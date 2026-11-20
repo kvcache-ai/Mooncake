@@ -669,6 +669,66 @@ class DelayedGatherEndpoint {
     std::jthread worker_;
 };
 
+TEST(StoreGatherDirectTest, StrictReadsBypassOwnerGatherStaging) {
+    const char* device = std::getenv("MC_GATHER_TEST_DEVICE");
+    if (!device) GTEST_SKIP() << "Set MC_GATHER_TEST_DEVICE for RDMA";
+    setenv("MC_STORE_MEMCPY", "0", 1);
+    setenv("MC_STORE_GATHER_READ", "1", 1);
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
+    auto owner = RealClient::create(), reader = RealClient::create();
+    ASSERT_EQ(owner->setup_real("127.0.0.1:0", P2PHANDSHAKE, 16 << 20, 8 << 20,
+                                "rdma", device, master.master_address()),
+              0);
+    ASSERT_EQ(reader->setup_real("127.0.0.2:0", P2PHANDSHAKE, 0, 8 << 20,
+                                 "rdma", device, master.master_address()),
+              0);
+    std::vector<char> value(1 << 20), output(256 * 264);
+    for (size_t i = 0; i < value.size(); ++i) value[i] = i % 251;
+    ASSERT_EQ(owner->put("direct-gather", value), 0);
+    auto replicas = owner->get_replica_desc("direct-gather");
+    ASSERT_EQ(replicas.size(), 1);
+    MasterClient discovery(generate_uuid());
+    ASSERT_EQ(discovery.Connect(master.master_address()), ErrorCode::OK);
+    DelayedGatherEndpoint delayed;
+    ASSERT_TRUE(discovery.PublishGatherEndpoint(
+        replicas[0]
+            .get_memory_descriptor()
+            .buffer_descriptor.transport_endpoint_,
+        delayed.endpoint, false));
+    ASSERT_EQ(reader->register_buffer(output.data(), output.size()), 0);
+    std::vector<std::vector<std::vector<size_t>>> dst{{{}}}, src{{{}}},
+        sizes{{{}}};
+    for (size_t i = 0; i < 256; ++i) {
+        dst[0][0].push_back(i * 264);
+        src[0][0].push_back(i * 997);
+        sizes[0][0].push_back(264);
+    }
+    auto verify = [&](const auto& results) {
+        ASSERT_EQ(results.size(), 1);
+        ASSERT_EQ(results[0].size(), 1);
+        ASSERT_EQ(results[0][0].size(), 256);
+        for (size_t i = 0; i < 256; ++i) {
+            EXPECT_EQ(results[0][0][i], 264);
+            EXPECT_EQ(
+                memcmp(output.data() + i * 264, value.data() + i * 997, 264),
+                0);
+        }
+    };
+    verify(reader->get_into_ranges_direct({output.data()}, {{"direct-gather"}},
+                                          dst, src, sizes));
+    EXPECT_FALSE(delayed.received);
+    std::fill(output.begin(), output.end(), 0);
+    verify(reader->get_into_ranges({output.data()}, {{"direct-gather"}}, dst,
+                                   src, sizes));
+    // The identical ordinary read must actually attempt gather, proving that
+    // strict success above did not merely use an ineligible scatter plan.
+    EXPECT_TRUE(delayed.received);
+    EXPECT_EQ(reader->unregister_buffer(output.data()), 0);
+    reader->tearDownAll();
+    owner->tearDownAll();
+}
+
 TEST(StoreGatherLeaseTest, RenewsAllOwnersDuringDelayedSessionOpen) {
     const char* device = std::getenv("MC_GATHER_TEST_DEVICE");
     if (!device) GTEST_SKIP() << "Set MC_GATHER_TEST_DEVICE for RDMA";
