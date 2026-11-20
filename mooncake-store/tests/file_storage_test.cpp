@@ -648,6 +648,9 @@ class FileStorageTest : public ::testing::Test {
         BucketBackendConfig bucket_config;
         bucket_config.write_io_workers = write_workers;
         bucket_config.bucket_keys_limit = write_workers > 0 ? 12 : keys.size();
+        // The parallel scenario has 25 inputs (24 real keys plus a missing
+        // source), and expects every real key to persist in this call.
+        bucket_config.flush_partial_buckets = write_workers > 0;
         bucket_config.write_sub_batch_max_iovecs = 4;
         std::unordered_set<std::string> duplicates;
         for (size_t i = 0; i < duplicate_count; ++i) {
