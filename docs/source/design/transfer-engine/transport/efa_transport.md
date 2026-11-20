@@ -163,8 +163,7 @@ The test suite includes:
 | `WarmupSegmentLoopback` | `warmupSegment()` handshake path + idempotent re-call |
 | `WarmupSegmentNotFound` | `warmupSegment()` fails cleanly for an unknown segment |
 | `RegisterMemoryBatch` | `registerLocalMemoryBatch` / `unregisterLocalMemoryBatch` round-trip |
-| `EFALocalNicMapTest.InvertsPreferredHca` | `MC_EFA_NIC_SELECTION=local` map inversion — needs no hardware |
-| `EFANicPlanTest.*` | which NICs each chunk of a buffer is registered on, including a split device buffer staying on its local NICs — needs no hardware |
+| `EFALocalNicMapTest.InvertsPreferredHca` | `MC_EFA_NIC_SELECTION=local` map inversion — the one case that needs no hardware |
 | `LargeTransfer` | 128 MB buffer, 64 x 1 MB slices — exercises WR / CQ pacing |
 | `RepeatedOpenSegment` | `openSegment()` on the same peer repeatedly still transfers correctly |
 
