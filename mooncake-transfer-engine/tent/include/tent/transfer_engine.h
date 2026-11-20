@@ -365,6 +365,14 @@ class TransferEngine {
                         std::vector<TransferStatus>* status_list = nullptr,
                         uint64_t timeout_ms = 0);
 
+    // Cancels the tasks of the batch that are still in flight and blocks until
+    // none of them can touch the caller's buffers. The timeout counts from the
+    // moment cancellation has been requested; 0 waits forever. Returns OK once
+    // every task has stopped and TimedOut when the deadline passes first, in
+    // which case the buffers must not be reused. The batch stays owned by the
+    // caller.
+    Status cancelAndWait(BatchID batch_id, uint64_t timeout_ms = 0);
+
     // Drive one progress step on a batch and return its aggregated status.
     // Unlike getTransferStatus, this always allows internal failover/resubmit
     // regardless of enable_auto_failover_on_poll. The call is non-blocking and

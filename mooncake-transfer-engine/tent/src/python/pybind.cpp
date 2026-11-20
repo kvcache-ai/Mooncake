@@ -17,14 +17,12 @@
 #include <pybind11/stl.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -151,33 +149,9 @@ static inline bool IsUint64Vector(const py::array& array) {
            array.strides(0) == static_cast<py::ssize_t>(sizeof(uint64_t));
 }
 
-// Cancel every task of a batch that will not complete and wait for the
-// transport to stop touching the caller's buffers. Returns true when every
-// task reached a terminal state within the settle window.
-static bool CancelAndSettle(TransferEngine& engine, BatchID batch_id,
-                            size_t count) {
-    for (size_t task_id = 0; task_id < count; ++task_id) {
-        (void)engine.cancelTransfer(batch_id, task_id);
-    }
-    constexpr auto kSettleWindow = std::chrono::milliseconds(250);
-    const auto deadline = std::chrono::steady_clock::now() + kSettleWindow;
-    std::vector<TransferStatus> status_list;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (!engine.getTransferStatus(batch_id, status_list).ok() ||
-            status_list.size() != count) {
-            return false;
-        }
-        bool pending = false;
-        for (const auto& status : status_list) {
-            pending = pending || status.s == TransferStatusEnum::PENDING;
-        }
-        if (!pending) {
-            return true;
-        }
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-    }
-    return false;
-}
+// How long a failed synchronous batch waits for cancellation to land before
+// the caller is told its buffers may still be in use.
+constexpr uint64_t kSettleTimeoutMs = 250;
 
 // =============================================================================
 // RAII Wrappers
@@ -857,19 +831,27 @@ PYBIND11_MODULE(tent, m) {
                             self.submitTransfer(batch_id, request_list);
                         if (!submit_status.ok()) {
                             // A rejected submit can still leave tasks in
-                            // flight; cancel them before the guard frees the
-                            // batch.
-                            (void)CancelAndSettle(self, batch_id, count);
+                            // flight; stop them before the guard frees the
+                            // batch, or the caller may reuse live buffers.
+                            auto settle =
+                                self.cancelAndWait(batch_id, kSettleTimeoutMs);
+                            if (!settle.ok()) {
+                                wait_error =
+                                    "submitTransfer failed: " +
+                                    submit_status.ToString() +
+                                    "; the batch may still access src and dst, "
+                                    "so do not reuse them";
+                            }
                         } else {
                             std::vector<TransferStatus> status_list;
                             auto wait_status =
                                 self.waitTransfer(batch_id, &status_list, 0);
                             if (!wait_status.ok()) {
-                                const bool idle =
-                                    CancelAndSettle(self, batch_id, count);
+                                auto settle = self.cancelAndWait(
+                                    batch_id, kSettleTimeoutMs);
                                 wait_error = "waitTransfer failed: " +
                                              wait_status.ToString();
-                                if (!idle) {
+                                if (!settle.ok()) {
                                     wait_error +=
                                         "; the batch may still access src and "
                                         "dst, so do not reuse them";
@@ -898,13 +880,13 @@ PYBIND11_MODULE(tent, m) {
             "Submit src to dst descriptors in one batch and wait until every "
             "descriptor reaches a terminal state. src, dst and lengths are "
             "one-dimensional uint64 arrays of equal length and must not be "
-            "modified until the call returns. Malformed non-empty input and "
-            "failed submits are reported as INVALID for every entry; an empty "
-            "input that is not three empty uint64 vectors raises "
-            "InvalidArgumentError. A failed wait cancels the batch and waits "
-            "up to 250 ms for every descriptor to stop before raising "
-            "InternalError; the error says src and dst must not be reused when "
-            "that does not happen. This call has no timeout.",
+            "modified until the call returns. Malformed non-empty input is "
+            "reported as INVALID for every entry; an empty input that is not "
+            "three empty uint64 vectors raises InvalidArgumentError. A failed "
+            "submit or wait cancels the batch and waits up to 250 ms for every "
+            "descriptor to stop; when that does not happen the call raises "
+            "InternalError, which says src and dst must not be reused. This "
+            "call has no timeout.",
             py::arg("src"), py::arg("dst"), py::arg("lengths"),
             py::arg("target_id"), py::arg("opcode"))
 

@@ -196,6 +196,10 @@ Status TransferEngine::waitTransfer(BatchID batch_id,
     return impl_->waitTransfer(batch_id, status_list, timeout_ms);
 }
 
+Status TransferEngine::cancelAndWait(BatchID batch_id, uint64_t timeout_ms) {
+    return impl_->cancelAndWait(batch_id, timeout_ms);
+}
+
 Status TransferEngine::progressBatch(BatchID batch_id,
                                      TransferStatus& overall_status) {
     return impl_->progressBatch(batch_id, overall_status);

@@ -4021,6 +4021,57 @@ Status TransferEngineImpl::waitTransfer(
                      "Transfer via stage buffer failed" LOC_MARK);
 }
 
+Status TransferEngineImpl::cancelAndWait(BatchID batch_id,
+                                         uint64_t timeout_ms) {
+    constexpr auto kMaxTimeout =
+        std::chrono::milliseconds(std::chrono::hours(24 * 365));
+    const auto deadline =
+        timeout_ms > static_cast<uint64_t>(kMaxTimeout.count())
+            ? std::chrono::steady_clock::time_point::max()
+            : std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(timeout_ms);
+    const auto timed_out = [&] {
+        return timeout_ms != 0 && std::chrono::steady_clock::now() >= deadline;
+    };
+    const auto in_flight = [](const TransferStatus& status) {
+        return status.s == PENDING;
+    };
+
+    TransferStatus overall_status{};
+    std::vector<TransferStatus> status_list;
+    bool canceled = false;
+    for (uint64_t poll_count = 0;; ++poll_count) {
+        CHECK_STATUS(progressBatch(batch_id, overall_status));
+        CHECK_STATUS(getTransferStatus(batch_id, status_list));
+        if (!canceled) {
+            // Stop admitting more of this batch before canceling what is in
+            // flight: polling releases dispatch window slots, and a refill
+            // would otherwise start another owner of this batch.
+            if (runtime_queue_config_.enabled) {
+                CHECK_STATUS(cancelQueuedOwners(batch_id));
+                CHECK_STATUS(getTransferStatus(batch_id, status_list));
+            }
+            for (size_t task_id = 0; task_id < status_list.size(); ++task_id) {
+                if (in_flight(status_list[task_id])) {
+                    (void)cancelTransfer(batch_id, task_id);
+                }
+            }
+            if (runtime_queue_config_.enabled) {
+                CHECK_STATUS(refillDispatchWindow());
+            }
+            canceled = true;
+        } else if (std::none_of(status_list.begin(), status_list.end(),
+                                in_flight)) {
+            return Status::OK();
+        } else if (timed_out()) {
+            return Status::TimedOut(
+                "batch tasks did not stop within the settle window" LOC_MARK);
+        } else {
+            waitBeforeNextPoll(poll_count);
+        }
+    }
+}
+
 Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
     BatchGuard batch_guard(*this, batch_id);
     auto status = waitTransfer(batch_id);

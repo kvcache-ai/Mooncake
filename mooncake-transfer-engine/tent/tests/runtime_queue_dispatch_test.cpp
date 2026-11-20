@@ -749,6 +749,86 @@ TEST(RuntimeQueueDispatch, SaturatesHugeTimeoutInsteadOfOverflowing) {
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
+TEST(RuntimeQueueDispatch, CancelAndWaitStopsQueuedAndDispatchedOwners) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma =
+        std::make_shared<FakeTransport>(RDMA, [](const Request&, int) {
+            return TransferStatus{TransferStatusEnum::PENDING, 0};
+        });
+    installFakeRdma(engine, fake_rdma);
+
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> buffer(kReqLen * 2, 0x22);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+    BatchID batch = engine.allocateBatch(2);
+    ASSERT_NE(batch, (BatchID)0);
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch,
+                            {makeLocalWrite(buffer.data(), kReqLen),
+                             makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
+            .ok());
+    ASSERT_EQ(fake_rdma->submit_calls.load(), 1);
+
+    ASSERT_TRUE(engine.cancelAndWait(batch, 1000).ok());
+
+    // The queued owner is canceled instead of being dispatched, and the owner
+    // already in the dispatch window is canceled at the transport.
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    TransferStatus first{};
+    TransferStatus second{};
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, first).ok());
+    ASSERT_TRUE(engine.getTransferStatus(batch, 1, second).ok());
+    EXPECT_EQ(first.s, TransferStatusEnum::CANCELED);
+    EXPECT_EQ(second.s, TransferStatusEnum::CANCELED);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, CancelAndWaitReportsTimeoutWhenCancelIsUnsupported) {
+    auto cfg = makeRuntimeQueueConfig(2, 1UL << 20);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma =
+        std::make_shared<FakeTransport>(RDMA, [](const Request&, int) {
+            return TransferStatus{TransferStatusEnum::PENDING, 0};
+        });
+    fake_rdma->cancellation_supported = false;
+    installFakeRdma(engine, fake_rdma);
+
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> buffer(kReqLen * 2, 0x33);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+    BatchID batch = engine.allocateBatch(2);
+    ASSERT_NE(batch, (BatchID)0);
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch,
+                            {makeLocalWrite(buffer.data(), kReqLen),
+                             makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
+            .ok());
+    ASSERT_EQ(fake_rdma->submit_calls.load(), 2);
+
+    auto status = engine.cancelAndWait(batch, 50);
+    EXPECT_TRUE(status.IsTimedOut()) << status.ToString();
+
+    TransferStatus first{};
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, first).ok());
+    EXPECT_EQ(first.s, TransferStatusEnum::PENDING);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
 TEST(RuntimeQueueDispatch, CancelsDispatchedRdmaTaskIdempotently) {
     auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
     TransferEngineImpl engine(cfg);

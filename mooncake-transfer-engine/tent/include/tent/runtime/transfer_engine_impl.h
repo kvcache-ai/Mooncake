@@ -372,6 +372,8 @@ class TransferEngineImpl {
                         std::vector<TransferStatus>* status_list = nullptr,
                         uint64_t timeout_ms = 0);
 
+    Status cancelAndWait(BatchID batch_id, uint64_t timeout_ms = 0);
+
     Status submitAndWaitTransfer(const std::vector<Request>& request_list);
 
     uint64_t lockStageBuffer(const std::string& location);
