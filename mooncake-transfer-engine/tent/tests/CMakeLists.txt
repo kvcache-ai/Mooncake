@@ -235,6 +235,10 @@ target_include_directories(transfer_engine_config_override_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME transfer_engine_config_override_test
          COMMAND transfer_engine_config_override_test)
+if(TARGET metastore_http)
+  target_compile_definitions(transfer_engine_config_override_test
+                             PRIVATE TENT_TEST_HTTP_METASTORE)
+endif()
 
 # Platform::getLoader is a process-wide singleton. Keep this regression in a
 # dedicated CPU-only process so its first call always exercises the null-config
@@ -387,17 +391,39 @@ if(USE_CUDA)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 endif()
 
-# NOT registered via add_test: needs a real GPU with POSIX-FD VMM support (the
-# peer buffer is exported by a forked child and imported via pidfd_getfd). Run
-# manually on a GPU box: ./tent_mnnvl_transport_test. MNNVL targets fully
-# connected NVLink domains; on a box whose GPUs lack P2P to each other, pin
-# CUDA_VISIBLE_DEVICES to one card.
+# CUDA cases skip explicitly without hardware. Each exporter case starts in a
+# fresh process so fork happens before CUDA or runtime threads initialize. Pin
+# CUDA_VISIBLE_DEVICES to one card on hosts without full peer access.
 if(USE_CUDA)
   add_executable(tent_mnnvl_transport_test mnnvl_transport_test.cpp)
   target_link_libraries(tent_mnnvl_transport_test PRIVATE gtest gtest_main
                                                           tent_link_group)
+  if(TARGET asio_shared)
+    target_link_libraries(tent_mnnvl_transport_test PRIVATE asio_shared)
+  endif()
   target_include_directories(tent_mnnvl_transport_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  if(UNIX AND NOT APPLE)
+    target_compile_definitions(tent_mnnvl_transport_test
+                               PRIVATE MNNVL_TEST_CUDA_WRAPPERS)
+    target_link_options(
+      tent_mnnvl_transport_test PRIVATE "-Wl,--wrap=cudaEventRecord"
+      "-Wl,--wrap=cudaEventQuery")
+  endif()
+  foreach(
+    case
+    RelocateImportsPosixFdHandle RelocateImportsLogicalSubrangeAndBoundsCache
+    RelocateFailsCleanlyWhenPeerIsGone
+    RelocateCacheIsScopedToTransportInstallation)
+    add_test(NAME tent_mnnvl_transport_${case}
+             COMMAND tent_mnnvl_transport_test
+                     --gtest_filter=MnnvlTransportTest.${case})
+    set_tests_properties(tent_mnnvl_transport_${case} PROPERTIES TIMEOUT 120)
+  endforeach()
+  add_test(NAME tent_mnnvl_completion_test
+           COMMAND tent_mnnvl_transport_test
+                   --gtest_filter=MnnvlCompletionTest.*)
+  set_tests_properties(tent_mnnvl_completion_test PROPERTIES TIMEOUT 120)
 endif()
 
 add_executable(tent_endpoint_lifecycle_test endpoint_lifecycle_test.cpp)
@@ -545,6 +571,16 @@ target_include_directories(tent_quota_accounting_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_quota_accounting_test COMMAND tent_quota_accounting_test)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(tent_shared_quota_test shared_quota_test.cpp)
+  target_link_libraries(tent_shared_quota_test PRIVATE gtest gtest_main
+                                                       tent_link_group)
+  target_link_options(tent_shared_quota_test PRIVATE "-Wl,--wrap=clock_gettime")
+  target_include_directories(tent_shared_quota_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_shared_quota_test COMMAND tent_shared_quota_test)
+endif()
+
 # QoS Contract Schema Unit Test
 add_executable(tent_qos_contract_test qos_contract_test.cpp
                                       ../src/runtime/qos_contract.cpp)
@@ -685,7 +721,7 @@ target_include_directories(tent_poll_backoff_test
 add_test(NAME tent_poll_backoff_test COMMAND tent_poll_backoff_test)
 
 # Delegate RPC end to end: ControlClient::delegate -> onDelegate ->
-# transferSync, against a real engine on loopback with a FakeTransport.
+# submitAndWaitTransfer, against a real engine on loopback with a FakeTransport.
 add_executable(tent_delegate_rpc_test delegate_rpc_test.cpp)
 target_link_libraries(tent_delegate_rpc_test PRIVATE gtest gtest_main
                                                      tent_link_group)
@@ -783,6 +819,71 @@ if(USE_TPU)
     tent_tpu_transport_test
     PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
   add_test(NAME tent_tpu_transport_test COMMAND tent_tpu_transport_test)
+
+  # The adapter hides the registry's symbols, so compile its source directly.
+  add_executable(
+    tent_tpu_fake_address_registry_test
+    tpu/tpu_fake_address_registry_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../plugins/tpu/tpu_synthetic_address_registry.cpp
+  )
+  target_link_libraries(tent_tpu_fake_address_registry_test PRIVATE gtest
+                                                                    gtest_main)
+  target_include_directories(tent_tpu_fake_address_registry_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../plugins/tpu)
+  add_test(NAME tent_tpu_fake_address_registry_test
+           COMMAND tent_tpu_fake_address_registry_test)
+
+  add_library(mock_tpu_buffer_provider SHARED tpu/mock_tpu_buffer_provider.cpp)
+  target_include_directories(mock_tpu_buffer_provider
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
+  add_executable(tent_tpu_pjrt_adapter_test tpu/tpu_pjrt_adapter_test.cpp)
+  add_dependencies(tent_tpu_pjrt_adapter_test tent_tpu_pjrt_adapter
+                   mock_tpu_buffer_provider)
+  target_link_libraries(
+    tent_tpu_pjrt_adapter_test PRIVATE gtest gtest_main tent_link_group
+                                       ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_pjrt_adapter_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_pjrt_adapter_test
+    PRIVATE
+      TPU_PJRT_ADAPTER_LIB="$<TARGET_FILE:tent_tpu_pjrt_adapter>"
+      MOCK_TPU_BUFFER_PROVIDER_LIB="$<TARGET_FILE:mock_tpu_buffer_provider>")
+  add_test(NAME tent_tpu_pjrt_adapter_test COMMAND tent_tpu_pjrt_adapter_test)
+
+  add_executable(tent_tpu_adapter_engine_test tpu/tpu_adapter_engine_test.cpp)
+  add_dependencies(tent_tpu_adapter_engine_test tent_tpu_pjrt_adapter
+                   mock_tpu_buffer_provider)
+  target_link_libraries(
+    tent_tpu_adapter_engine_test PRIVATE gtest gtest_main tent_link_group
+                                         ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_adapter_engine_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_adapter_engine_test
+    PRIVATE
+      TPU_PJRT_ADAPTER_LIB="$<TARGET_FILE:tent_tpu_pjrt_adapter>"
+      MOCK_TPU_BUFFER_PROVIDER_LIB="$<TARGET_FILE:mock_tpu_buffer_provider>")
+  add_test(NAME tent_tpu_adapter_engine_test
+           COMMAND tent_tpu_adapter_engine_test)
+  set_tests_properties(tent_tpu_adapter_engine_test PROPERTIES TIMEOUT 300)
+
+  add_executable(tent_tpu_adapter_process_test tpu/tpu_adapter_process_test.cpp)
+  add_dependencies(tent_tpu_adapter_process_test tent_tpu_pjrt_adapter
+                   mock_tpu_buffer_provider)
+  target_link_libraries(tent_tpu_adapter_process_test
+                        PRIVATE gtest tent_link_group ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_adapter_process_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_adapter_process_test
+    PRIVATE
+      TPU_PJRT_ADAPTER_LIB="$<TARGET_FILE:tent_tpu_pjrt_adapter>"
+      MOCK_TPU_BUFFER_PROVIDER_LIB="$<TARGET_FILE:mock_tpu_buffer_provider>")
+  add_test(NAME tent_tpu_adapter_process_test
+           COMMAND tent_tpu_adapter_process_test)
+  set_tests_properties(tent_tpu_adapter_process_test PROPERTIES TIMEOUT 300)
 endif()
 
 # XPU SYCL platform test: exercises XpuPlatform (device allocation, pointer
@@ -870,7 +971,7 @@ if(USE_ASCEND OR USE_ASCEND_DIRECT)
   add_executable(tent_ascend_direct_transport_test
                  ascend_direct_transport_test.cpp)
   target_link_libraries(tent_ascend_direct_transport_test
-                        PRIVATE gtest gtest_main tent_link_group)
+                        PRIVATE gtest gtest_main tent_link_group glog::glog)
   if(TARGET asio_shared)
     target_link_libraries(tent_ascend_direct_transport_test PRIVATE asio_shared)
   endif()
@@ -888,8 +989,8 @@ endif()
 
 if(USE_ASCEND_DIRECT)
   add_executable(tent_shared_host_mapper_test shared_host_mapper_test.cpp)
-  target_link_libraries(tent_shared_host_mapper_test
-                        PRIVATE gtest gtest_main tent_link_group)
+  target_link_libraries(tent_shared_host_mapper_test PRIVATE gtest gtest_main
+                                                             tent_link_group)
   target_include_directories(tent_shared_host_mapper_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_shared_host_mapper_test
@@ -961,17 +1062,33 @@ if(USE_MLU)
     add_test(NAME tent_mlu_${suite}_test COMMAND tent_mlu_${suite}_test)
     set_tests_properties(tent_mlu_${suite}_test PROPERTIES TIMEOUT 300)
   endforeach()
+  foreach(suite transport engine)
+    target_link_options(
+      tent_mlu_${suite}_test PRIVATE "-Wl,--wrap=cnGetMemAttribute"
+      "-Wl,--wrap=cnrtGetPeerAccessibility")
+  endforeach()
   target_link_options(
     tent_mlu_transport_test
     PRIVATE
     "-Wl,--wrap=cnrtHostMalloc"
     "-Wl,--wrap=cnrtFreeHost"
+    "-Wl,--wrap=cnrtMapMemHandle"
+    "-Wl,--wrap=cnrtUnMapMemHandle"
     "-Wl,--wrap=numa_move_pages"
     "-Wl,--wrap=cnPlaceNotifier"
+    "-Wl,--wrap=cnDestroyNotifier"
     "-Wl,--wrap=cnMemcpyAsync_V3"
+    "-Wl,--wrap=cnMemcpyPeerAsync"
     "-Wl,--wrap=cnMemcpyHtoD"
     "-Wl,--wrap=cnMemcpyDtoH"
     "-Wl,--wrap=cnQueueSync"
     "-Wl,--wrap=cnQueryNotifier"
     "-Wl,--wrap=cnQueryQueue")
 endif()
+
+# Exercise the C translation unit against the production shared library.
+enable_language(C)
+add_executable(tent_c_status_test c_status_test.cpp status_c_api_smoke.c)
+target_link_libraries(tent_c_status_test PRIVATE tent_shared tent_interface
+                                                 gtest gtest_main)
+add_test(NAME tent_c_status_test COMMAND tent_c_status_test)

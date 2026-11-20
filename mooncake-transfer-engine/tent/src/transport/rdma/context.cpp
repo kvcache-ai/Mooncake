@@ -35,6 +35,7 @@
 #ifdef USE_CUDA
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "tent/platform/cuda_utils.h"
 #endif
 
 #include "ib_link_speed.h"
@@ -547,13 +548,14 @@ RdmaContext::MemReg RdmaContext::registerMemReg(
     }
 
 #ifdef USE_CUDA
-    // Ensure CUDA context is current for GPU memory registration
-    // This is needed for worker threads or callers from non-CUDA threads
+    // Use ibv_reg_mr() directly only when a peer-memory module is active;
+    // otherwise fall through to the shared dma-buf export path below.
     CUmemorytype memType;
     CUresult result = cuPointerGetAttribute(
         &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
 
-    if (result == CUDA_SUCCESS && memType == CU_MEMORYTYPE_DEVICE) {
+    if (result == CUDA_SUCCESS && memType == CU_MEMORYTYPE_DEVICE &&
+        useCudaPeerMemoryModule()) {
         // Get device ordinal and set primary context current
         unsigned int devOrd = 0;
         result = cuPointerGetAttribute(
@@ -649,10 +651,11 @@ RdmaContext::MemReg RdmaContext::registerMemReg(
         }
     }
 
-    // MLU memory must not reach the plain MR path when dma-buf verbs or export
-    // are unavailable. The engine may still use a separate host stage buffer.
+    // Device memory without peer-memory must not reach the plain host MR path
+    // when dma-buf verbs or export are unavailable. The engine may still use a
+    // separate host stage buffer.
     const auto memory_type = Platform::getLoader().getMemoryType(addr);
-    if (memory_type == MTYPE_MLU) return nullptr;
+    if (memory_type == MTYPE_MLU || memory_type == MTYPE_CUDA) return nullptr;
 
     // Standard CPU memory registration
     ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);

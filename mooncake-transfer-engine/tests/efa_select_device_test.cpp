@@ -238,5 +238,90 @@ TEST(EfaTopologyIndexTest, SelectsTheGpusOwnNicsWithLocalKeys) {
     }
 }
 
+// MC_EFA_NIC_SELECTION=local builds its per-GPU NIC list through the shared
+// buildPreferredNicIndexMap(). A preferred HCA listed twice maps to one index,
+// so the buffer is not registered on the same NIC twice; missing HCAs are
+// skipped, and a GPU with none left gets no entry (the caller then falls back
+// to all NICs). efa_transport_test covers the same map but needs EFA hardware,
+// so CI only builds it; this suite runs.
+TEST(EfaLocalNicMapTest, DeduplicatesPreferredHca) {
+    TopologyMatrix matrix;
+    matrix["cuda:0"] =
+        TopologyEntry{.name = "cuda:0",
+                      .preferred_hca = {"rdmap1", "rdmap0", "rdmap1", "gone"},
+                      .avail_hca = {"rdmap2"}};
+    matrix["cuda:1"] = TopologyEntry{.name = "cuda:1",
+                                     .preferred_hca = {"gone", "gone"},
+                                     .avail_hca = {"rdmap0"}};
+    auto map =
+        EfaTransport::buildLocalNicMap(matrix, {"rdmap0", "rdmap1", "rdmap2"});
+    ASSERT_EQ(map.size(), 1u);
+    EXPECT_EQ(map.at("cuda:0"), (std::vector<size_t>{1, 0}));
+    EXPECT_EQ(map.count("cuda:1"), 0u);
+}
+
+// Which NICs each chunk of a buffer is registered on. 16 NICs, two per GPU,
+// as on p6-b300.
+TEST(EfaNicPlanTest, DeviceBufferKeepsLocalNicsWhenSplit) {
+    using Kind = EfaTransport::NicPlanKind;
+    using Plan = std::vector<std::vector<size_t>>;
+    const size_t nics = 16;
+    const std::vector<size_t> local{8, 9};
+
+    auto single = EfaTransport::planChunkNics(1, nics, &local, true);
+    EXPECT_EQ(single.kind, Kind::kSingleLocal);
+    EXPECT_EQ(single.assignments, (Plan{{8, 9}}));
+
+    // A 100 GiB KV cache on 4 KB pages: two chunks over the PTE budget, one
+    // local NIC each instead of NICs 0-7 and 8-15.
+    auto split = EfaTransport::planChunkNics(2, nics, &local, false);
+    EXPECT_EQ(split.kind, Kind::kLocalPartition);
+    EXPECT_EQ(split.assignments, (Plan{{8}, {9}}));
+
+    auto covered = EfaTransport::planChunkNics(2, nics, &local, true);
+    EXPECT_EQ(covered.kind, Kind::kLocalCoverage);
+    EXPECT_EQ(covered.assignments, (Plan{{8, 9}, {8, 9}}));
+
+    const std::vector<size_t> four{4, 5, 6, 7};
+    auto pairs = EfaTransport::planChunkNics(2, 32, &four, false);
+    EXPECT_EQ(pairs.kind, Kind::kLocalPartition);
+    EXPECT_EQ(pairs.assignments, (Plan{{4, 5}, {6, 7}}));
+
+    // More chunks than local NICs falls back to the all-NIC partition.
+    auto overflow = EfaTransport::planChunkNics(3, nics, &local, false);
+    EXPECT_EQ(overflow.kind, Kind::kPartition);
+    EXPECT_EQ(overflow.assignments[0], (std::vector<size_t>{0, 1, 2, 3, 4, 5}));
+    EXPECT_EQ(overflow.assignments[2],
+              (std::vector<size_t>{11, 12, 13, 14, 15}));
+}
+
+// Host memory and MC_EFA_NIC_SELECTION=all pass no local set.
+TEST(EfaNicPlanTest, NoLocalSetKeepsEveryNic) {
+    using Kind = EfaTransport::NicPlanKind;
+    using Plan = std::vector<std::vector<size_t>>;
+
+    auto single = EfaTransport::planChunkNics(1, 4, nullptr, true);
+    EXPECT_EQ(single.kind, Kind::kSingleAll);
+    EXPECT_EQ(single.assignments, (Plan{{0, 1, 2, 3}}));
+
+    auto covered = EfaTransport::planChunkNics(2, 4, nullptr, true);
+    EXPECT_EQ(covered.kind, Kind::kFullCoverage);
+    EXPECT_EQ(covered.assignments, (Plan{{0, 1, 2, 3}, {0, 1, 2, 3}}));
+
+    auto split = EfaTransport::planChunkNics(2, 16, nullptr, false);
+    EXPECT_EQ(split.kind, Kind::kPartition);
+    EXPECT_EQ(split.assignments[0],
+              (std::vector<size_t>{0, 1, 2, 3, 4, 5, 6, 7}));
+    EXPECT_EQ(split.assignments[1],
+              (std::vector<size_t>{8, 9, 10, 11, 12, 13, 14, 15}));
+
+    auto rr = EfaTransport::planChunkNics(5, 2, nullptr, false);
+    EXPECT_EQ(rr.kind, Kind::kRoundRobin);
+    EXPECT_EQ(rr.assignments, (Plan{{0}, {1}, {0}, {1}, {0}}));
+
+    EXPECT_TRUE(
+        EfaTransport::planChunkNics(0, 4, nullptr, true).assignments.empty());
+}
+
 }  // namespace
 }  // namespace mooncake

@@ -311,8 +311,9 @@ class MooncakeTransferEngineSink:
                         f"duplicate target executor rank and worker: {executor_key}"
                     )
                 target_executor_keys.add(executor_key)
+            required_fragment_id_set = frozenset(required_fragment_ids)
             for fragment in binding.fragments:
-                if fragment.fragment_id not in required_fragment_ids:
+                if fragment.fragment_id not in required_fragment_id_set:
                     continue
                 if fragment.fragment_id in targets:
                     raise TransferEngineError(

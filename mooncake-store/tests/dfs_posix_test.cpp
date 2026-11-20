@@ -4,6 +4,8 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <barrier>
+#include <mutex>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -1299,7 +1301,9 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
 // adapter pointer so the caller can program fault injection. The caller owns
 // Init() so it can ASSERT.
 std::unique_ptr<DistributedStorageBackend> MakeControlledBackend(
-    const std::string& dir, ControlledPosixFsAdapter** out_adapter) {
+    const std::string& dir, ControlledPosixFsAdapter** out_adapter,
+    std::unique_ptr<ControlledPosixFsAdapter> adapter =
+        std::make_unique<ControlledPosixFsAdapter>()) {
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = dir;
@@ -1311,10 +1315,398 @@ std::unique_ptr<DistributedStorageBackend> MakeControlledBackend(
     distributed_config.shard_capacity = 64 * 1024 * 1024;
     distributed_config.alignment = 4096;
 
-    auto adapter = std::make_unique<ControlledPosixFsAdapter>();
     *out_adapter = adapter.get();
     return std::make_unique<DistributedStorageBackend>(
         file_config, distributed_config, std::move(adapter));
+}
+
+// Opt into native batches while retaining real positional file I/O. The
+// first read snapshots its bytes before it blocks, allowing mutation tests
+// to distinguish the old source from a later allocation.
+class SharedReadFsAdapter : public ControlledPosixFsAdapter {
+   public:
+    ~SharedReadFsAdapter() override { Release(); }
+    bool SupportsBatchIo() const override { return true; }
+    bool SupportsFdReopen() const override { return false; }
+    bool fail_first = false;
+
+    bool WaitUntilBlocked() {
+        return blocked_.wait_for(std::chrono::seconds(5)) ==
+               std::future_status::ready;
+    }
+    bool WaitForReadCount(size_t count) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (read_calls.load() >= count) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    }
+    void Release() {
+        if (!released_once_.exchange(true)) release_signal_.set_value();
+    }
+    std::vector<size_t> BatchSizes() {
+        std::lock_guard lock(records_mutex_);
+        return batch_sizes_;
+    }
+    void* FirstReadBuffer() {
+        std::lock_guard lock(records_mutex_);
+        return read_buffers_.empty() ? nullptr : read_buffers_.front();
+    }
+    std::vector<tl::expected<size_t, ErrorCode>> BatchReadAt(
+        std::span<const FdIoRequest> requests) override {
+        {
+            std::lock_guard lock(records_mutex_);
+            batch_sizes_.push_back(requests.size());
+        }
+        return FileSystemAdapter::BatchReadAt(requests);
+    }
+    std::vector<tl::expected<size_t, ErrorCode>> BatchWriteAt(
+        std::span<const FdIoRequest> requests) override {
+        return FileSystemAdapter::BatchWriteAt(requests);
+    }
+    tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int count,
+                                           int64_t offset) override {
+        const size_t call = ++read_calls;
+        {
+            std::lock_guard lock(records_mutex_);
+            read_buffers_.push_back(count ? iov[0].iov_base : nullptr);
+        }
+        auto result = call == 1 && fail_first
+                          ? tl::expected<size_t, ErrorCode>(
+                                tl::make_unexpected(ErrorCode::FILE_READ_FAIL))
+                          : PosixFsAdapter::ReadAt(fd, iov, count, offset);
+        if (call == 1) {
+            blocked_signal_.set_value();
+            released_.wait();
+        }
+        return result;
+    }
+    std::atomic<size_t> read_calls{0};
+
+   private:
+    std::mutex records_mutex_;
+    std::vector<size_t> batch_sizes_;
+    std::vector<void*> read_buffers_;
+    std::atomic<bool> released_once_{false};
+    std::promise<void> blocked_signal_;
+    std::future<void> blocked_{blocked_signal_.get_future()};
+    std::promise<void> release_signal_;
+    std::shared_future<void> released_{release_signal_.get_future().share()};
+};
+
+struct ReleaseSharedRead {
+    SharedReadFsAdapter* adapter;
+    ~ReleaseSharedRead() { adapter->Release(); }
+};
+
+class DfsSharedReadTest : public DfsBackendTest {
+   protected:
+    void SetUp() override {
+        DfsBackendTest::SetUp();
+        auto adapter = std::make_unique<SharedReadFsAdapter>();
+        controlled_ = adapter.get();
+        ControlledPosixFsAdapter* unused = nullptr;
+        backend_ =
+            MakeControlledBackend(tmp_->path(), &unused, std::move(adapter));
+        ASSERT_TRUE(backend_->Init());
+        const std::array<std::string, 3> values{
+            "abcdefghijklmnop", "ABCDEFGHIJKLMNOP", "0123456789abcdef"};
+        for (size_t i = 0; i < values.size(); ++i) {
+            auto write = backend_->BatchWrite(
+                {{std::string(1, 'a' + i),
+                  Describe(i * 4096),
+                  {{const_cast<char*>(values[i].data()), values[i].size()}}}});
+            ASSERT_TRUE(write[0]);
+        }
+    }
+    DistributedFSDescriptor Describe(uint64_t offset = 0) const {
+        return {.file_path = ShardPath(0),
+                .offset = offset,
+                .object_size = 16,
+                .aligned_size = 4096,
+                .shard_idx = 0};
+    }
+    DfsReadRequest Request(std::string key, uint64_t offset,
+                           std::vector<Slice> slices,
+                           ReplicaID replica_id = 41) const {
+        return {.key = std::move(key),
+                .descriptor = Describe(offset),
+                .slices = std::move(slices),
+                .source_replica_id = replica_id};
+    }
+    SharedReadFsAdapter* controlled_ = nullptr;
+};
+
+TEST_F(DfsSharedReadTest, UncontendedReadKeepsCallerDestination) {
+    controlled_->Release();
+    std::array<char, 16> output{};
+    ASSERT_TRUE(
+        backend_->BatchRead({Request("a", 0, {{output.data(), 16}})})[0]);
+    EXPECT_EQ(controlled_->FirstReadBuffer(), output.data());
+    EXPECT_EQ(controlled_->read_calls, 1U);
+}
+
+TEST_F(DfsSharedReadTest, OverlappingScatterDoesNotPublishOverwrittenBytes) {
+    std::array<char, 8> aliased{};
+    std::array<char, 16> follower{};
+    std::vector<std::future<std::vector<tl::expected<void, ErrorCode>>>> reads;
+    ReleaseSharedRead release{controlled_};
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend_->BatchRead(
+            {Request("a", 0, {{aliased.data(), 8}, {aliased.data(), 8}})});
+    }));
+    ASSERT_TRUE(controlled_->WaitUntilBlocked());
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend_->BatchRead({Request("a", 0, {{follower.data(), 16}})});
+    }));
+    const auto ready = reads.back().wait_for(std::chrono::seconds(5));
+    controlled_->Release();
+    ASSERT_EQ(ready, std::future_status::ready);
+    for (auto& read : reads) ASSERT_TRUE(read.get()[0]);
+    EXPECT_EQ(std::string(aliased.data(), 8), "ijklmnop");
+    EXPECT_EQ(std::string(follower.data(), 16), "abcdefghijklmnop");
+    EXPECT_EQ(controlled_->read_calls, 2U);
+}
+
+TEST_F(DfsSharedReadTest, CrossRequestAliasesKeepOriginalBatchWrites) {
+    std::array<char, 16> shared{}, follower{};
+    std::vector<std::future<std::vector<tl::expected<void, ErrorCode>>>> reads;
+    ReleaseSharedRead release{controlled_};
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend_->BatchRead(
+            {Request("a", 0, {{shared.data(), 16}}, 41),
+             Request("b", 4096, {{shared.data(), 16}}, 42)});
+    }));
+    ASSERT_TRUE(controlled_->WaitUntilBlocked());
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend_->BatchRead({Request("a", 0, {{follower.data(), 16}})});
+    }));
+    const auto ready = reads.back().wait_for(std::chrono::seconds(5));
+    controlled_->Release();
+    ASSERT_EQ(ready, std::future_status::ready);
+    for (auto& read : reads)
+        for (const auto& result : read.get()) EXPECT_TRUE(result);
+    EXPECT_EQ(std::string(shared.data(), 16), "ABCDEFGHIJKLMNOP");
+    EXPECT_EQ(std::string(follower.data(), 16), "abcdefghijklmnop");
+    EXPECT_EQ(controlled_->read_calls, 3U);
+}
+
+TEST_F(DfsSharedReadTest, EightConsumersShareOneReadAcrossScatterLayouts) {
+    std::array<std::array<char, 16>, 8> output{};
+    std::barrier start(9);
+    std::vector<std::future<std::vector<tl::expected<void, ErrorCode>>>> reads;
+    ReleaseSharedRead release{controlled_};
+    for (size_t i = 0; i < output.size(); ++i) {
+        reads.push_back(std::async(std::launch::async, [&, i] {
+            const size_t split = i + 1;
+            auto request = Request("a", 0,
+                                   {{output[i].data(), split},
+                                    {output[i].data() + split, 16 - split}});
+            request.range_read = (i % 2) != 0;
+            start.arrive_and_wait();
+            return backend_->BatchRead({request});
+        }));
+    }
+    start.arrive_and_wait();
+    ASSERT_TRUE(controlled_->WaitUntilBlocked());
+    for (auto& read : reads)
+        EXPECT_EQ(read.wait_for(std::chrono::milliseconds(20)),
+                  std::future_status::timeout);
+    controlled_->Release();
+    for (auto& read : reads) ASSERT_TRUE(read.get()[0]);
+    EXPECT_EQ(controlled_->read_calls, 1U);
+    for (const auto& value : output)
+        EXPECT_EQ(std::string(value.data(), value.size()), "abcdefghijklmnop");
+
+    std::array<char, 16> later{};
+    ASSERT_TRUE(
+        backend_->BatchRead({Request("a", 0, {{later.data(), 16}})})[0]);
+    EXPECT_EQ(controlled_->read_calls, 2U);  // no completed-result cache
+}
+
+TEST_F(DfsSharedReadTest, PartialBatchOverlapSubmitsLeadersBeforeWaiting) {
+    std::array<char, 16> a{}, first_b{}, second_b{}, c{};
+    std::vector<std::future<std::vector<tl::expected<void, ErrorCode>>>> reads;
+    ReleaseSharedRead release{controlled_};
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend_->BatchRead(
+            {Request("a", 0, {{a.data(), 16}}, 41),
+             Request("b", 4096, {{first_b.data(), 16}}, 42)});
+    }));
+    ASSERT_TRUE(controlled_->WaitUntilBlocked());
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend_->BatchRead(
+            {Request("b", 4096, {{second_b.data(), 16}}, 42),
+             Request("c", 8192, {{c.data(), 16}}, 43)});
+    }));
+    EXPECT_TRUE(controlled_->WaitForReadCount(2));  // C can run while A blocks
+    controlled_->Release();
+    for (auto& read : reads)
+        for (const auto& result : read.get()) EXPECT_TRUE(result);
+    EXPECT_EQ(controlled_->read_calls, 3U);
+    auto batches = controlled_->BatchSizes();
+    std::sort(batches.begin(), batches.end());
+    EXPECT_EQ(batches, (std::vector<size_t>{1, 2}));
+    EXPECT_EQ(a,
+              (std::array<char, 16>{'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
+                                    'j', 'k', 'l', 'm', 'n', 'o', 'p'}));
+    EXPECT_EQ(first_b, second_b);
+    EXPECT_EQ(std::string(c.data(), c.size()), "0123456789abcdef");
+}
+
+TEST_F(DfsSharedReadTest, InvalidConsumerDoesNotWaitForOrReuseAValidRead) {
+    std::array<char, 16> good{};
+    std::array<char, 15> small{};
+    std::vector<std::future<std::vector<tl::expected<void, ErrorCode>>>> reads;
+    ReleaseSharedRead release{controlled_};
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend_->BatchRead({Request("a", 0, {{good.data(), 16}})});
+    }));
+    ASSERT_TRUE(controlled_->WaitUntilBlocked());
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend_->BatchRead({Request("a", 0, {{small.data(), 15}})});
+    }));
+    const auto ready = reads.back().wait_for(std::chrono::seconds(5));
+    controlled_->Release();
+    ASSERT_EQ(ready, std::future_status::ready);
+    auto invalid = reads.back().get();
+    ASSERT_FALSE(invalid[0]);
+    EXPECT_EQ(invalid[0].error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_TRUE(reads.front().get()[0]);
+    EXPECT_EQ(controlled_->read_calls, 1U);
+}
+
+TEST_F(DfsSharedReadTest, SourceIdAndWindowSeparateConcurrentReads) {
+    std::array<char, 16> first{}, other{};
+    std::vector<std::future<std::vector<tl::expected<void, ErrorCode>>>> reads;
+    ReleaseSharedRead release{controlled_};
+    reads.push_back(std::async(std::launch::async, [&] {
+        auto request = Request("a", 0, {{first.data(), 4}});
+        request.range_read = true;
+        return backend_->BatchRead({request});
+    }));
+    ASSERT_TRUE(controlled_->WaitUntilBlocked());
+    auto check_separate = [&](const DfsReadRequest& request) {
+        auto read = std::async(std::launch::async,
+                               [&] { return backend_->BatchRead({request}); });
+        const auto ready = read.wait_for(std::chrono::seconds(5));
+        if (ready != std::future_status::ready) controlled_->Release();
+        EXPECT_EQ(ready, std::future_status::ready);
+        EXPECT_TRUE(read.get()[0]);
+    };
+    auto different_window = Request("a", 0, {{other.data(), 4}});
+    different_window.range_read = true;
+    different_window.value_offset = 4;
+    check_separate(different_window);
+    EXPECT_EQ(std::string(other.data(), 4), "efgh");
+    auto different_id = Request("a", 0, {{other.data(), 4}}, 42);
+    different_id.range_read = true;
+    check_separate(different_id);
+    auto different_source = Request("a", 4096, {{other.data(), 4}}, 41);
+    different_source.range_read = true;
+    check_separate(different_source);
+    EXPECT_EQ(std::string(other.data(), 4), "ABCD");
+    auto different_key = Request("other-namespace/a", 0, {{other.data(), 4}});
+    different_key.range_read = true;
+    check_separate(different_key);
+    controlled_->Release();
+    EXPECT_TRUE(reads.front().get()[0]);
+    EXPECT_EQ(controlled_->read_calls, 5U);
+}
+
+TEST_F(DfsSharedReadTest, MutationDetachesTheOldInFlightSource) {
+    std::array<char, 16> before{}, after{};
+    std::vector<std::future<std::vector<tl::expected<void, ErrorCode>>>> reads;
+    ReleaseSharedRead release{controlled_};
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend_->BatchRead({Request("a", 0, {{before.data(), 16}})});
+    }));
+    ASSERT_TRUE(controlled_->WaitUntilBlocked());
+    std::string replacement = "replacement-data";
+    ASSERT_EQ(replacement.size(), 16U);
+    ASSERT_TRUE(backend_->BatchWrite(
+        {{"a", Describe(), {{replacement.data(), replacement.size()}}}})[0]);
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend_->BatchRead({Request("a", 0, {{after.data(), 16}})});
+    }));
+    const auto ready = reads.back().wait_for(std::chrono::seconds(5));
+    controlled_->Release();
+    ASSERT_EQ(ready, std::future_status::ready);
+    for (auto& read : reads) ASSERT_TRUE(read.get()[0]);
+    EXPECT_EQ(std::string(before.data(), 16), "abcdefghijklmnop");
+    EXPECT_EQ(std::string(after.data(), 16), replacement);
+    EXPECT_EQ(controlled_->read_calls, 2U);
+}
+
+TEST_F(DfsSharedReadTest, FailedSourceIsSharedAndNextReadRetries) {
+    controlled_->fail_first = true;
+    std::array<char, 16> first{}, second{};
+    std::vector<std::future<std::vector<tl::expected<void, ErrorCode>>>> reads;
+    ReleaseSharedRead release{controlled_};
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend_->BatchRead({Request("a", 0, {{first.data(), 16}})});
+    }));
+    ASSERT_TRUE(controlled_->WaitUntilBlocked());
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend_->BatchRead({Request("a", 0, {{second.data(), 16}})});
+    }));
+    EXPECT_EQ(reads.back().wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    controlled_->Release();
+    for (auto& read : reads) {
+        const auto result = read.get();
+        ASSERT_FALSE(result[0]);
+        EXPECT_EQ(result[0].error(), ErrorCode::FILE_READ_FAIL);
+    }
+    EXPECT_EQ(controlled_->read_calls, 1U);
+    ASSERT_TRUE(
+        backend_->BatchRead({Request("a", 0, {{first.data(), 16}})})[0]);
+    EXPECT_EQ(controlled_->read_calls, 2U);
+}
+
+TEST_F(DfsSharedReadTest, UnknownIdentityAndAliasedScatterKeepDirectReads) {
+    std::array<char, 16> first{}, second{};
+    std::vector<std::future<std::vector<tl::expected<void, ErrorCode>>>> reads;
+    ReleaseSharedRead release{controlled_};
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend_->BatchRead({Request("a", 0, {{first.data(), 16}}, 0)});
+    }));
+    ASSERT_TRUE(controlled_->WaitUntilBlocked());
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend_->BatchRead({Request("a", 0, {{second.data(), 16}}, 0)});
+    }));
+    const auto ready = reads.back().wait_for(std::chrono::seconds(5));
+    controlled_->Release();
+    ASSERT_EQ(ready, std::future_status::ready);
+    for (auto& read : reads) ASSERT_TRUE(read.get()[0]);
+    EXPECT_EQ(controlled_->read_calls, 2U);
+
+    auto aliased = Request("a", 0, {{first.data(), 8}, {first.data(), 8}});
+    ASSERT_TRUE(backend_->BatchRead({aliased})[0]);
+    EXPECT_EQ(std::string(first.data(), 8), "ijklmnop");
+    EXPECT_EQ(controlled_->FirstReadBuffer(), first.data());
+    EXPECT_EQ(controlled_->read_calls, 3U);
+}
+
+TEST_F(DfsSharedReadTest, RangeConsumerStillChecksTruncatedWholeValue) {
+    std::array<char, 16> first{}, second{};
+    std::vector<std::future<std::vector<tl::expected<void, ErrorCode>>>> reads;
+    ReleaseSharedRead release{controlled_};
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend_->BatchRead({Request("a", 0, {{first.data(), 16}})});
+    }));
+    ASSERT_TRUE(controlled_->WaitUntilBlocked());
+    ASSERT_EQ(::truncate(ShardPath(0).c_str(), 8), 0);
+    auto window = Request("a", 0, {{second.data(), 4}});
+    window.range_read = true;
+    const auto result = backend_->BatchRead({window});
+    ASSERT_FALSE(result[0]);
+    EXPECT_EQ(result[0].error(), ErrorCode::FILE_READ_FAIL);
+    controlled_->Release();
+    EXPECT_TRUE(reads.front().get()[0]);
+    EXPECT_EQ(controlled_->read_calls, 1U);
 }
 
 class BlockingShardFsAdapter : public PosixFsAdapter {

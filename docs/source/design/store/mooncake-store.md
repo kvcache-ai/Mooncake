@@ -418,9 +418,11 @@ Limitations: This strategy only supports single-replica allocation (does not dis
 
 When a `PutStart` request fails due to insufficient memory, or when the eviction thread detects that space usage has reached the configured high watermark (90% by default, configurable via `-eviction_high_watermark_ratio`), an eviction task is triggered to free up space by evicting a portion of objects (5% by default, configurable via `-eviction_ratio`). Similar to `Remove`, evicted objects are simply marked as deleted, with no data transfer required.
 
-Currently, an approximate LRU policy is adopted, where the least recently used objects are preferred for eviction. To avoid data races and corruption, objects currently being read or written by clients should not be evicted. For this reason, objects that have leases or have not been marked as complete by `PutEnd` requests will be ignored by the eviction task.
+Memory eviction uses a sharded lease-bucket index (`LeaseEvictionIndex`); there is no index-selection switch. It partitions keys across cacheline-aligned shards using intrusive list hooks on each route slot, filing lease deadlines in 100 ms buckets so eviction visits the oldest expired buckets first without scanning the entire keyspace. Reads can extend the authoritative lease without eagerly updating the filed bucket. Every candidate is revalidated under its key lock; active leases and hard pins remain protected, and incomplete memory replicas are not eviction candidates.
 
-For grouped objects, memory eviction resolves the current group membership and attempts to reclaim eligible members together.
+Workers claim disjoint shard-bucket ranges in ascending deadline order and reclaim their own candidates rather than receiving per-key tasks from a central producer. The embedded `MasterServiceConfig::eviction_worker_threads` setting defaults to `0`: automatic sizing selects `ceil(filed keys / 16,000,000)` per namespace, clamped to 1–64. The count is recomputed before each namespace scan, and the pool is resized when it changes. Explicit values `1`–`64` override automatic sizing for testing or diagnostics. This is not a master command-line flag. Policies, reclaimers and observers must explicitly support concurrent callbacks. Otherwise, including for OpLog and offloading reclaimers, the same index is traversed serially, preserving the shared run report and budgets.
+
+For grouped objects, memory eviction resolves the current group membership and attempts to reclaim eligible members together. A target does not deliberately stop halfway through a group, but this is not an atomic all-or-nothing operation: busy, renewed or failed members may survive. Groups and already-in-flight work can exceed the requested target. Detached buffers are released outside key locks, and all workers finish before soft-pin fallback runs.
 
 ## Lease
 
@@ -440,6 +442,8 @@ The soft-pin lifetime starts when the first replica becomes readable. When its d
 
 Soft pin is runtime-only eviction-priority state. It is not persisted in snapshots or the HA OpLog, so recovery and Standby promotion downgrade restored objects to ordinary cache. Existing snapshot fields are retained only for format compatibility and ignored during recovery.
 
+An explicitly started drain job can move a soft-pinned object's replicas to other segments. The job copies the data to the destination before retiring the source replica. The object retains its soft pin and TTL throughout the move.
+
 There are three startup parameters in `master_service` related to the soft pin mechanism:
 
 - `default_kv_soft_pin_ttl`: The fixed soft-pin lifetime (in milliseconds) used when an `ENABLE` request omits `soft_pin_ttl_ms`. The default value is `30 minutes`; reads do not extend it.
@@ -453,11 +457,31 @@ overrides are rejected for `PRESERVE` and `DISABLE`.
 
 Notably, soft pinned objects can still be removed using APIs such as `Remove` or `RemoveAll`.
 
+### Updating soft pins through the master RPC
+
+`MasterClient::BatchUpdateSoftPin(keys, ttl_ms)` changes the soft-pin deadline
+of existing objects in the client's tenant without reading or rewriting their
+payloads. A positive TTL sets the deadline relative to the call; `ttl_ms = 0`
+unpins the objects. The TTL must not exceed `max_kv_soft_pin_ttl`.
+
+```cpp
+auto pinned = master_client.BatchUpdateSoftPin(keys, 60000);
+auto unpinned = master_client.BatchUpdateSoftPin(keys, 0);
+```
+
+Results follow input key order, and batches are not atomic. Missing objects,
+empty keys, and objects with unfinished writes return per-key errors. This RPC
+uses the existing runtime-only soft-pin behavior: it changes eviction priority,
+does not create session membership, and does not prevent explicit removal.
+Both the client and master must support `BatchUpdateSoftPin`.
+
 ## Hard Pin
 
 For objects that must never be evicted under any circumstances (e.g., model weights, critical metadata), Mooncake Store provides a hard pin mechanism. Unlike soft pin, hard-pinned objects are permanently protected from eviction — they will never be selected as eviction candidates regardless of memory pressure.
 
 Hard pin is set at object creation time through the `with_hard_pin` field in `ReplicateConfig` and cannot be changed afterward. Hard-pinned objects can only be removed explicitly via `Remove` (with force) or `RemoveAll`.
+
+An explicitly started drain job can move a hard-pinned object's replicas to other segments. The job copies the data to the destination before retiring the source replica. The object retains its hard pin throughout the move.
 
 Key differences from soft pin:
 

@@ -519,7 +519,14 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 
         struct curl_slist *headers = nullptr;
         headers = curl_slist_append(headers, "Content-Type: application/json");
-        headers = appendAuthHeader(headers);
+        // The JSON body is already buffered; send it without waiting for 100
+        // Continue.
+        auto *without_expect = curl_slist_append(headers, "Expect:");
+        if (!without_expect) {
+            curl_slist_free_all(headers);
+            return false;
+        }
+        headers = appendAuthHeader(without_expect);
         curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers);
 
         CURLcode rc = curl_easy_perform(h);
