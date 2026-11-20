@@ -421,15 +421,16 @@ class MasterService {
 
     /**
      * @brief Start a put operation for an object
-     * @param[out] replica_list Vector to store replica information for the
-     * slice
+     * @param[out] preferred_memory_segment Optional logical segment name of
+     * the last allocated memory replica, used for subsequent batch placement.
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if exists,
      *         ErrorCode::NO_AVAILABLE_HANDLE if allocation fails,
      *         ErrorCode::INVALID_PARAMS if slice size is invalid
      */
     auto PutStart(const UUID& client_id, const std::string& key,
                   const TenantId& tenant_id, const uint64_t slice_length,
-                  const ReplicateConfig& config)
+                  const ReplicateConfig& config,
+                  std::string* preferred_memory_segment = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
@@ -1480,7 +1481,8 @@ class MasterService {
                         const ResolvedSoftPinRequest& soft_pin_request,
                         std::vector<Replica>&& replicas,
                         std::optional<std::chrono::system_clock::time_point>
-                            committed_soft_pin_timeout = std::nullopt)
+                            committed_soft_pin_timeout = std::nullopt,
+                        std::string* preferred_memory_segment = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     // Helper: allocate replicas, publish the object under the key `accessor`
@@ -1495,7 +1497,8 @@ class MasterService {
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
             committed_soft_pin_timeout = std::nullopt,
-        bool* dfs_allocation_failed = nullptr)
+        bool* dfs_allocation_failed = nullptr,
+        std::string* preferred_memory_segment = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     // What PutStart and UpsertStart settle before they take the key.
