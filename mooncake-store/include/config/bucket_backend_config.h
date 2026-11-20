@@ -31,6 +31,11 @@ inline std::ostream& operator<<(std::ostream& os,
 }
 
 struct BucketBackendConfig {
+    int64_t read_io_workers = 0;
+    int64_t read_sub_batch_max_iovecs = 32;
+    int64_t write_io_workers = 0;
+    int64_t write_sub_batch_max_iovecs = 128;
+    int64_t write_io_backoff_ms = 300;
     int64_t bucket_size_limit =
         256LL * 1024 * 1024;  // Max total size of a single bucket (256 MB)
 
@@ -59,12 +64,10 @@ struct BucketBackendConfig {
     // actually triggers pod eviction. Set it to the real quota minus headroom.
     int64_t max_physical_bytes = 0;
 
-    // How long ActualDiskBytesUsedLocked() caches its directory-scan result
-    // (milliseconds). Bounds scan cost under a high offload rate; larger =
-    // cheaper but a staler physical bound (disk may momentarily exceed the cap
-    // by roughly one interval's worth of writes), smaller = tighter but scans
-    // more often. <=0 disables caching (scan every check). Only relevant when
-    // max_physical_bytes > 0.
+    // Delay between completed background disk-usage scans (milliseconds).
+    // Directory traversal never runs on an I/O worker or under metadata locks.
+    // Writes admitted during a scan are included in its published estimate.
+    // <=0 selects a 1 ms delay. Only used when max_physical_bytes > 0.
     int64_t disk_scan_cache_ms = 500;
 
     // Write the final partial bucket in the current offload cycle instead of

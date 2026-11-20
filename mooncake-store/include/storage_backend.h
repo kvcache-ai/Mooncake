@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -15,10 +16,12 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
 #include "ascii_string.h"
+#include "batch_io_scheduler.h"
 #include "common/sharded_map.h"
 #include "config/bucket_backend_config.h"
 #include "config/file_per_key_config.h"
@@ -29,6 +32,9 @@
 #include "types.h"
 
 namespace mooncake {
+namespace test {
+class BucketStorageBackendTestPeer;
+}
 struct FileRecord {
     std::string path;
     uint64_t size;
@@ -847,6 +853,34 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     ~BucketStorageBackend();
 
+    using OffloadObjects = std::unordered_map<std::string, std::vector<Slice>>;
+    using OffloadComplete = std::function<ErrorCode(
+        const std::vector<std::string>&, std::vector<StorageObjectMetadata>&)>;
+    using OffloadSource =
+        std::function<tl::expected<OffloadObjects, ErrorCode>()>;
+
+    // Memory-only preparation across all buckets. Payloads may be unresolved
+    // (null Slice pointers) when load_source supplies them at execution time.
+    // Callers retain callback/source owners until SubmitOffloadsAndWait
+    // returns.
+    class PendingOffloads {
+       public:
+        PendingOffloads();
+        ~PendingOffloads();
+        PendingOffloads(const PendingOffloads&) = delete;
+        PendingOffloads& operator=(const PendingOffloads&) = delete;
+
+       private:
+        friend class BucketStorageBackend;
+        struct State;
+        std::unique_ptr<State> state_;
+    };
+    bool HasWriteScheduler() const { return write_io_scheduler_ != nullptr; }
+    tl::expected<void, ErrorCode> PrepareOffload(
+        PendingOffloads&, OffloadObjects objects, OffloadComplete complete,
+        EvictionHandler eviction = nullptr, OffloadSource load_source = {});
+    tl::expected<void, ErrorCode> SubmitOffloadsAndWait(PendingOffloads&);
+
     /**
      * @brief Offload objects in batches
      * @param batch_object  A map from object key to a list of data slices to be
@@ -1137,6 +1171,17 @@ class BucketStorageBackend : public StorageBackendInterface {
         int disk_index = -1;
     };
 
+    tl::expected<void, ErrorCode> WaitForReadIdle() const;
+    struct WritePlan;
+    tl::expected<void, ErrorCode> InitializeWritePlan(WritePlan&);
+    tl::expected<void, ErrorCode> ExecuteWriteRange(WritePlan&, size_t, size_t);
+    tl::expected<void, ErrorCode> FinishWritePlan(
+        WritePlan&, tl::expected<void, ErrorCode>);
+    tl::expected<int64_t, ErrorCode> CommitOffloadedBucket(
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket,
+        std::vector<StorageObjectMetadata>& metadatas, PendingEviction& pending,
+        const OffloadComplete& complete_handler);
+
     /**
      * @brief Phase 1 of eviction: under exclusive lock, select and remove
      * oldest buckets (FIFO) on one disk until that disk's total_size +
@@ -1199,22 +1244,50 @@ class BucketStorageBackend : public StorageBackendInterface {
     SelectEvictionCandidate(int disk_index);
 
     /**
-     * @brief Actual on-disk bytes of one disk's offload directory, measured
-     *        by summing real file allocation (stat st_blocks * 512) over every
-     *        file under that disk's root.
+     * @brief Per-disk on-disk bytes as published by the background scanner
+     *        (DiskUsageScanLoop below), which owns all directory traversal.
      *
-     * This is ground truth — the same block-based accounting kubelet uses for
-     * emptyDir sizeLimit — so it captures bucket files that linger after their
-     * objects are logically evicted (which the in-memory total_size misses).
-     * max_physical_bytes is a per-disk cap: each root sits on its own device
-     * (or its own emptyDir quota), so scanning and capping them together would
-     * make one busy disk reject writes on an idle one.
-     * Result is cached for bucket_backend_config_.disk_scan_cache_ms to bound
-     * the scan cost regardless of offload rate. Caller must hold mutex_.
+     * Ground truth — the same block-based accounting kubelet uses for
+     * emptyDir sizeLimit — so it captures bucket files that linger after
+     * their objects are logically evicted (which the in-memory total_size
+     * misses). max_physical_bytes is a per-disk cap: each root sits on its
+     * own device (or its own emptyDir quota), so scanning and capping them
+     * together would make one busy disk reject writes on an idle one.
+     * Never performs filesystem I/O: a never-scanned or failed disk fails
+     * closed (reports the cap as reached) until the scanner republishes.
+     * Caller must hold mutex_.
      *
-     * @param disk_index The disk whose root is scanned.
+     * @param disk_index The disk whose snapshot is read.
      */
     int64_t ActualDiskBytesUsedLocked(int disk_index) const;
+    /**
+     * Global snapshot across every disk root, maintained by the background
+     * scanner below (PR #5020). Complements the per-disk overload: reads a
+     * snapshot including a conservative budget for writes admitted since that
+     * scan began. Never performs filesystem I/O. Caller must hold mutex_.
+     */
+    int64_t ActualDiskBytesUsedLocked() const;
+
+    void StartDiskUsageScanner();
+    void StopDiskUsageScanner();
+    void RequestDiskUsageScan();
+    void DiskUsageScanLoop();
+    tl::expected<std::vector<int64_t>, ErrorCode> ScanPhysicalDiskBytes()
+        const;
+
+    friend class test::BucketStorageBackendTestPeer;
+    // Scanner publication only holds mutex_ briefly; directory traversal never
+    // holds mutex_ or offload_publish_mutex_. A negative snapshot fails closed.
+    mutable int64_t cached_disk_bytes_ GUARDED_BY(mutex_) = -1;
+    uint64_t physical_write_bytes_ GUARDED_BY(mutex_) = 0;
+    uint64_t scanned_write_bytes_ GUARDED_BY(mutex_) = 0;
+    std::mutex disk_scan_mutex_;
+    std::condition_variable disk_scan_cv_;
+    std::thread disk_scan_thread_;
+    std::atomic<bool> disk_scan_stopping_{false};
+    bool disk_scan_requested_ = false;
+    bool disk_scan_ready_ = false;
+    std::function<void()> disk_scan_hook_for_test_;
 
     /**
      * @brief Phase 2 of eviction: delete persisted metadata for each evicted
@@ -1354,6 +1427,13 @@ class BucketStorageBackend : public StorageBackendInterface {
         mutex_) buckets_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
+    std::unique_ptr<BatchIoScheduler> read_io_scheduler_;
+    std::unique_ptr<BatchIoScheduler> write_io_scheduler_;
+    std::atomic<size_t> active_reads_{0};
+    std::atomic<bool> write_stopping_{false};
+    // Order local publication/master notification against eviction admission.
+    // Data sub batches never hold this mutex.
+    std::mutex offload_publish_mutex_;
 
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)

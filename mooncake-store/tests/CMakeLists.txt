@@ -675,3 +675,6 @@ target_include_directories(hf3fs_resource_manager_test BEFORE
 target_link_libraries(hf3fs_resource_manager_test PRIVATE gtest gtest_main
                                                           pthread)
 add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)
+add_store_test(batch_io_scheduler_test batch_io_scheduler_test.cpp)
+add_store_test(bucket_disk_usage_scanner_test
+               bucket_disk_usage_scanner_test.cpp)

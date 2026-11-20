@@ -8,11 +8,16 @@
 #include <sys/uio.h>
 #include <errno.h>
 #include <climits>
+#if defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
+#endif
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <future>
+#include <mutex>
+#include <utility>
 
 #include <array>
 #include <cctype>
@@ -1634,6 +1639,10 @@ BucketStorageBackend::BucketStorageBackend(
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
+    write_stopping_.store(true, std::memory_order_release);
+    StopDiskUsageScanner();
+    if (write_io_scheduler_) write_io_scheduler_->Shutdown();
+    if (read_io_scheduler_) read_io_scheduler_->Shutdown();
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
     ClearFileCache();
@@ -1677,6 +1686,319 @@ void BucketStorageBackend::ReleaseDiskOwnerLocks() {
     owner_lock_fds_.clear();
 }
 
+tl::expected<void, ErrorCode> BucketStorageBackend::WaitForReadIdle() const {
+    for (;;) {
+        if (write_stopping_.load(std::memory_order_acquire))
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        if (active_reads_.load(std::memory_order_acquire) == 0) return {};
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+            bucket_backend_config_.write_io_backoff_ms));
+    }
+}
+
+// Each plan owns its layout and file. Initialization is lazy, so preparing
+// an entire heartbeat never performs RPC, file I/O or payload staging.
+struct BucketStorageBackend::WritePlan {
+    WritePlan(BucketStorageBackend* owner, int64_t bucket_id)
+        : backend(owner), id(bucket_id) {}
+
+    // One plan, one immutable file identity; ranges never span plans.
+    BucketStorageBackend* const backend;
+    const int64_t id;
+    // Set once PrepareEviction places the bucket on a disk; every cleanup
+    // helper needs it (the per-disk signatures carried over from dev).
+    int disk_index = 0;
+    OffloadObjects objects;
+    std::shared_ptr<BucketMetadata> bucket;
+    std::vector<iovec> iovs;
+    std::vector<StorageObjectMetadata> metadatas;
+    std::vector<size_t> slice_ends;
+    std::vector<size_t> iov_ends;
+    OffloadSource load_source;
+    OffloadComplete complete;
+    EvictionHandler eviction;
+    std::once_flag initialized;
+    std::optional<ErrorCode> init_error;
+    std::optional<PendingEviction> pending;
+    bool eviction_committed = false;
+    bool committed = false;
+    bool file_created = false;
+    std::unique_ptr<StorageFile> file;
+
+    ~WritePlan() {
+        // Also handles exceptions and a published batch rejected at shutdown.
+        try {
+            file.reset();
+            if (pending) {
+                if (eviction_committed)
+                    backend->ReleasePreparedWrite(*pending);
+                else
+                    backend->RestorePreparedEviction(std::move(*pending));
+            }
+            if (file_created && !committed)
+                backend->CleanupOrphanedBucket(id, disk_index);
+        } catch (...) {
+            LOG(ERROR) << "Failed to clean offload plan " << id;
+        }
+    }
+};
+
+struct BucketStorageBackend::PendingOffloads::State {
+    BatchIoScheduler::PendingBatch batch;
+    std::optional<ErrorCode> error;
+    BucketStorageBackend* backend = nullptr;
+};
+BucketStorageBackend::PendingOffloads::PendingOffloads()
+    : state_(std::make_unique<State>()) {}
+BucketStorageBackend::PendingOffloads::~PendingOffloads() = default;
+
+tl::expected<void, ErrorCode> BucketStorageBackend::PrepareOffload(
+    PendingOffloads& pending, OffloadObjects objects, OffloadComplete complete,
+    EvictionHandler eviction, OffloadSource load_source) {
+    auto& state = *pending.state_;
+    if (state.error) return tl::make_unexpected(*state.error);
+    const auto fail = [&](ErrorCode error) -> tl::expected<void, ErrorCode> {
+        state.error = error;
+        return tl::make_unexpected(error);
+    };
+    if (!initialized_.load(std::memory_order_acquire) || !write_io_scheduler_ ||
+        (state.backend && state.backend != this)) {
+        return fail(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    state.backend = this;
+    if (objects.empty()) return fail(ErrorCode::INVALID_PARAMS);
+    try {
+        auto plan =
+            std::make_shared<WritePlan>(this, bucket_id_generator_->NextId());
+        plan->objects = std::move(objects);
+        plan->load_source = std::move(load_source);
+        plan->complete = std::move(complete);
+        plan->eviction = std::move(eviction);
+        size_t offset = 0;
+        for (const auto& [key, slices] : plan->objects) {
+            if (slices.empty()) return fail(ErrorCode::INVALID_PARAMS);
+            if (key.size() > std::numeric_limits<int64_t>::max() - offset)
+                return fail(ErrorCode::INVALID_PARAMS);
+            offset += key.size();
+            for (const auto& slice : slices) {
+                if (slice.size == 0 || (!slice.ptr && !plan->load_source) ||
+                    slice.size > std::numeric_limits<int64_t>::max() - offset)
+                    return fail(ErrorCode::INVALID_PARAMS);
+                offset += slice.size;
+                plan->slice_ends.push_back(offset);
+            }
+        }
+        auto built =
+            BuildBucket(plan->id, plan->objects, plan->iovs, plan->metadatas);
+        if (!built) return fail(built.error());
+        plan->bucket = std::move(built.value());
+        auto result = write_io_scheduler_->PrepareSubBatches(
+            state.batch, plan->slice_ends.size(),
+            bucket_backend_config_.write_sub_batch_max_iovecs,
+            [this, plan](size_t begin, size_t end) {
+                return ExecuteWriteRange(*plan, begin, end);
+            },
+            [this, plan](tl::expected<void, ErrorCode> result) {
+                return FinishWritePlan(*plan, result);
+            });
+        if (!result) return fail(result.error());
+        return {};
+    } catch (const std::bad_alloc&) {
+        return fail(ErrorCode::NO_AVAILABLE_HANDLE);
+    } catch (...) {
+        return fail(ErrorCode::INTERNAL_ERROR);
+    }
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::SubmitOffloadsAndWait(
+    PendingOffloads& pending) {
+    std::unique_ptr<PendingOffloads::State> replacement;
+    try {
+        replacement = std::make_unique<PendingOffloads::State>();
+    } catch (const std::bad_alloc&) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    auto state = std::exchange(pending.state_, std::move(replacement));
+    if (state->error) return tl::make_unexpected(*state->error);
+    if (!state->backend) return {};
+    if (state->backend != this || !write_io_scheduler_)
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    return write_io_scheduler_->SubmitAndWait(state->batch);
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::InitializeWritePlan(
+    WritePlan& plan) {
+    if (plan.load_source) {
+        auto loaded = plan.load_source();
+        if (!loaded) return tl::make_unexpected(loaded.error());
+        // Keep the original map nodes/order: key iovecs refer to these strings.
+        for (auto& [key, slices] : plan.objects) {
+            auto it = loaded->find(key);
+            if (it == loaded->end() || it->second.size() != slices.size())
+                return tl::make_unexpected(ErrorCode::INVALID_READ);
+            for (size_t i = 0; i < slices.size(); ++i) {
+                if (!it->second[i].ptr || it->second[i].size != slices[i].size)
+                    return tl::make_unexpected(ErrorCode::INVALID_READ);
+            }
+            slices = std::move(it->second);
+        }
+        plan.iovs.clear();
+        plan.metadatas.clear();
+        auto built =
+            BuildBucket(plan.id, plan.objects, plan.iovs, plan.metadatas);
+        if (!built) return tl::make_unexpected(built.error());
+        plan.bucket = std::move(built.value());
+    }
+    size_t end = 0;
+    for (const auto& iov : plan.iovs) {
+        end += iov.iov_len;
+        plan.iov_ends.push_back(end);
+    }
+    if (plan.slice_ends.empty() || end != plan.slice_ends.back() ||
+        end != static_cast<size_t>(plan.bucket->data_size)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto enabled = IsEnableOffloading();
+    if (!enabled) return tl::make_unexpected(enabled.error());
+    if (!*enabled) return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    std::unique_lock<std::mutex> publish_lock(offload_publish_mutex_);
+    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
+        // Keys-only fast fail: size quotas are enforced per disk inside
+        // PrepareEviction (dev moved the global total_size_/pending budget
+        // into per-disk accounting).
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        if (object_bucket_map_.size() + pending_write_keys_.size() +
+                plan.objects.size() >
+            static_cast<size_t>(file_storage_config_.total_keys_limit))
+            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    }
+    auto reserved = PrepareEviction(
+        plan.bucket->data_size + plan.bucket->meta_size, plan.bucket->keys);
+    if (!reserved) return tl::make_unexpected(reserved.error());
+    plan.pending = std::move(*reserved);
+    plan.disk_index = plan.pending->disk_index;
+    plan.bucket->disk_index = plan.disk_index;
+    if (plan.eviction && !plan.pending->keys.empty()) {
+        auto notified = plan.eviction(plan.pending->keys);
+        if (!notified) return notified;
+    }
+    CommitPreparedEviction(*plan.pending);
+    plan.eviction_committed = true;
+    publish_lock.unlock();
+    auto finalized = FinalizeEviction(*plan.pending);
+    if (!finalized)
+        LOG(WARNING) << "Offload eviction cleanup: " << finalized.error();
+    auto path = GetBucketDataPath(plan.id, plan.disk_index);
+    if (!path) return tl::make_unexpected(path.error());
+    // Existing OpenFile writes are buffered POSIX, even with use_uring set.
+    // Open/truncate once per bucket, never once per sub batch.
+    auto opened = OpenFile(*path, FileMode::Write);
+    if (!opened) return tl::make_unexpected(opened.error());
+    plan.file = std::move(*opened);
+    plan.file_created = true;
+    return {};
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::ExecuteWriteRange(
+    WritePlan& plan, size_t begin, size_t end) {
+    // Slice indices are local to this file, never to the shared work queue.
+    if (begin >= end || end > plan.slice_ends.size())
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    std::call_once(plan.initialized, [&] {
+        try {
+            auto result = InitializeWritePlan(plan);
+            if (!result) plan.init_error = result.error();
+        } catch (...) {
+            plan.init_error = ErrorCode::INTERNAL_ERROR;
+        }
+    });
+    if (plan.init_error) return tl::make_unexpected(*plan.init_error);
+    // Read-busy gates dequeue; an already claimed write runs to completion.
+    size_t offset = begin == 0 ? 0 : plan.slice_ends[begin - 1];
+    const size_t limit = plan.slice_ends[end - 1];
+    auto it =
+        std::upper_bound(plan.iov_ends.begin(), plan.iov_ends.end(), offset);
+    size_t index = std::distance(plan.iov_ends.begin(), it);
+    // _SC_IOV_MAX is constant per process; hoist the lookup and the iovec
+    // scratch buffer out of the per-chunk loop (this runs on worker threads
+    // per sub-batch, so the buffer stays invocation-local).
+    static const size_t iov_limit = [] {
+        const long system_limit = ::sysconf(_SC_IOV_MAX);
+        return system_limit > 0 ? static_cast<size_t>(system_limit) : 1024;
+    }();
+    std::vector<iovec> iovs;
+    while (offset < limit) {
+        iovs.clear();
+        size_t bytes = 0;
+        for (; index < plan.iovs.size() && iovs.size() < iov_limit; ++index) {
+            const size_t source_begin =
+                index == 0 ? 0 : plan.iov_ends[index - 1];
+            const size_t start = std::max(offset, source_begin);
+            const size_t finish = std::min(limit, plan.iov_ends[index]);
+            if (start >= finish) break;
+            iovs.push_back({static_cast<char*>(plan.iovs[index].iov_base) +
+                                start - source_begin,
+                            finish - start});
+            bytes += finish - start;
+            if (finish == limit) break;
+        }
+        if (iovs.empty()) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        auto written = plan.file->vector_write(
+            iovs.data(), static_cast<int>(iovs.size()), offset);
+        if (!written) return tl::make_unexpected(written.error());
+        if (*written != bytes)
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        offset += bytes;
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::FinishWritePlan(
+    WritePlan& plan, tl::expected<void, ErrorCode> result) {
+    // Called once, after every data callback has returned, outside queue locks.
+    try {
+        if (result) {
+            result = plan.file->datasync();
+            if (test_datasync_failure_.load(std::memory_order_relaxed))
+                result = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (result)
+            result = StoreBucketMetadata(plan.id, plan.bucket,
+                                         plan.disk_index);
+        if (result) {
+            auto committed =
+                CommitOffloadedBucket(plan.id, plan.bucket, plan.metadatas,
+                                      *plan.pending, plan.complete);
+            if (committed)
+                plan.committed = true;
+            else
+                result = tl::make_unexpected(committed.error());
+        }
+    } catch (...) {
+        result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (!result && plan.file_created) {
+        // Handles callback exceptions as well as ordinary write failures.
+        RollbackCommittedBucket(plan.id, plan.bucket->keys, plan.disk_index);
+    }
+    plan.file.reset();
+    if (plan.pending) {
+        if (plan.eviction_committed)
+            ReleasePreparedWrite(*plan.pending);
+        else
+            RestorePreparedEviction(std::move(*plan.pending));
+        plan.pending.reset();
+    }
+    if (!plan.committed && plan.file_created)
+        CleanupOrphanedBucket(plan.id, plan.disk_index);
+    plan.file_created = false;
+    // Source loader owns device staging. Release it at this bucket's terminal
+    // state, not after the slowest bucket of the heartbeat finishes.
+    plan.load_source = {};
+    return result;
+}
+
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
@@ -1693,6 +2015,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
     }
 
+    auto ready = WaitForReadIdle();
+    if (!ready) return tl::make_unexpected(ready.error());
     auto enable_offloading_res = IsEnableOffloading();
     if (!enable_offloading_res) {
         return tl::make_unexpected(enable_offloading_res.error());
@@ -1723,6 +2047,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         }
     }
     const int64_t required_size = file_bytes + bucket->meta_size;
+    std::unique_lock<std::mutex> publish_lock(offload_publish_mutex_);
     auto prepare_result = PrepareEviction(required_size, bucket->keys);
     if (!prepare_result) {
         return tl::make_unexpected(prepare_result.error());
@@ -1740,6 +2065,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         }
     }
     CommitPreparedEviction(pending);
+    publish_lock.unlock();
 
     // Phase 2: delete evicted files NOW, before writing the new bucket, so
     // that the freed disk space is available for the incoming write.
@@ -1758,6 +2084,18 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         return tl::make_unexpected(write_bucket_result.error());
     }
     VLOG(1) << "Written bucket with id: " << bucket_id;
+    return CommitOffloadedBucket(bucket_id, std::move(bucket), metadatas,
+                                 pending, complete_handler);
+}
+
+tl::expected<int64_t, ErrorCode> BucketStorageBackend::CommitOffloadedBucket(
+    int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket,
+    std::vector<StorageObjectMetadata>& metadatas, PendingEviction& pending,
+    const OffloadComplete& complete_handler) {
+    std::lock_guard<std::mutex> publish_lock(offload_publish_mutex_);
+    // dev's commit bookkeeping is per disk; the plan/bucket was placed by
+    // PrepareEviction, which records the disk here.
+    const int disk_index = pending.disk_index;
     // Save a copy of bucket->keys before std::move(bucket) into buckets_
     // consumes the shared_ptr. Needed for complete_handler and rollback.
     const auto bucket_keys = bucket->keys;
@@ -1775,6 +2113,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         SharedMutexLocker lock(&mutex_);
 
         ReleasePreparedWriteLocked(pending);
+        pending.write_size = 0;
+        pending.write_keys.clear();
 
         // Duplicate safety net under mutex_: skip keys that PrepareEviction
         // flagged as already persisted or in flight, plus anything that got
@@ -1898,6 +2238,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadSpans(
 tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
     std::unordered_map<std::string, StorageValueSpan>& spans,
     bool require_exact_size) {
+    // Foreground reads take priority over background offload writes: the
+    // scheduler pauses write admission while a read is in flight, so the
+    // counter must cover every read path, not just the whole-object one.
+    struct ReadActivity {
+        std::atomic<size_t>& count;
+        explicit ReadActivity(std::atomic<size_t>& c) : count(c) { ++count; }
+        ~ReadActivity() { --count; }
+    } activity(active_reads_);
     // Step 1: Build read plan by copying metadata under lock
     // BucketReadGuard increments inflight_reads_ to prevent deletion during IO.
     // When the guard goes out of scope, it decrements the counter.
@@ -1910,6 +2258,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
         int64_t value_offset;
         Slice dest_slice;
         int disk_index;
+        StorageValueSpan* destination;
     };
 
     // Group by bucket for efficient file access
@@ -1919,7 +2268,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
 
     {
         SharedMutexLocker lock(&mutex_, shared_lock);
-        for (const auto& [key, span] : spans) {
+        for (auto& [key, span] : spans) {
             const Slice& dest_slice = span.slice;
             // Lookup key -> metadata
             auto object_it = object_bucket_map_.find(key);
@@ -1986,7 +2335,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
             bucket_read_plans[metadata.bucket_id].push_back(
                 ReadPlan{key, metadata.bucket_id, metadata.offset,
                          metadata.key_size, metadata.data_size, value_offset,
-                         dest_slice, bucket_it->second->disk_index});
+                         dest_slice, bucket_it->second->disk_index, &span});
         }
     }
     // Lock released here - bucket files protected by BucketReadGuards
@@ -1994,7 +2343,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
     // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
 
     // Step 2: Perform IO without holding any locks
-    for (auto& [bucket_id, read_plans] : bucket_read_plans) {
+    const auto read_bucket = [this](int64_t bucket_id,
+                                    std::span<const ReadPlan> read_plans)
+        -> tl::expected<void, ErrorCode> {
         // Open file for this bucket (cheap syscall, no lock needed).
         // Every plan in a bucket came from that bucket's metadata, so they all
         // carry the same disk. The vector is never empty: entries are only
@@ -2086,11 +2437,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                         << "), got: " << desc.bytes_read;
                     return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
-                spans.at(plan.key).slice.ptr =
+                plan.destination->slice.ptr =
                     static_cast<char*>(plan.dest_slice.ptr) +
                     batch_plan.offset_in_buffer;
             }
-            continue;
+            return {};
         }
 #endif
 
@@ -2114,9 +2465,37 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
         }
-    }
+        return {};
+    };
 
-    // bucket_guards go out of scope here, decrementing inflight_reads_
+    if (read_io_scheduler_) {
+        BatchIoScheduler::PendingBatch pending;
+        const size_t max_iovecs =
+            bucket_backend_config_.read_sub_batch_max_iovecs;
+        for (const auto& [bucket_id, read_plans] : bucket_read_plans) {
+            auto plans = std::span<const ReadPlan>(read_plans);
+            while (!plans.empty()) {
+                // Prepare each chunk separately to keep the read cap strict.
+                const auto chunk =
+                    plans.first(std::min(plans.size(), max_iovecs));
+                auto prepared = read_io_scheduler_->PrepareSubBatches(
+                    pending, chunk.size(), max_iovecs,
+                    [&read_bucket, bucket_id, chunk](size_t begin, size_t end) {
+                        return read_bucket(bucket_id,
+                                           chunk.subspan(begin, end - begin));
+                    });
+                if (!prepared) return prepared;
+                plans = plans.subspan(chunk.size());
+            }
+        }
+        // Publish the entire request together. Keep the bucket guards and
+        // destination spans alive until every running task has finished.
+        return read_io_scheduler_->SubmitAndWait(pending);
+    }
+    for (const auto& [bucket_id, read_plans] : bucket_read_plans) {
+        auto result = read_bucket(bucket_id, read_plans);
+        if (!result) return result;
+    }
     return {};
 }
 
@@ -2552,6 +2931,30 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             LOG(INFO) << "Initialized BucketIdGenerator from existing state. "
                       << "Last used bucket ID was " << max_bucket_id;
         }
+        if (bucket_backend_config_.read_io_workers > 0) {
+            auto reader = BatchIoScheduler::Create(
+                bucket_backend_config_.read_io_workers, {},
+                std::chrono::milliseconds{300}, "mc-ssd-r");
+            if (!reader) return tl::make_unexpected(reader.error());
+            read_io_scheduler_ = std::move(reader.value());
+        }
+        if (bucket_backend_config_.write_io_workers > 0) {
+            auto writer = BatchIoScheduler::Create(
+                bucket_backend_config_.write_io_workers,
+                [this] {
+                    return active_reads_.load(std::memory_order_acquire) == 0;
+                },
+                std::chrono::milliseconds(
+                    bucket_backend_config_.write_io_backoff_ms),
+                "mc-ssd-w");
+            if (!writer) return tl::make_unexpected(writer.error());
+            write_io_scheduler_ = std::move(writer.value());
+        }
+        // Startup recovery above owns the metadata lock. Release it before
+        // waiting for the scanner's first snapshot; the scanner publishes
+        // under the same lock. No foreground I/O is admitted until Init ends.
+        lock.unlock();
+        StartDiskUsageScanner();
         initialized_.store(true, std::memory_order_release);
     } catch (const std::exception& e) {
         LOG(ERROR) << "Bucket storage backend initialize error: " << e.what()
@@ -3444,6 +3847,15 @@ BucketStorageBackend::SelectEvictionCandidate(int disk_index) {
     }
 }
 
+namespace {
+int64_t AddPhysicalUsageBudget(int64_t bytes, uint64_t extra) {
+    const auto remaining =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - bytes);
+    return extra > remaining ? std::numeric_limits<int64_t>::max()
+                             : bytes + static_cast<int64_t>(extra);
+}
+}  // namespace
+
 tl::expected<int, ErrorCode> BucketStorageBackend::SelectDiskForWrite(
     int64_t required_size) {
     // Must be called with mutex_ held (exclusive).
@@ -3478,53 +3890,198 @@ tl::expected<int, ErrorCode> BucketStorageBackend::SelectDiskForWrite(
 }
 
 int64_t BucketStorageBackend::ActualDiskBytesUsedLocked(int disk_index) const {
-    namespace fs = std::filesystem;
-    auto& disk = disks_[disk_index];
-    const std::string& disk_path = disk_paths_[disk_index];
-    auto now = std::chrono::steady_clock::now();
-    if (disk.cached_disk_bytes >= 0 &&
-        now - disk.cached_disk_bytes_at <
-            std::chrono::milliseconds(
-                bucket_backend_config_.disk_scan_cache_ms)) {
-        return disk.cached_disk_bytes;
-    }
-    int64_t total = 0;
-    std::error_code ec;
-    // Physical usage includes the whole subtree (du/kubelet accounting), even
-    // though recovery and eviction only manage buckets in this directory.
-    fs::recursive_directory_iterator it(disk_path, ec), end;
-    if (ec) {
-        // Cannot even open the disk root. This is a hard safety cap, so fail
-        // CLOSED: report the cap as reached so eviction/rejection engages
-        // instead of letting the disk overflow, and do NOT cache the result
-        // (next call re-scans once the directory is readable again).
-        LOG(WARNING) << "[Bucket] physcap disk scan could not open "
-                     << disk_path << ": " << ec.message() << ", failing closed";
+    // The background scanner owns all directory traversal (orthogonal to the
+    // multi-disk layout). This reads its latest per-disk snapshot: writes
+    // admitted since that snapshot are budgeted via pending_write_size, and a
+    // never-scanned or failed disk fails CLOSED (reports the cap as reached,
+    // so eviction/rejection engages) until the scanner republishes.
+    const auto& disk = disks_[disk_index];
+    if (disk.cached_disk_bytes < 0) {
         return bucket_backend_config_.max_physical_bytes;
     }
-    for (; it != end; it.increment(ec)) {
-        if (ec) {
-            // Iteration errored partway. Returning the partial total would
-            // under-count and silently open the cap; fail closed and skip
-            // caching so the next call re-scans.
-            LOG(WARNING) << "[Bucket] physcap disk scan error under "
-                         << disk_path << ": " << ec.message()
-                         << ", failing closed";
-            return bucket_backend_config_.max_physical_bytes;
+    return AddPhysicalUsageBudget(disk.cached_disk_bytes,
+                                  static_cast<uint64_t>(
+                                      disk.pending_write_size));
+}
+
+int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
+    if (cached_disk_bytes_ < 0)
+        return bucket_backend_config_.max_physical_bytes;
+    return AddPhysicalUsageBudget(cached_disk_bytes_,
+                                  physical_write_bytes_ - scanned_write_bytes_);
+}
+
+void BucketStorageBackend::StartDiskUsageScanner() {
+    if (bucket_backend_config_.max_physical_bytes <= 0) return;
+    disk_scan_thread_ =
+        std::thread(&BucketStorageBackend::DiskUsageScanLoop, this);
+    // Seed the capacity check before accepting the first write. Only startup
+    // waits; foreground readers/writers never wait for a directory traversal.
+    std::unique_lock<std::mutex> lock(disk_scan_mutex_);
+    disk_scan_cv_.wait(lock, [this] { return disk_scan_ready_; });
+}
+
+void BucketStorageBackend::StopDiskUsageScanner() {
+    disk_scan_stopping_.store(true, std::memory_order_release);
+    disk_scan_cv_.notify_all();
+    if (disk_scan_thread_.joinable()) disk_scan_thread_.join();
+}
+
+void BucketStorageBackend::RequestDiskUsageScan() {
+    if (bucket_backend_config_.max_physical_bytes <= 0) return;
+    {
+        std::lock_guard<std::mutex> lock(disk_scan_mutex_);
+        disk_scan_requested_ = true;
+    }
+    disk_scan_cv_.notify_all();
+}
+
+void BucketStorageBackend::DiskUsageScanLoop() {
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "mc-ssd-scan");
+#elif defined(__APPLE__)
+    pthread_setname_np("mc-ssd-scan");
+#endif
+    LOG(INFO) << "Background disk usage scanner started: name=mc-ssd-scan";
+    const auto interval = std::chrono::milliseconds(
+        std::max<int64_t>(1, bucket_backend_config_.disk_scan_cache_ms));
+    std::unique_lock<std::mutex> scan_lock(disk_scan_mutex_);
+    while (!disk_scan_stopping_.load(std::memory_order_acquire)) {
+        disk_scan_requested_ = false;
+        auto hook = disk_scan_hook_for_test_;
+        scan_lock.unlock();
+        uint64_t write_start = 0;
+        uint64_t pending_start = 0;
+        std::vector<uint64_t> per_disk_pending;
+        tl::expected<std::vector<int64_t>, ErrorCode> scanned =
+            tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        try {
+            {
+                SharedMutexLocker lock(&mutex_, shared_lock);
+                write_start = physical_write_bytes_;
+                // Reservations already in flight may not have allocated their
+                // files yet. Include them even if the scan misses those files.
+                // Two files per bucket can each consume a final partial block;
+                // using the key count is a conservative bucket-count bound.
+                pending_start =
+                    pending_write_keys_.size() * 2 * kDirectIOAlignment;
+                // Per-disk in-flight write bytes, matched to disk_paths_ by
+                // position for the per-disk snapshot budget below. The global
+                // budget above sums the same values (dev has no global
+                // pending_write_size_ counter).
+                per_disk_pending.reserve(disks_.size());
+                for (const auto& disk : disks_) {
+                    per_disk_pending.push_back(
+                        static_cast<uint64_t>(disk.pending_write_size));
+                    pending_start += static_cast<uint64_t>(
+                        disk.pending_write_size);
+                }
+            }
+            if (hook) hook();
+            scanned = ScanPhysicalDiskBytes();
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Background disk usage scan failed: " << e.what();
+        } catch (...) {
+            LOG(WARNING) << "Background disk usage scan failed";
         }
-        struct stat st;
-        // st_blocks counts 512-byte blocks actually allocated on disk — the
-        // same basis as du / kubelet's emptyDir accounting (handles block
-        // rounding; ignores apparent size). A per-entry stat failure (e.g. a
-        // file concurrently deleted during eviction) is skipped best-effort:
-        // that only under-counts by ~one file and avoids spurious fail-closed.
-        if (::stat(it->path().c_str(), &st) == 0) {
-            total += static_cast<int64_t>(st.st_blocks) * 512;
+        if (!disk_scan_stopping_.load(std::memory_order_acquire)) {
+            SharedMutexLocker lock(&mutex_);
+            if (scanned) {
+                // Publish the per-disk snapshots the synchronous readers
+                // consume, then derive the global total from them so both
+                // views come from one scan pass.
+                int64_t total = 0;
+                for (size_t index = 0; index < disks_.size(); ++index) {
+                    int64_t published =
+                        index < scanned->size()
+                            ? AddPhysicalUsageBudget((*scanned)[index],
+                                                     per_disk_pending[index])
+                            : -1;
+                    disks_[index].cached_disk_bytes = published;
+                    disks_[index].cached_disk_bytes_at =
+                        std::chrono::steady_clock::now();
+                    if (published >= 0) {
+                        total = AddPhysicalUsageBudget(total,
+                                                       static_cast<uint64_t>(
+                                                           published));
+                    } else {
+                        // One unreadable disk fails the whole view closed.
+                        total = -1;
+                        break;
+                    }
+                }
+                cached_disk_bytes_ = total < 0
+                                         ? -1
+                                         : AddPhysicalUsageBudget(
+                                               total, pending_start);
+                scanned_write_bytes_ = write_start;
+            } else {
+                // A failed pass cannot be trusted for any view: fail the
+                // global total AND every per-disk snapshot closed (single-
+                // disk included), so eviction/rejection engages until the
+                // next pass republishes.
+                cached_disk_bytes_ = -1;
+                for (auto& disk : disks_) {
+                    disk.cached_disk_bytes = -1;
+                }
+            }
+        }
+        scan_lock.lock();
+        disk_scan_ready_ = true;
+        disk_scan_cv_.notify_all();
+        // The interval starts AFTER completion, including slow scans. An
+        // invalidation during a scan requests another pass without losing it.
+        disk_scan_cv_.wait_for(scan_lock, interval, [this] {
+            return disk_scan_stopping_.load(std::memory_order_acquire) ||
+                   disk_scan_requested_;
+        });
+    }
+}
+
+tl::expected<std::vector<int64_t>, ErrorCode>
+BucketStorageBackend::ScanPhysicalDiskBytes() const {
+    namespace fs = std::filesystem;
+    // One entry per disk root: each root is scanned and accounted on its own,
+    // matching the per-disk physical caps that eviction enforces.
+    std::vector<int64_t> per_disk(disk_paths_.size(), 0);
+    for (size_t index = 0; index < disk_paths_.size(); ++index) {
+        const std::string& disk_path = disk_paths_[index];
+        std::error_code ec;
+        // Physical usage includes the whole subtree (du/kubelet accounting),
+        // even though recovery and eviction only manage buckets in this
+        // directory.
+        fs::recursive_directory_iterator it(disk_path, ec), end;
+        if (ec) {
+            LOG(WARNING)
+                << "[Bucket] background physical-usage scan could not open "
+                << disk_path << ": " << ec.message();
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        while (it != end) {
+            if (disk_scan_stopping_.load(std::memory_order_acquire))
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            struct stat st;
+            if (::stat(it->path().c_str(), &st) == 0) {
+                per_disk[index] = AddPhysicalUsageBudget(
+                    per_disk[index],
+                    static_cast<uint64_t>(st.st_blocks) * 512);
+            } else if (errno != ENOENT) {
+                LOG(WARNING) << "[Bucket] background physical-usage stat "
+                                "failed: "
+                             << it->path() << ": " << strerror(errno);
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            it.increment(ec);
+            if (ec) {
+                LOG(WARNING) << "[Bucket] background physical-usage scan "
+                                "failed: "
+                             << disk_path << ": " << ec.message();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
         }
     }
-    disk.cached_disk_bytes = total;
-    disk.cached_disk_bytes_at = now;
-    return total;
+    return per_disk;
 }
 
 tl::expected<BucketStorageBackend::PendingEviction, ErrorCode>
@@ -3635,7 +4192,9 @@ BucketStorageBackend::PrepareEviction(
     // physical check below so we free enough room for THIS write, not merely
     // enough to bring current usage back under the cap.
     const int64_t incoming_physical_size =
-        write_keys.empty() ? 0 : required_size;
+        write_keys.empty()
+            ? 0
+            : AddPhysicalUsageBudget(required_size, 2 * kDirectIOAlignment);
 
     // Ground-truth physical usage of the offload directory (cached),
     // snapshotted once. As buckets are selected for eviction their files get
@@ -3651,10 +4210,13 @@ BucketStorageBackend::PrepareEviction(
     // physical cap. Shared by the in-loop "keep evicting" test and the
     // post-loop "reject the write" test.
     const auto phys_over_cap = [&](uint64_t freed) {
+        const uint64_t projected = static_cast<uint64_t>(AddPhysicalUsageBudget(
+            physical_used_start, incoming_physical_size));
         return bucket_backend_config_.max_physical_bytes > 0 &&
-               physical_used_start + incoming_physical_size -
-                       static_cast<int64_t>(freed) >
-                   bucket_backend_config_.max_physical_bytes;
+               projected > freed &&
+               projected - freed >
+                   static_cast<uint64_t>(
+                       bucket_backend_config_.max_physical_bytes);
     };
 
     const int64_t quota_limit = disk.max_total_size;
@@ -3745,6 +4307,12 @@ BucketStorageBackend::PrepareEviction(
                   << " total_after=" << disk.total_size;
     }
 
+    if (result.write_size > 0) {
+        // Monotonic admission accounting: scans add all reservations admitted
+        // after their start, even when a file was not seen by the iterator.
+        physical_write_bytes_ +=
+            static_cast<uint64_t>(result.write_size) + 2 * kDirectIOAlignment;
+    }
     return result;
 }
 
@@ -3926,14 +4494,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
     if (!pending.buckets.empty()) {
         LOG(INFO) << "[Evict] finalized: attempted=" << pending.buckets.size()
                   << " cleanup_failed=" << cleanup_failed_count;
-        // Files were just deleted; force the next physical-usage query to
-        // rescan rather than return the now-stale (higher) cached value.
+        // Files were just deleted; drop the affected per-disk snapshots so
+        // reads fail closed (cap treated as reached) until the background
+        // scanner — never an I/O thread — walks the directory again.
         {
             SharedMutexLocker lock(&mutex_);
             for (const auto& [bucket_id, bucket_meta] : pending.buckets) {
                 disks_[bucket_meta->disk_index].cached_disk_bytes = -1;
             }
         }
+        RequestDiskUsageScan();
     }
     if (cleanup_failed_count != 0) {
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
@@ -3986,6 +4556,9 @@ BucketStorageBackend::EvictAboveDiskWatermark(
         const auto target_total_size =
             static_cast<int64_t>(max_total_size * low_watermark_ratio);
         const auto synthetic_required_size = max_total_size - target_total_size;
+        // Serialize the reservation-to-commit window against concurrent
+        // offload publishes; file deletion (FinalizeEviction) stays outside.
+        std::unique_lock<std::mutex> publish_lock(offload_publish_mutex_);
         auto prepare_result =
             PrepareEviction(synthetic_required_size, /*write_keys=*/{},
                             /*disk_hint=*/static_cast<int>(index));
@@ -4004,6 +4577,7 @@ BucketStorageBackend::EvictAboveDiskWatermark(
             }
         }
         CommitPreparedEviction(pending);
+        publish_lock.unlock();
         auto finalize_result = FinalizeEviction(pending);
         if (!finalize_result) {
             LOG(ERROR)
