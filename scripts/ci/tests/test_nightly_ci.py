@@ -160,7 +160,15 @@ class NightlyCITest(unittest.TestCase):
             "free": "exit 0",
             "df": "exit 0",
             "vmstat": "exec sleep 30",
-            "docker": 'printf "%s\\n" "$@" > "$DOCKER_ARGS_FILE"\nexit "$DOCKER_EXIT_CODE"',
+            "numfmt": "echo 21474836480",
+            "docker": """\
+if [ "$1" = info ]; then
+    echo /docker-data
+    exit 0
+fi
+printf '%s\\n' "$BUILDX_BUILDER" "$@" > "$DOCKER_ARGS_FILE"
+exit "$DOCKER_EXIT_CODE"
+""",
         }
         for name, body in stubs.items():
             stub = bin_directory / name
@@ -173,15 +181,21 @@ class NightlyCITest(unittest.TestCase):
                     "build-docker",
                     "Build Docker image",
                     PATH=f"{bin_directory}:{os.environ['PATH']}",
+                    BUILDX_BUILDER="nightly-builder",
+                    CLEAN_BUILD_ARTIFACTS="1",
+                    CLEAN_BUILD_CACHE="1",
+                    BUILD_CACHE_MIN_FREE_GIB="20",
                     DOCKER_ARGS_FILE=str(arguments),
                     DOCKER_EXIT_CODE=str(code),
                 )
                 self.assertEqual(result.returncode, code, result.stderr)
                 args = arguments.read_text().splitlines()
-                self.assertEqual(args[:2], ["buildx", "build"])
+                self.assertEqual(args[:3], ["nightly-builder", "buildx", "build"])
                 self.assertIn("--output=type=cacheonly", args)
                 self.assertIn("--progress=plain", args)
                 self.assertIn("BUILD_JOBS=2", args)
+                self.assertIn("ENABLE_DEBUG_SYMBOLS=OFF", args)
+                self.assertIn("CLEAN_BUILD_ARTIFACTS", args)
 
 
 if __name__ == "__main__":
