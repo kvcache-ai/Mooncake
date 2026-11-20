@@ -281,6 +281,38 @@ Set `MC_STORE_CLIENT_METRIC=0` to disable client metric collection. If the
 client HTTP server remains enabled while metrics are disabled, `/metrics` and
 `/metrics/summary` return HTTP 503 with `metrics not available`.
 
+### Batch read item outcomes
+
+`mooncake_transfer_read_item_count{op_name,outcome}` counts the final
+per-item results returned by the Classic Store's `batch_get_into` and
+`batch_get_into_multi_buffers` APIs, including the dummy client's
+`batch_get_into_cuda_ipc` path. When the dummy client selects the CUDA IPC
+path, its results are attributed only to that path, not also to
+`batch_get_into`. Sum across the three operation names for the overall item
+rate. The same counts appear in the client summary
+when observed, including periodic dummy-client summaries. The bounded outcome
+labels are:
+
+- `success`: a nonnegative native byte receipt. A destination with excess
+  capacity is still a successful object read.
+- `not_found`: the returned error is `OBJECT_NOT_FOUND`.
+- `error`: any other negative result, including staging-copy failures on the
+  dummy client.
+
+Count each input position represented in the returned vector, including
+duplicates. Batch validation errors returned as per-item results by the native
+client are counted as errors. Empty batches do not contribute. These counts are
+independent of operation counts/latency, metadata queries, and TE task outcomes.
+They do not say whether the bytes returned are sufficient for an application
+page layout; callers still interpret the actual receipt.
+
+For example, the rate of missing objects versus other read errors is:
+
+```promql
+sum by (op_name, outcome) (
+  rate(mooncake_transfer_read_item_count{outcome!="success"}[5m])
+)
+```
 
 ### Master heartbeat observations
 
