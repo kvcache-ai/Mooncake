@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <string>
 #include <atomic>
@@ -33,6 +34,7 @@
 
 #include "mooncake_te_build_config.h"
 #include "common/base/status.h"
+#include "config.h"
 #include "transfer_metadata.h"
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
 #include "adaptive_congestion_control.h"
@@ -42,6 +44,7 @@
 namespace mooncake {
 
 class RdmaEndPoint;
+class TransferEngineImplTestPeer;
 class TransferMetadata;
 /// By default, these functions return 0 (or non-null pointer) on success and
 /// return -1 (or null pointer) on failure. The errno is set accordingly on
@@ -49,6 +52,7 @@ class TransferMetadata;
 class Transport {
     friend class TransferEngine;
     friend class TransferEngineImpl;
+    friend class TransferEngineImplTestPeer;
     friend class MultiTransport;
 
    public:
@@ -784,6 +788,13 @@ class Transport {
 
     std::shared_ptr<TransferMetadata> &meta() { return metadata_; }
 
+    // Engine override of MC_RDMA_NIC_SELECTION / MC_EFA_NIC_SELECTION, set by
+    // MultiTransport before install(); unset follows the variables. Only the
+    // RDMA and EFA transports read it.
+    void setNicSelection(std::optional<NicSelection> selection) {
+        nic_selection_ = selection;
+    }
+
     struct BufferEntry {
         void *addr;
         size_t length;
@@ -801,6 +812,8 @@ class Transport {
 
     std::string local_server_name_;
     std::shared_ptr<TransferMetadata> metadata_;
+    // See setNicSelection().
+    std::optional<NicSelection> nic_selection_;
 
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;

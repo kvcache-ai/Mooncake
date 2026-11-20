@@ -1437,7 +1437,12 @@ int EfaTransport::initializeEfaResources() {
                   << hca_list.size() << " listed)";
     }
 
-    if (globalConfig().efa_nic_selection == EfaNicSelection::LOCAL) {
+    const NicSelection nic_selection = nicSelection();
+    LOG(INFO) << "EfaTransport: efa_nic_selection = "
+              << (nic_selection == NicSelection::LOCAL ? "local" : "all")
+              << (nic_selection_ ? " (engine override)"
+                                 : " (MC_EFA_NIC_SELECTION)");
+    if (nic_selection == NicSelection::LOCAL) {
         std::vector<std::string> context_names;
         context_names.reserve(context_list_.size());
         for (auto& context : context_list_)
@@ -1454,7 +1459,7 @@ int EfaTransport::initializeEfaResources() {
                       << nic_list << "]";
         }
         if (local_nic_map_.empty()) {
-            LOG(WARNING) << "EfaTransport: MC_EFA_NIC_SELECTION=local but the "
+            LOG(WARNING) << "EfaTransport: efa_nic_selection = local but the "
                             "topology reports no per-location preferred NICs; "
                             "every buffer will use all NICs as before";
         }
@@ -1463,6 +1468,10 @@ int EfaTransport::initializeEfaResources() {
     clampMaxMrSize(efa_devices[0]);
 
     return 0;
+}
+
+NicSelection EfaTransport::nicSelection() const {
+    return nic_selection_.value_or(globalConfig().efa_nic_selection);
 }
 
 int EfaTransport::startHandshakeDaemon(std::string& local_server_name) {

@@ -32,6 +32,10 @@ namespace mooncake {
 
 class RdmaTransportTestPeer {
    public:
+    static NicSelection nicSelection(const RdmaTransport &transport) {
+        return transport.nicSelection();
+    }
+
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
     static void recordCongestionMode(RdmaTransport &transport,
                                      adaptive_congestion_control::Mode mode) {

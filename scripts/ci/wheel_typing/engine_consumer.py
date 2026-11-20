@@ -27,6 +27,7 @@ optional_engine: TransferEngine | None = None
 
 
 def exercise_transfer_engine(engine: TransferEngine) -> None:
+    assert_type(engine.set_nic_selection("local"), None)
     assert_type(engine.initialize("127.0.0.1", "P2PHANDSHAKE", "tcp", ""), int)
     assert_type(engine.get_rpc_port(), int)
 

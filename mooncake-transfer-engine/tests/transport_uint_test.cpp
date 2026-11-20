@@ -105,6 +105,21 @@ class TransferEngineImplTestPeer {
         return engine.auto_discover_config_;
     }
 
+    static std::optional<NicSelection> nicSelection(
+        const TransferEngineImpl& engine) {
+        return engine.nic_selection_;
+    }
+
+    static std::optional<NicSelection> installedNicSelection(
+        const TransferEngineImpl& engine) {
+        return engine.multi_transports_->nic_selection_;
+    }
+
+    static std::optional<NicSelection> transportNicSelection(
+        const Transport& transport) {
+        return transport.nic_selection_;
+    }
+
     static std::string autoDiscoverTransport(const TransferEngineImpl& engine) {
         return engine.autoDiscoverTransport();
     }
@@ -324,7 +339,51 @@ TEST(TransferEngineTentCompatibilityTest,
     EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
 }
 
+// TENT has no classic RDMA or EFA transport to apply it to; the call is
+// ignored before and after init(). Kept after the TENT tests above: a TENT
+// init() here changes what a later discovery in this process returns.
+TEST(TransferEngineTentCompatibilityTest, NicSelectionIsIgnored) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    TransferEngine engine(false);
+    ASSERT_TRUE(engine.isUsingTent());
+    engine.setNicSelection(NicSelection::LOCAL);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "compat-nic-selection"), 0);
+    engine.setNicSelection(NicSelection::LOCAL);
+}
 #endif
+
+// The selection set before init() reaches MultiTransport, which passes it to
+// every transport it installs; a later call is ignored and changes nothing.
+TEST(TransferEngineNicSelectionTest, IsFixedAtInit) {
+    TransferEngineImpl engine(false);
+    engine.setNicSelection(NicSelection::ALL);
+    engine.setNicSelection(NicSelection::LOCAL);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    EXPECT_EQ(TransferEngineImplTestPeer::installedNicSelection(engine),
+              NicSelection::LOCAL);
+
+    engine.setNicSelection(NicSelection::ALL);
+    EXPECT_EQ(TransferEngineImplTestPeer::nicSelection(engine),
+              NicSelection::LOCAL);
+    EXPECT_EQ(TransferEngineImplTestPeer::installedNicSelection(engine),
+              NicSelection::LOCAL);
+    // Transports installed after the ignored call still get the value.
+    Transport* transport = engine.installTransport("tcp", nullptr);
+    ASSERT_NE(transport, nullptr);
+    EXPECT_EQ(TransferEngineImplTestPeer::transportNicSelection(*transport),
+              NicSelection::LOCAL);
+}
+
+TEST(TransferEngineNicSelectionTest, UnsetFollowsEnvironment) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    EXPECT_EQ(TransferEngineImplTestPeer::installedNicSelection(engine),
+              std::nullopt);
+    Transport* transport = engine.installTransport("tcp", nullptr);
+    ASSERT_NE(transport, nullptr);
+    EXPECT_EQ(TransferEngineImplTestPeer::transportNicSelection(*transport),
+              std::nullopt);
+}
 
 TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
     TransferEngineImpl engine(false);
