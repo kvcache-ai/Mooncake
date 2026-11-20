@@ -8,6 +8,7 @@
 #include <barrier>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <set>
 
 #ifdef USE_TENT
@@ -98,6 +99,41 @@ TEST(TransferSharding, DefaultAndThresholdDoNotRunCallbacks) {
                          return Executor::Result::OK();
                      })
             .ok());
+}
+
+TEST(TransferSharding, BatchSubmitEnvironmentConfig) {
+    struct SavedEnvironment {
+        const char* name;
+        std::optional<std::string> previous;
+        explicit SavedEnvironment(const char* key) : name(key) {
+            if (const char* value = std::getenv(name)) previous = value;
+        }
+        ~SavedEnvironment() {
+            if (previous)
+                setenv(name, previous->c_str(), 1);
+            else
+                unsetenv(name);
+        }
+    } threads("MC_BATCH_SUBMIT_THREADS"), min_size("MC_BATCH_SUBMIT_MIN_SIZE");
+
+    ASSERT_EQ(unsetenv(threads.name), 0);
+    ASSERT_EQ(unsetenv(min_size.name), 0);
+    auto config = Executor::Config::fromEnvironment();
+    EXPECT_EQ(config.threads, 0);
+    EXPECT_EQ(config.min_descriptors, 4096);
+
+    ASSERT_EQ(setenv(threads.name, "4", 1), 0);
+    ASSERT_EQ(setenv(min_size.name, "8192", 1), 0);
+    Executor executor(Executor::Config::fromEnvironment());
+    EXPECT_EQ(executor.config().threads, 4);
+    EXPECT_FALSE(executor.eligible(8191));
+    EXPECT_TRUE(executor.eligible(8192));
+
+    ASSERT_EQ(setenv(threads.name, "33", 1), 0);
+    EXPECT_THROW(Executor::Config::fromEnvironment(), std::invalid_argument);
+    ASSERT_EQ(setenv(threads.name, "4", 1), 0);
+    ASSERT_EQ(setenv(min_size.name, "0", 1), 0);
+    EXPECT_THROW(Executor::Config::fromEnvironment(), std::invalid_argument);
 }
 
 TEST(TransferSharding, DetectsOverlapBeforeAnySubBatchCanPublish) {

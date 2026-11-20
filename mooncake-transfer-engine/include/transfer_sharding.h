@@ -92,8 +92,8 @@ class TransferShardingExecutor {
         size_t max_parents = 16;
 
         static Config fromEnvironment() {
-            return {read("MC_TRANSFER_SHARD_THREADS", 0, 0, 32),
-                    read("MC_TRANSFER_SHARD_MIN_DESCS", 4096, 1, SIZE_MAX), 16};
+            return {read("MC_BATCH_SUBMIT_THREADS", 0, 0, 32),
+                    read("MC_BATCH_SUBMIT_MIN_SIZE", 4096, 1, SIZE_MAX), 16};
         }
 
        private:
