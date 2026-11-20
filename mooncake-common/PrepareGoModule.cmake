@@ -1,9 +1,13 @@
 find_program(
   GO_EXECUTABLE
   NAMES go
-  HINTS /usr/local/go/bin)
+  PATHS "$ENV{MOONCAKE_GO_INSTALL_PREFIX}" ${CMAKE_SYSTEM_PREFIX_PATH}
+  PATH_SUFFIXES go/bin)
 if(NOT GO_EXECUTABLE)
-  message(FATAL_ERROR "Go is required to build ${CMAKE_CURRENT_SOURCE_DIR}")
+  message(
+    FATAL_ERROR
+      "Go is required to build ${CMAKE_CURRENT_SOURCE_DIR}. Put go on PATH or set -DGO_EXECUTABLE=/path/to/go."
+  )
 endif()
 
 # Track manifest changes and keep any Go checksum updates in the build tree.

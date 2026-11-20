@@ -24,6 +24,7 @@ NC="\033[0m" # No Color
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
 GOVER=1.26.9
+GO_INSTALL_PREFIX=${MOONCAKE_GO_INSTALL_PREFIX:-/usr/local}
 OS_RELEASE_FILE=${OS_RELEASE_FILE:-/etc/os-release}
 
 # Function to print section headers
@@ -409,7 +410,7 @@ install_go() {
     fi
 
     echo "Installing Go $GOVER..."
-    tar -C /usr/local -xzf "${GO_TARBALL}"
+    mkdir -p "$GO_INSTALL_PREFIX" && tar -C "$GO_INSTALL_PREFIX" -xzf "${GO_TARBALL}"
     check_success "Failed to install Go $GOVER"
 
     rm -f "${GO_TARBALL}"
@@ -418,23 +419,32 @@ install_go() {
     print_success "Go $GOVER installed successfully"
 }
 
+GO_VERSION=""
 if command -v go &> /dev/null; then
     GO_VERSION=$(go version | awk '{print $3}')
-    if [[ "$GO_VERSION" == "go$GOVER" ]]; then
-        echo -e "${YELLOW}Go $GOVER is already installed. Skipping...${NC}"
-    else
-        echo -e "${YELLOW}Found Go $GO_VERSION. Will install Go $GOVER...${NC}"
-        install_go
-    fi
-else
-    install_go
 fi
 
-# Add Go to PATH if not already there
-if ! grep -q "export PATH=\$PATH:/usr/local/go/bin" ~/.bashrc; then
-    echo -e "${YELLOW}Adding Go to your PATH in ~/.bashrc${NC}"
-    echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
-    echo -e "${YELLOW}Please run 'source ~/.bashrc' or start a new terminal to use Go${NC}"
+if [[ "$GO_VERSION" == "go$GOVER" ]]; then
+    echo -e "${YELLOW}Go $GOVER is already installed. Skipping...${NC}"
+else
+    if [ -n "$GO_VERSION" ]; then
+        echo -e "${YELLOW}Found Go $GO_VERSION. Will install Go $GOVER...${NC}"
+    fi
+    install_go
+
+    GO_BIN_DIR="$GO_INSTALL_PREFIX/go/bin"
+    # CI can pass its path file to make the new Go available in later steps.
+    if [ -n "${MOONCAKE_GO_PATH_FILE:-}" ]; then
+        printf '%s\n' "$GO_BIN_DIR" >> "$MOONCAKE_GO_PATH_FILE"
+        check_success "Failed to register the Go binary directory for CI"
+    else
+        GO_PATH_ENTRY=$(printf 'export PATH=%q:"$PATH"' "$GO_BIN_DIR")
+        if ! grep -Fqx "$GO_PATH_ENTRY" ~/.bashrc; then
+            echo -e "${YELLOW}Adding Go to your PATH in ~/.bashrc${NC}"
+            printf '%s\n' "$GO_PATH_ENTRY" >> ~/.bashrc
+            echo -e "${YELLOW}Please run 'source ~/.bashrc' or start a new terminal to use Go${NC}"
+        fi
+    fi
 fi
 
 # Set GOPROXY only if Go download fell back to a CN mirror

@@ -77,7 +77,11 @@ def test_go_wrapper_header_copied_to_source_dir(
         f"add_subdirectory({subdir})\n"
     )
 
-    env = {**os.environ, "GOPROXY": "off"}
+    env = {
+        **os.environ,
+        "GOPROXY": "off",
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    }
     subprocess.run(
         [
             "cmake",
@@ -87,7 +91,6 @@ def test_go_wrapper_header_copied_to_source_dir(
             str(tmp_path / "build"),
             "-G",
             generator,
-            f"-DGO_EXECUTABLE={stub}",
         ],
         check=True,
         env=env,

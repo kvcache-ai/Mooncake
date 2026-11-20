@@ -5,7 +5,14 @@
 ###############################################################################
 ARG CUDA_VERSION=13.0.3
 ARG UBUNTU_VERSION=22.04
+ARG PYTHON_VERSION=3.10
 ARG TORCH_VERSION=2.14.1
+ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
+ARG MOONCAKE_GO_INSTALL_PREFIX=/usr/local
+ARG MOONCAKE_WORK_DIR=/workspace
+ARG MOONCAKE_DEPS_DIR=/opt/mooncake-deps
+ARG TORCH_WHEEL_DIR=${MOONCAKE_DEPS_DIR}/torch-wheels
+ARG PYTHON_WHEEL_DIR=${MOONCAKE_DEPS_DIR}/python-wheels
 
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS system-deps
 
@@ -13,10 +20,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-ARG PYTHON_VERSION=3.10
-ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
-ENV PYTHON_VERSION=${PYTHON_VERSION} \
-    PATH="/usr/local/go/bin:${PATH}"
+ARG PYTHON_VERSION
+ARG PYPA_INDEX_URL
+ENV PYTHON_VERSION=${PYTHON_VERSION}
 
 # Install base build utilities and the requested Python version via deadsnakes PPA
 RUN apt-get update && \
@@ -39,15 +45,25 @@ RUN apt-get update && \
     apt-get purge -y --auto-remove software-properties-common && \
     rm -rf /var/lib/apt/lists/*
 
-WORKDIR /workspace
+ARG MOONCAKE_WORK_DIR
+WORKDIR ${MOONCAKE_WORK_DIR}
+ARG MOONCAKE_GO_INSTALL_PREFIX
+ENV PATH="${MOONCAKE_GO_INSTALL_PREFIX}/go/bin:${PATH}"
 # Install system dependencies independently of the source and submodule.
-COPY dependencies.sh /workspace/dependencies.sh
+COPY dependencies.sh ./
 RUN bash dependencies.sh -y --skip-submodules
+
+ARG MOONCAKE_DEPS_DIR
+ARG TORCH_WHEEL_DIR
+ARG PYTHON_WHEEL_DIR
+ENV GOMODCACHE=${MOONCAKE_DEPS_DIR}/go-mod-cache \
+    YLT_ARCHIVE=${MOONCAKE_DEPS_DIR}/yalantinglibs.tar.gz \
+    PYBIND11_DIR=${MOONCAKE_DEPS_DIR}/pybind11
 
 FROM system-deps AS torch-wheels
 ARG TORCH_VERSION
 RUN python${PYTHON_VERSION} -m pip download --only-binary=:all: \
-    --dest /opt/torch-wheels "torch==${TORCH_VERSION}"
+    --dest "$TORCH_WHEEL_DIR" "torch==${TORCH_VERSION}"
 
 FROM system-deps AS python-wheels
 COPY mooncake-wheel/pyproject.toml /tmp/mooncake-pyproject.toml
@@ -66,60 +82,59 @@ PYTHON
 COPY scripts/conductor-wheel-api-requirements.txt scripts/conductor-wheel-e2e-requirements.txt /tmp/
 # Resolve Torch and Mooncake runtime requirements together. Seed the download
 # directory with links so pip can reuse Torch wheels without copying them.
-RUN --mount=type=bind,from=torch-wheels,source=/opt/torch-wheels,target=/tmp/torch-wheels \
-    python${PYTHON_VERSION} -m pip wheel --wheel-dir /opt/python-wheels/build \
+RUN --mount=type=bind,from=torch-wheels,source=${TORCH_WHEEL_DIR},target=${TORCH_WHEEL_DIR} \
+    python${PYTHON_VERSION} -m pip wheel --wheel-dir "$PYTHON_WHEEL_DIR/build" \
         -r /tmp/build-requirements.txt -r /tmp/conductor-wheel-e2e-requirements.txt && \
-    mkdir -p /opt/python-wheels/runtime && \
-    ln -s /tmp/torch-wheels/*.whl /opt/python-wheels/runtime/ && \
-    python${PYTHON_VERSION} -m pip download --only-binary=:all: --find-links=/tmp/torch-wheels \
-        --dest /opt/python-wheels/runtime -r /tmp/runtime-requirements.txt /tmp/torch-wheels/torch-*.whl && \
-    find /opt/python-wheels/runtime -type l -delete && \
-    cp /tmp/build-requirements.txt /tmp/runtime-requirements.txt /opt/python-wheels/
+    mkdir -p "$PYTHON_WHEEL_DIR/runtime" && \
+    ln -s "$TORCH_WHEEL_DIR"/*.whl "$PYTHON_WHEEL_DIR/runtime/" && \
+    python${PYTHON_VERSION} -m pip download --only-binary=:all: --find-links="$TORCH_WHEEL_DIR" \
+        --dest "$PYTHON_WHEEL_DIR/runtime" -r /tmp/runtime-requirements.txt "$TORCH_WHEEL_DIR"/torch-*.whl && \
+    find "$PYTHON_WHEEL_DIR/runtime" -type l -delete && \
+    cp /tmp/build-requirements.txt /tmp/runtime-requirements.txt "$PYTHON_WHEEL_DIR/"
 
 FROM system-deps AS go-deps
-ENV GOMODCACHE=/opt/go-mod-cache
 COPY mooncake-common/etcd/go.mod mooncake-common/etcd/go.sum /tmp/etcd/
 RUN cd /tmp/etcd && go mod download
 
 FROM system-deps AS ylt-deps
 ARG GH_MIRROR
 COPY mooncake-common/FindYLT.cmake /tmp/FindYLT.cmake
-RUN cmake -DGH_MIRROR="${GH_MIRROR}" -DYLT_ARCHIVE=/opt/yalantinglibs.tar.gz -P /tmp/FindYLT.cmake
+RUN mkdir -p "$MOONCAKE_DEPS_DIR" && \
+    cmake -DGH_MIRROR="${GH_MIRROR}" -DYLT_ARCHIVE="$YLT_ARCHIVE" -P /tmp/FindYLT.cmake
 
 # Key the download on the submodule URL and gitlink, independently of the
 # surrounding Git index and history.
 FROM system-deps AS pybind11-pin
 COPY .gitmodules /tmp/.gitmodules
-RUN --mount=type=bind,source=.git,target=/workspace/.git \
+RUN --mount=type=bind,source=.git,target=${MOONCAKE_WORK_DIR}/.git \
     git config -f /tmp/.gitmodules --get submodule.extern/pybind11.url > /tmp/pybind11-url && \
     git ls-files --stage -- extern/pybind11 | \
     awk '$1 == "160000" && $3 == 0 { print $2; found = 1 } END { exit !found }' > /tmp/pybind11-revision
 
 FROM system-deps AS pybind11-deps
 COPY --from=pybind11-pin /tmp/pybind11-url /tmp/pybind11-revision /tmp/
-RUN git init -q /opt/pybind11 && \
-    cd /opt/pybind11 && \
+RUN git init -q "$PYBIND11_DIR" && \
+    cd "$PYBIND11_DIR" && \
     git remote add origin "$(cat /tmp/pybind11-url)" && \
     git fetch --depth=1 origin "$(cat /tmp/pybind11-revision)" && \
     git checkout --detach FETCH_HEAD && \
     git submodule update --init --recursive
 
 FROM system-deps AS source
-RUN --mount=type=bind,from=torch-wheels,source=/opt/torch-wheels,target=/tmp/torch-wheels \
-    python${PYTHON_VERSION} -m pip install --no-index --find-links=/tmp/torch-wheels /tmp/torch-wheels/torch-*.whl
+RUN --mount=type=bind,from=torch-wheels,source=${TORCH_WHEEL_DIR},target=${TORCH_WHEEL_DIR} \
+    python${PYTHON_VERSION} -m pip install --no-index --find-links="$TORCH_WHEEL_DIR" "$TORCH_WHEEL_DIR"/torch-*.whl
 ARG TORCH_VERSION
-RUN --network=none --mount=type=bind,from=torch-wheels,source=/opt/torch-wheels,target=/tmp/torch-wheels \
-    --mount=type=bind,from=python-wheels,source=/opt/python-wheels,target=/tmp/python-wheels \
-    python${PYTHON_VERSION} -m pip install --no-index --find-links=/tmp/python-wheels/build \
-        -r /tmp/python-wheels/build-requirements.txt && \
-    python${PYTHON_VERSION} -m pip install --no-index --find-links=/tmp/python-wheels/runtime \
-        --find-links=/tmp/torch-wheels -r /tmp/python-wheels/runtime-requirements.txt "torch==${TORCH_VERSION}"
-ENV GOMODCACHE=/opt/go-mod-cache
-COPY --from=go-deps /opt/go-mod-cache /opt/go-mod-cache
-COPY --from=ylt-deps /opt/yalantinglibs.tar.gz /opt/yalantinglibs.tar.gz
-COPY --from=pybind11-deps /opt/pybind11 /opt/pybind11
-COPY . /workspace
-RUN --network=none mkdir -p extern && rm -rf extern/pybind11 && mv /opt/pybind11 extern/pybind11
+RUN --network=none --mount=type=bind,from=torch-wheels,source=${TORCH_WHEEL_DIR},target=${TORCH_WHEEL_DIR} \
+    --mount=type=bind,from=python-wheels,source=${PYTHON_WHEEL_DIR},target=${PYTHON_WHEEL_DIR} \
+    python${PYTHON_VERSION} -m pip install --no-index --find-links="$PYTHON_WHEEL_DIR/build" \
+        -r "$PYTHON_WHEEL_DIR/build-requirements.txt" && \
+    python${PYTHON_VERSION} -m pip install --no-index --find-links="$PYTHON_WHEEL_DIR/runtime" \
+        --find-links="$TORCH_WHEEL_DIR" -r "$PYTHON_WHEEL_DIR/runtime-requirements.txt" "torch==${TORCH_VERSION}"
+COPY --from=go-deps ${GOMODCACHE} ${GOMODCACHE}
+COPY --from=ylt-deps ${YLT_ARCHIVE} ${YLT_ARCHIVE}
+COPY --from=pybind11-deps ${PYBIND11_DIR} ${PYBIND11_DIR}
+COPY . .
+RUN --network=none mkdir -p extern && rm -rf extern/pybind11 && mv "$PYBIND11_DIR" extern/pybind11
 
 FROM source AS builder
 
@@ -138,10 +153,11 @@ ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
 # auditwheel has resolved libraries from it. The large intermediate tree is
 # not retained in the builder layer when CLEAN_BUILD_ARTIFACTS=1.
 # The wheel smoke tests connect to a local server without a proxy.
-RUN --network=none --mount=type=bind,from=torch-wheels,source=/opt/torch-wheels,target=/tmp/torch-wheels \
-    --mount=type=bind,from=python-wheels,source=/opt/python-wheels,target=/tmp/python-wheels \
+RUN --network=none --mount=type=bind,from=torch-wheels,source=${TORCH_WHEEL_DIR},target=${TORCH_WHEEL_DIR} \
+    --mount=type=bind,from=python-wheels,source=${PYTHON_WHEEL_DIR},target=${PYTHON_WHEEL_DIR} \
     unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY && \
-    export PIP_FIND_LINKS="/tmp/python-wheels/build /tmp/python-wheels/runtime /tmp/torch-wheels" && \
+    CUDA_STUB_DIR="${CUDA_HOME:-/usr/local/cuda}/lib64/stubs" && \
+    export PIP_FIND_LINKS="${PYTHON_WHEEL_DIR}/build ${PYTHON_WHEEL_DIR}/runtime ${TORCH_WHEEL_DIR}" && \
     mkdir -p build && \
     cd build && \
     cmake -G Ninja .. \
@@ -152,22 +168,22 @@ RUN --network=none --mount=type=bind,from=torch-wheels,source=/opt/torch-wheels,
         -DWITH_EP=ON \
         -DWITH_CONDUCTOR=ON \
         -DSTORE_USE_ETCD=ON \
-        -DYLT_ARCHIVE=/opt/yalantinglibs.tar.gz \
+        -DYLT_ARCHIVE="$YLT_ARCHIVE" \
         -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
-    export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
+    export LIBRARY_PATH="$CUDA_STUB_DIR:$LIBRARY_PATH" && \
     cmake --build . --parallel "${BUILD_JOBS}" && \
-    cd /workspace && \
+    cd "$MOONCAKE_WORK_DIR" && \
     export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH && \
-    export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH && \
-    export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
+    export LD_LIBRARY_PATH="$CUDA_STUB_DIR:$LD_LIBRARY_PATH" && \
+    export LIBRARY_PATH="$CUDA_STUB_DIR:$LIBRARY_PATH" && \
     mkdir -p build/mooncake-transfer-engine/nvlink-allocator && \
     cd mooncake-transfer-engine/nvlink-allocator && \
     bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/ && \
-    cd /workspace && \
+    cd "$MOONCAKE_WORK_DIR" && \
     OUTPUT_DIR=dist ./scripts/build_wheel.sh && \
     python${PYTHON_VERSION} -m pip install mooncake-wheel/dist/*.whl && \
-    ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 && \
+    ln -sf "$CUDA_STUB_DIR/libcuda.so" "$CUDA_STUB_DIR/libcuda.so.1" && \
     python${PYTHON_VERSION} -m mooncake.pg --prebuild && \
     if [ "${CLEAN_BUILD_ARTIFACTS}" = "1" ]; then \
         rm -rf build; \
@@ -182,9 +198,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Inherit build-args so the runtime stage installs the matching interpreter
-ARG PYTHON_VERSION=3.10
-ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
+# Use the same Python and pip bootstrap defaults as the builder.
+ARG PYTHON_VERSION
+ARG PYPA_INDEX_URL
 ENV PYTHON_VERSION=${PYTHON_VERSION}
 
 # Install runtime dependencies and the requested Python version
@@ -211,18 +227,22 @@ RUN apt-get update && \
     apt-get purge -y --auto-remove software-properties-common curl && \
     rm -rf /var/lib/apt/lists/*
 
+ARG TORCH_WHEEL_DIR
+ARG PYTHON_WHEEL_DIR
+
 # Keep the Torch installation cached across Mooncake metadata changes.
-RUN --mount=type=bind,from=torch-wheels,source=/opt/torch-wheels,target=/tmp/torch-wheels \
-    python${PYTHON_VERSION} -m pip install --no-index --find-links=/tmp/torch-wheels /tmp/torch-wheels/torch-*.whl
+RUN --mount=type=bind,from=torch-wheels,source=${TORCH_WHEEL_DIR},target=${TORCH_WHEEL_DIR} \
+    python${PYTHON_VERSION} -m pip install --no-index --find-links="$TORCH_WHEEL_DIR" "$TORCH_WHEEL_DIR"/torch-*.whl
 
 ARG TORCH_VERSION
-RUN --mount=type=bind,from=torch-wheels,source=/opt/torch-wheels,target=/tmp/torch-wheels \
-    --mount=type=bind,from=python-wheels,source=/opt/python-wheels,target=/tmp/python-wheels \
-    python${PYTHON_VERSION} -m pip install --no-index --find-links=/tmp/torch-wheels \
-        --find-links=/tmp/python-wheels/runtime -r /tmp/python-wheels/runtime-requirements.txt "torch==${TORCH_VERSION}"
+RUN --mount=type=bind,from=torch-wheels,source=${TORCH_WHEEL_DIR},target=${TORCH_WHEEL_DIR} \
+    --mount=type=bind,from=python-wheels,source=${PYTHON_WHEEL_DIR},target=${PYTHON_WHEEL_DIR} \
+    python${PYTHON_VERSION} -m pip install --no-index --find-links="$TORCH_WHEEL_DIR" \
+        --find-links="$PYTHON_WHEEL_DIR/runtime" -r "$PYTHON_WHEEL_DIR/runtime-requirements.txt" "torch==${TORCH_VERSION}"
 
 # Copy wheels produced in builder stage and install them via pip
-COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
+ARG MOONCAKE_WORK_DIR
+COPY --from=builder ${MOONCAKE_WORK_DIR}/mooncake-wheel/dist /tmp/mooncake-wheel
 COPY --from=builder /root/.cache/mooncake/pg_jit /root/.cache/mooncake/pg_jit
 COPY --chmod=755 scripts/check_hicache_hugepage_requirements.py /usr/local/bin/mooncake-hicache-sizing
 RUN python${PYTHON_VERSION} -m pip install --no-index --no-deps /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip

@@ -181,13 +181,15 @@ jobs:
         run: git config --global --add safe.directory $GITHUB_WORKSPACE
         shell: bash
 
-      - name: Configure project
+      - name: Install dependencies
         run: |
           apt update -y
           apt install -y ninja-build
-          bash -x dependencies.sh -y
-          export PATH="/usr/local/go/bin:$PATH"
-          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          MOONCAKE_GO_PATH_FILE="$GITHUB_PATH" bash -x dependencies.sh -y
+        shell: bash
+
+      - name: Configure project
+        run: |
           mkdir build
           cd build
           cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DWITH_EP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF
@@ -233,8 +235,6 @@ jobs:
           trap 'kill "$monitor_pid" 2>/dev/null || true; free -h; df -h' EXIT
           # This job validates the build; avoid a second image copy in Docker's store.
           docker buildx build --output=type=cacheonly --progress=plain -f docker/mooncake.Dockerfile \
-            --build-arg PYTHON_VERSION=3.10 \
-            --build-arg TORCH_VERSION=2.14.1 \
             --build-arg BUILD_JOBS=2 \
             --build-arg CLEAN_BUILD_ARTIFACTS=1 \
             -t mooncake:from-source .
@@ -348,12 +348,13 @@ jobs:
       - name: Set up compiler cache
         uses: ./.github/actions/setup-sccache
 
-      - name: Configure project (Release, no ASAN)
+      - name: Install dependencies
         run: |
           sudo apt update -y
-          sudo bash -x dependencies.sh -y
-          export PATH="/usr/local/go/bin:$PATH"
-          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          sudo env "MOONCAKE_GO_PATH_FILE=$GITHUB_PATH" bash -x dependencies.sh -y
+
+      - name: Configure project (Release, no ASAN)
+        run: |
           mkdir build && cd build
           cmake -G Ninja .. \
             -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DUSE_CUDA=ON \
@@ -616,12 +617,13 @@ jobs:
       - name: Set up compiler cache
         uses: ./.github/actions/setup-sccache
 
-      - name: Configure project with coverage support
+      - name: Install dependencies
         run: |
           sudo apt update -y
-          sudo bash -x dependencies.sh -y
-          export PATH="/usr/local/go/bin:$PATH"
-          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          sudo env "MOONCAKE_GO_PATH_FILE=$GITHUB_PATH" bash -x dependencies.sh -y
+
+      - name: Configure project with coverage support
+        run: |
           mkdir build
           cd build
           cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DENABLE_DEBUG_SYMBOLS=OFF
