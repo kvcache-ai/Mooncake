@@ -11,7 +11,7 @@ import shlex
 import time
 from typing import TYPE_CHECKING, List, Dict, Any, Optional
 
-from mooncake._administration import require_paramiko
+from mooncake._administration import read_ssh_output, require_paramiko
 
 if TYPE_CHECKING:
     import paramiko
@@ -187,9 +187,7 @@ class SPDKTgtCreator:
         self.logger.debug(f"Executing command: {command}")
 
         stdin, stdout, stderr = ssh.exec_command(command, timeout=timeout)
-        exit_status = stdout.channel.recv_exit_status()
-        output = stdout.read().decode("utf-8")
-        error = stderr.read().decode("utf-8")
+        exit_status, output, error = read_ssh_output(stdout, stderr)
 
         if output:
             self.logger.debug(f"Command output: {output}")
