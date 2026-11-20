@@ -137,8 +137,10 @@ ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
 # Configure and build the wheel in one layer, then remove build/ only after
 # auditwheel has resolved libraries from it. The large intermediate tree is
 # not retained in the builder layer when CLEAN_BUILD_ARTIFACTS=1.
+# The wheel smoke tests connect to a local server without a proxy.
 RUN --network=none --mount=type=bind,from=torch-wheels,source=/opt/torch-wheels,target=/tmp/torch-wheels \
     --mount=type=bind,from=python-wheels,source=/opt/python-wheels,target=/tmp/python-wheels \
+    unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY && \
     export PIP_FIND_LINKS="/tmp/python-wheels/build /tmp/python-wheels/runtime /tmp/torch-wheels" && \
     mkdir -p build && \
     cd build && \
