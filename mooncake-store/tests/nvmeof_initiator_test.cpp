@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -43,18 +44,20 @@ class MockInitiator : public NVMeoFInitiator {
         return block_size_;
     }
 
-    int SubmitIO(NofSegmentHandle*, void*, uint64_t, uint64_t, NofIOOp,
+    int SubmitIO(NofSegmentHandle*, void*, uint64_t, uint64_t, NofIOOp op,
                  NofIOAdaptor* adaptor) override {
         if (pending_.size() >= queue_limit_) return -EAGAIN;
         if (fail_submit_) {
             return -1;
         }
         pending_.push_back(adaptor);
+        submitted_ops_.push_back(op);
         return 0;
     }
 
     int64_t PollCompletion(NofSegmentHandle*,
                            uint32_t max_completions) override {
+        if (!allow_completions_.load()) return 0;
         int64_t n = 0;
         while (!pending_.empty() &&
                (max_completions == 0 || n < max_completions)) {
@@ -82,6 +85,8 @@ class MockInitiator : public NVMeoFInitiator {
     bool fail_submit_ = false;
     bool fail_io_ = false;
     bool probe_ok_ = true;
+    std::atomic<bool> allow_completions_{true};
+    std::vector<NofIOOp> submitted_ops_;
     std::deque<NofIOAdaptor*> pending_;
     std::map<std::string, NofSegmentHandle*> handles_;
     std::array<uint64_t, 16> sentinels_{};
@@ -141,6 +146,33 @@ TEST(NofWorkerPoolTest, CompletesTaskWithSingleEntryQueue) {
         NofTask(seg, buf.data(), 0, buf.size(), NofIOOp::kWrite, state));
     state->wait_for_completion();
     EXPECT_EQ(state->get_result(), ErrorCode::OK);
+}
+
+TEST(NofWorkerPoolTest, WaitingWriteGetsNextFreeSlot) {
+    auto mock = std::make_shared<MockInitiator>();
+    mock->queue_limit_ = 1;
+    auto* seg = mock->OpenSegment("mixed-io");
+    auto first_read = std::make_shared<NofOperationState>();
+    auto write = std::make_shared<NofOperationState>();
+    auto next_read = std::make_shared<NofOperationState>();
+    std::vector<uint8_t> buf(mock->block_size_);
+    NofWorkerPool pool(mock, 0);
+    mock->allow_completions_.store(false);
+    pool.submitTask(
+        NofTask(seg, buf.data(), 0, buf.size(), NofIOOp::kRead, first_read));
+    pool.submitTask(
+        NofTask(seg, buf.data(), 0, buf.size(), NofIOOp::kWrite, write));
+    pool.submitTask(
+        NofTask(seg, buf.data(), 0, buf.size(), NofIOOp::kRead, next_read));
+    mock->allow_completions_.store(true);
+
+    for (const auto& state : {first_read, write, next_read}) {
+        state->wait_for_completion();
+        EXPECT_EQ(state->get_result(), ErrorCode::OK);
+    }
+    EXPECT_EQ(mock->submitted_ops_,
+              (std::vector<NofIOOp>{NofIOOp::kRead, NofIOOp::kWrite,
+                                    NofIOOp::kRead}));
 }
 
 TEST(NofRuntimeTest, NonNofBuildReturnsNullInitiator) {

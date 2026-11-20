@@ -486,6 +486,7 @@ struct NofQos {
     const uint32_t block_size;
     const int blocks_per_chunk;
     const int inflight_blocks_limit;
+    size_t next_op = static_cast<size_t>(NofIOOp::kRead);
     int inflight_blocks[static_cast<size_t>(NofIOOp::kNum)];
     NofTask* head[static_cast<size_t>(NofIOOp::kNum)];
     NofTask* tail[static_cast<size_t>(NofIOOp::kNum)];

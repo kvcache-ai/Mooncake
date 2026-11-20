@@ -555,7 +555,10 @@ void NofWorkerPool::workerThread(int work_idx) {
             const uint32_t block_size = nof_qos->block_size;
             const uint64_t chunk_bytes =
                 static_cast<uint64_t>(nof_qos->blocks_per_chunk) * block_size;
-            for (size_t i = 0; i < static_cast<size_t>(NofIOOp::kNum); ++i) {
+            constexpr size_t kNumOps = static_cast<size_t>(NofIOOp::kNum);
+            const size_t first_op = nof_qos->next_op;
+            for (size_t n = 0; n < kNumOps; ++n) {
+                const size_t i = (first_op + n) % kNumOps;
                 int avail_blocks = nof_qos->inflight_blocks_limit -
                                    nof_qos->inflight_blocks[i];
                 while (nof_qos->head[i] && avail_blocks > 0) {
@@ -620,6 +623,7 @@ void NofWorkerPool::workerThread(int work_idx) {
                             task->failed = true;
                             task->remaining_bytes = 0;
                         } else {
+                            nof_qos->next_op = (i + 1) % kNumOps;
                             const int submit_blocks =
                                 static_cast<int>(submit_bytes / block_size);
                             task->idx++;
