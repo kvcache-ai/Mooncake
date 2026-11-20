@@ -8,10 +8,11 @@
 **/.git/ORIG_HEAD
 
 # Exclude local build products, test output, and Python caches.
-**/build
-**/build-*
-**/cmake-build-*
-**/dist
+/build
+/build-*
+/cmake-build-*
+/dist
+/mooncake-wheel/dist
 **/*.egg-info
 **/__pycache__
 **/.pytest_cache
@@ -20,9 +21,4 @@
 **/*.pyo
 **/*.log
 
-# Carry verified YLT archives into the image, but not benchmark output or other
-# host caches. Partial downloads are excluded as well.
-.cache/*
-!.cache/yalantinglibs
-.cache/yalantinglibs/*
-!.cache/yalantinglibs/*.tar.gz
+/.cache

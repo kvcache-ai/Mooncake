@@ -1,5 +1,23 @@
 include_guard(GLOBAL)
 
+set(YLT_COMMIT 54f9c0642386e7860e8e11ada698c484dc562d7d)
+set(_ylt_url
+    "${GH_MIRROR}https://github.com/alibaba/yalantinglibs/archive/${YLT_COMMIT}.tar.gz"
+)
+set(_ylt_hash
+    SHA256=11040b1d3f859599e5453ef7e9b5f84f8afa2388b057330f4c667973e5b20f01)
+
+# Docker runs this file in script mode to prefetch the same verified archive.
+if(CMAKE_SCRIPT_MODE_FILE)
+  file(
+    DOWNLOAD "${_ylt_url}" "${YLT_ARCHIVE}"
+    EXPECTED_HASH "${_ylt_hash}"
+    TLS_VERIFY ON
+    INACTIVITY_TIMEOUT 60
+    TIMEOUT 600)
+  return()
+endif()
+
 include(FetchContent)
 
 if(POLICY CMP0135)
@@ -25,16 +43,13 @@ else()
       CACHE BOOL "Enable yalantinglibs ibverbs support")
 endif()
 
-set(YLT_COMMIT 54f9c0642386e7860e8e11ada698c484dc562d7d)
-if(YLT_DOWNLOAD_DIR)
-  set(_ylt_download_dir DOWNLOAD_DIR "${YLT_DOWNLOAD_DIR}")
+if(YLT_ARCHIVE)
+  set(_ylt_url "${YLT_ARCHIVE}")
 endif()
 FetchContent_Declare(
   yalantinglibs
-  ${_ylt_download_dir}
-  URL ${GH_MIRROR}https://github.com/alibaba/yalantinglibs/archive/${YLT_COMMIT}.tar.gz
-  URL_HASH
-    SHA256=11040b1d3f859599e5453ef7e9b5f84f8afa2388b057330f4c667973e5b20f01)
+  URL ${_ylt_url}
+  URL_HASH "${_ylt_hash}")
 
 # Exclude from install for CMake before 3.28
 FetchContent_GetProperties(yalantinglibs)
