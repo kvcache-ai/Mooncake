@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
             "fill",
             "write_perf",
             "read_perf",
+            "read_mix",
             "mixed_rw",
             "metadata_smoke",
             "mixed_metadata",
@@ -137,6 +138,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--prepare-mode", choices=["auto", "none", "write"], default="auto"
     )
     parser.add_argument("--rwmixread", type=int, default=70)
+    parser.add_argument(
+        "--read-hit-pct",
+        type=int,
+        default=None,
+        help="read_mix only: percent of keys expected present in the fixed read workload.",
+    )
 
     parser.add_argument(
         "--phase-gap-mode",
@@ -176,6 +183,10 @@ class PhaseStats:
     end_time: float = 0.0
     dataset_exhausted: bool = False
     latency_seen: int = 0
+    expected_hits: int = 0
+    expected_misses: int = 0
+    matched_hits: int = 0
+    matched_misses: int = 0
 
 
 @dataclass
@@ -188,6 +199,28 @@ class RequestResult:
     misses: int = 0
     verify_failures: int = 0
     error_counts: Counter = field(default_factory=Counter)
+    expected_hits: int = 0
+    expected_misses: int = 0
+    matched_hits: int = 0
+    matched_misses: int = 0
+
+
+# C++ Store ErrorCode::OBJECT_NOT_FOUND (mooncake-store/include/types.h).
+OBJECT_NOT_FOUND = -704
+
+
+def build_read_mix_plan(
+    start: int, prepared_count: int, read_count: int, hit_pct: int, seed: int
+) -> List[tuple[int, bool]]:
+    """Plan exact hit/miss object counts before lanes start submitting reads."""
+    hit_count = read_count * hit_pct // 100
+    plan = [(start + i % prepared_count, True) for i in range(hit_count)]
+    # Reserve a disjoint range that is never written by the prepare phase.
+    plan.extend(
+        (start + prepared_count + i, False) for i in range(read_count - hit_count)
+    )
+    random.Random(seed).shuffle(plan)
+    return plan
 
 
 METADATA_OPERATIONS = ("put", "get", "exist", "remove")
@@ -525,6 +558,61 @@ class StoreSession:
             misses=misses,
             verify_failures=verify_failures,
             error_counts=errors,
+        )
+
+    def get_expected_ids(
+        self, plan: List[tuple[int, bool]], verify: bool
+    ) -> RequestResult:
+        """Classify the actual per-key read status, not a later existence probe."""
+        assert self._zcopy is not None
+        keys = [
+            make_key(self.args.key_prefix, self.args.key_size, object_id)
+            for object_id, _ in plan
+        ]
+        expected_hits = sum(present for _, present in plan)
+        lengths = self._get_lengths_zcopy(keys, len(plan))
+        errors: Counter = Counter()
+        matched_hits = matched_misses = misses = verify_failures = 0
+        if len(lengths) != len(plan):
+            errors["READ_RESULT_COUNT_MISMATCH"] += len(plan)
+        else:
+            for slot, ((object_id, expected_present), length) in enumerate(
+                zip(plan, lengths)
+            ):
+                if length == OBJECT_NOT_FOUND:
+                    misses += 1
+                    if expected_present:
+                        errors["UNEXPECTED_MISS"] += 1
+                    else:
+                        matched_misses += 1
+                elif length < 0:
+                    errors[length] += 1
+                elif not expected_present:
+                    errors["UNEXPECTED_HIT"] += 1
+                elif length != self.args.value_size:
+                    verify_failures += 1
+                    errors["VERIFY_SIZE_MISMATCH"] += 1
+                elif verify and not self.payload_factory.verify_payload(
+                    object_id, self._zcopy.read_bytes(slot, length)
+                ):
+                    verify_failures += 1
+                    errors["VERIFY_FAIL"] += 1
+                else:
+                    matched_hits += 1
+
+        matched = matched_hits + matched_misses
+        return RequestResult(
+            request_ok=matched == len(plan),
+            kv_successes=matched,
+            kv_failures=len(plan) - matched,
+            bytes_processed=matched_hits * self.args.value_size,
+            misses=misses,
+            verify_failures=verify_failures,
+            error_counts=errors,
+            expected_hits=expected_hits,
+            expected_misses=len(plan) - expected_hits,
+            matched_hits=matched_hits,
+            matched_misses=matched_misses,
         )
 
     def metadata_operation(
@@ -890,6 +978,10 @@ def merge_stats(name: str, stats_list: List[PhaseStats]) -> PhaseStats:
         merged.bytes_processed += stats.bytes_processed
         merged.error_counts.update(stats.error_counts)
         merged.dataset_exhausted = merged.dataset_exhausted or stats.dataset_exhausted
+        merged.expected_hits += stats.expected_hits
+        merged.expected_misses += stats.expected_misses
+        merged.matched_hits += stats.matched_hits
+        merged.matched_misses += stats.matched_misses
     return merged
 
 
@@ -909,7 +1001,7 @@ def percentile(values: List[float], p: float) -> float:
 
 def summarize_stats(stats: PhaseStats) -> dict:
     duration = max(stats.end_time - stats.start_time, 0.0)
-    return {
+    summary = {
         "requests": stats.requests,
         "successful_requests": stats.successful_requests,
         "failed_requests": stats.failed_requests,
@@ -935,6 +1027,14 @@ def summarize_stats(stats: PhaseStats) -> dict:
         "dataset_exhausted": stats.dataset_exhausted,
         "error_counts": dict(stats.error_counts),
     }
+    if stats.expected_hits + stats.expected_misses:
+        summary.update(
+            expected_hits=stats.expected_hits,
+            expected_misses=stats.expected_misses,
+            matched_hits=stats.matched_hits,
+            matched_misses=stats.matched_misses,
+        )
+    return summary
 
 
 def log_phase_stats(stats: PhaseStats) -> None:
@@ -969,6 +1069,14 @@ def log_phase_stats(stats: PhaseStats) -> None:
     )
     if summary["error_counts"]:
         LOG.info("errors=%s", summary["error_counts"])
+    if stats.expected_hits + stats.expected_misses:
+        LOG.info(
+            "expected_hits=%d expected_misses=%d matched_hits=%d matched_misses=%d",
+            stats.expected_hits,
+            stats.expected_misses,
+            stats.matched_hits,
+            stats.matched_misses,
+        )
 
 
 class BenchmarkRunner:
@@ -1000,6 +1108,19 @@ class BenchmarkRunner:
             raise ValueError("prepare-objects must be >= 0")
         if self.args.rwmixread < 0 or self.args.rwmixread > 100:
             raise ValueError("rwmixread must be within [0, 100]")
+        if self.args.scenario == "read_mix":
+            if self.args.read_hit_pct is None or not 0 <= self.args.read_hit_pct <= 100:
+                raise ValueError("read_mix requires --read-hit-pct within [0, 100]")
+            if self.args.store_backend != "cpp" or self.args.io_api != "zcopy":
+                raise ValueError(
+                    "read_mix requires the C++ Store zcopy API for explicit miss status"
+                )
+            if self.args.runtime != 0:
+                raise ValueError(
+                    "read_mix requires --runtime=0 for an exact object-count mix"
+                )
+        elif self.args.read_hit_pct is not None:
+            raise ValueError("--read-hit-pct requires --scenario=read_mix")
         validate_operation_percentages(
             {
                 "put": self.args.put_pct,
@@ -1038,8 +1159,19 @@ class BenchmarkRunner:
                 "write-involved scenarios require value-size to be 512B aligned"
             )
         make_key(self.args.key_prefix, self.args.key_size, self.args.object_id_start)
+        if self.args.scenario == "read_mix":
+            miss_count = self.args.nr_objects - (
+                self.args.nr_objects * self.args.read_hit_pct // 100
+            )
+            make_key(
+                self.args.key_prefix,
+                self.args.key_size,
+                self.args.object_id_start + self._prepare_budget() + miss_count - 1,
+            )
 
     def _scenario_has_write(self) -> bool:
+        if self.args.scenario == "read_mix":
+            return self.args.prepare_mode != "none"
         return self.args.scenario in {
             "verify_write",
             "fill",
@@ -1174,6 +1306,10 @@ class BenchmarkRunner:
         stats.verify_failures += request.verify_failures
         stats.bytes_processed += request.bytes_processed
         stats.error_counts.update(request.error_counts)
+        stats.expected_hits += request.expected_hits
+        stats.expected_misses += request.expected_misses
+        stats.matched_hits += request.matched_hits
+        stats.matched_misses += request.matched_misses
 
     def _run_metadata_operations(
         self, phase_name: str, operations_by_lane
@@ -1505,11 +1641,36 @@ class BenchmarkRunner:
 
         return self._run_threads(phase_name, worker)
 
+    def _run_read_mix_phase(self) -> PhaseStats:
+        plan = build_read_mix_plan(
+            self.args.object_id_start,
+            self._prepare_budget(),
+            self.args.nr_objects,
+            self.args.read_hit_pct,
+            self.args.rand_seed,
+        )
+        batch_size = self.args.batch_size
+
+        def worker(session: StoreSession, lane_id: int) -> Callable[[PhaseStats], None]:
+            def run(stats: PhaseStats) -> None:
+                for offset in range(
+                    lane_id * batch_size, len(plan), self.lane_count * batch_size
+                ):
+                    batch = plan[offset : offset + batch_size]
+                    start = time.perf_counter()
+                    result = session.get_expected_ids(batch, verify=self.args.verify)
+                    self._record(stats, time.perf_counter() - start, result, len(batch))
+
+            return run
+
+        return self._run_threads("read_mix", worker)
+
     def _maybe_prepare_dataset(self) -> Optional[PhaseStats]:
         if self.args.prepare_mode == "none":
             return None
         if self.args.prepare_mode == "write" or self.args.scenario in {
             "read_perf",
+            "read_mix",
             "mixed_rw",
         }:
             stats = self._run_fixed_write(
@@ -1614,6 +1775,13 @@ class BenchmarkRunner:
             )
             return phases
 
+        if self.args.scenario == "read_mix":
+            prepared = self._maybe_prepare_dataset()
+            if prepared is not None:
+                phases.append(prepared)
+            phases.append(self._run_read_mix_phase())
+            return phases
+
         prepared = self._maybe_prepare_dataset()
         if prepared is not None:
             phases.append(prepared)
@@ -1639,11 +1807,14 @@ def main() -> int:
         runner.write_outputs(phases)
         if any(phase.verify_failures > 0 for phase in phases):
             return 20
-        if args.verify and any(
-            phase.misses > 0 for phase in phases if "read" in phase.name
+        if (
+            args.verify
+            and args.scenario != "read_mix"
+            and any(phase.misses > 0 for phase in phases if "read" in phase.name)
         ):
             return 21
         if args.scenario in {
+            "read_mix",
             "metadata_smoke",
             "mixed_metadata",
             "remove_perf",
