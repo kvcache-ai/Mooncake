@@ -109,10 +109,68 @@ TEST(HABackendAvailabilityTest, BareHostPortRemainsDirectMasterAddress) {
     }
 }
 
+TEST(HABackendAvailabilityTest, EtcdUnixEndpointsPreserveConnectionSemantics) {
+    for (const auto& connstring :
+         {"unix:///run/etcd.sock", "unixs:///run/etcd.sock", "unix://etcd.sock",
+          "unixs://etcd.sock", "unix://run/etcd.sock", "unixs://run/etcd.sock",
+          "unix:etcd.sock", "unixs:etcd.sock", "unix:/run/etcd.sock",
+          "unixs:/run/etcd.sock"}) {
+        SCOPED_TRACE(connstring);
+        auto spec = ParseHABackendSpec(std::string("etcd://") + connstring);
+#ifdef STORE_USE_ETCD
+        ASSERT_TRUE(spec.has_value());
+        ASSERT_TRUE(spec->has_value());
+        EXPECT_EQ(HABackendType::ETCD, (*spec)->type);
+        EXPECT_EQ(connstring, (*spec)->connstring);
+#else
+        ASSERT_FALSE(spec.has_value());
+        EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, spec.error());
+#endif
+    }
+}
+
+TEST(HABackendAvailabilityTest, EtcdUnixAndTcpEndpointListsAreAccepted) {
+    const std::pair<const char*, const char*> cases[] = {
+        {"etcd://unix:///run/etcd.sock;http://127.0.0.1:2379/",
+         "unix:///run/etcd.sock;http://127.0.0.1:2379/"},
+        {"etcd://https://127.0.0.1:2379/,unixs:///run/etcd.sock",
+         "https://127.0.0.1:2379/,unixs:///run/etcd.sock"},
+        {"etcd:// unix://etcd.sock ; 127.0.0.1:2379 ",
+         " unix://etcd.sock ; 127.0.0.1:2379"},
+    };
+    for (const auto& [entry, expected_connstring] : cases) {
+        SCOPED_TRACE(entry);
+        auto spec = ParseHABackendSpec(entry);
+#ifdef STORE_USE_ETCD
+        ASSERT_TRUE(spec.has_value());
+        ASSERT_TRUE(spec->has_value());
+        EXPECT_EQ(HABackendType::ETCD, (*spec)->type);
+        EXPECT_EQ(expected_connstring, (*spec)->connstring);
+#else
+        ASSERT_FALSE(spec.has_value());
+        EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, spec.error());
+#endif
+    }
+}
+
+TEST(HABackendAvailabilityTest, MalformedEtcdUnixEndpointIsRejected) {
+    for (const auto& entry :
+         {"etcd://unix:", "etcd://unixs:", "etcd://unix://", "etcd://unixs://",
+          "etcd://unix:///", "etcd://unixs:///", "etcd://unix:///run/",
+          "etcd://unixs:///run/", "etcd://unix:///run/etcd.sock;",
+          "etcd://unix+http:///run/etcd.sock"}) {
+        SCOPED_TRACE(entry);
+        auto spec = ParseHABackendSpec(entry);
+        ASSERT_FALSE(spec.has_value());
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, spec.error());
+    }
+}
+
 TEST(HABackendAvailabilityTest, EtcdRequiresExplicitScheme) {
     for (const auto& entry :
          {"127.0.0.1:2379;127.0.0.2:2379", "127.0.0.1:2379,127.0.0.2:2379",
-          "https://127.0.0.1:2379"}) {
+          "https://127.0.0.1:2379", "unix:///run/etcd.sock",
+          "unixs:///run/etcd.sock"}) {
         auto spec = ParseHABackendSpec(entry);
         ASSERT_FALSE(spec.has_value()) << entry;
         EXPECT_EQ(ErrorCode::INVALID_PARAMS, spec.error()) << entry;

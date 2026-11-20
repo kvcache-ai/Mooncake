@@ -27,6 +27,18 @@ bool IsHostCharacter(char character) {
 
 bool ParseEtcdEndpoint(std::string_view endpoint) {
     endpoint = TrimEndpoint(endpoint);
+    if (endpoint.starts_with("unix:") || endpoint.starts_with("unixs:")) {
+        // etcd supports both unix(s)://path and unix(s):path. Validate only
+        // the socket path here; preserve the original endpoint for Go, which
+        // distinguishes relative/absolute paths and the TLS scheme.
+        auto socket_path = endpoint.substr(endpoint.find(':') + 1);
+        if (socket_path.starts_with("//")) {
+            socket_path.remove_prefix(2);
+        }
+        return !socket_path.empty() && socket_path.back() != '/' &&
+               socket_path.find('\0') == std::string_view::npos;
+    }
+
     bool is_http_url = false;
     if (endpoint.starts_with("http://")) {
         is_http_url = true;
