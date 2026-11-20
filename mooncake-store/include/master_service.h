@@ -1371,6 +1371,10 @@ class MasterService {
     // its key, under that key's lock: the tasks in flight on it, its replicas'
     // resources and its KV events. The key stays held, so the caller may
     // publish a replacement.
+    void CancelOffloadOfRemovedObject(ObjectMetadata& metadata,
+                                      route::ObjectState& state,
+                                      const TenantId& tenant_id,
+                                      const std::string& key);
     void EraseMetadata(metadata::Namespace& ns, const route::WriteGuard& hold,
                        EraseMode erase_mode = EraseMode::kFull);
     void FinalizeRemovedReplicasAfterDurable(
@@ -1409,7 +1413,7 @@ class MasterService {
     // and the object with them.
     tl::expected<void, ErrorCode> MarkRemovedAndPersist(
         const TenantId& tenant_id, const std::string& key,
-        ObjectMetadata& metadata);
+        ObjectMetadata& metadata, route::ObjectState& state);
     // Returns why a remove may not take the object, or nothing if it may: its
     // lease is still held (unless `force`), a replica is incomplete, or a
     // replication task reads it.

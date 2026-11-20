@@ -2154,6 +2154,27 @@ void MasterService::CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor) {
     }
 }
 
+void MasterService::CancelOffloadOfRemovedObject(ObjectMetadata& metadata,
+                                                 route::ObjectState& state,
+                                                 const TenantId& tenant_id,
+                                                 const std::string& key) {
+    // Clean up offloading_task + dec_refcnt before erasing metadata.
+    // When BatchEvict deletes metadata, Store Worker may still have an
+    // in-flight offload for this key. Without this cleanup the task
+    // becomes an orphan that only expires after 600s.
+    if (state.offloading_task) {
+        auto source = metadata.GetReplicaByID(state.offloading_task->source_id);
+        if (source != nullptr) {
+            source->dec_refcnt();
+        }
+        state.offloading_task.reset();
+    }
+    // The mailbox entry must be dropped too, otherwise the next
+    // OffloadObjectHeartbeat drains a task-less key back to the client and
+    // produces an orphan bucket.
+    local_ssd_manager_.RemoveOffloadFromAll(tenant_id, key);
+}
+
 // EraseMetadata deletes the object and, with it, every task in flight for
 // it. It gives back what each task holds first: the offload's and the
 // replication's source refcount. Callers no longer need to clean these up
@@ -2170,21 +2191,7 @@ void MasterService::EraseMetadata(metadata::Namespace& ns,
         ns.BeforeTearDown(hold);
     }
 
-    // Clean up offloading_task + dec_refcnt before erasing metadata.
-    // When BatchEvict deletes metadata, Store Worker may still have an
-    // in-flight offload for this key. Without this cleanup the task
-    // becomes an orphan that only expires after 600s.
-    if (state.offloading_task) {
-        auto source = metadata.GetReplicaByID(state.offloading_task->source_id);
-        if (source != nullptr) {
-            source->dec_refcnt();
-        }
-        state.offloading_task.reset();
-    }
-    // The mailbox entry must be dropped too, otherwise the next
-    // OffloadObjectHeartbeat drains a task-less key back to the client and
-    // produces an orphan bucket.
-    local_ssd_manager_.RemoveOffloadFromAll(tenant_id, key);
+    CancelOffloadOfRemovedObject(metadata, state, tenant_id, key);
     if (state.replication_task) {
         auto source =
             metadata.GetReplicaByID(state.replication_task->source_id);
@@ -7354,15 +7361,16 @@ auto MasterService::RemoveObject(const std::string& key,
     }
 
     if (enable_ha_ && enable_oplog_) {
-        return MarkRemovedAndPersist(object_id.tenant_id, key, metadata);
+        return MarkRemovedAndPersist(object_id.tenant_id, key, metadata,
+                                     accessor.GetState());
     }
     accessor.Erase();
     return {};
 }
 
 tl::expected<void, ErrorCode> MasterService::MarkRemovedAndPersist(
-    const TenantId& tenant_id, const std::string& key,
-    ObjectMetadata& metadata) {
+    const TenantId& tenant_id, const std::string& key, ObjectMetadata& metadata,
+    route::ObjectState& state) {
     auto reservation = ReserveBatchOpLogSlot();
     if (!reservation) {
         return tl::make_unexpected(reservation.error());
@@ -7387,6 +7395,7 @@ tl::expected<void, ErrorCode> MasterService::MarkRemovedAndPersist(
     // which the caller holds, so it cannot run before the marks land.
     metadata.VisitReplicas(&Replica::fn_is_completed,
                            [](Replica& replica) { replica.mark_removed(); });
+    CancelOffloadOfRemovedObject(metadata, state, tenant_id, key);
     return {};
 }
 
@@ -7462,7 +7471,8 @@ MasterService::RemoveResult MasterService::RemoveTenantObjects(
             metadata.TotalLength() *
             metadata.CountReplicas(&Replica::fn_is_memory_replica);
         if (enable_ha_ && enable_oplog_) {
-            if (!MarkRemovedAndPersist(tenant_id, candidate.key, metadata)) {
+            if (!MarkRemovedAndPersist(tenant_id, candidate.key, metadata,
+                                       accessor.GetState())) {
                 result.skipped_object = true;
                 continue;
             }
@@ -7661,8 +7671,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
         }
 
         if (enable_ha_ && enable_oplog_) {
-            results[original_idx] =
-                MarkRemovedAndPersist(normalized_tenant, key, metadata);
+            results[original_idx] = MarkRemovedAndPersist(
+                normalized_tenant, key, metadata, accessor.GetState());
             continue;
         }
         accessor.Erase();
