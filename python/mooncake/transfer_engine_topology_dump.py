@@ -59,18 +59,23 @@ def resolve_backend(backend: str) -> str:
     if backend != "auto":
         return backend
     try:
-        from mooncake.engine import _is_tent_selected
+        import mooncake.engine as engine
     except ModuleNotFoundError as exc:
         if exc.name not in ("mooncake", "mooncake.engine"):
             raise
-        # The diagnostic can also run with just the standalone tent module.
-        disabled = (None, "0", "false", "off", "no")
-        use_tent = any(
-            os.getenv(name) not in disabled for name in ("MC_USE_TENT", "MC_USE_TEV1")
-        )
     else:
-        use_tent = _is_tent_selected()
-    return "tent" if use_tent else "te"
+        selector = getattr(engine, "_is_tent_selected", None)
+        if selector is not None:
+            return "tent" if selector() else "te"
+        if not getattr(engine, "SUPPORT_TENT", False):
+            return "te"
+
+    # A source checkout can also run with an older wheel or standalone tent.
+    disabled = (None, "0", "false", "off", "no")
+    for name in ("MC_USE_TENT", "MC_USE_TEV1"):
+        if os.getenv(name) not in disabled:
+            return "tent"
+    return "te"
 
 
 def apply_backend(backend: str) -> None:
@@ -157,44 +162,44 @@ def main():
     args = parse_args()
     os.environ["MC_LOG_LEVEL"] = "ERROR"
 
-    backend = resolve_backend(args.backend)
-    apply_backend(backend)
-
     temp_conf = None
-    if args.custom_topo_json is not None:
-        os.environ["MC_CUSTOM_TOPO_JSON"] = args.custom_topo_json
-        mode = f"custom ({args.custom_topo_json})"
-    elif args.use_custom_topo:
-        custom_path = os.environ.get("MC_CUSTOM_TOPO_JSON", "")
-        has_inline = False
-        if backend == "tent":
-            data, _ = _load_tent_conf_object(os.environ.get("MC_TENT_CONF", ""))
-            topo = data.get("topology") if isinstance(data, dict) else None
-            has_inline = isinstance(topo, dict) and (
-                "priority_matrix" in topo or "custom_json_path" in topo
-            )
-        if not custom_path and not has_inline:
-            print(
-                "error: --use-custom-topo requires MC_CUSTOM_TOPO_JSON "
-                "or TENT topology/priority_matrix|custom_json_path in "
-                "MC_TENT_CONF",
-                file=sys.stderr,
-            )
-            return 1
-        mode = (
-            f"custom ({custom_path})"
-            if custom_path
-            else "custom (MC_TENT_CONF topology)"
-        )
-    else:
-        # Force discover path. Empty string still makes getenv non-null in C++,
-        # which falls back to auto-detect when the path cannot be loaded.
-        os.environ["MC_CUSTOM_TOPO_JSON"] = ""
-        if backend == "tent":
-            temp_conf = sanitize_tent_conf_for_discover()
-        mode = "discover"
-
     try:
+        backend = resolve_backend(args.backend)
+        apply_backend(backend)
+
+        if args.custom_topo_json is not None:
+            os.environ["MC_CUSTOM_TOPO_JSON"] = args.custom_topo_json
+            mode = f"custom ({args.custom_topo_json})"
+        elif args.use_custom_topo:
+            custom_path = os.environ.get("MC_CUSTOM_TOPO_JSON", "")
+            has_inline = False
+            if backend == "tent":
+                data, _ = _load_tent_conf_object(os.environ.get("MC_TENT_CONF", ""))
+                topo = data.get("topology") if isinstance(data, dict) else None
+                has_inline = isinstance(topo, dict) and (
+                    "priority_matrix" in topo or "custom_json_path" in topo
+                )
+            if not custom_path and not has_inline:
+                print(
+                    "error: --use-custom-topo requires MC_CUSTOM_TOPO_JSON "
+                    "or TENT topology/priority_matrix|custom_json_path in "
+                    "MC_TENT_CONF",
+                    file=sys.stderr,
+                )
+                return 1
+            mode = (
+                f"custom ({custom_path})"
+                if custom_path
+                else "custom (MC_TENT_CONF topology)"
+            )
+        else:
+            # Force discover path. Empty string still makes getenv non-null in C++,
+            # which falls back to auto-detect when the path cannot be loaded.
+            os.environ["MC_CUSTOM_TOPO_JSON"] = ""
+            if backend == "tent":
+                temp_conf = sanitize_tent_conf_for_discover()
+            mode = "discover"
+
         if backend == "tent":
             topo = dump_tent_topology(args.device_name)
         else:

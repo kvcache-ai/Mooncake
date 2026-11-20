@@ -21,10 +21,11 @@ class TopologyBackendTest(unittest.TestCase):
                 {
                     "MC_USE_TENT": "0",
                     "MC_USE_TEV1": "off",
-                    "MC_FORCE_TCP": "1",
                     "MC_CUSTOM_TOPO_JSON": str(path),
                 },
             ):
+                # Forced TCP skips topology discovery, including custom matrices.
+                os.environ.pop("MC_FORCE_TCP", None)
                 self.assertFalse(_is_tent_selected())
                 self.assertEqual(resolve_backend("auto"), "te")
                 actual = TransferEngine().get_local_topology()

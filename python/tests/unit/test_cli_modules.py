@@ -231,3 +231,21 @@ def test_explicit_tent_fallback_checks_build(monkeypatch, mooncake_pkg, supporte
     module.apply_backend("te")
     assert "MC_USE_TENT" not in os.environ
     assert "MC_USE_TEV1" not in os.environ
+
+
+@pytest.mark.parametrize(
+    ("supported", "value", "expected"),
+    [(False, "1", "te"), (True, "0", "te"), (True, "", "tent")],
+)
+def test_topology_source_cli_with_older_wheel(
+    monkeypatch, mooncake_pkg, supported, value, expected
+):
+    engine = ModuleType("mooncake.engine")
+    engine.SUPPORT_TENT = supported
+    monkeypatch.setitem(sys.modules, "mooncake.engine", engine)
+    monkeypatch.setenv("MC_USE_TENT", value)
+    monkeypatch.delenv("MC_USE_TEV1", raising=False)
+    assert (
+        _load_module("transfer_engine_topology_dump.py").resolve_backend("auto")
+        == expected
+    )
