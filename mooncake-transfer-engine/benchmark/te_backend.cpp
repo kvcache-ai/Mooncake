@@ -689,6 +689,11 @@ int TEBenchRunner::startInitiator(int num_threads) {
     for (const auto& name : names) {
         SegmentID handle = engine_->openSegment(name);
         auto info = engine_->getMetadata()->getSegmentDescByID(handle);
+        if (!info || info->buffers.empty()) {
+            LOG(ERROR) << "Target segment " << name
+                       << " is unavailable or has no registered buffers";
+            return -1;
+        }
         std::sort(info->buffers.begin(), info->buffers.end(),
                   [](const TransferMetadata::BufferDesc& a,
                      const TransferMetadata::BufferDesc& b) {
