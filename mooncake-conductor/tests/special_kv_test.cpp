@@ -1061,5 +1061,126 @@ TEST_P(SpecialKVDeploymentFormats,
 INSTANTIATE_TEST_SUITE_P(StoreKeyFormats, SpecialKVDeploymentFormats,
                          ::testing::Bool());
 
+
+// Regression guard for deployment activation across instances of one ContextKey.
+// Only the instance that publishes the AscendStore declaration runs
+// ActivateDeployment(); before the propagation fix every other instance kept an
+// empty readable-domain set in its HybridIndex reader, so the shared pool copy
+// stayed invisible to it and /query reported cpu_share = 0.
+TEST(SpecialKVDeployment, DeclarationFromOneInstanceMakesPoolCopyVisibleToPeers) {
+    EventManager manager({}, 0);
+    PrefixCacheTable* index = manager.GetIndexer();
+    ASSERT_NE(index, nullptr);
+
+    auto p0 = Service();
+    p0.model_name = "GLM-5.3-Flash";   // in the cache-spec table: needs grouping
+    auto p1 = p0;
+    p1.instance_id = "p1";
+    p1.endpoint = "tcp://127.0.0.1:49001";
+    auto p2 = p0;
+    p2.instance_id = "p2";
+    p2.endpoint = "tcp://127.0.0.1:49002";
+    const ContextKey context{"default", p0.model_name, "", 16};
+
+    // Every instance joins the same ContextKey with the "unavailable" placeholder
+    // whose readable_domains is empty: the state a non-declaring instance is
+    // stuck in without the fix.
+    for (const auto& service : {p0, p1, p2}) {
+        const auto placeholder = ResolveModelLayout(service);
+        ASSERT_NE(placeholder.layout, nullptr);
+        ASSERT_FALSE(placeholder.layout->unavailable_reason.empty());
+        ASSERT_TRUE(placeholder.readable_domains.empty());
+        const auto registered = index->Register(
+            {.context = context,
+             .profile = service.hash_profile,
+             .instance_id = service.instance_id,
+             .dp_rank = service.dp_rank,
+             .effective_block_size = 16,
+             .layout = placeholder.layout,
+             .readable_domains = placeholder.readable_domains});
+        ASSERT_EQ(registered.error, "");
+    }
+
+    // p0/p1 are wired into the manager; p2 deliberately is not, so no declaration
+    // can ever reach it (the pre-fix situation of every peer).
+    for (const auto& service : {p0, p1}) {
+        kvevent::EventManagerTestPeer::FakeActiveService(
+            manager,
+            kvevent::MakeServiceKey(service.instance_id, service.tenant_id,
+                                    service.dp_rank),
+            service);
+    }
+    auto handler = kvevent::EventManagerTestPeer::HandlerFor(
+        manager, kvevent::MakeServiceKey(p0.instance_id, p0.tenant_id,
+                                         p0.dp_rank));
+    ASSERT_NE(handler, nullptr);
+
+    // AscendStore declaration: one dense attention group plus one aligned
+    // checkpoint (KDA) group. GLM Flash also verifies the pooled-indexer tail.
+    Json::Value root;
+    root["format"] = "ascend-store-v1";
+    root["model_name"] = "GLM-5.3-Flash-w8a8";
+    root["hash_unit_tokens"] = 16;
+    root["alignment_tokens"] = 16;
+    root["transient_alignment_tokens"] = 4;
+    root["storage_domain"] = "ascend://pool:1";
+    const auto append_group = [&root](int64_t id, const char* kind,
+                                      bool align) {
+        Json::Value group;
+        group["group_idx"] = id;
+        group["kind"] = kind;
+        group["block_tokens"] = 16;
+        if (align) group["mamba_cache_mode"] = "align";
+        group["key_prefixes"].append(
+            std::string("GLM-5.3-Flash-w8a8") +
+            "@dcp:0@head_or_tp_rank:0@pp_rank:0@group:" + std::to_string(id) +
+            "@cache_role:kv@cache_family:default@");
+        root["groups"].append(group);
+    };
+    append_group(0, "mla_attention", false);
+    append_group(2, "mamba", true);
+
+    zmq::VllmStoredEvent event;
+    event.block_size = 16;
+    event.medium = "GPU";
+    event.group_idx = 0;
+    event.kv_cache_spec_kind = "mla_attention";
+    event.block_hashes = {Hashes().front().projected.value};
+    event.kv_cache_layout = root.toStyledString();
+    ASSERT_EQ(handler->HandleBatch(Batch(event), Metadata(p0)), "");
+
+    // The declaration supplies the group geometry, so shared objects can be
+    // recorded now: one copy for each required group, first hash unit only.
+    for (size_t slot = 0; slot < 2; ++slot) {
+        GroupMutation shared{
+            .context = context,
+            .prefixes = {Hashes().front().projected},
+            .group = slot,
+            .part = size_t{0},
+            .tier = StorageTier::kCpuShare,
+            .owner = SharedObjectOwner{.source_stream = "store",
+                                       .backend_id = "backend",
+                                       .object_id =
+                                           "object-" + std::to_string(slot)},
+            .storage_domain = "ascend://pool:1"};
+        ASSERT_EQ(index->StoreGrouped(shared), "") << "slot " << slot;
+    }
+
+    const auto hits = index->Query(context, Tokens());
+    ASSERT_EQ(hits.count("p0"), 1u);
+    ASSERT_EQ(hits.count("p1"), 1u);
+    ASSERT_EQ(hits.count("p2"), 1u);
+    // Only the first hash unit was published, so the joint prefix ends there.
+    // Both instances reached by the propagation resolve the shared copy without
+    // ever storing it themselves.
+    EXPECT_EQ(hits.at("p0").cpu_share, 16);
+    EXPECT_EQ(hits.at("p1").cpu_share, 16);
+    EXPECT_EQ(hits.at("p0").device, 0);
+    EXPECT_EQ(hits.at("p1").device, 0);
+    // p2 never received the deployment: its reader keeps an empty domain set, so
+    // the same shared copy stays invisible. This pins the pre-fix behaviour.
+    EXPECT_EQ(hits.at("p2").cpu_share, 0);
+}
+
 }  // namespace
 }  // namespace mooncake::conductor

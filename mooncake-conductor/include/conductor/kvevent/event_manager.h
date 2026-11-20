@@ -69,6 +69,8 @@ class KVEventHandler : public zmq::EventHandler {
     std::string InvalidateEndpoint();
     // Wake a Store subscription whose initial events preceded the declaration.
     void RefreshDeployment();
+    // 把同一 ContextKey 已激活的部署挂到本实例（登记 reader、继承可读存储域）。
+    bool AttachDeployment(const prefixindex::SourceLayout& binding);
 
    private:
     friend class KVEventHandlerTestPeer;
@@ -157,7 +159,12 @@ class KVEventHandler : public zmq::EventHandler {
     EventManager* manager_;
     common::ServiceConfig service_;
     prefixindex::SourceLayout layout_;
-    const bool grouped_context_;
+    // layout 由事件中的 kv_cache_layout 声明决定，不能固定在构造期；
+    // 因此统一用本函数实时判断是否走分组（多 cache group）路径。
+    bool grouped_context() const { return layout_.layout != nullptr; }
+    // 同一 ContextKey 下任意实例宣告的部署都应能被其他实例复用：
+    // 本实例没有 layout 时，从索引取已激活的部署并登记自己的 reader。
+    bool EnsureDeployment();
     std::mutex grouped_dispatch_mu_;
     std::string deployment_declaration_;
     std::deque<std::pair<zmq::DecodedBatch, zmq::MessageMetadata>> pending_;
@@ -214,6 +221,9 @@ class EventManager {
     // under mu_ (read).
     bool IsStopped();
     void RefreshMooncakeDeployments(const prefixindex::ContextKey& context);
+    // 把某个 ContextKey 上已激活的部署传播给该 ContextKey 下的所有订阅实例。
+    void PropagateDeployment(const prefixindex::ContextKey& context,
+                             const prefixindex::SourceLayout& binding);
 
    private:
     friend class KVEventHandler;
