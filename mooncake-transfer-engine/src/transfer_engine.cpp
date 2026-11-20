@@ -24,6 +24,7 @@
 #include <cuda_runtime_api.h>
 #endif
 #include "error.h"
+#include "transfer_sharding.h"
 
 namespace mooncake {
 namespace {
@@ -1390,30 +1391,43 @@ std::string TransferEngine::showLinks(bool json) const {
 
 namespace mooncake {
 
-TransferShardingExecutor& TransferEngine::shardingExecutor() {
+bool TransferEngine::isBatchSubmitEligible(size_t count) const {
 #ifdef USE_TENT
-    if (use_tent_) return impl_tent_->shardingExecutor();
+    if (use_tent_)
+        return impl_tent_ && impl_tent_->isBatchSubmitEligible(count);
 #endif
-    return *sharding_executor_;
+    return impl_ && sharding_executor_ && sharding_executor_->eligible(count);
 }
+
+struct TransferEngine::TESubBatchAdapter {
+    using Executor = TransferShardingExecutor;
+    TransferEngine& engine;
+    const std::vector<TransferRequest>& requests;
+    BatchID sub_batch_id = INVALID_BATCH_ID;
+
+    Executor::Result allocate();
+    Executor::Result submit();
+    SubBatchProgress poll();
+    Executor::Result release();
+};
 
 TransferShardingExecutor::Result TransferEngine::TESubBatchAdapter::allocate() {
     sub_batch_id = engine.allocateBatchID(requests.size());
     return sub_batch_id == INVALID_BATCH_ID || sub_batch_id == 0
-               ? Executor::Result{-1, "Could not allocate sub-batch"}
+               ? Executor::Result::Error("Could not allocate sub-batch")
                : Executor::Result::OK();
 }
 
 TransferShardingExecutor::Result TransferEngine::TESubBatchAdapter::submit() {
     auto status = engine.submitTransfer(sub_batch_id, requests);
     return status.ok() ? Executor::Result::OK()
-                       : Executor::Result{-1, status.ToString()};
+                       : Executor::Result::Error(status.ToString());
 }
 
 SubBatchProgress TransferEngine::TESubBatchAdapter::poll() {
     TransferStatus status{};
     auto polled = engine.getBatchTransferStatus(sub_batch_id, status);
-    if (!polled.ok()) throw std::runtime_error(polled.ToString());
+    if (!polled.ok()) return {true, false, polled.ToString()};
     const bool terminal = status.s != TransferStatusEnum::WAITING &&
                           status.s != TransferStatusEnum::PENDING;
     return {terminal, status.s == TransferStatusEnum::COMPLETED, {}};
@@ -1424,7 +1438,7 @@ TransferShardingExecutor::Result TransferEngine::TESubBatchAdapter::release() {
     sub_batch_id = INVALID_BATCH_ID;
     return status.ok() || status.IsBatchCleanupDeferred()
                ? Executor::Result::OK()
-               : Executor::Result{-1, status.ToString()};
+               : Executor::Result::Error(status.ToString());
 }
 
 bool TransferEngine::supportsShardedTransfer(SegmentID peer) const {
@@ -1440,8 +1454,7 @@ std::optional<Status> TransferEngine::tryShardedTransfer(
     SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
     std::chrono::nanoseconds timeout, int transport_hint) {
     using Executor = TransferShardingExecutor;
-    auto& executor = shardingExecutor();
-    if (!executor.eligible(count)) return std::nullopt;
+    if (!isBatchSubmitEligible(count)) return std::nullopt;
 #ifdef USE_TENT
     if (use_tent_) {
         auto status = impl_tent_->tryShardedTransfer(
@@ -1485,6 +1498,7 @@ std::optional<Status> TransferEngine::tryShardedTransfer(
                             : Status::Context(status->ToString());
     }
 #endif
+    auto& executor = *sharding_executor_;
     const auto deadline = Executor::Clock::now() + timeout;
     if (!supportsShardedTransfer(peer)) {
         VLOG(1) << "Synchronous sharding admission declined: peer=" << peer
@@ -1497,8 +1511,9 @@ std::optional<Status> TransferEngine::tryShardedTransfer(
 #ifdef USE_CUDA
     const auto cuda_status = cudaGetDevice(&device);
     if (cuda_status == cudaErrorNoDevice ||
-        cuda_status == cudaErrorInsufficientDriver) {
-        // CUDA builds also support host-only transfers without a GPU/driver.
+        cuda_status == cudaErrorInsufficientDriver ||
+        cuda_status == cudaErrorInitializationError) {
+        // Host-only transfers also work without an initialized CUDA runtime.
         device = -1;
         (void)cudaGetLastError();
     } else if (cuda_status != cudaSuccess) {
@@ -1513,20 +1528,20 @@ std::optional<Status> TransferEngine::tryShardedTransfer(
         [&](Executor::Range range, const Executor::Cancellation& cancellation) {
 #ifdef USE_CUDA
             if (device >= 0 && cudaSetDevice(device) != cudaSuccess)
-                return Executor::Result{-1,
-                                        "Could not bind sharding CUDA device"};
+                return Executor::Result::Error(
+                    "Could not bind sharding CUDA device");
 #endif
             auto& requests = request_storage[range.index];
             requests = builder(range.begin, range.end);
             if (requests.size() != range.end - range.begin)
-                return Executor::Result{-1, "Invalid sub-batch request count"};
+                return Executor::Result::Error(
+                    "Invalid sub-batch request count");
             for (const auto& request : requests)
                 if (request.target_id != peer ||
                     (request.opcode != TransferRequest::READ &&
                      request.opcode != TransferRequest::WRITE))
-                    return Executor::Result{
-                        -1,
-                        "Sharded batch must contain READ/WRITE to one peer"};
+                    return Executor::Result::Error(
+                        "Sharded batch must contain READ/WRITE to one peer");
             TESubBatchAdapter sub_batch{*this, requests};
             return runSubBatch(sub_batch, cancellation);
         });

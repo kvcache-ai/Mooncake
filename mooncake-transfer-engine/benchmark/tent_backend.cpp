@@ -529,6 +529,7 @@ double TENTBenchRunner::runSingleTransfer(
     XferBenchTimer parent_timer;
     auto build = [&](size_t begin, size_t end) {
         std::vector<Request> requests;
+        requests.reserve(end - begin);
         for (uint64_t i = begin; i < end; ++i) {
             Request entry;
             entry.opcode = opcode == READ ? Request::READ : Request::WRITE;
@@ -551,6 +552,9 @@ double TENTBenchRunner::runSingleTransfer(
             transport_hint_);
         if (sharded_result) {
             if (!sharded_result->ok()) {
+                // Ordinary free may defer cleanup while transport work still
+                // owns the payload. Preserve engine and buffers at exit.
+                abandoned_batches_.fetch_add(1);
                 LOG(ERROR) << "Sharded transfer failed: "
                            << sharded_result->ToString();
                 return abortTransfer("Sharded transfer failed");

@@ -19,7 +19,10 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
+
+#include <glog/logging.h>
 
 namespace mooncake {
 
@@ -59,7 +62,18 @@ class TransferShardingExecutor {
         int code = 0;
         std::string error;
         static Result OK() { return {0, {}}; }
+        static Result Error(std::string error) {
+            return {kError, std::move(error)};
+        }
+        static Result Canceled(std::string error = {}) {
+            return {kCanceled, std::move(error)};
+        }
         bool ok() const { return code == 0; }
+        bool isCanceled() const { return code == kCanceled; }
+
+       private:
+        static constexpr int kError = -1;
+        static constexpr int kCanceled = -2;
     };
     struct Range {
         size_t index;
@@ -106,8 +120,11 @@ class TransferShardingExecutor {
             auto [end, ec] =
                 std::from_chars(text.data(), text.data() + text.size(), parsed);
             if (ec != std::errc{} || end != text.data() + text.size() ||
-                parsed < low || parsed > high)
-                throw std::invalid_argument(std::string("Invalid ") + name);
+                parsed < low || parsed > high) {
+                LOG(WARNING) << "Invalid " << name << " environment value: '"
+                             << value << "', using default " << fallback;
+                return fallback;
+            }
             return parsed;
         }
     };
@@ -153,9 +170,10 @@ class TransferShardingExecutor {
     }
 
     Result execute(size_t count, Clock::time_point deadline, Work work) {
-        if (!eligible(count)) return {-1, "Sharding executor not eligible"};
+        if (!eligible(count))
+            return Result::Error("Sharding executor not eligible");
         if (active_executor_ == this)
-            return {-1, "Recursive transfer sharding would deadlock"};
+            return Result::Error("Recursive transfer sharding would deadlock");
         auto ranges = partition(count, config_.threads);
         auto parent = std::make_shared<ParentBatch>(ranges.size(), deadline,
                                                     std::move(work));
@@ -169,8 +187,9 @@ class TransferShardingExecutor {
             if (!admission_.wait_until(lock, deadline, [&] {
                     return stopping_ || parents_.size() < config_.max_parents;
                 }))
-                return {-1, "Transfer sharding admission timed out"};
-            if (stopping_) return {-1, "Transfer sharding is shutting down"};
+                return Result::Error("Transfer sharding admission timed out");
+            if (stopping_)
+                return Result::Error("Transfer sharding is shutting down");
             parents_.push_back(parent);
             jobs_.splice(jobs_.end(), pending);
         }
@@ -197,8 +216,11 @@ class TransferShardingExecutor {
         admission_.notify_one();
         idle_.notify_all();
         for (const auto& result : parent->sub_batch_results)
-            if (result.code != 0 && result.code != kCanceled) return result;
-        if (timed_out) return {-1, "Transfer sharding timed out"};
+            if (!result.ok() && !result.isCanceled()) return result;
+        if (timed_out || parent->deadline_expired)
+            return Result::Error("Transfer sharding timed out");
+        if (parent->shutdown.load(std::memory_order_acquire))
+            return Result::Error("Transfer sharding is shutting down");
         for (const auto& result : parent->sub_batch_results)
             if (!result.ok()) return result;
         return Result::OK();
@@ -224,7 +246,6 @@ class TransferShardingExecutor {
     }
 
    private:
-    static constexpr int kCanceled = -2;
     struct ParentBatch {
         ParentBatch(size_t count, Clock::time_point until, Work function)
             : remaining_sub_batches(count),
@@ -234,6 +255,7 @@ class TransferShardingExecutor {
         std::mutex mutex;
         std::condition_variable finished;
         size_t remaining_sub_batches;
+        bool deadline_expired = false;
         std::atomic<bool> stopped{false};
         std::atomic<bool> shutdown{false};
         Clock::time_point deadline;
@@ -249,6 +271,11 @@ class TransferShardingExecutor {
         auto& parent = *job.parent;
         if (!result.ok()) parent.stopped.store(true, std::memory_order_release);
         std::lock_guard<std::mutex> lock(parent.mutex);
+        // Completion can satisfy wait_until's predicate after the deadline
+        // without reporting a timeout. Record canceled jobs that reached it;
+        // execute() reports the parent reason after checking actual errors.
+        if (result.isCanceled() && Clock::now() >= parent.deadline)
+            parent.deadline_expired = true;
         parent.sub_batch_results[job.range.index] = std::move(result);
         if (--parent.remaining_sub_batches == 0) parent.finished.notify_one();
     }
@@ -266,7 +293,7 @@ class TransferShardingExecutor {
         // The queue lock gives either this caller or a worker each job, never
         // both. Settle without allocating error strings or holding the queue
         // lock; execute() supplies the timeout diagnostic after joining.
-        for (const auto& job : canceled) finishJob(job, {kCanceled, {}});
+        for (const auto& job : canceled) finishJob(job, Result::Canceled());
     }
 
     void worker() {
@@ -285,14 +312,15 @@ class TransferShardingExecutor {
                                       &parent.shutdown};
             Result result;
             if (cancellation.requested()) {
-                result = {kCanceled, "Transfer sharding canceled or timed out"};
+                result = Result::Canceled("Parent canceled before preparation");
             } else {
                 try {
                     result = parent.work(job.range, cancellation);
                 } catch (const std::exception& error) {
-                    result = {-1, error.what()};
+                    result = Result::Error(error.what());
                 } catch (...) {
-                    result = {-1, "Unknown transfer sharding exception"};
+                    result =
+                        Result::Error("Unknown transfer sharding exception");
                 }
             }
             finishJob(job, std::move(result));
@@ -331,38 +359,45 @@ TransferShardingExecutor::Result runSubBatch(
         result = adapter.allocate();
         if (!result.ok()) return result;
         allocated = true;
-        result = cancellation.requested()
-                     ? Executor::Result{-1, "Parent canceled before submission"}
-                     : adapter.submit();
+        if (cancellation.requested()) {
+            result =
+                Executor::Result::Canceled("Parent canceled before submission");
+        } else {
+            result = adapter.submit();
+        }
     } catch (const std::exception& error) {
-        result = {-1, error.what()};
+        result = Executor::Result::Error(error.what());
     } catch (...) {
-        result = {-1, "Unknown synchronous batch exception"};
+        result = Executor::Result::Error("Unknown synchronous batch exception");
     }
     if (!allocated) return result;
     while (result.ok()) {
         if (cancellation.expired()) {
-            result = {-1, "Parent transfer canceled or timed out"};
+            result = Executor::Result::Canceled("Parent transfer canceled");
             break;
         }
         try {
             auto progress = adapter.poll();
             if (progress.terminal) {
                 if (!progress.success)
-                    result = {-1, progress.error.empty()
-                                      ? "Sub-batch transfer failed"
-                                      : progress.error};
+                    result = Executor::Result::Error(
+                        progress.error.empty() ? "Sub-batch transfer failed"
+                                               : progress.error);
                 break;
             }
         } catch (const std::exception& error) {
-            if (result.ok()) result = {-1, error.what()};
+            if (result.ok()) result = Executor::Result::Error(error.what());
         } catch (...) {
-            if (result.ok()) result = {-1, "Unknown batch polling exception"};
+            if (result.ok())
+                result =
+                    Executor::Result::Error("Unknown batch polling exception");
         }
         if (result.ok()) std::this_thread::yield();
     }
     // Never retry a free that may already have invalidated the native handle.
     auto released = adapter.release();
+    // A native release error must not be hidden by cooperative cancellation.
+    if (result.isCanceled() && !released.ok()) return released;
     return result.ok() ? std::move(released) : result;
 }
 

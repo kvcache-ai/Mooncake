@@ -780,6 +780,7 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
     XferBenchTimer parent_timer;
     auto build = [&](size_t begin, size_t end) {
         std::vector<TransferRequest> requests;
+        requests.reserve(end - begin);
         for (uint64_t i = begin; i < end; ++i) {
             TransferRequest entry;
             entry.opcode =
@@ -796,6 +797,9 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
         target_id, batch_size, build, std::chrono::seconds(30));
     if (sharded_result) {
         if (!sharded_result->ok()) {
+            // Ordinary free may defer cleanup while transport work still
+            // owns the payload. Preserve the buffers until process exit.
+            abandoned_batches_.fetch_add(1);
             LOG(ERROR) << "Sharded transfer failed: "
                        << sharded_result->ToString();
             noteTransferFailed();

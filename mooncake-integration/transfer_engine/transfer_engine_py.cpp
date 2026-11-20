@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transfer_engine_py.h"
+#include "transfer_sharding.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1114,7 +1115,7 @@ int TransferEnginePy::batchTransferSync(
     auto total_length = std::accumulate(lengths.begin(), lengths.end(), 0ull);
     auto batch_size = buffers.size();
     const int nic_hint_id = resolveNicHint(nic_hint);
-    if (!notify && engine_->shardingExecutor().eligible(batch_size) &&
+    if (!notify && engine_->isBatchSubmitEligible(batch_size) &&
         independentTransferDestinations(
             opcode == TransferOpcode::WRITE ? peer_buffer_addresses : buffers,
             lengths)) {

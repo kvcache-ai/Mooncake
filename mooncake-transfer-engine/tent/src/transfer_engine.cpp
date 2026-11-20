@@ -26,9 +26,11 @@ namespace mooncake {
 namespace tent {
 
 TransferEngine::TransferEngine()
-    : impl_(std::make_unique<TransferEngineImpl>()) {}
+    : impl_(std::make_unique<TransferEngineImpl>()),
+      sharding_executor_(std::make_shared<TransferShardingExecutor>()) {}
 
-TransferEngine::TransferEngine(const std::string config_path) {
+TransferEngine::TransferEngine(const std::string config_path)
+    : sharding_executor_(std::make_shared<TransferShardingExecutor>()) {
     auto conf = std::make_shared<Config>();
     auto status = conf->loadFile(config_path);
     if (!status.ok()) {
@@ -39,7 +41,8 @@ TransferEngine::TransferEngine(const std::string config_path) {
 }
 
 TransferEngine::TransferEngine(std::shared_ptr<Config> conf)
-    : impl_(std::make_unique<TransferEngineImpl>(conf)) {}
+    : impl_(std::make_unique<TransferEngineImpl>(conf)),
+      sharding_executor_(std::make_shared<TransferShardingExecutor>()) {}
 
 TransferEngine::~TransferEngine() { sharding_executor_->shutdown(); }
 
@@ -47,23 +50,40 @@ bool TransferEngine::supportsShardedTransfer(SegmentID peer) const {
     return impl_->supportsShardedTransfer(peer);
 }
 
+bool TransferEngine::isBatchSubmitEligible(size_t count) const {
+    return impl_ && sharding_executor_ && sharding_executor_->eligible(count);
+}
+
+struct TransferEngine::TentSubBatchAdapter {
+    using Executor = TransferShardingExecutor;
+    TransferEngine& engine;
+    const std::vector<Request>& requests;
+    BatchID sub_batch_id = 0;
+
+    Executor::Result allocate();
+    Executor::Result submit();
+    SubBatchProgress poll();
+    Executor::Result release();
+};
+
 TransferShardingExecutor::Result
 TransferEngine::TentSubBatchAdapter::allocate() {
     sub_batch_id = engine.allocateBatch(requests.size());
-    return sub_batch_id ? Executor::Result::OK()
-                        : Executor::Result{-1, "Could not allocate sub-batch"};
+    return sub_batch_id
+               ? Executor::Result::OK()
+               : Executor::Result::Error("Could not allocate sub-batch");
 }
 
 TransferShardingExecutor::Result TransferEngine::TentSubBatchAdapter::submit() {
     auto status = engine.submitTransfer(sub_batch_id, requests);
     return status.ok() ? Executor::Result::OK()
-                       : Executor::Result{-1, status.ToString()};
+                       : Executor::Result::Error(status.ToString());
 }
 
 SubBatchProgress TransferEngine::TentSubBatchAdapter::poll() {
     TransferStatus status{};
     auto polled = engine.getTransferStatus(sub_batch_id, status);
-    if (!polled.ok()) throw std::runtime_error(polled.ToString());
+    if (!polled.ok()) return {true, false, polled.ToString()};
     const bool terminal = status.s != PENDING && status.s != INITIAL;
     return {terminal, status.s == COMPLETED, {}};
 }
@@ -73,15 +93,15 @@ TransferEngine::TentSubBatchAdapter::release() {
     auto status = engine.freeBatch(sub_batch_id);
     sub_batch_id = 0;
     return status.ok() ? Executor::Result::OK()
-                       : Executor::Result{-1, status.ToString()};
+                       : Executor::Result::Error(status.ToString());
 }
 
 std::optional<Status> TransferEngine::tryShardedTransfer(
     SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
     std::chrono::nanoseconds timeout, TransportType hint) {
     using Executor = ::mooncake::TransferShardingExecutor;
+    if (!isBatchSubmitEligible(count)) return std::nullopt;
     auto& executor = *sharding_executor_;
-    if (!executor.eligible(count)) return std::nullopt;
     const auto deadline = Executor::Clock::now() + timeout;
     if (!supportsShardedTransfer(peer)) {
         VLOG(1) << "TENT synchronous sharding admission declined: peer=" << peer
@@ -94,8 +114,9 @@ std::optional<Status> TransferEngine::tryShardedTransfer(
 #ifdef USE_CUDA
     const auto cuda_status = cudaGetDevice(&device);
     if (cuda_status == cudaErrorNoDevice ||
-        cuda_status == cudaErrorInsufficientDriver) {
-        // CUDA builds also support host-only transfers without a GPU/driver.
+        cuda_status == cudaErrorInsufficientDriver ||
+        cuda_status == cudaErrorInitializationError) {
+        // Host-only transfers also work without an initialized CUDA runtime.
         device = -1;
         (void)cudaGetLastError();
     } else if (cuda_status != cudaSuccess) {
@@ -109,20 +130,21 @@ std::optional<Status> TransferEngine::tryShardedTransfer(
         [&](Executor::Range range, const Executor::Cancellation& cancellation) {
 #ifdef USE_CUDA
             if (device >= 0 && cudaSetDevice(device) != cudaSuccess)
-                return Executor::Result{-1,
-                                        "Could not bind sharding CUDA device"};
+                return Executor::Result::Error(
+                    "Could not bind sharding CUDA device");
 #endif
             auto& requests = request_storage[range.index];
             requests = builder(range.begin, range.end);
             if (requests.size() != range.end - range.begin)
-                return Executor::Result{-1, "Invalid sub-batch request count"};
+                return Executor::Result::Error(
+                    "Invalid sub-batch request count");
             for (const auto& request : requests)
                 if (request.target_id != peer ||
                     request.transport_hint != hint ||
                     (request.opcode != Request::READ &&
                      request.opcode != Request::WRITE))
-                    return Executor::Result{
-                        -1, "Sharded transfer request differs from admission"};
+                    return Executor::Result::Error(
+                        "Sharded transfer request differs from admission");
             TentSubBatchAdapter sub_batch{*this, requests};
             return ::mooncake::runSubBatch(sub_batch, cancellation);
         });

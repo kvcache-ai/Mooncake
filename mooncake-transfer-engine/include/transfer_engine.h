@@ -30,12 +30,12 @@
 #include "multi_transport.h"
 #include "task_congestion_status.h"
 #include "transfer_metadata.h"
-#include "transfer_sharding.h"
 #include "transport/transport.h"
 
 namespace mooncake {
 class ShutdownToken;
 class TransferEngineImpl;
+class TransferShardingExecutor;
 namespace tent {
 class Config;
 class TransferEngine;
@@ -217,8 +217,6 @@ class TransferEngine {
     std::optional<Status> tryShardedTransfer(
         SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
         std::chrono::nanoseconds timeout, int transport_hint = 0);
-
-    TransferShardingExecutor& shardingExecutor();
 
     struct ScatterTransferRange {
         TransferRequest::OpCode opcode;
@@ -409,18 +407,10 @@ class TransferEngine {
 
     bool supportsShardedTransfer(SegmentID peer) const;
 
-   private:
-    struct TESubBatchAdapter {
-        using Executor = TransferShardingExecutor;
-        TransferEngine& engine;
-        const std::vector<TransferRequest>& requests;
-        BatchID sub_batch_id = INVALID_BATCH_ID;
+    bool isBatchSubmitEligible(size_t count) const;
 
-        Executor::Result allocate();
-        Executor::Result submit();
-        SubBatchProgress poll();
-        Executor::Result release();
-    };
+   private:
+    struct TESubBatchAdapter;
 
     Status submitScatterTransfer(BatchID batch_id,
                                  const std::vector<TransferRequest>& entries);

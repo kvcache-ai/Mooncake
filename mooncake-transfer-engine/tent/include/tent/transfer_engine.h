@@ -258,11 +258,11 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
 
 #include "tent/common/status.h"
 #include "tent/common/types.h"
-#include "transfer_sharding.h"
 
 namespace mooncake {
 class TransferEngine;
 class TransferEngineImplTestPeer;
+class TransferShardingExecutor;
 namespace tent {
 class TransferEngineImpl;
 class Config;
@@ -350,7 +350,6 @@ class TransferEngine {
     std::optional<Status> tryShardedTransfer(
         SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
         std::chrono::nanoseconds timeout, TransportType hint = UNSPEC);
-    TransferShardingExecutor& shardingExecutor() { return *sharding_executor_; }
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list,
@@ -398,25 +397,16 @@ class TransferEngine {
 
     bool supportsShardedTransfer(SegmentID peer) const;
 
-   private:
-    struct TentSubBatchAdapter {
-        using Executor = TransferShardingExecutor;
-        TransferEngine& engine;
-        const std::vector<Request>& requests;
-        BatchID sub_batch_id = 0;
+    bool isBatchSubmitEligible(size_t count) const;
 
-        Executor::Result allocate();
-        Executor::Result submit();
-        SubBatchProgress poll();
-        Executor::Result release();
-    };
+   private:
+    struct TentSubBatchAdapter;
 
     Status submitTransferRequiringPostSubmitCancellation(
         BatchID batch_id, const std::vector<Request>& request_list);
 
     std::unique_ptr<TransferEngineImpl> impl_;
-    std::shared_ptr<TransferShardingExecutor> sharding_executor_ =
-        std::make_shared<TransferShardingExecutor>();
+    std::shared_ptr<TransferShardingExecutor> sharding_executor_;
     friend class ::mooncake::TransferEngine;
     friend class ::mooncake::TransferEngineImplTestPeer;
 };

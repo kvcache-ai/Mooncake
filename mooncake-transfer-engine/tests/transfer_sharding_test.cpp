@@ -129,11 +129,49 @@ TEST(TransferSharding, BatchSubmitEnvironmentConfig) {
     EXPECT_FALSE(executor.eligible(8191));
     EXPECT_TRUE(executor.eligible(8192));
 
-    ASSERT_EQ(setenv(threads.name, "33", 1), 0);
-    EXPECT_THROW(Executor::Config::fromEnvironment(), std::invalid_argument);
+    for (const char* invalid :
+         {"", "abc", "4junk", "-1", "33", "184467440737095516160"}) {
+        SCOPED_TRACE(invalid);
+        ASSERT_EQ(setenv(threads.name, invalid, 1), 0);
+        auto fallback = Executor::Config::fromEnvironment();
+        EXPECT_EQ(fallback.threads, 0);
+        EXPECT_EQ(fallback.min_descriptors, 8192);
+    }
     ASSERT_EQ(setenv(threads.name, "4", 1), 0);
-    ASSERT_EQ(setenv(min_size.name, "0", 1), 0);
-    EXPECT_THROW(Executor::Config::fromEnvironment(), std::invalid_argument);
+    for (const char* invalid :
+         {"", "abc", "4096junk", "-1", "0", "184467440737095516160"}) {
+        SCOPED_TRACE(invalid);
+        ASSERT_EQ(setenv(min_size.name, invalid, 1), 0);
+        auto fallback = Executor::Config::fromEnvironment();
+        EXPECT_EQ(fallback.threads, 4);
+        EXPECT_EQ(fallback.min_descriptors, 4096);
+    }
+}
+
+TEST(TransferSharding, MissingBackendDeclinesWithoutRunningBuilder) {
+    auto check = [](TransferEngine& engine) {
+        EXPECT_FALSE(engine.isBatchSubmitEligible(SIZE_MAX));
+        int builds = 0;
+        EXPECT_FALSE(engine.tryShardedTransfer(
+            1, 4096,
+            [&](size_t, size_t) {
+                ++builds;
+                return std::vector<TransferRequest>{};
+            },
+            1s));
+        EXPECT_EQ(builds, 0);
+    };
+    TransferEngine classic(false);
+    classic.freeEngine();
+    check(classic);
+#ifdef USE_TENT
+    TransferEngine facade(false);
+    // This is also the facade's state before init(), or if init() fails.
+    TransferEngineImplTestPeer::facade(facade, nullptr);
+    check(facade);
+    facade.freeEngine();
+    check(facade);
+#endif
 }
 
 TEST(TransferSharding, DetectsOverlapBeforeAnySubBatchCanPublish) {
@@ -241,13 +279,16 @@ TEST(TransferSharding, ShutdownStopsAdmissionAndWaitsForActiveCallbacks) {
                                     while (!stop.requested())
                                         std::this_thread::yield();
                                     ++returned;
-                                    return Executor::Result{-1, "worker ended"};
+                                    return Executor::Result::Canceled();
                                 });
     });
     started.get_future().wait();
     executor.shutdown();
     EXPECT_EQ(returned.load(), 1);
-    EXPECT_FALSE(parent.get().ok());
+    auto result = parent.get();
+    EXPECT_FALSE(result.ok());
+    EXPECT_FALSE(result.isCanceled());
+    EXPECT_EQ(result.error, "Transfer sharding is shutting down");
     EXPECT_FALSE(
         executor
             .execute(1, Executor::Clock::now() + 1s,
@@ -263,7 +304,7 @@ struct FakeAcceptedBatch {
     Executor::Result submit() {
         ++submitted;
         if (on_submit) on_submit();
-        return fail_submit ? Executor::Result{-1, "partial submission"}
+        return fail_submit ? Executor::Result::Error("partial submission")
                            : Executor::Result::OK();
     }
     SubBatchProgress poll() {
@@ -294,9 +335,109 @@ TEST(TransferSharding, SubBatchReleasesOnSuccessAndErrors) {
     }
 }
 
+TEST(TransferSharding, SiblingCancellationDoesNotMaskTheActualError) {
+    Executor executor({2, 1, 1});
+    struct HeldAllocation : FakeAcceptedBatch {
+        std::function<void()> on_allocate;
+        Executor::Result allocate() {
+            on_allocate();
+            return Executor::Result::OK();
+        }
+    } first;
+    std::promise<void> allocating;
+    auto started = allocating.get_future().share();
+    auto result = executor.execute(
+        2, Executor::Clock::now() + 5s,
+        [&](auto range, const auto& cancellation) {
+            if (range.index == 1) {
+                if (started.wait_until(cancellation.deadline) !=
+                    std::future_status::ready)
+                    return Executor::Result::Error("Allocation did not start");
+                return Executor::Result{-7, "Injected transport failure"};
+            }
+            first.on_allocate = [&] {
+                allocating.set_value();
+                while (!cancellation.requested()) std::this_thread::yield();
+            };
+            return runSubBatch(first, cancellation);
+        });
+    EXPECT_EQ(result.code, -7);
+    EXPECT_EQ(result.error, "Injected transport failure");
+    EXPECT_EQ(first.submitted, 0);
+    EXPECT_EQ(first.polls, 0);
+    EXPECT_EQ(first.freed, 1);
+}
+
+TEST(TransferSharding, DeadlineCancellationDoesNotMaskTheActualError) {
+    for (bool before_submit : {true, false}) {
+        SCOPED_TRACE(before_submit);
+        Executor executor({2, 1, 1});
+        struct HeldBatch : FakeAcceptedBatch {
+            bool hold_allocation = false;
+            std::function<void()> hold;
+            Executor::Result allocate() {
+                if (hold_allocation) hold();
+                return Executor::Result::OK();
+            }
+            SubBatchProgress poll() {
+                ++polls;
+                hold();
+                return {false, false, {}};
+            }
+        } first;
+        first.hold_allocation = before_submit;
+        std::promise<void> entered;
+        auto started = entered.get_future().share();
+        Executor::Result first_result;
+        auto result = executor.execute(
+            2, Executor::Clock::now() + 1s,
+            [&](auto range, const auto& cancellation) {
+                if (range.index == 1) {
+                    if (started.wait_until(cancellation.deadline) !=
+                        std::future_status::ready)
+                        return Executor::Result::Error(
+                            "First sub-batch did not start");
+                    return Executor::Result{-7, "Injected transport failure"};
+                }
+                first.hold = [&] {
+                    entered.set_value();
+                    while (!cancellation.expired()) std::this_thread::yield();
+                };
+                first_result = runSubBatch(first, cancellation);
+                return first_result;
+            });
+        EXPECT_TRUE(first_result.isCanceled());
+        EXPECT_EQ(result.code, -7);
+        EXPECT_EQ(result.error, "Injected transport failure");
+        EXPECT_EQ(first.submitted, before_submit ? 0 : 1);
+        EXPECT_EQ(first.polls, before_submit ? 0 : 1);
+        EXPECT_EQ(first.freed, 1);
+    }
+}
+
+TEST(TransferSharding, ReleaseErrorIsPreservedAfterCancellation) {
+    struct FailedRelease : FakeAcceptedBatch {
+        Executor::Result release() {
+            ++freed;
+            return Executor::Result::Error("release failed");
+        }
+    } batch;
+    std::atomic<bool> stopped{true};
+    auto result = runSubBatch(
+        batch, Executor::Cancellation{stopped, Executor::Clock::now() + 1s});
+    EXPECT_FALSE(result.ok());
+    EXPECT_FALSE(result.isCanceled());
+    EXPECT_EQ(result.error, "release failed");
+    EXPECT_EQ(batch.submitted, 0);
+    EXPECT_EQ(batch.polls, 0);
+    EXPECT_EQ(batch.freed, 1);
+}
+
 TEST(TransferSharding, AllocationFailureNeverSubmitsPollsOrReleasesAHandle) {
     struct UnallocatedBatch : FakeAcceptedBatch {
-        Executor::Result allocate() { return {-1, "allocation failed"}; }
+        Executor::Result allocate() {
+            return Executor::Result::Error("allocation failed");
+        }
     } batch;
     std::atomic<bool> stopped{false};
     auto result = runSubBatch(
@@ -314,7 +455,7 @@ TEST(TransferSharding, SubBatchReleasesOnTimeout) {
     FakeAcceptedBatch batch;
     batch.on_submit = [&] { cancellation.deadline = Executor::Clock::now(); };
     auto result = runSubBatch(batch, cancellation);
-    EXPECT_FALSE(result.ok());
+    EXPECT_TRUE(result.isCanceled());
     EXPECT_EQ(batch.submitted, 1);
     EXPECT_EQ(batch.polls, 0);
     EXPECT_EQ(batch.freed, 1);
@@ -336,7 +477,7 @@ TEST(TransferSharding, SubBatchReleasesOnShutdown) {
     });
     batch.polled.get_future().wait();
     shutdown.store(true);
-    EXPECT_FALSE(parent.get().ok());
+    EXPECT_TRUE(parent.get().isCanceled());
     EXPECT_EQ(batch.freed, 1);
 }
 
@@ -356,7 +497,8 @@ TEST(TransferSharding, FailureJoinsAcceptedSiblingWithoutExpiringIt) {
             2, Executor::Clock::now() + 10s,
             [&](auto range, const auto& cancellation) -> Executor::Result {
                 both_running.arrive_and_wait();
-                if (range.index == 0) return {-1, "first sub-batch failed"};
+                if (range.index == 0)
+                    return Executor::Result::Error("first sub-batch failed");
                 while (!cancellation.requested()) std::this_thread::yield();
                 cancel_seen.set_value();
                 EXPECT_FALSE(cancellation.expired());
@@ -378,7 +520,7 @@ TEST(TransferSharding, ConcurrentParentsKeepInputAndErrorsSeparate) {
         launch.arrive_and_wait();
         return executor.execute(
             8193, Executor::Clock::now() + 10s, [](auto, const auto&) {
-                return Executor::Result{-1, "isolated failure"};
+                return Executor::Result::Error("isolated failure");
             });
     });
     auto successful = std::async(std::launch::async, [&] {
@@ -503,7 +645,7 @@ TEST(TransferSharding, DeadlineBeforeSubmitStillReleasesAllocatedBatch) {
     FakeAcceptedBatch batch;
     auto result = runSubBatch(
         batch, Executor::Cancellation{stopped, Executor::Clock::now()});
-    EXPECT_FALSE(result.ok());
+    EXPECT_TRUE(result.isCanceled());
     EXPECT_EQ(batch.submitted, 0);
     EXPECT_EQ(batch.freed, 1);
     EXPECT_EQ(batch.polls, 0);

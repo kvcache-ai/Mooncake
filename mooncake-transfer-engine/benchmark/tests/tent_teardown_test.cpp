@@ -16,6 +16,7 @@
 #include "split_output.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
+#include "transfer_sharding.h"
 
 #include <gtest/gtest.h>
 #include <cstdio>
@@ -36,6 +37,10 @@ class TransferEngineImplTestPeer {
     static std::weak_ptr<tent::ControlService> metadata(
         const tent::TransferEngine& engine) {
         return engine.impl_->metadata_;
+    }
+    static void enableSharding(tent::TransferEngine& engine) {
+        engine.sharding_executor_ = std::make_shared<TransferShardingExecutor>(
+            TransferShardingExecutor::Config{1, 1, 4});
     }
 };
 
@@ -137,6 +142,7 @@ class NoQuiesceTransport : public Transport {
         ++removed_buffers;
         return Status::OK();
     }
+    bool supportsShardedTransfer() const override { return true; }
 };
 
 class TENTTeardownTest : public testing::TestWithParam<bool> {
@@ -228,6 +234,15 @@ class TENTTeardownTest : public testing::TestWithParam<bool> {
 };
 
 TEST_P(TENTTeardownTest, PollErrorRetainsEngineAndBuffer) {
+    transport_->mode = NoQuiesceTransport::Mode::PollError;
+    EXPECT_LT(transfer(), 0);
+    expectRetained();
+}
+
+TEST_P(TENTTeardownTest, ShardedPollErrorRetainsEngineAndBuffer) {
+    TransferEngineImplTestPeer::enableSharding(*engine_);
+    ASSERT_TRUE(engine_->isBatchSubmitEligible(1));
+    ASSERT_TRUE(engine_->supportsShardedTransfer(LOCAL_SEGMENT_ID));
     transport_->mode = NoQuiesceTransport::Mode::PollError;
     EXPECT_LT(transfer(), 0);
     expectRetained();
