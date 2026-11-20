@@ -139,6 +139,7 @@ RUN --network=none mkdir -p extern && rm -rf extern/pybind11 && mv "$PYBIND11_DI
 FROM source AS builder
 
 ARG CMAKE_BUILD_TYPE=Release
+ARG ENABLE_DEBUG_SYMBOLS=ON
 ARG TORCH_CUDA_ARCH_LIST="8.0;9.0;10.3"
 ARG CLEAN_BUILD_ARTIFACTS=0
 ARG BUILD_JOBS=2
@@ -149,9 +150,9 @@ ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     SKIP_WHEEL_BUILD_DEPS=1 \
     WHEEL_BUILD_NO_ISOLATION=1
 
-# Configure and build the wheel in one layer, then remove build/ only after
-# auditwheel has resolved libraries from it. The large intermediate tree is
-# not retained in the builder layer when CLEAN_BUILD_ARTIFACTS=1.
+# Build and package in one layer so deleted intermediates never enter a snapshot.
+# FREE_BUILD_DIR lets the wheel packager remove the native tree after staging
+# its inputs, before creating and repairing the wheel.
 # The wheel smoke tests connect to a local server without a proxy.
 RUN --network=none --mount=type=bind,from=torch-wheels,source=${TORCH_WHEEL_DIR},target=${TORCH_WHEEL_DIR} \
     --mount=type=bind,from=python-wheels,source=${PYTHON_WHEEL_DIR},target=${PYTHON_WHEEL_DIR} \
@@ -170,7 +171,8 @@ RUN --network=none --mount=type=bind,from=torch-wheels,source=${TORCH_WHEEL_DIR}
         -DSTORE_USE_ETCD=ON \
         -DYLT_ARCHIVE="$YLT_ARCHIVE" \
         -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
-        -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
+        -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+        -DENABLE_DEBUG_SYMBOLS="${ENABLE_DEBUG_SYMBOLS}" && \
     export LIBRARY_PATH="$CUDA_STUB_DIR:$LIBRARY_PATH" && \
     cmake --build . --parallel "${BUILD_JOBS}" && \
     cd "$MOONCAKE_WORK_DIR" && \
@@ -181,13 +183,12 @@ RUN --network=none --mount=type=bind,from=torch-wheels,source=${TORCH_WHEEL_DIR}
     cd mooncake-transfer-engine/nvlink-allocator && \
     bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/ && \
     cd "$MOONCAKE_WORK_DIR" && \
-    OUTPUT_DIR=dist ./scripts/build_wheel.sh && \
+    if [ "${CLEAN_BUILD_ARTIFACTS}" = "1" ]; then go clean -cache; fi && \
+    FREE_BUILD_DIR="${CLEAN_BUILD_ARTIFACTS}" OUTPUT_DIR=dist ./scripts/build_wheel.sh && \
+    if [ "${CLEAN_BUILD_ARTIFACTS}" = "1" ]; then rm -rf mooncake-wheel/build; fi && \
     python${PYTHON_VERSION} -m pip install mooncake-wheel/dist/*.whl && \
     ln -sf "$CUDA_STUB_DIR/libcuda.so" "$CUDA_STUB_DIR/libcuda.so.1" && \
-    python${PYTHON_VERSION} -m mooncake.pg --prebuild && \
-    if [ "${CLEAN_BUILD_ARTIFACTS}" = "1" ]; then \
-        rm -rf build; \
-    fi
+    python${PYTHON_VERSION} -m mooncake.pg --prebuild
 
 ###############################################################################
 # Stage 2: install the freshly built wheel into a runtime image
