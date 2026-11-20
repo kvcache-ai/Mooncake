@@ -158,7 +158,7 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_READ_IO_WORKERS` | `0` (disabled) | Shared reader count across bucket files and their sub batches. `0` retains the caller-driven read path; positive values enable parallel full-object and range reads through `BatchIoScheduler`. |
 | `MOONCAKE_OFFLOAD_READ_SUB_BATCH_MAX_IOVECS` | `32` | Maximum read plans (one per object or range) per read sub batch; minimum `4` when readers are enabled. Each sub batch stays within one bucket file. |
 | `MOONCAKE_OFFLOAD_WRITE_IO_WORKERS` | `0` (disabled) | Shared writer count across buckets and their sub batches. `0` retains sequential offload; positive values enable parallel offload through `BatchIoScheduler`. |
-| `MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS` | `128` | Logical source Slices per write sub batch; minimum `4` when writers are enabled. Small tails up to one quarter join the preceding group within the same bucket. |
+| `MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS` | `32` | Logical source Slices per write sub batch; minimum `4` when writers are enabled. Defaults to the per-worker io_uring submission depth; larger values only split into serial rounds within the sub batch. Small tails up to one quarter join the preceding group within the same bucket. |
 | `MOONCAKE_OFFLOAD_WRITE_IO_BACKOFF_MS` | `300` | Positive delay in milliseconds before writers recheck pending or in-flight reads. |
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | `268435456` (256 MB) | Max size per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
@@ -177,7 +177,7 @@ Set the write controls in the **Real Client** environment before starting the em
 ```bash
 export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 export MOONCAKE_OFFLOAD_WRITE_IO_WORKERS=8
-export MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS=128
+export MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS=32
 export MOONCAKE_OFFLOAD_WRITE_IO_BACKOFF_MS=300
 ```
 

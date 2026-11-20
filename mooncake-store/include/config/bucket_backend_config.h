@@ -34,7 +34,9 @@ struct BucketBackendConfig {
     int64_t read_io_workers = 0;
     int64_t read_sub_batch_max_iovecs = 32;
     int64_t write_io_workers = 0;
-    int64_t write_sub_batch_max_iovecs = 128;
+    int64_t write_sub_batch_max_iovecs = 32;  // Matches the per-worker
+        // io_uring submission depth (QUEUE_DEPTH in uring_file.cpp); larger
+        // values only split into serial 32-SQE rounds per sub batch.
     int64_t write_io_backoff_ms = 300;
     int64_t bucket_size_limit =
         256LL * 1024 * 1024;  // Max total size of a single bucket (256 MB)

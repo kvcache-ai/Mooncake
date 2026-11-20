@@ -266,7 +266,7 @@ TEST_F(BucketBackendConfigTest, ValidationPreservesExistingBounds) {
 TEST_F(BucketBackendConfigTest, WriteWorkersAreOptionalAndIndependent) {
     auto config = BucketBackendConfig::FromEnvironment();
     EXPECT_EQ(config.write_io_workers, 0);
-    EXPECT_EQ(config.write_sub_batch_max_iovecs, 128);
+    EXPECT_EQ(config.write_sub_batch_max_iovecs, 32);
     EXPECT_EQ(config.write_io_backoff_ms, 300);
     env.write_sub_batch.Set("0");
     EXPECT_TRUE(BucketBackendConfig::FromEnvironment().Validate());
