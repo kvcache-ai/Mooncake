@@ -443,8 +443,9 @@ cd /Mooncake-main/build/mooncake-transfer-engine/example
 ./transfer_engine_bench --device_name=ibp6s0 --metadata_server=10.1.101.3:2379 --mode=target --local_server_name=10.1.100.3
 ```
 
-Both Docker build commands cache the verified YLT archive before copying the
-source tree. `./docker/build-mooncake.sh` enables BuildKit, forwards proxy
+Both Docker build commands cache the verified YLT archive and pinned pybind11
+submodule before copying the source tree. The compilation stage runs without
+network access. `./docker/build-mooncake.sh` enables BuildKit, forwards proxy
 environment variables, and tags the image `mooncake:from-source` and
 `mooncake:<git short id>`. Direct `docker build` requires BuildKit (the
 default since Docker 23.0). Set `GH_MIRROR` when calling the helper or pass
