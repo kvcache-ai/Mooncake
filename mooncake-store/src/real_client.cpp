@@ -2157,16 +2157,14 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_dummy_client_monitor();
     stop_http_server();
 
-    // SSD handlers suspend on a separate read executor. Keep their RPC I/O
-    // threads and Client alive until accepted handlers have returned; stopping
-    // only the server does not drain work on that external executor.
-    while (!offload_rpc_drain_.drain_for(std::chrono::seconds(30))) {
-        LOG(WARNING) << "Waiting for accepted SSD offload RPCs before teardown";
-    }
     if (offload_rpc_server_) {
         offload_rpc_server_->stop();
         offload_rpc_server_.reset();
     }
+    // Close has drained accepted push writes; release the runtime's transport
+    // references before the storage arena and Client backing segments.
+    ssd_direct_.reset();
+    client_requester_.reset();
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     if (file_storage_) {
         auto result = file_storage_->Shutdown();

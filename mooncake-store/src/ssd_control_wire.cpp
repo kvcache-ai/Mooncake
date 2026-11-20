@@ -1,6 +1,7 @@
 // Copyright 2026 KVCache.AI
 // Licensed under the Apache License, Version 2.0.
 #include "ssd_control_wire.h"
+#include <bit>
 #include <limits>
 #include <type_traits>
 
@@ -38,10 +39,13 @@ class IO {
     void Number(T& value) {
         static_assert(std::is_unsigned_v<T>);
         if (!Room(sizeof(T))) return;
-        if (writing)
-            for (size_t i = 0; i < sizeof(T); ++i)
-                output.push_back(char(value >> (i * 8)));
-        else {
+        if (writing) {
+            if constexpr (std::endian::native == std::endian::little)
+                output.append(reinterpret_cast<const char*>(&value), sizeof(T));
+            else
+                for (size_t i = 0; i < sizeof(T); ++i)
+                    output.push_back(char(value >> (i * 8)));
+        } else {
             value = 0;
             for (size_t i = 0; i < sizeof(T); ++i)
                 value |= T(static_cast<unsigned char>(input[position++]))

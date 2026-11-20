@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import _store as store
@@ -307,6 +308,83 @@ class FixedL2DirectPythonTest(unittest.TestCase):
                         json.loads(owner.get_ssd_push_peer_info())["read_requests"], 2
                     )
 
+                    # Many disjoint small TCP destinations cannot share data
+                    # frames. Verify the pre-submit policy keeps this shape on
+                    # the batched legacy path and preserves every gap.
+                    ctypes.memset(pointer, 0xA5, size + 64)
+                    gapped_ptrs = [
+                        pointer + 32 + i * (small_size + 64)
+                        for i in range(len(small_keys))
+                    ]
+                    self.assertEqual(
+                        requester.batch_get_into(
+                            small_keys, gapped_ptrs, [small_size] * len(small_keys)
+                        ),
+                        [small_size] * len(small_keys),
+                    )
+                    for i, small_payload in enumerate(small_payloads):
+                        start = 32 + i * (small_size + 64)
+                        self.assertEqual(
+                            bytes(pool[start : start + small_size]), small_payload
+                        )
+                        self.assertEqual(
+                            bytes(pool[start + small_size : start + small_size + 64]),
+                            b"\xa5" * 64,
+                        )
+                    self.assertEqual(bytes(pool)[:32], b"\xa5" * 32)
+                    self.assertEqual(
+                        bytes(pool)[32 + len(small_keys) * (small_size + 64) :],
+                        b"\xa5" * (size + 32 - len(small_keys) * (small_size + 64)),
+                    )
+                    self.assertEqual(
+                        json.loads(owner.get_ssd_push_peer_info())["read_requests"], 2
+                    )
+
+                    overlapping = requester.batch_get_into(
+                        small_keys,
+                        [pointer + 32] * len(small_keys),
+                        [small_size] * len(small_keys),
+                    )
+                    self.assertTrue(all(result < 0 for result in overlapping))
+                    self.assertEqual(
+                        json.loads(owner.get_ssd_push_peer_info())["read_requests"], 2
+                    )
+
+                    # Concurrent reads borrow distinct destinations in the
+                    # same registered pool. Their attempts must retain their
+                    # own request binding and drain before returning.
+                    ctypes.memset(pointer, 0xA5, size + 64)
+                    lane_bytes = len(small_keys) * small_size + 64
+
+                    def read_small_lane(lane):
+                        base = pointer + lane * lane_bytes + 32
+                        addresses = [base + i * small_size for i in range(4)]
+                        for _ in range(8):
+                            self.assertEqual(
+                                requester.batch_get_into(
+                                    small_keys, addresses, [small_size] * 4
+                                ),
+                                [small_size] * 4,
+                            )
+
+                    with ThreadPoolExecutor(max_workers=4) as executor:
+                        list(executor.map(read_small_lane, range(4)))
+                    for lane in range(4):
+                        start = lane * lane_bytes
+                        self.assertEqual(bytes(pool[start : start + 32]), b"\xa5" * 32)
+                        for i, small_payload in enumerate(small_payloads):
+                            begin = start + 32 + i * small_size
+                            self.assertEqual(
+                                bytes(pool[begin : begin + small_size]), small_payload
+                            )
+                        self.assertEqual(
+                            bytes(pool[start + lane_bytes - 32 : start + lane_bytes]),
+                            b"\xa5" * 32,
+                        )
+                    self.assertEqual(
+                        json.loads(owner.get_ssd_push_peer_info())["read_requests"], 34
+                    )
+
                     proxy = LostReplyProxy(peer["control_host"], peer["control_port"])
                     peer["control_host"] = "127.0.0.1"
                     peer["control_port"] = proxy.port
@@ -332,7 +410,7 @@ class FixedL2DirectPythonTest(unittest.TestCase):
                     self.assertEqual(requester.unregister_buffer(pointer), 0)
                     self.assertEqual(requester.close(), 0)
                     self.assertEqual(
-                        json.loads(owner.get_ssd_push_peer_info())["read_requests"], 3
+                        json.loads(owner.get_ssd_push_peer_info())["read_requests"], 35
                     )
                     self.assertFalse(proxy.errors)
                 finally:

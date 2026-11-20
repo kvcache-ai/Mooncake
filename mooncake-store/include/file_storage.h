@@ -530,7 +530,7 @@ class FileStorage {
     ReadSingleFlight<std::string, ColdReadOutcome> inflight_cold_reads_;
 
     mutable Mutex offloading_mutex_;
-    bool GUARDED_BY(offloading_mutex_) enable_offloading_;
+    bool GUARDED_BY(offloading_mutex_) enable_offloading_ = false;
     std::atomic<bool> heartbeat_running_;
     std::thread heartbeat_thread_;
     std::atomic<bool> client_buffer_gc_running_;

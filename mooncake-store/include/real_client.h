@@ -1204,7 +1204,6 @@ class RealClient : public PyClient {
     std::string local_rpc_addr;
     std::unique_ptr<coro_rpc::coro_rpc_server> offload_rpc_server_;
     std::shared_ptr<ssd_offload::SsdDirectRuntime> ssd_direct_;
-    RpcDrainGuard offload_rpc_drain_;
     int offload_rpc_port_ = 0;
 
     // SSD prefetch (best-effort SSD->DRAM promotion on exist probes). Off

@@ -15,6 +15,8 @@
 #include <json/json.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <algorithm>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -316,6 +318,52 @@ std::optional<tl::expected<void, ErrorCode>> SsdDirectRuntime::Read(
     std::chrono::milliseconds timeout) {
     const auto start = std::chrono::steady_clock::now();
     if (timeout.count() <= 0) return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    // Reject overlapping destinations and route sparse small TCP batches to
+    // legacy before constructing a wire request or exposing any destination
+    // lease. Push still validates every registered region before submission.
+    if (impl_->self.protocol == "tcp" && objects.size() >= 4) {
+        struct Span {
+            uintptr_t address;
+            size_t length;
+        };
+        std::vector<Span> spans;
+        size_t payload = 0, destinations = 0;
+        bool eligible = true;
+        for (const auto& object : objects) {
+            if (object.source_offset != 0) {
+                eligible = false;
+                break;
+            }
+            size_t object_bytes = 0;
+            for (const auto& slice : object.destinations) {
+                const auto address = reinterpret_cast<uintptr_t>(slice.ptr);
+                if (slice.size > object.expected_size - object_bytes ||
+                    slice.size > std::numeric_limits<size_t>::max() - payload ||
+                    slice.size >
+                        std::numeric_limits<uintptr_t>::max() - address)
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                object_bytes += slice.size;
+                payload += slice.size;
+                ++destinations;
+                spans.push_back({address, slice.size});
+            }
+            if (object_bytes != object.expected_size) eligible = false;
+        }
+        if (eligible && payload <= 4 * 1024 * 1024 && destinations >= 4) {
+            std::sort(spans.begin(), spans.end(),
+                      [](const Span& a, const Span& b) {
+                          return a.address < b.address;
+                      });
+            size_t adjacent = 0;
+            for (size_t i = 1; i < spans.size(); ++i) {
+                const auto end = spans[i - 1].address + spans[i - 1].length;
+                if (spans[i].address < end)
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                adjacent += spans[i].address == end;
+            }
+            if (adjacent * 4 < spans.size() - 1) return {};
+        }
+    }
     SsdPushPeerInfo route;
     std::vector<SsdObjectReadV1> request;
     {

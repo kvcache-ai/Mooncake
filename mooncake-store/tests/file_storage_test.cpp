@@ -3506,11 +3506,13 @@ class SmallBatchTarget final : public ssd_offload::SourceDrainedWriteTarget {
     bool DestinationsDrained() const noexcept override { return drained; }
 };
 ssd_offload::SsdReadRequestV1 SmallRequest(
-    const std::vector<std::string>& values, bool split = false) {
+    const std::vector<std::string>& values, bool split = false,
+    uint64_t request_id = 1) {
     using namespace ssd_offload;
     const PeerIdentity requester{1, 2, 3}, owner{4, 5, 6};
     SsdReadRequestV1 request{1, requester, {owner, 1, 1}, "default", 60000,
                              0, {}};
+    request.attempt.request_id = request_id;
     for (size_t i = 0; i < values.size(); ++i) {
         const DestinationRegion region{requester, i + 1, 1, {7, 8}};
         SsdReadRangeV1 range{0, {{region, 0, values[i].size()}}};
@@ -3537,15 +3539,16 @@ FileStorageConfig SmallConfig(const std::string& path) {
 
 TEST_F(FileStorageTest,
        SmallOwnerBatchPushesNestedValuesOnceAndHonorsAdjustedPointers) {
-    for (const bool legacy_uring : {false, true}) {
-        auto config = SmallConfig(
-            data_path + (legacy_uring ? "/bulk-uring" : "/bulk-pread"));
+    for (int mode = 0; mode < 4; ++mode) {
+        const bool legacy_uring = (mode & 1) != 0;
+        auto config = SmallConfig(data_path + "/bulk-" + std::to_string(mode));
         fs::create_directories(config.storage_filepath);
         config.use_uring = legacy_uring;
         FileStorage storage(config, nullptr, "owner");
-        const std::vector<std::string> values{std::string(4093, 'a'),
-                                              std::string(65537, 'b'),
-                                              std::string(107, 'c')};
+        std::vector<std::string> values{std::string(4093, 'a'),
+                                        std::string(65537, 'b'),
+                                        std::string(107, 'c')};
+        if (mode & 2) values.resize(1);
         SeedPushBatch(storage, values);
         auto request = SmallRequest(values, true);
         std::vector<std::vector<char>> output;
@@ -3753,6 +3756,54 @@ TEST_F(FileStorageTest, SmallOwnerBatchUsesSlotsWhenArenaIsFragmented) {
                   ssd_offload::AttemptOutcome::kSucceeded);
     }
     EXPECT_EQ(ssd_offload::ValidateSsdReadResultV1(request, *result),
+              ssd_offload::DestinationError::kOk);
+}
+
+TEST_F(FileStorageTest,
+       SmallOwnerBatchSharesOverlappingReadsAndDrainsEachDestination) {
+    auto config = SmallConfig(data_path);
+    config.storage_backend_type = StorageBackendType::kBucket;
+    fs::create_directories(config.storage_filepath);
+    FileStorage storage(config, nullptr, "owner");
+    auto backend = InstallDelayedReadBackend(storage, config);
+    const std::string value(16384, 's');
+    SeedPushBatch(storage, {value});
+    const std::vector<std::string> values{value};
+    auto request_a = SmallRequest(values, false, 1);
+    auto request_b = SmallRequest(values, false, 2);
+    std::array<std::array<char, 16384>, 2> output{};
+    auto target_a = std::make_shared<SmallBatchTarget>();
+    auto target_b = std::make_shared<SmallBatchTarget>();
+    target_a->views.push_back({output[0].data(), output[0].size()});
+    target_b->views.push_back({output[1].data(), output[1].size()});
+    std::array<
+        std::optional<tl::expected<ssd_offload::SsdReadResultV1, ErrorCode>>, 2>
+        results;
+    std::barrier start(2);
+    std::thread first([&] {
+        start.arrive_and_wait();
+        results[0] = storage.ReadOwnerStreaming(
+            request_a, target_a,
+            std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    });
+    std::thread second([&] {
+        start.arrive_and_wait();
+        results[1] = storage.ReadOwnerStreaming(
+            request_b, target_b,
+            std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    });
+    first.join();
+    second.join();
+    EXPECT_EQ(backend->loads.load(), 1u);
+    ASSERT_TRUE(results[0] && *results[0]);
+    ASSERT_TRUE(results[1] && *results[1]);
+    EXPECT_EQ(target_a->writes, 1u);
+    EXPECT_EQ(target_b->writes, 1u);
+    EXPECT_EQ(std::string(output[0].begin(), output[0].end()), value);
+    EXPECT_EQ(std::string(output[1].begin(), output[1].end()), value);
+    EXPECT_EQ(ssd_offload::ValidateSsdReadResultV1(request_a, **results[0]),
+              ssd_offload::DestinationError::kOk);
+    EXPECT_EQ(ssd_offload::ValidateSsdReadResultV1(request_b, **results[1]),
               ssd_offload::DestinationError::kOk);
 }
 

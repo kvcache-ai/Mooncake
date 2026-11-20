@@ -52,10 +52,24 @@ the configured slot budget use one bounded bulk read and scatter push; larger
 requests keep the streaming pipeline. Exactly adjacent source and destination
 fragments share a wire WRITE only when the transport registration covers the
 combined range. Partial reads and explicit direct/fixed-buffer policies retain
-the pipeline. Control sockets first attempt nonblocking I/O and poll only when
+the pipeline. A fragmented staging arena can also use the smaller pipeline
+slots when a contiguous batch allocation does not fit. Complete single-value
+reads share an overlapping disk read through the existing singleflight helper;
+each accepted writer retains its staging owner through transfer completion.
+The Owner uses four bounded request workers by default.
+
+Small TCP batches with at least four destinations, at most 4 MiB of payload,
+and fewer than 25% adjacent destination pairs use legacy restore before a push
+attempt is exposed. This avoids one push data frame per disjoint destination.
+Contiguous destinations and RDMA keep their normal selection rules.
+
+Control sockets first attempt nonblocking I/O and poll only when
 it would block, with the same absolute deadline. With liburing, ordinary READ
 workers retain their rings across requests. File and slot references remain
 owned through real completions; shutdown drains accepted work before release.
+Transfer waits poll for up to 50 microseconds before sleeping so short transfers
+can complete without an initial scheduler delay. Slow transfers retain bounded
+polling intervals, and all accepted work still drains before buffer reuse.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |

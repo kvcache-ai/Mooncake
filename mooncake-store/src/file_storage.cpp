@@ -6,7 +6,6 @@
 #include "ssd_uring_pipeline.h"
 
 #include <algorithm>
-#include <cstring>
 #include <limits>
 #include <cerrno>
 #include <cstring>
@@ -288,6 +287,11 @@ tl::expected<void, ErrorCode> FileStorage::Shutdown() {
     }
     // A metadata rescan can still be reading through the storage backend.
     if (rescan_future_.valid()) rescan_future_.wait();
+    // Accepted Owner requests are drained before Shutdown. Stop persistent
+    // I/O executors while their staging arena and transport registration live.
+    streaming_uring_reads_.reset();
+    streaming_reads_.reset();
+    streaming_writes_.reset();
     if (staging_registered_) {
         auto result = client_->unregisterLocalMemory(
             client_buffer_allocator_->getBase(), true);
@@ -838,53 +842,78 @@ FileStorage::ReadOwnerStreaming(
             batch_keys.push_back(tenant.MakeScopedKey(object.key));
             batch_sizes.push_back(static_cast<int64_t>(size));
         }
+        // Reuse the existing in-flight read sharing for a complete single
+        // value. No completed value is cached; each writer retains its own
+        // shared staging owner until its destination transfer drains.
+        std::shared_ptr<AllocatedBatch> shared;
+        if (whole_batch && request.objects.size() == 1) {
+            auto key = BuildColdReadFlightKey(batch_keys, batch_sizes);
+            auto loaded = LoadBatchShared(batch_keys, batch_sizes, false,
+                                          std::move(*key));
+            if (loaded)
+                shared = std::move(*loaded);
+            else if (loaded.error() != ErrorCode::BUFFER_OVERFLOW)
+                return tl::make_unexpected(loaded.error());
+        }
         // Fragmentation can prevent a contiguous batch allocation while the
         // smaller streaming slots still fit. No I/O has been accepted, so
         // retain the pipeline below when the bulk allocation is unavailable.
-        auto handle = whole_batch
+        auto handle = whole_batch && !shared
                           ? client_buffer_allocator_->allocate(batch_bytes)
                           : std::nullopt;
-        if (handle) {
-            // Lay values out by destination registration/offset. Adjacent
-            // destinations can then share a wire WRITE after authorization.
-            std::vector<size_t> order(request.objects.size());
-            std::iota(order.begin(), order.end(), 0);
-            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-                const auto& left = request.objects[a].ranges[0].destinations[0];
-                const auto& right =
-                    request.objects[b].ranges[0].destinations[0];
-                return std::pair(left.region.region_id, left.offset) <
-                       std::pair(right.region.region_id, right.offset);
-            });
-            const auto begin = reinterpret_cast<uintptr_t>(handle->ptr());
+        if (shared || handle) {
             std::unordered_map<std::string, Slice> slices;
-            slices.reserve(request.objects.size());
-            size_t cursor = 0;
-            for (const auto index : order) {
-                if (config_.use_uring)
-                    cursor = align_up(begin + cursor, size_t{4096}) - begin;
-                slices.emplace(batch_keys[index],
-                               Slice{reinterpret_cast<void*>(begin + cursor),
-                                     static_cast<size_t>(batch_sizes[index])});
-                cursor +=
-                    config_.use_uring
-                        ? align_up(batch_sizes[index], size_t{4096}) + 4096
-                        : batch_sizes[index];
+            uintptr_t begin;
+            size_t read_bytes;
+            if (shared) {
+                const auto& slice = shared->slices.at(batch_keys.front());
+                begin = reinterpret_cast<uintptr_t>(slice.ptr);
+                read_bytes = slice.size;
+            } else {
+                // Lay values out by destination registration/offset. Adjacent
+                // destinations can share a wire WRITE after authorization.
+                std::vector<size_t> order(request.objects.size());
+                std::iota(order.begin(), order.end(), 0);
+                std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                    const auto& left =
+                        request.objects[a].ranges[0].destinations[0];
+                    const auto& right =
+                        request.objects[b].ranges[0].destinations[0];
+                    return std::pair(left.region.region_id, left.offset) <
+                           std::pair(right.region.region_id, right.offset);
+                });
+                begin = reinterpret_cast<uintptr_t>(handle->ptr());
+                read_bytes = handle->size();
+                slices.reserve(request.objects.size());
+                size_t cursor = 0;
+                for (const auto index : order) {
+                    if (config_.use_uring)
+                        cursor = align_up(begin + cursor, size_t{4096}) - begin;
+                    slices.emplace(
+                        batch_keys[index],
+                        Slice{reinterpret_cast<void*>(begin + cursor),
+                              static_cast<size_t>(batch_sizes[index])});
+                    cursor +=
+                        config_.use_uring
+                            ? align_up(batch_sizes[index], size_t{4096}) + 4096
+                            : batch_sizes[index];
+                }
+                auto loaded = BatchLoad(slices);
+                if (!loaded) return tl::make_unexpected(loaded.error());
             }
-            auto loaded = BatchLoad(slices);
-            if (!loaded) return tl::make_unexpected(loaded.error());
+            const auto& loaded_slices = shared ? shared->slices : slices;
             if (expired()) {
                 cancel_remaining(0);
                 return result;
             }
             ReadChunk chunk{};
-            chunk.read_bytes = handle->size();
+            chunk.read_bytes = read_bytes;
             chunk.fragments.reserve(batch_destinations);
             size_t ordinal = 0;
             for (size_t i = 0; i < request.objects.size(); ++i) {
-                size_t offset =
-                    reinterpret_cast<uintptr_t>(slices.at(batch_keys[i]).ptr) -
-                    begin;
+                size_t offset = reinterpret_cast<uintptr_t>(
+                                    loaded_slices.at(batch_keys[i]).ptr) -
+                                begin;
                 for (const auto& destination :
                      request.objects[i].ranges.front().destinations) {
                     chunk.fragments.push_back(

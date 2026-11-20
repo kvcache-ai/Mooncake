@@ -1513,9 +1513,16 @@ class TransferEngine::ScatterTransferOperation::Impl {
     }
 
     Status wait() {
+        const auto spin_until =
+            std::chrono::steady_clock::now() + std::chrono::microseconds(50);
         while (!completed_) {
             poll();
-            if (!completed_) std::this_thread::sleep_for(kPollInterval);
+            if (!completed_) {
+                if (std::chrono::steady_clock::now() < spin_until)
+                    PAUSE();
+                else
+                    std::this_thread::sleep_for(kPollInterval);
+            }
         }
         return aggregate_status_;
     }

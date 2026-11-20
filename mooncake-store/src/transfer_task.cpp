@@ -982,6 +982,10 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
 
 void TransferEngineOperationState::wait_for_completion() {
     const int64_t timeout_milliseconds = GetTransferTimeoutMilliseconds();
+    // Most small TCP/RDMA transfers finish before a scheduled sleep returns.
+    // Poll briefly first, then back off to bound CPU use on slow transfers.
+    const auto spin_until =
+        std::chrono::steady_clock::now() + std::chrono::microseconds(50);
     auto check_deadline = [&] {
         if (getCurrentTimeInMilli() - start_ts_ >= timeout_milliseconds &&
             !deadline_exceeded_) {
@@ -1007,6 +1011,10 @@ void TransferEngineOperationState::wait_for_completion() {
             if (deadline_exceeded_ && result_ == ErrorCode::OK)
                 result_ = ErrorCode::TRANSFER_FAIL;
             if (result_.has_value()) return;
+        }
+        if (std::chrono::steady_clock::now() < spin_until) {
+            PAUSE();
+            continue;
         }
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         if (!engine_.isUsingTent() && !submission_failed_) {
