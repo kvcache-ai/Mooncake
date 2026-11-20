@@ -1178,10 +1178,10 @@ class MasterService {
                                                  uint64_t target_bytes);
 
     // Caller holds the Replica owner's retaining guard.
-    auto AddReplicaForRetainedClient(const UUID& client_id,
-                                     const std::string& key,
-                                     const TenantId& tenant_id,
-                                     Replica& replica)
+    auto AddReplicaForRetainedClient(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id, Replica& replica,
+        const OffloadTaskItem* completed_offload = nullptr)
         -> tl::expected<bool, ErrorCode>;
 
     void ClearInvalidHandles();

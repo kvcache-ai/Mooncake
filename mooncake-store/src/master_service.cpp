@@ -5622,10 +5622,9 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     return AddReplicaForRetainedClient(client_id, key, tenant_id, replica);
 }
 
-auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
-                                                const std::string& key,
-                                                const TenantId& tenant_id,
-                                                Replica& replica)
+auto MasterService::AddReplicaForRetainedClient(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    Replica& replica, const OffloadTaskItem* completed_offload)
     -> tl::expected<bool, ErrorCode> {
     assert(tenant_id.IsValid());
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
@@ -5655,6 +5654,10 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     const ObjectIdentity object_id{normalized_tenant, key};
     MetadataAccessorRW accessor(this, object_id,
                                 MetadataAccessorRW::CreateKey{});
+    if (completed_offload != nullptr &&
+        local_ssd_manager_.FinishTakenOffload(client_id, *completed_offload)) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
     if (!accessor.IsPublished()) {
         accessor.Publish(
             client_id, std::chrono::system_clock::now(),
@@ -8457,9 +8460,11 @@ auto MasterService::NotifyOffloadSuccess(
                 request_object_id.user_key};
 
             auto res = AddReplicaForRetainedClient(
-                client_id, object_id.user_key, object_id.tenant_id, replica);
+                client_id, object_id.user_key, object_id.tenant_id, replica,
+                &task);
             if (!res) {
                 if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                    ++skipped_completed;
                     continue;
                 }
                 if (res.error() == ErrorCode::SEGMENT_NOT_FOUND) {
