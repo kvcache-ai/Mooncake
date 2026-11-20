@@ -128,10 +128,13 @@ _REQUIRED_NON_EMPTY_FIELDS = (
 )
 
 
+def _check_segment_size(value, field_name: str) -> None:
+    if not 0 <= value < (1 << 64):
+        raise ValueError(f"Invalid {field_name}: {value!r}. Size must fit in uint64.")
+
+
 def _parse_segment_size(value) -> int:
     """Parse bytes or binary size suffixes, including IEC KiB/MiB/GiB/TiB."""
-    if isinstance(value, int):
-        return value
     if isinstance(value, str):
         s = value.strip().lower()
         if not s:
@@ -143,8 +146,12 @@ def _parse_segment_size(value) -> int:
                     raise ValueError(
                         f"Invalid segment size: missing number before '{suffix}'"
                     )
-                return int(float(num) * multiplier)
-        return int(float(s))
+                value = float(num) * multiplier
+                break
+        else:
+            value = float(s)
+    # Validate the scaled value while a negative fraction is still negative.
+    _check_segment_size(value, "segment size")
     return int(value)
 
 
@@ -284,11 +291,7 @@ class MooncakeConfig:
             )
 
         for field_name in ("global_segment_size", "local_buffer_size"):
-            value = getattr(self, field_name)
-            if value < 0:
-                raise ValueError(
-                    f"Invalid {field_name}: {value}. Size must be non-negative."
-                )
+            _check_segment_size(getattr(self, field_name), field_name)
 
         for field_name in _REQUIRED_NON_EMPTY_FIELDS:
             value = getattr(self, field_name)

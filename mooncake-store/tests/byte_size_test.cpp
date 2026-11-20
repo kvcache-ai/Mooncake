@@ -79,6 +79,17 @@ TEST(UtilsTest, RejectsInvalidBinaryByteSizeSuffixes) {
     }
 }
 
+TEST(UtilsTest, IecUnitsRetainLegacyBinaryMultipliers) {
+    for (const std::string unit : {"K", "M", "G", "T"}) {
+        for (const std::string number : {"0", "1", "1.5", "256"}) {
+            SCOPED_TRACE(number + unit);
+            const auto legacy = try_string_to_byte_size(number + unit + "B");
+            ASSERT_TRUE(legacy.has_value());
+            EXPECT_EQ(try_string_to_byte_size(number + unit + "iB"), legacy);
+        }
+    }
+}
+
 TEST(UtilsTest, RejectsOutOfRangeAndNonFiniteByteSizes) {
     // value * multiplier reaches or exceeds 2^64; casting such a double to
     // uint64_t is undefined behavior, so these must be rejected, not clamped.
