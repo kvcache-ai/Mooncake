@@ -45,24 +45,40 @@ Refer to the [vLLM official repository](https://github.com/vllm-project/vllm) an
 
 #### 2. Mooncake Master Server
 
+This example uses an embedded Store: each vLLM worker contributes host memory
+to the shared KV cache pool. It uses TCP so that RDMA hardware is not required.
+
 **Start:**
 
 ```shell
-mooncake_master --port 50063
+mooncake_master --rpc_port 50063
 ```
 
 **Configure Mooncake**: Create a JSON configuration file (e.g., `mooncake_config.json`):
 
 ```json
 {
-  "metadata_server": "http://127.0.0.1:8092/metadata",
+  "metadata_server": "P2PHANDSHAKE",
   "master_server_address": "127.0.0.1:50063",
-  "global_segment_size": "0",
+  "mode": "embedded",
+  "global_segment_size": "1073741824",
   "local_buffer_size": "2147483648",
-  "protocol": "rdma",
+  "protocol": "tcp",
   "device_name": ""
 }
 ```
+
+`P2PHANDSHAKE` exchanges Transfer Engine metadata directly between clients, so
+no separate metadata service needs to be started. Each worker reserves 1 GiB
+for the Store pool and 2 GiB for its local transfer buffer; budget this memory
+per tensor/data parallel worker and adjust the sizes for your workload.
+Embedded mode requires a positive `global_segment_size`. A zero-sized segment
+is for `"mode": "standalone-store"`, where a separate `mooncake_client` owns the
+pool; see the [Store deployment guide](../../mooncake-store-deployment-guide.md).
+
+For RDMA deployments, use `"protocol": "rdma"` and configure the RDMA devices
+for your environment. When deploying across machines, replace `127.0.0.1` in
+`master_server_address` with the master's reachable address.
 
 **Set environment variable:**
 
