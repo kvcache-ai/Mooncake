@@ -516,6 +516,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       quota_bytes_(config.quota_bytes),
       enable_multi_tenants_(config.enable_multi_tenants),
       segment_manager_(config.memory_allocator, config.enable_cxl),
+      local_ssd_manager_(
+          std::chrono::seconds(config.put_start_release_timeout_sec)),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_type_(config.enable_cxl
@@ -2178,12 +2180,11 @@ void MasterService::EraseMetadata(metadata::Namespace& ns,
             source->dec_refcnt();
         }
         state.offloading_task.reset();
-
-        // The mailbox entry must be dropped too, otherwise the next
-        // OffloadObjectHeartbeat drains a task-less key back to the client and
-        // produces an orphan bucket.
-        local_ssd_manager_.RemoveOffloadFromAll(tenant_id, key);
     }
+    // The mailbox entry must be dropped too, otherwise the next
+    // OffloadObjectHeartbeat drains a task-less key back to the client and
+    // produces an orphan bucket.
+    local_ssd_manager_.RemoveOffloadFromAll(tenant_id, key);
     if (state.replication_task) {
         auto source =
             metadata.GetReplicaByID(state.replication_task->source_id);
@@ -8315,6 +8316,8 @@ auto MasterService::NotifyOffloadSuccess(
     // below). NACK cleanups still run for the rest of the batch; the caller
     // gets SEGMENT_NOT_FOUND so a rescan stops re-registering.
     bool refused_unmounted = false;
+    size_t skipped_completed = 0;
+    size_t skipped_nacked = 0;
 
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
@@ -8331,6 +8334,11 @@ auto MasterService::NotifyOffloadSuccess(
             std::shared_lock<std::shared_mutex> shared_lock(
                 master_state_mutex_);
             MetadataAccessorRW accessor(this, request_object_id);
+            if (local_ssd_manager_.FinishTakenOffload(
+                    client_id, TenantId(task.tenant_id), task.key)) {
+                ++skipped_nacked;
+                continue;
+            }
             if (accessor.Exists()) {
                 auto& offloading_task = accessor.GetState().offloading_task;
                 if (offloading_task) {
@@ -8373,6 +8381,11 @@ auto MasterService::NotifyOffloadSuccess(
             const bool segment_mounted =
                 !enable_offload_ || HasMountedLocalDiskSegment(client_id);
             MetadataAccessorRW accessor(this, request_object_id);
+            if (local_ssd_manager_.FinishTakenOffload(
+                    client_id, TenantId(task.tenant_id), task.key)) {
+                ++skipped_completed;
+                continue;
+            }
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
                 auto& offloading_task = accessor.GetState().offloading_task;
@@ -8471,6 +8484,12 @@ auto MasterService::NotifyOffloadSuccess(
         }
     }
 
+    if (skipped_completed + skipped_nacked > 0) {
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=notify_offload_success_skip_cancelled"
+                  << ", completed=" << skipped_completed
+                  << ", nacked=" << skipped_nacked;
+    }
     if (refused_unmounted) {
         LOG(WARNING) << "client_id=" << client_id
                      << ", action=notify_offload_success_refused"

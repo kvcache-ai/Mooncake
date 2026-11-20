@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <boost/functional/hash.hpp>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -19,11 +20,15 @@ namespace mooncake {
 
 class LocalSsdTaskMailbox {
    public:
-    explicit LocalSsdTaskMailbox(bool enable_offloading);
+    explicit LocalSsdTaskMailbox(
+        bool enable_offloading,
+        std::chrono::seconds taken_offload_ttl =
+            std::chrono::seconds(DEFAULT_PUT_START_RELEASE_TIMEOUT));
 
     ErrorCode EnqueueOffload(OffloadTaskItem task, size_t limit);
     std::vector<OffloadTaskItem> SetOffloadingAndTakePending(bool enabled);
     bool RemoveOffload(const TenantId& tenant_id, std::string_view key);
+    bool FinishTakenOffload(const TenantId& tenant_id, std::string_view key);
 
     ErrorCode EnqueuePromotion(PromotionTaskItem task);
     std::vector<PromotionTaskItem> TakePromotions(size_t max_items);
@@ -36,9 +41,17 @@ class LocalSsdTaskMailbox {
     bool ConsumeRemoveAll();
 
    private:
+    struct TakenOffload {
+        bool cancelled{false};
+        std::optional<std::chrono::steady_clock::time_point> finished_until;
+    };
+
     mutable Mutex mutex_;
     bool enable_offloading_ GUARDED_BY(mutex_);
+    const std::chrono::seconds taken_offload_ttl_;
     std::unordered_map<std::string, OffloadTaskItem> pending_offloads_
+        GUARDED_BY(mutex_);
+    std::unordered_map<std::string, TakenOffload> taken_offloads_
         GUARDED_BY(mutex_);
     // Dedup map + recency order. seq is monotone; enqueue, a duplicate
     // enqueue, and TouchPromotion all re-mark the entry with a fresh seq, so
@@ -68,6 +81,10 @@ class LocalSsdManager {
         int64_t used_bytes;
     };
 
+    explicit LocalSsdManager(
+        std::chrono::seconds taken_offload_ttl =
+            std::chrono::seconds(DEFAULT_PUT_START_RELEASE_TIMEOUT));
+
     ErrorCode RegisterClient(const UUID& client_id, bool enable_offloading);
     std::optional<int64_t> UnregisterClient(const UUID& client_id);
 
@@ -87,6 +104,8 @@ class LocalSsdManager {
     SetOffloadingAndTakePending(const UUID& client_id, bool enabled);
     bool RemoveOffload(const UUID& client_id, const TenantId& tenant_id,
                        std::string_view key);
+    bool FinishTakenOffload(const UUID& client_id, const TenantId& tenant_id,
+                            std::string_view key);
     size_t RemoveOffloadFromAll(const TenantId& tenant_id,
                                 std::string_view key);
     bool CancelOffloadsIfAllPending(const std::vector<UUID>& client_ids,
@@ -109,8 +128,9 @@ class LocalSsdManager {
 
    private:
     struct ClientRecord {
-        explicit ClientRecord(bool enable_offloading)
-            : mailbox(enable_offloading) {}
+        ClientRecord(bool enable_offloading,
+                     std::chrono::seconds taken_offload_ttl)
+            : mailbox(enable_offloading, taken_offload_ttl) {}
 
         // Unregistration removes the record from clients_ first, then takes
         // this lock exclusively to wait for operations that already found it.
@@ -143,6 +163,7 @@ class LocalSsdManager {
     std::vector<ClientAccess> SnapshotClients() const;
     static void WaitForOperations(const ClientMap& clients);
 
+    const std::chrono::seconds taken_offload_ttl_;
     mutable std::shared_mutex mutex_;
     ClientMap clients_;
 };

@@ -4,6 +4,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -76,6 +77,64 @@ class OffloadOnEvictTest : public ::testing::Test {
         }
         return queued;
     }
+
+    std::unique_ptr<MasterService> MakeEvictingService() const {
+        MasterServiceConfig config;
+        config.enable_offload = true;
+        config.offload_on_evict = true;
+        config.default_kv_lease_ttl = kLeaseTtlMs;
+        return std::make_unique<MasterService>(config);
+    }
+
+    std::vector<OffloadTaskItem> TakeOffloadsQueuedByEviction(
+        MasterService& service, const UUID& client_id) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kLeaseTtlMs * 2));
+        MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
+        auto taken = service.OffloadObjectHeartbeat(client_id, true);
+        EXPECT_TRUE(taken.has_value());
+        return taken ? std::move(taken.value())
+                     : std::vector<OffloadTaskItem>{};
+    }
+
+    std::vector<OffloadTaskItem> PutAndTakeOffloads(MasterService& service,
+                                                    const UUID& client_id) {
+        for (int i = 0; i < kObjects; ++i) {
+            PutObject(service, client_id, "in_flight_" + std::to_string(i),
+                      kObjectSize);
+        }
+        EXPECT_TRUE(DrainOffloadQueue(service, client_id).empty());
+        auto tasks = TakeOffloadsQueuedByEviction(service, client_id);
+        EXPECT_EQ(tasks.size(), static_cast<size_t>(kObjects));
+        return tasks;
+    }
+
+    static bool HasLocalDiskReplica(MasterService& service,
+                                    const std::string& key) {
+        auto replicas =
+            service.GetReplicaListForAdmin(key, TenantId::Default());
+        return replicas.has_value() &&
+               std::any_of(replicas->replicas.begin(), replicas->replicas.end(),
+                           [](const auto& replica) {
+                               return replica.is_local_disk_replica();
+                           });
+    }
+
+    static std::vector<StorageObjectMetadata> DiskMetadatas(
+        const std::vector<OffloadTaskItem>& tasks) {
+        std::vector<StorageObjectMetadata> metadatas;
+        for (const auto& task : tasks) {
+            StorageObjectMetadata metadata;
+            metadata.data_size = task.size;
+            metadata.transport_endpoint = "holder:1";
+            metadatas.push_back(metadata);
+        }
+        return metadatas;
+    }
+
+    static constexpr int kObjects = 8;
+    static constexpr uint64_t kLeaseTtlMs = 500;
+    static constexpr size_t kSegmentSize = 1024 * 1024 * 16;
+    static constexpr size_t kObjectSize = 1024 * 1024;
 };
 
 // =============================================================================
@@ -147,6 +206,84 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsQueuedOffloadWithOffloadOnEvict) {
     auto stale = DrainOffloadQueue(*service, ctx.client_id);
     EXPECT_EQ(stale.count(offloading_key), 0u)
         << "preempted key must not remain queued";
+
+    service->RemoveAll();
+}
+
+TEST_F(OffloadOnEvictTest, RemoveDuringInFlightOffloadStaysRemoved) {
+    auto service = MakeEvictingService();
+    auto ctx = PrepareSegment(*service, "test_segment", kDefaultSegmentBase,
+                              kSegmentSize);
+    ASSERT_TRUE(service->MountLocalDiskSegment(ctx.client_id, true));
+    auto tasks = PutAndTakeOffloads(*service, ctx.client_id);
+    ASSERT_FALSE(tasks.empty());
+
+    for (const auto& task : tasks) {
+        ASSERT_TRUE(service->Remove(task.key, TenantId::Default(), true));
+    }
+    for (int delivery = 0; delivery < 2; ++delivery) {
+        ASSERT_TRUE(service->NotifyOffloadSuccess(ctx.client_id, tasks,
+                                                  DiskMetadatas(tasks)));
+        for (const auto& task : tasks) {
+            auto exists = service->ExistKey(task.key, TenantId::Default());
+            ASSERT_TRUE(exists.has_value());
+            EXPECT_FALSE(exists.value()) << task.key;
+        }
+    }
+
+    service->RemoveAll();
+}
+
+TEST_F(OffloadOnEvictTest, StaleOffloadCompletionSkipsRecreatedObject) {
+    auto service = MakeEvictingService();
+    auto ctx = PrepareSegment(*service, "test_segment", kDefaultSegmentBase,
+                              kSegmentSize);
+    ASSERT_TRUE(service->MountLocalDiskSegment(ctx.client_id, true));
+    auto tasks = PutAndTakeOffloads(*service, ctx.client_id);
+    ASSERT_FALSE(tasks.empty());
+    std::vector<OffloadTaskItem> stale{tasks.front()};
+    const std::string& key = stale[0].key;
+
+    ASSERT_TRUE(service->Remove(key, TenantId::Default(), true));
+    PutObject(*service, ctx.client_id, key, kObjectSize);
+    ASSERT_TRUE(service->NotifyOffloadSuccess(ctx.client_id, stale,
+                                              DiskMetadatas(stale)));
+    EXPECT_FALSE(HasLocalDiskReplica(*service, key));
+
+    auto fresh = TakeOffloadsQueuedByEviction(*service, ctx.client_id);
+    ASSERT_EQ(fresh.size(), 1u);
+    ASSERT_EQ(fresh[0].key, key);
+    ASSERT_TRUE(service->NotifyOffloadSuccess(ctx.client_id, fresh,
+                                              DiskMetadatas(fresh)));
+    EXPECT_TRUE(HasLocalDiskReplica(*service, key));
+
+    service->RemoveAll();
+}
+
+TEST_F(OffloadOnEvictTest, StaleOffloadNackKeepsRecreatedObjectsMarker) {
+    auto service = MakeEvictingService();
+    auto ctx = PrepareSegment(*service, "test_segment", kDefaultSegmentBase,
+                              kSegmentSize);
+    ASSERT_TRUE(service->MountLocalDiskSegment(ctx.client_id, true));
+    auto tasks = PutAndTakeOffloads(*service, ctx.client_id);
+    ASSERT_FALSE(tasks.empty());
+    std::vector<OffloadTaskItem> stale{tasks.front()};
+    const std::string key = stale[0].key;
+
+    ASSERT_TRUE(service->Remove(key, TenantId::Default(), true));
+    PutObject(*service, ctx.client_id, key, kObjectSize);
+    std::this_thread::sleep_for(std::chrono::milliseconds(kLeaseTtlMs * 2));
+    MasterServiceTestPeer(*service).RunBatchEvictForTesting(1.0, 1.0);
+    stale[0].size = -1;
+    ASSERT_TRUE(service->NotifyOffloadSuccess(ctx.client_id, stale,
+                                              DiskMetadatas(stale)));
+
+    auto fresh = service->OffloadObjectHeartbeat(ctx.client_id, true);
+    ASSERT_TRUE(fresh.has_value());
+    ASSERT_EQ(fresh->size(), 1u);
+    ASSERT_EQ(fresh->front().key, key);
+    EXPECT_FALSE(service->UpsertStart(ctx.client_id, key, TenantId::Default(),
+                                      kObjectSize, ReplicateConfig{}));
 
     service->RemoveAll();
 }

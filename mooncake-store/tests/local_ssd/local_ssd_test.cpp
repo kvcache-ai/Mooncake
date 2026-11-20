@@ -47,6 +47,80 @@ TEST(LocalSsdTaskMailboxTest, DisabledOffloadingDrainsPendingTasks) {
                 ErrorCode::UNABLE_OFFLOADING);
 }
 
+TEST(LocalSsdTaskMailboxTest, RemovedTakenOffloadStaysCancelledUntilRetaken) {
+    LocalSsdTaskMailbox mailbox(true);
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "key", 1), 10) ==
+                ErrorCode::OK);
+    ASSERT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 1);
+
+    EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "key"));
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "unrelated", 1),
+                                       10) == ErrorCode::OK);
+    ASSERT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 1);
+    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("other"), "key"));
+    EXPECT_TRUE(mailbox.FinishTakenOffload(TenantId("tenant"), "key"));
+    ASSERT_TRUE(mailbox.SetOffloadingAndTakePending(true).empty());
+    EXPECT_TRUE(mailbox.FinishTakenOffload(TenantId("tenant"), "key"));
+
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "key", 1), 10) ==
+                ErrorCode::OK);
+    ASSERT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 1);
+    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("tenant"), "key"));
+}
+
+TEST(LocalSsdTaskMailboxTest, OnlyRemovedTakenOffloadsAreCancelled) {
+    LocalSsdTaskMailbox mailbox(true);
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "done", 1), 10) ==
+                ErrorCode::OK);
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "queued", 1), 10) ==
+                ErrorCode::OK);
+    ASSERT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 2);
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "queued", 1), 10) ==
+                ErrorCode::OK);
+
+    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("tenant"), "done"));
+    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("tenant"), "done"));
+    EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "done"));
+    EXPECT_TRUE(mailbox.FinishTakenOffload(TenantId("tenant"), "done"));
+
+    EXPECT_TRUE(mailbox.RemoveOffload(TenantId("tenant"), "queued"));
+    EXPECT_TRUE(mailbox.FinishTakenOffload(TenantId("tenant"), "queued"));
+    EXPECT_TRUE(mailbox.SetOffloadingAndTakePending(true).empty());
+
+    EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "never"));
+    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("tenant"), "never"));
+}
+
+TEST(LocalSsdTaskMailboxTest, OnlyFinishedOffloadsExpire) {
+    LocalSsdTaskMailbox mailbox(true, std::chrono::seconds(0));
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "open", 1), 10) ==
+                ErrorCode::OK);
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "done", 1), 10) ==
+                ErrorCode::OK);
+    ASSERT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 2);
+    EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "open"));
+    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("tenant"), "done"));
+    EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "done"));
+
+    EXPECT_TRUE(mailbox.SetOffloadingAndTakePending(true).empty());
+    EXPECT_TRUE(mailbox.FinishTakenOffload(TenantId("tenant"), "open"));
+    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("tenant"), "done"));
+}
+
+TEST(LocalSsdTaskMailboxTest, DrainWithOffloadingDisabledTracksNothing) {
+    LocalSsdTaskMailbox mailbox(true);
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "taken", 1), 10) ==
+                ErrorCode::OK);
+    ASSERT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 1);
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "key", 1), 10) ==
+                ErrorCode::OK);
+    ASSERT_EQ(mailbox.SetOffloadingAndTakePending(false).size(), 1);
+    EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "key"));
+    EXPECT_FALSE(mailbox.FinishTakenOffload(TenantId("tenant"), "key"));
+    EXPECT_FALSE(mailbox.RemoveOffload(TenantId("tenant"), "taken"));
+    EXPECT_TRUE(mailbox.FinishTakenOffload(TenantId("tenant"), "taken"));
+}
+
 TEST(LocalSsdTaskMailboxTest, PromotionsAreBatchedAndRemoveAllIsConsumed) {
     LocalSsdTaskMailbox mailbox(false);
     EXPECT_TRUE(mailbox.EnqueuePromotion(Promotion("a", "key", 1)) ==
