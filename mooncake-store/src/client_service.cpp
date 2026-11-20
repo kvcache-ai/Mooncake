@@ -977,6 +977,21 @@ ErrorCode Client::InitTransferEngine(
         globalConfig().ascend_store_te_init = true;
     }
 
+    // The Store never sends or reads Transfer Engine notifications, so its
+    // engine has no use for the RDMA notification channel, which registers
+    // 32 MiB per endpoint. Keep the channel off while this engine is set up,
+    // unless MC_RDMA_NOTIFY_ENABLED is set. Engines set up before or after
+    // this one see the configured value; like the guard above, this assumes
+    // TE inits are serialized within the process.
+    struct RdmaNotifyGuard {
+        const bool configured = globalConfig().rdma_notify_enabled;
+        ~RdmaNotifyGuard() { globalConfig().rdma_notify_enabled = configured; }
+    } rdma_notify_guard;
+    if (protocol == "rdma" && !globalConfig().use_rdma_twosided &&
+        std::getenv("MC_RDMA_NOTIFY_ENABLED") == nullptr) {
+        globalConfig().rdma_notify_enabled = false;
+    }
+
     // Check if using TENT mode - TENT handles transport configuration
     // internally. Use the engine's own check rather than the raw env var:
     // if Mooncake was built without USE_TENT, the env var has no effect on
