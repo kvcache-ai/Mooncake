@@ -7,6 +7,7 @@ set -o pipefail
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib.
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
+export MOONCAKE_STORE_BACKEND=p2p
 LOG_ROOT="${MOONCAKE_TEST_LOG_DIR:-/tmp/mooncake-tests}"
 mkdir -p "$LOG_ROOT"
 LOG_ROOT=$(cd "$LOG_ROOT" && pwd)
@@ -92,14 +93,6 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for command in mooncake_master mooncake_client; do
-    version=$(timeout 10s "$command" --version)
-    if ! grep -qx "architecture=p2p" <<<"$version"; then
-        echo "ERROR: $command is not the P2P binary: $version" >&2
-        exit 1
-    fi
-done
-
 case "$RUN_TESTS_METADATA_SERVER_MODE" in
     managed)
         echo "Starting standalone HTTP metadata server..."
@@ -137,7 +130,7 @@ export MOONCAKE_TIERED_BACKEND_CONFIG="$LOG_DIR/tiered-backend.json"
 cat >"$MOONCAKE_TIERED_BACKEND_CONFIG" <<'JSON'
 {"tiers": [{"type": "DRAM", "capacity": 536870912, "priority": 100, "allocator_type": "OFFSET"}]}
 JSON
-setsid mooncake_master --rpc_address=127.0.0.1 --rpc_port=50051 \
+setsid mooncake_p2p_master --rpc_address=127.0.0.1 --rpc_port=50051 \
     --metrics_port=0 --enable_metric_reporting=false --enable_ha=false \
     >"$LOG_DIR/master.log" 2>&1 &
 MASTER_PID=$!
@@ -168,7 +161,7 @@ wait "$TEST_PID"
 TEST_PID=""
 
 export MOONCAKE_REAL_CLIENT_ADDRESS=127.0.0.1:50052
-setsid mooncake_client --host=127.0.0.1 --metadata_server="$MC_METADATA_SERVER" \
+setsid mooncake_p2p_client --host=127.0.0.1 --metadata_server="$MC_METADATA_SERVER" \
     --protocol=tcp --client_rpc_port=0 --master_server_address="$MASTER_SERVER" \
     --port=50052 --tiered_backend_config="$MOONCAKE_TIERED_BACKEND_CONFIG" \
     --enable_http_server=false --enable_client_metric_collection=false \

@@ -1,12 +1,8 @@
-if(NOT MOONCAKE_STORE_CLIENT_ARCH STREQUAL "p2p")
-    return()
-endif()
-
 # P2P fixtures use only the selected P2P Store implementation.
 function(add_p2p_store_executable name)
     add_executable(${name} ${ARGN})
     target_link_libraries(${name} PUBLIC
-        mooncake_store
+        ${STORE_LIBRARY}
         transfer_engine
         cachelib_memory_allocator
         ${ETCD_WRAPPER_LIB}
@@ -31,7 +27,7 @@ endfunction()
 function(add_p2p_store_test_with_custom_main name)
     add_executable(${name} ${ARGN})
     target_link_libraries(${name} PUBLIC
-        mooncake_store
+        ${STORE_LIBRARY}
         transfer_engine
         cachelib_memory_allocator
         ${ETCD_WRAPPER_LIB}
@@ -67,7 +63,7 @@ set_tests_properties(p2p_master_rpc_test p2p_master_http_endpoints_test
 
 add_executable(stress_workload_test_p2p stress_workload_test.cpp)
 target_link_libraries(stress_workload_test_p2p PUBLIC
-    mooncake_store
+    ${STORE_LIBRARY}
     transfer_engine
     cachelib_memory_allocator
     ${ETCD_WRAPPER_LIB}
@@ -78,19 +74,17 @@ target_link_libraries(stress_workload_test_p2p PUBLIC
 )
 
 # client side
-add_p2p_store_test(inflight_tracker_test inflight_tracker_test.cpp)
-set_tests_properties(inflight_tracker_test PROPERTIES TIMEOUT 60)
-if(MOONCAKE_STORE_CLIENT_ARCH STREQUAL "p2p")
-    add_p2p_store_executable(p2p_real_client_test p2p_real_client_test.cpp)
-    add_test(NAME p2p_real_client_test COMMAND p2p_real_client_test
-        --gtest_filter=-P2PRealClientTest.IPv6LoopbackPutGet)
-    add_test(NAME p2p_real_client_ipv6_test COMMAND p2p_real_client_test
-        --gtest_filter=P2PRealClientTest.IPv6LoopbackPutGet)
-    set_tests_properties(p2p_real_client_test p2p_real_client_ipv6_test
-        PROPERTIES LABELS "p2p;client;integration" TIMEOUT 120)
-    set_tests_properties(p2p_real_client_ipv6_test
-        PROPERTIES ENVIRONMENT "MC_USE_IPV6=1")
-endif()
+add_p2p_store_test(inflight_tracker_test${STORE_TEST_SUFFIX} inflight_tracker_test.cpp)
+set_tests_properties(inflight_tracker_test${STORE_TEST_SUFFIX} PROPERTIES TIMEOUT 60)
+add_p2p_store_executable(p2p_real_client_test p2p_real_client_test.cpp)
+add_test(NAME p2p_real_client_test COMMAND p2p_real_client_test
+    --gtest_filter=-P2PRealClientTest.IPv6LoopbackPutGet)
+add_test(NAME p2p_real_client_ipv6_test COMMAND p2p_real_client_test
+    --gtest_filter=P2PRealClientTest.IPv6LoopbackPutGet)
+set_tests_properties(p2p_real_client_test p2p_real_client_ipv6_test
+    PROPERTIES LABELS "p2p;client;integration" TIMEOUT 120)
+set_tests_properties(p2p_real_client_ipv6_test
+    PROPERTIES ENVIRONMENT "MC_USE_IPV6=1")
 add_p2p_store_test_with_custom_main(p2p_client_integration_test p2p_client_integration_test.cpp)
 add_p2p_store_test(p2p_client_http_endpoints_test p2p_client_http_endpoints_test.cpp)
 add_p2p_store_test(p2p_register_concurrency_test p2p_register_concurrency_test.cpp)
@@ -211,8 +205,10 @@ set_tests_properties(p2p_client_ha_test ha_integration_test metadata_recovery_wo
 
 # Redis-dependent entries require the backend in this architecture.
 if(STORE_USE_REDIS)
-add_executable(redis_election_helper_test redis_election_helper_test.cpp)
-target_link_libraries(redis_election_helper_test PUBLIC mooncake_store transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
+    add_executable(redis_election_helper_test redis_election_helper_test.cpp)
+    target_link_libraries(redis_election_helper_test PUBLIC
+        ${STORE_LIBRARY} transfer_engine cachelib_memory_allocator
+        ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
     add_test(NAME redis_election_helper_test COMMAND redis_election_helper_test)
     add_p2p_store_test(redis_oplog_store_test ha/oplog/redis_oplog_store_test.cpp)
     add_p2p_store_test(redis_oplog_trim_worker_test

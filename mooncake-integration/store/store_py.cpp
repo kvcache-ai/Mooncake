@@ -9,7 +9,6 @@
 #include "allocator.h"
 #include "shm_helper.h"
 #include "types.h"
-#include "version.h"
 
 #include <cstdlib>  // for atexit
 #include <cstdint>
@@ -1755,7 +1754,7 @@ void BindCentralizedMethods(StoreBinding& store) {
 }  // namespace
 
 PYBIND11_MODULE(_store, m) {
-    m.attr("_store_architecture") = MOONCAKE_STORE_ARCHITECTURE;
+    m.attr("_store_architecture") = "centralized";
 
     BindCommonTypes(m);
 

@@ -39,8 +39,9 @@ void RegisterStatusHttpHandlers(coro_http::coro_http_server& server) {
     server.set_http_handler<GET>(
         "/server_info", [](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            resp.set_status_and_content(status_type::ok,
-                                        GetMooncakeStoreBuildInfo());
+            resp.set_status_and_content(
+                status_type::ok, "store_version=" + GetMooncakeStoreVersion() +
+                                     "\narchitecture=p2p");
         });
 
     server.set_http_handler<GET>(
@@ -72,7 +73,7 @@ void P2PStatusHttpServer::Start() {
     // Component info is process scoped. Initialize it before the supervisor
     // HTTP server becomes reachable so standby /metrics scrapes are complete.
     P2PMasterMetricManager::instance().set_component_info(
-        "p2p_master", GetMooncakeStoreVersion(), MOONCAKE_STORE_ARCHITECTURE);
+        "p2p_master", GetMooncakeStoreVersion(), "p2p");
 
     auto result = server_->async_start();
     if (result.hasResult()) {

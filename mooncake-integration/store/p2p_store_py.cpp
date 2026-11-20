@@ -9,7 +9,6 @@
 #include "allocator.h"
 #include "shm_helper.h"
 #include "types.h"
-#include "version.h"
 
 #include <cstdlib>  // for atexit
 #include <cstdint>
@@ -1743,8 +1742,8 @@ void BindP2PMethods(StoreBinding& store) {
 
 }  // namespace
 
-PYBIND11_MODULE(_store, m) {
-    m.attr("_store_architecture") = MOONCAKE_STORE_ARCHITECTURE;
+PYBIND11_MODULE(_store_p2p, m) {
+    m.attr("_store_architecture") = "p2p";
 
     BindCommonTypes(m);
 

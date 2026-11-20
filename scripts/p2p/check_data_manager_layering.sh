@@ -9,7 +9,7 @@
 set -euo pipefail
 
 root="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-store="${root}/mooncake-store"
+store="${root}/mooncake-store-p2p"
 status=0
 
 v2_include_dir="${store}/include/p2p/client/data_manager/v2"
@@ -54,7 +54,7 @@ if [[ -f "${types_cpp}" ]]; then
 fi
 
 # The base library must stay free of DataManager implementations.
-cmake_file="${store}/src/CMakeLists.txt"
+cmake_file="${root}/mooncake-store/src/CMakeLists.txt"
 base_block="$(awk '/^set\(MOONCAKE_STORE_SOURCES/,/^\)/' "${cmake_file}")"
 if grep -qE 'p2p/client/(data_manager/)?v[12]/' <<<"${base_block}"; then
     echo "ERROR: MOONCAKE_STORE_SOURCES lists a DataManager V1/V2 source" >&2

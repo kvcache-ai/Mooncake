@@ -38,18 +38,30 @@ def locate(name: str) -> str:
     return file_path
 
 
-def _exec_store_rs_binary(name: str) -> None:
+def _exec_binary(name: str) -> None:
     path = locate(name)
     os.execv(path, [path, *sys.argv[1:]])
 
 
 def store_rs_client() -> None:
-    _exec_store_rs_binary("mooncake-store-rs-client")
+    _exec_binary("mooncake-store-rs-client")
 
 
 def store_rs_admin() -> None:
-    _exec_store_rs_binary("mooncake-store-rs-admin")
+    _exec_binary("mooncake-store-rs-admin")
 
 
 def store_rs_bench() -> None:
-    _exec_store_rs_binary("mooncake-store-rs-bench")
+    _exec_binary("mooncake-store-rs-bench")
+
+
+# TODO(UPG-T0045, replace-in=UPG1.4): Verify the installed P2P commands,
+# Real/Dummy startup and shutdown, and the shared REST entry point.
+# Source: management 3 UPG1-F01-3.1, registered in UPG0.3 (Management 4).
+# 8e6f32a1957b0ccfe082f4add18d55260a08fc08:mooncake-wheel/pyproject.toml.
+def store_p2p_master() -> None:
+    _exec_binary("mooncake_p2p_master")
+
+
+def store_p2p_client() -> None:
+    _exec_binary("mooncake_p2p_client")

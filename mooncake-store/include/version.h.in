@@ -4,11 +4,8 @@
 
 namespace mooncake {
 
-// Version information for the Mooncake system
+// Version information for the Mooncake system (used for RPC handshake)
 constexpr const char* MOONCAKE_STORE_VERSION = "@MOONCAKE_STORE_VERSION@";
-
-// Selected Store architecture
-constexpr const char* MOONCAKE_STORE_ARCHITECTURE = "@MOONCAKE_STORE_CLIENT_ARCH@";
 
 // Function to get the version string
 inline const std::string& GetMooncakeStoreVersion() {
@@ -16,12 +13,9 @@ inline const std::string& GetMooncakeStoreVersion() {
     return version;
 }
 
-// Human-readable build identity
-inline const std::string& GetMooncakeStoreBuildInfo() {
-    static const std::string info =
-        std::string("store_version=") + MOONCAKE_STORE_VERSION +
-        "\narchitecture=" + MOONCAKE_STORE_ARCHITECTURE;
-    return info;
-}
+// Human-readable display version: sourced from pyproject.toml + short git hash
+// e.g. "0.3.10.post2 (git: abc1234)"
+// Used for the --version flag only; does not affect RPC compatibility.
+constexpr const char* MOONCAKE_DISPLAY_VERSION = "@MOONCAKE_DISPLAY_VERSION@";
 
 }  // namespace mooncake

@@ -38,10 +38,10 @@
 
 #include <hiredis/hiredis.h>
 
-DEFINE_string(master_path, "./mooncake-store/src/mooncake_master",
+DEFINE_string(master_path, "./mooncake-store-p2p/src/mooncake_p2p_master",
               "Path to the P2P master executable");
 FLAG_out_dir;
-DEFINE_string(clientctl_path, "./mooncake-store/tests/e2e/clientctl",
+DEFINE_string(clientctl_path, "./mooncake-store-p2p/tests/e2e/clientctl_p2p",
               "Path to the clientctl executable");
 DEFINE_string(redis_endpoint, "127.0.0.1:6379",
               "Redis endpoint for Redis master failover test");

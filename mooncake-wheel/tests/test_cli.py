@@ -8,33 +8,40 @@ import sys
 import subprocess
 import time
 
+BACKEND = os.environ.get("MOONCAKE_STORE_BACKEND", "centralized")
+COMMANDS = {
+    "centralized": ("mooncake_master", "mooncake_client"),
+    "p2p": ("mooncake_p2p_master", "mooncake_p2p_client"),
+}
+
 
 def test_entry_point_installed():
     """Test that the entry point is installed and can be executed."""
     try:
-        # Check if mooncake_master is in PATH
+        master, client = COMMANDS[BACKEND]
+        # Check that the selected backend's commands are installed.
         result = subprocess.run(
-            ["which", "mooncake_master"],
+            ["which", master],
             capture_output=True,
             text=True
         )
 
         if result.returncode != 0:
-            print("❌ mooncake_master entry point not found in PATH")
+            print(f"❌ {master} entry point not found in PATH")
             return False
 
-        print(f"✅ mooncake_master entry point found at: {result.stdout.strip()}")
+        print(f"✅ {master} entry point found at: {result.stdout.strip()}")
         result = subprocess.run(
-            ["which", "mooncake_client"],
+            ["which", client],
             capture_output=True,
             text=True
         )
 
         if result.returncode != 0:
-            print("❌ mooncake_client entry point not found in PATH")
+            print(f"❌ {client} entry point not found in PATH")
             return False
 
-        print(f"✅ mooncake_client entry point found at: {result.stdout.strip()}")
+        print(f"✅ {client} entry point found at: {result.stdout.strip()}")
         result = subprocess.run(
             ["which", "transfer_engine_bench"],
             capture_output=True,
@@ -57,7 +64,7 @@ def test_run_p2p_master_and_client():
     try:
         # Reuse the metadata server on 8080; isolate this Master's RPC and metrics.
         process = subprocess.Popen(
-            ["mooncake_master", "--rpc_port=61351", "--rpc_thread_num=2",
+            ["mooncake_p2p_master", "--rpc_port=61351", "--rpc_thread_num=2",
              "--metrics_port=19003"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
@@ -74,7 +81,7 @@ def test_run_p2p_master_and_client():
                 '"priority":10,"allocator_type":"OFFSET"}]}'
             )
             client_process = subprocess.Popen(
-                ["mooncake_client", "--master_server_address=127.0.0.1:61351",
+                ["mooncake_p2p_client", "--master_server_address=127.0.0.1:61351",
                  "--port=61352", f"--tiered_backend_config={tiered_backend_config}",
                  "--client_rpc_port=0", "--enable_http_server=false"],
                 stdout=subprocess.PIPE,
@@ -169,23 +176,10 @@ if __name__ == "__main__":
     # Run tests
     entry_point_installed = test_entry_point_installed()
 
-    if entry_point_installed:
-        try:
-            version = subprocess.check_output(
-                ["mooncake_master", "--version"],
-                stderr=subprocess.STDOUT, text=True,
-            ).splitlines()
-            if "architecture=p2p" in version:
-                run_master_and_client_success = test_run_p2p_master_and_client()
-            elif "architecture=centralized" in version:
-                run_master_and_client_success = test_run_centralized_master_and_client()
-            else:
-                raise ValueError("Missing or invalid master architecture")
-        except Exception as e:
-            print(f"❌ Error selecting CLI architecture: {e}")
-            run_master_and_client_success = False
-    else:
-        run_master_and_client_success = False
+    run_master_and_client_success = entry_point_installed and {
+        "centralized": test_run_centralized_master_and_client,
+        "p2p": test_run_p2p_master_and_client,
+    }[BACKEND]()
 
     # Print summary
     print("\nTest Summary:")

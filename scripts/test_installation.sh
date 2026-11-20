@@ -1,9 +1,16 @@
 #!/bin/bash
 # Script to test the installation of the mooncake wheel package
 # Usage: ./scripts/test_installation.sh
-# Set EXPECTED_STORE_ARCH=p2p for a P2P wheel (default: centralized).
+# Set MOONCAKE_STORE_BACKEND=p2p for a P2P wheel (default: centralized).
 
 set -e  # Exit immediately if a command exits with a non-zero status
+
+export MOONCAKE_STORE_BACKEND="${MOONCAKE_STORE_BACKEND:-centralized}"
+case "$MOONCAKE_STORE_BACKEND" in
+    centralized) store_commands=(mooncake_master mooncake_client) ;;
+    p2p) store_commands=(mooncake_p2p_master mooncake_p2p_client) ;;
+    *) echo "ERROR: Unsupported C++ Store backend: $MOONCAKE_STORE_BACKEND" >&2; exit 1 ;;
+esac
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
@@ -35,11 +42,6 @@ echo "Verifying that import succeeds after installation..."
 python -c "import mooncake.engine" && echo "Success: Import succeeded after installation" || { echo "ERROR: Import failed after installation!"; exit 1; }
 python -c "import mooncake.cli, mooncake.cli_bench, mooncake.cli_client, mooncake.transfer_engine_topology_dump" && echo "Success: CLI imports succeeded after installation" || { echo "ERROR: CLI imports failed after installation!"; exit 1; }
 
-echo "Verifying installed Store artifact architecture..."
-STORE_PACKAGE_DIR=$(python -c 'import mooncake; from pathlib import Path; print(Path(mooncake.__file__).parent)')
-python mooncake-wheel/setup.py --check-store-artifacts "$STORE_PACKAGE_DIR" \
-    --with-store ON --expected-architecture "${EXPECTED_STORE_ARCH:-centralized}"
-
 # Source: UPG1-F01-3.2; clarified by F02-B05/Codex on 2026-11-12.
 # Due: public modules during UPG2 merge review; structured consumers during
 # their assigned F15 implementation review, before each task is accepted.
@@ -65,17 +67,10 @@ python tests/test_mooncake_config.py
 echo "Running CLI module tests..."
 python -m pytest -q tests/test_cli_modules.py
 
-echo "Verifying mooncake_master entry point..."
-# Check if the mooncake_master entry point is installed and executable
-which mooncake_master || { echo "ERROR: mooncake_master entry point not found!"; exit 1; }
-mooncake_master --version
-python -I -m mooncake.cli --version
-echo "Success: mooncake_master entry point found"
-
-# Check if the mooncake_client entry point is installed and executable
-which mooncake_client || { echo "ERROR: mooncake_client entry point not found!"; exit 1; }
-python -I -m mooncake.cli_client --version
-echo "Success: mooncake_client entry point found"
+for command in "${store_commands[@]}"; do
+    echo "Verifying installed $command"
+    "$command" --version
+done
 
 echo "Verifying Store REST console entry point..."
 mc_store_rest_server --help >/dev/null

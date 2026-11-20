@@ -4,7 +4,7 @@ This script integrates P2P single-run performance testing and multi-dimensional 
 
 !!! IMPORTANT: DEPENDENCIES REQUIRED !!!
 This script is a WRAPPER that orchestrates the following C++ binaries:
-1. mooncake_master (The P2P master node service)
+1. mooncake_p2p_master (The P2P master node service)
 2. stress_workload_test_p2p (The P2P benchmark client)
 
 The locations of these two binaries MUST be correctly provided via the MASTER_BIN and TEST_BIN
@@ -61,9 +61,9 @@ import urllib.error
 PROJECT_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
-MASTER_BIN = os.path.join(PROJECT_ROOT, "build/mooncake-store/src/mooncake_master")
+MASTER_BIN = os.path.join(PROJECT_ROOT, "build/mooncake-store-p2p/src/mooncake_p2p_master")
 TEST_BIN = os.path.join(
-    PROJECT_ROOT, "build/mooncake-store/tests/p2p/stress_workload_test_p2p"
+    PROJECT_ROOT, "build/mooncake-store-p2p/tests/p2p/stress_workload_test_p2p"
 )
 RPC_PORT = 50051
 METRICS_PORT = 9003

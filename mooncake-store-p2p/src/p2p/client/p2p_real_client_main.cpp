@@ -104,7 +104,7 @@ DEFINE_uint64(metric_report_interval_seconds, 60,
               "0 disables periodic reporting (metrics are still collected).");
 
 int main(int argc, char* argv[]) {
-    gflags::SetVersionString(mooncake::GetMooncakeStoreBuildInfo());
+    gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
     // Attention !!!

@@ -103,7 +103,7 @@ jobs:
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DMOONCAKE_STORE_CLIENT_ARCH=p2p -DSTORE_USE_REDIS=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DPARALLEL_LINK_JOBS=2 -DPython3_EXECUTABLE="$(which python3)"
+        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DWITH_STORE=OFF -DWITH_STORE_P2P=ON -DSTORE_USE_REDIS=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DPARALLEL_LINK_JOBS=2 -DPython3_EXECUTABLE="$(which python3)"
       shell: bash
 
     - name: Build project
@@ -206,6 +206,8 @@ jobs:
         ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
         python-version: ['3.10', '3.12']
     runs-on: ${{ matrix.ubuntu-version }}
+    env:
+      MOONCAKE_STORE_BACKEND: p2p
     steps:
     - uses: actions/checkout@v4
 
@@ -252,7 +254,7 @@ jobs:
 
     - name: Run installation test script
       run: |
-        EXPECTED_STORE_ARCH=p2p bash scripts/test_installation.sh
+        bash scripts/test_installation.sh
       shell: bash
 
     - name: Start metadata server
@@ -289,8 +291,8 @@ jobs:
       id: wheel_lifecycle
       env:
         TMPDIR: ${{ runner.temp }}/store-wheel-p2p
-        MOONCAKE_MASTER_COMMAND: mooncake_master
-        MOONCAKE_REAL_CLIENT_COMMAND: "mooncake_client --tiered_backend_config='${{ runner.temp }}/store-wheel-p2p/tiered-backend.json'"
+        MOONCAKE_MASTER_COMMAND: mooncake_p2p_master
+        MOONCAKE_REAL_CLIENT_COMMAND: "mooncake_p2p_client --tiered_backend_config='${{ runner.temp }}/store-wheel-p2p/tiered-backend.json'"
         MOONCAKE_DEPLOYMENT_PROTOCOL: tcp
       run: |
         source test_env/bin/activate
@@ -325,7 +327,7 @@ jobs:
     - name: Start Mooncake Master
       run: |
         source test_env/bin/activate
-        mooncake_master --cluster_id=ci_test_cluster --rpc_port=50051 &
+        mooncake_p2p_master --cluster_id=ci_test_cluster --rpc_port=50051 &
         sleep 3
       shell: bash
 
@@ -451,7 +453,7 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DMOONCAKE_STORE_CLIENT_ARCH=p2p -DSTORE_USE_REDIS=ON -DWITH_P2P_STORE=ON -DWITH_EP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" -DPython3_EXECUTABLE="$(which python3)"
+        cmake -G Ninja .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=OFF -DWITH_STORE_P2P=ON -DSTORE_USE_REDIS=ON -DWITH_P2P_STORE=ON -DWITH_EP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" -DPython3_EXECUTABLE="$(which python3)"
       shell: bash
       # TODO: lack USE_NVMEOF,USE_MNNVL
 
@@ -543,5 +545,5 @@ jobs:
       uses: docker/setup-buildx-action@v3
 
     - name: Build Docker image
-      run: docker build --build-arg MOONCAKE_STORE_CLIENT_ARCH=p2p -t mooncake-app-p2p .
+      run: docker build --build-arg WITH_STORE=OFF --build-arg WITH_STORE_P2P=ON -t mooncake-app-p2p .
 

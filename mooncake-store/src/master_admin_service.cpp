@@ -294,18 +294,16 @@ void MasterAdminServer::HandleHealth(coro_http::coro_http_request&,
     WriteJsonResponse(resp, coro_http::status_type::ok, payload);
 }
 
+// TODO(UPG-T0041, replace-in=UPG2.2): Verify the installed admin version
+// endpoint using U's display-version provider.
+// Source: management 3 UPG1-F02-B05 (F02-T015/A14),
+// 8e6f32a1957b0ccfe082f4add18d55260a08fc08:mooncake-store/src/master_admin_service.cpp.
 void MasterAdminServer::HandleVersion(coro_http::coro_http_request&,
                                       coro_http::coro_http_response& resp) {
-    // TODO-REF(F02-T015, receiver=UPG1-F14-S49):
-    // Source: UPG1-F02-B05; owner: UPG1-F14-S65 (admin closure).
-    // Stage: UPG1 / F14-S49 / version observability implementation.
-    // Due: before S49 acceptance. Replace the real current build identity
-    // with U MOONCAKE_DISPLAY_VERSION after its build provider is received;
-    // close with installed version/JSON verification, review and receipt.
     WriteJsonResponse(
         resp, coro_http::status_type::ok,
         HttpVersionResponse{.version = GetMooncakeStoreVersion(),
-                            .display_version = GetMooncakeStoreBuildInfo()});
+                            .display_version = MOONCAKE_DISPLAY_VERSION});
 }
 
 void MasterAdminServer::HandleLeader(coro_http::coro_http_request&,

@@ -1,4 +1,4 @@
-# Sources, entry points and usage requirements of the selected P2P implementation.
+# Native P2P sources, entry points and usage requirements.
 option(USE_ASCEND_CACHE_TIER "Enable Ascend NPU cache tier support" OFF)
 option(USE_ASCEND_DRAM_TIER "Enable Ascend ACL Host memory for DRAM tier (aclrtMallocHost)" OFF)
 
@@ -88,6 +88,11 @@ set(MOONCAKE_STORE_P2P_CLIENT_SOURCES
     ha/metadata_recovery_worker.cpp
 )
 
+# TODO(UPG-T0043, replace-in=UPG1.2): Verify Redis ON/OFF sources,
+# headers and linkage for the independent native target and its consumers.
+# Source: management 3 UPG1-F02-B05 (F02-T005/A01),
+# 8e6f32a1957b0ccfe082f4add18d55260a08fc08:.github/workflows/ci.yml.
+# Registered in UPG0.3; receiver=UPG1.2 (Management 4).
 if(STORE_USE_REDIS)
     list(APPEND MOONCAKE_STORE_P2P_SHARED_SOURCES
         ha/redis_util.cpp
@@ -101,39 +106,46 @@ if(USE_ASCEND_CACHE_TIER)
     list(APPEND MOONCAKE_STORE_P2P_CLIENT_SOURCES client/tiered_cache/tiers/ascend_tier.cpp)
 endif()
 
-# Resolve P2P paths before attaching sources to the common OBJECT targets.
+set(STORE_P2P_INCLUDE "${CMAKE_CURRENT_LIST_DIR}/../../include")
+# Resolve P2P paths before attaching sources to the object targets.
 foreach(role SHARED MASTER CLIENT)
     list(TRANSFORM MOONCAKE_STORE_P2P_${role}_SOURCES
          PREPEND "${CMAKE_CURRENT_LIST_DIR}/")
 endforeach()
 
-target_sources(mooncake_store_shared_objects PRIVATE
+target_sources(mooncake_store_p2p_shared_objects PRIVATE
     ${MOONCAKE_STORE_P2P_SHARED_SOURCES})
-target_sources(mooncake_store_master_objects PRIVATE
+target_sources(mooncake_store_p2p_master_objects PRIVATE
     ${MOONCAKE_STORE_P2P_MASTER_SOURCES})
-target_sources(mooncake_store_client_objects PRIVATE
+target_sources(mooncake_store_p2p_client_objects PRIVATE
     ${MOONCAKE_STORE_P2P_CLIENT_SOURCES})
-target_sources(mooncake_master PRIVATE ${CMAKE_CURRENT_LIST_DIR}/master/p2p_master_main.cpp)
-target_sources(mooncake_client PRIVATE ${CMAKE_CURRENT_LIST_DIR}/client/p2p_real_client_main.cpp)
+target_sources(mooncake_p2p_master PRIVATE ${CMAKE_CURRENT_LIST_DIR}/master/p2p_master_main.cpp)
+target_sources(mooncake_p2p_client PRIVATE ${CMAKE_CURRENT_LIST_DIR}/client/p2p_real_client_main.cpp)
 
-foreach(target mooncake_store_shared_objects mooncake_store_master_objects
-               mooncake_store_client_objects)
+foreach(target mooncake_store_p2p_shared_objects mooncake_store_p2p_master_objects
+               mooncake_store_p2p_client_objects)
+    target_include_directories(${target} PRIVATE "${STORE_P2P_INCLUDE}")
     target_compile_definitions(${target} PRIVATE MOONCAKE_STORE_CLIENT_P2P)
 endforeach()
-target_compile_definitions(mooncake_store_master PUBLIC MOONCAKE_STORE_CLIENT_P2P)
-target_compile_definitions(mooncake_store PUBLIC MOONCAKE_STORE_CLIENT_P2P)
+foreach(target mooncake_store_p2p_master mooncake_store_p2p)
+    target_include_directories(${target} PUBLIC "${STORE_P2P_INCLUDE}")
+    target_compile_definitions(${target} PUBLIC MOONCAKE_STORE_CLIENT_P2P)
+endforeach()
 
 # Shared P2P discovery headers expose hiredis when Redis is enabled.
 if(STORE_USE_REDIS)
-    find_path(HIREDIS_INCLUDE_DIR NAMES hiredis/hiredis.h REQUIRED)
-    find_library(HIREDIS_LIB NAMES hiredis REQUIRED)
+    find_path(HIREDIS_INCLUDE_DIR NAMES hiredis/hiredis.h)
+    find_library(HIREDIS_LIB NAMES hiredis)
+    if(NOT HIREDIS_INCLUDE_DIR OR NOT HIREDIS_LIB)
+        message(FATAL_ERROR "STORE_USE_REDIS=ON requires hiredis headers and library")
+    endif()
     message(STATUS "Found hiredis: include=${HIREDIS_INCLUDE_DIR} lib=${HIREDIS_LIB}")
-    foreach(target mooncake_store_shared_objects mooncake_store_master_objects
-                   mooncake_store_client_objects)
+    foreach(target mooncake_store_p2p_shared_objects mooncake_store_p2p_master_objects
+                   mooncake_store_p2p_client_objects)
         target_include_directories(${target} PRIVATE ${HIREDIS_INCLUDE_DIR})
     endforeach()
-    target_link_libraries(mooncake_store_shared_objects PRIVATE JsonCpp::JsonCpp)
-    foreach(target mooncake_store_master mooncake_store)
+    target_link_libraries(mooncake_store_p2p_shared_objects PRIVATE JsonCpp::JsonCpp)
+    foreach(target mooncake_store_p2p_master mooncake_store_p2p)
         target_include_directories(${target} PUBLIC ${HIREDIS_INCLUDE_DIR})
         target_link_libraries(${target} PRIVATE ${HIREDIS_LIB})
     endforeach()
@@ -166,8 +178,8 @@ else()
 endif()
 
 # OpLog is compiled by the master object target and used by both aggregates.
-target_include_directories(mooncake_store_master_objects PRIVATE ${XXHASH_INCLUDE_DIR})
-foreach(target mooncake_store_master mooncake_store)
+target_include_directories(mooncake_store_p2p_master_objects PRIVATE ${XXHASH_INCLUDE_DIR})
+foreach(target mooncake_store_p2p_master mooncake_store_p2p)
     target_link_libraries(${target} PRIVATE ${XXHASH_LIBRARY})
 endforeach()
 
@@ -188,21 +200,21 @@ if(USE_ASCEND_CACHE_TIER OR USE_ASCEND_DRAM_TIER)
     else()
         message(STATUS "Found ascendcl library: ${ASCENDCL_LIB}")
         # Apply usage requirements even when the library path comes from cache.
-        target_link_libraries(mooncake_store PUBLIC ${ASCENDCL_LIB})
+        target_link_libraries(mooncake_store_p2p PUBLIC ${ASCENDCL_LIB})
         set(ASCEND_INCLUDE_PATHS
             $ENV{ASCEND_HOME}/include
             /usr/local/Ascend/ascend-toolkit/latest/include
             /usr/local/Ascend/nnrt/latest/include
         )
-        target_include_directories(mooncake_store_client_objects PRIVATE ${ASCEND_INCLUDE_PATHS})
-        target_include_directories(mooncake_store PUBLIC ${ASCEND_INCLUDE_PATHS})
+        target_include_directories(mooncake_store_p2p_client_objects PRIVATE ${ASCEND_INCLUDE_PATHS})
+        target_include_directories(mooncake_store_p2p PUBLIC ${ASCEND_INCLUDE_PATHS})
         if(USE_ASCEND_CACHE_TIER)
-            target_compile_definitions(mooncake_store_client_objects PRIVATE USE_ASCEND_CACHE_TIER)
-            target_compile_definitions(mooncake_store PUBLIC USE_ASCEND_CACHE_TIER)
+            target_compile_definitions(mooncake_store_p2p_client_objects PRIVATE USE_ASCEND_CACHE_TIER)
+            target_compile_definitions(mooncake_store_p2p PUBLIC USE_ASCEND_CACHE_TIER)
         endif()
         if(USE_ASCEND_DRAM_TIER)
-            target_compile_definitions(mooncake_store_client_objects PRIVATE USE_ASCEND_DRAM_TIER)
-            target_compile_definitions(mooncake_store PUBLIC USE_ASCEND_DRAM_TIER)
+            target_compile_definitions(mooncake_store_p2p_client_objects PRIVATE USE_ASCEND_DRAM_TIER)
+            target_compile_definitions(mooncake_store_p2p PUBLIC USE_ASCEND_DRAM_TIER)
         endif()
     endif()
 endif()
