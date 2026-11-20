@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 #include "ssd_control_wire.h"
 #include <bit>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 
@@ -46,10 +47,17 @@ class IO {
                 for (size_t i = 0; i < sizeof(T); ++i)
                     output.push_back(char(value >> (i * 8)));
         } else {
-            value = 0;
-            for (size_t i = 0; i < sizeof(T); ++i)
-                value |= T(static_cast<unsigned char>(input[position++]))
-                         << (i * 8);
+            if constexpr (std::endian::native == std::endian::little) {
+                // Wire integers are little-endian and need not be aligned.
+                // Room() above checks the entire load before touching input.
+                std::memcpy(&value, input.data() + position, sizeof(T));
+                position += sizeof(T);
+            } else {
+                value = 0;
+                for (size_t i = 0; i < sizeof(T); ++i)
+                    value |= T(static_cast<unsigned char>(input[position++]))
+                             << (i * 8);
+            }
         }
     }
     void Flag(bool& value) {

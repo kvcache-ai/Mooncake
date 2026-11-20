@@ -34,6 +34,59 @@ TEST(SsdControlWire, RoundTripsExactRequestAndGrant) {
     request.command = SsdControlCommand::kResolve;
     EXPECT_EQ(EncodeSsdControlMessage(request).error, DestinationError::kOk);
 }
+TEST(SsdControlWire, DecodesUnalignedFramesAndRejectsEveryTruncation) {
+    auto message = Message();
+    message.command = SsdControlCommand::kReadInto;
+    message.reference.credential = {0xfedcba9876543210ULL,
+                                    0x8070605040302010ULL};
+    message.request->objects[0].expected_object_checksum = UINT64_MAX;
+    message.destinations = {
+        {"requester-te", 0x123456789abcULL, 32, DestinationMemory::kHost}};
+    const auto encoded = EncodeSsdControlMessage(message);
+    ASSERT_EQ(encoded.error, DestinationError::kOk);
+    SsdControlReply reply{
+        SsdControlCommand::kReadInto,
+        DestinationError::kOk,
+        SsdOwnerRequestSnapshot{
+            DestinationError::kOk, SsdOwnerRequestState::kDrained,
+            SsdReadResultV1{1,
+                            message.reference.attempt,
+                            true,
+                            {{0, AttemptOutcome::kSucceeded, 32, UINT64_MAX}},
+                            message.reference.requester}},
+        {}};
+    const auto terminal = EncodeSsdControlReply(reply);
+    ASSERT_EQ(terminal.error, DestinationError::kOk);
+    for (size_t offset = 0; offset < 8; ++offset) {
+        SCOPED_TRACE(offset);
+        const auto storage = std::string(offset, 'x') + encoded.bytes;
+        const auto input = std::string_view(storage).substr(offset);
+        SsdControlMessage decoded;
+        ASSERT_EQ(DecodeSsdControlMessage(input, decoded),
+                  DestinationError::kOk);
+        EXPECT_EQ(decoded.reference, message.reference);
+        EXPECT_EQ(decoded.request, message.request);
+        EXPECT_EQ(EncodeSsdControlMessage(decoded).bytes, encoded.bytes);
+        const auto before = EncodeSsdControlMessage(decoded).bytes;
+        for (size_t size = 0; size < input.size(); ++size) {
+            EXPECT_NE(DecodeSsdControlMessage(input.substr(0, size), decoded),
+                      DestinationError::kOk);
+            EXPECT_EQ(EncodeSsdControlMessage(decoded).bytes, before);
+        }
+        const auto response_storage = std::string(offset, 'x') + terminal.bytes;
+        const auto response = std::string_view(response_storage).substr(offset);
+        SsdControlReply result;
+        ASSERT_EQ(DecodeSsdControlReply(response, result),
+                  DestinationError::kOk);
+        ASSERT_TRUE(result.snapshot);
+        EXPECT_EQ(result.snapshot->result, reply.snapshot->result);
+        for (size_t size = 0; size < response.size(); ++size) {
+            EXPECT_NE(DecodeSsdControlReply(response.substr(0, size), result),
+                      DestinationError::kOk);
+            EXPECT_EQ(EncodeSsdControlReply(result).bytes, terminal.bytes);
+        }
+    }
+}
 TEST(SsdControlWire, BoundsWireBeforeDecodeAndLeavesOutputUnchanged) {
     std::string oversized(kSsdControlMaxWireBytes + 1, 'x');
     SsdControlMessage decoded = Message();
