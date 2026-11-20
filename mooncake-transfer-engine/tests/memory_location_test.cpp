@@ -2,9 +2,15 @@
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <linux/mman.h>
 #include <numa.h>
 #include <numaif.h>
 #include <sys/mman.h>
+#include <unistd.h>
+
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
 
 #include <cstdint>
 #include <cstring>
@@ -210,3 +216,50 @@ TEST(MemoryLocationTest, ThpDetectionFullAndPartial) {
 
     munmap(raw, raw_size);
 }
+
+TEST(MemoryLocationTest, DetectBufferPageSizeHostAndUnknown) {
+    const auto base = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    void *addr = mmap(nullptr, base * 2, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(addr, MAP_FAILED);
+    EXPECT_EQ(mooncake::detectBufferPageSize(addr), base);
+    EXPECT_EQ(mooncake::detectBufferPageSize(static_cast<char *>(addr) + 1),
+              base);
+    EXPECT_EQ(munmap(addr, base * 2), 0);
+    EXPECT_EQ(mooncake::detectBufferPageSize(nullptr), base);
+}
+
+TEST(MemoryLocationTest, DetectBufferPageSizeHugeTlb) {
+    void *addr =
+        mmap(nullptr, kHugePage, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
+    if (addr == MAP_FAILED) GTEST_SKIP() << "No HugeTLB pages available";
+    EXPECT_EQ(mooncake::detectBufferPageSize(addr), kHugePage);
+    EXPECT_EQ(mooncake::detectBufferPageSize(static_cast<char *>(addr) + 1),
+              kHugePage);
+    EXPECT_EQ(munmap(addr, kHugePage), 0);
+}
+
+#ifdef USE_CUDA
+TEST(MemoryLocationTest, DetectBufferPageSizeCudaAllocations) {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
+        GTEST_SKIP() << "No CUDA device available";
+    const auto base = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    void *addr = nullptr;
+    ASSERT_EQ(cudaMalloc(&addr, base * 2), cudaSuccess);
+    EXPECT_EQ(mooncake::detectBufferPageSize(addr), base);
+    EXPECT_EQ(mooncake::detectBufferPageSize(static_cast<char *>(addr) + 1),
+              base);
+    EXPECT_EQ(cudaFree(addr), cudaSuccess);
+
+    // Unified memory is classified DEVICE too: it must retain host VMA lookup.
+    ASSERT_EQ(cudaMallocManaged(&addr, base * 2), cudaSuccess);
+    EXPECT_EQ(mooncake::detectBufferPageSize(addr), base);
+    EXPECT_EQ(cudaFree(addr), cudaSuccess);
+
+    ASSERT_EQ(cudaMallocHost(&addr, base * 2), cudaSuccess);
+    EXPECT_EQ(mooncake::detectBufferPageSize(addr), base);
+    EXPECT_EQ(cudaFreeHost(addr), cudaSuccess);
+}
+#endif

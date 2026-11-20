@@ -22,11 +22,29 @@
 #include <fstream>
 
 #include "cuda_alike.h"
+#ifdef USE_CUDA
+#include <cuda.h>
+#endif
 
 namespace mooncake {
 
 size_t detectBufferPageSize(void *addr) {
     const size_t fallback = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+#ifdef USE_CUDA
+    // GPU device allocations are not HugeTLB host VMAs. Keep managed and
+    // unclassified addresses on the existing host-page discovery path.
+    CUmemorytype memory_type{};
+    unsigned int managed = 1;
+    CUpointer_attribute attributes[] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                                        CU_POINTER_ATTRIBUTE_IS_MANAGED};
+    void *values[] = {&memory_type, &managed};
+    if (cuPointerGetAttributes(2, attributes, values,
+                               reinterpret_cast<CUdeviceptr>(addr)) ==
+            CUDA_SUCCESS &&
+        memory_type == CU_MEMORYTYPE_DEVICE && managed == 0) {
+        return fallback;
+    }
+#endif
     std::ifstream smaps("/proc/self/smaps");
     if (!smaps.is_open()) return fallback;
 
