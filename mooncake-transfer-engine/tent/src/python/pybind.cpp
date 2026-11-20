@@ -140,7 +140,12 @@ static inline std::vector<void*> U64VectorToPtrVector(
 }
 
 static inline bool IsUint64Vector(const py::array& array) {
-    return array.ndim() == 1 && array.dtype().is(py::dtype::of<uint64_t>()) &&
+    if (array.ndim() != 1 || !array.dtype().is(py::dtype::of<uint64_t>())) {
+        return false;
+    }
+    // numpy reports a zero stride for empty arrays, so the stride check only
+    // applies when there is an element to address.
+    return array.size() == 0 ||
            array.strides(0) == static_cast<py::ssize_t>(sizeof(uint64_t));
 }
 
@@ -781,6 +786,13 @@ PYBIND11_MODULE(tent, m) {
                     IsUint64Vector(src) && IsUint64Vector(dst) &&
                     IsUint64Vector(lengths) && src.size() == dst.size() &&
                     src.size() == lengths.size();
+                if (!well_formed && count == 0) {
+                    ThrowStatus(
+                        Status::InvalidArgument(
+                            "src, dst and lengths must be one-dimensional "
+                            "uint64 arrays of equal length" LOC_MARK),
+                        "transfer_sync_arrays");
+                }
                 py::array_t<uint8_t> result(static_cast<py::ssize_t>(count));
                 if (count == 0) {
                     return result;
@@ -795,6 +807,7 @@ PYBIND11_MODULE(tent, m) {
                 const auto* dst_ptr = static_cast<const uint64_t*>(dst.data());
                 const auto* len_ptr =
                     static_cast<const uint64_t*>(lengths.data());
+                std::string wait_error;
                 {
                     py::gil_scoped_release release;
                     std::vector<Request> request_list(count);
@@ -812,24 +825,40 @@ PYBIND11_MODULE(tent, m) {
                                          static_cast<uint64_t>(batch_id));
                         if (self.submitTransfer(batch_id, request_list).ok()) {
                             std::vector<TransferStatus> status_list;
-                            (void)self.waitTransfer(batch_id, &status_list, 0);
-                            const auto status_count =
-                                std::min(count, status_list.size());
-                            for (size_t i = 0; i < status_count; ++i) {
-                                states[i] =
-                                    static_cast<uint8_t>(status_list[i].s);
+                            auto wait_status =
+                                self.waitTransfer(batch_id, &status_list, 0);
+                            if (!wait_status.ok()) {
+                                wait_error = "waitTransfer failed: " +
+                                             wait_status.ToString();
+                            } else if (status_list.size() != count) {
+                                wait_error =
+                                    "waitTransfer returned " +
+                                    std::to_string(status_list.size()) +
+                                    " statuses for " + std::to_string(count) +
+                                    " descriptors";
+                            } else {
+                                for (size_t i = 0; i < count; ++i) {
+                                    states[i] =
+                                        static_cast<uint8_t>(status_list[i].s);
+                                }
                             }
                         }
                     }
+                }
+                if (!wait_error.empty()) {
+                    ThrowStatus(Status::InternalError(wait_error + LOC_MARK),
+                                "transfer_sync_arrays");
                 }
                 return result;
             },
             "Submit src to dst descriptors in one batch and wait until every "
             "descriptor reaches a terminal state. src, dst and lengths are "
             "one-dimensional uint64 arrays of equal length and must not be "
-            "modified until the call returns; malformed input and failures "
-            "are reported as INVALID for every entry. This call has no "
-            "timeout.",
+            "modified until the call returns. Malformed non-empty input and "
+            "failed submits are reported as INVALID for every entry; an empty "
+            "input that is not three empty uint64 vectors raises "
+            "InvalidArgumentError, and a failed wait raises InternalError. "
+            "This call has no timeout.",
             py::arg("src"), py::arg("dst"), py::arg("lengths"),
             py::arg("target_id"), py::arg("opcode"))
 

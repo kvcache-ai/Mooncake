@@ -85,6 +85,25 @@ class ArrayEntryPointTest(unittest.TestCase):
         self.assertEqual(states.dtype, np.uint8)
         self.assertEqual(states.shape, (0,))
 
+    def test_empty_non_uint64_input_raises(self):
+        empty = np.zeros(0, dtype=np.float64)
+        with self.assertRaises(tent.InvalidArgumentError):
+            self.engine.transfer_sync_arrays(empty, empty, empty, 0, tent.OpCode.WRITE)
+
+    def test_empty_two_dimensional_input_raises(self):
+        empty = np.zeros((0, 0), dtype=np.uint64)
+        with self.assertRaises(tent.InvalidArgumentError):
+            self.engine.transfer_sync_arrays(empty, empty, empty, 0, tent.OpCode.WRITE)
+
+    def test_empty_source_with_non_empty_target_raises(self):
+        source = np.zeros(0, dtype=np.uint64)
+        target = np.zeros(2, dtype=np.uint64)
+        lengths = np.zeros(0, dtype=np.uint64)
+        with self.assertRaises(tent.InvalidArgumentError):
+            self.engine.transfer_sync_arrays(
+                source, target, lengths, 0, tent.OpCode.WRITE
+            )
+
 
 class ArrayTransferTest(unittest.TestCase):
     def test_write_and_read_move_bytes(self):
