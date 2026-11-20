@@ -2749,20 +2749,29 @@ fn cold_delete_reclaims_used_bytes_via_owner_pending_queue() {
         .expect("put should succeed");
     wait_for_storage_clock_route(&client, &route, false);
     let backing = wait_for_materialized_cold_backing(&client, "cold-delete-key");
+    assert_eq!(backing.length, payload.len() as u64);
 
     let scoped = metadata
         .for_tenant("default")
         .expect("for_tenant should return Some");
-    let device_before = scoped
-        .get_cold_tier_device(device_id)
-        .expect("device lookup should succeed")
-        .expect("cold device should exist");
-    assert!(
-        device_before.used_bytes >= backing.length,
-        "cold used_bytes should include the materialized backing: used={} length={}",
-        device_before.used_bytes,
-        backing.length
-    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let device = scoped
+            .get_cold_tier_device(device_id)
+            .expect("device lookup should succeed")
+            .expect("cold device should exist");
+        if device.used_bytes == backing.length && device.reserved_bytes == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cold offload accounting did not settle: used={} reserved={} length={}",
+            device.used_bytes,
+            device.reserved_bytes,
+            backing.length
+        );
+        sleep(Duration::from_millis(20));
+    }
 
     client
         .remove("cold-delete-key", true)
@@ -2770,37 +2779,287 @@ fn cold_delete_reclaims_used_bytes_via_owner_pending_queue() {
 
     // Drive the owner-local cold reclaim queue until used_bytes is released.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let device_after = loop {
-        let _ = client.storage_owner.process_cold_pending_deletes(64);
+    loop {
+        client
+            .storage_owner
+            .process_cold_pending_deletes(64)
+            .unwrap();
         let device = scoped
             .get_cold_tier_device(device_id)
             .expect("device lookup should succeed")
             .expect("cold device should exist");
-        if device.used_bytes + backing.length <= device_before.used_bytes {
-            break device;
+        if device.used_bytes == 0
+            && device.reserved_bytes == 0
+            && client
+                .storage_owner
+                .pending_cold_deletes
+                .lock()
+                .entries
+                .is_empty()
+        {
+            break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "cold used_bytes was not released after delete: used={}",
-            device.used_bytes
+            "cold usage was not released after delete: used={} reserved={}",
+            device.used_bytes,
+            device.reserved_bytes
         );
         std::thread::sleep(Duration::from_millis(20));
-    };
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn build_cold_settlement_test_owner(
+    metadata: Arc<RecoverableMetadataBackend>,
+    device_id: &str,
+    root: &std::path::Path,
+) -> StoreClient {
+    let client = StoreClientBuilder::new(metadata, device_id)
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(Arc::new(TestTransport::new(device_id)))
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(512)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .reclaim_grace_ms(0)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .cold_tier_target(ColdTierTargetConfig::directory(
+            device_id,
+            ColdTierKind::Ssd,
+            root.to_path_buf(),
+        ))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client.register_local_memory().unwrap();
+    client
+}
+
+fn pause_cold_settlement(
+    metadata: &RecoverableMetadataBackend,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *metadata.cold_usage_settlement_gate.lock().unwrap() = Some((entered_tx, release_rx));
+    (entered_rx, release_tx)
+}
+
+#[test]
+fn cold_delete_during_offload_settlement_releases_used_bytes() {
+    let _cold_guard = enable_cold_tier_for_test();
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let metadata = Arc::new(RecoverableMetadataBackend::new(inner.clone()));
+    let device_id = "cold-delete-during-settlement";
+    let root = cold_tier_test_root(device_id);
+    let client = build_cold_settlement_test_owner(metadata.clone(), device_id, &root);
+    let other = StoreClientBuilder::new(metadata.clone(), "cold-delete-other-runtime")
+        .route_control(RouteControlMode::MetadataOnly)
+        .build(test_future_expiry_ms())
+        .expect("other client build should succeed");
+
+    let (entered_rx, release_tx) = pause_cold_settlement(&metadata);
+
+    let key = "delete-before-settlement";
+    let payload = b"cold-delete-payload";
+    let route = client.put(key, payload).unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let backing = wait_for_materialized_cold_backing(&client, key);
+    let backend = client
+        .storage_owner
+        .cold_tier_devices
+        .backend_for(&backing)
+        .unwrap();
+    let device = || inner.get_cold_tier_device(device_id).unwrap().unwrap();
+    let unsettled = device();
+    assert_eq!(unsettled.used_bytes, 0);
+    assert_eq!(unsettled.reserved_bytes, backing.length);
+
+    client.remove(key, true).unwrap();
+    let foreign_gc = other
+        .storage_owner
+        .garbage_collect_pending_delete_backings();
+    client
+        .storage_owner
+        .process_cold_pending_deletes(64)
+        .unwrap();
+    let route_before_settlement = inner.get_object_route(&route.key).unwrap();
+    let payload_before_settlement = backend.get_object(&backing).unwrap();
+    release_tx.send(()).unwrap();
+
     assert_eq!(
-        device_after.used_bytes + backing.length,
-        device_before.used_bytes,
-        "cold used_bytes must be released after reclaim (this was the leak)"
+        route_before_settlement.map(|route| route.state),
+        Some(RouteState::Deleting),
+        "the authoritative route must remain until settlement"
     );
-    assert!(
-        client
-            .storage_owner
-            .pending_cold_deletes
-            .lock()
-            .entries
-            .is_empty(),
-        "cold pending queue should be drained after reclaim"
+    assert_eq!(
+        payload_before_settlement.as_deref(),
+        Some(payload.as_slice()),
+        "reclaim removed the payload before settlement"
+    );
+    assert_eq!(
+        foreign_gc.expect("foreign GC must defer without touching accounting"),
+        0,
+        "another runtime must leave reclaim to the live owner"
     );
 
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        client
+            .storage_owner
+            .process_cold_pending_deletes(64)
+            .unwrap();
+        let usage = device();
+        if usage.used_bytes == 0
+            && usage.reserved_bytes == 0
+            && client
+                .storage_owner
+                .pending_cold_deletes
+                .lock()
+                .entries
+                .is_empty()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cold reclaim did not finish: used={} reserved={}",
+            usage.used_bytes,
+            usage.reserved_bytes
+        );
+        sleep(Duration::from_millis(20));
+    }
+    assert!(!client.is_exist(key).unwrap());
+    assert!(inner.get_object_route(&route.key).unwrap().is_none());
+    assert!(backend.get_object(&backing).unwrap().is_none());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn cold_overwrite_during_settlement_enqueues_new_backing() {
+    let _cold_guard = enable_cold_tier_for_test();
+    let metadata = Arc::new(RecoverableMetadataBackend::new(Arc::new(
+        InMemoryMetadataBackend::new(),
+    )));
+    let device_id = "cold-overwrite-during-settlement";
+    let root = cold_tier_test_root(device_id);
+    let client = build_cold_settlement_test_owner(metadata.clone(), device_id, &root);
+    let (entered_rx, release_tx) = pause_cold_settlement(&metadata);
+
+    let key = "overwritten-during-settlement";
+    client.put(key, b"original payload").unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let original = wait_for_materialized_cold_backing(&client, key);
+
+    let updated = b"replacement payload";
+    client.put(key, updated).unwrap();
+    let route = client.query_route(key).unwrap().unwrap();
+    let queue = client
+        .storage_owner
+        .pending_offloads
+        .observability_snapshot(Instant::now());
+    release_tx.send(()).unwrap();
+
+    let pending = route.cold_backing.unwrap();
+    assert_eq!(
+        pending.state,
+        mooncake_store_core::ColdBackingState::PendingOffload
+    );
+    assert_ne!(pending.object_locator, original.object_locator);
+    assert_eq!(
+        queue.ready + queue.delayed,
+        1,
+        "replacement backing must be queued before the original settles: {queue:?}"
+    );
+    let replacement = wait_for_materialized_cold_backing(&client, key);
+    assert_eq!(replacement.object_locator, pending.object_locator);
+    let backend = client
+        .storage_owner
+        .cold_tier_devices
+        .backend_for(&replacement)
+        .unwrap();
+    assert_eq!(
+        backend.get_object(&replacement).unwrap().as_deref(),
+        Some(updated.as_slice())
+    );
+    assert_eq!(client.get(key).unwrap(), updated);
+    drop(client);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn cold_delete_index_gc_reclaims_backing_after_exact_owner_expires() {
+    let _cold_guard = enable_cold_tier_for_test();
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let metadata = Arc::new(RecoverableMetadataBackend::new(inner.clone()));
+    let device_id = "cold-expired-owner-gc";
+    let root = cold_tier_test_root(device_id);
+    let mut client = build_cold_settlement_test_owner(metadata.clone(), device_id, &root);
+    let other = StoreClientBuilder::new(metadata, "cold-expired-owner-gc-observer")
+        .route_control(RouteControlMode::MetadataOnly)
+        .build(test_future_expiry_ms())
+        .unwrap();
+
+    let key = "expired-owner-key";
+    let route = client.put(key, b"cold payload").unwrap();
+    let backing = wait_for_materialized_cold_backing(&client, key);
+    // Join the offload worker to finish accounting and stop owner-local reclaim.
+    client.cold_tier.shutdown();
+    let device = || inner.get_cold_tier_device(device_id).unwrap().unwrap();
+    assert_eq!(device().used_bytes, backing.length);
+    assert_eq!(device().reserved_bytes, 0);
+    let backend = client
+        .storage_owner
+        .cold_tier_devices
+        .backend_for(&backing)
+        .unwrap();
+
+    client.remove(key, true).unwrap();
+    assert_eq!(
+        other
+            .storage_owner
+            .garbage_collect_pending_delete_backings()
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        backend.get_object(&backing).unwrap().as_deref(),
+        Some(b"cold payload".as_slice())
+    );
+
+    let mut expired = client.lease();
+    expired.expires_at_ms = 0;
+    inner.upsert_client_lease(&expired).unwrap();
+    assert!(inner.get_client_lease(&expired.runtime).unwrap().is_none());
+
+    // A live successor with the same stable ID must not hide the expired epoch.
+    let mut successor = expired.clone();
+    successor.runtime.epoch = ClientEpoch(expired.runtime.epoch.0 + 1);
+    successor.expires_at_ms = test_future_expiry_ms();
+    inner.upsert_client_lease(&successor).unwrap();
+    assert!(inner
+        .get_client_lease(&successor.runtime)
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        other
+            .storage_owner
+            .garbage_collect_pending_delete_backings()
+            .unwrap(),
+        1
+    );
+    assert!(inner.get_object_route(&route.key).unwrap().is_none());
+    assert!(backend.get_object(&backing).unwrap().is_none());
+    assert_eq!(device().used_bytes, 0);
+    assert_eq!(device().reserved_bytes, 0);
+
+    drop(client);
     let _ = std::fs::remove_dir_all(root);
 }
 
