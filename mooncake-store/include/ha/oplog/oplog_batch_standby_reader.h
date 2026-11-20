@@ -15,9 +15,17 @@ class OpLogApplier;
 
 enum class OpLogBatchStandbyPollDisposition {
     OK,
+    // Durable prefix is ahead, but the serializable batch Range is not yet.
+    WAITING_FOR_SUFFIX,
     RETRYABLE,
     REBOOTSTRAP_REQUIRED,
     FATAL,
+};
+
+enum class OpLogBatchStandbyReadMode {
+    SERIALIZABLE,
+    // Used to verify that a reported suffix gap is not follower lag.
+    LINEARIZABLE,
 };
 
 struct OpLogBatchStandbyPollResult {
@@ -28,6 +36,7 @@ struct OpLogBatchStandbyPollResult {
     size_t applied_entries{0};
     // Complete batches processed in this poll, including before a later error.
     size_t applied_batches{0};
+    bool has_more_pages{false};
     DurablePrefix durable_prefix{};
     uint64_t compaction_floor{0};
 };
@@ -37,7 +46,9 @@ class OpLogBatchStandbyReader {
     OpLogBatchStandbyReader(std::string cluster_id, HaKvBackend& backend,
                             OpLogApplier& applier);
 
-    OpLogBatchStandbyPollResult PollOnce(size_t max_batches = 1024);
+    OpLogBatchStandbyPollResult PollOnce(
+        size_t max_batches = 1024, OpLogBatchStandbyReadMode read_mode =
+                                       OpLogBatchStandbyReadMode::SERIALIZABLE);
     // Seed the reader after a materialized snapshot. The next poll starts at
     // cursor.batch_id + 1 and validates the complete suffix.
     ErrorCode SetBaselineCursor(const DurablePrefix& cursor);
@@ -49,7 +60,9 @@ class OpLogBatchStandbyReader {
     }
 
    private:
-    OpLogBatchStandbyPollResult PollBatches(size_t max_batches, uint64_t floor);
+    OpLogBatchStandbyPollResult PollBatches(
+        size_t max_batches, uint64_t floor,
+        OpLogBatchStandbyReadMode read_mode);
     OpLogBatchStorage storage_;
     OpLogApplier& applier_;
     bool batch_format_seen_{false};

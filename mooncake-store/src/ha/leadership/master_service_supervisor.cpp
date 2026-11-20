@@ -1078,7 +1078,9 @@ int MasterServiceSupervisor::Start() {
 
     std::unique_ptr<StandbyController> standby_controller;
     try {
-        standby_controller = CreateStandbyController(*spec, config_);
+        standby_controller = CreateStandbyController(
+            *spec, config_, {},
+            [this] { return ShutdownObserved(shutdown_requested_); });
     } catch (const std::exception& error) {
         LOG(ERROR) << "Standby dependency initialization failed: "
                    << error.what();

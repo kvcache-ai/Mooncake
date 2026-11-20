@@ -491,7 +491,7 @@ ErrorCode OpLogBatchStorage::ReadBatch(uint64_t batch_id,
 
 ErrorCode OpLogBatchStorage::ReadBatchesAfter(
     uint64_t after_batch_id, size_t limit,
-    std::vector<OpLogBatchRecord>& batches) {
+    std::vector<OpLogBatchRecord>& batches, bool serializable) {
     batches.clear();
     if (!IsValidClusterId()) {
         return ErrorCode::INVALID_PARAMS;
@@ -502,7 +502,10 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
         std::vector<KvPair> kvs;
         const size_t remaining = limit == 0 ? 0 : limit - batches.size();
         ErrorCode err =
-            backend_.Range(begin_key, range.end_key, remaining, kvs);
+            serializable
+                ? backend_.RangeSerializable(begin_key, range.end_key,
+                                             remaining, kvs)
+                : backend_.Range(begin_key, range.end_key, remaining, kvs);
         if (err != ErrorCode::OK) {
             return err;
         }
