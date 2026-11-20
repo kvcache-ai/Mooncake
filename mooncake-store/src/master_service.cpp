@@ -2557,23 +2557,23 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                 return false;
             }
             bool unfinished_affiliated_replica = false;
-            VisitNamespaces([&](const TenantId& /*tenant_id*/,
-                                metadata::Namespace& ns) {
-                if (unfinished_affiliated_replica) {
-                    return;
-                }
-                for (auto object : ns.objects.ReadCursor()) {
-                    if (object.metadata().HasReplica(
-                            [&job](const Replica& replica) {
-                                return replica.is_processing() &&
-                                       replica.isAffiliatedWith(
-                                           job.retired_session);
-                            })) {
-                        unfinished_affiliated_replica = true;
-                        break;
+            VisitNamespaces(
+                [&](const TenantId& /*tenant_id*/, metadata::Namespace& ns) {
+                    if (unfinished_affiliated_replica) {
+                        return;
                     }
-                }
-            });
+                    for (auto object : ns.objects.ReadCursor()) {
+                        if (object.metadata().HasReplica(
+                                [&job](const Replica& replica) {
+                                    return replica.is_processing() &&
+                                           replica.isAffiliatedWith(
+                                               job.retired_session);
+                                })) {
+                            unfinished_affiliated_replica = true;
+                            break;
+                        }
+                    }
+                });
             if (unfinished_affiliated_replica) {
                 LOG(ERROR)
                     << "client_id=" << job.client_id
@@ -11175,8 +11175,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                         !enable_ha_ &&
                         metadata.AllReplicas(&Replica::fn_is_memory_replica);
                     const auto& state = accessor.GetState();
-                    if (metadata.IsHardPinned() ||
-                        (!can_move_with_read_lease &&
+                    if ((!can_move_with_read_lease &&
                          !metadata.IsLeaseExpired()) ||
                         !metadata.AllReplicas(&Replica::fn_is_completed) ||
                         state.is_processing || state.replication_task ||
