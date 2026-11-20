@@ -2100,6 +2100,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 
         shm_it = shm_contexts_.erase(shm_it);
     }
+    remount_required_.clear();
     // Re-attempt quarantined segments (unregister failed during this teardown
     // or an earlier one). Failures stay pinned (never munmapped) until process
     // exit, and are reported so teardown does not claim success while
@@ -3266,6 +3267,7 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
             if (shm.dummy_base_addr ==
                 static_cast<uintptr_t>(dummy_base_addr)) {
                 LOG(INFO) << "Segment already mapped: " << shm_name;
+                ClearRemountSegmentLocked(client_id, dummy_base_addr);
                 if (fd >= 0) close(fd);
                 return {};
             }
@@ -3413,15 +3415,55 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
 #endif
 
     context.mapped_shms.push_back(std::move(shm));
+    ClearRemountSegmentLocked(client_id, dummy_base_addr);
 
     LOG(INFO) << "Mapped new shared memory: " << shm_name
               << ", size: " << shm_size;
     return {};
 }
 
+void RealClient::RecordRemountLocked(const UUID &client_id,
+                                     const ShmContext &context) {
+    if (context.mapped_shms.empty()) return;
+    auto &record = remount_required_[client_id];
+    for (const auto &shm : context.mapped_shms) {
+        record.dummy_base_addrs.insert(shm.dummy_base_addr);
+    }
+    record.expiry_seq = ++remount_expiry_seq_;
+    LOG(INFO) << "client_id=" << client_id
+              << ", action=remount_required, segments="
+              << record.dummy_base_addrs.size();
+    if (remount_required_.size() <= kMaxRemountRecords) return;
+    auto oldest = remount_required_.begin();
+    for (auto it = remount_required_.begin(); it != remount_required_.end();
+         ++it) {
+        if (it->second.expiry_seq < oldest->second.expiry_seq) oldest = it;
+    }
+    LOG(WARNING) << "client_id=" << oldest->first
+                 << ", action=remount_record_dropped, limit="
+                 << kMaxRemountRecords;
+    remount_required_.erase(oldest);
+}
+
+void RealClient::ClearRemountSegmentLocked(const UUID &client_id,
+                                           uint64_t dummy_base_addr) {
+    auto it = remount_required_.find(client_id);
+    if (it == remount_required_.end()) return;
+    it->second.dummy_base_addrs.erase(dummy_base_addr);
+    if (!it->second.dummy_base_addrs.empty()) return;
+    remount_required_.erase(it);
+    LOG(INFO) << "client_id=" << client_id << ", action=remount_complete";
+}
+
 tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     const UUID &client_id) {
+    return UnmapShmContext(client_id, /*require_remount=*/false);
+}
+
+tl::expected<void, ErrorCode> RealClient::UnmapShmContext(
+    const UUID &client_id, bool require_remount) {
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    if (!require_remount) remount_required_.erase(client_id);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
@@ -3429,6 +3471,9 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     }
 
     auto &context = it->second;
+    // Recorded before teardown: every segment leaves the active context below,
+    // whether it is unmapped or quarantined.
+    if (require_remount) RecordRemountLocked(client_id, context);
     context.client_buffer_allocator.reset();
 
     // Retry previously quarantined segments (unregister failed earlier) before
@@ -3843,6 +3888,7 @@ tl::expected<bool, ErrorCode> RealClient::is_shm_mapped_internal(
 tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     uint64_t dummy_base_addr, const UUID &client_id) {
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    ClearRemountSegmentLocked(client_id, dummy_base_addr);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         // Per-buffer unregistration is idempotent so a DummyClient can safely
@@ -9208,6 +9254,10 @@ tl::expected<PingResponse, ErrorCode> RealClient::ping(const UUID &client_id) {
 
     ClientStatus client_status =
         client_->is_ping_healthy() ? ClientStatus::OK : ClientStatus::UNDEFINED;
+    if (client_status == ClientStatus::OK &&
+        remount_required_.contains(client_id)) {
+        client_status = ClientStatus::NEED_REMOUNT;
+    }
 
     PodUUID pod_client_id = {client_id.first, client_id.second};
     if (!dummy_client_ping_queue_.push(pod_client_id)) {
@@ -9254,7 +9304,7 @@ void RealClient::dummy_client_monitor_func() {
                 if (globalConfig().ascend_agent_mode) {
                     ascend_unmap_shm_internal(client_id);
                 } else {
-                    unmap_shm_internal(client_id);
+                    UnmapShmContext(client_id, /*require_remount=*/true);
                 }
             }
         }

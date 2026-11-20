@@ -1247,6 +1247,26 @@ class RealClient : public PyClient {
     };
     mutable std::shared_mutex dummy_client_mutex_;
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
+    // Segments the TTL monitor unmapped while their dummy client still had them
+    // registered. Ping reports NEED_REMOUNT until each one is mapped again or
+    // unregistered, so a dummy expired while the real client stayed healthy
+    // re-registers instead of failing every request with shm_not_mapped.
+    struct RemountRecord {
+        std::unordered_set<uint64_t> dummy_base_addrs;
+        uint64_t expiry_seq = 0;
+    };
+    // Dead dummies never clear their record, so past this many the record that
+    // expired first is dropped.
+    static constexpr size_t kMaxRemountRecords = 1024;
+    std::unordered_map<UUID, RemountRecord, boost::hash<UUID>>
+        remount_required_;
+    uint64_t remount_expiry_seq_ = 0;
+    void RecordRemountLocked(const UUID &client_id, const ShmContext &context);
+    void ClearRemountSegmentLocked(const UUID &client_id,
+                                   uint64_t dummy_base_addr);
+    // unmap_shm_internal is an RPC handler, so its signature stays fixed.
+    tl::expected<void, ErrorCode> UnmapShmContext(const UUID &client_id,
+                                                  bool require_remount);
 
     mutable std::shared_mutex registered_buffer_mutex_;
     struct BufferRegistrationRecord {
