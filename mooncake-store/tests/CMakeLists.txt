@@ -67,6 +67,14 @@ if(USE_MLU)
     add_test(NAME ${mlu_test} COMMAND ${mlu_test})
   endforeach()
 endif()
+add_store_test(real_client_shutdown_test real_client_shutdown_test.cpp)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT BUILD_SHARED_LIBS)
+  target_compile_definitions(real_client_shutdown_test
+                             PRIVATE MOONCAKE_TEST_WRAP_UNREGISTER)
+  target_link_options(
+    real_client_shutdown_test PRIVATE
+    "-Wl,--wrap=_ZN8mooncake6Client21unregisterLocalMemoryEPvb")
+endif()
 add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
 add_store_test(read_singleflight_test read_singleflight_test.cpp)
 add_store_test(real_client_direct_read_test real_client_direct_read_test.cpp)
@@ -419,6 +427,14 @@ add_ha_test(batch_oplog_snapshot_writer_test
             ha/snapshot/batch_oplog/writer_test.cpp)
 add_ha_test(batch_oplog_snapshot_provider_test
             ha/snapshot/batch_oplog/provider_test.cpp)
+find_package(AWSSDK QUIET COMPONENTS s3)
+if(AWSSDK_FOUND)
+  add_ha_test(s3_snapshot_object_store_test
+              ha/snapshot/object/backends/s3/s3_snapshot_object_store_test.cpp)
+  target_compile_definitions(s3_snapshot_object_store_test PRIVATE HAVE_AWS_SDK)
+  target_link_libraries(s3_snapshot_object_store_test
+                        PRIVATE ${AWSSDK_LINK_LIBRARIES})
+endif()
 add_ha_test(batch_oplog_snapshot_publisher_test
             ha/snapshot/batch_oplog/publisher_test.cpp)
 add_ha_test(batch_oplog_pruning_coordinator_test
