@@ -1884,21 +1884,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // docs/source/design/store/ssd-prefetch.md).
     const bool enable_ssd_prefetch =
         get_config_bool(config, CONFIG_KEY_ENABLE_SSD_PREFETCH, false);
-    // These values are integer seconds, not byte sizes. The size parser
-    // accepts units and can lose range information for extreme inputs.
-    auto prefetch_seconds = [&config](const char *key, int64_t default_value) {
-        const auto it = config.find(key);
-        return it == config.end()
-                   ? std::optional<int64_t>(default_value)
-                   : TryParseInteger<int64_t>(it->second,
-                                              {.trim_ascii_whitespace = true});
-    };
     auto prefetch_cooldown_opt =
-        prefetch_seconds(CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC,
-                         DEFAULT_SSD_PREFETCH_COOLDOWN_SEC);
+        get_config_size(config, CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC,
+                        DEFAULT_SSD_PREFETCH_COOLDOWN_SEC);
     auto prefetch_dedup_ttl_opt =
-        prefetch_seconds(CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC,
-                         DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC);
+        get_config_size(config, CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC,
+                        DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC);
     if (!prefetch_cooldown_opt.has_value() ||
         !prefetch_dedup_ttl_opt.has_value()) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1914,7 +1905,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             nullptr, ipc_socket_path, 50052, enable_ssd_offload, true,
             ssd_offload_path, tenant_id, enable_client_http_server,
             client_http_port, enable_embedded_master, enable_ssd_prefetch,
-            *prefetch_cooldown_opt, *prefetch_dedup_ttl_opt);
+            static_cast<int64_t>(*prefetch_cooldown_opt),
+            static_cast<int64_t>(*prefetch_dedup_ttl_opt));
         if (!result && egm_config->enabled) {
             (void)tearDownAll_internal();
         }

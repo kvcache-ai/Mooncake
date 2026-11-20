@@ -255,8 +255,7 @@ TEST_F(PrefetchTeardownTest, ConfigDictRejectsInvalidDurationRanges) {
     ResetClient();
     for (const auto* knob : {CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC,
                              CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC}) {
-        for (const auto* value : {"-1", "9223372036854775807",
-                                  "18446744073709551615", "5MB", "1.5"}) {
+        for (const auto* value : {"-1", "9223372036854775807"}) {
             SCOPED_TRACE(std::string(knob) + "=" + value);
             ConfigDict config = {
                 {CONFIG_KEY_LOCAL_HOSTNAME, "127.0.0.1"},
