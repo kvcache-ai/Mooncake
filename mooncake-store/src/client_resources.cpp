@@ -155,8 +155,12 @@ ErrorCode ClientResources::InitTransferEngine(
         return ErrorCode::OK;
     }
 
-    // Check if using TENT mode - TENT handles transport configuration
-    // internally
+    // TODO(UPG-T0084, replace-in=UPG2.3): receiver=UPG2.3 (Management 4).
+    // Source: Management 3 UPG1.1 and RD-C01,
+    // d4a19a6ccb321782f8581376e1847e90d8a021a7:mooncake-store/src/client_resources.cpp:160.
+    // Owner: UPG2.3 shared deployment. Read TENT mode from the provider and
+    // publish an owned engine only after init and transport setup succeed.
+    // Verify both modes and preserve native failure diagnostics on both sides.
     use_tent_ = (std::getenv("MC_USE_TENT") != nullptr) ||
                 (std::getenv("MC_USE_TEV1") != nullptr);
 

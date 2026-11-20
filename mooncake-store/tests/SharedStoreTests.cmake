@@ -32,6 +32,11 @@ function(add_common_store_tests backend_label)
     add_store_test(serializer_test serializer_test.cpp)
     add_store_test(shm_helper_test shm_helper_test.cpp)
     add_store_test(mutex_test mutex_test.cpp)
+    # TODO(UPG-T0084, replace-in=UPG2.3): receiver=UPG2.3 (Management 4).
+    # Source: Management 3 UPG1.1,
+    # 0d67311c4e44044f8628a00a64f4dc0148535204:mooncake-store/src/real_client.cpp:310.
+    # Owner: UPG2.3 shared deployment. Keep both backend fixtures, CTest names,
+    # labels, and timeout. Verify RPC drain and SHM cleanup with both binaries.
     add_store_test(real_client_deployment_test real_client_deployment_test.cpp)
     set_tests_properties(real_client_deployment_test${STORE_TEST_SUFFIX}
         PROPERTIES LABELS "${backend_label};client;deployment;shm;ping" TIMEOUT 180)

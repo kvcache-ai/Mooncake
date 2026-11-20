@@ -25,14 +25,15 @@ set(MOONCAKE_STORE_COMMON_CLIENT_SOURCES
 set(EXTRA_LIBS "")
 
 if(USE_3FS)
-  # TODO(F10-S38-T001, replace-in=UPG1-F10-S38): Reconcile this client-side
-  # Source: UPG1-F01-2.1; tracking clarified by F02-B05/Codex, 2026-11-12.
-  # Due: UPG1-F10-S38 implementation/merge review, before task acceptance.
-  # ThreeFSFile wiring with U's shared HF3FS resource manager and DFS adapter
-  # when the approved descriptor-based DFS consumers are implemented.
-  # Owner: F10-S38. Keep USE_3FS source/header/library conditions aligned;
-  # this existing wiring does not provide descriptor-based DFS support.
-  # Remove this marker after the actual migration or approved exclusion.
+  # TODO(UPG-T0015, replace-in=UPG2.2): receiver=UPG2.2 (Management 4).
+  # Source: Management 3 UPG1-F01-2.1 (F10-S38-T001/A01),
+  # 8e6f32a1957b0ccfe082f4add18d55260a08fc08:mooncake-store/src/CMakeLists.txt:30;
+  # tracking clarified by F02-B05/Codex, 2026-11-12.
+  # Owner: UPG2.2 fixed U intake. Reconcile the legacy ThreeFSFile consumer
+  # with U's HF3FS resource manager and DFS adapter for the approved descriptor
+  # consumers. Verify matching USE_3FS guards for sources, headers and linkage.
+  # The legacy linkage does not provide descriptor-based DFS.
+  # Close after review and verification of the migration or approved exclusion.
   add_subdirectory(hf3fs)
   list(APPEND MOONCAKE_STORE_COMMON_CLIENT_SOURCES ${HF3FS_SOURCES})
   find_library(HF3FS_API_LIB hf3fs_api_shared PATHS /usr/lib NO_DEFAULT_PATH)

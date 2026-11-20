@@ -69,6 +69,12 @@ std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
 }
 
 // Removed allocated_bytes parameter and member initialization
+// TODO(UPG-T0086, replace-in=UPG2.3): receiver=UPG2.3 (Management 4).
+// Source: Management 3 UPG1.1,
+// 0d67311c4e44044f8628a00a64f4dc0148535204:mooncake-store/src/allocator.cpp:72.
+// Owner: UPG2.3 shared allocation. Separate metrics from functional usage and
+// preserve U's generic restore contract. Verify usage for live segments and
+// outstanding handles before and after restore.
 CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
                                                  size_t base, size_t size,
                                                  std::string transport_endpoint)

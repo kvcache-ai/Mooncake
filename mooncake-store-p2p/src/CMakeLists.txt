@@ -10,6 +10,12 @@ set(MOONCAKE_STORE_P2P_FOUNDATION_SOURCES
     offset_allocator.cpp
 )
 
+# TODO(UPG-T0042, replace-in=UPG1.6): receiver=UPG1.6 (Management 4).
+# Source: Management 3 UPG1-F01-2.1 (F10-S38-T001/A01),
+# 8e6f32a1957b0ccfe082f4add18d55260a08fc08:mooncake-store/src/CMakeLists.txt:30.
+# Owner: UPG1.6 native acceptance. Verify independent P2P builds and confirm
+# that the V1 bucket still uses PosixFile with USE_3FS off and on.
+# The optional HF3FS sources below do not provide descriptor-based DFS to P2P.
 set(MOONCAKE_STORE_P2P_CLIENT_FOUNDATION_SOURCES
     common/client_buffer_allocation.cpp
     common/mmap_buffer.cpp
