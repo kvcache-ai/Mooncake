@@ -120,6 +120,16 @@ class MockEventHandler : public EventHandler {
         stale_reason_ = reason;
     }
 
+    void OnSourceReset(const std::string& cache_pool_key,
+                       const MessageMetadata& metadata,
+                       const std::string& reason) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        ++reset_notifications_;
+        reset_cache_pool_key_ = cache_pool_key;
+        reset_metadata_ = metadata;
+        reset_reason_ = reason;
+    }
+
     std::optional<HandledBatch> FindBatch(int64_t sequence,
                                           const std::string& endpoint) {
         std::lock_guard<std::mutex> lock(mu_);
@@ -184,6 +194,20 @@ class MockEventHandler : public EventHandler {
                !stale_reason_.empty();
     }
 
+    size_t ResetNotificationCount() {
+        std::lock_guard<std::mutex> lock(mu_);
+        return reset_notifications_;
+    }
+
+    bool WasSourceReset(const std::string& cache_pool_key,
+                        const std::string& endpoint, int64_t last_sequence) {
+        std::lock_guard<std::mutex> lock(mu_);
+        return reset_cache_pool_key_ == cache_pool_key &&
+               reset_metadata_.endpoint == endpoint &&
+               reset_metadata_.sequence == last_sequence &&
+               !reset_reason_.empty();
+    }
+
    private:
     std::mutex mu_;
     std::vector<HandledBatch> batches_;
@@ -193,6 +217,10 @@ class MockEventHandler : public EventHandler {
     std::string stale_cache_pool_key_;
     MessageMetadata stale_metadata_;
     std::string stale_reason_;
+    size_t reset_notifications_ = 0;
+    std::string reset_cache_pool_key_;
+    MessageMetadata reset_metadata_;
+    std::string reset_reason_;
 };
 
 std::string PackVllmStoredBatch(uint64_t hash, int64_t dp_rank = 3) {
@@ -1292,6 +1320,81 @@ TEST(ZMQClient, FailedReconnectDoesNotRequestReplayUntilSuccess) {
     ASSERT_TRUE(publisher.WaitForReplayRequests(1, std::chrono::seconds(2)));
     EXPECT_EQ(publisher.ReplayRequestCount(), 1u);
     EXPECT_EQ(publisher.LastReplayFromSequence(), 11u);
+    client.Stop();
+}
+
+// A publisher restart resets its sequence counter. The subscriber must notice
+// the regression, retract the old epoch, and keep consuming the new one.
+TEST(ZMQClient, SequenceRegressionResetsSourceAndResubscribes) {
+    for (const bool replay : {true, false}) {
+        SCOPED_TRACE(replay ? "replay" : "live-only");
+        MockPublisher publisher;
+        auto handler = std::make_shared<MockEventHandler>();
+        auto config = TestConfig(publisher);
+        if (!replay) config.replay_endpoint.clear();
+        const std::string endpoint = config.endpoint;
+        ZMQClient client(config, handler);
+        ASSERT_EQ(client.Start(), "");
+
+        const auto first_payload = PackVllmStoredBatch(1);
+        ASSERT_TRUE(PublishUntilHandled(*handler, 10, endpoint, [&] {
+            publisher.Publish("", first_payload, 10);
+        }));
+        publisher.Publish("", PackVllmStoredBatch(2), 11);
+        ASSERT_TRUE(
+            handler->WaitForBatch(11, endpoint, std::chrono::seconds(2)));
+        EXPECT_EQ(client.GetLastSequence(), 11);
+
+        // The publisher restarts and starts counting from zero again.
+        publisher.Publish("", PackVllmStoredBatch(3), 0);
+        ASSERT_TRUE(
+            handler->WaitForBatch(0, endpoint, std::chrono::seconds(2)));
+        EXPECT_EQ(handler->ResetNotificationCount(), 1u);
+        EXPECT_TRUE(handler->WasSourceReset("test-pod", endpoint, 11));
+        EXPECT_EQ(handler->StaleNotificationCount(), 0u);
+        EXPECT_FALSE(client.IsStale());
+        EXPECT_EQ(client.GetLastSequence(), 0);
+        EXPECT_EQ(publisher.ReplayRequestCount(), 0u);
+
+        // The new epoch is tracked like a fresh subscription.
+        publisher.Publish("", PackVllmStoredBatch(4), 1);
+        ASSERT_TRUE(
+            handler->WaitForBatch(1, endpoint, std::chrono::seconds(2)));
+        EXPECT_EQ(client.GetLastSequence(), 1);
+        EXPECT_EQ(handler->ResetNotificationCount(), 1u);
+        EXPECT_EQ(handler->Sequences(endpoint),
+                  (std::vector<int64_t>{10, 11, 0, 1}));
+        client.Stop();
+    }
+}
+
+// After a reset the gap detector works against the new epoch, not the old
+// high-water mark.
+TEST(ZMQClient, GapAfterSequenceRegressionIsDetectedInNewEpoch) {
+    MockPublisher publisher;
+    auto handler = std::make_shared<MockEventHandler>();
+    auto config = TestConfig(publisher);
+    config.replay_endpoint.clear();
+    const std::string endpoint = config.endpoint;
+    ZMQClient client(config, handler);
+    ASSERT_EQ(client.Start(), "");
+
+    const auto first_payload = PackVllmStoredBatch(1);
+    ASSERT_TRUE(PublishUntilHandled(*handler, 10, endpoint, [&] {
+        publisher.Publish("", first_payload, 10);
+    }));
+    publisher.Publish("", PackVllmStoredBatch(2), 0);
+    ASSERT_TRUE(handler->WaitForBatch(0, endpoint, std::chrono::seconds(2)));
+    EXPECT_EQ(handler->ResetNotificationCount(), 1u);
+    EXPECT_EQ(client.GetDroppedEvents(), 0);
+
+    // Sequence 1 of the new epoch is missing; without replay that is fatal.
+    publisher.Publish("", PackVllmStoredBatch(3), 2);
+    ASSERT_TRUE(WaitForStale(client, std::chrono::seconds(2)));
+    EXPECT_EQ(client.GetDroppedEvents(), 1);
+    EXPECT_EQ(client.GetGapCount(), 1);
+    EXPECT_FALSE(handler->FindBatch(2, endpoint).has_value());
+    EXPECT_EQ(client.GetLastSequence(), 0);
     client.Stop();
 }
 
