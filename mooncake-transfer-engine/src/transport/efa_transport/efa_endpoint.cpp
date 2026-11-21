@@ -16,12 +16,46 @@
 
 #include <glog/logging.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <sstream>
+#include <thread>
 
 #include "config.h"
 
 namespace mooncake {
+
+namespace {
+
+// How long a handshake waits for an endpoint's lock_ before giving up.
+// RWSpinlock::lock() never queues behind readers, and submitPostSend() holds
+// lock_ as a reader for its whole submit window, so submitters that keep
+// overlapping can keep a writer out indefinitely. On the passive side, that
+// writer is the handshake daemon.
+constexpr auto kHandshakeLockBudget = std::chrono::seconds(5);
+
+// Takes `lock` for writing, or gives up after `budget`.
+bool tryWriteLockFor(RWSpinlock& lock,
+                     std::chrono::steady_clock::duration budget) {
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    for (uint32_t count = 0; !lock.tryLock(); ++count) {
+        if (count < 1000) {
+            PAUSE();
+            continue;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+// Releases a write lock taken with tryWriteLockFor().
+struct WriteUnlocker {
+    RWSpinlock& lock;
+    ~WriteUnlocker() { lock.unlock(); }
+};
+
+}  // namespace
 
 EfaEndPoint::EfaEndPoint(EfaContext& context)
     : context_(context), status_(INITIALIZING), peer_fi_addr_(FI_ADDR_UNSPEC) {}
@@ -45,7 +79,11 @@ int EfaEndPoint::setupConnectionsByActive() {
     TransferMetadata::HandShakeDesc local_desc, peer_desc;
     uint64_t generation;
     {
-        RWSpinlock::WriteGuard guard(lock_);
+        // Submitters hold lock_ for long only while posting on a connected
+        // endpoint, so if it cannot be had, the endpoint is connected.
+        if (!tryWriteLockFor(lock_, kHandshakeLockBudget))
+            return connected() ? 0 : ERR_ENDPOINT;
+        WriteUnlocker unlock{lock_};
         if (status_.load(std::memory_order_relaxed) == CONNECTED) return 0;
 
         if (context_.nicPath() == peer_nic_path_) {
@@ -79,7 +117,9 @@ int EfaEndPoint::setupConnectionsByActive() {
     int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
                                              peer_desc);
 
-    RWSpinlock::WriteGuard guard(lock_);
+    if (!tryWriteLockFor(lock_, kHandshakeLockBudget))
+        return connected() ? 0 : ERR_ENDPOINT;
+    WriteUnlocker unlock{lock_};
     // A passive handshake may have connected the endpoint while the RPC was
     // in flight; reuse that connection and discard this reply.
     if (status_.load(std::memory_order_relaxed) == CONNECTED) return 0;
@@ -111,7 +151,16 @@ int EfaEndPoint::setupConnectionsByActive() {
 
 int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
                                            HandShakeDesc& local_desc) {
-    RWSpinlock::WriteGuard guard(lock_);
+    // This runs on the handshake daemon, so never wait for lock_ without
+    // bound. The peer gets the rejection and retries on a later transfer.
+    if (!tryWriteLockFor(lock_, kHandshakeLockBudget)) {
+        local_desc.reply_msg = "EFA endpoint busy, retry the handshake";
+        LOG(WARNING) << "EFA passive handshake from "
+                     << peer_desc.local_nic_path << " to " << context_.nicPath()
+                     << " gave up waiting for the endpoint lock";
+        return ERR_REJECT_HANDSHAKE;
+    }
+    WriteUnlocker unlock{lock_};
 
     if (peer_desc.peer_nic_path != context_.nicPath() ||
         peer_desc.local_nic_path != peer_nic_path_) {
