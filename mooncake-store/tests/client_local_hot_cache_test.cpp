@@ -1639,6 +1639,34 @@ TEST_F(LocalHotCacheTest, CountMinSketchBasic) {
     EXPECT_EQ(sketch.count("key_b"), 0);  // 1 >> 1 = 0
 }
 
+// decay() halves every counter, whether the row is shorter than, equal to
+// or longer than a group of eight.
+TEST_F(LocalHotCacheTest, CountMinSketchDecayHalvesEveryCounter) {
+    bool saw_odd = false;
+    for (size_t width : {5, 8, 13, 64}) {
+        CountMinSketch sketch(width, 1);
+        std::vector<std::string> keys;
+        for (int i = 0; i < 300; ++i) {
+            keys.push_back("key-" + std::to_string(i));
+            sketch.increment(keys.back());
+        }
+        std::vector<uint8_t> before;
+        for (const auto& key : keys) {
+            before.push_back(sketch.count(key));
+            saw_odd = saw_odd || (before.back() & 1);
+        }
+
+        sketch.decay();
+
+        for (size_t i = 0; i < keys.size(); ++i) {
+            ASSERT_EQ(sketch.count(keys[i]), before[i] >> 1)
+                << "width " << width << ", key " << i;
+        }
+    }
+    // An odd counter is what could leak into its neighbour.
+    EXPECT_TRUE(saw_odd);
+}
+
 TEST_F(LocalHotCacheTest, CountMinSketchAutoDecay) {
     // Small sketch: width=8 → auto-decay every 4 increments
     CountMinSketch sketch(8, 2);

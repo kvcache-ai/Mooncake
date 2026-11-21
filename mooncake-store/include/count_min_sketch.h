@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -72,9 +73,19 @@ class CountMinSketch {
     }
 
     void decayLocked() {
-        for (size_t i = 0; i < depth_; ++i) {
-            for (size_t j = 0; j < width_; ++j) {
-                table_[i][j] >>= 1;
+        // Halve eight counters per step: shift the 64-bit word and clear the
+        // bit each counter took from its neighbour.
+        for (auto &row : table_) {
+            uint8_t *cells = row.data();
+            size_t j = 0;
+            for (; j + 8 <= row.size(); j += 8) {
+                uint64_t word;
+                std::memcpy(&word, cells + j, 8);
+                word = (word >> 1) & 0x7f7f7f7f7f7f7f7fULL;
+                std::memcpy(cells + j, &word, 8);
+            }
+            for (; j < row.size(); ++j) {
+                cells[j] >>= 1;
             }
         }
         total_increments_ = 0;
