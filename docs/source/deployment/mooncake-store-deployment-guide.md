@@ -151,9 +151,9 @@ mooncake_master \
   --rpc_address=10.0.0.1
 ```
 
-Each instance must specify its own reachable `--rpc_address`. `--etcd_endpoints` is still accepted as a backward-compatible alias for the etcd HA backend connection string when `--ha_backend_connstring` is empty. The etcd cluster used for HA can be shared with or separate from the Transfer Engine's metadata etcd.
+Each instance must specify its own reachable `--rpc_address`. `--etcd_endpoints` is still accepted as a backward-compatible alias for the etcd HA backend connection string when `--ha_backend_connstring` is empty. The Master connection string accepts a plain endpoint list; a leading `etcd://` is also tolerated and removed. The etcd cluster used for HA can be shared with or separate from the Transfer Engine's metadata etcd.
 
-**Client addressing:** to reach an HA cluster, clients must use the `etcd://` master-address form (so they can discover the current leader) instead of a single `IP:Port` — set `master_server_addr` (Method A) / `MOONCAKE_MASTER` (Method B) / `--master_server_address` (Method C) to `etcd://10.0.0.1:2379;10.0.0.2:2379;...`.
+**Client addressing:** to reach an HA cluster, clients must use the explicit `etcd://` master-address form so they can discover the current leader. Set `master_server_addr` (Method A) / `MOONCAKE_MASTER` (Method B) / `--master_server_address` (Method C) to `etcd://10.0.0.1:2379;10.0.0.2:2379;...`. Bare `host:port` remains a direct Master address, and a scheme-less endpoint list is rejected. This is distinct from the Master-side connection string described above.
 
 Set `MC_STORE_CLUSTER_ID` in every client process, including storage-owning clients, to match the masters' `--cluster_id`. This variable selects the HA leader-discovery namespace as well as labeling client metrics. Unset or empty values use `mooncake_cluster` for discovery. A mismatch can leave clients without a leader or direct them to another cluster on the same etcd service. For the master example above, Method B clients use:
 
@@ -187,7 +187,9 @@ For Transfer Engine `metadata_server`, use bare `host:port` endpoints or the
 `etcd://host:port` backend selector with these variables. A top-level `https://`
 metadata URL selects Mooncake's HTTP metadata service instead of etcd. Store
 leader discovery also keeps its `etcd://` backend selector, for example
-`etcd://10.0.0.1:2379;10.0.0.2:2379` for `master_server_addr`.
+`etcd://10.0.0.1:2379;10.0.0.2:2379` for `master_server_addr`. With TLS
+endpoint URLs, keep the selector and endpoint scheme, for example
+`etcd://https://10.0.0.1:2379;https://10.0.0.2:2379`.
 
 For example, start an HA master against an etcd cluster requiring mutual TLS:
 

@@ -25,6 +25,8 @@ class LeaderCoordinator {
     virtual tl::expected<std::optional<MasterView>, ErrorCode>
     ReadCurrentView() = 0;
 
+    virtual std::string GetDiscoveryDiagnostics() const { return {}; }
+
     virtual tl::expected<AcquireLeadershipResult, ErrorCode>
     TryAcquireLeadership(const std::string& leader_address) = 0;
 

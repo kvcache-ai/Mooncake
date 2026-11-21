@@ -34,6 +34,7 @@ namespace mooncake {
 
 class PutOperation;
 class DistributedStorageBackend;
+class RealClient;
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol);
@@ -1031,6 +1032,22 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    friend class RealClient;
+
+    struct CreateFailure {
+        ErrorCode code;
+        bool retryable_on_new_endpoint = false;
+    };
+
+    static tl::expected<std::shared_ptr<Client>, CreateFailure> CreateWithError(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
+        const std::optional<std::string>& device_names,
+        const std::string& master_server_entry,
+        const std::shared_ptr<TransferEngine>& transfer_engine,
+        std::map<std::string, std::string> labels, const std::string& tenant_id,
+        std::shared_ptr<NVMeoFInitiator> nof_initiator);
+
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -1048,10 +1065,11 @@ class Client {
         const ReplicateConfig& config);
 
     void EnterHaRuntimeMode();
-    ErrorCode InitTransferEngine(
-        const std::string& local_hostname,
-        const std::string& metadata_connstring, const std::string& protocol,
-        const std::optional<std::string>& device_names);
+    ErrorCode InitTransferEngine(const std::string& local_hostname,
+                                 const std::string& metadata_connstring,
+                                 const std::string& protocol,
+                                 const std::optional<std::string>& device_names,
+                                 bool& retryable_on_new_endpoint);
     void InitTransferSubmitter();
     // Submits one transfer without waiting for it. The caller must get() the
     // returned future before it releases the slices or the replica.

@@ -82,13 +82,16 @@ class HttpMetadataServer;
 inline std::string ResolveConfiguredHABackendConnstring(
     std::string_view ha_backend_type, std::string_view ha_backend_connstring,
     std::string_view etcd_endpoints) {
-    if (!ha_backend_connstring.empty()) {
-        return std::string(ha_backend_connstring);
-    }
     if (ha_backend_type == "etcd") {
-        return std::string(etcd_endpoints);
+        auto connstring = ha_backend_connstring.empty() ? etcd_endpoints
+                                                        : ha_backend_connstring;
+        if (connstring.starts_with("etcd://")) {
+            connstring.remove_prefix(std::string_view("etcd://").size());
+        }
+        return std::string(connstring);
     }
-    return {};
+    return ha_backend_connstring.empty() ? std::string{}
+                                         : std::string(ha_backend_connstring);
 }
 
 // The configuration for the master server

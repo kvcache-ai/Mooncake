@@ -154,6 +154,11 @@ EtcdLeaderCoordinator::EtcdLeaderCoordinator(const HABackendSpec& spec)
 
 EtcdLeaderCoordinator::~EtcdLeaderCoordinator() { ShutdownKeepAliveThread(); }
 
+std::string EtcdLeaderCoordinator::GetDiscoveryDiagnostics() const {
+    return "backend=etcd endpoints='" + spec_.connstring + "' view_key='" +
+           master_view_key_ + "'";
+}
+
 ErrorCode EtcdLeaderCoordinator::Connect() {
     if (connected_) {
         return ErrorCode::OK;

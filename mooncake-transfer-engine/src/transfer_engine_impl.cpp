@@ -30,6 +30,7 @@
 
 #include "transfer_metadata_plugin.h"
 #include "common.h"
+#include "error.h"
 #include "transport/transport.h"
 #include "transport/rdma_twosided/rdma_twosided_transport.h"
 #include "transport/shm_transport/shm_transport.h"
@@ -113,6 +114,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                              const std::string& local_server_name,
                              const std::string& ip_or_host_name,
                              uint64_t rpc_port) {
+    rpc_meta_entry_conflict_ = false;
     TransferMetadata::RpcMetaDesc desc;
     std::string rpc_binding_method;
 
@@ -220,7 +222,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
-    if (ret) return ret;
+    if (ret) {
+        rpc_meta_entry_conflict_ = ret == ERR_RPC_META_CONFLICT;
+        return ret;
+    }
 
     // Universal TCP force mechanism: if MC_FORCE_TCP is set, skip all other
     // transport installation logic and use TCP transport only. This allows
@@ -558,7 +563,14 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
 int TransferEngineImpl::freeEngine() {
     if (metadata_) {
-        metadata_->removeRpcMetaEntry(local_server_name_);
+        if (rpc_meta_entry_conflict_) {
+            LOG(WARNING) << "Preserving existing RPC metadata entry after a "
+                            "duplicate-key conflict for "
+                         << local_server_name_;
+        } else {
+            metadata_->removeRpcMetaEntry(local_server_name_);
+        }
+        rpc_meta_entry_conflict_ = false;
         metadata_.reset();
     }
     return 0;
