@@ -1999,6 +1999,15 @@ void WorkerPool::transferWorker(int thread_id) {
     const uint64_t idle_spin_ns =
         globalConfig().rdma_worker_idle_spin_us * 1000;
     uint64_t last_wait_ts = getCurrentTimeInNano();
+    // Idle iterations mostly re-read the clock and the outstanding-CQ
+    // counters; batch those checks so the spin window burns pause
+    // instructions instead of clock reads, and park progressively longer
+    // for pools that keep waking up without work (TCP-only deployments
+    // keep RDMA pools alive that never see traffic).
+    constexpr int kIdleClockCheckIters = 64;
+    constexpr int kMaxIdleParkShift = 6;  // 1s, 2s, ... capped at 64s
+    int idle_park_rounds = 0;
+    uint64_t idle_iter = 0;
     while (workers_running_.load(std::memory_order_relaxed)) {
         auto processed_slice_count =
             processed_slice_count_.load(std::memory_order_relaxed);
@@ -2006,6 +2015,7 @@ void WorkerPool::transferWorker(int thread_id) {
             submitted_slice_count_.load(std::memory_order_relaxed);
         if (processed_slice_count == submitted_slice_count &&
             !hasOutstandingCq(thread_id)) {
+            if ((++idle_iter & (kIdleClockCheckIters - 1)) != 0) continue;
             uint64_t curr_wait_ts = getCurrentTimeInNano();
             if (curr_wait_ts - last_wait_ts > idle_spin_ns) {
                 std::unique_lock<std::mutex> lock(cond_mutex_);
@@ -2016,13 +2026,17 @@ void WorkerPool::transferWorker(int thread_id) {
                 if (processed_slice_count_.load(std::memory_order_relaxed) ==
                         submitted_slice_count_.load() &&
                     !hasOutstandingCq(thread_id)) {
-                    cond_var_.wait_for(lock, std::chrono::seconds(1));
+                    const uint64_t park_seconds =
+                        1ull << std::min(idle_park_rounds, kMaxIdleParkShift);
+                    cond_var_.wait_for(lock, std::chrono::seconds(park_seconds));
                 }
                 parked_worker_count_.fetch_sub(1, std::memory_order_acq_rel);
                 last_wait_ts = curr_wait_ts;
+                ++idle_park_rounds;
             }
             continue;
         }
+        idle_park_rounds = 0;
         performPostSend(thread_id);
 #ifndef USE_FAKE_POST_SEND
         performPollCq(thread_id);
