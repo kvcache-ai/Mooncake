@@ -356,7 +356,7 @@ fn execute_read(
                     results.len()
                 )));
             }
-            for (key, exists) in keys.iter().zip(results.into_iter()) {
+            for (key, exists) in keys.iter().zip(results) {
                 if exists != expected_hit {
                     return Err(StoreError::InvalidState(format!(
                         "unexpected existence result for {key}: expected_hit={expected_hit} actual={exists}"
