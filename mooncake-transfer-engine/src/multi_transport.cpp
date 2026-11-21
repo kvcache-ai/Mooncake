@@ -569,6 +569,35 @@ bool MultiTransport::metricsEnabled() { return false; }
 
 #endif  // WITH_METRICS
 
+bool MultiTransport::supportsParallelBatchSubmit(Transport::SegmentID peer) {
+    auto segment = metadata_->getSegmentDescByID(peer);
+    if (!segment) return false;
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (segment->protocol.find(',') != std::string::npos) {
+        // Addresses can choose different protocols. Cover this peer's whole
+        // advertised set, not unrelated installed transports or only address 0.
+        std::istringstream protocols(segment->protocol);
+        std::string protocol;
+        bool found = false;
+        while (std::getline(protocols, protocol, ',')) {
+            auto it = transport_map_.find(protocol);
+            if (it == transport_map_.end() || !it->second ||
+                !it->second->supportsParallelBatchSubmit())
+                return false;
+            found = true;
+        }
+        return found;
+    }
+#endif
+    // Homogeneous routing is address independent. Reuse the native resolver,
+    // including its aliases and platform mappings, for this single peer.
+    TransferRequest route{};
+    route.target_id = peer;
+    Transport* transport = nullptr;
+    return selectTransport(route, transport).ok() && transport &&
+           transport->supportsParallelBatchSubmit();
+}
+
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
     return submitTransfer(batch_id, entries, nullptr);

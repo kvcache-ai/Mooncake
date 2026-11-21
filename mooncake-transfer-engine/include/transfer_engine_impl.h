@@ -473,6 +473,11 @@ class TransferEngineImpl {
         return local_topology_;
     }
 
+    bool supportsParallelBatchSubmit(Transport::SegmentID peer) const {
+        return multi_transports_ &&
+               multi_transports_->supportsParallelBatchSubmit(peer);
+    }
+
    private:
     struct MemoryRegion {
         void* addr;
