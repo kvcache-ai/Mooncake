@@ -14,8 +14,8 @@ class CodeFormatBaseTests(unittest.TestCase):
         workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yml").read_text())
         step = next(
             step
-            for step in workflow["jobs"]["clang-format"]["steps"]
-            if step["name"] == "Check code format"
+            for step in workflow["jobs"]["fast-checks"]["steps"]
+            if step.get("name") == "Check code format"
         )
         script = step["run"]
         context = {

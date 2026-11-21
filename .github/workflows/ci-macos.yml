@@ -6,7 +6,10 @@ on:
       - "main"
       - "release/**"
     paths: &macos-paths
-      - 'mooncake-*/**'
+      - 'mooncake-common/**'
+      - 'mooncake-transfer-engine/**'
+      - 'mooncake-store/**'
+      - 'mooncake-integration/**'
       - 'extern/**'
       - 'cmake/**'
       - 'CMakeLists.txt'

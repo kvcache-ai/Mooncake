@@ -15,7 +15,8 @@ inline const std::string& GetMooncakeStoreVersion() {
 
 // Human-readable display version: sourced from pyproject.toml + short git hash
 // e.g. "0.3.10.post2 (git: abc1234)"
-// Used for the --version flag only; does not affect RPC compatibility.
-constexpr const char* MOONCAKE_DISPLAY_VERSION = "@MOONCAKE_DISPLAY_VERSION@";
+// Defined out-of-line so git SHA changes do not invalidate compiler caches
+// across translation units that include version.h.
+extern const char* const MOONCAKE_DISPLAY_VERSION;
 
 }  // namespace mooncake
