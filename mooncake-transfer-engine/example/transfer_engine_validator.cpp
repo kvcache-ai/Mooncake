@@ -224,7 +224,9 @@ Status submitRequestSync(TransferEngine *engine, SegmentID handle,
     }
 
     s = engine->freeBatchID(batch_id);
-    LOG_ASSERT(s.ok());
+    // Both OK and BatchCleanupDeferred invalidate batch_id; the latter only
+    // means completion callbacks are still unwinding.
+    LOG_ASSERT(s.ok() || s.IsBatchCleanupDeferred());
     return Status::OK();
 }
 

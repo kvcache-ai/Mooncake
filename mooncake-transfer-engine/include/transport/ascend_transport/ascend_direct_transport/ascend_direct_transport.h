@@ -86,6 +86,7 @@ class AscendDirectTransport : public Transport {
     // client owns all devices) instead of using the single current-device
     // context.
     bool agent_mode_{false};
+    bool single_segment_{false};
     bool roce_mode_{false};
     // Whether this TE uses Ascend fabric memory (host mem for Store, e.g. RoCE
     // D2H/H2D). Captured once at install time from globalConfig() and gated on
@@ -93,6 +94,10 @@ class AscendDirectTransport : public Transport {
     // Store TE's fabric setting that leaked into the process-global flag. All
     // transfer-time decisions read this member, not the global.
     bool use_fabric_mem_{false};
+    // Resolved protocol_desc contains "hccs:device". Captured at install,
+    // with use_fabric_mem_, so a later clear of ascend_store_te_init does
+    // not change the protocol this TE was created under.
+    bool hccs_device_protocol_{false};
     std::vector<aclrtContext> local_engine_contexts_;
     // Same order as local_engine_contexts_. ACL logic ids, not a second
     // aclrtGetDevice call at dispatcher start.

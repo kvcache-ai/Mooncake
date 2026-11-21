@@ -18,11 +18,13 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, List, Optional
 
-_store_module = importlib.import_module(
-    os.environ.get("MOONCAKE_STORE_MODULE", "mooncake.store")
-)
-MooncakeDistributedStore = _store_module.MooncakeDistributedStore
-ReplicateConfig = _store_module.ReplicateConfig
+
+def load_store_module(backend: str):
+    # The facade picks its implementation on first import, so select first.
+    os.environ["MOONCAKE_STORE_BACKEND"] = backend
+    return importlib.import_module(
+        os.environ.get("MOONCAKE_STORE_MODULE", "mooncake.store")
+    )
 
 
 LOG = logging.getLogger("store_kv_bench")
@@ -48,6 +50,34 @@ def build_parser() -> argparse.ArgumentParser:
             "replay",
         ],
         help="Benchmark scenario to execute.",
+    )
+
+    parser.add_argument(
+        "--store-backend",
+        choices=["cpp", "rs"],
+        default="cpp",
+        help="Store implementation to drive: the C++ Store (cpp) or Store-RS (rs).",
+    )
+    parser.add_argument(
+        "--rs-metadata-url",
+        default="redis://127.0.0.1:6380",
+        help="Store-RS metadata backend. Accepts redis:// or etcd://.",
+    )
+    parser.add_argument(
+        "--rs-transport-metadata-url",
+        default="P2PHANDSHAKE",
+        help="Store-RS transfer engine metadata. Accepts P2PHANDSHAKE or redis://.",
+    )
+    parser.add_argument(
+        "--rs-keyspace",
+        default="",
+        help="Store-RS metadata keyspace prefix. Empty uses the backend default.",
+    )
+    parser.add_argument(
+        "--rs-route-control",
+        choices=["embedded_wrh", "metadata_only"],
+        default="embedded_wrh",
+        help="Store-RS route control mode.",
     )
 
     parser.add_argument("--local-hostname", default="127.0.0.1:50071")
@@ -394,16 +424,14 @@ class StoreSession:
         lane_id: int,
         payload_factory: PayloadFactory,
         store_obj,
+        replica_config,
         zcopy: Optional["ZcopyBufferView"] = None,
     ):
         self.args = args
         self.lane_id = lane_id
         self.payload_factory = payload_factory
         self.store = store_obj
-        self.config = ReplicateConfig()
-        self.config.replica_num = args.memory_replica_num
-        self.config.nof_replica_num = args.nof_replica_num
-        self.config.dfs_replica_num = args.dfs_replica_num
+        self.config = replica_config
         self._zcopy = zcopy
 
     def close(self) -> None:
@@ -511,7 +539,7 @@ class StoreSession:
 
         if operation == "put":
             payload = self.payload_factory.build(object_id)
-            result_code = self.store.put(key, payload, self.config)
+            result_code = self.store.put(key, payload, config=self.config)
             actual_present = result_code == 0 or self.store.is_exist(key) == 1
             success = result_code == 0 or (expected_present and actual_present)
             bytes_processed = len(payload) if success else 0
@@ -564,15 +592,15 @@ class StoreSession:
         values = [self.payload_factory.build(object_id) for object_id in object_ids]
         if self.args.io_api == "plain":
             if len(object_ids) == 1 and self.args.batch_size == 1:
-                return [self.store.put(keys[0], values[0], self.config)]
-            return [self.store.put_batch(keys, values, self.config)]
+                return [self.store.put(keys[0], values[0], config=self.config)]
+            return [self.store.put_batch(keys, values, config=self.config)]
 
         assert self._zcopy is not None
         ptrs = self._zcopy.fill_write_buffers(values)
         sizes = [len(value) for value in values]
         if len(object_ids) == 1 and self.args.batch_size == 1:
-            return [self.store.put_from(keys[0], ptrs[0], sizes[0], self.config)]
-        return list(self.store.batch_put_from(keys, ptrs, sizes, self.config))
+            return [self.store.put_from(keys[0], ptrs[0], sizes[0], config=self.config)]
+        return list(self.store.batch_put_from(keys, ptrs, sizes, config=self.config))
 
     def _get_payloads_plain(self, keys: List[str]) -> List[bytes]:
         if len(keys) == 1 and self.args.batch_size == 1:
@@ -589,14 +617,37 @@ class StoreSession:
 
 
 class ZcopyBufferPool:
-    def __init__(self, store_obj, value_size: int, slots: int, local_buffer_size: int):
+    def __init__(
+        self,
+        store_obj,
+        buffer_pool,
+        value_size: int,
+        slots: int,
+        local_buffer_size: int,
+        external: bool = False,
+    ):
         self.store = store_obj
+        self.external = external
         self.value_size = value_size
         self.slots = slots
         self.total_size = self.value_size * self.slots
         self._pool = None
         self._lease = None
+        self._external = None
         self.base_ptr = 0
+
+        if external:
+            # Store-RS tracks put_from buffers in a tenant-scoped registration
+            # table, and its local scratch pool is already registered with the
+            # transfer engine. Allocate and register a dedicated region.
+            self._external = ctypes.create_string_buffer(self.total_size)
+            self.base_ptr = ctypes.addressof(self._external)
+            ret = self.store.register_buffer(self.base_ptr, self.total_size)
+            if ret != 0:
+                self.base_ptr = 0
+                self._external = None
+                raise RuntimeError(f"register_buffer failed: {ret}")
+            return
 
         if self.total_size > local_buffer_size:
             raise ValueError(
@@ -604,10 +655,7 @@ class ZcopyBufferPool:
                 f"{self.total_size} bytes, but --local-buffer-size is "
                 f"{local_buffer_size}; increase --local-buffer-size"
             )
-
-        self._pool = _store_module.BufferPool(
-            self.store, max_bytes=local_buffer_size, max_regions=1
-        )
+        self._pool = buffer_pool(self.store, max_bytes=local_buffer_size, max_regions=1)
         try:
             self._lease = self._pool.acquire(self.total_size, block=False)
         except Exception:
@@ -617,6 +665,15 @@ class ZcopyBufferPool:
         self.base_ptr = self._lease.ptr
 
     def close(self) -> None:
+        if self.external:
+            if self.base_ptr:
+                try:
+                    self.store.unregister_buffer(self.base_ptr)
+                except Exception:
+                    LOG.debug("unregister_buffer failed", exc_info=True)
+            self.base_ptr = 0
+            self._external = None
+            return
         self.base_ptr = 0
         if self._lease is not None:
             self._lease.release()
@@ -675,8 +732,67 @@ class ZcopyBufferView:
 class StoreRuntime:
     def __init__(self, args: argparse.Namespace, lane_count: int):
         self.lane_count = lane_count
-        self.store = MooncakeDistributedStore()
-        setup_ret = self.store.setup(
+        self.is_rs = args.store_backend == "rs"
+        self.module = load_store_module(args.store_backend)
+        self.store = self.module.MooncakeDistributedStore()
+        setup_ret = self._setup(args)
+        if setup_ret != 0:
+            raise RuntimeError(f"setup failed: {setup_ret}")
+        self.replica_config = self._replica_config(args)
+
+        self.zcopy_pool: Optional[ZcopyBufferPool] = None
+        if args.io_api == "zcopy":
+            slots = max(1, args.batch_size) * lane_count
+            self.zcopy_pool = ZcopyBufferPool(
+                self.store,
+                self.module.BufferPool,
+                args.value_size,
+                slots,
+                args.local_buffer_size,
+                external=self.is_rs,
+            )
+
+    def _replica_config(self, args: argparse.Namespace):
+        config = self.module.ReplicateConfig()
+        config.replica_num = args.memory_replica_num
+        # Store-RS exposes only replica_num; NoF and DFS are C++ only.
+        if hasattr(config, "nof_replica_num"):
+            config.nof_replica_num = args.nof_replica_num
+        if hasattr(config, "dfs_replica_num"):
+            config.dfs_replica_num = args.dfs_replica_num
+        return config
+
+    def _setup(self, args: argparse.Namespace) -> int:
+        if self.is_rs:
+            LOG.info(
+                "store-rs setup: metadata_url=%s transport_metadata_url=%s "
+                "keyspace=%s route_control=%s replica_count=%d",
+                args.rs_metadata_url,
+                args.rs_transport_metadata_url,
+                args.rs_keyspace or "<default>",
+                args.rs_route_control,
+                args.memory_replica_num,
+            )
+            return self.store.setup(
+                args.local_hostname,
+                args.rs_transport_metadata_url,
+                args.global_segment_size,
+                args.local_buffer_size,
+                args.protocol,
+                args.device_name,
+                args.rs_metadata_url,
+                tenant=args.tenant_id,
+                replica_count=args.memory_replica_num,
+                keyspace=args.rs_keyspace or None,
+                route_control=args.rs_route_control,
+            )
+        LOG.info(
+            "cpp store setup: metadata_server=%s master=%s protocol=%s",
+            args.metadata_server,
+            args.master_server,
+            args.protocol,
+        )
+        return self.store.setup(
             args.local_hostname,
             args.metadata_server,
             args.global_segment_size,
@@ -686,15 +802,6 @@ class StoreRuntime:
             args.master_server,
             enable_ssd_offload=args.enable_ssd_offload,
         )
-        if setup_ret != 0:
-            raise RuntimeError(f"setup failed: {setup_ret}")
-
-        self.zcopy_pool: Optional[ZcopyBufferPool] = None
-        if args.io_api == "zcopy":
-            slots = max(1, args.batch_size) * lane_count
-            self.zcopy_pool = ZcopyBufferPool(
-                self.store, args.value_size, slots, args.local_buffer_size
-            )
 
     def make_session(
         self,
@@ -713,6 +820,7 @@ class StoreRuntime:
             lane_id,
             payload_factory,
             self.store,
+            self.replica_config,
             zcopy_view,
         )
 
@@ -730,6 +838,34 @@ class StoreRuntime:
                 self.store.tearDownAll()
             except Exception:
                 LOG.debug("shared tearDownAll failed", exc_info=True)
+
+
+def summarize_backend(args: argparse.Namespace) -> dict:
+    """Describe the backend and workload settings needed to reproduce a run."""
+    common = {
+        "protocol": args.protocol,
+        "tenant": args.tenant_id,
+        "replica_num": args.memory_replica_num,
+        "global_segment_size": args.global_segment_size,
+        "local_buffer_size": args.local_buffer_size,
+    }
+    if args.store_backend == "rs":
+        return {
+            "store": "rs",
+            "metadata": args.rs_metadata_url,
+            "transport_metadata": args.rs_transport_metadata_url,
+            "routing": args.rs_route_control,
+            "keyspace": args.rs_keyspace or None,
+            **common,
+        }
+    return {
+        "store": "cpp",
+        "metadata_server": args.metadata_server,
+        "master_server": args.master_server,
+        "routing": "master",
+        "keyspace": None,
+        **common,
+    }
 
 
 def merge_stats(name: str, stats_list: List[PhaseStats]) -> PhaseStats:
@@ -886,6 +1022,11 @@ class BenchmarkRunner:
             and self.args.dfs_replica_num == 0
         ):
             raise ValueError("at least one memory, NoF, or DFS replica is required")
+        if self.args.store_backend == "rs":
+            if not self.args.rs_metadata_url:
+                raise ValueError("rs backend requires --rs-metadata-url")
+            if self.args.nof_replica_num != 0:
+                raise ValueError("rs backend does not support --nof-replica-num")
         if self.args.phase_gap_mode == "sleep" and self.args.phase_gap_sec <= 0:
             raise ValueError("phase-gap-sec must be > 0 when phase-gap-mode=sleep")
         if self.args.phase_gap_mode == "file" and not self.args.phase_gap_file:
@@ -1175,6 +1316,7 @@ class BenchmarkRunner:
                 {
                     "schema_version": 1,
                     "scenario": self.args.scenario,
+                    "backend": summarize_backend(self.args),
                     "ok": overall.failed_kvs == 0 and overall.verify_failures == 0,
                     "phases": {phase.name: summarize_stats(phase) for phase in phases},
                     "overall": summarize_stats(overall),

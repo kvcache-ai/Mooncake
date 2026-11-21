@@ -13,6 +13,8 @@ namespace mooncake::conductor {
 
 struct ConductorClientConfig {
     std::string conductor_addr;  // RPC server address, "host:port"
+    // Negative disables the timeout. Setup rejects 0 and values above
+    // INT64_MAX / 1000000 with INVALID_PARAMS.
     int64_t connect_timeout_ms = 1000;
     int64_t request_timeout_ms = 3000;
 };
@@ -32,7 +34,7 @@ class ConductorClient {
 
     // Replaces the previous connection; failure leaves the client unconnected.
     tl::expected<void, ErrorCode> Setup(const ConductorClientConfig& config);
-    void Close();        // idempotent; Setup() may be called again afterwards
+    void Close();  // drains socket cleanup; idempotent; Setup may reconnect
     bool HealthCheck();  // healthy if one ListServices call succeeds
 
     tl::expected<QueryResult, ErrorCode> Query(const QueryRequest& request);

@@ -25,7 +25,7 @@ else()
   message(STATUS "Sunrise/Tang: Disabled")
 endif()
 
-file(GLOB TEBENCH_SOURCES "*.cpp")
+file(GLOB TEBENCH_SOURCES CONFIGURE_DEPENDS "*.cpp")
 # The TENT backend is only available when USE_TENT is enabled; drop its
 # translation unit (which pulls in tent/ headers) from non-TENT builds.
 if(NOT USE_TENT)
@@ -73,13 +73,34 @@ if(BUILD_UNIT_TESTS)
   if(USE_TENT)
     add_executable(
       tebench_tent_config_test tests/tent_config_test.cpp tent_backend.cpp
-                               split_output.cpp utils.cpp)
+                               bench_runner.cpp split_output.cpp utils.cpp)
     target_link_libraries(
       tebench_tent_config_test PRIVATE transfer_engine tent_link_group gtest
                                        gtest_main)
     target_include_directories(tebench_tent_config_test
                                PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME tebench_tent_config_test COMMAND tebench_tent_config_test)
+
+    add_executable(
+      tebench_tent_layout_test tests/tent_layout_test.cpp tent_backend.cpp
+                               bench_runner.cpp split_output.cpp utils.cpp)
+    target_link_libraries(
+      tebench_tent_layout_test PRIVATE transfer_engine tent_link_group gtest
+                                       gtest_main)
+    target_include_directories(tebench_tent_layout_test
+                               PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tebench_tent_layout_test COMMAND tebench_tent_layout_test)
+
+    add_executable(
+      tebench_tent_teardown_test tests/tent_teardown_test.cpp tent_backend.cpp
+                                 bench_runner.cpp split_output.cpp utils.cpp)
+    target_link_libraries(
+      tebench_tent_teardown_test
+      PRIVATE $<TARGET_PROPERTY:tebench,LINK_LIBRARIES> gtest gtest_main)
+    target_include_directories(tebench_tent_teardown_test
+                               PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tebench_tent_teardown_test COMMAND tebench_tent_teardown_test)
+    set_tests_properties(tebench_tent_teardown_test PROPERTIES TIMEOUT 30)
   endif()
 
   if(USE_MLU)
@@ -93,13 +114,92 @@ if(BUILD_UNIT_TESTS)
     add_test(NAME tebench_mlu_data_test COMMAND tebench_mlu_data_test)
   endif()
 
+  if(USE_XPU)
+    add_executable(tebench_xpu_data_test tests/xpu_data_test.cpp utils.cpp)
+    target_link_libraries(
+      tebench_xpu_data_test PRIVATE transfer_engine tent_link_group gtest
+                                    gtest_main)
+    target_include_directories(tebench_xpu_data_test
+                               PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tebench_xpu_data_test COMMAND tebench_xpu_data_test)
+  endif()
+
+  # Checks that the build-tree tebench finds Mooncake's libraries through its
+  # RPATH. A USE_XPU build also needs the oneAPI SYCL runtime, which is outside
+  # the build tree: keep the library path of the environment the build was
+  # configured in (setvars.sh), still dropping anything set at test time.
+  if(USE_XPU)
+    set(TEBENCH_HELP_ENV "LD_LIBRARY_PATH=$ENV{LD_LIBRARY_PATH}")
+  else()
+    set(TEBENCH_HELP_ENV --unset=LD_LIBRARY_PATH)
+  endif()
   add_test(NAME tebench_build_tree_help
-           COMMAND ${CMAKE_COMMAND} -E env --unset=LD_LIBRARY_PATH
+           COMMAND ${CMAKE_COMMAND} -E env ${TEBENCH_HELP_ENV}
                    $<TARGET_FILE:tebench> --help)
   set_tests_properties(
     tebench_build_tree_help
     PROPERTIES PASS_REGULAR_EXPRESSION
                "Mooncake Transfer Engine Benchmarking Tool" TIMEOUT 10)
+
+  # Bad flags are rejected before anything connects. The message is only
+  # printed by the validation path, which then exits with a failure.
+  add_test(
+    NAME tebench_reject_zero_sweep_start
+    COMMAND
+      ${CMAKE_COMMAND} -E env ${TEBENCH_HELP_ENV} $<TARGET_FILE:tebench>
+      --backend=tent --xport_type=shm --target_seg_name=127.0.0.1:1
+      --start_block_size=0)
+  set_tests_properties(
+    tebench_reject_zero_sweep_start
+    PROPERTIES PASS_REGULAR_EXPRESSION "--start_block_size must be positive"
+               TIMEOUT 10)
+  add_test(
+    NAME tebench_reject_sweep_overflow
+    COMMAND
+      ${CMAKE_COMMAND} -E env ${TEBENCH_HELP_ENV} $<TARGET_FILE:tebench>
+      --backend=tent --xport_type=shm --target_seg_name=127.0.0.1:1
+      --max_block_size=18446744073709551615)
+  set_tests_properties(
+    tebench_reject_sweep_overflow
+    PROPERTIES PASS_REGULAR_EXPRESSION "--max_block_size .* must be at most"
+               TIMEOUT 10)
+  add_test(
+    NAME tebench_reject_zero_duration
+    COMMAND
+      ${CMAKE_COMMAND} -E env ${TEBENCH_HELP_ENV} $<TARGET_FILE:tebench>
+      --backend=tent --xport_type=shm --target_seg_name=127.0.0.1:1
+      --duration=0)
+  set_tests_properties(
+    tebench_reject_zero_duration
+    PROPERTIES PASS_REGULAR_EXPRESSION "--duration must be positive" TIMEOUT 10)
+  # Target mode on the classic backend, which used to start with no buffers.
+  add_test(
+    NAME tebench_reject_unknown_seg_type
+    COMMAND ${CMAKE_COMMAND} -E env ${TEBENCH_HELP_ENV} $<TARGET_FILE:tebench>
+            --backend=classic --xport_type=tcp --seg_type=Foo)
+  set_tests_properties(
+    tebench_reject_unknown_seg_type
+    PROPERTIES PASS_REGULAR_EXPRESSION "--seg_type must be DRAM or VRAM"
+               TIMEOUT 10)
+
+  if(WITH_METRICS AND USE_TCP)
+    add_executable(
+      tebench_metrics_integration_test
+      tests/metrics_integration_test.cpp te_backend.cpp bench_runner.cpp
+      utils.cpp split_output.cpp numa_first_touch.cpp)
+    # Use the same backend dependencies as tebench, including device runtimes.
+    target_link_libraries(
+      tebench_metrics_integration_test
+      PRIVATE $<TARGET_PROPERTY:tebench,LINK_LIBRARIES> gtest gtest_main)
+    target_include_directories(
+      tebench_metrics_integration_test
+      PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+    add_test(NAME tebench_metrics_integration_test
+             COMMAND tebench_metrics_integration_test)
+    set_tests_properties(tebench_metrics_integration_test
+                         PROPERTIES TIMEOUT 60 LABELS integration)
+  endif()
 
   add_executable(
     tebench_qos_metrics_test tests/qos_metrics_test.cpp qos_metrics_adapter.cpp
@@ -132,10 +232,40 @@ if(BUILD_UNIT_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
   add_test(NAME tebench_target_metrics_test COMMAND tebench_target_metrics_test)
 
+  add_executable(tebench_bench_runner_test tests/bench_runner_test.cpp
+                                           bench_runner.cpp utils.cpp)
+  target_link_libraries(tebench_bench_runner_test PRIVATE transfer_engine gtest
+                                                          gtest_main)
+  if(USE_TENT)
+    target_link_libraries(tebench_bench_runner_test PRIVATE tent_common)
+  endif()
+  target_include_directories(
+    tebench_bench_runner_test
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+  add_test(NAME tebench_bench_runner_test COMMAND tebench_bench_runner_test)
+
+  add_executable(tebench_stats_test tests/stats_test.cpp utils.cpp)
+  target_link_libraries(tebench_stats_test PRIVATE transfer_engine gtest
+                                                   gtest_main)
+  if(USE_TENT)
+    target_link_libraries(tebench_stats_test PRIVATE tent_common)
+  endif()
+  target_include_directories(
+    tebench_stats_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+                               "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+  add_test(NAME tebench_stats_test COMMAND tebench_stats_test)
+
   add_executable(tebench_split_output_test tests/split_output_test.cpp
                                            split_output.cpp)
   target_link_libraries(tebench_split_output_test PRIVATE gtest gtest_main)
   target_include_directories(tebench_split_output_test
                              PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   add_test(NAME tebench_split_output_test COMMAND tebench_split_output_test)
+
+  add_test(
+    NAME tebench_multinode_script_test
+    COMMAND
+      bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tebench_multinode_test.sh"
+      "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_tebench_multinode.sh")
 endif()

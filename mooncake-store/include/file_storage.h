@@ -1,10 +1,16 @@
 #pragma once
 
+#include <array>
+#include <condition_variable>
 #include <functional>
+#include <future>
+#include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "client_service.h"
+#include "common/read_singleflight.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
@@ -19,6 +25,10 @@ class FileStorage {
                 const std::string& local_rpc_addr,
                 SsdMetric* ssd_metric = nullptr);
     ~FileStorage();
+
+    // The owner must stop external I/O first. Keep registered arenas alive
+    // until Client/TransferEngine teardown has completed.
+    tl::expected<void, ErrorCode> Shutdown();
 
     tl::expected<void, ErrorCode> Init();
 
@@ -42,8 +52,9 @@ class FileStorage {
      * holds across its master RPCs, so a tick that read the latch before it
      * was set cannot resume after the deregistration and re-mount: it either
      * finished before the drain latched, or it re-checks the latch when it
-     * acquires the lock. The latch is not reversible on success; the process
-     * is expected to exit.
+     * acquires the lock. The latch is never reversed; the process is
+     * expected to exit. If the unmount RPC fails, the latch stays and every
+     * heartbeat tick retries the unmount until the master acknowledges it.
      */
     tl::expected<void, ErrorCode> DrainLocalDiskSegment(
         uint64_t grace_period_ms);
@@ -77,9 +88,23 @@ class FileStorage {
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
 
+    // Reads [offset, offset + length) of each value. Returned pointers address
+    // the first requested byte, not the start of the object.
+    tl::expected<BatchGetResult, ErrorCode> BatchGetRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& offsets,
+        const std::vector<int64_t>& lengths,
+        const std::vector<int64_t>& object_sizes);
+
     tl::expected<LocalBatchResult, ErrorCode> BatchGetLocal(
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
+
+    tl::expected<LocalBatchResult, ErrorCode> BatchGetLocalRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& offsets,
+        const std::vector<int64_t>& lengths,
+        const std::vector<int64_t>& object_sizes);
 
     [[nodiscard]] bool HasPinnedRestoreArena() const {
         return pinned_restore_arena_allocator_ != nullptr;
@@ -103,6 +128,10 @@ class FileStorage {
      * divergence a dangling-replica probe needs to detect.
      */
     tl::expected<bool, ErrorCode> Exists(const std::string& key);
+
+    // What one failed disk syscall's errno means for the disk tier.
+    enum class DiskErrorAction { kIgnore, kCheckFilesystem, kFence };
+    static DiskErrorAction ClassifyDiskErrno(int err);
 
     FileStorageConfig config_;
 
@@ -153,6 +182,10 @@ class FileStorage {
 
    private:
     friend class FileStorageTest;
+    friend class FileStorageShutdownTestPeer;
+    std::mutex shutdown_mutex_;
+    bool staging_registered_ = false;
+    ErrorCode shutdown_error_ = ErrorCode::OK;
     friend class FileStoragePromotionTest;
     // TEST_F bodies are generated subclasses and do not inherit the fixture's
     // friendship, so the dangling-replica tests are friended by their
@@ -162,11 +195,42 @@ class FileStorage {
         FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplica_Test;
     friend class
         FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket_Test;
+
+    struct AllocatedBatch;
+    struct ColdReadInvalidation;
+
+    tl::expected<BatchGetResult, ErrorCode> BatchGetOnce(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes);
+    tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadBatchShared(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        bool prefer_pinned, std::string flight_key);
+    static tl::expected<std::vector<uint64_t>, ErrorCode>
+    StagingPointersInOrder(const AllocatedBatch& batch,
+                           const std::vector<std::string>& keys,
+                           const std::vector<int64_t>& sizes);
+
+    /**
+     * @brief Hands a singleflight waiter its own batch id and pointer order for
+     * the staging buffer its leader has already filled.
+     *
+     * The new id aliases the leader's AllocatedBatch, and the caller holds a
+     * strong reference to it, so the waiter can register its id even if the
+     * leader has already released its own. Every reader releases its own id
+     * and the staging memory goes back to the pool when the last id is gone.
+     * The alias gets its own lease because the waiter starts its own read
+     * window now; without that it could outlive the leader's lease and read
+     * freed memory. Keeping the deadline in the alias's table entry also lets
+     * different shards update and collect their leases independently.
+     */
+    BatchGetResult ShareStagingBuffer(
+        const std::shared_ptr<AllocatedBatch>& staging,
+        std::vector<uint64_t> pointers);
+
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
         std::unordered_map<std::string, Slice> slices;
-        std::chrono::steady_clock::time_point lease_timeout;
         std::vector<uint64_t> pointers;
         uint64_t total_size;
 
@@ -179,6 +243,11 @@ class FileStorage {
 
         ~AllocatedBatch() = default;
     };
+
+    // Shared staging stays alive independently of each remote alias lease or
+    // local reader's RAII owner. The flight itself retains no completed value.
+    using ColdReadOutcome =
+        tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode>;
 
     /**
      * @brief Offload object data and metadata.
@@ -258,6 +327,15 @@ class FileStorage {
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batch_object);
 
+    tl::expected<void, ErrorCode> BatchLoadSpans(
+        std::unordered_map<std::string, StorageValueSpan>& spans);
+
+    tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& offsets,
+        const std::vector<int64_t>& lengths,
+        const std::vector<int64_t>& object_sizes, bool prefer_pinned);
+
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
         const std::vector<std::string>& keys, const std::string& tenant_id,
         std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
@@ -281,6 +359,31 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
 
+    // Backend disk-error observer. Runs inline on the failing I/O thread, so
+    // it makes no RPC and takes no lock that I/O or the heartbeat holds.
+    void OnDiskError(int err, const char* op);
+    struct DiskFailure {
+        int err;
+        const char* op;  // string literal naming the failed syscall
+    };
+    // Checks the filesystem for this failure, then for the failures other
+    // threads queued while a check ran. Returns the failure whose check found
+    // the filesystem down, with that check's errno in check_err.
+    std::optional<DiskFailure> RunFilesystemChecks(DiskFailure failure,
+                                                   int& check_err);
+    // errno of the first offload root whose filesystem is down, 0 if all are
+    // up; sync_first runs syncfs on each root before fstat.
+    int CheckFilesystem(bool sync_first) const;
+    // Heartbeat: latch the drain and hand pending offload work back.
+    void ApplyDiskFence();
+    // Heartbeat thread: NACK the tasks carried for the backend's ungrouped
+    // pool and drop the pool (see deferred_task_by_storage_key_).
+    void NackCarriedOffloadTasks();
+    // Heartbeat, while draining_: unmount until the master acknowledges it
+    // (the master treats an already-unmounted segment as success).
+    void UnmountLocalDiskIfPending();
+    void WakeHeartbeat();
+
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
     std::string local_rpc_addr_;
@@ -290,9 +393,29 @@ class FileStorage {
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
-    mutable Mutex client_buffer_mutex_;
-    std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
-        client_buffer_mutex_) client_buffer_allocated_batches_;
+    // Whether client_buffer_allocator_'s buffer is the io_uring fixed buffer,
+    // which the destructor must unregister before the buffer is freed.
+    bool uring_buffer_registered_ = false;
+    // A singleflight burst gives every waiter of one batch its own batch id at
+    // the same instant, and all of them then register and release that id
+    // here. Striping the table by id keeps the resulting convoy off a single
+    // mutex; ids are handed out sequentially, so this spreads them evenly.
+    static constexpr size_t kClientBufferShards = 16;
+    struct ClientBufferEntry {
+        std::shared_ptr<AllocatedBatch> batch;
+        std::chrono::steady_clock::time_point lease_timeout;
+    };
+    struct ClientBufferShard {
+        Mutex mutex;
+        std::unordered_map<uint64_t, ClientBufferEntry> GUARDED_BY(
+            mutex) batches;
+    };
+    std::array<ClientBufferShard, kClientBufferShards> client_buffer_shards_;
+
+    ClientBufferShard& ShardFor(uint64_t batch_id) {
+        return client_buffer_shards_[batch_id % kClientBufferShards];
+    }
+
     std::atomic<uint64_t> next_batch_id_{1};
 
     /**
@@ -302,9 +425,10 @@ class FileStorage {
      * A key absent from all_bucket_keys was either deliberately skipped by
      * the backend (size over bucket limit / already on disk) — those must be
      * NACKed so the master releases the task and source-replica refcount — or
-     * DEFERRED to the backend's ungrouped pool to be written as part of a
-     * full bucket next cycle. Deferred keys must NOT be NACKed: the backend
-     * carries only key+size across the deferral, so their tasks must be
+     * DEFERRED to the backend's ungrouped pool. FileStorage replays carried
+     * keys next cycle and may flush a partial bucket. Deferred keys must NOT
+     * be NACKed: the backend carries only key+size across the deferral, so
+     * their tasks must be
      * carried here or the re-emitted keys arrive task-less and are silently
      * dropped (upstream #3006 — measured as ~12% of pool entries never
      * reaching the SSD tier).
@@ -360,6 +484,15 @@ class FileStorage {
     std::unordered_map<std::string, OffloadTaskItem>
         deferred_task_by_storage_key_;
 
+    // Singleflight for cold reads. The first reader of an exact batch becomes
+    // the leader and does the SSD I/O; readers that request the same key/size
+    // pairs, in any order, share the staging owner. Remote readers take an
+    // independent alias lease; local readers retain a request-scoped owner.
+    // Waiting on a future wakes only that batch's waiters, and if the leader
+    // unwinds, the destroyed promise reports a broken promise instead of
+    // parking the waiters forever.
+    ReadSingleFlight<std::string, ColdReadOutcome> inflight_cold_reads_;
+
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
     std::atomic<bool> heartbeat_running_;
@@ -375,6 +508,28 @@ class FileStorage {
     // again under offloading_mutex_ before the heartbeat RPC, because a tick
     // parked on that lock passed the entry check before the drain latched.
     std::atomic<bool> draining_{false};
+    bool GUARDED_BY(offloading_mutex_) local_disk_unmounted_{false};
+
+    // Set on the first disk failure retry cannot fix; cleared only by a
+    // store restart. Reads and offload stop as soon as it is set.
+    std::atomic<bool> disk_fenced_{false};
+    // The offload roots (storage_filepath may list several disks), each held
+    // open for CheckFilesystem; fd is -1 where the open failed.
+    struct DiskRoot {
+        std::string path;
+        int fd;
+    };
+    std::vector<DiskRoot> disk_roots_;
+    // One filesystem check runs at a time; a failure that arrives during it
+    // is queued for the running thread to check next.
+    Mutex filesystem_check_mutex_;
+    bool GUARDED_BY(filesystem_check_mutex_) filesystem_check_running_{false};
+    std::optional<DiskFailure> GUARDED_BY(filesystem_check_mutex_)
+        queued_disk_failure_;
+    // Test-only replacement for CheckFilesystem; returns errno.
+    std::function<int(bool sync_first)> test_filesystem_check_;
+    std::mutex heartbeat_wake_mutex_;
+    std::condition_variable heartbeat_wake_cv_;
 };
 
 }  // namespace mooncake

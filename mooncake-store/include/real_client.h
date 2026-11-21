@@ -493,6 +493,25 @@ class RealClient : public PyClient {
      */
     tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
 
+    tl::expected<UUID, ErrorCode> create_drain_job(
+        const CreateDrainJobRequest &request) override;
+
+    tl::expected<UUID, ErrorCode> create_timed_drain_job(
+        const CreateDrainJobRequest &request, uint64_t timeout_ms) override;
+
+    tl::expected<QueryJobResponse, ErrorCode> query_drain_job(
+        const UUID &job_id) override;
+
+    tl::expected<void, ErrorCode> cancel_drain_job(const UUID &job_id) override;
+
+    tl::expected<ListDrainJobsResponse, ErrorCode> list_drain_jobs(
+        const DrainJobListRequest &request) override;
+
+    tl::expected<ListTasksResponse, ErrorCode> list_tasks(
+        const TaskListRequest &request) override;
+
+    tl::expected<void, ErrorCode> cancel_task(const UUID &task_id) override;
+
     // Hot cache acquire: returns (offset, size) within the shm region.
     // Increments ref_count to prevent eviction.
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> acquire_hot_cache(
@@ -928,6 +947,13 @@ class RealClient : public PyClient {
     batch_get_offload_object(const std::vector<std::string> &keys,
                              const std::vector<int64_t> &sizes);
 
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
+    batch_get_offload_object_ranges(const std::vector<std::string> &keys,
+                                    const std::vector<int64_t> &offsets,
+                                    const std::vector<int64_t> &sizes,
+                                    const std::vector<int64_t> &object_sizes);
+
     /**
      * @brief Releases buffer associated with a specific batch_id.
      * Called by remote client after transfer completion.
@@ -970,7 +996,7 @@ class RealClient : public PyClient {
      */
     struct OffloadReadRange {
         uint64_t source_offset;
-        int64_t restore_size;
+        int64_t object_size;
     };
 
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
@@ -992,7 +1018,9 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<int64_t> &restore_sizes,
         const std::unordered_map<std::string, std::vector<Slice>> &objects,
-        bool allow_pinned = true);
+        bool allow_pinned = true,
+        const std::vector<int64_t> *value_offsets = nullptr,
+        const std::vector<int64_t> *object_sizes = nullptr);
 
     bool can_use_pinned_restore_arena(
         const std::string &target_rpc_service_addr,
@@ -1210,6 +1238,10 @@ class RealClient : public PyClient {
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
             nullptr;
         // Buffers held by dummy via acquire_buffer; keyed by dummy address
+        // Acquires pin mappings with dummy_client_mutex_ shared during I/O.
+        // Serialize their inserts here; other accesses hold
+        // dummy_client_mutex_ exclusively.
+        std::mutex handles_mutex;
         std::unordered_map<uint64_t, std::shared_ptr<BufferHandle>>
             active_handles;
     };
@@ -1316,7 +1348,8 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         const std::vector<std::string> &keys, const UUID &client_id) const;
 
-    // Ensure cleanup executes at most once across multiple entry points
+    // Reject new work once teardown begins; cleanup calls serialize to
+    // completion
     std::atomic<bool> closed_{false};
 
     // Latched when teardown's NoF buffer cleanup failed: repeat teardown
@@ -1367,6 +1400,10 @@ class RealClient : public PyClient {
     tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
         bool enable_ssd_offload);
 
+    std::mutex teardown_mutex_;
+    ErrorCode storage_shutdown_error_ = ErrorCode::OK;
+    RpcDrainGuard offload_rpc_drain_;
+    friend class RealClientShutdownTestPeer;
     std::unique_ptr<class EmbeddedMaster> embedded_master_;
 
     struct SessionRangeReadRequest {
@@ -1394,6 +1431,8 @@ class RealClient : public PyClient {
         std::vector<std::string> object_keys;
         std::vector<QueryResult> cached_query_results;
         std::unordered_map<std::string, std::vector<Slice>> object_slices;
+        std::unordered_map<std::string, uint64_t> window_offsets;
+        std::unordered_map<std::string, uint64_t> window_lengths;
     };
 
     bool validate_session_range_batch_arguments(
@@ -1437,12 +1476,12 @@ class RealClient : public PyClient {
         std::vector<int> &results);
 
     tl::expected<void, ErrorCode> scatter_session_range_read(
-        const SessionRangeReadRequest &request,
-        const void *staging_buffer) const;
+        const SessionRangeReadRequest &request, const void *staging_buffer,
+        uint64_t window_offset) const;
 
     void complete_staged_session_range_read(
         const SessionRangeReadRequest &request, const void *staging_buffer,
-        std::vector<int> &results);
+        uint64_t window_offset, std::vector<int> &results);
 
     bool invalidate_expired_get_session(const SessionRangeReadRequest &request,
                                         std::vector<int> &results);
@@ -1469,9 +1508,16 @@ class RealClient : public PyClient {
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;
+    friend class RangedDiskLeaseTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,
                                     void *buffer, size_t size) const;
+
+    // DFS replicas whose fs adapter accepts arbitrary host read buffers are
+    // read straight into host destinations; device destinations, more than
+    // IOV_MAX destinations and other DFS adapters keep the staging buffer.
+    bool can_use_direct_dfs_read(const Replica::Descriptor &replica,
+                                 const std::vector<void *> &buffers) const;
 
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;

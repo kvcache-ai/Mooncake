@@ -3,10 +3,10 @@
 #include <algorithm>
 #include <charconv>
 #include <utility>
+#include <vector>
 
 #include "crc32c.h"
 #include "ha/kv/ha_kv_backend.h"
-#include "ha/oplog/oplog_batch_storage.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "ha/snapshot/snapshot_maintenance_lease.h"
@@ -17,14 +17,18 @@ namespace mooncake {
 namespace {
 
 bool InspectArtifact(SnapshotObjectStore& store, const std::string& key,
-                     uint64_t size, uint32_t crc) {
+                     uint64_t size, uint32_t crc,
+                     bool require_checksum = false) {
     const auto inspection = store.InspectObject(key);
-    // A successful inspection with no checksum means the backend does not
-    // supply one. N03's full pre-publication readback remains the content
-    // evidence; do not download all chunks again here. Unknown metadata is an
-    // inspection error and fails closed.
-    return size != 0 && inspection && inspection->stored_size == size &&
-           (!inspection->crc32c || *inspection->crc32c == crc);
+    if (size == 0 || !inspection || inspection->stored_size != size)
+        return false;
+    if (inspection->crc32c) return *inspection->crc32c == crc;
+    // Ordinary artifacts retain their pre-publication readback policy.
+    // Object lifecycle records also need content evidence before log pruning.
+    if (!require_checksum) return true;
+    std::vector<uint8_t> bytes;
+    return store.DownloadBuffer(key, bytes) && bytes.size() == size &&
+           Crc32cValue(bytes.data(), bytes.size()) == crc;
 }
 
 bool ValidateSnapshot(SnapshotObjectStore& store, const std::string& root,
@@ -64,6 +68,14 @@ bool ValidateSnapshot(SnapshotObjectStore& store, const std::string& root,
             chunk.key != ha::BuildBatchOpLogSnapshotObjectChunkKey(
                              root, descriptor.snapshot_id, i) ||
             !InspectArtifact(store, chunk.key, chunk.stored_size, chunk.crc32c))
+            return false;
+    }
+    if (manifest->object_storage) {
+        const auto& objects = *manifest->object_storage;
+        if (objects.key != ha::BuildBatchOpLogSnapshotObjectStorageKey(
+                               root, descriptor.snapshot_id) ||
+            !InspectArtifact(store, objects.key, objects.stored_size,
+                             objects.crc32c, true))
             return false;
     }
     if (manifest->weight_metadata) {
@@ -190,14 +202,7 @@ ErrorCode BatchOpLogPruningCoordinator::Run(
             std::max(metrics.compaction_floor, candidate);
         metrics.floor_advances_total += candidate > floor;
     });
-    // Even if the lease is lost now, this range has already been advertised to
-    // readers. A crash or failed delete leaves the floor in place; a later
-    // successful publication can safely repeat this bounded deletion.
-    if (stopped()) return metric_timer.Success(ErrorCode::OK);
-    const auto delete_error = OpLogBatchStorage(cluster_id_, backend_)
-                                  .DeleteBatchesThrough(candidate);
-    metric_timer.error = static_cast<int64_t>(delete_error);
-    return delete_error;
+    return metric_timer.Success(ErrorCode::OK);
 }
 
 }  // namespace mooncake

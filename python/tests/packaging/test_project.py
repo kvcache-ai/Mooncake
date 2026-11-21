@@ -98,7 +98,11 @@ def test_structured_object_storage_has_one_authoritative_source() -> None:
     legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
     legacy_test_root = REPOSITORY_ROOT / "mooncake-wheel" / "tests"
 
-    for module in ("structured_object_store.py", "_fast_copy.c"):
+    for module in (
+        "structured_object_store.py",
+        "_structured_ranges.py",
+        "_fast_copy.c",
+    ):
         assert (package_root / module).is_file()
         assert not (legacy_package_root / module).exists()
 
@@ -115,7 +119,11 @@ def test_structured_object_storage_has_one_authoritative_source() -> None:
         .split(")", 1)[0]
         .split()
     )
-    assert {"structured_object_store.py", "_fast_copy.c"} <= set(migrated_modules)
+    assert {
+        "structured_object_store.py",
+        "_structured_ranges.py",
+        "_fast_copy.c",
+    } <= set(migrated_modules)
 
 
 def test_http_metadata_service_has_one_authoritative_source(
@@ -338,6 +346,25 @@ def test_cli_entry_points_remain_stable_across_build_interfaces() -> None:
         "mooncake-store-bench",
     }
     assert old_store_rs_commands.isdisjoint(scripts)
+
+
+def test_legacy_store_rs_wheel_build_is_explicitly_opt_in() -> None:
+    legacy_project = tomllib.loads(
+        (REPOSITORY_ROOT / "mooncake-wheel" / "pyproject.toml").read_text()
+    )
+    assert STORE_RS_CLI_ENTRY_POINTS.keys().isdisjoint(
+        legacy_project["project"]["scripts"]
+    )
+
+    legacy_builder = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    store_rs_builder = (
+        REPOSITORY_ROOT / "scripts" / "build_store_rs_wheel.sh"
+    ).read_text()
+    assert 'INCLUDE_STORE_RS="${INCLUDE_STORE_RS:-0}"' in legacy_builder
+    assert 'if [ "$INCLUDE_STORE_RS" = "1" ]' in legacy_builder
+    assert "--target" in store_rs_builder
+    assert "build_store_rs" in store_rs_builder
+    assert "INCLUDE_STORE_RS=1" in store_rs_builder
 
 
 def test_cli_build_inputs_use_the_canonical_sources() -> None:

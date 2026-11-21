@@ -136,6 +136,18 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
         admin_server_->SetRuntimeState(ha::MasterRuntimeState::kServing);
         admin_server_->SetServiceDelegate(wrapped_);
         admin_server_->SetServiceAvailable(true);
+
+        // Commit the restore lifecycle before the RPC service is registered,
+        // exactly as the non-HA master path does (RFC #4700, slice 1). The
+        // embedded master runs no restore, so it opens the lifecycle
+        // directly: Constructed -> Ready -> Serving. Leaving it in
+        // Constructed while it served RPCs would make the "Serving means
+        // committed to normal operation" contract depend on which startup
+        // path was taken, which is what the follow-up admission work must
+        // not have to special-case.
+        wrapped_->MarkReadyForServing();
+        wrapped_->ActivateServing();
+
         RegisterRpcService(*server_, *wrapped_);
 
         auto ec = server_->async_start();

@@ -49,6 +49,7 @@
 #include "tent/common/config.h"
 #include "tent/common/config_lifecycle.h"
 #include "tent/common/types.h"
+#include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
@@ -58,11 +59,48 @@ namespace mooncake {
 
 class TransferEngineImplTestPeer {
    public:
+    static tent::Status setCachedPeerBufferToMlu(
+        tent::TransferEngineImpl& engine, tent::SegmentID peer,
+        uint64_t address, size_t length) {
+        tent::SegmentDescRef pin;
+        return engine.metadata_->segmentManager().withCachedSegment(
+            peer, pin, [&](tent::SegmentDesc* desc) {
+                auto* buffer = desc->findBuffer(address, length);
+                if (!buffer)
+                    return tent::Status::InvalidArgument("missing buffer");
+                buffer->location = "mlu:0";
+                auto& topology =
+                    std::get<tent::MemorySegmentDesc>(desc->detail).topology;
+                topology.mem_list_.push_back(
+                    {"mlu:0", "", tent::Topology::MEM_MLU, 0, {}});
+                return tent::Status::OK();
+            });
+    }
+
     static tent::Status submitRequiringPostSubmitCancellation(
         tent::TransferEngineImpl& engine, tent::BatchID batch_id,
         const std::vector<tent::Request>& requests) {
         return engine.submitTransferRequiringPostSubmitCancellation(batch_id,
                                                                     requests);
+    }
+    // Exercise strict runtime logic with fakes, independently of CUDA startup.
+    static void setMnnvlOptions(tent::TransferEngineImpl& engine, bool strict,
+                                bool egm = true) {
+        engine.mnnvl_config_.require_fabric = strict;
+        engine.mnnvl_config_.egm_enabled = egm;
+    }
+    static std::shared_ptr<tent::ControlService> metadata(
+        tent::TransferEngineImpl& engine) {
+        return engine.metadata_;
+    }
+    static tent::Status clearFabricTag(tent::TransferEngineImpl& engine) {
+        return engine.metadata_->segmentManager().updateLocal(
+            [](tent::SegmentDesc& segment) {
+                for (auto& buffer :
+                     std::get<tent::MemorySegmentDesc>(segment.detail).buffers)
+                    buffer.mnnvl_handle.clear();
+                return tent::Status::OK();
+            });
     }
 };
 
@@ -234,6 +272,40 @@ class FakeTransport : public Transport {
     PollStatusFactory poll_status_factory_;
     bool force_submit_fail_;
     bool cancellation_supported_;
+};
+
+class FakeMnnvlTransport : public FakeTransport {
+   public:
+    explicit FakeMnnvlTransport(bool submit_failure = false,
+                                bool poll_failure = false)
+        : FakeTransport(MNNVL,
+                        poll_failure ? StatusFactory([](const Request&) {
+                            return TransferStatus{FAILED, 0};
+                        })
+                                     : StatusFactory{},
+                        PollStatusFactory{}, submit_failure) {}
+    bool omit_export{false};
+    bool fail_registration{false};
+    int removed{0};
+    int allocations{0};
+    Status addMemoryBuffer(BufferDesc& desc,
+                           const MemoryOptions& options) override {
+        if (options.perm == kLocalReadWrite) return Status::OK();
+        auto status = FakeTransport::addMemoryBuffer(desc, options);
+        if (!omit_export) desc.mnnvl_handle = "fake-fabric-export";
+        return fail_registration
+                   ? Status::InternalError("injected export failure")
+                   : status;
+    }
+    Status removeMemoryBuffer(BufferDesc&) override {
+        ++removed;
+        return Status::OK();
+    }
+    Status allocateLocalMemory(void** addr, size_t size,
+                               MemoryOptions& options) override {
+        ++allocations;
+        return FakeTransport::allocateLocalMemory(addr, size, options);
+    }
 };
 
 class HpTcpRecoveryTransport : public FakeTransport {
@@ -795,9 +867,9 @@ TEST(EngineFailoverE2E, AutoFailoverOnPollDisabledAppliesToOverallStatus) {
 // ---------------------------------------------------------------------------
 // P0c: Explicit progressBatch() drives one progress step and always allows
 // failover/resubmit, regardless of enable_auto_failover_on_poll. Internal
-// sync paths (waitTransferCompletion, transferSync) and the proxy event loop
-// are wired through it so observation-only callers stay decoupled from
-// progress-driving callers.
+// sync paths (waitTransferCompletion, submitAndWaitTransfer) and the proxy
+// event loop are wired through it so observation-only callers stay decoupled
+// from progress-driving callers.
 // ---------------------------------------------------------------------------
 
 TEST(EngineFailoverE2E, ProgressBatchRetriesWhenPollAutoFailoverDisabled) {
@@ -1037,7 +1109,8 @@ TEST(EngineFailoverE2E,
         engine.unregisterLocalMemory(batch.buf.data(), batch.buf.size()).ok());
 }
 
-TEST(EngineFailoverE2E, TransferSyncUsesProgressBatchWhenPollDisabled) {
+TEST(EngineFailoverE2E,
+     SubmitAndWaitTransferUsesProgressBatchWhenPollDisabled) {
     auto cfg = makeMinimalP2PConfig();
     cfg->set("enable_auto_failover_on_poll", false);
     TransferEngineImpl engine(cfg);
@@ -1068,18 +1141,18 @@ TEST(EngineFailoverE2E, TransferSyncUsesProgressBatchWhenPollDisabled) {
     req.target_offset = reinterpret_cast<uint64_t>(buf.data());
     req.length = kBufLen;
 
-    EXPECT_TRUE(engine.transferSync({req}).ok());
+    EXPECT_TRUE(engine.submitAndWaitTransfer({req}).ok());
     EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
     EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
 
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
 }
 
-// transferSync() allocates a batch before submitting, so every error path out
-// of it has to release that batch. submitTransfer() rejecting an unregistered
-// buffer is the reachable one; the poll-failure path leaves through the same
-// guard.
-TEST(EngineFailoverE2E, TransferSyncFreesBatchWhenSubmitFails) {
+// submitAndWaitTransfer() allocates a batch before submitting, so every error
+// path out of it has to release that batch. submitTransfer() rejecting an
+// unregistered buffer is the reachable one; the poll-failure path leaves
+// through the same guard.
+TEST(EngineFailoverE2E, SubmitAndWaitTransferFreesBatchWhenSubmitFails) {
     auto cfg = makeMinimalP2PConfig();
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
@@ -1100,10 +1173,11 @@ TEST(EngineFailoverE2E, TransferSyncFreesBatchWhenSubmitFails) {
     req.target_offset = reinterpret_cast<uint64_t>(unregistered.data());
     req.length = unregistered.size();
 
-    EXPECT_FALSE(engine.transferSync({req}).ok());
+    EXPECT_FALSE(engine.submitAndWaitTransfer({req}).ok());
     EXPECT_EQ(fake_rdma->submit_calls.load(), 0);
     EXPECT_EQ(engine.aliveBatchCountForTest(), alive_before)
-        << "the batch allocated by transferSync outlived the failed submit";
+        << "the batch allocated by submitAndWaitTransfer outlived the failed "
+           "submit";
 }
 
 TEST(EngineFailoverE2E, ProgressBatchAdvancesExactlyOneStepPerCall) {
@@ -1697,6 +1771,102 @@ TEST(EngineFailoverE2E, SubmitStageFailoverWithDerivedTasks) {
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
 }
 
+TEST(EngineFailoverE2E, MergedStagingRequestsShareOneSubmission) {
+    for (bool queued : {false, true}) {
+        for (bool fail : {false, true}) {
+            for (auto opcode : {Request::READ, Request::WRITE}) {
+                SCOPED_TRACE(::testing::Message()
+                             << "queued=" << queued << " fail=" << fail
+                             << " opcode=" << opcode);
+                auto cfg = makeMinimalP2PConfig();
+                cfg->set("merge_requests", true);
+                cfg->set("enable_runtime_queue", queued);
+                cfg->set("max_failover_attempts", 0);
+                cfg->set("use_legacy_transport_selection", false);
+
+                constexpr size_t kLengths[] = {512, 1024, 1536, 1024};
+                constexpr size_t kLength = 4096;
+                std::vector<uint8_t> local(kLength), remote(kLength);
+                std::atomic<bool> complete{false};
+                std::atomic<size_t> submitted_bytes{0};
+                TransferEngineImpl target(cfg), initiator(cfg);
+                ASSERT_TRUE(target.available());
+                ASSERT_TRUE(initiator.available());
+                auto network = std::make_shared<FakeTransport>(
+                    TCP,
+                    [&](const Request& request) {
+                        submitted_bytes += request.length;
+                        return TransferStatus{PENDING, 0};
+                    },
+                    [&](const Request& request, int) {
+                        if (!complete.load()) return TransferStatus{PENDING, 0};
+                        return fail ? TransferStatus{FAILED, 0}
+                                    : TransferStatus{COMPLETED, request.length};
+                    });
+                initiator.swapTransportForTest(TCP, network);
+                target.swapTransportForTest(
+                    TCP, std::make_shared<FakeTransport>(TCP));
+                ASSERT_TRUE(
+                    initiator.registerLocalMemory(local.data(), kLength).ok());
+                ASSERT_TRUE(
+                    target.registerLocalMemory(remote.data(), kLength).ok());
+                SegmentID peer;
+                ASSERT_TRUE(
+                    initiator.openSegment(peer, target.getSegmentName()).ok());
+                // Advertise a device buffer only in the initiator's cache.
+                // The peer uses host memory and the existing fake transport,
+                // exercising staging without a device SDK or hardware.
+                ASSERT_TRUE(
+                    TransferEngineImplTestPeer::setCachedPeerBufferToMlu(
+                        initiator, peer,
+                        reinterpret_cast<uint64_t>(remote.data()), kLength)
+                        .ok());
+
+                std::vector<Request> requests;
+                size_t offset = 0;
+                for (size_t length : kLengths) {
+                    Request request;
+                    request.opcode = opcode;
+                    request.source = local.data() + offset;
+                    request.target_id = peer;
+                    request.target_offset =
+                        reinterpret_cast<uint64_t>(remote.data()) + offset;
+                    request.length = length;
+                    requests.push_back(request);
+                    offset += length;
+                }
+                const auto batch = initiator.allocateBatch(requests.size());
+                ASSERT_NE(batch, static_cast<BatchID>(0));
+                ASSERT_TRUE(initiator.submitTransfer(batch, requests).ok());
+                TransferStatus status{};
+                EXPECT_TRUE(initiator.getTransferStatus(batch, 3, status).ok());
+                EXPECT_EQ(status.s, PENDING);
+                EXPECT_EQ(status.transferred_bytes, 0u);
+                complete.store(true);
+
+                // Poll aliases before their owner and preserve each request's
+                // original length, even though the physical request is merged.
+                for (size_t task_id : {3U, 2U, 1U, 0U}) {
+                    status = pollUntilDone(initiator, batch, task_id);
+                    EXPECT_EQ(status.s, fail ? FAILED : COMPLETED);
+                    EXPECT_EQ(status.transferred_bytes,
+                              fail ? 0u : kLengths[task_id]);
+                }
+                EXPECT_TRUE(initiator.getTransferStatus(batch, status).ok());
+                EXPECT_EQ(status.s, fail ? FAILED : COMPLETED);
+                EXPECT_EQ(status.transferred_bytes, fail ? 0u : kLength);
+                EXPECT_EQ(network->submitted_request_count.load(), 1);
+                EXPECT_EQ(submitted_bytes.load(), kLength);
+
+                EXPECT_TRUE(initiator.freeBatch(batch).ok());
+                EXPECT_TRUE(initiator.closeSegment(peer).ok());
+                EXPECT_TRUE(initiator.unregisterLocalMemory(local.data()).ok());
+                EXPECT_TRUE(target.unregisterLocalMemory(remote.data()).ok());
+            }
+        }
+    }
+}
+
 TEST(EngineFailoverE2E, PollStageFailoverWithDerivedTasksRunsOnce) {
     auto cfg = makeMinimalP2PConfig();
     cfg->set("merge_requests", true);
@@ -2124,6 +2294,493 @@ TEST(EngineFailoverE2E, SubmitStagePartialAcceptanceExecutesExactlyOnce) {
     EXPECT_TRUE(engine.freeBatch(batch_id).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
 }
+
+TEST(MnnvlRuntimeTest, StrictPreventsSubmitAndPollDowngrade) {
+    for (bool legacy : {false, true}) {
+        for (bool strict : {false, true}) {
+            for (bool submit_failure : {false, true}) {
+                auto config = makeMinimalP2PConfig();
+                config->set("use_legacy_transport_selection", legacy);
+                TransferEngineImpl engine(config);
+                ASSERT_TRUE(engine.available());
+                TransferEngineImplTestPeer::setMnnvlOptions(engine, strict);
+                auto fabric = std::make_shared<FakeMnnvlTransport>(
+                    submit_failure, !submit_failure);
+                auto tcp = std::make_shared<FakeTransport>(TCP);
+                engine.swapTransportForTest(MNNVL, fabric);
+                engine.swapTransportForTest(TCP, tcp);
+                std::vector<uint8_t> buffer(4096);
+                ASSERT_TRUE(
+                    engine.registerLocalMemory(buffer.data(), buffer.size())
+                        .ok());
+                Request request;
+                request.source = buffer.data();
+                request.target_id = LOCAL_SEGMENT_ID;
+                request.target_offset =
+                    reinterpret_cast<uint64_t>(buffer.data());
+                request.length = buffer.size();
+                request.transport_hint = MNNVL;
+                auto batch = engine.allocateBatch(1);
+                const auto submit = engine.submitTransfer(batch, {request});
+                if (!submit_failure || !strict) EXPECT_TRUE(submit.ok());
+                EXPECT_EQ(pollUntilDone(engine, batch, 0).s,
+                          strict ? FAILED : COMPLETED);
+                EXPECT_EQ(fabric->submit_calls.load(), 1);
+                EXPECT_EQ(tcp->submit_calls.load(), strict ? 0 : 1);
+                EXPECT_TRUE(engine.freeBatch(batch).ok());
+                EXPECT_TRUE(
+                    engine.unregisterLocalMemory(buffer.data(), buffer.size())
+                        .ok());
+            }
+        }
+    }
+}
+
+TEST(MnnvlRuntimeTest, RequiredRegistrationRejectsFailureAndFalseSuccess) {
+    for (bool false_success : {false, true}) {
+        TransferEngineImpl engine(makeMinimalP2PConfig());
+        ASSERT_TRUE(engine.available());
+        TransferEngineImplTestPeer::setMnnvlOptions(engine, true);
+        auto fabric = std::make_shared<FakeMnnvlTransport>();
+        fabric->omit_export = false_success;
+        fabric->fail_registration = !false_success;
+        auto tcp = std::make_shared<FakeTransport>(TCP);
+        engine.swapTransportForTest(MNNVL, fabric);
+        engine.swapTransportForTest(TCP, tcp);
+        std::vector<uint8_t> first(4096), second(4096);
+        MemoryOptions options;
+        EXPECT_FALSE(engine
+                         .registerLocalMemory({first.data(), second.data()},
+                                              {first.size(), second.size()},
+                                              options)
+                         .ok());
+        EXPECT_EQ(fabric->removed, 2);
+        EXPECT_EQ(tcp->add_mem_calls.load(), 0);
+        SegmentInfo info;
+        ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+        EXPECT_TRUE(info.buffers.empty());
+    }
+}
+
+TEST(MnnvlRuntimeTest, LocalOnlyDuplicateCannotMasqueradeAsExported) {
+    TransferEngineImpl engine(makeMinimalP2PConfig());
+    ASSERT_TRUE(engine.available());
+    TransferEngineImplTestPeer::setMnnvlOptions(engine, true);
+    engine.swapTransportForTest(MNNVL, std::make_shared<FakeMnnvlTransport>());
+    engine.swapTransportForTest(TCP, std::make_shared<FakeTransport>(TCP));
+    std::vector<uint8_t> buffer(4096);
+    ASSERT_TRUE(
+        engine
+            .registerLocalMemory(buffer.data(), buffer.size(), kLocalReadWrite)
+            .ok());
+    EXPECT_FALSE(
+        engine
+            .registerLocalMemory(buffer.data(), buffer.size(), kGlobalReadWrite)
+            .ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    SegmentInfo info;
+    ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+    EXPECT_TRUE(
+        info.buffers.empty());  // Failed duplicate rolled its refcount back.
+}
+
+TEST(MnnvlRuntimeTest, StrictAllocationSelectsMnnvlAndRejectsExplicitRdma) {
+    TransferEngineImpl engine(makeMinimalP2PConfig());
+    ASSERT_TRUE(engine.available());
+    TransferEngineImplTestPeer::setMnnvlOptions(engine, true, false);
+    auto fabric = std::make_shared<FakeMnnvlTransport>();
+    engine.swapTransportForTest(MNNVL, fabric);
+    engine.swapTransportForTest(RDMA, std::make_shared<FakeTransport>(RDMA));
+    MemoryOptions options;
+    options.location = "cuda:0";
+    void* address = nullptr;
+    ASSERT_TRUE(engine.allocateLocalMemory(&address, 4096, options).ok());
+    EXPECT_EQ(options.type, MNNVL);
+    EXPECT_EQ(fabric->allocations, 1);
+    EXPECT_TRUE(engine.freeLocalMemory(address).ok());
+    options.type = RDMA;
+    EXPECT_TRUE(engine.allocateLocalMemory(&address, 4096, options)
+                    .IsInvalidArgument());
+}
+
+// Strict MNNVL routing fails closed inside transport selection, not at submit
+// time: commitPreparedSubmit() still accepts the submission, appends a task
+// with type UNSPEC and logs the unroutable request. getTransferStatus() then
+// reports that task FAILED with no bytes, and handleTaskStatus() suppresses
+// failover for UNSPEC tasks, so no transport ever sees the request. Callers
+// pass the task id that this submission appends to the batch.
+void expectStrictRejection(TransferEngineImpl& engine, BatchID batch,
+                           const Request& request, size_t task_id) {
+    ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
+    const auto status = pollUntilDone(engine, batch, task_id);
+    EXPECT_EQ(status.s, FAILED);
+    EXPECT_EQ(status.transferred_bytes, 0U);
+}
+
+TEST(MnnvlRuntimeTest, StrictRouteRejectsConflictAndMissingExport) {
+    TransferEngineImpl engine(makeMinimalP2PConfig());
+    TransferEngineImpl peer(makeMinimalP2PConfig());
+    ASSERT_TRUE(engine.available());
+    ASSERT_TRUE(peer.available());
+    TransferEngineImplTestPeer::setMnnvlOptions(engine, true);
+    auto fabric = std::make_shared<FakeMnnvlTransport>();
+    auto tcp = std::make_shared<FakeTransport>(TCP);
+    engine.swapTransportForTest(MNNVL, fabric);
+    engine.swapTransportForTest(TCP, tcp);
+    std::vector<uint8_t> buffer(4096);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    Request request{};
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+    auto batch = engine.allocateBatch(3);
+    ASSERT_NE(batch, (BatchID)0);
+    ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
+    request.transport_hint = TCP;
+    expectStrictRejection(engine, batch, request, 1);
+    request.transport_hint = UNSPEC;
+    peer.swapTransportForTest(MNNVL, std::make_shared<FakeMnnvlTransport>());
+    ASSERT_TRUE(peer.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    ASSERT_TRUE(TransferEngineImplTestPeer::clearFabricTag(peer).ok());
+    ASSERT_TRUE(
+        engine.openSegment(request.target_id, peer.getSegmentName()).ok());
+    ASSERT_NE(request.target_id, LOCAL_SEGMENT_ID);
+    expectStrictRejection(engine, batch, request, 2);
+    EXPECT_TRUE(engine.closeSegment(request.target_id).ok());
+    EXPECT_TRUE(peer.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    EXPECT_EQ(pollUntilDone(engine, batch, 0).s, COMPLETED);
+    EXPECT_EQ(fabric->submit_calls.load(), 1);
+    EXPECT_EQ(tcp->submit_calls.load(), 0);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(MnnvlRuntimeTest, StrictLocalOnlyTargetsUseDefaultPolicyWithoutExport) {
+    for (bool legacy : {false, true}) {
+        for (bool register_tcp : {false, true}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "legacy=" << legacy
+                         << " register_tcp=" << register_tcp);
+            auto config = makeMinimalP2PConfig();
+            config->set("use_legacy_transport_selection", legacy);
+            TransferEngineImpl engine(config);
+            ASSERT_TRUE(engine.available());
+            // Fake host buffers exercise strict routing through EGM; actual
+            // CUDA byte-copy coverage lives in mnnvl_transport_test.cpp.
+            TransferEngineImplTestPeer::setMnnvlOptions(engine, true);
+            auto fabric = std::make_shared<FakeMnnvlTransport>();
+            auto tcp = std::make_shared<FakeTransport>(TCP);
+            engine.swapTransportForTest(MNNVL, fabric);
+            engine.swapTransportForTest(TCP, tcp);
+            std::vector<uint8_t> source(4096), target(4096);
+            MemoryOptions options;
+            options.type = register_tcp ? UNSPEC : MNNVL;
+            options.perm = kLocalReadWrite;
+            ASSERT_TRUE(engine
+                            .registerLocalMemory({source.data(), target.data()},
+                                                 {source.size(), target.size()},
+                                                 options)
+                            .ok());
+            auto expect_unexported = [&] {
+                auto local = TransferEngineImplTestPeer::metadata(engine)
+                                 ->segmentManager()
+                                 .getLocal();
+                for (auto* address : {source.data(), target.data()}) {
+                    auto* buffer = local->findBuffer(
+                        reinterpret_cast<uint64_t>(address), source.size());
+                    ASSERT_NE(buffer, nullptr);
+                    EXPECT_EQ(buffer->permission, kLocalReadWrite);
+                    EXPECT_TRUE(buffer->mnnvl_handle.empty());
+                    const std::vector<TransportType> expected =
+                        register_tcp ? std::vector<TransportType>{TCP}
+                                     : std::vector<TransportType>{};
+                    EXPECT_EQ(buffer->transports, expected);
+                }
+            };
+            expect_unexported();
+            Request request{};
+            request.source = source.data();
+            request.target_id = LOCAL_SEGMENT_ID;
+            request.target_offset = reinterpret_cast<uint64_t>(target.data());
+            request.length = target.size();
+            auto batch = engine.allocateBatch(8);
+            ASSERT_NE(batch, (BatchID)0);
+            request.transport_hint = TCP;
+            expectStrictRejection(engine, batch, request, 0);
+            request.transport_hint = UNSPEC;
+            request.policy_name = "unknown_policy";
+            expectStrictRejection(engine, batch, request, 1);
+            request.policy_name.reset();
+            for (auto hint : {UNSPEC, MNNVL}) {
+                for (auto opcode : {Request::READ, Request::WRITE}) {
+                    request.transport_hint = hint;
+                    request.opcode = opcode;
+                    ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
+                }
+            }
+            for (size_t i = 2; i < 6; ++i) {
+                const auto status = pollUntilDone(engine, batch, i);
+                EXPECT_EQ(status.s, COMPLETED);
+                EXPECT_EQ(status.transferred_bytes, request.length);
+            }
+            request.target_offset = 1;
+            expectStrictRejection(engine, batch, request, 6);
+            EXPECT_EQ(fabric->submit_calls.load(), 4);
+            EXPECT_EQ(tcp->submit_calls.load(), 0);
+            expect_unexported();
+            EXPECT_TRUE(engine.freeBatch(batch).ok());
+            EXPECT_TRUE(
+                engine
+                    .unregisterLocalMemory({source.data(), target.data()},
+                                           {source.size(), target.size()})
+                    .ok());
+        }
+    }
+}
+
+TEST(MnnvlRuntimeTest, StrictLocalOnlyPeerTargetsStillRequireExport) {
+    for (bool legacy : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "legacy=" << legacy);
+        auto config = makeMinimalP2PConfig();
+        config->set("use_legacy_transport_selection", legacy);
+        TransferEngineImpl engine(config);
+        TransferEngineImpl peer(makeMinimalP2PConfig());
+        ASSERT_TRUE(engine.available());
+        ASSERT_TRUE(peer.available());
+        TransferEngineImplTestPeer::setMnnvlOptions(engine, true);
+        auto fabric = std::make_shared<FakeMnnvlTransport>();
+        auto tcp = std::make_shared<FakeTransport>(TCP);
+        engine.swapTransportForTest(MNNVL, fabric);
+        engine.swapTransportForTest(TCP, tcp);
+        peer.swapTransportForTest(MNNVL,
+                                  std::make_shared<FakeMnnvlTransport>());
+        std::vector<uint8_t> source(4096), target(4096);
+        MemoryOptions options;
+        options.type = MNNVL;
+        options.perm = kLocalReadWrite;
+        ASSERT_TRUE(
+            engine
+                .registerLocalMemory({source.data()}, {source.size()}, options)
+                .ok());
+        ASSERT_TRUE(
+            peer.registerLocalMemory({target.data()}, {target.size()}, options)
+                .ok());
+        Request request{};
+        request.source = source.data();
+        request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        request.length = target.size();
+        ASSERT_TRUE(
+            engine.openSegment(request.target_id, peer.getSegmentName()).ok());
+        ASSERT_NE(request.target_id, LOCAL_SEGMENT_ID);
+        auto batch = engine.allocateBatch(4);
+        ASSERT_NE(batch, (BatchID)0);
+        size_t task_id = 0;
+        for (auto hint : {UNSPEC, MNNVL}) {
+            for (auto opcode : {Request::READ, Request::WRITE}) {
+                request.transport_hint = hint;
+                request.opcode = opcode;
+                expectStrictRejection(engine, batch, request, task_id++);
+            }
+        }
+        EXPECT_EQ(fabric->submit_calls.load(), 0);
+        EXPECT_EQ(tcp->submit_calls.load(), 0);
+        EXPECT_TRUE(engine.freeBatch(batch).ok());
+        EXPECT_TRUE(engine.closeSegment(request.target_id).ok());
+        EXPECT_TRUE(
+            engine.unregisterLocalMemory(source.data(), source.size()).ok());
+        EXPECT_TRUE(
+            peer.unregisterLocalMemory(target.data(), target.size()).ok());
+    }
+}
+
+TEST(MnnvlRuntimeTest, StrictLocalOnlyTargetsHonorPolicyWithoutExport) {
+    for (bool legacy : {false, true}) {
+        auto config = makeMinimalP2PConfig();
+        config->set("use_legacy_transport_selection", legacy);
+        config->set("policy", json::array({{{"name", "tcp_only"},
+                                            {"segment_type", "memory"},
+                                            {"transports", {"tcp"}}},
+                                           {{"name", "fabric_only"},
+                                            {"segment_type", "memory"},
+                                            {"transports", {"mnnvl"}}}}));
+        TransferEngineImpl engine(config);
+        ASSERT_TRUE(engine.available());
+        TransferEngineImplTestPeer::setMnnvlOptions(engine, true);
+        auto fabric = std::make_shared<FakeMnnvlTransport>();
+        auto tcp = std::make_shared<FakeTransport>(TCP);
+        engine.swapTransportForTest(MNNVL, fabric);
+        engine.swapTransportForTest(TCP, tcp);
+        std::vector<uint8_t> source(4096), target(4096);
+        MemoryOptions options;
+        options.type = MNNVL;
+        options.perm = kLocalReadWrite;
+        ASSERT_TRUE(engine
+                        .registerLocalMemory({source.data(), target.data()},
+                                             {source.size(), target.size()},
+                                             options)
+                        .ok());
+        Request request{};
+        request.source = source.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        request.length = target.size();
+        auto batch = engine.allocateBatch(7);
+        ASSERT_NE(batch, (BatchID)0);
+        request.opcode = Request::WRITE;
+        expectStrictRejection(engine, batch, request, 0);
+        request.policy_name = "tcp_only";
+        expectStrictRejection(engine, batch, request, 1);
+        request.policy_name = "fabric_only";
+        for (auto hint : {UNSPEC, MNNVL}) {
+            for (auto opcode : {Request::READ, Request::WRITE}) {
+                request.transport_hint = hint;
+                request.opcode = opcode;
+                ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
+            }
+        }
+        for (size_t i = 2; i < 6; ++i)
+            EXPECT_EQ(pollUntilDone(engine, batch, i).s, COMPLETED);
+        // An address that can never be registered keeps the out-of-range
+        // rejection independent of how the heap places the two buffers.
+        request.target_offset = 1;
+        expectStrictRejection(engine, batch, request, 6);
+        EXPECT_EQ(fabric->submit_calls.load(), 4);
+        EXPECT_EQ(tcp->submit_calls.load(), 0);
+        EXPECT_TRUE(engine.freeBatch(batch).ok());
+        EXPECT_TRUE(engine
+                        .unregisterLocalMemory({source.data(), target.data()},
+                                               {source.size(), target.size()})
+                        .ok());
+    }
+}
+
+TEST(MnnvlRuntimeTest, StrictHonorsPolicyExclusionInBothSelectors) {
+    for (bool legacy : {false, true}) {
+        auto config = makeMinimalP2PConfig();
+        config->set("use_legacy_transport_selection", legacy);
+        config->set("policy", json::array({{{"name", "tcp_only"},
+                                            {"segment_type", "memory"},
+                                            {"transports", {"tcp"}}},
+                                           {{"name", "fabric_only"},
+                                            {"segment_type", "memory"},
+                                            {"transports", {"mnnvl"}}}}));
+        TransferEngineImpl engine(config);
+        ASSERT_TRUE(engine.available());
+        TransferEngineImplTestPeer::setMnnvlOptions(engine, true);
+        auto fabric = std::make_shared<FakeMnnvlTransport>();
+        auto tcp = std::make_shared<FakeTransport>(TCP);
+        engine.swapTransportForTest(MNNVL, fabric);
+        engine.swapTransportForTest(TCP, tcp);
+        std::vector<uint8_t> buffer(4096);
+        ASSERT_TRUE(
+            engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+        Request request{};
+        request.source = buffer.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+        request.length = buffer.size();
+        request.transport_hint = MNNVL;
+        auto batch = engine.allocateBatch(3);
+        ASSERT_NE(batch, (BatchID)0);
+        expectStrictRejection(engine, batch, request, 0);
+        request.policy_name = "tcp_only";
+        expectStrictRejection(engine, batch, request, 1);
+        request.policy_name = "fabric_only";
+        ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
+        EXPECT_EQ(pollUntilDone(engine, batch, 2).s, COMPLETED);
+        EXPECT_EQ(fabric->submit_calls.load(), 1);
+        EXPECT_EQ(tcp->submit_calls.load(), 0);
+        EXPECT_TRUE(engine.freeBatch(batch).ok());
+        EXPECT_TRUE(
+            engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    }
+}
+
+TEST(MnnvlRuntimeTest, StrictRejectsWriteToReadOnlyExport) {
+    TransferEngineImpl engine(makeMinimalP2PConfig());
+    ASSERT_TRUE(engine.available());
+    TransferEngineImplTestPeer::setMnnvlOptions(engine, true);
+    auto fabric = std::make_shared<FakeMnnvlTransport>();
+    engine.swapTransportForTest(MNNVL, fabric);
+    std::vector<uint8_t> buffer(4096);
+    ASSERT_TRUE(
+        engine
+            .registerLocalMemory(buffer.data(), buffer.size(), kGlobalReadOnly)
+            .ok());
+    Request request{};
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+    request.opcode = Request::WRITE;
+    auto batch = engine.allocateBatch(2);
+    ASSERT_NE(batch, (BatchID)0);
+    expectStrictRejection(engine, batch, request, 0);
+    request.opcode = Request::READ;
+    ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
+    EXPECT_EQ(pollUntilDone(engine, batch, 1).s, COMPLETED);
+    EXPECT_EQ(fabric->submit_calls.load(), 1);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(MnnvlRuntimeTest, StrictWithoutEgmPreservesOrdinaryHostRoutes) {
+    TransferEngineImpl engine(makeMinimalP2PConfig());
+    ASSERT_TRUE(engine.available());
+    TransferEngineImplTestPeer::setMnnvlOptions(engine, true, false);
+    auto tcp = std::make_shared<FakeTransport>(TCP);
+    engine.swapTransportForTest(TCP, tcp);
+    std::vector<uint8_t> buffer(4096);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    Request request{};
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+    request.transport_hint = TCP;
+    auto batch = engine.allocateBatch(1);
+    ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
+    EXPECT_EQ(pollUntilDone(engine, batch, 0).s, COMPLETED);
+    EXPECT_EQ(tcp->submit_calls.load(), 1);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(MnnvlRuntimeTest, GpuWaitRejectsStartupAndRuntimeQueueEnablement) {
+    auto config = makeMinimalP2PConfig();
+    config->set("transports/mnnvl/sync_mode", "gpu_wait");
+    {
+        TransferEngineImpl engine(config);
+        ASSERT_TRUE(engine.available());
+        Config update;
+        update.set("enable_runtime_queue", true);
+        auto snapshot = buildTentConfigBundle(update, 1).runtime;
+        ASSERT_NE(snapshot->config, nullptr);
+        // enable_runtime_queue is bootstrap-only, so a runtime generation
+        // cannot carry it: deferred dispatch stays disabled for the whole life
+        // of a gpu_wait engine, and publishing the update is a no-op for it.
+        EXPECT_FALSE(snapshot->config->contains("enable_runtime_queue"));
+        EXPECT_TRUE(engine.publishRuntimeConfigForTest(snapshot).ok());
+    }
+    config->set("enable_runtime_queue", true);
+    TransferEngineImpl invalid(config);
+    EXPECT_FALSE(invalid.available());
+}
+
+#ifndef USE_CUDA
+TEST(MnnvlRuntimeTest, StrictInitializationRequiresCuda) {
+    auto config = makeMinimalP2PConfig();
+    config->set("transports/mnnvl/enable", true);
+    config->set("transports/mnnvl/require_fabric", true);
+    TransferEngineImpl engine(config);
+    EXPECT_FALSE(engine.available());
+}
+#endif
 
 }  // namespace
 }  // namespace tent

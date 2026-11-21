@@ -25,7 +25,11 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <iterator>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <thread>
 #include <unordered_map>
@@ -36,6 +40,8 @@
 #include "buffer_range_index.h"
 #include "common.h"
 #include "config.h"
+#include "cuda_alike.h"
+#include "hip_device_guard.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
@@ -43,7 +49,27 @@
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+#include "transport/hylink_transport/hylink_transport.h"
+#endif
+
 namespace mooncake {
+
+namespace {
+
+// Mirrors the ownership test the submit path already uses (see the
+// buffer.protocol checks below): descs published by this transport, plus
+// legacy descs with no protocol field. Without this, RDMA's removal can
+// erase a same-address desc belonging to HIP/nvlink, which now filter.
+bool isOwnRdmaDesc(const TransferMetadata::BufferDesc &desc) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    return desc.protocol.empty() || desc.protocol == "rdma";
+#else
+    return desc.shm_name.empty();
+#endif
+}
+
+}  // namespace
 
 static bool MCIbRelaxedOrderingEnabled = false;
 static int MCIbRelaxedOrderingMode = 2;
@@ -57,6 +83,22 @@ static std::string resolveBufferLocation(
                                            offset - buffer.addr);
     }
     return location;
+}
+
+int RdmaTransport::selectDestinationNic(SegmentDesc *peer, uint64_t offset,
+                                        size_t length, std::string_view &nic,
+                                        int &buffer_id, int &device_id,
+                                        int hint_buffer_id,
+                                        int hint_device_id) {
+    nic = {};
+    const int rc = selectDevice(peer, offset, length, buffer_id, device_id, 0,
+                                hint_buffer_id, hint_device_id);
+    if (rc) return rc;
+    const auto &hcas = peer->topology.getHcaList();
+    if (peer->buffers[buffer_id].name.starts_with(GPU_PREFIX) &&
+        static_cast<size_t>(device_id) < hcas.size())
+        nic = hcas[device_id];
+    return 0;
 }
 
 // The last-hit shortcut and the index lookup both assume the MR covering an
@@ -168,6 +210,88 @@ bool has_ibv_reg_mr_iova2(void) {
     return sym != NULL;
 }
 
+static void deregKfdPinAnchor(ibv_mr *mr) {
+    int ret = ibv_dereg_mr(mr);
+    if (ret)
+        LOG(WARNING) << "Failed to release KFD pin anchor: " << strerror(ret);
+}
+
+#ifdef USE_HIP_DMABUF
+// Whether HIP allocations get a KFD pin anchor. Process-wide: it depends on
+// the amdgpu driver and on whether any NIC takes a peer-memory MR.
+enum KfdPinAnchorState { kKfdPinUnprobed, kKfdPinAnchor, kKfdPinNoAnchor };
+
+static std::atomic<KfdPinAnchorState> &kfdPinAnchorState() {
+    static std::atomic<KfdPinAnchorState> state{
+        globalConfig().hip_kfd_pin_fix == HipKfdPinFix::OFF ? kKfdPinNoAnchor
+        : globalConfig().hip_kfd_pin_fix == HipKfdPinFix::FORCE
+            ? kKfdPinAnchor
+            : kKfdPinUnprobed};
+    return state;
+}
+
+static constexpr size_t kKfdPinProbeBytes = 64ull << 20;
+
+// Pins one page of a private, never-pinned allocation through dma-buf: a fixed
+// driver keeps KFD free VRAM flat, one that charges dma-buf pins twice drops it
+// by the whole allocation. A caller's buffer cannot serve, as it may already
+// be pinned or exceed the free VRAM that hipMemGetInfo clamps at 0. Anything
+// else, e.g. a concurrent allocation, leaves the decision to the next
+// registration.
+static KfdPinAnchorState probeKfdPin(ibv_pd *pd, int device) {
+    HipDeviceGuard guard(device);
+    void *buf = nullptr;
+    if (!guard.set_ok() || hipMalloc(&buf, kKfdPinProbeBytes) != hipSuccess) {
+        (void)hipGetLastError();
+        LOG(WARNING) << "KFD pin probe: cannot allocate its "
+                     << (kKfdPinProbeBytes >> 20) << " MiB on GPU " << device
+                     << "; probing again at the next registration";
+        return kKfdPinUnprobed;
+    }
+    DmabufExport exp;
+    const int64_t size = kKfdPinProbeBytes;
+    int64_t drop = 0;
+    KfdPinAnchorState result = kKfdPinUnprobed;
+    if (RdmaContext::exportDmabuf(buf, kKfdPinProbeBytes, exp) == 0 &&
+        exp.method == DmabufExport::Method::kDmabufReg) {
+        for (int attempt = 0; attempt < 3 && result == kKfdPinUnprobed;
+             ++attempt) {
+            size_t before = 0, after = 0, total = 0;
+            if (hipMemGetInfo(&before, &total) != hipSuccess ||
+                before < kKfdPinProbeBytes)
+                break;
+            ibv_mr *mr = ibv_reg_dmabuf_mr(pd, exp.offset, getpagesize(),
+                                           reinterpret_cast<uintptr_t>(buf),
+                                           exp.fd, IBV_ACCESS_LOCAL_WRITE);
+            if (!mr) break;
+            const bool measured = hipMemGetInfo(&after, &total) == hipSuccess;
+            if (int ret = ibv_dereg_mr(mr)) {
+                LOG(WARNING) << "Failed to deregister KFD pin probe MR: "
+                             << strerror(ret);
+                break;
+            }
+            if (!measured) break;
+            drop = (int64_t)before - (int64_t)after;
+            if (std::llabs(drop) < size / 4)
+                result = kKfdPinNoAnchor;
+            else if (std::llabs(drop - size) < size / 4)
+                result = kKfdPinAnchor;
+        }
+    }
+    RdmaContext::closeDmabufExport(exp);
+    (void)hipFree(buf);
+    LOG(INFO) << "KFD pin probe: a dma-buf pin of a private " << (size >> 20)
+              << " MiB allocation lowered KFD free VRAM by " << drop / (1 << 20)
+              << " MiB; "
+              << (result == kKfdPinAnchor ? "holding one peer-memory pin per "
+                                            "registered allocation"
+                  : result == kKfdPinNoAnchor
+                      ? "the driver counts it once, no anchor needed"
+                      : "inconclusive, probing again at the next registration");
+    return result;
+}
+#endif
+
 RdmaTransport::RdmaTransport() {
     MCIbRelaxedOrderingMode = getIbRelaxedOrderingMode();
     if (MCIbRelaxedOrderingMode == 0) {
@@ -190,6 +314,24 @@ RdmaTransport::RdmaTransport() {
     }
 }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+void RdmaTransport::recordClassicCongestionControlMode(
+    adaptive_congestion_control::Mode mode) {
+    const auto next_mode = static_cast<ClassicCongestionControlMode>(mode);
+    auto current =
+        classic_congestion_control_mode_.load(std::memory_order_acquire);
+    while (current == ClassicCongestionControlMode::kUninitialized) {
+        if (classic_congestion_control_mode_.compare_exchange_weak(
+                current, next_mode, std::memory_order_acq_rel,
+                std::memory_order_acquire))
+            return;
+    }
+    if (current != next_mode)
+        classic_congestion_control_mode_.store(
+            ClassicCongestionControlMode::kConflict, std::memory_order_release);
+}
+#endif
+
 RdmaTransport::~RdmaTransport() {
     notify_running_.store(false, std::memory_order_release);
     if (notify_worker_.joinable()) notify_worker_.join();
@@ -199,6 +341,9 @@ RdmaTransport::~RdmaTransport() {
 #endif
     metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
+    for (auto &[_, anchor] : kfd_pin_anchors_) deregKfdPinAnchor(anchor.mr);
+    kfd_pin_anchors_.clear();
+    kfd_pin_anchor_of_buffer_.clear();
     context_list_.clear();
 }
 
@@ -274,8 +419,9 @@ void RdmaTransport::notifyWorkerThread() {
     }
 }
 
-int RdmaTransport::preTouchMemory(void *addr, size_t length) {
-    if (context_list_.size() == 0) {
+int RdmaTransport::preTouchMemory(void *addr, size_t length,
+                                  size_t context_index) {
+    if (context_index >= context_list_.size()) {
         // At least one context is required for pre-touch.
         return 0;
     }
@@ -309,8 +455,9 @@ int RdmaTransport::preTouchMemory(void *addr, size_t length) {
         }
         void *block_addr = static_cast<char *>(addr) + offset;
         threads.emplace_back([this, thread_i, block_addr, block_size,
-                              &thread_results]() {
-            int ret = context_list_[0]->preTouchMemory(block_addr, block_size);
+                              context_index, &thread_results]() {
+            int ret = context_list_[context_index]->preTouchMemory(block_addr,
+                                                                   block_size);
             thread_results[thread_i] = ret;
         });
         offset += block_size;
@@ -329,6 +476,38 @@ int RdmaTransport::preTouchMemory(void *addr, size_t length) {
     return 0;
 }
 
+bool RdmaTransport::hasPendingDereg(uint64_t addr) {
+    std::lock_guard<std::mutex> lock(pending_cleanup_mutex_);
+    return pending_dereg_.contains(addr);
+}
+
+std::optional<std::vector<uint64_t>> RdmaTransport::lookupPendingRepublish(
+    uint64_t addr) {
+    std::lock_guard<std::mutex> lock(pending_cleanup_mutex_);
+    auto it = pending_republish_.find(addr);
+    if (it == pending_republish_.end()) return std::nullopt;
+    return it->second;
+}
+
+void RdmaTransport::markPendingDereg(uint64_t addr) {
+    std::lock_guard<std::mutex> lock(pending_cleanup_mutex_);
+    pending_republish_.erase(addr);
+    pending_dereg_.insert(addr);
+}
+
+void RdmaTransport::markPendingRepublish(uint64_t addr,
+                                         std::vector<uint64_t> keys) {
+    std::lock_guard<std::mutex> lock(pending_cleanup_mutex_);
+    pending_dereg_.erase(addr);
+    pending_republish_[addr] = std::move(keys);
+}
+
+void RdmaTransport::clearPending(uint64_t addr) {
+    std::lock_guard<std::mutex> lock(pending_cleanup_mutex_);
+    pending_dereg_.erase(addr);
+    pending_republish_.erase(addr);
+}
+
 int RdmaTransport::registerLocalMemory(void *addr, size_t length,
                                        const std::string &name,
                                        bool remote_accessible,
@@ -342,6 +521,22 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                                                bool remote_accessible,
                                                bool update_metadata,
                                                bool force_sequential) {
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+    // When HyLink is installed, device memory registration is delegated
+    // to HyLink, which rejects allocations it cannot export.
+    if (localSegmentHasHylink(metadata_) && isDtkDeviceMemory(addr)) {
+        {
+            std::lock_guard<std::mutex> lock(skipped_hylink_fabric_mutex_);
+            skipped_hylink_fabric_addrs_.insert(
+                reinterpret_cast<uint64_t>(addr));
+        }
+        if (globalConfig().trace) {
+            LOG(INFO) << "RdmaTransport: skipping device memory " << addr
+                      << " (owned by HyLink)";
+        }
+        return 0;
+    }
+#endif
     int access_rights = IBV_ACCESS_LOCAL_WRITE;
     if (remote_accessible)
         access_rights |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
@@ -350,6 +545,44 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     }
 
     std::string resolved_name = name;
+
+    // The HCAs this buffer is registered on, as indices into context_list_.
+    // By default every HCA. With MC_RDMA_NIC_SELECTION=local, GPU memory is
+    // registered only on the HCAs the topology prefers for its GPU. Skipped
+    // HCAs keep their slots in the published lkey/rkey arrays with zero keys,
+    // which device selection already skips, so a device index still names the
+    // same NIC in context_list_, the segment's devices and every key array.
+    // Host memory (cpu:N, segments:..., or an unresolved "*") keeps every HCA:
+    // a NUMA node's preferred set is not a GPU rail group.
+    std::vector<size_t> registration_nics;
+    bool narrowed = false;
+    if (globalConfig().rdma_nic_selection == NicSelection::LOCAL) {
+        std::string location = name;
+        if (name == kWildcardLocation) {
+            // For device memory this is a pointer-attribute query; it does not
+            // depend on the pages having been touched.
+            const auto entries = getMemoryLocation(addr, length, true);
+            if (!entries.empty()) location = entries[0].location;
+        }
+        if (location.rfind(GPU_PREFIX, 0) == 0) {
+            auto it = local_nic_map_.find(location);
+            if (it == local_nic_map_.end()) {
+                // Fail closed rather than silently registering on every HCA.
+                LOG(ERROR) << "MC_RDMA_NIC_SELECTION=local: no opened "
+                              "topology-preferred HCA for "
+                           << location << " (buffer " << addr
+                           << "); check the topology and device filters, or "
+                              "set MC_RDMA_NIC_SELECTION=all";
+                return ERR_DEVICE_NOT_FOUND;
+            }
+            registration_nics = it->second;
+            narrowed = true;
+        }
+    }
+    if (!narrowed) {
+        registration_nics.resize(context_list_.size());
+        std::iota(registration_nics.begin(), registration_nics.end(), 0);
+    }
 
     // Export a single dma_buf fd for the whole buffer and import it into every
     // NIC's PD during each chunk's registration below (one dma_buf object
@@ -370,6 +603,16 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         DmabufExport &exp;
         ~DmabufCloser() { RdmaContext::closeDmabufExport(exp); }
     } dmabuf_closer{dmabuf_exp};
+
+    // Taken before the first dma-buf pin and dropped after any rollback below.
+    struct KfdPinAnchorGuard {
+        RdmaTransport *transport;
+        void *addr;
+        bool held;
+        ~KfdPinAnchorGuard() {
+            if (held) transport->releaseKfdPinAnchor(addr);
+        }
+    } kfd_pin_anchor{this, addr, acquireKfdPinAnchor(addr, dmabuf_exp)};
 
     // Mooncake#2017: ibv_reg_mr silently truncates a registration to the device
     // max_mr_size, but the metadata would still advertise the full BufferDesc
@@ -437,69 +680,232 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         alignment = getpagesize();
     }
 #endif
-    std::vector<std::pair<void *, size_t>> chunks;
-    if (chunk_limit > 0) {
-        size_t offset = 0;
-        do {
-            auto *chunk_addr = static_cast<char *>(addr) + offset;
-            const size_t prefix = (uintptr_t)chunk_addr % alignment;
-            if (prefix >= chunk_limit) {
-                LOG(ERROR)
-                    << "Data Direct alignment prefix exceeds max_mr_size";
-                return ERR_INVALID_ARGUMENT;
+    // HugeTLB host memory: ibv_fork_init() makes ibv_reg_mr() run
+    // MADV_DONTFORK over the range it is handed, and the kernel refuses to
+    // split a hugetlb VMA at a boundary inside a huge page, so a view of a
+    // larger hugepage-backed mapping fails with EINVAL before reaching the
+    // HCA. Such a view is retried widened to the enclosing huge pages — but
+    // only after that EINVAL, so two disjoint views of one huge page still
+    // register wherever ibv_reg_mr does not madvise (e.g.
+    // RDMAV_HUGEPAGES_SAFE=1); probing the environment is not a reliable
+    // discriminator, the EINVAL is. The widened MR stays inside the mapping
+    // (an out-of-bounds request can widen past it; it was never bounds-checked
+    // either), but its keys cover whole huge pages — for the padding this
+    // exposes see the caller contract on TransferEngine::registerLocalMemory.
+    //
+    // Host memory only: a dma_buf export carries its own offset and size, and
+    // device mappings report the base page size anyway. Zero-length requests
+    // are left alone as well: widening them would turn a request that has
+    // always been rejected into a successful whole-page registration.
+    const bool hugetlb_backed =
+        dmabuf_exp.method == DmabufExport::Method::kHostReg &&
+        buffer_page_size > base_page_size;
+    const bool needs_widening =
+        hugetlb_backed && length > 0 &&
+        ((reinterpret_cast<uintptr_t>(addr) % buffer_page_size) != 0 ||
+         ((reinterpret_cast<uintptr_t>(addr) + length) % buffer_page_size) !=
+             0);
+
+    // A failed attempt is mapped back into the caller's error space; the
+    // EINVAL sentinel only steers the retry below.
+    auto toCallerError = [](int err) {
+        return err == ERR_CONTEXT_EINVAL ? ERR_CONTEXT : err;
+    };
+
+    // The range one registration attempt covers. mr_base/mr_len are what is
+    // handed to ibv_reg_mr (the caller's own range for the narrow attempt, the
+    // enclosing huge pages for the widened one); chunks splits it at the device
+    // max_mr_size.
+    struct RegisteredPlan {
+        void *mr_base = nullptr;
+        size_t mr_len = 0;
+        bool widened = false;
+        std::vector<std::pair<void *, size_t>> chunks;
+    };
+
+    auto buildPlan = [&](void *base, size_t len, bool widened,
+                         RegisteredPlan &plan) -> int {
+        plan.mr_base = base;
+        plan.mr_len = len;
+        plan.widened = widened;
+        plan.chunks.clear();
+        if (chunk_limit > 0) {
+            size_t offset = 0;
+            do {
+                auto *chunk_addr = static_cast<char *>(base) + offset;
+                const size_t prefix = (uintptr_t)chunk_addr % alignment;
+                if (prefix >= chunk_limit) {
+                    LOG(ERROR)
+                        << "Data Direct alignment prefix exceeds max_mr_size";
+                    return ERR_INVALID_ARGUMENT;
+                }
+                size_t chunk_len = std::min(chunk_limit - prefix, len - offset);
+                plan.chunks.emplace_back(chunk_addr, chunk_len);
+                offset += chunk_len;
+            } while (offset < len);
+            if (plan.chunks.size() > 1) {
+                LOG(WARNING) << "Auto-splitting buffer " << base << " (" << len
+                             << " bytes) into " << plan.chunks.size()
+                             << " chunks of <= " << chunk_limit
+                             << " bytes each (device max_mr_size; "
+                                "Mooncake#2017)";
             }
-            size_t chunk_len = std::min(chunk_limit - prefix, length - offset);
-            chunks.emplace_back(chunk_addr, chunk_len);
-            offset += chunk_len;
-        } while (offset < length);
-        if (chunks.size() > 1) {
-            LOG(WARNING) << "Auto-splitting buffer " << addr << " (" << length
-                         << " bytes) into " << chunks.size()
-                         << " chunks of <= " << chunk_limit
-                         << " bytes each (device max_mr_size; Mooncake#2017)";
+        } else {
+            plan.chunks.emplace_back(base, len);
         }
-    } else {
-        chunks.emplace_back(addr, length);
-    }
+        return 0;
+    };
+
+    // RdmaContext keys its MR map by base address and overwrites on a
+    // duplicate, so a view aiming at an already-registered huge page would
+    // silently drop the live MR. Every hugetlb registration therefore claims
+    // the range it actually attempts — not just a widened one, and not the
+    // widened range up front: claiming early would refuse the disjoint views
+    // narrow-first exists to preserve. Claim, both attempts and release run
+    // under one lock, because a batch registers buffers concurrently and two
+    // views of one huge page would otherwise both pass the check.
+    std::unique_lock<std::mutex> registry_lock(hugetlb_registry_mutex_,
+                                               std::defer_lock);
+    if (hugetlb_backed) registry_lock.lock();
+
+    auto overlapsLocked = [&](const RegisteredPlan &plan) {
+        for (auto &chunk : plan.chunks) {
+            const uint64_t begin = (uint64_t)chunk.first;
+            const size_t len = chunk.second;
+            auto next = hugetlb_registered_regions_.upper_bound(begin);
+            bool overlaps = next != hugetlb_registered_regions_.end() &&
+                            next->first < begin + len;
+            if (!overlaps && next != hugetlb_registered_regions_.begin()) {
+                auto prev = std::prev(next);
+                overlaps = prev->first + prev->second > begin;
+            }
+            if (overlaps) return true;
+        }
+        return false;
+    };
+
+    // Bases whose MR survived a failed rollback: the claim has to stay for
+    // those, because a live MR still owns its base and handing it back would
+    // let the next registration overwrite it in RdmaContext's map. It must NOT
+    // stay for the other bases of the same registration — dropping all of them
+    // because one chunk failed would strand the huge pages that did roll back.
+    std::set<uint64_t> retained_bases;
+    // Bases claimed by the attempt currently running or last succeeded.
+    std::vector<uint64_t> claimed_bases;
+
+    auto claimLocked = [&](const RegisteredPlan &plan) {
+        for (auto &chunk : plan.chunks) {
+            hugetlb_registered_regions_[(uint64_t)chunk.first] = chunk.second;
+            claimed_bases.push_back((uint64_t)chunk.first);
+        }
+    };
+
+    // Releases the claims of a failed or rolled-back attempt. A claim this
+    // cannot release — its MR survived the rollback and is still live — would
+    // otherwise be permanent: with no metadata entry, no chunk_map_ entry and
+    // no alias, a later unregisterLocalMemory() cannot find that MR and every
+    // registration of those huge pages is refused for the rest of the process.
+    // recordOrphanBookkeepingLocked below publishes the bookkeeping a
+    // successful registration would have published, so the cleanup stays
+    // reachable from the caller's address.
+    auto releaseClaimsLocked = [&](size_t chunk_count) {
+        // A chunked registration that could not roll back completely stays
+        // claimed as a whole. Its chunk_map_ entry is published below and names
+        // every chunk, and the chunked unregister path deregisters whatever
+        // that entry names without an ownership check, so the chunks that did
+        // roll back have to keep their claim: releasing them would let a later
+        // registration take those bases, which the cleanup would then tear down
+        // as if they were its own. Retrying the registration is blocked by the
+        // chunk that failed either way, since a retry covers the whole range.
+        const bool retain_all = !retained_bases.empty() && chunk_count > 1;
+        for (uint64_t base : claimed_bases)
+            if (!retain_all && !retained_bases.contains(base))
+                hugetlb_registered_regions_.erase(base);
+        claimed_bases.clear();
+    };
+
+    // Makes a surviving MR of a failed attempt reachable for a later
+    // unregisterLocalMemory(), which only knows the caller's address.
+    auto recordOrphanBookkeepingLocked = [&](const RegisteredPlan &plan) {
+        if (!hugetlb_backed || retained_bases.empty()) return;
+        if (plan.chunks.size() > 1) {
+            // A chunked buffer is re-enumerated through chunk_map_, which
+            // unregister consults before any bookkeeping keyed by address.
+            std::vector<uint64_t> chunk_addrs;
+            chunk_addrs.reserve(plan.chunks.size());
+            for (auto &chunk : plan.chunks)
+                chunk_addrs.push_back((uint64_t)chunk.first);
+            {
+                std::lock_guard<std::mutex> lock(chunk_map_mutex_);
+                chunk_map_[(uint64_t)addr] = std::move(chunk_addrs);
+            }
+            // Supersede any metadata-only record an earlier failed unregister
+            // left at this address. The surviving MRs still need the chunked
+            // MR cleanup; leaving a pending_republish_ entry in place would
+            // make the next unregister take that branch, skip the MR lookup
+            // and report success, stranding the MRs and their claims.
+            markPendingDereg((uint64_t)addr);
+            return;
+        }
+        // The single-buffer path deregisters by the caller's address, which
+        // only resolves to the widened MR through the alias.
+        if (plan.widened) {
+            hugepage_widen_aliases_[(uint64_t)addr] = (uint64_t)plan.mr_base;
+        }
+        markPendingDereg((uint64_t)addr);
+    };
 
     // Best-effort unregister of ONE chunk's MRs across all contexts. Used to
     // clean up a chunk whose registration failed part-way (some contexts
     // succeeded, one failed) BEFORE its metadata was committed — that chunk is
-    // not a "committed" chunk, so rollbackChunks() below must not touch its
+    // not a "committed" chunk, so rollbackPlan() below must not touch its
     // (never-added) metadata, but its partial MRs still need releasing.
     auto unregisterChunkMRs = [&](void *chunk_addr) {
-        for (auto &context : context_list_) {
-            int ret = context->unregisterMemoryRegion(chunk_addr);
-            if (ret)
+        for (size_t i : registration_nics) {
+            int ret = context_list_[i]->unregisterMemoryRegion(chunk_addr);
+            if (ret) {
                 LOG(WARNING) << "Rollback: failed to unregister chunk MR at "
                              << chunk_addr << " (ret=" << ret << ")";
+                retained_bases.insert((uint64_t)chunk_addr);
+            }
         }
+    };
+
+    // The metadata entry of a widened single-chunk registration sits at the
+    // caller's address, not at the MR base (see buffer_desc.addr below); every
+    // other registration keys its entries by chunk address. Rollback has to
+    // remove by the key the entry was added under.
+    auto metadataKeyForChunk = [&](const RegisteredPlan &plan,
+                                   size_t ci) -> void * {
+        return (plan.widened && plan.chunks.size() == 1)
+                   ? addr
+                   : plan.chunks[ci].first;
     };
 
     // Best-effort rollback of the first `committed` FULLY-committed chunks
     // (metadata added to the local segment desc AND MRs registered), i.e.
-    // chunks [0, committed). Pass the count of chunks whose
-    // addLocalMemoryBuffer has succeeded — `committed == 0` is a no-op (nothing
-    // to undo). Metadata is removed WITHOUT a per-chunk publish; one
-    // updateLocalSegmentDesc() at the end republishes the cleaned desc.
-    auto rollbackChunks = [&](size_t committed) {
-        size_t n = std::min(committed, chunks.size());
+    // chunks [0, committed). `committed == 0` is a no-op. Metadata is removed
+    // WITHOUT a per-chunk publish. Nothing added by a failed attempt was ever
+    // published — the single publish happens after a successful attempt,
+    // outside the registry lock — so there is nothing to republish here either.
+    auto rollbackPlan = [&](const RegisteredPlan &plan, size_t committed) {
+        size_t n = std::min(committed, plan.chunks.size());
         for (size_t ri = 0; ri < n; ++ri) {
+            void *metadata_key = metadataKeyForChunk(plan, ri);
             int rc = metadata_->removeLocalMemoryBuffer(
-                chunks[ri].first, /*update_metadata=*/false);
+                metadata_key, isOwnRdmaDesc, /*update_metadata=*/false);
             if (rc)
                 LOG(WARNING) << "Rollback: failed to remove metadata for chunk "
                                 "at "
-                             << chunks[ri].first << " (ret=" << rc << ")";
-            unregisterChunkMRs(chunks[ri].first);
+                             << metadata_key << " (ret=" << rc << ")";
+            unregisterChunkMRs(plan.chunks[ri].first);
         }
-        if (n > 0 && update_metadata) metadata_->updateLocalSegmentDesc();
     };
 
     // Pre-touch decision is loop-invariant: it depends only on context_list_,
     // hardware_concurrency(), and the ORIGINAL buffer length (never chunk_len,
     // which is capped at max_mr_size and would silently disable pre-touch for a
-    // >=4GiB buffer). Compute once above the loop to avoid repeated
+    // >=4GiB buffer). Compute once above the attempts to avoid repeated
     // hardware_concurrency() OS queries per chunk.
     //
     // Pre-touch faults host pages in before the real registration. It gains
@@ -511,165 +917,392 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
         length >= (size_t)4 * 1024 * 1024 * 1024;
 
-    for (size_t ci = 0; ci < chunks.size(); ++ci) {
-        void *chunk_addr = chunks[ci].first;
-        size_t chunk_len = chunks[ci].second;
-        const uint64_t chunk_offset = reinterpret_cast<uintptr_t>(chunk_addr) -
-                                      reinterpret_cast<uintptr_t>(addr);
-        DmabufExport chunk_dmabuf_exp = dmabuf_exp;
-        if (chunk_dmabuf_exp.method == DmabufExport::Method::kDmabufReg)
-            chunk_dmabuf_exp.offset += chunk_offset;
+    auto runChunks = [&](const RegisteredPlan &plan, int &err) {
+        err = 0;
+        auto &chunks = plan.chunks;
+        for (size_t ci = 0; ci < chunks.size(); ++ci) {
+            void *chunk_addr = chunks[ci].first;
+            size_t chunk_len = chunks[ci].second;
+            // Relative to the registration base, not the caller's address: a
+            // widened registration starts before it.
+            const uint64_t chunk_offset =
+                reinterpret_cast<uintptr_t>(chunk_addr) -
+                reinterpret_cast<uintptr_t>(plan.mr_base);
+            DmabufExport chunk_dmabuf_exp = dmabuf_exp;
+            if (chunk_dmabuf_exp.method == DmabufExport::Method::kDmabufReg)
+                chunk_dmabuf_exp.offset += chunk_offset;
 
-        if (do_pre_touch) {
-            // Parallel pre-touch the memory to speed up registration.
-            int ret = preTouchMemory(chunk_addr, chunk_len);
-            if (ret != 0) {
-                // pre-touch is before MR registration for chunk ci, so ci has
-                // no MR/metadata yet: roll back only committed chunks [0, ci).
-                rollbackChunks(ci);
-                return ret;
-            }
-        }
-
-        /* Parallel register when:
-        1. parallel_reg_mr is enabled via MC_ENABLE_PARALLEL_REG_MR;
-        2. parallel_reg_mr not set, multiple contexts exist, memory pre-touched.
-        force_sequential is used by batch operations to avoid nested
-        parallelism.
-        */
-        int use_parallel_reg = 0;
-        if (!force_sequential) {
-            use_parallel_reg = globalConfig().parallel_reg_mr;
-            if (use_parallel_reg == -1) {
-                use_parallel_reg = context_list_.size() > 1 && do_pre_touch;
-            }
-        }
-
-        auto reg_start = std::chrono::steady_clock::now();
-
-        if (use_parallel_reg) {
-            std::vector<std::thread> reg_threads;
-            reg_threads.reserve(context_list_.size());
-            std::vector<int> ret_codes(context_list_.size(), 0);
-            const int ar = access_rights;  // Local copy for lambda capture
-
-            for (size_t i = 0; i < context_list_.size(); ++i) {
-                reg_threads.emplace_back([this, &ret_codes, chunk_dmabuf_exp, i,
-                                          chunk_addr, chunk_len, ar]() {
-                    ret_codes[i] = context_list_[i]->registerMemoryRegion(
-                        chunk_addr, chunk_len, ar, chunk_dmabuf_exp);
-                });
-            }
-
-            for (auto &thread : reg_threads) thread.join();
-
-            for (size_t i = 0; i < ret_codes.size(); ++i) {
-                if (ret_codes[i] != 0) {
-                    LOG(ERROR) << "Failed to register memory region (chunk "
-                               << ci << ") with context " << i;
-                    // chunk ci's MRs are partially registered but its metadata
-                    // was never added; release ci's MRs, then roll back the
-                    // committed chunks [0, ci).
-                    unregisterChunkMRs(chunk_addr);
-                    rollbackChunks(ci);
-                    return ret_codes[i];
+            if (do_pre_touch) {
+                // Parallel pre-touch the memory to speed up registration.
+                int ret = preTouchMemory(chunk_addr, chunk_len,
+                                         registration_nics.front());
+                if (ret != 0) {
+                    // pre-touch is before MR registration for chunk ci, so ci
+                    // has no MR/metadata yet: roll back only committed chunks
+                    // [0, ci).
+                    rollbackPlan(plan, ci);
+                    err = ret;
+                    return;
                 }
             }
-        } else {
-            for (size_t i = 0; i < context_list_.size(); ++i) {
-                int ret = context_list_[i]->registerMemoryRegion(
-                    chunk_addr, chunk_len, access_rights, chunk_dmabuf_exp);
-                if (ret) {
-                    LOG(ERROR) << "Failed to register memory region (chunk "
-                               << ci << ") with context " << i;
-                    // chunk ci's MRs are partially registered but its metadata
-                    // was never added; release ci's MRs, then roll back [0,
-                    // ci).
-                    unregisterChunkMRs(chunk_addr);
-                    rollbackChunks(ci);
-                    return ret;
+
+            /* Parallel register when:
+            1. parallel_reg_mr is enabled via MC_ENABLE_PARALLEL_REG_MR;
+            2. parallel_reg_mr not set, multiple contexts exist, memory
+            pre-touched. force_sequential is used by batch operations to avoid
+            nested parallelism.
+            */
+            int use_parallel_reg = 0;
+            if (!force_sequential) {
+                use_parallel_reg = globalConfig().parallel_reg_mr;
+                if (use_parallel_reg == -1) {
+                    use_parallel_reg =
+                        registration_nics.size() > 1 && do_pre_touch;
                 }
             }
-        }
 
-        auto reg_end = std::chrono::steady_clock::now();
-        auto reg_duration_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(reg_end -
-                                                                  reg_start)
-                .count();
-        if (globalConfig().trace) {
-            LOG(INFO) << "registerMemoryRegion: chunk " << ci << "/"
-                      << chunks.size() << ", addr=" << chunk_addr
-                      << ", length=" << chunk_len
-                      << ", contexts=" << context_list_.size()
-                      << ", parallel=" << (use_parallel_reg ? "true" : "false")
-                      << ", duration=" << reg_duration_ms << "ms";
-        }
+            auto reg_start = std::chrono::steady_clock::now();
 
-        // Registration faults in untouched host pages. Resolve the original
-        // buffer's first page only after it has been pinned, or NUMA discovery
-        // can retain "*" and select NICs on unrelated NUMA nodes.
-        if (ci == 0 && name == kWildcardLocation) {
-            const auto entries = getMemoryLocation(addr, length, true);
-            resolved_name = entries[0].location;
-        }
+            if (use_parallel_reg) {
+                std::vector<std::thread> reg_threads;
+                reg_threads.reserve(registration_nics.size());
+                std::vector<int> ret_codes(context_list_.size(), 0);
+                const int ar = access_rights;  // Local copy for lambda capture
 
-        // Collect per-context keys for THIS chunk (address-range lookup).
-        BufferDesc buffer_desc;
-        for (auto &context : context_list_) {
-            buffer_desc.lkey.push_back(context->lkey(chunk_addr));
+                for (size_t i : registration_nics) {
+                    reg_threads.emplace_back([this, &ret_codes,
+                                              chunk_dmabuf_exp, i, chunk_addr,
+                                              chunk_len, ar]() {
+                        ret_codes[i] = context_list_[i]->registerMemoryRegion(
+                            chunk_addr, chunk_len, ar, chunk_dmabuf_exp);
+                    });
+                }
+
+                for (auto &thread : reg_threads) thread.join();
+
+                for (size_t i = 0; i < ret_codes.size(); ++i) {
+                    if (ret_codes[i] != 0) {
+                        LOG(ERROR) << "Failed to register memory region (chunk "
+                                   << ci << ") with context " << i;
+                        // chunk ci's MRs are partially registered but its
+                        // metadata was never added; release ci's MRs, then roll
+                        // back the committed chunks [0, ci).
+                        unregisterChunkMRs(chunk_addr);
+                        rollbackPlan(plan, ci);
+                        err = ret_codes[i];
+                        return;
+                    }
+                }
+            } else {
+                for (size_t i : registration_nics) {
+                    int ret = context_list_[i]->registerMemoryRegion(
+                        chunk_addr, chunk_len, access_rights, chunk_dmabuf_exp);
+                    if (ret) {
+                        LOG(ERROR) << "Failed to register memory region (chunk "
+                                   << ci << ") with context " << i;
+                        // chunk ci's MRs are partially registered but its
+                        // metadata was never added; release ci's MRs, then roll
+                        // back [0, ci).
+                        unregisterChunkMRs(chunk_addr);
+                        rollbackPlan(plan, ci);
+                        err = ret;
+                        return;
+                    }
+                }
+            }
+
+            auto reg_end = std::chrono::steady_clock::now();
+            auto reg_duration_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(reg_end -
+                                                                      reg_start)
+                    .count();
+            if (globalConfig().trace) {
+                LOG(INFO) << "registerMemoryRegion: chunk " << ci << "/"
+                          << chunks.size() << ", addr=" << chunk_addr
+                          << ", length=" << chunk_len
+                          << ", contexts=" << registration_nics.size() << "/"
+                          << context_list_.size() << ", parallel="
+                          << (use_parallel_reg ? "true" : "false")
+                          << ", duration=" << reg_duration_ms << "ms";
+            }
+
+            // Registration faults in untouched host pages. Resolve the original
+            // buffer's first page only after it has been pinned, or NUMA
+            // discovery can retain "*" and select NICs on unrelated NUMA nodes.
+            if (ci == 0 && name == kWildcardLocation) {
+                const auto entries = getMemoryLocation(addr, length, true);
+                resolved_name = entries[0].location;
+            }
+
+            // Collect per-context keys for THIS chunk (address-range lookup).
+            // One slot per context; HCAs the chunk was not registered on keep
+            // a zero key (and are not queried, which would log a missing MR).
+            BufferDesc buffer_desc;
+            buffer_desc.lkey.assign(context_list_.size(), 0);
             if (remote_accessible)
-                buffer_desc.rkey.push_back(context->rkey(chunk_addr));
-        }
-        buffer_desc.name = resolved_name;
-        buffer_desc.addr = (uint64_t)chunk_addr;
-        buffer_desc.length = chunk_len;
+                buffer_desc.rkey.assign(context_list_.size(), 0);
+            for (size_t i : registration_nics) {
+                buffer_desc.lkey[i] = context_list_[i]->lkey(chunk_addr);
+                if (remote_accessible)
+                    buffer_desc.rkey[i] = context_list_[i]->rkey(chunk_addr);
+            }
+            // A narrowed HCA can still record a region without an MR (a NIC
+            // that is not Data Direct-paired with the GPU), which could leave
+            // the chunk reachable through no HCA at all.
+            if (narrowed &&
+                std::all_of(
+                    buffer_desc.lkey.begin(), buffer_desc.lkey.end(),
+                    [](BufferDesc::mr_key_t key) { return key == 0; })) {
+                LOG(ERROR) << "MC_RDMA_NIC_SELECTION=local: no "
+                              "topology-preferred HCA of "
+                           << resolved_name << " holds an MR for " << chunk_addr
+                           << "; fix the topology or set "
+                              "MC_RDMA_NIC_SELECTION=all";
+                unregisterChunkMRs(chunk_addr);
+                rollbackPlan(plan, ci);
+                err = ERR_DEVICE_NOT_FOUND;
+                return;
+            }
+            buffer_desc.name = resolved_name;
+            // A widened registration publishes the range the caller asked for,
+            // not the padded one, so peers are told what was registered. The
+            // keys still cover the whole MR, so this boundary is cooperative,
+            // not enforced (see the caller contract on
+            // TransferEngine::registerLocalMemory). Only the single-chunk case
+            // can do this — a chunked buffer is re-enumerated through
+            // chunk_map_ at unregister time, so each chunk's desc has to carry
+            // the address it was added under.
+            const bool publish_requested_range =
+                plan.widened && chunks.size() == 1;
+            buffer_desc.addr =
+                (uint64_t)(publish_requested_range ? (uintptr_t)addr
+                                                   : (uintptr_t)chunk_addr);
+            buffer_desc.length = publish_requested_range ? length : chunk_len;
 #ifdef ENABLE_MULTI_PROTOCOL
-        buffer_desc.protocol = "rdma";
+            buffer_desc.protocol = "rdma";
 #endif
-        // Add to the LOCAL segment desc only (update_metadata=false); a chunked
-        // buffer otherwise publishes to the metadata server once PER CHUNK. We
-        // publish once, below, after every chunk has been added.
-        int rc = metadata_->addLocalMemoryBuffer(buffer_desc,
-                                                 /*update_metadata=*/false);
-        if (rc) {
-            // ci's MRs are registered but its metadata add failed; release ci's
-            // MRs, then roll back the committed chunks [0, ci).
-            unregisterChunkMRs(chunk_addr);
-            rollbackChunks(ci);
-            return rc;
+            // Add to the LOCAL segment desc only (update_metadata=false); a
+            // chunked buffer otherwise publishes to the metadata server once
+            // PER CHUNK. The single publish happens below, after a successful
+            // attempt.
+            int rc = metadata_->addLocalMemoryBuffer(buffer_desc,
+                                                     /*update_metadata=*/false);
+            if (rc) {
+                // ci's MRs are registered but its metadata add failed; release
+                // ci's MRs, then roll back the committed chunks [0, ci).
+                unregisterChunkMRs(chunk_addr);
+                rollbackPlan(plan, ci);
+                err = rc;
+                return;
+            }
         }
+    };
+
+    // Checks, claims and registers one plan; on failure it rolls back the MRs
+    // and releases the claim, leaving `retained_bases` holding whatever could
+    // not be released.
+    auto runAttempt =
+        [&](const RegisteredPlan &plan, int &err) {
+            retained_bases.clear();
+            claimed_bases.clear();
+            if (hugetlb_backed) {
+                if (overlapsLocked(plan)) {
+                    LOG(ERROR)
+                        << "HugeTLB registration at " << addr << " (" << length
+                        << " bytes) overlaps a registration that is already "
+                           "live. A hugepage-backed mapping can be registered "
+                           "only once: register the mapping itself rather "
+                           "than several views of it, or unregister the "
+                           "earlier registration first.";
+                    err = ERR_ADDRESS_OVERLAPPED;
+                    return;
+                }
+                claimLocked(plan);
+            }
+            runChunks(plan, err);
+            if (err == 0) return;
+            if (hugetlb_backed) {
+                releaseClaimsLocked(plan.chunks.size());
+                recordOrphanBookkeepingLocked(plan);
+            }
+        };
+
+    // The caller's own range first. Only a clean EINVAL on HugeTLB memory with
+    // every partial MR rolled back can mean the range cannot be madvised as
+    // given; anything else is reported as-is.
+    RegisteredPlan used;
+    int build_rc = buildPlan(addr, length, /*widened=*/false, used);
+    if (build_rc) {
+        return build_rc;
+    }
+    int first_err = 0;
+    runAttempt(used, first_err);
+    if (first_err != 0) {
+        if (first_err != ERR_CONTEXT_EINVAL || !needs_widening ||
+            !retained_bases.empty()) {
+            if (registry_lock.owns_lock()) registry_lock.unlock();
+            return toCallerError(first_err);
+        }
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(addr);
+        const uintptr_t wide_begin = begin - begin % buffer_page_size;
+        const uintptr_t wide_end = (begin + length + buffer_page_size - 1) /
+                                   buffer_page_size * buffer_page_size;
+        RegisteredPlan wide;
+        int wide_build_rc = buildPlan(reinterpret_cast<void *>(wide_begin),
+                                      wide_end - wide_begin,
+                                      /*widened=*/true, wide);
+        if (wide_build_rc) {
+            if (registry_lock.owns_lock()) registry_lock.unlock();
+            return toCallerError(first_err);
+        }
+        // A widened registration is published under the caller's range and
+        // deregistered through a single alias, which only holds while it stays
+        // one MR. A chunked widened registration would have to publish its
+        // padded chunks (making the padding addressable by peers) and would
+        // not use the chunk_map_-based unregister path built for it. Before
+        // this widening existed such a request simply failed with EINVAL, so
+        // report the first error rather than weaken that guarantee.
+        // Registering the hugepage-aligned mapping itself — which needs no
+        // widening — always works.
+        if (wide.chunks.size() > 1) {
+            LOG(ERROR)
+                << "HugeTLB registration at " << addr << " (" << length
+                << " bytes) widens to " << (void *)wide_begin << " ("
+                << wide.mr_len
+                << " bytes), which exceeds the max_mr_size chunk limit. "
+                   "Register the hugepage-aligned mapping itself instead "
+                   "of a sub-view larger than max_mr_size.";
+            if (registry_lock.owns_lock()) registry_lock.unlock();
+            return toCallerError(first_err);
+        }
+        int wide_err = 0;
+        runAttempt(wide, wide_err);
+        if (wide_err != 0) {
+            if (registry_lock.owns_lock()) registry_lock.unlock();
+            // The widened range is an internal fallback; report the failure of
+            // the range the caller actually asked for.
+            return toCallerError(first_err);
+        }
+        used = std::move(wide);
     }
 
-    // Publish the accumulated per-chunk BufferDescs in a SINGLE metadata update
-    // (a chunked buffer otherwise publishes once per chunk).
+    // Publish the accumulated BufferDescs in a SINGLE metadata update (a
+    // chunked buffer otherwise publishes once per chunk). Done outside the
+    // registry lock so a slow metadata server cannot serialize unrelated
+    // hugepage registrations.
+    if (registry_lock.owns_lock()) registry_lock.unlock();
     if (update_metadata) {
         int rc = metadata_->updateLocalSegmentDesc();
         if (rc) {
-            rollbackChunks(chunks.size());
+            rollbackPlan(used, used.chunks.size());
+            if (hugetlb_backed) {
+                std::lock_guard<std::mutex> lock(hugetlb_registry_mutex_);
+                releaseClaimsLocked(used.chunks.size());
+                recordOrphanBookkeepingLocked(used);
+            }
             return rc;
         }
     }
 
     // Remember chunk start-addresses so unregisterLocalMemory(addr) (which only
     // gets the base addr) can clean up every chunk.
-    if (chunks.size() > 1) {
-        std::lock_guard<std::mutex> lock(chunk_map_mutex_);
+    if (used.chunks.size() > 1) {
         std::vector<uint64_t> chunk_addrs;
-        chunk_addrs.reserve(chunks.size());
-        for (auto &c : chunks) chunk_addrs.push_back((uint64_t)c.first);
+        chunk_addrs.reserve(used.chunks.size());
+        for (auto &chunk : used.chunks)
+            chunk_addrs.push_back((uint64_t)chunk.first);
+        std::lock_guard<std::mutex> lock(chunk_map_mutex_);
         chunk_map_[(uint64_t)addr] = std::move(chunk_addrs);
     }
+
+    // The claims are kept for the live registration; only the alias still has
+    // to be recorded, and only once the MR it points at really exists. A
+    // registration that succeeded over the caller's own range has no alias.
+    if (used.widened) {
+        std::lock_guard<std::mutex> lock(hugetlb_registry_mutex_);
+        hugepage_widen_aliases_[(uint64_t)addr] = (uint64_t)used.mr_base;
+    }
+
+    // A successful registration supersedes any half-finished unregister of an
+    // earlier registration at this address.
+    clearPending((uint64_t)addr);
+    kfd_pin_anchor.held = false;
     return 0;
 }
 
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+void RdmaTransport::clearSkipRegistration(void *addr) {
+    std::lock_guard<std::mutex> lock(skipped_hylink_fabric_mutex_);
+    skipped_hylink_fabric_addrs_.erase(reinterpret_cast<uint64_t>(addr));
+}
+#endif
+
 int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
-    return unregisterLocalMemoryInternal(addr, update_metadata, false);
+    return unregisterLocalMemoryInternal(addr, update_metadata, false, false);
 }
 
 int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
                                                  bool update_metadata,
-                                                 bool force_sequential) {
+                                                 bool force_sequential,
+                                                 bool defer_publish_to_caller) {
+    // Finish a cleanup whose MRs are already gone and whose final publish was
+    // never delivered. This MUST stay first and MUST NOT touch verbs: a
+    // disjoint view of the same range may have registered after our MRs were
+    // released, and RdmaContext::unregisterMemoryRegion() resolves an address
+    // by containing range, so an MR lookup here would deregister that view's
+    // live MR.
+    if (auto keys = lookupPendingRepublish((uint64_t)addr)) {
+        int first_err = 0;
+        std::vector<uint64_t> remaining;
+        for (uint64_t key : *keys) {
+            int rc = metadata_->removeLocalMemoryBuffer(
+                reinterpret_cast<void *>(key), isOwnRdmaDesc,
+                /*update_metadata=*/false);
+            // An earlier attempt may have removed this entry already.
+            if (rc && rc != ERR_ADDRESS_NOT_REGISTERED) {
+                remaining.push_back(key);
+                if (!first_err) first_err = rc;
+            }
+        }
+        if (first_err) {
+            markPendingRepublish((uint64_t)addr, std::move(remaining));
+            return first_err;
+        }
+        if (update_metadata) {
+            int rc = metadata_->updateLocalSegmentDesc();
+            if (rc) {
+                // The publish is still owed; keep whatever a retry must still
+                // remove.
+                markPendingRepublish((uint64_t)addr, std::move(remaining));
+                return rc;
+            }
+            clearPending((uint64_t)addr);
+            return 0;
+        }
+        if (defer_publish_to_caller) {
+            // The batch publishes once for all members and clears this record
+            // when that succeeds.
+            markPendingRepublish((uint64_t)addr, std::move(remaining));
+            return 0;
+        }
+        // The caller explicitly owes no publish, so nothing is left to finish.
+        clearPending((uint64_t)addr);
+        return 0;
+    }
+
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+    {
+        std::lock_guard<std::mutex> lock(skipped_hylink_fabric_mutex_);
+        auto it =
+            skipped_hylink_fabric_addrs_.find(reinterpret_cast<uint64_t>(addr));
+        if (it != skipped_hylink_fabric_addrs_.end()) {
+            // Other transports may still fail. Keep the delegation mark so
+            // retrying the engine-level unregister remains a no-op for RDMA.
+            return 0;
+        }
+    }
+#endif
+
     // Mooncake#2017: if this base buffer was split into chunks at registration,
     // unregister each chunk's MR + metadata entry (unregisterLocalMemory only
     // receives the base addr).
@@ -683,6 +1316,23 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             chunk_addrs = it->second;
         }
     }
+    // A HugeTLB sub-view registration is widened to whole huge pages after its
+    // own range is rejected with EINVAL, so its MR lives at a base the caller
+    // never sees. Deregister through that base; the metadata entry still sits
+    // at the caller's address, which is what removeLocalMemoryBuffer() matches
+    // on. A chunked buffer does not need it — a chunked registration is never
+    // widened, so chunk_map_ already holds its MR bases — but the alias entry
+    // still has to be released below.
+    uint64_t widened_base = 0;
+    bool widened = false;
+    {
+        std::lock_guard<std::mutex> lock(hugetlb_registry_mutex_);
+        auto it = hugepage_widen_aliases_.find((uint64_t)addr);
+        if (it != hugepage_widen_aliases_.end()) {
+            widened = true;
+            widened_base = it->second;
+        }
+    }
     if (!chunk_addrs.empty()) {
         // Unregister EVERY chunk even if one fails; remember the first error
         // and report it at the end. The chunk_map_ entry is erased only on
@@ -692,14 +1342,18 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         // Metadata: remove each chunk from the local desc WITHOUT publishing (a
         // chunked buffer otherwise publishes to the metadata server once per
         // chunk); publish once after all removals, below.
+        std::vector<uint64_t> remaining_keys;
         for (uint64_t ca : chunk_addrs) {
             int rc = metadata_->removeLocalMemoryBuffer(
-                reinterpret_cast<void *>(ca), /*update_metadata=*/false);
+                reinterpret_cast<void *>(ca), isOwnRdmaDesc,
+                /*update_metadata=*/false);
             // ERR_ADDRESS_NOT_REGISTERED means an earlier attempt already
             // removed this chunk's metadata and then failed partway through
             // deregistration: tolerate it so the retry reaches the MR cleanup.
-            if (rc && rc != ERR_ADDRESS_NOT_REGISTERED && !first_err)
-                first_err = rc;
+            if (rc && rc != ERR_ADDRESS_NOT_REGISTERED) {
+                remaining_keys.push_back(ca);
+                if (!first_err) first_err = rc;
+            }
         }
 
         // MRs: unregister across contexts in PARALLEL (one thread per context,
@@ -712,6 +1366,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             if (use_parallel_unreg == -1)
                 use_parallel_unreg = context_list_.size() > 1;
         }
+        int mr_err = 0;
         if (use_parallel_unreg) {
             std::vector<std::thread> threads;
             threads.reserve(context_list_.size());
@@ -727,7 +1382,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             }
             for (auto &t : threads) t.join();
             for (int rc : ret_codes)
-                if (rc && !first_err) first_err = rc;
+                if (rc && !mr_err) mr_err = rc;
         } else {
             for (uint64_t ca : chunk_addrs)
                 for (auto &context : context_list_) {
@@ -736,24 +1391,64 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
                     if (ret) {
                         LOG(ERROR) << "Failed to unregister chunk MR at "
                                    << reinterpret_cast<void *>(ca);
-                        if (!first_err) first_err = ret;
+                        if (!mr_err) mr_err = ret;
                     }
                 }
         }
+        if (!mr_err) releaseKfdPinAnchor(addr);
+        if (!first_err) first_err = mr_err;
 
-        // Single metadata publish covering all removed chunks.
-        if (update_metadata) {
-            int rc = metadata_->updateLocalSegmentDesc();
-            if (rc && !first_err) first_err = rc;
-        }
-        if (!first_err) {
+        // The chunk addresses are the MR bases (a chunked registration is
+        // never widened), so they are what registerLocalMemoryInternal
+        // recorded.
+        // Erasing an absent key is a no-op, which keeps a non-hugetlb buffer's
+        // unregister on the same path.
+        //
+        // Gated on the dereg outcome rather than on first_err: the republish
+        // below can still fail, and returning with every MR gone but the claims
+        // still held would refuse every later view of those huge pages.
+        //
+        // The chunk_map_ entry goes with the claims, not with first_err: an
+        // entry that outlived its claims would name bases a later registration
+        // is free to take, and a retry of this cleanup would then deregister
+        // that registration's live MRs as if they were ours. On a partial dereg
+        // failure both are kept, so a retry redoes the whole cleanup.
+        if (!mr_err) {
+            {
+                std::lock_guard<std::mutex> registry_lock(
+                    hugetlb_registry_mutex_);
+                for (uint64_t ca : chunk_addrs)
+                    hugetlb_registered_regions_.erase(ca);
+                if (widened) hugepage_widen_aliases_.erase((uint64_t)addr);
+            }
             std::lock_guard<std::mutex> lock(chunk_map_mutex_);
             chunk_map_.erase((uint64_t)addr);
         }
-        return first_err;
+
+        // Publish the removals even when a deregistration failed: the local
+        // desc no longer lists these chunks either way, and leaving the
+        // advertisement stale would keep peers targeting MRs that are already
+        // gone on some contexts. The chunk_map_ entry retained above keeps the
+        // whole cleanup retryable; that retry re-runs the per-chunk cleanup
+        // and publishes once it succeeds.
+        int pub_rc = 0;
+        if (update_metadata) pub_rc = metadata_->updateLocalSegmentDesc();
+        if (mr_err) return first_err;
+
+        // Every MR is gone and the chunk_map_ entry with it. From here on this
+        // address must never reach an MR lookup again: a disjoint view may
+        // register while the publish is still owed, and the retry in that case
+        // goes through the metadata-only pending_republish_ branch above.
+        if (!pub_rc && !first_err && !defer_publish_to_caller) {
+            clearPending((uint64_t)addr);
+            return 0;
+        }
+        markPendingRepublish((uint64_t)addr, std::move(remaining_keys));
+        return first_err ? first_err : pub_rc;
     }
 
-    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    int rc = metadata_->removeLocalMemoryBuffer(addr, isOwnRdmaDesc,
+                                                update_metadata);
     // A missing metadata entry does NOT prove the MRs are gone: a partial
     // ibv_dereg_mr failure on an earlier attempt leaves live MRs behind it.
     // But a missing entry also occurs for an address that was never a
@@ -762,15 +1457,16 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
     // deregister another registration's live MR.
     const bool metadata_missing = (rc == ERR_ADDRESS_NOT_REGISTERED);
     if (metadata_missing) {
-        std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
-        if (!pending_dereg_.contains((uint64_t)addr)) {
+        // A widened registration (aliased below) proves a live MR of ours still
+        // sits at the caller's address even when no pending record was seeded,
+        // so finish the cleanup rather than stranding the alias and the MR.
+        if (!hasPendingDereg((uint64_t)addr) && !widened) {
             return ERR_ADDRESS_NOT_REGISTERED;
         }
     } else if (rc) {
         // Local metadata was removed but the publish failed; the MRs stay
         // live. Record the pending cleanup so a retry can still finish it.
-        std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
-        pending_dereg_.insert((uint64_t)addr);
+        markPendingDereg((uint64_t)addr);
         return rc;
     }
 
@@ -783,6 +1479,9 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         }
     }
 
+    // The MR of a widened HugeTLB registration is keyed by its widened base.
+    void *mr_addr = widened ? reinterpret_cast<void *>(widened_base) : addr;
+
     int dereg_err = 0;
     if (use_parallel_unreg) {
         std::vector<std::thread> unreg_threads;
@@ -790,8 +1489,9 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         std::vector<int> ret_codes(context_list_.size(), 0);
 
         for (size_t i = 0; i < context_list_.size(); ++i) {
-            unreg_threads.emplace_back([this, &ret_codes, i, addr]() {
-                ret_codes[i] = context_list_[i]->unregisterMemoryRegion(addr);
+            unreg_threads.emplace_back([this, &ret_codes, i, mr_addr]() {
+                ret_codes[i] =
+                    context_list_[i]->unregisterMemoryRegion(mr_addr);
             });
         }
 
@@ -804,7 +1504,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         }
     } else {
         for (size_t i = 0; i < context_list_.size(); ++i) {
-            int ret = context_list_[i]->unregisterMemoryRegion(addr);
+            int ret = context_list_[i]->unregisterMemoryRegion(mr_addr);
             if (ret && !dereg_err) dereg_err = ret;
         }
     }
@@ -813,30 +1513,115 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         LOG(ERROR) << "Failed to unregister memory region at " << addr;
         // The metadata entry is already gone; only the pending record keeps
         // the MR cleanup reachable from a later retry.
-        if (!metadata_missing) {
-            std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
-            pending_dereg_.insert((uint64_t)addr);
-        }
+        if (!metadata_missing) markPendingDereg((uint64_t)addr);
         return dereg_err;
     }
+    releaseKfdPinAnchor(addr);
 
-    // Confirmed cleanup: report success so the engine erases its region
-    // record and the same range can be registered again.
-    if (metadata_missing) {
-        if (update_metadata) {
-            // The earlier attempt removed the local metadata entry but may
-            // have failed to publish it (that failure is what seeded the
-            // pending record). Republish now so the remote metadata server
-            // drops the stale buffer advertisement. On publish failure the
-            // pending record is kept: a later retry re-runs this path (the
-            // MR cleanup above is then a no-op) and publishes again.
-            int pub_rc = metadata_->updateLocalSegmentDesc();
-            if (pub_rc) return pub_rc;
-        }
-        std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
-        pending_dereg_.erase((uint64_t)addr);
+    {
+        // Every MR is gone at this point, so the registry entries describing
+        // them have to go now — the republish below can still fail and return,
+        // and a stranded entry would refuse every later view of that huge
+        // page. Released before the dereg_err return above on purpose: there
+        // the MR may still be live and a retry has to find the widened base it
+        // must deregister.
+        std::lock_guard<std::mutex> lock(hugetlb_registry_mutex_);
+        hugetlb_registered_regions_.erase((uint64_t)mr_addr);
+        if (widened) hugepage_widen_aliases_.erase((uint64_t)addr);
     }
+
+    // The MRs are confirmed gone and the registry bookkeeping is released.
+    // Whatever remains is metadata-only, finished from pending_republish_ so a
+    // retry can never reach the MR lookup again.
+    if (update_metadata) {
+        if (metadata_missing) {
+            // The earlier attempt removed the local metadata entry but failed
+            // to publish that removal (which is what left this pending). The
+            // MR cleanup above was then a no-op, so the retry reaches here
+            // directly. On publish failure the record is kept.
+            int pub_rc = metadata_->updateLocalSegmentDesc();
+            if (pub_rc) {
+                markPendingRepublish((uint64_t)addr, {(uint64_t)addr});
+                return pub_rc;
+            }
+        }
+        // The entry was removed in this call, and its removal was published by
+        // removeLocalMemoryBuffer; or an earlier removal was published above.
+        clearPending((uint64_t)addr);
+        return 0;
+    }
+    if (defer_publish_to_caller) {
+        // The batch publishes once for all members; it clears this record when
+        // that succeeds.
+        markPendingRepublish((uint64_t)addr, {(uint64_t)addr});
+        return 0;
+    }
+    // The caller explicitly owes no publish, so nothing is left to finish.
+    clearPending((uint64_t)addr);
     return 0;
+}
+
+bool RdmaTransport::acquireKfdPinAnchor(void *addr, const DmabufExport &exp) {
+#ifdef USE_HIP_DMABUF
+    auto &state = kfdPinAnchorState();
+    if (!exp.alloc_base || state.load() == kKfdPinNoAnchor) return false;
+    if (state.load() == kKfdPinUnprobed) {
+        ibv_pd *pd = nullptr;
+        for (auto &context : context_list_)
+            if ((pd = context->pd())) break;
+        if (!pd) return false;
+        // HIP registrations wait here instead of pinning during the probe.
+        static std::mutex probe_mutex;
+        std::lock_guard<std::mutex> lock(probe_mutex);
+        if (state.load() == kKfdPinUnprobed)
+            state.store(probeKfdPin(pd, exp.device));
+        if (state.load() != kKfdPinAnchor) return false;
+    }
+
+    std::lock_guard<std::mutex> lock(kfd_pin_anchor_mutex_);
+    auto base = reinterpret_cast<uintptr_t>(exp.alloc_base);
+    if (!kfd_pin_anchor_of_buffer_
+             .emplace(reinterpret_cast<uintptr_t>(addr), base)
+             .second)
+        return false;
+    auto &anchor = kfd_pin_anchors_[base];
+    if (!anchor.mr) {
+        // The peer-memory client pins the whole allocation for any range.
+        for (auto &context : context_list_) {
+            if (!context->pd()) continue;
+            anchor.mr = ibv_reg_mr(context->pd(), exp.alloc_base, getpagesize(),
+                                   IBV_ACCESS_LOCAL_WRITE);
+            if (anchor.mr) break;
+        }
+        if (!anchor.mr) {
+            const int err = errno;
+            if (state.exchange(kKfdPinNoAnchor) == kKfdPinAnchor)
+                LOG(WARNING)
+                    << "amdgpu peer-memory pin unavailable (" << strerror(err)
+                    << "); KFD will count registered GPU memory "
+                       "twice in its free VRAM";
+            kfd_pin_anchors_.erase(base);
+            kfd_pin_anchor_of_buffer_.erase(reinterpret_cast<uintptr_t>(addr));
+            return false;
+        }
+    }
+    ++anchor.refs;
+    return true;
+#else
+    return false;
+#endif
+}
+
+void RdmaTransport::releaseKfdPinAnchor(void *addr) {
+    std::lock_guard<std::mutex> lock(kfd_pin_anchor_mutex_);
+    auto owner =
+        kfd_pin_anchor_of_buffer_.find(reinterpret_cast<uintptr_t>(addr));
+    if (owner == kfd_pin_anchor_of_buffer_.end()) return;
+    auto anchor = kfd_pin_anchors_.find(owner->second);
+    kfd_pin_anchor_of_buffer_.erase(owner);
+    if (--anchor->second.refs) return;
+    deregKfdPinAnchor(anchor->second.mr);
+    kfd_pin_anchors_.erase(anchor);
 }
 
 int RdmaTransport::allocateLocalSegmentID() {
@@ -948,12 +1733,27 @@ int RdmaTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
     std::atomic<bool> any_cleaned{false};
     std::atomic<bool> any_not_registered{false};
-    // Members whose cleanup completed in this call; their pending records
-    // must be restored if the deferred publish below fails.
+    // Members whose cleanup completed in this call. Each left a
+    // pending_republish_ record behind (empty when all it still owes is this
+    // deferred publish), which is cleared once the collective publish lands.
     std::mutex cleaned_mutex;
     std::vector<void *> cleaned_addrs;
     int first_error = runBoundedRegMrBatch(addr_list.size(), [&](size_t i) {
-        int ret = unregisterLocalMemoryInternal(addr_list[i], false, true);
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+        {
+            std::lock_guard<std::mutex> lock(skipped_hylink_fabric_mutex_);
+            if (skipped_hylink_fabric_addrs_.count(
+                    reinterpret_cast<uint64_t>(addr_list[i]))) {
+                // No RDMA cleanup: exclude this address from cleaned_addrs so
+                // a publish failure cannot seed pending_dereg_ for HyLink.
+                any_cleaned.store(true, std::memory_order_relaxed);
+                return 0;
+            }
+        }
+#endif
+        int ret =
+            unregisterLocalMemoryInternal(addr_list[i], false, true,
+                                          /*defer_publish_to_caller=*/true);
         // NOT_REGISTERED means nothing remains for this member: its metadata
         // entry is gone and no pending MR cleanup is recorded. A batch retry
         // after a partial failure always hits this for the members that
@@ -979,16 +1779,14 @@ int RdmaTransport::unregisterLocalMemoryBatch(
     // entries removed locally, and this best-effort republish keeps the
     // remote advertisement from going stale.
     int metadata_ret = metadata_->updateLocalSegmentDesc();
-    if (metadata_ret) {
-        // The deferred publish failed, but the members cleaned above already
-        // dropped their metadata entries and pending records: a retry would
-        // report NOT_REGISTERED (fatal to the engine) and could never
-        // republish. Re-seed their pending records so the retry re-runs the
-        // MR cleanup as a no-op (the MRs are already gone) and re-attempts
-        // this publish.
-        std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
+    if (!metadata_ret) {
+        // The deferred publish landed. Drop the metadata-only records the
+        // cleaned members left behind; on failure they stay put, so a retry
+        // republishes through the pending_republish_ branch — which never
+        // performs an MR lookup, so a view registered in the meantime is safe.
+        std::lock_guard<std::mutex> lock(cleaned_mutex);
         for (void *addr : cleaned_addrs) {
-            pending_dereg_.insert((uint64_t)addr);
+            clearPending((uint64_t)addr);
         }
     }
     if (first_error) return first_error;
@@ -1028,11 +1826,43 @@ Status RdmaTransport::submitTransfer(
 #endif
         task_list.push_back(&task);
     }
-    return submitTransferTask(task_list);
+    return submitTransferTaskWithSeal(task_list);
+}
+
+Status RdmaTransport::submitTransferTaskWithSeal(
+    const std::vector<TransferTask *> &task_list) {
+    for (auto *task : task_list) Slice::unsealTaskSubmission(task);
+    auto status = submitTransferTask(task_list);
+    for (auto *task : task_list) Slice::sealTaskSubmission(task);
+    return status;
 }
 
 Status RdmaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    const auto congestion_control_mode =
+        classic_congestion_control_mode_.load(std::memory_order_acquire);
+    std::optional<TaskCongestionControllerMode> task_mode;
+    switch (congestion_control_mode) {
+        case ClassicCongestionControlMode::kOff:
+            task_mode = TaskCongestionControllerMode::kOff;
+            break;
+        case ClassicCongestionControlMode::kObserve:
+            task_mode = TaskCongestionControllerMode::kObserve;
+            break;
+        case ClassicCongestionControlMode::kEnforce:
+            task_mode = TaskCongestionControllerMode::kEnforce;
+            break;
+        case ClassicCongestionControlMode::kUninitialized:
+        case ClassicCongestionControlMode::kConflict:
+            break;
+    }
+    if (task_mode) {
+        for (auto *task : task_list) {
+            task->rdma_congestion_control_mode = {true, *task_mode};
+        }
+    }
+#endif
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
         slices_to_post;
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
@@ -1052,6 +1882,15 @@ Status RdmaTransport::submitTransferTask(
     const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark =
         globalConfig().max_wr * globalConfig().num_qp_per_ep;
+    size_t pending_slice_count = 0;
+    auto flush_pending_slices = [&]() {
+        for (auto &entry : slices_to_post) {
+            if (entry.second.empty()) continue;
+            entry.first->submitPostSend(entry.second);
+            entry.second.clear();
+        }
+        pending_slice_count = 0;
+    };
     auto fail_unposted_slices = [&]() {
         for (auto &entry : slices_to_post)
             for (auto *slice : entry.second) slice->markFailed();
@@ -1071,6 +1910,10 @@ Status RdmaTransport::submitTransferTask(
             slice->length = 0;
             slice->task = &task;
             slice->status = Slice::PENDING;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            slice->rdma_congestion_control_slice_ordinal =
+                task.slice_list.size();
+#endif
             task.slice_list.push_back(slice);
             __sync_fetch_and_add(&task.slice_count, 1);
             slice->markFailed();
@@ -1084,19 +1927,20 @@ Status RdmaTransport::submitTransferTask(
         fail_unposted_slices();
         fail_unstarted_tasks(task_index + 1);
     };
-    uint64_t nr_slices;
     size_t task_index = 0, request_index = 0;
     BatchRdmaDeviceCache local_device_cache;
     int last_local_buffer_id = -1;
     int last_local_device_id = -1;
     int last_local_device_buffer_id = -1;
     int last_remote_buffer_id = -1;
+    int last_remote_device_id = -1;
+    int last_remote_device_buffer_id = -1;
     SegmentID last_remote_target_id = static_cast<SegmentID>(-1);
+    const bool prefer_dest_nic = globalConfig().rdma_write_prefer_dest_nic;
     while (task_index < task_list.size()) {
         assert(task_list[task_index]);
         auto &task = *task_list[task_index];
         const size_t current_task_index = task_index;
-        nr_slices = 0;
         assert(task.request);
         auto &request = task.request[request_index++];
         if (request_index == task.request_count) {
@@ -1114,22 +1958,55 @@ Status RdmaTransport::submitTransferTask(
         const auto &target_segment_desc = target_desc_it->second;
         if (request.target_id != last_remote_target_id) {
             last_remote_buffer_id = -1;
+            last_remote_device_id = -1;
+            last_remote_device_buffer_id = -1;
             last_remote_target_id = request.target_id;
         }
+        // MC_RDMA_WRITE_PREFER_DEST_NIC: a WRITE into the peer's GPU memory
+        // starts from the HCA the peer's topology picks for that GPU.
+        const bool write_dest_nic =
+            prefer_dest_nic && request.opcode == TransferRequest::WRITE;
+        auto destination_nic = [&](uint64_t offset, size_t length,
+                                   std::string_view &nic) {
+            int buffer_id = -1, device_id = -1;
+            const int hint_device_id =
+                last_remote_device_buffer_id == last_remote_buffer_id
+                    ? last_remote_device_id
+                    : -1;
+            const int rc = selectDestinationNic(
+                target_segment_desc.get(), offset, length, nic, buffer_id,
+                device_id, last_remote_buffer_id, hint_device_id);
+            if (rc == 0) {
+                last_remote_buffer_id = buffer_id;
+                last_remote_device_id = device_id;
+                last_remote_device_buffer_id = buffer_id;
+            }
+            return rc;
+        };
 
         // Select once per request so all of its slices normally use the same
         // local RNIC. The advisory hint affects initial submission only;
         // submit-level retries keep the existing topology policy.
         auto request_buffer_id = -1, request_device_id = -1;
-        const std::string_view request_hint =
-            request.advise_retry_cnt == 0 ? nic_hint_name(request.nic_hint)
-                                          : std::string_view{};
+        std::string_view request_hint;
+        bool select_per_slice = false;
+        if (request.advise_retry_cnt == 0) {
+            request_hint = nic_hint_name(request.nic_hint);
+            // A destination range that no single remote MR covers may span
+            // two GPUs; its slices end at remote MR boundaries, so each one
+            // selects with its own destination.
+            if (request_hint.empty() && write_dest_nic)
+                select_per_slice =
+                    destination_nic(request.target_offset, request.length,
+                                    request_hint) != 0;
+        }
         const int local_hint_device_id =
             request_hint.empty() &&
                     last_local_device_buffer_id == last_local_buffer_id
                 ? last_local_device_id
                 : -1;
-        if (local_device_cache.select(
+        if (select_per_slice ||
+            local_device_cache.select(
                 local_segment_desc, (uint64_t)request.source, request.length,
                 request_buffer_id, request_device_id, [&] {
                     return selectDevice(
@@ -1142,8 +2019,12 @@ Status RdmaTransport::submitTransferTask(
             request_device_id = -1;
         } else {
             last_local_buffer_id = request_buffer_id;
-            last_local_device_id = request_device_id;
-            last_local_device_buffer_id = request_buffer_id;
+            // A hinted pick follows the hint, not the source buffer, so
+            // unhinted requests must not reuse it.
+            if (request_hint.empty()) {
+                last_local_device_id = request_device_id;
+                last_local_device_buffer_id = request_buffer_id;
+            }
         }
 
         SliceLengthCalculator slice_calc{request,
@@ -1158,10 +2039,6 @@ Status RdmaTransport::submitTransferTask(
 
             Slice *slice = getSliceCache().allocate();
             assert(slice);
-            if (!slice->from_cache) {
-                nr_slices++;
-            }
-
             slice->source_addr = (char *)request.source + offset;
             slice->length = slice_length;
             slice->source_location.clear();
@@ -1173,17 +2050,25 @@ Status RdmaTransport::submitTransferTask(
             slice->target_id = request.target_id;
             slice->status = Slice::PENDING;
             slice->ts = 0;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            slice->rdma_congestion_control_slice_ordinal =
+                task.slice_list.size();
+#endif
             task.slice_list.push_back(slice);
 
             int buffer_id = -1, device_id = -1,
                 retry_cnt = request.advise_retry_cnt;
             bool found_device = false;
+            // Selected but inactive RNICs, named in the error below.
+            std::set<int> inactive_device_ids;
             if (request_buffer_id >= 0 && request_device_id >= 0) {
                 auto &request_context = context_list_[request_device_id];
                 if (request_context && request_context->active()) {
                     found_device = true;
                     buffer_id = request_buffer_id;
                     device_id = request_device_id;
+                } else if (request_context) {
+                    inactive_device_ids.insert(request_device_id);
                 }
             }
             while (retry_cnt < kMaxRetryCount && !found_device) {
@@ -1191,9 +2076,13 @@ Status RdmaTransport::submitTransferTask(
                 // registered-memory boundaries even though each slice is
                 // valid. Honor the hint for the initial per-slice attempt too,
                 // then drop it so retries can fail over to another RNIC.
-                const std::string_view slice_hint =
-                    retry_cnt == 0 ? nic_hint_name(request.nic_hint)
-                                   : std::string_view{};
+                std::string_view slice_hint;
+                if (retry_cnt == 0) {
+                    slice_hint = nic_hint_name(request.nic_hint);
+                    if (slice_hint.empty() && write_dest_nic)
+                        destination_nic(slice->rdma.dest_addr, slice->length,
+                                        slice_hint);
+                }
                 const int slice_hint_device_id =
                     slice_hint.empty() &&
                             last_local_device_buffer_id == last_local_buffer_id
@@ -1208,7 +2097,10 @@ Status RdmaTransport::submitTransferTask(
                        static_cast<size_t>(device_id) < context_list_.size());
                 auto &context = context_list_[device_id];
                 assert(context.get());
-                if (!context->active()) continue;
+                if (!context->active()) {
+                    inactive_device_ids.insert(device_id);
+                    continue;
+                }
                 assert(buffer_id >= 0 &&
                        static_cast<size_t>(buffer_id) <
                            local_segment_desc->buffers.size());
@@ -1216,19 +2108,37 @@ Status RdmaTransport::submitTransferTask(
                        context_list_.size());
                 found_device = true;
                 last_local_buffer_id = buffer_id;
-                last_local_device_id = device_id;
-                last_local_device_buffer_id = buffer_id;
+                if (slice_hint.empty()) {
+                    last_local_device_id = device_id;
+                    last_local_device_buffer_id = buffer_id;
+                }
                 break;
             }
             if (!found_device) {
                 auto source_addr = slice->source_addr;
+                std::string reason;
+                if (inactive_device_ids.empty()) {
+                    reason = "no selectable registered buffer covers " +
+                             std::to_string(slice->length) +
+                             " bytes at this address; registered buffers: " +
+                             std::to_string(local_segment_desc->buffers.size());
+                } else {
+                    reason = "selected RNIC(s) inactive:";
+                    const char *separator = " ";
+                    for (const int device_id : inactive_device_ids) {
+                        reason += separator;
+                        reason += context_list_[device_id]->deviceName();
+                        separator = ", ";
+                    }
+                }
                 fail_task_and_cleanup(task, slice, current_task_index);
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
-                    << source_addr;
+                    << source_addr << " (" << reason << ")";
                 return Status::AddressNotRegistered(
                     "Memory region not registered by any active device(s): " +
-                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
+                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)) +
+                    " (" + reason + ")");
             } else {
                 auto &context = context_list_[device_id];
                 if (!context->active()) {
@@ -1250,19 +2160,16 @@ Status RdmaTransport::submitTransferTask(
                 __sync_fetch_and_add(&task.slice_count, 1);
             }
 
-            if (nr_slices >= kSubmitWatermark) {
-                for (auto &entry : slices_to_post)
-                    entry.first->submitPostSend(entry.second);
-                slices_to_post.clear();
-                nr_slices = 0;
-            }
+            // Flush prepared slices so TE worker post can overlap with slice
+            // preparation
+            if (++pending_slice_count >= kSubmitWatermark)
+                flush_pending_slices();
 
             offset += slice->length;
         }
     }
 
-    for (auto &entry : slices_to_post)
-        if (!entry.second.empty()) entry.first->submitPostSend(entry.second);
+    flush_pending_slices();
     return Status::OK();
 }
 
@@ -1463,6 +2370,27 @@ int RdmaTransport::initializeRdmaResources() {
         LOG(ERROR) << "RdmaTransport: No available RNIC";
         return ERR_DEVICE_NOT_FOUND;
     }
+    if (globalConfig().rdma_nic_selection == NicSelection::LOCAL) {
+        // Index by context_list_ slot. A failed RNIC keeps its placeholder
+        // slot but disableDevice() already removed it from every preferred
+        // list, so it never enters the map.
+        std::vector<std::string> context_names;
+        context_names.reserve(context_list_.size());
+        for (const auto &context : context_list_)
+            context_names.push_back(context->deviceName());
+        local_nic_map_ = buildPreferredNicIndexMap(local_topology_->getMatrix(),
+                                                   context_names);
+        for (const auto &entry : local_nic_map_) {
+            if (entry.first.rfind(GPU_PREFIX, 0) != 0) continue;
+            std::string nic_list;
+            for (size_t i : entry.second) {
+                if (!nic_list.empty()) nic_list += ",";
+                nic_list += context_names[i];
+            }
+            LOG(INFO) << "RdmaTransport: MC_RDMA_NIC_SELECTION=local, "
+                      << entry.first << " registers on [" << nic_list << "]";
+        }
+    }
     return 0;
 }
 
@@ -1491,18 +2419,51 @@ bool isSelectableRdmaBuffer(
     return true;
 }
 
+// Translates a topology HCA index into the segment's device slot, which also
+// indexes every buffer's lkey/rkey arrays. The two agree on the publishing
+// side, where Topology::disableDevice() keeps indices stable. A peer, however,
+// rebuilds the topology from the published matrix, which omits HCAs that
+// failed to open or were disabled at runtime, so its resolve() compacts the
+// indices of the HCAs after them while devices and keys keep one slot per
+// context. Resolving by name keeps a selection on the NIC it names instead of
+// the NIC (and keys) in the shifted slot. Negative error codes pass through.
+int topologyIndexToDeviceId(const RdmaTransport::SegmentDesc *desc,
+                            int topology_id) {
+    if (topology_id < 0 || desc->devices.empty()) return topology_id;
+    const auto &hca_list = desc->topology.getHcaList();
+    const size_t index = static_cast<size_t>(topology_id);
+    if (index >= hca_list.size()) return ERR_DEVICE_NOT_FOUND;
+    const auto &hca = hca_list[index];
+    if (index < desc->devices.size() && desc->devices[index].name == hca)
+        return topology_id;
+    for (size_t i = 0; i < desc->devices.size(); ++i) {
+        if (desc->devices[i].name == hca) return static_cast<int>(i);
+    }
+    return ERR_DEVICE_NOT_FOUND;
+}
+
 int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
                        const TransferMetadata::BufferDesc &buffer,
                        uint64_t offset, std::string_view hint,
                        std::string_view local_hca, int retry_count,
                        bool by_local_hca) {
+    // Drop topology candidates without valid keys for this buffer before the
+    // selection rule applies. An entry that exists but has no such candidate
+    // fails rather than falling back to the wildcard entry, which would leave
+    // the buffer's location or the peer-affinity mapping. Topology indices
+    // are translated to device slots before any key lookup.
+    const std::function<bool(int)> device_filter = [desc, &buffer](int id) {
+        return RdmaTransport::hasValidKeys(desc, buffer,
+                                           topologyIndexToDeviceId(desc, id));
+    };
     if (by_local_hca) {
         const auto location = resolveBufferLocation(buffer, offset);
         int device_id = desc->topology.selectDeviceByLocalHca(
-            location, local_hca, retry_count);
-        if (device_id >= 0) return device_id;
-        return desc->topology.selectDeviceByLocalHca(kWildcardLocation,
-                                                     local_hca, retry_count);
+            location, local_hca, retry_count, device_filter);
+        if (device_id == ERR_DEVICE_NOT_FOUND)
+            device_id = desc->topology.selectDeviceByLocalHca(
+                kWildcardLocation, local_hca, retry_count, device_filter);
+        return topologyIndexToDeviceId(desc, device_id);
     }
 
     std::string location = buffer.name;
@@ -1514,17 +2475,25 @@ int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
     // A named hint is an explicit override: try the buffer location first,
     // then the global HCA set. Do not call the hint-taking selectDevice()
     // overload here because it applies normal selection immediately on a
-    // location miss, making the wildcard attempt unreachable.
+    // location miss, making the wildcard attempt unreachable. A hinted HCA
+    // without valid keys for the buffer is treated like an unknown hint name.
     if (!hint.empty()) {
-        int device_id = desc->topology.getDeviceIndex(location, hint);
-        if (device_id >= 0) return device_id;
-        device_id = desc->topology.getDeviceIndex(kWildcardLocation, hint);
-        if (device_id >= 0) return device_id;
+        int device_id = topologyIndexToDeviceId(
+            desc, desc->topology.getDeviceIndex(location, hint));
+        if (RdmaTransport::hasValidKeys(desc, buffer, device_id))
+            return device_id;
+        device_id = topologyIndexToDeviceId(
+            desc, desc->topology.getDeviceIndex(kWildcardLocation, hint));
+        if (RdmaTransport::hasValidKeys(desc, buffer, device_id))
+            return device_id;
     }
 
-    int device_id = desc->topology.selectDevice(location, retry_count);
-    if (device_id >= 0) return device_id;
-    return desc->topology.selectDevice(kWildcardLocation, retry_count);
+    int device_id =
+        desc->topology.selectDevice(location, retry_count, device_filter);
+    if (device_id == ERR_DEVICE_NOT_FOUND)
+        device_id = desc->topology.selectDevice(kWildcardLocation, retry_count,
+                                                device_filter);
+    return topologyIndexToDeviceId(desc, device_id);
 }
 
 int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
@@ -1552,8 +2521,7 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
             const size_t nkeys =
                 by_local_hca ? buffer.lkey.size() : buffer.rkey.size();
             if (static_cast<size_t>(hint_device_id) < nkeys &&
-                (desc->devices.empty() ||
-                 static_cast<size_t>(hint_device_id) < desc->devices.size())) {
+                RdmaTransport::hasValidKeys(desc, buffer, hint_device_id)) {
                 selected = hint_device_id;
             }
         }
@@ -1581,7 +2549,35 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
     return ERR_ADDRESS_NOT_REGISTERED;
 }
 
+// The device is within the segment and `keys` holds a nonzero key for it.
+bool isKeyedDevice(
+    const RdmaTransport::SegmentDesc *desc,
+    const std::vector<TransferMetadata::BufferDesc::mr_key_t> &keys,
+    int device_id) {
+    if (device_id < 0) return false;
+    const size_t id = static_cast<size_t>(device_id);
+    if (!desc->devices.empty() && id >= desc->devices.size()) return false;
+    return id < keys.size() && keys[id] != 0;
+}
+
 }  // namespace
+
+bool RdmaTransport::hasValidLkey(const SegmentDesc *desc,
+                                 const BufferDesc &buffer, int device_id) {
+    return isKeyedDevice(desc, buffer.lkey, device_id);
+}
+
+bool RdmaTransport::hasValidRkey(const SegmentDesc *desc,
+                                 const BufferDesc &buffer, int device_id) {
+    return isKeyedDevice(desc, buffer.rkey, device_id);
+}
+
+bool RdmaTransport::hasValidKeys(const SegmentDesc *desc,
+                                 const BufferDesc &buffer, int device_id) {
+    if (buffer.lkey.empty() && buffer.rkey.empty()) return false;
+    return (buffer.lkey.empty() || hasValidLkey(desc, buffer, device_id)) &&
+           (buffer.rkey.empty() || hasValidRkey(desc, buffer, device_id));
+}
 
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 size_t length, std::string_view hint,

@@ -83,8 +83,10 @@ impl ExtentStoreLocator {
             ));
         }
         let mut fields = bytes
-            .chunks_exact(std::mem::size_of::<u64>())
-            .map(|field| u64::from_le_bytes(field.try_into().unwrap()));
+            .as_chunks::<{ std::mem::size_of::<u64>() }>()
+            .0
+            .iter()
+            .map(|field| u64::from_le_bytes(*field));
         Ok(Self {
             segment_id: fields.next().unwrap(),
             offset: fields.next().unwrap(),

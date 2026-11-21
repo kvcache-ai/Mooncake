@@ -16,6 +16,7 @@
 #include "error_types.h"
 #include "gpu_runtime.h"
 #include "memory_location.h"
+#include "pg_host_ip_resolve.h"
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
 #include "device_comm/device_collective/device_collective.h"
 #include "device_comm/device_collective/device_collective_workspace.h"
@@ -28,16 +29,26 @@ namespace {
 // A non-zero operation size is required to ensure that the worker creates a
 // task for the barrier.
 constexpr size_t kBarrierDummySize = 1;
+
+PGResult<void> ApplyResolvedHostIp(std::string& host_ip) {
+    auto resolved = MaybeResolveRoutableHostIpFromEnv(host_ip);
+    if (resolved.outcome == HostIpResolveOutcome::FailFast) {
+        return makePGError(PGErrorCode::InvalidArgument,
+                           std::move(resolved.error_message));
+    }
+    host_ip = std::move(resolved.host_ip);
+    return {};
+}
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
 constexpr size_t kDefaultDeviceCollectiveBufferSize =
     32ull * 1024 * 1024;  // 32 MiB
-constexpr size_t kDefaultDeviceCollectiveControlReserve =
-    8ull * 1024 * 1024;  // 8 MiB
+constexpr size_t kDefaultCommunicatorResourceReserve =
+    64ull * 1024 * 1024;  // 64 MiB
 
 // Only remotely published resources occupy the eager peer-accessible region.
 // DTS allocates the local staging region lazily if a selected route needs one.
 constexpr size_t kDefaultPeerAccessibleCapacity =
-    kDefaultDeviceCollectiveBufferSize + kDefaultDeviceCollectiveControlReserve;
+    kDefaultDeviceCollectiveBufferSize + kDefaultCommunicatorResourceReserve;
 constexpr size_t kDefaultLocalStagingCapacity =
     kDefaultDeviceCollectiveBufferSize;
 
@@ -64,6 +75,24 @@ PGResult<DeviceRouteConfig> loadDeviceRouteConfigFromEnvironment() {
     return config;
 }
 #endif
+
+PGResult<std::optional<DeviceAllReduceAlgorithm>>
+loadCollectiveAlgorithmFromEnvironment() {
+    const char* raw_value = std::getenv("MOONCAKE_PG_COLLECTIVE_ALGORITHM");
+    if (!raw_value || std::string_view(raw_value) == "auto") {
+        return std::optional<DeviceAllReduceAlgorithm>{};
+    }
+    const std::string_view value(raw_value);
+    if (value == "ring") {
+        return std::optional{DeviceAllReduceAlgorithm::Ring};
+    }
+    if (value == "oneshot") {
+        return std::optional{DeviceAllReduceAlgorithm::OneShot};
+    }
+    return makePGError(PGErrorCode::InvalidArgument,
+                       "MOONCAKE_PG_COLLECTIVE_ALGORITHM must be 'auto', "
+                       "'ring', or 'oneshot'");
+}
 
 void copyDeviceToDevice(void* dst, const void* src, size_t bytes,
                         cudaStream_t stream) {
@@ -217,6 +246,11 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
         PG_VALIDATE_ARG(std::getenv("MC_MACA_HOST_TRANSPORT") != nullptr,
                         "MACA PG requires MC_MACA_HOST_TRANSPORT=1");
 #endif
+        // P2PHANDSHAKE publishes host_ip:<rpc_port> as the segment name. The
+        // default host_ip is 127.0.0.1, which hangs multi-node jobs that forget
+        // set_host_ip(); resolve a routable address when MASTER_ADDR indicates
+        // multi-node (#4981).
+        PG_TRY(ApplyResolvedHostIp(host_ip));
         PG_TRY_TE(engine->init(P2PHANDSHAKE, host_ip));
         engine_initialized = true;
     }
@@ -231,11 +265,12 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
     // initialized only when CUDA is available. GPU communicator creation
     // checks that these resources exist.
     if (get_device_result == cudaSuccess) {
+        PG_TRY(auto strong_stream, StrongStream::create(device_index));
         auto transfer_service = std::make_unique<DeviceTransferService>();
         PG_TRY(transfer_service->initialize(
             static_cast<GlobalRank>(rank), static_cast<uint32_t>(world_size),
             device_index, *engine, link_manager, kDefaultPeerAccessibleCapacity,
-            kDefaultLocalStagingCapacity, route_config));
+            kDefaultLocalStagingCapacity, *strong_stream, route_config));
 
         PG_TRY(auto workspace,
                DeviceCollectiveWorkspace::create(
@@ -243,15 +278,13 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
                    static_cast<uint32_t>(world_size),
                    kDefaultDeviceCollectiveBufferSize));
 
-        PG_TRY(auto strong_stream, StrongStream::create(device_index));
-
         auto recovery_worker =
             std::make_unique<DeviceCollectiveRecoveryWorker>();
         PG_TRY(recovery_worker->start());
 
+        device_collective_strong_stream = std::move(strong_stream);
         device_transfer_service = std::move(transfer_service);
         device_collective_workspace = std::move(workspace);
-        device_collective_strong_stream = std::move(strong_stream);
         device_collective_recovery_worker = std::move(recovery_worker);
     }
 #endif
@@ -272,8 +305,12 @@ PGResult<std::string> MooncakePGContext::launchCoordinator() {
     PG_VALIDATE_STATE(global_rank == 0,
                       "only global rank 0 may start the coordinator");
     if (!coordinator_host) {
+        // The coordinator publishes one algorithm policy for every rank.
+        PG_TRY(auto all_reduce_algorithm,
+               loadCollectiveAlgorithmFromEnvironment());
         auto candidate = std::make_unique<CoordinatorHost>(
-            host_ip, max_world_size, fault_reconciliation_window_us);
+            host_ip, max_world_size, fault_reconciliation_window_us,
+            all_reduce_algorithm);
         PG_TRY(candidate->start());
         coordinator_host = std::move(candidate);
     }
@@ -441,12 +478,12 @@ PGResult<void> MooncakePGContext::shutdown() {
         device_collective_recovery_worker->shutdown();
         device_collective_recovery_worker.reset();
     }
-    device_collective_strong_stream.reset();
     device_collective_workspace.reset();
     if (device_transfer_service) {
         PG_TRY(device_transfer_service->shutdown());
         device_transfer_service.reset();
     }
+    device_collective_strong_stream.reset();
 #endif
     link_manager.shutdown();
     engine = nullptr;
@@ -584,14 +621,28 @@ PGResult<void> MooncakeCommunicator::initialize(
         PG_TRY_TE(context_.engine->registerLocalMemory(recv_buffer_[index],
                                                        kBufferSize, location));
 
-        // Register CPU synchronization regions.
-        cpu_sync_send_region_[index] = new int32_t[kMaxNumRanks]{};
-        cpu_sync_recv_region_[index] = new int32_t[kMaxNumRanks]{};
+        // Register CPU synchronization regions (see HalfSendSync and
+        // HalfRecvSync). A half receives into two sets of flags, used by its
+        // consecutive runs in turn: a rank clears a run's flags when it
+        // finishes that run, and a faster peer may already have written its
+        // flag for the next run. A GPU communicator's send region is mapped
+        // into the device, which counts this rank's reads there.
+        if (is_cpu_) {
+            cpu_sync_send_region_[index] =
+                new int32_t[sizeof(HalfSendSync) / sizeof(int32_t)]{};
+        } else {
+            PG_TRY_CUDA(cudaHostAlloc(
+                reinterpret_cast<void**>(&cpu_sync_send_region_[index]),
+                sizeof(HalfSendSync), cudaHostAllocMapped));
+            std::memset(cpu_sync_send_region_[index], 0, sizeof(HalfSendSync));
+        }
+        cpu_sync_recv_region_[index] =
+            new int32_t[sizeof(HalfRecvSync) / sizeof(int32_t)]{};
         PG_TRY_TE(context_.engine->registerLocalMemory(
-            cpu_sync_send_region_[index], kMaxNumRanks * sizeof(int32_t),
+            cpu_sync_send_region_[index], sizeof(HalfSendSync),
             kWildcardLocation));
         PG_TRY_TE(context_.engine->registerLocalMemory(
-            cpu_sync_recv_region_[index], kMaxNumRanks * sizeof(int32_t),
+            cpu_sync_recv_region_[index], sizeof(HalfRecvSync),
             kWildcardLocation));
     }
 
@@ -654,6 +705,14 @@ PGResult<void> MooncakeCommunicator::initialize(
         PG_TRY_CUDA(cudaHostGetDevicePointer(&meta_->activeRanksDevice,
                                              meta_->activeRanks, 0));
         std::fill_n(meta_->activeRanks, max_group_size_, false);
+    }
+    meta_->halfReads =
+        reinterpret_cast<HalfSendSync*>(cpu_sync_send_region_[0])->halfReads;
+    if (is_cpu_) {
+        meta_->halfReadsDevice = meta_->halfReads;
+    } else {
+        PG_TRY_CUDA(cudaHostGetDevicePointer(&meta_->halfReadsDevice,
+                                             meta_->halfReads, 0));
     }
 
     // Initial local endpoint info.
@@ -1517,7 +1576,11 @@ PGResult<void> MooncakeCommunicator::shutdown() {
                 cpu_sync_recv_region_[index]);
             context_.engine->unregisterLocalMemory(send_buffer_[index]);
             context_.engine->unregisterLocalMemory(recv_buffer_[index]);
-            delete[] cpu_sync_send_region_[index];
+            if (is_cpu_) {
+                delete[] cpu_sync_send_region_[index];
+            } else {
+                cudaFreeHost(cpu_sync_send_region_[index]);
+            }
             delete[] cpu_sync_recv_region_[index];
             if (is_cpu_) {
                 std::free(send_buffer_[index]);
@@ -1796,6 +1859,28 @@ void MooncakeCommunicator::applyGroupState(
     std::vector<bool> previous_active_ranks(meta_->maxGroupSize);
     for (int local_rank = 0; local_rank < meta_->maxGroupSize; ++local_rank) {
         previous_active_ranks[local_rank] = meta_->activeRanks[local_rank];
+    }
+
+    // A rank being admitted counts a half's runs from zero, so every rank
+    // restarts the counts at this view. A view that only removes ranks does not
+    // restart them: it lands between chunks, the ranks that stay can be one run
+    // apart when they apply it, and they must not pick different flag sets.
+    if (next_mode == CollectiveExtensionState::Normal) {
+        const bool self_admitted =
+            self_active && (mode != CollectiveExtensionState::Normal ||
+                            !previous_active_ranks[rank_]);
+        bool any_admitted = self_admitted;
+        for (size_t local_rank = 0; local_rank < view.rank_order.size();
+             ++local_rank) {
+            const auto global_rank = view.rank_order[local_rank];
+            any_admitted |= view.members[global_rank].isActive() &&
+                            !previous_active_ranks[local_rank];
+        }
+        if (any_admitted) {
+            for (auto& runs : meta_->bufferHalfRuns) {
+                runs.store(0, std::memory_order_relaxed);
+            }
+        }
     }
 
     // The execution mode determines the effective active ranks consumed by

@@ -45,11 +45,20 @@ struct FilePerKeyEnvironmentVariables {
 };
 
 struct BucketBackendEnvironmentVariables {
+    // 0/false: buffered; packed/true/1: packed direct writes;
+    // aligned: aligned direct writes
+    // (BucketBackendConfig::aligned_direct_write).
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS);
     MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_BUCKET_MAX_TOTAL_SIZE);
+    // Comma-separated per-disk quotas, positionally aligned with the disk
+    // list in MOONCAKE_OFFLOAD_FILE_STORAGE_PATH. Kept as a string because it
+    // is a list, not a scalar.
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY);
@@ -100,6 +109,9 @@ struct HugepageEnvironmentVariables {
     // the existing byte-size parser, fallback, and logging behavior.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_USE_HUGEPAGE);
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_HUGEPAGE_SIZE);
+    // Opt-in THP backing of the RDMA client buffer (1/0, true/false, yes/no,
+    // on/off). Kept as a string so an invalid value can be warned about.
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_MADV_HUGEPAGE);
 };
 
 struct ShmSpdkRegistrationEnvironmentVariables {
@@ -134,6 +146,7 @@ struct DistributedStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DISTRIBUTED_ROOT_DIR);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DFS_FS_ADAPTER);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DISTRIBUTED_FS_TYPE);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_KVCS_EFC_CONFIG);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DFS_ALLOCATOR);
     MC_DEFINE_ENV_VAR(bool, MOONCAKE_DISTRIBUTED_HEALTH_CHECK);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_SHARD_COUNT);
@@ -147,6 +160,17 @@ struct DistributedStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(double, MOONCAKE_DFS_EVICTION_LOW_WATERMARK);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_DEFERRED_FREE_SECONDS);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_EVICTION_CHECK_INTERVAL);
+};
+
+struct KvcsEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_KVCS_EFC_SOCKET);
+    MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_KVCS_MAX_VALUE_SIZE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_KVCS_MAX_KEY_SIZE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_KVCS_MAX_KEYS_PER_BATCH);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_KVCS_GET_WORKERS);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_KVCS_SET_WORKERS);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_KVCS_SIMPLE_WORKERS);
+    MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_KVCS_OPERATION_TIMEOUT_MS);
 };
 
 struct OssAdapterEnvironmentVariables {
@@ -281,6 +305,11 @@ struct NvmeKvConnectorEnvironmentVariables {
 };
 
 struct RedisConnectionEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_CLUSTER_ENABLED);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_CONNECT_TIMEOUT_MS);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_COMMAND_TIMEOUT_MS);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_TOPOLOGY_REFRESH_MS);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_MAX_REDIRECTS);
     // Keep the DB index as a string so an explicitly empty value remains
     // distinguishable from a nonempty malformed value.
     MC_DEFINE_ENV_VAR(std::string, MC_REDIS_DB_INDEX);

@@ -80,6 +80,12 @@ On the initiator machine:
 Use `--request_interval_us=<N>` to add a per-thread delay before each
 transfer batch. The value is in microseconds; `0` disables pacing.
 
+Pacing is closed loop: each thread waits the interval after its previous
+transfer completes, then issues the next one. The per-thread request rate is
+therefore at most `1 / (interval + transfer latency)`, not `1 / interval`, and
+it drops as latency grows. The wait spins with `yield`, so each paced thread
+keeps a CPU core busy, which can compete with transport polling threads.
+
 When pacing is enabled, `Avg Lat (us)` includes the pacing gap because it is
 computed from wall-clock runtime, while `Avg Tx (us)` and Tx percentiles only
 measure transfer execution time.
@@ -120,6 +126,32 @@ also enables the MLU local-copy transport in the benchmark configuration.
 result back to host memory for comparison. For throughput measurements without
 payload checks, use `--check_consistency=false --op_type=read` or `write`.
 
+### 3.5 Intel XPU Device Memory and File Targets
+
+Build with `USE_TENT=ON`, `USE_XPU=ON` and `BUILD_BENCHMARK=ON`, using the
+Intel DPC++ compiler (`CXX=icpx`). In this build,
+`--backend=tent --seg_type=VRAM` allocates XPU device memory. `--local_gpu_id`
+works as in Section 3.4.
+
+A `file://<path>` target segment name makes the initiator transfer to and from
+a local file, so no target process is needed. Create the file first; it must
+cover `--target_offset` plus `max_num_threads * max_block_size *
+max_batch_size` bytes. Select the file transport with `--xport_type`:
+
+```bash
+fallocate -l 1G /mnt/nvme/tebench.dat
+./tebench --backend=tent --metadata_type=p2p --seg_type=VRAM \
+  --local_gpu_id=0 --xport_type=iouring --total_buffer_size=268435456 \
+  --target_seg_name=file:///mnt/nvme/tebench.dat \
+  --start_block_size=1048576 --max_block_size=1048576 \
+  --start_batch_size=1 --max_batch_size=1 \
+  --start_num_threads=1 --max_num_threads=8 \
+  --op_type=write --duration=10
+```
+
+To check the data, run once with `--op_type=write_seed` and then with
+`--op_type=read_verify` (Section 5.4).
+
 ## 4. Output Metrics
 
 Each output row corresponds to one benchmark configuration.
@@ -134,6 +166,13 @@ Each output row corresponds to one benchmark configuration.
 | `Avg Tx (us)`  | Average per-transfer execution time, excluding gaps |
 | `P99 Tx (us)`  | P99 transfer latency                                |
 | `P999 Tx (us)` | P999 transfer latency                               |
+
+`BW` is the throughput of the requested workload: total bytes divided by the
+pooled average worker duration of the measurement phase. It therefore includes
+work done inside the loop on request, such as `--request_interval_us` pacing
+and the data fill and verify of `--check_consistency`. `Avg Tx`, `P99 Tx`,
+`P999 Tx`, and `Avg Inst GB/s` time only the transfer itself, from submit to
+completion.
 
 A short (~1 second) warmup phase is executed before measurements begin.
 
@@ -256,17 +295,20 @@ empty: the transfer loop is unchanged, with no extra clocks or I/O.
 When set, each completed transfer appends one JSON line:
 
 ```json
-{"batch_size":207360,"submit_us":66874,"wait_us":556363,"polls":201}
+{"block_size":4096,"batch_size":1,"warmup":false,"submit_us":2.613,"wait_us":10.874,"polls":901}
 ```
 
 | Field | Meaning |
 | ----- | ------- |
-| `submit_us` | Time in `submitTransfer` |
-| `wait_us` | Time from submit return until the batch reports COMPLETED |
+| `block_size`, `batch_size` | Shape of the transfer, identifying the sweep point |
+| `warmup` | `true` for transfers in the 1 s warmup before measurement |
+| `submit_us` | Time in `submitTransfer`, in microseconds with ns precision |
+| `wait_us` | Time from submit return until the batch reports COMPLETED, in microseconds with ns precision |
 | `polls` | Number of status polls in that wait |
 
-The file is opened once as `std::ofstream` and written with stream buffering. Skip the first
-couple of lines when summarizing; they include warmup. This log is for
+The file is opened once as `std::ofstream` and written with stream buffering.
+Filter on `warmup` when summarizing; warmup includes one-time costs such as
+connection setup. This log is for
 control-path analysis. Do not treat `wait_us` or table `BW` as a substitute
 for an application poll interval.
 
@@ -355,11 +397,15 @@ Example:
 * `--start_num_threads`, `--max_num_threads` : thread sweep (powers of two)
 * `--duration` : measurement time per case (seconds)
 
-A test case is skipped when:
-
-```
-block_size × batch_size × num_threads > total_buffer_size
-```
+Each thread owns one fixed region in its local buffer and one in its target
+buffer, sized for the largest operation (`max_block_size × max_batch_size`, or
+`--target_window_size` on the target side; see Section 5.5 for which buffer a
+thread uses). A test case is skipped when some thread's region does not fit in its local
+buffer (`--total_buffer_size`) or its target buffer (the buffer length after
+`--target_offset`, and `--target_range_size` if set). Because the layout only
+depends on the thread count, all block and batch sizes of a thread count either
+run or are skipped together. If every case is skipped, tebench exits
+with an error so that a misconfigured run does not look like a pass.
 
 **Multi-target initiator**
 
@@ -402,6 +448,35 @@ buffer.
 ./tebench --target_seg_name=<SEG> --target_offset=536870912 --target_range_size=536870912
 ```
 
+By default every operation of a thread uses the same target offset. That
+suits memory targets and isolating transport overhead, but on file targets
+the results depend heavily on the storage device: repeated writes to the
+same blocks can hit a device rewrite penalty, and repeated reads can be
+served from the device's cache. Use `--target_access=random` for results
+comparable with storage benchmarks that use random offsets. It cannot be
+combined with `write_seed` / `read_verify`.
+
+Each thread owns its own region of the target, its window. Thread `i`'s
+window starts at `i x window size`, so threads never touch each other's
+blocks. With `random`, each operation (block size x batch size bytes) goes
+to a random operation-aligned offset in the window, never the same one twice
+in a row. Set the window with `--target_window_size`, normally the file size
+divided by the thread count; it must be a multiple of 4096 (file targets
+use `O_DIRECT`), at least `max_block_size x max_batch_size`, and is accepted
+only with `random`.
+Without it, the window is `max_block_size x max_batch_size` bytes, which at
+the largest block and batch size holds a single operation, so the offset
+stays fixed. `fixed` mode is unchanged: one offset per thread, spaced
+`max_block_size x max_batch_size` apart.
+
+```bash
+# 8 threads, random 4 KiB writes across a 1 GiB file:
+# window = 1 GiB / 8 = 128 MiB = 134217728 bytes, 32768 slots of 4 KiB
+./tebench --target_seg_name=file:///path/to/file --op_type=write \
+  --start_num_threads=8 --max_num_threads=8 --start_block_size=4096 \
+  --max_block_size=4096 --target_access=random --target_window_size=134217728
+```
+
 For read-only verification with multiple readers, first write deterministic data
 using `--op_type=write_seed`, then run readers with `--op_type=read_verify`
 against the same target range. `read_verify` performs pure READs and validates
@@ -409,18 +484,83 @@ the local buffer without modifying the remote data. Do not combine these modes
 with `--check_consistency`; `--check_consistency` remains the existing
 WRITE→READ self-check mode.
 
+#### Multi-node orchestration
+
+`benchmark/scripts/run_tebench_multinode.sh` launches targets and initiators
+over SSH, discovers the target segment names, releases all initiators from a
+start barrier, and collects each process's log and result JSONL.
+
+The script is an orchestration layer over the existing endpoint-level
+multi-target interface. It does not add a new `peer` mode to `tebench`; an
+all-to-all node runs separate target and initiator processes. Weighted targets,
+hotspot routing, and arbitrary custom target plans remain outside this
+launcher's scope.
+
+Every host must provide Bash and `setsid`, and the same absolute `tebench` path
+must exist on each host. The launcher host also needs Python 3 to combine
+results. SSH public-key authentication and host-key verification
+must already be configured. Use the literal host name `local` for a role that
+should run without SSH.
+
+`--env` entries are passed unchanged to every host. For per-host settings such
+as `rpc_server_hostname` or `topology/rdma_whitelist`, place a host-local TENT
+config file at the same path on each host and pass `--env=MC_TENT_CONF=<path>`.
+
+```bash
+./mooncake-transfer-engine/benchmark/scripts/run_tebench_multinode.sh \
+  --topology=m2n \
+  --targets=target-a,target-b \
+  --initiators=initiator-a,initiator-b \
+  --tebench=/opt/mooncake/bin/tebench \
+  --backend=tent \
+  --xport-type=rdma \
+  --num-threads=4 \
+  --duration=30 \
+  --range-policy=per_initiator
+```
+
+Supported topologies are:
+
+| Topology | Target plan |
+| -------- | ----------- |
+| `fanout` | One initiator accesses every target. |
+| `incast` | Every initiator accesses one target. |
+| `m2n` | Every initiator accesses every target. |
+| `all_to_all` | Every node publishes a segment and accesses every other node. |
+
+Use `--range-policy=per_initiator` when multiple writers share a target. The
+script divides `--total-buffer-size` into non-overlapping ranges and passes the
+corresponding `--target_offset` and `--target_range_size` to each initiator.
+`--range-policy=shared` leaves every initiator on the same range and is useful
+for read-only fan-out or incast measurements.
+
+`--verify-data` runs two synchronized phases while the targets stay alive:
+`write_seed` followed by `read_verify`. This validates the same deterministic
+target ranges used by the performance run without relying on application data.
+
+Use `--dry-run` to validate topology expansion, target lists, thread counts,
+and range assignments without connecting to any host. Each run stores logs and
+per-target JSONL files under a new local `tebench-multinode-*` directory.
+The directory also contains `results.json`, a single JSON object with
+`schema_version`, `run_id`, `topology`, `backend`, and a `results` array.
+Each entry identifies the `host`, `phase`, `initiator_index`, and `exit_code`,
+and includes the original JSONL objects in `records`, preserving all per-target
+metrics. Failed runs include available records; an unavailable exit code is
+`null`. Invalid JSON causes collection to fail instead of publishing a partial
+summary. Original logs and JSONL files are retained.
+An existing run directory is rejected; use a new `--run-id` when rerunning with
+`--keep-remote`.
+
 ---
 
 ### 5.5 GPU Affinity
 
-* `--local_gpu_id`  : initiator base GPU ID
-* `--target_gpu_id` : target base GPU ID
+* `--local_gpu_id`  : initiator GPU; `-1` allocates a buffer on every GPU
+* `--target_gpu_id` : first target buffer used, as an index into the target's
+  buffer list
 
-Each worker thread uses:
-
-```
-gpu_id + thread_id
-```
+Worker thread `i` uses local buffer `i % local_buffers` and target buffer
+`(target_gpu_id + i / target_count) % target_buffers`.
 
 ---
 
@@ -511,8 +651,9 @@ through `MC_TENT_CONF`:
      --start_num_threads=8 --max_num_threads=8
    ```
 
-   Initiator threads round-robin across the listed seg_types by `thread_id`
-   (even→DRAM, odd→VRAM). The engine selects transport based on the target
+   Initiator threads round-robin across the listed seg_types by
+   `thread_id / target_count` (with one target: even→DRAM, odd→VRAM), and use
+   the same seg_type on the local and the target side. The engine selects transport based on the target
    buffer's location — SHM for `cpu:N` buffers, NVLink for `cuda:N` buffers —
    so `/metrics` will show both `transport="shm"` and `transport="nvlink"`
    labels with non-zero counts from a single metrics endpoint.

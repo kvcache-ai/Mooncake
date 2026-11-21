@@ -159,6 +159,13 @@ class ClientRequester {
                              const std::vector<std::string> &keys,
                              const std::vector<int64_t> &sizes);
 
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    batch_get_offload_object_ranges(const std::string &client_addr,
+                                    const std::vector<std::string> &keys,
+                                    const std::vector<int64_t> &offsets,
+                                    const std::vector<int64_t> &sizes,
+                                    const std::vector<int64_t> &object_sizes);
+
     /**
      * @brief Notifies remote FileStorage to release buffer after transfer
      * completion. This is a fire-and-forget call - errors are logged but not
@@ -642,6 +649,26 @@ class PyClient {
     virtual tl::expected<UUID, ErrorCode> create_move_task(
         const std::string &key, const std::string &source,
         const std::string &target) = 0;
+
+    virtual tl::expected<UUID, ErrorCode> create_drain_job(
+        const CreateDrainJobRequest &request) = 0;
+
+    virtual tl::expected<UUID, ErrorCode> create_timed_drain_job(
+        const CreateDrainJobRequest &request, uint64_t timeout_ms) = 0;
+
+    virtual tl::expected<QueryJobResponse, ErrorCode> query_drain_job(
+        const UUID &job_id) = 0;
+
+    virtual tl::expected<void, ErrorCode> cancel_drain_job(
+        const UUID &job_id) = 0;
+
+    virtual tl::expected<ListDrainJobsResponse, ErrorCode> list_drain_jobs(
+        const DrainJobListRequest &request) = 0;
+
+    virtual tl::expected<ListTasksResponse, ErrorCode> list_tasks(
+        const TaskListRequest &request) = 0;
+
+    virtual tl::expected<void, ErrorCode> cancel_task(const UUID &task_id) = 0;
 
     virtual tl::expected<QueryTaskResponse, ErrorCode> query_task(
         const UUID &task_id) = 0;

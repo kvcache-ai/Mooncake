@@ -57,6 +57,17 @@ inline int clampRdAtomicDepth(int device_max) {
     return device_max < kIdealRdAtomicDepth ? device_max : kIdealRdAtomicDepth;
 }
 
+// Resolve a QP's RD-atomic depth from an operator request (MC_MAX_RD_ATOMIC /
+// MC_MAX_DEST_RD_ATOMIC) and the device's advertised limit.  requested <= 0
+// means "not set" and keeps the clampRdAtomicDepth() default.  Otherwise the
+// request is honored up to the device limit (floored at 1 as above), so it may
+// lower the depth below kIdealRdAtomicDepth or raise it up to the device max.
+inline int resolveRdAtomicDepth(int requested, int device_max) {
+    if (requested <= 0) return clampRdAtomicDepth(device_max);
+    int cap = device_max <= 0 ? 1 : device_max;
+    return requested < cap ? requested : cap;
+}
+
 class RdmaEndPoint;
 class RdmaTransport;
 class RdmaContextTestPeer;
@@ -119,6 +130,9 @@ struct DmabufExport {
     // unknown. Data Direct registration is only possible on NICs whose Data
     // Direct function sits under the same root.
     std::string pci_root;
+    // HIP: the exported allocation and the GPU that owns it.
+    void *alloc_base = nullptr;
+    int device = -1;
 };
 
 // RdmaContext represents the set of resources controlled by each local NIC,
@@ -341,6 +355,11 @@ class RdmaContext {
 
     int socketId();
 
+    // False when the HCA reports IBV_ATOMIC_NONE. Data QPs then omit
+    // IBV_ACCESS_REMOTE_ATOMIC. Mooncake's host path only posts RDMA
+    // READ/WRITE, so this does not change the transfer protocol.
+    bool supportsRdmaAtomic() const { return supports_rdma_atomic_; }
+
    private:
     int openRdmaDevice(const std::string &device_name, uint8_t port,
                        int gid_index);
@@ -380,6 +399,7 @@ class RdmaContext {
     ibv_comp_channel **comp_channel_ = nullptr;
 
     uint8_t port_ = 0;
+    bool supports_rdma_atomic_ = true;
     uint32_t lid_ = 0;
     int gid_index_ = -1;
     int active_speed_ = -1;
