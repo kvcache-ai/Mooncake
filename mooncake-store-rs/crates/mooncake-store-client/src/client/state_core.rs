@@ -1061,6 +1061,24 @@ impl LocalAllocatorState {
             })
     }
 
+    fn can_fit_after_eviction(
+        &self,
+        segment_name: Option<&SegmentName>,
+        length_bytes: u64,
+    ) -> bool {
+        match segment_name {
+            Some(segment_name) => self
+                .segments
+                .get(segment_name)
+                .is_some_and(|segment| segment.can_fit_after_eviction(length_bytes)),
+            None => self
+                .segments
+                .values()
+                .filter(|segment| segment.announcement.state == SegmentLifecycleState::Active)
+                .any(|segment| segment.can_fit_after_eviction(length_bytes)),
+        }
+    }
+
     fn allocations(&self) -> Vec<AllocationSpan> {
         self.segments
             .values()
@@ -1993,6 +2011,12 @@ impl SegmentAllocator {
         self.announcement
             .capacity_bytes
             .saturating_sub(self.announcement.used_bytes)
+    }
+
+    fn can_fit_after_eviction(&self, length_bytes: u64) -> bool {
+        length_bytes > 0
+            && align_up_u64(length_bytes, self.announcement.alignment_bytes.max(1))
+                <= self.announcement.capacity_bytes
     }
 
     fn allocations(&self) -> Vec<AllocationSpan> {
