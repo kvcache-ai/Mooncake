@@ -100,7 +100,7 @@ BatchSubmitExecutor::Result TransferEngine::TentSubBatchAdapter::release() {
 
 std::optional<Status> TransferEngine::tryParallelBatchTransfer(
     SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
-    std::chrono::nanoseconds timeout, TransportType hint,
+    std::chrono::nanoseconds timeout,
     ParallelBatchTransferFailureInfo* failure_info) {
     using Executor = ::mooncake::BatchSubmitExecutor;
     if (failure_info) *failure_info = {};
@@ -143,13 +143,6 @@ std::optional<Status> TransferEngine::tryParallelBatchTransfer(
             if (requests.size() != range.end - range.begin)
                 return Executor::Result::Error(
                     "Invalid sub-batch request count");
-            for (const auto& request : requests)
-                if (request.target_id != peer ||
-                    request.transport_hint != hint ||
-                    (request.opcode != Request::READ &&
-                     request.opcode != Request::WRITE))
-                    return Executor::Result::Error(
-                        "Parallel batch request differs from admission");
             TentSubBatchAdapter sub_batch{*this, requests};
             return ::mooncake::runSubBatch(sub_batch, cancellation);
         });

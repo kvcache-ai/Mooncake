@@ -219,11 +219,13 @@ class TransferEngine {
 
     // Opt-in synchronous path for independent ranges to one peer.
     // nullopt means disabled, below threshold, or unsupported before publish.
-    // The builder runs once per sub-batch and must preserve every request
-    // field.
+    // The builder runs once per sub-batch and must return the requested range
+    // as valid READ/WRITE requests to peer, preserving every request field.
+    // The caller must ensure that all requests can execute independently;
+    // these preconditions are not checked by scanning the built requests.
     std::optional<Status> tryParallelBatchTransfer(
         SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
-        std::chrono::nanoseconds timeout, int transport_hint = 0,
+        std::chrono::nanoseconds timeout,
         ParallelBatchTransferFailureInfo* failure_info = nullptr);
 
     struct ScatterTransferRange {

@@ -353,9 +353,15 @@ class TransferEngine {
         // Only native FAILED/TIMEOUT errors, without parent expiry/shutdown.
         bool retryable = false;
     };
+    // Opt-in synchronous path for independent ranges to one peer.
+    // nullopt means disabled, below threshold, or unsupported before publish.
+    // The builder runs once per sub-batch and must return the requested range
+    // as valid READ/WRITE requests to peer, preserving every request field.
+    // The caller must ensure that all requests can execute independently;
+    // these preconditions are not checked by scanning the built requests.
     std::optional<Status> tryParallelBatchTransfer(
         SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
-        std::chrono::nanoseconds timeout, TransportType hint = UNSPEC,
+        std::chrono::nanoseconds timeout,
         ParallelBatchTransferFailureInfo* failure_info = nullptr);
 
     Status submitTransfer(BatchID batch_id,

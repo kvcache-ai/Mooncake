@@ -1168,7 +1168,7 @@ int TransferEnginePy::batchTransferSync(
                 handle, batch_size, build_requests,
                 std::chrono::duration_cast<std::chrono::nanoseconds>(deadline -
                                                                      now),
-                hint, &failure);
+                &failure);
             if (result) {
                 if (result->ok()) return 0;
                 LOG(ERROR) << "Parallel batch transfer failed: "

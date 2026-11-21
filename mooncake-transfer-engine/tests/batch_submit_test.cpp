@@ -862,7 +862,7 @@ TEST_F(ClassicBatchSubmit, FailureInfoMatchesLegacyAndResets) {
         }
         EXPECT_TRUE(engine.freeBatchID(id).ok());
         auto result =
-            engine.tryParallelBatchTransfer(1, 1, requests, 5s, 0, &failure);
+            engine.tryParallelBatchTransfer(1, 1, requests, 5s, &failure);
         if (result) {
             EXPECT_EQ(failure.submit_failed, !submitted.ok());
             EXPECT_EQ(failure.retryable,
@@ -1210,9 +1210,11 @@ TEST_F(TentBatchSubmit, ExplicitHintDoesNotHideAnUnsupportedFailoverCandidate) {
         LOCAL_SEGMENT_ID, 2,
         [&](size_t begin, size_t end) {
             ++builds;
-            return requests(begin, end);
+            auto entries = requests(begin, end);
+            for (auto& request : entries) request.transport_hint = tt::TCP;
+            return entries;
         },
-        10s, tt::TCP);
+        10s);
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(builds, 0);
     EXPECT_EQ(transport->submits.load(), 0);
@@ -1411,8 +1413,8 @@ TEST_F(TentBatchSubmit, NativeAndFacadeFailureInfoMatchesLegacyAndResets) {
             EXPECT_TRUE(facade.getBatchTransferStatus(id, status).ok());
         }
         EXPECT_TRUE(facade.freeBatchID(id).ok());
-        auto result = facade.tryParallelBatchTransfer(
-            LOCAL_SEGMENT_ID, 1, builder, 5s, hint, &failure);
+        auto result = facade.tryParallelBatchTransfer(LOCAL_SEGMENT_ID, 1,
+                                                      builder, 5s, &failure);
         if (result) {
             EXPECT_EQ(failure.submit_failed, !submitted.ok());
             EXPECT_EQ(failure.retryable,
@@ -1454,7 +1456,7 @@ TEST_F(TentBatchSubmit, NativeAndFacadeFailureInfoMatchesLegacyAndResets) {
     EXPECT_FALSE(engine->tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 1,
         [&](size_t begin, size_t end) { return requests(begin, end); }, 5s,
-        tt::TCP, &native_failure));
+        &native_failure));
     EXPECT_FALSE(native_failure.submit_failed);
     EXPECT_FALSE(native_failure.retryable);
 }
@@ -1465,7 +1467,7 @@ TEST_F(TentBatchSubmit, PollApiErrorDoesNotAuthorizeRetry) {
     auto result = engine->tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 1,
         [&](size_t begin, size_t end) { return requests(begin, end); }, 5s,
-        tt::UNSPEC, &failure);
+        &failure);
     ASSERT_TRUE(result.has_value());
     EXPECT_FALSE(result->ok());
     EXPECT_FALSE(failure.submit_failed);
@@ -1512,7 +1514,7 @@ TEST_F(TentBatchSubmit, FacadePreservesExplicitHintAndIntent) {
             }
             return result;
         },
-        10s, tt::TCP);
+        10s);
     ASSERT_TRUE(result.has_value());
     ASSERT_TRUE(result->ok()) << result->ToString();
     for (const auto& request : transport->observed) {

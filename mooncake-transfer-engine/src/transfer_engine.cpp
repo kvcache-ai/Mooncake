@@ -1457,7 +1457,7 @@ bool TransferEngine::supportsParallelBatchSubmit(SegmentID peer) const {
 
 std::optional<Status> TransferEngine::tryParallelBatchTransfer(
     SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
-    std::chrono::nanoseconds timeout, int transport_hint,
+    std::chrono::nanoseconds timeout,
     ParallelBatchTransferFailureInfo* failure_info) {
     using Executor = BatchSubmitExecutor;
     if (failure_info) *failure_info = {};
@@ -1472,8 +1472,7 @@ std::optional<Status> TransferEngine::tryParallelBatchTransfer(
                 std::vector<tent::Request> converted;
                 converted.reserve(entries.size());
                 for (const auto& entry : entries) {
-                    if (entry.target_id != peer ||
-                        (entry.opcode != TransferRequest::READ &&
+                    if ((entry.opcode != TransferRequest::READ &&
                          entry.opcode != TransferRequest::WRITE) ||
                         entry.intent_type < 0 ||
                         entry.intent_type >
@@ -1500,8 +1499,7 @@ std::optional<Status> TransferEngine::tryParallelBatchTransfer(
                 }
                 return converted;
             },
-            timeout, static_cast<tent::TransportType>(transport_hint),
-            failure_info ? &tent_failure : nullptr);
+            timeout, failure_info ? &tent_failure : nullptr);
         if (failure_info)
             *failure_info = {tent_failure.submit_failed,
                              tent_failure.retryable};
@@ -1548,12 +1546,6 @@ std::optional<Status> TransferEngine::tryParallelBatchTransfer(
             if (requests.size() != range.end - range.begin)
                 return Executor::Result::Error(
                     "Invalid sub-batch request count");
-            for (const auto& request : requests)
-                if (request.target_id != peer ||
-                    (request.opcode != TransferRequest::READ &&
-                     request.opcode != TransferRequest::WRITE))
-                    return Executor::Result::Error(
-                        "Parallel batch must contain READ/WRITE to one peer");
             TESubBatchAdapter sub_batch{*this, requests};
             return runSubBatch(sub_batch, cancellation);
         });

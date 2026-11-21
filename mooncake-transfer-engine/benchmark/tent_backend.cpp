@@ -548,8 +548,7 @@ double TENTBenchRunner::runSingleTransfer(
     };
     if (!XferBenchConfig::notifi) {
         auto parallel_result = engine_->tryParallelBatchTransfer(
-            target_id, batch_size, build, std::chrono::seconds(30),
-            transport_hint_);
+            target_id, batch_size, build, std::chrono::seconds(30));
         if (parallel_result) {
             if (!parallel_result->ok()) {
                 // Ordinary free may defer cleanup while transport work still
