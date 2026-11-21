@@ -7,7 +7,9 @@
 #include <async_simple/coro/SyncAwait.h>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <limits>
 #include <mutex>
 #include <utility>
 
@@ -20,19 +22,53 @@ struct ConductorClient::Impl {
     std::mutex mu;  // serializes calls; see header's thread-safety note
     int64_t request_timeout_ms = 3000;
     bool connected = false;
+    bool cleanup_drained = false;
+
+    // Caller holds mu. Only a new connection attempt invalidates this state.
+    void Close() {
+        connected = false;
+        if (cleanup_drained) return;
+        // ylt close() dispatches socket cleanup asynchronously. Complete it
+        // before short-lived callers release the client and exit.
+        client.close();
+        auto executor = client.get_executor().get_asio_executor();
+        if (!executor.running_in_this_thread()) {
+            async_simple::coro::syncAwait(coro_io::post([] {}, executor));
+        }
+        cleanup_drained = true;
+    }
 };
 
 ConductorClient::ConductorClient() : impl_(std::make_unique<Impl>()) {}
-ConductorClient::~ConductorClient() { Close(); }
+ConductorClient::~ConductorClient() {
+    try {
+        Close();
+    } catch (...) {
+        // Destruction must not propagate allocation/executor failures. The
+        // native RPC member still performs its own socket cleanup.
+    }
+}
 
 tl::expected<void, ErrorCode> ConductorClient::Setup(
     const ConductorClientConfig& config) {
     std::lock_guard lock(impl_->mu);
     // Every setup attempt replaces the previous connection, even if the new
     // address is invalid or the connection fails.
-    impl_->connected = false;
-    impl_->client.close();
-    impl_->request_timeout_ms = config.request_timeout_ms;
+    impl_->Close();
+    // A negative timeout disables the ylt timer. Zero would expire at once,
+    // and larger values overflow ylt's nanosecond conversion.
+    constexpr int64_t max_timeout_ms =
+        std::numeric_limits<int64_t>::max() / 1000000;
+    if (config.connect_timeout_ms == 0 || config.request_timeout_ms == 0 ||
+        config.connect_timeout_ms > max_timeout_ms ||
+        config.request_timeout_ms > max_timeout_ms) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // Clamp negatives to -1 so the nanosecond conversion cannot overflow.
+    const int64_t connect_timeout_ms =
+        std::max<int64_t>(config.connect_timeout_ms, -1);
+    impl_->request_timeout_ms =
+        std::max<int64_t>(config.request_timeout_ms, -1);
     // Split "host:port" for coro_rpc_client::connect(host, port).
     const auto colon = config.conductor_addr.rfind(':');
     if (colon == std::string::npos) {
@@ -40,10 +76,11 @@ tl::expected<void, ErrorCode> ConductorClient::Setup(
     }
     const std::string host = config.conductor_addr.substr(0, colon);
     const std::string port = config.conductor_addr.substr(colon + 1);
+    impl_->cleanup_drained = false;
     auto ec = async_simple::coro::syncAwait(impl_->client.connect(
-        host, port, std::chrono::milliseconds(config.connect_timeout_ms)));
+        host, port, std::chrono::milliseconds(connect_timeout_ms)));
     if (ec) {
-        impl_->client.close();
+        impl_->Close();
         return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
     impl_->connected = true;
@@ -52,11 +89,7 @@ tl::expected<void, ErrorCode> ConductorClient::Setup(
 
 void ConductorClient::Close() {
     std::lock_guard lock(impl_->mu);
-    impl_->connected = false;
-    // ylt 0.5.7 client.close() uses close_socket_async: a CAS keeps it
-    // idempotent, the socket closes asynchronously without blocking, and
-    // connect_impl resets has_closed_, so Setup() after Close() reconnects.
-    impl_->client.close();
+    impl_->Close();
 }
 
 bool ConductorClient::HealthCheck() {
