@@ -860,3 +860,18 @@ if(USE_CUDA OR USE_HIP)
   add_test(NAME rdma_local_nic_gpu_test COMMAND rdma_local_nic_gpu_test)
   set_tests_properties(rdma_local_nic_gpu_test PROPERTIES LABELS "rdma;gpu")
 endif()
+
+if(USE_ASCEND_HETEROGENEOUS)
+  add_executable(heterogeneous_rdma_transport_test
+                 ${WORKSPACE}/heterogeneous_rdma_transport_test.cpp)
+  target_link_libraries(heterogeneous_rdma_transport_test
+                        PUBLIC transfer_engine gtest gtest_main)
+  if(UNIX AND NOT APPLE)
+    target_link_options(heterogeneous_rdma_transport_test
+                        PRIVATE "-Wl,--export-dynamic")
+  endif()
+  add_test(NAME heterogeneous_rdma_transport_test
+           COMMAND heterogeneous_rdma_transport_test)
+  set_tests_properties(heterogeneous_rdma_transport_test
+                       PROPERTIES TIMEOUT 60)
+endif()

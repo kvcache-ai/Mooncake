@@ -21,9 +21,20 @@ bool isCpuMemory(void *addr) {
 }  // namespace
 
 HeterogeneousRdmaTransport::~HeterogeneousRdmaTransport() {
-    running_ = false;
-    transfer_queue_cv_.notify_one();
-    transfer_thread_.join();
+    signalShutdown();
+    if (transfer_thread_.joinable()) {
+        transfer_thread_.join();
+    }
+    waitForSubmissions();
+    std::lock_guard<std::mutex> lock(memcpy_mutex_);
+    if (int ret = aclrtSetDevice(logic_device_id_)) {
+        LOG(ERROR) << "HeterogeneousRdmaTransport: aclrtSetDevice failed in "
+                      "destructor, ret: "
+                   << ret;
+    }
+    if (stream_copy_created_) {
+        aclrtDestroyStream(stream_copy_);
+    }
     free(host_addr_);
     host_addr_ = nullptr;
     aclrtFree(dev_addr_);
@@ -37,24 +48,33 @@ void HeterogeneousRdmaTransport::transferLoop() {
     if (ret) {
         LOG(ERROR) << "HeterogeneousRdmaTransport: aclrtSetDevice error, ret: "
                    << ret;
+        signalShutdown();
     }
 
-    ret = aclrtCreateStream(&stream_d2h);
-    if (ret) {
-        LOG(ERROR)
-            << "HeterogeneousRdmaTransport: aclrtCreateStream error, ret: "
-            << ret;
+    bool stream_d2h_created = false;
+    if (!ret) {
+        ret = aclrtCreateStream(&stream_d2h);
+        if (ret) {
+            LOG(ERROR)
+                << "HeterogeneousRdmaTransport: aclrtCreateStream error, ret: "
+                << ret;
+            signalShutdown();
+        } else {
+            stream_d2h_created = true;
+        }
     }
 
     while (running_) {
         auto transfer_info = getTransfer();
         const auto &task_list = transfer_info.tasks;
         if (task_list.empty()) {
+            if (!running_) break;
             LOG(ERROR)
                 << "HeterogeneousRdmaTransport: empty transfer task batch";
             continue;
         }
 
+        std::lock_guard<std::mutex> lock(memcpy_mutex_);
         int total_length = transfer_info.total_length;
         if ((host_offset_ + total_length) > HUGE_HOST_SIZE) {
             // LOG(INFO) << "HeterogeneousRdmaTransport: transferLoop reset host
@@ -72,6 +92,8 @@ void HeterogeneousRdmaTransport::transferLoop() {
                        << ", host_offset_: " << host_offset_
                        << ", deviceAddr: " << transfer_info.block
                        << "len: " << total_length;
+            signalShutdown();
+            releaseBlock(transfer_info.block);
             continue;
         }
 
@@ -80,6 +102,8 @@ void HeterogeneousRdmaTransport::transferLoop() {
             LOG(ERROR) << "HeterogeneousRdmaTransport: aclrtSynchronizeStream "
                           "error, ret: "
                        << ret;
+            signalShutdown();
+            releaseBlock(transfer_info.block);
             continue;
         }
 
@@ -94,8 +118,38 @@ void HeterogeneousRdmaTransport::transferLoop() {
         if (!s.ok()) {
             LOG(ERROR)
                 << "HeterogeneousRdmaTransport: Rdma submitTransferTask error";
+            signalShutdown();
+            releaseBlock(transfer_info.block);
+            continue;
         }
         releaseBlock(transfer_info.block);  // 释放block
+    }
+
+    // Shutdown: drain queued TransferInfos so their blocks return to
+    // block_queue_; otherwise a concurrent aggTransport() would wait
+    // forever in allBlockReleased() after this thread exits. The pending
+    // transfers themselves are dropped.
+    size_t dropped_batches = 0;
+    while (true) {
+        TransferInfo transfer_info{};
+        {
+            std::lock_guard<std::mutex> lock(transfer_queue_mutex_);
+            if (transfer_queue_.empty()) break;
+            transfer_info = transfer_queue_.front();
+            transfer_queue_.pop();
+        }
+        if (transfer_info.block != nullptr) {
+            releaseBlock(transfer_info.block);
+        }
+        ++dropped_batches;
+    }
+    if (dropped_batches > 0) {
+        LOG(INFO) << "HeterogeneousRdmaTransport: discarded " << dropped_batches
+                  << " pending transfer batch(es) on shutdown";
+    }
+
+    if (stream_d2h_created) {
+        aclrtDestroyStream(stream_d2h);
     }
 }
 
@@ -251,23 +305,29 @@ Status HeterogeneousRdmaTransport::submitTransfer(
         return Status::OK();
     }
 
+    SubmissionGuard guard(*this);
+    if (!guard.active()) {
+        return Status::InvalidArgument(
+            "HeterogeneousRdmaTransport: transport is shutting down");
+    }
     if (isCpuMemory(entries[0].source)) {
+        std::lock_guard<std::mutex> lock(memcpy_mutex_);
         return transport_->submitTransfer(batch_id, entries);
     }
 
     std::vector<TransferRequest> new_entries;
     new_entries.resize(entries.size());
     int index = 0;
-    int ret = checkAndCreateStreamCopy();
-    if (ret) {
-        LOG(ERROR) << "HeterogeneousRdmaTransport: createStream error, ret: "
-                   << ret;
-        return Status::InvalidArgument(
-            "HeterogeneousRdmaTransport: createStream error");
-    }
-
     {
         std::lock_guard<std::mutex> lock(memcpy_mutex_);
+        int ret = checkAndCreateStreamCopy();
+        if (ret) {
+            LOG(ERROR)
+                << "HeterogeneousRdmaTransport: createStream error, ret: "
+                << ret;
+            return Status::InvalidArgument(
+                "HeterogeneousRdmaTransport: createStream error");
+        }
         for (auto &request : entries) {
             if (host_offset_ + request.length > HUGE_HOST_SIZE) {
                 host_offset_ = 0;
@@ -298,9 +358,8 @@ Status HeterogeneousRdmaTransport::submitTransfer(
             return Status::InvalidArgument(
                 "HeterogeneousRdmaTransport: aclrtSynchronizeStream error");
         }
+        return transport_->submitTransfer(batch_id, new_entries);
     }
-
-    return transport_->submitTransfer(batch_id, new_entries);
 }
 
 Status HeterogeneousRdmaTransport::noAggTransport(
@@ -348,10 +407,22 @@ Status HeterogeneousRdmaTransport::noAggTransport(
 }
 
 Status HeterogeneousRdmaTransport::aggTransport(
-    const std::vector<TransferTask *> &task_list) {
+    const std::vector<TransferTask *> &task_list,
+    std::unique_lock<std::mutex> lock) {
     uint64_t index = 0;
     while (index < task_list.size()) {
+        if (lock.owns_lock()) lock.unlock();
         auto block = acquireBlock();
+        if (block == nullptr) {
+            // Shutdown in progress: acquireBlock() gave up waiting. Abort
+            // instead of copying into a null block; blocks of batches that
+            // were already queued are returned by the transferLoop() drain.
+            LOG(ERROR) << "HeterogeneousRdmaTransport: acquireBlock gave up "
+                          "during shutdown, aborting aggregate transfer";
+            return Status::InvalidArgument(
+                "HeterogeneousRdmaTransport: transport is shutting down");
+        }
+        lock.lock();
         uint64_t block_offset = 0;
         std::vector<TransferTask *> tasks;
 
@@ -370,6 +441,7 @@ Status HeterogeneousRdmaTransport::aggTransport(
                            << ret << ", host_offset_: " << host_offset_
                            << ", deviceAddr: " << request.source
                            << ", len: " << request.length;
+                releaseBlock(block);
                 return Status::InvalidArgument(
                     "HeterogeneousRdmaTransport: aclrtMemcpyAsync dtod error");
             }
@@ -384,6 +456,7 @@ Status HeterogeneousRdmaTransport::aggTransport(
             LOG(ERROR) << "HeterogeneousRdmaTransport: aclrtSynchronizeStream "
                           "failed, ret: "
                        << ret;
+            releaseBlock(block);
             return Status::InvalidArgument(
                 "HeterogeneousRdmaTransport: aclrtSynchronizeStream error");
         }
@@ -391,8 +464,13 @@ Status HeterogeneousRdmaTransport::aggTransport(
         addTransfer(std::move(tasks), block, block_offset);
     }
 
+    if (lock.owns_lock()) lock.unlock();
     auto start = std::chrono::high_resolution_clock::now();
-    while (!allBlockReleased()) {  // 等待transfer_queue_被处理完毕
+    // Wait until transfer_queue_ has been processed. Also stop waiting
+    // once shutdown started: normally the worker drains the queue and
+    // every block comes back, but never deadlock against a worker thread
+    // that has already exited.
+    while (!allBlockReleased() && running_) {  // 等待transfer_queue_被处理完毕
         auto end = std::chrono::high_resolution_clock::now();
         auto duration_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
@@ -410,6 +488,15 @@ Status HeterogeneousRdmaTransport::aggTransport(
         }
     }
 
+    if (!running_ || !allBlockReleased()) {
+        // Shutdown raced with the wait above (e.g. a batch submitted
+        // concurrently with shutdown). Stop waiting instead of hanging.
+        LOG(ERROR) << "HeterogeneousRdmaTransport: shutdown with blocks "
+                      "still in flight, stop waiting";
+        return Status::InvalidArgument(
+            "HeterogeneousRdmaTransport: transport is shutting down");
+    }
+
     return Status::OK();
 }
 
@@ -424,24 +511,30 @@ Status HeterogeneousRdmaTransport::submitTransferTask(
     auto &task = *task_list[0];
     auto &request = *task.request;
 
+    SubmissionGuard guard(*this);
+    if (!guard.active()) {
+        return Status::InvalidArgument(
+            "HeterogeneousRdmaTransport: transport is shutting down");
+    }
     if (isCpuMemory(request.source)) {
+        std::lock_guard<std::mutex> lock(memcpy_mutex_);
         return transport_->submitTransferTaskWithSeal(task_list);
     }
 
-    auto ret = checkAndCreateStreamCopy();
-    if (ret) {
-        LOG(ERROR) << "HeterogeneousRdmaTransport: createStream error, ret: "
-                   << ret;
-        return Status::InvalidArgument(
-            "HeterogeneousRdmaTransport: createStream error");
-    }
-
     {
-        std::lock_guard<std::mutex> lock(memcpy_mutex_);
+        std::unique_lock<std::mutex> lock(memcpy_mutex_);
+        auto ret = checkAndCreateStreamCopy();
+        if (ret) {
+            LOG(ERROR)
+                << "HeterogeneousRdmaTransport: createStream error, ret: "
+                << ret;
+            return Status::InvalidArgument(
+                "HeterogeneousRdmaTransport: createStream error");
+        }
         if (request.length >= AGGREGATE_SIZE_LIMIT) {
             return noAggTransport(task_list);
         } else {
-            return aggTransport(task_list);
+            return aggTransport(task_list, std::move(lock));
         }
     }
 
