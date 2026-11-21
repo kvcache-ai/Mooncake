@@ -508,6 +508,9 @@ class ObjectRoute {
     // on a lock whose holder may be waiting on a route. One that acts after
     // the cursor keeps `ref()` and goes through Write(ref).
     [[nodiscard]] Cursor<LockMode::kRead> ReadCursor() const;
+    // Like ReadCursor, but skips any slot whose key lock is busy. Check
+    // skipped_busy_keys() after the walk before treating it as complete.
+    [[nodiscard]] Cursor<LockMode::kRead> ReadCursorSkippingBusyKeys() const;
     [[nodiscard]] Cursor<LockMode::kWrite> WriteCursor();
 
     // The member keys of one group, as a snapshot to resolve again: a key in
@@ -691,11 +694,13 @@ class ObjectRoute::Cursor {
 
     Iterator begin() { return Iterator(this); }
     Sentinel end() const { return {}; }
+    bool skipped_busy_keys() const { return skipped_busy_keys_; }
 
    private:
     friend class ObjectRoute;
 
-    explicit Cursor(const ObjectRoute& route) : route_(route) {
+    explicit Cursor(const ObjectRoute& route, bool wait_for_busy_keys = true)
+        : route_(route), wait_for_busy_keys_(wait_for_busy_keys) {
 #ifndef NDEBUG
         route_.live_cursors_.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -724,7 +729,11 @@ class ObjectRoute::Cursor {
                 KeySlot& slot = (slot_it_++)->second;
                 Lock lock(slot.mutex_, std::try_to_lock);
                 if (!lock.owns_lock()) {
-                    deferred_.emplace_back(stripe, slot);
+                    if (wait_for_busy_keys_) {
+                        deferred_.emplace_back(stripe, slot);
+                    } else {
+                        skipped_busy_keys_ = true;
+                    }
                     continue;
                 }
                 if (slot.record_.has_value()) {
@@ -777,6 +786,8 @@ class ObjectRoute::Cursor {
     }
 
     const ObjectRoute& route_;
+    const bool wait_for_busy_keys_;
+    bool skipped_busy_keys_ = false;
     size_t stripe_ = 0;
     std::shared_lock<std::shared_mutex> stripe_lock_;
     // The next slot to try in the stripe held.
@@ -893,6 +904,11 @@ inline void ObjectRoute::TearDownLocked(KeySlot& slot) {
 
 inline ObjectRoute::Cursor<LockMode::kRead> ObjectRoute::ReadCursor() const {
     return Cursor<LockMode::kRead>(*this);
+}
+
+inline ObjectRoute::Cursor<LockMode::kRead>
+ObjectRoute::ReadCursorSkippingBusyKeys() const {
+    return Cursor<LockMode::kRead>(*this, /*wait_for_busy_keys=*/false);
 }
 
 inline ObjectRoute::Cursor<LockMode::kWrite> ObjectRoute::WriteCursor() {

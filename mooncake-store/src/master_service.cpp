@@ -10465,7 +10465,8 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
     const std::string& key, const TenantId& tenant_id,
     const std::string& source, const std::string& target,
-    bool retained_by_drain) {
+    bool retained_by_drain,
+    std::optional<route::Generation> expected_generation) {
     auto normalized_tenant_result = ResolveTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
@@ -10486,7 +10487,9 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
     {
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         MetadataAccessorRO accessor(this, object_id);
-        if (!accessor.Exists()) {
+        if (!accessor.Exists() ||
+            (expected_generation &&
+             accessor.Generation() != *expected_generation)) {
             VLOG(1) << "key=" << key << ", info=object_not_found";
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
@@ -10508,8 +10511,8 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
 
         metadata.VisitReplicas(
             [](const Replica&) { return true; },
-            [this, &source, &source_exists, &source_is_serving,
-             &source_session](const Replica& replica) {
+            [this, &source, &source_exists, &source_is_serving, &source_session,
+             retained_by_drain](const Replica& replica) {
                 const auto names = replica.get_segment_names();
                 const bool matches = std::any_of(
                     names.begin(), names.end(), [&source](const auto& name) {
@@ -10517,7 +10520,8 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
                     });
                 if (matches) {
                     source_exists = true;
-                    if (IsReplicaReadable(replica)) {
+                    if ((!retained_by_drain || !source_is_serving) &&
+                        IsReplicaReadable(replica)) {
                         source_is_serving = true;
                         source_session = replica.getClientSession();
                     }
@@ -10534,12 +10538,18 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
-        ErrorCode error =
-            segment_accessor.GetClientIdBySegmentName(source, select_client);
-        if (error != ErrorCode::OK) {
-            LOG(ERROR) << "key=" << key << ", segment_name=" << source
-                       << ", error=client_id_not_found";
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        if (retained_by_drain && source_session) {
+            // A new registration can take over the name index while existing
+            // replicas still belong to earlier registrations.
+            select_client = source_session->ClientId();
+        } else {
+            const auto error = segment_accessor.GetClientIdBySegmentName(
+                source, select_client);
+            if (error != ErrorCode::OK) {
+                LOG(ERROR) << "key=" << key << ", segment_name=" << source
+                           << ", error=client_id_not_found";
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
         }
     }
 
@@ -10556,18 +10566,27 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
     // takes those locks in the opposite order.
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     MetadataAccessorRO submission_metadata(this, object_id);
+    if (expected_generation &&
+        (!submission_metadata.IsPublished() ||
+         submission_metadata.Generation() != *expected_generation)) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
     if (!submission_metadata.Exists()) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     const auto& metadata = submission_metadata.Get();
     ScopedSegmentAccess submission_access = segment_manager_.getSegmentAccess();
     UUID current_source_client;
-    if (submission_access.GetClientIdBySegmentName(
-            source, current_source_client) != ErrorCode::OK ||
-        current_source_client != select_client ||
+    if ((!retained_by_drain &&
+         (submission_access.GetClientIdBySegmentName(
+              source, current_source_client) != ErrorCode::OK ||
+          current_source_client != select_client)) ||
         !submission_access.IsSegmentAllocatable(target) ||
-        !metadata.HasReplica([this, &source](const Replica& replica) {
-            if (!IsReplicaReadable(replica)) {
+        !metadata.HasReplica([this, &source, &source_session,
+                              retained_by_drain](const Replica& replica) {
+            if (!IsReplicaReadable(replica) ||
+                (retained_by_drain &&
+                 replica.getClientSession() != source_session)) {
                 return false;
             }
             const auto names = replica.get_segment_names();
@@ -10774,7 +10793,6 @@ tl::expected<UUID, ErrorCode> MasterService::CreateTimedDrainJob(
         deadline =
             now + std::chrono::milliseconds(static_cast<int64_t>(timeout_ms));
     }
-    std::vector<std::string> draining_segments;
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
@@ -10783,32 +10801,9 @@ tl::expected<UUID, ErrorCode> MasterService::CreateTimedDrainJob(
             return tl::make_unexpected(valid.error());
         }
 
-        draining_segments.reserve(request.segments.size());
         for (const auto& segment_name : request.segments) {
-            SegmentStatus previous = SegmentStatus::UNDEFINED;
-            auto err =
-                segment_access.GetSegmentStatusByName(segment_name, previous);
-            if (err != ErrorCode::OK) {
-                for (const auto& updated_segment : draining_segments) {
-                    (void)segment_access.SetSegmentStatusByName(
-                        updated_segment, SegmentStatus::OK);
-                }
-                return tl::make_unexpected(err);
-            }
-            // Preserve a pre-existing DRAINING or DRAINED status on retry.
-            if (previous != SegmentStatus::OK) {
-                continue;
-            }
-            err = segment_access.SetSegmentStatusByName(
-                segment_name, SegmentStatus::DRAINING);
-            if (err != ErrorCode::OK) {
-                for (const auto& updated_segment : draining_segments) {
-                    (void)segment_access.SetSegmentStatusByName(
-                        updated_segment, SegmentStatus::OK);
-                }
-                return tl::make_unexpected(err);
-            }
-            draining_segments.push_back(segment_name);
+            segment_access.SetDrainSourceStatus(segment_name,
+                                                SegmentStatus::DRAINING);
         }
     }
 
@@ -10861,7 +10856,7 @@ QueryJobResponse MasterService::DrainJob::ToResponse() const {
     response.segments = request.segments;
     response.succeeded_units = succeeded_units;
     response.failed_units = failed_units;
-    response.blocked_units = blocked_units;
+    response.blocked_units = plan ? plan->blocked_units : 0;
     response.active_units = static_cast<uint64_t>(active_tasks.size());
     response.migrated_bytes = migrated_bytes;
     response.message = message;
@@ -10953,6 +10948,7 @@ void MasterService::ProcessDrainJobStop(DrainJob& job) {
     }
     if (job.status != JobStatus::CANCELING) {
         job.status = JobStatus::CANCELING;
+        job.plan.reset();
         job.last_updated_at = std::chrono::system_clock::now();
         job.message = job.stop_reason.load(std::memory_order_relaxed) ==
                               DrainStopReason::TIMEOUT
@@ -10999,7 +10995,7 @@ void MasterService::RequestDrainTaskCancellation(DrainJob& job) {
     auto write_access = task_manager_.get_write_access();
     for (const auto& [task_id, active_task] : job.active_tasks) {
         const auto result =
-            write_access.cancel_task(task_id, active_task.tenant_id);
+            write_access.cancel_task(task_id, active_task.candidate.tenant_id);
         // A task may finish between scheduling and cancellation. Its result
         // is accounted for by RefreshDrainJobTasks.
         if (result != ErrorCode::OK &&
@@ -11028,13 +11024,7 @@ bool MasterService::FinishDrainJobCancellation(DrainJob& job) {
     // The job lock keeps queries and scheduling behind segment restoration.
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     for (const auto& segment_name : job.request.segments) {
-        SegmentStatus status = SegmentStatus::UNDEFINED;
-        if (segment_access.GetSegmentStatusByName(segment_name, status) ==
-                ErrorCode::OK &&
-            status != SegmentStatus::UNMOUNTING) {
-            (void)segment_access.SetSegmentStatusByName(segment_name,
-                                                        SegmentStatus::OK);
-        }
+        segment_access.SetDrainSourceStatus(segment_name, SegmentStatus::OK);
     }
     job.status = JobStatus::CANCELED;
     job.last_updated_at = std::chrono::system_clock::now();
@@ -11042,18 +11032,11 @@ bool MasterService::FinishDrainJobCancellation(DrainJob& job) {
     return true;
 }
 
-std::string MasterService::MakeDrainUnitKey(
-    const TenantId& tenant_id, const std::string& key,
-    const std::string& source_segment) const {
-    return std::to_string(tenant_id.value().size()) + ":" + tenant_id.value() +
-           ":" + std::to_string(key.size()) + ":" + key + ":" + source_segment;
-}
-
 std::optional<std::string> MasterService::SelectDrainTargetForKey(
-    const ObjectMetadata& metadata, const std::string& source_segment,
-    const std::vector<std::string>& requested_targets) {
+    const std::vector<std::string>& existing_segments,
+    const CreateDrainJobRequest& request) {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    std::vector<std::string> candidate_segments = requested_targets;
+    std::vector<std::string> candidate_segments = request.target_segments;
     if (candidate_segments.empty()) {
         auto err = segment_access.GetAllSegments(candidate_segments);
         if (err != ErrorCode::OK) {
@@ -11061,11 +11044,11 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
         }
     }
 
-    const auto existing_segments = metadata.GetReplicaSegmentNames();
     double best_util = std::numeric_limits<double>::max();
     std::optional<std::string> best_target;
     for (const auto& candidate : candidate_segments) {
-        if (candidate == source_segment) {
+        if (std::find(request.segments.begin(), request.segments.end(),
+                      candidate) != request.segments.end()) {
             continue;
         }
         if (std::find(existing_segments.begin(), existing_segments.end(),
@@ -11102,7 +11085,7 @@ void MasterService::RefreshDrainJobTasks(DrainJob& job) {
     std::vector<UUID> finished_task_ids;
     finished_task_ids.reserve(job.active_tasks.size());
 
-    for (const auto& [task_id, active_task] : job.active_tasks) {
+    for (auto& [task_id, active_task] : job.active_tasks) {
         const auto& task_opt = tasks.at(task_id);
         if (!task_opt.has_value()) {
             // Drain tasks are retained until observed. Do not infer that a
@@ -11114,13 +11097,14 @@ void MasterService::RefreshDrainJobTasks(DrainJob& job) {
             continue;
         }
 
+        auto& candidate = active_task.candidate;
         if (task_opt->status != TaskStatus::SUCCESS) {
             // A failed revoke can leave an allocation and a replication task
             // behind. The worker has stopped, but wait for its cleanup before
             // retrying the unit or restoring the source segment.
             std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
-            MetadataAccessorRO accessor(
-                this, ObjectIdentity{active_task.tenant_id, active_task.key});
+            MetadataAccessorRO accessor(this, candidate.tenant_id,
+                                        candidate.object.key);
             if (accessor.IsPublished() &&
                 accessor.GetState().replication_task) {
                 continue;
@@ -11131,16 +11115,14 @@ void MasterService::RefreshDrainJobTasks(DrainJob& job) {
         if (task_opt->status == TaskStatus::SUCCESS) {
             job.succeeded_units++;
             job.migrated_bytes += active_task.bytes;
-            job.completed_unit_keys.insert(active_task.unit_key);
-        } else if (task_opt->status == TaskStatus::FAILED ||
-                   (task_opt->status == TaskStatus::CANCELED &&
-                    !DrainJobStopRequested(job))) {
-            job.failed_units++;
-            auto& retry_count = job.retry_counts[active_task.unit_key];
-            retry_count++;
-            if (retry_count >= kMaxDrainUnitRetries) {
-                job.terminal_failed_unit_keys.insert(active_task.unit_key);
-            }
+        }
+        const bool failed = task_opt->status == TaskStatus::FAILED ||
+                            (task_opt->status == TaskStatus::CANCELED &&
+                             !DrainJobStopRequested(job));
+        if (failed && RecordDrainFailure(job, candidate)) {
+            job.plan->ready.push_back(std::move(candidate));
+        } else if (job.plan) {
+            --job.plan->sources[candidate.source_index].outstanding;
         }
     }
 
@@ -11153,182 +11135,136 @@ void MasterService::RefreshDrainJobTasks(DrainJob& job) {
     }
 }
 
-void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
-    if (DrainJobStopRequested(job)) {
-        return;
+bool MasterService::RecordDrainFailure(DrainJob& job,
+                                       DrainCandidate& candidate) {
+    ++job.failed_units;
+    if (!job.plan) {
+        return false;
     }
-    if (job.status == JobStatus::CREATED) {
-        job.status = JobStatus::PLANNING;
+    if (++candidate.failed_attempts < kMaxDrainUnitRetries) {
+        return true;
+    }
+    auto& source = job.plan->sources[candidate.source_index];
+    source.exhausted_attempts.insert_or_assign(
+        candidate.tenant_id.MakeScopedKey(candidate.object.key),
+        candidate.object.generation);
+    return false;
+}
+
+void MasterService::DelayDrainCandidate(DrainPlan& plan,
+                                        DrainCandidate candidate,
+                                        bool blocked) {
+    candidate.retry_at = std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds(kJobDispatchThreadSleepMs);
+    candidate.blocked = blocked;
+    plan.blocked_units += blocked;
+    plan.delayed.push_back(std::move(candidate));
+}
+
+tl::expected<MasterService::DrainMove, ErrorCode> MasterService::PlanDrainMove(
+    DrainCandidate& candidate, const CreateDrainJobRequest& request) {
+    const auto& source = request.segments[candidate.source_index];
+    std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
+    MetadataAccessorRO accessor(this, candidate.tenant_id,
+                                candidate.object.key);
+    if (!accessor.IsPublished()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
-    const uint32_t max_concurrency =
-        std::max<uint32_t>(1, job.request.max_concurrency);
-    if (job.active_tasks.size() >= max_concurrency) {
-        job.status = JobStatus::RUNNING;
-        return;
+    const auto& metadata = accessor.Get();
+    const auto segments = metadata.GetReplicaSegmentNames();
+    if (std::find(segments.begin(), segments.end(), source) == segments.end()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    if (candidate.object.generation != accessor.Generation()) {
+        candidate.object.generation = accessor.Generation();
+        candidate.failed_attempts = 0;
     }
 
-    struct DrainPlan {
-        TenantId tenant_id;
-        std::string key;
-        std::string source_segment;
-        std::string target_segment;
-        size_t bytes;
-        std::string unit_key;
-    };
-
-    const size_t slots = max_concurrency - job.active_tasks.size();
-    std::vector<DrainPlan> plans;
-    plans.reserve(slots);
-    std::unordered_set<std::string> active_unit_keys;
-    for (const auto& [_, task] : job.active_tasks) {
-        active_unit_keys.insert(task.unit_key);
+    const auto& state = accessor.GetState();
+    const bool can_move_with_read_lease =
+        !enable_ha_ && metadata.AllReplicas(&Replica::fn_is_memory_replica);
+    if ((!can_move_with_read_lease && !metadata.IsLeaseExpired()) ||
+        !metadata.AllReplicas(&Replica::fn_is_completed) ||
+        state.is_processing || state.replication_task ||
+        state.offloading_task) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
-    std::unordered_set<std::string> blocked_unit_keys;
-    {
-        std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-        VisitNamespaces([&](const TenantId& tenant_id,
-                            metadata::Namespace& ns) {
-            // The walk only narrows the keys to those with a replica on a
-            // source segment: target selection waits on the segment lock,
-            // which the walk body must not do while it holds the cursor, so
-            // each key is resolved again below and judged on what it holds
-            // then.
-            std::vector<std::string> keys_on_source;
-            for (auto object : ns.objects.ReadCursor()) {
-                if (DrainJobStopRequested(job)) {
-                    return;
-                }
-                const auto replica_segments =
-                    object.metadata().GetReplicaSegmentNames();
-                if (std::any_of(job.request.segments.begin(),
-                                job.request.segments.end(),
-                                [&](const std::string& source_segment) {
-                                    return std::find(replica_segments.begin(),
-                                                     replica_segments.end(),
-                                                     source_segment) !=
-                                           replica_segments.end();
-                                })) {
-                    keys_on_source.push_back(object.key());
-                }
+    const bool source_is_serving =
+        metadata.HasReplica([this, &source](const Replica& replica) {
+            if (!IsReplicaReadable(replica) || replica.is_busy()) {
+                return false;
             }
-            for (const std::string& key : keys_on_source) {
-                if (DrainJobStopRequested(job)) {
-                    return;
-                }
-                MetadataAccessorRO accessor(this,
-                                            ObjectIdentity{tenant_id, key});
-                if (!accessor.IsPublished()) {
-                    continue;
-                }
-                const auto& metadata = accessor.Get();
-                for (const auto& source_segment : job.request.segments) {
-                    if (DrainJobStopRequested(job)) {
-                        return;
-                    }
-                    const auto unit_key =
-                        MakeDrainUnitKey(tenant_id, key, source_segment);
-                    if (job.completed_unit_keys.contains(unit_key) ||
-                        active_unit_keys.contains(unit_key) ||
-                        job.terminal_failed_unit_keys.contains(unit_key)) {
-                        continue;
-                    }
-
-                    const auto replica_segments =
-                        metadata.GetReplicaSegmentNames();
-                    if (std::find(replica_segments.begin(),
-                                  replica_segments.end(),
-                                  source_segment) == replica_segments.end()) {
-                        continue;
-                    }
-
-                    bool source_is_serving = false;
-                    metadata.VisitReplicas(
-                        [this, &source_segment](const Replica& replica) {
-                            if (!IsReplicaReadable(replica) ||
-                                replica.is_busy()) {
-                                return false;
-                            }
-                            const auto names = replica.get_segment_names();
-                            return std::any_of(
-                                names.begin(), names.end(),
-                                [&source_segment](const auto& name) {
-                                    return name && *name == source_segment;
-                                });
-                        },
-                        [&source_is_serving](const Replica&) {
-                            source_is_serving = true;
-                        });
-                    if (!source_is_serving) {
-                        blocked_unit_keys.insert(unit_key);
-                        continue;
-                    }
-
-                    const bool can_move_with_read_lease =
-                        !enable_ha_ &&
-                        metadata.AllReplicas(&Replica::fn_is_memory_replica);
-                    const auto& state = accessor.GetState();
-                    if ((!can_move_with_read_lease &&
-                         !metadata.IsLeaseExpired()) ||
-                        !metadata.AllReplicas(&Replica::fn_is_completed) ||
-                        state.is_processing || state.replication_task ||
-                        state.offloading_task) {
-                        blocked_unit_keys.insert(unit_key);
-                        continue;
-                    }
-
-                    auto target = SelectDrainTargetForKey(
-                        metadata, source_segment, job.request.target_segments);
-                    if (!target.has_value()) {
-                        blocked_unit_keys.insert(unit_key);
-                        continue;
-                    }
-
-                    if (plans.size() < slots) {
-                        plans.push_back({tenant_id, key, source_segment,
-                                         *target, metadata.TotalLength(),
-                                         unit_key});
-                    }
-                }
-            }
+            const auto names = replica.get_segment_names();
+            return std::find(names.begin(), names.end(), source) != names.end();
         });
+    if (!source_is_serving) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
-    if (DrainJobStopRequested(job)) {
+    auto target = SelectDrainTargetForKey(segments, request);
+    if (!target) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    return DrainMove{std::move(*target), metadata.TotalLength()};
+}
+
+void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
+    if (DrainJobStopRequested(job) ||
+        job.active_tasks.size() >= job.request.max_concurrency) {
         return;
     }
-    job.blocked_units = blocked_unit_keys.size();
+    auto& plan = *job.plan;
+    const auto now = std::chrono::steady_clock::now();
+    size_t slots = job.request.max_concurrency - job.active_tasks.size();
+    while (slots != 0 && !DrainJobStopRequested(job)) {
+        if (plan.ready.empty() &&
+            (plan.delayed.empty() || plan.delayed.front().retry_at > now)) {
+            break;
+        }
+        auto& queue = plan.ready.empty() ? plan.delayed : plan.ready;
+        auto candidate = std::move(queue.front());
+        queue.pop_front();
+        plan.blocked_units -= candidate.blocked;
+        candidate.blocked = false;
 
-    for (const auto& plan : plans) {
+        auto& source = plan.sources[candidate.source_index];
+        auto move = PlanDrainMove(candidate, job.request);
+        if (!move) {
+            if (move.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                --source.outstanding;
+            } else {
+                DelayDrainCandidate(plan, std::move(candidate), true);
+            }
+            continue;
+        }
         if (DrainJobStopRequested(job)) {
             return;
         }
-        auto task_id = CreateMoveTaskInternal(plan.key, plan.tenant_id,
-                                              plan.source_segment,
-                                              plan.target_segment, true);
-        if (task_id.has_value()) {
-            ActiveDrainTask active_task;
-            active_task.task_id = task_id.value();
-            active_task.tenant_id = plan.tenant_id;
-            active_task.key = plan.key;
-            active_task.source_segment = plan.source_segment;
-            active_task.target_segment = plan.target_segment;
-            active_task.bytes = plan.bytes;
-            active_task.unit_key = plan.unit_key;
-            job.active_tasks.emplace(task_id.value(), std::move(active_task));
-        } else if (task_id.error() == ErrorCode::NO_AVAILABLE_HANDLE ||
-                   task_id.error() ==
-                       ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
-                   task_id.error() == ErrorCode::OBJECT_HAS_REPLICATION_TASK) {
-            job.blocked_units++;
+
+        const auto& source_segment =
+            job.request.segments[candidate.source_index];
+        --slots;
+        auto task_id = CreateMoveTaskInternal(
+            candidate.object.key, candidate.tenant_id, source_segment,
+            move->target, true, candidate.object.generation);
+        if (task_id) {
+            job.active_tasks.emplace(
+                *task_id, ActiveDrainTask{std::move(candidate), move->bytes});
+            continue;
+        }
+
+        const auto error = task_id.error();
+        const bool blocked =
+            error == ErrorCode::OBJECT_NOT_FOUND ||
+            error == ErrorCode::NO_AVAILABLE_HANDLE ||
+            error == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
+            error == ErrorCode::OBJECT_HAS_REPLICATION_TASK;
+        if (blocked || RecordDrainFailure(job, candidate)) {
+            DelayDrainCandidate(plan, std::move(candidate), blocked);
         } else {
-            job.failed_units++;
-            auto& retry_count = job.retry_counts[plan.unit_key];
-            retry_count++;
-            if (retry_count >= kMaxDrainUnitRetries) {
-                job.terminal_failed_unit_keys.insert(plan.unit_key);
-            }
+            --source.outstanding;
         }
     }
 
@@ -11338,95 +11274,265 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
 }
 
 bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
-    if (!job.active_tasks.empty() || DrainJobStopRequested(job)) {
-        return false;
-    }
-
-    std::unordered_set<std::string> remaining_segments;
-    std::unordered_set<std::string> remaining_unit_keys;
-    {
-        std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-        VisitNamespaces([&](const TenantId& tenant_id,
-                            metadata::Namespace& ns) {
-            for (auto object : ns.objects.ReadCursor()) {
-                if (DrainJobStopRequested(job)) {
-                    return;
-                }
-                const auto replica_segments =
-                    object.metadata().GetReplicaSegmentNames();
-                for (const auto& source_segment : job.request.segments) {
-                    if (std::find(replica_segments.begin(),
-                                  replica_segments.end(),
-                                  source_segment) != replica_segments.end()) {
-                        remaining_segments.insert(source_segment);
-                        remaining_unit_keys.insert(MakeDrainUnitKey(
-                            tenant_id, object.key(), source_segment));
-                    }
-                }
-            }
-        });
-    }
-
     if (DrainJobStopRequested(job)) {
         return false;
     }
-    bool awaiting_reclamation = false;
+    if (!job.plan) {
+        job.status = JobStatus::PLANNING;
+        job.plan.emplace();
+        job.plan->sources.resize(job.request.segments.size());
+    }
+
+    auto& plan = *job.plan;
+    const auto now = std::chrono::steady_clock::now();
+    const bool needs_candidates =
+        plan.ready.empty() &&
+        job.active_tasks.size() < job.request.max_concurrency;
+    const auto retry_incomplete_scan = [&](const DrainSourceProgress& source) {
+        return needs_candidates && source.scan_incomplete &&
+               source.verify_after <= now;
+    };
+    if (plan.checked_registration_version ==
+            segment_manager_.GetRegistrationVersion() &&
+        std::none_of(
+            plan.sources.begin(), plan.sources.end(), [&](const auto& source) {
+                return source.outstanding == 0 || retry_incomplete_scan(source);
+            })) {
+        return false;
+    }
+
+    struct SourceScan {
+        size_t index;
+        uint64_t registration_version;
+        bool has_exhausted_candidate{false};
+        std::unordered_set<std::string> outstanding_keys{};
+    };
+    std::unordered_map<std::string_view, SourceScan> scans;
+    bool all_idle = true;
+    bool reconciling = false;
     {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        for (const auto& segment_name : job.request.segments) {
-            if (!remaining_segments.contains(segment_name)) {
-                // Detached buffers still occupy the mounted allocator even
-                // after the last object has stopped advertising this segment.
-                if (segment_access.HasAllocatedMemory(segment_name)) {
-                    awaiting_reclamation = true;
-                    continue;
+        auto segments = segment_manager_.getSegmentAccess();
+        plan.checked_registration_version =
+            segment_manager_.GetRegistrationVersion();
+        for (size_t i = 0; i < plan.sources.size(); ++i) {
+            auto& source = plan.sources[i];
+            const auto& name = job.request.segments[i];
+            const auto version = segments.GetRegistrationVersion(name);
+            const bool registration_changed =
+                version != source.registration_version;
+            if (registration_changed) {
+                // Fence every mounted ID under this name before reconciling.
+                segments.SetDrainSourceStatus(name, SegmentStatus::DRAINING);
+                source.drained = false;
+            }
+
+            if (source.outstanding != 0) {
+                all_idle = false;
+                if (registration_changed || retry_incomplete_scan(source)) {
+                    scans.emplace(name, SourceScan{i, version});
+                    reconciling = true;
                 }
-                (void)segment_access.SetSegmentStatusByName(
-                    segment_name, SegmentStatus::DRAINED);
+                continue;
             }
-        }
-    }
 
-    if (awaiting_reclamation) {
-        return false;
-    }
-
-    if (remaining_segments.empty()) {
-        job.status = JobStatus::SUCCEEDED;
-        job.last_updated_at = std::chrono::system_clock::now();
-        job.message = "Drain job finished successfully";
-        return true;
-    }
-
-    bool all_remaining_terminal_failed = !remaining_unit_keys.empty();
-    for (const auto& unit_key : remaining_unit_keys) {
-        if (!job.terminal_failed_unit_keys.contains(unit_key)) {
-            all_remaining_terminal_failed = false;
-            break;
-        }
-    }
-    if (!all_remaining_terminal_failed) {
-        return false;
-    }
-
-    {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        for (const auto& segment_name : job.request.segments) {
             SegmentStatus status = SegmentStatus::UNDEFINED;
-            if (segment_access.GetSegmentStatusByName(segment_name, status) ==
-                    ErrorCode::OK &&
-                status != SegmentStatus::UNMOUNTING) {
-                (void)segment_access.SetSegmentStatusByName(segment_name,
-                                                            SegmentStatus::OK);
+            (void)segments.GetSegmentStatusByName(name, status);
+            if (status == SegmentStatus::OK) {
+                segments.SetDrainSourceStatus(name, SegmentStatus::DRAINING);
+                source.drained = false;
+                source.verify_after = {};
+            } else if (source.drained && status == SegmentStatus::DRAINING) {
+                source.drained = false;
+                source.verify_after = {};
+            }
+            if (registration_changed ||
+                (!source.drained && (source.verify_after <= now ||
+                                     (source.awaiting_reclamation &&
+                                      !segments.HasAllocatedMemory(name))))) {
+                scans.emplace(name, SourceScan{i, version});
+            }
+        }
+        if (all_idle && !scans.empty()) {
+            // Use the same walk to confirm earlier failures before deciding
+            // the overall job outcome.
+            for (size_t i = 0; i < plan.sources.size(); ++i) {
+                if (!plan.sources[i].drained) {
+                    const auto& name = job.request.segments[i];
+                    scans.try_emplace(
+                        name,
+                        SourceScan{i, segments.GetRegistrationVersion(name)});
+                }
             }
         }
     }
+    if (scans.empty()) {
+        return false;
+    }
 
-    job.status = JobStatus::FAILED;
+    if (reconciling) {
+        const auto remember = [&](const DrainCandidate& candidate) {
+            auto scan =
+                scans.find(job.request.segments[candidate.source_index]);
+            if (scan != scans.end()) {
+                scan->second.outstanding_keys.insert(
+                    candidate.tenant_id.MakeScopedKey(candidate.object.key));
+            }
+        };
+        for (const auto& candidate : plan.ready) {
+            remember(candidate);
+        }
+        for (const auto& candidate : plan.delayed) {
+            remember(candidate);
+        }
+        for (const auto& [_, task] : job.active_tasks) {
+            remember(task.candidate);
+        }
+    }
+
+    bool skipped_busy_keys = false;
+    {
+        std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
+        // Include first writes in empty namespaces. The allocator check below
+        // protects unpublished source buffers even when their keys are busy.
+        namespaces_.Visit([&](const TenantId& tenant_id,
+                              metadata::Namespace& ns) {
+            if (DrainJobStopRequested(job)) {
+                return;
+            }
+            auto cursor = ns.objects.ReadCursorSkippingBusyKeys();
+            for (auto object : cursor) {
+                if (DrainJobStopRequested(job)) {
+                    return;
+                }
+                const auto names = object.metadata().GetReplicaSegmentNames();
+                for (auto it = names.begin(); it != names.end(); ++it) {
+                    auto scan = scans.find(*it);
+                    if (scan == scans.end() ||
+                        std::find(names.begin(), it, *it) != it) {
+                        continue;
+                    }
+                    auto& entry = scan->second;
+                    auto& source = plan.sources[entry.index];
+                    if (!entry.outstanding_keys.empty() &&
+                        entry.outstanding_keys.contains(
+                            tenant_id.MakeScopedKey(object.key()))) {
+                        continue;
+                    }
+                    if (!source.exhausted_attempts.empty()) {
+                        const auto failed = source.exhausted_attempts.find(
+                            tenant_id.MakeScopedKey(object.key()));
+                        if (failed != source.exhausted_attempts.end()) {
+                            if (failed->second == object.generation()) {
+                                entry.has_exhausted_candidate = true;
+                                continue;
+                            }
+                            source.exhausted_attempts.erase(failed);
+                        }
+                    }
+                    plan.ready.push_back(
+                        {tenant_id, object.ref(), entry.index});
+                    ++source.outstanding;
+                }
+            }
+            skipped_busy_keys |= cursor.skipped_busy_keys();
+        });
+    }
+    if (DrainJobStopRequested(job)) {
+        return false;
+    }
+
+    bool can_finish = all_idle;
+    bool all_drained;
+    {
+        auto segments = segment_manager_.getSegmentAccess();
+        const auto verify_after =
+            std::chrono::steady_clock::now() + kDrainSourceVerificationInterval;
+        for (const auto& [_, scan] : scans) {
+            auto& source = plan.sources[scan.index];
+            const auto& name = job.request.segments[scan.index];
+            if (scan.registration_version !=
+                segments.GetRegistrationVersion(name)) {
+                // The next round will reconcile the registration that raced
+                // with this scan, even if this walk queued candidates.
+                segments.SetDrainSourceStatus(name, SegmentStatus::DRAINING);
+                can_finish = false;
+                continue;
+            }
+            source.registration_version = scan.registration_version;
+            source.verify_after = {};
+            source.awaiting_reclamation = false;
+            source.scan_incomplete = skipped_busy_keys;
+            if (source.outstanding != 0) {
+                if (source.scan_incomplete) {
+                    source.verify_after = verify_after;
+                }
+                can_finish = false;
+                continue;
+            }
+
+            SegmentStatus status = SegmentStatus::UNDEFINED;
+            (void)segments.GetSegmentStatusByName(name, status);
+            if (status == SegmentStatus::OK) {
+                segments.SetDrainSourceStatus(name, SegmentStatus::DRAINING);
+                can_finish = false;
+                continue;
+            }
+            if (scan.has_exhausted_candidate) {
+                // A skipped key may still contain a movable replica.
+                can_finish = can_finish && !source.scan_incomplete;
+                source.verify_after = verify_after;
+                continue;
+            }
+            if (segments.HasAllocatedMemory(name)) {
+                // A detached buffer can outlive its metadata. Check it cheaply
+                // between verification walks.
+                source.awaiting_reclamation = true;
+                source.verify_after = verify_after;
+                can_finish = false;
+                continue;
+            }
+            segments.SetDrainSourceStatus(name, SegmentStatus::DRAINED);
+            source.drained = true;
+            source.scan_incomplete = false;
+            source.exhausted_attempts.clear();
+        }
+        if (!can_finish || DrainJobStopRequested(job)) {
+            return false;
+        }
+        for (size_t i = 0; i < plan.sources.size(); ++i) {
+            auto& source = plan.sources[i];
+            const auto& name = job.request.segments[i];
+            if (source.registration_version !=
+                segments.GetRegistrationVersion(name)) {
+                return false;
+            }
+            if (source.drained) {
+                SegmentStatus status = SegmentStatus::UNDEFINED;
+                (void)segments.GetSegmentStatusByName(name, status);
+                if (status == SegmentStatus::OK ||
+                    status == SegmentStatus::DRAINING) {
+                    source.drained = false;
+                    source.verify_after = {};
+                    return false;
+                }
+            }
+        }
+        all_drained =
+            std::all_of(plan.sources.begin(), plan.sources.end(),
+                        [](const auto& source) { return source.drained; });
+        if (!all_drained) {
+            for (const auto& name : job.request.segments) {
+                segments.SetDrainSourceStatus(name, SegmentStatus::OK);
+            }
+        }
+
+        // Serialize the terminal decision with registration changes.
+        job.status = all_drained ? JobStatus::SUCCEEDED : JobStatus::FAILED;
+    }
+    job.plan.reset();
     job.last_updated_at = std::chrono::system_clock::now();
-    job.message = "Drain job failed: unrecoverable units remain";
+    job.message = all_drained ? "Drain job finished successfully"
+                              : "Drain job failed: unrecoverable units remain";
     return true;
 }
 

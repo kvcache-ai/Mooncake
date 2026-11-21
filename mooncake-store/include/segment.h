@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <boost/functional/hash.hpp>
 #include <chrono>
 #include <map>
@@ -168,8 +169,8 @@ class ScopedSegmentAccess {
                             size_t& capacity);
 
     /**
-     * @brief Check whether the named segment still has allocated memory,
-     * including when it no longer accepts new allocations.
+     * @brief Check whether any registration under this name still has
+     * allocated memory, including those closed to new allocations.
      * @param segment_name Name of the mounted segment to check.
      * @return True if the segment has allocated memory. False if the segment
      * is missing or has no allocated memory.
@@ -218,7 +219,17 @@ class ScopedSegmentAccess {
     ErrorCode SetSegmentStatusByName(const std::string& segment_name,
                                      SegmentStatus status);
 
+    // Zero denotes a name with no mounted registrations.
+    uint64_t GetRegistrationVersion(const std::string& segment_name) const;
+
+    // Drain jobs own a source name, which may contain several mounted IDs.
+    // Preserve already-drained registrations when closing them to allocation.
+    void SetDrainSourceStatus(const std::string& segment_name,
+                              SegmentStatus status);
+
    private:
+    void RecordRegistration(const Segment& segment);
+    ErrorCode SetSegmentStatus(MountedSegment& mounted, SegmentStatus status);
     void ReindexSegmentNameAfterRemoval(const UUID& removed_segment_id,
                                         const std::string& segment_name);
 
@@ -397,6 +408,12 @@ class SegmentManager {
         return usage_tracker_->GetUsage();
     }
 
+    // Used as a fast check before the drain scheduler takes segment_mutex_.
+    // Per-name versions are read under ScopedSegmentAccess.
+    [[nodiscard]] uint64_t GetRegistrationVersion() const noexcept {
+        return registration_version_.load(std::memory_order_relaxed);
+    }
+
     ErrorCode initializeCxlAllocator(const std::string& cxl_path,
                                      size_t cxl_size);
 
@@ -428,6 +445,12 @@ class SegmentManager {
         client_by_name_;  // segment name -> client_id
     std::unordered_map<std::string, UUID>
         segment_id_by_name_;             // segment name -> segment_id
+    struct Registrations {
+        std::set<UUID> ids;
+        uint64_t version{0};
+    };
+    std::unordered_map<std::string, Registrations> registrations_by_name_;
+    std::atomic<uint64_t> registration_version_{0};
     HostSegmentIndex segments_by_host_;  // host_id -> segment name -> segment
                                          // ids for allocatable segments
     friend class ScopedSegmentAccess;

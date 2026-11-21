@@ -351,6 +351,36 @@ class MasterServiceTestPeer {
         return service.task_manager_;
     }
 
+    static void StopDrainDispatchForTesting(MasterService& service) {
+        service.job_dispatch_running_ = false;
+        service.job_dispatch_thread_.join();
+    }
+
+    static void RunDrainRoundForTesting(MasterService& service) {
+        service.ProcessDrainJobs();
+    }
+
+    static void MakeDrainChecksDueForTesting(MasterService& service,
+                                             const UUID& job_id) {
+        std::lock_guard jobs_lock(service.job_mutex_);
+        const auto& job = service.drain_jobs_.at(job_id);
+        std::lock_guard job_lock(job->mutex);
+        for (auto& candidate : job->plan->delayed) {
+            candidate.retry_at = {};
+        }
+        for (auto& source : job->plan->sources) {
+            source.verify_after = {};
+        }
+    }
+
+    static bool DrainScanIncompleteForTesting(MasterService& service,
+                                              const UUID& job_id) {
+        std::lock_guard jobs_lock(service.job_mutex_);
+        const auto& job = service.drain_jobs_.at(job_id);
+        std::lock_guard job_lock(job->mutex);
+        return job->plan->sources.front().scan_incomplete;
+    }
+
     static std::unique_lock<std::mutex> LockDrainJobForTesting(
         MasterService& service, const UUID& job_id) {
         std::shared_ptr<MasterService::DrainJob> job;
