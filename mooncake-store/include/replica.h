@@ -302,10 +302,14 @@ enum class ReplicaWriteMode {
  */
 struct ExistOptions {
     bool prefetch_to_memory = false;
+    // Split the key set into chunks and query them in parallel on the master.
+    // Off by default; the serial path is unchanged when false.
+    bool chunked_parallel = false;
     friend std::ostream& operator<<(std::ostream& os,
                                     const ExistOptions& options) noexcept {
         os << "ExistOptions: { prefetch_to_memory: "
-           << options.prefetch_to_memory << " }";
+           << options.prefetch_to_memory
+           << ", chunked_parallel: " << options.chunked_parallel << " }";
         return os;
     }
 };

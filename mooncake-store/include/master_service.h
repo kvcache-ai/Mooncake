@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <latch>
 #include <list>
 #include <limits>
 #include <memory>
@@ -25,6 +26,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <asio/thread_pool.hpp>
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
 
@@ -251,7 +253,8 @@ class MasterService {
         -> tl::expected<bool, ErrorCode>;
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
-        const std::vector<std::string>& keys, const TenantId& tenant_id);
+        const std::vector<std::string>& keys, const TenantId& tenant_id,
+        bool parallel = false);
 
     /**
      * @brief Point-in-time existence check that grants no read lease.
@@ -1157,7 +1160,7 @@ class MasterService {
         -> tl::expected<bool, ErrorCode>;
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyImpl(
         const std::vector<std::string>& keys, const TenantId& tenant_id,
-        bool grant_lease);
+        bool grant_lease, bool parallel = false);
 
     // One pool-wide round of memory eviction (see eviction::Evictor), after
     // the housekeeping that frees expired writes and deferred releases. Each
@@ -2091,6 +2094,15 @@ class MasterService {
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     mutable std::shared_mutex master_state_mutex_;
+
+    // Parallel batch_is_exist pool. Lazily created on the first parallel
+    // lookup so a master that never opts in spawns no extra threads. It is a
+    // dedicated pool (separate from RpcWorkerPool) so a large batch cannot
+    // starve other RPC handlers.
+    std::once_flag batch_exist_pool_once_;
+    size_t batch_exist_worker_count_ = 0;
+    std::unique_ptr<asio::thread_pool> batch_exist_pool_;
+    asio::thread_pool* GetBatchExistPool();
 
     // Restore lifecycle state (RFC #4700, slice 1). Declared next to
     // master_state_mutex_ because the follow-up slices replace that lock's

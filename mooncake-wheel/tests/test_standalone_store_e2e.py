@@ -129,6 +129,26 @@ class TestStandaloneStoreE2E(unittest.TestCase):
         finally:
             self.assertEqual(self.store.unregister_buffer(ptr), 0)
 
+    def test_batch_is_exist_parallel_matches_serial(self) -> None:
+        from mooncake.store import ExistOptions
+
+        batch_size = 2000  # above the 1024-key parallel threshold
+        keys = [
+            f"standalone_parallel_exist_{os.getpid()}_{time.time_ns()}_{i}"
+            for i in range(batch_size)
+        ]
+        # Put roughly half the keys so the batch mixes hits and misses.
+        for i in range(0, batch_size, 2):
+            self.assertEqual(self.store.put(keys[i], b"x"), 0)
+
+        serial = self.store.batch_is_exist(keys)
+        options = ExistOptions()
+        options.chunked_parallel = True
+        parallel = self.store.batch_is_exist(keys, options)
+
+        self.assertEqual(len(serial), batch_size)
+        self.assertEqual(parallel, serial)
+
     def test_session_ranges_put_get(self) -> None:
         num_layers = 4
         page_size = 4096

@@ -1,6 +1,7 @@
 #include "master_service.h"
 #include "config/replica_selection_config.h"
 
+#include <asio/post.hpp>
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -2984,8 +2985,9 @@ bool MasterService::ReadExistence(const ObjectMetadata& metadata,
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
-    const std::vector<std::string>& keys, const TenantId& tenant_id) {
-    return BatchExistKeyImpl(keys, tenant_id, /*grant_lease=*/true);
+    const std::vector<std::string>& keys, const TenantId& tenant_id,
+    bool parallel) {
+    return BatchExistKeyImpl(keys, tenant_id, /*grant_lease=*/true, parallel);
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchProbeKey(
@@ -3040,26 +3042,81 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchProbeKey(
     return results;
 }
 
+asio::thread_pool* MasterService::GetBatchExistPool() {
+    std::call_once(batch_exist_pool_once_, [this] {
+        unsigned workers =
+            std::max<unsigned>(std::thread::hardware_concurrency(), 2u);
+        if (const char* env = std::getenv("MOONCAKE_BATCH_EXIST_WORKERS")) {
+            const unsigned parsed =
+                static_cast<unsigned>(std::strtoul(env, nullptr, 10));
+            if (parsed > 0) {
+                workers = parsed;
+            }
+        } else {
+            // Cap the default: on many-core hosts, shared_mutex reader
+            // contention and per-key atomic work-stealing outweigh the gains
+            // past ~32 workers (measured on a 256-core host).
+            workers = std::min<unsigned>(workers, 32u);
+        }
+        batch_exist_worker_count_ = workers;
+        batch_exist_pool_ = std::make_unique<asio::thread_pool>(workers);
+    });
+    return batch_exist_pool_.get();
+}
+
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
     const std::vector<std::string>& keys, const TenantId& tenant_id,
-    bool grant_lease) {
+    bool grant_lease, bool parallel) {
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
     std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
     if (keys.empty()) {
         return results;
     }
 
-    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    for (size_t i = 0; i < keys.size(); ++i) {
+    auto lookup = [&](size_t i) {
         MetadataAccessorRO accessor(this, normalized_tenant, keys[i]);
         if (!accessor.Exists()) {
             VLOG(1) << "key=" << keys[i] << ", tenant_id=" << normalized_tenant
                     << ", info=object_not_found";
             results[i] = false;
-            continue;
+            return;
         }
         results[i] = ReadExistence(accessor.Get(), grant_lease);
+    };
+
+    constexpr size_t kParallelThreshold = 1024;
+    asio::thread_pool* pool = parallel && keys.size() >= kParallelThreshold
+                                  ? GetBatchExistPool()
+                                  : nullptr;
+    const size_t worker_count =
+        pool ? std::min(keys.size(), batch_exist_worker_count_) : 0;
+
+    if (worker_count <= 1) {
+        std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            lookup(i);
+        }
+        return results;
     }
+
+    std::atomic<size_t> next_index{0};
+    std::latch completed(static_cast<std::ptrdiff_t>(worker_count));
+    for (size_t w = 0; w < worker_count; ++w) {
+        asio::post(pool->get_executor(), [&]() {
+            std::shared_lock<std::shared_mutex> shared_lock(
+                master_state_mutex_);
+            while (true) {
+                const size_t i =
+                    next_index.fetch_add(1, std::memory_order_relaxed);
+                if (i >= keys.size()) {
+                    break;
+                }
+                lookup(i);
+            }
+            completed.count_down();
+        });
+    }
+    completed.wait();
     return results;
 }
 

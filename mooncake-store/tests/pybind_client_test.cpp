@@ -3537,6 +3537,36 @@ TEST_F(RealClientTest, BatchIsExistMixed) {
     EXPECT_EQ(results[3], 0) << "also_missing should not exist";
 }
 
+TEST_F(RealClientTest, BatchIsExistParallelMatchesSerial) {
+    StartMasterAndSetupClient();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    const std::string data = "parallel_exist_data";
+    std::span<const char> data_span(data.data(), data.size());
+
+    constexpr int kBatchSize = 2000;  // above the 1024-key parallel threshold
+    std::vector<std::string> keys;
+    keys.reserve(kBatchSize);
+    for (int i = 0; i < kBatchSize; ++i) {
+        keys.push_back("parallel_exist_key_" + std::to_string(i));
+    }
+    // Put roughly half the keys so the batch mixes hits and misses.
+    for (int i = 0; i < kBatchSize; i += 2) {
+        ASSERT_EQ(py_client_->put(keys[i], data_span, config), 0);
+    }
+
+    auto serial = py_client_->batchIsExist(keys);
+    ExistOptions options;
+    options.chunked_parallel = true;
+    auto parallel = py_client_->batchIsExist(keys, options);
+
+    ASSERT_EQ(serial.size(), keys.size());
+    ASSERT_EQ(parallel.size(), serial.size());
+    EXPECT_EQ(parallel, serial);
+}
+
 TEST_F(RealClientTest, ErrBatchIsExistBeforeSetup) {
     GLogMuter muter;
     std::vector<std::string> keys = {"k1", "k2"};

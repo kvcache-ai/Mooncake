@@ -189,6 +189,8 @@ class DummyClient : public PyClient {
                                   const ExistOptions &options) override;
 
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
+    std::vector<int> batchIsExist(const std::vector<std::string> &keys,
+                                  bool parallel);
 
     int probeKey(const std::string &key);
 
