@@ -9,6 +9,7 @@
 #include <optional>
 #include <semaphore>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include <ylt/coro_http/coro_http_server.hpp>
@@ -41,6 +42,10 @@ class MasterAdminServer {
     void SetServiceDelegate(std::shared_ptr<WrappedMasterService> service);
 
     void SetServiceAvailable(bool available);
+
+    // Returns true when `remote_address` ("ip:port" as reported by the HTTP
+    // connection) names a loopback peer.
+    static bool IsLoopbackRemoteAddress(std::string_view remote_address);
 
    private:
     struct RuntimeSnapshot {
@@ -118,12 +123,21 @@ class MasterAdminServer {
     void HandleSoftPin(coro_http::coro_http_request& req,
                        coro_http::coro_http_response& resp, bool unpin);
 
+    // Key-inspection routes expose raw object keys, which may embed
+    // caller secrets (e.g. LMCache cache salts). With MC_MASTER_ADMIN_TOKEN
+    // set they require "Authorization: Bearer <token>"; otherwise they are
+    // limited to loopback peers unless MC_MASTER_ADMIN_ALLOW_INSECURE is set.
+    bool AuthorizeKeyInspection(coro_http::coro_http_request& req,
+                                coro_http::coro_http_response& resp) const;
+
     void RegisterHandler();
     void RefreshStorageMetrics() const;
 
     uint16_t http_port_;
     std::string http_host_;
     bool enable_metric_reporting_ = false;
+    std::string admin_token_;
+    bool allow_insecure_key_inspection_ = false;
     coro_http::coro_http_server http_server_;
     std::thread metric_report_thread_;
     std::atomic<bool> metric_report_running_{false};

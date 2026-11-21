@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import http.client
+import os
 import sys
 import urllib.error
 import urllib.parse
@@ -38,6 +39,11 @@ def parse_master_host(master_server_address: str) -> str:
 def fetch_keys(host: str, http_port: int, timeout: float) -> list[str]:
     url = f"http://{host}:{http_port}/get_all_keys"
     req = urllib.request.Request(url, method="GET")
+    # The master only serves key listings to loopback clients unless it is
+    # configured with MC_MASTER_ADMIN_TOKEN, in which case send it.
+    admin_token = os.environ.get("MC_MASTER_ADMIN_TOKEN")
+    if admin_token:
+        req.add_header("Authorization", f"Bearer {admin_token}")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8", errors="ignore")
