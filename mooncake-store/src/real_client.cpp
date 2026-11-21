@@ -1517,7 +1517,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     << "sunrise_link protocol requires USE_SUNRISE build";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
 #endif
-            } else if (this->protocol == "ub") {
+            } else if (this->protocol == "ub" && !use_mmap_segment) {
+                // Only allocate_buffer_allocator_memory() memory goes back
+                // through the UB free path; hugepage mmaps fall through to
+                // munmap below.
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
             } else if (use_mmap_segment) {
