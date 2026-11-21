@@ -1439,21 +1439,6 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
     if (context_.cqCount() <= 0) return 0;
     if (thread_id < 0 || thread_id >= worker_count_) return 0;
 
-    const uint64_t poll_ts = getCurrentTimeInNano();
-    const uint64_t previous_poll_ts =
-        last_poll_ts_ns_.exchange(poll_ts, std::memory_order_release);
-    last_poll_ts_ns_.notify_all();
-    if (previous_poll_ts > 0 && poll_ts > previous_poll_ts) {
-        const uint64_t interval = poll_ts - previous_poll_ts;
-        last_poll_interval_ns_.store(interval, std::memory_order_relaxed);
-        uint64_t previous_max =
-            max_poll_interval_ns_.load(std::memory_order_relaxed);
-        while (interval > previous_max &&
-               !max_poll_interval_ns_.compare_exchange_weak(
-                   previous_max, interval, std::memory_order_relaxed)) {
-        }
-    }
-
     const static size_t kPollCount = 64;
     std::vector<ibv_wc> wc_list;
     const int cq_index = cqIndexForPostingThread(thread_id);
@@ -1465,6 +1450,33 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
         LOG(ERROR) << "Worker: Failed to poll completion queues";
         return nr_poll;
     }
+
+    // Poll-interval statistics cost a clock read plus three atomics per
+    // call. Empty polls are the common case on deployments whose RDMA pools
+    // see little or no traffic, so sample the clock only on real completions
+    // or once every kIdlePollStatsInterval calls; the completion-timeout
+    // diagnostic reads these at millisecond granularity and tolerates the
+    // small staleness.
+    constexpr int kIdlePollStatsInterval = 256;
+    thread_local int idle_polls_since_stats = 0;
+    if (nr_poll > 0 || ++idle_polls_since_stats >= kIdlePollStatsInterval) {
+        idle_polls_since_stats = 0;
+        const uint64_t poll_ts = getCurrentTimeInNano();
+        const uint64_t previous_poll_ts =
+            last_poll_ts_ns_.exchange(poll_ts, std::memory_order_release);
+        last_poll_ts_ns_.notify_all();
+        if (previous_poll_ts > 0 && poll_ts > previous_poll_ts) {
+            const uint64_t interval = poll_ts - previous_poll_ts;
+            last_poll_interval_ns_.store(interval, std::memory_order_relaxed);
+            uint64_t previous_max =
+                max_poll_interval_ns_.load(std::memory_order_relaxed);
+            while (interval > previous_max &&
+                   !max_poll_interval_ns_.compare_exchange_weak(
+                       previous_max, interval, std::memory_order_relaxed)) {
+            }
+        }
+    }
+
     if (nr_poll == 0) return 0;
 
     int wr_retired = 0;
