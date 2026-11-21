@@ -1179,6 +1179,11 @@ TEST_F(MasterServiceTest, DfsOnlyLifecyclePathsReleaseTheExtent) {
     master_config.put_start_discard_timeout_sec = 1;
     master_config.put_start_release_timeout_sec = 2;
     MasterService service(master_config);
+    MasterServiceTestPeer peer(service);
+    peer.EvictionRunning(service).store(false, std::memory_order_relaxed);
+    if (peer.EvictionThread(service).joinable()) {
+        peer.EvictionThread(service).join();
+    }
     const UUID writer = generate_uuid();
     const UUID other = generate_uuid();
 
@@ -1224,10 +1229,16 @@ TEST_F(MasterServiceTest, DfsOnlyLifecyclePathsReleaseTheExtent) {
     EXPECT_EQ(leased.error(), ErrorCode::OBJECT_HAS_LEASE);
     ASSERT_TRUE(service.Remove("b", TenantId::Default(), /*force=*/true));
 
-    // An abandoned write is reaped after the release timeout.
+    // Drive expiry explicitly rather than racing the eviction worker's cadence.
     ASSERT_TRUE(service.PutStart(writer, "c", TenantId::Default(), kSize,
                                  DfsOnlyConfig()));
-    std::this_thread::sleep_for(std::chrono::seconds(4));
+    const auto now = std::chrono::system_clock::now();
+    peer.DiscardExpiredProcessingReplicas(TenantId::Default(), now);
+    auto pending = service.GetReplicaList("c", TenantId::Default());
+    ASSERT_FALSE(pending.has_value());
+    EXPECT_EQ(pending.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    peer.DiscardExpiredProcessingReplicas(TenantId::Default(),
+                                          now + std::chrono::seconds(3));
     auto reaped = service.GetReplicaList("c", TenantId::Default());
     ASSERT_FALSE(reaped.has_value());
     EXPECT_EQ(reaped.error(), ErrorCode::OBJECT_NOT_FOUND);
@@ -2903,7 +2914,10 @@ TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsEveryTenant) {
 }
 
 TEST_F(MasterServiceTest, UnmountSegmentKeepsSynchronousCleanupInHaMode) {
-    auto config = MasterServiceConfig::builder().set_enable_ha(true).build();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_default_kv_lease_ttl(100)
+                      .build();
     auto service = std::make_unique<MasterService>(config);
 
     auto segment = MakeSegment("ha_sync_segment");
@@ -2915,7 +2929,58 @@ TEST_F(MasterServiceTest, UnmountSegmentKeepsSynchronousCleanupInHaMode) {
     ASSERT_TRUE(exists.value());
 
     ASSERT_TRUE(service->UnmountSegment(segment.id, client_id).has_value());
+    // The lease granted by ExistKey still pins the record (#4508); the
+    // synchronous cleanup takes it once the lease lapses.
+    EXPECT_EQ(1u, service->GetKeyCount());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    ClearInvalidHandlesForTest(*service);
     EXPECT_EQ(0u, service->GetKeyCount());
+}
+
+// Regression for #4508: ExistKey grants a read lease on a hit, and the
+// stale-handle sweep used to erase the record anyway, so a lookup -> load
+// pair raced into OBJECT_NOT_FOUND on a key just reported as present. While
+// the lease is live the sweep now leaves record and replicas in place, so a
+// remount can still revive the object. Reads already fail at unmount itself:
+// PrepareUnmountSegment releases the allocator, so the stale replica reads
+// as REMOVED. After the lease lapses the next sweep takes both.
+TEST_F(MasterServiceTest, SweepDefersToActiveReadLease) {
+    const uint64_t kv_lease_ttl = 500;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    auto service = std::make_unique<MasterService>(service_config);
+    PauseReplicaCleanup(*service);
+
+    const std::string segment_name = "lease_gate_segment";
+    const auto segment = PrepareSimpleSegment(
+        *service, segment_name, kDefaultSegmentBase, kDefaultSegmentSize);
+    const std::string key = "lease_gate_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {segment_name};
+    PutCompletedObject(*service, segment.client_id, key, config);
+
+    // The lookup half of the race: hit, with a fresh read lease.
+    auto exists = service->ExistKey(key, TenantId::Default());
+    ASSERT_TRUE(exists.has_value());
+    ASSERT_TRUE(*exists);
+
+    ASSERT_TRUE(service->UnmountSegment(segment.segment_id, segment.client_id)
+                    .has_value());
+    ClearInvalidHandlesForTest(*service);
+
+    EXPECT_EQ(1u, service->GetKeyCount());
+    // Reads fail as not-found: the allocator went away at unmount and the
+    // stale replica reads as REMOVED. The record is what the lease protects.
+    ExpectKeyHiddenFromReadApis(*service, key, ErrorCode::OBJECT_NOT_FOUND);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(2 * kv_lease_ttl));
+    ClearInvalidHandlesForTest(*service);
+    EXPECT_EQ(0u, service->GetKeyCount());
+    auto after = service->GetReplicaList(key, TenantId::Default());
+    ASSERT_FALSE(after.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, after.error());
 }
 
 TEST_F(MasterServiceTest, CopyInProgressDoesNotKeepUnmountedSourceVisible) {
