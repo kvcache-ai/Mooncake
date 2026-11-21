@@ -7,6 +7,7 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 #include "transport/flagcx_transport/flagcx_transport.h"
+#include "transport/transport_registry.h"
 
 #include "transport/flagcx_transport/flagcx_transport_internal.h"
 
@@ -475,3 +476,5 @@ Status FlagCxTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 }
 
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(flagcx, "flagcx", mooncake::FlagCxTransport);

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/tcp_transport/tcp_transport.h"
+#include "transport/transport_registry.h"
 
 #include <bits/stdint-uintn.h>
 #include <glog/logging.h>
@@ -858,3 +859,5 @@ void TcpTransport::startTransferWithSocket(
 }
 
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(tcp, "tcp", mooncake::TcpTransport);

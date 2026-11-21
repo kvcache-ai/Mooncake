@@ -18,6 +18,7 @@
 #include <cassert>
 #include "transport/kunpeng_transport/ub_context.h"
 #include "transport/kunpeng_transport/ub_transport.h"
+#include "transport/transport_registry.h"
 #include "transport/kunpeng_transport/ub_endpoint.h"
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
 
@@ -560,3 +561,5 @@ std::shared_ptr<UbContext> UbTransport::buildContext(
     }
 }
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(ub, "ub", mooncake::UbTransport);

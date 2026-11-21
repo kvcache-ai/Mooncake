@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/cxl_transport/cxl_transport.h"
+#include "transport/transport_registry.h"
 
 #include <bits/stdint-uintn.h>
 #include <glog/logging.h>
@@ -405,3 +406,5 @@ Status CxlTransport::submitTransferTask(
 }
 
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(cxl, "cxl", mooncake::CxlTransport);

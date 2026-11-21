@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/rdma_transport/rdma_transport.h"
+#include "transport/transport_registry.h"
 
 #include <glog/logging.h>
 #include <sys/mman.h>
@@ -2607,3 +2608,5 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                         retry_count, hint_buffer_id, hint_device_id);
 }
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(rdma, "rdma", mooncake::RdmaTransport);

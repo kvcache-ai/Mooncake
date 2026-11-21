@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/nccl_transport/nccl_transport.h"
+#include "transport/transport_registry.h"
 
 #include <cuda_runtime.h>
 #include <glog/logging.h>
@@ -1290,3 +1291,6 @@ int NcclHostTransport::unregisterLocalMemoryBatch(
 }
 
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT_WITH_OPTIONS(
+    nccl, "nccl", mooncake::NcclHostTransport, true, nullptr, 0);

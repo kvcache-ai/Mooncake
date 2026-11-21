@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/rdma_twosided/rdma_twosided_transport.h"
+#include "transport/transport_registry.h"
 
 #include <glog/logging.h>
 
@@ -61,3 +62,6 @@ int RdmaTwoSidedTransport::onSetupRdmaConnections(
 }
 
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(rdma_twosided, "rdma_twosided",
+                            mooncake::RdmaTwoSidedTransport);

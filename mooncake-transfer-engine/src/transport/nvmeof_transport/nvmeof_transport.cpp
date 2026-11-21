@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/nvmeof_transport/nvmeof_transport.h"
+#include "transport/transport_registry.h"
 
 #include <bits/stdint-uintn.h>
 #include <glog/logging.h>
@@ -439,3 +440,5 @@ void NVMeoFTransport::addSliceToCUFileBatch(
     desc_pool_->pushParams(desc_id, params);
 }
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(nvmeof, "nvmeof", mooncake::NVMeoFTransport);
