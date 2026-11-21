@@ -200,7 +200,8 @@ class TcpTransport : public Transport {
 
     void startTransfer(Slice *slice,
                        std::function<void()> continuation = nullptr,
-                       bool reuse_connection = false);
+                       bool reuse_connection = false,
+                       std::vector<Slice *> followers = {});
 
     void startTransferSequence(std::vector<Slice *> slices);
 
@@ -214,6 +215,9 @@ class TcpTransport : public Transport {
     std::unique_ptr<TcpIoPool> io_pool_;
     size_t num_io_threads_ = 1;
     bool enable_connection_pool_ = true;
+    // MC_TCP_COALESCE=1: fold consecutive requests that continue one remote
+    // range into a single wire request. Off by default.
+    bool coalesce_enabled_ = false;
 
     // Client-side bounded work queues and fixed connection lanes.
     struct ConnectionKey {
@@ -255,6 +259,15 @@ class TcpTransport : public Transport {
         bool use_v2 = false;
         std::function<void()> continuation;
         std::chrono::steady_clock::time_point admission_deadline;
+        // Slices coalesced behind `slice` into the same wire request: same
+        // peer and opcode, remote ranges contiguous and in order.
+        std::vector<Slice *> followers;
+
+        uint64_t bytes() const {
+            uint64_t total = slice->length;
+            for (const auto *follower : followers) total += follower->length;
+            return total;
+        }
 
         TcpWorkItem() = default;
         TcpWorkItem(Slice *slice_arg, bool use_v2_arg,
@@ -266,7 +279,8 @@ class TcpTransport : public Transport {
             : slice(other.slice),
               use_v2(other.use_v2),
               continuation(std::move(other.continuation)),
-              admission_deadline(other.admission_deadline) {
+              admission_deadline(other.admission_deadline),
+              followers(std::move(other.followers)) {
             other.slice = nullptr;
         }
         TcpWorkItem &operator=(TcpWorkItem &&) = delete;
@@ -486,6 +500,7 @@ class TcpTransport : public Transport {
         const std::shared_ptr<PeerConnectionGroup> &group,
         const std::shared_ptr<ConnectionLane> &lane, uint64_t epoch,
         TransferStatusEnum status, bool connection_clean) noexcept;
+    static void initiateWork(ClientSession &session, const TcpWorkItem &work);
     static void completeTerminalAction(TerminalAction action) noexcept;
     static void failWorkItem(
         TcpWorkItem work, WorkFailureReason reason,

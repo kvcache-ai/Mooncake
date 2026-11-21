@@ -139,7 +139,7 @@ void TcpTransport::removeQueuedBytesLocked(PeerConnectionGroup& group,
     group.queued_bytes = 0;
     group.queued_bytes_saturated = false;
     for (const auto& item : group.queue) {
-        addQueuedBytesLocked(group, item.slice->length);
+        addQueuedBytesLocked(group, item.bytes());
         if (group.queued_bytes_saturated) break;
     }
 }
@@ -177,7 +177,7 @@ void TcpTransport::recomputeAdmittedBytesLocked(PeerConnectionGroup& group) {
     group.admitted_bytes = 0;
     auto add_remaining = [&group](const auto& entries) {
         for (const auto& item : entries) {
-            const uint64_t length = item.slice->length;
+            const uint64_t length = item.bytes();
             if (length > group.queued_byte_capacity - group.admitted_bytes) {
                 group.admitted_bytes = group.queued_byte_capacity;
                 return;
@@ -196,8 +196,8 @@ size_t TcpTransport::expirePendingAdmissionsLocked(
     size_t count = 0;
     while (!group.pending_admissions.empty() &&
            group.pending_admissions.front().admission_deadline <= now) {
-        removeAdmittedBytesLocked(
-            group, group.pending_admissions.front().slice->length);
+        removeAdmittedBytesLocked(group,
+                                  group.pending_admissions.front().bytes());
         expired.emplace_back(std::move(group.pending_admissions.front()));
         group.pending_admissions.pop_front();
         ++count;
@@ -212,7 +212,7 @@ size_t TcpTransport::promotePendingAdmissionsLocked(
            !group.pending_admissions.empty()) {
         group.queue.emplace_back(std::move(group.pending_admissions.front()));
         group.pending_admissions.pop_front();
-        addQueuedBytesLocked(group, group.queue.back().slice->length);
+        addQueuedBytesLocked(group, group.queue.back().bytes());
         ++count;
     }
     return count;
@@ -256,7 +256,7 @@ void TcpTransport::refreshAdmissionTimerLocked(
             timer_to_cancel = std::move(group->admission_timer);
         while (!group->pending_admissions.empty()) {
             removeAdmittedBytesLocked(
-                *group, group->pending_admissions.front().slice->length);
+                *group, group->pending_admissions.front().bytes());
             runtime_failed.emplace_back(
                 std::move(group->pending_admissions.front()));
             group->pending_admissions.pop_front();
@@ -293,8 +293,7 @@ void TcpTransport::handleAdmissionTimer(
                 // errors delivered while the matching timer is still active.
                 while (!group->pending_admissions.empty()) {
                     removeAdmittedBytesLocked(
-                        *group,
-                        group->pending_admissions.front().slice->length);
+                        *group, group->pending_admissions.front().bytes());
                     runtime_failed.emplace_back(
                         std::move(group->pending_admissions.front()));
                     group->pending_admissions.pop_front();
@@ -642,7 +641,7 @@ void TcpTransport::enqueuePooledTransfer(const std::string& logical_peer,
                     promoted = promotePendingAdmissionsLocked(*group);
 
                     const bool has_byte_capacity =
-                        hasQueuedByteCapacityLocked(*group, work.slice->length);
+                        hasQueuedByteCapacityLocked(*group, work.bytes());
                     if (!has_byte_capacity) {
                         rejected.emplace(std::move(work));
                         hard_rejection = true;
@@ -650,9 +649,9 @@ void TcpTransport::enqueuePooledTransfer(const std::string& logical_peer,
                                group->queue.size() < group->queue_capacity) {
                         group->queue.emplace_back(std::move(work));
                         addQueuedBytesLocked(*group,
-                                             group->queue.back().slice->length);
-                        addAdmittedBytesLocked(
-                            *group, group->queue.back().slice->length);
+                                             group->queue.back().bytes());
+                        addAdmittedBytesLocked(*group,
+                                               group->queue.back().bytes());
                         direct_admission = true;
                     } else if (group->pending_admissions.size() <
                                group->pending_admission_capacity) {
@@ -660,8 +659,7 @@ void TcpTransport::enqueuePooledTransfer(const std::string& logical_peer,
                             admission_time + group->admission_timeout;
                         group->pending_admissions.emplace_back(std::move(work));
                         addAdmittedBytesLocked(
-                            *group,
-                            group->pending_admissions.back().slice->length);
+                            *group, group->pending_admissions.back().bytes());
                         pending_admission = true;
                     } else {
                         rejected.emplace(std::move(work));
@@ -825,7 +823,7 @@ void TcpTransport::runGroupPump(
             }
 
             lane->current.emplace(std::move(group->queue.front()));
-            const uint64_t length = lane->current->slice->length;
+            const uint64_t length = lane->current->bytes();
             group->queue.pop_front();
             removeQueuedBytesLocked(*group, length);
             removeAdmittedBytesLocked(*group, length);
@@ -1257,10 +1255,7 @@ void TcpTransport::startLaneSession(
                                            status, clean);
                     });
                 lane->session = session;
-                session->initiate(lane->current->slice->source_addr,
-                                  lane->current->slice->tcp.dest_addr,
-                                  lane->current->slice->length,
-                                  lane->current->slice->opcode);
+                initiateWork(*session, *lane->current);
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
                 queue_depth = group->queue.size();
                 queued_bytes = group->queued_bytes;
@@ -1378,9 +1373,34 @@ void TcpTransport::handleLaneTerminal(
     scheduleGroupRetirement(group);
 }
 
+void TcpTransport::initiateWork(ClientSession& session,
+                                const TcpWorkItem& work) {
+    const Slice* head = work.slice;
+    if (work.followers.empty()) {
+        session.initiate(head->source_addr, head->tcp.dest_addr, head->length,
+                         head->opcode);
+        return;
+    }
+    std::vector<std::pair<char*, size_t>> segments;
+    segments.reserve(work.followers.size() + 1);
+    segments.emplace_back(static_cast<char*>(head->source_addr), head->length);
+    for (const auto* follower : work.followers)
+        segments.emplace_back(static_cast<char*>(follower->source_addr),
+                              follower->length);
+    session.initiateCoalesced(std::move(segments), head->tcp.dest_addr,
+                              head->opcode);
+}
+
 void TcpTransport::completeTerminalAction(TerminalAction action) noexcept {
     auto continuation = std::move(action.work.continuation);
     try {
+        // Followers share the wire request, so they share its outcome.
+        for (auto* follower : action.work.followers) {
+            if (action.status == TransferStatusEnum::COMPLETED)
+                follower->markSuccess();
+            else
+                follower->markFailed();
+        }
         if (action.status == TransferStatusEnum::COMPLETED)
             action.work.slice->markSuccess();
         else
