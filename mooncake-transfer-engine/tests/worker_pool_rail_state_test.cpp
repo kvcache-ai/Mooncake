@@ -230,6 +230,11 @@ class WorkerPoolTestPeer {
         pool.resumePausedContext();
     }
 
+    static constexpr auto last_port_down_ns = &WorkerPool::last_port_down_ns_;
+
+    static constexpr auto port_recovery_delay_ns =
+        &WorkerPool::portRecoveryDelayNs;
+
     static int contextFailureThreshold() {
         return WorkerPool::kLocalCompletionFailureThreshold;
     }
@@ -960,6 +965,7 @@ TEST_F(WorkerPoolRailStateTest, FatalEventCancelsPendingGidProbe) {
 
 TEST_F(WorkerPoolRailStateTest,
        PortPollArmsRecoveryWhenPortActiveEventIsMissed) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
     WorkerPoolTestPeer::contextEvent(*worker_pool_, IBV_EVENT_PORT_ERR);
     ASSERT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
     ASSERT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
@@ -985,14 +991,91 @@ TEST_F(WorkerPoolRailStateTest,
     WorkerPoolTestPeer::resumePausedContext(*worker_pool_);
     EXPECT_NE(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
     EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_))
-        << "missed PORT_ACTIVE must reuse the delayed GID probe, not enable "
+        << "missed PORT_ACTIVE must schedule the GID probe, not enable "
            "the context immediately";
 
     gid_probe = [] { return GidRefreshResult::UNCHANGED; };
-    WorkerPoolTestPeer::setRecoveryActivateAfter(*worker_pool_, 1);
     WorkerPoolTestPeer::recoverContext(*worker_pool_);
     EXPECT_TRUE(WorkerPoolTestPeer::contextActive(*worker_pool_));
     EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
+}
+
+TEST_F(WorkerPoolRailStateTest, IsolatedPortFlapRecoversButSecondFlapWaits) {
+    auto &pool = *worker_pool_;
+    WorkerPoolTestPeer::setContextActive(pool, true);
+    port_state_probe = [](ibv_port_state *state) {
+        *state = IBV_PORT_ACTIVE;
+        return 0;
+    };
+    gid_probe = [] { return GidRefreshResult::UNCHANGED; };
+
+    WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ERR);
+    auto &last_down = pool.*WorkerPoolTestPeer::last_port_down_ns;
+    const auto first_down = last_down;
+    WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ERR);
+    EXPECT_EQ(last_down, first_down);
+    WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ACTIVE);
+    WorkerPoolTestPeer::recoverContext(pool);
+    ASSERT_TRUE(WorkerPoolTestPeer::contextActive(pool));
+
+    WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ERR);
+    WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ACTIVE);
+    const auto deadline = WorkerPoolTestPeer::recoveryActivateAfter(pool);
+    ASSERT_NE(deadline, 0u);
+    WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ACTIVE);
+    EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(pool), deadline);
+    WorkerPoolTestPeer::recoverContext(pool);
+    EXPECT_FALSE(WorkerPoolTestPeer::contextActive(pool));
+
+    WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ERR);
+    EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(pool), 0u);
+    WorkerPoolTestPeer::resumePausedContext(pool);
+    WorkerPoolTestPeer::recoverContext(pool);
+    EXPECT_FALSE(WorkerPoolTestPeer::contextActive(pool));
+    WorkerPoolTestPeer::setRecoveryActivateAfter(pool, 1);
+    WorkerPoolTestPeer::recoverContext(pool);
+    EXPECT_TRUE(WorkerPoolTestPeer::contextActive(pool));
+
+    // A later isolated outage is eligible for fast recovery again.
+    last_down -= 30000000000ull;
+    WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ERR);
+    WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ACTIVE);
+    WorkerPoolTestPeer::recoverContext(pool);
+    EXPECT_TRUE(WorkerPoolTestPeer::contextActive(pool));
+}
+
+TEST_F(WorkerPoolRailStateTest, FiveSecondPortOutageIsInclusive) {
+    auto &pool = *worker_pool_;
+    WorkerPoolTestPeer::setContextActive(pool, true);
+    WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ERR);
+    const auto five_seconds_after_down =
+        (pool.*WorkerPoolTestPeer::last_port_down_ns) + 5000000000ull;
+    const auto delay = WorkerPoolTestPeer::port_recovery_delay_ns;
+    EXPECT_EQ(std::invoke(delay, pool, five_seconds_after_down), 0u);
+    EXPECT_EQ(std::invoke(delay, pool, five_seconds_after_down + 1),
+              30000000000ull);
+}
+
+TEST_F(WorkerPoolRailStateTest, PortMustStillBeActiveAtRecoveryProbe) {
+    auto &pool = *worker_pool_;
+    WorkerPoolTestPeer::setContextActive(pool, true);
+    ibv_port_state reported = IBV_PORT_ACTIVE;
+    port_state_probe = [&](ibv_port_state *state) {
+        *state = reported;
+        return 0;
+    };
+    gid_probe = [] {
+        ADD_FAILURE() << "A down port must not reach the GID probe";
+        return GidRefreshResult::UNCHANGED;
+    };
+
+    WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ERR);
+    WorkerPoolTestPeer::resumePausedContext(pool);
+    ASSERT_NE(WorkerPoolTestPeer::recoveryActivateAfter(pool), 0u);
+    reported = IBV_PORT_DOWN;
+    WorkerPoolTestPeer::recoverContext(pool);
+    EXPECT_FALSE(WorkerPoolTestPeer::contextActive(pool));
+    EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(pool), 0u);
 }
 
 TEST_F(WorkerPoolRailStateTest, PortPollLeavesNonPortErrFatalEventsInactive) {
