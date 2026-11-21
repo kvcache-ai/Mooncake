@@ -60,6 +60,9 @@ DEFINE_int32(ha_supervisor_admin_port, 0, "Child supervisor admin port");
 DEFINE_string(ha_supervisor_cluster_id, "", "Child supervisor cluster ID");
 DEFINE_bool(ha_supervisor_enable_oplog, false,
             "Child supervisor enables the batch OpLog");
+DEFINE_string(
+    ha_supervisor_snapshot_local_path, "",
+    "Enable child batch OpLog snapshots and pruning in this directory");
 DEFINE_string(ha_supervisor_shutdown_file, "",
               "Child supervisor also treats this file's existence as a "
               "shutdown request");
@@ -225,11 +228,25 @@ class SupervisorChildProcess {
           client_live_ttl_sec_(client_live_ttl_sec),
           client_suspicion_ttl_sec_(client_suspicion_ttl_sec) {}
 
-    ~SupervisorChildProcess() { Stop(); }
+    ~SupervisorChildProcess() {
+        Stop();
+        if (!snapshot_local_path_.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(snapshot_local_path_, ec);
+        }
+    }
 
     // Points the child at other etcd endpoints than the parent's.
     void SetEtcdEndpoints(std::string endpoints) {
         etcd_endpoints_ = std::move(endpoints);
+    }
+
+    bool EnableOpLogSnapshot() {
+        std::string pattern =
+            ::testing::TempDir() + "mooncake-ha-snapshot-XXXXXX";
+        if (mkdtemp(pattern.data()) == nullptr) return false;
+        snapshot_local_path_ = std::move(pattern);
+        return true;
     }
 
     bool Start() {
@@ -252,6 +269,10 @@ class SupervisorChildProcess {
         };
         if (!shutdown_file_.empty()) {
             args.push_back("--ha_supervisor_shutdown_file=" + shutdown_file_);
+        }
+        if (!snapshot_local_path_.empty()) {
+            args.push_back("--ha_supervisor_snapshot_local_path=" +
+                           snapshot_local_path_);
         }
         std::vector<char*> argv;
         for (auto& arg : args) {
@@ -325,6 +346,7 @@ class SupervisorChildProcess {
     int admin_port_;
     std::string cluster_id_;
     bool enable_oplog_;
+    std::string snapshot_local_path_;
     std::string log_path_;
     std::string shutdown_file_;
     int64_t client_live_ttl_sec_;
@@ -395,6 +417,14 @@ int RunSupervisorChild() {
     config.etcd_endpoints = FLAGS_etcd_endpoints;
     config.cluster_id = FLAGS_ha_supervisor_cluster_id;
     config.enable_oplog = FLAGS_ha_supervisor_enable_oplog;
+    if (!FLAGS_ha_supervisor_snapshot_local_path.empty()) {
+        config.enable_oplog_snapshot = true;
+        config.snapshot_object_store_type = "local";
+        if (setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH",
+                   FLAGS_ha_supervisor_snapshot_local_path.c_str(), 1) != 0) {
+            return 1;
+        }
+    }
 
     // Arm the shutdown bound and the handlers like main() does in HA mode.
     if (!StartShutdownWatchdog(ha::kHaShutdownDeadline) ||
@@ -563,6 +593,48 @@ TEST_F(HighAvailabilityTest, ServingStateSerializesActivationAndLoss) {
     EXPECT_TRUE(activated.load(std::memory_order_acquire));
     EXPECT_TRUE(stopped.load(std::memory_order_acquire));
     EXPECT_FALSE(serving_state.IsActive());
+}
+
+TEST_F(HighAvailabilityTest, ServingStateRejectsLateTerminalCallback) {
+    ha::detail::ServingStateGate serving_state;
+    bool callback_ran = false;
+
+    ASSERT_TRUE(serving_state.RequestShutdown([] {}));
+    EXPECT_FALSE(serving_state.RequestShutdown([&]() { callback_ran = true; }));
+    EXPECT_FALSE(serving_state.RunIfActive([&]() { callback_ran = true; }));
+    EXPECT_FALSE(callback_ran);
+}
+
+TEST_F(HighAvailabilityTest, ServingStateDrainsInFlightTerminalCallback) {
+    ha::detail::ServingStateGate serving_state;
+    std::atomic<int> callback_target{0};
+    std::promise<void> callback_started;
+    std::promise<void> finish_callback;
+    auto finish_callback_future = finish_callback.get_future().share();
+
+    auto terminal_callback = std::async(std::launch::async, [&] {
+        return serving_state.RequestShutdown([&] {
+            callback_started.set_value();
+            finish_callback_future.wait();
+            callback_target.fetch_add(1);
+        });
+    });
+    callback_started.get_future().wait();
+
+    std::promise<void> release_started;
+    auto release = std::async(std::launch::async, [&] {
+        release_started.set_value();
+        return serving_state.RequestShutdown(
+            [&] { callback_target.fetch_add(10); });
+    });
+    release_started.get_future().wait();
+    EXPECT_EQ(release.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+
+    finish_callback.set_value();
+    EXPECT_TRUE(terminal_callback.get());
+    EXPECT_FALSE(release.get());
+    EXPECT_EQ(1, callback_target.load());
 }
 
 #ifdef STORE_USE_ETCD
@@ -1794,6 +1866,68 @@ TEST_F(HighAvailabilityTest, SigtermWaitsForAdmittedHandler) {
     EXPECT_TRUE(LogHasPhase(ReadTextFile(log_path), "serving"));
     EXPECT_TRUE(FindDurableSegmentMount(cluster_id, segment_name).has_value())
         << "the admitted handler's entry must be durable before exit";
+}
+
+TEST_F(HighAvailabilityTest,
+       SigtermStopsPrunerBeforeRpcDrainAndJoinsBeforeLeaseRelease) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+    if (!kFailPointsEnabled) {
+        GTEST_SKIP() << "needs MOONCAKE_ENABLE_TEST_FAILPOINTS";
+    }
+
+    ScopedFailPointDir failpoints;
+    const auto ports = FreePortPairs(1);
+    ASSERT_EQ(ports.size(), 1u);
+    const std::string cluster_id = ClusterIdFor("sigterm-pruner-drain");
+    const std::string log_path = TempPath("sigterm-pruner-drain", ".log");
+    SupervisorChildProcess child(ports[0].rpc, ports[0].admin, cluster_id,
+                                 /*enable_oplog=*/true, log_path);
+    ASSERT_TRUE(child.EnableOpLogSnapshot());
+    ASSERT_TRUE(child.Start());
+    ASSERT_TRUE(WaitForServing(child, ports[0].admin, 30s));
+
+    failpoints.Arm("rpc_mount_segment_before_service");
+    failpoints.Arm("batch_oplog_pruner_before_exit");
+    failpoints.Arm("supervisor_before_shutdown_release");
+    MasterClient client(generate_uuid());
+    ASSERT_EQ(client.Connect("127.0.0.1:" + std::to_string(ports[0].rpc)),
+              ErrorCode::OK);
+    std::jthread mount([&] {
+        (void)MountTestSegment(client,
+                               "ha-pruner-drain-" + std::to_string(getpid()));
+    });
+    ASSERT_TRUE(failpoints.WaitForHit("rpc_mount_segment_before_service", 5s));
+
+    ASSERT_TRUE(child.Signal(SIGTERM));
+    // The handler is still held: reaching the worker's exit proves the stop
+    // request did not wait for the RPC drain.
+    const bool pruner_stopping =
+        failpoints.WaitForHit("batch_oplog_pruner_before_exit", 5s);
+    if (!pruner_stopping) {
+        failpoints.Release("rpc_mount_segment_before_service");
+        child.Stop();
+        mount.join();
+        FAIL() << "pruner was not stopped while the RPC handler was held";
+    }
+
+    failpoints.Release("rpc_mount_segment_before_service");
+    ASSERT_TRUE(WaitForLogLine(log_path, "Master service stopped:", 5s));
+    EXPECT_TRUE(child.IsRunning()) << "the pruner has not exited yet";
+    EXPECT_FALSE(
+        failpoints.WaitForHit("supervisor_before_shutdown_release", 100ms))
+        << "lease release must wait for the pruner to join";
+    EXPECT_TRUE(ReadEtcdKey(MasterViewKey(cluster_id)).has_value())
+        << "leadership must be held until the pruner has joined";
+
+    failpoints.Release("batch_oplog_pruner_before_exit");
+    ASSERT_TRUE(
+        failpoints.WaitForHit("supervisor_before_shutdown_release", 5s));
+    failpoints.Release("supervisor_before_shutdown_release");
+    ExpectExitedWith(child.WaitForExit(10s), 0);
+    mount.join();
+    EXPECT_FALSE(ReadEtcdKey(MasterViewKey(cluster_id)).has_value());
 }
 
 TEST_F(HighAvailabilityTest, InjectedRequestBlockedInDrainEndsByWatchdog) {

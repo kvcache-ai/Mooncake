@@ -1323,7 +1323,8 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         const std::vector<std::string> &keys, const UUID &client_id) const;
 
-    // Ensure cleanup executes at most once across multiple entry points
+    // Reject new work once teardown begins; cleanup calls serialize to
+    // completion
     std::atomic<bool> closed_{false};
 
     // Latched when teardown's NoF buffer cleanup failed: repeat teardown
@@ -1374,6 +1375,10 @@ class RealClient : public PyClient {
     tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
         bool enable_ssd_offload);
 
+    std::mutex teardown_mutex_;
+    ErrorCode storage_shutdown_error_ = ErrorCode::OK;
+    RpcDrainGuard offload_rpc_drain_;
+    friend class RealClientShutdownTestPeer;
     std::unique_ptr<class EmbeddedMaster> embedded_master_;
 
     struct SessionRangeReadRequest {
