@@ -110,6 +110,29 @@ TEST(BoundedMPSCQueueTest, PushStillAcceptsAndEmptyPushIsANoop) {
     EXPECT_EQ(queue.pop().num_slices, 0);
 }
 
+TEST(BoundedMPSCQueueTest, RejectingSecondQueueLeavesOnlyCanceledSlots) {
+    Queue first;
+    Queue full;
+    auto item = entry(1);
+    for (int i = 0; i < 8; ++i) ASSERT_TRUE(full.try_push(item));
+    for (int i = 0; i < 24; ++i) {
+        Queue::Reservation admitted, rejected;
+        ASSERT_TRUE(first.try_reserve(admitted));
+        EXPECT_FALSE(first.has_ready());
+        ASSERT_FALSE(full.try_reserve(rejected));
+        first.cancel_reservation(admitted);
+        EXPECT_TRUE(first.has_ready());
+        first.discard_empty_entries();
+        EXPECT_FALSE(first.has_ready());
+    }
+
+    Queue::Reservation reserved;
+    ASSERT_TRUE(first.try_reserve(reserved));
+    first.commit(reserved, item);
+    first.discard_empty_entries();
+    ASSERT_EQ(first.pop().num_slices, 1);
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

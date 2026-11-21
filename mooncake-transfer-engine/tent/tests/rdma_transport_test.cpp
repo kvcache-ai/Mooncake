@@ -987,6 +987,38 @@ TEST_F(RdmaSliceMetadataLifetimeTest,
     }
 }
 
+TEST_F(RdmaSliceMetadataLifetimeTest, FullLaneRejectsWholeUnpublishedFlush) {
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    RdmaTransportTestPeer::destroyWorkerContexts(*workers_);
+    auto& params = RdmaTransportTestPeer::params(transport_);
+    params->workers.num_workers = 2;
+    params->workers.block_size = 256;
+    params->endpoint.max_qp_wr = 4;
+    RdmaTransportTestPeer::makeWorkerContexts(*workers_, 2, true);
+
+    auto& first = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    auto& full = RdmaTransportTestPeer::workerContext(*workers_, 1);
+    RdmaSliceList dummy{};
+    dummy.num_slices = 1;
+    size_t filled = 0;
+    while (full.queues[PRIO_HIGH].try_push(dummy)) ++filled;
+    ASSERT_GT(filled, 0u);
+
+    ASSERT_TRUE(transport_.allocateSubBatch(batch_, 1).ok());
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    auto* task = static_cast<RdmaSubBatch*>(batch_)->task_list.front();
+    EXPECT_EQ(task->status_word, FAILED);
+    EXPECT_EQ(task->resolved_slices.load(), task->num_slices);
+    EXPECT_EQ(first.inflight_slices.load(), 0);
+    EXPECT_EQ(full.inflight_slices.load(), 0);
+    EXPECT_TRUE(first.queues[PRIO_HIGH].has_ready());
+    first.queues[PRIO_HIGH].discard_empty_entries();
+    EXPECT_FALSE(first.queues[PRIO_HIGH].has_ready());
+    EXPECT_EQ(first.queues[PRIO_HIGH].pop().num_slices, 0);
+    EXPECT_TRUE(first.queues[PRIO_HIGH].try_push(dummy));
+    EXPECT_EQ(first.queues[PRIO_HIGH].pop().num_slices, 1);
+}
+
 TEST_F(RdmaSliceMetadataLifetimeTest,
        CompleteTaskPrecedesPublicationAndRejectedChunksResolve) {
     ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());

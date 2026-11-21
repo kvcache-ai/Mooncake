@@ -16,6 +16,7 @@
 #define TENT_BOUNDED_MPSC_QUEUE_H
 
 #include <atomic>
+#include <memory>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -54,19 +55,59 @@ struct BoundedMPSCQueue {
     // local overflow instead of wedging the only consumer (issue #3637).
     bool try_push(T &slice_list) {
         if (slice_list.num_slices == 0) return true;
+        Reservation reservation;
+        if (!try_reserve(reservation)) return false;
+        commit(reservation, slice_list);
+        return true;
+    }
+
+    struct Reservation {
+        Cell *cell = nullptr;
+        uint64_t position = 0;
+    };
+
+    // Reserve every target queue before making any entry in a flush visible.
+    bool try_reserve(Reservation &reservation) {
         uint64_t pos = tail.load(std::memory_order_relaxed);
         Cell *cell = &buffer[pos % Capacity];
 
         uint64_t seq = cell->sequence.load(std::memory_order_acquire);
         intptr_t dif = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
         if (dif != 0) return false;
-        if (!tail.compare_exchange_weak(pos, pos + 1, std::memory_order_acq_rel,
-                                        std::memory_order_relaxed)) {
+        if (!tail.compare_exchange_strong(pos, pos + 1,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_relaxed)) {
             return false;
         }
-        cell->data = slice_list;
-        cell->sequence.store(pos + 1, std::memory_order_release);
+        reservation = {cell, pos};
         return true;
+    }
+
+    void commit(Reservation &reservation, const T &slice_list) {
+        reservation.cell->data = slice_list;
+        reservation.cell->sequence.store(reservation.position + 1,
+                                         std::memory_order_release);
+        reservation.cell = nullptr;
+    }
+
+    void cancel_reservation(Reservation &reservation) {
+        commit(reservation, T{});
+    }
+
+    // Single consumer: a reserved but unpublished head is not ready.
+    bool has_ready() const {
+        const auto pos = head.load(std::memory_order_relaxed);
+        return buffer[pos % Capacity].sequence.load(
+                   std::memory_order_acquire) == pos + 1;
+    }
+
+    // Empty cancellations use no send quota and must return their slots.
+    void discard_empty_entries() {
+        while (has_ready()) {
+            const auto pos = head.load(std::memory_order_relaxed);
+            if (buffer[pos % Capacity].data.num_slices != 0) break;
+            pop();
+        }
     }
 
     T pop() {
@@ -99,7 +140,7 @@ struct BoundedMPSCQueue {
                 T item = cell->data;
                 head.store(pos + 1, std::memory_order_release);
                 cell->sequence.store(pos + Capacity, std::memory_order_release);
-                result.push_back(std::move(item));
+                if (item.num_slices != 0) result.push_back(std::move(item));
             } else {
                 break;
             }
