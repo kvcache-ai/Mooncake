@@ -70,6 +70,29 @@ TEST_F(HttpMetadataServerTest, AllowsIdempotentRpcMetaRepublish) {
     server.stop();
 }
 
+TEST_F(HttpMetadataServerTest, AcceptsRpcMetaRepublishWithNewVersion) {
+    int port = getFreeTcpPort();
+    HttpMetadataServer server(static_cast<uint16_t>(port), "127.0.0.1");
+    ASSERT_TRUE(server.start());
+    WaitUntilReady(port);
+
+    const std::string path =
+        "/metadata?key=mooncake%2Frpc_meta%2F10.0.0.1%3A12384";
+    const std::string v1 =
+        R"({"ip_or_host_name":"10.0.0.1","rpc_port":15228,"metadata_version":1})";
+    const std::string v2 =
+        R"({"ip_or_host_name":"10.0.0.1","rpc_port":15228,"metadata_version":2})";
+
+    EXPECT_EQ(Put(port, path, v1).status, 200);
+    EXPECT_EQ(Put(port, path, v2).status, 200);
+
+    auto stored = Get(port, path);
+    EXPECT_EQ(stored.status, 200);
+    EXPECT_EQ(stored.body, v2);
+
+    server.stop();
+}
+
 TEST_F(HttpMetadataServerTest, RejectsChangedRpcMetaRepublish) {
     int port = getFreeTcpPort();
     HttpMetadataServer server(static_cast<uint16_t>(port), "127.0.0.1");
