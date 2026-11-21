@@ -88,6 +88,40 @@ void PutAndOffload(MasterService& service, const UUID& client_id,
                     .has_value());
 }
 
+TEST_F(MasterServiceSSDTest, RemoveAfterOneMirrorOffloadedStaysRemoved) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_a, "mirror_a", 0x300000000);
+    MountMemoryAndLocalDisk(*service, client_b, "mirror_b", 0x400000000);
+
+    const std::string key = "two_mirror_key";
+    ReplicateConfig config;
+    config.replica_num = 2;
+    ASSERT_TRUE(
+        service->PutStart(client_a, key, TenantId::Default(), 1024, config));
+    ASSERT_TRUE(service->PutEnd(client_a, key, TenantId::Default(),
+                                ReplicaType::MEMORY));
+    auto tasks_a = service->OffloadObjectHeartbeat(client_a, true);
+    auto tasks_b = service->OffloadObjectHeartbeat(client_b, true);
+    ASSERT_TRUE(tasks_a.has_value());
+    ASSERT_TRUE(tasks_b.has_value());
+    ASSERT_EQ(tasks_a->size(), 1u);
+    ASSERT_EQ(tasks_b->size(), 1u);
+
+    StorageObjectMetadata metadata;
+    metadata.data_size = 1024;
+    metadata.transport_endpoint = "mirror_a_disk";
+    ASSERT_TRUE(service->NotifyOffloadSuccess(client_a, *tasks_a, {metadata}));
+    ASSERT_TRUE(service->Remove(key, TenantId::Default(), true));
+    metadata.transport_endpoint = "mirror_b_disk";
+    ASSERT_TRUE(service->NotifyOffloadSuccess(client_b, *tasks_b, {metadata}));
+
+    auto exists = service->ExistKey(key, TenantId::Default());
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
+}
+
 TEST_F(MasterServiceSSDTest, PutRevokeProcessingDiskKeepsSsdTotal) {
     auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
     auto& metrics = MasterMetricManager::instance();
