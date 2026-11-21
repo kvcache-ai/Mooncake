@@ -492,6 +492,8 @@ Notifications are sent only when requested through the APIs below. For classic T
 
 - `MC_RDMA_NOTIFY_ENABLED=1` (default) enables RDMA notifications for both `rdma` and
   `rdma_twosided`; set it to `0` before initialization to use TCP.
+  An engine that Mooncake Store creates for itself with protocol `rdma` keeps them off
+  unless the variable is set, because the Store does not use notifications.
 - Ordinary `rdma` supports up to 65528 combined bytes of `name` and `msg`. Unsupported
   peers or larger messages fall back to TCP when `MC_RDMA_NOTIFY_OOB_FALLBACK=1`
   (default); set it to `0` to return an error instead.
