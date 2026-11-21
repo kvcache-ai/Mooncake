@@ -1853,21 +1853,23 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             LOG(ERROR) << "Complete handler failed: " << error_code
                        << ", Key count: " << committed_keys.size()
                        << ", Bucket id: " << bucket_id;
-            // Master was NOT notified. The local index has entries that
-            // Master doesn't know about — a "client can read but Master
-            // doesn't know" ghost replica. Rollback the local commit
-            // (removes index entries + waits for inflight reads + deletes
-            // on-disk files).
+        }
+        if (error_code == ErrorCode::OFFLOAD_NOT_DISPATCHED) {
             RollbackCommittedBucket(bucket_id, committed_keys, disk_index);
             return tl::make_unexpected(error_code);
         }
-    }
-
-    if (complete_handler != nullptr) {
-        SharedMutexLocker lock(&mutex_);
-        auto it = buckets_.find(bucket_id);
-        if (it != buckets_.end()) {
-            it->second->offload_notification_pending_ = false;
+        {
+            SharedMutexLocker lock(&mutex_);
+            auto it = buckets_.find(bucket_id);
+            if (it != buckets_.end()) {
+                it->second->offload_notification_pending_ = false;
+            }
+        }
+        // The master can publish earlier entries before rejecting the rest
+        // of the batch, or publish before the reply is lost, so any other
+        // failure keeps the bucket readable.
+        if (error_code != ErrorCode::OK) {
+            return tl::make_unexpected(error_code);
         }
     }
     return bucket_id;
