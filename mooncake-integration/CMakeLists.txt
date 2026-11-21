@@ -31,16 +31,42 @@ endif()
 include_directories("./")
 include_directories("../mooncake-transfer-engine/include")
 
-find_package(
-  Python3
-  COMPONENTS Interpreter Development.Module
-  REQUIRED)
-
-execute_process(
-  COMMAND ${Python3_EXECUTABLE} -c
-          "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
-  OUTPUT_VARIABLE PYTHON_EXT_SUFFIX
-  OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(WITH_TE OR WITH_STORE)
+  set(Python_EXECUTABLE "${Python3_EXECUTABLE}")
+  find_package(
+    Python
+    COMPONENTS Interpreter Development.Module
+    OPTIONAL_COMPONENTS Development.SABIModule
+    REQUIRED)
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+    OUTPUT_VARIABLE _nanobind_dir
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  find_package(nanobind CONFIG QUIET HINTS "${_nanobind_dir}")
+  if(NOT nanobind_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(
+      nanobind
+      GIT_REPOSITORY https://github.com/wjakob/nanobind.git
+      GIT_TAG v3.0.1
+      GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(nanobind)
+  endif()
+  if(SKBUILD_SABI_COMPONENT)
+    if(SKBUILD_SABI_VERSION VERSION_LESS 3.12)
+      message(
+        FATAL_ERROR
+          "Mooncake's nanobind extensions require CPython 3.12 or newer for abi3"
+      )
+    endif()
+    if(NOT TARGET Python::SABIModule)
+      message(
+        FATAL_ERROR
+          "Building an abi3 wheel requires Python Development.SABIModule")
+    endif()
+    set(MOONCAKE_NANOBIND_ABI STABLE_ABI)
+  endif()
+endif()
 
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
@@ -49,10 +75,19 @@ message(
   STATUS "Mooncake Python install directory: ${MOONCAKE_PYTHON_INSTALL_DIR}")
 
 if(WITH_TE)
-  pybind11_add_module(
-    engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
+  set(_rpc_dir
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-transfer-engine/src/transport/rpc_communicator"
+  )
+  nanobind_add_module(
+    engine
+    ${MOONCAKE_NANOBIND_ABI}
+    ${SOURCES}
+    ${CACHE_ALLOCATOR_SOURCES}
     transfer_engine/transfer_engine_py.cpp
-    transfer_engine/shared_segment_py.cpp)
+    transfer_engine/shared_segment_py.cpp
+    "${_rpc_dir}/rpc_communicator.cpp"
+    "${_rpc_dir}/rpc_interface.cpp")
+  target_link_libraries(engine PRIVATE yalantinglibs::yalantinglibs)
   set_target_properties(engine PROPERTIES INSTALL_RPATH "$ORIGIN")
 
   # Propagate EFA compile definition to engine target
@@ -68,9 +103,6 @@ if(WITH_TE)
     target_compile_definitions(engine PRIVATE USE_TENT)
   endif()
 
-  target_link_libraries(engine PRIVATE $<TARGET_OBJECTS:rpc_communicator>)
-
-  target_include_directories(engine PRIVATE ${Python3_INCLUDE_DIRS})
   if(USE_ASCEND_DIRECT)
     target_link_libraries(engine PUBLIC ascendcl transfer_engine glog::glog
                                         gflags::gflags)
@@ -84,18 +116,8 @@ if(WITH_TE)
     target_link_libraries(engine PRIVATE CUDA::cudart)
 
     if(BUILD_UNIT_TESTS)
-      find_package(
-        Python3
-        COMPONENTS Development.Embed
-        REQUIRED)
       add_executable(on_cuda_transport_guard_test
                      tests/on_cuda_transport_guard_test.cpp)
-      target_include_directories(
-        on_cuda_transport_guard_test
-        PRIVATE $<TARGET_PROPERTY:transfer_engine,INTERFACE_INCLUDE_DIRECTORIES>
-      )
-      target_link_libraries(on_cuda_transport_guard_test
-                            PRIVATE pybind11::headers Python3::Python)
       add_test(NAME on_cuda_transport_guard_test
                COMMAND on_cuda_transport_guard_test)
     endif()
@@ -166,14 +188,18 @@ if(WITH_STORE)
     add_subdirectory(../mooncake-store/src/engram
                      ${CMAKE_BINARY_DIR}/mooncake-store/src/engram)
   endif()
-  pybind11_add_module(
-    store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES} store/store_py.cpp
-    store/buffer_pool.cpp integration_utils.h)
+  nanobind_add_module(
+    store
+    ${MOONCAKE_NANOBIND_ABI}
+    ${SOURCES}
+    ${CACHE_ALLOCATOR_SOURCES}
+    store/store_py.cpp
+    store/buffer_pool.cpp
+    integration_utils.h)
   set_target_properties(store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH
                                                               "$ORIGIN")
-  if(USE_TENT)
-    target_link_libraries(store PRIVATE tent)
-  endif()
+  # transfer_engine provides TENT through tent_link_group. Linking tent
+  # directly would move its dependencies outside that archive rescan group.
   if(USE_ASCEND_DIRECT)
     target_link_libraries(
       store PUBLIC ascendcl transfer_engine glog::glog gflags::gflags
@@ -355,7 +381,7 @@ if(WITH_EP)
   install(
     CODE "
         execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink
-            \"engine${PYTHON_EXT_SUFFIX}\"
+            \"$<TARGET_FILE_NAME:engine>\"
             \"${_mooncake_engine_compat_path}\"
         )
     "
