@@ -5083,6 +5083,308 @@ TEST_F(MasterServiceTest, DrainJobFailsAfterRetryBudgetExhausted) {
     EXPECT_EQ(segment_status.value(), SegmentStatus::OK);
 }
 
+namespace {
+
+// Runs fetched moves the way the client does: a failed MoveStart fails the
+// task.
+std::vector<std::string> RunPendingMoveTasks(MasterService& service,
+                                             const UUID& client_id) {
+    std::vector<std::string> targets;
+    auto fetched = service.FetchTasks(client_id, /*batch_size=*/16);
+    if (!fetched.has_value()) {
+        return targets;
+    }
+    for (const auto& assignment : *fetched) {
+        ReplicaMovePayload payload;
+        struct_json::from_json(payload, assignment.payload);
+        targets.push_back(payload.target);
+        TaskCompleteRequest done;
+        done.id = assignment.id;
+        done.status = TaskStatus::FAILED;
+        if (service.MoveStart(client_id, payload.key, TenantId::Default(),
+                              payload.source, payload.target) &&
+            service.MoveEnd(client_id, payload.key, TenantId::Default())) {
+            done.status = TaskStatus::SUCCESS;
+        }
+        EXPECT_TRUE(service.MarkTaskToComplete(client_id, done).has_value());
+    }
+    return targets;
+}
+
+}  // namespace
+
+TEST_F(MasterServiceTest, DrainIntoFullTargetEvictsInsteadOfFailingMoves) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service = std::make_unique<MasterService>(service_config);
+    constexpr size_t kTargetSize = 1024 * 1024;
+    constexpr size_t kObjectSize = 64 * 1024;
+    const auto source = PrepareSimpleSegment(*service, "segment_0", 0x300000000,
+                                             kDefaultSegmentSize);
+    PrepareSimpleSegment(*service, "segment_1", 0x400000000, kTargetSize);
+
+    const UUID writer = generate_uuid();
+    for (size_t i = 0; i < kTargetSize / kObjectSize; ++i) {
+        PutObjectOnSegment(*service, writer, "segment_1", kObjectSize);
+    }
+    ASSERT_EQ(service->QuerySegments("segment_1")->first, kTargetSize);
+    ReplicateConfig pinned;
+    pinned.preferred_segment = "segment_0";
+    pinned.soft_pin_action = SoftPinAction::ENABLE;
+    const std::string key = "drain_full_target_key";
+    PutCompletedObject(*service, writer, key, pinned, kObjectSize);
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.max_concurrency = 1;
+    auto job_id = service->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    WaitUntil([&] {
+        RunPendingMoveTasks(*service, source.client_id);
+        auto query = service->QueryDrainJob(job_id.value());
+        return query.has_value() && query->status == JobStatus::SUCCEEDED;
+    });
+    auto query = service->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->failed_units, 0u);
+    auto replicas = service->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_EQ(replicas->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_1");
+}
+
+TEST_F(MasterServiceTest, DrainIntoRequestedFullTargetFailsWithoutEvicting) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service = std::make_unique<MasterService>(service_config);
+    constexpr size_t kTargetSize = 1024 * 1024;
+    constexpr size_t kObjectSize = 64 * 1024;
+    const auto source = PrepareSimpleSegment(*service, "segment_0", 0x300000000,
+                                             kDefaultSegmentSize);
+    PrepareSimpleSegment(*service, "segment_1", 0x400000000, kTargetSize);
+    PrepareSimpleSegment(*service, "segment_2", 0x500000000, kTargetSize);
+
+    const UUID writer = generate_uuid();
+    for (size_t i = 0; i < kTargetSize / kObjectSize; ++i) {
+        PutObjectOnSegment(*service, writer, "segment_1", kObjectSize);
+    }
+    ASSERT_EQ(service->QuerySegments("segment_1")->first, kTargetSize);
+    const std::string key =
+        PutObjectOnSegment(*service, writer, "segment_0", kObjectSize);
+    const int64_t eviction_attempts =
+        MasterMetricManager::instance().get_mem_eviction_attempts();
+
+    // No deadline: the job must still end and give the source back.
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    auto job_id = service->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+    WaitUntil(
+        [&] {
+            auto query = service->QueryDrainJob(job_id.value());
+            return query.has_value() && query->status == JobStatus::FAILED;
+        },
+        std::chrono::seconds(8));
+    auto query = service->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->failed_units, 3u);
+    EXPECT_EQ(MasterMetricManager::instance().get_mem_eviction_attempts(),
+              eviction_attempts);
+    EXPECT_EQ(service->QuerySegments("segment_1")->first, kTargetSize);
+    EXPECT_EQ(service->QuerySegmentStatusById(source.segment_id).value(),
+              SegmentStatus::OK);
+    auto replicas = service->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_EQ(replicas->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_0");
+}
+
+TEST_F(MasterServiceTest, DrainSpreadsOneRoundAcrossTargets) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service = std::make_unique<MasterService>(service_config);
+    constexpr size_t kTargetSize = 1024 * 1024;
+    constexpr size_t kObjectSize = 64 * 1024;
+    const auto source = PrepareSimpleSegment(*service, "segment_0", 0x300000000,
+                                             kDefaultSegmentSize);
+    PrepareSimpleSegment(*service, "segment_1", 0x400000000, kTargetSize);
+    PrepareSimpleSegment(*service, "segment_2", 0x500000000, kTargetSize);
+
+    const UUID writer = generate_uuid();
+    PutObjectOnSegment(*service, writer, "segment_0", kObjectSize);
+    PutObjectOnSegment(*service, writer, "segment_0", kObjectSize);
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.max_concurrency = 2;
+    auto job_id = service->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    std::multiset<std::string> targets;
+    WaitUntil([&] {
+        for (auto& target : RunPendingMoveTasks(*service, source.client_id)) {
+            targets.insert(std::move(target));
+        }
+        return targets.size() >= 2;
+    });
+    EXPECT_EQ(targets, (std::multiset<std::string>{"segment_1", "segment_2"}));
+    WaitUntil([&] {
+        auto query = service->QueryDrainJob(job_id.value());
+        return query.has_value() && query->status == JobStatus::SUCCEEDED;
+    });
+    auto query = service->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->failed_units, 0u);
+}
+
+TEST_F(MasterServiceTest, DrainCountsUnfinishedTasksAgainstTargetRoom) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service = std::make_unique<MasterService>(service_config);
+    constexpr size_t kObjectSize = 64 * 1024;
+    PrepareSimpleSegment(*service, "segment_0", 0x300000000,
+                         kDefaultSegmentSize);
+    PrepareSimpleSegment(*service, "segment_1", 0x400000000, kObjectSize);
+    PrepareSimpleSegment(*service, "segment_2", 0x500000000, kObjectSize / 2);
+
+    const UUID writer = generate_uuid();
+    PutObjectOnSegment(*service, writer, "segment_0", kObjectSize);
+    // Not completed yet, so the first round plans only the other object.
+    ReplicateConfig config;
+    config.preferred_segment = "segment_0";
+    const std::string late_key = "drain_late_key";
+    ASSERT_TRUE(service->PutStart(writer, late_key, TenantId::Default(),
+                                  kObjectSize, config));
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.max_concurrency = 2;
+    auto job_id = service->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+    WaitUntil([&] {
+        auto query = service->QueryDrainJob(job_id.value());
+        return query.has_value() && query->active_units == 1;
+    });
+    ASSERT_TRUE(service->PutEnd(writer, late_key, TenantId::Default(),
+                                ReplicaType::MEMORY));
+    // Lets two scheduling rounds see the late key while the move is planned.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    auto query = service->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->active_units, 1u);
+    EXPECT_EQ(query->blocked_units, 1u);
+    EXPECT_EQ(query->failed_units, 0u);
+}
+
+TEST_F(MasterServiceTest, DrainWaitsForStartedMovesWithoutEvicting) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service = std::make_unique<MasterService>(service_config);
+    constexpr size_t kObjectSize = 64 * 1024;
+    const auto source = PrepareSimpleSegment(*service, "segment_0", 0x300000000,
+                                             kDefaultSegmentSize);
+    PrepareSimpleSegment(*service, "segment_1", 0x400000000, 2 * kObjectSize);
+    PrepareSimpleSegment(*service, "segment_2", 0x500000000, kObjectSize);
+
+    const UUID writer = generate_uuid();
+    PutObjectOnSegment(*service, writer, "segment_2", kObjectSize);
+    PutObjectOnSegment(*service, writer, "segment_0", kObjectSize);
+    ReplicateConfig config;
+    config.preferred_segment = "segment_0";
+    const std::string late_key = "drain_late_key";
+    ASSERT_TRUE(service->PutStart(writer, late_key, TenantId::Default(),
+                                  kObjectSize, config));
+    const int64_t eviction_attempts =
+        MasterMetricManager::instance().get_mem_eviction_attempts();
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.max_concurrency = 2;
+    auto job_id = service->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+    WaitUntil([&] {
+        auto query = service->QueryDrainJob(job_id.value());
+        return query.has_value() && query->active_units == 1;
+    });
+    auto fetched = service->FetchTasks(source.client_id, /*batch_size=*/1);
+    ASSERT_TRUE(fetched.has_value());
+    ASSERT_EQ(fetched->size(), 1u);
+    ReplicaMovePayload payload;
+    struct_json::from_json(payload, fetched->front().payload);
+    ASSERT_TRUE(service->MoveStart(source.client_id, payload.key,
+                                   TenantId::Default(), payload.source,
+                                   payload.target));
+    ASSERT_TRUE(service->PutEnd(writer, late_key, TenantId::Default(),
+                                ReplicaType::MEMORY));
+    // Lets two scheduling rounds see the late key while the move is started.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    ASSERT_TRUE(
+        service->MoveEnd(source.client_id, payload.key, TenantId::Default()));
+    TaskCompleteRequest done;
+    done.id = fetched->front().id;
+    done.status = TaskStatus::SUCCESS;
+    ASSERT_TRUE(service->MarkTaskToComplete(source.client_id, done));
+    WaitUntil([&] {
+        RunPendingMoveTasks(*service, source.client_id);
+        auto query = service->QueryDrainJob(job_id.value());
+        return query.has_value() && query->status == JobStatus::SUCCEEDED;
+    });
+    EXPECT_EQ(MasterMetricManager::instance().get_mem_eviction_attempts(),
+              eviction_attempts);
+    auto replicas = service->GetReplicaList(late_key, TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_EQ(replicas->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_1");
+}
+
+TEST_F(MasterServiceTest, DrainFailsObjectLargerThanEveryTarget) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service = std::make_unique<MasterService>(service_config);
+    constexpr size_t kTargetSize = 64 * 1024;
+    PrepareSimpleSegment(*service, "segment_0", 0x300000000,
+                         kDefaultSegmentSize);
+    PrepareSimpleSegment(*service, "segment_1", 0x400000000, kTargetSize);
+    const std::string key = PutObjectOnSegment(*service, generate_uuid(),
+                                               "segment_0", 2 * kTargetSize);
+    const int64_t eviction_attempts =
+        MasterMetricManager::instance().get_mem_eviction_attempts();
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    auto job_id = service->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+    WaitUntil([&] {
+        auto query = service->QueryDrainJob(job_id.value());
+        return query.has_value() && query->status == JobStatus::FAILED;
+    });
+    auto query = service->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->failed_units, 1u);
+    EXPECT_EQ(MasterMetricManager::instance().get_mem_eviction_attempts(),
+              eviction_attempts);
+    auto replicas = service->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_EQ(replicas->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_0");
+}
+
 TEST_F(MasterServiceTest, SetSegmentStatusStopsAndRestoresAllocation) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
