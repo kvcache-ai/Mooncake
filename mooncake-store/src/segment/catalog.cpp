@@ -1,5 +1,7 @@
 #include "segment/catalog.h"
 
+#include <utility>
+
 namespace mooncake {
 
 const MountedRegion* RegionCatalog::Find(const UUID& segment_id) const {
@@ -28,6 +30,28 @@ bool RegionCatalog::SetStatus(const UUID& segment_id, SegmentStatus status) {
     return records_.modify(it, [this, status](MountedRegion& r) noexcept {
         r.status = status;
         r.generation = ++next_generation_;
+    });
+}
+
+bool RegionCatalog::SetLocality(
+    const UUID& segment_id, const std::optional<SegmentLocality>& locality) {
+    auto it = records_.find(segment_id);
+    if (it == records_.end()) return false;
+    return records_.modify(it, [&locality](MountedRegion& r) {
+        if (locality) {
+            r.segment.locality = *locality;
+        } else {
+            r.segment.locality.reset();
+        }
+    });
+}
+
+bool RegionCatalog::SetOwnerSession(const UUID& segment_id,
+                                    ClientSessionSharedPtr owner_session) {
+    auto it = records_.find(segment_id);
+    if (it == records_.end()) return false;
+    return records_.modify(it, [&owner_session](MountedRegion& r) noexcept {
+        r.owner_session = std::move(owner_session);
     });
 }
 

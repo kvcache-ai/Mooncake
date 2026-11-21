@@ -57,6 +57,12 @@ Segment MakeSegment(size_t index, std::string name,
     return segment;
 }
 
+std::shared_ptr<ClientLivenessRecord> MakeSession(
+    const UUID& client_id = generate_uuid()) {
+    return std::make_shared<ClientLivenessRecord>(
+        client_id, ClientLivenessRecord::Clock::now());
+}
+
 void CommitUnmount(SegmentPool& pool, const Segment& segment,
                    const UUID& client_id) {
     auto transaction = [&] {
@@ -81,8 +87,9 @@ TEST(SegmentPoolTest, ClassifiesOnlyCxlProtocolAsCxl) {
     auto cxl = MakeSegment(1, "cxl", "cxl");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(host, client), ErrorCode::OK);
-        ASSERT_EQ(access.MountSegment(cxl, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(host, MakeSession(client)),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(cxl, MakeSession(client)), ErrorCode::OK);
     }
 
     {
@@ -108,14 +115,14 @@ TEST(SegmentPoolTest, PreparedMountPublishesOnlyOnCommit) {
     auto segment = MakeSegment(0, "prepared");
     {
         auto access = pool.AcquireWriteAccess();
-        auto transaction = access.PrepareMount(segment, client);
+        auto transaction = access.PrepareMount(segment, MakeSession(client));
         ASSERT_TRUE(transaction.has_value());
     }
     EXPECT_EQ(pool.AcquireReadAccess().Catalog().Find(segment.id), nullptr);
 
     {
         auto access = pool.AcquireWriteAccess();
-        auto transaction = access.PrepareMount(segment, client);
+        auto transaction = access.PrepareMount(segment, MakeSession(client));
         ASSERT_TRUE(transaction.has_value());
         ASSERT_EQ(transaction->Commit(access), ErrorCode::OK);
     }
@@ -130,9 +137,10 @@ TEST(SegmentPoolTest, MountCommitRejectsPreparedIdAndOwnerConflicts) {
     auto other = MakeSegment(1, segment.name);
     {
         auto access = pool.AcquireWriteAccess();
-        auto first = access.PrepareMount(segment, client);
-        auto duplicate = access.PrepareMount(segment, client);
-        auto conflicting_owner = access.PrepareMount(other, generate_uuid());
+        auto first = access.PrepareMount(segment, MakeSession(client));
+        auto duplicate = access.PrepareMount(segment, MakeSession(client));
+        auto conflicting_owner =
+            access.PrepareMount(other, MakeSession(generate_uuid()));
         ASSERT_TRUE(first.has_value());
         ASSERT_TRUE(duplicate.has_value());
         ASSERT_TRUE(conflicting_owner.has_value());
@@ -167,7 +175,8 @@ TEST(SegmentPoolTest, RemountCommitRejectsInterveningStatusChanges) {
         auto segment = MakeSegment(0, "status-conflict");
         {
             auto access = pool.AcquireWriteAccess();
-            ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+            ASSERT_EQ(access.MountSegment(segment, MakeSession(client)),
+                      ErrorCode::OK);
             ASSERT_EQ(access.SetSegmentStatusByName(segment.name, initial),
                       ErrorCode::OK);
         }
@@ -176,7 +185,7 @@ TEST(SegmentPoolTest, RemountCommitRejectsInterveningStatusChanges) {
                                                        : SegmentStatus::OK;
         {
             auto access = pool.AcquireWriteAccess();
-            auto prepared = access.PrepareMount(segment, client);
+            auto prepared = access.PrepareMount(segment, MakeSession(client));
             ASSERT_TRUE(prepared.has_value());
             ASSERT_EQ(access.SetSegmentStatusByName(segment.name, next),
                       ErrorCode::OK);
@@ -203,13 +212,15 @@ TEST(SegmentPoolTest, RemountCommitRejectsReplacedOrRemovedResource) {
         auto segment = MakeSegment(0, "resource-conflict");
         {
             auto access = pool.AcquireWriteAccess();
-            ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
-            auto stale = access.PrepareMount(segment, client);
+            ASSERT_EQ(access.MountSegment(segment, MakeSession(client)),
+                      ErrorCode::OK);
+            auto stale = access.PrepareMount(segment, MakeSession(client));
             ASSERT_TRUE(stale.has_value());
             if (clear) {
                 access.Clear();
             } else {
-                auto replacement = access.PrepareMount(segment, client);
+                auto replacement =
+                    access.PrepareMount(segment, MakeSession(client));
                 ASSERT_TRUE(replacement.has_value());
                 ASSERT_EQ(replacement->Commit(access), ErrorCode::OK);
             }
@@ -237,7 +248,8 @@ TEST(SegmentPoolTest, RestoreReturnsImportedBuffersInInputOrder) {
         {4096, segment.base, "tcp", segment.te_endpoint}};
     {
         auto access = pool.AcquireWriteAccess();
-        auto transaction = access.PrepareRestore(segment, client, descriptors);
+        auto transaction =
+            access.PrepareRestore(segment, MakeSession(client), descriptors);
         ASSERT_TRUE(transaction.has_value());
         ASSERT_EQ(transaction->imported_buffers().size(), 2U);
         EXPECT_EQ(transaction->imported_requested_bytes(), 8192U);
@@ -260,7 +272,8 @@ TEST(SegmentPoolTest, RollbackRestoresOriginalLifecycleState) {
     auto segment = MakeSegment(0, "draining", "tcp", "host");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, MakeSession(client)),
+                  ErrorCode::OK);
         ASSERT_EQ(access.SetSegmentStatusByName(segment.name,
                                                 SegmentStatus::DRAINING),
                   ErrorCode::OK);
@@ -298,7 +311,8 @@ TEST(SegmentPoolTest, ImmediateUnmountRollbackRestoresPlacement) {
     auto segment = MakeSegment(0, "rollback", "tcp", "host");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, MakeSession(client)),
+                  ErrorCode::OK);
     }
     auto transaction = [&] {
         auto access = pool.AcquireWriteAccess();
@@ -333,7 +347,7 @@ TEST(SegmentPoolTest,
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "consume-unmount");
     auto access = pool.AcquireWriteAccess();
-    ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+    ASSERT_EQ(access.MountSegment(segment, MakeSession(client)), ErrorCode::OK);
     auto prepared = access.PrepareUnmount(segment.id, client);
     ASSERT_TRUE(prepared.has_value());
     auto transaction = std::move(*prepared);
@@ -402,8 +416,10 @@ TEST(SegmentPoolTest, LocalPlacementUsesMountedHostIdentity) {
     auto remote = MakeSegment(1, "remote", "tcp", "other-host");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(local, client), ErrorCode::OK);
-        ASSERT_EQ(access.MountSegment(remote, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(local, MakeSession(client)),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(remote, MakeSession(client)),
+                  ErrorCode::OK);
     }
     ReplicaAllocationRequest request;
     request.replicas.size = 4096;
@@ -421,8 +437,9 @@ TEST(SegmentPoolTest, SameNameKindsRemainIndependentAcrossUnmountRollback) {
     auto cxl = MakeSegment(1, "shared", "cxl", "host");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(native, client), ErrorCode::OK);
-        ASSERT_EQ(access.MountSegment(cxl, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(native, MakeSession(client)),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(cxl, MakeSession(client)), ErrorCode::OK);
     }
     {
         auto native_replica = pool.AllocateInSegment(
@@ -479,19 +496,22 @@ TEST(SegmentPoolTest,
     auto segment = MakeSegment(0, "restore-validation");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, MakeSession(client)),
+                  ErrorCode::OK);
     }
     auto original = pool.AcquireReadAccess().GetAllocator(segment.id);
     std::vector<AllocatedBuffer::Descriptor> descriptors{
         {4096, segment.base, "tcp", segment.name}};
     {
         auto access = pool.AcquireWriteAccess();
-        auto alias = access.PrepareRestore(segment, client, descriptors);
+        auto alias =
+            access.PrepareRestore(segment, MakeSession(client), descriptors);
         ASSERT_FALSE(alias.has_value());
         EXPECT_EQ(alias.error(), ErrorCode::INVALID_PARAMS);
         descriptors[0].transport_endpoint_ = segment.te_endpoint;
         descriptors.push_back(descriptors[0]);
-        auto overlap = access.PrepareRestore(segment, client, descriptors);
+        auto overlap =
+            access.PrepareRestore(segment, MakeSession(client), descriptors);
         ASSERT_FALSE(overlap.has_value());
         EXPECT_EQ(overlap.error(), ErrorCode::INVALID_PARAMS);
     }
@@ -511,13 +531,14 @@ TEST(SegmentPoolTest,
     auto segment = MakeSegment(0, "remount");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, MakeSession(client)),
+                  ErrorCode::OK);
     }
     EXPECT_EQ(metrics.get_total_mem_capacity(), capacity_before + kRegionSize);
     auto old_allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
     {
         auto access = pool.AcquireWriteAccess();
-        auto transaction = access.PrepareMount(segment, client);
+        auto transaction = access.PrepareMount(segment, MakeSession(client));
         ASSERT_TRUE(transaction.has_value());
         ASSERT_EQ(transaction->Commit(access), ErrorCode::OK);
     }
@@ -549,7 +570,8 @@ TEST(SegmentPoolTest, GracefulUnmountRetainsResourceUntilFinalization) {
     auto segment = MakeSegment(0, "graceful");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, MakeSession(client)),
+                  ErrorCode::OK);
     }
     auto allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
     auto buffer = allocator->allocate(4096);
@@ -584,7 +606,8 @@ TEST(SegmentPoolTest, GracefulUnmountCanResumeAndConsumesMovedTransaction) {
     auto segment = MakeSegment(0, "graceful-resume");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, MakeSession(client)),
+                  ErrorCode::OK);
         auto wrong_client =
             access.PrepareGracefulUnmount(segment.id, generate_uuid());
         ASSERT_FALSE(wrong_client.has_value());
@@ -624,13 +647,13 @@ TEST(SegmentPoolTest, StaleGracefulUnmountCannotFinalizeNewMount) {
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "graceful-remount");
     auto access = pool.AcquireWriteAccess();
-    ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+    ASSERT_EQ(access.MountSegment(segment, MakeSession(client)), ErrorCode::OK);
     auto stale = access.PrepareGracefulUnmount(segment.id, client);
     auto resumed = access.PrepareGracefulUnmount(segment.id, client);
     ASSERT_TRUE(stale.has_value());
     ASSERT_TRUE(resumed.has_value());
     ASSERT_EQ(std::move(*resumed).Finalize(access), ErrorCode::OK);
-    ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+    ASSERT_EQ(access.MountSegment(segment, MakeSession(client)), ErrorCode::OK);
     auto current = access.PrepareGracefulUnmount(segment.id, client);
     ASSERT_TRUE(current.has_value());
     EXPECT_EQ(std::move(*stale).Finalize(access),
@@ -646,10 +669,12 @@ TEST(SegmentPoolTest, UnmountCannotEraseRegionOwnedByAnotherClient) {
         const UUID new_client = generate_uuid();
         auto segment = MakeSegment(0, "unmount-new-owner");
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, MakeSession(client)),
+                  ErrorCode::OK);
         auto remount = [&] {
             access.Clear();
-            ASSERT_EQ(access.MountSegment(segment, new_client), ErrorCode::OK);
+            ASSERT_EQ(access.MountSegment(segment, MakeSession(new_client)),
+                      ErrorCode::OK);
         };
         if (graceful) {
             auto stale = access.PrepareGracefulUnmount(segment.id, client);
@@ -680,7 +705,8 @@ TEST(SegmentPoolTest, GracefulUnmountCannotFinalizeUnexpectedStatus) {
         const UUID client = generate_uuid();
         auto segment = MakeSegment(0, "graceful-status-changed");
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, MakeSession(client)),
+                  ErrorCode::OK);
         auto transaction = access.PrepareGracefulUnmount(segment.id, client);
         ASSERT_TRUE(transaction.has_value());
         ASSERT_EQ(access.SetSegmentStatusByName(segment.name, status),
@@ -700,7 +726,7 @@ TEST(SegmentPoolTest, StaleGracefulUnmountCannotFinalizeNewDrain) {
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "graceful-new-drain");
     auto access = pool.AcquireWriteAccess();
-    ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+    ASSERT_EQ(access.MountSegment(segment, MakeSession(client)), ErrorCode::OK);
     auto stale = access.PrepareGracefulUnmount(segment.id, client);
     ASSERT_TRUE(stale.has_value());
     ASSERT_EQ(access.SetSegmentStatusByName(segment.name, SegmentStatus::OK),
@@ -719,11 +745,13 @@ TEST(SegmentPoolTest, StaleUnmountCannotModifyRegionAfterClear) {
         const UUID client = generate_uuid();
         auto segment = MakeSegment(0, "unmount-clear");
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, MakeSession(client)),
+                  ErrorCode::OK);
         auto stale = access.PrepareUnmount(segment.id, client);
         ASSERT_TRUE(stale.has_value());
         access.Clear();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, MakeSession(client)),
+                  ErrorCode::OK);
         auto current = access.PrepareUnmount(segment.id, client);
         ASSERT_TRUE(current.has_value());
         EXPECT_EQ(rollback ? std::move(*stale).Rollback(access)
@@ -741,7 +769,7 @@ TEST(SegmentPoolTest, GracefulUnmountFailureConsumesTransaction) {
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "graceful-removed");
     auto access = pool.AcquireWriteAccess();
-    ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+    ASSERT_EQ(access.MountSegment(segment, MakeSession(client)), ErrorCode::OK);
     auto transaction = access.PrepareGracefulUnmount(segment.id, client);
     ASSERT_TRUE(transaction.has_value());
     access.Clear();
@@ -758,8 +786,10 @@ TEST(SegmentPoolTest, RemovedCxlBindingIsInactiveWhileSiblingRemainsReadable) {
     auto second = MakeSegment(1, "second-binding", "cxl");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(first, client), ErrorCode::OK);
-        ASSERT_EQ(access.MountSegment(second, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(first, MakeSession(client)),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(second, MakeSession(client)),
+                  ErrorCode::OK);
     }
     auto allocator = pool.AcquireReadAccess().GetAllocator(first.id);
     auto transaction = [&] {
@@ -800,8 +830,10 @@ TEST(SegmentPoolTest, CxlBindingsShareUsageAndDriverCapacityLifetime) {
         auto second = MakeSegment(1, "cxl-second", "cxl");
         {
             auto access = pool.AcquireWriteAccess();
-            ASSERT_EQ(access.MountSegment(first, client), ErrorCode::OK);
-            ASSERT_EQ(access.MountSegment(second, client), ErrorCode::OK);
+            ASSERT_EQ(access.MountSegment(first, MakeSession(client)),
+                      ErrorCode::OK);
+            ASSERT_EQ(access.MountSegment(second, MakeSession(client)),
+                      ErrorCode::OK);
         }
         EXPECT_EQ(pool.GetMemoryUsageSnapshot().capacity_bytes, kRegionSize);
         EXPECT_EQ(pool.GetMemoryUsage().capacity_bytes, kRegionSize);
@@ -890,7 +922,8 @@ TEST(SegmentPoolTest, HostPlacementTracksLastMemberAndLifecycle) {
     {
         auto access = pool.AcquireWriteAccess();
         for (const auto& segment : {a1, a2, a3, b, c}) {
-            ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+            ASSERT_EQ(access.MountSegment(segment, MakeSession(client)),
+                      ErrorCode::OK);
         }
     }
     std::string key;
@@ -929,8 +962,8 @@ TEST(SegmentPoolTest, HostPlacementTracksLastMemberAndLifecycle) {
         auto access = pool.AcquireWriteAccess();
         ASSERT_EQ(std::move(*unmount).Rollback(access), ErrorCode::OK);
         ASSERT_EQ(std::move(*graceful).Finalize(access), ErrorCode::OK);
-        ASSERT_EQ(access.MountSegment(b, client), ErrorCode::OK);
-        auto replacement = access.PrepareMount(c, client);
+        ASSERT_EQ(access.MountSegment(b, MakeSession(client)), ErrorCode::OK);
+        auto replacement = access.PrepareMount(c, MakeSession(client));
         ASSERT_TRUE(replacement.has_value());
         ASSERT_EQ(replacement->Commit(access), ErrorCode::OK);
     }
@@ -946,7 +979,7 @@ TEST(SegmentPoolTest, HostPlacementTracksLastMemberAndLifecycle) {
     {
         auto access = pool.AcquireWriteAccess();
         access.Clear();
-        ASSERT_EQ(access.MountSegment(b, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(b, MakeSession(client)), ErrorCode::OK);
     }
     EXPECT_EQ(names(), (std::vector<std::string>{"b"}));
 }
@@ -986,7 +1019,7 @@ TEST(SegmentPoolTest, RejectedAdoptionCommitDoesNotRegisterUsage) {
     auto transaction = access.PrepareAdopt({segment, client, SegmentStatus::OK},
                                            allocator, true);
     ASSERT_TRUE(transaction.has_value());
-    ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+    ASSERT_EQ(access.MountSegment(segment, MakeSession(client)), ErrorCode::OK);
     EXPECT_EQ(transaction->Commit(access), ErrorCode::SEGMENT_ALREADY_EXISTS);
     access.Clear();
     EXPECT_EQ(pool.GetMemoryUsage().capacity_bytes, 0U);
@@ -997,7 +1030,7 @@ TEST(SegmentPoolTest, AdoptRejectsCatalogConflictWithoutReplacingResource) {
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "adopt-conflict");
     auto access = pool.AcquireWriteAccess();
-    ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+    ASSERT_EQ(access.MountSegment(segment, MakeSession(client)), ErrorCode::OK);
     auto allocator = std::make_shared<TestBufferAllocator>(
         segment.name, segment.te_endpoint, kRegionSize, segment.base);
     auto duplicate = access.PrepareAdopt({segment, client, SegmentStatus::OK},
@@ -1023,8 +1056,8 @@ TEST(SegmentPoolTest, DestroyedPoolAndRetainedAllocatorRemoveMetricLabels) {
         {
             SegmentPool pool(Drivers());
             auto segment = MakeSegment(0, name);
-            ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment,
-                                                             generate_uuid()),
+            ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(
+                          segment, MakeSession(generate_uuid())),
                       ErrorCode::OK);
             auto allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
             ASSERT_NE(allocator, nullptr);
@@ -1049,6 +1082,279 @@ TEST(SegmentPoolTest, DestroyedPoolAndRetainedAllocatorRemoveMetricLabels) {
         EXPECT_EQ(metrics.get_segment_allocated_mem_size(name), 0);
         EXPECT_EQ(metrics.get_segment_total_mem_capacity(name), 0);
         EXPECT_EQ(metrics.serialize_metrics().find(label), std::string::npos);
+    }
+}
+
+TEST(SegmentPoolTest,
+     ClientSessionLifecycleGatesAllocationAndPreservesBuffersWhileSuspected) {
+    SegmentPool pool(Drivers());
+    const auto now = ClientLivenessRecord::Clock::now();
+    const UUID client = generate_uuid();
+    auto session = std::make_shared<ClientLivenessRecord>(client, now);
+    auto segment = MakeSegment(0, "session-gated");
+
+    {
+        auto access = pool.AcquireWriteAccess();
+        EXPECT_EQ(access.MountSegment(segment, nullptr),
+                  ErrorCode::INVALID_PARAMS);
+        EXPECT_FALSE(access.PrepareMount(segment, nullptr).has_value());
+        EXPECT_FALSE(access.PrepareRestore(segment, nullptr, {}).has_value());
+        ASSERT_EQ(access.MountSegment(segment, session), ErrorCode::OK);
+    }
+
+    auto replica = pool.AllocateInSegment(
+        segment.name, AllocationCandidateKind::NATIVE, 4096);
+    ASSERT_TRUE(replica.has_value());
+    EXPECT_FALSE(replica->has_invalid_mem_handle());
+    EXPECT_TRUE(replica->is_available());
+
+    ASSERT_EQ(
+        session->Evaluate(now + std::chrono::seconds(10),
+                          std::chrono::seconds(5), std::chrono::seconds(20)),
+        ClientLivenessTransition::BECAME_SUSPECTED);
+
+    // Suspected session blocks new placement, keeps existing buffers valid.
+    EXPECT_FALSE(pool.AllocateInSegment(segment.name,
+                                        AllocationCandidateKind::NATIVE, 4096)
+                     .has_value());
+    EXPECT_FALSE(replica->has_invalid_mem_handle());
+    EXPECT_FALSE(replica->is_available());
+
+    ASSERT_EQ(session->Observe(now + std::chrono::seconds(11)),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    EXPECT_TRUE(replica->is_available());
+    EXPECT_TRUE(pool.AllocateInSegment(segment.name,
+                                       AllocationCandidateKind::NATIVE, 4096)
+                    .has_value());
+    CommitUnmount(pool, segment, client);
+}
+
+TEST(SegmentPoolTest,
+     BindClientSessionIsolatesIncarnationsAndSkipsSameOrUnmounting) {
+    SegmentPool pool(Drivers());
+    const UUID client = generate_uuid();
+    auto session1 = MakeSession(client);
+    auto session2 = MakeSession(client);
+    auto seg_ok = MakeSegment(0, "bind-ok");
+    auto seg_unmounting = MakeSegment(1, "bind-unmounting");
+    {
+        auto access = pool.AcquireWriteAccess();
+        ASSERT_EQ(access.MountSegment(seg_ok, session1), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(seg_unmounting, session1), ErrorCode::OK);
+    }
+
+    auto old_replica = pool.AllocateInSegment(
+        seg_ok.name, AllocationCandidateKind::NATIVE, 4096);
+    auto unmounting_replica = pool.AllocateInSegment(
+        seg_unmounting.name, AllocationCandidateKind::NATIVE, 4096);
+    ASSERT_TRUE(old_replica.has_value());
+    ASSERT_TRUE(unmounting_replica.has_value());
+
+    // Binding the same session is a no-op and preserves existing buffers.
+    {
+        auto access = pool.AcquireWriteAccess();
+        access.BindClientSession(session1);
+    }
+    EXPECT_FALSE(old_replica->has_invalid_mem_handle());
+
+    auto unmount_txn = [&] {
+        auto access = pool.AcquireWriteAccess();
+        return access.PrepareUnmount(seg_unmounting.id, client);
+    }();
+    ASSERT_TRUE(unmount_txn.has_value());
+    EXPECT_TRUE(unmounting_replica->has_invalid_mem_handle());
+
+    // Binding a new incarnation invalidates old buffers on active regions
+    // and leaves UNMOUNTING regions invalidated.
+    {
+        auto access = pool.AcquireWriteAccess();
+        access.BindClientSession(session2);
+        EXPECT_EQ(access.Catalog().Find(seg_ok.id)->owner_session, session2);
+        EXPECT_EQ(access.Catalog().Find(seg_unmounting.id)->owner_session,
+                  session1);
+    }
+    EXPECT_TRUE(old_replica->has_invalid_mem_handle());
+    EXPECT_TRUE(unmounting_replica->has_invalid_mem_handle());
+
+    auto new_replica = pool.AllocateInSegment(
+        seg_ok.name, AllocationCandidateKind::NATIVE, 4096);
+    ASSERT_TRUE(new_replica.has_value());
+    EXPECT_FALSE(new_replica->has_invalid_mem_handle());
+
+    {
+        auto access = pool.AcquireWriteAccess();
+        ASSERT_EQ(std::move(*unmount_txn).Commit(access), ErrorCode::OK);
+    }
+    CommitUnmount(pool, seg_ok, client);
+}
+
+TEST(SegmentPoolTest,
+     PrepareUnmountInvalidatesHostAndCxlBuffersAndRollbackRearms) {
+    SegmentPool pool(Drivers(true));
+    const UUID client = generate_uuid();
+    auto session = MakeSession(client);
+    auto host = MakeSegment(0, "unmount-host", "tcp");
+    auto cxl = MakeSegment(1, "unmount-cxl", "cxl");
+    {
+        auto access = pool.AcquireWriteAccess();
+        ASSERT_EQ(access.MountSegment(host, session), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(cxl, session), ErrorCode::OK);
+    }
+
+    auto host_replica = pool.AllocateInSegment(
+        host.name, AllocationCandidateKind::NATIVE, 4096);
+    auto cxl_replica =
+        pool.AllocateInSegment(cxl.name, AllocationCandidateKind::CXL, 4096);
+    ASSERT_TRUE(host_replica.has_value());
+    ASSERT_TRUE(cxl_replica.has_value());
+    EXPECT_FALSE(host_replica->has_invalid_mem_handle());
+    EXPECT_FALSE(cxl_replica->has_invalid_mem_handle());
+
+    // Immediate unmount invalidates both host and CXL buffers right away.
+    auto host_txn = [&] {
+        auto access = pool.AcquireWriteAccess();
+        return access.PrepareUnmount(host.id, client);
+    }();
+    auto cxl_txn = [&] {
+        auto access = pool.AcquireWriteAccess();
+        return access.PrepareUnmount(cxl.id, client);
+    }();
+    ASSERT_TRUE(host_txn.has_value());
+    ASSERT_TRUE(cxl_txn.has_value());
+    EXPECT_TRUE(host_replica->has_invalid_mem_handle());
+    EXPECT_TRUE(cxl_replica->has_invalid_mem_handle());
+
+    // Rollback re-arms lifetime for subsequent allocations.
+    {
+        auto access = pool.AcquireWriteAccess();
+        ASSERT_EQ(std::move(*host_txn).Rollback(access), ErrorCode::OK);
+        ASSERT_EQ(std::move(*cxl_txn).Rollback(access), ErrorCode::OK);
+    }
+    auto rearmed_cxl =
+        pool.AllocateInSegment(cxl.name, AllocationCandidateKind::CXL, 4096);
+    ASSERT_TRUE(rearmed_cxl.has_value());
+    EXPECT_FALSE(rearmed_cxl->has_invalid_mem_handle());
+
+    // Graceful unmount keeps CXL buffers valid until Finalize.
+    auto graceful = [&] {
+        auto access = pool.AcquireWriteAccess();
+        return access.PrepareGracefulUnmount(cxl.id, client);
+    }();
+    ASSERT_TRUE(graceful.has_value());
+    EXPECT_FALSE(rearmed_cxl->has_invalid_mem_handle());
+    {
+        auto access = pool.AcquireWriteAccess();
+        ASSERT_EQ(std::move(*graceful).Finalize(access), ErrorCode::OK);
+    }
+    EXPECT_TRUE(rearmed_cxl->has_invalid_mem_handle());
+    CommitUnmount(pool, host, client);
+}
+
+TEST(SegmentPoolTest,
+     MountValidatesConflictsLocalityEnrichmentAndUnmountingName) {
+    SegmentPool pool(Drivers());
+    const UUID client = generate_uuid();
+    auto session = MakeSession(client);
+    auto other_session = MakeSession(generate_uuid());
+
+    // Negative numa_node is rejected everywhere.
+    auto bad_locality = MakeSegment(0, "bad-loc");
+    bad_locality.locality = SegmentLocality{-1, {"mlx5_0"}};
+    {
+        auto access = pool.AcquireWriteAccess();
+        EXPECT_EQ(access.MountSegment(bad_locality, session),
+                  ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(access.ValidateRemountSegment(bad_locality, client),
+                  ErrorCode::INVALID_PARAMS);
+    }
+
+    // Mount without locality, then validate conflict vs enrichment.
+    auto seg = MakeSegment(1, "enrich", "rdma", "host-1");
+    {
+        auto access = pool.AcquireWriteAccess();
+        ASSERT_EQ(access.MountSegment(seg, session), ErrorCode::OK);
+
+        // Wrong owner or mismatched metadata on same ID -> INVALID_PARAMS.
+        EXPECT_EQ(access.MountSegment(seg, other_session),
+                  ErrorCode::INVALID_PARAMS);
+        auto bad_size = seg;
+        bad_size.size *= 2;
+        EXPECT_EQ(access.MountSegment(bad_size, session),
+                  ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(access.ValidateRemountSegment(bad_size, client),
+                  ErrorCode::INVALID_PARAMS);
+
+        // Replay with locality enriches catalog and allocator.
+        auto with_loc = seg;
+        with_loc.locality = SegmentLocality{0, {"mlx5_0"}};
+        EXPECT_EQ(access.ValidateRemountSegment(with_loc, client),
+                  ErrorCode::OK);
+        EXPECT_EQ(access.MountSegment(with_loc, session),
+                  ErrorCode::SEGMENT_ALREADY_EXISTS);
+        EXPECT_EQ(access.Catalog().Find(seg.id)->segment.locality,
+                  with_loc.locality);
+
+        // Conflicting locality on same ID -> INVALID_PARAMS.
+        auto conflict_loc = seg;
+        conflict_loc.locality = SegmentLocality{1, {"mlx5_1"}};
+        EXPECT_EQ(access.MountSegment(conflict_loc, session),
+                  ErrorCode::INVALID_PARAMS);
+
+        // Replacement mount without locality preserves existing locality.
+        auto replacement = access.PrepareMount(seg, session);
+        ASSERT_TRUE(replacement.has_value());
+        ASSERT_EQ(replacement->Commit(access), ErrorCode::OK);
+        EXPECT_EQ(access.Catalog().Find(seg.id)->segment.locality,
+                  with_loc.locality);
+    }
+    EXPECT_EQ(pool.AcquireReadAccess().GetAllocator(seg.id)->GetLocality(),
+              (SegmentLocality{0, {"mlx5_0"}}));
+
+    // Uncommitted unmount blocks new mounts of the same name until Commit.
+    {
+        auto access = pool.AcquireWriteAccess();
+        auto unmount = access.PrepareUnmount(seg.id, client);
+        ASSERT_TRUE(unmount.has_value());
+        auto fresh = MakeSegment(2, seg.name);
+        EXPECT_EQ(access.MountSegment(fresh, session),
+                  ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        EXPECT_EQ(access.MountSegment(fresh, other_session),
+                  ErrorCode::INVALID_PARAMS);
+        ASSERT_EQ(std::move(*unmount).Commit(access), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(fresh, session), ErrorCode::OK);
+        auto unmount_fresh = access.PrepareUnmount(fresh.id, client);
+        ASSERT_TRUE(unmount_fresh.has_value());
+        ASSERT_EQ(std::move(*unmount_fresh).Commit(access), ErrorCode::OK);
+    }
+}
+
+TEST(SegmentPoolTest, CxlUsageTrackedBeforeFirstMountAndCatalogIndexesClient) {
+    SegmentPool pool(Drivers(true));
+    EXPECT_EQ(pool.GetMemoryUsageSnapshot().capacity_bytes, kRegionSize);
+    EXPECT_EQ(pool.GetMemoryUsage().capacity_bytes, kRegionSize);
+
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    auto s1 = MakeSegment(0, "a1");
+    auto s2 = MakeSegment(1, "a2");
+    auto s3 = MakeSegment(2, "b1");
+    {
+        auto access = pool.AcquireWriteAccess();
+        ASSERT_EQ(access.MountSegment(s1, MakeSession(client_a)),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(s2, MakeSession(client_a)),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(s3, MakeSession(client_b)),
+                  ErrorCode::OK);
+    }
+    {
+        auto read = pool.AcquireReadAccess();
+        std::set<UUID> a_ids;
+        for (const auto& r : read.Catalog().ClientRegions(client_a)) {
+            a_ids.insert(r.segment.id);
+        }
+        EXPECT_EQ(a_ids, (std::set<UUID>{s1.id, s2.id}));
+        EXPECT_EQ(read.Catalog().ClientRegions(client_b).size(), 1U);
     }
 }
 

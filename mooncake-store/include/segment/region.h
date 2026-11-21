@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 
+#include "client_liveness.h"
 #include "types.h"
 
 namespace mooncake {
@@ -20,6 +21,7 @@ struct RegionResourceSpec {
     size_t size{0};
     std::string transport_endpoint;
     std::string transport_protocol;
+    ClientSessionSharedPtr owner_session{nullptr};
 };
 
 }  // namespace mooncake

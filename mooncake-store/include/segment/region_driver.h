@@ -38,6 +38,13 @@ class RegionDriver {
         return allocator_type_;
     }
 
+    // Returns a driver-owned allocator shared across mounted regions (e.g.,
+    // global CXL allocator), or nullptr when each region owns its own.
+    virtual std::shared_ptr<BufferAllocatorBase> GetSharedAllocator()
+        const noexcept {
+        return nullptr;
+    }
+
     virtual tl::expected<PreparedRegionResource, ErrorCode> PrepareOpen(
         const RegionResourceSpec& spec,
         const std::vector<LiveAllocation>& live_allocations) = 0;
