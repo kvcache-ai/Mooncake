@@ -12,6 +12,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 #include "config/transfer_submitter_config.h"
 #include "config/nof_debug_config.h"
@@ -678,9 +679,6 @@ void NofWorkerPool::workerThread(int work_idx) {
 // ============================================================================
 // MemcpyWorkerPool Implementation
 // ============================================================================
-// Since memcpy is bound by memory bandwidth, we only need one worker thread.
-constexpr int kDefaultMemcpyWorkers = 1;
-
 namespace {
 
 // Per-pointer residency resolution costs one device query per call (e.g.
@@ -719,32 +717,37 @@ class PointerResidencyCache {
 }  // namespace
 
 MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
-    VLOG(1) << "Creating MemcpyWorkerPool with " << kDefaultMemcpyWorkers
-            << " workers";
+    const int workers = GetPositiveEnvOrDefault("MC_STORE_MEMCPY_WORKERS", 1);
+    VLOG(1) << "Creating MemcpyWorkerPool with " << workers << " workers";
 
-    // Start worker threads
-    workers_.reserve(kDefaultMemcpyWorkers);
-    for (int i = 0; i < kDefaultMemcpyWorkers; ++i) {
-        workers_.emplace_back(&MemcpyWorkerPool::workerThread, this);
+    workers_.reserve(workers);
+    try {
+        for (int i = 0; i < workers; ++i) {
+            workers_.emplace_back(&MemcpyWorkerPool::workerThread, this);
+        }
+    } catch (...) {
+        shutdown();
+        throw;
     }
 }
 
 MemcpyWorkerPool::~MemcpyWorkerPool() {
-    // Signal shutdown
+    shutdown();
+    VLOG(1) << "MemcpyWorkerPool destroyed";
+}
+
+void MemcpyWorkerPool::shutdown() {
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         shutdown_.store(true);
     }
     queue_cv_.notify_all();
 
-    // Wait for all workers to finish
     for (auto& worker : workers_) {
         if (worker.joinable()) {
             worker.join();
         }
     }
-
-    VLOG(1) << "MemcpyWorkerPool destroyed";
 }
 
 void MemcpyWorkerPool::submitTask(MemcpyTask task) {
@@ -756,9 +759,23 @@ void MemcpyWorkerPool::submitTask(MemcpyTask task) {
             task.state->set_completed(ErrorCode::TRANSFER_FAIL);
             return;
         }
-        task_queue_.push(std::move(task));
+        task_queue_.push_back(std::move(task));
     }
     queue_cv_.notify_one();
+}
+
+void MemcpyWorkerPool::submitTasks(std::list<MemcpyTask> tasks) {
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (shutdown_.load()) {
+            for (auto& task : tasks) {
+                task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+            }
+            return;
+        }
+        task_queue_.splice(task_queue_.end(), tasks);
+    }
+    queue_cv_.notify_all();
 }
 
 void MemcpyWorkerPool::workerThread() {
@@ -780,7 +797,7 @@ void MemcpyWorkerPool::workerThread() {
 
             if (!task_queue_.empty()) {
                 task = std::move(task_queue_.front());
-                task_queue_.pop();
+                task_queue_.pop_front();
             }
         }
 
@@ -1750,8 +1767,9 @@ TransferSubmitter::submit_batch_get_offload_object(
             offset += slice.size;
         }
     }
-    return use_local_memcpy ? submitMemcpyOperations(std::move(operations))
-                            : submitTransfer(requests, intent);
+    return use_local_memcpy
+               ? submitMemcpyOperations(std::move(operations), true)
+               : submitTransfer(requests, intent);
 }
 
 void TransferSubmitter::appendMemcpyOperations(
@@ -1787,10 +1805,65 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     return submitMemcpyOperations(std::move(operations));
 }
 
+static bool CanParallelizeMemcpy(
+    const std::vector<MemcpyOperation>& operations) {
+    const auto accelerators =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    std::vector<std::tuple<uintptr_t, uintptr_t, bool>> ranges;
+    ranges.reserve(2 * operations.size());
+    for (const auto& op : operations) {
+        const auto src = reinterpret_cast<uintptr_t>(op.src);
+        const auto dest = reinterpret_cast<uintptr_t>(op.dest);
+        if (op.size > std::numeric_limits<uintptr_t>::max() - src ||
+            op.size > std::numeric_limits<uintptr_t>::max() - dest ||
+            accelerators.FindDeviceForPointer(op.src) ||
+            accelerators.FindDeviceForPointer(op.dest)) {
+            return false;
+        }
+        ranges.emplace_back(src, src + op.size, false);
+        ranges.emplace_back(dest, dest + op.size, true);
+    }
+    // Shared sources are safe. No destination may intersect any other range.
+    std::sort(ranges.begin(), ranges.end());
+    uintptr_t source_end = 0;
+    uintptr_t destination_end = 0;
+    for (const auto& [start, end, is_destination] : ranges) {
+        if (start < destination_end || (is_destination && start < source_end)) {
+            return false;
+        }
+        if (is_destination) {
+            destination_end = end;
+        } else {
+            source_end = std::max(source_end, end);
+        }
+    }
+    return true;
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
-    std::vector<MemcpyOperation> operations) {
-    auto state = std::make_shared<MemcpyOperationState>();
+    std::vector<MemcpyOperation> operations, bool allow_parallel) {
     const size_t operation_count = operations.size();
+    const size_t tasks = std::min(operation_count, memcpy_pool_->workerCount());
+    if (allow_parallel && tasks > 1 && CanParallelizeMemcpy(operations)) {
+        auto state = std::make_shared<MemcpyOperationState>(tasks);
+        std::list<MemcpyTask> pending;
+        auto begin = operations.begin();
+        for (size_t i = 0; i < tasks; ++i) {
+            const size_t count =
+                operation_count / tasks + (i < operation_count % tasks);
+            auto end = begin + count;
+            pending.emplace_back(std::vector<MemcpyOperation>(begin, end),
+                                 state);
+            begin = end;
+        }
+        // Prepare every task before publishing any of them to the pool.
+        memcpy_pool_->submitTasks(std::move(pending));
+        VLOG(1) << "Memcpy transfer submitted to worker pool with "
+                << operation_count << " operations in " << tasks << " tasks";
+        return TransferFuture(state);
+    }
+
+    auto state = std::make_shared<MemcpyOperationState>();
     MemcpyTask task(std::move(operations), state);
     memcpy_pool_->submitTask(std::move(task));
 

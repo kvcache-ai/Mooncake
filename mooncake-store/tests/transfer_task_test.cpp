@@ -119,6 +119,29 @@ TEST_F(TransferTaskTest, MemcpyOperationState) {
     EXPECT_EQ(state->get_result(), ErrorCode::OK);
 }
 
+TEST_F(TransferTaskTest, MemcpyOperationStateWaitsForAllTasksAfterError) {
+    MemcpyOperationState state(3);
+
+    state.set_completed(ErrorCode::TRANSFER_FAIL);
+    EXPECT_FALSE(state.is_completed());
+    state.set_completed(ErrorCode::OK);
+    EXPECT_FALSE(state.is_completed());
+    state.set_completed(ErrorCode::OK);
+    EXPECT_TRUE(state.is_completed());
+    EXPECT_EQ(state.get_result(), ErrorCode::TRANSFER_FAIL);
+}
+
+TEST_F(TransferTaskTest, MemcpyWorkerPoolWorkerCountFromEnvironment) {
+    for (const char* value :
+         {static_cast<const char*>(nullptr), "0", "-1", "invalid"}) {
+        ScopedEnvVar workers("MC_STORE_MEMCPY_WORKERS", value);
+        EXPECT_EQ(MemcpyWorkerPool().workerCount(), 1);
+    }
+
+    ScopedEnvVar workers("MC_STORE_MEMCPY_WORKERS", "3");
+    EXPECT_EQ(MemcpyWorkerPool().workerCount(), 3);
+}
+
 // Test MemcpyWorkerPool basic functionality
 TEST_F(TransferTaskTest, MemcpyWorkerPoolBasic) {
     MemcpyWorkerPool pool;
@@ -523,6 +546,7 @@ TEST_F(TransferTaskTest, IsSameProcessEndpoint) {
 
 TEST_F(TransferTaskTest, BatchGetOffloadObjectHonorsLocalMemcpySetting) {
     setenv("MC_STORE_MEMCPY", "1", 1);
+    ScopedEnvVar workers("MC_STORE_MEMCPY_WORKERS", "2");
     TransferEngine engine(false);
     ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17933"), 0);
     const std::string endpoint = engine.getLocalIpAndPort();
@@ -533,7 +557,10 @@ TEST_F(TransferTaskTest, BatchGetOffloadObjectHonorsLocalMemcpySetting) {
     const std::vector<uint64_t> pointers{
         reinterpret_cast<uintptr_t>(source.data())};
     const std::unordered_map<std::string, std::vector<Slice>> slices{
-        {"key", {{nullptr, 0}, {destination.data(), destination.size()}}}};
+        {"key",
+         {{nullptr, 0},
+          {destination.data(), 256},
+          {destination.data() + 256, 256}}}};
 
     for (const auto access : {OffloadBufferAccess::kLocalAddress,
                               OffloadBufferAccess::kTransferEngine}) {

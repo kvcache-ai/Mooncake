@@ -1508,6 +1508,7 @@ Do not run binaries from before and after checksum support was introduced in the
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MC_STORE_MEMCPY` | auto | Prefer local memcpy when source/destination are on the same client. When unset, auto-detected by transport: **enabled** in a TCP-only environment, **disabled** when an RDMA/other transport is available. Accepts `1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off` to override |
+| `MC_STORE_MEMCPY_WORKERS` | 1 | Number of local copy workers per Store transfer submitter. A value greater than one lets same-process SSD offload GET batches split independent host-memory copies across workers. Accepts a positive integer. |
 | `MC_STORE_CLIENT_SETUP_RETRIES` | `20` | Number of times to retry client registration on failure |
 | `MC_CXL_DEV_SIZE` | unset | CXL device size in raw bytes for client-side allocation. **Required when `protocol="cxl"`** — the client aborts at startup if it is missing |
 

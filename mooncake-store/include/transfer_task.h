@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -152,6 +153,10 @@ class EmptyOperationState : public OperationState {
  */
 class MemcpyOperationState : public OperationState {
    public:
+    explicit MemcpyOperationState(size_t tasks = 1) : remaining_(tasks) {
+        assert(tasks != 0);
+    }
+
     bool is_completed() override {
         std::lock_guard<std::mutex> lock(mutex_);
         return result_.has_value();
@@ -160,8 +165,10 @@ class MemcpyOperationState : public OperationState {
     void set_completed(ErrorCode error_code) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            assert(!result_.has_value());
-            result_.emplace(error_code);
+            assert(remaining_ != 0);
+            if (first_error_ == ErrorCode::OK) first_error_ = error_code;
+            if (--remaining_ != 0) return;
+            result_.emplace(first_error_);
         }
         cv_.notify_all();
     }
@@ -174,6 +181,10 @@ class MemcpyOperationState : public OperationState {
     TransferStrategy get_strategy() const override {
         return TransferStrategy::LOCAL_MEMCPY;
     }
+
+   private:
+    size_t remaining_;
+    ErrorCode first_error_ = ErrorCode::OK;
 };
 
 /**
@@ -390,8 +401,7 @@ struct MemcpyTask {
 /**
  * @brief Thread pool for asynchronous memcpy operations
  *
- * This class manages a single worker thread that executes memcpy operations
- * asynchronously.
+ * The pool executes local copies asynchronously.
  */
 class MemcpyWorkerPool {
    public:
@@ -409,12 +419,15 @@ class MemcpyWorkerPool {
      * @param task The memcpy task to execute
      */
     void submitTask(MemcpyTask task);
+    void submitTasks(std::list<MemcpyTask> tasks);
+    size_t workerCount() const { return workers_.size(); }
 
    private:
+    void shutdown();
     void workerThread();
 
     std::vector<std::thread> workers_;
-    std::queue<MemcpyTask> task_queue_;
+    std::list<MemcpyTask> task_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::atomic<bool> shutdown_;
@@ -726,7 +739,7 @@ class TransferSubmitter {
         uint64_t src_offset = 0);
 
     std::optional<TransferFuture> submitMemcpyOperations(
-        std::vector<MemcpyOperation> operations);
+        std::vector<MemcpyOperation> operations, bool allow_parallel = false);
 
     /**
      * @brief Submit NoF (NVMe-oF) operation asynchronously
