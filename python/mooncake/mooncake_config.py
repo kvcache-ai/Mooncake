@@ -73,6 +73,10 @@ DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200  # 3.125 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
 
 _SIZE_SUFFIXES = [
+    ("kib", 1024),
+    ("mib", 1024**2),
+    ("gib", 1024**3),
+    ("tib", 1024**4),
     ("kb", 1024),
     ("mb", 1024**2),
     ("gb", 1024**3),

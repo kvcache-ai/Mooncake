@@ -114,7 +114,7 @@ TEST_F(HugepageConfigTest, AcceptsLegacyByteSizeSyntaxForSupportedSizes) {
 TEST_F(HugepageConfigTest, InvalidSizesWarnAndFallBackTo2Mb) {
     use_hugepage.Set("1");
     for (const char* value :
-         {"", " ", "2MiB", "2MBjunk", "1e999", "infinite", "256MB", "1.5GB"}) {
+         {"", " ", "2KiB", "2MBjunk", "1e999", "infinite", "256MB", "1.5GB"}) {
         SCOPED_TRACE(value);
         hugepage_size.Set(value);
         ::testing::internal::CaptureStderr();

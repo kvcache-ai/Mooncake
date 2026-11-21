@@ -4,6 +4,24 @@ The Python package exposes the native Store and framework-neutral structured
 objects. Existing `put_structured_object`, DataProto, whole-object
 `materialize` and matrix reads keep their current behavior.
 
+## Configuration size units
+
+`MooncakeConfig.from_file()` and `MooncakeConfig.load_from_env()` accept byte counts or case-insensitive size suffixes. `KiB`, `MiB`, `GiB` and `TiB` mean 1024, 1024², 1024³ and 1024⁴ bytes. The legacy `K`/`KB`, `M`/`MB`, `G`/`GB` and `T`/`TB` spellings keep the same binary multipliers; their meaning does not change to decimal units. Fractional values and surrounding whitespace retain the existing behavior, so `1.5 GiB` is 1610612736 bytes.
+
+For example, an existing JSON configuration can use:
+
+```json
+{
+  "local_hostname": "localhost",
+  "metadata_server": "P2PHANDSHAKE",
+  "master_server_address": "127.0.0.1:50051",
+  "global_segment_size": "8GiB",
+  "local_buffer_size": "512MiB"
+}
+```
+
+The corresponding environment values are `MOONCAKE_GLOBAL_SEGMENT_SIZE=8GiB` and `MOONCAKE_LOCAL_BUFFER_SIZE=512MiB`. Direct `MooncakeConfig(...)` construction still takes integer byte counts. The shared native byte-size parser accepts the same IEC suffixes and rejects results outside its `uint64_t` range; this does not change byte-size formatting or replace CLI flag validation.
+
 ## Reading member byte ranges
 
 `MooncakeBundleTransfer.materialize_ranges_into` reads selected byte intervals
