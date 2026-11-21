@@ -109,6 +109,28 @@ static std::string loadTopologyJsonFile(const std::string& path) {
     return content;
 }
 
+bool TransferEngineImpl::installDiscoveredTransport(
+    const std::string& protocol) {
+    if (multi_transports_->installTransport(protocol, local_topology_)) {
+        LOG(INFO) << "Installed transport, type=" << protocol;
+        return true;
+    }
+#ifdef USE_TCP
+    // RDMA disables unusable devices during initialization. A later failure
+    // (e.g. publishing the segment) must still be reported to the caller.
+    if (auto_discover_config_.protocol == "tcp" &&
+        !std::getenv("MC_FORCE_HCA") &&
+        (protocol == "rdma" || protocol == "rdma_twosided") &&
+        local_topology_->empty()) {
+        LOG(WARNING) << "No usable RDMA device, falling back to requested TCP";
+        return multi_transports_->installTransport("tcp", local_topology_) !=
+               nullptr;
+    }
+#endif
+    LOG(ERROR) << "Failed to install transport, type=" << protocol;
+    return false;
+}
+
 int TransferEngineImpl::init(const std::string& metadata_conn_string,
                              const std::string& local_server_name,
                              const std::string& ip_or_host_name,
@@ -372,13 +394,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             if ((local_topology_->getHcaList().size() > 0 &&
                  !getenv("MC_FORCE_TCP")) ||
                 getenv("MC_FORCE_HCA")) {
-                Transport* t = multi_transports_->installTransport(
-                    "rdma", local_topology_);
-                if (!t) {
-                    LOG(ERROR) << "Failed to install RDMA transport for MACA";
-                    return -1;
-                }
-                LOG(INFO) << "Using RDMA host transport for MACA";
+                if (!installDiscoveredTransport("rdma")) return -1;
             } else {
 #ifdef USE_TCP
                 Transport* t =
@@ -460,13 +476,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         } else if (!no_hca || force_hca) {
             const char* rdma_protocol =
                 globalConfig().use_rdma_twosided ? "rdma_twosided" : "rdma";
-            Transport* t = multi_transports_->installTransport(rdma_protocol,
-                                                               local_topology_);
-            if (!t) {
-                LOG(ERROR) << "Failed to install RDMA transport";
-                return -1;
-            }
-            LOG(INFO) << "Using RDMA transport, type=" << rdma_protocol;
+            if (!installDiscoveredTransport(rdma_protocol)) return -1;
         } else {
 #ifdef USE_TCP
             Transport* t = multi_transports_->installTransport("tcp", nullptr);
@@ -489,27 +499,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         if ((local_topology_->getHcaList().size() > 0 &&
              !getenv("MC_FORCE_TCP")) ||
             getenv("MC_FORCE_HCA")) {
-            const std::string transport_type = autoDiscoverTransport();
-            Transport* transport = nullptr;
-            if (transport_type == "barex") {
-#ifdef USE_BAREX
-                transport = multi_transports_->installTransport(
-                    "barex", local_topology_);
-#else
-                LOG(ERROR) << "Set USE BAREX while barex not compiled";
-                return -1;
-#endif
-            } else {
-                transport = multi_transports_->installTransport(
-                    transport_type, local_topology_);
-            }
-            if (transport == nullptr) {
-                LOG(ERROR) << "Failed to install transport, type="
-                           << transport_type;
-                return -1;
-            } else {
-                LOG(INFO) << "installTransport, type=" << transport_type;
-            }
+            if (!installDiscoveredTransport(autoDiscoverTransport())) return -1;
         } else {
             Transport* tcp_transport =
                 multi_transports_->installTransport("tcp", nullptr);
