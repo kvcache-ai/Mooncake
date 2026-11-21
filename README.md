@@ -210,15 +210,73 @@ Mooncake integrates with [vLLM](https://github.com/vllm-project/vllm) to acceler
 
 <h2 id="ecosystem-integrations">🌐 Ecosystem Integrations</h2>
 
-Mooncake connects inference engines, cache middleware, RL systems, and deployment tools. Click a logo to open the upstream project.
+Mooncake connects inference engines, cache middleware, RL systems, and deployment tools. Click a logo or a name to open the upstream project. Projects without a published logo are listed by name.
 
-| <a href="https://github.com/sgl-project/sglang"><img src="image/ecosystem/sglang.png" width="112" alt="SGLang"/></a> | <a href="https://github.com/vllm-project/vllm"><img src="image/ecosystem/vllm.png" width="112" alt="vLLM"/></a> | <a href="https://github.com/NVIDIA/TensorRT-LLM"><img src="image/ecosystem/tensorrt-llm.png" width="112" alt="TensorRT-LLM"/></a> | <a href="https://github.com/lightseekorg/tokenspeed"><img src="image/ecosystem/tokenspeed.png" width="112" alt="TokenSpeed"/></a> | <a href="https://github.com/InternLM/lmdeploy"><img src="image/ecosystem/lmdeploy.png" width="112" alt="LMDeploy"/></a> | <a href="https://github.com/vllm-project/vllm-ascend"><img src="image/ecosystem/vllm-ascend.png" width="112" alt="vLLM-Ascend"/></a> |
-| --- | --- | --- | --- | --- | --- |
-| <a href="https://github.com/PaddlePaddle/FastDeploy"><img src="image/ecosystem/fastdeploy.png" width="112" alt="FastDeploy"/></a> | <a href="https://github.com/xLLM-AI/xllm"><img src="image/ecosystem/xllm.png" width="112" alt="xLLM"/></a> | <a href="https://github.com/thu-pacman/chitu"><img src="image/ecosystem/chitu.png" width="112" alt="Chitu"/></a> | <a href="https://github.com/ROCm/ATOM"><img src="image/ecosystem/atom.png" width="112" alt="ATOM"/></a> | <a href="https://github.com/sgl-project/sglang-omni"><img src="image/ecosystem/sglang-omni.png" width="112" alt="SGLang-Omni"/></a> | <a href="https://github.com/vllm-project/vllm-omni"><img src="image/ecosystem/vllm-omni.png" width="112" alt="vLLM-Omni"/></a> |
-| <a href="https://github.com/ModelTC/LightX2V"><img src="image/ecosystem/lightx2v.png" width="112" alt="LightX2V"/></a> | <a href="https://github.com/LMCache/LMCache"><img src="image/ecosystem/lmcache.png" width="112" alt="LMCache"/></a> | <a href="https://github.com/taco-project/FlexKV"><img src="image/ecosystem/flexkv.png" width="112" alt="FlexKV"/></a> | <a href="https://github.com/alibaba/tair-kvcache"><img src="image/ecosystem/tair-kvcache.png" width="112" alt="Tair"/></a> | <a href="https://github.com/ai-dynamo/nixl"><img src="image/ecosystem/nixl.png" width="112" alt="NIXL"/></a> | <a href="https://github.com/pytorch/pytorch"><img src="image/ecosystem/pytorch.png" width="112" alt="PyTorch"/></a> |
-| <a href="https://github.com/ai-dynamo/dynamo"><img src="image/ecosystem/dynamo.png" width="112" alt="Dynamo"/></a> | <a href="https://github.com/llm-d/llm-d"><img src="image/ecosystem/llm-d.png" width="112" alt="llm-d"/></a> | <a href="https://github.com/sgl-project/rbg"><img src="image/ecosystem/rbg.png" width="112" alt="RBG"/></a> | <a href="https://github.com/NVIDIA/srt-slurm"><img src="image/ecosystem/srt-slurm.png" width="112" alt="srt-slurm"/></a> | <a href="https://github.com/verl-project/verl"><img src="image/ecosystem/verl.png" width="112" alt="verl"/></a> | <a href="https://github.com/THUDM/slime"><img src="image/ecosystem/slime.png" width="112" alt="slime"/></a> |
-| <a href="https://github.com/radixark/miles"><img src="image/ecosystem/miles.png" width="112" alt="Miles"/></a> | <a href="https://github.com/NVIDIA-NeMo/RL"><img src="image/ecosystem/nemo-rl.png" width="112" alt="NeMo RL"/></a> | <a href="https://github.com/Ascend/TransferQueue"><img src="image/ecosystem/transferqueue.png" width="112" alt="TransferQueue"/></a> | <a href="https://github.com/MoonshotAI/checkpoint-engine"><img src="image/ecosystem/checkpoint-engine.png" width="112" alt="checkpoint-engine"/></a> | <a href="https://github.com/torchspec-project/TorchSpec"><img src="image/ecosystem/torchspec.png" width="112" alt="TorchSpec"/></a> | <a href="https://github.com/vllm-project/speculators"><img src="image/ecosystem/speculators.png" width="112" alt="Speculators"/></a> |
-| <a href="https://github.com/sgl-project/SpecForge"><img src="image/ecosystem/specforge.png" width="112" alt="SpecForge"/></a> |  |  |  |  |  |
+<p align="center">
+  <a href="https://github.com/sgl-project/sglang"><img src="image/ecosystem/sglang.png" width="122" alt="SGLang"></a>
+  <a href="https://github.com/vllm-project/vllm"><img src="image/ecosystem/vllm.png" width="122" alt="vLLM"></a>
+  <a href="https://github.com/lightseekorg/tokenspeed"><img src="image/ecosystem/tokenspeed.png" width="122" alt="TokenSpeed"></a>
+  <a href="https://github.com/InternLM/lmdeploy"><img src="image/ecosystem/lmdeploy.png" width="122" alt="LMDeploy"></a>
+  <a href="https://github.com/vllm-project/vllm-ascend"><img src="image/ecosystem/vllm-ascend.png" width="122" alt="vLLM-Ascend"></a>
+  <a href="https://github.com/PaddlePaddle/FastDeploy"><img src="image/ecosystem/fastdeploy.png" width="122" alt="FastDeploy"></a>
+  <br>
+  <a href="https://github.com/xLLM-AI/xllm"><img src="image/ecosystem/xllm.png" width="122" alt="xLLM"></a>
+  <a href="https://github.com/thu-pacman/chitu"><img src="image/ecosystem/chitu.png" width="122" alt="Chitu"></a>
+  <a href="https://github.com/ROCm/ATOM"><img src="image/ecosystem/atom.png" width="122" alt="ATOM"></a>
+  <a href="https://github.com/sgl-project/sglang-omni"><img src="image/ecosystem/sglang-omni.png" width="122" alt="SGLang-Omni"></a>
+  <a href="https://github.com/vllm-project/vllm-omni"><img src="image/ecosystem/vllm-omni.png" width="122" alt="vLLM-Omni"></a>
+  <a href="https://github.com/ModelTC/LightX2V"><img src="image/ecosystem/lightx2v.png" width="122" alt="LightX2V"></a>
+  <br>
+  <a href="https://github.com/LMCache/LMCache"><img src="image/ecosystem/lmcache.png" width="122" alt="LMCache"></a>
+  <a href="https://github.com/ModelEngine-Group/unified-cache-management"><img src="image/ecosystem/ucm.png" width="122" alt="UCM"></a>
+  <a href="https://github.com/gpustack/gpustack"><img src="image/ecosystem/gpustack.png" width="122" alt="GPUStack"></a>
+  <a href="https://github.com/mstar-project/mstar"><img src="image/ecosystem/mstar.png" width="122" alt="mstar"></a>
+  <a href="https://github.com/pytorch/pytorch"><img src="image/ecosystem/pytorch.png" width="122" alt="PyTorch"></a>
+  <a href="https://github.com/ai-dynamo/dynamo"><img src="image/ecosystem/dynamo.png" width="122" alt="Dynamo"></a>
+  <br>
+  <a href="https://github.com/llm-d/llm-d"><img src="image/ecosystem/llm-d.png" width="122" alt="llm-d"></a>
+  <a href="https://github.com/verl-project/verl"><img src="image/ecosystem/verl.png" width="122" alt="verl"></a>
+  <a href="https://github.com/THUDM/slime"><img src="image/ecosystem/slime.png" width="122" alt="slime"></a>
+  <a href="https://github.com/radixark/miles"><img src="image/ecosystem/miles.png" width="122" alt="Miles"></a>
+  <a href="https://github.com/inclusionAI/Awex"><img src="image/ecosystem/awex.png" width="122" alt="Awex"></a>
+  <a href="https://github.com/sgl-project/SpecForge"><img src="image/ecosystem/specforge.png" width="122" alt="SpecForge"></a>
+  <br><br>
+  <a href="https://github.com/NVIDIA/TensorRT-LLM"><b>TensorRT-LLM</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/taco-project/FlexKV"><b>FlexKV</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/alibaba/tair-kvcache"><b>Tair KVCache</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/ai-dynamo/nixl"><b>NIXL</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/AMD-AGI/Infera"><b>Infera</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/Tele-AI/Fluxon"><b>Fluxon</b></a>
+  <br>
+  <a href="https://github.com/sgl-project/rbg"><b>RBG</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/smg-project/smg"><b>SMG</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/NVIDIA/srt-slurm"><b>srt-slurm</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/skyrl-project/SkyRL"><b>SkyRL</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/PrimeIntellect-ai/prime-rl"><b>prime-rl</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/NVIDIA-NeMo/RL"><b>NeMo RL</b></a>
+  <br>
+  <a href="https://github.com/Tencent-Hunyuan/UniRL"><b>UniRL</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/Ascend/TransferQueue"><b>TransferQueue</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/MoonshotAI/checkpoint-engine"><b>checkpoint-engine</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/pytorch/torchtitan"><b>TorchTitan</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/lightseekorg/TorchSpec"><b>TorchSpec</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://github.com/vllm-project/speculators"><b>Speculators</b></a>
+</p>
 
 <details>
 <summary>Integration directory</summary>
@@ -240,21 +298,32 @@ Mooncake connects inference engines, cache middleware, RL systems, and deploymen
 | [SGLang-Omni](https://github.com/sgl-project/sglang-omni) | TE | Cross-stage tensor and blob transfer between thinker, talker, codec, and vocoder stages | [Relay backend](https://github.com/sgl-project/sglang-omni/blob/main/sglang_omni/relay/mooncake.py) |
 | [vLLM-Omni](https://github.com/vllm-project/vllm-omni) | TE, Store | Data exchange between multimodal pipeline stages | [Omni connectors](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/distributed/omni_connectors/connectors) |
 | [LightX2V](https://github.com/ModelTC/LightX2V) | TE | Encoder/transformer disaggregation for video generation | [Transfer backend](https://github.com/ModelTC/LightX2V/blob/main/lightx2v/disagg/mooncake.py) |
+| [mstar](https://github.com/mstar-project/mstar) | TE | RDMA tensor transport between serving stages | [Tensor transport](https://github.com/mstar-project/mstar/blob/main/mstar/communication/tensors.py) |
+| [Infera](https://github.com/AMD-AGI/Infera) | TE via SGLang | PD disaggregation over Mooncake on ROCm | [1P1D example](https://github.com/AMD-AGI/Infera/blob/main/manual/examples/k8s_pd_1p1d_mooncake.md) |
 | [LMCache](https://github.com/LMCache/LMCache) | TE, Store | Remote KV storage, a native MP L2 adapter, and P2P cache sharing | [Store guide](https://docs.lmcache.ai/kv_cache/storage_backends/mooncake.html), [MP adapter](https://docs.lmcache.ai/mp/l2_storage.html#mooncake-store-mooncake-store-native-connector), [P2P backend](https://github.com/LMCache/LMCache/pull/4182) |
 | [FlexKV](https://github.com/taco-project/FlexKV) | TE, Store | Distributed cache reuse and a content-addressed REMOTE tier | [Distributed reuse](https://github.com/taco-project/FlexKV/blob/main/docs/dist_reuse/README_en.md), [Store backend](https://github.com/taco-project/FlexKV/pull/231) |
 | [Tair KVCache](https://github.com/alibaba/tair-kvcache) | Store | Mooncake Store as a data-storage backend for the KV Cache Manager | [Store backend](https://github.com/alibaba/tair-kvcache/blob/main/kv_cache_manager/data_storage/mooncake_backend.cc) |
+| [UCM](https://github.com/ModelEngine-Group/unified-cache-management) | Store | Shared KV store and PD transport for Ascend inference | [Store pipeline](https://ucm.readthedocs.io/en/latest/developer-guide/cache-configuration/mooncake/), [PD transport](https://ucm.readthedocs.io/en/latest/user-guide/capabilities/pd-disaggregation/distributed/) |
+| [Fluxon](https://github.com/Tele-AI/Fluxon) | Store | KV cache client backed by Mooncake Store | [Mooncake client](https://github.com/Tele-AI/Fluxon/blob/main/fluxon_py/kvclient/mooncake.py) |
 | [NIXL](https://github.com/ai-dynamo/nixl) | TE | Mooncake transport plugin for NIXL data movement | [Plugin guide](https://github.com/ai-dynamo/nixl/blob/main/src/plugins/mooncake/README.md) |
 | [PyTorch](https://github.com/pytorch/pytorch) | TE | Mooncake transport for point-to-point tensor transfer in `torch.distributed._transport` | [Transport](https://github.com/pytorch/pytorch/tree/main/torch/distributed/_transport/mooncake) |
 | [Dynamo](https://github.com/ai-dynamo/dynamo) | Store via SGLang HiCache | Shared-pool awareness and event-driven KV cache routing | [HiCache integration](https://github.com/ai-dynamo/dynamo/blob/main/docs/fern/pages/developer-guide/knowledge-base/modular-components/backends/sglang/hicache.md) |
+| [SMG](https://github.com/smg-project/smg) | TE via vLLM | KV-aware routing for Mooncake PD transfer | [PD transfer](https://github.com/smg-project/smg/blob/main/e2e_test/router/test_pd_mooncake.py) |
 | [llm-d](https://github.com/llm-d/llm-d) | TE, Store via vLLM | Kubernetes PD serving and tiered KV cache offloading | [PD integration](https://github.com/llm-d/llm-d/pull/1511), [Tiered prefix cache](https://github.com/llm-d/llm-d/tree/main/guides/tiered-prefix-cache) |
+| [GPUStack](https://github.com/gpustack/gpustack) | TE, Store | Managed Mooncake KV pools and PD disaggregation | [Cache backend](https://docs.gpustack.ai/gpustack-operator/v0.10.0/docs/modules/kv-cache/backend/), [PD disaggregation](https://docs.gpustack.ai/2.3/user-guide/pd-disaggregation/) |
 | [RBG](https://github.com/sgl-project/rbg) | TE, Store via inference engines | Role-based orchestration of Store, PD transfer, and cache reuse | [Deployment examples](https://github.com/sgl-project/rbg/tree/main/examples/inference/ecosystem/mooncake) |
 | [srt-slurm](https://github.com/NVIDIA/srt-slurm) | TE, Store via inference engines | Slurm deployment and Mooncake service configuration | [Mooncake services](https://github.com/NVIDIA/srt-slurm/blob/main/docs/mooncake-kv-store.md) |
 | [verl](https://github.com/verl-project/verl) | TE | Checkpoint-engine backend for trainer-to-rollout weight synchronization | [Mooncake backend](https://github.com/verl-project/verl/blob/main/verl/checkpoint_engine/mooncake_checkpoint_engine.py) |
 | [slime](https://github.com/THUDM/slime) | TE via SGLang | PD-disaggregated rollout serving | [RL serving architecture](https://github.com/THUDM/slime/blob/main/docs/en/advanced/rl-systems.md) |
 | [Miles](https://github.com/radixark/miles) | Store | Rollout-to-training data transfer | [Rollout transfer guide](https://github.com/radixark/miles/blob/main/docs/advanced/mooncake-rollout-transfer.md) |
+| [SkyRL](https://github.com/skyrl-project/SkyRL) | TE, Store via vLLM | PD transfer and shared KV offload for RL inference | [Inference guide](https://github.com/skyrl-project/SkyRL/blob/main/.agents/docs/inference.md) |
+| [prime-rl](https://github.com/PrimeIntellect-ai/prime-rl) | Store | Shared KV offload across inference nodes | [Inference guide](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/docs/inference.md) |
+| [UniRL](https://github.com/Tencent-Hunyuan/UniRL) | Store via TransferQueue | Rollout data exchange over Mooncake RDMA | [Data plane](https://github.com/Tencent-Hunyuan/UniRL/blob/main/unirl/distributed/README.md) |
+| [TorchTitan](https://github.com/pytorch/torchtitan) | Store via SGLang HiCache | Mooncake Store master for RL generators | [Store master](https://github.com/pytorch/torchtitan/blob/main/torchtitan/rl/generator/mooncake_master.py) |
 | [NeMo RL](https://github.com/NVIDIA-NeMo/RL) | Store via TransferQueue | Rollout-to-training data exchange with optional GDR client transfers | [Data plane](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data_plane/README.md), [GDR support](https://github.com/NVIDIA-NeMo/RL/pull/3501) |
 | [TransferQueue](https://github.com/Ascend/TransferQueue) | Store | RL tensor/object storage, GDR transfers, and SSD offloading | [Store client](https://github.com/Ascend/TransferQueue/blob/main/transfer_queue/storage/clients/mooncake_client.py), [GDR guide](https://github.com/Ascend/TransferQueue/blob/main/docs/storage_backends/mooncake_gdr.md) |
 | [checkpoint-engine](https://github.com/MoonshotAI/checkpoint-engine) | TE | Peer-to-peer model-weight distribution and updates | [P2P backend](https://github.com/MoonshotAI/checkpoint-engine) |
+| [Awex](https://github.com/inclusionAI/Awex) | TE | Training-to-inference weight synchronization | [Mooncake backend](https://github.com/inclusionAI/Awex#mooncake-weight-transfer) |
 | [TorchSpec](https://github.com/lightseekorg/TorchSpec) | Store | Hidden-state exchange between inference and draft-model training | [Training architecture](https://github.com/lightseekorg/TorchSpec) |
 | [Speculators](https://github.com/vllm-project/speculators) | Store | Hidden-state exchange for distributed online draft-model training | [Hidden-state connectors](https://github.com/vllm-project/speculators/tree/main/hs_connectors) |
 | [SpecForge](https://github.com/sgl-project/SpecForge) | Store | Hidden-state exchange for online draft-model training | [Store data plane](https://github.com/sgl-project/SpecForge/blob/main/specforge/runtime/data_plane/mooncake_store.py) |
