@@ -2373,9 +2373,24 @@ resources; restart the process to reclaim them.
 A failed mount may leave a remote segment record: close does not guarantee
 synchronous remote cleanup, and there is no background cleanup reaper.
 
+With `grace_period_seconds` greater than 0, a real client first gracefully
+unmounts all of its segments. Until the master removes them, other clients can
+still read the objects on them, and the client keeps running the drain tasks
+the master sends it. After the master removes a segment, the client keeps it
+registered for the default read lease (10 seconds), so readers that looked up
+its objects earlier can finish. This wait lasts at most about
+`grace_period_seconds + 13` seconds. A dummy client ignores
+`grace_period_seconds` and logs a warning. The wait releases the Python
+lock, and the store is cleared when `close()` returns, so stop the other
+threads that use the store before calling `close()`.
+
 ```python
-def close(self) -> int
+def close(self, grace_period_seconds: int = 0) -> int
 ```
+
+**Parameters:**
+- `grace_period_seconds` (int, optional): Grace period for unmounting the
+  segments before teardown. `0` (default) tears down right away.
 
 **Returns:**
 - `int`: Status code (0 = success, non-zero = terminal cleanup failure).

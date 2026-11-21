@@ -31,6 +31,11 @@ DEFINE_bool(start_offload_rpc_server, true,
             "(batch_get_offload_object / release_offload_buffer). "
             "Effective only when --enable_offload is true. "
             "Disable for a write-only owner.");
+DEFINE_uint64(shutdown_grace_seconds, 0,
+              "On SIGTERM, SIGINT or SIGHUP, gracefully unmount all segments "
+              "for this many seconds and keep serving until the master "
+              "removes them and the default read lease has passed. 0 exits "
+              "right away.");
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
 
@@ -162,6 +167,8 @@ int main(int argc, char *argv[]) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;
     }
+
+    client_inst->set_shutdown_grace_period(FLAGS_shutdown_grace_seconds);
 
     if (client_inst->start_dummy_client_monitor()) {
         LOG(FATAL) << "Failed to start dummy client monitor thread";
