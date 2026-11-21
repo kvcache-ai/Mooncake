@@ -840,6 +840,30 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
 
 int TransferEngineImpl::unregisterLocalMemory(void* addr,
                                               bool update_metadata) {
+    // Quiesce in-flight batches that still reference this buffer before
+    // transport deregister. Mid-flight ibv_dereg_mr causes LOC_PROT storms
+    // that latch sticky "Device is not active" (#5481).
+    if (multi_transports_) {
+        uint64_t region_length = 0;
+        // Unknown addresses keep the transport's own not-registered contract.
+        // Quiesce only a base this engine actually registered.
+        if (lookupLocalRegionLength(addr, &region_length)) {
+            Status st = multi_transports_->waitMemoryIdle(
+                addr, static_cast<size_t>(region_length),
+                /*timeout_ms=*/5000);
+            if (st.IsBatchBusy()) {
+                LOG(ERROR) << "unregisterLocalMemory: buffer still in flight, "
+                              "refusing deregister addr="
+                           << addr;
+                return ERR_BATCH_BUSY;
+            }
+            if (!st.ok()) {
+                LOG(WARNING) << "unregisterLocalMemory waitMemoryIdle: "
+                             << st.ToString();
+            }
+        }
+    }
+
     // Best-effort: try every transport so one failure can't leave the region
     // registered on the others; mirrors unregisterLocalMemoryBatch (#2869).
     int first_error = 0;
@@ -1056,6 +1080,25 @@ int TransferEngineImpl::registerLocalMemoryBatch(
 
 int TransferEngineImpl::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
+    if (multi_transports_) {
+        for (auto* addr : addr_list) {
+            uint64_t region_length = 0;
+            if (!lookupLocalRegionLength(addr, &region_length)) continue;
+            Status st = multi_transports_->waitMemoryIdle(
+                addr, static_cast<size_t>(region_length),
+                /*timeout_ms=*/5000);
+            if (st.IsBatchBusy()) {
+                LOG(ERROR) << "unregisterLocalMemoryBatch: buffer still in "
+                              "flight, refusing deregister addr="
+                           << addr;
+                return ERR_BATCH_BUSY;
+            }
+            if (!st.ok()) {
+                LOG(WARNING) << "unregisterLocalMemoryBatch waitMemoryIdle: "
+                             << st.ToString();
+            }
+        }
+    }
     int first_error = 0;
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemoryBatch(addr_list);
@@ -1140,6 +1183,16 @@ void TransferEngineImpl::releaseMemoryRegions(
         registering_memory_regions_.erase(
             reinterpret_cast<uintptr_t>(region.addr));
     }
+}
+
+bool TransferEngineImpl::lookupLocalRegionLength(void* addr, uint64_t* length) {
+    if (!addr || !length) return false;
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto it = local_memory_regions_.find(reinterpret_cast<uintptr_t>(addr));
+    if (it == local_memory_regions_.end() || it->second.length == 0)
+        return false;
+    *length = it->second.length;
+    return true;
 }
 
 void TransferEngineImpl::insertMemoryRegionLocked(const MemoryRegion& region) {

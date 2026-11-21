@@ -3385,6 +3385,17 @@ TEST_F(FileStorageTest,
     const int64_t target_size = sizes.front();
     constexpr int kConcurrency = 8;
 
+    // Hold the leader inside Acquire until every reader has joined. A fast
+    // local load otherwise finishes before the other threads enter, and each
+    // of them allocates its own staging buffer.
+    FileStorage::ColdReadOverlapGate overlap;
+    overlap.need = kConcurrency;
+    fileStorage.cold_read_overlap_gate_ = &overlap;
+    struct ClearOverlap {
+        FileStorage& storage;
+        ~ClearOverlap() { storage.cold_read_overlap_gate_ = nullptr; }
+    } clear_overlap{fileStorage};
+
     // Every reader disappears right after its cold read without releasing,
     // which is the worst case for a shared staging buffer: only the lease can
     // still get the memory back.

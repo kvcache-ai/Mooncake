@@ -160,6 +160,8 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     batch_desc_set_[batch_desc->id] = batch_desc;
     batch_desc_lock_.unlock();
 #endif
+    if (batch_size > 0) batch_desc->quiesce_spans.reserve(batch_size);
+    trackLiveBatch(batch_desc->id);
     return batch_desc->id;
 }
 
@@ -246,6 +248,7 @@ Status MultiTransport::tryFreeBatchID(
             "BatchID cannot be freed until completion callbacks are "
             "quiescent");
     }
+    untrackLiveBatch(batch_id);
     // The queue holds its own nodes, so the descriptor can be deleted once
     // no callback is still inside it. suppressCompletion keeps a published
     // id out of a later drain.
@@ -602,11 +605,16 @@ Status MultiTransport::submitTransfer(
     if (!select_status.ok()) return select_status;
 
     if (entries.empty()) return Status::OK();
+    // Publishing stays set until spans are installed, so a concurrent
+    // unregister treats this batch as busy instead of reading task_list
+    // while it grows.
+    beginQuiescePublish(batch_id);
     auto& task_list = batch_desc.task_list;
     const bool all_counter = std::all_of(
         transports.begin(), transports.end(),
         [](Transport* t) { return t->supportsBatchCompletionCounter(); });
     if (batch_desc.event_enabled && !all_counter) {
+        cancelQuiescePublish(batch_id);
         return Status::CompletionNotificationUnsupported(
             "event-enabled batch requires a transport that publishes "
             "completion without foreground polling");
@@ -617,6 +625,7 @@ Status MultiTransport::submitTransfer(
     batch_desc.is_finished.store(false, std::memory_order_relaxed);
     batch_desc.finished_transfer_bytes.store(0, std::memory_order_relaxed);
 
+    const size_t task_base = task_list.size();
     task_list.reserve(task_list.size() + entries.size());
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
         submit_tasks;
@@ -651,6 +660,37 @@ Status MultiTransport::submitTransfer(
         if (task_sizes) task_sizes->push_back(count);
         i += count;
     }
+    {
+        // Four inline spans cover the usual single-request submit without a
+        // heap allocation. Larger submits allocate once, outside the shard
+        // lock.
+        constexpr size_t kInlineSpans = 4;
+        BatchDesc::QuiesceSpan inline_spans[kInlineSpans];
+        std::vector<BatchDesc::QuiesceSpan> heap_spans;
+        size_t span_count = 0;
+        size_t req_i = 0;
+        for (size_t ti = task_base; ti < task_list.size(); ++ti) {
+            for (size_t k = 0; k < task_list[ti].request_count; ++k, ++req_i) {
+                const auto& req = entries[req_i];
+                BatchDesc::QuiesceSpan span{
+                    reinterpret_cast<uintptr_t>(req.source), req.length, ti};
+                if (heap_spans.empty() && span_count < kInlineSpans) {
+                    inline_spans[span_count++] = span;
+                    continue;
+                }
+                if (heap_spans.empty()) {
+                    heap_spans.reserve(entries.size());
+                    heap_spans.insert(heap_spans.end(), inline_spans,
+                                      inline_spans + span_count);
+                }
+                heap_spans.push_back(span);
+                span_count = heap_spans.size();
+            }
+        }
+        const BatchDesc::QuiesceSpan* published =
+            heap_spans.empty() ? inline_spans : heap_spans.data();
+        commitQuiesceSpans(batch_id, published, span_count);
+    }
     if (task_sizes) batch_desc.batch_size = task_list.size();
     // Arm the completion latch before any submitTransferTask. A seal that
     // finishes inside submit can release tokens early; the extra +1 keeps
@@ -674,6 +714,7 @@ Status MultiTransport::submitTransfer(
             overall_status = status;
         }
     }
+    settleQuiesceTasks(batch_id, task_base);
     // Non-event batches stop here. They never touch the latch.
     if (!batch_desc.event_enabled) return overall_status;
     // A failed submit leaves the extra token held so the latch never
@@ -734,11 +775,13 @@ Status MultiTransport::mp_submitTransfer(
         transports.push_back(transport);
     }
 
+    beginQuiescePublish(batch_id);
     batch_desc.counter_eligible = false;
     batch_desc.status_cached.store(false, std::memory_order_relaxed);
     batch_desc.is_finished.store(false, std::memory_order_relaxed);
     batch_desc.finished_transfer_bytes.store(0, std::memory_order_relaxed);
     size_t task_id = batch_desc.task_list.size();
+    const size_t task_base = task_id;
     batch_desc.task_list.resize(task_id + entries.size());
 
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
@@ -759,6 +802,32 @@ Status MultiTransport::mp_submitTransfer(
         recordTaskStart(task, request);
         submit_tasks[transport].push_back(&task);
     }
+    {
+        constexpr size_t kInlineSpans = 4;
+        BatchDesc::QuiesceSpan inline_spans[kInlineSpans];
+        std::vector<BatchDesc::QuiesceSpan> heap_spans;
+        size_t span_count = 0;
+        size_t req_i = 0;
+        for (size_t ti = task_base; ti < batch_desc.task_list.size(); ++ti) {
+            const auto& req = entries[req_i++];
+            BatchDesc::QuiesceSpan span{reinterpret_cast<uintptr_t>(req.source),
+                                        req.length, ti};
+            if (heap_spans.empty() && span_count < kInlineSpans) {
+                inline_spans[span_count++] = span;
+                continue;
+            }
+            if (heap_spans.empty()) {
+                heap_spans.reserve(entries.size());
+                heap_spans.insert(heap_spans.end(), inline_spans,
+                                  inline_spans + span_count);
+            }
+            heap_spans.push_back(span);
+            span_count = heap_spans.size();
+        }
+        const BatchDesc::QuiesceSpan* published =
+            heap_spans.empty() ? inline_spans : heap_spans.data();
+        commitQuiesceSpans(batch_id, published, span_count);
+    }
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
@@ -773,6 +842,7 @@ Status MultiTransport::mp_submitTransfer(
             overall_status = status;
         }
     }
+    settleQuiesceTasks(batch_id, task_base);
     return overall_status;
 }
 #endif
@@ -1482,6 +1552,143 @@ void* MultiTransport::getBaseAddr() {
     }
 #endif
     return 0;
+}
+
+void MultiTransport::trackLiveBatch(BatchID batch_id) {
+    auto& shard = live_batch_shards_[liveBatchShard(batch_id)];
+    std::lock_guard<std::mutex> guard(shard.mu);
+    shard.batches.insert(batch_id);
+}
+
+void MultiTransport::untrackLiveBatch(BatchID batch_id) {
+    auto& shard = live_batch_shards_[liveBatchShard(batch_id)];
+    std::lock_guard<std::mutex> guard(shard.mu);
+    shard.batches.erase(batch_id);
+}
+
+void MultiTransport::beginQuiescePublish(BatchID batch_id) {
+    auto& shard = live_batch_shards_[liveBatchShard(batch_id)];
+    std::lock_guard<std::mutex> guard(shard.mu);
+    auto& batch_desc = *((BatchDesc*)(batch_id));
+    batch_desc.quiesce_publishing = true;
+}
+
+void MultiTransport::commitQuiesceSpans(BatchID batch_id,
+                                        const BatchDesc::QuiesceSpan* spans,
+                                        size_t span_count) {
+    auto& shard = live_batch_shards_[liveBatchShard(batch_id)];
+    std::lock_guard<std::mutex> guard(shard.mu);
+    auto& batch_desc = *((BatchDesc*)(batch_id));
+    if (span_count > 0) {
+        auto& dst = batch_desc.quiesce_spans;
+        dst.insert(dst.end(), spans, spans + span_count);
+    }
+    batch_desc.quiesce_publishing = false;
+}
+
+void MultiTransport::settleQuiesceTasks(BatchID batch_id, size_t task_base) {
+    auto& batch_desc = *((BatchDesc*)(batch_id));
+    for (size_t ti = task_base; ti < batch_desc.task_list.size(); ++ti) {
+        __atomic_store_n(&batch_desc.task_list[ti].quiesce_settled,
+                         static_cast<uint64_t>(1), __ATOMIC_RELEASE);
+    }
+}
+
+void MultiTransport::cancelQuiescePublish(BatchID batch_id) {
+    auto& shard = live_batch_shards_[liveBatchShard(batch_id)];
+    std::lock_guard<std::mutex> guard(shard.mu);
+    auto& batch_desc = *((BatchDesc*)(batch_id));
+    batch_desc.quiesce_publishing = false;
+}
+
+bool MultiTransport::memoryReferencedByBatch(BatchID batch_id, void* addr,
+                                             size_t length) const {
+    if (!batch_id || batch_id == (BatchID)ERR_MEMORY) return false;
+    auto& batch_desc = *((BatchDesc*)(batch_id));
+    // Caller holds this batch's shard lock. A submit in progress has not
+    // installed spans yet; treat it as busy so we never read a growing
+    // task_list or a caller-owned TransferRequest.
+    if (batch_desc.quiesce_publishing) return true;
+    const uintptr_t a0 = reinterpret_cast<uintptr_t>(addr);
+    const uintptr_t a1 = length ? (a0 + length) : (a0 + 1);
+    for (const auto& span : batch_desc.quiesce_spans) {
+        if (span.task_index >= batch_desc.task_list.size()) continue;
+        const auto& task = batch_desc.task_list[span.task_index];
+        // Slice counters and quiesce_settled are only published with atomic
+        // builtins. is_finished is assigned from status polls; loading it
+        // here races those stores.
+        const uint64_t posted =
+            __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+        bool on_wire = true;
+        if (posted == 0) {
+            on_wire =
+                __atomic_load_n(&task.quiesce_settled, __ATOMIC_ACQUIRE) == 0;
+        } else {
+            const uint64_t ok =
+                __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+            const uint64_t bad =
+                __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+            on_wire = ok + bad < posted;
+        }
+        if (!on_wire) continue;
+        const uintptr_t s1 = span.addr + (span.length ? span.length : 1);
+        if (span.addr < a1 && a0 < s1) return true;
+    }
+    return false;
+}
+
+bool MultiTransport::memoryBusy(void* addr, size_t length) const {
+    auto shard_hits = [&](const LiveBatchShard& shard) {
+        for (BatchID batch_id : shard.batches) {
+            if (memoryReferencedByBatch(batch_id, addr, length)) return true;
+        }
+        return false;
+    };
+    for (const auto& shard : live_batch_shards_) {
+        std::lock_guard<std::mutex> guard(shard.mu);
+        if (shard_hits(shard)) return true;
+    }
+    // A batch can land in a shard we already released. Confirm once while
+    // holding every shard in index order (same order as any other full scan).
+    std::unique_lock<std::mutex> locks[kLiveBatchShards];
+    for (size_t i = 0; i < kLiveBatchShards; ++i) {
+        locks[i] = std::unique_lock<std::mutex>(live_batch_shards_[i].mu);
+    }
+    for (const auto& shard : live_batch_shards_) {
+        if (shard_hits(shard)) return true;
+    }
+    return false;
+}
+
+Status MultiTransport::waitMemoryIdle(void* addr, size_t length,
+                                      int64_t timeout_ms) {
+    if (!addr) return Status::InvalidArgument("addr is null");
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(std::max<int64_t>(timeout_ms, 0));
+    for (;;) {
+        bool busy = false;
+        busy = memoryBusy(addr, length);
+        if (!busy) {
+            std::lock_guard<std::mutex> def_guard(deferred_cleanup_mutex_);
+            for (const auto& entry : deferred_cleanup_batches_) {
+                auto& shard = live_batch_shards_[liveBatchShard(entry.first)];
+                std::lock_guard<std::mutex> live_guard(shard.mu);
+                if (memoryReferencedByBatch(entry.first, addr, length)) {
+                    busy = true;
+                    break;
+                }
+            }
+        }
+        if (!busy) return Status::OK();
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Status::BatchBusy(
+                "unregisterLocalMemory blocked: transfers still reference "
+                "buffer");
+        }
+        deferred_cleanup_cv_.notify_one();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 }  // namespace mooncake

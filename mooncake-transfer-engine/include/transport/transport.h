@@ -554,6 +554,10 @@ class Transport {
         volatile uint64_t completion_state = Slice::kCompletionSealBit;
         volatile uint64_t transferred_bytes = 0;
         volatile bool is_finished = false;
+        // Submit stores 1 with __atomic_store_n after post returns. Unregister
+        // loads it with __atomic_load_n. Status paths assign is_finished
+        // directly; reading that from the unregister thread races.
+        volatile uint64_t quiesce_settled = 0;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
 
@@ -649,6 +653,19 @@ class Transport {
         // terminal_notify and writes the fd. Legacy batches leave this false
         // and keep today's submit/status path with no eventfd write.
         bool event_enabled = false;
+
+        // Local source ranges copied at submit. Unregister scans these
+        // instead of task.request, which aliases the caller's vector.
+        // quiesce_publishing is set before task_list grows and cleared
+        // when the spans are visible. Both are only touched under the
+        // live-batch shard lock.
+        struct QuiesceSpan {
+            uintptr_t addr = 0;
+            size_t length = 0;
+            size_t task_index = 0;
+        };
+        std::vector<QuiesceSpan> quiesce_spans;
+        bool quiesce_publishing = false;
 
         // Number of completion callbacks currently holding a pin on this
         // BatchDesc and therefore still allowed to read or update it and the
