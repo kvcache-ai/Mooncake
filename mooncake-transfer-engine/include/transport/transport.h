@@ -794,10 +794,10 @@ class Transport {
     }
     virtual Status CheckStatus(SegmentID sid) { return Status::OK(); }
 
-    // Can an independent ordinary batch be submitted from a sharding worker
+    // Can an independent ordinary batch be submitted from a batch submit worker
     // without losing caller-thread context or execution dependencies?
     // This does not strengthen ordinary failure, timeout or cleanup semantics.
-    virtual bool supportsShardedTransfer() const { return false; }
+    virtual bool supportsParallelBatchSubmit() const { return false; }
 
    protected:
     virtual int install(std::string &local_server_name,

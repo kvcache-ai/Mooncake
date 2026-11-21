@@ -432,7 +432,7 @@ class TransferEngineImpl {
     void notifyBatchMaybeReady(BatchID batch_id,
                                bool poll_until_terminal = false);
 
-    bool supportsShardedTransfer(SegmentID peer) const;
+    bool supportsParallelBatchSubmit(SegmentID peer) const;
 
    private:
     friend class ProgressWorker;

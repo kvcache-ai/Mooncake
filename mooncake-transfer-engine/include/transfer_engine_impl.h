@@ -473,9 +473,9 @@ class TransferEngineImpl {
         return local_topology_;
     }
 
-    bool supportsShardedTransfer(Transport::SegmentID peer) const {
+    bool supportsParallelBatchSubmit(Transport::SegmentID peer) const {
         return multi_transports_ &&
-               multi_transports_->supportsShardedTransfer(peer);
+               multi_transports_->supportsParallelBatchSubmit(peer);
     }
 
    private:

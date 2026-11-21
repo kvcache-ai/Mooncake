@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "transfer_engine.h"
 #include "transfer_engine_impl.h"
-#include "transfer_sharding.h"
+#include "batch_submit.h"
 #include <gtest/gtest.h>
 #include <atomic>
 #include <barrier>
@@ -26,16 +26,16 @@ class TransferEngineImplTestPeer {
         engine.use_tent_ = false;
         engine.impl_ = std::make_shared<TransferEngineImpl>(false);
         engine.impl_->multi_transports_ = std::move(multi);
-        engine.sharding_executor_ = std::make_shared<TransferShardingExecutor>(
-            TransferShardingExecutor::Config{threads, 1, 4});
+        engine.batch_submit_executor_ = std::make_shared<BatchSubmitExecutor>(
+            BatchSubmitExecutor::Config{threads, 1, 4});
     }
 #ifdef USE_TENT
     static tent::TransferEngineImpl& impl(tent::TransferEngine& engine) {
         return *engine.impl_;
     }
     static void configure(tent::TransferEngine& engine, size_t threads = 2) {
-        engine.sharding_executor_ = std::make_shared<TransferShardingExecutor>(
-            TransferShardingExecutor::Config{threads, 1, 4});
+        engine.batch_submit_executor_ = std::make_shared<BatchSubmitExecutor>(
+            BatchSubmitExecutor::Config{threads, 1, 4});
     }
     static void facade(TransferEngine& engine,
                        std::shared_ptr<tent::TransferEngine> native) {
@@ -66,10 +66,10 @@ class MultiTransportBatchTestPeer {
 };
 
 namespace {
-using Executor = TransferShardingExecutor;
+using Executor = BatchSubmitExecutor;
 using namespace std::chrono_literals;
 
-TEST(TransferSharding, PreservesExactCoverageAndTail) {
+TEST(BatchSubmit, PreservesExactCoverageAndTail) {
     for (size_t n : {size_t(0), size_t(1), size_t(3), size_t(8193), SIZE_MAX}) {
         for (size_t p : {size_t(0), size_t(1), size_t(2), size_t(4)}) {
             auto ranges = Executor::partition(n, p);
@@ -84,7 +84,7 @@ TEST(TransferSharding, PreservesExactCoverageAndTail) {
     }
 }
 
-TEST(TransferSharding, DefaultAndThresholdDoNotRunCallbacks) {
+TEST(BatchSubmit, DefaultAndThresholdDoNotRunCallbacks) {
     Executor disabled({0, 4096, 1});
     EXPECT_FALSE(disabled.eligible(65536));
     Executor enabled({2, 4096, 1});
@@ -101,7 +101,7 @@ TEST(TransferSharding, DefaultAndThresholdDoNotRunCallbacks) {
             .ok());
 }
 
-TEST(TransferSharding, BatchSubmitEnvironmentConfig) {
+TEST(BatchSubmit, BatchSubmitEnvironmentConfig) {
     struct SavedEnvironment {
         const char* name;
         std::optional<std::string> previous;
@@ -148,11 +148,11 @@ TEST(TransferSharding, BatchSubmitEnvironmentConfig) {
     }
 }
 
-TEST(TransferSharding, MissingBackendDeclinesWithoutRunningBuilder) {
+TEST(BatchSubmit, MissingBackendDeclinesWithoutRunningBuilder) {
     auto check = [](TransferEngine& engine) {
         EXPECT_FALSE(engine.isBatchSubmitEligible(SIZE_MAX));
         int builds = 0;
-        EXPECT_FALSE(engine.tryShardedTransfer(
+        EXPECT_FALSE(engine.tryParallelBatchTransfer(
             1, 4096,
             [&](size_t, size_t) {
                 ++builds;
@@ -174,7 +174,7 @@ TEST(TransferSharding, MissingBackendDeclinesWithoutRunningBuilder) {
 #endif
 }
 
-TEST(TransferSharding, DetectsOverlapBeforeAnySubBatchCanPublish) {
+TEST(BatchSubmit, DetectsOverlapBeforeAnySubBatchCanPublish) {
     const std::vector<size_t> lengths{16, 16, 16};
     EXPECT_TRUE(independentTransferDestinations(
         std::vector<uintptr_t>{32, 64, 96}, lengths));
@@ -190,7 +190,7 @@ TEST(TransferSharding, DetectsOverlapBeforeAnySubBatchCanPublish) {
                                                  std::vector<size_t>{0}));
 }
 
-TEST(TransferSharding, RunsIndependentSubBatchesConcurrently) {
+TEST(BatchSubmit, RunsIndependentSubBatchesConcurrently) {
     Executor executor({4, 1, 2});
     std::barrier rendezvous(4);
     std::mutex mutex;
@@ -213,7 +213,7 @@ TEST(TransferSharding, RunsIndependentSubBatchesConcurrently) {
     for (auto value : touched) EXPECT_EQ(value, 1);
 }
 
-TEST(TransferSharding, OneThreadUsesTheWorkerAndRejectsRecursiveWait) {
+TEST(BatchSubmit, OneThreadUsesTheWorkerAndRejectsRecursiveWait) {
     Executor executor({1, 1, 1});
     const auto caller = std::this_thread::get_id();
     auto result = executor.execute(
@@ -229,7 +229,7 @@ TEST(TransferSharding, OneThreadUsesTheWorkerAndRejectsRecursiveWait) {
     EXPECT_TRUE(result.ok());
 }
 
-TEST(TransferSharding, AdmissionDeadlineDoesNotPublishWork) {
+TEST(BatchSubmit, AdmissionDeadlineDoesNotPublishWork) {
     Executor executor({1, 1, 1});
     std::promise<void> started, release;
     auto wait = release.get_future().share();
@@ -254,7 +254,7 @@ TEST(TransferSharding, AdmissionDeadlineDoesNotPublishWork) {
     EXPECT_TRUE(first.get().ok());
 }
 
-TEST(TransferSharding, ExceptionSettlesEverySubBatchAndPoolRemainsUsable) {
+TEST(BatchSubmit, ExceptionSettlesEverySubBatchAndPoolRemainsUsable) {
     Executor executor({2, 1, 2});
     auto failed =
         executor.execute(17, Executor::Clock::now() + 1s,
@@ -268,7 +268,7 @@ TEST(TransferSharding, ExceptionSettlesEverySubBatchAndPoolRemainsUsable) {
     EXPECT_TRUE(next.ok());
 }
 
-TEST(TransferSharding, ShutdownStopsAdmissionAndWaitsForActiveCallbacks) {
+TEST(BatchSubmit, ShutdownStopsAdmissionAndWaitsForActiveCallbacks) {
     Executor executor({2, 1, 1});
     std::promise<void> started;
     std::atomic<int> returned{0};
@@ -289,7 +289,7 @@ TEST(TransferSharding, ShutdownStopsAdmissionAndWaitsForActiveCallbacks) {
     EXPECT_FALSE(result.ok());
     EXPECT_FALSE(result.retryable);
     EXPECT_FALSE(result.isCanceled());
-    EXPECT_EQ(result.error, "Transfer sharding is shutting down");
+    EXPECT_EQ(result.error, "Batch submit executor is shutting down");
     EXPECT_FALSE(
         executor
             .execute(1, Executor::Clock::now() + 1s,
@@ -319,7 +319,7 @@ struct FakeAcceptedBatch {
     }
 };
 
-TEST(TransferSharding, SubBatchReleasesOnSuccessAndErrors) {
+TEST(BatchSubmit, SubBatchReleasesOnSuccessAndErrors) {
     for (int mode = 0; mode < 4; ++mode) {
         std::atomic<bool> stopped{false};
         FakeAcceptedBatch batch;
@@ -336,7 +336,7 @@ TEST(TransferSharding, SubBatchReleasesOnSuccessAndErrors) {
     }
 }
 
-TEST(TransferSharding, SiblingCancellationDoesNotMaskTheActualError) {
+TEST(BatchSubmit, SiblingCancellationDoesNotMaskTheActualError) {
     Executor executor({2, 1, 1});
     struct HeldAllocation : FakeAcceptedBatch {
         std::function<void()> on_allocate;
@@ -369,7 +369,7 @@ TEST(TransferSharding, SiblingCancellationDoesNotMaskTheActualError) {
     EXPECT_EQ(first.freed, 1);
 }
 
-TEST(TransferSharding, DeadlineCancellationDoesNotMaskTheActualError) {
+TEST(BatchSubmit, DeadlineCancellationDoesNotMaskTheActualError) {
     for (bool before_submit : {true, false}) {
         SCOPED_TRACE(before_submit);
         Executor executor({2, 1, 1});
@@ -416,7 +416,7 @@ TEST(TransferSharding, DeadlineCancellationDoesNotMaskTheActualError) {
     }
 }
 
-TEST(TransferSharding, ReleaseErrorIsPreservedAfterCancellation) {
+TEST(BatchSubmit, ReleaseErrorIsPreservedAfterCancellation) {
     struct FailedRelease : FakeAcceptedBatch {
         Executor::Result release() {
             ++freed;
@@ -434,7 +434,7 @@ TEST(TransferSharding, ReleaseErrorIsPreservedAfterCancellation) {
     EXPECT_EQ(batch.freed, 1);
 }
 
-TEST(TransferSharding, AllocationFailureNeverSubmitsPollsOrReleasesAHandle) {
+TEST(BatchSubmit, AllocationFailureNeverSubmitsPollsOrReleasesAHandle) {
     struct UnallocatedBatch : FakeAcceptedBatch {
         Executor::Result allocate() {
             return Executor::Result::Error("allocation failed");
@@ -450,7 +450,7 @@ TEST(TransferSharding, AllocationFailureNeverSubmitsPollsOrReleasesAHandle) {
     EXPECT_EQ(batch.freed, 0);
 }
 
-TEST(TransferSharding, SubBatchReleasesOnTimeout) {
+TEST(BatchSubmit, SubBatchReleasesOnTimeout) {
     std::atomic<bool> stopped{false};
     Executor::Cancellation cancellation{stopped, Executor::Clock::now() + 1h};
     FakeAcceptedBatch batch;
@@ -462,7 +462,7 @@ TEST(TransferSharding, SubBatchReleasesOnTimeout) {
     EXPECT_EQ(batch.freed, 1);
 }
 
-TEST(TransferSharding, SubBatchReleasesOnShutdown) {
+TEST(BatchSubmit, SubBatchReleasesOnShutdown) {
     struct HeldBatch : FakeAcceptedBatch {
         std::promise<void> polled;
         SubBatchProgress poll() {
@@ -482,13 +482,13 @@ TEST(TransferSharding, SubBatchReleasesOnShutdown) {
     EXPECT_EQ(batch.freed, 1);
 }
 
-TEST(TransferSharding, InvalidConfigIsRejectedWithoutSpawningThreads) {
+TEST(BatchSubmit, InvalidConfigIsRejectedWithoutSpawningThreads) {
     EXPECT_THROW((Executor({33, 1, 1})), std::invalid_argument);
     EXPECT_THROW((Executor({1, 0, 1})), std::invalid_argument);
     EXPECT_THROW((Executor({1, 1, 0})), std::invalid_argument);
 }
 
-TEST(TransferSharding, FailureJoinsAcceptedSiblingWithoutExpiringIt) {
+TEST(BatchSubmit, FailureJoinsAcceptedSiblingWithoutExpiringIt) {
     Executor executor({2, 1, 2});
     std::barrier both_running(2);
     std::promise<void> cancel_seen, release_sibling;
@@ -513,7 +513,7 @@ TEST(TransferSharding, FailureJoinsAcceptedSiblingWithoutExpiringIt) {
     EXPECT_EQ(parent.get().error, "first sub-batch failed");
 }
 
-TEST(TransferSharding, RetryDecisionIncludesEveryActualError) {
+TEST(BatchSubmit, RetryDecisionIncludesEveryActualError) {
     using Result = Executor::Result;
     struct Case {
         Result first, second;
@@ -549,7 +549,7 @@ TEST(TransferSharding, RetryDecisionIncludesEveryActualError) {
     }
 }
 
-TEST(TransferSharding, NativeFailureAfterDeadlineCannotRetry) {
+TEST(BatchSubmit, NativeFailureAfterDeadlineCannotRetry) {
     Executor executor({1, 1, 1});
     auto result = executor.execute(
         1, Executor::Clock::now() + 10ms, [](auto, const auto& cancellation) {
@@ -560,8 +560,7 @@ TEST(TransferSharding, NativeFailureAfterDeadlineCannotRetry) {
     EXPECT_FALSE(result.retryable);
 }
 
-TEST(TransferSharding,
-     ShutdownDisablesRetryEvenWhenNativeFailureWinsDiagnosis) {
+TEST(BatchSubmit, ShutdownDisablesRetryEvenWhenNativeFailureWinsDiagnosis) {
     Executor executor({1, 1, 1});
     std::promise<void> started;
     auto parent = std::async(std::launch::async, [&] {
@@ -579,7 +578,7 @@ TEST(TransferSharding,
     EXPECT_FALSE(result.retryable);
 }
 
-TEST(TransferSharding, NativeFailureSurvivesReleaseError) {
+TEST(BatchSubmit, NativeFailureSurvivesReleaseError) {
     struct FailedBatch : FakeAcceptedBatch {
         SubBatchProgress poll() {
             return {true, false, "native failure", true};
@@ -598,7 +597,7 @@ TEST(TransferSharding, NativeFailureSurvivesReleaseError) {
     EXPECT_EQ(batch.freed, 1);
 }
 
-TEST(TransferSharding, ConcurrentParentsKeepInputAndErrorsSeparate) {
+TEST(BatchSubmit, ConcurrentParentsKeepInputAndErrorsSeparate) {
     Executor executor({2, 1, 2});
     std::barrier launch(2);
     std::vector<int> successful_input(8193, 0);
@@ -624,7 +623,7 @@ TEST(TransferSharding, ConcurrentParentsKeepInputAndErrorsSeparate) {
     for (int count : successful_input) EXPECT_EQ(count, 1);
 }
 
-TEST(TransferSharding, ExpiredQueuedParentDoesNotSubmitAnySubBatch) {
+TEST(BatchSubmit, ExpiredQueuedParentDoesNotSubmitAnySubBatch) {
     Executor executor({2, 1, 2});
     std::promise<void> started, release;
     std::atomic<int> occupied{0};
@@ -660,7 +659,7 @@ TEST(TransferSharding, ExpiredQueuedParentDoesNotSubmitAnySubBatch) {
             .ok());
 }
 
-TEST(TransferSharding, TimeoutJoinsStartedCallbacksAndPreservesErrors) {
+TEST(BatchSubmit, TimeoutJoinsStartedCallbacksAndPreservesErrors) {
     // Cover active-only, active+queued, and an actual error after expiry.
     for (auto [count, fail] :
          {std::pair{1, false}, std::pair{2, false}, std::pair{2, true}}) {
@@ -716,7 +715,7 @@ TEST(TransferSharding, TimeoutJoinsStartedCallbacksAndPreservesErrors) {
         EXPECT_EQ(calls.load(), 1);
         EXPECT_EQ(result.code, fail ? -7 : -1);
         EXPECT_EQ(result.error, fail ? "Injected active failure"
-                                     : "Transfer sharding timed out");
+                                     : "Parallel batch transfer timed out");
         EXPECT_TRUE(executor
                         .execute(1, Executor::Clock::now() + 1s,
                                  [](auto, const auto&) {
@@ -726,7 +725,7 @@ TEST(TransferSharding, TimeoutJoinsStartedCallbacksAndPreservesErrors) {
     }
 }
 
-TEST(TransferSharding, DeadlineBeforeSubmitStillReleasesAllocatedBatch) {
+TEST(BatchSubmit, DeadlineBeforeSubmitStillReleasesAllocatedBatch) {
     std::atomic<bool> stopped{false};
     FakeAcceptedBatch batch;
     auto result = runSubBatch(
@@ -736,7 +735,7 @@ TEST(TransferSharding, DeadlineBeforeSubmitStillReleasesAllocatedBatch) {
     EXPECT_EQ(batch.freed, 1);
     EXPECT_EQ(batch.polls, 0);
 }
-class ShardingProbe : public Transport {
+class BatchSubmitProbe : public Transport {
    public:
     std::atomic<bool> supported{true};
     bool fail_submit = false;
@@ -747,7 +746,9 @@ class ShardingProbe : public Transport {
     std::mutex mutex;
     std::vector<TransferRequest> observed;
 
-    bool supportsShardedTransfer() const override { return supported.load(); }
+    bool supportsParallelBatchSubmit() const override {
+        return supported.load();
+    }
     Status submitTransfer(BatchID,
                           const std::vector<TransferRequest>&) override {
         return Status::NotImplemented("Use MultiTransport");
@@ -775,7 +776,9 @@ class ShardingProbe : public Transport {
             toBatchDesc(id).task_list[index].request->length;
         return Status::OK();
     }
-    const char* getName() const override { return "arbitrary-sharding-probe"; }
+    const char* getName() const override {
+        return "arbitrary-batch-submit-probe";
+    }
 
    private:
     int registerLocalMemory(void*, size_t, const std::string&, bool,
@@ -792,15 +795,15 @@ class ShardingProbe : public Transport {
     }
 };
 
-class ClassicSharding : public ::testing::Test {
+class ClassicBatchSubmit : public ::testing::Test {
    protected:
     std::string local = "local:1";
     std::shared_ptr<TransferMetadata> metadata =
         std::make_shared<TransferMetadata>(P2PHANDSHAKE);
     std::shared_ptr<MultiTransport> multi =
         std::make_shared<MultiTransport>(metadata, local);
-    std::shared_ptr<ShardingProbe> transport =
-        std::make_shared<ShardingProbe>();
+    std::shared_ptr<BatchSubmitProbe> transport =
+        std::make_shared<BatchSubmitProbe>();
     TransferEngine engine{false};
 
     void SetUp() override {
@@ -832,9 +835,9 @@ class ClassicSharding : public ::testing::Test {
     }
 };
 
-TEST_F(ClassicSharding, ArbitraryTransportNameAndRequestFieldsArePreserved) {
-    ASSERT_TRUE(engine.supportsShardedTransfer(1));
-    auto result = engine.tryShardedTransfer(1, 5, requests, 10s);
+TEST_F(ClassicBatchSubmit, ArbitraryTransportNameAndRequestFieldsArePreserved) {
+    ASSERT_TRUE(engine.supportsParallelBatchSubmit(1));
+    auto result = engine.tryParallelBatchTransfer(1, 5, requests, 10s);
     ASSERT_TRUE(result.has_value());
     ASSERT_TRUE(result->ok()) << result->ToString();
     EXPECT_EQ(transport->submits.load(), 2);
@@ -847,8 +850,8 @@ TEST_F(ClassicSharding, ArbitraryTransportNameAndRequestFieldsArePreserved) {
     }
 }
 
-TEST_F(ClassicSharding, FailureInfoMatchesLegacyAndResets) {
-    TransferEngine::ShardedTransferFailureInfo failure{true, true};
+TEST_F(ClassicBatchSubmit, FailureInfoMatchesLegacyAndResets) {
+    TransferEngine::ParallelBatchTransferFailureInfo failure{true, true};
     auto transfer = [&] {
         auto entries = requests(0, 1);
         auto id = engine.allocateBatchID(entries.size());
@@ -859,7 +862,7 @@ TEST_F(ClassicSharding, FailureInfoMatchesLegacyAndResets) {
         }
         EXPECT_TRUE(engine.freeBatchID(id).ok());
         auto result =
-            engine.tryShardedTransfer(1, 1, requests, 5s, 0, &failure);
+            engine.tryParallelBatchTransfer(1, 1, requests, 5s, 0, &failure);
         if (result) {
             EXPECT_EQ(failure.submit_failed, !submitted.ok());
             EXPECT_EQ(failure.retryable,
@@ -891,10 +894,10 @@ TEST_F(ClassicSharding, FailureInfoMatchesLegacyAndResets) {
     EXPECT_FALSE(failure.retryable);
 }
 
-TEST_F(ClassicSharding, UnsupportedAdmissionBuildsNothingAndFallsBackOnce) {
+TEST_F(ClassicBatchSubmit, UnsupportedAdmissionBuildsNothingAndFallsBackOnce) {
     transport->supported.store(false);
     int builds = 0;
-    auto result = engine.tryShardedTransfer(
+    auto result = engine.tryParallelBatchTransfer(
         1, 4,
         [&](auto begin, auto end) {
             ++builds;
@@ -911,12 +914,12 @@ TEST_F(ClassicSharding, UnsupportedAdmissionBuildsNothingAndFallsBackOnce) {
     EXPECT_TRUE(engine.freeBatchID(id).ok());
 }
 
-TEST_F(ClassicSharding, UnrelatedUnsupportedTransportDoesNotBlockThePeer) {
-    auto unsupported = std::make_shared<ShardingProbe>();
+TEST_F(ClassicBatchSubmit, UnrelatedUnsupportedTransportDoesNotBlockThePeer) {
+    auto unsupported = std::make_shared<BatchSubmitProbe>();
     unsupported->supported.store(false);
     MultiTransportBatchTestPeer::install(*multi, "other", unsupported);
     int builds = 0;
-    auto result = engine.tryShardedTransfer(
+    auto result = engine.tryParallelBatchTransfer(
         1, 2,
         [&](size_t begin, size_t end) {
             ++builds;
@@ -930,13 +933,13 @@ TEST_F(ClassicSharding, UnrelatedUnsupportedTransportDoesNotBlockThePeer) {
     EXPECT_EQ(unsupported->submits.load(), 0);
 }
 
-TEST_F(ClassicSharding, MixedPeerDoesNotCheckOnlyTheFirstProtocol) {
-    auto other = std::make_shared<ShardingProbe>();
+TEST_F(ClassicBatchSubmit, MixedPeerDoesNotCheckOnlyTheFirstProtocol) {
+    auto other = std::make_shared<BatchSubmitProbe>();
     other->supported.store(false);
     MultiTransportBatchTestPeer::install(*multi, "other", other);
     add(1, "probe,other");
     int builds = 0;
-    EXPECT_FALSE(engine.tryShardedTransfer(
+    EXPECT_FALSE(engine.tryParallelBatchTransfer(
         1, 2,
         [&](size_t begin, size_t end) {
             ++builds;
@@ -948,11 +951,11 @@ TEST_F(ClassicSharding, MixedPeerDoesNotCheckOnlyTheFirstProtocol) {
     EXPECT_EQ(other->submits.load(), 0);
 #ifdef ENABLE_MULTI_PROTOCOL
     other->supported.store(true);
-    EXPECT_TRUE(engine.supportsShardedTransfer(1));
+    EXPECT_TRUE(engine.supportsParallelBatchSubmit(1));
 #endif
 }
 
-TEST_F(ClassicSharding,
+TEST_F(ClassicBatchSubmit,
        DeferredFreeKeepsRequestsUntilParentJoinAndIsNotTransferFailure) {
     std::promise<BatchID> published;
     std::promise<void> resume_sibling;
@@ -966,7 +969,7 @@ TEST_F(ClassicSharding,
         published.set_value(id);
     };
     auto parent = std::async(std::launch::async, [&] {
-        return engine.tryShardedTransfer(
+        return engine.tryParallelBatchTransfer(
             1, 2,
             [&](size_t begin, size_t end) {
                 if (begin != 0) resume.wait();
@@ -975,9 +978,9 @@ TEST_F(ClassicSharding,
             10s);
     });
     const auto id = published.get_future().get();
-    const auto until = TransferShardingExecutor::Clock::now() + 5s;
+    const auto until = BatchSubmitExecutor::Clock::now() + 5s;
     while (!MultiTransportBatchTestPeer::deferred(*multi, id) &&
-           TransferShardingExecutor::Clock::now() < until)
+           BatchSubmitExecutor::Clock::now() < until)
         std::this_thread::yield();
     EXPECT_TRUE(MultiTransportBatchTestPeer::deferred(*multi, id));
     EXPECT_EQ(parent.wait_for(0s), std::future_status::timeout);
@@ -994,7 +997,8 @@ TEST_F(ClassicSharding,
     EXPECT_EQ(transport->submits.load(), 2);
 }
 
-TEST_F(ClassicSharding, ReadySubBatchSubmitsBeforeSlowSiblingFinishesBuilding) {
+TEST_F(ClassicBatchSubmit,
+       ReadySubBatchSubmitsBeforeSlowSiblingFinishesBuilding) {
     std::promise<void> submitted, release;
     auto ready = submitted.get_future();
     auto proceed = release.get_future().share();
@@ -1003,7 +1007,7 @@ TEST_F(ClassicSharding, ReadySubBatchSubmitsBeforeSlowSiblingFinishesBuilding) {
         if (++count == 1) submitted.set_value();
     };
     auto parent = std::async(std::launch::async, [&] {
-        return engine.tryShardedTransfer(
+        return engine.tryParallelBatchTransfer(
             1, 2,
             [&](size_t begin, size_t end) {
                 if (begin == 0) proceed.wait();
@@ -1027,9 +1031,9 @@ struct ProbeSubBatch : tt::Transport::SubBatch {
     size_t size() const override { return requests.size(); }
 };
 
-class TentShardingProbe : public tt::Transport {
+class TentBatchSubmitProbe : public tt::Transport {
    public:
-    explicit TentShardingProbe(tt::TransportType type) : type_(type) {
+    explicit TentBatchSubmitProbe(tt::TransportType type) : type_(type) {
         caps.dram_to_dram = true;
     }
     std::atomic<bool> supported{true}, pending{false};
@@ -1040,7 +1044,9 @@ class TentShardingProbe : public tt::Transport {
     std::function<void()> on_submit, on_poll;
     std::mutex mutex;
     std::vector<tt::Request> observed;
-    bool supportsShardedTransfer() const override { return supported.load(); }
+    bool supportsParallelBatchSubmit() const override {
+        return supported.load();
+    }
     tt::Status allocateSubBatch(SubBatchRef& batch, size_t) override {
         batch = new ProbeSubBatch;
         return tt::Status::OK();
@@ -1093,7 +1099,7 @@ class TentShardingProbe : public tt::Transport {
     tt::TransportType type_;
 };
 
-std::shared_ptr<tt::Config> shardingConfig(bool queue = false) {
+std::shared_ptr<tt::Config> batchSubmitConfig(bool queue = false) {
     auto config = std::make_shared<tt::Config>();
     config->set("metadata_type", "p2p");
     config->set("rpc_server_hostname", "127.0.0.1");
@@ -1109,12 +1115,12 @@ std::shared_ptr<tt::Config> shardingConfig(bool queue = false) {
     return config;
 }
 
-class TentSharding : public ::testing::Test {
+class TentBatchSubmit : public ::testing::Test {
    protected:
     std::shared_ptr<tt::TransferEngine> engine =
-        std::make_shared<tt::TransferEngine>(shardingConfig());
-    std::shared_ptr<TentShardingProbe> transport =
-        std::make_shared<TentShardingProbe>(tt::TCP);
+        std::make_shared<tt::TransferEngine>(batchSubmitConfig());
+    std::shared_ptr<TentBatchSubmitProbe> transport =
+        std::make_shared<TentBatchSubmitProbe>(tt::TCP);
     std::vector<uint8_t> bytes = std::vector<uint8_t>(128);
     void SetUp() override {
         ASSERT_TRUE(engine->available());
@@ -1128,14 +1134,14 @@ class TentSharding : public ::testing::Test {
         EXPECT_TRUE(engine->unregisterLocalMemory(bytes.data()).ok());
     }
     std::shared_ptr<tt::TransferEngine> remote(tt::SegmentID& id) {
-        auto peer = std::make_shared<tt::TransferEngine>(shardingConfig());
+        auto peer = std::make_shared<tt::TransferEngine>(batchSubmitConfig());
         EXPECT_TRUE(peer->available());
-        auto peer_transport = std::make_shared<TentShardingProbe>(tt::TCP);
+        auto peer_transport = std::make_shared<TentBatchSubmitProbe>(tt::TCP);
         TransferEngineImplTestPeer::impl(*peer).swapTransportForTest(
             tt::TCP, peer_transport);
         EXPECT_TRUE(peer->registerLocalMemory(bytes.data(), bytes.size()).ok());
         EXPECT_TRUE(TransferEngineImplTestPeer::machine(
-                        *peer, "sharding-remote-machine")
+                        *peer, "batch-submit-remote-machine")
                         .ok());
         EXPECT_TRUE(engine->openSegment(id, peer->getSegmentName()).ok());
         return peer;
@@ -1157,9 +1163,9 @@ class TentSharding : public ::testing::Test {
     }
 };
 
-TEST_F(TentSharding, PreservesFieldsThroughNativeBatch) {
-    ASSERT_TRUE(engine->supportsShardedTransfer(LOCAL_SEGMENT_ID));
-    auto result = engine->tryShardedTransfer(
+TEST_F(TentBatchSubmit, PreservesFieldsThroughNativeBatch) {
+    ASSERT_TRUE(engine->supportsParallelBatchSubmit(LOCAL_SEGMENT_ID));
+    auto result = engine->tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 4,
         [&](auto begin, auto end) { return requests(begin, end); }, 10s);
     ASSERT_TRUE(result.has_value());
@@ -1176,10 +1182,10 @@ TEST_F(TentSharding, PreservesFieldsThroughNativeBatch) {
     EXPECT_EQ(total, 4u * 16);
 }
 
-TEST_F(TentSharding, UnsupportedCandidateRejectsBeforeBuilder) {
+TEST_F(TentBatchSubmit, UnsupportedCandidateRejectsBeforeBuilder) {
     transport->supported.store(false);
     int builds = 0;
-    auto result = engine->tryShardedTransfer(
+    auto result = engine->tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 4,
         [&](auto begin, auto end) {
             ++builds;
@@ -1191,16 +1197,16 @@ TEST_F(TentSharding, UnsupportedCandidateRejectsBeforeBuilder) {
     EXPECT_EQ(transport->submits.load(), 0);
 }
 
-TEST_F(TentSharding, ExplicitHintDoesNotHideAnUnsupportedFailoverCandidate) {
-    auto unsupported = std::make_shared<TentShardingProbe>(tt::RDMA);
+TEST_F(TentBatchSubmit, ExplicitHintDoesNotHideAnUnsupportedFailoverCandidate) {
+    auto unsupported = std::make_shared<TentBatchSubmitProbe>(tt::RDMA);
     unsupported->supported.store(false);
     ASSERT_TRUE(engine->unregisterLocalMemory(bytes.data()).ok());
     TransferEngineImplTestPeer::impl(*engine).swapTransportForTest(tt::RDMA,
                                                                    unsupported);
     ASSERT_TRUE(engine->registerLocalMemory(bytes.data(), bytes.size()).ok());
-    EXPECT_FALSE(engine->supportsShardedTransfer(LOCAL_SEGMENT_ID));
+    EXPECT_FALSE(engine->supportsParallelBatchSubmit(LOCAL_SEGMENT_ID));
     int builds = 0;
-    auto result = engine->tryShardedTransfer(
+    auto result = engine->tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 2,
         [&](size_t begin, size_t end) {
             ++builds;
@@ -1213,16 +1219,16 @@ TEST_F(TentSharding, ExplicitHintDoesNotHideAnUnsupportedFailoverCandidate) {
     EXPECT_EQ(unsupported->submits.load(), 0);
 }
 
-TEST_F(TentSharding, LocalOnlyTransportsDoNotBlockCrossMachineTransfer) {
+TEST_F(TentBatchSubmit, LocalOnlyTransportsDoNotBlockCrossMachineTransfer) {
     tt::SegmentID peer_id = 0;
     auto peer = remote(peer_id);
     for (auto type : {tt::NVLINK, tt::SHM, tt::TPU}) {
-        auto local_only = std::make_shared<TentShardingProbe>(type);
+        auto local_only = std::make_shared<TentBatchSubmitProbe>(type);
         local_only->supported.store(false);
         TransferEngineImplTestPeer::impl(*engine).swapTransportForTest(
             type, local_only);
     }
-    auto result = engine->tryShardedTransfer(
+    auto result = engine->tryParallelBatchTransfer(
         peer_id, 2,
         [&](size_t begin, size_t end) {
             auto entries = requests(begin, end);
@@ -1237,15 +1243,15 @@ TEST_F(TentSharding, LocalOnlyTransportsDoNotBlockCrossMachineTransfer) {
     EXPECT_TRUE(peer->unregisterLocalMemory(bytes.data()).ok());
 }
 
-TEST_F(TentSharding, CrossMachineMnnvlRemainsAPossibleCandidate) {
+TEST_F(TentBatchSubmit, CrossMachineMnnvlRemainsAPossibleCandidate) {
     tt::SegmentID peer_id = 0;
     auto peer = remote(peer_id);
-    auto unsupported = std::make_shared<TentShardingProbe>(tt::MNNVL);
+    auto unsupported = std::make_shared<TentBatchSubmitProbe>(tt::MNNVL);
     unsupported->supported.store(false);
     TransferEngineImplTestPeer::impl(*engine).swapTransportForTest(tt::MNNVL,
                                                                    unsupported);
     int builds = 0;
-    auto result = engine->tryShardedTransfer(
+    auto result = engine->tryParallelBatchTransfer(
         peer_id, 2,
         [&](size_t, size_t) {
             ++builds;
@@ -1258,10 +1264,10 @@ TEST_F(TentSharding, CrossMachineMnnvlRemainsAPossibleCandidate) {
     EXPECT_TRUE(peer->unregisterLocalMemory(bytes.data()).ok());
 }
 
-TEST_F(TentSharding, FileOnlyTransportDoesNotBlockMemoryTransfer) {
-    class FileOnly : public TentShardingProbe {
+TEST_F(TentBatchSubmit, FileOnlyTransportDoesNotBlockMemoryTransfer) {
+    class FileOnly : public TentBatchSubmitProbe {
        public:
-        FileOnly() : TentShardingProbe(tt::IOURING) {
+        FileOnly() : TentBatchSubmitProbe(tt::IOURING) {
             caps.dram_to_dram = false;
             caps.dram_to_file = true;
             supported.store(false);
@@ -1270,22 +1276,22 @@ TEST_F(TentSharding, FileOnlyTransportDoesNotBlockMemoryTransfer) {
     auto file = std::make_shared<FileOnly>();
     TransferEngineImplTestPeer::impl(*engine).swapTransportForTest(tt::IOURING,
                                                                    file);
-    auto result = engine->tryShardedTransfer(
+    auto result = engine->tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 1,
         [&](size_t begin, size_t end) { return requests(begin, end); }, 10s);
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(result->ok());
 }
 
-TEST_F(TentSharding, RuntimeQueueAcceptsWorkerCompatibleTransport) {
-    tt::TransferEngine queued(shardingConfig(true));
+TEST_F(TentBatchSubmit, RuntimeQueueAcceptsWorkerCompatibleTransport) {
+    tt::TransferEngine queued(batchSubmitConfig(true));
     ASSERT_TRUE(queued.available());
     TransferEngineImplTestPeer::configure(queued);
-    auto queued_transport = std::make_shared<TentShardingProbe>(tt::TCP);
+    auto queued_transport = std::make_shared<TentBatchSubmitProbe>(tt::TCP);
     TransferEngineImplTestPeer::impl(queued).swapTransportForTest(
         tt::TCP, queued_transport);
     ASSERT_TRUE(queued.registerLocalMemory(bytes.data(), bytes.size()).ok());
-    auto result = queued.tryShardedTransfer(
+    auto result = queued.tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 4,
         [&](size_t begin, size_t end) { return requests(begin, end); }, 10s);
     ASSERT_TRUE(result.has_value());
@@ -1294,7 +1300,7 @@ TEST_F(TentSharding, RuntimeQueueAcceptsWorkerCompatibleTransport) {
     EXPECT_TRUE(queued.unregisterLocalMemory(bytes.data()).ok());
 }
 
-TEST_F(TentSharding, ReadySubBatchDoesNotWaitForAllBuilders) {
+TEST_F(TentBatchSubmit, ReadySubBatchDoesNotWaitForAllBuilders) {
     std::promise<void> submitted, release;
     auto ready = submitted.get_future();
     auto proceed = release.get_future().share();
@@ -1303,7 +1309,7 @@ TEST_F(TentSharding, ReadySubBatchDoesNotWaitForAllBuilders) {
         if (++count == 1) submitted.set_value();
     };
     auto parent = std::async(std::launch::async, [&] {
-        return engine->tryShardedTransfer(
+        return engine->tryParallelBatchTransfer(
             LOCAL_SEGMENT_ID, 2,
             [&](size_t begin, size_t end) {
                 if (begin == 0) proceed.wait();
@@ -1319,14 +1325,14 @@ TEST_F(TentSharding, ReadySubBatchDoesNotWaitForAllBuilders) {
     EXPECT_TRUE(result->ok()) << result->ToString();
 }
 
-TEST_F(TentSharding, BuilderFailureWaitsForPendingSiblingWithoutReplay) {
+TEST_F(TentBatchSubmit, BuilderFailureWaitsForPendingSiblingWithoutReplay) {
     std::promise<void> submitted, failed;
     auto ready = submitted.get_future().share();
     auto rejected = failed.get_future();
     transport->pending.store(true);
     transport->on_submit = [&] { submitted.set_value(); };
     auto parent = std::async(std::launch::async, [&] {
-        return engine->tryShardedTransfer(
+        return engine->tryParallelBatchTransfer(
             LOCAL_SEGMENT_ID, 2,
             [&](size_t begin, size_t end) {
                 if (begin != 0) {
@@ -1349,14 +1355,14 @@ TEST_F(TentSharding, BuilderFailureWaitsForPendingSiblingWithoutReplay) {
     EXPECT_EQ(transport->releases.load(), 1);
 }
 
-TEST_F(TentSharding, SubBatchUsesNativeFailover) {
-    auto first = std::make_shared<TentShardingProbe>(tt::RDMA);
+TEST_F(TentBatchSubmit, SubBatchUsesNativeFailover) {
+    auto first = std::make_shared<TentBatchSubmitProbe>(tt::RDMA);
     first->fail_poll.store(true);
     ASSERT_TRUE(engine->unregisterLocalMemory(bytes.data()).ok());
     TransferEngineImplTestPeer::impl(*engine).swapTransportForTest(tt::RDMA,
                                                                    first);
     ASSERT_TRUE(engine->registerLocalMemory(bytes.data(), bytes.size()).ok());
-    auto result = engine->tryShardedTransfer(
+    auto result = engine->tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 1,
         [&](size_t begin, size_t end) { return requests(begin, end); }, 10s);
     ASSERT_TRUE(result.has_value());
@@ -1366,9 +1372,9 @@ TEST_F(TentSharding, SubBatchUsesNativeFailover) {
     EXPECT_EQ(first->releases.load(), 1);
 }
 
-TEST_F(TentSharding, NativeSubmitFailureDoesNotReplayTheParent) {
+TEST_F(TentBatchSubmit, NativeSubmitFailureDoesNotReplayTheParent) {
     transport->fail_submit = true;
-    auto result = engine->tryShardedTransfer(
+    auto result = engine->tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 1,
         [&](size_t begin, size_t end) { return requests(begin, end); }, 10s);
     ASSERT_TRUE(result.has_value());
@@ -1377,10 +1383,10 @@ TEST_F(TentSharding, NativeSubmitFailureDoesNotReplayTheParent) {
     EXPECT_TRUE(transport->observed.empty());
 }
 
-TEST_F(TentSharding, NativeAndFacadeFailureInfoMatchesLegacyAndResets) {
+TEST_F(TentBatchSubmit, NativeAndFacadeFailureInfoMatchesLegacyAndResets) {
     TransferEngine facade(false);
     TransferEngineImplTestPeer::facade(facade, engine);
-    TransferEngine::ShardedTransferFailureInfo failure{true, true};
+    TransferEngine::ParallelBatchTransferFailureInfo failure{true, true};
     auto hint = tt::TCP;
     auto builder = [&](size_t begin, size_t end) {
         std::vector<TransferRequest> entries;
@@ -1405,8 +1411,8 @@ TEST_F(TentSharding, NativeAndFacadeFailureInfoMatchesLegacyAndResets) {
             EXPECT_TRUE(facade.getBatchTransferStatus(id, status).ok());
         }
         EXPECT_TRUE(facade.freeBatchID(id).ok());
-        auto result = facade.tryShardedTransfer(LOCAL_SEGMENT_ID, 1, builder,
-                                                5s, hint, &failure);
+        auto result = facade.tryParallelBatchTransfer(
+            LOCAL_SEGMENT_ID, 1, builder, 5s, hint, &failure);
         if (result) {
             EXPECT_EQ(failure.submit_failed, !submitted.ok());
             EXPECT_EQ(failure.retryable,
@@ -1443,8 +1449,9 @@ TEST_F(TentSharding, NativeAndFacadeFailureInfoMatchesLegacyAndResets) {
     EXPECT_FALSE(transfer());
     EXPECT_FALSE(failure.submit_failed);
     EXPECT_FALSE(failure.retryable);
-    tt::TransferEngine::ShardedTransferFailureInfo native_failure{true, true};
-    EXPECT_FALSE(engine->tryShardedTransfer(
+    tt::TransferEngine::ParallelBatchTransferFailureInfo native_failure{true,
+                                                                        true};
+    EXPECT_FALSE(engine->tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 1,
         [&](size_t begin, size_t end) { return requests(begin, end); }, 5s,
         tt::TCP, &native_failure));
@@ -1452,10 +1459,10 @@ TEST_F(TentSharding, NativeAndFacadeFailureInfoMatchesLegacyAndResets) {
     EXPECT_FALSE(native_failure.retryable);
 }
 
-TEST_F(TentSharding, PollApiErrorDoesNotAuthorizeRetry) {
+TEST_F(TentBatchSubmit, PollApiErrorDoesNotAuthorizeRetry) {
     transport->fail_poll_api.store(true);
-    tt::TransferEngine::ShardedTransferFailureInfo failure{true, true};
-    auto result = engine->tryShardedTransfer(
+    tt::TransferEngine::ParallelBatchTransferFailureInfo failure{true, true};
+    auto result = engine->tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 1,
         [&](size_t begin, size_t end) { return requests(begin, end); }, 5s,
         tt::UNSPEC, &failure);
@@ -1467,13 +1474,14 @@ TEST_F(TentSharding, PollApiErrorDoesNotAuthorizeRetry) {
     EXPECT_EQ(transport->releases.load(), 1);
 }
 
-TEST_F(TentSharding, NativePollErrorUsesOrdinaryFreeWithoutAnotherSubmission) {
+TEST_F(TentBatchSubmit,
+       NativePollErrorUsesOrdinaryFreeWithoutAnotherSubmission) {
     std::atomic<int> polls{0};
     transport->on_poll = [&] {
         if (++polls == 1)
             throw std::runtime_error("Injected native poll failure");
     };
-    auto result = engine->tryShardedTransfer(
+    auto result = engine->tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 1,
         [&](size_t begin, size_t end) { return requests(begin, end); }, 10s);
     ASSERT_TRUE(result.has_value());
@@ -1483,10 +1491,10 @@ TEST_F(TentSharding, NativePollErrorUsesOrdinaryFreeWithoutAnotherSubmission) {
     EXPECT_GT(polls.load(), 1);
 }
 
-TEST_F(TentSharding, FacadePreservesExplicitHintAndIntent) {
+TEST_F(TentBatchSubmit, FacadePreservesExplicitHintAndIntent) {
     TransferEngine facade(false);
     TransferEngineImplTestPeer::facade(facade, engine);
-    auto result = facade.tryShardedTransfer(
+    auto result = facade.tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 4,
         [&](size_t begin, size_t end) {
             std::vector<TransferRequest> result;
@@ -1514,10 +1522,10 @@ TEST_F(TentSharding, FacadePreservesExplicitHintAndIntent) {
     }
 }
 
-TEST_F(TentSharding, FacadeRejectsUnsupportedProducerEvent) {
+TEST_F(TentBatchSubmit, FacadeRejectsUnsupportedProducerEvent) {
     TransferEngine facade(false);
     TransferEngineImplTestPeer::facade(facade, engine);
-    auto result = facade.tryShardedTransfer(
+    auto result = facade.tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 1,
         [&](size_t begin, size_t end) {
             std::vector<TransferRequest> result;

@@ -199,7 +199,7 @@ class Transport {
 
     // Worker submission must preserve caller-thread context and execution
     // dependencies. Ordinary failure/timeout and cleanup semantics still apply.
-    virtual bool supportsShardedTransfer() const { return false; }
+    virtual bool supportsParallelBatchSubmit() const { return false; }
 
    protected:
     Capabilities caps;

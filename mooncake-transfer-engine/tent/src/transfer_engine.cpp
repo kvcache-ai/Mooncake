@@ -16,7 +16,7 @@
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/topology.h"
-#include "transfer_sharding.h"
+#include "batch_submit.h"
 #ifdef USE_CUDA
 #include <cuda_runtime_api.h>
 #endif
@@ -27,10 +27,10 @@ namespace tent {
 
 TransferEngine::TransferEngine()
     : impl_(std::make_unique<TransferEngineImpl>()),
-      sharding_executor_(std::make_shared<TransferShardingExecutor>()) {}
+      batch_submit_executor_(std::make_shared<BatchSubmitExecutor>()) {}
 
 TransferEngine::TransferEngine(const std::string config_path)
-    : sharding_executor_(std::make_shared<TransferShardingExecutor>()) {
+    : batch_submit_executor_(std::make_shared<BatchSubmitExecutor>()) {
     auto conf = std::make_shared<Config>();
     auto status = conf->loadFile(config_path);
     if (!status.ok()) {
@@ -42,20 +42,21 @@ TransferEngine::TransferEngine(const std::string config_path)
 
 TransferEngine::TransferEngine(std::shared_ptr<Config> conf)
     : impl_(std::make_unique<TransferEngineImpl>(conf)),
-      sharding_executor_(std::make_shared<TransferShardingExecutor>()) {}
+      batch_submit_executor_(std::make_shared<BatchSubmitExecutor>()) {}
 
-TransferEngine::~TransferEngine() { sharding_executor_->shutdown(); }
+TransferEngine::~TransferEngine() { batch_submit_executor_->shutdown(); }
 
-bool TransferEngine::supportsShardedTransfer(SegmentID peer) const {
-    return impl_->supportsShardedTransfer(peer);
+bool TransferEngine::supportsParallelBatchSubmit(SegmentID peer) const {
+    return impl_->supportsParallelBatchSubmit(peer);
 }
 
 bool TransferEngine::isBatchSubmitEligible(size_t count) const {
-    return impl_ && sharding_executor_ && sharding_executor_->eligible(count);
+    return impl_ && batch_submit_executor_ &&
+           batch_submit_executor_->eligible(count);
 }
 
 struct TransferEngine::TentSubBatchAdapter {
-    using Executor = TransferShardingExecutor;
+    using Executor = BatchSubmitExecutor;
     TransferEngine& engine;
     const std::vector<Request>& requests;
     BatchID sub_batch_id = 0;
@@ -66,15 +67,14 @@ struct TransferEngine::TentSubBatchAdapter {
     Executor::Result release();
 };
 
-TransferShardingExecutor::Result
-TransferEngine::TentSubBatchAdapter::allocate() {
+BatchSubmitExecutor::Result TransferEngine::TentSubBatchAdapter::allocate() {
     sub_batch_id = engine.allocateBatch(requests.size());
     return sub_batch_id
                ? Executor::Result::OK()
                : Executor::Result::Error("Could not allocate sub-batch");
 }
 
-TransferShardingExecutor::Result TransferEngine::TentSubBatchAdapter::submit() {
+BatchSubmitExecutor::Result TransferEngine::TentSubBatchAdapter::submit() {
     auto status = engine.submitTransfer(sub_batch_id, requests);
     return status.ok() ? Executor::Result::OK()
                        : Executor::Result::SubmitError(status.ToString());
@@ -91,29 +91,28 @@ SubBatchProgress TransferEngine::TentSubBatchAdapter::poll() {
             status.s == FAILED || status.s == TIMEOUT};
 }
 
-TransferShardingExecutor::Result
-TransferEngine::TentSubBatchAdapter::release() {
+BatchSubmitExecutor::Result TransferEngine::TentSubBatchAdapter::release() {
     auto status = engine.freeBatch(sub_batch_id);
     sub_batch_id = 0;
     return status.ok() ? Executor::Result::OK()
                        : Executor::Result::Error(status.ToString());
 }
 
-std::optional<Status> TransferEngine::tryShardedTransfer(
+std::optional<Status> TransferEngine::tryParallelBatchTransfer(
     SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
     std::chrono::nanoseconds timeout, TransportType hint,
-    ShardedTransferFailureInfo* failure_info) {
-    using Executor = ::mooncake::TransferShardingExecutor;
+    ParallelBatchTransferFailureInfo* failure_info) {
+    using Executor = ::mooncake::BatchSubmitExecutor;
     if (failure_info) *failure_info = {};
     if (!isBatchSubmitEligible(count)) return std::nullopt;
-    auto& executor = *sharding_executor_;
+    auto& executor = *batch_submit_executor_;
     const auto deadline = Executor::Clock::now() + timeout;
-    if (!supportsShardedTransfer(peer)) {
-        VLOG(1) << "TENT synchronous sharding admission declined: peer=" << peer
+    if (!supportsParallelBatchSubmit(peer)) {
+        VLOG(1) << "TENT parallel batch admission declined: peer=" << peer
                 << " descriptors=" << count;
         return std::nullopt;
     }
-    VLOG(1) << "TENT synchronous sharding admitted: peer=" << peer
+    VLOG(1) << "TENT parallel batch admitted: peer=" << peer
             << " descriptors=" << count;
     int device = -1;
 #ifdef USE_CUDA
@@ -125,7 +124,8 @@ std::optional<Status> TransferEngine::tryShardedTransfer(
         device = -1;
         (void)cudaGetLastError();
     } else if (cuda_status != cudaSuccess) {
-        return Status::InternalError("Could not capture sharding CUDA device");
+        return Status::InternalError(
+            "Could not capture batch submit CUDA device");
     }
 #endif
     std::vector<std::vector<Request>> request_storage(
@@ -136,7 +136,7 @@ std::optional<Status> TransferEngine::tryShardedTransfer(
 #ifdef USE_CUDA
             if (device >= 0 && cudaSetDevice(device) != cudaSuccess)
                 return Executor::Result::Error(
-                    "Could not bind sharding CUDA device");
+                    "Could not bind batch submit CUDA device");
 #endif
             auto& requests = request_storage[range.index];
             requests = builder(range.begin, range.end);
@@ -149,7 +149,7 @@ std::optional<Status> TransferEngine::tryShardedTransfer(
                     (request.opcode != Request::READ &&
                      request.opcode != Request::WRITE))
                     return Executor::Result::Error(
-                        "Sharded transfer request differs from admission");
+                        "Parallel batch request differs from admission");
             TentSubBatchAdapter sub_batch{*this, requests};
             return ::mooncake::runSubBatch(sub_batch, cancellation);
         });

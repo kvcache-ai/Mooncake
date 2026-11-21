@@ -13,7 +13,7 @@
 // limitations under the License.
 
 #include "transfer_engine_py.h"
-#include "transfer_sharding.h"
+#include "batch_submit.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1126,7 +1126,7 @@ int TransferEnginePy::batchTransferSync(
     auto batch_size = buffers.size();
     const int nic_hint_id = resolveNicHint(nic_hint);
     const int hint = parseTransportHint(transport_hint);
-    const bool try_sharding =
+    const bool try_parallel_batch =
         !notify && engine_->isBatchSubmitEligible(batch_size) &&
         independentTransferDestinations(
             opcode == TransferOpcode::WRITE ? peer_buffer_addresses : buffers,
@@ -1162,16 +1162,17 @@ int TransferEnginePy::batchTransferSync(
             }
             return requests;
         };
-        if (try_sharding) {
-            TransferEngine::ShardedTransferFailureInfo failure;
-            auto result = engine_->tryShardedTransfer(
+        if (try_parallel_batch) {
+            TransferEngine::ParallelBatchTransferFailureInfo failure;
+            auto result = engine_->tryParallelBatchTransfer(
                 handle, batch_size, build_requests,
                 std::chrono::duration_cast<std::chrono::nanoseconds>(deadline -
                                                                      now),
                 hint, &failure);
             if (result) {
                 if (result->ok()) return 0;
-                LOG(ERROR) << "Sharded transfer failed: " << result->ToString();
+                LOG(ERROR) << "Parallel batch transfer failed: "
+                           << result->ToString();
                 if (failure.submit_failed) {
                     evictStaleSegment(target_hostname, handle);
                     return -1;
@@ -1180,8 +1181,8 @@ int TransferEnginePy::batchTransferSync(
                 continue;
             }
         }
-        // Build the full request vector only after sharding declines this
-        // attempt, before any work has been published.
+        // Build the full request vector only after parallel submission declines
+        // this attempt, before any work has been published.
         if (entries.empty())
             entries = build_requests(0, batch_size);
         else

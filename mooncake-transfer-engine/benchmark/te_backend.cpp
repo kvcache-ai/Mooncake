@@ -793,15 +793,15 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
         }
         return requests;
     };
-    auto sharded_result = engine_->tryShardedTransfer(
+    auto parallel_result = engine_->tryParallelBatchTransfer(
         target_id, batch_size, build, std::chrono::seconds(30));
-    if (sharded_result) {
-        if (!sharded_result->ok()) {
+    if (parallel_result) {
+        if (!parallel_result->ok()) {
             // Ordinary free may defer cleanup while transport work still
             // owns the payload. Preserve the buffers until process exit.
             abandoned_batches_.fetch_add(1);
-            LOG(ERROR) << "Sharded transfer failed: "
-                       << sharded_result->ToString();
+            LOG(ERROR) << "Parallel batch transfer failed: "
+                       << parallel_result->ToString();
             noteTransferFailed();
             return -1.0;
         }

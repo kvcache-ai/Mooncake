@@ -35,7 +35,7 @@
 namespace mooncake {
 class ShutdownToken;
 class TransferEngineImpl;
-class TransferShardingExecutor;
+class BatchSubmitExecutor;
 namespace tent {
 class Config;
 class TransferEngine;
@@ -210,7 +210,7 @@ class TransferEngine {
     using SubBatchRequestBuilder =
         std::function<std::vector<TransferRequest>(size_t begin, size_t end)>;
 
-    struct ShardedTransferFailureInfo {
+    struct ParallelBatchTransferFailureInfo {
         // At least one engine submit API returned an error.
         bool submit_failed = false;
         // Only native FAILED/TIMEOUT errors, without parent expiry/shutdown.
@@ -221,10 +221,10 @@ class TransferEngine {
     // nullopt means disabled, below threshold, or unsupported before publish.
     // The builder runs once per sub-batch and must preserve every request
     // field.
-    std::optional<Status> tryShardedTransfer(
+    std::optional<Status> tryParallelBatchTransfer(
         SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
         std::chrono::nanoseconds timeout, int transport_hint = 0,
-        ShardedTransferFailureInfo* failure_info = nullptr);
+        ParallelBatchTransferFailureInfo* failure_info = nullptr);
 
     struct ScatterTransferRange {
         TransferRequest::OpCode opcode;
@@ -413,7 +413,7 @@ class TransferEngine {
     void enableGracefulShutdown();
     std::string showLinks(bool json = false) const;
 
-    bool supportsShardedTransfer(SegmentID peer) const;
+    bool supportsParallelBatchSubmit(SegmentID peer) const;
 
     bool isBatchSubmitEligible(size_t count) const;
 
@@ -428,7 +428,7 @@ class TransferEngine {
         const std::string& local_server_name) const;
 
     std::shared_ptr<TransferEngineImpl> impl_;
-    std::shared_ptr<TransferShardingExecutor> sharding_executor_;
+    std::shared_ptr<BatchSubmitExecutor> batch_submit_executor_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
     std::unique_ptr<Transport> tent_compat_transport_;
     std::mutex tent_compat_transport_mutex_;

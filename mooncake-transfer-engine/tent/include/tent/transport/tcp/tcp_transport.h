@@ -119,7 +119,7 @@ class TcpTransport : public Transport {
 
     virtual Status receiveNotification(std::vector<Notification> &notify_list);
 
-    bool supportsShardedTransfer() const override { return true; }
+    bool supportsParallelBatchSubmit() const override { return true; }
 
    private:
     Status uninstallImpl(bool force);

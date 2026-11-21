@@ -16,7 +16,7 @@
 #include "split_output.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
-#include "transfer_sharding.h"
+#include "batch_submit.h"
 
 #include <gtest/gtest.h>
 #include <cstdio>
@@ -38,9 +38,9 @@ class TransferEngineImplTestPeer {
         const tent::TransferEngine& engine) {
         return engine.impl_->metadata_;
     }
-    static void enableSharding(tent::TransferEngine& engine) {
-        engine.sharding_executor_ = std::make_shared<TransferShardingExecutor>(
-            TransferShardingExecutor::Config{1, 1, 4});
+    static void enableParallelBatchSubmit(tent::TransferEngine& engine) {
+        engine.batch_submit_executor_ = std::make_shared<BatchSubmitExecutor>(
+            BatchSubmitExecutor::Config{1, 1, 4});
     }
 };
 
@@ -142,7 +142,7 @@ class NoQuiesceTransport : public Transport {
         ++removed_buffers;
         return Status::OK();
     }
-    bool supportsShardedTransfer() const override { return true; }
+    bool supportsParallelBatchSubmit() const override { return true; }
 };
 
 class TENTTeardownTest : public testing::TestWithParam<bool> {
@@ -239,10 +239,10 @@ TEST_P(TENTTeardownTest, PollErrorRetainsEngineAndBuffer) {
     expectRetained();
 }
 
-TEST_P(TENTTeardownTest, ShardedPollErrorRetainsEngineAndBuffer) {
-    TransferEngineImplTestPeer::enableSharding(*engine_);
+TEST_P(TENTTeardownTest, ParallelBatchPollErrorRetainsEngineAndBuffer) {
+    TransferEngineImplTestPeer::enableParallelBatchSubmit(*engine_);
     ASSERT_TRUE(engine_->isBatchSubmitEligible(1));
-    ASSERT_TRUE(engine_->supportsShardedTransfer(LOCAL_SEGMENT_ID));
+    ASSERT_TRUE(engine_->supportsParallelBatchSubmit(LOCAL_SEGMENT_ID));
     transport_->mode = NoQuiesceTransport::Mode::PollError;
     EXPECT_LT(transfer(), 0);
     expectRetained();

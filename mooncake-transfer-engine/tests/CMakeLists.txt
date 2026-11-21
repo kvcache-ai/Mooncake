@@ -1,12 +1,12 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
-add_executable(transfer_sharding_test ${WORKSPACE}/transfer_sharding_test.cpp)
-target_link_libraries(transfer_sharding_test PRIVATE transfer_engine gtest
-                                                     gtest_main pthread)
+add_executable(batch_submit_test ${WORKSPACE}/batch_submit_test.cpp)
+target_link_libraries(batch_submit_test PRIVATE transfer_engine gtest
+                                                gtest_main pthread)
 if(USE_TENT)
-  target_compile_definitions(transfer_sharding_test PRIVATE USE_TENT)
+  target_compile_definitions(batch_submit_test PRIVATE USE_TENT)
 endif()
-add_test(NAME transfer_sharding_test COMMAND transfer_sharding_test)
+add_test(NAME batch_submit_test COMMAND batch_submit_test)
 
 if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
   add_executable(task_congestion_observation_test

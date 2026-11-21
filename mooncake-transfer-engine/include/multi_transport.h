@@ -128,7 +128,7 @@ class MultiTransport {
 
     // Conservative peer routes, without constructing/routing a descriptor
     // batch.
-    bool supportsShardedTransfer(Transport::SegmentID peer);
+    bool supportsParallelBatchSubmit(Transport::SegmentID peer);
 
    private:
     Status freeBatchID(BatchID batch_id,

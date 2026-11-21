@@ -1373,7 +1373,7 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
     return batch_id;
 }
 
-bool TransferEngineImpl::supportsShardedTransfer(SegmentID peer) const {
+bool TransferEngineImpl::supportsParallelBatchSubmit(SegmentID peer) const {
     if (!available_) return false;
     auto local = metadata_->segmentManager().getLocal();
     SegmentDescRef remote;
@@ -1400,7 +1400,7 @@ bool TransferEngineImpl::supportsShardedTransfer(SegmentID peer) const {
         // Cover possible direct submissions without planning requests. Native
         // failover can select another candidate. Internal staging submissions
         // remain on ProxyManager's own threads, as on the ordinary path.
-        if (!transport->supportsShardedTransfer()) return false;
+        if (!transport->supportsParallelBatchSubmit()) return false;
         found = true;
     }
     return found;

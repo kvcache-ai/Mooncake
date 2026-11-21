@@ -262,7 +262,7 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
 namespace mooncake {
 class TransferEngine;
 class TransferEngineImplTestPeer;
-class TransferShardingExecutor;
+class BatchSubmitExecutor;
 namespace tent {
 class TransferEngineImpl;
 class Config;
@@ -347,16 +347,16 @@ class TransferEngine {
 
     using SubBatchRequestBuilder =
         std::function<std::vector<Request>(size_t begin, size_t end)>;
-    struct ShardedTransferFailureInfo {
+    struct ParallelBatchTransferFailureInfo {
         // At least one engine submit API returned an error.
         bool submit_failed = false;
         // Only native FAILED/TIMEOUT errors, without parent expiry/shutdown.
         bool retryable = false;
     };
-    std::optional<Status> tryShardedTransfer(
+    std::optional<Status> tryParallelBatchTransfer(
         SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
         std::chrono::nanoseconds timeout, TransportType hint = UNSPEC,
-        ShardedTransferFailureInfo* failure_info = nullptr);
+        ParallelBatchTransferFailureInfo* failure_info = nullptr);
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list,
@@ -402,7 +402,7 @@ class TransferEngine {
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
-    bool supportsShardedTransfer(SegmentID peer) const;
+    bool supportsParallelBatchSubmit(SegmentID peer) const;
 
     bool isBatchSubmitEligible(size_t count) const;
 
@@ -413,7 +413,7 @@ class TransferEngine {
         BatchID batch_id, const std::vector<Request>& request_list);
 
     std::unique_ptr<TransferEngineImpl> impl_;
-    std::shared_ptr<TransferShardingExecutor> sharding_executor_;
+    std::shared_ptr<BatchSubmitExecutor> batch_submit_executor_;
     friend class ::mooncake::TransferEngine;
     friend class ::mooncake::TransferEngineImplTestPeer;
 };

@@ -55,7 +55,7 @@ inline bool independentTransferDestinations(
 // A bounded, engine-owned executor for independent synchronous sub-batches.
 // All callbacks finish before execute() returns. Native cleanup follows the
 // ordinary batch contract, including deferred cleanup on failure or timeout.
-class TransferShardingExecutor {
+class BatchSubmitExecutor {
    public:
     using Clock = std::chrono::steady_clock;
     struct Result {
@@ -141,13 +141,12 @@ class TransferShardingExecutor {
         }
     };
 
-    TransferShardingExecutor()
-        : TransferShardingExecutor(Config::fromEnvironment()) {}
+    BatchSubmitExecutor() : BatchSubmitExecutor(Config::fromEnvironment()) {}
 
-    explicit TransferShardingExecutor(Config config) : config_(config) {
+    explicit BatchSubmitExecutor(Config config) : config_(config) {
         if (config.threads > 32 || config.min_descriptors == 0 ||
             config.max_parents == 0)
-            throw std::invalid_argument("Invalid transfer sharding config");
+            throw std::invalid_argument("Invalid batch submit config");
         try {
             for (size_t i = 0; i < config_.threads; ++i)
                 threads_.emplace_back([this] { worker(); });
@@ -157,10 +156,9 @@ class TransferShardingExecutor {
         }
     }
 
-    ~TransferShardingExecutor() { shutdown(); }
-    TransferShardingExecutor(const TransferShardingExecutor&) = delete;
-    TransferShardingExecutor& operator=(const TransferShardingExecutor&) =
-        delete;
+    ~BatchSubmitExecutor() { shutdown(); }
+    BatchSubmitExecutor(const BatchSubmitExecutor&) = delete;
+    BatchSubmitExecutor& operator=(const BatchSubmitExecutor&) = delete;
 
     bool eligible(size_t count) const {
         return config_.threads != 0 && count >= config_.min_descriptors;
@@ -183,9 +181,9 @@ class TransferShardingExecutor {
 
     Result execute(size_t count, Clock::time_point deadline, Work work) {
         if (!eligible(count))
-            return Result::Error("Sharding executor not eligible");
+            return Result::Error("Batch submit executor not eligible");
         if (active_executor_ == this)
-            return Result::Error("Recursive transfer sharding would deadlock");
+            return Result::Error("Recursive batch submission would deadlock");
         auto ranges = partition(count, config_.threads);
         auto parent = std::make_shared<ParentBatch>(ranges.size(), deadline,
                                                     std::move(work));
@@ -199,9 +197,9 @@ class TransferShardingExecutor {
             if (!admission_.wait_until(lock, deadline, [&] {
                     return stopping_ || parents_.size() < config_.max_parents;
                 }))
-                return Result::Error("Transfer sharding admission timed out");
+                return Result::Error("Parallel batch admission timed out");
             if (stopping_)
-                return Result::Error("Transfer sharding is shutting down");
+                return Result::Error("Batch submit executor is shutting down");
             parents_.push_back(parent);
             jobs_.splice(jobs_.end(), pending);
         }
@@ -245,9 +243,10 @@ class TransferShardingExecutor {
                      Clock::now() < deadline;
         if (outcome.ok()) {
             if (expired)
-                outcome = Result::Error("Transfer sharding timed out");
+                outcome = Result::Error("Parallel batch transfer timed out");
             else if (shutdown)
-                outcome = Result::Error("Transfer sharding is shutting down");
+                outcome =
+                    Result::Error("Batch submit executor is shutting down");
             else
                 for (const auto& result : parent->sub_batch_results)
                     if (!result.ok()) {
@@ -354,7 +353,7 @@ class TransferShardingExecutor {
                     result = Result::Error(error.what());
                 } catch (...) {
                     result =
-                        Result::Error("Unknown transfer sharding exception");
+                        Result::Error("Unknown batch submission exception");
                 }
             }
             finishJob(job, std::move(result));
@@ -362,8 +361,7 @@ class TransferShardingExecutor {
         active_executor_ = nullptr;
     }
 
-    inline static thread_local TransferShardingExecutor* active_executor_ =
-        nullptr;
+    inline static thread_local BatchSubmitExecutor* active_executor_ = nullptr;
     const Config config_;
     std::mutex mutex_;
     std::condition_variable ready_, admission_, idle_;
@@ -384,10 +382,9 @@ struct SubBatchProgress {
 // until every callback ends. Errors/timeouts use ordinary native free, which
 // may defer cleanup and does not promise that payload access has stopped.
 template <class Adapter>
-TransferShardingExecutor::Result runSubBatch(
-    Adapter& adapter,
-    const TransferShardingExecutor::Cancellation& cancellation) {
-    using Executor = TransferShardingExecutor;
+BatchSubmitExecutor::Result runSubBatch(
+    Adapter& adapter, const BatchSubmitExecutor::Cancellation& cancellation) {
+    using Executor = BatchSubmitExecutor;
     Executor::Result result;
     bool allocated = false;
     try {

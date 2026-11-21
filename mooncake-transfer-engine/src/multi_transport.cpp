@@ -569,7 +569,7 @@ bool MultiTransport::metricsEnabled() { return false; }
 
 #endif  // WITH_METRICS
 
-bool MultiTransport::supportsShardedTransfer(Transport::SegmentID peer) {
+bool MultiTransport::supportsParallelBatchSubmit(Transport::SegmentID peer) {
     auto segment = metadata_->getSegmentDescByID(peer);
     if (!segment) return false;
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -582,7 +582,7 @@ bool MultiTransport::supportsShardedTransfer(Transport::SegmentID peer) {
         while (std::getline(protocols, protocol, ',')) {
             auto it = transport_map_.find(protocol);
             if (it == transport_map_.end() || !it->second ||
-                !it->second->supportsShardedTransfer())
+                !it->second->supportsParallelBatchSubmit())
                 return false;
             found = true;
         }
@@ -595,7 +595,7 @@ bool MultiTransport::supportsShardedTransfer(Transport::SegmentID peer) {
     route.target_id = peer;
     Transport* transport = nullptr;
     return selectTransport(route, transport).ok() && transport &&
-           transport->supportsShardedTransfer();
+           transport->supportsParallelBatchSubmit();
 }
 
 Status MultiTransport::submitTransfer(
