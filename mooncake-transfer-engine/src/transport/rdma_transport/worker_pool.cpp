@@ -2093,10 +2093,39 @@ void WorkerPool::processContextEventForTest(ibv_event_type event_type) {
 bool WorkerPool::handleContextEvent(ibv_event_type event_type,
                                     bool injected_for_test,
                                     struct ibv_async_event *event) {
+    if (event &&
+        (event_type == IBV_EVENT_PORT_ERR ||
+         event_type == IBV_EVENT_PORT_ACTIVE) &&
+        event->element.port_num != context_.portNum())
+        return false;
+
     if (event_type == IBV_EVENT_DEVICE_FATAL ||
         event_type == IBV_EVENT_CQ_ERR || event_type == IBV_EVENT_WQ_FATAL ||
         event_type == IBV_EVENT_PORT_ERR ||
         event_type == IBV_EVENT_LID_CHANGE) {
+        if (event_type == IBV_EVENT_PORT_ERR) {
+            const auto previous_deadline =
+                recovery_activate_after_ns_.load(std::memory_order_relaxed);
+            const int cause =
+                context_disabling_event_.load(std::memory_order_relaxed);
+            // Repeated DOWN reports describe one outage. A port event also
+            // cannot turn a device/CQ failure into a recoverable port outage.
+            if (cause != -1 &&
+                (cause != IBV_EVENT_PORT_ERR || previous_deadline == 0)) {
+                recovery_activate_after_ns_.store(0, std::memory_order_relaxed);
+                return false;
+            }
+            const uint64_t now = getCurrentTimeInNano();
+            const bool isolated =
+                !last_port_down_ns_ ||
+                (now >= last_port_down_ns_ &&
+                 now - last_port_down_ns_ >= kPortFlapWindowNs);
+            fast_recovery_until_ns_ =
+                context_.active() && isolated ? now + kShortPortOutageNs : 0;
+            last_port_down_ns_ = now;
+        } else {
+            fast_recovery_until_ns_ = 0;
+        }
         recovery_activate_after_ns_.store(0, std::memory_order_relaxed);
         // The async event now owns this context's inactive state. Clear the
         // local-WC breaker deadline so its TTL cannot resurrect a context that
@@ -2147,13 +2176,32 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
         // PORT_ACTIVE only means the link started coming back. Real mlx5/RoCE
         // data path can still reject RTR for a while after link-up, so delay
         // publishing an inactive local RNIC back to metadata.
-        scheduleContextRecovery();
+        if (context_disabling_event_.load(std::memory_order_relaxed) !=
+            IBV_EVENT_PORT_ERR) {
+            scheduleContextRecovery();
+        } else if (recovery_activate_after_ns_.load(
+                       std::memory_order_relaxed) == 0) {
+            ibv_port_state state;
+            if (context_.queryPortState(&state) == 0 &&
+                state == IBV_PORT_ACTIVE) {
+                scheduleContextRecovery(
+                    portRecoveryDelayNs(getCurrentTimeInNano()));
+            } else {
+                fast_recovery_until_ns_ = 0;
+            }
+        }
         if (event != nullptr) ibv_ack_async_event(event);
     } else {
         return false;
     }
 
     return true;
+}
+
+uint64_t WorkerPool::portRecoveryDelayNs(uint64_t now_ns) const {
+    return now_ns >= last_port_down_ns_ && now_ns <= fast_recovery_until_ns_
+               ? 0
+               : kContextRecoveryDelayNs;
 }
 
 void WorkerPool::scheduleContextRecovery(uint64_t delay_ns,
@@ -2184,6 +2232,18 @@ void WorkerPool::maybeActivateRecoveredContext() {
     if (activate_after == 0 ||
         static_cast<uint64_t>(getCurrentTimeInNano()) < activate_after)
         return;
+
+    if (context_disabling_event_.load(std::memory_order_relaxed) ==
+        IBV_EVENT_PORT_ERR) {
+        ibv_port_state state;
+        if (context_.queryPortState(&state) != 0 || state != IBV_PORT_ACTIVE) {
+            // Start a fresh stability window when the port is observed up
+            // again.
+            fast_recovery_until_ns_ = 0;
+            recovery_activate_after_ns_.store(0, std::memory_order_relaxed);
+            return;
+        }
+    }
 
     // Recovery probes and async events run on the same monitor thread.
     // Keep the deadline armed throughout GID I/O: event recovery still owns
@@ -2241,7 +2301,7 @@ void WorkerPool::resumePausedContext() {
     LOG(WARNING) << "Worker: Context " << context_.deviceName()
                  << " port reports ACTIVE without an IBV_EVENT_PORT_ACTIVE "
                     "event";
-    scheduleContextRecovery(kContextRecoveryDelayNs,
+    scheduleContextRecovery(portRecoveryDelayNs(getCurrentTimeInNano()),
                             /*override_breaker=*/false);
 }
 
@@ -2324,7 +2384,16 @@ void WorkerPool::monitorWorker() {
     bindToSocket(numa_socket_id_);
     auto last_reset_ts = getCurrentTimeInNano();
     CqTimeoutDiagnostic cq_timeout_diagnostic;
+    bool injected_port_down = false;
     while (workers_running_) {
+        const int injected =
+            injected_context_event_.exchange(-1, std::memory_order_relaxed);
+        if (injected != -1) {
+            const auto event_type = static_cast<ibv_event_type>(injected);
+            if (event_type == IBV_EVENT_PORT_ERR) injected_port_down = true;
+            if (event_type == IBV_EVENT_PORT_ACTIVE) injected_port_down = false;
+            processContextEventForTest(event_type);
+        }
         const uint64_t current_ts =
             static_cast<uint64_t>(getCurrentTimeInNano());
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
@@ -2345,7 +2414,8 @@ void WorkerPool::monitorWorker() {
             active_endpoint_connect_pause.prune();
             // Safety net for a recovery event that never reached us. See
             // issue #4694; TENT's equivalent is Workers::resumePausedContexts.
-            resumePausedContext();
+            // During a simulated outage the physical port can still be up.
+            if (!injected_port_down) resumePausedContext();
             last_reset_ts = current_ts;
         }
 

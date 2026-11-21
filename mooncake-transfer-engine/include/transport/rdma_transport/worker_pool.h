@@ -172,10 +172,11 @@ class WorkerPool {
                             struct ibv_async_event *event = nullptr);
     void scheduleContextRecovery(uint64_t delay_ns = kContextRecoveryDelayNs,
                                  bool override_breaker = true);
+    uint64_t portRecoveryDelayNs(uint64_t now_ns) const;
     void maybeActivateRecoveredContext();
     // Safety net for a PORT_ERR whose PORT_ACTIVE never arrived. At most the
     // 1 Hz monitor tick calls this, and only when context_disabling_event_
-    // is IBV_EVENT_PORT_ERR. On IBV_PORT_ACTIVE it arms the same delayed GID
+    // is IBV_EVENT_PORT_ERR. On IBV_PORT_ACTIVE it arms the same GID
     // probe as the event path. DEVICE_FATAL, CQ_ERR, WQ_FATAL and LID_CHANGE
     // stay inactive: the probe does not rebuild a failed CQ or device.
     // Breaker-owned pauses are left alone so TTL reactivation still owns
@@ -254,6 +255,11 @@ class WorkerPool {
         pending_redispatch_;
 
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
+    // Events injected by integration tests are consumed by the monitor thread.
+    std::atomic<int> injected_context_event_{-1};
+    uint64_t last_port_down_ns_{0};
+    // Nonzero only for a short outage eligible for immediate recovery.
+    uint64_t fast_recovery_until_ns_{0};
     std::atomic<uint64_t> recovery_activate_after_ns_{0};
     // Fatal async event that owns the inactive context, or -1 when none does.
     // The 1 Hz port poll resumes only IBV_EVENT_PORT_ERR.
@@ -273,6 +279,8 @@ class WorkerPool {
     // restarted. Without it a long-lived process accumulates isolated failures
     // until an otherwise healthy rail is paused.
     const static uint64_t kRailErrorWindowNs = 5000000000ull;  // 5 seconds
+    static constexpr uint64_t kShortPortOutageNs = 5000000000ull;
+    static constexpr uint64_t kPortFlapWindowNs = 30000000000ull;
     const static uint64_t kContextRecoveryDelayNs =
         30000000000ull;  // 30 seconds before a recovered local RNIC is reused
 
