@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <cstdint>
 #include <compare>
 #include <map>
@@ -16,6 +17,7 @@
 
 #include "conductor/common/types.h"
 #include "conductor/prefixindex/prefix_indexer.h"
+#include "conductor/prefixindex/cache_layout.h"
 #include "conductor/zmq/event_type.h"
 #include "conductor/zmq/zmq_client.h"
 
@@ -44,7 +46,8 @@ class ConductorService;
 // KVEventHandler adapts the generic EventHandler interface for EventManager.
 class KVEventHandler : public zmq::EventHandler {
    public:
-    KVEventHandler(EventManager* manager, common::ServiceConfig svc);
+    KVEventHandler(EventManager* manager, common::ServiceConfig svc,
+                   prefixindex::SourceLayout layout = {});
 
     std::string HandleBatch(const zmq::DecodedBatch& batch,
                             const zmq::MessageMetadata& metadata) override;
@@ -64,6 +67,10 @@ class KVEventHandler : public zmq::EventHandler {
 
     // Called only after the subscriber has stopped and joined.
     std::string InvalidateEndpoint();
+    // Wake a Store subscription whose initial events preceded the declaration.
+    void RefreshDeployment();
+    // 把同一 ContextKey 已激活的部署挂到本实例（登记 reader、继承可读存储域）。
+    bool AttachDeployment(const prefixindex::SourceLayout& binding);
 
    private:
     friend class KVEventHandlerTestPeer;
@@ -122,8 +129,21 @@ class KVEventHandler : public zmq::EventHandler {
         const std::optional<std::string>& backend_id,
         const std::optional<std::string>& tenant_id);
 
+    std::string HandleGroupedVllmStored(const zmq::VllmStoredEvent& event);
+    std::string HandleGroupedVllmRemoved(const zmq::VllmRemovedEvent& event);
+    std::string HandleGroupedSglangStored(const zmq::SglangStoredEvent& event);
+    std::string HandleGroupedSglangRemoved(
+        const zmq::SglangRemovedEvent& event);
+    std::string HandleGroupedMooncakeStored(
+        const zmq::MooncakeStoredEvent& event);
+    std::string HandleGroupedMooncakeRemoved(
+        const zmq::MooncakeRemovedEvent& event);
+
     bool BeginDispatch();
     void EndDispatch();
+    std::string QueuePending(const zmq::DecodedBatch& batch,
+                             const zmq::MessageMetadata& metadata);
+    void DrainPending();
 
     class DispatchLease {
        public:
@@ -138,6 +158,18 @@ class KVEventHandler : public zmq::EventHandler {
 
     EventManager* manager_;
     common::ServiceConfig service_;
+    prefixindex::SourceLayout layout_;
+    // layout 由事件中的 kv_cache_layout 声明决定，不能固定在构造期；
+    // 因此统一用本函数实时判断是否走分组（多 cache group）路径。
+    bool grouped_context() const { return layout_.layout != nullptr; }
+    // 同一 ContextKey 下任意实例宣告的部署都应能被其他实例复用：
+    // 本实例没有 layout 时，从索引取已激活的部署并登记自己的 reader。
+    bool EnsureDeployment();
+    std::mutex grouped_dispatch_mu_;
+    std::string deployment_declaration_;
+    std::deque<std::pair<zmq::DecodedBatch, zmq::MessageMetadata>> pending_;
+    size_t pending_event_count_ = 0;
+    size_t pending_bytes_ = 0;
     std::mutex lifecycle_mu_;
     std::condition_variable lifecycle_cv_;
     bool available_ = true;
@@ -188,6 +220,10 @@ class EventManager {
     // True once Stop() has begun; checked by KVEventHandler::HandleBatch
     // under mu_ (read).
     bool IsStopped();
+    void RefreshMooncakeDeployments(const prefixindex::ContextKey& context);
+    // 把某个 ContextKey 上已激活的部署传播给该 ContextKey 下的所有订阅实例。
+    void PropagateDeployment(const prefixindex::ContextKey& context,
+                             const prefixindex::SourceLayout& binding);
 
    private:
     friend class KVEventHandler;
