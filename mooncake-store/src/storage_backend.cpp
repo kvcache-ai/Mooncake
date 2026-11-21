@@ -19,6 +19,7 @@
 #include <optional>
 #include <regex>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 #include <algorithm>
@@ -28,6 +29,7 @@
 #include <ylt/struct_pb.hpp>
 
 #include "mutex.h"
+#include "thread_pool.h"
 #include "nvme_kv/backend.h"
 #include "common/timestamp.h"
 #include "common/file_util.h"
@@ -1622,6 +1624,14 @@ BucketStorageBackend::BucketStorageBackend(
     // pointing at the wrong roots.
     disk_paths_ =
         ResolveOffloadDiskPaths(file_storage_config_.storage_filepath);
+    if (file_storage_config_.offload_write_workers < 1 ||
+        file_storage_config_.offload_write_workers > 16) {
+        throw std::invalid_argument("Invalid bucket offload worker count");
+    }
+    if (file_storage_config_.offload_write_workers > 1) {
+        offload_write_pool_ = std::make_unique<ThreadPool>(
+            file_storage_config_.offload_write_workers);
+    }
     const auto& per_disk = bucket_backend_config_.max_total_size_per_disk;
     disks_.resize(disk_paths_.size());
     // Init() rejects a per-disk list of the wrong length; guard the indexing
@@ -1634,10 +1644,65 @@ BucketStorageBackend::BucketStorageBackend(
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
+    StopOffloadWorkers();
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
     ClearFileCache();
     ReleaseDiskOwnerLocks();
+}
+
+void BucketStorageBackend::ExecuteOffloadBatches(
+    size_t count, const std::function<bool(size_t)>& process) {
+    if (!offload_write_pool_) {
+        for (size_t i = 0; i < count; ++i)
+            if (!process(i)) break;
+        return;
+    }
+    std::atomic<size_t> next{0};
+    std::atomic<bool> abort{false};
+    std::vector<std::future<void>> jobs;
+    jobs.reserve(
+        std::min<size_t>(count, file_storage_config_.offload_write_workers));
+    std::exception_ptr error;
+    try {
+        for (size_t w = 0;
+             w < std::min<size_t>(count,
+                                  file_storage_config_.offload_write_workers);
+             ++w) {
+            auto job = std::make_shared<std::packaged_task<void()>>([&] {
+                try {
+                    while (!abort.load()) {
+                        const size_t index = next.fetch_add(1);
+                        if (index >= count || abort.load()) break;
+                        if (!process(index)) abort.store(true);
+                    }
+                } catch (...) {
+                    abort.store(true);
+                    throw;  // packaged_task captures it; the pool thread
+                            // survives.
+                }
+            });
+            auto future = job->get_future();
+            offload_write_pool_->enqueue([job] { (*job)(); });
+            jobs.push_back(std::move(future));
+        }
+    } catch (...) {
+        abort.store(true);
+        error = std::current_exception();
+    }
+    // Never unwind captured state while a worker still uses it.
+    for (auto& job : jobs) {
+        try {
+            job.get();
+        } catch (...) {
+            if (!error) error = std::current_exception();
+        }
+    }
+    if (error) std::rethrow_exception(error);
+}
+
+void BucketStorageBackend::StopOffloadWorkers() {
+    if (offload_write_pool_) offload_write_pool_->stop();
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::AcquireDiskOwnerLocks() {
@@ -3601,6 +3666,25 @@ BucketStorageBackend::PrepareEviction(
             result.write_keys.push_back(key);
         }
         if (!result.write_keys.empty()) {
+            if (bucket_backend_config_.eviction_policy ==
+                BucketEvictionPolicy::NONE) {
+                int64_t reserved_size = 0;
+                for (const auto& entry : disks_) {
+                    reserved_size +=
+                        entry.total_size + entry.pending_write_size;
+                }
+                // IsEnableOffloading() is only an advisory snapshot. Reserve
+                // against committed data and every concurrent writer here.
+                if (object_bucket_map_.size() + pending_write_keys_.size() +
+                            result.write_keys.size() >
+                        static_cast<size_t>(
+                            file_storage_config_.total_keys_limit) ||
+                    reserved_size + required_size >
+                        file_storage_config_.total_size_limit) {
+                    // Reservations may be released by another writer.
+                    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_DISK);
+                }
+            }
             result.write_size = required_size;
             disk.pending_write_size += required_size;
             pending_write_keys_.insert(result.write_keys.begin(),
@@ -3633,9 +3717,9 @@ BucketStorageBackend::PrepareEviction(
             // Watermark eviction passes a synthetic required_size to drive
             // quota-based cleanup. It is not a real incoming write, so it
             // should not be counted as physical disk free-space demand.
-            uint64_t req_sz = (!result.write_keys.empty() && required_size > 0)
-                                  ? static_cast<uint64_t>(required_size)
-                                  : 0;
+            // Files of other reserved writes may not be visible to fs::space
+            // yet. Counting a partially written file twice is conservative.
+            uint64_t req_sz = static_cast<uint64_t>(disk.pending_write_size);
             initial_disk_full = actual_available < req_sz + kMinFreeSpace;
             if (initial_disk_full) {
                 deficit = req_sz + kMinFreeSpace - actual_available;
@@ -3655,12 +3739,8 @@ BucketStorageBackend::PrepareEviction(
     uint64_t accumulated_freed_space = 0;
     const int64_t synthetic_required_size =
         write_keys.empty() ? required_size : 0;
-    // On-disk footprint of the incoming write (~required_size); 0 for
-    // watermark-driven eviction, which has no incoming write. Added to the
-    // physical check below so we free enough room for THIS write, not merely
-    // enough to bring current usage back under the cap.
-    const int64_t incoming_physical_size =
-        write_keys.empty() ? 0 : required_size;
+    // Include every reserved write on this disk, not only this caller.
+    const int64_t incoming_physical_size = disk.pending_write_size;
 
     // Ground-truth physical usage of the offload directory (cached),
     // snapshotted once. As buckets are selected for eviction their files get
@@ -3754,13 +3834,13 @@ BucketStorageBackend::PrepareEviction(
                                     synthetic_required_size >
                                 quota_limit;
     // Physical cap still exceeded after evicting up to kMaxEvictionBuckets:
-    // reject the write (FILE_WRITE_FAIL, handled as an offload miss upstream)
+    // reject admission without reporting an I/O failure
     // rather than overrun the disk quota and get OOM-evicted.
     const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
     disk.pending_eviction_size += result.evicted_size;
     if (!result.write_keys.empty() && (quota_exceeded || phys_exceeded)) {
         RestorePreparedEvictionLocked(std::move(result));
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_DISK);
     }
 
     if (!result.buckets.empty()) {
