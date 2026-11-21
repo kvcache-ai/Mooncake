@@ -9,8 +9,7 @@
 #include <thread>
 
 #include "ha/leadership/leader_coordinator.h"
-
-struct redisContext;
+#include "ha/common/redis/redis_cluster_client.h"
 
 namespace mooncake {
 namespace ha {
@@ -19,6 +18,15 @@ namespace redis {
 
 class RedisLeaderCoordinator final : public LeaderCoordinator {
    public:
+    enum class OwnershipReconciliation {
+        NotNeeded,
+        MatchingUnconfirmed,
+        Lost,
+        Unknown,
+    };
+    OwnershipReconciliation LastOwnershipReconciliation() const {
+        return reconciliation_.load();
+    }
     explicit RedisLeaderCoordinator(const HABackendSpec& spec);
     ~RedisLeaderCoordinator() override;
 
@@ -54,6 +62,8 @@ class RedisLeaderCoordinator final : public LeaderCoordinator {
     static LeadershipLossReason ClassifyLeadershipLossReason(ErrorCode err);
 
     ErrorCode ConnectLocked();
+    common::redis::RedisReplyPtr ExecuteLocked(
+        const std::vector<std::string>& command, bool write);
     void DisconnectLocked();
     ErrorCode RenewLeadershipOnceLocked(const LeadershipSession& session,
                                         bool& renewed);
@@ -68,12 +78,14 @@ class RedisLeaderCoordinator final : public LeaderCoordinator {
                            std::optional<ViewVersionId> known_version) const;
 
     HABackendSpec spec_;
+    std::atomic<OwnershipReconciliation> reconciliation_{
+        OwnershipReconciliation::NotNeeded};
     std::string master_view_key_;
     std::string view_version_key_;
 
     std::mutex state_mutex_;
     std::condition_variable renew_cv_;
-    redisContext* context_ = nullptr;
+    std::unique_ptr<common::redis::RedisClusterClient> client_;
     bool connected_ = false;
 
     std::thread renew_thread_;

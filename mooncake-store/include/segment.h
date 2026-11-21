@@ -168,6 +168,15 @@ class ScopedSegmentAccess {
                             size_t& capacity);
 
     /**
+     * @brief Check whether the named segment still has allocated memory,
+     * including when it no longer accepts new allocations.
+     * @param segment_name Name of the mounted segment to check.
+     * @return True if the segment has allocated memory. False if the segment
+     * is missing or has no allocated memory.
+     */
+    bool HasAllocatedMemory(const std::string& segment_name) const;
+
+    /**
      * @brief Get all segments that are not ready (not in OK status)
      * @param[out] unready_segments Vector to store the unready segments
      * pair<segment, client_id>

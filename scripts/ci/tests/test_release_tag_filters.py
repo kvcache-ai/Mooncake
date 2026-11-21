@@ -17,7 +17,6 @@ STABLE_RELEASE_WORKFLOWS = (
     "release-memfabric.yaml",
     "release-musa.yaml",
     "release-non-cuda.yaml",
-    "release-npu.yaml",
     "release-rocm.yaml",
 )
 
@@ -84,7 +83,6 @@ VERSION_CHECK_SOURCES = {
     "release-non-cuda.yaml": "_build-wheel.yaml",
     "release-memfabric.yaml": "release-memfabric.yaml",
     "release-musa.yaml": "release-musa.yaml",
-    "release-npu.yaml": "release-npu.yaml",
     "release-rocm.yaml": "release-rocm.yaml",
 }
 VERSION_CHECK_STEP = "Check tag matches wheel version"
@@ -133,6 +131,15 @@ class ReleaseTagFilterTest(unittest.TestCase):
             for tag in NON_RELEASE_TAGS:
                 with self.subTest(workflow=name, tag=tag):
                     self.assertFalse(matches(patterns, tag))
+
+    def test_npu_release_workflow_skips_non_release_tags(self):
+        # release-npu.yaml ships vX.Y.Z and its own npu-vX.Y.Z[.postN] hotfix
+        # tags; test_release_npu.py covers those and its version check.
+        patterns = tag_patterns("release-npu.yaml")
+        self.assertTrue(matches(patterns, "v0.3.14"))
+        for tag in NON_RELEASE_TAGS + tuple("npu-" + t for t in NON_RELEASE_TAGS):
+            with self.subTest(tag=tag):
+                self.assertFalse(matches(patterns, tag))
 
     def test_pre_release_workflow_triggers_on_prerelease_tags(self):
         patterns = tag_patterns("pre-release.yaml")

@@ -574,6 +574,13 @@ TEST(TransportSelectorTest, TransportCapabilityGpuToGpu) {
     auto result = selector.select(ctx, transports);
     EXPECT_EQ(result.transport, RDMA)
         << "RDMA should be available for CUDA-to-CUDA";
+
+    ctx.rdma_device_direct = false;
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC);
+
+    rdma->setDramToDram(true);
+    ctx.host_staging = true;
+    EXPECT_EQ(selector.select(ctx, transports).transport, RDMA);
 }
 
 TEST(TransportSelectorTest, TransportCapabilityDramToGpu) {
@@ -813,6 +820,42 @@ TEST(TransportSelectorTest, XpuIpcKeepsNetworkFallbackStaged) {
     EXPECT_EQ(selector.select(ctx, transports, 1).transport, UNSPEC);
 }
 
+TEST(TransportSelectorTest, MluIpcKeepsNetworkFallbackStaged) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[MLU] = std::make_shared<FakeTransport>(MLU);
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    static_cast<FakeTransport*>(transports[MLU].get())->setGpuToGpu(true);
+    static_cast<FakeTransport*>(transports[TCP].get())->setDramToDram(true);
+    std::vector<TransportType> candidates{MLU, TCP};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = true;
+    ctx.local_segment = false;
+    ctx.mlu_ipc = true;
+    ctx.host_staging = true;
+    ctx.local_memory_type = MTYPE_MLU;
+    ctx.remote_memory_type = MTYPE_MLU;
+    ctx.buffer_transports = &candidates;
+    EXPECT_EQ(selector.select(ctx, transports, 0).transport, MLU);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, TCP);
+
+    ctx.mlu_ipc = false;
+    EXPECT_EQ(selector.select(ctx, transports, 0).transport, TCP);
+    ctx.mlu_ipc = true;
+    ctx.same_machine = false;
+    EXPECT_EQ(selector.select(ctx, transports, 0).transport, TCP);
+
+    ctx.same_machine = true;
+    ctx.host_staging = false;
+    ctx.mlu_ipc_only = true;
+    EXPECT_EQ(selector.select(ctx, transports, 0).transport, MLU);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, UNSPEC);
+}
+
 // Regression: a SelectionPolicy memory pattern of "xpu" must match XPU VRAM
 // (MTYPE_XPU). matchesMemoryPattern maps MTYPE_XPU -> "xpu"; without that arm
 // XPU fell through to "unknown" and no xpu-scoped policy could ever match.
@@ -998,6 +1041,35 @@ TEST(TransportSelectorTest, MluStagingUsesHostCapsWithoutBypassingPolicy) {
     ctx.local_memory_type = MTYPE_CPU;
     EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC)
         << "staging must not bypass the original memory policy";
+}
+
+TEST(TransportSelectorTest, LocalMluStagingRequiresBothCopyDirections) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    auto mlu = std::make_shared<FakeTransport>(MLU);
+    auto tcp = std::make_shared<FakeTransport>(TCP);
+    transports[MLU] = mlu;
+    transports[TCP] = tcp;
+    tcp->setGpuToGpu(true);
+    tcp->setDramToDram(true);
+    mlu->setGpuToDram(true);
+    std::vector<TransportType> candidates{TCP, MLU};
+    SelectionContext ctx{};
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = ctx.local_segment = true;
+    ctx.local_memory_type = ctx.remote_memory_type = MTYPE_MLU;
+    ctx.buffer_transports = &candidates;
+    ctx.local_mlu_staging = true;
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC);
+    mlu->setDramToGpu(true);
+    EXPECT_EQ(selector.select(ctx, transports).transport, MLU);
+    EXPECT_EQ(selector.select(ctx, transports, 0, MLU).transport, MLU);
+    EXPECT_EQ(selector.select(ctx, transports, 0, TCP).transport, UNSPEC);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, UNSPEC);
+    ctx.local_segment = false;
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC);
 }
 
 TEST(TransportSelectorTest, FileSegmentDramToFile) {

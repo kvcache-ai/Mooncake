@@ -173,7 +173,8 @@ pub trait MetadataBackend: Send + Sync {
 
     fn list_object_routes(&self) -> Result<Vec<ObjectRoute>>;
 
-    /// Lists object routes with cold backing attributes.
+    /// Lists matching cold-backed routes in object-key order, after the exclusive
+    /// continuation key and before applying the result limit.
     ///
     /// # Performance
     /// The default implementation filters the full route set in memory and is
@@ -184,7 +185,16 @@ pub trait MetadataBackend: Send + Sync {
         filter: &ColdBackingRouteFilter,
     ) -> Result<Vec<ObjectRoute>> {
         let mut routes = Vec::new();
-        for route in self.list_object_routes()? {
+        let mut listed = self.list_object_routes()?;
+        listed.sort_by(|left, right| left.key.cmp(&right.key));
+        for route in listed {
+            if filter
+                .after_key
+                .as_ref()
+                .is_some_and(|key| route.key <= *key)
+            {
+                continue;
+            }
             let Some(backing) = route.cold_backing.as_ref() else {
                 continue;
             };
@@ -435,6 +445,12 @@ pub trait MetadataBackend: Send + Sync {
     fn get_handoff(&self, stable_id: &ClientStableId) -> Result<Option<HandoffPlan>>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteOwnerScanStatus {
+    Complete,
+    Incomplete,
+}
+
 pub trait RouteDirectory: Send + Sync {
     fn get_object_route(
         &self,
@@ -613,6 +629,21 @@ pub trait RouteDirectory: Send + Sync {
             visitor(route)?;
         }
         Ok(())
+    }
+
+    /// Visits owner routes and reports whether every authority was scanned.
+    ///
+    /// Implementations that can query mirrored authorities should return
+    /// [`RouteOwnerScanStatus::Incomplete`] when any authority failed while
+    /// still delivering routes from the authorities that responded.
+    fn visit_routes_by_replica_owner_with_status(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+        visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
+    ) -> Result<RouteOwnerScanStatus> {
+        self.visit_routes_by_replica_owner(observer, owner, visitor)?;
+        Ok(RouteOwnerScanStatus::Complete)
     }
 
     fn list_routes_by_cold_backing(

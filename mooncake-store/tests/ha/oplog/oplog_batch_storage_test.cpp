@@ -9,6 +9,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -19,6 +20,7 @@
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
+#include "ha_metric_manager.h"
 
 namespace mooncake::test {
 namespace {
@@ -191,6 +193,20 @@ OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
     }
     return batch;
 }
+
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+uint64_t HistogramCount(const std::string& name) {
+    std::istringstream lines(HAMetricManager::instance().serialize_metrics());
+    std::string line;
+    const auto prefix = name + "_count ";
+    while (std::getline(lines, line)) {
+        if (line.rfind(prefix, 0) == 0) {
+            return std::stoull(line.substr(prefix.size()));
+        }
+    }
+    return 0;
+}
+#endif
 
 }  // namespace
 
@@ -572,6 +588,47 @@ TEST(OpLogBatchStorageTest, WriteBatchAndAdvancePrefixCommitsAtomically) {
     EXPECT_EQ(2u, prefix.batch_id);
     EXPECT_EQ(5u, prefix.last_seq);
 }
+
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+TEST(OpLogBatchStorageTest, CollectsPhaseLatenciesAcrossReadsAndTxnAttempts) {
+    FakeHaKvBackend backend;
+    const DurablePrefix old_prefix{.batch_id = 1, .last_seq = 3};
+    // A different JSON representation forces a compare retry on the first
+    // write, even though the durable cursor has not changed.
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          " " + EncodeDurablePrefix(old_prefix)));
+    OpLogBatchStorage storage("clusterA", backend);
+    const std::string encode = "ha_batch_record_encode_latency_us";
+    const std::string decode = "ha_batch_record_decode_latency_us";
+    const std::string txn = "ha_batch_record_backend_txn_latency_us";
+    const auto encode_before = HistogramCount(encode);
+    const auto decode_before = HistogramCount(decode);
+    const auto txn_before = HistogramCount(txn);
+
+    ASSERT_EQ(ErrorCode::OK, storage.WriteBatchAndAdvancePrefix(
+                                 MakeBatch(2, 4, 2), old_prefix));
+    EXPECT_EQ(encode_before + 1, HistogramCount(encode));
+    EXPECT_EQ(decode_before, HistogramCount(decode));
+    EXPECT_EQ(txn_before + 2, HistogramCount(txn));
+
+    OpLogBatchRecord batch;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadBatch(2, batch));
+    EXPECT_EQ(decode_before + 1, HistogramCount(decode));
+    std::vector<OpLogBatchRecord> batches;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadBatchesAfter(1, 10, batches));
+    ASSERT_EQ(1u, batches.size());
+    EXPECT_EQ(decode_before + 2, HistogramCount(decode));
+
+    backend.FailNextTxn(ErrorCode::ETCD_OPERATION_ERROR);
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              storage.WriteBatchAndAdvancePrefix(
+                  MakeBatch(3, 6, 1), {.batch_id = 2, .last_seq = 5}));
+    EXPECT_EQ(encode_before + 2, HistogramCount(encode));
+    EXPECT_EQ(txn_before + 3, HistogramCount(txn));
+    EXPECT_EQ(decode_before + 2, HistogramCount(decode));
+}
+#endif
 
 TEST(OpLogBatchStorageTest, FencedAdvanceDoesNotModifyProducerView) {
     FakeHaKvBackend backend;
@@ -966,7 +1023,7 @@ TEST(OpLogBatchStorageBackendErrorTest, TxnErrorDoesNotAdvanceDurablePrefix) {
 TEST(OpLogBatchStorageDeleteTest, InclusiveBoundariesAndProtectedKeys) {
     FakeHaKvBackend backend;
     OpLogBatchStorage storage("clusterA", backend);
-    const std::vector<uint64_t> ids{0, 1, 2, 9, 10, UINT64_MAX - 1, UINT64_MAX};
+    const std::vector<uint64_t> ids{1, 2, 9, 10, UINT64_MAX - 1, UINT64_MAX};
     const std::vector<std::string> protected_keys{
         BuildDurablePrefixKey("clusterA"),
         BuildProducerViewKey("clusterA"),
@@ -984,8 +1041,8 @@ TEST(OpLogBatchStorageDeleteTest, InclusiveBoundariesAndProtectedKeys) {
                   backend.Put(BuildBatchRecordKey("clusterA", id), "record"));
     }
     for (auto cutoff : ids) {
-        ASSERT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(cutoff));
-        ASSERT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(cutoff));
+        ASSERT_EQ(ErrorCode::OK, storage.DeleteBatchesInRange(1, cutoff));
+        ASSERT_EQ(ErrorCode::OK, storage.DeleteBatchesInRange(1, cutoff));
         std::string value;
         for (auto id : ids) {
             EXPECT_EQ(
@@ -1002,12 +1059,13 @@ TEST(OpLogBatchStorageDeleteTest, InclusiveBoundariesAndProtectedKeys) {
 TEST(OpLogBatchStorageDeleteTest, EmptyNamespaceAndInvalidCluster) {
     FakeHaKvBackend backend;
     OpLogBatchStorage storage("clusterA", backend);
-    EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(0));
-    EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(UINT64_MAX));
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, storage.DeleteBatchesInRange(1, 0));
+    EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesInRange(1, UINT64_MAX));
     backend.delete_ranges.clear();
     for (const auto* cluster : {"", "/", "a/b"}) {
         OpLogBatchStorage invalid(cluster, backend);
-        EXPECT_EQ(ErrorCode::INVALID_PARAMS, invalid.DeleteBatchesThrough(1));
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+                  invalid.DeleteBatchesInRange(1, 1));
     }
     EXPECT_TRUE(backend.delete_ranges.empty());
 }
@@ -1024,7 +1082,7 @@ TEST(OpLogBatchStorageDeleteTest, AppendInterleavedBeforeDeleteSurvives) {
                   storage.WriteBatchAndAdvancePrefix(
                       MakeBatch(2, 2, 1), {.batch_id = 1, .last_seq = 1}));
     };
-    ASSERT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(1));
+    ASSERT_EQ(ErrorCode::OK, storage.DeleteBatchesInRange(1, 1));
     OpLogBatchRecord record;
     EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(1, record));
     EXPECT_EQ(ErrorCode::OK, storage.ReadBatch(2, record));
@@ -1045,10 +1103,10 @@ TEST(OpLogBatchStorageDeleteTest, FailureDoesNotRetryOrExpandRange) {
         backend.delete_fail_after = fail_after;
         backend.delete_result = ErrorCode::ETCD_OPERATION_ERROR;
         EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
-                  storage.DeleteBatchesThrough(3));
+                  storage.DeleteBatchesInRange(1, 3));
         ASSERT_EQ(1u, backend.delete_ranges.size());
         const auto attempted = backend.delete_ranges.front();
-        EXPECT_EQ(BuildBatchRecordKey("clusterA", 0), attempted.begin_key);
+        EXPECT_EQ(BuildBatchRecordKey("clusterA", 1), attempted.begin_key);
         EXPECT_EQ(BuildBatchRecordKey("clusterA", 4), attempted.end_key);
         std::string value;
         for (uint64_t id = 1; id <= 4; ++id) {
@@ -1058,7 +1116,7 @@ TEST(OpLogBatchStorageDeleteTest, FailureDoesNotRetryOrExpandRange) {
         }
         backend.delete_fail_after = std::numeric_limits<size_t>::max();
         backend.delete_result = ErrorCode::OK;
-        EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(3));
+        EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesInRange(1, 3));
         ASSERT_EQ(2u, backend.delete_ranges.size());
         EXPECT_EQ(attempted.begin_key, backend.delete_ranges.back().begin_key);
         EXPECT_EQ(attempted.end_key, backend.delete_ranges.back().end_key);
@@ -1111,7 +1169,7 @@ TEST(EtcdHaKvBackendDeleteTest, RealEtcdDeleteWhileAppending) {
         }
     });
     for (int i = 0; i < 16; ++i) {
-        EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(1));
+        EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesInRange(1, 1));
     }
     append.join();
     OpLogBatchRecord record;
@@ -1123,8 +1181,10 @@ TEST(EtcdHaKvBackendDeleteTest, RealEtcdDeleteWhileAppending) {
     EXPECT_EQ(16u, prefix.batch_id);
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildBatchRecordKey(cluster, UINT64_MAX), "record"));
-    EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(UINT64_MAX));
-    EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(UINT64_MAX));
+    EXPECT_EQ(ErrorCode::OK,
+              storage.DeleteBatchesInRange(UINT64_MAX, UINT64_MAX));
+    EXPECT_EQ(ErrorCode::OK,
+              storage.DeleteBatchesInRange(UINT64_MAX, UINT64_MAX));
     std::string value;
     EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
               backend.Get(BuildBatchRecordKey(cluster, UINT64_MAX), value));

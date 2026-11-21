@@ -22,9 +22,40 @@
 
 #include "config.h"
 #include "transport/batch_registration.h"
+#include "transport/rdma_transport/rdma_context.h"
 
 namespace mooncake {
 namespace {
+
+TEST(AscendSingleSegmentConfigTest, DefaultsOffAndParsesExplicitBoolean) {
+    unsetenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT");
+    unsetenv("ASCEND_STANDALONE_SINGLE_SEGMENT");
+    GlobalConfig defaults;
+    loadGlobalConfig(defaults);
+    EXPECT_FALSE(defaults.ascend_standalone_single_segment);
+    for (const char* value : {"1", "true", "0", "false", "invalid"}) {
+        setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", value, 1);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.ascend_standalone_single_segment,
+                  std::string(value) == "1" || std::string(value) == "true");
+    }
+    setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", "0", 1);
+    setenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT", "1", 1);
+    GlobalConfig mc_override;
+    loadGlobalConfig(mc_override);
+    EXPECT_TRUE(mc_override.ascend_standalone_single_segment);
+
+    setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", "1", 1);
+    setenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT", "0", 1);
+    GlobalConfig mc_disable;
+    mc_disable.ascend_standalone_single_segment = true;
+    loadGlobalConfig(mc_disable);
+    EXPECT_FALSE(mc_disable.ascend_standalone_single_segment);
+
+    unsetenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT");
+    unsetenv("ASCEND_STANDALONE_SINGLE_SEGMENT");
+}
 
 // --- MC_PKEY_INDEX (stoi with try-catch, range 0-65535) ---
 
@@ -1095,6 +1126,130 @@ TEST_F(RdmaWorkerIdleSpinEnvTest, EmptyStringKeepsDefault) {
     config.rdma_worker_idle_spin_us = 19;
     loadGlobalConfig(config);
     EXPECT_EQ(config.rdma_worker_idle_spin_us, 19u);
+}
+
+// --- MC_MAX_RECV_WR (1-65535, clamped to device max_qp_wr) ---
+
+class MaxRecvWrEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_MAX_RECV_WR"); }
+};
+
+TEST_F(MaxRecvWrEnvTest, UnsetKeepsRecvDepthEqualToMaxWr) {
+    ::unsetenv("MC_MAX_RECV_WR");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_recv_wr, 0u);  // 0 => endpoint uses max_wr
+}
+
+TEST_F(MaxRecvWrEnvTest, ValidOverride) {
+    ASSERT_EQ(::setenv("MC_MAX_RECV_WR", "16", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_recv_wr, 16u);
+    ASSERT_EQ(::setenv("MC_MAX_RECV_WR", "65535", 1), 0);
+    GlobalConfig config_max;
+    loadGlobalConfig(config_max);
+    EXPECT_EQ(config_max.max_recv_wr, 65535u);
+}
+
+TEST_F(MaxRecvWrEnvTest, OutOfRangeIsIgnored) {
+    for (const char* bad : {"0", "-1", "65536", "abc"}) {
+        ASSERT_EQ(::setenv("MC_MAX_RECV_WR", bad, 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.max_recv_wr, 0u) << "MC_MAX_RECV_WR=" << bad;
+    }
+}
+
+TEST_F(MaxRecvWrEnvTest, ClampedToDeviceMaxQpWr) {
+    // updateGlobalConfig() mutates the process-wide config; restore it.
+    auto& config = globalConfig();
+    const GlobalConfig saved = config;
+    ibv_device_attr attr{};
+    attr.max_qp = 1 << 20;
+    attr.max_cq = 1 << 20;
+    attr.max_qp_wr = 1024;
+    attr.max_sge = 64;
+    attr.max_cqe = 1 << 20;
+    attr.max_mr_size = UINT64_MAX;
+
+    config.max_recv_wr = 4096;
+    updateGlobalConfig(attr);
+    EXPECT_EQ(config.max_recv_wr, 1024u);
+
+    config.max_recv_wr = 16;
+    updateGlobalConfig(attr);
+    EXPECT_EQ(config.max_recv_wr, 16u);
+
+    config.max_recv_wr = 0;  // unset stays unset
+    updateGlobalConfig(attr);
+    EXPECT_EQ(config.max_recv_wr, 0u);
+    config = saved;
+}
+
+// --- MC_MAX_RD_ATOMIC / MC_MAX_DEST_RD_ATOMIC (1-255, clamped to device) ---
+
+class RdAtomicEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override {
+        ::unsetenv("MC_MAX_RD_ATOMIC");
+        ::unsetenv("MC_MAX_DEST_RD_ATOMIC");
+    }
+};
+
+TEST_F(RdAtomicEnvTest, UnsetMeansDeviceDefault) {
+    ::unsetenv("MC_MAX_RD_ATOMIC");
+    ::unsetenv("MC_MAX_DEST_RD_ATOMIC");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_rd_atomic, 0);
+    EXPECT_EQ(config.max_dest_rd_atomic, 0);
+}
+
+TEST_F(RdAtomicEnvTest, ValidOverrides) {
+    ASSERT_EQ(::setenv("MC_MAX_RD_ATOMIC", "2", 1), 0);
+    ASSERT_EQ(::setenv("MC_MAX_DEST_RD_ATOMIC", "255", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_rd_atomic, 2);
+    EXPECT_EQ(config.max_dest_rd_atomic, 255);
+}
+
+TEST_F(RdAtomicEnvTest, OutOfRangeIsIgnored) {
+    for (const char* bad : {"0", "-2", "256", "abc"}) {
+        ASSERT_EQ(::setenv("MC_MAX_RD_ATOMIC", bad, 1), 0);
+        ASSERT_EQ(::setenv("MC_MAX_DEST_RD_ATOMIC", bad, 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.max_rd_atomic, 0) << "value=" << bad;
+        EXPECT_EQ(config.max_dest_rd_atomic, 0) << "value=" << bad;
+    }
+}
+
+TEST(RdAtomicResolveTest, UnsetKeepsUpstreamDeviceDerivedDepth) {
+    // requested == 0 must match clampRdAtomicDepth() exactly (#4312 behavior).
+    for (int dev : {-1, 0, 1, 2, 8, 16, 32, 255}) {
+        EXPECT_EQ(resolveRdAtomicDepth(0, dev), clampRdAtomicDepth(dev))
+            << "device_max=" << dev;
+    }
+}
+
+TEST(RdAtomicResolveTest, RequestBelowDeviceLimitIsHonored) {
+    EXPECT_EQ(resolveRdAtomicDepth(2, 16), 2);
+    EXPECT_EQ(resolveRdAtomicDepth(1, 8), 1);
+}
+
+TEST(RdAtomicResolveTest, RequestIsClampedToDeviceLimit) {
+    EXPECT_EQ(resolveRdAtomicDepth(32, 16), 16);
+    EXPECT_EQ(resolveRdAtomicDepth(255, 8), 8);
+    // A device that advertises 0 still floors at 1.
+    EXPECT_EQ(resolveRdAtomicDepth(4, 0), 1);
+}
+
+TEST(RdAtomicResolveTest, RequestMayExceedHistoricalCapUpToDeviceLimit) {
+    EXPECT_EQ(resolveRdAtomicDepth(64, 128), 64);
+    EXPECT_EQ(resolveRdAtomicDepth(255, 255), 255);
 }
 
 }  // namespace

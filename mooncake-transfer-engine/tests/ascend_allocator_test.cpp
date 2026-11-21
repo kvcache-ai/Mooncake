@@ -61,7 +61,9 @@ void ResetMocks() {
     g_current_device = 0;
     g_provider_agent_mode = false;
     g_provider_use_fabric_mem = false;
+    unsetenv("MC_ASCEND_ENABLE_USE_FABRIC_MEM");
     unsetenv("ASCEND_ENABLE_USE_FABRIC_MEM");
+    unsetenv("MC_ASCEND_USE_SHMEM");
     unsetenv("ASCEND_USE_SHMEM");
 }
 
@@ -136,11 +138,30 @@ class AscendAllocatorTest : public ::testing::Test {
 
     void TearDown() override {
         ascend_allocator_set_config_provider(nullptr, nullptr);
+        ascend_allocator_set_single_segment_provider(nullptr);
         ContextManager::getInstance().finalize();
+        unsetenv("MC_ASCEND_USE_SHMEM");
         unsetenv("ASCEND_USE_SHMEM");
+        unsetenv("MC_ASCEND_ENABLE_USE_FABRIC_MEM");
         unsetenv("ASCEND_ENABLE_USE_FABRIC_MEM");
     }
 };
+
+bool SingleSegmentOn() { return true; }
+
+TEST_F(AscendAllocatorTest, SingleSegmentChunkCapIsOnePool) {
+    g_device_count = 4;
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+    ascend_allocator_set_runtime_flags(true, false, false);
+    EXPECT_EQ(ascend_agent_mode_store_chunk_cap(4096), 1024u);
+
+    ascend_allocator_set_runtime_flags(true, false, true);
+    EXPECT_EQ(ascend_agent_mode_store_chunk_cap(4096), 0u);
+
+    ascend_allocator_set_runtime_flags(true, false, false);
+    ascend_allocator_set_single_segment_provider(&SingleSegmentOn);
+    EXPECT_EQ(ascend_agent_mode_store_chunk_cap(8192), 0u);
+}
 
 TEST_F(AscendAllocatorTest, RuntimeFlagsSelectHostAllocation) {
     ascend_allocator_set_runtime_flags(false, false);
@@ -226,6 +247,17 @@ TEST_F(AscendAllocatorTest, SharedHostMemoryPublishesImportableHandle) {
     EXPECT_NE(handle.rfind("/proc/", 0), std::string::npos);
     ascend_free_memory("ascend", ptr);
     unsetenv("ASCEND_USE_SHMEM");
+}
+
+TEST_F(AscendAllocatorTest, McAscendEnvTakesPrecedenceOverLegacy) {
+    ascend_allocator_set_runtime_flags(false, false);
+    setenv("ASCEND_USE_SHMEM", "0", 1);
+    setenv("MC_ASCEND_USE_SHMEM", "1", 1);
+    void* ptr = ascend_allocate_memory(4096, "ascend");
+    ASSERT_NE(ptr, nullptr);
+    std::string handle;
+    EXPECT_TRUE(ascend_get_shared_host_handle(ptr, &handle));
+    ascend_free_memory("ascend", ptr);
 }
 
 }  // namespace

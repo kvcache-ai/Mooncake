@@ -36,6 +36,7 @@ constexpr ConfigFieldSpec kConfigFields[] = {
     {"transports/rdma/enable_smart_scheduling", ConfigFieldMatch::kExact},
     {"transports/rdma/numa_penalties", ConfigFieldMatch::kExact},
     {"transports/rdma/strict_local_numa", ConfigFieldMatch::kExact},
+    {"transports/rdma/dest_device_affinity", ConfigFieldMatch::kExact},
     {"transports/rdma/bandwidth_learning_rate", ConfigFieldMatch::kExact},
     {"transports/rdma/ewma_min_bandwidth_multiplier", ConfigFieldMatch::kExact},
     {"transports/rdma/ewma_max_bandwidth_multiplier", ConfigFieldMatch::kExact},
