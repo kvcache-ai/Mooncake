@@ -87,8 +87,9 @@ class DummyClient : public PyClient {
         const std::optional<ReadConfig>& config = std::nullopt) override;
 
     // TODO(UPG-T0083, replace-in=UPG2.2): receiver=UPG2.2 (Management 4).
-    // Source: Management 3 UPG1-F02-B05, 8e6f32a19:mooncake-store/src/dummy_client.cpp:505.
-    // Replace the raw SHM address with U's acquire/release buffer ownership.
+    // Source: Management 3 UPG1-F02-B05,
+    // 8e6f32a19:mooncake-store/src/dummy_client.cpp:505. Replace the raw SHM
+    // address with U's acquire/release buffer ownership.
     std::tuple<uint64_t, size_t> get_buffer_info(
         const std::string& key,
         const std::optional<ReadConfig>& config = std::nullopt) override;

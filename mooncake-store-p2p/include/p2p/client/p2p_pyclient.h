@@ -135,7 +135,6 @@ class PyClient {
 
     virtual int tearDownAll() = 0;
 
-
     virtual bool is_initialized() const = 0;
 };
 

@@ -181,8 +181,9 @@ std::shared_ptr<RealClient> RealClient::create() {
 }
 
 // TODO(UPG-T0085, replace-in=UPG2.3): receiver=UPG2.3 (Management 4).
-// Source: Management 3 UPG1.1, 0d67311c4:mooncake-store/src/real_client.cpp:187.
-// Move the ready RPC with Dummy and preserve the readiness and shutdown results.
+// Source: Management 3 UPG1.1,
+// 0d67311c4:mooncake-store/src/real_client.cpp:187. Move the ready RPC with
+// Dummy and preserve the readiness and shutdown results.
 tl::expected<DeploymentMode, ErrorCode> RealClient::service_ready_internal() {
     const auto state = state_.load(std::memory_order_acquire);
     if (state != State::READY) {
@@ -307,8 +308,9 @@ int RealClient::initAll(const std::string& protocol_,
 }
 
 // TODO(UPG-T0084, replace-in=UPG2.3): receiver=UPG2.3 (Management 4).
-// Source: Management 3 UPG1.1, 0d67311c4:mooncake-store/src/real_client.cpp:310.
-// Preserve RPC drain, UDS shutdown, and provider-safe SHM cleanup in that order.
+// Source: Management 3 UPG1.1,
+// 0d67311c4:mooncake-store/src/real_client.cpp:310. Preserve RPC drain, UDS
+// shutdown, and provider-safe SHM cleanup in that order.
 tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     std::lock_guard lifecycle_lock(lifecycle_mutex_);
     if (state_.load(std::memory_order_acquire) == State::CLOSED) {
@@ -857,8 +859,9 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
 }
 
 // TODO(UPG-T0084, replace-in=UPG2.3): receiver=UPG2.3 (Management 4).
-// Source: Management 3 UPG1.1, 0d67311c4:mooncake-store/src/real_client.cpp:861.
-// Keep SHM cleanup safe while RPC handlers still own the mapped context.
+// Source: Management 3 UPG1.1,
+// 0d67311c4:mooncake-store/src/real_client.cpp:861. Keep SHM cleanup safe while
+// RPC handlers still own the mapped context.
 tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     const UUID& client_id) {
     const auto state = state_.load(std::memory_order_acquire);
@@ -1548,8 +1551,9 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
 }
 
 // TODO(UPG-T0085, replace-in=UPG2.3): receiver=UPG2.3 (Management 4).
-// Source: Management 3 UPG1.1, 0d67311c4:mooncake-store/src/real_client.cpp:1545.
-// Preserve the typed shutdown error and per-client SHM count when moving ping.
+// Source: Management 3 UPG1.1,
+// 0d67311c4:mooncake-store/src/real_client.cpp:1545. Preserve the typed
+// shutdown error and per-client SHM count when moving ping.
 tl::expected<DummyHeartbeatResponse, ErrorCode> RealClient::ping(
     const UUID& client_id) {
     const auto state = state_.load(std::memory_order_acquire);

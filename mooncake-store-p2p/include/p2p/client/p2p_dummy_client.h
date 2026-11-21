@@ -129,7 +129,6 @@ class DummyClient : public PyClient {
 
     int tearDownAll() override;
 
-
    private:
     ErrorCode connect(const std::string& server_address);
 

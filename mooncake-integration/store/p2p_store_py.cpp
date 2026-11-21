@@ -1416,9 +1416,11 @@ void BindCommonMethods(py::module_& m, StoreBinding& store) {
                const std::vector<std::vector<size_t>>& all_sizes,
                const std::optional<WriteConfig>& config) {
                 py::gil_scoped_release release;
-                // TODO(UPG-T0087, replace-in=UPG3.3): receiver=UPG3.3 (Management 4).
-                // Source: Management 3 UPG1.1, 0d67311c4:mooncake-integration/store/store_py.cpp:1424.
-                // Route Dummy multi-buffer puts through the typed RPC and SHM provider.
+                // TODO(UPG-T0087, replace-in=UPG3.3): receiver=UPG3.3
+                // (Management 4). Source: Management 3 UPG1.1,
+                // 0d67311c4:mooncake-integration/store/store_py.cpp:1424. Route
+                // Dummy multi-buffer puts through the typed RPC and SHM
+                // provider.
                 if (self.use_dummy_client_) {
                     LOG(ERROR)
                         << "batch_put_from_multi_buffers is not supported for "
@@ -1442,9 +1444,11 @@ void BindCommonMethods(py::module_& m, StoreBinding& store) {
                bool aggregate_same_segment_task = false,
                const std::optional<ReadConfig>& config = std::nullopt) {
                 py::gil_scoped_release release;
-                // TODO(UPG-T0087, replace-in=UPG3.3): receiver=UPG3.3 (Management 4).
-                // Source: Management 3 UPG1.1, 0d67311c4:mooncake-integration/store/store_py.cpp:1447.
-                // Route Dummy multi-buffer gets through the typed RPC and SHM provider.
+                // TODO(UPG-T0087, replace-in=UPG3.3): receiver=UPG3.3
+                // (Management 4). Source: Management 3 UPG1.1,
+                // 0d67311c4:mooncake-integration/store/store_py.cpp:1447. Route
+                // Dummy multi-buffer gets through the typed RPC and SHM
+                // provider.
                 if (self.use_dummy_client_) {
                     LOG(ERROR)
                         << "batch_get_into_multi_buffers is not supported for "

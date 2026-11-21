@@ -292,7 +292,6 @@ class RealClient : public PyClient {
      */
     int64_t getSize(const std::string& key) override;
 
-
     // Dummy client helper functions that return tl::expected
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
     get_buffer_info_dummy_helper(const std::string& key,

@@ -161,8 +161,9 @@ ErrorCode DummyClient::connect(const std::string& server_address) {
     // The client pool does not have native connection check method, so we need
     // to use custom ServiceReady API.
     // TODO(UPG-T0085, replace-in=UPG2.3): receiver=UPG2.3 (Management 4).
-    // Source: Management 3 UPG1.1, 0d67311c4:mooncake-store/src/dummy_client.cpp:164.
-    // Move the ready RPC with the server and preserve typed readiness errors.
+    // Source: Management 3 UPG1.1,
+    // 0d67311c4:mooncake-store/src/dummy_client.cpp:164. Move the ready RPC
+    // with the server and preserve typed readiness errors.
     auto result =
         invoke_rpc<&RealClient::service_ready_internal, DeploymentMode>();
     if (!result.has_value()) {
@@ -311,8 +312,9 @@ int DummyClient::setup(DummyClientConfig& config) {
 }
 
 // TODO(UPG-T0084, replace-in=UPG2.3): receiver=UPG2.3 (Management 4).
-// Source: Management 3 UPG1.1, 0d67311c4:mooncake-store/src/dummy_client.cpp:315.
-// Preserve heartbeat join and SHM unmap order when switching deployment providers.
+// Source: Management 3 UPG1.1,
+// 0d67311c4:mooncake-store/src/dummy_client.cpp:315. Preserve heartbeat join
+// and SHM unmap order when switching deployment providers.
 int DummyClient::tearDownAll() {
     // Stop and join the heartbeat before unmapping so it cannot re-register
     // SHM.
@@ -529,8 +531,9 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
 }
 
 // TODO(UPG-T0087, replace-in=UPG3.3): receiver=UPG3.3 (Management 4).
-// Source: Management 3 UPG1.1, 0d67311c4:mooncake-store/src/dummy_client.cpp:544.
-// Connect get_into through typed RPC, the SHM provider, and the P2P binding.
+// Source: Management 3 UPG1.1,
+// 0d67311c4:mooncake-store/src/dummy_client.cpp:544. Connect get_into through
+// typed RPC, the SHM provider, and the P2P binding.
 int64_t DummyClient::get_into(const std::string& key, void* buffer, size_t size,
                               const std::optional<ReadConfig>& config) {
     // TODO: implement this function
@@ -568,8 +571,9 @@ std::vector<int> DummyClient::batch_put_from(
 }
 
 // TODO(UPG-T0087, replace-in=UPG3.3): receiver=UPG3.3 (Management 4).
-// Source: Management 3 UPG1.1, 0d67311c4:mooncake-store/src/dummy_client.cpp:580.
-// Connect put_from through typed RPC, the SHM provider, and the P2P binding.
+// Source: Management 3 UPG1.1,
+// 0d67311c4:mooncake-store/src/dummy_client.cpp:580. Connect put_from through
+// typed RPC, the SHM provider, and the P2P binding.
 int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
                           const std::optional<WriteConfig>& config) {
     // TODO: implement this function
@@ -601,8 +605,9 @@ std::vector<int64_t> DummyClient::batch_get_into(
 }
 
 // TODO(UPG-T0087, replace-in=UPG3.3): receiver=UPG3.3 (Management 4).
-// Source: Management 3 UPG1.1, 0d67311c4:mooncake-store/src/dummy_client.cpp:610.
-// Connect data and metadata buffers through typed RPC and the P2P binding.
+// Source: Management 3 UPG1.1,
+// 0d67311c4:mooncake-store/src/dummy_client.cpp:610. Connect data and metadata
+// buffers through typed RPC and the P2P binding.
 int DummyClient::put_from_with_metadata(
     const std::string& key, void* buffer, void* metadata_buffer, size_t size,
     size_t metadata_size, const std::optional<WriteConfig>& config) {
@@ -611,8 +616,9 @@ int DummyClient::put_from_with_metadata(
 }
 
 // TODO(UPG-T0087, replace-in=UPG3.3): receiver=UPG3.3 (Management 4).
-// Source: Management 3 UPG1.1, 0d67311c4:mooncake-store/src/dummy_client.cpp:617.
-// Connect the multi-buffer put batch through typed RPC and the P2P binding.
+// Source: Management 3 UPG1.1,
+// 0d67311c4:mooncake-store/src/dummy_client.cpp:617. Connect the multi-buffer
+// put batch through typed RPC and the P2P binding.
 std::vector<int> DummyClient::batch_put_from_multi_buffers(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
@@ -624,8 +630,9 @@ std::vector<int> DummyClient::batch_put_from_multi_buffers(
 }
 
 // TODO(UPG-T0087, replace-in=UPG3.3): receiver=UPG3.3 (Management 4).
-// Source: Management 3 UPG1.1, 0d67311c4:mooncake-store/src/dummy_client.cpp:627.
-// Connect the multi-buffer get batch through typed RPC and the P2P binding.
+// Source: Management 3 UPG1.1,
+// 0d67311c4:mooncake-store/src/dummy_client.cpp:627. Connect the multi-buffer
+// get batch through typed RPC and the P2P binding.
 std::vector<int> DummyClient::batch_get_into_multi_buffers(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
@@ -665,10 +672,10 @@ std::vector<ObjectDescriptor> DummyClient::get_replica_desc(
     return replica_list;
 }
 
-
 // TODO(UPG-T0085, replace-in=UPG2.3): receiver=UPG2.3 (Management 4).
-// Source: Management 3 UPG1.1, 0d67311c4:mooncake-store/src/dummy_client.cpp:684.
-// Keep re-registration tied to the registered SHM snapshot and local flag.
+// Source: Management 3 UPG1.1,
+// 0d67311c4:mooncake-store/src/dummy_client.cpp:684. Keep re-registration tied
+// to the registered SHM snapshot and local flag.
 bool DummyClient::reregister_all_shms() {
     bool all_registered = true;
     for (const auto& shm_ptr : shm_helper_->get_registered_snapshot()) {
@@ -683,8 +690,9 @@ bool DummyClient::reregister_all_shms() {
 }
 
 // TODO(UPG-T0085, replace-in=UPG2.3): receiver=UPG2.3 (Management 4).
-// Source: Management 3 UPG1.1, 0d67311c4:mooncake-store/src/dummy_client.cpp:697.
-// Preserve typed heartbeat failures and segment-count recovery with the new provider.
+// Source: Management 3 UPG1.1,
+// 0d67311c4:mooncake-store/src/dummy_client.cpp:697. Preserve typed heartbeat
+// failures and segment-count recovery with the new provider.
 void DummyClient::ping_thread_main() {
     const int max_ping_fail_count = 3;
     const int success_ping_interval_ms = 1000;
