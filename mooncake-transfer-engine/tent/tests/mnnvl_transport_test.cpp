@@ -1496,6 +1496,85 @@ TEST_F(MnnvlCompletionTest, PoolBoundsDevicesAndNeverRetainsPendingEvents) {
     EXPECT_EQ(MnnvlTransportTestPeer::idle(*zero, 0), 0);
 }
 
+TEST_F(MnnvlCompletionTest, DestroyedContextsDoNotConsumePoolCapacity) {
+#if CUDA_VERSION < 12000
+    GTEST_SKIP() << "Context lifetime detection requires CUDA 12+ headers";
+#else
+    CUcontext caller = nullptr;
+    ASSERT_EQ(cuCtxGetCurrent(&caller), CUDA_SUCCESS);
+    CUdevice device;
+    ASSERT_EQ(cuDeviceGet(&device, 0), CUDA_SUCCESS);
+    auto destroy_context = [caller](CUcontext context) {
+        EXPECT_EQ(cuCtxDestroy(context), CUDA_SUCCESS);
+        EXPECT_EQ(cuCtxSetCurrent(caller), CUDA_SUCCESS);
+    };
+    for (bool acquire_before_destroy : {false, true}) {
+        SCOPED_TRACE(::testing::Message()
+                     << "acquire_before_destroy=" << acquire_before_destroy);
+        CUcontext raw = nullptr;
+#if CUDA_VERSION >= 13000
+        ASSERT_EQ(cuCtxCreate(&raw, nullptr, 0, device), CUDA_SUCCESS);
+#else
+        ASSERT_EQ(cuCtxCreate(&raw, 0, device), CUDA_SUCCESS);
+#endif
+        std::unique_ptr<CUctx_st, decltype(destroy_context)> context_a(
+            raw, destroy_context);
+        auto pool = std::make_shared<MnnvlCompletionEventPool>(1);
+        {
+            MnnvlCompletion cached;
+            cached.pool = pool;
+            cached.device = 0;
+            ASSERT_TRUE(pool->acquire(0, cached).ok());
+            ASSERT_EQ(cached.context, context_a.get());
+            ASSERT_EQ(cudaEventRecord(cached.event, cudaStreamPerThread),
+                      cudaSuccess);
+            cached.recorded = true;
+            ASSERT_EQ(cudaEventSynchronize(cached.event), cudaSuccess);
+        }
+        ASSERT_EQ(MnnvlTransportTestPeer::idle(*pool, 0), 1);
+        ASSERT_EQ(cuCtxSetCurrent(caller), CUDA_SUCCESS);
+
+        // Cover both a fresh acquisition after A dies and an event already
+        // in flight when A dies. Acquisition-only pruning misses the latter.
+        cudaEvent_t retained = nullptr;
+        {
+            MnnvlCompletion live;
+            live.pool = pool;
+            live.device = 0;
+            if (!acquire_before_destroy) context_a.reset();
+            ASSERT_TRUE(pool->acquire(0, live).ok());
+            ASSERT_EQ(live.context, caller);
+            ASSERT_EQ(cudaEventRecord(live.event, cudaStreamPerThread),
+                      cudaSuccess);
+            live.recorded = true;
+            ASSERT_EQ(cudaEventSynchronize(live.event), cudaSuccess);
+            if (acquire_before_destroy) context_a.reset();
+            retained = live.event;
+        }
+        EXPECT_EQ(MnnvlTransportTestPeer::idle(*pool, 0), 1);
+        CUcontext current = nullptr;
+        ASSERT_EQ(cuCtxGetCurrent(&current), CUDA_SUCCESS);
+        EXPECT_EQ(current, caller);
+        {
+            MnnvlCompletion reused;
+            reused.pool = pool;
+            reused.device = 0;
+            ASSERT_TRUE(pool->acquire(0, reused).ok());
+            EXPECT_EQ(reused.event, retained);
+            EXPECT_EQ(reused.context, caller);
+            // Checking the slot count distinguishes a real hit from a newly
+            // allocated event that happens to reuse a destroyed event handle.
+            EXPECT_EQ(MnnvlTransportTestPeer::idle(*pool, 0), 0);
+            ASSERT_EQ(cudaEventRecord(reused.event, cudaStreamPerThread),
+                      cudaSuccess);
+            reused.recorded = true;
+            ASSERT_EQ(cudaEventSynchronize(reused.event), cudaSuccess);
+        }
+        EXPECT_EQ(MnnvlTransportTestPeer::idle(*pool, 0), 1);
+    }
+#endif
+}
+
 TEST_F(MnnvlCompletionTest, OverlappingContextsNeverShareCompletionEvents) {
     CUcontext caller = nullptr;
     ASSERT_EQ(cuCtxGetCurrent(&caller), CUDA_SUCCESS);
