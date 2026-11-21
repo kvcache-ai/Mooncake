@@ -488,10 +488,41 @@ int TcpTransport::registerLocalMemory(void* addr, size_t length,
 #ifdef ENABLE_MULTI_PROTOCOL
     buffer_desc.protocol = "tcp";
 #endif
-    return metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
+    std::lock_guard<std::mutex> pending_lock(pending_republish_mutex_);
+    int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
+    clearPendingRepublish((uint64_t)addr);
+    return ret;
+}
+
+bool TcpTransport::hasPendingRepublish(uint64_t addr) {
+    return pending_republish_.count(addr) != 0;
+}
+
+void TcpTransport::markPendingRepublish(uint64_t addr) {
+    pending_republish_.insert(addr);
+}
+
+void TcpTransport::clearPendingRepublish(uint64_t addr) {
+    pending_republish_.erase(addr);
 }
 
 int TcpTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
+    std::lock_guard<std::mutex> pending_lock(pending_republish_mutex_);
+    return unregisterLocalMemoryInternal(addr, update_metadata,
+                                         /*defer_publish_to_caller=*/false);
+}
+
+int TcpTransport::unregisterLocalMemoryInternal(void* addr,
+                                                bool update_metadata,
+                                                bool defer_publish_to_caller) {
+    if (hasPendingRepublish((uint64_t)addr)) {
+        if (!update_metadata && defer_publish_to_caller) return 0;
+        int ret = metadata_->updateLocalSegmentDesc();
+        if (ret) return ret;
+        clearPendingRepublish((uint64_t)addr);
+        return 0;
+    }
+
     // Remove only the descs this transport published. Under multi-protocol
     // the protocol field is authoritative; otherwise ours are the entries
     // without a serialized IPC handle.
@@ -503,7 +534,16 @@ int TcpTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
             return desc.shm_name.empty();
 #endif
         };
-    return metadata_->removeLocalMemoryBuffer(addr, own_desc, update_metadata);
+    int ret =
+        metadata_->removeLocalMemoryBuffer(addr, own_desc, update_metadata);
+    if (update_metadata && ret == ERR_METADATA) {
+        markPendingRepublish((uint64_t)addr);
+    } else if (ret == 0 && defer_publish_to_caller) {
+        markPendingRepublish((uint64_t)addr);
+    } else if (ret == 0 && update_metadata) {
+        clearPendingRepublish((uint64_t)addr);
+    }
+    return ret;
 }
 
 int TcpTransport::registerLocalMemoryBatch(
@@ -519,13 +559,30 @@ int TcpTransport::registerLocalMemoryBatch(
 
 int TcpTransport::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
+    std::lock_guard<std::mutex> pending_lock(pending_republish_mutex_);
     int first_error = 0;
+    bool any_not_registered = false;
+    std::vector<void*> cleaned_addrs;
     for (auto& addr : addr_list) {
-        int ret = unregisterLocalMemory(addr, false);
-        if (ret && !first_error) first_error = ret;
+        int ret = unregisterLocalMemoryInternal(
+            addr, false, /*defer_publish_to_caller=*/true);
+        if (ret == ERR_ADDRESS_NOT_REGISTERED) {
+            any_not_registered = true;
+            continue;
+        }
+        if (ret) {
+            if (!first_error) first_error = ret;
+            continue;
+        }
+        cleaned_addrs.push_back(addr);
     }
     int metadata_ret = metadata_->updateLocalSegmentDesc();
-    return first_error ? first_error : metadata_ret;
+    if (!metadata_ret) {
+        for (void* addr : cleaned_addrs) clearPendingRepublish((uint64_t)addr);
+    }
+    if (first_error) return first_error;
+    if (any_not_registered) return ERR_ADDRESS_NOT_REGISTERED;
+    return metadata_ret;
 }
 
 Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,

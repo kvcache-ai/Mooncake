@@ -32,6 +32,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -150,6 +151,8 @@ class TcpIoPool {
 };
 
 class TcpTransport : public Transport {
+    friend class TcpUnregisterRepublishTestPeer;
+
    public:
     using BufferDesc = TransferMetadata::BufferDesc;
     using SegmentDesc = TransferMetadata::SegmentDesc;
@@ -189,6 +192,12 @@ class TcpTransport : public Transport {
 
     int unregisterLocalMemory(void *addr, bool update_metadata = false);
 
+    int unregisterLocalMemoryInternal(void *addr, bool update_metadata,
+                                      bool defer_publish_to_caller);
+    bool hasPendingRepublish(uint64_t addr);
+    void markPendingRepublish(uint64_t addr);
+    void clearPendingRepublish(uint64_t addr);
+
     int registerLocalMemoryBatch(
         const std::vector<Transport::BufferEntry> &buffer_list,
         const std::string &location);
@@ -209,6 +218,10 @@ class TcpTransport : public Transport {
     const char *getName() const override { return "tcp"; }
 
    private:
+    // Serializes register/unregister; pending entries owe only publication.
+    std::mutex pending_republish_mutex_;
+    std::unordered_set<uint64_t> pending_republish_;
+
     TcpContext *context_;
     std::atomic_bool running_;
     std::unique_ptr<TcpIoPool> io_pool_;
