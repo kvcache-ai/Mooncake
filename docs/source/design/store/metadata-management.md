@@ -59,7 +59,7 @@ Each key maps to one `ObjectMetadata` record:
 | Field | Meaning |
 |---|---|
 | `client_id`, `put_start_time` | Writer identity and write-start time (used to reap stale `PutStart`s) |
-| `size`, `object_checksum`, `data_type` | Object length, optional checksum, data-type classification |
+| `size`, `object_checksum`, `data_type`, `kv_cache_kind` | Object length, optional checksum, data-type classification, and the KV cache kind when `data_type` is `KVCACHE` |
 | `tenant_id`, `user_key`, `group_id` | Identity (the key is stored again inside the record) and optional group for shared-TTL lifecycle |
 | `lease`, `soft_pin_timeout`, `hard_pinned` | Read lease and pin state that control eviction eligibility |
 | `replicas_` | `std::vector<Replica>` — the location descriptors |
@@ -77,6 +77,46 @@ A `Replica` is a `std::variant` over the storage media, with a serializable
 Replicas carry a status (`INITIALIZED -> PROCESSING -> COMPLETE | FAILED |
 REMOVED`); only readable replicas (`COMPLETE` with a valid handle) are
 returned to readers.
+
+## KV Cache Kinds
+
+`ObjectDataType::KVCACHE` says an object is KV cache. `kv_cache_kind` says
+which kind, so a master can treat those objects differently. A put names the
+kind per key on `ReplicateConfig.kv_cache_kinds`, in the same order as the
+keys. Omitting the list stores `UNSPECIFIED`, which is also what objects
+written before this field restore as.
+
+| Kind | What it stores |
+|---|---|
+| `UNSPECIFIED` | Legacy KV cache, or a put that did not name a kind |
+| `FULL` | Full-attention KV |
+| `SWA` | Sliding-window attention KV |
+| `DSA` | DeepSeek sparse-attention latent KV |
+| `INDEXER` | DSA indexer vectors that address the DSA KV |
+| `MLA` | Multi-head latent attention cache that is not DSA |
+| `MAMBA` | Mamba / SSM recurrent state |
+| `LINEAR` | Other linear-attention recurrent state |
+
+The master flag and config key `kv_cache_kind_evict` assigns each kind one
+eviction control. An empty value leaves every kind on `NORMAL`, so existing
+clusters keep today's lease order.
+
+| Control | Eviction |
+|---|---|
+| `NORMAL` | Ordinary lease order |
+| `DEFER` | Only in the fallback pass, after ordinary objects |
+| `PROTECT` | Left in place after the lease expires |
+
+`PROTECT` does not override a hard pin's earlier check, and it does not
+expire a live lease. It is the control for a small state whose loss forces a
+full recompute, such as Mamba state or a DSA indexer. Example:
+
+```text
+--kv_cache_kind_evict=MAMBA=PROTECT,INDEXER=DEFER,SWA=DEFER
+```
+
+The same string is the `kv_cache_kind_evict` field in the master config file.
+Names are case-sensitive, and a kind may appear once.
 
 ## Put Path: Two-Phase Metadata
 
