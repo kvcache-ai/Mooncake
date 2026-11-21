@@ -1010,10 +1010,11 @@ MasterService::~MasterService() {
     dynamic_replication_.Stop();
 
     client_offboarding_worker_.Stop();
-    for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
+    for (const auto& charge : orphaned_segments_.ReleaseAll()) {
         MasterMetricManager::instance().dec_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
-        MasterMetricManager::instance().remove_segment_metrics(segment);
+            charge.segment_name, static_cast<int64_t>(charge.bytes));
+        MasterMetricManager::instance().remove_segment_metrics(
+            charge.segment_name);
     }
 
     // Segments still mounted here never went through CommitUnmountSegment;
@@ -1178,25 +1179,7 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
 
 ErrorCode MasterService::ValidateStandbyRemountSegment(
     const Segment& segment) const {
-    const StandbySegmentInfo* match = nullptr;
-    for (const auto& standby : standby_memory_segments_) {
-        if (standby.transport_endpoint == segment.te_endpoint ||
-            standby.segment_name == segment.name) {
-            if (match != nullptr && match != &standby) {
-                return ErrorCode::INVALID_PARAMS;
-            }
-            match = &standby;
-        }
-    }
-    if (match != nullptr && segment.protocol == "cxl") {
-        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
-    }
-    if (match != nullptr && (match->segment_name != segment.name ||
-                             match->transport_endpoint != segment.te_endpoint ||
-                             match->capacity != segment.size)) {
-        return ErrorCode::INVALID_PARAMS;
-    }
-    return ErrorCode::OK;
+    return orphaned_segments_.Validate(segment);
 }
 
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
@@ -1262,7 +1245,6 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             std::vector<Replica*> replicas;
             std::vector<AllocatedBuffer::Descriptor> descriptors;
             std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
-            uint64_t imported_size{0};
         };
         std::vector<SegmentRestore> restores;
         restores.reserve(segments.size());
@@ -1320,8 +1302,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                         nullptr,
                                         {},
                                         {},
-                                        {},
-                                        0});
+                                        {}});
                 }
             }
         }
@@ -1329,75 +1310,88 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             return fail_remount(remount_error);
         }
 
+        // The restore that orphaned each segment listed the replicas it put
+        // there, so they are looked up by reference instead of walking the
+        // store. master_state_mutex_ is held exclusively, so no object
+        // operation runs until the repair below: the replicas this lookup
+        // collects stay put, and each object it touched is locked again there
+        // by its publication.
         bool ambiguous_endpoint = false;
         bool unsupported_cxl = false;
-        // master_state_mutex_ is held exclusively, so no object operation runs
-        // until the repair below: the replicas this walk collects stay put,
-        // and each object it touched is locked again there by its publication.
         std::vector<std::pair<TenantId, route::ObjectRef>> affected_objects;
-        bool any_standby_kept_alive = std::any_of(
-            segments.begin(), segments.end(), [this](const Segment& segment) {
-                return standby_accounted_memory_bytes_.contains(segment.name);
-            });
-        if (any_standby_kept_alive) {
-            VisitNamespaces([&](const TenantId& tenant_id,
-                                metadata::Namespace& ns) {
-                for (auto object : ns.objects.WriteCursor()) {
-                    bool affected = false;
-                    object.metadata().VisitReplicas(
-                        [](const Replica& replica) {
-                            return replica.is_memory_replica() &&
-                                   replica.status() != ReplicaStatus::REMOVED &&
-                                   replica.status() != ReplicaStatus::FAILED;
-                        },
-                        [&](Replica& replica) {
-                            auto descriptor = replica.get_descriptor()
-                                                  .get_memory_descriptor()
-                                                  .buffer_descriptor;
-                            SegmentRestore* match = nullptr;
-                            bool endpoint_match = false;
-                            for (auto& restore : restores) {
-                                if (descriptor.transport_endpoint_ ==
-                                        restore.segment.te_endpoint ||
-                                    descriptor.transport_endpoint_ ==
-                                        restore.segment.name) {
-                                    endpoint_match = true;
-                                    // Reject CXL via the existing check below.
-                                    if (descriptor.protocol_ != "cxl" &&
-                                        (descriptor.buffer_address_ <
-                                             restore.segment.base ||
-                                         descriptor.buffer_address_ -
-                                                 restore.segment.base >=
-                                             restore.segment.size))
-                                        continue;
-                                    if (match != nullptr) {
-                                        ambiguous_endpoint = true;
-                                        return;
-                                    }
-                                    match = &restore;
-                                }
-                            }
-                            if (endpoint_match && match == nullptr) {
-                                ambiguous_endpoint = true;
-                                return;
-                            }
-                            if (match != nullptr) {
-                                if (descriptor.protocol_ == "cxl") {
-                                    unsupported_cxl = true;
-                                    return;
-                                }
-                                descriptor.transport_endpoint_ =
-                                    match->segment.te_endpoint;
-                                match->replicas.push_back(&replica);
-                                match->descriptors.push_back(descriptor);
-                                affected = true;
-                            }
-                        });
-                    if (affected) {
-                        affected_objects.emplace_back(tenant_id, object.ref());
+        std::vector<const OrphanedSegment*> remounted_orphans;
+        for (const auto& restore : restores) {
+            const auto* orphan = orphaned_segments_.Find(restore.segment);
+            if (orphan != nullptr &&
+                std::find(remounted_orphans.begin(), remounted_orphans.end(),
+                          orphan) == remounted_orphans.end()) {
+                remounted_orphans.push_back(orphan);
+            }
+        }
+        for (const auto* orphan : remounted_orphans) {
+            for (const auto& restored : orphan->replicas) {
+                MetadataAccessorRW accessor(this, restored.tenant_id,
+                                            restored.object);
+                if (!accessor.IsPublished()) {
+                    continue;
+                }
+                // Replica ids are never reused, so a key that was removed and
+                // put again does not match.
+                Replica* replica = accessor.Get().GetFirstReplica(
+                    [&](const Replica& candidate) {
+                        return candidate.id() == restored.replica_id &&
+                               candidate.is_live_memory_replica();
+                    });
+                if (replica == nullptr) {
+                    continue;
+                }
+                auto descriptor = replica->get_descriptor()
+                                      .get_memory_descriptor()
+                                      .buffer_descriptor;
+                SegmentRestore* match = nullptr;
+                bool endpoint_match = false;
+                for (auto& restore : restores) {
+                    if (descriptor.transport_endpoint_ ==
+                            restore.segment.te_endpoint ||
+                        descriptor.transport_endpoint_ ==
+                            restore.segment.name) {
+                        endpoint_match = true;
+                        // Reject CXL via the existing check below.
+                        if (descriptor.protocol_ != "cxl" &&
+                            (descriptor.buffer_address_ <
+                                 restore.segment.base ||
+                             descriptor.buffer_address_ -
+                                     restore.segment.base >=
+                                 restore.segment.size)) {
+                            continue;
+                        }
+                        if (match != nullptr) {
+                            ambiguous_endpoint = true;
+                            break;
+                        }
+                        match = &restore;
                     }
                 }
-            });
+                if (ambiguous_endpoint ||
+                    (endpoint_match && match == nullptr)) {
+                    ambiguous_endpoint = true;
+                    break;
+                }
+                if (match != nullptr) {
+                    if (descriptor.protocol_ == "cxl") {
+                        unsupported_cxl = true;
+                        break;
+                    }
+                    descriptor.transport_endpoint_ = match->segment.te_endpoint;
+                    match->replicas.push_back(replica);
+                    match->descriptors.push_back(descriptor);
+                    affected_objects.emplace_back(restored.tenant_id,
+                                                  restored.object);
+                }
+            }
+            if (ambiguous_endpoint || unsupported_cxl) {
+                break;
+            }
         }
         if (ambiguous_endpoint) {
             return fail_remount(ErrorCode::INVALID_PARAMS);
@@ -1454,17 +1448,6 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                 [](const auto& buffer) { return !buffer; })) {
                     return fail_remount(ErrorCode::INTERNAL_ERROR);
                 }
-                restore.imported_size = std::accumulate(
-                    restore.descriptors.begin(), restore.descriptors.end(),
-                    uint64_t{0}, [](uint64_t sum, const auto& descriptor) {
-                        return sum + descriptor.size_;
-                    });
-                auto accounted =
-                    standby_accounted_memory_bytes_.find(restore.segment.name);
-                if (accounted == standby_accounted_memory_bytes_.end() ||
-                    accounted->second < restore.imported_size) {
-                    return fail_remount(ErrorCode::INTERNAL_ERROR);
-                }
                 allocator_replacements.push_back({restore.segment.id,
                                                   restore.old_allocator,
                                                   restore.restored_allocator});
@@ -1490,25 +1473,16 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             return fail_remount(ErrorCode::INTERNAL_ERROR);
         }
         for (auto& restore : restores) {
-            if (restore.imported_size != 0) {
-                MasterMetricManager::instance().dec_allocated_mem_size(
-                    restore.segment.name,
-                    static_cast<int64_t>(restore.imported_size));
-                auto accounted =
-                    standby_accounted_memory_bytes_.find(restore.segment.name);
-                accounted->second -= restore.imported_size;
-                if (accounted->second == 0) {
-                    standby_accounted_memory_bytes_.erase(accounted);
-                }
-            }
             for (size_t i = 0; i < restore.replicas.size(); ++i) {
                 (void)restore.replicas[i]->replace_memory_buffer(
                     std::move(restore.buffers[i]));
             }
-            invalid_replica_endpoints_.erase(restore.segment.te_endpoint);
-            invalid_replica_endpoints_.erase(restore.segment.name);
-            standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
-            standby_allocator_keepalive_.erase(restore.segment.name);
+            // Adopting releases everything still charged to the orphan: the
+            // re-adopted allocator counts the surviving replicas on its own.
+            if (auto charge = orphaned_segments_.Adopt(restore.segment)) {
+                MasterMetricManager::instance().dec_allocated_mem_size(
+                    charge->segment_name, static_cast<int64_t>(charge->bytes));
+            }
         }
         for (const auto& [tenant_id, object] : affected_objects) {
             MetadataAccessorRW accessor(this, tenant_id, object);
@@ -3837,12 +3811,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         }
     }
 
-    std::vector<StandbySegmentInfo> restored_memory_segments;
+    std::vector<OrphanedSegment> orphans;
     std::unordered_map<std::string, const StandbySegmentInfo*>
         memory_segments_by_alias;
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
         restored_allocators;
-    std::unordered_set<std::string> restored_invalid_endpoints;
     for (const auto& seg : segments) {
         if (!seg.is_memory_segment) {
             continue;
@@ -3868,34 +3841,33 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        restored_memory_segments.push_back(seg);
-        // Reuse the live standby allocator only on an exact endpoint
-        // match. Restored buffers hold their allocator by weak_ptr, so a
-        // later snapshot that swaps the keepalive must not expire the
-        // buffers an earlier snapshot restored onto the same endpoint. A
-        // name match with a changed endpoint is a different physical
-        // segment: reusing its allocator would make the replica report
-        // the stale endpoint and look readable before the new endpoint
-        // remounts.
-        std::shared_ptr<BufferAllocatorBase> allocator;
-        if (auto keepalive =
-                standby_allocator_keepalive_.find(seg.transport_endpoint);
-            keepalive != standby_allocator_keepalive_.end()) {
-            allocator = keepalive->second;
+        // Take over the live orphan only on an exact endpoint match.
+        // Restored buffers hold their allocator by weak_ptr, so a later
+        // snapshot that replaces the orphan must not expire the buffers an
+        // earlier snapshot restored onto the same endpoint, and the remount
+        // still has to find those replicas. A name match with a changed
+        // endpoint is a different physical segment: reusing its allocator
+        // would make the replica report the stale endpoint and look readable
+        // before the new endpoint remounts.
+        OrphanedSegment orphan{
+            seg,
+            nullptr,
+            0,
+            segment_manager_.HasSegmentByEndpoint(seg.transport_endpoint),
+            {}};
+        if (const auto* previous =
+                orphaned_segments_.FindAtEndpoint(seg.transport_endpoint)) {
+            orphan.keepalive = previous->keepalive;
+            orphan.replicas = previous->replicas;
         } else {
-            allocator = std::make_shared<DummyBufferAllocator>(
+            orphan.keepalive = std::make_shared<DummyBufferAllocator>(
                 seg.segment_name, seg.transport_endpoint);
         }
-        restored_allocators[seg.transport_endpoint] = allocator;
+        restored_allocators[seg.transport_endpoint] = orphan.keepalive;
         if (seg.segment_name != seg.transport_endpoint) {
-            restored_allocators[seg.segment_name] = allocator;
+            restored_allocators[seg.segment_name] = orphan.keepalive;
         }
-        if (!segment_manager_.HasSegmentByEndpoint(seg.transport_endpoint)) {
-            restored_invalid_endpoints.insert(seg.transport_endpoint);
-            if (seg.segment_name != seg.transport_endpoint) {
-                restored_invalid_endpoints.insert(seg.segment_name);
-            }
-        }
+        orphans.push_back(std::move(orphan));
     }
 
     // Batch restore spans chunks, so it needs an ordered cross-chunk index.
@@ -4154,15 +4126,56 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         }
     }
 
-    const auto prev_standby_accounted_memory_bytes =
-        standby_accounted_memory_bytes_;
-    const auto prev_standby_memory_segments = standby_memory_segments_;
-    const auto prev_standby_allocator_keepalive = standby_allocator_keepalive_;
-    const auto prev_invalid_replica_endpoints = invalid_replica_endpoints_;
+    // The memory segments' allocators now belong to their orphans; whatever is
+    // left in restored_allocators backs the restored NoF replicas.
+    for (auto& orphan : orphans) {
+        auto charged =
+            restored_accounted_memory_bytes.find(orphan.info.segment_name);
+        if (charged != restored_accounted_memory_bytes.end()) {
+            orphan.charged_bytes = charged->second;
+        }
+        restored_allocators.erase(orphan.info.transport_endpoint);
+        restored_allocators.erase(orphan.info.segment_name);
+    }
+    // List each orphan's replicas now, while every installed object is known,
+    // so that re-adopting the segment never has to walk the store.
+    {
+        // A replica names its segment by endpoint, or by name for CXL. The
+        // aliases were checked to be unique above.
+        std::unordered_map<std::string, OrphanedSegment*> orphan_by_alias;
+        for (auto& orphan : orphans) {
+            orphan_by_alias.emplace(orphan.info.transport_endpoint, &orphan);
+            orphan_by_alias.emplace(orphan.info.segment_name, &orphan);
+        }
+        for (const auto& [tenant, ref] : installed) {
+            MetadataAccessorRW accessor(this, tenant, ref);
+            if (!accessor.IsPublished()) {
+                continue;
+            }
+            accessor.Get().VisitReplicas(
+                Replica::fn_is_live_memory_replica,
+                [&](const Replica& replica) {
+                    const auto endpoint = replica.transport_endpoint();
+                    if (!endpoint) {
+                        return;
+                    }
+                    auto orphan_it = orphan_by_alias.find(*endpoint);
+                    if (orphan_it != orphan_by_alias.end()) {
+                        orphan_it->second->replicas.push_back(
+                            {tenant, ref, replica.id()});
+                    }
+                });
+        }
+    }
+    const auto unreadable_segments =
+        std::count_if(orphans.begin(), orphans.end(),
+                      [](const auto& orphan) { return !orphan.readable; });
+    const OrphanedSegments prev_orphaned_segments = orphaned_segments_;
+    const auto prev_restored_nof_allocators = restored_nof_allocators_;
 
     // A failed restore leaves nothing behind: installed keys go back out
-    // through the canonical removal, bookkeeping returns to its pre-restore
-    // snapshots, and staged owner sessions in `restore` are discarded on scope
+    // through the canonical removal, the orphans return to their pre-restore
+    // state, and staged owner sessions in `restore` are discarded on scope
     // exit without touching exported metrics. The memory gauges are only
     // swapped in once the restore can no longer fail, so rollback never has to
     // undo a published metric delta.
@@ -4174,18 +4187,16 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                 accessor.Erase();
             }
         }
-        standby_accounted_memory_bytes_ = prev_standby_accounted_memory_bytes;
-        standby_memory_segments_ = prev_standby_memory_segments;
-        standby_allocator_keepalive_ = prev_standby_allocator_keepalive;
-        invalid_replica_endpoints_ = prev_invalid_replica_endpoints;
+        orphaned_segments_ = prev_orphaned_segments;
+        restored_nof_allocators_ = prev_restored_nof_allocators;
         NotifyPolicyRestored();
     };
 
-    standby_accounted_memory_bytes_ =
-        std::move(restored_accounted_memory_bytes);
-    standby_memory_segments_ = std::move(restored_memory_segments);
-    standby_allocator_keepalive_ = std::move(restored_allocators);
-    invalid_replica_endpoints_ = std::move(restored_invalid_endpoints);
+    const auto discarded_charges = orphaned_segments_.Reset(std::move(orphans));
+    restored_nof_allocators_.clear();
+    for (auto& [endpoint, allocator] : restored_allocators) {
+        restored_nof_allocators_.push_back(std::move(allocator));
+    }
 
     if (max_live_id != 0) {
         const ReplicaID desired_next_id = max_live_id + 1;
@@ -4310,11 +4321,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     // fail-closed paths above must stay a no-op for the exported gauges, and
     // the client/snapshot mutexes held here mean no concurrent reader can see
     // the gauge drift between the map swap and this commit.
-    for (const auto& [segment, bytes] : prev_standby_accounted_memory_bytes) {
+    for (const auto& charge : discarded_charges) {
         MasterMetricManager::instance().dec_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
+            charge.segment_name, static_cast<int64_t>(charge.bytes));
     }
-    for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
+    for (const auto& [segment, bytes] : restored_accounted_memory_bytes) {
         MasterMetricManager::instance().inc_allocated_mem_size(
             segment, static_cast<int64_t>(bytes));
     }
@@ -4322,7 +4333,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     LOG(INFO) << "Restored from standby: " << restored_object_count
               << " objects, " << segments.size()
               << " segments, initial_seq_id=" << initial_oplog_sequence_id
-              << ", invalid_endpoints=" << invalid_replica_endpoints_.size()
+              << ", unreadable_segments=" << unreadable_segments
               << ", rejected_objects=" << rejected_count;
     if (dropped_stale_replica_count > 0) {
         LOG(WARNING) << "Restored from standby dropped "
@@ -4582,13 +4593,13 @@ auto MasterService::BatchReplicaClear(
 }
 
 bool MasterService::IsAwaitingRemount(const Replica& replica) const {
-    // The set is empty outside the window between a standby restore and the
-    // owners' remounts, so the endpoint is looked up only inside it.
-    if (invalid_replica_endpoints_.empty()) {
+    // There are no orphans outside the window between a standby restore and
+    // the owners' remounts, so the endpoint is looked up only inside it.
+    if (orphaned_segments_.empty()) {
         return false;
     }
     const auto endpoint = replica.transport_endpoint();
-    return endpoint && invalid_replica_endpoints_.contains(*endpoint);
+    return endpoint && orphaned_segments_.IsUnreadable(*endpoint);
 }
 
 bool MasterService::TryGetReadableReplicaDescriptor(

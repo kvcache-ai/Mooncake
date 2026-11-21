@@ -55,6 +55,7 @@
 #include "rpc_types.h"
 #include "replica.h"
 #include "ha/ha_types.h"
+#include "ha/orphaned_segments.h"
 #include "ha/snapshot/batch_oplog/promotion.h"
 #include "task_manager.h"
 #include "kv_event/kv_event_publisher.h"
@@ -2338,21 +2339,16 @@ class MasterService {
         const std::string& tenant_id, const std::string& key,
         const std::string& payload, DurableFinalizeCallback callback);
 
-    // Standby-restored memory endpoints remain unreadable until the owning
-    // Client has successfully remounted them.
-    std::unordered_set<std::string> invalid_replica_endpoints_;
-
-    // Keep DummyBufferAllocator alive after standby restore.
-    // Key: transport_endpoint, Value: allocator.
-    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
-        standby_allocator_keepalive_;
-    std::vector<StandbySegmentInfo> standby_memory_segments_;
-    std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
+    // Guarded by master_state_mutex_.
+    OrphanedSegments orphaned_segments_;
+    // Keeps the allocators behind restored NoF replicas alive. No remount
+    // adopts them, so they last until the next restore.
+    std::vector<std::shared_ptr<BufferAllocatorBase>> restored_nof_allocators_;
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
-    // True while the replica sits on an endpoint in
-    // invalid_replica_endpoints_. The read path asks only this, never the set.
+    // True while the replica sits on an orphaned segment nobody has
+    // re-adopted yet. The read path asks only this, never orphaned_segments_.
     bool IsAwaitingRemount(const Replica& replica) const;
     bool TryGetReadableReplicaDescriptor(const Replica& replica,
                                          Replica::Descriptor& descriptor) const;
