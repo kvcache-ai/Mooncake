@@ -26,7 +26,10 @@
 #include <vector>
 
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <glog/logging.h>
 
@@ -297,6 +300,47 @@ inline PrefaultResult prefaultPages(void** pages, int n,
     }
 
     return result;
+}
+
+// struct procmap_query and PROCMAP_QUERY (Linux 6.11) from <linux/fs.h>,
+// spelled out so the build does not depend on the installed kernel headers.
+struct ProcmapQuery {
+    uint64_t size;
+    uint64_t query_flags;
+    uint64_t query_addr;
+    uint64_t vma_start;
+    uint64_t vma_end;
+    uint64_t vma_flags;
+    uint64_t vma_page_size;
+    uint64_t vma_offset;
+    uint64_t inode;
+    uint32_t dev_major;
+    uint32_t dev_minor;
+    uint32_t vma_name_size;
+    uint32_t build_id_size;
+    uint64_t vma_name_addr;
+    uint64_t build_id_addr;
+};
+static_assert(sizeof(ProcmapQuery) == 104, "must match struct procmap_query");
+
+// Step size for a NUMA probe of [start, start + len). A HugeTLB page sits on
+// one node, so probing one address per huge page gives the same answer as
+// probing every 4 KiB in it, at a fraction of the move_pages() cost. Use
+// 4 KiB unless the whole range lies in one VMA whose page size PROCMAP_QUERY
+// reports.
+inline size_t probePageSize(const void* start, size_t len) {
+    constexpr size_t kBasePageSize = 4096;
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return kBasePageSize;
+    ProcmapQuery query = {};
+    query.size = sizeof(query);
+    query.query_addr = reinterpret_cast<uintptr_t>(start);
+    int rc = ioctl(fd, _IOWR('f', 17, ProcmapQuery), &query);
+    close(fd);
+    if (rc != 0 || query.vma_page_size <= kBasePageSize ||
+        reinterpret_cast<uintptr_t>(start) + len > query.vma_end)
+        return kBasePageSize;
+    return query.vma_page_size;
 }
 
 // Convenience wrapper: run prefaultPages and log the result.
