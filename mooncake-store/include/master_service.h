@@ -118,6 +118,17 @@ class MasterService {
         std::function<std::unique_ptr<OrderedOpLogWriter>(
             OrderedOpLogWriterConfig, OrderedOpLogWriter::WriteBatchFn)>;
 
+    // Outcome of one death-probe pass over a suspected client's segment
+    // endpoints: kReachable answers, kRefused proves the owner process is
+    // gone, kTimeout is inconclusive (presumed dead only after the failure
+    // threshold) and kNoSegments means the client holds nothing to protect.
+    enum class ClientDeathProbeOutcome {
+        kReachable,
+        kRefused,
+        kTimeout,
+        kNoSegments,
+    };
+
     MasterService();
     MasterService(const MasterServiceConfig& config);
     ~MasterService();
@@ -1930,6 +1941,33 @@ class MasterService {
     // coordination is a session listener, not a session responsibility.
     ClientOffboardingWorker client_offboarding_worker_;
     ClientSessionRegistry client_sessions_;
+
+    // Client death probing: while a client is SUSPECTED (missed heartbeat),
+    // actively probe the transport endpoints of its segments.  An owner that
+    // refuses connections is dead, and one that stops answering is presumed
+    // dead after consecutive timeouts; both cases retire the session
+    // immediately instead of waiting for the full suspicion TTL.
+    struct ClientDeathProbeState {
+        std::vector<std::string> endpoints;
+        bool endpoints_ready{false};
+        std::chrono::steady_clock::time_point next_probe_at{};
+        uint32_t consecutive_failures{0};
+    };
+    void ClientDeathProbeThreadFunc();
+    void ClientDeathProbeRound();
+    ClientDeathProbeOutcome ProbeClientEndpoints(
+        const std::vector<std::string>& endpoints, uint32_t timeout_ms);
+    std::vector<std::string> GetClientSegmentEndpoints(const UUID& client_id);
+    std::mutex client_death_probe_mutex_;
+    std::unordered_map<UUID, ClientDeathProbeState, boost::hash<UUID>>
+        client_death_probes_ GUARDED_BY(client_death_probe_mutex_);
+    std::thread client_death_probe_thread_;
+    std::atomic<bool> client_death_probe_running_{false};
+    static constexpr uint64_t kClientDeathProbeSleepMs = 200;
+    const bool client_death_probe_enable_;
+    const std::chrono::milliseconds client_death_probe_interval_ms_;
+    const std::chrono::milliseconds client_death_probe_timeout_ms_;
+    const uint32_t client_death_probe_failures_threshold_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
     const uint32_t nof_heartbeat_failures_threshold_;

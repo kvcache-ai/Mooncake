@@ -130,6 +130,22 @@ class ClientLivenessRecord {
         return ClientLivenessTransition::NONE;
     }
 
+    // Force-retires a SUSPECTED record, skipping the remaining suspicion
+    // TTL. Publishes the retirement barrier before OFFLINE, exactly like
+    // the TTL-driven path in Evaluate. Returns false when the record is not
+    // SUSPECTED, so callers can treat a false return as "retry later".
+    template <typename ReserveRetirement>
+    [[nodiscard]] bool RetireSuspected(ReserveRetirement&& reserve_retirement) {
+        std::lock_guard<std::mutex> lock(transition_mutex_);
+        if (state_.load(std::memory_order_relaxed) !=
+            ClientLivenessState::SUSPECTED) {
+            return false;
+        }
+        std::forward<ReserveRetirement>(reserve_retirement)();
+        state_.store(ClientLivenessState::OFFLINE, std::memory_order_release);
+        return true;
+    }
+
    private:
     [[nodiscard]] bool IsExpiredLocked(TimePoint now,
                                        Clock::duration active_ttl,

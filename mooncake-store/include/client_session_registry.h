@@ -118,6 +118,18 @@ class ClientSessionRegistry {
     // cleanup has not converged. OFFLINE is itself the barrier: whoever can
     // observe it can also observe this, with no separate reservation.
     bool HasRetiredSession() const;
+    // Snapshots every session currently in the SUSPECTED state, for active
+    // death probing. The shared_ptrs retain the records after the registry
+    // lock is released; callers must revalidate state before acting.
+    std::vector<std::pair<UUID, ClientSessionSharedPtr>> SnapshotSuspected()
+        const;
+    // Force-retires a session that is currently SUSPECTED, skipping the
+    // remaining suspicion TTL. Mirrors the BECAME_OFFLINE branch of
+    // ExpireSessions: clears slot state, then publishes the OFFLINE
+    // transition so the session's listeners run the terminal cleanup.
+    // Returns false when the session is missing or no longer SUSPECTED
+    // (for example, recovered to ACTIVE or already retired).
+    bool ForceRetireSuspected(const UUID& client_id);
     // Drops every session. Only allowed once monitoring and event delivery
     // are stopped.
     void Reset();
