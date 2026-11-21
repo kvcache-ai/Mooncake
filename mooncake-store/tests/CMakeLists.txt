@@ -462,6 +462,8 @@ add_store_test(bucket_direct_write_test bucket_direct_write_test.cpp)
 if(TARGET Mooncake::liburing)
   target_compile_definitions(bucket_direct_write_test PRIVATE USE_URING)
 endif()
+add_store_test(bucket_reclaim_test bucket_reclaim_test.cpp)
+add_store_test(reclaim_query_bench_test reclaim_query_bench_test.cpp)
 add_store_test(bucket_backend_config_test bucket_backend_config_test.cpp)
 add_store_test(file_per_key_config_test file_per_key_config_test.cpp)
 add_store_test(offset_allocator_backend_config_test
