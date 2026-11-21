@@ -12,9 +12,10 @@ pub mod traits;
 pub use nof::{NofBackingReplica, NofBackingRoute, NofBackingRouteFilter};
 
 pub use cold_tier::{
-    ColdBackingReplica, ColdBackingRoute, ColdBackingRouteFilter, ColdBackingState,
-    ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceState, ColdTierDeviceUpdate,
-    ColdTierPutDeviceResult, ColdTierTarget, ColdTierTargetSpec, ColdTierUsageDelta,
+    ColdBackingReplica, ColdBackingRoute, ColdBackingRouteFilter, ColdBackingRoutePage,
+    ColdBackingState, ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceState,
+    ColdTierDeviceUpdate, ColdTierPutDeviceResult, ColdTierTarget, ColdTierTargetSpec,
+    ColdTierUsageDelta,
 };
 pub use compat::{
     CompatibilityDescriptor, ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY,

@@ -96,15 +96,21 @@ impl StorageOwnerState {
             // Global and device-specific sweeps each retain their own position.
             let mut cursors = self.pending_delete_gc_cursors.lock();
             let scope = device_id.map(str::to_string);
-            let routes = self.metadata.as_ref().list_object_routes_by_cold_backing(
-                &mooncake_store_core::ColdBackingRouteFilter {
-                    device_id: scope.clone(),
-                    after_key: cursors.get(&scope).cloned(),
-                    limit: Some(limit),
-                    ..mooncake_store_core::ColdBackingRouteFilter::default()
-                },
+            let filter = mooncake_store_core::ColdBackingRouteFilter {
+                device_id: scope.clone(),
+                // Periodic GC only visits pending-delete entries. Device-scoped
+                // cleanup also handles Deleting + Materialized routes.
+                state: scope
+                    .is_none()
+                    .then_some(mooncake_store_core::ColdBackingState::PendingDelete),
+                ..Default::default()
+            };
+            let page = self.metadata.scan_object_routes_by_cold_backing(
+                &filter,
+                cursors.get(&scope).map(String::as_str),
+                limit,
             )?;
-            let exhausted = routes.len() < limit;
+            let routes = page.routes;
             let mut result = PendingDeleteGcResult::default();
             let mut live_foreign_owners = BTreeSet::new();
             for listed_route in routes {
@@ -112,9 +118,6 @@ impl StorageOwnerState {
                     break;
                 }
                 result.scanned_routes = result.scanned_routes.saturating_add(1);
-                // Advance even when this entry is deferred or its reclaim fails.
-                // Update per entry so an error cannot skip the rest of the page.
-                cursors.insert(scope.clone(), listed_route.key.clone());
                 let Some(listed_backing) = listed_route.cold_backing.as_ref() else {
                     continue;
                 };
@@ -137,7 +140,10 @@ impl StorageOwnerState {
                 }
                 self.reclaim_pending_delete_cold_route(&listed_route, listed_backing, &mut result)?;
             }
-            if exhausted {
+            // Retain the old position on error so the rest of the page is retried.
+            if let Some(next) = page.next_cursor {
+                cursors.insert(scope, next);
+            } else {
                 cursors.remove(&scope);
             }
             Ok(result)

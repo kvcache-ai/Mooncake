@@ -5,11 +5,12 @@ use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
     ColdBackingRouteFilter, ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceUpdate,
     ColdTierPutDeviceResult, ColdTierUsageDelta, HandoffPlan, LogicalObjectId, MetadataBackend,
-    NamespaceScope, ObjectKey, ObjectRoute, Result, ReuseIdentity, RoutePolicy, RoutePolicyDomain,
-    RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
-    StoreError, TenantObjectAccounting, TenantPolicy, TenantPolicyScope, TenantQuotaAbortOutcome,
-    TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest, TenantQuotaReservation,
-    TenantQuotaReservationOutcome, TenantQuotaReservationRequest, TenantQuotaState,
+    NamespaceScope, NofBackingRouteFilter, ObjectKey, ObjectRoute, Result, ReuseIdentity,
+    RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
+    SegmentName, SegmentReservation, StoreError, TenantObjectAccounting, TenantPolicy,
+    TenantPolicyScope, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
+    TenantQuotaFinalizeRequest, TenantQuotaReservation, TenantQuotaReservationOutcome,
+    TenantQuotaReservationRequest, TenantQuotaState,
 };
 
 use super::registry;
@@ -240,6 +241,27 @@ impl MetadataBackend for ObservedMetadataBackend {
     ) -> Result<Vec<ObjectRoute>> {
         self.observe("list_object_routes_by_cold_backing", || {
             self.inner.list_object_routes_by_cold_backing(filter)
+        })
+    }
+
+    fn list_object_routes_by_nof_backing(
+        &self,
+        filter: &NofBackingRouteFilter,
+    ) -> Result<Vec<ObjectRoute>> {
+        self.observe("list_object_routes_by_nof_backing", || {
+            self.inner.list_object_routes_by_nof_backing(filter)
+        })
+    }
+
+    fn scan_object_routes_by_cold_backing(
+        &self,
+        filter: &ColdBackingRouteFilter,
+        cursor: Option<&str>,
+        max_candidates: usize,
+    ) -> Result<mooncake_store_core::ColdBackingRoutePage> {
+        self.observe("scan_object_routes_by_cold_backing", || {
+            self.inner
+                .scan_object_routes_by_cold_backing(filter, cursor, max_candidates)
         })
     }
 
