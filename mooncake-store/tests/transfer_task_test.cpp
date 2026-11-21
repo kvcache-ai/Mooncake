@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "types.h"
+#include "config.h"
 #include "pinned_buffer_pool.h"
 #if defined(USE_CUDA) || defined(MOONCAKE_TEST_CUDA_H2D)
 #include <cuda_runtime_api.h>
@@ -719,6 +720,79 @@ TEST_F(TransferTaskTest, RemoteTransferWaitCompletesCorrectly) {
     EXPECT_EQ(client.unregisterLocalMemory(local.data()), 0);
     EXPECT_EQ(server.unregisterLocalMemory(remote.data()), 0);
 }
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+struct CompletionWaitProbeResult {
+    int64_t elapsed_ms;
+    ErrorCode error;
+};
+
+CompletionWaitProbeResult RunCompletionWaitProbe(
+    bool counter_eligible, int64_t slice_timeout,
+    bool notify_batch_immediately) {
+    TransferEngine engine(false);
+    if (engine.init("P2PHANDSHAKE", "127.0.0.1:0", "", 0, "tcp") != 0) {
+        throw std::runtime_error("could not initialize completion-wait probe");
+    }
+    auto* batch = new Transport::BatchDesc{};
+    batch->batch_size = 1;
+    batch->counter_eligible = counter_eligible;
+    batch->task_list.resize(1);
+    const BatchID batch_id = reinterpret_cast<BatchID>(batch);
+    auto& task = batch->task_list[0];
+    task.batch_id = batch_id;
+    task.slice_count = 1;
+    auto state =
+        std::make_shared<TransferEngineOperationState>(engine, batch_id, 1);
+
+    const int64_t previous_timeout = globalConfig().slice_timeout;
+    globalConfig().slice_timeout = slice_timeout;
+    std::thread notifier([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        __atomic_store_n(&task.success_slice_count, 1, __ATOMIC_RELEASE);
+        if (!notify_batch_immediately) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(950));
+        }
+        {
+            std::lock_guard<std::mutex> lock(batch->completion_mutex);
+            batch->is_finished.store(true, std::memory_order_release);
+        }
+        batch->completion_cv.notify_all();
+    });
+
+    const auto start = std::chrono::steady_clock::now();
+    state->wait_for_completion();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+    notifier.join();
+    globalConfig().slice_timeout = previous_timeout;
+    const auto error = state->get_result();
+    state.reset();
+    if (engine.freeEngine() != 0) {
+        throw std::runtime_error("could not release completion-wait probe");
+    }
+    return {elapsed, error};
+}
+
+TEST_F(TransferTaskTest, PollOnlyBatchUsesStatusPollingInsteadOfEventWait) {
+    const auto result = RunCompletionWaitProbe(false, 0, false);
+    EXPECT_EQ(result.error, ErrorCode::OK);
+    EXPECT_LT(result.elapsed_ms, 500);
+}
+
+TEST_F(TransferTaskTest, SliceTimeoutBatchUsesStatusPollingInsteadOfEventWait) {
+    const auto result = RunCompletionWaitProbe(true, 1, false);
+    EXPECT_EQ(result.error, ErrorCode::OK);
+    EXPECT_LT(result.elapsed_ms, 500);
+}
+
+TEST_F(TransferTaskTest, EventEligibleBatchWakesOnCompletionNotification) {
+    const auto result = RunCompletionWaitProbe(true, 0, true);
+    EXPECT_EQ(result.error, ErrorCode::OK);
+    EXPECT_LT(result.elapsed_ms, 500);
+}
+#endif
 
 // Test TransferStrategy enum and stream operator
 TEST_F(TransferTaskTest, TransferStrategyEnum) {
