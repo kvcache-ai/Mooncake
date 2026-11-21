@@ -324,43 +324,19 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
             slice_dev_ids.push_back(c.dev_id);
         }
     } else {
-        // Normal mode: weighted distribution based on inverse score
-        // Lower score → higher weight → more slices
-        double total_weight = 0.0;
-        double max_weight = -1.0;
-        int best_dev_idx = -1;
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            double w =
-                1.0 / (candidates[i].score + sched_params_.score_epsilon);
-            total_weight += w;
-            if (w > max_weight) {
-                max_weight = w;
-                best_dev_idx = static_cast<int>(i);
-            }
-        }
-        if (best_dev_idx == -1 || num_slices == 0 || total_weight <= 0.0)
-            return;
-        uint32_t remaining_slices = num_slices;
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            double w =
-                1.0 / (candidates[i].score + sched_params_.score_epsilon);
-            uint32_t assigned =
-                static_cast<uint32_t>((w / total_weight) * num_slices);
-            if (assigned > 0) {
-                if (assigned > remaining_slices) assigned = remaining_slices;
-                remaining_slices -= assigned;
-                const Candidate& c = candidates[i];
-                for (uint32_t s = 0; s < assigned; ++s) {
-                    slice_dev_ids.push_back(c.dev_id);
-                }
-            }
-        }
-        if (remaining_slices > 0) {
-            const Candidate& c = candidates[best_dev_idx];
-            for (uint32_t s = 0; s < remaining_slices; ++s) {
-                slice_dev_ids.push_back(c.dev_id);
-            }
-        }
+        // Normal mode: slices in proportion to inverse score (lower score,
+        // more slices), rounded by largest remainder so that equal devices
+        // split evenly; each device's slices form one run, in candidate
+        // order.
+        std::vector<double> weights;
+        weights.reserve(candidates.size());
+        for (const Candidate& c : candidates)
+            weights.push_back(1.0 / (c.score + sched_params_.score_epsilon));
+        const std::vector<uint32_t> counts =
+            apportionSlices(weights, num_slices);
+        for (size_t i = 0; i < candidates.size(); ++i)
+            slice_dev_ids.insert(slice_dev_ids.end(), counts[i],
+                                 candidates[i].dev_id);
     }
     // Charge each device what its slices actually carry, in the caller's
     // slice order, so release() (which returns the slice's length) balances

@@ -21,7 +21,11 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
+#include <cstddef>
+#include <limits>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <utility>
 #include <algorithm>
@@ -395,6 +399,104 @@ TEST(DeviceSelectorTransmitTest, MultiPathChargesActualSliceBytes) {
     }
     EXPECT_EQ(sel.getInflightBytes(0), 0u);
     EXPECT_EQ(sel.getInflightBytes(1), 0u);
+}
+
+// Two identical NICs get half of a request each. Scores carry a few
+// nanoseconds of random jitter, so they are almost never exactly equal; with
+// both shares floored and every leftover slice handed to the best NIC, 32
+// slices split 17/15. A link-limited model predicts about 6% longer completion
+// than an even split because the NIC with 17 slices finishes last.
+TEST(DeviceSelectorMultiPathTest, EqualDevicesSplitEvenlyDespiteJitter) {
+    auto sel = makeTwoNicSelector();
+    const uint64_t block = 2 * kMiB;
+    for (uint32_t slices : {16u, 32u}) {
+        for (int round = 0; round < 200; ++round) {
+            std::vector<int> ids;
+            ASSERT_TRUE(sel->allocate(slices * block, slices, block, "cpu:0",
+                                      ids, PRIO_HIGH, ~0ULL)
+                            .ok());
+            ASSERT_EQ(ids.size(), slices);
+            EXPECT_EQ(std::count(ids.begin(), ids.end(), kDev0),
+                      static_cast<std::ptrdiff_t>(slices / 2))
+                << slices << " slices, round " << round;
+            // No latency sample, so nothing is learned between rounds.
+            for (int id : ids) ASSERT_TRUE(sel->release(id, block, 0.0).ok());
+        }
+    }
+}
+
+// Each device's slices form one run: the slices that rounding leaves over
+// belong to their device's run instead of trailing the other devices'. A
+// probe call (one multi-slice allocation in 100 per thread) alternates
+// devices, so one round in these 50 may interleave.
+TEST(DeviceSelectorMultiPathTest, EachDeviceGetsOneRun) {
+    auto sel = makeTwoNicSelector();
+    const uint64_t block = 2 * kMiB;
+    int interleaved = 0;
+    for (int round = 0; round < 50; ++round) {
+        std::vector<int> ids;
+        ASSERT_TRUE(
+            sel->allocate(32 * block, 32, block, "cpu:0", ids, PRIO_HIGH, ~0ULL)
+                .ok());
+        int changes = 0;
+        for (size_t i = 1; i < ids.size(); ++i) changes += ids[i] != ids[i - 1];
+        if (changes > 1) ++interleaved;
+        for (int id : ids) ASSERT_TRUE(sel->release(id, block, 0.0).ok());
+    }
+    EXPECT_LE(interleaved, 1);
+}
+
+TEST(ApportionSlicesTest, LeftoverGoesToTheLargestFraction) {
+    // Exact shares 19.2 and 12.8: the one slice flooring leaves goes to 12.8.
+    EXPECT_EQ(apportionSlices({0.6, 0.4}, 32), (std::vector<uint32_t>{19, 13}));
+}
+
+TEST(ApportionSlicesTest, NearlyEqualWeightsSplitEvenly) {
+    for (int n_dev : {2, 4, 8}) {
+        std::vector<double> weights;
+        for (int i = 0; i < n_dev; ++i)
+            weights.push_back(i % 2 ? 1.0 + 1e-9 : 1.0 - 1e-9);
+        EXPECT_EQ(apportionSlices(weights, 32),
+                  std::vector<uint32_t>(n_dev, 32 / n_dev))
+            << n_dev << " devices";
+    }
+}
+
+TEST(ApportionSlicesTest, EveryCountIsWithinOneSliceOfItsShare) {
+    std::mt19937 rng(4362);
+    std::uniform_real_distribution<double> draw(0.01, 10.0);
+    for (int trial = 0; trial < 2000; ++trial) {
+        const size_t n_dev = 1 + trial % 8;
+        const uint32_t n = 1 + trial % 64;
+        std::vector<double> weights(n_dev);
+        double total = 0.0;
+        for (double& w : weights) total += (w = draw(rng));
+        const std::vector<uint32_t> counts = apportionSlices(weights, n);
+        ASSERT_EQ(counts.size(), n_dev);
+        uint32_t sum = 0;
+        for (size_t i = 0; i < n_dev; ++i) {
+            sum += counts[i];
+            EXPECT_LT(std::abs(counts[i] - weights[i] / total * n), 1.0)
+                << "trial " << trial << ", candidate " << i;
+        }
+        EXPECT_EQ(sum, n) << "trial " << trial;
+    }
+}
+
+TEST(ApportionSlicesTest, TiesFavourTheEarlierCandidate) {
+    EXPECT_EQ(apportionSlices({1.0, 1.0, 1.0}, 4),
+              (std::vector<uint32_t>{2, 1, 1}));
+}
+
+TEST(ApportionSlicesTest, WeightsThatCannotCountGetNothing) {
+    const double inf = std::numeric_limits<double>::infinity();
+    EXPECT_TRUE(apportionSlices({}, 8).empty());
+    EXPECT_EQ(apportionSlices({1.0, 2.0}, 0), (std::vector<uint32_t>{0, 0}));
+    EXPECT_EQ(apportionSlices({0.0, -1.0}, 8), (std::vector<uint32_t>{0, 0}));
+    EXPECT_EQ(apportionSlices({1.0, 0.0}, 8), (std::vector<uint32_t>{8, 0}));
+    EXPECT_EQ(apportionSlices({std::nan(""), 1.0}, 5),
+              (std::vector<uint32_t>{0, 5}));
+    EXPECT_EQ(apportionSlices({inf, 1.0}, 5), (std::vector<uint32_t>{0, 5}));
 }
 
 // A learning rate is a weight on the old value; anything outside [0, 1]
