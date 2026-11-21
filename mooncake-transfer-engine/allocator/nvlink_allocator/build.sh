@@ -2,7 +2,7 @@
 
 set -e
 
-source "$(dirname "$(readlink -f "$0")")/../scripts/allocator_build_common.sh"
+source "$(dirname "$(readlink -f "$0")")/../../scripts/allocator_build_common.sh"
 
 # Check for flags
 USE_NVCC=false
