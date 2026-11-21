@@ -93,6 +93,9 @@ class Transport {
             "allocateSubBatch not implemented" LOC_MARK);
     }
 
+    // Success releases the sub-batch and clears `batch`. On failure, any
+    // unreleased sub-batch must remain valid and `batch` must remain suitable
+    // for a later retry instead of invalidating or deallocating it.
     virtual Status freeSubBatch(SubBatchRef& batch) {
         return Status::NotImplemented("freeSubBatch not implemented" LOC_MARK);
     }
