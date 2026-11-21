@@ -347,6 +347,9 @@ struct TransferOperationMetric {
           read_op_latency_us("mooncake_transfer_read_operation_latency",
                              "Read operation latency by interface type (us)",
                              kLatencyBucket, labels, op_names),
+          read_item_count("mooncake_transfer_read_item_count",
+                          "Batch read results by interface and final outcome",
+                          labels, {"op_name", "outcome"}),
           write_op_count("mooncake_transfer_write_operation_count",
                          "Total write operations by interface type", labels,
                          op_names),
@@ -360,6 +363,7 @@ struct TransferOperationMetric {
     ylt::metric::hybrid_counter_1t read_op_count;
     ylt::metric::hybrid_counter_1t read_op_bytes;
     ylt::metric::hybrid_histogram_1t read_op_latency_us;
+    ylt::metric::hybrid_counter_2t read_item_count;
     ylt::metric::hybrid_counter_1t write_op_count;
     ylt::metric::hybrid_counter_1t write_op_bytes;
     ylt::metric::hybrid_histogram_1t write_op_latency_us;
@@ -387,10 +391,41 @@ struct TransferOperationMetric {
         }
     }
 
+    // One result per key position, not one operation or transfer-engine task.
+    // A nonnegative byte receipt is successful even if the destination
+    // capacity was larger than the object.
+    template <typename Receipt>
+    void ObserveReadItemResults(const std::string& op_name,
+                                const std::vector<Receipt>& results,
+                                int32_t not_found_result) {
+        int64_t success = 0;
+        int64_t not_found = 0;
+        int64_t error = 0;
+        for (auto result : results) {
+            if (result >= 0) {
+                ++success;
+            } else if (result == not_found_result) {
+                ++not_found;
+            } else {
+                ++error;
+            }
+        }
+        if (success > 0) {
+            read_item_count.inc({op_name, "success"}, success);
+        }
+        if (not_found > 0) {
+            read_item_count.inc({op_name, "not_found"}, not_found);
+        }
+        if (error > 0) {
+            read_item_count.inc({op_name, "error"}, error);
+        }
+    }
+
     void serialize(std::string& str) {
         read_op_count.serialize(str);
         read_op_bytes.serialize(str);
         read_op_latency_us.serialize(str);
+        read_item_count.serialize(str);
         write_op_count.serialize(str);
         write_op_bytes.serialize(str);
         write_op_latency_us.serialize(str);
@@ -406,6 +441,25 @@ struct TransferOperationMetric {
         ss << format_operation_group_summary(
             "Write Interfaces", snapshot_operations(observed_write_ops_),
             write_op_count, write_op_bytes, write_op_latency_us);
+        // The dummy client reports periodically through this summary, even
+        // when a batch has no successful bytes and no operation observation.
+        bool read_items_seen = false;
+        for (const std::string op :
+             {"batch_get_into", "batch_get_into_multi_buffers",
+              "batch_get_into_cuda_ipc"}) {
+            const auto success = read_item_count.value({op, "success"});
+            const auto not_found = read_item_count.value({op, "not_found"});
+            const auto error = read_item_count.value({op, "error"});
+            if (success == 0 && not_found == 0 && error == 0) {
+                continue;
+            }
+            if (!read_items_seen) {
+                ss << "\nBatch Read Items:\n";
+                read_items_seen = true;
+            }
+            ss << "  " << op << ": success=" << success
+               << ", not_found=" << not_found << ", error=" << error << "\n";
+        }
         return ss.str();
     }
 

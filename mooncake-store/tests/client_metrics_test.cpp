@@ -272,6 +272,46 @@ TEST_F(ClientMetricsTest, CompareWithSerializedMetrics) {
                 summary.find("No data") != std::string::npos);
 }
 
+TEST_F(ClientMetricsTest, BatchReadItemMetricsCountFinalReceipts) {
+    TransferOperationMetric metrics({{"client_mode", "dummy"}});
+    const int not_found = toInt(ErrorCode::OBJECT_NOT_FOUND);
+    const int error = toInt(ErrorCode::INTERNAL_ERROR);
+    const std::vector<int64_t> mixed = {4096, 2048, 0, not_found, error};
+    metrics.ObserveReadItemResults("batch_get_into", mixed, not_found);
+    metrics.ObserveReadItemResults("batch_get_into",
+                                   std::vector<int64_t>{not_found}, not_found);
+    metrics.ObserveReadItemResults("batch_get_into_multi_buffers",
+                                   std::vector<int>{not_found, error},
+                                   not_found);
+    metrics.ObserveReadItemResults("batch_get_into_cuda_ipc",
+                                   std::vector<int64_t>{}, not_found);
+    EXPECT_EQ(metrics.read_item_count.value({"batch_get_into", "success"}), 3);
+    EXPECT_EQ(metrics.read_item_count.value({"batch_get_into", "not_found"}),
+              2);
+    EXPECT_EQ(metrics.read_item_count.value({"batch_get_into", "error"}), 1);
+    EXPECT_EQ(metrics.read_item_count.value(
+                  {"batch_get_into_multi_buffers", "not_found"}),
+              1);
+    EXPECT_EQ(metrics.read_item_count.value(
+                  {"batch_get_into_multi_buffers", "error"}),
+              1);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+    EXPECT_NE(serialized.find(
+                  "mooncake_transfer_read_item_count{client_mode=\"dummy\","
+                  "op_name=\"batch_get_into\",outcome=\"success\"} 3"),
+              std::string::npos);
+    EXPECT_EQ(serialized.find("batch_get_into_cuda_ipc"), std::string::npos);
+    const auto summary = metrics.summary_metrics();
+    EXPECT_NE(summary.find("batch_get_into: success=3, not_found=2, error=1"),
+              std::string::npos);
+    EXPECT_NE(
+        summary.find(
+            "batch_get_into_multi_buffers: success=0, not_found=1, error=1"),
+        std::string::npos);
+}
+
 TEST_F(ClientMetricsTest, HybridHistogramSerializesEachLabelOnce) {
     ylt::metric::hybrid_histogram_1t histogram(
         "request_latency", "Request latency", {10.0, 20.0}, {}, {"route"});
@@ -519,6 +559,73 @@ TEST_F(ClientMetricsTest, HttpMetricsEndpointsReturnData) {
     EXPECT_EQ(summary.status, 200);
     EXPECT_NE(summary.body.find("Client Metrics Summary"), std::string::npos);
 
+    EXPECT_EQ(client->tearDownAll(), 0);
+}
+
+TEST_F(ClientMetricsTest, BatchReadItemMetricsExposeNativeReadResults) {
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_http_metadata_port(0)
+                                 .build()));
+    std::unordered_set<int> used_ports;
+    const int http_port = GetTestPort(used_ports);
+    const int client_port = GetTestPort(used_ports);
+    ASSERT_GT(http_port, 0);
+    ASSERT_GT(client_port, 0);
+    auto client = RealClient::create();
+    ASSERT_TRUE(SetupClientWithHttp(
+                    client, "127.0.0.1:" + std::to_string(client_port),
+                    master.master_address(), true, http_port, 16 * 1024 * 1024)
+                    .has_value());
+
+    std::vector<char> buffer(1024, 'x');
+    ASSERT_EQ(client->register_buffer(buffer.data(), buffer.size()), 0);
+    ASSERT_EQ(client->put_from("present", buffer.data(), 64), 0);
+    const int not_found = toInt(ErrorCode::OBJECT_NOT_FOUND);
+    const int invalid = toInt(ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(client->batch_get_into({"present", "missing", "present"},
+                                     {buffer.data() + 128, buffer.data() + 256,
+                                      buffer.data() + 640},
+                                     {128, 128, 32}),
+              (std::vector<int64_t>{64, not_found, invalid}));
+    EXPECT_EQ(client->batch_get_into({"missing"}, {buffer.data() + 256}, {128}),
+              (std::vector<int64_t>{not_found}));
+    EXPECT_EQ(client->batch_get_into_multi_buffers(
+                  {"present", "missing"},
+                  {{buffer.data() + 384, buffer.data() + 448},
+                   {buffer.data() + 512, buffer.data() + 576}},
+                  {{32, 32}, {32, 32}}, false),
+              (std::vector<int>{64, not_found}));
+    // The Classic multi-buffer transfer currently rejects this size mismatch.
+    // Count its final failure, rather than inferring success from object size.
+    EXPECT_EQ(client->batch_get_into_multi_buffers(
+                  {"present"}, {{buffer.data() + 704, buffer.data() + 768}},
+                  {{64, 64}}, false),
+              (std::vector<int>{toInt(ErrorCode::TRANSFER_FAIL)}));
+
+    const auto metrics =
+        FetchUrl("http://127.0.0.1:" + std::to_string(http_port) + "/metrics");
+    ASSERT_EQ(metrics.status, 200);
+    auto sample_value = [&](const std::string& op,
+                            const std::string& outcome) -> int64_t {
+        std::istringstream lines(metrics.body);
+        std::string line;
+        while (std::getline(lines, line)) {
+            if (line.starts_with("mooncake_transfer_read_item_count{") &&
+                line.find("op_name=\"" + op + "\"") != std::string::npos &&
+                line.find("outcome=\"" + outcome + "\"") != std::string::npos) {
+                return std::stoll(line.substr(line.rfind('}') + 1));
+            }
+        }
+        return int64_t{-1};
+    };
+    EXPECT_EQ(sample_value("batch_get_into", "success"), 1);
+    EXPECT_EQ(sample_value("batch_get_into", "not_found"), 2);
+    EXPECT_EQ(sample_value("batch_get_into", "error"), 1);
+    EXPECT_EQ(sample_value("batch_get_into_multi_buffers", "success"), 1);
+    EXPECT_EQ(sample_value("batch_get_into_multi_buffers", "not_found"), 1);
+    EXPECT_EQ(sample_value("batch_get_into_multi_buffers", "error"), 1);
+    EXPECT_EQ(client->unregister_buffer(buffer.data()), 0);
     EXPECT_EQ(client->tearDownAll(), 0);
 }
 
