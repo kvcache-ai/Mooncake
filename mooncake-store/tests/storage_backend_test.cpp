@@ -28,6 +28,9 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 #include <ylt/util/tl/expected.hpp>
 
@@ -7620,6 +7623,391 @@ TEST_F(StorageBackendTest, BucketIndexGrowthPreservesRollbackAndRecovery) {
     EXPECT_EQ(recovered.GetStoreMetadata()->total_keys, 0);
     ASSERT_TRUE(recovered.BatchOffload(make_batch(0), nullptr));
     EXPECT_EQ(recovered.GetStoreMetadata()->total_keys, keys_per_bucket);
+}
+
+TEST_F(StorageBackendTest, StreamRollbackKeepsAccountingWhenUnlinkFails) {
+    auto root = fs::path(data_path) / "rollback-permissions";
+    fs::create_directory(root);
+    fs::permissions(root, fs::perms::all);
+    ASSERT_EXIT(
+        ([&] {
+            // Drop root privileges so directory permissions cause real EACCES.
+            if (geteuid() == 0 && seteuid(65534) != 0) _exit(2);
+            for (bool key_limit : {false, true}) {
+                FileStorageConfig config;
+                config.storage_filepath = root.string();
+                config.total_keys_limit = key_limit ? 0 : 100;
+                config.total_size_limit = key_limit ? 1024 * 1024 : 1;
+                FilePerKeyConfig file_config;
+                file_config.fsdir = key_limit ? "key-limit" : "byte-limit";
+                file_config.enable_eviction = false;
+                StorageBackendAdaptor backend(config, file_config);
+                if (!backend.Init() || !backend.ScanMeta(NoopCompleteHandler()))
+                    _exit(3);
+                const std::string key = "rejected-stream";
+                const std::string payload(4096, 'r');
+                auto path = FileUtil::ResolvePathFromKey(
+                    key, config.storage_filepath, file_config.fsdir);
+                auto result = backend.OffloadStream(
+                    key, payload.size(),
+                    [&](int fd, uint64_t offset,
+                        uint64_t) -> tl::expected<void, ErrorCode> {
+                        if (pwrite(fd, payload.data(), payload.size(),
+                                   offset) !=
+                            static_cast<ssize_t>(payload.size()))
+                            return tl::make_unexpected(
+                                ErrorCode::FILE_WRITE_FAIL);
+                        return {};
+                    },
+                    [&](const auto&, auto&) {
+                        fs::permissions(
+                            fs::path(path).parent_path(),
+                            fs::perms::owner_read | fs::perms::owner_exec);
+                        return ErrorCode::INVALID_PARAMS;
+                    });
+                fs::permissions(fs::path(path).parent_path(),
+                                fs::perms::owner_all);
+                if (result || result.error() != ErrorCode::INVALID_PARAMS ||
+                    !backend.IsExist(key).value_or(false) ||
+                    backend.IsEnableOffloading().value_or(true)) {
+                    fprintf(stderr, "rollback lost %s accounting\n",
+                            key_limit ? "object count" : "byte count");
+                    _exit(4);
+                }
+            }
+            _exit(0);
+        }()),
+        ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(StorageBackendTest, StreamFailureCheckpointsCommittedEvictions) {
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig backend_config;
+    backend_config.eviction_policy = OffsetEvictionPolicy::FIFO;
+    backend_config.persist_mode = OffsetPersistMode::kStrict;
+    std::vector<std::string> evicted;
+    {
+        OffsetAllocatorStorageBackend backend(config, backend_config);
+        ASSERT_TRUE(backend.Init());
+        std::vector<std::unique_ptr<char[]>> buffers;
+        for (const auto& key : {"victim-a", "victim-b", "victim-c"}) {
+            auto batch =
+                MakeSingleKeyBatch(key, std::string(4096, 'v'), buffers);
+            ASSERT_TRUE(backend.BatchOffload(batch, NoopCompleteHandler(),
+                                             AcceptAllEvictionHandler()));
+        }
+        backend.SetSkipFinalCheckpointForTest();
+        bool published = false;
+        auto result = backend.OffloadStream(
+            "failed-stream", 48 * 1024,
+            [](int, uint64_t, uint64_t) -> tl::expected<void, ErrorCode> {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            },
+            [&](const auto&, auto&) {
+                published = true;
+                return ErrorCode::OK;
+            },
+            [&](const std::vector<std::string>& keys)
+                -> tl::expected<void, ErrorCode> {
+                evicted.insert(evicted.end(), keys.begin(), keys.end());
+                return {};
+            });
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        EXPECT_FALSE(published);
+        ASSERT_EQ(evicted.size(), 3U);
+        for (const auto& key : evicted) EXPECT_FALSE(*backend.IsExist(key));
+    }
+    OffsetAllocatorStorageBackend recovered(config, backend_config);
+    ASSERT_TRUE(recovered.Init());
+    for (const auto& key : evicted)
+        EXPECT_FALSE(*recovered.IsExist(key)) << key;
+    EXPECT_FALSE(*recovered.IsExist("failed-stream"));
+}
+
+TEST_F(StorageBackendTest, StreamRecoveryCleansOrphansWithoutEviction) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "stream-recovery";
+    backend_config.enable_eviction = false;
+    const std::string value = "committed-value";
+    {
+        StorageBackendAdaptor backend(config, backend_config);
+        ASSERT_TRUE(backend.Init());
+        ASSERT_TRUE(backend.ScanMeta(NoopCompleteHandler()));
+        ASSERT_TRUE(backend.OffloadStream(
+            "committed", value.size(),
+            [&](int fd, uint64_t offset,
+                uint64_t size) -> tl::expected<void, ErrorCode> {
+                if (pwrite(fd, value.data(), size, offset) !=
+                    static_cast<ssize_t>(size))
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                return {};
+            },
+            NoopCompleteHandler()));
+    }
+    const auto temporary = fs::path(data_path) / backend_config.fsdir /
+                           ".streaming" / "interrupted";
+    fs::create_directories(temporary.parent_path());
+    std::ofstream(temporary) << "partial-payload";
+    StorageBackendAdaptor recovered(config, backend_config);
+    ASSERT_TRUE(recovered.Init());
+    ASSERT_TRUE(recovered.ScanMeta(NoopCompleteHandler()));
+    EXPECT_FALSE(fs::exists(temporary));
+    EXPECT_FALSE(*recovered.IsExist("interrupted"));
+    std::string output(value.size(), '\0');
+    std::unordered_map<std::string, Slice> reads{
+        {"committed", {output.data(), output.size()}}};
+    ASSERT_TRUE(recovered.BatchLoad(reads));
+    EXPECT_EQ(output, value);
+}
+
+TEST_F(StorageBackendTest, StreamReportsWriteErrnoToDiskObserver) {
+    ASSERT_EXIT(
+        ([&] {
+            FileStorageConfig config;
+            config.storage_filepath = data_path;
+            BucketStorageBackend backend(config, BucketBackendConfig{});
+            if (!backend.Init()) _exit(1);
+            std::vector<std::pair<int, std::string>> reported;
+            backend.SetDiskErrorObserver([&](int err, const char* op) {
+                reported.emplace_back(err, op);
+            });
+            struct rlimit limit;
+            if (getrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(2);
+            limit.rlim_cur = 0;
+            signal(SIGXFSZ, SIG_IGN);
+            if (setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(3);
+            bool writer_called = false;
+            auto result = backend.OffloadStream(
+                "write-failure", 4096,
+                [&](int, uint64_t, uint64_t) -> tl::expected<void, ErrorCode> {
+                    writer_called = true;
+                    return {};
+                },
+                NoopCompleteHandler());
+            const bool observed = reported.size() == 1 &&
+                                  reported[0].first == EFBIG &&
+                                  reported[0].second == "pwrite";
+            _exit(!result && !writer_called && observed ? 0 : 4);
+        }()),
+        ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(StorageBackendTest, StreamReportsSyncErrnoButNotWriterCancellation) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, BucketBackendConfig{});
+    ASSERT_TRUE(backend.Init());
+    std::vector<std::pair<int, std::string>> reported;
+    backend.SetDiskErrorObserver(
+        [&](int err, const char* op) { reported.emplace_back(err, op); });
+    auto result = backend.OffloadStream(
+        "sync-failure", 4096,
+        [](int fd, uint64_t, uint64_t) -> tl::expected<void, ErrorCode> {
+            EXPECT_EQ(close(fd), 0);
+            return {};
+        },
+        NoopCompleteHandler());
+    ASSERT_FALSE(result);
+    EXPECT_EQ(reported.size(), 1U);
+    if (reported.size() == 1) {
+        EXPECT_EQ(reported[0], std::make_pair(EBADF, std::string("fdatasync")));
+    }
+    reported.clear();
+    auto cancelled = backend.OffloadStream(
+        "cancelled-stream", 4096,
+        [](int, uint64_t, uint64_t) -> tl::expected<void, ErrorCode> {
+            errno = EIO;
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        },
+        NoopCompleteHandler());
+    ASSERT_FALSE(cancelled);
+    EXPECT_TRUE(reported.empty());
+}
+
+TEST_F(StorageBackendTest, StreamWriteNativeFormatsRecoveryAndCancellation) {
+    constexpr uint64_t size = 5 * 1024 * 1024 + 37;
+    for (int kind = 0; kind != 4; ++kind) {
+        SCOPED_TRACE(kind);
+        FileStorageConfig cfg;
+        cfg.storage_filepath = data_path + "/stream-" + std::to_string(kind);
+        cfg.total_size_limit = 32 * 1024 * 1024;
+        cfg.total_keys_limit = 100;
+        FilePerKeyConfig per_key;
+        per_key.fsdir = "stream";
+        per_key.enable_eviction = true;
+        OffsetAllocatorBackendConfig offset_cfg;
+        offset_cfg.persist_mode = OffsetPersistMode::kStrict;
+        offset_cfg.enable_record_crc = true;
+        auto make = [&]() -> std::unique_ptr<StorageBackendInterface> {
+            if (kind == 0)
+                return std::make_unique<StorageBackendAdaptor>(cfg, per_key);
+            if (kind == 1 || kind == 3) {
+                BucketBackendConfig bucket_cfg;
+                bucket_cfg.aligned_direct_write = kind == 3;
+                return std::make_unique<BucketStorageBackend>(cfg, bucket_cfg);
+            }
+            return std::make_unique<OffsetAllocatorStorageBackend>(cfg,
+                                                                   offset_cfg);
+        };
+        auto complete = [](const auto&, auto&) { return ErrorCode::OK; };
+        auto scan = [&](StorageBackendInterface& backend) {
+            return backend.ScanMeta(complete);
+        };
+        auto backend = make();
+        ASSERT_TRUE(backend->Init());
+        ASSERT_TRUE(scan(*backend));
+        size_t calls = 0;
+        auto writer = [&](int fd, uint64_t offset,
+                          uint64_t count) -> tl::expected<void, ErrorCode> {
+            ++calls;
+            EXPECT_EQ(count, size);
+            std::array<char, 64 * 1024> chunk;
+            chunk.fill('q');
+            for (uint64_t done = 0; done < count;) {
+                size_t n = std::min<uint64_t>(chunk.size(), count - done);
+                if (pwrite(fd, chunk.data(), n, offset + done) !=
+                    static_cast<ssize_t>(n)) {
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                }
+                done += n;
+            }
+            return {};
+        };
+        ASSERT_TRUE(
+            backend->OffloadStream("stream-key", size, writer, complete));
+        ASSERT_EQ(calls, 1);
+        auto check = [&](StorageBackendInterface& b,
+                         const std::string& key = "stream-key") {
+            std::string value(size, '\0');
+            std::unordered_map<std::string, Slice> output{
+                {key, {value.data(), value.size()}}};
+            auto loaded = b.BatchLoad(output);
+            EXPECT_TRUE(loaded);
+            if (loaded) {
+                EXPECT_EQ(value, std::string(size, 'q'));
+            }
+        };
+        check(*backend);
+        auto duplicate =
+            backend->OffloadStream("stream-key", size, writer, complete);
+        EXPECT_FALSE(duplicate);
+        EXPECT_EQ(calls, 1);
+        auto rejected = backend->OffloadStream(
+            "rejected-key", size, writer,
+            [](const auto&, auto&) { return ErrorCode::INVALID_PARAMS; });
+        EXPECT_FALSE(rejected);
+        EXPECT_FALSE(*backend->IsExist("rejected-key"));
+        auto unknown = backend->OffloadStream(
+            "unknown-key", size, writer,
+            [](const auto&, auto&) { return ErrorCode::RPC_TIMEOUT; });
+        EXPECT_FALSE(unknown);
+        EXPECT_TRUE(*backend->IsExist("unknown-key"));
+        check(*backend, "unknown-key");
+        bool completed = false;
+        auto cancelled = backend->OffloadStream(
+            "cancelled-key", size,
+            [](int fd, uint64_t offset,
+               uint64_t) -> tl::expected<void, ErrorCode> {
+                char byte = 'x';
+                EXPECT_EQ(pwrite(fd, &byte, 1, offset), 1);
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            },
+            [&](const auto&, auto&) {
+                completed = true;
+                return ErrorCode::OK;
+            });
+        EXPECT_FALSE(cancelled);
+        EXPECT_FALSE(completed);
+        ASSERT_TRUE(backend->IsExist("cancelled-key"));
+        EXPECT_FALSE(*backend->IsExist("cancelled-key"));
+        backend.reset();
+        backend = make();
+        ASSERT_TRUE(backend->Init());
+        ASSERT_TRUE(scan(*backend));
+        check(*backend);
+        EXPECT_FALSE(*backend->IsExist("cancelled-key"));
+        EXPECT_FALSE(*backend->IsExist("rejected-key"));
+        EXPECT_TRUE(*backend->IsExist("unknown-key"));
+        check(*backend, "unknown-key");
+        backend->RemoveAll();
+        EXPECT_FALSE(*backend->IsExist("stream-key"));
+        backend.reset();
+        backend = make();
+        ASSERT_TRUE(backend->Init());
+        ASSERT_TRUE(scan(*backend));
+        EXPECT_FALSE(*backend->IsExist("stream-key"));
+    }
+}
+
+TEST_F(StorageBackendTest, StreamWriteLargePayloadsAcrossNativeFormats) {
+    const char* size_override = std::getenv("MC_TEST_STREAM_BYTES");
+    const uint64_t size =
+        size_override ? std::stoull(size_override) : 128 * 1024 * 1024;
+    const char* backend_override = std::getenv("MC_TEST_STREAM_BACKEND");
+    ASSERT_GT(size, 0);
+    for (int kind = 0; kind != 3; ++kind) {
+        if (backend_override && kind != std::stoi(backend_override)) continue;
+        SCOPED_TRACE(kind);
+        FileStorageConfig cfg;
+        cfg.storage_filepath = data_path + "/bounded-" + std::to_string(kind);
+        cfg.total_size_limit = 512 * 1024 * 1024;
+        cfg.total_keys_limit = 100;
+        FilePerKeyConfig per_key;
+        per_key.fsdir = "bounded-stream";
+        std::unique_ptr<StorageBackendInterface> backend;
+        if (kind == 0) {
+            backend = std::make_unique<StorageBackendAdaptor>(cfg, per_key);
+        } else if (kind == 1) {
+            backend = std::make_unique<BucketStorageBackend>(
+                cfg, BucketBackendConfig{});
+        } else {
+            OffsetAllocatorBackendConfig offset_cfg;
+            offset_cfg.persist_mode = OffsetPersistMode::kStrict;
+            offset_cfg.enable_record_crc = true;
+            backend = std::make_unique<OffsetAllocatorStorageBackend>(
+                cfg, offset_cfg);
+        }
+        ASSERT_TRUE(backend->Init());
+        ASSERT_TRUE(backend->ScanMeta(
+            [](const auto&, auto&) { return ErrorCode::OK; }));
+        // Warm allocator/checkpoint metadata before measuring payload
+        // scratch. The source buffer belongs to the caller.
+        if (kind == 2) {
+            char seed = 's';
+            ASSERT_TRUE(
+                backend->BatchOffload({{"seed", {{&seed, 1}}}}, nullptr));
+        }
+        std::string source(size, 'b');
+        rusage before{}, after{};
+        ASSERT_EQ(getrusage(RUSAGE_SELF, &before), 0);
+        auto result = backend->OffloadStream(
+            "bounded", size,
+            [&](int fd, uint64_t offset,
+                uint64_t count) -> tl::expected<void, ErrorCode> {
+                for (uint64_t done = 0; done < count;) {
+                    size_t n = std::min<uint64_t>(64 * 1024, count - done);
+                    auto written =
+                        pwrite(fd, source.data() + done, n, offset + done);
+                    if (written != static_cast<ssize_t>(n)) {
+                        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                    }
+                    done += n;
+                }
+                return {};
+            },
+            nullptr);
+        ASSERT_TRUE(result);
+        ASSERT_EQ(getrusage(RUSAGE_SELF, &after), 0);
+        const long scratch_kib = after.ru_maxrss - before.ru_maxrss;
+        std::cout << "stream backend=" << kind << " payload_bytes=" << size
+                  << " incremental_peak_kib=" << scratch_kib << std::endl;
+        backend->RemoveAll();
+    }
 }
 
 }  // namespace mooncake::test
