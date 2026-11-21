@@ -1,4 +1,8 @@
 import unittest
+import json
+import subprocess
+import sys
+import textwrap
 import os
 import ctypes
 from mooncake.engine import TransferEngine
@@ -525,6 +529,92 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
             0,
             "send_probe to unknown peer unexpectedly succeeded",
         )
+
+
+class TestTransferEngineInitialization(unittest.TestCase):
+    """Run against a known build with MC_TEST_ENGINE=classic (default) or tent.
+
+    Native tests cover build-specific plugins and HTTP publication/cleanup.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        mode = os.environ.get("MC_TEST_ENGINE", "classic")
+        if mode not in ("classic", "tent"):
+            raise RuntimeError("MC_TEST_ENGINE must be classic or tent")
+        cls.selectors = ("MC_USE_TENT", "MC_USE_TEV1") if mode == "tent" else (None,)
+        if mode == "tent":
+            # A separate dispatch canary: Classic ignores this existing TENT
+            # setting and would succeed, exposing a silent Classic fallback.
+            probe = cls()
+            for selector in cls.selectors:
+                probe.assertEqual(
+                    probe.initialize(
+                        ["P2PHANDSHAKE"], selector=selector, rpc_threads="0"
+                    ),
+                    [-1],
+                    "TENT selection fell back to Classic",
+                )
+                probe.assertEqual(
+                    probe.initialize(["P2PHANDSHAKE"], selector=selector), [0]
+                )
+
+    def initialize(self, connections, *, selector=None, rpc_threads=None):
+        # Fatal native regressions must not kill the test runner.
+        code = textwrap.dedent("""
+            import json
+            import sys
+            from mooncake.engine import TransferEngine
+
+            try:
+                import resource
+            except ImportError:
+                pass  # Core dump limits are optional on non-POSIX platforms.
+            else:
+                resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            engine = TransferEngine()
+            results = [engine.initialize("127.0.0.1", connection, "tcp", "")
+                       for connection in sys.argv[1:]]
+            del engine
+            print(json.dumps(results), flush=True)
+        """)
+        environment = {**os.environ, "MC_FORCE_TCP": "1"}
+        for name in (
+            "MC_USE_TENT",
+            "MC_USE_TEV1",
+            "MC_TENT_CONF",
+            "MC_TENT_RPC_THREADS",
+        ):
+            environment.pop(name, None)
+        if selector:
+            environment[selector] = "1"
+        if rpc_threads is not None:
+            environment["MC_TENT_RPC_THREADS"] = rpc_threads
+        process = subprocess.run(
+            [sys.executable, "-X", "faulthandler", "-c", code, *connections],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        return json.loads(process.stdout.splitlines()[-1])
+
+    def test_unsupported_plugin_returns_error(self):
+        for selector in self.selectors:
+            with self.subTest(selector=selector):
+                self.assertEqual(
+                    self.initialize(["unsupported://127.0.0.1:1"], selector=selector),
+                    [-1],
+                )
+
+    def test_can_initialize_p2p_after_rejected_configuration(self):
+        connections = ["unsupported://127.0.0.1:1"] * 4 + ["P2PHANDSHAKE"]
+        for selector in self.selectors:
+            with self.subTest(selector=selector):
+                self.assertEqual(
+                    self.initialize(connections, selector=selector), [-1] * 4 + [0]
+                )
 
 
 if __name__ == "__main__":

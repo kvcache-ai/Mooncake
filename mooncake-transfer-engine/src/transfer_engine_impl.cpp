@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -121,6 +122,17 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                         "initialization, but this may cause issues if too many "
                         "files are opened.";
     }
+
+    // Validate the backend before reserving an RPC socket. A failed metadata
+    // constructor must not leave an invalid object or leak a socket on retries.
+    std::shared_ptr<TransferMetadata> metadata;
+    try {
+        metadata = std::make_shared<TransferMetadata>(metadata_conn_string);
+    } catch (const std::invalid_argument& e) {
+        LOG(ERROR) << "Unable to initialize transfer metadata: " << e.what();
+        return ERR_INVALID_ARGUMENT;
+    }
+
     // Set resources to the maximum value
 #ifdef USE_BAREX
     const char* use_barex_env = std::getenv("USE_BAREX");
@@ -216,9 +228,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
               << "";
 
-    metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
+    metadata_ = std::move(metadata);
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
+
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
