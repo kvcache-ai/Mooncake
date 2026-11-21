@@ -1666,8 +1666,14 @@ void AsyncMemoryGetManager::RunSubmissions() {
             LOG(ERROR) << "async get submission raised an unknown error";
         }
         if (!backend) {
-            pending.operation->Complete(std::vector<int64_t>(
-                pending.keys.size(), static_cast<int64_t>(failure)));
+            try {
+                pending.operation->Complete(std::vector<int64_t>(
+                    pending.keys.size(), static_cast<int64_t>(failure)));
+            } catch (...) {
+                // Publishing the result allocates; an escaping exception here
+                // would terminate the dispatcher thread.
+                LOG(ERROR) << "async get failed to publish submission failure";
+            }
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1770,7 +1776,13 @@ void AsyncMemoryGetManager::RunCompletions() {
         } catch (...) {
             LOG(ERROR) << "async get completion raised an unknown error";
         }
-        operation->Complete(std::move(results));
+        try {
+            operation->Complete(std::move(results));
+        } catch (...) {
+            // Same rationale as the submission path: never let a publication
+            // allocation failure terminate the completion thread.
+            LOG(ERROR) << "async get failed to publish completion result";
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = std::find_if(active_.begin(), active_.end(),
