@@ -386,6 +386,52 @@ TEST(GetHandshakeMaxLengthTest, ReturnsSameValueOnMultipleCalls) {
 }
 
 //------------------------------------------------------------------------------
+// readString
+//------------------------------------------------------------------------------
+
+// The handshake daemon feeds readString() bytes from unauthenticated peers.
+// A frame whose length prefix is zero used to index buffer[0] of an empty
+// vector and crash the daemon (#4452); it must be rejected instead.
+TEST(ReadStringTest, ZeroLengthFrameIsRejected) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    const uint64_t length = 0;
+    ASSERT_EQ(write(fds[1], &length, sizeof(length)), (ssize_t)sizeof(length));
+    close(fds[1]);
+
+    auto [type, str] = readString(fds[0]);
+    EXPECT_EQ(type, HandShakeRequestType::Invalid);
+    EXPECT_TRUE(str.empty());
+    close(fds[0]);
+}
+
+TEST(ReadStringTest, OversizedLengthIsRejected) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    const uint64_t length = getHandshakeMaxLength() + 1;
+    ASSERT_EQ(write(fds[1], &length, sizeof(length)), (ssize_t)sizeof(length));
+    close(fds[1]);
+
+    auto [type, str] = readString(fds[0]);
+    EXPECT_EQ(type, HandShakeRequestType::Invalid);
+    EXPECT_TRUE(str.empty());
+    close(fds[0]);
+}
+
+TEST(ReadStringTest, RoundTripsTypedFrame) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    const std::string payload = "{\"k\":1}";
+    ASSERT_EQ(writeString(fds[1], HandShakeRequestType::Probe, payload), 0);
+    close(fds[1]);
+
+    auto [type, str] = readString(fds[0]);
+    EXPECT_EQ(type, HandShakeRequestType::Probe);
+    EXPECT_EQ(str, payload);
+    close(fds[0]);
+}
+
+//------------------------------------------------------------------------------
 // bindToSocket
 //------------------------------------------------------------------------------
 
