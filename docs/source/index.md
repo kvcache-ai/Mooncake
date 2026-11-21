@@ -216,6 +216,7 @@ design/architecture
 design/transfer-engine/index
 design/tent/overview
 design/store/mooncake-store
+design/store/high-availability
 design/store/store-rs/index
 design/store/ssd-prefetch
 design/mooncake-backend-pg
