@@ -154,6 +154,26 @@ tl::expected<std::string, ErrorCode> GetResidencyAffinityIdForKey(
     return config.residency_affinity_ids->at(key_index);
 }
 
+// Drains move objects read since they were written first, most recently read
+// first, then the rest, most recently written first. PutEnd grants a zero
+// lease and a read or lookup extends it to now + TTL, so a deadline at or past
+// put_start_time + TTL means the object was used after the put.
+struct DrainPriority {
+    bool read_since_written;
+    std::chrono::system_clock::time_point last_use;
+
+    auto operator<=>(const DrainPriority&) const = default;
+};
+
+DrainPriority GetDrainPriority(const ObjectMetadata& metadata,
+                               std::chrono::milliseconds lease_ttl) {
+    const auto deadline = metadata.EvictionDeadline();
+    if (deadline >= metadata.put_start_time + lease_ttl) {
+        return {true, deadline};
+    }
+    return {false, metadata.put_start_time};
+}
+
 }  // namespace
 
 // Defined unconditionally (CreateNofRuntime() exists in every build and
@@ -11175,11 +11195,17 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
         std::string target_segment;
         size_t bytes;
         std::string unit_key;
+        DrainPriority priority;
     };
 
     const size_t slots = max_concurrency - job.active_tasks.size();
+    // Heap of the best plans so far, the lowest priority at the front.
     std::vector<DrainPlan> plans;
     plans.reserve(slots);
+    const auto ranks_higher = [](const DrainPlan& lhs, const DrainPlan& rhs) {
+        return lhs.priority > rhs.priority;
+    };
+    const auto lease_ttl = std::chrono::milliseconds(default_kv_lease_ttl_);
     std::unordered_set<std::string> active_unit_keys;
     for (const auto& [_, task] : job.active_tasks) {
         active_unit_keys.insert(task.unit_key);
@@ -11285,11 +11311,18 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                         continue;
                     }
 
-                    if (plans.size() < slots) {
-                        plans.push_back({tenant_id, key, source_segment,
-                                         *target, metadata.TotalLength(),
-                                         unit_key});
+                    const auto priority = GetDrainPriority(metadata, lease_ttl);
+                    if (plans.size() == slots) {
+                        if (priority <= plans.front().priority) {
+                            continue;
+                        }
+                        std::pop_heap(plans.begin(), plans.end(), ranks_higher);
+                        plans.pop_back();
                     }
+                    plans.push_back({tenant_id, key, source_segment, *target,
+                                     metadata.TotalLength(), unit_key,
+                                     priority});
+                    std::push_heap(plans.begin(), plans.end(), ranks_higher);
                 }
             }
         });
@@ -11300,6 +11333,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
     }
     job.blocked_units = blocked_unit_keys.size();
 
+    std::sort_heap(plans.begin(), plans.end(), ranks_higher);
     for (const auto& plan : plans) {
         if (DrainJobStopRequested(job)) {
             return;
