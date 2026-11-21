@@ -201,6 +201,13 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         bool prefer_alloc_in_same_node);
 
+    // First-phase RFC #5668 API: RDMA memory-backed reads into explicitly
+    // registered buffers only. Returned handle keeps the Store Client alive.
+    std::shared_ptr<AsyncMemoryBatchGet> submit_async_memory_batch_get(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes);
+
     /**
      * @brief Put object data directly from a pre-allocated buffer
      * @param key Key of the object to put
@@ -1374,6 +1381,11 @@ class RealClient : public PyClient {
    private:
     tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
         bool enable_ssd_offload);
+
+    // Serializes async admissions against deregistration and teardown.
+    // The manager tracks registered destination reservations until completion.
+    std::mutex async_memory_get_mutex_;
+    std::shared_ptr<AsyncMemoryGetManager> async_memory_get_manager_;
 
     std::mutex teardown_mutex_;
     ErrorCode storage_shutdown_error_ = ErrorCode::OK;
