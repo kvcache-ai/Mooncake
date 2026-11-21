@@ -138,6 +138,20 @@ void loadGlobalConfig(GlobalConfig& config) {
         parseBoolConfigEnv(legacy, "ASCEND_STANDALONE_SINGLE_SEGMENT",
                            config.ascend_standalone_single_segment);
     }
+    // Agent mode lets a store client that does not own an inference runtime
+    // (e.g. the Python mc_store_rest_server) self-manage the ACL device
+    // context and split its capacity across local NPUs. The C++
+    // real_client_main binary enables it automatically under
+    // USE_ASCEND_DIRECT; embedded processes opt in explicitly so the
+    // in-process store client keeps its existing capacity semantics.
+    if (const char* value = std::getenv("MC_ASCEND_AGENT_MODE");
+        value != nullptr && value[0] != '\0') {
+        parseBoolConfigEnv(value, "MC_ASCEND_AGENT_MODE",
+                           config.ascend_agent_mode);
+    } else if (const char* legacy = std::getenv("ASCEND_AGENT_MODE")) {
+        parseBoolConfigEnv(legacy, "ASCEND_AGENT_MODE",
+                           config.ascend_agent_mode);
+    }
     // Without a peer-memory module, ibv_reg_mr() fails with EFAULT at the
     // first GPU buffer, so the dma_buf export is the default there;
     // WITH_NVIDIA_PEERMEM below still decides when set.
