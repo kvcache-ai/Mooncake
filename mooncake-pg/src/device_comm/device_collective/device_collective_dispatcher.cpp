@@ -6,7 +6,9 @@
 #include <glog/logging.h>
 
 #include "device_comm/device_collective/algorithms/one_shot/one_shot_algorithm.h"
+#include "device_comm/device_collective/algorithms/pairwise/pairwise_algorithm.h"
 #include "device_comm/device_collective/algorithms/ring/ring_algorithm.h"
+#include "device_comm/device_collective/algorithms/star/star_algorithm.h"
 #include "device_comm/device_collective/protocols/ll/ll_protocol.h"
 #include "device_comm/device_collective/protocols/simple/simple_protocol.h"
 #include "device_comm/device_transfer/transfer_service.h"
@@ -73,6 +75,10 @@ DeviceCollectiveDispatcher::create(DeviceTransferService& transfer_service,
 
     if (simple) {
         dispatcher->tryLoadAlgorithm<RingAlgorithm>(device_index, collective,
+                                                    workspace, *simple);
+        dispatcher->tryLoadAlgorithm<PairwiseAlgorithm>(
+            device_index, collective, workspace, *simple);
+        dispatcher->tryLoadAlgorithm<StarAlgorithm>(device_index, collective,
                                                     workspace, *simple);
     }
     if (ll) {
@@ -151,8 +157,13 @@ PGResult<const AlgorithmProvider*> DeviceCollectiveDispatcher::selectAlgorithm(
     const DeviceCollectiveRequest& request) const {
     const auto [operation, bytes] = std::visit(
         [](const auto& value) {
-            return std::pair{value.kOperation,
-                             value.count * elementSize(value.datatype)};
+            if constexpr (value.kOperation == OpType::Barrier) {
+                // Barrier has no user payload.
+                return std::pair{value.kOperation, uint64_t{0}};
+            } else {
+                return std::pair{value.kOperation,
+                                 value.count * elementSize(value.datatype)};
+            }
         },
         request);
     for (const auto& choice : algorithm_choices_) {

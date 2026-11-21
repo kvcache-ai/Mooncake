@@ -347,23 +347,29 @@ PGResult<void> DeviceCollectiveRuntime::handleFailure(
         hint[failed_rank] = 1;
     }
 
-    // The callback can install views through the agent executor, so it must
-    // run without mutex_.
-    const auto recovery_result = failure_recovery_callback_(failed_rank);
-    if (!recovery_result.has_value()) {
-        LOG(ERROR) << "device collective recovery failed; falling "
-                      "back to Plan invalidation: "
-                   << recovery_result.error().message;
+    const bool communication_failure =
+        failure.failure_type == CollectiveFailureType::Communication;
+    bool recovery_failed = false;
+    if (communication_failure) {
+        // The callback can install views through the agent executor, so it
+        // must run without mutex_.
+        const auto recovery_result = failure_recovery_callback_(failed_rank);
+        recovery_failed = !recovery_result.has_value();
+        if (recovery_failed) {
+            LOG(ERROR) << "device collective recovery failed; falling "
+                          "back to Plan invalidation: "
+                       << recovery_result.error().message;
+        }
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
     ControlUpdateBuilder builder;
-    if (recovery_result.has_value() && published_view_update_ &&
+    if (!recovery_failed && published_view_update_ &&
         !published_view_update_->handle.poll()) {
         // The GPU waits for the recovery reply before claiming control
         // updates. Append recovery work to this pending view update.
         builder = ControlUpdateBuilder(published_view_update_->update);
-    } else {
+    } else if (communication_failure) {
         // A failed callback or no new view (e.g. autoSyncOnFailure disabled)
         // leaves the failed plans unavailable until another view is installed.
         PG_TRY(dispatcher_->invalidatePlans(builder));

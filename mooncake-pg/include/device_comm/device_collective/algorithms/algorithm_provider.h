@@ -98,6 +98,41 @@ class AlgorithmProvider {
         return makePGError(PGErrorCode::NotSupported,
                            "device collective implementation is unavailable");
     }
+    virtual PGResult<void> enqueueImpl(const ReduceScatterRequest&,
+                                       cudaStream_t) const {
+        return makePGError(PGErrorCode::NotSupported,
+                           "device collective implementation is unavailable");
+    }
+    virtual PGResult<void> enqueueImpl(const BroadcastRequest&,
+                                       cudaStream_t) const {
+        return makePGError(PGErrorCode::NotSupported,
+                           "device collective implementation is unavailable");
+    }
+    virtual PGResult<void> enqueueImpl(const ReduceRequest&,
+                                       cudaStream_t) const {
+        return makePGError(PGErrorCode::NotSupported,
+                           "device collective implementation is unavailable");
+    }
+    virtual PGResult<void> enqueueImpl(const AllToAllRequest&,
+                                       cudaStream_t) const {
+        return makePGError(PGErrorCode::NotSupported,
+                           "device collective implementation is unavailable");
+    }
+    virtual PGResult<void> enqueueImpl(const GatherRequest&,
+                                       cudaStream_t) const {
+        return makePGError(PGErrorCode::NotSupported,
+                           "device collective implementation is unavailable");
+    }
+    virtual PGResult<void> enqueueImpl(const ScatterRequest&,
+                                       cudaStream_t) const {
+        return makePGError(PGErrorCode::NotSupported,
+                           "device collective implementation is unavailable");
+    }
+    virtual PGResult<void> enqueueImpl(const BarrierRequest&,
+                                       cudaStream_t) const {
+        return makePGError(PGErrorCode::NotSupported,
+                           "device collective implementation is unavailable");
+    }
 
    private:
     DeviceCollectiveAlgorithm type_;
