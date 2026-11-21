@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 import time
 
@@ -126,6 +127,42 @@ class MooncakeStoreService:
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         )
 
+    def _prepare_ascend_transport(self):
+        """Opt the standalone store service into Ascend agent mode.
+
+        The C++ real_client_main binary enables agent mode automatically
+        under USE_ASCEND_DIRECT, but a Python store client does not: without
+        it, protocol='ascend' requires the process to have established an ACL
+        device context by other means, which a bare store service has not.
+        An explicit non-empty MC_ASCEND_AGENT_MODE / ASCEND_AGENT_MODE setting
+        always wins (mirroring the C++ parser, which treats an empty value as
+        unset); agent mode only alters behavior for protocol='ascend'.
+        """
+        if self.config.protocol != "ascend":
+            return
+        if os.environ.get("MC_ASCEND_AGENT_MODE", "") or os.environ.get(
+            "ASCEND_AGENT_MODE", ""
+        ):
+            return
+        try:
+            from mooncake import _store as _cpp_store
+        except ImportError:
+            logging.warning(
+                "protocol='ascend' requires the C++ store backend; agent "
+                "mode could not be enabled for this backend"
+            )
+            return
+        enable = getattr(_cpp_store, "set_ascend_agent_mode", None)
+        if enable is None:
+            logging.warning(
+                "mooncake._store lacks set_ascend_agent_mode; upgrade the "
+                "wheel so a protocol='ascend' store service can self-manage "
+                "its ACL device context"
+            )
+            return
+        enable(True)
+        logging.info("Enabled Ascend agent mode for the standalone store service")
+
     async def start_store_service(
         self, max_wait_time: float = 60, shutdown_event=None
     ):
@@ -142,6 +179,7 @@ class MooncakeStoreService:
         retry_count = 0
         retry_interval = 1.0  # Fixed retry interval: 1 second
         start_time = time.perf_counter()
+        self._prepare_ascend_transport()
 
         if shutdown_event is not None:
             # Process any signal callback queued immediately before startup.
