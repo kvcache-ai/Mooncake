@@ -23,11 +23,14 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <utility>
 #include <vector>
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include "storage/distributed/object_replica_io.h"
+#include "storage/distributed/object_replica_state.h"
 #include "allocation_strategy.h"
 #include "background_worker.h"
 #include "client_liveness.h"
@@ -117,6 +120,15 @@ class MasterService {
     using BatchOpLogWriterFactory =
         std::function<std::unique_ptr<OrderedOpLogWriter>(
             OrderedOpLogWriterConfig, OrderedOpLogWriter::WriteBatchFn)>;
+
+    tl::expected<ObjectStorageConfig, ErrorCode> GetObjectStorageConfig();
+    tl::expected<void, ErrorCode> FinishObjectStorageUpload(const UUID&,
+                                                            const std::string&,
+                                                            ObjectUploadOutcome,
+                                                            const TenantId&);
+    tl::expected<void, ErrorCode> RevokeObjectStorageWrite(
+        const UUID&, const std::string&, const ObjectWriteAttempt&,
+        const TenantId&);
 
     MasterService();
     MasterService(const MasterServiceConfig& config);
@@ -527,6 +539,11 @@ class MasterService {
                      const TenantId& tenant_id,
                      const std::vector<uint64_t>& slice_lengths,
                      const ReplicateConfig& config);
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
+                  const TenantId& tenant_id,
+                  const std::vector<uint64_t>& slice_lengths,
+                  const ReplicateConfig& config);
 
     /**
      * @brief Complete a batch of upsert operations. Delegates to BatchPutEnd.
@@ -949,7 +966,8 @@ class MasterService {
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
-        const WeightMetadataSnapshot& weight_metadata = {});
+        const WeightMetadataSnapshot& weight_metadata = {},
+        const ObjectReplicaSnapshot& object_storage = {});
     // Copies objects out of the handoff. The caller keeps ownership so a
     // failed restore or a later lease loss can still PreservePromotionBaseline.
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
@@ -1105,7 +1123,8 @@ class MasterService {
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
         std::optional<ReplicaID> expected_max_replica_id,
-        const WeightMetadataSnapshot* legacy_weight_metadata);
+        const WeightMetadataSnapshot* legacy_weight_metadata,
+        const ObjectReplicaSnapshot* legacy_object_storage);
 
     // The restore implementation itself; entered only through
     // RestoreFromStandbyState above.
@@ -1116,7 +1135,8 @@ class MasterService {
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
         std::optional<ReplicaID> expected_max_replica_id,
-        const WeightMetadataSnapshot* legacy_weight_metadata);
+        const WeightMetadataSnapshot* legacy_weight_metadata,
+        const ObjectReplicaSnapshot* legacy_object_storage);
 
     // Tolerant legacy snapshot restore (#3760), one phase per method so each
     // stays single-purpose.
@@ -1409,7 +1429,7 @@ class MasterService {
     // and the object with them.
     tl::expected<void, ErrorCode> MarkRemovedAndPersist(
         const TenantId& tenant_id, const std::string& key,
-        ObjectMetadata& metadata);
+        ObjectMetadata& metadata, uint64_t& object_sequence);
     // Returns why a remove may not take the object, or nothing if it may: its
     // lease is still held (unless `force`), a replica is incomplete, or a
     // replication task reads it.
@@ -1417,6 +1437,7 @@ class MasterService {
         const ObjectMetadata& metadata, const route::ObjectState& state,
         bool force, std::chrono::system_clock::time_point now);
     struct RemoveResult {
+        uint64_t object_sequence{0};
         long removed_count{0};
         int64_t freed_bytes{0};
         // Whether the walk reached any object, and whether it left any
@@ -1524,8 +1545,9 @@ class MasterService {
     // A write's first step under the key: drops the held object's stale
     // replica handles and, without the oplog, the object itself when none is
     // left. With the oplog the cleanup is only queued and the write is refused
-    // with OBJECT_ALREADY_EXISTS.
-    auto CleanupStaleBeforeWrite(const char* why, MetadataAccessorRW& accessor)
+    // until it is durable.
+    auto CleanupStaleBeforeWrite(const char* why, MetadataAccessorRW& accessor,
+                                 const ReplicateConfig& config)
         -> tl::expected<void, ErrorCode>;
     // Runs a write's admission, which reports through its argument whether
     // DFS allocation itself ran out of capacity. Only then is the admission
@@ -1595,6 +1617,7 @@ class MasterService {
     DeadlineScheduler<GracefulUnmountDeadlineRecord>
         graceful_unmount_scheduler_;
     BackgroundWorker replica_cleanup_worker_;
+    BackgroundWorker object_storage_worker_;
     BackgroundWorker kvcs_capacity_refresh_worker_;
     const bool enable_async_segment_cleanup_;
 
@@ -2313,6 +2336,60 @@ class MasterService {
     bool batch_oplog_pruning_stop_requested_{false};
     BatchOpLogWriterFactory batch_oplog_writer_factory_;
 
+    auto RemoveObjectImpl(const std::string&, const TenantId&, bool, bool,
+                          uint64_t&) -> tl::expected<void, ErrorCode>;
+    ObjectStorageConfig object_storage_config_;
+    std::shared_ptr<ObjectStorageAdapter> object_storage_adapter_;
+    std::unique_ptr<StandbyMetadataStore> object_uploads_;
+    std::mutex object_storage_mutex_;
+    std::unordered_map<std::string, uint64_t> object_upload_sequences_;
+    // Pending work only: committed, referenced objects consume no admission
+    // slots. Both indexes are rebuilt from recovered records and metadata.
+    struct ObjectPendingWork {
+        uint64_t deadline_ms;
+        uint64_t generation;
+    };
+    std::unordered_map<std::string, ObjectPendingWork>
+        object_pending_deadlines_;
+    uint64_t object_work_generation_{0};
+    std::set<std::pair<uint64_t, std::string>> object_work_;
+    void SetObjectWorkLocked(const std::string&, std::optional<uint64_t>);
+    void ScheduleObjectWorkLocked();
+    void InitObjectStorage(const MasterServiceConfig&);
+    void MaintainObjectStorage();
+    tl::expected<void, ErrorCode> RestoreObjectStorageLocked(
+        const ObjectReplicaSnapshot&);
+    tl::expected<void, ErrorCode> AuthorizeObjectStorage(const UUID&,
+                                                         const TenantId&,
+                                                         const std::string&,
+                                                         uint64_t,
+                                                         std::vector<Replica>&);
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+        AwaitObjectAuthorization(
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>);
+    tl::expected<void, ErrorCode> CommitObjectStorage(
+        const UUID&, const ObjectMeta&, const TenantId&, ReplicaType,
+        std::future<ErrorCode>* deferred = nullptr);
+    tl::expected<void, ErrorCode> WaitObjectDurable(uint64_t);
+    tl::expected<OrderedOpLogWriter::PendingHandle, ErrorCode>
+    CommitObjectAware(OrderedOpLogWriter::Reservation&&, OpLogEntry,
+                      DurableFinalizeCallback,
+                      uint64_t* object_sequence = nullptr);
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchWriteStart(const UUID&, const std::vector<std::string>&,
+                    const TenantId&, const std::vector<uint64_t>&,
+                    const ReplicateConfig&, bool upsert);
+    auto PutStartImpl(const UUID&, const std::string&, const TenantId&,
+                      uint64_t, const ReplicateConfig&)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    auto UpsertStartImpl(const UUID&, const std::string&, const TenantId&,
+                         uint64_t, const ReplicateConfig&)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    auto PutEndImpl(const UUID&, const ObjectMeta&, const TenantId&,
+                    ReplicaType, bool persist = true,
+                    WeightStoreManager::ImportWriteGuard* admission = nullptr)
+        -> tl::expected<void, ErrorCode>;
+
     // OpLog publishing helpers
     std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
     std::string SerializeMetadataForOpLogFromReplicaDescriptors(
@@ -2336,7 +2413,8 @@ class MasterService {
     tl::expected<OpLogEntry, ErrorCode> AppendReservedOpLogWithDurableFinalize(
         OrderedOpLogWriter::Reservation&& reservation, OpType type,
         const std::string& tenant_id, const std::string& key,
-        const std::string& payload, DurableFinalizeCallback callback);
+        const std::string& payload, DurableFinalizeCallback callback,
+        uint64_t* object_sequence = nullptr);
 
     // Standby-restored memory endpoints remain unreadable until the owning
     // Client has successfully remounted them.

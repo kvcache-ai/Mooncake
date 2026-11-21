@@ -1,0 +1,127 @@
+#include "client_service.h"
+
+#include <limits>
+
+#include "device/accelerator_registry.h"
+#include "storage/distributed/object_replica_io.h"
+
+namespace mooncake {
+ErrorCode Client::InitObjectStorage() {
+    auto config = master_client_.GetObjectStorageConfig();
+    if (!config) return config.error();
+    if (!config->enabled) return ErrorCode::OK;
+    auto adapter = CreateObjectReplicaAdapter(*config);
+    if (!adapter) return adapter.error();
+    object_storage_namespace_ = config->NamespaceId();
+    object_storage_backend_ = std::make_shared<ObjectStorageBackend>(
+        // A published descriptor may predate a lower write admission limit.
+        ObjectStorageBackendConfig{
+            .max_object_bytes = config->max_object_bytes,
+            .max_staging_bytes = config->max_staging_bytes,
+            .max_read_object_bytes = std::numeric_limits<uint64_t>::max()},
+        *adapter);
+    EnsureStorageControlPlaneStarted();
+    return ErrorCode::OK;
+}
+ErrorCode Client::WriteObjectStorageReplica(const Replica::Descriptor& replica,
+                                            const std::vector<Slice>& slices) {
+    const auto& object = replica.get_object_storage_descriptor();
+    if (!object_storage_backend_ ||
+        object.namespace_id != object_storage_namespace_) {
+        ReportObjectStorageUpload(object.object_key,
+                                  ObjectUploadOutcome::NOT_STARTED);
+        return object_storage_backend_ ? ErrorCode::INVALID_PARAMS
+                                       : ErrorCode::NOT_SUPPORTED;
+    }
+    auto runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
+    bool started = false;
+    auto start = std::chrono::steady_clock::now();
+    auto error = object_storage_backend_->WriteV(
+        object.object_key, object.object_size, slices,
+        [&](const Slice& slice) {
+            return !runtime.FindDeviceForPointer(slice.ptr);
+        },
+        [&](void* dst, const void* src, size_t size) {
+            return runtime.CopyToHost(dst, src, size);
+        },
+        &started);
+    if (metrics_)
+        metrics_->transfer_metric.object_put_latency_us.observe(
+            elapsed_us_since(start));
+    if (error == ErrorCode::OK) {
+        // Completion is normally persisted with PutEnd, avoiding another RPC
+        // and log barrier. Retain only a notification in case PutEnd fails.
+        std::lock_guard lock(object_storage_completions_mutex_);
+        object_storage_completions_.insert_or_assign(
+            object.object_key, ObjectUploadOutcome::COMPLETE);
+    } else {
+        ReportObjectStorageUpload(object.object_key,
+                                  started ? ObjectUploadOutcome::UNKNOWN
+                                          : ObjectUploadOutcome::NOT_STARTED);
+    }
+    return error;
+}
+ErrorCode Client::ReadObjectStorageReplica(const Replica::Descriptor& replica,
+                                           const std::vector<Slice>& slices,
+                                           uint64_t offset) {
+    if (!object_storage_backend_) return ErrorCode::NOT_SUPPORTED;
+    const auto& object = replica.get_object_storage_descriptor();
+    if (object.namespace_id != object_storage_namespace_)
+        return ErrorCode::INVALID_PARAMS;
+    auto runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
+    auto start = std::chrono::steady_clock::now();
+    auto result = object_storage_backend_->Read(
+        object.object_key, object.object_size, slices, offset,
+        [&](void* dst, const void* src, size_t size) {
+            return runtime.CopyFromHost(dst, src, size);
+        },
+        [&](const Slice& slice) {
+            return !runtime.FindDeviceForPointer(slice.ptr);
+        });
+    if (metrics_)
+        metrics_->transfer_metric.object_get_latency_us.observe(
+            elapsed_us_since(start));
+    return result;
+}
+void Client::ReportObjectStorageUpload(const std::string& name,
+                                       ObjectUploadOutcome outcome) {
+    if (!master_client_.FinishObjectStorageUpload(name, outcome)) {
+        {
+            std::lock_guard lock(object_storage_completions_mutex_);
+            object_storage_completions_.insert_or_assign(name, outcome);
+        }
+        EnsureStorageControlPlaneStarted();
+    }
+}
+void Client::AcknowledgeObjectStorageWrite(
+    const std::vector<Replica::Descriptor>& replicas) {
+    if (!object_storage_backend_) return;
+    std::lock_guard lock(object_storage_completions_mutex_);
+    for (const auto& replica : replicas)
+        if (replica.is_object_storage_replica())
+            object_storage_completions_.erase(
+                replica.get_object_storage_descriptor().object_key);
+}
+void Client::PollObjectStorage() {
+    std::vector<std::pair<std::string, ObjectUploadOutcome>> pending;
+    {
+        std::lock_guard lock(object_storage_completions_mutex_);
+        auto it = object_storage_completions_.upper_bound(last_polled_object_);
+        const auto count =
+            std::min(kTaskBatchSize, object_storage_completions_.size());
+        for (size_t i = 0; i < count; ++i) {
+            if (it == object_storage_completions_.end())
+                it = object_storage_completions_.begin();
+            pending.push_back(*it++);
+        }
+    }
+    for (const auto& [name, outcome] : pending) {
+        if (!task_poll_running_.load()) break;
+        last_polled_object_ = name;
+        if (master_client_.FinishObjectStorageUpload(name, outcome)) {
+            std::lock_guard lock(object_storage_completions_mutex_);
+            object_storage_completions_.erase(name);
+        }
+    }
+}
+}  // namespace mooncake

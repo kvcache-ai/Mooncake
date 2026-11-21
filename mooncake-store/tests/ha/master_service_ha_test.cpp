@@ -1321,6 +1321,109 @@ TEST_F(MasterServiceHATest,
     EXPECT_TRUE(NeedMemoryEvictionForTesting(service));
 }
 
+TEST_F(MasterServiceHATest, ObjectPutDoesNotSucceedOnQueuedStaleCleanup) {
+    MasterService service(MakeStrictHAConfig());
+    MasterServiceTestPeer peer(service);
+    ASSERT_EQ(peer.SetBatchOpLogBackendForTesting(
+                  std::make_shared<FakeBatchHaKvBackend>()),
+              ErrorCode::OK);
+    peer.EnableObjectRecordsForTesting({});
+    auto disk_owner = generate_uuid();
+    auto object = MakeStandbyObject("stale", "disk");
+    object.metadata.replicas = {
+        MakeStandbyLocalDiskReplica(disk_owner, "disk")};
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({object}, 0, {}));
+    auto owner = peer.FindClientRecord(disk_owner);
+    ASSERT_TRUE(owner);
+    const auto now = ClientLivenessRecord::Clock::now();
+    const auto zero = ClientLivenessRecord::Clock::duration::zero();
+    owner->Evaluate(now, zero, zero);
+    owner->Evaluate(now, zero, zero);
+    ASSERT_FALSE(owner->ShouldRetainResources());
+    ReplicateConfig placement;
+    placement.replica_num = 0;
+    placement.os_replica_num = 1;
+    auto result = service.PutStart(generate_uuid(), "stale", kDefaultTenant,
+                                   1024, placement);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::REPLICA_IS_NOT_READY);
+}
+
+TEST_F(MasterServiceHATest, ObjectRetirementHonorsLeasesFromEarlierLeaders) {
+    ObjectStorageConfig storage;
+    storage.enabled = true;
+    storage.target = {
+        "s3", "https://example.test", "bucket", "region", "prefix", true};
+    ObjectReplicaSnapshot snapshot;
+    std::vector<StandbyObjectEntry> objects;
+    const auto writer = generate_uuid();
+    std::string name;
+    uint64_t retirement_deadline = 0;
+    // The middle leader must persist its larger TTL before it serves reads.
+    for (const uint64_t ttl : {1000, 60000, 100, 120000}) {
+        auto config = MakeStrictHAConfig();
+        config.default_kv_lease_ttl = ttl;
+        MasterService service(config);
+        MasterServiceTestPeer peer(service);
+        ASSERT_EQ(peer.SetBatchOpLogBackendForTesting(
+                      std::make_shared<FakeBatchHaKvBackend>()),
+                  ErrorCode::OK);
+        auto& records = peer.EnableObjectRecordsForTesting(storage);
+        ASSERT_TRUE(
+            service.RestoreFromStandbySnapshot(objects, 0, {}, {}, snapshot));
+        if (retirement_deadline) {
+            auto retired = records.FindObjectUpload(name);
+            ASSERT_TRUE(retired);
+            EXPECT_EQ(retired->not_before_ms, retirement_deadline);
+            continue;
+        }
+        if (objects.empty()) {
+            ReplicateConfig placement;
+            placement.replica_num = 0;
+            placement.os_replica_num = 1;
+            auto targets = service.PutStart(writer, "leased", kDefaultTenant,
+                                            64, placement);
+            ASSERT_TRUE(targets);
+            ASSERT_EQ(targets->size(), 1u);
+            const auto& target = targets->front();
+            name = target.get_object_storage_descriptor().object_key;
+            ASSERT_TRUE(
+                service.PutEnd(writer,
+                               ObjectMeta{"leased", std::nullopt,
+                                          ObjectWriteAttempt{target.id, name}},
+                               kDefaultTenant, ReplicaType::ALL));
+        }
+        auto readable = service.GetReplicaList("leased", kDefaultTenant);
+        ASSERT_TRUE(readable);
+        if (ttl == 100) {
+            const auto now =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count();
+            ASSERT_TRUE(service.Remove("leased", kDefaultTenant, true));
+            auto retired = records.FindObjectUpload(name);
+            ASSERT_TRUE(retired);
+            EXPECT_EQ(retired->phase, ObjectUploadPhase::RETIRED);
+            EXPECT_GE(retired->not_before_ms,
+                      static_cast<uint64_t>(now) + 60000);
+            retirement_deadline = retired->not_before_ms;
+            snapshot = records.SnapshotObjectReplicas();
+            objects.clear();
+        } else {
+            auto decoded = struct_pack::deserialize<ObjectReplicaSnapshot>(
+                struct_pack::serialize(records.SnapshotObjectReplicas()));
+            ASSERT_TRUE(decoded);
+            snapshot = std::move(*decoded);
+            auto metadata = records.GetMetadata("default", "leased");
+            ASSERT_TRUE(metadata);
+            objects = {{"default", "leased", *metadata}};
+            ASSERT_EQ(snapshot.records.size(), 1u);
+            EXPECT_EQ(snapshot.records.front().read_lease_ttl_ms.value_or(0),
+                      ttl);
+        }
+    }
+}
+
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
@@ -1515,10 +1618,10 @@ TEST_F(MasterServiceHATest, BatchPromotionRejectsCrossChunkOverlap) {
     EXPECT_EQ(2u, handoff.metadata_store->GetKeyCount());
     EXPECT_TRUE(handoff.metadata_store->Exists(first.tenant_id, first.key));
     EXPECT_TRUE(handoff.metadata_store->Exists(second.tenant_id, second.key));
-    EXPECT_EQ(
-        HasMetadataEntryForTesting(service, kDefaultTenant, first.key) +
-            HasMetadataEntryForTesting(service, kDefaultTenant, second.key),
-        1);
+    EXPECT_FALSE(
+        HasMetadataEntryForTesting(service, kDefaultTenant, first.key));
+    EXPECT_FALSE(
+        HasMetadataEntryForTesting(service, kDefaultTenant, second.key));
 }
 
 TEST_F(MasterServiceHATest,

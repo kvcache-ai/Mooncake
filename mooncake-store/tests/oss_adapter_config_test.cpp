@@ -84,6 +84,19 @@ TEST_F(OssAdapterConfigTest, InitUsesCompatibilityAliases) {
     EXPECT_TRUE(adapter.Init());
 }
 
+TEST_F(OssAdapterConfigTest,
+       ObjectReplicaRegionIsExplicitAndOverridesEnvironment) {
+    SetRequiredPrimary();
+    Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    ObjectReplicaTarget target{
+        "oss", "https://objects.example.com", "bucket", "", "cluster", false};
+    EXPECT_FALSE(OssAdapterConfig::FromEnvironment(&target));
+    target.region = "cn-hangzhou";
+    const auto config = OssAdapterConfig::FromEnvironment(&target);
+    ASSERT_TRUE(config);
+    EXPECT_EQ(config->region, "cn-hangzhou");
+}
+
 TEST_F(OssAdapterConfigTest, EmptyPrimaryOverridesCompatibilityAlias) {
     Set("OSS_ENDPOINT", "https://oss.example.com");
     Set("MOONCAKE_OSS_ENDPOINT", "");

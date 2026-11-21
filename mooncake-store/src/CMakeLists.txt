@@ -11,11 +11,13 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     etcd_helper.cpp
     uds_transport.cpp
     config/distributed_storage_config.cpp
+    config/object_storage_config.cpp
     config/rpc_protocol_config.cpp
     config/replica_selection_config.cpp
     config/store_cluster_identity_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/object_storage_backend.cpp
+    storage/distributed/object_replica_io.cpp
     storage/distributed/posix_fs_adapter.cpp
     common/file_util.cpp
     storage/distributed/kvcs/kvcs_efc_target.cpp
@@ -42,6 +44,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     eviction/report_observers.cpp
     metadata/lease_eviction_index.cpp
     master_service.cpp
+    master_object_storage.cpp
     promotion_candidate_tracker.cpp
     master_store_backend.cpp
     weight_store_manager.cpp
@@ -115,6 +118,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     common/mmap_buffer.cpp
     client_service.cpp
     gather_read.cpp
+    client_object_storage.cpp
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
@@ -267,7 +271,7 @@ if(CURL_FOUND AND OpenSSL_FOUND)
   set(MOONCAKE_OSS_ADAPTER_ENABLED
       TRUE
       CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES config/oss_adapter_config.cpp
+  list(APPEND MOONCAKE_STORE_SHARED_SOURCES config/oss_adapter_config.cpp
        storage/distributed/oss_adapter.cpp)
   list(APPEND EXTRA_LIBS CURL::libcurl OpenSSL::Crypto)
   add_definitions(-DHAVE_OSS_ADAPTER)
@@ -288,7 +292,7 @@ if(CURL_FOUND AND OpenSSL_FOUND)
       CACHE INTERNAL "Whether the S3-compatible adapter is built")
   list(
     APPEND
-    MOONCAKE_STORE_CLIENT_SOURCES
+    MOONCAKE_STORE_SHARED_SOURCES
     storage/distributed/rest_object_storage_adapter.cpp
     storage/distributed/object_storage_xml.cpp
     config/s3_adapter_config.cpp
@@ -576,8 +580,9 @@ add_library(mooncake_store_shared_objects OBJECT
             ${MOONCAKE_STORE_SHARED_SOURCES})
 set_target_properties(mooncake_store_shared_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(mooncake_store_shared_objects
-                           PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS})
+target_include_directories(
+  mooncake_store_shared_objects PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS}
+                                        ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(
   mooncake_store_shared_objects
   PRIVATE cachelib_memory_allocator
@@ -588,6 +593,10 @@ target_link_libraries(
           $<$<PLATFORM_ID:Linux>:numa>
           asio_shared
           yalantinglibs::yalantinglibs)
+if(CURL_FOUND AND OpenSSL_FOUND)
+  target_link_libraries(mooncake_store_shared_objects PRIVATE CURL::libcurl
+                                                              OpenSSL::Crypto)
+endif()
 if(MOONCAKE_KVCS_SDK_FOUND)
   target_compile_definitions(mooncake_store_shared_objects
                              PRIVATE MOONCAKE_HAVE_KVCS_SDK=1)

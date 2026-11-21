@@ -564,7 +564,7 @@ inline const Replica::Descriptor *SelectSessionReplica(
 
     for (const auto &replica : replicas) {
         if (replica.status == ReplicaStatus::COMPLETE &&
-            replica.is_dfs_replica()) {
+            (replica.is_dfs_replica() || replica.is_object_storage_replica())) {
             return &replica;
         }
     }
@@ -4483,7 +4483,8 @@ RealClient::batch_get_buffer_internal(
         // the read will fail.
         auto runtime_accelerator =
             device::GetAcceleratorRegistry().RuntimeAccelerators();
-        if ((replica.is_disk_replica() || replica.is_dfs_replica()) &&
+        if ((replica.is_disk_replica() || replica.is_dfs_replica() ||
+             replica.is_object_storage_replica()) &&
             runtime_accelerator.FindDeviceForPointer(buffer_handle->ptr())) {
             LOG(WARNING)
                 << (replica.is_dfs_replica() ? "DFS" : "DISK")
@@ -5018,6 +5019,18 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    if (replica.is_object_storage_replica()) {
+        std::vector<Slice> slices{
+            {static_cast<char *>(buffer) + dst_offset, size}};
+        auto filtered =
+            FilterQueryResult(query_result, replica, verify_checksum);
+        auto read = src_offset == 0 && size == total_size
+                        ? client_->Get(key, filtered, slices)
+                        : client_->Get(key, filtered, slices, src_offset);
+        if (!read) return tl::unexpected(read.error());
+        return static_cast<int64_t>(size);
+    }
+
     if (src_offset == 0 && size == total_size) {
         // LOCAL_DISK full-object read: destination buffer is passed
         // directly to SSD RPC (same pattern as single-buffer batch_get_into;
@@ -5061,7 +5074,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             return static_cast<int64_t>(total_size);
         }
 
-        if (replica.is_disk_replica() || replica.is_dfs_replica()) {
+        if (replica.is_disk_replica() || replica.is_dfs_replica() ||
+            replica.is_object_storage_replica()) {
             // File-backed full read: use a contiguous temp buffer, then
             // scatter to the requested destination.
             const char *replica_type =
@@ -7081,8 +7095,8 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        // MEMORY / NOF: RDMA directly to user buffer. DFS into host memory:
-        // the fs adapter reads directly to user buffer.
+        // MEMORY, NoF, object storage, and direct DFS reads use the caller's
+        // destination slices.
         std::vector<Slice> key_slices;
         allocateSlices(key_slices, replica, buffers[i]);
         valid_operations.push_back(
@@ -7630,6 +7644,8 @@ RealClient::classify_session_range_read_requests(
     for (auto &request : requests) {
         if (request.selected_replica.is_memory_replica()) {
             read_plan.memory_requests.push_back(std::move(request));
+        } else if (request.selected_replica.is_object_storage_replica()) {
+            read_plan.object_requests.push_back(std::move(request));
         } else if (request.selected_replica.is_dfs_replica()) {
             read_plan.dfs_requests.push_back(std::move(request));
         } else if (request.selected_replica.is_local_disk_replica()) {
@@ -7642,6 +7658,34 @@ RealClient::classify_session_range_read_requests(
         }
     }
     return read_plan;
+}
+
+void RealClient::execute_session_object_range_reads(
+    const std::vector<SessionRangeReadRequest> &requests,
+    std::vector<int> &results) {
+    for (const auto &request : requests) {
+        ErrorCode error = ErrorCode::OK;
+        auto filtered = FilterQueryResult(request.cached_query_result,
+                                          request.selected_replica, false);
+        for (size_t i = 0; i < request.range_sizes.size(); ++i) {
+            std::vector<Slice> slices{
+                {request.destination_buffers[i], request.range_sizes[i]}};
+            auto read = client_->Get(request.object_key, filtered, slices,
+                                     request.source_offsets[i]);
+            if (!read) {
+                error = read.error();
+                break;
+            }
+        }
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        if (error != ErrorCode::OK)
+            results[request.result_index] = toInt(error);
+        else if (std::chrono::steady_clock::now() >= request.lease_deadline)
+            mark_get_session_lease_expired_locked(request, results);
+        else
+            results[request.result_index] =
+                static_cast<int>(request.transferred_bytes);
+    }
 }
 
 void RealClient::execute_session_memory_range_reads(
@@ -8217,6 +8261,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     auto read_plan =
         classify_session_range_read_requests(std::move(requests), results);
 
+    execute_session_object_range_reads(read_plan.object_requests, results);
     execute_session_memory_range_reads(read_plan.memory_requests, results);
     execute_session_dfs_range_reads(read_plan.dfs_requests, results);
     execute_session_local_disk_range_reads(read_plan.local_disk_requests,
@@ -8274,7 +8319,7 @@ std::vector<int> RealClient::batch_put_session_start(
     // Ranged session writes never reach DFS and session end finalizes MEMORY
     // only, so a DFS reservation would stay PROCESSING until the put-start
     // discard timeout while the object looks complete.
-    if (config.dfs_replica_num > 0) {
+    if (config.dfs_replica_num > 0 || config.os_replica_num > 0) {
         LOG(ERROR) << "batch_put_session_start rejects DFS configs: "
                    << "session path never writes DFS "
                    << "(dfs_replica_num=" << config.dfs_replica_num
@@ -8319,6 +8364,7 @@ std::vector<int> RealClient::batch_put_session_start(
     auto start_responses =
         client_->StartBatchPutForSizes(start_keys, start_sizes, start_config);
     std::vector<std::string> keys_to_revoke;
+    std::vector<std::pair<size_t, ObjectWriteAttempt>> exact_revocations;
     std::vector<std::string> hot_keys_to_remove;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -8330,6 +8376,20 @@ std::vector<int> RealClient::batch_put_session_start(
                 continue;
             }
             auto replicas = std::move(start_responses[j].value());
+            auto tracked = std::find_if(
+                replicas.begin(), replicas.end(), [](const auto &replica) {
+                    return replica.object_write_attempt.has_value();
+                });
+            if (tracked != replicas.end()) {
+                // Session writes finalize MEMORY only and cannot participate
+                // in the atomic object replacement protocol. Revoke the exact
+                // allocation instead of leaving an unfinishable session.
+                exact_revocations.emplace_back(
+                    i, tracked->object_write_attempt.value());
+                hot_keys_to_remove.push_back(keys[i]);
+                results[i] = toInt(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
             bool has_memory_replica = false;
             for (const auto &replica : replicas) {
                 if (replica.is_memory_replica()) {
@@ -8356,6 +8416,15 @@ std::vector<int> RealClient::batch_put_session_start(
     }
     if (!keys_to_revoke.empty()) {
         (void)client_->BatchPutRevoke(keys_to_revoke);
+    }
+    for (const auto &[index, attempt] : exact_revocations) {
+        auto revoked = client_->RevokeObjectStorageWrite(keys[index], attempt);
+        if (!revoked && revoked.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR)
+                << "Cannot revoke unsupported tracked write session: key="
+                << keys[index] << ", error=" << toString(revoked.error());
+            results[index] = toInt(revoked.error());
+        }
     }
     return results;
 }
@@ -8842,6 +8911,11 @@ RealClient::batch_get_into_multi_buffers_internal(
         const auto replica = *best_replica;
         uint64_t total_size = calculate_total_size(replica);
         const auto &sizes = all_sizes[i];
+        const auto &buffers = all_buffers[i];
+        if (buffers.size() != sizes.size()) {
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
         uint64_t dst_total_size = 0;
         for (auto &size : sizes) {
             dst_total_size += size;
@@ -8854,10 +8928,10 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
         // Create slices for this key's buffer
-        const auto &buffers = all_buffers[i];
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
         if (replica.is_memory_replica() || replica.is_nof_replica() ||
+            replica.is_object_storage_replica() ||
             (replica.is_dfs_replica() &&
              can_use_direct_dfs_read(replica, buffers))) {
             // MEMORY / NOF: RDMA directly to the user buffers. DFS into host
@@ -8914,7 +8988,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         return results;
     }
 
-    // ---- Memory/NOF replica: existing BatchGet path ----
+    // Read into the primary destinations, then fan out duplicate keys.
     if (!valid_operations.empty()) {
         std::vector<std::string> batch_keys;
         std::vector<QueryResult> batch_query_results;

@@ -5,6 +5,7 @@
 #include <limits>
 #include <mutex>
 
+#include "ha/standby_metadata_store.h"
 #include "storage/distributed/kvcs/kvcs_capacity_provider.h"
 
 namespace mooncake::test {
@@ -15,6 +16,13 @@ ErrorCode MasterServiceTestPeer::SetBatchOpLogBackendForTesting(
     // view still exercises the production fenced path.
     return service_.InitializeBatchOpLogWriter(std::move(backend),
                                                service_.view_version_ > 0);
+}
+
+StandbyMetadataStore& MasterServiceTestPeer::EnableObjectRecordsForTesting(
+    const ObjectStorageConfig& config) {
+    service_.object_storage_config_ = config;
+    service_.object_uploads_ = std::make_unique<StandbyMetadataStore>();
+    return *service_.object_uploads_;
 }
 
 void MasterServiceTestPeer::SetBatchOpLogWriterFactoryForTesting(

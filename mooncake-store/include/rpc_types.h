@@ -15,11 +15,14 @@ template <typename T>
 using WeightRpcResult =
     tl::expected<tl::expected<T, WeightManagementError>, ErrorCode>;
 
+enum class ObjectUploadOutcome : uint8_t { COMPLETE, NOT_STARTED, UNKNOWN };
+
 struct ObjectMeta {
     std::string key;
     std::optional<uint64_t> object_checksum;
+    std::optional<ObjectWriteAttempt> object_storage_target = std::nullopt;
 };
-YLT_REFL(ObjectMeta, key, object_checksum);
+YLT_REFL(ObjectMeta, key, object_checksum, object_storage_target);
 
 enum class ReplicaActionType {
     ADD = 0,

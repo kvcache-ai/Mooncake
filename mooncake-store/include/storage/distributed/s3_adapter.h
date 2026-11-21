@@ -1,4 +1,6 @@
 #pragma once
+#include <optional>
+#include "config/object_storage_config.h"
 
 #include <map>
 #include <string>
@@ -22,6 +24,10 @@ class S3ObjectStorageAdapter : public RestObjectStorageAdapter {
    public:
     explicit S3ObjectStorageAdapter(std::string key_prefix)
         : RestObjectStorageAdapter(std::move(key_prefix)) {}
+    explicit S3ObjectStorageAdapter(ObjectReplicaTarget target)
+        : S3ObjectStorageAdapter(target.prefix) {
+        target_ = std::move(target);
+    }
     ~S3ObjectStorageAdapter() override = default;
 
     tl::expected<void, ErrorCode> Init() override;
@@ -44,6 +50,7 @@ class S3ObjectStorageAdapter : public RestObjectStorageAdapter {
         const std::string& range, const std::string& timestamp) const;
 
    private:
+    std::optional<ObjectReplicaTarget> target_;
     // Host header value, including the bucket for virtual-hosted addressing
     // and the port when the endpoint names one other than the default.
     std::string HostHeader() const;

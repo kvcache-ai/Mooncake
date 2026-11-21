@@ -9,6 +9,7 @@
 #include "config/metrics_bootstrap_config.h"
 #include "config_helper.h"
 #include "types.h"
+#include "config/object_storage_config.h"
 
 namespace mooncake {
 
@@ -128,6 +129,7 @@ struct MasterConfig {
     int32_t etcd_max_send_message_bytes = 2 * 1024 * 1024;
 
     // OpLog store configuration
+    ObjectStorageConfig object_storage;
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
@@ -269,6 +271,7 @@ class MasterServiceSupervisorConfig {
     int64_t ha_leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     std::string etcd_endpoints = "0.0.0.0:2379";
     // OpLog store configuration
+    ObjectStorageConfig object_storage;
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
@@ -413,6 +416,7 @@ class MasterServiceSupervisorConfig {
             config.ha_redis_expected_replicas_per_shard;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
+        object_storage = config.object_storage;
         enable_oplog = config.enable_oplog;
         weight_management_oplog_capability_confirmed =
             config.weight_management_oplog_capability_confirmed;
@@ -602,6 +606,7 @@ class WrappedMasterServiceConfig {
     std::string ha_backend_connstring;
     uint32_t ha_redis_expected_replicas_per_shard = 0;
     // OpLog store configuration
+    ObjectStorageConfig object_storage;
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
@@ -704,6 +709,7 @@ class WrappedMasterServiceConfig {
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
+        object_storage = config.object_storage;
         enable_oplog = config.enable_oplog;
         weight_management_oplog_capability_confirmed =
             config.weight_management_oplog_capability_confirmed;
@@ -836,6 +842,7 @@ class WrappedMasterServiceConfig {
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
+        object_storage = config.object_storage;
         enable_oplog = config.enable_oplog;
         weight_management_oplog_capability_confirmed =
             config.weight_management_oplog_capability_confirmed;
@@ -1318,6 +1325,7 @@ class MasterServiceConfig {
     std::string ha_backend_connstring;
     uint32_t ha_redis_expected_replicas_per_shard = 0;
     // OpLog store configuration
+    ObjectStorageConfig object_storage;
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
@@ -1416,6 +1424,7 @@ class MasterServiceConfig {
         ha_redis_expected_replicas_per_shard =
             config.ha_redis_expected_replicas_per_shard;
         ha_backend_connstring = config.ha_backend_connstring;
+        object_storage = config.object_storage;
         enable_oplog = config.enable_oplog;
         weight_management_oplog_capability_confirmed =
             config.weight_management_oplog_capability_confirmed;

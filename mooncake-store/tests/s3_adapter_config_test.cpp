@@ -78,6 +78,21 @@ TEST(S3AdapterConfigTest, AppliesDefaults) {
     EXPECT_EQ(config->max_connections, 64);
 }
 
+TEST(S3AdapterConfigTest,
+     ObjectReplicaRegionIsExplicitAndOverridesEnvironment) {
+    ScopedEnvironment env;
+    SetMinimal(env);
+    env.Set("MOONCAKE_S3_REGION", "environment-region");
+    env.Set("AWS_REGION", "aws-region");
+    ObjectReplicaTarget target{
+        "s3", "https://objects.example.com", "bucket", "", "cluster", false};
+    EXPECT_FALSE(S3AdapterConfig::FromEnvironment(&target));
+    target.region = "eu-west-1";
+    const auto config = S3AdapterConfig::FromEnvironment(&target);
+    ASSERT_TRUE(config);
+    EXPECT_EQ(config->region, "eu-west-1");
+}
+
 TEST(S3AdapterConfigTest, FallsBackToStandardAwsVariables) {
     ScopedEnvironment env;
     env.Set("AWS_ENDPOINT_URL", "https://s3.us-west-2.amazonaws.com");

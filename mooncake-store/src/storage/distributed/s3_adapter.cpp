@@ -25,7 +25,8 @@ constexpr char kUnsignedPayload[] = "UNSIGNED-PAYLOAD";
 }  // namespace
 
 tl::expected<void, ErrorCode> S3ObjectStorageAdapter::Init() {
-    auto config = S3AdapterConfig::FromEnvironment();
+    auto config =
+        S3AdapterConfig::FromEnvironment(target_ ? &*target_ : nullptr);
     if (!config.has_value()) {
         return tl::make_unexpected(config.error());
     }

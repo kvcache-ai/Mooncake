@@ -47,6 +47,11 @@ class MasterServiceTestPeer {
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
 
+    // Exercise object commit and recovery with the in-memory HA log. Remote
+    // I/O and the cleanup worker are deliberately not started by this fixture.
+    StandbyMetadataStore& EnableObjectRecordsForTesting(
+        const ObjectStorageConfig& config);
+
     void SetBatchOpLogWriterFactoryForTesting(
         MasterService::BatchOpLogWriterFactory factory);
 
@@ -89,6 +94,10 @@ class MasterServiceTestPeer {
         const std::function<void(const TenantId&, metadata::Namespace&)>& visit)
         const {
         service_.VisitNamespaces(visit);
+    }
+
+    static auto KvMediaMasksForMetadata(const ObjectMetadata& metadata) {
+        return MasterService::KvMediaMasksForMetadata(metadata);
     }
 
     // Enable epoch bookkeeping without starting a live KV event publisher.

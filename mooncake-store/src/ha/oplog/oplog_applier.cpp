@@ -1,3 +1,4 @@
+#include "metadata_wire_compat.h"
 #include "ha/oplog/oplog_applier.h"
 
 #include <glog/logging.h>
@@ -193,7 +194,7 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
 
     // Deserialize payload using struct_pack (msgpack binary format)
     MetadataPayload payload;
-    auto result = struct_pack::deserialize_to(payload, entry.payload);
+    auto result = DeserializeMetadataPayload(payload, entry.payload);
     if (result != struct_pack::errc::ok) {
         LOG(ERROR) << "OpLogApplier: failed to deserialize payload for key="
                    << entry.object_key << ", sequence_id=" << entry.sequence_id

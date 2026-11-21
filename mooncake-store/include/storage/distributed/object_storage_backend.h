@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,8 @@ namespace mooncake {
 struct ObjectStorageBackendConfig {
     uint64_t max_object_bytes{256ULL * 1024 * 1024};
     uint64_t max_staging_bytes{1024ULL * 1024 * 1024};
+    // Standalone readers default to the same object limit as writers.
+    std::optional<uint64_t> max_read_object_bytes{std::nullopt};
 };
 
 // Synchronous I/O for a caller-selected immutable object name. The caller owns

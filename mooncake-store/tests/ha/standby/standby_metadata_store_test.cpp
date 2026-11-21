@@ -410,3 +410,71 @@ TEST(ObjectReplicaStateTest, ExistingSnapshotWireShapeRemainsReadable) {
 
 }  // namespace
 }  // namespace mooncake
+
+TEST(StandbyMetadataStoreObjectTest, ExactDescriptorAndIndexedCleanup) {
+    using namespace mooncake;
+    StandbyMetadataStore store;
+    ObjectReplicaTarget target{"s3",        "http://localhost:9000",
+                               "bucket",    "us-east-1",
+                               "isolated/", true};
+    ObjectUploadRecord record;
+    record.target = target;
+    record.tenant_id = "default";
+    record.key = "key";
+    record.writer = {1, 2};
+    record.replica_id = 31;
+    record.object = {"attempt-one", 64};
+    ObjectReplicaMutation mutation;
+    mutation.target = target;
+    mutation.records = {record};
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation("default", "key", mutation));
+    EXPECT_EQ(store.ObjectUploadCount(), 1);
+    ASSERT_TRUE(store.FirstObjectUploadForKey("default", "key"));
+    ASSERT_EQ(store.ActiveObjectUploadsForKey("default", "key").size(), 1);
+    EXPECT_TRUE(store.RetiredObjectUploadChunk("", 10).empty());
+    ASSERT_EQ(store.ObjectUploadChunk("", 1).size(), 1);
+    EXPECT_TRUE(store.ObjectUploadChunk("attempt-one", 1).empty());
+
+    record.phase = ObjectUploadPhase::UPLOADED;
+    record.upload_finished = true;
+    mutation.records = {record};
+    MetadataPayload payload;
+    payload.client_id = record.writer;
+    payload.size = 64;
+    Replica::Descriptor descriptor;
+    descriptor.id = 31;
+    descriptor.status = ReplicaStatus::COMPLETE;
+    descriptor.descriptor_variant =
+        ObjectStorageDescriptor{"wrong-attempt", 64};
+    payload.replicas = {descriptor};
+    auto bytes = struct_pack::serialize(payload);
+    mutation.metadata_payload.assign(bytes.begin(), bytes.end());
+    EXPECT_FALSE(store.ApplyObjectReplicaMutation("default", "key", mutation));
+    EXPECT_EQ(store.FindObjectUpload("attempt-one")->phase,
+              ObjectUploadPhase::AUTHORIZED);
+    EXPECT_FALSE(store.GetMetadata("default", "key"));
+
+    payload.replicas.front().get_object_storage_descriptor().object_key =
+        "attempt-one";
+    bytes = struct_pack::serialize(payload);
+    mutation.metadata_payload.assign(bytes.begin(), bytes.end());
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation("default", "key", mutation));
+    ASSERT_TRUE(store.GetMetadata("default", "key"));
+    record.phase = ObjectUploadPhase::RETIRED;
+    record.not_before_ms = 123;
+    mutation.records = {record};
+    mutation.metadata_payload.clear();
+    mutation.remove_value = true;
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation("default", "key", mutation));
+    EXPECT_FALSE(store.GetMetadata("default", "key"));
+    EXPECT_TRUE(store.ActiveObjectUploadsForKey("default", "key").empty());
+    EXPECT_EQ(store.RetiredObjectUploadChunk("", 10).size(), 1);
+    mutation.records.clear();
+    mutation.remove_value = false;
+    mutation.forget = {"attempt-one"};
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation("default", "key", mutation));
+    EXPECT_EQ(store.ObjectUploadCount(), 0);
+    EXPECT_FALSE(store.FirstObjectUploadForKey("default", "key"));
+    EXPECT_TRUE(store.RetiredObjectUploadChunk("", 10).empty());
+    EXPECT_TRUE(store.ObjectUploadChunk("", 10).empty());
+}
