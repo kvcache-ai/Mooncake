@@ -44,7 +44,12 @@ class PrefetchTeardownTest : public ::testing::Test {
         client_ = RealClient::create();
         ASSERT_TRUE(client_->setup_internal(config).has_value());
     }
-    void TearDown() override { master_.Stop(); }
+    void TearDown() override {
+        // Release the client's segments before the master goes away, or its
+        // destructor unmounts against a stopped master (RPC_FAIL noise).
+        client_.reset();
+        master_.Stop();
+    }
 
     // TEST_F bodies run in generated subclasses, which do NOT inherit this
     // fixture's friendship with RealClient — every touch of a private member
@@ -121,6 +126,44 @@ TEST_F(PrefetchTeardownTest, ShutdownIsIdempotentAndStopsNewWork) {
     EXPECT_EQ(client_->isExist(key, options), 1);
 
     EXPECT_EQ(client_->tearDownAll(), 0);
+}
+
+// The SSD prefetch cooldown/dedup knobs are seconds; they must keep rejecting
+// the IEC spellings like main did (1MiB must not become 1048576 seconds).
+// One case per knob so reverting either call site to default IEC parsing is
+// caught independently.
+TEST_F(PrefetchTeardownTest, SetupRejectsIecSuffixOnPrefetchCooldownSec) {
+    ConfigDict config = {
+        {CONFIG_KEY_LOCAL_HOSTNAME, "127.0.0.1"},
+        {CONFIG_KEY_METADATA_SERVER, "P2PHANDSHAKE"},
+        {CONFIG_KEY_GLOBAL_SEGMENT_SIZE, "16777216"},
+        {CONFIG_KEY_LOCAL_BUFFER_SIZE, "16777216"},
+        {CONFIG_KEY_PROTOCOL, "tcp"},
+        {CONFIG_KEY_MASTER_SERVER_ADDR, master_.master_address()},
+        {CONFIG_KEY_ENABLE_SSD_PREFETCH, "true"},
+        {CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC, "1MiB"},
+    };
+    auto client = RealClient::create();
+    const auto result = client->setup_internal(config);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(PrefetchTeardownTest, SetupRejectsIecSuffixOnPrefetchDedupTtlSec) {
+    ConfigDict config = {
+        {CONFIG_KEY_LOCAL_HOSTNAME, "127.0.0.1"},
+        {CONFIG_KEY_METADATA_SERVER, "P2PHANDSHAKE"},
+        {CONFIG_KEY_GLOBAL_SEGMENT_SIZE, "16777216"},
+        {CONFIG_KEY_LOCAL_BUFFER_SIZE, "16777216"},
+        {CONFIG_KEY_PROTOCOL, "tcp"},
+        {CONFIG_KEY_MASTER_SERVER_ADDR, master_.master_address()},
+        {CONFIG_KEY_ENABLE_SSD_PREFETCH, "true"},
+        {CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC, "1MiB"},
+    };
+    auto client = RealClient::create();
+    const auto result = client->setup_internal(config);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
 }  // namespace mooncake::test

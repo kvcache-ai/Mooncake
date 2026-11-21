@@ -73,6 +73,10 @@ DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200  # 3.125 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
 
 _SIZE_SUFFIXES = [
+    ("kib", 1024),
+    ("mib", 1024**2),
+    ("gib", 1024**3),
+    ("tib", 1024**4),
     ("kb", 1024),
     ("mb", 1024**2),
     ("gb", 1024**3),
@@ -124,22 +128,30 @@ _REQUIRED_NON_EMPTY_FIELDS = (
 )
 
 
-def _parse_segment_size(value) -> int:
-    if isinstance(value, int):
-        return value
+def _check_segment_size(value, field_name: str) -> None:
+    if not 0 <= value < (1 << 64):
+        raise ValueError(f"Invalid {field_name}: {value!r}. Size must fit in uint64.")
+
+
+def _parse_segment_size(value, field_name: str = "segment size") -> int:
+    """Parse bytes or binary size suffixes, including IEC KiB/MiB/GiB/TiB."""
     if isinstance(value, str):
         s = value.strip().lower()
         if not s:
-            raise ValueError("Invalid segment size: empty string")
+            raise ValueError(f"Invalid {field_name}: empty string")
         for suffix, multiplier in _SIZE_SUFFIXES:
             if s.endswith(suffix):
                 num = s[: -len(suffix)].strip()
                 if not num:
                     raise ValueError(
-                        f"Invalid segment size: missing number before '{suffix}'"
+                        f"Invalid {field_name}: missing number before '{suffix}'"
                     )
-                return int(float(num) * multiplier)
-        return int(float(s))
+                value = float(num) * multiplier
+                break
+        else:
+            value = float(s)
+    # Validate the scaled value while a negative fraction is still negative.
+    _check_segment_size(value, field_name)
     return int(value)
 
 
@@ -279,11 +291,7 @@ class MooncakeConfig:
             )
 
         for field_name in ("global_segment_size", "local_buffer_size"):
-            value = getattr(self, field_name)
-            if value < 0:
-                raise ValueError(
-                    f"Invalid {field_name}: {value}. Size must be non-negative."
-                )
+            _check_segment_size(getattr(self, field_name), field_name)
 
         for field_name in _REQUIRED_NON_EMPTY_FIELDS:
             value = getattr(self, field_name)
@@ -312,10 +320,12 @@ class MooncakeConfig:
             local_hostname=config.get("local_hostname"),
             metadata_server=config.get("metadata_server"),
             global_segment_size=_parse_segment_size(
-                config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
+                config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE),
+                "global_segment_size",
             ),
             local_buffer_size=_parse_segment_size(
-                config.get("local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE)
+                config.get("local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE),
+                "local_buffer_size",
             ),
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", ""),
@@ -353,10 +363,12 @@ class MooncakeConfig:
                 global_segment_size=_parse_segment_size(
                     os.getenv(
                         "MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE
-                    )
+                    ),
+                    "global_segment_size",
                 ),
                 local_buffer_size=_parse_segment_size(
-                    os.getenv("MOONCAKE_LOCAL_BUFFER_SIZE", DEFAULT_LOCAL_BUFFER_SIZE)
+                    os.getenv("MOONCAKE_LOCAL_BUFFER_SIZE", DEFAULT_LOCAL_BUFFER_SIZE),
+                    "local_buffer_size",
                 ),
                 protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
                 device_name=os.getenv("MOONCAKE_DEVICE", ""),

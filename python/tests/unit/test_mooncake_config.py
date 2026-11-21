@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from mooncake import mooncake_config as _cfg_mod
 from mooncake.mooncake_config import (
@@ -79,6 +80,52 @@ class TestMooncakeConfig(unittest.TestCase):
         self.assertEqual(config.tenant_id, "default")
         self.assertEqual(config.enable_client_http_server, False)
         self.assertEqual(config.client_http_port, 9300)
+
+    def test_iec_sizes_from_file(self):
+        self.write_config(
+            {
+                **self.valid_config,
+                "global_segment_size": "256MiB",
+                "local_buffer_size": "1.5 GiB",
+            }
+        )
+        config = MooncakeConfig.from_file(self.config_file)
+        self.assertEqual(config.global_segment_size, 268435456)
+        self.assertEqual(config.local_buffer_size, 1610612736)
+
+    def test_iec_sizes_from_env(self):
+        with patch.dict(
+            os.environ,
+            {
+                "MOONCAKE_MASTER": "localhost:8081",
+                "MOONCAKE_GLOBAL_SEGMENT_SIZE": "1TiB",
+                "MOONCAKE_LOCAL_BUFFER_SIZE": "512kib",
+            },
+            clear=True,
+        ):
+            config = MooncakeConfig.load_from_env()
+        self.assertEqual(config.global_segment_size, 1099511627776)
+        self.assertEqual(config.local_buffer_size, 524288)
+
+    def test_size_boundaries_in_file_and_env(self):
+        for invalid in ("16777216TiB", "-0.0005KiB"):
+            self.write_config({**self.valid_config, "global_segment_size": invalid})
+            with self.subTest(source="file", value=invalid), self.assertRaisesRegex(
+                ValueError, "global_segment_size"
+            ):
+                MooncakeConfig.from_file(self.config_file)
+            with patch.dict(
+                os.environ,
+                {
+                    "MOONCAKE_MASTER": "localhost:8081",
+                    "MOONCAKE_LOCAL_BUFFER_SIZE": invalid,
+                },
+                clear=True,
+            ):
+                with self.subTest(source="env", value=invalid), self.assertRaisesRegex(
+                    ValueError, "local_buffer_size"
+                ):
+                    MooncakeConfig.load_from_env()
 
     def test_load_tenant_id_from_file(self):
         """Test loading tenant_id from configuration file"""
@@ -316,9 +363,60 @@ class TestMooncakeConfig(unittest.TestCase):
 
 
 class TestParseSegmentSize(unittest.TestCase):
+    def test_iec_suffixes(self):
+        for suffix, expected in (
+            ("KiB", 1024),
+            ("MiB", 1048576),
+            ("GiB", 1073741824),
+            ("TiB", 1099511627776),
+        ):
+            for input_value, value in (
+                (f"1{suffix}", expected),
+                (f"1{suffix.lower()}", expected),
+                (f"1{suffix.upper()}", expected),
+                (f"1{suffix.swapcase()}", expected),
+                (f"1.5 {suffix}", expected * 3 // 2),
+                (f" \t2\t{suffix}\r\n", expected * 2),
+                (f"0{suffix}", 0),
+            ):
+                with self.subTest(input_value=input_value):
+                    self.assertEqual(_parse_segment_size(input_value), value)
+
+    def test_invalid_iec_suffixes(self):
+        for value in (
+            "KiB",
+            "MiB",
+            "GiB",
+            "TiB",
+            "1Ki",
+            "1MiBB",
+            "256XiB",
+            "1PiB",
+            "1MiBjunk",
+            "1Mi B",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _parse_segment_size(value)
+
     def test_integer_passthrough(self):
         self.assertEqual(_parse_segment_size(1024), 1024)
         self.assertEqual(_parse_segment_size(0), 0)
+        self.assertEqual(_parse_segment_size((1 << 64) - 1), (1 << 64) - 1)
+
+    def test_uint64_bounds_before_truncation(self):
+        for value in (
+            "-0.0005KiB",
+            "-0.0005KB",
+            -0.5,
+            "16777216TiB",
+            "16777216TB",
+            1 << 64,
+            "nanMiB",
+            "infGiB",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _parse_segment_size(value)
+        self.assertEqual(_parse_segment_size("18446744073709549568B"), (1 << 64) - 2048)
 
     def test_float_passthrough(self):
         self.assertEqual(_parse_segment_size(1.5), 1)
@@ -453,6 +551,11 @@ class TestMooncakeConfigValidation(unittest.TestCase):
         config = self.make(global_segment_size=0, local_buffer_size=0)
         self.assertEqual(config.global_segment_size, 0)
         self.assertEqual(config.local_buffer_size, 0)
+
+    def test_direct_sizes_fit_uint64(self):
+        for field in ("global_segment_size", "local_buffer_size"):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
+                self.make(**{field: 1 << 64})
 
     def test_negative_sizes_raise(self):
         with self.assertRaises(ValueError) as cm:
