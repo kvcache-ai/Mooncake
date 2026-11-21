@@ -2190,6 +2190,7 @@ void MasterService::EraseMetadata(metadata::Namespace& ns,
         if (source != nullptr) {
             source->dec_refcnt();
         }
+        QuarantineDrainTarget(metadata, *state.replication_task);
     }
     ErasePromotionTaskIfPresent(state);
     dynamic_replication_.ClearPendingLocked(tenant_id, key, state);
@@ -2563,6 +2564,11 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
     {
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
 
+        if (!job.drain_tasks_settled) {
+            SettleRetiredDrainTasks(job);
+            job.drain_tasks_settled = true;
+        }
+
         {
             // Prepare whatever the client still owns and this job has not
             // prepared yet. The segments are enumerated again on every attempt
@@ -2724,6 +2730,34 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
     return true;
 }
 
+void MasterService::SettleRetiredDrainTasks(const ClientOffboardingJob& job) {
+    if (!job.retired_session || job.retired_session->ShouldRetainResources()) {
+        return;
+    }
+    std::vector<Task> tasks;
+    {
+        auto read = task_manager_.get_read_access();
+        for (const auto& [_, task] : read) {
+            if (task.retained_by_drain && task.drain_source &&
+                task.drain_source->session == job.retired_session &&
+                task.status != TaskStatus::SUCCESS) {
+                tasks.push_back(task);
+            }
+        }
+    }
+    for (const auto& task : tasks) {
+        ReplicaMovePayload payload;
+        struct_json::from_json(payload, task.payload);
+        MetadataAccessorRW accessor(
+            this, ObjectIdentity{TenantId(payload.tenant_id), payload.key},
+            MetadataAccessorRW::AsIs{});
+        AbortDrainMove(accessor, task.id);
+        task_manager_.get_write_access().complete_task(job.client_id, task.id,
+                                                       TaskStatus::FAILED,
+                                                       "Source client offline");
+    }
+}
+
 void MasterService::TaskCleanupThreadFunc() {
     LOG(INFO) << "Task cleanup thread started";
     while (task_cleanup_running_) {
@@ -2798,6 +2832,11 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
+        if (segment_access.HasProtectedDrainTarget(segment_id)) {
+            // The caller may unregister and free the memory after success.
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
         Segment segment;
         if (!segment_access.GetSegment(segment_id, segment)) {
             return {};  // Unmount is idempotent for a missing segment.
@@ -2883,6 +2922,9 @@ auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    if (segment_access.HasProtectedDrainTarget(segment_id)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     err = segment_access.PrepareGracefulUnmountSegment(segment_id);
     if (err == ErrorCode::SEGMENT_NOT_FOUND) {
         return {};
@@ -5393,6 +5435,11 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 }
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
+            if (accessor.HasReplicationTask() &&
+                accessor.GetReplicationTask().drain_task_id != UUID{}) {
+                return tl::make_unexpected(
+                    ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+            }
             if (enable_oplog_ && ordered_oplog_writer_) {
                 auto err = PersistRemoveForHA("PutStart(stale cleanup REMOVE)",
                                               object_id.tenant_id, key);
@@ -6939,10 +6986,17 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
 
 tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
-    const std::string& src_segment, const std::string& tgt_segment) {
+    const std::string& src_segment, const std::string& tgt_segment,
+    const Task* drain_task) {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     auto serving_guard = client_sessions_.TryAcquireServingSession(client_id);
     if (!serving_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (drain_task &&
+        (serving_guard->Session() != drain_task->drain_source->session ||
+         drain_task->status != TaskStatus::PROCESSING ||
+         drain_task->drain_move_started)) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
@@ -6986,6 +7040,15 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         LOG(ERROR) << "key=" << key << ", src_segment=" << src_segment
                    << ", replica not found or not completed";
         return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
+    }
+    if (drain_task) {
+        auto segments = segment_manager_.getSegmentAccess();
+        if (segments.GetDrainSource(src_segment) != drain_task->drain_source ||
+            source->getClientSession() != serving_guard->Session() ||
+            segments.GetAllocator(drain_task->drain_source->segment_id) !=
+                source->GetMemoryAllocator()) {
+            return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
+        }
     }
     if (accessor.InProcessing() || accessor.GetState().offloading_task ||
         source->is_busy()) {
@@ -7050,9 +7113,30 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     if (replication_task) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
+    if (drain_task) {
+        // Keep retirement ordered with the grant under the key lock. The
+        // write may reach the target even if this RPC's response is lost.
+        auto segments = segment_manager_.getSegmentAccess();
+        if (!replicas.empty()) {
+            const auto result = segments.ProtectDrainTarget(
+                drain_task->id, client_id, tgt_segment, replicas.front());
+            if (result != ErrorCode::OK) {
+                return tl::make_unexpected(result);
+            }
+        }
+        if (!task_manager_.get_write_access().start_drain_move(
+                drain_task->id)) {
+            segments.ReleaseDrainTarget(drain_task->id, client_id);
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
     replication_task.emplace(client_id, std::chrono::system_clock::now(),
                              ReplicationTask::Type::MOVE, source->id(),
                              std::move(replica_ids), UUID{}, 0);
+    if (drain_task) {
+        replication_task->drain_task_id = drain_task->id;
+    }
     if (target != nullptr) {
         replication_task->existing_move_target = target->id();
     }
@@ -7067,12 +7151,18 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     return response;
 }
 
-tl::expected<void, ErrorCode> MasterService::MoveEnd(
-    const UUID& client_id, const std::string& key, const TenantId& tenant_id) {
+tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
+                                                     const std::string& key,
+                                                     const TenantId& tenant_id,
+                                                     const Task* drain_task) {
     auto retaining_guard =
         client_sessions_.TryAcquireRetainingSession(client_id);
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (drain_task &&
+        retaining_guard->Session() != drain_task->drain_source->session) {
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     MetadataAccessorRW accessor(this,
@@ -7089,6 +7179,9 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
     }
 
     auto& task = accessor.GetReplicationTask();
+    if (task.drain_task_id != (drain_task ? drain_task->id : UUID{})) {
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
     if (task.client_id != client_id) {
         LOG(ERROR) << "Illegal client " << client_id << " to MoveEnd key "
                    << key << ", was MoveStart-ed by " << task.client_id;
@@ -7100,6 +7193,11 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    if (drain_task) {
+        // The accepted executor waited for every write before committing.
+        segment_manager_.getSegmentAccess().ReleaseDrainTarget(drain_task->id,
+                                                               client_id);
+    }
     auto& metadata = accessor.Get();
     auto source_id = task.source_id;
     auto source = metadata.GetReplicaByID(source_id);
@@ -7243,15 +7341,26 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
 
     accessor.EraseReplicationTask();
 
+    if (drain_task) {
+        const auto result = task_manager_.get_write_access().complete_task(
+            client_id, drain_task->id, TaskStatus::SUCCESS, "Move committed");
+        DCHECK_EQ(result, ErrorCode::OK);
+    }
+
     return {};
 }
 
 tl::expected<void, ErrorCode> MasterService::MoveRevoke(
-    const UUID& client_id, const std::string& key, const TenantId& tenant_id) {
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    const Task* drain_task) {
     auto retaining_guard =
         client_sessions_.TryAcquireRetainingSession(client_id);
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (drain_task &&
+        retaining_guard->Session() != drain_task->drain_source->session) {
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     MetadataAccessorRW accessor(this,
@@ -7268,6 +7377,9 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     }
 
     auto& task = accessor.GetReplicationTask();
+    if (task.drain_task_id != (drain_task ? drain_task->id : UUID{})) {
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
     if (task.client_id != client_id) {
         LOG(ERROR) << "Illegal client " << client_id << " to MoveRevoke key "
                    << key << ", was MoveStart-ed by " << task.client_id;
@@ -7277,6 +7389,11 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     if (task.type != ReplicationTask::Type::MOVE) {
         LOG(ERROR) << "Ongoing replication task type is COPY instead of MOVE";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    if (drain_task) {
+        AbortDrainMove(accessor, drain_task->id);
+        return {};
     }
 
     auto& metadata = accessor.Get();
@@ -7306,6 +7423,80 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     }
 
     return {};
+}
+
+tl::expected<MoveStartResponse, ErrorCode> MasterService::StartDrainMove(
+    const UUID& client_id, const UUID& task_id) {
+    const auto task = task_manager_.get_read_access().find_task_by_id(task_id);
+    if (!task || !task->drain_source || task->assigned_client != client_id) {
+        return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
+    }
+    ReplicaMovePayload payload;
+    struct_json::from_json(payload, task->payload);
+    return MoveStart(client_id, payload.key, TenantId(payload.tenant_id),
+                     payload.source, payload.target, &*task);
+}
+
+tl::expected<void, ErrorCode> MasterService::FinishDrainMove(
+    const UUID& client_id, const UUID& task_id, bool commit,
+    bool writes_drained) {
+    if (commit && !writes_drained) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!commit && writes_drained) {
+        // An acknowledgement for this exact write can release its range
+        // after retirement, but cannot publish or mutate the old replica.
+        segment_manager_.getSegmentAccess().ReleaseDrainTarget(task_id,
+                                                               client_id);
+    }
+    const auto task = task_manager_.get_read_access().find_task_by_id(task_id);
+    if (!task || !task->drain_source || task->assigned_client != client_id) {
+        return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
+    }
+    if (task->is_finished()) {
+        if (!commit || task->status == TaskStatus::SUCCESS) {
+            return {};
+        }
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    ReplicaMovePayload payload;
+    struct_json::from_json(payload, task->payload);
+    const TenantId tenant_id(payload.tenant_id);
+    if (commit) {
+        return MoveEnd(client_id, payload.key, tenant_id, &*task);
+    }
+    return MoveRevoke(client_id, payload.key, tenant_id, &*task);
+}
+
+void MasterService::QuarantineDrainTarget(ObjectMetadata& metadata,
+                                          const ReplicationTask& task) {
+    if (task.drain_task_id == UUID{} || task.replica_ids.empty()) {
+        return;
+    }
+    auto replicas = PopReplicasWithCacheTotalAccounting(
+        metadata, [&task](const Replica& replica) {
+            return replica.id() == task.replica_ids.front();
+        });
+    segment_manager_.getSegmentAccess().QuarantineDrainTarget(
+        task.drain_task_id, std::move(replicas));
+}
+
+void MasterService::AbortDrainMove(MetadataAccessorRW& accessor,
+                                   const UUID& task_id) {
+    if (!accessor.HasReplicationTask() ||
+        accessor.GetReplicationTask().drain_task_id != task_id) {
+        return;
+    }
+    const auto& task = accessor.GetReplicationTask();
+    auto& metadata = accessor.Get();
+    if (auto* source = metadata.GetReplicaByID(task.source_id)) {
+        source->dec_refcnt();
+    }
+    QuarantineDrainTarget(metadata, task);
+    accessor.EraseReplicationTask();
+    if (!metadata.IsValid()) {
+        accessor.Erase();
+    }
 }
 
 // How a single-key remove reports a refusal: a held lease is routine, while
@@ -9708,6 +9899,11 @@ void MasterService::DiscardExpiredProcessingReplicas(
         }
         auto& task = accessor.GetState().replication_task;
 
+        if (task->drain_task_id != UUID{}) {
+            // Its address remains writable until the executor acknowledges
+            // completion or offboarding moves the allocation to quarantine.
+            continue;
+        }
         const auto ttl = task->start_time + put_start_release_timeout_sec_;
         if (ttl > now || task->durable_cleanup_pending) {
             continue;
@@ -10459,13 +10655,13 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     const std::string& key, const TenantId& tenant_id,
     const std::string& source, const std::string& target) {
-    return CreateMoveTaskInternal(key, tenant_id, source, target, false);
+    return CreateMoveTaskInternal(key, tenant_id, source, target, nullptr);
 }
 
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
     const std::string& key, const TenantId& tenant_id,
     const std::string& source, const std::string& target,
-    bool retained_by_drain) {
+    const DrainSource* drain_source) {
     auto normalized_tenant_result = ResolveTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
@@ -10578,6 +10774,11 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
         })) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    if (drain_source &&
+        (submission_access.GetDrainSource(source) != *drain_source ||
+         source_session != drain_source->session)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
 
     return task_manager_.get_write_access()
         .submit_task_typed<TaskType::REPLICA_MOVE>(
@@ -10586,7 +10787,9 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
              .key = object_id.user_key,
              .source = source,
              .target = target},
-            retained_by_drain);
+            drain_source != nullptr,
+            drain_source ? std::optional<DrainSource>(*drain_source)
+                         : std::nullopt);
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
@@ -10650,12 +10853,41 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
 
 tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
     const UUID& client_id, const TaskCompleteRequest& request) {
+    const auto task =
+        task_manager_.get_read_access().find_task_by_id(request.id);
+    if (task && task->drain_source && task->assigned_client == client_id &&
+        task->is_finished()) {
+        return {};
+    }
     auto retaining_guard =
         client_sessions_.TryAcquireRetainingSession(client_id);
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    if (task && task->drain_source) {
+        if (retaining_guard->Session() != task->drain_source->session) {
+            return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+        }
+        if (request.status != TaskStatus::CANCELED &&
+            request.status != TaskStatus::FAILED) {
+            // Only MoveEnd can publish a successful Drain Move.
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        ReplicaMovePayload payload;
+        struct_json::from_json(payload, task->payload);
+        MetadataAccessorRW accessor(
+            this, ObjectIdentity{TenantId(payload.tenant_id), payload.key},
+            MetadataAccessorRW::AsIs{});
+        AbortDrainMove(accessor, task->id);
+        const auto result = task_manager_.get_write_access().complete_task(
+            client_id, request.id, request.status, request.message);
+        if (result != ErrorCode::OK) {
+            return tl::make_unexpected(result);
+        }
+        return {};
+    }
     auto write_access = task_manager_.get_write_access();
     ErrorCode err = write_access.complete_task(client_id, request.id,
                                                request.status, request.message);
@@ -10775,12 +11007,24 @@ tl::expected<UUID, ErrorCode> MasterService::CreateTimedDrainJob(
             now + std::chrono::milliseconds(static_cast<int64_t>(timeout_ms));
     }
     std::vector<std::string> draining_segments;
+    std::unordered_map<std::string, DrainSource> sources;
+    std::unordered_set<std::string> drained_sources;
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
         auto valid = ValidateDrainRequestLocked(segment_access, request);
         if (!valid.has_value()) {
             return tl::make_unexpected(valid.error());
+        }
+
+        for (const auto& name : request.segments) {
+            auto source = segment_access.GetDrainSource(name);
+            if (!source || !source->session ||
+                !source->session->ShouldRetainResources()) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+            sources.emplace(name, std::move(*source));
         }
 
         draining_segments.reserve(request.segments.size());
@@ -10796,6 +11040,9 @@ tl::expected<UUID, ErrorCode> MasterService::CreateTimedDrainJob(
                 return tl::make_unexpected(err);
             }
             // Preserve a pre-existing DRAINING or DRAINED status on retry.
+            if (previous == SegmentStatus::DRAINED) {
+                drained_sources.insert(segment_name);
+            }
             if (previous != SegmentStatus::OK) {
                 continue;
             }
@@ -10817,6 +11064,8 @@ tl::expected<UUID, ErrorCode> MasterService::CreateTimedDrainJob(
         job->id = generate_uuid();
     } while (drain_jobs_.contains(job->id));
     job->request = request;
+    job->sources = std::move(sources);
+    job->drained_sources = std::move(drained_sources);
     job->deadline = deadline;
     job->created_at = std::chrono::system_clock::now();
     job->last_updated_at = job->created_at;
@@ -11028,6 +11277,11 @@ bool MasterService::FinishDrainJobCancellation(DrainJob& job) {
     // The job lock keeps queries and scheduling behind segment restoration.
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     for (const auto& segment_name : job.request.segments) {
+        const auto& source = job.sources.at(segment_name);
+        if (!source.session->ShouldRetainResources() ||
+            segment_access.GetDrainSource(segment_name) != source) {
+            continue;
+        }
         SegmentStatus status = SegmentStatus::UNDEFINED;
         if (segment_access.GetSegmentStatusByName(segment_name, status) ==
                 ErrorCode::OK &&
@@ -11121,9 +11375,12 @@ void MasterService::RefreshDrainJobTasks(DrainJob& job) {
             std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
             MetadataAccessorRO accessor(
                 this, ObjectIdentity{active_task.tenant_id, active_task.key});
-            if (accessor.IsPublished() &&
-                accessor.GetState().replication_task) {
-                continue;
+            if (accessor.IsPublished()) {
+                const auto& move = accessor.GetState().replication_task;
+                if (move && (!task_opt->drain_source ||
+                             move->drain_task_id == task_id)) {
+                    continue;
+                }
             }
         }
 
@@ -11227,6 +11484,10 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                     if (DrainJobStopRequested(job)) {
                         return;
                     }
+                    if (!job.sources.at(source_segment)
+                             .session->ShouldRetainResources()) {
+                        continue;
+                    }
                     const auto unit_key =
                         MakeDrainUnitKey(tenant_id, key, source_segment);
                     if (job.completed_unit_keys.contains(unit_key) ||
@@ -11304,9 +11565,9 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
         if (DrainJobStopRequested(job)) {
             return;
         }
-        auto task_id = CreateMoveTaskInternal(plan.key, plan.tenant_id,
-                                              plan.source_segment,
-                                              plan.target_segment, true);
+        auto task_id = CreateMoveTaskInternal(
+            plan.key, plan.tenant_id, plan.source_segment, plan.target_segment,
+            &job.sources.at(plan.source_segment));
         if (task_id.has_value()) {
             ActiveDrainTask active_task;
             active_task.task_id = task_id.value();
@@ -11344,6 +11605,16 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
 
     std::unordered_set<std::string> remaining_segments;
     std::unordered_set<std::string> remaining_unit_keys;
+    std::unordered_set<std::string> unavailable_sources;
+    {
+        auto segments = segment_manager_.getSegmentAccess();
+        for (const auto& [name, source] : job.sources) {
+            if (!source.session->ShouldRetainResources() ||
+                segments.GetDrainSource(name) != source) {
+                unavailable_sources.insert(name);
+            }
+        }
+    }
     {
         std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
         VisitNamespaces([&](const TenantId& tenant_id,
@@ -11355,6 +11626,9 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
                 const auto replica_segments =
                     object.metadata().GetReplicaSegmentNames();
                 for (const auto& source_segment : job.request.segments) {
+                    if (unavailable_sources.contains(source_segment)) {
+                        continue;
+                    }
                     if (std::find(replica_segments.begin(),
                                   replica_segments.end(),
                                   source_segment) != replica_segments.end()) {
@@ -11375,6 +11649,12 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
         for (const auto& segment_name : job.request.segments) {
+            const auto& source = job.sources.at(segment_name);
+            if (!source.session->ShouldRetainResources() ||
+                segment_access.GetDrainSource(segment_name) != source) {
+                unavailable_sources.insert(segment_name);
+                continue;
+            }
             if (!remaining_segments.contains(segment_name)) {
                 // Detached buffers still occupy the mounted allocator even
                 // after the last object has stopped advertising this segment.
@@ -11382,8 +11662,11 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
                     awaiting_reclamation = true;
                     continue;
                 }
-                (void)segment_access.SetSegmentStatusByName(
-                    segment_name, SegmentStatus::DRAINED);
+                if (segment_access.SetSegmentStatusByName(
+                        segment_name, SegmentStatus::DRAINED) ==
+                    ErrorCode::OK) {
+                    job.drained_sources.insert(segment_name);
+                }
             }
         }
     }
@@ -11392,7 +11675,12 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         return false;
     }
 
-    if (remaining_segments.empty()) {
+    const bool source_failed =
+        std::any_of(unavailable_sources.begin(), unavailable_sources.end(),
+                    [&job](const auto& name) {
+                        return !job.drained_sources.contains(name);
+                    });
+    if (remaining_segments.empty() && !source_failed) {
         job.status = JobStatus::SUCCEEDED;
         job.last_updated_at = std::chrono::system_clock::now();
         job.message = "Drain job finished successfully";
@@ -11406,7 +11694,7 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
             break;
         }
     }
-    if (!all_remaining_terminal_failed) {
+    if (!remaining_segments.empty() && !all_remaining_terminal_failed) {
         return false;
     }
 
@@ -11414,10 +11702,15 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
         for (const auto& segment_name : job.request.segments) {
+            const auto& source = job.sources.at(segment_name);
+            if (!source.session->ShouldRetainResources() ||
+                segment_access.GetDrainSource(segment_name) != source) {
+                continue;
+            }
             SegmentStatus status = SegmentStatus::UNDEFINED;
             if (segment_access.GetSegmentStatusByName(segment_name, status) ==
                     ErrorCode::OK &&
-                status != SegmentStatus::UNMOUNTING) {
+                status == SegmentStatus::DRAINING) {
                 (void)segment_access.SetSegmentStatusByName(segment_name,
                                                             SegmentStatus::OK);
             }
@@ -11426,7 +11719,10 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
 
     job.status = JobStatus::FAILED;
     job.last_updated_at = std::chrono::system_clock::now();
-    job.message = "Drain job failed: unrecoverable units remain";
+    job.message =
+        source_failed
+            ? "Drain job failed: source retired before drain completed"
+            : "Drain job failed: unrecoverable units remain";
     return true;
 }
 

@@ -707,6 +707,10 @@ class MasterClient {
         const std::string& key);
     [[nodiscard]] tl::expected<void, ErrorCode> MoveRevoke(
         const std::string& key, const std::string& tenant_id);
+    [[nodiscard]] tl::expected<MoveStartResponse, ErrorCode> StartDrainMove(
+        const UUID& task_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> FinishDrainMove(
+        const UUID& task_id, bool commit, bool writes_drained);
 
     /**
      * @brief Create a task to copy an object's replica to target segments

@@ -1297,7 +1297,8 @@ class Client {
     tl::expected<void, ErrorCode> ExecuteReplicaTransfer(
         const std::string& key, const std::string& action_name,
         std::function<tl::expected<void, ErrorCode>()> end_fn,
-        std::function<tl::expected<void, ErrorCode>()> revoke_fn,
+        std::function<tl::expected<void, ErrorCode>(bool writes_drained)>
+            revoke_fn,
         const Replica::Descriptor& source,
         const std::vector<Replica::Descriptor>& targets, const UUID* task_id);
 
@@ -1338,7 +1339,8 @@ class Client {
                                        const std::string& tenant_id,
                                        const std::string& source,
                                        const std::string& target,
-                                       const UUID* task_id = nullptr);
+                                       const UUID* task_id = nullptr,
+                                       bool drain_move = false);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;

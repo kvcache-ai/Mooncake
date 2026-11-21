@@ -218,6 +218,28 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     }
     const uintptr_t buffer = segment.base;
     const size_t size = segment.size;
+    for (const auto& [task_id, target] : segment_manager_->drain_targets_) {
+        // CXL reuses the same global allocator, so its held allocations
+        // already remain protected when another view is mounted.
+        if (segment_manager_->enable_cxl_ && segment.protocol == "cxl" &&
+            target.segment.protocol == "cxl") {
+            continue;
+        }
+        const bool same_storage =
+            segment.id == target.segment.id || client_id == target.owner ||
+            segment.name == target.segment.name ||
+            (!segment.te_endpoint.empty() &&
+             segment.te_endpoint == target.segment.te_endpoint);
+        const bool overlaps = buffer <= target.address
+                                  ? target.address - buffer < size
+                                  : buffer - target.address < target.bytes;
+        if (same_storage && overlaps) {
+            LOG(WARNING) << "segment_name=" << segment.name
+                         << ", task_id=" << task_id
+                         << ", error=drain_target_write_still_protected";
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        }
+    }
 
     // Check if cxl storage is enable
     if (segment_manager_->enable_cxl_ && segment.protocol == "cxl") {
@@ -395,6 +417,125 @@ bool ScopedSegmentAccess::GetSegment(const UUID& segment_id,
     }
     segment = mounted->second.segment;
     return true;
+}
+
+std::optional<DrainSource> ScopedSegmentAccess::GetDrainSource(
+    const std::string& name) const {
+    const auto indexed = segment_manager_->segment_id_by_name_.find(name);
+    if (indexed == segment_manager_->segment_id_by_name_.end()) {
+        return std::nullopt;
+    }
+    const auto mounted =
+        segment_manager_->mounted_segments_.find(indexed->second);
+    if (mounted == segment_manager_->mounted_segments_.end() ||
+        !mounted->second.allocator_registration) {
+        return std::nullopt;
+    }
+    return DrainSource{
+        mounted->first,
+        mounted->second.allocator_registration->GetClientSession()};
+}
+
+ErrorCode ScopedSegmentAccess::ProtectDrainTarget(const UUID& task_id,
+                                                  const UUID& writer,
+                                                  const std::string& name,
+                                                  const Replica& replica) {
+    const auto& session = replica.getClientSession();
+    const auto allocator = replica.GetMemoryAllocator();
+    if (!session || !allocator || !replica.is_available()) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    const auto owner =
+        segment_manager_->client_segments_.find(session->ClientId());
+    if (owner == segment_manager_->client_segments_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    for (const auto& id : owner->second) {
+        const auto mounted = segment_manager_->mounted_segments_.find(id);
+        if (mounted == segment_manager_->mounted_segments_.end()) {
+            continue;
+        }
+        const auto& entry = mounted->second;
+        if (entry.buf_allocator != allocator ||
+            entry.status != SegmentStatus::OK || entry.segment.name != name ||
+            !entry.allocator_registration ||
+            entry.allocator_registration->GetClientSession() != session) {
+            continue;
+        }
+        const auto desc =
+            replica.get_descriptor().get_memory_descriptor().buffer_descriptor;
+        const UUID budget_id =
+            allocator == segment_manager_->cxl_global_allocator_
+                ? UUID{}
+                : entry.segment.id;
+        auto& reserved = segment_manager_->drain_target_bytes_[budget_id];
+        // Limit outstanding/isolated writes to half the allocator; allow a
+        // single larger object when it is the only outstanding write.
+        const auto limit =
+            std::max<size_t>(allocator->capacity() / 2, desc.size_);
+        if (reserved > limit - desc.size_) {
+            return ErrorCode::NO_AVAILABLE_HANDLE;
+        }
+        const auto [_, inserted] = segment_manager_->drain_targets_.try_emplace(
+            task_id,
+            SegmentManager::DrainTarget{.segment = entry.segment,
+                                        .owner = session->ClientId(),
+                                        .writer = writer,
+                                        .budget_id = budget_id,
+                                        .address = desc.buffer_address_,
+                                        .bytes = desc.size_,
+                                        .replica = std::nullopt});
+        if (!inserted) {
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        }
+        reserved += desc.size_;
+        return ErrorCode::OK;
+    }
+    return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+}
+
+void ScopedSegmentAccess::QuarantineDrainTarget(const UUID& task_id,
+                                                std::vector<Replica> replicas) {
+    auto target = segment_manager_->drain_targets_.find(task_id);
+    if (target == segment_manager_->drain_targets_.end() ||
+        target->second.quarantined) {
+        return;
+    }
+    auto& hold = target->second;
+    hold.quarantined = true;
+    if (!replicas.empty()) {
+        hold.replica.emplace(std::move(replicas.front()));
+    }
+    LOG(INFO) << "task_id=" << task_id << ", segment_name=" << hold.segment.name
+              << ", bytes=" << hold.bytes
+              << ", action=drain_target_quarantined";
+    VLOG(1) << "task_id=" << task_id << ", address=" << hold.address
+            << ", action=drain_target_address";
+}
+
+void ScopedSegmentAccess::ReleaseDrainTarget(const UUID& task_id,
+                                             const UUID& writer) {
+    auto target = segment_manager_->drain_targets_.find(task_id);
+    if (target == segment_manager_->drain_targets_.end() ||
+        target->second.writer != writer) {
+        return;
+    }
+    auto reserved =
+        segment_manager_->drain_target_bytes_.find(target->second.budget_id);
+    reserved->second -= target->second.bytes;
+    if (reserved->second == 0) {
+        segment_manager_->drain_target_bytes_.erase(reserved);
+    }
+    segment_manager_->drain_targets_.erase(target);
+}
+
+bool ScopedSegmentAccess::HasProtectedDrainTarget(
+    const UUID& segment_id) const {
+    return std::any_of(segment_manager_->drain_targets_.begin(),
+                       segment_manager_->drain_targets_.end(),
+                       [&](const auto& entry) {
+                           return entry.second.segment.id == segment_id;
+                       });
 }
 
 bool ScopedSegmentAccess::ReplaceAllocators(

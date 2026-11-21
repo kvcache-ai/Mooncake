@@ -4521,11 +4521,7 @@ TEST_F(MasterServiceTest, DrainJobTimeoutWaitsForMoveAndCanResume) {
     ASSERT_TRUE(fetched);
     ASSERT_EQ(fetched->size(), 1u);
     const auto assignment = fetched->front();
-    ReplicaMovePayload payload;
-    struct_json::from_json(payload, assignment.payload);
-    ASSERT_TRUE(service_->MoveStart(source.client_id, payload.key,
-                                    TenantId(payload.tenant_id), payload.source,
-                                    payload.target));
+    ASSERT_TRUE(service_->StartDrainMove(source.client_id, assignment.id));
 
     WaitUntil(
         [&] {
@@ -4549,12 +4545,9 @@ TEST_F(MasterServiceTest, DrainJobTimeoutWaitsForMoveAndCanResume) {
     ASSERT_TRUE(service_->CancelDrainJob(*first));
 
     // A move that committed concurrently with the deadline stays successful.
-    ASSERT_TRUE(service_->MoveEnd(source.client_id, payload.key,
-                                  TenantId(payload.tenant_id)));
-    TaskCompleteRequest completion;
-    completion.id = assignment.id;
-    completion.status = TaskStatus::SUCCESS;
-    ASSERT_TRUE(service_->MarkTaskToComplete(source.client_id, completion));
+    ASSERT_TRUE(service_->FinishDrainMove(source.client_id, assignment.id,
+                                          /*commit=*/true,
+                                          /*writes_drained=*/true));
     WaitUntil(
         [&] {
             auto result = service_->QueryDrainJob(*first);
@@ -4884,9 +4877,7 @@ TEST_F(MasterServiceTest, CancelDrainJobWaitsForProcessingTaskAndCleanup) {
     const auto assignment = fetched->front();
     ReplicaMovePayload payload;
     struct_json::from_json(payload, assignment.payload);
-    ASSERT_TRUE(service_->MoveStart(ctx0.client_id, payload.key,
-                                    TenantId(payload.tenant_id), payload.source,
-                                    payload.target));
+    ASSERT_TRUE(service_->StartDrainMove(ctx0.client_id, assignment.id));
 
     ASSERT_TRUE(service_->CancelDrainJob(*job_id));
     ASSERT_TRUE(service_->CancelDrainJob(*job_id));
@@ -4908,27 +4899,27 @@ TEST_F(MasterServiceTest, CancelDrainJobWaitsForProcessingTaskAndCleanup) {
     ASSERT_EQ(canceling->jobs.size(), 1u);
     EXPECT_EQ(canceling->jobs.front().id, *job_id);
 
-    // Even a terminal report is insufficient while a failed revoke has left
-    // an ongoing replication task. Cleanup must precede segment restoration.
+    // An ambiguous transfer failure does not authorize reusing the address.
     TaskCompleteRequest completion;
     completion.id = assignment.id;
     completion.status = TaskStatus::FAILED;
     completion.message = "revoke failed";
     ASSERT_TRUE(service_->MarkTaskToComplete(ctx0.client_id, completion));
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    EXPECT_EQ(service_->QueryDrainJob(*job_id)->status, JobStatus::CANCELING);
-    EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
-              SegmentStatus::DRAINING);
-    EXPECT_TRUE(service_->FetchTasks(ctx0.client_id, 16)->empty());
-
-    ASSERT_TRUE(service_->MoveRevoke(ctx0.client_id, payload.key,
-                                     TenantId(payload.tenant_id)));
     WaitUntil([&] {
         auto result = service_->QueryDrainJob(*job_id);
         return result && result->status == JobStatus::CANCELED;
     });
     EXPECT_EQ(service_->QuerySegmentStatus("segment_0").value(),
               SegmentStatus::OK);
+    EXPECT_GT(MasterMetricManager::instance().get_segment_allocated_mem_size(
+                  "segment_1"),
+              0);
+    ASSERT_TRUE(service_->FinishDrainMove(ctx0.client_id, assignment.id,
+                                          /*commit=*/false,
+                                          /*writes_drained=*/true));
+    EXPECT_EQ(MasterMetricManager::instance().get_segment_allocated_mem_size(
+                  "segment_1"),
+              0);
     auto replicas = service_->GetReplicaList(payload.key, TenantId::Default());
     ASSERT_TRUE(replicas);
     ASSERT_EQ(replicas->replicas.size(), 1u);
@@ -4964,17 +4955,24 @@ TEST_F(MasterServiceTest, CancelDrainJobKeepsMoveCommittedDuringCancellation) {
     ASSERT_EQ(assignments.size(), 1u);
     ReplicaMovePayload payload;
     struct_json::from_json(payload, assignments.front().payload);
-    ASSERT_TRUE(service_->MoveStart(source.client_id, payload.key,
-                                    TenantId(payload.tenant_id), payload.source,
-                                    payload.target));
+    ASSERT_TRUE(
+        service_->StartDrainMove(source.client_id, assignments.front().id));
     ASSERT_TRUE(service_->CancelDrainJob(*job_id));
-    ASSERT_TRUE(service_->MoveEnd(source.client_id, payload.key,
-                                  TenantId(payload.tenant_id)));
-    TaskCompleteRequest completion;
-    completion.id = assignments.front().id;
-    completion.status = TaskStatus::SUCCESS;
-    completion.message = "committed before cancellation";
-    ASSERT_TRUE(service_->MarkTaskToComplete(source.client_id, completion));
+    ASSERT_TRUE(service_->FinishDrainMove(source.client_id,
+                                          assignments.front().id,
+                                          /*commit=*/true,
+                                          /*writes_drained=*/true));
+    EXPECT_EQ(service_->QueryTask(assignments.front().id)->status,
+              TaskStatus::SUCCESS);
+    Segment retired_source;
+    {
+        auto segments =
+            MasterServiceTestPeer::SegmentManager(*service_).getSegmentAccess();
+        ASSERT_TRUE(segments.GetSegment(source.segment_id, retired_source));
+    }
+    RetireSegmentForTest(*service_, retired_source, source.client_id);
+    EXPECT_EQ(service_->QueryTask(assignments.front().id)->status,
+              TaskStatus::SUCCESS);
     WaitUntil([&] {
         auto result = service_->QueryDrainJob(*job_id);
         return result && result->status == JobStatus::CANCELED;
@@ -4988,6 +4986,92 @@ TEST_F(MasterServiceTest, CancelDrainJobKeepsMoveCommittedDuringCancellation) {
                   .buffer_descriptor.transport_endpoint_,
               "segment_1");
     EXPECT_TRUE(service_->FetchTasks(source.client_id, 16)->empty());
+}
+
+TEST_F(MasterServiceTest, DrainJobRetirementProtectsTargetAcrossRemount) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(0)
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .set_max_total_processing_tasks(1)
+                              .build());
+    const auto source = MakeSegment("source");
+    const auto target = MakeSegment("target", 0x400000000);
+    const auto source_id = generate_uuid();
+    const auto target_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(source, source_id));
+    ASSERT_TRUE(service.MountSegment(target, target_id));
+    PutObjectOnSegment(service, source_id, source.name);
+    const CreateDrainJobRequest request{.segments = {source.name},
+                                        .target_segments = {target.name},
+                                        .max_concurrency = 1};
+    auto job = service.CreateDrainJob(request);
+    ASSERT_TRUE(job);
+
+    std::vector<TaskAssignment> assignments;
+    WaitUntil([&] {
+        auto fetched = service.FetchTasks(source_id, 1);
+        if (!fetched || fetched->empty()) return false;
+        assignments = std::move(*fetched);
+        return true;
+    });
+    ASSERT_EQ(assignments.size(), 1u);
+    const auto attempt = assignments.front().id;
+    auto start = service.StartDrainMove(source_id, attempt);
+    ASSERT_TRUE(start);
+    ASSERT_TRUE(start->target);
+    ASSERT_TRUE(service.CancelDrainJob(*job));
+    RetireSegmentForTest(service, source, source_id);
+    WaitUntil([&] {
+        auto result = service.QueryDrainJob(*job);
+        return result && result->status == JobStatus::CANCELED;
+    });
+    EXPECT_EQ(service.QueryTask(attempt)->status, TaskStatus::FAILED);
+
+    auto unmount = service.UnmountSegment(target.id, target_id);
+    ASSERT_FALSE(unmount);
+    EXPECT_EQ(unmount.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    RetireSegmentForTest(service, target, target_id);
+    ASSERT_TRUE(service.ReMountSegment({source}, source_id));
+    EXPECT_FALSE(service.FinishDrainMove(source_id, attempt, /*commit=*/true,
+                                         /*writes_drained=*/true));
+    ASSERT_TRUE(service.FinishDrainMove(source_id, attempt, /*commit=*/false,
+                                        /*writes_drained=*/false));
+    auto remount = service.ReMountSegment({target}, target_id);
+    ASSERT_FALSE(remount);
+    EXPECT_EQ(remount.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    ASSERT_TRUE(service.FinishDrainMove(source_id, attempt, /*commit=*/false,
+                                        /*writes_drained=*/true));
+    ASSERT_TRUE(service.ReMountSegment({target}, target_id));
+
+    // A new task can take the only processing slot, and the old task
+    // cannot commit after its client UUID has remounted.
+    PutObjectOnSegment(service, source_id, source.name);
+    auto next_job = service.CreateDrainJob(request);
+    ASSERT_TRUE(next_job);
+    WaitUntil([&] { return ExecutePendingMoveTasks(service, source_id); });
+    EXPECT_EQ(service.QueryTask(attempt)->status, TaskStatus::FAILED);
+}
+
+TEST_F(MasterServiceTest, RetiredDrainSourceWithoutMoveDoesNotSucceed) {
+    MasterService service(
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build());
+    const auto source = MakeSegment("source");
+    const auto source_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(source, source_id));
+    const auto target = PrepareSimpleSegment(service, "target", 0x400000000);
+    (void)target;
+    PutObjectOnSegment(service, source_id, source.name);
+    const CreateDrainJobRequest request{.segments = {source.name},
+                                        .target_segments = {"target"},
+                                        .max_concurrency = 1};
+    const auto job = service.CreateDrainJob(request);
+    ASSERT_TRUE(job);
+    WaitUntil([&] { return service.QueryDrainJob(*job)->active_units == 1; });
+    RetireSegmentForTest(service, source, source_id);
+    WaitUntil([&] {
+        return service.QueryDrainJob(*job)->status == JobStatus::FAILED;
+    });
+    EXPECT_EQ(service.QueryDrainJob(*job)->succeeded_units, 0u);
 }
 
 TEST_F(MasterServiceTest, DrainJobRetriesTimedOutMovesAfterAcknowledgment) {
