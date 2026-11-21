@@ -8,6 +8,7 @@ old
 local_test
 go.sum
 !mooncake-common/etcd/go.sum
+!mooncake-common/k8s-lease/go.sum
 *.so
 bin
 mod

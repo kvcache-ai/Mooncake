@@ -1,2 +1,24 @@
 **/.dockerignore
 **/*.Dockerfile
+
+# Keep Git metadata for submodule initialization and source version detection.
+**/.git/logs
+**/.git/index.lock
+**/.git/FETCH_HEAD
+**/.git/ORIG_HEAD
+
+# Exclude local build products, test output, and Python caches.
+/build
+/build-*
+/cmake-build-*
+/dist
+/mooncake-wheel/dist
+**/*.egg-info
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/*.pyc
+**/*.pyo
+**/*.log
+
+/.cache

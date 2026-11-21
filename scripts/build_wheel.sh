@@ -571,7 +571,9 @@ echo "Installing required build packages"
 # rocm/musa CI images built on it) is 0.14.3, which makes `auditwheel repair`
 # abort. The PyPI wheel lands ahead of /usr/bin on PATH and works everywhere
 # the Python toolchain does.
-if [ "$NPU_BUILD" = "1" ]; then
+if [ "${SKIP_WHEEL_BUILD_DEPS:-0}" = "1" ]; then
+    echo "Using preinstalled wheel build packages"
+elif [ "$NPU_BUILD" = "1" ]; then
     PYTHON_CMD="python${PYTHON_VERSION}"
     if ! command -v "$PYTHON_CMD" &>/dev/null; then
         echo "Error: $PYTHON_CMD not found for NPU wheel build"
@@ -681,7 +683,7 @@ echo "Detected glibc version: $GLIBC_VERSION"
 echo "Using platform tag: $PLATFORM_TAG"
 
 echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-if [ "$NPU_BUILD" = "1" ]; then
+if [ "$NPU_BUILD" = "1" ] || [ "${WHEEL_BUILD_NO_ISOLATION:-0}" = "1" ]; then
     python${PYTHON_VERSION} -m build --wheel --no-isolation --outdir ${OUTPUT_DIR}
     AUDITWHEEL_CMD="python${PYTHON_VERSION} -m auditwheel"
 else
@@ -707,7 +709,12 @@ fi
 # excluded too: the XPU EP runs on PyTorch's own sycl::queue, so it must share
 # the one SYCL runtime that PyTorch XPU installs (intel-sycl-rt,
 # intel-cmplr-lib-rt) rather than carry a second copy.
-${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
+# After early cleanup, auditwheel can resolve sibling libraries from staging.
+AUDITWHEEL_LIBRARY_PATH="$LD_LIBRARY_PATH"
+if [ ! -d "$BUILD_DIR_ABS" ]; then
+    AUDITWHEEL_LIBRARY_PATH="$WHEEL_PACKAGE_DIR:$AUDITWHEEL_LIBRARY_PATH"
+fi
+LD_LIBRARY_PATH="$AUDITWHEEL_LIBRARY_PATH" ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libsycl.so* \
     --exclude libze_loader.so* \
     --exclude libsvml.so* \
