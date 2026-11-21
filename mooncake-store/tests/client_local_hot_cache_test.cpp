@@ -1640,20 +1640,60 @@ TEST_F(LocalHotCacheTest, CountMinSketchBasic) {
 }
 
 TEST_F(LocalHotCacheTest, CountMinSketchAutoDecay) {
-    // Small sketch: width=8, depth=2 → auto-decay threshold = 16
+    // Small sketch: width=8 → auto-decay every 4 increments
     CountMinSketch sketch(8, 2);
 
-    // Increment one key 15 times (below threshold)
-    for (int i = 0; i < 15; ++i) {
+    // Increment one key 3 times (below threshold)
+    for (int i = 0; i < 3; ++i) {
         sketch.increment("hot_key");
     }
-    EXPECT_EQ(sketch.count("hot_key"), 15);
+    EXPECT_EQ(sketch.count("hot_key"), 3);
 
-    // The 16th increment triggers auto-decay: increment returns the
-    // pre-decay count (16), but afterwards counters are halved.
+    // The 4th increment triggers auto-decay: increment returns the
+    // pre-decay count (4), but afterwards counters are halved.
     uint8_t ret = sketch.increment("hot_key");
-    EXPECT_EQ(ret, 16);
-    EXPECT_EQ(sketch.count("hot_key"), 8);  // 16 >> 1 = 8
+    EXPECT_EQ(ret, 4);
+    EXPECT_EQ(sketch.count("hot_key"), 2);  // 4 >> 1 = 2
+}
+
+// The gate both users apply is increment(key) >= 2. A key that has never
+// been seen must stay below it, even when every access is a new key.
+TEST_F(LocalHotCacheTest, CountMinSketchKeepsNeverSeenKeysBelowTwo) {
+    CountMinSketch sketch;
+
+    constexpr int kWarmup = 300000;
+    constexpr int kMeasured = 100000;
+    int reached_two = 0;
+    for (int i = 0; i < kWarmup + kMeasured; ++i) {
+        const bool at_two = sketch.increment("once-" + std::to_string(i)) >= 2;
+        if (i >= kWarmup && at_two) {
+            ++reached_two;
+        }
+    }
+    // Not zero: four cells that other keys have already bumped read as a
+    // first touch. The share stays at a few percent.
+    EXPECT_LT(reached_two, kMeasured / 20);
+}
+
+// A key read again after 1000 other new keys is on its second touch.
+TEST_F(LocalHotCacheTest, CountMinSketchCountsASecondTouchAfterOtherKeys) {
+    CountMinSketch sketch;
+
+    constexpr int kKeys = 100000;
+    constexpr int kGap = 1000;
+    int second_touches = 0;
+    int reached_two = 0;
+    for (int i = 0; i < kKeys; ++i) {
+        sketch.increment("key-" + std::to_string(i));
+        if (i >= kGap && i % 100 == 0) {
+            ++second_touches;
+            if (sketch.increment("key-" + std::to_string(i - kGap)) >= 2) {
+                ++reached_two;
+            }
+        }
+    }
+    // A decay between the two touches drops the first one, so a few miss.
+    EXPECT_GT(reached_two, second_touches * 95 / 100);
 }
 
 TEST_F(LocalHotCacheTest, CountMinSketchZeroDimensions) {
