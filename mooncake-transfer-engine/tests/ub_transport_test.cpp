@@ -18,12 +18,14 @@
 #include <sys/time.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <memory>
 
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#include "transport/kunpeng_transport/ub_transport.h"
 #include "common.h"
 
 using namespace mooncake;
@@ -162,6 +164,16 @@ class UBTransportTest : public ::testing::Test {
         }
     }
 };
+
+TEST_F(UBTransportTest, RmModeMatchesEnvironment) {
+    auto *ub = dynamic_cast<UbTransport *>(xport);
+    ASSERT_NE(ub, nullptr);
+    const char *mode = getenv("MC_UB_TRANS_MODE");
+    const bool expected =
+        mode != nullptr && (strcmp(mode, "rm") == 0 ||
+                            strcmp(mode, "RM") == 0 || strcmp(mode, "1") == 0);
+    EXPECT_EQ(ub->rmMode(), expected);
+}
 
 TEST_F(UBTransportTest, MultiWrite) {
     const size_t kDataLength = 4096000;
