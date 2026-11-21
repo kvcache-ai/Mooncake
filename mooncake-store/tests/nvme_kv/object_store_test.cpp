@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <future>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -16,7 +17,8 @@ namespace {
 class MemoryExecutor final : public NvmeKvCommandExecutor {
    public:
     tl::expected<void, ErrorCode> Store(const PhysicalKey& key,
-                                        std::string value) override {
+                                        std::string value,
+                                        StoreMode mode) override {
         std::lock_guard lock(mutex);
         ++stores;
         if (throw_store && key == *throw_store) {
@@ -28,8 +30,19 @@ class MemoryExecutor final : public NvmeKvCommandExecutor {
             }
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-        if (!values.emplace(key, std::move(value)).second)
-            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        if (mode == StoreMode::kUpdate) {
+            auto it = values.find(key);
+            if (it == values.end())
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            it->second = std::move(value);
+            if (lose_update_completion)
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        } else {
+            if (!values.emplace(key, std::move(value)).second)
+                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+            if (lose_insert_completion == key)
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
         return {};
     }
 
@@ -77,6 +90,8 @@ class MemoryExecutor final : public NvmeKvCommandExecutor {
     std::optional<PhysicalKey> throw_store;
     std::optional<PhysicalKey> throw_delete;
     bool throw_on_retry = false;
+    bool lose_update_completion = false;
+    std::optional<PhysicalKey> lose_insert_completion;
     size_t failed_stores = 0;
     size_t stores = 0, deletes = 0;
 };
@@ -128,6 +143,199 @@ TEST_P(NvmeKvObjectStoreTest, LocalConflictAndChunkedLayoutRemainReadable) {
     std::string output(payload.size(), '?');
     ASSERT_TRUE(Get("target", output));
     EXPECT_EQ(output, payload);
+    const std::string replacement(payload.size(), 'w');
+    ASSERT_TRUE(Put("target", replacement).value_or(NvmeKvPutResult{}).stored);
+    EXPECT_EQ(device->values[first_slot], device->values[other]);
+    NewStore();
+    ASSERT_TRUE(Get("target", output));
+    EXPECT_EQ(output, replacement);
+}
+
+TEST_P(NvmeKvObjectStoreTest, SameKeyRewritesSurviveReopen) {
+    for (const size_t size : {4u, 9000u}) {
+        const std::string key = "rewrite-" + std::to_string(size);
+        for (char fill : {'a', 'b', 'a', 'a'}) {
+            const std::string value(size, fill);
+            auto result = Put(key, value);
+            ASSERT_TRUE(result && result->stored);
+            for (bool reopen : {false, true}) {
+                if (reopen) NewStore();
+                std::string output(size, '?');
+                ASSERT_TRUE(Get(key, output));
+                EXPECT_TRUE(output == value)
+                    << key << " expected " << fill << ", reopen=" << reopen;
+            }
+        }
+    }
+}
+
+TEST_P(NvmeKvObjectStoreTest, InlineRewriteSupersedesCachedManifest) {
+    const std::string large(9000, 'a');
+    ASSERT_TRUE(Put("rewrite", large).value_or(NvmeKvPutResult{}).stored);
+    ASSERT_TRUE(Put("rewrite", "tiny").value_or(NvmeKvPutResult{}).stored);
+    std::string old_size(large.size(), '?');
+    EXPECT_FALSE(Get("rewrite", old_size));
+    NewStore();
+    std::string output(4, '?');
+    ASSERT_TRUE(Get("rewrite", output));
+    EXPECT_EQ(output, "tiny");
+}
+
+TEST_P(NvmeKvObjectStoreTest, FailedRewriteKeepsPreviousRootAndCanBeRetried) {
+    const std::string first(9000, 'a'), second(9000, 'b');
+    ASSERT_TRUE(Put("key", first).value_or(NvmeKvPutResult{}).stored);
+    device->fail_store = EncodeNvmeKvPhysicalKey({"key"});
+    ASSERT_FALSE(Put("key", second));
+    NewStore();
+    std::string output(first.size(), '?');
+    ASSERT_TRUE(Get("key", output));
+    EXPECT_EQ(output, first);
+    ASSERT_TRUE(Put("key", second).value_or(NvmeKvPutResult{}).stored);
+    NewStore();
+    ASSERT_TRUE(Get("key", output));
+    EXPECT_EQ(output, second);
+}
+
+TEST_P(NvmeKvObjectStoreTest, LostRootUpdateCompletionKeepsPublishedChunks) {
+    const std::string first(9000, 'a'), second(9000, 'b');
+    ASSERT_TRUE(Put("key", first).value_or(NvmeKvPutResult{}).stored);
+    device->lose_update_completion = true;
+    ASSERT_FALSE(Put("key", second));
+    NewStore();
+    std::string output(second.size(), '?');
+    ASSERT_TRUE(Get("key", output));
+    EXPECT_EQ(output, second);
+    auto retry = Put("key", second);
+    ASSERT_TRUE(retry && retry->stored);
+    EXPECT_FALSE(retry->inserted);
+}
+
+TEST_P(NvmeKvObjectStoreTest, RewritesAccountForNewPayloadStorage) {
+    auto result = Put("key", "a");
+    ASSERT_TRUE(result && result->stored && result->inserted);
+    EXPECT_EQ(result->inline_bytes, 1u);
+    EXPECT_EQ(result->new_chunk_bytes, 0u);
+    result = Put("key", "longer");
+    ASSERT_TRUE(result && result->stored && !result->inserted);
+    EXPECT_EQ(result->inline_bytes, 6u);
+    const std::string value(9000, 'x');
+    result = Put("key", value);
+    ASSERT_TRUE(result && result->stored && !result->inserted);
+    EXPECT_EQ(result->inline_bytes, 0u);
+    EXPECT_EQ(result->new_chunk_bytes, value.size());
+    result = Put("key", value);
+    ASSERT_TRUE(result && result->stored && !result->inserted);
+    EXPECT_EQ(result->new_chunk_bytes, 0u);
+}
+
+TEST_P(NvmeKvObjectStoreTest, ConcurrentRewritesPublishOneCompleteValue) {
+    const std::string original(9000, 'a'), left(9000, 'b'), right(9000, 'c');
+    ASSERT_TRUE(Put("key", original).value_or(NvmeKvPutResult{}).stored);
+    auto writer =
+        std::async(std::launch::async, [&] { return Put("key", left); });
+    auto second = Put("key", right);
+    auto first = writer.get();
+    ASSERT_TRUE(first && first->stored);
+    ASSERT_TRUE(second && second->stored);
+    std::string warm(original.size(), '?'), cold(original.size(), '?');
+    ASSERT_TRUE(Get("key", warm));
+    EXPECT_TRUE(warm == left || warm == right);
+    NewStore();
+    ASSERT_TRUE(Get("key", cold));
+    EXPECT_EQ(warm, cold);
+}
+
+TEST_P(NvmeKvObjectStoreTest, PublishedRewriteSurvivesAnotherWritersRollback) {
+    const std::string key = "rewrite";
+    const std::string value(9000, 'x');
+    ASSERT_TRUE(Put(key, "old").value_or(NvmeKvPutResult{}).stored);
+
+    // Pause one writer after staging its first chunk, before publishing a root.
+    const auto chunk = EncodeNvmeKvChunkPhysicalKey({key}, 0);
+    ASSERT_TRUE(device->Store(
+        chunk, value.substr(0, device->caps.effective_max_value_size),
+        NvmeKvCommandExecutor::StoreMode::kInsert));
+    ASSERT_TRUE(Put(key, value).value_or(NvmeKvPutResult{}).stored);
+    std::string output(value.size(), '?');
+    ASSERT_TRUE(Get(key, output));
+    ASSERT_EQ(output, value);
+
+    // The first writer still owns the speculative chunk and may roll it back.
+    ASSERT_TRUE(device->Delete(chunk));
+    ASSERT_TRUE(Get(key, output));
+    EXPECT_EQ(output, value);
+    NewStore();
+    ASSERT_TRUE(Get(key, output));
+    EXPECT_EQ(output, value);
+}
+
+TEST_P(NvmeKvObjectStoreTest, LostInsertCompletionPreservesPublishedChunks) {
+    const std::string key = "lost-root";
+    const std::string value(9000, 'x');
+    device->lose_insert_completion = EncodeNvmeKvPhysicalKey({key});
+    ASSERT_TRUE(Put(key, value).value_or(NvmeKvPutResult{}).stored);
+    EXPECT_EQ(device->deletes, 0u);
+    NewStore();
+    std::string output(value.size(), '?');
+    ASSERT_TRUE(Get(key, output));
+    EXPECT_EQ(output, value);
+}
+
+TEST_P(NvmeKvObjectStoreTest, FailedManifestRetentionCanBeRetried) {
+    const std::string value(9000, 'x');
+    for (bool applied : {false, true}) {
+        const std::string key = applied ? "applied" : "rejected";
+        ASSERT_TRUE(Put(key, "old").value_or(NvmeKvPutResult{}).stored);
+        auto plan = BuildNvmeKvWritePlan(
+            {key}, value, device->caps.effective_max_value_size,
+            {EncodeNvmeKvPhysicalKey({key}), 0, [&](uint32_t index) {
+                 return EncodeNvmeKvChunkPhysicalKey({key}, index);
+             }});
+        ASSERT_TRUE(plan);
+        const auto record =
+            EncodeNvmeKvRetainedManifestKey({key}, plan->root_blob);
+        if (applied) {
+            device->lose_insert_completion = record;
+        } else {
+            device->fail_store = record;
+        }
+        Slice slice{const_cast<char*>(value.data()), value.size()};
+        NvmeKvObjectStore::PutRequest request{{key}, {&slice, 1}};
+        store->PutBatch(std::span(&request, 1));
+        ASSERT_FALSE(request.result);
+        EXPECT_EQ(request.retained_on_failure, applied ? value.size() : 0u);
+        std::string old(3, '?');
+        ASSERT_TRUE(Get(key, old));
+        EXPECT_EQ(old, "old");
+        for (const auto& chunk : plan->manifest_records) {
+            EXPECT_EQ(device->values.contains(chunk.physical_key), applied);
+        }
+
+        NewStore();
+        auto retry = Put(key, value);
+        ASSERT_TRUE(retry && retry->stored);
+        EXPECT_EQ(retry->new_chunk_bytes, applied ? 0u : value.size());
+        NewStore();
+        std::string output(value.size(), '?');
+        ASSERT_TRUE(Get(key, output));
+        EXPECT_EQ(output, value);
+    }
+}
+
+TEST_P(NvmeKvObjectStoreTest, ReopenedWriterReusesRetiredChunkSets) {
+    const std::string key = "rewrite";
+    const std::string first(9000, 'a'), second(9000, 'b');
+    ASSERT_TRUE(Put(key, first).value_or(NvmeKvPutResult{}).stored);
+    ASSERT_TRUE(Put(key, second).value_or(NvmeKvPutResult{}).stored);
+    for (const auto& value : {first, second}) {
+        NewStore();
+        auto restored = Put(key, value);
+        ASSERT_TRUE(restored && restored->stored);
+        EXPECT_EQ(restored->new_chunk_bytes, 0u);
+        std::string output(value.size(), '?');
+        ASSERT_TRUE(Get(key, output));
+        EXPECT_EQ(output, value);
+    }
 }
 
 TEST_P(NvmeKvObjectStoreTest, RootPlacementIsValidatedForReadsAndExistence) {

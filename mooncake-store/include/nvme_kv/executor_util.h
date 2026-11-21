@@ -25,6 +25,7 @@ constexpr uint32_t kDefaultNvmeKvValueBlockUnitBytes = 512;
 constexpr uint32_t kNvmeKvMaxKeySizeBytes = 16;
 constexpr uint32_t kNvmeKvCommandTimeoutMs = 30000;
 constexpr uint32_t kNvmeKvStoreIfNotExistsOption = 0x2;
+constexpr uint32_t kNvmeKvStoreIfExistsOption = 0x1;
 constexpr uint8_t kNvmeKvCommandSetIdentifier = 0x01;
 constexpr uint8_t kNvmeKvStoreOpcode = 0x01;
 constexpr uint8_t kNvmeKvRetrieveOpcode = 0x02;
@@ -80,15 +81,19 @@ void EncodeNvmeKvKey(const NvmeKvCommandExecutor::PhysicalKey &key,
 template <typename Command>
 void BuildNvmeKvStoreCommand(Command &cmd, uint32_t nsid,
                              const NvmeKvCommandExecutor::PhysicalKey &key,
-                             const void *data, uint32_t transfer_bytes) {
+                             const void *data, uint32_t transfer_bytes,
+                             NvmeKvCommandExecutor::StoreMode mode =
+                                 NvmeKvCommandExecutor::StoreMode::kInsert) {
     cmd = {};
     cmd.opcode = kNvmeKvStoreOpcode;
     cmd.nsid = nsid;
     cmd.addr = reinterpret_cast<uint64_t>(data);
     cmd.data_len = transfer_bytes;
     cmd.cdw10 = transfer_bytes;
-    cmd.cdw11 = (kNvmeKvStoreIfNotExistsOption << 8) |
-                BuildNvmeKvKeyLengthField(key.size());
+    const auto option = mode == NvmeKvCommandExecutor::StoreMode::kUpdate
+                            ? kNvmeKvStoreIfExistsOption
+                            : kNvmeKvStoreIfNotExistsOption;
+    cmd.cdw11 = (option << 8) | BuildNvmeKvKeyLengthField(key.size());
     cmd.cdw12 = ComputeNvmeKvValueBlockCountMinusOne(transfer_bytes);
     cmd.timeout_ms = kNvmeKvCommandTimeoutMs;
     EncodeNvmeKvKey(key, cmd);

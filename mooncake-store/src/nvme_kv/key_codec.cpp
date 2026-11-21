@@ -10,6 +10,7 @@ namespace {
 constexpr uint8_t kIdentityEncodingVersion = 1;
 constexpr uint8_t kRootKeyRole = 1;
 constexpr uint8_t kChunkKeyRole = 2;
+constexpr uint8_t kRetainedManifestRole = 3;
 
 void AppendU32(std::string& encoded, uint32_t value) {
     const size_t offset = encoded.size();
@@ -108,6 +109,14 @@ NvmeKvPhysicalKey EncodeNvmeKvChunkPhysicalKey(
     const NvmeKvObjectIdentity& identity, uint32_t chunk_index, uint32_t slot) {
     return DerivePhysicalKey(
         BuildDerivationInput(identity, kChunkKeyRole, slot, chunk_index));
+}
+
+NvmeKvPhysicalKey EncodeNvmeKvRetainedManifestKey(
+    const NvmeKvObjectIdentity& identity, std::string_view manifest) {
+    auto encoded =
+        BuildDerivationInput(identity, kRetainedManifestRole, 0, std::nullopt);
+    encoded.append(manifest);
+    return DerivePhysicalKey(encoded);
 }
 
 }  // namespace mooncake

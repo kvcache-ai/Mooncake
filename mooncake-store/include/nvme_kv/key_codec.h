@@ -30,5 +30,7 @@ NvmeKvPhysicalKey EncodeNvmeKvPhysicalKey(const NvmeKvObjectIdentity& identity,
 NvmeKvPhysicalKey EncodeNvmeKvChunkPhysicalKey(
     const NvmeKvObjectIdentity& identity, uint32_t chunk_index,
     uint32_t slot = 0);
+NvmeKvPhysicalKey EncodeNvmeKvRetainedManifestKey(
+    const NvmeKvObjectIdentity& identity, std::string_view manifest);
 
 }  // namespace mooncake

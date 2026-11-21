@@ -99,12 +99,13 @@ tl::expected<void, ErrorCode> NvmeKvConnector::Init(
     return {};
 }
 
-tl::expected<void, ErrorCode> NvmeKvConnector::Store(const PhysicalKey &key,
-                                                     std::string value) {
+tl::expected<void, ErrorCode> NvmeKvConnector::Store(
+    const PhysicalKey &key, std::string value,
+    NvmeKvCommandExecutor::StoreMode mode) {
     if (executor_ == nullptr) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    return executor_->Store(key, std::move(value));
+    return executor_->Store(key, std::move(value), mode);
 }
 
 void NvmeKvConnector::StoreBatch(

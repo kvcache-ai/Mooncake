@@ -76,9 +76,11 @@ unchanged.
 
 NVMe KV commands use a 16-byte physical key, while Mooncake logical keys can be longer. The key codec derives root and chunk keys from the complete logical key, object role, chunk index, and conflict slot. Two independently seeded XXH64 values form the physical key, and four independently seeded XXH64 values form the identity verification hash stored in the root header. No logical-key byte is reserved or discarded.
 
-The backend tries at most 64 conflict slots. Every Store uses store-if-not-exists. When a physical key already exists, the backend retrieves the value and compares it with the expected bytes. Identical bytes mean the same object and make the operation idempotently successful. Different bytes mean a physical-key collision, so the backend tries the next slot. Other device errors are returned to `FileStorage`.
+The backend probes up to 64 collision slots. It inserts new roots and chunks with store-if-not-exists. A root owned by another logical key stays in place. When rewriting the same logical key, the backend stages all chunks first, reusing identical bytes and trying another slot for differing bytes. It then updates the existing root with store-if-key-exists. Readers that already resolved the previous manifest can finish against its immutable chunks.
 
-Reads derive the same root keys and probe conflict slots until the stored logical identity matches the requested key. Placement metadata in the root must agree with both the observed physical key and the selected slot.
+During recovery, a writer can reuse a matching chunk when the current root references it or when an immutable copy of the proposed manifest already identifies the complete chunk set. Otherwise the chunk may still belong to a writer that can roll it back, so recovery tries another slot. Before updating a root, recovery stores a copy of the new manifest under a separate physical-key role. It also retains a previously published chunked root before replacing it, so its chunks can be reused after reopening. These records add metadata writes on rewrites. Readers continue to use only the root and its chunks.
+
+Reads probe until the root identity matches the logical key and verify its physical address and slot. All chunk addresses in a manifest must derive from the same logical key and chunk slot. A reader checks the current root before reusing cached chunk offsets.
 
 ## Object Layout
 
@@ -186,7 +188,8 @@ The ioctl executor builds the same command fields in `nvme_passthru_cmd` and sub
 |----------|----------|
 | Key not found | Return `OBJECT_NOT_FOUND`. |
 | Store-if-not-exists finds identical bytes | Treat as idempotent success. |
-| Store-if-not-exists finds different bytes | Treat as a physical-key collision and try the next slot. |
+| Physical root belongs to another logical key, or chunk bytes differ | Try the next collision slot. |
+| Same logical key receives a new value | Publish the replacement at the existing root after staging its chunks. |
 | Header, identity, placement, manifest, or checksum failure | Return `FILE_READ_FAIL`. |
 | Partial chunk write | Best-effort cleanup of keys created by the failed attempt. |
 | io_uring submission or completion anomaly | Drain accepted commands, reset the thread-local ring, and fail the operation. |
