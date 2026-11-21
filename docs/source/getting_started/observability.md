@@ -282,6 +282,83 @@ client HTTP server remains enabled while metrics are disabled, `/metrics` and
 `/metrics/summary` return HTTP 503 with `metrics not available`.
 
 
+### Read Operation Stage Breakdown
+
+To separate master metadata lookup latency from data-path latency without
+correlating mixed metrics, `batch_get_into_multi_buffers` exports an exhaustive
+two-stage breakdown alongside `mooncake_transfer_read_operation_latency`:
+
+- Metric: `mooncake_transfer_read_operation_stage_latency` (histogram, microseconds)
+- Labels: `op_name` (currently `"batch_get_into_multi_buffers"`), `stage`, `outcome`
+- Bounded label values:
+  - `stage`: `metadata`, `post_query`
+  - `outcome`: `ok` (all keys succeeded), `partial` (some keys succeeded), `error` (entered transfer, all keys failed)
+
+#### Stage Boundaries
+
+Pre-query validation (`!client_`, vector size mismatch, empty `keys`) occurs
+outside stage timing. Once `BatchQuery` begins, the two stages partition the
+remaining call with zero gap:
+
+1. **`metadata`**: `Client::BatchQuery(keys)`, including `QueryResult`
+   construction and lease-deadline calculation.
+2. **`post_query`**: starts at the exact timestamp `metadata` ends and runs
+   until `batch_get_into_multi_buffers_internal` returns. It covers
+   `GetLocalEndpoints()`, async SSD prefetch scheduling
+   (`KickPrefetchForDiskHeadedKeys`), replica selection (`SelectBestReplica`),
+   buffer and direct-DFS checks, slice/op preparation, duplicate planning
+   (`PlanDuplicateKeys`), temporary buffer allocation, data transfers across
+   all backends (`Client::BatchGet` for MEMORY/NOF/direct-DFS and
+   DISK/staged-DFS, plus `LOCAL_DISK` offload RPCs), checksum verification,
+   host/device scatter, and duplicate fan-out (`FanOutDuplicates`).
+
+#### Outcome, Sample-Count Semantics, and Existing Metrics
+
+- **No-transfer calls are skipped**: if all keys fail metadata lookup or
+  validation (`valid_operations` and `valid_local_disk_ops` are both empty),
+  neither `metadata` nor `post_query` is observed so zero-transfer calls do not
+  bias the latency distribution.
+- **One sample per stage per call**: each call that enters the data path emits
+  exactly one `metadata` sample and one `post_query` sample, even for
+  mixed-backend batches that invoke `Client::BatchGet` multiple times or mix
+  `Client::BatchGet` with `LOCAL_DISK` offload RPCs.
+- **Disabled overhead**: when `MC_STORE_CLIENT_METRIC=0`, stage timing checks
+  are gated off before sampling `steady_clock::now()`.
+- **Comparison with existing metrics**:
+  - `mooncake_transfer_read_operation_latency{op_name="batch_get_into_multi_buffers"}`
+    is the outer end-to-end latency (including precondition failures and
+    no-transfer calls).
+  - `mooncake_client_rpc_latency{rpc_name="BatchGetReplicaList"}` aggregates
+    all callers of `BatchGetReplicaList` (`batch_get_into`, `batch_get_buffer`,
+    `Client::BatchGet`, `batch_get_into_multi_buffers`, etc.) and skips
+    recording on `RPC_FAIL` / `RPC_TIMEOUT`, whereas `stage="metadata"` is
+    scoped to `batch_get_into_multi_buffers` calls that enter the data path.
+  - `mooncake_transfer_batch_get_latency` measures `Client::BatchGet` itself,
+    not end-to-end `batch_get_into_multi_buffers` latency (a single
+    `batch_get_into_multi_buffers` call emits 0, 1, or 2 samples to
+    `mooncake_transfer_batch_get_latency` depending on the replica backends).
+
+#### Dummy Mode Collection and Sample-Population Differences
+
+When running with a `DummyClient` connected to a `RealClient` daemon
+(`real_client_main`), the outer latency and the stage breakdown are recorded in
+different processes and cover different timers and sample populations:
+
+| Metric | Recorded in | How to collect | Timer scope | Sample population |
+|---|---|---|---|---|
+| `mooncake_transfer_read_operation_stage_latency` (`stage=metadata`, `post_query`) | **RealClient daemon** (`client_mode="real"`) | Scrape the daemon's `/metrics` or inspect `/metrics/summary` | `BatchQuery` + post-query work inside `batch_get_into_multi_buffers_internal` (excludes Dummy→daemon RPC, SHM address mapping, and Dummy copy-back) | Calls that pass helper pre-checks (`shm_not_mapped`, address mapping) and enter the data path (`ok`, `partial`, `error`); `no_transfer` calls are skipped |
+| `mooncake_transfer_read_operation_latency{op_name="batch_get_into_multi_buffers"}` | **Calling `DummyClient` process** (`client_mode="dummy"`) | Collected on the `DummyClient` instance (`DummyClient::batch_get_into_multi_buffers`) | End-to-end Dummy→daemon RPC round-trip plus Dummy-side `copy_from_staging` copy-back | The batch is sampled when the sum of positive per-key results after `copy_from_staging` is greater than zero, including batches with some copy-back failures; all-error reads, `no_transfer` calls, zero-byte reads, and all-key copy-back failures are omitted |
+
+Note also that `RealClient::batch_get_into_multi_buffers_dummy_helper` invokes
+`batch_get_into_multi_buffers_internal` directly after mapping the Dummy
+buffers, so the daemon does **not** emit outer
+`mooncake_transfer_read_operation_latency{op_name="batch_get_into_multi_buffers"}`
+samples for Dummy-originated reads. Conversely, in `RealClient` direct mode
+(without Dummy), `RealClient::batch_get_into_multi_buffers` records the outer
+histogram for every initialized-client call (including `no_transfer` and
+`error`), while the stage breakdown still skips `no_transfer`.
+
+
 ### Master heartbeat observations
 
 Clients running the storage heartbeat expose two gauges through `/metrics`:
