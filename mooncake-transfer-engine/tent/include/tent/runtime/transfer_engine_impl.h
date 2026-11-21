@@ -88,6 +88,9 @@ struct TaskInfo {
     bool cancel_requested{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
     std::atomic<TransferStatusEnum> staging_status{TransferStatusEnum::PENDING};
+    // Set by cancelTransfer() and read by the staging worker, which then
+    // stops issuing chunks.
+    std::atomic<bool> staging_cancel_requested{false};
     std::chrono::steady_clock::time_point start_time{};     // Request submit
     std::chrono::steady_clock::time_point dispatch_time{};  // Initial dispatch
     std::chrono::steady_clock::time_point post_time{};      // Initial post
@@ -136,6 +139,8 @@ struct TaskInfo {
           cancel_requested(other.cancel_requested),
           status(other.status),
           staging_status(other.staging_status.load(std::memory_order_relaxed)),
+          staging_cancel_requested(
+              other.staging_cancel_requested.load(std::memory_order_relaxed)),
           start_time(other.start_time),
           dispatch_time(other.dispatch_time),
           post_time(other.post_time),
@@ -167,6 +172,8 @@ struct TaskInfo {
           cancel_requested(other.cancel_requested),
           status(other.status),
           staging_status(other.staging_status.load(std::memory_order_relaxed)),
+          staging_cancel_requested(
+              other.staging_cancel_requested.load(std::memory_order_relaxed)),
           start_time(other.start_time),
           dispatch_time(other.dispatch_time),
           post_time(other.post_time),
@@ -200,6 +207,9 @@ struct TaskInfo {
             status = other.status;
             staging_status.store(
                 other.staging_status.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            staging_cancel_requested.store(
+                other.staging_cancel_requested.load(std::memory_order_relaxed),
                 std::memory_order_relaxed);
             start_time = other.start_time;
             dispatch_time = other.dispatch_time;
@@ -236,6 +246,9 @@ struct TaskInfo {
             status = other.status;
             staging_status.store(
                 other.staging_status.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            staging_cancel_requested.store(
+                other.staging_cancel_requested.load(std::memory_order_relaxed),
                 std::memory_order_relaxed);
             start_time = other.start_time;
             dispatch_time = other.dispatch_time;

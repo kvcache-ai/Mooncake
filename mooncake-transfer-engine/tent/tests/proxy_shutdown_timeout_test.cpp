@@ -297,6 +297,49 @@ TEST(ProxyShutdownTimeout, FailedSiblingDoesNotPublishParentBeforeCopyDrains) {
     EXPECT_TRUE(engine->unregisterLocalMemory(target.data()).ok());
 }
 
+TEST(ProxyStagingCancel, StopsIssuingChunksAndReportsCanceledAfterDrain) {
+    auto cfg = makeMinimalP2PConfig();
+    auto engine = std::make_unique<TransferEngineImpl>(cfg);
+    ASSERT_TRUE(engine->available());
+    auto transport = std::make_shared<NeverCompletingTransport>();
+    engine->swapTransportForTest(TCP, transport);
+    std::vector<uint8_t> source(512, 0x91), target(512, 0);
+    ASSERT_TRUE(engine->registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(engine->registerLocalMemory(target.data(), target.size()).ok());
+    TaskInfo task;
+    task.request.opcode = Request::WRITE;
+    task.request.source = source.data();
+    task.request.target_id = LOCAL_SEGMENT_ID;
+    task.request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    task.request.length = source.size();
+    task.staging = true;
+    // Eight 64-byte chunks share two stage buffers, so two are in flight.
+    auto manager = std::make_unique<ProxyManager>(engine.get(), 64, 2);
+    ASSERT_TRUE(manager->submit(&task, 0, {"", kWildcardLocation, ""}).ok());
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transport->submit_calls.load() < 2 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    ASSERT_EQ(transport->submit_calls.load(), 2);
+
+    task.staging_cancel_requested.store(true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(task.staging_status.load(), PENDING);
+
+    transport->complete_first = true;
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (task.staging_status.load() == PENDING &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    EXPECT_EQ(task.staging_status.load(), CANCELED);
+    EXPECT_EQ(transport->submit_calls.load(), 2);
+    EXPECT_EQ(target, std::vector<uint8_t>(512, 0));
+    manager.reset();
+    EXPECT_EQ(engine->aliveBatchCountForTest(), 0u);
+    EXPECT_TRUE(engine->unregisterLocalMemory(source.data()).ok());
+    EXPECT_TRUE(engine->unregisterLocalMemory(target.data()).ok());
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake
