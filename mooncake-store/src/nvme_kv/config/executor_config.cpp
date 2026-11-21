@@ -48,6 +48,12 @@ std::size_t NvmeKvExecutorConfig::ReadPlanBatchSizeFromEnvironment() {
                : std::min<std::size_t>(read_plan_batch_size, 1024);
 }
 
+uint32_t NvmeKvExecutorConfig::ReadSpdkCompletionTimeoutMsFromEnvironment() {
+    return ReadNvmeKvU32Or(NvmeKvExecutorEnvironmentVariables::
+                               MOONCAKE_NVME_KV_SPDK_COMPLETION_TIMEOUT_MS,
+                           NvmeKvExecutorConfig{}.spdk_completion_timeout_ms);
+}
+
 NvmeKvExecutorConfig NvmeKvExecutorConfig::FromEnvironment() {
     NvmeKvExecutorConfig config;
     config.transfer_alignment_bytes =
@@ -55,6 +61,8 @@ NvmeKvExecutorConfig NvmeKvExecutorConfig::FromEnvironment() {
     config.value_block_unit_bytes = ReadValueBlockUnitBytesFromEnvironment();
     config.protocol_max_value_size = ReadProtocolMaxValueSizeFromEnvironment();
     config.read_plan_batch_size = ReadPlanBatchSizeFromEnvironment();
+    config.spdk_completion_timeout_ms =
+        ReadSpdkCompletionTimeoutMsFromEnvironment();
     return config;
 }
 
