@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
+#include <limits>
 #include <sstream>
 
 namespace mooncake {
@@ -126,6 +128,58 @@ std::vector<std::string> Config::paths() const {
     std::sort(paths.begin(), paths.end());
     paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
     return paths;
+}
+
+static inline const char* getEnvWithFallback(const char* primary,
+                                             const char* fallback,
+                                             const char* extra = nullptr) {
+    for (const char* name : {primary, fallback, extra}) {
+        if (!name) continue;
+        const char* val = std::getenv(name);
+        if (val != nullptr && val[0] != '\0') return val;
+    }
+    return nullptr;
+}
+
+static inline void setStringConfigWithFallback(Config& config,
+                                               const char* primary,
+                                               const char* fallback,
+                                               const std::string& config_key,
+                                               const char* extra = nullptr) {
+    const char* val = getEnvWithFallback(primary, fallback, extra);
+    if (val) config.set(config_key, std::string(val));
+}
+
+static inline void setBoolConfigWithFallback(Config& config,
+                                             const char* primary,
+                                             const char* fallback,
+                                             const std::string& config_key) {
+    const char* val = getEnvWithFallback(primary, fallback);
+    if (!val) return;
+    config.set(config_key,
+               ConfigHelper::parseBool(val, config.get(config_key, false)));
+}
+
+static inline void setBoundedIntConfigWithFallback(
+    Config& config, const char* primary, const char* fallback,
+    const std::string& config_key, int64_t min_val, int64_t max_val) {
+    const char* val = getEnvWithFallback(primary, fallback);
+    if (!val) return;
+    try {
+        size_t parsed = 0;
+        long long int_val = std::stoll(val, &parsed);
+        if (parsed != std::strlen(val) || int_val < min_val ||
+            int_val > max_val) {
+            LOG(WARNING) << "Invalid value '" << val << "' for " << primary
+                         << "/" << fallback << " (expected [" << min_val << ", "
+                         << max_val << "]), ignoring";
+            return;
+        }
+        config.set(config_key, int_val);
+    } catch (const std::exception&) {
+        LOG(WARNING) << "Invalid integer '" << val << "' for " << primary << "/"
+                     << fallback << ", ignoring";
+    }
 }
 
 static inline void setConfig(Config& config, const std::string& env_key,
@@ -305,6 +359,41 @@ Status ConfigHelper::loadFromEnv(Config& config) {
               "transports/io_uring/staging_slot_kb");
     setConfig(config, "MC_IOURING_STAGING_SLOTS",
               "transports/io_uring/staging_slots");
+    // Ascend Direct transport env vars (MC_ASCEND_* with ASCEND_* fallback).
+    setBoundedIntConfigWithFallback(
+        config, "MC_ASCEND_TRANSFER_TIMEOUT", "ASCEND_TRANSFER_TIMEOUT",
+        "transports/ascend_direct/transfer_timeout_ms", 1,
+        std::numeric_limits<int32_t>::max());
+    setBoundedIntConfigWithFallback(
+        config, "MC_ASCEND_BASE_PORT", "ASCEND_BASE_PORT",
+        "transports/ascend_direct/base_port", 1024, 65535 - 100);
+    setBoundedIntConfigWithFallback(
+        config, "MC_ASCEND_THREAD_POOL_SIZE", "ASCEND_THREAD_POOL_SIZE",
+        "transports/ascend_direct/thread_pool_size", 1, 32);
+    setStringConfigWithFallback(config, "MC_ASCEND_RDMA_TC", "ASCEND_RDMA_TC",
+                                "transports/ascend_direct/rdma_tc",
+                                "HCCL_RDMA_TC");
+    setStringConfigWithFallback(config, "MC_ASCEND_RDMA_SL", "ASCEND_RDMA_SL",
+                                "transports/ascend_direct/rdma_sl",
+                                "HCCL_RDMA_SL");
+    setStringConfigWithFallback(config, "MC_ASCEND_LOCAL_COMM_RES",
+                                "ASCEND_LOCAL_COMM_RES",
+                                "transports/ascend_direct/local_comm_res");
+    setStringConfigWithFallback(
+        config, "MC_ASCEND_GLOBAL_RESOURCE_CONFIG",
+        "ASCEND_GLOBAL_RESOURCE_CONFIG",
+        "transports/ascend_direct/global_resource_config");
+    if (config.get("transports/ascend_direct/store_te_init", false)) {
+        setBoolConfigWithFallback(config, "MC_ASCEND_ENABLE_USE_FABRIC_MEM",
+                                  "ASCEND_ENABLE_USE_FABRIC_MEM",
+                                  "transports/ascend_direct/fabric_mem");
+    }
+    setBoolConfigWithFallback(config, "MC_ASCEND_USE_SHMEM", "ASCEND_USE_SHMEM",
+                              "transports/ascend_direct/use_shmem");
+    setBoolConfigWithFallback(
+        config, "MC_ASCEND_STANDALONE_SINGLE_SEGMENT",
+        "ASCEND_STANDALONE_SINGLE_SEGMENT",
+        "transports/ascend_direct/standalone_single_segment");
     return status;
 }
 

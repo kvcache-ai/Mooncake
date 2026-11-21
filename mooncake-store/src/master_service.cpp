@@ -44,6 +44,7 @@
 #include "ha/ha_types.h"
 #include "ha/kv/ha_kv_backend_factory.h"
 #include "ha/oplog/oplog_batch_storage.h"
+#include "ha/oplog/batch_oplog_pruning_worker.h"
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "types.h"
 #include "common/zstd_util.h"
@@ -64,6 +65,25 @@
 namespace mooncake {
 
 namespace {
+
+tl::expected<OpLogEntry, ErrorCode> BuildSegmentMountOpLogEntry(
+    const Segment& segment, const std::string& key) {
+    SegmentMountOp op;
+    op.segment_name = segment.name;
+    op.transport_endpoint = segment.te_endpoint;
+    op.capacity = segment.size;
+    op.is_memory_segment = true;
+    auto bytes = struct_pack::serialize(op);
+    OpLogEntry entry;
+    entry.op_type = OpType::SEGMENT_MOUNT;
+    entry.tenant_id = TenantId::Default().value();
+    entry.object_key = key;
+    entry.payload = std::string(bytes.begin(), bytes.end());
+    if (!ValidateOpLogBatchEntry(entry)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return entry;
+}
 
 uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
     if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs) {
@@ -932,6 +952,7 @@ void MasterService::InitDfsAllocatorFromEnvironment(
 }
 
 MasterService::~MasterService() {
+    StopBatchOpLogPruningWorker();
     // Stop and join the threads
     eviction_running_ = false;
     // Stop publishing transitions and deliver what is already queued, while
@@ -1011,6 +1032,44 @@ void MasterService::SetBatchOpLogTerminalCallback(
     }
 }
 
+ErrorCode MasterService::StartBatchOpLogPruningWorker(
+    uint64_t chunk_batch_count, uint64_t max_batches_per_second) {
+    std::lock_guard lock(batch_oplog_pruning_mutex_);
+    if (batch_oplog_pruning_stop_requested_) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    if (chunk_batch_count == 0 || max_batches_per_second == 0 ||
+        !batch_oplog_storage_) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (!batch_oplog_pruning_worker_) {
+        batch_oplog_pruning_worker_ = std::make_unique<BatchOpLogPruningWorker>(
+            *batch_oplog_storage_, chunk_batch_count, max_batches_per_second);
+    }
+    return batch_oplog_pruning_worker_->Start();
+}
+
+void MasterService::RequestStopBatchOpLogPruningWorker() {
+    std::lock_guard lock(batch_oplog_pruning_mutex_);
+    batch_oplog_pruning_stop_requested_ = true;
+    if (batch_oplog_pruning_worker_) {
+        batch_oplog_pruning_worker_->RequestStop();
+    }
+}
+
+void MasterService::StopBatchOpLogPruningWorker() {
+    std::unique_ptr<BatchOpLogPruningWorker> worker;
+    {
+        std::lock_guard lock(batch_oplog_pruning_mutex_);
+        batch_oplog_pruning_stop_requested_ = true;
+        if (batch_oplog_pruning_worker_) {
+            batch_oplog_pruning_worker_->RequestStop();
+            worker = std::move(batch_oplog_pruning_worker_);
+        }
+    }
+    if (worker) worker->Stop();
+}
+
 void MasterService::StopBatchOpLogWriter() {
     if (ordered_oplog_writer_) ordered_oplog_writer_->Stop();
 }
@@ -1037,7 +1096,22 @@ TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    ErrorCode mount_result;
+    // Reject writer backpressure before installing a segment. Otherwise the
+    // primary can report success for a mount that standby replay never sees.
+    std::optional<OrderedOpLogWriter::Reservation> reservation;
+    std::optional<OpLogEntry> entry;
+    if (enable_oplog_ && ordered_oplog_writer_) {
+        // A reservation guarantees capacity, not entry validity. Validate the
+        // exact record before installing state that an idempotent retry skips.
+        auto prepared =
+            BuildSegmentMountOpLogEntry(segment, segment.te_endpoint);
+        if (!prepared) return tl::make_unexpected(prepared.error());
+        entry.emplace(std::move(*prepared));
+        auto reserved = ReserveBatchOpLogSlot();
+        if (!reserved) return tl::make_unexpected(reserved.error());
+        reservation.emplace(std::move(reserved.value()));
+    }
+    ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
     {
         auto registration = client_sessions_.BeginRegistration(client_id);
         if (!registration) {
@@ -1065,18 +1139,10 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         registration->Commit();
     }
 
-    if (mount_result == ErrorCode::OK && enable_oplog_ &&
-        ordered_oplog_writer_) {
-        SegmentMountOp op;
-        op.segment_name = segment.name;
-        op.transport_endpoint = segment.te_endpoint;
-        op.capacity = segment.size;
-        op.is_memory_segment = true;
-        op.file_path.clear();
-        auto bytes = struct_pack::serialize(op);
-        PersistSegmentOpForHA("MountSegment", OpType::SEGMENT_MOUNT,
-                              segment.te_endpoint,
-                              std::string(bytes.begin(), bytes.end()));
+    if (mount_result == ErrorCode::OK && reservation) {
+        auto persisted = PersistSegmentOpForHA("MountSegment",
+                                               std::move(*reservation), *entry);
+        if (!persisted) return persisted;
     }
     if (mount_result == ErrorCode::OK) {
         NotifyPolicyCapacityChanged();
@@ -1136,6 +1202,22 @@ ErrorCode MasterService::ValidateStandbyRemountSegment(
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    // A remount can contain several segments. Admit the complete event group
+    // before rebinding any of them, rather than silently logging only a prefix.
+    std::optional<OrderedOpLogWriter::Reservation> reservation;
+    std::vector<OpLogEntry> entries;
+    if (enable_oplog_ && ordered_oplog_writer_ && !segments.empty()) {
+        // Validate the whole group before changing any segment or client state.
+        entries.reserve(segments.size());
+        for (const auto& segment : segments) {
+            auto prepared = BuildSegmentMountOpLogEntry(segment, segment.name);
+            if (!prepared) return tl::make_unexpected(prepared.error());
+            entries.push_back(std::move(*prepared));
+        }
+        auto reserved = ordered_oplog_writer_->ReserveBatch(segments.size());
+        if (!reserved) return tl::make_unexpected(reserved.error());
+        reservation.emplace(std::move(reserved.value()));
+    }
     {
         auto remount = client_sessions_.BeginRemount(client_id);
         if (!remount) {
@@ -1438,19 +1520,10 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         remount->Commit();
     }
 
-    if (enable_oplog_ && ordered_oplog_writer_) {
-        for (const auto& seg : segments) {
-            SegmentMountOp op;
-            op.segment_name = seg.name;
-            op.transport_endpoint = seg.te_endpoint;
-            op.capacity = seg.size;
-            op.is_memory_segment = true;
-            op.file_path.clear();
-            auto bytes = struct_pack::serialize(op);
-            PersistSegmentOpForHA("ReMountSegment", OpType::SEGMENT_MOUNT,
-                                  seg.name,
-                                  std::string(bytes.begin(), bytes.end()));
-        }
+    if (reservation) {
+        auto persisted = ordered_oplog_writer_->CommitBatch(
+            std::move(*reservation), std::move(entries), nullptr);
+        if (!persisted) return tl::make_unexpected(persisted.error());
     }
     NotifyPolicyCapacityChanged();
 
@@ -2557,23 +2630,23 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                 return false;
             }
             bool unfinished_affiliated_replica = false;
-            VisitNamespaces([&](const TenantId& /*tenant_id*/,
-                                metadata::Namespace& ns) {
-                if (unfinished_affiliated_replica) {
-                    return;
-                }
-                for (auto object : ns.objects.ReadCursor()) {
-                    if (object.metadata().HasReplica(
-                            [&job](const Replica& replica) {
-                                return replica.is_processing() &&
-                                       replica.isAffiliatedWith(
-                                           job.retired_session);
-                            })) {
-                        unfinished_affiliated_replica = true;
-                        break;
+            VisitNamespaces(
+                [&](const TenantId& /*tenant_id*/, metadata::Namespace& ns) {
+                    if (unfinished_affiliated_replica) {
+                        return;
                     }
-                }
-            });
+                    for (auto object : ns.objects.ReadCursor()) {
+                        if (object.metadata().HasReplica(
+                                [&job](const Replica& replica) {
+                                    return replica.is_processing() &&
+                                           replica.isAffiliatedWith(
+                                               job.retired_session);
+                                })) {
+                            unfinished_affiliated_replica = true;
+                            break;
+                        }
+                    }
+                });
             if (unfinished_affiliated_replica) {
                 LOG(ERROR)
                     << "client_id=" << job.client_id
@@ -2708,6 +2781,16 @@ void MasterService::WeightReconciliationThreadFunc() {
 auto MasterService::UnmountSegment(const UUID& segment_id,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    // Capacity must be available before PrepareUnmountSegment releases the
+    // allocator. Returning an error afterwards would make retries unable to
+    // recover the missing retirement event from an already-deleted segment.
+    std::optional<OrderedOpLogWriter::Reservation> reservation;
+    std::optional<OpLogEntry> entry;
+    if (enable_oplog_ && ordered_oplog_writer_) {
+        auto reserved = ReserveBatchOpLogSlot();
+        if (!reserved) return tl::make_unexpected(reserved.error());
+        reservation.emplace(std::move(reserved.value()));
+    }
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
@@ -2715,6 +2798,24 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
+        Segment segment;
+        if (!segment_access.GetSegment(segment_id, segment)) {
+            return {};  // Unmount is idempotent for a missing segment.
+        }
+        if (reservation && !segment.te_endpoint.empty()) {
+            SegmentUnmountOp op{segment.te_endpoint};
+            auto bytes = struct_pack::serialize(op);
+            entry.emplace();
+            entry->op_type = OpType::SEGMENT_UNMOUNT;
+            entry->tenant_id = TenantId::Default().value();
+            entry->object_key = segment.te_endpoint;
+            entry->payload = std::string(bytes.begin(), bytes.end());
+            // PrepareUnmountSegment destroys the allocator, so validating at
+            // Commit would be too late to preserve state on a rejected entry.
+            if (!ValidateOpLogBatchEntry(*entry)) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
         ErrorCode err = segment_access.PrepareUnmountSegment(
             segment_id, metrics_dec_capacity);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
@@ -2726,21 +2827,15 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         }
     }
 
-    // Keep HA, snapshot, and CXL behavior unchanged. Regular memory segments
-    // become unreadable as soon as PrepareUnmountSegment releases their
-    // allocator; only the physical metadata sweep is deferred.
-    if (enable_async_segment_cleanup_) {
-        replica_cleanup_worker_.Schedule();
-    } else {
-        ClearInvalidHandlesLocked();
-    }
-
-    // Cache endpoint before commit removes segment from registry.
-    std::string segment_name;
-    std::string te_endpoint;
-    if (!segment_manager_.GetSegmentBasicInfo(segment_id, segment_name,
-                                              te_endpoint)) {
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    // A logged retirement schedules cleanup after durability below: its
+    // reservation must not consume the slot needed by the cleanup's REMOVE.
+    // Invalidating the allocator already makes these replicas unreadable.
+    if (!entry) {
+        if (enable_async_segment_cleanup_) {
+            replica_cleanup_worker_.Schedule();
+        } else {
+            ClearInvalidHandlesLocked();
+        }
     }
 
     // 3. Commit the unmount operation
@@ -2754,12 +2849,11 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         }
     }
 
-    if (enable_oplog_ && ordered_oplog_writer_ && !te_endpoint.empty()) {
-        SegmentUnmountOp op{te_endpoint};
-        auto bytes = struct_pack::serialize(op);
-        PersistSegmentOpForHA("UnmountSegment", OpType::SEGMENT_UNMOUNT,
-                              te_endpoint,
-                              std::string(bytes.begin(), bytes.end()));
+    if (entry) {
+        auto persisted = PersistSegmentOpForHA(
+            "UnmountSegment", std::move(*reservation), *entry,
+            [this](const OpLogEntry&) { replica_cleanup_worker_.Schedule(); });
+        if (!persisted) return persisted;
     }
     NotifyPolicyCapacityChanged();
     return {};
@@ -11175,8 +11269,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                         !enable_ha_ &&
                         metadata.AllReplicas(&Replica::fn_is_memory_replica);
                     const auto& state = accessor.GetState();
-                    if (metadata.IsHardPinned() ||
-                        (!can_move_with_read_lease &&
+                    if ((!can_move_with_read_lease &&
                          !metadata.IsLeaseExpired()) ||
                         !metadata.AllReplicas(&Replica::fn_is_completed) ||
                         state.is_processing || state.replication_task ||
@@ -11898,16 +11991,20 @@ tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
     return {};
 }
 
-void MasterService::PersistSegmentOpForHA(const char* why, OpType type,
-                                          const std::string& key,
-                                          const std::string& payload) {
-    auto result = AppendOpLogVisibleBeforeDurable(
-        type, TenantId::Default().value(), key, payload);
+tl::expected<void, ErrorCode> MasterService::PersistSegmentOpForHA(
+    const char* why, OrderedOpLogWriter::Reservation&& reservation,
+    const OpLogEntry& entry, DurableFinalizeCallback callback) {
+    auto result = AppendReservedOpLogWithDurableFinalize(
+        std::move(reservation), entry.op_type, entry.tenant_id,
+        entry.object_key, entry.payload, std::move(callback));
     if (!result) {
-        LOG(WARNING) << why << ": segment OpLog queue failed for key=" << key
-                     << ", type=" << static_cast<int>(type)
+        LOG(WARNING) << why << ": segment OpLog queue failed for key="
+                     << entry.object_key
+                     << ", type=" << static_cast<int>(entry.op_type)
                      << ", err=" << static_cast<int>(result.error());
+        return tl::make_unexpected(result.error());
     }
+    return {};
 }
 
 std::vector<Replica::Descriptor>
