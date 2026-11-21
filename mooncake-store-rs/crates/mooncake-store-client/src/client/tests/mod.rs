@@ -11430,6 +11430,60 @@ fn invalid_local_put_preserves_existing_object() {
 }
 
 #[test]
+fn terminal_allocation_failures_preserve_existing_object() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("terminal-allocation-segment"));
+    let client = StoreClientBuilder::new(metadata, "terminal-allocation")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let keep = b"0123456789abcdef";
+    let keep_route = client.put("terminal-keep", keep).expect("seed put");
+    let segment_name = keep_route.replicas[0].segment_name.clone();
+    {
+        let mut allocator = client.allocator.lock();
+        let segment = allocator.segments.get_mut(&segment_name).expect("segment");
+        segment.next_allocation_id = u64::MAX;
+    }
+    let generation_error = client
+        .reserve_segment_allocation(client.runtime_id(), Some(&segment_name), 16, true)
+        .expect_err("generation exhaustion should be terminal");
+    assert!(matches!(generation_error, StoreError::InvalidState(_)));
+    assert_eq!(
+        client
+            .get("terminal-keep")
+            .expect("generation exhaustion must preserve the existing object"),
+        keep
+    );
+
+    {
+        let mut allocator = client.allocator.lock();
+        let segment = allocator.segments.get_mut(&segment_name).expect("segment");
+        segment.next_allocation_id = 1;
+        segment.announcement.used_bytes = u64::MAX;
+        segment.cursor_bytes = 0;
+        segment.free_spans.clear();
+    }
+    let overflow_error = client
+        .reserve_segment_allocation(client.runtime_id(), Some(&segment_name), 16, true)
+        .expect_err("reservation overflow should be terminal");
+    assert!(matches!(overflow_error, StoreError::InvalidState(_)));
+    assert_eq!(
+        client
+            .get("terminal-keep")
+            .expect("reservation overflow must preserve the existing object"),
+        keep
+    );
+}
+
+#[test]
 fn invalid_remote_put_preserves_existing_object() {
     let _guard = metrics_test_lock().lock();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
@@ -19346,6 +19400,14 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
     allocator.upsert(&primary);
     allocator.upsert(&secondary);
     allocator.upsert(&draining);
+    assert!(allocator.can_fit_after_eviction(None, 128));
+    assert!(!allocator.can_fit_after_eviction(None, 129));
+    assert!(allocator.can_fit_after_eviction(Some(&primary.segment_name), 128));
+    assert!(!allocator.can_fit_after_eviction(Some(&primary.segment_name), 129));
+    assert!(!allocator.can_fit_after_eviction(Some(&primary.segment_name), 0));
+    assert!(allocator.can_fit_after_eviction(Some(&secondary.segment_name), 63));
+    assert!(!allocator.can_fit_after_eviction(Some(&secondary.segment_name), 65));
+    assert!(!allocator.can_fit_after_eviction(Some(&draining.segment_name), 1));
     assert_eq!(allocator.announcements().len(), 3);
     assert!(allocator.announcement(&primary.segment_name).is_some());
     assert!(matches!(
