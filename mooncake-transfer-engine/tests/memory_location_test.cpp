@@ -5,6 +5,7 @@
 #include <numa.h>
 #include <numaif.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <cstdint>
 #include <cstring>
@@ -209,4 +210,22 @@ TEST(MemoryLocationTest, ThpDetectionFullAndPartial) {
     EXPECT_FALSE(mooncake::isThpBacked(addr, size));
 
     munmap(raw, raw_size);
+}
+
+TEST(MemoryLocationTest, DetectBufferPageSizeBasePage) {
+    const size_t base = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    void *addr = mmap(nullptr, base * 4, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(addr, MAP_FAILED);
+    EXPECT_EQ(mooncake::detectBufferPageSize(addr), base);
+    munmap(addr, base * 4);
+}
+
+TEST(MemoryLocationTest, DetectBufferPageSizeHugeTLB) {
+    const size_t huge = 2UL << 20;
+    void *addr = mmap(nullptr, huge, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    if (addr == MAP_FAILED) GTEST_SKIP() << "no 2MB HugeTLB pages available";
+    EXPECT_EQ(mooncake::detectBufferPageSize(addr), huge);
+    munmap(addr, huge);
 }
