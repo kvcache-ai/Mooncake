@@ -52,11 +52,12 @@ def setup_embedded_master(
     master_server_addr: str = "",
     metadata_server: str = "P2PHANDSHAKE",
     local_hostname: str = "localhost",
+    segment_size: int = SEGMENT_SIZE,
 ) -> int:
     return store.setup(
         local_hostname,
         metadata_server,
-        SEGMENT_SIZE,
+        segment_size,
         LOCAL_BUFFER_SIZE,
         _protocol(),
         _device_name(),
@@ -217,6 +218,34 @@ class TestStandaloneStoreE2E(unittest.TestCase):
         self.assertIsNotNone(retrieved)
         self.assertEqual(retrieved.dtype, tensor.dtype)
         self.assertTrue(torch.allclose(tensor, retrieved))
+
+
+class TestStrictBatchPlacementE2E(unittest.TestCase):
+    def test_batch_put_from_preserves_successes_around_failed_allocation(self) -> None:
+        mib = 1024 * 1024
+        store = MooncakeDistributedStore()
+        self.addCleanup(store.close)
+        self.assertEqual(setup_embedded_master(store, segment_size=16 * mib), 0)
+        config = ReplicateConfig()
+        config.allowed_memory_segments = [store.get_hostname()]
+        config.with_hard_pin = True
+
+        keys = ["first", "no-room", "last"]
+        payloads = [b"A" * (12 * mib), b"B" * (8 * mib), b"C" * mib]
+        sizes = list(map(len, payloads))
+        buf = ctypes.create_string_buffer(b"".join(payloads), sum(sizes))
+        base = ctypes.addressof(buf)
+        self.assertEqual(store.register_buffer(base, len(buf)), 0)
+        try:
+            ptrs = [base, base + sizes[0], base + sizes[0] + sizes[1]]
+            results = store.batch_put_from(keys, ptrs, sizes, config)
+            no_available_handle = -200
+            self.assertEqual(results, [0, no_available_handle, 0])
+            self.assertEqual(store.get(keys[0]), payloads[0])
+            self.assertEqual(store.is_exist(keys[1]), 0)
+            self.assertEqual(store.get(keys[2]), payloads[2])
+        finally:
+            self.assertEqual(store.unregister_buffer(base), 0)
 
 
 class TestStandaloneConfigDictE2E(unittest.TestCase):

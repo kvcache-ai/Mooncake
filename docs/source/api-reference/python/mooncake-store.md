@@ -828,6 +828,9 @@ If no listed segment can fit a key, `PutStart` returns `NO_AVAILABLE_HANDLE`
 even when an unlisted segment has room. `BatchPutStart` decides independently
 for each key; an earlier success is not rolled back and later keys are still
 tried. Strict names take precedence over soft segment and writer-locality hints.
+When using `batch_put_from`, leave `prefer_alloc_in_same_node` unset (or `False`):
+that API rejects `True` even when an allowlist is set. In the native C++
+`Client::BatchPut` API, enabling that hint still requires `replica_num == 1`.
 This option does not change replica-count policy, migrate existing keys, pin
 objects against eviction, or disable a globally configured disk mirror.
 
