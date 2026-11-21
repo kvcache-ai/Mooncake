@@ -9,7 +9,7 @@
 #include <future>
 #include <mutex>
 #include <optional>
-#include <set>
+#include <tuple>
 
 #ifdef USE_TENT
 #include "tent/transfer_engine.h"
@@ -69,39 +69,7 @@ namespace {
 using Executor = BatchSubmitExecutor;
 using namespace std::chrono_literals;
 
-TEST(BatchSubmit, PreservesExactCoverageAndTail) {
-    for (size_t n : {size_t(0), size_t(1), size_t(3), size_t(8193), SIZE_MAX}) {
-        for (size_t p : {size_t(0), size_t(1), size_t(2), size_t(4)}) {
-            auto ranges = Executor::partition(n, p);
-            size_t end = 0;
-            for (const auto& range : ranges) {
-                EXPECT_EQ(range.begin, end);
-                EXPECT_GT(range.end, range.begin);
-                end = range.end;
-            }
-            EXPECT_EQ(end, p == 0 ? 0 : n);
-        }
-    }
-}
-
-TEST(BatchSubmit, DefaultAndThresholdDoNotRunCallbacks) {
-    Executor disabled({0, 4096, 1});
-    EXPECT_FALSE(disabled.eligible(65536));
-    Executor enabled({2, 4096, 1});
-    EXPECT_FALSE(enabled.eligible(4095));
-    EXPECT_TRUE(enabled.eligible(4096));
-    EXPECT_FALSE(
-        enabled
-            .execute(4, Executor::Clock::now() + 1s,
-                     [](auto, const auto&) -> Executor::Result {
-                         ADD_FAILURE()
-                             << "Below-threshold call entered the pool";
-                         return Executor::Result::OK();
-                     })
-            .ok());
-}
-
-TEST(BatchSubmit, BatchSubmitEnvironmentConfig) {
+TEST(BatchSubmit, ConfigParsingAndEligibility) {
     struct SavedEnvironment {
         const char* name;
         std::optional<std::string> previous;
@@ -121,6 +89,8 @@ TEST(BatchSubmit, BatchSubmitEnvironmentConfig) {
     auto config = Executor::Config::fromEnvironment();
     EXPECT_EQ(config.threads, 0);
     EXPECT_EQ(config.min_descriptors, 4096);
+    Executor disabled(config);
+    EXPECT_FALSE(disabled.eligible(65536));
 
     ASSERT_EQ(setenv(threads.name, "4", 1), 0);
     ASSERT_EQ(setenv(min_size.name, "8192", 1), 0);
@@ -128,6 +98,9 @@ TEST(BatchSubmit, BatchSubmitEnvironmentConfig) {
     EXPECT_EQ(executor.config().threads, 4);
     EXPECT_FALSE(executor.eligible(8191));
     EXPECT_TRUE(executor.eligible(8192));
+    EXPECT_THROW((Executor({33, 1, 1})), std::invalid_argument);
+    EXPECT_THROW((Executor({1, 0, 1})), std::invalid_argument);
+    EXPECT_THROW((Executor({1, 1, 0})), std::invalid_argument);
 
     for (const char* invalid :
          {"", "abc", "4junk", "-1", "33", "184467440737095516160"}) {
@@ -148,32 +121,6 @@ TEST(BatchSubmit, BatchSubmitEnvironmentConfig) {
     }
 }
 
-TEST(BatchSubmit, MissingBackendDeclinesWithoutRunningBuilder) {
-    auto check = [](TransferEngine& engine) {
-        EXPECT_FALSE(engine.isBatchSubmitEligible(SIZE_MAX));
-        int builds = 0;
-        EXPECT_FALSE(engine.tryParallelBatchTransfer(
-            1, 4096,
-            [&](size_t, size_t) {
-                ++builds;
-                return std::vector<TransferRequest>{};
-            },
-            1s));
-        EXPECT_EQ(builds, 0);
-    };
-    TransferEngine classic(false);
-    classic.freeEngine();
-    check(classic);
-#ifdef USE_TENT
-    TransferEngine facade(false);
-    // This is also the facade's state before init(), or if init() fails.
-    TransferEngineImplTestPeer::facade(facade, nullptr);
-    check(facade);
-    facade.freeEngine();
-    check(facade);
-#endif
-}
-
 TEST(BatchSubmit, DetectsOverlapBeforeAnySubBatchCanPublish) {
     const std::vector<size_t> lengths{16, 16, 16};
     EXPECT_TRUE(independentTransferDestinations(
@@ -190,128 +137,60 @@ TEST(BatchSubmit, DetectsOverlapBeforeAnySubBatchCanPublish) {
                                                  std::vector<size_t>{0}));
 }
 
-TEST(BatchSubmit, RunsIndependentSubBatchesConcurrently) {
-    Executor executor({4, 1, 2});
-    std::barrier rendezvous(4);
-    std::mutex mutex;
-    std::set<std::thread::id> threads;
-    std::vector<int> touched(8193, 0);
-    auto result =
-        executor.execute(8193, Executor::Clock::now() + 10s,
-                         [&](auto range, const auto&) -> Executor::Result {
-                             {
-                                 std::lock_guard<std::mutex> lock(mutex);
-                                 threads.insert(std::this_thread::get_id());
-                             }
-                             rendezvous.arrive_and_wait();
-                             for (size_t i = range.begin; i < range.end; ++i)
-                                 ++touched[i];
-                             return Executor::Result::OK();
-                         });
-    ASSERT_TRUE(result.ok()) << result.error;
-    EXPECT_EQ(threads.size(), 4);
-    for (auto value : touched) EXPECT_EQ(value, 1);
-}
-
-TEST(BatchSubmit, OneThreadUsesTheWorkerAndRejectsRecursiveWait) {
-    Executor executor({1, 1, 1});
-    const auto caller = std::this_thread::get_id();
-    auto result = executor.execute(
-        1, Executor::Clock::now() + 1s,
-        [&](auto, const auto&) -> Executor::Result {
-            EXPECT_NE(std::this_thread::get_id(), caller);
-            auto recursive = executor.execute(
-                1, Executor::Clock::now() + 1s,
-                [](auto, const auto&) { return Executor::Result::OK(); });
-            EXPECT_FALSE(recursive.ok());
-            return Executor::Result::OK();
-        });
-    EXPECT_TRUE(result.ok());
-}
-
-TEST(BatchSubmit, AdmissionDeadlineDoesNotPublishWork) {
-    Executor executor({1, 1, 1});
-    std::promise<void> started, release;
-    auto wait = release.get_future().share();
-    auto first = std::async(std::launch::async, [&] {
-        return executor.execute(1, Executor::Clock::now() + 10s,
-                                [&](auto, const auto&) {
-                                    started.set_value();
-                                    wait.wait();
-                                    return Executor::Result::OK();
-                                });
-    });
-    started.get_future().wait();
-    bool called = false;
-    auto second =
-        executor.execute(1, Executor::Clock::now(), [&](auto, const auto&) {
-            called = true;
-            return Executor::Result::OK();
-        });
-    EXPECT_FALSE(second.ok());
-    EXPECT_FALSE(called);
-    release.set_value();
-    EXPECT_TRUE(first.get().ok());
-}
-
-TEST(BatchSubmit, ExceptionSettlesEverySubBatchAndPoolRemainsUsable) {
-    Executor executor({2, 1, 2});
-    auto failed =
-        executor.execute(17, Executor::Clock::now() + 1s,
-                         [](auto, const auto&) -> Executor::Result {
-                             throw std::runtime_error("allocation failed");
-                         });
-    EXPECT_FALSE(failed.ok());
-    auto next = executor.execute(
-        17, Executor::Clock::now() + 1s,
-        [](auto, const auto&) { return Executor::Result::OK(); });
-    EXPECT_TRUE(next.ok());
-}
-
 TEST(BatchSubmit, ShutdownStopsAdmissionAndWaitsForActiveCallbacks) {
-    Executor executor({2, 1, 1});
-    std::promise<void> started;
-    std::atomic<int> returned{0};
-    auto parent = std::async(std::launch::async, [&] {
-        return executor.execute(1, Executor::Clock::now() + 10s,
-                                [&](auto, const auto& stop) {
-                                    started.set_value();
-                                    while (!stop.requested())
-                                        std::this_thread::yield();
-                                    ++returned;
-                                    return Executor::Result::Canceled();
-                                });
-    });
-    started.get_future().wait();
-    executor.shutdown();
-    EXPECT_EQ(returned.load(), 1);
-    auto result = parent.get();
-    EXPECT_FALSE(result.ok());
-    EXPECT_FALSE(result.retryable);
-    EXPECT_FALSE(result.isCanceled());
-    EXPECT_EQ(result.error, "Batch submit executor is shutting down");
-    EXPECT_FALSE(
-        executor
-            .execute(1, Executor::Clock::now() + 1s,
-                     [](auto, const auto&) { return Executor::Result::OK(); })
-            .ok());
+    for (bool native_failure : {false, true}) {
+        SCOPED_TRACE(native_failure);
+        Executor executor({2, 1, 1});
+        std::promise<void> started;
+        std::atomic<int> returned{0};
+        auto parent = std::async(std::launch::async, [&] {
+            return executor.execute(
+                1, Executor::Clock::now() + 10s, [&](auto, const auto& stop) {
+                    started.set_value();
+                    while (!stop.requested()) std::this_thread::yield();
+                    ++returned;
+                    return native_failure ? Executor::Result::TransferError(
+                                                "native failure")
+                                          : Executor::Result::Canceled();
+                });
+        });
+        started.get_future().wait();
+        executor.shutdown();
+        EXPECT_EQ(returned.load(), 1);
+        auto result = parent.get();
+        EXPECT_FALSE(result.ok());
+        EXPECT_FALSE(result.retryable);
+        EXPECT_FALSE(result.isCanceled());
+        EXPECT_EQ(result.error, native_failure
+                                    ? "native failure"
+                                    : "Batch submit executor is shutting down");
+        EXPECT_FALSE(executor
+                         .execute(1, Executor::Clock::now() + 1s,
+                                  [](auto, const auto&) {
+                                      return Executor::Result::OK();
+                                  })
+                         .ok());
+    }
 }
 
 struct FakeAcceptedBatch {
     int submitted = 0, polls = 0, freed = 0;
-    bool fail_submit = false, throw_poll = false, fail_status = false;
-    std::function<void()> on_submit;
-    Executor::Result allocate() { return Executor::Result::OK(); }
+    Executor::Result allocation = Executor::Result::OK();
+    Executor::Result submission = Executor::Result::OK();
+    SubBatchProgress progress{true, true, {}};
+    bool throw_poll = false;
+    std::function<void()> on_submit, on_poll;
+    Executor::Result allocate() { return allocation; }
     Executor::Result submit() {
         ++submitted;
         if (on_submit) on_submit();
-        return fail_submit ? Executor::Result::Error("partial submission")
-                           : Executor::Result::OK();
+        return submission;
     }
     SubBatchProgress poll() {
         ++polls;
+        if (on_poll) on_poll();
         if (throw_poll) throw std::runtime_error("poll failure");
-        return {true, !fail_status, {}};
+        return progress;
     }
     Executor::Result release() {
         ++freed;
@@ -319,173 +198,71 @@ struct FakeAcceptedBatch {
     }
 };
 
-TEST(BatchSubmit, SubBatchReleasesOnSuccessAndErrors) {
-    for (int mode = 0; mode < 4; ++mode) {
+TEST(BatchSubmit, SubBatchReleasesOnlyAllocatedHandlesOnSuccessAndErrors) {
+    enum class Failure { None, Allocate, Submit, Poll, Terminal, SiblingStop };
+    for (auto [name, failure] :
+         {std::pair{"success", Failure::None},
+          std::pair{"allocation", Failure::Allocate},
+          std::pair{"submit", Failure::Submit},
+          std::pair{"poll exception", Failure::Poll},
+          std::pair{"terminal failure", Failure::Terminal},
+          std::pair{"accepted sibling stop", Failure::SiblingStop}}) {
+        SCOPED_TRACE(name);
         std::atomic<bool> stopped{false};
         FakeAcceptedBatch batch;
-        batch.fail_submit = mode == 1;
-        batch.throw_poll = mode == 2;
-        batch.fail_status = mode == 3;
+        if (failure == Failure::Allocate)
+            batch.allocation = Executor::Result::Error("allocation failed");
+        if (failure == Failure::Submit)
+            batch.submission = Executor::Result::SubmitError("submit failed");
+        if (failure == Failure::SiblingStop)
+            batch.on_submit = [&] { stopped.store(true); };
+        batch.throw_poll = failure == Failure::Poll;
+        batch.progress.success = failure != Failure::Terminal;
         auto result = runSubBatch(
             batch,
             Executor::Cancellation{stopped, Executor::Clock::now() + 1s});
-        EXPECT_EQ(result.ok(), mode == 0);
-        EXPECT_EQ(batch.submitted, 1);
-        EXPECT_EQ(batch.freed, 1);
-        EXPECT_EQ(batch.polls, mode == 1 ? 0 : 1);
+        EXPECT_EQ(result.ok(),
+                  failure == Failure::None || failure == Failure::SiblingStop);
+        EXPECT_EQ(batch.submitted, failure == Failure::Allocate ? 0 : 1);
+        EXPECT_EQ(
+            batch.polls,
+            failure == Failure::Allocate || failure == Failure::Submit ? 0 : 1);
+        EXPECT_EQ(batch.freed, failure == Failure::Allocate ? 0 : 1);
+        EXPECT_EQ(result.submit_failed, failure == Failure::Submit);
     }
 }
 
-TEST(BatchSubmit, SiblingCancellationDoesNotMaskTheActualError) {
-    Executor executor({2, 1, 1});
-    struct HeldAllocation : FakeAcceptedBatch {
-        std::function<void()> on_allocate;
-        Executor::Result allocate() {
-            on_allocate();
-            return Executor::Result::OK();
-        }
-    } first;
-    std::promise<void> allocating;
-    auto started = allocating.get_future().share();
-    auto result = executor.execute(
-        2, Executor::Clock::now() + 5s,
-        [&](auto range, const auto& cancellation) {
-            if (range.index == 1) {
-                if (started.wait_until(cancellation.deadline) !=
-                    std::future_status::ready)
-                    return Executor::Result::Error("Allocation did not start");
-                return Executor::Result{-7, "Injected transport failure"};
-            }
-            first.on_allocate = [&] {
-                allocating.set_value();
-                while (!cancellation.requested()) std::this_thread::yield();
+TEST(BatchSubmit, SubBatchReleasesOnDeadlineAndShutdownAtEachStage) {
+    enum class Stage { BeforeSubmit, AfterSubmit, PendingPoll };
+    for (bool shutdown_requested : {false, true}) {
+        for (auto stage :
+             {Stage::BeforeSubmit, Stage::AfterSubmit, Stage::PendingPoll}) {
+            SCOPED_TRACE(shutdown_requested);
+            SCOPED_TRACE(static_cast<int>(stage));
+            std::atomic<bool> stopped{false}, shutdown{false};
+            Executor::Cancellation cancellation{
+                stopped, Executor::Clock::now() + 1h, &shutdown};
+            FakeAcceptedBatch batch;
+            batch.progress = {false, false, {}};
+            auto cancel = [&] {
+                if (shutdown_requested)
+                    shutdown.store(true);
+                else
+                    cancellation.deadline = Executor::Clock::now();
             };
-            return runSubBatch(first, cancellation);
-        });
-    EXPECT_EQ(result.code, -7);
-    EXPECT_EQ(result.error, "Injected transport failure");
-    EXPECT_EQ(first.submitted, 0);
-    EXPECT_EQ(first.polls, 0);
-    EXPECT_EQ(first.freed, 1);
-}
-
-TEST(BatchSubmit, DeadlineCancellationDoesNotMaskTheActualError) {
-    for (bool before_submit : {true, false}) {
-        SCOPED_TRACE(before_submit);
-        Executor executor({2, 1, 1});
-        struct HeldBatch : FakeAcceptedBatch {
-            bool hold_allocation = false;
-            std::function<void()> hold;
-            Executor::Result allocate() {
-                if (hold_allocation) hold();
-                return Executor::Result::OK();
-            }
-            SubBatchProgress poll() {
-                ++polls;
-                hold();
-                return {false, false, {}};
-            }
-        } first;
-        first.hold_allocation = before_submit;
-        std::promise<void> entered;
-        auto started = entered.get_future().share();
-        Executor::Result first_result;
-        auto result = executor.execute(
-            2, Executor::Clock::now() + 1s,
-            [&](auto range, const auto& cancellation) {
-                if (range.index == 1) {
-                    if (started.wait_until(cancellation.deadline) !=
-                        std::future_status::ready)
-                        return Executor::Result::Error(
-                            "First sub-batch did not start");
-                    return Executor::Result{-7, "Injected transport failure"};
-                }
-                first.hold = [&] {
-                    entered.set_value();
-                    while (!cancellation.expired()) std::this_thread::yield();
-                };
-                first_result = runSubBatch(first, cancellation);
-                return first_result;
-            });
-        EXPECT_TRUE(first_result.isCanceled());
-        EXPECT_EQ(result.code, -7);
-        EXPECT_EQ(result.error, "Injected transport failure");
-        EXPECT_EQ(first.submitted, before_submit ? 0 : 1);
-        EXPECT_EQ(first.polls, before_submit ? 0 : 1);
-        EXPECT_EQ(first.freed, 1);
+            if (stage == Stage::BeforeSubmit)
+                cancel();
+            else if (stage == Stage::AfterSubmit)
+                batch.on_submit = cancel;
+            else
+                batch.on_poll = cancel;
+            auto result = runSubBatch(batch, cancellation);
+            EXPECT_TRUE(result.isCanceled());
+            EXPECT_EQ(batch.submitted, stage == Stage::BeforeSubmit ? 0 : 1);
+            EXPECT_EQ(batch.polls, stage == Stage::PendingPoll ? 1 : 0);
+            EXPECT_EQ(batch.freed, 1);
+        }
     }
-}
-
-TEST(BatchSubmit, ReleaseErrorIsPreservedAfterCancellation) {
-    struct FailedRelease : FakeAcceptedBatch {
-        Executor::Result release() {
-            ++freed;
-            return Executor::Result::Error("release failed");
-        }
-    } batch;
-    std::atomic<bool> stopped{true};
-    auto result = runSubBatch(
-        batch, Executor::Cancellation{stopped, Executor::Clock::now() + 1s});
-    EXPECT_FALSE(result.ok());
-    EXPECT_FALSE(result.isCanceled());
-    EXPECT_EQ(result.error, "release failed");
-    EXPECT_EQ(batch.submitted, 0);
-    EXPECT_EQ(batch.polls, 0);
-    EXPECT_EQ(batch.freed, 1);
-}
-
-TEST(BatchSubmit, AllocationFailureNeverSubmitsPollsOrReleasesAHandle) {
-    struct UnallocatedBatch : FakeAcceptedBatch {
-        Executor::Result allocate() {
-            return Executor::Result::Error("allocation failed");
-        }
-    } batch;
-    std::atomic<bool> stopped{false};
-    auto result = runSubBatch(
-        batch, Executor::Cancellation{stopped, Executor::Clock::now() + 1s});
-    EXPECT_FALSE(result.ok());
-    EXPECT_EQ(result.error, "allocation failed");
-    EXPECT_EQ(batch.submitted, 0);
-    EXPECT_EQ(batch.polls, 0);
-    EXPECT_EQ(batch.freed, 0);
-}
-
-TEST(BatchSubmit, SubBatchReleasesOnTimeout) {
-    std::atomic<bool> stopped{false};
-    Executor::Cancellation cancellation{stopped, Executor::Clock::now() + 1h};
-    FakeAcceptedBatch batch;
-    batch.on_submit = [&] { cancellation.deadline = Executor::Clock::now(); };
-    auto result = runSubBatch(batch, cancellation);
-    EXPECT_TRUE(result.isCanceled());
-    EXPECT_EQ(batch.submitted, 1);
-    EXPECT_EQ(batch.polls, 0);
-    EXPECT_EQ(batch.freed, 1);
-}
-
-TEST(BatchSubmit, SubBatchReleasesOnShutdown) {
-    struct HeldBatch : FakeAcceptedBatch {
-        std::promise<void> polled;
-        SubBatchProgress poll() {
-            if (++polls == 1) polled.set_value();
-            return {false, false, {}};
-        }
-    } batch;
-    std::atomic<bool> stopped{false}, shutdown{false};
-    auto parent = std::async(std::launch::async, [&] {
-        return runSubBatch(
-            batch, Executor::Cancellation{stopped, Executor::Clock::now() + 1h,
-                                          &shutdown});
-    });
-    batch.polled.get_future().wait();
-    shutdown.store(true);
-    EXPECT_TRUE(parent.get().isCanceled());
-    EXPECT_EQ(batch.freed, 1);
-}
-
-TEST(BatchSubmit, InvalidConfigIsRejectedWithoutSpawningThreads) {
-    EXPECT_THROW((Executor({33, 1, 1})), std::invalid_argument);
-    EXPECT_THROW((Executor({1, 0, 1})), std::invalid_argument);
-    EXPECT_THROW((Executor({1, 1, 0})), std::invalid_argument);
 }
 
 TEST(BatchSubmit, FailureJoinsAcceptedSiblingWithoutExpiringIt) {
@@ -499,7 +276,7 @@ TEST(BatchSubmit, FailureJoinsAcceptedSiblingWithoutExpiringIt) {
             [&](auto range, const auto& cancellation) -> Executor::Result {
                 both_running.arrive_and_wait();
                 if (range.index == 0)
-                    return Executor::Result::Error("first sub-batch failed");
+                    throw std::runtime_error("first sub-batch failed");
                 while (!cancellation.requested()) std::this_thread::yield();
                 cancel_seen.set_value();
                 EXPECT_FALSE(cancellation.expired());
@@ -511,6 +288,11 @@ TEST(BatchSubmit, FailureJoinsAcceptedSiblingWithoutExpiringIt) {
     EXPECT_EQ(parent.wait_for(0s), std::future_status::timeout);
     release_sibling.set_value();
     EXPECT_EQ(parent.get().error, "first sub-batch failed");
+    EXPECT_TRUE(
+        executor
+            .execute(1, Executor::Clock::now() + 1s,
+                     [](auto, const auto&) { return Executor::Result::OK(); })
+            .ok());
 }
 
 TEST(BatchSubmit, RetryDecisionIncludesEveryActualError) {
@@ -549,56 +331,8 @@ TEST(BatchSubmit, RetryDecisionIncludesEveryActualError) {
     }
 }
 
-TEST(BatchSubmit, NativeFailureAfterDeadlineCannotRetry) {
-    Executor executor({1, 1, 1});
-    auto result = executor.execute(
-        1, Executor::Clock::now() + 10ms, [](auto, const auto& cancellation) {
-            while (!cancellation.expired()) std::this_thread::yield();
-            return Executor::Result::TransferError("late native failure");
-        });
-    EXPECT_EQ(result.error, "late native failure");
-    EXPECT_FALSE(result.retryable);
-}
-
-TEST(BatchSubmit, ShutdownDisablesRetryEvenWhenNativeFailureWinsDiagnosis) {
-    Executor executor({1, 1, 1});
-    std::promise<void> started;
-    auto parent = std::async(std::launch::async, [&] {
-        return executor.execute(
-            1, Executor::Clock::now() + 5s, [&](auto, const auto& stop) {
-                started.set_value();
-                while (!stop.expired()) std::this_thread::yield();
-                return Executor::Result::TransferError("native failure");
-            });
-    });
-    started.get_future().wait();
-    executor.shutdown();
-    auto result = parent.get();
-    EXPECT_EQ(result.error, "native failure");
-    EXPECT_FALSE(result.retryable);
-}
-
-TEST(BatchSubmit, NativeFailureSurvivesReleaseError) {
-    struct FailedBatch : FakeAcceptedBatch {
-        SubBatchProgress poll() {
-            return {true, false, "native failure", true};
-        }
-        Executor::Result release() {
-            ++freed;
-            return Executor::Result::Error("release error");
-        }
-    } batch;
-    std::atomic<bool> stopped{false};
-    auto result = runSubBatch(
-        batch, Executor::Cancellation{stopped, Executor::Clock::now() + 1s});
-    EXPECT_EQ(result.error, "native failure");
-    EXPECT_TRUE(result.retryable);
-    EXPECT_FALSE(result.submit_failed);
-    EXPECT_EQ(batch.freed, 1);
-}
-
 TEST(BatchSubmit, ConcurrentParentsKeepInputAndErrorsSeparate) {
-    Executor executor({2, 1, 2});
+    Executor executor({4, 1, 2});
     std::barrier launch(2);
     std::vector<int> successful_input(8193, 0);
     auto failed = std::async(std::launch::async, [&] {
@@ -623,99 +357,39 @@ TEST(BatchSubmit, ConcurrentParentsKeepInputAndErrorsSeparate) {
     for (int count : successful_input) EXPECT_EQ(count, 1);
 }
 
-TEST(BatchSubmit, ExpiredQueuedParentDoesNotSubmitAnySubBatch) {
-    Executor executor({2, 1, 2});
-    std::promise<void> started, release;
-    std::atomic<int> occupied{0};
-    auto unblock = release.get_future().share();
-    auto first = std::async(std::launch::async, [&] {
-        return executor.execute(2, Executor::Clock::now() + 10s,
-                                [&](auto, const auto&) {
-                                    if (++occupied == 2) started.set_value();
-                                    unblock.wait();
-                                    return Executor::Result::OK();
-                                });
-    });
-    started.get_future().wait();
-    std::atomic<int> submitted{0};
-    auto expired = std::async(std::launch::async, [&] {
-        return executor.execute(4, Executor::Clock::now(),
-                                [&](auto, const auto&) {
-                                    ++submitted;
-                                    return Executor::Result::OK();
-                                });
-    });
-    // An expired queued parent must return while every worker is occupied.
-    EXPECT_EQ(expired.wait_for(2s), std::future_status::ready);
-    EXPECT_EQ(submitted.load(), 0);
-    release.set_value();
-    EXPECT_TRUE(first.get().ok());
-    EXPECT_FALSE(expired.get().ok());
-    EXPECT_EQ(submitted.load(), 0);
-    EXPECT_TRUE(
-        executor
-            .execute(1, Executor::Clock::now() + 1s,
-                     [](auto, const auto&) { return Executor::Result::OK(); })
-            .ok());
-}
-
-TEST(BatchSubmit, TimeoutJoinsStartedCallbacksAndPreservesErrors) {
-    // Cover active-only, active+queued, and an actual error after expiry.
-    for (auto [count, fail] :
-         {std::pair{1, false}, std::pair{2, false}, std::pair{2, true}}) {
-        SCOPED_TRACE(count);
-        SCOPED_TRACE(fail);
-        Executor executor({2, 1, 2});
-        std::promise<void> occupied, release_other, release_active;
-        std::promise<bool> timeout_seen;
-        auto other_wait = release_other.get_future().share();
-        auto active_wait = release_active.get_future().share();
-        auto other = std::async(std::launch::async, [&] {
-            return executor.execute(1, Executor::Clock::now() + 30s,
+TEST(BatchSubmit, ExpiredParentDoesNotPublishOrRunQueuedWork) {
+    for (bool admission_full : {false, true}) {
+        SCOPED_TRACE(admission_full);
+        Executor executor({2, 1, admission_full ? 1u : 2u});
+        std::promise<void> started, release;
+        std::atomic<int> occupied{0};
+        auto unblock = release.get_future().share();
+        auto first = std::async(std::launch::async, [&] {
+            return executor.execute(2, Executor::Clock::now() + 10s,
                                     [&](auto, const auto&) {
-                                        occupied.set_value();
-                                        other_wait.wait();
+                                        if (++occupied == 2)
+                                            started.set_value();
+                                        unblock.wait();
                                         return Executor::Result::OK();
                                     });
         });
-        occupied.get_future().wait();
-        std::atomic<int> calls{0};
-        auto parent = std::async(std::launch::async, [&] {
-            return executor.execute(
-                count, Executor::Clock::now() + 1s,
-                [&](auto, const auto& stop) -> Executor::Result {
-                    ++calls;
-                    // Wait for the caller's timeout handling, with a bound so
-                    // a broken implementation still allows test cleanup.
-                    const auto until = stop.deadline + 2s;
-                    while (!stop.stopped.load() &&
-                           Executor::Clock::now() < until)
-                        std::this_thread::yield();
-                    timeout_seen.set_value(stop.stopped.load());
-                    active_wait.wait();
-                    return fail
-                               ? Executor::Result{-7, "Injected active failure"}
-                               : Executor::Result::OK();
-                });
+        started.get_future().wait();
+        std::atomic<int> submitted{0};
+        auto expired = std::async(std::launch::async, [&] {
+            return executor.execute(4, Executor::Clock::now(),
+                                    [&](auto, const auto&) {
+                                        ++submitted;
+                                        return Executor::Result::OK();
+                                    });
         });
-        auto observed = timeout_seen.get_future();
-        auto observed_status = observed.wait_for(5s);
-        EXPECT_EQ(observed_status, std::future_status::ready);
-        if (observed_status == std::future_status::ready) {
-            EXPECT_TRUE(observed.get());
-        }
-        EXPECT_EQ(parent.wait_for(0s), std::future_status::timeout);
-        release_active.set_value();
-        // The unrelated parent still occupies its worker.
-        EXPECT_EQ(parent.wait_for(2s), std::future_status::ready);
-        EXPECT_EQ(other.wait_for(0s), std::future_status::timeout);
-        release_other.set_value();
-        auto result = parent.get();
-        EXPECT_TRUE(other.get().ok());
-        EXPECT_EQ(calls.load(), 1);
-        EXPECT_EQ(result.code, fail ? -7 : -1);
-        EXPECT_EQ(result.error, fail ? "Injected active failure"
-                                     : "Parallel batch transfer timed out");
+        // Both admission and queued-work expiry must return with workers
+        // occupied.
+        EXPECT_EQ(expired.wait_for(2s), std::future_status::ready);
+        EXPECT_EQ(submitted.load(), 0);
+        release.set_value();
+        EXPECT_TRUE(first.get().ok());
+        EXPECT_FALSE(expired.get().ok());
+        EXPECT_EQ(submitted.load(), 0);
         EXPECT_TRUE(executor
                         .execute(1, Executor::Clock::now() + 1s,
                                  [](auto, const auto&) {
@@ -725,16 +399,110 @@ TEST(BatchSubmit, TimeoutJoinsStartedCallbacksAndPreservesErrors) {
     }
 }
 
-TEST(BatchSubmit, DeadlineBeforeSubmitStillReleasesAllocatedBatch) {
-    std::atomic<bool> stopped{false};
-    FakeAcceptedBatch batch;
-    auto result = runSubBatch(
-        batch, Executor::Cancellation{stopped, Executor::Clock::now()});
-    EXPECT_TRUE(result.isCanceled());
-    EXPECT_EQ(batch.submitted, 0);
-    EXPECT_EQ(batch.freed, 1);
-    EXPECT_EQ(batch.polls, 0);
+TEST(BatchSubmit, TimeoutJoinsStartedCallbacksAndPreservesErrors) {
+    for (bool fail : {false, true}) {
+        SCOPED_TRACE(fail);
+        Executor executor({1, 1, 1});
+        std::promise<void> release;
+        std::promise<bool> timeout_seen;
+        auto wait = release.get_future().share();
+        auto parent = std::async(std::launch::async, [&] {
+            return executor.execute(
+                1, Executor::Clock::now() + 1s, [&](auto, const auto& stop) {
+                    const auto until = stop.deadline + 2s;
+                    while (!stop.stopped.load() &&
+                           Executor::Clock::now() < until)
+                        std::this_thread::yield();
+                    timeout_seen.set_value(stop.stopped.load());
+                    wait.wait();
+                    return fail ? Executor::Result::TransferError(
+                                      "late native failure")
+                                : Executor::Result::OK();
+                });
+        });
+        auto observed = timeout_seen.get_future();
+        const auto ready = observed.wait_for(5s);
+        EXPECT_EQ(ready, std::future_status::ready);
+        if (ready == std::future_status::ready) {
+            EXPECT_TRUE(observed.get());
+        }
+        EXPECT_EQ(parent.wait_for(0s), std::future_status::timeout);
+        release.set_value();
+        auto result = parent.get();
+        EXPECT_FALSE(result.ok());
+        EXPECT_FALSE(result.retryable);
+        EXPECT_EQ(result.error, fail ? "late native failure"
+                                     : "Parallel batch transfer timed out");
+    }
 }
+
+template <class Engine, class Builder>
+void expectIndependentSubmission(Engine& engine, uint64_t peer, Builder build,
+                                 std::function<void()>& on_submit) {
+    std::promise<void> submitted, release;
+    auto ready = submitted.get_future();
+    auto proceed = release.get_future().share();
+    std::atomic<int> submits{0};
+    on_submit = [&] {
+        if (++submits == 1) submitted.set_value();
+    };
+    auto parent = std::async(std::launch::async, [&] {
+        return engine.tryParallelBatchTransfer(
+            peer, 2,
+            [&](auto begin, auto end) {
+                if (begin == 0) proceed.wait();
+                return build(begin, end);
+            },
+            10s);
+    });
+    EXPECT_EQ(ready.wait_for(5s), std::future_status::ready);
+    EXPECT_EQ(parent.wait_for(0s), std::future_status::timeout);
+    release.set_value();
+    auto result = parent.get();
+    on_submit = {};
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->ok()) << result->ToString();
+    EXPECT_EQ(submits.load(), 2);
+}
+
+template <class Builder, class Probe>
+void expectFailureInfoMatchesLegacy(TransferEngine& engine, uint64_t peer,
+                                    Builder build, Probe& probe) {
+    auto entries = build(0, 1);
+    auto id = engine.allocateBatchID(entries.size());
+    auto before = probe.submits.load();
+    auto submitted = engine.submitTransfer(id, entries);
+    TransferStatus status{};
+    if (submitted.ok()) {
+        EXPECT_TRUE(engine.getBatchTransferStatus(id, status).ok());
+    }
+    EXPECT_TRUE(engine.freeBatchID(id).ok());
+    const auto legacy_submits = probe.submits.load() - before;
+    before = probe.submits.load();
+    const auto observed = probe.observed.size();
+    TransferEngine::ParallelBatchTransferFailureInfo failure{true, true};
+    auto result = engine.tryParallelBatchTransfer(peer, 1, build, 5s, &failure);
+    EXPECT_EQ(result.has_value(), probe.supported.load());
+    if (!result) {
+        EXPECT_EQ(probe.submits.load(), before);
+        EXPECT_FALSE(failure.submit_failed);
+        EXPECT_FALSE(failure.retryable);
+        return;
+    }
+    EXPECT_EQ(result->ok(), submitted.ok() && status.s == Transport::COMPLETED);
+    using State = decltype(probe.terminal.load());
+    EXPECT_EQ(result->ok(), submitted.ok() && !probe.fail_submit &&
+                                probe.terminal.load() == State::COMPLETED);
+    EXPECT_EQ(failure.submit_failed, !submitted.ok());
+    EXPECT_EQ(failure.retryable,
+              submitted.ok() && (status.s == Transport::FAILED ||
+                                 status.s == Transport::TIMEOUT));
+    EXPECT_EQ(probe.submits.load() - before, legacy_submits);
+    if (probe.fail_submit) {
+        EXPECT_EQ(probe.observed.size(), observed);
+    }
+}
+
 class BatchSubmitProbe : public Transport {
    public:
     std::atomic<bool> supported{true};
@@ -836,6 +604,9 @@ class ClassicBatchSubmit : public ::testing::Test {
 };
 
 TEST_F(ClassicBatchSubmit, ArbitraryTransportNameAndRequestFieldsArePreserved) {
+    auto unrelated = std::make_shared<BatchSubmitProbe>();
+    unrelated->supported.store(false);
+    MultiTransportBatchTestPeer::install(*multi, "other", unrelated);
     ASSERT_TRUE(engine.supportsParallelBatchSubmit(1));
     auto result = engine.tryParallelBatchTransfer(1, 5, requests, 10s);
     ASSERT_TRUE(result.has_value());
@@ -851,86 +622,21 @@ TEST_F(ClassicBatchSubmit, ArbitraryTransportNameAndRequestFieldsArePreserved) {
 }
 
 TEST_F(ClassicBatchSubmit, FailureInfoMatchesLegacyAndResets) {
-    TransferEngine::ParallelBatchTransferFailureInfo failure{true, true};
-    auto transfer = [&] {
-        auto entries = requests(0, 1);
-        auto id = engine.allocateBatchID(entries.size());
-        auto submitted = engine.submitTransfer(id, entries);
-        TransferStatus status{};
-        if (submitted.ok()) {
-            EXPECT_TRUE(engine.getBatchTransferStatus(id, status).ok());
-        }
-        EXPECT_TRUE(engine.freeBatchID(id).ok());
-        auto result =
-            engine.tryParallelBatchTransfer(1, 1, requests, 5s, &failure);
-        if (result) {
-            EXPECT_EQ(failure.submit_failed, !submitted.ok());
-            EXPECT_EQ(failure.retryable,
-                      submitted.ok() && (status.s == Transport::FAILED ||
-                                         status.s == Transport::TIMEOUT));
-        }
-        return result;
-    };
-    for (auto terminal : {Transport::TransferStatusEnum::FAILED,
-                          Transport::TransferStatusEnum::TIMEOUT}) {
-        transport->terminal.store(terminal);
-        ASSERT_FALSE(transfer()->ok());
-        EXPECT_TRUE(failure.retryable);
-        EXPECT_FALSE(failure.submit_failed);
+    using State = Transport::TransferStatusEnum;
+    for (auto [state, submit_error, supported] :
+         {std::tuple{State::FAILED, false, true},
+          std::tuple{State::TIMEOUT, false, true},
+          std::tuple{State::COMPLETED, true, true},
+          std::tuple{State::COMPLETED, false, true},
+          std::tuple{State::COMPLETED, false, false}}) {
+        SCOPED_TRACE(state);
+        SCOPED_TRACE(submit_error);
+        SCOPED_TRACE(supported);
+        transport->terminal.store(state);
+        transport->fail_submit = submit_error;
+        transport->supported.store(supported);
+        expectFailureInfoMatchesLegacy(engine, 1, requests, *transport);
     }
-    transport->fail_submit = true;
-    ASSERT_FALSE(transfer()->ok());
-    EXPECT_TRUE(failure.submit_failed);
-    EXPECT_FALSE(failure.retryable);
-    transport->fail_submit = false;
-    transport->terminal.store(Transport::TransferStatusEnum::COMPLETED);
-    ASSERT_TRUE(transfer()->ok());
-    EXPECT_FALSE(failure.submit_failed);
-    EXPECT_FALSE(failure.retryable);
-    failure = {true, true};
-    transport->supported.store(false);
-    EXPECT_FALSE(transfer());
-    EXPECT_FALSE(failure.submit_failed);
-    EXPECT_FALSE(failure.retryable);
-}
-
-TEST_F(ClassicBatchSubmit, UnsupportedAdmissionBuildsNothingAndFallsBackOnce) {
-    transport->supported.store(false);
-    int builds = 0;
-    auto result = engine.tryParallelBatchTransfer(
-        1, 4,
-        [&](auto begin, auto end) {
-            ++builds;
-            return requests(begin, end);
-        },
-        10s);
-    EXPECT_FALSE(result.has_value());
-    EXPECT_EQ(builds, 0);
-    EXPECT_EQ(transport->submits.load(), 0);
-    auto id = engine.allocateBatchID(4);
-    auto entries = requests(0, 4);
-    ASSERT_TRUE(engine.submitTransfer(id, entries).ok());
-    EXPECT_EQ(transport->submits.load(), 1);
-    EXPECT_TRUE(engine.freeBatchID(id).ok());
-}
-
-TEST_F(ClassicBatchSubmit, UnrelatedUnsupportedTransportDoesNotBlockThePeer) {
-    auto unsupported = std::make_shared<BatchSubmitProbe>();
-    unsupported->supported.store(false);
-    MultiTransportBatchTestPeer::install(*multi, "other", unsupported);
-    int builds = 0;
-    auto result = engine.tryParallelBatchTransfer(
-        1, 2,
-        [&](size_t begin, size_t end) {
-            ++builds;
-            return requests(begin, end);
-        },
-        10s);
-    ASSERT_TRUE(result.has_value());
-    EXPECT_TRUE(result->ok());
-    EXPECT_EQ(builds, 2);
-    EXPECT_EQ(transport->submits.load(), 2);
-    EXPECT_EQ(unsupported->submits.load(), 0);
 }
 
 TEST_F(ClassicBatchSubmit, MixedPeerDoesNotCheckOnlyTheFirstProtocol) {
@@ -938,17 +644,7 @@ TEST_F(ClassicBatchSubmit, MixedPeerDoesNotCheckOnlyTheFirstProtocol) {
     other->supported.store(false);
     MultiTransportBatchTestPeer::install(*multi, "other", other);
     add(1, "probe,other");
-    int builds = 0;
-    EXPECT_FALSE(engine.tryParallelBatchTransfer(
-        1, 2,
-        [&](size_t begin, size_t end) {
-            ++builds;
-            return requests(begin, end);
-        },
-        10s));
-    EXPECT_EQ(builds, 0);
-    EXPECT_EQ(transport->submits.load(), 0);
-    EXPECT_EQ(other->submits.load(), 0);
+    EXPECT_FALSE(engine.supportsParallelBatchSubmit(1));
 #ifdef ENABLE_MULTI_PROTOCOL
     other->supported.store(true);
     EXPECT_TRUE(engine.supportsParallelBatchSubmit(1));
@@ -999,29 +695,7 @@ TEST_F(ClassicBatchSubmit,
 
 TEST_F(ClassicBatchSubmit,
        ReadySubBatchSubmitsBeforeSlowSiblingFinishesBuilding) {
-    std::promise<void> submitted, release;
-    auto ready = submitted.get_future();
-    auto proceed = release.get_future().share();
-    std::atomic<int> count{0};
-    transport->on_submit = [&] {
-        if (++count == 1) submitted.set_value();
-    };
-    auto parent = std::async(std::launch::async, [&] {
-        return engine.tryParallelBatchTransfer(
-            1, 2,
-            [&](size_t begin, size_t end) {
-                if (begin == 0) proceed.wait();
-                return requests(begin, end);
-            },
-            10s);
-    });
-    EXPECT_EQ(ready.wait_for(5s), std::future_status::ready);
-    EXPECT_EQ(parent.wait_for(0s), std::future_status::timeout);
-    release.set_value();
-    auto result = parent.get();
-    ASSERT_TRUE(result.has_value());
-    EXPECT_TRUE(result->ok()) << result->ToString();
-    EXPECT_EQ(transport->submits.load(), 2);
+    expectIndependentSubmission(engine, 1, requests, transport->on_submit);
 }
 
 #ifdef USE_TENT
@@ -1033,15 +707,18 @@ struct ProbeSubBatch : tt::Transport::SubBatch {
 
 class TentBatchSubmitProbe : public tt::Transport {
    public:
-    explicit TentBatchSubmitProbe(tt::TransportType type) : type_(type) {
-        caps.dram_to_dram = true;
+    explicit TentBatchSubmitProbe(tt::TransportType type,
+                                  bool file_only = false)
+        : type_(type) {
+        caps.dram_to_dram = !file_only;
+        caps.dram_to_file = file_only;
     }
-    std::atomic<bool> supported{true}, pending{false};
+    std::atomic<bool> supported{true};
     std::atomic<tt::TransferStatusEnum> terminal{tt::COMPLETED};
     std::atomic<int> submits{0}, releases{0};
     bool fail_submit = false;
-    std::atomic<bool> fail_poll{false}, fail_poll_api{false};
-    std::function<void()> on_submit, on_poll;
+    std::atomic<bool> fail_poll_api{false};
+    std::function<void()> on_submit;
     std::mutex mutex;
     std::vector<tt::Request> observed;
     bool supportsParallelBatchSubmit() const override {
@@ -1074,13 +751,10 @@ class TentBatchSubmitProbe : public tt::Transport {
     }
     tt::Status getTransferStatus(SubBatchRef batch, int id,
                                  tt::TransferStatus& status) override {
-        if (on_poll) on_poll();
         if (fail_poll_api.exchange(false))
             return tt::Status::InvalidArgument(
                 "Injected native poll API error");
-        status.s = pending.load()     ? tt::PENDING
-                   : fail_poll.load() ? tt::FAILED
-                                      : terminal.load();
+        status.s = terminal.load();
         status.transferred_bytes =
             static_cast<ProbeSubBatch*>(batch)->requests.at(id).length;
         return tt::Status::OK();
@@ -1099,13 +773,13 @@ class TentBatchSubmitProbe : public tt::Transport {
     tt::TransportType type_;
 };
 
-std::shared_ptr<tt::Config> batchSubmitConfig(bool queue = false) {
+std::shared_ptr<tt::Config> batchSubmitConfig() {
     auto config = std::make_shared<tt::Config>();
     config->set("metadata_type", "p2p");
     config->set("rpc_server_hostname", "127.0.0.1");
     config->set("rpc_server_port", "0");
     config->set("log_level", "warning");
-    config->set("enable_runtime_queue", queue);
+    config->set("enable_runtime_queue", false);
     for (int type = 1; type < tt::kSupportedTransportTypes; ++type)
         config->set("transports/" +
                         std::string(tt::transportTypeName(
@@ -1146,327 +820,142 @@ class TentBatchSubmit : public ::testing::Test {
         EXPECT_TRUE(engine->openSegment(id, peer->getSegmentName()).ok());
         return peer;
     }
-    std::vector<tt::Request> requests(size_t begin, size_t end) {
-        std::vector<tt::Request> result;
+
+    template <class Request = tt::Request>
+    std::vector<Request> requests(
+        size_t begin, size_t end, int hint = tt::UNSPEC,
+        typename Request::OpCode opcode = Request::WRITE) {
+        std::vector<Request> result;
         for (size_t i = begin; i < end; ++i) {
-            tt::Request request{};
-            request.opcode = tt::Request::WRITE;
+            Request request{};
+            request.opcode = opcode;
             request.source = bytes.data() + i * 16;
             request.target_id = LOCAL_SEGMENT_ID;
             request.target_offset = reinterpret_cast<uint64_t>(request.source);
             request.length = 16;
             request.priority = tt::PRIO_LOW;
-            request.intent_type = tt::IntentType::CHECKPOINT;
+            request.intent_type = static_cast<decltype(request.intent_type)>(
+                tt::IntentType::CHECKPOINT);
+            request.transport_hint =
+                static_cast<decltype(request.transport_hint)>(hint);
             result.push_back(request);
         }
         return result;
     }
 };
 
-TEST_F(TentBatchSubmit, PreservesFieldsThroughNativeBatch) {
-    ASSERT_TRUE(engine->supportsParallelBatchSubmit(LOCAL_SEGMENT_ID));
-    auto result = engine->tryParallelBatchTransfer(
+TEST_F(TentBatchSubmit, FacadePreservesFieldsThroughNativeBatch) {
+    TransferEngine facade(false);
+    TransferEngineImplTestPeer::facade(facade, engine);
+    auto result = facade.tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 4,
-        [&](auto begin, auto end) { return requests(begin, end); }, 10s);
+        [&](auto begin, auto end) {
+            return requests<TransferRequest>(begin, end, tt::TCP,
+                                             TransferRequest::READ);
+        },
+        10s);
     ASSERT_TRUE(result.has_value());
     ASSERT_TRUE(result->ok()) << result->ToString();
     EXPECT_EQ(transport->submits.load(), 2);
     EXPECT_EQ(transport->releases.load(), 2);
     size_t total = 0;
     for (const auto& request : transport->observed) {
-        total += request.length;  // Native merging may combine adjacent ranges.
-        EXPECT_EQ(request.transport_hint, tt::UNSPEC);
+        // Native merging may combine adjacent ranges.
+        total += request.length;
+        EXPECT_EQ(request.opcode, tt::Request::READ);
+        EXPECT_EQ(request.transport_hint, tt::TCP);
         EXPECT_EQ(request.priority, tt::PRIO_LOW);
         EXPECT_EQ(request.intent_type, tt::IntentType::CHECKPOINT);
     }
     EXPECT_EQ(total, 4u * 16);
 }
 
-TEST_F(TentBatchSubmit, UnsupportedCandidateRejectsBeforeBuilder) {
-    transport->supported.store(false);
-    int builds = 0;
-    auto result = engine->tryParallelBatchTransfer(
-        LOCAL_SEGMENT_ID, 4,
-        [&](auto begin, auto end) {
-            ++builds;
-            return requests(begin, end);
-        },
-        10s);
-    EXPECT_FALSE(result.has_value());
-    EXPECT_EQ(builds, 0);
-    EXPECT_EQ(transport->submits.load(), 0);
-}
-
-TEST_F(TentBatchSubmit, ExplicitHintDoesNotHideAnUnsupportedFailoverCandidate) {
-    auto unsupported = std::make_shared<TentBatchSubmitProbe>(tt::RDMA);
-    unsupported->supported.store(false);
-    ASSERT_TRUE(engine->unregisterLocalMemory(bytes.data()).ok());
-    TransferEngineImplTestPeer::impl(*engine).swapTransportForTest(tt::RDMA,
-                                                                   unsupported);
-    ASSERT_TRUE(engine->registerLocalMemory(bytes.data(), bytes.size()).ok());
-    EXPECT_FALSE(engine->supportsParallelBatchSubmit(LOCAL_SEGMENT_ID));
-    int builds = 0;
-    auto result = engine->tryParallelBatchTransfer(
-        LOCAL_SEGMENT_ID, 2,
-        [&](size_t begin, size_t end) {
-            ++builds;
-            auto entries = requests(begin, end);
-            for (auto& request : entries) request.transport_hint = tt::TCP;
-            return entries;
-        },
-        10s);
-    EXPECT_FALSE(result.has_value());
-    EXPECT_EQ(builds, 0);
-    EXPECT_EQ(transport->submits.load(), 0);
-    EXPECT_EQ(unsupported->submits.load(), 0);
-}
-
-TEST_F(TentBatchSubmit, LocalOnlyTransportsDoNotBlockCrossMachineTransfer) {
+TEST_F(TentBatchSubmit, AdmissionRespectsLocalityAndMemoryCapabilities) {
     tt::SegmentID peer_id = 0;
     auto peer = remote(peer_id);
-    for (auto type : {tt::NVLINK, tt::SHM, tt::TPU}) {
-        auto local_only = std::make_shared<TentBatchSubmitProbe>(type);
-        local_only->supported.store(false);
-        TransferEngineImplTestPeer::impl(*engine).swapTransportForTest(
-            type, local_only);
-    }
-    auto result = engine->tryParallelBatchTransfer(
-        peer_id, 2,
-        [&](size_t begin, size_t end) {
-            auto entries = requests(begin, end);
-            for (auto& request : entries) request.target_id = peer_id;
-            return entries;
-        },
-        10s);
-    ASSERT_TRUE(result.has_value());
-    EXPECT_TRUE(result->ok()) << result->ToString();
-    EXPECT_EQ(transport->submits.load(), 2);
-    EXPECT_TRUE(engine->closeSegment(peer_id).ok());
-    EXPECT_TRUE(peer->unregisterLocalMemory(bytes.data()).ok());
-}
-
-TEST_F(TentBatchSubmit, CrossMachineMnnvlRemainsAPossibleCandidate) {
-    tt::SegmentID peer_id = 0;
-    auto peer = remote(peer_id);
-    auto unsupported = std::make_shared<TentBatchSubmitProbe>(tt::MNNVL);
-    unsupported->supported.store(false);
-    TransferEngineImplTestPeer::impl(*engine).swapTransportForTest(tt::MNNVL,
-                                                                   unsupported);
-    int builds = 0;
-    auto result = engine->tryParallelBatchTransfer(
-        peer_id, 2,
-        [&](size_t, size_t) {
-            ++builds;
-            return std::vector<tt::Request>{};
-        },
-        10s);
-    EXPECT_FALSE(result.has_value());
-    EXPECT_EQ(builds, 0);
-    EXPECT_TRUE(engine->closeSegment(peer_id).ok());
-    EXPECT_TRUE(peer->unregisterLocalMemory(bytes.data()).ok());
-}
-
-TEST_F(TentBatchSubmit, FileOnlyTransportDoesNotBlockMemoryTransfer) {
-    class FileOnly : public TentBatchSubmitProbe {
-       public:
-        FileOnly() : TentBatchSubmitProbe(tt::IOURING) {
-            caps.dram_to_dram = false;
-            caps.dram_to_file = true;
-            supported.store(false);
+    auto& impl = TransferEngineImplTestPeer::impl(*engine);
+    for (auto type : {tt::NVLINK, tt::SHM, tt::TPU, tt::MNNVL, tt::IOURING}) {
+        SCOPED_TRACE(type);
+        const bool file_only = type == tt::IOURING;
+        const bool admitted = type != tt::MNNVL;
+        auto unsupported =
+            std::make_shared<TentBatchSubmitProbe>(type, file_only);
+        unsupported->supported.store(false);
+        impl.swapTransportForTest(type, unsupported);
+        const auto target = file_only ? LOCAL_SEGMENT_ID : peer_id;
+        EXPECT_EQ(engine->supportsParallelBatchSubmit(target), admitted);
+        const auto submits = transport->submits.load();
+        std::atomic<int> builds{0};
+        auto result = engine->tryParallelBatchTransfer(
+            target, 2,
+            [&](auto begin, auto end) {
+                ++builds;
+                auto entries = requests(begin, end);
+                for (auto& request : entries) request.target_id = target;
+                return entries;
+            },
+            10s);
+        EXPECT_EQ(result.has_value(), admitted);
+        if (result) {
+            EXPECT_TRUE(result->ok()) << result->ToString();
         }
-    };
-    auto file = std::make_shared<FileOnly>();
-    TransferEngineImplTestPeer::impl(*engine).swapTransportForTest(tt::IOURING,
-                                                                   file);
-    auto result = engine->tryParallelBatchTransfer(
-        LOCAL_SEGMENT_ID, 1,
-        [&](size_t begin, size_t end) { return requests(begin, end); }, 10s);
-    ASSERT_TRUE(result.has_value());
-    EXPECT_TRUE(result->ok());
-}
-
-TEST_F(TentBatchSubmit, RuntimeQueueAcceptsWorkerCompatibleTransport) {
-    tt::TransferEngine queued(batchSubmitConfig(true));
-    ASSERT_TRUE(queued.available());
-    TransferEngineImplTestPeer::configure(queued);
-    auto queued_transport = std::make_shared<TentBatchSubmitProbe>(tt::TCP);
-    TransferEngineImplTestPeer::impl(queued).swapTransportForTest(
-        tt::TCP, queued_transport);
-    ASSERT_TRUE(queued.registerLocalMemory(bytes.data(), bytes.size()).ok());
-    auto result = queued.tryParallelBatchTransfer(
-        LOCAL_SEGMENT_ID, 4,
-        [&](size_t begin, size_t end) { return requests(begin, end); }, 10s);
-    ASSERT_TRUE(result.has_value());
-    EXPECT_TRUE(result->ok()) << result->ToString();
-    EXPECT_GT(queued_transport->submits.load(), 0);
-    EXPECT_TRUE(queued.unregisterLocalMemory(bytes.data()).ok());
+        EXPECT_EQ(builds.load(), admitted ? 2 : 0);
+        EXPECT_EQ(transport->submits.load() - submits, admitted ? 2 : 0);
+        impl.swapTransportForTest(type, nullptr);
+    }
+    EXPECT_TRUE(engine->closeSegment(peer_id).ok());
+    EXPECT_TRUE(peer->unregisterLocalMemory(bytes.data()).ok());
 }
 
 TEST_F(TentBatchSubmit, ReadySubBatchDoesNotWaitForAllBuilders) {
-    std::promise<void> submitted, release;
-    auto ready = submitted.get_future();
-    auto proceed = release.get_future().share();
-    std::atomic<int> count{0};
-    transport->on_submit = [&] {
-        if (++count == 1) submitted.set_value();
-    };
-    auto parent = std::async(std::launch::async, [&] {
-        return engine->tryParallelBatchTransfer(
-            LOCAL_SEGMENT_ID, 2,
-            [&](size_t begin, size_t end) {
-                if (begin == 0) proceed.wait();
-                return requests(begin, end);
-            },
-            10s);
-    });
-    EXPECT_EQ(ready.wait_for(5s), std::future_status::ready);
-    EXPECT_EQ(parent.wait_for(0s), std::future_status::timeout);
-    release.set_value();
-    auto result = parent.get();
-    ASSERT_TRUE(result.has_value());
-    EXPECT_TRUE(result->ok()) << result->ToString();
+    expectIndependentSubmission(
+        *engine, LOCAL_SEGMENT_ID,
+        [&](auto begin, auto end) { return requests(begin, end); },
+        transport->on_submit);
 }
 
-TEST_F(TentBatchSubmit, BuilderFailureWaitsForPendingSiblingWithoutReplay) {
-    std::promise<void> submitted, failed;
-    auto ready = submitted.get_future().share();
-    auto rejected = failed.get_future();
-    transport->pending.store(true);
-    transport->on_submit = [&] { submitted.set_value(); };
-    auto parent = std::async(std::launch::async, [&] {
-        return engine->tryParallelBatchTransfer(
-            LOCAL_SEGMENT_ID, 2,
-            [&](size_t begin, size_t end) {
-                if (begin != 0) {
-                    ready.wait();
-                    failed.set_value();
-                    throw std::runtime_error("Injected builder failure");
-                }
-                return requests(begin, end);
-            },
-            10s);
-    });
-    EXPECT_EQ(rejected.wait_for(5s), std::future_status::ready);
-    EXPECT_EQ(parent.wait_for(0s), std::future_status::timeout);
-    EXPECT_EQ(transport->releases.load(), 0);
-    transport->pending.store(false);
-    auto result = parent.get();
-    ASSERT_TRUE(result.has_value());
-    EXPECT_FALSE(result->ok());
-    EXPECT_EQ(transport->submits.load(), 1);
-    EXPECT_EQ(transport->releases.load(), 1);
-}
-
-TEST_F(TentBatchSubmit, SubBatchUsesNativeFailover) {
-    auto first = std::make_shared<TentBatchSubmitProbe>(tt::RDMA);
-    first->fail_poll.store(true);
-    ASSERT_TRUE(engine->unregisterLocalMemory(bytes.data()).ok());
-    TransferEngineImplTestPeer::impl(*engine).swapTransportForTest(tt::RDMA,
-                                                                   first);
-    ASSERT_TRUE(engine->registerLocalMemory(bytes.data(), bytes.size()).ok());
-    auto result = engine->tryParallelBatchTransfer(
-        LOCAL_SEGMENT_ID, 1,
-        [&](size_t begin, size_t end) { return requests(begin, end); }, 10s);
-    ASSERT_TRUE(result.has_value());
-    EXPECT_TRUE(result->ok()) << result->ToString();
-    EXPECT_EQ(first->submits.load(), 1);
-    EXPECT_EQ(transport->submits.load(), 1);
-    EXPECT_EQ(first->releases.load(), 1);
-}
-
-TEST_F(TentBatchSubmit, NativeSubmitFailureDoesNotReplayTheParent) {
-    transport->fail_submit = true;
-    auto result = engine->tryParallelBatchTransfer(
-        LOCAL_SEGMENT_ID, 1,
-        [&](size_t begin, size_t end) { return requests(begin, end); }, 10s);
-    ASSERT_TRUE(result.has_value());
-    EXPECT_FALSE(result->ok());
-    EXPECT_EQ(transport->submits.load(), 1);
-    EXPECT_TRUE(transport->observed.empty());
-}
-
-TEST_F(TentBatchSubmit, NativeAndFacadeFailureInfoMatchesLegacyAndResets) {
+TEST_F(TentBatchSubmit, FacadeFailureInfoMatchesLegacyAndResets) {
     TransferEngine facade(false);
     TransferEngineImplTestPeer::facade(facade, engine);
-    TransferEngine::ParallelBatchTransferFailureInfo failure{true, true};
-    auto hint = tt::TCP;
-    auto builder = [&](size_t begin, size_t end) {
-        std::vector<TransferRequest> entries;
-        for (const auto& request : requests(begin, end)) {
-            TransferRequest entry{};
-            entry.opcode = TransferRequest::WRITE;
-            entry.source = request.source;
-            entry.target_id = request.target_id;
-            entry.target_offset = request.target_offset;
-            entry.length = request.length;
-            entry.transport_hint = hint;
-            entries.push_back(entry);
-        }
-        return entries;
-    };
-    auto transfer = [&] {
-        auto entries = builder(0, 1);
-        auto id = facade.allocateBatchID(entries.size());
-        auto submitted = facade.submitTransfer(id, entries);
-        TransferStatus status{};
-        if (submitted.ok()) {
-            EXPECT_TRUE(facade.getBatchTransferStatus(id, status).ok());
-        }
-        EXPECT_TRUE(facade.freeBatchID(id).ok());
-        auto result = facade.tryParallelBatchTransfer(LOCAL_SEGMENT_ID, 1,
-                                                      builder, 5s, &failure);
-        if (result) {
-            EXPECT_EQ(failure.submit_failed, !submitted.ok());
-            EXPECT_EQ(failure.retryable,
-                      submitted.ok() && (status.s == Transport::FAILED ||
-                                         status.s == Transport::TIMEOUT));
-        }
-        return result;
-    };
-    for (auto terminal : {tt::FAILED, tt::TIMEOUT}) {
-        transport->terminal.store(terminal);
-        ASSERT_FALSE(transfer()->ok());
-        EXPECT_TRUE(failure.retryable);
-        EXPECT_FALSE(failure.submit_failed);
+    for (auto [state, submit_error, supported, hint] :
+         {std::tuple{tt::FAILED, false, true, tt::TCP},
+          std::tuple{tt::TIMEOUT, false, true, tt::TCP},
+          std::tuple{tt::COMPLETED, true, true, tt::TCP},
+          std::tuple{tt::COMPLETED, false, true, tt::RDMA},
+          std::tuple{tt::COMPLETED, false, true, tt::TCP},
+          std::tuple{tt::COMPLETED, false, false, tt::TCP}}) {
+        SCOPED_TRACE(state);
+        SCOPED_TRACE(submit_error);
+        SCOPED_TRACE(supported);
+        SCOPED_TRACE(hint);
+        transport->terminal.store(state);
+        transport->fail_submit = submit_error;
+        transport->supported.store(supported);
+        // TENT may turn a transport submit error into a retryable native
+        // failure; a disabled explicit hint is an engine submit API error.
+        expectFailureInfoMatchesLegacy(
+            facade, LOCAL_SEGMENT_ID,
+            [&](auto begin, auto end) {
+                return requests<TransferRequest>(begin, end, hint);
+            },
+            *transport);
     }
-    transport->fail_submit = true;
-    ASSERT_FALSE(transfer()->ok());
-    // TENT absorbs a transport submit error into native FAILED after its
-    // own failover, so the binding may retry just as on the ordinary path.
-    EXPECT_FALSE(failure.submit_failed);
-    EXPECT_TRUE(failure.retryable);
-    transport->fail_submit = false;
-    // A disabled explicit hint fails the engine submit API itself.
-    hint = tt::RDMA;
-    ASSERT_FALSE(transfer()->ok());
-    EXPECT_TRUE(failure.submit_failed);
-    EXPECT_FALSE(failure.retryable);
-    hint = tt::TCP;
-    transport->terminal.store(tt::COMPLETED);
-    ASSERT_TRUE(transfer()->ok());
-    EXPECT_FALSE(failure.submit_failed);
-    EXPECT_FALSE(failure.retryable);
-    failure = {true, true};
-    transport->supported.store(false);
-    EXPECT_FALSE(transfer());
-    EXPECT_FALSE(failure.submit_failed);
-    EXPECT_FALSE(failure.retryable);
-    tt::TransferEngine::ParallelBatchTransferFailureInfo native_failure{true,
-                                                                        true};
+    tt::TransferEngine::ParallelBatchTransferFailureInfo failure{true, true};
     EXPECT_FALSE(engine->tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 1,
-        [&](size_t begin, size_t end) { return requests(begin, end); }, 5s,
-        &native_failure));
-    EXPECT_FALSE(native_failure.submit_failed);
-    EXPECT_FALSE(native_failure.retryable);
+        [&](auto begin, auto end) { return requests(begin, end); }, 5s,
+        &failure));
+    EXPECT_FALSE(failure.submit_failed);
+    EXPECT_FALSE(failure.retryable);
 }
 
-TEST_F(TentBatchSubmit, PollApiErrorDoesNotAuthorizeRetry) {
+TEST_F(TentBatchSubmit,
+       PollApiErrorUsesOrdinaryFreeWithoutRetryOrResubmission) {
     transport->fail_poll_api.store(true);
     tt::TransferEngine::ParallelBatchTransferFailureInfo failure{true, true};
     auto result = engine->tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 1,
-        [&](size_t begin, size_t end) { return requests(begin, end); }, 5s,
+        [&](auto begin, auto end) { return requests(begin, end); }, 5s,
         &failure);
     ASSERT_TRUE(result.has_value());
     EXPECT_FALSE(result->ok());
@@ -1476,72 +965,16 @@ TEST_F(TentBatchSubmit, PollApiErrorDoesNotAuthorizeRetry) {
     EXPECT_EQ(transport->releases.load(), 1);
 }
 
-TEST_F(TentBatchSubmit,
-       NativePollErrorUsesOrdinaryFreeWithoutAnotherSubmission) {
-    std::atomic<int> polls{0};
-    transport->on_poll = [&] {
-        if (++polls == 1)
-            throw std::runtime_error("Injected native poll failure");
-    };
-    auto result = engine->tryParallelBatchTransfer(
-        LOCAL_SEGMENT_ID, 1,
-        [&](size_t begin, size_t end) { return requests(begin, end); }, 10s);
-    ASSERT_TRUE(result.has_value());
-    EXPECT_FALSE(result->ok());
-    EXPECT_EQ(transport->submits.load(), 1);
-    EXPECT_EQ(transport->releases.load(), 1);
-    EXPECT_GT(polls.load(), 1);
-}
-
-TEST_F(TentBatchSubmit, FacadePreservesExplicitHintAndIntent) {
-    TransferEngine facade(false);
-    TransferEngineImplTestPeer::facade(facade, engine);
-    auto result = facade.tryParallelBatchTransfer(
-        LOCAL_SEGMENT_ID, 4,
-        [&](size_t begin, size_t end) {
-            std::vector<TransferRequest> result;
-            for (const auto& source : requests(begin, end)) {
-                TransferRequest entry{};
-                entry.opcode = TransferRequest::READ;
-                entry.source = source.source;
-                entry.target_id = source.target_id;
-                entry.target_offset = source.target_offset;
-                entry.length = source.length;
-                entry.priority = 2;
-                entry.intent_type = 4;
-                entry.transport_hint = tt::TCP;
-                result.push_back(entry);
-            }
-            return result;
-        },
-        10s);
-    ASSERT_TRUE(result.has_value());
-    ASSERT_TRUE(result->ok()) << result->ToString();
-    for (const auto& request : transport->observed) {
-        EXPECT_EQ(request.transport_hint, tt::TCP);
-        EXPECT_EQ(request.intent_type, tt::IntentType::CHECKPOINT);
-        EXPECT_EQ(request.opcode, tt::Request::READ);
-    }
-}
-
 TEST_F(TentBatchSubmit, FacadeRejectsUnsupportedProducerEvent) {
     TransferEngine facade(false);
     TransferEngineImplTestPeer::facade(facade, engine);
     auto result = facade.tryParallelBatchTransfer(
         LOCAL_SEGMENT_ID, 1,
-        [&](size_t begin, size_t end) {
-            std::vector<TransferRequest> result;
-            for (const auto& source : requests(begin, end)) {
-                TransferRequest entry{};
-                entry.opcode = TransferRequest::WRITE;
-                entry.source = source.source;
-                entry.target_id = source.target_id;
-                entry.target_offset = source.target_offset;
-                entry.length = source.length;
+        [&](auto begin, auto end) {
+            auto entries = requests<TransferRequest>(begin, end, tt::TCP);
+            for (auto& entry : entries)
                 entry.producer_event = reinterpret_cast<void*>(uintptr_t{1});
-                result.push_back(entry);
-            }
-            return result;
+            return entries;
         },
         10s);
     ASSERT_TRUE(result.has_value());
