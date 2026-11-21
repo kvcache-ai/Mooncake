@@ -588,27 +588,17 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                        tl::make_unexpected(resolved_tenant_id.error()));
     } else if (config.prefer_alloc_in_same_node) {
         ReplicateConfig new_config = config;
+        std::string preferred_segment;
         for (size_t i = 0; i < keys.size(); ++i) {
             new_config.SetKeyIds(config, i);
             auto result = master_service_.PutStart(
                 client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], new_config);
-            results.emplace_back(result);
-            if ((i == 0) && result.has_value()) {
-                std::string preferred_segment;
-                for (const auto& replica : result.value()) {
-                    if (replica.is_memory_replica()) {
-                        auto handles =
-                            replica.get_memory_descriptor().buffer_descriptor;
-                        if (!handles.transport_endpoint_.empty()) {
-                            preferred_segment = handles.transport_endpoint_;
-                        }
-                    }
-                }
-                if (!preferred_segment.empty()) {
-                    new_config.preferred_segment = preferred_segment;
-                }
+                slice_lengths[i], new_config,
+                i == 0 ? &preferred_segment : nullptr);
+            if (i == 0 && result && !preferred_segment.empty()) {
+                new_config.preferred_segment = std::move(preferred_segment);
             }
+            results.emplace_back(std::move(result));
         }
     } else {
         ReplicateConfig key_config = config;
