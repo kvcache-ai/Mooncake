@@ -98,6 +98,12 @@ class ScopedSegmentAccess {
 
     bool GetSegment(const UUID& segment_id, Segment& segment) const;
 
+    // Confirm a live, allocatable registration belongs to this exact client
+    // incarnation, rather than merely to the same client UUID.
+    bool IsSegmentMountedForSession(
+        const UUID& segment_id,
+        const ClientSessionSharedPtr& owner_session) const;
+
     struct AllocatorReplacement {
         UUID segment_id;
         std::shared_ptr<BufferAllocatorBase> expected;

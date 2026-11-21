@@ -397,6 +397,19 @@ bool ScopedSegmentAccess::GetSegment(const UUID& segment_id,
     return true;
 }
 
+bool ScopedSegmentAccess::IsSegmentMountedForSession(
+    const UUID& segment_id, const ClientSessionSharedPtr& owner_session) const {
+    const auto it = segment_manager_->mounted_segments_.find(segment_id);
+    if (!owner_session || it == segment_manager_->mounted_segments_.end()) {
+        return false;
+    }
+    const auto& mounted = it->second;
+    const auto& registration = mounted.allocator_registration;
+    return mounted.status == SegmentStatus::OK && mounted.buf_allocator &&
+           registration && registration->IsAllocatable() &&
+           registration->GetClientSession() == owner_session;
+}
+
 bool ScopedSegmentAccess::ReplaceAllocators(
     const std::vector<AllocatorReplacement>& replacements) {
     std::vector<AllocatorManager::RegistrationReplacement> manager_replacements;
