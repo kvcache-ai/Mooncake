@@ -32,6 +32,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "buffer_range_index.h"
 #include "common.h"
@@ -186,12 +187,12 @@ class TransferMetadata {
 
     struct RpcMetaDesc {
         std::string ip_or_host_name;
-        uint16_t rpc_port;
+        uint16_t rpc_port{0};
         uint64_t metadata_version{0};
 #ifdef USE_BAREX
         uint16_t barex_port;
 #endif
-        int sockfd;  // local cache
+        int sockfd{-1};  // Local reservation; transferred by addRpcMetaEntry().
     };
 
     struct HandShakeDesc {
@@ -304,8 +305,11 @@ class TransferMetadata {
 
     int removeLocalSegment(const std::string &segment_name);
 
+    // Takes ownership of desc.sockfd on success, clearing the caller's fd.
+    // P2P hands the fd to the daemon even if daemon startup fails.
     int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
 
+    // Only removes this object's acknowledged local publication.
     int removeRpcMetaEntry(const std::string &server_name);
 
     // Re-publish the local RPC meta entry to the HTTP metadata server.
@@ -381,7 +385,13 @@ class TransferMetadata {
     std::vector<NotifyDesc> notifys;
     RWSpinlock rpc_meta_lock_;
     std::unordered_map<std::string, RpcMetaDesc> rpc_meta_map_;
+    // Owns sockfd until startHandshakeDaemon() transfers it to the plugin.
     RpcMetaDesc local_rpc_meta_;
+    // Nonempty only for an acknowledged publication not yet removed.
+    // This is local cleanup eligibility, not a fence against another writer.
+    std::string published_rpc_meta_key_;
+    // Keep cleanup eligibility for earlier acknowledged keys as well.
+    std::unordered_set<std::string> published_rpc_meta_keys_;
 
     std::atomic<SegmentID> next_segment_id_;
 

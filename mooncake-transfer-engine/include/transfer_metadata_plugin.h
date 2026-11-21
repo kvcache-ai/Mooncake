@@ -56,6 +56,8 @@ struct HandShakePlugin {
     using OnReceiveCallBack =
         std::function<int(const Json::Value &, Json::Value &)>;
 
+    // Consumes sockfd when nonnegative, including on failure or an already
+    // running daemon. Passing the daemon's existing listener keeps it open.
     virtual int startDaemon(uint16_t listen_port, int sockfd) = 0;
 
     // Connect to peer endpoint, and wait for receiving
