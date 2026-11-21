@@ -19,10 +19,26 @@ import (
 	"sync"
 )
 
+type bufferState uint8
+
+const (
+	bufferRegistering bufferState = iota
+	bufferReady
+	bufferRemoving
+)
+
+// Completion results are operation-scoped so later removals cannot race registration waiters.
+type bufferOperation struct {
+	done chan struct{}
+	err  error
+}
+
 type BufferHandle struct {
-	addr     uintptr
-	length   uint64
-	refCount int
+	addr      uintptr
+	length    uint64
+	refCount  int
+	state     bufferState
+	operation *bufferOperation
 }
 
 type RegisteredMemory struct {
@@ -48,26 +64,47 @@ func (memory *RegisteredMemory) Add(addr uintptr, length uint64, maxShardSize ui
 		return ErrInvalidArgument
 	}
 
-	memory.mu.Lock()
-	for idx, entry := range memory.bufferList {
-		if entry.addr == addr && entry.length == length {
-			memory.bufferList[idx].refCount++
-			memory.mu.Unlock()
-			return nil
-		}
+retryAdd:
+	for {
+		memory.mu.Lock()
+		for idx, entry := range memory.bufferList {
+			if entry.addr == addr && entry.length == length {
+				switch entry.state {
+				case bufferRegistering:
+					operation := entry.operation
+					memory.mu.Unlock()
+					<-operation.done
+					if operation.err != nil {
+						return operation.err
+					}
+					continue retryAdd
+				case bufferRemoving:
+					operation := entry.operation
+					memory.mu.Unlock()
+					<-operation.done
+					continue retryAdd
+				case bufferReady:
+					memory.bufferList[idx].refCount++
+					memory.mu.Unlock()
+					return nil
+				}
+			}
 
-		entryEndAddr := entry.addr + uintptr(entry.length)
-		requestEndAddr := addr + uintptr(length)
-		if addr < entryEndAddr && requestEndAddr > entry.addr {
-			memory.mu.Unlock()
-			return ErrAddressOverlapped
+			entryEndAddr := entry.addr + uintptr(entry.length)
+			requestEndAddr := addr + uintptr(length)
+			if addr < entryEndAddr && requestEndAddr > entry.addr {
+				memory.mu.Unlock()
+				return ErrAddressOverlapped
+			}
 		}
+		memory.bufferList = append(memory.bufferList, BufferHandle{
+			addr: addr, length: length, refCount: 1, state: bufferRegistering,
+			operation: &bufferOperation{done: make(chan struct{})},
+		})
+		memory.mu.Unlock()
+		break
 	}
-	memory.bufferList = append(memory.bufferList,
-		BufferHandle{addr: addr, length: length, refCount: 1})
-	memory.mu.Unlock()
 
-	// Proceed memory registration
 	var wg sync.WaitGroup
 	errChan := make(chan error, 1)
 	successfulTasks := make([]uintptr, 0)
@@ -108,19 +145,33 @@ func (memory *RegisteredMemory) Add(addr uintptr, length uint64, maxShardSize ui
 				log.Println("cascading error:", unregisterErr)
 			}
 		}
-		memory.mu.Lock()
-		for idx, entry := range memory.bufferList {
-			if entry.addr == addr && entry.length == length {
-				memory.bufferList = append(memory.bufferList[:idx],
-					memory.bufferList[idx+1:]...)
-				break
-			}
-		}
-		memory.mu.Unlock()
+		memory.finishBufferOperation(addr, length, err)
 		return err
 	}
 
+	memory.mu.Lock()
+	for idx, entry := range memory.bufferList {
+		if entry.addr == addr && entry.length == length {
+			memory.bufferList[idx].state = bufferReady
+			close(entry.operation.done)
+			break
+		}
+	}
+	memory.mu.Unlock()
 	return nil
+}
+
+func (memory *RegisteredMemory) finishBufferOperation(addr uintptr, length uint64, err error) {
+	memory.mu.Lock()
+	for idx, entry := range memory.bufferList {
+		if entry.addr == addr && entry.length == length {
+			entry.operation.err = err
+			memory.bufferList = append(memory.bufferList[:idx], memory.bufferList[idx+1:]...)
+			close(entry.operation.done)
+			break
+		}
+	}
+	memory.mu.Unlock()
 }
 
 func (memory *RegisteredMemory) Remove(addr uintptr, length uint64, maxShardSize uint64) error {
@@ -128,27 +179,44 @@ func (memory *RegisteredMemory) Remove(addr uintptr, length uint64, maxShardSize
 		return ErrInvalidArgument
 	}
 
-	memory.mu.Lock()
-	found := false
-	lastRef := false
-	for idx, entry := range memory.bufferList {
-		if entry.addr == addr && entry.length == length {
-			found = true
-			memory.bufferList[idx].refCount--
-			if memory.bufferList[idx].refCount == 0 {
-				lastRef = true
-				memory.bufferList = append(memory.bufferList[:idx],
-					memory.bufferList[idx+1:]...)
+retryRemove:
+	for {
+		memory.mu.Lock()
+		found := false
+		lastRef := false
+		for idx, entry := range memory.bufferList {
+			if entry.addr == addr && entry.length == length {
+				found = true
+				switch entry.state {
+				case bufferRegistering:
+					operation := entry.operation
+					memory.mu.Unlock()
+					<-operation.done
+					continue retryRemove
+				case bufferRemoving:
+					operation := entry.operation
+					memory.mu.Unlock()
+					<-operation.done
+					continue retryRemove
+				case bufferReady:
+					memory.bufferList[idx].refCount--
+					if memory.bufferList[idx].refCount == 0 {
+						lastRef = true
+						memory.bufferList[idx].state = bufferRemoving
+						memory.bufferList[idx].operation = &bufferOperation{done: make(chan struct{})}
+					}
+				}
+				break
 			}
-			break
 		}
-	}
-	memory.mu.Unlock()
-	if !found {
-		return ErrInvalidArgument
-	}
-	if !lastRef {
-		return nil
+		memory.mu.Unlock()
+		if !found {
+			return ErrInvalidArgument
+		}
+		if !lastRef {
+			return nil
+		}
+		break
 	}
 
 	var wg sync.WaitGroup
@@ -169,10 +237,7 @@ func (memory *RegisteredMemory) Remove(addr uintptr, length uint64, maxShardSize
 
 	wg.Wait()
 	close(errChan)
-	select {
-	case err := <-errChan:
-		return err
-	default:
-	}
-	return nil
+	err := <-errChan
+	memory.finishBufferOperation(addr, length, err)
+	return err
 }
