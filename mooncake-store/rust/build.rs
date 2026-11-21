@@ -398,6 +398,14 @@ fn main() {
         println!("cargo:rustc-link-lib={library}");
     }
 
+    let cache = fs::read_to_string(build_dir.join("CMakeCache.txt")).unwrap_or_default();
+    let link_nof_linux = cache
+        .lines()
+        .any(|line| line == "MOONCAKE_STORE_LINK_NOF_LINUX:INTERNAL=TRUE");
+    if link_nof_linux {
+        println!("cargo:rustc-link-lib=static=mooncake_nof_linux");
+    }
+
     for (link_name, candidates) in [
         ("etcd_wrapper", &["etcd_wrapper"] as &[&str]),
         ("hiredis", &["hiredis"]),
@@ -408,7 +416,7 @@ fn main() {
         ("uring", &["uring"]),
         ("zmq", &["zmq"]),
     ] {
-        if has_library(&search_dirs, candidates) {
+        if (link_nof_linux && link_name == "uring") || has_library(&search_dirs, candidates) {
             println!("cargo:rustc-link-lib={link_name}");
         }
     }
