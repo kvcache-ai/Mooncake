@@ -79,6 +79,41 @@ if(WITH_TE)
                                         gflags::gflags)
   endif()
 
+  if(BUILD_UNIT_TESTS
+     AND NOT USE_TENT
+     AND NOT USE_CUDA
+     AND USE_TCP
+     AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(
+      Python3
+      COMPONENTS Development.Embed
+      REQUIRED)
+    add_executable(
+      transfer_engine_py_sync_test
+      tests/transfer_engine_py_sync_test.cpp
+      transfer_engine/transfer_engine_py.cpp
+      transfer_engine/shared_segment_py.cpp)
+    target_include_directories(
+      transfer_engine_py_sync_test
+      PRIVATE $<TARGET_PROPERTY:engine,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(
+      transfer_engine_py_sync_test
+      PRIVATE $<TARGET_PROPERTY:engine,COMPILE_DEFINITIONS>)
+    target_link_libraries(
+      transfer_engine_py_sync_test
+      PRIVATE transfer_engine
+              glog::glog
+              gflags::gflags
+              $<TARGET_OBJECTS:rpc_communicator>
+              pybind11::headers
+              Python3::Python
+              gtest)
+    add_test(NAME transfer_engine_py_sync_test
+             COMMAND transfer_engine_py_sync_test)
+    set_tests_properties(transfer_engine_py_sync_test
+                         PROPERTIES LABELS "cpu;classic" TIMEOUT 60)
+  endif()
+
   if(USE_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(engine PRIVATE CUDA::cudart)
