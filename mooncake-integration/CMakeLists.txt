@@ -18,7 +18,7 @@ else()
   set(MOONCAKE_PYTHON_INSTALL_DIR "${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}")
 endif()
 
-if(WITH_STORE)
+if(WITH_STORE OR WITH_STORE_P2P)
   include_directories("../mooncake-store/include")
   include_directories("../mooncake-store/include/cachelib_memory_allocator")
 
@@ -49,13 +49,9 @@ set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 message(
   STATUS "Mooncake Python install directory: ${MOONCAKE_PYTHON_INSTALL_DIR}")
 
-# TODO(F01-T113, replace-in=UPG2-F01-public-build): Receive U's shared-segment,
-# Source: UPG1-F01-3.1; tracking clarified by F02-B05/Codex, 2026-11-12.
-# Due: UPG2-F01-public-build implementation/merge review, before task acceptance.
-# TE/TENT/device bindings, allocator gates, and independent EP/Conductor/Reshard
-# package wiring with their real providers, including legacy-wheel consumers.
-# Owner: UPG2 public-build integration. Close only after the per-component
-# source, target, install, and package checks in the F01-3.1 U-diff ledger.
+# TODO(UPG-T0004, replace-in=UPG2.3): Reconcile the TE/TENT and shared-segment
+# bindings, allocator gates, and independent packages with U's real providers.
+# Source: management 3 UPG1-F01-3.1 (F01-T113/A01), 8e6f32a1957b0ccfe082f4add18d55260a08fc08:mooncake-integration/CMakeLists.txt.
 if(WITH_TE)
   pybind11_add_module(
     engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
@@ -101,30 +97,48 @@ if(MOONCAKE_HAS_NVLINK_ALLOCATOR)
     COMPONENT python)
 endif()
 
-# TODO(F01-T114, replace-in=UPG1-F15): Add Engram binding sources/includes and
-# Source: UPG1-F01-3.1; tracking clarified by F02-B05/Codex, 2026-11-12.
-# Due: UPG1-F15 implementation/merge review, before task acceptance.
-# structured/range/fast-copy Python package consumers with the approved native
-# features. Owner: F15 (S58, W01-W04, W06, W07); close after all assigned items.
-# F01-T110 also covers buffer_pool.cpp and buffer_pool.py installation in S13.
-if(WITH_STORE)
+function(add_store_binding target module source store_library)
   pybind11_add_module(
-    store
+    ${target}
     ${SOURCES}
     ${CACHE_ALLOCATOR_SOURCES}
-    store/store_py.cpp
+    ${source}
     integration_utils.h)
   set_target_properties(
-    store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH "$ORIGIN")
+    ${target} PROPERTIES OUTPUT_NAME "${module}" INSTALL_RPATH "$ORIGIN")
+  target_link_libraries(
+    ${target} PUBLIC transfer_engine glog::glog gflags::gflags
+                    ${store_library} cachelib_memory_allocator)
   if(USE_ASCEND_DIRECT)
-    target_link_libraries(
-      store PUBLIC ascendcl transfer_engine glog::glog gflags::gflags
-                   mooncake_store cachelib_memory_allocator)
-  else()
-    target_link_libraries(
-      store PUBLIC transfer_engine glog::glog gflags::gflags mooncake_store
-                   cachelib_memory_allocator)
+    target_link_libraries(${target} PUBLIC ascendcl)
   endif()
+  install(TARGETS ${target} LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+                             COMPONENT python)
+endfunction()
+
+set(store_cli_targets)
+if(WITH_STORE)
+  # TODO(UPG-T0003, replace-in=UPG2.2): Receive U's central BufferPool binding and wrapper.
+  # TODO(UPG-T0005, replace-in=UPG2.2): Receive U's central Engram sources and includes.
+  # Source: management 3 UPG1-F01-3.1 (F01-T110/A01, F01-T114/A01),
+  # 8e6f32a1957b0ccfe082f4add18d55260a08fc08:mooncake-integration/CMakeLists.txt.
+  add_store_binding(store _store store/store_py.cpp mooncake_store)
+  list(APPEND store_cli_targets mooncake_master mooncake_client)
+endif()
+if(WITH_STORE_P2P)
+  add_store_binding(store_p2p _store_p2p store/p2p_store_py.cpp mooncake_store_p2p)
+  list(APPEND store_cli_targets mooncake_p2p_master mooncake_p2p_client)
+endif()
+
+if(store_cli_targets)
+  if(SKBUILD)
+    set(store_cli_rpath "$ORIGIN")
+  else()
+    set(store_cli_rpath "$ORIGIN;$ORIGIN/../lib")
+  endif()
+  set_target_properties(${store_cli_targets} PROPERTIES INSTALL_RPATH "${store_cli_rpath}")
+  install(TARGETS ${store_cli_targets}
+          RUNTIME DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
 endif()
 
 if(NOT SKBUILD)
@@ -172,42 +186,31 @@ if(NOT SKBUILD)
     FILES_MATCHING
     PATTERN "*.py")
 
-  # TODO(F01-T115, replace-in=UPG1-F02-B05): Complete installed CLI/config
-  # Source: UPG1-F01-3.1; tracking clarified by F02-B05/Codex, 2026-11-12.
-  # Due: UPG1-F02-B05 implementation/merge review, before task acceptance.
-  # Deferred business-field handoffs are F02-T001/T002/T003; they do not block
-  # the current F02 base interface receipt or provide future business capability.
-  # validation and full REST behavior. Track deferred U config consumers in
-  # python/mooncake/mooncake_config.py with their downstream business tasks.
-  # Owner: F02-B05; retain this marker until all receiver obligations close.
-  if(WITH_STORE)
-    set_target_properties(mooncake_master mooncake_client
-                          PROPERTIES INSTALL_RPATH "$ORIGIN;$ORIGIN/../lib")
-    install(TARGETS mooncake_master mooncake_client
-            RUNTIME DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
+  # TODO(UPG-T0012, replace-in=UPG2.2): Reconcile installed central CLI,
+  # config, and REST providers with U.
+  # Source: management 3 UPG1-F01-3.1 (F01-T115/A01),
+  # 8e6f32a1957b0ccfe082f4add18d55260a08fc08:mooncake-integration/CMakeLists.txt.
+  if(WITH_STORE OR WITH_STORE_P2P)
     install(
       FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_store_service.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_config.py"
+      DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR})
+  endif()
+
+  if(WITH_STORE)
+    install(
+      FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/cli.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/cli_client.py"
       DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR})
-  endif()
-endif()
 
-# TODO(F01-T116, replace-in=UPG1-F10-S41): Install and collect U's NoF
-# Source: UPG1-F01-3.1; tracking clarified by F02-B05/Codex, 2026-11-12.
-# Due: UPG1-F10-S41 implementation/merge review, before task acceptance.
-# administration, SSD register/unregister, and SPDK target tools with their
-# native providers and USE_NOF gate. Owner: F10-S41; verify installed commands.
-# TODO(F01-T117, replace-in=UPG1-F13-S57): Add U's conditional K8s lease runtime
-# Source: UPG1-F01-3.1; tracking clarified by F02-B05/Codex, 2026-11-12.
-# Due: UPG1-F13-S57 implementation/merge review, before task acceptance.
-# library install and legacy-wheel collection with the lease backend.
-# Owner: F13-S57; verify enabled/disabled package contents and library loading.
-if(WITH_STORE)
-  install(TARGETS store LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
-                                COMPONENT python)
+    # TODO(UPG-T0013, replace-in=UPG2.2): Receive U's centralized NoF tools.
+    # TODO(UPG-T0046, replace-in=UPG1.4): Tie NoF wheel contents to the
+    # centralized provider and keep them out of P2P-only packages.
+    # Source: management 3 UPG1-F01-3.1 (F01-T116/A01),
+    # 8e6f32a1957b0ccfe082f4add18d55260a08fc08:mooncake-integration/CMakeLists.txt.
+  endif()
 endif()
 
 if(WITH_TE)
@@ -221,13 +224,6 @@ if(WITH_TE)
 endif()
 
 if(SKBUILD)
-  if(WITH_STORE)
-    set_target_properties(mooncake_master mooncake_client
-                          PROPERTIES INSTALL_RPATH "$ORIGIN")
-    install(TARGETS mooncake_master mooncake_client
-            RUNTIME DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
-  endif()
-
   if(WITH_TE AND BUILD_EXAMPLES)
     set_target_properties(transfer_engine_bench PROPERTIES INSTALL_RPATH
                                                            "$ORIGIN")
@@ -241,6 +237,11 @@ if(SKBUILD)
       DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
       COMPONENT python)
   endif()
+
+  # TODO(UPG-T0014, replace-in=UPG2.2): Receive U's gated K8s lease runtime
+  # and verify that enabled packages can load the actual library.
+  # Source: management 3 UPG1-F01-3.1 (F01-T117/A01),
+  # 8e6f32a1957b0ccfe082f4add18d55260a08fc08:mooncake-integration/CMakeLists.txt.
 
   if(USE_ASCEND_DIRECT)
     install(TARGETS ascend_transport
@@ -260,29 +261,10 @@ if(SKBUILD)
     if(WITH_STORE)
       list(APPEND _mooncake_python_shared_targets mooncake_store)
     endif()
+    if(WITH_STORE_P2P)
+      list(APPEND _mooncake_python_shared_targets mooncake_store_p2p)
+    endif()
     install(TARGETS ${_mooncake_python_shared_targets}
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()
-
-  # Validate only this wheel's native Store artifacts, before backend assembly.
-  if(WITH_STORE)
-    set(_mooncake_store_check_options
-        "--with-store ON --expected-architecture ${MOONCAKE_STORE_CLIENT_ARCH}")
-  else()
-    set(_mooncake_store_check_options "--with-store OFF")
-  endif()
-  install(
-    CODE "
-      execute_process(
-        COMMAND \"${Python3_EXECUTABLE}\"
-                \"${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/setup.py\"
-                --check-store-artifacts
-                \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${MOONCAKE_PYTHON_INSTALL_DIR}\"
-                ${_mooncake_store_check_options}
-        RESULT_VARIABLE _mooncake_store_check_result)
-      if(NOT _mooncake_store_check_result EQUAL 0)
-        message(FATAL_ERROR \"Store artifact architecture check failed\")
-      endif()
-    "
-    COMPONENT python)
 endif()

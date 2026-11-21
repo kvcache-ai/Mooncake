@@ -22,14 +22,15 @@
 #include <vector>
 
 #include "config.h"
-#include "dummy_client.h"
 #include "shm_helper.h"
 #include "real_client_test_helper.h"
 #if defined(MOONCAKE_STORE_CLIENT_P2P)
 #include "p2p/client/p2p_client_config_builder.h"
+#include "p2p/client/p2p_dummy_client.h"
 #include "p2p/test_p2p_server_helpers.h"
 #else
 #include "centralized_client_config_builder.h"
+#include "dummy_client.h"
 #include "test_server_helpers.h"
 #endif
 

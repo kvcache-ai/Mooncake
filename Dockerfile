@@ -20,8 +20,9 @@ RUN bash dependencies.sh \
      && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
      && find /var/cache -type f -delete
 
-ARG MOONCAKE_STORE_CLIENT_ARCH=centralized
+ARG WITH_STORE=ON
+ARG WITH_STORE_P2P=OFF
 
 RUN rm -rf build || true \
      && mkdir build && cd build \
-     && cmake .. -DSTORE_USE_ETCD=ON -DMOONCAKE_STORE_CLIENT_ARCH="${MOONCAKE_STORE_CLIENT_ARCH}" && make -j$(nproc) && make install
+     && cmake .. -DSTORE_USE_ETCD=ON -DWITH_STORE="${WITH_STORE}" -DWITH_STORE_P2P="${WITH_STORE_P2P}" && make -j$(nproc) && make install

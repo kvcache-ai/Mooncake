@@ -86,6 +86,10 @@ class DummyClient : public PyClient {
         const std::string& key,
         const std::optional<ReadConfig>& config = std::nullopt) override;
 
+    // TODO(UPG-T0083, replace-in=UPG2.2): receiver=UPG2.2 (Management 4).
+    // Source: Management 3 UPG1-F02-B05,
+    // 8e6f32a19:mooncake-store/src/dummy_client.cpp:505. Replace the raw SHM
+    // address with U's acquire/release buffer ownership.
     std::tuple<uint64_t, size_t> get_buffer_info(
         const std::string& key,
         const std::optional<ReadConfig>& config = std::nullopt) override;
@@ -129,7 +133,6 @@ class DummyClient : public PyClient {
 
     int tearDownAll() override;
 
-#if !defined(MOONCAKE_STORE_CLIENT_P2P)
     tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string& key,
         const std::vector<std::string>& targets) override;
@@ -140,7 +143,6 @@ class DummyClient : public PyClient {
 
     tl::expected<QueryTaskResponse, ErrorCode> query_task(
         const UUID& task_id) override;
-#endif
 
    private:
     ErrorCode connect(const std::string& server_address);

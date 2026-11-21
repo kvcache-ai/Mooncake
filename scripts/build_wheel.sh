@@ -12,29 +12,9 @@ set -x
 PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
 OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
-# CMake build directory containing the selected Store architecture.
+# CMake build directory containing the enabled Store components.
 BUILD_DIR="${BUILD_DIR:-build}"
 BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
-if [ ! -f "${BUILD_DIR}/CMakeCache.txt" ]; then
-    echo "Error: missing ${BUILD_DIR}/CMakeCache.txt" >&2
-    exit 1
-fi
-
-# Only Store enablement and architecture need to be read for identity checks.
-STORE_ENABLED=$(sed -n 's/^WITH_STORE:[^=]*=//p' "${BUILD_DIR}/CMakeCache.txt")
-case "${STORE_ENABLED^^}" in
-    "")
-        echo "Error: WITH_STORE is missing from ${BUILD_DIR}/CMakeCache.txt" >&2
-        exit 1
-        ;;
-    0|OFF|NO|FALSE|N|IGNORE|NOTFOUND|*-NOTFOUND) STORE_ENABLED=OFF ;;
-    *) STORE_ENABLED=ON ;;
-esac
-STORE_CHECK_OPTIONS=(--with-store "$STORE_ENABLED")
-if [ "$STORE_ENABLED" = "ON" ]; then
-    STORE_ARCHITECTURE=$(sed -n 's/^MOONCAKE_STORE_CLIENT_ARCH:[^=]*=//p' "${BUILD_DIR}/CMakeCache.txt")
-    STORE_CHECK_OPTIONS+=(--expected-architecture "$STORE_ARCHITECTURE")
-fi
 
 # Detect CUDA version (env wins, then nvcc, then /usr/local/cuda/version.txt, else 0.0)
 CUDA_VERSION=${CUDA_VERSION:-$(nvcc --version 2>/dev/null | grep -o "release [0-9][0-9]*\.[0-9]*" | awk '{print $2}' || true)}
@@ -52,37 +32,40 @@ echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
-# Remove binaries from the previous architecture before selecting this pair.
-rm -f mooncake-wheel/mooncake/mooncake_master mooncake-wheel/mooncake/mooncake_client
+# Remove native commands left by a previous component build.
+rm -f mooncake-wheel/mooncake/mooncake_master mooncake-wheel/mooncake/mooncake_client \
+      mooncake-wheel/mooncake/mooncake_p2p_master mooncake-wheel/mooncake/mooncake_p2p_client
 
 echo "Creating directory structure..."
 
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp "${BUILD_DIR}"/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
-# The current Asio provider still lives in mooncake-asio (F01-T113).
+# TODO(UPG-T0004, replace-in=UPG2.3): Collect U's TE/TENT/Asio, EP/PG,
+# Conductor, and Reshard artifacts from their real providers.
+# Source: management 3 UPG1-F01-3.1, registered in UPG0.3 (Management 4).
+# 8e6f32a1957b0ccfe082f4add18d55260a08fc08:scripts/build_wheel.sh.
 cp "${BUILD_DIR}/mooncake-asio/libasio.so" mooncake-wheel/mooncake/libasio.so
 
-# Copy the private C++ Store extension to the mooncake package.
-if compgen -G "${BUILD_DIR}/mooncake-integration/_store.*.so" >/dev/null; then
-    echo "Copying _store extension..."
-    cp "${BUILD_DIR}"/mooncake-integration/_store.*.so mooncake-wheel/mooncake/
-    echo "Copying master binary..."
-    # Copy master binary
-    cp "${BUILD_DIR}/mooncake-store/src/mooncake_master" mooncake-wheel/mooncake/
-    # Copy client binary
-    cp "${BUILD_DIR}/mooncake-store/src/mooncake_client" mooncake-wheel/mooncake/
-    # Stage the canonical async Store client for the legacy wheel builder.
-    cp python/mooncake/async_store.py mooncake-wheel/mooncake/async_store.py
-else
-    echo "Skipping _store extension (not built - likely WITH_STORE is set to OFF)"
-fi
+# Copy each Store backend whose extension exists in the build directory.
+# TODO(UPG-T0044, replace-in=UPG1.4): Verify artifact collection and imports
+# in both wheel entry points for each enabled Store configuration.
+# Source: management 3 UPG1-F01-3.1, registered in UPG0.3 (Management 4).
+# 8e6f32a1957b0ccfe082f4add18d55260a08fc08:scripts/build_wheel.sh.
+copy_store_backend() {
+    local module=$1 native_dir=$2 master=$3 client=$4 library=$5
+    if ! compgen -G "${BUILD_DIR}/mooncake-integration/${module}.*.so" >/dev/null; then
+        return 0
+    fi
+    cp "${BUILD_DIR}/mooncake-integration/${module}".*.so mooncake-wheel/mooncake/
+    cp "${BUILD_DIR}/${native_dir}/src/${master}" "${BUILD_DIR}/${native_dir}/src/${client}" mooncake-wheel/mooncake/
+    if [ -f "${BUILD_DIR}/${native_dir}/src/${library}.so" ]; then
+        cp "${BUILD_DIR}/${native_dir}/src/${library}.so" mooncake-wheel/mooncake/
+    fi
+}
 
-# Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
-if [ -f "${BUILD_DIR}/mooncake-store/src/libmooncake_store.so" ]; then
-    echo "Copying libmooncake_store.so..."
-    cp "${BUILD_DIR}/mooncake-store/src/libmooncake_store.so" mooncake-wheel/mooncake/libmooncake_store.so
-fi
+copy_store_backend _store mooncake-store mooncake_master mooncake_client libmooncake_store
+copy_store_backend _store_p2p mooncake-store-p2p mooncake_p2p_master mooncake_p2p_client libmooncake_store_p2p
 
 # Copy libmooncake_common.so (only when BUILD_SHARED_LIBS is set).
 if [ -f "${BUILD_DIR}/mooncake-common/src/libmooncake_common.so" ]; then
@@ -90,12 +73,16 @@ if [ -f "${BUILD_DIR}/mooncake-common/src/libmooncake_common.so" ]; then
     cp "${BUILD_DIR}/mooncake-common/src/libmooncake_common.so" mooncake-wheel/mooncake/libmooncake_common.so
 fi
 
-# F01-T117 adds the K8s lease runtime alongside its actual enabled backend.
 # Copy the Go etcd runtime used by TE metadata or Store HA.
 if [ -f "${BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so" ]; then
     echo "Copying libetcd_wrapper.so..."
     cp "${BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so" mooncake-wheel/mooncake/libetcd_wrapper.so
 fi
+
+# TODO(UPG-T0014, replace-in=UPG2.2): Collect U's K8s lease runtime when
+# the centralized lease provider is enabled.
+# Source: management 3 UPG1-F01-3.1, registered in UPG0.3 (Management 4).
+# 8e6f32a1957b0ccfe082f4add18d55260a08fc08:scripts/build_wheel.sh.
 
 # Copy libtransfer_engine.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
 if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so" ]; then
@@ -135,11 +122,7 @@ else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
 fi
 
-python${PYTHON_VERSION} mooncake-wheel/setup.py --check-store-artifacts \
-    mooncake-wheel/mooncake "${STORE_CHECK_OPTIONS[@]}"
-
 if [ "$BUILD_WITH_EP" = "1" ]; then
-    # F01-T113 replaces this legacy EP/PG build with U's real CMake/JIT staging.
     echo "Building Mooncake EP"
     cd mooncake-ep
     if [ -z "$EP_TORCH_VERSIONS" ]; then
@@ -148,7 +131,6 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
         for version in ${EP_TORCH_VERSIONS//;/ }; do
             cuda_major=${CUDA_VERSION%%.*}
             if [ "$cuda_major" -ge 13 ]; then
-                # TODO: Fix me when we need to support more CUDA 13 versions or when the CI env is fixed
                 pip install torch==$version --index-url https://download.pytorch.org/whl/cu130
             else
                 pip install torch==$version
@@ -169,7 +151,6 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
         for version in ${EP_TORCH_VERSIONS//;/ }; do
             cuda_major=${CUDA_VERSION%%.*}
             if [ "$cuda_major" -ge 13 ]; then
-                # TODO: Fix me when we need to support more CUDA 13 versions or when the CI env is fixed
                 pip install torch==$version --index-url https://download.pytorch.org/whl/cu130
             else
                 pip install torch==$version
@@ -188,8 +169,13 @@ MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
 STORE_FACADE_SOURCE_DIR="python/mooncake/store"
 STORE_FACADE_STAGING_DIR="${MIGRATED_PYTHON_STAGING_DIR}/store"
 MIGRATED_PYTHON_INIT_BACKUP=""
-# Pending sources: F01-T110 (pools), F01-T114 (structured/ranges/fast-copy),
-# F01-T116 (NoF), and F01-T113 (TE/EP/Reshard).
+# TODO(UPG-T0003, replace-in=UPG2.2): Collect the central BufferPool wrapper.
+# TODO(UPG-T0006, replace-in=UPG2.2): Collect the central structured Store wrapper.
+# TODO(UPG-T0010, replace-in=UPG2.2): Collect U's central _structured_ranges module.
+# TODO(UPG-T0011, replace-in=UPG2.2): Stage U's _fast_copy source and build its extension.
+# TODO(UPG-T0046, replace-in=UPG1.4): Collect NoF tools only with the enabled central provider.
+# Source: management 3 UPG1-F01-3.1, registered in UPG0.3 (Management 4).
+# 8e6f32a1957b0ccfe082f4add18d55260a08fc08:scripts/build_wheel.sh.
 MIGRATED_PYTHON_MODULES=(
     __init__.py
     py.typed
@@ -197,6 +183,7 @@ MIGRATED_PYTHON_MODULES=(
     _launcher.py
     cli.py
     cli_client.py
+    async_store.py
     mooncake_config.py
 )
 cleanup_migrated_python_staging() {
@@ -240,12 +227,10 @@ cleanup_wheel_metadata_state() {
 }
 trap cleanup_wheel_metadata_state EXIT
 
-# TODO(F01-T118, replace-in=UPG1-F22-B02): Receive U's release variants and
-# Source: UPG1-F01-3.1; tracking clarified by F02-B05/Codex, 2026-11-12.
-# Due: UPG1-F22-B02 implementation/merge review, before task acceptance.
-# platform-specific tool invocation, external-library exclusions, and NPU ELF
-# repair with supported providers. Owner: F22-B02; resolve Python-floor policy
-# explicitly and validate each approved platform instead of copying flags.
+# TODO(UPG-T0047, replace-in=UPG1.5): Apply the approved Python/platform
+# wheel matrix, including platform tools, library exclusions, and NPU ELF repair.
+# Source: management 3 UPG1-F01-3.1, registered in UPG0.3 (Management 4).
+# 8e6f32a1957b0ccfe082f4add18d55260a08fc08:scripts/build_wheel.sh.
 BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD"
 BUILD_VARIANT_COUNT=0
 for build_variant in $BUILD_VARIANTS; do

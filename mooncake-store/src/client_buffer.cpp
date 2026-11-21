@@ -20,6 +20,12 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
         new ClientBufferAllocator(size, protocol, use_hugepage));
 }
 
+// TODO(UPG-T0086, replace-in=UPG2.3): receiver=UPG2.3 (Management 4).
+// Source: Management 3 UPG1.1,
+// 0d67311c4e44044f8628a00a64f4dc0148535204:mooncake-store/src/client_buffer.cpp:24.
+// Owner: UPG2.3 shared allocation. Validate the external buffer in the factory
+// and verify both RealClient callers roll back the mapping on factory failure.
+// Keep the external memory owned by the caller.
 tl::expected<std::shared_ptr<ClientBufferAllocator>, ErrorCode>
 ClientBufferAllocator::create(void* addr, size_t size,
                               const std::string& protocol) {

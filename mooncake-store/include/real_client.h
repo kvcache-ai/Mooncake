@@ -13,11 +13,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "pyclient.h"
-#if defined(MOONCAKE_STORE_CLIENT_P2P)
-#include "p2p/client/p2p_client_service.h"
-#else
 #include "client_service.h"
-#endif
 #include "client_buffer.h"
 #include "mutex.h"
 #include "utils.h"
@@ -25,15 +21,9 @@
 namespace mooncake {
 
 struct CentralizedClientConfig;
-struct P2PClientConfig;
 
-#if defined(MOONCAKE_STORE_CLIENT_P2P)
-using ClientServiceImpl = P2PClientService;
-using ClientConfig = P2PClientConfig;
-#else
 using ClientServiceImpl = Client;
 using ClientConfig = CentralizedClientConfig;
-#endif
 
 class RealClient;
 
@@ -304,7 +294,6 @@ class RealClient : public PyClient {
      */
     int64_t getSize(const std::string& key) override;
 
-#if !defined(MOONCAKE_STORE_CLIENT_P2P)
     /**
      * @brief Create a copy task to replicate an object's data to target
      * segments
@@ -338,7 +327,6 @@ class RealClient : public PyClient {
      */
     tl::expected<QueryTaskResponse, ErrorCode> query_task(
         const UUID& task_id) override;
-#endif
 
     // Dummy client helper functions that return tl::expected
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>

@@ -19,14 +19,11 @@
 #include <exception>
 #include <vector>
 
-#if defined(MOONCAKE_STORE_CLIENT_P2P)
-#include "p2p/client/p2p_client_config_builder.h"
-#else
 #include "centralized_client_config_builder.h"
-#endif
 #include "real_client.h"
 #include "client_buffer.h"
 #include "mutex.h"
+#include "shm_helper.h"
 #include "types.h"
 #include "utils.h"
 #include "common/result.h"

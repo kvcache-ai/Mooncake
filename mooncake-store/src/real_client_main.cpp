@@ -22,7 +22,7 @@ DEFINE_uint32(client_rpc_port, 0,
               "Native client-to-client RPC port; 0 selects an available port");
 
 int main(int argc, char* argv[]) {
-    gflags::SetVersionString(mooncake::GetMooncakeStoreBuildInfo());
+    gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
     // Attention !!!

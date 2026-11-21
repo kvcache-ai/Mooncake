@@ -1,6 +1,10 @@
 #pragma once
 
+#if defined(MOONCAKE_STORE_CLIENT_P2P)
+#include "p2p/client/p2p_real_client.h"
+#else
 #include "real_client.h"
+#endif
 
 namespace mooncake {
 

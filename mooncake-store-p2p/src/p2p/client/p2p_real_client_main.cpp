@@ -2,7 +2,7 @@
 #include <gflags/gflags.h>
 
 #include "p2p/client/p2p_client_config_builder.h"
-#include "real_client.h"
+#include "p2p/client/p2p_real_client.h"
 
 using namespace mooncake;
 
@@ -104,7 +104,7 @@ DEFINE_uint64(metric_report_interval_seconds, 60,
               "0 disables periodic reporting (metrics are still collected).");
 
 int main(int argc, char* argv[]) {
-    gflags::SetVersionString(mooncake::GetMooncakeStoreBuildInfo());
+    gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
     // Attention !!!

@@ -19,22 +19,21 @@ set(MOONCAKE_STORE_COMMON_CLIENT_SOURCES
     config/client_auto_port_config.cpp
     posix_file.cpp
     client_buffer.cpp
-    real_client.cpp
-    dummy_client.cpp
     shm_helper.cpp
 )
 
 set(EXTRA_LIBS "")
 
 if(USE_3FS)
-  # TODO(F10-S38-T001, replace-in=UPG1-F10-S38): Reconcile this client-side
-  # Source: UPG1-F01-2.1; tracking clarified by F02-B05/Codex, 2026-11-12.
-  # Due: UPG1-F10-S38 implementation/merge review, before task acceptance.
-  # ThreeFSFile wiring with U's shared HF3FS resource manager and DFS adapter
-  # when the approved descriptor-based DFS consumers are implemented.
-  # Owner: F10-S38. Keep USE_3FS source/header/library conditions aligned;
-  # this existing wiring does not provide descriptor-based DFS support.
-  # Remove this marker after the actual migration or approved exclusion.
+  # TODO(UPG-T0015, replace-in=UPG2.2): receiver=UPG2.2 (Management 4).
+  # Source: Management 3 UPG1-F01-2.1 (F10-S38-T001/A01),
+  # 8e6f32a1957b0ccfe082f4add18d55260a08fc08:mooncake-store/src/CMakeLists.txt:30;
+  # tracking clarified by F02-B05/Codex, 2026-11-12.
+  # Owner: UPG2.2 fixed U intake. Reconcile the legacy ThreeFSFile consumer
+  # with U's HF3FS resource manager and DFS adapter for the approved descriptor
+  # consumers. Verify matching USE_3FS guards for sources, headers and linkage.
+  # The legacy linkage does not provide descriptor-based DFS.
+  # Close after review and verification of the migration or approved exclusion.
   add_subdirectory(hf3fs)
   list(APPEND MOONCAKE_STORE_COMMON_CLIENT_SOURCES ${HF3FS_SOURCES})
   find_library(HF3FS_API_LIB hf3fs_api_shared PATHS /usr/lib NO_DEFAULT_PATH)
@@ -244,43 +243,40 @@ target_include_directories(mooncake_store_client_objects
 target_include_directories(mooncake_store
                            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include)
 
-# Select the implementation of the standard Store targets.
-if(MOONCAKE_STORE_CLIENT_ARCH STREQUAL "centralized")
-    target_sources(mooncake_store_shared_objects PRIVATE
-        config/rpc_protocol_config.cpp
-        config/rpc_timeout_config.cpp)
-    # Sources and entry points of the selected centralized implementation.
-    set(MOONCAKE_STORE_CENTRALIZED_MASTER_SOURCES
-        master_service.cpp
-        master_metric_manager.cpp
-        config/metrics_bootstrap_config_loader.cpp
-        ha_helper.cpp
-        segment.cpp
-        rpc_service.cpp
-        master_admin_service.cpp
-        http_metadata_server.cpp
-        task_manager.cpp
-    )
+target_sources(mooncake_store_shared_objects PRIVATE
+    config/rpc_protocol_config.cpp
+    config/rpc_timeout_config.cpp)
+# Sources and entry points of the selected centralized implementation.
+set(MOONCAKE_STORE_CENTRALIZED_MASTER_SOURCES
+    master_service.cpp
+    master_metric_manager.cpp
+    config/metrics_bootstrap_config_loader.cpp
+    ha_helper.cpp
+    segment.cpp
+    rpc_service.cpp
+    master_admin_service.cpp
+    http_metadata_server.cpp
+    task_manager.cpp
+)
 
-    set(MOONCAKE_STORE_CENTRALIZED_CLIENT_SOURCES
-        client_service.cpp
-        centralized_real_client.cpp
-        client_metric.cpp
-        config/client_metric_config.cpp
-        master_client.cpp
-        transfer_task.cpp
-        file_storage.cpp
-        storage_backend.cpp
-    )
+set(MOONCAKE_STORE_CENTRALIZED_CLIENT_SOURCES
+    client_service.cpp
+    centralized_real_client.cpp
+    real_client.cpp
+    dummy_client.cpp
+    client_metric.cpp
+    config/client_metric_config.cpp
+    master_client.cpp
+    transfer_task.cpp
+    file_storage.cpp
+    storage_backend.cpp
+)
 
-    target_sources(mooncake_store_master_objects PRIVATE
-        ${MOONCAKE_STORE_CENTRALIZED_MASTER_SOURCES})
-    target_sources(mooncake_store_client_objects PRIVATE
-        ${MOONCAKE_STORE_CENTRALIZED_CLIENT_SOURCES})
-    target_sources(mooncake_master PRIVATE master.cpp)
-    target_sources(mooncake_client PRIVATE real_client_main.cpp)
-else()
-    include(p2p/CMakeLists.txt)
-endif()
+target_sources(mooncake_store_master_objects PRIVATE
+    ${MOONCAKE_STORE_CENTRALIZED_MASTER_SOURCES})
+target_sources(mooncake_store_client_objects PRIVATE
+    ${MOONCAKE_STORE_CENTRALIZED_CLIENT_SOURCES})
+target_sources(mooncake_master PRIVATE master.cpp)
+target_sources(mooncake_client PRIVATE real_client_main.cpp)
 
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)

@@ -1,5 +1,7 @@
 #pragma once
 
+#define MOONCAKE_SHM_NAME "mooncake_shm"
+
 #include <cstddef>
 #include <memory>
 #include <mutex>

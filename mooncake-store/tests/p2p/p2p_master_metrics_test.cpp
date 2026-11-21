@@ -36,9 +36,7 @@ TEST_F(P2PMasterMetricsTest,
     EXPECT_NE(
         text.find("component_version=\"" + GetMooncakeStoreVersion() + "\""),
         std::string::npos);
-    EXPECT_NE(text.find("architecture=\"" +
-                        std::string(MOONCAKE_STORE_ARCHITECTURE) + "\""),
-              std::string::npos);
+    EXPECT_NE(text.find("architecture=\"p2p\""), std::string::npos);
 
     server.Stop();
 }
@@ -84,8 +82,7 @@ TEST_F(P2PMasterMetricsTest, CountersAndResetTest) {
 
 TEST_F(P2PMasterMetricsTest, ComponentInfoMetricTest) {
     auto& metrics = P2PMasterMetricManager::instance();
-    metrics.set_component_info("p2p_master", GetMooncakeStoreVersion(),
-                               MOONCAKE_STORE_ARCHITECTURE);
+    metrics.set_component_info("p2p_master", GetMooncakeStoreVersion(), "p2p");
     const auto text = metrics.serialize_metrics();
 
     EXPECT_NE(
@@ -94,9 +91,7 @@ TEST_F(P2PMasterMetricsTest, ComponentInfoMetricTest) {
     EXPECT_NE(
         text.find("component_version=\"" + GetMooncakeStoreVersion() + "\""),
         std::string::npos);
-    EXPECT_NE(text.find("architecture=\"" +
-                        std::string(MOONCAKE_STORE_ARCHITECTURE) + "\""),
-              std::string::npos);
+    EXPECT_NE(text.find("architecture=\"p2p\""), std::string::npos);
 }
 
 TEST_F(P2PMasterMetricsTest, SerializeMetricsContentTest) {

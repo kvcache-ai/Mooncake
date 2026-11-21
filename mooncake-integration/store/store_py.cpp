@@ -2,18 +2,13 @@
 #include <pybind11/stl.h>
 #include <numa.h>
 
-#if defined(MOONCAKE_STORE_CLIENT_P2P)
-#include "p2p/client/p2p_client_config_builder.h"
-#else
 #include "centralized_client_config_builder.h"
-#endif
-#include "allocator.h"
-#include "pyclient.h"
 #include "dummy_client.h"
-#include "shm_helper.h"
+#include "pyclient.h"
 #include "real_client.h"
+#include "allocator.h"
+#include "shm_helper.h"
 #include "types.h"
-#include "version.h"
 
 #include <cstdlib>  // for atexit
 #include <cstdint>
@@ -1505,244 +1500,6 @@ void BindCommonMethods(py::module_& m, StoreBinding& store) {
         "specified NUMA node");
 }
 
-#if defined(MOONCAKE_STORE_CLIENT_P2P)
-
-void BindP2PTypes(py::module_& m) {
-    // P2P Architecture
-    py::enum_<P2PClientSelectionStrategy>(m, "P2PClientSelectionStrategy")
-        .value("ORDERED", P2PClientSelectionStrategy::ORDERED)
-        .value("RANDOM", P2PClientSelectionStrategy::RANDOM)
-        .value("CAPACITY_PRIORITY",
-               P2PClientSelectionStrategy::CAPACITY_PRIORITY);
-
-    py::class_<P2PReadRouteConfig>(m, "P2PReadRouteConfig")
-        .def(py::init<>())
-        .def_readwrite("max_candidates", &P2PReadRouteConfig::max_candidates)
-        .def_readwrite("tag_filters", &P2PReadRouteConfig::tag_filters)
-        .def_readwrite("priority_limit", &P2PReadRouteConfig::priority_limit);
-
-    py::enum_<TransferDirectionMode>(m, "TransferDirectionMode")
-        .value("REVERSE", TransferDirectionMode::REVERSE)
-        .value("FORWARD", TransferDirectionMode::FORWARD);
-
-    py::class_<P2PWriteRouteConfig>(m, "P2PWriteRouteConfig")
-        .def(py::init<>())  // Default constructor
-        .def_readwrite("max_candidates", &P2PWriteRouteConfig::max_candidates)
-        .def_readwrite("strategy", &P2PWriteRouteConfig::strategy)
-        .def_readwrite("remote_weight", &P2PWriteRouteConfig::remote_weight)
-        .def_readwrite("local_write_waterline",
-                       &P2PWriteRouteConfig::local_write_waterline)
-        .def_readwrite("top_tier_only", &P2PWriteRouteConfig::top_tier_only)
-        .def_readwrite("early_return", &P2PWriteRouteConfig::early_return)
-        .def_readwrite("tag_filters", &P2PWriteRouteConfig::tag_filters)
-        .def_readwrite("priority_limit", &P2PWriteRouteConfig::priority_limit)
-        .def("__str__", [](const P2PWriteRouteConfig& config) {
-            std::ostringstream oss;
-            oss << config;
-            return oss.str();
-        });
-    py::class_<P2PRouteDescriptor>(m, "P2PRouteDescriptor")
-        .def_readonly("client_id", &P2PRouteDescriptor::client_id)
-        .def_readonly("segment_id", &P2PRouteDescriptor::segment_id)
-        .def_readonly("ip_address", &P2PRouteDescriptor::ip_address)
-        .def_readonly("rpc_port", &P2PRouteDescriptor::rpc_port)
-        .def_readonly("object_size", &P2PRouteDescriptor::object_size);
-}
-
-void BindP2PMethods(StoreBinding& store) {
-    store
-        .def(
-            "setup_p2p_real_client",
-            [](MooncakeStorePyWrapper& self, const std::string& local_hostname,
-               const std::string& metadata_server,
-               const std::string& tiered_backend_config_json =
-                   "conf/tiered_backend.json",
-               size_t local_buffer_size = 1024 * 1024 * 16,
-               const std::string& protocol = "tcp",
-               const std::string& rdma_devices = "",
-               const std::string& master_server_addr = "127.0.0.1:50051",
-               uint16_t client_rpc_port = 12345,
-               uint32_t client_rpc_thread_num = 16,
-               size_t lock_shard_count = 1024,
-               size_t route_cache_max_memory = 0,
-               uint64_t route_cache_ttl_ms = 60 * 1000,
-               const std::string& local_transfer_mode = "te",
-               size_t local_io_worker_num = 32, uint16_t http_port = 9003,
-               bool enable_http_server = true,
-               size_t async_sender_thread_count = 4,
-               size_t async_max_batch_size = 2000,
-               size_t async_route_queue_size = 0,
-               uint32_t p2p_key_lease_duration_ms = 5000,
-               uint32_t p2p_key_lease_scan_interval_ms = 1000,
-               const std::string& p2p_transfer_direction_mode = "reverse",
-               const py::object& engine = py::none(),
-               const std::string& runtime_config = "",
-               bool enable_metric_collection = true,
-               uint64_t metric_report_interval_seconds = 60,
-               uint16_t heartbeat_rpc_port = 0, bool start_local_only = false,
-               size_t te_async_poll_worker_num = 32,
-               size_t business_coro_worker_num = 32,
-               int32_t heartbeat_rpc_timeout_ms = 1000) {
-                std::shared_ptr<mooncake::TransferEngine> transfer_engine =
-                    nullptr;
-                if (!engine.is_none()) {
-                    transfer_engine =
-                        engine.cast<std::shared_ptr<TransferEngine>>();
-                }
-
-                py::gil_scoped_release release;
-                auto config = P2PClientConfigBuilder::build_p2p_real_client(
-                    local_hostname, metadata_server, protocol,
-                    rdma_devices.empty()
-                        ? std::optional<std::string>(std::nullopt)
-                        : std::optional<std::string>(rdma_devices),
-                    master_server_addr, tiered_backend_config_json,
-                    local_buffer_size, transfer_engine, "", client_rpc_port,
-                    client_rpc_thread_num, lock_shard_count,
-                    route_cache_max_memory, route_cache_ttl_ms,
-                    local_transfer_mode, local_io_worker_num, http_port,
-                    enable_http_server, {}, async_sender_thread_count,
-                    async_max_batch_size, async_route_queue_size,
-                    p2p_key_lease_duration_ms, p2p_key_lease_scan_interval_ms,
-                    p2p_transfer_direction_mode, runtime_config,
-                    enable_metric_collection, metric_report_interval_seconds,
-                    DEFAULT_CLUSTER_ID, "", 0, 4, 1, "", heartbeat_rpc_port,
-                    te_async_poll_worker_num, start_local_only,
-                    business_coro_worker_num, heartbeat_rpc_timeout_ms);
-
-                if (!config) {
-                    LOG(ERROR) << "Store setup configuration failed: "
-                               << config.error();
-                    return to_py_ret(config.error());
-                }
-                std::shared_ptr<RealClient> real_client;
-                {
-                    py::gil_scoped_acquire acquire;
-                    real_client = self.init_real_client();
-                }
-                auto result = real_client->setup(*config);
-                if (result != 0) {
-                    LOG(ERROR) << "Store native setup failed: " << result;
-                }
-                return result;
-            },
-            py::arg("local_hostname"), py::arg("metadata_server"),
-            py::arg("tiered_backend_config_json"), py::arg("local_buffer_size"),
-            py::arg("protocol"), py::arg("rdma_devices"),
-            py::arg("master_server_addr"), py::arg("client_rpc_port") = 12345,
-            py::arg("client_rpc_thread_num") = 16,
-            py::arg("lock_shard_count") = 1024,
-            py::arg("route_cache_max_memory") = 0,
-            py::arg("route_cache_ttl_ms") = 60 * 1000,
-            py::arg("local_transfer_mode") = "te",
-            py::arg("local_io_worker_num") = 32, py::arg("http_port") = 9003,
-            py::arg("enable_http_server") = true,
-            py::arg("async_sender_thread_count") = 4,
-            py::arg("async_max_batch_size") = 2000,
-            py::arg("async_route_queue_size") = 0,
-            py::arg("p2p_key_lease_duration_ms") = 5000,
-            py::arg("p2p_key_lease_scan_interval_ms") = 1000,
-            py::arg("p2p_transfer_direction_mode") = "reverse",
-            py::arg("engine") = py::none(), py::arg("runtime_config") = "",
-            py::arg("enable_metric_collection") = true,
-            py::arg("metric_report_interval_seconds") = 60,
-            py::arg("heartbeat_rpc_port") = 0,
-            py::arg("start_local_only") = false,
-            py::arg("te_async_poll_worker_num") = 32,
-            py::arg("business_coro_worker_num") = 32,
-            py::arg("heartbeat_rpc_timeout_ms") = 1000,
-            "Setup the store in P2P architecture. start_local_only skips "
-            "Master "
-            "connection and heartbeat until an explicit POST /register.")
-        .def(
-            "setup_p2p_real_client",
-            [](MooncakeStorePyWrapper& self, const py::dict& config_dict) {
-                auto real_client = self.init_real_client();
-                ConfigDict config;
-                for (auto item : config_dict) {
-                    std::string key = py::str(item.first);
-                    std::string value = py::str(item.second);
-                    config[key] = value;
-                }
-
-                py::gil_scoped_release release;
-                auto p2p_config =
-                    P2PClientConfigBuilder::build_p2p_real_client(config);
-                if (!p2p_config) {
-                    LOG(ERROR) << "P2P setup configuration failed: "
-                               << p2p_config.error();
-                    return to_py_ret(p2p_config.error());
-                }
-                auto result = real_client->setup(*p2p_config);
-                if (result != 0) {
-                    LOG(ERROR) << "Store native setup failed: " << result;
-                }
-                return result;
-            },
-            py::arg("config"),
-            "Setup the store in P2P mode with a configuration dictionary.\n"
-            "Supported keys:\n"
-            "  start_local_only: Start without joining Master; join later via "
-            "POST /register (default false).\n"
-            "  local_hostname (required): Local hostname.\n"
-            "  metadata_server (required): Metadata server address.\n"
-            "  protocol: Transfer protocol (default 'tcp').\n"
-            "  rdma_devices: RDMA device list.\n"
-            "  master_server_addr: Master server address (default "
-            "'127.0.0.1:50051').\n"
-            "  local_buffer_size: Local buffer size (default 16MB).\n"
-            "  tiered_backend_config: Tiered backend JSON config path or "
-            "content.\n"
-            "  client_rpc_port: P2P RPC port (default 12345).\n"
-            "  rpc_thread_num: P2P RPC thread count (default 2).\n"
-            "  lock_shard_count: Key lock shard count (default 1024).\n"
-            "  route_cache_max_memory_bytes: Route cache max memory in bytes "
-            "(default 0, disabled).\n"
-            "  route_cache_ttl_ms: Route cache TTL in ms.\n"
-            "  local_transfer_mode: Local transfer mode, 'te' or 'memcpy' "
-            "(default 'te').\n"
-            "  local_io_worker_num: Local I/O worker count "
-            "(default 32; 0 = deferred until Wait; V2: both modes; "
-            "V1: memcpy only).\n"
-            "  te_async_poll_worker_num: TE batch poll worker count "
-            "(default 32; 0 = sync TE wait).\n"
-            "  business_coro_worker_num: Business coroutine worker count "
-            "(default 32; 0 = hardware_concurrency, minimum 1; independent of "
-            "TE polling).\n"
-            "  async_sender_thread_count: Async route sender thread count "
-            "(default 4).\n"
-            "  async_max_batch_size: Async route max batch size (default "
-            "2000).\n"
-            "  async_route_queue_size: Async route queue size (default 0).\n"
-            "  ipc_socket_path: IPC socket path.\n"
-            "  http_port: Native client HTTP port (default 9003).\n"
-            "  enable_http_server: Enable native client HTTP (default true).\n"
-            "  p2p_key_lease_duration_ms: Key lease duration (default 5000; "
-            "0 uses the built-in default).\n"
-            "  p2p_key_lease_scan_interval_ms: Lease scan interval (default "
-            "1000; 0 uses the built-in default).\n"
-            "  p2p_transfer_direction_mode: 'reverse' or 'forward' "
-            "(default 'reverse').\n"
-            "  runtime_config: JSON text or path; empty uses "
-            "MC_RUNTIME_CONFIG.\n"
-            "  enable_metric_collection: Collect client metrics (default "
-            "true).\n"
-            "  metric_report_interval_seconds: Report interval (default 60; "
-            "0 disables periodic reporting).\n"
-            "  redis_cluster_id: Redis discovery cluster ID.\n"
-            "  redis_username / redis_password: Redis authentication.\n"
-            "  redis_db_index: Redis database index (default 0).\n"
-            "  redis_master_view_ttl_sec: Master view TTL (default 4).\n"
-            "  redis_heartbeat_interval_sec: Redis heartbeat interval "
-            "(default 1).\n"
-            "  heartbeat_rpc_port: Dedicated heartbeat RPC port on the master "
-            "(0 uses the main RPC port, default 0).\n"
-            "  heartbeat_rpc_timeout_ms: Client heartbeat connection/request "
-            "timeout in milliseconds (positive, default 1000).");
-}
-
-#else
-
 // Centralization Architecture
 void BindCentralizedTypes(py::module_& m) {
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
@@ -1994,25 +1751,18 @@ void BindCentralizedMethods(StoreBinding& store) {
             "success, error code: 0 if success, non-zero if failure)");
 }
 
-#endif
-
 }  // namespace
 
 PYBIND11_MODULE(_store, m) {
-    m.attr("_store_architecture") = MOONCAKE_STORE_ARCHITECTURE;
+    m.attr("_store_architecture") = "centralized";
 
     BindCommonTypes(m);
 
     StoreBinding store(m, "MooncakeDistributedStore");
     store.def(py::init<>());
 
-#if defined(MOONCAKE_STORE_CLIENT_P2P)
-    BindP2PTypes(m);
-    BindP2PMethods(store);
-#else
     BindCentralizedTypes(m);
     BindCentralizedMethods(store);
-#endif
 
     BindCommonMethods(m, store);
 }

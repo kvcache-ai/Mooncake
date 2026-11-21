@@ -166,12 +166,7 @@ ErrorCode DummyClient::connect(const std::string& server_address) {
         timer.LogResponse("error_code=", result.error());
         return result.error();
     }
-#if defined(MOONCAKE_STORE_CLIENT_P2P)
-    constexpr auto expected_mode = DeploymentMode::P2P;
-#else
-    constexpr auto expected_mode = DeploymentMode::CENTRALIZATION;
-#endif
-    if (result.value() != expected_mode) {
+    if (result.value() != DeploymentMode::CENTRALIZATION) {
         LOG(ERROR) << "Dummy and Real must use the same client architecture";
         connected_ = false;
         return ErrorCode::INVALID_PARAMS;
@@ -649,7 +644,6 @@ std::vector<ObjectDescriptor> DummyClient::get_replica_desc(
     return replica_list;
 }
 
-#if !defined(MOONCAKE_STORE_CLIENT_P2P)
 tl::expected<UUID, ErrorCode> DummyClient::create_copy_task(
     const std::string& key, const std::vector<std::string>& targets) {
     return invoke_rpc<&RealClient::create_copy_task, UUID>(key, targets);
@@ -665,7 +659,6 @@ tl::expected<QueryTaskResponse, ErrorCode> DummyClient::query_task(
     const UUID& task_id) {
     return invoke_rpc<&RealClient::query_task, QueryTaskResponse>(task_id);
 }
-#endif
 
 bool DummyClient::reregister_all_shms() {
     bool all_registered = true;

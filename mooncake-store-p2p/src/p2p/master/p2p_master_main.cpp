@@ -464,7 +464,7 @@ static tl::expected<P2PMasterConfig, std::string> LoadP2PMasterConfig() {
 }  // namespace mooncake
 
 int main(int argc, char* argv[]) {
-    gflags::SetVersionString(mooncake::GetMooncakeStoreBuildInfo());
+    gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     mooncake::init_ylt_log_level();
     if (!FLAGS_log_dir.empty()) {

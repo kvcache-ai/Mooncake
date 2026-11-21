@@ -538,7 +538,7 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
 
 int main(int argc, char* argv[]) {
     // Initialize gflags
-    gflags::SetVersionString(mooncake::GetMooncakeStoreBuildInfo());
+    gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     mooncake::init_ylt_log_level();
 
