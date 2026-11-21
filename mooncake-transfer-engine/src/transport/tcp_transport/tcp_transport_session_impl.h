@@ -107,7 +107,9 @@ class TcpStagingBuffer {
 };
 #endif
 
-#ifdef USE_MACA
+#if defined(USE_CUDA) || defined(USE_MACA)
+// A default-stream graph may wait for this transfer. Stage on an independent
+// stream so the copy does not wait behind the graph's completion barrier.
 static cudaError_t copyTcpCudaMemory(void* dst, const void* src, size_t size) {
     cudaStream_t stream;
     cudaError_t status =
@@ -288,7 +290,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         if (cuda_device_ >= 0) {
             dram_buffer = staging_buffer_.ensure(buffer_size);
             cudaSetDevice(cuda_device_);
-#ifdef USE_MACA
+#if defined(USE_CUDA) || defined(USE_MACA)
             cudaError_t cuda_status = copyTcpCudaMemory(
                 dram_buffer, addr + total_transferred_bytes_, buffer_size);
 #else
@@ -395,7 +397,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_COREX) || defined(USE_SUPA)
                 if (cuda_device_ >= 0) {
                     cudaSetDevice(cuda_device_);
-#ifdef USE_MACA
+#if defined(USE_CUDA) || defined(USE_MACA)
                     cudaError_t cuda_status =
                         copyTcpCudaMemory(addr + total_transferred_bytes_,
                                           dram_buffer, transferred_bytes);
@@ -887,7 +889,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     defined(USE_COREX) || defined(USE_SUPA)
                 if (cuda_device_ >= 0) {
                     cudaSetDevice(cuda_device_);
-#ifdef USE_MACA
+#if defined(USE_CUDA) || defined(USE_MACA)
                     cudaError_t cuda_status =
                         copyTcpCudaMemory(addr + total_transferred_bytes_,
                                           dram_buffer, transferred_bytes);
@@ -965,7 +967,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         if (cuda_device_ >= 0) {
             dram_buffer = staging_buffer_.ensure(buffer_size);
             cudaSetDevice(cuda_device_);
-#ifdef USE_MACA
+#if defined(USE_CUDA) || defined(USE_MACA)
             cudaError_t cuda_status = copyTcpCudaMemory(
                 dram_buffer, addr + total_transferred_bytes_, buffer_size);
 #else
