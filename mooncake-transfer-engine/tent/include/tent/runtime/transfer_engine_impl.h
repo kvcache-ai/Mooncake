@@ -558,6 +558,12 @@ class TransferEngineImpl {
     // flight.
     Status cancelQueuedOwners(BatchID batch_id);
 
+    // Bounded waitTransfer sets the batch deadline before polling. Clear it
+    // on every exit so a later submit can fill the window again.
+    void armWaitDeadline(BatchID batch_id,
+                         std::chrono::steady_clock::time_point deadline);
+    void clearWaitDeadline(BatchID batch_id);
+
     Status retireQueueForBatch(Batch* batch);
 
     Status pollTaskStatus(Batch* batch, size_t task_id,

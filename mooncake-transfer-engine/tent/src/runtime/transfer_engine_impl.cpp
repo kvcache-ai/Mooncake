@@ -97,6 +97,12 @@ struct Batch {
         std::unordered_set<SegmentID> targets;
     };
     std::vector<SubmitHook> submit_hooks;
+    // waitTransfer arms this. time_point::max() means the batch is not inside
+    // a bounded wait. A refill must not admit another queued owner once the
+    // deadline has passed: the poll that noticed the deadline may have just
+    // freed a dispatch-window slot.
+    std::chrono::steady_clock::time_point wait_deadline{
+        std::chrono::steady_clock::time_point::max()};
 };
 
 struct PreservedTentConfigOverrides {
@@ -3275,10 +3281,38 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     return markQueuedOwnerSubmitted(owner_id);
 }
 
+void TransferEngineImpl::armWaitDeadline(
+    BatchID batch_id, std::chrono::steady_clock::time_point deadline) {
+    std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+    if (!isBatchAlive(batch_id)) return;
+    reinterpret_cast<Batch*>(batch_id)->wait_deadline = deadline;
+}
+
+void TransferEngineImpl::clearWaitDeadline(BatchID batch_id) {
+    std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+    if (!isBatchAlive(batch_id)) return;
+    reinterpret_cast<Batch*>(batch_id)->wait_deadline =
+        std::chrono::steady_clock::time_point::max();
+}
+
 Status TransferEngineImpl::refillDispatchWindow() {
     // Queue is off by default; skip the global lock on the poll hot path.
     if (!runtime_queue_config_.enabled) return Status::OK();
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<BatchID> expired_waits;
+    for (const auto& entry : queued_owners_) {
+        Batch* batch = entry.second.batch;
+        if (!batch || entry.second.in_dispatch_window) continue;
+        if (now < batch->wait_deadline) continue;
+        expired_waits.push_back(reinterpret_cast<BatchID>(batch));
+    }
+    std::sort(expired_waits.begin(), expired_waits.end());
+    expired_waits.erase(std::unique(expired_waits.begin(), expired_waits.end()),
+                        expired_waits.end());
+    for (const auto batch_id : expired_waits) {
+        CHECK_STATUS(cancelQueuedOwners(batch_id));
+    }
     if (dispatch_inflight_owners_ >=
             runtime_queue_config_.max_dispatch_owners ||
         dispatch_inflight_bytes_ >= runtime_queue_config_.max_dispatch_bytes) {
@@ -4281,6 +4315,20 @@ Status TransferEngineImpl::waitTransfer(
     const auto timed_out = [&] {
         return timeout_ms != 0 && std::chrono::steady_clock::now() >= deadline;
     };
+    // A poll can outlast this deadline and complete the in-window request
+    // before the loop below notices. Arm the deadline first so the refill
+    // that follows that completion cancels owners still in the queue.
+    struct WaitDeadlineGuard {
+        TransferEngineImpl& engine;
+        BatchID batch_id;
+        ~WaitDeadlineGuard() { engine.clearWaitDeadline(batch_id); }
+    };
+    // timeout_ms == 0 is an unbounded wait: its deadline is "now", but
+    // timed_out() stays false. Do not arm admission off that value.
+    if (timeout_ms != 0 &&
+        deadline != std::chrono::steady_clock::time_point::max())
+        armWaitDeadline(batch_id, deadline);
+    [[maybe_unused]] WaitDeadlineGuard deadline_guard{*this, batch_id};
 
     TransferStatus overall_status{};
     for (uint64_t poll_count = 0;; ++poll_count) {
