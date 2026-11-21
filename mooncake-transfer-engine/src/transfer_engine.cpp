@@ -21,16 +21,25 @@
 #include <thread>
 #include <unordered_map>
 #include "error.h"
+#include "transfer_engine.h"
 
 namespace mooncake {
-namespace {
 
-bool isTransferEngineEnvEnabled(const char* name) {
-    const char* value = std::getenv(name);
-    if (value == nullptr) return false;
-    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
-           std::strcmp(value, "off") != 0 && std::strcmp(value, "no") != 0;
+bool TransferEngine::isTentSelectedFromEnv() {
+#ifdef USE_TENT
+    const auto enabled = [](const char* name) {
+        const char* value = std::getenv(name);
+        return value != nullptr && std::strcmp(value, "0") != 0 &&
+               std::strcmp(value, "false") != 0 &&
+               std::strcmp(value, "off") != 0 && std::strcmp(value, "no") != 0;
+    };
+    return enabled("MC_USE_TENT") || enabled("MC_USE_TEV1");
+#else
+    return false;
+#endif
 }
+
+namespace {
 
 // Producer events are only ordered by TENT transports; the classic engine
 // would silently drop the dependency.
@@ -46,7 +55,6 @@ bool hasProducerEvent(const Requests& entries) {
 }  // namespace mooncake
 
 #ifndef USE_TENT
-#include "transfer_engine.h"
 #include "show_links.h"
 #include "transfer_engine_impl.h"
 #include "graceful_shutdown.h"
@@ -425,7 +433,6 @@ std::string TransferEngine::showLinks(bool json) const {
 }  // namespace mooncake
 #else
 #include "error.h"
-#include "transfer_engine.h"
 #include "transfer_engine_impl.h"
 #include "tent/transfer_engine.h"
 #include "tent/common/config.h"
@@ -571,11 +578,8 @@ void detachShutdownToken(std::shared_ptr<ShutdownToken>& token) {
 
 }  // namespace
 
-TransferEngine::TransferEngine(bool auto_discover) {
-    if (isTransferEngineEnvEnabled("MC_USE_TENT") ||
-        isTransferEngineEnvEnabled("MC_USE_TEV1")) {
-        use_tent_ = true;
-    }
+TransferEngine::TransferEngine(bool auto_discover)
+    : use_tent_(isTentSelectedFromEnv()) {
     if (!use_tent_) {
         impl_ = std::make_shared<TransferEngineImpl>(auto_discover);
     }
@@ -612,11 +616,8 @@ Status TransferEngine::submitScatterTransfer(
 }
 
 TransferEngine::TransferEngine(bool auto_discover,
-                               const std::vector<std::string>& filter) {
-    if (isTransferEngineEnvEnabled("MC_USE_TENT") ||
-        isTransferEngineEnvEnabled("MC_USE_TEV1")) {
-        use_tent_ = true;
-    }
+                               const std::vector<std::string>& filter)
+    : use_tent_(isTentSelectedFromEnv()) {
     if (use_tent_) {
         tent_device_filter_ = filter;
     } else {

@@ -2859,7 +2859,7 @@ TEST_F(RealClientTest, SetupWithConfigDictAllowsZeroSizes) {
 TEST_F(RealClientTest, NvlinkConfigHonorsDiscoveryOverride) {
     ScopedEnvVar auto_discover("MC_MS_AUTO_DISC", "1");
     ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
-    // TENT selection tests variable presence, not its value.
+    // Exercise the classic engine regardless of the test runner's environment.
     ScopedEnvVar use_tent("MC_USE_TENT");
     ScopedEnvVar use_tev1("MC_USE_TEV1");
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
