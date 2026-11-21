@@ -118,7 +118,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     const auto warp_group_id = warp_id / kNumWarpsPerGroup;
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
-#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA) || \
+    defined(MOONCAKE_EP_USE_HYGON)
     // C500 reports 64-thread hardware warps. Do not split the last hardware
     // warp by assigning only the final 32-thread pseudo-warp to count work.
     // Reserve one full warp group from the data path, but write counts from a
@@ -285,7 +286,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                     } else {
                         // IBGDA path — send directly from source buffer
                         mc_fence();
-#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
+#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA) || \
+    defined(MOONCAKE_EP_USE_HYGON)
                         // MACA and MUSA execute two 32-lane sub-warps in one
                         // hardware warp; serialize posts sharing one QP.
                         for (int half = 0; half < 2; ++half) {
@@ -298,7 +300,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                                             dst_rank, num_qp_per_rank, src_ptr,
                                             dst_ptr, num_bytes_per_msg,
                                             lane_id);
-#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
+#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA) || \
+    defined(MOONCAKE_EP_USE_HYGON)
                             }
                             __syncwarp();
                         }
@@ -412,7 +415,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                                               sm_id * kNumWarpGroups];
 
         // Wait local sends issued and send expert counts
-#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
+#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA) || \
+    defined(MOONCAKE_EP_USE_HYGON)
         while (
             atomicAdd(atomic_finish_counter_per_expert + responsible_expert_idx,
                       0) != FINISHED_SUM_TAG * 2) {

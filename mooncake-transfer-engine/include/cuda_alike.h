@@ -24,6 +24,12 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include "cuda_fabric_compat.h"
+#ifndef cudaHostRegisterIoMemory
+#define cudaHostRegisterIoMemory 0
+#endif
+#ifndef CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED
+#define CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED ((CUdevice_attribute)0)
+#endif
 #elif defined(USE_COREX)
 #include <cuda.h>
 #include <cuda_runtime.h>

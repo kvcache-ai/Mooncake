@@ -24,7 +24,7 @@ template <int kLength, int kMaxUnrollFactor, int kWarpSize = 32>
 constexpr int get_max_unroll_factor() {
     for (int i = kMaxUnrollFactor; i >= 1; --i)
         if (kLength % (kWarpSize * i) == 0) return i;
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_HYGON)
     return 1;
 #else
     throw std::logic_error("Invalid length, cannot find unrolling factor");

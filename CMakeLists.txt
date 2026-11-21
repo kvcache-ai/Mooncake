@@ -4,7 +4,7 @@ project(mooncake CXX C)
 # EP and PG are separate components. Declare these before the scikit-build
 # subdirectory reads them so WITH_PG has its final default on first configure.
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
-if(USE_XPU)
+if(USE_XPU OR USE_HYGON)
   set(_WITH_PG_DEFAULT OFF)
 else()
   set(_WITH_PG_DEFAULT "${WITH_EP}")
@@ -63,8 +63,8 @@ option(MOONCAKE_ENABLE_OPLOG_PERF_METRICS
 set(EP_PG_STAGING_DIR "${CMAKE_BINARY_DIR}/ep_pg_staging")
 file(REMOVE_RECURSE "${EP_PG_STAGING_DIR}")
 
-if(USE_XPU AND WITH_PG)
-  message(FATAL_ERROR "WITH_PG=ON is not supported on Intel XPU")
+if((USE_XPU OR USE_HYGON) AND WITH_PG)
+  message(FATAL_ERROR "WITH_PG=ON is not supported on Hygon DCU or Intel XPU")
 endif()
 # Without TENT only Mooncake EP builds for XPU: the Store's XPU device gets its
 # SYCL flags from TENT's platform library. Checked before the Store's
@@ -217,11 +217,16 @@ if(WITH_STORE_RS)
 endif()
 
 option(EP_USE_IDE "Enable intelligent indexing for IDEs" OFF)
-if(WITH_EP AND USE_XPU)
-  # Mooncake PG is CUDA/MUSA/MACA-only; the XPU EP bootstraps over any
-  # torch.distributed group, so only the EP module is built.
-  message(
-    STATUS "WITH_EP enabled on Intel XPU: building the SYCL Mooncake EP module")
+if(WITH_EP AND (USE_XPU OR USE_HYGON))
+  # Mooncake PG is CUDA/MUSA/MACA-only; the XPU and Hygon EP bootstrap over
+  # torch.distributed groups, so only the EP module is built.
+  if(USE_XPU)
+    message(
+      STATUS "WITH_EP enabled on Intel XPU: building the SYCL Mooncake EP module")
+  elseif(USE_HYGON)
+    message(
+      STATUS "WITH_EP enabled on Hygon DCU: building the Mooncake EP module")
+  endif()
   add_subdirectory(mooncake-ep)
 elseif(WITH_EP OR WITH_PG)
   if(WITH_PG)
@@ -304,17 +309,17 @@ elseif(WITH_EP OR WITH_PG)
       DEPENDS mooncake_pg_device
       VERBATIM)
   endif()
+endif()
 
-  if(WITH_EP AND USE_CUDA)
-    add_custom_target(
-      mooncake_ep_device_stage ALL
-      COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "$<TARGET_FILE:mooncake_ep_device>" "${EP_PG_STAGING_DIR}/"
-      COMMENT "Staging Mooncake EP CUDA device library"
-      DEPENDS mooncake_ep_device
-      VERBATIM)
-  endif()
+if(WITH_EP AND (USE_CUDA OR USE_HYGON))
+  add_custom_target(
+    mooncake_ep_device_stage ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:mooncake_ep_device>" "${EP_PG_STAGING_DIR}/"
+    COMMENT "Staging Mooncake EP device library"
+    DEPENDS mooncake_ep_device
+    VERBATIM)
 endif()
 
 add_subdirectory(mooncake-integration)
