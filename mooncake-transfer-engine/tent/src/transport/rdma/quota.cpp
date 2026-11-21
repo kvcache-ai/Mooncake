@@ -222,6 +222,19 @@ int DeviceSelector::getDeviceRank(const std::string& location,
     return 0;
 }
 
+size_t DeviceSelector::candidateRankEnd(const Topology::MemEntry* entry,
+                                        uint64_t device_mask) const {
+    if (!sched_params_.closest_tier_only) return Topology::DevicePriorityRanks;
+    for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
+        for (int dev_id : entry->device_list[rank]) {
+            if (usable(dev_id) && (device_mask & (1ULL << dev_id)) != 0 &&
+                isNumaEligible(entry, dev_id))
+                return rank + 1;
+        }
+    }
+    return Topology::DevicePriorityRanks;
+}
+
 Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
                                        uint64_t slice_bytes,
                                        uint64_t device_mask,
@@ -248,8 +261,10 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
         candidates.push_back(c);
     };
 
+    const size_t rank_end = candidateRankEnd(entry, device_mask);
+
     // First pass: filter by device priority (QoS filtering)
-    for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
+    for (size_t rank = 0; rank < rank_end; ++rank) {
         for (int dev_id : entry->device_list[rank]) {
             if (!usable(dev_id)) continue;
             if ((device_mask & (1ULL << dev_id)) == 0) continue;
@@ -267,7 +282,7 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
 
     // Retry without QoS filtering; availability and NUMA exclusion stay.
     if (candidates.empty()) {
-        for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
+        for (size_t rank = 0; rank < rank_end; ++rank) {
             for (int dev_id : entry->device_list[rank]) {
                 if (!usable(dev_id)) continue;
                 if ((device_mask & (1ULL << dev_id)) == 0) continue;
