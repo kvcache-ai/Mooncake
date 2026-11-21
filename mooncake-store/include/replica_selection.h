@@ -4,11 +4,11 @@
 // for a key, choose which one to actually fetch from.
 //
 // The base policy is type + locality based (local MEMORY > local NOF_SSD >
-// remote MEMORY > remote NOF_SSD > LOCAL_DISK > DISK). On top of that, when a
-// key has more than one *remote* MEMORY replica, the historical code kept the
-// first one master happened to return, which is effectively arbitrary. This
-// header adds an opt-in scoring hook (issue #2516) and request-local HCA
-// affinity so a better memory replica can be picked.
+// remote MEMORY > remote NOF_SSD > SHARED_NVME_KV > LOCAL_DISK > DISK).
+// On top of that, when a key has more than one *remote* MEMORY replica,
+// the historical code kept the first one master happened to return, which is
+// effectively arbitrary. This header adds an opt-in scoring hook (issue #2516)
+// and request-local HCA affinity so a better memory replica can be picked.
 //
 // Design constraints:
 //   * Remote protocol scoring is opt-in via MC_STORE_REPLICA_SCORING=1 or an
@@ -124,12 +124,12 @@ inline const Replica::Descriptor *PickBestRemoteMemory(
 }
 
 // Select the best replica from a list: prefer local MEMORY, local NOF_SSD,
-// remote MEMORY, remote NOF_SSD, LOCAL_DISK, DFS, then DISK. Master may return
-// replicas in any order, so we always scan all replicas before deciding — this
-// ensures local MEMORY is always preferred over local NOF regardless of the
-// order replicas appear in the list. When scoring is enabled and there are
-// multiple remote MEMORY replicas, the best-scoring one is chosen instead of
-// the first encountered.
+// remote MEMORY, remote NOF_SSD, SHARED_NVME_KV, LOCAL_DISK, DFS, then DISK.
+// Master may return replicas in any order, so we always scan all replicas
+// before deciding — this ensures local MEMORY is always preferred over local
+// NOF regardless of the order replicas appear in the list. When scoring is
+// enabled and there are multiple remote MEMORY replicas, the best-scoring one
+// is chosen instead of the first encountered.
 inline const Replica::Descriptor *SelectBestReplica(
     const std::vector<Replica::Descriptor> &replicas,
     const std::unordered_set<std::string> &local_endpoints,
@@ -182,6 +182,7 @@ inline const Replica::Descriptor *SelectBestReplica(
     const Replica::Descriptor *best = nullptr;
     for (const auto &r : replicas) {
         if (r.status != ReplicaStatus::COMPLETE) continue;
+        if (r.is_shared_kv_replica()) return &r;
         if (r.is_local_disk_replica()) {
             best = &r;  // LOCAL_DISK always overrides DFS and DISK
         } else if (r.is_dfs_replica()) {
