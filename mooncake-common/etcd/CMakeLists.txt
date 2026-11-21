@@ -1,10 +1,29 @@
+# Go 1.26's randomized heap base can overlap Ascend's fixed FabricMem window.
+# This is a compatibility measure, not a guarantee against all VA conflicts.
+set(_etcd_go_env)
+if(USE_ASCEND_DIRECT)
+  execute_process(
+    COMMAND go env GOVERSION
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE _etcd_go_version
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(_etcd_go_version MATCHES "^go1\\.26($|\\.)")
+    set(_etcd_go_experiment "$ENV{GOEXPERIMENT}")
+    if(NOT _etcd_go_experiment STREQUAL "")
+      string(APPEND _etcd_go_experiment ",")
+    endif()
+    string(APPEND _etcd_go_experiment "norandomizedheapbase64")
+    set(_etcd_go_env "GOEXPERIMENT=${_etcd_go_experiment}")
+  endif()
+endif()
+
 add_custom_command(
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libetcd_wrapper.so
-  COMMAND
-    bash -c "go mod tidy" && bash -c
-    "go build -buildmode=c-shared -o ${CMAKE_CURRENT_BINARY_DIR}/libetcd_wrapper.so etcd_wrapper.go"
-    && cp ${CMAKE_CURRENT_BINARY_DIR}/libetcd_wrapper.h
-    ${CMAKE_CURRENT_SOURCE_DIR}
+  COMMAND go mod tidy
+  COMMAND ${CMAKE_COMMAND} -E env ${_etcd_go_env} go build -buildmode=c-shared
+          -o ${CMAKE_CURRENT_BINARY_DIR}/libetcd_wrapper.so etcd_wrapper.go
+  COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_BINARY_DIR}/libetcd_wrapper.h
+          ${CMAKE_CURRENT_SOURCE_DIR}
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   COMMENT "Building Go shared library"
   DEPENDS etcd_wrapper.go go.mod go.sum build.sh)
