@@ -27,6 +27,9 @@ fi
 echo "=== In-process master Python unittest e2e ==="
 "$PYTHON" "$REPO_ROOT/mooncake-wheel/tests/test_standalone_store_e2e.py" -v
 
+echo "=== Store setup lifecycle ==="
+"$PYTHON" "$REPO_ROOT/mooncake-wheel/tests/test_store_setup_lifecycle.py" -v
+
 if pgrep -x mooncake_master >/dev/null 2>&1; then
     echo "ERROR: mooncake_master is running after in-process master e2e" >&2
     pgrep -ax mooncake_master >&2 || true
