@@ -78,7 +78,7 @@ jobs:
             intel-oneapi-compiler-dpcpp-cpp-2026.1 \
             python3.12-dev python3.12-venv iproute2 librdmacm-dev
           bash dependencies.sh -y
-          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          echo "/opt/mooncake-toolchain/bin" >> "$GITHUB_PATH"
           /usr/bin/python3.12 -m venv "$RUNNER_TEMP/xpu-build-env"
           echo "$RUNNER_TEMP/xpu-build-env/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/xpu-build-env/bin/python" -m pip install numpy==2.5.4
