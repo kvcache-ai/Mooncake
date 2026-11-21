@@ -23,16 +23,19 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Build Arguments
         id: build_args
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           ARGS="REPO: ${{ github.repository }}
           REQUEST_SOURCE: ${{ github.event_name }}
           THREAD_ID: ${{ github.event.comment.node_id }}
           COMMENT_ID: ${{ github.event.comment.id }}
           AUTHOR: ${{ github.event.comment.user.login }}
-          BODY: ${{ github.event.comment.body }}
+          BODY: ${COMMENT_BODY}
           URL: ${{ github.event.comment.html_url }}
           IS_PR: ${{ github.event.issue.pull_request != null || github.event_name == 'pull_request_review_comment' }}
           ISSUE_OR_PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}"
@@ -47,9 +50,10 @@ jobs:
           REPLY_TO_COMMENT_ID: ${{ github.event.comment.in_reply_to_id }}"
           fi
           
-          echo "args<<EOF" >> $GITHUB_OUTPUT
-          echo "$ARGS" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          OUTPUT_DELIMITER="EOF_${RANDOM}_${RANDOM}_$(date +%s%N)"
+          echo "args<<${OUTPUT_DELIMITER}" >> "$GITHUB_OUTPUT"
+          echo "$ARGS" >> "$GITHUB_OUTPUT"
+          echo "${OUTPUT_DELIMITER}" >> "$GITHUB_OUTPUT"
 
       - name: Run Qoder Assistant
         uses: QoderAI/qoder-action@v0
