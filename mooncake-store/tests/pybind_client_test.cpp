@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
+#include <future>
 #include <algorithm>
 #include <limits>
 #include <map>
@@ -2607,6 +2608,282 @@ TEST_F(RealClientTest, TestPutSessionEndCompletesMemoryReplica) {
 
     ASSERT_EQ(py_client_->unregister_buffer(src.data()), 0);
     ASSERT_EQ(py_client_->unregister_buffer(dst.data()), 0);
+}
+
+class DiskPutSessionTest : public RealClientTest {
+   protected:
+    void SetUp() override {
+        RealClientTest::SetUp();
+        ASSERT_NO_FATAL_FAILURE(StartDiskMaster());
+        SetupDiskClient(master_.master_address());
+    }
+
+    void StartDiskMaster() {
+        char path[] = "/tmp/mooncake_disk_put_session_XXXXXX";
+        ASSERT_NE(mkdtemp(path), nullptr);
+        ssd_path_ = path;
+        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                      .set_root_fs_dir(ssd_path_)
+                                      .set_default_kv_lease_ttl(10000)
+                                      .build()));
+    }
+
+    void SetupDiskClient(const std::string& address) {
+        ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                         16 * 1024 * 1024, 16 * 1024 * 1024,
+                                         "tcp", "", address),
+                  0);
+    }
+};
+
+TEST_F(DiskPutSessionTest, CompletedSessionsReleaseUnwrittenDiskReplicas) {
+    const std::vector<std::string> keys = {"disk_session_a", "disk_session_b"};
+    constexpr size_t kSize = 256;
+    std::string src(kSize, 'P');
+    std::string dst(kSize, 'Q');
+    ASSERT_EQ(py_client_->register_buffer(src.data(), src.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(dst.data(), dst.size()), 0);
+
+    for (int round = 0; round < 3; ++round) {
+        SCOPED_TRACE(round);
+        ASSERT_EQ(py_client_->batch_put_session_start(keys, {kSize, kSize}),
+                  (std::vector<int>{0, 0}));
+        ASSERT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                      keys, {{src.data()}, {src.data()}}, {{kSize}, {kSize}},
+                      {{0}, {0}}),
+                  (std::vector<int>{kSize, kSize}));
+        ASSERT_EQ(py_client_->batch_put_session_end(keys),
+                  (std::vector<int>{0, 0}));
+
+        for (const auto& key : keys) {
+            auto replicas = py_client_->get_replica_desc(key);
+            ASSERT_EQ(replicas.size(), 1u);
+            EXPECT_TRUE(replicas[0].is_memory_replica());
+            EXPECT_EQ(replicas[0].status, ReplicaStatus::COMPLETE);
+        }
+        ASSERT_EQ(py_client_->batch_get_session_start({keys[0]}),
+                  (std::vector<int>{0}));
+        ASSERT_EQ(py_client_->batch_get_into_multi_buffer_ranges(
+                      {keys[0]}, {{dst.data()}}, {{kSize}}, {{0}}),
+                  (std::vector<int>{kSize}));
+        EXPECT_EQ(dst, src);
+        ASSERT_EQ(py_client_->batch_get_session_end({keys[0]}), 0);
+        for (const auto& key : keys) {
+            // No processing replica may block removal or the next session.
+            ASSERT_EQ(py_client_->remove(key, true), 0);
+        }
+    }
+    EXPECT_EQ(py_client_->unregister_buffer(src.data()), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(dst.data()), 0);
+}
+
+TEST_F(DiskPutSessionTest, RevokedSessionsReleaseUnwrittenDiskReplicas) {
+    const std::vector<std::string> keys = {"disk_revoke_a", "disk_revoke_b"};
+    constexpr size_t kSize = 256;
+    std::string src(kSize, 'P');
+    ASSERT_EQ(py_client_->register_buffer(src.data(), src.size()), 0);
+
+    for (int round = 0; round < 3; ++round) {
+        SCOPED_TRACE(round);
+        // Immediate reuse catches metadata left by the previous revocation.
+        ASSERT_EQ(py_client_->batch_put_session_start(keys, {kSize, kSize}),
+                  (std::vector<int>{0, 0}));
+        ASSERT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                      keys, {{src.data()}, {src.data()}}, {{kSize}, {kSize}},
+                      {{0}, {1}}),
+                  (std::vector<int>{kSize, toInt(ErrorCode::INVALID_PARAMS)}));
+        ASSERT_EQ(py_client_->batch_put_session_revoke(keys),
+                  (std::vector<int>{0, 0}));
+        for (const auto& key : keys) {
+            auto result = master_.service()->GetReplicaListForAdmin(key);
+            ASSERT_FALSE(result.has_value());
+            EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND);
+        }
+    }
+    EXPECT_EQ(py_client_->unregister_buffer(src.data()), 0);
+}
+
+TEST_F(DiskPutSessionTest, DiskCleanupFailureRetainsSessionForRetry) {
+    const std::vector<std::string> keys = {"disk_cleanup_fail",
+                                           "disk_cleanup_ok"};
+    ASSERT_EQ(py_client_->batch_put_session_start(keys, {256, 256}),
+              (std::vector<int>{0, 0}));
+
+    // Use the low-level API to make one reservation non-revocable. Cleanup
+    // must surface the Master's error without finalizing that session's memory
+    // or dropping its local state. The other key must still complete.
+    auto disk_end = py_client_->client_->BatchPutEnd({{keys[0], std::nullopt}},
+                                                     ReplicaType::DISK);
+    ASSERT_EQ(disk_end.size(), 1u);
+    ASSERT_TRUE(disk_end[0].has_value());
+    const int invalid_write = toInt(ErrorCode::INVALID_WRITE);
+    EXPECT_EQ(py_client_->batch_put_session_end(keys),
+              (std::vector<int>{invalid_write, 0}));
+    EXPECT_EQ(py_client_->batch_put_session_end({keys[0]}),
+              (std::vector<int>{invalid_write}));
+    EXPECT_EQ(py_client_->batch_put_session_revoke({keys[0]}),
+              (std::vector<int>{invalid_write}));
+
+    // Once the disk replica is evicted, retry the same sealed session.
+    ASSERT_TRUE(
+        py_client_->client_->EvictDiskReplica(keys[0], ReplicaType::DISK)
+            .has_value());
+    EXPECT_EQ(py_client_->batch_put_session_end({keys[0]}),
+              (std::vector<int>{0}));
+    for (const auto& key : keys) {
+        EXPECT_EQ(py_client_->remove(key, true), 0);
+    }
+}
+
+// Forward to the real master, with one-shot controls on the session RPCs.
+class DiskPutSessionRpcTest : public DiskPutSessionTest {
+   protected:
+    void SetUp() override {
+        RealClientTest::SetUp();
+        ASSERT_NO_FATAL_FAILURE(StartDiskMaster());
+        service_ = master_.service();
+        server_.register_handler<
+            &WrappedMasterService::Ping, &WrappedMasterService::ServiceReady,
+            &WrappedMasterService::MountSegment,
+            &WrappedMasterService::ReMountSegment,
+            &WrappedMasterService::UnmountSegment,
+            &WrappedMasterService::GracefulUnmountSegment,
+            &WrappedMasterService::GetStorageConfig,
+            &WrappedMasterService::FetchTasks,
+            &WrappedMasterService::BatchGetReplicaList,
+            &WrappedMasterService::BatchPutEnd, &WrappedMasterService::Remove>(
+            service_.get());
+        server_.register_handler<&DiskPutSessionRpcTest::Start>(
+            this, coro_rpc::func_id<&WrappedMasterService::BatchPutStart>());
+        server_.register_handler<&DiskPutSessionRpcTest::Revoke>(
+            this, coro_rpc::func_id<&WrappedMasterService::BatchPutRevoke>());
+        auto serving = server_.async_start();
+        ASSERT_FALSE(serving.hasResult());
+        SetupDiskClient("127.0.0.1:" + std::to_string(server_.port()));
+    }
+
+    void TearDown() override {
+        DiskPutSessionTest::TearDown();
+        server_.stop();
+    }
+
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    Start(const UUID& client_id, const std::vector<std::string>& keys,
+          const std::vector<uint64_t>& sizes, const ReplicateConfig& config,
+          const std::string& tenant) {
+        const bool no_memory = no_memory_response_.exchange(false);
+        auto master_config = config;
+        if (no_memory) {
+            master_config.nof_replica_num = 0;
+        }
+        auto results = service_->BatchPutStart(client_id, keys, sizes,
+                                               master_config, tenant);
+        if (no_memory) {
+            for (auto& result : results) {
+                if (result) {
+                    // A flexible allocation can return only NoF plus the
+                    // file reservation. Substitute the descriptor so this
+                    // test can exercise that reply without NoF hardware.
+                    std::erase_if(*result, [](const auto& replica) {
+                        return replica.is_memory_replica();
+                    });
+                    result->push_back(Replica::Descriptor{
+                        .descriptor_variant = NoFDescriptor{},
+                        .status = ReplicaStatus::PROCESSING,
+                    });
+                }
+            }
+        }
+        return results;
+    }
+
+    std::vector<tl::expected<void, ErrorCode>> Revoke(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType type, const std::string& tenant) {
+        if (type == ReplicaType::DISK && fail_revoke_.exchange(false)) {
+            return {keys.size(), tl::unexpected(ErrorCode::INVALID_WRITE)};
+        }
+        auto results = service_->BatchPutRevoke(client_id, keys, type, tenant);
+        if (type == ReplicaType::DISK && delay_revoke_.exchange(false)) {
+            revoke_applied_.set_value();
+            auto release = release_revoke_.get_future();
+            EXPECT_EQ(release.wait_for(std::chrono::seconds(5)),
+                      std::future_status::ready);
+        }
+        return results;
+    }
+
+    std::shared_ptr<WrappedMasterService> service_;
+    coro_rpc::coro_rpc_server server_{4, 0, "127.0.0.1"};
+    std::atomic<bool> no_memory_response_{false};
+    std::atomic<bool> fail_revoke_{false};
+    std::atomic<bool> delay_revoke_{false};
+    std::promise<void> revoke_applied_;
+    std::promise<void> release_revoke_;
+};
+
+TEST_F(DiskPutSessionRpcTest, InFlightEndOwnsKeyUntilPublicationFinishes) {
+    const std::vector<std::string> keys = {"pending_disk_end"};
+    ASSERT_EQ(py_client_->batch_put_session_start(keys, {256}),
+              (std::vector<int>{0}));
+    std::string src(256, 'a');
+    ASSERT_EQ(py_client_->register_buffer(src.data(), src.size()), 0);
+    ASSERT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                  keys, {{src.data()}}, {{src.size()}}, {{0}}),
+              (std::vector<int>{256}));
+    delay_revoke_ = true;
+    auto applied = revoke_applied_.get_future();
+    auto end = std::async(std::launch::async, [&] {
+        return py_client_->batch_put_session_end(keys);
+    });
+
+    const bool blocked =
+        applied.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+    if (blocked) {
+        const int busy = toInt(ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(py_client_->batch_put_session_revoke(keys),
+                  (std::vector<int>{busy}));
+        EXPECT_EQ(py_client_->batch_put_session_start(keys, {256}),
+                  (std::vector<int>{busy}));
+        const std::vector<std::string> other = {"unrelated_disk_session"};
+        EXPECT_EQ(py_client_->batch_put_session_start(other, {256}),
+                  (std::vector<int>{0}));
+        EXPECT_EQ(py_client_->batch_put_session_revoke(other),
+                  (std::vector<int>{0}));
+    }
+    release_revoke_.set_value();
+    ASSERT_TRUE(blocked);
+    EXPECT_EQ(end.get(), (std::vector<int>{0}));
+    EXPECT_EQ(py_client_->remove(keys[0], true), 0);
+    ASSERT_EQ(py_client_->batch_put_session_start(keys, {256}),
+              (std::vector<int>{0}));
+    EXPECT_EQ(py_client_->batch_put_session_revoke(keys),
+              (std::vector<int>{0}));
+    EXPECT_EQ(py_client_->unregister_buffer(src.data()), 0);
+}
+
+TEST_F(DiskPutSessionRpcTest, FailedStartLetsMasterDecideWhenKeyCanBeReused) {
+    const std::vector<std::string> keys = {"rejected_no_memory_session"};
+    ReplicateConfig flexible;
+    flexible.nof_replica_num = 1;
+    no_memory_response_ = true;
+    fail_revoke_ = true;
+    ASSERT_EQ(py_client_->batch_put_session_start(keys, {256}, flexible),
+              (std::vector<int>{toInt(ErrorCode::INVALID_REPLICA)}));
+    EXPECT_EQ(py_client_->batch_put_session_start(keys, {256}),
+              (std::vector<int>{toInt(ErrorCode::OBJECT_ALREADY_EXISTS)}));
+
+    // Model the master's reservation being reclaimed after the client-side
+    // cleanup failure. The low-level calls do not touch the session map.
+    for (auto type : {ReplicaType::DISK, ReplicaType::ALL}) {
+        auto revoked = py_client_->client_->BatchPutRevoke(keys, type);
+        ASSERT_EQ(revoked.size(), 1u);
+        ASSERT_TRUE(revoked.front().has_value());
+    }
+    ASSERT_EQ(py_client_->batch_put_session_start(keys, {256}),
+              (std::vector<int>{0}));
+    EXPECT_EQ(py_client_->batch_put_session_revoke(keys),
+              (std::vector<int>{0}));
 }
 
 // Lease expire on get ranges must drop the cached get session.
