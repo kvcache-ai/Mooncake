@@ -54,6 +54,9 @@ class ResourceTracker {
     // Get the singleton instance
     static ResourceTracker &getInstance();
 
+    // Call before getInstance() when the executable owns shutdown signals.
+    static void DisableSignalHandling();
+
     // Register a DistributedObjectStore instance for cleanup
     void registerInstance(const std::shared_ptr<PyClient> &instance);
 
