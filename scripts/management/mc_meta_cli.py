@@ -9,6 +9,8 @@ Usage:
 
   2) Query one key from HTTP metadata server:
      python mc_meta_cli.py --query-key <key> --metadata-server http://127.0.0.1:8080/metadata
+     If the metadata server requires a token, export the same
+     MC_METADATA_HTTP_TOKEN it was started with.
 
   3) Delete one key via RPC (default protocol: rpc_only):
      python mc_meta_cli.py --delete-key <key> --force
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import http.client
+import os
 import sys
 import urllib.error
 import urllib.parse
@@ -66,12 +69,23 @@ def metadata_hint(metadata_server: str) -> str:
 def query_key_by_http(metadata_server: str, key: str, timeout: float) -> bool:
     url = build_metadata_url(metadata_server, key)
     req = urllib.request.Request(url, method="GET")
+    # Same shared token the metadata server and the engines read; a server
+    # started with it rejects requests that do not present it.
+    token = os.environ.get("MC_METADATA_HTTP_TOKEN")
+    if token:
+        req.add_unredirected_header("Authorization", f"Bearer {token}")
     try:
         with urllib.request.urlopen(req, timeout=timeout):
             return True
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return False
+        if exc.code == 401:
+            raise RuntimeError(
+                f"HTTP error 401 for {url}. Hint: the metadata server requires "
+                "a token; export the same MC_METADATA_HTTP_TOKEN it was "
+                "started with."
+            ) from exc
         raise RuntimeError(f"HTTP error {exc.code} for {url}") from exc
     except http.client.RemoteDisconnected as exc:
         raise RuntimeError(
@@ -152,7 +166,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--query-key",
         default=None,
-        help="Query one key by HTTP metadata endpoint.",
+        help=(
+            "Query one key by HTTP metadata endpoint. Sends "
+            "MC_METADATA_HTTP_TOKEN as a bearer token when it is set."
+        ),
     )
     parser.add_argument(
         "--delete-key",
