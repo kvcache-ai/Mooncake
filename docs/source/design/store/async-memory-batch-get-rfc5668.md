@@ -36,9 +36,12 @@ must remain alive and registered through terminal completion. The next
 3. The **single submission thread** resolves replica metadata, validates
    memory routing/size/lease and submits native TransferFuture operations.
    Preflight happens before any transfer for that operation.
-4. The **single completion thread** polls in-flight native futures and
-   independently validates transfer results, checksums and leases before
-   publishing the operation's immutable per-key result.
+4. The **single completion thread** observes in-flight native futures with
+   bounded backoff (25 µs, doubling to a 250 µs cap) and independently
+   validates transfer results, checksums and leases before publishing the
+   operation's immutable per-key result. The cap is deliberately below the
+   444-451 µs adjacent-layer gap measured in the RFC; a fixed 1 ms poll could
+   delay completion discovery past the next layer's submission.
 5. Credits and destination reservations are released only after the
    completion path drains backend accesses.
 
@@ -50,6 +53,35 @@ destination memory.
 The first implementation deliberately rejects overlapping destinations,
 duplicate keys, unsupported source replica types (including SSD/DFS/NoF)
 and non-RDMA protocols rather than silently using a staged path.
+
+## Failure semantics
+
+Preflight runs on the submission thread, so a rejected request is reported
+through the handle's per-key results rather than thrown to the caller. The
+reported code keeps the real failure class:
+
+| Result code | Meaning |
+| --- | --- |
+| non-negative | Bytes read for that key |
+| `INVALID_PARAMS` (-600) | Malformed descriptor, duplicate key, overlapping destination, or an unsupported replica route/protocol (SSD, DFS, NoF, non-RDMA) |
+| `REPLICA_NOT_FOUND` / `OBJECT_NOT_FOUND` / `LEASE_EXPIRED` | Selector or metadata outcome, preserved per key |
+| `TRANSFER_FAIL` (-800) | The data path failed after submission |
+| `CHECKSUM_MISMATCH` (-801) | Transfer completed but verification failed |
+| `INTERNAL_ERROR` (-1) | Unexpected transport or validation exception |
+
+`AsyncMemoryBatchGetError` carries the intended `ErrorCode` across the
+submission thread boundary; `std::invalid_argument` maps to
+`INVALID_PARAMS`. Neither is flattened into `TRANSFER_FAIL`.
+
+## Drain and destructor guarantees
+
+Each key is finished independently. A throwing `TransferFuture::get()` or a
+throwing checksum/lease validation is recorded for that key as
+`INTERNAL_ERROR`; the remaining keys are still waited on. Every future is
+released only after it reaches a terminal state, and `wait()` releases all
+futures before allocating the result vector. The destructor wraps `wait()` in
+a catch-all so an exception can never escape and call `std::terminate`, and it
+performs a noexcept drain as a last resort.
 
 ## Lifecycle contract
 
@@ -76,6 +108,10 @@ completion backend and checks:
 - Duplicate keys, overlapping buffers and invalid/zero slices fail before
   dispatch. Destination reservations release on completion.
 - Shutdown rejects admissions and drains accepted operations before return.
+- A transport-level exception on one key does not prevent other submitted
+  DMA from draining, and the destructor does not terminate.
+- A rejected replica route publishes `INVALID_PARAMS`, not `TRANSFER_FAIL`.
+- Completion is observed without a fixed 1 ms poll stall.
 
 These tests validate the **control-plane state machine** only. They do
 not prove RDMA completion, direct placement, checksum data correctness,

@@ -1379,7 +1379,17 @@ AsyncMemoryBatchGet::~AsyncMemoryBatchGet() {
     // Backend futures must drain before their state and Client are freed.
     // A pending handle owns no DMA itself; the manager retains a reference
     // until it has completed every accepted operation.
-    if (!pending_) (void)wait();
+    if (pending_) return;
+    try {
+        (void)wait();
+    } catch (...) {
+        // A destructor must never let an exception escape: that would call
+        // std::terminate. wait() isolates per-entry failures, so this is a
+        // last-resort guard (for example allocation failure while publishing
+        // the result vector). DrainTransfers() is noexcept and still releases
+        // every already-submitted future.
+        DrainTransfers();
+    }
 }
 
 bool AsyncMemoryBatchGet::ready() {
@@ -1407,6 +1417,72 @@ void AsyncMemoryBatchGet::Complete(std::vector<int64_t> results) {
     cv_.notify_all();
 }
 
+int64_t AsyncMemoryBatchGet::FinishEntry(Entry& entry) {
+    if (!entry.transfer) return entry.result;
+
+    ErrorCode status = ErrorCode::TRANSFER_FAIL;
+    try {
+        status = entry.transfer->get();
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "async get transfer wait failed for key " << entry.key
+                   << ": " << e.what();
+        entry.result = static_cast<int64_t>(ErrorCode::INTERNAL_ERROR);
+        return entry.result;
+    } catch (...) {
+        LOG(ERROR) << "async get transfer wait raised an unknown error for key "
+                   << entry.key;
+        entry.result = static_cast<int64_t>(ErrorCode::INTERNAL_ERROR);
+        return entry.result;
+    }
+
+    if (status != ErrorCode::OK) {
+        entry.result = static_cast<int64_t>(status);
+        return entry.result;
+    }
+    if (!entry.query || !owner_) {
+        entry.result = static_cast<int64_t>(ErrorCode::INTERNAL_ERROR);
+        return entry.result;
+    }
+    try {
+        // A successful transfer is not consumable until its checksum and
+        // lease have also been validated.
+        auto verified = owner_->VerifyObjectChecksum(
+            entry.key, entry.slices, entry.bytes, entry.query->object_checksum);
+        if (!verified) {
+            entry.result = static_cast<int64_t>(verified.error());
+        } else if (entry.query->IsLeaseExpired()) {
+            entry.result = static_cast<int64_t>(ErrorCode::LEASE_EXPIRED);
+        } else {
+            entry.result = static_cast<int64_t>(entry.bytes);
+        }
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "async get validation failed for key " << entry.key
+                   << ": " << e.what();
+        entry.result = static_cast<int64_t>(ErrorCode::INTERNAL_ERROR);
+    } catch (...) {
+        LOG(ERROR) << "async get validation raised an unknown error for key "
+                   << entry.key;
+        entry.result = static_cast<int64_t>(ErrorCode::INTERNAL_ERROR);
+    }
+    return entry.result;
+}
+
+void AsyncMemoryBatchGet::DrainTransfers() noexcept {
+    for (auto& entry : entries_) {
+        if (!entry.transfer) continue;
+        try {
+            // get() waits for the batch to reach a terminal state. Releasing a
+            // future whose DMA is still in flight could free the batch ID
+            // underneath the transport, so wait before reset().
+            if (!entry.transfer->isReady()) (void)entry.transfer->get();
+        } catch (...) {
+            // Already waited as far as the transport allows; the future still
+            // has to be released, and this path must not propagate.
+        }
+        entry.transfer.reset();
+    }
+}
+
 std::vector<int64_t> AsyncMemoryBatchGet::wait() {
     std::unique_lock<std::mutex> lock(mutex_);
     if (pending_) {
@@ -1414,37 +1490,25 @@ std::vector<int64_t> AsyncMemoryBatchGet::wait() {
         return *completed_;
     }
     if (completed_) return *completed_;
+
+    // Each key is finished independently: a transport or validation exception
+    // is recorded for that key and does not prevent the other submitted
+    // transfers from being drained below.
+    for (auto& entry : entries_) (void)FinishEntry(entry);
+    // All futures are terminal at this point; release them before allocating
+    // the result vector so that a later allocation failure cannot leave DMA
+    // outstanding.
+    DrainTransfers();
+
     std::vector<int64_t> results;
     results.reserve(entries_.size());
-    // A successful transfer is not consumable until its checksum and lease
-    // have also been validated. All failures still drain the transfer.
-    for (auto& entry : entries_) {
-        if (entry.transfer) {
-            const ErrorCode status = entry.transfer->get();
-            entry.transfer.reset();
-            if (status != ErrorCode::OK) {
-                entry.result = static_cast<int64_t>(status);
-            } else {
-                auto verified = owner_->VerifyObjectChecksum(
-                    entry.key, entry.slices, entry.bytes,
-                    entry.query->object_checksum);
-                if (!verified) {
-                    entry.result = static_cast<int64_t>(verified.error());
-                } else if (entry.query->IsLeaseExpired()) {
-                    entry.result =
-                        static_cast<int64_t>(ErrorCode::LEASE_EXPIRED);
-                } else {
-                    entry.result = static_cast<int64_t>(entry.bytes);
-                }
-            }
-        }
-        results.push_back(entry.result);
-    }
-    completed_ = results;
+    for (const auto& entry : entries_) results.push_back(entry.result);
+    completed_.emplace(std::move(results));
     completed_flag_.store(true, std::memory_order_release);
+    const std::vector<int64_t> published = *completed_;
     lock.unlock();
     cv_.notify_all();
-    return results;
+    return published;
 }
 
 std::optional<std::vector<int64_t>> AsyncMemoryBatchGet::wait_for(
@@ -1582,8 +1646,20 @@ void AsyncMemoryGetManager::RunSubmissions() {
             queue_.pop_front();
         }
         std::shared_ptr<AsyncMemoryBatchGet> backend;
+        // Preserve the real failure class. A rejected replica route or an
+        // unsupported descriptor is a caller-visible precondition failure, not
+        // an RDMA data-path failure, so it must not be reported as
+        // TRANSFER_FAIL.
+        ErrorCode failure = ErrorCode::TRANSFER_FAIL;
         try {
             backend = submit_(pending.keys, pending.destinations);
+        } catch (const AsyncMemoryBatchGetError& e) {
+            failure = e.code();
+            LOG(ERROR) << "async get submission rejected: " << e.what()
+                       << " (code " << static_cast<int>(failure) << ")";
+        } catch (const std::invalid_argument& e) {
+            failure = ErrorCode::INVALID_PARAMS;
+            LOG(ERROR) << "async get submission rejected: " << e.what();
         } catch (const std::exception& e) {
             LOG(ERROR) << "async get submission failed: " << e.what();
         } catch (...) {
@@ -1591,8 +1667,7 @@ void AsyncMemoryGetManager::RunSubmissions() {
         }
         if (!backend) {
             pending.operation->Complete(std::vector<int64_t>(
-                pending.keys.size(),
-                static_cast<int64_t>(ErrorCode::TRANSFER_FAIL)));
+                pending.keys.size(), static_cast<int64_t>(failure)));
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1614,9 +1689,19 @@ void AsyncMemoryGetManager::RunSubmissions() {
 }
 
 void AsyncMemoryGetManager::RunCompletions() {
+    // TransferFuture exposes no completion callback, so discovery is poll
+    // based. Poll tightly at first, then back off, but keep the cap well below
+    // the ~444-451us gap between adjacent layer transfers reported in RFC
+    // #5668: a fixed 1ms interval could delay completion detection past the
+    // next layer's submission and cancel out the prefetch overlap.
+    constexpr auto kMinPollInterval = std::chrono::microseconds(25);
+    constexpr auto kMaxPollInterval = std::chrono::microseconds(250);
+    std::chrono::microseconds poll_interval{0};
+
     for (;;) {
         std::shared_ptr<AsyncMemoryBatchGet> backend;
         std::shared_ptr<AsyncMemoryBatchGet> operation;
+        bool backend_in_flight = false;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             // Sleep without polling while no backend is submitted. Pending
@@ -1630,7 +1715,9 @@ void AsyncMemoryGetManager::RunCompletions() {
             });
             if (stopping_ && active_.empty() && queue_.empty()) return;
             for (auto& active : active_) {
-                if (active.backend && active.backend->ready()) {
+                if (!active.backend) continue;
+                backend_in_flight = true;
+                if (active.backend->ready()) {
                     backend = std::move(active.backend);
                     operation = active.operation;
                     // Null backend marks a completion in progress; keep
@@ -1640,12 +1727,41 @@ void AsyncMemoryGetManager::RunCompletions() {
             }
         }
         if (!backend) {
-            // One bounded poll interval only when a real transfer is active.
-            // Avoid spinning when a submitter is still resolving metadata.
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait_for(lock, std::chrono::milliseconds(1));
+            if (!backend_in_flight) {
+                if (stopping_) {
+                    // Shutdown with no published backend: the submission
+                    // thread is finishing its last queue entry. Yield instead
+                    // of blocking so the join in CloseAndDrain can proceed.
+                    lock.unlock();
+                    std::this_thread::yield();
+                    continue;
+                }
+                // Only queued work: wait for the submission thread to publish
+                // a backend instead of polling.
+                cv_.wait(lock, [this] {
+                    return stopping_ ||
+                           std::any_of(active_.begin(), active_.end(),
+                                       [](const Active& item) {
+                                           return item.backend != nullptr;
+                                       });
+                });
+                poll_interval = std::chrono::microseconds{0};
+                continue;
+            }
+            if (poll_interval == std::chrono::microseconds{0}) {
+                // First pass after a submission: give the transport a chance
+                // without burning the scheduler quantum.
+                lock.unlock();
+                std::this_thread::yield();
+                poll_interval = kMinPollInterval;
+            } else {
+                cv_.wait_for(lock, poll_interval);
+                poll_interval = std::min(poll_interval * 2, kMaxPollInterval);
+            }
             continue;
         }
+        poll_interval = std::chrono::microseconds{0};
         std::vector<int64_t> results;
         try {
             results = backend->wait();
@@ -1691,12 +1807,15 @@ std::shared_ptr<AsyncMemoryBatchGet> Client::SubmitAsyncMemoryBatchGet(
     if (owner.get() != this || keys.empty() ||
         keys.size() != destinations.size() || !transfer_submitter_ ||
         protocol_ != "rdma") {
-        throw std::invalid_argument(
+        throw AsyncMemoryBatchGetError(
+            ErrorCode::INVALID_PARAMS,
             "async memory batch get requires RDMA and matching descriptors");
     }
     const auto queries = BatchQuery(keys);
     if (queries.size() != keys.size()) {
-        throw std::runtime_error("async batch read metadata count mismatch");
+        throw AsyncMemoryBatchGetError(
+            ErrorCode::INTERNAL_ERROR,
+            "async batch read metadata count mismatch");
     }
     std::unordered_set<std::string> seen;
     std::vector<AsyncMemoryBatchGet::Entry> entries;
@@ -1706,7 +1825,8 @@ std::shared_ptr<AsyncMemoryBatchGet> Client::SubmitAsyncMemoryBatchGet(
     // All-key preflight before the first DMA submission.
     for (size_t i = 0; i < keys.size(); ++i) {
         if (!seen.insert(keys[i]).second || destinations[i].empty()) {
-            throw std::invalid_argument(
+            throw AsyncMemoryBatchGetError(
+                ErrorCode::INVALID_PARAMS,
                 "async get requires unique keys and valid destination slices");
         }
         AsyncMemoryBatchGet::Entry entry;
@@ -1715,7 +1835,9 @@ std::shared_ptr<AsyncMemoryBatchGet> Client::SubmitAsyncMemoryBatchGet(
         for (const auto& slice : entry.slices) {
             if (!slice.ptr || slice.size == 0 ||
                 slice.size > SIZE_MAX - entry.bytes) {
-                throw std::invalid_argument("async batch read invalid slice");
+                throw AsyncMemoryBatchGetError(
+                    ErrorCode::INVALID_PARAMS,
+                    "async batch read invalid slice");
             }
             entry.bytes += slice.size;
         }
@@ -1734,14 +1856,24 @@ std::shared_ptr<AsyncMemoryBatchGet> Client::SubmitAsyncMemoryBatchGet(
         }
         const ErrorCode error =
             select(query.replicas, entry.slices, entry.replica);
-        if (error != ErrorCode::OK || !entry.replica.is_memory_replica() ||
+        if (error != ErrorCode::OK) {
+            // Keep the selector's own class (for example REPLICA_NOT_FOUND)
+            // instead of reporting a data-path failure.
+            throw AsyncMemoryBatchGetError(
+                error, "async batch get found no usable read replica");
+        }
+        if (!entry.replica.is_memory_replica() ||
             entry.replica.get_memory_descriptor().buffer_descriptor.protocol_ !=
                 "rdma") {
-            throw std::invalid_argument(
+            // A supported local SSD/DFS/NoF replica is a routing limitation,
+            // not a transfer failure.
+            throw AsyncMemoryBatchGetError(
+                ErrorCode::INVALID_PARAMS,
                 "async batch get supports only RDMA memory replicas");
         }
         if (entry.bytes != calculate_total_size(entry.replica)) {
-            throw std::invalid_argument("async batch read size mismatch");
+            throw AsyncMemoryBatchGetError(ErrorCode::INVALID_PARAMS,
+                                           "async batch read size mismatch");
         }
         entry.query.emplace(query);
         entries.emplace_back(std::move(entry));

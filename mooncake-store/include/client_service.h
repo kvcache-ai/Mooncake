@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -84,6 +85,22 @@ class Client;
 class AsyncMemoryGetManager;
 class AsyncMemoryBatchGetTestPeer;
 
+// Typed failure for the async Batch Get pipeline. The async manager resolves
+// metadata on a submission thread, so a preflight failure cannot be returned
+// synchronously to the caller. Carrying the ErrorCode lets the completion
+// path publish the real cause (for example INVALID_PARAMS for an unsupported
+// replica route) instead of collapsing every failure into TRANSFER_FAIL.
+class AsyncMemoryBatchGetError : public std::runtime_error {
+   public:
+    AsyncMemoryBatchGetError(ErrorCode code, const std::string& message)
+        : std::runtime_error(message), code_(code) {}
+
+    ErrorCode code() const noexcept { return code_; }
+
+   private:
+    ErrorCode code_;
+};
+
 // A terminal read result is published only after all associated transfer
 // futures have been drained. Caller-owned destination memory must remain
 // registered and alive until wait() returns.
@@ -119,6 +136,15 @@ class AsyncMemoryBatchGet {
     friend class AsyncMemoryBatchGetTestPeer;
     friend class Client;
     void Complete(std::vector<int64_t> results);
+
+    // Waits for one entry's transfer, then runs checksum and lease
+    // validation. Never propagates: a transport or validation failure becomes
+    // that key's terminal result, so one bad key cannot stop the remaining
+    // submitted DMA from draining.
+    int64_t FinishEntry(Entry& entry);
+    // Releases every transfer future only after it reached a terminal state.
+    // Called from the destructor path, therefore must never throw.
+    void DrainTransfers() noexcept;
 
     std::shared_ptr<Client> owner_;
     const bool pending_;

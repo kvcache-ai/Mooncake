@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -275,6 +276,124 @@ TEST(AsyncMemoryBatchGetTest, DroppedHandleRemainsOwnedThroughCompletion) {
     AsyncMemoryBatchGetTestPeer::Complete(backend.WaitForSubmission(0), {8});
     manager.CloseAndDrain();
     EXPECT_TRUE(dropped.expired());
+}
+
+// TransferFuture is constructible from any OperationState, so transport-level
+// exceptions can be injected without RDMA hardware. This is what makes the
+// destructor exception-safety contract testable.
+class ThrowingOperationState : public OperationState {
+   public:
+    bool is_completed() override { return false; }
+
+    void wait_for_completion() override {
+        throw std::runtime_error("injected transport wait failure");
+    }
+
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::TRANSFER_ENGINE;
+    }
+};
+
+class CountingOperationState : public OperationState {
+   public:
+    bool is_completed() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return result_.has_value();
+    }
+
+    void wait_for_completion() override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!result_) result_.emplace(ErrorCode::OK);
+        }
+        waits.fetch_add(1, std::memory_order_relaxed);
+        cv_.notify_all();
+    }
+
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::TRANSFER_ENGINE;
+    }
+
+    std::atomic<int> waits{0};
+};
+
+TEST(AsyncMemoryBatchGetTest, ThrowingTransferDoesNotBlockOtherDrains) {
+    std::vector<AsyncMemoryBatchGet::Entry> entries;
+
+    AsyncMemoryBatchGet::Entry failing;
+    failing.key = "failing";
+    failing.transfer.emplace(std::make_shared<ThrowingOperationState>());
+    entries.emplace_back(std::move(failing));
+
+    auto healthy_state = std::make_shared<CountingOperationState>();
+    AsyncMemoryBatchGet::Entry healthy;
+    healthy.key = "healthy";
+    healthy.transfer.emplace(healthy_state);
+    entries.emplace_back(std::move(healthy));
+
+    auto op =
+        std::make_shared<AsyncMemoryBatchGet>(nullptr, std::move(entries));
+
+    std::vector<int64_t> results;
+    EXPECT_NO_THROW(results = op->wait());
+    ASSERT_EQ(results.size(), 2U);
+    EXPECT_EQ(results[0], static_cast<int64_t>(ErrorCode::INTERNAL_ERROR));
+    // The healthy transfer must still be awaited even though the first one
+    // raised: one bad key cannot leave other DMA undrained.
+    EXPECT_EQ(healthy_state->waits.load(), 1);
+}
+
+TEST(AsyncMemoryBatchGetTest, DestructorIsNoexceptWhenTransferWaitThrows) {
+    std::vector<AsyncMemoryBatchGet::Entry> entries;
+    AsyncMemoryBatchGet::Entry failing;
+    failing.key = "failing";
+    failing.transfer.emplace(std::make_shared<ThrowingOperationState>());
+    entries.emplace_back(std::move(failing));
+
+    auto op =
+        std::make_shared<AsyncMemoryBatchGet>(nullptr, std::move(entries));
+    // Escaping here would call std::terminate and abort the test binary.
+    EXPECT_NO_THROW(op.reset());
+}
+
+TEST(AsyncMemoryBatchGetTest, PreflightFailureKeepsErrorClass) {
+    AsyncMemoryGetManager manager(
+        nullptr, 1, 8,
+        [](const auto&, const auto&) -> std::shared_ptr<AsyncMemoryBatchGet> {
+            throw AsyncMemoryBatchGetError(ErrorCode::INVALID_PARAMS,
+                                           "unsupported replica route");
+        });
+    std::array<char, 8> buffer{};
+    auto operation = manager.Submit({"unsupported-route"},
+                                    {{{buffer.data(), buffer.size()}}});
+    auto results = operation->wait_for(3s);
+    ASSERT_TRUE(results.has_value());
+    // Must not be flattened into TRANSFER_FAIL: the caller needs to tell a
+    // routing/precondition failure apart from a real data-path failure.
+    EXPECT_EQ(*results, (std::vector<int64_t>{
+                            static_cast<int64_t>(ErrorCode::INVALID_PARAMS)}));
+    manager.Drain();
+}
+
+TEST(AsyncMemoryBatchGetTest, CompletionIsPublishedWithoutPollingStall) {
+    FakeBackend backend;
+    AsyncMemoryGetManager manager(
+        nullptr, 1, 8, [&backend](const auto& keys, const auto& destinations) {
+            return backend.Submit(keys, destinations);
+        });
+    std::array<char, 8> data{};
+    auto operation = manager.Submit({"one"}, {{{data.data(), data.size()}}});
+    auto submitted = backend.WaitForSubmission(0);
+    ASSERT_NE(submitted, nullptr);
+
+    const auto start = std::chrono::steady_clock::now();
+    AsyncMemoryBatchGetTestPeer::Complete(submitted, {8});
+    ASSERT_TRUE(operation->wait_for(2s).has_value());
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    // Bounded backoff replaced the fixed 1ms poll. 10ms tolerates CI
+    // scheduling noise while still catching a stalled dispatcher.
+    EXPECT_LT(elapsed, 10ms);
+    manager.Drain();
 }
 
 }  // namespace
