@@ -347,7 +347,7 @@ When `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true`, the FileStorage hea
 
 | Backend | Behavior |
 |---------|----------|
-| `bucket_storage_backend` | Reuses `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY`; set it to `fifo` or `lru` because the default policy `none` makes watermark eviction a no-op |
+| `bucket_storage_backend` | Reuses `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY`; watermark eviction is a no-op when it is `none` |
 | `file_per_key_storage_backend` | Requires `MOONCAKE_OFFLOAD_ENABLE_EVICTION=true`; reuses the FIFO file eviction queue and recovered keys from startup metadata scan |
 | `offset_allocator_storage_backend` | No-op in this version |
 
