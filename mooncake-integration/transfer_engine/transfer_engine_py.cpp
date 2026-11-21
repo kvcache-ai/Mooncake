@@ -998,6 +998,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
     const int max_retry =
         engine_->numContexts() + 1;  // Iter all possible local contexts
     auto start_ts = getCurrentTimeInNano();
+    const int transport_hint_id = parseTransportHint(transport_hint);
     const int nic_hint_id = resolveNicHint(nic_hint);
     for (int retry = 0; retry < max_retry; ++retry) {
         auto batch_id = engine_->allocateBatchID(1);
@@ -1012,7 +1013,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
         entry.target_id = handle;
         entry.target_offset = peer_buffer_address;
         entry.advise_retry_cnt = retry;
-        entry.transport_hint = parseTransportHint(transport_hint);
+        entry.transport_hint = transport_hint_id;
         entry.nic_hint = nic_hint_id;
 
         Status s =
@@ -1383,6 +1384,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
         }
     }
 
+    const int transport_hint_id = parseTransportHint(transport_hint);
     auto batch_id = engine_->allocateBatchID(1);
     TransferRequest entry;
     entry.opcode = TransferRequest::WRITE;
@@ -1390,7 +1392,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     entry.source = (void*)buffer;
     entry.target_id = handle;
     entry.target_offset = peer_buffer_address;
-    entry.transport_hint = parseTransportHint(transport_hint);
+    entry.transport_hint = transport_hint_id;
     entry.nic_hint = resolveNicHint(nic_hint);
 
     Status s = engine_->submitTransfer(batch_id, {entry});

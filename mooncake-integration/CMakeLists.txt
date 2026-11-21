@@ -102,6 +102,37 @@ if(WITH_TE)
   endif()
 
   if(BUILD_UNIT_TESTS AND USE_TENT)
+    find_package(
+      Python3
+      COMPONENTS Development.Embed
+      REQUIRED)
+    add_executable(
+      transport_hint_batch_leak_test
+      tests/transport_hint_batch_leak_test.cpp
+      transfer_engine/transfer_engine_py.cpp
+      transfer_engine/shared_segment_py.cpp)
+    target_compile_definitions(transport_hint_batch_leak_test PRIVATE USE_TENT)
+    target_include_directories(transport_hint_batch_leak_test
+                               PRIVATE ${Python3_INCLUDE_DIRS})
+    target_link_libraries(
+      transport_hint_batch_leak_test
+      PRIVATE $<TARGET_OBJECTS:rpc_communicator>
+              transfer_engine
+              glog::glog
+              gflags::gflags
+              pybind11::headers
+              Python3::Python
+              gtest
+              gtest_main)
+    add_test(
+      NAME transport_hint_batch_leak_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env MC_USE_TENT=1 MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
+        "MC_TENT_CONF={\"transports\":{\"rdma\":{\"enable\":false},\"tcp\":{\"enable\":true},\"gds\":{\"enable\":false},\"shm\":{\"enable\":false}}}"
+        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>
+        $<TARGET_FILE:transport_hint_batch_leak_test>)
+    set_tests_properties(transport_hint_batch_leak_test PROPERTIES TIMEOUT 60)
+
     add_test(
       NAME tent_python_send_probe_test
       COMMAND
