@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <exception>
 #include <iomanip>
@@ -20,7 +21,8 @@ namespace mooncake {
 
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(2);
-    if (static_cast<int64_t>(bytes) == std::numeric_limits<int64_t>::max()) {
+    if (bytes == std::numeric_limits<uint64_t>::max() ||
+        bytes == static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
         oss << "infinite";
     } else if (bytes >= static_cast<uint64_t>(kTiB)) {
         oss << bytes / kTiB << " TB";
@@ -60,7 +62,7 @@ namespace mooncake {
     } catch (const std::exception&) {
         return std::nullopt;
     }
-    if (value < 0) {
+    if (value < 0 || !std::isfinite(value)) {
         return std::nullopt;
     }
     if (unit_offset >= value_string.length()) {
