@@ -653,7 +653,23 @@ class RealClient::OffloadRestoreLease {
     }
 
     bool LeaseExpired() const {
-        return !local_batch_ && ElapsedMs() >= response_.gc_ttl_ms;
+        if (local_batch_) {
+            return false;
+        }
+        // The owner starts the lease at grant, not at handler entry, so the
+        // handler->grant stretch it measured (pre_grant_ms) did not consume any
+        // of the lease even though our clock started before the request. Drop
+        // exactly that conservative lower bound from the age we hold against
+        // the TTL; the pre-send and post-receive gaps, both-side network
+        // transit, and the TE transfer still count. An absent field (0) or one
+        // larger than our measured total keeps the old unadjusted window rather
+        // than widening it past what the owner actually observed.
+        const uint64_t elapsed = ElapsedMs();
+        const uint64_t pre_grant =
+            response_.pre_grant_ms.has_value() ? *response_.pre_grant_ms : 0;
+        const uint64_t accounted =
+            pre_grant <= elapsed ? elapsed - pre_grant : elapsed;
+        return accounted >= response_.gc_ttl_ms;
     }
 
    private:
@@ -9573,7 +9589,13 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
     if (!inflight.ok()) {
         co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
-
+    // Stamp handler entry so we can report the handler->grant stretch to the
+    // reader. The lease starts only once BatchGet returns below, but the
+    // reader's own clock started before it sent the request, so without this
+    // the reader would hold a shorter window than the owner's lease actually
+    // allows. Measured on this process's monotonic clock and shipped as a
+    // lower bound; the reader subtracts it defensively.
+    const auto handler_entry = std::chrono::steady_clock::now();
     // Run SSD I/O on a dedicated thread pool so the coro_rpc IO thread is
     // free to handle ping and other RPCs. Same heap-owned state pattern as
     // batch_get_into_dummy_helper: the lambda captures only a raw pointer.
@@ -9595,10 +9617,15 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
                    << result.error();
         co_return tl::make_unexpected(result.error());
     }
-    co_return BatchGetOffloadObjectResponse(
+    BatchGetOffloadObjectResponse response(
         result.value().batch_id, std::move(result.value().pointers),
         client_->GetSegmentEndpoint(),
         file_storage_->config_.client_buffer_gc_ttl_ms);
+    response.pre_grant_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - handler_entry)
+            .count());
+    co_return response;
 }
 
 async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
@@ -9610,7 +9637,9 @@ RealClient::batch_get_offload_object_ranges(
     if (!inflight.ok()) {
         co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
-
+    // See batch_get_offload_object: report handler->grant so the reader can
+    // align its window to the owner's lease start.
+    const auto handler_entry = std::chrono::steady_clock::now();
     struct CallState {
         std::vector<std::string> keys;
         std::vector<int64_t> offsets;
@@ -9635,10 +9664,15 @@ RealClient::batch_get_offload_object_ranges(
                    << result.error();
         co_return tl::make_unexpected(result.error());
     }
-    co_return BatchGetOffloadObjectResponse(
+    BatchGetOffloadObjectResponse response(
         result.value().batch_id, std::move(result.value().pointers),
         client_->GetSegmentEndpoint(),
         file_storage_->config_.client_buffer_gc_ttl_ms);
+    response.pre_grant_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - handler_entry)
+            .count());
+    co_return response;
 }
 
 bool RealClient::release_offload_buffer(uint64_t batch_id) {

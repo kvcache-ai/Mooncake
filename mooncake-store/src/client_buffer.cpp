@@ -146,11 +146,37 @@ BufferHandle::BufferHandle(void* ptr, size_t size,
                            std::function<void()> release_fn)
     : view_ptr_(ptr), view_size_(size), release_fn_(std::move(release_fn)) {}
 
-BufferHandle::~BufferHandle() {
-    if (release_fn_) {
-        release_fn_();
+BufferHandle::~BufferHandle() { Release(); }
+
+BufferHandle& BufferHandle::operator=(BufferHandle&& other) noexcept {
+    if (this != &other) {
+        // Returning our own allocation frees capacity, so wake waiters after.
+        Release();
+        allocator_ = std::move(other.allocator_);
+        handle_ = std::move(other.handle_);
+        view_ptr_ = other.view_ptr_;
+        view_size_ = other.view_size_;
+        release_fn_ = std::move(other.release_fn_);
+        other.view_ptr_ = nullptr;
+        other.view_size_ = 0;
     }
-    // Otherwise OffsetAllocationHandle destructor handles deallocation
+    return *this;
+}
+
+void BufferHandle::Release() noexcept {
+    if (release_fn_) {
+        // View handle: dropping the alias does not return the underlying
+        // memory, so the owner signals when it actually frees.
+        release_fn_();
+        return;
+    }
+    // Free the allocation before signalling so a woken waiter sees the space.
+    // Assigning an empty handle runs OffsetAllocationHandle's move-assign,
+    // which deallocates the current region.
+    handle_ = offset_allocator::OffsetAllocationHandle();
+    if (allocator_) {
+        allocator_->NotifyReleased();
+    }
 }
 
 void* BufferHandle::ptr() const {

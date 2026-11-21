@@ -126,6 +126,15 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
 
+    // One shared signal backs the staging-arena wait/notify protocol. The
+    // default allocator and every handle it hands out hold it, so a release
+    // wakes waiters whether it comes from ReleaseBuffer, the lease GC, a
+    // rolled-back partial batch, or a handle going out of scope, with no
+    // back-reference to this FileStorage from the allocator.
+    client_buffer_release_signal_ =
+        std::make_shared<ClientBufferReleaseSignal>();
+    client_buffer_allocator_->SetReleaseSignal(client_buffer_release_signal_);
+
     if (config.pinned_restore_arena_size > 0) {
         if (config.use_uring) {
             LOG(WARNING) << "Pinned SSD restore is disabled with io_uring";
@@ -457,11 +466,13 @@ FileStorage::LoadRanges(const std::vector<std::string>& keys,
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGetOnce(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
-    auto lease_timeout =
-        start_time + std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
     auto load_result = LoadBatch(keys, sizes, false);
     if (!load_result) return tl::make_unexpected(load_result.error());
 
+    // Arena waits and disk I/O must not consume the consumer's lease.
+    auto lease_timeout =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
     auto allocated_batch = std::move(load_result.value());
     uint64_t batch_id = allocated_batch->batch_id;
     BatchGetResult batch_result{batch_id, allocated_batch->pointers};
@@ -632,12 +643,13 @@ FileStorage::BatchGetRanges(const std::vector<std::string>& keys,
                             const std::vector<int64_t>& offsets,
                             const std::vector<int64_t>& lengths,
                             const std::vector<int64_t>& object_sizes) {
-    const auto lease_timeout =
-        std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
     auto load_result = LoadRanges(keys, offsets, lengths, object_sizes, false);
     if (!load_result) return tl::make_unexpected(load_result.error());
 
+    // Ranged loads share the same lease-after-load contract as BatchGetOnce.
+    auto lease_timeout =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
     auto allocated_batch = std::move(load_result.value());
     uint64_t batch_id = allocated_batch->batch_id;
     BatchGetResult batch_result{batch_id, allocated_batch->pointers};
@@ -1817,19 +1829,21 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
                    << ", sizes=" << sizes.size();
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto result = std::make_shared<AllocatedBatch>();
-    result->batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
     static constexpr size_t kDirectIOAlignment = 4096;
 
-    u_int64_t total_size = 0;
-    bool gc_triggered = false;
+    // Compute each slice's allocation footprint so the whole batch can be
+    // admitted or rejected before any of it is held. Concurrent readers share
+    // this arena; a batch whose footprint cannot fit even an empty arena would
+    // otherwise wait out its deadline and then fail, so reject it up front.
+    std::vector<size_t> alloc_sizes;
+    alloc_sizes.reserve(sizes.size());
+    u_int64_t total_alloc_size = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (sizes[i] < 0 || sizes[i] > config_.local_buffer_size) {
             LOG(ERROR) << "Invalid size for key " << keys[i] << ": " << sizes[i]
                        << " (limit: " << config_.local_buffer_size << ")";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-
         size_t data_size = static_cast<size_t>(sizes[i]);
         size_t alloc_size = std::max<size_t>(data_size, 1);
         if (config_.use_uring) {
@@ -1838,54 +1852,147 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
             alloc_size = align_up(data_size, kDirectIOAlignment) +
                          2 * kDirectIOAlignment;
         }
+        alloc_sizes.push_back(alloc_size);
+        total_alloc_size += alloc_size;
+    }
 
-        auto alloc_result = allocator.allocate(alloc_size);
-        if (!alloc_result && !gc_triggered &&
-            &allocator == client_buffer_allocator_.get()) {
-            gc_triggered = true;
-            {
-                auto gc_now = std::chrono::steady_clock::now();
-                for (auto& shard : client_buffer_shards_) {
-                    MutexLocker locker(&shard.mutex);
-                    for (auto it = shard.batches.begin();
-                         it != shard.batches.end();) {
-                        if (gc_now >= it->second.lease_timeout) {
-                            it = shard.batches.erase(it);
-                        } else {
-                            ++it;
+    if (total_alloc_size > allocator.size()) {
+        LOG(ERROR) << "Batch allocation footprint " << total_alloc_size
+                   << " exceeds staging arena size " << allocator.size()
+                   << "; rejecting without waiting";
+        return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
+    }
+
+    const uint64_t batch_id =
+        next_batch_id_.fetch_add(1, std::memory_order_relaxed);
+    const bool waits_on_default =
+        (&allocator == client_buffer_allocator_.get());
+    // Only the default staging allocator is waited against; a pinned/one-off
+    // allocator has no shared signal and no release traffic to wait on.
+    std::shared_ptr<ClientBufferReleaseSignal> signal =
+        waits_on_default ? client_buffer_release_signal_ : nullptr;
+    // One monotonic deadline bounds the entire admission, not each slice.
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.client_buffer_alloc_wait_ms);
+    bool gc_triggered = false;
+
+    while (true) {
+        // Admit the whole batch or none of it. A partial batch that parked
+        // while holding slices would let two readers of the same arena hold
+        // each other's needed slices until they both time out, so on any
+        // shortfall every partial handle is released before the wait.
+        std::vector<BufferHandle> handles;
+        std::unordered_map<std::string, Slice> slices;
+        std::vector<uint64_t> pointers;
+        handles.reserve(keys.size());
+        pointers.reserve(keys.size());
+        u_int64_t total_size = 0;
+        bool complete = true;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            size_t alloc_size = alloc_sizes[i];
+            auto alloc_result = allocator.allocate(alloc_size);
+            if (!alloc_result && waits_on_default && !gc_triggered) {
+                // Reap batches whose lease already expired before parking on
+                // live holders. This is the only GC on the alloc fast path.
+                gc_triggered = true;
+                size_t reaped = 0;
+                {
+                    auto gc_now = std::chrono::steady_clock::now();
+                    for (auto& shard : client_buffer_shards_) {
+                        MutexLocker locker(&shard.mutex);
+                        for (auto it = shard.batches.begin();
+                             it != shard.batches.end();) {
+                            if (gc_now >= it->second.lease_timeout) {
+                                it = shard.batches.erase(it);
+                                ++reaped;
+                            } else {
+                                ++it;
+                            }
                         }
                     }
                 }
+                if (reaped > 0 && signal) {
+                    signal->NotifyReleased();
+                }
+                alloc_result = allocator.allocate(alloc_size);
             }
-            alloc_result = allocator.allocate(alloc_size);
+            if (!alloc_result) {
+                complete = false;
+                break;
+            }
+
+            void* data_ptr = alloc_result->ptr();
+            if (config_.use_uring) {
+                data_ptr = reinterpret_cast<void*>(
+                    (reinterpret_cast<uintptr_t>(data_ptr) +
+                     kDirectIOAlignment - 1) &
+                    ~(kDirectIOAlignment - 1));
+            }
+
+            size_t data_size = static_cast<size_t>(sizes[i]);
+            total_size += data_size;
+            slices.emplace(keys[i], Slice{data_ptr, data_size});
+            // pointers will be adjusted after BatchLoad (offset_in_buffer
+            // correction)
+            pointers.emplace_back(reinterpret_cast<uint64_t>(data_ptr));
+            handles.emplace_back(std::move(alloc_result.value()));
         }
-        if (!alloc_result) {
+
+        if (complete) {
+            auto result = std::make_shared<AllocatedBatch>();
+            result->batch_id = batch_id;
+            result->total_size = total_size;
+            result->slices = std::move(slices);
+            result->pointers = std::move(pointers);
+            result->handles = std::move(handles);
+            return result;
+        }
+
+        // Roll back the partial batch now. Releasing the handles frees the
+        // slices and, through the release signal, wakes other readers waiting
+        // on this arena; that must not be deferred to the wait below.
+        handles.clear();
+        slices.clear();
+        pointers.clear();
+
+        if (!waits_on_default || !signal ||
+            config_.client_buffer_alloc_wait_ms <= 0) {
             return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
         }
 
-        void* data_ptr = alloc_result->ptr();
-        if (config_.use_uring) {
-            data_ptr =
-                reinterpret_cast<void*>((reinterpret_cast<uintptr_t>(data_ptr) +
-                                         kDirectIOAlignment - 1) &
-                                        ~(kDirectIOAlignment - 1));
+        // Concurrent SSD restores legitimately share this arena, so a hard
+        // BUFFER_OVERFLOW on a transient shortfall is a spurious failure, not
+        // an overload signal. Wait for capacity to actually return instead,
+        // bounded by the single deadline for the whole batch. The generation
+        // snapshot is taken after the rollback so our own release does not
+        // re-wake us, and it is read under the signal lock so a release that
+        // lands between the failed attempt and this wait cannot be lost.
+        LOG(WARNING) << "Staging arena exhausted (" << config_.local_buffer_size
+                     << " bytes); waiting up to "
+                     << config_.client_buffer_alloc_wait_ms
+                     << "ms for in-flight read batches to release";
+        {
+            std::unique_lock<std::mutex> lk(signal->mu);
+            const uint64_t observed = signal->generation;
+            signal->cv.wait_until(
+                lk, deadline, [&] { return signal->generation != observed; });
         }
-
-        total_size += data_size;
-        result->slices.emplace(keys[i], Slice{data_ptr, data_size});
-        // pointers will be adjusted after BatchLoad (offset_in_buffer
-        // correction)
-        result->pointers.emplace_back(reinterpret_cast<uintptr_t>(data_ptr));
-        result->handles.emplace_back(std::move(alloc_result.value()));
+        if (std::chrono::steady_clock::now() >= deadline) {
+            LOG(WARNING) << "Staging allocation still pending after "
+                         << config_.client_buffer_alloc_wait_ms
+                         << "ms; giving up";
+            return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
+        }
+        LOG(INFO) << "Staging arena capacity returned; retrying whole batch";
     }
-    result->total_size = total_size;
-    return result;
 }
 
 void FileStorage::ClientBufferGCThreadFunc() {
     LOG(INFO) << "action=client_buffer_gc_thread_started";
     while (client_buffer_gc_running_) {
         {
+            size_t reaped = 0;
             auto now = std::chrono::steady_clock::now();
             for (auto& shard : client_buffer_shards_) {
                 MutexLocker locker(&shard.mutex);
@@ -1895,10 +2002,14 @@ void FileStorage::ClientBufferGCThreadFunc() {
                         VLOG(1) << "GC releasing batch_id: " << it->first
                                 << " (lease expired)";
                         it = shard.batches.erase(it);
+                        ++reaped;
                     } else {
                         ++it;
                     }
                 }
+            }
+            if (reaped > 0 && client_buffer_release_signal_) {
+                client_buffer_release_signal_->NotifyReleased();
             }
         }
         std::this_thread::sleep_for(
@@ -1916,16 +2027,26 @@ tl::expected<bool, ErrorCode> FileStorage::Exists(const std::string& key) {
 }
 
 bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
-    auto& shard = ShardFor(batch_id);
-    MutexLocker locker(&shard.mutex);
-    auto it = shard.batches.find(batch_id);
-    if (it != shard.batches.end()) {
-        // A singleflight waiter's id aliases its leader's batch, so several
-        // ids can map to one staging buffer; erasing this id drops one
-        // reference and the last one returns the memory to the pool.
-        VLOG(1) << "Releasing buffer for batch_id: " << batch_id
-                << " (transfer completed)";
-        shard.batches.erase(it);
+    bool released = false;
+    {
+        auto& shard = ShardFor(batch_id);
+        MutexLocker locker(&shard.mutex);
+        auto it = shard.batches.find(batch_id);
+        if (it != shard.batches.end()) {
+            // A singleflight waiter's id aliases its leader's batch, so several
+            // ids can map to one staging buffer; erasing this id drops one
+            // reference and the last one returns the memory to the pool.
+            VLOG(1) << "Releasing buffer for batch_id: " << batch_id
+                    << " (transfer completed)";
+            shard.batches.erase(it);
+            released = true;
+        }
+    }
+    if (released) {
+        // Wake readers waiting on staging-arena space in AllocateBatch.
+        if (client_buffer_release_signal_) {
+            client_buffer_release_signal_->NotifyReleased();
+        }
         return true;
     }
     VLOG(1) << "batch_id " << batch_id
