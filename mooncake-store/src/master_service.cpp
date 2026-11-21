@@ -965,7 +965,10 @@ MasterService::~MasterService() {
         std::lock_guard lock(weight_reconciliation_mutex_);
         weight_reconciliation_running_ = false;
     }
-    job_dispatch_running_ = false;
+    {
+        std::lock_guard<std::mutex> lock(job_dispatch_mutex_);
+        job_dispatch_running_.store(false);
+    }
     http_metadata_cleanup_running_ = false;
     // Resolve durability waits while every callback target is still alive,
     // before joining workers that may be waiting for an OpLog publication.
@@ -986,6 +989,7 @@ MasterService::~MasterService() {
     task_cleanup_cv_.notify_all();
     weight_reconciliation_cv_.notify_all();
     http_metadata_cleanup_cv_.notify_all();
+    job_dispatch_cv_.notify_all();
 
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
@@ -10655,14 +10659,21 @@ tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
-    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    auto write_access = task_manager_.get_write_access();
-    ErrorCode err = write_access.complete_task(client_id, request.id,
-                                               request.status, request.message);
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "task_id=" << request.id
-                   << ", error=complete_task_failed";
-        return tl::make_unexpected(err);
+    bool completed_drain_task = false;
+    {
+        std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+        auto write_access = task_manager_.get_write_access();
+        ErrorCode err =
+            write_access.complete_task(client_id, request.id, request.status,
+                                       request.message, &completed_drain_task);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "task_id=" << request.id
+                       << ", error=complete_task_failed";
+            return tl::make_unexpected(err);
+        }
+    }
+    if (completed_drain_task) {
+        NotifyJobDispatch();
     }
     return {};
 }
@@ -10986,6 +10997,8 @@ void MasterService::HandleDrainJobTimeout(
         if (lock) {
             ProcessDrainJobStop(*job);
             retry = !IsDrainJobTerminal(job->status);
+        } else {
+            NotifyJobDispatch();
         }
     }
     if (retry && job_dispatch_running_.load()) {
@@ -11467,18 +11480,52 @@ void MasterService::ProcessDrainJobs() {
     }
 }
 
+void MasterService::NotifyJobDispatch() {
+    {
+        std::lock_guard<std::mutex> lock(job_dispatch_mutex_);
+        job_dispatch_wake_requested_ = true;
+    }
+    job_dispatch_cv_.notify_one();
+}
+
 void MasterService::JobDispatchThreadFunc() {
-    while (job_dispatch_running_) {
+    while (job_dispatch_running_.load()) {
         // RFC #4700 slice 1: drain jobs mutate business metadata.
         if (!AdmitsBusinessWorkers()) {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(kJobDispatchThreadSleepMs));
+            std::unique_lock<std::mutex> lock(job_dispatch_mutex_);
+            job_dispatch_cv_.wait_for(
+                lock, std::chrono::milliseconds(kJobDispatchThreadSleepMs),
+                [&] { return !job_dispatch_running_.load(); });
             continue;
         }
 
+        {
+            std::lock_guard<std::mutex> lock(job_dispatch_mutex_);
+            job_dispatch_wake_requested_ = false;
+        }
+
+        const auto round_start = std::chrono::steady_clock::now();
         ProcessDrainJobs();
-        std::this_thread::sleep_for(
+        const auto round_end = std::chrono::steady_clock::now();
+
+        using SteadyDuration = std::chrono::steady_clock::duration;
+        const auto min_sleep = std::chrono::duration_cast<SteadyDuration>(
+            std::chrono::milliseconds(kMinJobDispatchIntervalMs));
+        const auto max_sleep = std::chrono::duration_cast<SteadyDuration>(
             std::chrono::milliseconds(kJobDispatchThreadSleepMs));
+        const auto cooldown =
+            std::clamp(round_end - round_start, min_sleep, max_sleep);
+
+        std::unique_lock<std::mutex> lock(job_dispatch_mutex_);
+        if (job_dispatch_cv_.wait_until(lock, round_end + cooldown, [&] {
+                return !job_dispatch_running_.load();
+            })) {
+            break;
+        }
+        job_dispatch_cv_.wait_until(lock, round_end + max_sleep, [&] {
+            return !job_dispatch_running_.load() ||
+                   job_dispatch_wake_requested_;
+        });
     }
 }
 

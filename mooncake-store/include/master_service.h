@@ -2204,6 +2204,7 @@ class MasterService {
         const std::string& source, const std::string& target,
         bool retained_by_drain);
     void ProcessDrainJobs();
+    void NotifyJobDispatch();
     void ProcessDrainJobStop(DrainJob& job);
     void HandleDrainJobTimeout(const std::weak_ptr<DrainJob>& job);
     void RefreshDrainJobTasks(DrainJob& job);
@@ -2218,10 +2219,16 @@ class MasterService {
                                  const std::string& key,
                                  const std::string& source_segment) const;
 
-    std::thread job_dispatch_thread_;
+    // Leaf lock synchronizing job_dispatch_thread_ wake-ups and shutdown.
+    std::mutex job_dispatch_mutex_;
+    std::condition_variable job_dispatch_cv_;
+    bool job_dispatch_wake_requested_{false};
     std::atomic<bool> job_dispatch_running_{false};
+    std::thread job_dispatch_thread_;
     DeadlineScheduler<std::weak_ptr<DrainJob>> drain_job_deadline_scheduler_;
     static constexpr uint64_t kJobDispatchThreadSleepMs = 500;
+    // Floor for post-round cooldown; slow scans back off by their own duration.
+    static constexpr uint64_t kMinJobDispatchIntervalMs = 10;
     std::mutex job_mutex_;
     std::map<UUID, std::shared_ptr<DrainJob>> drain_jobs_
         GUARDED_BY(job_mutex_);

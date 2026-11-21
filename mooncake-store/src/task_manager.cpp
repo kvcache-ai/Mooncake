@@ -232,7 +232,11 @@ std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
 ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
                                                const UUID& task_id,
                                                TaskStatus status,
-                                               const std::string& message) {
+                                               const std::string& message,
+                                               bool* completed_drain_task) {
+    if (completed_drain_task != nullptr) {
+        *completed_drain_task = false;
+    }
     if (!is_finished_status(status)) {
         LOG(ERROR) << "complete_task: invalid completion status=" << status
                    << ", task_id=" << task_id;
@@ -264,6 +268,9 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
         manager_->total_pending_tasks_--;
     }
     task.mark_complete(status, message);
+    if (completed_drain_task != nullptr && task.retained_by_drain) {
+        *completed_drain_task = true;
+    }
 
     auto ps_it = manager_->processing_tasks_.find(client_id);
     if (ps_it != manager_->processing_tasks_.end()) {
