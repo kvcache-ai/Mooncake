@@ -159,6 +159,17 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     [[nodiscard]]
     std::optional<OffsetAllocationHandle> allocate(size_t size);
 
+    enum class AllocationFailureReason {
+        kOther,
+        kNodeExhausted,
+        kNoFittingRegion,
+    };
+
+    // The failure reason is meaningful only when no handle is returned.
+    [[nodiscard]]
+    std::optional<OffsetAllocationHandle> allocate(
+        size_t size, AllocationFailureReason* failure_reason);
+
     // ===== Recovery helpers =====
 
     template <typename Func>

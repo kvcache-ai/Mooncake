@@ -571,6 +571,38 @@ TEST_F(OffsetAllocatorTest, AllocationFailure) {
     EXPECT_FALSE(handle.has_value());
 }
 
+TEST_F(OffsetAllocatorTest, ReportsNodeExhaustionAfterHintTightens) {
+    using FailureReason = OffsetAllocator::AllocationFailureReason;
+    auto allocator = OffsetAllocator::create(0, 1024, 2, 2);
+    auto live = allocator->allocate(128);
+    ASSERT_TRUE(live.has_value());
+    ASSERT_GE(allocator->getLargestFreeRegion(), 128);
+
+    FailureReason reason;
+    EXPECT_FALSE(allocator->allocate(128, &reason).has_value());
+    EXPECT_EQ(reason, FailureReason::kNodeExhausted);
+    ASSERT_EQ(allocator->getLargestFreeRegion(), 0);
+
+    EXPECT_FALSE(allocator->allocate(128, &reason).has_value());
+    EXPECT_EQ(reason, FailureReason::kNodeExhausted);
+}
+
+TEST_F(OffsetAllocatorTest, ReportsNoFittingRegionWithNodesAvailable) {
+    using FailureReason = OffsetAllocator::AllocationFailureReason;
+    auto allocator = OffsetAllocator::create(0, 1024, 8, 8);
+    auto live = allocator->allocate(768);
+    ASSERT_TRUE(live.has_value());
+    ASSERT_GE(allocator->getLargestFreeRegion(), 512);
+
+    FailureReason reason;
+    EXPECT_FALSE(allocator->allocate(512, &reason).has_value());
+    EXPECT_EQ(reason, FailureReason::kNoFittingRegion);
+    ASSERT_LT(allocator->getLargestFreeRegion(), 512);
+
+    EXPECT_FALSE(allocator->allocate(512, &reason).has_value());
+    EXPECT_EQ(reason, FailureReason::kNoFittingRegion);
+}
+
 TEST_F(OffsetAllocatorTest, FreeReturnsMergedRegionSize) {
     constexpr uint32 ALLOCATOR_SIZE = 1024;
     constexpr uint32 MAX_ALLOCS = 8;
