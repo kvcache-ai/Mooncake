@@ -11,6 +11,8 @@
 /mooncake-ep @UNIDY2002 @ympcMark @yuechen-sys
 /mooncake-integration/transfer_engine @ShangmingCai @alogfans
 /mooncake-integration/store @ykwd @stmatengss @zxpdemonio
+/monitoring @ykwd @stmatengss
+/mooncake-p2p-store @ykwd @stmatengss
 /mooncake-pg @UNIDY2002 @ympcMark @yuechen-sys
 /mooncake-reshard @ShangmingCai @stmatengss @Bo-Vincent @zxpdemonio
 /mooncake-store @ykwd @stmatengss @XucSh @YiXR @Aionw
