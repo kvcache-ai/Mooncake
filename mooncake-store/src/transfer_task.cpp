@@ -681,6 +681,43 @@ void NofWorkerPool::workerThread(int work_idx) {
 // Since memcpy is bound by memory bandwidth, we only need one worker thread.
 constexpr int kDefaultMemcpyWorkers = 1;
 
+namespace {
+
+// Per-pointer residency resolution costs one device query per call (e.g.
+// cudaPointerGetAttributes), and a GET batch walks only a few distinct
+// allocations: one staging buffer plus one or two caller segments. Cache the
+// answer for the 2 MiB-aligned base of each side so a whole batch resolves
+// with a handful of queries instead of two per operation.
+class PointerResidencyCache {
+   public:
+    const device::AcceleratorDevice* Resolve(
+        const device::RuntimeAccelerator& runtime, const void* ptr,
+        device::PointerInfo* info) {
+        const uintptr_t base =
+            reinterpret_cast<uintptr_t>(ptr) & ~kBaseMaskLowBits;
+        const size_t slot = (base >> 21) % kSlots;
+        if (bases_[slot] == base) {
+            *info = infos_[slot];
+            return devices_[slot];
+        }
+        auto* device = runtime.FindDeviceForPointer(ptr, info);
+        bases_[slot] = base;
+        infos_[slot] = *info;
+        devices_[slot] = device;
+        return device;
+    }
+
+   private:
+    static constexpr uintptr_t kBaseMaskLowBits = 2 * 1024 * 1024 - 1;
+    static constexpr size_t kSlots = 4;
+    uintptr_t bases_[kSlots] = {0, 0, 0, 0};
+    device::PointerInfo infos_[kSlots];
+    const device::AcceleratorDevice* devices_[kSlots] = {nullptr, nullptr,
+                                                         nullptr, nullptr};
+};
+
+}  // namespace
+
 MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
     VLOG(1) << "Creating MemcpyWorkerPool with " << kDefaultMemcpyWorkers
             << " workers";
@@ -753,13 +790,23 @@ void MemcpyWorkerPool::workerThread() {
                 bool ok = true;
                 auto runtime_accelerator =
                     device::GetAcceleratorRegistry().RuntimeAccelerators();
+                // With no accelerator devices registered every pointer is
+                // host memory; skip the per-op residency work entirely.
+                const bool has_accelerators =
+                    !runtime_accelerator.Devices().empty();
+                PointerResidencyCache src_cache;
+                PointerResidencyCache dst_cache;
                 for (const auto& op : task.operations) {
                     device::PointerInfo src_info;
                     device::PointerInfo dst_info;
-                    auto* src_device = runtime_accelerator.FindDeviceForPointer(
-                        op.src, &src_info);
-                    auto* dst_device = runtime_accelerator.FindDeviceForPointer(
-                        op.dest, &dst_info);
+                    const device::AcceleratorDevice* src_device = nullptr;
+                    const device::AcceleratorDevice* dst_device = nullptr;
+                    if (has_accelerators) {
+                        src_device = src_cache.Resolve(
+                            runtime_accelerator, op.src, &src_info);
+                        dst_device = dst_cache.Resolve(
+                            runtime_accelerator, op.dest, &dst_info);
+                    }
 
                     if (!src_device && !dst_device) {
                         std::memcpy(op.dest, op.src, op.size);
