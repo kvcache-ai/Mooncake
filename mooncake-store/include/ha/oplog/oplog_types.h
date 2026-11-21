@@ -24,6 +24,8 @@ enum class OpType : uint8_t {
     WEIGHT_LEASE_UPSERT = 10,
     WEIGHT_LEASE_DELETE = 11,
     OBJECT_STORAGE_MUTATION = 12,
+    NOF_SEGMENT_MOUNT = 13,
+    NOF_SEGMENT_UNMOUNT = 14,
     OP_TYPE_MAX,
 };
 
@@ -81,6 +83,24 @@ struct SegmentUpdateOp {
 
     YLT_REFL(SegmentUpdateOp, segment_name, transport_endpoint, capacity,
              is_memory_segment, file_path);
+};
+
+struct NoFSegmentMountOp {
+    UUID segment_id{0, 0};
+    UUID client_id{0, 0};
+    std::string segment_name;
+    std::string transport_endpoint;
+    uint64_t base{0};
+    uint64_t capacity{0};
+
+    YLT_REFL(NoFSegmentMountOp, segment_id, client_id, segment_name,
+             transport_endpoint, base, capacity);
+};
+
+struct NoFSegmentUnmountOp {
+    std::string transport_endpoint;
+
+    YLT_REFL(NoFSegmentUnmountOp, transport_endpoint);
 };
 
 struct OpLogEntry {

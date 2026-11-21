@@ -353,7 +353,8 @@ class WrappedMasterService {
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
-        const WeightMetadataSnapshot& weight_metadata = {});
+        const WeightMetadataSnapshot& weight_metadata = {},
+        const std::vector<NoFSegmentInfo>& nof_segments = {});
     // Copies objects out of the handoff; the caller keeps ownership.
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
         const BatchOpLogPromotionHandoff& handoff,
@@ -363,7 +364,8 @@ class WrappedMasterService {
         DurablePrefix applied_cursor,
         const std::vector<StandbySegmentInfo>& segments,
         ReplicaID max_replica_id,
-        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
+        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects,
+        const std::vector<NoFSegmentInfo>& nof_segments = {});
 
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,
