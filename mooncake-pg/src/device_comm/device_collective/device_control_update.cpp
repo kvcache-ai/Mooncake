@@ -36,32 +36,26 @@ PGResult<void> ControlUpdateBuilder::copyBytes(void* destination,
     return append(operation);
 }
 
-PGResult<void> ControlUpdateBuilder::fillBytes(void* destination, uint8_t value,
-                                               size_t count) {
+PGResult<void> ControlUpdateBuilder::fillPattern(void* destination,
+                                                 const void* value,
+                                                 size_t element_size,
+                                                 size_t count) {
     PG_VALIDATE_ARG(destination, "control update fill destination is null");
     PG_VALIDATE_ARG(count <= std::numeric_limits<uint32_t>::max(),
                     "control update fill is too large");
+    PG_VALIDATE_STATE(
+        element_size <= kDeviceControlUpdatePayloadBytes - update_.payload_size,
+        "device control update payload is too large");
+    const uint32_t payload_offset = update_.payload_size;
+    std::memcpy(update_.payload + payload_offset, value, element_size);
+    update_.payload_size = payload_offset + static_cast<uint32_t>(element_size);
     ControlUpdateOp operation;
-    operation.kind = ControlUpdateOpKind::FillBytes;
-    operation.payload.fill_bytes = ControlUpdateOp::FillBytes{
+    operation.kind = ControlUpdateOpKind::Fill;
+    operation.payload.fill = ControlUpdateOp::Fill{
         .destination = reinterpret_cast<uint64_t>(destination),
-        .value = value,
+        .element_size = static_cast<uint32_t>(element_size),
         .count = static_cast<uint32_t>(count),
-    };
-    return append(operation);
-}
-
-PGResult<void> ControlUpdateBuilder::fillU64(uint64_t* destination,
-                                             uint64_t value, size_t count) {
-    PG_VALIDATE_ARG(destination, "control update fill destination is null");
-    PG_VALIDATE_ARG(count <= std::numeric_limits<uint32_t>::max(),
-                    "control update fill is too large");
-    ControlUpdateOp operation;
-    operation.kind = ControlUpdateOpKind::FillU64;
-    operation.payload.fill_u64 = ControlUpdateOp::FillU64{
-        .destination = reinterpret_cast<uint64_t>(destination),
-        .value = value,
-        .count = static_cast<uint32_t>(count),
+        .payload_offset = payload_offset,
     };
     return append(operation);
 }

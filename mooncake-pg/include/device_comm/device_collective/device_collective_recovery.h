@@ -38,13 +38,13 @@ class DeviceCollectiveRecoveryWorker {
     friend class DeviceCollectiveRuntime;
 
     struct MailboxState;
-    // Called after the worker observes a new device failure. The callback must
-    // prepare and pin the control update that lets the last channel CTA exit.
-    using PrepareResumeCallback =
-        std::function<PGResult<void>(const CollectiveFailureReport&)>;
+    // Handles a complete device failure request. On success, the callback has
+    // published the pinned control update and replied to the request.
+    using HandleFailureCallback = std::function<PGResult<void>(
+        const ControlMailbox::RecoverySlot::ReceivedRequest&)>;
 
     PGResult<void> addMailbox(ControlMailbox* mailbox,
-                              PrepareResumeCallback prepare_resume);
+                              HandleFailureCallback handle_failure);
     void removeMailbox(ControlMailbox* mailbox) noexcept;
     void runLoop();
     void run() noexcept;

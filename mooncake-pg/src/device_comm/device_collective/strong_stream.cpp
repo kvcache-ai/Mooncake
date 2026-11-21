@@ -219,7 +219,7 @@ PGResult<void> StrongStream::release(const GpuCaptureInfo& capture) {
         // captured node must depend on. `frontier` above is a copy of the USER
         // stream's frontier, queried from capture.origin.
         //
-        // In enqueueAllReduce(), handoff_event_.record(user_stream) captures
+        // In runtime enqueue(), handoff_event_.record(user_stream) captures
         // that user frontier. order_stream.waitEvent(handoff_event_) then adds
         // those nodes to the ORDER stream's capture frontier. Its old nodes can
         // remain there: for a single kernel, the order frontier can contain

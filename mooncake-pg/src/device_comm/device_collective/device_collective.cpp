@@ -1,8 +1,8 @@
 #include "device_comm/device_collective/device_collective.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
-#include <limits>
 #include <new>
 #include <utility>
 
@@ -10,44 +10,16 @@
 
 #include "device_comm/device_utils/d2h_request_slot.h"
 #include "device_comm/device_utils/h2d_request_slot.h"
-#include "device_comm/device_collective/algorithms/ring/ring_all_reduce.h"
-#include "device_comm/device_collective/algorithms/oneshot/one_shot_all_reduce.h"
+#include "device_comm/device_collective/device_collective_dispatcher.h"
 #include "device_comm/device_collective/device_control_update.h"
 #include "device_comm/device_collective/device_collective_workspace.h"
-#include "device_comm/device_collective/protocols/simple/simple_resources.h"
-#include "device_comm/device_collective/protocols/ll/ll_resources.h"
 #include "device_comm/device_collective/strong_stream.h"
 #include "gpu_runtime.h"
 #include "pg_utils.h"
 
 namespace mooncake {
 
-// One committed View's binding and Plan images. Protocol progress lives on the
-// device. LL progress survives publication; its reset requires peer quiescence.
-struct DeviceCollectiveRuntime::Configuration {
-    uint64_t epoch = kInvalidViewEpoch;
-    SimpleBindings simple;
-    LLBindings ll;
-    RingAllReducePlan ring;
-    OneShotAllReducePlan one_shot;
-    std::array<int32_t, kMaxNumRanks> active_ranks{};
-};
-
 namespace {
-
-// Simple (3), LL bindings (1), two Plans, and the recovery mirror.
-static_assert(kMaxDeviceControlUpdateOperations >= 7);
-
-bool rangesOverlap(const void* left, const void* right, size_t size) {
-    if (size == 0 || left == right) return false;
-    const auto left_begin = reinterpret_cast<uintptr_t>(left);
-    const auto right_begin = reinterpret_cast<uintptr_t>(right);
-    if (size > std::numeric_limits<uintptr_t>::max() - left_begin ||
-        size > std::numeric_limits<uintptr_t>::max() - right_begin) {
-        return true;
-    }
-    return left_begin < right_begin + size && right_begin < left_begin + size;
-}
 
 struct GraphUsePayload {
     std::atomic<size_t>* live_uses = nullptr;
@@ -72,7 +44,6 @@ DeviceCollectiveRuntime::DeviceCollectiveRuntime(
       device_index_(device_index),
       self_rank_(self_rank),
       view_epoch_signals_(std::move(view_epoch_signals)),
-      configuration_(std::make_unique<Configuration>()),
       strong_stream_(strong_stream),
       active_ranks_mirror_(active_ranks_mirror),
       active_ranks_count_(max_group_size),
@@ -107,7 +78,6 @@ DeviceCollectiveRuntime::create(DeviceTransferService& transfer_service,
             transfer_service, workspace, device_index, self_rank,
             max_group_size, active_ranks_mirror, std::move(view_epoch_signals),
             strong_stream, std::move(handoff_event)));
-    ControlMailbox* device_control_mailbox = nullptr;
     {
         PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
         std::array<uint64_t, kMaxNumRanks> initial_view_epoch_signals;
@@ -116,49 +86,27 @@ DeviceCollectiveRuntime::create(DeviceTransferService& transfer_service,
                                initial_view_epoch_signals.data(),
                                runtime->view_epoch_signals_.size(),
                                cudaMemcpyHostToDevice));
-        PG_TRY_CUDA(
-            cudaMalloc(reinterpret_cast<void**>(&runtime->invocation_state_),
-                       sizeof(InvocationState)));
-        PG_TRY_CUDA(
-            cudaMemset(runtime->invocation_state_, 0, sizeof(InvocationState)));
-
-        PG_TRY_CUDA(
-            cudaHostAlloc(reinterpret_cast<void**>(&runtime->control_mailbox_),
-                          sizeof(ControlMailbox),
-                          cudaHostAllocMapped | cudaHostAllocPortable));
-        std::construct_at(runtime->control_mailbox_);
-
-        void* device_mailbox = nullptr;
-        PG_TRY_CUDA(cudaHostGetDevicePointer(&device_mailbox,
-                                             runtime->control_mailbox_, 0));
-        device_control_mailbox = static_cast<ControlMailbox*>(device_mailbox);
+        PG_TRY(runtime->device_group_view_,
+               GpuBuffer<DeviceGroupView>::fromHost(device_index,
+                                                    DeviceGroupView{}));
+        PG_TRY(runtime->invocation_state_,
+               GpuBuffer<InvocationState>::zeroed(device_index));
+        PG_TRY(runtime->control_mailbox_,
+               MappedHostBuffer<ControlMailbox>::create(device_index, 1,
+                                                        cudaHostAllocPortable));
     }
-    PG_TRY(runtime->simple_, SimpleResources::create(
-                                 transfer_service, self_rank, max_group_size));
-    PG_TRY(runtime->configuration_->simple,
-           runtime->simple_->bindGroupView(ResolvedGroupView{}));
     const CollectiveRuntimeBindings collective{
         .transfer_handle = transfer_service.deviceHandle(),
         .timeout_ticks = timeout_ticks,
+        .group_view = runtime->device_group_view_.get(),
         .view_epoch_signals =
             static_cast<const uint64_t*>(runtime->view_epoch_signals_.addr()),
-        .invocation_state = runtime->invocation_state_,
-        .control_mailbox = device_control_mailbox,
+        .invocation_state = runtime->invocation_state_.get(),
+        .control_mailbox = runtime->control_mailbox_.device(),
     };
-    PG_TRY(runtime->ring_all_reduce_,
-           RingAllReduceAlgorithm::create(device_index, collective, workspace,
-                                          *runtime->simple_));
-    const auto* p2p = transfer_service.findRoute<P2pRoute>();
-    if (max_group_size > 1 && p2p && !p2p->nativeAtomicPeerUuids().empty()) {
-        PG_TRY(runtime->ll_, LLResources::create(transfer_service, self_rank,
-                                                 max_group_size));
-        PG_TRY(runtime->configuration_->ll,
-               runtime->ll_->bindGroupView(ResolvedGroupView{}));
-        PG_TRY(
-            runtime->one_shot_all_reduce_,
-            OneShotAllReduceAlgorithm::create(transfer_service, max_group_size,
-                                              collective, *runtime->ll_));
-    }
+    PG_TRY(runtime->dispatcher_, DeviceCollectiveDispatcher::create(
+                                     transfer_service, workspace, device_index,
+                                     self_rank, max_group_size, collective));
     return runtime;
 }
 
@@ -173,34 +121,26 @@ DeviceCollectiveRuntime::~DeviceCollectiveRuntime() noexcept {
 }
 
 DeviceGroupEndpoint DeviceCollectiveRuntime::localEndpoint() const {
-    return DeviceGroupEndpoint{
+    DeviceGroupEndpoint endpoint{
         .view_epoch_signal = view_epoch_signals_.offset(),
         .view_epoch_signal_count = static_cast<uint32_t>(active_ranks_count_),
-        .simple = simple_->localEndpoint(),
-        .ll = ll_ ? std::optional{ll_->localEndpoint()} : std::nullopt,
-        .one_shot = one_shot_all_reduce_
-                        ? std::optional{one_shot_all_reduce_->localEndpoint()}
-                        : std::nullopt,
     };
+    dispatcher_->fillLocalEndpoint(endpoint);
+    return endpoint;
 }
 
-PGResult<void> DeviceCollectiveRuntime::useLocalOnly(uint64_t view_epoch) {
+PGResult<void> DeviceCollectiveRuntime::useLocalOnly(const GroupView& view) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (shutdown_complete_) return {};
     PG_VALIDATE_STATE(!shutdown_requested_,
                       "device collective runtime is shutting down");
-    PG_ASSERT(view_epoch != kInvalidViewEpoch,
-              "device collective View epoch uses the reserved invalid value");
-    if (configuration_->epoch == view_epoch) return {};
-
-    ResolvedGroupView view{
-        .epoch = view_epoch,
-        .self_active_index = 0,
-        .buffer_size = workspace_.buffer().size(),
-    };
-    view.participants.push_back(
-        ResolvedParticipant{.in_group_rank = self_rank_});
-    return installGroupView(view, one_shot_all_reduce_ != nullptr);
+    if (installed_view_epoch_ == view.epoch && installed_local_only_) return {};
+    PG_TRY(installGroupView(
+        ResolvedGroupView::localOnly(self_rank_, workspace_.buffer().size(),
+                                     view.collective_algorithm_choices)));
+    installed_view_epoch_ = view.epoch;
+    installed_local_only_ = true;
+    return {};
 }
 
 PGResult<void> DeviceCollectiveRuntime::applyGroupView(const GroupView& view) {
@@ -210,19 +150,12 @@ PGResult<void> DeviceCollectiveRuntime::applyGroupView(const GroupView& view) {
                       "device collective runtime is shutting down");
     PG_ASSERT(view.epoch != kInvalidViewEpoch,
               "device collective View epoch uses the reserved invalid value");
-    // A duplicate group view must not reset protocol progress again.
-    if (configuration_->epoch == view.epoch) return {};
-
-    // Allocate the choice snapshot before committing any data-plane state.
-    auto choices = view.all_reduce_algorithm_choices;
+    if (installed_view_epoch_ == view.epoch && !installed_local_only_)
+        return {};
     PG_TRY(auto collective_view, resolveGroupView(view));
-    const bool one_shot_selected = std::any_of(
-        view.all_reduce_algorithm_choices.begin(),
-        view.all_reduce_algorithm_choices.end(), [](const auto& choice) {
-            return choice.algorithm == DeviceAllReduceAlgorithm::OneShot;
-        });
-    PG_TRY(installGroupView(collective_view, one_shot_selected));
-    all_reduce_algorithm_choices_ = std::move(choices);
+    PG_TRY(installGroupView(collective_view));
+    installed_view_epoch_ = view.epoch;
+    installed_local_only_ = false;
     return {};
 }
 
@@ -230,10 +163,10 @@ PGResult<void> DeviceCollectiveRuntime::enableRecovery(
     DeviceCollectiveRecoveryWorker& worker, FailureRecoveryCallback callback) {
     std::lock_guard<std::mutex> lock(mutex_);
     failure_recovery_callback_ = std::move(callback);
-    auto added = worker.addMailbox(
-        control_mailbox_, [this](const CollectiveFailureReport& failure) {
-            return prepareFailureResume(failure);
-        });
+    auto added = worker.addMailbox(control_mailbox_.host(),
+                                   [this](const RecoveryRequest& request) {
+                                       return handleFailure(request);
+                                   });
     if (!added.has_value()) {
         failure_recovery_callback_ = {};
         return makePGError(std::move(added).error());
@@ -242,31 +175,13 @@ PGResult<void> DeviceCollectiveRuntime::enableRecovery(
     return {};
 }
 
-PGResult<void> DeviceCollectiveRuntime::enqueueAllReduce(
-    const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
-    ReduceOp op, cudaStream_t user_stream_handle, int32_t* failed_ranks_hint) {
+PGResult<void> DeviceCollectiveRuntime::enqueue(
+    const DeviceCollectiveRequest& request, cudaStream_t user_stream_handle) {
     std::unique_lock<std::mutex> enqueue_lock(mutex_);
 
-    const size_t buffer_size = count * elementSize(datatype);
-    PG_VALIDATE_ARG(
-        !rangesOverlap(send_buffer, recv_buffer, buffer_size),
-        "device AllReduce buffers must be identical or non-overlapping");
     PG_VALIDATE_STATE(!shutdown_requested_,
                       "device collective runtime is shutting down");
-    const bool use_one_shot = allReduceAlgorithm(buffer_size, datatype, op) ==
-                              DeviceAllReduceAlgorithm::OneShot;
-    PG_VALIDATE_STATE(
-        (use_one_shot ? configuration_->one_shot.status
-                      : configuration_->ring.status) == DevicePlanStatus::Ready,
-        "selected device AllReduce Plan is not ready");
-    const AllReduceRequest request{
-        .send_buffer = send_buffer,
-        .recv_buffer = recv_buffer,
-        .count = static_cast<uint64_t>(count),
-        .datatype = datatype,
-        .op = op,
-        .failed_ranks_hint = failed_ranks_hint,
-    };
+    PG_TRY(auto algorithm, dispatcher_->selectAlgorithm(request));
 
     auto user_stream = GpuStream::borrow(user_stream_handle, device_index_);
     PG_TRY(auto capture, user_stream.captureInfo());
@@ -278,13 +193,7 @@ PGResult<void> DeviceCollectiveRuntime::enqueueAllReduce(
         PG_TRY(handoff_event_.record(order_stream));
         PG_TRY(user_stream.waitEvent(handoff_event_));
 
-        PGResult<void> launched;
-        if (use_one_shot) {
-            launched =
-                one_shot_all_reduce_->enqueue(request, user_stream.get());
-        } else {
-            launched = ring_all_reduce_->enqueue(request, user_stream.get());
-        }
+        auto launched = algorithm->enqueue(request, user_stream.get());
 
         PG_TRY(handoff_event_.record(user_stream));
         PG_TRY(order_stream.waitEvent(handoff_event_));
@@ -326,16 +235,13 @@ PGResult<void> DeviceCollectiveRuntime::shutdown() {
         recovery_worker = std::exchange(recovery_worker_, nullptr);
     }
     if (recovery_worker) {
-        recovery_worker->removeMailbox(control_mailbox_);
+        recovery_worker->removeMailbox(control_mailbox_.host());
     }
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
         failure_recovery_callback_ = {};
-        ring_all_reduce_.reset();
-        one_shot_all_reduce_.reset();
-        simple_.reset();
-        ll_.reset();
+        dispatcher_.reset();
         releaseState();
         shutdown_complete_ = true;
     }
@@ -350,6 +256,7 @@ PGResult<ResolvedGroupView> DeviceCollectiveRuntime::resolveGroupView(
     ResolvedGroupView resolved{
         .epoch = view.epoch,
         .buffer_size = workspace_.buffer().size(),
+        .collective_algorithm_choices = view.collective_algorithm_choices,
     };
     resolved.participants.reserve(view.rank_order.size());
 
@@ -374,10 +281,9 @@ PGResult<ResolvedGroupView> DeviceCollectiveRuntime::resolveGroupView(
         });
     }
 
-    // An inactive local rank only needs its Plans invalidated and protocol
-    // state reset. Return before endpoint validation so a missing peer endpoint
-    // cannot prevent that update. Only active local ranks need the bindings
-    // below.
+    // An inactive local rank only needs its Plans invalidated. Return before
+    // endpoint validation so a missing peer endpoint cannot prevent that
+    // update. Only active local ranks need the bindings below.
     if (resolved.self_active_index < 0) return resolved;
 
     for (auto& peer : resolved.participants) {
@@ -392,7 +298,8 @@ PGResult<ResolvedGroupView> DeviceCollectiveRuntime::resolveGroupView(
                 endpoint.view_epoch_signal % alignof(uint64_t) == 0 &&
                 !addOverflows(endpoint.view_epoch_signal, signal_bytes),
             "Device collective peer View-epoch endpoint is invalid");
-        peer.endpoint = endpoint;
+        peer.protocols = endpoint.protocols;
+        peer.algorithms = endpoint.algorithms;
         PG_TRY(peer.workspace, workspace_.endpoint(peer.global_rank));
         // All participants use the same workspace prefix despite independent
         // DTS offsets and possibly different allocation capacities.
@@ -406,100 +313,80 @@ PGResult<ResolvedGroupView> DeviceCollectiveRuntime::resolveGroupView(
 }
 
 PGResult<void> DeviceCollectiveRuntime::installGroupView(
-    const ResolvedGroupView& view, bool require_one_shot_plan) {
-    Configuration next;
-    next.epoch = view.epoch;
-    PG_TRY(next.simple, simple_->bindGroupView(view));
-    PG_TRY(next.ring, ring_all_reduce_->buildPlan(view));
-    if (require_one_shot_plan && view.self_active_index >= 0) {
-        PG_VALIDATE_STATE(ll_ && one_shot_all_reduce_,
-                          "Selected one-shot resources are unavailable");
-        PG_TRY(next.ll, ll_->bindGroupView(view));
-        PG_TRY(next.one_shot, one_shot_all_reduce_->buildPlan(view));
-    } else if (ll_) {
-        PG_TRY(next.ll, ll_->bindGroupView(ResolvedGroupView{}));
-    }
-    for (const auto& peer : view.participants)
-        next.active_ranks[peer.in_group_rank] = 1;
-    PG_TRY(publishControlState(next, /* pinned = */ false,
-                               /* include_active_ranks_mirror = */ false));
-    return {};
-}
-
-PGResult<void> DeviceCollectiveRuntime::publishControlState(
-    const Configuration& configuration, bool pinned,
-    bool include_active_ranks_mirror) {
-    static_assert(sizeof(Configuration) <= kDeviceControlUpdatePayloadBytes);
+    const ResolvedGroupView& view) {
     ControlUpdateBuilder builder;
-    // The caller-owned mirror normally follows the direct cudaMemcpyAsync
-    // path. Parked recovery includes it in the same update because
-    // synchronizing a separate CUDA copy while the last channel CTA is waiting
-    // may deadlock recovery.
-    if (include_active_ranks_mirror && active_ranks_mirror_) {
-        PG_TRY(builder.copyBytes(
-            active_ranks_mirror_, configuration.active_ranks.data(),
-            active_ranks_count_ * sizeof(configuration.active_ranks.front())));
+    const auto group_view = view.asDeviceView();
+    PG_TRY(builder.copyBytes(device_group_view_.get(), &group_view,
+                             sizeof(group_view)));
+    PG_TRY(dispatcher_->installGroupView(view, builder));
+    // Save the mirror source for recovery control updates.
+    active_ranks_source_.fill(0);
+    for (const auto& peer : view.participants) {
+        active_ranks_source_[peer.in_group_rank] = 1;
     }
-
-    PG_TRY(simple_->appendUpdate(builder, configuration.simple));
-    if (ll_) PG_TRY(ll_->appendUpdate(builder, configuration.ll));
-    PG_TRY(ring_all_reduce_->appendPlanUpdate(builder, configuration.ring));
-    if (one_shot_all_reduce_) {
-        PG_TRY(one_shot_all_reduce_->appendPlanUpdate(builder,
-                                                      configuration.one_shot));
-    }
-    *configuration_ = configuration;
-    control_mailbox_->control_update_slot.publish(builder.controlUpdate(),
-                                                  pinned);
+    const auto handle = control_mailbox_.host()->control_update_slot.publish(
+        builder.controlUpdate());
+    published_view_update_ = PublishedViewUpdate{
+        .update = builder.controlUpdate(),
+        .handle = handle,
+    };
     return {};
 }
 
 bool DeviceCollectiveRuntime::hasPendingRecovery() const noexcept {
-    return control_mailbox_->recovery.hasPendingRequest();
+    return control_mailbox_.host()->recovery.hasPendingRequest();
 }
 
-PGResult<void> DeviceCollectiveRuntime::prepareFailureResume(
-    const CollectiveFailureReport& failure) {
+PGResult<void> DeviceCollectiveRuntime::handleFailure(
+    const RecoveryRequest& request) {
+    const auto& report = request.request;
+    const auto& failure = report.result;
     const auto failed_rank = failure.failed_rank;
-    if (failure.failed_hint_address != 0) {
-        auto* hint = reinterpret_cast<int32_t*>(failure.failed_hint_address);
+    if (report.failed_hint_address != 0) {
+        auto* hint = reinterpret_cast<int32_t*>(report.failed_hint_address);
         hint[failed_rank] = 1;
     }
 
-    auto recovery_result = failure_recovery_callback_(failed_rank);
-
-    std::lock_guard<std::mutex> lock(mutex_);
-    // On success, publish the host plans left by the callback together with
-    // each protocol's progress updates. The last channel CTA of the failed
-    // invocation is the only consumer of this pinned update.
-    //
-    // On failure, commit unavailable Plans with the pinned update so that CTA
-    // can exit without leaving stale Plans usable.
-    if (recovery_result.has_value()) {
-        PG_TRY(publishControlState(*configuration_, /* pinned = */ true,
-                                   /* include_active_ranks_mirror = */ true));
-    } else {
-        LOG(ERROR) << "device collective recovery callback failed; falling "
+    // The callback can install views through the agent executor, so it must
+    // run without mutex_.
+    const auto recovery_result = failure_recovery_callback_(failed_rank);
+    if (!recovery_result.has_value()) {
+        LOG(ERROR) << "device collective recovery failed; falling "
                       "back to Plan invalidation: "
                    << recovery_result.error().message;
-        auto invalid = *configuration_;
-        invalid.epoch = kInvalidViewEpoch;
-        invalid.ring = RingAllReducePlan{};
-        invalid.one_shot = OneShotAllReducePlan{};
-        PG_TRY(publishControlState(invalid, /* pinned = */ true,
-                                   /* include_active_ranks_mirror = */ true));
     }
-    return {};
-}
 
-DeviceAllReduceAlgorithm DeviceCollectiveRuntime::allReduceAlgorithm(
-    size_t bytes, DataType datatype, ReduceOp op) const noexcept {
-    if (isDeviceAllReduceCombinationSupported(datatype, op)) {
-        for (const auto& choice : all_reduce_algorithm_choices_) {
-            if (bytes <= choice.max_bytes) return choice.algorithm;
-        }
+    std::lock_guard<std::mutex> lock(mutex_);
+    ControlUpdateBuilder builder;
+    if (recovery_result.has_value() && published_view_update_ &&
+        !published_view_update_->handle.poll()) {
+        // The GPU waits for the recovery reply before claiming control
+        // updates. Append recovery work to this pending view update.
+        builder = ControlUpdateBuilder(published_view_update_->update);
+    } else {
+        // A failed callback or no new view (e.g. autoSyncOnFailure disabled)
+        // leaves the failed plans unavailable until another view is installed.
+        PG_TRY(dispatcher_->invalidatePlans(builder));
     }
-    return DeviceAllReduceAlgorithm::Ring;
+
+    // The caller-owned mirror normally follows the direct cudaMemcpyAsync
+    // path. Parked recovery includes it in the same update because
+    // synchronizing a separate CUDA copy while the last channel CTA is waiting
+    // may deadlock recovery.
+    if (active_ranks_mirror_) {
+        PG_TRY(builder.copyBytes(
+            active_ranks_mirror_, active_ranks_source_.data(),
+            active_ranks_count_ * sizeof(active_ranks_source_.front())));
+    }
+    // Publish and reply while holding the mutex so later view installations
+    // cannot interleave. Pinned keeps this update available until the waiting
+    // GPU applies it.
+    control_mailbox_.host()->control_update_slot.publish(
+        builder.controlUpdate(),
+        /* pinned = */ true);
+    published_view_update_.reset();
+    request.handle.reply({});
+    return {};
 }
 
 PGResult<void> DeviceCollectiveRuntime::attachGraphUse(
@@ -524,32 +411,9 @@ PGResult<void> DeviceCollectiveRuntime::attachGraphUse(
 }
 
 void DeviceCollectiveRuntime::releaseState() noexcept {
-    if (invocation_state_) {
-        auto device_guard = GpuDeviceGuard::create(device_index_);
-        if (!device_guard.has_value()) {
-            LOG(ERROR) << "Failed to select CUDA device while releasing "
-                          "device collective invocation state: "
-                       << device_guard.error().message;
-        } else {
-            const auto result = cudaFree(invocation_state_);
-            invocation_state_ = nullptr;
-            if (result != cudaSuccess) {
-                LOG(ERROR)
-                    << "Failed to free device collective invocation state: "
-                    << cudaGetErrorString(result);
-            }
-        }
-    }
-
-    if (control_mailbox_) {
-        std::destroy_at(control_mailbox_);
-        const auto result = cudaFreeHost(control_mailbox_);
-        if (result != cudaSuccess) {
-            LOG(ERROR) << "Failed to free device collective control mailbox: "
-                       << cudaGetErrorString(result);
-        }
-        control_mailbox_ = nullptr;
-    }
+    device_group_view_.reset();
+    invocation_state_.reset();
+    control_mailbox_.reset();
 }
 
 }  // namespace mooncake
