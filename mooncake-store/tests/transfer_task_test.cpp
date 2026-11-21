@@ -71,6 +71,36 @@ class TransferTaskTest : public ::testing::Test {
     }
 };
 
+TEST(TransferTaskStatusTest, TentTimeoutEndsTheWaitClassicTimeoutDoesNot) {
+    struct Case {
+        TransferStatusEnum status;
+        TransferTaskOutcome classic;
+        TransferTaskOutcome tent;
+    };
+    const Case cases[] = {
+        {TransferStatusEnum::WAITING, TransferTaskOutcome::RUNNING,
+         TransferTaskOutcome::RUNNING},
+        {TransferStatusEnum::PENDING, TransferTaskOutcome::RUNNING,
+         TransferTaskOutcome::RUNNING},
+        {TransferStatusEnum::COMPLETED, TransferTaskOutcome::SUCCEEDED,
+         TransferTaskOutcome::SUCCEEDED},
+        {TransferStatusEnum::FAILED, TransferTaskOutcome::FAILED,
+         TransferTaskOutcome::FAILED},
+        {TransferStatusEnum::CANCELED, TransferTaskOutcome::FAILED,
+         TransferTaskOutcome::FAILED},
+        {TransferStatusEnum::INVALID, TransferTaskOutcome::FAILED,
+         TransferTaskOutcome::FAILED},
+        {TransferStatusEnum::TIMEOUT, TransferTaskOutcome::RUNNING,
+         TransferTaskOutcome::FAILED},
+    };
+    for (const auto& c : cases) {
+        EXPECT_EQ(ClassifyTransferTaskStatus(c.status, false), c.classic)
+            << static_cast<int>(c.status);
+        EXPECT_EQ(ClassifyTransferTaskStatus(c.status, true), c.tent)
+            << static_cast<int>(c.status);
+    }
+}
+
 TEST(TransferIntentTest, UsesStableNamedValues) {
     EXPECT_EQ(static_cast<int>(TransferIntent::kUnspecified),
               transfer_intent_values::kUnspecified);
