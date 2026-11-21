@@ -91,6 +91,16 @@ struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::PutStartStrict> {
+    static constexpr const char* value = "PutStartStrict";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPutStartStrict> {
+    static constexpr const char* value = "BatchPutStartStrict";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PutStart> {
     static constexpr const char* value = "PutStart";
 };
@@ -842,9 +852,15 @@ MasterClient::PutStart(const std::string& key,
         total_slice_length += slice_length;
     }
 
-    auto result = invoke_rpc<&WrappedMasterService::PutStart,
-                             std::vector<Replica::Descriptor>>(
-        client_id_, key, total_slice_length, config, tenant_id_.value());
+    using Descriptors = std::vector<Replica::Descriptor>;
+    auto result =
+        config.allowed_memory_segments
+            ? invoke_rpc<&WrappedMasterService::PutStartStrict, Descriptors>(
+                  client_id_, key, total_slice_length, config,
+                  tenant_id_.value())
+            : invoke_rpc<&WrappedMasterService::PutStart, Descriptors>(
+                  client_id_, key, total_slice_length, config,
+                  tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -867,10 +883,17 @@ MasterClient::BatchPutStart(
         total_slice_lengths.emplace_back(total_slice_length);
     }
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
-                                   std::vector<Replica::Descriptor>>(
-        keys.size(), client_id_, keys, total_slice_lengths, config,
-        tenant_id_.value());
+    using Descriptors = std::vector<Replica::Descriptor>;
+    auto result =
+        config.allowed_memory_segments
+            ? invoke_batch_rpc<&WrappedMasterService::BatchPutStartStrict,
+                               Descriptors>(keys.size(), client_id_, keys,
+                                            total_slice_lengths, config,
+                                            tenant_id_.value())
+            : invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
+                               Descriptors>(keys.size(), client_id_, keys,
+                                            total_slice_lengths, config,
+                                            tenant_id_.value());
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -925,6 +948,9 @@ MasterClient::UpsertStart(const std::string& key,
                           const std::vector<size_t>& slice_lengths,
                           const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "MasterClient::UpsertStart");
+    if (config.allowed_memory_segments) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     timer.LogRequest("key=", key, ", slice_count=", slice_lengths.size());
 
     uint64_t total_slice_length = 0;
@@ -945,6 +971,9 @@ MasterClient::BatchUpsertStart(
     const std::vector<std::vector<uint64_t>>& slice_lengths,
     const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "MasterClient::BatchUpsertStart");
+    if (config.allowed_memory_segments) {
+        return {keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS)};
+    }
     timer.LogRequest("keys_count=", keys.size());
 
     std::vector<uint64_t> total_slice_lengths;

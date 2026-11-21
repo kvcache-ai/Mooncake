@@ -399,6 +399,57 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentInsufficientSpace) {
     EXPECT_EQ(mem_desc.buffer_descriptor.size_, small_slice);
 }
 
+TEST_P(AllocationStrategyParameterizedTest, StrictLogicalSegmentSnapshot) {
+    auto home = CreateTestAllocator("endpoint-A", 0);
+    auto other = CreateTestAllocator("endpoint-B", 0x10000000ULL);
+    AllocatorManager segments;
+    segments.addAllocator("home", home);
+    segments.addAllocator("other", other);
+    const std::vector<std::string> allowed{"home"};
+    auto restricted = segments.SnapshotForSegments(allowed);
+    std::vector<std::vector<Replica>> held;
+    for (size_t index = 0; index < 4; ++index) {
+        auto first = strategy_->Allocate(restricted, 15 * MiB, 1, allowed);
+        ASSERT_TRUE(first.has_value());
+        held.push_back(std::move(first.value()));
+    }
+    const auto home_usage = home->size();
+    const auto other_usage = other->size();
+    auto strict = strategy_->Allocate(restricted, 5 * MiB, 1, allowed);
+    ASSERT_FALSE(strict.has_value());
+    EXPECT_EQ(strict.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(home->size(), home_usage);
+    EXPECT_EQ(other->size(), other_usage);
+
+    auto soft = strategy_->Allocate(segments, 5 * MiB, 1, allowed);
+    ASSERT_TRUE(soft.has_value());
+    ASSERT_EQ(soft->size(), 1u);
+    EXPECT_EQ(soft->front()
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "endpoint-B");
+}
+
+TEST_F(AllocationStrategyTest, StrictSnapshotMatchesOnlyRegisteredNames) {
+    AllocatorManager segments;
+    auto home =
+        CreateBufferAllocator(BufferAllocatorType::OFFSET, "home",
+                              0x100000000ULL, 64 * MiB, "endpoint-A", "tcp");
+    ASSERT_TRUE(home.has_value());
+    segments.addAllocator("home", *home);
+    const std::unordered_map<std::string, UUID> owners{
+        {"home", generate_uuid()}, {"absent", generate_uuid()}};
+    auto selected =
+        segments.SnapshotForSegments({"absent", "home", "home"}, &owners);
+    EXPECT_EQ(selected.getNames(), std::vector<std::string>{"home"});
+    EXPECT_EQ(selected.GetOwnerClientId("home"), owners.at("home"));
+    EXPECT_FALSE(selected.GetOwnerClientId("absent").has_value());
+    EXPECT_TRUE(
+        segments.SnapshotForSegments({"endpoint-A"}).getNames().empty());
+    EXPECT_TRUE(segments.SnapshotForSegments({}).getNames().empty());
+}
+
 // Test allocation when all allocators are full
 TEST_P(AllocationStrategyParameterizedTest, AllAllocatorsFull) {
     auto allocator1 = CreateTestAllocator("segment1", 0);

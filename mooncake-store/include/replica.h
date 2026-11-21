@@ -139,6 +139,8 @@ struct ReplicateConfig {
         per_key_preferred_hca_names;
     // Per-key opaque residency affinity metadata.
     struct_pack::compatible<std::vector<std::string>, 4> residency_affinity_ids;
+    struct_pack::compatible<std::vector<std::string>, 5>
+        allowed_memory_segments;
 
     bool HasValidKeyHints(size_t key_count) const {
         return (!group_ids || group_ids->size() == key_count) &&

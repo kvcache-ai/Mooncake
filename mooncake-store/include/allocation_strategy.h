@@ -155,6 +155,28 @@ class AllocatorManager {
         return snapshot;
     }
 
+    AllocatorManager SnapshotForSegments(
+        const std::vector<std::string>& allowed_names,
+        const std::unordered_map<std::string, UUID>* owners = nullptr) const {
+        AllocatorManager snapshot;
+        for (const auto& name : allowed_names) {
+            const auto registrations = allocators_.find(name);
+            if (registrations == allocators_.end() ||
+                !snapshot.allocators_.try_emplace(name, registrations->second)
+                     .second) {
+                continue;
+            }
+            snapshot.names_.push_back(name);
+            if (owners) {
+                const auto owner = owners->find(name);
+                if (owner != owners->end()) {
+                    snapshot.owner_by_name_.insert(*owner);
+                }
+            }
+        }
+        return snapshot;
+    }
+
     [[nodiscard]] std::optional<UUID> GetOwnerClientId(
         const std::string& name) const {
         const auto owner = owner_by_name_.find(name);
