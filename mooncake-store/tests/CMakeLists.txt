@@ -630,6 +630,11 @@ add_ha_test(oplog_batch_standby_reader_test
 add_ha_test(batch_oplog_pruning_worker_test
             ha/oplog/batch_oplog_pruning_worker_test.cpp)
 add_ha_test(ordered_oplog_writer_test ha/oplog/ordered_oplog_writer_test.cpp)
+# Keep timeout gates available even when production file failpoints are off.
+target_sources(ordered_oplog_writer_test
+               PRIVATE ../src/ha/oplog/oplog_test_failpoint.cpp)
+target_compile_definitions(ordered_oplog_writer_test
+                           PRIVATE MOONCAKE_ENABLE_TEST_FAILPOINTS)
 if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
   target_compile_definitions(ha_metric_manager_test
                              PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)

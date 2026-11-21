@@ -10,17 +10,106 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <mutex>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <unistd.h>
 
 #include "ha_metric_manager.h"
 
 namespace mooncake::test {
 namespace {
+
+class TimeoutGate {
+   public:
+    explicit TimeoutGate(std::string failpoint = "durable_wait_before_timeout")
+        : failpoint_(std::move(failpoint)) {
+        char pattern[] = "/tmp/mooncake-durable-wait-XXXXXX";
+        const char* directory = mkdtemp(pattern);
+        if (!directory) throw std::runtime_error("cannot create timeout gate");
+        root_ = directory;
+        Save("MOONCAKE_TEST_FAILPOINT_DIR", previous_dir_);
+        Save("MOONCAKE_TEST_FAILPOINT_TIMEOUT_SEC", previous_timeout_);
+        try {
+            std::ofstream arm(Path(".arm"));
+            arm.put('\n');
+            if (!arm) throw std::runtime_error("cannot arm timeout gate");
+            // The outer CTest timeout handles failed tests; the gate must not
+            // publish a result while registration is delayed within its budget.
+            if (setenv("MOONCAKE_TEST_FAILPOINT_DIR", root_.c_str(), 1) != 0 ||
+                setenv("MOONCAKE_TEST_FAILPOINT_TIMEOUT_SEC", "3600", 1) != 0)
+                throw std::runtime_error("cannot enable timeout gate");
+        } catch (...) {
+            Close();
+            throw;
+        }
+    }
+    ~TimeoutGate() { Close(); }
+    bool WaitForHit() const {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!std::filesystem::exists(Path(".hit")) &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return std::filesystem::exists(Path(".hit"));
+    }
+    bool Release() {
+        if (released_) return true;
+        if (!WaitForHit()) return false;
+        std::ofstream release(Path(".release"));
+        release.put('\n');
+        if (!release) return false;
+        released_ = true;
+        return true;
+    }
+    void CancelOrRelease() {
+        if (released_) return;
+        if (!std::filesystem::remove(Path(".arm"))) {
+            const auto claim = Path(".claimed." + std::to_string(getpid()));
+            while (std::filesystem::exists(claim) &&
+                   !std::filesystem::exists(Path(".hit")))
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (std::filesystem::exists(Path(".hit"))) Release();
+        }
+        released_ = true;
+    }
+    void Close() {
+        if (root_.empty()) return;
+        CancelOrRelease();
+        Restore("MOONCAKE_TEST_FAILPOINT_DIR", previous_dir_);
+        Restore("MOONCAKE_TEST_FAILPOINT_TIMEOUT_SEC", previous_timeout_);
+        std::filesystem::remove_all(root_);
+        root_.clear();
+    }
+
+   private:
+    std::string Path(const std::string& suffix) const {
+        return root_ + "/" + failpoint_ + suffix;
+    }
+    static void Save(const char* name, std::optional<std::string>& value) {
+        if (const char* current = std::getenv(name)) value = current;
+    }
+    static void Restore(const char* name,
+                        const std::optional<std::string>& value) {
+        if (value)
+            setenv(name, value->c_str(), 1);
+        else
+            unsetenv(name);
+    }
+    std::string root_;
+    std::string failpoint_;
+    std::optional<std::string> previous_dir_, previous_timeout_;
+    bool released_{false};
+};
 
 class FakeBatchWriter {
    public:
@@ -181,7 +270,7 @@ async_simple::coro::Lazy<ErrorCode> AwaitOnExecutor(
     OrderedOpLogWriter& writer, uint64_t sequence,
     std::promise<std::thread::id>& registered,
     std::promise<std::thread::id>& resumed) {
-    auto future = writer.AwaitDurable(sequence);
+    auto future = writer.AwaitDurable(sequence, std::chrono::hours(1));
     registered.set_value(std::this_thread::get_id());
     auto error = co_await std::move(future);
     resumed.set_value(std::this_thread::get_id());
@@ -190,6 +279,8 @@ async_simple::coro::Lazy<ErrorCode> AwaitOnExecutor(
 
 class OrderedOpLogWriterAwaitTest : public ::testing::Test {
    protected:
+    void PauseTimeouts() { timeout_gate_ = std::make_unique<TimeoutGate>(); }
+    bool ResumeTimeouts() { return timeout_gate_->Release(); }
     void CreateWriter(OrderedOpLogWriterConfig config = {},
                       OrderedOpLogWriter::TerminalCallback callback = {}) {
         writer_ = std::make_unique<OrderedOpLogWriter>(
@@ -303,9 +394,11 @@ class OrderedOpLogWriterAwaitTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        if (timeout_gate_) timeout_gate_->CancelOrRelease();
         storage_.UnblockWrites();
         ReleaseCallback();
         if (writer_) writer_->Stop();
+        timeout_gate_.reset();
     }
 
     FakeBatchWriter storage_;
@@ -317,6 +410,7 @@ class OrderedOpLogWriterAwaitTest : public ::testing::Test {
     std::condition_variable callback_cv_;
     bool callback_entered_{false};
     bool callback_released_{false};
+    std::unique_ptr<TimeoutGate> timeout_gate_;
 };
 
 }  // namespace
@@ -330,6 +424,42 @@ TEST_F(OrderedOpLogWriterAwaitTest,
     writer_->Stop();
     ExpectReadyResult(Await(10), ErrorCode::OK);
     ExpectReadyResult(Await(11), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, TimedWaitDoesNotCancelOtherWaitersOrWrite) {
+    storage_.BlockWrites();
+    CreateWriter();
+    writer_->Start();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation);
+    auto pending = writer_->Commit(std::move(*reservation), MakeEntry(), {});
+    ASSERT_TRUE(pending);
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+    auto timed = writer_->AwaitDurable(pending->sequence_id(),
+                                       std::chrono::milliseconds(10));
+    auto untimed = writer_->AwaitDurable(pending->sequence_id());
+    ReenterFromContinuation(timed);
+    ExpectResult(timed, ErrorCode::PERSISTENT_FAIL);
+    EXPECT_FALSE(untimed.hasResult());
+    EXPECT_TRUE(writer_->IsAccepting());
+    storage_.UnblockWrites();
+    ExpectResult(untimed, ErrorCode::OK);
+    auto retry = writer_->AwaitDurable(pending->sequence_id(),
+                                       std::chrono::milliseconds::zero());
+    ExpectReadyResult(retry, ErrorCode::OK);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, StopDrainsTimedWaitersExactlyOnce) {
+    CreateWriter();
+    auto timed = writer_->AwaitDurable(1, std::chrono::hours(1));
+    std::atomic<int> completions{0};
+    auto completed = std::move(timed).thenValue([&](ErrorCode error) {
+        ++completions;
+        return error;
+    });
+    writer_->Stop();
+    ExpectResult(completed, ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(completions.load(), 1);
 }
 
 TEST_F(OrderedOpLogWriterAwaitTest, CommittedSequenceWaitsForStorageSuccess) {
@@ -1851,6 +1981,473 @@ TEST(OrderedOpLogWriterAdmissionTest, CommitBatchRejectsSlotMismatch) {
     auto next = writer.ReserveBatch(2);
     ASSERT_TRUE(next.has_value());
     writer.Abort(std::move(*next));
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, ZeroAndNegativeWaitsDoNotAffectAdmission) {
+    CreateWriter();
+    auto poll = writer_->AwaitDurable(1, std::chrono::milliseconds::zero());
+    ExpectReadyResult(poll, ErrorCode::PERSISTENT_FAIL);
+    auto invalid = writer_->AwaitDurable(1, std::chrono::milliseconds(-1));
+    ExpectReadyResult(invalid, ErrorCode::INVALID_PARAMS);
+    EXPECT_TRUE(writer_->IsAccepting());
+    auto covered = writer_->AwaitDurable(0, std::chrono::milliseconds::zero());
+    ExpectReadyResult(covered, ErrorCode::OK);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, VeryLargeTimeoutDoesNotOverflow) {
+    CreateWriter();
+    auto waiter = writer_->AwaitDurable(
+        1, std::chrono::milliseconds::max() - std::chrono::milliseconds(1));
+    // Let the same timer process a real deadline. An overflowing "huge" wait
+    // would have expired before this probe, rather than merely racing our poll.
+    auto probe = writer_->AwaitDurable(2, std::chrono::milliseconds(1));
+    ExpectResult(probe, ErrorCode::PERSISTENT_FAIL);
+    ExpectPending(waiter);
+    writer_->Stop();
+    ExpectResult(waiter, ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, TimedAndUntimedWaitsCompleteOnceOnSuccess) {
+    storage_.BlockWrites();
+    CreateWriter();
+    writer_->Start();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation);
+    auto pending = writer_->Commit(std::move(*reservation), MakeEntry(), {});
+    ASSERT_TRUE(pending);
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+    auto timed =
+        writer_->AwaitDurable(pending->sequence_id(), std::chrono::hours(1));
+    auto untimed = writer_->AwaitDurable(pending->sequence_id());
+    ReenterFromContinuation(timed);
+    storage_.UnblockWrites();
+    ExpectResult(timed, ErrorCode::OK);
+    ExpectResult(untimed, ErrorCode::OK);
+    writer_->Stop();
+}
+TEST_F(OrderedOpLogWriterAwaitTest, TimedContinuationCanStopWriter) {
+    CreateWriter();
+    PauseTimeouts();
+    auto timed = writer_->AwaitDurable(1, std::chrono::milliseconds(1));
+    ASSERT_TRUE(timeout_gate_->WaitForHit());
+    ASSERT_FALSE(timed.hasResult());
+    auto stopped = std::move(timed).thenValue([this](ErrorCode result) {
+        writer_->Stop();
+        return result;
+    });
+    ASSERT_TRUE(ResumeTimeouts());
+    ExpectResult(stopped, ErrorCode::PERSISTENT_FAIL);
+    writer_->Stop();
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest,
+       BlockedTimeoutContinuationDoesNotDelayAnotherWait) {
+    storage_.BlockWrites();
+    CreateWriter();
+    PauseTimeouts();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation);
+    auto pending = writer_->Commit(std::move(*reservation), MakeEntry(), {});
+    ASSERT_TRUE(pending);
+    writer_->Start();
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+
+    std::atomic<int> active{0};
+    std::vector<async_simple::Future<ErrorCode>> first;
+    for (int i = 0; i < 32; ++i) {
+        auto timed = writer_->AwaitDurable(pending->sequence_id(),
+                                           std::chrono::milliseconds(1));
+        if (i == 0) {
+            ASSERT_TRUE(timeout_gate_->WaitForHit());
+        }
+        ASSERT_FALSE(timed.hasResult());
+        first.push_back(std::move(timed).thenValue([&](ErrorCode error) {
+            ++active;
+            BlockCallback();
+            return error;
+        }));
+    }
+    ASSERT_TRUE(ResumeTimeouts());
+    ASSERT_TRUE(WaitForCallback());
+    auto second = writer_->AwaitDurable(pending->sequence_id(),
+                                        std::chrono::milliseconds(1));
+    ExpectResult(second, ErrorCode::PERSISTENT_FAIL);
+    EXPECT_LE(active.load(), 4);
+    ReleaseCallback();
+    for (auto& waiter : first) ExpectResult(waiter, ErrorCode::PERSISTENT_FAIL);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest,
+       TimeoutContinuationCanSynchronouslyWaitForAnotherTimeout) {
+    CreateWriter();
+    PauseTimeouts();
+    auto timed = writer_->AwaitDurable(1, std::chrono::milliseconds(1));
+    ASSERT_TRUE(timeout_gate_->WaitForHit());
+    ASSERT_FALSE(timed.hasResult());
+    auto first = std::move(timed).thenValue([this](ErrorCode error) {
+        EXPECT_EQ(error, ErrorCode::PERSISTENT_FAIL);
+        return writer_->AwaitDurable(1, std::chrono::milliseconds(1)).get();
+    });
+    ASSERT_TRUE(ResumeTimeouts());
+    ExpectResult(first, ErrorCode::PERSISTENT_FAIL);
+    // On failure, Stop releases the nested wait before joining the timer.
+    writer_->Stop();
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest,
+       StopDoesNotWaitForBlockedTimeoutContinuation) {
+    CreateWriter();
+    PauseTimeouts();
+    writer_->Start();
+    auto timed = writer_->AwaitDurable(1, std::chrono::milliseconds(1));
+    ASSERT_TRUE(timeout_gate_->WaitForHit());
+    ASSERT_FALSE(timed.hasResult());
+    auto first = std::move(timed).thenValue([this](ErrorCode error) {
+        BlockCallback();
+        return error;
+    });
+    ASSERT_TRUE(ResumeTimeouts());
+    ASSERT_TRUE(WaitForCallback());
+    std::promise<void> stopped;
+    auto completion = stopped.get_future();
+    std::thread stopping([&] {
+        writer_->Stop();
+        stopped.set_value();
+    });
+    const auto status = completion.wait_for(std::chrono::seconds(5));
+    ReleaseCallback();
+    stopping.join();
+    EXPECT_EQ(status, std::future_status::ready);
+    ExpectResult(first, ErrorCode::PERSISTENT_FAIL);
+}
+
+TEST(OrderedOpLogWriterTimeoutTest, ContinuationCanReleaseLastWriterOwner) {
+    for (bool start : {false, true}) {
+        SCOPED_TRACE(start ? "started writer" : "writer before Start");
+        TimeoutGate deadline_gate;
+        auto destroyed = std::make_shared<std::promise<void>>();
+        auto destruction = destroyed->get_future();
+        auto writer = std::shared_ptr<OrderedOpLogWriter>(
+            new OrderedOpLogWriter({},
+                                   [](const auto&, const auto&) {
+                                       return ErrorCode::PERSISTENT_FAIL;
+                                   }),
+            [destroyed](OrderedOpLogWriter* ptr) {
+                delete ptr;
+                destroyed->set_value();
+            });
+        if (start) {
+            auto reservation = writer->Reserve();
+            ASSERT_TRUE(reservation);
+            auto pending =
+                writer->Commit(std::move(*reservation), MakeEntry(), {});
+            ASSERT_TRUE(pending);
+            writer->Start();
+        }
+        auto timed = writer->AwaitDurable(1, std::chrono::milliseconds(1));
+        ASSERT_TRUE(deadline_gate.WaitForHit());
+        ASSERT_FALSE(timed.hasResult());
+        auto completed =
+            std::move(timed).thenValue([owner = writer](ErrorCode error) {
+                owner->LastError();
+                return error;
+            });
+        std::weak_ptr<OrderedOpLogWriter> owner = writer;
+        writer.reset();
+        ASSERT_TRUE(deadline_gate.Release());
+        // Returning from the continuation releases its last shared_ptr. Wait
+        // for deletion to finish, not just for the downstream result to wake.
+        ASSERT_EQ(destruction.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        EXPECT_TRUE(owner.expired());
+        EXPECT_EQ(std::move(completed).get(), ErrorCode::PERSISTENT_FAIL);
+    }
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, ShutdownContinuationCanReenterStop) {
+    CreateWriter();
+    auto waiter = writer_->AwaitDurable(1).thenValue([this](ErrorCode error) {
+        writer_->Stop();
+        return error;
+    });
+    writer_->Stop();
+    ExpectResult(waiter, ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, DurabilityCanOvertakeExtractedDeadline) {
+    storage_.BlockWrites();
+    CreateWriter();
+    PauseTimeouts();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation);
+    auto pending = writer_->Commit(std::move(*reservation), MakeEntry(), {});
+    ASSERT_TRUE(pending);
+    std::atomic<int> completions{0};
+    auto timed =
+        writer_
+            ->AwaitDurable(pending->sequence_id(), std::chrono::milliseconds(1))
+            .via(nullptr)
+            .thenValue([&](ErrorCode error) {
+                ++completions;
+                BlockCallback();
+                return error;
+            });
+    writer_->Start();
+    ASSERT_TRUE(timeout_gate_->WaitForHit());
+    storage_.UnblockWrites();
+    ASSERT_TRUE(WaitForCallback());
+    // The waiter has left the pending map, but is kept alive by the inline
+    // success continuation. The extracted timer must not use its old position.
+    ASSERT_TRUE(ResumeTimeouts());
+    auto probe = writer_->AwaitDurable(pending->sequence_id() + 1,
+                                       std::chrono::milliseconds(1));
+    ExpectResult(probe, ErrorCode::PERSISTENT_FAIL);
+    EXPECT_EQ(completions.load(), 1);
+    ReleaseCallback();
+    ExpectResult(timed, ErrorCode::OK);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, ReverseDeadlinesKeepOtherWaitersValid) {
+    CreateWriter();
+    auto untimed = writer_->AwaitDurable(1);
+    std::vector<async_simple::Future<ErrorCode>> timed;
+    for (int i = 16; i > 0; --i)
+        timed.push_back(writer_->AwaitDurable(1, std::chrono::milliseconds(i)));
+    for (auto& waiter : timed) ExpectResult(waiter, ErrorCode::PERSISTENT_FAIL);
+    ExpectPending(untimed);
+    writer_->Stop();
+    ExpectResult(untimed, ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, DurableContinuationCanRequestStop) {
+    storage_.BlockWrites();
+    CreateWriter();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation);
+    auto pending = writer_->Commit(std::move(*reservation), MakeEntry(), {});
+    ASSERT_TRUE(pending);
+    auto waiter = writer_->AwaitDurable(pending->sequence_id())
+                      .thenValue([this](ErrorCode error) {
+                          writer_->Stop();
+                          return error;
+                      });
+    auto later = writer_->AwaitDurable(pending->sequence_id() + 1);
+    writer_->Start();
+    storage_.UnblockWrites();
+    ExpectResult(waiter, ErrorCode::OK);
+    ExpectResult(later, ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    writer_->Stop();
+}
+
+TEST(OrderedOpLogWriterTimeoutTest, InlineContinuationCanRequestStop) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(
+        ([] {
+            TimeoutGate gate;
+            OrderedOpLogWriter writer(
+                {}, [](const auto&, const auto&) { return ErrorCode::OK; });
+            writer.Start();
+            auto timed = writer.AwaitDurable(1, std::chrono::milliseconds(1));
+            if (!gate.WaitForHit() || timed.hasResult()) std::_Exit(1);
+            auto stopped =
+                std::move(timed).via(nullptr).thenValue([&](ErrorCode error) {
+                    writer.Stop();
+                    return error;
+                });
+            if (!gate.Release()) std::_Exit(1);
+            try {
+                if (std::move(stopped).get() != ErrorCode::PERSISTENT_FAIL)
+                    std::_Exit(1);
+            } catch (...) {
+                std::_Exit(1);
+            }
+            writer.Stop();
+            gate.Close();
+            std::_Exit(0);
+        }()),
+        ::testing::ExitedWithCode(0), "");
+}
+
+TEST(OrderedOpLogWriterTimeoutTest, ConcurrentContinuationsCanStopWriter) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(
+        ([] {
+            TimeoutGate deadline_gate;
+            FakeBatchWriter storage;
+            storage.BlockWrites();
+            OrderedOpLogWriter writer(
+                {}, [&](const auto& batch, const auto& prefix) {
+                    return storage.Write(batch, prefix);
+                });
+            auto reservation = writer.Reserve();
+            auto pending =
+                writer.Commit(std::move(*reservation), MakeEntry(), {});
+            writer.Start();
+            std::promise<void> release;
+            auto gate = release.get_future().share();
+            std::atomic<int> entered{0}, finished{0};
+            auto stop = [&](ErrorCode error) {
+                ++entered;
+                gate.wait();
+                writer.Stop();
+                ++finished;
+                return error;
+            };
+            auto timed = writer.AwaitDurable(pending->sequence_id(),
+                                             std::chrono::milliseconds(1));
+            if (!deadline_gate.WaitForHit() || timed.hasResult()) std::_Exit(1);
+            auto first = std::move(timed).thenValue(stop);
+            auto second = writer
+                              .AwaitDurable(pending->sequence_id(),
+                                            std::chrono::milliseconds(1))
+                              .thenValue(stop);
+            if (!deadline_gate.Release()) std::_Exit(1);
+            auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (entered != 2 && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::yield();
+            release.set_value();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            storage.UnblockWrites();
+            while (finished != 2 && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::yield();
+            if (finished != 2) std::_Exit(1);
+            deadline_gate.Close();
+            std::_Exit(0);
+        }()),
+        ::testing::ExitedWithCode(0), "");
+}
+
+TEST(OrderedOpLogWriterTimeoutTest,
+     DispatchFailureFallbackDoesNotBlockLaterWaiters) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(
+        ([] {
+            TimeoutGate dispatch_gate("durable_wait_before_dispatch_failure");
+            OrderedOpLogWriter writer(
+                {}, [](const auto&, const auto&) { return ErrorCode::OK; });
+            std::promise<void> first_callback_entered_promise;
+            auto first_callback_entered =
+                first_callback_entered_promise.get_future();
+            std::promise<void> release_first_callback_promise;
+            auto release_first_callback =
+                release_first_callback_promise.get_future().share();
+            auto first = writer.AwaitDurable(1, std::chrono::milliseconds(10))
+                             .thenValue([&](ErrorCode error) {
+                                 first_callback_entered_promise.set_value();
+                                 release_first_callback.wait();
+                                 return error;
+                             });
+            std::promise<void> second_callback_entered_promise;
+            auto second_callback_entered =
+                second_callback_entered_promise.get_future();
+            auto second = writer.AwaitDurable(2, std::chrono::milliseconds(40))
+                              .thenValue([&](ErrorCode error) {
+                                  second_callback_entered_promise.set_value();
+                                  return error;
+                              });
+            if (!dispatch_gate.WaitForHit()) std::_Exit(1);
+            // Keep the first completion in executor dispatch while the later
+            // deadline expires and queues behind it.
+            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            if (!dispatch_gate.Release()) std::_Exit(1);
+            if (first_callback_entered.wait_for(std::chrono::seconds(5)) !=
+                std::future_status::ready)
+                std::_Exit(1);
+            if (second_callback_entered.wait_for(std::chrono::seconds(2)) !=
+                std::future_status::ready)
+                std::_Exit(1);
+
+            auto stopped =
+                std::async(std::launch::async, [&] { writer.Stop(); });
+            if (stopped.wait_for(std::chrono::seconds(2)) !=
+                std::future_status::ready)
+                std::_Exit(1);
+            if (std::move(second).get() != ErrorCode::PERSISTENT_FAIL)
+                std::_Exit(1);
+            release_first_callback_promise.set_value();
+            if (std::move(first).get() != ErrorCode::PERSISTENT_FAIL)
+                std::_Exit(1);
+            stopped.get();
+            dispatch_gate.Close();
+            std::_Exit(0);
+        }()),
+        ::testing::ExitedWithCode(0), "");
+}
+
+TEST(OrderedOpLogWriterTimeoutTest,
+     StopDrainsMixedWaitersWhileDispatchFallbackIsBlocked) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(
+        ([] {
+            for (bool start : {false, true}) {
+                TimeoutGate dispatch_gate(
+                    "durable_wait_before_dispatch_failure");
+                OrderedOpLogWriter writer(
+                    {}, [](const auto&, const auto&) { return ErrorCode::OK; });
+                if (start) writer.Start();
+                std::promise<void> callback_entered_promise;
+                auto callback_entered = callback_entered_promise.get_future();
+                std::promise<void> release_callback_promise;
+                auto release_callback =
+                    release_callback_promise.get_future().share();
+                std::atomic<int> callback_count{0};
+                // Stop triggers completion after every continuation is
+                // registered; these deadlines cannot race registration.
+                auto first = writer.AwaitDurable(1, std::chrono::hours(1))
+                                 .thenValue([&](ErrorCode error) {
+                                     ++callback_count;
+                                     callback_entered_promise.set_value();
+                                     release_callback.wait();
+                                     return error;
+                                 });
+                std::atomic<int> later_count{0};
+                auto later = writer.AwaitDurable(2, std::chrono::hours(1))
+                                 .thenValue([&](ErrorCode error) {
+                                     ++later_count;
+                                     return error;
+                                 });
+                auto untimed = writer.AwaitDurable(3);
+
+                auto stopped =
+                    std::async(std::launch::async, [&] { writer.Stop(); });
+                if (!dispatch_gate.WaitForHit() || !dispatch_gate.Release())
+                    std::_Exit(1);
+                if (callback_entered.wait_for(std::chrono::seconds(5)) !=
+                    std::future_status::ready)
+                    std::_Exit(1);
+                if (stopped.wait_for(std::chrono::seconds(5)) !=
+                    std::future_status::ready)
+                    std::_Exit(1);
+                stopped.get();
+
+                const auto deadline =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (!later.hasResult() &&
+                       std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::yield();
+                // A blocked fallback must not prevent either finite or
+                // unbounded waits from observing shutdown.
+                if (first.hasResult() || !later.hasResult() ||
+                    !untimed.hasResult())
+                    std::_Exit(1);
+                if (std::move(later).get() !=
+                        ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
+                    std::move(untimed).get() !=
+                        ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS)
+                    std::_Exit(1);
+                writer.Stop();
+                if (callback_count != 1 || later_count != 1) std::_Exit(1);
+
+                release_callback_promise.set_value();
+                if (std::move(first).get() !=
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS)
+                    std::_Exit(1);
+                dispatch_gate.Close();
+            }
+            std::_Exit(0);
+        }()),
+        ::testing::ExitedWithCode(0), "");
 }
 
 }  // namespace mooncake::test
