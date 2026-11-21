@@ -393,6 +393,26 @@ void MnnvlCompletionEventPool::release(int device,
     if (completed && capacity_ != 0) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto &events = idle_[device];
+#if CUDA_VERSION >= 12000
+        // Contexts can die after returning events (or while another context
+        // has events in flight). Reclaim stale slots only under capacity
+        // pressure, without switching contexts or touching invalid events.
+        if (events.size() >= capacity_) {
+            events.erase(
+                std::remove_if(
+                    events.begin(), events.end(),
+                    [](const MnnvlCompletionEvent &event) {
+                        unsigned long long id = 0;
+                        const auto error = cuCtxGetId(event.context, &id);
+                        // Other errors do not establish that the owner died.
+                        return error == CUDA_ERROR_INVALID_CONTEXT ||
+                               error == CUDA_ERROR_CONTEXT_IS_DESTROYED ||
+                               (error == CUDA_SUCCESS &&
+                                id != event.context_id);
+                    }),
+                events.end());
+        }
+#endif
         if (events.size() < capacity_) {
             events.push_back(completion);
             return;
@@ -402,6 +422,9 @@ void MnnvlCompletionEventPool::release(int device,
 }
 
 MnnvlCompletion::~MnnvlCompletion() {
+    // Default construction leaves both event and pool empty. Construction
+    // paths assign pool before acquiring or adopting an event, so a non-null
+    // event implies a non-null pool kept alive by shared ownership below.
     if (!event) return;
     MnnvlCompletionContextGuard guard(*this);
     // Only completed, error-free records can enter the idle pool. Pending
