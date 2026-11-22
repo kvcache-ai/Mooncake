@@ -819,13 +819,22 @@ std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
         }
         case BackendType::BUCKET: {
             config.storage_backend_type = mooncake::StorageBackendType::kBucket;
-            mooncake::BucketBackendConfig bucket_config;
-            bucket_config.bucket_size_limit = 256 * MB;
-            bucket_config.bucket_keys_limit = 500;
-            bucket_config.aligned_direct_write =
+            auto bucket_config =
+                mooncake::BucketBackendConfig::FromEnvironment();
+            if (!bucket_config) {
+                LOG(ERROR) << "Invalid bucket backend environment";
+                return nullptr;
+            }
+            // Keep eviction opt-in for the benchmark.
+            if (!std::getenv("MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY") &&
+                !std::getenv("MOONCAKE_BUCKET_EVICTION_POLICY")) {
+                bucket_config->eviction_policy =
+                    mooncake::BucketEvictionPolicy::NONE;
+            }
+            bucket_config->aligned_direct_write =
                 FLAGS_bucket_aligned_direct_write;
             return std::make_shared<mooncake::BucketStorageBackend>(
-                config, bucket_config);
+                config, bucket_config.value());
         }
         case BackendType::FILE_PER_KEY: {
             config.storage_backend_type =
@@ -844,16 +853,27 @@ std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
 // Utility Functions
 // ============================================================================
 
-void CleanupStoragePath(const std::string& path) {
-    if (fs::exists(path)) {
-        std::error_code ec;
-        fs::remove_all(path, ec);
-        if (ec) {
-            LOG(WARNING) << "Failed to cleanup " << path << ": "
-                         << ec.message();
-        }
+void CleanupStoragePath(const std::string& path, bool split_bucket_roots) {
+    const auto roots = split_bucket_roots
+                           ? mooncake::ResolveOffloadDiskPaths(path)
+                           : std::vector<std::string>{path};
+    // A bucket path list with an empty entry is rejected by Init().
+    if (split_bucket_roots &&
+        std::any_of(roots.begin(), roots.end(),
+                    [](const auto& root) { return root.empty(); })) {
+        return;
     }
-    fs::create_directories(path);
+    for (const auto& root : roots) {
+        if (fs::exists(root)) {
+            std::error_code ec;
+            fs::remove_all(root, ec);
+            if (ec) {
+                LOG(WARNING)
+                    << "Failed to cleanup " << root << ": " << ec.message();
+            }
+        }
+        fs::create_directories(root);
+    }
 }
 
 // Print system info (best effort)
@@ -999,7 +1019,7 @@ double BenchInit(BackendType type, const std::string& storage_path,
                  size_t capacity) {
     PrintHeader("INIT", type, 0, 0);
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(storage_path, type == BackendType::BUCKET);
 
     auto backend = CreateBackend(type, storage_path, capacity);
     if (!backend) {
@@ -1035,7 +1055,7 @@ void BenchBatchOffload(BackendType type, const std::string& storage_path,
                        BenchmarkStats& stats) {
     PrintHeader("BATCH_OFFLOAD", type, value_size, batch_size);
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(storage_path, type == BackendType::BUCKET);
 
     auto backend = CreateBackend(type, storage_path, capacity);
     if (!backend) {
@@ -1228,7 +1248,7 @@ void BenchBatchLoad(BackendType type, const std::string& storage_path,
                     BenchmarkStats& stats) {
     PrintHeader("BATCH_LOAD", type, value_size, batch_size);
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(storage_path, type == BackendType::BUCKET);
 
     auto backend = CreateBackend(type, storage_path, capacity);
     if (!backend) {
@@ -1423,7 +1443,7 @@ void BenchConcurrentLoad(BackendType type, const std::string& storage_path,
                          BenchmarkStats& stats) {
     PrintHeader("CONCURRENT_LOAD", type, value_size, batch_size, num_threads);
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(storage_path, type == BackendType::BUCKET);
 
     auto backend = CreateBackend(type, storage_path, capacity);
     if (!backend) {
@@ -1591,7 +1611,7 @@ void BenchIsExist(BackendType type, const std::string& storage_path,
                   BenchmarkStats& hit_stats, BenchmarkStats& miss_stats) {
     PrintHeader("IS_EXIST", type, 0, 0);
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(storage_path, type == BackendType::BUCKET);
 
     auto backend = CreateBackend(type, storage_path, capacity);
     if (!backend) {
@@ -1737,7 +1757,7 @@ void BenchMixedRW(BackendType type, const std::string& storage_path,
     std::cout << "  Reader threads: " << read_threads << "\n";
     std::cout << "  Writer threads: " << write_threads << "\n";
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(storage_path, type == BackendType::BUCKET);
 
     auto backend = CreateBackend(type, storage_path, capacity);
     if (!backend) {
@@ -1955,7 +1975,7 @@ void BenchChurn(BackendType type, const std::string& storage_path,
     PrintHeader("CHURN", type, value_size, batch_size);
     std::cout << "  Fill ratio: " << (fill_ratio * 100) << "%\n";
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(storage_path, type == BackendType::BUCKET);
 
     auto backend = CreateBackend(type, storage_path, capacity);
     if (!backend) {
@@ -2146,7 +2166,7 @@ void BenchRestart(BackendType type, const std::string& storage_path,
     PrintHeader("RESTART", type, value_size, 0);
     std::cout << "  Testing recovery with " << num_keys << " keys\n";
 
-    CleanupStoragePath(storage_path);
+    CleanupStoragePath(storage_path, type == BackendType::BUCKET);
 
     DataGenerator gen;
     KeySet keys;
@@ -2455,7 +2475,8 @@ int main(int argc, char** argv) {
 
     // Cleanup
     if (!FLAGS_skip_cleanup) {
-        CleanupStoragePath(storage_path);
+        CleanupStoragePath(storage_path,
+                           !FLAGS_run_all && FLAGS_backend == "bucket");
     }
 
     google::ShutdownGoogleLogging();

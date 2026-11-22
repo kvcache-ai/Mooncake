@@ -1624,6 +1624,7 @@ BucketStorageBackend::BucketStorageBackend(
         ResolveOffloadDiskPaths(file_storage_config_.storage_filepath);
     const auto& per_disk = bucket_backend_config_.max_total_size_per_disk;
     disks_.resize(disk_paths_.size());
+    disk_usage_cache_ = std::make_unique<DiskUsageCache[]>(disk_paths_.size());
     // Init() rejects a per-disk list of the wrong length; guard the indexing
     // here so construction itself stays safe.
     const bool use_per_disk = per_disk.size() == disks_.size();
@@ -2197,6 +2198,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
 #endif
         }
 
+        for (size_t i = 0; i < disk_paths_.size(); ++i) {
+            disk_usage_cache_[i].Invalidate();
+        }
+
         SharedMutexLocker lock(&mutex_);
         object_bucket_map_.clear();
         buckets_.clear();
@@ -2206,7 +2211,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             disk.pending_eviction_size = 0;
             disk.fifo_index.clear();
             disk.lru_index.clear();
-            disk.cached_disk_bytes = -1;
         }
         int64_t max_bucket_id = BucketIdGenerator::INIT_NEW_START_ID;
 
@@ -3502,17 +3506,22 @@ tl::expected<int, ErrorCode> BucketStorageBackend::SelectDiskForWrite(
     return tl::make_unexpected(ErrorCode::NO_AVAILABLE_DISK);
 }
 
-int64_t BucketStorageBackend::ActualDiskBytesUsedLocked(int disk_index) const {
+int64_t BucketStorageBackend::ActualDiskBytesUsed(int disk_index) const {
     namespace fs = std::filesystem;
-    auto& disk = disks_[disk_index];
+    auto& cache = disk_usage_cache_[disk_index];
     const std::string& disk_path = disk_paths_[disk_index];
-    auto now = std::chrono::steady_clock::now();
-    if (disk.cached_disk_bytes >= 0 &&
-        now - disk.cached_disk_bytes_at <
-            std::chrono::milliseconds(
-                bucket_backend_config_.disk_scan_cache_ms)) {
-        return disk.cached_disk_bytes;
+
+    // Held across the walk: serialises concurrent scans of this disk and
+    // guards the cached value. Only other probes of this disk wait for the
+    // walk. Readers can still acquire the metadata lock.
+    MutexLocker lock(&cache.mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (cache.bytes >= 0 &&
+        now - cache.taken_at < std::chrono::milliseconds(
+                                   bucket_backend_config_.disk_scan_cache_ms)) {
+        return cache.bytes;
     }
+
     int64_t total = 0;
     std::error_code ec;
     // Physical usage includes the whole subtree (du/kubelet accounting), even
@@ -3547,15 +3556,59 @@ int64_t BucketStorageBackend::ActualDiskBytesUsedLocked(int disk_index) const {
             total += static_cast<int64_t>(st.st_blocks) * 512;
         }
     }
-    disk.cached_disk_bytes = total;
-    disk.cached_disk_bytes_at = now;
+    cache.bytes = total;
+    cache.taken_at = now;
     return total;
+}
+
+DiskSpaceSnapshot BucketStorageBackend::SnapshotDiskSpace(
+    int disk_index) const {
+    namespace fs = std::filesystem;
+    DiskSpaceSnapshot snapshot;
+    std::error_code ec;
+    auto space_info = fs::space(disk_paths_[disk_index], ec);
+    if (!ec) {
+        snapshot.space_known = true;
+        snapshot.available = space_info.available;
+    } else {
+        LOG(WARNING) << "[Evict] Failed to get disk space info for "
+                     << disk_paths_[disk_index] << ": " << ec.message();
+    }
+    if (bucket_backend_config_.max_physical_bytes > 0) {
+        snapshot.physical_used = ActualDiskBytesUsed(disk_index);
+    }
+    return snapshot;
 }
 
 tl::expected<BucketStorageBackend::PendingEviction, ErrorCode>
 BucketStorageBackend::PrepareEviction(
     int64_t required_size, const std::vector<std::string>& write_keys,
     int disk_hint) {
+    const int disk_count = static_cast<int>(disk_paths_.size());
+    if (disk_hint >= disk_count) {
+        LOG(ERROR) << "PrepareEviction called with out-of-range disk hint "
+                   << disk_hint;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    const bool eviction_enabled =
+        bucket_backend_config_.eviction_policy != BucketEvictionPolicy::NONE;
+
+    // Probe free space and physical usage BEFORE taking mutex_. fs::space()
+    // is a system call and the physical-usage check may walk the whole
+    // offload directory; under the exclusive lock either one stalls every
+    // reader and writer of the backend for its whole duration. The disk is
+    // picked under the lock below, so without a hint every disk is probed:
+    // a statfs each, plus a scan-cache hit in the common case.
+    std::vector<DiskSpaceSnapshot> snapshots;
+    if (eviction_enabled) {
+        snapshots.resize(disk_count);
+        for (int i = 0; i < disk_count; ++i) {
+            if (disk_hint < 0 || i == disk_hint) {
+                snapshots[i] = SnapshotDiskSpace(i);
+            }
+        }
+    }
+
     PendingEviction result;
     SharedMutexLocker lock(&mutex_);
 
@@ -3565,11 +3618,6 @@ BucketStorageBackend::PrepareEviction(
     // cannot pick the same disk based on free space this call is about to
     // consume.
     int disk_index = disk_hint;
-    if (disk_index >= static_cast<int>(disks_.size())) {
-        LOG(ERROR) << "PrepareEviction called with out-of-range disk hint "
-                   << disk_hint;
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
     if (disk_index < 0) {
         auto disk_result = SelectDiskForWrite(required_size);
         if (!disk_result) {
@@ -3608,9 +3656,10 @@ BucketStorageBackend::PrepareEviction(
         }
     }
 
-    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
+    if (!eviction_enabled) {
         return result;
     }
+    const DiskSpaceSnapshot& space = snapshots[disk_index];
 
     // Check actual disk space once before the loop. PrepareEviction only
     // removes metadata -- files are deleted later in FinalizeEviction -- so
@@ -3623,30 +3672,22 @@ BucketStorageBackend::PrepareEviction(
     // meta_size, so this is a safe lower bound -- we will not under-evict.
     bool initial_disk_full = false;
     uint64_t deficit = 0;
-    {
-        namespace fs = std::filesystem;
-        std::error_code ec;
-        auto space_info = fs::space(disk_paths_[disk_index], ec);
-        if (!ec) {
-            uint64_t actual_available = space_info.available;
-            constexpr uint64_t kMinFreeSpace = 256 * kMB;
-            // Watermark eviction passes a synthetic required_size to drive
-            // quota-based cleanup. It is not a real incoming write, so it
-            // should not be counted as physical disk free-space demand.
-            uint64_t req_sz = (!result.write_keys.empty() && required_size > 0)
-                                  ? static_cast<uint64_t>(required_size)
-                                  : 0;
-            initial_disk_full = actual_available < req_sz + kMinFreeSpace;
-            if (initial_disk_full) {
-                deficit = req_sz + kMinFreeSpace - actual_available;
-                LOG(WARNING) << "[Evict] Actual disk space too low: available="
-                             << actual_available << ", required=" << req_sz
-                             << ", deficit=" << deficit
-                             << ". Will evict buckets to free space.";
-            }
-        } else {
-            LOG(WARNING) << "[Evict] Failed to get disk space info for "
-                         << disk_paths_[disk_index] << ": " << ec.message();
+    if (space.space_known) {
+        uint64_t actual_available = space.available;
+        constexpr uint64_t kMinFreeSpace = 256 * kMB;
+        // Watermark eviction passes a synthetic required_size to drive
+        // quota-based cleanup. It is not a real incoming write, so it
+        // should not be counted as physical disk free-space demand.
+        uint64_t req_sz = (!result.write_keys.empty() && required_size > 0)
+                              ? static_cast<uint64_t>(required_size)
+                              : 0;
+        initial_disk_full = actual_available < req_sz + kMinFreeSpace;
+        if (initial_disk_full) {
+            deficit = req_sz + kMinFreeSpace - actual_available;
+            LOG(WARNING) << "[Evict] Actual disk space too low: available="
+                         << actual_available << ", required=" << req_sz
+                         << ", deficit=" << deficit
+                         << ". Will evict buckets to free space.";
         }
     }
 
@@ -3663,14 +3704,12 @@ BucketStorageBackend::PrepareEviction(
         write_keys.empty() ? 0 : required_size;
 
     // Ground-truth physical usage of the offload directory (cached),
-    // snapshotted once. As buckets are selected for eviction their files get
-    // deleted in the later FinalizeEviction, so (physical_used_start -
-    // accumulated_freed_space) projects the physical bytes that will remain
-    // after this round.
+    // snapshotted once, before mutex_ was taken. As buckets are selected for
+    // eviction their files get deleted in the later FinalizeEviction, so
+    // (physical_used_start - accumulated_freed_space) projects the physical
+    // bytes that will remain after this round.
     const int64_t physical_used_start =
-        bucket_backend_config_.max_physical_bytes > 0
-            ? ActualDiskBytesUsedLocked(disk_index)
-            : 0;
+        bucket_backend_config_.max_physical_bytes > 0 ? space.physical_used : 0;
     // True when the projected physical usage after this round — real disk usage
     // minus what we free here, plus the incoming write — would still exceed the
     // physical cap. Shared by the in-loop "keep evicting" test and the
@@ -3953,11 +3992,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
                   << " cleanup_failed=" << cleanup_failed_count;
         // Files were just deleted; force the next physical-usage query to
         // rescan rather than return the now-stale (higher) cached value.
-        {
-            SharedMutexLocker lock(&mutex_);
-            for (const auto& [bucket_id, bucket_meta] : pending.buckets) {
-                disks_[bucket_meta->disk_index].cached_disk_bytes = -1;
-            }
+        for (const auto& [bucket_id, bucket_meta] : pending.buckets) {
+            disk_usage_cache_[bucket_meta->disk_index].Invalidate();
         }
     }
     if (cleanup_failed_count != 0) {

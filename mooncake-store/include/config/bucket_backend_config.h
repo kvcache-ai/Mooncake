@@ -59,7 +59,7 @@ struct BucketBackendConfig {
     // actually triggers pod eviction. Set it to the real quota minus headroom.
     int64_t max_physical_bytes = 0;
 
-    // How long ActualDiskBytesUsedLocked() caches its directory-scan result
+    // How long ActualDiskBytesUsed() caches its directory-scan result
     // (milliseconds). Bounds scan cost under a high offload rate; larger =
     // cheaper but a staler physical bound (disk may momentarily exceed the cap
     // by roughly one interval's worth of writes), smaller = tighter but scans

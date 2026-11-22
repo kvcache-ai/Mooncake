@@ -7565,6 +7565,71 @@ TEST_F(StorageBackendTest, AlignedDirectBucketBatchLoadWithUring) {
 }
 #endif
 
+// The physical-usage scan is cached outside the metadata lock. A cached
+// value is reused until FinalizeEviction invalidates it, after which the
+// next check re-measures the directory.
+TEST_F(StorageBackendTest, BucketPhysicalUsageCacheInvalidatedByEviction) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 10 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.max_physical_bytes = int64_t{1} << 40;  // never binding
+    bucket_config.disk_scan_cache_ms = 3600 * 1000;       // never expires
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    const auto write_file = [&](const std::string& name, size_t bytes) {
+        std::ofstream out(fs::path(data_path) / name, std::ios::binary);
+        ASSERT_TRUE(out.is_open());
+        // Incompressible, so st_blocks reflects the size on any file system.
+        std::string payload(bytes, '\0');
+        uint64_t state = 0x9E3779B97F4A7C15ull;
+        for (auto& c : payload) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            c = static_cast<char>(state);
+        }
+        out.write(payload.data(), static_cast<std::streamsize>(bytes));
+    };
+    constexpr size_t kProbeBytes = 1 << 20;
+    const int64_t before = storage_backend.ActualDiskBytesUsedForTest(0);
+    write_file("physical_usage_probe", kProbeBytes);
+    // Still the cached measurement: the probe file is not counted yet.
+    EXPECT_EQ(storage_backend.ActualDiskBytesUsedForTest(0), before);
+
+    std::string first_value(6 * 1024, 'A');
+    std::unordered_map<std::string, std::vector<Slice>> first_batch;
+    first_batch.emplace(
+        "first_key",
+        std::vector<Slice>{Slice{first_value.data(), first_value.size()}});
+    ASSERT_TRUE(storage_backend.BatchOffload(first_batch, NoopCompleteHandler())
+                    .has_value());
+    std::string second_value(6 * 1024, 'B');
+    std::unordered_map<std::string, std::vector<Slice>> second_batch;
+    second_batch.emplace(
+        "second_key",
+        std::vector<Slice>{Slice{second_value.data(), second_value.size()}});
+    std::vector<std::string> evicted;
+    ASSERT_TRUE(storage_backend
+                    .BatchOffload(second_batch, NoopCompleteHandler(),
+                                  [&](const std::vector<std::string>& keys)
+                                      -> tl::expected<void, ErrorCode> {
+                                      evicted = keys;
+                                      return {};
+                                  })
+                    .has_value());
+    ASSERT_EQ(evicted, std::vector<std::string>{"first_key"});
+
+    // FinalizeEviction deleted files and invalidated the cache: the next
+    // measurement is a fresh scan, which now sees the probe file.
+    EXPECT_GE(storage_backend.ActualDiskBytesUsedForTest(0),
+              before + static_cast<int64_t>(kProbeBytes));
+}
+
 TEST_F(StorageBackendTest, BucketIndexGrowthPreservesRollbackAndRecovery) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
