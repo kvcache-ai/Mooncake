@@ -2108,10 +2108,12 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
                 recovery_activate_after_ns_.load(std::memory_order_relaxed);
             const int cause =
                 context_disabling_event_.load(std::memory_order_relaxed);
-            // Repeated DOWN reports describe one outage. A port event also
-            // cannot turn a device/CQ failure into a recoverable port outage.
+            // A repeated DOWN may be a duplicate or follow a missed ACTIVE.
+            // Keep the outage start but require stability before recovery.
+            // Preserve any device/CQ failure that already owns recovery.
             if (cause != -1 &&
                 (cause != IBV_EVENT_PORT_ERR || previous_deadline == 0)) {
+                fast_recovery_until_ns_ = 0;
                 recovery_activate_after_ns_.store(0, std::memory_order_relaxed);
                 return false;
             }

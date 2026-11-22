@@ -1011,9 +1011,6 @@ TEST_F(WorkerPoolRailStateTest, IsolatedPortFlapRecoversButSecondFlapWaits) {
 
     WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ERR);
     auto &last_down = pool.*WorkerPoolTestPeer::last_port_down_ns;
-    const auto first_down = last_down;
-    WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ERR);
-    EXPECT_EQ(last_down, first_down);
     WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ACTIVE);
     WorkerPoolTestPeer::recoverContext(pool);
     ASSERT_TRUE(WorkerPoolTestPeer::contextActive(pool));
@@ -1054,6 +1051,22 @@ TEST_F(WorkerPoolRailStateTest, FiveSecondPortOutageIsInclusive) {
     EXPECT_EQ(std::invoke(delay, pool, five_seconds_after_down), 0u);
     EXPECT_EQ(std::invoke(delay, pool, five_seconds_after_down + 1),
               30000000000ull);
+}
+
+TEST_F(WorkerPoolRailStateTest, RepeatedPortErrorWithoutActiveRequiresDelay) {
+    auto &pool = *worker_pool_;
+    WorkerPoolTestPeer::setContextActive(pool, true);
+    WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ERR);
+    const auto &last_down = pool.*WorkerPoolTestPeer::last_port_down_ns;
+    const auto first_down = last_down;
+    const auto delay = WorkerPoolTestPeer::port_recovery_delay_ns;
+    const auto recovery_at = first_down + 1000000000ull;
+    ASSERT_EQ(std::invoke(delay, pool, recovery_at), 0u);
+
+    // The monitor saw neither PORT_ACTIVE nor a poll between these reports.
+    WorkerPoolTestPeer::contextEvent(pool, IBV_EVENT_PORT_ERR);
+    EXPECT_EQ(last_down, first_down);
+    EXPECT_EQ(std::invoke(delay, pool, recovery_at), 30000000000ull);
 }
 
 TEST_F(WorkerPoolRailStateTest, PortMustStillBeActiveAtRecoveryProbe) {
