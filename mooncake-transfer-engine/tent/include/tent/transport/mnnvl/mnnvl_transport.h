@@ -105,6 +105,8 @@ class MnnvlTransport : public Transport {
 
     virtual const char *getName() const { return "mnnvl"; }
 
+    virtual bool supportsProducerEvent() const { return true; }
+
     bool strictFabricEgm() const {
         return installed_ && egm_enabled_ && egm_strict_ &&
                handle_type_ == CU_MEM_HANDLE_TYPE_FABRIC;

@@ -73,10 +73,15 @@ bool GetUInt64Field(const Json::Value& root, const char* field, uint64_t* out,
     return true;
 }
 
-Json::Value BatchRecordToJson(const OpLogBatchRecord& batch,
-                              bool include_checksum) {
+uint32_t ComputeJsonChecksum(const Json::Value& value) {
+    const std::string stable_payload = WriteJson(value);
+    return static_cast<uint32_t>(
+        XXH32(stable_payload.data(), stable_payload.size(), 0));
+}
+
+Json::Value BatchRecordToJson(const OpLogBatchRecord& batch) {
     Json::Value root(Json::arrayValue);
-    root.append(static_cast<Json::UInt>(batch.schema_version));
+    root.append(static_cast<Json::UInt>(kOpLogBatchRecordSchemaVersion));
     root.append(static_cast<Json::UInt64>(batch.batch_id));
     root.append(static_cast<Json::UInt64>(batch.first_seq));
     root.append(static_cast<Json::UInt64>(batch.last_seq));
@@ -90,21 +95,9 @@ Json::Value BatchRecordToJson(const OpLogBatchRecord& batch,
         entries.append(entry_root);
     }
     root.append(std::move(entries));
-    if (include_checksum) {
-        root.append(static_cast<Json::UInt>(batch.checksum));
-    }
+    // Hash the five-field array before appending its checksum.
+    root.append(ComputeJsonChecksum(root));
     return root;
-}
-
-uint32_t ComputeJsonChecksum(const Json::Value& value) {
-    const std::string stable_payload = WriteJson(value);
-    return static_cast<uint32_t>(
-        XXH32(stable_payload.data(), stable_payload.size(), 0));
-}
-
-uint32_t ComputeBatchChecksum(const OpLogBatchRecord& batch) {
-    return ComputeJsonChecksum(
-        BatchRecordToJson(batch, /*include_checksum=*/false));
 }
 
 bool JsonEntryToOpLogEntry(const Json::Value& root, uint64_t sequence_id,
@@ -194,10 +187,7 @@ bool DecodeDurablePrefix(const std::string& value, DurablePrefix* prefix,
 }
 
 std::string EncodeOpLogBatchRecord(const OpLogBatchRecord& batch) {
-    OpLogBatchRecord encoded = batch;
-    encoded.schema_version = kOpLogBatchRecordSchemaVersion;
-    encoded.checksum = ComputeBatchChecksum(encoded);
-    return WriteJson(BatchRecordToJson(encoded, /*include_checksum=*/true));
+    return WriteJson(BatchRecordToJson(batch));
 }
 
 bool DecodeOpLogBatchRecord(const std::string& value, OpLogBatchRecord* batch,
