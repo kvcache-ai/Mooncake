@@ -405,6 +405,10 @@ jobs:
         deactivate
       shell: bash
 
+    - name: Test installed Engram control plane without GPU or RDMA
+      run: test_env/bin/python -m pytest -q scripts/test_engram_control.py
+      shell: bash
+
     - name: Run tensor snapshot regressions
       timeout-minutes: 30
       env:

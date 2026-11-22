@@ -40,6 +40,40 @@ intel_runtime_library_path() {
         END { if (dirs) print dirs }'
 }
 
+cmake_option_enabled() {
+    local option_name="$1"
+    local option_value
+    local option_cache="${2:-${CMAKE_CACHE:-}}"
+    option_value=$(sed -n "s/^${option_name}:[^=]*=//p" "$option_cache" | tail -n 1)
+    # Match CMake's case-insensitive false constants; NOTFOUND suffix matching is case-sensitive.
+    case "${option_value^^}" in
+        ""|0|OFF|NO|FALSE|N|IGNORE) return 1 ;;
+    esac
+    [[ "$option_value" != NOTFOUND && "$option_value" != *-NOTFOUND ]]
+}
+
+# Stage the same Engram sources used by CMake, including runtime JIT inputs.
+stage_engram_backend() {
+    local source_root="$1"
+    local build_root="$2"
+    local package_root="$3"
+    local engram_source="${source_root}/mooncake-store/src/engram"
+    rm -rf "${package_root}/_engram"
+    rm -f "${package_root}"/_engram_cuda.*.so
+    mkdir -p "${package_root}/_engram"
+    cp "${engram_source}/__init__.py" "${package_root}/_engram/"
+    cp -R "${engram_source}/remote" "${package_root}/_engram/remote"
+    if cmake_option_enabled WITH_STORE "${build_root}/CMakeCache.txt" &&
+       cmake_option_enabled USE_CUDA "${build_root}/CMakeCache.txt"; then
+        local cuda_extensions=("${build_root}/mooncake-store/src/engram/local"/_engram_cuda.*.so)
+        if [ "${#cuda_extensions[@]}" -ne 1 ] || [ ! -f "${cuda_extensions[0]}" ]; then
+            echo "Error: expected one Engram CUDA extension; build the _engram_cuda target first" >&2
+            return 1
+        fi
+        cp "${cuda_extensions[0]}" "${package_root}/"
+    fi
+}
+
 # Sourcing exposes the helpers above without starting a wheel build.
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then
     return 0
@@ -70,17 +104,6 @@ if [ ! -f "$CMAKE_CACHE" ]; then
     echo "Error: CMake cache not found at ${CMAKE_CACHE}; configure the build before packaging"
     exit 1
 fi
-
-cmake_option_enabled() {
-    local option_name="$1"
-    local option_value
-    option_value=$(sed -n "s/^${option_name}:[^=]*=//p" "$CMAKE_CACHE" | tail -n 1)
-    # Match CMake's case-insensitive false constants; NOTFOUND suffix matching is case-sensitive.
-    case "${option_value^^}" in
-        ""|0|OFF|NO|FALSE|N|IGNORE) return 1 ;;
-    esac
-    [[ "$option_value" != NOTFOUND && "$option_value" != *-NOTFOUND ]]
-}
 
 if ! grep -q '^WITH_EP:' "$CMAKE_CACHE"; then
     echo "Error: WITH_EP is missing from ${CMAKE_CACHE}; configure with the current CMake files"
@@ -308,6 +331,81 @@ cp "${BUILD_DIR_ABS}/mooncake-common/libasio.so" "$CONDUCTOR_SMOKE_DIR/"
 # Kernel header tree the CUDA EP JIT compiles against at runtime.
 CUDA_EP_JIT_DIR="${BUILD_DIR_ABS}/mooncake_ep_jit"
 
+echo "Building wheel package..."
+# Stage migrated root Python modules and the legacy Reshard package for the
+# combined-wheel builder. Each tracked source remains in its authoritative tree.
+MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
+MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
+STORE_FACADE_SOURCE_DIR="python/mooncake/store"
+STORE_FACADE_STAGING_DIR="${MIGRATED_PYTHON_STAGING_DIR}/store"
+MIGRATED_PYTHON_INIT_BACKUP=""
+MIGRATED_PYTHON_MODULES=(
+    __init__.py
+    py.typed
+    engine.pyi
+    engram.py
+    structured_object_store.py
+    _structured_ranges.py
+    _fast_copy.c
+    http_metadata_server.py
+    _launcher.py
+    cli.py
+    cli_bench.py
+    cli_client.py
+    conductor.py
+    transfer_engine_topology_dump.py
+    buffer_pool.py
+    mooncake_config.py
+    ep.py
+    mooncake_ep_buffer.py
+    mooncake_ep_tcpstore.py
+    mooncake_elastic_buffer.py
+    _administration.py
+    mooncake_ssd_register.py
+    mooncake_ssd_unregister.py
+    spdk_tgt_create.py
+)
+RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
+RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
+PG_MODULE_SOURCE="${BUILD_ROOT}/mooncake-wheel/mooncake/pg.py"
+PG_MODULE_BACKUP=""
+cleanup_migrated_python_staging() {
+    for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+        if [ "${module}" = "__init__.py" ]; then
+            continue
+        fi
+        rm -f "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
+    done
+    if [ -n "${MIGRATED_PYTHON_INIT_BACKUP}" ]; then
+        cp "${MIGRATED_PYTHON_INIT_BACKUP}" "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py"
+        rm -f "${MIGRATED_PYTHON_INIT_BACKUP}"
+        MIGRATED_PYTHON_INIT_BACKUP=""
+    fi
+    if [ -n "${PG_MODULE_BACKUP}" ] && [ -f "${PG_MODULE_BACKUP}" ]; then
+        mv "${PG_MODULE_BACKUP}" "${PG_MODULE_SOURCE}"
+        PG_MODULE_BACKUP=""
+    fi
+    rm -rf "${STORE_FACADE_STAGING_DIR}"
+    rm -rf "${RESHARD_STAGING_DIR}"
+    rm -rf "${MIGRATED_PYTHON_STAGING_DIR}/_engram"
+    rm -f "${MIGRATED_PYTHON_STAGING_DIR}"/_engram_cuda.*.so
+}
+trap 'cleanup_migrated_python_staging; cleanup_conductor_smoke' EXIT
+cleanup_migrated_python_staging
+if [ "$WITH_PG_BUILD" != "1" ] && [ -f "$PG_MODULE_SOURCE" ]; then
+    PG_MODULE_BACKUP=$(mktemp)
+    mv "$PG_MODULE_SOURCE" "$PG_MODULE_BACKUP"
+fi
+MIGRATED_PYTHON_INIT_BACKUP=$(mktemp)
+cp "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py" "${MIGRATED_PYTHON_INIT_BACKUP}"
+for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+    cp "${MIGRATED_PYTHON_SOURCE_DIR}/${module}" \
+       "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
+done
+cp -R "${STORE_FACADE_SOURCE_DIR}" "${STORE_FACADE_STAGING_DIR}"
+cp -R "${RESHARD_SOURCE_DIR}" "${RESHARD_STAGING_DIR}"
+stage_engram_backend "$BUILD_ROOT" "$BUILD_DIR_ABS" "$MIGRATED_PYTHON_STAGING_DIR"
+
 # CI only: remove build/ to free disk before python -m build.
 # FREE_BUILD_DIR=1 enables local cleanup; 0 preserves build dependencies and tests.
 # If EP/PG .so files were staged inside the build directory, preserve them in a
@@ -354,77 +452,6 @@ fi
 # Make the post-repair device library discoverable while auditwheel resolves
 # the host extension.  It is explicitly excluded below and injected later.
 export LD_LIBRARY_PATH="${DEVICE_STAGING_DIR}:${DEVICE_STAGING_TEMP}:${LD_LIBRARY_PATH}"
-
-echo "Building wheel package..."
-# Stage migrated root Python modules and the legacy Reshard package for the
-# combined-wheel builder. Each tracked source remains in its authoritative tree.
-MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
-MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
-STORE_FACADE_SOURCE_DIR="python/mooncake/store"
-STORE_FACADE_STAGING_DIR="${MIGRATED_PYTHON_STAGING_DIR}/store"
-MIGRATED_PYTHON_INIT_BACKUP=""
-MIGRATED_PYTHON_MODULES=(
-    __init__.py
-    py.typed
-    engine.pyi
-    structured_object_store.py
-    _structured_ranges.py
-    _fast_copy.c
-    http_metadata_server.py
-    _launcher.py
-    cli.py
-    cli_bench.py
-    cli_client.py
-    conductor.py
-    transfer_engine_topology_dump.py
-    buffer_pool.py
-    mooncake_config.py
-    ep.py
-    mooncake_ep_buffer.py
-    mooncake_ep_tcpstore.py
-    mooncake_elastic_buffer.py
-    _administration.py
-    mooncake_ssd_register.py
-    mooncake_ssd_unregister.py
-    spdk_tgt_create.py
-)
-RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
-RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
-PG_MODULE_SOURCE="${BUILD_ROOT}/mooncake-wheel/mooncake/pg.py"
-PG_MODULE_BACKUP=""
-cleanup_migrated_python_staging() {
-    for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
-        if [ "${module}" = "__init__.py" ]; then
-            continue
-        fi
-        rm -f "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
-    done
-    if [ -n "${MIGRATED_PYTHON_INIT_BACKUP}" ]; then
-        cp "${MIGRATED_PYTHON_INIT_BACKUP}" "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py"
-        rm -f "${MIGRATED_PYTHON_INIT_BACKUP}"
-        MIGRATED_PYTHON_INIT_BACKUP=""
-    fi
-    if [ -n "${PG_MODULE_BACKUP}" ] && [ -f "${PG_MODULE_BACKUP}" ]; then
-        mv "${PG_MODULE_BACKUP}" "${PG_MODULE_SOURCE}"
-        PG_MODULE_BACKUP=""
-    fi
-    rm -rf "${STORE_FACADE_STAGING_DIR}"
-    rm -rf "${RESHARD_STAGING_DIR}"
-}
-trap 'cleanup_migrated_python_staging; cleanup_conductor_smoke' EXIT
-cleanup_migrated_python_staging
-if [ "$WITH_PG_BUILD" != "1" ] && [ -f "$PG_MODULE_SOURCE" ]; then
-    PG_MODULE_BACKUP=$(mktemp)
-    mv "$PG_MODULE_SOURCE" "$PG_MODULE_BACKUP"
-fi
-MIGRATED_PYTHON_INIT_BACKUP=$(mktemp)
-cp "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py" "${MIGRATED_PYTHON_INIT_BACKUP}"
-for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
-    cp "${MIGRATED_PYTHON_SOURCE_DIR}/${module}" \
-       "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
-done
-cp -R "${STORE_FACADE_SOURCE_DIR}" "${STORE_FACADE_STAGING_DIR}"
-cp -R "${RESHARD_SOURCE_DIR}" "${RESHARD_STAGING_DIR}"
 
 # Build the wheel package
 cd mooncake-wheel

@@ -21,6 +21,7 @@ namespace mooncake {
 
 template <auto Method>
 struct RpcNameTraits;
+
 template <>
 struct RpcNameTraits<&store::GatherReadDirectory::Publish> {
     static constexpr const char* value = "PublishGatherEndpoint";
@@ -441,6 +442,11 @@ DEFINE_WEIGHT_RPC_NAME(QueryWeightOperation);
 DEFINE_WEIGHT_RPC_NAME(DeleteWeightRevision);
 
 #undef DEFINE_WEIGHT_RPC_NAME
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::EngramControl> {
+    static constexpr const char* value = "EngramControl";
+};
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
@@ -1738,4 +1744,10 @@ tl::expected<std::string, ErrorCode> MasterClient::ResolveGatherEndpoint(
     const std::string& owner) {
     return invoke_rpc<&store::GatherReadDirectory::Resolve, std::string>(owner);
 }
+tl::expected<EngramControlResponse, ErrorCode> MasterClient::EngramControl(
+    const EngramControlRequest& request) {
+    return invoke_rpc<&WrappedMasterService::EngramControl,
+                      EngramControlResponse>(request);
+}
+
 }  // namespace mooncake

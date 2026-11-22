@@ -21,6 +21,7 @@
 #include "segment.h"
 #include "types.h"
 #include "rpc_types.h"
+#include "engram_coordinator.h"
 #include "master_metric_manager.h"
 #include "store_rpc_client_io_context.h"
 #include "task_manager.h"
@@ -122,6 +123,9 @@ class MasterClient {
 
     MasterClient(const MasterClient&) = delete;
     MasterClient& operator=(const MasterClient&) = delete;
+
+    tl::expected<EngramControlResponse, ErrorCode> EngramControl(
+        const EngramControlRequest& request);
 
     /**
      * @brief Connects to the master service

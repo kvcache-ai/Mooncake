@@ -35,6 +35,7 @@ keywords = ["mooncake", "transfer engine", "kv cache", "llm inference", "rdma"]
 classifiers = ["Development Status :: 5 - Production/Stable", "Environment :: GPU :: NVIDIA CUDA", "Intended Audience :: Developers", "Intended Audience :: Science/Research", "License :: OSI Approved :: Apache Software License", "Operating System :: POSIX :: Linux", "Programming Language :: C++", "Programming Language :: Python :: 3", "Programming Language :: Python :: 3 :: Only", "Programming Language :: Python :: 3.10", "Programming Language :: Python :: 3.11", "Programming Language :: Python :: 3.12", "Programming Language :: Python :: 3.13", "Programming Language :: Python :: 3.14", "Programming Language :: Python :: Implementation :: CPython", "Topic :: Scientific/Engineering :: Artificial Intelligence", "Topic :: System :: Distributed Computing"]
 
 [project.optional-dependencies]
+engram = ["numpy>=1.24"]
 administration = ["paramiko"]
 
 [project.urls]
@@ -64,3 +65,4 @@ include = ["mooncake*"]
 
 [tool.setuptools.package-data]
 mooncake = ["*.so", "*.pyi", "py.typed", "mooncake_master", "mooncake_client", "transfer_engine_bench", "_pg_jit/*.cpp", "_pg_jit/*.h"]
+"mooncake._engram.remote.deepep_rdma" = ["*.cpp", "DEEP_EP_LICENSE"]

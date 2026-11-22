@@ -2,15 +2,16 @@
 
 import errno
 import gc
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from mooncake.engram import EngramStore
+from mooncake.engram import EngramStore, EngramStoreConfig
 
 
-def test_remote_backend_is_reserved_but_unsupported():
+def test_reserved_store_client_is_unsupported():
     with pytest.raises(
         NotImplementedError, match="Remote EngramStore is not supported"
     ):
@@ -19,6 +20,77 @@ def test_remote_backend_is_reserved_but_unsupported():
             namespace="test/v1",
             store_client=object(),
         )
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_local_config_roundtrip_and_immutability(tmp_path, persistent):
+    config = EngramStoreConfig(local_dir=tmp_path, persistent=persistent)
+    rows = np.arange(24, dtype=np.uint8).reshape(3, 8)
+    with EngramStore(
+        tables={"h": {"num_rows": 3, "row_bytes": 8}},
+        namespace="configured-table",
+        config=config,
+    ) as store:
+        store.populate("h", rows)
+        output = np.full((2, 1, 8), 255, np.uint8)
+        store.lookup(["h"], np.array([[2], [-1]], np.int64), output)
+        np.testing.assert_array_equal(output[0, 0], rows[2])
+        assert np.all(output[1] == 255)
+        assert store.group_id is store.shard_id is store.group_size is None
+    if not persistent:
+        assert list(tmp_path.iterdir()) == []
+    with pytest.raises(FrozenInstanceError):
+        config.backend = "other"
+
+
+def remote_config(**changes):
+    options = dict(
+        backend="deepep_rdma",
+        assignment="auto",
+        group_size=2,
+        node_id="node",
+        model_key="checkpoint",
+        caller_id=0,
+        num_callers=4,
+        max_lookup_rows=4096,
+    )
+    return EngramStoreConfig(**(options | changes))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"caller_id": -1},
+        {"caller_id": 4},
+        {"num_callers": True},
+        {"group_size": 0},
+        {"group_size": True},
+        {"max_lookup_rows": 0},
+        {"assignment": "guess"},
+        {"shard_id": 0},
+        {"group_id": "manual"},
+        {"node_id": ""},
+        {"model_key": ""},
+        {"timeout": float("nan")},
+        {"timeout": -1},
+        {"backend": "unknown"},
+        {"local_dir": "/tmp"},
+    ],
+)
+def test_invalid_remote_config_is_rejected_without_native_build(changes):
+    with pytest.raises(ValueError):
+        remote_config(**changes)
+
+
+def test_auto_and_manual_config_have_distinct_placement_contracts():
+    automatic = remote_config()
+    assert automatic.group_id is automatic.shard_id is None
+    manual = replace(automatic, assignment="manual", group_id="group", shard_id=1)
+    assert manual.shard_id == 1 and manual.group_size == 2
+    with pytest.raises(ValueError):
+        replace(manual, shard_id=2)
+    with pytest.raises(ValueError):
+        replace(manual, group_id=None)
 
 
 def make_store(path, width=17, persistent=True):
