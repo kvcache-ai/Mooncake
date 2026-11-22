@@ -879,7 +879,7 @@ TEST_F(AscendDirectTransportTest, LocalCopyPublishFailureAbortsBeforeRelease) {
 
     Transport::SubBatchRef failed_batch = nullptr;
     ASSERT_TRUE(transport_->allocateSubBatch(failed_batch, 2).ok());
-    AscendDirectTransportTestPeer::failNextLocalCopyPublish(*transport_);
+    AscendDirectTransportTestPeer::failNextGroupPublish(*transport_);
     const int destroys_before = g_stream_destroys;
     ASSERT_TRUE(
         transport_
@@ -1144,6 +1144,63 @@ TEST_F(AscendDirectTransportTest, QueryErrorWaitsForEachAcceptedGroup) {
     EXPECT_EQ(status.s, FAILED);
     ASSERT_TRUE(transport_->isSubBatchDrained(batch_, drained).ok());
     EXPECT_TRUE(drained);
+}
+
+TEST_F(AscendDirectTransportTest, TrackingFailureRejectsBeforeNativeSubmit) {
+    ASSERT_TRUE(InstallAgentTwoEngines().ok());
+    PublishEngineBuffers();
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 1).ok());
+    char src[16]{};
+    AscendDirectTransportTestPeer::failNextGroupPublish(*transport_);
+    ASSERT_TRUE(
+        transport_->submitTransferTasks(batch_, {MakeRemoteWrite(src, 16)})
+            .ok());
+    WaitUntilTerminal(*transport_, batch_, 0);
+    TransferStatus status{};
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    bool drained = false;
+    ASSERT_TRUE(transport_->isSubBatchDrained(batch_, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_EQ(state_->transfer_async_calls, 0);
+}
+
+TEST_F(AscendDirectTransportTest, RepeatedQueryErrorsSpareLaterSubmission) {
+    ASSERT_TRUE(InstallAgentTwoEngines().ok());
+    PublishEngineBuffers();
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+    char src[32]{};
+    auto submit = [&](char* buffer) {
+        return transport_
+            ->submitTransferTasks(batch_, {MakeRemoteWrite(buffer, 16)})
+            .ok();
+    };
+    ASSERT_TRUE(submit(src));
+    state_->query_result = 1;
+    TransferStatus status{};
+    auto poll_first = [&] {
+        auto queries = state_->get_status_calls;
+        return WaitUntil(
+            [&] {
+                return transport_->getTransferStatus(batch_, 0, status).ok() &&
+                       state_->get_status_calls > queries;
+            },
+            2000);
+    };
+    ASSERT_TRUE(poll_first());
+    ASSERT_EQ(status.s, PENDING);
+    ASSERT_TRUE(submit(src + 16));
+    auto* sub = static_cast<HixlSubBatch*>(batch_);
+    ASSERT_TRUE(
+        WaitUntil([&] { return sub->pending_submits.load() == 0; }, 2000));
+    ASSERT_TRUE(poll_first());
+    state_->query_result = kHixlOk;
+    WaitUntilTerminal(*transport_, batch_, 0);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    WaitUntilTerminal(*transport_, batch_, 1);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, status).ok());
+    EXPECT_EQ(status.s, COMPLETED);
 }
 
 TEST_F(AscendDirectTransportTest, FailedDisconnectDoesNotDrainTimeout) {

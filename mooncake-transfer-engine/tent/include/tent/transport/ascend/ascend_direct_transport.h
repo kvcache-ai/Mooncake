@@ -50,6 +50,9 @@ struct HixlTask {
     volatile TransferStatusEnum status_word = TransferStatusEnum::PENDING;
     volatile size_t transferred_bytes = 0;
     void* req_handle = nullptr;
+    // Remote groups are indexed by their first task before TransferAsync.
+    // Local copies use their native handle. Published with req_handle.
+    void* group_key = nullptr;
     uint64_t batch_size = 0;
     std::string remote_hixl;
     // Steady-clock nanoseconds. accepted_time_ns is taken by the submitter, so
@@ -174,9 +177,8 @@ class AscendDirectTransport : public Transport {
     void abandonGroup(const std::vector<HixlTask*>& tasks);
     // A route error is sticky, but a group is terminal only after its own
     // completion or a successful disconnect covering its submission.
-    void failEntireRoute(size_t engine_idx, const std::string& remote,
-                         TransferStatusEnum status,
-                         void* finished_handle = nullptr);
+    void failEntireRoute(HixlTask& task, TransferStatusEnum status,
+                         bool finished = false);
     bool applyGroupStatus(HixlTask& task, GroupState& group);
     bool finishTaskLocked(HixlTask& task, void** local_release_handle,
                           size_t* local_release_engine);
@@ -211,18 +213,12 @@ class AscendDirectTransport : public Transport {
     bool use_shmem_{false};
     // ASCEND_STANDALONE_SINGLE_SEGMENT, read once at install(). Default off.
     bool standalone_single_segment_{false};
-    // Test-only fault injection and inert unless the test peer sets it (no
-    // production caller): startLocalCopy() then treats publishing the group as
-    // failed (as if groups_.emplace() threw under memory pressure), so the
-    // abort-before-release cleanup for a copy request whose handle was never
-    // published stays covered. Set through
-    // AscendDirectTransportTestPeer::failNextLocalCopyPublish().
-    bool fail_local_copy_publish_{false};
+    // Inject a group tracking allocation failure through the test peer.
+    bool fail_group_publish_{false};
 
     std::mutex req_mutex_;
     uint64_t last_remote_submission_ = 0;
     std::unordered_map<void*, GroupState> groups_;
-    std::map<std::pair<size_t, std::string>, std::vector<void*>> route_groups_;
 
     std::mutex inflight_mu_;
     std::condition_variable inflight_cv_;
@@ -258,9 +254,9 @@ class AscendDirectTransportTestPeer {
         return transport.installed_;
     }
 
-    // Makes the next local copy group publication fail once.
-    static void failNextLocalCopyPublish(AscendDirectTransport& transport) {
-        transport.fail_local_copy_publish_ = true;
+    // Makes the next group publication fail once.
+    static void failNextGroupPublish(AscendDirectTransport& transport) {
+        transport.fail_group_publish_ = true;
     }
 };
 
