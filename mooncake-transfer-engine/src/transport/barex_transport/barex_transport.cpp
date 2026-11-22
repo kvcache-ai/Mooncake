@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #include "transport/barex_transport/barex_transport.h"
+#include "transport/transport_registry.h"
+
+#include <cstdlib>
 
 #include <glog/logging.h>
 #include <sys/mman.h>
@@ -40,6 +43,35 @@ class EmptyCallback : public XChannelCallback {
 };
 
 BarexTransport::BarexTransport() {}
+
+void prepareBarexTransportInstall(const std::shared_ptr<Topology> &topo) {
+    bool use_eic = false;
+    for (const auto &dev : topo->getHcaList()) {
+        if (dev.find("soe") != std::string::npos ||
+            dev.find("solar") != std::string::npos) {
+            use_eic = true;
+        }
+    }
+
+    std::string nics;
+    for (const auto &dev : topo->getHcaList()) {
+        if (use_eic && dev.find("soe") == std::string::npos &&
+            dev.find("solar") == std::string::npos) {
+            continue;
+        }
+        nics += dev;
+        nics += ",";
+    }
+
+    if (!nics.empty()) {
+        nics.pop_back();
+    }
+
+    if (!nics.empty()) {
+        LOG(INFO) << "ACCL_USE_NICS is set to " << nics;
+        setenv("ACCL_USE_NICS", nics.c_str(), 1);
+    }
+}
 
 BarexTransport::~BarexTransport() { shutdownResources(); }
 
@@ -1626,3 +1658,7 @@ int BarexTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
     return ERR_ADDRESS_NOT_REGISTERED;
 }
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT_WITH_OPTIONS(
+    barex, "barex", mooncake::BarexTransport, false,
+    mooncake::prepareBarexTransportInstall, 0);

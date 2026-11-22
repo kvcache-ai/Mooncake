@@ -172,6 +172,8 @@ class BarexTransport : public Transport {
     std::random_device rd;
 };
 
+void prepareBarexTransportInstall(const std::shared_ptr<Topology> &topo);
+
 }  // namespace mooncake
 
 #endif  // BAREX_TRANSPORT_H_

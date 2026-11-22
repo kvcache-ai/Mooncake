@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/hylink_transport/hylink_transport.h"
+#include "transport/transport_registry.h"
 
 #include <glog/logging.h>
 
@@ -829,3 +830,5 @@ int HylinkTransport::unregisterLocalMemoryBatch(
 }
 
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(hylink, "hylink", mooncake::HylinkTransport);

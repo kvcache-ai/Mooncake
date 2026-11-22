@@ -1,6 +1,7 @@
 // Copyright 2024 KVCache.AI
 
 #include "transport/sunrise_link_transport/sunrise_link_transport.h"
+#include "transport/transport_registry.h"
 #include "sunrise_allocator.h"
 
 #include <dlfcn.h>
@@ -766,3 +767,6 @@ Status SunriseLinkTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 }
 
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(sunrise_link, "sunrise_link",
+                            mooncake::SunriseLinkTransport);

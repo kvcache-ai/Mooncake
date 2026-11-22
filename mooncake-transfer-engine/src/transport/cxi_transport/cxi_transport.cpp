@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/cxi_transport/cxi_transport.h"
+#include "transport/transport_registry.h"
 
 #include <glog/logging.h>
 #include <sys/mman.h>
@@ -1021,3 +1022,5 @@ int CxiTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
 }
 
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(cxi, "cxi", mooncake::CxiTransport);

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
+#include "transport/transport_registry.h"
 
 #include <glog/logging.h>
 
@@ -815,3 +816,5 @@ void UBShmemTransport::freePinnedLocalMemory(void *ptr) {
     (void)aclrtFreePhysical(handle);
 }
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(ubshmem, "ubshmem", mooncake::UBShmemTransport);

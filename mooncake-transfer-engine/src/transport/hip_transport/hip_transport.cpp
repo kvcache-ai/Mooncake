@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/hip_transport/hip_transport.h"
+#include "transport/transport_registry.h"
 
 #include <glog/logging.h>
 
@@ -1134,3 +1135,5 @@ void HipTransport::freePinnedLocalMemory(void* ptr) {
     (void)hipMemRelease(handle);
 }
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(hip, "hip", mooncake::HipTransport);

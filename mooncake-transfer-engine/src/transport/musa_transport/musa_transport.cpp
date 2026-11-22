@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/musa_transport/musa_transport.h"
+#include "transport/transport_registry.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -325,3 +326,5 @@ void* MusaTransport::allocatePinnedLocalMemory(size_t length) {
 void MusaTransport::freePinnedLocalMemory(void* addr) { cudaFree(addr); }
 
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(musa, "musa", mooncake::MusaTransport);

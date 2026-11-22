@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/nvlink_transport/nvlink_transport.h"
+#include "transport/transport_registry.h"
 
 #include <bits/stdint-uintn.h>
 #include "cuda_alike.h"
@@ -1579,3 +1580,5 @@ void NvlinkTransport::freePinnedLocalMemory(void *ptr) {
     cuMemRelease(handle);
 }
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(nvlink, "nvlink", mooncake::NvlinkTransport);

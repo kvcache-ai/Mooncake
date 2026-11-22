@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/shm_transport/shm_transport.h"
+#include "transport/transport_registry.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1063,3 +1064,5 @@ Status ShmTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 }
 
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(shm, "shm", mooncake::ShmTransport);

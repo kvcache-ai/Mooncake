@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transport/maca_transport/maca_transport.h"
+#include "transport/transport_registry.h"
 
 #include <bits/stdint-uintn.h>
 #include "cuda_alike.h"
@@ -963,3 +964,5 @@ void MacaTransport::freePinnedLocalMemory(void *ptr) {
 }
 
 }  // namespace mooncake
+
+MOONCAKE_REGISTER_BUILTIN_TRANSPORT(maca, "maca", mooncake::MacaTransport);
