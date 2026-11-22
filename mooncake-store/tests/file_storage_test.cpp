@@ -357,6 +357,8 @@ class FileStorageTest : public ::testing::Test {
                 EXPECT_TRUE(storage.reclaim_dead_keys_.empty());
                 return;
             case ReclaimCase::kExistingData: {
+                storage.storage_backend_.reset();
+                backend.reset();
                 FileStorage restarted(config, client, endpoint);
                 ASSERT_TRUE(restarted.Init());
                 ASSERT_TRUE(restarted.Shutdown());
@@ -3688,8 +3690,7 @@ class FileStorageReclaimTest
 
 TEST_P(FileStorageReclaimTest, Scenario) { RunReclaimScenario(GetParam()); }
 
-std::string ReclaimCaseName(
-    const ::testing::TestParamInfo<ReclaimCase>& info) {
+std::string ReclaimCaseName(const ::testing::TestParamInfo<ReclaimCase>& info) {
     constexpr const char* kNames[] = {
         "DeletesBucketOfRemovedObject", "OffloadsRePutKeyAfresh",
         "KeepsLiveCopyOnRetriedTask",   "WaitsForRescanAfterSegmentLoss",
