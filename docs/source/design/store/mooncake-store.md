@@ -16,7 +16,7 @@ Key features of Mooncake Store include:
 - **Zero-copy, bandwidth-saturating transfers**: Powered by the Transfer Engine, Mooncake Store eliminates redundant memory copies and exploits multi-NIC GPUDirect RDMA pooling to drive data across the network at full line rate while keeping CPU overhead negligible.
 - **High bandwidth utilization**: Mooncake Store supports striping and parallel I/O transfer of large objects, fully utilizing multi-NIC aggregated bandwidth for high-speed data reads and writes.
 - **Dynamic resource scaling**: Mooncake Store supports dynamically adding and removing nodes to flexibly handle changes in system load, achieving elastic resource management.
-- **Fault tolerance**: Mooncake store is designed with robust fault tolerance. Failures of any number of master and client nodes will not result in incorrect data being read. As long as at least one master and one client remain operational, Mooncake Store continues to function correctly and serve requests.
+- **Fault tolerance**: With HA metadata replication configured, Mooncake Store can recover from master failures when the coordination backend and complete recovery history remain available. Reading a cached object also requires an accessible payload replica. Requests may fail during election, recovery, and client reconnection; see [High Availability Design](high-availability.md) for the prerequisites and recovery boundaries.
 - **Multi-layer storage support**​​: Mooncake Store supports offloading cached data from RAM to SSD, further balancing cost and performance to improve storage system efficiency.
 
 ## Architecture
@@ -175,6 +175,7 @@ tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
 
 The Client requests the Master Service to delete all replicas corresponding to the specified key or for all object keys that match the specified regular expression.
 
+(store-object-groups)=
 ### Optional Object Groups
 
 Object groups are intended for workloads where one logical cache entry is split into multiple Mooncake Store objects, such as separate K/V tensors, parallel shards, or auxiliary index objects. Without grouping, these objects are managed independently, so lease refresh and memory eviction may affect different parts of the same logical entry at different times.
@@ -629,7 +630,7 @@ The HTTP metadata server can be configured using the following parameters:
 - **`http_metadata_server_port`** (integer, default: `8080`): Specifies the TCP port on which the HTTP metadata server will listen for incoming connections. This port must be available and not conflict with other services.
 - **`http_metadata_server_host`** (string, default: `"0.0.0.0"`): Specifies the host address for the HTTP metadata server to bind to. Use `"0.0.0.0"` to listen on all available network interfaces, or specify a specific IP address for security purposes.
 ### Environment Variables
-- MC_STORE_CLUSTER_ID: Identify the metadata when multiple cluster share the same master, default 'mooncake'.
+- `MC_STORE_CLUSTER_ID`: Selects the client's HA leader-discovery namespace and labels client metrics. Discovery defaults to `mooncake_cluster` when unset or empty; it must match the masters' `--cluster_id`. See {ref}`HA client addressing <store-ha-etcd-deployment>`.
 - MC_STORE_MEMCPY: Enables or disables local memcpy optimization, set to 1/true to enable, 0/false to disable.
 - MC_STORE_CLIENT_METRIC: Enables client metric reporting, enabled by default; set to 0/false to disable.
 - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds, default 0 (collects but does not report).
