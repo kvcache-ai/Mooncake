@@ -33,6 +33,7 @@ struct SunriseLinkTask {
     uint64_t target_addr = 0;
     bool is_tang_ipc = false;
     int tang_gpu_id = -1;
+    int local_device = -1;
     // Set only while an accepted async copy still needs a completion query.
     int async_device = -1;
 };
@@ -95,7 +96,7 @@ class SunriseLinkTransport : public Transport {
 
    private:
     friend class SunriseLinkTransportTestPeer;
-    Status startTransfer(SunriseLinkTask* task, SunriseLinkSubBatch* batch);
+    void startTransfer(SunriseLinkTask* task, SunriseLinkSubBatch* batch);
 
     // SunriseLink initialization
     Status initSunriseLink();

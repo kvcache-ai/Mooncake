@@ -25,6 +25,7 @@ struct Copy {
 struct MockTang {
     int device = 0;
     int failed_device = -1;
+    int failed_copy_device = -1;
     tangError_t query_error = tangSuccess;
     int query_calls = 0;
     int synchronize_calls = 0;
@@ -75,12 +76,14 @@ tangError_t __wrap_tangStreamDestroy(tangStream_t stream) {
 }
 tangError_t __wrap_tangMemcpy(void* destination, const void* source,
                               size_t size, tangMemcpyKind) {
+    if (mock.device == mock.failed_copy_device) return tangErrorInvalidValue;
     std::memcpy(destination, source, size);
     return tangSuccess;
 }
 tangError_t __wrap_tangMemcpyAsync(void* destination, const void* source,
                                    size_t size, tangMemcpyKind,
                                    tangStream_t stream) {
+    if (mock.device == mock.failed_copy_device) return tangErrorInvalidValue;
     mock.pending.push_back({stream, destination, source, size});
     return tangSuccess;
 }
@@ -175,6 +178,24 @@ TEST_F(SunriseLinkStreamTest, WaitsForBothStreamsWhenSecondFinishesFirst) {
     EXPECT_EQ(target[0], 'A');
 }
 
+TEST_F(SunriseLinkStreamTest, CopyFailureAfterPreflightKeepsAcceptedCopy) {
+    mock.failed_copy_device = 1;
+    ASSERT_TRUE(
+        transport.submitTransferTasks(&batch, {request(0), request(1)}).ok());
+    ASSERT_EQ(mock.pending.size(), 1u);
+    TransferStatus status{};
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 1, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    bool drained = true;
+    ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_FALSE(drained);
+    mock.complete();
+    ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_EQ(target[0], 'A');
+    EXPECT_EQ(target[16], 0);
+}
+
 TEST_F(SunriseLinkStreamTest, SynchronousCopyDrainsAfterSubmitterExits) {
     SunriseLinkTransport sync_transport;
     std::thread submitter([&] {
@@ -235,12 +256,13 @@ TEST_P(SunriseLinkDrainTest, RejectedRequestLeavesNoTask) {
     EXPECT_TRUE(drained);
 }
 
-TEST_P(SunriseLinkDrainTest, PartialSubmissionKeepsAcceptedCopy) {
+TEST_P(SunriseLinkDrainTest, RejectedRequestLeavesEntireSubmissionUnposted) {
     EXPECT_FALSE(transport
                      .submitTransferTasks(
                          &batch, {request(0), rejectedRequest(), request(0)})
                      .ok());
-    checkAcceptedCopy();
+    EXPECT_EQ(batch.size(), 0u);
+    EXPECT_TRUE(mock.pending.empty());
 }
 
 TEST_P(SunriseLinkDrainTest, RejectedAppendKeepsEarlierSubmission) {
@@ -251,9 +273,9 @@ TEST_P(SunriseLinkDrainTest, RejectedAppendKeepsEarlierSubmission) {
 }
 
 TEST_P(SunriseLinkDrainTest, QueryErrorKeepsAcceptedCopyUndrained) {
+    ASSERT_TRUE(transport.submitTransferTasks(&batch, {request(0)}).ok());
     EXPECT_FALSE(
-        transport.submitTransferTasks(&batch, {request(0), rejectedRequest()})
-            .ok());
+        transport.submitTransferTasks(&batch, {rejectedRequest()}).ok());
     ASSERT_EQ(batch.size(), 1u);
     ASSERT_EQ(mock.pending.size(), 1u);
     mock.query_error = tangErrorInvalidValue;
