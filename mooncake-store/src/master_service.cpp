@@ -2720,6 +2720,8 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         return false;
     }
 
+    task_manager_.get_write_access().retire_task_fetch_replay(
+        job.retired_session);
     client_sessions_.Remove(job.client_id, job.retired_session);
     return true;
 }
@@ -10639,13 +10641,44 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
         return std::vector<TaskAssignment>{};
     }
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    const auto& tasks =
-        task_manager_.get_write_access().pop_tasks(client_id, batch_size);
+    std::vector<Task> tasks;
+    {
+        auto write = task_manager_.get_write_access();
+        if (write.task_fetch_replay_active(serving_guard->Session())) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        tasks = write.pop_tasks(client_id, batch_size);
+    }
     std::vector<TaskAssignment> assignments;
     for (const auto& task : tasks) {
         assignments.emplace_back(task);
     }
     return assignments;
+}
+
+tl::expected<FetchTasksReplayResponse, ErrorCode>
+MasterService::FetchTasksReplay(const UUID& client_id,
+                                const FetchTasksReplayRequest& request) {
+    auto guard = request.closing
+                     ? client_sessions_.TryAcquireRetainingSession(client_id)
+                     : client_sessions_.TryAcquireServingSession(client_id);
+    if (!guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    auto batch = task_manager_.get_write_access().fetch_tasks_replay(
+        guard->Session(), request.token, request.sequence, request.batch_size,
+        request.closing);
+    if (!batch) {
+        return tl::make_unexpected(batch.error());
+    }
+    FetchTasksReplayResponse response{batch->token, batch->sequence, {}};
+    response.assignments.reserve(batch->tasks.size());
+    for (const auto& task : batch->tasks) {
+        response.assignments.emplace_back(task);
+    }
+    return response;
 }
 
 tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(

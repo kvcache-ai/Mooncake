@@ -238,6 +238,10 @@ struct RpcTimeoutEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_RPC_CONNECT_TIMEOUT_MS);
 };
 
+struct TaskFetchEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MC_STORE_ADAPTIVE_TASK_FETCH);
+};
+
 struct RpcProtocolEnvironmentVariables {
     // Preserve the legacy exact, case-sensitive "rdma" token check.
     MC_DEFINE_ENV_VAR(std::string, MC_RPC_PROTOCOL);

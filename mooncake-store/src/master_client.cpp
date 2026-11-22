@@ -6,6 +6,7 @@
 
 #include <csignal>
 #include <string>
+#include <type_traits>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
 #include <ylt/util/tl/expected.hpp>
@@ -398,6 +399,11 @@ struct RpcNameTraits<&WrappedMasterService::FetchTasks> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::FetchTasksReplay> {
+    static constexpr const char* value = "FetchTasksReplay";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::MarkTaskToComplete> {
     static constexpr const char* value = "MarkTaskToComplete";
 };
@@ -473,6 +479,15 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
                 if (result.error().code == coro_rpc::errc::timed_out) {
                     LOG(ERROR) << "RPC call timed out: " << result.error().msg;
                     co_return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+                }
+                using ReplayRpc =
+                    RpcNameTraits<&WrappedMasterService::FetchTasksReplay>;
+                if constexpr (std::is_same_v<RpcNameTraits<ServiceMethod>,
+                                             ReplayRpc>) {
+                    if (result.error().code ==
+                        coro_rpc::errc::function_not_registered) {
+                        co_return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+                    }
                 }
                 LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
@@ -1582,6 +1597,18 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterClient::FetchTasks(
     auto result =
         invoke_rpc<&WrappedMasterService::FetchTasks,
                    std::vector<TaskAssignment>>(client_id_, batch_size);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<FetchTasksReplayResponse, ErrorCode>
+MasterClient::FetchTasksReplay(const FetchTasksReplayRequest& request) {
+    ScopedVLogTimer timer(1, "MasterClient::FetchTasksReplay");
+    timer.LogRequest("client_id=", client_id_, ", sequence=", request.sequence,
+                     ", batch_size=", request.batch_size,
+                     ", closing=", request.closing);
+    auto result = invoke_rpc<&WrappedMasterService::FetchTasksReplay,
+                             FetchTasksReplayResponse>(client_id_, request);
     timer.LogResponseExpected(result);
     return result;
 }

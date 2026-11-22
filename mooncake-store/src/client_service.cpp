@@ -40,6 +40,8 @@
 #include "transfer_task.h"
 #include "transport/transport.h"
 #include "config.h"
+#include "environ.h"
+#include "environment_variables.h"
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "types.h"
 #include "client_buffer.h"
@@ -476,7 +478,9 @@ Client::Client(const std::string& local_hostname,
           ClientObjectChecksumConfig::IsEnabledAtFirstUse()),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
-      task_thread_pool_(4) {
+      task_thread_pool_(kTaskWorkerCount),
+      adaptive_task_fetch_enabled_(Environ::ReadOr(
+          TaskFetchEnvironmentVariables::MC_STORE_ADAPTIVE_TASK_FETCH, false)) {
     LOG(INFO) << "client_id=" << client_id_;
     if (!host_id_.empty()) {
         LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
@@ -501,11 +505,29 @@ Client::Client(const std::string& local_hostname,
 }
 
 Client::~Client() {
-    task_poll_running_ = false;
+    {
+        std::lock_guard<std::mutex> lock(task_poll_mutex_);
+        task_poll_running_ = false;
+    }
+    task_poll_cv_.notify_all();
     if (task_poll_thread_.joinable()) {
         task_poll_thread_.join();
     }
 
+    {
+        std::lock_guard<std::mutex> lock(graceful_unmount_timer_mutex_);
+        graceful_unmount_timer_stopping_ = true;
+    }
+    graceful_unmount_timer_cv_.notify_all();
+
+    // Stop queued timer/task callbacks before tearing down segment state.
+    {
+        std::lock_guard<std::mutex> lock(task_poll_mutex_);
+        task_running_ = false;
+    }
+    task_thread_pool_.stop();
+
+    // Keep the session live while workers settle their outstanding tasks.
     storage_heartbeat_running_ = false;
     if (storage_heartbeat_thread_.joinable()) {
         storage_heartbeat_thread_.join();
@@ -520,16 +542,6 @@ Client::~Client() {
     if (leader_monitor_thread_.joinable()) {
         leader_monitor_thread_.join();
     }
-
-    {
-        std::lock_guard<std::mutex> lock(graceful_unmount_timer_mutex_);
-        graceful_unmount_timer_stopping_ = true;
-    }
-    graceful_unmount_timer_cv_.notify_all();
-
-    // Stop queued timer/task callbacks before tearing down segment state.
-    task_running_ = false;
-    task_thread_pool_.stop();
 
     // Unmount callbacks must finish before the service and sources are drained.
     gather_service_.reset();
@@ -5656,6 +5668,9 @@ void Client::PollAndDispatchTasks() {
 }
 
 void Client::TaskPollThreadMain() {
+    if (adaptive_task_fetch_enabled_ && RunReplayTaskPoller()) {
+        return;
+    }
     const auto poll_interval = std::chrono::milliseconds(1000);
 
     while (task_poll_running_.load()) {
@@ -5664,7 +5679,133 @@ void Client::TaskPollThreadMain() {
     }
 }
 
-void Client::SubmitTask(const TaskAssignment& assignment) {
+bool Client::RunReplayTaskPoller() {
+    constexpr auto kMinDelay = std::chrono::milliseconds(25);
+    constexpr auto kMaxDelay = std::chrono::milliseconds(1000);
+    constexpr auto kCompletionWindow = std::chrono::milliseconds(2);
+    auto delay = kMinDelay;
+    FetchTasksReplayRequest request;
+    bool retried_close = false;
+    auto wait_for_retry = [&](size_t previous_in_flight,
+                              bool wake_on_completion) {
+        std::unique_lock<std::mutex> lock(task_poll_mutex_);
+        task_poll_cv_.wait_for(lock, delay, [&] {
+            return !task_poll_running_.load() ||
+                   (wake_on_completion &&
+                    tasks_in_flight_ != previous_in_flight);
+        });
+        delay = std::min(delay * 2, kMaxDelay);
+    };
+
+    while (task_poll_running_.load() || request.batch_size != 0) {
+        if (request.sequence == 0) {
+            auto opened = master_client_.FetchTasksReplay(request);
+            if (!opened) {
+                if (opened.error() == ErrorCode::NOT_SUPPORTED) {
+                    LOG(INFO) << "Master has no replay RPC, using legacy task "
+                                 "fetching";
+                    return false;
+                }
+                wait_for_retry(0, false);
+                continue;
+            }
+            if (opened->sequence != 0 || opened->token == UUID{} ||
+                !opened->assignments.empty()) {
+                LOG(ERROR) << "Task fetch replay lane already has a grant";
+                return true;
+            }
+            request.token = opened->token;
+            request.sequence = 1;
+            delay = kMinDelay;
+            continue;
+        }
+
+        size_t in_flight;
+        {
+            std::unique_lock<std::mutex> lock(task_poll_mutex_);
+            const bool was_full = tasks_in_flight_ == kTaskWorkerCount;
+            task_poll_cv_.wait(lock, [&] {
+                return !task_poll_running_.load() ||
+                       tasks_in_flight_ < kTaskWorkerCount;
+            });
+            if (was_full && tasks_in_flight_ != 0) {
+                // Workers often complete a batch within the same millisecond.
+                task_poll_cv_.wait_for(lock, kCompletionWindow, [&] {
+                    return !task_poll_running_.load() || tasks_in_flight_ == 0;
+                });
+            }
+            if (!task_poll_running_.load()) {
+                if (request.batch_size == 0) {
+                    return true;
+                }
+                request.closing = true;
+            }
+            in_flight = tasks_in_flight_;
+            // Retrying uses the credit originally reserved for this request.
+            if (request.batch_size == 0) {
+                request.batch_size = kTaskWorkerCount - in_flight;
+            }
+        }
+
+        auto response = master_client_.FetchTasksReplay(request);
+        if (!response) {
+            if (request.closing) {
+                const auto error = response.error();
+                if (retried_close || (error != ErrorCode::RPC_TIMEOUT &&
+                                      error != ErrorCode::RPC_FAIL)) {
+                    LOG(ERROR)
+                        << "Could not settle pending task fetch on shutdown"
+                        << ", sequence=" << request.sequence
+                        << ", error=" << error;
+                    return true;
+                }
+                retried_close = true;
+                std::this_thread::sleep_for(kMinDelay);
+                continue;
+            }
+            LOG_EVERY_N(WARNING, 100)
+                << "Task fetch replay failed, sequence=" << request.sequence
+                << ", error=" << response.error();
+            wait_for_retry(in_flight, false);
+            continue;
+        }
+        if (response->token != request.token ||
+            response->sequence != request.sequence ||
+            response->assignments.size() > request.batch_size) {
+            LOG(ERROR) << "Invalid task fetch replay response, sequence="
+                       << request.sequence;
+            return true;
+        }
+
+        const auto received = response->assignments.size();
+        const bool underfilled = received < request.batch_size;
+        ++request.sequence;
+        request.batch_size = 0;
+        if (response->assignments.empty()) {
+            if (request.closing) {
+                return true;
+            }
+            wait_for_retry(in_flight, true);
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(task_poll_mutex_);
+            tasks_in_flight_ += received;
+        }
+        for (const auto& assignment : response->assignments) {
+            SubmitTask(assignment, /*holds_fetch_credit=*/true);
+        }
+        delay = kMinDelay;
+        if (underfilled) {
+            wait_for_retry(in_flight + received, true);
+        }
+    }
+    return true;
+}
+
+void Client::SubmitTask(const TaskAssignment& assignment,
+                        bool holds_fetch_credit) {
     if (!task_running_.load()) {
         LOG(WARNING) << "action=task_rejected" << ", task_id=" << assignment.id
                      << ", reason=executor_stopped";
@@ -5675,6 +5816,7 @@ void Client::SubmitTask(const TaskAssignment& assignment) {
     ClientTask client_task;
     client_task.assignment = assignment;
     client_task.retry_count = 0;
+    client_task.holds_fetch_credit = holds_fetch_credit;
 
     task_thread_pool_.enqueue(
         [this, client_task]() { ExecuteTask(client_task); });
@@ -5732,20 +5874,38 @@ void Client::ExecuteTask(const ClientTask& client_task) {
     }
 
     auto report_completion = [&](const TaskCompleteRequest& request) {
+        bool retried_during_shutdown = false;
         for (;;) {
             auto completion = master_client_.MarkTaskToComplete(request);
-            if (completion) {
+            if (completion ||
+                (client_task.holds_fetch_credit &&
+                 completion.error() == ErrorCode::TASK_NOT_FOUND)) {
+                if (client_task.holds_fetch_credit) {
+                    {
+                        std::lock_guard<std::mutex> lock(task_poll_mutex_);
+                        --tasks_in_flight_;
+                    }
+                    task_poll_cv_.notify_one();
+                }
                 return;
             }
             LOG(WARNING) << "action=task_complete_failed"
                          << ", task_id=" << assignment.id
                          << ", error_code=" << completion.error();
-            if (!task_running_.load() ||
-                (completion.error() != ErrorCode::RPC_FAIL &&
-                 completion.error() != ErrorCode::RPC_TIMEOUT &&
-                 completion.error() !=
-                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS)) {
+            const bool transport_failure =
+                completion.error() == ErrorCode::RPC_FAIL ||
+                completion.error() == ErrorCode::RPC_TIMEOUT;
+            if (!transport_failure &&
+                completion.error() !=
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
                 return;
+            }
+            if (!task_running_.load()) {
+                if (!client_task.holds_fetch_credit || !transport_failure ||
+                    retried_during_shutdown) {
+                    return;
+                }
+                retried_during_shutdown = true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
@@ -5786,8 +5946,19 @@ void Client::ExecuteTask(const ClientTask& client_task) {
                          << assignment.max_retry_attempts << ", will_retry=true"
                          << ", retry_delay=" << retry_delay.count() << "ms";
 
-            task_thread_pool_.enqueue(
-                [this, retry_task]() { ExecuteTask(retry_task); });
+            {
+                std::lock_guard<std::mutex> lock(task_poll_mutex_);
+                if (task_running_.load()) {
+                    task_thread_pool_.enqueue(
+                        [this, retry_task]() { ExecuteTask(retry_task); });
+                    return;
+                }
+            }
+            TaskCompleteRequest interrupted;
+            interrupted.id = assignment.id;
+            interrupted.status = TaskStatus::FAILED;
+            interrupted.message = "Executor stopped before retry";
+            report_completion(interrupted);
         } else {
             LOG(ERROR) << "action=task_execution_failed"
                        << ", task_id=" << assignment.id
