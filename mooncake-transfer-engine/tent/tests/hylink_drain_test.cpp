@@ -14,13 +14,16 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 #include "tent/transport/hylink/hylink_transport.h"
 
 namespace {
-enum class Failure { Create, Record, Query, SecondRecord };
+enum class Failure { None, Create, Record, Query, SecondRecord, Copy };
 Failure failure;
 int copies;
-bool stream_ready;
+std::vector<hipStream_t> pending_copies;
+uintptr_t next_stream;
 int events_created;
 }  // namespace
 
@@ -35,12 +38,14 @@ hipError_t __wrap_hipGetDevice(int* device) {
 }
 hipError_t __wrap_hipSetDevice(int) { return hipSuccess; }
 hipError_t __wrap_hipStreamCreate(hipStream_t* stream) {
-    *stream = reinterpret_cast<hipStream_t>(1);
+    *stream = reinterpret_cast<hipStream_t>(++next_stream);
     return hipSuccess;
 }
 hipError_t __wrap_hipStreamDestroy(hipStream_t) { return hipSuccess; }
 hipError_t __wrap_hipMemcpyAsync(void*, const void*, size_t, hipMemcpyKind,
-                                 hipStream_t) {
+                                 hipStream_t stream) {
+    if (failure == Failure::Copy) return hipErrorInvalidValue;
+    pending_copies.push_back(stream);
     ++copies;
     return hipSuccess;
 }
@@ -53,8 +58,9 @@ hipError_t __wrap_hipEventCreateWithFlags(hipEvent_t* event, unsigned) {
         reinterpret_cast<hipEvent_t>(static_cast<uintptr_t>(events_created));
     return hipSuccess;
 }
-hipError_t __wrap_hipEventRecord(hipEvent_t, hipStream_t) {
-    if ((events_created > 1 && failure == Failure::Record) ||
+hipError_t __wrap_hipEventRecord(hipEvent_t, hipStream_t stream) {
+    if (stream == hipStreamPerThread) return hipSuccess;
+    if (failure == Failure::Record ||
         (events_created == 3 && failure == Failure::SecondRecord))
         return hipErrorInvalidValue;
     return hipSuccess;
@@ -64,8 +70,11 @@ hipError_t __wrap_hipEventDestroy(hipEvent_t) { return hipSuccess; }
 hipError_t __wrap_hipEventQuery(hipEvent_t) {
     return failure == Failure::Query ? hipErrorInvalidValue : hipSuccess;
 }
-hipError_t __wrap_hipStreamQuery(hipStream_t) {
-    return stream_ready ? hipSuccess : hipErrorNotReady;
+hipError_t __wrap_hipStreamQuery(hipStream_t stream) {
+    return std::find(pending_copies.begin(), pending_copies.end(), stream) ==
+                   pending_copies.end()
+               ? hipSuccess
+               : hipErrorNotReady;
 }
 hipError_t __wrap_hipGetLastError() { return hipSuccess; }
 const char* __wrap_hipGetErrorString(hipError_t) { return "mock HIP error"; }
@@ -79,7 +88,8 @@ class HylinkDrainTest : public ::testing::Test {
     void SetUp() override {
         failure = Failure::Query;
         copies = events_created = 0;
-        stream_ready = false;
+        next_stream = 0x100;
+        pending_copies.clear();
         auto meta = std::make_shared<ControlService>("p2p", "", nullptr);
         ASSERT_TRUE(meta->segmentManager()
                         .updateLocal([&](SegmentDesc& seg) {
@@ -123,7 +133,7 @@ TEST_P(HylinkEventFailureTest, AcceptedCopyOutlivesEventFailure) {
     bool drained = true;
     ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
     EXPECT_FALSE(drained);
-    stream_ready = true;
+    pending_copies.clear();
     ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
     EXPECT_TRUE(drained);
     ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
@@ -143,9 +153,43 @@ TEST_F(HylinkDrainTest, SecondCopyEventFailureKeepsBothTasks) {
     bool drained = true;
     ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
     EXPECT_FALSE(drained);
-    stream_ready = true;
+    pending_copies.clear();
     ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
     EXPECT_TRUE(drained);
+}
+
+TEST_P(HylinkEventFailureTest, LaterBatchCannotExtendFailedCopyDrain) {
+    failure = GetParam();
+    ASSERT_TRUE(transport.submitTransferTasks(&batch, {request()}).ok());
+    failure = Failure::Query;
+    HylinkSubBatch later;
+    later.max_size = 8;
+    ASSERT_TRUE(transport
+                    .submitTransferTasks(
+                        &later, std::vector<Request>(later.max_size, request()))
+                    .ok());
+    ASSERT_EQ(pending_copies.size(), 1 + later.max_size);
+    pending_copies.erase(pending_copies.begin());
+    bool drained = false;
+    ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_TRUE(drained);
+    ASSERT_TRUE(transport.isSubBatchDrained(&later, drained).ok());
+    EXPECT_FALSE(drained);
+    pending_copies.clear();
+    ASSERT_TRUE(transport.isSubBatchDrained(&later, drained).ok());
+    EXPECT_TRUE(drained);
+}
+
+TEST_F(HylinkDrainTest, CopyRejectionReturnsSubmitErrorAndPreservesPriorTasks) {
+    failure = Failure::None;
+    ASSERT_TRUE(transport.submitTransferTasks(&batch, {request()}).ok());
+    failure = Failure::Copy;
+    EXPECT_FALSE(transport.submitTransferTasks(&batch, {request()}).ok());
+    ASSERT_EQ(batch.size(), 1u);
+    EXPECT_EQ(copies, 1);
+    TransferStatus status{};
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
+    EXPECT_EQ(status.s, COMPLETED);
 }
 
 TEST_F(HylinkDrainTest, RejectsInvalidRequestBeforeFirstCopy) {

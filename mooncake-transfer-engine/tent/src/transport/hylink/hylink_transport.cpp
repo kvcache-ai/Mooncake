@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <cstring>
 #include <exception>
+#include <new>
+#include <utility>
 #include <vector>
 
 #include "tent/common/utils/string_builder.h"
@@ -179,11 +181,15 @@ Status onHylinkDevice(int device, F&& operation) {
     CHECK_HIP(hipGetDevice(&saved));
     if (device < 0 || device == saved) return operation(saved);
     CHECK_HIP(hipSetDevice(device));
-    auto result = operation(device);
-    if (auto err = hipSetDevice(saved); err != hipSuccess)
-        LOG(ERROR) << "Failed to restore HIP device: "
-                   << hipGetErrorString(err);
-    return result;
+    struct RestoreDevice {
+        int device;
+        ~RestoreDevice() {
+            if (auto err = hipSetDevice(device); err != hipSuccess)
+                LOG(ERROR) << "Failed to restore HIP device: "
+                           << hipGetErrorString(err);
+        }
+    } restore{saved};
+    return operation(device);
 }
 
 Status syncWithCallerStream() {
@@ -366,15 +372,7 @@ Status HylinkTransport::uninstall() {
     }
     {
         std::lock_guard<std::mutex> lock(stream_pool_mutex_);
-        int saved = 0;
-        const bool have_device = hipGetDevice(&saved) == hipSuccess;
-        for (auto& entry : stream_pools_) {
-            if (have_device) (void)hipSetDevice(entry.first);
-            for (auto stream : entry.second) (void)hipStreamDestroy(stream);
-        }
         stream_pools_.clear();
-        stream_cursors_.clear();
-        if (have_device) (void)hipSetDevice(saved);
     }
     return Status::OK();
 }
@@ -441,28 +439,41 @@ Status HylinkTransport::submitTransferTasks(
     }
 
     const size_t original_task_count = hylink_batch->task_list.size();
-    for (const auto& request : request_list) {
-        auto& task = hylink_batch->task_list.emplace_back();
-        auto status = prepareTask(request, local_segment, task);
-        if (!status.ok()) {
-            hylink_batch->task_list.resize(original_task_count);
-            return status;
+    try {
+        for (const auto& request : request_list) {
+            auto& task = hylink_batch->task_list.emplace_back();
+            auto status =
+                prepareTask(*hylink_batch, request, local_segment, task);
+            if (!status.ok()) {
+                hylink_batch->task_list.resize(original_task_count);
+                return status;
+            }
         }
+    } catch (const std::bad_alloc&) {
+        hylink_batch->task_list.resize(original_task_count);
+        return Status::InternalError("Unable to prepare hylink batch" LOC_MARK);
     }
     for (size_t i = original_task_count; i < hylink_batch->size(); ++i) {
         auto& task = hylink_batch->task_list[i];
-        auto status = onHylinkDevice(task.device_id,
-                                     [&](int) { return submitTaskCopy(task); });
+        // Only an accepted copy leaves a stream for drain to query.
+        auto stream = std::exchange(task.pending_stream, nullptr);
+        auto status = onHylinkDevice(
+            task.device_id, [&](int) { return submitTaskCopy(task, stream); });
         if (!status.ok()) {
             LOG(ERROR) << "HylinkTransport: submit task failed: "
                        << status.ToString();
+            if (i == original_task_count && !task.pending_stream) {
+                hylink_batch->task_list.resize(original_task_count);
+                return status;
+            }
             task.status_word = FAILED;
         }
     }
     return Status::OK();
 }
 
-Status HylinkTransport::prepareTask(const Request& request,
+Status HylinkTransport::prepareTask(HylinkSubBatch& batch,
+                                    const Request& request,
                                     const SegmentDescRef& local_segment,
                                     HylinkTask& task) {
     BufferDesc* buf = local_segment->findBuffer(
@@ -483,46 +494,51 @@ Status HylinkTransport::prepareTask(const Request& request,
             task.request = request;
             task.status_word = PENDING;
             task.transferred_bytes = 0;
-            if (request.target_id != LOCAL_SEGMENT_ID)
-                return relocateSharedMemoryAddress(
-                    task.target_addr, request.length, request.target_id);
+            if (request.target_id != LOCAL_SEGMENT_ID) {
+                CHECK_STATUS(relocateSharedMemoryAddress(
+                    task.target_addr, request.length, request.target_id));
+            }
+            task.pending_stream = acquireStream(batch, device);
+            if (!task.pending_stream)
+                return Status::InternalError(
+                    "hylink failed to create a copy stream" LOC_MARK);
             return Status::OK();
         });
 }
 
-hipStream_t HylinkTransport::acquireStream(int device_id) {
-    std::lock_guard<std::mutex> lock(stream_pool_mutex_);
-    auto& streams = stream_pools_[device_id];
-    if (streams.empty()) {
-        int saved = 0;
-        const bool have_device = hipGetDevice(&saved) == hipSuccess;
-        if (have_device) (void)hipSetDevice(device_id);
-        for (int i = 0; i < kStreamsPerDevice; ++i) {
+hipStream_t HylinkTransport::acquireStream(HylinkSubBatch& batch,
+                                           int device_id) {
+    auto& device = batch.device_streams[device_id];
+    const auto slot = device.next++ % kStreamsPerDevice;
+    if (slot >= device.streams.size()) {
+        std::lock_guard<std::mutex> lock(stream_pool_mutex_);
+        auto& pool = stream_pools_[device_id];
+        auto idle = std::find_if(pool.begin(), pool.end(), [](const auto& s) {
+            return s.use_count() == 1;
+        });
+        if (idle != pool.end()) {
+            device.streams.push_back(*idle);
+        } else if (pool.size() < kStreamsPerDevice || device.streams.empty()) {
             hipStream_t stream = nullptr;
             if (hipStreamCreate(&stream) == hipSuccess) {
-                streams.push_back(stream);
+                HylinkStream owned(stream, [device_id](hipStream_t s) {
+                    (void)onHylinkDevice(device_id, [&](int) {
+                        CHECK_HIP(hipStreamDestroy(s));
+                        return Status::OK();
+                    });
+                });
+                if (pool.size() < kStreamsPerDevice) pool.push_back(owned);
+                device.streams.push_back(std::move(owned));
             } else {
                 (void)hipGetLastError();
             }
         }
-        if (have_device) (void)hipSetDevice(saved);
-        if (streams.empty()) {
-            stream_pools_.erase(device_id);
-            return nullptr;
-        }
     }
-    size_t& cursor = stream_cursors_[device_id];
-    hipStream_t stream = streams[cursor % streams.size()];
-    ++cursor;
-    return stream;
+    if (device.streams.empty()) return nullptr;
+    return device.streams[slot % device.streams.size()].get();
 }
 
-Status HylinkTransport::submitTaskCopy(HylinkTask& task) {
-    hipStream_t stream = acquireStream(task.device_id);
-    if (!stream) {
-        return Status::InternalError(
-            "hylink failed to create a copy stream" LOC_MARK);
-    }
+Status HylinkTransport::submitTaskCopy(HylinkTask& task, hipStream_t stream) {
     void* src = nullptr;
     void* dst = nullptr;
     if (task.request.opcode == Request::READ) {
