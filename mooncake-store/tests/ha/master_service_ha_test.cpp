@@ -1352,6 +1352,154 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     EXPECT_EQ(restored.transport_endpoint_, endpoint);
 }
 
+TEST_F(MasterServiceHATest,
+       RestoreFromStandbyAllowsSameNameSegmentsWithDistinctEndpoints) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string shared_name = "127.0.0.1";
+    auto first_segment = MakeStandbyMemorySegment("127.0.0.1:15005", 1024);
+    auto second_segment = MakeStandbyMemorySegment("127.0.0.1:15006", 1024);
+    first_segment.segment_name = shared_name;
+    second_segment.segment_name = shared_name;
+    auto object = MakeStandbyObject("standby_same_name",
+                                    first_segment.transport_endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto second_replica =
+        MakeStandbyMemoryReplica(second_segment.transport_endpoint, 1024);
+    second_replica.id = 2;
+    second_replica.get_memory_descriptor().buffer_descriptor.buffer_address_ =
+        kDefaultSegmentBase;
+    object.metadata.replicas.push_back(std::move(second_replica));
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {object}, 7, {first_segment, second_segment});
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "standby_same_name"),
+        2);
+
+    auto first_live = MakeSegment(shared_name, kDefaultSegmentBase, 1024);
+    first_live.te_endpoint = first_segment.transport_endpoint;
+    auto second_live = MakeSegment(shared_name, kDefaultSegmentBase, 1024);
+    second_live.te_endpoint = second_segment.transport_endpoint;
+    auto remount =
+        service.ReMountSegment({first_live, second_live}, generate_uuid());
+    ASSERT_TRUE(remount.has_value()) << toString(remount.error());
+    EXPECT_TRUE(HasReadableReplicaForTesting(service, kDefaultTenant,
+                                             "standby_same_name"));
+    auto replicas = service.GetReplicaList("standby_same_name", kDefaultTenant);
+    ASSERT_TRUE(replicas.has_value());
+    EXPECT_EQ(replicas->replicas.size(), 2);
+}
+
+TEST_F(MasterServiceHATest,
+       BatchPromotionAllowsSameNameSegmentsWithDistinctEndpoints) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string shared_name = "127.0.0.1";
+    auto first_segment = MakeStandbyMemorySegment("127.0.0.1:15005", 1024);
+    auto second_segment = MakeStandbyMemorySegment("127.0.0.1:15006", 1024);
+    first_segment.segment_name = shared_name;
+    second_segment.segment_name = shared_name;
+    auto first = MakeStandbyObject("batch_same_name_first",
+                                   first_segment.transport_endpoint);
+    auto second = MakeStandbyObject("batch_same_name_second",
+                                    second_segment.transport_endpoint);
+    second.metadata.replicas.front().id = 2;
+    for (auto* entry : {&first, &second}) {
+        entry->metadata.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    }
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(
+        source->PutMetadata(first.tenant_id, first.key, first.metadata));
+    ASSERT_TRUE(
+        source->PutMetadata(second.tenant_id, second.key, second.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {first_segment, second_segment};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = 2;
+
+    auto result = service.RestoreFromBatchOpLogPromotion(handoff, 1);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "batch_same_name_first"),
+              1);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "batch_same_name_second"),
+              1);
+
+    auto first_live = MakeSegment(shared_name, kDefaultSegmentBase, 1024);
+    first_live.te_endpoint = first_segment.transport_endpoint;
+    auto second_live = MakeSegment(shared_name, kDefaultSegmentBase, 1024);
+    second_live.te_endpoint = second_segment.transport_endpoint;
+    auto first_remount = service.ReMountSegment({first_live}, generate_uuid());
+    ASSERT_TRUE(first_remount.has_value())
+        << toString(first_remount.error());
+    EXPECT_TRUE(HasReadableReplicaForTesting(service, kDefaultTenant,
+                                             "batch_same_name_first"));
+    EXPECT_FALSE(HasReadableReplicaForTesting(service, kDefaultTenant,
+                                              "batch_same_name_second"));
+    auto second_remount =
+        service.ReMountSegment({second_live}, generate_uuid());
+    ASSERT_TRUE(second_remount.has_value())
+        << toString(second_remount.error());
+    EXPECT_TRUE(HasReadableReplicaForTesting(service, kDefaultTenant,
+                                             "batch_same_name_second"));
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreFromStandbyRejectsAmbiguousSegmentNameReplica) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string shared_name = "127.0.0.1";
+    auto first_segment = MakeStandbyMemorySegment("127.0.0.1:15005", 1024);
+    auto second_segment = MakeStandbyMemorySegment("127.0.0.1:15006", 1024);
+    first_segment.segment_name = shared_name;
+    second_segment.segment_name = shared_name;
+    auto ambiguous = MakeStandbyObject("standby_ambiguous_name", shared_name);
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {ambiguous}, 7, {first_segment, second_segment});
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(source->PutMetadata(ambiguous.tenant_id, ambiguous.key,
+                                    ambiguous.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {first_segment, second_segment};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = 1;
+    MasterService batch_service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    auto batch_result =
+        batch_service.RestoreFromBatchOpLogPromotion(handoff, 1);
+
+    ASSERT_FALSE(batch_result.has_value());
+    EXPECT_EQ(batch_result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(MasterServiceHATest, RestoreFromStandbyRejectsDuplicateSegmentEndpoint) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const auto segment = MakeStandbyMemorySegment("127.0.0.1:15005", 1024);
+
+    auto result = service.RestoreFromStandbySnapshot({}, 7, {segment, segment});
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
 TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
     const std::string endpoint = "checksum_restore_segment";
     auto legacy_object = MakeStandbyObject("checksum_legacy_key", endpoint);

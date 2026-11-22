@@ -1179,9 +1179,14 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
 ErrorCode MasterService::ValidateStandbyRemountSegment(
     const Segment& segment) const {
     const StandbySegmentInfo* match = nullptr;
-    for (const auto& standby : standby_memory_segments_) {
-        if (standby.transport_endpoint == segment.te_endpoint ||
-            standby.segment_name == segment.name) {
+    // Exact endpoints are unique; shared names are only a legacy fallback.
+    for (int pass = 0; pass < 2 && match == nullptr; ++pass) {
+        for (const auto& standby : standby_memory_segments_) {
+            if ((pass == 0 &&
+                 standby.transport_endpoint != segment.te_endpoint) ||
+                (pass == 1 && standby.segment_name != segment.name)) {
+                continue;
+            }
             if (match != nullptr && match != &standby) {
                 return ErrorCode::INVALID_PARAMS;
             }
@@ -1340,6 +1345,19 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 return standby_accounted_memory_bytes_.contains(segment.name);
             });
         if (any_standby_kept_alive) {
+            std::unordered_set<std::string> standby_aliases;
+            std::unordered_set<std::string> ambiguous_standby_aliases;
+            for (const auto& standby : standby_memory_segments_) {
+                const auto track_alias = [&](const std::string& alias) {
+                    if (!standby_aliases.insert(alias).second) {
+                        ambiguous_standby_aliases.insert(alias);
+                    }
+                };
+                track_alias(standby.transport_endpoint);
+                if (standby.segment_name != standby.transport_endpoint) {
+                    track_alias(standby.segment_name);
+                }
+            }
             VisitNamespaces([&](const TenantId& tenant_id,
                                 metadata::Namespace& ns) {
                 for (auto object : ns.objects.WriteCursor()) {
@@ -1356,11 +1374,21 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                                   .buffer_descriptor;
                             SegmentRestore* match = nullptr;
                             bool endpoint_match = false;
-                            for (auto& restore : restores) {
-                                if (descriptor.transport_endpoint_ ==
-                                        restore.segment.te_endpoint ||
-                                    descriptor.transport_endpoint_ ==
-                                        restore.segment.name) {
+                            // Prefer exact endpoints over shared name aliases.
+                            for (int pass = 0; pass < 2 && !endpoint_match;
+                                 ++pass) {
+                                if (pass == 1 &&
+                                    ambiguous_standby_aliases.contains(
+                                        descriptor.transport_endpoint_)) {
+                                    break;
+                                }
+                                for (auto& restore : restores) {
+                                    if (descriptor.transport_endpoint_ !=
+                                        (pass == 0
+                                             ? restore.segment.te_endpoint
+                                             : restore.segment.name)) {
+                                        continue;
+                                    }
                                     endpoint_match = true;
                                     // Reject CXL via the existing check below.
                                     if (descriptor.protocol_ != "cxl" &&
@@ -3222,7 +3250,7 @@ struct MasterService::LegacyRestoreContext {
         segments_by_alias;
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>&
         allocators;
-    std::unordered_map<std::string, uint64_t>& accounted_bytes;
+    std::unordered_map<const StandbySegmentInfo*, uint64_t>& accounted_bytes;
     size_t& rejected_count;
     size_t& already_existing_count;
     std::vector<std::pair<TenantId, std::string>>& repair_remove_keys;
@@ -3294,6 +3322,11 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
                 ctx.segments_by_alias.find(buffer.transport_endpoint_);
             if (segment_it == ctx.segments_by_alias.end()) {
                 NoteLegacyStandbyRejection(ctx, entry, "unknown_endpoint");
+                valid = false;
+                break;
+            }
+            if (segment_it->second == nullptr) {
+                NoteLegacyStandbyRejection(ctx, entry, "ambiguous_alias");
                 valid = false;
                 break;
             }
@@ -3419,7 +3452,7 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
         // Per-object bytes join the segment totals only once the whole
         // object validates, so a mid-construction rejection never leaves
         // phantom accounting behind for later capacity checks or metrics.
-        std::unordered_map<std::string, uint64_t> object_bytes;
+        std::unordered_map<const StandbySegmentInfo*, uint64_t> object_bytes;
 
         for (size_t desc_idx = 0; desc_idx < standby_meta.replicas.size();
              ++desc_idx) {
@@ -3436,9 +3469,8 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     ctx.segments_by_alias.at(buffer.transport_endpoint_);
                 if (desc.status != ReplicaStatus::REMOVED &&
                     desc.status != ReplicaStatus::FAILED) {
-                    const uint64_t used =
-                        ctx.accounted_bytes[segment->segment_name] +
-                        object_bytes[segment->segment_name];
+                    const uint64_t used = ctx.accounted_bytes[segment] +
+                                          object_bytes[segment];
                     if (used > segment->capacity ||
                         buffer.size_ > segment->capacity - used) {
                         NoteLegacyStandbyRejection(ctx, entry,
@@ -3446,7 +3478,7 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                         construction_ok = false;
                         break;
                     }
-                    object_bytes[segment->segment_name] += buffer.size_;
+                    object_bytes[segment] += buffer.size_;
                 }
 
                 replicas.push_back(Replica(
@@ -3512,8 +3544,8 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
         if (!construction_ok) {
             continue;
         }
-        for (const auto& [segment_name, bytes] : object_bytes) {
-            ctx.accounted_bytes[segment_name] += bytes;
+        for (const auto& [segment, bytes] : object_bytes) {
+            ctx.accounted_bytes[segment] += bytes;
         }
         ctx.prepared.push_back(
             {accepted_entry.entry, std::move(accepted_entry.tenant_id),
@@ -3838,8 +3870,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     }
 
     std::vector<StandbySegmentInfo> restored_memory_segments;
+    // A null entry marks an alias shared by multiple memory segments. It is
+    // rejected only if a replica actually references it.
     std::unordered_map<std::string, const StandbySegmentInfo*>
         memory_segments_by_alias;
+    std::unordered_set<std::string> memory_segment_endpoints;
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
         restored_allocators;
     std::unordered_set<std::string> restored_invalid_endpoints;
@@ -3855,17 +3890,20 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                        << ", capacity=" << seg.capacity;
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        const auto add_alias = [&](const std::string& alias) {
-            return memory_segments_by_alias.emplace(alias, &seg).second;
-        };
-        if (!add_alias(seg.transport_endpoint) ||
-            (seg.segment_name != seg.transport_endpoint &&
-             !add_alias(seg.segment_name))) {
-            LOG(ERROR)
-                << "RestoreFromStandbySnapshot: ambiguous memory segment "
-                << "name=" << seg.segment_name
-                << ", endpoint=" << seg.transport_endpoint;
+        if (!memory_segment_endpoints.insert(seg.transport_endpoint).second) {
+            LOG(ERROR) << "RestoreFromStandbySnapshot: duplicate memory "
+                       << "segment endpoint=" << seg.transport_endpoint;
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const auto add_alias = [&](const std::string& alias) {
+            auto [it, inserted] = memory_segments_by_alias.emplace(alias, &seg);
+            if (!inserted) {
+                it->second = nullptr;
+            }
+        };
+        add_alias(seg.transport_endpoint);
+        if (seg.segment_name != seg.transport_endpoint) {
+            add_alias(seg.segment_name);
         }
 
         restored_memory_segments.push_back(seg);
@@ -3901,7 +3939,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     // Batch restore spans chunks, so it needs an ordered cross-chunk index.
     std::unordered_map<const StandbySegmentInfo*, std::map<uintptr_t, uint64_t>>
         bounded_memory_ranges;
-    std::unordered_map<std::string, uint64_t> restored_accounted_memory_bytes;
+    std::unordered_map<const StandbySegmentInfo*, uint64_t>
+        restored_accounted_memory_bytes;
     size_t restored_object_count = 0;
     size_t dropped_stale_replica_count = 0;
     size_t skipped_stale_object_count = 0;
@@ -3972,6 +4011,14 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                         dropped_stale_replica = true;
                         continue;
                     }
+                    if (segment_it->second == nullptr) {
+                        LOG(ERROR)
+                            << "RestoreFromStandbySnapshot: ambiguous memory "
+                            << "segment alias=" << buffer.transport_endpoint_
+                            << ", tenant=" << tenant_id.value()
+                            << ", key=" << user_key;
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
                     if (buffer.size_ != standby_meta.size ||
                         buffer.size_ == 0 ||
                         buffer.buffer_address_ >
@@ -3988,8 +4035,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                     if (desc.status != ReplicaStatus::REMOVED &&
                         desc.status != ReplicaStatus::FAILED) {
                         auto& bytes =
-                            restored_accounted_memory_bytes[segment
-                                                                ->segment_name];
+                            restored_accounted_memory_bytes[segment];
                         if (bytes > segment->capacity ||
                             buffer.size_ > segment->capacity - bytes) {
                             LOG(ERROR)
@@ -4154,6 +4200,14 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         }
     }
 
+    // Metrics and remount bookkeeping stay name-keyed; capacity validation
+    // above uses pointer identity so equal names do not share a budget.
+    std::unordered_map<std::string, uint64_t>
+        restored_accounted_memory_bytes_by_name;
+    for (const auto& [segment, bytes] : restored_accounted_memory_bytes) {
+        restored_accounted_memory_bytes_by_name[segment->segment_name] += bytes;
+    }
+
     const auto prev_standby_accounted_memory_bytes =
         standby_accounted_memory_bytes_;
     const auto prev_standby_memory_segments = standby_memory_segments_;
@@ -4182,7 +4236,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     };
 
     standby_accounted_memory_bytes_ =
-        std::move(restored_accounted_memory_bytes);
+        std::move(restored_accounted_memory_bytes_by_name);
     standby_memory_segments_ = std::move(restored_memory_segments);
     standby_allocator_keepalive_ = std::move(restored_allocators);
     invalid_replica_endpoints_ = std::move(restored_invalid_endpoints);
