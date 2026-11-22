@@ -74,3 +74,9 @@ add_executable(exists_evict_bench exists_evict_bench.cpp)
 target_link_libraries(
   exists_evict_bench PRIVATE master_service_test_peer cachelib_memory_allocator
                              gflags::gflags glog::glog pthread)
+
+# Add KV cache data plane benchmark executable
+add_executable(kv_cache_bench kv_cache_bench.cpp)
+target_link_libraries(
+  kv_cache_bench PRIVATE mooncake_store cachelib_memory_allocator glog::glog
+                        pthread)

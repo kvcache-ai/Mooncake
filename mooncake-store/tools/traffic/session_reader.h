@@ -64,6 +64,9 @@ class SessionReader {
 
     std::vector<std::filesystem::path> files_;
     std::size_t next_file_ = 0;
+    // The sequence number the next segment must carry. A gap means a segment
+    // file was removed, and the remaining traffic is not the recorded session.
+    std::uint64_t expected_segment_seq_ = 0;
     std::filesystem::path current_path_;
     std::ifstream input_;
     std::array<std::uint8_t, 16> session_id_{};

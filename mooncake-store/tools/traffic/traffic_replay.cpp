@@ -26,40 +26,19 @@
 #include <json/json.h>
 
 #include "session_reader.h"
+#include "traffic_wire.h"
 
 namespace {
 
-constexpr std::uint32_t kRequestMagic = 21;
-constexpr std::uint32_t kMaxResponseBytes = 512U * 1024U * 1024U;
+using mooncake::traffic::wire::kMaxResponseBytes;
+using mooncake::traffic::wire::kProtocolVersion;
+using mooncake::traffic::wire::kRequestMagic;
+using mooncake::traffic::wire::RequestHeader;
+using mooncake::traffic::wire::ResponseHeader;
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
-
-#pragma pack(push, 1)
-struct RequestHeader {
-    std::uint8_t magic;
-    std::uint8_t version;
-    std::uint8_t serialize_type;
-    std::uint8_t msg_type;
-    std::uint32_t seq_num;
-    std::uint32_t function_id;
-    std::uint32_t length;
-    std::uint32_t attach_length;
-};
-static_assert(sizeof(RequestHeader) == 20);
-
-struct ResponseHeader {
-    std::uint8_t magic;
-    std::uint8_t version;
-    std::uint8_t err_code;
-    std::uint8_t msg_type;
-    std::uint32_t seq_num;
-    std::uint32_t length;
-    std::uint32_t attach_length;
-};
-static_assert(sizeof(ResponseHeader) == 16);
-#pragma pack(pop)
 
 using mooncake::traffic::Record;
 using mooncake::traffic::RedactionName;
@@ -199,7 +178,7 @@ class SocketClient {
     bool Replay(const Record& record, bool* rpc_ok, std::string* error) {
         RequestHeader request{};
         request.magic = static_cast<std::uint8_t>(kRequestMagic);
-        request.version = 0;
+        request.version = static_cast<std::uint8_t>(kProtocolVersion);
         request.serialize_type = 0;
         request.msg_type = 0;
         request.seq_num = record.header.seq_num;
@@ -223,7 +202,8 @@ class SocketClient {
                      DescribeIoFailure(io_error, timeout_ms_);
             return false;
         }
-        if (response.magic != kRequestMagic || response.version != 0 ||
+        if (response.magic != kRequestMagic ||
+            response.version != kProtocolVersion ||
             response.length > kMaxResponseBytes) {
             Close();
             *error = "bad response header";
@@ -280,6 +260,7 @@ struct Options {
     double speed = 0.0;
     int timeout_ms = 5000;
     bool allow_all = false;
+    bool allow_rpc_errors = false;
     bool dry_run = false;
     bool verbose = false;
     std::vector<std::string> allow_route_args;
@@ -367,7 +348,11 @@ void PrintUsage() {
         << "  --allow-all           allow every route\n"
         << "  --dry-run             parse and count without sending\n"
         << "  --rate QPS            fixed send rate\n"
-        << "  --speed N             replay at N times the recorded speed\n"
+        << "  --speed N             replay at N times the recorded speed, in\n"
+        << "                        timestamp order (holds the selected records\n"
+        << "                        in memory)\n"
+        << "  --allow-rpc-errors    exit 0 when the server returned errors; use\n"
+        << "                        only to test the transport\n"
         << "  --timeout-ms N        socket timeout (default 5000)\n"
         << "  --verbose             print progress\n";
 }
@@ -446,6 +431,8 @@ bool ParseOptions(int argc, char** argv, Options* options, std::string* error) {
             options->allow_route_args.push_back(value);
         } else if (arg == "--allow-all") {
             options->allow_all = true;
+        } else if (arg == "--allow-rpc-errors") {
+            options->allow_rpc_errors = true;
         } else if (arg == "--dry-run") {
             options->dry_run = true;
         } else if (arg == "--verbose") {
@@ -643,6 +630,38 @@ int Run(const Options& options) {
     Record record;
     const auto start = std::chrono::steady_clock::now();
 
+    const auto send = [&](const Record& item) -> int {
+        if (!client.EnsureConnected(options.target, options.timeout_ms,
+                                    &error)) {
+            return ReportError(error, 2);
+        }
+        pacer.Wait(item.header.timestamp_ms);
+        bool rpc_ok = false;
+        if (!client.Replay(item, &rpc_ok, &error)) {
+            ++transport_error;
+            return ReportError(
+                "record " + std::to_string(records_read) + ": " + error, 2);
+        }
+        ++sent;
+        bytes += item.payload.size();
+        if (rpc_ok) {
+            ++ok;
+        } else {
+            ++rpc_error;
+        }
+        if (options.verbose && sent % 10000 == 0) {
+            std::cerr << "sent=" << sent << "\n";
+        }
+        return 0;
+    };
+
+    // --speed follows the recorded timestamps, but a segment stores records in
+    // the order the recorder drained its shards, which is not the arrival
+    // order. The selected records are buffered and sorted before the first
+    // send so the pacing follows the trace instead of the file layout.
+    const bool ordered = options.speed > 0 && !options.dry_run;
+    std::vector<Record> batch;
+
     while (true) {
         const auto result = reader.Next(&record, &error);
         if (result == SessionReader::NextResult::kDone) {
@@ -662,26 +681,25 @@ int Run(const Options& options) {
         if (options.dry_run) {
             continue;
         }
-        if (!client.EnsureConnected(options.target, options.timeout_ms,
-                                    &error)) {
-            return ReportError(error, 2);
+        if (ordered) {
+            batch.push_back(record);
+            continue;
         }
-        pacer.Wait(record.header.timestamp_ms);
-        bool rpc_ok = false;
-        if (!client.Replay(record, &rpc_ok, &error)) {
-            ++transport_error;
-            return ReportError(
-                "record " + std::to_string(records_read) + ": " + error, 2);
+        if (const int code = send(record); code != 0) {
+            return code;
         }
-        ++sent;
-        bytes += record.payload.size();
-        if (rpc_ok) {
-            ++ok;
-        } else {
-            ++rpc_error;
-        }
-        if (options.verbose && sent % 10000 == 0) {
-            std::cerr << "sent=" << sent << "\n";
+    }
+
+    if (ordered) {
+        std::stable_sort(batch.begin(), batch.end(),
+                         [](const Record& a, const Record& b) {
+                             return a.header.timestamp_ms <
+                                    b.header.timestamp_ms;
+                         });
+        for (const Record& item : batch) {
+            if (const int code = send(item); code != 0) {
+                return code;
+            }
         }
     }
 
@@ -697,7 +715,16 @@ int Run(const Options& options) {
         std::cerr << "warning: the session has no footer; it was cut short and "
                      "the records after the cut are missing\n";
     }
-    return transport_error == 0 ? 0 : 2;
+    if (transport_error > 0) {
+        return 2;
+    }
+    if (rpc_error > 0 && !options.allow_rpc_errors) {
+        std::cerr << rpc_error
+                  << " records returned a non-zero err_code; pass "
+                     "--allow-rpc-errors to treat them as success\n";
+        return 1;
+    }
+    return 0;
 }
 
 }  // namespace

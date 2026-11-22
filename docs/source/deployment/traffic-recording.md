@@ -146,10 +146,16 @@ sends every route and belongs on a disposable target.
 |--------|-------------|
 | `--dry-run` | Select records without opening a connection. |
 | `--rate N` | Limit the send rate to N requests per second. |
-| `--speed N` | Replay at N times the recorded pace. |
+| `--speed N` | Replay at N times the recorded pace, sending in timestamp order; the selected records are held in memory. |
+| `--allow-rpc-errors` | Return 0 when the server answered with errors; use only to test the transport. |
 | `--timeout-ms N` | Bounds connection setup and each response; defaults to 5000. |
 | `--limit N` | Stop after N selected records; must be at least 1. |
 | `--verbose` | Print per-request progress. |
+
+The exit code is 2 when the connection or framing failed and 1 when the server
+answered with a non-zero `err_code`, so a script that only checks for zero does
+not treat an application error as success. A trace that reads objects answers
+`object_not_found` on an empty Master, which is exactly what this code reports.
 
 The tool speaks the Master client framing over one TCP connection and does not
 link the Master service library. `metadata` sessions cannot be replayed because
@@ -162,6 +168,115 @@ to travel. Replaying needs a Master in a comparable state: `run` reports `ok`
 for every well-formed response and does not decode handler results, so a trace
 that reads objects answers `object_not_found` on an empty Master. Check the
 Master log for the handler-level outcome.
+
+## Profiling and Load Testing
+
+Two more tools read the same session directory. Build them alongside the
+replay tool:
+
+```bash
+cmake --build build --target traffic_profile traffic_load
+```
+
+`traffic_profile` describes what a session contains without decoding any
+payload: the route mix, the payload size distribution, the arrival spacing, and
+the connection count. It reads every record to verify the block checksums but
+keeps only the route, the payload size, and the timestamp, so its memory grows
+with the record count and not with the payload bytes. It works for every
+redaction mode.
+
+```bash
+./build/mooncake-store/tools/traffic/traffic_profile \
+  --dir /var/log/mooncake/traffic/session-1234567890-1234
+```
+
+`traffic_load` replays a session against a Master at a fixed aggregate rate.
+Every connection keeps one request in flight: it sends, waits for the reply,
+then waits for the next slot. `--saturate` drops the pacing and lets each
+connection send as soon as the previous reply arrives, which measures the
+capacity of a given concurrency.
+
+```bash
+./build/mooncake-store/tools/traffic/traffic_load \
+  --dir /var/log/mooncake/traffic/session-1234567890-1234 \
+  --target 127.0.0.1:50051 --rate 5000 --connections 8 --duration 30
+```
+
+The report is a JSON object with `achieved_rps`, `offered_rps`, and percentiles
+of `service_us` (send to complete response) and `queue_us` (scheduled slot to
+actual send). A growing `queue_us` means the server cannot hold the requested
+rate; `--saturate` has no slot, so it does not report that field. The exit code
+is nonzero when a connection failed or a response carried a non-zero `err_code`;
+`rpc_errors_by_route` names the routes that failed.
+
+A session without a footer lost its last records, so `traffic_load` refuses it
+unless `--allow-incomplete` is given. Replaying a truncated session is still
+useful when the missing tail is known to be idle.
+
+A session replays the same records repeatedly, so the key space does not grow
+with the run. Against an empty Master every lookup misses, which measures the
+miss path and not a populated cache. The recorded connection and sequence
+numbers are not restored either: requests are spread over the replay
+connections, so a method whose behaviour depends on ordering or on a connection
+being reused sees this as a request mix rather than as the original trace.
+
+## KV Cache Benchmark
+
+The tools above measure the Master control plane. A model's KV cache lives in
+the store data plane, which never reaches the Master and therefore never appears
+in a recorded session. `kv_cache_bench` measures that path directly: it fills a
+segment with blocks shaped like a model's KV cache, then issues the same batch
+reads a connector issues when it restores a request's context.
+
+```bash
+cmake -S . -B build -DBUILD_BENCHMARK=ON
+cmake --build build --target kv_cache_bench
+
+./build/mooncake-store/benchmarks/kv_cache_bench \
+  --master 127.0.0.1:50051 --block-bytes 524288 \
+  --blocks-per-request 8 --prefix-blocks 4 \
+  --prefixes 32 --requests-per-prefix 32 \
+  --rate 2000 --connections 64 --scale 2 --duration 30
+```
+
+Each request reads `blocks-per-request` blocks, `prefix-blocks` of which it
+shares with the other requests on the same prefix. `--scale` multiplies the
+target rate, the connection count, and the number of distinct prefixes, so the
+per-request shape and the hit ratio stay the same while the working set grows
+with the load.
+
+The report is a JSON object with `achieved_rps`, `gib_per_s`, and percentiles of
+`fetch_us`, the time to read one request's working set. That number is the
+contribution the store makes to time-to-first-token when a request's context is
+not in GPU memory. `client_bound` is true when the run did not reach its target
+rate, in which case `fetch_us` describes the load generator's queue rather than
+the store.
+
+Two limits follow from the setup. Both clients run on one host and the transfer
+protocol is TCP, so the measurement covers the software path (RPC, transfer
+scheduling, memory copy) and not a multi-host network. The blocks are filled
+with a constant pattern, so nothing here is sensitive to data content or to the
+checksum path.
+
+One process is limited by its own transfer thread: past roughly 64 connections
+it moves about 2.3 GiB/s regardless of the request size, and adding connections
+past that point lowers throughput. The data plane is therefore scaled by adding
+processes, and `kv_fleet.sh` runs several of them with distinct listening ports
+and reports one aggregate line.
+
+```bash
+mooncake-store/benchmarks/kv_fleet.sh 4 12000 8 \
+  --master 127.0.0.1:50051 --block-bytes 131072 \
+  --blocks-per-request 8 --prefix-blocks 4 \
+  --prefixes 16 --requests-per-prefix 16 --duration 30
+```
+
+The first argument is the process count, the second the aggregate target rate,
+and the third the connection count of one process; everything after that is
+passed through. Each process gets its own key prefix, so the fleet's working set
+grows with the process count instead of every process writing the same objects.
+The aggregate `fetch_us` is the slowest process, since a release gate cares
+about the tail rather than the mean.
 
 ## Limits
 

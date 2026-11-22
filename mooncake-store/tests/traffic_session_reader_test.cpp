@@ -1,5 +1,6 @@
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -242,6 +243,40 @@ TEST_F(SessionReaderTest, ReportsFooterCounterMismatch) {
     // been consumed.
     EXPECT_FALSE(reader.Finish(&error));
     EXPECT_NE(error.find("footer counters mismatch"), std::string::npos)
+        << error;
+}
+
+TEST_F(SessionReaderTest, RejectsMissingMiddleSegment) {
+    // A segment budget smaller than one block gives every block its own file.
+    FileSink sink(64, 300, 0, RedactionMode::kNone);
+    ASSERT_TRUE(sink.OpenSession(dir_.path().string(), 1));
+    const std::string payload(44, 'x');
+    for (int index = 0; index < 3; ++index) {
+        auto record =
+            MakeRecord(7, static_cast<std::uint32_t>(index), payload);
+        struct iovec iov[1] = {{record.data(), record.size()}};
+        ASSERT_TRUE(sink.WriteRecords(iov, 1, record.size(), 1));
+    }
+    sink.Close();
+    const std::string session = sink.session_dir();
+
+    std::vector<std::filesystem::path> segments;
+    for (const auto& entry : std::filesystem::directory_iterator(session)) {
+        if (entry.path().extension() == ".mcr") {
+            segments.push_back(entry.path());
+        }
+    }
+    ASSERT_EQ(segments.size(), 3u);
+    std::sort(segments.begin(), segments.end());
+    std::error_code ec;
+    std::filesystem::remove(segments[1], ec);
+    ASSERT_FALSE(ec) << ec.message();
+
+    SessionReader reader;
+    std::string error;
+    ASSERT_TRUE(reader.Open(session, &error)) << error;
+    EXPECT_FALSE(reader.Finish(&error));
+    EXPECT_NE(error.find("segment 1 is missing before"), std::string::npos)
         << error;
 }
 

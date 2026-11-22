@@ -160,6 +160,12 @@ SessionReader::OpenResult SessionReader::OpenNextFile(std::string* error) {
         *error = "unsupported file header: " + current_path_.string();
         return OpenResult::kError;
     }
+    if (header.segment_seq != expected_segment_seq_) {
+        *error = "segment " + std::to_string(expected_segment_seq_) +
+                 " is missing before " + current_path_.string();
+        return OpenResult::kError;
+    }
+    ++expected_segment_seq_;
     if (segment_count_ == 0) {
         std::memcpy(session_id_.data(), header.session_id,
                     session_id_.size());
