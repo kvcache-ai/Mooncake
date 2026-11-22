@@ -1384,9 +1384,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                 }
                                 for (auto& restore : restores) {
                                     if (descriptor.transport_endpoint_ !=
-                                        (pass == 0
-                                             ? restore.segment.te_endpoint
-                                             : restore.segment.name)) {
+                                        (pass == 0 ? restore.segment.te_endpoint
+                                                   : restore.segment.name)) {
                                         continue;
                                     }
                                     endpoint_match = true;
@@ -3469,8 +3468,8 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     ctx.segments_by_alias.at(buffer.transport_endpoint_);
                 if (desc.status != ReplicaStatus::REMOVED &&
                     desc.status != ReplicaStatus::FAILED) {
-                    const uint64_t used = ctx.accounted_bytes[segment] +
-                                          object_bytes[segment];
+                    const uint64_t used =
+                        ctx.accounted_bytes[segment] + object_bytes[segment];
                     if (used > segment->capacity ||
                         buffer.size_ > segment->capacity - used) {
                         NoteLegacyStandbyRejection(ctx, entry,
@@ -4034,8 +4033,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                     const auto* segment = segment_it->second;
                     if (desc.status != ReplicaStatus::REMOVED &&
                         desc.status != ReplicaStatus::FAILED) {
-                        auto& bytes =
-                            restored_accounted_memory_bytes[segment];
+                        auto& bytes = restored_accounted_memory_bytes[segment];
                         if (bytes > segment->capacity ||
                             buffer.size_ > segment->capacity - bytes) {
                             LOG(ERROR)

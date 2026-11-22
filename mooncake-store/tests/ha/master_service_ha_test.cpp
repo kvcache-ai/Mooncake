@@ -1440,16 +1440,14 @@ TEST_F(MasterServiceHATest,
     auto second_live = MakeSegment(shared_name, kDefaultSegmentBase, 1024);
     second_live.te_endpoint = second_segment.transport_endpoint;
     auto first_remount = service.ReMountSegment({first_live}, generate_uuid());
-    ASSERT_TRUE(first_remount.has_value())
-        << toString(first_remount.error());
+    ASSERT_TRUE(first_remount.has_value()) << toString(first_remount.error());
     EXPECT_TRUE(HasReadableReplicaForTesting(service, kDefaultTenant,
                                              "batch_same_name_first"));
     EXPECT_FALSE(HasReadableReplicaForTesting(service, kDefaultTenant,
                                               "batch_same_name_second"));
     auto second_remount =
         service.ReMountSegment({second_live}, generate_uuid());
-    ASSERT_TRUE(second_remount.has_value())
-        << toString(second_remount.error());
+    ASSERT_TRUE(second_remount.has_value()) << toString(second_remount.error());
     EXPECT_TRUE(HasReadableReplicaForTesting(service, kDefaultTenant,
                                              "batch_same_name_second"));
 }
