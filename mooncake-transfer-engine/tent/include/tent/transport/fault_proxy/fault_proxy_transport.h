@@ -132,6 +132,10 @@ class FaultProxyTransport : public Transport {
         return s;
     }
 
+    Status isSubBatchDrained(SubBatchRef batch, bool& drained) override {
+        return real_->isSubBatchDrained(batch, drained);
+    }
+
     // -- Memory management (pass-through) ------------------------------------
 
     Status addMemoryBuffer(BufferDesc& desc,

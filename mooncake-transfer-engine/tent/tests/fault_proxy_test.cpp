@@ -85,6 +85,12 @@ class FakeTransport : public Transport {
         return Status::OK();
     }
 
+    bool physically_drained = true;
+    Status isSubBatchDrained(SubBatchRef, bool& drained) override {
+        drained = physically_drained;
+        return Status::OK();
+    }
+
     const char* getName() const override { return "<fake>"; }
 };
 
@@ -142,6 +148,13 @@ TEST(FaultProxyTest, DelegatesToReal) {
     EXPECT_EQ(ts.transferred_bytes, 4096u);
     EXPECT_EQ(fake->status_calls, 1);
 
+    bool drained = true;
+    fake->physically_drained = false;
+    ASSERT_TRUE(proxy->isSubBatchDrained(batch, drained).ok());
+    EXPECT_FALSE(drained);
+    fake->physically_drained = true;
+    ASSERT_TRUE(proxy->isSubBatchDrained(batch, drained).ok());
+    EXPECT_TRUE(drained);
     proxy->freeSubBatch(batch);
 }
 
