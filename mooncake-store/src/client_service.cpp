@@ -981,15 +981,19 @@ ErrorCode Client::InitTransferEngine(
     // engine has no use for the RDMA notification channel, which registers
     // 32 MiB per endpoint. Keep the channel off while this engine is set up,
     // unless MC_RDMA_NOTIFY_ENABLED is set. Engines set up before or after
-    // this one see the configured value; like the guard above, this assumes
-    // TE inits are serialized within the process.
+    // this one see the configured value. Only the call that turned it off
+    // turns it back on, so overlapping Store setups do not leave it off.
     struct RdmaNotifyGuard {
-        const bool configured = globalConfig().rdma_notify_enabled;
-        ~RdmaNotifyGuard() { globalConfig().rdma_notify_enabled = configured; }
+        bool turned_off = false;
+        ~RdmaNotifyGuard() {
+            if (turned_off) globalConfig().rdma_notify_enabled = true;
+        }
     } rdma_notify_guard;
     if (protocol == "rdma" && !globalConfig().use_rdma_twosided &&
+        globalConfig().rdma_notify_enabled &&
         std::getenv("MC_RDMA_NOTIFY_ENABLED") == nullptr) {
         globalConfig().rdma_notify_enabled = false;
+        rdma_notify_guard.turned_off = true;
     }
 
     // Check if using TENT mode - TENT handles transport configuration
