@@ -54,6 +54,7 @@ struct HylinkTask {
     // Device of the source buffer. The remote handle import, the copy and
     // the completion event all run under this device's context.
     int device_id = -1;
+    hipStream_t pending_stream = nullptr;
     hipEvent_t completion_event = nullptr;
 };
 
@@ -90,6 +91,8 @@ class HylinkTransport : public Transport {
 
     Status getTransferStatus(SubBatchRef batch, int task_id,
                              TransferStatus& status) override;
+
+    Status isSubBatchDrained(SubBatchRef batch, bool& drained) override;
 
     Status addMemoryBuffer(BufferDesc& desc,
                            const MemoryOptions& options) override;
@@ -130,12 +133,8 @@ class HylinkTransport : public Transport {
     // Issues the task's copy and records its completion event. Must be
     // called with task.device_id as the current device.
     Status submitTaskCopy(HylinkTask& task);
-    // Handles one request end to end under the source buffer's device
-    // context: validate, open the remote handle, submit the copy. Mirrors
-    // the classic hip transport's startAsyncTransfer.
-    Status startAsyncTransfer(const Request& request,
-                              const SegmentDescRef& local_segment,
-                              HylinkTask& task);
+    Status prepareTask(const Request& request,
+                       const SegmentDescRef& local_segment, HylinkTask& task);
 
     Status relocateSharedMemoryAddress(uint64_t& dest_addr, uint64_t length,
                                        uint64_t target_id,

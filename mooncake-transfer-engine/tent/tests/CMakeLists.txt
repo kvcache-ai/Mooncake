@@ -533,6 +533,34 @@ if(TARGET tent_xport_gds)
            COMMAND tent_gds_transport_status_test)
 endif()
 
+if(USE_HYLINK)
+  add_executable(tent_hylink_drain_test hylink_drain_test.cpp)
+  target_link_libraries(tent_hylink_drain_test
+                        PRIVATE gtest gtest_main tent_link_group hip::host)
+  target_include_directories(tent_hylink_drain_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_options(
+    tent_hylink_drain_test
+    PRIVATE
+    "-Wl,--wrap=hipGetDeviceCount"
+    "-Wl,--wrap=hipGetDevice"
+    "-Wl,--wrap=hipSetDevice"
+    "-Wl,--wrap=hipStreamCreate"
+    "-Wl,--wrap=hipStreamDestroy"
+    "-Wl,--wrap=hipMemcpyAsync"
+    "-Wl,--wrap=hipEventCreateWithFlags"
+    "-Wl,--wrap=hipEventRecord"
+    "-Wl,--wrap=hipEventSynchronize"
+    "-Wl,--wrap=hipEventDestroy"
+    "-Wl,--wrap=hipEventQuery"
+    "-Wl,--wrap=hipStreamQuery"
+    "-Wl,--wrap=hipGetLastError"
+    "-Wl,--wrap=hipGetErrorString")
+  add_test(NAME tent_hylink_drain_test COMMAND tent_hylink_drain_test)
+  set_tests_properties(tent_hylink_drain_test PROPERTIES ENVIRONMENT
+                                                         "MC_HYLINK_USE_VMM=0")
+endif()
+
 if(USE_SUNRISE)
   add_executable(tent_sunrise_link_transport_test
                  sunrise_link_transport_test.cpp)
