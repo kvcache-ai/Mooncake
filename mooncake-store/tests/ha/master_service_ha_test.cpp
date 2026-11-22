@@ -6651,9 +6651,7 @@ TEST_F(MasterServiceHATest, InvalidMountLogEntryLeavesNoSegmentOrClient) {
         EXPECT_FALSE(
             MasterServiceTestPeer::SegmentManager(service).GetSegmentBasicInfo(
                 segment.id, name, endpoint));
-        EXPECT_FALSE(
-            MasterServiceTestPeer::ClientLivenessRecords(service).contains(
-                client));
+        EXPECT_FALSE(MasterServiceTestPeer(service).FindClientRecord(client));
     }
     // The limit itself is legal. Correcting the request must mount and log it,
     // rather than finding state left behind by the rejected request.
@@ -6692,8 +6690,7 @@ TEST_F(MasterServiceHATest, InvalidRemountLogEntryRejectsTheWholeGroup) {
     auto& manager = MasterServiceTestPeer::SegmentManager(service);
     EXPECT_FALSE(manager.GetSegmentBasicInfo(first.id, name, endpoint));
     EXPECT_FALSE(manager.GetSegmentBasicInfo(second.id, name, endpoint));
-    EXPECT_FALSE(
-        MasterServiceTestPeer::ClientLivenessRecords(service).contains(client));
+    EXPECT_FALSE(MasterServiceTestPeer(service).FindClientRecord(client));
     second.name.resize(kMaxOpLogObjectKeySize);
     ASSERT_TRUE(service.ReMountSegment({first, second}, client));
     OpLogBatchStorage storage(cluster_id, *backend);

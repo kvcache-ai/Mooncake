@@ -172,6 +172,16 @@ if(BUILD_UNIT_TESTS)
   set_tests_properties(
     tebench_reject_zero_duration
     PROPERTIES PASS_REGULAR_EXPRESSION "--duration must be positive" TIMEOUT 10)
+  add_test(
+    NAME tebench_reject_negative_warmup
+    COMMAND
+      ${CMAKE_COMMAND} -E env ${TEBENCH_HELP_ENV} $<TARGET_FILE:tebench>
+      --backend=classic --xport_type=tcp --target_seg_name=127.0.0.1:1
+      --warmup_ms=-1)
+  set_tests_properties(
+    tebench_reject_negative_warmup
+    PROPERTIES PASS_REGULAR_EXPRESSION "--warmup_ms must be non-negative"
+               TIMEOUT 10)
   # Target mode on the classic backend, which used to start with no buffers.
   add_test(
     NAME tebench_reject_unknown_seg_type
