@@ -235,47 +235,30 @@ Mooncake connects inference engines, cache middleware, RL systems, and deploymen
   <a href="https://github.com/ai-dynamo/dynamo"><img src="image/ecosystem/dynamo.png" width="122" alt="Dynamo"></a>
   <br>
   <a href="https://github.com/llm-d/llm-d"><img src="image/ecosystem/llm-d.png" width="122" alt="llm-d"></a>
-  <a href="https://github.com/verl-project/verl"><img src="image/ecosystem/verl.png" width="122" alt="verl"></a>
   <a href="https://github.com/THUDM/slime"><img src="image/ecosystem/slime.png" width="122" alt="slime"></a>
   <a href="https://github.com/radixark/miles"><img src="image/ecosystem/miles.png" width="122" alt="Miles"></a>
   <a href="https://github.com/inclusionAI/Awex"><img src="image/ecosystem/awex.png" width="122" alt="Awex"></a>
   <a href="https://github.com/sgl-project/SpecForge"><img src="image/ecosystem/specforge.png" width="122" alt="SpecForge"></a>
-  <br><br>
-  <a href="https://github.com/NVIDIA/TensorRT-LLM"><b>TensorRT-LLM</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/taco-project/FlexKV"><b>FlexKV</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/alibaba/tair-kvcache"><b>Tair KVCache</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/ai-dynamo/nixl"><b>NIXL</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/AMD-AGI/Infera"><b>Infera</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/Tele-AI/Fluxon"><b>Fluxon</b></a>
   <br>
-  <a href="https://github.com/sgl-project/rbg"><b>RBG</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/smg-project/smg"><b>SMG</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/NVIDIA/srt-slurm"><b>srt-slurm</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/skyrl-project/SkyRL"><b>SkyRL</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/PrimeIntellect-ai/prime-rl"><b>prime-rl</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/NVIDIA-NeMo/RL"><b>NeMo RL</b></a>
-  <br>
-  <a href="https://github.com/Tencent-Hunyuan/UniRL"><b>UniRL</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/Ascend/TransferQueue"><b>TransferQueue</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/MoonshotAI/checkpoint-engine"><b>checkpoint-engine</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/pytorch/torchtitan"><b>TorchTitan</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/lightseekorg/TorchSpec"><b>TorchSpec</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://github.com/vllm-project/speculators"><b>Speculators</b></a>
+  <a href="https://github.com/NVIDIA/TensorRT-LLM">TensorRT-LLM</a> ·
+  <a href="https://github.com/taco-project/FlexKV">FlexKV</a> ·
+  <a href="https://github.com/alibaba/tair-kvcache">Tair KVCache</a> ·
+  <a href="https://github.com/ai-dynamo/nixl">NIXL</a> ·
+  <a href="https://github.com/AMD-AGI/Infera">Infera</a> ·
+  <a href="https://github.com/Tele-AI/Fluxon">Fluxon</a> ·
+  <a href="https://github.com/sgl-project/rbg">RBG</a> ·
+  <a href="https://github.com/smg-project/smg">SMG</a> ·
+  <a href="https://github.com/NVIDIA/srt-slurm">srt-slurm</a> ·
+  <a href="https://github.com/verl-project/verl">verl</a> ·
+  <a href="https://github.com/skyrl-project/SkyRL">SkyRL</a> ·
+  <a href="https://github.com/PrimeIntellect-ai/prime-rl">prime-rl</a> ·
+  <a href="https://github.com/NVIDIA-NeMo/RL">NeMo RL</a> ·
+  <a href="https://github.com/Tencent-Hunyuan/UniRL">UniRL</a> ·
+  <a href="https://github.com/Ascend/TransferQueue">TransferQueue</a> ·
+  <a href="https://github.com/MoonshotAI/checkpoint-engine">checkpoint-engine</a> ·
+  <a href="https://github.com/pytorch/torchtitan">TorchTitan</a> ·
+  <a href="https://github.com/lightseekorg/TorchSpec">TorchSpec</a> ·
+  <a href="https://github.com/vllm-project/speculators">Speculators</a>
 </p>
 
 <details>
