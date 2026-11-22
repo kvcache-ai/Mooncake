@@ -1703,6 +1703,7 @@ TEST_F(MasterServiceTest, DfsReplicaNormalizesToDiskMediumForKvEvents) {
 
     {
         MasterService service;
+        MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
         const auto context = PrepareSimpleSegment(service);
         ReplicateConfig config;
         config.replica_num = 1;
@@ -1717,45 +1718,42 @@ TEST_F(MasterServiceTest, DfsReplicaNormalizesToDiskMediumForKvEvents) {
                                 TenantId::Default(), ReplicaType::ALL)
                         .has_value());
 
-        // Memory + DFS collapse to exactly the two logical tiers, sorted the
-        // same way the publisher sorts them.
-        auto media = KvMediaForKey(service, "dfs_kv_media");
+        // Memory + DFS collapse to the two logical KV media bits on the route.
+        auto media = AnnouncedKvMediaForKey(service, "dfs_kv_media");
         ASSERT_TRUE(media.has_value());
-        EXPECT_EQ(std::vector<std::string>({"cpu", "disk"}), *media);
-
-        auto removal_media = KvRemovalMediaForKey(service, "dfs_kv_media");
-        ASSERT_TRUE(removal_media.has_value());
-        EXPECT_EQ(std::vector<std::string>({"cpu", "disk"}), *removal_media);
+        EXPECT_EQ(KvEventPublisher::kMediumCpu | KvEventPublisher::kMediumDisk,
+                  *media);
     }
 
     std::error_code ec;
     std::filesystem::remove_all(dfs_root, ec);
 }
 
-// A removal path can run while a replica is still PROCESSING. That medium was
-// never announced as available, but the removal snapshot must still name it:
-// otherwise a tier that a subscriber may have seen is never retracted. The
-// contrast with KvMediaForKey, which counts only completed replicas, is the
-// whole point of having two helpers.
-TEST_F(MasterServiceTest, ProcessingReplicaMediumAppearsInRemovalSnapshot) {
+// PutStart without PutEnd leaves the replica PROCESSING; the route observer
+// keeps announced_kv_media at 0, so revoking the uncommitted write tears down
+// the slot without bumping the tenant epoch or retracting an unannounced tier.
+TEST_F(MasterServiceTest, ProcessingReplicaRemainsUnannouncedOnRoute) {
     MasterService service;
+    MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
     const auto context = PrepareSimpleSegment(service);
     ReplicateConfig config;
     config.replica_num = 1;
 
-    // PutStart without PutEnd leaves the replica PROCESSING.
     auto start = service.PutStart(context.client_id, "processing_kv_media",
                                   TenantId::Default(), 4096, config);
     ASSERT_TRUE(start.has_value());
 
-    auto media = KvMediaForKey(service, "processing_kv_media");
+    auto media = AnnouncedKvMediaForKey(service, "processing_kv_media");
     ASSERT_TRUE(media.has_value());
-    EXPECT_TRUE(media->empty()) << "a PROCESSING replica is not yet available "
-                                   "and must not be announced";
+    EXPECT_EQ(0u, *media) << "a PROCESSING replica is not yet available and "
+                             "must not be marked announced";
 
-    auto removal_media = KvRemovalMediaForKey(service, "processing_kv_media");
-    ASSERT_TRUE(removal_media.has_value());
-    EXPECT_EQ(std::vector<std::string>({"cpu"}), *removal_media);
+    ASSERT_TRUE(service
+                    .PutRevoke(context.client_id, "processing_kv_media",
+                               TenantId::Default(), ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_FALSE(
+        AnnouncedKvMediaForKey(service, "processing_kv_media").has_value());
 }
 
 // A RemoveAll whose oplog slot reservation fails must leave the object in
@@ -4292,7 +4290,7 @@ TEST_F(MasterServiceTest,
                     .has_value());
 }
 
-TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
+TEST_F(MasterServiceTest, DrainJobMovesHardPinnedObjectAndConvergesToDrained) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
     auto service_ = std::make_unique<MasterService>(service_config);
@@ -4302,9 +4300,12 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
     [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
         *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
 
-    const UUID put_client_id = generate_uuid();
-    const std::string key =
-        PutObjectOnSegment(*service_, put_client_id, "segment_0");
+    const std::string key = "hard-pinned-drain-key";
+    ReplicateConfig replica_config;
+    replica_config.replica_num = 1;
+    replica_config.preferred_segments = {"segment_0"};
+    replica_config.with_hard_pin = true;
+    PutCompletedObject(*service_, generate_uuid(), key, replica_config);
 
     CreateDrainJobRequest request;
     request.segments = {"segment_0"};
@@ -4326,7 +4327,7 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
     ASSERT_TRUE(query.has_value());
     EXPECT_EQ(query->status, JobStatus::SUCCEEDED);
     EXPECT_EQ(query->active_units, 0u);
-    EXPECT_GE(query->succeeded_units, 1u);
+    EXPECT_EQ(query->succeeded_units, 1u);
 
     auto segment_status = service_->QuerySegmentStatus("segment_0");
     ASSERT_TRUE(segment_status.has_value());
@@ -4334,13 +4335,17 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
 
     auto replicas = service_->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(replicas.has_value());
-    std::unordered_set<std::string> segment_names;
-    for (const auto& replica : replicas->replicas) {
-        segment_names.insert(replica.get_memory_descriptor()
-                                 .buffer_descriptor.transport_endpoint_);
-    }
-    EXPECT_TRUE(segment_names.contains("segment_1"));
-    EXPECT_FALSE(segment_names.contains("segment_0"));
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_EQ(replicas->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_1");
+
+    MasterServiceTestPeer::MetadataAccessorRO accessor(
+        service_.get(),
+        MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+    ASSERT_TRUE(accessor.Exists());
+    EXPECT_TRUE(accessor.Get().IsHardPinned());
 }
 
 TEST_F(MasterServiceTest, FailedMoveKeepsTheSourceAndSerializesUpsert) {
@@ -4604,12 +4609,8 @@ TEST_F(MasterServiceTest, DrainJobTimeoutPreservesPartiallyDrainedSources) {
         *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
     [[maybe_unused]] const auto target = PrepareSimpleSegment(
         *service_, "segment_2", 0x500000000, kDefaultSegmentSize);
-    ReplicateConfig replica_config;
-    replica_config.replica_num = 1;
-    replica_config.preferred_segments = {"segment_1"};
-    replica_config.with_hard_pin = true;
-    PutCompletedObject(*service_, generate_uuid(), "timeout-pinned",
-                       replica_config);
+    // Leave the move pending so segment_1 still has data at the deadline.
+    PutObjectOnSegment(*service_, generate_uuid(), "segment_1");
     CreateDrainJobRequest request;
     request.segments = {"segment_0", "segment_1"};
     request.target_segments = {"segment_2"};

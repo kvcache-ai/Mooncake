@@ -186,6 +186,7 @@ class Config {
 // Bootstrap-only MNNVL controls. Defaults preserve the existing transport.
 struct MnnvlConfig {
     bool require_fabric{false};
+    bool gpu_wait{false};
     bool egm_enabled{false};
 };
 

@@ -755,6 +755,10 @@ int TransferEngine::init(const std::string& metadata_conn_string,
         if (globalConfig().ascend_agent_mode) {
             config->set("transports/ascend_direct/agent_mode", true);
         }
+        if (globalConfig().ascend_standalone_single_segment) {
+            config->set("transports/ascend_direct/standalone_single_segment",
+                        true);
+        }
         if (globalConfig().ascend_store_te_init) {
             config->set("transports/ascend_direct/store_te_init", true);
             if (globalConfig().ascend_use_fabric_mem) {

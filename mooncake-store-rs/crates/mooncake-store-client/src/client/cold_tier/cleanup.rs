@@ -12,7 +12,7 @@ use super::{
     same_cold_payload,
 };
 use mooncake_store_core::{ClientRuntimeId, ColdTierDeviceRecord};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 use tracing::{info, warn};
 
@@ -92,19 +92,29 @@ impl StorageOwnerState {
         let tracker = OperationTracker::new("storage_owner_pending_delete_gc");
         let result = (|| {
             let limit = max_backings.max(1);
+            // Serialize scan progress, including calls made by device cleanup.
+            // Global and device-specific sweeps each retain their own position.
+            let mut cursors = self.pending_delete_gc_cursors.lock();
+            let scope = device_id.map(str::to_string);
             let routes = self.metadata.as_ref().list_object_routes_by_cold_backing(
                 &mooncake_store_core::ColdBackingRouteFilter {
-                    device_id: device_id.map(str::to_string),
+                    device_id: scope.clone(),
+                    after_key: cursors.get(&scope).cloned(),
                     limit: Some(limit),
                     ..mooncake_store_core::ColdBackingRouteFilter::default()
                 },
             )?;
+            let exhausted = routes.len() < limit;
             let mut result = PendingDeleteGcResult::default();
+            let mut live_foreign_owners = BTreeSet::new();
             for listed_route in routes {
                 if result.scanned_routes >= limit {
                     break;
                 }
                 result.scanned_routes = result.scanned_routes.saturating_add(1);
+                // Advance even when this entry is deferred or its reclaim fails.
+                // Update per entry so an error cannot skip the rest of the page.
+                cursors.insert(scope.clone(), listed_route.key.clone());
                 let Some(listed_backing) = listed_route.cold_backing.as_ref() else {
                     continue;
                 };
@@ -115,7 +125,20 @@ impl StorageOwnerState {
                 {
                     continue;
                 }
+                // Only the backing owner can see its in-flight offload. Keep the
+                // index fallback for expired owners, whose local queue is gone.
+                let owner = &listed_backing.owner;
+                if *owner != self.runtime
+                    && (live_foreign_owners.contains(owner)
+                        || self.metadata.get_client_lease(owner)?.is_some())
+                {
+                    live_foreign_owners.insert(owner.clone());
+                    continue;
+                }
                 self.reclaim_pending_delete_cold_route(&listed_route, listed_backing, &mut result)?;
+            }
+            if exhausted {
+                cursors.remove(&scope);
             }
             Ok(result)
         })();
@@ -266,7 +289,8 @@ impl StorageOwnerState {
         let Some(backing) = route.cold_backing.as_ref() else {
             return Ok(true);
         };
-        if backing.cold_tier_id != identity.cold_tier_id
+        if backing.owner != identity.owner
+            || backing.cold_tier_id != identity.cold_tier_id
             || backing.object_locator != identity.object_locator
         {
             // The route now carries a different cold generation; token is stale.
@@ -309,6 +333,10 @@ impl StorageOwnerState {
         };
         if !eligible {
             self.sync_route(&current);
+            return Ok(None);
+        }
+        // Materialized becomes visible before the offload settles device usage.
+        if self.pending_offloads.is_settling(current_backing) {
             return Ok(None);
         }
         let mut claimed = current.clone();
@@ -761,6 +789,11 @@ impl StorageOwnerState {
                 skipped_still_referenced: true,
                 ..crate::control_plane::ColdReclaimResult::default()
             });
+        }
+        if self.pending_offloads.is_settling(cold_backing) {
+            return Err(StoreError::Backpressure(
+                "cold backing usage settlement is still in flight".to_string(),
+            ));
         }
         let backend = self.cold_tier_devices.backend_for(cold_backing)?;
         let removed_cold_payload = backend_remove_cold_payload(backend.as_ref(), cold_backing)?;

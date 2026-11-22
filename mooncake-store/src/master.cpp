@@ -9,6 +9,7 @@
 #include <memory>   // For std::unique_ptr
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>  // For std::thread
 #include <json/json.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -361,6 +362,8 @@ DEFINE_validator(ha_leader_lease_ttl_sec, [](const char* flagname,
     }
     return true;
 });
+DEFINE_uint32(ha_redis_expected_replicas_per_shard, 0,
+              "Expected replica membership per Redis shard; must be positive");
 DEFINE_string(ha_backend_connstring, "",
               "HA backend connection string. If unset, only backend_type=etcd "
               "falls back to etcd_endpoints for backward compatibility");
@@ -414,6 +417,10 @@ DEFINE_uint64(weight_import_idle_timeout_ms, 5 * 60 * 1000,
               "without accepted member writes");
 DEFINE_uint64(snapshot_chunk_object_count, 1000000,
               "Maximum objects per standby batch OpLog snapshot chunk");
+DEFINE_uint64(oplog_prune_chunk_batch_count, 10,
+              "Maximum historical OpLog batches deleted per pruning request");
+DEFINE_uint64(oplog_prune_max_batches_per_second, 50,
+              "Maximum historical OpLog batch IDs deleted per second");
 DEFINE_uint64(snapshot_interval_seconds, 600,
               "Interval between standby batch OpLog snapshots in seconds");
 DEFINE_string(snapshot_object_store_type, "",
@@ -703,6 +710,10 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("ha_backend_connstring",
                              &master_config.ha_backend_connstring,
                              FLAGS_ha_backend_connstring);
+    default_config.GetUInt32(
+        "ha_redis_expected_replicas_per_shard",
+        &master_config.ha_redis_expected_replicas_per_shard,
+        FLAGS_ha_redis_expected_replicas_per_shard);
     default_config.GetInt64("ha_leader_lease_ttl_sec",
                             &master_config.ha_leader_lease_ttl_sec,
                             FLAGS_ha_leader_lease_ttl_sec);
@@ -728,6 +739,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("snapshot_chunk_object_count",
                              &master_config.snapshot_chunk_object_count,
                              FLAGS_snapshot_chunk_object_count);
+    default_config.GetUInt64("oplog_prune_chunk_batch_count",
+                             &master_config.oplog_prune_chunk_batch_count,
+                             FLAGS_oplog_prune_chunk_batch_count);
+    default_config.GetUInt64("oplog_prune_max_batches_per_second",
+                             &master_config.oplog_prune_max_batches_per_second,
+                             FLAGS_oplog_prune_max_batches_per_second);
     default_config.GetUInt64("snapshot_interval_seconds",
                              &master_config.snapshot_interval_seconds, 600);
     default_config.GetString("snapshot_object_store_type",
@@ -1153,6 +1170,16 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.ha_leader_lease_ttl_sec = FLAGS_ha_leader_lease_ttl_sec;
     }
+    if (google::GetCommandLineFlagInfo("ha_redis_expected_replicas_per_shard",
+                                       &info) &&
+        !info.is_default) {
+        master_config.ha_redis_expected_replicas_per_shard =
+            FLAGS_ha_redis_expected_replicas_per_shard;
+    }
+    if (master_config.enable_ha && master_config.ha_backend_type == "redis" &&
+        master_config.ha_redis_expected_replicas_per_shard == 0) {
+        LOG(FATAL) << "ha_redis_expected_replicas_per_shard must be positive";
+    }
     if (master_config.ha_leader_lease_ttl_sec < kMinHaLeaderLeaseTtlSec ||
         master_config.ha_leader_lease_ttl_sec > kMaxHaLeaderLeaseTtlSec) {
         LOG(FATAL) << "ha_leader_lease_ttl_sec must be in ["
@@ -1227,6 +1254,20 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.snapshot_chunk_object_count =
             FLAGS_snapshot_chunk_object_count;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_prune_chunk_batch_count",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_prune_chunk_batch_count =
+            FLAGS_oplog_prune_chunk_batch_count;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_prune_max_batches_per_second",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_prune_max_batches_per_second =
+            FLAGS_oplog_prune_max_batches_per_second;
     }
     if ((google::GetCommandLineFlagInfo("snapshot_interval_seconds", &info) &&
          !info.is_default) ||
@@ -1570,9 +1611,13 @@ int main(int argc, char* argv[]) {
     if (!master_config.ha_backend_connstring.empty() &&
         !master_config.etcd_endpoints.empty() &&
         master_config.ha_backend_connstring != master_config.etcd_endpoints) {
+        const std::string_view ha_backend_connstring_for_log =
+            master_config.ha_backend_type == "redis"
+                ? std::string_view{"<Redis endpoints>"}
+                : std::string_view{master_config.ha_backend_connstring};
         LOG(WARNING) << "Both ha_backend_connstring and etcd_endpoints are "
                      << "set. Using ha_backend_connstring="
-                     << master_config.ha_backend_connstring
+                     << ha_backend_connstring_for_log
                      << " for HA coordinator setup";
     }
     if (master_config.memory_allocator != "cachelib" &&
@@ -1636,6 +1681,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    const std::string_view ha_backend_connstring_for_log =
+        master_config.ha_backend_type == "redis"
+            ? std::string_view{"<Redis endpoints>"}
+            : std::string_view{ha_backend_connstring};
     LOG(INFO)
         << "Master service started on port " << master_config.rpc_port
         << ", max_threads=" << master_config.rpc_thread_num
@@ -1660,6 +1709,10 @@ int main(int argc, char* argv[]) {
         << ", enable_oplog_snapshot=" << master_config.enable_oplog_snapshot
         << ", snapshot_chunk_object_count="
         << master_config.snapshot_chunk_object_count
+        << ", oplog_prune_chunk_batch_count="
+        << master_config.oplog_prune_chunk_batch_count
+        << ", oplog_prune_max_batches_per_second="
+        << master_config.oplog_prune_max_batches_per_second
         << ", enable_offload=" << master_config.enable_offload
         << ", enable_kv_events=" << master_config.enable_kv_events
         << ", kv_events_bind_endpoint=" << master_config.kv_events_bind_endpoint
@@ -1669,7 +1722,7 @@ int main(int argc, char* argv[]) {
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type
-        << ", ha_backend_connstring=" << ha_backend_connstring
+        << ", ha_backend_connstring=" << ha_backend_connstring_for_log
         << ", ha_leader_lease_ttl_sec=" << master_config.ha_leader_lease_ttl_sec
         << ", etcd_endpoints=" << master_config.etcd_endpoints
         << ", etcd_max_send_message_bytes="

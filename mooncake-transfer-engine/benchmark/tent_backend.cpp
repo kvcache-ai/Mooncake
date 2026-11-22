@@ -535,6 +535,7 @@ double TENTBenchRunner::runSingleTransfer(
     };
 
     std::vector<Request> requests;
+    requests.reserve(batch_size);
     for (uint64_t i = 0; i < batch_size; ++i) {
         Request entry;
         entry.opcode = opcode == READ ? Request::READ : Request::WRITE;

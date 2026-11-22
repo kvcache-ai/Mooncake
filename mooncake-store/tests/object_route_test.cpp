@@ -854,11 +854,17 @@ class RecordingObserver final : public route::RouteObserver {
         bool processing;
     };
 
+    void OnBeforeTearDown(const route::WriteGuard& guard) override {
+        ASSERT_TRUE(guard.has_object());
+        torn_down.push_back({guard.key(), guard.state().announced_kv_media});
+    }
+
     void OnWriteRelease(const route::WriteGuard& guard) override {
         releases.push_back({guard.key(), guard.has_object(),
                             guard.has_object() && guard.state().is_processing});
     }
 
+    std::vector<std::pair<std::string, uint8_t>> torn_down;
     std::vector<Release> releases;
 };
 
@@ -898,8 +904,12 @@ TEST(ObjectRouteTest, ObserverSeesEveryWriteGuardAsItIsReleased) {
     {
         auto guard = route.Write("k1");
         ASSERT_TRUE(guard.has_value());
+        guard->state().announced_kv_media = 0x3;
         guard->TearDown();
     }
+    ASSERT_EQ(observer.torn_down.size(), 1u);
+    EXPECT_EQ(observer.torn_down[0],
+              (std::pair<std::string, uint8_t>{"k1", 3}));
     ASSERT_EQ(observer.releases.size(), 4u);
     EXPECT_FALSE(observer.releases[3].has_object);
 }
