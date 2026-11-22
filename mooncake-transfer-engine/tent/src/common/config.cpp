@@ -394,6 +394,11 @@ Status ConfigHelper::loadFromEnv(Config& config) {
         config, "MC_ASCEND_STANDALONE_SINGLE_SEGMENT",
         "ASCEND_STANDALONE_SINGLE_SEGMENT",
         "transports/ascend_direct/standalone_single_segment");
+    // Scheduling env aliases override MC_TENT_CONF, like other env aliases.
+    setConfig(config, "MC_TENT_RDMA_SELECTION_ESTIMATOR",
+              "transports/rdma/selection_estimator");
+    setConfig(config, "MC_TENT_RDMA_ALLOCATION",
+              "transports/rdma/allocation_policy");
     return status;
 }
 

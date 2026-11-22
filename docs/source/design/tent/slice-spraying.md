@@ -229,6 +229,74 @@ For large transfers, TENT distributes slices across multiple devices:
 
 All slice spraying parameters are configurable via the configuration file:
 
+### Optional RDMA Estimator and Allocation Policies
+
+Two independent startup policies control the bandwidth estimate used for NIC
+selection and the allocation of multi-slice requests. Configure them in
+`MC_TENT_CONF`, with smart scheduling enabled:
+
+```json
+{
+  "transports": {
+    "rdma": {
+      "enable_smart_scheduling": true,
+      "selection_estimator": "transmit",
+      "allocation_policy": "finish_time"
+    }
+  }
+}
+```
+
+| Configuration key | Default | Alternative | Environment alias |
+|---|---|---|---|
+| `selection_estimator` | `latency` | `transmit` | `MC_TENT_RDMA_SELECTION_ESTIMATOR` |
+| `allocation_policy` | `inverse_score` | `finish_time` | `MC_TENT_RDMA_ALLOCATION` |
+
+Environment aliases override JSON values. Unset or empty values retain the
+corresponding default; an unknown value logs a warning and falls back to that
+default. Workers parses both policies into per-engine `SchedulingParams` at
+startup; changing the configuration does not update existing selectors. Neither
+policy enables smart scheduling automatically. When it is disabled, allocation
+retains the existing round-robin behavior.
+
+`latency` uses the existing per-completion estimate of slice bytes divided by
+post-to-observed-completion time. `transmit` instead reads the existing estimate
+of successful completion bytes divided by NIC busy time. Both estimators keep
+learning, and their sampling and clamping settings are unchanged. Busy time
+excludes idle periods but still includes software completion observation costs;
+it is not a hardware-only NIC bandwidth measurement.
+
+`inverse_score` divides the request using inverse candidate-score weights from
+one snapshot. `finish_time` uses the same eligible candidates and snapshots,
+then updates a virtual backlog after each planned slice:
+
+```text
+pending_i = snapshot of existing inflight bytes on NIC i
+topology_adjusted_bandwidth_i = selected_bandwidth_i / topology_penalty_i
+for each slice of its actual length L:
+    choose i minimizing (pending_i + L) / topology_adjusted_bandwidth_i
+    pending_i += L
+```
+
+The topology-adjusted bandwidth represents the topology cost in the scheduling
+model; it does not change the measured estimate. Pending starts from the
+candidate's `initial_inflight_bytes` and includes assignments from this request.
+Common accounting still charges each real slice once, including short or folded
+tails. The policy balances modeled completion times, rather than equal bytes.
+
+After planning, `finish_time` groups equal-sized slice assignments by NIC before
+the existing worker/QP round-robin. Periodic NIC choices can otherwise restrict
+each NIC to a subset of lanes. The final slice stays on its planned NIC because
+it can contain a folded tail, preserving each NIC's planned byte allocation.
+Grouping also applies to periodic probes without changing their byte shares.
+
+Single-slice selection, eligibility filters, and periodic exploration remain in
+effect. Requests that do not qualify for aggregate allocation retain worker-side
+single-slice selection. State is per engine; it does not coordinate application
+ranks or model shared PCIe capacity. For N slices and M candidates, finish-time
+planning costs O(N*M), followed by O(N log N) grouping. It is a heuristic, and its
+throughput and tail-latency effects should be measured for the target workload.
+
 ### Core Scheduling
 
 Smart scheduling is temporarily disabled by default because of scheduling

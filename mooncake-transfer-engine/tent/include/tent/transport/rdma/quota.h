@@ -40,7 +40,7 @@ class SharedSlotManager;
  *    - All devices used equally
  *
  * 2. Smart mode (smart_selection_enabled=true): EWMA-based selection
- *    - Tracks global inflight bytes per device
+ *    - Tracks inflight bytes per device within this engine
  *    - Learns effective bandwidth via EWMA
  *    - Selects device with minimal predicted completion time
  *    - Supports multi-path for large requests
@@ -63,7 +63,12 @@ class SharedSlotManager;
  * post-to-completion grows with the depth of the batch it travelled in. The
  * selection EWMA goes on learning from each successful completion's own
  * post-to-completion time on purpose, so that a NIC backed up behind
- * earlier work requests scores worse.
+ * earlier work requests scores worse. MC_TENT_RDMA_SELECTION_ESTIMATOR=transmit
+ * opts selection into the busy-throughput estimate instead.
+ * MC_TENT_RDMA_ALLOCATION=finish_time opts multi-slice requests into greedy
+ * allocation by predicted finish time, updating virtual backlog per slice.
+ * Workers resolves both policies from Config into SchedulingParams at startup;
+ * the default parameters keep legacy behavior.
  */
 class DeviceSelector {
    public:
@@ -72,6 +77,10 @@ class DeviceSelector {
         int dev_id;
         double score;
         bool is_cross_numa;
+        // Inflight snapshot used to score this candidate, before this request.
+        uint64_t initial_inflight_bytes{0};
+        // Selected estimate / topology penalty, in bytes per second.
+        double topology_adjusted_bandwidth{0.0};
     };
 
     // 64-byte aligned so the padding below really does put each hot atomic
@@ -291,7 +300,13 @@ class DeviceSelector {
     void fillDevicePriorities();
     int getDevicePriority(int dev_id) const;
 
+    enum class SelectionEstimator { Latency, Transmit };
+    enum class AllocationPolicy { InverseScore, FinishTime };
+
     struct SchedulingParams {
+        SelectionEstimator selection_estimator = SelectionEstimator::Latency;
+        AllocationPolicy allocation_policy = AllocationPolicy::InverseScore;
+
         // NUMA tier penalties (rank 0 = local, should be smallest)
         double numa_tier_weights[Topology::DevicePriorityRanks] = {1.0, 5.0,
                                                                    10.0};

@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <iostream>
 #include <iomanip>
+#include <limits>
 
 namespace mooncake {
 namespace tent {
@@ -233,7 +234,10 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
     auto add_candidate = [&](int dev_id, size_t rank) {
         auto& dev = devices_[dev_id];
         uint64_t inflight = dev.getInflightBytes();
-        double ewma_bw = dev.getEwmaBandwidth();
+        double ewma_bw =
+            sched_params_.selection_estimator == SelectionEstimator::Transmit
+                ? dev.getTransmitBandwidth()
+                : dev.getEwmaBandwidth();
         double predicted_time =
             static_cast<double>(inflight + slice_bytes) / ewma_bw;
         double rank_penalty = sched_params_.numa_tier_weights[rank];
@@ -245,6 +249,8 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
         c.dev_id = dev_id;
         c.score = score;
         c.is_cross_numa = is_cross_numa;
+        c.initial_inflight_bytes = inflight;
+        c.topology_adjusted_bandwidth = ewma_bw / rank_penalty;
         candidates.push_back(c);
     };
 
@@ -323,6 +329,36 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
             const Candidate& c = candidates[i % candidates.size()];
             slice_dev_ids.push_back(c.dev_id);
         }
+    } else if (sched_params_.allocation_policy ==
+               AllocationPolicy::FinishTime) {
+        // Keep bandwidth/topology snapshots fixed for this request. Virtual
+        // backlog includes existing inflight plus slices assigned here; the
+        // common accounting below charges each real slice exactly once.
+        std::vector<uint64_t> pending;
+        pending.reserve(candidates.size());
+        for (const auto& c : candidates)
+            pending.push_back(c.initial_inflight_bytes);
+        uint64_t offset = 0;
+        for (uint32_t i = 0; i < num_slices; ++i) {
+            const uint64_t bytes =
+                (i + 1 == num_slices)
+                    ? total_length - offset
+                    : std::min(slice_bytes, total_length - offset);
+            size_t best = 0;
+            double best_finish = std::numeric_limits<double>::infinity();
+            for (size_t j = 0; j < candidates.size(); ++j) {
+                const double finish =
+                    (static_cast<double>(pending[j]) + bytes) /
+                    candidates[j].topology_adjusted_bandwidth;
+                if (finish < best_finish) {
+                    best = j;
+                    best_finish = finish;
+                }
+            }
+            slice_dev_ids.push_back(candidates[best].dev_id);
+            pending[best] += bytes;
+            offset += bytes;
+        }
     } else {
         // Normal mode: weighted distribution based on inverse score
         // Lower score → higher weight → more slices
@@ -361,6 +397,15 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
                 slice_dev_ids.push_back(c.dev_id);
             }
         }
+    }
+    if (sched_params_.allocation_policy == AllocationPolicy::FinishTime &&
+        slice_dev_ids.size() > first + 1) {
+        // Group equal-sized slices before the transport round-robins them
+        // across worker/QP lanes. Periodic NIC choices can otherwise alias
+        // that round-robin and limit each NIC to a subset of the lanes.
+        // Keep the final, possibly folded tail on its planned device so each
+        // NIC retains exactly the byte allocation, including during probes.
+        std::sort(slice_dev_ids.begin() + first, slice_dev_ids.end() - 1);
     }
     // Charge each device what its slices actually carry, in the caller's
     // slice order, so release() (which returns the slice's length) balances

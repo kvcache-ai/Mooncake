@@ -297,6 +297,30 @@ TEST(HttpMetaStoreTest, BufferedPutDoesNotRequest100Continue) {
 
 #endif
 
+TEST(TransferEngineConfigOverrideTest, SchedulingEnvOverridesJson) {
+    for (const std::string estimator : {"latency", "transmit"}) {
+        for (const std::string allocation : {"inverse_score", "finish_time"}) {
+            SCOPED_TRACE(estimator + "/" + allocation);
+            Config opposite;
+            opposite.set("transports/rdma/selection_estimator",
+                         estimator == "latency" ? "transmit" : "latency");
+            opposite.set("transports/rdma/allocation_policy",
+                         allocation == "inverse_score" ? "finish_time"
+                                                       : "inverse_score");
+            EnvVarGuard conf_guard("MC_TENT_CONF", opposite.dump());
+            EnvVarGuard estimator_guard("MC_TENT_RDMA_SELECTION_ESTIMATOR",
+                                        estimator);
+            EnvVarGuard allocation_guard("MC_TENT_RDMA_ALLOCATION", allocation);
+            Config config;
+            ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+            EXPECT_EQ(config.get("transports/rdma/selection_estimator", ""),
+                      estimator);
+            EXPECT_EQ(config.get("transports/rdma/allocation_policy", ""),
+                      allocation);
+        }
+    }
+}
+
 TEST(TransferEngineConfigOverrideTest,
      NullSharedConfigPreventsExplicitConstruction) {
     std::shared_ptr<Config> config;

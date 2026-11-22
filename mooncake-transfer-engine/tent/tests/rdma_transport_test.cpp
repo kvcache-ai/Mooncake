@@ -141,6 +141,14 @@ class RdmaTransportTestPeer {
         return transport.initializeContexts();
     }
 
+    static void setSchedulingConfig(RdmaTransport& transport,
+                                    const std::string& estimator,
+                                    const std::string& allocation) {
+        transport.conf_->set("transports/rdma/enable_smart_scheduling", false);
+        transport.conf_->set("transports/rdma/selection_estimator", estimator);
+        transport.conf_->set("transports/rdma/allocation_policy", allocation);
+    }
+
     // Constructs Workers (which seeds the DeviceSelector from context_set_)
     // without starting any threads.
     static std::unique_ptr<Workers> makeWorkers(RdmaTransport& transport) {
@@ -1388,6 +1396,72 @@ TEST(DeviceSelectorTest, PerSliceAllocationHonorsPolicy) {
                                   (1ULL << 1) | (1ULL << 2))
                         .ok());
         EXPECT_EQ(chosen_device, 2);
+    }
+}
+
+TEST(RdmaSchedulingConfigTest, WorkersParseIndependentEnginePolicies) {
+    RdmaTransport first, second;
+    auto topology = topologyWithRdmaNics(2);
+    RdmaTransportTestPeer::bindTopology(first, topology);
+    RdmaTransportTestPeer::bindTopology(second, topology);
+    RdmaTransportTestPeer::setSchedulingConfig(first, "transmit",
+                                               "finish_time");
+    auto first_workers = RdmaTransportTestPeer::makeWorkers(first);
+    auto second_workers = RdmaTransportTestPeer::makeWorkers(second);
+    const auto& a = first_workers->getDeviceSelector()->getSchedulingParams();
+    const auto& b = second_workers->getDeviceSelector()->getSchedulingParams();
+    EXPECT_EQ(a.selection_estimator,
+              DeviceSelector::SelectionEstimator::Transmit);
+    EXPECT_EQ(a.allocation_policy,
+              DeviceSelector::AllocationPolicy::FinishTime);
+    EXPECT_EQ(b.selection_estimator,
+              DeviceSelector::SelectionEstimator::Latency);
+    EXPECT_EQ(b.allocation_policy,
+              DeviceSelector::AllocationPolicy::InverseScore);
+}
+
+TEST(RdmaSchedulingConfigTest, InvalidAndEmptyPoliciesKeepDefaults) {
+    for (const std::string value : {"invalid", ""}) {
+        RdmaTransport transport;
+        auto topology = topologyWithRdmaNics(2);
+        RdmaTransportTestPeer::bindTopology(transport, topology);
+        RdmaTransportTestPeer::setSchedulingConfig(transport, value, value);
+        auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+        EXPECT_FALSE(workers->getDeviceSelector()->getSmartSelection());
+        const auto& params =
+            workers->getDeviceSelector()->getSchedulingParams();
+        EXPECT_EQ(params.selection_estimator,
+                  DeviceSelector::SelectionEstimator::Latency);
+        EXPECT_EQ(params.allocation_policy,
+                  DeviceSelector::AllocationPolicy::InverseScore);
+    }
+}
+
+TEST(RdmaSchedulingConfigTest, WorkersParseAllPolicyCombinations) {
+    const std::vector<std::pair<std::string, std::string>> policies = {
+        {"latency", "inverse_score"},
+        {"transmit", "inverse_score"},
+        {"latency", "finish_time"},
+        {"transmit", "finish_time"}};
+    for (const auto& [estimator, allocation] : policies) {
+        SCOPED_TRACE(estimator + "/" + allocation);
+        RdmaTransport transport;
+        auto topology = topologyWithRdmaNics(2);
+        RdmaTransportTestPeer::bindTopology(transport, topology);
+        RdmaTransportTestPeer::setSchedulingConfig(transport, estimator,
+                                                   allocation);
+        auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+        EXPECT_FALSE(workers->getDeviceSelector()->getSmartSelection());
+        const auto& params =
+            workers->getDeviceSelector()->getSchedulingParams();
+        EXPECT_EQ(params.selection_estimator,
+                  estimator == "latency"
+                      ? DeviceSelector::SelectionEstimator::Latency
+                      : DeviceSelector::SelectionEstimator::Transmit);
+        EXPECT_EQ(params.allocation_policy,
+                  allocation == "inverse_score"
+                      ? DeviceSelector::AllocationPolicy::InverseScore
+                      : DeviceSelector::AllocationPolicy::FinishTime);
     }
 }
 
