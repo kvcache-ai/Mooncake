@@ -2312,7 +2312,9 @@ bool HasOnlyClientLocalDiskReplicas(
 
 Client::DiskReplicaHealResult Client::healDanglingLocalDiskReplica(
     const ObjectKey& key) {
-    auto replicas = master_client_.GetReplicaList(key);
+    // This lookup supports a write-path repair, not a client read. Do not
+    // extend read leases or record read hits while inspecting the old replica.
+    auto replicas = master_client_.GetReplicaListReadOnly(key);
     if (!replicas ||
         !HasOnlyClientLocalDiskReplicas(replicas->replicas, client_id_) ||
         !local_disk_probe_fn_) {
@@ -2672,8 +2674,10 @@ void Client::healDanglingLocalDiskBatchStarts(
     }
     // One round trip for the whole subset: a healthy idempotent batch pays a
     // single batched query and no evictions, and the per-key work left over
-    // is a local filesystem probe.
-    auto replica_lists = master_client_.BatchGetReplicaList(candidate_keys);
+    // is a local filesystem probe. This is write-path bookkeeping, so the
+    // query must not grant read leases or generate read-side follow-ups.
+    auto replica_lists =
+        master_client_.BatchGetReplicaListReadOnly(candidate_keys);
     if (replica_lists.size() != candidate_keys.size()) {
         return;
     }

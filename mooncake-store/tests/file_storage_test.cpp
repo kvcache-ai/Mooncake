@@ -15,6 +15,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <unordered_set>
 #include <string>
 #include <thread>
@@ -31,6 +32,18 @@
 #include "utils/common.h"
 
 namespace mooncake {
+
+int64_t SerializedCounterValue(const std::string& name) {
+    std::istringstream metrics(
+        MasterMetricManager::instance().serialize_metrics());
+    std::string line;
+    while (std::getline(metrics, line)) {
+        if (line.starts_with(name + " ")) {
+            return std::stoll(line.substr(name.size() + 1));
+        }
+    }
+    return 0;
+}
 
 void SetEnv(const std::string& key, const std::string& value) {
     setenv(key.c_str(), value.c_str(), 1);
@@ -1379,6 +1392,14 @@ class FileStorageTest : public ::testing::Test {
 
         // Put the same key again: the dangling replica must be evicted and the
         // Put must really store new data.
+        const auto valid_get_before_put =
+            SerializedCounterValue("valid_get_nums_");
+        const auto total_get_before_put =
+            SerializedCounterValue("total_get_nums_");
+        const auto mem_hit_before_put =
+            SerializedCounterValue("mem_cache_hit_nums_");
+        const auto file_hit_before_put =
+            SerializedCounterValue("file_cache_hit_nums_");
         void* buf = allocator.allocate(512);
         ASSERT_NE(buf, nullptr);
         std::string updated(512, 'y');
@@ -1390,6 +1411,14 @@ class FileStorageTest : public ::testing::Test {
         ASSERT_TRUE(put.has_value())
             << "Put over a dangling replica failed: " << toString(put.error());
         allocator.deallocate(buf, 512);
+        EXPECT_EQ(SerializedCounterValue("valid_get_nums_"),
+                  valid_get_before_put);
+        EXPECT_EQ(SerializedCounterValue("total_get_nums_"),
+                  total_get_before_put);
+        EXPECT_EQ(SerializedCounterValue("mem_cache_hit_nums_"),
+                  mem_hit_before_put);
+        EXPECT_EQ(SerializedCounterValue("file_cache_hit_nums_"),
+                  file_hit_before_put);
 
         // The new data is readable through the normal Get path.
         void* read_buf = allocator.allocate(512);
@@ -1516,6 +1545,14 @@ class FileStorageTest : public ::testing::Test {
                 std::vector<std::vector<std::string>>{
                     {"mlx5_0"}, {}, {"mlx5_1"}};
         }
+        const auto valid_get_before_put =
+            SerializedCounterValue("valid_get_nums_");
+        const auto total_get_before_put =
+            SerializedCounterValue("total_get_nums_");
+        const auto mem_hit_before_put =
+            SerializedCounterValue("mem_cache_hit_nums_");
+        const auto file_hit_before_put =
+            SerializedCounterValue("file_cache_hit_nums_");
         auto results = client.value()->BatchPut(keys, batched_slices, cfg);
         ASSERT_EQ(results.size(), keys.size());
         for (size_t i = 0; i < results.size(); ++i) {
@@ -1523,6 +1560,14 @@ class FileStorageTest : public ::testing::Test {
                 << "BatchPut over a dangling replica failed for " << keys[i]
                 << ": " << toString(results[i].error());
         }
+        EXPECT_EQ(SerializedCounterValue("valid_get_nums_"),
+                  valid_get_before_put);
+        EXPECT_EQ(SerializedCounterValue("total_get_nums_"),
+                  total_get_before_put);
+        EXPECT_EQ(SerializedCounterValue("mem_cache_hit_nums_"),
+                  mem_hit_before_put);
+        EXPECT_EQ(SerializedCounterValue("file_cache_hit_nums_"),
+                  file_hit_before_put);
 
         // Every key, healed or fresh, reads the new data back.
         for (const auto& key : keys) {
