@@ -1257,8 +1257,7 @@ class FileStorageTest : public ::testing::Test {
         std::free(seg_ptr);
     }
     void RunBatchPutHealWipeScenario(const std::string& data_path,
-                                     bool with_key_metadata = false,
-                                     bool with_affinity_only = false) {
+                                     const ReplicateConfig& cfg = {}) {
         std::filesystem::path master_root =
             std::filesystem::path(data_path) / "heal_master_batch";
         std::filesystem::create_directories(master_root);
@@ -1351,21 +1350,6 @@ class FileStorageTest : public ::testing::Test {
             std::memcpy(buf, updated.data(), 512);
             buffers.push_back(buf);
             batched_slices.push_back({Slice{buf, 512}});
-        }
-        ReplicateConfig cfg;
-        cfg.replica_num = 1;
-        if (with_affinity_only) {
-            cfg.residency_affinity_ids =
-                std::vector<std::string>{"fresh-unit", "unit-a", "unit-b"};
-        }
-        if (with_key_metadata) {
-            cfg.session_ids =
-                std::vector<std::string>{"fresh", "wiped-a", "wiped-b"};
-            cfg.group_ids =
-                std::vector<std::string>{"fresh-group", "a-group", "b-group"};
-            cfg.per_key_preferred_hca_names =
-                std::vector<std::vector<std::string>>{
-                    {"mlx5_0"}, {}, {"mlx5_1"}};
         }
         auto results = client.value()->BatchPut(keys, batched_slices, cfg);
         ASSERT_EQ(results.size(), keys.size());
@@ -2452,12 +2436,31 @@ TEST_F(FileStorageTest,
 
 TEST_F(FileStorageTest,
        SessionAndHcaBatchPutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
-    RunBatchPutHealWipeScenario(data_path, true);
+    ReplicateConfig config;
+    config.session_ids =
+        std::vector<std::string>{"fresh", "wiped-a", "wiped-b"};
+    config.group_ids =
+        std::vector<std::string>{"fresh-group", "a-group", "b-group"};
+    config.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_0"}, {}, {"mlx5_1"}};
+    RunBatchPutHealWipeScenario(data_path, config);
 }
 
 TEST_F(FileStorageTest,
        AffinityOnlyBatchPutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
-    RunBatchPutHealWipeScenario(data_path, false, true);
+    ReplicateConfig config;
+    config.residency_affinity_ids =
+        std::vector<std::string>{"fresh-unit", "unit-a", "unit-b"};
+    RunBatchPutHealWipeScenario(data_path, config);
+}
+
+TEST_F(FileStorageTest,
+       KindOnlyBatchPutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
+    ReplicateConfig config;
+    config.data_type = ObjectDataType::KVCACHE;
+    config.kv_cache_kinds = std::vector<KVCacheKind>{
+        KVCacheKind::FULL, KVCacheKind::SWA, KVCacheKind::MAMBA};
+    RunBatchPutHealWipeScenario(data_path, config);
 }
 
 TEST_F(FileStorageTest, ClassifyDiskErrno) {

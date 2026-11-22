@@ -244,8 +244,10 @@ TEST_F(ObjectDataTypeTest, KindFieldIsWireCompatibleAndRoundTrips) {
 }
 
 TEST_F(ObjectDataTypeTest, MasterAppliesKindEvictionPolicy) {
-    MasterServiceConfig config;
-    config.kv_cache_kind_evict = "MAMBA=PROTECT,INDEXER=DEFER,SWA=DEFER";
+    auto config =
+        MasterServiceConfig::builder()
+            .set_kv_cache_kind_evict("MAMBA=PROTECT,INDEXER=DEFER,SWA=DEFER")
+            .build();
     MasterService service(config);
     EXPECT_EQ(service.EvictControlForKind(KVCacheKind::MAMBA),
               KVCacheEvictControl::PROTECT);
@@ -367,6 +369,102 @@ TEST_F(ObjectDataTypeTest, PutStartRecordsTheKVCacheKind) {
                                      TenantId::Default(), 1024, config);
     EXPECT_FALSE(rejected.has_value());
     EXPECT_EQ(rejected.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(ObjectDataTypeTest,
+       UpsertUpdatesOrPreservesKindAcrossBufferReplacement) {
+    auto settings =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    settings.memory_allocator = BufferAllocatorType::OFFSET;
+    MasterService service(settings);
+    const auto writer = generate_uuid();
+    const auto tenant = TenantId::Default();
+    const std::string key = "upsert-kind";
+    ASSERT_TRUE(service.MountSegment(MakeSegment(), writer));
+    ReplicateConfig tagged;
+    tagged.data_type = ObjectDataType::KVCACHE;
+    tagged.kv_cache_kinds = std::vector<KVCacheKind>{KVCacheKind::FULL};
+    ASSERT_TRUE(service.PutStart(writer, key, tenant, 1024, tagged));
+    ASSERT_TRUE(service.PutEnd(writer, key, tenant, ReplicaType::MEMORY));
+
+    auto check = [&](size_t size, const ReplicateConfig& config,
+                     ObjectDataType type, KVCacheKind expected) {
+        ASSERT_TRUE(service.UpsertStart(writer, key, tenant, size, config));
+        ASSERT_TRUE(
+            service.UpsertEnd(writer, key, tenant, ReplicaType::MEMORY));
+        MasterServiceTestPeer::MetadataAccessorRO object(&service,
+                                                         {tenant, key});
+        ASSERT_TRUE(object.Exists());
+        EXPECT_EQ(object.Get().data_type, type);
+        EXPECT_EQ(object.Get().kv_cache_kind, expected);
+        EXPECT_EQ(object.Get().TotalLength(), size);
+    };
+    tagged.kv_cache_kinds = std::vector<KVCacheKind>{KVCacheKind::MAMBA};
+    check(1024, tagged, ObjectDataType::KVCACHE, KVCacheKind::MAMBA);
+    check(1024, {}, ObjectDataType::KVCACHE, KVCacheKind::MAMBA);
+    check(2048, {}, ObjectDataType::KVCACHE, KVCacheKind::MAMBA);
+    tagged.kv_cache_kinds = std::vector<KVCacheKind>{KVCacheKind::SWA};
+    check(4096, tagged, ObjectDataType::KVCACHE, KVCacheKind::SWA);
+    tagged.kv_cache_kinds = std::vector<KVCacheKind>{KVCacheKind::UNSPECIFIED};
+    check(4096, tagged, ObjectDataType::KVCACHE, KVCacheKind::UNSPECIFIED);
+    ReplicateConfig tensor;
+    tensor.data_type = ObjectDataType::TENSOR;
+    check(4096, tensor, ObjectDataType::TENSOR, KVCacheKind::UNSPECIFIED);
+    tagged.kv_cache_kinds = std::vector<KVCacheKind>{KVCacheKind::DSA};
+    check(4096, tagged, ObjectDataType::KVCACHE, KVCacheKind::DSA);
+}
+
+TEST_F(ObjectDataTypeTest,
+       KindOnlyTensorBatchesKeepTheOriginalIndexForEveryShard) {
+    ReplicateConfig config;
+    config.kv_cache_kinds =
+        std::vector<KVCacheKind>{KVCacheKind::FULL, KVCacheKind::MAMBA};
+    const auto all = config.ForRepeatedKeySubset({0, 1}, 2);
+    ASSERT_TRUE(all.ValidKVCacheKinds(4));
+    EXPECT_EQ(
+        *all.kv_cache_kinds,
+        (std::vector<KVCacheKind>{KVCacheKind::FULL, KVCacheKind::FULL,
+                                  KVCacheKind::MAMBA, KVCacheKind::MAMBA}));
+    const auto partial = config.ForRepeatedKeySubset({1}, 2);
+    ASSERT_TRUE(partial.ValidKVCacheKinds(2));
+    EXPECT_EQ(*partial.kv_cache_kinds,
+              std::vector<KVCacheKind>(2, KVCacheKind::MAMBA));
+    EXPECT_TRUE(config.ValidKVCacheKinds(2));
+}
+
+TEST_F(ObjectDataTypeTest, NoFLastReplicaHonorsKindAndFallbackQuota) {
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "nof", kDefaultSegmentBase, kDefaultSegmentSize, "endpoint", "nvmeof",
+        ReplicaType::NOF_SSD);
+    MasterService service(
+        MasterServiceConfig::builder()
+            .set_kv_cache_kind_evict("MAMBA=PROTECT,SWA=DEFER")
+            .build());
+    MasterServiceTestPeer peer(service);
+    const auto tenant = TenantId::Default();
+    auto& objects = peer.GetOrCreateNamespace(tenant).objects;
+    // The evictor operates on master descriptors. Offset allocations give each
+    // object a live NoF-only replica without requiring an NVMe target.
+    for (auto kind :
+         {KVCacheKind::MAMBA, KVCacheKind::SWA, KVCacheKind::FULL}) {
+        const std::string key(KVCacheKindName(kind));
+        auto buffer = allocator->allocate(4096);
+        ASSERT_TRUE(buffer);
+        std::vector<Replica> replicas;
+        replicas.emplace_back(std::move(buffer), ReplicaStatus::COMPLETE,
+                              ReplicaType::NOF_SSD);
+        auto guard = objects.WriteKey(key);
+        guard.Publish(generate_uuid(), std::chrono::system_clock::now(), 4096,
+                      std::move(replicas), std::nullopt, false,
+                      ObjectDataType::KVCACHE, "", tenant, key, "", kind);
+    }
+    peer.RunNoFBatchEvictForTesting(1.0, 0.0);
+    EXPECT_FALSE(objects.Contains("FULL"));
+    EXPECT_TRUE(objects.Contains("SWA"));
+    EXPECT_TRUE(objects.Contains("MAMBA"));
+    peer.RunNoFBatchEvictForTesting(1.0, 1.0);
+    EXPECT_FALSE(objects.Contains("SWA"));
+    EXPECT_TRUE(objects.Contains("MAMBA"));
 }
 
 }  // namespace mooncake::test

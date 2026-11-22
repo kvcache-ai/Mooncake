@@ -207,6 +207,44 @@ class TestStandaloneStoreE2E(unittest.TestCase):
         self.assertEqual(retrieved.dtype, tensor.dtype)
         self.assertTrue(torch.allclose(tensor, retrieved))
 
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_kind_only_tensor_parallel_writes(self) -> None:
+        from mooncake.store import KVCacheKind, ObjectDataType, ReplicateConfig
+
+        tensor = torch.arange(8).reshape(2, 4)
+        config = ReplicateConfig()
+        config.data_type = ObjectDataType.KVCACHE
+        config.kv_cache_kinds = [KVCacheKind.MAMBA]
+        self.assertEqual(
+            self.store.pub_tensor_with_tp("single", tensor, config, tp_size=2), 0
+        )
+        self.assertEqual(config.kv_cache_kinds, [KVCacheKind.MAMBA])
+        config.kv_cache_kinds = [KVCacheKind.FULL, KVCacheKind.SWA]
+        self.assertNotEqual(
+            self.store.pub_tensor_with_tp("bad-count", tensor, config, tp_size=2), 0
+        )
+        self.assertEqual(
+            self.store.batch_pub_tensor_with_tp(
+                ["a", "b"], [tensor, tensor], config, tp_size=2
+            ),
+            [0, 0],
+        )
+        invalid, valid = self.store.batch_pub_tensor_with_tp(
+            ["invalid", "valid"], [None, tensor], config, tp_size=2
+        )
+        self.assertNotEqual(invalid, 0)
+        self.assertEqual(valid, 0)
+        for rank in range(2):
+            for key in ("single", "a", "b", "valid"):
+                self.assertTrue(
+                    torch.equal(
+                        self.store.get_tensor(f"{key}_tp_{rank}"),
+                        tensor[rank : rank + 1],
+                    )
+                )
+            for key in ("bad-count", "invalid"):
+                self.assertEqual(self.store.is_exist(f"{key}_tp_{rank}"), 0)
+
 
 class TestStandaloneConfigDictE2E(unittest.TestCase):
     def test_config_dict_omits_master_address(self) -> None:

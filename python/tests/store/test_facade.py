@@ -35,6 +35,7 @@ def _run_python(
 _CPP_PUBLIC_NAMES = {
     "RangedReadSnapshot",
     "ObjectDataType",
+    "KVCacheKind",
     "SoftPinAction",
     "ReplicateConfig",
     "ExistOptions",

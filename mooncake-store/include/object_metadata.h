@@ -107,9 +107,9 @@ struct ObjectMetadata {
     UUID client_id;
     // Updated by UpsertStart (Case B) to reset the discard timeout.
     std::chrono::system_clock::time_point put_start_time;
-    const ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
     // Meaningful for KVCACHE objects. UNSPECIFIED keeps legacy eviction.
-    const KVCacheKind kv_cache_kind{KVCacheKind::UNSPECIFIED};
+    KVCacheKind kv_cache_kind{KVCacheKind::UNSPECIFIED};
     const std::string group_id;
     const std::string residency_affinity_id;
     const TenantId tenant_id;

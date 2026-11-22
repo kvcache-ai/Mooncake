@@ -184,6 +184,71 @@ TEST(MasterServiceDfsScenarioTest, EvictionReclaimsLastReplicas) {
                        /*evict_memory_first=*/true);
 }
 
+class KVCacheKindDfsEvictionTest
+    : public ::testing::TestWithParam<const char*> {};
+
+TEST_P(KVCacheKindDfsEvictionTest, ReclaimsOrdinaryThenDeferredLastReplicas) {
+    const ScopedDfsEnvironment dfs("kv_kind_dfs", "16384");
+    const ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", GetParam());
+    const ScopedEnvVar bucket_size("MOONCAKE_DFS_BUCKET_CAPACITY", "8192");
+    const ScopedEnvVar bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "4");
+    const ScopedEnvVar low("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.8");
+    const ScopedEnvVar enabled("MOONCAKE_DFS_EVICTION_ENABLED", "1");
+    const ScopedEnvVar interval("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL", "60");
+    MasterService service(
+        MasterServiceConfig::builder()
+            .set_default_kv_lease_ttl(0)
+            .set_kv_cache_kind_evict("MAMBA=PROTECT,SWA=DEFER")
+            .build());
+    MasterServiceTestPeer::EvictionRunning(service) = false;
+    MasterServiceTestPeer::EvictionThread(service).join();
+    const auto tenant = TenantId::Default();
+    const UUID client = generate_uuid();
+    auto put_key = [&](const std::string& key, KVCacheKind kind) {
+        ReplicateConfig config;
+        config.replica_num = 0;
+        config.dfs_replica_num = 1;
+        config.data_type = ObjectDataType::KVCACHE;
+        config.kv_cache_kinds = std::vector<KVCacheKind>{kind};
+        ASSERT_TRUE(service.PutStart(client, key, tenant, 4096, config)) << key;
+        ASSERT_TRUE(service.PutEnd(client, key, tenant, ReplicaType::DFS))
+            << key;
+    };
+    const bool bucket = std::string(GetParam()) == "bucket";
+    auto put = [&](const std::string& key, KVCacheKind kind) {
+        put_key(key, kind);
+        if (bucket) put_key(key + "-peer", KVCacheKind::FULL);
+    };
+    auto exists = [&](const std::string& key, bool expected) {
+        auto result = service.ProbeKey(key, tenant);
+        ASSERT_TRUE(result) << key;
+        EXPECT_EQ(*result, expected) << key;
+    };
+    // Give the protected and deferred objects the oldest storage extents.
+    put("protected", KVCacheKind::MAMBA);
+    put("deferred", KVCacheKind::SWA);
+    put("ordinary", KVCacheKind::FULL);
+    put("active", KVCacheKind::MAMBA);
+    MasterServiceTestPeer(service).RunDfsEvictionForTesting();
+    exists("ordinary", false);
+    exists("deferred", true);
+    exists("protected", true);
+    put("refill", KVCacheKind::MAMBA);
+    MasterServiceTestPeer(service).RunDfsEvictionForTesting();
+    exists("deferred", false);
+    exists("protected", true);
+    exists("active", true);
+    exists("refill", true);
+    if (bucket) {
+        exists("protected-peer", true);
+        exists("deferred-peer", false);
+        exists("ordinary-peer", false);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(DfsAllocators, KVCacheKindDfsEvictionTest,
+                         ::testing::Values("shard", "bucket"));
+
 class ManagedWeightDfsEvictionTest : public MasterServiceTest {};
 
 TEST_F(ManagedWeightDfsEvictionTest,

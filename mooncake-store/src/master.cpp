@@ -913,6 +913,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.allow_evict_soft_pinned_objects =
             FLAGS_allow_evict_soft_pinned_objects;
     }
+    if (!conf_set ||
+        (google::GetCommandLineFlagInfo("kv_cache_kind_evict", &info) &&
+         !info.is_default)) {
+        master_config.kv_cache_kind_evict = FLAGS_kv_cache_kind_evict;
+    }
     if ((google::GetCommandLineFlagInfo("eviction_ratio", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1627,6 +1632,7 @@ int main(int argc, char* argv[]) {
         << ", max_kv_soft_pin_ttl=" << master_config.max_kv_soft_pin_ttl
         << ", allow_evict_soft_pinned_objects="
         << master_config.allow_evict_soft_pinned_objects
+        << ", kv_cache_kind_evict=" << master_config.kv_cache_kind_evict
         << ", eviction_ratio=" << master_config.eviction_ratio
         << ", eviction_high_watermark_ratio="
         << master_config.eviction_high_watermark_ratio

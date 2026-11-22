@@ -84,7 +84,9 @@ returned to readers.
 which kind, so a master can treat those objects differently. A put names the
 kind per key on `ReplicateConfig.kv_cache_kinds`, in the same order as the
 keys. Omitting the list stores `UNSPECIFIED`, which is also what objects
-written before this field restore as.
+written before this field restore as. An upsert on existing KV cache keeps
+its kind when the writer omits the list, including when the payload changes
+size. Supply a kind to reclassify the object or `UNSPECIFIED` to clear it.
 
 | Kind | What it stores |
 |---|---|
@@ -116,6 +118,9 @@ full recompute, such as Mamba state or a DSA indexer. Example:
 ```
 
 The same string is the `kv_cache_kind_evict` field in the master config file.
+An explicit command-line flag overrides the file, including an empty value.
+The policy applies to memory, NoF SSD and DFS replicas. A DFS bucket can be
+reclaimed only when every live member is eligible for the current pass.
 Names are case-sensitive, and a kind may appear once.
 
 ## Put Path: Two-Phase Metadata

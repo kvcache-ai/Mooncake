@@ -3,6 +3,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 #include <glog/logging.h>
 
@@ -944,6 +945,11 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_allow_evict_soft_pinned_objects(
         bool allow) {
         allow_evict_soft_pinned_objects_ = allow;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_kv_cache_kind_evict(std::string policy) {
+        kv_cache_kind_evict_ = std::move(policy);
         return *this;
     }
 

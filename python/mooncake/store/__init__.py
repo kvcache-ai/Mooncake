@@ -10,6 +10,7 @@ _CPP_EXPORTS = frozenset(
     {
         "RangedReadSnapshot",
         "ObjectDataType",
+        "KVCacheKind",
         "SoftPinAction",
         "ReplicateConfig",
         "ExistOptions",

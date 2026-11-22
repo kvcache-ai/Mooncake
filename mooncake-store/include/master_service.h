@@ -1409,6 +1409,11 @@ class MasterService {
         std::chrono::system_clock::time_point now,
         const std::function<bool(const std::string& key)>& matches_key);
     static void ApplySoftPinMetricDelta(int metric_delta);
+    KVCacheEvictControl KindEvictControl(const ObjectMetadata& metadata) const {
+        return metadata.data_type == ObjectDataType::KVCACHE
+                   ? kv_cache_kind_policy_.ControlFor(metadata.kv_cache_kind)
+                   : KVCacheEvictControl::NORMAL;
+    }
     void ApplySoftPinEvaluation(
         const ObjectMetadata& metadata,
         const ObjectMetadata::SoftPinEvaluation& result) const;

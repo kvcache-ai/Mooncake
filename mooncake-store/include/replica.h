@@ -144,6 +144,11 @@ struct ReplicateConfig {
     // every key is UNSPECIFIED, which keeps the legacy eviction behavior.
     struct_pack::compatible<std::vector<KVCacheKind>, 5> kv_cache_kinds;
 
+    bool HasPerKeyHints() const {
+        return group_ids || session_ids || residency_affinity_ids ||
+               per_key_preferred_hca_names || kv_cache_kinds;
+    }
+
     bool ValidKVCacheKinds(size_t key_count) const {
         if (!kv_cache_kinds) return true;
         return kv_cache_kinds->size() == key_count &&
@@ -202,6 +207,17 @@ struct ReplicateConfig {
             }
         }
         return result;
+    }
+
+    ReplicateConfig ForRepeatedKeySubset(const std::vector<size_t>& indices,
+                                         size_t shards_per_key) const {
+        if (!HasPerKeyHints()) return *this;
+        std::vector<size_t> shard_indices;
+        shard_indices.reserve(indices.size() * shards_per_key);
+        for (size_t index : indices) {
+            shard_indices.insert(shard_indices.end(), shards_per_key, index);
+        }
+        return ForKeySubset(shard_indices);
     }
 
     bool ValidSessionIds(size_t key_count) const {

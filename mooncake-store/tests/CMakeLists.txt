@@ -206,7 +206,7 @@ add_test(
   NAME object_checksum_client_test
   COMMAND
     client_integration_test
-    "--gtest_filter=ObjectChecksumTest.*:ClientIntegrationTest.ObjectChecksumRejectsCorruptedObject:ClientIntegrationTest.BatchPutPreservesObjectChecksumPairing:ClientIntegrationTest.TaggedBatchWritesSkipChecksumFailures"
+    "--gtest_filter=ObjectChecksumTest.*:ClientIntegrationTest.ObjectChecksumRejectsCorruptedObject:ClientIntegrationTest.BatchPutPreservesObjectChecksumPairing:ClientIntegrationTest.*BatchWritesSkipChecksumFailures"
 )
 set_tests_properties(object_checksum_client_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
@@ -487,6 +487,11 @@ add_store_test(mmap_arena_test mmap_arena_test.cpp)
 add_store_test(mmap_arena_config_test mmap_arena_config_test.cpp)
 add_store_test(mmap_arena_fallback_test mmap_arena_fallback_test.cpp)
 add_store_test(object_data_type_test object_data_type_test.cpp)
+add_test(
+  NAME kv_cache_kind_cli_test
+  COMMAND
+    ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/kv_cache_kind_cli_test.py
+    $<TARGET_FILE:mooncake_master>)
 add_subdirectory(e2e)
 
 add_executable(high_availability_test ha/leadership/high_availability_test.cpp)

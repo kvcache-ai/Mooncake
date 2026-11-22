@@ -1035,6 +1035,36 @@ TEST_F(ClientIntegrationTest, AffinityOnlyBatchWritesSkipChecksumFailures) {
     client_buffer_allocator_->deallocate(buffer, 4);
 }
 
+TEST_F(ClientIntegrationTest, KindOnlyBatchWritesSkipChecksumFailures) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+    void* buffer = client_buffer_allocator_->allocate(4);
+    ASSERT_NE(buffer, nullptr);
+    std::memcpy(buffer, "data", 4);
+    ReplicateConfig config;
+    config.data_type = ObjectDataType::KVCACHE;
+    config.kv_cache_kinds =
+        std::vector<KVCacheKind>{KVCacheKind::FULL, KVCacheKind::MAMBA};
+    for (bool upsert : {false, true}) {
+        const std::vector<ObjectKey> keys = {
+            "kind-invalid-slice",
+            upsert ? "kind-filtered-upsert" : "kind-filtered-put"};
+        std::vector<std::vector<Slice>> slices{{Slice{nullptr, 1}},
+                                               {Slice{buffer, 4}}};
+        auto results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                              : test_client_->BatchPut(keys, slices, config);
+        ASSERT_EQ(results.size(), 2u);
+        ASSERT_FALSE(results[0]);
+        EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+        ASSERT_TRUE(results[1]) << (upsert ? "BatchUpsert" : "BatchPut");
+        auto query = test_client_->Query(keys[1]);
+        ASSERT_TRUE(query);
+        EXPECT_EQ(query->object_checksum, ComputeCrcChecksum("data", 4));
+    }
+    client_buffer_allocator_->deallocate(buffer, 4);
+}
+
 TEST_F(ClientIntegrationTest, ResidencyAffinityRejectsMutationAndEmptyValue) {
     constexpr size_t value_size = 4;
     void* buffer = client_buffer_allocator_->allocate(value_size);
