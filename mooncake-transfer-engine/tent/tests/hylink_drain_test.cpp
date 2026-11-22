@@ -24,6 +24,7 @@ Failure failure;
 int copies;
 std::vector<hipStream_t> pending_copies;
 uintptr_t next_stream;
+bool forbid_new_streams;
 int events_created;
 }  // namespace
 
@@ -38,6 +39,7 @@ hipError_t __wrap_hipGetDevice(int* device) {
 }
 hipError_t __wrap_hipSetDevice(int) { return hipSuccess; }
 hipError_t __wrap_hipStreamCreate(hipStream_t* stream) {
+    if (forbid_new_streams) return hipErrorOutOfMemory;
     *stream = reinterpret_cast<hipStream_t>(++next_stream);
     return hipSuccess;
 }
@@ -89,6 +91,7 @@ class HylinkDrainTest : public ::testing::Test {
         failure = Failure::Query;
         copies = events_created = 0;
         next_stream = 0x100;
+        forbid_new_streams = false;
         pending_copies.clear();
         auto meta = std::make_shared<ControlService>("p2p", "", nullptr);
         ASSERT_TRUE(meta->segmentManager()
@@ -190,6 +193,39 @@ TEST_F(HylinkDrainTest, CopyRejectionReturnsSubmitErrorAndPreservesPriorTasks) {
     TransferStatus status{};
     ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
     EXPECT_EQ(status.s, COMPLETED);
+}
+
+TEST_F(HylinkDrainTest, RejectedAppendReturnsOnlyUnusedStreams) {
+    batch.max_size = 9;
+    ASSERT_TRUE(transport.submitTransferTasks(&batch, {request()}).ok());
+    ASSERT_EQ(pending_copies.size(), 1u);
+    const auto first = pending_copies.front();
+    std::vector<Request> append(8, request());
+    append.back().source = nullptr;
+    ASSERT_FALSE(transport.submitTransferTasks(&batch, append).ok());
+    ASSERT_EQ(batch.size(), 1u);
+    EXPECT_EQ(copies, 1);
+
+    forbid_new_streams = true;
+    HylinkSubBatch other;
+    other.max_size = 1;
+    ASSERT_TRUE(transport.submitTransferTasks(&other, {request()}).ok());
+    ASSERT_EQ(pending_copies.size(), 2u);
+    EXPECT_NE(first, pending_copies.back());
+    bool drained = true;
+    ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_FALSE(drained);
+    pending_copies.erase(pending_copies.begin());
+    ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_TRUE(drained);
+    TransferStatus status{};
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    ASSERT_TRUE(transport.isSubBatchDrained(&other, drained).ok());
+    EXPECT_FALSE(drained);
+    pending_copies.clear();
+    ASSERT_TRUE(transport.isSubBatchDrained(&other, drained).ok());
+    EXPECT_TRUE(drained);
 }
 
 TEST_F(HylinkDrainTest, RejectsInvalidRequestBeforeFirstCopy) {

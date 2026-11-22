@@ -439,18 +439,32 @@ Status HylinkTransport::submitTransferTasks(
     }
 
     const size_t original_task_count = hylink_batch->task_list.size();
+    auto rollback = [&] {
+        hylink_batch->task_list.resize(original_task_count);
+        auto unused = [&](const HylinkStream& stream) {
+            for (const auto& task : hylink_batch->task_list)
+                if (task.pending_stream == stream.get()) return false;
+            return true;
+        };
+        for (auto& entry : hylink_batch->device_streams) {
+            auto& streams = entry.second.streams;
+            streams.erase(
+                std::remove_if(streams.begin(), streams.end(), unused),
+                streams.end());
+        }
+    };
     try {
         for (const auto& request : request_list) {
             auto& task = hylink_batch->task_list.emplace_back();
             auto status =
                 prepareTask(*hylink_batch, request, local_segment, task);
             if (!status.ok()) {
-                hylink_batch->task_list.resize(original_task_count);
+                rollback();
                 return status;
             }
         }
     } catch (const std::bad_alloc&) {
-        hylink_batch->task_list.resize(original_task_count);
+        rollback();
         return Status::InternalError("Unable to prepare hylink batch" LOC_MARK);
     }
     for (size_t i = original_task_count; i < hylink_batch->size(); ++i) {
@@ -463,7 +477,7 @@ Status HylinkTransport::submitTransferTasks(
             LOG(ERROR) << "HylinkTransport: submit task failed: "
                        << status.ToString();
             if (i == original_task_count && !task.pending_stream) {
-                hylink_batch->task_list.resize(original_task_count);
+                rollback();
                 return status;
             }
             task.status_word = FAILED;
