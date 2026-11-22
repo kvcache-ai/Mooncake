@@ -890,6 +890,30 @@ Status SunriseLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
     return Status::OK();
 }
 
+Status SunriseLinkTransport::isSubBatchDrained(SubBatchRef batch,
+                                               bool& drained) {
+    drained = false;
+    auto* shm_batch = dynamic_cast<SunriseLinkSubBatch*>(batch);
+    if (!shm_batch)
+        return Status::InvalidArgument(
+            "Invalid SunriseLink sub-batch" LOC_MARK);
+    bool terminal = false;
+    CHECK_STATUS(Transport::isSubBatchDrained(batch, terminal));
+    if (!terminal) return Status::OK();
+
+    // A stream-query error can mark tasks FAILED while copies still run.
+    // Confirm physical completion without changing the original task status.
+    if (auto stream = reinterpret_cast<tangStream_t>(shm_batch->stream)) {
+        auto result = tangStreamQuery(stream);
+        if (result == tangErrorNotReady) return Status::OK();
+        if (result != tangSuccess)
+            return Status::InternalError(std::string("tangStreamQuery: ") +
+                                         tangGetErrorString(result) + LOC_MARK);
+    }
+    drained = true;
+    return Status::OK();
+}
+
 Status SunriseLinkTransport::addMemoryBuffer(BufferDesc& desc,
                                              const MemoryOptions& options) {
     LocationParser location(desc.location);

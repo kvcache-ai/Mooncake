@@ -77,6 +77,8 @@ class SunriseLinkTransport : public Transport {
     Status getTransferStatus(SubBatchRef batch, int task_id,
                              TransferStatus& status) override;
 
+    Status isSubBatchDrained(SubBatchRef batch, bool& drained) override;
+
     Status addMemoryBuffer(BufferDesc& desc,
                            const MemoryOptions& options) override;
 

@@ -22,6 +22,9 @@ struct Copy {
 struct MockTang {
     int device = 0;
     int failed_device = -1;
+    tangError_t query_error = tangSuccess;
+    int query_calls = 0;
+    int synchronize_calls = 0;
     std::vector<Copy> pending;
 
     void complete() {
@@ -62,9 +65,12 @@ tangError_t __wrap_tangMemcpyAsync(void* destination, const void* source,
     return tangSuccess;
 }
 tangError_t __wrap_tangStreamQuery(tangStream_t) {
+    ++mock.query_calls;
+    if (mock.query_error != tangSuccess) return mock.query_error;
     return mock.pending.empty() ? tangSuccess : tangErrorNotReady;
 }
 tangError_t __wrap_tangStreamSynchronize(tangStream_t) {
+    ++mock.synchronize_calls;
     EXPECT_TRUE(mock.pending.empty());
     return tangSuccess;
 }
@@ -167,6 +173,50 @@ TEST_P(SunriseLinkDrainTest, RejectedAppendKeepsEarlierSubmission) {
     EXPECT_FALSE(
         transport.submitTransferTasks(&batch, {rejectedRequest()}).ok());
     checkAcceptedCopy();
+}
+
+TEST_P(SunriseLinkDrainTest, QueryErrorKeepsAcceptedCopyUndrained) {
+    EXPECT_FALSE(
+        transport.submitTransferTasks(&batch, {request(0), rejectedRequest()})
+            .ok());
+    ASSERT_EQ(batch.size(), 1u);
+    ASSERT_EQ(mock.pending.size(), 1u);
+    mock.query_error = tangErrorInvalidValue;
+    TransferStatus status{};
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
+    ASSERT_EQ(status.s, FAILED);
+
+    for (int i = 0; i < 2; ++i) {
+        const int queries = mock.query_calls;
+        bool drained = true;
+        EXPECT_FALSE(transport.isSubBatchDrained(&batch, drained).ok());
+        EXPECT_FALSE(drained);
+        EXPECT_GT(mock.query_calls, queries);
+        EXPECT_EQ(mock.pending.size(), 1u);
+        EXPECT_EQ(target[0], 0);
+    }
+
+    // Clearing the query error does not mean the copy has completed.
+    mock.query_error = tangSuccess;
+    bool drained = true;
+    ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_FALSE(drained);
+    EXPECT_EQ(mock.synchronize_calls, 0);
+
+    mock.complete();
+    // Completion is not confirmed while the query itself keeps failing.
+    mock.query_error = tangErrorInvalidValue;
+    EXPECT_FALSE(transport.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_FALSE(drained);
+    mock.query_error = tangSuccess;
+    ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_TRUE(drained);
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    EXPECT_EQ(status.transferred_bytes, 0u);
+    source.fill('B');
+    EXPECT_EQ(target[0], 'A');
+    EXPECT_EQ(target[16], 0);
 }
 
 INSTANTIATE_TEST_SUITE_P(PreflightFailure, SunriseLinkDrainTest,
