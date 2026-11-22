@@ -48,6 +48,11 @@ class UbTransport : public Transport {
 
     ~UbTransport();
 
+    // True when the URMA transport should use RM (Reliable Message) mode,
+    // which is the only mode supported by UBoE (UB over Ethernet) devices.
+    // Selected via the MC_UB_TRANS_MODE=rm environment variable.
+    bool rmMode() const { return rm_mode_; }
+
     int install(std::string& local_server_name,
                 std::shared_ptr<TransferMetadata> meta,
                 std::shared_ptr<Topology> topo) override;
@@ -117,6 +122,7 @@ class UbTransport : public Transport {
     std::vector<std::shared_ptr<UbContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
     UB_ENDPOINT_TYPE endpoint_type_;
+    bool rm_mode_ = false;
     bool urma_initialized_ = false;
 };
 }  // namespace mooncake

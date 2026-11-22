@@ -26,7 +26,7 @@ namespace tent {
 TargetMetricsReport calculateTargetMetrics(
     size_t block_size, size_t batch_size, int num_threads,
     const std::string& backend, const std::string& op_type,
-    std::vector<TargetBenchStats>* stats) {
+    const std::vector<TargetBenchStats>* stats) {
     TargetMetricsReport report;
     report.block_size = block_size;
     report.batch_size = batch_size;
@@ -38,7 +38,7 @@ TargetMetricsReport calculateTargetMetrics(
     int assigned_threads = 0;
 
     for (size_t i = 0; i < stats->size(); ++i) {
-        auto& input = (*stats)[i];
+        const auto& input = (*stats)[i];
         TargetMetrics metrics;
         metrics.index = i;
         metrics.segment_name = input.segment_name;
