@@ -173,12 +173,22 @@ class TransferFault:
         self._delay_flags = self._library.mooncakePgTestDelayFlagCompletion
         self._delay_flags.argtypes = [ctypes.c_int64]
         self._delay_flags.restype = None
+        self._reset_counts = self._library.mooncakePgTestResetTransferCounts
+        self._reset_counts.argtypes = []
+        self._reset_counts.restype = None
+        self._get_held = self._library.mooncakePgTestGetHeldFlagBatchCount
+        self._get_held.argtypes = []
+        self._get_held.restype = ctypes.c_uint64
+        self._get_count_reads = self._library.mooncakePgTestGetCountReadCount
+        self._get_count_reads.argtypes = []
+        self._get_count_reads.restype = ctypes.c_uint64
         if local_rank < 0:
             raise ValueError("local rank must be non-negative")
         self._local_rank = local_rank
         self._set_enabled(0)
         self._clear_failed_targets()
         self._reset_count()
+        self._reset_counts()
         self._active = False
 
     @staticmethod
@@ -239,6 +249,18 @@ class TransferFault:
         """Make this rank's sync flag writes report completion late."""
         self._delay_flags(int(seconds * 1_000_000))
 
+    def reset_transfer_counts(self) -> None:
+        """Restart held_flag_batches and count_reads from zero."""
+        self._reset_counts()
+
     @property
     def injected_count(self) -> int:
         return int(self._get_count())
+
+    @property
+    def held_flag_batches(self) -> int:
+        return int(self._get_held())
+
+    @property
+    def count_reads(self) -> int:
+        return int(self._get_count_reads())

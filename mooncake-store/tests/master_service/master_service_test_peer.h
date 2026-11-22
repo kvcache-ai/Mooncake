@@ -2,6 +2,7 @@
 
 #include <utility>
 
+#include "client_session/client_session_registry_test_peer.h"
 #include "master_service.h"
 
 namespace mooncake::test {
@@ -136,18 +137,19 @@ class MasterServiceTestPeer {
         return service.batch_oplog_storage_;
     }
 
-    static auto& ClientLivenessRecords(MasterService& service) {
-        return service.client_sessions_.records_;
+    static auto& ClientSessions(MasterService& service) {
+        return service.client_sessions_;
     }
-    static const auto& ClientLivenessRecords(const MasterService& service) {
-        return service.client_sessions_.records_;
+    static const auto& ClientSessions(const MasterService& service) {
+        return service.client_sessions_;
     }
-
-    static auto& ClientMutex(MasterService& service) {
-        return service.client_sessions_.mutex_;
+    // Registry membership by client, not a frozen copy of session state.
+    static auto ClientSessionRecords(const MasterService& service) {
+        return ClientSessionRegistryTestPeer::SnapshotRecords(
+            service.client_sessions_);
     }
-    static const auto& ClientMutex(const MasterService& service) {
-        return service.client_sessions_.mutex_;
+    static auto& ClientOffboarding(MasterService& service) {
+        return service.client_offboarding_worker_;
     }
 
     static auto& DynamicReplicationWindows(MasterService& service) {
@@ -349,6 +351,20 @@ class MasterServiceTestPeer {
         return service.task_manager_;
     }
 
+    static std::unique_lock<std::mutex> LockDrainJobForTesting(
+        MasterService& service, const UUID& job_id) {
+        std::shared_ptr<MasterService::DrainJob> job;
+        {
+            std::lock_guard<std::mutex> lock(service.job_mutex_);
+            auto it = service.drain_jobs_.find(job_id);
+            if (it == service.drain_jobs_.end()) {
+                return {};
+            }
+            job = it->second;
+        }
+        return std::unique_lock<std::mutex>(job->mutex);
+    }
+
     static auto& TenantQuotaPolicyMutex(MasterService& service) {
         return service.tenant_quota_policy_->manager_.policy_mutex_;
     }
@@ -498,7 +514,8 @@ class MasterServiceTestPeer {
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const {
-        return service_.client_sessions_.Find(client_id);
+        return ClientSessionRegistryTestPeer::Find(service_.client_sessions_,
+                                                   client_id);
     }
 
     // Resolves the namespace, creating it through the table's factory on first
@@ -516,16 +533,6 @@ class MasterServiceTestPeer {
 
     bool IsReplicaReadable(const Replica& replica) const {
         return service_.IsReplicaReadable(replica);
-    }
-
-    static std::vector<std::string> KvMediaForMetadata(
-        const ObjectMetadata& metadata) {
-        return MasterService::KvMediaForMetadata(metadata);
-    }
-
-    static std::vector<std::string> KvMediaForRemoval(
-        const ObjectMetadata& metadata) {
-        return MasterService::KvMediaForRemoval(metadata);
     }
 
     void LoadTenantQuotaPoliciesFromStoreOrThrow() {

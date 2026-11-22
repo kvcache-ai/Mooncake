@@ -17,6 +17,7 @@
 
 #include "client_service.h"
 #include "master_client.h"
+#include "master_metric_manager.h"
 #include "task_manager.h"
 #include "types.h"
 #include "common/client_buffer_allocation.h"
@@ -655,6 +656,103 @@ TEST_F(TaskExecutorIntegrationTest, DrainJobCompleteFlow) {
         wait_for_segments(key, target_segment, source_segment);
         assert_key_data(key, value);
     }
+}
+
+TEST_F(TaskExecutorIntegrationTest, DrainCompletesWhileGroupedKeyStaysHot) {
+    const std::string key = "drain_hot_key";
+    const std::string peer_key = "drain_hot_peer";
+    std::string value(16 * 1024, 'h');
+    std::vector<Slice> source{{value.data(), value.size()}};
+    ReplicateConfig placement;
+    placement.replica_num = 1;
+    placement.group_ids = std::vector<std::string>{"drain_hot_group"};
+    placement.preferred_segment = kClient1Endpoint;
+    ASSERT_TRUE(client1_->Put(key, source, placement));
+    placement.preferred_segment = kClient2Endpoint;
+    ASSERT_TRUE(client2_->Put(peer_key, source, placement));
+
+    const auto initial = client2_->Query(key);
+    ASSERT_TRUE(initial);
+    const auto ttl = initial->lease_timeout - std::chrono::steady_clock::now();
+    if (ttl <= std::chrono::milliseconds(100)) {
+        GTEST_SKIP() << "This test needs a read lease long enough for TCP IO";
+    }
+    std::optional<QueryResult> source_query;
+    source_query.emplace(*initial);
+
+    CreateDrainJobRequest request;
+    request.segments = {kClient1Endpoint};
+    request.target_segments = {kClient2Endpoint};
+    request.max_concurrency = 1;
+    auto job = CreateDrainJobViaHttp(request);
+    ASSERT_TRUE(job && job->success);
+
+    const auto endpoint = [](const QueryResult& query) {
+        return query.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.transport_endpoint_;
+    };
+    const auto interval = std::min(
+        ttl / 10,
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::milliseconds(50)));
+    const auto deadline =
+        std::chrono::steady_clock::now() + ttl + std::chrono::seconds(15);
+    std::string output(value.size(), '\0');
+    std::vector<Slice> destination{{output.data(), output.size()}};
+    bool switched = false;
+    bool drained = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto query = client2_->Query(key);
+        ASSERT_TRUE(query);
+        ASSERT_EQ(query->replicas.size(), 1u);
+        ASSERT_TRUE(query->replicas.front().is_memory_replica());
+        if (endpoint(*query) == kClient1Endpoint) {
+            ASSERT_FALSE(switched);
+            EXPECT_FALSE(source_query->IsLeaseExpired());
+            source_query.emplace(*query);
+        } else {
+            ASSERT_EQ(endpoint(*query), kClient2Endpoint);
+            if (!switched) {
+                switched = true;
+                ASSERT_EQ(endpoint(*source_query), kClient1Endpoint);
+                ASSERT_TRUE(client2_->Get(key, *source_query, destination, 0));
+                EXPECT_EQ(output, value);
+                EXPECT_GE(MasterMetricManager::instance()
+                              .get_segment_allocated_mem_size(kClient1Endpoint),
+                          static_cast<int64_t>(value.size()));
+                const auto status = QuerySegmentStatusViaHttp(kClient1Endpoint);
+                ASSERT_TRUE(status && status->success);
+                EXPECT_EQ(status->status_name, "DRAINING");
+            }
+        }
+        std::fill(output.begin(), output.end(), '\0');
+        ASSERT_TRUE(client2_->Get(key, *query, destination));
+        EXPECT_EQ(output, value);
+        auto exists = client2_->IsExist(peer_key);
+        ASSERT_TRUE(exists && *exists);
+
+        auto progress = QueryDrainJobViaHttp(job->job_id);
+        ASSERT_TRUE(progress && progress->success);
+        ASSERT_NE(progress->status_name, "FAILED");
+        if (progress->status_name == "SUCCEEDED") {
+            EXPECT_EQ(progress->succeeded_units, 1u);
+            drained = true;
+            break;
+        }
+        std::this_thread::sleep_for(interval);
+    }
+    ASSERT_TRUE(switched);
+    ASSERT_TRUE(drained);
+    EXPECT_EQ(MasterMetricManager::instance().get_segment_allocated_mem_size(
+                  kClient1Endpoint),
+              0);
+    const auto expired = client2_->Get(key, *source_query, destination);
+    ASSERT_FALSE(expired);
+    EXPECT_EQ(expired.error(), ErrorCode::LEASE_EXPIRED);
+    const auto status = QuerySegmentStatusViaHttp(kClient1Endpoint);
+    ASSERT_TRUE(status && status->success);
+    EXPECT_EQ(status->status_name, "DRAINED");
 }
 
 TEST_F(TaskExecutorIntegrationTest, ReplicaCopyToMultipleTargets) {

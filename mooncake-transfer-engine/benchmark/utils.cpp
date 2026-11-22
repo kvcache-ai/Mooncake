@@ -28,7 +28,8 @@
 
 DEFINE_string(seg_name, "", "Memory segment name for the local side");
 DEFINE_string(seg_type, "DRAM",
-              "Memory segment type for the target side: DRAM|VRAM");
+              "Memory segment type for the target side: DRAM|VRAM "
+              "(case-insensitive)");
 DEFINE_string(
     seg_type_mix, "",
     "Comma-separated segment types for mixed DRAM+VRAM runs, e.g. "
@@ -53,6 +54,8 @@ DEFINE_uint64(max_block_size, 1UL << 26, "Maximum block size (in bytes).");
 DEFINE_uint64(start_batch_size, 1, "Start batch size (number of requests).");
 DEFINE_uint64(max_batch_size, 1, "Maximum batch size (number of requests).");
 DEFINE_int32(duration, 5, "Number of duration per test case.");
+DEFINE_int32(warmup_ms, 1000,
+             "Warmup time per test case in milliseconds (0 disables warmup).");
 DEFINE_int32(start_num_threads, 1,
              "Start number of concurrent worker threads.");
 DEFINE_int32(max_num_threads, 1,
@@ -102,7 +105,11 @@ DEFINE_string(
     "and no I/O. Enable to split Avg Tx into submit vs completion wait.");
 DEFINE_uint64(request_interval_us, 0,
               "Per-thread delay before issuing each transfer batch, in "
-              "microseconds. 0 disables pacing.");
+              "microseconds. 0 disables pacing. Closed loop: the wait starts "
+              "after the previous transfer completes, so each thread issues "
+              "at most 1 / (interval + transfer latency) requests per "
+              "second. The wait busy-yields, so a pacing thread may keep "
+              "a core occupied.");
 DEFINE_uint64(deadline_us, 0,
               "tent only: relative per-transfer deadline in microseconds for "
               "tight worker threads (0 disables deadline tagging); cannot be "
@@ -175,6 +182,7 @@ size_t XferBenchConfig::max_block_size = 0;
 size_t XferBenchConfig::start_batch_size = 0;
 size_t XferBenchConfig::max_batch_size = 0;
 int XferBenchConfig::duration = 0;
+int XferBenchConfig::warmup_ms = 1000;
 int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
 size_t XferBenchConfig::target_offset = 0;
@@ -255,7 +263,11 @@ std::optional<size_t> parseHugepageSizeFlag(std::string_view raw) {
 }  // namespace
 
 void XferBenchConfig::loadFromFlags() {
+    // Case-insensitive, as TENT already accepted "dram"/"vram"; the backends
+    // compare against "DRAM"/"VRAM".
     seg_type = FLAGS_seg_type;
+    for (auto& c : seg_type)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     seg_type_mix = FLAGS_seg_type_mix;
     seg_name = FLAGS_seg_name;
     target_seg_name = FLAGS_target_seg_name;
@@ -285,6 +297,7 @@ void XferBenchConfig::loadFromFlags() {
     deadline_tight_threads = FLAGS_deadline_tight_threads;
     deadline_bw_arbitration = FLAGS_deadline_bw_arbitration;
     duration = FLAGS_duration;
+    warmup_ms = FLAGS_warmup_ms;
 
     metadata_type = FLAGS_metadata_type;
     metadata_url_list = FLAGS_metadata_url_list;
@@ -361,12 +374,20 @@ bool XferBenchConfig::resolveDramNumaRange(int& start_idx, int& num_buffers,
     return true;
 }
 
-double XferMetricStats::percentile(double p) {
+const std::vector<double>& XferMetricStats::sortedSamples() const {
+    if (!sorted_valid) {
+        sorted_samples = samples;
+        std::sort(sorted_samples.begin(), sorted_samples.end());
+        sorted_valid = true;
+    }
+    return sorted_samples;
+}
+
+double XferMetricStats::percentile(double p) const {
     if (samples.empty()) return 0.0;
     if (p <= 0) return min();
     if (p >= 100) return max();
-    std::vector<double> sorted = samples;
-    std::sort(sorted.begin(), sorted.end());
+    const std::vector<double>& sorted = sortedSamples();
     double rank = (p / 100.0) * (sorted.size() - 1);
     size_t idx = static_cast<size_t>(rank);
     double frac = rank - idx;
@@ -393,16 +414,19 @@ void printStatsHeader() {
     // clang-format on
 }
 
-void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
-                int num_threads) {
+void printStats(size_t block_size, size_t batch_size,
+                const XferBenchStats& stats, int num_threads) {
     size_t total_data_transferred = 0;
     double avg_latency = 0, throughput_gb = 0;
     auto num_ops = stats.transfer_duration.count();
     double total_duration = stats.total_duration.avg();
     total_data_transferred = ((block_size * batch_size) * num_ops);
-    avg_latency = (total_duration * num_threads / num_ops);
-    throughput_gb = (((double)total_data_transferred / (1000 * 1000 * 1000)) /
-                     (total_duration / 1e6));  // In GB/Sec
+    // An empty run (e.g. --duration=0) keeps its row, with zero rates.
+    if (num_ops != 0) avg_latency = (total_duration * num_threads / num_ops);
+    if (total_duration > 0)
+        throughput_gb =
+            (((double)total_data_transferred / (1000 * 1000 * 1000)) /
+             (total_duration / 1e6));  // In GB/Sec
     const double avg_instant_gbps = stats.instant_bandwidth.avg();
 
     // Tabulate print with fixed width for each string
@@ -422,7 +446,7 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
 }
 
 void printDeadlineGroupStats(const char* group, size_t block_size,
-                             size_t batch_size, XferBenchStats& stats,
+                             size_t batch_size, const XferBenchStats& stats,
                              int num_threads, uint64_t deadline_us) {
     if (num_threads <= 0 || stats.transfer_duration.count() == 0) return;
     const double duration_s = stats.total_duration.avg() / 1e6;

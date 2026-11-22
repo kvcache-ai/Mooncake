@@ -15,6 +15,7 @@
 #include "utils.h"
 #include "split_output.h"
 #include "common.h"
+#include "bench_config.h"
 
 #include "bench_runner.h"
 #include "qos_metrics_adapter.h"
@@ -42,70 +43,24 @@ double gbPerSecond(uint64_t bytes, double duration_us) {
     return static_cast<double>(bytes) / (1000.0 * duration_us);
 }
 
-// A random slot in [0, slots) other than prev, so consecutive operations never
-// rewrite the same blocks. prev == slots means no previous slot. slots >= 2.
 uint64_t pickTargetSlot(std::mt19937_64& rng, uint64_t slots, uint64_t prev) {
     if (prev == slots) return rng() % slots;
     const uint64_t slot = rng() % (slots - 1);
     return slot >= prev ? slot + 1 : slot;
 }
 
+// Returns 0 on success, 1 if the sweep point is skipped because the buffer
+// layout does not fit, and -1 on failure.
 int processBatchSizes(
     BenchRunner& runner, size_t block_size, size_t batch_size, int num_threads,
-    const std::vector<QosClassConfig>& qos_classes,
+    const OpMode& op_mode, const std::vector<QosClassConfig>& qos_classes,
     const std::vector<WorkloadClassConfig>& workload_classes = {}) {
-    bool mixed_opcode = false;
-    bool write_seed = false;
-    bool read_verify = false;
-    OpCode opcode = READ;
-    if (XferBenchConfig::check_consistency &&
-        (XferBenchConfig::op_type == "write_seed" ||
-         XferBenchConfig::op_type == "read_verify")) {
-        LOG(ERROR) << "--check_consistency cannot be combined with "
-                      "write_seed/read_verify";
-        exit(EXIT_FAILURE);
-    }
-    if (XferBenchConfig::check_consistency || XferBenchConfig::op_type == "mix")
-        mixed_opcode = true;
-    else if (XferBenchConfig::op_type == "read")
-        opcode = READ;
-    else if (XferBenchConfig::op_type == "write")
-        opcode = WRITE;
-    else if (XferBenchConfig::op_type == "write_seed") {
-        opcode = WRITE;
-        write_seed = true;
-    } else if (XferBenchConfig::op_type == "read_verify") {
-        opcode = READ;
-        read_verify = true;
-    } else {
-        LOG(ERROR) << "Invalid args: workload only support "
-                      "read|write|mix|write_seed|read_verify";
-        exit(EXIT_FAILURE);
-    }
-    const std::string& target_access = XferBenchConfig::target_access;
-    const bool random_access = target_access == "random";
-    if (!random_access && target_access != "fixed") {
-        LOG(ERROR) << "Invalid args: --target_access only supports "
-                      "fixed|random";
-        exit(EXIT_FAILURE);
-    }
-    if (!random_access && XferBenchConfig::target_window_size != 0) {
-        LOG(ERROR) << "--target_window_size requires --target_access=random";
-        exit(EXIT_FAILURE);
-    }
-    // The window is also the per-thread stride, and file targets are opened
-    // with O_DIRECT, which needs aligned offsets.
-    if (XferBenchConfig::target_window_size % 4096 != 0) {
-        LOG(ERROR) << "--target_window_size must be a multiple of 4096";
-        exit(EXIT_FAILURE);
-    }
-    // Seeded data is checked at the offset it was written to, which a moving
-    // offset in a separate write_seed run would not revisit.
-    if (random_access && (write_seed || read_verify)) {
-        LOG(ERROR) << "--target_access=" << target_access
-                   << " cannot be combined with write_seed/read_verify";
-        exit(EXIT_FAILURE);
-    }
+    const bool mixed_opcode = op_mode.mixed_opcode;
+    const bool write_seed = op_mode.write_seed;
+    const bool read_verify = op_mode.read_verify;
+    const OpCode opcode = op_mode.opcode;
+    const bool random_access = op_mode.random_access;
+    const uint64_t warmup_ns = XferBenchConfig::warmup_ms * 1000000ull;
 
     XferBenchStats stats;
     std::vector<XferBenchStats> qos_stats(qos_classes.size());
@@ -117,6 +72,12 @@ int processBatchSizes(
         target_stats[i].segment_name = target_names[i];
     XferBenchStats tight_stats;
     XferBenchStats loose_stats;
+    // Per-target and deadline-group stats are copies of the samples above;
+    // only collect them when the reporting below uses them.
+    const bool report_targets = runner.getTargetCount() > 1 ||
+                                !XferBenchConfig::result_output_jsonl.empty();
+    const bool report_deadline_groups =
+        XferBenchConfig::deadline_us > 0 && workload_classes.empty();
     std::mutex mutex;
     std::atomic<int> measurement_ready{0};
     std::atomic<bool> measurement_started{false};
@@ -130,7 +91,8 @@ int processBatchSizes(
         }
     };
     size_t address_stride_bytes =
-        XferBenchConfig::max_block_size * XferBenchConfig::max_batch_size;
+        checkedMul(XferBenchConfig::max_block_size,
+                   XferBenchConfig::max_batch_size, "address stride");
     if (!workload_classes.empty()) {
         address_stride_bytes = 0;
         for (const auto& config : workload_classes) {
@@ -150,19 +112,41 @@ int processBatchSizes(
                    << address_stride_bytes << ")";
         exit(EXIT_FAILURE);
     }
+    // Every worker's regions must fit before any transfer starts; the layout
+    // depends on the thread count and the largest operation, not on the
+    // current block and batch size.
+    for (int thread_id = 0; thread_id < num_threads; ++thread_id) {
+        const char* side = nullptr;
+        uint64_t bytes = 0;
+        if (!runner.getLocalBufferBase(thread_id, address_stride_bytes)) {
+            side = "local";
+            bytes = address_stride_bytes;
+        } else if (!runner.getTargetBufferBase(thread_id,
+                                               target_window_bytes)) {
+            side = "target";
+            bytes = target_window_bytes;
+        }
+        if (side != nullptr) {
+            LOG(INFO) << "Skipped for block_size " << block_size
+                      << " batch_size " << batch_size << ": the " << side
+                      << " region of thread " << thread_id << " (" << bytes
+                      << " bytes per thread) does not fit in its buffer";
+            return 1;
+        }
+    }
     int rc = runner.runInitiatorTasks([&](int thread_id) -> int {
         runner.pinThread(thread_id);
-        auto local_gpu_offset = std::max(0, XferBenchConfig::local_gpu_id);
-        auto target_gpu_offset = std::max(0, XferBenchConfig::target_gpu_id);
-        const int target_thread_id =
-            static_cast<int>(target_gpu_offset * runner.getTargetCount()) +
-            thread_id;
-        uint64_t local_addr = runner.getLocalBufferBase(
-            local_gpu_offset + thread_id, address_stride_bytes, 1);
-        uint64_t target_addr = runner.getTargetBufferBase(
-            target_thread_id, target_window_bytes, 1);
-        uint64_t target_id = runner.getTargetSegmentId(target_thread_id);
-        const size_t target_index = runner.getTargetIndex(target_thread_id);
+        const auto local_base =
+            runner.getLocalBufferBase(thread_id, address_stride_bytes);
+        const auto target_base =
+            runner.getTargetBufferBase(thread_id, target_window_bytes);
+        LOG_ASSERT(local_base.has_value() && target_base.has_value())
+            << "Buffer layout of thread " << thread_id
+            << " passed the pre-flight check but no longer fits";
+        const uint64_t local_addr = *local_base;
+        const uint64_t target_addr = *target_base;
+        uint64_t target_id = runner.getTargetSegmentId(thread_id);
+        const size_t target_index = runner.getTargetIndex(thread_id);
         const bool qos_enabled = !qos_classes.empty();
         const size_t qos_class =
             qos_enabled ? qosClassForThread(qos_classes, thread_id) : 0;
@@ -205,13 +189,16 @@ int processBatchSizes(
         };
 
         XferBenchTimer timer;
-        while (timer.lap_us(false) < 1000000ull) {
+        setSplitWarmup(true);
+        while (timer.lap_ns(false) < warmup_ns) {
             if (runner.runSingleTransfer(
                     local_addr, target_id, nextTargetAddr(), thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type) < 0) {
+                setSplitWarmup(false);
                 return failTask();
             }
         }
+        setSplitWarmup(false);
         if (measurement_ready.fetch_add(1, std::memory_order_acq_rel) + 1 ==
             num_threads) {
             measurement_started.store(true, std::memory_order_release);
@@ -226,13 +213,9 @@ int processBatchSizes(
         if (mixed_opcode) {
             while (timer.lap_us(false) <
                    XferBenchConfig::duration * 1000000ull) {
-                const size_t bytes =
-                    checkedMul(thread_block_size, thread_batch_size,
-                               "consistency payload size");
-                const uint64_t batch_bytes = bytes;
                 uint8_t pattern = 0;
                 if (XferBenchConfig::check_consistency)
-                    pattern = fillData((void*)local_addr, bytes);
+                    pattern = fillData((void*)local_addr, op_bytes);
                 // Read back from where this iteration wrote.
                 const uint64_t op_target_addr = nextTargetAddr();
                 paceRequest();
@@ -240,33 +223,28 @@ int processBatchSizes(
                     local_addr, target_id, op_target_addr, thread_block_size,
                     thread_batch_size, WRITE, deadlineNs(), intent_type);
                 if (val < 0) return failTask();
-                thread_instant_bandwidth.push_back(
-                    gbPerSecond(batch_bytes, val));
+                thread_instant_bandwidth.push_back(gbPerSecond(op_bytes, val));
                 transfer_duration.push_back(val);
-                fillData((void*)local_addr, bytes);
+                // Clobber the local copy so the READ must bring the data
+                // back; a value distinct from pattern keeps a no-op READ
+                // from passing verification.
+                if (XferBenchConfig::check_consistency)
+                    fillData((void*)local_addr, op_bytes, pattern ^ 0xFF);
                 paceRequest();
                 val = runner.runSingleTransfer(
                     local_addr, target_id, op_target_addr, thread_block_size,
                     thread_batch_size, READ, deadlineNs(), intent_type);
                 if (val < 0) return failTask();
-                thread_instant_bandwidth.push_back(
-                    gbPerSecond(batch_bytes, val));
+                thread_instant_bandwidth.push_back(gbPerSecond(op_bytes, val));
                 if (XferBenchConfig::check_consistency)
-                    verifyData((void*)local_addr,
-                               checkedMul(thread_block_size, thread_batch_size,
-                                          "consistency payload size"),
-                               pattern);
+                    verifyData((void*)local_addr, op_bytes, pattern);
                 transfer_duration.push_back(val);
             }
         } else {
             while (timer.lap_us(false) <
                    XferBenchConfig::duration * 1000000ull) {
-                const size_t bytes =
-                    checkedMul(thread_block_size, thread_batch_size,
-                               "operation payload size");
-                const uint64_t batch_bytes = bytes;
                 if (write_seed) {
-                    fillData((void*)local_addr, bytes,
+                    fillData((void*)local_addr, op_bytes,
                              stableDataSeed(target_addr));
                 }
                 paceRequest();
@@ -274,58 +252,60 @@ int processBatchSizes(
                     local_addr, target_id, nextTargetAddr(), thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type);
                 if (val < 0) return failTask();
-                thread_instant_bandwidth.push_back(
-                    gbPerSecond(batch_bytes, val));
+                thread_instant_bandwidth.push_back(gbPerSecond(op_bytes, val));
                 if (read_verify) {
-                    verifyData((void*)local_addr, bytes,
+                    verifyData((void*)local_addr, op_bytes,
                                stableDataSeed(target_addr));
                 }
                 transfer_duration.push_back(val);
             }
         }
         auto total_duration = timer.lap_us();
-        const uint64_t bytes_per_operation = checkedMul(
-            thread_block_size, thread_batch_size, "operation payload size");
-        const uint64_t transferred_bytes =
-            checkedMul(bytes_per_operation, transfer_duration.size(),
-                       "thread transferred bytes");
+        const uint64_t transferred_bytes = checkedMul(
+            op_bytes, transfer_duration.size(), "thread transferred bytes");
         std::lock_guard<std::mutex> lock(mutex);
         stats.total_duration.add(total_duration);
         stats.transfer_duration.add(transfer_duration);
         stats.instant_bandwidth.add(thread_instant_bandwidth);
-        auto& target = target_stats[target_index];
-        ++target.threads;
-        target.transferred_bytes =
-            checkedAdd(target.transferred_bytes, transferred_bytes,
-                       "target transferred bytes");
-        target.stats.total_duration.add(total_duration);
-        target.stats.transfer_duration.add(transfer_duration);
-        target.stats.instant_bandwidth.add(thread_instant_bandwidth);
+        if (report_targets) {
+            auto& target = target_stats[target_index];
+            ++target.threads;
+            target.transferred_bytes =
+                checkedAdd(target.transferred_bytes, transferred_bytes,
+                           "target transferred bytes");
+            target.stats.total_duration.add(total_duration);
+            target.stats.transfer_duration.add(transfer_duration);
+            target.stats.instant_bandwidth.add(thread_instant_bandwidth);
+        }
         if (qos_enabled) {
             qos_stats[qos_class].total_duration.add(total_duration);
             qos_stats[qos_class].transfer_duration.add(transfer_duration);
             qos_stats[qos_class].instant_bandwidth.add(
                 thread_instant_bandwidth);
         }
-        auto& group_stats = tight ? tight_stats : loose_stats;
-        group_stats.total_duration.add(total_duration);
-        group_stats.transfer_duration.add(transfer_duration);
+        if (report_deadline_groups) {
+            auto& group_stats = tight ? tight_stats : loose_stats;
+            group_stats.total_duration.add(total_duration);
+            group_stats.transfer_duration.add(transfer_duration);
+        }
         return 0;
     });
 
     if (rc != 0) return -1;
     if (workload_classes.empty())
         printStats(block_size, batch_size, stats, num_threads);
-    auto target_report = calculateTargetMetrics(
-        block_size, batch_size, num_threads, XferBenchConfig::backend,
-        mixed_opcode ? "mix" : XferBenchConfig::op_type, &target_stats);
-    if (runner.getTargetCount() > 1) printTargetMetrics(target_report);
-    if (!XferBenchConfig::result_output_jsonl.empty()) {
-        std::string error;
-        if (!appendTargetMetricsJsonl(XferBenchConfig::result_output_jsonl,
-                                      target_report, &error)) {
-            LOG(ERROR) << error;
-            return -1;
+    if (report_targets) {
+        auto target_report = calculateTargetMetrics(
+            block_size, batch_size, num_threads, XferBenchConfig::backend,
+            mixed_opcode ? "mix" : XferBenchConfig::op_type, &target_stats);
+        if (runner.getTargetCount() > 1) printTargetMetrics(target_report);
+        if (!XferBenchConfig::result_output_jsonl.empty()) {
+            std::string error;
+            if (!appendTargetMetricsJsonl(XferBenchConfig::result_output_jsonl,
+                                          target_report, &error)) {
+                LOG(ERROR) << error;
+                return -1;
+            }
         }
     }
     if (!qos_classes.empty()) {
@@ -347,7 +327,7 @@ int processBatchSizes(
             }
         }
     }
-    if (XferBenchConfig::deadline_us > 0 && workload_classes.empty()) {
+    if (report_deadline_groups) {
         const int tight_threads =
             std::min(num_threads, XferBenchConfig::deadline_tight_threads);
         printDeadlineGroupStats("tight", block_size, batch_size, tight_stats,
@@ -376,130 +356,14 @@ int main(int argc, char* argv[]) {
             return EXIT_FAILURE;
         }
     }
-    if (XferBenchConfig::use_hugepage) {
-        if (XferBenchConfig::backend != "classic" ||
-            (XferBenchConfig::xport_type != "shm" &&
-             XferBenchConfig::xport_type != "rdma")) {
-            LOG(ERROR) << "--use_hugepage requires --backend=classic and "
-                          "--xport_type=shm or rdma";
-            return EXIT_FAILURE;
-        }
-        if (XferBenchConfig::hugepage_size == static_cast<size_t>(-1)) {
-            LOG(ERROR) << "--hugepage_size must be 2MB, 512MB, 1GB, or a byte "
-                          "count (2097152, 536870912, 1073741824)";
-            return EXIT_FAILURE;
-        }
-        const size_t hp = XferBenchConfig::hugepage_size == 0
-                              ? mooncake::SharedMemoryOptions::kHugepage2MB
-                              : XferBenchConfig::hugepage_size;
-        if (!mooncake::SharedMemoryOptions::isSupportedHugepageSize(hp)) {
-            LOG(ERROR) << "--hugepage_size must be 2MB, 512MB, 1GB, or a byte "
-                          "count (2097152, 536870912, 1073741824)";
-            return EXIT_FAILURE;
-        }
-        if (XferBenchConfig::total_buffer_size % hp != 0) {
-            LOG(ERROR) << "--total_buffer_size must be a multiple of "
-                          "hugepage_size";
-            return EXIT_FAILURE;
-        }
-    }
-    std::vector<WorkloadClassConfig> workload_classes;
-    std::vector<QosClassConfig> qos_classes;
-    if (!XferBenchConfig::workload_classes_json.empty() &&
-        (!XferBenchConfig::qos_classes.empty() ||
-         !XferBenchConfig::qos_classes_json.empty())) {
-        LOG(ERROR)
-            << "Use --workload_classes_json or QoS class flags, not both";
+    BenchConfig config;
+    std::string config_error;
+    if (!validateConfig(&config, &config_error)) {
+        LOG(ERROR) << config_error;
         return EXIT_FAILURE;
     }
-    if (!XferBenchConfig::qos_classes.empty() &&
-        !XferBenchConfig::qos_classes_json.empty()) {
-        LOG(ERROR) << "Use only one of --qos_classes or --qos_classes_json";
-        return EXIT_FAILURE;
-    }
-    if (!XferBenchConfig::workload_classes_json.empty()) {
-        std::string error;
-        if (!parseWorkloadClassesJson(XferBenchConfig::workload_classes_json,
-                                      &workload_classes, &error)) {
-            LOG(ERROR) << "Invalid --workload_classes_json: " << error;
-            return EXIT_FAILURE;
-        }
-        qos_classes = qosClassesFromWorkload(workload_classes);
-    } else if (!XferBenchConfig::qos_classes_json.empty()) {
-        std::string error;
-        if (!parseQosClassesJson(XferBenchConfig::qos_classes_json,
-                                 &qos_classes, &error)) {
-            LOG(ERROR) << "Invalid --qos_classes_json: " << error;
-            return EXIT_FAILURE;
-        }
-    } else if (!XferBenchConfig::qos_classes.empty()) {
-        std::string error;
-        if (!parseQosClasses(XferBenchConfig::qos_classes, &qos_classes,
-                             &error)) {
-            LOG(ERROR) << "Invalid --qos_classes: " << error;
-            return EXIT_FAILURE;
-        }
-    }
-    if (!qos_classes.empty()) {
-        std::string error;
-        if (XferBenchConfig::start_num_threads !=
-            XferBenchConfig::max_num_threads) {
-            LOG(ERROR)
-                << "QoS metrics require start_num_threads == max_num_threads";
-            return EXIT_FAILURE;
-        }
-        if (!validateQosClasses(qos_classes, XferBenchConfig::start_num_threads,
-                                &error)) {
-            LOG(ERROR) << "Invalid QoS classes: " << error;
-            return EXIT_FAILURE;
-        }
-        if (!workload_classes.empty() &&
-            !validateWorkloadClasses(
-                workload_classes, XferBenchConfig::start_num_threads,
-                XferBenchConfig::total_buffer_size, &error)) {
-            LOG(ERROR) << "Invalid workload classes: " << error;
-            return EXIT_FAILURE;
-        }
-    }
-    if (XferBenchConfig::qos_link_capacity_gbps < 0.0 ||
-        !std::isfinite(XferBenchConfig::qos_link_capacity_gbps)) {
-        LOG(ERROR) << "qos_link_capacity_gbps must be finite and non-negative";
-        return EXIT_FAILURE;
-    }
-    if (XferBenchConfig::deadline_tight_threads < 0 ||
-        XferBenchConfig::deadline_tight_threads >
-            XferBenchConfig::max_num_threads) {
-        LOG(ERROR) << "deadline_tight_threads must be in [0, max_num_threads]";
-        return EXIT_FAILURE;
-    }
-    if (XferBenchConfig::deadline_us > 0 &&
-        XferBenchConfig::backend != "tent") {
-        LOG(ERROR) << "deadline tagging is supported only by the tent backend";
-        return EXIT_FAILURE;
-    }
-    if (!workload_classes.empty() &&
-        XferBenchConfig::tent_intent_type != "unspec") {
-        LOG(ERROR) << "--tent_intent_type cannot be combined with per-class "
-                      "intent_type";
-        return EXIT_FAILURE;
-    }
-    if (!workload_classes.empty() &&
-        (XferBenchConfig::deadline_us != 0 ||
-         XferBenchConfig::deadline_tight_threads != 0)) {
-        LOG(ERROR) << "--deadline_us and --deadline_tight_threads cannot be "
-                      "combined with per-class workload deadlines";
-        return EXIT_FAILURE;
-    }
-    if (!workload_classes.empty() && XferBenchConfig::backend != "tent") {
-        for (const auto& config : workload_classes) {
-            if (config.deadline_us != 0 ||
-                config.intent_type != IntentType::INTENT_UNSPEC) {
-                LOG(ERROR) << "per-class deadline_us and intent_type require "
-                              "the tent backend";
-                return EXIT_FAILURE;
-            }
-        }
-    }
+    const auto& qos_classes = config.qos_classes;
+    const auto& workload_classes = config.workload_classes;
     std::unique_ptr<BenchRunner> runner;
     if (XferBenchConfig::backend == "classic") {
         runner = std::make_unique<TEBenchRunner>();
@@ -525,13 +389,15 @@ int main(int argc, char* argv[]) {
     if (!workload_classes.empty()) {
         const int num_threads = XferBenchConfig::start_num_threads;
         if (runner->startInitiator(num_threads) != 0) return EXIT_FAILURE;
-        const int rc = processBatchSizes(*runner, 0, 0, num_threads,
-                                         qos_classes, workload_classes);
+        const int rc =
+            processBatchSizes(*runner, 0, 0, num_threads, config.op_mode,
+                              qos_classes, workload_classes);
         runner->stopInitiator();
         return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     printStatsHeader();
     bool interrupted = false;
+    bool ran_any = false;
     for (int num_threads = XferBenchConfig::start_num_threads;
          !interrupted && num_threads <= XferBenchConfig::max_num_threads;
          num_threads *= 2) {
@@ -551,20 +417,20 @@ int main(int argc, char* argv[]) {
                     bytes_per_thread > XferBenchConfig::target_range_size) {
                     LOG(ERROR) << "target range is smaller than one operation";
                     interrupted = true;
-                } else if (num_threads != 0 &&
-                           bytes_per_thread >
-                               XferBenchConfig::total_buffer_size /
-                                   num_threads) {
-                    LOG(INFO) << "Skipped for block_size " << block_size
-                              << " batch_size " << batch_size;
                 } else {
-                    if (processBatchSizes(*runner, block_size, batch_size,
-                                          num_threads, qos_classes) != 0)
-                        interrupted = true;
+                    const int rc = processBatchSizes(
+                        *runner, block_size, batch_size, num_threads,
+                        config.op_mode, qos_classes);
+                    if (rc < 0) interrupted = true;
+                    if (rc == 0) ran_any = true;
                 }
             }
         }
         runner->stopInitiator();
     }
-    return interrupted ? EXIT_FAILURE : EXIT_SUCCESS;
+    if (!interrupted && !ran_any) {
+        // A run that measured nothing must not look like a pass.
+        LOG(ERROR) << "No benchmark case ran: every sweep point was skipped";
+    }
+    return sweepExitStatus(interrupted, ran_any);
 }

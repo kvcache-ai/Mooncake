@@ -109,6 +109,15 @@ cudaError_t __wrap_cudaMemcpyBatchAsync(void** dsts, void** srcs, size_t* sizes,
     return cudaSuccess;
 }
 #endif
+void* __real_dlsym(void* handle, const char* symbol);
+void* __wrap_dlsym(void* handle, const char* symbol) {
+#if CUDART_VERSION >= 12080 && CUDART_VERSION < 13000
+    // CUDA 12.8+ resolves the batch-copy entry point at runtime.
+    if (std::strcmp(symbol, "cudaMemcpyBatchAsync") == 0)
+        return reinterpret_cast<void*>(&__wrap_cudaMemcpyBatchAsync);
+#endif
+    return __real_dlsym(handle, symbol);
+}
 cudaError_t __wrap_cudaEventCreateWithFlags(cudaEvent_t* event, unsigned) {
     if (mock.fail_create) return cudaErrorMemoryAllocation;
     *event = reinterpret_cast<cudaEvent_t>(new Event);

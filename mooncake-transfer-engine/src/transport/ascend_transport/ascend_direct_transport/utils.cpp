@@ -15,7 +15,6 @@
 
 #include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
-#include <dlfcn.h>
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
@@ -182,11 +181,12 @@ bool IsRoceModeEnabled() {
         LOG(WARNING) << "HCCL_INTRA_ROCE_ENABLE is not valid, value:"
                      << roce_enable_str;
     }
-    char* global_resource_config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+    const char* global_resource_config = getEnvWithFallback(
+        "MC_ASCEND_GLOBAL_RESOURCE_CONFIG", "ASCEND_GLOBAL_RESOURCE_CONFIG");
     std::string resolved =
         ResolveAscendGlobalResourceConfig(global_resource_config);
-    LOG(INFO) << "[AscendTE] resolved ASCEND_GLOBAL_RESOURCE_CONFIG "
-                 "(protocol_desc): "
+    LOG(INFO) << "[AscendTE] resolved MC_ASCEND_GLOBAL_RESOURCE_CONFIG/"
+                 "ASCEND_GLOBAL_RESOURCE_CONFIG (protocol_desc): "
               << (resolved.empty() ? "(none)" : resolved);
     if (HasRoceProtocolDescInGlobalResourceConfig(resolved.c_str())) {
         return true;

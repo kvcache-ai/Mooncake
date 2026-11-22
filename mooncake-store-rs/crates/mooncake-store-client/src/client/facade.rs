@@ -557,8 +557,9 @@ impl StoreClient {
                 self.route_ops().delete_route_with_version_fence(&route)?
             };
             if cas.applied {
-                self.finalize_tenant_quota_delete(quota_reservation.as_ref())?;
+                let finalize_result = self.finalize_tenant_quota_delete(quota_reservation.as_ref());
                 self.schedule_reclaim_after_logical_remove(&route);
+                finalize_result?;
                 return Ok(());
             }
 

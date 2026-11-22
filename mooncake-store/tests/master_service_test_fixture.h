@@ -62,7 +62,24 @@ class MasterServiceTest : public ::testing::Test {
 
     std::shared_ptr<ClientLivenessRecord> FindClientLivenessForTest(
         MasterService& service, const UUID& client_id) {
-        return MasterServiceTestPeer(service).FindClientRecord(client_id);
+        return ClientSessionRegistryTestPeer::Find(
+            MasterServiceTestPeer::ClientSessions(service), client_id);
+    }
+
+    // Stop publishing and delivering transitions, leaving residual offboarding
+    // running.
+    void QuiesceClientSessionsForTest(MasterService& service) {
+        MasterServiceTestPeer::ClientSessions(service).Stop();
+    }
+
+    void StopClientSessionsForTest(MasterService& service) {
+        QuiesceClientSessionsForTest(service);
+        MasterServiceTestPeer::ClientOffboarding(service).Stop();
+    }
+
+    bool HasPendingOffboardingForTest(MasterService& service) {
+        return MasterServiceTestPeer::ClientSessions(service)
+            .HasRetiredSession();
     }
 
     bool ProcessClientOffboardingForTest(MasterService& service,
@@ -216,31 +233,18 @@ class MasterServiceTest : public ::testing::Test {
         return std::nullopt;
     }
 
-    // Inspect normalized media through the peer's locked metadata accessors.
-    std::optional<std::vector<std::string>> KvMediaForKey(
+    // Inspect the route-tracked KV media bitmask under a read guard.
+    std::optional<uint8_t> AnnouncedKvMediaForKey(
         MasterService& service, const std::string& key,
         const TenantId& tenant_id = TenantId::Default()) {
-        MasterServiceTestPeer::MetadataAccessorRO accessor(
-            &service,
-            MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
-                key, tenant_id));
-        if (!accessor.Exists()) {
+        MasterServiceTestPeer peer(service);
+        const auto identity = peer.MakeObjectIdentityForRequest(key, tenant_id);
+        auto guard = peer.GetOrCreateNamespace(identity.tenant_id)
+                         .objects.Read(identity.user_key);
+        if (!guard.has_value()) {
             return std::nullopt;
         }
-        return MasterServiceTestPeer::KvMediaForMetadata(accessor.Get());
-    }
-
-    std::optional<std::vector<std::string>> KvRemovalMediaForKey(
-        MasterService& service, const std::string& key,
-        const TenantId& tenant_id = TenantId::Default()) {
-        MasterServiceTestPeer::MetadataAccessorRO accessor(
-            &service,
-            MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
-                key, tenant_id));
-        if (!accessor.Exists()) {
-            return std::nullopt;
-        }
-        return MasterServiceTestPeer::KvMediaForRemoval(accessor.Get());
+        return guard->state().announced_kv_media;
     }
 
     void UpsertSoftPinDeadlineIndexForTest(
