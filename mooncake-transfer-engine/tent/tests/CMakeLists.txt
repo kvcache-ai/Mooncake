@@ -560,6 +560,7 @@ if(USE_SUNRISE)
     "-Wl,--wrap=tangPointerGetAttributes"
     "-Wl,--wrap=tangStreamCreateWithFlags"
     "-Wl,--wrap=tangStreamDestroy"
+    "-Wl,--wrap=tangMemcpy"
     "-Wl,--wrap=tangMemcpyAsync"
     "-Wl,--wrap=tangStreamQuery"
     "-Wl,--wrap=tangStreamSynchronize")

@@ -8,6 +8,8 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "tent/transport/sunrise_link/sunrise_link_transport.h"
@@ -15,6 +17,7 @@
 namespace {
 
 struct Copy {
+    tangStream_t stream;
     void* destination;
     const void* source;
     size_t size;
@@ -27,12 +30,18 @@ struct MockTang {
     int synchronize_calls = 0;
     std::vector<Copy> pending;
 
-    void complete() {
-        for (const auto& copy : pending)
-            std::memcpy(copy.destination, copy.source, copy.size);
-        pending.clear();
+    void complete(tangStream_t stream = nullptr) {
+        for (auto it = pending.begin(); it != pending.end();) {
+            if (stream && it->stream != stream) {
+                ++it;
+                continue;
+            }
+            std::memcpy(it->destination, it->source, it->size);
+            it = pending.erase(it);
+        }
     }
 } mock;
+std::unordered_map<tangStream_t, int> stream_devices;
 
 }  // namespace
 
@@ -55,23 +64,39 @@ tangError_t __wrap_tangPointerGetAttributes(tangPointerAttributes* attributes,
     return tangSuccess;
 }
 tangError_t __wrap_tangStreamCreateWithFlags(tangStream_t* stream, unsigned) {
-    *stream = reinterpret_cast<tangStream_t>(1);
+    static uintptr_t next = 1;
+    *stream = reinterpret_cast<tangStream_t>(next++);
+    stream_devices.emplace(*stream, mock.device);
     return tangSuccess;
 }
-tangError_t __wrap_tangStreamDestroy(tangStream_t) { return tangSuccess; }
+tangError_t __wrap_tangStreamDestroy(tangStream_t stream) {
+    EXPECT_EQ(stream_devices.erase(stream), 1u);
+    return tangSuccess;
+}
+tangError_t __wrap_tangMemcpy(void* destination, const void* source,
+                              size_t size, tangMemcpyKind) {
+    std::memcpy(destination, source, size);
+    return tangSuccess;
+}
 tangError_t __wrap_tangMemcpyAsync(void* destination, const void* source,
-                                   size_t size, tangMemcpyKind, tangStream_t) {
-    mock.pending.push_back({destination, source, size});
+                                   size_t size, tangMemcpyKind,
+                                   tangStream_t stream) {
+    mock.pending.push_back({stream, destination, source, size});
     return tangSuccess;
 }
-tangError_t __wrap_tangStreamQuery(tangStream_t) {
+tangError_t __wrap_tangStreamQuery(tangStream_t stream) {
     ++mock.query_calls;
     if (mock.query_error != tangSuccess) return mock.query_error;
-    return mock.pending.empty() ? tangSuccess : tangErrorNotReady;
+    auto it = stream_devices.find(stream);
+    if (it == stream_devices.end() || it->second != mock.device)
+        return tangErrorInvalidValue;
+    for (const auto& copy : mock.pending)
+        if (copy.stream == stream) return tangErrorNotReady;
+    return tangSuccess;
 }
-tangError_t __wrap_tangStreamSynchronize(tangStream_t) {
+tangError_t __wrap_tangStreamSynchronize(tangStream_t stream) {
     ++mock.synchronize_calls;
-    EXPECT_TRUE(mock.pending.empty());
+    for (const auto& copy : mock.pending) EXPECT_NE(copy.stream, stream);
     return tangSuccess;
 }
 }  // extern "C"
@@ -92,7 +117,7 @@ class SunriseLinkTransportTestPeer {
     }
 };
 
-class SunriseLinkDrainTest : public ::testing::TestWithParam<bool> {
+class SunriseLinkStreamTest : public ::testing::Test {
    protected:
     void SetUp() override {
         mock = {};
@@ -114,16 +139,59 @@ class SunriseLinkDrainTest : public ::testing::TestWithParam<bool> {
         result.length = 16;
         return result;
     }
-    Request rejectedRequest() {
-        auto result = request(GetParam() ? 1 : 0);
-        if (GetParam()) {
-            mock.failed_device = 1;
-        } else {
-            // No peer is opened for this ID, so real address resolution fails.
-            result.target_id = std::numeric_limits<SegmentID>::max();
-        }
-        return result;
-    }
+    SunriseLinkTransport transport;
+    SunriseLinkSubBatch batch;
+    std::array<char, 32> source{}, target{};
+};
+
+TEST_F(SunriseLinkStreamTest, WaitsForBothStreamsWhenSecondFinishesFirst) {
+    std::thread submitter([&] {
+        ASSERT_TRUE(
+            transport.submitTransferTasks(&batch, {request(0), request(1)})
+                .ok());
+        ASSERT_EQ(mock.pending.size(), 2u);
+        ASSERT_NE(mock.pending[0].stream, mock.pending[1].stream);
+        mock.complete(mock.pending[1].stream);
+
+        TransferStatus status{};
+        ASSERT_TRUE(transport.getTransferStatus(&batch, 1, status).ok());
+        EXPECT_EQ(status.s, COMPLETED);
+        ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
+        EXPECT_EQ(status.s, PENDING);
+        bool drained = true;
+        ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+        EXPECT_FALSE(drained);
+        EXPECT_EQ(target[0], 0);
+        EXPECT_EQ(target[16], 'A');
+    });
+    submitter.join();
+
+    bool drained = true;
+    ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_FALSE(drained);
+    mock.complete();
+    ASSERT_TRUE(transport.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_EQ(target[0], 'A');
+}
+
+TEST_F(SunriseLinkStreamTest, SynchronousCopyDrainsAfterSubmitterExits) {
+    SunriseLinkTransport sync_transport;
+    std::thread submitter([&] {
+        EXPECT_TRUE(
+            sync_transport.submitTransferTasks(&batch, {request(0)}).ok());
+    });
+    submitter.join();
+    ASSERT_EQ(target[0], 'A');
+    bool drained = false;
+    EXPECT_TRUE(sync_transport.isSubBatchDrained(&batch, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_EQ(mock.query_calls, 0);
+}
+
+class SunriseLinkDrainTest : public SunriseLinkStreamTest,
+                             public ::testing::WithParamInterface<bool> {
+   protected:
     void checkAcceptedCopy() {
         ASSERT_EQ(batch.size(), 1u);
         ASSERT_EQ(mock.pending.size(), 1u);
@@ -145,9 +213,16 @@ class SunriseLinkDrainTest : public ::testing::TestWithParam<bool> {
         EXPECT_EQ(status.s, COMPLETED);
         EXPECT_EQ(status.transferred_bytes, 16u);
     }
-    SunriseLinkTransport transport;
-    SunriseLinkSubBatch batch;
-    std::array<char, 32> source{}, target{};
+    Request rejectedRequest() {
+        auto result = request(GetParam() ? 1 : 0);
+        if (GetParam()) {
+            mock.failed_device = 1;
+        } else {
+            // No peer is opened for this ID, so real address resolution fails.
+            result.target_id = std::numeric_limits<SegmentID>::max();
+        }
+        return result;
+    }
 };
 
 TEST_P(SunriseLinkDrainTest, RejectedRequestLeavesNoTask) {
