@@ -296,6 +296,8 @@ struct MockHixlState {
     int disconnect_calls = 0;
     int transfer_async_calls = 0;
     int get_status_calls = 0;
+    uint32_t query_result = kHixlOk;
+    void* waiting_handle = nullptr;
     int register_calls = 0;
     int deregister_calls = 0;
     std::vector<bool> register_local_only;
@@ -315,6 +317,7 @@ struct MockHixlState {
     // Return value of Disconnect; kHixlNotConnected is what a peer whose
     // session was already torn down reports, and it must be tolerated.
     uint32_t disconnect_status = kHixlOk;
+    std::function<void()> on_disconnect;
     std::map<std::string, std::string> last_options;
     std::string last_remote;
     std::vector<std::map<std::string, std::string>> all_options;
@@ -405,17 +408,18 @@ class MockHixlVendor final : public HixlEngine::Vendor {
     }
 
     uint32_t GetTransferStatus(void* req, HixlXferState& status) override {
-        (void)req;
         std::lock_guard<std::mutex> lock(state_->mu);
         state_->get_status_calls++;
-        status = state_->xfer_state;
-        return kHixlOk;
+        status = req == state_->waiting_handle ? HixlXferState::Waiting
+                                               : state_->xfer_state;
+        return state_->query_result;
     }
 
     uint32_t Disconnect(const std::string& remote,
                         int32_t timeout_ms) override {
         (void)remote;
         (void)timeout_ms;
+        if (state_->on_disconnect) state_->on_disconnect();
         std::lock_guard<std::mutex> lock(state_->mu);
         state_->disconnect_calls++;
         return state_->disconnect_status;
@@ -1103,6 +1107,90 @@ TEST_F(AscendDirectTransportTest, FailEntireRouteMarksSiblingTasks) {
     EXPECT_EQ(state_->get_status_calls, polls_after_first);
     EXPECT_EQ(state_->disconnect_calls, 0);
     EXPECT_EQ(state_->transfer_async_calls, 1);
+}
+
+TEST_F(AscendDirectTransportTest, QueryErrorWaitsForEachAcceptedGroup) {
+    ASSERT_TRUE(InstallAgentTwoEngines().ok());
+    PublishEngineBuffers();
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+    char src[64]{};
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_TRUE(transport_
+                        ->submitTransferTasks(
+                            batch_, {MakeRemoteWrite(src + i * 32, 32,
+                                                     0x20010 + i * 32)})
+                        .ok());
+    }
+    auto* sub = static_cast<HixlSubBatch*>(batch_);
+    ASSERT_TRUE(
+        WaitUntil([&] { return sub->pending_submits.load() == 0; }, 2000));
+    ASSERT_NE(sub->task_list[0].req_handle, sub->task_list[1].req_handle);
+    state_->waiting_handle = sub->task_list[1].req_handle;
+    state_->query_result = 1;
+    TransferStatus status{};
+    bool drained = true;
+    ASSERT_TRUE(transport_->isSubBatchDrained(batch_, drained).ok());
+    ASSERT_FALSE(drained);
+    ASSERT_GT(state_->get_status_calls, 0);
+    state_->query_result = kHixlOk;
+    WaitUntilTerminal(*transport_, batch_, 0);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    ASSERT_TRUE(transport_->isSubBatchDrained(batch_, drained).ok());
+    EXPECT_FALSE(drained);
+    state_->waiting_handle = nullptr;
+    WaitUntilTerminal(*transport_, batch_, 1);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    ASSERT_TRUE(transport_->isSubBatchDrained(batch_, drained).ok());
+    EXPECT_TRUE(drained);
+}
+
+TEST_F(AscendDirectTransportTest, FailedDisconnectDoesNotDrainTimeout) {
+    state_->xfer_state = HixlXferState::Timeout;
+    state_->disconnect_status = 1;
+    ASSERT_TRUE(InstallAgentTwoEngines().ok());
+    PublishEngineBuffers();
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+    char src[16]{};
+    ASSERT_TRUE(
+        transport_->submitTransferTasks(batch_, {MakeRemoteWrite(src, 16)})
+            .ok());
+    bool drained = true;
+    ASSERT_TRUE(WaitUntil(
+        [&] {
+            return transport_->isSubBatchDrained(batch_, drained).ok() &&
+                   state_->disconnect_calls > 0;
+        },
+        2000));
+    EXPECT_FALSE(drained);
+    // The worker can publish a new request while the old session is closing.
+    // Its handle is outside the set covered by this disconnect.
+    state_->on_disconnect = [&] {
+        ASSERT_TRUE(
+            transport_->submitTransferTasks(batch_, {MakeRemoteWrite(src, 16)})
+                .ok());
+        auto* sub = static_cast<HixlSubBatch*>(batch_);
+        ASSERT_TRUE(
+            WaitUntil([&] { return sub->pending_submits.load() == 0; }, 2000));
+        state_->waiting_handle = sub->task_list[1].req_handle;
+        ASSERT_NE(state_->waiting_handle, nullptr);
+    };
+    state_->disconnect_status = kHixlOk;
+    WaitUntilTerminal(*transport_, batch_, 0);
+    TransferStatus status{};
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
+    EXPECT_EQ(status.s, TIMEOUT);
+    state_->on_disconnect = {};
+    ASSERT_TRUE(transport_->isSubBatchDrained(batch_, drained).ok());
+    EXPECT_FALSE(drained);
+    state_->waiting_handle = nullptr;
+    state_->xfer_state = HixlXferState::Completed;
+    WaitUntilTerminal(*transport_, batch_, 1);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, status).ok());
+    EXPECT_EQ(status.s, COMPLETED);
+    ASSERT_TRUE(transport_->isSubBatchDrained(batch_, drained).ok());
+    EXPECT_TRUE(drained);
 }
 
 // A timeout reported by HIXL for one task marks the whole route group; the

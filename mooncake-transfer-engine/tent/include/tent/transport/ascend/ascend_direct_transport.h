@@ -131,6 +131,8 @@ class AscendDirectTransport : public Transport {
 
     struct GroupState {
         TransferStatusEnum status = TransferStatusEnum::PENDING;
+        TransferStatusEnum failure = PENDING;
+        uint64_t submission = 0;
         int remaining = 0;
         size_t engine_idx = 0;
         std::string remote;
@@ -170,12 +172,11 @@ class AscendDirectTransport : public Transport {
     // reservation back. Used when a transfer worker aborts before it publishes
     // its group (for example when issueGroup throws).
     void abandonGroup(const std::vector<HixlTask*>& tasks);
-    // Marks every group of one route terminal. disconnect=true also tears down
-    // the HIXL session of that peer: a timed-out transfer has no cancel API, so
-    // Disconnect is what aborts its in-flight DMA before the caller can reuse
-    // the buffers. FAILED and local-copy routes pass false.
+    // A route error is sticky, but a group is terminal only after its own
+    // completion or a successful disconnect covering its submission.
     void failEntireRoute(size_t engine_idx, const std::string& remote,
-                         TransferStatusEnum status, bool disconnect);
+                         TransferStatusEnum status,
+                         void* finished_handle = nullptr);
     bool applyGroupStatus(HixlTask& task, GroupState& group);
     bool finishTaskLocked(HixlTask& task, void** local_release_handle,
                           size_t* local_release_engine);
@@ -219,6 +220,7 @@ class AscendDirectTransport : public Transport {
     bool fail_local_copy_publish_{false};
 
     std::mutex req_mutex_;
+    uint64_t last_remote_submission_ = 0;
     std::unordered_map<void*, GroupState> groups_;
     std::map<std::pair<size_t, std::string>, std::vector<void*>> route_groups_;
 

@@ -905,6 +905,7 @@ void AscendDirectTransport::issueGroup(const std::string& remote_hixl,
         }
         if (pending > 0) {
             group.remaining = pending;
+            group.submission = ++last_remote_submission_;
             const std::pair<size_t, std::string> route_key{local_engine_idx,
                                                            remote_hixl};
             auto& route = route_groups_[route_key];
@@ -1196,39 +1197,47 @@ bool AscendDirectTransport::applyGroupStatus(HixlTask& task,
 void AscendDirectTransport::failEntireRoute(size_t engine_idx,
                                             const std::string& remote,
                                             TransferStatusEnum status,
-                                            bool disconnect) {
-    int inflight_dec = 0;
+                                            void* finished_handle) {
+    const auto route = std::make_pair(engine_idx, remote);
+    uint64_t cutoff;
     {
         std::lock_guard<std::mutex> lock(req_mutex_);
-        auto it = route_groups_.find({engine_idx, remote});
-        std::vector<void*> handles;
-        if (it != route_groups_.end()) {
-            handles = it->second;
+        auto it = route_groups_.find(route);
+        if (it == route_groups_.end()) return;
+        cutoff = last_remote_submission_;
+        for (auto handle : it->second) {
+            auto& group = groups_.at(handle);
+            if (group.status != PENDING) continue;
+            if (group.failure == PENDING) group.failure = status;
+            if (handle == finished_handle) group.status = group.failure;
         }
-        for (void* handle : handles) {
-            auto git = groups_.find(handle);
-            if (git == groups_.end()) {
-                continue;
-            }
-            if (git->second.status == TransferStatusEnum::PENDING) {
-                git->second.status = status;
-            }
-            if (git->second.counted) {
-                git->second.counted = false;
-                inflight_dec++;
+    }
+    if (status != TIMEOUT || engine_idx >= engines_.size() ||
+        !engines_[engine_idx])
+        return;
+    if (!engines_[engine_idx]
+             ->disconnectOnTimeout(remote, kAscendTimeoutDisconnectMs)
+             .ok())
+        return;
+
+    // A new session can already have accepted work while Disconnect returned.
+    // Only requests published before this abort are covered.
+    int released = 0;
+    {
+        std::lock_guard<std::mutex> lock(req_mutex_);
+        auto it = route_groups_.find(route);
+        if (it == route_groups_.end()) return;
+        for (auto handle : it->second) {
+            auto& group = groups_.at(handle);
+            if (group.submission > cutoff || group.status != PENDING) continue;
+            group.status = group.failure;
+            if (group.counted) {
+                group.counted = false;
+                ++released;
             }
         }
     }
-    // Never acquire inflight_mu_ while holding req_mutex_: submit waits on
-    // inflight_mu_ and later takes req_mutex_.
-    releaseInflight(inflight_dec);
-    // Also outside req_mutex_: HIXL takes per-peer locks and may block for up
-    // to the disconnect timeout, so this must not hold the transport's group
-    // lock.
-    if (disconnect && engine_idx < engines_.size() && engines_[engine_idx]) {
-        (void)engines_[engine_idx]->disconnectOnTimeout(
-            remote, kAscendTimeoutDisconnectMs);
-    }
+    releaseInflight(released);
 }
 
 bool AscendDirectTransport::finishTaskLocked(HixlTask& task,
@@ -1365,14 +1374,17 @@ Status AscendDirectTransport::getTransferStatus(SubBatchRef batch, int task_id,
             // A caller-judged HIXL timeout must disconnect the peer: no cancel
             // API exists, and Disconnect aborts the request's device DMA.
             failEntireRoute(task.local_engine_idx, task.remote_hixl,
-                            TransferStatusEnum::TIMEOUT, /*disconnect=*/true);
+                            TransferStatusEnum::TIMEOUT);
         }
         completePolledTask(task);
-        if (LoadTaskStatus(task) == TransferStatusEnum::PENDING) {
-            StoreTaskStatus(task, TransferStatusEnum::TIMEOUT);
+        if (task.local_copy && LoadTaskStatus(task) == PENDING)
+            StoreTaskStatus(task, TIMEOUT);
+        if (LoadTaskStatus(task) != PENDING) {
+            status = TransferStatus{LoadTaskStatus(task), LoadTaskBytes(task)};
+            return Status::OK();
         }
-        status = TransferStatus{LoadTaskStatus(task), LoadTaskBytes(task)};
-        return Status::OK();
+        // A failed disconnect proves nothing. The request can still complete
+        // normally, so keep polling its native handle.
     }
 
     // The thread-local poll cache only skips the HIXL query below; the group
@@ -1432,32 +1444,30 @@ Status AscendDirectTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
     if (task.local_engine_idx >= engines_.size() ||
         !engines_[task.local_engine_idx]) {
-        failEntireRoute(task.local_engine_idx, task.remote_hixl,
-                        TransferStatusEnum::FAILED, /*disconnect=*/false);
-        completePolledTask(task);
-        if (LoadTaskStatus(task) == TransferStatusEnum::PENDING) {
-            StoreTaskStatus(task, TransferStatusEnum::FAILED);
-        }
-        status = TransferStatus{LoadTaskStatus(task), LoadTaskBytes(task)};
-        return Status::OK();
+        failEntireRoute(task.local_engine_idx, task.remote_hixl, FAILED);
+        status = TransferStatus{PENDING, 0};
+        return Status::InternalError(
+            "HIXL engine unavailable while polling" LOC_MARK);
     }
 
     HixlXferState xfer_status = HixlXferState::Waiting;
     auto err =
         engines_[task.local_engine_idx]->getTransferStatus(handle, xfer_status);
     const auto mapped = FromHixlState(xfer_status);
-    if (!err.ok() || mapped == TransferStatusEnum::FAILED) {
-        failEntireRoute(task.local_engine_idx, task.remote_hixl,
-                        TransferStatusEnum::FAILED, /*disconnect=*/false);
+    if (!err.ok() || mapped == FAILED) {
+        failEntireRoute(task.local_engine_idx, task.remote_hixl, FAILED,
+                        err.ok() ? handle : nullptr);
     } else if (mapped == TransferStatusEnum::TIMEOUT) {
         failEntireRoute(task.local_engine_idx, task.remote_hixl,
-                        TransferStatusEnum::TIMEOUT, /*disconnect=*/true);
+                        TransferStatusEnum::TIMEOUT);
     } else if (mapped == TransferStatusEnum::COMPLETED) {
         std::lock_guard<std::mutex> lock(req_mutex_);
         auto git = groups_.find(handle);
         if (git != groups_.end() &&
             git->second.status == TransferStatusEnum::PENDING) {
-            git->second.status = TransferStatusEnum::COMPLETED;
+            git->second.status = git->second.failure == PENDING
+                                     ? COMPLETED
+                                     : git->second.failure;
         }
     }
 
