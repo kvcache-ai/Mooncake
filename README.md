@@ -321,7 +321,7 @@ Mooncake supports hardware backends across accelerator vendors, cloud fabrics, a
 
 <!-- Regenerate with: uv run scripts/generate_hardware_overview.py -->
 <p align="center">
-  <img src="image/hardwares/supported_hardware.png" width="960" alt="Supported hardware ecosystem: NVIDIA, Huawei, AMD, Cambricon, Moore Threads, AWS, MetaX, T-Head, Alibaba Cloud, Sunrise, Hygon, Biren Technology, Intel, Google, HPE, Iluvatar CoreX, FlagOS."/>
+  <img src="image/hardwares/supported_hardware.png" width="960" alt="Supported hardware ecosystem: NVIDIA, Huawei, AMD, Cambricon, Moore Threads, AWS, MetaX, T-Head, Alibaba Cloud, Sunrise, Hygon, Biren Technology, Intel, Google, HPE, Iluvatar CoreX, FlagOS, Enflame."/>
 </p>
 
 *Each logo has equal display space; placement does not indicate ranking.*
