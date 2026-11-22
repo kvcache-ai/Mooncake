@@ -168,9 +168,6 @@ class AscendDirectTransport : public Transport {
     void startLocalCopy(size_t local_engine_idx, bool write,
                         const std::vector<HixlTask*>& tasks,
                         bool use_mapped_remote = false);
-    void failLocalCopyStream(size_t engine_idx, TransferStatusEnum status);
-    void markGroupHandles(const std::vector<void*>& handles,
-                          TransferStatusEnum status);
     // Marks the tasks that are still PENDING as FAILED and gives the group
     // reservation back. Used when a transfer worker aborts before it publishes
     // its group (for example when issueGroup throws).

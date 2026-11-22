@@ -34,8 +34,8 @@ namespace tent {
 // Same-engine copies: one aclrtMemcpyAsync per slice spread over several
 // streams, each closed by a D2H of a host completion flag. A group is done
 // when every stream it used has set its flag, so nothing here waits on a
-// stream. Any submit/timeout failure destroys the streams, recreates them,
-// and fails every in-flight group on them.
+// stream. On failure, keep each group until its flags land or its streams
+// have been destroyed. New copies use fresh streams.
 class LocalCopyEngine {
    public:
     // Runs one stream's issue work. The transport supplies a pool so a group
@@ -58,12 +58,10 @@ class LocalCopyEngine {
     void finalize();
     void setTaskRunner(TaskRunner runner);
 
-    Status submit(bool write, const std::vector<HixlOpDesc>& ops, void*& req,
-                  std::vector<void*>& failed_handles);
+    Status submit(bool write, const std::vector<HixlOpDesc>& ops, void*& req);
 
-    TransferStatusEnum poll(void* req);
+    TransferStatusEnum poll(void* req, bool timed_out);
     void release(void* req);
-    std::vector<void*> failAndRecreate();
 
    private:
     struct Group {
@@ -71,7 +69,7 @@ class LocalCopyEngine {
         // never land their completion write in the same cache line.
         void* host_flags = nullptr;
         size_t stream_count = 0;
-        bool failed = false;
+        TransferStatusEnum failure = PENDING;
     };
 
     class ContextGuard {
@@ -92,7 +90,7 @@ class LocalCopyEngine {
     Status allocHostFlags(Group& group);
     void freeHostFlags(Group& group);
     static volatile uint32_t* flagAt(const Group& group, size_t index);
-    std::vector<void*> failAndRecreateLocked();
+    void failStreamsLocked(TransferStatusEnum failure);
     static aclrtMemcpyKind memcpyKind(void* src, void* dst);
 
     mutable std::mutex mutex_;
@@ -102,6 +100,7 @@ class LocalCopyEngine {
     void* device_one_{nullptr};
     std::unordered_map<void*, std::unique_ptr<Group>> groups_;
     TaskRunner task_runner_;
+    bool retiring_{false};
     bool initialized_{false};
 };
 

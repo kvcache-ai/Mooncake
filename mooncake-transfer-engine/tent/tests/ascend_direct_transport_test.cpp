@@ -61,6 +61,8 @@ int g_stream_creates = 0;
 int g_stream_destroys = 0;
 int g_memcpy_async_calls = 0;
 bool g_memcpy_async_fail = false;
+bool g_fail_flag_copy = false;
+bool g_cleanup_fails = false;
 bool g_skip_memcpy_copy = false;
 uintptr_t g_next_stream = 0x3000;
 // Ordered ACL events, so a test can assert that the streams were aborted
@@ -96,6 +98,8 @@ void ResetAcl() {
     g_stream_destroys = 0;
     g_memcpy_async_calls = 0;
     g_memcpy_async_fail = false;
+    g_fail_flag_copy = false;
+    g_cleanup_fails = false;
     g_skip_memcpy_copy = false;
     g_next_stream = 0x3000;
     g_acl_event_seq = 0;
@@ -165,10 +169,10 @@ aclError aclrtMemcpy(void* dst, size_t destMax, const void* src, size_t count,
 aclError aclrtMemcpyAsync(void* dst, size_t destMax, const void* src,
                           size_t count, aclrtMemcpyKind kind,
                           aclrtStream stream) {
-    (void)kind;
     (void)stream;
     ++g_memcpy_async_calls;
-    if (g_memcpy_async_fail) {
+    if (g_memcpy_async_fail ||
+        (g_fail_flag_copy && kind == ACL_MEMCPY_DEVICE_TO_HOST)) {
         return 1;
     }
     if (g_skip_memcpy_copy || dst == nullptr || src == nullptr || count == 0) {
@@ -220,13 +224,13 @@ aclError aclrtCreateStreamWithConfig(aclrtStream* stream, uint32_t priority,
 aclError aclrtDestroyStream(aclrtStream stream) {
     (void)stream;
     g_stream_destroys++;
-    return ACL_ERROR_NONE;
+    return g_cleanup_fails ? 1 : ACL_ERROR_NONE;
 }
 
 aclError aclrtStreamAbort(aclrtStream stream) {
     (void)stream;
     g_last_stream_abort_seq = ++g_acl_event_seq;
-    return ACL_ERROR_NONE;
+    return g_cleanup_fails ? 1 : ACL_ERROR_NONE;
 }
 
 const char* aclGetRecentErrMsg() { return "mock acl error message"; }
@@ -859,51 +863,85 @@ TEST_F(AscendDirectTransportTest, LocalCopyFailureFailsAllStreamTasks) {
     EXPECT_TRUE(transport_->freeSubBatch(batch_b).ok());
 }
 
-// When publishing a copy group fails after the streams were issued, the
-// request's host flags must not be freed while a queued D2H can still write
-// them: the streams are aborted first (failAndRecreate), the sibling groups on
-// them are failed through markGroupHandles, and only then are the flags
-// released.
-TEST_F(AscendDirectTransportTest, LocalCopyPublishFailureAbortsBeforeRelease) {
+TEST_F(AscendDirectTransportTest, LocalTrackingFailureRejectsBeforeCopy) {
     ASSERT_TRUE(Install().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
     char src[16]{};
     g_skip_memcpy_copy = true;
-    // A first local copy group stays in flight, so its handle is still tracked
-    // when the second publication fails.
-    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
-    ASSERT_TRUE(
-        transport_->submitTransferTasks(batch_, {MakeWrite(src, 0x1000, 16)})
-            .ok());
-    ASSERT_EQ(g_host_allocs.size(), 1U);
-    void* const sibling_flags = g_host_allocs[0];
-
-    Transport::SubBatchRef failed_batch = nullptr;
-    ASSERT_TRUE(transport_->allocateSubBatch(failed_batch, 2).ok());
+    auto request = MakeWrite(src, 0x1000, sizeof(src));
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, {request}).ok());
+    const auto issued = g_memcpy_async_calls;
     AscendDirectTransportTestPeer::failNextGroupPublish(*transport_);
-    const int destroys_before = g_stream_destroys;
-    ASSERT_TRUE(
-        transport_
-            ->submitTransferTasks(failed_batch, {MakeWrite(src, 0x2000, 16)})
-            .ok());
-    ASSERT_EQ(g_host_allocs.size(), 2U);
-    void* const failed_flags = g_host_allocs[1];
-    // The abort must come before the flags of the failed request are released.
-    ASSERT_EQ(g_host_free_seq.count(failed_flags), 1U);
-    EXPECT_GT(g_host_free_seq[failed_flags], g_last_stream_abort_seq);
-    EXPECT_GT(g_stream_destroys, destroys_before);
-    // The sibling group on the recreated streams was failed, not lost, and its
-    // flags are released through the normal poll path.
-    TransferStatus sibling{};
-    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, sibling).ok());
-    EXPECT_EQ(sibling.s, TransferStatusEnum::FAILED);
-    EXPECT_EQ(g_host_free_seq.count(sibling_flags), 1U);
-    EXPECT_GT(g_host_free_seq[sibling_flags], g_last_stream_abort_seq);
-    TransferStatus failed{};
-    ASSERT_TRUE(transport_->getTransferStatus(failed_batch, 0, failed).ok());
-    EXPECT_EQ(failed.s, TransferStatusEnum::FAILED);
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, {request}).ok());
+    EXPECT_EQ(g_memcpy_async_calls, issued);
+    TransferStatus status{};
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
+    EXPECT_EQ(status.s, PENDING);
+    ASSERT_EQ(g_host_allocs.size(), 1u);
+    *static_cast<uint32_t*>(g_host_allocs.front()) = 1;
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
+    EXPECT_EQ(status.s, COMPLETED);
     EXPECT_EQ(AscendDirectTransportTestPeer::inflight(*transport_), 0);
-    EXPECT_EQ(state_->transfer_async_calls, 0);
-    EXPECT_TRUE(transport_->freeSubBatch(failed_batch).ok());
+}
+
+TEST_F(AscendDirectTransportTest,
+       PartialLocalCopyRetainsFlagsUntilStreamRetires) {
+    ASSERT_TRUE(Install().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+    char src[16]{};
+    g_skip_memcpy_copy = true;
+    g_cleanup_fails = true;
+    g_fail_flag_copy = true;
+    auto request = MakeWrite(src, 0x1000, sizeof(src));
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, {request}).ok());
+    ASSERT_EQ(g_memcpy_async_calls, 2);
+    ASSERT_EQ(g_host_allocs.size(), 1u);
+    bool drained = true;
+    ASSERT_TRUE(transport_->isSubBatchDrained(batch_, drained).ok());
+    EXPECT_FALSE(drained);
+    EXPECT_TRUE(g_host_free_seq.empty());
+    EXPECT_EQ(AscendDirectTransportTestPeer::inflight(*transport_), 1);
+
+    static_cast<HixlSubBatch*>(batch_)->task_list[0].start_time_ns = 1;
+    g_cleanup_fails = false;
+    ASSERT_TRUE(transport_->isSubBatchDrained(batch_, drained).ok());
+    EXPECT_TRUE(drained);
+    TransferStatus status{};
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    EXPECT_EQ(g_host_free_seq.count(g_host_allocs.front()), 1u);
+    EXPECT_EQ(AscendDirectTransportTestPeer::inflight(*transport_), 0);
+}
+
+TEST_F(AscendDirectTransportTest,
+       LocalTimeoutWaitsForCopyFlagAfterCleanupError) {
+    ASSERT_TRUE(Install().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+    char src[16]{};
+    g_skip_memcpy_copy = true;
+    auto request = MakeWrite(src, 0x1000, sizeof(src));
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, {request}).ok());
+    g_cleanup_fails = true;
+    static_cast<HixlSubBatch*>(batch_)->task_list[0].start_time_ns = 1;
+    bool drained = true;
+    ASSERT_TRUE(transport_->isSubBatchDrained(batch_, drained).ok());
+    ASSERT_FALSE(drained);
+    ASSERT_TRUE(g_host_free_seq.empty());
+    ASSERT_EQ(g_host_allocs.size(), 1u);
+    *static_cast<uint32_t*>(g_host_allocs.front()) = 1;
+    ASSERT_TRUE(transport_->isSubBatchDrained(batch_, drained).ok());
+    EXPECT_TRUE(drained);
+    TransferStatus status{};
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
+    EXPECT_EQ(status.s, TIMEOUT);
+
+    g_cleanup_fails = false;
+    g_skip_memcpy_copy = false;
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, {request}).ok());
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, status).ok());
+    EXPECT_EQ(status.s, COMPLETED);
 }
 
 TEST_F(AscendDirectTransportTest, LocalCopyTimeoutRecreatesStream) {
@@ -1201,6 +1239,46 @@ TEST_F(AscendDirectTransportTest, RepeatedQueryErrorsSpareLaterSubmission) {
     WaitUntilTerminal(*transport_, batch_, 1);
     ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, status).ok());
     EXPECT_EQ(status.s, COMPLETED);
+}
+
+TEST_F(AscendDirectTransportTest, DisconnectRetrySparesNewerRequest) {
+    state_->xfer_state = HixlXferState::Waiting;
+    state_->disconnect_status = 1;
+    ASSERT_TRUE(InstallAgentTwoEngines().ok());
+    PublishEngineBuffers();
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+    auto* sub = static_cast<HixlSubBatch*>(batch_);
+    char src[32]{};
+    auto submit = [&](char* ptr) {
+        return transport_
+                   ->submitTransferTasks(batch_, {MakeRemoteWrite(ptr, 16)})
+                   .ok() &&
+               WaitUntil([&] { return sub->pending_submits.load() == 0; },
+                         2000);
+    };
+    ASSERT_TRUE(submit(src));
+    sub->task_list[0].start_time_ns = 1;
+    TransferStatus a{}, b{};
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, a).ok());
+    ASSERT_EQ(a.s, PENDING);
+    ASSERT_EQ(state_->disconnect_calls, 1);
+    ASSERT_TRUE(submit(src + 16));
+    state_->waiting_handle = sub->task_list[1].req_handle;
+    state_->disconnect_status = kHixlOk;
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, a).ok());
+    EXPECT_EQ(a.s, PENDING);
+    EXPECT_EQ(state_->disconnect_calls, 1);
+    state_->xfer_state = HixlXferState::Completed;
+    WaitUntilTerminal(*transport_, batch_, 0);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, a).ok());
+    EXPECT_EQ(state_->disconnect_calls, 1);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, b).ok());
+    EXPECT_EQ(a.s, TIMEOUT);
+    EXPECT_EQ(b.s, PENDING);
+    state_->waiting_handle = nullptr;
+    WaitUntilTerminal(*transport_, batch_, 1);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, b).ok());
+    EXPECT_EQ(b.s, COMPLETED);
 }
 
 TEST_F(AscendDirectTransportTest, FailedDisconnectDoesNotDrainTimeout) {
