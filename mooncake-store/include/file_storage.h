@@ -359,24 +359,16 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
 
-    // Master removes drop only metadata. Each pass asks the master about a
-    // share of the stored keys and records those it no longer has; on the
-    // next tick, buckets whose keys are all dead are deleted. Called from
-    // Heartbeat only.
+    // Each pass records stored keys the master no longer has; the next tick
+    // deletes buckets whose keys are all dead. Heartbeat thread only.
     void ReclaimRemovedObjects();
 
     // True unless a metadata rescan is running or still owed to a master
     // that lost our LOCAL_DISK segment.
     bool MasterKnowsOurObjects() const;
 
-    // Turns reclaim off for this process when the offload directory already
-    // held objects at start: replicas of a previous incarnation can hide
-    // the registration Init made, so the master's answers cannot be trusted.
-    void DisableReclaimOnExistingData();
-
-    // Adds to dead_keys the keys the master no longer has or, for
-    // offload_targets, has without our LOCAL_DISK replica. False when the
-    // master did not answer for every key.
+    // Adds the keys the master no longer has (or, for offload_targets, has
+    // without our LOCAL_DISK replica). False if any key went unanswered.
     bool FindDeadKeys(
         const std::vector<std::pair<int64_t, std::string>>& bucket_keys,
         bool offload_targets,

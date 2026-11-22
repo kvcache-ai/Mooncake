@@ -141,6 +141,17 @@ class DelayedReadBackend : public BucketStorageBackend {
     std::atomic<size_t> loads{0};
 };
 
+enum class ReclaimCase {
+    kRemoved,
+    kRePut,
+    kRetriedTask,
+    kSegmentLost,
+    kSegmentRemounted,
+    kQueryFails,
+    kExistingData,
+    kOffloadFails
+};
+
 class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
@@ -155,17 +166,6 @@ class FileStorageTest : public ::testing::Test {
         }
         return bytes;
     }
-
-    enum class ReclaimCase {
-        kRemoved,
-        kRePut,
-        kRetriedTask,
-        kSegmentLost,
-        kSegmentRemounted,
-        kQueryFails,
-        kExistingData,
-        kOffloadFails
-    };
 
     // Fails every write while `fail` is set, like a full disk.
     class FailingWriteBackend : public BucketStorageBackend {
@@ -186,10 +186,6 @@ class FileStorageTest : public ::testing::Test {
         std::atomic<bool> fail{false};
     };
 
-    // One object offloaded into its own bucket, then removed (its bucket
-    // goes after two passes), removed and put again (the fresh value is
-    // offloaded at once), or offloaded again by a retried task (the live
-    // copy stays); the other cases check what holds reclaim back.
     void RunReclaimScenario(ReclaimCase reclaim_case) {
         testing::InProcMaster master;
         ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
@@ -325,8 +321,6 @@ class FileStorageTest : public ::testing::Test {
                 EXPECT_EQ(populated, StoredFileBytes(config.storage_filepath));
                 break;
             case ReclaimCase::kSegmentLost:
-                // The master lost our segment: nothing is reclaimed until a
-                // rescan for that loss has re-registered our objects.
                 ASSERT_TRUE(client->Remove(key, true));
                 storage.segment_lost_epoch_.fetch_add(1);
                 reclaim_twice();
@@ -338,9 +332,6 @@ class FileStorageTest : public ::testing::Test {
                 EXPECT_EQ(baseline, StoredFileBytes(config.storage_filepath));
                 break;
             case ReclaimCase::kSegmentRemounted:
-                // The real recovery path: the master lost our segment, the
-                // heartbeat re-mounts it and owes a rescan; reclaim reopens
-                // once that rescan has re-registered our object.
                 storage.enable_offloading_ = true;
                 ASSERT_TRUE(client->UnmountLocalDiskSegment());
                 ASSERT_FALSE(master_has_our_replica());
@@ -355,8 +346,6 @@ class FileStorageTest : public ::testing::Test {
                 EXPECT_EQ(first_bucket, bucket_of());
                 break;
             case ReclaimCase::kQueryFails:
-                // A pass the master does not answer voids the verdicts of
-                // the pass before it.
                 ASSERT_TRUE(client->Remove(key, true));
                 storage.ReclaimRemovedObjects();
                 ASSERT_EQ(1,
@@ -367,16 +356,20 @@ class FileStorageTest : public ::testing::Test {
                 EXPECT_EQ(first_bucket, bucket_of());
                 EXPECT_TRUE(storage.reclaim_dead_keys_.empty());
                 return;
-            case ReclaimCase::kExistingData:
-                // As after a start on this non-empty directory.
-                storage.DisableReclaimOnExistingData();
+            case ReclaimCase::kExistingData: {
+                FileStorage restarted(config, client, endpoint);
+                ASSERT_TRUE(restarted.Init());
+                ASSERT_TRUE(restarted.Shutdown());
+                EXPECT_TRUE(restarted.reclaim_disabled_);
                 ASSERT_TRUE(client->Remove(key, true));
-                reclaim_twice();
-                EXPECT_EQ(first_bucket, bucket_of());
+                for (int i = 0; i < 2; ++i) {
+                    restarted.next_reclaim_at_ = {};
+                    restarted.ReclaimRemovedObjects();
+                }
+                EXPECT_EQ(populated, StoredFileBytes(config.storage_filepath));
                 break;
+            }
             case ReclaimCase::kOffloadFails:
-                // A failing offload does not stop the reclaim that would
-                // free the disk.
                 storage.enable_offloading_ = true;
                 ASSERT_TRUE(client->Remove(key, true));
                 ASSERT_TRUE(storage.Heartbeat());
@@ -3689,36 +3682,28 @@ TEST_F(FileStorageTest,
            "lease expires, otherwise the memory leaks for good";
 }
 
-TEST_F(FileStorageTest, ReclaimDeletesBucketOfRemovedObject) {
-    RunReclaimScenario(ReclaimCase::kRemoved);
+class FileStorageReclaimTest
+    : public FileStorageTest,
+      public ::testing::WithParamInterface<ReclaimCase> {};
+
+TEST_P(FileStorageReclaimTest, Scenario) { RunReclaimScenario(GetParam()); }
+
+std::string ReclaimCaseName(
+    const ::testing::TestParamInfo<ReclaimCase>& info) {
+    constexpr const char* kNames[] = {
+        "DeletesBucketOfRemovedObject", "OffloadsRePutKeyAfresh",
+        "KeepsLiveCopyOnRetriedTask",   "WaitsForRescanAfterSegmentLoss",
+        "ReopensAfterRemountRescan",    "PassFailsWhenQueryFails",
+        "DisabledOnNonEmptyDirectory",  "RunsWhenOffloadFails"};
+    return kNames[static_cast<int>(info.param)];
 }
 
-TEST_F(FileStorageTest, ReclaimOffloadsRePutKeyAfresh) {
-    RunReclaimScenario(ReclaimCase::kRePut);
-}
-
-TEST_F(FileStorageTest, ReclaimKeepsLiveCopyOnRetriedOffloadTask) {
-    RunReclaimScenario(ReclaimCase::kRetriedTask);
-}
-
-TEST_F(FileStorageTest, ReclaimWaitsForRescanAfterSegmentLoss) {
-    RunReclaimScenario(ReclaimCase::kSegmentLost);
-}
-
-TEST_F(FileStorageTest, ReclaimReopensAfterRescanOfRemountedSegment) {
-    RunReclaimScenario(ReclaimCase::kSegmentRemounted);
-}
-
-TEST_F(FileStorageTest, ReclaimPassFailsWhenQueryFails) {
-    RunReclaimScenario(ReclaimCase::kQueryFails);
-}
-
-TEST_F(FileStorageTest, ReclaimDisabledOnNonEmptyDirectory) {
-    RunReclaimScenario(ReclaimCase::kExistingData);
-}
-
-TEST_F(FileStorageTest, ReclaimRunsWhenOffloadFails) {
-    RunReclaimScenario(ReclaimCase::kOffloadFails);
-}
+INSTANTIATE_TEST_SUITE_P(
+    Reclaim, FileStorageReclaimTest,
+    ::testing::Values(ReclaimCase::kRemoved, ReclaimCase::kRePut,
+                      ReclaimCase::kRetriedTask, ReclaimCase::kSegmentLost,
+                      ReclaimCase::kSegmentRemounted, ReclaimCase::kQueryFails,
+                      ReclaimCase::kExistingData, ReclaimCase::kOffloadFails),
+    ReclaimCaseName);
 
 }  // namespace mooncake

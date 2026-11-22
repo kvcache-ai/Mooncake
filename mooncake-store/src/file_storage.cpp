@@ -333,7 +333,18 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             return scan_meta_result;
         }
     }
-    DisableReclaimOnExistingData();
+    // Replicas of an earlier incarnation make the master's answers
+    // untrustworthy, so reclaim stays off on a non-empty directory.
+    if (auto bucket_backend =
+            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+        bucket_backend && config_.reclaim_interval_seconds != 0) {
+        auto store_metadata = bucket_backend->GetStoreMetadata();
+        if (!store_metadata || store_metadata->total_keys != 0) {
+            reclaim_disabled_ = true;
+            LOG(WARNING) << "Reclaim of removed objects is disabled: the "
+                            "offload directory was not empty at start";
+        }
+    }
 
     heartbeat_running_.store(true);
     heartbeat_thread_ = std::thread([this]() {
@@ -1084,21 +1095,6 @@ bool FileStorage::MasterKnowsOurObjects() const {
            rescanned_epoch_.load() == segment_lost_epoch_.load();
 }
 
-void FileStorage::DisableReclaimOnExistingData() {
-    auto bucket_backend =
-        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
-    if (config_.reclaim_interval_seconds == 0 || !bucket_backend) {
-        return;
-    }
-    auto store_metadata = bucket_backend->GetStoreMetadata();
-    if (store_metadata && store_metadata->total_keys == 0) {
-        return;
-    }
-    reclaim_disabled_ = true;
-    LOG(WARNING) << "Reclaim of removed objects is disabled: the offload "
-                    "directory was not empty at start";
-}
-
 bool FileStorage::FindDeadKeys(
     const std::vector<std::pair<int64_t, std::string>>& bucket_keys,
     bool offload_targets,
@@ -1130,11 +1126,8 @@ bool FileStorage::FindDeadKeys(
                 return false;
             }
             for (size_t i = 0; i < results.size(); ++i) {
-                // A stored key is dead once the master no longer has the
-                // object. Its replica list is not used for that: it shows
-                // readable replicas only, and ours may be briefly unreadable.
-                // An offload target is dead here when the master has the
-                // object (it just asked for it) without our replica.
+                // Stored key: dead once the object is gone (replica lists omit
+                // unreadable replicas). Offload target: dead without ours.
                 bool dead = false;
                 if (results[i]) {
                     dead = offload_targets &&
@@ -1163,10 +1156,8 @@ void FileStorage::DropStaleCopiesOfOffloadTargets(
     if (config_.reclaim_interval_seconds == 0 || !MasterKnowsOurObjects()) {
         return;
     }
-    // The master asks this holder to offload a key only while it has no
-    // LOCAL_DISK replica here, so a key we still map is a stale copy of a
-    // removed object, unless the master says otherwise. Left alone, the
-    // fresh value would be skipped as already persisted.
+    // A target we still map is a stale copy of a removed object unless the
+    // master lists our replica; left mapped, the new value would be skipped.
     std::vector<std::pair<int64_t, std::string>> mapped;
     for (const auto& [storage_key, size] : storage_object_sizes) {
         auto exists = backend.IsExist(storage_key);
@@ -1193,9 +1184,6 @@ void FileStorage::ReclaimRemovedObjects() {
     if (!bucket_backend) {
         return;
     }
-    // Until a rescan has re-registered our objects with a master that lost
-    // our segment, that master does not know them; verdicts taken against
-    // it, or before it, are void.
     if (config_.reclaim_interval_seconds == 0 || reclaim_disabled_ ||
         !MasterKnowsOurObjects()) {
         reclaim_dead_keys_.clear();
@@ -1209,10 +1197,8 @@ void FileStorage::ReclaimRemovedObjects() {
     if (now >= next_reclaim_at_ && store_metadata) {
         next_reclaim_at_ =
             now + std::chrono::seconds(config_.reclaim_interval_seconds);
-        // A lap covers the keys stored at its start in cycle/interval
-        // passes, so it takes about reclaim_cycle_seconds whatever the disk
-        // size. The share is fixed per lap: recomputing it from a key count
-        // that shrinks as buckets go would only decay geometrically.
+        // The share is fixed per lap from the key count at its start, so a
+        // lap takes about reclaim_cycle_seconds as buckets go.
         if (reclaim_passes_left_ == 0) {
             reclaim_passes_left_ =
                 std::max<uint32_t>(1, config_.reclaim_cycle_seconds /
@@ -1373,10 +1359,8 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
-    // Retry metadata resync if previous attempt failed, or if the segment
-    // was lost again after the last rescan started. Only after a heartbeat
-    // that succeeded: a rescan against an unmounted segment cannot register
-    // anything.
+    // Retry a failed rescan, or one owed to a later segment loss; only after
+    // a successful heartbeat, as an unmounted segment registers nothing.
     if ((metadata_resync_pending_.load() ||
          rescanned_epoch_.load() != segment_lost_epoch_.load()) &&
         !rescan_future_.valid()) {

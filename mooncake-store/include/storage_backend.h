@@ -336,11 +336,9 @@ struct FileStorageConfig {
     // Interval between heartbeats sent to the control plane (in seconds)
     uint32_t heartbeat_interval_seconds = 10;
 
-    // Interval between passes that delete buckets whose objects the master
-    // no longer tracks (bucket backend only); 0 disables them.
+    // Interval between reclaim passes (bucket backend only); 0 disables them.
     uint32_t reclaim_interval_seconds = 10;
-    // Every stored key is checked against the master once per this many
-    // seconds; each pass checks the matching share of the keys.
+    // Time in which the passes check every stored key against the master.
     uint32_t reclaim_cycle_seconds = 120;
 
     // Interval between client_buffer_gc (in seconds)
@@ -1111,9 +1109,8 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<void, ErrorCode> DeleteBucket(int64_t bucket_id);
 
-    // Buckets after after_bucket_id (wrapping, at most one lap) with the
-    // keys still mapped to them, until max_keys keys; next_cursor is the last
-    // bucket returned.
+    // Buckets after after_bucket_id (wrapping, at most one lap) with their
+    // mapped keys, up to max_keys keys; next_cursor is the last one returned.
     std::vector<std::pair<int64_t, std::vector<std::string>>>
     GetReclaimCandidates(int64_t after_bucket_id, size_t max_keys,
                          int64_t& next_cursor) const;

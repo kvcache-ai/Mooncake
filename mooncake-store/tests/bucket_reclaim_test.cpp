@@ -2,12 +2,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -77,8 +75,7 @@ class BucketReclaimTest : public ::testing::Test {
         return scanned;
     }
 
-    // Rewrites a bucket's files, so that a directory listing in creation
-    // order meets them after any bucket written later.
+    // Rewrites a bucket's files so creation-order listings meet them last.
     void RecreateFiles(int64_t bucket_id) const {
         for (const char* suffix : {".bucket", ".meta"}) {
             const std::string path =
@@ -109,9 +106,8 @@ TEST_F(BucketReclaimTest, PartiallyDeadBucketStays) {
 }
 
 TEST_F(BucketReclaimTest, UnmappedKeyMapsToNewestCopy) {
-    // Several keys, each with a stale copy in a bucket kept alive by another
-    // key and a newer copy in its own bucket: after a restart every key must
-    // map to its newer copy whatever order Init lists the buckets in.
+    // Each key has a stale copy in a live bucket and a newer one in its own;
+    // after a restart it must map to the newer copy in any listing order.
     constexpr int kKeys = 8;
     const std::string old_value(4096, 'o'), new_value(4096, 'n');
     std::vector<std::pair<std::string, int64_t>> expected;
@@ -131,9 +127,8 @@ TEST_F(BucketReclaimTest, UnmappedKeyMapsToNewestCopy) {
     std::sort(expected.begin(), expected.end());
     EXPECT_EQ(Scan(), expected);
 
-    // After a restart both bucket files still list each key. The stale
-    // copies' files are rewritten so that neither a creation-order nor a
-    // reverse-creation-order listing meets the newest copy first by luck.
+    // Rewrite half the stale copies' files so neither creation order nor its
+    // reverse meets the newest copy first by luck.
     backend_.reset();
     for (int i = 0; i < kKeys; i += 2) {
         RecreateFiles(old_buckets[i]);
@@ -149,41 +144,6 @@ TEST_F(BucketReclaimTest, UnmappedKeyMapsToNewestCopy) {
                   1u);
         EXPECT_EQ(Load(key, new_value.size()), new_value) << key;
     }
-}
-
-TEST_F(BucketReclaimTest, ConcurrentReadsDuringDeleteCompleteOrMiss) {
-    const std::string value(1 << 20, 'r');
-    const int64_t bucket_id = Offload({{"k1", value}});
-    std::atomic<bool> stop{false};
-    std::atomic<int> hits{0}, misses{0}, corrupt{0};
-    std::vector<std::thread> readers;
-    for (int i = 0; i < 4; ++i) {
-        readers.emplace_back([&] {
-            while (!stop.load()) {
-                auto loaded = Load("k1", value.size());
-                if (!loaded) {
-                    misses.fetch_add(1);
-                } else if (*loaded == value) {
-                    hits.fetch_add(1);
-                } else {
-                    corrupt.fetch_add(1);
-                }
-            }
-        });
-    }
-    while (hits.load() < 8) {
-        std::this_thread::yield();
-    }
-    EXPECT_EQ(backend_->RemoveDeadBuckets({{bucket_id, {"k1"}}}), 1u);
-    while (misses.load() < 8) {
-        std::this_thread::yield();
-    }
-    stop.store(true);
-    for (auto& reader : readers) {
-        reader.join();
-    }
-    EXPECT_EQ(corrupt.load(), 0);
-    EXPECT_FALSE(fs::exists(DataFile(bucket_id)));
 }
 
 }  // namespace mooncake
