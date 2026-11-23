@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 
+#include "ha/oplog/oplog_batch_config.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "types.h"
 
@@ -36,6 +37,8 @@ struct OpLogBatchStandbyPollResult {
     size_t applied_entries{0};
     // Complete batches processed in this poll, including before a later error.
     size_t applied_batches{0};
+    // The final range hit its page limit before reaching the durable prefix.
+    // Accumulated progress across a compaction retry does not imply more pages.
     bool has_more_pages{false};
     DurablePrefix durable_prefix{};
     uint64_t compaction_floor{0};
@@ -47,8 +50,9 @@ class OpLogBatchStandbyReader {
                             OpLogApplier& applier);
 
     OpLogBatchStandbyPollResult PollOnce(
-        size_t max_batches = 1024, OpLogBatchStandbyReadMode read_mode =
-                                       OpLogBatchStandbyReadMode::SERIALIZABLE);
+        size_t max_batches = kDefaultOpLogStandbyMaxBatchesPerPoll,
+        OpLogBatchStandbyReadMode read_mode =
+            OpLogBatchStandbyReadMode::SERIALIZABLE);
     // Seed the reader after a materialized snapshot. The next poll starts at
     // cursor.batch_id + 1 and validates the complete suffix.
     ErrorCode SetBaselineCursor(const DurablePrefix& cursor);

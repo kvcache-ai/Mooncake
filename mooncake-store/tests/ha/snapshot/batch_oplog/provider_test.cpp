@@ -145,10 +145,10 @@ TEST_F(BatchOpLogSnapshotProviderTest,
 }
 
 TEST_F(BatchOpLogSnapshotProviderTest,
-       FailedSecondPageRetainsCompleteBatchProgress) {
+       DefaultPageLimitBoundsProgressBeforeSecondPageFailure) {
     EmptyBackend backend;
     LocalFileSnapshotObjectStore objects(root_);
-    for (uint64_t id = 1; id <= 1025; ++id) {
+    for (uint64_t id = 1; id <= 257; ++id) {
         OpLogEntry entry;
         entry.sequence_id = id;
         entry.op_type = OpType::REMOVE;
@@ -160,9 +160,8 @@ TEST_F(BatchOpLogSnapshotProviderTest,
                     EncodeOpLogBatchRecord(batch));
     }
     backend.Put(BuildDurablePrefixKey("clusterA"),
-                EncodeDurablePrefix({.batch_id = 1025, .last_seq = 1025}));
-    backend.fail_range_begin =
-        BuildBatchRecordRange("clusterA", 1024).begin_key;
+                EncodeDurablePrefix({.batch_id = 257, .last_seq = 257}));
+    backend.fail_range_begin = BuildBatchRecordRange("clusterA", 256).begin_key;
     BatchOpLogSnapshotProvider provider("clusterA", backend, objects,
                                         "snapshots");
     StandbyMetadataStore metadata;
@@ -171,9 +170,9 @@ TEST_F(BatchOpLogSnapshotProviderTest,
     const auto result = provider.RestoreBaseline(metadata, registry, &applier);
     ASSERT_FALSE(result);
     EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, result.error());
-    EXPECT_EQ(1025u, applier.GetExpectedSequenceId());
+    EXPECT_EQ(257u, applier.GetExpectedSequenceId());
     EXPECT_EQ(
-        1024u,
+        256u,
         HAMetricManager::instance().get_snapshot_runtime().suffix_batches);
 }
 

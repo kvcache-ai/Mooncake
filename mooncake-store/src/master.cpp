@@ -22,6 +22,7 @@
 #include "etcd_helper.h"
 #include "ha/ha_types.h"
 #include "ha/leadership/master_service_supervisor.h"
+#include "ha/oplog/oplog_batch_config.h"
 #include "ha/snapshot/batch_oplog/config.h"
 
 #include "http_metadata_server.h"
@@ -404,7 +405,8 @@ DEFINE_int32(oplog_poll_interval_ms, 1000,
 DEFINE_uint32(oplog_batch_max_entries, 1024,
               "Maximum number of committed/reserved entries in the open "
               "batch-record OpLog waiting batch.");
-DEFINE_uint32(oplog_standby_max_batches_per_poll, 256,
+DEFINE_uint32(oplog_standby_max_batches_per_poll,
+              mooncake::kDefaultOpLogStandbyMaxBatchesPerPoll,
               "Maximum number of durable batch records fetched per standby "
               "poll.");
 DEFINE_uint32(batch_oplog_retry_timeout_sec, 180,

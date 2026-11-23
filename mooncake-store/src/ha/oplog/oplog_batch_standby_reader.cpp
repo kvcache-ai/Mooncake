@@ -86,10 +86,6 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
             SetPollError(result, err, IsRetryableBackendError(err));
         }
     }
-    result.has_more_pages =
-        max_batches != 0 && result.applied_batches >= max_batches &&
-        result.durable_prefix_present &&
-        last_applied_batch_id_ < result.durable_prefix.batch_id;
     return result;
 }
 

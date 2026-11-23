@@ -8,6 +8,7 @@
 
 #include <ylt/util/tl/expected.hpp>
 
+#include "ha/oplog/oplog_batch_config.h"
 #include "ha/standby_metadata_store.h"
 #include "types.h"
 
@@ -38,7 +39,7 @@ class BatchOpLogSnapshotProvider final {
     BatchOpLogSnapshotProvider(
         std::string cluster_id, HaKvBackend& backend,
         SnapshotObjectStore& object_store, std::string snapshot_root,
-        size_t max_batches_per_poll = 1024,
+        size_t max_batches_per_poll = kDefaultOpLogStandbyMaxBatchesPerPoll,
         std::chrono::milliseconds poll_interval = std::chrono::seconds(1),
         std::chrono::milliseconds no_progress_timeout =
             std::chrono::seconds(180));

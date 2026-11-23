@@ -14,6 +14,7 @@
 
 #include "ha/ha_types.h"
 #include "ha/oplog/oplog_applier.h"
+#include "ha/oplog/oplog_batch_config.h"
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_types.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
@@ -51,7 +52,8 @@ struct HotStandbyConfig {
     bool enable_oplog_following{true};
 
     int oplog_poll_interval_ms{1000};
-    uint32_t oplog_standby_max_batches_per_poll{1024};
+    uint32_t oplog_standby_max_batches_per_poll{
+        kDefaultOpLogStandbyMaxBatchesPerPoll};
     uint32_t batch_oplog_retry_timeout_sec{180};
 };
 

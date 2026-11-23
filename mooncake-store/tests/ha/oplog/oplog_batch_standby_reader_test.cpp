@@ -225,6 +225,92 @@ TEST(OpLogBatchStandbyReaderTest, FloorDoesNotHideUnknownSuffixGap) {
     EXPECT_EQ(2u, applier.GetExpectedSequenceId());
 }
 
+TEST(OpLogBatchStandbyReaderTest,
+     CompactionRetryKeepsSuffixWaitDespiteAccumulatedProgress) {
+    class FailOnceLeaseRemovalStore : public MockMetadataStore {
+       public:
+        std::function<void()> on_failure;
+
+        bool RemoveWeightLease(uint64_t lease_id,
+                               const WeightRevisionIdentity& identity,
+                               uint64_t generation) override {
+            if (on_failure) {
+                auto callback = std::move(on_failure);
+                callback();
+                return false;
+            }
+            return MockMetadataStore::RemoveWeightLease(lease_id, identity,
+                                                        generation);
+        }
+    } metadata;
+    const WeightRevisionLease lease{
+        .lease_id = 1,
+        .identity = {.tenant_id = "tenant",
+                     .name_space = "production",
+                     .resource_id = "model",
+                     .revision = "v1",
+                     .weight_generation = 1},
+        .holder = "reader",
+        .expires_at_ms = 100,
+        .fenced_metadata_generation = 1,
+    };
+    ASSERT_TRUE(metadata.PutWeightLease(lease));
+    auto lease_batch = MakeBatch(2, 2, 2);
+    auto& entry = lease_batch.entries.front();
+    entry.op_type = OpType::WEIGHT_LEASE_DELETE;
+    entry.object_key = MakeWeightLeaseMetadataKey(lease.lease_id);
+    const auto payload = struct_pack::serialize(WeightLeaseDeleteOp{
+        .lease_id = lease.lease_id,
+        .identity = lease.identity,
+        .fenced_metadata_generation = lease.fenced_metadata_generation,
+    });
+    entry.payload.assign(payload.begin(), payload.end());
+    entry.checksum = static_cast<uint32_t>(
+        XXH32(entry.payload.data(), entry.payload.size(), 0));
+    entry.prefix_hash = static_cast<uint32_t>(
+        XXH32(entry.object_key.data(), entry.object_key.size(), 0));
+
+    FakeHaKvBackend backend;
+    backend.Put(BuildDurablePrefixKey("clusterA"),
+                EncodeDurablePrefix({.batch_id = 3, .last_seq = 3}));
+    for (uint64_t id = 1; id <= 3; ++id) {
+        backend.Put(BuildBatchRecordKey("clusterA", id),
+                    EncodeOpLogBatchRecord(id == 2 ? lease_batch
+                                                   : MakeBatch(id, id, id)));
+    }
+    backend.PublishLocal(BuildBatchRecordKey("clusterA", 1));
+    backend.PublishLocal(BuildBatchRecordKey("clusterA", 2));
+    // The first pass applies batch 1, then fails to apply batch 2 while
+    // compaction advances to the applied cursor. The retry applies batch 2,
+    // but the local view still lacks batch 3.
+    metadata.on_failure = [&] {
+        backend.Put("/oplog/clusterA/snapshot/compaction_floor", "1");
+    };
+    OpLogApplier applier(&metadata, "clusterA");
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+
+    const auto waiting = reader.PollOnce(/*max_batches=*/2);
+
+    ASSERT_EQ(ErrorCode::OK, waiting.error);
+    EXPECT_EQ(OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX,
+              waiting.disposition);
+    EXPECT_EQ(2u, waiting.applied_batches);
+    EXPECT_FALSE(waiting.has_more_pages);
+    EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+    EXPECT_FALSE(metadata.GetWeightLease(lease.lease_id).has_value());
+    const auto cursor = reader.GetLastAppliedDurablePrefix();
+    ASSERT_TRUE(cursor.has_value());
+    EXPECT_EQ(2u, cursor->batch_id);
+    EXPECT_EQ(2u, cursor->last_seq);
+
+    backend.PublishLocal(BuildBatchRecordKey("clusterA", 3));
+    const auto complete = reader.PollOnce(/*max_batches=*/2);
+    ASSERT_EQ(ErrorCode::OK, complete.error);
+    EXPECT_EQ(OpLogBatchStandbyPollDisposition::OK, complete.disposition);
+    EXPECT_FALSE(complete.has_more_pages);
+    EXPECT_EQ(4u, applier.GetExpectedSequenceId());
+}
+
 TEST(OpLogBatchStandbyReaderTest, MissingPrefixWaitsWithoutLegacyFallback) {
     FakeHaKvBackend backend;
     MockMetadataStore metadata_store;
@@ -579,6 +665,32 @@ TEST(OpLogBatchStandbyReaderTest, FullPageContinuesOnNextPoll) {
     ASSERT_TRUE(applied_prefix.has_value());
     EXPECT_EQ(3u, applied_prefix->batch_id);
     EXPECT_EQ(3u, applied_prefix->last_seq);
+}
+
+TEST(OpLogBatchStandbyReaderTest, DefaultPageLimitBoundsPollProgress) {
+    FakeHaKvBackend backend;
+    backend.Put(BuildDurablePrefixKey("clusterA"),
+                EncodeDurablePrefix({.batch_id = 257, .last_seq = 257}));
+    for (uint64_t id = 1; id <= 257; ++id) {
+        backend.Put(BuildBatchRecordKey("clusterA", id),
+                    EncodeOpLogBatchRecord(MakeBatch(id, id, id)));
+    }
+    MockMetadataStore metadata;
+    OpLogApplier applier(&metadata, "clusterA");
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+
+    const auto first = reader.PollOnce();
+
+    ASSERT_EQ(ErrorCode::OK, first.error);
+    EXPECT_EQ(256u, first.applied_batches);
+    EXPECT_TRUE(first.has_more_pages);
+    EXPECT_EQ(257u, applier.GetExpectedSequenceId());
+
+    const auto second = reader.PollOnce();
+    ASSERT_EQ(ErrorCode::OK, second.error);
+    EXPECT_EQ(1u, second.applied_batches);
+    EXPECT_FALSE(second.has_more_pages);
+    EXPECT_EQ(258u, applier.GetExpectedSequenceId());
 }
 
 TEST(OpLogBatchStandbyReaderTest,
