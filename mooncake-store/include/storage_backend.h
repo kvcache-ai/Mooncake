@@ -1110,10 +1110,13 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> DeleteBucket(int64_t bucket_id);
 
     // Buckets after after_bucket_id (wrapping, at most one lap) with their
-    // mapped keys, up to max_keys keys; next_cursor is the last one returned.
+    // mapped keys, up to max_keys keys.
     std::vector<std::pair<int64_t, std::vector<std::string>>>
-    GetReclaimCandidates(int64_t after_bucket_id, size_t max_keys,
-                         int64_t& next_cursor) const;
+    GetReclaimCandidates(int64_t after_bucket_id, size_t max_keys) const;
+
+    // The given keys that are mapped, each with its bucket, in one lookup.
+    std::vector<std::pair<int64_t, std::string>> GetMappedBuckets(
+        const std::unordered_map<std::string, int64_t>& keys) const;
 
     // Deletes each given bucket whose keys are all listed for it or no
     // longer mapped to it; returns the number deleted.

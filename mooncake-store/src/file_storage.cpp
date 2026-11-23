@@ -1095,11 +1095,19 @@ bool FileStorage::MasterKnowsOurObjects() const {
            rescanned_epoch_.load() == segment_lost_epoch_.load();
 }
 
+namespace {
+// Per-RPC caps keep requests and replies well under the 4 MiB message limit.
+constexpr size_t kReclaimQueryKeys = 10'000;
+constexpr size_t kReclaimQueryKeyBytes = 512 * 1024;
+// A pass stops querying after this long and resumes from its cursor, so the
+// heartbeat stays well inside the master's client TTL.
+constexpr auto kReclaimPassBudget = std::chrono::seconds(2);
+}  // namespace
+
 bool FileStorage::FindDeadKeys(
     const std::vector<std::pair<int64_t, std::string>>& bucket_keys,
     bool offload_targets,
     std::unordered_map<int64_t, std::vector<std::string>>& dead_keys) {
-    constexpr size_t kQueryChunk = 10'000;
     std::unordered_map<TenantId, std::vector<size_t>, TenantIdHash>
         indices_by_tenant;
     for (size_t i = 0; i < bucket_keys.size(); ++i) {
@@ -1112,19 +1120,18 @@ bool FileStorage::FindDeadKeys(
         return disk != nullptr && disk->transport_endpoint == local_rpc_addr_;
     };
     for (const auto& [tenant_id, indices] : indices_by_tenant) {
-        for (size_t begin = 0; begin < indices.size(); begin += kQueryChunk) {
-            const size_t end = std::min(indices.size(), begin + kQueryChunk);
+        for (size_t begin = 0, end = 0; begin < indices.size(); begin = end) {
             std::vector<std::string> keys;
-            keys.reserve(end - begin);
-            for (size_t i = begin; i < end; ++i) {
+            for (size_t bytes = 0;
+                 end < indices.size() && keys.size() < kReclaimQueryKeys &&
+                 bytes < kReclaimQueryKeyBytes;
+                 ++end) {
                 keys.push_back(
-                    TenantId::ParseScopedKey(bucket_keys[indices[i]].second)
+                    TenantId::ParseScopedKey(bucket_keys[indices[end]].second)
                         .second);
+                bytes += keys.back().size();
             }
             auto results = client_->BatchQueryReadOnly(keys, tenant_id.value());
-            if (results.size() != keys.size()) {
-                return false;
-            }
             for (size_t i = 0; i < results.size(); ++i) {
                 // Stored key: dead once the object is gone (replica lists omit
                 // unreadable replicas). Offload target: dead without ours.
@@ -1158,18 +1165,7 @@ void FileStorage::DropStaleCopiesOfOffloadTargets(
     }
     // A target we still map is a stale copy of a removed object unless the
     // master lists our replica; left mapped, the new value would be skipped.
-    std::vector<std::pair<int64_t, std::string>> mapped;
-    for (const auto& [storage_key, size] : storage_object_sizes) {
-        auto exists = backend.IsExist(storage_key);
-        if (!exists || !*exists) {
-            continue;
-        }
-        std::unordered_map<std::string, StorageObjectMetadata> metadata;
-        if (backend.BatchQuery({storage_key}, metadata)) {
-            mapped.emplace_back(metadata.at(storage_key).bucket_id,
-                                storage_key);
-        }
-    }
+    const auto mapped = backend.GetMappedBuckets(storage_object_sizes);
     std::unordered_map<int64_t, std::vector<std::string>> stale;
     if (!mapped.empty() &&
         FindDeadKeys(mapped, /*offload_targets=*/true, stale)) {
@@ -1209,23 +1205,33 @@ void FileStorage::ReclaimRemovedObjects() {
         }
         --reclaim_passes_left_;
 
+        auto candidates = bucket_backend->GetReclaimCandidates(
+            reclaim_cursor_, reclaim_keys_per_pass_);
         std::vector<std::pair<int64_t, std::string>> bucket_keys;
-        for (auto& [bucket_id, storage_keys] :
-             bucket_backend->GetReclaimCandidates(
-                 reclaim_cursor_, reclaim_keys_per_pass_, reclaim_cursor_)) {
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            auto& [bucket_id, storage_keys] = candidates[i];
             reclaim_dead_keys_[bucket_id];
             for (auto& storage_key : storage_keys) {
                 bucket_keys.emplace_back(bucket_id, std::move(storage_key));
             }
-        }
-        // A master that does not answer for every key voids this pass and
-        // the previous one's verdicts; a later pass takes them again.
-        if (!FindDeadKeys(bucket_keys, /*offload_targets=*/false,
-                          reclaim_dead_keys_)) {
-            LOG(WARNING) << "Reclaim pass skipped: the master did not answer "
-                            "for every key";
-            reclaim_dead_keys_.clear();
-            return;
+            if (bucket_keys.size() < kReclaimQueryKeys &&
+                i + 1 < candidates.size()) {
+                continue;
+            }
+            // A master that does not answer for every key voids this pass
+            // and the previous one's verdicts; a later pass takes them again.
+            if (!FindDeadKeys(bucket_keys, /*offload_targets=*/false,
+                              reclaim_dead_keys_)) {
+                LOG(WARNING) << "Reclaim pass skipped: the master did not "
+                                "answer for every key";
+                reclaim_dead_keys_.clear();
+                return;
+            }
+            bucket_keys.clear();
+            reclaim_cursor_ = bucket_id;
+            if (std::chrono::steady_clock::now() >= now + kReclaimPassBudget) {
+                break;
+            }
         }
     }
     if (!verdicts.empty()) {

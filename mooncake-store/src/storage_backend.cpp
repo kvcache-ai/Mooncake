@@ -4185,10 +4185,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
 
 std::vector<std::pair<int64_t, std::vector<std::string>>>
 BucketStorageBackend::GetReclaimCandidates(int64_t after_bucket_id,
-                                           size_t max_keys,
-                                           int64_t& next_cursor) const {
+                                           size_t max_keys) const {
     std::vector<std::pair<int64_t, std::vector<std::string>>> candidates;
-    next_cursor = after_bucket_id;
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto it = buckets_.upper_bound(after_bucket_id);
     size_t num_keys = 0;
@@ -4206,9 +4204,21 @@ BucketStorageBackend::GetReclaimCandidates(int64_t after_bucket_id,
         }
         num_keys += mapped_keys.size();
         candidates.emplace_back(bucket_id, std::move(mapped_keys));
-        next_cursor = bucket_id;
     }
     return candidates;
+}
+
+std::vector<std::pair<int64_t, std::string>>
+BucketStorageBackend::GetMappedBuckets(
+    const std::unordered_map<std::string, int64_t>& keys) const {
+    std::vector<std::pair<int64_t, std::string>> mapped;
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    for (const auto& [key, size] : keys) {
+        if (const auto* object = object_bucket_map_.find(key)) {
+            mapped.emplace_back(object->bucket_id, key);
+        }
+    }
+    return mapped;
 }
 
 size_t BucketStorageBackend::RemoveDeadBuckets(
@@ -4236,8 +4246,12 @@ size_t BucketStorageBackend::RemoveDeadBuckets(
     }
     size_t deleted = 0;
     for (int64_t bucket_id : dead_buckets) {
-        if (DeleteBucket(bucket_id)) {
+        if (auto result = DeleteBucket(bucket_id)) {
             ++deleted;
+        } else {
+            LOG(WARNING) << "RemoveDeadBuckets: failed to delete bucket "
+                         << bucket_id << ": " << result.error()
+                         << "; its files stay until the next start";
         }
     }
     if (deleted != 0) {
