@@ -546,6 +546,7 @@ def test_structured_object_expands_store_replicate_config() -> None:
     config = mooncake_store.ReplicateConfig()
     config.replica_num = 2
     config.group_ids = ["rollout-group"]
+    config.kv_cache_kinds = [mooncake_store.KVCacheKind.MAMBA]
     payload = structured_payload(
         {"kind": "replicated"}, values=_multi_buffer_payload(range(8))
     )
@@ -574,6 +575,8 @@ def test_structured_object_expands_store_replicate_config() -> None:
     expanded = sos._config_for_grouped_keys(config, 2)
     assert expanded is not config
     assert list(expanded.group_ids) == ["rollout-group", "rollout-group"]
+    assert list(expanded.kv_cache_kinds) == [mooncake_store.KVCacheKind.MAMBA] * 2
+    assert config.kv_cache_kinds == [mooncake_store.KVCacheKind.MAMBA]
     assert expanded.replica_num == 2
     assert config.group_ids == ["rollout-group"]
 
@@ -5288,3 +5291,23 @@ def test_session_config_expands_with_physical_keys_without_mutating_input():
         _config_for_grouped_keys(
             SimpleNamespace(per_key_preferred_hca_names=[["mlx5_0"], []]), 2
         )
+
+
+@pytest.mark.parametrize("group_ids", [None, ["group"]])
+def test_kv_kind_survives_structured_physical_key_expansion(group_ids):
+    class Config:
+        def __copy__(self):
+            raise TypeError("native config requires field-by-field copy")
+
+    config = Config()
+    config.group_ids = group_ids
+    config.kv_cache_kinds = ["MAMBA"]
+    expanded = sos._config_for_grouped_keys(config, 3)
+    assert expanded.kv_cache_kinds == ["MAMBA"] * 3
+    assert expanded.group_ids == (group_ids * 3 if group_ids else None)
+    assert config.kv_cache_kinds == ["MAMBA"]
+    assert config.group_ids == group_ids
+    for kinds in ([], ["FULL", "MAMBA"]):
+        config.kv_cache_kinds = kinds
+        with pytest.raises(ValueError, match="kv_cache_kinds"):
+            sos._config_for_grouped_keys(config, 2)

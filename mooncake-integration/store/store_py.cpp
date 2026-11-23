@@ -12,6 +12,8 @@
 #include "real_client.h"
 #include "common.h"
 #include "types.h"
+#include "kv_cache_kind.h"
+#include "replica.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
 #include "device/accelerator_registry.h"
@@ -1105,25 +1107,6 @@ class MooncakeStorePyWrapper {
         return config.ForKeySubset(original_indices);
     }
 
-    ReplicateConfig MakeRepeatedIndexedConfig(
-        const ReplicateConfig &config,
-        const std::vector<size_t> &original_indices, int repeat_count) const {
-        if (!config.group_ids && !config.session_ids &&
-            !config.residency_affinity_ids &&
-            !config.per_key_preferred_hca_names) {
-            return config;
-        }
-        std::vector<size_t> shard_indices;
-        shard_indices.reserve(original_indices.size() *
-                              static_cast<size_t>(repeat_count));
-        for (size_t index : original_indices) {
-            for (int i = 0; i < repeat_count; ++i) {
-                shard_indices.push_back(index);
-            }
-        }
-        return config.ForKeySubset(shard_indices);
-    }
-
     std::vector<int> ValidateBatchKeyHints(const ReplicateConfig &config,
                                            size_t key_count,
                                            const char *operation_name) const {
@@ -1133,10 +1116,9 @@ class MooncakeStorePyWrapper {
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
         if (!config.HasValidKeyHints(key_count)) {
-            LOG(ERROR)
-                << operation_name
-                << ": group, affinity and per-key HCA hint counts must match "
-                   "keys size";
+            LOG(ERROR) << operation_name
+                       << ": invalid per-key group, affinity, HCA or KV cache "
+                          "kind hints";
             return std::vector<int>(key_count,
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
@@ -1147,14 +1129,18 @@ class MooncakeStorePyWrapper {
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
-        // Single-tensor TP keeps per-shard group/HCA hints. Session and
-        // residency affinity IDs describe the source tensor, not each shard.
-        if (!config.ValidSessionIds(1) ||
+        // Group and HCA hints are per shard. Session, residency affinity and
+        // KV cache kind describe the source tensor.
+        if (!config.ValidSessionIds(1) || !config.ValidKVCacheKinds(1) ||
             (config.residency_affinity_ids &&
              config.residency_affinity_ids->size() != 1))
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         try {
             ReplicateConfig tp_config = config;
+            if (config.kv_cache_kinds) {
+                tp_config.kv_cache_kinds = std::vector<KVCacheKind>(
+                    tp_size, config.kv_cache_kinds->front());
+            }
             if (config.residency_affinity_ids) {
                 tp_config.residency_affinity_ids = std::vector<std::string>(
                     tp_size, config.residency_affinity_ids->front());
@@ -1335,7 +1321,7 @@ class MooncakeStorePyWrapper {
             if (all_chunk_keys.empty()) return final_results;
 
             ReplicateConfig chunk_config =
-                MakeRepeatedIndexedConfig(config, processed_indices, tp_size);
+                config.ForRepeatedKeySubset(processed_indices, tp_size);
             std::vector<int> chunk_results = batch_put_tensor_infos_impl(
                 all_chunk_keys, all_chunk_infos, chunk_config);
             if (chunk_results.size() != all_chunk_keys.size()) {
@@ -2265,6 +2251,17 @@ PYBIND11_MODULE(_store, m) {
         .value("GENERAL", ObjectDataType::GENERAL)
         .export_values();
 
+    py::enum_<KVCacheKind>(m, "KVCacheKind")
+        .value("UNSPECIFIED", KVCacheKind::UNSPECIFIED)
+        .value("FULL", KVCacheKind::FULL)
+        .value("SWA", KVCacheKind::SWA)
+        .value("DSA", KVCacheKind::DSA)
+        .value("INDEXER", KVCacheKind::INDEXER)
+        .value("MLA", KVCacheKind::MLA)
+        .value("MAMBA", KVCacheKind::MAMBA)
+        .value("LINEAR", KVCacheKind::LINEAR)
+        .export_values();
+
     py::enum_<SoftPinAction>(m, "SoftPinAction")
         .value("PRESERVE", SoftPinAction::PRESERVE)
         .value("ENABLE", SoftPinAction::ENABLE)
@@ -2287,6 +2284,18 @@ PYBIND11_MODULE(_store, m) {
         .def_readwrite("prefer_alloc_in_same_node",
                        &ReplicateConfig::prefer_alloc_in_same_node)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
+        .def_property(
+            "kv_cache_kinds",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<KVCacheKind>> {
+                if (!config.kv_cache_kinds) return std::nullopt;
+                return *config.kv_cache_kinds;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<KVCacheKind>> kinds) {
+                config.kv_cache_kinds.reset();
+                if (kinds) config.kv_cache_kinds = std::move(*kinds);
+            })
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
         .def_property(
             "session_ids",

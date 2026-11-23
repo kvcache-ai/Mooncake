@@ -6875,6 +6875,7 @@ def _call_write_with_optional_config(fn: Any, *args: Any, config: Any = None) ->
 
 _WRITE_CONFIG_COPY_FIELDS = (
     "data_type",
+    "kv_cache_kinds",
     "dfs_replica_num",
     "group_ids",
     "session_ids",
@@ -6896,6 +6897,15 @@ def _config_for_grouped_keys(config: Any, key_count: int) -> Any:
     """Expand logical per-key write metadata across physical Mooncake keys."""
     if config is None or key_count <= 0:
         return config
+    kinds = getattr(config, "kv_cache_kinds", None)
+    if kinds is not None:
+        if len(kinds) != 1:
+            raise ValueError(
+                "config.kv_cache_kinds must contain exactly one logical kind"
+            )
+        if key_count != 1:
+            config = _copy_write_config(config)
+            config.kv_cache_kinds = [kinds[0]] * key_count
     session_ids = getattr(config, "session_ids", None)
     if session_ids is not None:
         session_ids = (

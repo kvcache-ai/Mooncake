@@ -122,6 +122,11 @@ class MasterService {
     MasterService(const MasterServiceConfig& config);
     ~MasterService();
 
+    [[nodiscard]] KVCacheEvictControl EvictControlForKind(
+        KVCacheKind kind) const {
+        return kv_cache_kind_policy_.ControlFor(kind);
+    }
+
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
     // Whether requests name their tenant, which multi-tenancy turns on.
     bool IsTenantQuotaEnabled() const {
@@ -1432,6 +1437,11 @@ class MasterService {
         std::chrono::system_clock::time_point now,
         const std::function<bool(const std::string& key)>& matches_key);
     static void ApplySoftPinMetricDelta(int metric_delta);
+    KVCacheEvictControl KindEvictControl(const ObjectMetadata& metadata) const {
+        return metadata.data_type == ObjectDataType::KVCACHE
+                   ? kv_cache_kind_policy_.ControlFor(metadata.kv_cache_kind)
+                   : KVCacheEvictControl::NORMAL;
+    }
     void ApplySoftPinEvaluation(
         const ObjectMetadata& metadata,
         const ObjectMetadata::SoftPinEvaluation& result) const;
@@ -1644,6 +1654,7 @@ class MasterService {
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
     const uint64_t max_kv_soft_pin_ttl_;      // in milliseconds
     const bool allow_evict_soft_pinned_objects_;
+    const KVCacheKindPolicy kv_cache_kind_policy_;
 
     // Eviction related members
     std::atomic<bool> need_mem_eviction_{

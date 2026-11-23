@@ -20,6 +20,7 @@
 #include <string_view>
 #include <ostream>
 
+#include "kv_cache_kind.h"
 #include "types.h"
 #include "allocator.h"
 #include "master_metric_manager.h"
@@ -139,13 +140,38 @@ struct ReplicateConfig {
         per_key_preferred_hca_names;
     // Per-key opaque residency affinity metadata.
     struct_pack::compatible<std::vector<std::string>, 4> residency_affinity_ids;
+    // Per-key KV cache kind, aligned with the request's keys. Absent means
+    // every key is UNSPECIFIED, which keeps the legacy eviction behavior.
+    struct_pack::compatible<std::vector<KVCacheKind>, 5> kv_cache_kinds;
+
+    bool HasPerKeyHints() const {
+        return group_ids || session_ids || residency_affinity_ids ||
+               per_key_preferred_hca_names || kv_cache_kinds;
+    }
+
+    bool ValidKVCacheKinds(size_t key_count) const {
+        if (!kv_cache_kinds) return true;
+        return kv_cache_kinds->size() == key_count &&
+               std::all_of(kv_cache_kinds->begin(), kv_cache_kinds->end(),
+                           IsKnownKVCacheKind);
+    }
+
+    // The kind selected for one key after SetKeyIds / ForSingleKey. An
+    // absent list is UNSPECIFIED.
+    KVCacheKind KVCacheKindForKey(size_t key_index) const {
+        if (!kv_cache_kinds || key_index >= kv_cache_kinds->size()) {
+            return KVCacheKind::UNSPECIFIED;
+        }
+        return kv_cache_kinds->at(key_index);
+    }
 
     bool HasValidKeyHints(size_t key_count) const {
         return (!group_ids || group_ids->size() == key_count) &&
                (!residency_affinity_ids ||
                 residency_affinity_ids->size() == key_count) &&
                (!per_key_preferred_hca_names ||
-                per_key_preferred_hca_names->size() == key_count);
+                per_key_preferred_hca_names->size() == key_count) &&
+               ValidKVCacheKinds(key_count);
     }
 
     ReplicateConfig ForKeySubset(const std::vector<size_t>& indices) const {
@@ -174,7 +200,24 @@ struct ReplicateConfig {
                     per_key_preferred_hca_names->at(index));
             }
         }
+        if (kv_cache_kinds) {
+            result.kv_cache_kinds = std::vector<KVCacheKind>{};
+            for (auto index : indices) {
+                result.kv_cache_kinds->push_back(kv_cache_kinds->at(index));
+            }
+        }
         return result;
+    }
+
+    ReplicateConfig ForRepeatedKeySubset(const std::vector<size_t>& indices,
+                                         size_t shards_per_key) const {
+        if (!HasPerKeyHints()) return *this;
+        std::vector<size_t> shard_indices;
+        shard_indices.reserve(indices.size() * shards_per_key);
+        for (size_t index : indices) {
+            shard_indices.insert(shard_indices.end(), shards_per_key, index);
+        }
+        return ForKeySubset(shard_indices);
     }
 
     bool ValidSessionIds(size_t key_count) const {
@@ -220,6 +263,10 @@ struct ReplicateConfig {
             residency_affinity_ids = std::vector<std::string>{
                 batch_config.residency_affinity_ids->at(key_index)};
         }
+        if (batch_config.kv_cache_kinds) {
+            kv_cache_kinds = std::vector<KVCacheKind>{
+                batch_config.kv_cache_kinds->at(key_index)};
+        }
     }
 
     ReplicateConfig ForSingleKey(size_t key_index) const {
@@ -260,6 +307,14 @@ struct ReplicateConfig {
         os << ", prefer_alloc_in_same_node: "
            << config.prefer_alloc_in_same_node
            << ", data_type: " << config.data_type;
+        if (config.kv_cache_kinds.has_value()) {
+            os << ", kv_cache_kinds: [";
+            for (size_t i = 0; i < config.kv_cache_kinds->size(); ++i) {
+                os << config.kv_cache_kinds->at(i);
+                if (i + 1 < config.kv_cache_kinds->size()) os << ", ";
+            }
+            os << "]";
+        }
         if (!config.host_id.empty()) {
             os << ", host_id: " << config.host_id;
         }

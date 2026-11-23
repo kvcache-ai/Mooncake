@@ -43,12 +43,13 @@ struct StandbyObjectMetadata {
     struct_pack::compatible<std::string, 2> session_id;
     struct_pack::compatible<uint64_t, 3> object_checksum;
     struct_pack::compatible<std::string, 4> residency_affinity_id;
+    struct_pack::compatible<KVCacheKind, 5> kv_cache_kind;
 
     StandbyObjectMetadata() = default;
 
     YLT_REFL(StandbyObjectMetadata, client_id, size, replicas, group_id,
              data_type, hard_pinned, session_id, object_checksum,
-             residency_affinity_id);
+             residency_affinity_id, kv_cache_kind);
 
     // Check if this metadata has valid replicas
     bool HasReplicas() const { return !replicas.empty(); }
@@ -116,9 +117,11 @@ struct MetadataPayload {
     struct_pack::compatible<std::string, 2> session_id;
     struct_pack::compatible<uint64_t, 3> object_checksum;
     struct_pack::compatible<std::string, 4> residency_affinity_id;
+    struct_pack::compatible<KVCacheKind, 5> kv_cache_kind;
 
     YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type,
-             hard_pinned, session_id, object_checksum, residency_affinity_id);
+             hard_pinned, session_id, object_checksum, residency_affinity_id,
+             kv_cache_kind);
 
     // Convert to StandbyObjectMetadata
     StandbyObjectMetadata ToStandbyMetadata() const {
@@ -132,6 +135,7 @@ struct MetadataPayload {
         meta.data_type = data_type.value_or(ObjectDataType::UNKNOWN);
         meta.hard_pinned = hard_pinned.value_or(false);
         meta.residency_affinity_id = residency_affinity_id.value_or("");
+        meta.kv_cache_kind = kv_cache_kind.value_or(KVCacheKind::UNSPECIFIED);
         return meta;
     }
 };

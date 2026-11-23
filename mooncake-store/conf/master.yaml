@@ -16,6 +16,11 @@ eviction_ratio: 0.1
 # usage-ratio eviction; allocation-failure-triggered eviction remains enabled.
 eviction_high_watermark_ratio: 1.0
 
+# Per-kind KV cache eviction. Empty keeps every kind on NORMAL.
+# Kinds: UNSPECIFIED, FULL, SWA, DSA, INDEXER, MLA, MAMBA, LINEAR.
+# Controls: NORMAL, DEFER, PROTECT.
+# kv_cache_kind_evict: "MAMBA=PROTECT,INDEXER=DEFER,SWA=DEFER"
+
 # Per-tenant eviction watermark, as a fraction of each tenant's OWN effective
 # quota. Defaults to 0.9 in code, mirroring eviction_high_watermark_ratio; set
 # 0.0 to disable the pass and keep the historical behaviour.

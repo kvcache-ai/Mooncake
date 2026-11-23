@@ -3,6 +3,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 #include <glog/logging.h>
 
@@ -174,6 +175,10 @@ struct MasterConfig {
     // Snapshot object store type: "local" or "s3", required when
     // batch OpLog snapshot is enabled
     std::string snapshot_object_store_type;
+    // KIND=CONTROL list. Empty leaves every KV cache kind on NORMAL eviction.
+    // Kinds: UNSPECIFIED, FULL, SWA, DSA, INDEXER, MLA, MAMBA, LINEAR.
+    // Controls: NORMAL, DEFER, PROTECT.
+    std::string kv_cache_kind_evict;
 
     // Task manager configuration
     uint32_t max_total_finished_tasks;
@@ -304,6 +309,7 @@ class MasterServiceSupervisorConfig {
 
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     std::string snapshot_object_store_type;
+    std::string kv_cache_kind_evict;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
@@ -469,6 +475,7 @@ class MasterServiceSupervisorConfig {
 
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_object_store_type = config.snapshot_object_store_type;
+        kv_cache_kind_evict = config.kv_cache_kind_evict;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -627,6 +634,7 @@ class WrappedMasterServiceConfig {
 
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     std::string snapshot_object_store_type;
+    std::string kv_cache_kind_evict;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -758,6 +766,7 @@ class WrappedMasterServiceConfig {
 
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_object_store_type = config.snapshot_object_store_type;
+        kv_cache_kind_evict = config.kv_cache_kind_evict;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -862,6 +871,7 @@ class WrappedMasterServiceConfig {
 
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_object_store_type = config.snapshot_object_store_type;
+        kv_cache_kind_evict = config.kv_cache_kind_evict;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -936,6 +946,7 @@ class MasterServiceConfigBuilder {
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     std::string snapshot_object_store_type_;
+    std::string kv_cache_kind_evict_;
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -968,6 +979,11 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_allow_evict_soft_pinned_objects(
         bool allow) {
         allow_evict_soft_pinned_objects_ = allow;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_kv_cache_kind_evict(std::string policy) {
+        kv_cache_kind_evict_ = std::move(policy);
         return *this;
     }
 
@@ -1345,6 +1361,7 @@ class MasterServiceConfig {
 
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     std::string snapshot_object_store_type;
+    std::string kv_cache_kind_evict;
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
@@ -1443,6 +1460,7 @@ class MasterServiceConfig {
 
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_object_store_type = config.snapshot_object_store_type;
+        kv_cache_kind_evict = config.kv_cache_kind_evict;
 
         task_manager_config.max_total_finished_tasks =
             config.max_total_finished_tasks;
@@ -1525,6 +1543,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.tenant_quota_connector_uri = tenant_quota_connector_uri_;
     config.snapshot_interval_seconds = snapshot_interval_seconds_;
     config.snapshot_object_store_type = snapshot_object_store_type_;
+    config.kv_cache_kind_evict = kv_cache_kind_evict_;
     config.task_manager_config.max_total_finished_tasks =
         max_total_finished_tasks_;
     config.task_manager_config.max_total_pending_tasks =

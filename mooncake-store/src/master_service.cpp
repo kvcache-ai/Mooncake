@@ -200,6 +200,16 @@ struct MasterService::MemoryEviction {
                 return tl::make_unexpected(
                     eviction::SkipReason::kExternalEvict);
             }
+            const auto kind_control =
+                service_.KindEvictControl(candidate.metadata);
+            if (kind_control == KVCacheEvictControl::PROTECT) {
+                return tl::make_unexpected(
+                    eviction::SkipReason::kKindProtected);
+            }
+            if (kind_control == KVCacheEvictControl::DEFER &&
+                !candidate.fallback) {
+                return tl::make_unexpected(eviction::SkipReason::kDeferred);
+            }
             if (service_.IsSoftPinActive(candidate.metadata, candidate.now)) {
                 if (!allow_soft_pinned_) {
                     return tl::make_unexpected(
@@ -478,6 +488,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       max_kv_soft_pin_ttl_(config.max_kv_soft_pin_ttl),
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
+      kv_cache_kind_policy_(
+          ParseKVCacheKindPolicyOrDie(config.kv_cache_kind_evict)),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
       nof_eviction_ratio_(config.nof_eviction_ratio),
@@ -3571,7 +3583,8 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
             std::move(object.replicas), std::nullopt,
             standby_meta.hard_pinned.value_or(false), standby_meta.data_type,
             standby_meta.group_id, object.tenant_id, object.user_key,
-            standby_meta.residency_affinity_id.value_or(""));
+            standby_meta.residency_affinity_id.value_or(""),
+            standby_meta.kv_cache_kind.value_or(KVCacheKind::UNSPECIFIED));
         auto& metadata = accessor.Get();
         metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         metadata.session_id = standby_meta.session_id.value_or("");
@@ -5142,7 +5155,8 @@ auto MasterService::InsertMetadata(
     accessor.Publish(client_id, now, value_length, std::move(replicas),
                      std::move(committed_soft_pin_timeout),
                      config.with_hard_pin, config.data_type, group_id,
-                     tenant_id, key, residency_affinity_id);
+                     tenant_id, key, residency_affinity_id,
+                     config.KVCacheKindForKey(0));
     auto& metadata = accessor.Get();
     metadata.BeginSessionTag(config.SessionId(), eligible_replica_ids);
     metadata.BeginSoftPinAction(soft_pin_request,
@@ -5263,7 +5277,7 @@ auto MasterService::PrepareWriteStart(
     VLOG(1) << "key=" << key << ", value_length=" << slice_length
             << ", config=" << config << ", action=" << action << "_begin";
 
-    if (!config.ValidSessionIds(1)) {
+    if (!config.ValidSessionIds(1) || !config.ValidKVCacheKinds(1)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto group_id = GetGroupIdForKey(config, 1, 0);
@@ -5968,6 +5982,22 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // Cleanup follows the membership checks so rejected writes leave
             // managed objects and their replicas unchanged.
             if (accessor.IsPublished()) {
+                // A legacy writer may omit both fields. Preserve the KV
+                // classification even when this write has to replace the
+                // object.
+                const auto& current = accessor.Get();
+                allocation_config = config;
+                if (config.data_type == ObjectDataType::UNKNOWN &&
+                    current.data_type == ObjectDataType::KVCACHE) {
+                    allocation_config.data_type = current.data_type;
+                }
+                if (!config.kv_cache_kinds &&
+                    current.data_type == ObjectDataType::KVCACHE &&
+                    allocation_config.data_type == ObjectDataType::KVCACHE &&
+                    current.kv_cache_kind != KVCacheKind::UNSPECIFIED) {
+                    allocation_config.kv_cache_kinds =
+                        std::vector<KVCacheKind>{current.kv_cache_kind};
+                }
                 CleanupInvalidMemoryReplicas(accessor);
             }
             // --- Step 0: stale handle cleanup ---
@@ -6148,6 +6178,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     !has_bucket_dfs_replica && !restore_missing_bucket_dfs) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
+                    if (metadata.data_type == ObjectDataType::KVCACHE ||
+                        allocation_config.data_type ==
+                            ObjectDataType::KVCACHE) {
+                        metadata.data_type = allocation_config.data_type;
+                    }
+                    metadata.kv_cache_kind =
+                        allocation_config.KVCacheKindForKey(0);
 
                     // Mark COMPLETE → PROCESSING so readers won't see stale
                     // data mid-transfer.  The key becomes unreadable until
@@ -6195,7 +6232,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // Preserve hard_pin and soft_pin from the old metadata so that
                 // eviction protection survives a size-changing upsert (RFC
                 // §2.2.2).
-                allocation_config = config;
                 allocation_config.with_hard_pin =
                     allocation_config.with_hard_pin || metadata.IsHardPinned();
                 allocation_committed_soft_pin_timeout =
@@ -7758,14 +7794,22 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
 
     const TenantId tenant_id = TenantId::Default();
     std::set<int64_t> attempted;
+    bool fallback = false;
+    bool saw_deferred = false;
     while (true) {
         auto pending =
             force_one ? bucket_allocator_->PrepareEvictionForAllocationFailure()
                       : bucket_allocator_->PrepareEviction();
         if (pending.Empty()) return evicted;
         if (!attempted.insert(pending.bucket_id()).second) {
-            bucket_allocator_->AbortEviction(std::move(pending));
-            return evicted;
+            if (fallback || !saw_deferred) {
+                bucket_allocator_->AbortEviction(std::move(pending));
+                return evicted;
+            }
+            // Normal buckets have had a turn. Revalidate deferred buckets
+            // under the same lease, pin and replica checks on this pass.
+            fallback = true;
+            attempted = {pending.bucket_id()};
         }
 
         const auto& candidates = pending.Candidates();
@@ -7823,6 +7867,13 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                     metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
                     (IsSoftPinActive(metadata, now) &&
                      !allow_evict_soft_pinned_objects_)) {
+                    all_accepted = false;
+                    break;
+                }
+                const auto control = KindEvictControl(metadata);
+                if (control == KVCacheEvictControl::PROTECT ||
+                    (control == KVCacheEvictControl::DEFER && !fallback)) {
+                    saw_deferred |= control == KVCacheEvictControl::DEFER;
                     all_accepted = false;
                     break;
                 }
@@ -7986,6 +8037,8 @@ void MasterService::RunShardDfsEviction() {
     const TenantId tenant_id = TenantId::Default();
     using CandidateIdentity = std::tuple<std::string, int, uint64_t>;
     std::set<CandidateIdentity> attempted;
+    bool fallback = false;
+    bool saw_deferred = false;
 
     while (true) {
         auto pending = shard_allocator_->PrepareEviction();
@@ -7994,7 +8047,6 @@ void MasterService::RunShardDfsEviction() {
         const auto candidates = pending.Candidates();
         std::vector<bool> accepted(candidates.size(), false);
         std::vector<bool> considered(candidates.size(), false);
-        bool saw_repeated_candidate = false;
 
         // Prepared allocator extents stay unavailable until
         // ResolvePreparedEviction(), so each candidate is validated and removed
@@ -8007,7 +8059,6 @@ void MasterService::RunShardDfsEviction() {
                      .emplace(candidate.key, candidate.shard_idx,
                               candidate.offset)
                      .second) {
-                saw_repeated_candidate = true;
                 continue;
             }
             considered[i] = true;
@@ -8064,6 +8115,13 @@ void MasterService::RunShardDfsEviction() {
                               (!IsSoftPinActive(metadata, now) ||
                                allow_evict_soft_pinned_objects_);
                 if (!accepted[i]) continue;
+                const auto control = KindEvictControl(metadata);
+                if (control == KVCacheEvictControl::PROTECT ||
+                    (control == KVCacheEvictControl::DEFER && !fallback)) {
+                    saw_deferred |= control == KVCacheEvictControl::DEFER;
+                    accepted[i] = false;
+                    continue;
+                }
 
                 // A missing descriptor was accepted above and is already
                 // evicted from the master's point of view. Otherwise remove
@@ -8095,8 +8153,10 @@ void MasterService::RunShardDfsEviction() {
             }
         }
 
-        if (saw_repeated_candidate) {
-            return;
+        if (candidate_indexes.empty()) {
+            if (fallback || !saw_deferred) return;
+            fallback = true;
+            attempted.clear();
         }
     }
 }
@@ -9954,34 +10014,52 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
     // is rotated to a random start, so that the objects a walk reaches first
     // are not the ones every round prefers.
     std::vector<std::pair<TenantId, route::ObjectRef>> candidates;
+    std::vector<std::pair<TenantId, route::ObjectRef>> deferred;
     VisitNamespaces([&](const TenantId& tenant_id, metadata::Namespace& ns) {
         DiscardExpiredProcessingReplicas(ns, now);
         for (auto object : ns.objects.ReadCursor()) {
             object_count++;
             if (may_evict(object.metadata())) {
-                candidates.emplace_back(tenant_id, object.ref());
+                const auto control = KindEvictControl(object.metadata());
+                if (control != KVCacheEvictControl::PROTECT) {
+                    auto& list = control == KVCacheEvictControl::DEFER
+                                     ? deferred
+                                     : candidates;
+                    list.emplace_back(tenant_id, object.ref());
+                }
             }
         }
     });
     const long ideal_evict_num =
         static_cast<long>(std::ceil(object_count * evict_ratio_target));
-    if (!candidates.empty()) {
-        std::rotate(candidates.begin(),
-                    candidates.begin() + randomIndex(candidates.size()),
-                    candidates.end());
+    const long minimum_evict_num =
+        static_cast<long>(std::ceil(object_count * evict_ratio_lowerbound));
+    for (auto* list : {&candidates, &deferred}) {
+        if (!list->empty()) {
+            std::rotate(list->begin(),
+                        list->begin() + randomIndex(list->size()), list->end());
+        }
     }
+    const size_t normal_count = candidates.size();
+    candidates.insert(candidates.end(),
+                      std::make_move_iterator(deferred.begin()),
+                      std::make_move_iterator(deferred.end()));
 
-    for (const auto& [tenant_id, object] : candidates) {
-        if (evicted_count >= ideal_evict_num) {
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const bool fallback = i >= normal_count;
+        if (evicted_count >= (fallback ? minimum_evict_num : ideal_evict_num)) {
             break;
         }
+        const auto& [tenant_id, object] = candidates[i];
         const std::string& key = object.key;
         MetadataAccessorRW accessor(this, tenant_id, object);
         if (!accessor.IsPublished()) {
             continue;
         }
         auto& metadata = accessor.Get();
-        if (!may_evict(metadata)) {
+        const auto control = KindEvictControl(metadata);
+        if (!may_evict(metadata) || control == KVCacheEvictControl::PROTECT ||
+            (control == KVCacheEvictControl::DEFER && !fallback)) {
             continue;
         }
 
@@ -11787,6 +11865,7 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.hard_pinned = metadata.IsHardPinned();
     payload.object_checksum = metadata.GetPart(0).checksum();
     payload.residency_affinity_id = metadata.residency_affinity_id;
+    payload.kv_cache_kind = metadata.kv_cache_kind;
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }
