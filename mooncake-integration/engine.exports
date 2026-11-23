@@ -1,0 +1,4 @@
+{
+  global: PyInit_engine;
+  local: *;
+};
