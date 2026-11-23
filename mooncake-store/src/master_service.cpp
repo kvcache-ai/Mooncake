@@ -11148,6 +11148,16 @@ void MasterService::DelayDrainCandidate(DrainPlan& plan,
     plan.delayed.push_back(std::move(candidate));
 }
 
+MasterService::DrainPriority MasterService::GetDrainPriority(
+    const ObjectMetadata& metadata) const {
+    const auto deadline = metadata.EvictionDeadline();
+    if (deadline >= metadata.put_start_time +
+                        std::chrono::milliseconds(default_kv_lease_ttl_)) {
+        return {true, deadline};
+    }
+    return {false, metadata.put_start_time};
+}
+
 tl::expected<MasterService::DrainMove, ErrorCode> MasterService::PlanDrainMove(
     DrainCandidate& candidate, const CreateDrainJobRequest& request) {
     const auto& source = request.segments[candidate.source_index];
@@ -11273,6 +11283,7 @@ std::vector<bool> MasterService::ScanDrainSources(
         sources_by_name.emplace(job.request.segments[index], index);
     }
     std::vector<bool> has_exhausted(plan.sources.size(), false);
+    const size_t queued_before_walk = plan.ready.size();
 
     std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
     // Include first writes whose namespace has no published objects yet.
@@ -11305,11 +11316,19 @@ std::vector<bool> MasterService::ScanDrainSources(
                         source.exhausted_attempts.erase(failed);
                     }
                 }
-                plan.ready.push_back({tenant_id, object.ref(), index});
+                plan.ready.push_back({tenant_id, object.ref(), index,
+                                      GetDrainPriority(object.metadata())});
                 ++source.outstanding;
             }
         }
     });
+    lock.unlock();
+    if (!DrainJobStopRequested(job) && plan.ready.size() > queued_before_walk) {
+        std::sort(plan.ready.begin(), plan.ready.end(),
+                  [](const DrainCandidate& lhs, const DrainCandidate& rhs) {
+                      return lhs.priority > rhs.priority;
+                  });
+    }
     return has_exhausted;
 }
 
