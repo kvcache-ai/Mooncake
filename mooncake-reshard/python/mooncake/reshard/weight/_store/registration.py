@@ -100,6 +100,9 @@ class StoreBufferRegistration:
                 raise WeightStoreError(
                     f"pending Store registration does not exist: {pending_registration_id}"
                 )
+            # Registration cleanup has completed even if releasing a pin below
+            # fails. A retry must only repeat the remaining lifetime cleanup.
+            current.addresses.clear()
             tokens = current.tokens
             terminal_state = current.terminal_state
             current.tokens = ()
