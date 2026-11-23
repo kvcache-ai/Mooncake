@@ -1856,6 +1856,7 @@ class MasterService {
 
         // Get metadata (only call when Exists() is true)
         const ObjectMetadata& Get() const { return guard_->metadata(); }
+        route::Generation Generation() const { return guard_->generation(); }
 
         // The tasks in flight for the object (only call when IsPublished()
         // is true)
@@ -2161,6 +2162,13 @@ class MasterService {
         std::string target_segment;
         size_t bytes;
         std::string unit_key;
+        route::Generation generation;
+    };
+
+    struct DrainCapacityRetry {
+        route::Generation generation;
+        std::unordered_set<std::string> failed_targets;
+        std::chrono::steady_clock::time_point retry_at{};
     };
 
     enum class DrainStopReason { NONE, USER, TIMEOUT };
@@ -2190,6 +2198,7 @@ class MasterService {
         std::unordered_set<std::string> completed_unit_keys;
         std::unordered_map<std::string, uint32_t> retry_counts;
         std::unordered_set<std::string> terminal_failed_unit_keys;
+        std::unordered_map<std::string, DrainCapacityRetry> capacity_retries;
     };
 
     static constexpr uint32_t kMaxDrainUnitRetries = 3;
@@ -2212,8 +2221,10 @@ class MasterService {
     void ScheduleDrainJobTasks(DrainJob& job);
     bool MaybeCompleteDrainJob(DrainJob& job);
     std::optional<std::string> SelectDrainTargetForKey(
-        const ObjectMetadata& metadata, const std::string& source_segment,
-        const std::vector<std::string>& requested_targets);
+        const ObjectMetadata& metadata, size_t object_size,
+        const std::string& source_segment,
+        const std::vector<std::string>& requested_targets,
+        const std::unordered_set<std::string>* failed_targets);
     std::string MakeDrainUnitKey(const TenantId& tenant_id,
                                  const std::string& key,
                                  const std::string& source_segment) const;

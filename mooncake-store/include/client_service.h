@@ -1334,11 +1334,11 @@ class Client {
     tl::expected<void, ErrorCode> Move(const std::string& key,
                                        const std::string& source,
                                        const std::string& target);
-    tl::expected<void, ErrorCode> Move(const std::string& key,
-                                       const std::string& tenant_id,
-                                       const std::string& source,
-                                       const std::string& target,
-                                       const UUID* task_id = nullptr);
+    tl::expected<void, ErrorCode> Move(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& source, const std::string& target,
+        const UUID* task_id = nullptr,
+        bool* target_allocation_failed = nullptr);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;

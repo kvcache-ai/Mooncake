@@ -4248,6 +4248,52 @@ TEST_F(MasterServiceTest, LegacyTaskPayloadDefaultsTenant) {
     EXPECT_EQ(move_payload.target, "segment_1");
 }
 
+TEST_F(MasterServiceTest, DrainCapacityRetryFieldsAreWireCompatible) {
+    struct LegacyAssignment {
+        UUID id;
+        TaskType type;
+        std::string payload;
+        int64_t created_at_ms_epoch;
+        uint32_t max_retry_attempts;
+    };
+    struct LegacyCompletion {
+        UUID id;
+        TaskStatus status;
+        std::string message;
+    };
+
+    const UUID id = generate_uuid();
+    const std::vector<LegacyAssignment> legacy_assignments{
+        {id, TaskType::REPLICA_MOVE, "{}", 0, 10}};
+    auto assignments = struct_pack::deserialize<std::vector<TaskAssignment>>(
+        struct_pack::serialize(legacy_assignments));
+    ASSERT_TRUE(assignments);
+    ASSERT_EQ(assignments->size(), 1u);
+    EXPECT_FALSE(assignments->front().retry_capacity_on_master);
+    assignments->front().retry_capacity_on_master = true;
+    auto old_assignments =
+        struct_pack::deserialize<std::vector<LegacyAssignment>>(
+            struct_pack::serialize(*assignments));
+    ASSERT_TRUE(old_assignments);
+    ASSERT_EQ(old_assignments->size(), 1u);
+    EXPECT_EQ(old_assignments->front().id, id);
+    EXPECT_EQ(old_assignments->front().max_retry_attempts, 10u);
+
+    const LegacyCompletion legacy_completion{id, TaskStatus::FAILED,
+                                             "allocation failed"};
+    auto completion = struct_pack::deserialize<TaskCompleteRequest>(
+        struct_pack::serialize(legacy_completion));
+    ASSERT_TRUE(completion);
+    EXPECT_FALSE(completion->target_allocation_failed);
+    completion->target_allocation_failed = true;
+    auto old_completion = struct_pack::deserialize<LegacyCompletion>(
+        struct_pack::serialize(*completion));
+    ASSERT_TRUE(old_completion);
+    EXPECT_EQ(old_completion->id, id);
+    EXPECT_EQ(old_completion->status, TaskStatus::FAILED);
+    EXPECT_EQ(old_completion->message, legacy_completion.message);
+}
+
 TEST_F(MasterServiceTest,
        CreateDrainJobMarksSegmentDrainingAndSkipsAllocation) {
     auto service_config =
@@ -4405,6 +4451,161 @@ TEST_F(MasterServiceTest, FailedMoveKeepsTheSourceAndSerializesUpsert) {
 // Drain plans and completes one tenant at a time: the segment counts as
 // drained only once every tenant's object under the same user key has left
 // it.
+TEST_F(MasterServiceTest, DrainJobSkipsTargetWithInsufficientFreeBytes) {
+    auto config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    MasterService service(config);
+    MasterServiceTestPeer::StopDrainDispatchForTesting(service);
+
+    constexpr size_t kSmallCapacity = 4 * 1024 * 1024;
+    constexpr size_t kObjectSize = 2 * kSmallCapacity;
+    const auto source = PrepareSimpleSegment(service, "source", 0x300000000);
+    PrepareSimpleSegment(service, "small", 0x400000000, kSmallCapacity);
+    const auto target = PrepareSimpleSegment(service, "large", 0x500000000,
+                                             kSmallCapacity + kObjectSize);
+    const auto key =
+        PutObjectOnSegment(service, source.client_id, "source", kObjectSize);
+    PutObjectOnSegment(service, target.client_id, "large", kSmallCapacity);
+    const auto usage = service.QuerySegments("large");
+    ASSERT_TRUE(usage);
+    ASSERT_EQ(usage->first, kSmallCapacity);
+    ASSERT_EQ(usage->second - usage->first, kObjectSize);
+
+    CreateDrainJobRequest request;
+    request.segments = {"source"};
+    request.target_segments = {"small", "large"};
+    request.max_concurrency = 1;
+    ASSERT_TRUE(service.CreateDrainJob(request));
+    MasterServiceTestPeer::RunDrainRoundForTesting(service);
+    ASSERT_TRUE(ExecutePendingMoveTasks(service, source.client_id));
+
+    const auto replicas = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replicas);
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_EQ(replicas->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "large");
+}
+
+TEST_F(MasterServiceTest, DrainJobRetriesAfterTargetCapacityIsFreed) {
+    auto config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    MasterService service(config);
+    MasterServiceTestPeer::StopDrainDispatchForTesting(service);
+
+    constexpr size_t kTargetCapacity = 4 * 1024 * 1024;
+    const auto source = PrepareSimpleSegment(service, "source", 0x300000000);
+    const auto target =
+        PrepareSimpleSegment(service, "target", 0x400000000, kTargetCapacity);
+    PutObjectOnSegment(service, source.client_id, "source");
+    const auto filler = PutObjectOnSegment(service, target.client_id, "target",
+                                           kTargetCapacity);
+
+    CreateDrainJobRequest request;
+    request.segments = {"source"};
+    request.target_segments = {"target"};
+    request.max_concurrency = 1;
+    const auto job_id = service.CreateDrainJob(request);
+    ASSERT_TRUE(job_id);
+    MasterServiceTestPeer::RunDrainRoundForTesting(service);
+    const auto job = service.QueryDrainJob(*job_id);
+    ASSERT_TRUE(job);
+    EXPECT_EQ(job->blocked_units, 1u);
+    EXPECT_EQ(job->active_units, 0u);
+    EXPECT_EQ(job->failed_units, 0u);
+
+    ASSERT_TRUE(service.Remove(filler, TenantId::Default(), /*force=*/true));
+    WaitUntil([&] {
+        MasterServiceTestPeer::RunDrainRoundForTesting(service);
+        return ExecutePendingMoveTasks(service, source.client_id);
+    });
+    MasterServiceTestPeer::RunDrainRoundForTesting(service);
+    const auto finished = service.QueryDrainJob(*job_id);
+    ASSERT_TRUE(finished);
+    EXPECT_EQ(finished->status, JobStatus::SUCCEEDED);
+    EXPECT_EQ(finished->succeeded_units, 1u);
+}
+
+TEST_F(MasterServiceTest, DrainJobTriesOtherTargetsBeforeWaitingForCapacity) {
+    auto config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    MasterService service(config);
+    MasterServiceTestPeer::StopDrainDispatchForTesting(service);
+
+    constexpr size_t kTargetCapacity = 4 * 1024 * 1024;
+    const auto source = PrepareSimpleSegment(service, "source", 0x300000000);
+    const auto target_a =
+        PrepareSimpleSegment(service, "target_a", 0x400000000, kTargetCapacity);
+    const auto target_b =
+        PrepareSimpleSegment(service, "target_b", 0x500000000, kTargetCapacity);
+    const auto key = PutObjectOnSegment(service, source.client_id, "source");
+    const auto tenant = TenantId::Default();
+
+    CreateDrainJobRequest request;
+    request.segments = {"source"};
+    request.target_segments = {"target_a", "target_b"};
+    request.max_concurrency = 1;
+    const auto job_id = service.CreateDrainJob(request);
+    ASSERT_TRUE(job_id);
+
+    const auto fail_move = [&](const std::string& target, const UUID& owner) {
+        MasterServiceTestPeer::RunDrainRoundForTesting(service);
+        auto assignments = service.FetchTasks(source.client_id, 1);
+        ASSERT_TRUE(assignments);
+        ASSERT_EQ(assignments->size(), 1u);
+        const auto& assignment = assignments->front();
+        ASSERT_TRUE(assignment.retry_capacity_on_master.value_or(false));
+        ReplicaMovePayload payload;
+        struct_json::from_json(payload, assignment.payload);
+        ASSERT_EQ(payload.key, key);
+        ASSERT_EQ(payload.target, target);
+
+        const auto filler =
+            PutObjectOnSegment(service, owner, target, kTargetCapacity);
+        const auto move =
+            service.MoveStart(source.client_id, key, tenant, "source", target);
+        ASSERT_FALSE(move);
+        ASSERT_EQ(move.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+        TaskCompleteRequest completion;
+        completion.id = assignment.id;
+        completion.status = TaskStatus::FAILED;
+        completion.target_allocation_failed = true;
+        ASSERT_TRUE(service.MarkTaskToComplete(source.client_id, completion));
+        // Make the failed target eligible again in the capacity snapshot.
+        ASSERT_TRUE(service.Remove(filler, tenant, /*force=*/true));
+    };
+    ASSERT_NO_FATAL_FAILURE(fail_move("target_a", target_a.client_id));
+    ASSERT_NO_FATAL_FAILURE(fail_move("target_b", target_b.client_id));
+
+    MasterServiceTestPeer::RunDrainRoundForTesting(service);
+    const auto blocked = service.QueryDrainJob(*job_id);
+    ASSERT_TRUE(blocked);
+    EXPECT_EQ(blocked->status, JobStatus::RUNNING);
+    EXPECT_EQ(blocked->active_units, 0u);
+    EXPECT_EQ(blocked->blocked_units, 1u);
+    EXPECT_EQ(blocked->failed_units, 0u);
+
+    const auto replicas = service.GetReplicaList(key, tenant);
+    ASSERT_TRUE(replicas);
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_EQ(replicas->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "source");
+
+    WaitUntil([&] {
+        MasterServiceTestPeer::RunDrainRoundForTesting(service);
+        return ExecutePendingMoveTasks(service, source.client_id);
+    });
+    MasterServiceTestPeer::RunDrainRoundForTesting(service);
+    const auto finished = service.QueryDrainJob(*job_id);
+    ASSERT_TRUE(finished);
+    EXPECT_EQ(finished->status, JobStatus::SUCCEEDED);
+    EXPECT_EQ(finished->succeeded_units, 1u);
+    EXPECT_EQ(finished->failed_units, 0u);
+}
+
 TEST_F(MasterServiceTest, DrainJobMovesObjectsOfEveryTenant) {
     const TenantId tenant_a("drain_tenant_a");
     const TenantId tenant_b("drain_tenant_b");

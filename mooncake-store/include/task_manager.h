@@ -86,6 +86,7 @@ struct Task {
     // A drain must observe the final result before this task can be pruned.
     // In particular, a processing timeout is not proof that its worker stopped.
     bool retained_by_drain = false;
+    bool target_allocation_failed = false;
 
     bool is_finished() const { return is_finished_status(status); }
 
@@ -215,7 +216,8 @@ class ScopedTaskWriteAccess {
     std::vector<Task> pop_tasks(const UUID& client_id, size_t batch_size);
 
     ErrorCode complete_task(const UUID& client_id, const UUID& task_id,
-                            TaskStatus status, const std::string& message);
+                            TaskStatus status, const std::string& message,
+                            bool target_allocation_failed = false);
 
     ErrorCode cancel_task(const UUID& task_id, const TenantId& tenant_id);
 
