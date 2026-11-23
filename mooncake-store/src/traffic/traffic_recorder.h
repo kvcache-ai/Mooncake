@@ -92,6 +92,7 @@ class TrafficRecorder {
     bool FlushRecords(Shard& shard, std::vector<struct iovec>& iov,
                       std::uint64_t bytes, std::uint32_t records,
                       std::uint64_t commit_tail);
+    void FinalizeAtQuota();
     void StopInternal();
     void ResetConfig();
     Shard* BindShard() noexcept;

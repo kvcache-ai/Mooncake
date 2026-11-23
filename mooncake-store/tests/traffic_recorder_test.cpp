@@ -749,24 +749,30 @@ TEST(TrafficRecorderTest, StopsAtTheSessionSizeLimit) {
     EXPECT_TRUE(status.format_complete);
     EXPECT_FALSE(status.capture_complete);
 
+    const std::filesystem::path segment =
+        std::filesystem::path(status.session_dir) / "segment-000000.mcr";
+    const std::uint64_t expected_segment_size =
+        kTrafficFileHeaderSize + kTrafficBlockHeaderSize +
+        kTrafficRecordHeaderSize + payload.size() + kTrafficFooterSize;
+    // Reaching the quota closes the segment immediately. The footer has to be
+    // on disk before format_complete turns true, so the session is replayable
+    // without a later Stop.
+    ASSERT_TRUE(std::filesystem::exists(segment));
+    EXPECT_EQ(std::filesystem::file_size(segment), expected_segment_size);
+    {
+        std::ifstream summary(status.session_dir + "/summary.json");
+        ASSERT_TRUE(summary);
+        const std::string text((std::istreambuf_iterator<char>(summary)),
+                               std::istreambuf_iterator<char>());
+        EXPECT_NE(text.find("\"capture_complete\":false"), std::string::npos);
+    }
+
     recorder.Stop();
     status = recorder.GetStatus();
     EXPECT_EQ(status.state, "idle");
     EXPECT_TRUE(status.format_complete);
     EXPECT_FALSE(status.capture_complete);
-
-    const std::filesystem::path segment =
-        std::filesystem::path(status.session_dir) / "segment-000000.mcr";
-    ASSERT_TRUE(std::filesystem::exists(segment));
-    EXPECT_EQ(std::filesystem::file_size(segment),
-              kTrafficFileHeaderSize + kTrafficBlockHeaderSize +
-                  kTrafficRecordHeaderSize + payload.size() +
-                  kTrafficFooterSize);
-    std::ifstream summary(status.session_dir + "/summary.json");
-    ASSERT_TRUE(summary);
-    const std::string text((std::istreambuf_iterator<char>(summary)),
-                           std::istreambuf_iterator<char>());
-    EXPECT_NE(text.find("\"capture_complete\":false"), std::string::npos);
+    EXPECT_EQ(std::filesystem::file_size(segment), expected_segment_size);
 
     recorder.Shutdown();
     if (previous_config) {

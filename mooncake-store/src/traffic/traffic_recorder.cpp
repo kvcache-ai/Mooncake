@@ -353,6 +353,23 @@ void TrafficRecorder::StopInternal() {
     stop_in_progress_.store(false, std::memory_order_release);
 }
 
+void TrafficRecorder::FinalizeAtQuota() {
+    active_.store(false, std::memory_order_release);
+    writer_stop_.store(true, std::memory_order_release);
+    if (sink_ != nullptr) {
+        // Close here so format_complete means what the control API says: every
+        // segment has a footer, even when the recorder keeps running.
+        sink_->Close();
+    }
+    const bool failed = sink_ != nullptr && sink_->failed();
+    SetState(failed ? State::kError : State::kIdle);
+    if (!session_dir_.empty()) {
+        WriteSummaryJson(session_dir_, GetStatus());
+        std::lock_guard<std::mutex> lock(route_names_mu_);
+        WriteRouteNamesJson(session_dir_, route_names_);
+    }
+}
+
 void TrafficRecorder::SetState(State state) {
     std::lock_guard<std::mutex> lock(status_mu_);
     state_ = state;
@@ -585,12 +602,10 @@ void TrafficRecorder::WriterLoop() {
                                 : DrainShardRedacted(*shard);
             if (!ok) {
                 if (sink_ != nullptr && sink_->quota_reached()) {
-                    // The session hit its size limit. Stop accepting records;
-                    // the stop path finalizes the segment, so the file stays
-                    // complete.
-                    active_.store(false, std::memory_order_release);
-                    writer_stop_.store(true, std::memory_order_release);
-                    SetState(State::kIdle);
+                    // The session hit its size limit. Close the segment now:
+                    // format_complete is reported from the closed file, and the
+                    // session must be replayable before a later Stop or restart.
+                    FinalizeAtQuota();
                     return;
                 }
                 StopForWriterFailure();
