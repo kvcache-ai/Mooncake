@@ -308,13 +308,15 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     }
 
     auto scan_meta_result = storage_backend_->ScanMeta(
-        [this](const std::vector<std::string>& keys,
-               std::vector<StorageObjectMetadata>& metadatas) {
+        [this, generation = RecoveryGeneration()](
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas) {
             for (auto& metadata : metadatas) {
                 metadata.transport_endpoint = local_rpc_addr_;
             }
             auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
-            auto add_object_result = NotifyRecoveredObjects(tasks, metadatas);
+            auto add_object_result =
+                NotifyRecoveredObjects(tasks, metadatas, generation);
             if (!add_object_result) {
                 LOG(ERROR) << "Failed to add object to master: "
                            << add_object_result.error();
@@ -916,6 +918,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             return res;
         };
         auto offload_res = [&] {
+            std::shared_lock lock(recovery_mutex_);
             ColdReadInvalidation invalidate(*this);
             return storage_backend_->BatchOffload(
                 host_batch_object, bucket_complete_handler,
@@ -1021,6 +1024,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 tl::expected<void, ErrorCode> FileStorage::NotifyEvictedDiskReplicas(
     const std::vector<std::string>& evicted_keys) {
     if (evicted_keys.empty()) return {};
+    // Mutation callers hold recovery_mutex_ until eviction finishes.
+    ++recovery_generation_;
+    WakeHeartbeat();
 
     std::optional<ErrorCode> first_error;
     std::unordered_map<TenantId, std::vector<std::string>, TenantIdHash>
@@ -1073,6 +1079,7 @@ tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
     }
 
     auto eviction_result = [&] {
+        std::shared_lock lock(recovery_mutex_);
         ColdReadInvalidation invalidate(*this);
         return storage_backend_->EvictAboveDiskWatermark(
             config_.disk_eviction_high_watermark_ratio,
@@ -1426,6 +1433,9 @@ void FileStorage::RemoveAll() {
     // must not request it; callers must ensure no live object depends on the
     // files being removed.
     if (storage_backend_) {
+        std::shared_lock lock(recovery_mutex_);
+        ++recovery_generation_;
+        WakeHeartbeat();
         ColdReadInvalidation invalidate(*this);
         storage_backend_->RemoveAll();
     }
@@ -2113,19 +2123,34 @@ bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
     return false;
 }
 
+uint64_t FileStorage::RecoveryGeneration() {
+    std::unique_lock lock(recovery_mutex_);
+    return recovery_generation_.load();
+}
+
 tl::expected<void, ErrorCode> FileStorage::NotifyRecoveredObjects(
     const std::vector<OffloadTaskItem>& tasks,
-    const std::vector<StorageObjectMetadata>& metadatas) {
+    const std::vector<StorageObjectMetadata>& metadatas, uint64_t generation) {
     uint64_t delay_ms = config_.metadata_recovery_retry_initial_ms;
     const auto stopping = [this] {
         return recovery_stopping_.load() || draining_.load() ||
                disk_fenced_.load();
     };
     while (true) {
-        if (stopping()) {
-            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        tl::expected<void, ErrorCode> result;
+        {
+            std::unique_lock lock(recovery_mutex_);
+            if (stopping()) {
+                return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+            }
+            if (recovery_generation_.load() != generation) {
+                // A fresh scan is required: keys or storage coordinates from
+                // this snapshot may have been evicted or replaced.
+                LOG(INFO) << "SSD recovery snapshot invalidated; restart scan";
+                return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            }
+            result = client_->NotifyOffloadSuccess(tasks, metadatas);
         }
-        auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
         if (result) return result;
         const auto error = result.error();
         if (error != ErrorCode::TASK_PENDING_LIMIT_EXCEEDED &&
@@ -2140,11 +2165,20 @@ tl::expected<void, ErrorCode> FileStorage::NotifyRecoveredObjects(
         LOG(WARNING) << "SSD recovery registration failed: " << error
                      << ", retrying " << tasks.size() << " keys in " << wait_ms
                      << "ms";
-        // Drain, disk fencing and shutdown already signal this wakeup.
+        // Invalidation wakes the rescan to restart from current metadata.
         std::unique_lock lock(heartbeat_wake_mutex_);
         if (heartbeat_wake_cv_.wait_for(
-                lock, std::chrono::milliseconds(wait_ms), stopping)) {
-            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+                lock, std::chrono::milliseconds(wait_ms), [&, this] {
+                    return stopping() ||
+                           recovery_generation_.load() != generation;
+                })) {
+            if (!stopping()) {
+                LOG(INFO)
+                    << "SSD recovery snapshot invalidated during backoff; "
+                       "restart scan";
+            }
+            return tl::make_unexpected(stopping() ? ErrorCode::SEGMENT_NOT_FOUND
+                                                  : ErrorCode::RPC_FAIL);
         }
         delay_ms = std::min(delay_ms * 2,
                             uint64_t{config_.metadata_recovery_retry_max_ms});
@@ -2166,7 +2200,8 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
                  "storage_backend_->ScanMeta()";
     auto scan_meta_result =
         storage_backend_->ScanMeta(
-            [this, &total_keys, &total_batches, &total_failures](
+            [this, &total_keys, &total_batches, &total_failures,
+             generation = RecoveryGeneration()](
                 const std::vector<std::string>& keys,
                 std::vector<StorageObjectMetadata>& metadatas) {
                 // A rescan can be mid-flight when a drain deregisters the
@@ -2187,7 +2222,7 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
                 }
                 auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
                 auto add_object_result =
-                    NotifyRecoveredObjects(tasks, metadatas);
+                    NotifyRecoveredObjects(tasks, metadatas, generation);
                 if (!add_object_result) {
                     total_failures++;
                     LOG(ERROR)

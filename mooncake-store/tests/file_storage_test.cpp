@@ -48,10 +48,17 @@ class RecoveryRpcService {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas) {
-        std::lock_guard lock(mutex_);
+        std::unique_lock lock(mutex_);
         attempts_.push_back(std::chrono::steady_clock::now());
         batches_.push_back(tasks);
         if (attempts_.size() <= 2) {
+            if (attempts_.size() == 1) {
+                attempts_cv_.notify_all();
+                if (!attempts_cv_.wait_for(lock, std::chrono::seconds(10),
+                                           [this] { return !pause_first_; })) {
+                    return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+                }
+            }
             if (attempts_.size() == 1 && !tasks.empty()) {
                 auto partial = master_->NotifyOffloadSuccess(
                     client_id, {tasks.front()}, {metadatas.front()});
@@ -61,6 +68,17 @@ class RecoveryRpcService {
             return tl::make_unexpected(error_);
         }
         return master_->NotifyOffloadSuccess(client_id, tasks, metadatas);
+    }
+
+    void PauseFirstAttempt() {
+        std::lock_guard lock(mutex_);
+        pause_first_ = true;
+    }
+
+    void ResumeFirstAttempt() {
+        std::lock_guard lock(mutex_);
+        pause_first_ = false;
+        attempts_cv_.notify_all();
     }
 
     bool WaitForAttempt() {
@@ -79,6 +97,7 @@ class RecoveryRpcService {
     ErrorCode error_;
     std::mutex mutex_;
     std::condition_variable attempts_cv_;
+    bool pause_first_ = false;
     std::vector<std::chrono::steady_clock::time_point> attempts_;
     std::vector<std::vector<OffloadTaskItem>> batches_;
 };
@@ -204,7 +223,14 @@ enum class ReclaimCase {
 
 class FileStorageTest : public ::testing::Test {
    protected:
-    enum class RecoveryPath { Startup, Rescan, Drain, Shutdown };
+    enum class RecoveryPath {
+        Startup,
+        Rescan,
+        Drain,
+        Shutdown,
+        Eviction,
+        EvictionDuringRpc
+    };
 
     void RunRecoveryRegistrationRetry(ErrorCode error, RecoveryPath path,
                                       bool retryable) {
@@ -230,7 +256,8 @@ class FileStorageTest : public ::testing::Test {
                                 &WrappedMasterService::PromotionObjectHeartbeat,
                                 &WrappedMasterService::PollRemoveAll,
                                 &WrappedMasterService::FetchTasks,
-                                &WrappedMasterService::GetReplicaList>(
+                                &WrappedMasterService::GetReplicaList,
+                                &WrappedMasterService::BatchEvictDiskReplica>(
             service.get());
         server.register_handler<&store::GatherReadDirectory::Publish,
                                 &store::GatherReadDirectory::Resolve>(
@@ -255,13 +282,21 @@ class FileStorageTest : public ::testing::Test {
         config.client_buffer_gc_interval_seconds = 1;
         const bool cancel =
             path == RecoveryPath::Drain || path == RecoveryPath::Shutdown;
-        if (cancel) {
+        const bool evict = path == RecoveryPath::Eviction ||
+                           path == RecoveryPath::EvictionDuringRpc;
+        if (cancel || evict) {
             config.metadata_recovery_retry_initial_ms = 5000;
             config.metadata_recovery_retry_max_ms = 5000;
         }
         fs::create_directories(config.storage_filepath);
         BucketBackendConfig buckets;
         buckets.bucket_keys_limit = 2;
+        if (evict) {
+            buckets.eviction_policy = BucketEvictionPolicy::FIFO;
+            buckets.max_total_size = 1024 * 1024;
+            config.disk_eviction_high_watermark_ratio = 1e-12;
+            config.disk_eviction_low_watermark_ratio = 0.5e-12;
+        }
         const std::vector<std::string> keys{"recover-a", "recover-b",
                                             "recover-c", "recover-d"};
         std::string value(128, 'r');
@@ -288,6 +323,75 @@ class FileStorageTest : public ::testing::Test {
         if (path != RecoveryPath::Startup) {
             ASSERT_TRUE(storage->storage_backend_->Init());
             ASSERT_TRUE(client->MountLocalDiskSegment(true));
+        }
+        if (evict) {
+            const auto backend = std::static_pointer_cast<BucketStorageBackend>(
+                storage->storage_backend_);
+            auto metadata = backend->GetStoreMetadata();
+            ASSERT_TRUE(metadata);
+            // Evict the older two-key bucket, preserving the later bucket for
+            // the fresh scan after invalidation.
+            storage->config_.disk_eviction_high_watermark_ratio =
+                static_cast<double>(metadata->total_size - 1) /
+                buckets.max_total_size;
+            storage->config_.disk_eviction_low_watermark_ratio =
+                static_cast<double>(metadata->total_size / 2 + 1) /
+                buckets.max_total_size;
+            const bool during_rpc = path == RecoveryPath::EvictionDuringRpc;
+            if (during_rpc) recovery.PauseFirstAttempt();
+            auto outcome = completed.get_future();
+            auto* owner = storage.get();
+            storage->rescan_future_ =
+                std::async(std::launch::async, [&completed, owner] {
+                    completed.set_value(owner->ReRegisterOffloadedObjects());
+                });
+            ASSERT_TRUE(recovery.WaitForAttempt());
+            // The first registration partially succeeds, then backs off. Real
+            // watermark eviction removes the SSD buckets and their replicas.
+            if (during_rpc) {
+                std::promise<void> eviction_started;
+                auto started = eviction_started.get_future();
+                auto eviction = std::async(std::launch::async, [&] {
+                    eviction_started.set_value();
+                    return storage->RunDiskWatermarkEviction();
+                });
+                started.wait();
+                // Eviction cannot notify/delete before the outstanding
+                // registration RPC finishes, even with a valid snapshot.
+                EXPECT_EQ(eviction.wait_for(std::chrono::milliseconds(100)),
+                          std::future_status::timeout);
+                recovery.ResumeFirstAttempt();
+                ASSERT_TRUE(eviction.get());
+            } else {
+                ASSERT_TRUE(storage->RunDiskWatermarkEviction());
+            }
+            for (size_t i = 0; i < keys.size(); ++i) {
+                auto exists =
+                    storage->Exists(TenantId::Default().MakeScopedKey(keys[i]));
+                ASSERT_TRUE(exists);
+                EXPECT_EQ(*exists, i >= 2);
+                EXPECT_FALSE(client->Query(keys[i]));
+            }
+            EXPECT_EQ(outcome.wait_for(std::chrono::seconds(1)),
+                      std::future_status::ready);
+            // Join even on the old implementation so the regression reports
+            // stale master replicas instead of destroying an active worker.
+            auto result = outcome.get();
+            EXPECT_FALSE(result.has_value());
+            if (!result) EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
+            EXPECT_EQ(recovery.Snapshot().first.size(), 1u);
+            for (const auto& key : keys) {
+                auto advertised = client->Query(key);
+                EXPECT_FALSE(advertised)
+                    << "Evicted key was re-registered: " << key;
+            }
+            // The next heartbeat's fresh scan registers the surviving bucket.
+            ASSERT_TRUE(storage->ReRegisterOffloadedObjects());
+            for (size_t i = 0; i < keys.size(); ++i) {
+                auto advertised = client->Query(keys[i]);
+                EXPECT_EQ(advertised.has_value(), i >= 2) << keys[i];
+            }
+            return;
         }
         if (cancel) {
             auto outcome = completed.get_future();
@@ -3254,6 +3358,7 @@ TEST_F(FileStorageTest, DrainUnmountFailureKeepsLatchAndRetries) {
     EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, heartbeat_rpc.error());
 }
 
+
 TEST_F(FileStorageTest, BatchGetRanges_RegistersReleasableStaging) {
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
@@ -3821,6 +3926,16 @@ INSTANTIATE_TEST_SUITE_P(
 TEST_F(FileStorageTest, RecoveryDoesNotRetryInvalidMetadata) {
     RunRecoveryRegistrationRetry(ErrorCode::INVALID_PARAMS,
                                  RecoveryPath::Startup, false);
+}
+
+TEST_F(FileStorageTest, RecoveryBackoffDoesNotReregisterEvictedBuckets) {
+    RunRecoveryRegistrationRetry(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED,
+                                 RecoveryPath::Eviction, true);
+}
+
+TEST_F(FileStorageTest, RecoveryRegistrationFinishesBeforeBucketEviction) {
+    RunRecoveryRegistrationRetry(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED,
+                                 RecoveryPath::EvictionDuringRpc, true);
 }
 
 TEST_F(FileStorageTest, RecoveryBackoffStopsOnDrain) {
