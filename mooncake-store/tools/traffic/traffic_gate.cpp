@@ -142,6 +142,8 @@ bool SamePlan(const Json::Value& baseline, const Json::Value& current,
     int current_connections = 0;
     double baseline_duration = 0;
     double current_duration = 0;
+    double baseline_warmup = 0;
+    double current_warmup = 0;
     if (!NumberField(baseline, "rate_target", &baseline_rate, error) ||
         !NumberField(current, "rate_target", &current_rate, error) ||
         !BoolField(baseline, "saturate", &baseline_saturate, error) ||
@@ -149,13 +151,16 @@ bool SamePlan(const Json::Value& baseline, const Json::Value& current,
         !IntField(baseline, "connections", &baseline_connections, error) ||
         !IntField(current, "connections", &current_connections, error) ||
         !NumberField(baseline, "duration_s", &baseline_duration, error) ||
-        !NumberField(current, "duration_s", &current_duration, error)) {
+        !NumberField(current, "duration_s", &current_duration, error) ||
+        !NumberField(baseline, "warmup_s", &baseline_warmup, error) ||
+        !NumberField(current, "warmup_s", &current_warmup, error)) {
         return false;
     }
     if (baseline_saturate != current_saturate ||
         std::fabs(baseline_rate - current_rate) > 1e-6 ||
         baseline_connections != current_connections ||
-        std::fabs(baseline_duration - current_duration) > 1e-6) {
+        std::fabs(baseline_duration - current_duration) > 1e-6 ||
+        std::fabs(baseline_warmup - current_warmup) > 1e-6) {
         *error = "reports were produced by different plans";
         return false;
     }

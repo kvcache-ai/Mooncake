@@ -221,7 +221,9 @@ release gate. It reads `achieved_rps` and the `service_us` p99 from a baseline
 and a current report, and fails when throughput drops by more than
 `--max-rps-drop-pct` (default 5%) or p99 rises by more than
 `--max-p99-increase-pct` (default 10%), or when the current run had RPC or
-transport errors. It exits 0 on pass, 1 on gate failure, and 2 on bad input.
+transport errors. It rejects reports whose rate target, pacing mode, connection
+count, duration, or warmup differ. It exits 0 on pass, 1 on gate failure, and 2
+on bad input.
 
 ```bash
 ./build/mooncake-store/tools/traffic/traffic_load ... > baseline.json
