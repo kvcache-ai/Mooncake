@@ -77,6 +77,16 @@ Status SegmentManager::updateLocal(
     // reading local_desc_ without local_desc_lock_ is safe here.
     auto next = std::make_shared<SegmentDesc>(*local_desc_);
     CHECK_STATUS(mutator(*next));
+    // MLU installs this transport attribute once. Carry a publication number
+    // even when an update removes the last MLU buffer, so importers can retire
+    // its mapping. local_update_mu_ serializes the counter and the snapshot.
+    if (next->type == SegmentType::Memory) {
+        auto &attrs = std::get<MemorySegmentDesc>(next->detail).transport_attrs;
+        auto it = attrs.find(MLU);
+        if (it != attrs.end())
+            it->second = std::to_string(
+                local_desc_version_.load(std::memory_order_relaxed) + 1);
+    }
     {
         std::unique_lock<std::shared_mutex> guard(local_desc_lock_);
         local_desc_ = std::move(next);

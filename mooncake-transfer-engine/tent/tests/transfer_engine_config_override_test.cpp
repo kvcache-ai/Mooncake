@@ -29,6 +29,9 @@
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transfer_engine.h"
+#ifdef TENT_TEST_HTTP_METASTORE
+#include "tent/metastore/http.h"
+#endif
 
 #ifndef _WIN32
 #include <asio.hpp>
@@ -177,6 +180,11 @@ class TestHttpMetadataServer {
         return it->second;
     }
 
+    std::string lastPutExpectHeader() const {
+        std::lock_guard<std::mutex> lock(store_mutex_);
+        return last_put_expect_;
+    }
+
    private:
     void initServer() {
         using namespace coro_http;
@@ -220,6 +228,7 @@ class TestHttpMetadataServer {
 
                 std::lock_guard<std::mutex> lock(store_mutex_);
                 store_[key] = std::string(req.get_body());
+                last_put_expect_ = std::string(req.get_header_value("Expect"));
                 resp.set_status_and_content(status_type::ok,
                                             "metadata updated");
             });
@@ -265,7 +274,27 @@ class TestHttpMetadataServer {
     std::unique_ptr<coro_http::coro_http_server> server_;
     mutable std::mutex store_mutex_;
     std::unordered_map<std::string, std::string> store_;
+    std::string last_put_expect_;
 };
+#ifdef TENT_TEST_HTTP_METASTORE
+TEST(HttpMetaStoreTest, BufferedPutDoesNotRequest100Continue) {
+    const auto port = reserveUnusedTcpPort();
+    TestHttpMetadataServer server(port);
+    ASSERT_TRUE(server.start());
+    HttpMetaStore store;
+    ASSERT_TRUE(store.connect(buildHttpMetadataEndpoint(port)).ok());
+    for (size_t size : {size_t{32}, size_t{2 * 1024 * 1024}}) {
+        const std::string value(size, 'x');
+        ASSERT_TRUE(store.set("buffered-put", value).ok());
+        EXPECT_TRUE(server.lastPutExpectHeader().empty());
+        std::string actual;
+        ASSERT_TRUE(store.get("buffered-put", actual).ok());
+        EXPECT_EQ(actual, value);
+        EXPECT_TRUE(store.remove("buffered-put").ok());
+    }
+}
+#endif
+
 #endif
 
 TEST(TransferEngineConfigOverrideTest,
@@ -509,6 +538,16 @@ TEST(TransferEngineConfigOverrideTest,
     EXPECT_TRUE(config.get("transports/rdma/log_slice_affinity", false));
 }
 
+TEST(TransferEngineConfigOverrideTest,
+     LegacyRdmaDestDeviceAffinityEnvLoadsIntoTentConfig) {
+    EnvVarGuard guard("MC_ENABLE_DEST_DEVICE_AFFINITY", "true");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_TRUE(config.get("transports/rdma/dest_device_affinity", false));
+}
+
 // "1" is how most MC_* switches are set; setFromString() would store it as an
 // integer, which get(..., false) cannot read as a bool.
 TEST(TransferEngineConfigOverrideTest, LegacyBoolEnvAcceptsNumericValues) {
@@ -516,6 +555,8 @@ TEST(TransferEngineConfigOverrideTest, LegacyBoolEnvAcceptsNumericValues) {
         {"MC_DISABLE_GPU_DIRECT_RDMA",
          "transports/rdma/disable_gpu_direct_rdma"},
         {"MC_LOG_RDMA_SLICE_AFFINITY", "transports/rdma/log_slice_affinity"},
+        {"MC_ENABLE_DEST_DEVICE_AFFINITY",
+         "transports/rdma/dest_device_affinity"},
     };
     for (const auto& [env, key] : cases) {
         SCOPED_TRACE(env);
@@ -854,6 +895,70 @@ TEST(TransferEngineConfigOverrideTest,
 
     engine.unregisterLocalMemory(buf.data(), kBufSize);
 #endif
+}
+
+TEST(TransferEngineConfigOverrideTest, AscendEnvVarsConvertToTentConfig) {
+    EnvVarGuard timeout_guard("MC_ASCEND_TRANSFER_TIMEOUT", "4321");
+    EnvVarGuard legacy_timeout_guard("ASCEND_TRANSFER_TIMEOUT", "9999");
+    EnvVarGuard base_port_guard("MC_ASCEND_BASE_PORT", "21000");
+    EnvVarGuard legacy_port_guard("ASCEND_BASE_PORT", "22000");
+    EnvVarGuard pool_guard("MC_ASCEND_THREAD_POOL_SIZE", "8");
+    EnvVarGuard legacy_pool_guard("ASCEND_THREAD_POOL_SIZE", "4");
+    EnvVarGuard tc_guard("MC_ASCEND_RDMA_TC", "106");
+    EnvVarGuard sl_guard("MC_ASCEND_RDMA_SL", "3");
+    EnvVarGuard lcr_guard("MC_ASCEND_LOCAL_COMM_RES", R"({"version":"1.4"})");
+    EnvVarGuard grc_guard(
+        "MC_ASCEND_GLOBAL_RESOURCE_CONFIG",
+        R"({"comm_resource_config":{"protocol_desc":"roce:device"}})");
+    EnvVarGuard shmem_guard("MC_ASCEND_USE_SHMEM", "1");
+    EnvVarGuard single_seg_guard("MC_ASCEND_STANDALONE_SINGLE_SEGMENT", "true");
+    EnvVarGuard fabric_guard("MC_ASCEND_ENABLE_USE_FABRIC_MEM", "1");
+
+    Config p2p_conf;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(p2p_conf).ok());
+    EXPECT_EQ(p2p_conf.get("transports/ascend_direct/transfer_timeout_ms", 0),
+              4321);
+    EXPECT_EQ(p2p_conf.get("transports/ascend_direct/base_port", 0), 21000);
+    EXPECT_EQ(p2p_conf.get("transports/ascend_direct/thread_pool_size", 0), 8);
+    EXPECT_EQ(p2p_conf.get("transports/ascend_direct/rdma_tc", ""), "106");
+    EXPECT_EQ(p2p_conf.get("transports/ascend_direct/rdma_sl", ""), "3");
+    EXPECT_EQ(p2p_conf.get("transports/ascend_direct/local_comm_res", ""),
+              R"({"version":"1.4"})");
+    EXPECT_EQ(
+        p2p_conf.get("transports/ascend_direct/global_resource_config", ""),
+        R"({"comm_resource_config":{"protocol_desc":"roce:device"}})");
+    EXPECT_TRUE(p2p_conf.get("transports/ascend_direct/use_shmem", false));
+    EXPECT_TRUE(p2p_conf.get(
+        "transports/ascend_direct/standalone_single_segment", false));
+    EXPECT_FALSE(p2p_conf.get("transports/ascend_direct/fabric_mem", false));
+
+    Config store_conf;
+    store_conf.set("transports/ascend_direct/store_te_init", true);
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(store_conf).ok());
+    EXPECT_TRUE(store_conf.get("transports/ascend_direct/fabric_mem", false));
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     LegacyAscendEnvVarsFallbackWhenMcPrefixUnset) {
+    EnvVarGuard mc_timeout_guard("MC_ASCEND_TRANSFER_TIMEOUT", "");
+    EnvVarGuard mc_base_port_guard("MC_ASCEND_BASE_PORT", "");
+    EnvVarGuard mc_pool_guard("MC_ASCEND_THREAD_POOL_SIZE", "");
+    EnvVarGuard mc_tc_guard("MC_ASCEND_RDMA_TC", "");
+    EnvVarGuard mc_sl_guard("MC_ASCEND_RDMA_SL", "");
+    EnvVarGuard timeout_guard("ASCEND_TRANSFER_TIMEOUT", "3456");
+    EnvVarGuard base_port_guard("ASCEND_BASE_PORT", "23000");
+    EnvVarGuard pool_guard("ASCEND_THREAD_POOL_SIZE", "12");
+    EnvVarGuard tc_guard("ASCEND_RDMA_TC", "192");
+    EnvVarGuard sl_guard("ASCEND_RDMA_SL", "5");
+
+    Config conf;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(conf).ok());
+    EXPECT_EQ(conf.get("transports/ascend_direct/transfer_timeout_ms", 0),
+              3456);
+    EXPECT_EQ(conf.get("transports/ascend_direct/base_port", 0), 23000);
+    EXPECT_EQ(conf.get("transports/ascend_direct/thread_pool_size", 0), 12);
+    EXPECT_EQ(conf.get("transports/ascend_direct/rdma_tc", ""), "192");
+    EXPECT_EQ(conf.get("transports/ascend_direct/rdma_sl", ""), "5");
 }
 
 }  // namespace

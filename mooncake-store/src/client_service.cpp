@@ -11,12 +11,14 @@
 #include <csignal>
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <charconv>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <future>
 #include <iomanip>
 #include <limits>
 #if defined(__linux__)
@@ -508,9 +510,11 @@ Client::~Client() {
     if (storage_heartbeat_thread_.joinable()) {
         storage_heartbeat_thread_.join();
     }
-    if (!gather_endpoint_.empty())
+    // The heartbeat thread has drained any in-flight gather refresh.
+    if (!gather_endpoint_.empty()) {
         (void)master_client_.PublishGatherEndpoint(GetSegmentEndpoint(),
                                                    gather_endpoint_, true);
+    }
 
     leader_monitor_running_ = false;
     if (leader_monitor_thread_.joinable()) {
@@ -737,8 +741,10 @@ tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
         return std::optional<ha::HABackendSpec>{std::nullopt};
     }
 
-    auto backend_type =
-        ha::ParseHABackendType(master_server_entry.substr(0, delimiter_pos));
+    const bool redis_cluster =
+        master_server_entry.substr(0, delimiter_pos) == "redis+cluster";
+    auto backend_type = ha::ParseHABackendType(
+        redis_cluster ? "redis" : master_server_entry.substr(0, delimiter_pos));
     if (!backend_type.has_value()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -750,8 +756,11 @@ tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
 
     return std::optional<ha::HABackendSpec>{ha::HABackendSpec{
         .type = backend_type.value(),
-        .connstring = master_server_entry.substr(delimiter_pos + 3),
+        .connstring = redis_cluster
+                          ? master_server_entry
+                          : master_server_entry.substr(delimiter_pos + 3),
         .cluster_namespace = "",
+        .redis_read_only = backend_type.value() == ha::HABackendType::REDIS,
     }};
 }
 
@@ -996,10 +1005,15 @@ ErrorCode Client::InitTransferEngine(
     }
 
     if (protocol == "ascend" || protocol == "ubshmem") {
-        const char* ascend_use_fabric_mem =
-            std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
+        const char* ascend_use_fabric_mem = getEnvWithFallback(
+            "MC_ASCEND_ENABLE_USE_FABRIC_MEM", "ASCEND_ENABLE_USE_FABRIC_MEM");
         if (ascend_use_fabric_mem) {
-            globalConfig().ascend_use_fabric_mem = true;
+            std::string val(ascend_use_fabric_mem);
+            std::transform(val.begin(), val.end(), val.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (val != "0" && val != "false" && val != "off" && val != "no") {
+                globalConfig().ascend_use_fabric_mem = true;
+            }
         }
     }
     if (protocol == "sunrise_link") {
@@ -1875,7 +1889,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
             const auto& desc = replica.get_dfs_descriptor();
             dfs_read_requests.push_back(
-                DfsReadRequest{key, desc, slices_it->second});
+                DfsReadRequest{.key = key,
+                               .descriptor = desc,
+                               .slices = slices_it->second,
+                               .source_replica_id = replica.id});
             dfs_read_indices.push_back(i);
             dfs_read_replicas.push_back(replica);
             continue;
@@ -4121,13 +4138,18 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
                         transfer_engine_, store::GatherReadOptions{},
                         GetSegmentEndpoint());
                     service->start("0.0.0.0");
-                    gather_endpoint_ = buildHostNameWithPort(
+                    auto gather_endpoint = buildHostNameWithPort(
                         getHostNameWithoutPort(
                             transfer_engine_->getLocalIpAndPort()),
                         service->port());
-                    gather_service_ = std::move(service);
+                    // Let the initial publish finish before heartbeats can
+                    // see the endpoint and schedule a refresh.
                     (void)master_client_.PublishGatherEndpoint(
-                        GetSegmentEndpoint(), gather_endpoint_);
+                        GetSegmentEndpoint(), gather_endpoint);
+                    gather_service_ = std::move(service);
+                    std::lock_guard<std::mutex> endpoint_lock(
+                        gather_endpoint_mutex_);
+                    gather_endpoint_ = std::move(gather_endpoint);
                 }
                 gather_service_->addSource(const_cast<void*>(buffer), size);
             } catch (const std::exception& e) {
@@ -4608,12 +4630,20 @@ tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
     return master_client_.CreateMoveTask(key, tenant_id, source, target);
 }
 
+bool Client::IsTaskCancellationRequested(const UUID* task_id) {
+    if (!task_id) {
+        return false;
+    }
+    // A failed check is best effort, including calls to older masters.
+    return master_client_.IsTaskCancellationRequested(*task_id).value_or(false);
+}
+
 tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
     const std::string& key, const std::string& action_name,
     std::function<tl::expected<void, ErrorCode>()> end_fn,
     std::function<tl::expected<void, ErrorCode>()> revoke_fn,
     const Replica::Descriptor& source,
-    const std::vector<Replica::Descriptor>& targets) {
+    const std::vector<Replica::Descriptor>& targets, const UUID* task_id) {
     auto revoke_lambda = [&]() {
         auto revoke_result = revoke_fn();
         if (!revoke_result.has_value()) {
@@ -4622,43 +4652,84 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
                          << ", error_code=" << revoke_result.error();
         }
     };
+    auto cancel_and_revoke = [&]() -> tl::expected<void, ErrorCode> {
+        auto result = revoke_fn();
+        if (!result &&
+            result.error() != ErrorCode::OBJECT_NO_REPLICATION_TASK &&
+            result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(WARNING) << "action=replica_" << action_name
+                         << "_cancel_revoke_failed, key=" << key
+                         << ", error_code=" << result.error();
+            // Do not report a successful cancellation, or retry the transfer,
+            // when the master's cleanup has not been confirmed.
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        return tl::unexpected(ErrorCode::TASK_CANCELED);
+    };
 
-    // currently only memory source replica is supported
-    if (!source.is_memory_replica()) {
-        LOG(ERROR) << "action=replica_" << action_name << "_failed"
-                   << ", key=" << key << ", error=invalid_replica_type";
-        revoke_lambda();
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    std::vector<Slice> slices;
+    if (!targets.empty()) {
+        // currently only memory source replica is supported
+        if (!source.is_memory_replica()) {
+            LOG(ERROR) << "action=replica_" << action_name << "_failed"
+                       << ", key=" << key << ", error=invalid_replica_type";
+            revoke_lambda();
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        // Validate that source replica is in local memory
+        if (!IsReplicaOnLocalMemory(source)) {
+            LOG(ERROR) << "action=replica_" << action_name << "_failed"
+                       << ", key=" << key
+                       << ", error=source_replica_not_in_local_memory";
+            revoke_lambda();
+            return tl::unexpected(ErrorCode::REPLICA_NOT_IN_LOCAL_MEMORY);
+        }
+
+        // Split the source replica into slices for transfer
+        // This avoids data copy because the source replica is already in memory
+        const auto& buffer_descriptor =
+            source.get_memory_descriptor().buffer_descriptor;
+        void* buffer =
+            reinterpret_cast<void*>(buffer_descriptor.buffer_address_);
+        slices = split_into_slices(buffer, buffer_descriptor.size_);
     }
 
-    // Validate that source replica is in local memory
-    if (!IsReplicaOnLocalMemory(source)) {
-        LOG(ERROR) << "action=replica_" << action_name << "_failed"
-                   << ", key=" << key
-                   << ", error=source_replica_not_in_local_memory";
-        revoke_lambda();
-        return tl::unexpected(ErrorCode::REPLICA_NOT_IN_LOCAL_MEMORY);
-    }
-
-    // Split the source replica into slices for transfer
-    // This avoids data copy because the source replica is already in memory
-    const auto& buffer_descriptor =
-        source.get_memory_descriptor().buffer_descriptor;
-    void* buffer = reinterpret_cast<void*>(buffer_descriptor.buffer_address_);
-    auto slices = split_into_slices(buffer, buffer_descriptor.size_);
-
-    // Transfer to each target
     for (const auto& target : targets) {
-        if (TransferWrite(target, slices, TransferIntent::kMigration) !=
-            ErrorCode::OK) {
+        if (IsTaskCancellationRequested(task_id)) {
+            return cancel_and_revoke();
+        }
+        if (task_id && slices.size() > 1 && target.is_memory_replica()) {
+            uint64_t offset = 0;
+            std::vector<Slice> chunk(1);
+            for (const auto& slice : slices) {
+                if (offset != 0 && IsTaskCancellationRequested(task_id)) {
+                    return cancel_and_revoke();
+                }
+                chunk.front() = slice;
+                if (TransferWriteRange(target, chunk, offset,
+                                       TransferIntent::kMigration) !=
+                    ErrorCode::OK) {
+                    revoke_lambda();
+                    return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                }
+                offset += slice.size;
+            }
+        } else if (TransferWrite(target, slices, TransferIntent::kMigration) !=
+                   ErrorCode::OK) {
             revoke_lambda();
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
     }
 
-    // Call end function to finalize
+    // A cancellation observed before commit can safely revoke the allocation.
+    if (IsTaskCancellationRequested(task_id)) {
+        return cancel_and_revoke();
+    }
     auto end_result = end_fn();
     if (!end_result.has_value()) {
+        // Start creates a replication task even when the target already
+        // exists, so a failed end must release the source reservation.
         revoke_lambda();
         return tl::unexpected(end_result.error());
     }
@@ -4682,7 +4753,10 @@ tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& tenant_id,
     const std::string& source, const std::vector<std::string>& targets,
     const UUID& dynamic_replication_lease_id,
-    uint64_t dynamic_replication_version_epoch) {
+    uint64_t dynamic_replication_version_epoch, const UUID* task_id) {
+    if (IsTaskCancellationRequested(task_id)) {
+        return tl::unexpected(ErrorCode::TASK_CANCELED);
+    }
     LOG(INFO) << "action=replica_copy_start" << ", key=" << key
               << ", targets_count=" << targets.size();
 
@@ -4709,25 +4783,6 @@ tl::expected<void, ErrorCode> Client::Copy(
     }
 
     const auto& response = start_result.value();
-    if (response.targets.empty()) {
-        LOG(INFO) << "action=replica_copy_skipped" << ", key=" << key
-                  << ", info=target_replicas_already_exist";
-        // Target replicas already exist, consider it success
-        auto copy_end_result =
-            dynamic_replication_lease_id == UUID{}
-                ? master_client_.CopyEnd(key, tenant_id)
-                : master_client_.DynamicReplicaCopyEnd(
-                      key, tenant_id, dynamic_replication_lease_id,
-                      dynamic_replication_version_epoch);
-        if (!copy_end_result.has_value()) {
-            ErrorCode error = copy_end_result.error();
-            LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
-                       << ", error=copy_end_failed" << ", error_code=" << error;
-            return tl::unexpected(error);
-        }
-        return {};
-    }
-
     auto copy_end = [&]() {
         return dynamic_replication_lease_id == UUID{}
                    ? master_client_.CopyEnd(key, tenant_id)
@@ -4742,8 +4797,9 @@ tl::expected<void, ErrorCode> Client::Copy(
                          key, tenant_id, dynamic_replication_lease_id,
                          dynamic_replication_version_epoch);
     };
-    auto result = ExecuteReplicaTransfer(key, "copy", copy_end, copy_revoke,
-                                         response.source, response.targets);
+    auto result =
+        ExecuteReplicaTransfer(key, "copy", copy_end, copy_revoke,
+                               response.source, response.targets, task_id);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_copy_success" << ", key=" << key
@@ -4762,7 +4818,11 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
 tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& tenant_id,
                                            const std::string& source,
-                                           const std::string& target) {
+                                           const std::string& target,
+                                           const UUID* task_id) {
+    if (IsTaskCancellationRequested(task_id)) {
+        return tl::unexpected(ErrorCode::TASK_CANCELED);
+    }
     LOG(INFO) << "action=replica_move_start" << ", key=" << key
               << ", source_segment=" << source << ", target_segment=" << target;
 
@@ -4779,27 +4839,18 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     }
 
     const auto& response = move_start_result.value();
-    if (!response.target.has_value()) {
+    std::vector<Replica::Descriptor> targets;
+    if (response.target) {
+        targets.push_back(*response.target);
+    } else {
         LOG(INFO) << "action=replica_move_skipped" << ", key=" << key
                   << ", info=target_replica_already_exists";
-        // Target already exists, consider it success
-        auto move_end_result = master_client_.MoveEnd(key, tenant_id);
-        if (!move_end_result.has_value()) {
-            (void)master_client_.MoveRevoke(key, tenant_id);
-            ErrorCode error = move_end_result.error();
-            LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
-                       << ", error=move_end_failed" << ", error_code=" << error;
-            return tl::unexpected(error);
-        }
-        return {};
     }
-
-    std::vector<Replica::Descriptor> targets = {response.target.value()};
 
     auto result = ExecuteReplicaTransfer(
         key, "move", [&]() { return master_client_.MoveEnd(key, tenant_id); },
         [&]() { return master_client_.MoveRevoke(key, tenant_id); },
-        response.source, targets);
+        response.source, targets, task_id);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_move_success" << ", key=" << key
@@ -4808,6 +4859,39 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     }
 
     return result;
+}
+
+tl::expected<UUID, ErrorCode> Client::CreateDrainJob(
+    const CreateDrainJobRequest& request) {
+    return master_client_.CreateDrainJob(request);
+}
+
+tl::expected<UUID, ErrorCode> Client::CreateTimedDrainJob(
+    const CreateDrainJobRequest& request, uint64_t timeout_ms) {
+    return master_client_.CreateTimedDrainJob(request, timeout_ms);
+}
+
+tl::expected<QueryJobResponse, ErrorCode> Client::QueryDrainJob(
+    const UUID& job_id) {
+    return master_client_.QueryDrainJob(job_id);
+}
+
+tl::expected<void, ErrorCode> Client::CancelDrainJob(const UUID& job_id) {
+    return master_client_.CancelDrainJob(job_id);
+}
+
+tl::expected<ListDrainJobsResponse, ErrorCode> Client::ListDrainJobs(
+    const DrainJobListRequest& request) {
+    return master_client_.ListDrainJobs(request);
+}
+
+tl::expected<ListTasksResponse, ErrorCode> Client::ListTasks(
+    const TaskListRequest& request) {
+    return master_client_.ListTasks(request);
+}
+
+tl::expected<void, ErrorCode> Client::CancelTask(const UUID& task_id) {
+    return master_client_.CancelTask(task_id);
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> Client::QueryTask(
@@ -5009,13 +5093,13 @@ std::optional<TransferFuture> Client::SubmitRangeRead(
 
 std::optional<TransferFuture> Client::SubmitRangeWrite(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
-    uint64_t dst_offset) {
+    uint64_t dst_offset, TransferIntent intent) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return std::nullopt;
     }
-    return transfer_submitter_->submitRangeWrite(
-        replica_descriptor, slices, dst_offset, TransferIntent::kUnspecified);
+    return transfer_submitter_->submitRangeWrite(replica_descriptor, slices,
+                                                 dst_offset, intent);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
@@ -5306,8 +5390,9 @@ ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
 
 ErrorCode Client::TransferWriteRange(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
-    uint64_t dst_offset) {
-    auto future = SubmitRangeWrite(replica_descriptor, slices, dst_offset);
+    uint64_t dst_offset, TransferIntent intent) {
+    auto future =
+        SubmitRangeWrite(replica_descriptor, slices, dst_offset, intent);
     if (!future) {
         LOG(ERROR) << "Failed to submit range write operation";
         return ErrorCode::TRANSFER_FAIL;
@@ -5370,7 +5455,11 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
 
     auto* dfs_metric = GetDfsMetricPtr();
     const auto& desc = replica_descriptor.get_dfs_descriptor();
-    std::vector<DfsReadRequest> requests{DfsReadRequest{key, desc, slices}};
+    std::vector<DfsReadRequest> requests{
+        DfsReadRequest{.key = key,
+                       .descriptor = desc,
+                       .slices = slices,
+                       .source_replica_id = replica_descriptor.id}};
     const auto read_start = std::chrono::steady_clock::now();
     auto results = dfs_storage_backend_->BatchRead(requests);
     const auto read_latency_us = elapsed_us_since(read_start);
@@ -5485,7 +5574,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchReadFileReplicaRanges(
                                               replicas[i].get_dfs_descriptor(),
                                               {windows[i]},
                                               value_offsets[i],
-                                              true});
+                                              true,
+                                              replicas[i].id});
         dfs_indexes.push_back(i);
         results[i] = {};
     }
@@ -5602,10 +5692,10 @@ void Client::ExecuteTask(const ClientTask& client_task) {
                 const UUID dynamic_lease_id{
                     payload.dynamic_replication_lease_id_high,
                     payload.dynamic_replication_lease_id_low};
-                auto copy_result =
-                    Copy(payload.key, payload.tenant_id, payload.source,
-                         payload.targets, dynamic_lease_id,
-                         payload.dynamic_replication_version_epoch);
+                auto copy_result = Copy(
+                    payload.key, payload.tenant_id, payload.source,
+                    payload.targets, dynamic_lease_id,
+                    payload.dynamic_replication_version_epoch, &assignment.id);
                 if (copy_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
@@ -5616,8 +5706,9 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_MOVE: {
                 ReplicaMovePayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto move_result = Move(payload.key, payload.tenant_id,
-                                        payload.source, payload.target);
+                auto move_result =
+                    Move(payload.key, payload.tenant_id, payload.source,
+                         payload.target, &assignment.id);
                 if (move_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
@@ -5640,18 +5731,36 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         result = ErrorCode::INTERNAL_ERROR;
     }
 
-    if (result == ErrorCode::OK) {
-        TaskCompleteRequest complete_request;
-        complete_request.id = assignment.id;
-        complete_request.status = TaskStatus::SUCCESS;
-        complete_request.message = "Task completed successfully";
-        auto complete_result =
-            master_client_.MarkTaskToComplete(complete_request);
-        if (!complete_result.has_value()) {
+    auto report_completion = [&](const TaskCompleteRequest& request) {
+        for (;;) {
+            auto completion = master_client_.MarkTaskToComplete(request);
+            if (completion) {
+                return;
+            }
             LOG(WARNING) << "action=task_complete_failed"
                          << ", task_id=" << assignment.id
-                         << ", error_code=" << complete_result.error();
+                         << ", error_code=" << completion.error();
+            if (!task_running_.load() ||
+                (completion.error() != ErrorCode::RPC_FAIL &&
+                 completion.error() != ErrorCode::RPC_TIMEOUT &&
+                 completion.error() !=
+                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS)) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
+    };
+
+    if (result == ErrorCode::OK || result == ErrorCode::TASK_CANCELED) {
+        TaskCompleteRequest complete_request;
+        complete_request.id = assignment.id;
+        complete_request.status = result == ErrorCode::OK
+                                      ? TaskStatus::SUCCESS
+                                      : TaskStatus::CANCELED;
+        complete_request.message = result == ErrorCode::OK
+                                       ? "Task completed successfully"
+                                       : "Task canceled";
+        report_completion(complete_request);
     } else {
         uint32_t current_retry_count = client_task.retry_count;
         // Only retry on allocation failures (NO_AVAILABLE_HANDLE)
@@ -5691,13 +5800,7 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             complete_request.message =
                 toString(result) + " (max retries reached: " +
                 std::to_string(assignment.max_retry_attempts) + ")";
-            auto complete_result =
-                master_client_.MarkTaskToComplete(complete_request);
-            if (!complete_result.has_value()) {
-                LOG(WARNING) << "action=task_complete_failed"
-                             << ", task_id=" << assignment.id
-                             << ", error_code=" << complete_result.error();
-            }
+            report_completion(complete_request);
         }
     }
 }
@@ -5766,9 +5869,38 @@ void Client::StorageHeartbeatThreadMain() {
         // SEGMENT_NOT_FOUND, which also triggers ScanMeta to
         // re-register offloaded object metadata.
     };
-    // Use another thread to remount segments to avoid blocking the ping
-    // thread
+    // Remounts and metadata retries share one slot.
     std::future<void> remount_segment_future;
+    std::atomic<bool> gather_refresh_done{true};
+    std::thread gather_refresh_thread;
+
+    auto retry_metadata = [this]() {
+        auto metadata = transfer_engine_->getMetadata();
+        if (!metadata) return;
+
+        if (segment_desc_publish_pending_.load()) {
+            int rc = metadata->updateLocalSegmentDesc();
+            if (rc != 0) {
+                LOG(ERROR) << "Retry: failed to re-publish segment "
+                           << "descriptor to metadata server, rc=" << rc;
+            } else {
+                LOG(INFO) << "Retry: successfully re-published segment "
+                          << "descriptor to metadata server";
+                segment_desc_publish_pending_.store(false);
+            }
+        }
+        if (rpc_meta_publish_pending_.load()) {
+            int rc = metadata->rePublishRpcMetaEntry(local_hostname_);
+            if (rc != 0) {
+                LOG(ERROR) << "Retry: failed to re-publish RPC "
+                           << "meta entry to metadata server, rc=" << rc;
+            } else {
+                LOG(INFO) << "Retry: successfully re-published "
+                          << "RPC meta entry to metadata server";
+                rpc_meta_publish_pending_.store(false);
+            }
+        }
+    };
 
     while (storage_heartbeat_running_.load()) {
         // Join the remount segment thread if it is ready
@@ -5777,22 +5909,38 @@ void Client::StorageHeartbeatThreadMain() {
                 std::future_status::ready) {
             remount_segment_future = std::future<void>();
         }
-
         auto ping_result = metrics_
                                ? metrics_->master_heartbeat_metric.ObservePing(
                                      [this] { return master_client_.Ping(); })
                                : master_client_.Ping();
         if (ping_result) {
-            // Ephemeral gather discovery survives Master restart/failover
-            // through the existing owner heartbeat, not snapshot metadata.
-            std::string gather_endpoint;
-            {
-                std::lock_guard lock(mounted_segments_mutex_);
-                gather_endpoint = gather_endpoint_;
+            // Skip refreshes while a publication is still in flight.
+            if (gather_refresh_done.load()) {
+                if (gather_refresh_thread.joinable()) {
+                    gather_refresh_thread.join();
+                }
+                std::string endpoint;
+                {
+                    std::lock_guard<std::mutex> lock(gather_endpoint_mutex_);
+                    endpoint = gather_endpoint_;
+                }
+                if (!endpoint.empty()) {
+                    gather_refresh_done.store(false);
+                    gather_refresh_thread =
+                        std::thread([this, endpoint = std::move(endpoint),
+                                     &gather_refresh_done] {
+                            try {
+                                (void)master_client_.PublishGatherEndpoint(
+                                    GetSegmentEndpoint(), endpoint);
+                            } catch (const std::exception& e) {
+                                LOG(WARNING)
+                                    << "Failed to refresh gather endpoint: "
+                                    << e.what();
+                            }
+                            gather_refresh_done.store(true);
+                        });
+                }
             }
-            if (!gather_endpoint.empty())
-                (void)master_client_.PublishGatherEndpoint(GetSegmentEndpoint(),
-                                                           gather_endpoint);
             // Reset ping failure count
             ping_fail_count = 0;
             last_ping_success_.store(true);
@@ -5802,41 +5950,13 @@ void Client::StorageHeartbeatThreadMain() {
                 // Ensure at most one remount segment thread is running
                 remount_segment_future =
                     std::async(std::launch::async, remount_segment);
-            } else if (segment_desc_publish_pending_.load() &&
+            } else if ((segment_desc_publish_pending_.load() ||
+                        rpc_meta_publish_pending_.load()) &&
                        !remount_segment_future.valid()) {
-                // Previous remount succeeded but updateLocalSegmentDesc()
-                // failed (e.g. transient HTTP error).  Retry it directly
-                // without re-running ReMountSegment.
-                auto metadata = transfer_engine_->getMetadata();
-                if (metadata) {
-                    int rc = metadata->updateLocalSegmentDesc();
-                    if (rc != 0) {
-                        LOG(ERROR)
-                            << "Retry: failed to re-publish segment "
-                            << "descriptor to metadata server, rc=" << rc;
-                    } else {
-                        LOG(INFO) << "Retry: successfully re-published "
-                                  << "segment descriptor to metadata server";
-                        segment_desc_publish_pending_.store(false);
-                    }
-                }
-            } else if (rpc_meta_publish_pending_.load() &&
-                       !remount_segment_future.valid()) {
-                // Previous remount succeeded but rePublishRpcMetaEntry()
-                // failed.  Retry it directly.
-                auto metadata = transfer_engine_->getMetadata();
-                if (metadata) {
-                    int rc = metadata->rePublishRpcMetaEntry(local_hostname_);
-                    if (rc != 0) {
-                        LOG(ERROR)
-                            << "Retry: failed to re-publish RPC "
-                            << "meta entry to metadata server, rc=" << rc;
-                    } else {
-                        LOG(INFO) << "Retry: successfully re-published "
-                                  << "RPC meta entry to metadata server";
-                        rpc_meta_publish_pending_.store(false);
-                    }
-                }
+                // Serialize retries with remount so an older attempt cannot
+                // clear the pending status of a newer publication.
+                remount_segment_future =
+                    std::async(std::launch::async, retry_metadata);
             }
 
             std::this_thread::sleep_for(
@@ -5903,7 +6023,10 @@ void Client::StorageHeartbeatThreadMain() {
             ping_fail_count = 0;
         }
     }
-    // Explicitly wait for the remount segment thread to finish
+    if (gather_refresh_thread.joinable()) {
+        gather_refresh_thread.join();
+    }
+    // Finish remounts and metadata retries before destroying the client.
     if (remount_segment_future.valid()) {
         remount_segment_future.wait();
     }

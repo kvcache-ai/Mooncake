@@ -159,6 +159,10 @@ impl SuspectRuntimeCache {
         self.suspects.contains_key(runtime)
     }
 
+    pub(crate) fn clear(&mut self, runtime: &ClientRuntimeId) {
+        self.suspects.remove(runtime);
+    }
+
     pub(crate) fn reconcile_with_leases(&mut self, leases: &[ClientLease]) {
         let now = Instant::now();
         self.suspects.retain(|runtime, entry| {
@@ -798,6 +802,7 @@ struct StorageOwnerState {
     pending_evictions: Mutex<BTreeMap<AllocationIdentity, PendingEviction>>,
     pending_deletes: Mutex<PendingDeleteQueue>,
     pending_cold_deletes: Mutex<PendingColdDeleteQueue>,
+    pending_delete_gc_cursors: Mutex<BTreeMap<Option<String>, ObjectKey>>,
     pending_delete_next_due_at_ms: AtomicU64,
     pending_publication_authority_retry: Mutex<PendingPublicationAuthorityRetry>,
     // Bounded candidate reconciliation is independent from owner-wide audit.

@@ -84,10 +84,12 @@ static inline int bindToSocket(int socket_id) {
     return 0;
 }
 
+// Callers subtract two timestamps to measure elapsed time, so the clock must
+// not follow wall-clock steps.
 static inline int64_t getCurrentTimeInNano() {
     const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
     struct timespec ts;
-    if (clock_gettime(CLOCK_REALTIME, &ts)) {
+    if (clock_gettime(CLOCK_MONOTONIC, &ts)) {
         PLOG(ERROR) << "getCurrentTimeInNano: clock_gettime failed";
         return -1;
     }

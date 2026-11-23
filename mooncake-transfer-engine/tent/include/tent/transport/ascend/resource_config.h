@@ -29,6 +29,8 @@ namespace tent {
 
 constexpr int32_t kAscendDefaultTransferTimeoutMs = 10000;
 constexpr int32_t kAscendDefaultBasePort = 20000;
+constexpr size_t kAscendDefaultThreadPoolSize = 16;
+constexpr size_t kAscendMaxThreadPoolSize = 32;
 // Disconnect timeout used when aborting the HIXL sessions of a timed-out route.
 // A caller-judged timeout must Disconnect the peer: HIXL never reports TIMEOUT
 // itself and has no cancel API, and Disconnect is what aborts the in-flight
@@ -41,9 +43,12 @@ constexpr const char* kHixlNamesAttr = "hixl_names";
 struct AscendDirectOptions {
     int32_t transfer_timeout_ms = kAscendDefaultTransferTimeoutMs;
     int32_t base_port = kAscendDefaultBasePort;
+    size_t thread_pool_size = kAscendDefaultThreadPoolSize;
     bool agent_mode = false;
     bool store_te_init = false;
     bool use_fabric_mem = false;
+    bool use_shmem = false;
+    bool standalone_single_segment = false;
     bool roce_mode = false;
     std::string rdma_tc;
     std::string rdma_sl;
@@ -51,7 +56,9 @@ struct AscendDirectOptions {
     std::string global_resource_config;
 };
 
+const char* GetAscendEnv(const char* primary, const char* fallback = nullptr);
 bool ParseEnvEnabled(const char* name);
+bool ParseEnvEnabled(const char* primary, const char* fallback);
 
 // TE support for configuring HIXL's comm_resource_config.nic_topo_path in the
 // (already role-resolved) GlobalResourceConfig: fills it from the custom
@@ -106,6 +113,14 @@ class HixlNameResolver {
     // HIXL engine name that owns dest_addr, or an empty string when the
     // segment publishes no engine name.
     const std::string& Resolve(uint64_t dest_addr) const;
+
+    // Endpoint indices whose buffers cover the whole [dest, dest+length).
+    // Sorted and unique. One published name yields {0}. Empty means the caller
+    // should use Resolve() for the legacy point match.
+    std::vector<size_t> CoveringNameIndices(uint64_t dest_addr,
+                                            size_t length) const;
+
+    const std::string& NameAt(size_t index) const;
 
    private:
     struct BufferRange {

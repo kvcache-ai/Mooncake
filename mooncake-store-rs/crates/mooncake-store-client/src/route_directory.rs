@@ -213,6 +213,10 @@ impl RouteMembershipProvider for ClientRouteMembership {
             .lock()
             .mark(runtime, quarantine_until, observed);
     }
+
+    fn clear_suspect(&self, runtime: &ClientRuntimeId) {
+        self.suspect_runtime_cache.lock().clear(runtime);
+    }
 }
 
 struct ClientRouteMetricsSink;

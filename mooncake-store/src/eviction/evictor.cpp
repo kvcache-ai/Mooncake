@@ -12,13 +12,14 @@
 #include <vector>
 
 #include "eviction/range_executor.h"
+#include "types.h"
 
 namespace mooncake {
 namespace eviction {
 namespace {
 
 constexpr uint64_t kKeysPerWorker = 16'000'000;
-constexpr uint32_t kMaxEvictionWorkers = 64;
+constexpr uint32_t kMaxEvictionWorkers = MAX_EVICTION_WORKER_THREADS;
 
 // A ratio above 1 asks for every eligible object; one that is negative or not
 // a number asks for none.

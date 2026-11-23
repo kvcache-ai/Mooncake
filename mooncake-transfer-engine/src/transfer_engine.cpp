@@ -32,6 +32,16 @@ bool isTransferEngineEnvEnabled(const char* name) {
            std::strcmp(value, "off") != 0 && std::strcmp(value, "no") != 0;
 }
 
+// Producer events are only ordered by TENT transports; the classic engine
+// would silently drop the dependency.
+template <typename Requests>
+bool hasProducerEvent(const Requests& entries) {
+    for (const auto& entry : entries) {
+        if (entry.producer_event) return true;
+    }
+    return false;
+}
+
 }  // namespace
 }  // namespace mooncake
 
@@ -212,17 +222,23 @@ int TransferEngine::freeSharedMemory(void* addr) {
 
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    if (hasProducerEvent(entries))
+        return Status::NotImplemented("producer_event requires TENT");
     return impl_->submitTransfer(batch_id, entries);
 }
 
 Status TransferEngine::submitScatterTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    if (hasProducerEvent(entries))
+        return Status::NotImplemented("producer_event requires TENT");
     return impl_->submitTransfer(batch_id, entries);
 }
 
 Status TransferEngine::submitTransferWithNotify(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     TransferMetadata::NotifyDesc notify_msg) {
+    if (hasProducerEvent(entries))
+        return Status::NotImplemented("producer_event requires TENT");
     return impl_->submitTransferWithNotify(batch_id, entries, notify_msg);
 }
 
@@ -243,12 +259,16 @@ int TransferEngine::mp_unregisterLocalMemory(
 Status TransferEngine::mp_submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     std::string& proto) {
+    if (hasProducerEvent(entries))
+        return Status::NotImplemented("producer_event requires TENT");
     return impl_->mp_submitTransfer(batch_id, entries, proto);
 }
 
 Status TransferEngine::mp_submitTransferWithNotify(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     TransferMetadata::NotifyDesc notify_msg, std::string& proto) {
+    if (hasProducerEvent(entries))
+        return Status::NotImplemented("producer_event requires TENT");
     return impl_->mp_submitTransferWithNotify(batch_id, entries, notify_msg,
                                               proto);
 }
@@ -580,6 +600,7 @@ Status TransferEngine::submitScatterTransfer(
             req.target_offset = item.target_offset;
             req.transport_hint =
                 mooncake::tent::c_to_transport_hint(item.transport_hint);
+            req.producer_event = item.producer_event;
             requests.push_back(req);
         }
         auto status = impl_tent_->submitTransferRequiringPostSubmitCancellation(
@@ -589,6 +610,8 @@ Status TransferEngine::submitScatterTransfer(
             return Status::NotImplemented(status.message());
         return Status::Context(status.ToString());
     }
+    if (hasProducerEvent(entries))
+        return Status::NotImplemented("producer_event requires TENT");
     return impl_->submitTransfer(batch_id, entries);
 }
 
@@ -735,6 +758,10 @@ int TransferEngine::init(const std::string& metadata_conn_string,
         // Store creates the native engine itself.
         if (globalConfig().ascend_agent_mode) {
             config->set("transports/ascend_direct/agent_mode", true);
+        }
+        if (globalConfig().ascend_standalone_single_segment) {
+            config->set("transports/ascend_direct/standalone_single_segment",
+                        true);
         }
         if (globalConfig().ascend_store_te_init) {
             config->set("transports/ascend_direct/store_te_init", true);
@@ -980,6 +1007,7 @@ Status TransferEngine::submitTransfer(
             req.transport_hint =
                 mooncake::tent::c_to_transport_hint(item.transport_hint);
             req.intent_type = *intent;
+            req.producer_event = item.producer_event;
             requests.push_back(req);
         }
         auto status = impl_tent_->submitTransfer(batch_id, requests);
@@ -988,6 +1016,8 @@ Status TransferEngine::submitTransfer(
         else
             return Status::OK();
     } else {
+        if (hasProducerEvent(entries))
+            return Status::NotImplemented("producer_event requires TENT");
         return impl_->submitTransfer(batch_id, entries);
     }
 }
@@ -1012,6 +1042,7 @@ Status TransferEngine::submitTransferWithNotify(
             req.transport_hint =
                 mooncake::tent::c_to_transport_hint(item.transport_hint);
             req.intent_type = *intent;
+            req.producer_event = item.producer_event;
             requests.push_back(req);
         }
         mooncake::tent::Notification notifi;
@@ -1023,6 +1054,8 @@ Status TransferEngine::submitTransferWithNotify(
         else
             return Status::OK();
     } else {
+        if (hasProducerEvent(entries))
+            return Status::NotImplemented("producer_event requires TENT");
         return impl_->submitTransferWithNotify(batch_id, entries, notify_msg);
     }
 }

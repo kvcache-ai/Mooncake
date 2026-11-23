@@ -5,6 +5,25 @@
 namespace mooncake::test {
 namespace {
 
+TEST(RedisHaConfigTest, ReplicaCountSurvivesAllConfigAdapters) {
+    MasterConfig master{};
+    EXPECT_EQ(0u, master.ha_redis_expected_replicas_per_shard);
+    EXPECT_EQ(0u, MasterServiceConfigBuilder()
+                      .build()
+                      .ha_redis_expected_replicas_per_shard);
+    master.ha_redis_expected_replicas_per_shard = 2;
+    master.ha_backend_type = "redis";
+    master.ha_backend_connstring = "redis+cluster://localhost:6379";
+    MasterServiceSupervisorConfig supervisor(master);
+    EXPECT_EQ(2u, supervisor.ha_redis_expected_replicas_per_shard);
+    WrappedMasterServiceConfig wrapped(master, 0);
+    EXPECT_EQ(2u, wrapped.ha_redis_expected_replicas_per_shard);
+    auto service = MasterServiceConfigBuilder()
+                       .set_ha_redis_expected_replicas_per_shard(2)
+                       .build();
+    EXPECT_EQ(2u, service.ha_redis_expected_replicas_per_shard);
+}
+
 TEST(ClientLivenessConfigTest, UsesIndependentDefaultsWhenNothingIsSet) {
     const auto resolved = ResolveClientLivenessConfig({}, {});
 
