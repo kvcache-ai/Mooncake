@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -50,8 +51,8 @@ struct HixlTask {
     volatile TransferStatusEnum status_word = TransferStatusEnum::PENDING;
     volatile size_t transferred_bytes = 0;
     void* req_handle = nullptr;
-    // Remote groups are indexed by their first task before TransferAsync.
-    // Local copies use their native handle. Published with req_handle.
+    // The first task indexes the group before native submission.
+    // Published with req_handle.
     void* group_key = nullptr;
     uint64_t batch_size = 0;
     std::string remote_hixl;
@@ -135,7 +136,7 @@ class AscendDirectTransport : public Transport {
     struct GroupState {
         TransferStatusEnum status = TransferStatusEnum::PENDING;
         TransferStatusEnum failure = PENDING;
-        uint64_t submission = 0;
+        HixlTask* leader = nullptr;  // Published after remote submission.
         int remaining = 0;
         size_t engine_idx = 0;
         std::string remote;
@@ -145,6 +146,7 @@ class AscendDirectTransport : public Transport {
         // collapse the per-task polls of one request into one query per short
         // window. Must not come from CLOCK_REALTIME.
         int64_t last_poll_ns = 0;
+        bool polling = false;
     };
 
     Status initEngines();
@@ -179,7 +181,7 @@ class AscendDirectTransport : public Transport {
     bool applyGroupStatus(HixlTask& task, GroupState& group);
     bool finishTaskLocked(HixlTask& task, void** local_release_handle,
                           size_t* local_release_engine);
-    void completePolledTask(HixlTask& task);
+    void completePolledTask(HixlTask& task, bool finished_query = false);
     void releaseInflight(int n = 1);
 
     friend class AscendDirectTransportTestPeer;
@@ -214,7 +216,8 @@ class AscendDirectTransport : public Transport {
     bool fail_group_publish_{false};
 
     std::mutex req_mutex_;
-    uint64_t last_remote_submission_ = 0;
+    std::condition_variable route_cv_;
+    std::set<std::pair<size_t, std::string>> disconnecting_;
     std::unordered_map<void*, GroupState> groups_;
 
     std::mutex inflight_mu_;

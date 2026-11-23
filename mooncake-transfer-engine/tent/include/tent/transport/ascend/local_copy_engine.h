@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "tent/common/status.h"
@@ -42,7 +43,8 @@ class LocalCopyEngine {
     // spread over several streams does not issue one stream at a time.
     using TaskRunner = std::function<void(std::function<void()>)>;
 
-    LocalCopyEngine() = default;
+    explicit LocalCopyEngine(std::function<void()> release_inflight)
+        : release_inflight_(std::move(release_inflight)) {}
     ~LocalCopyEngine();
 
     LocalCopyEngine(const LocalCopyEngine&) = delete;
@@ -70,6 +72,7 @@ class LocalCopyEngine {
         void* host_flags = nullptr;
         size_t stream_count = 0;
         TransferStatusEnum failure = PENDING;
+        bool counted = false;
     };
 
     class ContextGuard {
@@ -85,6 +88,7 @@ class LocalCopyEngine {
 
     Status createStreamsLocked();
     void destroyStreamsLocked();
+    bool finishIfDrained(Group& group);
     bool issueGroupLocked(size_t stream_count,
                           const std::function<bool(size_t)>& issue_stream);
     Status allocHostFlags(Group& group);
@@ -100,6 +104,7 @@ class LocalCopyEngine {
     void* device_one_{nullptr};
     std::unordered_map<void*, std::unique_ptr<Group>> groups_;
     TaskRunner task_runner_;
+    std::function<void()> release_inflight_;
     bool retiring_{false};
     bool initialized_{false};
 };

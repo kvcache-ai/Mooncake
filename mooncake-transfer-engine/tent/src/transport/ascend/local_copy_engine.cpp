@@ -73,6 +73,10 @@ void LocalCopyEngine::destroyStreamsLocked() {
     retiring_ = std::any_of(streams_.begin(), streams_.end(),
                             [](aclrtStream s) { return s != nullptr; });
     if (!retiring_) streams_.clear();
+    for (auto& entry : groups_) {
+        auto& group = *entry.second;
+        if (group.counted) finishIfDrained(group);
+    }
 }
 
 Status LocalCopyEngine::createStreamsLocked() {
@@ -312,13 +316,16 @@ Status LocalCopyEngine::submit(bool write, const std::vector<HixlOpDesc>& ops,
     if (!issued) {
         failStreamsLocked(FAILED);
         destroyStreamsLocked();
-        if (!retiring_) {
+        if (finishIfDrained(*group)) {
             freeHostFlags(*group);
             groups_.erase(group);
             return Status::InternalError("aclrtMemcpyAsync failed" LOC_MARK);
         }
     }
 
+    // The submitter releases rejected groups. Accepted groups own the
+    // reservation until the last stream using their buffers is done.
+    group->counted = true;
     req = group;
     return Status::OK();
 }
@@ -386,18 +393,22 @@ TransferStatusEnum LocalCopyEngine::poll(void* req, bool timed_out) {
     if (it == groups_.end() || !it->second) {
         return TransferStatusEnum::FAILED;
     }
-    const auto& group = *it->second;
+    auto& group = *it->second;
     if (timed_out && group.failure == PENDING) failStreamsLocked(TIMEOUT);
     if (retiring_) {
         ContextGuard guard(context_);
         if (guard.ok()) destroyStreamsLocked();
     }
-    for (size_t i = 0; i < group.stream_count; ++i) {
-        if (*flagAt(group, i) != kDoneFlag) {
-            return TransferStatusEnum::PENDING;
-        }
-    }
+    if (!finishIfDrained(group)) return PENDING;
     return group.failure == PENDING ? COMPLETED : group.failure;
+}
+
+bool LocalCopyEngine::finishIfDrained(Group& group) {
+    for (size_t i = 0; i < group.stream_count; ++i) {
+        if (*flagAt(group, i) != kDoneFlag) return false;
+    }
+    if (std::exchange(group.counted, false)) release_inflight_();
+    return true;
 }
 
 void LocalCopyEngine::release(void* req) {
