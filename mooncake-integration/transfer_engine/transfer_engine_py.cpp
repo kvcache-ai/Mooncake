@@ -18,12 +18,20 @@
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
+#include <stdexcept>
 #include <fstream>
 #include <limits>
 #include <mutex>
 #include <numeric>
 
 #include <pybind11/stl.h>
+
+namespace {
+class CompletionNotificationFallback : public std::runtime_error {
+   public:
+    using std::runtime_error::runtime_error;
+};
+}  // namespace
 
 #include <algorithm>
 #include <cstring>
@@ -34,6 +42,10 @@
 #include "tent/common/config.h"
 #include "tent/common/types.h"
 #include "tent/transfer_engine.h"
+#endif
+
+#ifdef USE_ASCEND_DIRECT
+#include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
 #endif
 
 #ifdef USE_EFA
@@ -1208,7 +1220,8 @@ batch_id_t TransferEnginePy::batchTransferAsync(
     const char* target_hostname, const std::vector<uintptr_t>& buffers,
     const std::vector<uintptr_t>& peer_buffer_addresses,
     const std::vector<size_t>& lengths, TransferOpcode opcode,
-    const std::string& transport_hint, const std::string& nic_hint) {
+    const std::string& transport_hint, const std::string& nic_hint,
+    bool enable_completion_notification) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -1219,7 +1232,9 @@ batch_id_t TransferEnginePy::batchTransferAsync(
             handle = engine_->openSegment(target_hostname);
             // batch_id_t is unsigned; 0 is the documented failure sentinel
             // (-1 would surface as 2^64 - 1 in Python).
-            if (handle == (Transport::SegmentHandle)-1) return 0;
+            if (handle == (Transport::SegmentHandle)-1) {
+                return 0;
+            }
             handle_map_[target_hostname] = handle;
         }
     }
@@ -1255,14 +1270,37 @@ batch_id_t TransferEnginePy::batchTransferAsync(
 
     for (int retry = 0; retry < max_retry; ++retry) {
         batch_id = engine_->allocateBatchID(batch_size);
-        auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
+        if (!Transport::isValidBatchID(batch_id)) {
+            return 0;
+        }
+        if (!engine_->isUsingTent()) {
+            auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
+            batch_desc->start_timestamp = getCurrentTimeInNano();
+        }
 
-        auto start_ts = getCurrentTimeInNano();
-        batch_desc->start_timestamp = start_ts;
+        if (enable_completion_notification) {
+            Status enable =
+                engine_->enableBatchCompletionNotification(batch_id);
+            if (!enable.ok()) {
+                engine_->freeBatchID(batch_id);
+                LOG(ERROR) << "enableBatchCompletionNotification failed: "
+                           << enable.ToString();
+                // Only "fall back to polling" needs a distinct signal.
+                // Every other failure keeps the pre-existing return-0 path.
+                if (enable.IsCompletionNotificationUnsupported()) {
+                    throw CompletionNotificationFallback(enable.ToString());
+                }
+                return 0;
+            }
+        }
 
         Status s = engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
             engine_->freeBatchID(batch_id);
+            if (enable_completion_notification &&
+                s.IsCompletionNotificationUnsupported()) {
+                throw CompletionNotificationFallback(s.ToString());
+            }
             return 0;
         } else {
             break;
@@ -1275,17 +1313,27 @@ batch_id_t TransferEnginePy::batchTransferAsync(
 int TransferEnginePy::getBatchTransferStatus(
     const std::vector<batch_id_t>& batch_ids) {
     pybind11::gil_scoped_release release;
+    if (!engine_) return -1;
+    for (auto& batch_id : batch_ids) {
+        if (!Transport::isValidBatchID(batch_id)) {
+            return -1;
+        }
+    }
+    const bool use_tent = engine_->isUsingTent();
+    const auto call_start_ts = getCurrentTimeInNano();
     TransferStatus status;
     std::unordered_map<batch_id_t, int64_t> timeout_table{};
     for (auto& batch_id : batch_ids) {
         int64_t total_length = 0;
-        auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
-        const size_t task_count = batch_desc->task_list.size();
+        if (!use_tent) {
+            auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
+            const size_t task_count = batch_desc->task_list.size();
 
-        for (size_t task_id = 0; task_id < task_count; task_id++) {
-            auto& task = batch_desc->task_list[task_id];
-            for (auto& slice : task.slice_list) {
-                total_length += slice->length;
+            for (size_t task_id = 0; task_id < task_count; task_id++) {
+                auto& task = batch_desc->task_list[task_id];
+                for (auto& slice : task.slice_list) {
+                    total_length += slice->length;
+                }
             }
         }
 
@@ -1296,10 +1344,15 @@ int TransferEnginePy::getBatchTransferStatus(
     std::unordered_set<batch_id_t> remove_ids{};
     while (!timeout_table.empty() && !failed_or_timeout) {
         for (auto& entry : timeout_table) {
-            auto batch_desc = reinterpret_cast<BatchDesc*>(entry.first);
-            auto start_timestamp = batch_desc->start_timestamp;
+            const auto start_timestamp =
+                use_tent ? call_start_ts
+                         : reinterpret_cast<BatchDesc*>(entry.first)
+                               ->start_timestamp;
             Status s = engine_->getBatchTransferStatus(entry.first, status);
-            LOG_ASSERT(s.ok());
+            if (!s.ok()) {
+                failed_or_timeout = true;
+                break;
+            }
             if (status.s == TransferStatusEnum::COMPLETED) {
                 engine_->freeBatchID(entry.first);
                 LOG(INFO) << "Batch Transfer completed!";
@@ -1308,6 +1361,10 @@ int TransferEnginePy::getBatchTransferStatus(
                 failed_or_timeout = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
+                failed_or_timeout = true;
+            } else if (status.s != TransferStatusEnum::WAITING &&
+                       status.s != TransferStatusEnum::PENDING) {
+                failed_or_timeout = true;
             }
             auto current_ts = getCurrentTimeInNano();
             if (current_ts - start_timestamp > entry.second) {
@@ -1353,6 +1410,13 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     }
 
     auto batch_id = engine_->allocateBatchID(1);
+    if (!Transport::isValidBatchID(batch_id)) {
+        return 0;
+    }
+    if (!engine_->isUsingTent()) {
+        reinterpret_cast<BatchDesc*>(batch_id)->start_timestamp =
+            getCurrentTimeInNano();
+    }
     TransferRequest entry;
     entry.opcode = TransferRequest::WRITE;
     entry.length = length;
@@ -1371,23 +1435,70 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     return batch_id;
 }
 
-int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
-    pybind11::gil_scoped_release release;
+int TransferEnginePy::checkSingleBatchStatus(batch_id_t batch_id) {
+    if (!engine_ || !Transport::isValidBatchID(batch_id)) {
+        return -1;
+    }
     TransferStatus status;
-    Status s = engine_->getTransferStatus(batch_id, 0, status);
-    LOG_ASSERT(s.ok());
+    Status s = engine_->getBatchTransferStatus(batch_id, status);
+    if (!s.ok()) {
+        Status free_s = engine_->freeBatchID(batch_id);
+        return (free_s.ok() || free_s.IsBatchCleanupDeferred()) ? -2 : -1;
+    }
+    if (status.s == TransferStatusEnum::WAITING ||
+        status.s == TransferStatusEnum::PENDING) {
+        return 0;
+    }
     if (status.s == TransferStatusEnum::COMPLETED) {
         engine_->freeBatchID(batch_id);
         return 1;
-    } else if (status.s == TransferStatusEnum::FAILED) {
-        engine_->freeBatchID(batch_id);
-        return -1;
-    } else if (status.s == TransferStatusEnum::TIMEOUT) {
+    }
+    if (status.s == TransferStatusEnum::TIMEOUT) {
         engine_->freeBatchID(batch_id);
         return -2;
-    } else {
-        return 0;
     }
+
+    // Classic MultiTransport::getBatchTransferStatus folds per-task TIMEOUT
+    // into FAILED and short-circuits on the first failed task while sibling
+    // tasks may still have DMA in flight. Check per-task drainage before
+    // freeing BatchDesc so undrained/timed-out batches return -2 instead of -1.
+    bool all_tasks_drained = true;
+    if (!engine_->isUsingTent()) {
+        auto* batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
+        const size_t task_count = batch_desc->task_list.size();
+        for (size_t task_id = 0; task_id < task_count; ++task_id) {
+            auto& task = batch_desc->task_list[task_id];
+            if (__atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE) ||
+                task.slice_count == 0) {
+                continue;
+            }
+            TransferStatus task_status;
+            Status ts =
+                engine_->getTransferStatus(batch_id, task_id, task_status);
+            if (!ts.ok() || (task_status.s != TransferStatusEnum::COMPLETED &&
+                             task_status.s != TransferStatusEnum::FAILED)) {
+                all_tasks_drained = false;
+                break;
+            }
+        }
+    }
+    engine_->freeBatchID(batch_id);
+    return all_tasks_drained ? -1 : -2;
+}
+
+int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
+    pybind11::gil_scoped_release release;
+    return checkSingleBatchStatus(batch_id);
+}
+
+std::vector<int> TransferEnginePy::batchTransferCheckStatus(
+    const std::vector<batch_id_t>& batch_ids) {
+    pybind11::gil_scoped_release release;
+    std::vector<int> statuses(batch_ids.size(), -1);
+    for (size_t i = 0; i < batch_ids.size(); ++i) {
+        statuses[i] = checkSingleBatchStatus(batch_ids[i]);
+    }
+    return statuses;
 }
 
 int TransferEnginePy::batchRegisterMemory(
@@ -1427,6 +1538,26 @@ int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
     pybind11::gil_scoped_release release;
     char* buffer = reinterpret_cast<char*>(buffer_addr);
     return engine_->unregisterLocalMemory(buffer);
+}
+
+int TransferEnginePy::disconnectAllPeers() {
+#ifdef USE_ASCEND_DIRECT
+    if (!engine_) {
+        LOG(ERROR) << "Transfer engine is not initialized";
+        return -1;
+    }
+    Transport* base_transport = engine_->getTransport("ascend");
+    if (base_transport == nullptr) {
+        LOG(ERROR) << "Ascend transport is not installed";
+        return -1;
+    }
+    auto* transport = static_cast<AscendDirectTransport*>(base_transport);
+    pybind11::gil_scoped_release release;
+    return transport->disconnectAllPeers();
+#else
+    LOG(ERROR) << "Mooncake was built without Ascend Direct transport";
+    return -1;
+#endif
 }
 
 #ifdef USE_CUDA
@@ -1765,6 +1896,8 @@ PYBIND11_MODULE(engine, m) {
     m.attr("SUPPORT_TENT") = false;
 #endif
 
+    py::register_exception<CompletionNotificationFallback>(
+        m, "CompletionNotificationFallback");
 #ifdef USE_EFA
     m.attr("SUPPORT_EFA") = true;
 #else
@@ -1812,6 +1945,15 @@ PYBIND11_MODULE(engine, m) {
     transfer_opcode.value("Read", TransferEnginePy::TransferOpcode::READ)
         .value("Write", TransferEnginePy::TransferOpcode::WRITE)
         .export_values();
+
+    py::enum_<TransferStatusEnum>(m, "TransferStatus")
+        .value("WAITING", TransferStatusEnum::WAITING)
+        .value("PENDING", TransferStatusEnum::PENDING)
+        .value("INVALID", TransferStatusEnum::INVALID)
+        .value("CANCELED", TransferStatusEnum::CANCELED)
+        .value("COMPLETED", TransferStatusEnum::COMPLETED)
+        .value("TIMEOUT", TransferStatusEnum::TIMEOUT)
+        .value("FAILED", TransferStatusEnum::FAILED);
 
     py::enum_<ScatterTransferCompletionStatus>(
         m, "ScatterTransferCompletionStatus")
@@ -1976,7 +2118,12 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("opcode"), py::arg("transport_hint") = "",
-                 py::arg("nic_hint") = "")
+                 py::arg("nic_hint") = "",
+                 py::arg("enable_completion_notification") = false,
+                 "With enable_completion_notification, a path that cannot "
+                 "complete without polling raises "
+                 "CompletionNotificationFallback so the caller can poll. "
+                 "Every other failure still returns 0.")
 #ifdef USE_CUDA
             .def("transfer_write_on_cuda",
                  &TransferEnginePy::transferWriteOnCuda,
@@ -2011,6 +2158,8 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("transport_hint") = "", py::arg("nic_hint") = "")
             .def("transfer_check_status",
                  &TransferEnginePy::transferCheckStatus)
+            .def("batch_transfer_check_status",
+                 &TransferEnginePy::batchTransferCheckStatus)
             .def("write_bytes_to_buffer", &TransferEnginePy::writeBytesToBuffer)
             .def("read_bytes_from_buffer",
                  &TransferEnginePy::readBytesFromBuffer)
@@ -2019,6 +2168,7 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("location") = kWildcardLocation,
                  py::arg("remote_accessible") = true)
             .def("unregister_memory", &TransferEnginePy::unregisterMemory)
+            .def("disconnect_all_peers", &TransferEnginePy::disconnectAllPeers)
             .def("batch_register_memory",
                  &TransferEnginePy::batchRegisterMemory,
                  py::arg("buffer_addresses"), py::arg("capacities"),
@@ -2039,6 +2189,67 @@ PYBIND11_MODULE(engine, m) {
                  "SGLang's failed-session blacklist recovery.")
             .def("get_engine", &TransferEnginePy::getEngine)
             .def("get_engine_ptr", &TransferEnginePy::getEnginePtr);
+
+    adaptor_cls
+        .def(
+            "completion_fd",
+            [](TransferEnginePy& self) {
+                auto engine = self.getEngine();
+                return engine ? engine->completionFd() : -1;
+            },
+            "Engine-owned completion eventfd. -1 when the wake is unavailable. "
+            "A non-negative fd means the facility exists; pass "
+            "enable_completion_notification=True to batch_transfer_async "
+            "to wait on it. See TransferEngine::completionFd() / RFC #5164.")
+        .def(
+            "free_batch_id",
+            [](TransferEnginePy& self, batch_id_t batch_id) {
+                auto engine = self.getEngine();
+                if (!engine) {
+                    throw std::runtime_error(
+                        "transfer engine is not initialized");
+                }
+                // Non-blocking ownership release: OK or BatchCleanupDeferred
+                // both invalidate the handle. Does not poll status in a loop.
+                auto status = engine->freeBatchID(batch_id);
+                if (!status.ok() && !status.IsBatchCleanupDeferred()) {
+                    throw std::runtime_error(status.ToString());
+                }
+                return status.IsBatchCleanupDeferred() ? 1 : 0;
+            },
+            py::arg("batch_id"),
+            "Release a batch handle without a blocking status loop. Returns "
+            "0 on immediate free, 1 when cleanup was deferred.")
+        .def(
+            "drain_completions",
+            [](TransferEnginePy& self) {
+                auto engine = self.getEngine();
+                if (!engine) {
+                    throw std::runtime_error(
+                        "transfer engine is not initialized");
+                }
+                // GIL stays on the caller thread. Completion only writes the
+                // eventfd. Drain does not free handles and does not send
+                // peer notify.
+                std::vector<BatchCompletion> done;
+                auto status = engine->drainCompletions(done);
+                if (!status.ok()) {
+                    throw std::runtime_error(status.ToString());
+                }
+                py::list out;
+                for (const auto& item : done) {
+                    py::dict row;
+                    row["batch_id"] = item.batch_id;
+                    row["status"] = static_cast<int>(item.status.s);
+                    row["transferred_bytes"] = item.status.transferred_bytes;
+                    out.append(std::move(row));
+                }
+                return out;
+            },
+            "Non-blocking drain of terminal batches. Each item has batch_id, "
+            "status, and transferred_bytes. Does not free batch handles. "
+            "One caller at a time. Concurrent calls race the queue tail "
+            "and split one wake.");
 
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
 

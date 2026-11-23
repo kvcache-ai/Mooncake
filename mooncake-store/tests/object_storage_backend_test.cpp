@@ -1,9 +1,14 @@
 #include "storage/distributed/object_storage_backend.h"
+#include "storage/distributed/distributed_storage_backend.h"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <barrier>
+#include <mutex>
+#include <thread>
 #include <chrono>
 #include <cstring>
 #include <future>
@@ -96,6 +101,140 @@ class MemoryObjectAdapter : public ObjectStorageAdapter {
     bool SupportsSinglePutAttempt() const override { return true; }
     bool SupportsSinglePutVAttempt() const override { return true; }
 };
+
+// A whole-object adapter with a controlled in-flight read, for the DFS
+// backend's object-storage branch (the range backend above is independent).
+class SharedWholeObjectAdapter : public MemoryObjectAdapter {
+   public:
+    ~SharedWholeObjectAdapter() override { Release(); }
+    bool WaitUntilBlocked() {
+        return blocked_.wait_for(std::chrono::seconds(5)) ==
+               std::future_status::ready;
+    }
+    void Release() {
+        if (!released_once_.exchange(true)) release_signal_.set_value();
+    }
+    tl::expected<size_t, ErrorCode> Get(const std::string& key, void* buffer,
+                                        size_t size) override {
+        const auto call = ++get_calls;
+        tl::expected<size_t, ErrorCode> result =
+            tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
+        {
+            std::lock_guard lock(mutex_);
+            read_buffers.push_back(buffer);
+            const auto it = objects.find(key);
+            if (it != objects.end()) {
+                if (it->second.size() > size)
+                    result = tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                else {
+                    std::memcpy(buffer, it->second.data(), it->second.size());
+                    result = it->second.size();
+                }
+            }
+        }
+        if (call == 1) {
+            blocked_signal_.set_value();
+            released_.wait();
+        }
+        return result;
+    }
+    tl::expected<void, ErrorCode> Delete(const std::string& key) override {
+        std::lock_guard lock(mutex_);
+        return MemoryObjectAdapter::Delete(key);
+    }
+    std::atomic<size_t> get_calls{0};
+
+   private:
+    std::mutex mutex_;
+    std::atomic<bool> released_once_{false};
+    std::promise<void> blocked_signal_;
+    std::future<void> blocked_{blocked_signal_.get_future()};
+    std::promise<void> release_signal_;
+    std::shared_future<void> released_{release_signal_.get_future().share()};
+};
+
+struct ReleaseWholeObjectRead {
+    SharedWholeObjectAdapter* adapter;
+    ~ReleaseWholeObjectRead() { adapter->Release(); }
+};
+
+std::unique_ptr<DistributedStorageBackend> MakeSharedObjectBackend(
+    std::unique_ptr<SharedWholeObjectAdapter> adapter) {
+    DistributedStorageConfig config;
+    config.enable_health_check = false;
+    config.fs_adapter_type = "memory";
+    return std::make_unique<DistributedStorageBackend>(
+        FileStorageConfig{}, config, nullptr, std::move(adapter));
+}
+
+DfsReadRequest WholeObjectRead(std::vector<Slice> slices) {
+    return {.key = "object-key",
+            .descriptor = {.file_path = "object://test-namespace",
+                           .object_size = 8,
+                           .aligned_size = 8},
+            .slices = std::move(slices),
+            .source_replica_id = 7};
+}
+
+TEST(DistributedObjectReadSharingTest, EightConsumersShareWholeValue) {
+    auto adapter = std::make_unique<SharedWholeObjectAdapter>();
+    auto* observed = adapter.get();
+    adapter->objects["object-key"] = "abcdefgh";
+    auto backend = MakeSharedObjectBackend(std::move(adapter));
+    ASSERT_TRUE(backend->Init());
+    std::array<std::array<char, 10>, 8> output;
+    for (auto& value : output) value.fill('!');
+    std::barrier start(9);
+    std::vector<std::future<std::vector<tl::expected<void, ErrorCode>>>> reads;
+    ReleaseWholeObjectRead release{observed};
+    for (size_t i = 0; i < output.size(); ++i) {
+        reads.push_back(std::async(std::launch::async, [&, i] {
+            auto request = WholeObjectRead(
+                {{output[i].data(), 3}, {output[i].data() + 3, 7}});
+            start.arrive_and_wait();
+            return backend->BatchRead({request});
+        }));
+    }
+    start.arrive_and_wait();
+    ASSERT_TRUE(observed->WaitUntilBlocked());
+    for (auto& read : reads)
+        EXPECT_EQ(read.wait_for(std::chrono::milliseconds(20)),
+                  std::future_status::timeout);
+    observed->Release();
+    for (auto& read : reads) ASSERT_TRUE(read.get()[0]);
+    EXPECT_EQ(observed->get_calls, 1U);
+    for (const auto& value : output)
+        EXPECT_EQ(std::string(value.data(), value.size()), "abcdefgh!!");
+}
+
+TEST(DistributedObjectReadSharingTest, DeleteDetachesPendingObjectRead) {
+    auto adapter = std::make_unique<SharedWholeObjectAdapter>();
+    auto* observed = adapter.get();
+    adapter->objects["object-key"] = "abcdefgh";
+    auto backend = MakeSharedObjectBackend(std::move(adapter));
+    ASSERT_TRUE(backend->Init());
+    std::array<char, 8> before{}, after{};
+    std::vector<std::future<std::vector<tl::expected<void, ErrorCode>>>> reads;
+    ReleaseWholeObjectRead release{observed};
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend->BatchRead({WholeObjectRead({{before.data(), 8}})});
+    }));
+    ASSERT_TRUE(observed->WaitUntilBlocked());
+    const std::array<std::string, 1> keys{"object-key"};
+    ASSERT_TRUE(backend->BatchDeleteObjects(keys)[0]);
+    reads.push_back(std::async(std::launch::async, [&] {
+        return backend->BatchRead({WholeObjectRead({{after.data(), 8}})});
+    }));
+    const auto ready = reads.back().wait_for(std::chrono::seconds(5));
+    observed->Release();
+    ASSERT_EQ(ready, std::future_status::ready);
+    auto missing = reads.back().get();
+    ASSERT_FALSE(missing[0]);
+    EXPECT_EQ(missing[0].error(), ErrorCode::FILE_NOT_FOUND);
+    ASSERT_TRUE(reads.front().get()[0]);
+    EXPECT_EQ(std::string(before.data(), before.size()), "abcdefgh");
+    EXPECT_EQ(observed->get_calls, 2U);
+}
 
 bool HostCopy(void* dst, const void* src, size_t size) {
     std::memcpy(dst, src, size);

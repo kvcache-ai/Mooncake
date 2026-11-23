@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 
 #include "common/heap_optional.h"
 #include "object_runtime_state.h"
@@ -18,6 +19,14 @@ namespace route {
 struct ObjectState {
     // A primary write or a background task is in flight for this key.
     bool is_processing{false};
+    // KV event state fits in the padding after `is_processing`, so it adds
+    // zero bytes to KeySlot. Announcements may outlive availability while a
+    // removed replica waits for durable finalization.
+    uint8_t announced_kv_media{0};
+    uint8_t live_kv_media{0};
+    // An in-place overwrite invalidates the old contents even if a pending
+    // REMOVED replica still retains their tier. Consumed on write release.
+    bool kv_content_invalidated{false};
     HeapOptional<ReplicationTask> replication_task;
     HeapOptional<OffloadingTask> offloading_task;
     HeapOptional<PromotionTask> promotion_task;

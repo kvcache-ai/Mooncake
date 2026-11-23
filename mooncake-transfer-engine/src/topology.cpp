@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
@@ -960,9 +961,27 @@ int Topology::selectDevice(const std::string storage_type,
     return selectDevice(storage_type, retry_count);
 }
 
-int Topology::selectDeviceByLocalHca(const std::string storage_type,
-                                     std::string_view local_hca,
-                                     int retry_count) {
+namespace {
+// The devices in `device_ids` that `device_filter` accepts, in order. Returns
+// `device_ids` itself when there is no filter or it accepts all of them;
+// otherwise fills `kept` with the accepted ones and returns it.
+const std::vector<int> &filterDevices(
+    const std::vector<int> &device_ids,
+    const std::function<bool(int)> &device_filter, std::vector<int> &kept) {
+    if (!device_filter) return device_ids;
+    auto it = std::find_if_not(device_ids.begin(), device_ids.end(),
+                               std::ref(device_filter));
+    if (it == device_ids.end()) return device_ids;
+    kept.assign(device_ids.begin(), it);
+    std::copy_if(it + 1, device_ids.end(), std::back_inserter(kept),
+                 std::ref(device_filter));
+    return kept;
+}
+}  // namespace
+
+int Topology::selectDeviceByLocalHca(
+    const std::string storage_type, std::string_view local_hca, int retry_count,
+    const std::function<bool(int)> &device_filter) {
     if (!local_hca.empty()) {
         auto local_it =
             resolved_hca_peer_affinity_by_local_.find(std::string(local_hca));
@@ -970,7 +989,10 @@ int Topology::selectDeviceByLocalHca(const std::string storage_type,
             auto hints_it = local_it->second.find(std::string(storage_type));
             if (hints_it != local_it->second.end() &&
                 !hints_it->second.empty()) {
-                const auto &candidates = hints_it->second;
+                std::vector<int> kept_candidates;
+                const auto &candidates = filterDevices(
+                    hints_it->second, device_filter, kept_candidates);
+                if (candidates.empty()) return ERR_ADDRESS_NOT_REGISTERED;
                 if (retry_count == 0) {
                     int rand_value;
                     if (use_round_robin_) {
@@ -987,18 +1009,27 @@ int Topology::selectDeviceByLocalHca(const std::string storage_type,
         }
     }
 
-    return selectDevice(storage_type, retry_count);
+    return selectDevice(storage_type, retry_count, device_filter);
 }
 
-int Topology::selectDevice(const std::string storage_type, int retry_count) {
+int Topology::selectDevice(const std::string storage_type, int retry_count,
+                           const std::function<bool(int)> &device_filter) {
     if (resolved_matrix_.count(storage_type) == 0) return ERR_DEVICE_NOT_FOUND;
 
     auto &entry = resolved_matrix_[storage_type];
     if (entry.preferred_hca.empty() && entry.avail_hca.empty()) {
         return ERR_DEVICE_NOT_FOUND;
     }
+    std::vector<int> kept_preferred_hca, kept_avail_hca;
+    const auto &preferred_hca =
+        filterDevices(entry.preferred_hca, device_filter, kept_preferred_hca);
 
     if (retry_count == 0) {
+        const auto &candidates =
+            !preferred_hca.empty()
+                ? preferred_hca
+                : filterDevices(entry.avail_hca, device_filter, kept_avail_hca);
+        if (candidates.empty()) return ERR_ADDRESS_NOT_REGISTERED;
         int rand_value;
         if (use_round_robin_) {
             thread_local int tl_counter = 0;
@@ -1006,18 +1037,18 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
             tl_counter = (tl_counter + 1) % 10000;
         } else
             rand_value = SimpleRandom::Get().next();
-        if (!entry.preferred_hca.empty())
-            return entry.preferred_hca[rand_value % entry.preferred_hca.size()];
-        else
-            return entry.avail_hca[rand_value % entry.avail_hca.size()];
+        return candidates[rand_value % candidates.size()];
     } else {
-        size_t index = (retry_count - 1) %
-                       (entry.preferred_hca.size() + entry.avail_hca.size());
-        if (index < entry.preferred_hca.size())
-            return entry.preferred_hca[index];
+        const auto &avail_hca =
+            filterDevices(entry.avail_hca, device_filter, kept_avail_hca);
+        const size_t total = preferred_hca.size() + avail_hca.size();
+        if (total == 0) return ERR_ADDRESS_NOT_REGISTERED;
+        size_t index = (retry_count - 1) % total;
+        if (index < preferred_hca.size())
+            return preferred_hca[index];
         else {
-            index -= entry.preferred_hca.size();
-            return entry.avail_hca[index];
+            index -= preferred_hca.size();
+            return avail_hca[index];
         }
     }
     return ERR_DEVICE_NOT_FOUND;
@@ -1129,5 +1160,29 @@ int Topology::disableDevice(const std::string &device_name) {
         }
     }
     return 0;
+}
+
+std::unordered_map<std::string, std::vector<size_t>> buildPreferredNicIndexMap(
+    const TopologyMatrix &matrix,
+    const std::vector<std::string> &device_names) {
+    std::unordered_map<std::string, size_t> name_to_index;
+    for (size_t i = 0; i < device_names.size(); ++i)
+        name_to_index.emplace(device_names[i], i);
+
+    std::unordered_map<std::string, std::vector<size_t>> nic_map;
+    for (const auto &entry : matrix) {
+        std::vector<size_t> indices;
+        for (const auto &hca : entry.second.preferred_hca) {
+            auto it = name_to_index.find(hca);
+            // A preferred HCA can be missing when the transport filtered it
+            // out or failed to open it. Skipping it leaves the rest usable.
+            if (it != name_to_index.end() &&
+                std::find(indices.begin(), indices.end(), it->second) ==
+                    indices.end())
+                indices.push_back(it->second);
+        }
+        if (!indices.empty()) nic_map.emplace(entry.first, std::move(indices));
+    }
+    return nic_map;
 }
 }  // namespace mooncake

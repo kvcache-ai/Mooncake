@@ -394,6 +394,40 @@ public JSON APIs. Their wire format contains only canonical fields, and
 deserialization rejects alternate field names rather than translating
 framework-specific input.
 
+## Weight reshard CPU overhead
+
+Weight planning and execution use call-local fragment indexes and membership
+sets to avoid repeated linear scans. Indexed lookups retain full fragment
+equality checks. Operation views share construction-time accumulators instead
+of repeatedly hashing executor keys containing long fragment tuples.
+
+Within one bind call, executor construction reuses runtime binding attestations
+created for the exact same placement and binding objects. This reuse does not
+cache validation across calls or extend allocation lifetimes. Canonical rank
+encoding retains the existing identity fields and serialized representation.
+
+Segment iteration advances N-dimensional offsets incrementally, with a direct
+range iterator for eligible one-dimensional regions. Batch lowering constructs
+bounded innermost runs for eligible canonical regions, advancing prefixes lazily
+and accumulating short runs within one operation up to the configured batch
+size. It preserves segment order and keeps different operations' allocation
+ranges separate. Custom region subclasses and unsupported stride
+or loop shapes continue through the segment iterator. Segment-budget rejection
+still occurs before a batch is produced; batching does not raise the budget.
+
+These implementation choices reduce Python bookkeeping while preserving
+coverage, bounds, canonical identities, and allocation lifetime contracts.
+Integer geometry normalization reuses exact immutable tuples only after checking
+every element and its minimum value. Lists and other supported sequences retain
+their existing normalization and validation behavior; no metadata is cached
+across bindings or generations.
+Strict geometry iteration uses the native `zip(strict=True)` implementation on
+Python 3.10 and newer, including its iterator construction and error semantics;
+the compatibility implementation remains available for older runtimes.
+End-to-end startup also includes framework initialization, model allocation,
+transport, and serving readiness; it must be measured separately from these
+CPU paths.
+
 Run the reshard tests from the repository root:
 
 ```bash

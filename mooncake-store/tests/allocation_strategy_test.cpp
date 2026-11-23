@@ -70,7 +70,8 @@ class AllocationStrategyParameterizedTest
     // Registrations bound to the returned record are not serving.
     static std::shared_ptr<ClientLivenessRecord> MakeSuspectedRecord() {
         const auto initial = ClientLivenessRecord::TimePoint{};
-        auto record = std::make_shared<ClientLivenessRecord>(initial);
+        auto record =
+            std::make_shared<ClientLivenessRecord>(generate_uuid(), initial);
         EXPECT_EQ(
             record->Evaluate(initial + std::chrono::seconds(1),
                              std::chrono::seconds(1), std::chrono::seconds(10)),
@@ -122,6 +123,63 @@ INSTANTIATE_TEST_SUITE_P(
         return strategy_str + "_" + allocator_str;
     });
 
+TEST(AllocatorManagerTest, ReplacesDistinctRegistrationSlots) {
+    for (const std::string second_name : {"second", "first"}) {
+        SCOPED_TRACE(second_name);
+        auto first_allocator =
+            std::make_shared<DummyBufferAllocator>("first", "first");
+        auto second_allocator =
+            std::make_shared<DummyBufferAllocator>(second_name, second_name);
+        AllocatorManager manager;
+        const auto first = manager.addAllocator("first", first_allocator);
+        const auto second = manager.addAllocator(second_name, second_allocator);
+        AllocatorManager replacements;
+        const auto next_first =
+            replacements.addAllocator("first", first_allocator);
+        const auto next_second =
+            replacements.addAllocator(second_name, second_allocator);
+
+        // Cover both separate per-name vectors (including checked iterators)
+        // and distinct slots in the same vector.
+        ASSERT_TRUE(
+            manager.replaceRegistrations({{"first", first, next_first},
+                                          {second_name, second, next_second}}));
+        ASSERT_NE(manager.getAllocators("first"), nullptr);
+        ASSERT_NE(manager.getAllocators(second_name), nullptr);
+        EXPECT_EQ(manager.getAllocators("first")->front(), next_first);
+        EXPECT_EQ(manager.getAllocators(second_name)->back(), next_second);
+    }
+}
+
+TEST(AllocatorManagerTest,
+     DuplicateReplacementLeavesAllRegistrationsUnchanged) {
+    auto first_allocator =
+        std::make_shared<DummyBufferAllocator>("first", "first");
+    auto second_allocator =
+        std::make_shared<DummyBufferAllocator>("second", "second");
+    AllocatorManager manager;
+    const auto first = manager.addAllocator("first", first_allocator);
+    const auto second = manager.addAllocator("second", second_allocator);
+    AllocatorManager replacements;
+    const auto next_first = replacements.addAllocator("first", first_allocator);
+    const auto next_second =
+        replacements.addAllocator("second", second_allocator);
+
+    EXPECT_FALSE(manager.replaceRegistrations({{"first", first, next_first},
+                                               {"second", second, next_second},
+                                               {"first", first, next_first}}));
+    ASSERT_NE(manager.getAllocators("first"), nullptr);
+    ASSERT_NE(manager.getAllocators("second"), nullptr);
+    EXPECT_EQ(manager.getAllocators("first")->front(), first);
+    EXPECT_EQ(manager.getAllocators("second")->front(), second);
+
+    // A rejected batch must also leave both slots usable by a later batch.
+    ASSERT_TRUE(manager.replaceRegistrations(
+        {{"first", first, next_first}, {"second", second, next_second}}));
+    EXPECT_EQ(manager.getAllocators("first")->front(), next_first);
+    EXPECT_EQ(manager.getAllocators("second")->front(), next_second);
+}
+
 // Test basic functionality with empty allocators map (non-parameterized)
 TEST_F(AllocationStrategyTest, EmptyAllocatorsMap) {
     AllocatorManager allocator_manager;
@@ -147,12 +205,14 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
 
 TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    auto suspected = std::make_shared<ClientLivenessRecord>(initial);
+    auto suspected =
+        std::make_shared<ClientLivenessRecord>(generate_uuid(), initial);
     ASSERT_EQ(
         suspected->Evaluate(initial + std::chrono::seconds(1),
                             std::chrono::seconds(1), std::chrono::seconds(10)),
         ClientLivenessTransition::BECAME_SUSPECTED);
-    auto active = std::make_shared<ClientLivenessRecord>(initial);
+    auto active =
+        std::make_shared<ClientLivenessRecord>(generate_uuid(), initial);
 
     auto suspected_allocator = std::make_shared<OffsetBufferAllocator>(
         "shared", DEFAULT_CXL_BASE, 64 * MiB, "suspected", "tcp");

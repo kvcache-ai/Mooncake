@@ -26,7 +26,6 @@ namespace redis {
 
 namespace {
 
-using common::redis::ConnectRedis;
 using common::redis::IsStringReply;
 using common::redis::RedisReplyPtr;
 using common::redis::SanitizeHashTagComponent;
@@ -275,18 +274,10 @@ RedisLeaderCoordinator::ReadCurrentView() {
         return tl::make_unexpected(err);
     }
 
-    auto* raw_reply = static_cast<redisReply*>(
-        redisCommand(context_, "HMGET %b %s %s %s", master_view_key_.data(),
-                     master_view_key_.size(), kLeaderAddressField,
-                     kViewVersionField, kOwnerTokenField));
-    RedisReplyPtr reply(raw_reply);
+    auto reply = ExecuteLocked({"HMGET", master_view_key_, kLeaderAddressField,
+                                kViewVersionField, kOwnerTokenField},
+                               false);
     if (reply == nullptr) {
-        LOG(WARNING) << "Redis HMGET failed for key=" << master_view_key_
-                     << ", error="
-                     << (context_ != nullptr && context_->err != 0
-                             ? context_->errstr
-                             : "connection error");
-        DisconnectLocked();
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     if (reply->type == REDIS_REPLY_ERROR) {
@@ -354,20 +345,12 @@ RedisLeaderCoordinator::TryAcquireLeadership(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 kRedisLeaseTtl)
                 .count();
-        auto* raw_reply = static_cast<redisReply*>(
-            redisCommand(context_, "EVAL %s 2 %b %b %b %lld %b",
-                         kAcquireLeadershipScript, master_view_key_.data(),
-                         master_view_key_.size(), view_version_key_.data(),
-                         view_version_key_.size(), leader_address.data(),
-                         leader_address.size(), static_cast<long long>(ttl_ms),
-                         owner_token.data(), owner_token.size()));
-        RedisReplyPtr reply(raw_reply);
+        auto reply =
+            ExecuteLocked({"EVAL", kAcquireLeadershipScript, "2",
+                           master_view_key_, view_version_key_, leader_address,
+                           std::to_string(ttl_ms), owner_token},
+                          true);
         if (reply == nullptr) {
-            LOG(WARNING) << "Redis acquire leadership failed, error="
-                         << (context_ != nullptr && context_->err != 0
-                                 ? context_->errstr
-                                 : "connection error");
-            DisconnectLocked();
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
         if (reply->type == REDIS_REPLY_ERROR) {
@@ -687,33 +670,74 @@ LeadershipLossReason RedisLeaderCoordinator::ClassifyLeadershipLossReason(
 }
 
 ErrorCode RedisLeaderCoordinator::ConnectLocked() {
-    if (connected_ && context_ != nullptr) {
-        return ErrorCode::OK;
+    if (connected_ && client_) return ErrorCode::OK;
+    auto client = std::make_unique<common::redis::RedisClusterClient>();
+    const auto result = client->ConnectDetailed(
+        spec_.connstring, spec_.ha_redis_expected_replicas_per_shard,
+        spec_.redis_read_only);
+    if (result.error != ErrorCode::OK) {
+        LOG(ERROR) << "Redis leadership startup failed: error="
+                   << toString(result.error) << " routing_error="
+                   << common::redis::RedisClusterClient::RoutingErrorName(
+                          result.routing_error);
+        return result.error;
     }
-
-    auto context = ConnectRedis(spec_.connstring, ErrorCode::INTERNAL_ERROR);
-    if (!context) {
-        if (context.error() == ErrorCode::INVALID_PARAMS) {
-            LOG(ERROR) << "Invalid Redis HA backend configuration";
-        } else {
-            LOG(WARNING) << "Failed to connect Redis HA backend";
-        }
-        DisconnectLocked();
-        return context.error();
-    }
-
-    DisconnectLocked();
-    context_ = context->release();
+    client_ = std::move(client);
     connected_ = true;
     return ErrorCode::OK;
 }
 
 void RedisLeaderCoordinator::DisconnectLocked() {
-    if (context_ != nullptr) {
-        redisFree(context_);
-        context_ = nullptr;
-    }
+    client_.reset();
     connected_ = false;
+}
+
+RedisReplyPtr RedisLeaderCoordinator::ExecuteLocked(
+    const std::vector<std::string>& command, bool write) {
+    const auto started = std::chrono::steady_clock::now();
+    if (write) reconciliation_ = OwnershipReconciliation::NotNeeded;
+    {
+        auto lease = client_->Execute(command, master_view_key_, write,
+                                      started + std::chrono::seconds(2));
+        if (lease.reply && lease.error == ErrorCode::OK) {
+            if (!write || lease.reply->type == REDIS_REPLY_ERROR)
+                return std::move(lease.reply);
+            const auto ack =
+                client_->Wait(lease, spec_.ha_redis_expected_replicas_per_shard,
+                              std::chrono::milliseconds(1000));
+            // Leave enough of the five-second lease for the next renewal.
+            if (ack && *ack == spec_.ha_redis_expected_replicas_per_shard &&
+                std::chrono::steady_clock::now() - started < kRedisLeaseTtl / 2)
+                return std::move(lease.reply);
+        }
+    }
+    if (write) {
+        // Reconcile ownership on the current owner, but never turn a read-back
+        // into replication confirmation or replay an uncertain lease mutation.
+        auto observed = client_->Execute(
+            {"HGET", master_view_key_, kOwnerTokenField}, master_view_key_,
+            false, started + std::chrono::seconds(2));
+        const auto& expected_owner = command[1] == kAcquireLeadershipScript
+                                         ? command.back()
+                                         : command[4];
+        const auto owner = GetReplyString(observed.reply.get());
+        auto state = OwnershipReconciliation::Unknown;
+        if (observed.error == ErrorCode::OK && observed.reply) {
+            if (owner)
+                state = *owner == expected_owner
+                            ? OwnershipReconciliation::MatchingUnconfirmed
+                            : OwnershipReconciliation::Lost;
+            else if (observed.reply->type == REDIS_REPLY_NIL)
+                state = OwnershipReconciliation::Lost;
+        }
+        reconciliation_ = state;
+        LOG(WARNING) << "Redis leadership write unconfirmed; reconciliation="
+                     << (state == OwnershipReconciliation::MatchingUnconfirmed
+                             ? "matching-unconfirmed"
+                         : state == OwnershipReconciliation::Lost ? "lost"
+                                                                  : "unknown");
+    }
+    return {};
 }
 
 ErrorCode RedisLeaderCoordinator::RenewLeadershipOnceLocked(
@@ -726,18 +750,11 @@ ErrorCode RedisLeaderCoordinator::RenewLeadershipOnceLocked(
     const auto ttl_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(session.lease_ttl)
             .count();
-    auto* raw_reply = static_cast<redisReply*>(
-        redisCommand(context_, "EVAL %s 1 %b %b %lld", kRenewLeadershipScript,
-                     master_view_key_.data(), master_view_key_.size(),
-                     session.owner_token.data(), session.owner_token.size(),
-                     static_cast<long long>(ttl_ms)));
-    RedisReplyPtr reply(raw_reply);
+    auto reply =
+        ExecuteLocked({"EVAL", kRenewLeadershipScript, "1", master_view_key_,
+                       session.owner_token, std::to_string(ttl_ms)},
+                      true);
     if (reply == nullptr) {
-        LOG(WARNING) << "Redis renew leadership failed, error="
-                     << (context_ != nullptr && context_->err != 0
-                             ? context_->errstr
-                             : "connection error");
-        DisconnectLocked();
         return ErrorCode::INTERNAL_ERROR;
     }
     if (reply->type == REDIS_REPLY_ERROR) {
@@ -769,17 +786,10 @@ ErrorCode RedisLeaderCoordinator::ReleaseLeadershipOnceLocked(
         return err;
     }
 
-    auto* raw_reply = static_cast<redisReply*>(
-        redisCommand(context_, "EVAL %s 1 %b %b", kReleaseLeadershipScript,
-                     master_view_key_.data(), master_view_key_.size(),
-                     owner_token.data(), owner_token.size()));
-    RedisReplyPtr reply(raw_reply);
+    auto reply = ExecuteLocked(
+        {"EVAL", kReleaseLeadershipScript, "1", master_view_key_, owner_token},
+        true);
     if (reply == nullptr) {
-        LOG(WARNING) << "Redis release leadership failed, error="
-                     << (context_ != nullptr && context_->err != 0
-                             ? context_->errstr
-                             : "connection error");
-        DisconnectLocked();
         return ErrorCode::INTERNAL_ERROR;
     }
     if (reply->type == REDIS_REPLY_ERROR) {
