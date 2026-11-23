@@ -15,6 +15,10 @@ namespace mooncake {
 struct ResolvedParticipant {
     GlobalRank global_rank = kInvalidGlobalRank;
     InGroupRank in_group_rank = kInvalidInGroupRank;
+    // Index in the full active DeviceGroupView.
+    uint32_t active_index = 0;
+    // Rank used by data-layout helpers; defaults to in_group_rank.
+    uint32_t layout_rank = 0;
     std::vector<ProtocolEndpoint> protocols;
     std::vector<AlgorithmEndpoint> algorithms;
     DeviceCollectiveWorkspaceEndpoint workspace;
@@ -59,7 +63,15 @@ struct ResolvedGroupView {
         return {
             .self_active_index = 0,
             .buffer_size = buffer_size,
-            .participants = {ResolvedParticipant{.in_group_rank = self_rank}},
+            .participants = {ResolvedParticipant{
+                .global_rank = kInvalidGlobalRank,
+                .in_group_rank = self_rank,
+                .active_index = 0,
+                .layout_rank = static_cast<uint32_t>(self_rank),
+                .protocols = {},
+                .algorithms = {},
+                .workspace = {},
+                .view_epoch_signal_offset = 0}},
             .collective_algorithm_choices = {choices.begin(), choices.end()},
         };
     }

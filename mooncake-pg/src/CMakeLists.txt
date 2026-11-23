@@ -187,6 +187,7 @@ if(USE_CUDA)
       device_comm/device_collective/protocols/simple/simple_protocol.cpp
       device_comm/device_collective/protocols/ll/ll_protocol.cpp
       device_comm/device_collective/algorithms/ring/ring_algorithm.cpp
+      device_comm/device_collective/algorithms/hierarchical/hierarchical_algorithm.cpp
       device_comm/device_collective/algorithms/one_shot/one_shot_algorithm.cpp
       device_comm/device_collective/algorithms/pairwise/pairwise_algorithm.cpp
       device_comm/device_collective/algorithms/star/star_algorithm.cpp

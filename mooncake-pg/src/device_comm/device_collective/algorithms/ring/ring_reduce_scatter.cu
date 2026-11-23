@@ -15,16 +15,15 @@ template <typename T>
 struct ReduceScatterLayout {
     const T* input;
     T* output;
-    const DeviceGroupView& view;
+    const RingPlan& plan;
     uint64_t rank_elements;
     RingChannelPartition channel;
     uint64_t chunk_capacity;
 
     [[nodiscard]] __device__ __forceinline__ CollectiveChunk<T> chunk(
         uint32_t active_index, uint64_t chunk_index) const {
-        PG_ASSERT(active_index < view.participant_count);
-        const auto rank = view.participants[active_index].in_group_rank;
-        PG_ASSERT(rank >= 0);
+        PG_ASSERT(active_index < plan.participant_count);
+        const auto rank = plan.participant_ranks[active_index];
         const uint64_t chunk_begin = chunk_index * chunk_capacity;
         PG_ASSERT(chunk_begin < channel.count);
         const uint64_t offset = channel.offset + chunk_begin;
@@ -44,29 +43,28 @@ struct ReduceScatterLayout {
 
 template <typename T, ReduceOp Op>
 [[nodiscard]] __device__ __forceinline__ CollectiveResult
-runRingRound(const DeviceGroupView& view, SimplePrimitives<T>& primitives,
+runRingRound(const RingPlan& plan, SimplePrimitives<T>& primitives,
              const ReduceScatterLayout<T>& layout, uint64_t chunk_index,
              cooperative_groups::thread_block block) {
     const auto [send_op, reduce_op, final_op] =
-        makeRingReductionOps<T, Op>(view.participant_count);
+        makeRingReductionOps<T, Op>(plan.participant_count);
     // Inject the preceding participant's segment so that P - 1 receives
     // complete this rank's result.
     const uint32_t first_active_index =
-        ringIndexAtDistance(view.self_active_index, view.participant_count, 1);
+        ringIndexAtDistance(plan.self_index, plan.participant_count, 1);
     const auto first_chunk = layout.chunk(first_active_index, chunk_index);
     PG_COLL_TRY(primitives.transformSend(first_chunk, block, send_op));
 
-    for (uint64_t distance = 2; distance < view.participant_count; ++distance) {
+    for (uint64_t distance = 2; distance < plan.participant_count; ++distance) {
         const uint32_t active_index = ringIndexAtDistance(
-            view.self_active_index, view.participant_count, distance);
+            plan.self_index, plan.participant_count, distance);
         const auto chunk = layout.chunk(active_index, chunk_index);
         PG_COLL_TRY(primitives.recvTransformSend(chunk, block, reduce_op));
     }
 
     // The last receive is at distance P and belongs to this rank. In-place
     // output overwrites its input segment only after the final reduction.
-    const auto completed_chunk =
-        layout.chunk(view.self_active_index, chunk_index);
+    const auto completed_chunk = layout.chunk(plan.self_index, chunk_index);
     return primitives.recvTransformCopy(completed_chunk, block, final_op);
 }
 
@@ -93,7 +91,7 @@ runRingChannel(const ReduceScatterRequest& request, RingDeviceState* state,
     const ReduceScatterLayout<T> layout{
         .input = static_cast<const T*>(request.send_buffer),
         .output = static_cast<T*>(request.recv_buffer),
-        .view = view,
+        .plan = plan,
         .rank_elements = request.count,
         .channel = partition,
         .chunk_capacity = primitives.chunkElements(),
@@ -103,7 +101,7 @@ runRingChannel(const ReduceScatterRequest& request, RingDeviceState* state,
     const uint64_t chunk_count = layout.chunkCount();
     for (uint64_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
         PG_COLL_TRY(
-            runRingRound<T, Op>(view, primitives, layout, chunk_index, block));
+            runRingRound<T, Op>(plan, primitives, layout, chunk_index, block));
     }
     return primitives.finish(block);
 }

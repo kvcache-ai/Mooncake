@@ -5,6 +5,7 @@
 
 #include <glog/logging.h>
 
+#include "device_comm/device_collective/algorithms/hierarchical/hierarchical_algorithm.h"
 #include "device_comm/device_collective/algorithms/one_shot/one_shot_algorithm.h"
 #include "device_comm/device_collective/algorithms/pairwise/pairwise_algorithm.h"
 #include "device_comm/device_collective/algorithms/ring/ring_algorithm.h"
@@ -76,6 +77,8 @@ DeviceCollectiveDispatcher::create(DeviceTransferService& transfer_service,
     if (simple) {
         dispatcher->tryLoadAlgorithm<RingAlgorithm>(device_index, collective,
                                                     workspace, *simple);
+        dispatcher->tryLoadAlgorithm<HierarchicalAlgorithm>(
+            device_index, collective, workspace, *simple);
         dispatcher->tryLoadAlgorithm<PairwiseAlgorithm>(
             device_index, collective, workspace, *simple);
         dispatcher->tryLoadAlgorithm<StarAlgorithm>(device_index, collective,

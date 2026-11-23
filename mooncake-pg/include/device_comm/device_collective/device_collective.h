@@ -70,8 +70,8 @@ class DeviceCollectiveRuntime {
                             uint32_t max_group_size,
                             int32_t* active_ranks_mirror,
                             RegionSlice view_epoch_signals,
-                            StrongStream& strong_stream,
-                            GpuEvent handoff_event);
+                            StrongStream& strong_stream, GpuEvent handoff_event,
+                            uint32_t ranks_per_node);
 
     PGResult<ResolvedGroupView> resolveGroupView(const GroupView& view) const;
     PGResult<void> installGroupView(const ResolvedGroupView& view);
@@ -84,6 +84,7 @@ class DeviceCollectiveRuntime {
     DeviceCollectiveWorkspace& workspace_;
     int device_index_ = -1;
     InGroupRank self_rank_ = kInvalidInGroupRank;
+    uint32_t ranks_per_node_ = 0;
     RegionSlice view_epoch_signals_;
     GpuBuffer<DeviceGroupView> device_group_view_;
     GpuBuffer<InvocationState> invocation_state_;

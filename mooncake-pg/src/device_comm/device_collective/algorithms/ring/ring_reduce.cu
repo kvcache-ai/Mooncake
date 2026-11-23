@@ -14,8 +14,16 @@ template <typename T, ReduceOp Op>
 runRingChannel(const ReduceRequest& request, RingDeviceState* state,
                uint32_t channel, cooperative_groups::thread_block block) {
     const auto& view = *state->collective.group_view;
-    // A captured request may outlive its root's membership.
-    if (view.activeIndex(request.root) < 0) {
+    const auto& plan = state->plan;
+    // A captured request may outlive its root's subgroup membership.
+    bool root_present = false;
+    for (uint32_t index = 0; index < plan.participant_count; ++index) {
+        if (plan.participant_ranks[index] == request.root) {
+            root_present = true;
+            break;
+        }
+    }
+    if (!root_present) {
         return {
             .failed_rank = request.root,
             .failure_type = CollectiveFailureType::UnavailableParticipant,
@@ -23,15 +31,13 @@ runRingChannel(const ReduceRequest& request, RingDeviceState* state,
     }
     if (request.count == 0) return {};
 
-    const auto& plan = state->plan;
     const uint32_t channel_count = RingChannelPartition::chooseChannelCount(
         request.count * sizeof(T), plan.workspace.bytes);
     if (channel >= channel_count) return {};
     const auto partition =
         RingChannelPartition::make(request.count, channel, channel_count);
-    const bool is_root = view.self().in_group_rank == request.root;
-    const bool is_first =
-        view.participants[plan.predecessor_index].in_group_rank == request.root;
+    const bool is_root = plan.participant_ranks[plan.self_index] == request.root;
+    const bool is_first = plan.predecessor_rank == request.root;
     const auto* input =
         static_cast<const T*>(request.send_buffer) + partition.offset;
     // Only the root has an output operand. Other ranks may pass nullptr.
@@ -40,7 +46,7 @@ runRingChannel(const ReduceRequest& request, RingDeviceState* state,
                        : nullptr;
 
     const auto [send_op, reduce_op, final_op] =
-        makeRingReductionOps<T, Op>(view.participant_count);
+        makeRingReductionOps<T, Op>(plan.participant_count);
 
     PG_ASSERT(state->simple);
     auto primitives = SimplePrimitives<T>::bind(

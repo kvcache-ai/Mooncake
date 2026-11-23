@@ -1,5 +1,7 @@
 #include "control_plane/collective_selection.h"
 
+#include "control_plane/hierarchical_topology.h"
+
 #include <algorithm>
 #include <limits>
 
@@ -137,6 +139,14 @@ std::vector<DeviceCollectiveAlgorithmChoice> selectDeviceCollectiveAlgorithms(
     const std::optional<std::vector<DeviceCollectiveAlgorithmChoice>>&
         algorithm_choices_override) {
     auto choices = defaultDeviceCollectiveAlgorithmChoices();
+    if (groupSupportsHierarchical(view)) {
+        std::erase_if(choices, [](const auto& choice) {
+            return choice.operation == OpType::AllReduce;
+        });
+        choices.push_back({OpType::AllReduce,
+                           std::numeric_limits<uint64_t>::max(),
+                           DeviceCollectiveAlgorithm::Hierarchical});
+    }
     if (groupSupportsOneShot(view, installed_routes)) {
         choices.push_back({OpType::AllReduce, 512 * 1024,
                            DeviceCollectiveAlgorithm::OneShot});
