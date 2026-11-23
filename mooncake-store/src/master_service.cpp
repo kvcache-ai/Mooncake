@@ -965,7 +965,10 @@ MasterService::~MasterService() {
         std::lock_guard lock(weight_reconciliation_mutex_);
         weight_reconciliation_running_ = false;
     }
-    job_dispatch_running_ = false;
+    {
+        std::lock_guard<std::mutex> lock(job_dispatch_mutex_);
+        job_dispatch_running_.store(false);
+    }
     http_metadata_cleanup_running_ = false;
     // Resolve durability waits while every callback target is still alive,
     // before joining workers that may be waiting for an OpLog publication.
@@ -986,6 +989,7 @@ MasterService::~MasterService() {
     task_cleanup_cv_.notify_all();
     weight_reconciliation_cv_.notify_all();
     http_metadata_cleanup_cv_.notify_all();
+    job_dispatch_cv_.notify_all();
 
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
@@ -10489,13 +10493,14 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     const std::string& key, const TenantId& tenant_id,
     const std::string& source, const std::string& target) {
-    return CreateMoveTaskInternal(key, tenant_id, source, target, false);
+    return CreateMoveTaskInternal(key, tenant_id, source, target, std::nullopt);
 }
 
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
     const std::string& key, const TenantId& tenant_id,
     const std::string& source, const std::string& target,
-    bool retained_by_drain) {
+    std::optional<UUID> drain_job_id) {
+    const bool retained_by_drain = drain_job_id.has_value();
     auto normalized_tenant_result = ResolveTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
@@ -10629,7 +10634,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTaskInternal(
              .key = object_id.user_key,
              .source = source,
              .target = target},
-            retained_by_drain);
+            drain_job_id);
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
@@ -10698,14 +10703,21 @@ tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
-    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    auto write_access = task_manager_.get_write_access();
-    ErrorCode err = write_access.complete_task(client_id, request.id,
-                                               request.status, request.message);
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "task_id=" << request.id
-                   << ", error=complete_task_failed";
-        return tl::make_unexpected(err);
+    std::optional<UUID> drain_job_id;
+    {
+        std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+        auto write_access = task_manager_.get_write_access();
+        ErrorCode err =
+            write_access.complete_task(client_id, request.id, request.status,
+                                       request.message, &drain_job_id);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "task_id=" << request.id
+                       << ", error=complete_task_failed";
+            return tl::make_unexpected(err);
+        }
+    }
+    if (drain_job_id) {
+        NotifyJobDispatch(*drain_job_id);
     }
     return {};
 }
@@ -10977,6 +10989,8 @@ void MasterService::HandleDrainJobTimeout(
         if (lock) {
             ProcessDrainJobStop(*job);
             retry = !IsDrainJobTerminal(job->status);
+        } else {
+            NotifyJobDispatch(job->id);
         }
     }
     if (retry && job_dispatch_running_.load()) {
@@ -11107,7 +11121,8 @@ void MasterService::RefreshDrainJobTasks(DrainJob& job) {
             status == TaskStatus::FAILED ||
             (status == TaskStatus::CANCELED && !DrainJobStopRequested(job));
         if (failed && RecordDrainFailure(job, candidate)) {
-            job.plan->ready.push_back(std::move(candidate));
+            // Completions wake the dispatcher, so space the retries out.
+            DelayDrainCandidate(*job.plan, std::move(candidate), false);
         } else if (job.plan) {
             --job.plan->sources[candidate.source_index].outstanding;
         }
@@ -11235,7 +11250,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
         --slots;
         auto task_id =
             CreateMoveTaskInternal(candidate.object.key, candidate.tenant_id,
-                                   source_segment, move->target, true);
+                                   source_segment, move->target, job.id);
         if (task_id) {
             job.active_tasks.emplace(
                 *task_id, ActiveDrainTask{std::move(candidate), move->bytes});
@@ -11416,13 +11431,23 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
     return true;
 }
 
-void MasterService::ProcessDrainJobs() {
+void MasterService::ProcessDrainJobs(
+    const std::unordered_set<UUID, boost::hash<UUID>>* job_ids) {
     std::vector<std::shared_ptr<DrainJob>> jobs;
     {
         std::lock_guard<std::mutex> lock(job_mutex_);
-        jobs.reserve(drain_jobs_.size());
-        for (const auto& [_, job] : drain_jobs_) {
-            jobs.push_back(job);
+        if (job_ids == nullptr) {
+            jobs.reserve(drain_jobs_.size());
+            for (const auto& [_, job] : drain_jobs_) {
+                jobs.push_back(job);
+            }
+        } else {
+            for (const auto& job_id : *job_ids) {
+                auto it = drain_jobs_.find(job_id);
+                if (it != drain_jobs_.end()) {
+                    jobs.push_back(it->second);
+                }
+            }
         }
     }
 
@@ -11450,18 +11475,58 @@ void MasterService::ProcessDrainJobs() {
     }
 }
 
+void MasterService::NotifyJobDispatch(const UUID& job_id) {
+    {
+        std::lock_guard<std::mutex> lock(job_dispatch_mutex_);
+        woken_drain_jobs_.insert(job_id);
+    }
+    job_dispatch_cv_.notify_one();
+}
+
 void MasterService::JobDispatchThreadFunc() {
-    while (job_dispatch_running_) {
+    using SteadyDuration = std::chrono::steady_clock::duration;
+    const auto min_sleep = std::chrono::duration_cast<SteadyDuration>(
+        std::chrono::milliseconds(kMinJobDispatchIntervalMs));
+    const auto sweep_interval = std::chrono::duration_cast<SteadyDuration>(
+        std::chrono::milliseconds(kJobDispatchThreadSleepMs));
+    // Rounds for woken jobs never postpone the full sweep, which jobs waiting
+    // for lease expiry or buffer reclamation rely on.
+    auto next_sweep = std::chrono::steady_clock::now();
+    while (job_dispatch_running_.load()) {
         // RFC #4700 slice 1: drain jobs mutate business metadata.
         if (!AdmitsBusinessWorkers()) {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(kJobDispatchThreadSleepMs));
+            std::unique_lock<std::mutex> lock(job_dispatch_mutex_);
+            job_dispatch_cv_.wait_for(
+                lock, std::chrono::milliseconds(kJobDispatchThreadSleepMs),
+                [&] { return !job_dispatch_running_.load(); });
             continue;
         }
 
-        ProcessDrainJobs();
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kJobDispatchThreadSleepMs));
+        std::unordered_set<UUID, boost::hash<UUID>> woken_jobs;
+        {
+            std::lock_guard<std::mutex> lock(job_dispatch_mutex_);
+            woken_jobs.swap(woken_drain_jobs_);
+        }
+
+        const auto round_start = std::chrono::steady_clock::now();
+        const bool full_sweep = round_start >= next_sweep;
+        ProcessDrainJobs(full_sweep ? nullptr : &woken_jobs);
+        const auto round_end = std::chrono::steady_clock::now();
+        if (full_sweep) {
+            next_sweep = round_end + sweep_interval;
+        }
+        const auto cooldown =
+            std::clamp(round_end - round_start, min_sleep, sweep_interval);
+
+        std::unique_lock<std::mutex> lock(job_dispatch_mutex_);
+        if (job_dispatch_cv_.wait_until(lock, round_end + cooldown, [&] {
+                return !job_dispatch_running_.load();
+            })) {
+            break;
+        }
+        job_dispatch_cv_.wait_until(lock, next_sweep, [&] {
+            return !job_dispatch_running_.load() || !woken_drain_jobs_.empty();
+        });
     }
 }
 

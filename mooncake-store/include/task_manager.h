@@ -86,6 +86,8 @@ struct Task {
     // A drain must observe the final result before this task can be pruned.
     // In particular, a processing timeout is not proof that its worker stopped.
     bool retained_by_drain = false;
+    // The drain job that submitted this task, if any.
+    std::optional<UUID> drain_job_id;
 
     bool is_finished() const { return is_finished_status(status); }
 
@@ -204,19 +206,23 @@ class ScopedTaskWriteAccess {
 
     ~ScopedTaskWriteAccess() = default;
 
+    // A task submitted with a drain_job_id is retained by that drain.
     template <TaskType Type>
     tl::expected<UUID, ErrorCode> submit_task_typed(
         const UUID& client_id,
         const typename TaskPayloadTraits<Type>::type& payload,
-        bool retained_by_drain = false) {
+        std::optional<UUID> drain_job_id = std::nullopt) {
         std::string json = serialize_payload(payload);
-        return submit_task(client_id, Type, json, retained_by_drain);
+        return submit_task(client_id, Type, json, drain_job_id);
     }
 
     std::vector<Task> pop_tasks(const UUID& client_id, size_t batch_size);
 
+    // Sets *drain_job_id to the task's drain job if this call finishes the
+    // task, and to nullopt otherwise.
     ErrorCode complete_task(const UUID& client_id, const UUID& task_id,
-                            TaskStatus status, const std::string& message);
+                            TaskStatus status, const std::string& message,
+                            std::optional<UUID>* drain_job_id = nullptr);
 
     ErrorCode cancel_task(const UUID& task_id, const TenantId& tenant_id);
 
@@ -233,7 +239,7 @@ class ScopedTaskWriteAccess {
     tl::expected<UUID, ErrorCode> submit_task(const UUID& client_id,
                                               TaskType type,
                                               const std::string& payload,
-                                              bool retained_by_drain);
+                                              std::optional<UUID> drain_job_id);
 
     ClientTaskManager* manager_;
     SharedMutexLocker lock_;
