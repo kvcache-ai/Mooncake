@@ -442,6 +442,7 @@ class TransferEngineImpl {
     Status setupLocalSegment();
 
     Status lazyFreeBatch();
+    Status freeSubBatches(Batch* batch);
 
     SelectionResult getTransportType(const Request& request,
                                      int transport_index = 0);
