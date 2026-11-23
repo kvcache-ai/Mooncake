@@ -169,6 +169,9 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
 
 Status MultiTransport::freeBatchID(BatchID batch_id,
                                    const std::function<void()>& before_delete) {
+    if (!Transport::isValidBatchID(batch_id)) {
+        return Status::InvalidArgument("Invalid batch ID");
+    }
     std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
     if (deferred_cleanup_batches_.count(batch_id) != 0) {
         return Status::BatchCleanupDeferred(
@@ -200,6 +203,9 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
 
 Status MultiTransport::tryFreeBatchID(
     BatchID batch_id, const std::function<void()>& before_delete) {
+    if (!Transport::isValidBatchID(batch_id)) {
+        return Status::InvalidArgument("Invalid batch ID");
+    }
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     bool busy = false;
@@ -331,6 +337,9 @@ bool MultiTransport::popCompletion(BatchCompletion& out) {
 }
 
 Status MultiTransport::enableBatchCompletionNotification(BatchID batch_id) {
+    if (!Transport::isValidBatchID(batch_id)) {
+        return Status::InvalidArgument("Invalid batch ID");
+    }
     if (completion_fd_ < 0) {
         return Status::CompletionNotificationUnsupported(
             "completion eventfd is not available");
@@ -577,6 +586,9 @@ Status MultiTransport::submitTransfer(
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     std::vector<size_t>* task_sizes) {
+    if (!Transport::isValidBatchID(batch_id)) {
+        return Status::InvalidArgument("Invalid batch ID");
+    }
     auto& batch_desc = *((BatchDesc*)(batch_id));
     if (!task_sizes &&
         batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
@@ -697,7 +709,7 @@ Status MultiTransport::submitScatter(
     if (entries.empty())
         return Status::InvalidArgument("scatter transfer is empty");
     submission.batch_id = allocateBatchID(0);
-    if (submission.batch_id == static_cast<BatchID>(-1))
+    if (!Transport::isValidBatchID(submission.batch_id))
         return Status::InvalidArgument(
             "failed to allocate scatter transfer batch");
     return submitTransfer(submission.batch_id, entries, &submission.task_sizes);
@@ -707,6 +719,9 @@ Status MultiTransport::submitScatter(
 Status MultiTransport::mp_submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     std::string& proto) {
+    if (!Transport::isValidBatchID(batch_id)) {
+        return Status::InvalidArgument("Invalid batch ID");
+    }
     auto& batch_desc = *((BatchDesc*)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         return Status::TooManyRequests(
@@ -779,6 +794,9 @@ Status MultiTransport::mp_submitTransfer(
 
 Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                                          TransferStatus& status) {
+    if (!Transport::isValidBatchID(batch_id)) {
+        return Status::InvalidArgument("Invalid batch ID");
+    }
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     if (task_id >= task_count) {
@@ -854,8 +872,8 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
 static Status lookupTask(BatchID batch_id, size_t task_id,
                          const Transport::TransferTask*& task) {
-    if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
-        return Status::InvalidArgument("Invalid Batch ID");
+    if (!Transport::isValidBatchID(batch_id))
+        return Status::InvalidArgument("Invalid batch ID");
     const auto& batch_desc = Transport::toBatchDesc(batch_id);
     if (task_id >= batch_desc.task_list.size())
         return Status::InvalidArgument("Task ID out of range");
@@ -931,6 +949,9 @@ Status MultiTransport::getTaskCongestionDetail(
 Status MultiTransport::getScatterRequestStatuses(
     BatchID batch_id, size_t task_id,
     std::vector<TransferStatusEnum>& request_statuses) {
+    if (!Transport::isValidBatchID(batch_id)) {
+        return Status::InvalidArgument("Invalid batch ID");
+    }
     auto& batch_desc = *((BatchDesc*)(batch_id));
     if (task_id >= batch_desc.task_list.size())
         return Status::InvalidArgument("Task ID out of range");
@@ -968,6 +989,9 @@ Status MultiTransport::getScatterRequestStatuses(
 Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
                                               TransferStatus& status,
                                               bool walk_tasks) {
+    if (!Transport::isValidBatchID(batch_id)) {
+        return Status::InvalidArgument("Invalid batch ID");
+    }
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;

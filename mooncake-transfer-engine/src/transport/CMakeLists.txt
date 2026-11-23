@@ -2,11 +2,8 @@ file(GLOB XPORT_SOURCES "*.cpp")
 
 add_subdirectory(rdma_transport)
 add_subdirectory(rdma_twosided)
-add_subdirectory(rpc_communicator)
-add_library(
-  transport OBJECT
-  ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport>
-  $<TARGET_OBJECTS:rdma_twosided> $<TARGET_OBJECTS:rpc_communicator>)
+add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport>
+                             $<TARGET_OBJECTS:rdma_twosided>)
 target_link_libraries(
   transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog
                     pthread)
@@ -43,7 +40,6 @@ endif()
 
 add_subdirectory(shm_transport)
 target_sources(transport PUBLIC $<TARGET_OBJECTS:shm_transport>)
-
 
 if(USE_ASCEND_DIRECT)
   add_subdirectory(ascend_transport)
@@ -113,7 +109,10 @@ if(USE_CUDA
   target_sources(transport PUBLIC $<TARGET_OBJECTS:device_transport>)
   # device_transport (ibgda_device_transport.cpp / mlx5gda.cpp) calls libmlx5
   # DevX symbols (mlx5dv_devx_*, mlx5dv_init_obj) directly.
-  if((USE_CUDA OR USE_MUSA OR USE_MACA) AND NOT USE_CXI)
+  if((USE_CUDA
+      OR USE_MUSA
+      OR USE_MACA)
+     AND NOT USE_CXI)
     target_link_libraries(transport PUBLIC mlx5)
   endif()
   if(USE_CUDA AND MOONCAKE_HAVE_MLX5_DMABUF_UMEM)

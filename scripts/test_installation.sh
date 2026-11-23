@@ -61,7 +61,9 @@ python unit_tests/test_mooncake_config.py
 
 echo "Running reshard contract tests..."
 python -m pip install pytest hypothesis==6.141.0 paramiko
-python -m pytest reshard_tests ssd_tests store_tests -q
+python -m pytest reshard_tests ssd_tests store_tests -q \
+  unit_tests/test_rpc_interface.py unit_tests/test_shared_segment.py \
+  unit_tests/test_transfer_engine_topology.py
 
 echo "Verifying mooncake_master entry point..."
 # Check if the mooncake_master entry point is installed and executable

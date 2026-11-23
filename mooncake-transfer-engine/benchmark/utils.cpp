@@ -54,6 +54,8 @@ DEFINE_uint64(max_block_size, 1UL << 26, "Maximum block size (in bytes).");
 DEFINE_uint64(start_batch_size, 1, "Start batch size (number of requests).");
 DEFINE_uint64(max_batch_size, 1, "Maximum batch size (number of requests).");
 DEFINE_int32(duration, 5, "Number of duration per test case.");
+DEFINE_int32(warmup_ms, 1000,
+             "Warmup time per test case in milliseconds (0 disables warmup).");
 DEFINE_int32(start_num_threads, 1,
              "Start number of concurrent worker threads.");
 DEFINE_int32(max_num_threads, 1,
@@ -180,6 +182,7 @@ size_t XferBenchConfig::max_block_size = 0;
 size_t XferBenchConfig::start_batch_size = 0;
 size_t XferBenchConfig::max_batch_size = 0;
 int XferBenchConfig::duration = 0;
+int XferBenchConfig::warmup_ms = 1000;
 int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
 size_t XferBenchConfig::target_offset = 0;
@@ -294,6 +297,7 @@ void XferBenchConfig::loadFromFlags() {
     deadline_tight_threads = FLAGS_deadline_tight_threads;
     deadline_bw_arbitration = FLAGS_deadline_bw_arbitration;
     duration = FLAGS_duration;
+    warmup_ms = FLAGS_warmup_ms;
 
     metadata_type = FLAGS_metadata_type;
     metadata_url_list = FLAGS_metadata_url_list;
