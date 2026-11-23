@@ -14,6 +14,7 @@
 
 #include "tent/platform/ascend.h"
 #include "tent/runtime/topology.h"
+#include "tent/common/config.h"
 #include "tent/common/status.h"
 
 #include <numa.h>
@@ -48,8 +49,12 @@ bool WantFabricMem(const std::shared_ptr<Config>& conf,
     if (!conf->get("transports/ascend_direct/store_te_init", false)) {
         return false;
     }
-    const char* env = std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
-    return env && std::strcmp(env, "1") == 0;
+    const char* env = std::getenv("MC_ASCEND_ENABLE_USE_FABRIC_MEM");
+    if (env == nullptr || env[0] == '\0') {
+        env = std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
+    }
+    return env != nullptr && env[0] != '\0' &&
+           ConfigHelper::parseBool(env, false);
 }
 
 #ifdef ASCEND_SUPPORT_FABRIC_MEM

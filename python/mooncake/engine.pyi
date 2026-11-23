@@ -22,6 +22,28 @@ SUPPORT_MUSA: bool
 SUPPORT_TENT: bool
 SUPPORT_XPU: bool
 
+class CompletionNotificationFallback(Exception):
+    """Notification was requested, but this submit must fall back to polling."""
+
+class TransferStatus:
+    """Values carried by ``drain_completions`` rows as ``status``."""
+
+    WAITING: ClassVar[TransferStatus]
+    PENDING: ClassVar[TransferStatus]
+    INVALID: ClassVar[TransferStatus]
+    CANCELED: ClassVar[TransferStatus]
+    COMPLETED: ClassVar[TransferStatus]
+    TIMEOUT: ClassVar[TransferStatus]
+    FAILED: ClassVar[TransferStatus]
+    __members__: ClassVar[dict[str, TransferStatus]]
+    def __init__(self, value: int) -> None: ...
+    def __int__(self) -> int: ...
+    def __index__(self) -> int: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+
 class TransferOpcode:
     Read: ClassVar[TransferOpcode]
     Write: ClassVar[TransferOpcode]
@@ -292,7 +314,15 @@ class TransferEngine:
         opcode: _TransferOpcode,
         transport_hint: str = "",
         nic_hint: str = "",
-    ) -> int: ...
+        enable_completion_notification: bool = False,
+    ) -> int:
+        """Return a batch id.
+
+        With completion notification enabled, a path that cannot complete
+        without polling raises CompletionNotificationFallback. Every other
+        failure still returns 0. Without the flag, failure also returns 0.
+        """
+        ...
     # The *_on_cuda methods are only bound when SUPPORT_CUDA is true.
     def transfer_write_on_cuda(
         self,
@@ -335,6 +365,9 @@ class TransferEngine:
         nic_hint: str = "",
     ) -> None: ...
     def get_batch_transfer_status(self, batch_ids: Sequence[int], /) -> int: ...
+    def completion_fd(self) -> int: ...
+    def free_batch_id(self, batch_id: int) -> int: ...
+    def drain_completions(self) -> list[dict[str, int]]: ...
     def transfer_submit_write(
         self,
         target_hostname: str,
@@ -345,6 +378,7 @@ class TransferEngine:
         nic_hint: str = "",
     ) -> int: ...
     def transfer_check_status(self, batch_id: int, /) -> int: ...
+    def batch_transfer_check_status(self, batch_ids: Sequence[int], /) -> list[int]: ...
     def write_bytes_to_buffer(
         self, dest_address: int, src_ptr: bytes | str, length: int, /
     ) -> int: ...
@@ -358,6 +392,7 @@ class TransferEngine:
         remote_accessible: bool = True,
     ) -> int: ...
     def unregister_memory(self, buffer_addr: int, /) -> int: ...
+    def disconnect_all_peers(self) -> int: ...
     def batch_register_memory(
         self,
         buffer_addresses: Sequence[int],

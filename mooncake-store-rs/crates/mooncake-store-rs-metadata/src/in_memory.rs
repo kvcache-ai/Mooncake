@@ -380,7 +380,9 @@ impl MetadataBackend for InMemoryMetadataBackend {
             };
             lease.state = next;
         }
-        if next != ClientLifecycleState::Active {
+        if next != ClientLifecycleState::Active
+            && state.stable_runtimes.get(&runtime.stable_id) == Some(&runtime_key)
+        {
             state.stable_runtimes.remove(&runtime.stable_id);
         }
         Ok(())
@@ -592,6 +594,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
             return Ok(CasResult {
                 applied: false,
                 current,
+                delete_version: None,
                 version_floor: None,
             });
         }
@@ -608,6 +611,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
         Ok(CasResult {
             applied: true,
             current: next.cloned(),
+            delete_version: None,
             version_floor: None,
         })
     }
@@ -1358,6 +1362,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new(owner_id, ClientEpoch(1)),
                 segment_name: SegmentName::new(seg_name),
+                allocation_id: None,
                 offset: Some(0),
                 segment_offset: 0,
                 length: 4096,
@@ -2442,6 +2447,52 @@ mod tests {
             .update_client_state(&runtime, ClientLifecycleState::Draining)
             .expect_err("phantom lease has no state to update");
         assert!(matches!(err, StoreError::NotFound(_)));
+    }
+
+    #[test]
+    fn update_client_state_only_removes_owned_stable_runtime() {
+        let metadata = InMemoryMetadataBackend::new();
+        let predecessor = make_lease("client-handoff", 5);
+        metadata
+            .upsert_client_lease(&predecessor)
+            .expect("predecessor active lease should upsert");
+        metadata
+            .update_client_state(&predecessor.runtime, ClientLifecycleState::Draining)
+            .expect("predecessor should enter draining");
+        assert!(metadata
+            .get_live_runtime_by_stable_id(&predecessor.runtime.stable_id)
+            .expect("owned stable lookup should succeed")
+            .is_none());
+
+        let successor = make_lease("client-handoff", 6);
+        metadata
+            .upsert_client_lease(&successor)
+            .expect("successor active lease should upsert");
+        assert_eq!(
+            metadata
+                .get_live_runtime_by_stable_id(&successor.runtime.stable_id)
+                .expect("successor stable lookup should succeed"),
+            Some(successor.clone())
+        );
+
+        metadata
+            .update_client_state(&predecessor.runtime, ClientLifecycleState::Offline)
+            .expect("predecessor state update should succeed");
+
+        assert_eq!(
+            metadata
+                .get_client_lease(&predecessor.runtime)
+                .expect("predecessor lease lookup should succeed")
+                .expect("predecessor lease should remain present")
+                .state,
+            ClientLifecycleState::Offline
+        );
+        assert_eq!(
+            metadata
+                .get_live_runtime_by_stable_id(&successor.runtime.stable_id)
+                .expect("stable lookup after predecessor state update should succeed"),
+            Some(successor)
+        );
     }
 
     #[test]
