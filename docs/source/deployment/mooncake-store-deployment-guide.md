@@ -863,6 +863,7 @@ mooncake_master \
 | `--allow_evict_soft_pinned_objects` | `true` | Allow evicting soft-pinned objects |
 | `--eviction_ratio` | `0.05` | Fraction evicted at high watermark |
 | `--eviction_high_watermark_ratio` | `0.90` | Usage ratio triggering eviction |
+| `--eviction_worker_threads` | `0` | Threads per memory eviction pass; `0` picks one per 16M keys (1–64), `1`–`64` sets the count |
 | `--client_ttl` | `10` s | Seconds before a silent client is considered disconnected |
 
 ### Tenant Quota
@@ -1394,6 +1395,14 @@ mooncake_client \
 | `--enable_http_server` | `false` | Enable client-side `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `--http_port` | `9300` | Client-side HTTP endpoint port |
 
+The real client queues shared-memory registration connections while serving
+another client. It reads `MOONCAKE_UDS_LISTEN_BACKLOG` to configure its UDS
+acceptor's pending connection backlog
+(default `128`, replacing the previous fixed value `5`). It accepts a positive
+integer; an empty, invalid, or nonpositive value logs a warning and uses `128`.
+The kernel may cap this value at `net.core.somaxconn`. This setting does not
+change connection or receive timeouts.
+
 `mooncake_client --version` prints the release version plus the short git hash,
 and the same value is logged at startup.
 
@@ -1519,6 +1528,18 @@ Do not run binaries from before and after checksum support was introduced in the
 | `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Disable arena, fall back to per-call `mmap()`. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
 | `MC_STORE_REGISTER_SPDK` | unset | Set `1` to register `ShmHelper`-allocated shared memory (host pool, dummy local buffer) with SPDK for NoF zero-copy transfers. Forces HugeTLB backing for those allocations, defaulting to 2MB hugepages when `MC_STORE_USE_HUGEPAGE` is unset. Must be set on BOTH the dummy and the real process (SPDK registration is per-process) |
+| `MC_STORE_MADV_HUGEPAGE` | unset (off) | Set `1` to back the RDMA client (local) buffer with transparent huge pages (`madvise(MADV_HUGEPAGE)`), like the RDMA global segment. Ignored when `MC_STORE_USE_HUGEPAGE` is set. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
+
+Without `MC_STORE_USE_HUGEPAGE`, the RDMA global segment is an anonymous
+mapping advised with `madvise(MADV_HUGEPAGE)`, so it is backed by transparent
+huge pages when the host THP mode is `always` or `madvise`. Set
+`MC_STORE_MADV_HUGEPAGE=1` to back the RDMA client (local) buffer the same way;
+it is off by default. THP keeps the NIC memory-registration footprint 512x
+smaller than 4KB-backed memory, which some NICs (e.g. Pensando ionic) need to
+register more than a few GiB. THP backing is best effort: under memory
+fragmentation part of the mapping may stay base-page backed; use
+`MC_STORE_USE_HUGEPAGE` to guarantee huge pages. Dummy-client shared-memory
+buffers are not covered.
 
 RDMA Store segments backed by HugeTLB are populated in parallel immediately
 before transfer-engine registration. No additional population-mode setting is

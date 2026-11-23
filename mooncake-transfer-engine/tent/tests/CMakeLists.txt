@@ -229,6 +229,10 @@ target_include_directories(transfer_engine_config_override_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME transfer_engine_config_override_test
          COMMAND transfer_engine_config_override_test)
+if(TARGET metastore_http)
+  target_compile_definitions(transfer_engine_config_override_test
+                             PRIVATE TENT_TEST_HTTP_METASTORE)
+endif()
 
 # Platform::getLoader is a process-wide singleton. Keep this regression in a
 # dedicated CPU-only process so its first call always exercises the null-config
@@ -560,6 +564,16 @@ target_link_libraries(tent_quota_accounting_test PRIVATE gtest gtest_main
 target_include_directories(tent_quota_accounting_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_quota_accounting_test COMMAND tent_quota_accounting_test)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(tent_shared_quota_test shared_quota_test.cpp)
+  target_link_libraries(tent_shared_quota_test PRIVATE gtest gtest_main
+                                                       tent_link_group)
+  target_link_options(tent_shared_quota_test PRIVATE "-Wl,--wrap=clock_gettime")
+  target_include_directories(tent_shared_quota_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_shared_quota_test COMMAND tent_shared_quota_test)
+endif()
 
 # QoS Contract Schema Unit Test
 add_executable(tent_qos_contract_test qos_contract_test.cpp
@@ -904,8 +918,8 @@ endif()
 
 if(USE_ASCEND_DIRECT)
   add_executable(tent_shared_host_mapper_test shared_host_mapper_test.cpp)
-  target_link_libraries(tent_shared_host_mapper_test
-                        PRIVATE gtest gtest_main tent_link_group)
+  target_link_libraries(tent_shared_host_mapper_test PRIVATE gtest gtest_main
+                                                             tent_link_group)
   target_include_directories(tent_shared_host_mapper_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_shared_host_mapper_test
@@ -991,3 +1005,10 @@ if(USE_MLU)
     "-Wl,--wrap=cnQueryNotifier"
     "-Wl,--wrap=cnQueryQueue")
 endif()
+
+# Exercise the C translation unit against the production shared library.
+enable_language(C)
+add_executable(tent_c_status_test c_status_test.cpp status_c_api_smoke.c)
+target_link_libraries(tent_c_status_test PRIVATE tent_shared tent_interface
+                                                 gtest gtest_main)
+add_test(NAME tent_c_status_test COMMAND tent_c_status_test)
