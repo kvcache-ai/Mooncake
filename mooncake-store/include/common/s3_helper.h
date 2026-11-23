@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 
@@ -19,6 +20,10 @@ class S3Helper {
     static void InitAPI();
 
     static void ShutdownAPI();
+
+    // Recognize the stable category emitted by object read failures. The
+    // category is derived from SDK fields, never from the human-readable text.
+    static bool IsNotFoundError(std::string_view error);
 
    private:
     static bool aws_initialized;

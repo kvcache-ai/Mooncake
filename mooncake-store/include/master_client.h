@@ -379,6 +379,17 @@ class MasterClient {
     [[nodiscard]] tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
     /**
+     * @brief Set the soft-pin TTL of existing objects without transferring
+     * data.
+     * @param keys Object keys in this client's tenant.
+     * @param ttl_ms TTL from now; zero clears the soft pin. Must not exceed the
+     * master's max_kv_soft_pin_ttl. Soft pins remain runtime-only hints.
+     * @return One status per key in input order; the batch is not atomic.
+     */
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpdateSoftPin(
+        const std::vector<std::string>& keys, uint64_t ttl_ms);
+
+    /**
      * @brief Batch remove objects and all their replicas
      * @param keys List of keys to remove
      * @param force If true, skip lease and replication task checks
@@ -734,6 +745,30 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
         const UUID& task_id);
+
+    [[nodiscard]] tl::expected<void, ErrorCode> CancelTask(const UUID& task_id);
+    [[nodiscard]] tl::expected<bool, ErrorCode> IsTaskCancellationRequested(
+        const UUID& task_id);
+
+    /**
+     * List task summaries in this client's tenant (request.tenant_id is
+     * replaced). Keep filters fixed while following next_page_token.
+     * Pages reflect current state, not a snapshot across calls; completed
+     * tasks may disappear when task-history retention prunes them.
+     */
+    [[nodiscard]] tl::expected<ListTasksResponse, ErrorCode> ListTasks(
+        TaskListRequest request = {});
+
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateDrainJob(
+        const CreateDrainJobRequest& request);
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateTimedDrainJob(
+        const CreateDrainJobRequest& request, uint64_t timeout_ms);
+    [[nodiscard]] tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(
+        const UUID& job_id);
+    [[nodiscard]] tl::expected<ListDrainJobsResponse, ErrorCode> ListDrainJobs(
+        const DrainJobListRequest& request);
+    [[nodiscard]] tl::expected<void, ErrorCode> CancelDrainJob(
+        const UUID& job_id);
 
     /**
      * @brief Fetch tasks assigned to a client

@@ -1,14 +1,14 @@
 use super::super::{
     cold_tier_device_id, current_time_ms, refresh_cold_tier_device_cache, registry, CasResult,
-    ColdObjectWrite, ColdTierCleanupGuard, ColdTierCleanupManager, ColdTierDeviceRecord,
-    ColdTierOffloadManager, ColdTierOffloadMode, ColdTierOffloadPriorityConfig,
-    ColdTierOffloadRunGuard, ColdTierPendingOffloadPolicy, FreeSchedulerState, ObjectKey,
-    ObjectRoute, OperationTracker, PendingOffloadCasContext, PendingOffloadCasOutcome,
-    PendingOffloadEntry, PendingOffloadKey, PendingOffloadMaterialization, PendingOffloadPayload,
-    PendingOffloadPrepareOutcome, PendingOffloadQueue, PendingOffloadQueueSnapshot,
-    PendingOffloadReadyRoute, PersistentStorageBackend, Result, RouteCasRequest, RouteState,
-    RouteVersion, StorageOwnerState, StoreError, DEFAULT_PENDING_OFFLOAD_RETRY_BASE_MS,
-    DEFAULT_PENDING_OFFLOAD_RETRY_MAX_MS,
+    ColdBackingIdentity, ColdObjectWrite, ColdTierCleanupGuard, ColdTierCleanupManager,
+    ColdTierDeviceRecord, ColdTierOffloadManager, ColdTierOffloadMode,
+    ColdTierOffloadPriorityConfig, ColdTierOffloadRunGuard, ColdTierPendingOffloadPolicy,
+    FreeSchedulerState, ObjectKey, ObjectRoute, OperationTracker, PendingOffloadCasContext,
+    PendingOffloadCasOutcome, PendingOffloadEntry, PendingOffloadKey,
+    PendingOffloadMaterialization, PendingOffloadPayload, PendingOffloadPrepareOutcome,
+    PendingOffloadQueue, PendingOffloadQueueSnapshot, PendingOffloadReadyRoute,
+    PersistentStorageBackend, Result, RouteCasRequest, RouteState, RouteVersion, StorageOwnerState,
+    StoreError, DEFAULT_PENDING_OFFLOAD_RETRY_BASE_MS, DEFAULT_PENDING_OFFLOAD_RETRY_MAX_MS,
 };
 use super::{
     backend_remove_cold_payload, backend_remove_pending_source, backend_store_cold_payload_batch,
@@ -16,6 +16,7 @@ use super::{
     pending_persistent_backing, persistent_backing_contains_target, persistent_backing_targets,
     pin_local_hot_replica_payload, read_local_hot_replica_payload, same_cold_payload,
 };
+use mooncake_store_core::ColdBackingRoute;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -878,6 +879,8 @@ pub(in super::super) fn materialize_prepared_pending_offload_batch(
     // Write to replica backends (best-effort — failures are logged but don't
     // block the primary offload).
     write_pending_offload_replicas(storage_owner, pending, &mut ready);
+    // Reclaim can observe the new route as soon as the CAS applies.
+    let settlement = storage_owner.pending_offloads.guard_settlement(&ready);
     let cas_tracker = OperationTracker::new("cold_offload_route_cas_batch");
     let cas_results = match cas_pending_offload_routes(storage_owner, pending, &ready) {
         Ok(results) => {
@@ -909,15 +912,13 @@ pub(in super::super) fn materialize_prepared_pending_offload_batch(
     for backing in &outcome.cleanup {
         remove_unpublished_persistent_backing(storage_owner, backing);
     }
-    if let Err(error) = settle_pending_offload_batch(
+    settle_pending_offload_batch(
         storage_owner,
         pending,
         outcome.used_add_bytes,
         outcome.reserved_release_bytes,
-    ) {
-        complete_pending_offload_batch(storage_owner, pending);
-        return Err(error);
-    }
+    )?;
+    drop(settlement);
     // Signal cold restore waiters that new Materialized entries are available for
     // zero-I/O eviction. This is the "proxy execution" notification: offload completed
     // its SSD write, now cold restore can evict the clean entry instantly.
@@ -1092,15 +1093,6 @@ fn retry_pending_offload_batch(
 ) {
     for prepared in pending {
         storage_owner.pending_offloads.retry(prepared.entry.clone());
-    }
-}
-
-fn complete_pending_offload_batch(
-    storage_owner: &StorageOwnerState,
-    pending: &[PendingOffloadMaterialization],
-) {
-    for prepared in pending {
-        storage_owner.pending_offloads.complete(&prepared.entry.key);
     }
 }
 
@@ -1629,11 +1621,43 @@ fn rebuild_pending_offload_queue_with(
 // ColdTierOffloadManager / PendingOffloadQueue impl blocks
 // ---------------------------------------------------------------------------
 
+impl From<&ColdBackingRoute> for ColdBackingIdentity {
+    fn from(backing: &ColdBackingRoute) -> Self {
+        Self {
+            owner: backing.owner.clone(),
+            cold_tier_id: backing.cold_tier_id.clone(),
+            object_locator: backing.object_locator.clone(),
+        }
+    }
+}
+
+struct ColdOffloadSettlementGuard<'a> {
+    manager: &'a ColdTierOffloadManager,
+    backings: Vec<ColdBackingIdentity>,
+}
+
+impl Drop for ColdOffloadSettlementGuard<'_> {
+    fn drop(&mut self) {
+        let mut settling = self.manager.settling_backings.lock();
+        for backing in self.backings.drain(..) {
+            if let std::collections::btree_map::Entry::Occupied(mut entry) = settling.entry(backing)
+            {
+                if *entry.get() == 1 {
+                    entry.remove();
+                } else {
+                    *entry.get_mut() -= 1;
+                }
+            }
+        }
+    }
+}
+
 impl ColdTierOffloadManager {
     pub(in super::super) fn new(priority: ColdTierOffloadPriorityConfig) -> Self {
         Self {
             queue: Mutex::new(PendingOffloadQueue::new(priority)),
             materializing: AtomicBool::new(false),
+            settling_backings: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1696,6 +1720,30 @@ impl ColdTierOffloadManager {
         route_version: RouteVersion,
     ) -> Option<PendingOffloadEntry> {
         self.queue.lock().claim(route_key, route_version)
+    }
+
+    fn guard_settlement(
+        &self,
+        ready: &[PendingOffloadReadyRoute],
+    ) -> ColdOffloadSettlementGuard<'_> {
+        let backings = ready
+            .iter()
+            .map(|route| ColdBackingIdentity::from(&route.materialized_cold_backing))
+            .collect::<Vec<_>>();
+        let mut settling = self.settling_backings.lock();
+        for backing in &backings {
+            *settling.entry(backing.clone()).or_default() += 1;
+        }
+        ColdOffloadSettlementGuard {
+            manager: self,
+            backings,
+        }
+    }
+
+    pub(in super::super) fn is_settling(&self, backing: &ColdBackingRoute) -> bool {
+        self.settling_backings
+            .lock()
+            .contains_key(&ColdBackingIdentity::from(backing))
     }
 
     pub(in super::super) fn complete(&self, key: &PendingOffloadKey) {

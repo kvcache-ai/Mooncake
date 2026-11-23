@@ -47,6 +47,11 @@ _CPP_PUBLIC_NAMES = {
     "TaskType",
     "TaskStatus",
     "QueryTaskResponse",
+    "JobType",
+    "JobStatus",
+    "QueryJobResponse",
+    "ListTasksResponse",
+    "ListDrainJobsResponse",
     "BufferHandle",
     "BufferLeaseView",
     "BufferLease",
@@ -81,6 +86,7 @@ _CPP_PUBLIC_NAMES = {
     "REPLICA_MOVE",
     "PENDING",
     "SUCCESS",
+    "CANCELED",
 }
 
 

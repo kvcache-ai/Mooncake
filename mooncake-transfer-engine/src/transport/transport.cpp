@@ -49,6 +49,9 @@ Transport::BatchID Transport::allocateBatchID(size_t batch_size) {
 }
 
 Status Transport::freeBatchID(BatchID batch_id) {
+    if (!isValidBatchID(batch_id)) {
+        return Status::InvalidArgument("Invalid batch ID");
+    }
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {

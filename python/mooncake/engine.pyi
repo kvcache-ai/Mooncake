@@ -25,7 +25,6 @@ SUPPORT_XPU: bool
 class CompletionNotificationFallback(Exception):
     """Notification was requested, but this submit must fall back to polling."""
 
-
 class TransferStatus:
     """Values carried by ``drain_completions`` rows as ``status``."""
 
@@ -44,7 +43,6 @@ class TransferStatus:
     def name(self) -> str: ...
     @property
     def value(self) -> int: ...
-
 
 class TransferOpcode:
     Read: ClassVar[TransferOpcode]
@@ -380,6 +378,7 @@ class TransferEngine:
         nic_hint: str = "",
     ) -> int: ...
     def transfer_check_status(self, batch_id: int, /) -> int: ...
+    def batch_transfer_check_status(self, batch_ids: Sequence[int], /) -> list[int]: ...
     def write_bytes_to_buffer(
         self, dest_address: int, src_ptr: bytes | str, length: int, /
     ) -> int: ...
@@ -392,6 +391,7 @@ class TransferEngine:
         remote_accessible: bool = True,
     ) -> int: ...
     def unregister_memory(self, buffer_addr: int, /) -> int: ...
+    def disconnect_all_peers(self) -> int: ...
     def batch_register_memory(
         self,
         buffer_addresses: Sequence[int],
