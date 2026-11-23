@@ -99,6 +99,9 @@ class TransferEnginePy {
 
     int transferCheckStatus(batch_id_t batch_id);
 
+    std::vector<int> batchTransferCheckStatus(
+        const std::vector<batch_id_t> &batch_ids);
+
     int transferSyncRead(const char *target_hostname, uintptr_t buffer,
                          uintptr_t peer_buffer_address, size_t length,
                          const std::string &transport_hint = "",
@@ -302,6 +305,8 @@ class TransferEnginePy {
     // must be called before TransferEnginePy::~TransferEnginePy()
     int unregisterMemory(uintptr_t buffer_addr);
 
+    int disconnectAllPeers();
+
     int batchRegisterMemory(std::vector<uintptr_t> buffer_addresses,
                             std::vector<size_t> capacities,
                             const std::string &location = kWildcardLocation);
@@ -330,6 +335,8 @@ class TransferEnginePy {
         const std::vector<std::vector<size_t>> &lengths, TransferOpcode opcode);
 
     int resolveNicHint(const std::string &name) const;
+
+    int checkSingleBatchStatus(batch_id_t batch_id);
 
     char *allocateRawBuffer(size_t capacity);
 

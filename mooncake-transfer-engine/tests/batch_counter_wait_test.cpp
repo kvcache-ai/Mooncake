@@ -1049,5 +1049,23 @@ TEST_F(BatchCounterWait, DrainRacesFreeAfterPublish) {
 #endif
 }
 
+TEST_F(BatchCounterWait, RejectsInvalidBatchHandles) {
+    Transport::TransferStatus status{};
+    std::vector<Transport::TransferStatusEnum> scatter_statuses;
+    for (Transport::BatchID bad :
+         {Transport::BatchID{0}, UINT64_MAX,
+          static_cast<Transport::BatchID>(ERR_MEMORY)}) {
+        EXPECT_TRUE(
+            multi.enableBatchCompletionNotification(bad).IsInvalidArgument());
+        EXPECT_TRUE(multi.submitTransfer(bad, {}).IsInvalidArgument());
+        EXPECT_TRUE(
+            multi.getTransferStatus(bad, 0, status).IsInvalidArgument());
+        EXPECT_TRUE(multi.getScatterRequestStatuses(bad, 0, scatter_statuses)
+                        .IsInvalidArgument());
+        EXPECT_TRUE(
+            multi.getBatchTransferStatus(bad, status).IsInvalidArgument());
+        EXPECT_TRUE(multi.freeBatchID(bad).IsInvalidArgument());
+    }
+}
 }  // namespace
 }  // namespace mooncake
