@@ -155,6 +155,31 @@ has drained. Publish the destination data only after the read succeeds.
 
 ## Storage Backends
 
+### Owner-read controller development
+
+The owner-read controller provides request validation, bounded admission,
+terminal-result caching, and destination-registration lifetime tracking for
+the owner-push work in RFC #5768. Integration supplies the trusted peer
+bindings, a control-call adapter, an SSD reader and a transport write target.
+The adapter must authenticate both directions before interpreting a reply
+as evidence of drain.
+
+`SsdFixedL2Requester::ReadWithRecovery` makes bounded recovery attempts.
+A result without a terminal snapshot retains the registered allocation owner
+and records the attempt as pending. Only managed allocations may use this
+API. A raw borrowed application pointer requires an independent receiver
+fence before the application can reuse it after a failed call.
+
+Retired owner request IDs are stored as bounded, coalesced ranges. Recovering
+one ID retires that ID alone, allowing earlier requests to arrive out of order.
+The terminal cache evicts by completion time. Running attempts retain their
+resource credits, while an admitted operation abandoned before start returns
+its credits with a rejected result.
+
+This component is exercised through injected transport and storage adapters.
+The network listener, authenticated bootstrap, epoch retirement, and the
+public managed-buffer API are integration work tracked by RFC #5768.
+
 ### BucketStorageBackend (default)
 
 Objects are grouped into **buckets** before being written to disk. Each bucket produces two files:

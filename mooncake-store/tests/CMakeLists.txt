@@ -697,3 +697,13 @@ target_include_directories(hf3fs_resource_manager_test BEFORE
 target_link_libraries(hf3fs_resource_manager_test PRIVATE gtest gtest_main
                                                           pthread)
 add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)
+
+add_store_test(ssd_destination_registry_test ssd_destination_registry_test.cpp)
+
+add_store_test(ssd_read_protocol_test ssd_read_protocol_test.cpp)
+
+add_store_test(ssd_direct_read_test ssd_direct_read_test.cpp)
+
+add_store_test(ssd_fixed_l2_requester_test ssd_fixed_l2_requester_test.cpp)
+
+add_store_test(ssd_control_wire_test ssd_control_wire_test.cpp)
