@@ -101,13 +101,17 @@ TEST(HALeaseTtlConfigTest, SupervisorConfigCarriesMasterConfigTtl) {
     EXPECT_EQ(17, supervisor_config.ha_leader_lease_ttl_sec);
 }
 
-TEST(OffloadConfigTest, ConfigSurvivesAdaptersAndValidates) {
+TEST(OffloadPromotionConfigTest, ConfigSurvivesAdaptersAndValidates) {
     MasterConfig master{};
     master.enable_offload = true;
     master.offload_on_evict = true;
     master.offload_force_evict = true;
     master.offloading_queue_limit = 4096;
     master.offload_cap_ratio = 0.25;
+    master.promotion_on_hit = true;
+    master.promotion_admission_threshold = 3;
+    master.promotion_queue_limit = 2048;
+    master.promotion_max_per_heartbeat = 4;
 
     WrappedMasterServiceConfig wrapped(master, 0);
     MasterServiceConfig service(wrapped);
@@ -116,6 +120,10 @@ TEST(OffloadConfigTest, ConfigSurvivesAdaptersAndValidates) {
     EXPECT_TRUE(service.offload_config.offload_force_evict);
     EXPECT_EQ(service.offload_config.offloading_queue_limit, 4096u);
     EXPECT_DOUBLE_EQ(service.offload_config.offload_cap_ratio, 0.25);
+    EXPECT_TRUE(service.promotion_config.promotion_on_hit);
+    EXPECT_EQ(service.promotion_config.promotion_admission_threshold, 3u);
+    EXPECT_EQ(service.promotion_config.promotion_queue_limit, 2048u);
+    EXPECT_EQ(service.promotion_config.promotion_max_per_heartbeat, 4u);
     EXPECT_NO_THROW(service.Validate());
     EXPECT_EQ(service.offload_config.OffloadCap(), 1024);
     EXPECT_TRUE(service.offload_config.ShouldOffloadOnEvict());
@@ -134,7 +142,7 @@ TEST(OffloadConfigTest, ConfigSurvivesAdaptersAndValidates) {
         EXPECT_FALSE(disabled_cfg.ShouldOffloadOnPutEnd());
     }
 
-    // Invalid offload values fail config validation directly.
+    // Invalid offload & promotion values fail config validation directly.
     {
         MasterServiceConfig bad = service;
         bad.offload_config.offload_cap_ratio = 1.5;
@@ -151,11 +159,32 @@ TEST(OffloadConfigTest, ConfigSurvivesAdaptersAndValidates) {
         bad.offload_config.offloading_queue_limit = 0;
         EXPECT_THROW(bad.Validate(), std::invalid_argument);
     }
+    {
+        MasterServiceConfig bad = service;
+        bad.promotion_config.promotion_admission_threshold = 0;
+        EXPECT_THROW(bad.Validate(), std::invalid_argument);
+    }
+    {
+        MasterServiceConfig bad = service;
+        bad.promotion_config.promotion_admission_threshold = 256;
+        EXPECT_THROW(bad.Validate(), std::invalid_argument);
+    }
+    {
+        MasterServiceConfig bad = service;
+        bad.promotion_config.promotion_max_per_heartbeat = 0;
+        EXPECT_THROW(bad.Validate(), std::invalid_argument);
+    }
 
-    // Supervisor config validation rejects invalid offload knobs.
+    // Supervisor config validation rejects invalid offload/promotion knobs.
     {
         MasterConfig bad_master{};
         bad_master.offload_cap_ratio = -0.1;
+        EXPECT_THROW((void)MasterServiceSupervisorConfig(bad_master),
+                     std::invalid_argument);
+    }
+    {
+        MasterConfig bad_master{};
+        bad_master.promotion_max_per_heartbeat = 0;
         EXPECT_THROW((void)MasterServiceSupervisorConfig(bad_master),
                      std::invalid_argument);
     }

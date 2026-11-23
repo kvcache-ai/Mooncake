@@ -34,13 +34,13 @@
 #include "client_offboarding.h"
 #include "client_session_event.h"
 #include "client_session_registry.h"
-#include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "dynamic_replication_controller.h"
 #include "lease.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "offload_manager.h"
+#include "promotion_manager.h"
 #include "segment.h"
 #include "local_ssd/manager.h"
 #include "tenant/quota_policy.h"
@@ -52,7 +52,6 @@
 #include "metadata/namespace_table.h"
 #include "metadata/object_route.h"
 #include "metadata/object_state.h"
-#include "promotion_candidate_tracker.h"
 #include "rpc_types.h"
 #include "replica.h"
 #include "ha/ha_types.h"
@@ -1534,9 +1533,9 @@ class MasterService {
     void DiscardExpiredProcessingReplicas(
         const metadata::Namespace& ns,
         const std::chrono::system_clock::time_point& now);
-    // Scans the global offload task table once per round, re-checking each
-    // expired candidate under its per-object write lock.
-    void DiscardExpiredOffloadTasks(
+    // Scans global offload and promotion task tables once per round,
+    // re-checking each expired candidate under its per-object write lock.
+    void DiscardExpiredOffloadAndPromotionTasks(
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          std::span<const Replica> replicas);
@@ -1580,55 +1579,17 @@ class MasterService {
     const bool enable_async_segment_cleanup_;
 
     /**
-     * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an
-     * task into the holder client's LocalSSD mailbox.
-     * Caller is responsible for refcnt-pinning the source replica and
-     * recording the task on the object.
-     */
-    tl::expected<void, ErrorCode> PushPromotionQueue(
-        const ObjectIdentity& object_id, Replica& source_replica);
-
-    /**
      * @brief Helper invoked from GetReplicaList when an only-LOCAL_DISK key is
      * observed. Applies the gating chain (frequency / watermark / dedup /
-     * queue-cap / PushPromotionQueue), refcnt-pins the source LOCAL_DISK
-     * replica, and records the in-flight PromotionTask on the object.
-     *
-     * Must be called AFTER GetReplicaList has released its RO accessor so we
-     * can acquire a RW accessor on the key without upgrading a shared lock.
-     *
-     * @param record_candidate When true, transient rejections (DRAM watermark,
-     *        queue cap, or transient push failure) record a PromotionCandidate
-     *        so the background retry loop can re-attempt admission later.
-     *        Pass false from the retry loop itself so backoff is managed by
-     *        BackoffCandidate instead of resetting retry_count.
-     * @param force When true, bypasses the promotion_on_hit_ flag and
-     *        CountMinSketch frequency gate. Used by explicit promotion APIs
-     *        that have already decided the key should be promoted.
+     * cap), refcnt-pins the source LOCAL_DISK replica, records a
+     * PromotionTask, and pushes onto the holder client's LocalSSD mailbox.
+     * Acquires its own RW accessor; safe to call after
+     * GetReplicaList's RO accessor has been released.
      */
     PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
                                                bool record_candidate = true,
                                                bool force = false);
-    void EraseCandidate(const ObjectIdentity& object_id);
-    void BackoffCandidate(const ObjectIdentity& object_id,
-                          PromotionQueueResult result);
     size_t RunPromotionCandidateRetry();
-
-    // Erase the object's in-flight PromotionTask and decrement the
-    // cluster-wide in-flight counter. Safe no-op if no task exists.
-    void ErasePromotionTaskIfPresent(route::ObjectState& state)
-        NO_THREAD_SAFETY_ANALYSIS {
-        if (state.promotion_task) {
-            state.promotion_task.reset();
-            promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
-            MasterMetricManager::instance().dec_promotion_in_flight();
-            MasterMetricManager::instance().inc_promotion_cancelled();
-        }
-    }
-    void CancelPromotionTaskForRemovedReplicas(
-        ObjectMetadata& metadata, route::ObjectState& state,
-        const std::vector<ReplicaID>& removed_replica_ids)
-        NO_THREAD_SAFETY_ANALYSIS;
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
@@ -1951,38 +1912,6 @@ class MasterService {
     // if high availability features enabled
     const bool enable_ha_;
 
-    // Promotion-on-hit: opt-in flag enabling LOCAL_DISK -> MEMORY promotion
-    // when a Get observes a key with only LOCAL_DISK replicas.
-    bool promotion_on_hit_{false};
-    uint32_t promotion_admission_threshold_{2};
-    uint32_t promotion_queue_limit_{50000};
-    uint32_t promotion_max_per_heartbeat_{1};
-    // Global in-flight task counter, checked against promotion_queue_limit_
-    // as the gate cap. Promotion specifically targets skewed
-    // access (hot keys re-accessed after eviction), so the global counter
-    // is the correct primitive. Incremented in TryPushPromotionQueue after
-    // successful enqueue; decremented in NotifyPromotionSuccess and in the
-    // promotion task reaper after the task entry is erased. Relaxed memory
-    // order is safe — the value is an advisory soft cap, not a barrier.
-    std::atomic<uint64_t> promotion_in_flight_{0};
-    // Promotion retry candidates: the index of due keys and the retry rules.
-    PromotionCandidateTracker promotion_candidates_;
-    // At most this many due candidates are tried per retry round.
-    static constexpr size_t kPromotionRetryBatchSize = 128;
-    // Bound on self-sustaining execution-failure cycles: a key whose
-    // promotion keeps failing at execution time (AllocStart under DRAM
-    // pressure, TE-write flake, SSD error) is re-recorded at most this many
-    // times. Bounds a persistently-failing ("poison") key to this many
-    // delivery slots (~this many heartbeat ticks, ~30s at the 10s default)
-    // before it stops re-queueing itself; genuine reads can still re-admit
-    // it afterwards with a fresh count.
-    static constexpr uint32_t kMaxPromotionExecutionFailures = 3;
-
-    // Master-side frequency sketch. Constructed only when promotion_on_hit_ is
-    // true. CountMinSketch is mutex-protected internally so we can call into it
-    // from any GetReplicaList caller without additional locking.
-    std::unique_ptr<CountMinSketch> promotion_sketch_;
-
     // Hot-object MEMORY replication: heat admission, placement and the leases
     // a client copies inside. The pending task of a key stays on its record.
     DynamicReplicationController dynamic_replication_;
@@ -2086,6 +2015,7 @@ class MasterService {
     LocalSsdManager local_ssd_manager_;
     OffloadHostView offload_host_view_;
     OffloadManager offload_manager_;
+    PromotionManager promotion_manager_;
     NoFSegmentManager nof_segment_manager_;
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;

@@ -9,13 +9,13 @@
 namespace mooncake {
 namespace route {
 
-// The per-object runtime state kept next to the object's metadata: the task
-// in flight for the key, at most one of each kind, and the promotion retry
-// candidate. Offloading tasks are owned inside OffloadManager under its own
-// sharded locks.
+// The per-object runtime state kept next to the object's metadata: primary
+// write and replication tasks in flight for the key, plus dynamic replication
+// pending/cooldown state. Offload and promotion tasks/candidates are owned
+// inside OffloadManager and PromotionManager under their own sharded locks.
 //
-// Every object carries one, and almost every object carries neither a task nor
-// a candidate, so each lives on the heap and costs a pointer while absent.
+// Every object carries one, and almost every object carries no task, so each
+// task lives on the heap and costs a pointer while absent.
 struct ObjectState {
     // A primary write or a background task is in flight for this key.
     bool is_processing{false};
@@ -28,19 +28,13 @@ struct ObjectState {
     // REMOVED replica still retains their tier. Consumed on write release.
     bool kv_content_invalidated{false};
     HeapOptional<ReplicationTask> replication_task;
-    HeapOptional<PromotionTask> promotion_task;
     // The dynamic replica proposal admitted for this key and not yet started
     // by its CopyStart, and how long the key waits before the next one. Owned
     // by DynamicReplicationController; neither is work in flight.
     HeapOptional<DynamicReplicaPending> dynamic_replication_pending;
     std::chrono::steady_clock::time_point dynamic_replication_cooldown{};
-    // A promotion a transient gate turned away, waiting for a retry. It is
-    // not work in flight: no task holds anything for it.
-    HeapOptional<PromotionCandidate> promotion_candidate;
 
-    bool HasWorkInFlight() const {
-        return is_processing || replication_task || promotion_task;
-    }
+    bool HasWorkInFlight() const { return is_processing || replication_task; }
 };
 
 }  // namespace route

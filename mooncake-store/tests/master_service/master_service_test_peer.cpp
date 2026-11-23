@@ -150,31 +150,12 @@ size_t MasterServiceTestPeer::RunPromotionCandidateRetryForTesting() {
 
 size_t MasterServiceTestPeer::CountCandidatesForTesting(
     const TenantId& tenant_id) {
-    // The count is the tenant's share of the retry index; the candidate state
-    // itself lives on each object.
-    const auto& tracker = service_.promotion_candidates_;
-    std::lock_guard<std::mutex> lock(tracker.mutex_);
-    return std::count_if(
-        tracker.due_.begin(), tracker.due_.end(),
-        [&](const auto& entry) { return entry.first.tenant_id == tenant_id; });
+    return service_.promotion_manager_.promotion_candidates_.CountByTenant(
+        tenant_id);
 }
 
 void MasterServiceTestPeer::ResetCandidateBackoffsForTesting() {
-    const auto epoch = std::chrono::steady_clock::time_point{};
-    auto& tracker = service_.promotion_candidates_;
-    // The index only names keys, so each key is resolved again under its
-    // shard lock and refiled as due now.
-    for (const auto& [tenant_id, key] :
-         tracker.Due(std::chrono::steady_clock::time_point::max(),
-                     std::numeric_limits<size_t>::max())) {
-        MasterService::MetadataAccessorRW accessor(
-            &service_, MasterService::ObjectIdentity{.tenant_id = tenant_id,
-                                                     .user_key = key});
-        if (accessor.Exists() && accessor.GetState().promotion_candidate) {
-            accessor.GetState().promotion_candidate->retry_after = epoch;
-            tracker.File(tenant_id, key, epoch);
-        }
-    }
+    service_.promotion_manager_.promotion_candidates_.ResetBackoffs();
 }
 
 size_t MasterServiceTestPeer::SoftPinHeapSize() const {
