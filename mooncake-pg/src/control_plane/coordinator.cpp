@@ -107,14 +107,11 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
             result.response.require_new_session = true;
             return result;
         }
-        if (info.transfer_service_endpoint != req.transfer_service_endpoint ||
-            info.collective_workspace_endpoint !=
-                req.collective_workspace_endpoint) {
-            result.response.success = false;
-            result.response.reject_reason =
-                "rank endpoint changed within one agent session";
-            result.response.require_new_session = true;
-            return result;
+        const auto& incoming = req.transfer_service_endpoint;
+        auto& current = info.transfer_service_endpoint;
+        if (incoming && (!current || incoming->version > current->version)) {
+            current = incoming;
+            updateTransferEndpoints(result.effects);
         }
         info.last_heartbeat = std::chrono::steady_clock::now();
         populateRegisterAgentResponse(result.response, req.rank);
@@ -189,11 +186,11 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
         .rank_epoch = info.rank_epoch,
         .te_server_name = info.te_server_name,
         .warmup_recv_addr = info.warmup_recv_addr,
-        .transfer_service_endpoint = info.transfer_service_endpoint,
         .collective_workspace_endpoint = info.collective_workspace_endpoint,
     }});
     result.effects.push_back(makeRankStateEffect(req.rank));
 
+    updateTransferEndpoints(result.effects);
     populateRegisterAgentResponse(result.response, req.rank);
     return result;
 }
@@ -238,8 +235,6 @@ void CentralizedCoordinatorStateMachine::populateRegisterAgentResponse(
         connection.agent_addr = ranks_[i].agent_addr;
         connection.te_server_name = ranks_[i].te_server_name;
         connection.warmup_recv_addr = ranks_[i].warmup_recv_addr;
-        connection.transfer_service_endpoint =
-            ranks_[i].transfer_service_endpoint;
         connection.collective_workspace_endpoint =
             ranks_[i].collective_workspace_endpoint;
         response.rank_connections.push_back(std::move(connection));
@@ -279,6 +274,7 @@ CentralizedCoordinatorStateMachine::handleUnregisterAgent(
     // separate operations.
     if (invalidateAgentSession(req.rank)) {
         result.effects.push_back(makeRankStateEffect(req.rank));
+        updateTransferEndpoints(result.effects);
         updateRankStates(result.effects);
     }
 
@@ -314,8 +310,21 @@ CentralizedCoordinatorStateMachine::handleRegisterGroup(
     if (new_group) {
         bindGroupBootstrapId(*group_id, req.group_bootstrap_id);
     }
+
+    const auto& view = group_views_.at(*group_id);
+    // Startup batching: see transfer_endpoint_updates_started_ in
+    // coordinator.h.
+    if (!transfer_endpoint_updates_started_ &&
+        std::all_of(view.rank_order.begin(), view.rank_order.end(),
+                    [this](GlobalRank rank) {
+                        return ranks_[rank].state != RankState::Offline;
+                    })) {
+        transfer_endpoint_updates_started_ = true;
+        updateTransferEndpoints(result.effects);
+    }
+
     result.response.success = true;
-    result.response.view = group_views_.at(*group_id);
+    result.response.view = view;
     return result;
 }
 
@@ -643,6 +652,36 @@ CentralizedCoordinatorStateMachine::handleViewUpdateAck(GroupId group_id,
     return result;
 }
 
+CoordinatorApplyResult<void>
+CentralizedCoordinatorStateMachine::handleTransferEndpointUpdateAck(
+    const TransferEndpointUpdateAck& ack) {
+    CoordinatorApplyResult<void> result;
+    if (!ack.applied || !pending_transfer_endpoint_installation_) return result;
+    auto& installation = *pending_transfer_endpoint_installation_;
+    if (ack.version != installation.snapshot.version ||
+        !installation.waiting_acks.contains(ack.rank) ||
+        ack.rank_epoch != installation.snapshot.rank_epochs[ack.rank] ||
+        ranks_[ack.rank].state == RankState::Offline ||
+        ranks_[ack.rank].rank_epoch != ack.rank_epoch)
+        return result;
+    if (ack.updated_endpoint) {
+        const auto& old = installation.snapshot.endpoints[ack.rank];
+        if (ack.updated_endpoint->version <= old->version) {
+            LOG(WARNING)
+                << "[COORD] Invalid post-install device endpoint, rank="
+                << ack.rank;
+            return result;
+        }
+        // Save bootstrap metadata for future installations.
+        auto& latest = ranks_[ack.rank].transfer_service_endpoint;
+        if (ack.updated_endpoint->version > latest->version)
+            latest = ack.updated_endpoint;
+    }
+    installation.waiting_acks.erase(ack.rank);
+    tryCompleteTransferEndpointInstallation(result.effects);
+    return result;
+}
+
 CoordinatorApplyResult<void> CentralizedCoordinatorStateMachine::tick() {
     CoordinatorApplyResult<void> result;
     if (shutdown_confirmed_) return result;
@@ -657,6 +696,23 @@ CoordinatorApplyResult<void> CentralizedCoordinatorStateMachine::tick() {
             handleTimedOutAgent(rank, "heartbeat timeout", result.effects);
         }
     }
+
+    // Endpoint installation timeout and completion.
+    if (pending_transfer_endpoint_installation_ &&
+        now > pending_transfer_endpoint_installation_->deadline) {
+        const auto& installation = *pending_transfer_endpoint_installation_;
+        std::vector<GlobalRank> timed_out;
+        for (auto rank : installation.waiting_acks) {
+            if (ranks_[rank].state != RankState::Offline &&
+                ranks_[rank].rank_epoch ==
+                    installation.snapshot.rank_epochs[rank])
+                timed_out.push_back(rank);
+        }
+        for (auto rank : timed_out)
+            handleTimedOutAgent(rank, "TransferEndpointUpdate ACK timeout",
+                                result.effects);
+    }
+    tryCompleteTransferEndpointInstallation(result.effects);
 
     // Remove expired barriers first, checkGroupTransitions may create new
     // bootstrap barriers and rehash this map.
@@ -786,6 +842,7 @@ void CentralizedCoordinatorStateMachine::handleTimedOutAgent(
     }
 
     effects.push_back(makeRankStateEffect(rank));
+    updateTransferEndpoints(effects);
     updateRankStates(effects);
     applyAutoDeactivate(effects);
     checkGroupTransitions(effects);
@@ -849,12 +906,94 @@ void CentralizedCoordinatorStateMachine::tryConfirmShutdown(
     effects.push_back(ShutdownCoordinatorHost{});
 }
 
+DeviceTransferSnapshot
+CentralizedCoordinatorStateMachine::transferEndpointSnapshot() const {
+    DeviceTransferSnapshot snapshot;
+    snapshot.endpoints.resize(max_world_size_);
+    snapshot.rank_epochs.resize(max_world_size_);
+    for (GlobalRank rank = 0; rank < max_world_size_; ++rank) {
+        const auto& info = ranks_[rank];
+        if (info.state == RankState::Offline || !info.transfer_service_endpoint)
+            continue;
+        // Published endpoints can be installed while a process is Synced;
+        // installation is part of establishing its connectivity.
+        snapshot.endpoints[rank] = info.transfer_service_endpoint;
+        snapshot.rank_epochs[rank] = info.rank_epoch;
+        snapshot.participants.push_back(rank);
+    }
+    return snapshot;
+}
+
+void CentralizedCoordinatorStateMachine::
+    tryCompleteTransferEndpointInstallation(
+        std::vector<CoordinatorEffect>& effects) {
+    if (!pending_transfer_endpoint_installation_) return;
+    auto& installation = *pending_transfer_endpoint_installation_;
+    std::erase_if(installation.waiting_acks, [&](GlobalRank rank) {
+        return ranks_[rank].state == RankState::Offline ||
+               ranks_[rank].rank_epoch !=
+                   installation.snapshot.rank_epochs[rank];
+    });
+    if (!installation.waiting_acks.empty()) return;
+
+    installed_transfer_endpoints_ = std::move(installation.snapshot);
+    pending_transfer_endpoint_installation_.reset();
+    // As with positive link reports, defer health updates while a fault
+    // reconciliation window is open.
+    if (!reconciliation_ctx_.active) {
+        updateRankStates(effects);
+        checkGroupTransitions(effects);
+    }
+    // Include changes that arrived while this installation was pending.
+    updateTransferEndpoints(effects);
+}
+
+void CentralizedCoordinatorStateMachine::updateTransferEndpoints(
+    std::vector<CoordinatorEffect>& effects) {
+    if (!transfer_endpoint_updates_started_ ||
+        pending_transfer_endpoint_installation_ || shutdown_requested_)
+        return;
+
+    auto snapshot = transferEndpointSnapshot();
+    // Install when the Synced set gains a device participant or a new rank
+    // epoch.
+    if (std::all_of(snapshot.participants.begin(), snapshot.participants.end(),
+                    [this](GlobalRank rank) { return isDeviceLinkUp(rank); }))
+        return;
+    snapshot.version = next_transfer_snapshot_version_++;
+    PendingTransferEndpointInstallation installation;
+    installation.snapshot = std::move(snapshot);
+    installation.waiting_acks.insert(installation.snapshot.participants.begin(),
+                                     installation.snapshot.participants.end());
+    installation.deadline =
+        std::chrono::steady_clock::now() + kTransferEndpointUpdateTimeout;
+    const auto reclaim_before_version =
+        installed_transfer_endpoints_ ? installed_transfer_endpoints_->version
+                                      : 0;
+    effects.push_back(PushTransferEndpointUpdate{
+        {installation.snapshot, reclaim_before_version}});
+    pending_transfer_endpoint_installation_ = std::move(installation);
+}
+
+bool CentralizedCoordinatorStateMachine::isDeviceLinkUp(GlobalRank rank) const {
+    // We may need a device-side link manager in the future. For now, an
+    // installed endpoint for the current rank epoch serves as a health
+    // indicator.
+    const auto& info = ranks_[rank];
+    return installed_transfer_endpoints_ &&
+           installed_transfer_endpoints_->endpoints[rank].has_value() &&
+           installed_transfer_endpoints_->rank_epochs[rank] == info.rank_epoch;
+}
+
 bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
     GlobalRank a, GlobalRank b) const {
     PG_ASSERT(rankInRange(a) && rankInRange(b),
               "isMutuallyConnected called with an out-of-range rank");
     if (ranks_[a].state == RankState::Offline ||
         ranks_[b].state == RankState::Offline)
+        return false;
+    if ((ranks_[a].transfer_service_endpoint && !isDeviceLinkUp(a)) ||
+        (ranks_[b].transfer_service_endpoint && !isDeviceLinkUp(b)))
         return false;
     return static_cast<size_t>(b) < ranks_[a].link_status.size() &&
            static_cast<size_t>(a) < ranks_[b].link_status.size() &&

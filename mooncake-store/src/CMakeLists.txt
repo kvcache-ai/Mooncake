@@ -34,10 +34,13 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     config/s3_client_config.cpp
     segment_allocator_registration.cpp
     client_offboarding.cpp
+    client_session_registry.cpp
+    client_session_event_dispatcher.cpp
     dynamic_replication_controller.cpp
     eviction/evictor.cpp
     eviction/offloading_reclaimer.cpp
     eviction/report_observers.cpp
+    metadata/lease_eviction_index.cpp
     master_service.cpp
     promotion_candidate_tracker.cpp
     master_store_backend.cpp
@@ -68,6 +71,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
     ha/common/redis/redis_connection.cpp
+    ha/common/redis/redis_cluster_client.cpp
     ha/leadership/backends/redis/redis_leader_coordinator.cpp
     ha/leadership/master_service_supervisor.cpp
     shutdown_request.cpp
@@ -92,6 +96,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/oplog/oplog_types.cpp
     ha/oplog/oplog_batch_codec.cpp
     ha/oplog/oplog_batch_storage.cpp
+    ha/oplog/batch_oplog_pruning_worker.cpp
     ha/oplog/oplog_batch_standby_reader.cpp
     ha/oplog/oplog_batch_types.cpp
     ha/oplog/ordered_oplog_writer.cpp
@@ -109,6 +114,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/mmap_arena_config.cpp
     common/mmap_buffer.cpp
     client_service.cpp
+    gather_read.cpp
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
@@ -125,6 +131,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     nvme_kv/key_codec.cpp
     nvme_kv/key_conflict_policy.cpp
     nvme_kv/object_layout.cpp
+    nvme_kv/object_store.cpp
     transfer_task.cpp
     config/nof_debug_config.cpp
     config/fileread_worker_pool_config.cpp
@@ -172,6 +179,24 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
 
 if(BUILD_UNIT_TESTS)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv/executor_stub.cpp)
+  add_executable(store_gather_read_test ../tests/gather_read_test.cpp)
+  target_link_libraries(store_gather_read_test PRIVATE mooncake_store gtest
+                                                       gtest_main)
+  add_test(NAME store_gather_read_test COMMAND store_gather_read_test)
+  # Intercept calls from the static Store archive for deterministic transport
+  # failures. ELF wrappers do not intercept calls inside a shared Store.
+  if(UNIX
+     AND NOT APPLE
+     AND NOT BUILD_SHARED_LIBS)
+    target_compile_definitions(store_gather_read_test
+                               PRIVATE MOONCAKE_GATHER_TEST_WRAPPED_SUBMIT)
+    target_link_options(
+      store_gather_read_test
+      PRIVATE
+      "-Wl,--wrap=_ZN8mooncake14TransferEngine14submitTransferEmRKSt6vectorINS_9Transport15TransferRequestESaIS3_EE"
+      "-Wl,--wrap=_ZN8mooncake14TransferEngine17getTransferStatusEmmRNS_9Transport14TransferStatusE"
+    )
+  endif()
 endif()
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
@@ -374,14 +399,14 @@ endif()
 # configuration so unit tests can exercise it without SPDK; both mooncake_store
 # and mooncake_nof_spdk link it (the latter cannot link mooncake_store — that
 # would be a cycle).
-add_library(mooncake_nof_core STATIC nof/page_registry.cpp
-                                     nof/probe_context_pool.cpp
-                                     config/spdk_controller_config.cpp)
+add_library(
+  mooncake_nof_core STATIC nof/page_registry.cpp nof/probe_context_pool.cpp
+                           config/spdk_controller_config.cpp)
 target_include_directories(mooncake_nof_core
                            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-target_link_libraries(mooncake_nof_core
-                      PUBLIC glog::glog yalantinglibs::yalantinglibs
-                             cachelib_memory_allocator mooncake_common)
+target_link_libraries(
+  mooncake_nof_core PUBLIC glog::glog yalantinglibs::yalantinglibs
+                           cachelib_memory_allocator mooncake_common)
 
 if(USE_NOF)
   set(SPDK_INCLUDE_DIR
@@ -475,11 +500,10 @@ if(USE_NOF)
   target_include_directories(
     mooncake_nof_spdk
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SPDK_INCLUDE_DIR}
-            ${DPDK_INCLUDE_DIR})
-  target_link_libraries(mooncake_nof_spdk
-                        PRIVATE ${SPDK_STATIC_LIBS} glog::glog
-                                mooncake_nof_core yalantinglibs::yalantinglibs)
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
+  target_link_libraries(
+    mooncake_nof_spdk PRIVATE ${SPDK_STATIC_LIBS} glog::glog mooncake_nof_core
+                              yalantinglibs::yalantinglibs)
 
   # spdk_mem_register (SPDK >= 22.05) compile-time probe.
   # CMAKE_TRY_COMPILE_TARGET_TYPE was added in CMake 3.6 (project requires
@@ -488,10 +512,8 @@ if(USE_NOF)
   set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
   include(CheckCXXSourceCompiles)
   set(CMAKE_REQUIRED_INCLUDES ${SPDK_INCLUDE_DIR})
-  check_cxx_source_compiles(
-    "#include <spdk/env.h>
-     int main() { (void)&spdk_mem_register; return 0; }"
-    HAVE_SPDK_MEM_REGISTER)
+  check_cxx_source_compiles("#include <spdk/env.h>
+     int main() { (void)&spdk_mem_register; return 0; }" HAVE_SPDK_MEM_REGISTER)
   unset(CMAKE_REQUIRED_INCLUDES)
   unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
   if(HAVE_SPDK_MEM_REGISTER)
@@ -499,11 +521,10 @@ if(USE_NOF)
                                PRIVATE HAVE_SPDK_MEM_REGISTER=1)
   else()
     message(
-      WARNING
-      "spdk_mem_register not found under ${SPDK_INCLUDE_DIR} "
-      "(SPDK < 22.05?). NoF-over-RDMA user-buffer registration (#3131) "
-      "will remain unfixed: pure-NoF writes over RDMA will fail with "
-      "'No translation for ptr' errors.")
+      WARNING "spdk_mem_register not found under ${SPDK_INCLUDE_DIR} "
+              "(SPDK < 22.05?). NoF-over-RDMA user-buffer registration (#3131) "
+              "will remain unfixed: pure-NoF writes over RDMA will fail with "
+              "'No translation for ptr' errors.")
   endif()
 endif()
 
@@ -780,6 +801,26 @@ if(USE_SUNRISE)
   target_link_libraries(
     mooncake_store PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
                            ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+endif()
+
+if(BUILD_UNIT_TESTS AND USE_MLU)
+  # --wrap cannot intercept CNRT calls inside a shared mooncake_store. Reuse its
+  # objects in a test-only archive so those calls reach the final link. Keep
+  # this target here so directory-scoped dependency targets are visible.
+  add_library(
+    mooncake_store_mlu_test STATIC
+    $<TARGET_OBJECTS:mooncake_store_shared_objects>
+    $<TARGET_OBJECTS:mooncake_store_master_objects>
+    $<TARGET_OBJECTS:mooncake_store_client_objects>)
+  target_include_directories(
+    mooncake_store_mlu_test
+    PUBLIC $<TARGET_PROPERTY:mooncake_store,INTERFACE_INCLUDE_DIRECTORIES>)
+  target_compile_definitions(
+    mooncake_store_mlu_test
+    PUBLIC $<TARGET_PROPERTY:mooncake_store,INTERFACE_COMPILE_DEFINITIONS>)
+  get_target_property(mlu_test_store_dependencies mooncake_store LINK_LIBRARIES)
+  target_link_libraries(mooncake_store_mlu_test
+                        PUBLIC ${mlu_test_store_dependencies})
 endif()
 
 if(BUILD_SHARED_LIBS)

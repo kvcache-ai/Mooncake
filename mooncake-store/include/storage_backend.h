@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "ascii_string.h"
+#include "common/sharded_map.h"
 #include "config/bucket_backend_config.h"
 #include "config/file_per_key_config.h"
 #include "config/offset_allocator_backend_config.h"
@@ -53,6 +54,8 @@ struct BucketMetadata {
     // Last access timestamp in nanoseconds; used by LRU eviction policy.
     // Updated on every read with relaxed ordering (approximate is sufficient).
     mutable std::atomic<int64_t> last_access_ns_{0};
+    // Guarded by BucketStorageBackend::mutex_; not serialized.
+    bool offload_notification_pending_ = false;
     // Index into BucketStorageBackend::disks_ identifying which disk holds
     // this bucket's files. Not serialized: Init() re-derives it from the disk
     // the .meta file was found on.
@@ -365,6 +368,11 @@ class StorageBackendInterface {
         std::function<bool(const std::string& key)> /* predicate */) {
         // Default: no-op (no test failures injected)
     }
+
+    // Receives each failed disk syscall's errno and name, on the I/O thread.
+    // Set before any I/O starts; backends without errno reporting ignore it.
+    using DiskErrorObserver = std::function<void(int err, const char* op)>;
+    virtual void SetDiskErrorObserver(DiskErrorObserver /* observer */) {}
 
     // Remove all persisted objects from disk. Called during RemoveAll to
     // clean up physical SSD files alongside master metadata deletion.
@@ -927,6 +935,10 @@ class BucketStorageBackend : public StorageBackendInterface {
         next_bucket_ = -1;
     }
 
+    void SetDiskErrorObserver(DiskErrorObserver observer) override {
+        disk_error_observer_ = std::move(observer);
+    }
+
     /**
      * @brief Checks whether the backend is allowed to continue offloading.
      * @return tl::expected<bool, ErrorCode>
@@ -944,9 +956,9 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param buckets_keys Output: bucketized keys; each inner vector is a
      * bucket.
      * @param deferred_keys Optional output: keys moved to the internal
-     * ungrouped pool this call (the tail partial bucket, deferred so the next
-     * call can write them as part of a full bucket). These keys are NOT in
-     * buckets_keys now but WILL be emitted in a bucket by a later call. The
+     * ungrouped pool this call (the tail partial bucket). These keys are NOT
+     * in buckets_keys now. FileStorage replays carried keys on the next pass,
+     * which may emit a partial bucket; empty backend input does not flush. The
      * caller must keep their offload tasks alive across the deferral — a key
      * re-emitted from the pool arrives without a task otherwise
      * (neuralwatt: the silent deferred-tail loss, upstream #3006).
@@ -1029,6 +1041,17 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<iovec>& iovs,
         std::vector<StorageObjectMetadata>& metadatas);
 
+    // BuildBucket for bucket_backend_config_.aligned_direct_write: every
+    // iovec starts and ends on a 4 KiB boundary of the file. The copied
+    // bytes live in a per-thread buffer that stays valid until the next
+    // call on the same thread.
+    tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode>
+    BuildAlignedDirectBucket(
+        int64_t bucket_id,
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::vector<iovec>& iovs,
+        std::vector<StorageObjectMetadata>& metadatas);
+
     tl::expected<void, ErrorCode> WriteBucket(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
         std::vector<iovec>& iovs, int disk_index);
@@ -1049,8 +1072,11 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<std::string, ErrorCode> GetBucketDataPath(
         int64_t bucket_id, int disk_index) const;
 
+    // direct_write (Write only): an aligned direct bucket data file, opened
+    // for O_DIRECT where the file system allows it.
     tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
-        const std::string& path, FileMode mode) const;
+        const std::string& path, FileMode mode,
+        bool direct_write = false) const;
 
     tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
@@ -1243,7 +1269,26 @@ class BucketStorageBackend : public StorageBackendInterface {
         test_datasync_failure_.store(enabled, std::memory_order_relaxed);
     }
 
+    // Test-only: bytes the last aligned direct bucket copied (key blocks,
+    // partial value blocks, unaligned values).
+    size_t GetLastAlignedCopyBytesForTest() const {
+        return last_aligned_copy_bytes_.load(std::memory_order_relaxed);
+    }
+
+    // Test-only: open aligned direct bucket files as on a file system that
+    // refuses O_DIRECT.
+    void SetDirectIOUnavailableForTest(bool unavailable) {
+        test_direct_io_unavailable_.store(unavailable,
+                                          std::memory_order_relaxed);
+    }
+
    private:
+    void NotifyDiskError(int err, const char* op) const {
+        if (err != 0 && disk_error_observer_) disk_error_observer_(err, op);
+    }
+
+    DiskErrorObserver disk_error_observer_;
+
     /**
      * @brief Take the exclusive owner lock on every disk root.
      *
@@ -1259,6 +1304,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     void ReleaseDiskOwnerLocks();
 
     std::atomic<bool> test_datasync_failure_{false};
+    std::atomic<size_t> last_aligned_copy_bytes_{0};
+    std::atomic<bool> test_direct_io_unavailable_{false};
     // Alignment helper functions for O_DIRECT I/O
     static constexpr size_t kDirectIOAlignment = 4096;
 
@@ -1299,7 +1346,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     // Round-robin cursor for SelectDiskForWrite: the disk to try first on the
     // next write.
     int rr_cursor_ GUARDED_BY(mutex_) = 0;
-    std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
+    ShardedMap<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
     // Reserved key sets stay global: key uniqueness is a property of the whole
     // backend, not of one disk.
@@ -1370,10 +1417,16 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
      * @param batched_slices A map from object key to a pre-allocated writable
      * buffer (Slice).
      * @return tl::expected<void, ErrorCode> indicating operation status.
+     *
+     * With io_uring (O_DIRECT), a buffer that starts on a 4 KiB boundary
+     * must have room for the value rounded up to 4 KiB and one page more,
+     * as the buffers of FileStorage::AllocateBatch have: whole pages are
+     * read into it and Slice::ptr is moved to the first byte of the value.
      */
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
 
+    // Same buffer requirement as BatchLoad.
     tl::expected<void, ErrorCode> BatchLoadSpans(
         std::unordered_map<std::string, StorageValueSpan>& spans) override;
 
@@ -1542,7 +1595,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         // Validate key matches expected key
         tl::expected<void, ErrorCode> ValidateKey(
             const std::string& expected_key,
-            const std::string& stored_key) const {
+            std::string_view stored_key) const {
             if (stored_key.size() != key_len) {
                 LOG(ERROR) << "Key length mismatch: expected " << key_len
                            << ", got " << stored_key.size();
@@ -1561,6 +1614,31 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> ReadOffsetValues(
         std::unordered_map<std::string, StorageValueSpan>& spans,
         bool require_exact_size);
+
+    // One value to read: where its record is and where the bytes go.
+    struct ReadPlan;
+
+    // Reads one record with a single read when the value is wanted from its
+    // first byte, and with two otherwise, then checks its header and key.
+    // `head` is scratch space for the header and key.
+    static tl::expected<void, ErrorCode> ReadRecord(const ReadPlan& plan,
+                                                    std::string& head);
+
+    // Checks the header and key at `head`, the first bytes of the record
+    // read from disk, against what the index has for the record.
+    static tl::expected<void, ErrorCode> CheckRecordHead(const ReadPlan& plan,
+                                                         const char* head);
+
+#ifdef USE_URING
+    // Reads the records of `plans`, all in `file`, with page-aligned reads
+    // submitted together, and moves each plan's destination pointer to the
+    // first value byte.
+    static tl::expected<void, ErrorCode> ReadRecordsDirect(
+        UringFile& file, const std::vector<ReadPlan*>& plans);
+#endif
+
+    // Alignment O_DIRECT wants for buffer, length and file offset.
+    static constexpr uint64_t kDirectIoAlignment = 4096;
 
     // Maximum key length accepted by BatchOffload and trusted on recovery.
     // Write-side enforcement (BatchOffload) and recovery-side validation

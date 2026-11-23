@@ -77,6 +77,15 @@ struct BucketBackendConfig {
     // per disk; BucketStorageBackend::Init() rejects any other length.
     std::vector<int64_t> max_total_size_per_disk;
 
+    // Write bucket data files with O_DIRECT instead of through the page
+    // cache. Every value starts on a 4 KiB boundary of the file (zeros, then
+    // the key, in front of it), so the 4 KiB blocks of a value in 4 KiB
+    // aligned buffers go to the device from those buffers; only key blocks,
+    // each value's last partial block and unaligned values are copied.
+    // Files written this way stay readable when the option is off.
+    // Set by MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=aligned.
+    bool aligned_direct_write = false;
+
     bool Validate() const;
 
     /**

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <barrier>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -289,6 +290,157 @@ TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
     }
 }
 
+TEST_F(RealClientTest, BatchGetIntoRechecksLocalDiskLeasePerKeyBeforeFanOut) {
+    StartMasterAndSetupClient();
+
+    constexpr size_t kObjectSize = 16;
+    auto make_query = [](std::chrono::steady_clock::time_point lease_timeout) {
+        LocalDiskDescriptor descriptor;
+        descriptor.client_id = generate_uuid();
+        descriptor.object_size = kObjectSize;
+        descriptor.transport_endpoint = "local-disk-endpoint";
+        Replica::Descriptor replica;
+        replica.descriptor_variant = std::move(descriptor);
+        replica.status = ReplicaStatus::COMPLETE;
+        return QueryResult({std::move(replica)}, lease_timeout);
+    };
+
+    std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
+    query_results.emplace_back(
+        make_query(std::chrono::steady_clock::now() - std::chrono::seconds(1)));
+    query_results.emplace_back(
+        make_query(std::chrono::steady_clock::now() + std::chrono::minutes(1)));
+    query_results.emplace_back(
+        make_query(std::chrono::steady_clock::now() - std::chrono::seconds(1)));
+
+    const std::vector<std::string> keys = {"expired", "live", "expired"};
+    std::vector<std::vector<char>> destinations(
+        keys.size(), std::vector<char>(kObjectSize, '\0'));
+    size_t read_call_count = 0;
+    auto local_disk_reader = [&read_call_count](
+                                 const std::string&,
+                                 RealClient::LocalDiskOffloadObjects& objects)
+        -> tl::expected<void, ErrorCode> {
+        ++read_call_count;
+        for (auto& [key, slices] : objects) {
+            for (auto& slice : slices) {
+                std::memset(slice.ptr, key.front(), slice.size);
+            }
+        }
+        return {};
+    };
+
+    auto results = py_client_->batch_get_into_internal(
+        keys,
+        {destinations[0].data(), destinations[1].data(),
+         destinations[2].data()},
+        {kObjectSize, kObjectSize, kObjectSize}, query_results,
+        local_disk_reader);
+
+    EXPECT_EQ(read_call_count, 1u);
+    ASSERT_EQ(results.size(), keys.size());
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::LEASE_EXPIRED);
+    ASSERT_TRUE(results[1].has_value());
+    EXPECT_EQ(*results[1], static_cast<int64_t>(kObjectSize));
+    ASSERT_FALSE(results[2].has_value());
+    EXPECT_EQ(results[2].error(), ErrorCode::LEASE_EXPIRED);
+    EXPECT_EQ(std::string(destinations[1].begin(), destinations[1].end()),
+              std::string(kObjectSize, 'l'));
+    // The duplicate must not inherit a successful result or bytes from its
+    // expired primary.
+    EXPECT_EQ(destinations[2], std::vector<char>(kObjectSize, '\0'));
+}
+
+TEST_F(RealClientTest, LocalDiskBufferReadsRejectExpiredMasterLeaseAfterIo) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_expired_lease_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+
+    // A zero TTL makes every QueryResult expire at its query-start timestamp.
+    // No sleep or transfer-size timing assumption is needed to exercise the
+    // post-I/O check deterministically.
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(0)
+                                  .set_eviction_high_watermark_ratio(1.0)
+                                  .build()));
+    master_address_ = master_.master_address();
+    const std::string owner = "localhost:17813";
+    ASSERT_EQ(py_client_->setup_real(
+                  owner, "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
+                  "tcp", "", master_address_, nullptr, "", true, ssd_path_),
+              0);
+
+    constexpr size_t kSize = 256;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "local_disk_expired_master_lease";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    bool disk_ready = false;
+    const auto offload_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < offload_deadline && !disk_ready) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            disk_ready |= replica.is_local_disk_replica() &&
+                          replica.status == ReplicaStatus::COMPLETE;
+        }
+        if (!disk_ready) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_TRUE(disk_ready);
+
+    bool disk_only = false;
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < clear_deadline && !disk_only) {
+        const auto replicas = py_client_->get_replica_desc(key);
+        disk_only =
+            replicas.size() == 1 && replicas.front().is_local_disk_replica();
+        if (!disk_only) {
+            py_client_->batch_replica_clear({key}, owner);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_TRUE(disk_only);
+
+    // get_buffer: successful SSD I/O must still produce the existing nullptr
+    // failure result when the master lease expired.
+    EXPECT_EQ(py_client_->get_buffer(key), nullptr);
+
+    // batch_get_buffer: the duplicate must not receive a handle fanned out
+    // from the expired primary.
+    auto buffers = py_client_->batch_get_buffer({key, key});
+    ASSERT_EQ(buffers.size(), 2u);
+    EXPECT_EQ(buffers[0], nullptr);
+    EXPECT_EQ(buffers[1], nullptr);
+
+    // multi-buffer batch: both entries fail per key, and duplicate bytes are
+    // not published after the primary's failed lease check.
+    std::vector<char> destinations(2 * kSize, '\0');
+    ASSERT_EQ(
+        py_client_->register_buffer(destinations.data(), destinations.size()),
+        0);
+    auto results = py_client_->batch_get_into_multi_buffers(
+        {key, key}, {{destinations.data()}, {destinations.data() + kSize}},
+        {{kSize}, {kSize}}, false);
+    EXPECT_EQ(py_client_->unregister_buffer(destinations.data()), 0);
+    const int lease_expired = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+    EXPECT_EQ(results, (std::vector<int>{lease_expired, lease_expired}));
+    EXPECT_TRUE(std::all_of(destinations.begin() + kSize, destinations.end(),
+                            [](char value) { return value == '\0'; }));
+}
+
 TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
     ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
     ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
@@ -368,6 +520,115 @@ TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
     EXPECT_EQ(py_client_->batch_get_session_end({key}), 0);
     EXPECT_EQ(py_client_->unregister_buffer(first.data()), 0);
     EXPECT_EQ(py_client_->unregister_buffer(second.data()), 0);
+}
+
+TEST_F(RealClientTest, PosixDfsHostReadsSkipStagingBuffer) {
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "distributed_storage_backend");
+    ScopedEnvVar local_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                              "16777216");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar dfs_shards("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar dfs_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar dfs_alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar dfs_eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar dfs_deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar dfs_single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    char path[] = "/tmp/mooncake_posix_dfs_direct_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+
+    ASSERT_TRUE(master_.Start(
+        InProcMasterConfigBuilder().set_default_kv_lease_ttl(1000).build()));
+    master_address_ = master_.master_address();
+    constexpr char kClientAddress[] = "localhost:17825";
+    ASSERT_EQ(
+        py_client_->setup_real(kClientAddress, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, "tcp", "", master_address_,
+                               nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 64 * 1024;
+    const std::string key = "posix_dfs_direct";
+    std::string source(kObjectSize, '\0');
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 13) % 251);
+    }
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, source, config), 0);
+    ASSERT_EQ(py_client_->batch_replica_clear({key}, kClientAddress).size(), 1);
+    const auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_dfs_replica());
+
+    // A staging buffer cannot fit the object, so every read below succeeds
+    // only if it lands in the unregistered host destination directly.
+    auto client_buffer_allocator =
+        std::move(py_client_->client_buffer_allocator_);
+    py_client_->client_buffer_allocator_ = ClientBufferAllocator::create(4096);
+
+    std::string full(kObjectSize, '\0');
+    EXPECT_EQ(py_client_->get_into(key, full.data(), full.size()),
+              static_cast<int64_t>(kObjectSize));
+    EXPECT_EQ(full, source);
+
+    // get_into_ranges sizes its destinations from the registration.
+    std::string window(kObjectSize, '\0');
+    ASSERT_EQ(py_client_->register_buffer(window.data(), window.size()), 0);
+    constexpr size_t kSrcOffset = 1000;
+    constexpr size_t kWindowSize = 20000;
+    const auto ranged = py_client_->get_into_ranges(
+        {window.data()}, {{key}}, {{{8}}}, {{{kSrcOffset}}}, {{{kWindowSize}}});
+    ASSERT_EQ(ranged.size(), 1);
+    ASSERT_EQ(ranged[0].size(), 1);
+    ASSERT_EQ(ranged[0][0].size(), 1);
+    EXPECT_EQ(ranged[0][0][0], static_cast<int64_t>(kWindowSize));
+    EXPECT_EQ(window.substr(8, kWindowSize),
+              source.substr(kSrcOffset, kWindowSize));
+    EXPECT_EQ(py_client_->unregister_buffer(window.data()), 0);
+
+    std::string first(kObjectSize, '\0');
+    std::string duplicate(kObjectSize, '\0');
+    const auto batch =
+        py_client_->batch_get_into({key, key}, {first.data(), duplicate.data()},
+                                   {first.size(), duplicate.size()});
+    EXPECT_EQ(batch, (std::vector<int64_t>{static_cast<int64_t>(kObjectSize),
+                                           static_cast<int64_t>(kObjectSize)}));
+    EXPECT_EQ(first, source);
+    EXPECT_EQ(duplicate, source);
+
+    std::string head(12345, '\0');
+    std::string tail(kObjectSize - head.size() + 100, '\0');
+    const auto multi = py_client_->batch_get_into_multi_buffers(
+        {key}, {{head.data(), tail.data()}}, {{head.size(), tail.size()}},
+        true);
+    EXPECT_EQ(multi, std::vector<int>{static_cast<int>(kObjectSize)});
+    EXPECT_EQ(head, source.substr(0, head.size()));
+    EXPECT_EQ(tail.substr(0, kObjectSize - head.size()),
+              source.substr(head.size()));
+
+    py_client_->client_buffer_allocator_ = std::move(client_buffer_allocator);
+
+    // More destinations than one preadv() accepts stay on the staging path.
+    constexpr size_t kPieceSize = 16;
+    std::string scattered(kObjectSize, '\0');
+    std::vector<void*> pieces;
+    std::vector<size_t> piece_sizes;
+    for (size_t off = 0; off < kObjectSize; off += kPieceSize) {
+        pieces.push_back(scattered.data() + off);
+        piece_sizes.push_back(kPieceSize);
+    }
+    ASSERT_GT(pieces.size(), static_cast<size_t>(IOV_MAX));
+    const auto many = py_client_->batch_get_into_multi_buffers(
+        {key}, {pieces}, {piece_sizes}, true);
+    EXPECT_EQ(many, std::vector<int>{static_cast<int>(kObjectSize)});
+    EXPECT_EQ(scattered, source);
 }
 
 #ifdef MOONCAKE_TEST_CUDA_H2D
@@ -3878,6 +4139,17 @@ TEST_F(RealClientTest, UnregisterBufferRetryReachesNofCleanup) {
     // the TE error without touching the NoF side.
     EXPECT_NE(py_client_->unregister_buffer(buffer.data()), 0);
     EXPECT_EQ(initiator->unregister_calls_, 2);
+
+    // TENT can report success for an already-unregistered address. Store's
+    // missing record must still prevent another NoF cleanup in that case.
+    {
+        TeUnregisterHookGuard hook_guard;
+        RealClient::SetTeUnregisterHookForTesting(
+            [](void*) -> tl::expected<void, ErrorCode> { return {}; });
+        EXPECT_EQ(py_client_->unregister_buffer(buffer.data()),
+                  toInt(ErrorCode::NOT_REGISTERED));
+        EXPECT_EQ(initiator->unregister_calls_, 2);
+    }
 
     ASSERT_EQ(py_client_->tearDownAll(), 0);
 }

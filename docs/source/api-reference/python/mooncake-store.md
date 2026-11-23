@@ -620,6 +620,44 @@ In the example above:
 - Source overflow is checked against the source object's size.
 - Full-object `get_into()` and ranged `get_into_ranges()` are different APIs; use `get_into()` when you want the whole object into one buffer.
 
+Gather endpoints are discovered through a separate, expiring Store RPC directory.
+Owners refresh their entries on existing heartbeats; readers cache discoveries.
+This does not change segment/object descriptors, allocator metadata, or snapshots.
+Missing entries or unsupported directory RPCs fall back to scatter.
+
+**Automatic gather/scatter selection:** for remote CPU memory replicas on
+classic RDMA Store owners, the Store can pack many small source fragments
+into registered chunks and pipeline ordinary Transfer Engine WRITEs into a
+contiguous destination. The API and per-fragment results remain unchanged.
+
+Selection is per owner and destination buffer, including ranges from multiple
+keys ordered by destination offset. The initial policy requires at least 256
+source runs, fragments of at most 1 KiB, at least 64 KiB total payload, and a
+contiguous, non-overlapping destination. Requests are bounded to 131,072 ranges
+and 512 MiB per gather operation. Small requests, large fragments, destination
+gaps, local-copy/shared-memory proxy paths, TCP, TENT, mixed-protocol destinations,
+and owners without the capability use existing paths. TCP gathering is disabled
+because a failed sender cannot fence writes still pending at the receiver. Set `MC_STORE_GATHER_READ=0` on the reader to disable gather selection.
+This switch does not change buffer registration, allowing direct comparisons.
+
+Store output buffers registered on supported classic RDMA transports are published
+for remote access because gather uses owner-initiated WRITEs. Callers must keep
+buffers and registrations alive until the synchronous read returns, and must
+establish GPU visibility before consuming RDMA-written GPU data. Ordinary reads
+retain lease renewal during discovery, connection/session setup, and transfer
+completion across all owners; snapshot reads do not renew or change the selected
+snapshot. An owner rejection before any write can fall back to scatter. If a
+later chunk fails, fully completed fragments retain their successful results;
+fragments overlapping failed or unproven chunks return errors after all writes
+drain. Submitted data failures do not fall back or replay writes.
+Idle sessions may be retired when the owner's session table is full; retired
+sessions fall back safely, and readers replace retired connections. Fencing
+identifies the service instance so session retirement cannot hide an owner restart.
+After a control-connection failure, the reader fences the original operation
+before returning; it does not replay writes. If the original owner/session
+cannot be reached, the read remains pending rather than allowing unsafe buffer
+reuse. Automatic recovery from a lost owner process is not provided.
+
 **Current limitation:** true ranged items currently require the selected source replica to be memory-backed. Whole-object reads still follow the normal full-read path, but partial reads through `get_into_ranges()` do not support non-memory replicas.
 
 ---
@@ -710,7 +748,7 @@ therefore become ordinary cache after recovery or Standby promotion.
 #### with_hard_pin
 **Type:** `bool`
 **Default:** `False`
-**Description:** Enables hard pinning for the stored object. Hard pinned objects will not be evicted. This grants user to manually control the life time of stored objects.
+**Description:** Enables hard pinning for the stored object. Hard pinned objects will not be evicted. This grants user to manually control the life time of stored objects. An explicit drain job can move its replicas to other segments while preserving the hard pin.
 
 ```python
 config = ReplicateConfig()
@@ -2284,6 +2322,34 @@ while tasks:
 print("All tasks completed")
 store.close()
 ```
+
+---
+
+(python-timed-drain-job)=
+#### create_drain_job()
+
+Start draining mounted memory segments using an initialized
+`MooncakeDistributedStore` with the C++ backend. A positive `timeout_ms`
+sets a deadline in milliseconds from job creation. The default of `0`
+creates a job with no deadline.
+
+The following example creates a job with a 30-second deadline.
+
+```python
+job_id, error_code = store.create_drain_job(
+    segments=["segment_0"],
+    target_segments=["segment_1"],
+    timeout_ms=30_000,
+)
+if error_code != 0:
+    raise RuntimeError(f"Failed to create drain job ({error_code})")
+```
+
+Poll `store.query_drain_job(job_id)` for `(job, error_code)`. When
+`error_code` is `0`, read `job.status`. A job that reaches its deadline
+enters `JobStatus.CANCELING` and reaches `JobStatus.TIMED_OUT` after in-flight
+tasks and their cleanup finish. Unfinished source segments stay `DRAINING`
+so a new job can resume draining them.
 
 ---
 

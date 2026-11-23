@@ -36,10 +36,46 @@ void AgentStateMachine::appendApplyGroupStateEffect(
                                                     std::move(activatable)});
 }
 
+std::vector<GlobalRank> AgentStateMachine::appendPeerSegmentRefreshEffects(
+    const GroupView* old_view, const GroupView& view,
+    AgentApplyResult& effects) const {
+    std::vector<GlobalRank> refreshed;
+    for (size_t r = 0; r < view.members.size(); ++r) {
+        if (r == static_cast<size_t>(rank_)) continue;
+        if (!view.members[r].isMember()) continue;
+        uint64_t old_epoch = 0;
+        uint64_t new_epoch = 0;
+        if (old_view && r < old_view->members.size() &&
+            old_view->members[r].hasEndpoint()) {
+            old_epoch = old_view->members[r].endpoint->endpoint_epoch;
+        }
+        if (view.members[r].hasEndpoint()) {
+            new_epoch = view.members[r].endpoint->endpoint_epoch;
+        }
+        if (new_epoch != 0 && new_epoch != old_epoch) {
+            effects.push_back(RefreshPeerLink{static_cast<GlobalRank>(r)});
+            refreshed.push_back(static_cast<GlobalRank>(r));
+        }
+    }
+    return refreshed;
+}
+
 AgentApplyResult AgentStateMachine::registerGroup(const GroupView& group) {
     AgentApplyResult effects;
+    // The registration view already holds the endpoints that peers published
+    // before this rank registered, and later views do not change them. Their
+    // segments need a refresh all the same: a peer may register this group's
+    // memory at addresses that a destroyed group used, and a segment
+    // descriptor cached before then still maps them to the old rkeys.
+    auto it = groups_.find(group.group_id);
+    const auto need_segment_refresh = appendPeerSegmentRefreshEffects(
+        it == groups_.end() ? nullptr : &it->second, group, effects);
     groups_.insert_or_assign(group.group_id, group);
     appendApplyGroupStateEffect(group, effects);
+    // As in applyGroupView, after the communicator has the view's rank order.
+    for (auto gr : need_segment_refresh) {
+        effects.push_back(NotifyLinkRefreshed{gr});
+    }
     return effects;
 }
 
@@ -126,15 +162,8 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
         .agent_addr = "",
         .te_server_name = push.te_server_name,
         .warmup_recv_addr = push.warmup_recv_addr,
-        .transfer_service_endpoint = push.transfer_service_endpoint,
         .collective_workspace_endpoint = push.collective_workspace_endpoint,
     };
-    if (push.transfer_service_endpoint) {
-        effects.push_back(InstallDeviceTransferEndpoint{
-            .rank = push.rank,
-            .endpoint = *push.transfer_service_endpoint,
-        });
-    }
     if (push.collective_workspace_endpoint) {
         effects.push_back(InstallDeviceCollectiveWorkspaceEndpoint{
             .rank = push.rank,
@@ -215,26 +244,9 @@ PGResult<AgentApplyResult> AgentStateMachine::applyGroupView(
                                " at epoch " + std::to_string(view.epoch));
     }
 
-    // Collect peers whose segment caches must be refreshed.
-    std::vector<GlobalRank> need_segment_refresh;
-
-    // Detect endpoint updates.
-    for (size_t r = 0; r < view.members.size(); ++r) {
-        if (r == static_cast<size_t>(rank_)) continue;
-        if (!view.members[r].isMember()) continue;
-        uint64_t old_epoch = 0;
-        uint64_t new_epoch = 0;
-        if (old_view.members[r].hasEndpoint()) {
-            old_epoch = old_view.members[r].endpoint->endpoint_epoch;
-        }
-        if (view.members[r].hasEndpoint()) {
-            new_epoch = view.members[r].endpoint->endpoint_epoch;
-        }
-        if (new_epoch != 0 && new_epoch != old_epoch) {
-            effects.push_back(RefreshPeerLink{static_cast<GlobalRank>(r)});
-            need_segment_refresh.push_back(static_cast<GlobalRank>(r));
-        }
-    }
+    // Detect endpoint updates; these peers' segment caches must be refreshed.
+    const auto need_segment_refresh =
+        appendPeerSegmentRefreshEffects(&old_view, view, effects);
 
     // Applying the view must happen-before waking group/rank waiters: callers
     // may submit a collective as soon as waitUntilGroupReady()/joinGroup()
@@ -277,6 +289,25 @@ PGResult<AgentApplyResult> AgentStateMachine::applyGroupView(
 PGResult<AgentApplyResult> AgentStateMachine::handleViewUpdate(
     const ViewUpdatePush& push) {
     return applyGroupView(push.view);
+}
+
+PGResult<AgentApplyResult> AgentStateMachine::handleTransferEndpointUpdate(
+    uint64_t request_id, const TransferEndpointUpdatePush& push) const {
+    const auto& snapshot = push.snapshot;
+    const uint64_t rank_epoch =
+        snapshot.rank_epochs.size() == static_cast<size_t>(max_world_size_)
+            ? snapshot.rank_epochs[rank_]
+            : 0;
+    PG_VALIDATE_STATE(
+        snapshot.endpoints.size() == static_cast<size_t>(max_world_size_) &&
+            snapshot.endpoints[rank_] &&
+            std::find(snapshot.participants.begin(),
+                      snapshot.participants.end(),
+                      rank_) != snapshot.participants.end(),
+        "invalid device endpoint installation");
+
+    return AgentApplyResult{InstallTransferEndpoints{
+        request_id, snapshot, push.reclaim_before_version}};
 }
 
 HeartbeatRequest AgentStateMachine::buildHeartbeat() const {
@@ -334,12 +365,6 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
         rank_connections_[connection.rank] = connection;
         // Install rank-scoped endpoints before applying any restored group
         // state that may reference them.
-        if (connection.transfer_service_endpoint) {
-            effects.push_back(InstallDeviceTransferEndpoint{
-                .rank = connection.rank,
-                .endpoint = *connection.transfer_service_endpoint,
-            });
-        }
         if (connection.collective_workspace_endpoint) {
             effects.push_back(InstallDeviceCollectiveWorkspaceEndpoint{
                 .rank = connection.rank,

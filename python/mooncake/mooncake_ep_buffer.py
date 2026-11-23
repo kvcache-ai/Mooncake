@@ -1,13 +1,13 @@
 import functools
 import os
-import pickle
 import socket
 from contextlib import contextmanager
-from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+
+from .mooncake_ep_tcpstore import fetch_peer_metadata
 
 if TYPE_CHECKING:
     from mooncake import ep
@@ -319,27 +319,14 @@ class Buffer:
     def _fetch_remote_metadata_from_tcp_store(self, remote_ranks: List[int]):
         if self.tcp_store_group is None:
             raise RuntimeError("Mooncake peer metadata exchange requires a TCPStore.")
-        store = self.tcp_store_group
-        outgoing_keys = [f"MOONCAKE_EP/{self.rank}/{rank}" for rank in remote_ranks]
-        incoming_keys = [f"MOONCAKE_EP/{rank}/{self.rank}" for rank in remote_ranks]
-        envelope = pickle.dumps((socket.gethostname(), self._get_local_peer_metadata()))
-        consumed_incoming_keys = []
-        try:
-            for key in outgoing_keys:
-                store.set(key, envelope)
-            if incoming_keys:
-                store.wait(
-                    incoming_keys,
-                    timedelta(milliseconds=self.metadata_timeout_ms),
-                )
-                remote_metadata = store.multi_get(incoming_keys)
-                consumed_incoming_keys.extend(incoming_keys)
-            else:
-                remote_metadata = []
-            yield [pickle.loads(metadata) for metadata in remote_metadata]
-        finally:
-            for key in consumed_incoming_keys:
-                store.delete_key(key)
+        with fetch_peer_metadata(
+            self.tcp_store_group,
+            self.rank,
+            remote_ranks,
+            self._get_local_peer_metadata(),
+            self.metadata_timeout_ms,
+        ) as metadata:
+            yield metadata
 
     def connect_ranks(self, remote_ranks: List[int], activate: bool = True) -> None:
         """Exchange peer metadata and optionally activate the connections.

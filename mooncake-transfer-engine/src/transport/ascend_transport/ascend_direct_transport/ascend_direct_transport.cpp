@@ -131,17 +131,11 @@ int AscendDirectTransport::install(std::string& local_server_name,
             << ret;
         return ret;
     }
-    ret = metadata_->updateLocalSegmentDesc();
-    if (ret) {
-        LOG(ERROR) << "cannot publish segments, "
-                      "check the availability of metadata storage, ret: "
-                   << ret;
-        return ret;
-    }
-
     TransferExecutorBase::InitParams exec_params;
     exec_params.metadata = metadata_;
     exec_params.local_engine_contexts = local_engine_contexts_;
+    exec_params.local_engine_device_ids = local_engine_device_ids_;
+    exec_params.base_port = base_port_;
     exec_params.agent_mode = agent_mode_;
     exec_params.roce_mode = roce_mode_;
     exec_params.use_fabric_mem = use_fabric_mem_;
@@ -154,8 +148,18 @@ int AscendDirectTransport::install(std::string& local_server_name,
             << ret;
         return ret;
     }
+    ret = metadata_->updateLocalSegmentDesc();
+    if (ret) {
+        LOG(ERROR) << "cannot publish segments, "
+                      "check the availability of metadata storage, ret: "
+                   << ret;
+        return ret;
+    }
 
-    if (agent_mode_ && roce_mode_) {
+    // RoceDummyRealSliceDispatcher is the sunset path for a standalone holder
+    // that still sets HCCL_INTRA_ROCE_ENABLE. roce:device and roce:host stay
+    // on DefaultSliceDispatcher even when agent_mode publishes every NPU.
+    if (agent_mode_ && IsHcclIntraRoceEnabled()) {
         dispatcher_ = std::make_unique<RoceDummyRealSliceDispatcher>(
             transfer_executor_.get(), local_engine_contexts_,
             local_engine_device_ids_);
@@ -164,6 +168,12 @@ int AscendDirectTransport::install(std::string& local_server_name,
             transfer_executor_.get(), local_engine_contexts_,
             local_engine_device_ids_);
     }
+    LOG(INFO) << "AscendDirectTransport: dispatcher="
+              << (agent_mode_ && IsHcclIntraRoceEnabled()
+                      ? "RoceDummyRealSliceDispatcher"
+                      : "DefaultSliceDispatcher")
+              << ", agent_mode=" << agent_mode_ << ", roce_mode=" << roce_mode_
+              << ", local_devices=" << local_engine_device_ids_.size();
     return 0;
 }
 
@@ -190,6 +200,8 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     desc->protocol = "ascend";
 
     agent_mode_ = globalConfig().ascend_agent_mode;
+    single_segment_ =
+        agent_mode_ && globalConfig().ascend_standalone_single_segment;
     roce_mode_ = IsRoceModeEnabled();
     // Only a Store-init TE may use fabric mem; gate on ascend_store_te_init so
     // a P2P/HCCS TE does not inherit a Store TE's fabric flag left in the
@@ -201,7 +213,8 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     // subtree.
     hccs_device_protocol_ = HasHccsDeviceProtocolDescInGlobalResourceConfig(
         ResolveAscendGlobalResourceConfig(
-            std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG"))
+            getEnvWithFallback("MC_ASCEND_GLOBAL_RESOURCE_CONFIG",
+                               "ASCEND_GLOBAL_RESOURCE_CONFIG"))
             .c_str());
     LOG(INFO) << "[AscendTE] init local segment, te is created for store="
               << (globalConfig().ascend_store_te_init ? "true" : "false")
@@ -213,7 +226,8 @@ int AscendDirectTransport::allocateLocalSegmentID() {
                       ? ", launched as standalone real client (manages all "
                         "local NPU devices)"
                       : "");
-    char* adxl_base_port = std::getenv("ASCEND_BASE_PORT");
+    const char* adxl_base_port =
+        getEnvWithFallback("MC_ASCEND_BASE_PORT", "ASCEND_BASE_PORT");
     if (adxl_base_port) {
         std::optional<int32_t> base_port =
             parseFromString<int32_t>(adxl_base_port);
@@ -221,7 +235,8 @@ int AscendDirectTransport::allocateLocalSegmentID() {
             base_port_ = base_port.value();
             LOG(INFO) << "Set base port to:" << base_port_;
         } else {
-            LOG(WARNING) << "ASCEND_BASE_PORT is not valid, value:"
+            LOG(WARNING) << "MC_ASCEND_BASE_PORT/ASCEND_BASE_PORT is not "
+                            "valid, value:"
                          << adxl_base_port;
         }
     }
@@ -347,6 +362,11 @@ Status AscendDirectTransport::getTransferStatus(BatchID batch_id,
             std::to_string(batch_id));
     }
     auto& task = batch_desc.task_list[task_id];
+    // TENT drives local-copy completion from the transport status path; do the
+    // same here instead of running a per-engine completion thread.
+    if (transfer_executor_) {
+        transfer_executor_->pollLocalCopies();
+    }
     uint64_t success_slice_count =
         __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
     uint64_t failed_slice_count =
@@ -422,6 +442,38 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
         return ERR_INVALID_ARGUMENT;
     }
 
+    const bool all_engines = single_segment_ && remote_accessible;
+    if (all_engines) {
+        if (transfer_executor_->getUseBufferPool()) {
+            LOG(ERROR) << "MC_ASCEND_STANDALONE_SINGLE_SEGMENT/"
+                          "ASCEND_STANDALONE_SINGLE_SEGMENT requires "
+                          "MC_ASCEND_BUFFER_POOL/ASCEND_BUFFER_POOL=0:0";
+            return ERR_INVALID_ARGUMENT;
+        }
+        // Register once per engine, keeping every handle under this address.
+        // Publish the existing BufferDesc format once all engines are ready.
+        int ret = transfer_executor_->registerMem(addr, length, mem_type, false,
+                                                  remote_accessible, true);
+        if (ret != 0) return ret;
+        for (size_t i = 0; i < local_engine_contexts_.size(); ++i) {
+            buffer_desc.device_id = static_cast<int32_t>(i);
+            metadata_->addLocalMemoryBuffer(buffer_desc, false);
+        }
+        ret = update_metadata ? metadata_->updateLocalSegmentDesc() : 0;
+        if (ret != 0) {
+            for (size_t i = 0; i < local_engine_contexts_.size(); ++i) {
+                metadata_->removeLocalMemoryBuffer(
+                    addr,
+                    [length](const BufferDesc& buffer) {
+                        return buffer.length == length;
+                    },
+                    false);
+            }
+            (void)transfer_executor_->deregisterMem(addr);
+        }
+        return ret;
+    }
+
     int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (ret) {
         LOG(ERROR) << "addLocalMemoryBuffer failed, ret: " << ret;
@@ -446,18 +498,44 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
 
 int AscendDirectTransport::unregisterLocalMemory(void* addr,
                                                  bool update_metadata) {
+    // Unregistering can run on a thread that never bound a context, such as the
+    // signal handling thread that unmounts the store segments on Ctrl-C. There
+    // is then nothing to put back, and deregisterMem binds the context each
+    // handle was registered with regardless of what the caller has bound.
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtGetCurrentContext failed, errmsg: "
-                   << aclGetRecentErrMsg();
-        return -1;
+        LOG_FIRST_N(WARNING, 1)
+            << "aclrtGetCurrentContext failed while unregistering memory "
+               "(no ACL context on this thread), errmsg: "
+            << aclGetRecentErrMsg();
+        saved_ctx = nullptr;
     }
-    MAKE_GUARD(ctx_restore,
-               [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
+    MAKE_GUARD(ctx_restore, [saved_ctx]() {
+        if (saved_ctx != nullptr) {
+            (void)aclrtSetCurrentContext(saved_ctx);
+        }
+    });
 
     int ret = transfer_executor_->deregisterMem(addr);
     if (ret != 0) {
         return ret;
+    }
+    if (single_segment_) {
+        // Multi-engine registrations share an address. Remove every record
+        // before publishing, after all handles have been deregistered.
+        const auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        bool removed = false;
+        if (desc) {
+            for (const auto& buffer : desc->buffers) {
+                if (buffer.addr == reinterpret_cast<uint64_t>(addr)) {
+                    metadata_->removeLocalMemoryBuffer(addr, false);
+                    removed = true;
+                }
+            }
+        }
+        if (removed) {
+            return update_metadata ? metadata_->updateLocalSegmentDesc() : 0;
+        }
     }
     (void)metadata_->removeLocalMemoryBuffer(addr, update_metadata);
     return 0;

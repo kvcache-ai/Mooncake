@@ -172,7 +172,8 @@ impl ClassicTransferEngine {
 
     pub fn rpc_server_address_text(&self) -> Result<String> {
         let mut buffer = vec![0i8; 256];
-        let rc = unsafe { ffi::getLocalIpAndPort(self.raw, buffer.as_mut_ptr(), buffer.len()) };
+        let rc =
+            unsafe { ffi::getLocalIpAndPort(self.raw, buffer.as_mut_ptr().cast(), buffer.len()) };
         check_zero(rc, "getLocalIpAndPort")?;
         Ok(read_c_buffer(&buffer))
     }
@@ -381,7 +382,7 @@ impl ClassicTransferEngine {
         let rc = unsafe {
             ffi::mooncake_classic_get_local_segment_descriptor_json(
                 self.raw,
-                buffer.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
                 buffer.len(),
             )
         };
