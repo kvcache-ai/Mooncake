@@ -478,6 +478,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       max_kv_soft_pin_ttl_(config.max_kv_soft_pin_ttl),
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
+      evacuate_on_graceful_unmount_(config.evacuate_on_graceful_unmount),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
       nof_eviction_ratio_(config.nof_eviction_ratio),
@@ -2883,6 +2884,8 @@ auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    SegmentStatus prev_status = SegmentStatus::UNDEFINED;
+    (void)segment_access.GetSegmentStatusById(segment_id, prev_status);
     err = segment_access.PrepareGracefulUnmountSegment(segment_id);
     if (err == ErrorCode::SEGMENT_NOT_FOUND) {
         return {};
@@ -2894,6 +2897,12 @@ auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
     auto expire_time = std::chrono::steady_clock::now() +
                        std::chrono::milliseconds(grace_period_ms);
     graceful_unmount_scheduler_.Schedule({segment_id, client_id}, expire_time);
+    if (evacuate_on_graceful_unmount_ && grace_period_ms > 0 &&
+        prev_status != SegmentStatus::GRACEFULLY_UNMOUNTING) {
+        std::lock_guard<std::mutex> evacuation_lock(exit_evacuation_mutex_);
+        pending_exit_evacuations_.push_back(
+            {segment_id, client_id, expire_time});
+    }
     return {};
 }
 
@@ -10802,6 +10811,29 @@ tl::expected<UUID, ErrorCode> MasterService::CreateTimedDrainJob(
         }
     }
 
+    return AddDrainJobLocked(request, deadline, {});
+}
+
+bool MasterService::HasUnfinishedDrainJobLocked(
+    const std::string& segment_name) {
+    for (const auto& [_, existing] : drain_jobs_) {
+        const auto& sources = existing->request.segments;
+        if (std::find(sources.begin(), sources.end(), segment_name) ==
+            sources.end()) {
+            continue;
+        }
+        std::lock_guard<std::mutex> job_lock(existing->mutex);
+        if (!IsDrainJobTerminal(existing->status)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+UUID MasterService::AddDrainJobLocked(
+    const CreateDrainJobRequest& request,
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::optional<ExitEvacuation> exit_evacuation) {
     auto job = std::make_shared<DrainJob>();
     do {
         job->id = generate_uuid();
@@ -10811,12 +10843,146 @@ tl::expected<UUID, ErrorCode> MasterService::CreateTimedDrainJob(
     job->created_at = std::chrono::system_clock::now();
     job->last_updated_at = job->created_at;
     job->status = JobStatus::CREATED;
-    job->message = "Drain job created";
+    job->message =
+        exit_evacuation ? "Exit evacuation created" : "Drain job created";
+    job->exit_evacuation = std::move(exit_evacuation);
     drain_jobs_.emplace(job->id, job);
     if (deadline) {
         drain_job_deadline_scheduler_.Schedule(job, *deadline);
     }
     return job->id;
+}
+
+void MasterService::StartExitEvacuations() {
+    std::vector<ExitEvacuationRequest> requests;
+    {
+        std::lock_guard<std::mutex> lock(exit_evacuation_mutex_);
+        requests.swap(pending_exit_evacuations_);
+    }
+    if (requests.empty()) {
+        return;
+    }
+
+    // Replicas are addressed by segment name, so one job evacuates all of a
+    // client's segments that share a name, once none of them serves writes.
+    struct Evacuation {
+        std::vector<ExitEvacuationRequest> requests;
+        ExitEvacuation job;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    std::map<std::pair<UUID, std::string>, Evacuation> evacuations;
+    std::vector<ExitEvacuationRequest> waiting;
+    const auto now = std::chrono::steady_clock::now();
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (const auto& request : requests) {
+            Segment segment;
+            if (request.deadline <= now ||
+                !segment_access.GetSegment(request.segment_id, segment)) {
+                continue;
+            }
+            auto& evacuation = evacuations[{request.client_id, segment.name}];
+            evacuation.requests.push_back(request);
+            evacuation.deadline =
+                std::max(evacuation.deadline, request.deadline);
+        }
+        for (auto it = evacuations.begin(); it != evacuations.end();) {
+            const auto& [client_id, name] = it->first;
+            std::vector<Segment> client_segments;
+            (void)segment_access.GetClientSegments(client_id, client_segments);
+            bool ready = true;
+            for (const auto& segment : client_segments) {
+                if (segment.name != name) {
+                    continue;
+                }
+                SegmentStatus status = SegmentStatus::UNDEFINED;
+                (void)segment_access.GetSegmentStatusById(segment.id, status);
+                if (status != SegmentStatus::GRACEFULLY_UNMOUNTING) {
+                    ready = false;
+                    break;
+                }
+                it->second.job.segments.push_back({segment.id, client_id});
+            }
+            // Another client may serve writes under the same name.
+            auto& known = it->second.job.known_registrations;
+            known = segment_access.GetSegmentIdsByName(name);
+            const bool serves_writes =
+                std::any_of(known.begin(), known.end(), [&](const UUID& id) {
+                    SegmentStatus status = SegmentStatus::UNDEFINED;
+                    (void)segment_access.GetSegmentStatusById(id, status);
+                    return status == SegmentStatus::OK;
+                });
+            if (!ready || serves_writes ||
+                segment_access.IsDrainSourceFenced(name)) {
+                waiting.insert(waiting.end(), it->second.requests.begin(),
+                               it->second.requests.end());
+                it = evacuations.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    for (auto& [owner, evacuation] : evacuations) {
+        const auto& name = owner.second;
+        CreateDrainJobRequest request;
+        request.segments = {name};
+        request.max_concurrency = kExitEvacuationConcurrency;
+        std::lock_guard<std::mutex> lock(job_mutex_);
+        // A drain already moving this name keeps it; retry once it ends.
+        if (HasUnfinishedDrainJobLocked(name)) {
+            waiting.insert(waiting.end(), evacuation.requests.begin(),
+                           evacuation.requests.end());
+            continue;
+        }
+        const auto job_id = AddDrainJobLocked(request, evacuation.deadline,
+                                              std::move(evacuation.job));
+        LOG(INFO) << "action=start_exit_evacuation, segment_name=" << name
+                  << ", job_id=" << job_id;
+    }
+
+    if (!waiting.empty()) {
+        std::lock_guard<std::mutex> lock(exit_evacuation_mutex_);
+        pending_exit_evacuations_.insert(pending_exit_evacuations_.end(),
+                                         waiting.begin(), waiting.end());
+    }
+}
+
+bool MasterService::ExitEvacuationSuperseded(const DrainJob& job) {
+    if (!job.exit_evacuation) {
+        return false;
+    }
+    // Any client, the leaving one included, may mount the name again, or an
+    // operator drain may take over the name.
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    const auto& name = job.request.segments.front();
+    if (segment_access.IsDrainSourceFenced(name)) {
+        return true;
+    }
+    const auto& known = job.exit_evacuation->known_registrations;
+    const auto ids = segment_access.GetSegmentIdsByName(name);
+    return std::any_of(ids.begin(), ids.end(), [&](const UUID& id) {
+        return std::find(known.begin(), known.end(), id) == known.end();
+    });
+}
+
+void MasterService::UnmountEvacuatedSegments(
+    const std::vector<GracefulUnmountDeadlineRecord>& segments) {
+    for (const auto& segment : segments) {
+        auto result = UnmountSegment(segment.segment_id, segment.client_id);
+        if (!result.has_value()) {
+            // The graceful unmount deadline still unmounts it.
+            LOG(WARNING) << "action=unmount_evacuated_segment_failed"
+                         << ", segment_id=" << segment.segment_id
+                         << ", error=" << toString(result.error());
+            continue;
+        }
+        graceful_unmount_scheduler_.RemoveIf(
+            [&segment](const GracefulUnmountDeadlineRecord& pending) {
+                return pending.segment_id == segment.segment_id;
+            });
+    }
 }
 
 tl::expected<QueryJobResponse, ErrorCode> MasterService::QueryDrainJob(
@@ -11008,13 +11174,15 @@ void MasterService::FinishDrainJobCancellation(DrainJob& job) {
 
     const bool timed_out = job.stop_reason.load(std::memory_order_relaxed) ==
                            DrainStopReason::TIMEOUT;
-    auto segments = segment_manager_.getSegmentAccess();
-    for (const auto& name : job.request.segments) {
-        // Timed-out sources keep their status so a new job can resume.
-        if (!timed_out) {
-            segments.SetDrainSourceStatus(name, SegmentStatus::OK);
+    if (!job.exit_evacuation) {
+        auto segments = segment_manager_.getSegmentAccess();
+        for (const auto& name : job.request.segments) {
+            // Timed-out sources keep their status so a new job can resume.
+            if (!timed_out) {
+                segments.SetDrainSourceStatus(name, SegmentStatus::OK);
+            }
+            segments.ReleaseDrainSourceFence(name);
         }
-        segments.ReleaseDrainSourceFence(name);
     }
     job.status = timed_out ? JobStatus::TIMED_OUT : JobStatus::CANCELED;
     job.last_updated_at = std::chrono::system_clock::now();
@@ -11382,7 +11550,9 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
                 source.state = DrainSourceState::kAwaitingReclamation;
                 source.verify_after = verify_after;
             } else {
-                segments.SetDrainSourceStatus(name, SegmentStatus::DRAINED);
+                if (!job.exit_evacuation) {
+                    segments.SetDrainSourceStatus(name, SegmentStatus::DRAINED);
+                }
                 source.state = DrainSourceState::kDrained;
                 source.exhausted_attempts.clear();
             }
@@ -11401,11 +11571,13 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
                         [](const DrainSourceProgress& source) {
                             return source.state == DrainSourceState::kDrained;
                         });
-        for (const auto& name : job.request.segments) {
-            if (!all_drained) {
-                segments.SetDrainSourceStatus(name, SegmentStatus::OK);
+        if (!job.exit_evacuation) {
+            for (const auto& name : job.request.segments) {
+                if (!all_drained) {
+                    segments.SetDrainSourceStatus(name, SegmentStatus::OK);
+                }
+                segments.ReleaseDrainSourceFence(name);
             }
-            segments.ReleaseDrainSourceFence(name);
         }
         job.status = all_drained ? JobStatus::SUCCEEDED : JobStatus::FAILED;
     }
@@ -11417,6 +11589,8 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
 }
 
 void MasterService::ProcessDrainJobs() {
+    StartExitEvacuations();
+
     std::vector<std::shared_ptr<DrainJob>> jobs;
     {
         std::lock_guard<std::mutex> lock(job_mutex_);
@@ -11427,6 +11601,7 @@ void MasterService::ProcessDrainJobs() {
     }
 
     bool swept_discarded_replicas = false;
+    std::vector<GracefulUnmountDeadlineRecord> evacuated;
     for (const auto& job : jobs) {
         std::lock_guard<std::mutex> job_lock(job->mutex);
         if (IsDrainJobTerminal(job->status)) {
@@ -11438,16 +11613,28 @@ void MasterService::ProcessDrainJobs() {
             ReleaseExpiredDiscardedReplicas(std::chrono::system_clock::now());
             swept_discarded_replicas = true;
         }
+        if (ExitEvacuationSuperseded(*job)) {
+            auto expected = DrainStopReason::NONE;
+            job->stop_reason.compare_exchange_strong(
+                expected, DrainStopReason::USER, std::memory_order_relaxed);
+        }
         if (DrainJobStopRequested(*job)) {
             ProcessDrainJobStop(*job);
             continue;
         }
         RefreshDrainJobTasks(*job);
         if (MaybeCompleteDrainJob(*job)) {
+            if (job->status == JobStatus::SUCCEEDED && job->exit_evacuation) {
+                const auto& segments = job->exit_evacuation->segments;
+                evacuated.insert(evacuated.end(), segments.begin(),
+                                 segments.end());
+            }
             continue;
         }
         ScheduleDrainJobTasks(*job);
     }
+    // Unmount outside the job locks, as the graceful unmount deadline does.
+    UnmountEvacuatedSegments(evacuated);
 }
 
 void MasterService::JobDispatchThreadFunc() {

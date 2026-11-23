@@ -197,6 +197,10 @@ DEFINE_validator(eviction_worker_threads,
                      }
                      return true;
                  });
+DEFINE_bool(evacuate_on_graceful_unmount, false,
+            "When a client gracefully unmounts a segment, move its objects to "
+            "other segments before the grace period ends, and unmount it as "
+            "soon as it is empty");
 DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
               "Ratio of objects to evict when NoF SSD space is full");
 DEFINE_double(nof_eviction_high_watermark_ratio,
@@ -608,6 +612,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("eviction_worker_threads",
                              &master_config.eviction_worker_threads,
                              FLAGS_eviction_worker_threads);
+    default_config.GetBool("evacuate_on_graceful_unmount",
+                           &master_config.evacuate_on_graceful_unmount,
+                           FLAGS_evacuate_on_graceful_unmount);
     default_config.GetDouble("nof_eviction_ratio",
                              &master_config.nof_eviction_ratio,
                              FLAGS_nof_eviction_ratio);
@@ -974,6 +981,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.eviction_worker_threads = FLAGS_eviction_worker_threads;
+    }
+    if ((google::GetCommandLineFlagInfo("evacuate_on_graceful_unmount",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.evacuate_on_graceful_unmount =
+            FLAGS_evacuate_on_graceful_unmount;
     }
     if ((google::GetCommandLineFlagInfo("nof_eviction_ratio", &info) &&
          !info.is_default) ||
@@ -1721,6 +1735,8 @@ int main(int argc, char* argv[]) {
         << ", tenant_eviction_high_watermark_ratio="
         << master_config.tenant_eviction_high_watermark_ratio
         << ", eviction_worker_threads=" << master_config.eviction_worker_threads
+        << ", evacuate_on_graceful_unmount="
+        << master_config.evacuate_on_graceful_unmount
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_oplog=" << master_config.enable_oplog
         << ", weight_management_oplog_capability_confirmed="

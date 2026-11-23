@@ -1644,6 +1644,7 @@ class MasterService {
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
     const uint64_t max_kv_soft_pin_ttl_;      // in milliseconds
     const bool allow_evict_soft_pinned_objects_;
+    const bool evacuate_on_graceful_unmount_;
 
     // Eviction related members
     std::atomic<bool> need_mem_eviction_{
@@ -2194,6 +2195,20 @@ class MasterService {
 
     enum class DrainStopReason { NONE, USER, TIMEOUT };
 
+    struct ExitEvacuationRequest {
+        UUID segment_id;
+        UUID client_id;
+        std::chrono::steady_clock::time_point deadline;
+    };
+
+    struct ExitEvacuation {
+        // Gracefully unmounting segments to unmount once the job succeeds.
+        std::vector<GracefulUnmountDeadlineRecord> segments;
+        // Segments registered under the name when the job started. Any other
+        // one serves the name again and cancels the job.
+        std::vector<UUID> known_registrations;
+    };
+
     struct DrainJob {
         // Caller holds mutex.
         QueryJobResponse ToResponse() const;
@@ -2216,6 +2231,7 @@ class MasterService {
         std::unordered_map<UUID, ActiveDrainTask, boost::hash<UUID>>
             active_tasks;
         std::optional<DrainPlan> plan;
+        std::optional<ExitEvacuation> exit_evacuation;
     };
 
     struct DrainMove {
@@ -2226,12 +2242,24 @@ class MasterService {
     static constexpr uint32_t kMaxDrainUnitRetries = 3;
     static constexpr auto kDrainSourceVerificationInterval =
         std::chrono::seconds(5);
+    // One client task fetch (Client::kTaskBatchSize) fills an evacuation.
+    static constexpr uint32_t kExitEvacuationConcurrency = 16;
 
     static bool IsDrainJobTerminal(JobStatus status);
     static bool DrainJobStopRequested(const DrainJob& job);
     tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
         ScopedSegmentAccess& segment_access,
         const CreateDrainJobRequest& request);
+    bool HasUnfinishedDrainJobLocked(const std::string& segment_name)
+        REQUIRES(job_mutex_);
+    UUID AddDrainJobLocked(
+        const CreateDrainJobRequest& request,
+        std::optional<std::chrono::steady_clock::time_point> deadline,
+        std::optional<ExitEvacuation> exit_evacuation) REQUIRES(job_mutex_);
+    void StartExitEvacuations();
+    bool ExitEvacuationSuperseded(const DrainJob& job);
+    void UnmountEvacuatedSegments(
+        const std::vector<GracefulUnmountDeadlineRecord>& segments);
     tl::expected<UUID, ErrorCode> CreateMoveTaskInternal(
         const std::string& key, const TenantId& tenant_id,
         const std::string& source, const std::string& target,
@@ -2263,6 +2291,11 @@ class MasterService {
     std::mutex job_mutex_;
     std::map<UUID, std::shared_ptr<DrainJob>> drain_jobs_
         GUARDED_BY(job_mutex_);
+    // GracefulUnmountSegment holds the state lock exclusively, so it only
+    // queues the request and the job dispatcher starts the evacuation.
+    std::mutex exit_evacuation_mutex_;
+    std::vector<ExitEvacuationRequest> pending_exit_evacuations_
+        GUARDED_BY(exit_evacuation_mutex_);
 
     std::unique_ptr<KvEventPublisher> kv_event_publisher_;
     bool kv_events_enabled_{false};
