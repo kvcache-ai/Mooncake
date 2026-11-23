@@ -1793,8 +1793,8 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     .target_id = *segment_handle,
                     .target_offset = range.remote_base_offset + remote_offset,
                     .length = length,
-                    .task_group_id = 1,
                     .require_tcp_write_ack = range.require_tcp_write_ack,
+                    .task_group_id = 1,
                 };
                 req.intent_type = range.intent_type;
                 requests_.push_back(req);

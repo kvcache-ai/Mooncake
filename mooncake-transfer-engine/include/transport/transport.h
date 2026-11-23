@@ -84,6 +84,9 @@ class Transport {
         void *producer_event = nullptr;
         // Business intent for TENT scheduling (0 = unspecified).
         int intent_type = 0;
+        // Use existing padding before the group ID to preserve request size.
+        // Classic TCP WRITE must use acknowledged v2 framing when requested.
+        bool require_tcp_write_ack = false;
         // Adjacent requests in a group may be scheduled as one unit.
         uint64_t task_group_id = kNoTaskGroup;
         // TENT transport selection priority; ignored by classic TE.
@@ -92,8 +95,6 @@ class Transport {
         // refers to Topology::getHcaList(); -1 keeps normal topology-based
         // selection. The hint is advisory and only affects initial submission.
         int nic_hint = -1;
-        // Classic TCP WRITE must use acknowledged v2 framing when requested.
-        bool require_tcp_write_ack = false;
     };
 
     enum TransferStatusEnum {
