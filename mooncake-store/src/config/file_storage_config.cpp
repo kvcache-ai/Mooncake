@@ -165,6 +165,20 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_OFFLOAD_USE_URING, legacy_use_uring);
     config.use_uring = ParseStrictBoolOr(use_uring, false);
 
+    auto& stream = config.streaming_read;
+    stream.enabled = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ, stream.enabled);
+    stream.slot_bytes = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES, stream.slot_bytes);
+    stream.slots = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_STREAM_SLOTS, uint32_t(stream.slots));
+    stream.read_workers = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_STREAM_READ_THREADS, uint32_t(stream.read_workers));
+    stream.write_workers = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_STREAM_WRITE_THREADS, uint32_t(stream.write_workers));
+    stream.max_outstanding = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_STREAM_MAX_OUTSTANDING, uint32_t(stream.max_outstanding));
+
     return config;
 }
 
@@ -230,6 +244,11 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
+    if (streaming_read.enabled &&
+        (local_buffer_size <= 0 || !streaming_read.Validate(local_buffer_size))) {
+        LOG(ERROR) << "Invalid SSD streaming limits or staging arena size";
+        return false;
+    }
     // storage_filepath may be a comma-separated multi-disk list. ValidatePath
     // stats a single path and would reject the raw list string (stat of
     // "/d0,/d1" is ENOENT), so validate each root on its own. Distributed

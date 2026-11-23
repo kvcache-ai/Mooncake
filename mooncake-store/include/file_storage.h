@@ -13,6 +13,8 @@
 #include "common/read_singleflight.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
+#include "ssd_pipeline_io.h"
+#include <shared_mutex>
 #include "pinned_buffer_pool.h"
 
 namespace mooncake {
@@ -67,6 +69,23 @@ class FileStorage {
         uint64_t batch_id;
         std::vector<uint64_t> pointers;
     };
+
+    struct LocalReadRequest {
+        std::string storage_key;
+        // Size of the complete persisted object, before range selection.
+        uint64_t expected_size{0};
+        uint64_t source_offset{0};
+        std::vector<Slice> destinations;
+    };
+    bool SupportsLocalStreamingRead() const;
+    // Destinations are writable CPU memory, held exclusively through return.
+    // Their sizes select a continuous source range in destination order.
+    // Destinations across the whole batch must not overlap. An I/O error can
+    // partially modify them; publish only after whole-batch success. Every
+    // return drains accepted I/O before releasing staging or source leases.
+    tl::expected<void, ErrorCode> ReadLocalStreaming(
+        const std::vector<LocalReadRequest>& requests);
+
 
     struct LocalBatchResult {
         std::vector<uint64_t> pointers;
@@ -393,6 +412,11 @@ class FileStorage {
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
+    mutable std::shared_mutex streaming_mutex_;
+    bool streaming_stopped_{false};
+    std::unique_ptr<ssd_offload::BoundedExecutor> streaming_reads_;
+    std::unique_ptr<ssd_offload::BoundedExecutor> streaming_writes_;
+    std::atomic<size_t> active_streaming_sources_{0};
     // Whether client_buffer_allocator_'s buffer is the io_uring fixed buffer,
     // which the destructor must unregister before the buffer is freed.
     bool uring_buffer_registered_ = false;
