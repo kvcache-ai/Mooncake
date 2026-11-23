@@ -1,6 +1,8 @@
+import asyncio
 import gc
 import os
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -8,6 +10,71 @@ import time
 import weakref
 
 import pytest
+
+
+def _loopback_endpoint():
+    with socket.socket() as port:
+        port.bind(("127.0.0.1", 0))
+        return port.getsockname()
+
+
+@pytest.fixture
+def rpc_peers(monkeypatch):
+    engine = pytest.importorskip("mooncake.engine")
+    monkeypatch.setenv("MC_RPC_PROTOCOL", "tcp")
+    host, port = _loopback_endpoint()
+    address = f"{host}:{port}"
+    server = engine.RpcInterface()
+    assert server.initialize_server(address, thread_count=2, timeout_seconds=5)
+    assert server.start_server_async()
+    try:
+        client = engine.RpcInterface()
+        assert client.initialize_client(timeout_seconds=5)
+        yield server, client, address
+    finally:
+        server.stop_server()
+
+
+def test_rpc_tensor_view_outlives_receive_callback(rpc_peers):
+    server, client, address = rpc_peers
+    payload = b"\x00\xff\x01"
+    # The RPC tensor header carries the dtype, rank and four dimension slots.
+    header = struct.pack("=II4q", 8, 1, len(payload), 0, 0, 0)
+    views = []
+
+    def receive(tensor):
+        views.append(tensor.get_memory_view()[len(header) :])
+
+    server.set_tensor_receive_callback(receive)
+    assert client.send_data(address, header + payload) == 0
+    (view,) = views
+    assert view.obj is not None
+    assert view.readonly
+    assert view.tobytes() == payload
+
+
+@pytest.mark.parametrize("method", ["send_data_async", "send_tensor_async"])
+def test_rpc_async_send_uses_supplied_loop(rpc_peers, method):
+    server, client, address = rpc_peers
+    received = []
+    server.set_data_receive_callback(lambda message: received.append(message["data"]))
+    payload = b"\x00\xff\x01"
+    request = payload
+    if method == "send_tensor_async":
+        torch = pytest.importorskip("torch")
+        request = torch.tensor(list(payload), dtype=torch.uint8)
+
+    async def send():
+        loop = asyncio.get_running_loop()
+        # Submit from a thread with no current loop and await on the supplied loop.
+        future = await asyncio.to_thread(
+            getattr(client, method), address, request, loop
+        )
+        assert future.get_loop() is loop
+        assert await asyncio.wait_for(future, timeout=5) == 0
+
+    asyncio.run(send())
+    assert received == [payload]
 
 
 @pytest.mark.parametrize(
@@ -35,9 +102,7 @@ def _shutdown_with_receive_in_flight(mode):
     from mooncake import engine
 
     gc.disable()
-    with socket.socket() as port:
-        port.bind(("127.0.0.1", 0))
-        endpoint = port.getsockname()
+    endpoint = _loopback_endpoint()
     address = f"{endpoint[0]}:{endpoint[1]}"
 
     entered = threading.Event()

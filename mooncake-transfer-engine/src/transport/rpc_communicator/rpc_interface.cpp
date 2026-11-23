@@ -203,8 +203,7 @@ py::object RpcInterface::sendDataAsync(const std::string& target_address,
                                        py::handle data, py::handle loop) {
     py::gil_scoped_acquire acquire;
 
-    auto future_module = py::module_::import_("asyncio");
-    auto future_obj = future_module.attr("Future")();
+    auto future_obj = loop.attr("create_future")();
 
     if (!impl_->communicator) {
         auto exc_type = py::module_::import_("builtins").attr("RuntimeError");
@@ -322,8 +321,7 @@ py::object RpcInterface::sendTensorAsync(const std::string& target_address,
                                          py::handle tensor, py::handle loop) {
     py::gil_scoped_acquire acquire;
 
-    auto future_module = py::module_::import_("asyncio");
-    auto future_obj = future_module.attr("Future")();
+    auto future_obj = loop.attr("create_future")();
 
     if (!impl_->communicator) {
         auto exc_type = py::module_::import_("builtins").attr("RuntimeError");
@@ -520,7 +518,7 @@ void RpcInterface::Impl::handleIncomingTensor(std::string_view source,
         received.shape = shape;
         received.dtype = std::string(dtype);
 
-        callback(received);
+        callback(std::move(received));
     } catch (const std::exception& e) {
         LOG(ERROR) << "Error in tensor receive callback: " << e.what();
     }

@@ -20,8 +20,7 @@ class RpcInterface {
             return py::bytes(data.data(), data.size());
         }
         py::memoryview getMemoryView() const {
-            return py::steal<py::memoryview>(PyMemoryView_FromMemory(
-                const_cast<char*>(data.data()), data.size(), PyBUF_READ));
+            return py::memoryview(getBytes());
         }
     };
 
@@ -36,8 +35,7 @@ class RpcInterface {
             return py::bytes(data.data(), data.size());
         }
         py::memoryview getMemoryView() const {
-            return py::steal<py::memoryview>(PyMemoryView_FromMemory(
-                const_cast<char*>(data.data()), data.size(), PyBUF_READ));
+            return py::memoryview(getDataAsBytes());
         }
     };
 

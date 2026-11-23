@@ -423,8 +423,7 @@ void RpcCommunicator::handleDataTransferWithAttachment(
     py_rpc_context t{};
     t.context_ = std::move(context);
     py::gil_scoped_acquire acquire;
-    auto view = py::steal<py::memoryview>(PyMemoryView_FromMemory(
-        const_cast<char*>(data.data()), data.size(), PyBUF_READ));
+    auto view = py::memoryview(py::bytes(data.data(), data.size()));
 
     py_callback_->callback(std::move(t), view);
 }
@@ -440,8 +439,7 @@ void RpcCommunicator::handleTensorTransferWithAttachment(
     t.context_ = std::move(context);
     py::gil_scoped_acquire acquire;
 
-    auto view = py::steal<py::memoryview>(PyMemoryView_FromMemory(
-        const_cast<char*>(attachment.data()), attachment.size(), PyBUF_READ));
+    auto view = py::memoryview(py::bytes(attachment.data(), attachment.size()));
 
     py_callback_->callback(std::move(t), view);
 }
