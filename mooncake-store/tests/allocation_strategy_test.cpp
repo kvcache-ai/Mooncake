@@ -1004,6 +1004,70 @@ class SsdPlacementTestState {
     std::shared_mutex mutex;
 };
 
+class OwnerAwareTestStrategy final : public AllocationStrategy {
+   public:
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& snapshot, size_t size, size_t count,
+        const std::vector<std::string>& preferred,
+        const std::set<std::string>& excluded, ReplicaType type) override {
+        if (preferred.empty() ||
+            !snapshot.GetOwnerClientId(preferred.front())) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return delegate_.Allocate(snapshot, size, count, preferred, excluded,
+                                  type);
+    }
+
+    tl::expected<Replica, ErrorCode> AllocateFrom(
+        const AllocatorManager& snapshot, size_t size,
+        const std::string& name) override {
+        return delegate_.AllocateFrom(snapshot, size, name);
+    }
+
+   private:
+    RandomAllocationStrategy delegate_;
+};
+
+TEST_F(AllocationStrategyTest,
+       SnapshotMetadataSupportsBuiltinsAndOwnerAwareExtension) {
+    const std::string name = "snapshot-region";
+    const UUID owner{1, 100};
+    AllocatorManager allocators;
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        name, DEFAULT_CXL_BASE, 64 * MiB, "snapshot-endpoint", "tcp");
+    auto registration = allocators.addAllocator(name, allocator);
+    HostSegmentIndex hosts;
+    std::unordered_map<std::string, UUID> owners{{name, owner}};
+    std::shared_mutex mutex;
+    LocalSsdManager local_ssd;
+    const std::vector<std::shared_ptr<AllocationStrategy>> strategies{
+        std::make_shared<RandomAllocationStrategy>(),
+        std::make_shared<FreeRatioFirstAllocationStrategy>(),
+        std::make_shared<CxlAllocationStrategy>(),
+        std::make_shared<SsdFreeRatioFirstAllocationStrategy>(local_ssd),
+        std::make_shared<OwnerAwareTestStrategy>()};
+    for (size_t i = 0; i < strategies.size(); ++i) {
+        SCOPED_TRACE(i);
+        AllocatorManager snapshot;
+        {
+            ScopedAllocatorAccess access(allocators, hosts, owners, mutex);
+            EXPECT_EQ(access.SnapshotAllocatorManager().GetOwnerClientId(name),
+                      owner);
+            snapshot = access.SnapshotAllocatorManager(
+                strategies[i]->GetSnapshotMetadata());
+        }
+        EXPECT_EQ(snapshot.GetOwnerClientId(name).has_value(), i >= 3);
+        ASSERT_NE(snapshot.getAllocators(name), nullptr);
+        ASSERT_EQ(snapshot.getAllocators(name)->size(), 1u);
+        EXPECT_EQ(snapshot.getAllocators(name)->front(), registration);
+        auto result = strategies[i]->Allocate(snapshot, 1024, 1, {name}, {},
+                                              ReplicaType::MEMORY);
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result->size(), 1u);
+    }
+    EXPECT_EQ(allocator->size(), 0u);
+}
+
 TEST_F(AllocationStrategyTest, SsdFreeRatioFirstChoosesHighestFreeRatio) {
     const int kNumSegments = 3;
     const size_t kSegmentSize = 64 * MiB;
