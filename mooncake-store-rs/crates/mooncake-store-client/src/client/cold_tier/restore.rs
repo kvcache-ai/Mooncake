@@ -22,10 +22,30 @@ use std::{
         Arc,
     },
     thread::sleep,
+    time::{Duration, Instant},
 };
 use tracing::{debug, info, warn};
 
 impl StoreClient {
+    /// Wait for configured NoF targets to finish ownership and startup recovery.
+    /// Reads cached health; the existing membership and NoF workers make progress.
+    pub fn wait_for_nof_targets_ready(&self, timeout: Duration) -> Result<()> {
+        let targets = &self.storage_owner.cold_tier_devices.nof_targets;
+        let started = Instant::now();
+        while targets
+            .target_ids()
+            .any(|target| !targets.available_for_io(target))
+        {
+            if started.elapsed() >= timeout {
+                return Err(StoreError::Backpressure(
+                    "NoF target ownership or startup recovery is not ready".to_string(),
+                ));
+            }
+            sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
     /// Evict all DRAM KV cache entries from this storage owner.
     ///
     /// Evict all DRAM KV cache entries from this storage owner.

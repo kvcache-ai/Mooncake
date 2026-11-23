@@ -13,6 +13,7 @@
 #include "spdk/env.h"
 #include "spdk/nvme.h"
 #include "spdk/nvmf_spec.h"
+#include "spdk/version.h"
 
 struct mc_nof_device {
     struct spdk_nvme_ctrlr *ctrlr;
@@ -73,12 +74,24 @@ static int mc_nof_init_env(int no_huge, char *err, size_t err_len) {
         pthread_mutex_unlock(&g_env_lock);
         return 0;
     }
-    struct spdk_env_opts opts;
-    spdk_env_opts_init(&opts);
+    struct spdk_env_opts opts = {0};
+#if SPDK_VERSION_MAJOR > 24 || \
+    (SPDK_VERSION_MAJOR == 24 && SPDK_VERSION_MINOR >= 9)
+    // Newer SPDK preserves the caller's size during initialization. The pinned
+    // SPDK 23.01 build does not have this field.
     opts.opts_size = sizeof(opts);
+#endif
+    spdk_env_opts_init(&opts);
     opts.name = "mooncake-nof";
     opts.no_pci = true;
+    if (no_huge != 0) {
+        opts.iova_mode = "va";
+    }
+#if SPDK_VERSION_MAJOR >= 24
     opts.no_huge = no_huge != 0;
+#else
+    opts.env_context = no_huge != 0 ? "--no-huge --legacy-mem" : NULL;
+#endif
     opts.mem_size = no_huge != 0 ? 512 : 0;
     opts.shm_id = -1;
     int rc = spdk_env_init(&opts);
@@ -272,6 +285,15 @@ struct mc_nof_device *mc_nof_connect(const char *transport, const char *traddr,
     return device;
 }
 
+static bool mc_nof_qpair_connected(struct spdk_nvme_qpair *qpair) {
+#if SPDK_VERSION_MAJOR >= 24
+    return spdk_nvme_qpair_is_connected(qpair);
+#else
+    return spdk_nvme_qpair_get_failure_reason(qpair) ==
+           SPDK_NVME_QPAIR_FAILURE_NONE;
+#endif
+}
+
 int mc_nof_health(struct mc_nof_device *device, char *err, size_t err_len) {
     if (device == NULL) {
         mc_nof_set_error(err, err_len, "invalid SPDK device", -EINVAL);
@@ -281,7 +303,7 @@ int mc_nof_health(struct mc_nof_device *device, char *err, size_t err_len) {
         spdk_nvme_ctrlr_is_failed(device->ctrlr) ||
         spdk_nvme_ctrlr_get_admin_qp_failure_reason(device->ctrlr) !=
             SPDK_NVME_QPAIR_FAILURE_NONE ||
-        !spdk_nvme_qpair_is_connected(device->qpair)) {
+        !mc_nof_qpair_connected(device->qpair)) {
         mc_nof_set_error(err, err_len, "SPDK controller transport failed",
                          -ENODEV);
         return -ENODEV;
