@@ -748,7 +748,7 @@ therefore become ordinary cache after recovery or Standby promotion.
 #### with_hard_pin
 **Type:** `bool`
 **Default:** `False`
-**Description:** Enables hard pinning for the stored object. Hard pinned objects will not be evicted. This grants user to manually control the life time of stored objects.
+**Description:** Enables hard pinning for the stored object. Hard pinned objects will not be evicted. This grants user to manually control the life time of stored objects. An explicit drain job can move its replicas to other segments while preserving the hard pin.
 
 ```python
 config = ReplicateConfig()
@@ -2322,6 +2322,34 @@ while tasks:
 print("All tasks completed")
 store.close()
 ```
+
+---
+
+(python-timed-drain-job)=
+#### create_drain_job()
+
+Start draining mounted memory segments using an initialized
+`MooncakeDistributedStore` with the C++ backend. A positive `timeout_ms`
+sets a deadline in milliseconds from job creation. The default of `0`
+creates a job with no deadline.
+
+The following example creates a job with a 30-second deadline.
+
+```python
+job_id, error_code = store.create_drain_job(
+    segments=["segment_0"],
+    target_segments=["segment_1"],
+    timeout_ms=30_000,
+)
+if error_code != 0:
+    raise RuntimeError(f"Failed to create drain job ({error_code})")
+```
+
+Poll `store.query_drain_job(job_id)` for `(job, error_code)`. When
+`error_code` is `0`, read `job.status`. A job that reaches its deadline
+enters `JobStatus.CANCELING` and reaches `JobStatus.TIMED_OUT` after in-flight
+tasks and their cleanup finish. Unfinished source segments stay `DRAINING`
+so a new job can resume draining them.
 
 ---
 

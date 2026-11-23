@@ -42,8 +42,15 @@ class RedisConnectionConfigTest : public ::testing::Test {
     }
 
    private:
-    inline static constexpr std::array<const char*, 3> kVariables = {
-        "MC_REDIS_DB_INDEX", "MC_REDIS_USERNAME", "MC_REDIS_PASSWORD"};
+    inline static constexpr std::array<const char*, 8> kVariables = {
+        "MC_REDIS_DB_INDEX",
+        "MC_REDIS_USERNAME",
+        "MC_REDIS_PASSWORD",
+        "MC_REDIS_CLUSTER_ENABLED",
+        "MC_REDIS_CONNECT_TIMEOUT_MS",
+        "MC_REDIS_COMMAND_TIMEOUT_MS",
+        "MC_REDIS_TOPOLOGY_REFRESH_MS",
+        "MC_REDIS_MAX_REDIRECTS"};
     std::array<std::optional<std::string>, kVariables.size()> original_;
     std::unique_lock<std::mutex> environment_lock_;
 };
@@ -57,6 +64,58 @@ TEST_F(RedisConnectionConfigTest, UnsetAndEmptyDbIndexUseZero) {
     result = ha::common::redis::ResolveRedisDbIndex();
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(*result, 0);
+}
+
+TEST_F(RedisConnectionConfigTest, ClusterModeRequiresExplicitBoolean) {
+    EXPECT_FALSE(RedisConnectionConfig::FromEnvironment()->cluster_enabled);
+    ASSERT_EQ(0, setenv("MC_REDIS_CLUSTER_ENABLED", "1", 1));
+    EXPECT_TRUE(RedisConnectionConfig::FromEnvironment()->cluster_enabled);
+    ASSERT_EQ(0, setenv("MC_REDIS_CLUSTER_ENABLED", "0", 1));
+    EXPECT_FALSE(RedisConnectionConfig::FromEnvironment()->cluster_enabled);
+    ASSERT_EQ(0, setenv("MC_REDIS_CLUSTER_ENABLED", "invalid", 1));
+    EXPECT_FALSE(RedisConnectionConfig::FromEnvironment().has_value());
+}
+
+TEST_F(RedisConnectionConfigTest, RoutingSettingsHaveBoundedValues) {
+    auto defaults = RedisConnectionConfig::FromEnvironment();
+    ASSERT_TRUE(defaults);
+    EXPECT_EQ(3000, defaults->connect_timeout_ms);
+    EXPECT_EQ(3000, defaults->command_timeout_ms);
+    EXPECT_EQ(1000, defaults->topology_refresh_ms);
+    EXPECT_EQ(5, defaults->max_redirects);
+    for (const auto* name :
+         {"MC_REDIS_CONNECT_TIMEOUT_MS", "MC_REDIS_COMMAND_TIMEOUT_MS",
+          "MC_REDIS_TOPOLOGY_REFRESH_MS", "MC_REDIS_MAX_REDIRECTS"}) {
+        for (const auto* value : {"-1", "60001", "4junk", "999999999999"}) {
+            ASSERT_EQ(0, setenv(name, value, 1));
+            EXPECT_FALSE(RedisConnectionConfig::FromEnvironment()) << name;
+        }
+        ASSERT_EQ(0, unsetenv(name));
+    }
+    ASSERT_EQ(0, setenv("MC_REDIS_CONNECT_TIMEOUT_MS", "11", 1));
+    ASSERT_EQ(0, setenv("MC_REDIS_COMMAND_TIMEOUT_MS", "12", 1));
+    ASSERT_EQ(0, setenv("MC_REDIS_TOPOLOGY_REFRESH_MS", "0", 1));
+    ASSERT_EQ(0, setenv("MC_REDIS_MAX_REDIRECTS", "0", 1));
+    auto configured = RedisConnectionConfig::FromEnvironment();
+    ASSERT_TRUE(configured);
+    EXPECT_EQ(11, configured->connect_timeout_ms);
+    EXPECT_EQ(12, configured->command_timeout_ms);
+    EXPECT_EQ(0, configured->topology_refresh_ms);
+    EXPECT_EQ(0, configured->max_redirects);
+    ASSERT_EQ(0, setenv("MC_REDIS_CONNECT_TIMEOUT_MS", "0", 1));
+    EXPECT_FALSE(RedisConnectionConfig::FromEnvironment());
+}
+
+TEST_F(RedisConnectionConfigTest, EndpointPortsAreStrictAndIpv6IsBracketed) {
+    auto endpoint = ha::common::redis::ParseRedisEndpoint("redis://[::1]:6380");
+    ASSERT_TRUE(endpoint.has_value());
+    EXPECT_EQ("::1", endpoint->host);
+    EXPECT_EQ(6380, endpoint->port);
+    for (const auto* value :
+         {"host:123junk", "host:-1", "::1:6380", "user:secret@host:6379",
+          "host:6379,other:6380"}) {
+        EXPECT_FALSE(ha::common::redis::ParseRedisEndpoint(value).has_value());
+    }
 }
 
 TEST_F(RedisConnectionConfigTest, AcceptsSupportedDbIndexSyntax) {

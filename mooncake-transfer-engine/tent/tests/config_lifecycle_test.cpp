@@ -360,6 +360,73 @@ TEST(ConfigLifecycleTest, MnnvlEgmDefaultsOffAndFollowsEnv) {
     }
 }
 
+TEST(MnnvlConfigTest, DefaultsAndBootstrapLifecycle) {
+    Config config;
+    MnnvlConfig options;
+    ASSERT_TRUE(parseMnnvlConfig(config, options).ok());
+    EXPECT_FALSE(options.require_fabric);
+    EXPECT_FALSE(options.gpu_wait);
+    for (const auto* key : {"require_fabric", "sync_mode"}) {
+        EXPECT_EQ(classifyConfigPath(std::string("transports/mnnvl/") + key),
+                  ConfigLifecycle::kBootstrapOnly);
+    }
+}
+
+TEST(MnnvlConfigTest, RejectsMalformedControlsWithoutUpdatingOptions) {
+    for (const auto& entry :
+         std::vector<std::pair<std::string, json>>{{"require_fabric", "true"},
+                                                   {"require_fabric", nullptr},
+                                                   {"sync_mode", true},
+                                                   {"sync_mode", "invalid"}}) {
+        Config config;
+        config.set("transports/mnnvl/" + entry.first, entry.second);
+        MnnvlConfig options;
+        options.egm_enabled = true;
+        EXPECT_TRUE(parseMnnvlConfig(config, options).IsInvalidArgument())
+            << entry.first;
+        EXPECT_TRUE(options.egm_enabled);
+    }
+}
+
+TEST(MnnvlConfigTest, StrictRejectsDisabledAndNonFabricConfigurations) {
+    for (const auto& entry : std::vector<std::pair<std::string, json>>{
+             {"transports/mnnvl/enable", false},
+             {"transports/mnnvl/enable", "true"},
+             {"transports/force_tcp", true},
+             {"transports/force_tcp", "false"},
+             {"transports/nvlink/handle_type", "posix_fd"},
+             {"transports/nvlink/handle_type", 0}}) {
+        Config config;
+        config.set("transports/mnnvl/require_fabric", true);
+        config.set(entry.first, entry.second);
+        MnnvlConfig options;
+        EXPECT_TRUE(parseMnnvlConfig(config, options).IsInvalidArgument())
+            << entry.first;
+    }
+}
+
+TEST(MnnvlConfigTest, GpuWaitRejectsDeferredDispatch) {
+    Config config;
+    config.set("transports/mnnvl/sync_mode", "gpu_wait");
+    config.set("enable_runtime_queue", true);
+    MnnvlConfig options;
+    EXPECT_TRUE(parseMnnvlConfig(config, options).IsInvalidArgument());
+    config.set("transports/mnnvl/sync_mode", "cpu_block");
+    EXPECT_TRUE(parseMnnvlConfig(config, options).ok());
+}
+
+TEST(MnnvlConfigTest, EnvironmentOverridesAndMalformedBooleans) {
+    EnvVarGuard conf_guard("MC_TENT_CONF", "{}");
+    EnvVarGuard strict_guard("MC_MNNVL_REQUIRE_FABRIC", "1");
+    EnvVarGuard sync_guard("MC_MNNVL_SYNC_MODE", "gpu_wait");
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+    EXPECT_TRUE(config.get("transports/mnnvl/require_fabric", false));
+    EXPECT_EQ(config.get("transports/mnnvl/sync_mode", ""), "gpu_wait");
+    EnvVarGuard invalid_guard("MC_MNNVL_REQUIRE_FABRIC", "tru");
+    EXPECT_TRUE(ConfigHelper().loadFromEnv(config).IsInvalidArgument());
+}
+
 TEST(ConfigLifecycleTest, PreservesLegacyEnvironmentPrecedence) {
     EnvVarGuard conf_guard(
         "MC_TENT_CONF",

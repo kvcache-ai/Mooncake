@@ -130,6 +130,8 @@ class CudaPlatform : public Platform {
                                            const CudaPointerInfo& info);
     Status synchronizeDevices(const Topology* topology) override;
 
+    Status exportDmabuf(void* addr, size_t length, DmabufExport& out) override;
+
     // cudaHostAlloc(cudaHostAllocPortable): pinned for every CUDA context.
     Status allocatePinnedHost(void** pptr, size_t size) override;
 

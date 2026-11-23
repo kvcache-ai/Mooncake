@@ -33,12 +33,17 @@ bool AllocatorAgentMode() { return globalConfig().ascend_agent_mode; }
 
 bool AllocatorUseFabricMem() { return globalConfig().ascend_use_fabric_mem; }
 
+bool AllocatorSingleSegment() {
+    return globalConfig().ascend_standalone_single_segment;
+}
+
 // transfer_engine is a shared library in the direct/UBSHMEM configurations, so
 // this constructor runs when the engine is loaded, before any allocation.
 struct AscendAllocatorConfigBridge {
     AscendAllocatorConfigBridge() {
         ascend_allocator_set_config_provider(&AllocatorAgentMode,
                                              &AllocatorUseFabricMem);
+        ascend_allocator_set_single_segment_provider(&AllocatorSingleSegment);
     }
 };
 

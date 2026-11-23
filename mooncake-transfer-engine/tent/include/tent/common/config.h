@@ -183,6 +183,15 @@ class Config {
     mutable std::mutex mutex_;
 };
 
+// Bootstrap-only MNNVL controls. Defaults preserve the existing transport.
+struct MnnvlConfig {
+    bool require_fabric{false};
+    bool gpu_wait{false};
+    bool egm_enabled{false};
+};
+
+Status parseMnnvlConfig(const Config& config, MnnvlConfig& options);
+
 struct ConfigHelper {
     Status loadFromEnv(Config& config);
 
