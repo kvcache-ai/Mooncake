@@ -2,10 +2,16 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
+#include <limits>
 #include <set>
 #include <sstream>
 
+#include <glog/logging.h>
+
 #include "config/redis_connection_config.h"
+#include "ha/ha_types.h"
+#include "ha_metric_manager.h"
 
 #ifdef STORE_USE_REDIS
 #include <arpa/inet.h>
@@ -40,6 +46,95 @@ RedisReplyPtr Command(redisContext* context,
 
 std::string Bytes(const redisReply* reply) {
     return reply && reply->str ? std::string(reply->str, reply->len) : "";
+}
+
+std::optional<RedisClusterClient::RoutingError> PermissionRoutingError(
+    const redisReply* reply) {
+    if (!reply || reply->type != REDIS_REPLY_ERROR || !reply->str)
+        return std::nullopt;
+    const std::string_view message(reply->str, reply->len);
+    for (const auto prefix : {"NOPERM ", "NOAUTH ", "WRONGPASS "}) {
+        if (message.rfind(prefix, 0) == 0)
+            return RedisClusterClient::RoutingError::PermissionDenied;
+    }
+    return std::nullopt;
+}
+
+std::string ProbeReplyText(const redisReply* reply) {
+    if (!reply) return "<no reply>";
+    if (!reply->str) return "<empty reply>";
+    constexpr size_t kMaxProbeErrorLength = 256;
+    return std::string(reply->str,
+                       std::min<size_t>(reply->len, kMaxProbeErrorLength));
+}
+
+void LogProbeFailure(const std::string& endpoint, std::string_view probe,
+                     RedisClusterClient::RoutingError error,
+                     const redisReply* reply) {
+    LOG(WARNING) << "Redis durability probe failed endpoint=" << endpoint
+                 << " probe=" << probe << " routing_error="
+                 << RedisClusterClient::RoutingErrorName(error)
+                 << " redis_error=" << ProbeReplyText(reply);
+}
+
+// INFO is a field protocol, not a substring capability advertisement. Reject
+// duplicate fields and malformed lines rather than guessing server settings.
+std::optional<std::string_view> InfoField(const redisReply* reply,
+                                          std::string_view field) {
+    if (!reply || reply->type != REDIS_REPLY_STRING || !reply->str)
+        return std::nullopt;
+    std::string_view text(reply->str, reply->len);
+    std::optional<std::string_view> result;
+    while (!text.empty()) {
+        const auto end = text.find('\n');
+        auto line = text.substr(0, end);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        if (!line.empty() && line.front() != '#') {
+            const auto colon = line.find(':');
+            if (colon == 0 || colon == std::string_view::npos)
+                return std::nullopt;
+            if (line.substr(0, colon) == field) {
+                if (result) return std::nullopt;
+                result = line.substr(colon + 1);
+            }
+        }
+        if (end == std::string_view::npos) break;
+        text.remove_prefix(end + 1);
+    }
+    return result;
+}
+
+std::optional<bool> SupportsWaitAof(std::string_view version) {
+    std::array<unsigned, 3> components{};
+    for (size_t i = 0; i < components.size(); ++i) {
+        const auto dot = version.find('.');
+        if ((i < 2) != (dot != std::string_view::npos)) return std::nullopt;
+        const auto component = version.substr(0, dot);
+        const auto parsed =
+            std::from_chars(component.data(),
+                            component.data() + component.size(), components[i]);
+        if (parsed.ec != std::errc{} ||
+            parsed.ptr != component.data() + component.size())
+            return std::nullopt;
+        if (i < 2) version.remove_prefix(dot + 1);
+    }
+    return components[0] > 7 || (components[0] == 7 && components[1] >= 2);
+}
+
+std::optional<std::pair<size_t, size_t>> AofCounts(const redisReply* reply) {
+    if (!reply || reply->type != REDIS_REPLY_ARRAY || reply->elements != 2)
+        return std::nullopt;
+    for (size_t i = 0; i < 2; ++i) {
+        const auto* count = reply->element[i];
+        if (!count || count->type != REDIS_REPLY_INTEGER ||
+            count->integer < 0 ||
+            static_cast<unsigned long long>(count->integer) >
+                std::numeric_limits<size_t>::max())
+            return std::nullopt;
+    }
+    if (reply->element[0]->integer > 1) return std::nullopt;
+    return std::pair<size_t, size_t>{reply->element[0]->integer,
+                                     reply->element[1]->integer};
 }
 
 // RESP2 represents SHARDS maps as alternating field/value arrays.
@@ -108,6 +203,14 @@ const char* RedisClusterClient::RoutingErrorName(RoutingError error) {
             return "transport";
         case RoutingError::InvalidTopology:
             return "invalid-topology";
+        case RoutingError::DurabilityUnsupported:
+            return "durability-unsupported";
+        case RoutingError::InvalidDurabilityResponse:
+            return "invalid-durability-response";
+        case RoutingError::AofDisabled:
+            return "aof-disabled";
+        case RoutingError::PermissionDenied:
+            return "permission-denied";
         case RoutingError::ReplicaCountMismatch:
             return "replica-count-mismatch";
         case RoutingError::RedirectLoop:
@@ -127,18 +230,20 @@ const char* RedisClusterClient::RoutingErrorName(RoutingError error) {
 }
 
 ErrorCode RedisClusterClient::Connect(std::string connstring,
-                                      size_t expected_replicas,
-                                      bool read_only) {
-    return ConnectDetailed(std::move(connstring), expected_replicas, read_only)
+                                      size_t expected_replicas, bool read_only,
+                                      bool require_aof) {
+    return ConnectDetailed(std::move(connstring), expected_replicas, read_only,
+                           require_aof)
         .error;
 }
 
 RedisClusterClient::ConnectResult RedisClusterClient::ConnectDetailed(
-    std::string connstring, size_t expected_replicas, bool read_only) {
+    std::string connstring, size_t expected_replicas, bool read_only,
+    bool require_aof) {
     std::lock_guard<std::mutex> lock(mutex_);
     refresh_error_ = RoutingError::None;
-    const auto error =
-        ConnectLocked(std::move(connstring), expected_replicas, read_only);
+    const auto error = ConnectLocked(std::move(connstring), expected_replicas,
+                                     read_only, require_aof);
     if (error == ErrorCode::OK) return {};
     if (error == ErrorCode::INVALID_PARAMS)
         return {error, RoutingError::InvalidConfiguration};
@@ -151,7 +256,7 @@ RedisClusterClient::ConnectResult RedisClusterClient::ConnectDetailed(
 
 ErrorCode RedisClusterClient::ConnectLocked(std::string connstring,
                                             size_t expected_replicas,
-                                            bool read_only) {
+                                            bool read_only, bool require_aof) {
     connections_.clear();
     slots_only_endpoints_.clear();
     shards_.clear();
@@ -167,11 +272,13 @@ ErrorCode RedisClusterClient::ConnectLocked(std::string connstring,
     if (cluster_) connstring.erase(0, scheme.size());
     const auto config = RedisConnectionConfig::FromEnvironment();
     if (!config) return config.error();
+    require_aof_ = require_aof || config->durability_profile ==
+                                      RedisDurabilityProfile::kPersistent;
     command_timeout_ms_ = config->command_timeout_ms;
     topology_refresh_ms_ = config->topology_refresh_ms;
     max_redirects_ = config->max_redirects;
     cluster_ = cluster_ || config->cluster_enabled;
-    if ((!read_only_ && expected_replicas == 0) ||
+    if ((!read_only_ && !ha::IsValidRedisReplicaCount(expected_replicas)) ||
         (cluster_ && config->db_index != 0))
         return ErrorCode::INVALID_PARAMS;
     size_t begin = 0;
@@ -189,25 +296,203 @@ ErrorCode RedisClusterClient::ConnectLocked(std::string connstring,
 #ifndef STORE_USE_REDIS
     return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
 #else
-    return cluster_ ? Refresh()
-                    : (Connection(seeds_[0]) ? ErrorCode::OK : kError);
+    if (cluster_) {
+        const auto err = Refresh();
+        if (err != ErrorCode::OK) return err;
+        if (ValidateAllShards()) return ErrorCode::OK;
+        topology_valid_ = false;
+        return kError;
+    }
+    return Connection(seeds_[0]) && ValidateNode(seeds_[0], seeds_[0])
+               ? ErrorCode::OK
+               : kError;
 #endif
 }
 
 redisContext* RedisClusterClient::Connection(const std::string& endpoint) {
 #ifdef STORE_USE_REDIS
-    auto& context = connections_[endpoint];
-    if (context && context->err) context.reset();
-    if (!context) {
+    auto& state = connections_[endpoint];
+    if (state.context && state.context->err) state.context.reset();
+    if (!state.context) {
+        state.validated_membership.clear();
+        slots_only_endpoints_.erase(endpoint);
         auto connected = ConnectRedis(endpoint, kError, deadline_);
         if (!connected) return nullptr;
-        context = std::move(*connected);
+        state.context = std::move(*connected);
+        ++state.generation;
     }
-    return context.get();
+    return state.context.get();
 #else
     (void)endpoint;
     return nullptr;
 #endif
+}
+
+bool RedisClusterClient::ValidateNode(const std::string& endpoint,
+                                      const std::string& membership,
+                                      bool replica) {
+    if (!require_aof_) return true;
+#ifdef STORE_USE_REDIS
+    auto* context = Connection(endpoint);
+    if (!context) {
+        refresh_error_ = RoutingError::Transport;
+        return false;
+    }
+    auto& state = connections_.at(endpoint);
+    if (state.validated_membership == membership) return true;
+    const auto server = Run(context, {"INFO", "server"});
+    if (const auto permission = PermissionRoutingError(server.get())) {
+        refresh_error_ = *permission;
+        LogProbeFailure(endpoint, "INFO server", refresh_error_, server.get());
+        return false;
+    }
+    const auto version = InfoField(server.get(), "redis_version");
+    if (!version) {
+        refresh_error_ = RoutingError::InvalidDurabilityResponse;
+        LogProbeFailure(endpoint, "INFO server", refresh_error_, server.get());
+        return false;
+    }
+    const auto supported = SupportsWaitAof(*version);
+    if (!supported || !*supported) {
+        refresh_error_ = RoutingError::DurabilityUnsupported;
+        LOG(WARNING) << "Redis WAITAOF unsupported endpoint=" << endpoint
+                     << " redis_version=" << *version;
+        return false;
+    }
+    const auto persistence = Run(context, {"INFO", "persistence"});
+    if (const auto permission = PermissionRoutingError(persistence.get())) {
+        refresh_error_ = *permission;
+        LogProbeFailure(endpoint, "INFO persistence", refresh_error_,
+                        persistence.get());
+        return false;
+    }
+    const auto enabled = InfoField(persistence.get(), "aof_enabled");
+    if (!enabled) {
+        refresh_error_ = RoutingError::InvalidDurabilityResponse;
+        LogProbeFailure(endpoint, "INFO persistence", refresh_error_,
+                        persistence.get());
+        return false;
+    }
+    if (*enabled != "1") {
+        refresh_error_ = RoutingError::AofDisabled;
+        LOG(WARNING) << "Redis AOF disabled endpoint=" << endpoint
+                     << " aof_enabled=" << *enabled;
+        return false;
+    }
+    auto capability = Run(context, {"WAITAOF", "0", "0", "1"});
+    // Redis 7.2+ dispatches WAITAOF on replicas but rejects execution with
+    // this exact role error, after ACL checks. It proves command capability
+    // without requiring administrative ACL DRYRUN permission or any write.
+    constexpr std::string_view replica_error =
+        "ERR WAITAOF cannot be used with replica instances. Please also note "
+        "that writes to replicas are just local and are not propagated.";
+    if (const auto permission = PermissionRoutingError(capability.get())) {
+        refresh_error_ = *permission;
+        LogProbeFailure(endpoint, "WAITAOF", refresh_error_, capability.get());
+        return false;
+    }
+    const bool capable = replica ? capability &&
+                                       capability->type == REDIS_REPLY_ERROR &&
+                                       Bytes(capability.get()) == replica_error
+                                 : AofCounts(capability.get()).has_value();
+    if (!capable) {
+        refresh_error_ = capability && capability->type == REDIS_REPLY_ERROR
+                             ? RoutingError::DurabilityUnsupported
+                             : RoutingError::InvalidDurabilityResponse;
+        LogProbeFailure(endpoint, "WAITAOF", refresh_error_, capability.get());
+        return false;
+    }
+    state.validated_membership = membership;
+    return true;
+#else
+    (void)endpoint;
+    (void)membership;
+    (void)replica;
+    return false;
+#endif
+}
+
+bool RedisClusterClient::ValidateShard(const Shard& shard) {
+    if (!require_aof_) return true;
+    std::string_view members(shard.membership);
+    while (!members.empty()) {
+        const auto end = members.find('\n');
+        const auto identity = members.substr(0, end);
+        const auto at = identity.rfind('@');
+        if (at == std::string_view::npos || end == std::string_view::npos ||
+            !ValidateNode(std::string(identity.substr(at + 1)),
+                          shard.membership,
+                          identity.data() != shard.membership.data()))
+            return false;
+        members.remove_prefix(end + 1);
+    }
+    return true;
+}
+
+void RedisClusterClient::InvalidateStaleCapabilities() {
+    if (!require_aof_) return;
+    // Forget nodes removed from the authoritative topology, including former
+    // slotless targets. A later reappearance must not reuse an old success.
+    for (auto& [endpoint, state] : connections_) {
+        const auto end = state.validated_membership.find('\n');
+        const auto at = state.validated_membership.rfind('@', end);
+        if (at == std::string::npos || end == std::string::npos) {
+            state.validated_membership.clear();
+            continue;
+        }
+        const auto primary =
+            state.validated_membership.substr(at + 1, end - at - 1);
+        const auto shard = shards_.find(primary);
+        if (shard == shards_.end() ||
+            shard->second.membership != state.validated_membership)
+            state.validated_membership.clear();
+    }
+}
+
+bool RedisClusterClient::ValidateAllShards() {
+    if (!require_aof_) return true;
+    for (const auto& [endpoint, shard] : shards_)
+        if (!ValidateShard(shard)) return false;
+    return true;
+}
+
+bool RedisClusterClient::LeaseConnectionValid(const Lease& lease) const {
+    const auto connection = connections_.find(lease.endpoint);
+    return connection != connections_.end() &&
+           connection->second.context.get() == lease.context &&
+           connection->second.generation == lease.connection_generation;
+}
+
+bool RedisClusterClient::ValidateAcknowledgement(Lease& lease) {
+    if (!LeaseConnectionValid(lease) ||
+        std::chrono::steady_clock::now() >= deadline_) {
+        lease.routing_error = RoutingError::Transport;
+        return false;
+    }
+    if (!cluster_) return true;
+    if (Refresh() != ErrorCode::OK) {
+        lease.routing_error = refresh_error_;
+        return false;
+    }
+    const auto shard = shards_.find(lease.endpoint);
+    const auto slotless = shard == shards_.end() && !shards_snapshot_
+                              ? SlotlessShard(lease.endpoint)
+                              : std::nullopt;
+    const auto membership = shard != shards_.end() ? shard->second.membership
+                            : slotless             ? slotless->membership
+                                                   : "";
+    if (membership != lease.membership ||
+        (slots_[lease.slot].primary != lease.slot_owner &&
+         slots_[lease.slot].primary != lease.endpoint)) {
+        lease.routing_error = RoutingError::MembershipChanged;
+        return false;
+    }
+    if (!LeaseConnectionValid(lease) ||
+        std::chrono::steady_clock::now() >= deadline_) {
+        lease.routing_error = RoutingError::Transport;
+        return false;
+    }
+    return true;
 }
 
 RedisReplyPtr RedisClusterClient::Run(redisContext* context,
@@ -354,7 +639,11 @@ ErrorCode RedisClusterClient::Refresh() {
     for (const auto& endpoint : candidates) {
         if (!slots_only_endpoints_.count(endpoint)) {
             auto reply = Run(Connection(endpoint), {"CLUSTER", "SHARDS"});
-            if (ParseShards(reply.get(), endpoint)) return ErrorCode::OK;
+            if (ParseShards(reply.get(), endpoint)) {
+                InvalidateStaleCapabilities();
+                topology_valid_ = true;
+                return ErrorCode::OK;
+            }
             // Malformed topology, ACL errors and transport failures must not
             // silently switch to a weaker discovery protocol.
             if (!ShardsUnsupported(reply.get())) {
@@ -474,10 +763,12 @@ ErrorCode RedisClusterClient::Refresh() {
             slots_ = std::move(next);
             shards_ = std::move(next_shards);
             shards_snapshot_ = false;
-            topology_valid_ = true;
+            topology_valid_ = false;
             refreshed_at_ = std::chrono::steady_clock::now();
             for (const auto& node : discovered_endpoints)
                 connections_.try_emplace(node);
+            InvalidateStaleCapabilities();
+            topology_valid_ = true;
             return ErrorCode::OK;
         }
         record_error(RoutingError::InvalidTopology);
@@ -542,6 +833,7 @@ std::optional<RedisClusterClient::Shard> RedisClusterClient::SlotlessShard(
         return std::nullopt;
     std::sort(replicas.begin(), replicas.end());
     for (const auto& replica : replicas) shard.membership += replica + "\n";
+    if (!ValidateShard(shard)) return std::nullopt;
     return shard;
 #else
     (void)endpoint;
@@ -637,7 +929,8 @@ RedisClusterClient::Lease RedisClusterClient::Execute(
         lease.context = Connection(endpoint);
         if (!lease.context) break;
         lease.endpoint = endpoint;
-        if (cluster_ && write) {
+        lease.connection_generation = connections_.at(endpoint).generation;
+        if (cluster_ && (write || require_aof_)) {
             lease.slot_owner = slots_[slot].primary;
             auto shard = shards_.find(endpoint);
             if (shard == shards_.end()) {
@@ -650,9 +943,18 @@ RedisClusterClient::Lease RedisClusterClient::Execute(
                 }
                 lease.membership = slotless->membership;
             } else {
+                if (!ValidateShard(shard->second)) {
+                    lease.routing_error = refresh_error_;
+                    break;
+                }
                 lease.membership = shard->second.membership;
             }
         }
+        if (!cluster_ && !ValidateNode(endpoint, endpoint)) {
+            lease.routing_error = refresh_error_;
+            break;
+        }
+        if (!LeaseConnectionValid(lease)) break;
         if (asking) {
             auto reply = Run(lease.context, {"ASKING"});
             if (!reply || reply->type != REDIS_REPLY_STATUS ||
@@ -729,50 +1031,19 @@ RedisClusterClient::Lease RedisClusterClient::Execute(
 tl::expected<size_t, ErrorCode> RedisClusterClient::Wait(
     Lease& lease, size_t replicas, std::chrono::milliseconds timeout) {
 #ifdef STORE_USE_REDIS
-    if (!lease.context || !lease.lock.owns_lock() ||
-        replicas != expected_replicas_)
-        return tl::make_unexpected(kError);
-    // A failed confirmation must not leave a reusable topology snapshot.
-    // Successful cluster confirmation below installs a newly checked one.
-    topology_valid_ = false;
-    auto ms = timeout.count() + 1000;
-    if (deadline_ != std::chrono::steady_clock::time_point::max())
-        ms = std::min(ms, std::chrono::duration_cast<std::chrono::milliseconds>(
-                              deadline_ - std::chrono::steady_clock::now())
-                              .count());
-    if (ms <= 0) return tl::make_unexpected(kError);
-    timeval deadline{static_cast<long>(ms / 1000),
-                     static_cast<long>((ms % 1000) * 1000)};
-    if (redisSetTimeout(lease.context, deadline) != REDIS_OK)
-        return tl::make_unexpected(kError);
-    auto reply = Command(lease.context, {"WAIT", std::to_string(replicas),
-                                         std::to_string(timeout.count())});
-    timeval ordinary{command_timeout_ms_ / 1000,
-                     (command_timeout_ms_ % 1000) * 1000};
-    if (redisSetTimeout(lease.context, ordinary) != REDIS_OK || !reply ||
-        reply->type != REDIS_REPLY_INTEGER || reply->integer < 0) {
+    if (replicas != expected_replicas_) return tl::make_unexpected(kError);
+    auto reply =
+        Acknowledge(lease, {"WAIT", std::to_string(replicas)}, timeout);
+    if (!reply || reply->type != REDIS_REPLY_INTEGER || reply->integer < 0 ||
+        static_cast<unsigned long long>(reply->integer) >
+            std::numeric_limits<size_t>::max()) {
         lease.routing_error = RoutingError::Transport;
         return tl::make_unexpected(kError);
     }
-    if (cluster_) {
-        if (Refresh() != ErrorCode::OK) {
-            lease.routing_error = refresh_error_;
-            return tl::make_unexpected(kError);
-        }
-        const auto shard = shards_.find(lease.endpoint);
-        const auto slotless = shard == shards_.end() && !shards_snapshot_
-                                  ? SlotlessShard(lease.endpoint)
-                                  : std::nullopt;
-        const auto membership = shard != shards_.end()
-                                    ? shard->second.membership
-                                : slotless ? slotless->membership
-                                           : "";
-        if (membership != lease.membership ||
-            (slots_[lease.slot].primary != lease.slot_owner &&
-             slots_[lease.slot].primary != lease.endpoint)) {
-            lease.routing_error = RoutingError::MembershipChanged;
-            return tl::make_unexpected(kError);
-        }
+    HAMetricManager::instance().observe_redis_replica_acks(reply->integer);
+    if (!ValidateAcknowledgement(lease)) {
+        topology_valid_ = false;
+        return tl::make_unexpected(kError);
     }
     return static_cast<size_t>(reply->integer);
 #else
@@ -780,6 +1051,68 @@ tl::expected<size_t, ErrorCode> RedisClusterClient::Wait(
     (void)replicas;
     (void)timeout;
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+#endif
+}
+
+tl::expected<std::pair<size_t, size_t>, ErrorCode> RedisClusterClient::WaitAof(
+    Lease& lease, size_t replicas, std::chrono::milliseconds timeout) {
+#ifdef STORE_USE_REDIS
+    if (!require_aof_ || replicas != expected_replicas_)
+        return tl::make_unexpected(kError);
+    auto reply =
+        Acknowledge(lease, {"WAITAOF", "1", std::to_string(replicas)}, timeout);
+    const auto counts = AofCounts(reply.get());
+    if (!counts) {
+        lease.routing_error = RoutingError::InvalidDurabilityResponse;
+        return tl::make_unexpected(kError);
+    }
+    HAMetricManager::instance().observe_redis_aof_acks(counts->first,
+                                                       counts->second);
+    if (!ValidateAcknowledgement(lease)) {
+        topology_valid_ = false;
+        return tl::make_unexpected(kError);
+    }
+    return *counts;
+#else
+    (void)lease;
+    (void)replicas;
+    (void)timeout;
+    return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+#endif
+}
+
+RedisReplyPtr RedisClusterClient::Acknowledge(
+    Lease& lease, std::vector<std::string> command,
+    std::chrono::milliseconds timeout) {
+    topology_valid_ = false;
+#ifdef STORE_USE_REDIS
+    if (!lease.context || !lease.lock.owns_lock() ||
+        lease.lock.mutex() != &mutex_ || !LeaseConnectionValid(lease) ||
+        lease.context->err || timeout.count() < 1 || timeout.count() > 60000)
+        return {};
+    auto wait_ms = timeout.count();
+    auto socket_ms = wait_ms + 1000;
+    if (deadline_ != std::chrono::steady_clock::time_point::max()) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline_ - std::chrono::steady_clock::now())
+                .count();
+        wait_ms = std::min(wait_ms, remaining);
+        socket_ms = std::min(socket_ms, remaining);
+    }
+    if (wait_ms <= 0 || socket_ms <= 0) return {};
+    const timeval socket_timeout{static_cast<long>(socket_ms / 1000),
+                                 static_cast<long>((socket_ms % 1000) * 1000)};
+    if (redisSetTimeout(lease.context, socket_timeout) != REDIS_OK) return {};
+    command.push_back(std::to_string(wait_ms));
+    // Never reconnect or replay an acknowledgement: the offset belongs to
+    // this exact execution socket. Subsequent Run calls set their own timeout.
+    return Command(lease.context, command);
+#else
+    (void)lease;
+    (void)command;
+    (void)timeout;
+    return {};
 #endif
 }
 }  // namespace mooncake::ha::common::redis

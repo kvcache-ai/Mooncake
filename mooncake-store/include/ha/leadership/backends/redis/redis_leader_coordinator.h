@@ -78,6 +78,10 @@ class RedisLeaderCoordinator final : public LeaderCoordinator {
                            std::optional<ViewVersionId> known_version) const;
 
     HABackendSpec spec_;
+    bool require_aof_ = false;
+    std::chrono::milliseconds replication_ack_timeout_{1000};
+    std::chrono::milliseconds aof_ack_timeout_{1000};
+    std::chrono::milliseconds lease_ttl_{0};
     std::atomic<OwnershipReconciliation> reconciliation_{
         OwnershipReconciliation::NotNeeded};
     std::string master_view_key_;

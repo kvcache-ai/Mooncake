@@ -24,7 +24,9 @@ class RedisHaKvProtocolTest : public ::testing::Test {
              {"MC_REDIS_DB_INDEX", "MC_REDIS_PASSWORD", "MC_REDIS_USERNAME",
               "MC_REDIS_CLUSTER_ENABLED", "MC_REDIS_TOPOLOGY_REFRESH_MS",
               "MC_REDIS_CONNECT_TIMEOUT_MS", "MC_REDIS_COMMAND_TIMEOUT_MS",
-              "MC_REDIS_MAX_REDIRECTS"}) {
+              "MC_REDIS_MAX_REDIRECTS", "MC_REDIS_DURABILITY_PROFILE",
+              "MC_REDIS_REPLICATION_ACK_TIMEOUT_MS",
+              "MC_REDIS_AOF_ACK_TIMEOUT_MS"}) {
             const auto* value = std::getenv(name);
             environment_.emplace_back(
                 name, value ? std::optional<std::string>(value) : std::nullopt);
@@ -51,6 +53,451 @@ class RedisHaKvProtocolTest : public ::testing::Test {
 using mooncake::testing::ScriptedRedisPeer;
 using mooncake::testing::ShardsTopology;
 using mooncake::testing::Topology;
+
+std::string Bulk(const std::string& value) {
+    return "$" + std::to_string(value.size()) + "\r\n" + value + "\r\n";
+}
+
+const std::string kRedisVersion = Bulk("# Server\r\nredis_version:7.2.0\r\n");
+const std::string kAofEnabled = Bulk("# Persistence\r\naof_enabled:1\r\n");
+const std::string kAofProbe = "*2\r\n:0\r\n:0\r\n";
+const std::string kReplicaAofProbe =
+    "-ERR WAITAOF cannot be used with replica instances. Please also note "
+    "that writes to replicas are just local and are not propagated.\r\n";
+
+std::string Port(const ScriptedRedisPeer& peer) {
+    return peer.endpoint().substr(peer.endpoint().rfind(':') + 1);
+}
+
+std::string PersistentTopology(const ScriptedRedisPeer& replica,
+                               bool shards = false) {
+    auto topology = shards ? ShardsTopology(1) : Topology(1);
+    const auto marker = shards ? ":6001\r\n" : ":6000\r\n";
+    topology.replace(topology.find(marker), std::string(marker).size(),
+                     ":" + Port(replica) + "\r\n");
+    return topology;
+}
+
+TEST_F(RedisHaKvProtocolTest, PersistentStartupRejectsUnprovenCapabilities) {
+    using Client = ha::common::redis::RedisClusterClient;
+    const std::vector<std::vector<std::string>> failures{
+        {Bulk("redis_version:7.0.15\r\n")},
+        {Bulk("redis_version:7.1.99\r\n")},
+        {Bulk("redis_version:unknown\r\n")},
+        {Bulk("redis_version:7.2\r\n")},
+        {Bulk("redis_version:7.2.0junk\r\n")},
+        {Bulk("redis_version:7.2.0\r\nredis_version:8.0.0\r\n")},
+        {Bulk("other_redis_version:7.2.0\r\n")},
+        {"-NOPERM INFO denied\r\n"},
+        {kRedisVersion, Bulk("aof_enabled:0\r\n")},
+        {kRedisVersion, Bulk("aof_enabled:10\r\n")},
+        {kRedisVersion, Bulk("appendonly:yes\r\n")},
+        {kRedisVersion, Bulk("not_aof_enabled:1\r\n")},
+        {kRedisVersion, Bulk("aof_enabled:1\r\naof_enabled:0\r\n")},
+        {kRedisVersion, Bulk("aof_enabled:1\r\nmalformed\r\n")},
+        {kRedisVersion, "-NOPERM INFO denied\r\n"},
+        {kRedisVersion, kAofEnabled, "-ERR unknown command WAITAOF\r\n"},
+        {kRedisVersion, kAofEnabled, "-NOPERM WAITAOF denied\r\n"},
+        {kRedisVersion, kAofEnabled, ":1\r\n"},
+        {kRedisVersion, kAofEnabled, "*2\r\n:2\r\n:0\r\n"},
+        {kRedisVersion, kAofEnabled, kReplicaAofProbe},
+    };
+    for (const auto& replies : failures) {
+        ScriptedRedisPeer peer(replies);
+        {
+            Client client;
+            const auto result =
+                client.ConnectDetailed(peer.endpoint(), 1, false, true);
+            EXPECT_NE(ErrorCode::OK, result.error);
+            EXPECT_NE(Client::RoutingError::None, result.routing_error);
+        }
+        peer.Join();
+        ASSERT_EQ(replies.size(), peer.commands().size());
+        for (const auto& command : peer.commands()) {
+            EXPECT_TRUE(command[0] == "INFO" || command[0] == "WAITAOF");
+            if (command[0] == "WAITAOF")
+                EXPECT_EQ((std::vector<std::string>{"WAITAOF", "0", "0", "1"}),
+                          command);
+        }
+    }
+}
+
+TEST_F(RedisHaKvProtocolTest, PermissionDeniedIsDistinctFromUnsupported) {
+    using Client = ha::common::redis::RedisClusterClient;
+    struct Case {
+        std::vector<std::string> replies;
+        Client::RoutingError expected;
+    };
+    const std::vector<Case> cases{
+        {{"-NOPERM INFO server denied\r\n"},
+         Client::RoutingError::PermissionDenied},
+        {{kRedisVersion, "-NOPERM INFO persistence denied\r\n"},
+         Client::RoutingError::PermissionDenied},
+        {{kRedisVersion, kAofEnabled, "-NOPERM WAITAOF denied\r\n"},
+         Client::RoutingError::PermissionDenied},
+        {{kRedisVersion, kAofEnabled, "-NOAUTH Authentication required.\r\n"},
+         Client::RoutingError::PermissionDenied},
+        {{kRedisVersion, kAofEnabled, "-WRONGPASS invalid credentials\r\n"},
+         Client::RoutingError::PermissionDenied},
+        {{kRedisVersion, kAofEnabled, "-ERR unknown command WAITAOF\r\n"},
+         Client::RoutingError::DurabilityUnsupported},
+    };
+    for (const auto& test : cases) {
+        ScriptedRedisPeer peer(test.replies);
+        Client client;
+        const auto result =
+            client.ConnectDetailed(peer.endpoint(), 1, false, true);
+        EXPECT_NE(ErrorCode::OK, result.error);
+        EXPECT_EQ(test.expected, result.routing_error);
+        peer.Join();
+    }
+}
+
+TEST_F(RedisHaKvProtocolTest,
+       ConfiguredAndExplicitPersistenceCannotBeWeakened) {
+    for (const auto* profile : {"memory", "persistent"}) {
+        ASSERT_EQ(0, setenv("MC_REDIS_DURABILITY_PROFILE", profile, 1));
+        for (bool explicit_aof : {false, true}) {
+            const bool persistent =
+                explicit_aof || std::string(profile) == "persistent";
+            if (std::string(profile) == "persistent" && !explicit_aof) {
+                // Explicit memory policy conflicts with the configured
+                // persistent profile; fail instead of mutating the policy.
+                RedisHaKvBackend backend({.replicas_required = 1});
+                EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+                          backend.Connect("127.0.0.1:1"));
+                EXPECT_FALSE(
+                    backend.GetWriteDurabilityPolicy().require_local_aof);
+                continue;
+            }
+            std::vector<std::string> replies;
+            if (persistent) replies = {kRedisVersion, kAofEnabled, kAofProbe};
+            replies.insert(replies.end(), {"*1\r\n:1\r\n", ":1\r\n"});
+            if (persistent) replies.push_back("*2\r\n:1\r\n:1\r\n");
+            ScriptedRedisPeer peer(replies);
+            RedisHaKvBackend backend(
+                {.replicas_required = 1,
+                 .require_local_aof = explicit_aof,
+                 .replica_aof_required = explicit_aof ? 1u : 0u});
+            ASSERT_EQ(ErrorCode::OK, backend.Connect(peer.endpoint()));
+            EXPECT_EQ(persistent,
+                      backend.GetWriteDurabilityPolicy().require_local_aof);
+            const auto result =
+                backend.PutWithResult("/oplog/bar/key", "value");
+            EXPECT_EQ(KvWriteStatus::kCommitted, result.status);
+            EXPECT_EQ(persistent, result.local_aof_acked);
+            peer.Join();
+            ASSERT_EQ(replies.size(), peer.commands().size());
+            const size_t write_index = persistent ? 3 : 0;
+            EXPECT_EQ("EVAL", peer.commands()[write_index][0]);
+            EXPECT_EQ("WAIT", peer.commands()[write_index + 1][0]);
+            if (persistent)
+                EXPECT_EQ(
+                    (std::vector<std::string>{"WAITAOF", "1", "1", "1000"}),
+                    peer.commands()[write_index + 2]);
+        }
+    }
+}
+
+TEST_F(RedisHaKvProtocolTest, PersistentWritesRequireExactMemoryAndAofCounts) {
+    for (const auto& [memory, local, replica] :
+         std::vector<std::tuple<int, int, int>>{{1, 1, 2},
+                                                {3, 1, 2},
+                                                {2, 0, 2},
+                                                {2, 1, 1},
+                                                {2, 1, 3},
+                                                {2, 1, 2}}) {
+        std::vector<std::string> replies{kRedisVersion, kAofEnabled, kAofProbe,
+                                         "*1\r\n:1\r\n",
+                                         ":" + std::to_string(memory) + "\r\n"};
+        if (memory == 2)
+            replies.push_back("*2\r\n:" + std::to_string(local) +
+                              "\r\n:" + std::to_string(replica) + "\r\n");
+        ScriptedRedisPeer peer(replies);
+        RedisHaKvBackend backend({.replicas_required = 2,
+                                  .require_local_aof = true,
+                                  .replica_aof_required = 2});
+        ASSERT_EQ(ErrorCode::OK, backend.Connect(peer.endpoint()));
+        const auto result = backend.PutWithResult("/oplog/bar/key", "value");
+        EXPECT_EQ(memory == 2 && local == 1 && replica == 2
+                      ? KvWriteStatus::kCommitted
+                      : KvWriteStatus::kOutcomeUnknown,
+                  result.status);
+        EXPECT_EQ(static_cast<size_t>(memory), result.replicas_acked);
+        if (memory == 2) {
+            EXPECT_EQ(local == 1, result.local_aof_acked);
+            EXPECT_EQ(static_cast<size_t>(replica), result.replica_aof_acked);
+        }
+        peer.Join();
+        ASSERT_EQ(replies.size(), peer.commands().size());
+        EXPECT_EQ("EVAL", peer.commands()[3][0]);
+        EXPECT_EQ("WAIT", peer.commands()[4][0]);
+        if (memory == 2) EXPECT_EQ("WAITAOF", peer.commands()[5][0]);
+    }
+}
+
+TEST_F(RedisHaKvProtocolTest, MalformedOrLostAofAcknowledgementIsNotReplayed) {
+    for (const auto* reply :
+         {"", "-NOPERM denied\r\n", ":1\r\n", "*1\r\n:1\r\n",
+          "*3\r\n:1\r\n:2\r\n:0\r\n", "*2\r\n:-1\r\n:2\r\n",
+          "*2\r\n:1\r\n:-1\r\n", "*2\r\n:2\r\n:2\r\n",
+          "*2\r\n$1\r\n1\r\n:2\r\n"}) {
+        ScriptedRedisPeer peer({kRedisVersion, kAofEnabled, kAofProbe,
+                                "*1\r\n:1\r\n", ":2\r\n", reply});
+        RedisHaKvBackend backend({.replicas_required = 2,
+                                  .require_local_aof = true,
+                                  .replica_aof_required = 2});
+        ASSERT_EQ(ErrorCode::OK, backend.Connect(peer.endpoint()));
+        EXPECT_EQ(KvWriteStatus::kOutcomeUnknown,
+                  backend.PutWithResult("/oplog/bar/key", "value").status);
+        peer.Join();
+        ASSERT_EQ(6u, peer.commands().size());
+        EXPECT_EQ("EVAL", peer.commands()[3][0]);
+        EXPECT_EQ("WAIT", peer.commands()[4][0]);
+        EXPECT_EQ("WAITAOF", peer.commands()[5][0]);
+    }
+}
+
+TEST_F(RedisHaKvProtocolTest,
+       PersistentClusterProbesEveryNodeAndUsesWriteSocket) {
+    for (bool shards : {false, true}) {
+        ScriptedRedisPeer replica(
+            {kRedisVersion, kAofEnabled, kReplicaAofProbe});
+        const auto topology = PersistentTopology(replica, shards);
+        ScriptedRedisPeer primary(
+            {topology, kRedisVersion, kAofEnabled, kAofProbe, topology,
+             "*1\r\n:1\r\n", ":1\r\n", topology, "*2\r\n:1\r\n:1\r\n",
+             topology},
+            {}, false, shards);
+        RedisHaKvBackend backend({.replicas_required = 1,
+                                  .require_local_aof = true,
+                                  .replica_aof_required = 1});
+        ASSERT_EQ(ErrorCode::OK,
+                  backend.Connect("redis+cluster://" + primary.endpoint()));
+        EXPECT_EQ(KvWriteStatus::kCommitted,
+                  backend.PutWithResult("/oplog/bar/key", "value").status);
+        primary.Join();
+        replica.Join();
+        ASSERT_EQ(3u, replica.commands().size());
+        EXPECT_EQ((std::vector<std::string>{"INFO", "server"}),
+                  replica.commands()[0]);
+        EXPECT_EQ((std::vector<std::string>{"INFO", "persistence"}),
+                  replica.commands()[1]);
+        EXPECT_EQ((std::vector<std::string>{"WAITAOF", "0", "0", "1"}),
+                  replica.commands()[2]);
+        std::vector<std::string> confirmations;
+        for (const auto& command : primary.commands()) {
+            if (command[0] == "EVAL" || command[0] == "WAIT" ||
+                (command[0] == "WAITAOF" && command[1] == "1"))
+                confirmations.push_back(command[0]);
+        }
+        EXPECT_EQ((std::vector<std::string>{"EVAL", "WAIT", "WAITAOF"}),
+                  confirmations);
+    }
+}
+
+TEST_F(RedisHaKvProtocolTest, PersistentReplicaCapabilityFailureStopsStartup) {
+    for (const auto& replies : std::vector<std::vector<std::string>>{
+             {Bulk("redis_version:7.0.15\r\n")},
+             {kRedisVersion, Bulk("aof_enabled:0\r\n")},
+             {kRedisVersion, kAofEnabled, "-NOPERM WAITAOF denied\r\n"},
+             {kRedisVersion, kAofEnabled, "-ERR unknown command WAITAOF\r\n"},
+             {kRedisVersion, kAofEnabled, "-ERR different failure\r\n"}}) {
+        ScriptedRedisPeer replica(replies);
+        ScriptedRedisPeer primary({PersistentTopology(replica), kRedisVersion,
+                                   kAofEnabled, kAofProbe});
+        {
+            ha::common::redis::RedisClusterClient client;
+            EXPECT_NE(ErrorCode::OK,
+                      client.Connect("redis+cluster://" + primary.endpoint(), 1,
+                                     false, true));
+        }
+        primary.Join();
+        replica.Join();
+        for (const auto& command : primary.commands())
+            EXPECT_NE("EVAL", command[0]);
+        EXPECT_EQ(replies.size(), replica.commands().size());
+    }
+}
+
+TEST_F(RedisHaKvProtocolTest, NewReplicaWithDisabledAofPreventsBusinessWrite) {
+    ScriptedRedisPeer old_replica(
+        {kRedisVersion, kAofEnabled, kReplicaAofProbe});
+    ScriptedRedisPeer bad_replica({kRedisVersion, Bulk("aof_enabled:0\r\n")});
+    ScriptedRedisPeer primary({PersistentTopology(old_replica), kRedisVersion,
+                               kAofEnabled, kAofProbe,
+                               PersistentTopology(bad_replica), kRedisVersion,
+                               kAofEnabled, kAofProbe});
+    RedisHaKvBackend backend({.replicas_required = 1,
+                              .require_local_aof = true,
+                              .replica_aof_required = 1});
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Connect("redis+cluster://" + primary.endpoint()));
+    EXPECT_EQ(KvWriteStatus::kFailedBeforeCommit,
+              backend.PutWithResult("/oplog/bar/key", "value").status);
+    primary.Join();
+    old_replica.Join();
+    bad_replica.Join();
+    ASSERT_EQ(2u, bad_replica.commands().size());
+    for (const auto& command : primary.commands())
+        EXPECT_NE("EVAL", command[0]);
+}
+
+TEST_F(RedisHaKvProtocolTest, ReplicaIdentityChangeInvalidatesCapabilityCache) {
+    ScriptedRedisPeer replica({kRedisVersion, kAofEnabled, kReplicaAofProbe,
+                               kRedisVersion, Bulk("aof_enabled:0\r\n")});
+    const auto initial = PersistentTopology(replica);
+    auto changed = initial;
+    changed.replace(changed.find("\r\na\r\n"), 5, "\r\nx\r\n");
+    ScriptedRedisPeer primary({initial, kRedisVersion, kAofEnabled, kAofProbe,
+                               changed, kRedisVersion, kAofEnabled, kAofProbe});
+    RedisHaKvBackend backend({.replicas_required = 1,
+                              .require_local_aof = true,
+                              .replica_aof_required = 1});
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Connect("redis+cluster://" + primary.endpoint()));
+    EXPECT_EQ(KvWriteStatus::kFailedBeforeCommit,
+              backend.PutWithResult("/oplog/bar/key", "value").status);
+    primary.Join();
+    replica.Join();
+    EXPECT_EQ(5u, replica.commands().size());
+}
+
+TEST_F(RedisHaKvProtocolTest, AofAcknowledgementRevalidatesChangedMembership) {
+    ScriptedRedisPeer old_replica(
+        {kRedisVersion, kAofEnabled, kReplicaAofProbe});
+    ScriptedRedisPeer bad_replica({kRedisVersion, Bulk("aof_enabled:0\r\n")});
+    const auto initial = PersistentTopology(old_replica);
+    // Refresh only invalidates stale capability caches; it does not probe
+    // non-target shards. The membership change alone makes the write unknown.
+    ScriptedRedisPeer primary({initial, kRedisVersion, kAofEnabled, kAofProbe,
+                               initial, "*1\r\n:1\r\n", ":1\r\n", initial,
+                               "*2\r\n:1\r\n:1\r\n",
+                               PersistentTopology(bad_replica)});
+    RedisHaKvBackend backend({.replicas_required = 1,
+                              .require_local_aof = true,
+                              .replica_aof_required = 1});
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Connect("redis+cluster://" + primary.endpoint()));
+    EXPECT_EQ(KvWriteStatus::kOutcomeUnknown,
+              backend.PutWithResult("/oplog/bar/key", "value").status);
+    primary.Join();
+    old_replica.Join();
+    // bad_replica is never connected: no full topology probe after refresh.
+    size_t writes = 0;
+    for (const auto& command : primary.commands())
+        writes += command[0] == "EVAL";
+    EXPECT_EQ(1u, writes);
+}
+
+TEST_F(RedisHaKvProtocolTest, AnotherShardsCapabilityCannotCoverBadPrimary) {
+    ScriptedRedisPeer good_replica(
+        {kRedisVersion, kAofEnabled, kReplicaAofProbe});
+    ScriptedRedisPeer bad_primary({kRedisVersion, Bulk("aof_enabled:0\r\n")});
+    auto first = Topology(1, "PORT", 0, 8191);
+    first.replace(first.find(":6000\r\n"), 7,
+                  ":" + Port(good_replica) + "\r\n");
+    const auto topology =
+        "*2\r\n" + first.substr(4) +
+        Topology(1, Port(bad_primary), 8192, 16383, 1).substr(4);
+    ScriptedRedisPeer seed({topology, kRedisVersion, kAofEnabled, kAofProbe});
+    {
+        ha::common::redis::RedisClusterClient client;
+        const auto result = client.ConnectDetailed(
+            "redis+cluster://" + seed.endpoint(), 1, false, true);
+        EXPECT_NE(ErrorCode::OK, result.error);
+        EXPECT_EQ(
+            ha::common::redis::RedisClusterClient::RoutingError::AofDisabled,
+            result.routing_error);
+    }
+    seed.Join();
+    bad_primary.Join();
+    ASSERT_EQ(2u, bad_primary.commands().size());
+    for (const auto& command : seed.commands()) EXPECT_NE("EVAL", command[0]);
+    // If the bad primary sorts first, the good replica was never connected;
+    // its peer destructor shuts down accept without waiting for a command.
+}
+
+TEST_F(RedisHaKvProtocolTest, RedirectCannotBypassNewPrimaryAofValidation) {
+    for (bool asking : {false, true}) {
+        ScriptedRedisPeer replica_a(
+            {kRedisVersion, kAofEnabled, kReplicaAofProbe});
+        ScriptedRedisPeer replica_b(
+            {kRedisVersion, kAofEnabled, kReplicaAofProbe});
+        std::vector<std::string> target_replies;
+        if (asking) target_replies.push_back("NODES");
+        target_replies.insert(target_replies.end(),
+                              {kRedisVersion, Bulk("aof_enabled:0\r\n")});
+        ScriptedRedisPeer target(target_replies);
+        auto topology = Topology();
+        topology.replace(topology.find(":6000\r\n"), 7,
+                         ":" + Port(replica_a) + "\r\n");
+        topology.replace(topology.find(":6001\r\n"), 7,
+                         ":" + Port(replica_b) + "\r\n");
+        auto moved = topology;
+        moved.replace(moved.find(":PORT\r\n"), 7, ":" + Port(target) + "\r\n");
+        ScriptedRedisPeer seed({topology, kRedisVersion, kAofEnabled, kAofProbe,
+                                topology,
+                                std::string(asking ? "-ASK " : "-MOVED ") +
+                                    "5061 " + target.endpoint() + "\r\n",
+                                asking ? topology : moved});
+        RedisHaKvBackend backend({.replicas_required = 2,
+                                  .require_local_aof = true,
+                                  .replica_aof_required = 2});
+        ASSERT_EQ(ErrorCode::OK,
+                  backend.Connect("redis+cluster://" + seed.endpoint()));
+        EXPECT_EQ(KvWriteStatus::kFailedBeforeCommit,
+                  backend.PutWithResult("/oplog/bar/key", "value").status);
+        seed.Join();
+        target.Join();
+        replica_a.Join();
+        replica_b.Join();
+        ASSERT_EQ(asking ? 3u : 2u, target.commands().size());
+        for (const auto& command : target.commands()) {
+            EXPECT_NE("EVAL", command[0]);
+            EXPECT_NE("ASKING", command[0]);
+            EXPECT_NE("WAIT", command[0]);
+        }
+    }
+}
+
+TEST_F(RedisHaKvProtocolTest, WaitAofRejectsInvalidTimeoutBeforeSending) {
+    ScriptedRedisPeer peer({kRedisVersion, kAofEnabled, kAofProbe, ":1\r\n"});
+    ha::common::redis::RedisClusterClient client;
+    ASSERT_EQ(ErrorCode::OK, client.Connect(peer.endpoint(), 1, false, true));
+    auto lease =
+        client.Execute({"EVAL", "return 1", "1", "{bar}"}, "{bar}", true);
+    ASSERT_TRUE(lease.reply);
+    for (int timeout : {-1, 0, 60001})
+        EXPECT_FALSE(
+            client.WaitAof(lease, 1, std::chrono::milliseconds(timeout)));
+    peer.Join();
+    ASSERT_EQ(4u, peer.commands().size());
+    EXPECT_EQ("EVAL", peer.commands().back()[0]);
+}
+
+TEST_F(RedisHaKvProtocolTest, WaitAofHonorsExecutionDeadlineWithoutRetry) {
+    ScriptedRedisPeer peer(
+        {kRedisVersion, kAofEnabled, kAofProbe, ":1\r\n", "*2\r\n:1\r\n:1\r\n"},
+        {std::chrono::milliseconds(0), std::chrono::milliseconds(0),
+         std::chrono::milliseconds(0), std::chrono::milliseconds(0),
+         std::chrono::milliseconds(200)});
+    ha::common::redis::RedisClusterClient client;
+    ASSERT_EQ(ErrorCode::OK, client.Connect(peer.endpoint(), 1, false, true));
+    const auto start = std::chrono::steady_clock::now();
+    auto lease = client.Execute({"EVAL", "return 1", "1", "{bar}"}, "{bar}",
+                                true, start + std::chrono::milliseconds(80));
+    ASSERT_TRUE(lease.reply);
+    EXPECT_FALSE(client.WaitAof(lease, 1, std::chrono::milliseconds(1000)));
+    EXPECT_LT(std::chrono::steady_clock::now() - start,
+              std::chrono::milliseconds(180));
+    peer.Join();
+    ASSERT_EQ(5u, peer.commands().size());
+    EXPECT_EQ("WAITAOF", peer.commands()[4][0]);
+    const auto wait_ms = std::stol(peer.commands()[4][3]);
+    EXPECT_GT(wait_ms, 0);
+    EXPECT_LE(wait_ms, 80);
+}
 
 TEST_F(RedisHaKvProtocolTest, StartupFailuresRetainStructuredReason) {
     using Client = ha::common::redis::RedisClusterClient;

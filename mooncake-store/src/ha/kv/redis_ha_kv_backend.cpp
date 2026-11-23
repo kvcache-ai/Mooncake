@@ -7,6 +7,7 @@
 
 #include <glog/logging.h>
 
+#include "config/redis_connection_config.h"
 #include "ha/kv/redis_write_ack.h"
 #include "types.h"
 
@@ -226,6 +227,17 @@ ErrorCode RedisHaKvBackend::Connect(std::string connstring) {
     std::lock_guard<std::mutex> lock(mu_);
     connstring_ = std::move(connstring);
     client_.reset();
+    const auto config = RedisConnectionConfig::FromEnvironment();
+    if (!config) return config.error();
+    // The policy is fixed at construction. A persistent profile may require a
+    // stronger policy, but Connect must not silently rewrite the configured
+    // policy; reject the conflict instead.
+    if (config->durability_profile == RedisDurabilityProfile::kPersistent &&
+        !write_policy_.require_local_aof) {
+        LOG(ERROR) << "Redis persistent profile requires a write policy with "
+                      "require_local_aof enabled";
+        return ErrorCode::INVALID_PARAMS;
+    }
     const auto validation = ValidateRedisWriteDurabilityPolicy(write_policy_);
     if (validation != ErrorCode::OK) {
         return validation;
@@ -298,6 +310,9 @@ KvWriteResult RedisHaKvBackend::ExecuteWriteLocked(
         [&](size_t replicas, std::chrono::milliseconds wait_timeout)
             -> tl::expected<size_t, ErrorCode> {
             return client_->Wait(lease, replicas, wait_timeout);
+        },
+        [&](size_t replicas, std::chrono::milliseconds wait_timeout) {
+            return client_->WaitAof(lease, replicas, wait_timeout);
         });
     if (result.status == KvWriteStatus::kOutcomeUnknown ||
         lease.routing_error !=
@@ -306,7 +321,10 @@ KvWriteResult RedisHaKvBackend::ExecuteWriteLocked(
                      << " unconfirmed: cluster=" << cluster_id
                      << " slot=" << NamespaceSlot(cluster_id)
                      << " required=" << result.replicas_required
-                     << " acked=" << result.replicas_acked << " routing_error="
+                     << " acked=" << result.replicas_acked
+                     << " local_aof_acked=" << result.local_aof_acked
+                     << " replica_aof_acked=" << result.replica_aof_acked
+                     << " routing_error="
                      << ha::common::redis::RedisClusterClient::RoutingErrorName(
                             lease.routing_error);
     }
@@ -329,7 +347,8 @@ ErrorCode RedisHaKvBackend::EnsureConnectedLocked() {
     if (client_) return ErrorCode::OK;
     auto client = std::make_unique<ha::common::redis::RedisClusterClient>();
     const auto result =
-        client->ConnectDetailed(connstring_, write_policy_.replicas_required);
+        client->ConnectDetailed(connstring_, write_policy_.replicas_required,
+                                false, write_policy_.require_local_aof);
     if (result.error != ErrorCode::OK) {
         LOG(ERROR) << "Redis KV startup failed: error="
                    << toString(result.error) << " routing_error="

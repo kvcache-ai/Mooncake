@@ -310,6 +310,9 @@ struct RedisConnectionEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_REDIS_COMMAND_TIMEOUT_MS);
     MC_DEFINE_ENV_VAR(std::string, MC_REDIS_TOPOLOGY_REFRESH_MS);
     MC_DEFINE_ENV_VAR(std::string, MC_REDIS_MAX_REDIRECTS);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_DURABILITY_PROFILE);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_REPLICATION_ACK_TIMEOUT_MS);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_AOF_ACK_TIMEOUT_MS);
     // Keep the DB index as a string so an explicitly empty value remains
     // distinguishable from a nonempty malformed value.
     MC_DEFINE_ENV_VAR(std::string, MC_REDIS_DB_INDEX);

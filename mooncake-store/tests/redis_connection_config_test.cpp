@@ -42,7 +42,7 @@ class RedisConnectionConfigTest : public ::testing::Test {
     }
 
    private:
-    inline static constexpr std::array<const char*, 8> kVariables = {
+    inline static constexpr std::array<const char*, 11> kVariables = {
         "MC_REDIS_DB_INDEX",
         "MC_REDIS_USERNAME",
         "MC_REDIS_PASSWORD",
@@ -50,7 +50,10 @@ class RedisConnectionConfigTest : public ::testing::Test {
         "MC_REDIS_CONNECT_TIMEOUT_MS",
         "MC_REDIS_COMMAND_TIMEOUT_MS",
         "MC_REDIS_TOPOLOGY_REFRESH_MS",
-        "MC_REDIS_MAX_REDIRECTS"};
+        "MC_REDIS_MAX_REDIRECTS",
+        "MC_REDIS_DURABILITY_PROFILE",
+        "MC_REDIS_REPLICATION_ACK_TIMEOUT_MS",
+        "MC_REDIS_AOF_ACK_TIMEOUT_MS"};
     std::array<std::optional<std::string>, kVariables.size()> original_;
     std::unique_lock<std::mutex> environment_lock_;
 };
@@ -74,6 +77,48 @@ TEST_F(RedisConnectionConfigTest, ClusterModeRequiresExplicitBoolean) {
     EXPECT_FALSE(RedisConnectionConfig::FromEnvironment()->cluster_enabled);
     ASSERT_EQ(0, setenv("MC_REDIS_CLUSTER_ENABLED", "invalid", 1));
     EXPECT_FALSE(RedisConnectionConfig::FromEnvironment().has_value());
+}
+
+TEST_F(RedisConnectionConfigTest, DurabilityProfileAndAckTimeoutsAreStrict) {
+    auto defaults = RedisConnectionConfig::FromEnvironment();
+    ASSERT_TRUE(defaults);
+    EXPECT_EQ(RedisDurabilityProfile::kMemory, defaults->durability_profile);
+    EXPECT_EQ(1000, defaults->replication_ack_timeout_ms);
+    EXPECT_EQ(1000, defaults->aof_ack_timeout_ms);
+
+    ASSERT_EQ(0, setenv("MC_REDIS_DURABILITY_PROFILE", "persistent", 1));
+    ASSERT_EQ(0, setenv("MC_REDIS_REPLICATION_ACK_TIMEOUT_MS", "123", 1));
+    ASSERT_EQ(0, setenv("MC_REDIS_AOF_ACK_TIMEOUT_MS", "456", 1));
+    auto configured = RedisConnectionConfig::FromEnvironment();
+    ASSERT_TRUE(configured);
+    EXPECT_EQ(RedisDurabilityProfile::kPersistent,
+              configured->durability_profile);
+    EXPECT_EQ(123, configured->replication_ack_timeout_ms);
+    EXPECT_EQ(456, configured->aof_ack_timeout_ms);
+
+    for (const auto* profile : {"", "unknown", "MEMORY"}) {
+        ASSERT_EQ(0, setenv("MC_REDIS_DURABILITY_PROFILE", profile, 1));
+        EXPECT_FALSE(RedisConnectionConfig::FromEnvironment());
+    }
+    ASSERT_EQ(0, setenv("MC_REDIS_DURABILITY_PROFILE", "memory", 1));
+    auto memory = RedisConnectionConfig::FromEnvironment();
+    ASSERT_TRUE(memory);
+    EXPECT_EQ(RedisDurabilityProfile::kMemory, memory->durability_profile);
+    ASSERT_EQ(0, unsetenv("MC_REDIS_DURABILITY_PROFILE"));
+    for (const auto* name : {"MC_REDIS_REPLICATION_ACK_TIMEOUT_MS",
+                             "MC_REDIS_AOF_ACK_TIMEOUT_MS"}) {
+        for (const auto* value :
+             {"", "0", "-1", "60001", "4junk", "999999999999999999999"}) {
+            ASSERT_EQ(0, setenv(name, value, 1));
+            EXPECT_FALSE(RedisConnectionConfig::FromEnvironment())
+                << name << value;
+        }
+        for (const auto* value : {"1", "60000"}) {
+            ASSERT_EQ(0, setenv(name, value, 1));
+            EXPECT_TRUE(RedisConnectionConfig::FromEnvironment()) << name;
+        }
+        ASSERT_EQ(0, unsetenv(name));
+    }
 }
 
 TEST_F(RedisConnectionConfigTest, RoutingSettingsHaveBoundedValues) {

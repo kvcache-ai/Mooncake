@@ -1,5 +1,8 @@
 #include "redis_connection_config.h"
 
+#include <charconv>
+#include <glog/logging.h>
+
 #include "environ.h"
 #include "environment_value_parser.h"
 #include "environment_variables.h"
@@ -9,6 +12,41 @@ namespace mooncake {
 tl::expected<RedisConnectionConfig, ErrorCode>
 RedisConnectionConfig::FromEnvironment() {
     RedisConnectionConfig config;
+    const auto profile = Environ::Read(
+        RedisConnectionEnvironmentVariables::MC_REDIS_DURABILITY_PROFILE);
+    if (profile) {
+        if (*profile == "persistent") {
+            config.durability_profile = RedisDurabilityProfile::kPersistent;
+        } else if (*profile != "memory") {
+            LOG(ERROR)
+                << "MC_REDIS_DURABILITY_PROFILE must be memory or persistent";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+    const auto ack_timeout = [](const auto& variable, int& value) {
+        const auto raw = Environ::Read(variable);
+        if (!raw) return true;
+        int parsed = 0;
+        const auto result =
+            std::from_chars(raw->data(), raw->data() + raw->size(), parsed);
+        if (result.ec != std::errc{} ||
+            result.ptr != raw->data() + raw->size() || parsed < 1 ||
+            parsed > 60000) {
+            LOG(ERROR) << variable.name
+                       << " must be a decimal integer in [1, 60000]";
+            return false;
+        }
+        value = parsed;
+        return true;
+    };
+    if (!ack_timeout(RedisConnectionEnvironmentVariables::
+                         MC_REDIS_REPLICATION_ACK_TIMEOUT_MS,
+                     config.replication_ack_timeout_ms) ||
+        !ack_timeout(
+            RedisConnectionEnvironmentVariables::MC_REDIS_AOF_ACK_TIMEOUT_MS,
+            config.aof_ack_timeout_ms)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     const auto integer = [](const auto& variable, int& value, int minimum,
                             int maximum) {
         const auto raw = Environ::Read(variable);
