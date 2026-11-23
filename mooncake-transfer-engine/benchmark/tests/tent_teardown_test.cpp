@@ -157,8 +157,13 @@ class TENTTeardownTest : public testing::TestWithParam<bool> {
         config->set("rpc_server_hostname", "127.0.0.1");
         config->set("rpc_server_port", 0);
         config->set("log_level", "warning");
-        for (const auto* name : {"rdma", "tcp", "hp_tcp", "shm", "io_uring"})
-            config->set(std::string("transports/") + name + "/enable", false);
+        // Only the injected transport participates in admission and teardown.
+        for (int type = 1; type < kSupportedTransportTypes; ++type)
+            config->set("transports/" +
+                            std::string(transportTypeName(
+                                static_cast<TransportType>(type))) +
+                            "/enable",
+                        false);
         auto engine = std::make_unique<TransferEngine>(config);
         ASSERT_TRUE(engine->available());
         engine_ = engine.get();
