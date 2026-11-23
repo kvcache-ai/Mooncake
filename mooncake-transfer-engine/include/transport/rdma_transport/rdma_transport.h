@@ -42,6 +42,11 @@ class RdmaEndPoint;
 class TransferMetadata;
 class RdmaTransportTestPeer;
 class WorkerPool;
+#ifdef MOONCAKE_ENABLE_PXN
+namespace pxn {
+class PxnRuntimeManager;
+}
+#endif
 
 class RdmaTransport : public Transport {
     friend class RdmaContext;
@@ -73,6 +78,17 @@ class RdmaTransport : public Transport {
     // was posted locally, not that the remote application consumed it.
     int sendNativeNotify(const std::string &peer_server_name,
                          const TransferMetadata::NotifyDesc &notify);
+#ifdef MOONCAKE_ENABLE_PXN
+    // Override PXN slice completion handler
+    // Implementation is in
+    // src/transport/rdma_transport/pxn/pxn_slice_completion.cpp
+    void pxnSliceCompletion(Slice *slice) override;
+
+    // Override PXN task-owned CW reclaim hook. Implemented in
+    // pxn_slice_completion.cpp; decrements each CW's pxn_task_refcount and
+    // returns it to the TLS pool when it reaches zero.
+    void pxnFreeTaskCws(std::vector<void *> &cws) override;
+#endif
 
     // HugeTLB host memory is tried over the caller's own range first; only an
     // EINVAL from ibv_reg_mr (a hugetlb VMA cannot be split for the
@@ -245,6 +261,10 @@ class RdmaTransport : public Transport {
         ClassicCongestionControlMode::kUninitialized};
 #endif
     std::shared_ptr<Topology> local_topology_;
+#ifdef MOONCAKE_ENABLE_PXN
+    // PXN runtime service object
+    std::unique_ptr<pxn::PxnRuntimeManager> pxn_runtime_mgr_;
+#endif
     // MC_RDMA_NIC_SELECTION=local: GPU location (e.g. "cuda:0") -> indices into
     // context_list_ of its topology-preferred HCAs that opened. Built once in
     // initializeRdmaResources() and read-only afterwards, so registration
@@ -330,6 +350,15 @@ class RdmaTransport : public Transport {
     // A different transport may fail after RDMA has already returned success.
     std::mutex skipped_hylink_fabric_mutex_;
     std::unordered_set<uint64_t> skipped_hylink_fabric_addrs_;
+#endif
+#ifdef MOONCAKE_ENABLE_PXN
+   public:
+    // Returns the PxnRuntimeManager owned by this transport, or nullptr if
+    // the transport has not been installed yet (e.g. during unit tests that
+    // bypass install()). Callers must null-check.
+    pxn::PxnRuntimeManager *PxnRuntimeMgr() const {
+        return pxn_runtime_mgr_.get();
+    }
 #endif
 };
 

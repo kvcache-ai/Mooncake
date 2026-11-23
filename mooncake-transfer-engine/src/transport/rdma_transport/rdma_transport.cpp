@@ -14,6 +14,11 @@
 
 #include "transport/rdma_transport/rdma_transport.h"
 
+#ifdef MOONCAKE_ENABLE_PXN
+#include "transport/rdma_transport/pxn/pxn_memory_manager.h"
+#include "transport/rdma_transport/pxn/pxn_runtime_manager.h"
+#endif
+
 #include <glog/logging.h>
 #include <sys/mman.h>
 #include <sys/time.h>
@@ -358,6 +363,11 @@ int RdmaTransport::install(std::string &local_server_name,
     metadata_ = meta;
     local_server_name_ = local_server_name;
     local_topology_ = topo;
+
+#ifdef MOONCAKE_ENABLE_PXN
+    pxn_runtime_mgr_.reset(new pxn::PxnRuntimeManager(
+        local_topology_->getHcaList(), MCIbRelaxedOrderingEnabled));
+#endif
 
     // In dual-NIC environments (e.g. separate TCP and RDMA interfaces),
     // MC_RDMA_BIND_ADDRESS allows NIC paths to use an RDMA-reachable IP
@@ -1064,6 +1074,10 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                 return;
             }
             buffer_desc.name = resolved_name;
+#ifdef MOONCAKE_ENABLE_PXN
+            pxn::PxnEnsureGpuMemory(chunk_addr, buffer_desc.isGpuMem,
+                                    buffer_desc.gpuid);
+#endif
             // A widened registration publishes the range the caller asked for,
             // not the padded one, so peers are told what was registered. The
             // keys still cover the whole MR, so this boundary is cooperative,
@@ -1877,6 +1891,9 @@ Status RdmaTransport::submitTransferTask(
         }
         return local_hca_list[static_cast<size_t>(nic_hint)];
     };
+#ifdef MOONCAKE_ENABLE_PXN
+    pxn::PxnPackingContext pxn_pack_ctx(&globalConfig());
+#endif
     const size_t kBlockSize = globalConfig().slice_size;
     const int kMaxRetryCount = globalConfig().retry_cnt;
     const size_t kFragmentSize = globalConfig().fragment_limit;
@@ -1925,6 +1942,10 @@ Status RdmaTransport::submitTransferTask(
         __sync_fetch_and_add(&task.slice_count, 1);
         slice->markFailed();
         fail_unposted_slices();
+#ifdef MOONCAKE_ENABLE_PXN
+        if (auto *mgr = PxnRuntimeMgr())
+            mgr->PxnFailPendingSlices(pxn_pack_ctx);
+#endif
         fail_unstarted_tasks(task_index + 1);
     };
     size_t task_index = 0, request_index = 0;
@@ -1942,11 +1963,27 @@ Status RdmaTransport::submitTransferTask(
         auto &task = *task_list[task_index];
         const size_t current_task_index = task_index;
         assert(task.request);
+#ifndef MOONCAKE_ENABLE_PXN
         auto &request = task.request[request_index++];
+#else
+        if (auto *mgr = PxnRuntimeMgr()) {
+            mgr->PxnPlanAndPack(task_list, task_index, request_index++,
+                                context_list_, local_segment_desc.get(),
+                                kSubmitWatermark, pxn_pack_ctx);
+        } else {
+            pxn_pack_ctx.pxn_bypass_requests.clear();
+            pxn_pack_ctx.pxn_bypass_requests.push_back(
+                task.request[request_index++]);
+        }
+#endif
         if (request_index == task.request_count) {
             ++task_index;
             request_index = 0;
         }
+#ifdef MOONCAKE_ENABLE_PXN
+        // clang-format off
+        for (const auto &request : pxn_pack_ctx.pxn_bypass_requests) {
+#endif
         auto target_desc_it = target_segment_descs.find(request.target_id);
         if (target_desc_it == target_segment_descs.end()) {
             target_desc_it =
@@ -2167,6 +2204,10 @@ Status RdmaTransport::submitTransferTask(
 
             offset += slice->length;
         }
+#ifdef MOONCAKE_ENABLE_PXN
+        }  // end for bypass_requests
+        // clang-format on
+#endif
     }
 
     flush_pending_slices();
