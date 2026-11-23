@@ -126,8 +126,14 @@ class UrmaContext : public UbContext {
     int eid_index_ = -1;
     int active_speed_ = -1;
 
+    struct SegRegion {
+        urma_target_seg_t* seg;
+        uint64_t length;
+        uint32_t index;
+    };
+
     RWSpinlock seg_region_lock_;
-    std::vector<std::pair<urma_target_seg_t*, uint64_t>> seg_region_list_;
+    std::vector<SegRegion> seg_region_list_;
     std::vector<urma_target_seg_t*> local_tseg_list_;
     std::vector<urma_seg_t*> remote_seg_list_;
     std::vector<urma_target_seg_t*> imported_seg_list_;

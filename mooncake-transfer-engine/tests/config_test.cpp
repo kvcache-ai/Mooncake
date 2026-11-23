@@ -1252,5 +1252,33 @@ TEST(RdAtomicResolveTest, RequestMayExceedHistoricalCapUpToDeviceLimit) {
     EXPECT_EQ(resolveRdAtomicDepth(255, 255), 255);
 }
 
+class MaxSegSizeEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_MAX_SEG_SIZE"); }
+};
+
+TEST_F(MaxSegSizeEnvTest, UnsetKeepsDefault) {
+    ::unsetenv("MC_MAX_SEG_SIZE");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_seg_size, 0x10000000000ULL);
+}
+
+TEST_F(MaxSegSizeEnvTest, ValidOverrideUpdatesMaxSegSize) {
+    ASSERT_EQ(::setenv("MC_MAX_SEG_SIZE", " 67108864 ", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_seg_size, 67108864ULL);
+}
+
+TEST_F(MaxSegSizeEnvTest, InvalidOrNonPositiveValuesAreIgnored) {
+    for (const char* bad : {"", "0", "-1", "abc", "64abc"}) {
+        ASSERT_EQ(::setenv("MC_MAX_SEG_SIZE", bad, 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.max_seg_size, 0x10000000000ULL) << "value=" << bad;
+    }
+}
+
 }  // namespace
 }  // namespace mooncake

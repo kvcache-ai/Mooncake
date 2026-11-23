@@ -15,7 +15,9 @@
 #ifndef UB_TRANSPORT_H
 #define UB_TRANSPORT_H
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "topology.h"
 #include "transfer_metadata.h"
@@ -37,6 +39,7 @@ class UbTransport : public Transport {
     friend class UbContext;
     friend class UbEndPoint;
     friend class UbWorkerPool;
+    friend class UbTransportTestPeer;
 
    public:
     using BufferDesc = TransferMetadata::BufferDesc;
@@ -124,6 +127,12 @@ class UbTransport : public Transport {
     UB_ENDPOINT_TYPE endpoint_type_;
     bool rm_mode_ = false;
     bool urma_initialized_ = false;
+    // Mooncake#3503: buffers larger than max_seg_size are split into multiple
+    // <= max_seg_size URMA segments (one BufferDesc per chunk).
+    // unregisterLocalMemory() only receives the base addr, so remember each
+    // base buffer's chunk start-addresses for cleanup.
+    std::mutex chunk_map_mutex_;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> chunk_map_;
 };
 }  // namespace mooncake
 

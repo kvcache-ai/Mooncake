@@ -584,6 +584,24 @@ if(USE_UB)
   # conditions and other stability issues, so keep it out of CI for now. Run
   # manually with ./ub_transport_test. add_test(NAME ub_transport_test COMMAND
   # ub_transport_test)
+
+  # Hardware-free unit tests for #3503 (auto-chunking registrations larger than
+  # max_seg_size and splitting cross-BufferDesc transfers).
+  add_executable(ub_large_seg_unit_test ${WORKSPACE}/ub_large_seg_unit_test.cpp)
+  target_link_libraries(ub_large_seg_unit_test PUBLIC transfer_engine gtest
+                                                     gtest_main glog::glog
+                                                     pthread)
+  target_include_directories(ub_large_seg_unit_test
+                             PRIVATE ${urma_INCLUDE_DIR})
+  add_test(NAME ub_large_seg_unit_test COMMAND ub_large_seg_unit_test)
+
+  # Kunpeng / URMA hardware loopback regression test for #3503. Built but not
+  # registered with ctest because it requires URMA hardware and
+  # MC_MAX_SEG_SIZE=67108864 ./ub_large_seg_test.
+  add_executable(ub_large_seg_test ${WORKSPACE}/ub_large_seg_test.cpp)
+  target_link_libraries(ub_large_seg_test PUBLIC transfer_engine gtest
+                                                 gflags::gflags glog::glog
+                                                 pthread)
 endif()
 
 if(USE_SUNRISE)

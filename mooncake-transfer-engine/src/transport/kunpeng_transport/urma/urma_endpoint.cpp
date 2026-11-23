@@ -172,12 +172,13 @@ int UrmaContext::construct(GlobalConfig& config) {
 
 int UrmaContext::deconstruct() {
     for (auto& entry : seg_region_list_) {
-        int ret = urma_unregister_seg(entry.first);
+        int ret = urma_unregister_seg(entry.seg);
         if (ret) {
             PLOG(ERROR) << "Failed to unregister segment";
         }
     }
     seg_region_list_.clear();
+    local_tseg_list_.clear();
 
     for (auto& seg : imported_seg_list_) {
         int ret = urma_unimport_seg(seg);
@@ -254,34 +255,62 @@ int UrmaContext::deconstruct() {
 
 urma_target_seg_t* UrmaContext::seg(uint64_t addr) {
     RWSpinlock::ReadGuard guard(seg_region_lock_);
-    for (auto iter = seg_region_list_.begin(); iter != seg_region_list_.end();
-         ++iter)
-        if ((*iter).first->seg.ubva.va <= addr &&
-            addr < (*iter).first->seg.ubva.va + (*iter).second)
-            return (*iter).first;
+    for (const auto& entry : seg_region_list_) {
+        if (entry.seg->seg.ubva.va <= addr &&
+            addr < entry.seg->seg.ubva.va + entry.length) {
+            return entry.seg;
+        }
+    }
 
     LOG(ERROR) << "Address " << addr << " seg not found for " << deviceName();
-    return 0;
+    return nullptr;
 }
 
 int UrmaContext::buildLocalBufferDesc(uint64_t addr,
                                       UbTransport::BufferDesc& buffer_desc) {
-    auto str = serializeBinaryData(&seg(addr)->seg, sizeof(urma_seg_t));
-    auto index = local_tseg_list().size() - 1;
+    urma_seg_t seg_copy{};
+    uint32_t index = 0;
+    bool found = false;
+    {
+        RWSpinlock::ReadGuard guard(seg_region_lock_);
+        for (const auto& entry : seg_region_list_) {
+            if (entry.seg->seg.ubva.va <= addr &&
+                addr < entry.seg->seg.ubva.va + entry.length) {
+                seg_copy = entry.seg->seg;
+                index = entry.index;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        LOG(ERROR) << "Address " << addr << " seg not found for "
+                   << deviceName();
+        return ERR_CONTEXT;
+    }
+    auto str = serializeBinaryData(&seg_copy, sizeof(urma_seg_t));
     buffer_desc.tseg.push_back(str);
     buffer_desc.l_seg_index.push_back(index);
     return 0;
 }
 
 void* UrmaContext::localSegWithIndex(unsigned value) {
+    RWSpinlock::ReadGuard guard(seg_region_lock_);
     return local_tseg_list_.at(value);
 }
 
 int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
-    if (length > (size_t)globalConfig().max_seg_size) {
-        PLOG(WARNING) << "The buffer length exceeds device max_seg_size, "
-                      << "shrink it to " << globalConfig().max_seg_size;
-        length = (size_t)globalConfig().max_seg_size;
+    if (globalConfig().max_seg_size > 0 &&
+        length > (size_t)globalConfig().max_seg_size) {
+        // #3503: registerLocalMemory auto-chunks buffers to <= max_seg_size, so
+        // no larger buffer should reach here. Fail loudly instead of silently
+        // truncating the segment — a truncated segment advertises bytes past
+        // the registered region.
+        LOG(ERROR) << "Buffer length " << length
+                   << " exceeds device max_seg_size "
+                   << globalConfig().max_seg_size
+                   << " (should have been chunked before registration, #3503)";
+        return ERR_INVALID_ARGUMENT;
     }
     LOG(INFO) << "Register memory region " << va << " length " << length;
     urma_reg_seg_flag_t flag = {};
@@ -306,10 +335,11 @@ int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
         return ERR_CONTEXT;
     }
     LOG(INFO) << "Local seg token id : " << seg->seg.token_id;
-    local_tseg_list_.push_back(seg);
 
     RWSpinlock::WriteGuard guard(seg_region_lock_);
-    seg_region_list_.emplace_back(seg, length);
+    uint32_t index = static_cast<uint32_t>(local_tseg_list_.size());
+    local_tseg_list_.push_back(seg);
+    seg_region_list_.push_back({seg, length, index});
     return 0;
 }
 
@@ -320,12 +350,15 @@ int UrmaContext::unregisterMemoryRegion(uint64_t addr) {
         has_removed = false;
         for (auto iter = seg_region_list_.begin();
              iter != seg_region_list_.end(); ++iter) {
-            if ((*iter).first->seg.ubva.va <= addr &&
-                addr < (*iter).first->seg.ubva.va + (*iter).second) {
-                if (urma_unregister_seg((*iter).first)) {
+            if (iter->seg->seg.ubva.va <= addr &&
+                addr < iter->seg->seg.ubva.va + iter->length) {
+                if (urma_unregister_seg(iter->seg)) {
                     LOG(ERROR) << "Failed to unregister memory "
-                               << (*iter).first->seg.ubva.va;
+                               << iter->seg->seg.ubva.va;
                     return ERR_CONTEXT;
+                }
+                if (iter->index < local_tseg_list_.size()) {
+                    local_tseg_list_[iter->index] = nullptr;
                 }
                 seg_region_list_.erase(iter);
                 has_removed = true;
