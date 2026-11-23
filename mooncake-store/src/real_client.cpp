@@ -9405,6 +9405,10 @@ void RealClient::handle_ipc_shm_fd_request(UdsConnection &connection) {
 
 std::vector<Replica::Descriptor> RealClient::get_replica_desc(
     const std::string &key) {
+    if (!client_) {
+        LOG(ERROR) << "get_replica_desc: client not initialized";
+        return {};
+    }
     auto query_result = client_->Query(key);
     if (!query_result) {
         std::vector<Replica::Descriptor> replica_list = {};
@@ -9427,6 +9431,10 @@ std::vector<Replica::Descriptor> RealClient::get_replica_desc(
 
 std::map<std::string, std::vector<Replica::Descriptor>>
 RealClient::batch_get_replica_desc(const std::vector<std::string> &keys) {
+    if (!client_) {
+        LOG(ERROR) << "batch_get_replica_desc: client not initialized";
+        return {};
+    }
     auto query_results = client_->BatchQuery(keys);
     std::map<std::string, std::vector<Replica::Descriptor>> replica_map;
     if (query_results.size() != keys.size()) {

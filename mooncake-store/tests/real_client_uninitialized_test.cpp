@@ -89,6 +89,14 @@ TEST_F(RealClientUninitializedTest, BatchGetBufferReturnsNullHandles) {
     }
 }
 
+TEST_F(RealClientUninitializedTest, GetReplicaDescReturnsEmpty) {
+    EXPECT_TRUE(client_->get_replica_desc(keys_[0]).empty());
+}
+
+TEST_F(RealClientUninitializedTest, BatchGetReplicaDescReturnsEmpty) {
+    EXPECT_TRUE(client_->batch_get_replica_desc(keys_).empty());
+}
+
 TEST_F(RealClientUninitializedTest, GetIntoRangesDoesNotCrash) {
     std::vector<void *> range_buffers{data_};
     std::vector<std::vector<std::string>> all_keys{keys_};
