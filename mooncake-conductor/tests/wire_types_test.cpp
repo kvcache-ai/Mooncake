@@ -49,6 +49,58 @@ TEST(WireTypesTest, ServiceConfigRoundtrip) {
     svc.hash_profile.strategy = "vllm";
     svc.hash_profile.algorithm = "sha256";
     ExpectRoundtrip(svc);
+    svc.shared_backend_ids.emplace();
+    ExpectRoundtrip(svc);
+    svc.shared_backend_ids->insert("pool-a");
+    ExpectRoundtrip(svc);
+}
+
+// The exact ServiceConfig layout used by older RPC clients/servers.
+struct LegacyServiceConfig {
+    std::string endpoint;
+    std::string replay_endpoint;
+    common::PublisherKind publisher_kind;
+    std::string model_name;
+    std::string lora_name;
+    std::string tenant_id;
+    std::string instance_id;
+    int64_t block_size;
+    int dp_rank;
+    std::optional<int64_t> cache_group;
+    common::ResolvedHashProfile hash_profile;
+    bool operator==(const LegacyServiceConfig&) const = default;
+};
+
+TEST(WireTypesTest, SharedBackendIdsKeepLegacyRpcLayoutCompatible) {
+    LegacyServiceConfig old{.endpoint = "tcp://127.0.0.1:12345",
+                            .publisher_kind = common::PublisherKind::kSglang,
+                            .model_name = "model",
+                            .tenant_id = "default",
+                            .instance_id = "engine",
+                            .block_size = 16,
+                            .dp_rank = 0};
+    const auto decoded = struct_pack::deserialize<common::ServiceConfig>(
+        struct_pack::serialize(old));
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_FALSE(decoded->shared_backend_ids.has_value());
+    auto scoped = *decoded;
+    scoped.shared_backend_ids.emplace(common::SharedBackendIds{"pool-a"});
+    auto empty = *decoded;
+    empty.shared_backend_ids.emplace();
+    // ListServices sends a vector containing legacy, scoped and empty entries.
+    const auto list = std::vector{*decoded, scoped, empty};
+    ExpectRoundtrip(list);
+    const auto old_list =
+        struct_pack::deserialize<std::vector<LegacyServiceConfig>>(
+            struct_pack::serialize(list));
+    ASSERT_TRUE(old_list.has_value());
+    EXPECT_EQ(*old_list, (std::vector<LegacyServiceConfig>{old, old, old}));
+    const auto new_list =
+        struct_pack::deserialize<std::vector<common::ServiceConfig>>(
+            struct_pack::serialize(*old_list));
+    ASSERT_TRUE(new_list.has_value());
+    EXPECT_EQ(*new_list, (std::vector<common::ServiceConfig>{*decoded, *decoded,
+                                                             *decoded}));
 }
 
 TEST(WireTypesTest, RegisterUnregisterResultRoundtrip) {

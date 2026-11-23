@@ -140,9 +140,13 @@ class ConductorClient:
         Keys follow the Python API convention (model_name / publisher_type,
         not the HTTP /register wire names modelname / type): instance_id,
         endpoint, replay_endpoint, publisher_type, model_name, lora_name,
-        tenant_id, block_size, dp_rank, cache_group, hash_profile. Required:
+        tenant_id, block_size, dp_rank, cache_group, hash_profile,
+        shared_backend_ids. Required:
         instance_id, endpoint, model_name, block_size, hash_profile.
         tenant_id defaults to "default" when omitted or empty.
+        shared_backend_ids is an optional list of non-empty Store backend IDs
+        for an engine. Omit for legacy shared visibility, or pass [] for no
+        shared backends.
         hash_profile accepts four fields: strategy, algorithm,
         python_hash_seed, index_projection. Unknown keys or wrong types raise
         ValueError.
@@ -176,7 +180,7 @@ class ConductorClient:
 
         Service entries use the /services wire key style (Endpoint, Type,
         ModelName, LoraName, TenantID, InstanceID, BlockSize, DPRank,
-        CacheGroup, HashProfile). On error "ret" is a negative error code and
-        "services" is empty.
+        CacheGroup, HashProfile, and SharedBackendIDs when explicitly configured).
+        On error "ret" is a negative error code and "services" is empty.
         """
         return self._raw.list_services()

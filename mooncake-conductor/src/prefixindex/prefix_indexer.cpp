@@ -214,6 +214,18 @@ int64_t MatchedTokens(size_t block_count, int64_t block_size,
 
 }  // namespace
 
+bool EngineRankPolicy::HasScopedSharedOwner(
+    const common::SharedBackendIds& ids,
+    const std::set<SharedObjectOwner>& owners) {
+    if (ids.empty()) {
+        return false;
+    }
+    return std::any_of(owners.begin(), owners.end(),
+                       [&](const SharedObjectOwner& owner) {
+                           return ids.contains(owner.backend_id);
+                       });
+}
+
 RegistrationResult PrefixCacheTable::ValidateRegistration(
     const EngineRegistration& registration) {
     if (auto error = ValidateLayout(registration.context,
@@ -232,6 +244,10 @@ RegistrationResult PrefixCacheTable::ValidateRegistration(
         registration.publisher_kind != common::PublisherKind::kSglang) {
         return {.error = "engine publisher must be vLLM or SGLang"};
     }
+    if (registration.shared_backend_ids &&
+        registration.shared_backend_ids->contains("")) {
+        return {.error = "shared_backend_ids must contain non-empty strings"};
+    }
     if (auto error = ValidateHashProfile(registration.profile);
         !error.empty()) {
         return {.error = std::move(error)};
@@ -248,10 +264,12 @@ RegistrationResult PrefixCacheTable::Register(
 
     auto candidate =
         std::make_shared<ContextState>(registration.profile, block_limit_);
+    const EngineRankPolicy policy{registration.publisher_kind,
+                                  registration.shared_backend_ids};
     candidate->instance_ranks[registration.instance_id].insert(
         registration.dp_rank);
-    candidate->instance_publishers[registration.instance_id].emplace(
-        registration.dp_rank, registration.publisher_kind);
+    candidate->instance_policies[registration.instance_id].emplace(
+        registration.dp_rank, policy);
 
     std::shared_ptr<ContextState> state;
     {
@@ -269,21 +287,27 @@ RegistrationResult PrefixCacheTable::Register(
         return {.error =
                     "registration conflicts with the ContextKey hash profile"};
     }
-    auto publisher = state->instance_publishers.find(registration.instance_id);
-    if (publisher != state->instance_publishers.end()) {
-        auto rank = publisher->second.find(registration.dp_rank);
-        if (rank != publisher->second.end() &&
-            rank->second != registration.publisher_kind) {
-            return {
-                .error =
-                    "registration conflicts with the engine publisher kind"};
+    auto instance = state->instance_policies.find(registration.instance_id);
+    if (instance != state->instance_policies.end()) {
+        auto rank = instance->second.find(registration.dp_rank);
+        if (rank != instance->second.end()) {
+            if (rank->second.publisher_kind != policy.publisher_kind) {
+                return {.error =
+                            "registration conflicts with the engine "
+                            "publisher kind"};
+            }
+            if (rank->second.shared_backend_ids != policy.shared_backend_ids) {
+                return {.error =
+                            "registration conflicts with the engine "
+                            "shared_backend_ids"};
+            }
         }
     }
     const bool inserted = state->instance_ranks[registration.instance_id]
                               .insert(registration.dp_rank)
                               .second;
-    state->instance_publishers[registration.instance_id].emplace(
-        registration.dp_rank, registration.publisher_kind);
+    state->instance_policies[registration.instance_id].emplace(
+        registration.dp_rank, policy);
     return {.inserted = inserted, .error = ""};
 }
 
@@ -340,11 +364,11 @@ std::string PrefixCacheTable::Unregister(const ContextKey& context,
             state->instance_ranks.erase(instance);
         }
     }
-    auto publisher = state->instance_publishers.find(instance_id);
-    if (publisher != state->instance_publishers.end()) {
-        publisher->second.erase(dp_rank);
-        if (publisher->second.empty()) {
-            state->instance_publishers.erase(publisher);
+    auto policies = state->instance_policies.find(instance_id);
+    if (policies != state->instance_policies.end()) {
+        policies->second.erase(dp_rank);
+        if (policies->second.empty()) {
+            state->instance_policies.erase(policies);
         }
     }
 
@@ -386,15 +410,21 @@ std::string PrefixCacheTable::StoreEngine(const EngineMutation& mutation) {
         !instance->second.contains(mutation.owner.dp_rank)) {
         return "engine owner instance/rank is not registered";
     }
-    const bool vllm_local =
-        mutation.tier == StorageTier::kCpuLocal &&
-        state->instance_publishers.at(mutation.owner.instance_id)
-                .at(mutation.owner.dp_rank) == common::PublisherKind::kVllm;
+    const EngineRankPolicy* vllm_local = nullptr;
+    if (mutation.tier == StorageTier::kCpuLocal) {
+        const auto& policy =
+            state->instance_policies.at(mutation.owner.instance_id)
+                .at(mutation.owner.dp_rank);
+        if (policy.publisher_kind == common::PublisherKind::kVllm) {
+            vllm_local = &policy;
+        }
+    }
     for (ProjectedPrefix prefix : mutation.prefixes) {
         if (vllm_local) {
             auto existing = state->blocks.find(prefix);
             if (existing != state->blocks.end() &&
-                !existing->second.cpu_share_owners.empty()) {
+                vllm_local->HasAccessibleSharedOwner(
+                    existing->second.cpu_share_owners)) {
                 continue;
             }
         }
@@ -496,13 +526,16 @@ std::string PrefixCacheTable::StoreShared(const SharedMutation& mutation) {
             std::erase_if(
                 presence.cpu_local_owners, [&](const EngineOwner& owner) {
                     auto instance =
-                        state->instance_publishers.find(owner.instance_id);
-                    if (instance == state->instance_publishers.end()) {
+                        state->instance_policies.find(owner.instance_id);
+                    if (instance == state->instance_policies.end()) {
                         return false;
                     }
                     auto rank = instance->second.find(owner.dp_rank);
                     return rank != instance->second.end() &&
-                           rank->second == common::PublisherKind::kVllm;
+                           rank->second.publisher_kind ==
+                               common::PublisherKind::kVllm &&
+                           rank->second.CanAccessSharedBackend(
+                               mutation.owner.backend_id);
                 });
             std::erase_if(presence.cpu_local_refs, [&](const auto& ref) {
                 return !presence.cpu_local_owners.contains(ref.first);
@@ -674,8 +707,20 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
 
     for (const auto& [instance_id, ranks] : selected_instances) {
         CacheHitResult result;
+        // The rank set was selected before hashing, outside this lock. Never
+        // fall back to unrestricted visibility for a concurrently removed or
+        // re-registered rank; use only its current registration policy.
+        auto instance = state->instance_policies.find(instance_id);
+        if (instance == state->instance_policies.end()) {
+            continue;
+        }
 
         for (int64_t rank : ranks) {
+            auto policy_it = instance->second.find(rank);
+            if (policy_it == instance->second.end()) {
+                continue;
+            }
+            const auto& policy = policy_it->second;
             auto engine_present = [&](const std::set<EngineOwner>& owners) {
                 return std::any_of(owners.begin(), owners.end(),
                                    [&](const EngineOwner& owner) {
@@ -699,8 +744,12 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
                 return std::any_of(
                     owners.begin(), owners.end(), [&](const TierOwner& owner) {
                         const auto* engine = std::get_if<EngineOwner>(&owner);
-                        return !engine || (engine->instance_id == instance_id &&
-                                           engine->dp_rank == rank);
+                        if (engine) {
+                            return engine->instance_id == instance_id &&
+                                   engine->dp_rank == rank;
+                        }
+                        return policy.CanAccessSharedBackend(
+                            std::get<SharedObjectOwner>(owner).backend_id);
                     });
             };
             auto local_present = [&](const BlockPresence& block) {
@@ -714,7 +763,9 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
                 MatchedTokens(cursor, context.block_size, queried_tokens);
 
             auto shared_present = [&](const BlockPresence& block) {
-                return !block.cpu_share_owners.empty() || local_present(block);
+                return policy.HasAccessibleSharedOwner(
+                           block.cpu_share_owners) ||
+                       local_present(block);
             };
             advance_cursor(cursor, shared_present);
             rank_match.cpu_share =
@@ -733,8 +784,10 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
             result.cpu_share = std::max(result.cpu_share, rank_match.cpu_share);
             result.disk = std::max(result.disk, rank_match.disk);
         }
-        result.longest_match_tokens = result.disk;
-        results.emplace(instance_id, std::move(result));
+        if (!result.rank_matches.empty()) {
+            result.longest_match_tokens = result.disk;
+            results.emplace(instance_id, std::move(result));
+        }
     }
     if (!chain_error.empty()) {
         LOG(ERROR) << "Query hash computation failed: " << chain_error;

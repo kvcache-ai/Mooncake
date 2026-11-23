@@ -49,8 +49,21 @@ ignored.
 
 `instance_id` and `backend_id` have different meanings. `instance_id` is the
 scheduling target returned by the Indexer API. `backend_id` identifies the
-owner of shared cache objects in the event stream; shared-tier hits count for
-every instance registered in the same context.
+owner of shared cache objects in the event stream. By default those objects
+are visible to every instance registered in the same context. An engine rank
+can instead declare `shared_backend_ids`, the set of Store backends it can
+read. Shared CPU and disk objects count only if their event `backend_id` is
+eligible. Engine-local owners are unaffected, except that vLLM CPU-local
+announcements yield only to a reachable shared CPU owner.
+
+For example, when identical model replicas use two independent Store pools,
+start their masters with distinct `--kv_events_backend_id` values (e.g.
+`store-a` and `store-b`) and register the respective engine ranks with
+`"shared_backend_ids": ["store-a"]` or `["store-b"]`. Keep a backend ID stable
+for the same physical pool and distinct from any independent pool in the same
+context. This is a routing eligibility declaration, not a data-access control
+or a guarantee that a later restore succeeds. It is separate from `cache_group`
+(the model's KV layout).
 
 ### Hash profiles
 
@@ -144,11 +157,21 @@ Registers a KV event publisher and starts consuming its events.
 | `lora_name` | No | LoRA adapter name. Defaults to empty (base model). |
 | `tenant_id` | No | Defaults to `default`. |
 | `cache_group` | No | Integer or nil. Only `0` is supported. |
+| `shared_backend_ids` | No | Array of non-empty strings for vLLM/SGLang only. Omitted means all shared backends in the context (legacy behavior); `[]` means none. IDs are case-sensitive and treated as a set. |
 
 The service key is `instance_id|tenant_id|dp_rank`. Registering an identical
 configuration again succeeds without change. A different configuration for an
 existing key, or an endpoint already used by another service, fails with
 `invalid_registration`.
+
+Changing `shared_backend_ids` requires unregistering and registering the rank
+again; the field does not alter the owner's lifetime or the hash context.
+Unseen backend IDs simply contribute no hits. Explicit eligibility requires a
+Conductor version supporting this field; older HTTP servers reject it. New
+C++ and Python RPC clients use a distinct registration RPC for explicit
+eligibility so an older server cannot silently ignore it. The existing C,
+Go and Rust registration interfaces remain unchanged; configure scoped
+engines via static configuration, HTTP, or the updated RPC clients.
 
 Response:
 
@@ -300,6 +323,8 @@ Lists active publisher configurations, ordered by service key.
 
 Service keys use these PascalCase names, unlike the registration input.
 `HashProfile` is the resolved profile, including `root_digest`.
+`SharedBackendIDs` is returned as a sorted array only when explicitly
+configured, including `[]`; legacy entries retain the original shape.
 
 ## KV event input
 
@@ -352,8 +377,9 @@ To index a master stream:
    hash profile.
 2. Register the master's reachable endpoint with `type` = `Mooncake` and the
    same hash profile as the engines that write the keys. `instance_id` and
-   `dp_rank` identify the subscription only; shared-tier hits are reported for
-   every instance in the context.
+   `dp_rank` identify the subscription only. Use distinct event `backend_id`
+   values for independent physical Store pools and configure engine eligibility
+   with `shared_backend_ids` when their accessible pools differ.
 3. Keep `--kv_events_emit_object_key=true` (the default). Without object keys the
    master emits no `stored` or `removed` events.
 

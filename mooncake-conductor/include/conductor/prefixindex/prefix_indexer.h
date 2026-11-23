@@ -40,6 +40,30 @@ struct BlockPresence {
     }
 };
 
+struct EngineRankPolicy {
+    common::PublisherKind publisher_kind;
+    std::optional<common::SharedBackendIds> shared_backend_ids;
+
+    bool CanAccessSharedBackend(const std::string& backend_id) const {
+        return !shared_backend_ids || shared_backend_ids->contains(backend_id);
+    }
+
+    bool HasAccessibleSharedOwner(
+        const std::set<SharedObjectOwner>& owners) const {
+        // Keep unrestricted queries and vLLM CPU writes on the cheap
+        // existing owner-presence check.
+        return !shared_backend_ids
+                   ? !owners.empty()
+                   : HasScopedSharedOwner(*shared_backend_ids, owners);
+    }
+
+    bool operator==(const EngineRankPolicy&) const = default;
+
+   private:
+    static bool HasScopedSharedOwner(const common::SharedBackendIds& ids,
+                                     const std::set<SharedObjectOwner>& owners);
+};
+
 // Default maximum number of prefixes tracked for each context; the service
 // configuration (max_blocks_per_context) may override it.
 constexpr size_t kDefaultMaxBlocks = 200000;
@@ -56,8 +80,8 @@ struct ContextState {
     mutable std::shared_mutex mutex;
     const HashProfile profile;
     std::map<std::string, std::set<int64_t>> instance_ranks;
-    std::map<std::string, std::map<int64_t, common::PublisherKind>>
-        instance_publishers;
+    std::map<std::string, std::map<int64_t, EngineRankPolicy>>
+        instance_policies;
     std::unordered_map<ProjectedPrefix, BlockPresence> blocks;
 
     // Store order: newest prefix at the front, oldest at the back. Query does

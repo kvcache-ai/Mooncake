@@ -129,6 +129,10 @@ tl::expected<QueryResult, ErrorCode> ConductorClient::Query(
 
 tl::expected<RegisterResult, ErrorCode> ConductorClient::Register(
     const common::ServiceConfig& config) {
+    if (config.shared_backend_ids) {
+        return Invoke<&kvevent::ConductorService::RegisterWithSharedBackends,
+                      RegisterResult>(*impl_, config);
+    }
     return Invoke<&kvevent::ConductorService::Register, RegisterResult>(*impl_,
                                                                         config);
 }

@@ -43,6 +43,17 @@ def test_register_integer_fields(client, field, value):
         client.register({field: value})
 
 
+@pytest.mark.parametrize("value", [None, "pool-a", {}, [123], [""]])
+def test_shared_backend_ids_validation(client, value):
+    with pytest.raises(ValueError, match="shared_backend_ids"):
+        client.register({"shared_backend_ids": value})
+
+
+@pytest.mark.parametrize("value", [[], ["pool-b", "pool-a"]])
+def test_shared_backend_ids_valid_types_reach_client(client, value):
+    assert client.register({"shared_backend_ids": value}) < 0
+
+
 @pytest.mark.parametrize("profile", [None, [], "profile", 123])
 def test_hash_profile_requires_dict(client, profile):
     with pytest.raises(ValueError, match="hash_profile"):

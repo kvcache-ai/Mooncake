@@ -115,7 +115,8 @@ EngineRegistration RegistrationFor(const ServiceConfig& service) {
             .dp_rank = service.dp_rank,
             .effective_block_size = service.block_size,
             .cache_group = service.cache_group,
-            .publisher_kind = service.publisher_kind};
+            .publisher_kind = service.publisher_kind,
+            .shared_backend_ids = service.shared_backend_ids};
 }
 
 ServiceConfig VllmService(const std::string& instance_id = "instance-1",
@@ -145,6 +146,7 @@ ServiceConfig MooncakeService(const ServiceConfig& engine) {
     service.endpoint = "tcp://127.0.0.1:60999";
     service.replay_endpoint = "tcp://127.0.0.1:60998";
     service.publisher_kind = PublisherKind::kMooncake;
+    service.shared_backend_ids.reset();
     service.instance_id = "shared-pool";
     service.dp_rank = 0;
     return service;
@@ -339,6 +341,11 @@ Json::Value ServiceJson(const ServiceConfig& service) {
     profile["python_hash_seed"] = service.hash_profile.python_hash_seed;
     profile["index_projection"] = service.hash_profile.index_projection;
     value["hash_profile"] = profile;
+    if (service.shared_backend_ids) {
+        Json::Value ids(Json::arrayValue);
+        for (const auto& id : *service.shared_backend_ids) ids.append(id);
+        value["shared_backend_ids"] = std::move(ids);
+    }
     return value;
 }
 
@@ -1077,6 +1084,50 @@ TEST_F(RegistrationHttpTest, ResolvesReportsAndRetriesSeedProfile) {
     const Json::Value& context_profile = view["contexts"][0]["hash_profile"];
     EXPECT_EQ(context_profile["python_hash_seed"].asString(), "0");
     EXPECT_EQ(context_profile["root_digest"].asString(), kRootDigest);
+}
+
+TEST_F(RegistrationHttpTest, ValidatesAndReportsSharedBackendIds) {
+    const auto svc = VllmService();
+    auto valid = ServiceJson(svc);
+    auto post = [&](const Json::Value& body) {
+        return HttpPostMsgpack(port_, "/register", MsgpackDocument(body));
+    };
+    for (auto value : {Json::Value("pool-a"), Json::Value(Json::nullValue),
+                       TokenArray({123}), Json::Value(Json::objectValue)}) {
+        auto invalid = valid;
+        invalid["shared_backend_ids"] = std::move(value);
+        const auto resp = post(invalid);
+        EXPECT_EQ(resp.status, 400);
+        EXPECT_EQ(ParseMsgpackResponse(resp)["field"].asString(),
+                  "shared_backend_ids");
+    }
+    auto empty_id = valid;
+    empty_id["shared_backend_ids"].append("");
+    EXPECT_EQ(post(empty_id).status, 400);
+    auto pool = ServiceJson(MooncakeService(svc));
+    pool["shared_backend_ids"] = Json::Value(Json::arrayValue);
+    EXPECT_EQ(post(pool).status, 400);
+    EXPECT_EQ(EventManagerTestPeer::SubscriberCount(*manager_), 0u);
+
+    valid["shared_backend_ids"].append("pool-b");
+    valid["shared_backend_ids"].append("pool-a");
+    valid["shared_backend_ids"].append("pool-a");
+    ASSERT_EQ(post(valid).status, 200);
+    Json::Value canonical(Json::arrayValue);
+    canonical.append("pool-a");
+    canonical.append("pool-b");
+    valid["shared_backend_ids"] = canonical;
+    EXPECT_EQ(post(valid).status, 200);
+    const auto services = ParseMsgpackResponse(HttpGet(port_, "/services"));
+    ASSERT_EQ(services["services"].size(), 1u);
+    EXPECT_EQ(services["services"][0]["SharedBackendIDs"], canonical);
+    valid["shared_backend_ids"] = Json::Value(Json::arrayValue);
+    EXPECT_EQ(post(valid).status, 400);
+    ASSERT_EQ(Unregister(svc.instance_id, svc.dp_rank).status, 200);
+    ASSERT_EQ(post(valid).status, 200);
+    const auto scoped = ParseMsgpackResponse(HttpGet(port_, "/services"));
+    EXPECT_EQ(scoped["services"][0]["SharedBackendIDs"],
+              Json::Value(Json::arrayValue));
 }
 
 TEST_F(RegistrationHttpTest, ResolvesAndReportsPickleProfile) {
@@ -3261,6 +3312,46 @@ TEST(ParseConfig, ExplicitInstanceIdSupportsMultipleStaticRanks) {
     EXPECT_EQ(services[1].dp_rank, 1);
     EXPECT_EQ(services[0].tenant_id, "default");
     EXPECT_EQ(services[1].tenant_id, "default");
+    std::remove(path.c_str());
+}
+
+TEST(ParseConfig, SharedBackendIdsPreserveOmittedAndEmptyDistinction) {
+    ConfigEnvGuard guard;
+    const std::string path =
+        ::testing::TempDir() + "conductor_cfg_shared_backend_ids.json";
+    Json::Value config(Json::objectValue);
+    auto& instances = config["kvevent_instance"];
+    instances["legacy"] = ServiceJson(VllmService("legacy"));
+    instances["restricted"] = ServiceJson(VllmService("restricted"));
+    instances["restricted"]["shared_backend_ids"].append("pool-b");
+    instances["restricted"]["shared_backend_ids"].append("pool-a");
+    instances["none"] = ServiceJson(VllmService("none"));
+    instances["none"]["shared_backend_ids"] = Json::Value(Json::arrayValue);
+    instances["invalid"] = ServiceJson(VllmService("invalid"));
+    instances["invalid"]["shared_backend_ids"] = "pool-a";
+    instances["bad-element"] = ServiceJson(VllmService("bad-element"));
+    instances["bad-element"]["shared_backend_ids"].append("");
+    instances["pool"] = ServiceJson(MooncakeService(VllmService()));
+    instances["pool"]["shared_backend_ids"].append("pool-b");
+    {
+        std::ofstream out(path);
+        out << config;
+    }
+    guard.SetPath(path);
+    int port = 0, rpc_port = 0;
+    const auto services =
+        mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port);
+    ASSERT_EQ(services.size(), 3u);
+    EXPECT_EQ(services[0].instance_id, "legacy");
+    EXPECT_FALSE(services[0].shared_backend_ids.has_value());
+    EXPECT_EQ(services[1].instance_id, "none");
+    ASSERT_TRUE(services[1].shared_backend_ids.has_value());
+    EXPECT_TRUE(services[1].shared_backend_ids->empty());
+    EXPECT_EQ(services[2].instance_id, "restricted");
+    ASSERT_TRUE(services[2].shared_backend_ids.has_value());
+    EXPECT_EQ(
+        *services[2].shared_backend_ids,
+        (mooncake::conductor::common::SharedBackendIds{"pool-a", "pool-b"}));
     std::remove(path.c_str());
 }
 

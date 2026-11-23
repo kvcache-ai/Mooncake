@@ -393,11 +393,11 @@ TEST(Registration, TracksEveryInstanceAndRankIdempotently) {
     EXPECT_EQ(state.profile, TestProfile());
     EXPECT_EQ(state.instance_ranks.at("instance-a"), (std::set<int64_t>{0, 2}));
     EXPECT_EQ(state.instance_ranks.at("instance-b"), (std::set<int64_t>{1}));
-    EXPECT_EQ(state.instance_publishers.at("instance-a").at(0),
+    EXPECT_EQ(state.instance_policies.at("instance-a").at(0).publisher_kind,
               PublisherKind::kVllm);
-    EXPECT_EQ(state.instance_publishers.at("instance-a").at(2),
+    EXPECT_EQ(state.instance_policies.at("instance-a").at(2).publisher_kind,
               PublisherKind::kVllm);
-    EXPECT_EQ(state.instance_publishers.at("instance-b").at(1),
+    EXPECT_EQ(state.instance_policies.at("instance-b").at(1).publisher_kind,
               PublisherKind::kVllm);
     EXPECT_TRUE(state.blocks.empty());
 }
@@ -415,7 +415,7 @@ TEST(Registration, PublisherKindConflictPreservesStateAndUnregisterRemovesIt) {
     ASSERT_EQ(table.Unregister(TestContext(), "instance-a", 0), "");
     EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table)
                     .contexts.at(TestContext())
-                    .instance_publishers.empty());
+                    .instance_policies.empty());
     auto replacement =
         table.Register(Registration("instance-a", 0, PublisherKind::kSglang));
     EXPECT_TRUE(replacement.error.empty());
@@ -755,6 +755,86 @@ TEST(Query, ExactTwoInstanceSharedCacheExample) {
         (std::map<int64_t, RankCacheHitResult>{{1, RankMatch(0, 0, 48, 48)}}));
     EXPECT_EQ(second.cpu_share, 48);
     EXPECT_EQ(second.disk, 48);
+}
+
+TEST(Query, SharedBackendEligibilityAppliesPerRankAcrossTiers) {
+    PrefixCacheTable table;
+    using Ids = mooncake::conductor::common::SharedBackendIds;
+    auto reg = [&](const std::string& instance, int64_t rank,
+                   std::optional<Ids> ids) {
+        auto registration =
+            Registration(instance, rank, PublisherKind::kSglang);
+        registration.profile = SglangProfile();
+        registration.shared_backend_ids = std::move(ids);
+        return registration;
+    };
+    const auto rank_a = reg("split", 0, Ids{"backend-a"});
+    const auto rank_b = reg("split", 1, Ids{"backend-b"});
+    RegisterOrFail(table, rank_a);
+    RegisterOrFail(table, rank_b);
+    RegisterOrFail(table, reg("both", 0, Ids{"backend-a", "backend-b"}));
+    RegisterOrFail(table, reg("legacy", 0, std::nullopt));
+    RegisterOrFail(table, reg("none", 0, Ids{}));
+
+    const auto tokens = Tokens(64);
+    const auto hashes = SglangHashes(tokens);
+    ASSERT_EQ(hashes.size(), 4u);
+    const auto a = SharedOwner("object-a", "stream-a", "backend-a");
+    const auto b = SharedOwner("object-b", "stream-b", "backend-b");
+    ASSERT_EQ(table.StoreShared(
+                  Shared({hashes[0], hashes[1]}, StorageTier::kCpuShare, a)),
+              "");
+    ASSERT_EQ(table.StoreShared(Shared({hashes[2]}, StorageTier::kDisk, a)),
+              "");
+    ASSERT_EQ(table.StoreShared(Shared({hashes[2]}, StorageTier::kCpuShare, b)),
+              "");
+    ASSERT_EQ(table.StoreShared(Shared({hashes[3]}, StorageTier::kDisk, b)),
+              "");
+
+    auto hits = table.Query(TestContext(), tokens);
+    EXPECT_EQ(hits.at("split").rank_matches.at(0), RankMatch(0, 0, 32, 48));
+    // B has a suffix, but cannot restore the initial block from A.
+    EXPECT_EQ(hits.at("split").rank_matches.at(1), RankMatch(0, 0, 0, 0));
+    EXPECT_EQ(hits.at("split").longest_match_tokens, 48);
+    EXPECT_EQ(hits.at("both").rank_matches.at(0), RankMatch(0, 0, 48, 64));
+    EXPECT_EQ(hits.at("legacy").rank_matches.at(0), RankMatch(0, 0, 48, 64));
+    EXPECT_EQ(hits.at("none").rank_matches.at(0), RankMatch(0, 0, 0, 0));
+
+    // Local tiers remain reachable even if the shared allowlist is empty;
+    // local disk owners are not shared backend IDs.
+    auto local = Device({hashes[0]}, DeviceOwner("none", 0));
+    ASSERT_EQ(table.StoreEngine(local), "");
+    local.prefixes = {hashes[1]};
+    local.tier = StorageTier::kCpuLocal;
+    ASSERT_EQ(table.StoreEngine(local), "");
+    local.prefixes = {hashes[2]};
+    local.tier = StorageTier::kDisk;
+    ASSERT_EQ(table.StoreEngine(local), "");
+    hits = table.Query(TestContext(), tokens, std::nullopt, "none");
+    ASSERT_EQ(hits.size(), 1u);
+    EXPECT_EQ(hits.at("none").rank_matches.at(0), RankMatch(16, 32, 32, 48));
+
+    // Registration is idempotent, but membership is not mutable in place.
+    EXPECT_FALSE(table.Register(rank_b).inserted);
+    auto moved = rank_b;
+    moved.shared_backend_ids = Ids{"backend-a"};
+    EXPECT_FALSE(table.Register(moved).error.empty());
+    auto invalid = rank_b;
+    invalid.shared_backend_ids = Ids{""};
+    EXPECT_FALSE(table.Register(invalid).error.empty());
+    ASSERT_EQ(table.Unregister(TestContext(), "split", 1), "");
+    RegisterOrFail(table, moved);
+    hits = table.Query(TestContext(), tokens);
+    EXPECT_EQ(hits.at("split").rank_matches.at(1), RankMatch(0, 0, 32, 48));
+
+    // B's independent disk owner cannot extend the re-registered A ranks.
+    ASSERT_EQ(table.ClearShared(ClearFor(a)), "");
+    hits = table.Query(TestContext(), tokens);
+    EXPECT_EQ(hits.at("split").rank_matches.at(0), RankMatch(0, 0, 0, 0));
+    EXPECT_EQ(hits.at("split").rank_matches.at(1), RankMatch(0, 0, 0, 0));
+    EXPECT_EQ(hits.at("none").rank_matches.at(0), RankMatch(16, 32, 32, 48));
+    EXPECT_EQ(Presence(table, hashes[3]).disk_owners,
+              (std::set<mooncake::conductor::prefixindex::TierOwner>{b}));
 }
 
 TEST(Query, TrailingPartialBlockNeverReportsMoreThanPromptTokens) {
@@ -1169,6 +1249,52 @@ TEST(Mutations, VllmCpuLocalYieldsToSharedAcrossInstancesAndRanks) {
     ASSERT_EQ(table.StoreEngine(later_local), "");
     EXPECT_EQ(Presence(table, hashes[1]).cpu_local_owners,
               (std::set<EngineOwner>{a0}));
+}
+
+TEST(Mutations, VllmLocalCpuYieldsOnlyToReachableSharedBackends) {
+    PrefixCacheTable table;
+    using Ids = mooncake::conductor::common::SharedBackendIds;
+    auto rank_a = Registration("instance-a", 0);
+    rank_a.shared_backend_ids = Ids{"backend-a"};
+    auto rank_b = Registration("instance-b", 0);
+    rank_b.shared_backend_ids = Ids{"backend-b"};
+    RegisterOrFail(table, rank_a);
+    RegisterOrFail(table, rank_b);
+    const auto tokens = Tokens(32);
+    const auto hashes = Hashes(tokens);
+    ASSERT_EQ(hashes.size(), 2u);
+    auto local_a = Device({hashes[0], hashes[1]}, DeviceOwner("instance-a"));
+    local_a.tier = StorageTier::kCpuLocal;
+    auto local_b = Device({hashes[0], hashes[1]}, DeviceOwner("instance-b"));
+    local_b.tier = StorageTier::kCpuLocal;
+    const auto shared_a = Shared(hashes, StorageTier::kCpuShare);
+    const auto shared_b = Shared(hashes, StorageTier::kCpuShare,
+                                 SharedOwner("b", "b", "backend-b"));
+
+    // Local-first and shared-first paths must use the same eligibility rule.
+    ASSERT_EQ(table.StoreEngine(local_a), "");
+    ASSERT_EQ(table.StoreEngine(local_b), "");
+    ASSERT_EQ(table.StoreShared(shared_a), "");
+    ASSERT_EQ(table.StoreEngine(local_a), "");
+    ASSERT_EQ(table.StoreEngine(local_b), "");
+    auto hits = table.Query(TestContext(), tokens);
+    EXPECT_EQ(hits.at("instance-a").rank_matches.at(0),
+              RankMatch(0, 0, 32, 32));
+    EXPECT_EQ(hits.at("instance-b").rank_matches.at(0),
+              RankMatch(0, 32, 32, 32));
+    // B's two local announcements are still reference-counted.
+    ASSERT_EQ(table.RemoveEngine(local_b), "");
+    EXPECT_EQ(table.Query(TestContext(), tokens).at("instance-b").cpu_local,
+              32);
+
+    ASSERT_EQ(table.StoreShared(shared_b), "");
+    ASSERT_EQ(table.RemoveShared(shared_a), "");
+    hits = table.Query(TestContext(), tokens);
+    EXPECT_EQ(hits.at("instance-a").rank_matches.at(0), RankMatch(0, 0, 0, 0));
+    EXPECT_EQ(hits.at("instance-b").rank_matches.at(0),
+              RankMatch(0, 0, 32, 32));
+    ASSERT_EQ(table.RemoveShared(shared_b), "");
+    EXPECT_EQ(table.Query(TestContext(), tokens).at("instance-b").disk, 0);
 }
 
 TEST(Mutations, ConcurrentVllmLocalAndSharedStoresKeepSharedOnly) {

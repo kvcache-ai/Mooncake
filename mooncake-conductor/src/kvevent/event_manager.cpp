@@ -564,7 +564,7 @@ bool ParseServiceConfigRequest(const msgpack::object_map& body,
     static const std::set<std::string> kAllowedFields = {
         "block_size",      "cache_group", "dp_rank",   "endpoint",
         "hash_profile",    "instance_id", "lora_name", "modelname",
-        "replay_endpoint", "tenant_id",   "type"};
+        "replay_endpoint", "tenant_id",   "type",      "shared_backend_ids"};
     std::string publisher_type;
     if (!RejectUnknownFields(body, kAllowedFields, resp) ||
         !RequiredString(body, "endpoint", resp, &service->endpoint) ||
@@ -590,6 +590,33 @@ bool ParseServiceConfigRequest(const msgpack::object_map& body,
         return false;
     }
     service->publisher_kind = *publisher_kind;
+    if (const auto* ids = MapFind(body, "shared_backend_ids")) {
+        if (service->publisher_kind == common::PublisherKind::kMooncake) {
+            HttpValidationError(
+                resp, "invalid_registration",
+                "shared_backend_ids may only be set for an engine",
+                "shared_backend_ids");
+            return false;
+        }
+        if (ids->type != msgpack::type::ARRAY) {
+            HttpValidationError(resp, "invalid_type",
+                                "shared_backend_ids must be an array",
+                                "shared_backend_ids");
+            return false;
+        }
+        service->shared_backend_ids.emplace();
+        for (uint32_t i = 0; i < ids->via.array.size; ++i) {
+            const auto& id = ids->via.array.ptr[i];
+            if (id.type != msgpack::type::STR || ObjectStr(id).empty()) {
+                HttpValidationError(
+                    resp, "invalid_value",
+                    "shared_backend_ids elements must be non-empty strings",
+                    "shared_backend_ids", i);
+                return false;
+            }
+            service->shared_backend_ids->emplace(ObjectStr(id));
+        }
+    }
     if (service->tenant_id.empty()) {
         service->tenant_id = "default";
     }
@@ -681,7 +708,7 @@ void PackServiceConfig(MsgpackPacker& packer,
                        const common::ServiceConfig& svc) {
     // Field names are the exported struct-field names of
     // common.ServiceConfig (fixed wire contract).
-    packer.pack_map(11);
+    packer.pack_map(svc.shared_backend_ids ? 12 : 11);
     packer.pack("Endpoint");
     packer.pack(svc.endpoint);
     packer.pack("ReplayEndpoint");
@@ -708,6 +735,10 @@ void PackServiceConfig(MsgpackPacker& packer,
     }
     packer.pack("HashProfile");
     PackHashProfile(packer, svc.hash_profile);
+    if (svc.shared_backend_ids) {
+        packer.pack("SharedBackendIDs");
+        packer.pack(*svc.shared_backend_ids);
+    }
 }
 
 }  // namespace

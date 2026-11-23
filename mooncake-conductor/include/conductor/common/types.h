@@ -2,8 +2,11 @@
 
 #include <cstdint>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
+
+#include <ylt/struct_pack/compatible.hpp>
 
 namespace mooncake::conductor::common {
 
@@ -61,6 +64,8 @@ struct ResolvedHashProfile {
     }
 };
 
+using SharedBackendIds = std::set<std::string>;
+
 struct ServiceConfig {
     std::string endpoint;         // kv publisher endpoint
     std::string replay_endpoint;  // replay publisher endpoint
@@ -73,6 +78,9 @@ struct ServiceConfig {
     int dp_rank = 0;
     std::optional<int64_t> cache_group;
     ResolvedHashProfile hash_profile;
+    // Engine-only eligibility for shared Store owners in this context.
+    // Omitted retains legacy visibility; an explicit empty set allows none.
+    struct_pack::compatible<SharedBackendIds, 1> shared_backend_ids;
 
     bool operator==(const ServiceConfig&) const = default;
 };

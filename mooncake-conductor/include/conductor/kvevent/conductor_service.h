@@ -23,6 +23,10 @@ class ConductorService {
 
     tl::expected<RegisterResult, ErrorCode> Register(
         const common::ServiceConfig& config);
+    // Separate RPC name for explicit eligibility: old servers must reject a
+    // scoped registration rather than silently discard its compatible field.
+    tl::expected<RegisterResult, ErrorCode> RegisterWithSharedBackends(
+        const common::ServiceConfig& config);
     tl::expected<UnregisterResult, ErrorCode> Unregister(
         const std::string& instance_id, const std::string& tenant_id,
         int dp_rank);
