@@ -9,6 +9,7 @@
 #include <nanobind/stl/vector.h>
 #include <numa.h>
 
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -405,6 +406,104 @@ void apply_tensor_batch_results(std::vector<int> &results,
     }
     for (size_t i = 0; i < op_results.size(); ++i)
         results[original_indices[i]] = op_results[i];
+}
+
+// Probe keys for a prefix lookup, built in C++ so the caller does not create
+// one Python string per key. `hashes` holds equal-length block hashes back to
+// back; group g probes the hashes at `indices[g]`, each under every prefix of
+// `prefixes[g]`, as "<prefix><separator><lowercase hex of the hash>". Keys are
+// ordered by group, then hash index, then prefix.
+struct HashedKeyRequest {
+    std::string hashes;
+    size_t hash_len = 0;
+    std::vector<std::vector<std::string>> prefixes;
+    std::vector<std::vector<int64_t>> indices;
+    std::string separator;
+
+    // Copies the Python arguments; call with the GIL held, it may raise.
+    static HashedKeyRequest FromPython(
+        py::handle hashes, size_t hash_len,
+        std::vector<std::vector<std::string>> prefixes, py::list indices,
+        std::string separator) {
+        if (hash_len == 0) throw py::value_error("hash_len must be positive");
+        if (prefixes.size() != indices.size()) {
+            throw py::value_error(
+                "prefixes and indices need one entry per group");
+        }
+        HashedKeyRequest req;
+        // The buffer view must outlive the span read below.
+        const PythonBuffer hash_buf(hashes);
+        const auto hash_span = contiguous_buffer_span(hash_buf.view());
+        if (hash_span.size() % hash_len != 0) {
+            throw py::value_error(
+                "hashes length is not a multiple of hash_len");
+        }
+        req.hashes.assign(hash_span.data(), hash_span.size());
+        req.hash_len = hash_len;
+        const int64_t num_hashes =
+            static_cast<int64_t>(hash_span.size() / hash_len);
+        req.indices.reserve(prefixes.size());
+        for (py::handle buf : indices) {
+            const PythonBuffer index_buf(buf);
+            const Py_buffer &info = index_buf.view();
+            if (info.itemsize != sizeof(int64_t) || info.format == nullptr ||
+                (std::strcmp(info.format, "q") != 0 &&
+                 std::strcmp(info.format, "l") != 0)) {
+                throw py::value_error("indices must be int64 buffers");
+            }
+            const auto span = contiguous_buffer_span(info);
+            std::vector<int64_t> group(span.size() / sizeof(int64_t));
+            if (!group.empty()) {
+                std::memcpy(group.data(), span.data(), span.size());
+            }
+            for (const int64_t idx : group) {
+                if (idx < 0 || idx >= num_hashes) {
+                    throw py::index_error("hash index out of range");
+                }
+            }
+            req.indices.push_back(std::move(group));
+        }
+        req.prefixes = std::move(prefixes);
+        req.separator = std::move(separator);
+        return req;
+    }
+
+    std::vector<std::string> BuildKeys() const {
+        static constexpr char kHex[] = "0123456789abcdef";
+        size_t num_keys = 0;
+        for (size_t g = 0; g < indices.size(); ++g) {
+            num_keys += indices[g].size() * prefixes[g].size();
+        }
+        std::vector<std::string> keys;
+        keys.reserve(num_keys);
+        std::string hex(2 * hash_len, '\0');
+        for (size_t g = 0; g < indices.size(); ++g) {
+            for (const int64_t idx : indices[g]) {
+                const auto *h = reinterpret_cast<const unsigned char *>(
+                    hashes.data() + idx * hash_len);
+                for (size_t i = 0; i < hash_len; ++i) {
+                    hex[2 * i] = kHex[h[i] >> 4];
+                    hex[2 * i + 1] = kHex[h[i] & 0xf];
+                }
+                for (const auto &prefix : prefixes[g]) {
+                    std::string key;
+                    key.reserve(prefix.size() + separator.size() + hex.size());
+                    key.append(prefix).append(separator).append(hex);
+                    keys.push_back(std::move(key));
+                }
+            }
+        }
+        return keys;
+    }
+};
+
+// One signed byte per key: 1 exists, 0 missing, -1 error.
+inline std::string results_to_bytes(const std::vector<int> &results) {
+    std::string out(results.size(), '\0');
+    for (size_t i = 0; i < results.size(); ++i) {
+        out[i] = static_cast<char>(results[i] < 0 ? -1 : results[i]);
+    }
+    return out;
 }
 
 }  // namespace
@@ -2853,6 +2952,69 @@ NB_MODULE(_store, m) {
             "negative values on error. none grants no leases. LastHitOnly "
             "leases the last all-1 group of candidate_size results; failed "
             "candidates may retain partial leases after a concurrent eviction.")
+        .def(
+            "batch_is_exist_hashed",
+            [](MooncakeStorePyWrapper &self, py::handle hashes, size_t hash_len,
+               std::vector<std::vector<std::string>> prefixes, py::list indices,
+               const std::string &separator, const ExistOptions &options) {
+                auto req = HashedKeyRequest::FromPython(
+                    hashes, hash_len, std::move(prefixes), indices, separator);
+                // Hold our own reference: close() may reset store_ while
+                // the GIL is released.
+                const bool ready = self.is_client_initialized();
+                const std::shared_ptr<PyClient> store = self.store_;
+                std::string out;
+                {
+                    py::gil_scoped_release release;
+                    const auto keys = req.BuildKeys();
+                    if (!ready) {
+                        out.assign(keys.size(), static_cast<char>(-1));
+                    } else {
+                        out = results_to_bytes(
+                            store->batchIsExist(keys, options));
+                    }
+                }
+                return py::bytes(out.data(), out.size());
+            },
+            py::arg("hashes"), py::arg("hash_len"), py::arg("prefixes"),
+            py::arg("indices"), py::arg("separator") = "@",
+            py::arg("options") = ExistOptions{},
+            "batch_is_exist for keys \"<prefix><separator><hex(hash)>\" built "
+            "without the GIL. `hashes` is a buffer of equal-length block "
+            "hashes; group g probes the hashes at `indices[g]` (int64 "
+            "buffer) under each prefix in `prefixes[g]`. Returns bytes, one "
+            "per key in (group, index, prefix) order: 1 exists, 0 missing, "
+            "-1 error. Holds the GIL only to copy the arguments.")
+        .def(
+            "batch_probe_key_hashed",
+            [](MooncakeStorePyWrapper &self, py::handle hashes, size_t hash_len,
+               std::vector<std::vector<std::string>> prefixes, py::list indices,
+               const std::string &separator) {
+                auto req = HashedKeyRequest::FromPython(
+                    hashes, hash_len, std::move(prefixes), indices, separator);
+                GrantLeasePolicy lease_policy;
+                lease_policy.lease_mode = ProbeLeaseMode::None;
+                // Hold our own reference: close() may reset store_ while
+                // the GIL is released.
+                const bool ready = self.is_client_initialized();
+                const std::shared_ptr<PyClient> store = self.store_;
+                std::string out;
+                {
+                    py::gil_scoped_release release;
+                    const auto keys = req.BuildKeys();
+                    if (!ready) {
+                        out.assign(keys.size(), static_cast<char>(-1));
+                    } else {
+                        out = results_to_bytes(
+                            store->batchProbeKey(keys, lease_policy));
+                    }
+                }
+                return py::bytes(out.data(), out.size());
+            },
+            py::arg("hashes"), py::arg("hash_len"), py::arg("prefixes"),
+            py::arg("indices"), py::arg("separator") = "@",
+            "batch_probe_key (no lease) with keys built as in "
+            "batch_is_exist_hashed; same arguments and result bytes.")
         .def(
             "close",
             [](MooncakeStorePyWrapper &self) {
