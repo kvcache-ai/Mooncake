@@ -583,9 +583,14 @@ Status MultiTransport::submitTransfer(
     return submitTransfer(batch_id, entries, nullptr);
 }
 
+Status MultiTransport::submitAcknowledgedTcpWrite(
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    return submitTransfer(batch_id, entries, nullptr, true);
+}
+
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
-    std::vector<size_t>* task_sizes) {
+    std::vector<size_t>* task_sizes, bool require_tcp_ack) {
     if (!Transport::isValidBatchID(batch_id)) {
         return Status::InvalidArgument("Invalid batch ID");
     }
@@ -612,6 +617,26 @@ Status MultiTransport::submitTransfer(
     std::vector<Transport*> transports;
     auto select_status = selectTransports(entries, transports);
     if (!select_status.ok()) return select_status;
+
+#ifdef USE_TCP
+    TcpTransport* acknowledged = nullptr;
+    if (require_tcp_ack) {
+        acknowledged = dynamic_cast<TcpTransport*>(getTransport("tcp"));
+        if (!acknowledged)
+            return Status::NotImplemented(
+                "classic TCP transport is unavailable");
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (transports[i] != acknowledged ||
+                entries[i].opcode != TransferRequest::WRITE) {
+                return Status::InvalidArgument(
+                    "acknowledged TCP submission requires TCP WRITE entries");
+            }
+        }
+    }
+#else
+    if (require_tcp_ack)
+        return Status::NotImplemented("classic TCP transport is unavailable");
+#endif
 
     if (entries.empty()) return Status::OK();
     auto& task_list = batch_desc.task_list;
@@ -673,7 +698,13 @@ Status MultiTransport::submitTransfer(
     }
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
-        auto status = entry.first->submitTransferTask(entry.second);
+        Status status;
+#ifdef USE_TCP
+        if (acknowledged)
+            status = acknowledged->submitAcknowledgedWriteTasks(entry.second);
+        else
+#endif
+            status = entry.first->submitTransferTask(entry.second);
         for (auto* task : entry.second) {
             if ((__atomic_load_n(&task->completion_state, __ATOMIC_RELAXED) &
                  Transport::Slice::kCompletionSealBit) == 0)

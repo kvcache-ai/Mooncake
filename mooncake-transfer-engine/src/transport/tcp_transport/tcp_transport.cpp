@@ -586,12 +586,23 @@ Status TcpTransport::submitTransfer(
 
 Status TcpTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
+    return submitTasks(task_list, false);
+}
+
+Status TcpTransport::submitAcknowledgedWriteTasks(
+    const std::vector<TransferTask*>& task_list) {
+    return submitTasks(task_list, true);
+}
+
+Status TcpTransport::submitTasks(const std::vector<TransferTask*>& task_list,
+                                 bool require_ack) {
     for (size_t i = 0; i < task_list.size();) {
         auto* task = task_list[i];
         assert(task && task->request);
         const auto group_id = task->request->task_group_id;
         if (group_id == TransferRequest::kNoTaskGroup) {
-            startTransfer(prepareTransfer(task, *task->request));
+            startTransfer(prepareTransfer(task, *task->request), nullptr, false,
+                          require_ack);
             ++i;
             continue;
         }
@@ -607,7 +618,7 @@ Status TcpTransport::submitTransferTask(
                  task_list[i]->request->task_group_id == group_id &&
                  task_list[i - 1]->request + task_list[i - 1]->request_count ==
                      task_list[i]->request);
-        startTransferSequence(std::move(slices));
+        startTransferSequence(std::move(slices), require_ack);
     }
     return Status::OK();
 }
@@ -642,7 +653,8 @@ Transport::Slice* TcpTransport::prepareTransfer(
     return slice;
 }
 
-void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
+void TcpTransport::startTransferSequence(std::vector<Slice*> slices,
+                                         bool require_ack) {
     struct Sequence {
         std::mutex mutex;
         std::vector<Slice*> slices;
@@ -657,7 +669,7 @@ void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
     auto advance = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak_advance = advance;
 
-    *advance = [this, sequence, weak_advance]() {
+    *advance = [this, sequence, weak_advance, require_ack]() {
         auto advance = weak_advance.lock();
         if (!advance) return;
 
@@ -695,7 +707,7 @@ void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
             // another loop iteration rather than recursive calls. For an
             // asynchronous completion, this invocation returns and the
             // continuation becomes the next runner.
-            startTransfer(slice, std::move(continuation), true);
+            startTransfer(slice, std::move(continuation), true, require_ack);
 
             {
                 std::lock_guard<std::mutex> lock(sequence->mutex);
@@ -734,7 +746,7 @@ std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
 
 void TcpTransport::startTransfer(Slice* slice,
                                  std::function<void()> continuation,
-                                 bool reuse_connection) {
+                                 bool reuse_connection, bool require_ack) {
     auto finish = [slice, &continuation](TransferStatusEnum status) mutable {
         if (status == TransferStatusEnum::COMPLETED)
             slice->markSuccess();
@@ -778,6 +790,10 @@ void TcpTransport::startTransfer(Slice* slice,
     const ConnectionKey key{desc->tcp_data_host,
                             static_cast<uint16_t>(desc->tcp_data_port)};
     const bool use_v2 = desc->tcp_proto_version >= 2 && !forceLegacyTcpProto();
+    if (require_ack && !use_v2) {
+        finish(TransferStatusEnum::FAILED);
+        return;
+    }
     TcpWorkItem work(slice, use_v2, std::move(continuation));
 
     // Scatter task groups request reuse even when the general pool setting is

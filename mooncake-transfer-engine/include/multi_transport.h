@@ -70,6 +70,11 @@ class MultiTransport {
     // cleanup means in-flight transport work may still own transfer buffers.
     Status freeBatchID(BatchID batch_id);
 
+    // Submit classic TCP WRITEs that require a receiver ACK. A legacy
+    // peer cannot complete this operation through an unacknowledged write.
+    Status submitAcknowledgedTcpWrite(
+        BatchID batch_id, const std::vector<TransferRequest> &entries);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries);
 
@@ -132,7 +137,8 @@ class MultiTransport {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries,
-                          std::vector<size_t> *task_sizes);
+                          std::vector<size_t> *task_sizes,
+                          bool require_tcp_ack = false);
 
     Status selectTransports(const std::vector<TransferRequest> &entries,
                             std::vector<Transport *> &transports);

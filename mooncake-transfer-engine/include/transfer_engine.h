@@ -202,6 +202,11 @@ class TransferEngine {
 
     int unregisterLocalMemory(void* addr, bool update_metadata = true);
 
+    // Submit classic TCP WRITEs that require a receiver ACK. A legacy
+    // peer cannot complete this operation through an unacknowledged write.
+    Status submitAcknowledgedTcpWrite(
+        BatchID batch_id, const std::vector<TransferRequest>& entries);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries);
 

@@ -166,6 +166,9 @@ class TcpTransport : public Transport {
     Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) override;
 
+    Status submitAcknowledgedWriteTasks(
+        const std::vector<TransferTask *> &task_list);
+
     Status submitTransferTaskGroup(
         const std::vector<TransferTask *> &task_list) override;
 
@@ -200,9 +203,12 @@ class TcpTransport : public Transport {
 
     void startTransfer(Slice *slice,
                        std::function<void()> continuation = nullptr,
-                       bool reuse_connection = false);
+                       bool reuse_connection = false, bool require_ack = false);
 
-    void startTransferSequence(std::vector<Slice *> slices);
+    void startTransferSequence(std::vector<Slice *> slices,
+                               bool require_ack = false);
+    Status submitTasks(const std::vector<TransferTask *> &task_list,
+                       bool require_ack);
 
     bool validateAddress(uint64_t addr, uint64_t size) const;
 

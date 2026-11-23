@@ -2014,6 +2014,64 @@ TEST(TcpWriteVisibilityTest, GroupedScatterPreservesPartialFailureResults) {
     }
 }
 
+TEST(TcpWriteVisibilityTest, ExplicitAcknowledgedWriteWaitsForReceiverAck) {
+    ReusingWriteServer peer(/*hold_first_ack=*/true);
+    ASSERT_TRUE(peer.ok());
+    EngineHandle h;
+    h.init("P2PHANDSHAKE", "127.0.0.2:17991", kSmallLength);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, peer.port());
+    const auto batch = h.engine->allocateBatchID(1);
+    const std::vector<TransferRequest> requests{
+        makeWriteRequest(h, kSmallLength)};
+    ASSERT_TRUE(h.engine->submitAcknowledgedTcpWrite(batch, requests).ok());
+    EXPECT_TRUE(peer.waitForFirstRequest(std::chrono::seconds(5)));
+    TransferStatus status;
+    ASSERT_TRUE(h.engine->getTransferStatus(batch, 0, status).ok());
+    EXPECT_NE(status.s, TransferStatusEnum::COMPLETED);
+    peer.releaseFirstAck();
+    EXPECT_TRUE(waitForTaskTerminal(h.engine.get(), batch,
+                                    std::chrono::seconds(5), &status.s));
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    const auto freed = h.engine->freeBatchID(batch);
+    EXPECT_TRUE(freed.ok() || freed.IsBatchCleanupDeferred());
+}
+
+TEST(TcpWriteVisibilityTest, ExplicitAcknowledgedWriteRejectsLegacyFraming) {
+    ScopedEnvVar legacy("MC_TCP_PROTO", "1");
+    EngineHandle h;
+    h.init("P2PHANDSHAKE", "127.0.0.2:17992", 2 * kSmallLength);
+    ASSERT_TRUE(h.ok);
+    auto* source = static_cast<char*>(h.pool) + kSmallLength;
+    memset(source, 0x4b, kSmallLength);
+    auto request = makeWriteRequest(h, kSmallLength);
+    request.source = source;
+    const std::vector<TransferRequest> requests{request};
+    const auto batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(h.engine->submitAcknowledgedTcpWrite(batch, requests).ok());
+    TransferStatusEnum status;
+    ASSERT_TRUE(waitForTaskTerminal(h.engine.get(), batch,
+                                    std::chrono::seconds(5), &status));
+    EXPECT_EQ(status, TransferStatusEnum::FAILED);
+    EXPECT_EQ(static_cast<char*>(h.pool)[0], 0);
+    const auto freed = h.engine->freeBatchID(batch);
+    EXPECT_TRUE(freed.ok() || freed.IsBatchCleanupDeferred());
+    EXPECT_EQ(runOne(h.engine.get(), request), TransferStatusEnum::COMPLETED);
+}
+
+TEST(TcpWriteVisibilityTest,
+     ExplicitAcknowledgedWriteRejectsReadBeforeDispatch) {
+    EngineHandle h;
+    h.init("P2PHANDSHAKE", "127.0.0.2:17993", kSmallLength);
+    ASSERT_TRUE(h.ok);
+    const auto batch = h.engine->allocateBatchID(1);
+    const std::vector<TransferRequest> requests{
+        makeReadRequest(h, h.pool, kSmallLength)};
+    EXPECT_FALSE(h.engine->submitAcknowledgedTcpWrite(batch, requests).ok());
+    EXPECT_TRUE(Transport::toBatchDesc(batch).task_list.empty());
+    EXPECT_TRUE(h.engine->freeBatchID(batch).ok());
+}
+
 // Mixed-version quadrant: a pooled legacy (v1) initiator against the current
 // server still transfers data correctly over repeated exchanges on one fixed
 // lane (with the old weaker WRITE completion semantics).

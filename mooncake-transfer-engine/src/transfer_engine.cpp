@@ -220,6 +220,13 @@ int TransferEngine::freeSharedMemory(void* addr) {
     return impl_->freeSharedMemory(addr);
 }
 
+Status TransferEngine::submitAcknowledgedTcpWrite(
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    if (hasProducerEvent(entries))
+        return Status::NotImplemented("producer_event requires TENT");
+    return impl_->submitAcknowledgedTcpWrite(batch_id, entries);
+}
+
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
     if (hasProducerEvent(entries))
@@ -982,6 +989,16 @@ Status TransferEngine::freeBatchID(BatchID batch_id) {
     } else {
         return impl_->freeBatchID(batch_id);
     }
+}
+
+Status TransferEngine::submitAcknowledgedTcpWrite(
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    if (use_tent_)
+        return Status::NotImplemented(
+            "acknowledged TCP WRITE requires classic TE");
+    if (hasProducerEvent(entries))
+        return Status::NotImplemented("producer_event requires TENT");
+    return impl_->submitAcknowledgedTcpWrite(batch_id, entries);
 }
 
 Status TransferEngine::submitTransfer(
