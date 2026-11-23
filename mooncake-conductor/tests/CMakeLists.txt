@@ -49,3 +49,10 @@ if(TARGET mooncake_conductor_client)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/repeat_client_lifecycle.cmake)
   set_tests_properties(conductor_c_lifecycle_test PROPERTIES TIMEOUT 30)
 endif()
+
+option(CONDUCTOR_BUILD_QUERY_BENCHMARK "Build the prefix-query microbenchmark"
+       OFF)
+if(CONDUCTOR_BUILD_QUERY_BENCHMARK)
+  add_executable(conductor_query_benchmark query_benchmark.cpp)
+  target_link_libraries(conductor_query_benchmark PRIVATE conductor_cpp_core)
+endif()
