@@ -196,10 +196,15 @@ then waits for the next slot. `--saturate` drops the pacing and lets each
 connection send as soon as the previous reply arrives, which measures the
 capacity of a given concurrency.
 
+The recorded requests may include methods that modify the Master, so the tool
+requires either `--allow-route` for each route to replay or `--allow-all` for
+every route. Point it only at a disposable Master.
+
 ```bash
 ./build/mooncake-store/tools/traffic/traffic_load \
   --dir /var/log/mooncake/traffic/session-1234567890-1234 \
-  --target 127.0.0.1:50051 --rate 5000 --connections 8 --duration 30
+  --target 127.0.0.1:50051 --rate 5000 --connections 8 --duration 30 \
+  --allow-all
 ```
 
 The report is a JSON object with `achieved_rps`, `offered_rps`, and percentiles

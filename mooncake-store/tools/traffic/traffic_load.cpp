@@ -270,6 +270,7 @@ struct Options {
     int timeout_ms = 1000;
     bool saturate = false;
     bool allow_incomplete = false;
+    bool allow_all = false;
     std::vector<std::uint32_t> routes;
 };
 
@@ -278,7 +279,8 @@ void PrintUsage() {
         "usage: traffic_load --dir <session-dir> --target host:port\n"
         "                    (--rate N | --saturate)\n"
         "                    [--connections N] [--duration S] [--warmup S]\n"
-        "                    [--timeout-ms N] [--allow-route key ...]\n"
+        "                    [--timeout-ms N]\n"
+        "                    (--allow-route key ... | --allow-all)\n"
         "                    [--allow-incomplete]\n"
         "\n"
         "Replays the recorded requests at a fixed aggregate rate. Every\n"
@@ -304,6 +306,10 @@ void PrintUsage() {
         "run is paced. The report is a JSON object on stdout and the exit code "
         "is\n"
         "nonzero when the connection failed or the server returned an error.\n"
+        "\n"
+        "Recorded requests include methods that modify the Master. Pass\n"
+        "--allow-route for each route to replay, or --allow-all to replay every\n"
+        "route; point the tool only at a disposable Master.\n"
         "\n"
         "A session without a footer is rejected unless --allow-incomplete is\n"
         "given: its last records may be missing, which makes it a poor\n"
@@ -401,6 +407,8 @@ bool ParseOptions(int argc, char** argv, Options* options) {
                 return false;
             }
             options->routes.push_back(static_cast<std::uint32_t>(key));
+        } else if (arg == "--allow-all") {
+            options->allow_all = true;
         } else if (arg == "--saturate") {
             options->saturate = true;
         } else if (arg == "--allow-incomplete") {
@@ -415,6 +423,17 @@ bool ParseOptions(int argc, char** argv, Options* options) {
     }
     if (options->dir.empty() || options->target.empty()) {
         std::fprintf(stderr, "--dir and --target are required\n");
+        return false;
+    }
+    if (options->allow_all && !options->routes.empty()) {
+        std::fprintf(stderr,
+                     "--allow-all and --allow-route are mutually exclusive\n");
+        return false;
+    }
+    if (!options->allow_all && options->routes.empty()) {
+        std::fprintf(stderr,
+                     "--allow-route or --allow-all is required; recorded "
+                     "requests may modify the target\n");
         return false;
     }
     if (!options->saturate && options->rate <= 0) {
@@ -479,7 +498,7 @@ int main(int argc, char** argv) {
             if (next == SessionReader::NextResult::kDone) {
                 break;
             }
-            if (!options.routes.empty() &&
+            if (!options.allow_all &&
                 std::find(options.routes.begin(), options.routes.end(),
                           record.header.route_key) == options.routes.end()) {
                 record = Record{};
