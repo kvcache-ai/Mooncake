@@ -79,6 +79,43 @@ class EfaTransport : public Transport {
     buildLocalNicMap(const TopologyMatrix& matrix,
                      const std::vector<std::string>& device_names);
 
+    // Which NICs each chunk of a buffer is registered on, as indices into the
+    // opened EFA devices. A device buffer keeps its local NICs however many
+    // chunks it has; partitioning every NIC by index left most of a split GPU
+    // buffer reachable only through the other socket's NICs. `local_nics` is
+    // null for host memory and MC_EFA_NIC_SELECTION=all; `full_coverage` means
+    // the whole buffer fits one NIC's PTE budget. Exposed for testing.
+    enum class NicPlanKind {
+        kSingleLocal,
+        kSingleAll,
+        kLocalCoverage,   // every chunk on every local NIC
+        kLocalPartition,  // local NICs divided among the chunks
+        kFullCoverage,
+        kPartition,  // every NIC divided among the chunks
+        kRoundRobin,
+    };
+    struct NicPlan {
+        NicPlanKind kind;
+        std::vector<std::vector<size_t>> assignments;
+    };
+    static NicPlan planChunkNics(size_t num_chunks, size_t num_nics,
+                                 const std::vector<size_t>* local_nics,
+                                 bool full_coverage);
+
+    // Writes to `indexed` a copy of `topology` that lists only `device_names`
+    // (the EFA devices the transport opened), numbered in the topology's own
+    // order. A topology index selects both the NIC in context_list_ and the
+    // buffer key in lkey/rkey, which hold one entry per opened device, so a
+    // topology that also lists other HCAs -- the two non-EFA InfiniBand HCAs
+    // on p6-b300, or an EFA device that failed to open -- shifts every
+    // selection to another NIC. Topology::disableDevice() cannot close the
+    // gap, because it keeps indices stable for the RDMA transport.
+    //
+    // Exposed for testing.
+    static int indexTopologyOverDevices(
+        const Topology& topology, const std::vector<std::string>& device_names,
+        Topology& indexed);
+
     // Eagerly populate the address vector with every (local_ctx, peer_nic)
     // handshake for `segment_name`.
     //

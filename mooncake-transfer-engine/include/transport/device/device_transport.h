@@ -45,6 +45,27 @@ namespace device {
 // Manages intra-node GPU P2P IPC handles and the device-visible peer pointer
 // table used by the EP kernel.
 // ---------------------------------------------------------------------------
+// One imported peer allocation. Stop GPU accesses before destroying it.
+// Destruction selects the import device and restores the caller's device.
+class P2pMapping {
+   public:
+    virtual ~P2pMapping() = default;
+    virtual void* address() const = 0;
+};
+
+// Export caller-owned memory on the current device.
+// For FABRIC VMM, ptr must be the allocation base. bytes must be a multiple of
+// the minimum allocation granularity and must not exceed the allocation size.
+// The caller must keep the allocation alive until all peers release their
+// mappings.
+// Returns type-tagged metadata, or an empty vector if export is unavailable.
+std::vector<int32_t> exportP2pMemory(void* ptr, size_t bytes);
+
+// Import metadata from exportP2pMemory() on the current device.
+// Returns nullptr for invalid or inaccessible peer memory.
+std::unique_ptr<P2pMapping> importP2pMemory(
+    const std::vector<int32_t>& metadata);
+
 class P2pTransport {
    public:
     virtual ~P2pTransport() = default;

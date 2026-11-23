@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import repeat
 from math import prod
 from types import MappingProxyType
 from typing import (
@@ -331,26 +332,40 @@ class TransferRegion(Generic[_SourceFragmentT, _TargetFragmentT]):
         if not self.outer_loop_counts:
             yield self.source_base_offset, self.target_base_offset, self.inner_bytes
             return
-        indices = [0] * len(self.outer_loop_counts)
-        while True:
-            yield (
-                self.source_base_offset
-                + sum(
-                    index * stride
-                    for index, stride in _strict_zip(indices, self.source_strides)
+        if (
+            len(self.outer_loop_counts) == 1
+            and self.source_strides[0] > 0
+            and self.target_strides[0] > 0
+        ):
+            count = self.outer_loop_counts[0]
+            yield from zip(
+                range(
+                    self.source_base_offset,
+                    self.source_base_offset + count * self.source_strides[0],
+                    self.source_strides[0],
                 ),
-                self.target_base_offset
-                + sum(
-                    index * stride
-                    for index, stride in _strict_zip(indices, self.target_strides)
+                range(
+                    self.target_base_offset,
+                    self.target_base_offset + count * self.target_strides[0],
+                    self.target_strides[0],
                 ),
-                self.inner_bytes,
+                repeat(self.inner_bytes, count),
             )
+            return
+        indices = [0] * len(self.outer_loop_counts)
+        source_offset = self.source_base_offset
+        target_offset = self.target_base_offset
+        while True:
+            yield source_offset, target_offset, self.inner_bytes
             for dim in range(len(indices) - 1, -1, -1):
                 indices[dim] += 1
+                source_offset += self.source_strides[dim]
+                target_offset += self.target_strides[dim]
                 if indices[dim] < self.outer_loop_counts[dim]:
                     break
                 indices[dim] = 0
+                source_offset -= self.outer_loop_counts[dim] * self.source_strides[dim]
+                target_offset -= self.outer_loop_counts[dim] * self.target_strides[dim]
             else:
                 return
 
@@ -698,15 +713,17 @@ def _index_executors_by_fragment(
     executors: Sequence[Union[ExecutorTransferPlan, PlacementExecutorPlan]],
 ) -> tuple[
     dict[ExecutorProjectionKey, list[int]],
-    dict[FragmentProjectionKey, list[ExecutorProjectionKey]],
+    dict[FragmentProjectionKey, list[list[int]]],
 ]:
     indices_by_executor: dict[ExecutorProjectionKey, list[int]] = {}
-    executors_by_fragment: dict[FragmentProjectionKey, list[ExecutorProjectionKey]] = {}
+    executors_by_fragment: dict[FragmentProjectionKey, list[list[int]]] = {}
     for executor in executors:
         executor_key = _executor_projection_key(executor)
         if executor_key in indices_by_executor:
             raise ValueError("transfer plan has duplicate executor projection key")
-        indices_by_executor[executor_key] = []
+        # Share the accumulator so each operation avoids hashing the full key.
+        executor_indices: list[int] = []
+        indices_by_executor[executor_key] = executor_indices
         fragment_ids: Sequence[str]
         fragment_kind: str
         if isinstance(executor, PlacementExecutorPlan):
@@ -717,7 +734,7 @@ def _index_executors_by_fragment(
             fragment_kind = "runtime"
         for fragment_id in fragment_ids:
             executors_by_fragment.setdefault((fragment_kind, fragment_id), []).append(
-                executor_key
+                executor_indices
             )
     return indices_by_executor, executors_by_fragment
 
@@ -732,12 +749,12 @@ def _build_operation_views(
     for index, operation in enumerate(operations):
         source_key = _fragment_projection_key(operation.source)
         if source_key is not None:
-            for executor_key in source_by_fragment.get(source_key, ()):
-                source_indices[executor_key].append(index)
+            for executor_indices in source_by_fragment.get(source_key, ()):
+                executor_indices.append(index)
         target_key = _fragment_projection_key(operation.target)
         if target_key is not None:
-            for executor_key in target_by_fragment.get(target_key, ()):
-                target_indices[executor_key].append(index)
+            for executor_indices in target_by_fragment.get(target_key, ()):
+                executor_indices.append(index)
     return _OperationViews(
         source_indices=MappingProxyType(
             {key: tuple(indices) for key, indices in source_indices.items()}

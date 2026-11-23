@@ -39,17 +39,25 @@ For TCP-only testing, use this configuration:
 ```
 
 For two hosts, set `rpc_server_hostname` to an address reachable from the peer.
-The transport is enabled by default in an MLU build. It handles only local
-MLU-to-host and host-to-MLU copies. The existing ProxyManager chains those copies
-with a host-to-host network transfer:
+The MLU transport is enabled by default in an MLU build and handles local
+MLU-to-host and host-to-MLU copies. When both buffers register on RDMA, TENT
+exports MLU device memory as DMA-BUF and registers it with
+`ibv_reg_dmabuf_mr`. The NIC can then read or write the device buffer directly,
+without host staging. This requires Neuware DMA-BUF export and a compatible
+RNIC/verbs implementation. TENT closes the CNDrv-exported fd after MR
+registration; the MR retains its own reference.
+
+If either device buffer cannot register on RDMA, or a host-only transport is
+selected, ProxyManager chains local device copies with a host-to-host network
+transfer:
 
 ```text
 MLU A -> host stage A -> TCP -> host stage B -> MLU B
 ```
 
 A host-memory endpoint omits its device stage. Both READ and WRITE are supported.
-A peer transfer uses a network transport hint such as `TCP`; `MLU` is only a
-local-copy hint. For separate allocation and registration calls, use fresh
+A peer transfer uses a network transport hint such as `RDMA` or `TCP`; `MLU` is
+only a local-copy hint. For separate allocation and registration calls, use fresh
 `MemoryOptions` or reset `type = UNSPEC` before automatic registration: allocation
 may fill in the transport type. Explicit MLU-only device registration is also
 supported, since the network stage registers its own host buffers.
@@ -85,17 +93,22 @@ its completion cannot be tracked, it remains pending until the queue drains.
 Drain failures are reported and resources are retained for retry. External pinned
 allocations remain owned by the caller.
 
-There is no MLU peer-to-peer, MLU IPC, or direct device RDMA. An invalid allocation
-range, missing local copy transport, or missing staging location fails instead
-of submitting device pointers to the host network path.
+There is no MLU peer-to-peer or MLU IPC. Direct device RDMA is offered only when
+both endpoints advertise successful RDMA registration; otherwise the host
+staging route is used. An invalid allocation range, missing local copy
+transport, or missing staging location fails instead of submitting unregistered
+device pointers to the network path.
 
 The tests cover real SDK allocations, fresh worker threads, interior pointers,
 out-of-bounds rejection, transport routing, and READ/WRITE payload equality.
 Transport tests hold real device queues to check pending status and resource
 lifetimes, and inject notifier-record failure after a copy is submitted.
-The engine suite covers TCP/HP TCP, legacy/policy selection, and runtime queues.
+The engine suite covers TCP/HP TCP, legacy/policy selection, runtime queues,
+and opt-in hardware RDMA checks. Set `MC_TENT_MLU_REQUIRE_DMABUF_RDMA=1` on a
+host expected to support direct RDMA so missing DMA-BUF or RNIC support fails
+instead of skipping those checks.
 The process suite starts a second executable with independent allocations and
 passes payloads through loopback TCP/HP TCP; test pipes carry only commands
 and metadata.
 Run it on each supported SDK/device combination. Single-host success does not
-establish multi-host bandwidth or RDMA support.
+establish multi-host bandwidth or reachability.
