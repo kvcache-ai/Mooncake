@@ -8832,8 +8832,9 @@ MasterService::SubmitReplicaActionProposalLocked(
         proposal.object_size_bytes != metadata.TotalLength()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (metadata.DynamicReplicationRecreateBlocked(
-            std::chrono::steady_clock::now())) {
+    const auto recreate_now = std::chrono::steady_clock::now();
+    metadata.ReclaimExpiredDynamicReplicaState(recreate_now);
+    if (metadata.DynamicReplicationRecreateBlocked(recreate_now)) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
