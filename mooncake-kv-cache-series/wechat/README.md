@@ -8,10 +8,10 @@
 
 | 篇次 | 文章 | 对应源码解析版 |
 |---|---|---|
-| 1 | [Mooncake 如何让多台机器共享 KV Cache？](01-shared-kv-cache.md) | [篇0：架构总览](../00-architecture-overview.md) |
-| 2 | [对象、副本、Segment、Slice：Mooncake 的数据到底怎么放？](02-objects-and-replicas.md) | [篇4：核心数据结构](../04-core-data-structures.md) |
-| 3 | [数据写完了，为什么 Mooncake 还不能让别人读？](03-put-visibility.md) | [篇2：Put 路径](../02-put-path.md) |
-| 4 | [读回了字节，不代表 Get 成功：理解 Mooncake 的读取保护](04-get-and-lease.md) | [篇3：Get 路径](../03-get-path.md) |
+| 1 | [两台推理实例，怎么复用同一段 KV Cache？](01-shared-kv-cache.md) | [篇0：架构总览](../00-architecture-overview.md) |
+| 2 | [一个 KV Cache 对象，在 Mooncake 里到底怎么放？](02-objects-and-replicas.md) | [篇4：核心数据结构](../04-core-data-structures.md) |
+| 3 | [字节已经写完，为什么另一个 Client 还读不到？](03-put-visibility.md) | [篇2：Put 路径](../02-put-path.md) |
+| 4 | [字节读回来了，这次 Get 为什么还可能失败？](04-get-and-lease.md) | [篇3：Get 路径](../03-get-path.md) |
 | 5 | [读 Mooncake 源码，从哪里开始才不容易迷路？](05-source-reading.md) | [篇1：源码导航](../01-source-navigation.md) |
 | 6 | [Transfer Engine 返回成功，数据就传完了吗？](06-transfer-lifecycle.md) | [篇5：TE 生命周期](../05-transfer-engine-task-lifecycle.md) |
 | 7 | [一次 RDMA 传输，究竟经历了什么？](07-rdma-data-path.md) | [篇6：RDMA 数据路径](../06-rdma-data-path.md) |
@@ -31,13 +31,13 @@
 
 ## 配图使用
 
-11 篇文章共含 16 个 Mermaid 配图源稿，均放在相应正文的位置。需在支持 Mermaid 的阅读器中渲染；公众号编辑器不能直接使用 Mermaid 代码块。
+11 篇文章共含 17 个 Mermaid 配图源稿，均放在相应正文的位置。需在支持 Mermaid 的阅读器中渲染；公众号编辑器不能直接使用 Mermaid 代码块。
 
 发布前将图导出为清晰的 PNG，上传到公众号素材库后插入对应位置。优先纵向布局，时序图控制参与方数量，统一字体、白色背景与角色配色。缩放到手机正文宽度后检查文字是否无需放大就能阅读。
 
 “配图”说明用于标识插图位置；发布时用导出的图片替换代码块，并保留有解释作用的图注。原理图不表达未经验证的性能倍数。
 
-当前提交内容为 Markdown 和图示源稿，未包含 PNG、HTML 或公众号素材库资源，也未向公众号发布。
+第 1–4 篇已由 `build_publish.py` 生成 `publish/` 目录下的发布稿 Markdown、内联 CSS HTML 与 PNG；第 5–11 篇仍为源稿，尚未生成对应产物。本轮未向公众号发布，未做微信编辑器粘贴预览，也未上传公众号素材库。
 
 ## 版本与证据边界
 

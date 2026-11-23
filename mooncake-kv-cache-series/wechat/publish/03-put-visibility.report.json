@@ -1,0 +1,22 @@
+{
+  "source": "/builder_img/z0/yangxingxiang/github/yangxx_github/Mooncake/mooncake-kv-cache-series/wechat/publish/03-put-visibility.html-src.md",
+  "output": "/builder_img/z0/yangxingxiang/github/yangxx_github/Mooncake/mooncake-kv-cache-series/wechat/publish/03-put-visibility.html",
+  "title": "第3篇｜字节已经写完，为什么另一个 Client 还读不到？",
+  "params": {
+    "accent": "#1677FF",
+    "font_size": 16,
+    "line_height": 1.8,
+    "code_bg": "#F4F6F8"
+  },
+  "stats": {
+    "headings": 8,
+    "paragraphs": 38,
+    "list_items": 20,
+    "code_blocks": 0,
+    "tables": 1,
+    "images": 1,
+    "words": 1755,
+    "read_minutes": 4
+  },
+  "warnings": []
+}

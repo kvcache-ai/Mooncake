@@ -1,0 +1,22 @@
+{
+  "source": "/builder_img/z0/yangxingxiang/github/yangxx_github/Mooncake/mooncake-kv-cache-series/wechat/publish/02-objects-and-replicas.html-src.md",
+  "output": "/builder_img/z0/yangxingxiang/github/yangxx_github/Mooncake/mooncake-kv-cache-series/wechat/publish/02-objects-and-replicas.html",
+  "title": "第2篇｜一个 KV Cache 对象，在 Mooncake 里到底怎么放？",
+  "params": {
+    "accent": "#1677FF",
+    "font_size": 16,
+    "line_height": 1.8,
+    "code_bg": "#F4F6F8"
+  },
+  "stats": {
+    "headings": 5,
+    "paragraphs": 28,
+    "list_items": 11,
+    "code_blocks": 0,
+    "tables": 0,
+    "images": 2,
+    "words": 1389,
+    "read_minutes": 3
+  },
+  "warnings": []
+}

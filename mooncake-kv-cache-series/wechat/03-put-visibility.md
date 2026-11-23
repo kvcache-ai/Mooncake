@@ -1,82 +1,145 @@
-# 第3篇｜数据写完了，为什么 Mooncake 还不能让别人读？
+# 第3篇｜字节已经写完，为什么另一个 Client 还读不到？
 
-**摘要：**一次 Put 至少有两个重要时刻：数据传输完成，以及副本变得可见。它们为什么不能合并？
+**摘要：**A 的字节已经写完，B 仍可能查不到可读副本。数据搬完与副本提交，为什么是两个时刻？
 
-假设你正在向远端写入一个大对象。
+实例 A 正在把前缀 KV 写入共享缓存，key 是 `K`。
 
-前半部分已经到达，后半部分还在传输。此时另一个 Client 查询相同的 key，应该读到什么？
+数据已经开始通过网络搬运，另一台机器上的实例 B 恰好查询同一个 key。此时 B 应该读到什么？
 
-如果系统只看“空间已经分配”，就可能把一份尚未写完的数据交出去。
+如果系统只看"空间已经分配"，就可能把一份尚未写完的数据交出去。如果只看"字节已经到达"，又可能忽略提交这一步。
 
-Mooncake 的写入流程需要解决的，首先就是这个可见性问题。
+本篇讨论**普通新对象 Put**，不混入覆盖写。沿着 `Client::Put` 走一遍，看清数据搬完、副本提交、读方可见这三个时刻为什么不能合并。
 
 ## 先申请，再搬运，最后提交
 
-默认的新对象写入路径可以分成三个动作：
+一次 Put 可以拆成三个动作：
 
-1. `PutStart`：申请副本空间。
+1. `PutStart`：向 Master 申请副本空间。
 2. 数据传输：把字节写入目标地址。
-3. `PutEnd`：提交写入结果。
+3. `PutEnd`：提交写入结果，让副本变得可读。
 
-在申请成功后，副本处于处理中。它已经有地址，但不能据此作为可读副本交给普通 Get。
+`PutStart` 返回的不是"稍后告诉你"，而是**已经分配好的副本描述**：地址、长度、传输端点。此时副本已经进入 Master 的元数据表，但状态是 `PROCESSING`。
 
-传输完成后，客户端调用 `PutEnd`。Master 接受提交，副本才进入完成状态。
+接下来，A 通过 Transfer Engine 把切片写到目标副本。传输返回成功，只说明字节到了远端内存段，**不说明这份副本可以被读**。
 
-**网络操作完成，解决“数据是否搬完”；元数据提交，解决“读方能否使用”。**
+真正打开可见性的是 `PutEnd`。Master 把目标副本从 `PROCESSING` 翻成 `COMPLETE`，`Client::Put` 才返回成功。
 
-*配图1：Put 的两个完成点。*
+*配图1：A 写入、B 两次查询的时序。*
 
 ```mermaid
 sequenceDiagram
-    participant C as 写入 Client
+    participant A as 实例 A（写入 Client）
     participant M as Master
-    participant S as 存储节点
-    C->>M: PutStart：申请空间
-    M-->>C: 返回位置，副本处理中
-    C->>S: 写入对象数据
-    S-->>C: 数据传输完成
-    Note over C,M: 此时仍需提交
-    C->>M: PutEnd
-    M-->>C: 提交成功，副本可读
+    participant B as 实例 B（读取 Client）
+    participant R1 as R1（目标副本端）
+    A->>M: PutStart(K)
+    M-->>A: 分配 R1，状态 PROCESSING
+    A->>R1: TE 写入数据
+    R1-->>A: 数据传输完成
+    B->>M: 第一次 Get(K)
+    M-->>B: REPLICA_IS_NOT_READY
+    Note over M: R1 仍是 PROCESSING，不算可读副本
+    A->>M: PutEnd(K)
+    M-->>A: 接受提交，R1 变为 COMPLETE
+    B->>M: 第二次 Get(K)
+    M-->>B: 返回 R1 描述符
 ```
 
-*图注：图示只区分“数据搬完”与“元数据提交”两个时刻；副本数量与失败策略取决于配置。*
+*图注：这是普通成功路径。数据流只发生在 A 与 R1 之间；指向 Master 的箭头只表示申请、查询或提交。B 第二次拿到的是读取候选，后续读取仍可能失败。*
 
-## 为什么失败后还需要撤销？
+## 可读副本是过滤出来的
 
-空间申请成功，后续传输仍可能失败。
+B 第一次查询时，对象其实已经存在——`PutStart` 就把它插进了元数据表。但 Master 返回的不是"对象不存在"，而是 `REPLICA_IS_NOT_READY`。
 
-客户端可能遇到连接异常、资源不足，或者部分副本写入失败。系统不能把所有申请过的位置都标记为成功。
+原因在 `GetReplicaList`：它遍历副本，只把通过 `IsReplicaReadable` 的副本放进返回列表。
 
-失败处理需要结合当前副本策略，决定哪些副本可以提交，哪些未完成副本需要撤销。
+`IsReplicaReadable` 要求三件事：
 
-这意味着“Put 成功”的强度依赖配置。讨论它时，应说清楚副本数量和失败策略，而不是笼统地理解为“所有期望副本都在”。
+- 副本状态是 `COMPLETE`；
+- 内存或 NoF 句柄仍然有效；
+- 传输端点没有被标记为失效。
 
-这里的分阶段写入，也不应直接等同于数据库的两阶段提交协议。流程相似，不代表具备完全相同的事务保证。
+`PROCESSING` 在第一步就被排除。所以"对象查得到"和"副本读得到"是两件事。
 
-## 客户端突然崩溃，谁来收尾？
+如果整个副本列表为空，Master 还会再分一次：
 
-更麻烦的情况是：Client 完成了 `PutStart`，却在提交或撤销之前崩溃。
+- 所有副本都是 `REMOVED`：返回 `OBJECT_NOT_FOUND`，让调用方放弃；
+- 仍有未完成或不可用副本：返回 `REPLICA_IS_NOT_READY`，值得短暂重试。
 
-此时留下的是未完成对象。它占着资源，也可能阻挡后续同 key 写入。
+**分析：**这两个错误码的区别，直接决定上层该不该重试。把 `REPLICA_IS_NOT_READY` 当成对象不存在而放弃，会错过马上就能读到的数据。
 
-Master 需要依靠超时与清理机制，让这些对象不至于永久占用空间。超时顶替与实际回收还可能发生在不同时间，不能认为客户端消失后，资源就立刻恢复可用。
+## 失败时，提交与撤销如何分工
 
-还有另一种不确定性：Master 已经接受 `PutEnd`，但响应在网络中丢失。
+空间申请成功，后续传输仍可能失败。客户端不能把所有申请过的位置都标记为成功，也不能把已完成的一侧一起撤销。
 
-对客户端来说，这次操作超时了；对服务端来说，它可能已经完成。
+`Client::Put` 在传输结束后调用 `DetermineFinalizeDecision`，由它决定 `PutEnd` 与 `PutRevoke` 分别作用于哪一类副本。
+
+默认可靠模式下，条件是严格的：
+
+- 分配到的副本数量满足配置；
+- **已分配副本的传输全部成功**。
+
+两者都满足才 `PutEnd(ALL)`；否则 `PutRevoke(ALL)`，本次 Put 失败。
+
+双副本模式 `FLEXIBLE_DUAL_REPLICA` 放宽了要求：
+
+- 内存与 NoF 两侧都成功：`PutEnd(ALL)`；
+- 只有内存成功：`PutEnd(MEMORY)` + `PutRevoke(NOF_SSD)`；
+- 只有 NoF 成功：`PutEnd(NOF_SSD)` + `PutRevoke(MEMORY)`；
+- 两侧都失败：`PutRevoke(ALL)`。
+
+所以同一条"Put 成功"，在不同配置下强度不同。默认路径要求分配到的副本全部成功；双副本模式只要求一侧成功。调用方若依赖副本数，应当读配置或指标，而不是假设。
+
+`PutRevoke` 本身也有限制：它只撤销仍处于 `PROCESSING` 的目标副本。如果目标类别里已经有非 `PROCESSING` 的副本（例如 `COMPLETE`），Master 返回 `INVALID_WRITE`，而不是误删已完成的数据。这正好要求调用方"提交成功的那一类，撤销失败的那一类"。
+
+## 三种异常
+
+### 传输失败
+
+按上一节的提交条件处理：能提交的提交，不能提交的撤销，最终是否成功由 `DetermineFinalizeDecision` 决定。不要笼统地说"Put 失败了"，要区分是空间不足、部分副本失败，还是全部失败。
+
+### Client 在提交前退出
+
+A 完成了 `PutStart`，却在 `PutEnd` 或 `PutRevoke` 之前崩溃。对象停在 `PROCESSING`，既不可读，也挡住后续同 key 写入。
+
+Master 用两个超时收尾：
+
+| 参数 | 默认 | 作用 |
+|---|---|---|
+| `put_start_discard_timeout_sec` | 30 秒 | 超时后允许同 key 的新 `PutStart` 顶替旧对象 |
+| `put_start_release_timeout_sec` | 600 秒 | 超时后旧对象占用的空间才可被回收 |
+
+**关键细节**：顶替不是复用旧空间，而是重新分配。旧的 `PROCESSING` 副本被移入 `discarded_replicas_`，等第二个超时到期后才释放。所以客户端消失后，资源不会立刻恢复，30 秒内它仍是故障源。
+
+### Master 已接受 PutEnd，但响应丢失
+
+A 发出 `PutEnd`，Master 执行成功，响应却在网络中丢失。
+
+对 A 来说，这次调用超时了；对 Master 来说，对象已经 `COMPLETE`。
 
 **超时只能说明客户端没拿到结果，不能证明服务端没有执行。**
 
-## 重试之前，先理解同 key 语义
+此时如果 A 重试同一个 key 的 Put：`PutStart` 发现已有 `COMPLETE` 副本，返回 `OBJECT_ALREADY_EXISTS`；`Client::Put` 把这个错误当成功返回，已有内容不变。
 
-原系列分析的普通 Put 路径，对已存在 key 采用“保留已有内容”的处理方式，不能把重试当成覆盖写。
+这带来一个必须理解的结果：重试是幂等的，但不是覆盖。
 
-如果业务要替换内容，应确认是否需要 `Upsert` 等其他接口，并核对相应并发语义。
+## 同 key 再写：重试、幂等与覆盖
 
-理解写入可见性后，下一个问题是：读方拿到副本地址，如何确认最终读回的数据仍然可以使用？
+普通 Put 遇到已存在的 key，语义是"保留已有内容 + 幂等成功"，不是"用新数据替换旧数据"。
 
-**源码延伸：**原系列篇2；`Client::Put`、`PutStart`、`PutEnd`、`PutRevoke`。版本基线为 `v0.3.13.post1`。
+- 已有 `COMPLETE` 副本：`OBJECT_ALREADY_EXISTS`，`Client::Put` 返回成功，内容不变。
+- 仍是 `PROCESSING` 且未超过 discard 超时：同样返回 `OBJECT_ALREADY_EXISTS`。
+- 超过 discard 超时：允许新 `PutStart` 顶替，重新分配空间。
+
+如果业务需要替换内容，应使用 `Upsert`，并核对它在并发写入下的语义。把 Put 重试当成覆盖写，是这里最容易犯的错。
+
+字节已经写完，B 也终于从 R1 读回了数据。但读回来的字节，这次 Get 为什么还可能失败？
+
+**源码延伸：**原系列篇2；`Client::Put`、`PutStart`、`PutEnd`、`PutRevoke`、`IsReplicaReadable`。版本基线为 `v0.3.13.post1`。
+
+- [Client::Put](https://github.com/kvcache-ai/Mooncake/blob/719735896c86b56fabec6cf3e825fb2ea640597a/mooncake-store/src/client_service.cpp#L1853)
+- [PutStart](https://github.com/kvcache-ai/Mooncake/blob/719735896c86b56fabec6cf3e825fb2ea640597a/mooncake-store/src/master_service.cpp#L4292) · [PutEnd](https://github.com/kvcache-ai/Mooncake/blob/719735896c86b56fabec6cf3e825fb2ea640597a/mooncake-store/src/master_service.cpp#L4509) · [PutRevoke](https://github.com/kvcache-ai/Mooncake/blob/719735896c86b56fabec6cf3e825fb2ea640597a/mooncake-store/src/master_service.cpp#L4776)
+- [IsReplicaReadable](https://github.com/kvcache-ai/Mooncake/blob/719735896c86b56fabec6cf3e825fb2ea640597a/mooncake-store/src/master_service.cpp#L3546)
 
 [源码解析版](../02-put-path.md) · [系列目录与排版说明](README.md)
 
