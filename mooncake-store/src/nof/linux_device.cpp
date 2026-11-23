@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace mooncake::detail {
 namespace {
@@ -100,53 +101,88 @@ bool ParseNofEndpoint(const std::string& text, NofEndpoint& endpoint,
     return true;
 }
 
+// Example layouts under /sys/class/nvme-subsystem/:
+//   multipath=Y (two controllers in the same subsystem)
+//     nvme-subsys11/nvme11/nvme11c11n1   NSID 1: hidden path through nvme11
+//     nvme-subsys11/nvme11n1             NSID 1: visible head -> /dev/nvme11n1
+//     nvme-subsys11/nvme12/nvme11c12n2   NSID 2: hidden path through nvme12
+//     nvme-subsys11/nvme11n2             NSID 2: visible head -> /dev/nvme11n2
+//   multipath=N
+//     nvme-subsys20/nvme20/nvme20n1      NSID 1: visible path -> /dev/nvme20n1
 std::string FindLinuxNvmeDevice(const NofEndpoint& endpoint, std::string& error,
                                 const std::string& subsystem_root) {
     namespace fs = std::filesystem;
     std::set<std::string> devices;
+    std::vector<fs::path> directories;
+    size_t controller_count = 0;
     size_t matches = 0;
+    fs::path selected;
+    size_t target_paths = 0;
     try {
         for (const auto& subsystem : fs::directory_iterator(subsystem_root)) {
             if (Read(subsystem.path() / "subsysnqn") != endpoint.nqn) continue;
-            size_t controllers = 0;
-            fs::path selected;
+            directories.push_back(subsystem.path());
             for (const auto& entry : fs::directory_iterator(subsystem.path())) {
+                const auto name = entry.path().filename().string();
+                if (!name.starts_with("nvme") || name.size() == 4 ||
+                    name.find_first_not_of("0123456789", 4) !=
+                        std::string::npos)
+                    continue;
+                directories.push_back(entry.path());
+                ++controller_count;
                 const auto transport = Read(entry.path() / "transport");
-                if (transport.empty()) continue;
-                ++controllers;
                 const auto address = Read(entry.path() / "address");
+                if (transport.empty() || address.empty()) {
+                    error = "cannot read NVMe controller binding: " + name;
+                    return {};
+                }
                 if (transport == endpoint.transport &&
                     Address(AddressField(address, "traddr")) ==
                         endpoint.address &&
                     AddressField(address, "trsvcid") == endpoint.service) {
-                    selected = entry.path();
                     ++matches;
+                    selected = entry.path();
                 }
             }
-            if (selected.empty()) continue;
-            // This backend initially supports one path per subsystem. A
-            // multipath head could otherwise route an endpoint's writes over
-            // a different controller and alias two Store allocation domains.
-            if (controllers != 1) {
-                error =
-                    "Linux NoF requires one connected controller per subsystem";
-                return {};
-            }
-            // With native multipath enabled, the visible namespace head lives
-            // under the subsystem. Otherwise it lives under the controller.
-            // Hidden per-controller paths have no dev attribute; never open
-            // one or derive a device name from NSID (NSID != device suffix).
-            for (const auto& directory : {subsystem.path(), selected}) {
-                for (const auto& entry : fs::directory_iterator(directory)) {
-                    const auto name = entry.path().filename().string();
-                    uint32_t nsid = 0;
-                    if (name.rfind("nvme", 0) == 0 &&
-                        !Read(entry.path() / "dev").empty() &&
-                        Read(entry.path() / "hidden") != "1" &&
-                        Number(Read(entry.path() / "nsid"), nsid) &&
-                        nsid == endpoint.nsid)
-                        devices.insert("/dev/" + name);
+        }
+        if (matches != 1) {
+            error = "expected one controller for " + endpoint.nqn + " at " +
+                    endpoint.transport + " " + endpoint.address + ":" +
+                    endpoint.service + ", found " + std::to_string(matches);
+            return {};
+        }
+
+        // With multiple controllers, check all paths, including hidden ones,
+        // to ensure only the selected controller exposes the requested NSID.
+        const bool single_controller = controller_count == 1;
+        for (const auto& directory : directories) {
+            for (const auto& entry : fs::directory_iterator(directory)) {
+                const auto& path = entry.path();
+                const auto name = path.filename().string();
+                if (!name.starts_with("nvme")) continue;
+                const auto id = Read(path / "nsid");
+                if (!single_controller && id.empty() &&
+                    (fs::exists(path / "size") ||
+                     fs::exists(path / "hidden"))) {
+                    error = "cannot determine namespace ID: " + path.string();
+                    return {};
                 }
+                uint32_t nsid = 0;
+                if (!Number(id, nsid) || nsid != endpoint.nsid) continue;
+                if (!single_controller && directory != selected &&
+                    directory != selected.parent_path()) {
+                    error = "NSID " + std::to_string(nsid) + " for " +
+                            endpoint.nqn + ": requested target " +
+                            endpoint.address + ":" + endpoint.service + " (" +
+                            selected.filename().string() + "), found at " +
+                            path.string();
+                    return {};
+                }
+                const bool hidden = Read(path / "hidden") == "1";
+                if (!hidden && Read(path / "dev").empty()) continue;
+                if (directory == selected) ++target_paths;
+                if (hidden) continue;
+                devices.insert("/dev/" + name);
             }
         }
     } catch (const fs::filesystem_error& exception) {
@@ -154,7 +190,7 @@ std::string FindLinuxNvmeDevice(const NofEndpoint& endpoint, std::string& error,
                 std::string(exception.what());
         return {};
     }
-    if (matches != 1 || devices.size() != 1) {
+    if ((controller_count > 1 && target_paths != 1) || devices.size() != 1) {
         error = "expected one connected controller/namespace for trtype:" +
                 endpoint.transport + " traddr:" + endpoint.address +
                 " trsvcid:" + endpoint.service + " subnqn:" + endpoint.nqn +

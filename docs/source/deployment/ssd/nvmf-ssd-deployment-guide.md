@@ -49,8 +49,8 @@ export MC_NOF_BACKEND=linux
 Linux data queue (default `256`, range `1`–`32768`). It is read at first use;
 invalid values fall back to the default. Probe queues are unaffected.
 
-**Connect storage devices.** Connect the required subsystems on the master
-host and every client host that performs NoF I/O. For TCP:
+**Connect storage devices.** Before starting the Mooncake master and clients,
+connect each host to the NVMe-oF targets it will use. For TCP:
 
 ```bash
 sudo modprobe nvme-tcp
@@ -77,10 +77,10 @@ Recommended settings are listed below. All time values are in seconds.
 
 For RDMA, load `nvme-rdma` and use `-t rdma`.
 
-Clients and the master on the same host can share a kernel connection; do not
-connect separately for each process. The current implementation requires one
-connected controller per subsystem on each host. Multiple namespaces in that
-subsystem share the connection.
+Clients and the master on the same host can share a kernel connection.
+A single controller can serve multiple namespaces. If a host connects to
+multiple controllers in the same subsystem, each registered NSID must be
+exposed only by the controller matching its configured endpoint.
 
 **Start services and register segments.** The recommended deployment order is:
 

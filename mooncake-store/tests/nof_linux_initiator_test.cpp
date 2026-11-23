@@ -60,6 +60,13 @@ class LinuxNofDiscoveryTest : public ::testing::Test {
               "traddr=" + address + ",trsvcid=4420,src_addr=127.0.0.1");
     }
 
+    void Namespace(const std::string& controller, const std::string& device,
+                   uint32_t nsid) {
+        const auto path = "subsystem/" + controller + "/" + device;
+        Write(path + "/nsid", std::to_string(nsid));
+        Write(path + "/dev", "259:1");
+    }
+
     std::string Find() {
         return detail::FindLinuxNvmeDevice(endpoint, error, root.string());
     }
@@ -84,11 +91,54 @@ TEST_F(LinuxNofDiscoveryTest, UsesVisibleHeadWithOneController) {
     Write("subsystem/nvme19n2/nsid", "7");
     Write("subsystem/nvme19n2/dev", "259:1");
     EXPECT_EQ(Find(), "/dev/nvme19n2");
+}
 
-    // Reject a second controller even if it does not match the endpoint.
+TEST_F(LinuxNofDiscoveryTest, ResolvesNamespacesAcrossControllers) {
     Controller("nvme20", "127.0.0.2");
+    Controller("nvme21", "127.0.0.3");
+    Namespace("nvme19", "nvme19n1", 3);
+    Namespace("nvme20", "nvme20n2", 2);
+    Namespace("nvme21", "nvme21n3", 1);
+
+    endpoint.nsid = 3;
+    EXPECT_EQ(Find(), "/dev/nvme19n1");
+    endpoint.nsid = 2;
     EXPECT_TRUE(Find().empty());
-    EXPECT_NE(error.find("one connected controller"), std::string::npos);
+    endpoint.address = "127.0.0.2";
+    EXPECT_EQ(Find(), "/dev/nvme20n2");
+    endpoint.address = "127.0.0.3";
+    endpoint.nsid = 1;
+    EXPECT_EQ(Find(), "/dev/nvme21n3");
+
+    Write("subsystem/nvme19/nvme19n1/nsid", "1");
+    EXPECT_TRUE(Find().empty());
+}
+
+TEST_F(LinuxNofDiscoveryTest, ResolvesHeadBackedOnlyByTargetController) {
+    Controller("nvme20", "127.0.0.2");
+    Write("subsystem/nvme19n2/nsid", "7");
+    Write("subsystem/nvme19n2/dev", "259:1");
+
+    // The head alone does not establish which target serves it.
+    EXPECT_TRUE(Find().empty());
+    Write("subsystem/nvme19/nvme19c19n2/nsid", "7");
+    Write("subsystem/nvme19/nvme19c19n2/hidden", "1");
+    EXPECT_EQ(Find(), "/dev/nvme19n2");
+
+    endpoint.address = "127.0.0.2";
+    EXPECT_TRUE(Find().empty());
+    endpoint.address = "127.0.0.1";
+    Write("subsystem/nvme20/nvme19c20n2/hidden", "1");
+    EXPECT_TRUE(Find().empty());  // Cannot identify the peer's namespace.
+    Write("subsystem/nvme20/nvme19c20n2/nsid", "7");
+    EXPECT_TRUE(Find().empty());
+}
+
+TEST_F(LinuxNofDiscoveryTest, RejectsDuplicateEndpoint) {
+    Controller("nvme20", endpoint.address);
+    Namespace("nvme19", "nvme19n2", 7);
+    EXPECT_TRUE(Find().empty());
+    EXPECT_NE(error.find("found 2"), std::string::npos);
 }
 
 TEST_F(LinuxNofDiscoveryTest, RejectsMissingAndAmbiguousDevices) {
