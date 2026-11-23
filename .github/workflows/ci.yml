@@ -891,10 +891,12 @@ jobs:
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         fi
         cd build-tent
+        # Cap parallelism: cuda-off still compiles Store + TE, and unbounded
+        # ninja has OOM'd / disconnected the hosted runner mid-build.
         if [ -n "${{ matrix.build_targets }}" ]; then
-          cmake --build . --target ${{ matrix.build_targets }}
+          cmake --build . --parallel 2 --target ${{ matrix.build_targets }}
         else
-          cmake --build .
+          cmake --build . --parallel 2
           sudo cmake --install .
         fi
       shell: bash
