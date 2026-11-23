@@ -76,9 +76,11 @@ class RpcDrainGuard {
        private:
         static bool try_enter(State& state) {
             if (state.stopping.load(std::memory_order_acquire)) return false;
-            state.inflight.fetch_add(1, std::memory_order_acq_rel);
-            // a drain that started between the two reads still sees this call
-            if (state.stopping.load(std::memory_order_acquire)) {
+            // Give the admission increment and the drain's stop/count
+            // snapshot one total order. Otherwise both sides can miss the
+            // other's update on weakly ordered machines.
+            state.inflight.fetch_add(1, std::memory_order_seq_cst);
+            if (state.stopping.load(std::memory_order_seq_cst)) {
                 leave(state);
                 return false;
             }
@@ -101,10 +103,10 @@ class RpcDrainGuard {
     // regardless (the registry already does), and the state itself stays
     // valid until the last ScopedCall lets go of it.
     bool drain_for(std::chrono::milliseconds timeout) {
-        state_->stopping.store(true, std::memory_order_release);
+        state_->stopping.store(true, std::memory_order_seq_cst);
         std::unique_lock lk(state_->mutex);
         return state_->cv.wait_for(lk, timeout, [&] {
-            return state_->inflight.load(std::memory_order_acquire) == 0;
+            return state_->inflight.load(std::memory_order_seq_cst) == 0;
         });
     }
 
