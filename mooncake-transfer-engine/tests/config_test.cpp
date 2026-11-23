@@ -27,6 +27,36 @@
 namespace mooncake {
 namespace {
 
+TEST(AscendSingleSegmentConfigTest, DefaultsOffAndParsesExplicitBoolean) {
+    unsetenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT");
+    unsetenv("ASCEND_STANDALONE_SINGLE_SEGMENT");
+    GlobalConfig defaults;
+    loadGlobalConfig(defaults);
+    EXPECT_FALSE(defaults.ascend_standalone_single_segment);
+    for (const char* value : {"1", "true", "0", "false", "invalid"}) {
+        setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", value, 1);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.ascend_standalone_single_segment,
+                  std::string(value) == "1" || std::string(value) == "true");
+    }
+    setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", "0", 1);
+    setenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT", "1", 1);
+    GlobalConfig mc_override;
+    loadGlobalConfig(mc_override);
+    EXPECT_TRUE(mc_override.ascend_standalone_single_segment);
+
+    setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", "1", 1);
+    setenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT", "0", 1);
+    GlobalConfig mc_disable;
+    mc_disable.ascend_standalone_single_segment = true;
+    loadGlobalConfig(mc_disable);
+    EXPECT_FALSE(mc_disable.ascend_standalone_single_segment);
+
+    unsetenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT");
+    unsetenv("ASCEND_STANDALONE_SINGLE_SEGMENT");
+}
+
 // --- MC_PKEY_INDEX (stoi with try-catch, range 0-65535) ---
 
 class PkeyIndexEnvTest : public ::testing::Test {

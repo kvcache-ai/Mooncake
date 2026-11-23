@@ -4,16 +4,24 @@ on:
   push:
     tags:
       - 'v*'
+      - '!v*-*'
+      - '!v*.post*'
+      - 'npu-v*'
+      - '!npu-v*-*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v0.1.0)'
+        description: 'Release tag (e.g. v0.3.14, v0.3.14.post1, or npu-v0.3.14.post1)'
         required: true
         type: string
 
 jobs:
   build:
-    if: ${{ (github.event_name == 'push' && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v') && !contains(inputs.tag, '-')) }}
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+        ((startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-') && !contains(github.ref_name, '.post')) ||
+         startsWith(github.ref_name, 'npu-v')))
 
     strategy:
       max-parallel: 2
@@ -35,6 +43,7 @@ jobs:
 
     env:
       NPU_BUILD: "1"
+      GOEXPERIMENT: "norandomizedheapbase64"
 
     steps:
       - name: Checkout code
@@ -42,6 +51,26 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
           fetch-depth: 0
+
+      - name: Align wheel version with release tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_TAG}" =~ ^(npu-)?v([0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?)$ ]]; then
+            echo "::error::Invalid release tag '${RELEASE_TAG}'"
+            exit 1
+          fi
+          VERSION="${BASH_REMATCH[2]}"
+          CUR="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' mooncake-wheel/pyproject.toml | head -n 1)"
+          if [[ "${RELEASE_TAG}" == npu-v* ]]; then
+            [[ "${VERSION%%.post*}" == "${CUR%%.post*}" ]] || { echo "::error::Tag ${VERSION} does not match pyproject base ${CUR}"; exit 1; }
+            sed -i "s/^version = \"[^\"]*\"$/version = \"${VERSION}\"/" mooncake-wheel/pyproject.toml
+          elif [[ "${CUR}" != "${VERSION}" ]]; then
+            echo "::error::Tag ${VERSION} does not match pyproject ${CUR}"
+            exit 1
+          fi
 
       - name: Setup Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -158,7 +187,6 @@ jobs:
           path: mooncake-wheel/dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
-    if: ${{ (github.event_name == 'push' && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v') && !contains(inputs.tag, '-')) }}
     needs: build
     runs-on: ubuntu-22.04
     environment: pypi
@@ -168,11 +196,6 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
-
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
         with:
@@ -186,8 +209,17 @@ jobs:
           echo "Collected wheels for release:"
           ls -la mooncake-wheel/dist-release/
 
+      - name: Upload wheels to NPU GitHub Release
+        if: startsWith(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, 'npu-v')
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          make_latest: false
+          files: mooncake-wheel/dist-release/*.whl
+
       - name: Upload wheels to GitHub Release
-        uses: softprops/action-gh-release@v1
+        if: ${{ !startsWith(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, 'npu-v') }}
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           files: mooncake-wheel/dist-release/*.whl
@@ -197,3 +229,4 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: mooncake-wheel/dist-release/
+          skip-existing: ${{ github.event_name == 'workflow_dispatch' }}

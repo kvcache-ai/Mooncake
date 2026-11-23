@@ -26,6 +26,10 @@ class FileStorage {
                 SsdMetric* ssd_metric = nullptr);
     ~FileStorage();
 
+    // The owner must stop external I/O first. Keep registered arenas alive
+    // until Client/TransferEngine teardown has completed.
+    tl::expected<void, ErrorCode> Shutdown();
+
     tl::expected<void, ErrorCode> Init();
 
     void RemoveAll();
@@ -178,6 +182,10 @@ class FileStorage {
 
    private:
     friend class FileStorageTest;
+    friend class FileStorageShutdownTestPeer;
+    std::mutex shutdown_mutex_;
+    bool staging_registered_ = false;
+    ErrorCode shutdown_error_ = ErrorCode::OK;
     friend class FileStoragePromotionTest;
     // TEST_F bodies are generated subclasses and do not inherit the fixture's
     // friendship, so the dangling-replica tests are friended by their

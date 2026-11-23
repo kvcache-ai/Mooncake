@@ -1,0 +1,4 @@
+MOONCAKE_CONDUCTOR_1 {
+  global: mooncake_conductor_*;
+  local: *;
+};

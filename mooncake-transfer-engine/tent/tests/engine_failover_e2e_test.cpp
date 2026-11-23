@@ -2751,6 +2751,27 @@ TEST(MnnvlRuntimeTest, StrictWithoutEgmPreservesOrdinaryHostRoutes) {
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
+TEST(MnnvlRuntimeTest, GpuWaitRejectsStartupAndRuntimeQueueEnablement) {
+    auto config = makeMinimalP2PConfig();
+    config->set("transports/mnnvl/sync_mode", "gpu_wait");
+    {
+        TransferEngineImpl engine(config);
+        ASSERT_TRUE(engine.available());
+        Config update;
+        update.set("enable_runtime_queue", true);
+        auto snapshot = buildTentConfigBundle(update, 1).runtime;
+        ASSERT_NE(snapshot->config, nullptr);
+        // enable_runtime_queue is bootstrap-only, so a runtime generation
+        // cannot carry it: deferred dispatch stays disabled for the whole life
+        // of a gpu_wait engine, and publishing the update is a no-op for it.
+        EXPECT_FALSE(snapshot->config->contains("enable_runtime_queue"));
+        EXPECT_TRUE(engine.publishRuntimeConfigForTest(snapshot).ok());
+    }
+    config->set("enable_runtime_queue", true);
+    TransferEngineImpl invalid(config);
+    EXPECT_FALSE(invalid.available());
+}
+
 #ifndef USE_CUDA
 TEST(MnnvlRuntimeTest, StrictInitializationRequiresCuda) {
     auto config = makeMinimalP2PConfig();

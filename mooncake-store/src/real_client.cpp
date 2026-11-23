@@ -8,6 +8,7 @@
 #include <thread>
 #include <stop_token>
 
+#include <gflags/gflags.h>
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <cstring>
@@ -116,11 +117,7 @@ bool IsHostStoreSegmentProtocol(const std::string &protocol) {
 #ifdef USE_ASCEND_DIRECT
 // Split standalone store capacity across NPUs: cap each mount at total/n.
 size_t AgentModeStoreChunkCap(size_t total_size) {
-    const uint32_t n = ContextManager::getInstance().getDeviceCount();
-    if (n <= 1 || total_size == 0) {
-        return 0;
-    }
-    return total_size / n;
+    return ascend_agent_mode_store_chunk_cap(total_size);
 }
 
 bool RestoreAgentModeDeviceZero() {
@@ -523,6 +520,13 @@ inline QueryResult FilterQueryResult(const QueryResult &qr,
         qr.lease_timeout,
         include_object_checksum ? qr.object_checksum : std::nullopt,
         qr.resolved_tenant_id);
+}
+
+bool IsLocalDiskMasterLeaseExpired(const QueryResult &query_result,
+                                   const std::string &key) {
+    if (!query_result.IsLeaseExpired()) return false;
+    LOG(WARNING) << "lease_expired_before_data_transfer_completed key=" << key;
+    return true;
 }
 
 // Shared object-byte range overflow check (same semantics as
@@ -939,12 +943,7 @@ RealClient::RealClient() : prefetcher_(std::make_unique<SsdPrefetcher>()) {
 }
 
 RealClient::~RealClient() {
-    if (offload_rpc_server_) {
-        offload_rpc_server_->stop();
-        offload_rpc_server_.reset();
-    }
-    // Ensure resources are cleaned even if not explicitly closed
-    stop_http_server();
+    // All close paths share the same ordered teardown owner.
     // A destructor cannot propagate errors, but a teardown failure (e.g.
     // unconfirmed NoF cleanup) must still leave a trace.
     if (!tearDownAll_internal()) {
@@ -1075,6 +1074,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     // Reset the teardown latch so this instance can be torn down again.
     closed_.store(false, std::memory_order_release);
+    offload_rpc_drain_ = RpcDrainGuard{};
+    storage_shutdown_error_ = ErrorCode::OK;
 
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
@@ -1929,28 +1930,12 @@ int RealClient::initAll(const std::string &protocol_,
 }
 
 tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
-    // Ensure cleanup executes once across destructor/close/signal paths
-    bool expected = false;
-    if (!closed_.compare_exchange_strong(expected, true,
-                                         std::memory_order_acq_rel)) {
-        // A previous teardown's cleanup failure must not decay into success
-        // on repeat calls: retry the idempotent cleanups and keep reporting
-        // failure until they heal.
-        if (nof_buffer_cleanup_failed_.load(std::memory_order_acquire)) {
-            const ErrorCode rc = CleanupNofRegisteredBuffers();
-            if (rc != ErrorCode::OK) {
-                return tl::unexpected(rc);
-            }
-        }
-        ErrorCode shm_rc;
-        {
-            std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
-            shm_rc = RetryQuarantinedShmsLocked();
-        }
-        if (shm_rc != ErrorCode::OK) {
-            return tl::unexpected(shm_rc);
-        }
-        return {};
+    std::lock_guard teardown_lock(teardown_mutex_);
+    // Serialize complete cleanup, including retries after a failed unregister.
+    closed_.store(true, std::memory_order_release);
+    // Stop new offload work before draining any pool it can submit to.
+    while (!offload_rpc_drain_.drain_for(std::chrono::seconds(30))) {
+        LOG(WARNING) << "Waiting for in-flight offload RPCs during teardown";
     }
 
     // Drain the prefetch pool before any resource release below. Pool jobs
@@ -1966,16 +1951,19 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_dummy_client_monitor();
     stop_http_server();
 
-    ErrorCode cleanup_error = ErrorCode::OK;
+    if (offload_rpc_server_) {
+        offload_rpc_server_->stop();
+        offload_rpc_server_.reset();
+    }
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    if (file_storage_) {
+        auto result = file_storage_->Shutdown();
+        if (!result) storage_shutdown_error_ = result.error();
+    }
+
+    ErrorCode cleanup_error = storage_shutdown_error_;
     if (client_) {
         if (!egm_segment_ptrs_.empty()) {
-            // Callers must quiesce in-flight requests before close. FileStorage
-            // owns a Client reference and workers that access segments.
-            if (offload_rpc_server_) {
-                offload_rpc_server_->stop();
-                offload_rpc_server_.reset();
-            }
-            file_storage_.reset();
             for (auto it = egm_segment_ptrs_.rbegin();
                  it != egm_segment_ptrs_.rend(); ++it) {
                 auto &owner = *it;
@@ -2015,6 +2003,8 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         // transfers that timed out may still require deferred cleanup.
         client_.reset();
     }
+    // Free staging arenas only after the last storage-owned Client/TE owner.
+    file_storage_.reset();
     if (embedded_master_) {
         embedded_master_->Stop();
         embedded_master_.reset();
@@ -2071,7 +2061,6 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     local_hostname = "";
     device_name = "";
     protocol = "";
-    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto shm_it = shm_contexts_.begin();
     while (shm_it != shm_contexts_.end()) {
         auto &context = shm_it->second;
@@ -4131,6 +4120,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                        << "': " << toString(checksum_result.error());
             return nullptr;
         }
+        if (IsLocalDiskMasterLeaseExpired(query_result.value(), key)) {
+            return nullptr;
+        }
         return buffer_handle;
     }
 
@@ -4646,6 +4638,11 @@ RealClient::batch_get_buffer_internal(
                             tl::make_unexpected(checksum_result.error());
                         continue;
                     }
+                    if (IsLocalDiskMasterLeaseExpired(op.query_result, key)) {
+                        op_status[idx_it->second] =
+                            tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
+                        continue;
+                    }
                     op_status[idx_it->second] =
                         static_cast<int64_t>(op.total_size);
                 } else {
@@ -4716,6 +4713,7 @@ RealClient::batch_get_buffer_internal(
             }
         }
 
+        // Healed reads already checked their fresh lease in the recursive call.
         std::vector<DuplicateFanOutJob> dup_jobs;
         for (const auto &[dup_idx, primary_idx] : duplicate_disk_ops) {
             const auto &dup_op = disk_ops[dup_idx];
@@ -7296,6 +7294,12 @@ RealClient::batch_get_into_internal(
             if (!checksum_result) {
                 results[op.original_index] =
                     tl::make_unexpected(checksum_result.error());
+                continue;
+            }
+            if (IsLocalDiskMasterLeaseExpired(op.query_result,
+                                              offload_object_it.first)) {
+                results[op.original_index] =
+                    tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
             }
         }
     }
@@ -9034,6 +9038,11 @@ RealClient::batch_get_into_multi_buffers_internal(
                     if (!checksum_result) {
                         results[op.original_index] =
                             tl::make_unexpected(checksum_result.error());
+                        continue;
+                    }
+                    if (IsLocalDiskMasterLeaseExpired(op.query_result, key)) {
+                        results[op.original_index] =
+                            tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
                     }
                 }
             }
@@ -9563,6 +9572,11 @@ tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
 async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
 RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
                                      const std::vector<int64_t> &sizes) {
+    RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
+    if (!inflight.ok()) {
+        co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     // Run SSD I/O on a dedicated thread pool so the coro_rpc IO thread is
     // free to handle ping and other RPCs. Same heap-owned state pattern as
     // batch_get_into_dummy_helper: the lambda captures only a raw pointer.
@@ -9595,6 +9609,11 @@ RealClient::batch_get_offload_object_ranges(
     const std::vector<std::string> &keys, const std::vector<int64_t> &offsets,
     const std::vector<int64_t> &sizes,
     const std::vector<int64_t> &object_sizes) {
+    RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
+    if (!inflight.ok()) {
+        co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     struct CallState {
         std::vector<std::string> keys;
         std::vector<int64_t> offsets;
@@ -9626,6 +9645,11 @@ RealClient::batch_get_offload_object_ranges(
 }
 
 bool RealClient::release_offload_buffer(uint64_t batch_id) {
+    RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
+    if (!inflight.ok()) {
+        return false;
+    }
+
     if (!file_storage_) {
         LOG(WARNING)
             << "release_offload_buffer called but file_storage_ is null";
@@ -9637,6 +9661,11 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
 bool RealClient::prefetch_offload_object(const std::vector<std::string> &keys,
                                          const std::vector<int64_t> &sizes,
                                          const std::string &tenant_id) {
+    RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
+    if (!inflight.ok()) {
+        return false;
+    }
+
     if (!enable_ssd_prefetch_ || !prefetcher_ || !file_storage_) {
         VLOG(1) << "prefetch_offload_object called but SSD prefetch is "
                    "disabled or SSD offload is not set up";
@@ -9660,6 +9689,11 @@ bool RealClient::prefetch_offload_object(const std::vector<std::string> &keys,
 
 async_simple::coro::Lazy<tl::expected<VerifyDiskReplicaResponse, ErrorCode>>
 RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
+    RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
+    if (!inflight.ok()) {
+        co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     if (!file_storage_) {
         LOG(ERROR) << "verify_disk_replica called but file_storage_ is null";
         co_return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
