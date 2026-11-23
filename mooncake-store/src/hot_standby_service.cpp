@@ -126,6 +126,8 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
             spec.type = oplog_backend_type_;
             spec.connstring = oplog_endpoints;
             spec.cluster_namespace = cluster_id;
+            spec.ha_redis_expected_replicas_per_shard =
+                config_.ha_redis_expected_replicas_per_shard;
             auto backend = CreateHaKvBackend(spec);
             if (!backend) {
                 if (backend.error() == ErrorCode::UNAVAILABLE_IN_CURRENT_MODE) {
@@ -517,6 +519,8 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
     spec.type = oplog_backend_type_;
     spec.connstring = oplog_endpoints_;
     spec.cluster_namespace = cluster_id_;
+    spec.ha_redis_expected_replicas_per_shard =
+        config_.ha_redis_expected_replicas_per_shard;
     auto backend = CreateHaKvBackend(spec);
     if (!backend) {
         LOG(ERROR) << "Final OpLog catch-up failed to open backend: "

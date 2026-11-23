@@ -101,6 +101,9 @@ struct HABackendSpec {
     ClusterNamespace cluster_namespace;
     // Leadership lease TTL in seconds. Currently honored by the etcd backend.
     int64_t leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
+    size_t ha_redis_expected_replicas_per_shard = 0;
+    // Client discovery reads topology without imposing a write policy.
+    bool redis_read_only = false;
 };
 
 struct MasterView {

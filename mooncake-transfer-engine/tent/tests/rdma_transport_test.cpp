@@ -1331,6 +1331,21 @@ TEST(RdmaParamsTest, DefaultsKeepLaneCountsAligned) {
     EXPECT_EQ(params.endpoint.path_mtu, IBV_MTU_4096);
 }
 
+// Slice timeouts subtract two of these timestamps. A wall-clock step between
+// them must not change the result, so they come from the monotonic clock.
+TEST(RdmaSliceClockTest, TimestampsComeFromTheMonotonicClock) {
+    auto monotonic_ns = [] {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return int64_t{ts.tv_sec} * 1000000000 + ts.tv_nsec;
+    };
+    const int64_t before = monotonic_ns();
+    const int64_t now = getCurrentTimeInNano();
+    const int64_t after = monotonic_ns();
+    EXPECT_GE(now, before);
+    EXPECT_LE(now, after);
+}
+
 TEST(RdmaSubBatchTest, ReportsTaskCount) {
     RdmaSubBatch batch;
     batch.max_size = 8;
