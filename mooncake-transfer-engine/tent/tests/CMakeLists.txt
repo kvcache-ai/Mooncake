@@ -1056,6 +1056,8 @@ if(USE_MLU)
     add_test(NAME tent_mlu_${suite}_test COMMAND tent_mlu_${suite}_test)
     set_tests_properties(tent_mlu_${suite}_test PROPERTIES TIMEOUT 300)
   endforeach()
+  target_link_options(tent_mlu_platform_test PRIVATE
+                      "-Wl,--wrap=cnrtDeviceGetByPCIBusId")
   foreach(suite transport engine)
     target_link_options(
       tent_mlu_${suite}_test PRIVATE "-Wl,--wrap=cnGetMemAttribute"
@@ -1064,6 +1066,7 @@ if(USE_MLU)
   target_link_options(
     tent_mlu_transport_test
     PRIVATE
+    "-Wl,--wrap=cnrtDeviceGetByPCIBusId"
     "-Wl,--wrap=cnrtHostMalloc"
     "-Wl,--wrap=cnrtFreeHost"
     "-Wl,--wrap=cnrtMapMemHandle"
