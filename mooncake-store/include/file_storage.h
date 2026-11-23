@@ -189,6 +189,14 @@ class FileStorage {
         FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplica_Test;
     friend class
         FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket_Test;
+    friend class
+        FileStorageTest_BatchGetSingleflight_SameMultiKeyBatchShared_Test;
+    friend class
+        FileStorageTest_BatchGetSingleflight_StagingSharingVerification_Test;
+    friend class
+        FileStorageTest_BatchGetSingleflight_LastReleaseFreesSharedStaging_Test;
+    friend class
+        FileStorageTest_BatchGetSingleflight_AbandonedReaderDoesNotLeakStaging_Test;
 
     struct AllocatedBatch;
     struct ColdReadInvalidation;
@@ -489,14 +497,6 @@ class FileStorage {
     // Test-only. When set, the leader of a cold read waits until `need`
     // callers have entered Acquire, so overlapping readers share one staging
     // buffer instead of racing a fast local load.
-    struct ColdReadOverlapGate {
-        std::atomic<int> entered{0};
-        int need = 0;
-    };
-    ColdReadOverlapGate* cold_read_overlap_gate_ = nullptr;
-    // Test-only. When set, the cold-read leader waits until `need` callers
-    // have entered this flight, so a unit test can observe shared staging
-    // without racing the SSD read.
     struct ColdReadOverlapGate {
         std::atomic<int> entered{0};
         int need = 0;
