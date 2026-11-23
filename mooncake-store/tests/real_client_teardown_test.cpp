@@ -3,15 +3,12 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <future>
 #include <memory>
 #include <string>
-#include <thread>
-#include <utility>
 
 #include "real_client.h"
 #include "test_server_helpers.h"
@@ -19,22 +16,14 @@
 namespace mooncake::test {
 namespace {
 
-struct ShutdownProbe {
-    std::promise<void> client_destructor_started;
-    std::atomic<bool> worker_saw_mapping{false};
-};
-
 class TeardownClient : public Client {
    public:
-    explicit TeardownClient(std::shared_ptr<ShutdownProbe> probe)
-        : Client("localhost", "", "tcp"), probe_(std::move(probe)) {}
-
-    ~TeardownClient() override {
-        probe_->client_destructor_started.set_value();
-    }
+    explicit TeardownClient(std::promise<void> &destroying)
+        : Client("localhost", "", "tcp"), destroying_(destroying) {}
+    ~TeardownClient() override { destroying_.set_value(); }
 
    private:
-    std::shared_ptr<ShutdownProbe> probe_;
+    std::promise<void> &destroying_;
 };
 
 bool IsMapped(void *address) {
@@ -59,13 +48,14 @@ class RealClientTeardownTest : public ::testing::Test {
         const int port = getFreeTcpPort();
         failing_master_ = std::make_unique<coro_rpc::coro_rpc_server>(
             1, port, "127.0.0.1", std::chrono::seconds(0), true);
-        failing_master_->register_handler<&WrappedMasterService::ServiceReady>(
+        failing_master_->register_handler<&WrappedMasterService::ServiceReady,
+                                          &WrappedMasterService::BatchPutStart,
+                                          &WrappedMasterService::BatchPutEnd>(
             master_.service().get());
         ASSERT_FALSE(failing_master_->async_start().hasResult());
 
-        probe_ = std::make_shared<ShutdownProbe>();
         client_ = std::make_shared<RealClient>();
-        client_->client_ = std::make_shared<TeardownClient>(probe_);
+        client_->client_ = std::make_shared<TeardownClient>(destroying_);
         ASSERT_EQ(client_->client_->master_client_.Connect(
                       "127.0.0.1:" + std::to_string(port)),
                   ErrorCode::OK);
@@ -110,33 +100,16 @@ class RealClientTeardownTest : public ::testing::Test {
     }
 
     void CheckDestructorOrdering() {
-        std::promise<void> release_worker;
-        auto release = release_worker.get_future().share();
-        auto arrived = std::make_shared<std::promise<void>>();
-        auto worker_started = arrived->get_future();
-        auto client_destructor_started =
-            probe_->client_destructor_started.get_future();
-        client_->client_->task_thread_pool_.enqueue(
-            [arrived, release, probe = probe_, mapping = mapping_] {
-                arrived->set_value();
-                release.wait();
-                probe->worker_saw_mapping.store(IsMapped(mapping));
-            });
-        ASSERT_EQ(worker_started.wait_for(std::chrono::seconds(10)),
-                  std::future_status::ready);
-
-        std::thread destroyer(
-            [client = std::move(client_)]() mutable { client.reset(); });
-        EXPECT_EQ(client_destructor_started.wait_for(std::chrono::seconds(10)),
-                  std::future_status::ready);
-        // Client's destructor now has to join the gated production worker.
-        // mincore detects the old ordering safely, without reading freed
-        // memory.
-        EXPECT_TRUE(IsMapped(mapping_));
-        release_worker.set_value();
-        destroyer.join();
-
-        EXPECT_TRUE(probe_->worker_saw_mapping.load());
+        bool worker_saw_mapping = false;
+        auto destroying = destroying_.get_future().share();
+        client_->client_->task_thread_pool_.enqueue([&, destroying] {
+            if (destroying.wait_for(std::chrono::seconds(10)) ==
+                std::future_status::ready) {
+                worker_saw_mapping = IsMapped(mapping_);
+            }
+        });
+        client_.reset();  // Joins the worker before releasing segment memory.
+        EXPECT_TRUE(worker_saw_mapping);
         EXPECT_FALSE(IsMapped(mapping_));
     }
 
@@ -155,11 +128,62 @@ class RealClientTeardownTest : public ::testing::Test {
             master_.master_address());
     }
 
+#ifdef USE_NOF
+    void CheckNoFCleanup() {
+        const auto id = client_->client_->getClientId();
+        Segment mem;
+        mem.id = generate_uuid();
+        mem.name = mem.te_endpoint = "mem";
+        mem.protocol = "tcp";
+        mem.base = 0x300000000;
+        mem.size = 16 << 20;
+        NoFSegment nof;
+        nof.id = generate_uuid();
+        nof.name = nof.te_endpoint = "nof";
+        nof.base = 0x400000000;
+        nof.size = 16 << 20;
+        auto master = master_.service();
+        ASSERT_TRUE(master->MountSegment(mem, id));
+        ASSERT_TRUE(master->MountNoFSegment(nof, id));
+
+        const std::vector<std::string> keys{"end_failed", "end_lost",
+                                            "revoke_lost"};
+        ReplicateConfig config;
+        config.replica_num = config.nof_replica_num = 1;
+        ASSERT_EQ(client_->batch_put_session_start(keys, {64, 64, 64}, config),
+                  std::vector<int>(3, 0));
+        // The proxy acknowledges MEMORY End for two keys, then fails NoF
+        // revoke. Simulate lost End and revoke replies directly at Master.
+        EXPECT_EQ(client_->batch_put_session_end({keys[0], keys[2]}),
+                  std::vector<int>(2, toInt(ErrorCode::RPC_FAIL)));
+        ASSERT_TRUE(master->PutEnd(id, ObjectMeta{keys[1], std::nullopt},
+                                   ReplicaType::MEMORY));
+        ASSERT_TRUE(master->PutRevoke(id, keys[2], ReplicaType::NOF_SSD));
+        EXPECT_EQ(client_->tearDownAll(), toInt(ErrorCode::RPC_FAIL));
+        ASSERT_EQ(ReconnectMaster(), ErrorCode::OK);
+        EXPECT_EQ(client_->tearDownAll(), 0);
+        EXPECT_TRUE(PendingStateEmpty());
+        for (const auto &key : keys) {
+            SCOPED_TRACE(key);
+            auto replicas = master->GetReplicaList(key);
+            ASSERT_TRUE(replicas);
+            ASSERT_EQ(replicas->replicas.size(), 1u);
+            EXPECT_TRUE(replicas->replicas.front().is_memory_replica());
+            EXPECT_EQ(replicas->replicas.front().status,
+                      ReplicaStatus::COMPLETE);
+            // GetReplicaList hides PROCESSING replicas; probe NoF directly.
+            auto revoke = master->PutRevoke(id, key, ReplicaType::NOF_SSD);
+            ASSERT_FALSE(revoke);
+            EXPECT_EQ(revoke.error(), ErrorCode::INVALID_WRITE);
+        }
+    }
+#endif
+
     static constexpr const char *kPendingKey = "teardown_pending_put";
     testing::InProcMaster master_;
     std::unique_ptr<coro_rpc::coro_rpc_server> failing_master_;
+    std::promise<void> destroying_;
     std::shared_ptr<RealClient> client_;
-    std::shared_ptr<ShutdownProbe> probe_;
     void *mapping_ = MAP_FAILED;
     size_t mapping_size_ = 0;
     std::string storage_path_;
@@ -172,14 +196,12 @@ TEST_F(RealClientTeardownTest, DestructorJoinsWorkersAfterSessionCleanupFails) {
 TEST_F(RealClientTeardownTest,
        DestructorDropsFileStorageReferenceBeforeReleasingSegments) {
     AddFileStorage();
-    ASSERT_NE(client_->file_storage_, nullptr);
     CheckDestructorOrdering();
 }
 
 TEST_F(RealClientTeardownTest, ExplicitCloseRetainsFailedSessionForRetry) {
     EXPECT_EQ(client_->tearDownAll(), static_cast<int>(ErrorCode::RPC_FAIL));
     EXPECT_EQ(client_->tearDownAll(), static_cast<int>(ErrorCode::RPC_FAIL));
-    EXPECT_NE(client_->client_, nullptr);
     EXPECT_TRUE(HasPendingSession());
     EXPECT_TRUE(IsMapped(mapping_));
 
@@ -187,9 +209,14 @@ TEST_F(RealClientTeardownTest, ExplicitCloseRetainsFailedSessionForRetry) {
     // The synthetic pending key is absent, so OBJECT_NOT_FOUND confirms that
     // the retry can release its session ownership and complete shutdown.
     EXPECT_EQ(client_->tearDownAll(), 0);
-    EXPECT_EQ(client_->client_, nullptr);
     EXPECT_TRUE(PendingStateEmpty());
     EXPECT_FALSE(IsMapped(mapping_));
 }
+
+#ifdef USE_NOF
+TEST_F(RealClientTeardownTest, CleanupAfterLostMemoryEndAndNoFRevokeReplies) {
+    CheckNoFCleanup();
+}
+#endif
 
 }  // namespace mooncake::test

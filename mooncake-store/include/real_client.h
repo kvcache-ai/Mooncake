@@ -43,6 +43,9 @@ namespace test {
 class PrefetchTeardownTest;
 class RealClientTeardownTest;
 }  // namespace test
+namespace testing {
+class DummyClientSessionTest;
+}  // namespace testing
 class NvlinkHostNumaAllocation;
 struct EgmStorePoolConfig;
 class RegisteredPinnedRegion;
@@ -312,16 +315,15 @@ class RealClient : public PyClient {
     std::vector<int> batch_put_session_start_dummy_helper(
         const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
         const ReplicateConfig &config, const UUID &client_id);
-    std::vector<int> batch_put_session_end_dummy_helper(
-        const std::vector<std::string> &keys, const UUID &client_id);
-    std::vector<int> batch_put_session_revoke_dummy_helper(
-        const std::vector<std::string> &keys, const UUID &client_id);
-    std::vector<int> batch_get_into_multi_buffer_ranges_dummy_helper(
-        const std::vector<DummySessionRangeRequest> &requests,
-        int32_t device_id, const UUID &client_id);
-    std::vector<int> batch_put_from_multi_buffer_ranges_dummy_helper(
-        const std::vector<DummySessionRangeRequest> &requests,
-        int32_t device_id, const UUID &client_id);
+    std::vector<int> finish_dummy_put_sessions(
+        const std::vector<std::string> &keys, const UUID &client_id,
+        bool commit);
+    std::vector<int> execute_dummy_session_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<uint64_t>> &addresses,
+        const std::vector<std::vector<size_t>> &sizes,
+        const std::vector<std::vector<size_t>> &offsets, int32_t device_id,
+        const UUID &client_id, bool is_write);
 
     int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values,
@@ -1240,6 +1242,7 @@ class RealClient : public PyClient {
         std::vector<Replica::Descriptor> replicas;
         uint64_t object_size{0};
         ReplicaWriteMode write_mode{ReplicaWriteMode::SINGLE_REPLICA};
+        bool memory_finalized{false};
         bool writable{true};
         size_t inflight_transfers{0};
     };
@@ -1253,8 +1256,7 @@ class RealClient : public PyClient {
     };
 
     struct ShmContext {
-        std::shared_ptr<SessionState> sessions =
-            std::make_shared<SessionState>();
+        SessionState sessions;
         // Closed before cleanup; failed revocations retain this context for
         // retry.
         bool sessions_closing = false;
@@ -1314,9 +1316,7 @@ class RealClient : public PyClient {
         SessionState &sessions, const std::vector<std::string> &keys);
     ErrorCode cleanup_dummy_sessions(ShmContext &context);
     ErrorCode cleanup_session_state(SessionState &sessions);
-    std::vector<int> execute_dummy_session_ranges(
-        const std::vector<DummySessionRangeRequest> &requests,
-        int32_t device_id, const UUID &client_id, bool is_write);
+    ShmContext *find_open_dummy_context_locked(const UUID &client_id);
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
@@ -1515,6 +1515,7 @@ class RealClient : public PyClient {
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;
     friend class test::RealClientTeardownTest;
+    friend class testing::DummyClientSessionTest;
     friend class RangedDiskLeaseTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,

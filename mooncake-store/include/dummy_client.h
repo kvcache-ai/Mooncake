@@ -253,7 +253,8 @@ class DummyClient : public PyClient {
     };
 
     bool is_device_buffer(void *buffer) const;
-    bool is_dummy_shm_buffer(void *buffer, size_t size) const;
+    bool is_dummy_shm_buffer(void *buffer, size_t size,
+                             bool *uses_pool = nullptr) const;
     std::optional<size_t> external_buffer_remaining(void *buffer) const;
     bool is_registered_buffer(void *buffer, size_t size) const;
     int register_external_buffer(void *buffer, size_t size);
@@ -306,6 +307,7 @@ class DummyClient : public PyClient {
     int register_ascend_shm(const ShmHelper::ShmSegment *shm,
                             bool is_local = false);
 
+    int map_shm(const ShmHelper::ShmSegment *shm, bool local);
     int register_shm_via_ipc(const ShmHelper::ShmSegment *shm,
                              bool is_local = false);
 
@@ -375,6 +377,10 @@ class DummyClient : public PyClient {
     ShmHelper *shm_helper_ = nullptr;
     std::string ipc_socket_path_;
     void *local_buffer_base_ = nullptr;
+    mutable std::mutex shm_mutex_;
+    std::unordered_map<void *, std::shared_ptr<ShmHelper::ShmSegment>>
+        registered_shms_;
+    std::vector<void *> pending_session_staging_;
 
     // Hot cache shm mapping (obtained from real client via IPC)
     void *hot_cache_base_ = nullptr;
