@@ -896,7 +896,8 @@ TEST(TrafficRecorderTest, WritesRouteNamesSidecar) {
     // The sidecar is written at start, before any request: a recorder that is
     // killed never reaches Stop, and its session still has to name its routes.
     {
-        std::ifstream started(recorder.GetStatus().session_dir + "/routes.json");
+        std::ifstream started(recorder.GetStatus().session_dir +
+                              "/routes.json");
         ASSERT_TRUE(started);
         const std::string early((std::istreambuf_iterator<char>(started)),
                                 std::istreambuf_iterator<char>());

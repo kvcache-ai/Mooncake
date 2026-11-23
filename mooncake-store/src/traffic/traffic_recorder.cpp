@@ -607,7 +607,8 @@ void TrafficRecorder::WriterLoop() {
                 if (sink_ != nullptr && sink_->quota_reached()) {
                     // The session hit its size limit. Close the segment now:
                     // format_complete is reported from the closed file, and the
-                    // session must be replayable before a later Stop or restart.
+                    // session must be replayable before a later Stop or
+                    // restart.
                     FinalizeAtQuota();
                     return;
                 }
