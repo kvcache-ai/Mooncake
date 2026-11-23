@@ -11,7 +11,7 @@ use parking_lot::Mutex as ParkingMutex;
 
 use crate::metrics::record_delete_marker_state;
 use crate::shim::RouteAuthorityService;
-use crate::table::LocalRouteTable;
+use crate::table::{LocalRouteTable, RouteGaugeSnapshot};
 use crate::{
     RouteAuthorityPresence, RouteAuthorityRecord, RouteOwnerPage, DEFAULT_ROUTE_OWNER_PAGE_SIZE,
 };
@@ -466,14 +466,43 @@ pub(crate) fn local_authority_service(
         .and_then(|slot| slot.service.clone())
 }
 
-fn route_mesh(namespace: &str) -> Arc<ClusterRouteMesh> {
+fn route_meshes() -> &'static DashMap<String, Arc<ClusterRouteMesh>> {
     static ROUTE_MESHES: OnceLock<DashMap<String, Arc<ClusterRouteMesh>>> = OnceLock::new();
-    let meshes = ROUTE_MESHES.get_or_init(DashMap::new);
-    meshes
+    ROUTE_MESHES.get_or_init(DashMap::new)
+}
+
+fn route_mesh(namespace: &str) -> Arc<ClusterRouteMesh> {
+    route_meshes()
         .entry(namespace.to_string())
         .or_insert_with(|| Arc::new(ClusterRouteMesh::new()))
         .value()
         .clone()
+}
+
+/// Collects local authority entry counts without walking or cloning object routes.
+///
+/// Shared registrations count once; distinct tables count independently. Each
+/// table is read consistently, but the process-wide snapshot is not atomic.
+///
+/// Callers must not hold a metrics sink lock: route mutations may invoke that
+/// sink while holding an authority write lock.
+pub fn snapshot_route_gauges() -> RouteGaugeSnapshot {
+    // Release the namespace registry before acquiring any authority locks.
+    let meshes: Vec<_> = route_meshes()
+        .iter()
+        .map(|entry| entry.value().clone())
+        .collect();
+    let mut snapshot = RouteGaugeSnapshot::default();
+    for mesh in meshes {
+        collect_mesh_gauges(&mesh, &mut snapshot);
+    }
+    snapshot
+}
+
+fn collect_mesh_gauges(mesh: &ClusterRouteMesh, snapshot: &mut RouteGaugeSnapshot) {
+    for slot in &mesh.authorities {
+        snapshot.merge(slot.table.gauge_snapshot());
+    }
 }
 
 fn not_attached(authority: &ClientStableId) -> StoreError {
@@ -481,4 +510,144 @@ fn not_attached(authority: &ClientStableId) -> StoreError {
         "route authority {} is not attached locally",
         authority
     ))
+}
+
+#[cfg(test)]
+mod gauge_tests {
+    use super::*;
+    use mooncake_store_core::{
+        ClientEpoch, CompatibilityDescriptor, ReplicaRoute, ReplicaTier, RouteState, SegmentName,
+    };
+
+    fn route() -> ObjectRoute {
+        ObjectRoute {
+            key: ObjectKey::new("tenant-a::shared-key"),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: vec![ReplicaRoute {
+                owner: ClientRuntimeId::new("gauge-owner", ClientEpoch(1)),
+                segment_name: SegmentName::new("segment"),
+                allocation_id: Some(1),
+                offset: Some(0),
+                segment_offset: 0,
+                length: 1,
+                checksum: None,
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+            cold_backing: None,
+            nof_backing: None,
+        }
+    }
+
+    fn snapshot_namespaces(namespaces: &[&str]) -> RouteGaugeSnapshot {
+        let mut snapshot = RouteGaugeSnapshot::default();
+        for namespace in namespaces {
+            collect_mesh_gauges(&route_mesh(namespace), &mut snapshot);
+        }
+        snapshot
+    }
+
+    #[test]
+    fn route_gauges_count_tables_once_and_follow_authority_lifetimes() {
+        let namespaces = ["gauge-lifetime-a", "gauge-lifetime-b"];
+        let first = ClientStableId::new("authority-a");
+        let second = ClientStableId::new("authority-b");
+        let mut route = route();
+        route.key = ObjectKey::new("gauge-lifetime-tenant::shared-key");
+        register_local_authority(namespaces[0], &first, 1024);
+        register_local_authority(namespaces[0], &first, 1024);
+        register_local_authority(namespaces[0], &second, 1024);
+        register_local_authority(namespaces[1], &first, 1024);
+        for (namespace, authority) in [
+            (namespaces[0], &first),
+            (namespaces[0], &second),
+            (namespaces[1], &first),
+        ] {
+            authority_replace(namespace, authority, &route.key, Some(&route)).unwrap();
+        }
+
+        let snapshot = snapshot_namespaces(&namespaces);
+        assert_eq!(snapshot.objects_by_tenant["gauge-lifetime-tenant"], 3);
+        assert_eq!(
+            snapshot.replicas_by_runtime[&route.replicas[0].owner]["dram"],
+            3
+        );
+        assert_eq!(
+            snapshot_route_gauges().objects_by_tenant["gauge-lifetime-tenant"],
+            3
+        );
+        unregister_local_authority(namespaces[0], &first);
+        assert_eq!(snapshot_namespaces(&namespaces), snapshot);
+
+        // Removing one table's key must not erase another table's contribution.
+        authority_replace(namespaces[0], &second, &route.key, None).unwrap();
+        assert_eq!(
+            snapshot_namespaces(&namespaces).objects_by_tenant["gauge-lifetime-tenant"],
+            2
+        );
+        unregister_local_authority(namespaces[0], &second);
+        unregister_local_authority(namespaces[0], &first);
+        assert_eq!(
+            snapshot_namespaces(&namespaces).objects_by_tenant["gauge-lifetime-tenant"],
+            1
+        );
+        unregister_local_authority(namespaces[1], &first);
+        assert_eq!(
+            snapshot_namespaces(&namespaces),
+            RouteGaugeSnapshot::default()
+        );
+        assert!(!snapshot_route_gauges()
+            .objects_by_tenant
+            .contains_key("gauge-lifetime-tenant"));
+
+        register_local_authority(namespaces[0], &first, 1024);
+        assert_eq!(
+            snapshot_namespaces(&namespaces),
+            RouteGaugeSnapshot::default()
+        );
+        unregister_local_authority(namespaces[0], &first);
+    }
+
+    #[test]
+    fn route_gauge_snapshot_is_consistent_during_table_mutations() {
+        let namespace = "gauge-concurrent-snapshot";
+        let authority = ClientStableId::new("authority");
+        register_local_authority(namespace, &authority, 1024);
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut route = route();
+                barrier.wait();
+                for index in 0..128 {
+                    route.version = RouteVersion(2 * index + 1);
+                    authority_replace(namespace, &authority, &route.key, Some(&route)).unwrap();
+                    authority_replace(namespace, &authority, &route.key, None).unwrap();
+                }
+            });
+            barrier.wait();
+            for _ in 0..128 {
+                let snapshot = snapshot_namespaces(&[namespace]);
+                let objects: u64 = snapshot.objects_by_tenant.values().sum();
+                let replicas: u64 = snapshot
+                    .replicas_by_runtime
+                    .values()
+                    .flat_map(|tiers| tiers.values())
+                    .sum();
+                assert!(objects <= 1);
+                assert_eq!(objects, replicas);
+            }
+        });
+        assert_eq!(
+            snapshot_namespaces(&[namespace]),
+            RouteGaugeSnapshot::default()
+        );
+        unregister_local_authority(namespace, &authority);
+    }
 }
