@@ -3082,6 +3082,15 @@ TEST_F(FileStorageTest, BatchGetSingleflight_SameMultiKeyBatchShared) {
     keys.resize(3);
     sizes.resize(3);
     constexpr int kConcurrency = 16;
+
+    FileStorage::ColdReadOverlapGate overlap;
+    overlap.need = kConcurrency;
+    fileStorage.cold_read_overlap_gate_ = &overlap;
+    struct ClearOverlap {
+        FileStorage& storage;
+        ~ClearOverlap() { storage.cold_read_overlap_gate_ = nullptr; }
+    } clear_overlap{fileStorage};
+
     std::atomic<int> started{0};
     std::atomic<int> success_count{0};
     std::vector<uint64_t> first_key_pointers(kConcurrency, 0);
@@ -3134,8 +3143,8 @@ TEST_F(FileStorageTest, BatchGetSingleflight_SameMultiKeyBatchShared) {
         }
         largest_shared_group = std::max(largest_shared_group, shared_group);
     }
-    EXPECT_GT(largest_shared_group, 1u)
-        << "At least 2 reordered readers should share one staging batch";
+    EXPECT_EQ(largest_shared_group, static_cast<size_t>(kConcurrency))
+        << "All reordered readers should share one staging batch";
 }
 
 TEST_F(FileStorageTest, BatchGetSingleflight_StagingSharingVerification) {
@@ -3155,6 +3164,16 @@ TEST_F(FileStorageTest, BatchGetSingleflight_StagingSharingVerification) {
     const int64_t target_size = sizes.front();
     const std::string& expected_data = batch_data.at(target_key);
     constexpr int kConcurrency = 16;
+
+    // Hold the cold-read leader until every reader has entered Acquire so a
+    // fast local load cannot finish before the other threads join the flight.
+    FileStorage::ColdReadOverlapGate overlap;
+    overlap.need = kConcurrency;
+    fileStorage.cold_read_overlap_gate_ = &overlap;
+    struct ClearOverlap {
+        FileStorage& storage;
+        ~ClearOverlap() { storage.cold_read_overlap_gate_ = nullptr; }
+    } clear_overlap{fileStorage};
 
     std::atomic<int> success_count{0};
     std::atomic<int> started{0};
@@ -3214,8 +3233,8 @@ TEST_F(FileStorageTest, BatchGetSingleflight_StagingSharingVerification) {
     LOG(INFO) << "Staging sharing results: " << kConcurrency << " readers used "
               << distinct_ids.size() << " batch ids, " << largest_group
               << " of them shared one staging buffer";
-    EXPECT_GT(largest_group, 1u)
-        << "At least 2 readers should share the same staging buffer";
+    EXPECT_EQ(largest_group, static_cast<size_t>(kConcurrency))
+        << "All concurrent readers should share the same staging buffer";
 }
 
 TEST_F(FileStorageTest, BatchGetSingleflight_LastReleaseFreesSharedStaging) {
@@ -3235,6 +3254,14 @@ TEST_F(FileStorageTest, BatchGetSingleflight_LastReleaseFreesSharedStaging) {
     const int64_t target_size = sizes.front();
     const std::string& expected_data = batch_data.at(target_key);
     constexpr int kConcurrency = 8;
+
+    FileStorage::ColdReadOverlapGate overlap;
+    overlap.need = kConcurrency;
+    fileStorage.cold_read_overlap_gate_ = &overlap;
+    struct ClearOverlap {
+        FileStorage& storage;
+        ~ClearOverlap() { storage.cold_read_overlap_gate_ = nullptr; }
+    } clear_overlap{fileStorage};
 
     std::vector<uint64_t> batch_ids(kConcurrency, 0);
     std::vector<uint64_t> staging_ptrs(kConcurrency, 0);
@@ -3294,7 +3321,7 @@ TEST_F(FileStorageTest, BatchGetSingleflight_LastReleaseFreesSharedStaging) {
     LOG(INFO) << "Shared staging test: " << sharers << "/" << kConcurrency
               << " readers share the staging buffer of batch_id "
               << batch_ids[0];
-    EXPECT_GT(sharers, 1)
+    EXPECT_EQ(sharers, kConcurrency)
         << "Concurrent same-key readers should share one staging buffer";
 
     sync_point.arrive_and_wait();  // release every id but the survivor's
@@ -3432,7 +3459,7 @@ TEST_F(FileStorageTest,
             sharers++;
         }
     }
-    EXPECT_GT(sharers, 1)
+    EXPECT_EQ(sharers, kConcurrency)
         << "Expected the concurrent readers to share one staging buffer";
     EXPECT_EQ(ClientBufferBatchCount(fileStorage),
               static_cast<size_t>(kConcurrency))
