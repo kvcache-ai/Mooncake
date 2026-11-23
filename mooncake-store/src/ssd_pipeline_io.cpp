@@ -59,7 +59,7 @@ struct BoundedExecutor::Impl {
             if (stopping || pending == limit || !task) return false;
             tasks.push(std::move(task));
             ++pending;
-            changed.notify_one();
+            changed.notify_all();
             return true;
         } catch (...) {
             return false;

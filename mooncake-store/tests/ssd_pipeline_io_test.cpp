@@ -51,6 +51,34 @@ TEST(SsdExecutor, BoundsQueuedAndRunningTasksAndDrainsShutdown) {
     EXPECT_FALSE(executor.TrySubmit([] {}));
 }
 
+TEST(SsdExecutor, WaitSubmitAppliesBackpressureUntilCreditReturns) {
+    BoundedExecutor executor(1, 1);
+    Gate gate;
+    auto entered = gate.entered.get_future();
+    ASSERT_TRUE(executor.TrySubmit([&] { gate.Wait(); }));
+    const auto started = entered.wait_for(2s);
+    if (started != std::future_status::ready) {
+        gate.release.set_value();
+        FAIL() << "Worker did not start";
+        return;
+    }
+    std::promise<void> attempted;
+    auto attempting = attempted.get_future();
+    std::atomic<bool> finished{false};
+    auto waiting = std::async(std::launch::async, [&] {
+        attempted.set_value();
+        return executor.WaitSubmit([&] { finished.store(true); });
+    });
+    attempting.wait();
+    EXPECT_EQ(waiting.wait_for(20ms), std::future_status::timeout);
+    EXPECT_EQ(executor.outstanding(), 1u);
+    gate.release.set_value();
+    EXPECT_TRUE(waiting.get());
+    executor.Shutdown();
+    EXPECT_TRUE(finished.load());
+    EXPECT_FALSE(executor.WaitSubmit([] {}));
+}
+
 class MemorySource final : public ReadSource {
    public:
     explicit MemorySource(size_t size) : bytes(size) {

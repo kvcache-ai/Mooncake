@@ -45,6 +45,8 @@ TEST(SsdReadSource, ReadsRealFileUsingImmutableValueMetadata) {
     auto result = OpenPosixReadSource(file.path, {12000, 17, 1});
     ASSERT_EQ(result.error, Error::kOk);
     ASSERT_TRUE(result.source);
+    ASSERT_TRUE(result.source->native_read_fd());
+    EXPECT_EQ(fcntl(*result.source->native_read_fd(), F_GETFL) & O_NONBLOCK, 0);
     EXPECT_EQ(result.source->info().object_bytes, 12000u);
     EXPECT_EQ(result.source->info().value_file_offset, 17u);
     std::array<std::byte, 257> buffer{};

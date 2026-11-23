@@ -131,6 +131,28 @@ Step by step:
 
 ---
 
+## Bounded local streaming restore
+
+`MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ=true` enables a CPU restore path for
+objects owned by the same Store client. The bucket backend pins each source
+file while a bounded set of staging slots reads and copies chunks into the
+caller's destinations. Whole objects and ranges can exceed the staging arena.
+The default is disabled.
+
+`MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES` defaults to 1 MiB and
+`MOONCAKE_OFFLOAD_STREAM_SLOTS` defaults to four. Read and copy executors
+default to four and two workers, configured with
+`MOONCAKE_OFFLOAD_STREAM_READ_THREADS` and
+`MOONCAKE_OFFLOAD_STREAM_WRITE_THREADS`.
+`MOONCAKE_OFFLOAD_STREAM_MAX_OUTSTANDING` bounds accepted tasks and source
+leases. Full executors apply backpressure. Shutdown waits for accepted local
+reads before releasing their staging memory.
+
+The entire batch is checked for invalid ranges and overlapping destinations
+before copying. A preflight capacity failure can use the existing restore
+path. An I/O failure after copying starts reports failure after accepted work
+has drained. Publish the destination data only after the read succeeds.
+
 ## Storage Backends
 
 ### BucketStorageBackend (default)

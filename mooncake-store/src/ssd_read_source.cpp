@@ -8,7 +8,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
-#include <cstdio>
 
 namespace mooncake::ssd_offload {
 namespace {
@@ -49,25 +48,6 @@ class PosixReadSource final : public ReadSource {
                 file_offset % kDirectReadAlignment != 0)
                 return {0, Error::kInvalidArgument};
             if (buffer.empty()) return {};
-            // A successful short direct read may end at an unaligned EOF.
-            // Return it to the existing payload-coverage check; issuing a
-            // suffix pread would violate O_DIRECT alignment and turn a valid
-            // payload into EINVAL. EINTR accepts no bytes, so retry unchanged.
-            ssize_t result;
-            do {
-                result = pread(fd_, buffer.data(), buffer.size(),
-                               static_cast<off_t>(file_offset));
-            } while (result < 0 && errno == EINTR);
-            if (result < 0) {
-                const auto error = errno;
-                std::fprintf(stderr,
-                             "SSD_FILE_READ mode=direct fd=%d offset=%llu "
-                             "requested=%zu errno=%d\n",
-                             fd_, static_cast<unsigned long long>(file_offset),
-                             buffer.size(), error);
-                return {0, Error::kIoError};
-            }
-            return {static_cast<size_t>(result), Error::kOk};
         }
         size_t bytes = 0;
         while (bytes < buffer.size()) {
@@ -76,16 +56,15 @@ class PosixReadSource final : public ReadSource {
                       static_cast<off_t>(file_offset + bytes));
             if (result < 0) {
                 if (errno == EINTR) continue;
-                const auto error = errno;
-                std::fprintf(stderr,
-                             "SSD_FILE_READ mode=buffered fd=%d offset=%llu "
-                             "requested=%zu completed=%zu errno=%d\n",
-                             fd_, static_cast<unsigned long long>(file_offset),
-                             buffer.size(), bytes, error);
                 return {bytes, Error::kIoError};
             }
             if (result == 0) break;
             bytes += static_cast<size_t>(result);
+            // An unaligned direct read can be the final file block. The
+            // planner checks that all payload bytes are present.
+            if (info_.io_mode == ReadIoMode::kDirect &&
+                size_t(result) % kDirectReadAlignment != 0)
+                break;
         }
         return {bytes, Error::kOk};
     }
