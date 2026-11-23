@@ -1707,7 +1707,7 @@ TEST_F(LocalHotCacheTest, CountMinSketchKeepsNeverSeenKeysBelowTwo) {
 TEST_F(LocalHotCacheTest, CountMinSketchCountsASecondTouchAfterOtherKeys) {
     CountMinSketch sketch;
 
-    constexpr int kKeys = 100000;
+    constexpr int kKeys = 400000;
     constexpr int kGap = 1000;
     int second_touches = 0;
     int reached_two = 0;
