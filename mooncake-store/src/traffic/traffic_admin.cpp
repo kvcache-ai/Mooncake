@@ -7,12 +7,14 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <vector>
 
 #include <json/json.h>
+#include <openssl/crypto.h>
 #include <openssl/rand.h>
 #include <ylt/coro_http/coro_http_server.hpp>
 
@@ -59,30 +61,55 @@ std::string WriteJson(const Json::Value& root) {
 bool Authorized(coro_http::coro_http_request& request,
                 const std::string& token) {
     if (token.empty()) {
-        return true;
+        return false;
     }
-    return request.get_header_value("Authorization") == "Bearer " + token;
+    const std::string_view header = request.get_header_value("Authorization");
+    const std::string expected = "Bearer " + token;
+    if (header.size() != expected.size()) {
+        return false;
+    }
+    return CRYPTO_memcmp(header.data(), expected.data(), expected.size()) == 0;
 }
 
 // Writes one file of a session directory. Both summary.json and routes.json
 // go through this so the 0600 permission and the failure messages stay in one
 // place: a session file left at the default mode would be readable by every
-// local user.
+// local user. The body goes to a sibling temporary file and is renamed into
+// place, so a reader sees either the previous complete file or the new one.
 bool WriteSessionFile(const std::filesystem::path& session_dir,
                       const char* name, const std::string& body) {
     if (session_dir.empty()) {
         return false;
     }
     const std::filesystem::path path = session_dir / name;
-    std::ofstream out(path, std::ios::trunc);
-    if (!out) {
-        LOG(ERROR) << "traffic: cannot write " << name << " in " << session_dir;
+    const std::filesystem::path temporary =
+        session_dir / (std::string(name) + ".tmp." + std::to_string(::getpid()));
+    {
+        std::ofstream out(temporary, std::ios::trunc);
+        if (!out) {
+            LOG(ERROR) << "traffic: cannot write " << name << " in "
+                       << session_dir;
+            return false;
+        }
+        out << body;
+        out.close();
+        if (!out) {
+            LOG(ERROR) << "traffic: cannot write " << name << " in "
+                       << session_dir;
+            ::unlink(temporary.c_str());
+            return false;
+        }
+    }
+    if (::chmod(temporary.c_str(), 0600) != 0) {
+        LOG(ERROR) << "traffic: cannot chmod " << name;
+        ::unlink(temporary.c_str());
         return false;
     }
-    out << body;
-    out.close();
-    if (::chmod(path.c_str(), 0600) != 0) {
-        LOG(WARNING) << "traffic: cannot chmod " << name;
+    if (::rename(temporary.c_str(), path.c_str()) != 0) {
+        LOG(ERROR) << "traffic: cannot publish " << name << " in "
+                   << session_dir;
+        ::unlink(temporary.c_str());
+        return false;
     }
     return true;
 }
