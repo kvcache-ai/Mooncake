@@ -134,6 +134,8 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
             spec.type = oplog_backend_type_;
             spec.connstring = oplog_endpoints;
             spec.cluster_namespace = cluster_id;
+            spec.ha_redis_expected_replicas_per_shard =
+                config_.ha_redis_expected_replicas_per_shard;
             auto backend = CreateHaKvBackend(spec);
             if (!backend) {
                 if (backend.error() == ErrorCode::UNAVAILABLE_IN_CURRENT_MODE) {
@@ -573,6 +575,8 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
     spec.type = oplog_backend_type_;
     spec.connstring = oplog_endpoints_;
     spec.cluster_namespace = cluster_id_;
+    spec.ha_redis_expected_replicas_per_shard =
+        config_.ha_redis_expected_replicas_per_shard;
     auto backend = CreateHaKvBackend(spec);
     if (!backend) {
         LOG(ERROR) << "Final OpLog catch-up failed to open backend: "
@@ -890,9 +894,11 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
     if (metadata_store_) {
         metadata_store_->Snapshot(out.objects);
         out.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+        out.object_storage = metadata_store_->SnapshotObjectReplicas();
     } else {
         out.objects.clear();
         out.weight_metadata = WeightMetadataSnapshot{};
+        out.object_storage = ObjectReplicaSnapshot{};
     }
     if (oplog_applier_) {
         out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
@@ -1037,9 +1043,11 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
     if (metadata_store_) {
         metadata_store_->Snapshot(out.objects);
         out.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+        out.object_storage = metadata_store_->SnapshotObjectReplicas();
     } else {
         out.objects.clear();
         out.weight_metadata = WeightMetadataSnapshot{};
+        out.object_storage = ObjectReplicaSnapshot{};
     }
 
     // Export segments from OpLogApplier's registry (Patch B)
@@ -1134,6 +1142,7 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
             metadata_store_->BeginSnapshotTraversal(), state->generation,
             state);
         capture.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+        capture.object_storage = metadata_store_->SnapshotObjectReplicas();
         ready_snapshot_capture_ = std::move(capture);
         state->active = true;
     }

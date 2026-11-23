@@ -42,6 +42,10 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::unregister_shm_buffer_internal>(&rc);
     server.register_handler<&RealClient::probeKey_internal>(&rc);
     server.register_handler<&RealClient::batchProbeKey_internal>(&rc);
+    server.register_handler<&RealClient::create_drain_job>(&rc);
+    server.register_handler<&RealClient::create_timed_drain_job>(&rc);
+    server.register_handler<&RealClient::query_drain_job>(&rc);
+    server.register_handler<&RealClient::cancel_drain_job>(&rc);
 }
 
 static constexpr size_t kMB = 1024ULL * 1024;
@@ -131,6 +135,32 @@ TEST_F(DummyClientProbeKeyTest, ProbeKeyOverRpcReportsExistence) {
 
     EXPECT_EQ(dummy_client_->probeKey("probe_rpc_missing_key"), 0)
         << "probeKey should report a missing key as 0, not an error";
+}
+
+TEST_F(DummyClientProbeKeyTest, TimedDrainJobOverRpcCanBeRetried) {
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+    PutData("timed_drain_dummy_key", std::string(1024, 'd'));
+    CreateDrainJobRequest request;
+    request.segments = {real_client_->get_hostname()};
+    auto job_id = dummy_client_->create_timed_drain_job(request, 250);
+    ASSERT_TRUE(job_id);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool timed_out = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto job = dummy_client_->query_drain_job(*job_id);
+        ASSERT_TRUE(job);
+        if (job->status == JobStatus::TIMED_OUT) {
+            timed_out = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(timed_out);
+    auto retry = dummy_client_->create_drain_job(request);
+    ASSERT_TRUE(retry);
+    EXPECT_NE(*retry, *job_id);
+    ASSERT_TRUE(dummy_client_->cancel_drain_job(*retry));
 }
 
 TEST_F(DummyClientProbeKeyTest, BatchProbeKeyOverRpcReportsExistence) {

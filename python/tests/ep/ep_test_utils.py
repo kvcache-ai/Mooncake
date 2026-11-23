@@ -10,7 +10,7 @@ from typing import Optional
 importlib.import_module("mooncake.pg")
 
 
-def init_dist(local_rank: int, num_local_ranks: int):
+def init_dist(local_rank: int, num_local_ranks: int, backend: str = "mooncake"):
     # NOTES: you may rewrite this function with your own cluster settings
     ip = os.getenv("MASTER_ADDR", "127.0.0.1")
     port = int(os.getenv("MASTER_PORT", "8361"))
@@ -20,7 +20,7 @@ def init_dist(local_rank: int, num_local_ranks: int):
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group(
-        backend="mooncake",
+        backend=backend,
         init_method=f"tcp://{ip}:{port}",
         world_size=num_nodes * num_local_ranks,
         rank=node_rank * num_local_ranks + local_rank,

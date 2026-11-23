@@ -167,6 +167,23 @@ class TransferEngine {
 
     int removeLocalSegment(const std::string& segment_name);
 
+    // Register [addr, addr + length) for local and (when remote_accessible)
+    // remote RDMA access.
+    //
+    // HugeTLB sub-views: RDMA transports that madvise the registered range
+    // (RDMA transports call ibv_fork_init, whose MADV_DONTFORK the kernel
+    // refuses to apply to a hugetlb VMA split inside a huge page) first try
+    // the range as given. Only if that is rejected with EINVAL is the
+    // registration retried over the enclosing huge pages. The resulting MR —
+    // and the rkey/lkey handed to peers — therefore covers whole huge pages,
+    // including padding outside [addr, addr + length). Access rights are
+    // per-MR, not per-range: a peer that holds the key can address that
+    // padding, which may contain application data that was never registered.
+    // The published description advertises only the requested range, but that
+    // is a cooperative boundary, not an enforced one. A caller unwilling to
+    // expose neighbouring bytes must register the whole hugepage-aligned
+    // mapping itself (whose sub-ranges it then owns exclusively) rather than
+    // passing a sub-view.
     int registerLocalMemory(void* addr, size_t length,
                             const std::string& location = kWildcardLocation,
                             bool remote_accessible = true,
@@ -295,6 +312,32 @@ class TransferEngine {
                                    TaskCongestionDetail& detail) const;
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
+
+    // Engine-owned counter-mode eventfd for batch completion. -1 on
+    // non-Linux, when eventfd() failed, or when this engine is the TENT
+    // runtime. The caller may dup the fd. Destroying the engine closes
+    // the original.
+    //
+    // A non-negative fd means the engine has a notification facility. It
+    // does not mean a particular batch can finish without polling. Call
+    // enableBatchCompletionNotification after allocateBatchID and before
+    // the single submitTransfer. Only that opted-in, counter-capable path
+    // writes the fd. See RFC #5164. Timeout still requires
+    // getTransferStatus; an application deadline ends the wait only.
+    int completionFd() const;
+
+    // Opt in before the first submitTransfer. Fails when the facility is
+    // unavailable, when slice timeouts require foreground polling, or when
+    // the batch already has submitted tasks. A second submitTransfer on an
+    // event-enabled batch is rejected.
+    Status enableBatchCompletionNotification(BatchID batch_id);
+
+    // Non-blocking drain of terminal batches. See BatchCompletion.
+    // Does not free batch handles and does not send peer notify.
+    // One caller at a time. Concurrent calls race the queue tail and
+    // split one wake. CompletionNotificationUnsupported when
+    // completionFd() is -1.
+    Status drainCompletions(std::vector<BatchCompletion>& out);
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 

@@ -42,6 +42,8 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
         .oplog_standby_max_batches_per_poll =
             config.oplog_standby_max_batches_per_poll,
         .batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec,
+        .ha_redis_expected_replicas_per_shard =
+            config.ha_redis_expected_replicas_per_shard,
     });
 }
 
@@ -383,6 +385,8 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         ctx.segments = std::move(snapshot.segments);
         ctx.weight_metadata =
             snapshot.weight_metadata.value_or(WeightMetadataSnapshot{});
+        ctx.object_storage =
+            snapshot.object_storage.value_or(ObjectReplicaSnapshot{});
 
         return ctx;
     }

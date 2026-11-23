@@ -110,6 +110,7 @@ struct MasterConfig {
     double eviction_ratio;
     double eviction_high_watermark_ratio;
     double tenant_eviction_high_watermark_ratio;
+    uint32_t eviction_worker_threads = DEFAULT_EVICTION_WORKER_THREADS;
     double nof_eviction_ratio;
     double nof_eviction_high_watermark_ratio;
     int64_t client_active_ttl_sec;
@@ -122,6 +123,7 @@ struct MasterConfig {
     bool enable_offload;
     std::string ha_backend_type;
     std::string ha_backend_connstring;
+    uint32_t ha_redis_expected_replicas_per_shard = 0;
     int64_t ha_leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     std::string etcd_endpoints;
     int32_t etcd_max_send_message_bytes = 2 * 1024 * 1024;
@@ -132,6 +134,8 @@ struct MasterConfig {
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
+    uint64_t oplog_prune_chunk_batch_count = 10;
+    uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t oplog_standby_max_batches_per_poll =
@@ -254,6 +258,7 @@ class MasterServiceSupervisorConfig {
     // Parameters with default values (optional parameters)
     double tenant_eviction_high_watermark_ratio =
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
+    uint32_t eviction_worker_threads = DEFAULT_EVICTION_WORKER_THREADS;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     std::string rpc_address = "0.0.0.0";
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
@@ -263,6 +268,7 @@ class MasterServiceSupervisorConfig {
     uint32_t handler_worker_thread_num = 0;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
+    uint32_t ha_redis_expected_replicas_per_shard = 0;
     int64_t ha_leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     std::string etcd_endpoints = "0.0.0.0:2379";
     // OpLog store configuration
@@ -271,6 +277,8 @@ class MasterServiceSupervisorConfig {
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
+    uint64_t oplog_prune_chunk_batch_count = 10;
+    uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t oplog_standby_max_batches_per_poll =
@@ -356,6 +364,7 @@ class MasterServiceSupervisorConfig {
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
+        eviction_worker_threads = config.eviction_worker_threads;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -405,6 +414,8 @@ class MasterServiceSupervisorConfig {
         ha_backend_type = config.ha_backend_type;
         ha_leader_lease_ttl_sec = config.ha_leader_lease_ttl_sec;
         etcd_endpoints = config.etcd_endpoints;
+        ha_redis_expected_replicas_per_shard =
+            config.ha_redis_expected_replicas_per_shard;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
         enable_oplog = config.enable_oplog;
@@ -413,6 +424,9 @@ class MasterServiceSupervisorConfig {
         weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
+        oplog_prune_chunk_batch_count = config.oplog_prune_chunk_batch_count;
+        oplog_prune_max_batches_per_second =
+            config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         oplog_standby_max_batches_per_poll =
@@ -553,6 +567,7 @@ class WrappedMasterServiceConfig {
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
     double tenant_eviction_high_watermark_ratio =
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
+    uint32_t eviction_worker_threads = DEFAULT_EVICTION_WORKER_THREADS;
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
@@ -592,12 +607,15 @@ class WrappedMasterServiceConfig {
     uint32_t kv_events_queue_capacity = 65536;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
+    uint32_t ha_redis_expected_replicas_per_shard = 0;
     // OpLog store configuration
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
+    uint64_t oplog_prune_chunk_batch_count = 10;
+    uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t oplog_standby_max_batches_per_poll =
@@ -649,6 +667,7 @@ class WrappedMasterServiceConfig {
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
+        eviction_worker_threads = config.eviction_worker_threads;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -689,6 +708,8 @@ class WrappedMasterServiceConfig {
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
+        ha_redis_expected_replicas_per_shard =
+            config.ha_redis_expected_replicas_per_shard;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
@@ -698,6 +719,9 @@ class WrappedMasterServiceConfig {
         weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
+        oplog_prune_chunk_batch_count = config.oplog_prune_chunk_batch_count;
+        oplog_prune_max_batches_per_second =
+            config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         oplog_standby_max_batches_per_poll =
@@ -776,6 +800,7 @@ class WrappedMasterServiceConfig {
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
+        eviction_worker_threads = config.eviction_worker_threads;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -817,6 +842,8 @@ class WrappedMasterServiceConfig {
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
+        ha_redis_expected_replicas_per_shard =
+            config.ha_redis_expected_replicas_per_shard;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
@@ -826,6 +853,9 @@ class WrappedMasterServiceConfig {
         weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
+        oplog_prune_chunk_batch_count = config.oplog_prune_chunk_batch_count;
+        oplog_prune_max_batches_per_second =
+            config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         oplog_standby_max_batches_per_poll =
@@ -874,6 +904,7 @@ class MasterServiceConfigBuilder {
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
     double tenant_eviction_high_watermark_ratio_ =
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
+    uint32_t eviction_worker_threads_ = DEFAULT_EVICTION_WORKER_THREADS;
     double nof_eviction_ratio_ = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio_ =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
@@ -890,12 +921,15 @@ class MasterServiceConfigBuilder {
     bool enable_offload_ = false;
     std::string ha_backend_type_ = "etcd";
     std::string ha_backend_connstring_;
+    uint32_t ha_redis_expected_replicas_per_shard_ = 0;
     // OpLog store configuration
     bool enable_oplog_ = false;
     bool weight_management_oplog_capability_confirmed_ = false;
     uint64_t weight_import_idle_timeout_ms_ = 5 * 60 * 1000;
     bool enable_oplog_snapshot_ = false;
     uint64_t snapshot_chunk_object_count_ = 1000000;
+    uint64_t oplog_prune_chunk_batch_count_ = 10;
+    uint64_t oplog_prune_max_batches_per_second_ = 50;
     int oplog_poll_interval_ms_ = 1000;
     uint32_t oplog_batch_max_entries_ = 1024;
     uint32_t oplog_standby_max_batches_per_poll_ =
@@ -969,6 +1003,11 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_eviction_worker_threads(uint32_t threads) {
+        eviction_worker_threads_ = threads;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_nof_eviction_ratio(double ratio) {
         nof_eviction_ratio_ = ratio;
         return *this;
@@ -1035,6 +1074,12 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_ha_redis_expected_replicas_per_shard(
+        uint32_t replicas) {
+        ha_redis_expected_replicas_per_shard_ = replicas;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_ha_backend_connstring(
         const std::string& connstring) {
         ha_backend_connstring_ = connstring;
@@ -1066,6 +1111,18 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_snapshot_chunk_object_count(
         uint64_t count) {
         snapshot_chunk_object_count_ = count;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_prune_chunk_batch_count(
+        uint64_t count) {
+        oplog_prune_chunk_batch_count_ = count;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_prune_max_batches_per_second(
+        uint64_t rate) {
+        oplog_prune_max_batches_per_second_ = rate;
         return *this;
     }
 
@@ -1224,6 +1281,11 @@ struct TaskManagerConfig {
 
 class MasterServiceConfig {
    public:
+    // Parallel eviction workers. Callbacks that do not support concurrent
+    // execution stay serial. Default 0 = ceil(filed keys / 16M), clamped
+    // to [1, 64] each round; explicit counts [1, 64] override automatic sizing.
+    // Set from the master's -eviction_worker_threads flag or config key.
+    uint32_t eviction_worker_threads = DEFAULT_EVICTION_WORKER_THREADS;
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
@@ -1275,12 +1337,15 @@ class MasterServiceConfig {
     uint32_t kv_events_queue_capacity = 65536;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
+    uint32_t ha_redis_expected_replicas_per_shard = 0;
     // OpLog store configuration
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
+    uint64_t oplog_prune_chunk_batch_count = 10;
+    uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t oplog_standby_max_batches_per_poll =
@@ -1330,6 +1395,7 @@ class MasterServiceConfig {
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
+        eviction_worker_threads = config.eviction_worker_threads;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -1370,6 +1436,8 @@ class MasterServiceConfig {
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
+        ha_redis_expected_replicas_per_shard =
+            config.ha_redis_expected_replicas_per_shard;
         ha_backend_connstring = config.ha_backend_connstring;
         enable_oplog = config.enable_oplog;
         weight_management_oplog_capability_confirmed =
@@ -1377,6 +1445,9 @@ class MasterServiceConfig {
         weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
+        oplog_prune_chunk_batch_count = config.oplog_prune_chunk_batch_count;
+        oplog_prune_max_batches_per_second =
+            config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         oplog_standby_max_batches_per_poll =
@@ -1436,6 +1507,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
     config.tenant_eviction_high_watermark_ratio =
         tenant_eviction_high_watermark_ratio_;
+    config.eviction_worker_threads = eviction_worker_threads_;
     config.nof_eviction_ratio = nof_eviction_ratio_;
     config.nof_eviction_high_watermark_ratio =
         nof_eviction_high_watermark_ratio_;
@@ -1449,12 +1521,17 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_offload = enable_offload_;
     config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
+    config.ha_redis_expected_replicas_per_shard =
+        ha_redis_expected_replicas_per_shard_;
     config.enable_oplog = enable_oplog_;
     config.weight_management_oplog_capability_confirmed =
         weight_management_oplog_capability_confirmed_;
     config.weight_import_idle_timeout_ms = weight_import_idle_timeout_ms_;
     config.enable_oplog_snapshot = enable_oplog_snapshot_;
     config.snapshot_chunk_object_count = snapshot_chunk_object_count_;
+    config.oplog_prune_chunk_batch_count = oplog_prune_chunk_batch_count_;
+    config.oplog_prune_max_batches_per_second =
+        oplog_prune_max_batches_per_second_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
     config.oplog_batch_max_entries = oplog_batch_max_entries_;
     config.oplog_standby_max_batches_per_poll =

@@ -55,6 +55,7 @@ struct HotStandbyConfig {
     uint32_t oplog_standby_max_batches_per_poll{
         kDefaultOpLogStandbyMaxBatchesPerPoll};
     uint32_t batch_oplog_retry_timeout_sec{180};
+    uint32_t ha_redis_expected_replicas_per_shard{0};
 };
 
 /**

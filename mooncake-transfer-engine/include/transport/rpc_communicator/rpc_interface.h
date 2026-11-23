@@ -3,8 +3,9 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include <pybind11/pybind11.h>
-#include <pybind11/pytypes.h>
+#include <nanobind/nanobind.h>
+
+namespace py = nanobind;
 
 namespace mooncake {
 
@@ -15,11 +16,11 @@ class RpcInterface {
         std::string data;
         size_t data_size = 0;
 
-        pybind11::bytes getBytes() const { return pybind11::bytes(data); }
-        pybind11::memoryview getMemoryView() const {
-            return pybind11::memoryview::from_memory(
-                const_cast<void*>(static_cast<const void*>(data.data())),
-                data.size(), true);
+        py::bytes getBytes() const {
+            return py::bytes(data.data(), data.size());
+        }
+        py::memoryview getMemoryView() const {
+            return py::memoryview(getBytes());
         }
     };
 
@@ -30,11 +31,11 @@ class RpcInterface {
         std::string dtype;
         size_t total_bytes = 0;
         size_t getDataSize() const { return data.size(); }
-        pybind11::bytes getDataAsBytes() const { return pybind11::bytes(data); }
-        pybind11::memoryview getMemoryView() const {
-            return pybind11::memoryview::from_memory(
-                const_cast<void*>(static_cast<const void*>(data.data())),
-                data.size(), true);
+        py::bytes getDataAsBytes() const {
+            return py::bytes(data.data(), data.size());
+        }
+        py::memoryview getMemoryView() const {
+            return py::memoryview(getDataAsBytes());
         }
     };
 
@@ -58,27 +59,24 @@ class RpcInterface {
     bool startServerImpl(bool is_async = true);
     void stopServer();
 
-    int sendData(const std::string& target_address, pybind11::handle data);
-    pybind11::object sendDataAsync(const std::string& target_address,
-                                   pybind11::handle data,
-                                   pybind11::handle loop);
+    int sendData(const std::string& target_address, py::handle data);
+    py::object sendDataAsync(const std::string& target_address, py::handle data,
+                             py::handle loop);
 
-    int sendTensor(const std::string& target_address, pybind11::handle tensor);
-    pybind11::object sendTensorAsync(const std::string& target_address,
-                                     pybind11::handle tensor,
-                                     pybind11::handle loop);
+    int sendTensor(const std::string& target_address, py::handle tensor);
+    py::object sendTensorAsync(const std::string& target_address,
+                               py::handle tensor, py::handle loop);
 
-    void setDataReceiveCallback(pybind11::function callback);
-    void setTensorReceiveCallback(pybind11::function callback);
-
-    void handleIncomingData(std::string_view source_address,
-                            std::string_view data);
-    void handleIncomingTensor(std::string_view source_address,
-                              std::string_view data,
-                              const std::vector<size_t>& shape,
-                              std::string_view dtype);
+    void setDataReceiveCallback(py::callable callback);
+    void setTensorReceiveCallback(py::callable callback);
 
    private:
+    friend void bind_rpc_interface(py::module_& m);
+    static int traversePythonReferences(PyObject* self, visitproc visit,
+                                        void* arg);
+    static int clearPythonReferences(PyObject* self);
+
+    void shutdown();
     std::unique_ptr<Impl> impl_;
 };
 
@@ -87,6 +85,6 @@ std::unique_ptr<RpcInterface> createRpcClient(uint64_t local_rank = 0,
 std::unique_ptr<RpcInterface> createRpcServer(uint64_t local_rank = 0,
                                               uint64_t world_size = 1);
 
-void bind_rpc_interface(pybind11::module_& m);
+void bind_rpc_interface(py::module_& m);
 
 }  // namespace mooncake
