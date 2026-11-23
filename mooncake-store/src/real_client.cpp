@@ -43,6 +43,7 @@
 #include "config/distributed_storage_config.h"
 #include "config/rpc_protocol_config.h"
 #include "store_rpc_client_io_context.h"
+#include "offload_read_executor_config.h"
 #include "bool_parser.h"
 #include "client_auto_port_config.h"
 #include "config/cxl_segment_config.h"
@@ -92,6 +93,21 @@ DEFINE_int32(http_port, 9300,
 namespace mooncake {
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
+
+coro_io::ExecutorWrapper<> *GetOffloadReadExecutor() {
+    static const auto pool = [] {
+        const char *value = std::getenv("MOONCAKE_OFFLOAD_READ_IO_THREADS");
+        const auto configured = detail::ParseOffloadReadIoThreads(value);
+        const auto threads =
+            configured.value_or(detail::kDefaultOffloadReadIoThreads);
+        if (!configured) {
+            LOG(WARNING) << "Invalid MOONCAKE_OFFLOAD_READ_IO_THREADS; using "
+                         << threads << " threads";
+        }
+        return CreateRpcClientIoContextPool(threads);
+    }();
+    return pool->get_executor();
+}
 
 size_t DivideRoundUp(size_t value, size_t divisor) {
     return value / divisor + (value % divisor != 0);
@@ -9591,7 +9607,11 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
     state->file_storage = file_storage_;
     auto *s = state.get();
     auto try_result = co_await coro_io::post(
-        [s]() { return s->file_storage->BatchGet(s->keys, s->sizes); });
+        [s]() { return s->file_storage->BatchGet(s->keys, s->sizes); },
+        GetOffloadReadExecutor());
+    if (co_await async_simple::CurrentExecutor{}) {
+        co_await async_simple::coro::Yield{};
+    }
     auto result = try_result.value();
     if (!result) {
         LOG(ERROR) << "Batch get offload object failed,err_code = "
@@ -9628,10 +9648,15 @@ RealClient::batch_get_offload_object_ranges(
     state->object_sizes = object_sizes;
     state->file_storage = file_storage_;
     auto *s = state.get();
-    auto try_result = co_await coro_io::post([s]() {
-        return s->file_storage->BatchGetRanges(s->keys, s->offsets, s->sizes,
-                                               s->object_sizes);
-    });
+    auto try_result = co_await coro_io::post(
+        [s]() {
+            return s->file_storage->BatchGetRanges(s->keys, s->offsets,
+                                                   s->sizes, s->object_sizes);
+        },
+        GetOffloadReadExecutor());
+    if (co_await async_simple::CurrentExecutor{}) {
+        co_await async_simple::coro::Yield{};
+    }
     auto result = try_result.value();
     if (!result) {
         LOG(ERROR) << "Batch get offload object range failed, err_code = "
