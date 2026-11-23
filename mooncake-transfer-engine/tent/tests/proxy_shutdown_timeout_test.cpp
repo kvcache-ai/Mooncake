@@ -115,6 +115,17 @@ class NeverCompletingTransport : public Transport {
         return Status::OK();
     }
 
+    Status getSubBatchDrainStatus(SubBatchRef batch, bool& drained) override {
+        auto* fb = static_cast<NeverCompletingSubBatch*>(batch);
+        // The injected failure accepts no copy. All other requests can
+        // still access their buffers until the test releases them.
+        if (fail_second && fb->submission == 2) {
+            drained = true;
+            return Status::OK();
+        }
+        return Transport::getSubBatchDrainStatus(batch, drained);
+    }
+
     Status addMemoryBuffer(BufferDesc& desc,
                            const MemoryOptions& /*options*/) override {
         desc.transports.push_back(TCP);

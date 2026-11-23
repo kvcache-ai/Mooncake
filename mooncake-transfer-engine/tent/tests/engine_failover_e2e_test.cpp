@@ -211,6 +211,19 @@ class FakeTransport : public Transport {
         return Status::OK();
     }
 
+    Status getSubBatchDrainStatus(SubBatchRef batch, bool& drained) override {
+        drained = false;
+        for (size_t task_id = 0; task_id < batch->size(); ++task_id) {
+            TransferStatus task_status{PENDING, 0};
+            CHECK_STATUS(getTransferStatus(batch, task_id, task_status));
+            // The fake performs no asynchronous I/O after a terminal status.
+            if (task_status.s == INITIAL || task_status.s == PENDING)
+                return Status::OK();
+        }
+        drained = true;
+        return Status::OK();
+    }
+
     bool supportsCancellation() const override {
         return cancellation_supported_;
     }

@@ -508,7 +508,12 @@ void ProxyManager::runner(size_t id) {
                  it != undrained_batches.end();) {
                 TransferStatus child_status;
                 auto polled = impl_->progressBatch(*it, child_status);
+                bool drained = false;
                 if (polled.ok() && child_status.s != PENDING) {
+                    polled =
+                        impl_->getBatchDrainStatusInternal(*it, drained, false);
+                }
+                if (polled.ok() && drained) {
                     impl_->releaseBatch(reinterpret_cast<Batch*>(*it));
                     it = undrained_batches.erase(it);
                 } else {
