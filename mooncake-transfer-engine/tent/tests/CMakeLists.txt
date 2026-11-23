@@ -432,6 +432,7 @@ if(USE_CUDA)
     "-Wl,--wrap=cudaSetDevice"
     "-Wl,--wrap=cudaGetErrorString"
     "-Wl,--wrap=cudaGetLastError"
+    "-Wl,--wrap=cudaMemcpy"
     "-Wl,--wrap=cudaMemcpyAsync"
     "-Wl,--wrap=cudaMemcpyBatchAsync"
     "-Wl,--wrap=dlsym"

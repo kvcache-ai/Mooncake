@@ -26,6 +26,7 @@ struct MockCuda {
     std::vector<Copy> pending;
     size_t accepted = 0, completed = 0, live_events = 0;
     int copy_calls = 0, fail_copy = 0, stream_queries = 0;
+    size_t nvlink_threshold = 0;
     int device = 1;
     CUcontext context = reinterpret_cast<CUcontext>(0x10000);
     bool fail_create = false, fail_record = false, batch_fallback = false;
@@ -80,8 +81,14 @@ CUresult __wrap_cuCtxSetCurrent(CUcontext context) {
 }
 const char* __wrap_cudaGetErrorString(cudaError_t) { return "injected error"; }
 cudaError_t __wrap_cudaGetLastError() { return cudaSuccess; }
+// CUDA may return from a device-to-device cudaMemcpy before the copy finishes.
+cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t size,
+                              cudaMemcpyKind) {
+    return enqueue(dst, src, size);
+}
 cudaError_t __wrap_cudaMemcpyAsync(void* dst, const void* src, size_t size,
-                                   cudaMemcpyKind, cudaStream_t) {
+                                   cudaMemcpyKind, cudaStream_t stream) {
+    if (stream != testStream()) return cudaErrorInvalidResourceHandle;
     return enqueue(dst, src, size);
 }
 #if CUDART_VERSION >= 12080
@@ -142,7 +149,8 @@ cudaError_t __wrap_cudaEventDestroy(cudaEvent_t event) {
     return cudaSuccess;
 }
 cudaError_t __wrap_cudaEventSynchronize(cudaEvent_t) { return cudaSuccess; }
-cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t) {
+cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream) {
+    if (stream != testStream()) return cudaErrorInvalidResourceHandle;
     if (mock.pending.empty()) return cudaSuccess;
     if (mock.sync_error != cudaSuccess) return mock.sync_error;
     mock.complete();
@@ -172,7 +180,7 @@ class NVLinkTransportTestPeer {
     using Batch = NVLinkSubBatch;
     static Status start(TransportType& transport, Batch& batch,
                         const std::vector<Request>& requests) {
-        transport.async_memcpy_threshold_ = 0;
+        transport.async_memcpy_threshold_ = mock.nvlink_threshold;
         batch.task_list.resize(requests.size());
         std::vector<NVLinkTask*> tasks;
         for (size_t i = 0; i < requests.size(); ++i) {
@@ -364,6 +372,26 @@ TYPED_TEST(CudaTransportDrainTest, UnusedBatchDoesNotQueryDefaultStream) {
 }
 
 using NVLinkDrainTest = CudaTransportDrainTest<NVLinkTransportTestPeer>;
+TEST_F(NVLinkDrainTest, SmallCopyCompletesOnBatchStream) {
+    mock.nvlink_threshold = 1024;
+    mock.sync_error = cudaSuccess;
+    ASSERT_TRUE(start().ok());
+    TransferStatus status{};
+    ASSERT_TRUE(transport.getTransferStatus(batch.get(), 0, status).ok());
+    EXPECT_EQ(status.s, COMPLETED);
+    bool drained = false;
+    ASSERT_TRUE(transport.isSubBatchDrained(batch.get(), drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_EQ(mock.completed, 1u);
+    EXPECT_EQ(target.front(), source.front());
+}
+
+TEST_F(NVLinkDrainTest, SmallCopySyncFailureWaitsForAcceptedCopy) {
+    mock.nvlink_threshold = 1024;
+    ASSERT_TRUE(start().ok());
+    checkFailedCopyDrain();
+}
+
 TEST_F(NVLinkDrainTest, EventCreationFailureWaitsForCopy) {
     mock.fail_create = true;
     ASSERT_TRUE(start().ok());
