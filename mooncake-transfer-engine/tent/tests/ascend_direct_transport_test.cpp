@@ -64,6 +64,9 @@ int g_memcpy_async_calls = 0;
 bool g_memcpy_async_fail = false;
 bool g_fail_flag_copy = false;
 bool g_cleanup_fails = false;
+int g_device_flags = 0;
+bool g_fail_host_free = false;
+bool g_fail_device_free = false;
 bool g_skip_memcpy_copy = false;
 uintptr_t g_next_stream = 0x3000;
 // Ordered ACL events, so a test can assert that the streams were aborted
@@ -101,6 +104,7 @@ void ResetAcl() {
     g_memcpy_async_fail = false;
     g_fail_flag_copy = false;
     g_cleanup_fails = false;
+    g_fail_host_free = g_fail_device_free = false;
     g_skip_memcpy_copy = false;
     g_next_stream = 0x3000;
     g_acl_event_seq = 0;
@@ -191,10 +195,13 @@ aclError aclrtMemcpyAsync(void* dst, size_t destMax, const void* src,
 aclError aclrtMalloc(void** devPtr, size_t size, aclrtMemMallocPolicy policy) {
     (void)policy;
     *devPtr = std::malloc(size);
+    if (*devPtr) ++g_device_flags;
     return *devPtr != nullptr ? ACL_ERROR_NONE : 1;
 }
 
 aclError aclrtFree(void* devPtr) {
+    if (g_fail_device_free) return 1;
+    if (devPtr) --g_device_flags;
     std::free(devPtr);
     return ACL_ERROR_NONE;
 }
@@ -208,6 +215,7 @@ aclError aclrtMallocHost(void** hostPtr, size_t size) {
 }
 
 aclError aclrtFreeHost(void* hostPtr) {
+    if (g_fail_host_free) return 1;
     g_host_free_seq[hostPtr] = ++g_acl_event_seq;
     std::free(hostPtr);
     return ACL_ERROR_NONE;
@@ -1340,6 +1348,135 @@ TEST_F(AscendDirectTransportTest, DisconnectRetryPollsNewerGroup) {
     EXPECT_EQ(state_->disconnect_calls, 2);
     ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, status).ok());
     EXPECT_EQ(status.s, COMPLETED);
+}
+
+TEST_F(AscendDirectTransportTest, UninstallRetriesLocalStreamCleanup) {
+    ASSERT_TRUE(Install().ok());
+    ASSERT_EQ(g_device_flags, 1);
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 1).ok());
+    char src[16]{}, dst[16]{};
+    g_fail_host_free = true;
+    ASSERT_TRUE(
+        transport_
+            ->submitTransferTasks(
+                batch_,
+                {MakeWrite(src, reinterpret_cast<uintptr_t>(dst), sizeof(src))})
+            .ok());
+    TransferStatus status{};
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
+    ASSERT_EQ(status.s, COMPLETED);
+    ASSERT_EQ(g_host_allocs.size(), 1u);
+    g_cleanup_fails = true;
+    EXPECT_FALSE(transport_->uninstall().ok());
+    EXPECT_EQ(g_device_flags, 1);
+    g_cleanup_fails = false;
+    EXPECT_FALSE(transport_->uninstall().ok());
+    EXPECT_TRUE(g_host_free_seq.empty());
+    g_fail_host_free = false;
+    g_fail_device_free = true;
+    EXPECT_FALSE(transport_->uninstall().ok());
+    EXPECT_EQ(g_host_free_seq.size(), 1u);
+    EXPECT_EQ(g_device_flags, 1);
+    g_fail_device_free = false;
+    EXPECT_TRUE(transport_->uninstall().ok());
+    EXPECT_EQ(g_device_flags, 0);
+    EXPECT_TRUE(transport_->uninstall().ok());
+    EXPECT_EQ(g_device_flags, 0);
+}
+
+TEST_F(AscendDirectTransportTest, RequestsExpireWhilePeerDisconnects) {
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/ascend_direct/transfer_timeout_ms", 100);
+    ASSERT_TRUE(InstallAgentTwoEngines(conf).ok());
+    PublishEngineBuffers();
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 3).ok());
+    char src[48]{};
+    auto* sub = static_cast<HixlSubBatch*>(batch_);
+    ASSERT_TRUE(
+        transport_->submitTransferTasks(batch_, {MakeRemoteWrite(src, 16)})
+            .ok());
+    ASSERT_TRUE(
+        WaitUntil([&] { return sub->pending_submits.load() == 0; }, 2000));
+    sub->task_list[0].start_time_ns = 1;
+    state_->waiting_handle = sub->task_list[0].req_handle;
+    state_->on_disconnect = [&] {
+        ASSERT_TRUE(
+            transport_
+                ->submitTransferTasks(batch_, {MakeRemoteWrite(src + 16, 16),
+                                               MakeRemoteWrite(src + 32, 16)})
+                .ok());
+        // Poll only one sibling. The worker must also expire the unpolled one.
+        EXPECT_TRUE(WaitUntil(
+            [&] {
+                TransferStatus status{};
+                return transport_->getTransferStatus(batch_, 1, status).ok() &&
+                       status.s == TIMEOUT;
+            },
+            1000));
+        EXPECT_TRUE(
+            WaitUntil([&] { return sub->pending_submits.load() == 0; }, 1000));
+    };
+    TransferStatus status{};
+    EXPECT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
+    EXPECT_EQ(status.s, TIMEOUT);
+    state_->on_disconnect = {};
+    ASSERT_TRUE(
+        WaitUntil([&] { return sub->pending_submits.load() == 0; }, 2000));
+    EXPECT_EQ(state_->transfer_async_calls, 1);
+    EXPECT_TRUE(transport_->getTransferStatus(batch_, 2, status).ok());
+    EXPECT_EQ(status.s, TIMEOUT);
+    EXPECT_EQ(AscendDirectTransportTestPeer::inflight(*transport_), 0);
+}
+
+TEST_F(AscendDirectTransportTest, RetryQueryAllowsOtherPeerToComplete) {
+    ASSERT_TRUE(InstallAgentTwoEngines().ok());
+    PublishEngineBuffers();
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 3).ok());
+    auto* sub = static_cast<HixlSubBatch*>(batch_);
+    char src[48]{};
+    auto submit = [&](int i, uint64_t dest) {
+        return transport_
+                   ->submitTransferTasks(
+                       batch_, {MakeRemoteWrite(src + 16 * i, 16, dest)})
+                   .ok() &&
+               WaitUntil([&] { return sub->pending_submits.load() == 0; },
+                         2000);
+    };
+    ASSERT_TRUE(submit(0, 0x20010));
+    sub->task_list[0].start_time_ns = 1;
+    state_->waiting_handle = sub->task_list[0].req_handle;
+    state_->disconnect_status = 1;
+    TransferStatus status{};
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
+    ASSERT_EQ(state_->disconnect_calls, 1);
+    ASSERT_TRUE(submit(1, 0x20020));
+    g_device_id = 1;
+    ASSERT_TRUE(submit(2, 0x10010));
+    ASSERT_NE(sub->task_list[0].remote_hixl, sub->task_list[2].remote_hixl);
+    std::promise<void> entered, resume;
+    auto resume_query = resume.get_future();
+    state_->on_query = [&](void* handle) {
+        if (handle == sub->task_list[1].req_handle) {
+            entered.set_value();
+            resume_query.wait();
+        }
+    };
+    state_->disconnect_status = kHixlOk;
+    auto poll = [&](int i) {
+        TransferStatus result{};
+        EXPECT_TRUE(transport_->getTransferStatus(batch_, i, result).ok());
+        return result.s;
+    };
+    auto recovery = std::async(std::launch::async, poll, 0);
+    EXPECT_EQ(entered.get_future().wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    auto other = std::async(std::launch::async, poll, 2);
+    EXPECT_EQ(other.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    resume.set_value();
+    EXPECT_EQ(other.get(), COMPLETED);
+    EXPECT_EQ(recovery.get(), TIMEOUT);
+    EXPECT_EQ(poll(1), COMPLETED);
 }
 
 TEST_F(AscendDirectTransportTest, FailedDisconnectDoesNotDrainTimeout) {

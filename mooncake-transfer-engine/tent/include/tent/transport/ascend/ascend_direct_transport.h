@@ -150,7 +150,7 @@ class AscendDirectTransport : public Transport {
     };
 
     Status initEngines();
-    void finalizeEngines();
+    Status finalizeEngines();
     void startPools(const std::vector<std::vector<int>>& engine_cpus);
     void stopPools();
     Status publishLocalEngines();

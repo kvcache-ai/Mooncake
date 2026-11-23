@@ -114,18 +114,10 @@ Status LocalCopyEngine::initialize(aclrtContext context, int32_t device_id,
     if (!lazy_streams) {
         CHECK_STATUS(createStreamsLocked());
     }
-    auto tear_down = [this]() {
-        destroyStreamsLocked();
-        if (device_one_ != nullptr) {
-            (void)aclrtFree(device_one_);
-            device_one_ = nullptr;
-        }
-    };
     auto ret = aclrtMalloc(&device_one_, kFlagBytes, ACL_MEM_MALLOC_HUGE_FIRST);
     if (ret != ACL_ERROR_NONE || device_one_ == nullptr) {
         device_one_ = nullptr;
         LOG(ERROR) << "aclrtMalloc device flag failed, ret:" << ret;
-        tear_down();
         return Status::InternalError(
             "Alloc local copy device flag failed" LOC_MARK);
     }
@@ -134,7 +126,6 @@ Status LocalCopyEngine::initialize(aclrtContext context, int32_t device_id,
                       ACL_MEMCPY_HOST_TO_DEVICE);
     if (ret != ACL_ERROR_NONE) {
         LOG(ERROR) << "aclrtMemcpy device flag failed, ret:" << ret;
-        tear_down();
         return Status::InternalError(
             "Init local copy device flag failed" LOC_MARK);
     }
@@ -142,31 +133,37 @@ Status LocalCopyEngine::initialize(aclrtContext context, int32_t device_id,
     return Status::OK();
 }
 
-void LocalCopyEngine::finalize() {
+Status LocalCopyEngine::finalize() {
     std::lock_guard<std::mutex> lock(mutex_);
-    ContextGuard guard(context_);
     task_runner_ = nullptr;
     // Abort and destroy the streams before releasing the flags: a stream that
     // is still running may still be writing its group's host flag, and freeing
     // the flag first would leave that write pointing at released memory.
     initialized_ = false;
-    if (!guard.ok()) return;
+    if (streams_.empty() && groups_.empty() && !device_one_)
+        return Status::OK();
+    ContextGuard guard(context_);
+    if (!guard.ok())
+        return Status::InternalError("Set ACL context failed" LOC_MARK);
     destroyStreamsLocked();
     if (retiring_) {
-        LOG(ERROR) << "Local copy streams still own their completion flags";
-        return;
+        return Status::InternalError(
+            "Local copy streams still own their completion flags" LOC_MARK);
     }
-    for (auto& [handle, group] : groups_) {
-        (void)handle;
-        if (group) {
-            freeHostFlags(*group);
-        }
+    while (!groups_.empty()) {
+        auto it = groups_.begin();
+        if (!freeHostFlags(*it->second))
+            return Status::InternalError(
+                "Free local copy host flags failed" LOC_MARK);
+        groups_.erase(it);
     }
-    groups_.clear();
     if (device_one_ != nullptr) {
-        (void)aclrtFree(device_one_);
+        if (aclrtFree(device_one_) != ACL_ERROR_NONE)
+            return Status::InternalError(
+                "Free local copy device flag failed" LOC_MARK);
         device_one_ = nullptr;
     }
+    return Status::OK();
 }
 
 void LocalCopyEngine::setTaskRunner(TaskRunner runner) {
@@ -194,11 +191,11 @@ Status LocalCopyEngine::allocHostFlags(Group& group) {
     return Status::OK();
 }
 
-void LocalCopyEngine::freeHostFlags(Group& group) {
-    if (group.host_flags != nullptr) {
-        (void)aclrtFreeHost(group.host_flags);
-        group.host_flags = nullptr;
-    }
+bool LocalCopyEngine::freeHostFlags(Group& group) {
+    if (group.host_flags && aclrtFreeHost(group.host_flags) != ACL_ERROR_NONE)
+        return false;
+    group.host_flags = nullptr;
+    return true;
 }
 
 aclrtMemcpyKind LocalCopyEngine::memcpyKind(void* src, void* dst) {
@@ -317,8 +314,7 @@ Status LocalCopyEngine::submit(bool write, const std::vector<HixlOpDesc>& ops,
         failStreamsLocked(FAILED);
         destroyStreamsLocked();
         if (finishIfDrained(*group)) {
-            freeHostFlags(*group);
-            groups_.erase(group);
+            if (freeHostFlags(*group)) groups_.erase(group);
             return Status::InternalError("aclrtMemcpyAsync failed" LOC_MARK);
         }
     }
@@ -417,10 +413,7 @@ void LocalCopyEngine::release(void* req) {
     if (it == groups_.end()) {
         return;
     }
-    if (it->second) {
-        freeHostFlags(*it->second);
-    }
-    groups_.erase(it);
+    if (freeHostFlags(*it->second)) groups_.erase(it);
 }
 
 }  // namespace tent

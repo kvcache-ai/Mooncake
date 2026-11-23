@@ -57,7 +57,7 @@ class LocalCopyEngine {
     // would leave most of them unused.
     Status initialize(aclrtContext context, int32_t device_id,
                       size_t local_engine_count);
-    void finalize();
+    Status finalize();
     void setTaskRunner(TaskRunner runner);
 
     Status submit(bool write, const std::vector<HixlOpDesc>& ops, void*& req);
@@ -92,7 +92,7 @@ class LocalCopyEngine {
     bool issueGroupLocked(size_t stream_count,
                           const std::function<bool(size_t)>& issue_stream);
     Status allocHostFlags(Group& group);
-    void freeHostFlags(Group& group);
+    bool freeHostFlags(Group& group);
     static volatile uint32_t* flagAt(const Group& group, size_t index);
     void failStreamsLocked(TransferStatusEnum failure);
     static aclrtMemcpyKind memcpyKind(void* src, void* dst);
