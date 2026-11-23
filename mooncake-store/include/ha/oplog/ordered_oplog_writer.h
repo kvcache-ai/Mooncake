@@ -107,6 +107,16 @@ class OrderedOpLogWriter {
     // use via(executor) to select the continuation's execution context.
     async_simple::Future<ErrorCode> AwaitDurable(uint64_t sequence);
 
+    // Blocking bridges for synchronous Store RPC handlers. Zero waits until
+    // progress or shutdown; timeout never cancels the accepted log record.
+    tl::expected<void, ErrorCode> WaitUntilDurable(
+        uint64_t sequence, std::chrono::milliseconds timeout);
+    // Includes ordered completion callbacks, needed before returning a delete
+    // whose retired allocation may otherwise still block a same-key rewrite.
+    tl::expected<void, ErrorCode> WaitUntilFinalized(
+        uint64_t sequence, std::chrono::milliseconds timeout);
+
+    uint64_t DurableSequence() const;
     bool IsAccepting() const;
     ErrorCode LastError() const;
     std::optional<OrderedOpLogWriterTerminalState> GetTerminalState() const;
