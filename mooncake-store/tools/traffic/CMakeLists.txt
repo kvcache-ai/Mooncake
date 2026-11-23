@@ -39,3 +39,7 @@ target_include_directories(
 target_link_libraries(traffic_load PRIVATE Threads::Threads
                                               JsonCpp::JsonCpp
                                               traffic_session)
+
+add_executable(traffic_gate traffic_gate.cpp)
+target_compile_features(traffic_gate PRIVATE cxx_std_20)
+target_link_libraries(traffic_gate PRIVATE JsonCpp::JsonCpp)

@@ -175,7 +175,7 @@ Two more tools read the same session directory. Build them alongside the
 replay tool:
 
 ```bash
-cmake --build build --target traffic_profile traffic_load
+cmake --build build --target traffic_profile traffic_load traffic_gate
 ```
 
 `traffic_profile` describes what a session contains without decoding any
@@ -215,6 +215,20 @@ actual send). A growing `queue_us` means the server cannot hold the requested
 rate; `--saturate` has no slot, so it does not report that field. The exit code
 is nonzero when a connection failed or a response carried a non-zero `err_code`;
 `rpc_errors_by_route` names the routes that failed.
+
+`traffic_gate` turns two `traffic_load` reports from the same plan into a
+release gate. It reads `achieved_rps` and the `service_us` p99 from a baseline
+and a current report, and fails when throughput drops by more than
+`--max-rps-drop-pct` (default 5%) or p99 rises by more than
+`--max-p99-increase-pct` (default 10%), or when the current run had RPC or
+transport errors. It exits 0 on pass, 1 on gate failure, and 2 on bad input.
+
+```bash
+./build/mooncake-store/tools/traffic/traffic_load ... > baseline.json
+./build/mooncake-store/tools/traffic/traffic_load ... > current.json
+./build/mooncake-store/tools/traffic/traffic_gate \
+  --baseline baseline.json --current current.json
+```
 
 A session without a footer lost its last records, so `traffic_load` refuses it
 unless `--allow-incomplete` is given. Replaying a truncated session is still
