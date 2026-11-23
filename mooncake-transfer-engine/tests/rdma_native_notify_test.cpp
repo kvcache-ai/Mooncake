@@ -405,6 +405,64 @@ TEST_F(NativeNotifyTest, SharedSwitchDisablesNativeServiceAndUsesTcp) {
     EXPECT_EQ(got[0].notify_msg, message.notify_msg);
 }
 
+TEST_F(NativeNotifyTest, EngineSwitchLeavesOtherEnginesAlone) {
+    sender_.reset();
+    auto quiet = std::make_unique<TransferEngine>(
+        true, std::vector<std::string>{device_});
+    quiet->setRdmaNotifyEnabled(false);
+    // An engine set up between the call and init() keeps its own setting.
+    sender_ = makeEngine("127.0.0.1:0");
+    ASSERT_NE(sender_, nullptr);
+    ASSERT_EQ(quiet->init("P2PHANDSHAKE", "127.0.0.1:0"), 0);
+    EXPECT_TRUE(globalConfig().rdma_notify_enabled);
+    EXPECT_FALSE(RdmaNotificationTestPeer::hasNativeService(*quiet));
+    ASSERT_TRUE(RdmaNotificationTestPeer::hasNativeService(*sender_));
+    // Fallback is off, so only the native channel can deliver this one.
+    ASSERT_EQ(sender_->sendNotifyByName(receiver_name_, {"native", "rdma"}), 0);
+    std::vector<Notify> got;
+    ASSERT_TRUE(waitForNotifies(*receiver_, 1, got));
+    ASSERT_EQ(got.size(), 1u);
+    EXPECT_EQ(got[0].name, "native");
+    // TCP is the selected path of the quiet engine, as with the shared
+    // switch, so the disabled fallback does not apply to it.
+    ASSERT_EQ(quiet->sendNotifyByName(receiver_name_, {"quiet", "tcp"}), 0);
+    ASSERT_TRUE(waitForNotifies(*receiver_, 1, got));
+    ASSERT_EQ(got.size(), 1u);
+    EXPECT_EQ(got[0].name, "quiet");
+    // A call after init() changes nothing: the native channel stays selected
+    // and refuses a payload larger than its slot.
+    sender_->setRdmaNotifyEnabled(false);
+    EXPECT_EQ(sender_->sendNotifyByName(receiver_name_,
+                                        {"late", std::string(kSlotBytes, 'x')}),
+              ERR_NOT_IMPLEMENTED);
+}
+
+TEST_F(NativeNotifyTest, EngineSwitchAppliesToTwosided) {
+    sender_.reset();
+    receiver_.reset();
+    setenv("MC_USE_RDMA_TWOSIDED", "1", 1);
+    loadGlobalConfig(globalConfig());
+    sender_ = makeEngine("127.0.0.1:0");
+    ASSERT_NE(sender_, nullptr);
+    auto quiet = std::make_unique<TransferEngine>(
+        true, std::vector<std::string>{device_});
+    quiet->setRdmaNotifyEnabled(false);
+    ASSERT_EQ(quiet->init("P2PHANDSHAKE", "127.0.0.1:0"), 0);
+    ASSERT_NE(quiet->getTransport("rdma_twosided"), nullptr);
+    // The quiet engine refuses the control channel, and fallback is off.
+    EXPECT_EQ(
+        sender_->sendNotifyByName(quiet->getLocalIpAndPort(), {"refused", "x"}),
+        ERR_ENDPOINT);
+    // Its own notifications use TCP.
+    ASSERT_EQ(
+        quiet->sendNotifyByName(sender_->getLocalIpAndPort(), {"quiet", "tcp"}),
+        0);
+    std::vector<Notify> got;
+    ASSERT_TRUE(waitForNotifies(*sender_, 1, got));
+    ASSERT_EQ(got.size(), 1u);
+    EXPECT_EQ(got[0].name, "quiet");
+}
+
 TEST_F(NativeNotifyTest, TwosidedKeepsItsOwnNotificationService) {
     sender_.reset();
     receiver_.reset();

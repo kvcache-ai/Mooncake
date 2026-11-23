@@ -219,6 +219,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
+    multi_transports_->setRdmaNotifyEnabled(rdma_notify_enabled_);
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
@@ -695,7 +696,7 @@ int TransferEngineImpl::sendNotifyByID(
 
 int TransferEngineImpl::sendNotifyByName(
     std::string remote_agent, TransferMetadata::NotifyDesc notify_msg) {
-    if (globalConfig().rdma_notify_enabled) {
+    if (rdmaNotifyEnabled()) {
         Transport* transport = getTransport("rdma_twosided");
         if (!transport) transport = getTransport("rdma");
         auto* rdma_twosided = dynamic_cast<RdmaTwoSidedTransport*>(transport);

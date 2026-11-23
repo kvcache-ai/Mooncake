@@ -544,6 +544,17 @@ int sendNotifyByName(std::string remote_agent, TransferMetadata::NotifyDesc noti
 Sends a notification to a remote agent by name.
 - Typical use: best-effort coordination when you only know the peer's name (segment name), not the handle.
 
+#### TransferEngine::setRdmaNotifyEnabled
+
+```cpp
+void setRdmaNotifyEnabled(bool enabled);
+```
+
+Overrides `MC_RDMA_NOTIFY_ENABLED` for the `rdma` and `rdma_twosided` transports of this engine. Other engines in the process keep following the variable.
+
+- Call it before `init()`; a later call logs an error and changes nothing.
+- Typical use: an engine that never sends or reads notifications turns them off, which saves the registered memory ordinary `rdma` keeps per endpoint.
+
 ### Segment Cache and Metadata Access
 
 #### TransferEngine::syncSegmentCache

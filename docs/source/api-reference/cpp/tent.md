@@ -92,6 +92,7 @@ For users migrating from Transfer Engine, the following table shows how TE APIs 
 | `checkOverlap(addr, length)` | *Not available* | — |
 | `setAutoDiscover(auto_discover)` | *Not available* | Always enabled (ignored under `MC_USE_TENT`) |
 | `setWhitelistFilters(filters)` | *Not available* | Configure via `Config` |
+| `setRdmaNotifyEnabled(enabled)` | *Not available* | Ignored under `MC_USE_TENT` |
 | `numContexts()` | *Not available* | — |
 | *Not available* | `available()` | TENT-only: check if engine initialized successfully |
 | *Not available* | `getSegmentName()` | TENT-only: get local segment name |

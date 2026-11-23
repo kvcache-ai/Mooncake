@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -441,6 +442,21 @@ class TransferEngineImpl {
         auto_discover_config_ = config;
     }
 
+    // See TransferEngine::setRdmaNotifyEnabled().
+    void setRdmaNotifyEnabled(bool enabled) {
+        if (multi_transports_) {
+            LOG(ERROR) << "setRdmaNotifyEnabled() must be called before "
+                          "init(); ignoring it";
+            return;
+        }
+        rdma_notify_enabled_ = enabled;
+    }
+
+    bool rdmaNotifyEnabled() const {
+        return rdma_notify_enabled_.value_or(
+            globalConfig().rdma_notify_enabled);
+    }
+
     // Optional transport hint carried by the protocol argument of init(). An
     // empty value keeps the config written by setAutoDiscover(), which Store
     // uses to pass the protocol of the client before calling init(). A hint
@@ -539,6 +555,8 @@ class TransferEngineImpl {
 
     // Discover topology and install transports automatically when enabled.
     AutoDiscoverConfig auto_discover_config_;
+    // Set by setRdmaNotifyEnabled(); unset follows MC_RDMA_NOTIFY_ENABLED.
+    std::optional<bool> rdma_notify_enabled_;
     std::vector<std::string> filter_;
     bool use_barex_ = false;
 

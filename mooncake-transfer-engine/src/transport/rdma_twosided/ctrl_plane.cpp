@@ -81,7 +81,7 @@ RdmaTwoSidedTransport::ConnectScope::~ConnectScope() {
 
 int RdmaTwoSidedTransport::onSetupCtrlChannel(const HandShakeDesc &peer_desc,
                                               HandShakeDesc &local_desc) {
-    if (!globalConfig().rdma_notify_enabled) {
+    if (!notifyEnabled()) {
         local_desc.reply_msg = "RDMA notify disabled";
         return ERR_INVALID_ARGUMENT;
     }
@@ -125,7 +125,7 @@ int RdmaTwoSidedTransport::onSetupCtrlChannel(const HandShakeDesc &peer_desc,
 std::shared_ptr<CtrlChannel> RdmaTwoSidedTransport::ensureCtrlChannel(
     const std::string &peer_server_name) {
     const auto &contexts = getContextList();
-    if (!globalConfig().rdma_notify_enabled || contexts.empty()) {
+    if (!notifyEnabled() || contexts.empty()) {
         return nullptr;
     }
 

@@ -46,7 +46,7 @@ int RdmaTwoSidedTransport::install(std::string &local_server_name,
                                    std::shared_ptr<Topology> topo) {
     int ret = RdmaTransport::install(local_server_name, meta, topo);
     if (ret) return ret;
-    if (globalConfig().rdma_notify_enabled) {
+    if (notifyEnabled()) {
         startCtrlWorker();
     }
     return 0;

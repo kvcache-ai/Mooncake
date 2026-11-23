@@ -74,6 +74,13 @@ class RdmaTransport : public Transport {
     int sendNativeNotify(const std::string &peer_server_name,
                          const TransferMetadata::NotifyDesc &notify);
 
+    // The engine's setRdmaNotifyEnabled() value, set by MultiTransport before
+    // install(); unset follows MC_RDMA_NOTIFY_ENABLED.
+    void setNotifyEnabled(std::optional<bool> enabled) {
+        notify_enabled_ = enabled;
+    }
+    bool notifyEnabled() const;
+
     // HugeTLB host memory is tried over the caller's own range first; only an
     // EINVAL from ibv_reg_mr (a hugetlb VMA cannot be split for the
     // MADV_DONTFORK ibv_fork_init installs) retries it over the enclosing huge
@@ -231,6 +238,7 @@ class RdmaTransport : public Transport {
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::atomic<bool> notify_running_{false};
     std::thread notify_worker_;
+    std::optional<bool> notify_enabled_;
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
     enum class ClassicCongestionControlMode {
         kUninitialized = -1,

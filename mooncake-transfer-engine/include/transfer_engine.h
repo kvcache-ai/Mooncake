@@ -376,6 +376,12 @@ class TransferEngine {
     void setAutoDiscover(bool auto_discover);
     void setAutoDiscover(const AutoDiscoverConfig& config);
 
+    // Overrides MC_RDMA_NOTIFY_ENABLED for the rdma and rdma_twosided
+    // transports of this engine; without a call they follow the variable.
+    // Must be called before init(); a later call logs an error and changes
+    // nothing. Has no effect with TENT.
+    void setRdmaNotifyEnabled(bool enabled);
+
     void* getBaseAddr();
 
     void setWhitelistFilters(std::vector<std::string>&& filters);
