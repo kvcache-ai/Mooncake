@@ -6036,6 +6036,7 @@ auto MasterService::UpsertStartImpl(const UUID& client_id,
     std::string allocation_residency_affinity_id = residency_affinity_id;
     std::optional<std::chrono::system_clock::time_point>
         allocation_committed_soft_pin_timeout;
+    std::shared_future<ErrorCode> revocation;
     auto admit = [&](bool* dfs_allocation_failed)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
         auto now = std::chrono::system_clock::now();
@@ -6050,6 +6051,10 @@ auto MasterService::UpsertStartImpl(const UUID& client_id,
             MetadataAccessorRW accessor(
                 this, object_id,
                 MetadataAccessorRW::CreateKey{.cleanup_invalid = false});
+            if (revocation.valid() && accessor.IsPublished()) {
+                // Another writer took the key while we waited for revocation.
+                return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
+            }
             if (auto admitted = accessor.Grow(0); !admitted) {
                 return tl::make_unexpected(admitted.error());
             }
@@ -6146,6 +6151,28 @@ auto MasterService::UpsertStartImpl(const UUID& client_id,
                 // PutStart (which only preempts after a timeout), UpsertStart
                 // preempts immediately.
                 if (state.is_processing) {
+                    const bool erase_key =
+                        !metadata.HasReplica(&Replica::fn_is_completed);
+                    if (erase_key) {
+                        allocation_session_id = metadata.session_id;
+                        allocation_residency_affinity_id =
+                            metadata.residency_affinity_id;
+                        allocation_committed_soft_pin_timeout =
+                            metadata.GetCommittedSoftPinTimeout();
+                        if (allocation_committed_soft_pin_timeout &&
+                            *allocation_committed_soft_pin_timeout <= now) {
+                            allocation_committed_soft_pin_timeout.reset();
+                        }
+                        if (metadata.object_storage_write_attempt) {
+                            auto pending = BeginObjectWriteRevocation(
+                                accessor, now + put_start_release_timeout_sec_);
+                            if (!pending)
+                                return tl::make_unexpected(pending.error());
+                            revocation = pending->share();
+                            return tl::make_unexpected(
+                                ErrorCode::OBJECT_REPLICA_BUSY);
+                        }
+                    }
                     auto processing_replicas =
                         metadata.PopReplicas(&Replica::fn_is_processing);
                     metadata.ClearPendingSoftPinAction();
@@ -6161,16 +6188,7 @@ auto MasterService::UpsertStartImpl(const UUID& client_id,
 
                     // If no COMPLETE replicas survive the preemption, this key
                     // effectively does not exist — fall through to Case A.
-                    if (!metadata.HasReplica(&Replica::fn_is_completed)) {
-                        allocation_session_id = metadata.session_id;
-                        allocation_residency_affinity_id =
-                            metadata.residency_affinity_id;
-                        allocation_committed_soft_pin_timeout =
-                            metadata.GetCommittedSoftPinTimeout();
-                        if (allocation_committed_soft_pin_timeout &&
-                            *allocation_committed_soft_pin_timeout <= now) {
-                            allocation_committed_soft_pin_timeout.reset();
-                        }
+                    if (erase_key) {
                         accessor.Erase();
                     }
                 }
@@ -6425,6 +6443,20 @@ auto MasterService::UpsertStartImpl(const UUID& client_id,
     // maintenance pass, not the write path's: this write fails, the evictor
     // builds headroom, the next one succeeds.
     auto result = AdmitWithDfsRecovery(config, admit);
+    if (revocation.valid()) {
+        // The old attempt releases the key in its durable callback. Hold no
+        // key or group lock while waiting for that callback before admission.
+        if (weight_group_operation_lock) weight_group_operation_lock->unlock();
+        auto error = revocation.get();
+        if (error != ErrorCode::OK) return tl::make_unexpected(error);
+        if (weight_group_operation_lock) {
+            weight_group_operation_lock->lock();
+            if (!weight_manager_.AllowsGroupMemberMutation(group_id))
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        result = AdmitWithDfsRecovery(config, admit);
+    }
     if (result && weight_group_operation_lock) {
         weight_manager_.RecordImportWrite(object_id.tenant_id, group_id);
     }
@@ -9844,6 +9876,19 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         if (accessor.GetState().object_storage_commit_pending) continue;
         auto& metadata = accessor.Get();
+        const auto ttl =
+            metadata.put_start_time + put_start_release_timeout_sec_;
+        if (metadata.object_storage_write_attempt &&
+            (!metadata.IsValid() ||
+             (ttl < now && !metadata.HasReplica(&Replica::fn_is_completed)))) {
+            auto revoke = BeginObjectWriteRevocation(accessor, ttl);
+            if (!revoke) {
+                LOG(WARNING)
+                    << "Cannot revoke abandoned object write for key=" << key
+                    << ", err=" << toString(revoke.error());
+            }
+            continue;
+        }
         if (!metadata.IsValid() ||
             metadata.AllReplicas(&Replica::fn_is_completed)) {
             metadata.ClearPendingSoftPinIfNoViableReplica();
@@ -9856,8 +9901,6 @@ void MasterService::DiscardExpiredProcessingReplicas(
             continue;
         }
 
-        const auto ttl =
-            metadata.put_start_time + put_start_release_timeout_sec_;
         if (ttl < now) {
             const route::ObjectRef object = accessor.GetRef();
             const bool had_complete_replica =

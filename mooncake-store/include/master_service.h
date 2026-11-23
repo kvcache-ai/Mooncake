@@ -2359,6 +2359,8 @@ class MasterService {
     tl::expected<void, ErrorCode> CommitObjectStorage(
         const UUID&, const ObjectMeta&, const TenantId&, ReplicaType,
         std::future<ErrorCode>* deferred = nullptr);
+    tl::expected<std::future<ErrorCode>, ErrorCode> BeginObjectWriteRevocation(
+        MetadataAccessorRW&, std::chrono::system_clock::time_point release_at);
     tl::expected<void, ErrorCode> WaitObjectDurable(uint64_t);
     tl::expected<OrderedOpLogWriter::PendingHandle, ErrorCode>
     CommitObjectAware(OrderedOpLogWriter::Reservation&&, OpLogEntry,

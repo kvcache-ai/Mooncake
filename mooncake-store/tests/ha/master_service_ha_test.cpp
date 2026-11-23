@@ -1344,6 +1344,111 @@ TEST_F(MasterServiceHATest, ObjectPutDoesNotSucceedOnQueuedStaleCleanup) {
     EXPECT_EQ(result.error(), ErrorCode::REPLICA_IS_NOT_READY);
 }
 
+enum class AbandonedWrite { Expiry, InvalidMemory, Preemption };
+class AbandonedObjectUpsertTest
+    : public MasterServiceHATest,
+      public ::testing::WithParamInterface<AbandonedWrite> {};
+
+TEST_P(AbandonedObjectUpsertTest, StaysRemovedAfterReplay) {
+    const auto scenario = GetParam();
+    const bool preempt = scenario == AbandonedWrite::Preemption;
+    const std::string key = "replacement";
+    auto config = MakeStrictHAConfig();
+    MasterService service(config);
+    MasterServiceTestPeer peer(service);
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto* log = InstallGatedWriter(service, backend);
+    ObjectStorageConfig storage;
+    storage.enabled = true;
+    storage.target = {
+        "s3", "https://example.test", "bucket", "region", "prefix", true};
+    peer.EnableObjectRecordsForTesting(storage);
+    const auto segment = PrepareSimpleSegment(service, "replacement-memory");
+    const auto writer = segment.client_id;
+    ReplicateConfig memory;
+    memory.replica_num = 1;
+    ReplicateConfig object;
+    object.replica_num = 0;
+    object.os_replica_num = 1;
+    auto original = service.PutStart(writer, key, kDefaultTenant, 64, object);
+    ASSERT_TRUE(original);
+    ASSERT_EQ(original->size(), 1u);
+    ASSERT_TRUE(original->front().object_write_attempt.has_value());
+    const auto& committed = *original->front().object_write_attempt;
+    ASSERT_TRUE(service.PutEnd(writer, ObjectMeta{key, std::nullopt, committed},
+                               kDefaultTenant, ReplicaType::ALL));
+    auto replacement = service.UpsertStart(writer, key, kDefaultTenant, 64,
+                                           preempt ? object : memory);
+    ASSERT_TRUE(replacement);
+    ASSERT_EQ(replacement->size(), 1u);
+    ASSERT_TRUE(replacement->front().object_write_attempt.has_value());
+    const auto attempt = *replacement->front().object_write_attempt;
+
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, config.cluster_id);
+    OpLogBatchStandbyReader reader(config.cluster_id, *backend, applier);
+    ASSERT_EQ(reader.PollOnce().error, ErrorCode::OK);
+    ASSERT_TRUE(standby.GetMetadata(kDefaultTenant.value(), key));
+
+    if (preempt) {
+        // Case A cannot reserve the replacement after revoking the old attempt.
+        auto result = service.UpsertStart(writer, key, kDefaultTenant,
+                                          kStrictTenantQuotaBytes + 1, memory);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
+    } else {
+        auto prefix = reader.GetLastAppliedDurablePrefix();
+        ASSERT_TRUE(prefix);
+        ASSERT_TRUE(log->PauseCallbacksAfter(prefix->last_seq));
+        auto now = std::chrono::system_clock::now();
+        if (scenario == AbandonedWrite::InvalidMemory) {
+            PrepareUnmountSegmentForTesting(service, segment.segment_id);
+        } else {
+            now += std::chrono::hours(24);
+        }
+        peer.DiscardExpiredProcessingReplicas(kDefaultTenant, now);
+        auto late = std::async(std::launch::async, [&] {
+            return service.UpsertEnd(writer,
+                                     ObjectMeta{key, std::nullopt, attempt},
+                                     kDefaultTenant, ReplicaType::ALL);
+        });
+        EXPECT_EQ(late.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        if (scenario == AbandonedWrite::Expiry) {
+            // Invalidate the memory handle between append and finalization.
+            PrepareUnmountSegmentForTesting(service, segment.segment_id);
+        }
+        log->ResumeCallbacks();
+        auto result = late.get();
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), scenario == AbandonedWrite::InvalidMemory
+                                      ? ErrorCode::OBJECT_NOT_FOUND
+                                      : ErrorCode::OBJECT_REPLICA_BUSY);
+        ASSERT_TRUE(log->RunCallbacksThrough(prefix->last_seq + 1));
+    }
+    auto live = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_FALSE(live);
+    EXPECT_EQ(live.error(), ErrorCode::OBJECT_NOT_FOUND);
+    ASSERT_EQ(reader.PollOnce().error, ErrorCode::OK);
+    EXPECT_FALSE(standby.GetMetadata(kDefaultTenant.value(), key));
+    MasterServiceTestPeer::MetadataAccessorRO accessor(
+        &service, MasterServiceTestPeer::ObjectIdentity{kDefaultTenant, key});
+    EXPECT_FALSE(accessor.IsPublished());
+    auto old = standby.FindObjectUpload(committed.token);
+    ASSERT_TRUE(old);
+    EXPECT_EQ(old->phase, ObjectUploadPhase::RETIRED);
+    if (preempt) {
+        auto abandoned = standby.FindObjectUpload(attempt.token);
+        ASSERT_TRUE(abandoned);
+        EXPECT_EQ(abandoned->phase, ObjectUploadPhase::RETIRED);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(HA, AbandonedObjectUpsertTest,
+                         ::testing::Values(AbandonedWrite::Expiry,
+                                           AbandonedWrite::InvalidMemory,
+                                           AbandonedWrite::Preemption));
+
 TEST_F(MasterServiceHATest, ObjectRetirementHonorsLeasesFromEarlierLeaders) {
     ObjectStorageConfig storage;
     storage.enabled = true;

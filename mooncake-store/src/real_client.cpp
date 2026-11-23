@@ -4491,8 +4491,7 @@ RealClient::batch_get_buffer_internal(
         // the read will fail.
         auto runtime_accelerator =
             device::GetAcceleratorRegistry().RuntimeAccelerators();
-        if ((replica.is_disk_replica() || replica.is_dfs_replica() ||
-             replica.is_object_storage_replica()) &&
+        if ((replica.is_disk_replica() || replica.is_dfs_replica()) &&
             runtime_accelerator.FindDeviceForPointer(buffer_handle->ptr())) {
             LOG(WARNING)
                 << (replica.is_dfs_replica() ? "DFS" : "DISK")
@@ -5076,8 +5075,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             return static_cast<int64_t>(total_size);
         }
 
-        if (replica.is_disk_replica() || replica.is_dfs_replica() ||
-            replica.is_object_storage_replica()) {
+        if (replica.is_disk_replica() || replica.is_dfs_replica()) {
             // File-backed full read: use a contiguous temp buffer, then
             // scatter to the requested destination.
             const char *replica_type =

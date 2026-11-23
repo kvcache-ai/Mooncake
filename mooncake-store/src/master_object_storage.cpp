@@ -495,75 +495,66 @@ tl::expected<void, ErrorCode> MasterService::CommitObjectStorage(
 tl::expected<void, ErrorCode> MasterService::RevokeObjectStorageWrite(
     const UUID& writer, const std::string& key,
     const ObjectWriteAttempt& attempt, const TenantId& tenant) {
-    const auto replica_id = attempt.replica_id;
     if (!object_uploads_) return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
-    auto completion = std::make_shared<ObjectCompletion>();
-    auto result = completion->promise.get_future();
-    uint64_t sequence;
-    {
+    auto revoke = [&]() -> tl::expected<std::future<ErrorCode>, ErrorCode> {
         std::shared_lock lock(master_state_mutex_);
         MetadataAccessorRW accessor(this,
                                     MakeObjectIdentityForRequest(key, tenant));
-        if (!accessor.Exists())
+        if (!accessor.IsPublished())
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         auto& metadata = accessor.Get();
-        auto* replica = metadata.GetReplicaByID(replica_id);
-        if (metadata.client_id != writer || !replica ||
+        if (metadata.client_id != writer ||
+            !metadata.GetReplicaByID(attempt.replica_id) ||
             !metadata.object_storage_write_attempt ||
             *metadata.object_storage_write_attempt != attempt ||
             !accessor.InProcessing() ||
             accessor.GetState().object_storage_commit_pending)
             return tl::make_unexpected(ErrorCode::INVALID_WRITE);
-        OpType revoke_type = OpType::PUT_REVOKE;
-        std::string revoke_payload;
-        if (replica->is_object_storage_replica()) {
-            auto record = object_uploads_->FindObjectUpload(
-                replica->get_object_storage_descriptor().object_key);
-            if (!record) return tl::make_unexpected(ErrorCode::INVALID_WRITE);
-            if (record->phase != ObjectUploadPhase::RETIRED) {
-                RetireObject(*record, default_kv_lease_ttl_, ObjectNowMs());
-            }
-            ObjectReplicaMutation mutation;
-            mutation.target = record->target;
-            mutation.records.push_back(*record);
-            mutation.remove_value = true;
-            revoke_type = OpType::OBJECT_STORAGE_MUTATION;
-            revoke_payload = EncodeObjectMutation(mutation);
-        }
-        auto appended = AppendOpLogWithDurableFinalize(
-            revoke_type, tenant.value(), key, std::move(revoke_payload),
-            [this, tenant, key, replica_id, completion](const OpLogEntry&) {
-                std::shared_lock lock(master_state_mutex_);
-                MetadataAccessorRW current(
-                    this, MakeObjectIdentityForRequest(key, tenant));
-                if (current.Exists() &&
-                    current.Get().GetReplicaByID(replica_id)) {
-                    auto replicas =
-                        current.Get().PopReplicas(&Replica::fn_is_processing);
-                    if (!replicas.empty()) {
-                        std::lock_guard discarded_lock(
-                            discarded_replicas_mutex_);
-                        discarded_replicas_.emplace_back(
-                            std::move(replicas),
-                            std::chrono::system_clock::now() +
-                                put_start_release_timeout_sec_);
-                    }
-                    current.Erase();
-                }
-                completion->Finish(ErrorCode::OK);
-            });
-        if (!appended) return tl::make_unexpected(appended.error());
-        accessor.GetState().object_storage_commit_pending = true;
-        sequence = appended->sequence_id;
-    }
-    [[maybe_unused]] auto failure =
-        ordered_oplog_writer_->AwaitDurable(sequence).thenValue(
-            [completion](ErrorCode error) {
-                if (error != ErrorCode::OK) completion->Finish(error);
-            });
-    auto error = result.get();
+        return BeginObjectWriteRevocation(
+            accessor,
+            std::chrono::system_clock::now() + put_start_release_timeout_sec_);
+    }();
+    if (!revoke) return tl::make_unexpected(revoke.error());
+    auto error = revoke->get();
     if (error != ErrorCode::OK) return tl::make_unexpected(error);
     return {};
+}
+
+tl::expected<std::future<ErrorCode>, ErrorCode>
+MasterService::BeginObjectWriteRevocation(
+    MetadataAccessorRW& accessor,
+    std::chrono::system_clock::time_point release_at) {
+    auto completion = std::make_shared<ObjectCompletion>();
+    auto result = completion->promise.get_future();
+    // CommitObjectAware retires every active upload for this logical key,
+    // including a committed value hidden by a memory-only replacement.
+    auto appended = AppendOpLogWithDurableFinalize(
+        OpType::PUT_REVOKE, accessor.GetTenantId().value(), accessor.GetKey(),
+        {},
+        [this, object = accessor.GetRef(), release_at,
+         completion](const OpLogEntry& entry) {
+            std::shared_lock lock(master_state_mutex_);
+            MetadataAccessorRW current(this, TenantId(entry.tenant_id), object);
+            if (current.IsPublished()) {
+                auto replicas =
+                    current.Get().PopReplicas(&Replica::fn_is_processing);
+                if (!replicas.empty()) {
+                    std::lock_guard discarded_lock(discarded_replicas_mutex_);
+                    discarded_replicas_.emplace_back(std::move(replicas),
+                                                     release_at);
+                }
+                current.Erase();
+            }
+            completion->Finish(ErrorCode::OK);
+        });
+    if (!appended) return tl::make_unexpected(appended.error());
+    accessor.GetState().object_storage_commit_pending = true;
+    [[maybe_unused]] auto failure =
+        ordered_oplog_writer_->AwaitDurable(appended->sequence_id)
+            .thenValue([completion](ErrorCode error) {
+                if (error != ErrorCode::OK) completion->Finish(error);
+            });
+    return result;
 }
 
 // object_storage_mutex_ protects admission and both scheduling indexes.
