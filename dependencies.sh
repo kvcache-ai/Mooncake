@@ -23,7 +23,7 @@ NC="\033[0m" # No Color
 # Configuration
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
-GOVER=1.25.9
+GOVER=1.26.9
 OS_RELEASE_FILE=${OS_RELEASE_FILE:-/etc/os-release}
 
 # Function to print section headers
@@ -47,6 +47,74 @@ check_success() {
     if [ $? -ne 0 ]; then
         print_error "$1"
     fi
+}
+
+
+# Install MessagePack C++ from source on openEuler.
+install_msgpack_from_source() {
+    local msgpack_tag="cpp-6.1.1"
+    local expected_commit="44c0f705c9a60217d7e07de844fb13ce4c1c1e6e"
+    local work_dir
+    local source_dir
+    local build_dir
+    local actual_commit
+    local source_url="${GITHUB_PROXY%/}/msgpack/msgpack-c.git"
+
+    print_section "Installing MessagePack C++ from source"
+
+    work_dir=$(mktemp -d) || \
+        print_error "Failed to create temporary directory"
+
+    source_dir="${work_dir}/msgpack-c"
+    build_dir="${work_dir}/build"
+
+    # Download the pinned source version.
+    if ! git clone --depth 1 --branch "$msgpack_tag" \
+        "$source_url" "$source_dir"; then
+        rm -rf "$work_dir"
+        print_error "Failed to download msgpack-c"
+    fi
+
+    # Verify the exact source revision.
+    actual_commit=$(git -C "$source_dir" rev-parse HEAD)
+
+    if [ "$actual_commit" != "$expected_commit" ]; then
+        rm -rf "$work_dir"
+        print_error "Unexpected msgpack-c commit: $actual_commit"
+    fi
+
+    # Configure.
+    if ! cmake -S "$source_dir" -B "$build_dir" \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        -DMSGPACK_BUILD_DOCS=OFF \
+        -DMSGPACK_BUILD_EXAMPLES=OFF \
+        -DMSGPACK_BUILD_TESTS=OFF; then
+        rm -rf "$work_dir"
+        print_error "Failed to configure msgpack-c"
+    fi
+
+    # Build.
+    if ! cmake --build "$build_dir" --parallel "$(nproc)"; then
+        rm -rf "$work_dir"
+        print_error "Failed to build msgpack-c"
+    fi
+
+    # Install.
+    if ! cmake --install "$build_dir"; then
+        rm -rf "$work_dir"
+        print_error "Failed to install msgpack-c"
+    fi
+
+    # Verify the installed C++ header.
+    if [ ! -f /usr/local/include/msgpack.hpp ]; then
+        rm -rf "$work_dir"
+        print_error "MessagePack header installation verification failed"
+    fi
+
+    rm -rf "$work_dir"
+
+    print_success "MessagePack C++ installed successfully"
 }
 
 # Detect ScaleFabric SHCA (shca-tools).
@@ -149,6 +217,15 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
     apt-get update
     check_success "Failed to update package lists"
 elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ] || [ "$OS" = "kylin" ]; then
+    # Package names for openEuler
+    if [ "$OS" = "openeuler" ]; then
+        BOOST_PACKAGE="boost-devel"
+        MSGPACK_PACKAGE=""
+    else
+        BOOST_PACKAGE="boost1.78-devel"
+        MSGPACK_PACKAGE="msgpack-devel"
+    fi
+
     yum install -y dnf-plugins-core epel-release || true
     yum config-manager --set-enabled powertools || yum config-manager --set-enabled crb || true
     yum clean all
@@ -191,6 +268,7 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      libzstd-dev \
                      libasio-dev \
                      libxxhash-dev \
+                     libcli11-dev \
                      pkg-config \
                      patchelf \
                      libc6-dev \
@@ -203,6 +281,13 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
         SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed 's/libibverbs-dev//g')
         SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed "s/libboost-all-dev/libboost-dev/g")
         echo -e "${GREEN}shca-tools package detected. Adjusting system packages accordingly; build with -DUSE_SHCA=ON to enable SHCA support.${NC}"
+    fi
+
+    # Since Ubuntu 26.04, libmsgpack-dev is a transitional package for the C-only
+    # libmsgpack-c-dev, so msgpack.hpp needs libmsgpack-cxx-dev. Ubuntu 22.04 has no
+    # libmsgpack-cxx-dev and ships msgpack.hpp in libmsgpack-dev.
+    if apt-cache show libmsgpack-cxx-dev > /dev/null 2>&1; then
+        SYSTEM_PACKAGES="$SYSTEM_PACKAGES libmsgpack-cxx-dev"
     fi
 
     apt-get install -y $SYSTEM_PACKAGES
@@ -221,7 +306,7 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      libunwind-devel \
                      numactl-devel \
                      python3-devel \
-                     boost1.78-devel \
+                     $BOOST_PACKAGE \
                      openssl-devel \
                      protobuf-devel \
                      yaml-cpp-devel \
@@ -229,7 +314,7 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      hiredis-devel \
                      liburing-devel \
                      jemalloc-devel \
-                     msgpack-devel \
+                     $MSGPACK_PACKAGE \
                      zeromq-devel \
                      libzstd-devel \
                      pkgconf-pkg-config \
@@ -246,6 +331,8 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
 
     yum install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"
+    # The TENT CLI needs CLI11 headers; some releases do not package them.
+    yum install -y cli11-devel || echo -e "${YELLOW}cli11-devel is not available; install CLI11 headers manually to build the TENT CLI.${NC}"
 
 elif [ "$OS" = "kylin" ]; then
     SYSTEM_PACKAGES="@development \
@@ -300,11 +387,19 @@ elif [ "$OS" = "kylin" ]; then
         --setopt=kylin-epkl.gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-kylin \
         --enablerepo=kylin-epkl install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"
+    dnf --repofrompath="kylin-epkl,$KYLIN_EPKL_URL" \
+        --setopt=kylin-epkl.gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-kylin \
+        --enablerepo=kylin-epkl install -y cli11-devel || echo -e "${YELLOW}cli11-devel is not available; install CLI11 headers manually to build the TENT CLI.${NC}"
 else
     print_error "Unsupported OS: $OS"
 fi
 
 print_success "System packages installed successfully"
+
+# openEuler does not provide the required MessagePack C++ development package.
+if [ "$OS" = "openeuler" ]; then
+    install_msgpack_from_source
+fi
 
 # Initialize and update git submodules
 print_section "Initializing Git Submodules"
