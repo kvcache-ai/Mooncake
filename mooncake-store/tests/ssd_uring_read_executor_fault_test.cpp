@@ -724,6 +724,54 @@ TEST(SsdUringReadExecutorFault, OldCqeCannotReleaseANewOperationInTheSameRing) {
 }
 
 class CompletionBoundary : public testing::TestWithParam<int> {};
+class TransientReadCompletion : public testing::TestWithParam<bool> {};
+TEST_P(TransientReadCompletion, RetriesWithFreshIdsAndRetainsSource) {
+    fake_uring::Kernel kernel;
+    File file(13);
+    Arena arena(1);
+    auto source = Source(file);
+    ASSERT_TRUE(source);
+    std::weak_ptr<ReadSource> lease = source;
+    auto pool = UringReadExecutor::Create(1, 1);
+    ASSERT_TRUE(pool);
+    fake_uring::DrainOnExit cleanup{kernel};
+    auto results = std::make_shared<Results>();
+    ASSERT_TRUE(pool->TrySubmit(
+        source, *source->native_read_fd(), {arena.slot(0).data, kSlot}, 0,
+        [results](ReadResult result) { results->Add(0, result); }));
+    source.reset();
+    auto ring = kernel.First();
+    uint64_t previous_id = 0;
+    for (size_t attempt = 0; attempt < 4; ++attempt) {
+        ASSERT_TRUE(ring->WaitAccepted(attempt + 1));
+        const auto id = ring->History().back().user_data;
+        EXPECT_GT(id, previous_id);
+        previous_id = id;
+        EXPECT_EQ(pool->outstanding(), 1u);
+        EXPECT_FALSE(lease.expired());
+        EXPECT_EQ(results->Count(), 0u);
+        const bool success = GetParam() && attempt == 3;
+        ASSERT_TRUE(ring->Complete(
+            id, success ? int(kSlot) : (attempt % 2 ? -EAGAIN : -EINTR)));
+    }
+    ASSERT_TRUE(results->Wait(1));
+    pool->Shutdown();
+    EXPECT_EQ(pool->outstanding(), 0u);
+    EXPECT_TRUE(lease.expired());
+    EXPECT_EQ(results->Count(), 1u);
+    EXPECT_EQ(results->values[0].second.error,
+              GetParam() ? Error::kOk : Error::kIoError);
+    EXPECT_EQ(results->values[0].second.bytes, GetParam() ? kSlot : 0u);
+    if (GetParam()) {
+        EXPECT_EQ(std::memcmp(arena.data, file.bytes.data(), kSlot), 0);
+    }
+    EXPECT_EQ(ring->History().size(), 4u);
+    pool.reset();
+    EXPECT_FALSE(ring->exit_with_unfinished);
+}
+INSTANTIATE_TEST_SUITE_P(RecoveredAndExhausted, TransientReadCompletion,
+                         testing::Bool());
+
 TEST_P(CompletionBoundary,
        RealPipelineAcceptsOnlyPayloadCoveringCqesWithoutSuffixRetry) {
     fake_uring::Kernel kernel;
@@ -778,6 +826,6 @@ TEST_P(CompletionBoundary,
     EXPECT_FALSE(ring->invalid_fixture);
 }
 INSTANTIATE_TEST_SUITE_P(EofShortNegativeAndCoveredPadding, CompletionBoundary,
-                         testing::Values(0, 127, -EIO, -EINTR, 1037));
+                         testing::Values(0, 127, -EIO, 1037));
 }  // namespace
 }  // namespace mooncake::ssd_offload

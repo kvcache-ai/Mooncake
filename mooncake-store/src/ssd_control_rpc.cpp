@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 #include "ssd_control_rpc.h"
 #include "ssd_pipeline_io.h"
+#include <glog/logging.h>
 #include <ylt/struct_pack.hpp>
 #include <ylt/util/utils.hpp>
 #include <cerrno>
@@ -72,6 +73,11 @@ void SsdReadIntoRpcEndpoint::Call(SsdDirectRpcContext context,
                                   {},
                                   {}};
             try {
+                VLOG(2)
+                    << "ssd_push_dispatch_us="
+                    << std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - received)
+                           .count();
                 reply = owner->Execute(work->message, received);
             } catch (...) {
             }

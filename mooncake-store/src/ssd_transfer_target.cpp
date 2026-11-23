@@ -2,8 +2,10 @@
 // Licensed under the Apache License, Version 2.0.
 #include "ssd_transfer_target.h"
 #include "transfer_engine.h"
+#include <glog/logging.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 
@@ -169,8 +171,22 @@ class ClassicWriteTarget final : public SourceDrainedWriteTarget {
             // submission exception retains or drains committed tasks before
             // return/throw. A wait timeout is never used as this slot's
             // barrier.
+            const bool trace_write = VLOG_IS_ON(2);
+            const auto begin_write =
+                trace_write ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
             auto operation = engine_->submitScatter(ranges);
-            if (operation.wait().ok()) return Error::kOk;
+            const auto status = operation.wait();
+            if (trace_write) {
+                LOG(INFO)
+                    << "ssd_push_write_us="
+                    << std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - begin_write)
+                           .count()
+                    << " bytes=" << chunk.payload_bytes
+                    << " ok=" << status.ok();
+            }
+            if (status.ok()) return Error::kOk;
             destinations_drained_.store(false, std::memory_order_relaxed);
             return Error::kTransferError;
         } catch (...) {

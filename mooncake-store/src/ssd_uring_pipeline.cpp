@@ -27,6 +27,7 @@ bool Same(const SlotToken& a, const SlotToken& b) {
 }  // namespace
 
 struct UringReadExecutor::Impl {
+    static constexpr unsigned kMaxReadRetries = 3;
     struct Operation {
         std::shared_ptr<ReadSource> source;
         int fd;
@@ -34,6 +35,7 @@ struct UringReadExecutor::Impl {
         uint64_t offset;
         Completion completion;
         uint64_t id{0};
+        unsigned retries{0};
     };
     struct Worker {
         explicit Worker(size_t depth) : active(depth) {}
@@ -108,6 +110,13 @@ struct UringReadExecutor::Impl {
         std::lock_guard lock(mutex);
         --pending;
     }
+    void PrepareRead(Worker& worker, io_uring_sqe* sqe, Operation& op) {
+        // A new ID distinguishes this submission from a retired CQE.
+        op.id = ++worker.next_id;
+        io_uring_prep_read(sqe, op.fd, op.buffer.data(),
+                           unsigned(op.buffer.size()), op.offset);
+        io_uring_sqe_set_data64(sqe, op.id);
+    }
     void Harvest(Worker& worker) {
         io_uring_cqe* cqe = nullptr;
         while (io_uring_peek_cqe(&worker.ring, &cqe) == 0) {
@@ -120,6 +129,22 @@ struct UringReadExecutor::Impl {
             const ReadResult result{
                 cqe->res < 0 ? 0 : size_t(cqe->res),
                 cqe->res < 0 ? Error::kIoError : Error::kOk};
+            if (found != worker.active.end() &&
+                (cqe->res == -EINTR || cqe->res == -EAGAIN)) {
+                auto& op = **found;
+                std::lock_guard lock(mutex);
+                if (!stopping && op.retries < kMaxReadRetries &&
+                    worker.next_id != UINT64_MAX) {
+                    if (auto* sqe = io_uring_get_sqe(&worker.ring)) {
+                        // This CQE retired the previous read. Keep the same
+                        // source lease, slot and admission credit for retry.
+                        ++op.retries;
+                        PrepareRead(worker, sqe, op);
+                        io_uring_cqe_seen(&worker.ring, cqe);
+                        continue;
+                    }
+                }
+            }
             if (found != worker.active.end()) {
                 const auto& op = **found;
                 const auto info = op.source->info();
@@ -162,10 +187,7 @@ struct UringReadExecutor::Impl {
             worker.queued.pop_front();
             // IDs live in the worker's ring domain across all requests. A
             // request-local slot index is insufficient for a shared ring.
-            active->id = ++worker.next_id;
-            io_uring_prep_read(sqe, active->fd, active->buffer.data(),
-                               unsigned(active->buffer.size()), active->offset);
-            io_uring_sqe_set_data64(sqe, active->id);
+            PrepareRead(worker, sqe, *active);
         }
     }
     void Flush(Worker& worker) {
