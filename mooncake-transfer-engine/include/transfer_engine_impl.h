@@ -133,7 +133,7 @@ class TransferEngineImpl {
 
     int removeLocalSegment(const std::string& segment_name);
 
-    int enableSharedMemoryRegistration();
+    int enableMemoryRegistrationReuse();
 
     int registerLocalMemory(void* addr, size_t length,
                             const std::string& location = kWildcardLocation,
@@ -455,16 +455,19 @@ class TransferEngineImpl {
 
     using MemoryRegionMap = std::map<uintptr_t, MemoryRegion>;
 
-    int registerSharedMemory(const std::vector<BufferEntry>& buffers,
-                             const std::string& location);
-    int unregisterSharedMemory(const std::vector<void*>& addresses);
+    int registerReusableMemory(const std::vector<BufferEntry>& buffers,
+                               const std::string& location);
+    int unregisterReusableMemory(const std::vector<void*>& addresses);
+    int releaseReusableRegions(const std::vector<void*>& regions);
+    void retryFailedRollbacks();
     int registerLocalMemoryBatchImpl(const std::vector<BufferEntry>& buffers,
                                      const std::string& location);
     int unregisterLocalMemoryBatchImpl(const std::vector<void*>& addresses);
 
-    bool shared_memory_registration_ = false;
-    std::mutex shared_registration_mutex_;
-    std::map<uintptr_t, size_t> shared_memory_users_;
+    bool memory_registration_reuse_ = false;
+    std::mutex registration_reuse_mutex_;
+    std::map<uintptr_t, size_t> registration_users_;
+    std::vector<void*> failed_rollbacks_;
 
     bool hasOverlapLocked(uintptr_t addr, uint64_t length) const;
 

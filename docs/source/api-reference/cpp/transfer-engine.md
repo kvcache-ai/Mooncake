@@ -181,26 +181,29 @@ Recycles `BatchID`, and subsequent operations on `submitTransfer` and `getTransf
 
 For the RDMA transfer process, the source pointer `TransferRequest::source` must be registered in advance as an RDMA readable/writable Memory Region space, that is, included as part of the RAM Segment of the current process. Therefore, the following functions are needed:
 
-(shared-memory-registration)=
+(memory-registration-reuse)=
 
-#### TransferEngine::enableSharedMemoryRegistration
+#### TransferEngine::enableMemoryRegistrationReuse
 
 ```cpp
-int enableSharedMemoryRegistration();
+int enableMemoryRegistrationReuse();
 ```
 
 Call before registering memory or starting concurrent callers. Classic TE only;
 TENT and explicit `mp_*` registration are unsupported. Returns `0` on success.
-Identical or contained regions with matching locations share a registration;
+The `nvmeof` and `barex` transports are unsupported.
+Identical or contained regions with matching locations reuse a registration;
 partial overlaps remain errors. Register whole allocations before their views.
-Shared registrations are always remote-accessible and published, regardless of
+Reused registrations are always remote-accessible and published, regardless of
 `remote_accessible` or `update_metadata`.
 
 Release each registration at its requested start address. Keep the allocation
 alive until all users release it, and finish transfers before release. Failed
 cleanup can be retried; affected regions cannot be acquired until it succeeds.
-If a failed registration cannot be rolled back, unregister its start address to
-retry the cleanup. Store clients must still use their own buffer registration API.
+If a failed registration cannot be rolled back, the engine keeps the region
+and retries the rollback on later registrations and releases; keep the
+allocation alive while `checkOverlap` still reports it. Store clients must
+still use their own buffer registration API.
 
 #### TransferEngine::registerLocalMemory
 

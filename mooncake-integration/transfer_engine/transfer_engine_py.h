@@ -288,7 +288,7 @@ class TransferEnginePy {
     }
 
     // FOR EXPERIMENT ONLY
-    int enableSharedMemoryRegistration();
+    int enableMemoryRegistrationReuse();
 
     int registerMemory(uintptr_t buffer_addr, size_t capacity,
                        const std::string &location = kWildcardLocation,

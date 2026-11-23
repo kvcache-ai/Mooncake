@@ -4781,6 +4781,14 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     // registrations are not special-cased and behave exactly as before.
     // A zero-length request is left untouched so it keeps hitting the
     // existing length==0 rejection instead of being widened to the segment.
+    {
+        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        if (registered_buffer_sizes_.count(buffer)) {
+            LOG(ERROR) << "Buffer " << buffer << " is already registered";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
     size_t registration_size = size;
     auto *shm_helper = ShmHelper::getInstance();
     if (shm_helper->is_hugepage()) {
@@ -4845,6 +4853,13 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto unregister_result = [&]() -> tl::expected<void, ErrorCode> {
+        {
+            std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+            auto rec_it = registered_buffer_sizes_.find(buffer);
+            if (rec_it != registered_buffer_sizes_.end() &&
+                rec_it->second.te_released)
+                return {};
+        }
         auto &hook = TeUnregisterHookForTestingSlot();
         if (hook) {
             return hook(buffer);
@@ -4885,6 +4900,7 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
                        << buffer << ": " << toString(rc)
                        << "; buffer stays recorded and the NoF pages stay "
                           "quarantined. Do not free or remap this buffer.";
+            rec_it->second.te_released = true;
             return tl::unexpected(rc);
         }
     }

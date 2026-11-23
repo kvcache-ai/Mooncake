@@ -566,6 +566,10 @@ int TransferEngineImpl::freeEngine() {
     return 0;
 }
 
+static bool supportsRegistrationReuse(const std::string& proto) {
+    return proto != "nvmeof" && proto != "barex";
+}
+
 // Only for testing
 Transport* TransferEngineImpl::installTransport(const std::string& proto,
                                                 void** args) {
@@ -573,6 +577,11 @@ Transport* TransferEngineImpl::installTransport(const std::string& proto,
     if (transport) {
         LOG(WARNING) << "Transport " << proto << " already installed";
         return transport;
+    }
+    if (memory_registration_reuse_ && !supportsRegistrationReuse(proto)) {
+        LOG(ERROR) << "Transport " << proto
+                   << " does not support memory registration reuse";
+        return nullptr;
     }
 #ifdef USE_NCCL_HOST
     if (proto == "nccl" && !local_memory_regions_.empty()) {
@@ -793,18 +802,22 @@ bool TransferEngineImpl::checkOverlap(void* addr, uint64_t length) {
     return hasOverlapLocked(reinterpret_cast<uintptr_t>(addr), length);
 }
 
-int TransferEngineImpl::enableSharedMemoryRegistration() {
+int TransferEngineImpl::enableMemoryRegistrationReuse() {
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    if (shared_memory_registration_) return 0;
+    if (memory_registration_reuse_) return 0;
     if (!local_memory_regions_.empty() || !registering_memory_regions_.empty())
         return ERR_INVALID_ARGUMENT;
-    shared_memory_registration_ = true;
+    for (auto transport : multi_transports_->listTransports())
+        if (!supportsRegistrationReuse(transport->getName()))
+            return ERR_NOT_IMPLEMENTED;
+    memory_registration_reuse_ = true;
     return 0;
 }
 
-int TransferEngineImpl::registerSharedMemory(
+int TransferEngineImpl::registerReusableMemory(
     const std::vector<BufferEntry>& buffers, const std::string& location) {
-    std::lock_guard<std::mutex> transaction(shared_registration_mutex_);
+    std::lock_guard<std::mutex> transaction(registration_reuse_mutex_);
+    retryFailedRollbacks();
     std::vector<BufferEntry> new_buffers;
     std::vector<uintptr_t> bases;
     std::set<uintptr_t> addresses;
@@ -839,14 +852,15 @@ int TransferEngineImpl::registerSharedMemory(
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (size_t i = 0; i < buffers.size(); ++i) {
         ++local_memory_regions_.at(bases[i]).users;
-        ++shared_memory_users_[reinterpret_cast<uintptr_t>(buffers[i].addr)];
+        ++registration_users_[reinterpret_cast<uintptr_t>(buffers[i].addr)];
     }
     return 0;
 }
 
-int TransferEngineImpl::unregisterSharedMemory(
+int TransferEngineImpl::unregisterReusableMemory(
     const std::vector<void*>& addresses) {
-    std::lock_guard<std::mutex> transaction(shared_registration_mutex_);
+    std::lock_guard<std::mutex> transaction(registration_reuse_mutex_);
+    retryFailedRollbacks();
     std::map<uintptr_t, size_t> releases;
     std::set<uintptr_t> unique;
     std::vector<void*> expired;
@@ -855,18 +869,10 @@ int TransferEngineImpl::unregisterSharedMemory(
         for (auto ptr : addresses) {
             auto addr = reinterpret_cast<uintptr_t>(ptr);
             if (!unique.insert(addr).second) return ERR_INVALID_ARGUMENT;
-            if (shared_memory_users_.count(addr)) {
-                auto region =
-                    std::prev(local_memory_regions_.upper_bound(addr));
-                ++releases[region->first];
-                continue;
-            }
-            // A registration whose rollback failed leaves a userless record.
-            auto orphan = local_memory_regions_.find(addr);
-            if (orphan == local_memory_regions_.end() ||
-                !orphan->second.releasing || orphan->second.users)
+            if (!registration_users_.count(addr))
                 return ERR_ADDRESS_NOT_REGISTERED;
-            releases[addr];
+            auto region = std::prev(local_memory_regions_.upper_bound(addr));
+            ++releases[region->first];
         }
         for (const auto& [base, count] : releases) {
             auto& region = local_memory_regions_.at(base);
@@ -876,44 +882,61 @@ int TransferEngineImpl::unregisterSharedMemory(
             }
         }
     }
-    // On retry, some transports may have already unregistered the region.
     if (!expired.empty()) {
-        int first_error = 0;
-        for (auto transport : multi_transports_->listTransports()) {
-            for (auto addr : expired) {
-                int ret = transport->unregisterLocalMemory(addr, false);
-                if (ret && ret != ERR_ADDRESS_NOT_REGISTERED && !first_error)
-                    first_error = ret;
-            }
-        }
-        int metadata_ret = metadata_->updateLocalSegmentDesc();
-        if (first_error) return first_error;
-        if (metadata_ret) return metadata_ret;
+        int ret = releaseReusableRegions(expired);
+        if (ret) return ret;
     }
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (auto addr : expired) {
-        clearSkipRegistrationLocked(addr);
-        eraseMemoryRegionLocked(addr);
-    }
     for (const auto& [base, count] : releases) {
         auto region = local_memory_regions_.find(base);
         if (region != local_memory_regions_.end())
             region->second.users -= count;
     }
     for (auto ptr : addresses) {
-        auto user = shared_memory_users_.find(reinterpret_cast<uintptr_t>(ptr));
-        if (user != shared_memory_users_.end() && --user->second == 0)
-            shared_memory_users_.erase(user);
+        auto user = registration_users_.find(reinterpret_cast<uintptr_t>(ptr));
+        if (user != registration_users_.end() && --user->second == 0)
+            registration_users_.erase(user);
     }
     return 0;
+}
+
+int TransferEngineImpl::releaseReusableRegions(
+    const std::vector<void*>& regions) {
+    // On retry, some transports may have already unregistered the region.
+    auto transports = multi_transports_->listTransports();
+    int first_error = 0;
+    for (auto transport : transports) {
+        for (auto addr : regions) {
+            int ret = transport->unregisterLocalMemory(addr, false);
+            if (ret && ret != ERR_ADDRESS_NOT_REGISTERED && !first_error)
+                first_error = ret;
+        }
+    }
+    if (!transports.empty()) {
+        int metadata_ret = metadata_->updateLocalSegmentDesc();
+        if (!first_error) first_error = metadata_ret;
+    }
+    if (first_error) return first_error;
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    for (auto addr : regions) {
+        clearSkipRegistrationLocked(addr);
+        eraseMemoryRegionLocked(addr);
+    }
+    return 0;
+}
+
+void TransferEngineImpl::retryFailedRollbacks() {
+    if (failed_rollbacks_.empty()) return;
+    if (releaseReusableRegions(failed_rollbacks_) == 0)
+        failed_rollbacks_.clear();
 }
 
 int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
                                             const std::string& location,
                                             bool remote_accessible,
                                             bool update_metadata) {
-    if (shared_memory_registration_)
-        return registerSharedMemory({{addr, length}}, location);
+    if (memory_registration_reuse_)
+        return registerReusableMemory({{addr, length}}, location);
     if (length == 0) {
         LOG(ERROR)
             << "Transfer Engine does not support zero length memory region";
@@ -959,7 +982,7 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
 
 int TransferEngineImpl::unregisterLocalMemory(void* addr,
                                               bool update_metadata) {
-    if (shared_memory_registration_) return unregisterSharedMemory({addr});
+    if (memory_registration_reuse_) return unregisterReusableMemory({addr});
     // Best-effort: try every transport so one failure can't leave the region
     // registered on the others; mirrors unregisterLocalMemoryBatch (#2869).
     int first_error = 0;
@@ -981,7 +1004,7 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
 int TransferEngineImpl::mp_registerLocalMemory(
     std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
         buffer_map) {
-    if (shared_memory_registration_) return ERR_NOT_IMPLEMENTED;
+    if (memory_registration_reuse_) return ERR_NOT_IMPLEMENTED;
     // ========== Phase 1: Pre-check ==========
     for (const auto& entry : buffer_map) {
         for (const auto& buffer : entry.second) {
@@ -1073,7 +1096,7 @@ void TransferEngineImpl::rollbackAllRegistrations(
 int TransferEngineImpl::mp_unregisterLocalMemory(
     std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
         buffer_map) {
-    if (shared_memory_registration_) return ERR_NOT_IMPLEMENTED;
+    if (memory_registration_reuse_) return ERR_NOT_IMPLEMENTED;
     for (const auto& buffer_entry : buffer_map) {
         const std::string& protocol = buffer_entry.first;
         const std::vector<RegisteredBuffer>& buffer_list = buffer_entry.second;
@@ -1104,8 +1127,8 @@ int TransferEngineImpl::mp_unregisterLocalMemory(
 
 int TransferEngineImpl::registerLocalMemoryBatch(
     const std::vector<BufferEntry>& buffer_list, const std::string& location) {
-    if (shared_memory_registration_)
-        return registerSharedMemory(buffer_list, location);
+    if (memory_registration_reuse_)
+        return registerReusableMemory(buffer_list, location);
     return registerLocalMemoryBatchImpl(buffer_list, location);
 }
 
@@ -1176,9 +1199,11 @@ int TransferEngineImpl::registerLocalMemoryBatchImpl(
                         << (*it)->getName() << ", ret=" << rollback_ret;
                 }
             }
-            if (rollback_failed && shared_memory_registration_) {
-                // Keep the records so unregistering them retries the cleanup.
-                for (auto& region : regions) region.releasing = true;
+            if (rollback_failed && memory_registration_reuse_) {
+                for (auto& region : regions) {
+                    region.releasing = true;
+                    failed_rollbacks_.push_back(region.addr);
+                }
                 commitMemoryRegions(regions);
             } else {
                 releaseMemoryRegions(regions);
@@ -1193,7 +1218,7 @@ int TransferEngineImpl::registerLocalMemoryBatchImpl(
 
 int TransferEngineImpl::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
-    if (shared_memory_registration_) return unregisterSharedMemory(addr_list);
+    if (memory_registration_reuse_) return unregisterReusableMemory(addr_list);
     return unregisterLocalMemoryBatchImpl(addr_list);
 }
 

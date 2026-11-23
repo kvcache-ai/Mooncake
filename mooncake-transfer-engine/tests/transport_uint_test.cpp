@@ -1479,7 +1479,7 @@ TEST_F(TransportTest, ReadEmptyFile) {
 }
 
 template <typename Engine>
-Transport* installSharedRegistrationTcp(Engine& engine) {
+Transport* installRegistrationReuseTcp(Engine& engine) {
     testing::internal::CaptureStderr();
     auto* transport = engine.installTransport("tcp", nullptr);
     auto output = testing::internal::GetCapturedStderr();
@@ -1494,14 +1494,14 @@ Transport* installSharedRegistrationTcp(Engine& engine) {
     return transport;
 }
 
-class SharedMemoryRegistrationTest : public TransportTest {
+class MemoryRegistrationReuseTest : public TransportTest {
    protected:
     void SetUp() override {
         TransportTest::SetUp();
         engine = std::make_unique<TransferEngine>(false);
         ASSERT_EQ(engine->init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
-        ASSERT_NE(installSharedRegistrationTcp(*engine), nullptr);
-        ASSERT_EQ(engine->enableSharedMemoryRegistration(), 0);
+        ASSERT_NE(installRegistrationReuseTcp(*engine), nullptr);
+        ASSERT_EQ(engine->enableMemoryRegistrationReuse(), 0);
     }
 
     void TearDown() override {
@@ -1519,7 +1519,7 @@ class SharedMemoryRegistrationTest : public TransportTest {
     std::unique_ptr<TransferEngine> engine;
 };
 
-TEST_F(SharedMemoryRegistrationTest,
+TEST_F(MemoryRegistrationReuseTest,
        StoreAndPdShareIdenticalAndContainedRegions) {
     auto* base = allocation.data();
     // Store requests local access; PD needs a published remote-accessible MR.
@@ -1537,7 +1537,7 @@ TEST_F(SharedMemoryRegistrationTest,
     EXPECT_EQ(publishedBuffers(), 0u);
 }
 
-TEST_F(SharedMemoryRegistrationTest, ParentReleaseKeepsChildAlive) {
+TEST_F(MemoryRegistrationReuseTest, ParentReleaseKeepsChildAlive) {
     auto* base = allocation.data();
     ASSERT_EQ(engine->registerLocalMemory(base, 256), 0);
     ASSERT_EQ(engine->registerLocalMemory(base + 64, 64), 0);
@@ -1551,7 +1551,7 @@ TEST_F(SharedMemoryRegistrationTest, ParentReleaseKeepsChildAlive) {
     EXPECT_EQ(publishedBuffers(), 0u);
 }
 
-TEST_F(SharedMemoryRegistrationTest, InvalidBatchDoesNotAcquireReferences) {
+TEST_F(MemoryRegistrationReuseTest, InvalidBatchDoesNotAcquireReferences) {
     auto* base = allocation.data();
     ASSERT_EQ(engine->registerLocalMemory(base, 128), 0);
     testing::internal::CaptureStderr();
@@ -1566,7 +1566,7 @@ TEST_F(SharedMemoryRegistrationTest, InvalidBatchDoesNotAcquireReferences) {
     EXPECT_FALSE(engine->checkOverlap(base, 128));
 }
 
-TEST_F(SharedMemoryRegistrationTest,
+TEST_F(MemoryRegistrationReuseTest,
        RejectsInvalidLeasesWithoutReleasingOthers) {
     auto* base = allocation.data();
     ASSERT_EQ(engine->registerLocalMemory(base, 128), 0);
@@ -1587,8 +1587,7 @@ TEST_F(SharedMemoryRegistrationTest,
     EXPECT_EQ(publishedBuffers(), 0u);
 }
 
-TEST_F(SharedMemoryRegistrationTest,
-       ConcurrentUsersKeepStoreRegistrationAlive) {
+TEST_F(MemoryRegistrationReuseTest, ConcurrentUsersKeepStoreRegistrationAlive) {
     auto* base = allocation.data();
     ASSERT_EQ(engine->registerLocalMemory(base, 256), 0);
     std::vector<std::future<int>> users;
@@ -1606,13 +1605,13 @@ TEST_F(SharedMemoryRegistrationTest,
     EXPECT_EQ(publishedBuffers(), 0u);
 }
 
-TEST_F(TransportTest, SharedMemoryRegistrationRequiresEmptyClassicEngine) {
+TEST_F(TransportTest, MemoryRegistrationReuseRequiresEmptyClassicEngine) {
     TransferEngine engine(false);
     ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
     std::array<char, 64> allocation{};
     ASSERT_EQ(engine.registerLocalMemory(allocation.data(), allocation.size()),
               0);
-    EXPECT_EQ(engine.enableSharedMemoryRegistration(), ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(engine.enableMemoryRegistrationReuse(), ERR_INVALID_ARGUMENT);
     testing::internal::CaptureStderr();
     auto result =
         engine.registerLocalMemory(allocation.data(), allocation.size());
@@ -1620,16 +1619,16 @@ TEST_F(TransportTest, SharedMemoryRegistrationRequiresEmptyClassicEngine) {
     EXPECT_EQ(result, ERR_ADDRESS_OVERLAPPED);
     EXPECT_NE(errors.find("overlapped memory region"), std::string::npos);
     ASSERT_EQ(engine.unregisterLocalMemory(allocation.data()), 0);
-    EXPECT_EQ(engine.enableSharedMemoryRegistration(), 0);
-    EXPECT_EQ(engine.enableSharedMemoryRegistration(), 0);
+    EXPECT_EQ(engine.enableMemoryRegistrationReuse(), 0);
+    EXPECT_EQ(engine.enableMemoryRegistrationReuse(), 0);
 }
 
 TEST_F(TransportTest,
-       SharedMemoryRegistrationBackendFailureDoesNotLeakReferences) {
+       MemoryRegistrationReuseBackendFailureDoesNotLeakReferences) {
     TransferEngineImpl engine(false);
     ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
-    ASSERT_NE(installSharedRegistrationTcp(engine), nullptr);
-    ASSERT_EQ(engine.enableSharedMemoryRegistration(), 0);
+    ASSERT_NE(installRegistrationReuseTcp(engine), nullptr);
+    ASSERT_EQ(engine.enableMemoryRegistrationReuse(), 0);
     auto transport = std::make_shared<BatchResultTransport>();
     TransferEngineImplTestPeer::addTransport(engine, transport);
     std::array<char, 256> allocation{};
@@ -1654,7 +1653,7 @@ TEST_F(TransportTest,
     ASSERT_EQ(engine.unregisterLocalMemory(base + 128), 0);
 }
 
-TEST_F(TransportTest, SharedMemoryRegistrationRetriesFailedCleanup) {
+TEST_F(TransportTest, MemoryRegistrationReuseRetriesFailedCleanup) {
     class CleanupTransport : public BatchResultTransport {
        public:
         int result = ERR_MEMORY;
@@ -1664,8 +1663,8 @@ TEST_F(TransportTest, SharedMemoryRegistrationRetriesFailedCleanup) {
     };
     TransferEngineImpl engine(false);
     ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
-    ASSERT_NE(installSharedRegistrationTcp(engine), nullptr);
-    ASSERT_EQ(engine.enableSharedMemoryRegistration(), 0);
+    ASSERT_NE(installRegistrationReuseTcp(engine), nullptr);
+    ASSERT_EQ(engine.enableMemoryRegistrationReuse(), 0);
     auto transport = std::make_shared<CleanupTransport>();
     TransferEngineImplTestPeer::addTransport(engine, transport);
     std::array<char, 64> allocation{};
@@ -1681,31 +1680,34 @@ TEST_F(TransportTest, SharedMemoryRegistrationRetriesFailedCleanup) {
     EXPECT_EQ(engine.unregisterLocalMemory(base), ERR_ADDRESS_NOT_REGISTERED);
 }
 
-TEST_F(TransportTest, SharedMemoryRegistrationRetriesFailedRollback) {
+TEST_F(TransportTest, MemoryRegistrationReuseRetriesFailedRollback) {
     TransferEngineImpl engine(false);
     ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
-    ASSERT_NE(installSharedRegistrationTcp(engine), nullptr);
-    ASSERT_EQ(engine.enableSharedMemoryRegistration(), 0);
+    ASSERT_NE(installRegistrationReuseTcp(engine), nullptr);
+    ASSERT_EQ(engine.enableMemoryRegistrationReuse(), 0);
     auto transport = std::make_shared<BatchResultTransport>(ERR_MEMORY);
     TransferEngineImplTestPeer::addTransport(engine, transport);
-    std::array<char, 64> allocation{};
+    std::array<char, 128> allocation{};
     auto* base = allocation.data();
+    ASSERT_EQ(engine.registerLocalMemory(base, 64), 0);
     transport->setRegisterResult(ERR_MEMORY);
     testing::internal::CaptureStderr();
-    auto result = engine.registerLocalMemory(base, allocation.size());
+    auto result =
+        engine.registerLocalMemoryBatch({{base, 64}, {base + 64, 64}}, "*");
     auto errors = testing::internal::GetCapturedStderr();
     EXPECT_EQ(result, ERR_MEMORY);
     EXPECT_NE(errors.find("Failed to register a batch"), std::string::npos);
     EXPECT_NE(errors.find("Failed to roll back batch registration"),
               std::string::npos);
-    EXPECT_TRUE(engine.checkOverlap(base, allocation.size()));
-    EXPECT_EQ(engine.registerLocalMemory(base, allocation.size()), ERR_CONTEXT);
-    EXPECT_EQ(engine.unregisterLocalMemory(base), 0);
-    EXPECT_FALSE(engine.checkOverlap(base, allocation.size()));
-    EXPECT_EQ(engine.unregisterLocalMemory(base), ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_TRUE(engine.checkOverlap(base + 64, 64));
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({base, base + 64}),
+              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_TRUE(engine.checkOverlap(base, 64));
+    EXPECT_FALSE(engine.checkOverlap(base + 64, 64));
     transport->setRegisterResult(0);
-    ASSERT_EQ(engine.registerLocalMemory(base, allocation.size()), 0);
-    ASSERT_EQ(engine.unregisterLocalMemory(base), 0);
+    ASSERT_EQ(engine.registerLocalMemory(base + 64, 64), 0);
+    ASSERT_EQ(engine.unregisterLocalMemoryBatch({base, base + 64}), 0);
+    EXPECT_FALSE(engine.checkOverlap(base, allocation.size()));
 }
 
 TEST_F(TransportTest, RegisterLocalMemoryBatchRejectsOverlappingBuffers) {

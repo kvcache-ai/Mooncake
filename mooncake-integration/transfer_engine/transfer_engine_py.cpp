@@ -518,7 +518,8 @@ char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
     if (!buffer) return nullptr;
     int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
     if (ret) {
-        freeMemory(buffer);
+        // A failed rollback leaves the engine tracking the buffer.
+        if (!engine_->checkOverlap(buffer, capacity)) freeMemory(buffer);
         return nullptr;
     }
     return (char*)buffer;
@@ -1414,9 +1415,9 @@ int TransferEnginePy::batchUnregisterMemory(
     return engine_->unregisterLocalMemoryBatch(buffers);
 }
 
-int TransferEnginePy::enableSharedMemoryRegistration() {
+int TransferEnginePy::enableMemoryRegistrationReuse() {
     if (!engine_) return ERR_INVALID_ARGUMENT;
-    return engine_->enableSharedMemoryRegistration();
+    return engine_->enableMemoryRegistrationReuse();
 }
 
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity,
@@ -2019,8 +2020,8 @@ PYBIND11_MODULE(engine, m) {
             .def("write_bytes_to_buffer", &TransferEnginePy::writeBytesToBuffer)
             .def("read_bytes_from_buffer",
                  &TransferEnginePy::readBytesFromBuffer)
-            .def("enable_shared_memory_registration",
-                 &TransferEnginePy::enableSharedMemoryRegistration)
+            .def("enable_memory_registration_reuse",
+                 &TransferEnginePy::enableMemoryRegistrationReuse)
             .def("register_memory", &TransferEnginePy::registerMemory,
                  py::arg("buffer_addr"), py::arg("capacity"),
                  py::arg("location") = kWildcardLocation,
