@@ -16,14 +16,20 @@
 #include <unordered_set>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "memfabric_allocator.h"
 #include "tent/common/config.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/transfer_engine.h"
+#include "tent/transport/memfabric/memfabric_shared_memory.h"
 #include "tent/transport/memfabric/memfabric_transport.h"
 #include "tent/transport/memfabric/memfabric_under_api.h"
 
@@ -133,6 +139,257 @@ const char* aclGetRecentErrMsg() { return ""; }
 
 namespace mooncake {
 namespace tent {
+
+namespace {
+
+struct FakeHybm {
+    static constexpr uint64_t kSize = 2ULL << 20;
+    bool loaded = false;
+    bool blocked = false, entered = false, throw_batch = false;
+    std::optional<uint64_t> blocked_source;
+    bool reachable = true, stale_registry = false;
+    bool fail_create = false;
+    int initialize_result = 0, reserve_result = 0;
+    int result = 0, wait_result = 0, waits = 0;
+    int connect_result = 0, map_result = 0, remove_result = 0;
+    int entity_export_result = 0, fail_slice_export_at = 0;
+    int entity_import_result = 0, slice_import_result = 0;
+    int translate_result = 0;
+    int initializes = 0, creates = 0, frees = 0, unmaps = 0;
+    int entity_exports = 0, slice_exports = 0, imports = 0, slice_imports = 0;
+    int connects = 0;
+    uint64_t alias_offset = 0;
+    std::vector<size_t> batch_sizes;
+    std::vector<std::array<uint64_t, 4>> copies;
+
+    std::mutex mutex;
+    std::condition_variable cv;
+
+    void release() {
+        std::lock_guard lock(mutex);
+        blocked = false;
+        cv.notify_all();
+    }
+
+    bool awaitEntry() {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(2),
+                           [&] { return entered; });
+    }
+};
+
+struct HybmSlice {
+    uint64_t size;
+    bool imported;
+};
+
+struct HybmEntity {
+    MemFabricGvaConfig config;
+    uint64_t serial;
+    uint64_t cursor = 0;
+    std::map<uint64_t, HybmSlice> slices;
+};
+
+auto g_hybm = std::make_unique<FakeHybm>();
+std::map<uint16_t, std::unique_ptr<HybmEntity>> g_hybm_entities;
+thread_local uint16_t g_hybm_device;
+
+HybmEntity& hybmEntity(void* handle) {
+    return *static_cast<HybmEntity*>(handle);
+}
+
+FakeHybm& fakeHybm() { return *g_hybm; }
+
+// Test-side conveniences for single-slice cases; production code uses the
+// MemoryOptions and batch publish forms directly.
+Status allocateGva(MemFabricSharedMemory& memory, void** out, size_t size,
+                   uint32_t memory_type, uint64_t requested) {
+    MemoryOptions options;
+    options.global_address = requested;
+    return memory.allocate(out, size, memory_type, options);
+}
+
+Status publishGva(MemFabricSharedMemory& memory, void* ptr, size_t size,
+                  std::string& descriptor) {
+    std::vector<std::string> descriptors;
+    CHECK_STATUS(memory.publish({{ptr, size}}, descriptors));
+    descriptor = std::move(descriptors.front());
+    return Status::OK();
+}
+
+// Call after destroying contexts and draining their workers.
+void resetFakeHybm() {
+    g_hybm_entities.clear();
+    g_hybm = std::make_unique<FakeHybm>();
+    g_hybm_device = 0;
+}
+
+}  // namespace
+
+bool MemFabricGvaApi::LoadLibrary() { return g_hybm->loaded; }
+
+int MemFabricGvaApi::copy(void*, uint64_t, uint64_t, size_t, uint32_t) {
+    return g_hybm->result;
+}
+
+int MemFabricGvaApi::batchCopy(void*,
+                               const std::vector<MemFabricGvaCopy>& copies,
+                               uint32_t direction) {
+    std::unique_lock lock(g_hybm->mutex);
+    g_hybm->batch_sizes.push_back(copies.size());
+    for (const auto& copy : copies) {
+        g_hybm->copies.push_back(
+            {copy.source, copy.destination, copy.size, direction});
+    }
+    g_hybm->entered = true;
+    g_hybm->cv.notify_all();
+    g_hybm->cv.wait(lock, [&] {
+        return !g_hybm->blocked ||
+               (g_hybm->blocked_source &&
+                copies.front().source != *g_hybm->blocked_source);
+    });
+    if (g_hybm->throw_batch) throw std::runtime_error("mock HYBM batch error");
+    return g_hybm->result;
+}
+
+int MemFabricGvaApi::wait(void*) {
+    std::lock_guard lock(g_hybm->mutex);
+    ++g_hybm->waits;
+    return g_hybm->wait_result;
+}
+
+int MemFabricGvaApi::bind(uint16_t next_device) {
+    g_hybm_device = next_device;
+    return 0;
+}
+
+int MemFabricGvaApi::initialize(uint16_t) {
+    ++g_hybm->initializes;
+    return g_hybm->initialize_result;
+}
+
+void MemFabricGvaApi::uninitialize() {}
+
+void* MemFabricGvaApi::create(const MemFabricGvaConfig& config) {
+    if (g_hybm->fail_create) return nullptr;
+    auto created = std::make_unique<HybmEntity>();
+    created->config = config;
+    created->serial = ++g_hybm->creates;
+    return g_hybm_entities.emplace(config.device, std::move(created))
+        .first->second.get();
+}
+
+void MemFabricGvaApi::destroy(void* handle) {
+    const auto id = hybmEntity(handle).config.device;
+    g_hybm_entities.erase(id);
+}
+
+int MemFabricGvaApi::reserve(void*) { return g_hybm->reserve_result; }
+int MemFabricGvaApi::unreserve(void*) { return 0; }
+
+void* MemFabricGvaApi::allocate(void* handle, uint32_t type, uint64_t bytes) {
+    if (type != kGvaMemoryTypeDevice) return nullptr;
+    auto& local = hybmEntity(handle);
+    const auto addr = base(handle, type) +
+                      local.config.rank * local.config.hbm_window +
+                      local.cursor;
+    local.cursor += bytes;
+    local.slices.emplace(addr, HybmSlice{bytes, false});
+    return reinterpret_cast<void*>(addr);
+}
+
+int MemFabricGvaApi::free(void* handle, void* slice) {
+    ++g_hybm->frees;
+    hybmEntity(handle).slices.erase(reinterpret_cast<uint64_t>(slice));
+    return 0;
+}
+
+uint64_t MemFabricGvaApi::address(void*, void* slice) {
+    return reinterpret_cast<uint64_t>(slice);
+}
+
+uint64_t MemFabricGvaApi::size(void* handle, void* slice) {
+    return hybmEntity(handle).slices.at(address(handle, slice)).size;
+}
+
+uint64_t MemFabricGvaApi::base(void*, uint32_t type) {
+    return (1ULL << 56) + (uint64_t{type} << 40);
+}
+
+int MemFabricGvaApi::translate(uint64_t addr, uint32_t type, uint64_t& out) {
+    if (g_hybm->translate_result) return g_hybm->translate_result;
+    auto local = g_hybm_entities.find(g_hybm_device);
+    if (type != kGvaMemoryTypeDevice || local == g_hybm_entities.end())
+        return -12;
+    const auto& slices = local->second->slices;
+    auto slice = slices.upper_bound(addr);
+    if (slice == slices.begin()) return -12;
+    --slice;
+    if (addr - slice->first >= slice->second.size) return -12;
+    if (slice->second.imported &&
+        local->second->config.protocol != "device_sdma")
+        return -12;
+    out = addr + g_hybm->alias_offset;
+    return 0;
+}
+
+int MemFabricGvaApi::exportBlob(void* handle, void* slice,
+                                std::vector<uint8_t>& blob) {
+    if (!slice) {
+        ++g_hybm->entity_exports;
+        if (g_hybm->entity_export_result) return g_hybm->entity_export_result;
+    } else {
+        if (++g_hybm->slice_exports == g_hybm->fail_slice_export_at) return -1;
+    }
+    const std::array<uint64_t, 2> data =
+        slice ? std::array<uint64_t, 2>{address(handle, slice),
+                                        size(handle, slice)}
+              : std::array<uint64_t, 2>{hybmEntity(handle).serial, 0};
+    blob.resize(sizeof(data));
+    std::memcpy(blob.data(), data.data(), sizeof(data));
+    return 0;
+}
+
+int MemFabricGvaApi::importBlob(void* handle, bool entity_info,
+                                const std::vector<uint8_t>& blob) {
+    ++g_hybm->imports;
+    if (entity_info) return g_hybm->entity_import_result;
+    ++g_hybm->slice_imports;
+    if (g_hybm->slice_import_result) return g_hybm->slice_import_result;
+    std::array<uint64_t, 2> data;
+    if (blob.size() != sizeof(data)) return -1;
+    std::memcpy(data.data(), blob.data(), sizeof(data));
+    hybmEntity(handle).slices.emplace(data[0], HybmSlice{data[1], true});
+    return 0;
+}
+
+int MemFabricGvaApi::map(void*) { return g_hybm->map_result; }
+
+int MemFabricGvaApi::connect(void*, uint32_t) {
+    ++g_hybm->connects;
+    return g_hybm->connect_result;
+}
+
+int MemFabricGvaApi::reach(void*, uint32_t, uint32_t& out) {
+    out = g_hybm->reachable ? 1 : 0;
+    return 0;
+}
+
+int MemFabricGvaApi::remove(void*, uint32_t) { return g_hybm->remove_result; }
+
+int MemFabricGvaApi::unmap(void* handle, uint32_t rank) {
+    ++g_hybm->unmaps;
+    if (g_hybm->stale_registry) return 0;
+    auto& local = hybmEntity(handle);
+    const auto window = local.config.hbm_window;
+    const auto start = base(handle, kGvaMemoryTypeDevice) + rank * window;
+    const auto end = start + window;
+    std::erase_if(local.slices, [&](const auto& entry) {
+        return entry.second.imported && entry.first >= start &&
+               entry.first < end;
+    });
+    return 0;
+}
 
 struct MockMemFabricState {
     std::mutex mu;
@@ -394,13 +651,27 @@ class MemFabricTransportTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        fakeHybm().release();
         if (batch_ != nullptr) {
             (void)transport_->freeSubBatch(batch_);
             batch_ = nullptr;
         }
+        for (auto* peer : {&peer_, &extra_peer_}) {
+            if (!peer->buffer) continue;
+            (void)transport_->unmapRemoteMemory(peer->id, peer->buffer);
+            (void)peer->memory->unpublish(peer->buffer);
+            (void)peer->memory->free(peer->buffer, kHbmSize);
+            peer->memory.reset();
+        }
+        if (hbm_) {
+            (void)transport_->removeMemoryBuffer(local_hbm_);
+            (void)transport_->freeLocalMemory(hbm_, kHbmSize);
+        }
         if (transport_) {
             (void)transport_->uninstall();
         }
+        transport_.reset();
+        resetFakeHybm();
         ResetMockApi();
         g_state.reset();
         unsetenv("MF_PROTOCOL");
@@ -471,6 +742,111 @@ class MemFabricTransportTest : public ::testing::Test {
         auto it = attrs.find("memfabric_unique_id");
         return it == attrs.end() ? "" : it->second;
     }
+
+    static constexpr size_t kHbmSize = FakeHybm::kSize;
+
+    struct GvaPeer {
+        std::shared_ptr<ControlService> metadata;
+        std::unique_ptr<MemFabricSharedMemory> memory;
+        void* buffer = nullptr;
+        SegmentID id = 0;
+    };
+
+    std::shared_ptr<Config> GvaSettings(int64_t capacity = 256) {
+        auto config = std::make_shared<Config>();
+        const std::string prefix = "transports/memfabric/gva/";
+        config->set(prefix + "enabled", true);
+        config->set(prefix + "rank_count", int64_t{3});
+        config->set(prefix + "rank", int64_t{0});
+        config->set(prefix + "hbm_window", uint64_t{1});
+        config->set(prefix + "max_pending_copies", capacity);
+        return config;
+    }
+
+    Status PrepareHbm(const char* protocol = "device_sdma",
+                      int64_t capacity = 256) {
+        fakeHybm().loaded = true;
+        setenv("MF_PROTOCOL", protocol, 1);
+        CHECK_STATUS(transport_->install(name_, metadata_, nullptr,
+                                         GvaSettings(capacity)));
+        MemoryOptions options;
+        options.location = "npu:0";
+        CHECK_STATUS(transport_->allocateLocalMemory(&hbm_, kHbmSize, options));
+        EXPECT_EQ(options.global_address, reinterpret_cast<uint64_t>(hbm_));
+        EXPECT_EQ(options.type, MEMFABRIC);
+        EXPECT_EQ(options.location, "npu:0");
+        local_hbm_.addr = options.global_address;
+        local_hbm_.length = kHbmSize;
+        CHECK_STATUS(transport_->addMemoryBuffer(local_hbm_, options));
+        return PublishBuffers(*metadata_, name_, {local_hbm_});
+    }
+
+    Status AddHbmPeer(GvaPeer& peer, uint16_t rank) {
+        peer.metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+        uint16_t port = 0;
+        CHECK_STATUS(peer.metadata->start(port));
+        const auto name = "127.0.0.1:" + std::to_string(port);
+        auto config = transport_->gva_config_;
+        config.rank = config.device = rank;
+        peer.memory = std::make_unique<MemFabricSharedMemory>(config, name);
+        CHECK_STATUS(peer.memory->initialize());
+        CHECK_STATUS(allocateGva(*peer.memory, &peer.buffer, kHbmSize,
+                                 kGvaMemoryTypeDevice, 0));
+        BufferDesc buffer{};
+        buffer.addr = reinterpret_cast<uint64_t>(peer.buffer);
+        buffer.length = kHbmSize;
+        CHECK_STATUS(publishGva(*peer.memory, peer.buffer, kHbmSize,
+                                buffer.transport_attrs[MEMFABRIC]));
+        CHECK_STATUS(PublishBuffers(*peer.metadata, name, {buffer}));
+        CHECK_STATUS(metadata_->segmentManager().openRemote(peer.id, name));
+        (void)MemFabricGvaApi::bind(transport_->gva_config_.device);
+        return transport_->mapRemoteMemory(peer.id, peer.buffer, kHbmSize);
+    }
+
+    Status PublishBuffers(ControlService& service, const std::string& name,
+                          std::vector<BufferDesc> buffers) {
+        return service.segmentManager().updateLocal([&](SegmentDesc& segment) {
+            segment.name = segment.rpc_server_addr = name;
+            std::get<MemorySegmentDesc>(segment.detail).buffers =
+                std::move(buffers);
+            return Status::OK();
+        });
+    }
+
+    Request HbmRequest(Request::OpCode op, const GvaPeer& peer,
+                       size_t local_offset, size_t remote_offset,
+                       size_t length = 32) {
+        Request request{};
+        request.opcode = op;
+        request.source =
+            reinterpret_cast<void*>(local_hbm_.addr + local_offset);
+        request.target_id = peer.id;
+        request.target_offset =
+            reinterpret_cast<uint64_t>(peer.buffer) + remote_offset;
+        request.length = length;
+        return request;
+    }
+
+    bool WaitHbm(size_t pending = 0) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (transport_->gva_pending_->load() != pending) {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::yield();
+        }
+        return true;
+    }
+
+    void ExpectHbmStatus(int index, TransferStatusEnum expected, size_t bytes) {
+        TransferStatus status{};
+        ASSERT_TRUE(transport_->getTransferStatus(batch_, index, status).ok());
+        EXPECT_EQ(status.s, expected);
+        EXPECT_EQ(status.transferred_bytes, bytes);
+    }
+
+    void* hbm_ = nullptr;
+    BufferDesc local_hbm_{};
+    GvaPeer peer_, extra_peer_;
 
     void InstallMockApi();
     void ResetMockApi();
@@ -1740,6 +2116,518 @@ TEST_F(MemFabricTransportTest, ExcessiveSliceCountDispatchesNoWork) {
     EXPECT_EQ(batch_->size(), 0u);
     EXPECT_EQ(state_->batch_copy_calls, 0);
 }
+
+namespace {
+
+using Json = nlohmann::json;
+constexpr auto kPoolSize = FakeHybm::kSize;
+constexpr auto kHbm = kGvaMemoryTypeDevice;
+
+MemFabricGvaConfig config(uint16_t rank = 0,
+                          const char* protocol = "device_sdma") {
+    MemFabricGvaConfig options;
+    options.enabled = true;
+    options.protocol = protocol;
+    options.rank_count = 2;
+    options.rank = options.device = rank;
+    options.hbm_window = options.hbm_size = 4 * kPoolSize;
+    return options;
+}
+
+uint64_t addr(void* pointer) { return reinterpret_cast<uint64_t>(pointer); }
+
+void freePool(MemFabricSharedMemory& memory, void* pointer) {
+    ASSERT_TRUE(memory.unpublish(pointer).ok());
+    ASSERT_TRUE(memory.free(pointer, kPoolSize).ok());
+}
+
+class MemFabricGva : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        resetFakeHybm();
+        fakeHybm().loaded = true;
+    }
+
+    void TearDown() override { resetFakeHybm(); }
+};
+
+struct HbmPair {
+    explicit HbmPair(const char* protocol = "device_sdma")
+        : local(config(0, protocol), "local"),
+          remote(config(1, protocol), "remote") {}
+
+    void initialize() {
+        ASSERT_TRUE(local.initialize().ok());
+        ASSERT_TRUE(allocateGva(local, &source, kPoolSize, kHbm, 0).ok());
+        std::string descriptor;
+        ASSERT_TRUE(publishGva(local, source, kPoolSize, descriptor).ok());
+        ASSERT_TRUE(remote.initialize().ok());
+        ASSERT_TRUE(allocateGva(remote, &target, kPoolSize, kHbm, 0).ok());
+        ASSERT_TRUE(publishGva(remote, target, kPoolSize, publication).ok());
+    }
+
+    void release() {
+        ASSERT_TRUE(unmap(target).ok());
+        freePool(local, source);
+        freePool(remote, target);
+    }
+
+    Status map() { return map(publication, addr(target)); }
+    Status map(const std::string& desc, uint64_t base,
+               size_t size = kPoolSize) {
+        // The simulated ranks share one thread and its active device.
+        (void)MemFabricGvaApi::bind(0);
+        return local.map("remote", desc, base, size);
+    }
+    Status unmap(void* pointer) { return local.unmap("remote", addr(pointer)); }
+    Status prepare() {
+        (void)MemFabricGvaApi::bind(0);
+        return local.prepare("remote", publication, addr(target), kPoolSize);
+    }
+    Status beginCopy(const MemFabricGvaCopy& copy, uint32_t& direction) {
+        return local.beginCopy(copy.source, copy.destination, copy.size,
+                               direction);
+    }
+
+    MemFabricSharedMemory local, remote;
+    void* source = nullptr;
+    void* target = nullptr;
+    std::string publication;
+};
+
+TEST_F(MemFabricGva, InitializesExplicitlyAndRetriesNativeFailures) {
+    auto& native = fakeHybm();
+    native.loaded = false;
+    MemFabricSharedMemory unavailable(config(), "segment");
+    EXPECT_TRUE(unavailable.initialize().IsNotImplemented());
+    native.loaded = true;
+    MemFabricSharedMemory memory(config(), "segment");
+    void* pointer = nullptr;
+    EXPECT_TRUE(allocateGva(memory, &pointer, kPoolSize, kHbm, 0)
+                    .IsInvalidArgument());
+    native.initialize_result = -1;
+    EXPECT_FALSE(memory.initialize().ok());
+    native.initialize_result = 0;
+    native.fail_create = true;
+    EXPECT_FALSE(memory.initialize().ok());
+    native.fail_create = false;
+    native.reserve_result = -1;
+    EXPECT_FALSE(memory.initialize().ok());
+    native.reserve_result = 0;
+    native.entity_export_result = -1;
+    EXPECT_FALSE(memory.initialize().ok());
+    ASSERT_TRUE(allocateGva(memory, &pointer, kPoolSize, kHbm, 0)
+                    .IsInvalidArgument());
+    native.entity_export_result = 0;
+    ASSERT_TRUE(memory.initialize().ok());
+    EXPECT_EQ(native.creates, 2);
+    EXPECT_EQ(native.initializes, 2);
+    ASSERT_TRUE(memory.initialize().ok());
+    EXPECT_EQ(native.entity_exports, 2);
+    ASSERT_TRUE(memory.close().ok());
+    ASSERT_TRUE(memory.initialize().ok());
+    EXPECT_EQ(native.creates, 3);
+}
+
+TEST_F(MemFabricGva, HbmAllocationUsesIdentityAndAccountsForNativeCursor) {
+    auto settings = config();
+    settings.hbm_window = settings.hbm_size = 5 * kPoolSize;
+    MemFabricSharedMemory memory(settings, "segment");
+    ASSERT_TRUE(memory.initialize().ok());
+    auto& native = fakeHybm();
+    const auto base = MemFabricGvaApi::base(nullptr, kHbm);
+    void* pointer = nullptr;
+    EXPECT_FALSE(allocateGva(memory, &pointer, kPoolSize, kHbm, base + 1).ok());
+    EXPECT_EQ(pointer, nullptr);
+    native.alias_offset = 128;
+    EXPECT_FALSE(allocateGva(memory, &pointer, kPoolSize, kHbm, 0).ok());
+    native.alias_offset = 0;
+    native.translate_result = -23;
+    EXPECT_FALSE(allocateGva(memory, &pointer, kPoolSize, kHbm, 0).ok());
+    native.translate_result = 0;
+    EXPECT_EQ(native.frees, 3);
+    MemoryOptions options;
+    options.global_address = base + 3 * kPoolSize;
+    ASSERT_TRUE(memory.allocate(&pointer, kPoolSize, kHbm, options).ok());
+    EXPECT_EQ(addr(pointer), options.global_address);
+    EXPECT_EQ(options.type, MEMFABRIC);
+    EXPECT_EQ(options.location, "npu:0");
+    void* output = nullptr;
+    EXPECT_FALSE(allocateGva(memory, &output, 2 * kPoolSize, kHbm, 0).ok());
+    EXPECT_TRUE(memory.close().IsTooManyRequests());
+    EXPECT_FALSE(memory.free(pointer, kPoolSize - 1).ok());
+    ASSERT_TRUE(memory.free(pointer, kPoolSize).ok());
+    ASSERT_TRUE(allocateGva(memory, &output, kPoolSize, kHbm, 0).ok());
+    EXPECT_EQ(addr(output), base + 4 * kPoolSize);
+    ASSERT_TRUE(memory.free(output, kPoolSize).ok());
+    EXPECT_FALSE(allocateGva(memory, &output, kPoolSize, kHbm, 0).ok());
+}
+
+TEST_F(MemFabricGva, InvalidBundlesNeverReachNativeImports) {
+    HbmPair pair;
+    ASSERT_NO_FATAL_FAILURE(pair.initialize());
+    const auto desc = Json::parse(pair.publication);
+    EXPECT_FALSE(desc.contains("group"));
+    const auto target = addr(pair.target);
+    for (const auto& [key, value] : std::vector<std::pair<std::string, Json>>{
+             {"address_mode", "logical56"},
+             {"segment_name", "other"},
+             {"generation", 1u},
+             {"rank", 0u},
+             {"ranks", "2"},
+             {"offset", UINT64_MAX},
+             {"slice_blob", Json::array()},
+             {"slice_blob", Json::array({"invalid"})},
+             {"slice_blob", Json::array({256u})}}) {
+        SCOPED_TRACE(key);
+        auto invalid = desc;
+        invalid[key] = value;
+        const auto status = pair.map(invalid.dump(), target);
+        EXPECT_FALSE(status.ok());
+        EXPECT_NE(status.message().find("'" + key + "'"), std::string::npos);
+    }
+    EXPECT_FALSE(pair.map("{", target).ok());
+    EXPECT_FALSE(pair.map(Json::array({desc, desc}).dump(), target).ok());
+    auto shifted = desc;
+    shifted["address"] = target + 32;
+    shifted["offset"] = 32u;
+    auto inconsistent = shifted;
+    inconsistent["generation"] = "restart";
+    for (const auto& second : {shifted, inconsistent}) {
+        EXPECT_FALSE(pair.map(Json::array({desc, second}).dump(), target).ok());
+    }
+    EXPECT_FALSE(pair.map(pair.publication, target + 1, 32).ok());
+    auto unnamed = desc;
+    unnamed["segment_name"] = "";
+    ASSERT_TRUE(pair.local.map("", unnamed.dump(), target, kPoolSize)
+                    .IsInvalidArgument());
+    EXPECT_EQ(fakeHybm().imports, 0);
+    ASSERT_TRUE(pair.map().ok());
+    EXPECT_FALSE(pair.map(shifted.dump(), target + 32).ok());
+    auto changed = desc;
+    changed["generation"] = "restart";
+    EXPECT_TRUE(pair.map(changed.dump(), target).IsTooManyRequests());
+    EXPECT_FALSE(
+        pair.local.validateCopyTarget("remote", target, changed.dump()).ok());
+    EXPECT_TRUE(
+        pair.local.validateCopyTarget("remote", target, pair.publication).ok());
+    ASSERT_NO_FATAL_FAILURE(pair.release());
+}
+
+TEST_F(MemFabricGva, SdmaRetriesImportsAndRequiresLiveIdentityMapping) {
+    HbmPair pair;
+    ASSERT_NO_FATAL_FAILURE(pair.initialize());
+    auto& native = fakeHybm();
+    native.entity_import_result = -1;
+    EXPECT_FALSE(pair.map().ok());
+    EXPECT_EQ(native.slice_imports, 0);
+    native.entity_import_result = 0;
+    native.slice_import_result = -1;
+    EXPECT_FALSE(pair.map().ok());
+    native.slice_import_result = 0;
+    native.map_result = -1;
+    EXPECT_TRUE(pair.map().IsTooManyRequests());
+    native.map_result = 0;
+    native.reachable = false;
+    EXPECT_TRUE(pair.map().IsNotImplemented());
+    native.reachable = true;
+    const auto imports = native.slice_imports;
+    native.alias_offset = 128;
+    EXPECT_FALSE(pair.map().ok());
+    native.alias_offset = 0;
+    ASSERT_TRUE(pair.map().ok());
+    ASSERT_TRUE(pair.map().ok());
+    EXPECT_EQ(native.slice_imports, imports);
+    native.remove_result = -1;
+    EXPECT_TRUE(pair.unmap(pair.target).IsTooManyRequests());
+    native.remove_result = 0;
+    native.stale_registry = true;
+    EXPECT_TRUE(pair.unmap(pair.target).IsTooManyRequests());
+    native.stale_registry = false;
+    ASSERT_NO_FATAL_FAILURE(pair.release());
+    EXPECT_TRUE(
+        pair.local.unmap("other", addr(pair.target)).IsInvalidArgument());
+}
+
+TEST_F(MemFabricGva, HbmSlicesShareRankCleanup) {
+    HbmPair pair;
+    ASSERT_NO_FATAL_FAILURE(pair.initialize());
+    ASSERT_TRUE(pair.map().ok());
+    void* second = nullptr;
+    std::string publication;
+    (void)MemFabricGvaApi::bind(1);
+    ASSERT_TRUE(allocateGva(pair.remote, &second, kPoolSize, kHbm, 0).ok());
+    ASSERT_TRUE(publishGva(pair.remote, second, kPoolSize, publication).ok());
+    const auto bundle =
+        Json::array({Json::parse(pair.publication), Json::parse(publication)})
+            .dump();
+    ASSERT_TRUE(pair.map(bundle, addr(second)).ok());
+    auto& native = fakeHybm();
+    EXPECT_TRUE(pair.unmap(second).IsTooManyRequests());
+    EXPECT_EQ(native.unmaps, 0);
+    ASSERT_TRUE(pair.unmap(pair.target).ok());
+    EXPECT_EQ(native.unmaps, 1);
+    ASSERT_TRUE(pair.map(publication, addr(second)).ok());
+    ASSERT_TRUE(pair.unmap(second).ok());
+    freePool(pair.remote, second);
+    freePool(pair.local, pair.source);
+    freePool(pair.remote, pair.target);
+}
+
+class MemFabricNetworkGva : public MemFabricGva,
+                            public ::testing::WithParamInterface<const char*> {
+};
+
+TEST_P(MemFabricNetworkGva,
+       PreparesHbmWithoutDirectMappingAndQuarantinesFailure) {
+    HbmPair pair(GetParam());
+    ASSERT_NO_FATAL_FAILURE(pair.initialize());
+    auto& native = fakeHybm();
+    EXPECT_TRUE(pair.map().IsNotImplemented());
+    EXPECT_EQ(native.imports, 0);
+    native.connect_result = -1;
+    EXPECT_TRUE(pair.prepare().IsTooManyRequests());
+    uint32_t direction = 0;
+    const MemFabricGvaCopy copy{addr(pair.source), addr(pair.target), 32};
+    EXPECT_FALSE(pair.beginCopy(copy, direction).ok());
+    native.connect_result = 0;
+    ASSERT_TRUE(pair.prepare().ok());
+    EXPECT_EQ(native.connects, 2);
+    EXPECT_EQ(native.slice_imports, 1);
+    ASSERT_TRUE(pair.beginCopy(copy, direction).ok());
+    ASSERT_TRUE(pair.beginCopy(copy, direction).ok());
+    native.result = -23;
+    EXPECT_FALSE(pair.local.runBatchCopy({copy}, direction).ok());
+    EXPECT_TRUE(pair.local.runBatchCopy({copy}, direction).IsTooManyRequests());
+    EXPECT_EQ(native.waits, 0);
+    EXPECT_EQ(native.batch_sizes, std::vector<size_t>{1});
+    EXPECT_TRUE(pair.local.unpublish(pair.source).IsTooManyRequests());
+    EXPECT_TRUE(pair.local.close().IsTooManyRequests());
+    freePool(pair.remote, pair.target);
+}
+
+INSTANTIATE_TEST_SUITE_P(Protocols, MemFabricNetworkGva,
+                         ::testing::Values("device_rdma", "device_urma"));
+
+}  // namespace
+
+TEST_F(MemFabricTransportTest, GvaConfigRejectsInvalidBoundsAndCanRetryLoad) {
+    const std::string prefix = "transports/memfabric/gva/";
+    auto config = GvaSettings(0);
+    setenv("MF_PROTOCOL", "device_sdma", 1);
+    auto install = [&] {
+        return transport_->install(name_, metadata_, nullptr, config);
+    };
+    EXPECT_TRUE(install().IsInvalidArgument());
+    config->set(prefix + "max_pending_copies", int64_t{1});
+    config->set(prefix + "hbm_window", uint64_t{1} << 20);
+    EXPECT_TRUE(install().IsInvalidArgument());
+    config->set(prefix + "hbm_window", uint64_t{1});
+    config->set(prefix + "rank", int64_t{-1});
+    EXPECT_TRUE(install().IsInvalidArgument());
+    config->set(prefix + "rank", int64_t{0});
+    setenv("MF_PROTOCOL", "host_rdma", 1);
+    EXPECT_TRUE(install().IsInvalidArgument());
+    setenv("MF_PROTOCOL", "device_sdma", 1);
+    ASSERT_TRUE(SetRpcAddress("").ok());
+    EXPECT_TRUE(install().IsNotImplemented());
+    EXPECT_FALSE(transport_->supportsGlobalAddressing());
+    fakeHybm().loaded = true;
+    ASSERT_TRUE(install().ok());
+    EXPECT_TRUE(transport_->supportsGlobalAddressing());
+    EXPECT_TRUE(Initialize(*transport_).IsInvalidArgument());
+    ASSERT_TRUE(transport_->uninstall().ok());
+    ASSERT_TRUE(SetRpcAddress(name_).ok());
+    ASSERT_TRUE(Configure().ok());
+    BufferDesc unknown{};
+    MemoryOptions options;
+    unknown.addr = options.global_address = 1ULL << 56;
+    unknown.length = kHbmSize;
+    EXPECT_TRUE(
+        transport_->addMemoryBuffer(unknown, options).IsInvalidArgument());
+    EXPECT_EQ(state_->init_calls, 0);
+    EXPECT_EQ(state_->create_calls, 0);
+}
+
+TEST_F(MemFabricTransportTest, EngineRegistersAndFreesHbm) {
+    auto conf = GvaSettings();
+    conf->set("metadata_type", "p2p");
+    conf->set("metadata_servers", "");
+    conf->set("rpc_server_hostname", "127.0.0.1");
+    conf->set("rpc_server_port", "0");
+    conf->set("log_level", "warning");
+    for (const char* transport : {"tcp", "shm", "rdma", "io_uring", "nvlink",
+                                  "mnnvl", "gds", "ascend_direct", "mlu"}) {
+        conf->set(std::string("transports/") + transport + "/enable", false);
+    }
+    conf->set("transports/memfabric/enable", true);
+    setenv("MF_PROTOCOL", "device_sdma", 1);
+    auto& native = fakeHybm();
+    native.loaded = true;
+    TransferEngine frontend(conf);
+    ASSERT_TRUE(frontend.available());
+
+    MemoryOptions options;
+    options.type = MEMFABRIC;
+    options.location = "npu:0";
+    EXPECT_TRUE(frontend.allocateLocalMemory(nullptr, kHbmSize, options)
+                    .IsInvalidArgument());
+    void* pool = nullptr;
+    ASSERT_TRUE(frontend.allocateLocalMemory(&pool, kHbmSize, options).ok());
+    native.fail_slice_export_at = 1;
+    EXPECT_FALSE(frontend.registerLocalMemory(pool, kHbmSize).ok());
+    ASSERT_TRUE(frontend.freeLocalMemory(pool).ok());
+    options.global_address = 0;
+    ASSERT_TRUE(frontend.allocateLocalMemory(&pool, kHbmSize, options).ok());
+    ASSERT_TRUE(frontend.registerLocalMemory(pool, kHbmSize).ok());
+    EXPECT_TRUE(
+        frontend.mapRemoteMemory(1, pool, 0, MEMFABRIC).IsInvalidArgument());
+    EXPECT_TRUE(frontend.freeLocalMemory(pool).IsInvalidArgument());
+    ASSERT_TRUE(frontend.unregisterLocalMemory(pool).ok());
+    ASSERT_TRUE(frontend.freeLocalMemory(pool).ok());
+    EXPECT_EQ(native.frees, 2);
+}
+
+TEST_F(MemFabricTransportTest, HbmBatchAdmissionIsAtomicAndPinsPendingMemory) {
+    ASSERT_TRUE(PrepareHbm("device_sdma", 2).ok());
+    ASSERT_TRUE(AddHbmPeer(peer_, 1).ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 3).ok());
+    EXPECT_TRUE(transport_->warmupMemory(hbm_, kHbmSize));
+    EXPECT_FALSE(transport_->freeLocalMemory(hbm_, kHbmSize).ok());
+    EXPECT_FALSE(transport_->mapRemoteMemory(peer_.id, peer_.buffer, 0).ok());
+    auto& fake = fakeHybm();
+    const auto write = HbmRequest(Request::WRITE, peer_, 0, 0);
+    auto invalid = write;
+    invalid.source = nullptr;
+    EXPECT_TRUE(transport_->submitTransferTasks(batch_, {}).ok());
+    EXPECT_FALSE(
+        transport_->submitTransferTasks(batch_, {write, invalid}).ok());
+    EXPECT_EQ(batch_->size(), 0u);
+    EXPECT_TRUE(fake.copies.empty());
+    ASSERT_TRUE(transport_->removeMemoryBuffer(local_hbm_).ok());
+    ASSERT_TRUE(transport_->addMemoryBuffer(local_hbm_, MemoryOptions{}).ok());
+    fake.blocked = true;
+    const auto second = HbmRequest(Request::WRITE, peer_, 64, 64, 16);
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, {write, second}).ok());
+    ASSERT_TRUE(fake.awaitEntry());
+    ExpectHbmStatus(0, TransferStatusEnum::PENDING, 0);
+    EXPECT_TRUE(
+        transport_->submitTransferTasks(batch_, {write}).IsTooManyRequests());
+    EXPECT_EQ(batch_->size(), 2u);
+    EXPECT_FALSE(transport_->unmapRemoteMemory(peer_.id, peer_.buffer).ok());
+    EXPECT_FALSE(transport_->removeMemoryBuffer(local_hbm_).ok());
+    fake.release();
+    ASSERT_TRUE(WaitHbm());
+    ExpectHbmStatus(0, TransferStatusEnum::COMPLETED, 32);
+    ExpectHbmStatus(1, TransferStatusEnum::COMPLETED, 16);
+    EXPECT_EQ(fake.batch_sizes, std::vector<size_t>{2});
+    EXPECT_EQ(state_->batch_copy_calls, 0);
+    EXPECT_EQ(state_->status_query_calls, 0);
+}
+
+TEST_F(MemFabricTransportTest,
+       IndependentGvaCopiesCompleteConcurrentlyAndKeepPendingMemoryPinned) {
+    ASSERT_TRUE(PrepareHbm().ok());
+    ASSERT_TRUE(AddHbmPeer(peer_, 1).ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+    const auto first = HbmRequest(Request::WRITE, peer_, 0, 0);
+    const auto second = HbmRequest(Request::WRITE, peer_, 64, 64, 16);
+    auto& fake = fakeHybm();
+    fake.blocked = true;
+    fake.blocked_source = reinterpret_cast<uint64_t>(first.source);
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, {first}).ok());
+    ASSERT_TRUE(fake.awaitEntry());
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, {second}).ok());
+    ASSERT_TRUE(WaitHbm(1));
+
+    ExpectHbmStatus(0, TransferStatusEnum::PENDING, 0);
+    ExpectHbmStatus(1, TransferStatusEnum::COMPLETED, second.length);
+    EXPECT_FALSE(transport_->unmapRemoteMemory(peer_.id, peer_.buffer).ok());
+    EXPECT_FALSE(transport_->removeMemoryBuffer(local_hbm_).ok());
+
+    fake.release();
+    ASSERT_TRUE(WaitHbm());
+    ExpectHbmStatus(0, TransferStatusEnum::COMPLETED, first.length);
+    EXPECT_TRUE(transport_->unmapRemoteMemory(peer_.id, peer_.buffer).ok());
+    EXPECT_TRUE(transport_->removeMemoryBuffer(local_hbm_).ok());
+}
+
+class MemFabricHbmProtocolTest
+    : public MemFabricTransportTest,
+      public ::testing::WithParamInterface<const char*> {};
+
+TEST_P(MemFabricHbmProtocolTest, BatchesSeparateOpcodesPeersAndOverlaps) {
+    ASSERT_TRUE(PrepareHbm(GetParam()).ok());
+    ASSERT_TRUE(AddHbmPeer(peer_, 1).ok());
+    ASSERT_TRUE(AddHbmPeer(extra_peer_, 2).ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 7).ok());
+    const std::vector<Request> requests{
+        HbmRequest(Request::WRITE, peer_, 0, 0, 64),
+        HbmRequest(Request::WRITE, peer_, 64, 32),
+        HbmRequest(Request::WRITE, peer_, 96, 96),
+        HbmRequest(Request::READ, peer_, 0, 0),
+        HbmRequest(Request::READ, extra_peer_, 32, 0),
+        HbmRequest(Request::READ, peer_, 64, 64),
+    };
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, requests).ok());
+    ASSERT_TRUE(WaitHbm());
+    const auto& fake = fakeHybm();
+    auto sizes = fake.batch_sizes;
+    std::sort(sizes.begin(), sizes.end());
+    EXPECT_EQ(sizes, (std::vector<size_t>{1, 1, 1, 1, 2}));
+    std::vector<std::array<uint64_t, 4>> expected;
+    for (size_t index = 0; index < requests.size(); ++index) {
+        const auto& request = requests[index];
+        const auto local = reinterpret_cast<uint64_t>(request.source);
+        const auto remote = request.target_offset;
+        const bool read = request.opcode == Request::READ;
+        expected.push_back(
+            {read ? remote : local, read ? local : remote, request.length, 9u});
+        ExpectHbmStatus(index, TransferStatusEnum::COMPLETED, request.length);
+    }
+    auto copies = fake.copies;
+    std::sort(copies.begin(), copies.end());
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(copies, expected);
+    EXPECT_TRUE(transport_->unmapRemoteMemory(peer_.id, peer_.buffer).ok());
+    EXPECT_FALSE(
+        transport_->submitTransferTasks(batch_, {requests.back()}).ok());
+    EXPECT_EQ(state_->batch_copy_calls, 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(Protocols, MemFabricHbmProtocolTest,
+                         ::testing::Values("device_sdma", "device_rdma",
+                                           "device_urma"));
+
+class MemFabricHbmFailureTest : public MemFabricTransportTest,
+                                public ::testing::WithParamInterface<int> {};
+
+TEST_P(MemFabricHbmFailureTest,
+       FailureMarksWholeBatchAndRetainsOnlyUndrainedPins) {
+    ASSERT_TRUE(PrepareHbm().ok());
+    ASSERT_TRUE(AddHbmPeer(peer_, 1).ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+    auto& fake = fakeHybm();
+    const bool drained = GetParam() == 0;
+    fake.result = -19;
+    fake.wait_result = drained ? 0 : -1;
+    fake.throw_batch = GetParam() == 2;
+    const auto first = HbmRequest(Request::WRITE, peer_, 0, 0);
+    const auto second = HbmRequest(Request::WRITE, peer_, 64, 64);
+    ASSERT_TRUE(transport_->submitTransferTasks(batch_, {first, second}).ok());
+    ASSERT_TRUE(WaitHbm());
+    EXPECT_EQ(fake.batch_sizes, std::vector<size_t>{2});
+    EXPECT_EQ(fake.waits, GetParam() == 2 ? 0 : 1);
+    for (int index = 0; index < 2; ++index) {
+        ExpectHbmStatus(index, TransferStatusEnum::FAILED, 0);
+    }
+    EXPECT_EQ(transport_->removeMemoryBuffer(local_hbm_).ok(), drained);
+    const auto unmap = transport_->unmapRemoteMemory(peer_.id, peer_.buffer);
+    EXPECT_TRUE(drained ? unmap.ok() : unmap.IsTooManyRequests());
+}
+
+INSTANTIATE_TEST_SUITE_P(Outcomes, MemFabricHbmFailureTest,
+                         ::testing::Values(0, 1, 2));
 
 }  // namespace tent
 }  // namespace mooncake

@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "memfabric_types.h"
+#include "tent/common/concurrent/thread_pool.h"
+#include "tent/transport/memfabric/memfabric_shared_memory.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
 #include "tent/transport/memfabric/memfabric_under_api.h"
@@ -30,7 +32,11 @@ struct MemFabricConfig {
     std::string data_op_type_str;
 };
 
+struct MemFabricCopyCompletion {
+    std::atomic<TransferStatusEnum> status{TransferStatusEnum::PENDING};
+};
 struct MemFabricTask {
+    std::shared_ptr<MemFabricCopyCompletion> gva_completion;
     Request request;
     volatile TransferStatusEnum status_word = TransferStatusEnum::PENDING;
     uint64_t batch_id = 0;
@@ -42,6 +48,7 @@ struct MemFabricSubBatch : public Transport::SubBatch {
     std::vector<MemFabricTask> task_list;
     std::unordered_map<uint64_t, TransferStatusEnum> batch_status_cache;
     size_t pending_batch_count = 0;
+    size_t capacity = 0;
     size_t size() const override { return task_list.size(); }
     ~MemFabricSubBatch() override;
 };
@@ -75,11 +82,43 @@ class MemFabricTransport : public Transport {
                            const MemoryOptions& options) override;
     Status removeMemoryBuffer(BufferDesc& desc) override;
 
+    Status allocateLocalMemory(void**, size_t, MemoryOptions&) override;
+    Status freeLocalMemory(void*, size_t) override;
+    bool warmupMemory(void* address, size_t size) override;
+    bool supportsGlobalAddressing() const override;
+    Status mapRemoteMemory(SegmentID, void*, size_t) override;
+    Status unmapRemoteMemory(SegmentID, void*) override;
     const char* getName() const override { return "memfabric"; }
     bool supportNotification() const override { return false; }
 
    private:
+    struct GvaCopy {
+        uint64_t source, destination;
+        size_t size;
+        uint32_t direction;
+    };
+    struct GvaCopyGroup {
+        uint32_t direction;
+        SegmentID target;
+        Request::OpCode opcode;
+        std::vector<MemFabricGvaCopy> copies;
+        std::shared_ptr<MemFabricCopyCompletion> completion =
+            std::make_shared<MemFabricCopyCompletion>();
+    };
+    Status submitGvaCopies(MemFabricSubBatch*, const std::vector<Request>&);
+    Status resolveGvaCopies(const std::vector<Request>&, std::vector<GvaCopy>&);
+    Status buildGvaCopyGroups(MemFabricSubBatch*, const std::vector<Request>&,
+                              const std::vector<GvaCopy>&,
+                              std::vector<std::shared_ptr<GvaCopyGroup>>&);
+    void dispatchGvaCopyGroups(std::vector<std::shared_ptr<GvaCopyGroup>>&);
+    std::vector<std::unique_ptr<ThreadPool>> copy_workers_;
+    size_t next_copy_worker_ = 0;
+    std::shared_ptr<std::atomic<size_t>> gva_pending_ =
+        std::make_shared<std::atomic<size_t>>(0);
+    size_t max_pending_copies_ = 256;
     Status loadConfig(const std::shared_ptr<Config>& conf);
+    Status loadGvaConfig(const Config& conf, const std::string& protocol);
+    Status finishInstall();
     // Called with inflight_mu_ held; also serializes registration and teardown.
     Status initializeLocked();
     Status bindDevice() const;
@@ -100,7 +139,10 @@ class MemFabricTransport : public Transport {
     std::string local_segment_name_;
     MemFabricConfig config_;
 
-    std::mutex inflight_mu_;
+    mutable std::mutex inflight_mu_;
+    std::shared_ptr<MemFabricSharedMemory> gva_;
+    MemFabricGvaConfig gva_config_;
+    std::map<std::pair<SegmentID, uint64_t>, std::string> gva_remote_;
     std::condition_variable inflight_cv_;
     // Non-owning batch index, protected together with submission and polling.
     std::unordered_set<MemFabricSubBatch*> batches_;
