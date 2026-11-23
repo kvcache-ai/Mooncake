@@ -365,6 +365,20 @@ if(USE_TENT)
   set_tests_properties(standalone_client_tent_test
                        PROPERTIES ENVIRONMENT "MC_USE_TENT=1;MC_FORCE_TCP=1")
 endif()
+# Store over TENT UB without hardware. Keep UB-only assertions separate from
+# the general Store integration and hugepage regression suites.
+if(USE_TENT AND USE_UB_MOCK)
+  add_store_test(store_tent_ub_mock_test store_tent_ub_mock_test.cpp)
+  target_link_libraries(store_tent_ub_mock_test PRIVATE tent)
+  target_include_directories(
+    store_tent_ub_mock_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/tent/tests/ub_mock)
+  set(STORE_UB_MOCK_ENV
+      "MC_USE_TENT=1;MC_TENT_UB_MOCK=1;MC_TENT_CONF={\"transports\":{\"tcp\":{\"enable\":false},\"rdma\":{\"enable\":false},\"hp_tcp\":{\"enable\":false},\"shm\":{\"enable\":false},\"io_uring\":{\"enable\":false},\"ub\":{\"enable\":true}}}"
+  )
+  set_tests_properties(store_tent_ub_mock_test
+                       PROPERTIES ENVIRONMENT "${STORE_UB_MOCK_ENV}" TIMEOUT 300)
+endif()
 if(USE_CUDA)
   target_compile_definitions(pybind_client_test PRIVATE MOONCAKE_TEST_CUDA_H2D)
   target_link_libraries(pybind_client_test PRIVATE CUDA::cudart)
