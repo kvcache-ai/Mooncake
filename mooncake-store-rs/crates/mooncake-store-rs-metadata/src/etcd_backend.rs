@@ -53,6 +53,19 @@ impl EtcdMetadataConfig {
     }
 }
 
+// Keep lease updates successful when another runtime owns the stable index.
+fn delete_stable_runtime_if_owned(stable_key: String, runtime_key: String) -> TxnOp {
+    TxnOp::txn(
+        Txn::new()
+            .when([Compare::value(
+                stable_key.clone(),
+                CompareOp::Equal,
+                runtime_key,
+            )])
+            .and_then([TxnOp::delete(stable_key, None)]),
+    )
+}
+
 const EVICTION_FRONTIER_LIMIT: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -543,7 +556,10 @@ impl MetadataBackend for EtcdMetadataBackend {
                     if lease.state == ClientLifecycleState::Active {
                         ops.push(TxnOp::put(stable_key.clone(), runtime_key.clone(), None));
                     } else {
-                        ops.push(TxnOp::delete(stable_key.clone(), None));
+                        ops.push(delete_stable_runtime_if_owned(
+                            stable_key.clone(),
+                            runtime_key.clone(),
+                        ));
                     }
                     if let Some(current_expiry_entry) =
                         current_expiry_entry.filter(|value| value != &expiry_entry_key)
@@ -632,7 +648,10 @@ impl MetadataBackend for EtcdMetadataBackend {
                         if lease.state == ClientLifecycleState::Active {
                             ops.push(TxnOp::put(stable_key.clone(), runtime_key.clone(), None));
                         } else {
-                            ops.push(TxnOp::delete(stable_key.clone(), None));
+                            ops.push(delete_stable_runtime_if_owned(
+                                stable_key.clone(),
+                                runtime_key.clone(),
+                            ));
                         }
                         if let Some(current_expiry_entry) =
                             current_expiry_entry.filter(|value| value != &expiry_entry_key)
@@ -730,7 +749,10 @@ impl MetadataBackend for EtcdMetadataBackend {
                                 None,
                             ));
                         } else {
-                            ops.push(TxnOp::delete(stable_key.clone(), None));
+                            ops.push(delete_stable_runtime_if_owned(
+                                stable_key.clone(),
+                                lease.runtime.storage_key(),
+                            ));
                         }
                         if let Some(current_expiry_entry) =
                             current_expiry_entry.filter(|value| value != &expiry_entry_key)
@@ -776,7 +798,10 @@ impl MetadataBackend for EtcdMetadataBackend {
                 if next == ClientLifecycleState::Active {
                     ops.push(TxnOp::put(stable_key.clone(), runtime.storage_key(), None));
                 } else {
-                    ops.push(TxnOp::delete(stable_key.clone(), None));
+                    ops.push(delete_stable_runtime_if_owned(
+                        stable_key.clone(),
+                        runtime.storage_key(),
+                    ));
                 }
                 let txn = Txn::new()
                     .when([Compare::mod_revision(
@@ -3074,6 +3099,202 @@ mod tests {
             .list_live_clients()
             .expect("live client listing should succeed");
         assert_eq!(live, vec![draining]);
+    }
+
+    fn publish_predecessor_and_successor(
+        backend: &EtcdMetadataBackend,
+    ) -> (ClientLease, ClientLease) {
+        let mut predecessor = sample_lease(ClientLifecycleState::Active);
+        backend
+            .upsert_client_lease(&predecessor)
+            .expect("predecessor active lease should upsert");
+        predecessor.state = ClientLifecycleState::Draining;
+        backend
+            .update_client_state(&predecessor.runtime, ClientLifecycleState::Draining)
+            .expect("predecessor should enter draining");
+
+        let mut successor = predecessor.clone();
+        successor.runtime = ClientRuntimeId::new("writer", ClientEpoch(6));
+        successor.state = ClientLifecycleState::Active;
+        backend
+            .upsert_client_lease(&successor)
+            .expect("successor active lease should upsert");
+        assert_eq!(
+            backend
+                .get_live_runtime_by_stable_id(&successor.runtime.stable_id)
+                .expect("successor stable lookup should succeed"),
+            Some(successor.clone())
+        );
+        (predecessor, successor)
+    }
+
+    #[test]
+    fn etcd_predecessor_heartbeat_preserves_successor_stable_runtime() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()])
+                .keyspace(MetadataKeyspace::new("test/etcd-predecessor-heartbeat")),
+        )
+        .expect("etcd backend should initialize");
+        let (mut predecessor, successor) = publish_predecessor_and_successor(&backend);
+        predecessor.expires_at_ms += 60_000;
+
+        backend
+            .upsert_client_lease(&predecessor)
+            .expect("predecessor heartbeat should refresh");
+
+        assert_eq!(
+            backend
+                .get_client_lease(&predecessor.runtime)
+                .expect("predecessor lease lookup should succeed"),
+            Some(predecessor)
+        );
+        assert_eq!(
+            backend
+                .get_live_runtime_by_stable_id(&successor.runtime.stable_id)
+                .expect("stable lookup after predecessor heartbeat should succeed"),
+            Some(successor)
+        );
+    }
+
+    #[test]
+    fn etcd_predecessor_state_update_preserves_successor_stable_runtime() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()])
+                .keyspace(MetadataKeyspace::new("test/etcd-predecessor-state-update")),
+        )
+        .expect("etcd backend should initialize");
+        let (predecessor, successor) = publish_predecessor_and_successor(&backend);
+
+        backend
+            .update_client_state(&predecessor.runtime, ClientLifecycleState::Offline)
+            .expect("predecessor state update should succeed");
+
+        assert_eq!(
+            backend
+                .get_client_lease(&predecessor.runtime)
+                .expect("predecessor lease lookup should succeed")
+                .expect("predecessor lease should remain present")
+                .state,
+            ClientLifecycleState::Offline
+        );
+        assert_eq!(
+            backend
+                .get_live_runtime_by_stable_id(&successor.runtime.stable_id)
+                .expect("stable lookup after predecessor state update should succeed"),
+            Some(successor)
+        );
+    }
+
+    #[test]
+    fn etcd_draining_heartbeat_removes_owned_stable_runtime() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()])
+                .keyspace(MetadataKeyspace::new("test/etcd-owned-stable-runtime")),
+        )
+        .expect("etcd backend should initialize");
+        let mut draining = sample_lease(ClientLifecycleState::Active);
+        backend
+            .upsert_client_lease(&draining)
+            .expect("active lease should upsert");
+        draining.state = ClientLifecycleState::Draining;
+
+        backend
+            .upsert_client_lease(&draining)
+            .expect("draining heartbeat should refresh");
+
+        assert_eq!(
+            backend
+                .get_client_lease(&draining.runtime)
+                .expect("draining lease lookup should succeed"),
+            Some(draining.clone())
+        );
+        assert!(backend
+            .get_live_runtime_by_stable_id(&draining.runtime.stable_id)
+            .expect("owned stable lookup should succeed")
+            .is_none());
+    }
+
+    #[test]
+    fn etcd_new_draining_lease_preserves_active_stable_runtime() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()])
+                .keyspace(MetadataKeyspace::new("test/etcd-new-draining-lease")),
+        )
+        .expect("etcd backend should initialize");
+        let active = sample_lease(ClientLifecycleState::Active);
+        backend
+            .upsert_client_lease(&active)
+            .expect("active lease should upsert");
+        let mut draining = active.clone();
+        draining.runtime = ClientRuntimeId::new("writer", ClientEpoch(6));
+        draining.state = ClientLifecycleState::Draining;
+
+        backend
+            .upsert_client_lease(&draining)
+            .expect("new draining lease should upsert");
+
+        assert_eq!(
+            backend
+                .get_client_lease(&draining.runtime)
+                .expect("draining lease lookup should succeed"),
+            Some(draining)
+        );
+        assert_eq!(
+            backend
+                .get_live_runtime_by_stable_id(&active.runtime.stable_id)
+                .expect("stable lookup after new draining lease should succeed"),
+            Some(active)
+        );
+    }
+
+    #[test]
+    fn etcd_draining_allocation_preserves_active_stable_runtime() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()])
+                .keyspace(MetadataKeyspace::new("test/etcd-draining-allocation")),
+        )
+        .expect("etcd backend should initialize");
+        let active = sample_lease(ClientLifecycleState::Active);
+        backend
+            .upsert_client_lease(&active)
+            .expect("active lease should upsert");
+        let mut template = active.clone();
+        template.state = ClientLifecycleState::Draining;
+
+        let allocated = backend
+            .allocate_client_lease(&template)
+            .expect("draining lease allocation should succeed");
+
+        assert_eq!(allocated.epoch, ClientEpoch(6));
+        assert_eq!(
+            backend
+                .get_client_lease(&allocated)
+                .expect("allocated lease lookup should succeed")
+                .expect("allocated lease should remain present")
+                .state,
+            ClientLifecycleState::Draining
+        );
+        assert_eq!(
+            backend
+                .get_live_runtime_by_stable_id(&active.runtime.stable_id)
+                .expect("stable lookup after draining allocation should succeed"),
+            Some(active)
+        );
     }
 
     #[test]

@@ -11,6 +11,12 @@ else()
 endif()
 option(WITH_PG "build the Mooncake ProcessGroup backend" ${_WITH_PG_DEFAULT})
 option(WITH_CONDUCTOR "build mooncake conductor service" OFF)
+option(WITH_CONDUCTOR_GO "build Go bindings for mooncake conductor" OFF)
+option(WITH_CONDUCTOR_C_SHARED
+       "build the conductor client C ABI shared library" OFF)
+if((WITH_CONDUCTOR_GO OR WITH_CONDUCTOR_C_SHARED) AND NOT WITH_CONDUCTOR)
+  message(FATAL_ERROR "Conductor language bindings require WITH_CONDUCTOR=ON")
+endif()
 
 if(SKBUILD_SABI_COMPONENT
    AND (WITH_EP

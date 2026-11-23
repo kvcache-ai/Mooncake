@@ -154,6 +154,19 @@ print(f'Initialize result: {result}')  # Should be 0
     --device_name=urma0,urma1,urma2,urma3
 ```
 
+### UBoE (RM Mode)
+
+UBoE (UnifiedBus over Ethernet) carries UB messages over Ethernet/IP and requires URMA's RM (Reliable Message) mode. Native UB keeps RC (Reliable Connection) by default. Select RM with `MC_UB_TRANS_MODE=rm` (also `RM`/`1`) on both target and initiator before the UB transport is constructed.
+
+UBoE support requires a UBoE-capable device with URMA RM support, for example a Huawei SDI 6.0 platform.
+
+| Mode | URMA transport | Channel establishment | Use case |
+|------|----------------|-----------------------|----------|
+| RC (default) | `URMA_TM_RC` | `urma_import_jetty()` + `urma_bind_jetty()` | Native UB |
+| RM | `URMA_TM_RM` | `urma_import_jetty()` only | UBoE |
+
+In RM mode, jfs/jfr use `URMA_TM_RM` and `depth = min(device capability, 2048)`. UBoE devices report `max_jfs_depth` / `max_jfr_depth` = 2047; RC keeps 2048. The channel is established by `urma_import_jetty()` alone; `urma_bind_jetty()` / `urma_unbind_jetty()` are RC-only.
+
 ## Unit Tests
 
 Run the UB transport unit tests:
@@ -162,12 +175,21 @@ Run the UB transport unit tests:
 ./build/mooncake-transfer-engine/tests/ub_transport_test
 ```
 
+Run the same suite against UBoE with RM mode:
+
+```bash
+MC_UB_TRANS_MODE=rm ./build/mooncake-transfer-engine/tests/ub_transport_test \
+    --metadata_server=P2PHANDSHAKE \
+    --device_name=<uboe-device>
+```
+
 The test suite includes:
 
 | Test | Description |
 |------|-------------|
 | `MultiWrite` | Multiple write operations |
 | `MultipleRead` | Multiple read operations with data integrity check |
+| `RMModeMatchesEnvironment` | `rmMode()` matches `MC_UB_TRANS_MODE` |
 
 You can also run all unit tests via CTest:
 

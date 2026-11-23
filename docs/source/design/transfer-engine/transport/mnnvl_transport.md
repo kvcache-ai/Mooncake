@@ -9,7 +9,7 @@ completion overhead. They do not establish that this branch has passed
 production acceptance, nor imply that previously deployed MNNVL systems were
 unusable.
 
-This page describes the workspace-root implementation, including the F5
+This page describes the workspace-root implementation, including the F5/F1
 changes and the registration/routing repairs. The classic implementation,
 serving-framework connectors, public Transfer Engine requests, and Python
 bindings are unchanged by this work.
@@ -182,6 +182,28 @@ These checks prevent unintended data-path downgrade; they do not prove that an
 external allocator, serving framework, or a historical peer is correctly
 configured. Verify the actual allocation, engine, and per-transfer route.
 
+## F1: GPU-Side Caller Dependency
+
+The transport records its existing caller-sync event on
+`cudaStreamPerThread`, on the original caller's device:
+
+```text
+cpu_block: record caller event -> CPU event synchronize -> enqueue copy
+ gpu_wait: record caller event -> copy stream waits on event -> enqueue copy
+```
+
+`gpu_wait` removes the host wait for this dependency; it does not remove CUDA
+stream ordering or make one sub-batch's copies run in parallel. Re-recording
+the cached caller event does not change previously enqueued waits.
+
+Existing PD producer-event fencing remains mandatory. An event on the
+transport caller's per-thread stream does **not** automatically capture work
+on an arbitrary PyTorch/application stream. No producer-event propagation was
+added to requests, connectors, or Python APIs.
+
+`gpu_wait` requires `enable_runtime_queue=false`: deferred worker dispatch
+would observe the worker's stream rather than the original caller's stream.
+
 ## Reviewed P1/P2 Repairs
 
 | Severity | Defect | Repair and regression coverage |
@@ -201,12 +223,13 @@ Native TENT bootstrap defaults remain conservative:
 | JSON path | Environment override | Default |
 | --- | --- | --- |
 | `transports/mnnvl/require_fabric` | `MC_MNNVL_REQUIRE_FABRIC` | `false` |
+| `transports/mnnvl/sync_mode` | `MC_MNNVL_SYNC_MODE` | `cpu_block` |
 | `transports/mnnvl/egm` | `MC_MNNVL_EGM` | `false` |
 
-The new boolean environment controls accept `true/false`, `1/0`, `yes/no`,
-and `on/off`; malformed new controls fail configuration. Use actual JSON
-booleans in configuration files. Recreate the engine to change these
-bootstrap settings.
+`sync_mode` accepts only `cpu_block` or `gpu_wait`. The new boolean environment
+controls accept `true/false`, `1/0`, `yes/no`, and `on/off`; malformed new
+controls fail configuration. Use actual JSON booleans in configuration files.
+Recreate the engine to change these bootstrap settings.
 
 MNNVL retains some legacy-named tuning keys under `transports/nvlink`, including
 `handle_type` (normally `fabric`) and `host_register` (default `true`).
@@ -219,10 +242,12 @@ JSON object or a file path:
 
 ```json
 {
+  "enable_runtime_queue": false,
   "transports": {
     "mnnvl": {
       "enable": true,
       "require_fabric": true,
+      "sync_mode": "gpu_wait",
       "egm": false
     },
     "nvlink": { "handle_type": "fabric" }
@@ -273,12 +298,13 @@ export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
 export MC_USE_TENT=1
 export MC_ENABLE_MNNVL=1
 export MC_MNNVL_REQUIRE_FABRIC=1
+export MC_MNNVL_SYNC_MODE=gpu_wait
 ```
 
-Do not use `MC_FORCE_MNNVL` as a substitute for native activation. These
-settings are a validation example, not a production-certified recipe: the
-external allocator limitation below must be checked against the actual
-SGLang/Mooncake versions first.
+Leave `enable_runtime_queue=false`, and do not use `MC_FORCE_MNNVL` as a
+substitute for native activation. These settings are a validation example,
+not a production-certified recipe: the external allocator limitation below
+must be checked against the actual SGLang/Mooncake versions first.
 
 Launch prefill and decode workers using their existing model, network, and TP
 settings, adding `--disaggregation-mode prefill` or
@@ -349,8 +375,8 @@ Hardware acceptance still requires:
 2. Strict negative cases: unavailable FABRIC/IMEX, unsupported/nonexportable
    allocation, absent export, conflicting policy/hint, and copy/poll errors;
    no unintended RDMA/TCP payload fallback.
-3. Delayed producers on the existing PD stream/event path, concurrent batches,
-   repeated appends, polling progress, and teardown.
+3. Delayed producers on the existing PD stream/event path in both sync modes,
+   concurrent batches, repeated appends, polling progress, and teardown.
 4. SGLang PD correctness and sustained p95/p99 latency/CPU/throughput comparison
    with defaults, then staged capacity testing under realistic concurrency.
 
