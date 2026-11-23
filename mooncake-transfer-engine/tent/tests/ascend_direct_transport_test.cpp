@@ -1320,8 +1320,13 @@ TEST_F(AscendDirectTransportTest, DisconnectRetryPollsNewerGroup) {
     // queried by its owner; its terminal result can only be consumed once.
     std::promise<void> entered, resume;
     auto resume_query = resume.get_future();
-    std::atomic<int> queries{0};
+    std::atomic<int> queries{0}, completed_queries{0};
     state_->on_query = [&](void* handle) {
+        if (handle == sub->task_list[1].req_handle) {
+            ++completed_queries;
+            // The query began before the deadline and observed completion.
+            sub->task_list[1].start_time_ns = 1;
+        }
         if (handle == sub->task_list[2].req_handle && ++queries == 1) {
             entered.set_value();
             EXPECT_EQ(resume_query.wait_for(std::chrono::seconds(5)),
@@ -1339,6 +1344,7 @@ TEST_F(AscendDirectTransportTest, DisconnectRetryPollsNewerGroup) {
     EXPECT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
     EXPECT_EQ(status.s, PENDING);
     EXPECT_EQ(state_->disconnect_calls, 1);
+    EXPECT_EQ(completed_queries.load(), 1);
     resume.set_value();
     EXPECT_EQ(owner.get(), COMPLETED);
     EXPECT_EQ(queries.load(), 1);

@@ -1051,7 +1051,7 @@ void AscendDirectTransport::failEntireRoute(HixlTask& task,
                group.engine_idx == route.first && group.remote == route.second;
     };
     int released = 0;
-    bool can_disconnect = true;
+    bool can_disconnect;
     {
         std::unique_lock<std::mutex> lock(req_mutex_);
         auto it = groups_.find(task.group_key);
@@ -1069,27 +1069,25 @@ void AscendDirectTransport::failEntireRoute(HixlTask& task,
         }
         if (status != TIMEOUT || disconnecting_.count(route)) return;
 
-        // A submission without a published handle may already be inside HIXL.
-        // A newer handle must make progress even if only the old one is polled.
-        for (;;) {
-            const auto next = std::find_if(
-                groups_.begin(), groups_.end(), [&](const auto& entry) {
-                    const auto& group = entry.second;
-                    return on_route(group) &&
-                           (!group.leader ||
-                            (group.polling && entry.first != task.group_key) ||
-                            group.failure == PENDING);
-                });
-            if (next == groups_.end()) break;
+        // Query each newer handle once. A busy sibling prevents disconnect,
+        // but must not hide other requests that have already completed.
+        std::vector<void*> candidates;
+        for (const auto& [key, group] : groups_) {
+            if (on_route(group) && group.failure == PENDING)
+                candidates.push_back(key);
+        }
+        for (auto key : candidates) {
+            auto next = groups_.find(key);
+            if (next == groups_.end()) continue;
             auto& group = next->second;
-            if (!group.leader || group.polling) {
-                can_disconnect = false;
-                break;
-            }
-            // The polling claim keeps the group pending and its handle live.
-            // Re-scan after each query: submissions can join while unlocked.
+            if (!on_route(group) || !group.leader || group.polling ||
+                group.failure != PENDING)
+                continue;
             group.polling = true;
             void* handle = LoadTaskHandle(*group.leader);
+            const bool expired =
+                SteadyTimeInNano() - group.leader->start_time_ns >
+                transfer_timeout_ns_;
             lock.unlock();
             HixlXferState native = HixlXferState::Waiting;
             auto query =
@@ -1097,9 +1095,6 @@ void AscendDirectTransport::failEntireRoute(HixlTask& task,
             lock.lock();
             group.polling = false;
             const auto state = query.ok() ? FromHixlState(native) : PENDING;
-            const bool expired =
-                SteadyTimeInNano() - group.leader->start_time_ns >
-                transfer_timeout_ns_;
             if (state == COMPLETED || state == FAILED) {
                 group.status = group.failure != PENDING
                                    ? group.failure
@@ -1107,12 +1102,18 @@ void AscendDirectTransport::failEntireRoute(HixlTask& task,
                 if (std::exchange(group.counted, false)) ++released;
             } else if (expired || state == TIMEOUT) {
                 if (group.failure == PENDING) group.failure = TIMEOUT;
-            } else {
-                can_disconnect = false;
-                break;
             }
         }
-        if (can_disconnect) disconnecting_.insert(route);
+        // Submissions and other pollers may have joined while unlocked.
+        can_disconnect = std::none_of(
+            groups_.begin(), groups_.end(), [&](const auto& entry) {
+                const auto& group = entry.second;
+                return on_route(group) &&
+                       (!group.leader || group.failure == PENDING ||
+                        (group.polling && entry.first != task.group_key));
+            });
+        if (can_disconnect)
+            can_disconnect = disconnecting_.insert(route).second;
     }
     releaseInflight(released);
     if (!can_disconnect) return;
