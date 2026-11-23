@@ -76,6 +76,7 @@ class HaKvBackend;
 class HttpMetadataServer;
 class OpLogBatchStorage;
 class OrderedOpLogWriter;
+class BatchOpLogPruningWorker;
 
 namespace test {
 class MasterServiceTestPeer;
@@ -161,6 +162,10 @@ class MasterService {
 
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
+    ErrorCode StartBatchOpLogPruningWorker(uint64_t chunk_batch_count,
+                                           uint64_t max_batches_per_second);
+    void RequestStopBatchOpLogPruningWorker();
+    void StopBatchOpLogPruningWorker();
     void StopBatchOpLogWriter();
 
     /**
@@ -2300,6 +2305,12 @@ class MasterService {
     std::shared_ptr<HaKvBackend> batch_oplog_kv_backend_;
     std::unique_ptr<OpLogBatchStorage> batch_oplog_storage_;
     std::unique_ptr<OrderedOpLogWriter> ordered_oplog_writer_;
+    std::unique_ptr<BatchOpLogPruningWorker> batch_oplog_pruning_worker_;
+    // Serializes the pruning worker's pointer publication with asynchronous
+    // stop requests. The stop latch belongs to this service instance and is
+    // intentionally not cleared by a later worker Start().
+    std::mutex batch_oplog_pruning_mutex_;
+    bool batch_oplog_pruning_stop_requested_{false};
     BatchOpLogWriterFactory batch_oplog_writer_factory_;
 
     // OpLog publishing helpers
@@ -2352,14 +2363,12 @@ class MasterService {
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     /**
-     * Appends a SEGMENT_MOUNT / SEGMENT_UNMOUNT entry without waiting for it
-     * to become durable. The local segment change has already happened and
-     * cannot be rolled back, so a failed append is only logged; nothing
-     * retries it.
+     * Commits a segment event using capacity reserved before the local change.
+     * Does not wait for durability; commit failures are returned to the caller.
      */
-    void PersistSegmentOpForHA(const char* why, OpType type,
-                               const std::string& key,
-                               const std::string& payload);
+    tl::expected<void, ErrorCode> PersistSegmentOpForHA(
+        const char* why, OrderedOpLogWriter::Reservation&& reservation,
+        const OpLogEntry& entry, DurableFinalizeCallback callback = nullptr);
 
     /**
      * Appends a REMOVE entry for the key, without waiting for it to become

@@ -30,7 +30,7 @@ std::atomic<int64_t> frozen_time_ns{-1};
 extern "C" int __real_clock_gettime(clockid_t clock, struct timespec* ts);
 extern "C" int __wrap_clock_gettime(clockid_t clock, struct timespec* ts) {
     const int64_t now = frozen_time_ns.load();
-    if (clock == CLOCK_REALTIME && now >= 0) {
+    if (clock == CLOCK_MONOTONIC && now >= 0) {
         ts->tv_sec = now / 1000000000;
         ts->tv_nsec = now % 1000000000;
         return 0;
