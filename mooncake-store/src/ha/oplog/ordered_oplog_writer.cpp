@@ -185,6 +185,7 @@ struct OrderedOpLogWriter::Impl {
     uint64_t next_reservation_id{1};
     uint64_t next_sequence_id{1};
     uint64_t next_group_id{1};
+    uint64_t finalized_sequence{config.initial_durable_prefix.last_seq};
     DurablePrefix durable_prefix{config.initial_durable_prefix};
     DurableWaiters durable_waiters;
     size_t open_waiting_slots{0};
@@ -439,6 +440,54 @@ async_simple::Future<ErrorCode> OrderedOpLogWriter::AwaitDurable(
     return future;
 }
 
+tl::expected<void, ErrorCode> OrderedOpLogWriter::WaitUntilDurable(
+    uint64_t sequence, std::chrono::milliseconds timeout) {
+    std::unique_lock lock(impl_->mutex);
+    auto ready = [&] {
+        return impl_->durable_prefix.last_seq >= sequence ||
+               impl_->terminal_state || impl_->stop_requested;
+    };
+    if (timeout.count() < 0 ||
+        timeout > std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::duration::max() / 2))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (timeout.count() == 0)
+        impl_->cv.wait(lock, ready);
+    else if (!impl_->cv.wait_for(lock, timeout, ready))
+        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+    if (impl_->durable_prefix.last_seq >= sequence) return {};
+    return tl::make_unexpected(impl_->terminal_state
+                                   ? impl_->terminal_state->error
+                                   : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+tl::expected<void, ErrorCode> OrderedOpLogWriter::WaitUntilFinalized(
+    uint64_t sequence, std::chrono::milliseconds timeout) {
+    std::unique_lock lock(impl_->mutex);
+    auto ready = [&] {
+        return impl_->finalized_sequence >= sequence ||
+               ((impl_->terminal_state || impl_->stop_requested) &&
+                impl_->durable_prefix.last_seq < sequence);
+    };
+    if (timeout.count() < 0 ||
+        timeout > std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::duration::max() / 2))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (timeout.count() == 0)
+        impl_->cv.wait(lock, ready);
+    else if (!impl_->cv.wait_for(lock, timeout, ready))
+        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+    if (impl_->finalized_sequence >= sequence) return {};
+    return tl::make_unexpected(impl_->terminal_state
+                                   ? impl_->terminal_state->error
+                                   : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+uint64_t OrderedOpLogWriter::DurableSequence() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->durable_prefix.last_seq;
+}
+
 bool OrderedOpLogWriter::IsAccepting() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->accepting;
@@ -510,6 +559,11 @@ void OrderedOpLogWriter::Start() {
 #endif
                 callback_entry.callback(callback_entry.entry);
             }
+            {
+                std::lock_guard lock(impl_->mutex);
+                impl_->finalized_sequence = callback_entry.entry.sequence_id;
+            }
+            impl_->cv.notify_all();
         }
     });
     impl_->writer_thread = std::thread([this] {
