@@ -464,7 +464,7 @@ class TransferEngineImpl {
                                      const std::string& location);
     int unregisterLocalMemoryBatchImpl(const std::vector<void*>& addresses);
 
-    bool memory_registration_reuse_ = false;
+    std::atomic<bool> memory_registration_reuse_{false};
     std::mutex registration_reuse_mutex_;
     std::map<uintptr_t, size_t> registration_users_;
     std::vector<void*> failed_rollbacks_;

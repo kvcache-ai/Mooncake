@@ -189,9 +189,11 @@ For the RDMA transfer process, the source pointer `TransferRequest::source` must
 int enableMemoryRegistrationReuse();
 ```
 
-Call before registering memory or starting concurrent callers. Classic TE only;
-TENT and explicit `mp_*` registration are unsupported. Returns `0` on success.
-The `nvmeof` and `barex` transports are unsupported.
+Do not call concurrently with memory registration. Classic TE only; TENT and
+explicit `mp_*` registration are unsupported. Returns `0` on success.
+The `nvmeof` and `barex` transports are unsupported. Each existing registration
+becomes one registration at its start address; one registered without remote
+access cannot be reused.
 Identical or contained regions with matching locations reuse a registration;
 partial overlaps remain errors. Register whole allocations before their views.
 Reused registrations are always remote-accessible and published, regardless of

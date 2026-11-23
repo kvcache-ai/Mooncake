@@ -594,7 +594,8 @@ Reads bytes from a buffer at the specified address and returns them as a Python 
 #### enable_memory_registration_reuse()
 
 Enables {ref}`registration reuse <memory-registration-reuse>` on a classic
-engine. Call before registering buffers or sharing the engine with Store.
+engine. Call before sharing the engine with Store, not concurrently with
+memory registration.
 Returns `0` on success, a negative error code otherwise.
 
 #### register_memory()

@@ -803,13 +803,17 @@ bool TransferEngineImpl::checkOverlap(void* addr, uint64_t length) {
 }
 
 int TransferEngineImpl::enableMemoryRegistrationReuse() {
+    std::lock_guard<std::mutex> transaction(registration_reuse_mutex_);
     std::unique_lock<std::shared_mutex> lock(mutex_);
     if (memory_registration_reuse_) return 0;
-    if (!local_memory_regions_.empty() || !registering_memory_regions_.empty())
-        return ERR_INVALID_ARGUMENT;
+    if (!registering_memory_regions_.empty()) return ERR_INVALID_ARGUMENT;
     for (auto transport : multi_transports_->listTransports())
         if (!supportsRegistrationReuse(transport->getName()))
             return ERR_NOT_IMPLEMENTED;
+    for (auto& [base, region] : local_memory_regions_) {
+        region.users = 1;
+        ++registration_users_[base];
+    }
     memory_registration_reuse_ = true;
     return 0;
 }
@@ -837,6 +841,8 @@ int TransferEngineImpl::registerReusableMemory(
                     if (region.releasing) return ERR_CONTEXT;
                     if (region.location != location)
                         return ERR_INVALID_ARGUMENT;
+                    if (!region.remote_accessible)
+                        return ERR_ADDRESS_OVERLAPPED;
                     bases.push_back(base);
                     continue;
                 }

@@ -167,7 +167,7 @@ class TransferEngine {
 
     int removeLocalSegment(const std::string& segment_name);
 
-    // Enable before registering memory or starting concurrent callers.
+    // Do not call concurrently with memory registration.
     int enableMemoryRegistrationReuse();
 
     int registerLocalMemory(void* addr, size_t length,

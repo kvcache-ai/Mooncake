@@ -1605,22 +1605,25 @@ TEST_F(MemoryRegistrationReuseTest, ConcurrentUsersKeepStoreRegistrationAlive) {
     EXPECT_EQ(publishedBuffers(), 0u);
 }
 
-TEST_F(TransportTest, MemoryRegistrationReuseRequiresEmptyClassicEngine) {
+TEST_F(TransportTest, MemoryRegistrationReuseAdoptsExistingRegistrations) {
     TransferEngine engine(false);
     ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
-    std::array<char, 64> allocation{};
-    ASSERT_EQ(engine.registerLocalMemory(allocation.data(), allocation.size()),
-              0);
-    EXPECT_EQ(engine.enableMemoryRegistrationReuse(), ERR_INVALID_ARGUMENT);
-    testing::internal::CaptureStderr();
-    auto result =
-        engine.registerLocalMemory(allocation.data(), allocation.size());
-    auto errors = testing::internal::GetCapturedStderr();
-    EXPECT_EQ(result, ERR_ADDRESS_OVERLAPPED);
-    EXPECT_NE(errors.find("overlapped memory region"), std::string::npos);
-    ASSERT_EQ(engine.unregisterLocalMemory(allocation.data()), 0);
+    ASSERT_NE(installRegistrationReuseTcp(engine), nullptr);
+    std::array<char, 256> allocation{};
+    auto* base = allocation.data();
+    ASSERT_EQ(engine.registerLocalMemory(base, 128), 0);
+    ASSERT_EQ(engine.registerLocalMemory(base + 128, 128, "*", false), 0);
     EXPECT_EQ(engine.enableMemoryRegistrationReuse(), 0);
     EXPECT_EQ(engine.enableMemoryRegistrationReuse(), 0);
+    ASSERT_EQ(engine.registerLocalMemory(base + 64, 64), 0);
+    EXPECT_EQ(engine.registerLocalMemory(base + 128, 64),
+              ERR_ADDRESS_OVERLAPPED);
+    ASSERT_EQ(engine.unregisterLocalMemory(base), 0);
+    EXPECT_TRUE(engine.checkOverlap(base, 128));
+    ASSERT_EQ(engine.unregisterLocalMemory(base + 64), 0);
+    EXPECT_FALSE(engine.checkOverlap(base, 128));
+    ASSERT_EQ(engine.unregisterLocalMemory(base + 128), 0);
+    EXPECT_FALSE(engine.checkOverlap(base, allocation.size()));
 }
 
 TEST_F(TransportTest,
