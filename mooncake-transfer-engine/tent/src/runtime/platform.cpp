@@ -14,7 +14,9 @@
 
 #include "tent/runtime/platform.h"
 
+#include <chrono>
 #include <cstdlib>
+#include <thread>
 #include <mutex>
 #include <unordered_set>
 #include <utility>
@@ -49,6 +51,23 @@ void DmabufExport::close() {
     fd = -1;
     close_fd = false;
     if (::close(owned_fd) != 0) PLOG(WARNING) << "Failed to close dma-buf fd";
+}
+
+Status Platform::copyWithCompletion(void* dst, void* src, size_t length,
+                                    PendingCopy& pending) {
+#ifdef USE_CUDA
+    if (auto* cuda = dynamic_cast<CudaPlatform*>(this))
+        return cuda->copy(dst, src, length, &pending);
+#elif defined(USE_HIP)
+    if (auto* rocm = dynamic_cast<RocmPlatform*>(this))
+        return rocm->copy(dst, src, length, &pending);
+#endif
+    return copy(dst, src, length);
+}
+
+void CopyCompletion::wait() {
+    while (!finished())
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
 Platform& Platform::getLoader(std::shared_ptr<Config> conf) {

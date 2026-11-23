@@ -290,6 +290,8 @@ Status IOUringTransport::freeSubBatch(SubBatchRef& batch) {
     for (auto& task : io_uring_batch->task_list)
         if (task.status_word == TransferStatusEnum::PENDING) ++outstanding;
     waitForInFlight(&ring, outstanding);
+    for (auto& task : io_uring_batch->task_list)
+        if (task.copyback) task.copyback->wait();
     io_uring_queue_exit(&ring);
     Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
     batch = nullptr;
@@ -330,7 +332,11 @@ IOUringFileContext* IOUringTransport::findFileContext(SegmentID target_id) {
     return tl_file_context_map[target_id].get();
 }
 
-Status IOUringTransport::copyMemory(void* dst, void* src, size_t length) {
+Status IOUringTransport::copyMemory(void* dst, void* src, size_t length,
+                                    Platform::PendingCopy* pending) {
+    if (pending)
+        return Platform::getLoader().copyWithCompletion(dst, src, length,
+                                                        *pending);
     return Platform::getLoader().copy(dst, src, length);
 }
 
@@ -495,8 +501,9 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
                 Status copy_status;
                 if (cqe_task->buffer && completed_bytes != 0 &&
                     cqe_task->request.opcode == Request::READ) {
-                    copy_status = copyMemory(cqe_task->request.source,
-                                             cqe_task->buffer, completed_bytes);
+                    copy_status =
+                        copyMemory(cqe_task->request.source, cqe_task->buffer,
+                                   completed_bytes, &cqe_task->copyback);
                 }
                 if (!copy_status.ok()) {
                     LOG(WARNING) << "IOUringTransport: READ copyback failed: "
@@ -511,11 +518,19 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
                             : TransferStatusEnum::FAILED;
                 }
             }
-            cqe_task->releaseBuffer();
+            if (!cqe_task->copyback) cqe_task->releaseBuffer();
         }
         io_uring_cqe_seen(&io_uring_batch->ring, cqe);
         batch->notifyProgress();
         status = TransferStatus{task.status_word, task.transferred_bytes};
+    }
+    if (task.copyback) {
+        if (!task.copyback->finished()) {
+            status = TransferStatus{PENDING, 0};
+        } else {
+            task.copyback.reset();
+            task.releaseBuffer();
+        }
     }
     return Status::OK();
 }

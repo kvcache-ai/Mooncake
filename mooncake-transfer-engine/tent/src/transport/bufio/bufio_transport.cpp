@@ -121,6 +121,8 @@ Status BufIoTransport::freeSubBatch(SubBatchRef& batch) {
     if (!buf_batch) {
         return Status::InvalidArgument("Invalid BufIo sub-batch" LOC_MARK);
     }
+    for (auto& task : buf_batch->task_list)
+        if (task.copyback) task.copyback->wait();
     delete buf_batch;
     batch = nullptr;
     return Status::OK();
@@ -225,8 +227,15 @@ Status BufIoTransport::submitTransferTasks(
                     continue;
                 }
 
-                platform.copy(req.source, host_buf.get(),
-                              static_cast<size_t>(io_ret));
+                if (!platform
+                         .copyWithCompletion(req.source, host_buf.get(),
+                                             static_cast<size_t>(io_ret),
+                                             task.copyback)
+                         .ok()) {
+                    if (task.copyback) task.staging = std::move(host_buf);
+                    task.status_word = TransferStatusEnum::FAILED;
+                    continue;
+                }
             } else {
                 io_ret = ::pread(fd, req.source, req.length,
                                  static_cast<off_t>(req.target_offset));
@@ -287,6 +296,14 @@ Status BufIoTransport::getTransferStatus(SubBatchRef batch, int task_id,
         return Status::InvalidArgument("Invalid task ID");
     }
     auto& task = buf_batch->task_list[task_id];
+    if (task.copyback) {
+        if (!task.copyback->finished()) {
+            status = TransferStatus{PENDING, 0};
+            return Status::OK();
+        }
+        task.copyback.reset();
+        task.staging.reset();
+    }
     status = TransferStatus{task.status_word, task.transferred_bytes};
     return Status::OK();
 }

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "tent/runtime/control_plane.h"
+#include "tent/runtime/platform.h"
 #include "tent/runtime/transport.h"
 
 namespace mooncake {
@@ -34,6 +35,9 @@ struct BufIoTask {
     Request request;
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
+
+    Platform::PendingCopy copyback;
+    std::unique_ptr<uint8_t[]> staging;
 
     BufIoTask()
         : status_word(TransferStatusEnum::PENDING), transferred_bytes(0) {}

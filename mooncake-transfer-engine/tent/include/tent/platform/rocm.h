@@ -110,6 +110,8 @@ class RocmPlatform : public Platform {
 
     virtual Status copy(void* dst, void* src, size_t length);
 
+    Status copy(void* dst, void* src, size_t length, PendingCopy* pending);
+
     virtual MemoryType getMemoryType(void* addr);
 
     virtual const std::vector<RangeLocation> getLocation(

@@ -39,6 +39,10 @@ set(cuda_pointer_wrapped_symbols
     cudaSetDevice
     cudaStreamCreateWithFlags
     cudaStreamDestroy
+    cuStreamGetCtx
+    cuCtxPushCurrent_v2
+    cuCtxPopCurrent_v2
+    cudaStreamQuery
     cudaStreamSynchronize
     cudaMemcpyAsync
     cudaMemcpy

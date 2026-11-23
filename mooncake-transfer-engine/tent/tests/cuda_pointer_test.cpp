@@ -19,6 +19,9 @@
 #include "tent/runtime/segment_manager.h"
 #include "tent/runtime/segment_registry.h"
 #include "tent/runtime/segment_tracker.h"
+#include "tent/transport/bufio/bufio_transport.h"
+#include <cstdio>
+#include <unistd.h>
 #endif
 
 #include <cuda.h>
@@ -39,6 +42,8 @@ struct Attributes {
 std::map<CUdeviceptr, Attributes> pointers;
 int copies, frees, host_frees, numa_probes, stream_creates;
 bool fail_copy;
+cudaError_t sync_result, query_result;
+CUcontext previous_context, query_context;
 bool fail_set_device, fail_free;
 bool fail_restore_context;
 CUcontext current_context;
@@ -51,6 +56,7 @@ class CudaPointerTest : public testing::Test {
         pointers.clear();
         copies = frees = host_frees = numa_probes = stream_creates = 0;
         fail_copy = false;
+        sync_result = query_result = cudaSuccess;
         fail_set_device = fail_free = false;
         fail_restore_context = false;
         current_context = reinterpret_cast<CUcontext>(0x1234);
@@ -137,7 +143,25 @@ cudaError_t __wrap_cudaStreamCreateWithFlags(cudaStream_t* stream,
     return cudaSuccess;
 }
 cudaError_t __wrap_cudaStreamDestroy(cudaStream_t) { return cudaSuccess; }
-cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t) { return cudaSuccess; }
+CUresult __wrap_cuStreamGetCtx(CUstream, CUcontext* context) {
+    *context = reinterpret_cast<CUcontext>(0x2001);
+    return CUDA_SUCCESS;
+}
+CUresult __wrap_cuCtxPushCurrent_v2(CUcontext context) {
+    previous_context = current_context;
+    current_context = context;
+    return CUDA_SUCCESS;
+}
+CUresult __wrap_cuCtxPopCurrent_v2(CUcontext* context) {
+    *context = current_context;
+    current_context = previous_context;
+    return CUDA_SUCCESS;
+}
+cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t) { return sync_result; }
+cudaError_t __wrap_cudaStreamQuery(cudaStream_t) {
+    query_context = current_context;
+    return query_result;
+}
 cudaError_t __wrap_cudaMemcpyAsync(void* dst, const void* src, size_t size,
                                    cudaMemcpyKind, cudaStream_t) {
     ++copies;
@@ -163,6 +187,63 @@ int __wrap_numa_move_pages(int, unsigned long, void**, const int*, int*, int) {
     return -1;
 }
 }
+
+#ifdef TENT_TEST_SEGMENT_TRACKER
+TEST_F(CudaPointerTest, BufferedFileReadHoldsStagingUntilGpuCopyFinishes) {
+    std::unique_ptr<FILE, decltype(&fclose)> file(std::tmpfile(), fclose);
+    ASSERT_TRUE(file);
+    char dst[16]{};
+    ASSERT_EQ(ftruncate(fileno(file.get()), sizeof(dst)), 0);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(metadata->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.type = SegmentType::File;
+                        FileBufferDesc buffer{};
+                        buffer.path = "/proc/self/fd/" +
+                                      std::to_string(fileno(file.get()));
+                        buffer.length = sizeof(dst);
+                        FileSegmentDesc desc{};
+                        desc.buffers.push_back(buffer);
+                        segment.detail = std::move(desc);
+                        return Status::OK();
+                    })
+                    .ok());
+    std::string name = "bufio";
+    BufIoTransport transport;
+    ASSERT_TRUE(transport.install(name, metadata, nullptr).ok());
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 2).ok());
+    pointers[reinterpret_cast<CUdeviceptr>(dst)] = {CU_MEMORYTYPE_DEVICE, 0, 1};
+    Request req{};
+    req.opcode = Request::READ;
+    req.source = dst;
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.length = sizeof(dst);
+    sync_result = cudaErrorUnknown;
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {req}).ok());
+    auto& task = static_cast<BufIoSubBatch*>(batch)->task_list.front();
+    auto caller = current_context;
+    bool drained = false;
+    for (auto result : {cudaErrorUnknown, cudaErrorNotReady, cudaSuccess}) {
+        query_result = result;
+        ASSERT_TRUE(transport.isSubBatchDrained(batch, drained).ok());
+        EXPECT_EQ(drained, result == cudaSuccess);
+        EXPECT_EQ(task.staging != nullptr, !drained);
+        EXPECT_EQ(query_context, reinterpret_cast<CUcontext>(0x2001));
+        EXPECT_EQ(current_context, caller);
+    }
+    TransferStatus status{};
+    ASSERT_TRUE(transport.getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    EXPECT_EQ(status.transferred_bytes, 0u);
+    fail_copy = true;
+    query_result = cudaErrorNotReady;
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {req}).ok());
+    ASSERT_TRUE(transport.isSubBatchDrained(batch, drained).ok());
+    EXPECT_TRUE(drained);
+    EXPECT_TRUE(transport.freeSubBatch(batch).ok());
+}
+#endif
 
 TEST_F(CudaPointerTest, HostControl) {
     CudaPlatform platform(nullptr);

@@ -62,6 +62,14 @@ struct DmabufExportGuard {
     ~DmabufExportGuard() { handle.close(); }
 };
 
+// A failed copy may still be using the source and destination.
+class CopyCompletion {
+   public:
+    virtual ~CopyCompletion() = default;
+    virtual bool finished() = 0;
+    void wait();
+};
+
 class Platform {
    public:
     static Platform &getLoader(std::shared_ptr<Config> conf = nullptr);
@@ -109,6 +117,11 @@ class Platform {
     virtual Status allocatePinnedHost(void **pptr, size_t size);
 
     virtual Status freePinnedHost(void *ptr, size_t size);
+
+    using PendingCopy = std::shared_ptr<CopyCompletion>;
+    // Pass an empty pending handle. It owns any copy still in flight on error.
+    Status copyWithCompletion(void *dst, void *src, size_t length,
+                              PendingCopy &pending);
 
    protected:
     static std::vector<int> topologyDeviceIndices(const Topology *topology,

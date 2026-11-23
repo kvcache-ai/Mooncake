@@ -17,9 +17,10 @@
 #include <algorithm>
 
 #include "tent/transport/hylink/hylink_transport.h"
+#include "tent/platform/rocm.h"
 
 namespace {
-enum class Failure { None, Create, Record, Query, SecondRecord, Copy };
+enum class Failure { None, Create, Record, Query, SecondRecord, Copy, Sync };
 Failure failure;
 int copies;
 int destroyed_streams;
@@ -45,6 +46,18 @@ hipError_t __wrap_hipStreamCreate(hipStream_t* stream) {
     if (forbid_new_streams) return hipErrorOutOfMemory;
     *stream = reinterpret_cast<hipStream_t>(++next_stream);
     return hipSuccess;
+}
+hipError_t __wrap_hipStreamCreateWithFlags(hipStream_t* stream, unsigned) {
+    return __wrap_hipStreamCreate(stream);
+}
+hipError_t __wrap_hipPointerGetAttributes(hipPointerAttribute_t* attr,
+                                          const void*) {
+    attr->type = hipMemoryTypeDevice;
+    attr->device = 0;
+    return hipSuccess;
+}
+hipError_t __wrap_hipStreamSynchronize(hipStream_t) {
+    return failure == Failure::Sync ? hipErrorInvalidValue : hipSuccess;
 }
 hipError_t __wrap_hipStreamDestroy(hipStream_t) {
     ++destroyed_streams;
@@ -130,6 +143,25 @@ class HylinkDrainTest : public ::testing::Test {
     HylinkSubBatch batch;
     int source{}, target{};
 };
+
+TEST_F(HylinkDrainTest, FailedFileCopyKeepsAcceptedStreamUntilCompletion) {
+    failure = Failure::Sync;
+    RocmPlatform platform(nullptr);
+    Platform::PendingCopy pending;
+    ASSERT_FALSE(
+        platform.copyWithCompletion(&target, &source, sizeof(source), pending)
+            .ok());
+    ASSERT_TRUE(pending);
+    EXPECT_FALSE(pending->finished());
+    pending_copies.clear();
+    EXPECT_TRUE(pending->finished());
+    pending.reset();
+    failure = Failure::Copy;
+    ASSERT_FALSE(
+        platform.copyWithCompletion(&target, &source, sizeof(source), pending)
+            .ok());
+    EXPECT_FALSE(pending);
+}
 
 class HylinkEventFailureTest : public HylinkDrainTest,
                                public ::testing::WithParamInterface<Failure> {};
