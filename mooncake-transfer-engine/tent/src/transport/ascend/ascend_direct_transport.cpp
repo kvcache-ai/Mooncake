@@ -1071,6 +1071,7 @@ void AscendDirectTransport::failEntireRoute(HixlTask& task,
 
         // Query each newer handle once. A busy sibling prevents disconnect,
         // but must not hide other requests that have already completed.
+        const auto poll_start = SteadyTimeInNano();
         std::vector<void*> candidates;
         for (const auto& [key, group] : groups_) {
             if (on_route(group) && group.failure == PENDING)
@@ -1086,8 +1087,7 @@ void AscendDirectTransport::failEntireRoute(HixlTask& task,
             group.polling = true;
             void* handle = LoadTaskHandle(*group.leader);
             const bool expired =
-                SteadyTimeInNano() - group.leader->start_time_ns >
-                transfer_timeout_ns_;
+                poll_start - group.leader->start_time_ns > transfer_timeout_ns_;
             lock.unlock();
             HixlXferState native = HixlXferState::Waiting;
             auto query =

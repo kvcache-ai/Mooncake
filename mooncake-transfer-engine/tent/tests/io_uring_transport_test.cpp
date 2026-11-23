@@ -767,6 +767,35 @@ INSTANTIATE_TEST_SUITE_P(
                                          CopyFailure::Pending,
                                          CopyFailure::QueryError)));
 
+TEST(IOUringStagingPoolTest, ReclaimsAllCompletedCopiesInOneSweep) {
+    struct Fence : CopyCompletion {
+        bool done = false;
+        int queries = 0;
+        Status query(bool& finished) override {
+            ++queries;
+            finished = done;
+            return Status::OK();
+        }
+    };
+    auto pool = std::make_shared<IOUringStagingPool>();
+    ASSERT_TRUE(pool->init(kPageSize, 3).ok());
+    auto pending = std::make_shared<Fence>();
+    auto complete = std::make_shared<Fence>();
+    complete->done = true;
+    for (const auto& fence : {pending, complete, complete}) {
+        auto* slot = pool->acquire(kPageSize);
+        ASSERT_NE(slot, nullptr);
+        CopyCompletion::quarantine(fence,
+                                   [pool, slot] { pool->release(slot); });
+    }
+    CopyCompletion::reclaimQuarantined();
+    EXPECT_EQ(pool->freeSlots(), 2u);
+    EXPECT_EQ(pending->queries, 1);
+    pending->done = true;
+    CopyCompletion::reclaimQuarantined();
+    EXPECT_EQ(pool->freeSlots(), 3u);
+}
+
 TEST(IOUringStagingPoolTest, LendsPageAlignedSlotsWithoutBlocking) {
     IOUringStagingPool pool;
     EXPECT_EQ(pool.acquire(1), nullptr);

@@ -20,6 +20,7 @@
 #include "tent/runtime/segment_registry.h"
 #include "tent/runtime/segment_tracker.h"
 #include "tent/transport/bufio/bufio_transport.h"
+#include "tent/transport/tcp/tcp_transport.h"
 #include <cstdio>
 #include <unistd.h>
 #endif
@@ -189,6 +190,52 @@ int __wrap_numa_move_pages(int, unsigned long, void**, const int*, int*, int) {
 }
 
 #ifdef TENT_TEST_SEGMENT_TRACKER
+TEST_F(CudaPointerTest, TcpReadRetainsReplyUntilDeviceCopyDrains) {
+    TcpTransport transport;
+    Transport::SubBatchRef batch = nullptr;
+    char dst[4]{};
+    pointers[reinterpret_cast<CUdeviceptr>(dst)] = {CU_MEMORYTYPE_DEVICE, 0, 1};
+    sync_result = cudaErrorUnknown;
+    for (const std::string wire :
+         {std::string("data"), std::string("\0data", 5)}) {
+        ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+        auto& task = static_cast<TcpSubBatch*>(batch)->task_list.emplace_back();
+        task.request.source = dst;
+        task.request.length = sizeof(dst);
+        auto reply = wire;
+        ASSERT_FALSE(task.copyReadReply(reply).ok());
+        task.status_word = FAILED;
+        std::weak_ptr<TcpTask::DeviceRead> owner = task.device_read;
+        EXPECT_EQ(std::string(dst, sizeof(dst)), "data");
+        for (auto result : {cudaErrorUnknown, cudaErrorNotReady, cudaSuccess}) {
+            query_result = result;
+            bool drained = true;
+            EXPECT_EQ(transport.isSubBatchDrained(batch, drained).ok(),
+                      result != cudaErrorUnknown);
+            EXPECT_EQ(drained, result == cudaSuccess);
+            EXPECT_EQ(owner.expired(), drained);
+        }
+        TransferStatus status{};
+        ASSERT_TRUE(transport.getTransferStatus(batch, 0, status).ok());
+        EXPECT_EQ(status.s, FAILED);
+        EXPECT_EQ(status.transferred_bytes, 0u);
+        ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    }
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    auto& task = static_cast<TcpSubBatch*>(batch)->task_list.emplace_back();
+    task.request.source = dst;
+    task.request.length = sizeof(dst);
+    std::string reply = "data";
+    ASSERT_FALSE(task.copyReadReply(reply).ok());
+    std::weak_ptr<TcpTask::DeviceRead> owner = task.device_read;
+    query_result = cudaErrorUnknown;
+    EXPECT_FALSE(transport.freeSubBatch(batch).ok());
+    EXPECT_FALSE(owner.expired());
+    query_result = cudaSuccess;
+    CopyCompletion::reclaimQuarantined();
+    EXPECT_TRUE(owner.expired());
+}
+
 class BufferedFileCopyTest
     : public CudaPointerTest,
       public testing::WithParamInterface<Request::OpCode> {};

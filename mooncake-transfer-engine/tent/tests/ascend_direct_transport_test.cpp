@@ -1294,11 +1294,14 @@ TEST_F(AscendDirectTransportTest, DisconnectRetrySparesNewerRequest) {
 }
 
 TEST_F(AscendDirectTransportTest, DisconnectRetryPollsNewerGroup) {
-    ASSERT_TRUE(InstallAgentTwoEngines().ok());
+    constexpr int timeout_ms = 10000;
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/ascend_direct/transfer_timeout_ms", timeout_ms);
+    ASSERT_TRUE(InstallAgentTwoEngines(conf).ok());
     PublishEngineBuffers();
-    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 3).ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 4).ok());
     auto* sub = static_cast<HixlSubBatch*>(batch_);
-    char src[48]{};
+    char src[64]{};
     auto submit = [&](char* ptr) {
         return transport_
                    ->submitTransferTasks(batch_, {MakeRemoteWrite(ptr, 16)})
@@ -1316,16 +1319,25 @@ TEST_F(AscendDirectTransportTest, DisconnectRetryPollsNewerGroup) {
 
     ASSERT_TRUE(submit(src + 16));
     ASSERT_TRUE(submit(src + 32));
-    // One newer handle has completed without being polled. Another is being
-    // queried by its owner; its terminal result can only be consumed once.
+    ASSERT_TRUE(submit(src + 48));
+    // Two siblings have completed. The third has a native poll in progress.
     std::promise<void> entered, resume;
     auto resume_query = resume.get_future();
     std::atomic<int> queries{0}, completed_queries{0};
     state_->on_query = [&](void* handle) {
-        if (handle == sub->task_list[1].req_handle) {
-            ++completed_queries;
-            // The query began before the deadline and observed completion.
-            sub->task_list[1].start_time_ns = 1;
+        if (handle == sub->task_list[1].req_handle ||
+            handle == sub->task_list[3].req_handle) {
+            if (++completed_queries == 1) {
+                // Place both deadlines inside this query, after the scan began.
+                const auto start =
+                    std::chrono::steady_clock::now().time_since_epoch() -
+                    std::chrono::milliseconds(timeout_ms);
+                sub->task_list[1].start_time_ns =
+                    sub->task_list[3].start_time_ns =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            start)
+                            .count();
+            }
         }
         if (handle == sub->task_list[2].req_handle && ++queries == 1) {
             entered.set_value();
@@ -1344,7 +1356,7 @@ TEST_F(AscendDirectTransportTest, DisconnectRetryPollsNewerGroup) {
     EXPECT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
     EXPECT_EQ(status.s, PENDING);
     EXPECT_EQ(state_->disconnect_calls, 1);
-    EXPECT_EQ(completed_queries.load(), 1);
+    EXPECT_EQ(completed_queries.load(), 2);
     resume.set_value();
     EXPECT_EQ(owner.get(), COMPLETED);
     EXPECT_EQ(queries.load(), 1);
@@ -1353,6 +1365,8 @@ TEST_F(AscendDirectTransportTest, DisconnectRetryPollsNewerGroup) {
     EXPECT_EQ(status.s, TIMEOUT);
     EXPECT_EQ(state_->disconnect_calls, 2);
     ASSERT_TRUE(transport_->getTransferStatus(batch_, 1, status).ok());
+    EXPECT_EQ(status.s, COMPLETED);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 3, status).ok());
     EXPECT_EQ(status.s, COMPLETED);
 }
 

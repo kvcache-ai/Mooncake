@@ -102,26 +102,29 @@ void CopyCompletion::quarantine(std::shared_ptr<CopyCompletion> copy,
 void CopyCompletion::reclaimQuarantined() {
     auto& queue = copyQuarantine();
     if (!queue.pending.load(std::memory_order_relaxed)) return;
-    // Retry one fence per cleanup, without holding the queue lock in the
-    // driver.
-    decltype(queue.copies) entry;
+    // Query each entry present at the start once, outside the queue lock.
+    decltype(queue.copies) copies;
     {
         std::lock_guard<std::mutex> lock(queue.mutex);
-        if (queue.copies.empty()) return;
-        entry.splice(entry.end(), queue.copies, queue.copies.begin());
-        queue.pending = !queue.copies.empty();
+        copies.swap(queue.copies);
+        queue.pending = false;
     }
-    bool finished = false;
-    try {
-        if (entry.front().first->query(finished).ok() && finished) {
-            entry.front().second();
-            return;
+    for (auto it = copies.begin(); it != copies.end();) {
+        bool finished = false;
+        try {
+            if (it->first->query(finished).ok() && finished) {
+                it->second();
+                it = copies.erase(it);
+                continue;
+            }
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "Could not reclaim staging: " << error.what();
         }
-    } catch (const std::exception& error) {
-        LOG(ERROR) << "Could not reclaim file staging: " << error.what();
+        ++it;
     }
+    if (copies.empty()) return;
     std::lock_guard<std::mutex> lock(queue.mutex);
-    queue.copies.splice(queue.copies.end(), entry);
+    queue.copies.splice(queue.copies.end(), copies);
     queue.pending = true;
 }
 
