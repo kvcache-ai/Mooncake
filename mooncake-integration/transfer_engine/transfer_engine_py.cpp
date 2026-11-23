@@ -1739,10 +1739,10 @@ int TransferEnginePy::sendProbe(const std::string& peer_server_name) {
 }
 
 int TransferEnginePy::refreshSession(const std::string& peer_server_name) {
+    pybind11::gil_scoped_release release;
     if (!engine_) return -1;
     auto metadata = engine_->getMetadata();
     if (!metadata) return ERR_NOT_IMPLEMENTED;
-    pybind11::gil_scoped_release release;
     return metadata->refreshCachedSegment(peer_server_name);
 }
 
