@@ -292,6 +292,29 @@ class ConcurrentShardedMap {
         return it->second;
     }
 
+    // Lock-free negative filter fast path before locking the shard. If the key
+    // exists, invokes `fn(const Value&)` under the shard lock and returns true.
+    template <typename Fn>
+    bool VisitExisting(const TenantId& tenant_id, std::string_view key,
+                       Fn&& fn) const {
+        if (Empty()) {
+            return false;
+        }
+        const uint64_t h = ShardPresenceFilter::MixedHash(tenant_id, key);
+        const Shard& shard = ShardForHash(h);
+        if (shard.size.load(std::memory_order_relaxed) == 0 ||
+            !shard.filter.MayContain(h)) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto it = shard.entries.find(ScopedObjectKeyView{&tenant_id, key});
+        if (it == shard.entries.end()) {
+            return false;
+        }
+        fn(it->second);
+        return true;
+    }
+
     std::optional<Value> Erase(const TenantId& tenant_id,
                                std::string_view key) {
         if (Empty()) {

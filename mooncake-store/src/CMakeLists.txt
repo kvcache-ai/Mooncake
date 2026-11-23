@@ -44,6 +44,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_service.cpp
     offload_manager.cpp
     promotion_candidate_tracker.cpp
+    promotion_manager.cpp
     master_store_backend.cpp
     weight_store_manager.cpp
     master_metric_manager.cpp

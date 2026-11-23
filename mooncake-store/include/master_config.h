@@ -8,6 +8,7 @@
 
 #include "config/metrics_bootstrap_config.h"
 #include "config/offload_config.h"
+#include "config/promotion_config.h"
 #include "config_helper.h"
 #include "types.h"
 
@@ -548,6 +549,13 @@ class MasterServiceSupervisorConfig {
             .offload_force_evict = offload_force_evict,
             .offloading_queue_limit = offloading_queue_limit,
             .offload_cap_ratio = offload_cap_ratio,
+        }
+            .Validate();
+        PromotionConfig{
+            .promotion_on_hit = promotion_on_hit,
+            .promotion_admission_threshold = promotion_admission_threshold,
+            .promotion_queue_limit = promotion_queue_limit,
+            .promotion_max_per_heartbeat = promotion_max_per_heartbeat,
         }
             .Validate();
     }
@@ -1300,10 +1308,7 @@ class MasterServiceConfig {
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha = false;
     OffloadConfig offload_config;
-    bool promotion_on_hit = false;
-    uint32_t promotion_admission_threshold = 2;
-    uint32_t promotion_queue_limit = 50000;
-    uint32_t promotion_max_per_heartbeat = 1;
+    PromotionConfig promotion_config;
     std::string dynamic_replication_mode = "off";
     uint32_t dynamic_replication_heat_window_seconds = 10;
     double dynamic_replication_admission_qps_threshold = 0.8;
@@ -1395,10 +1400,12 @@ class MasterServiceConfig {
         offload_config.offload_force_evict = config.offload_force_evict;
         offload_config.offloading_queue_limit = config.offloading_queue_limit;
         offload_config.offload_cap_ratio = config.offload_cap_ratio;
-        promotion_on_hit = config.promotion_on_hit;
-        promotion_admission_threshold = config.promotion_admission_threshold;
-        promotion_queue_limit = config.promotion_queue_limit;
-        promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        promotion_config.promotion_on_hit = config.promotion_on_hit;
+        promotion_config.promotion_admission_threshold =
+            config.promotion_admission_threshold;
+        promotion_config.promotion_queue_limit = config.promotion_queue_limit;
+        promotion_config.promotion_max_per_heartbeat =
+            config.promotion_max_per_heartbeat;
         dynamic_replication_mode = config.dynamic_replication_mode;
         dynamic_replication_heat_window_seconds =
             config.dynamic_replication_heat_window_seconds;
@@ -1466,7 +1473,10 @@ class MasterServiceConfig {
         enable_cxl = config.enable_cxl;
     }
 
-    void Validate() const { offload_config.Validate(); }
+    void Validate() const {
+        offload_config.Validate();
+        promotion_config.Validate();
+    }
 
     // Static factory method to create a builder
     static MasterServiceConfigBuilder builder();

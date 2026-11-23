@@ -848,15 +848,14 @@ class MasterServiceHATest : public ::testing::Test {
     static void SeedPromotionTaskForTesting(
         MasterService* service, const TenantId& tenant, const std::string& key,
         const UUID& holder_id, ReplicaID alloc_id, uint64_t object_size) {
-        auto hold = MasterServiceTestPeer::WriteObject(
-            *service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
-        ASSERT_TRUE(hold.has_value());
-        hold->state().promotion_task = MasterServiceTestPeer::PromotionTask{
-            .source_id = 0,
-            .alloc_id = alloc_id,
-            .object_size = object_size,
-            .start_time = std::chrono::system_clock::now(),
-            .holder_id = holder_id};
+        MasterServiceTestPeer::SeedPromotionTask(
+            *service, tenant, key,
+            MasterServiceTestPeer::PromotionTask{
+                .source_id = 0,
+                .alloc_id = alloc_id,
+                .object_size = object_size,
+                .start_time = std::chrono::system_clock::now(),
+                .holder_id = holder_id});
     }
 
     static bool NeedMemoryEvictionForTesting(const MasterService& service) {

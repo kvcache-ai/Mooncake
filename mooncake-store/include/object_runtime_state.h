@@ -1,8 +1,8 @@
 #pragma once
 
-// Per-key runtime state records: the in-flight replication, offloading and
-// promotion bookkeeping that belongs to one object key. Moved out of
-// MasterService unchanged; each record is small state, not a container.
+// Per-key runtime state records: the in-flight replication and promotion
+// bookkeeping that belongs to one object key. Each record is small state,
+// not a container.
 
 #include <chrono>
 #include <cstdint>
@@ -42,11 +42,6 @@ struct ReplicationTask {
     ReplicaPin source_pin{};
 };
 
-// Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
-// LOCAL_DISK replica is refcnt-pinned for the duration of the task
-// so it cannot be evicted.
-//
-// alloc_id pins down which staged PROCESSING MEMORY replica
 enum class PromotionQueueResult {
     kQueued,
     kDisabled,
@@ -83,23 +78,25 @@ struct PromotionCandidate {
     uint32_t execution_failures{0};
 };
 
-// NotifyPromotionSuccess should commit, so a concurrent Put on the
-// same key cannot be confused with ours. 0 until
-// PromotionAllocStart records the new replica.
+// Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source LOCAL_DISK replica
+// is refcnt-pinned for the duration of the task so it cannot be evicted.
 //
-// start_time is the reaper deadline anchor. Set at task admission
-// and reset at PromotionAllocStart so each phase (queue-wait and
-// active-transfer) gets its own full put_start_release_timeout_sec_
-// window. Without the reset a backlogged task could enter active
-// transfer with little TTL left, and the reaper could erase the
-// staged replica by its allocation id mid-RDMA-write.
+// alloc_id pins down which staged PROCESSING MEMORY replica
+// NotifyPromotionSuccess should commit, so a concurrent Put on the same key
+// cannot be confused with ours. 0 until PromotionAllocStart records the new
+// replica.
 //
-// holder_id is the client owning the source LOCAL_DISK segment and
-// the only one authorized to commit (NotifyPromotionSuccess) or
-// abort (NotifyPromotionFailure) the task. Without it, any client
-// knowing the key could flip the staged PROCESSING replica to
-// COMPLETE before the holder's RDMA write landed, exposing torn
-// data to readers.
+// start_time is the reaper deadline anchor. Set at task admission and reset at
+// PromotionAllocStart so each phase (queue-wait and active-transfer) gets its
+// own full put_start_release_timeout_sec_ window. Without the reset a
+// backlogged task could enter active transfer with little TTL left, and the
+// reaper could erase the staged replica by its allocation id mid-RDMA-write.
+//
+// holder_id is the client owning the source LOCAL_DISK segment and the only
+// one authorized to commit (NotifyPromotionSuccess) or abort
+// (NotifyPromotionFailure) the task. Without it, any client knowing the key
+// could flip the staged PROCESSING replica to COMPLETE before the holder's
+// RDMA write landed, exposing torn data to readers.
 struct PromotionTask {
     ReplicaID source_id;    // the LOCAL_DISK replica being promoted
     ReplicaID alloc_id{0};  // the new MEMORY replica staged by AllocStart
@@ -116,6 +113,9 @@ struct PromotionTask {
     // SSD prefetch admission. NotifyPromotionSuccess grants a read lease
     // so the promoted replica survives until the follow-up get.
     bool from_prefetch{false};
+    // True while PromotionAllocStart has reserved this task for DRAM
+    // allocation and before CommitAlloc/AbortAlloc completes.
+    bool allocating{false};
     // RAII pin on the source LOCAL_DISK replica; auto-unpins when erased.
     ReplicaPin source_pin{};
 };
