@@ -185,16 +185,30 @@ tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
 
 std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
+    return BatchExistKeyInternal(keys, tenant_id, /*parallel=*/false);
+}
+
+std::vector<tl::expected<bool, ErrorCode>>
+WrappedMasterService::BatchExistKeyParallel(
+    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    return BatchExistKeyInternal(keys, tenant_id, /*parallel=*/true);
+}
+
+std::vector<tl::expected<bool, ErrorCode>>
+WrappedMasterService::BatchExistKeyInternal(
+    const std::vector<std::string>& keys, const std::string& tenant_id,
+    bool parallel) {
     ScopedVLogTimer timer(1, "BatchExistKey");
     const size_t total_keys = keys.size();
-    timer.LogRequest("keys_count=", total_keys);
+    timer.LogRequest("keys_count=", total_keys, ", parallel=", parallel);
     MasterMetricManager::instance().inc_batch_exist_key_requests(total_keys);
 
     auto result = WithRequestTenantBatch(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
         keys.size(), [&](const TenantId& resolved_tenant_id) {
-            return master_service_.BatchExistKey(keys, resolved_tenant_id);
+            return master_service_.BatchExistKey(keys, resolved_tenant_id,
+                                                 parallel);
         });
 
     size_t failure_count = 0;
@@ -2156,6 +2170,7 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::QuerySegmentStatusById,
         &WrappedMasterService::GetStorageConfig,
         &WrappedMasterService::BatchExistKey,
+        &WrappedMasterService::BatchExistKeyParallel,
         &WrappedMasterService::BatchProbeKey,
         &WrappedMasterService::MountLocalDiskSegment,
         &WrappedMasterService::UnmountLocalDiskSegment,

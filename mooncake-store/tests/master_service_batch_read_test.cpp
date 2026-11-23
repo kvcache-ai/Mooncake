@@ -194,4 +194,41 @@ TEST_F(BatchReadTest, ListsAndCountsThroughTheRouteCursors) {
     EXPECT_EQ(service.GetKeyCount(), 2u * kKeysPerTenant);
 }
 
+TEST_F(BatchReadTest, ParallelBatchExistMatchesSerial) {
+    MasterService service(MultiTenantConfig());
+    const auto context = PrepareSimpleSegment(service);
+    Populate(service, context.client_id);
+
+    // A batch large enough to cross the parallel threshold, with heavy key
+    // duplication plus pending, missing and cross-tenant keys mixed in.
+    std::vector<std::string> keys;
+    constexpr int kLargeCount = 3000;
+    keys.reserve(kLargeCount + 5);
+    for (int i = 0; i < kLargeCount; ++i) {
+        keys.push_back("a" + std::to_string(i % kKeysPerTenant));
+    }
+    keys.push_back("a7");
+    keys.push_back("a-pending");
+    keys.push_back("absent");
+    keys.push_back("b3");
+    keys.push_back("a7");
+
+    const auto serial =
+        service.BatchExistKey(keys, kTenantA, /*parallel=*/false);
+    const auto parallel =
+        service.BatchExistKey(keys, kTenantA, /*parallel=*/true);
+
+    ASSERT_EQ(serial.size(), keys.size());
+    ASSERT_EQ(parallel.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        SCOPED_TRACE(keys[i]);
+        ASSERT_EQ(serial[i].has_value(), parallel[i].has_value());
+        if (serial[i].has_value()) {
+            EXPECT_EQ(*serial[i], *parallel[i]);
+        } else {
+            EXPECT_EQ(serial[i].error(), parallel[i].error());
+        }
+    }
+}
+
 }  // namespace mooncake::test

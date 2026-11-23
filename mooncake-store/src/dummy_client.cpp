@@ -1319,9 +1319,14 @@ int DummyClient::isExist(const std::string& key, const ExistOptions& options) {
 
 std::vector<int> DummyClient::batchIsExist(
     const std::vector<std::string>& keys) {
+    return batchIsExist(keys, false);
+}
+
+std::vector<int> DummyClient::batchIsExist(const std::vector<std::string>& keys,
+                                           bool parallel) {
     auto internal_results =
-        invoke_batch_rpc<&RealClient::batchIsExist_internal, bool>(keys.size(),
-                                                                   keys);
+        invoke_batch_rpc<&RealClient::batchIsExist_internal, bool>(
+            keys.size(), keys, parallel);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -1373,7 +1378,7 @@ std::vector<int> DummyClient::batchIsExist(const std::vector<std::string>& keys,
         VLOG(1) << "SSD prefetch is not supported via DummyClient; "
                 << "prefetch_to_memory ignored";
     }
-    return batchIsExist(keys);
+    return batchIsExist(keys, options.chunked_parallel);
 }
 
 int64_t DummyClient::getSize(const std::string& key) {

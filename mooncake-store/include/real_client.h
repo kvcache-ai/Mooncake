@@ -889,7 +889,7 @@ class RealClient : public PyClient {
     tl::expected<bool, ErrorCode> isExist_internal(const std::string &key);
 
     std::vector<tl::expected<bool, ErrorCode>> batchIsExist_internal(
-        const std::vector<std::string> &keys);
+        const std::vector<std::string> &keys, bool parallel = false);
 
     tl::expected<bool, ErrorCode> probeKey_internal(const std::string &key);
 

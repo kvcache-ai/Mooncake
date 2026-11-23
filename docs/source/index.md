@@ -219,6 +219,7 @@ design/store/mooncake-store
 design/store/high-availability
 design/store/store-rs/index
 design/store/ssd-prefetch
+design/store/batch-is-exist-parallel
 design/mooncake-backend-pg
 design/mooncake-ep
 design/conductor/index
