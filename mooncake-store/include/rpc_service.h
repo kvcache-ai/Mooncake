@@ -25,6 +25,10 @@ class WrappedMasterService {
     store::GatherReadDirectory gather_directory;
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
+    ErrorCode StartBatchOpLogPruningWorker(uint64_t chunk_batch_count,
+                                           uint64_t max_batches_per_second);
+    void RequestStopBatchOpLogPruningWorker();
+    void StopBatchOpLogPruningWorker();
     void StopBatchOpLogWriter();
     void StopHttpMetadataCleanup();
     // Restore lifecycle hooks (RFC #4700, slice 1). Serving means "committed
@@ -292,8 +296,13 @@ class WrappedMasterService {
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
 
+    tl::expected<UUID, ErrorCode> CreateTimedDrainJob(
+        const CreateDrainJobRequest& request, uint64_t timeout_ms);
+
     tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
 
+    tl::expected<ListDrainJobsResponse, ErrorCode> ListDrainJobs(
+        const DrainJobListRequest& request);
     tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
 
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
@@ -365,7 +374,14 @@ class WrappedMasterService {
                                                  const std::string& source,
                                                  const std::string& target);
 
+    tl::expected<void, ErrorCode> CancelTask(const UUID& task_id,
+                                             const std::string& tenant_id);
+    tl::expected<bool, ErrorCode> IsTaskCancellationRequested(
+        const UUID& client_id, const UUID& task_id);
     tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    tl::expected<ListTasksResponse, ErrorCode> ListTasks(
+        const TaskListRequest& request);
 
     tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
         const UUID& client_id, size_t batch_size);

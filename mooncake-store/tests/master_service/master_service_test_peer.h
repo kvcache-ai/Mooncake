@@ -351,6 +351,20 @@ class MasterServiceTestPeer {
         return service.task_manager_;
     }
 
+    static std::unique_lock<std::mutex> LockDrainJobForTesting(
+        MasterService& service, const UUID& job_id) {
+        std::shared_ptr<MasterService::DrainJob> job;
+        {
+            std::lock_guard<std::mutex> lock(service.job_mutex_);
+            auto it = service.drain_jobs_.find(job_id);
+            if (it == service.drain_jobs_.end()) {
+                return {};
+            }
+            job = it->second;
+        }
+        return std::unique_lock<std::mutex>(job->mutex);
+    }
+
     static auto& TenantQuotaPolicyMutex(MasterService& service) {
         return service.tenant_quota_policy_->manager_.policy_mutex_;
     }
@@ -519,16 +533,6 @@ class MasterServiceTestPeer {
 
     bool IsReplicaReadable(const Replica& replica) const {
         return service_.IsReplicaReadable(replica);
-    }
-
-    static std::vector<std::string> KvMediaForMetadata(
-        const ObjectMetadata& metadata) {
-        return MasterService::KvMediaForMetadata(metadata);
-    }
-
-    static std::vector<std::string> KvMediaForRemoval(
-        const ObjectMetadata& metadata) {
-        return MasterService::KvMediaForRemoval(metadata);
     }
 
     void LoadTenantQuotaPoliciesFromStoreOrThrow() {

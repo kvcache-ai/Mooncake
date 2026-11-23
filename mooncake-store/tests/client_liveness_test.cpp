@@ -30,7 +30,7 @@ TEST(ClientLivenessRecordTest, ClientIdSurvivesLivenessTransitions) {
 
 TEST(ClientLivenessRecordTest, SuspicionWindowStartsAtActualTransition) {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    ClientLivenessRecord record(UUID{}, initial);
+    ClientLivenessRecord record(UUID{1, 2}, initial);
 
     EXPECT_FALSE(record.IsExpiredAt(initial + 9s, 10s, 20s));
     EXPECT_TRUE(record.IsExpiredAt(initial + 10s, 10s, 20s));
@@ -48,7 +48,7 @@ TEST(ClientLivenessRecordTest, SuspicionWindowStartsAtActualTransition) {
 
 TEST(ClientLivenessRecordTest, ObservationRecoversSuspectedButNotOffline) {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    ClientLivenessRecord record(UUID{}, initial);
+    ClientLivenessRecord record(UUID{1, 2}, initial);
 
     ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
               ClientLivenessTransition::BECAME_SUSPECTED);
@@ -70,6 +70,8 @@ TEST(ClientLivenessRecordTest, EveryStateChangeIsReportedToItsCaller) {
     ClientLivenessRecord record(UUID{1, 2}, initial);
     using Observation = ClientLivenessObservation;
     using Transition = ClientLivenessTransition;
+    // The return value is the only notification there is, so it must tell a
+    // state change from a call that changed nothing.
     EXPECT_EQ(record.Observe(initial + 1s), Observation::REFRESHED_ACTIVE);
     EXPECT_EQ(record.Evaluate(initial + 10s, 10s, 20s), Transition::NONE);
     EXPECT_EQ(record.Evaluate(initial + 11s, 10s, 20s),

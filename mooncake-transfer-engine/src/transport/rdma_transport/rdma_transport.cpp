@@ -85,6 +85,22 @@ static std::string resolveBufferLocation(
     return location;
 }
 
+int RdmaTransport::selectDestinationNic(SegmentDesc *peer, uint64_t offset,
+                                        size_t length, std::string_view &nic,
+                                        int &buffer_id, int &device_id,
+                                        int hint_buffer_id,
+                                        int hint_device_id) {
+    nic = {};
+    const int rc = selectDevice(peer, offset, length, buffer_id, device_id, 0,
+                                hint_buffer_id, hint_device_id);
+    if (rc) return rc;
+    const auto &hcas = peer->topology.getHcaList();
+    if (peer->buffers[buffer_id].name.starts_with(GPU_PREFIX) &&
+        static_cast<size_t>(device_id) < hcas.size())
+        nic = hcas[device_id];
+    return 0;
+}
+
 // The last-hit shortcut and the index lookup both assume the MR covering an
 // address is unique; only then do they answer what a first-match scan would.
 // Descriptors with overlapping MRs, or whose index is out of sync with
@@ -1917,7 +1933,10 @@ Status RdmaTransport::submitTransferTask(
     int last_local_device_id = -1;
     int last_local_device_buffer_id = -1;
     int last_remote_buffer_id = -1;
+    int last_remote_device_id = -1;
+    int last_remote_device_buffer_id = -1;
     SegmentID last_remote_target_id = static_cast<SegmentID>(-1);
+    const bool prefer_dest_nic = globalConfig().rdma_write_prefer_dest_nic;
     while (task_index < task_list.size()) {
         assert(task_list[task_index]);
         auto &task = *task_list[task_index];
@@ -1939,22 +1958,55 @@ Status RdmaTransport::submitTransferTask(
         const auto &target_segment_desc = target_desc_it->second;
         if (request.target_id != last_remote_target_id) {
             last_remote_buffer_id = -1;
+            last_remote_device_id = -1;
+            last_remote_device_buffer_id = -1;
             last_remote_target_id = request.target_id;
         }
+        // MC_RDMA_WRITE_PREFER_DEST_NIC: a WRITE into the peer's GPU memory
+        // starts from the HCA the peer's topology picks for that GPU.
+        const bool write_dest_nic =
+            prefer_dest_nic && request.opcode == TransferRequest::WRITE;
+        auto destination_nic = [&](uint64_t offset, size_t length,
+                                   std::string_view &nic) {
+            int buffer_id = -1, device_id = -1;
+            const int hint_device_id =
+                last_remote_device_buffer_id == last_remote_buffer_id
+                    ? last_remote_device_id
+                    : -1;
+            const int rc = selectDestinationNic(
+                target_segment_desc.get(), offset, length, nic, buffer_id,
+                device_id, last_remote_buffer_id, hint_device_id);
+            if (rc == 0) {
+                last_remote_buffer_id = buffer_id;
+                last_remote_device_id = device_id;
+                last_remote_device_buffer_id = buffer_id;
+            }
+            return rc;
+        };
 
         // Select once per request so all of its slices normally use the same
         // local RNIC. The advisory hint affects initial submission only;
         // submit-level retries keep the existing topology policy.
         auto request_buffer_id = -1, request_device_id = -1;
-        const std::string_view request_hint =
-            request.advise_retry_cnt == 0 ? nic_hint_name(request.nic_hint)
-                                          : std::string_view{};
+        std::string_view request_hint;
+        bool select_per_slice = false;
+        if (request.advise_retry_cnt == 0) {
+            request_hint = nic_hint_name(request.nic_hint);
+            // A destination range that no single remote MR covers may span
+            // two GPUs; its slices end at remote MR boundaries, so each one
+            // selects with its own destination.
+            if (request_hint.empty() && write_dest_nic)
+                select_per_slice =
+                    destination_nic(request.target_offset, request.length,
+                                    request_hint) != 0;
+        }
         const int local_hint_device_id =
             request_hint.empty() &&
                     last_local_device_buffer_id == last_local_buffer_id
                 ? last_local_device_id
                 : -1;
-        if (local_device_cache.select(
+        if (select_per_slice ||
+            local_device_cache.select(
                 local_segment_desc, (uint64_t)request.source, request.length,
                 request_buffer_id, request_device_id, [&] {
                     return selectDevice(
@@ -1967,8 +2019,12 @@ Status RdmaTransport::submitTransferTask(
             request_device_id = -1;
         } else {
             last_local_buffer_id = request_buffer_id;
-            last_local_device_id = request_device_id;
-            last_local_device_buffer_id = request_buffer_id;
+            // A hinted pick follows the hint, not the source buffer, so
+            // unhinted requests must not reuse it.
+            if (request_hint.empty()) {
+                last_local_device_id = request_device_id;
+                last_local_device_buffer_id = request_buffer_id;
+            }
         }
 
         SliceLengthCalculator slice_calc{request,
@@ -2020,9 +2076,13 @@ Status RdmaTransport::submitTransferTask(
                 // registered-memory boundaries even though each slice is
                 // valid. Honor the hint for the initial per-slice attempt too,
                 // then drop it so retries can fail over to another RNIC.
-                const std::string_view slice_hint =
-                    retry_cnt == 0 ? nic_hint_name(request.nic_hint)
-                                   : std::string_view{};
+                std::string_view slice_hint;
+                if (retry_cnt == 0) {
+                    slice_hint = nic_hint_name(request.nic_hint);
+                    if (slice_hint.empty() && write_dest_nic)
+                        destination_nic(slice->rdma.dest_addr, slice->length,
+                                        slice_hint);
+                }
                 const int slice_hint_device_id =
                     slice_hint.empty() &&
                             last_local_device_buffer_id == last_local_buffer_id
@@ -2048,8 +2108,10 @@ Status RdmaTransport::submitTransferTask(
                        context_list_.size());
                 found_device = true;
                 last_local_buffer_id = buffer_id;
-                last_local_device_id = device_id;
-                last_local_device_buffer_id = buffer_id;
+                if (slice_hint.empty()) {
+                    last_local_device_id = device_id;
+                    last_local_device_buffer_id = buffer_id;
+                }
                 break;
             }
             if (!found_device) {
