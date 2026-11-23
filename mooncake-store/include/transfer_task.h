@@ -290,6 +290,7 @@ class TransferEngineOperationState : public OperationState {
     bool deadline_exceeded_ = false;
     bool status_query_failed_ = false;
     bool submission_failed_ = false;
+    bool small_tcp_offload_read_ = false;
     // Classic task descriptors retain request pointers through completion.
     std::vector<TransferRequest> requests_;
 };
@@ -789,7 +790,8 @@ class TransferSubmitter {
 
     std::optional<TransferFuture> submitTransfer(
         std::vector<TransferRequest>& requests,
-        TransferIntent intent = TransferIntent::kUnspecified);
+        TransferIntent intent = TransferIntent::kUnspecified,
+        bool small_tcp_offload_read = false);
 };
 
 }  // namespace mooncake

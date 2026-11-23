@@ -982,10 +982,13 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
 
 void TransferEngineOperationState::wait_for_completion() {
     const int64_t timeout_milliseconds = GetTransferTimeoutMilliseconds();
-    // Most small TCP/RDMA transfers finish before a scheduled sleep returns.
-    // Poll briefly first, then back off to bound CPU use on slow transfers.
-    const auto spin_until =
-        std::chrono::steady_clock::now() + std::chrono::microseconds(50);
+    auto poll_budget = std::chrono::microseconds(50);
+#ifndef USE_EVENT_DRIVEN_COMPLETION
+    // Small SSD pulls over TCP can complete during the first polling sleep.
+    // Give them a bounded window to observe completion before backing off.
+    if (small_tcp_offload_read_) poll_budget = std::chrono::microseconds(200);
+#endif
+    const auto spin_until = std::chrono::steady_clock::now() + poll_budget;
     auto check_deadline = [&] {
         if (getCurrentTimeInMilli() - start_ts_ >= timeout_milliseconds &&
             !deadline_exceeded_) {
@@ -1817,8 +1820,16 @@ TransferSubmitter::submit_batch_get_offload_object(
             offset += slice.size;
         }
     }
-    return use_local_memcpy ? submitMemcpyOperations(std::move(operations))
-                            : submitTransfer(requests, intent);
+    if (use_local_memcpy) {
+        return submitMemcpyOperations(std::move(operations));
+    }
+
+    constexpr size_t kSmallOffloadReadBytes = 256 * 1024;
+    const bool small_tcp_offload_read =
+        requests.size() == 1 &&
+        requests.front().length <= kSmallOffloadReadBytes &&
+        engine_.isTcpOnly();
+    return submitTransfer(requests, intent, small_tcp_offload_read);
 }
 
 void TransferSubmitter::appendMemcpyOperations(
@@ -1869,7 +1880,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests, TransferIntent intent) {
+    std::vector<TransferRequest>& requests, TransferIntent intent,
+    bool small_tcp_offload_read) {
     auto state = std::make_shared<TransferEngineOperationState>(
         engine_, INVALID_BATCH_ID, requests.size(), std::move(requests));
 #ifdef USE_TENT
@@ -1923,6 +1935,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         (void)future.get();
         return std::nullopt;
     }
+    state->small_tcp_offload_read_ = small_tcp_offload_read;
     return future;
 }
 
