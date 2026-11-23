@@ -513,21 +513,26 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> cancel_task(const UUID &task_id) override;
 
     // Hot cache acquire: returns (offset, size) within the shm region.
-    // Increments ref_count to prevent eviction.
+    // Increments ref_count to prevent eviction. Pins are tracked per
+    // client_id so dummy-client expiry can ReleaseHotKey when the
+    // BufferHandle destructor is skipped (e.g. SIGKILL).
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> acquire_hot_cache(
-        const std::string &key);
+        const std::string &key, const UUID &client_id);
 
     // Hot cache release: decrements ref_count after dummy is done reading.
-    tl::expected<void, ErrorCode> release_hot_cache(const std::string &key);
+    // No-ops if the pin was already released during client unmap/expiry.
+    tl::expected<void, ErrorCode> release_hot_cache(const std::string &key,
+                                                    const UUID &client_id);
 
     // Batch hot cache acquire: returns vector of (offset, size).
     // SIZE_MAX offset indicates cache miss for that key.
     std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
-    batch_acquire_hot_cache(const std::vector<std::string> &keys);
+    batch_acquire_hot_cache(const std::vector<std::string> &keys,
+                            const UUID &client_id);
 
     // Batch hot cache release.
     tl::expected<void, ErrorCode> batch_release_hot_cache(
-        const std::vector<std::string> &keys);
+        const std::vector<std::string> &keys, const UUID &client_id);
 
     // Allocator-backed buffer acquire: allocates + fills, keeps handle alive.
     // Returns (dummy_addr, size).
@@ -1244,6 +1249,10 @@ class RealClient : public PyClient {
         std::mutex handles_mutex;
         std::unordered_map<uint64_t, std::shared_ptr<BufferHandle>>
             active_handles;
+        // Hot-cache keys pinned by this dummy via acquire_hot_cache.
+        // Count allows nested acquires of the same key. Cleared and released
+        // on unmap so SIGKILL/TTL expiry does not strand ref_count.
+        std::unordered_map<std::string, size_t> hot_cache_pins;
     };
     mutable std::shared_mutex dummy_client_mutex_;
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
@@ -1522,6 +1531,16 @@ class RealClient : public PyClient {
     // must hold dummy_client_mutex_. Failures stay quarantined; returns OK
     // only when nothing remains quarantined.
     ErrorCode RetryQuarantinedShmsLocked();
+
+    // Move hot_cache_pins out of a ShmContext. Caller must hold
+    // dummy_client_mutex_. Expands to one ReleaseHotKey call per pin.
+    // Must not be called while holding LocalHotCache locks.
+    static std::vector<std::string> TakeHotCachePinsLocked(ShmContext &context);
+
+    // ReleaseHotKey for each key from TakeHotCachePinsLocked. Call only after
+    // releasing dummy_client_mutex_ to avoid lock-order inversion with
+    // LocalHotCache::lru_mutex_.
+    void ReleaseHotCachePins(const std::vector<std::string> &keys);
 };
 
 }  // namespace mooncake

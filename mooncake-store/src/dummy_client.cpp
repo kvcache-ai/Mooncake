@@ -1385,20 +1385,22 @@ std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
     // Try hot cache path if shm is mapped
     if (hot_cache_base_) {
         auto result = invoke_rpc<&RealClient::acquire_hot_cache,
-                                 std::tuple<uint64_t, size_t>>(key);
+                                 std::tuple<uint64_t, size_t>>(key, client_id_);
         if (result.has_value()) {
             auto [offset, size] = result.value();
             if (offset + size > hot_cache_size_) {
                 LOG(ERROR) << "Hot cache offset out of bounds: offset="
                            << offset << " size=" << size
                            << " cache_size=" << hot_cache_size_;
+                (void)invoke_rpc<&RealClient::release_hot_cache, void>(
+                    key, client_id_);
                 return nullptr;
             }
             void* local_ptr = static_cast<uint8_t*>(hot_cache_base_) + offset;
             std::string key_copy = key;
             auto release = [this, key_copy]() {
                 (void)invoke_rpc<&RealClient::release_hot_cache, void>(
-                    key_copy);
+                    key_copy, client_id_);
             };
             ObserveTransferMetric(TransferOperationKind::kRead, "get_buffer",
                                   size, elapsed_us_since(start_time), false);
@@ -1436,7 +1438,8 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
     if (hot_cache_base_) {
         auto hot_results =
             invoke_batch_rpc<&RealClient::batch_acquire_hot_cache,
-                             std::tuple<uint64_t, size_t>>(keys.size(), keys);
+                             std::tuple<uint64_t, size_t>>(keys.size(), keys,
+                                                           client_id_);
         for (size_t i = 0; i < keys.size(); ++i) {
             if (hot_results[i].has_value()) {
                 auto [offset, size] = hot_results[i].value();
@@ -1445,12 +1448,15 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
                         << "Hot cache offset out of bounds: offset=" << offset
                         << " size=" << size
                         << " cache_size=" << hot_cache_size_;
+                    (void)invoke_rpc<&RealClient::release_hot_cache, void>(
+                        keys[i], client_id_);
                     miss_indices.push_back(i);
                     continue;
                 }
                 void* ptr = static_cast<uint8_t*>(hot_cache_base_) + offset;
                 auto release = [this, key = keys[i]]() {
-                    (void)invoke_rpc<&RealClient::release_hot_cache, void>(key);
+                    (void)invoke_rpc<&RealClient::release_hot_cache, void>(
+                        key, client_id_);
                 };
                 results[i] = std::make_shared<BufferHandle>(ptr, size,
                                                             std::move(release));

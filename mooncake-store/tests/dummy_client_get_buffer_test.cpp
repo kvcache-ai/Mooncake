@@ -23,6 +23,7 @@
 #include "default_config.h"
 #include "dummy_client.h"
 #include "../src/config/client_object_checksum_config.h"
+#include "local_hot_cache.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
 
@@ -763,6 +764,56 @@ TEST_F(DummyClientGetBufferTest, Perf_BatchHotVsCold) {
 
     EXPECT_LT(hot_ms, fallback_ms)
         << "Batch hot cache path should be faster than fallback";
+}
+
+// Access DummyClient::client_id_ for the expiry regression below.
+class DummyClientHotCachePinTestPeer {
+   public:
+    static UUID client_id(const DummyClient &client) {
+        return client.client_id_;
+    }
+};
+
+// Regression for #5750: when a dummy client dies while holding a hot-cache
+// BufferHandle, daemon expiry unmaps SHM without running the destructor.
+// Pins must be released so the block becomes selectable again.
+TEST_F(DummyClientGetBufferTest, ExpiredDummyClientReleasesHotCachePin) {
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+
+    const std::string key = "dead_dummy_hot_cache_pin";
+    const std::string data(kPayloadSize, 'P');
+    PutData(key, data);
+    WarmHotCache(key);
+
+    auto buf = dummy_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr);
+    ASSERT_TRUE(dummy_client_->is_hot_cache_ptr(buf->ptr()))
+        << "expected hot-cache hit so a pin is held";
+
+    auto hot_cache = real_client_->client_->GetHotCache();
+    ASSERT_NE(hot_cache, nullptr);
+
+    // Simulate daemon TTL expiry while the BufferHandle is still alive
+    // (SIGKILL skips the destructor that would call release_hot_cache).
+    const UUID id = DummyClientHotCachePinTestPeer::client_id(*dummy_client_);
+    ASSERT_TRUE(real_client_->unmap_shm_internal(id).has_value())
+        << "unmap_shm_internal should succeed for the live dummy client";
+
+    // GetHotKey bumps ref_count by 1. If the expired client's pin was
+    // released, ref_count is exactly 1; a stranded pin would make it 2+.
+    HotMemBlock *blk = hot_cache->GetHotKey(key);
+    ASSERT_NE(blk, nullptr);
+    EXPECT_EQ(blk->ref_count.load(), 1)
+        << "expired dummy client's hot-cache pin must be released on unmap";
+    hot_cache->ReleaseHotKey(key);
+
+    // Dropping the handle after unmap must not double-decrement (release
+    // is a no-op once the client context is gone).
+    buf.reset();
+    blk = hot_cache->GetHotKey(key);
+    ASSERT_NE(blk, nullptr);
+    EXPECT_EQ(blk->ref_count.load(), 1);
+    hot_cache->ReleaseHotKey(key);
 }
 
 }  // namespace testing

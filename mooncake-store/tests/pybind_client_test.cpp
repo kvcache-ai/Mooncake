@@ -807,9 +807,10 @@ TEST_F(RealClientTest, RangedSnapshotGpuReadBypassesNewerHotCacheValue) {
     bool cache_ready = false;
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    auto hot_cache = py_client_->client_->GetHotCache();
+    ASSERT_NE(hot_cache, nullptr);
     while (std::chrono::steady_clock::now() < deadline) {
-        if (py_client_->acquire_hot_cache(key).has_value()) {
-            ASSERT_TRUE(py_client_->release_hot_cache(key).has_value());
+        if (hot_cache->HasHotKey(key)) {
             cache_ready = true;
             break;
         }
