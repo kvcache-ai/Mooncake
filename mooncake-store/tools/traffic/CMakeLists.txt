@@ -36,4 +36,6 @@ target_compile_features(traffic_load PRIVATE cxx_std_20)
 target_include_directories(
   traffic_load PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../include
                        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/traffic)
-target_link_libraries(traffic_load PRIVATE Threads::Threads traffic_session)
+target_link_libraries(traffic_load PRIVATE Threads::Threads
+                                              JsonCpp::JsonCpp
+                                              traffic_session)

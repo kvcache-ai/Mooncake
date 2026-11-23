@@ -198,7 +198,9 @@ capacity of a given concurrency.
 
 The recorded requests may include methods that modify the Master, so the tool
 requires either `--allow-route` for each route to replay or `--allow-all` for
-every route. Point it only at a disposable Master.
+every route. `--allow-route` accepts a numeric route key, a full method name,
+or a unique short name from `routes.json`. Point it only at a disposable
+Master.
 
 ```bash
 ./build/mooncake-store/tools/traffic/traffic_load \

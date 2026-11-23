@@ -12,11 +12,17 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include <json/json.h>
 
 #include "session_reader.h"
 #include "traffic_wire.h"
@@ -260,6 +266,93 @@ void PrintPercentiles(const char* name, std::vector<std::uint64_t>* values) {
         static_cast<unsigned long long>(Max(*values)));
 }
 
+bool ParseU32(const std::string& text, std::uint32_t* value) {
+    if (text.empty()) {
+        return false;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
+    if (errno != 0 || end == text.c_str() || *end != '\0' ||
+        parsed > UINT32_MAX) {
+        return false;
+    }
+    *value = static_cast<std::uint32_t>(parsed);
+    return true;
+}
+
+bool LoadRouteNames(const std::filesystem::path& session_dir,
+                    std::map<std::string, std::uint32_t>* names,
+                    std::string* error) {
+    names->clear();
+    const std::filesystem::path path = session_dir / "routes.json";
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        return true;
+    }
+    std::ifstream in(path);
+    if (!in) {
+        *error = "cannot read " + path.string();
+        return false;
+    }
+    Json::CharReaderBuilder builder;
+    Json::Value root;
+    std::string parse_error;
+    if (!Json::parseFromStream(builder, in, &root, &parse_error)) {
+        *error = "cannot parse " + path.string() + ": " + parse_error;
+        return false;
+    }
+    if (!root.isObject()) {
+        *error = path.string() + " must be a JSON object";
+        return false;
+    }
+    for (const auto& key : root.getMemberNames()) {
+        std::uint32_t route = 0;
+        if (!ParseU32(key, &route) || !root[key].isString()) {
+            *error = "invalid route entry in " + path.string();
+            return false;
+        }
+        (*names)[root[key].asString()] = route;
+    }
+    return true;
+}
+
+bool ResolveRoutes(const std::vector<std::string>& args,
+                   const std::map<std::string, std::uint32_t>& names,
+                   std::vector<std::uint32_t>* keys, std::string* error) {
+    keys->clear();
+    for (const std::string& arg : args) {
+        std::uint32_t key = 0;
+        if (ParseU32(arg, &key)) {
+            keys->push_back(key);
+            continue;
+        }
+        const auto exact = names.find(arg);
+        if (exact != names.end()) {
+            keys->push_back(exact->second);
+            continue;
+        }
+        std::vector<std::uint32_t> matches;
+        const std::string suffix = "::" + arg;
+        for (const auto& [name, route] : names) {
+            if (name.size() >= suffix.size() &&
+                name.compare(name.size() - suffix.size(), suffix.size(),
+                             suffix) == 0) {
+                matches.push_back(route);
+            }
+        }
+        if (matches.size() != 1) {
+            *error = matches.empty()
+                         ? "unknown route name: " + arg +
+                               "; run traffic_replay inspect to list names"
+                         : "ambiguous route name: " + arg;
+            return false;
+        }
+        keys->push_back(matches.front());
+    }
+    return true;
+}
+
 struct Options {
     std::string dir;
     std::string target;
@@ -271,6 +364,7 @@ struct Options {
     bool saturate = false;
     bool allow_incomplete = false;
     bool allow_all = false;
+    std::vector<std::string> route_args;
     std::vector<std::uint32_t> routes;
 };
 
@@ -280,7 +374,7 @@ void PrintUsage() {
         "                    (--rate N | --saturate)\n"
         "                    [--connections N] [--duration S] [--warmup S]\n"
         "                    [--timeout-ms N]\n"
-        "                    (--allow-route key ... | --allow-all)\n"
+        "                    (--allow-route key|name ... | --allow-all)\n"
         "                    [--allow-incomplete]\n"
         "\n"
         "Replays the recorded requests at a fixed aggregate rate. Every\n"
@@ -400,13 +494,11 @@ bool ParseOptions(int argc, char** argv, Options* options) {
             }
             options->timeout_ms = static_cast<int>(timeout);
         } else if (arg == "--allow-route") {
-            long long key = 0;
-            if (!take(&value) || !ParseInt(value, &key) || key < 0 ||
-                key > 0xffffffffLL) {
+            if (!take(&value) || value.empty()) {
                 std::fprintf(stderr, "bad --allow-route\n");
                 return false;
             }
-            options->routes.push_back(static_cast<std::uint32_t>(key));
+            options->route_args.push_back(value);
         } else if (arg == "--allow-all") {
             options->allow_all = true;
         } else if (arg == "--saturate") {
@@ -425,12 +517,12 @@ bool ParseOptions(int argc, char** argv, Options* options) {
         std::fprintf(stderr, "--dir and --target are required\n");
         return false;
     }
-    if (options->allow_all && !options->routes.empty()) {
+    if (options->allow_all && !options->route_args.empty()) {
         std::fprintf(stderr,
                      "--allow-all and --allow-route are mutually exclusive\n");
         return false;
     }
-    if (!options->allow_all && options->routes.empty()) {
+    if (!options->allow_all && options->route_args.empty()) {
         std::fprintf(stderr,
                      "--allow-route or --allow-all is required; recorded "
                      "requests may modify the target\n");
@@ -478,6 +570,15 @@ int main(int argc, char** argv) {
     if (!reader.Open(options.dir, &error)) {
         std::fprintf(stderr, "%s\n", error.c_str());
         return 1;
+    }
+    if (!options.allow_all) {
+        std::map<std::string, std::uint32_t> names;
+        if (!LoadRouteNames(reader.session_dir(), &names, &error) ||
+            !ResolveRoutes(options.route_args, names, &options.routes,
+                           &error)) {
+            std::fprintf(stderr, "%s\n", error.c_str());
+            return 2;
+        }
     }
     if (reader.redaction() == 1) {
         std::fprintf(stderr,
