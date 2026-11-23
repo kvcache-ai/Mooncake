@@ -14,7 +14,9 @@
 
 #include "tent/runtime/platform.h"
 
+#include <atomic>
 #include <chrono>
+#include <list>
 #include <cstdlib>
 #include <thread>
 #include <mutex>
@@ -65,9 +67,62 @@ Status Platform::copyWithCompletion(void* dst, void* src, size_t length,
     return copy(dst, src, length);
 }
 
-void CopyCompletion::wait() {
-    while (!finished())
+Status CopyCompletion::wait() {
+    for (;;) {
+        bool finished = false;
+        CHECK_STATUS(query(finished));
+        if (finished) return Status::OK();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+namespace {
+struct CopyQuarantine {
+    std::mutex mutex;
+    std::list<std::pair<std::shared_ptr<CopyCompletion>, std::function<void()>>>
+        copies;
+    std::atomic<bool> pending{false};
+};
+
+CopyQuarantine& copyQuarantine() {
+    // An unconfirmed DMA may outlive all transports and static destructors.
+    static auto* quarantine = new CopyQuarantine;
+    return *quarantine;
+}
+}  // namespace
+
+void CopyCompletion::quarantine(std::shared_ptr<CopyCompletion> copy,
+                                std::function<void()> release_staging) {
+    auto& queue = copyQuarantine();
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    queue.copies.emplace_back(std::move(copy), std::move(release_staging));
+    queue.pending = true;
+}
+
+void CopyCompletion::reclaimQuarantined() {
+    auto& queue = copyQuarantine();
+    if (!queue.pending.load(std::memory_order_relaxed)) return;
+    // Retry one fence per cleanup, without holding the queue lock in the
+    // driver.
+    decltype(queue.copies) entry;
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        if (queue.copies.empty()) return;
+        entry.splice(entry.end(), queue.copies, queue.copies.begin());
+        queue.pending = !queue.copies.empty();
+    }
+    bool finished = false;
+    try {
+        if (entry.front().first->query(finished).ok() && finished) {
+            entry.front().second();
+            return;
+        }
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "Could not reclaim file staging: " << error.what();
+    }
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    queue.copies.splice(queue.copies.end(), entry);
+    queue.pending = true;
 }
 
 Platform& Platform::getLoader(std::shared_ptr<Config> conf) {

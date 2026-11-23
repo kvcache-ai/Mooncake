@@ -189,10 +189,14 @@ int __wrap_numa_move_pages(int, unsigned long, void**, const int*, int*, int) {
 }
 
 #ifdef TENT_TEST_SEGMENT_TRACKER
-TEST_F(CudaPointerTest, BufferedFileReadHoldsStagingUntilGpuCopyFinishes) {
+class BufferedFileCopyTest
+    : public CudaPointerTest,
+      public testing::WithParamInterface<Request::OpCode> {};
+
+TEST_P(BufferedFileCopyTest, RetainsStagingUntilGpuCopyFinishes) {
     std::unique_ptr<FILE, decltype(&fclose)> file(std::tmpfile(), fclose);
     ASSERT_TRUE(file);
-    char dst[16]{};
+    char dst[16] = "device";
     ASSERT_EQ(ftruncate(fileno(file.get()), sizeof(dst)), 0);
     auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
     ASSERT_TRUE(metadata->segmentManager()
@@ -215,7 +219,7 @@ TEST_F(CudaPointerTest, BufferedFileReadHoldsStagingUntilGpuCopyFinishes) {
     ASSERT_TRUE(transport.allocateSubBatch(batch, 2).ok());
     pointers[reinterpret_cast<CUdeviceptr>(dst)] = {CU_MEMORYTYPE_DEVICE, 0, 1};
     Request req{};
-    req.opcode = Request::READ;
+    req.opcode = GetParam();
     req.source = dst;
     req.target_id = LOCAL_SEGMENT_ID;
     req.length = sizeof(dst);
@@ -226,7 +230,8 @@ TEST_F(CudaPointerTest, BufferedFileReadHoldsStagingUntilGpuCopyFinishes) {
     bool drained = false;
     for (auto result : {cudaErrorUnknown, cudaErrorNotReady, cudaSuccess}) {
         query_result = result;
-        ASSERT_TRUE(transport.isSubBatchDrained(batch, drained).ok());
+        EXPECT_EQ(transport.isSubBatchDrained(batch, drained).ok(),
+                  result != cudaErrorUnknown);
         EXPECT_EQ(drained, result == cudaSuccess);
         EXPECT_EQ(task.staging != nullptr, !drained);
         EXPECT_EQ(query_context, reinterpret_cast<CUcontext>(0x2001));
@@ -241,8 +246,26 @@ TEST_F(CudaPointerTest, BufferedFileReadHoldsStagingUntilGpuCopyFinishes) {
     ASSERT_TRUE(transport.submitTransferTasks(batch, {req}).ok());
     ASSERT_TRUE(transport.isSubBatchDrained(batch, drained).ok());
     EXPECT_TRUE(drained);
-    EXPECT_TRUE(transport.freeSubBatch(batch).ok());
+    if (GetParam() == Request::WRITE) {
+        char contents[sizeof(dst)]{};
+        ASSERT_EQ(pread(fileno(file.get()), contents, sizeof(contents), 0),
+                  static_cast<ssize_t>(sizeof(contents)));
+        EXPECT_EQ(contents[0], 0);
+    }
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    fail_copy = false;
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {req}).ok());
+    query_result = cudaErrorIllegalAddress;
+    EXPECT_FALSE(transport.isSubBatchDrained(batch, drained).ok());
+    EXPECT_FALSE(drained);
+    EXPECT_FALSE(transport.freeSubBatch(batch).ok());
+    EXPECT_EQ(batch, nullptr);
 }
+
+INSTANTIATE_TEST_SUITE_P(ReadAndWrite, BufferedFileCopyTest,
+                         testing::Values(Request::READ, Request::WRITE));
 #endif
 
 TEST_F(CudaPointerTest, HostControl) {

@@ -36,7 +36,7 @@ struct BufIoTask {
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
 
-    Platform::PendingCopy copyback;
+    Platform::PendingCopy pending_copy;
     std::unique_ptr<uint8_t[]> staging;
 
     BufIoTask()

@@ -60,13 +60,19 @@ namespace {
 struct HipCopyCompletion final : CopyCompletion {
     HIPStreamHandle stream;
     int device;
-    bool finished() override {
+    Status query(bool& finished) override {
+        finished = false;
         int saved;
-        if (hipGetDevice(&saved) != hipSuccess) return false;
-        if (saved != device && hipSetDevice(device) != hipSuccess) return false;
+        CHECK_HIP(hipGetDevice(&saved));
+        if (saved != device) CHECK_HIP(hipSetDevice(device));
         auto result = hipStreamQuery(stream.get());
-        if (saved != device) (void)hipSetDevice(saved);
-        return result == hipSuccess;
+        if (saved != device) CHECK_HIP(hipSetDevice(saved));
+        if (result == hipErrorNotReady) return Status::OK();
+        if (result != hipSuccess)
+            return Status::InternalError(std::string("hipStreamQuery: ") +
+                                         hipGetErrorString(result));
+        finished = true;
+        return Status::OK();
     }
 };
 }  // namespace

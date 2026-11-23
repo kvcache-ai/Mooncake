@@ -82,10 +82,10 @@ class IOUringStagingPool {
 
 struct IOUringTask {
     Request request;
-    volatile TransferStatusEnum status_word;
-    volatile size_t transferred_bytes;
+    volatile TransferStatusEnum status_word = PENDING;
+    volatile size_t transferred_bytes = 0;
     void *buffer = nullptr;
-    Platform::PendingCopy copyback;
+    Platform::PendingCopy pending_copy;
     // Set when `buffer` is a slot of this pool; keeps the pool alive until
     // the slot is returned. Null when `buffer` came from posix_memalign().
     std::shared_ptr<IOUringStagingPool> pool;
@@ -149,9 +149,8 @@ class IOUringTransport : public Transport {
         return io_uring_submit(ring);
     }
 
-    // A READ copyback can retain its stream when synchronization fails.
     virtual Status copyMemory(void *dst, void *src, size_t length,
-                              Platform::PendingCopy *pending = nullptr);
+                              Platform::PendingCopy &pending);
 
     IOUringStagingPool *stagingPool() const { return staging_pool_.get(); }
 

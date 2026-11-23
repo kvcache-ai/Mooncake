@@ -112,15 +112,20 @@ Status CudaPlatform::freePinnedHost(void* ptr, size_t size) {
 namespace {
 struct CudaCopyCompletion final : CopyCompletion {
     CUDAStreamHandle stream;
-    bool finished() override {
+    Status query(bool& finished) override {
+        finished = false;
         CUcontext context;
-        if (cuStreamGetCtx(stream.get(), &context) != CUDA_SUCCESS ||
-            cuCtxPushCurrent(context) != CUDA_SUCCESS)
-            return false;
+        CHECK_CU(cuStreamGetCtx(stream.get(), &context));
+        CHECK_CU(cuCtxPushCurrent(context));
         auto result = cudaStreamQuery(stream.get());
         CUcontext popped;
-        (void)cuCtxPopCurrent(&popped);
-        return result == cudaSuccess;
+        CHECK_CU(cuCtxPopCurrent(&popped));
+        if (result == cudaErrorNotReady) return Status::OK();
+        if (result != cudaSuccess)
+            return Status::InternalError(std::string("cudaStreamQuery: ") +
+                                         cudaGetErrorString(result));
+        finished = true;
+        return Status::OK();
     }
 };
 }  // namespace

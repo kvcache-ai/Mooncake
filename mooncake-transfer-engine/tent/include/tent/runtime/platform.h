@@ -15,6 +15,8 @@
 #ifndef PLATFORM_H
 #define PLATFORM_H
 
+#include <functional>
+
 #include "tent/runtime/topology.h"
 
 namespace mooncake {
@@ -66,8 +68,12 @@ struct DmabufExportGuard {
 class CopyCompletion {
    public:
     virtual ~CopyCompletion() = default;
-    virtual bool finished() = 0;
-    void wait();
+    virtual Status query(bool &finished) = 0;
+    Status wait();
+    // Run the staging release only after the stream confirms completion.
+    static void quarantine(std::shared_ptr<CopyCompletion> copy,
+                           std::function<void()> release_staging);
+    static void reclaimQuarantined();
 };
 
 class Platform {

@@ -152,9 +152,12 @@ TEST_F(HylinkDrainTest, FailedFileCopyKeepsAcceptedStreamUntilCompletion) {
         platform.copyWithCompletion(&target, &source, sizeof(source), pending)
             .ok());
     ASSERT_TRUE(pending);
-    EXPECT_FALSE(pending->finished());
+    bool finished = true;
+    ASSERT_TRUE(pending->query(finished).ok());
+    EXPECT_FALSE(finished);
     pending_copies.clear();
-    EXPECT_TRUE(pending->finished());
+    ASSERT_TRUE(pending->query(finished).ok());
+    EXPECT_TRUE(finished);
     pending.reset();
     failure = Failure::Copy;
     ASSERT_FALSE(
