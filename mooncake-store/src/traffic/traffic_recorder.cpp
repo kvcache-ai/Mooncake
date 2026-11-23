@@ -204,7 +204,10 @@ bool TrafficRecorder::Start() {
         shards_.reserve(config_.ring_shards);
         for (std::uint32_t i = 0; i < config_.ring_shards; ++i) {
             auto shard = std::make_unique<Shard>();
-            shard->ring = std::make_unique<char[]>(shard_bytes);
+            // The writer only reads bytes after a producer publishes them, so
+            // zeroing the whole ring on start adds a 1 GiB memset by default
+            // without making any access safe.
+            shard->ring = std::unique_ptr<char[]>(new char[shard_bytes]);
             shard->capacity = shard_bytes;
             shard->mask = shard_bytes - 1;
             shard->state.store(kAccepting, std::memory_order_relaxed);
