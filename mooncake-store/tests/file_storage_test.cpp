@@ -3571,5 +3571,33 @@ TEST_F(FileStorageTest, LocalStreamingBoundsOpenSourcesBeforeWriting) {
     EXPECT_TRUE(storage.ReadLocalStreaming(requests));
 }
 
+TEST_F(FileStorageTest, LocalStreamingUringModesCopyAcrossSlots) {
+    for (const bool fixed : {false, true}) {
+        SCOPED_TRACE(fixed);
+        FileStorageConfig config;
+        config.storage_filepath = data_path;
+        config.local_buffer_size = 8 * 1024 * 1024;
+        config.streaming_read.enabled = true;
+        config.streaming_read.use_uring = true;
+        config.streaming_read.fixed_buffers = fixed;
+        config.streaming_read.slot_bytes = 4096;
+        config.streaming_read.slots = 2;
+        FileStorage storage(config, nullptr, "local");
+        std::string value(20017, 'x');
+        for (size_t i = 0; i < value.size(); ++i) value[i] = char(i % 251);
+        const std::string key = fixed ? "uring-fixed" : "uring-ordinary";
+        PrepareStreamingObject(storage, key, value);
+        std::vector<char> destination(17000 + 32, 'z');
+        ASSERT_TRUE(storage.ReadLocalStreaming(
+            {{key, value.size(), 113, {{destination.data() + 16, 17000}}}}));
+        EXPECT_EQ(std::string(destination.data() + 16, 17000),
+                  value.substr(113, 17000));
+        EXPECT_EQ(std::string(destination.data(), 16), std::string(16, 'z'));
+        EXPECT_EQ(std::string(destination.end() - 16, destination.end()),
+                  std::string(16, 'z'));
+        ASSERT_TRUE(storage.Shutdown());
+        EXPECT_FALSE(storage.SupportsLocalStreamingRead());
+    }
+}
 
 }  // namespace mooncake

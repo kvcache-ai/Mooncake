@@ -153,6 +153,20 @@ before copying. A preflight capacity failure can use the existing restore
 path. An I/O failure after copying starts reports failure after accepted work
 has drained. Publish the destination data only after the read succeeds.
 
+### Optional streaming io_uring
+
+Set `MOONCAKE_OFFLOAD_STREAM_USE_URING=true` together with local streaming
+to use persistent ordinary-READ workers. The worker retains each file and
+slot until its completion is consumed. Partial reads continue from the
+completed offset, and transient completion errors have a finite retry budget.
+Submission backpressure keeps accepted work within the configured limit.
+
+`MOONCAKE_OFFLOAD_STREAM_FIXED_BUFFERS=true` uses a request-local ring with
+the staging slots registered as fixed buffers. Registration failure uses
+ordinary READ on that ring. A build or kernel without io_uring uses the
+portable pread driver. Both drivers drain accepted work before source and
+staging release.
+
 ## Storage Backends
 
 ### BucketStorageBackend (default)

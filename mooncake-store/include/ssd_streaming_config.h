@@ -9,6 +9,8 @@ namespace mooncake::ssd_offload {
 
 struct StreamingReadConfig {
     bool enabled{false};
+    bool use_uring{false};
+    bool fixed_buffers{false};
     size_t slot_bytes{1024 * 1024};
     size_t slots{4};
     size_t read_workers{4};
