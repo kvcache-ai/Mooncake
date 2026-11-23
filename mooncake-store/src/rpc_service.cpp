@@ -1516,6 +1516,43 @@ WrappedMasterService::BatchEvictDiskReplica(
     return results;
 }
 
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchEvictDiskReplicaIfAllUnleased(
+    const UUID& client_id, const std::vector<std::string>& scoped_keys,
+    ReplicaType replica_type) {
+    ScopedVLogTimer timer(1, "BatchEvictDiskReplicaIfAllUnleased");
+    timer.LogRequest("client_id=", client_id,
+                     ", keys_count=", scoped_keys.size(),
+                     ", replica_type=", replica_type);
+    MasterMetricManager::instance().inc_evict_disk_replica_requests();
+
+    auto results = master_service_.BatchEvictDiskReplicaIfAllUnleased(
+        client_id, scoped_keys, replica_type);
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            ++failure_count;
+            if (results[i].error() == ErrorCode::OBJECT_HAS_LEASE) {
+                VLOG(1) << "BatchEvictDiskReplicaIfAllUnleased deferred key["
+                        << i << "] '" << scoped_keys[i] << "'";
+            } else {
+                LOG(WARNING) << "BatchEvictDiskReplicaIfAllUnleased failed for "
+                             << "key[" << i << "] '" << scoped_keys[i]
+                             << "': " << toString(results[i].error());
+            }
+        }
+    }
+    if (failure_count > 0) {
+        MasterMetricManager::instance().inc_evict_disk_replica_failures();
+    }
+
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
+}
+
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
     const std::string& key, const std::string& tenant_id,
     const std::vector<std::string>& targets) {
@@ -2177,6 +2214,7 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::EvictDiskReplica,
         &WrappedMasterService::EvictDiskReplicaIfCurrent,
         &WrappedMasterService::BatchEvictDiskReplica,
+        &WrappedMasterService::BatchEvictDiskReplicaIfAllUnleased,
         &WrappedMasterService::PollRemoveAll,
         &WrappedMasterService::CreateCopyTask,
         &WrappedMasterService::CreateMoveTask, &WrappedMasterService::QueryTask,

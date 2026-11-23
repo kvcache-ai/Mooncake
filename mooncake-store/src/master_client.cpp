@@ -418,6 +418,12 @@ struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplica> {
 };
 
 template <>
+struct RpcNameTraits<
+    &WrappedMasterService::BatchEvictDiskReplicaIfAllUnleased> {
+    static constexpr const char* value = "BatchEvictDiskReplicaIfAllUnleased";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
     static constexpr const char* value = "PollRemoveAll";
 };
@@ -1725,6 +1731,21 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
     auto result =
         invoke_batch_rpc<&WrappedMasterService::BatchEvictDiskReplica, void>(
             keys.size(), client_id_, keys, tenant_id, replica_type);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+MasterClient::BatchEvictDiskReplicaIfAllUnleased(
+    const std::vector<std::string>& scoped_keys, ReplicaType replica_type) {
+    ScopedVLogTimer timer(1,
+                          "MasterClient::BatchEvictDiskReplicaIfAllUnleased");
+    timer.LogRequest("keys_count=", scoped_keys.size(),
+                     ", replica_type=", replica_type);
+
+    auto result = invoke_batch_rpc<
+        &WrappedMasterService::BatchEvictDiskReplicaIfAllUnleased, void>(
+        scoped_keys.size(), client_id_, scoped_keys, replica_type);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

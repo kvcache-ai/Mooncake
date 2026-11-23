@@ -447,6 +447,11 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);
 
+    std::vector<tl::expected<void, ErrorCode>>
+    BatchEvictDiskReplicaIfAllUnleased(
+        const UUID& client_id, const std::vector<std::string>& scoped_keys,
+        ReplicaType replica_type);
+
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
 

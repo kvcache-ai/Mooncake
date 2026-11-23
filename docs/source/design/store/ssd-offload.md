@@ -213,6 +213,8 @@ For `BucketStorageBackend`, write-time eviction and watermark eviction both use 
 
 `last_access_ns_` is an atomic `int64_t` updated on every `BatchLoad` with relaxed ordering. Buckets that have never been read have `last_access_ns_ == 0` and are therefore always evicted first under LRU, giving FIFO-among-unread semantics.
 
+Local bucket LRU is only the candidate-selection heuristic; it is not the object's authoritative hotness. Successful business `ExistKey` and `GetReplicaList` calls refresh the master-side read lease whether the object is served from MEMORY or LOCAL_DISK. Capacity eviction checks that shared lease before removing LOCAL_DISK replicas, so hits served by an upper tier also protect the SSD copy. Read-only admin queries and lease-free probes do not refresh it.
+
 ### Two-phase eviction protocol
 
 Eviction is split into two phases to ensure that the master is notified before files are deleted, and that no in-flight reads are interrupted.
@@ -225,7 +227,7 @@ Eviction is split into two phases to ensure that the master is notified before f
 
 **Between phases** — notify master:
 
-The caller invokes the `eviction_handler` callback with the full list of evicted keys. The handler calls `MasterClient::BatchEvictDiskReplica`, which sends one batched RPC to the master and receives a per-key result.
+The caller invokes the `eviction_handler` callback with the full list of evicted keys. The handler calls `MasterClient::BatchEvictDiskReplicaIfAllUnleased`, which sends one batched RPC to the master and receives a per-key result. If any key has an active read lease, the master rejects the whole batch without evicting any replica and the backend restores the prepared bucket metadata instead of deleting files. `OBJECT_NOT_FOUND` remains an idempotent success for keys the master no longer tracks. The legacy `BatchEvictDiskReplica` RPC is unchanged for dangling-replica healing and older callers.
 
 **Phase 2 — `FinalizeEviction(pending)`** (called after master notification):
 

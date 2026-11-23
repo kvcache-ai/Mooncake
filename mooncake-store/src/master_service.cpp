@@ -6510,6 +6510,57 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
     return results;
 }
 
+std::vector<tl::expected<void, ErrorCode>>
+MasterService::BatchEvictDiskReplicaIfAllUnleased(
+    const UUID& client_id, const std::vector<std::string>& scoped_keys,
+    ReplicaType replica_type) {
+    std::vector<tl::expected<void, ErrorCode>> results(scoped_keys.size());
+    if (replica_type != ReplicaType::DISK &&
+        replica_type != ReplicaType::LOCAL_DISK) {
+        for (auto& result : results) {
+            result = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return results;
+    }
+
+    // The storage backend restores the whole bucket on any rejection. Exclude
+    // business reads from renewing a lease between the all-key precheck and
+    // the removals so a hot key can never leave a partially evicted bucket.
+    std::unique_lock<std::shared_mutex> state_lock(master_state_mutex_);
+    auto now = std::chrono::system_clock::now();
+    bool rejected = false;
+    for (size_t i = 0; i < scoped_keys.size(); ++i) {
+        const auto [tenant_id, key] = TenantId::ParseScopedKey(scoped_keys[i]);
+        MetadataAccessorRO accessor(
+            this, MakeObjectIdentityForRequest(key, tenant_id));
+        if (!accessor.Exists()) {
+            results[i] = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            continue;
+        }
+        const auto& metadata = accessor.Get();
+        if (weight_manager_.IsManagedGroup(metadata.group_id)) {
+            results[i] =
+                tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            rejected = true;
+        } else if (!metadata.IsLeaseExpired(now)) {
+            results[i] = tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+            rejected = true;
+        }
+    }
+    if (rejected) {
+        return results;
+    }
+
+    for (size_t i = 0; i < scoped_keys.size(); ++i) {
+        if (!results[i].has_value()) {
+            continue;
+        }
+        const auto [tenant_id, key] = TenantId::ParseScopedKey(scoped_keys[i]);
+        results[i] = EvictDiskReplica(client_id, key, tenant_id, replica_type);
+    }
+    return results;
+}
+
 tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     const std::string& src_segment,
