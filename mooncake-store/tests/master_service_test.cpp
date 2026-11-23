@@ -4290,7 +4290,7 @@ TEST_F(MasterServiceTest,
                     .has_value());
 }
 
-TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
+TEST_F(MasterServiceTest, DrainJobMovesHardPinnedObjectAndConvergesToDrained) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
     auto service_ = std::make_unique<MasterService>(service_config);
@@ -4300,9 +4300,12 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
     [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
         *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
 
-    const UUID put_client_id = generate_uuid();
-    const std::string key =
-        PutObjectOnSegment(*service_, put_client_id, "segment_0");
+    const std::string key = "hard-pinned-drain-key";
+    ReplicateConfig replica_config;
+    replica_config.replica_num = 1;
+    replica_config.preferred_segments = {"segment_0"};
+    replica_config.with_hard_pin = true;
+    PutCompletedObject(*service_, generate_uuid(), key, replica_config);
 
     CreateDrainJobRequest request;
     request.segments = {"segment_0"};
@@ -4324,7 +4327,7 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
     ASSERT_TRUE(query.has_value());
     EXPECT_EQ(query->status, JobStatus::SUCCEEDED);
     EXPECT_EQ(query->active_units, 0u);
-    EXPECT_GE(query->succeeded_units, 1u);
+    EXPECT_EQ(query->succeeded_units, 1u);
 
     auto segment_status = service_->QuerySegmentStatus("segment_0");
     ASSERT_TRUE(segment_status.has_value());
@@ -4332,13 +4335,17 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
 
     auto replicas = service_->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(replicas.has_value());
-    std::unordered_set<std::string> segment_names;
-    for (const auto& replica : replicas->replicas) {
-        segment_names.insert(replica.get_memory_descriptor()
-                                 .buffer_descriptor.transport_endpoint_);
-    }
-    EXPECT_TRUE(segment_names.contains("segment_1"));
-    EXPECT_FALSE(segment_names.contains("segment_0"));
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_EQ(replicas->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_1");
+
+    MasterServiceTestPeer::MetadataAccessorRO accessor(
+        service_.get(),
+        MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+    ASSERT_TRUE(accessor.Exists());
+    EXPECT_TRUE(accessor.Get().IsHardPinned());
 }
 
 TEST_F(MasterServiceTest, FailedMoveKeepsTheSourceAndSerializesUpsert) {
@@ -4602,12 +4609,8 @@ TEST_F(MasterServiceTest, DrainJobTimeoutPreservesPartiallyDrainedSources) {
         *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
     [[maybe_unused]] const auto target = PrepareSimpleSegment(
         *service_, "segment_2", 0x500000000, kDefaultSegmentSize);
-    ReplicateConfig replica_config;
-    replica_config.replica_num = 1;
-    replica_config.preferred_segments = {"segment_1"};
-    replica_config.with_hard_pin = true;
-    PutCompletedObject(*service_, generate_uuid(), "timeout-pinned",
-                       replica_config);
+    // Leave the move pending so segment_1 still has data at the deadline.
+    PutObjectOnSegment(*service_, generate_uuid(), "segment_1");
     CreateDrainJobRequest request;
     request.segments = {"segment_0", "segment_1"};
     request.target_segments = {"segment_2"};
