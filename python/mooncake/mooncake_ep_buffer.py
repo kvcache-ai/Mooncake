@@ -23,12 +23,43 @@ def _env_enabled(name: str, default: bool = False) -> bool:
 _USE_MACA = _env_enabled("MOONCAKE_EP_USE_MACA") or bool(
     getattr(torch.version, "maca", None)
 )
-_USE_SPLIT_SEND_RECV = _USE_MACA
+
+
+def _detect_hygon() -> bool:
+    if _env_enabled("MOONCAKE_EP_USE_HYGON"):
+        return True
+    try:
+        if bool(getattr(torch.version, "hip", None)):
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                dev_name = torch.cuda.get_device_name(0).lower()
+                return any(k in dev_name for k in ("hygon", "dcu", "z100", "k100"))
+    except Exception:
+        pass
+    return False
+
+
+_USE_HYGON = _detect_hygon()
+_USE_SPLIT_SEND_RECV = _USE_MACA or _USE_HYGON
+_DEBUG_PHASES = _env_enabled("MOONCAKE_EP_DEBUG_PHASES")
+
+# DTK intermittently rejects simultaneous reciprocal IPC opens even though
+# each device pair reports peer accessibility. Import handles one rank at a
+# time on Hygon so the EP fast-path decision does not depend on which process
+# wins the driver-side race.
+_SERIALIZE_IPC_OPEN = _env_enabled(
+    "MOONCAKE_EP_SERIALIZE_IPC_OPEN",
+    _USE_HYGON,
+)
 
 _ZERO_COPY_COMBINE_UNSUPPORTED = (
     "Mooncake EP zero-copy combine is not supported; pass the expert output "
     "tensor to combine() with zero_copy=False"
 )
+
+
+def _debug_phase(rank: int, phase: str) -> None:
+    if _DEBUG_PHASES:
+        print(f"[Mooncake EP debug][rank {rank}] {phase}", flush=True)
 
 
 @functools.lru_cache(maxsize=None)
@@ -548,17 +579,30 @@ class Buffer:
         )
 
     def _maca_phase_fence(self, send_event: Optional[Any] = None) -> None:
-        if not _USE_MACA:
+        if not (_USE_MACA or _USE_HYGON):
             return
-
-        backend = dist.get_backend(self.group)
-        fence_device = torch.device("cpu" if backend == "gloo" else "cuda")
 
         def wait_send_done() -> None:
             if send_event is not None:
                 send_event.synchronize()
             else:
                 torch.cuda.synchronize()
+
+        if _USE_HYGON:
+            # DTK IPC peer stores and completion flags are not reliably
+            # observable while the peer's SEND kernel is still running.  Make
+            # split SEND/RECV a real two-phase protocol: finish the local SEND
+            # stream, then align all ranks on the Gloo control group before any
+            # rank launches RECV.  Payload traffic remains on the device P2P path.
+            _debug_phase(self.rank, "phase fence: waiting local SEND")
+            wait_send_done()
+            _debug_phase(self.rank, "phase fence: entering Hygon barrier")
+            dist.barrier(group=self.group)
+            _debug_phase(self.rank, "phase fence: Hygon barrier complete")
+            return
+
+        backend = dist.get_backend(self.group)
+        fence_device = torch.device("cpu" if backend == "gloo" else "cuda")
 
         # Compatibility fence between SEND and RECV.  The EP payload still
         # uses the P2P fast path; this only keeps rank phases aligned on MACA.
@@ -609,13 +653,15 @@ class Buffer:
 
     def _bootstrap_device(self) -> torch.device:
         """Device for the tensors that bootstrap exchanges over the group."""
-        if self.device_type != "xpu":
-            return torch.device("cuda")
         try:
             backend = dist.get_backend(self.group)
         except Exception:
             backend = None
-        return torch.device("cpu" if backend == "gloo" else "xpu")
+        if backend == "gloo":
+            return torch.device("cpu")
+        if self.device_type == "xpu":
+            return torch.device("xpu")
+        return torch.device("cuda")
 
     def connect(self, is_update: bool = False):
         device = self._bootstrap_device()
@@ -648,8 +694,6 @@ class Buffer:
             and not self.runtime.ibgda_disabled()
         ):
             (raddr, rkey) = self.runtime.get_mr_info()
-            # torchada maps the CUDA device namespace to MUSA when enabled.
-
             raddr = torch.tensor([raddr], dtype=torch.int64, device=device)
             raddrs = [
                 torch.empty(1, dtype=torch.int64, device=device)
@@ -747,12 +791,38 @@ class Buffer:
                     )
                     for _ in range(self.group_size)
                 ]
-                dist.all_gather(handles, local_handle_tensor, self.group)
+                dist.all_gather(handles, local_handle_tensor, group=self.group)
+                _debug_phase(self.rank, "connect: IPC handles gathered")
                 remote_handles = [h.tolist() for h in handles]
                 active_ranks_mask = self._active_ranks_list(device)
                 if self.device_type == "xpu":
                     self._connect_xpu_rdma(remote_handles, active_ranks_mask, device)
-                self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
+                if _SERIALIZE_IPC_OPEN:
+                    for importer_rank in range(self.group_size):
+                        if self.rank == importer_rank:
+                            _debug_phase(
+                                self.rank,
+                                f"connect: importing IPC handles in slot {importer_rank}",
+                            )
+                            self.runtime.sync_nvlink_ipc_handles(
+                                remote_handles, active_ranks_mask
+                            )
+                            _debug_phase(
+                                self.rank,
+                                f"connect: imported IPC handles in slot {importer_rank}",
+                            )
+                        # Keep every exported allocation alive and prevent two
+                        # processes from entering the DTK IPC-open path at the
+                        # same time.
+                        dist.barrier(group=self.group)
+                        _debug_phase(
+                            self.rank,
+                            f"connect: passed IPC barrier {importer_rank}",
+                        )
+                else:
+                    self.runtime.sync_nvlink_ipc_handles(
+                        remote_handles, active_ranks_mask
+                    )
             except Exception as e:
                 import warnings
 
@@ -762,6 +832,10 @@ class Buffer:
                     stacklevel=2,
                 )
         else:
+            _debug_phase(
+                self.rank,
+                f"connect: complete (no p2p, fallback={int(self._use_fallback)})",
+            )
             return
 
         use_fast_path = False
@@ -778,6 +852,10 @@ class Buffer:
         dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=self.group)
         use_fast_path = bool(agreed.item())
         self._use_fallback = not use_fast_path
+        _debug_phase(
+            self.rank,
+            f"connect: complete (fallback={int(self._use_fallback)})",
+        )
 
     def _connect_xpu_rdma(
         self,
@@ -1049,8 +1127,9 @@ class Buffer:
                 async_finish and return_recv_hook
             ), "MACA does not support async_finish and return_recv_hook together"
 
-        # MUSA and MACA use split SEND/RECV launches because they do not expose
-        # CUDA cooperative-grid synchronization. Only MACA adds a phase fence.
+        # MUSA, MACA, and Hygon use split SEND/RECV launches because they do not
+        # expose CUDA cooperative-grid synchronization. Only MACA adds a host
+        # phase fence; Hygon uses the device-side phase acknowledgement.
         if _USE_SPLIT_SEND_RECV and async_finish:
             import warnings
 
@@ -1171,11 +1250,14 @@ class Buffer:
                 native_dispatch_args += (
                     _cumulative_local_expert_recv_stats.data_ptr(),
                 )
+            _debug_phase(self.rank, "dispatch: native SEND enqueued")
             event, hook = self.runtime.dispatch(*native_dispatch_args)
             if _USE_SPLIT_SEND_RECV:
                 hook = self._wrap_maca_recv_hook(hook, event)
                 if not return_recv_hook:
+                    _debug_phase(self.rank, "dispatch: entering native RECV hook")
                     hook()
+                    _debug_phase(self.rank, "dispatch: native RECV enqueued")
                     hook = None
         handle = (
             packed_recv_src_info,
@@ -1412,10 +1494,13 @@ class Buffer:
                 runtime_return_recv_hook,
                 _native_current_stream_ptr(),
             )
+            _debug_phase(self.rank, "combine: native SEND enqueued")
             if _USE_SPLIT_SEND_RECV:
                 hook = self._wrap_maca_recv_hook(hook, event)
                 if not return_recv_hook:
+                    _debug_phase(self.rank, "combine: entering native RECV hook")
                     hook()
+                    _debug_phase(self.rank, "combine: native RECV enqueued")
                     hook = None
         tensors_to_record = (
             x,
@@ -1475,21 +1560,37 @@ class Buffer:
             num_ranks = self.group_size
             num_local_experts = num_experts // num_ranks
 
+            ctrl_dev = self._bootstrap_device()
+            use_cpu_collectives = ctrl_dev.type == "cpu"
+
             # Gather sizes first to handle variable num_tokens per rank
             num_tokens_tensor = torch.tensor(
-                [num_tokens], dtype=torch.int64, device=x.device
+                [num_tokens], dtype=torch.int64, device=ctrl_dev
             )
             num_tokens_list = [
-                torch.empty(1, dtype=torch.int64, device=x.device)
+                torch.empty(1, dtype=torch.int64, device=ctrl_dev)
                 for _ in range(num_ranks)
             ]
             dist.all_gather(num_tokens_list, num_tokens_tensor, group=self.group)
-            num_tokens_per_rank = [t.item() for t in num_tokens_list]
+            num_tokens_per_rank = [int(t.item()) for t in num_tokens_list]
+
+            # Validate and clamp gathered token counts
+            validated_tokens_per_rank = []
+            for val in num_tokens_per_rank:
+                if val < 0 or val > num_max_dispatch_tokens_per_rank:
+                    val = num_tokens
+                validated_tokens_per_rank.append(val)
+            num_tokens_per_rank = validated_tokens_per_rank
+
             backend_active_ranks = self._active_ranks_list(x.device)
             for i in range(num_ranks):
                 if backend_active_ranks[i] == 0:
                     num_tokens_per_rank[i] = 0
-            max_num_tokens = max(num_tokens_per_rank)
+            max_num_tokens = max(max(num_tokens_per_rank), num_tokens)
+            if max_num_tokens <= 0:
+                max_num_tokens = 1
+            elif max_num_tokens > num_max_dispatch_tokens_per_rank:
+                max_num_tokens = num_max_dispatch_tokens_per_rank
 
             # Pad inputs to max_num_tokens for all_gather (all ranks must have same shape)
             if num_tokens < max_num_tokens:
@@ -1517,14 +1618,45 @@ class Buffer:
             num_max_dispatch_tokens = num_ranks * num_max_dispatch_tokens_per_rank
 
             # Gather inputs from all ranks (all have same shape after padding)
-            all_x = torch.empty(
-                (num_ranks, max_num_tokens, hidden), dtype=x.dtype, device=x.device
-            )
-            dist.all_gather_into_tensor(all_x, x_padded, group=self.group)
-            all_topk = torch.empty(
-                (num_ranks, max_num_tokens, k), dtype=topk_idx.dtype, device=x.device
-            )
-            dist.all_gather_into_tensor(all_topk, topk_padded, group=self.group)
+            if use_cpu_collectives:
+                x_padded_cpu = x_padded.float().cpu()
+                all_x_list = [
+                    torch.zeros(
+                        (max_num_tokens, hidden),
+                        dtype=torch.float32,
+                        device="cpu",
+                    )
+                    for _ in range(num_ranks)
+                ]
+                dist.all_gather(all_x_list, x_padded_cpu, group=self.group)
+                all_x = torch.stack(all_x_list, dim=0).to(
+                    dtype=x.dtype, device=x.device
+                )
+
+                topk_padded_cpu = topk_padded.cpu()
+                all_topk_list = [
+                    torch.zeros(
+                        (max_num_tokens, k),
+                        dtype=topk_idx.dtype,
+                        device="cpu",
+                    )
+                    for _ in range(num_ranks)
+                ]
+                dist.all_gather(all_topk_list, topk_padded_cpu, group=self.group)
+                all_topk = torch.stack(all_topk_list, dim=0).to(device=x.device)
+            else:
+                all_x = torch.zeros(
+                    (num_ranks, max_num_tokens, hidden),
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+                dist.all_gather_into_tensor(all_x, x_padded, group=self.group)
+                all_topk = torch.zeros(
+                    (num_ranks, max_num_tokens, k),
+                    dtype=topk_idx.dtype,
+                    device=x.device,
+                )
+                dist.all_gather_into_tensor(all_topk, topk_padded, group=self.group)
 
             # Prepare outputs per local expert
             recv_x_list: List[torch.Tensor] = []
@@ -1602,24 +1734,20 @@ class Buffer:
                         (num_valid,), dtype=torch.int32, device=x.device
                     )
 
-                # Pad to full size
-                if use_fp8:
-                    pad = num_max_dispatch_tokens - num_valid
-                    if pad > 0:
-                        pad_tensor = torch.zeros(
-                            (pad, hidden), dtype=torch.bfloat16, device=x.device
-                        )
-                        gathered = torch.cat([gathered, pad_tensor], dim=0)
+                pad = num_max_dispatch_tokens - num_valid
+                if pad > 0:
+                    pad_tensor = torch.zeros(
+                        (pad, hidden), dtype=torch.bfloat16, device=x.device
+                    )
+                    gathered = torch.cat([gathered, pad_tensor], dim=0)
+                if use_fp8 and not _USE_HYGON:
                     fp8, scales = self._fp8_cast(gathered)
                     recv_x_list.append(fp8)
                     recv_x_scales_list.append(scales)
                 else:
-                    pad = num_max_dispatch_tokens - num_valid
-                    if pad > 0:
-                        pad_tensor = torch.zeros(
-                            (pad, hidden), dtype=torch.bfloat16, device=x.device
-                        )
-                        gathered = torch.cat([gathered, pad_tensor], dim=0)
+                    # DTK can cast to float8, but does not implement the
+                    # float8 cat kernel used internally by torch.stack.  Keep
+                    # Hygon expert buffers in BF16 until after stacking.
                     recv_x_list.append(gathered)
 
                 # src info padded
@@ -1627,26 +1755,49 @@ class Buffer:
                     recv_src_info[le, :num_valid] = src_meta
 
             if use_fp8:
-                packed_recv_x = (
-                    torch.stack(recv_x_list, dim=0)
-                    if len(recv_x_list) > 0
-                    else torch.empty(
+                if _USE_HYGON and recv_x_list:
+                    packed_bf16 = torch.stack(recv_x_list, dim=0)
+                    flat_fp8, flat_scales = self._fp8_cast(
+                        packed_bf16.reshape(-1, hidden)
+                    )
+                    packed_recv_x = flat_fp8.reshape(
+                        num_local_experts, num_max_dispatch_tokens, hidden
+                    )
+                    packed_recv_x_scales = flat_scales.reshape(
+                        num_local_experts,
+                        num_max_dispatch_tokens,
+                        hidden // 128,
+                    )
+                elif _USE_HYGON:
+                    packed_recv_x = torch.empty(
                         (0, num_max_dispatch_tokens, hidden),
                         dtype=torch.float8_e4m3fn,
                         device=x.device,
                     )
-                )
-                # Calculate scales shape correctly
-                num_scales_per_token = hidden // 128
-                packed_recv_x_scales = (
-                    torch.stack(recv_x_scales_list, dim=0)
-                    if len(recv_x_scales_list) > 0
-                    else torch.empty(
-                        (0, num_max_dispatch_tokens, num_scales_per_token),
+                    packed_recv_x_scales = torch.empty(
+                        (0, num_max_dispatch_tokens, hidden // 128),
                         dtype=torch.float32,
                         device=x.device,
                     )
-                )
+                else:
+                    packed_recv_x = (
+                        torch.stack(recv_x_list, dim=0)
+                        if recv_x_list
+                        else torch.empty(
+                            (0, num_max_dispatch_tokens, hidden),
+                            dtype=torch.float8_e4m3fn,
+                            device=x.device,
+                        )
+                    )
+                    packed_recv_x_scales = (
+                        torch.stack(recv_x_scales_list, dim=0)
+                        if recv_x_scales_list
+                        else torch.empty(
+                            (0, num_max_dispatch_tokens, hidden // 128),
+                            dtype=torch.float32,
+                            device=x.device,
+                        )
+                    )
             else:
                 packed_recv_x = (
                     torch.stack(recv_x_list, dim=0)
@@ -1699,21 +1850,37 @@ class Buffer:
             num_ranks = self.group_size
             num_local_experts = num_experts // num_ranks
 
+            ctrl_dev = self._bootstrap_device()
+            use_cpu_collectives = ctrl_dev.type == "cpu"
+
             # Gather sizes first to handle variable num_tokens per rank
             num_tokens_tensor = torch.tensor(
-                [num_tokens], dtype=torch.int64, device=topk_idx.device
+                [num_tokens], dtype=torch.int64, device=ctrl_dev
             )
             num_tokens_list = [
-                torch.empty(1, dtype=torch.int64, device=topk_idx.device)
+                torch.empty(1, dtype=torch.int64, device=ctrl_dev)
                 for _ in range(num_ranks)
             ]
             dist.all_gather(num_tokens_list, num_tokens_tensor, group=self.group)
-            num_tokens_per_rank = [t.item() for t in num_tokens_list]
+            num_tokens_per_rank = [int(t.item()) for t in num_tokens_list]
+
+            # Validate and clamp gathered token counts
+            validated_tokens_per_rank = []
+            for val in num_tokens_per_rank:
+                if val < 0 or val > num_max_dispatch_tokens_per_rank:
+                    val = num_tokens
+                validated_tokens_per_rank.append(val)
+            num_tokens_per_rank = validated_tokens_per_rank
+
             backend_active_ranks = self._active_ranks_list(topk_idx.device)
             for i in range(num_ranks):
                 if backend_active_ranks[i] == 0:
                     num_tokens_per_rank[i] = 0
-            max_num_tokens = max(num_tokens_per_rank)
+            max_num_tokens = max(max(num_tokens_per_rank), num_tokens)
+            if max_num_tokens <= 0:
+                max_num_tokens = 1
+            elif max_num_tokens > num_max_dispatch_tokens_per_rank:
+                max_num_tokens = num_max_dispatch_tokens_per_rank
 
             # Gather routing info across ranks to fetch per-token weights
             k = topk_idx.size(1)
@@ -1747,18 +1914,47 @@ class Buffer:
                 topk_padded = topk_idx
                 topk_w_padded = topk_weights
 
-            all_topk_idx = torch.empty(
-                (num_ranks, max_num_tokens, k),
-                dtype=topk_idx.dtype,
-                device=topk_idx.device,
-            )
-            dist.all_gather_into_tensor(all_topk_idx, topk_padded, group=self.group)
-            all_topk_w = torch.empty(
-                (num_ranks, max_num_tokens, k),
-                dtype=topk_weights.dtype,
-                device=topk_weights.device,
-            )
-            dist.all_gather_into_tensor(all_topk_w, topk_w_padded, group=self.group)
+            if use_cpu_collectives:
+                topk_padded_cpu = topk_padded.cpu()
+                all_topk_idx_list = [
+                    torch.zeros(
+                        (max_num_tokens, k),
+                        dtype=topk_idx.dtype,
+                        device="cpu",
+                    )
+                    for _ in range(num_ranks)
+                ]
+                dist.all_gather(all_topk_idx_list, topk_padded_cpu, group=self.group)
+                all_topk_idx = torch.stack(all_topk_idx_list, dim=0).to(
+                    device=topk_idx.device
+                )
+
+                topk_w_padded_cpu = topk_w_padded.cpu()
+                all_topk_w_list = [
+                    torch.zeros(
+                        (max_num_tokens, k),
+                        dtype=topk_weights.dtype,
+                        device="cpu",
+                    )
+                    for _ in range(num_ranks)
+                ]
+                dist.all_gather(all_topk_w_list, topk_w_padded_cpu, group=self.group)
+                all_topk_w = torch.stack(all_topk_w_list, dim=0).to(
+                    device=topk_weights.device
+                )
+            else:
+                all_topk_idx = torch.zeros(
+                    (num_ranks, max_num_tokens, k),
+                    dtype=topk_idx.dtype,
+                    device=topk_idx.device,
+                )
+                dist.all_gather_into_tensor(all_topk_idx, topk_padded, group=self.group)
+                all_topk_w = torch.zeros(
+                    (num_ranks, max_num_tokens, k),
+                    dtype=topk_weights.dtype,
+                    device=topk_weights.device,
+                )
+                dist.all_gather_into_tensor(all_topk_w, topk_w_padded, group=self.group)
 
             expert_buffers = self._fallback_next_combine_buffer if zero_copy else x
             # Ensure bf16 input for accumulation
@@ -1773,13 +1969,14 @@ class Buffer:
                 device=expert_buffers.device,
             )
 
+            layout_range_cpu = layout_range.cpu()
             for le in range(num_local_experts):
                 expert_id = self.rank * num_local_experts + le
                 # layout_range[le, j]: upper 32 begin, lower 32 count
                 for src_rank in range(num_ranks):
-                    entry = layout_range[le, src_rank]
-                    begin = (entry >> 32).item() & 0xFFFFFFFF
-                    count = (entry & ((1 << 32) - 1)).item()
+                    entry = int(layout_range_cpu[le, src_rank].item())
+                    begin = (entry >> 32) & 0xFFFFFFFF
+                    count = entry & 0xFFFFFFFF
                     if count == 0:
                         continue
                     tokens = src_info[le, begin : begin + count].to(torch.long)
@@ -1803,9 +2000,15 @@ class Buffer:
                         send_buf[src_rank, tokens_valid] += contrib_valid * weights
 
             # All-reduce then take local slice (only valid tokens)
-            dist.all_reduce(send_buf, group=self.group)
-            combined_x = send_buf[self.rank, :num_tokens]
-
+            if use_cpu_collectives:
+                send_buf_cpu = send_buf.float().cpu()
+                dist.all_reduce(send_buf_cpu, group=self.group)
+                combined_x = send_buf_cpu[self.rank, :num_tokens].to(
+                    dtype=send_buf.dtype, device=send_buf.device
+                )
+            else:
+                dist.all_reduce(send_buf, group=self.group)
+                combined_x = send_buf[self.rank, :num_tokens]
             # Write to out if provided
             if out is not None:
                 out.copy_(combined_x)

@@ -10,7 +10,7 @@
 #include <transport/device/comm_device.cuh>
 #include <mooncake_ep_utils.cuh>
 
-#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA) && !defined(MOONCAKE_EP_USE_HYGON)
 #include <jit/combine_jit.h>
 #include <jit/dispatch_jit.h>
 #endif
@@ -212,10 +212,10 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         active_qps_per_rank,
     };
 
-#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA) && !defined(MOONCAKE_EP_USE_HYGON)
     jit::launch_dispatch_jit(hidden, use_fp8, num_warp_groups,
                              kNumWarpsPerGroup, num_sms, args, stream);
-#else // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+#else // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA) && !defined(MOONCAKE_EP_USE_HYGON)
 #define DISPATCH_LAUNCH_GROUP(hidden, groups) case groups: { \
 constexpr int kNumWarpGroups = groups; \
 auto dispatch_func = use_fp8 ? dispatch<true, kNumWarpGroups, kNumWarpsPerGroup, hidden> : \
@@ -237,7 +237,7 @@ default: EP_HOST_ASSERT(false && "Unsupported dispatch warp-group count"); \
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 #undef DISPATCH_LAUNCH_GROUP
-#endif // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+#endif // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA) && !defined(MOONCAKE_EP_USE_HYGON)
 }
 
 void combine(void* combined_x, int32_t* active_ranks,
@@ -298,10 +298,10 @@ void combine(void* combined_x, int32_t* active_ranks,
         active_qps_per_rank
     };
 
-#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA) && !defined(MOONCAKE_EP_USE_HYGON)
     jit::launch_combine_jit(hidden, kNumMaxTopk,
                             kNumWarpGroups, kNumWarpsPerGroup, num_sms, args, stream);
-#else // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+#else // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA) && !defined(MOONCAKE_EP_USE_HYGON)
 #define COMBINE_LAUNCH_CASE(hidden) { \
 auto combine_func = combine<kNumWarpGroups, kNumWarpsPerGroup, hidden, kNumMaxTopk>; \
 LAUNCH_KERNEL(&cfg, combine_func, args); } break
@@ -309,7 +309,7 @@ LAUNCH_KERNEL(&cfg, combine_func, args); } break
     SETUP_LAUNCH_CONFIG(num_sms, kNumWarpGroups * kNumWarpsPerGroup * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
-#endif // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+#endif // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA) && !defined(MOONCAKE_EP_USE_HYGON)
 }
 
 __global__ void update_active_mask_kernel(int32_t* active_ranks, int rank,

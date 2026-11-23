@@ -211,7 +211,8 @@ __device__ __forceinline__ void combine_kernel_impl(
                                        buf_int4_ptr, x_int4, mc_ld_nc,
                                        mc_st_na);
                 __syncwarp();
-#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
+#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA) || \
+    defined(MOONCAKE_EP_USE_HYGON)
                 // Match dispatch publication and avoid concurrent posts from
                 // the two 32-lane sub-warps sharing one QP.
                 mc_fence();
@@ -224,7 +225,8 @@ __device__ __forceinline__ void combine_kernel_impl(
                                           active_qps_per_rank),
                             dst_rank, num_qp_per_rank, buf_ptr, dst_ptr,
                             num_bytes_per_slot, lane_id);
-#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
+#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA) || \
+    defined(MOONCAKE_EP_USE_HYGON)
                     }
                     __syncwarp();
                 }
