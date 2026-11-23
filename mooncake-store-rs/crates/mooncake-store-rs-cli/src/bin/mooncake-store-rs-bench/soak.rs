@@ -31,8 +31,10 @@ fn write_operation_width(interface: WriteInterface, batch_size: usize) -> usize 
 
 fn read_operation_width(interface: ReadInterface, batch_size: usize) -> usize {
     match interface {
-        ReadInterface::Get => 1,
-        ReadInterface::BatchGet | ReadInterface::BatchGetInto => batch_size,
+        ReadInterface::Get | ReadInterface::IsExist => 1,
+        ReadInterface::BatchGet | ReadInterface::BatchGetInto | ReadInterface::BatchIsExist => {
+            batch_size
+        }
     }
 }
 
@@ -193,6 +195,9 @@ fn execute_soak_read(
                 buffer.as_mut_slice().fill(0);
             }
             Ok(values)
+        }
+        ReadInterface::IsExist | ReadInterface::BatchIsExist => {
+            Err("existence interfaces are supported only by bench".into())
         }
     }
 }

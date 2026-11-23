@@ -16,7 +16,7 @@ Key features of Mooncake Store include:
 - **Zero-copy, bandwidth-saturating transfers**: Powered by the Transfer Engine, Mooncake Store eliminates redundant memory copies and exploits multi-NIC GPUDirect RDMA pooling to drive data across the network at full line rate while keeping CPU overhead negligible.
 - **High bandwidth utilization**: Mooncake Store supports striping and parallel I/O transfer of large objects, fully utilizing multi-NIC aggregated bandwidth for high-speed data reads and writes.
 - **Dynamic resource scaling**: Mooncake Store supports dynamically adding and removing nodes to flexibly handle changes in system load, achieving elastic resource management.
-- **Fault tolerance**: Mooncake store is designed with robust fault tolerance. Failures of any number of master and client nodes will not result in incorrect data being read. As long as at least one master and one client remain operational, Mooncake Store continues to function correctly and serve requests.
+- **Fault tolerance**: With HA metadata replication configured, Mooncake Store can recover from master failures when the coordination backend and complete recovery history remain available. Reading a cached object also requires an accessible payload replica. Requests may fail during election, recovery, and client reconnection; see [High Availability Design](high-availability.md) for the prerequisites and recovery boundaries.
 - **Multi-layer storage support**​​: Mooncake Store supports offloading cached data from RAM to SSD, further balancing cost and performance to improve storage system efficiency.
 
 ## Architecture
@@ -95,6 +95,7 @@ descriptors to fetch the object.
 See {ref}`store-master-rpc` for the RPC signatures and
 operation semantics.
 
+(store-object-groups)=
 ### Optional Object Groups
 
 Object groups are intended for workloads where one logical cache entry is split into multiple Mooncake Store objects, such as separate K/V tensors, parallel shards, or auxiliary index objects. Without grouping, these objects are managed independently, so lease refresh and memory eviction may affect different parts of the same logical entry at different times.
@@ -383,6 +384,8 @@ The soft-pin lifetime starts when the first replica becomes readable. When its d
 
 Soft pin is runtime-only eviction-priority state. It is not persisted in snapshots or the HA OpLog, so recovery and Standby promotion downgrade restored objects to ordinary cache. Existing snapshot fields are retained only for format compatibility and ignored during recovery.
 
+An explicitly started drain job can move a soft-pinned object's replicas to other segments. The job copies the data to the destination before retiring the source replica. The object retains its soft pin and TTL throughout the move.
+
 There are three startup parameters in `master_service` related to the soft pin mechanism:
 
 - `default_kv_soft_pin_ttl`: The fixed soft-pin lifetime (in milliseconds) used when an `ENABLE` request omits `soft_pin_ttl_ms`. The default value is `30 minutes`; reads do not extend it.
@@ -396,6 +399,24 @@ overrides are rejected for `PRESERVE` and `DISABLE`.
 
 Notably, soft pinned objects can still be removed using APIs such as `Remove` or `RemoveAll`.
 
+### Updating soft pins through the master RPC
+
+`MasterClient::BatchUpdateSoftPin(keys, ttl_ms)` changes the soft-pin deadline
+of existing objects in the client's tenant without reading or rewriting their
+payloads. A positive TTL sets the deadline relative to the call; `ttl_ms = 0`
+unpins the objects. The TTL must not exceed `max_kv_soft_pin_ttl`.
+
+```cpp
+auto pinned = master_client.BatchUpdateSoftPin(keys, 60000);
+auto unpinned = master_client.BatchUpdateSoftPin(keys, 0);
+```
+
+Results follow input key order, and batches are not atomic. Missing objects,
+empty keys, and objects with unfinished writes return per-key errors. This RPC
+uses the existing runtime-only soft-pin behavior: it changes eviction priority,
+does not create session membership, and does not prevent explicit removal.
+Both the client and master must support `BatchUpdateSoftPin`.
+
 ## Hard Pin
 
 The Master skips hard-pinned objects during capacity-driven memory eviction.
@@ -405,6 +426,8 @@ preserves an existing pin and can enable one through `with_hard_pin`.
 
 A hard pin has no expiry. Explicit removal of a hard-pinned object follows the
 normal removal rules, including the lease and replica-state checks.
+
+An explicitly started drain job can move a hard-pinned object's replicas to other segments. The job copies the data to the destination before retiring the source replica. The object retains its hard pin throughout the move.
 
 ## Zombie Object Cleanup
 
@@ -546,7 +569,7 @@ The HTTP metadata server can be configured using the following parameters:
 - **`http_metadata_server_port`** (integer, default: `8080`): Specifies the TCP port on which the HTTP metadata server will listen for incoming connections. This port must be available and not conflict with other services.
 - **`http_metadata_server_host`** (string, default: `"0.0.0.0"`): Specifies the host address for the HTTP metadata server to bind to. Use `"0.0.0.0"` to listen on all available network interfaces, or specify a specific IP address for security purposes.
 ### Environment Variables
-- MC_STORE_CLUSTER_ID: Identify the metadata when multiple cluster share the same master, default 'mooncake'.
+- `MC_STORE_CLUSTER_ID`: Selects the client's HA leader-discovery namespace and labels client metrics. Discovery defaults to `mooncake_cluster` when unset or empty; it must match the masters' `--cluster_id`. See {ref}`HA client addressing <store-ha-etcd-deployment>`.
 - MC_STORE_MEMCPY: Enables or disables local memcpy optimization, set to 1/true to enable, 0/false to disable.
 - MC_STORE_CLIENT_METRIC: Enables client metric reporting, enabled by default; set to 0/false to disable.
 - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds, default 0 (collects but does not report).

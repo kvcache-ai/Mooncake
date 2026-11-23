@@ -6,8 +6,8 @@ use mooncake_store_core::{
 };
 
 use crate::shim::{
-    RouteAuthorityClient, RouteAuthorityRecord, RouteAuthorityService, RouteOwnerPage,
-    RouteOwnerPageQuery,
+    RouteAuthorityClient, RouteAuthorityPresence, RouteAuthorityRecord, RouteAuthorityService,
+    RouteOwnerPage, RouteOwnerPageQuery,
 };
 
 #[derive(Clone, Debug)]
@@ -21,6 +21,7 @@ pub enum RouteControlRequest {
         namespace: String,
         authority: ClientStableId,
         keys: Vec<ObjectKey>,
+        include_presence: bool,
     },
     BatchCompareAndSwap {
         namespace: String,
@@ -80,9 +81,15 @@ impl RouteControlRequest {
             Self::BatchGet { keys, .. } if keys.is_empty() => {
                 Some(RouteControlResponse::BatchGet(Vec::new()))
             }
-            Self::BatchContains { keys, .. } if keys.is_empty() => {
-                Some(RouteControlResponse::BatchContains(Vec::new()))
-            }
+            Self::BatchContains {
+                keys,
+                include_presence,
+                ..
+            } if keys.is_empty() => Some(if *include_presence {
+                RouteControlResponse::BatchGetPresence(Vec::new())
+            } else {
+                RouteControlResponse::BatchContains(Vec::new())
+            }),
             Self::BatchCompareAndSwap { requests, .. } if requests.is_empty() => {
                 Some(RouteControlResponse::BatchCompareAndSwap(Vec::new()))
             }
@@ -107,6 +114,7 @@ impl RouteControlRequest {
 pub enum RouteControlResponse {
     BatchGet(Vec<Result<RouteAuthorityRecord>>),
     BatchContains(Vec<Result<bool>>),
+    BatchGetPresence(Vec<Result<RouteAuthorityPresence>>),
     BatchCompareAndSwap(Vec<Result<CasResult>>),
     BatchReplace(Vec<Result<()>>),
     ListByReplicaOwner(RouteOwnerPage),
@@ -138,9 +146,18 @@ pub fn serve_route_control_request(
             namespace,
             authority,
             keys,
-        } => Ok(RouteControlResponse::BatchContains(
-            service.batch_contains_routes(&namespace, &authority, &keys),
-        )),
+            include_presence,
+        } => {
+            if include_presence {
+                Ok(RouteControlResponse::BatchGetPresence(
+                    service.batch_get_route_presence(&namespace, &authority, &keys),
+                ))
+            } else {
+                Ok(RouteControlResponse::BatchContains(
+                    service.batch_contains_routes(&namespace, &authority, &keys),
+                ))
+            }
+        }
         RouteControlRequest::BatchCompareAndSwap {
             namespace,
             authority,
@@ -262,6 +279,32 @@ impl RouteAuthorityClient for RouteControlAuthorityClient {
         Ok(references)
     }
 
+    fn batch_get_route_presence(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<Result<RouteAuthorityPresence>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let response = self.transport.send_route_control(
+            lease,
+            RouteControlRequest::BatchContains {
+                namespace: namespace.to_string(),
+                authority: authority.clone(),
+                keys: keys.to_vec(),
+                include_presence: true,
+            },
+        )?;
+        let RouteControlResponse::BatchGetPresence(replies) = response else {
+            return unexpected_response("batch_get_route_presence");
+        };
+        ensure_batch_len("batch_get_route_presence", keys.len(), replies.len())?;
+        Ok(replies)
+    }
+
     fn batch_contains_routes(
         &self,
         lease: &ClientLease,
@@ -278,6 +321,7 @@ impl RouteAuthorityClient for RouteControlAuthorityClient {
                 namespace: namespace.to_string(),
                 authority: authority.clone(),
                 keys: keys.to_vec(),
+                include_presence: false,
             },
         )?;
         let RouteControlResponse::BatchContains(replies) = response else {

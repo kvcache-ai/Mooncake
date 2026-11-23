@@ -33,6 +33,7 @@ LOGOS = {
     "HPE": "hardwares/hpe_logo.png",
     "Iluvatar CoreX": "hardwares/iluvatar_corex_logo.png",
     "FlagOS": "hardwares/flagos_logo.png",
+    "Enflame": "hardwares/enflame_logo.png",
 }
 OUTPUT = ROOT / "image/hardwares/supported_hardware.png"
 COLUMNS = 6

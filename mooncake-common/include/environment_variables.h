@@ -109,6 +109,9 @@ struct HugepageEnvironmentVariables {
     // the existing byte-size parser, fallback, and logging behavior.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_USE_HUGEPAGE);
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_HUGEPAGE_SIZE);
+    // Opt-in THP backing of the RDMA client buffer (1/0, true/false, yes/no,
+    // on/off). Kept as a string so an invalid value can be warned about.
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_MADV_HUGEPAGE);
 };
 
 struct ShmSpdkRegistrationEnvironmentVariables {
@@ -302,6 +305,11 @@ struct NvmeKvConnectorEnvironmentVariables {
 };
 
 struct RedisConnectionEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_CLUSTER_ENABLED);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_CONNECT_TIMEOUT_MS);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_COMMAND_TIMEOUT_MS);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_TOPOLOGY_REFRESH_MS);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_MAX_REDIRECTS);
     // Keep the DB index as a string so an explicitly empty value remains
     // distinguishable from a nonempty malformed value.
     MC_DEFINE_ENV_VAR(std::string, MC_REDIS_DB_INDEX);
