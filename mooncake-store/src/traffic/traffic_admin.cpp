@@ -83,7 +83,8 @@ bool WriteSessionFile(const std::filesystem::path& session_dir,
     }
     const std::filesystem::path path = session_dir / name;
     const std::filesystem::path temporary =
-        session_dir / (std::string(name) + ".tmp." + std::to_string(::getpid()));
+        session_dir /
+        (std::string(name) + ".tmp." + std::to_string(::getpid()));
     {
         std::ofstream out(temporary, std::ios::trunc);
         if (!out) {

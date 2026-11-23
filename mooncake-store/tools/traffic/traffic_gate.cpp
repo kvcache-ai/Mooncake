@@ -225,8 +225,7 @@ int main(int argc, char** argv) {
     std::printf("  \"current\": \"%s\",\n", options.current.c_str());
     std::printf("  \"rps_drop_pct\": %.3f,\n", rps_drop_pct);
     std::printf("  \"p99_increase_pct\": %.3f,\n", p99_increase_pct);
-    std::printf("  \"max_rps_drop_pct\": %.3f,\n",
-                options.max_rps_drop_pct);
+    std::printf("  \"max_rps_drop_pct\": %.3f,\n", options.max_rps_drop_pct);
     std::printf("  \"max_p99_increase_pct\": %.3f,\n",
                 options.max_p99_increase_pct);
     std::printf("  \"rps_ok\": %s,\n", rps_ok ? "true" : "false");
