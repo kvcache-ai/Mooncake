@@ -22,6 +22,8 @@ namespace {
 enum class Failure { None, Create, Record, Query, SecondRecord, Copy };
 Failure failure;
 int copies;
+int destroyed_streams;
+bool fail_get_device;
 std::vector<hipStream_t> pending_copies;
 uintptr_t next_stream;
 bool forbid_new_streams;
@@ -34,6 +36,7 @@ hipError_t __wrap_hipGetDeviceCount(int* count) {
     return hipSuccess;
 }
 hipError_t __wrap_hipGetDevice(int* device) {
+    if (fail_get_device) return hipErrorInvalidValue;
     *device = 0;
     return hipSuccess;
 }
@@ -43,7 +46,10 @@ hipError_t __wrap_hipStreamCreate(hipStream_t* stream) {
     *stream = reinterpret_cast<hipStream_t>(++next_stream);
     return hipSuccess;
 }
-hipError_t __wrap_hipStreamDestroy(hipStream_t) { return hipSuccess; }
+hipError_t __wrap_hipStreamDestroy(hipStream_t) {
+    ++destroyed_streams;
+    return hipSuccess;
+}
 hipError_t __wrap_hipMemcpyAsync(void*, const void*, size_t, hipMemcpyKind,
                                  hipStream_t stream) {
     if (failure == Failure::Copy) return hipErrorInvalidValue;
@@ -91,6 +97,8 @@ class HylinkDrainTest : public ::testing::Test {
         failure = Failure::Query;
         copies = events_created = 0;
         next_stream = 0x100;
+        destroyed_streams = 0;
+        fail_get_device = false;
         forbid_new_streams = false;
         pending_copies.clear();
         auto meta = std::make_shared<ControlService>("p2p", "", nullptr);
@@ -141,6 +149,23 @@ TEST_P(HylinkEventFailureTest, AcceptedCopyOutlivesEventFailure) {
     EXPECT_TRUE(drained);
     ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
     EXPECT_EQ(status.s, FAILED);
+}
+
+TEST_F(HylinkDrainTest, ReleasesStreamWhenDeviceLookupFailsAtUninstall) {
+    failure = Failure::None;
+    {
+        HylinkSubBatch completed;
+        completed.max_size = 1;
+        ASSERT_TRUE(
+            transport.submitTransferTasks(&completed, {request()}).ok());
+        pending_copies.clear();
+        bool drained = false;
+        ASSERT_TRUE(transport.isSubBatchDrained(&completed, drained).ok());
+        ASSERT_TRUE(drained);
+    }
+    fail_get_device = true;
+    EXPECT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(destroyed_streams, 1);
 }
 
 TEST_F(HylinkDrainTest, SecondCopyEventFailureKeepsBothTasks) {

@@ -535,11 +535,10 @@ hipStream_t HylinkTransport::acquireStream(HylinkSubBatch& batch,
         } else if (pool.size() < kStreamsPerDevice || device.streams.empty()) {
             hipStream_t stream = nullptr;
             if (hipStreamCreate(&stream) == hipSuccess) {
-                HylinkStream owned(stream, [device_id](hipStream_t s) {
-                    (void)onHylinkDevice(device_id, [&](int) {
-                        CHECK_HIP(hipStreamDestroy(s));
-                        return Status::OK();
-                    });
+                HylinkStream owned(stream, [](hipStream_t s) {
+                    if (auto err = hipStreamDestroy(s); err != hipSuccess)
+                        LOG(ERROR) << "hipStreamDestroy failed: "
+                                   << hipGetErrorString(err);
                 });
                 if (pool.size() < kStreamsPerDevice) pool.push_back(owned);
                 device.streams.push_back(std::move(owned));
