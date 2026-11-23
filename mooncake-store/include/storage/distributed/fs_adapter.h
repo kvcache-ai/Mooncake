@@ -96,8 +96,10 @@ class FileSystemAdapter {
 
     // Open a file that must already exist. Implementations must not use
     // O_CREAT: bucket descriptors can arrive after whole-bucket eviction.
+    // Read-only opens must not request write access: on 3FS a writable open
+    // and its close each cost a metadata round trip that reads do not need.
     virtual tl::expected<int, ErrorCode> OpenExistingFile(
-        const std::string& /*path*/) {
+        const std::string& /*path*/, bool /*write*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
