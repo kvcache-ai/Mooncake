@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <limits>
 #include <future>
+#include <atomic>
 
 #include <array>
 #include <cctype>
@@ -60,6 +61,7 @@ std::string ErrnoSuffix(int err) {
     if (err == 0) return "";
     return ", errno=" + std::to_string(err) + " (" + strerror(err) + ")";
 }
+std::atomic<uint64_t> g_bucket_metadata_temp_sequence{0};
 }  // namespace
 
 #include "storage/distributed/distributed_storage_backend.h"
@@ -3254,17 +3256,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         LOG(ERROR) << "Failed to store bucket metadata, error: "
                    << store_bucket_metadata_result.error();
 
-        // Clean up the bucket file to prevent orphans
-        std::error_code ec;
-        if (fs::remove(bucket_data_path, ec)) {
-            LOG(WARNING) << "Cleaned up orphaned bucket file after metadata "
-                            "write failure: "
-                         << bucket_data_path;
-        } else if (ec) {
-            LOG(ERROR) << "Failed to clean up bucket file after metadata write "
-                          "failure: "
-                       << bucket_data_path << ", error: " << ec.message();
-        }
+        // A rename may succeed before directory sync fails. Clean both
+        // files so restart cannot recover an unacknowledged partial commit.
+        CleanupOrphanedBucket(bucket_id, disk_index);
 
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -4202,25 +4196,116 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto meta_path = meta_path_res.value();
-    auto open_file_result = OpenFile(meta_path, FileMode::Write);
-    if (!open_file_result) {
-        LOG(ERROR) << "Failed to open file for bucket writing: " << meta_path;
+    std::string str;
+    try {
+        struct_pb::to_pb(*metadata, str);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to serialize bucket metadata for " << meta_path
+                   << ", error=" << e.what();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    // Publish metadata through a same-directory temporary file. A direct
+    // O_TRUNC write can leave a torn .meta file that Init() treats as a bad
+    // bucket and deletes, even though the bucket data was already synced.
+    // Bucket IDs are unique; the pid/sequence suffix plus O_EXCL also avoids
+    // colliding with a stale temporary file after a process restart.
+    std::string temp_path;
+    int fd = -1;
+    for (int attempt = 0; attempt < 128; ++attempt) {
+        const auto sequence = g_bucket_metadata_temp_sequence.fetch_add(
+            1, std::memory_order_relaxed);
+        temp_path = meta_path + ".tmp." + std::to_string(getpid()) + "." +
+                    std::to_string(sequence);
+        fd = open(temp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                  0644);
+        if (fd >= 0 || errno != EEXIST) break;
+    }
+    if (fd < 0) {
+        LOG(ERROR) << "Failed to create temporary bucket metadata file for: "
+                   << meta_path << ", errno=" << errno << " ("
+                   << strerror(errno) << ")";
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
-    auto file = std::move(open_file_result.value());
-    std::string str;
-    struct_pb::to_pb(*metadata, str);
-    auto write_result = file->write(str, str.size());
-    if (!write_result) {
-        NotifyDiskError(file->sys_errno(), "write");
-        LOG(ERROR) << "Write failed for: " << meta_path
-                   << ", error: " << write_result.error();
-        return tl::make_unexpected(write_result.error());
+    FdGuard file_guard(fd);
+    auto remove_temp = [&]() {
+        if (unlink(temp_path.c_str()) != 0 && errno != ENOENT) {
+            LOG(ERROR) << "Failed to remove temporary metadata file "
+                       << temp_path << ", errno=" << errno << " ("
+                       << strerror(errno) << ")";
+        }
+    };
+    auto injected_failure = [&](MetadataFailurePointForTest point) {
+        return test_metadata_failure_point_.load(std::memory_order_relaxed) ==
+               point;
+    };
+
+    size_t written = 0;
+    while (written < str.size()) {
+        const ssize_t result =
+            write(fd, str.data() + written, str.size() - written);
+        if (result < 0 && errno == EINTR) continue;
+        if (result <= 0) {
+            LOG(ERROR) << "Failed to write temporary bucket metadata: "
+                       << temp_path << ", errno=" << errno << " ("
+                       << strerror(errno) << ")";
+            remove_temp();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        written += static_cast<size_t>(result);
     }
-    if (write_result.value() != str.size()) {
-        LOG(ERROR) << "Write size mismatch for: " << meta_path
-                   << ", expected: " << str.size()
-                   << ", got: " << write_result.value();
+    if (injected_failure(MetadataFailurePointForTest::kAfterWrite)) {
+        remove_temp();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (injected_failure(MetadataFailurePointForTest::kFileSync) ||
+        fsync(fd) != 0) {
+        LOG(ERROR) << "Failed to sync temporary bucket metadata: " << temp_path
+                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+        remove_temp();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (close(file_guard.release()) != 0) {
+        LOG(ERROR) << "Failed to close temporary bucket metadata: " << temp_path
+                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+        remove_temp();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    if (injected_failure(MetadataFailurePointForTest::kRename) ||
+        rename(temp_path.c_str(), meta_path.c_str()) != 0) {
+        LOG(ERROR) << "Failed to publish bucket metadata " << meta_path
+                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+        remove_temp();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    const auto parent_path =
+        std::filesystem::path(meta_path).parent_path().empty()
+            ? std::filesystem::path(".")
+            : std::filesystem::path(meta_path).parent_path();
+    const int dir_fd =
+        open(parent_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0) {
+        LOG(ERROR) << "Failed to open bucket metadata directory " << parent_path
+                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+        unlink(meta_path.c_str());
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    FdGuard dir_guard(dir_fd);
+    if (injected_failure(MetadataFailurePointForTest::kDirectorySync) ||
+        fsync(dir_fd) != 0) {
+        LOG(ERROR) << "Failed to sync bucket metadata directory " << parent_path
+                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+        if (unlink(meta_path.c_str()) != 0 && errno != ENOENT) {
+            LOG(ERROR) << "Failed to roll back bucket metadata " << meta_path
+                       << " after directory sync failure, errno=" << errno
+                       << " (" << strerror(errno) << ")";
+        } else if (fsync(dir_fd) != 0) {
+            LOG(ERROR) << "Failed to sync bucket metadata rollback in "
+                       << parent_path << ", errno=" << errno << " ("
+                       << strerror(errno) << ")";
+        }
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     metadata->meta_size = str.size();

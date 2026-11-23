@@ -916,6 +916,14 @@ struct DiskState {
 
 class BucketStorageBackend : public StorageBackendInterface {
    public:
+    enum class MetadataFailurePointForTest {
+        kNone,
+        kAfterWrite,
+        kFileSync,
+        kRename,
+        kDirectorySync,
+    };
+
     BucketStorageBackend(const FileStorageConfig& file_storage_config_,
                          const BucketBackendConfig& bucket_backend_config_);
 
@@ -1343,6 +1351,10 @@ class BucketStorageBackend : public StorageBackendInterface {
     // Test-only: inject datasync failure in WriteBucket to verify orphan
     // cleanup. SetDatasyncFailureForTest(true) makes WriteBucket fail its
     // datasync call and immediately call CleanupOrphanedBucket.
+    void SetMetadataFailurePointForTest(MetadataFailurePointForTest point) {
+        test_metadata_failure_point_.store(point, std::memory_order_relaxed);
+    }
+
     void SetDatasyncFailureForTest(bool enabled) {
         test_datasync_failure_.store(enabled, std::memory_order_relaxed);
     }
@@ -1382,6 +1394,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     void ReleaseDiskOwnerLocks();
 
     std::atomic<bool> test_datasync_failure_{false};
+    std::atomic<MetadataFailurePointForTest> test_metadata_failure_point_{
+        MetadataFailurePointForTest::kNone};
     std::atomic<size_t> last_aligned_copy_bytes_{0};
     std::atomic<bool> test_direct_io_unavailable_{false};
     // Alignment helper functions for O_DIRECT I/O

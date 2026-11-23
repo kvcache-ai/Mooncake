@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <ylt/struct_pb.hpp>
 
 #include <cerrno>
 #include <chrono>
@@ -7724,6 +7725,126 @@ TEST_F(StorageBackendTest, BucketIndexGrowthPreservesRollbackAndRecovery) {
     EXPECT_EQ(recovered.GetStoreMetadata()->total_keys, 0);
     ASSERT_TRUE(recovered.BatchOffload(make_batch(0), nullptr));
     EXPECT_EQ(recovered.GetStoreMetadata()->total_keys, keys_per_bucket);
+}
+
+TEST_F(StorageBackendTest, BucketMetadataPublicationFailureDoesNotAcknowledge) {
+    using Failure = BucketStorageBackend::MetadataFailurePointForTest;
+    const std::array<Failure, 4> failure_points{
+        Failure::kAfterWrite, Failure::kFileSync, Failure::kRename,
+        Failure::kDirectorySync};
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    auto storage_backend =
+        std::make_unique<BucketStorageBackend>(config, bucket_config);
+    ASSERT_TRUE(storage_backend->Init());
+
+    const std::string key = "metadata_failure_key";
+    std::string value(65536, 'm');
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(key, std::vector<Slice>{Slice{value.data(), value.size()}});
+    int completion_count = 0;
+    for (const auto failure : failure_points) {
+        SCOPED_TRACE(static_cast<int>(failure));
+        storage_backend->SetMetadataFailurePointForTest(failure);
+        auto result =
+            storage_backend->BatchOffload(batch, [&](const auto&, auto&) {
+                ++completion_count;
+                return ErrorCode::OK;
+            });
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
+        EXPECT_EQ(completion_count, 0);
+        auto exists = storage_backend->IsExist(key);
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_FALSE(exists.value());
+        for (const auto& entry : fs::directory_iterator(data_path))
+            EXPECT_EQ(entry.path().filename(), ".mooncake_local_disk.lock");
+        storage_backend.reset();
+        {
+            BucketStorageBackend restarted(config, bucket_config);
+            ASSERT_TRUE(restarted.Init());
+            auto recovered = restarted.IsExist(key);
+            ASSERT_TRUE(recovered.has_value());
+            EXPECT_FALSE(recovered.value());
+        }
+        storage_backend =
+            std::make_unique<BucketStorageBackend>(config, bucket_config);
+        ASSERT_TRUE(storage_backend->Init());
+    }
+
+    // Failure must also release the pending write reservation so a retry can
+    // commit normally, using a new bucket ID rather than a partial metadata.
+    storage_backend->SetMetadataFailurePointForTest(Failure::kNone);
+    auto retry = storage_backend->BatchOffload(batch, [&](const auto&, auto&) {
+        ++completion_count;
+        return ErrorCode::OK;
+    });
+    ASSERT_TRUE(retry.has_value());
+    EXPECT_EQ(completion_count, 1);
+    storage_backend.reset();
+    BucketStorageBackend restarted(config, bucket_config);
+    ASSERT_TRUE(restarted.Init());
+    auto recovered = restarted.IsExist(key);
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_TRUE(recovered.value());
+}
+
+TEST_F(StorageBackendTest, BucketMetadataPublishedBeforeCompletionAndRestart) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    std::string value(65536, '\0');
+    for (size_t i = 0; i < value.size(); ++i) {
+        value[i] = static_cast<char>(i % 251);
+    }
+    const std::string key = "metadata_commit_key";
+    int completion_count = 0;
+    {
+        BucketStorageBackend storage_backend(config, bucket_config);
+        ASSERT_TRUE(storage_backend.Init());
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(key,
+                      std::vector<Slice>{Slice{value.data(), value.size()}});
+        auto result = storage_backend.BatchOffload(
+            batch, [&](const auto& keys, auto& metadatas) {
+                ++completion_count;
+                EXPECT_EQ(keys, std::vector<std::string>{key});
+                EXPECT_EQ(metadatas.size(), 1);
+                // The completion callback may publish this replica to Master.
+                // Its files must already be recoverable by an independent
+                // backend, and temporary metadata must no longer be present.
+                size_t files = 0;
+                for (const auto& entry : fs::directory_iterator(data_path)) {
+                    if (entry.path().filename() == ".mooncake_local_disk.lock")
+                        continue;
+                    ++files;
+                    EXPECT_TRUE(entry.path().extension() == ".meta" ||
+                                entry.path().extension() == ".bucket");
+                }
+                EXPECT_EQ(files, 2);
+                for (const auto& entry : fs::directory_iterator(data_path)) {
+                    if (entry.path().extension() != ".meta") continue;
+                    std::ifstream input(entry.path(), std::ios::binary);
+                    const std::string bytes(
+                        (std::istreambuf_iterator<char>(input)), {});
+                    BucketMetadata persisted;
+                    EXPECT_NO_THROW(struct_pb::from_pb(persisted, bytes));
+                    EXPECT_EQ(persisted.keys, keys);
+                }
+                return ErrorCode::OK;
+            });
+        ASSERT_TRUE(result.has_value());
+    }
+    EXPECT_EQ(completion_count, 1);
+
+    BucketStorageBackend recovered(config, bucket_config);
+    ASSERT_TRUE(recovered.Init());
+    std::string loaded(value.size(), '\0');
+    std::unordered_map<std::string, Slice> reads{
+        {key, {loaded.data(), loaded.size()}}};
+    ASSERT_TRUE(recovered.BatchLoad(reads));
+    EXPECT_EQ(loaded, value);
 }
 
 }  // namespace mooncake::test
