@@ -23,7 +23,9 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -222,6 +224,10 @@ class TransferEngineImpl {
 
     BatchID allocateBatchID(size_t batch_size) {
         return multi_transports_->allocateBatchID(batch_size);
+    }
+
+    bool hasPendingBatchCleanup() const {
+        return multi_transports_ && multi_transports_->hasPendingBatchCleanup();
     }
 
     Status freeBatchID(BatchID batch_id) {
@@ -483,6 +489,23 @@ class TransferEngineImpl {
 
     using MemoryRegionMap = std::map<uintptr_t, MemoryRegion>;
 
+    // Only one unregister may interpret a missing descriptor or release the
+    // range. Other addresses can continue registering and unregistering.
+    class UnregisterClaim {
+       public:
+        UnregisterClaim(TransferEngineImpl& engine,
+                        std::span<void* const> addresses);
+        ~UnregisterClaim();
+        UnregisterClaim(const UnregisterClaim&) = delete;
+        UnregisterClaim& operator=(const UnregisterClaim&) = delete;
+        bool acquired() const { return acquired_; }
+
+       private:
+        TransferEngineImpl& engine_;
+        std::span<void* const> addresses_;
+        bool acquired_ = false;
+    };
+
     bool hasOverlapLocked(uintptr_t addr, uint64_t length) const;
 
     bool hasOverlapInMapLocked(const MemoryRegionMap& regions, uintptr_t addr,
@@ -506,6 +529,7 @@ class TransferEngineImpl {
     std::shared_mutex mutex_;
     MemoryRegionMap local_memory_regions_;
     MemoryRegionMap registering_memory_regions_;
+    std::set<uintptr_t> unregistering_addresses_;
     std::shared_ptr<Topology> local_topology_;
 
     RWSpinlock send_notifies_lock_;

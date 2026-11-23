@@ -1262,16 +1262,21 @@ hosts with RDMA HCAs to select MNNVL instead of RDMA.
 
 ---
 #### setup_dummy()
-Initialize the store with a dummy client for testing purposes.
+Connect a DummyClient to a RealClient daemon on the same host.
 
 ```python
-def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address: str) -> int
+def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address: str,
+                cuda_ipc_persistent_registration: Optional[bool] = None) -> int
 ```
 
 **Parameters:**
 - `mem_pool_size` (int): Memory pool size in bytes
 - `local_buffer_size` (int): Local buffer size in bytes
 - `server_address` (str): Server address in format "hostname:port"
+- `cuda_ipc_persistent_registration` enables direct access to registered GPU
+  buffers on the C++ backend. With `False`, session ranges use SHM and eligible
+  buffer operations can export CUDA IPC handles per call. `None` reads
+  `MC_CUDA_IPC_PERSISTENT_REGISTRATION` (only `1` enables it).
 
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
@@ -2360,10 +2365,10 @@ calls concurrently. Close stops local services. For an EGM Provider, close
 also stops `FileStorage` workers before unmounting EGM segments and
 releasing their backing memory.
 
-Close is terminal: both real-client and dummy-client handles are cleared from
-the Python object even when cleanup fails. Further `close()` calls are
-idempotent, not cleanup retries. Repeated `setup()` calls are not a recovery
-mechanism.
+Close normally clears the native handle even when cleanup fails. For a
+persistent CUDA DummyClient, `CUDA_BUFFER_IN_USE` (-802) means the daemon
+may still access its registered buffers. Keep those allocations and their
+contents intact and retry `close()` on the same store until it succeeds.
 
 If EGM setup fails, Mooncake attempts cleanup even for failed or uncertain
 mounts. When unmount cannot be confirmed, it logs the error and retains the
@@ -2378,7 +2383,8 @@ def close(self) -> int
 ```
 
 **Returns:**
-- `int`: Status code (0 = success, non-zero = terminal cleanup failure).
+- `int`: 0 on success, -802 while a CUDA transfer still needs to be drained,
+  or another nonzero status on terminal cleanup failure.
 
 **Example:**
 ```python
@@ -3275,11 +3281,30 @@ After `setup_dummy`, each DummyClient has its own sessions on the shared
 RealClient daemon. Disconnect cleanup revokes that client's unfinished puts.
 Use matching builds of DummyClient and the daemon for the session RPCs.
 
-Range calls copy registered buffers through one private SHM allocation per
-batch, using a temporary segment if the local pool is absent or too small.
-Keep buffers registered until the call returns and synchronize device producer
-streams before writes. After a timeout, the caller can reuse its buffers while
-the daemon retains the staging memory until the mapping is released.
+By default, range calls copy registered buffers through one private SHM
+allocation per batch. The caller can reuse its buffers after a timeout while
+the daemon finishes against that allocation. Synchronize device producer
+streams before writes.
+
+With `setup_dummy(..., cuda_ipc_persistent_registration=True)`, the daemon
+imports registered GPU allocations and uses their Transfer Engine registration
+directly. Host fragments in the same batch still use staging. This mode
+supports the classic Transfer Engine with RDMA Data Direct disabled. GPU-only
+clients may use `local_buffer_size=0`.
+
+If a direct transfer loses its reply or the transfer engine reports pending
+I/O after a timeout, the client asks the daemon to drain accesses and release
+its mappings. If the daemon cannot confirm cleanup,
+the call returns `CUDA_BUFFER_IN_USE` (-802). Keep the registered buffers
+and their contents intact and retry `close()` on the same store. Once
+cleanup succeeds, set up a new DummyClient and re-register its buffers.
+
+Match each successful `register_buffer` with an `unregister_buffer`.
+Keep the GPU allocation alive until final unregistration succeeds. After a
+lost registration reply, retry registration or unregister the buffer to
+confirm cleanup. A daemon that cannot confirm rollback retains the mapping
+until process exit and keeps its IPC socket name reserved so a replacement
+daemon cannot acknowledge on its behalf.
 
 #### batch_get_session_start()
 

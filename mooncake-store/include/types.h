@@ -389,6 +389,8 @@ enum class ErrorCode : int32_t {
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
     /// Store checksum verification failed.
     CHECKSUM_MISMATCH = -801,
+    CUDA_BUFFER_IN_USE =
+        -802,  ///< Possible remote CUDA access. Retry Dummy close before reuse.
 
     // RPC errors (Range: -900 to -999)
     RPC_FAIL = -900,     ///< RPC operation failed.

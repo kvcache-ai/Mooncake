@@ -1351,46 +1351,121 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertIn("3", config_str)  # Should contain replica_num
 
 
+class TestDummyClientConfiguration(unittest.TestCase):
+    def test_setup_dummy_rejects_non_boolean_persistent_registration(self):
+        store = MooncakeDistributedStore()
+        for value in (0, 1, 0.0, "false", [], {}, object()):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    TypeError, "cuda_ipc_persistent_registration must be bool or None"
+                ),
+            ):
+                store.setup_dummy(0, 0, "", cuda_ipc_persistent_registration=value)
+
+
 @unittest.skipUnless(os.getenv("MC_CUDA_REAL_CLIENT"), "requires a separate daemon")
 @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "requires CUDA")
 class TestDummyClientCudaSessions(unittest.TestCase):
-    def test_registered_cuda_fragments(self):
+    def connect(self, pool_size=0, persistent=True):
         store = MooncakeDistributedStore()
-        self.addCleanup(store.close)
-        self.assertEqual(
-            store.setup_dummy(0, 4 << 20, os.environ["MC_CUDA_REAL_CLIENT"]), 0
-        )
+        self.addCleanup(lambda: self.assertEqual(store.close(), 0))
         key = f"cuda_session_{uuid.uuid4().hex}"
+        self.assertEqual(
+            store.setup_dummy(
+                0,
+                pool_size,
+                os.environ["MC_CUDA_REAL_CLIENT"],
+                cuda_ipc_persistent_registration=persistent,
+            ),
+            0,
+        )
         self.addCleanup(store.remove, key, force=True)
+        return store, key
 
-        # Keep both tensors alive until the registrations are released.
+    def register(self, store, *tensors):
+        def unregister(tensor):
+            self.assertEqual(store.unregister_buffer(tensor.data_ptr()), 0)
+
+        for tensor in tensors:
+            self.assertEqual(store.register_buffer(tensor.data_ptr(), tensor.nbytes), 0)
+            self.addCleanup(unregister, tensor)
+        return [tensor.data_ptr() for tensor in tensors]
+
+    def test_registered_cuda_fragments(self):
+        # None follows the environment, allowing the same test to exercise
+        # staged CUDA and persistent CUDA mixed with staged CPU fragments.
+        store, key = self.connect(4 << 20, None)
         source = torch.arange(64, dtype=torch.uint8, device="cuda")
         dest = torch.zeros_like(source)
+        tail = torch.tensor([91, 92], dtype=torch.uint8)
+        tail_dest = torch.zeros_like(tail)
         torch.cuda.synchronize()
+        src, dst, cpu_src, cpu_dst = self.register(store, source, dest, tail, tail_dest)
         with contextlib.ExitStack() as cleanup:
-            for tensor in (source, dest):
-                self.assertEqual(store.register_buffer(tensor.data_ptr(), 64), 0)
-                cleanup.callback(store.unregister_buffer, tensor.data_ptr())
-
-            src, dst = source.data_ptr(), dest.data_ptr()
-            self.assertEqual(store.batch_put_session_start([key], [64]), [0])
+            self.assertEqual(store.batch_put_session_start([key], [66]), [0])
             cleanup.callback(store.batch_put_session_revoke, [key])
             self.assertEqual(
                 store.batch_put_from_multi_buffer_ranges(
-                    [key], [[src, src + 17]], [[17, 47]], [[0, 17]]
+                    [key], [[src, cpu_src, src + 17]], [[17, 2, 47]], [[0, 64, 17]]
                 ),
-                [64],
+                [66],
             )
             self.assertEqual(store.batch_put_session_end([key]), [0])
             self.assertEqual(store.batch_get_session_start([key]), [0])
             cleanup.callback(store.batch_get_session_end, [key])
             self.assertEqual(
                 store.batch_get_into_multi_buffer_ranges(
-                    [key], [[dst + 17, dst]], [[47, 17]], [[17, 0]]
+                    [key], [[dst + 17, cpu_dst, dst]], [[47, 2, 17]], [[17, 64, 0]]
                 ),
-                [64],
+                [66],
             )
             self.assertTrue(torch.equal(dest, source))
+            self.assertTrue(torch.equal(tail_dest, tail))
+
+    def test_persistent_gpu_only_batch_put_and_adjacent_range_reads(self):
+        store, key = self.connect()
+        size = 256
+        pool = torch.zeros((4, size), dtype=torch.uint8, device="cuda")
+        pool[0].fill_(17)
+        pool[1].fill_(53)
+        torch.cuda.synchronize()
+        # Register adjacent slices from highest address first.
+        ptrs = self.register(store, *reversed(pool.unbind()))[::-1]
+        config = mooncake_store.ReplicateConfig()
+        config.prefer_alloc_in_same_node = True
+        self.assertEqual(
+            store.batch_put_from([key, key], ptrs[:2], [size, size], config), [0, 0]
+        )
+        self.assertEqual(
+            store.get_into_ranges(
+                ptrs[2:],
+                [[key], [key]],
+                [[[0]], [[0]]],
+                [[[0]], [[0]]],
+                [[[size]], [[size]]],
+            ),
+            [[[size]], [[size]]],
+        )
+        self.assertTrue(bool(torch.all(pool[2:] == 17)))
+
+    @unittest.skipUnless(
+        os.getenv("MC_TEST_CUDA_NOF") == "1", "requires a mounted NVMe-oF replica"
+    )
+    def test_persistent_gpu_batch_put_get_nof_with_unaligned_subranges(self):
+        store, key = self.connect()
+        size = 4096
+        source = torch.full((size + 1,), 91, dtype=torch.uint8, device="cuda")
+        dest = torch.zeros_like(source)
+        torch.cuda.synchronize()
+        src, dst = self.register(store, source, dest)
+        config = mooncake_store.ReplicateConfig()
+        config.replica_num = 0
+        config.nof_replica_num = 1
+        self.assertEqual(store.batch_put_from([key], [src + 1], [size], config), [0])
+        self.assertEqual(store.batch_get_into([key], [dst + 1], [size]), [size])
+        self.assertEqual(dest[0].item(), 0)
+        self.assertTrue(torch.equal(dest[1:], source[1:]))
 
 
 if __name__ == "__main__":

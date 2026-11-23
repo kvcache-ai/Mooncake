@@ -45,6 +45,7 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
                                 RealClient &rc) {
     server.register_handler<&RealClient::service_ready_internal>(&rc);
     server.register_handler<&RealClient::ping>(&rc);
+    server.register_handler<&RealClient::ping_persistent_dummy>(&rc);
     server.register_handler<&RealClient::map_shm_internal>(&rc);
     server.register_handler<&RealClient::unmap_shm_internal>(&rc);
     server.register_handler<&RealClient::unregister_shm_buffer_internal>(&rc);
@@ -790,8 +791,10 @@ class DummyClientSessionTest : public ::testing::Test {
         ASSERT_FALSE(server_->async_start().hasResult());
     }
 
-    std::shared_ptr<DummyClient> Connect(size_t pool_size = 4 * kMB) {
-        auto dummy = std::make_shared<DummyClient>();
+    std::shared_ptr<DummyClient> Connect(
+        size_t pool_size = 4 * kMB,
+        std::optional<bool> persistent = std::nullopt) {
+        auto dummy = std::make_shared<DummyClient>(persistent);
         if (dummy->setup_dummy(0, pool_size, address_, ipc_) != 0) return {};
         return dummy;
     }
@@ -837,6 +840,25 @@ class DummyClientSessionTest : public ::testing::Test {
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;
     std::string ipc_, address_;
 };
+
+TEST_F(DummyClientSessionTest, PersistentContextRecoversWithoutHostShm) {
+    auto dummy = Connect(0, true);
+    ASSERT_NE(dummy, nullptr);
+    const std::vector<std::string> keys{"gpu_only_context"};
+    ASSERT_EQ(real_->put(keys[0], std::span<const char>(payload_)), 0);
+    ASSERT_EQ(dummy->batch_get_session_start(keys), std::vector<int>{0});
+    ASSERT_EQ(dummy->batch_get_session_end(keys), 0);
+
+    // Drop the context without disconnecting RPC, as the TTL monitor does.
+    ASSERT_EQ(dummy->unregister_shm(), 0);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (dummy->batch_get_session_start(keys) != std::vector<int>{0}) {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    EXPECT_EQ(dummy->batch_get_session_end(keys), 0);
+}
 
 TEST_F(DummyClientSessionTest, FragmentedRangesPreserveRowResultsAndBounds) {
     // With no local pool, use a separate SHM mapping, even for a large batch.

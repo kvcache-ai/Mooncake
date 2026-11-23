@@ -180,6 +180,11 @@ class RdmaContext {
     // see the VMM note in exportDmabuf().
     static int exportDmabuf(void *addr, size_t length, DmabufExport &out);
 
+    // Borrow an exporter-owned fd for synchronous registration on this thread.
+    // exportDmabuf duplicates it; the caller retains ownership and must reset
+    // this override to -1 before registering any unrelated buffer.
+    static void setExternalDmabufForThread(int fd);
+
     // Closes the fd held by a DmabufExport, if any. Idempotent.
     static void closeDmabufExport(DmabufExport &exp);
 

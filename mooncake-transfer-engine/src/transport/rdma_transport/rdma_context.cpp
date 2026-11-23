@@ -65,6 +65,8 @@ static int isNullGid(union ibv_gid *gid) {
 }
 
 namespace {
+thread_local int external_dmabuf_fd = -1;
+
 #ifdef USE_CUDA
 #if CUDA_VERSION < 12080
 #define CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE 0x1
@@ -555,8 +557,23 @@ int RdmaContext::deconstruct() {
     return 0;
 }
 
+void RdmaContext::setExternalDmabufForThread(int fd) {
+    external_dmabuf_fd = fd;
+}
+
 int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     out = DmabufExport{};
+    if (external_dmabuf_fd >= 0) {
+        const int fd = fcntl(external_dmabuf_fd, F_DUPFD_CLOEXEC, 0);
+        if (fd < 0) {
+            PLOG(ERROR) << "Failed to duplicate external dmabuf fd";
+            return ERR_CONTEXT;
+        }
+        out.method = DmabufExport::Method::kDmabufReg;
+        out.fd = fd;
+        out.offset = 0;
+        return 0;
+    }
     (void)addr;  // unused on the host-only (#else) build
     (void)length;
     const bool data_direct = globalConfig().rdma_data_direct;

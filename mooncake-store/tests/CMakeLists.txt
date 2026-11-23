@@ -495,6 +495,13 @@ add_store_test(task_manager_test task_manager_test.cpp)
 add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
 add_store_test(dummy_client_teardown_test dummy_client_teardown_test.cpp)
+add_store_test(dummy_client_cuda_lifecycle_test
+               dummy_client_cuda_lifecycle_test.cpp)
+if(USE_CUDA)
+  target_link_libraries(dummy_client_cuda_lifecycle_test
+                        PRIVATE CUDA::cuda_driver CUDA::cudart)
+endif()
+set_tests_properties(dummy_client_cuda_lifecycle_test PROPERTIES TIMEOUT 90)
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
 add_store_test(dummy_client_probe_key_test dummy_client_probe_key_test.cpp)
 add_test(NAME dummy_client_session_test

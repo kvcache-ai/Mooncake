@@ -12,6 +12,31 @@
 
 #include "real_client.h"
 #include "test_server_helpers.h"
+#include "transfer_engine_impl.h"
+#include "transport/shm_transport/shm_transport.h"
+#include "uds_transport.h"
+
+namespace mooncake {
+class TransferEngineImplTestPeer {
+   public:
+    // The Store capability check queries the engine mode and installed names;
+    // neither a verbs device nor a TENT backend is needed for that query.
+    static std::shared_ptr<TransferEngine> makeEngine(bool use_tent,
+                                                      const char *name) {
+        auto engine = std::make_shared<TransferEngine>(false);
+        engine->use_tent_ = use_tent;
+        if (!use_tent) {
+            engine->impl_ = std::make_shared<TransferEngineImpl>();
+            auto &impl = *engine->impl_;
+            impl.multi_transports_ = std::make_shared<MultiTransport>(
+                nullptr, impl.local_server_name_);
+            impl.multi_transports_->transport_map_[name] =
+                std::make_shared<ShmTransport>();
+        }
+        return engine;
+    }
+};
+}  // namespace mooncake
 
 namespace mooncake::test {
 namespace {
@@ -179,6 +204,140 @@ class RealClientTeardownTest : public ::testing::Test {
     }
 #endif
 
+    using CudaState = RealClient::CudaRegistrationState;
+    const UUID cuda_id_ = generate_uuid();
+    const CudaIpcBufferHandle handle_{.size = 4096, .has_device_uuid = true};
+
+    std::weak_ptr<ClientBufferAllocator> AddCudaAllocation(CudaState state) {
+        const std::string key(
+            handle_.device_uuid.size() + handle_.handle.size(), '\0');
+        auto &context = client_->shm_contexts_[cuda_id_];
+        auto &allocation = client_->cuda_allocations_[key];
+        allocation = std::make_shared<RealClient::CudaRegisteredAllocation>();
+        allocation->state = state;
+        if (state != CudaState::kQuarantined) {
+            context.cuda_buffers.emplace(
+                kCudaAddress,
+                RealClient::CudaRegisteredBuffer{handle_, allocation});
+        }
+        context.client_buffer_allocator =
+            ClientBufferAllocator::create(mapping_, mapping_size_);
+        return context.client_buffer_allocator;
+    }
+
+    void StartIpcWithReplacement(UdsAcceptor &replacement) {
+        client_->ipc_socket_path_ = std::to_string(cuda_id_.first);
+        replacement.registerHandler([](UdsConnection &) {});
+        ASSERT_EQ(client_->start_ipc_server(), 0);
+    }
+
+    void CheckCudaQuarantine() {
+        UdsAcceptor replacement(std::to_string(cuda_id_.first));
+        StartIpcWithReplacement(replacement);
+        auto allocator = AddCudaAllocation(CudaState::kQuarantined);
+        // A second request for an allocation with an ambiguous initial
+        // rollback must preserve the negative acknowledgement for this client.
+        ASSERT_FALSE(client_->register_cuda_buffer_with_fd(
+            kCudaAddress, handle_, cuda_id_, -1));
+        EXPECT_FALSE(client_->unmap_shm_internal(cuda_id_));
+        EXPECT_TRUE(allocator.expired());
+        EXPECT_EQ(client_->shm_contexts_.count(cuda_id_), 0U);
+        EXPECT_FALSE(client_->unregister_cuda_buffer_internal(
+            kCudaAddress, handle_, cuda_id_));
+        EXPECT_FALSE(client_->unmap_shm_internal(cuda_id_));
+        EXPECT_TRUE(client_->unmap_shm_internal(generate_uuid()));
+        ASSERT_EQ(ReconnectMaster(), ErrorCode::OK);
+        EXPECT_NE(client_->tearDownAll(), 0);
+        EXPECT_EQ(client_->client_, nullptr);
+        EXPECT_FALSE(UdsConnector(client_->ipc_socket_path_).connect());
+        EXPECT_FALSE(replacement.start());
+        EXPECT_NE(client_->tearDownAll(), 0);
+        EXPECT_EQ(client_->cuda_allocations_.size(), 1U);
+        // There is no actual MR or CUDA import in this synthetic test.
+        client_->cuda_allocations_.clear();
+    }
+
+    void CheckIpcNameDuringTransfer() {
+        using namespace std::chrono_literals;
+        ASSERT_EQ(ReconnectMaster(), ErrorCode::OK);
+        UdsAcceptor replacement(std::to_string(cuda_id_.first));
+        StartIpcWithReplacement(replacement);
+
+        // A direct range handler holds this lock from address lookup through
+        // transfer completion. A replacement cannot acknowledge its drain.
+        std::shared_lock transfer(client_->dummy_client_mutex_);
+        auto closing = std::async(std::launch::async,
+                                  [this] { return client_->tearDownAll(); });
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (!client_->closed_.load() &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(1ms);
+        EXPECT_TRUE(client_->closed_.load());
+        EXPECT_EQ(closing.wait_for(100ms), std::future_status::timeout);
+        EXPECT_FALSE(replacement.start());
+        transfer.unlock();
+        EXPECT_EQ(closing.get(), 0);
+        EXPECT_TRUE(replacement.start());
+    }
+
+    void CheckCudaDeregistrationRetry() {
+        auto allocator = AddCudaAllocation(CudaState::kRegistered);
+        auto &allocation = client_->cuda_allocations_.begin()->second;
+        client_->registered_buffer_sizes_[allocation->mapping.base()] = {
+            handle_.size};
+        int attempts = 0;
+        struct ResetHook {
+            ~ResetHook() { RealClient::SetTeUnregisterHookForTesting(nullptr); }
+        } reset_hook;
+        RealClient::SetTeUnregisterHookForTesting(
+            [&](void *) -> tl::expected<void, ErrorCode> {
+                // The first attempt fails after removing the MR. The retry
+                // confirms that TE no longer has it and clears the Store
+                // record.
+                return tl::unexpected(++attempts == 1
+                                          ? ErrorCode::INVALID_PARAMS
+                                          : ErrorCode::NOT_REGISTERED);
+            });
+        auto result = client_->unmap_shm_internal(cuda_id_);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_TRUE(allocator.expired());
+        EXPECT_EQ(allocation->state, CudaState::kUnregisterPending);
+        EXPECT_TRUE(client_->unmap_shm_internal(cuda_id_));
+        EXPECT_TRUE(client_->unmap_shm_internal(cuda_id_));
+        EXPECT_EQ(attempts, 2);
+        EXPECT_TRUE(client_->cuda_allocations_.empty());
+    }
+
+    void CheckUnsupportedCudaBackend(bool tent, const char *transport) {
+        client_->client_->transfer_engine_ =
+            TransferEngineImplTestPeer::makeEngine(tent, transport);
+        client_->shm_contexts_.try_emplace(cuda_id_);
+        const bool previous =
+            std::exchange(globalConfig().rdma_data_direct, !tent);
+        auto result = client_->register_cuda_buffer_with_fd(
+            kCudaAddress, handle_, cuda_id_, -1);
+        globalConfig().rdma_data_direct = previous;
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::NOT_SUPPORTED);
+        EXPECT_TRUE(client_->cuda_allocations_.empty());
+        EXPECT_TRUE(client_->shm_contexts_[cuda_id_].cuda_buffers.empty());
+        EXPECT_TRUE(client_->unregister_cuda_buffer_internal(
+            kCudaAddress, handle_, cuda_id_));
+    }
+
+    void CheckCudaClosePending() {
+        AddCudaAllocation(CudaState::kClosePending);
+        EXPECT_FALSE(client_->register_cuda_buffer_with_fd(
+            kCudaAddress, handle_, cuda_id_, -1));
+        EXPECT_TRUE(client_->unregister_cuda_buffer_internal(
+            kCudaAddress, handle_, cuda_id_));
+        EXPECT_TRUE(client_->cuda_allocations_.empty());
+        EXPECT_TRUE(client_->shm_contexts_[cuda_id_].cuda_buffers.empty());
+        EXPECT_TRUE(client_->unmap_shm_internal(cuda_id_));
+    }
+
+    static constexpr uint64_t kCudaAddress = 0x1000;
     static constexpr const char *kPendingKey = "teardown_pending_put";
     testing::InProcMaster master_;
     std::unique_ptr<coro_rpc::coro_rpc_server> failing_master_;
@@ -218,5 +377,29 @@ TEST_F(RealClientTeardownTest, CleanupAfterLostMemoryEndAndNoFRevokeReplies) {
     CheckNoFCleanup();
 }
 #endif
+TEST_F(RealClientTeardownTest, CudaQuarantineSurvivesDummyAndRealClose) {
+    CheckCudaQuarantine();
+}
+
+TEST_F(RealClientTeardownTest, HoldsIpcNameUntilActiveTransferDrains) {
+    CheckIpcNameDuringTransfer();
+}
+
+TEST_F(RealClientTeardownTest, CudaDeregistrationRetriesAfterShmCleanup) {
+    CheckCudaDeregistrationRetry();
+}
+
+TEST_F(RealClientTeardownTest, CudaCloseRetrySkipsCompletedMrDeregistration) {
+    CheckCudaClosePending();
+}
+
+TEST_F(RealClientTeardownTest, TentRejectsPersistentCudaBeforeImport) {
+    CheckUnsupportedCudaBackend(true, "rdma");
+}
+
+TEST_F(RealClientTeardownTest, DataDirectRejectsPersistentCudaBeforeImport) {
+    CheckUnsupportedCudaBackend(false, "rdma");
+    CheckUnsupportedCudaBackend(false, "rdma_twosided");
+}
 
 }  // namespace mooncake::test

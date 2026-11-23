@@ -1,16 +1,35 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <dlfcn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <array>
 #include <cstdio>
+#include <limits>
+#include <utility>
 
 #include "device/cuda_ipc_buffer.h"
 
 namespace {
 
 constexpr size_t kBytes = 4096;
+bool fail_next_close = false;
+
+}  // namespace
+
+// Fail one importer close before calling the CUDA runtime. All other closes
+// exercise the real CUDA IPC mapping opened by this process.
+extern "C" cudaError_t CUDARTAPI cudaIpcCloseMemHandle(void *ptr) {
+    if (std::exchange(fail_next_close, false)) return cudaErrorUnknown;
+    static auto close_handle =
+        reinterpret_cast<decltype(&cudaIpcCloseMemHandle)>(
+            dlsym(RTLD_NEXT, "cudaIpcCloseMemHandle"));
+    return close_handle ? close_handle(ptr)
+                        : cudaErrorSharedObjectSymbolNotFound;
+}
+
+namespace {
 
 template <typename T>
 bool Transfer(int fd, T &value, bool writing) {
@@ -34,14 +53,33 @@ int Import(int fd) {
     if (!Transfer(fd, handle, false)) return 77;
     auto mapping = mooncake::device::CudaIpcBufferMapping::Open(handle);
     if (!mapping) return 2;
+    if (mapping->base() == nullptr || mapping->allocation_size() < kBytes ||
+        mapping->ptr() != static_cast<char *>(mapping->base()) + handle.offset)
+        return 5;
+    auto moved = std::move(*mapping);
+    if (mapping->base() != nullptr || mapping->allocation_size() != 0) return 6;
     std::array<unsigned char, kBytes> actual{};
-    if (cudaMemcpy(actual.data(), mapping->ptr(), actual.size(),
+    if (cudaMemcpy(actual.data(), moved.ptr(), actual.size(),
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return 3;
     }
     for (size_t i = 0; i < actual.size(); ++i) {
         if (actual[i] != static_cast<unsigned char>(i)) return 4;
     }
+    auto base = moved.base();
+    fail_next_close = true;
+    if (moved.Close() || moved.base() != base || moved.ptr() == nullptr ||
+        moved.allocation_size() < kBytes)
+        return 7;
+    if (!moved.Close() || moved.base() != nullptr || moved.ptr() != nullptr ||
+        moved.allocation_size() != 0 || !moved.Close())
+        return 8;
+    // Validation can fail after the driver has opened a real IPC import.
+    handle.size = std::numeric_limits<uint64_t>::max() - handle.offset;
+    mooncake::device::CudaIpcBufferMapping invalid;
+    if (invalid.OpenInto(handle) || !invalid.base() || invalid.ptr() ||
+        !invalid.Close())
+        return 9;
     return 0;
 }
 

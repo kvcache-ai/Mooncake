@@ -20,6 +20,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <sys/resource.h>
 #include <unistd.h>
 #ifdef WITH_METRICS
@@ -637,6 +638,7 @@ int TransferEngineImpl::freeSharedMemory(void* addr) {
         LOG(WARNING) << "unregisterLocalMemory failed before freeSharedMemory, "
                         "ret="
                      << uret;
+        return uret;
     }
     return shm->freeSharedMemory(addr);
 }
@@ -840,16 +842,45 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
 
 int TransferEngineImpl::unregisterLocalMemory(void* addr,
                                               bool update_metadata) {
+    UnregisterClaim claim(*this, {&addr, 1});
+    if (!claim.acquired()) return ERR_CONTEXT;
     // Best-effort: try every transport so one failure can't leave the region
     // registered on the others; mirrors unregisterLocalMemoryBatch (#2869).
     int first_error = 0;
+    bool already_removed = false;
+    bool unconfirmed_removal = false;
     for (auto& transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemory(addr, update_metadata);
-        if (ret && !first_error) first_error = ret;
+        if (ret == ERR_ADDRESS_NOT_REGISTERED) {
+            already_removed = true;
+            // TCP and SHM only remove a descriptor. Both classic RDMA modes
+            // track pending MR deregistration. Other transports can lose
+            // their descriptor while still holding an MR.
+            std::string_view name = transport->getName();
+            if (name != "tcp" && name != "shm" && name != "rdma" &&
+                name != "rdma_twosided")
+                unconfirmed_removal = true;
+        } else if (ret && !first_error) {
+            first_error = ret;
+        }
     }
     if (first_error) return first_error;
 
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (already_removed) {
+        {
+            std::shared_lock lock(mutex_);
+            if (!local_memory_regions_.count(reinterpret_cast<uintptr_t>(addr)))
+                return ERR_ADDRESS_NOT_REGISTERED;
+        }
+        if (unconfirmed_removal) return ERR_CONTEXT;
+        // A transport may have removed its local descriptor before an earlier
+        // publish failed. Keep the range reserved until peers can see removal.
+        if (update_metadata) {
+            int ret = metadata_->updateLocalSegmentDesc();
+            if (ret) return ret;
+        }
+    }
+    std::unique_lock lock(mutex_);
     clearSkipRegistrationLocked(addr);
     eraseMemoryRegionLocked(addr);
     return 0;
@@ -952,6 +983,12 @@ void TransferEngineImpl::rollbackAllRegistrations(
 int TransferEngineImpl::mp_unregisterLocalMemory(
     std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
         buffer_map) {
+    std::vector<void*> addresses;
+    for (const auto& [_, buffers] : buffer_map)
+        for (const auto& buffer : buffers) addresses.push_back(buffer.addr);
+    UnregisterClaim claim(*this, addresses);
+    if (!claim.acquired()) return ERR_CONTEXT;
+
     for (const auto& buffer_entry : buffer_map) {
         const std::string& protocol = buffer_entry.first;
         const std::vector<RegisteredBuffer>& buffer_list = buffer_entry.second;
@@ -1056,6 +1093,8 @@ int TransferEngineImpl::registerLocalMemoryBatch(
 
 int TransferEngineImpl::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
+    UnregisterClaim claim(*this, addr_list);
+    if (!claim.acquired()) return ERR_CONTEXT;
     int first_error = 0;
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemoryBatch(addr_list);
@@ -1071,8 +1110,37 @@ int TransferEngineImpl::unregisterLocalMemoryBatch(
     return 0;
 }
 
+TransferEngineImpl::UnregisterClaim::UnregisterClaim(
+    TransferEngineImpl& engine, std::span<void* const> addresses)
+    : engine_(engine), addresses_(addresses) {
+    // Allocate before updating shared state so even a failed batch allocation
+    // leaves no claims behind. Repeated addresses within a call share a claim.
+    std::set<uintptr_t> pending;
+    for (void* addr : addresses)
+        pending.insert(reinterpret_cast<uintptr_t>(addr));
+    std::unique_lock lock(engine_.mutex_);
+    for (auto addr : pending) {
+        if (engine_.unregistering_addresses_.count(addr) ||
+            engine_.registering_memory_regions_.count(addr))
+            return;
+    }
+    engine_.unregistering_addresses_.merge(pending);
+    acquired_ = true;
+}
+
+TransferEngineImpl::UnregisterClaim::~UnregisterClaim() {
+    if (!acquired_) return;
+    std::unique_lock lock(engine_.mutex_);
+    for (void* addr : addresses_)
+        engine_.unregistering_addresses_.erase(
+            reinterpret_cast<uintptr_t>(addr));
+}
+
 bool TransferEngineImpl::hasOverlapLocked(uintptr_t addr,
                                           uint64_t length) const {
+    auto next = unregistering_addresses_.lower_bound(addr);
+    if (next != unregistering_addresses_.end() && *next - addr < length)
+        return true;
     return hasOverlapInMapLocked(local_memory_regions_, addr, length) ||
            hasOverlapInMapLocked(registering_memory_regions_, addr, length);
 }
