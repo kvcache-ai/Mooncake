@@ -51,6 +51,9 @@
             auto _msg = std::string(#call) + ": " + cudaGetErrorString(err) + \
                         LOC_MARK;                                             \
             LOG(ERROR) << "CUDA error: " << _msg;                             \
+            /* The error is reported through Status; don't leave it set */    \
+            /* for the caller's next CUDA error check (e.g. PyTorch's).  */   \
+            (void)cudaGetLastError();                                         \
             return Status::InternalError(std::move(_msg));                    \
         }                                                                     \
     } while (0)
