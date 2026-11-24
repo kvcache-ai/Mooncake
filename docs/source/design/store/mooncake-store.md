@@ -11,12 +11,12 @@ Mooncake Store provides low-level object storage and management capabilities, in
 Key features of Mooncake Store include:
 - **Object-level storage operations**: Mooncake Store provides simple and easy-to-use object-level APIs, including `Put`, `Get`, and `Remove` operations.
 - **Optional object grouping**: Related objects can carry an optional group ID so that the Master applies best-effort shared lifecycle behavior. Object routing stays decoupled from groups (always `hash(tenant, key)`); grouping only carries a shared group TTL.
-- **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure. Each slice within an object is guaranteed to be placed in different segments, while different objects' slices may share segments. Replication operates on a best-effort basis.
+- **Multi-replica support**. Mooncake Store can place complete copies of an object on multiple segments to spread read traffic. The requested storage tiers and replica counts determine the {ref}`store-put-start-replica-allocation`.
 - **Strong consistency**: Mooncake Store guarantees that `Get` operations always return correct and complete data. Once an object has been successfully `Put`, it remains immutable until removal, ensuring that all subsequent `Get` requests retrieve the most recent value.
 - **Zero-copy, bandwidth-saturating transfers**: Powered by the Transfer Engine, Mooncake Store eliminates redundant memory copies and exploits multi-NIC GPUDirect RDMA pooling to drive data across the network at full line rate while keeping CPU overhead negligible.
 - **High bandwidth utilization**: Mooncake Store supports striping and parallel I/O transfer of large objects, fully utilizing multi-NIC aggregated bandwidth for high-speed data reads and writes.
 - **Dynamic resource scaling**: Mooncake Store supports dynamically adding and removing nodes to flexibly handle changes in system load, achieving elastic resource management.
-- **Fault tolerance**: Mooncake store is designed with robust fault tolerance. Failures of any number of master and client nodes will not result in incorrect data being read. As long as at least one master and one client remain operational, Mooncake Store continues to function correctly and serve requests.
+- **Fault tolerance**: With HA metadata replication configured, Mooncake Store can recover from master failures when the coordination backend and complete recovery history remain available. Reading a cached object also requires an accessible payload replica. Requests may fail during election, recovery, and client reconnection; see [High Availability Design](high-availability.md) for the prerequisites and recovery boundaries.
 - **Multi-layer storage support**​​: Mooncake Store supports offloading cached data from RAM to SSD, further balancing cost and performance to improve storage system efficiency.
 
 ## Architecture
@@ -57,7 +57,7 @@ The cluster's available resources are viewed as a large resource pool, managed c
 
 ### Snapshot & Restore
 
-HA recovery uses standby-generated batch OpLog snapshots. The standby captures
+With batch OpLog recovery enabled, the standby captures
 object metadata, segment state, and weight metadata at a durable OpLog cursor,
 writes immutable chunk and manifest artifacts to the configured object store,
 and publishes `latest` and `fallback` control pointers. A standby or a newly
@@ -85,96 +85,17 @@ Snapshots restore object runtime state only. Tenant quota policy is always loade
 
 ### Object Information Maintenance
 
-The Master Service needs to maintain mappings related to buffer allocators and object metadata to efficiently manage memory resources and precisely control replica states in multi-replica scenarios. Additionally, the Master Service uses read-write locks to protect critical data structures, ensuring data consistency and security in multi-threaded environments. The following are the interfaces maintained by the Master Service for storage space information:
+The Master tracks registered segments, their allocators, and the replica state of
+each object. A storage client registers memory with the Transfer Engine before
+mounting the segment on the Master. For writes, the client obtains replica
+locations from the Master, transfers the bytes, then completes or revokes the
+write. Readers query the Master for readable replica descriptors and use those
+descriptors to fetch the object.
 
-- MountSegment
+See {ref}`store-master-rpc` for the RPC signatures and
+operation semantics.
 
-```C++
-tl::expected<void, ErrorCode> MountSegment(uint64_t buffer,
-                                          uint64_t size,
-                                          const std::string& segment_name);
-```
-
-The storage node (Client) registers the storage segment space with the Master Service.
-
-- UnmountSegment
-
-```C++
-tl::expected<void, ErrorCode> UnmountSegment(const std::string& segment_name);
-```
-
-The storage node (Client) unregisters the storage segment space with the Master Service.
-
-The Master Service handles object-related interfaces as follows:
-
-- Put
-
-```C++
-    ErrorCode PutStart(const std::string& key,
-                       uint64_t value_length,
-                       const std::vector<uint64_t>& slice_lengths,
-                       const ReplicateConfig& config,
-                       std::vector<ReplicaInfo>& replica_list);
-
-    ErrorCode PutEnd(const std::string& key);
-```
-
-Before writing an object, the Client calls PutStart to request storage space allocation from the Master Service. After completing data writing, the Client calls PutEnd to notify the Master Service to mark the object write as completed.
-
-- Upsert
-
-```C++
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
-    const std::string& key,
-    const std::vector<size_t>& slice_lengths,
-    const ReplicateConfig& config);
-
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-BatchUpsertStart(const std::vector<std::string>& keys,
-                 const std::vector<std::vector<uint64_t>>& slice_lengths,
-                 const ReplicateConfig& config);
-
-tl::expected<void, ErrorCode> UpsertEnd(
-    const std::string& key, ReplicaType replica_type);
-
-std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
-    const std::vector<std::string>& keys);
-
-tl::expected<void, ErrorCode> UpsertRevoke(
-    const std::string& key, ReplicaType replica_type);
-
-std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
-    const std::vector<std::string>& keys);
-```
-
-`UpsertStart` / `UpsertEnd` / `UpsertRevoke` mirror the existing put lifecycle
-but operate on insert-or-update semantics. If the key does not exist, the flow
-behaves like `PutStart`. If the key already exists, the Master may reuse the
-current allocation for an in-place update or allocate new space when the object
-layout changes. The batch variants provide the same control flow for multiple
-keys and are the lower-level primitives used by the high-level `BatchUpsert`
-path.
-
-- GetReplicaList
-
-```C++
-ErrorCode GetReplicaList(const std::string& key,
-                         std::vector<ReplicaInfo>& replica_list);
-tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
-GetReplicaListByRegex(const std::string& str);
-```
-
-The Client requests the Master Service to retrieve the replica list for a specified key or for all object keys matching a specified regular expression, allowing the Client to select an appropriate replica for reading based on this information.
-
-- Remove
-
-```C++
-tl::expected<void, ErrorCode> Remove(const std::string& key);
-tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
-```
-
-The Client requests the Master Service to delete all replicas corresponding to the specified key or for all object keys that match the specified regular expression.
-
+(store-object-groups)=
 ### Optional Object Groups
 
 Object groups are intended for workloads where one logical cache entry is split into multiple Mooncake Store objects, such as separate K/V tensors, parallel shards, or auxiliary index objects. Without grouping, these objects are managed independently, so lease refresh and memory eviction may affect different parts of the same logical entry at different times.
@@ -183,14 +104,17 @@ Mooncake Store remains an object-oriented KV cache: objects are still put, queri
 
 For single-object writes, `group_ids` contains one entry. For batch writes, it must have the same length as the key list, and entry `i` is the group ID for key `i`. An empty string stores that key as ungrouped, and leaving the field unset preserves the legacy ungrouped behavior. For an existing object, group membership is immutable: `Upsert` may preserve the existing group, but it cannot move the object to another group or clear its group while the object exists.
 
-On the Master side, objects are always routed by `hash(tenant, key)` — group membership is an annotation, not a routing key. Group state is tenant-scoped and kept in a separate, single group domain (`group_domain_`) keyed by `scoped(tenant, group_id)`; it holds only the current member key list plus one shared group TTL. Existing key-based APIs locate grouped objects via `hash(tenant, key)` as usual; there is no object-to-group routing index. The Master tracks only the current member set of each group; it does not require an expected member count, a member index, or a commit protocol for group completeness.
+The Master locates an object by key in its tenant's `ObjectRoute`. Each route
+keeps a separate group index keyed by `group_id`, with the current member keys
+and one shared lease per group. Publishing or removing an object updates its
+group membership.
 
 Group metadata affects lifecycle behavior on a best-effort basis:
 
-- `ExistKey` and `GetReplicaList` refresh the group's shared read TTL. A read of any member extends the same group TTL, so the whole group is protected together; a grouped object's own per-member lease is not authoritative. Object soft-pin deadlines are independent and are not extended.
-- Memory eviction first consults the group's single shared TTL: if the group was read recently it is skipped as a whole; otherwise the group's current members are evicted all-or-none, applying the existing per-object safety checks (hard pins, soft pins when soft-pin eviction is disabled, incomplete writes, busy replicas, unavailable replica states) on a best-effort basis. The number of evicted objects is bounded by the requested eviction ratio.
+- `ExistKey` and `GetReplicaList` extend the shared read lease when any member is found readable. Each object's soft-pin deadline is independent of the shared lease.
+- Memory eviction visits the group as one entry and checks each member under its own key lock. The shared lease protects all members while it is active. Members can also survive because of individual pins, ongoing work, or replica state. The eviction target is checked between groups, so processing a group can exceed the target.
 - Object removal APIs, copy/move tasks, and NoF eviction keep their existing object-level semantics. Group membership metadata is cleaned up when objects are removed.
-- On standby restore, each grouped object rejoins its group from the group id in its metadata. The standby snapshot carries no leases, so, as for a newly created group, the shared TTL is unset until a member is read.
+- On standby restore, the Master rebuilds membership from each object's stored group ID. It constructs fresh leases for the restored objects.
 
 This design is intentionally lightweight and backward compatible. Grouping should be treated as a lifecycle hint for related objects, not as a transactional guarantee that all members are created, made visible, or evicted atomically.
 
@@ -198,7 +122,9 @@ This design is intentionally lightweight and backward compatible. Grouping shoul
 
 The buffer allocator serves as a low-level memory management component within the Mooncake Store system, primarily responsible for efficient memory allocation and deallocation. It builds upon underlying memory allocators to perform its functions.
 
-Importantly, the memory managed by the buffer allocator does not reside within the `Master Service` itself. Instead, it operates on memory segments registered by `Clients`. When the `Master Service` receives a `MountSegment` request to register a contiguous memory region, it creates a corresponding buffer allocator via the `AddSegment` interface.
+The allocator manages memory contributed by clients. On a `MountSegment`
+request, the Master creates an allocator for the registered segment and adds it
+to the allocator manager.
 
 Mooncake Store provides two concrete implementations of `BufferAllocatorBase`:
 
@@ -208,23 +134,26 @@ For measured utilization and allocation latency across LLM-style workloads, see 
 
 **CachelibBufferAllocator (deprecated)**: This allocator leverages Facebook's [CacheLib](https://github.com/facebook/CacheLib) to manage memory using a slab-based allocation strategy. It provides efficient memory allocation with good fragmentation resistance and is well-suited for high-performance scenarios. However, in our modified version, it does not handle workloads with highly variable object sizes effectively, so it is currently marked as deprecated.
 
-Users can choose the allocator that best matches their performance and memory usage requirements through the `--memory-allocator` startup parameter of `master_service`.
+Set `--memory_allocator=offset` or `--memory_allocator=cachelib` when starting
+`mooncake_master`. The default is `offset`.
 
 Both allocators implement the same interface as `BufferAllocatorBase`. The main interfaces of the `BufferAllocatorBase` class are as follows:
 
 ```C++
 class BufferAllocatorBase {
+public:
     virtual ~BufferAllocatorBase() = default;
     virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
     virtual void deallocate(AllocatedBuffer* handle) = 0;
 };
 ```
 
-1. **Constructor**: When a `BufferAllocator` instance is created, the upstream component must provide the base address and size of the memory region to be managed. This information is used to initialize the internal allocator, enabling unified memory management.
-
-2. **`allocate` Function**: When the upstream issues read or write requests, it needs a memory region to operate on. The `allocate` function invokes the internal allocator to reserve a memory block and returns metadata such as the starting address and size. The status of the newly allocated memory is initialized as `BufStatus::INIT`.
-
-3. **`deallocate` Function**: This function is automatically triggered by the `BufHandle` destructor. It calls the internal allocator to release the associated memory and updates the handle’s status to `BufStatus::UNREGISTERED`.
+The segment's base address and size define the region managed by the allocator.
+`allocate` returns an `AllocatedBuffer` that owns the reservation and can
+describe its address, size, and transport. The `AllocatedBuffer` destructor
+calls `deallocate` while its allocator is still available. The owning
+`Replica` tracks the write lifecycle and is created in `PROCESSING` state by
+the allocation strategy.
 
 ### Client Local Buffer and Python BufferPool
 
@@ -246,22 +175,27 @@ AllocationStrategy is used in conjunction with the Master Service and the underl
 
 ### APIs
 
-`Allocate`: Finds suitable storage segments from available storage resources to allocate space of a specified size for multiple replicas. Uses best-effort semantics, meaning it allocates as many replicas as possible even if the full requested count cannot be satisfied.
+`Allocate` reserves space for replicas on distinct segments within the selected
+storage tier. It may return a partial allocation. The Master applies the
+{ref}`store-put-start-replica-allocation` to decide whether it can proceed with
+the write.
 
 ```C++
 virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const size_t replica_num = 1,
         const std::vector<std::string>& preferred_segments = std::vector<std::string>(),
-        const std::set<std::string> excluded_segments = std::set<std::string>()) = 0;
+        const std::set<std::string>& excluded_segments = std::set<std::string>(),
+        const ReplicaType replica_type = ReplicaType::MEMORY) = 0;
 ```
 
 - **Input Parameters**:
   - `allocator_manager`: The allocator manager that manages the allocators to use
-  - `slice_length`: Length of the slice to be allocated
+  - `slice_length`: Bytes to reserve per replica. `PutStart` passes the total object size.
   - `replica_num`: Number of replicas to allocate (default: 1)
   - `preferred_segments`: Preferred segments to allocate buffers from (default: empty vector)
   - `excluded_segments`: Excluded segments that should not allocate buffers from (default: empty set)
+  - `replica_type`: Storage tier of the returned replicas (default: `ReplicaType::MEMORY`)
 - **Output**: Returns tl::expected containing either:
   - On success: vector of allocated replicas (may be fewer than requested due to resource constraints, but at least 1)
   - On failure: ErrorCode::NO_AVAILABLE_HANDLE if no replicas can be allocated, ErrorCode::INVALID_PARAMS for invalid configuration
@@ -307,11 +241,11 @@ For benchmark data comparing `random` and `free_ratio_first` across segment coun
 Pure random allocation with preferred segment support. The allocation process for N replicas is:
 
 1. **Preferred segment phase**: If preferred segments are specified in the `ReplicateConfig`, they are tried first in order. Each successful allocation consumes one replica slot. If all replicas are satisfied, the process finishes early.
-2. **Random phase**: For any remaining replicas, a random starting index is chosen among all available segments. The strategy then iterates consecutively from that index, attempting to allocate from each segment. Segments already used for a previous replica of the same slice, as well as explicitly excluded segments, are skipped to guarantee that each replica resides on a different segment.
-3. **Retry limit**: The iteration is capped at `min(100, total_segments)` to avoid excessive scanning when most segments are full.
+2. **Random phase**: For any remaining replicas, a random starting index is chosen among all available segments. The strategy then iterates consecutively from that index, attempting to allocate from each segment. It skips segments already used for a replica of the object and any explicitly excluded segments.
+3. **Retry limit**: The random phase visits at most 100 serving candidates. Non-serving segments are skipped before counting against that budget.
 4. **Best-effort result**: If fewer than N replicas are allocated but at least one succeeds, the partial result is returned. The call fails only if zero replicas can be allocated.
 
-All random state uses a thread-local Mersenne Twister (`std::mt19937`), so no locks or shared mutable data are involved.
+Random draws use the shared random helpers with a thread-local `std::mt19937_64` engine.
 
 **`free_ratio_first` — FreeRatioFirstAllocationStrategy (Best-of-N)**
 
@@ -426,13 +360,21 @@ For grouped objects, memory eviction resolves the current group membership and a
 
 ## Lease
 
-To avoid data conflicts, a per-object lease is granted whenever an `ExistKey` request or a `GetReplicaListRequest` request succeeds. While the lease is active, the object is protected from `Remove`, `RemoveAll`, and `Eviction` operations. Specifically, a `Remove` request targeting a leased object will fail, and a `RemoveAll` request will only delete objects without an active lease. This ensures that the object’s data can be safely read as long as the lease has not expired.
+A readable hit from `ExistKey` or `GetReplicaList` extends the object's read
+lease. Grouped objects share a lease, so a hit on one member extends protection
+for the group. `PutEnd` updates the lease deadline with a zero TTL and preserves
+any later deadline already in effect.
 
-For grouped objects, a successful `ExistKey` or `GetReplicaList` refreshes the lease for the current members of the group, so recently accessed members are less likely to be separated by memory eviction.
+Active leases protect objects during Master-managed memory eviction and
+ordinary removal. Passing `force=true` to `Remove`, `RemoveByRegex`, or
+`RemoveAll` bypasses the lease check. These operations still enforce replica
+completion and replication-task checks.
 
-However, if the lease expires before a `Get` operation finishes reading the data, the operation will be considered failed, and no data will be returned, in order to prevent potential data corruption.
+The client checks the lease after the transfer and reports `LEASE_EXPIRED`
+when a `Get` outlasts it.
 
-The default lease TTL is 10 seconds and is configurable via a startup parameter of `master_service`.
+The default read lease TTL is 10 seconds. Set `--default_kv_lease_ttl` on
+`mooncake_master` to change it.
 
 ## Soft Pin
 
@@ -441,6 +383,8 @@ For important and frequently used objects, such as system prompts, Mooncake Stor
 The soft-pin lifetime starts when the first replica becomes readable. When its deadline is reached, the object becomes ordinary cache; later reads grant only an ordinary read lease and do not reactivate soft pinning. A later write can explicitly enable it again.
 
 Soft pin is runtime-only eviction-priority state. It is not persisted in snapshots or the HA OpLog, so recovery and Standby promotion downgrade restored objects to ordinary cache. Existing snapshot fields are retained only for format compatibility and ignored during recovery.
+
+An explicitly started drain job can move a soft-pinned object's replicas to other segments. The job copies the data to the destination before retiring the source replica. The object retains its soft pin and TTL throughout the move.
 
 There are three startup parameters in `master_service` related to the soft pin mechanism:
 
@@ -475,15 +419,15 @@ Both the client and master must support `BatchUpdateSoftPin`.
 
 ## Hard Pin
 
-For objects that must never be evicted under any circumstances (e.g., model weights, critical metadata), Mooncake Store provides a hard pin mechanism. Unlike soft pin, hard-pinned objects are permanently protected from eviction — they will never be selected as eviction candidates regardless of memory pressure.
+The Master skips hard-pinned objects during capacity-driven memory eviction.
+Set `ReplicateConfig::with_hard_pin` when creating an object. An in-place
+`Upsert` keeps the current pin. An `Upsert` that allocates a replacement
+preserves an existing pin and can enable one through `with_hard_pin`.
 
-Hard pin is set at object creation time through the `with_hard_pin` field in `ReplicateConfig` and cannot be changed afterward. Hard-pinned objects can only be removed explicitly via `Remove` (with force) or `RemoveAll`.
+A hard pin has no expiry. Explicit removal of a hard-pinned object follows the
+normal removal rules, including the lease and replica-state checks.
 
-Key differences from soft pin:
-
-- Hard pin never expires. Soft pin expires at a fixed deadline that starts when the first replica becomes readable, regardless of later accesses.
-- Hard-pinned objects are completely skipped during eviction. Soft-pinned objects may still be evicted when no other candidates are available.
-- Hard pin is immutable once set. Soft pin can be explicitly preserved, enabled, or disabled by write requests; reads do not refresh or reactivate it.
+An explicitly started drain job can move a hard-pinned object's replicas to other segments. The job copies the data to the destination before retiring the source replica. The object retains its hard pin throughout the move.
 
 ## Zombie Object Cleanup
 
@@ -501,32 +445,26 @@ Replica space allocated during a `PutStart` is considered releasable by the Mast
 
 Mooncake Store provides a **preferred segment allocation** feature that allows users to specify a preferred storage segment (node) for object allocation. This feature is particularly useful for optimizing data locality and reducing network overhead in distributed scenarios.
 
-The preferred segment allocation feature is implemented through the
-`AllocationStrategy` system. The following excerpt shows the legacy
-single-segment field and the memory-replica count used by this path; other
-`ReplicateConfig` fields are omitted:
+`ReplicateConfig::preferred_segments` lists preferred memory segments in order.
+The legacy `preferred_segment` field takes precedence if it is nonempty.
+`preferred_nof_segments` supplies the preferences for NoF replicas.
 
 ```cpp
 struct ReplicateConfig {
     size_t replica_num{1};                    // Number of memory replicas
-    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
-    std::optional<uint64_t> soft_pin_ttl_ms{}; // ENABLE override; omitted uses the Master default
-    bool with_hard_pin{false};               // Whether to enable hard pin (never evicted)
-    std::string preferred_segment{};         // Preferred segment for allocation
-    // Other fields, including nof_replica_num and dfs_replica_num, are omitted.
+    std::vector<std::string> preferred_segments{};
+    std::string preferred_segment{};         // Legacy single-segment preference
+    std::vector<std::string> preferred_nof_segments{};
+    // Other fields are omitted.
 };
 ```
 
-When a `Put` operation is initiated with a non-empty `preferred_segment` value, the allocation strategy follows this process:
-
-1. **Preferred Allocation Attempt**: The system first attempts to allocate space from the specified preferred segment. If the preferred segment has sufficient available space, the allocation succeeds immediately.
-
-2. **Fallback to Random Allocation**: If the preferred segment is unavailable, full, or doesn't exist, the system automatically falls back to the standard random allocation strategy among all available segments.
-
-3. **Retry Logic**: The allocation strategy includes built-in retry mechanisms with up to 10 attempts to find suitable storage space across different segments.
-
-- **Data Locality**: By preferring local segments, applications can reduce network traffic and improve access performance for frequently used data.
-- **Load Balancing**: Applications can distribute data across specific nodes to achieve better load distribution.
+Successful preferred allocations fill replica slots. The selected strategy
+determines how to place the remaining replicas. `random` uses its random
+candidate scan, and the free-ratio strategies rank candidates first. For a
+single memory replica, `local_first` adds a host-ordered list after the
+explicit preferences.
+`cxl` uses the first preferred segment as its allocation target.
 
 ## Multi-layer Storage Support
 
@@ -618,14 +556,20 @@ fallback to POSIX. See the [HF3FS USRBIO adapter guide](../../getting_started/pl
 for build prerequisites and configuration.
 
 ## Builtin Metadata Server
-Mooncake Store provides a built-in HTTP metadata server as an alternative to etcd for storing cluster metadata. This feature is particularly useful for development environments or scenarios where etcd is not available.
+
+The built-in HTTP metadata server provides a key-value endpoint for Transfer
+Engine peer discovery and connection metadata. It can replace an external
+etcd or Redis service used for that purpose. The Master keeps Store object
+metadata in its tenant routes and configures any HA election and OpLog backend
+separately.
+
 ### Configuration Parameters
 The HTTP metadata server can be configured using the following parameters:
-- **`enable_http_metadata_server`** (boolean, default: `false`): Enables the built-in HTTP metadata server instead of using etcd. When set to `true`, the master service will start an embedded HTTP server that handles metadata operations.
+- **`enable_http_metadata_server`** (boolean, default `false`) starts the embedded Transfer Engine metadata endpoint.
 - **`http_metadata_server_port`** (integer, default: `8080`): Specifies the TCP port on which the HTTP metadata server will listen for incoming connections. This port must be available and not conflict with other services.
 - **`http_metadata_server_host`** (string, default: `"0.0.0.0"`): Specifies the host address for the HTTP metadata server to bind to. Use `"0.0.0.0"` to listen on all available network interfaces, or specify a specific IP address for security purposes.
 ### Environment Variables
-- MC_STORE_CLUSTER_ID: Identify the metadata when multiple cluster share the same master, default 'mooncake'.
+- `MC_STORE_CLUSTER_ID`: Selects the client's HA leader-discovery namespace and labels client metrics. Discovery defaults to `mooncake_cluster` when unset or empty; it must match the masters' `--cluster_id`. See {ref}`HA client addressing <store-ha-etcd-deployment>`.
 - MC_STORE_MEMCPY: Enables or disables local memcpy optimization, set to 1/true to enable, 0/false to disable.
 - MC_STORE_CLIENT_METRIC: Enables client metric reporting, enabled by default; set to 0/false to disable.
 - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds, default 0 (collects but does not report).
@@ -643,8 +587,11 @@ To start the master service with the HTTP metadata server enabled:
     --http_metadata_server_port=8080 \
     --http_metadata_server_host=0.0.0.0
 ```
-When enabled, the HTTP metadata server will start automatically and provide metadata services for the Mooncake Store cluster. This eliminates the need for an external etcd deployment, simplifying the setup process for development and testing environments.
-Note that the HTTP metadata server is designed for single-node deployments and does not provide the high availability features that etcd offers. For production environments requiring high availability, etcd is still the recommended choice.
+Point each client's Transfer Engine `metadata_server` at
+`http://<master-host>:8080/metadata`. For Master HA, configure
+`--enable_ha` and the `--ha_backend_type` and `--ha_backend_connstring`
+settings as described in the
+[deployment guide](../../deployment/mooncake-store-deployment-guide.md).
 
 For detailed guidance on monitoring master metrics, Prometheus endpoints, and health checks, see the [Observability guide](../../getting_started/observability.md).
 
@@ -668,248 +615,216 @@ For Python, C++, and HTTP API signatures, parameter details, and usage examples,
 - [Mooncake Store C++ API Reference](../../api-reference/cpp/mooncake-store.md)
 - [Mooncake Store HTTP Service](../../api-reference/http/http-service.md)
 
+(store-master-rpc)=
 ### Master Service APIs
 
-The protobuf definition between Master and Client is as follows:
+The C++ Store client calls `WrappedMasterService` handlers over YLT
+`coro_rpc`, with arguments and results serialized by `struct_pack`.
+The signatures below are selected control-plane handlers. The full handler set
+is in [`rpc_service.h`](gh-file:mooncake-store/include/rpc_service.h) and
+[`RegisterRpcService`](gh-file:mooncake-store/src/rpc_service.cpp).
+Data transfers happen separately through the locations returned by the Master.
 
-```protobuf
-message BufHandle {
-  required uint64 segment_name = 1;  // Storage segment name (can be simply understood as the name of the storage node)
-  required uint64 size = 2;          // Size of the allocated space
-  required uint64 buffer = 3;        // Pointer to the allocated space
+A handler returning `tl::expected<T, ErrorCode>` returns either a value or a
+Store error. Batch query, Put, and Upsert handlers return one result per input
+in input order. For handlers that take a tenant, the default is `"default"`.
+When multi-tenancy is disabled, the Master resolves requests to that namespace.
 
-  enum BufStatus {
-    INIT = 0;          // Initial state, space reserved but not used
-    COMPLETE = 1;      // Completed usage, space contains valid data
-    FAILED = 2;        // Usage failed, upstream should update the handle state to this value
-    UNREGISTERED = 3;  // Space has been unregistered, metadata deleted
-  }
-  required BufStatus status = 4 [default = INIT]; // Space status
-};
+#### Replica queries
 
-message ReplicaInfo {
-  repeated BufHandle handles = 1; // Specific locations of the stored object data
+```cpp
+tl::expected<
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+    ErrorCode>
+GetReplicaListByRegex(const std::string& str,
+                      const std::string& tenant_id = "default");
 
-  enum ReplicaStatus {
-    UNDEFINED = 0;   // Uninitialized
-    INITIALIZED = 1; // Space allocated, waiting for write
-    PROCESSING = 2;  // Writing data in progress
-    COMPLETE = 3;    // Write completed, replica available
-    REMOVED = 4;     // Replica has been removed
-    FAILED = 5;      // Replica write failed, consider reallocation
-  }
-  required ReplicaStatus status = 2 [default = UNDEFINED]; // Replica status
-};
+tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
+    const std::string& key, const std::string& tenant_id = "default");
 
-service MasterService {
-  // Get the list of replicas for an object
-  rpc GetReplicaList(GetReplicaListRequest) returns (GetReplicaListResponse);
-
-  // Get replica lists for objects matching a regex
-  rpc GetReplicaListByRegex(GetReplicaListByRegexRequest) returns (GetReplicaListByRegexResponse);
-
-  // Batch query IP addresses for multiple client IDs
-  rpc BatchQueryIp(BatchQueryIpRequest) returns (BatchQueryIpResponse);
-
-  // Batch clear replicas for multiple object keys
-  rpc BatchReplicaClear(BatchReplicaClearRequest) returns (BatchReplicaClearResponse);
-
-  // Start Put operation, allocate storage space
-  rpc PutStart(PutStartRequest) returns (PutStartResponse);
-
-  // End Put operation, mark object write completion
-  rpc PutEnd(PutEndRequest) returns (PutEndResponse);
-
-  // Delete all replicas of an object
-  rpc Remove(RemoveRequest) returns (RemoveResponse);
-
-  // Remove objects matching a regex
-  rpc RemoveByRegex(RemoveByRegexRequest) returns (RemoveByRegexResponse);
-
-  // Storage node (Client) registers a storage segment
-  rpc MountSegment(MountSegmentRequest) returns (MountSegmentResponse);
-
-  // Storage node (Client) unregisters a storage segment
-  rpc UnmountSegment(UnmountSegmentRequest) returns (UnmountSegmentResponse);
-}
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+BatchGetReplicaList(const std::vector<std::string>& keys,
+                    const std::string& tenant_id = "default");
 ```
 
-1. GetReplicaList
+`GetReplicaList` returns readable replicas and grants a read lease.
+[`GetReplicaListResponse`](gh-file:mooncake-store/include/rpc_types.h)
+contains `replicas`, `lease_ttl_ms`, an optional `object_checksum`, and the
+compatible `resolved_tenant_id` field used to verify local-disk replicas under
+the correct tenant. Each
+[`Replica::Descriptor`](gh-file:mooncake-store/include/replica.h)
+contains a replica ID, status, and a location variant for memory, NoF, legacy
+disk, local disk, or DFS. `BatchGetReplicaList` returns the same response type
+per key.
 
-```protobuf
-message GetReplicaListRequest {
-  required string key = 1;
-};
+`GetReplicaListByRegex` searches keys in the resolved tenant using an
+ECMAScript regular expression. It returns a map of keys to readable replica
+descriptors and grants a lease for each returned key. The read-only
+`GetReplicaListForAdmin` and `BatchGetReplicaListForAdmin` variants query
+replicas without granting leases or triggering promotion.
 
-message GetReplicaListResponse {
-  required int32 status_code = 1;
-  repeated ReplicaInfo replica_list = 2; // List of replica information
-};
+#### Put and Upsert
+
+```cpp
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
+    const UUID& client_id, const std::string& key,
+    const uint64_t slice_length, const ReplicateConfig& config,
+    const std::string& tenant_id = "default");
+
+tl::expected<void, ErrorCode> PutEnd(
+    const UUID& client_id, const ObjectMeta& object_meta,
+    ReplicaType replica_type = ReplicaType::ALL,
+    const std::string& tenant_id = "default");
+
+tl::expected<void, ErrorCode> PutRevoke(
+    const UUID& client_id, const std::string& key,
+    ReplicaType replica_type = ReplicaType::ALL,
+    const std::string& tenant_id = "default");
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
+              const std::vector<uint64_t>& slice_lengths,
+              const ReplicateConfig& config,
+              const std::string& tenant_id = "default");
+
+std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
+    const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
+    ReplicaType replica_type = ReplicaType::ALL,
+    const std::string& tenant_id = "default");
+
+std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    ReplicaType replica_type = ReplicaType::ALL,
+    const std::string& tenant_id = "default");
+
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
+    const UUID& client_id, const std::string& key,
+    const uint64_t slice_length, const ReplicateConfig& config,
+    const std::string& tenant_id = "default");
+
+tl::expected<void, ErrorCode> UpsertEnd(
+    const UUID& client_id, const ObjectMeta& object_meta,
+    ReplicaType replica_type = ReplicaType::ALL,
+    const std::string& tenant_id = "default");
+
+tl::expected<void, ErrorCode> UpsertRevoke(
+    const UUID& client_id, const std::string& key,
+    ReplicaType replica_type = ReplicaType::ALL,
+    const std::string& tenant_id = "default");
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+BatchUpsertStart(const UUID& client_id,
+                 const std::vector<std::string>& keys,
+                 const std::vector<uint64_t>& slice_lengths,
+                 const ReplicateConfig& config,
+                 const std::string& tenant_id = "default");
+
+std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
+    const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
+    const std::string& tenant_id = "default");
+
+std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id = "default");
 ```
 
-- **Request**: `GetReplicaListRequest` containing the key to query.
-- **Response**: `GetReplicaListResponse` containing the status code status_code and the list of replica information `replica_list`.
-- **Description**: Used to retrieve information about all available replicas for a specified key. The Client can select an appropriate replica for reading based on this information.
+(store-put-start-replica-allocation)=
+##### PutStart replica allocation rules
 
-2. GetReplicaListByRegex
+The client sums the sizes of an object's input slices before calling
+`PutStart`. The RPC's `slice_length` is that total in bytes. `BatchPutStart`
+carries one total length per key. Each allocated replica holds the complete
+object, and segment placement applies to replicas within each tier.
 
-```protobuf
-message GetReplicaListByRegexRequest {
-  required string key_regex = 1;
-};
+| Requested replicas | Allocation required to proceed |
+|---|---|
+| Memory only (`nof_replica_num=0`, `dfs_replica_num=0`) | At least one memory replica. A request for three memory replicas can proceed with one or two. |
+| Flexible dual replica (`replica_num=1`, `nof_replica_num=1`, `dfs_replica_num=0`) | At least one of the two replicas. Either memory or NoF alone is sufficient. |
+| All other requests involving NoF or DFS | The exact requested memory and NoF counts, plus a DFS allocation if requested. |
 
-message ObjectReplicaList {
-  repeated ReplicaInfo replica_list = 1;
-};
+If the required memory or NoF allocation falls short, `PutStart` returns
+`NO_AVAILABLE_HANDLE`. A DFS allocation failure also fails the request if it
+persists after any applicable retry. If allocation proceeds with fewer memory
+or NoF replicas than requested, the Master logs
+`action=put_start_partial_allocation` and increments
+`master_put_start_partial_allocations_total`.
 
-message GetReplicaListByRegexResponse {
-  required int32 status_code = 1;
-  map<string, ObjectReplicaList> object_map = 2; // Matched objects and their replica information.
-};
+##### Write completion
+
+The client writes to the descriptors returned by `PutStart`. For ordinary
+`Put` and `BatchPut` operations, all allocated memory, NoF, and DFS replicas
+must be written successfully, including when a memory-only request was
+allocated fewer replicas than requested. In flexible dual-replica mode, the
+client can complete the write with one successful replica and revoke a failed
+replica on the other tier.
+
+After transferring the data, the writer calls `PutEnd` with the key and optional
+checksum in [`ObjectMeta`](gh-file:mooncake-store/include/rpc_types.h).
+`replica_type` selects which replicas to complete. The `ALL` selector targets
+memory, NoF, and DFS write replicas. On failure, the writer can call
+`PutRevoke` to cancel pending replicas.
+
+Upsert uses the same start, transfer, and completion sequence. A missing key
+follows the insert path. An existing object can reuse its allocation when it
+is eligible for an in-place update. The Master can also allocate a replacement
+when the write needs a new allocation. `BatchUpsertEnd` and
+`BatchUpsertRevoke` use the `ALL` selector internally.
+
+#### Removal
+
+```cpp
+tl::expected<void, ErrorCode> Remove(
+    const std::string& key, bool force = false,
+    const std::string& tenant_id = "default");
+
+tl::expected<long, ErrorCode> RemoveByRegex(
+    const std::string& str, bool force = false,
+    const std::string& tenant_id = "default");
 ```
 
-- **Request**: GetReplicaListByRegexRequest, which contains the regular expression key_regex to be matched.
-- **Response**: GetReplicaListByRegexResponse, which contains a status_code and an object_map. The keys of this map are the successfully matched object keys, and the values are the lists of replica information for each key.
-- **Description**: Used to query for all keys and their replica information that match the specified regular expression. This interface facilitates bulk queries and management.
+`Remove` removes the specified object and its replicas. `RemoveByRegex`
+searches keys in the resolved tenant and returns the number of objects removed.
+Setting `force=true` bypasses the lease check. Both operations still check
+replica completion and in-flight replication tasks.
 
-3. BatchQueryIp
+#### Segment registration
 
-```protobuf
-message BatchQueryIpRequest {
-  repeated UUID client_ids = 1; // List of client IDs to query
-};
+```cpp
+tl::expected<void, ErrorCode> MountSegment(
+    const Segment& segment, const UUID& client_id);
 
-message BatchQueryIpResponse {
-  required int32 status_code = 1;
-  map<UUID, IPAddressList> client_ip_map = 2; // Map from client ID to their IP address lists
-};
-
-message IPAddressList {
-  repeated string ip_addresses = 1; // List of unique IP addresses
-};
+tl::expected<void, ErrorCode> UnmountSegment(
+    const UUID& segment_id, const UUID& client_id);
 ```
 
-- **Request**: `BatchQueryIpRequest` containing a list of client IDs to query.
-- **Response**: `BatchQueryIpResponse` containing the status code `status_code` and a `client_ip_map`. The keys of this map are the client IDs that have successfully mounted segments, and the values are lists of unique IP addresses extracted from all segments mounted by each client. Client IDs that have no mounted segments or are not found are silently skipped and not included in the result map.
-- **Description**: Used to batch query the IP addresses for multiple client IDs. For each client ID in the input list, this interface retrieves the unique IP addresses from all segments mounted by that client.
+After registering a memory region with the Transfer Engine, the storage client
+calls `MountSegment` with its client ID and a
+[`Segment`](gh-file:mooncake-store/include/types.h). The segment
+includes its UUID, logical name, base address, size, transport endpoint,
+protocol, host ID, and optional locality. `UnmountSegment` identifies the
+mounted resource by its segment UUID and client ID.
 
-4. BatchReplicaClear
+#### Batch maintenance
 
-```protobuf
-message BatchReplicaClearRequest {
-  repeated string object_keys = 1; // List of object keys to clear
-  required UUID client_id = 2;     // Client ID that owns the objects
-  optional string segment_name = 3; // Optional segment name. If empty, clears all segments
-};
+```cpp
+tl::expected<
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+    ErrorCode>
+BatchQueryIp(const std::vector<UUID>& client_ids);
 
-message BatchReplicaClearResponse {
-  required int32 status_code = 1;
-  repeated string cleared_keys = 2; // List of object keys that were successfully cleared
-};
+tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& segment_name,
+    const std::string& tenant_id = "default");
 ```
 
-- **Request**: `BatchReplicaClearRequest` containing a list of object keys to clear, the client ID that owns the objects, and an optional segment name. If `segment_name` is empty, all replicas of the specified objects are cleared (the objects are deleted entirely). If `segment_name` is provided, only replicas located on that specific segment are cleared.
-- **Response**: `BatchReplicaClearResponse` containing the status code `status_code` and a list of `cleared_keys` representing the object keys that were successfully cleared. Only objects that belong to the specified `client_id`, have expired leases, and meet the clearing criteria are included in the result. Objects with active leases, incomplete replicas (when clearing all segments), or belonging to different clients are silently skipped.
-- **Description**: Used to batch clear replicas for multiple object keys belonging to a specific client ID. This interface allows clearing replicas either on a specific segment or across all segments, providing flexible storage resource management capabilities.
+`BatchQueryIp` returns the distinct IP addresses derived from each client's
+mounted segments. The response omits clients without matching segments.
 
-5. PutStart
-
-```protobuf
-message PutStartRequest {
-  required string key = 1;             // Object key
-  required int64 value_length = 2;     // Total length of data to be written
-  required ReplicateConfig config = 3; // Replica configuration information
-  repeated uint64 slice_lengths = 4;   // Lengths of each data slice
-};
-
-message PutStartResponse {
-  required int32 status_code = 1;
-  repeated ReplicaInfo replica_list = 2;  // Replica information allocated by the Master Service
-};
-```
-
-- **Request**: `PutStartRequest` containing the key, data length, and replica configuration config.
-- **Response**: `PutStartResponse` containing the status code status_code and the allocated replica information replica_list.
-- **Description**: Before writing an object, the Client must call PutStart to request storage space from the Master Service. The Master Service allocates space based on the config and returns the allocation results (`replica_list`) to the Client. The allocation strategy ensures that each slice of the object is placed in different segments, while operating on a best-effort basis - if insufficient space is available for all requested replicas, as many replicas as possible will be allocated. The Client then writes data to the storage nodes where the allocated replicas are located. The need for both start and end steps ensures that other Clients do not read partially written values, preventing dirty reads.
-
-6. PutEnd
-
-```protobuf
-message PutEndRequest {
-  required string key = 1;
-};
-
-message PutEndResponse {
-  required int32 status_code = 1;
-};
-```
-
-- **Request**: `PutEndRequest` containing the key.
-- **Response**: `PutEndResponse` containing the status code status_code.
-- **Description**: After the Client completes data writing, it calls `PutEnd` to notify the Master Service. The Master Service updates the object's metadata, marking the replica status as `COMPLETE`, indicating that the object is readable.
-
-7. Remove
-
-```protobuf
-message RemoveRequest {
-  required string key = 1;
-};
-
-message RemoveResponse {
-  required int32 status_code = 1;
-};
-```
-
-- **Request**: `RemoveRequest` containing the key of the object to be deleted.
-- **Response**: `RemoveResponse` containing the status code `status_code`.
-- **Description**: Used to delete the object and all its replicas corresponding to the specified key. The Master Service marks all replicas of the corresponding object as deleted.
-
-8. RemoveByRegex
-
-```protobuf
-message RemoveByRegexRequest {
-  required string key_regex = 1;
-};
-
-message RemoveByRegexResponse {
-  required int32 status_code = 1;
-  optional int64 removed_count = 2; // The number of objects removed.
-};
-```
-
-- **Request**: RemoveByRegexRequest, which contains the regular expression key_regex to be matched.
-- **Response**: RemoveByRegexResponse, which contains a status_code and the number of objects that were removed, removed_count.
-- **Description**: Used to delete all objects and their corresponding replicas for keys that match the specified regular expression. Similar to the Remove interface, this is a metadata operation where the Master Service marks the status of all matched object replicas as removed.
-
-9. MountSegment
-
-```protobuf
-message MountSegmentRequest {
-  required uint64 buffer = 1;       // Starting address of the space
-  required uint64 size = 2;         // Size of the space
-  required string segment_name = 3; // Storage segment name
-}
-
-message MountSegmentResponse {
-  required int32 status_code = 1;
-};
-```
-
-The storage node (Client) allocates a segment of memory and, after calling `TransferEngine::registerLocalMemory` to complete local mounting, calls this interface to mount the allocated continuous address space to the Master Service for allocation.
-
-10. UnmountSegment
-
-```protobuf
-message UnmountSegmentRequest {
-  required string segment_name = 1;  // Storage segment name used during mounting
-}
-
-message UnMountSegmentResponse {
-  required int32 status_code = 1;
-};
-```
-
-When the space needs to be released, this interface is used to remove the previously mounted resources from the Master Service.
+`BatchReplicaClear` returns the keys for which replica clearing succeeded.
+It checks that the client owns the object and that its lease has expired.
+An empty `segment_name` clears the entire object if all its replicas are
+complete. A nonempty name clears completed replicas on that segment.
 
 ---
 

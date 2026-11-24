@@ -573,12 +573,26 @@ curl -X PUT http://localhost:9003/api/v1/dfs/shard_count \
 
 ### Drain Job Endpoints
 
-Drain jobs migrate all objects away from one or more segments so they can be
-unmounted safely. Job states follow `CREATED -> PLANNING -> RUNNING ->
-SUCCEEDED | FAILED | CANCELED`.
+Drain jobs move replicas, including those of hard-pinned or soft-pinned objects, off one or
+more segments so the segments can be unmounted safely. Hard-pinned and soft-pinned objects
+retain their eviction protection and TTL after the move.
+
+A job starts in `CREATED` and normally progresses through `PLANNING` and
+`RUNNING`. It reaches `SUCCEEDED` once the source segments are empty and their
+allocations have been reclaimed. If the sources are already empty, it can go
+directly from `CREATED` to `SUCCEEDED`. It reaches `FAILED` when all remaining
+migration units have exhausted their retry budgets.
+
+A cancellation request or an expired deadline moves a job from `CREATED`,
+`PLANNING`, or `RUNNING` to `CANCELING`. Once in-flight tasks have stopped and
+cleanup is complete, the job reaches `CANCELED` for a user cancellation or
+`TIMED_OUT` for a deadline. After a timeout, unfinished source segments stay
+`DRAINING` so a new job can resume draining them.
 
 #### `POST /api/v1/drain_jobs`
-Create a drain job for the given segments.
+Create an untimed drain job for the given segments. To set a deadline, use
+{ref}`the Python DrainJob API <python-timed-drain-job>` with `timeout_ms`, or use
+`mooncake_store_create_timed_drain_job()` in C.
 
 **Method**: `POST`
 **Content-Type**: `application/json; charset=utf-8`
@@ -614,7 +628,8 @@ curl -X POST http://localhost:9003/api/v1/drain_jobs \
 ```
 
 #### `GET /api/v1/drain_jobs/query`
-Query the status and progress of a drain job.
+Query the status and progress of a drain job, including timed jobs created
+through the native APIs.
 
 **Method**: `GET`
 **Parameters**: `job_id` (query parameter) - UUID returned by the create call
@@ -648,7 +663,9 @@ curl "http://localhost:9003/api/v1/drain_jobs/query?job_id=00000000-0000-0000-00
 
 **Fields**:
 - `type` / `type_name` (integer / string): Job type; currently always `DRAIN` (0)
-- `status` / `status_name` (integer / string): Job status. One of `CREATED` (0), `PLANNING` (1), `RUNNING` (2), `SUCCEEDED` (3), `FAILED` (4), `CANCELED` (5)
+- `status` / `status_name` (integer / string): Job status. One of
+  `CREATED` (0), `PLANNING` (1), `RUNNING` (2), `SUCCEEDED` (3),
+  `FAILED` (4), `CANCELED` (5), `CANCELING` (6), or `TIMED_OUT` (7).
 - `succeeded_units` / `failed_units` / `blocked_units` / `active_units` (integer): Per-object migration counters
 - `migrated_bytes` (integer): Total bytes migrated so far
 - `message` (string): Additional status or error message
@@ -663,8 +680,9 @@ curl "http://localhost:9003/api/v1/drain_jobs/query?job_id=00000000-0000-0000-00
 ```
 
 #### `POST /api/v1/drain_jobs/cancel`
-Cancel a running drain job. Objects already migrated stay migrated; objects not
-yet migrated remain on the source segments.
+Request cancellation of a drain job. Objects already migrated stay migrated.
+The response can report `CANCELING` while in-flight tasks stop and cleanup
+finishes. Query the job to check its terminal state.
 
 **Method**: `POST`
 **Parameters**: `job_id` (query parameter) - UUID returned by the create call

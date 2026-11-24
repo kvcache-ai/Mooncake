@@ -784,6 +784,7 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
         return -1.0;
     }
     std::vector<TransferRequest> requests;
+    requests.reserve(batch_size);
     for (uint64_t i = 0; i < batch_size; ++i) {
         TransferRequest entry;
         entry.opcode =

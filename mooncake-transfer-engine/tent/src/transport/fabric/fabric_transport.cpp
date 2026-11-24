@@ -745,9 +745,13 @@ Status FabricTransport::addMemoryBuffer(BufferDesc& desc,
         Platform::getLoader().getMemoryType(reinterpret_cast<void*>(desc.addr));
     if (mtype == MTYPE_CUDA) {
 #if defined(USE_CUDA)
-        if (hmem_)
-            cuda_device =
-                getCudaDeviceForPtr(reinterpret_cast<void*>(desc.addr));
+        if (hmem_) {
+            CudaPointerInfo info;
+            if (getCudaPointerInfo(reinterpret_cast<void*>(desc.addr), info) ==
+                    CUDA_SUCCESS &&
+                info.isCuda())
+                cuda_device = info.device;
+        }
 #endif
         // Leave it to other transports.
         if (cuda_device < 0) return Status::OK();

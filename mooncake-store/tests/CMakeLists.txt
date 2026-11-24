@@ -67,6 +67,14 @@ if(USE_MLU)
     add_test(NAME ${mlu_test} COMMAND ${mlu_test})
   endforeach()
 endif()
+add_store_test(real_client_shutdown_test real_client_shutdown_test.cpp)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT BUILD_SHARED_LIBS)
+  target_compile_definitions(real_client_shutdown_test
+                             PRIVATE MOONCAKE_TEST_WRAP_UNREGISTER)
+  target_link_options(
+    real_client_shutdown_test PRIVATE
+    "-Wl,--wrap=_ZN8mooncake6Client21unregisterLocalMemoryEPvb")
+endif()
 add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
 add_store_test(read_singleflight_test read_singleflight_test.cpp)
 add_store_test(real_client_direct_read_test real_client_direct_read_test.cpp)
@@ -357,6 +365,20 @@ if(USE_TENT)
   set_tests_properties(standalone_client_tent_test
                        PROPERTIES ENVIRONMENT "MC_USE_TENT=1;MC_FORCE_TCP=1")
 endif()
+# Store over TENT UB without hardware. Keep UB-only assertions separate from
+# the general Store integration and hugepage regression suites.
+if(USE_TENT AND USE_UB_MOCK)
+  add_store_test(store_tent_ub_mock_test store_tent_ub_mock_test.cpp)
+  target_link_libraries(store_tent_ub_mock_test PRIVATE tent)
+  target_include_directories(
+    store_tent_ub_mock_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/tent/tests/ub_mock)
+  set(STORE_UB_MOCK_ENV
+      "MC_USE_TENT=1;MC_TENT_UB_MOCK=1;MC_TENT_CONF={\"transports\":{\"tcp\":{\"enable\":false},\"rdma\":{\"enable\":false},\"hp_tcp\":{\"enable\":false},\"shm\":{\"enable\":false},\"io_uring\":{\"enable\":false},\"ub\":{\"enable\":true}}}"
+  )
+  set_tests_properties(store_tent_ub_mock_test
+                       PROPERTIES ENVIRONMENT "${STORE_UB_MOCK_ENV}" TIMEOUT 300)
+endif()
 if(USE_CUDA)
   target_compile_definitions(pybind_client_test PRIVATE MOONCAKE_TEST_CUDA_H2D)
   target_link_libraries(pybind_client_test PRIVATE CUDA::cudart)
@@ -619,6 +641,8 @@ add_ha_test(oplog_types_test ha/oplog/oplog_types_test.cpp)
 add_ha_test(oplog_batch_codec_test ha/oplog/oplog_batch_codec_test.cpp)
 add_ha_test(oplog_batch_standby_reader_test
             ha/oplog/oplog_batch_standby_reader_test.cpp)
+add_ha_test(batch_oplog_pruning_worker_test
+            ha/oplog/batch_oplog_pruning_worker_test.cpp)
 add_ha_test(ordered_oplog_writer_test ha/oplog/ordered_oplog_writer_test.cpp)
 if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
   target_compile_definitions(ha_metric_manager_test

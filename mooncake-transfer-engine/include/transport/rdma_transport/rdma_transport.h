@@ -186,6 +186,15 @@ class RdmaTransport : public Transport {
     void notifyWorkerThread();
 
    public:
+    // MC_RDMA_WRITE_PREFER_DEST_NIC: selectDevice() on the peer for a WRITE's
+    // destination range. `nic` names the HCA the peer's topology picks when
+    // the range lies in one of its GPU buffers, and is empty otherwise; it
+    // points into the peer's HCA list.
+    static int selectDestinationNic(SegmentDesc *peer, uint64_t offset,
+                                    size_t length, std::string_view &nic,
+                                    int &buffer_id, int &device_id,
+                                    int hint_buffer_id = -1,
+                                    int hint_device_id = -1);
     static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
                             int &buffer_id, int &device_id, int retry_cnt = 0,
                             int hint_buffer_id = -1, int hint_device_id = -1);

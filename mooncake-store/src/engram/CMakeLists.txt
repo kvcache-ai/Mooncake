@@ -9,7 +9,8 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
 endif()
 enable_language(CUDA)
 
-pybind11_add_module(_engram_cuda engram_local_cuda.cpp engram_local_cuda.cu)
+nanobind_add_module(_engram_cuda ${MOONCAKE_NANOBIND_ABI} engram_local_cuda.cpp
+                    engram_local_cuda.cu)
 set_target_properties(_engram_cuda PROPERTIES CUDA_STANDARD 17 INSTALL_RPATH
                                                                "$ORIGIN")
 target_include_directories(
