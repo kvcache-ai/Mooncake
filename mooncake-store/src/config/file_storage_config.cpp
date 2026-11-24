@@ -120,6 +120,15 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.heartbeat_interval_seconds =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS,
                         config.heartbeat_interval_seconds);
+    const auto busy_poll_interval_ms =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_BUSY_POLL_INTERVAL_MS,
+                        config.heartbeat_busy_poll_interval_ms);
+    if (busy_poll_interval_ms == 0) {
+        LOG(WARNING) << "MOONCAKE_OFFLOAD_BUSY_POLL_INTERVAL_MS must > 0; "
+                        "using default 100";
+    } else {
+        config.heartbeat_busy_poll_interval_ms = busy_poll_interval_ms;
+    }
     config.client_buffer_gc_interval_seconds = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS,
         config.client_buffer_gc_interval_seconds);
@@ -275,6 +284,11 @@ bool FileStorageConfig::Validate() const {
     }
     if (heartbeat_interval_seconds <= 0) {
         LOG(ERROR) << "FileStorageConfig: heartbeat_interval_seconds must > 0";
+        return false;
+    }
+    if (heartbeat_busy_poll_interval_ms == 0) {
+        LOG(ERROR)
+            << "FileStorageConfig: heartbeat_busy_poll_interval_ms must > 0";
         return false;
     }
     if (disk_eviction_low_watermark_ratio <= 0.0 ||

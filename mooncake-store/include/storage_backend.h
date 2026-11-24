@@ -264,6 +264,10 @@ struct FileStorageConfig {
     // Interval between heartbeats sent to the control plane (in seconds)
     uint32_t heartbeat_interval_seconds = 10;
 
+    // Fast offload-only polling after productive work. Promotion and disk
+    // watermark maintenance retain the regular heartbeat cadence.
+    uint32_t heartbeat_busy_poll_interval_ms = 100;
+
     // Interval between client_buffer_gc (in seconds)
     uint32_t client_buffer_gc_interval_seconds = 1;
     uint64_t client_buffer_gc_ttl_ms = 5000;
