@@ -55,9 +55,8 @@ inline thread_local std::optional<RequestContext> g_current_ctx;
 class CurrentCtxScope {
    public:
     CurrentCtxScope() = default;
-    explicit CurrentCtxScope(RequestContext ctx) : saved_(g_current_ctx) {
-        g_current_ctx = std::move(ctx);
-    }
+    explicit CurrentCtxScope(std::optional<RequestContext> ctx)
+        : saved_(std::exchange(g_current_ctx, std::move(ctx))) {}
     ~CurrentCtxScope() { g_current_ctx = std::move(saved_); }
     CurrentCtxScope(const CurrentCtxScope&) = delete;
     CurrentCtxScope& operator=(const CurrentCtxScope&) = delete;

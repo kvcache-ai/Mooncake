@@ -1085,29 +1085,18 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
     if (!shm) {
         return register_external_buffer(buffer, size);
     }
-    if (shm_helper_->is_hugepage()) {
-        const size_t alignment = get_hugepage_size_from_env();
-        if (alignment != 0 &&
-            size > std::numeric_limits<size_t>::max() - (alignment - 1)) {
-            LOG(ERROR) << "Buffer size overflows hugepage alignment";
-            return -1;
-        }
-        size = align_up(size, alignment);
-    }
-    // Check bounds. The buffer must be the segment base and the size must match
-    // either the caller's original request (ShmSegment::requested_size) or the
-    // padded mapping size (shm->size, aligned up to the hugepage/2MB boundary
-    // for SPDK registration). Both are valid: IPC always sends shm->size, and
-    // legacy callers may pass the padded size directly.
-    if (reinterpret_cast<uint8_t*>(buffer) !=
-            reinterpret_cast<uint8_t*>(shm->base_addr) ||
-        (size != shm->requested_size && size != shm->size)) {
-        LOG(ERROR) << "Invalid buffer address or size for registration: "
-                      "Buffer addr: "
-                   << buffer << ", need addr: " << shm->base_addr
-                   << ", buffer size: " << size
-                   << ", need size: " << shm->requested_size
-                   << " (padded: " << shm->size << ")";
+    // A caller can register views into an allocation, such as separate K and
+    // V tensors. The receiver maps the whole segment once via IPC, so the
+    // original allocation base remains the handle for unregistration.
+    const auto offset = reinterpret_cast<uintptr_t>(buffer) -
+                        reinterpret_cast<uintptr_t>(shm->base_addr);
+    const bool padded_segment = offset == 0 && size == shm->size;
+    if (!padded_segment && (offset >= shm->requested_size ||
+                            size > shm->requested_size - offset)) {
+        LOG(ERROR) << "Buffer registration exceeds its shared allocation"
+                   << ", buffer=" << buffer << ", size=" << size
+                   << ", allocation_base=" << shm->base_addr
+                   << ", allocation_size=" << shm->requested_size;
         return -1;
     }
 

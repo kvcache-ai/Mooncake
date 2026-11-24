@@ -7,8 +7,8 @@
 // default, using opentelemetry-cpp's built-in curl client, built with
 // WITH_HTTP_CLIENT_CURL=ON) or OTLP/gRPC (selected via --otlp-traces-protocol
 // grpc, built with WITH_OTLP_GRPC=ON). Both exporters are installed by
-// install_otel.sh. When the macro is undefined everything compiles to no-op
-// stubs.
+// dependencies.sh --with-otel. When the macro is undefined, tracing uses
+// no-op stubs.
 
 #include "tracing.h"
 

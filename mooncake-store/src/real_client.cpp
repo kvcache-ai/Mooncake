@@ -6615,6 +6615,7 @@ RealClient::batch_get_into_dummy_helper(
         std::vector<size_t> sizes;
         std::vector<void *> buffers;
         std::shared_ptr<std::shared_lock<std::shared_mutex>> lock;
+        std::optional<RequestContext> request_context;
         int32_t device_id;
     };
     auto state = std::make_unique<CallState>();
@@ -6622,6 +6623,7 @@ RealClient::batch_get_into_dummy_helper(
     state->sizes = sizes;
     state->buffers = std::move(buffers_result.value());
     state->lock = std::move(lock);
+    state->request_context = get_current_request_context();
     state->device_id = device_id;
 
     auto *s = state.get();
@@ -6634,6 +6636,8 @@ RealClient::batch_get_into_dummy_helper(
                 s->keys.size(), tl::unexpected(context_result.error()));
         }
 #endif
+        // The batch query runs on this worker, outside the RPC thread's scope.
+        CurrentCtxScope request_scope(std::move(s->request_context));
         return batch_get_into_internal(s->keys, s->buffers, s->sizes);
     });
     co_return try_result.value();

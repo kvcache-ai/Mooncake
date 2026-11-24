@@ -88,7 +88,7 @@ class ScopedSpan {
 // "grpc" (OTLP/gRPC); anything other than "grpc" falls back to OTLP/HTTP. An
 // empty endpoint disables tracing (no provider installed, ScopedSpan becomes
 // no-op). Returns true if tracing was enabled. Headers/libs for both exporters
-// are built by install_otel.sh (WITH_OTLP_HTTP=ON, WITH_OTLP_GRPC=ON).
+// are installed by dependencies.sh --with-otel.
 bool InitTracing(const std::string& otlp_endpoint, std::string service_name,
                  const std::string& protocol = "http");
 
