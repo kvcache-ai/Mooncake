@@ -64,7 +64,7 @@ int main() {
         expect(py::isinstance<py::str>(text_key), "utf8 key must be str");
         expect(!py::isinstance<py::bytes>(text_key),
                "utf8 key must not be bytes");
-        expect(text_key.cast<std::string>() == "mooncake_key",
+        expect(py::cast<std::string>(text_key) == "mooncake_key",
                "utf8 key must round-trip");
 
         const std::string binary = Sha256ImageKey();
@@ -77,7 +77,7 @@ int main() {
                "binary key must be bytes");
         expect(!py::isinstance<py::str>(binary_key),
                "binary key must not be str");
-        expect(binary_key.cast<std::string>() == binary,
+        expect(py::cast<std::string>(binary_key) == binary,
                "binary key must keep its bytes");
 
         const std::string embedded_nul("a\0b", 3);
@@ -85,7 +85,7 @@ int main() {
         std::cout << "embedded nul -> " << TypeName(nul_key) << '\n';
         expect(py::isinstance<py::str>(nul_key),
                "nul inside utf8 must stay str");
-        expect(nul_key.cast<std::string>() == embedded_nul,
+        expect(py::cast<std::string>(nul_key) == embedded_nul,
                "nul inside utf8 must be preserved");
 
         py::dict batch;
@@ -93,8 +93,10 @@ int main() {
         batch[binary_key] = 2;
         std::cout << "batch size -> " << batch.size() << '\n';
         expect(batch.size() == 2, "one binary key must not drop the other key");
-        expect(batch["mooncake_key"].cast<int>() == 1, "str key lookup failed");
-        expect(batch[py::bytes(binary.data(), binary.size())].cast<int>() == 2,
+        expect(py::cast<int>(batch["mooncake_key"]) == 1,
+               "str key lookup failed");
+        expect(py::cast<int>(batch[py::bytes(binary.data(), binary.size())]) ==
+                   2,
                "bytes key lookup failed");
 
         bool map_caster_rejects_binary = false;
