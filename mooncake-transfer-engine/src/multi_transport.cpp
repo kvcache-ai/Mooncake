@@ -614,10 +614,6 @@ Status MultiTransport::submitTransfer(
             "event-enabled batch rejects an empty submit");
     }
 
-    std::vector<Transport*> transports;
-    auto select_status = selectTransports(entries, transports);
-    if (!select_status.ok()) return select_status;
-
 #ifdef USE_TCP
     TcpTransport* acknowledged = nullptr;
     if (require_tcp_ack) {
@@ -625,6 +621,18 @@ Status MultiTransport::submitTransfer(
         if (!acknowledged)
             return Status::NotImplemented(
                 "classic TCP transport is unavailable");
+    }
+#else
+    if (require_tcp_ack)
+        return Status::NotImplemented("classic TCP transport is unavailable");
+#endif
+
+    std::vector<Transport*> transports;
+    auto select_status = selectTransports(entries, transports);
+    if (!select_status.ok()) return select_status;
+
+#ifdef USE_TCP
+    if (acknowledged) {
         for (size_t i = 0; i < entries.size(); ++i) {
             if (transports[i] != acknowledged ||
                 entries[i].opcode != TransferRequest::WRITE) {
@@ -632,10 +640,10 @@ Status MultiTransport::submitTransfer(
                     "acknowledged TCP submission requires TCP WRITE entries");
             }
         }
+        auto ack_status =
+            acknowledged->validateAcknowledgedWriteEntries(entries);
+        if (!ack_status.ok()) return ack_status;
     }
-#else
-    if (require_tcp_ack)
-        return Status::NotImplemented("classic TCP transport is unavailable");
 #endif
 
     if (entries.empty()) return Status::OK();

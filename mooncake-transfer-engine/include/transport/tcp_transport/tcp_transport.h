@@ -32,6 +32,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -166,9 +167,6 @@ class TcpTransport : public Transport {
     Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) override;
 
-    Status submitAcknowledgedWriteTasks(
-        const std::vector<TransferTask *> &task_list);
-
     Status submitTransferTaskGroup(
         const std::vector<TransferTask *> &task_list) override;
 
@@ -178,6 +176,13 @@ class TcpTransport : public Transport {
                              TransferStatus &status) override;
 
    private:
+    friend class MultiTransport;
+
+    Status validateAcknowledgedWriteEntries(
+        const std::vector<TransferRequest> &entries) const;
+
+    Status submitAcknowledgedWriteTasks(
+        const std::vector<TransferTask *> &task_list);
     int install(std::string &local_server_name,
                 std::shared_ptr<TransferMetadata> meta,
                 std::shared_ptr<Topology> topo);
@@ -205,8 +210,7 @@ class TcpTransport : public Transport {
                        std::function<void()> continuation = nullptr,
                        bool reuse_connection = false, bool require_ack = false);
 
-    void startTransferSequence(std::vector<Slice *> slices,
-                               bool require_ack = false);
+    void startTransferSequence(std::vector<Slice *> slices, bool require_ack);
     Status submitTasks(const std::vector<TransferTask *> &task_list,
                        bool require_ack);
 
@@ -404,6 +408,22 @@ class TcpTransport : public Transport {
         std::shared_ptr<FailureCounters> failure_counters;
     };
 
+    struct OneShotSession {
+        std::mutex mutex;
+        asio::ip::tcp::socket::executor_type executor;
+        std::shared_ptr<asio::ip::tcp::socket> socket;
+        std::shared_ptr<ClientSession> session;
+        std::optional<TcpWorkItem> work;
+        bool cancelled = false;
+
+        OneShotSession(asio::ip::tcp::socket::executor_type executor_arg,
+                       std::shared_ptr<asio::ip::tcp::socket> socket_arg,
+                       TcpWorkItem work_arg)
+            : executor(std::move(executor_arg)),
+              socket(std::move(socket_arg)),
+              work(std::move(work_arg)) {}
+    };
+
     struct ConnectionLaneState {
         std::mutex mutex;
         bool shutting_down = false;
@@ -417,6 +437,7 @@ class TcpTransport : public Transport {
             groups;
         std::unordered_map<std::string, ConnectionKey> current_key_by_peer;
         std::vector<std::shared_ptr<PeerConnectionGroup>> retiring_groups;
+        std::unordered_set<std::shared_ptr<OneShotSession>> one_shot_sessions;
         std::weak_ptr<ConnectionLaneRuntime> runtime;
         std::shared_ptr<FailureCounters> failure_counters =
             std::make_shared<FailureCounters>();

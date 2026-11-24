@@ -1471,6 +1471,7 @@ void TcpTransport::closeSocketNoThrow(
 void TcpTransport::shutdownConnectionLanes() {
     const auto state = lane_state_;
     std::vector<std::shared_ptr<PeerConnectionGroup>> groups;
+    std::vector<std::shared_ptr<OneShotSession>> one_shots;
     {
         std::lock_guard<std::mutex> state_lock(state->mutex);
         if (state->shutting_down) return;
@@ -1479,6 +1480,8 @@ void TcpTransport::shutdownConnectionLanes() {
         for (const auto& entry : state->groups) groups.push_back(entry.second);
         for (const auto& group : state->retiring_groups)
             groups.push_back(group);
+        one_shots.assign(state->one_shot_sessions.begin(),
+                         state->one_shot_sessions.end());
     }
 
     for (const auto& group : groups) {
@@ -1510,6 +1513,11 @@ void TcpTransport::shutdownConnectionLanes() {
                       state->failure_counters);
     }
 
+    for (const auto& entry : one_shots) {
+        std::lock_guard<std::mutex> lock(entry->mutex);
+        entry->cancelled = true;
+    }
+
     auto cancellation_posts = std::make_shared<LaneCancellationPostTracker>();
     if (io_pool_ && running_) {
         struct LaneTeardown {
@@ -1518,6 +1526,28 @@ void TcpTransport::shutdownConnectionLanes() {
             std::shared_ptr<asio::ip::tcp::resolver> resolver;
             std::shared_ptr<asio::ip::tcp::socket> socket;
         };
+        for (const auto& entry : one_shots) {
+            std::shared_ptr<ClientSession> session;
+            std::shared_ptr<asio::ip::tcp::socket> socket;
+            {
+                std::lock_guard<std::mutex> lock(entry->mutex);
+                session = entry->session;
+                socket = entry->socket;
+            }
+            if (session || socket) {
+                cancellation_posts->add();
+                try {
+                    asio::dispatch(entry->executor,
+                                   [session, socket, cancellation_posts] {
+                                       if (session) session->cancel();
+                                       closeSocketNoThrow(socket);
+                                       cancellation_posts->done();
+                                   });
+                } catch (...) {
+                    cancellation_posts->done();
+                }
+            }
+        }
         for (const auto& group : groups) {
             std::vector<LaneTeardown> teardowns;
             std::shared_ptr<asio::steady_timer> retry_timer;
@@ -1591,6 +1621,16 @@ void TcpTransport::shutdownConnectionLanes() {
     std::vector<std::shared_ptr<asio::steady_timer>> retry_timers;
     std::vector<std::shared_ptr<asio::steady_timer>> admission_timers;
 
+    for (const auto& entry : one_shots) {
+        std::lock_guard<std::mutex> lock(entry->mutex);
+        if (entry->work.has_value()) {
+            deferred.emplace_back(std::move(*entry->work));
+            entry->work.reset();
+        }
+        if (entry->session) sessions.push_back(std::move(entry->session));
+        if (entry->socket) sockets.push_back(std::move(entry->socket));
+    }
+
     for (const auto& group : groups) {
         {
             std::lock_guard<std::mutex> lock(group->mutex);
@@ -1663,6 +1703,7 @@ void TcpTransport::shutdownConnectionLanes() {
         state->groups.clear();
         state->current_key_by_peer.clear();
         state->retiring_groups.clear();
+        state->one_shot_sessions.clear();
         state->runtime.reset();
     }
     groups.clear();
