@@ -89,8 +89,7 @@ without manually deriving them from the table.
 `master_memory_bench` is a standalone Master metadata benchmark. It mounts
 memory segments, creates a large object set with `BatchPutStart` /
 `BatchPutEnd`, then reads the same keys with `BatchExistKey` and
-`BatchGetReplicaList`. It does not move KV payloads or depend on traffic
-recording.
+`BatchGetReplicaList`. It does not move KV payloads.
 
 See `master_memory_bench.md` for the 100M-key baseline, the
 `--read_rate` / `--amplify` load sweep, and the

@@ -1,8 +1,7 @@
 # Master Memory Segment Benchmark
 
 `master_memory_bench` measures the Master metadata path on a large Memory
-Segment data set. It is an independent benchmark: it does not require the
-traffic recorder or replay tools.
+Segment data set. It is an independent benchmark.
 
 The default workload mounts two 64 GiB memory segments and creates one hundred
 million 512-byte objects with `BatchPutStart` / `BatchPutEnd`. It then reads
@@ -25,9 +24,8 @@ listing, and the Master's metadata path.
   `--fill_threads=16`, `--read_threads=16`, `--batch_size=64`, and
   `--seed=1`.
 
-This is a fixed synthetic Master workload, not a recorded model trace. The
-`--model` label is result metadata; it does not change key size, mix, or
-schedule.
+The workload is fixed. The `--model` label is result metadata; it does not
+change key size, mix, or schedule.
 
 ## Build
 
@@ -66,19 +64,52 @@ Start a Master with enough memory for the metadata and disable eviction:
 The fill phase reports keys per second. The read phase reports batch and key
 throughput and p50/p90/p99/p999 latency. `read.seconds` is the measured wall
 time, and throughput is computed from it. `--read_rate` is the target number of
-batch RPCs per second; 0 saturates. `--amplify` multiplies that rate, so
-`--amplify=2` and `--amplify=3` produce the 2x and 3x load points. Each
-invocation mounts its own segments and fills the data set; use a smaller
-`--keys` value while tuning the load points.
+batch RPCs per second; 0 saturates. Each invocation mounts its own segments and
+fills the data set; use a smaller `--keys` value while tuning the load points.
+
+## Read amplification
+
+`--amplify` multiplies the read target rate:
+
+```text
+target = --read_rate * --amplify
+```
+
+Only the read RPC rate changes. The key count, object size, batch size, read
+thread count, read duration, and 50/50 batch mix stay fixed. Fill always runs at
+full speed and is not amplified. `--read_rate=0` means saturated read, so
+`--amplify` has no effect in that mode.
+
+For example, `--read_rate=200 --amplify=2` targets 400 read batches per second,
+and `--amplify=3` targets 600. The per-thread send interval is computed from
+the target and the thread count; at high amplification the target may exceed
+what the clients and Master can sustain.
+
+1M-key smoke results:
+
+| amplify | read batches/s | p50 | p99 |
+|---:|---:|---:|---:|
+| 1x | 197.3 | 436 us | 747 us |
+| 2x | 377.0 | 1,074 us | 1,843 us |
+| 3x | 567.7 | 563 us | 1,152 us |
+
+These are separate runs on a shared host; use them to verify the load path,
+not as a latency curve.
+
+`master_memory_gate.py` treats `--amplify` as part of the workload. Results from
+different amplification factors are rejected as different workloads. Gate each
+version at the same amplification factor; collect the 1x/2x/3x points
+separately when studying the load curve.
 
 ## Release comparison
 
 `master_memory_gate.py` compares two result files from the same workload. It
-checks the object count, object size, segment layout, model label, read
-threads, read rate, and amplification. It requires the fill to complete for
-every key, then fails when read batch throughput drops by more than 5%, or
-read p99 rises by more than 10%, by default. Fill throughput is also gated when
-both fills take at least 5 seconds; shorter fills only check completion.
+checks object count, object size, batch size, fill threads, seed, segment
+layout, model label, read threads, read rate, read duration, and amplification.
+It requires the fill to complete for every key, then fails when read batch
+throughput drops by more than 5%, or read p99 rises by more than 10%, by
+default. Fill throughput is also gated when both fills take at least 5 seconds;
+shorter fills only check completion.
 
 Start each side from a fresh Master. After a 100M-key run the Master may spend
 minutes cleaning up the unmounted keys; starting the next run during cleanup
