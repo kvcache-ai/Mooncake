@@ -15,6 +15,9 @@
 #ifndef TENT_PLATFORM_MLU_H_
 #define TENT_PLATFORM_MLU_H_
 
+#include <mutex>
+#include <unordered_map>
+
 #include "tent/platform/cpu.h"
 
 namespace mooncake::tent {
@@ -32,7 +35,16 @@ class MluPlatform : public CpuPlatform {
         void* start, size_t len, bool skip_prefault = false) override;
     Status exportDmabuf(void* addr, size_t length, DmabufExport& out) override;
     Status synchronizeDevices(const Topology* topology) override;
+    // Same-host physical device identity, independent of visible ordinals.
+    Status devicePciBusId(int device, std::string& identity);
+    // Resolve through CNRT and cache successful lookups of physical devices.
+    Status deviceByPciBusId(const std::string& identity, int& device);
     const std::string type() const override { return "mlu"; }
+
+   private:
+    // CNRT's visible device ordinals stay fixed for this platform's lifetime.
+    std::mutex pci_devices_mutex_;
+    std::unordered_map<std::string, int> pci_devices_;
 };
 }  // namespace mooncake::tent
 #endif  // TENT_PLATFORM_MLU_H_

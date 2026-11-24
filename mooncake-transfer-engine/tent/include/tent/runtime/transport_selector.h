@@ -227,6 +227,12 @@ class TransportSelector {
     static std::optional<std::vector<TransportType>> reorderWithHint(
         const std::vector<TransportType>& raw, TransportType hint);
 
+    // Coarse reachability for direct peer submissions. Internal staging uses
+    // ProxyManager's own threads and can still use local-only transports.
+    static bool isPeerReachable(TransportType type, bool same_machine) {
+        return same_machine || (type != NVLINK && type != SHM && type != TPU);
+    }
+
    private:
     // Width of SelectionResult::device_mask; a NIC past this index cannot be
     // named by a policy at all.
