@@ -155,6 +155,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     ssd_control_wire.cpp
     ssd_direct_read.cpp
     ssd_fixed_l2_requester.cpp
+    ssd_transfer_target.cpp
     config/client_host_identity_config.cpp
     ssd_prefetcher.cpp
     config/client_metric_config.cpp
