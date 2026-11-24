@@ -184,6 +184,7 @@ class RdmaContext {
     // exportDmabuf duplicates it; the caller retains ownership and must reset
     // this override to -1 before registering any unrelated buffer.
     static void setExternalDmabufForThread(int fd);
+    static bool hasExternalDmabufForThread();
 
     // Closes the fd held by a DmabufExport, if any. Idempotent.
     static void closeDmabufExport(DmabufExport &exp);

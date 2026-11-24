@@ -3290,7 +3290,9 @@ With `setup_dummy(..., cuda_ipc_persistent_registration=True)`, the daemon
 imports registered GPU allocations and uses their Transfer Engine registration
 directly. Host fragments in the same batch still use staging. This mode
 supports the classic Transfer Engine with RDMA Data Direct disabled. GPU-only
-clients may use `local_buffer_size=0`.
+clients may use `local_buffer_size=0`. With Transfer Engine registration reuse
+enabled, the daemon reserves each imported allocation until its final unregister.
+Overlapping Store or PD registrations on that engine are rejected.
 
 If a direct transfer loses its reply or the transfer engine reports pending
 I/O after a timeout, the client asks the daemon to drain accesses and release

@@ -634,6 +634,21 @@ if(USE_UB)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_native_data_path_test
            COMMAND tent_ub_native_data_path_test)
+
+  # Engine-level UB run on the test-only loopback adapter (no UB hardware).
+  if(USE_UB_MOCK)
+    add_executable(tent_ub_loopback_engine_test ub_loopback_engine_test.cpp)
+    target_link_libraries(tent_ub_loopback_engine_test PRIVATE gtest gtest_main
+                                                               tent_link_group)
+    target_include_directories(
+      tent_ub_loopback_engine_test
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+              ${CMAKE_CURRENT_SOURCE_DIR}/ub_mock)
+    add_test(NAME tent_ub_loopback_engine_test
+             COMMAND tent_ub_loopback_engine_test)
+    set_tests_properties(tent_ub_loopback_engine_test
+                         PROPERTIES ENVIRONMENT "MC_TENT_UB_MOCK=1" TIMEOUT 120)
+  endif()
 endif()
 
 # End-to-end failover test: drives real TransferEngineImpl with

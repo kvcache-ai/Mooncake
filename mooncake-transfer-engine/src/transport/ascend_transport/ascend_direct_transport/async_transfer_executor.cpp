@@ -50,6 +50,10 @@ int AsyncTransferExecutor::initialize() {
 }
 
 void AsyncTransferExecutor::finalize() {
+    // Wait out an in-progress disconnectAllPeers(). Stopping the query
+    // thread first still drops active_async_tasks_, so that call would go
+    // on to Disconnect while this function destroys the engines.
+    std::lock_guard<std::mutex> disconnect_all(disconnect_all_mutex_);
     if (finalized_) {
         return;
     }
@@ -137,13 +141,18 @@ TransferExecutorBase::ExecuteResult AsyncTransferExecutor::execute(
         if (active_async_tasks_ > 0) {
             active_async_tasks_--;
         }
-        async_task_cv_.notify_one();
+        async_task_cv_.notify_all();
     }
     if (!params_.auto_connect) {
         disconnect(local_engine_idx, target_adxl_engine_name,
                    kDefaultDisconnectTime);
     }
     return {.ret = -1, .status = status, .retryable = true};
+}
+
+void AsyncTransferExecutor::drainInFlightTransfers() {
+    std::unique_lock<std::mutex> lock(async_task_mutex_);
+    async_task_cv_.wait(lock, [this] { return active_async_tasks_ == 0; });
 }
 
 void AsyncTransferExecutor::queryThreadLoop() {
@@ -191,6 +200,22 @@ void AsyncTransferExecutor::queryThreadLoop() {
                 std::chrono::microseconds(kQueryPollIntervalMicros));
         }
     }
+    abandonInFlightBatches(pending_batches);
+}
+
+void AsyncTransferExecutor::abandonInFlightBatches(
+    std::vector<QueryBatch>& pending) {
+    {
+        std::lock_guard<std::mutex> lock(query_mutex_);
+        while (!query_slice_queue_.empty()) {
+            pending.emplace_back(std::move(query_slice_queue_.front()));
+            query_slice_queue_.pop();
+        }
+    }
+    for (auto& batch : pending) {
+        markBatchFailed(batch, "Async executor stopped", false);
+    }
+    pending.clear();
 }
 
 void AsyncTransferExecutor::fetchPendingBatches(
@@ -235,7 +260,8 @@ void AsyncTransferExecutor::failAllPendingOnRoute(
             continue;
         }
 
-        markBatchFailed(batch, reason, false);
+        // Disconnect before the async counter drops. disconnectAllPeers waits
+        // for that counter, then walks the peer table itself.
         if (!cleaned_up && engine_idx < adxl_engines_.size() &&
             !target.empty()) {
             if (params_.auto_connect && adxl_already_disconnected) {
@@ -245,6 +271,7 @@ void AsyncTransferExecutor::failAllPendingOnRoute(
             }
             cleaned_up = true;
         }
+        markBatchFailed(batch, reason, false);
 
         std::swap(pending[j], pending.back());
         pending.pop_back();
@@ -305,11 +332,11 @@ void AsyncTransferExecutor::processOneBatch(QueryBatch& batch,
         for (auto* slice : batch.slices) {
             slice->markSuccess();
         }
-        handleTaskFinished();
         if (params_.use_short_connection) {
             disconnect(batch.engine_idx, batch.target_adxl_engine_name,
                        params_.connect_timeout);
         }
+        handleTaskFinished();
         result.done = true;
         return;
     }
@@ -330,7 +357,7 @@ void AsyncTransferExecutor::handleTaskFinished() {
     if (active_async_tasks_ > 0) {
         active_async_tasks_--;
     }
-    async_task_cv_.notify_one();
+    async_task_cv_.notify_all();
 }
 
 }  // namespace mooncake

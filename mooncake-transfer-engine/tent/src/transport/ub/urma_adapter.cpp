@@ -14,6 +14,10 @@
 
 #include "tent/transport/ub/urma_adapter.h"
 
+#if defined(TENT_UB_MOCK_ADAPTER) && TENT_UB_MOCK_ADAPTER
+#include "loopback_urma_adapter.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -1700,6 +1704,11 @@ class RealUrmaAdapter final : public UrmaAdapter {
 }  // namespace
 
 std::shared_ptr<UrmaAdapter> createDefaultUrmaAdapter() {
+#if defined(TENT_UB_MOCK_ADAPTER) && TENT_UB_MOCK_ADAPTER
+    // Test-only builds (USE_UB_MOCK=ON): MC_TENT_UB_MOCK=1 selects the
+    // in-process loopback adapter instead of liburma.
+    if (mock::loopbackRequested()) return mock::createLoopbackUrmaAdapter();
+#endif
 #if defined(TENT_HAS_REAL_URMA) && TENT_HAS_REAL_URMA
     return std::make_shared<RealUrmaAdapter>();
 #else

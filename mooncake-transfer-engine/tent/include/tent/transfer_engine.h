@@ -248,6 +248,9 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <chrono>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -259,6 +262,7 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
 namespace mooncake {
 class TransferEngine;
 class TransferEngineImplTestPeer;
+class BatchSubmitExecutor;
 namespace tent {
 class TransferEngineImpl;
 class Config;
@@ -341,6 +345,25 @@ class TransferEngine {
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list);
 
+    using SubBatchRequestBuilder =
+        std::function<std::vector<Request>(size_t begin, size_t end)>;
+    struct ParallelBatchTransferFailureInfo {
+        // At least one engine submit API returned an error.
+        bool submit_failed = false;
+        // Only native FAILED/TIMEOUT errors, without parent expiry/shutdown.
+        bool retryable = false;
+    };
+    // Opt-in synchronous path for independent ranges to one peer.
+    // nullopt means disabled, below threshold, or unsupported before publish.
+    // The builder runs once per sub-batch and must return the requested range
+    // as valid READ/WRITE requests to peer, preserving every request field.
+    // The caller must ensure that all requests can execute independently;
+    // these preconditions are not checked by scanning the built requests.
+    std::optional<Status> tryParallelBatchTransfer(
+        SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
+        std::chrono::nanoseconds timeout,
+        ParallelBatchTransferFailureInfo* failure_info = nullptr);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list,
                           const Notification& notifi);
@@ -385,11 +408,18 @@ class TransferEngine {
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
+    bool supportsParallelBatchSubmit(SegmentID peer) const;
+
+    bool isBatchSubmitEligible(size_t count) const;
+
    private:
+    struct TentSubBatchAdapter;
+
     Status submitTransferRequiringPostSubmitCancellation(
         BatchID batch_id, const std::vector<Request>& request_list);
 
     std::unique_ptr<TransferEngineImpl> impl_;
+    std::shared_ptr<BatchSubmitExecutor> batch_submit_executor_;
     friend class ::mooncake::TransferEngine;
     friend class ::mooncake::TransferEngineImplTestPeer;
 };

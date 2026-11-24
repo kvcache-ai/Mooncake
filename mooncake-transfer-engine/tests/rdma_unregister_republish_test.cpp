@@ -417,6 +417,20 @@ TEST_F(RdmaUnregisterRepublishTest, MissingDescriptorCanLeaveAnUnconfirmedMr) {
     EXPECT_EQ(plugin_->setCalls(), sets_before);
 }
 
+TEST_F(RdmaUnregisterRepublishTest, ReuseRetainsUnconfirmedCudaImport) {
+    auto missing =
+        std::make_shared<MissingRegistrationTransport>("efa", metadata_);
+    TransferEngineImplTestPeer engine(metadata_, {{"efa", missing}});
+    RdmaContext::setExternalDmabufForThread(0);
+    int result =
+        engine.registerLocalMemory(addrA(), kLen, "cpu:0", true, false);
+    RdmaContext::setExternalDmabufForThread(-1);
+    ASSERT_EQ(result, 0);
+    ASSERT_EQ(engine.enableMemoryRegistrationReuse(), 0);
+    EXPECT_EQ(engine.unregisterLocalMemory(addrA(), true), ERR_CONTEXT);
+    EXPECT_TRUE(engine.checkOverlap(addrA(), kLen));
+}
+
 TEST_F(RdmaUnregisterRepublishTest,
        ShmAndTwoSidedRdmaRetryAfterPartialRemoval) {
     auto shm = std::make_shared<ShmTransport>();

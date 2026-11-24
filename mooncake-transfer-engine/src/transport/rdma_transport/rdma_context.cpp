@@ -561,6 +561,10 @@ void RdmaContext::setExternalDmabufForThread(int fd) {
     external_dmabuf_fd = fd;
 }
 
+bool RdmaContext::hasExternalDmabufForThread() {
+    return external_dmabuf_fd >= 0;
+}
+
 int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     out = DmabufExport{};
     if (external_dmabuf_fd >= 0) {

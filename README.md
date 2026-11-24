@@ -345,6 +345,17 @@ In addition to CUDA, Mooncake also supports other accelerator backends, along wi
 - [Build from Source](https://kvcache-ai.github.io/Mooncake/getting_started/build.html)
 - [Deployment Guide](https://kvcache-ai.github.io/Mooncake/deployment/mooncake-store-deployment-guide.html)
 
+To build one Transfer Engine and Store wheel per platform for GIL-enabled
+CPython 3.12 and newer, use CPython 3.12 and CMake 3.26 or newer.
+
+```bash
+uv build --wheel -Cwheel.py-api=cp312 -Ccmake.define.WITH_CONDUCTOR=OFF
+```
+
+The resulting wheel has the `cp312-abi3` tag. Builds that include the EP,
+Conductor or TENT Python extensions use the regular CPython-specific wheel.
+
+
 
 ### Skills for AI Assistants
 

@@ -1731,7 +1731,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     << "sunrise_link protocol requires USE_SUNRISE build";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
 #endif
-            } else if (this->protocol == "ub") {
+            } else if (this->protocol == "ub" && !use_mmap_segment) {
+                // Only allocate_buffer_allocator_memory() memory goes back
+                // through the UB free path; hugepage mmaps fall through to
+                // munmap below.
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
             } else if (use_mmap_segment) {
@@ -5037,6 +5040,14 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    {
+        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        if (registered_buffer_sizes_.count(buffer)) {
+            LOG(ERROR) << "Buffer " << buffer << " is already registered";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
     // Only a HugeTLB segment's base address is widened to the physical
     // segment. ShmHelper::allocate rounds the mapping up to hugepage
     // granularity, so the MR bounds must coincide with the mapping bounds;
@@ -5112,6 +5123,13 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto unregister_result = [&]() -> tl::expected<void, ErrorCode> {
+        {
+            std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+            auto rec_it = registered_buffer_sizes_.find(buffer);
+            if (rec_it != registered_buffer_sizes_.end() &&
+                rec_it->second.te_released)
+                return {};
+        }
         auto &hook = TeUnregisterHookForTestingSlot();
         if (hook) {
             return hook(buffer);
@@ -5152,6 +5170,7 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
                        << buffer << ": " << toString(rc)
                        << "; buffer stays recorded and the NoF pages stay "
                           "quarantined. Do not free or remap this buffer.";
+            rec_it->second.te_released = true;
             return tl::unexpected(rc);
         }
     }

@@ -232,6 +232,11 @@ void LocalCopyEngine::SetTaskRunner(TaskRunner runner) {
     task_runner_ = std::move(runner);
 }
 
+bool LocalCopyEngine::HasPending() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !groups_.empty();
+}
+
 void LocalCopyEngine::Poll() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_ || groups_.empty()) {
