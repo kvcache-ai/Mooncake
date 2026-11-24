@@ -309,6 +309,9 @@ class TransferEnginePy {
     uintptr_t getEnginePtr() const { return (uintptr_t)engine_.get(); }
 
    private:
+    void evictStaleSegment(const std::string &target_hostname,
+                           Transport::SegmentHandle failed_handle);
+
     std::shared_ptr<ScatterTransferTicket> scatterTransferSyncWithTicket(
         const std::string &endpoint,
         const std::vector<uintptr_t> &local_base_addresses,
