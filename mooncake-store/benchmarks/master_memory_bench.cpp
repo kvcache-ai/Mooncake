@@ -298,11 +298,20 @@ void Read(const std::string& master, uint64_t keys, uint64_t batch_size,
                               1e9 * threads / target_rate));
 
                 while (!stop.load()) {
-                    if (std::chrono::steady_clock::now() >= deadline) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= deadline) {
                         break;
                     }
                     if (interval.count() > 0) {
-                        std::this_thread::sleep_for(interval);
+                        const auto remaining = std::chrono::duration_cast<
+                            std::chrono::nanoseconds>(deadline - now);
+                        const auto sleep = std::min(interval, remaining);
+                        if (sleep.count() > 0) {
+                            std::this_thread::sleep_for(sleep);
+                        }
+                    }
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        break;
                     }
 
                     const uint64_t batch_id = next_batch.fetch_add(1) % batches;
@@ -376,8 +385,8 @@ int main(int argc, char** argv) {
                       "fill_threads, read_threads and amplify must be positive";
         return 2;
     }
-    if (FLAGS_object_bytes == 0) {
-        LOG(ERROR) << "object_bytes must be positive";
+    if (FLAGS_object_bytes == 0 || FLAGS_read_duration == 0) {
+        LOG(ERROR) << "object_bytes and read_duration must be positive";
         return 2;
     }
     if (FLAGS_batch_size > FLAGS_keys) {
@@ -417,17 +426,22 @@ int main(int argc, char** argv) {
                            FLAGS_batch_size, FLAGS_fill_threads);
     LOG(INFO) << "fill: " << fill.completed << " completed, " << fill.errors
               << " errors, " << fill.seconds << " seconds";
-    if (fill.errors != 0) {
+    if (fill.errors != 0 || fill.completed != FLAGS_keys) {
         stop_heartbeat.store(true);
         heartbeat.join();
         return 1;
     }
 
     LatencyStats read;
+    double read_seconds = 0.0;
     if (FLAGS_read_duration > 0) {
+        const auto read_start = std::chrono::steady_clock::now();
         Read(FLAGS_master, FLAGS_keys, FLAGS_batch_size, FLAGS_read_threads,
              FLAGS_read_duration, FLAGS_read_rate, FLAGS_amplify, FLAGS_seed,
              read);
+        read_seconds = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - read_start)
+                           .count();
         LOG(INFO) << "read: " << read.batches.load() << " batches, "
                   << read.keys.load() << " keys, " << read.errors.load()
                   << " errors";
@@ -437,9 +451,6 @@ int main(int argc, char** argv) {
     heartbeat.join();
 
     std::vector<double> latency = read.latency_us;
-    const double read_seconds = static_cast<double>(FLAGS_read_duration) > 0
-                                    ? static_cast<double>(FLAGS_read_duration)
-                                    : 0.0;
     const double read_batches_per_second =
         read_seconds > 0 ? read.batches.load() / read_seconds : 0.0;
     const double read_keys_per_second =
@@ -467,6 +478,7 @@ int main(int argc, char** argv) {
     json << "  \"read\": {\"amplify\": " << FLAGS_amplify
          << ", \"threads\": " << FLAGS_read_threads
          << ", \"duration_s\": " << FLAGS_read_duration
+         << ", \"seconds\": " << read_seconds
          << ", \"rate_target\": " << target_rate
          << ", \"batches\": " << read.batches.load()
          << ", \"keys\": " << read.keys.load()

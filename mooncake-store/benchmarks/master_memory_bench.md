@@ -64,7 +64,8 @@ Start a Master with enough memory for the metadata and disable eviction:
 ```
 
 The fill phase reports keys per second. The read phase reports batch and key
-throughput and p50/p90/p99/p999 latency. `--read_rate` is the target number of
+throughput and p50/p90/p99/p999 latency. `read.seconds` is the measured wall
+time, and throughput is computed from it. `--read_rate` is the target number of
 batch RPCs per second; 0 saturates. `--amplify` multiplies that rate, so
 `--amplify=2` and `--amplify=3` produce the 2x and 3x load points. Each
 invocation mounts its own segments and fills the data set; use a smaller
@@ -74,8 +75,14 @@ invocation mounts its own segments and fills the data set; use a smaller
 
 `master_memory_gate.py` compares two result files from the same workload. It
 checks the object count, object size, segment layout, model label, read
-threads, read rate, and amplification. It fails when the read batch throughput
-drops by more than 5% or the read p99 rises by more than 10% by default.
+threads, read rate, and amplification. It requires the fill to complete for
+every key, then fails when read batch throughput drops by more than 5%, or
+read p99 rises by more than 10%, by default. Fill throughput is also gated when
+both fills take at least 5 seconds; shorter fills only check completion.
+
+Start each side from a fresh Master. After a 100M-key run the Master may spend
+minutes cleaning up the unmounted keys; starting the next run during cleanup
+causes RPC timeouts.
 
 ```bash
 python3 mooncake-store/benchmarks/master_memory_gate.py \
