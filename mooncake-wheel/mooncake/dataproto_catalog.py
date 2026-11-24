@@ -7,6 +7,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -14,8 +15,9 @@ logger = logging.getLogger(__name__)
 class DataProtoCatalog:
     """Map logical rows and fields to immutable DataProto refs.
 
-    Calls to one catalog instance must be serialized by its host. Direct
-    handles remain metadata-only. DataProtoCatalogTransfer marks only fresh,
+    Direct calls to one catalog instance must be serialized by its host;
+    DataProtoCatalogTransfer serializes them itself. Direct handles remain
+    metadata-only. DataProtoCatalogTransfer marks only fresh,
     independent fragments as managed so their physical lifetime, including
     append-derived handles, can follow logical references and active readers.
     """
@@ -39,8 +41,16 @@ class DataProtoCatalog:
         *,
         tags: Sequence[Mapping[str, Any]] | None = None,
         handle: Mapping[str, Any] | None = None,
+        allow_overlap: bool = True,
     ) -> dict[str, Any]:
-        return self._update(partition, keys, tags=tags, handle=handle, managed=False)
+        return self._update(
+            partition,
+            keys,
+            tags=tags,
+            handle=handle,
+            managed=False,
+            allow_overlap=allow_overlap,
+        )
 
     def publish(
         self,
@@ -50,6 +60,7 @@ class DataProtoCatalog:
         *,
         tags: Sequence[Mapping[str, Any]] | None = None,
         handle: Mapping[str, Any] | None = None,
+        allow_overlap: bool = True,
     ) -> dict[str, Any]:
         """Idempotently publish one transfer-managed fresh fragment."""
         operation_id = _nonempty_string(operation_id, "operation_id")
@@ -63,6 +74,7 @@ class DataProtoCatalog:
             tags=tags,
             handle=handle,
             managed=handle is not None,
+            allow_overlap=allow_overlap,
         )
         self._publications[operation_id] = copy.deepcopy(result)
         return result
@@ -161,6 +173,7 @@ class DataProtoCatalog:
         tags: Sequence[Mapping[str, Any]] | None,
         handle: Mapping[str, Any] | None,
         managed: bool,
+        allow_overlap: bool,
     ) -> dict[str, Any]:
         if self._drained:
             raise RuntimeError("DataProto catalog is drained")
@@ -189,6 +202,22 @@ class DataProtoCatalog:
                 )
 
         current_entries = self._partitions.get(partition, {})
+        if fragment is not None and not allow_overlap:
+            conflicts = [
+                (key, field)
+                for key in keys
+                for field in fields
+                if (
+                    location := current_entries.get(key, {})
+                    .get("fields", {})
+                    .get(field)
+                )
+                and location[0] != fragment_id
+            ]
+            if conflicts:
+                raise ValueError(
+                    f"DataProto keys already carry these fields: {conflicts[:4]}"
+                )
         merged_tags = {}
         response_tags = []
         for row, key in enumerate(keys):
@@ -426,7 +455,14 @@ class DataProtoCatalogTransfer:
 
     def __init__(self, transfer: Any, catalog_call: Callable[..., Any]) -> None:
         self.transfer = transfer
-        self._catalog_call = catalog_call
+        self._catalog_lock = threading.RLock()
+        catalog = catalog_call
+
+        def serialized(method: str, *args: Any, **kwargs: Any) -> Any:
+            with self._catalog_lock:
+                return catalog(method, *args, **kwargs)
+
+        self._catalog_call = serialized
         self._pending_publications: list[dict[str, Any]] = []
         self._pending_publication_acks: list[str] = []
         self._pending_results: list[Any] = []
@@ -463,22 +499,7 @@ class DataProtoCatalogTransfer:
                     data, type="dataproto", partition=partition, **put_kwargs
                 )
             )
-        publication = {
-            "operation_id": uuid.uuid4().hex,
-            "method": "publish",
-            "args": (partition, normalized_keys),
-            "kwargs": {"tags": normalized_tags, "handle": handle},
-        }
-        for attempt in range(2):
-            try:
-                return self._publish(publication)
-            except Exception:
-                if attempt:
-                    with self._cleanup_lock:
-                        self._pending_publications.append(publication)
-                    raise
-                logger.exception("Retrying DataProto Catalog publication")
-        raise AssertionError("unreachable")
+        return self._publish_handle(partition, normalized_keys, normalized_tags, handle)
 
     def append(
         self,
@@ -529,21 +550,11 @@ class DataProtoCatalogTransfer:
                 "handle": appended_handle,
             },
         }
-        for attempt in range(2):
-            try:
-                result = self._publish(publication)
-            except Exception:
-                if attempt:
-                    with self._cleanup_lock:
-                        self._pending_publications.append(publication)
-                    raise
-                logger.exception("Retrying DataProto Catalog append publication")
-            else:
-                rejection = result.get("append_rejected")
-                if rejection is not None:
-                    raise ValueError(rejection)
-                return result
-        raise AssertionError("unreachable")
+        result = self._publish_with_retry(publication)
+        rejection = result.get("append_rejected")
+        if rejection is not None:
+            raise ValueError(rejection)
+        return result
 
     def resolve(
         self,
@@ -552,6 +563,98 @@ class DataProtoCatalogTransfer:
         fields: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         return self._catalog_call("resolve", partition, keys, fields, pin=True)
+
+    def register(
+        self,
+        partition: str,
+        keys: Sequence[str],
+        handle: Mapping[str, Any],
+        *,
+        tags: Sequence[Mapping[str, Any]] | None = None,
+        managed: bool = True,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """Register a fragment written by another producer for these keys.
+
+        Managed fragments follow catalog lifetime rules and can be appended to
+        later; unmanaged fragments stay metadata-only. Fields already owned by
+        another fragment are rejected unless `overwrite` is set.
+        """
+        self._retry_publication_acks()
+        self._retry_publications(strict=True)
+        partition = _nonempty_string(partition, "partition")
+        normalized_keys = _names(keys, "keys")
+        normalized_tags = _tags(tags, len(normalized_keys))
+        if not managed:
+            return self._catalog_call(
+                "update",
+                partition,
+                normalized_keys,
+                tags=normalized_tags,
+                handle=handle,
+                allow_overlap=overwrite,
+            )
+        return self._publish_handle(
+            partition,
+            normalized_keys,
+            normalized_tags,
+            handle,
+            allow_overlap=overwrite,
+        )
+
+    def read(
+        self,
+        partition: str,
+        keys: Sequence[str],
+        fields: Sequence[str] | None = None,
+        *,
+        data_cls: Any = None,
+    ) -> Any:
+        """Materialize keyed fragments as one batch in key order.
+
+        Resolves the keys, reads each contiguous (fragment, row) run, and
+        concatenates the parts in key order. The resolve pin is always
+        released, including when a read fails. Returns a plain dict, or
+        `data_cls` built from batch, non_tensor_batch, and meta_info.
+        """
+        plan = self.resolve(partition, keys, fields)
+        batch: dict[str, list[Any]] = {}
+        non_tensor_batch: dict[str, list[Any]] = {}
+        try:
+            for group in plan["field_groups"]:
+                names = list(group["fields"])
+                for fragment_id, start, stop in _location_runs(group["locations"]):
+                    part = self.transfer.get_dataproto(
+                        plan["handles"][fragment_id],
+                        fields=names,
+                        rows=slice(start, stop),
+                    )
+                    for name in names:
+                        if name in part["batch"]:
+                            batch.setdefault(name, []).append(part["batch"][name])
+                        else:
+                            non_tensor_batch.setdefault(name, []).append(
+                                part["non_tensor_batch"][name]
+                            )
+        finally:
+            token = plan.get("read_token")
+            if token is not None:
+                self.release_read(token)
+        rows = len(plan["keys"])
+        merged_batch = {name: _concat_field(parts) for name, parts in batch.items()}
+        merged_non_tensor = {
+            name: _concat_field(parts) for name, parts in non_tensor_batch.items()
+        }
+        for name, value in (*merged_batch.items(), *merged_non_tensor.items()):
+            if len(value) != rows:
+                raise ValueError(
+                    f"DataProto field {name!r} read {len(value)} rows, expected {rows}"
+                )
+        from mooncake.structured_object_store import _build_dataproto_like_result
+
+        return _build_dataproto_like_result(
+            merged_batch, merged_non_tensor, plan["meta_info"], data_cls
+        )
 
     def release_read(self, token: int) -> None:
         self._cleanup_retired(self._catalog_call("release_read", token))
@@ -621,6 +724,42 @@ class DataProtoCatalogTransfer:
                 f"failed to clean up {failures} retired DataProto fragment(s)"
             )
 
+    def _publish_with_retry(self, publication: Mapping[str, Any]) -> dict[str, Any]:
+        for attempt in range(2):
+            try:
+                return self._publish(publication)
+            except ValueError:
+                raise
+            except Exception:
+                if attempt:
+                    with self._cleanup_lock:
+                        self._pending_publications.append(dict(publication))
+                    raise
+                logger.exception("Retrying DataProto Catalog publication")
+        raise AssertionError("unreachable")
+
+    def _publish_handle(
+        self,
+        partition: str,
+        keys: Sequence[str],
+        tags: Sequence[Mapping[str, Any]] | None,
+        handle: Mapping[str, Any] | None,
+        *,
+        allow_overlap: bool = True,
+    ) -> dict[str, Any]:
+        return self._publish_with_retry(
+            {
+                "operation_id": uuid.uuid4().hex,
+                "method": "publish",
+                "args": (partition, keys),
+                "kwargs": {
+                    "tags": tags,
+                    "handle": handle,
+                    "allow_overlap": allow_overlap,
+                },
+            }
+        )
+
     def _publish(self, publication: Mapping[str, Any]) -> dict[str, Any]:
         operation_id = publication["operation_id"]
         result = self._catalog_call(
@@ -629,9 +768,7 @@ class DataProtoCatalogTransfer:
             *publication["args"],
             **publication["kwargs"],
         )
-        if publication["method"] == "publish_append" and result.get(
-            "append_rejected"
-        ):
+        if publication["method"] == "publish_append" and result.get("append_rejected"):
             self.transfer.cleanup_dataproto_append(
                 publication["kwargs"]["previous_handle"],
                 publication["kwargs"]["handle"],
@@ -735,6 +872,34 @@ def _field_union(
     return list(
         dict.fromkeys(field for key in keys for field in entries[key]["fields"])
     )
+
+
+def _location_runs(
+    locations: Sequence[tuple[str, int]],
+) -> list[tuple[str, int, int]]:
+    """Coalesce consecutive fragment rows into [start, stop) runs."""
+    runs: list[list[Any]] = []
+    for fragment_id, row in locations:
+        if runs and runs[-1][0] == fragment_id and runs[-1][2] == row:
+            runs[-1][2] = row + 1
+        else:
+            runs.append([fragment_id, row, row + 1])
+    return [(fragment_id, start, stop) for fragment_id, start, stop in runs]
+
+
+def _concat_field(parts: Sequence[Any]) -> Any:
+    if len(parts) == 1:
+        return parts[0]
+    if isinstance(parts[0], np.ndarray):
+        return np.concatenate(parts, axis=0)
+    if type(parts[0]).__module__.split(".")[0] == "torch":
+        import torch
+
+        return torch.cat(parts, dim=0)
+    merged: list[Any] = []
+    for part in parts:
+        merged.extend(part)
+    return merged
 
 
 def _names(values: Sequence[str] | Mapping[str, Any], label: str) -> tuple[str, ...]:

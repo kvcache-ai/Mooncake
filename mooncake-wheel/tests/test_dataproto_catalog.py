@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import copy
+import threading
+import time
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from mooncake.dataproto_catalog import DataProtoCatalog, DataProtoCatalogTransfer
 from mooncake.structured_object_store import import_dataproto_ref
 
 
-def handle(name: str, fields: list[str], batch_size: int = 2) -> dict:
+def handle(
+    name: str, fields: list[str], batch_size: int = 2, partition: str = "default"
+) -> dict:
     return {
         "type": "mooncake_dataproto_ref",
         "version": 1,
         "kind": "bundle_stages",
         "batch_size": batch_size,
+        "partition": partition,
         "stage_refs": {"rollout": {"manifest_key": f"manifest/{name}"}},
         "field_index": {
             field: {
@@ -178,14 +184,17 @@ def test_catalog_append_replaces_managed_handle_ownership() -> None:
         "member": "batch.score",
         "section": "batch",
     }
-    assert "fragment identity" in catalog.publish_append(
-        "wrong-partition",
-        "manifest/base",
-        "other",
-        ["a"],
-        previous_handle=base,
-        handle=appended,
-    )["append_rejected"]
+    assert (
+        "fragment identity"
+        in catalog.publish_append(
+            "wrong-partition",
+            "manifest/base",
+            "other",
+            ["a"],
+            previous_handle=base,
+            handle=appended,
+        )["append_rejected"]
+    )
     catalog.publish_append(
         "append-op",
         "manifest/base",
@@ -202,14 +211,17 @@ def test_catalog_append_replaces_managed_handle_ownership() -> None:
         previous_handle=base,
         handle=appended,
     )["fields"] == ["input", "value", "score"]
-    assert "stale" in catalog.publish_append(
-        "stale-op",
-        "manifest/base",
-        "train",
-        ["a"],
-        previous_handle=base,
-        handle=appended,
-    )["append_rejected"]
+    assert (
+        "stale"
+        in catalog.publish_append(
+            "stale-op",
+            "manifest/base",
+            "train",
+            ["a"],
+            previous_handle=base,
+            handle=appended,
+        )["append_rejected"]
+    )
 
     plan = catalog.resolve("train", ["a"])
     assert plan["fields"] == ["input", "value", "score"]
@@ -355,6 +367,361 @@ def test_catalog_retry_does_not_resurrect_a_superseded_fragment() -> None:
     plan = catalog.resolve("train", ["a"])
     assert set(plan["handles"]) == {"manifest/put-2"}
     assert transfer.cleaned == ["manifest/put-1"]
+
+
+class ShardTransfer:
+    """Serve row ranges from in-memory fragments and record each read."""
+
+    def __init__(self, fragments: dict[str, dict]) -> None:
+        self.fragments = fragments
+        self.calls: list[tuple[str, int, int, tuple[str, ...]]] = []
+        self.cleaned: list[str] = []
+
+    def get_dataproto(self, ref, *, fields, rows):
+        result = {"batch": {}, "non_tensor_batch": {}, "meta_info": {}}
+        for name in fields:
+            stage = ref["field_index"][name]["stage"]
+            fragment_id = ref["stage_refs"][stage]["manifest_key"]
+            self.calls.append((fragment_id, rows.start, rows.stop, (name,)))
+            data = self.fragments[fragment_id]
+            if name in data["batch"]:
+                result["batch"][name] = data["batch"][name][rows]
+            else:
+                result["non_tensor_batch"][name] = data["non_tensor_batch"][name][rows]
+        return result
+
+    def cleanup_dataproto(self, ref):
+        self.cleaned.append(next(iter(ref["stage_refs"].values()))["manifest_key"])
+
+
+def catalog_client(transfer):
+    catalog = DataProtoCatalog()
+
+    def call(method, *args, **kwargs):
+        return getattr(catalog, method)(*args, **kwargs)
+
+    return catalog, DataProtoCatalogTransfer(transfer, call)
+
+
+def sharded_fragments(values: np.ndarray, shards: int) -> dict[str, dict]:
+    rows = len(values) // shards
+    return {
+        f"manifest/s{i}": {
+            "batch": {"score": values[i * rows : (i + 1) * rows].copy()},
+            "non_tensor_batch": {},
+        }
+        for i in range(shards)
+    }
+
+
+def test_catalog_transfer_registers_shards_and_reads_in_key_order() -> None:
+    values = np.arange(6, dtype=np.float32).reshape(6, 1)
+    transfer = ShardTransfer(sharded_fragments(values, 3))
+    catalog, client = catalog_client(transfer)
+    keys = [f"k{i}" for i in range(6)]
+    for i in range(3):
+        client.register("train", keys[i * 2 : (i + 1) * 2], handle(f"s{i}", ["score"]))
+
+    result = client.read("train", keys, ["score"])
+
+    np.testing.assert_array_equal(result["batch"]["score"], values)
+    assert transfer.calls == [
+        ("manifest/s0", 0, 2, ("score",)),
+        ("manifest/s1", 0, 2, ("score",)),
+        ("manifest/s2", 0, 2, ("score",)),
+    ]
+    assert catalog._read_pins == {}
+
+
+def test_catalog_transfer_read_honors_reordered_keys() -> None:
+    values = np.arange(4, dtype=np.float32).reshape(4, 1)
+    transfer = ShardTransfer(sharded_fragments(values, 2))
+    _catalog, client = catalog_client(transfer)
+    keys = [f"k{i}" for i in range(4)]
+    client.register("train", keys[:2], handle("s0", ["score"]))
+    client.register("train", keys[2:], handle("s1", ["score"]))
+
+    result = client.read("train", keys[::-1], ["score"])
+
+    np.testing.assert_array_equal(result["batch"]["score"], values[::-1])
+    assert all(call[1] == call[2] - 1 for call in transfer.calls)
+
+
+def test_catalog_transfer_read_merges_non_tensor_fields() -> None:
+    values = np.array(["a", "bb", "ccc", "dddd"], dtype=object).reshape(4, 1)
+    fragments = {
+        f"manifest/t{i}": {
+            "batch": {},
+            "non_tensor_batch": {"text": values[i * 2 : (i + 1) * 2].copy()},
+        }
+        for i in range(2)
+    }
+    transfer = ShardTransfer(fragments)
+    _catalog, client = catalog_client(transfer)
+    keys = [f"k{i}" for i in range(4)]
+    client.register("train", keys[:2], handle("t0", ["text"]))
+    client.register("train", keys[2:], handle("t1", ["text"]))
+
+    result = client.read("train", keys, ["text"])
+
+    assert list(result["non_tensor_batch"]["text"][:, 0]) == ["a", "bb", "ccc", "dddd"]
+
+
+def test_catalog_transfer_read_rejects_incomplete_fields() -> None:
+    transfer = ShardTransfer(sharded_fragments(np.zeros((4, 1), np.float32), 2))
+    _catalog, client = catalog_client(transfer)
+    keys = [f"k{i}" for i in range(4)]
+    client.register("train", keys[:2], handle("s0", ["score"]))
+    client.register("train", keys[2:], handle("s1", ["other"]))
+
+    with pytest.raises(ValueError, match="fields are not ready"):
+        client.read("train", keys, ["score"])
+
+
+def test_catalog_transfer_read_releases_pin_on_error() -> None:
+    class FailingTransfer:
+        def get_dataproto(self, ref, *, fields, rows):
+            raise RuntimeError("read failed")
+
+    catalog, client = catalog_client(FailingTransfer())
+    client.register("train", ["a", "b"], handle("s0", ["score"]))
+
+    with pytest.raises(RuntimeError, match="read failed"):
+        client.read("train", ["a", "b"], ["score"])
+
+    assert catalog._read_pins == {}
+    assert catalog._fragment_readers == {}
+
+
+class BatchData:
+    def __init__(self, **fields):
+        self.fields = fields
+
+    def __len__(self):
+        return len(next(iter(self.fields.values())))
+
+
+class AppendTransfer(ShardTransfer):
+    def append_dataproto_fields(self, handle, data, *, stage):
+        field, value = next(iter(data.fields.items()))
+        appended = copy.deepcopy(handle)
+        appended["stage_refs"][stage] = {"manifest_key": f"manifest/{stage}"}
+        appended["field_index"][field] = {
+            "stage": stage,
+            "member": f"batch.{field}",
+            "section": "batch",
+        }
+        self.fragments[f"manifest/{stage}"] = {
+            "batch": {field: value},
+            "non_tensor_batch": {},
+        }
+        return import_dataproto_ref(appended)
+
+    def cleanup_dataproto_append(self, previous_handle, handle):
+        return None
+
+
+def test_catalog_transfer_appends_to_registered_fragment() -> None:
+    values = np.arange(4, dtype=np.float32).reshape(4, 1)
+    transfer = AppendTransfer(sharded_fragments(values, 1))
+    _catalog, client = catalog_client(transfer)
+    keys = ["k0", "k1", "k2", "k3"]
+    client.register(
+        "train", keys, handle("s0", ["score"], batch_size=4, partition="train")
+    )
+    plan = client.resolve("train", keys, ["score"])
+    fragment_id, fragment_handle = next(iter(plan["handles"].items()))
+    advantage = np.full((4, 1), 7.0, dtype=np.float32)
+
+    client.append(
+        fragment_id,
+        fragment_handle,
+        BatchData(advantage=advantage),
+        partition="train",
+        keys=keys,
+        stage="advantage",
+    )
+
+    result = client.read("train", keys, ["score", "advantage"])
+    np.testing.assert_array_equal(result["batch"]["score"], values)
+    np.testing.assert_array_equal(result["batch"]["advantage"], advantage)
+
+
+def test_catalog_transfer_rejects_append_for_unmanaged_fragment() -> None:
+    values = np.arange(4, dtype=np.float32).reshape(4, 1)
+    transfer = AppendTransfer(sharded_fragments(values, 1))
+    _catalog, client = catalog_client(transfer)
+    keys = ["k0", "k1", "k2", "k3"]
+    client.register(
+        "train",
+        keys,
+        handle("s0", ["score"], batch_size=4, partition="train"),
+        managed=False,
+    )
+    plan = client.resolve("train", keys, ["score"])
+    fragment_id, fragment_handle = next(iter(plan["handles"].items()))
+
+    with pytest.raises(ValueError, match="stale DataProto append handle"):
+        client.append(
+            fragment_id,
+            fragment_handle,
+            BatchData(advantage=np.zeros((4, 1), np.float32)),
+            partition="train",
+            keys=keys,
+            stage="advantage",
+        )
+
+
+def test_catalog_transfer_serializes_concurrent_catalog_calls() -> None:
+    active = 0
+    overlap: list[int] = []
+    guard = threading.Lock()
+
+    class SlowCatalog(DataProtoCatalog):
+        def update(self, *args, **kwargs):
+            nonlocal active
+            with guard:
+                active += 1
+                if active > 1:
+                    overlap.append(active)
+            time.sleep(0.001)
+            try:
+                return super().update(*args, **kwargs)
+            finally:
+                with guard:
+                    active -= 1
+
+    catalog = SlowCatalog()
+
+    def call(method, *args, **kwargs):
+        return getattr(catalog, method)(*args, **kwargs)
+
+    client = DataProtoCatalogTransfer(ShardTransfer({}), call)
+    keys = [f"k{i}" for i in range(4)]
+    threads = [
+        threading.Thread(
+            target=client.register,
+            args=("train", keys, handle("s0", ["score"], batch_size=4)),
+            kwargs={"managed": False},
+        )
+        for _ in range(8)
+    ]
+
+    [thread.start() for thread in threads]
+    [thread.join() for thread in threads]
+
+    assert overlap == []
+    assert catalog._fragment_refcounts == {"manifest/s0": 4}
+
+
+def test_catalog_transfer_rejects_replayed_append_handle() -> None:
+    values = np.arange(4, dtype=np.float32).reshape(4, 1)
+    transfer = AppendTransfer(sharded_fragments(values, 1))
+    _catalog, client = catalog_client(transfer)
+    keys = ["k0", "k1", "k2", "k3"]
+    client.register(
+        "train", keys, handle("s0", ["score"], batch_size=4, partition="train")
+    )
+    plan = client.resolve("train", keys, ["score"])
+    fragment_id, fragment_handle = next(iter(plan["handles"].items()))
+    client.release_read(plan["read_token"])
+    client.append(
+        fragment_id,
+        fragment_handle,
+        BatchData(advantage=np.zeros((4, 1), np.float32)),
+        partition="train",
+        keys=keys,
+        stage="advantage",
+    )
+
+    with pytest.raises(ValueError, match="stale DataProto append handle"):
+        client.append(
+            fragment_id,
+            fragment_handle,
+            BatchData(credit=np.ones((4, 1), np.float32)),
+            partition="train",
+            keys=keys,
+            stage="credit",
+        )
+
+
+def test_catalog_transfer_read_builds_data_class() -> None:
+    class Result:
+        @classmethod
+        def from_dict(cls, batch, non_tensor_batch, meta_info=None):
+            return cls(batch, non_tensor_batch, meta_info)
+
+        def __init__(self, batch, non_tensor_batch, meta_info) -> None:
+            self.batch = batch
+            self.non_tensor_batch = non_tensor_batch
+            self.meta_info = meta_info
+
+    values = np.arange(4, dtype=np.float32).reshape(4, 1)
+    transfer = ShardTransfer(sharded_fragments(values, 2))
+    _catalog, client = catalog_client(transfer)
+    keys = [f"k{i}" for i in range(4)]
+    client.register("train", keys[:2], handle("s0", ["score"], batch_size=2))
+    client.register("train", keys[2:], handle("s1", ["score"], batch_size=2))
+
+    result = client.read("train", keys, ["score"], data_cls=Result)
+
+    assert isinstance(result, Result)
+    np.testing.assert_array_equal(result.batch["score"], values)
+    assert result.meta_info == {}
+
+
+def test_catalog_transfer_read_checks_row_counts() -> None:
+    class TruncatingTransfer(ShardTransfer):
+        def get_dataproto(self, ref, *, fields, rows):
+            result = super().get_dataproto(ref, fields=fields, rows=rows)
+            return {
+                "batch": {name: value[:-1] for name, value in result["batch"].items()},
+                "non_tensor_batch": result["non_tensor_batch"],
+                "meta_info": {},
+            }
+
+    transfer = TruncatingTransfer(sharded_fragments(np.zeros((4, 1), np.float32), 1))
+    _catalog, client = catalog_client(transfer)
+    keys = [f"k{i}" for i in range(4)]
+    client.register("train", keys, handle("s0", ["score"], batch_size=4))
+
+    with pytest.raises(ValueError, match="read 3 rows, expected 4"):
+        client.read("train", keys, ["score"])
+
+
+def test_catalog_transfer_rejects_overlapping_register() -> None:
+    transfer = ShardTransfer(sharded_fragments(np.zeros((4, 1), np.float32), 1))
+    _catalog, client = catalog_client(transfer)
+    keys = [f"k{i}" for i in range(4)]
+    client.register("train", keys, handle("s0", ["score"], batch_size=4))
+    client.register("train", keys, handle("s0", ["score"], batch_size=4))
+
+    with pytest.raises(ValueError, match="already carry these fields"):
+        client.register("train", keys, handle("s1", ["score"], batch_size=4))
+    with pytest.raises(ValueError, match="already carry these fields"):
+        client.register(
+            "train",
+            keys,
+            handle("s2", ["score"], batch_size=4),
+            managed=False,
+        )
+    assert client._pending_publications == []
+
+
+def test_catalog_transfer_register_overwrite_replaces_field() -> None:
+    values = np.zeros((4, 1), np.float32)
+    transfer = ShardTransfer(sharded_fragments(values, 1))
+    _catalog, client = catalog_client(transfer)
+    keys = [f"k{i}" for i in range(4)]
+    client.register("train", keys, handle("s0", ["score"], batch_size=4))
+
+    client.register(
+        "train", keys, handle("s1", ["score"], batch_size=4), overwrite=True
+    )
+
+    plan = client.resolve("train", keys, ["score"])
+    assert set(plan["handles"]) == {"manifest/s1"}
+    assert transfer.cleaned == ["manifest/s0"]
 
 
 def test_catalog_ack_retry_does_not_republish_a_superseded_fragment() -> None:
