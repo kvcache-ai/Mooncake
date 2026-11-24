@@ -10,6 +10,7 @@
 #include <unordered_set>
 
 #include "client_service.h"
+#include "device/transfer_context.h"
 #include "common/read_singleflight.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
@@ -31,6 +32,12 @@ class FileStorage {
     tl::expected<void, ErrorCode> Shutdown();
 
     tl::expected<void, ErrorCode> Init();
+
+    // Background promotion must use the context that registered its source
+    // staging arena, rather than the requester's device or a fixed device 0.
+    device::TransferContext::Guard BindTransferContext() const {
+        return device::TransferContext::Guard(transfer_context_);
+    }
 
     void RemoveAll();
 
@@ -393,6 +400,7 @@ class FileStorage {
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
+    device::TransferContext transfer_context_;
     // Whether client_buffer_allocator_'s buffer is the io_uring fixed buffer,
     // which the destructor must unregister before the buffer is freed.
     bool uring_buffer_registered_ = false;

@@ -321,6 +321,18 @@ add_store_test(client_readonly_query_test client_readonly_query_test.cpp)
 add_store_test(prefetch_throttle_test prefetch_throttle_test.cpp)
 add_store_test(prefetch_task_master_test prefetch_task_master_test.cpp)
 add_store_test(prefetch_teardown_test prefetch_teardown_test.cpp)
+
+# Exercise ACL thread-local binding without an NPU SDK or device. Keep this
+# mock-only target separate from production Store/transport libraries.
+add_executable(ssd_transfer_context_test ssd_transfer_context_test.cpp)
+target_compile_definitions(ssd_transfer_context_test PRIVATE USE_ASCEND_DIRECT)
+target_include_directories(
+  ssd_transfer_context_test BEFORE
+  PRIVATE ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/tent/tests/mock_acl
+          ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_link_libraries(ssd_transfer_context_test PRIVATE glog::glog gtest
+                                                        gtest_main pthread)
+add_test(NAME ssd_transfer_context_test COMMAND ssd_transfer_context_test)
 add_store_test(segment_test segment_test.cpp)
 add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)
 target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

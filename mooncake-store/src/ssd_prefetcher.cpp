@@ -95,6 +95,11 @@ void RegisterAndPromote(Client& client, FileStorage& file_storage,
             throttle->markFailed(scoped);
         }
     };
+    auto context_guard = file_storage.BindTransferContext();
+    if (!context_guard.ok()) {
+        for (const auto& key : keys) on_key_done(key, false);
+        return;
+    }
     for (size_t i = 0; i < keys.size(); ++i) {
         auto register_result = client.RegisterPrefetchTask(keys[i], tenant_id);
         if (!register_result) {

@@ -1791,6 +1791,10 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
 }
 
 tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
+    device::TransferContext context;
+    if (!context.Capture(client_->GetProtocol())) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     // The buffer pool backs SSD-offload read results that are fetched by
     // remote peers via RDMA READ.  It must therefore be registered with
     // remote_accessible=true so its BufferDesc publishes an rkey; otherwise
@@ -1805,6 +1809,7 @@ tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
         return error_code;
     }
     staging_registered_ = true;
+    transfer_context_ = context;
     return {};
 }
 
