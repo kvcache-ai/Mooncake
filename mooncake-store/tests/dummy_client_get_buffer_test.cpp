@@ -31,6 +31,15 @@ DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 
 namespace mooncake {
+
+// Access DummyClient::client_id_ for the expiry regression below.
+class DummyClientHotCachePinTestPeer {
+   public:
+    static UUID client_id(const DummyClient &client) {
+        return client.client_id_;
+    }
+};
+
 namespace testing {
 
 // Register all RPC handlers that DummyClient needs
@@ -765,14 +774,6 @@ TEST_F(DummyClientGetBufferTest, Perf_BatchHotVsCold) {
     EXPECT_LT(hot_ms, fallback_ms)
         << "Batch hot cache path should be faster than fallback";
 }
-
-// Access DummyClient::client_id_ for the expiry regression below.
-class DummyClientHotCachePinTestPeer {
-   public:
-    static UUID client_id(const DummyClient &client) {
-        return client.client_id_;
-    }
-};
 
 // Regression for #5750: when a dummy client dies while holding a hot-cache
 // BufferHandle, daemon expiry unmaps SHM without running the destructor.
