@@ -2167,6 +2167,34 @@ for key, desc_list in descriptors_map.items():
 
 ---
 
+#### batch_query_read_only()
+
+Read-only batch query of replica metadata. Unlike `batch_get_replica_desc()`, this method grants no read lease and does not trigger promotion-on-hit, so it is safe to call for metadata classification (e.g. tier-aware admission control) without perturbing hot-path state.
+
+```python
+def batch_query_read_only(self, keys: List[str]) -> Dict[str, List[Replica::Descriptor]]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of mooncake store keys
+
+**Returns:**
+- `Dict[str, List[Replica::Descriptor]]`: Dictionary mapping keys to their list of replica descriptors. Keys that failed the query are omitted from the result.
+
+**Example:**
+```python
+descriptors_map = store.batch_query_read_only(["key1", "key2"])
+for key, desc_list in descriptors_map.items():
+    print(f"Replicas for key: {key}")
+    for desc in desc_list:
+        if desc.is_memory_replica():
+            print("MEMORY replica")
+        elif desc.is_dfs_replica():
+            print("DFS replica")
+```
+
+---
+
 #### create_copy_task()
 
 Creates an asynchronous copy task to replicate an object to target segments.
