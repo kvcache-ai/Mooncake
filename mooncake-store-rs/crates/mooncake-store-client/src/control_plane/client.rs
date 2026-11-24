@@ -1,8 +1,8 @@
 use super::codec::*;
 use super::*;
 use mooncake_store_route::{
-    RouteAuthorityRecord, RouteControlRequest, RouteControlResponse, RouteControlTransport,
-    RouteOwnerPageQuery,
+    RouteAuthorityPresence, RouteAuthorityRecord, RouteControlRequest, RouteControlResponse,
+    RouteControlTransport, RouteOwnerPageQuery,
 };
 
 impl RouteControlTransport for ControlPlaneClient {
@@ -40,7 +40,29 @@ fn decode_route_batch_get_reply(reply: pb::BatchGetRoutesReply) -> Result<RouteC
 
 fn decode_route_batch_contains_reply(
     reply: pb::BatchContainsRoutesReply,
+    include_presence: bool,
 ) -> Result<RouteControlResponse> {
+    if include_presence {
+        return Ok(RouteControlResponse::BatchGetPresence(
+            reply
+                .replies
+                .into_iter()
+                .map(|entry| {
+                    decode_error(entry.error)?;
+                    let presence = entry.presence.ok_or_else(|| {
+                        StoreError::Unsupported(
+                            "route authority returned a legacy contains reply without presence"
+                                .to_string(),
+                        )
+                    })?;
+                    Ok(RouteAuthorityPresence {
+                        live_version: presence.live_version.map(RouteVersion),
+                        delete_version: presence.delete_version.map(RouteVersion),
+                    })
+                })
+                .collect(),
+        ));
+    }
     Ok(RouteControlResponse::BatchContains(
         reply
             .replies
@@ -204,7 +226,10 @@ impl ControlPlaneClient {
                 namespace,
                 authority,
                 keys,
-            } => self.send_route_batch_contains(lease, namespace, authority, keys),
+                include_presence,
+            } => {
+                self.send_route_batch_contains(lease, namespace, authority, keys, include_presence)
+            }
             RouteControlRequest::BatchCompareAndSwap {
                 namespace,
                 authority,
@@ -254,11 +279,13 @@ impl ControlPlaneClient {
         namespace: String,
         authority: ClientStableId,
         keys: Vec<ObjectKey>,
+        include_presence: bool,
     ) -> Result<RouteControlResponse> {
         let request = pb::BatchContainsRoutesRequest {
             namespace,
             authority: authority.0.clone(),
             keys: keys.iter().map(|key| key.0.clone()).collect(),
+            include_presence,
         };
         match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
             request_id,
@@ -280,7 +307,7 @@ impl ControlPlaneClient {
                         "control stream batch_contains_routes reply type mismatch".to_string(),
                     ));
                 };
-                return decode_route_batch_contains_reply(reply);
+                return decode_route_batch_contains_reply(reply, include_presence);
             }
             Err(error) => {
                 warn!(
@@ -294,7 +321,7 @@ impl ControlPlaneClient {
         let reply = self.rpc_for_lease(lease, move |mut client| async move {
             client.batch_contains_routes(Request::new(request)).await
         })?;
-        decode_route_batch_contains_reply(reply)
+        decode_route_batch_contains_reply(reply, include_presence)
     }
 
     fn send_route_batch_get(
@@ -1662,5 +1689,51 @@ mod owner_page_decode_tests {
         })
         .expect_err("an oversized transport page must fail closed");
         assert!(matches!(error, StoreError::Transport(_)));
+    }
+}
+
+#[cfg(test)]
+mod contains_decode_tests {
+    use super::*;
+
+    #[test]
+    fn presence_decode_distinguishes_empty_snapshot_from_legacy_reply() {
+        let empty = decode_route_batch_contains_reply(
+            pb::BatchContainsRoutesReply {
+                replies: vec![pb::ContainsRouteReply {
+                    exists: false,
+                    error: None,
+                    presence: Some(pb::RoutePresenceSummary::default()),
+                }],
+            },
+            true,
+        )
+        .expect("empty presence should decode");
+        let RouteControlResponse::BatchGetPresence(mut records) = empty else {
+            panic!("expected presence response");
+        };
+        assert_eq!(
+            records.pop().expect("presence item").unwrap(),
+            RouteAuthorityPresence::default()
+        );
+
+        let legacy = decode_route_batch_contains_reply(
+            pb::BatchContainsRoutesReply {
+                replies: vec![pb::ContainsRouteReply {
+                    exists: true,
+                    error: None,
+                    presence: None,
+                }],
+            },
+            true,
+        )
+        .expect("legacy response should decode as an unsupported item");
+        let RouteControlResponse::BatchGetPresence(mut records) = legacy else {
+            panic!("expected presence response");
+        };
+        assert!(matches!(
+            records.pop().expect("legacy item"),
+            Err(StoreError::Unsupported(_))
+        ));
     }
 }

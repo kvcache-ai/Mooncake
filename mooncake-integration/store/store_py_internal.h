@@ -1,8 +1,8 @@
 #pragma once
 
 #include <glog/logging.h>
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/string.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -17,7 +17,7 @@
 
 #include "integration_utils.h"
 
-namespace py = pybind11;
+namespace py = nanobind;
 
 namespace mooncake {
 
@@ -70,7 +70,7 @@ inline std::vector<int64_t> tensor_shape_to_vector(const py::handle &tensor) {
     std::vector<int64_t> shape;
     shape.reserve(shape_tuple.size());
     for (const auto &dim : shape_tuple) {
-        shape.push_back(dim.cast<int64_t>());
+        shape.push_back(py::cast<int64_t>(dim));
     }
     return shape;
 }
@@ -118,11 +118,12 @@ inline py::object materialize_contiguous_tensor(const py::handle &tensor) {
     py::object contiguous = tensor.attr("contiguous")();
 #ifdef USE_MLU
     if (!contiguous.is(tensor) &&
-        contiguous.attr("device").attr("type").cast<std::string>() == "mlu") {
+        py::cast<std::string>(contiguous.attr("device").attr("type")) ==
+            "mlu") {
         // CNRT copies do not wait for work on PyTorch's current MLU stream.
         // The caller can synchronize its input, but this new copy is ours.
         // Wait before exposing its pointer to Store, including for TP shards.
-        py::module_::import("torch")
+        py::module_::import_("torch")
             .attr("mlu")
             .attr("current_stream")(contiguous.attr("device"))
             .attr("synchronize")();
@@ -136,10 +137,8 @@ inline PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
                                              bool require_contiguous,
                                              const char *role) {
     PyTensorInfo info = {0, 0, {}, py::none()};
-    if (!(tensor.attr("__class__")
-              .attr("__name__")
-              .cast<std::string>()
-              .find("Tensor") != std::string::npos)) {
+    if (py::cast<std::string>(tensor.attr("__class__").attr("__name__"))
+            .find("Tensor") == std::string::npos) {
         LOG(ERROR) << role << " " << (key_name.empty() ? "" : "for " + key_name)
                    << " is not a PyTorch tensor";
         return info;
@@ -147,7 +146,7 @@ inline PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
 
     try {
         if (require_contiguous &&
-            !tensor.attr("is_contiguous")().cast<bool>()) {
+            !py::cast<bool>(tensor.attr("is_contiguous")())) {
             LOG(ERROR) << role << " "
                        << (key_name.empty() ? "" : "for " + key_name)
                        << " must be contiguous";
@@ -157,9 +156,10 @@ inline PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
         py::object inspected =
             require_contiguous ? tensor : materialize_contiguous_tensor(tensor);
         info.owner = inspected;
-        info.data_ptr = inspected.attr("data_ptr")().cast<uintptr_t>();
-        size_t numel = inspected.attr("numel")().cast<size_t>();
-        size_t element_size = inspected.attr("element_size")().cast<size_t>();
+        info.data_ptr = py::cast<uintptr_t>(inspected.attr("data_ptr")());
+        size_t numel = py::cast<size_t>(inspected.attr("numel")());
+        size_t element_size =
+            py::cast<size_t>(inspected.attr("element_size")());
         info.tensor_size = numel * element_size;
 
         TensorDtype dtype_enum = get_tensor_dtype(inspected.attr("dtype"));
@@ -168,7 +168,8 @@ inline PyTensorInfo extract_tensor_info_impl(const py::object &tensor,
                        << (key_name.empty() ? "" : " for " + key_name);
             return {0, 0, {}, py::none()};
         }
-        int32_t ndim = static_cast<int32_t>(py::len(inspected.attr("shape")));
+        int32_t ndim =
+            static_cast<int32_t>(py::len(py::object(inspected.attr("shape"))));
         if (ndim > static_cast<int32_t>(kMaxTensorDims)) {
             LOG(ERROR) << "Tensor has more than " << kMaxTensorDims
                        << " dimensions: " << ndim;
@@ -236,7 +237,7 @@ inline std::optional<py::object> materialize_shard_tensor(
         return std::nullopt;
     }
 
-    py::object torch_tensor = py::reinterpret_borrow<py::object>(tensor);
+    py::object torch_tensor = py::borrow<py::object>(tensor);
     const auto [start, size] =
         calculate_shard_range(shape[split_dim], rank, shard_count);
     return materialize_contiguous_tensor(

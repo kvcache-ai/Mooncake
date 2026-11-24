@@ -35,6 +35,9 @@ SyncTransferExecutor::~SyncTransferExecutor() {
 int SyncTransferExecutor::initialize() { return initEngines(); }
 
 void SyncTransferExecutor::finalize() {
+    // Same lock disconnectAllPeers() holds, so teardown cannot free engines
+    // while that call is still using them.
+    std::lock_guard<std::mutex> disconnect_all(disconnect_all_mutex_);
     if (finalized_) {
         return;
     }

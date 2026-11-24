@@ -119,6 +119,8 @@ class TcpTransport : public Transport {
 
     virtual Status receiveNotification(std::vector<Notification> &notify_list);
 
+    bool supportsParallelBatchSubmit() const override { return true; }
+
    private:
     Status uninstallImpl(bool force);
 

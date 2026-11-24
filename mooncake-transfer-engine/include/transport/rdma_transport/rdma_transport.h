@@ -227,6 +227,8 @@ class RdmaTransport : public Transport {
         return context_list_;
     }
 
+    bool supportsParallelBatchSubmit() const override { return true; }
+
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::atomic<bool> notify_running_{false};

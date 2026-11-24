@@ -12,7 +12,9 @@ use parking_lot::Mutex as ParkingMutex;
 use crate::metrics::record_delete_marker_state;
 use crate::shim::RouteAuthorityService;
 use crate::table::LocalRouteTable;
-use crate::{RouteAuthorityRecord, RouteOwnerPage, DEFAULT_ROUTE_OWNER_PAGE_SIZE};
+use crate::{
+    RouteAuthorityPresence, RouteAuthorityRecord, RouteOwnerPage, DEFAULT_ROUTE_OWNER_PAGE_SIZE,
+};
 
 pub(crate) fn bind_local_authority_service(
     namespace: &str,
@@ -88,6 +90,22 @@ pub(crate) fn authority_get_records(
         return Err(not_attached(authority));
     }
     Ok(slot.table.get_records(keys))
+}
+
+pub(crate) fn authority_get_presence_many(
+    namespace: &str,
+    authority: &ClientStableId,
+    keys: &[ObjectKey],
+) -> Result<Vec<RouteAuthorityPresence>> {
+    let mesh = route_mesh(namespace);
+    let slot = mesh
+        .authorities
+        .get(&authority.0)
+        .ok_or_else(|| not_attached(authority))?;
+    if slot.ref_count == 0 {
+        return Err(not_attached(authority));
+    }
+    Ok(slot.table.get_presence_many(keys))
 }
 
 pub(crate) fn authority_contains_many(
