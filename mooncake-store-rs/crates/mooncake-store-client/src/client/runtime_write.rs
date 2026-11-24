@@ -223,6 +223,9 @@ impl StoreClient {
                 let tracker =
                     OperationTracker::new("put_remote_batch_write").input_bytes(remote_bytes);
                 let result = (|| {
+                    // Transfer requests only borrow source addresses. Keep the
+                    // reservation across submission and completion polling.
+                    let scratch;
                     let requests = if let Some(source) = registered_source {
                         let mut requests = Vec::new();
                         for (handle, target_offset, info) in &remote_requests {
@@ -238,7 +241,7 @@ impl StoreClient {
                         }
                         requests
                     } else {
-                        let scratch = {
+                        scratch = {
                             let state = self.state.lock();
                             state.memory_ref()?.plan_scratch(&[value.len()])?
                         };
