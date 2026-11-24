@@ -123,6 +123,109 @@ TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
     ASSERT_EQ(re, 0);
 }
 
+static TransferMetadata::BufferDesc makeTestBuffer(const char *name,
+                                                   uint64_t addr,
+                                                   uint64_t length) {
+    TransferMetadata::BufferDesc buffer{};
+    buffer.name = name;
+    buffer.addr = addr;
+    buffer.length = length;
+    return buffer;
+}
+
+TEST(TransferMetadataBatchTest, MatchesSingleBufferOperations) {
+    using BufferDesc = TransferMetadata::BufferDesc;
+    TransferMetadata single(P2PHANDSHAKE);
+    TransferMetadata batch(P2PHANDSHAKE);
+    for (auto *metadata : {&single, &batch}) {
+        auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+        segment->name = "local";
+        ASSERT_EQ(metadata->addLocalSegment(LOCAL_SEGMENT_ID, "local",
+                                            std::move(segment)),
+                  0);
+    }
+
+    std::vector<BufferDesc> buffers{
+        makeTestBuffer("foreign", 0x4000, 0x100),
+        makeTestBuffer("first", 0x2000, 0x100),
+        makeTestBuffer("second", 0x2000, 0x200),
+        makeTestBuffer("kept", 0x1000, 0x100),
+    };
+    buffers[1].rkey = {1};
+    buffers[2].rkey = {2};
+    for (const auto &buffer : buffers)
+        ASSERT_EQ(single.addLocalMemoryBuffer(buffer, false), 0);
+    ASSERT_EQ(batch.addLocalMemoryBuffers(buffers, true), 0);
+    auto snapshot = batch.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_EQ(snapshot->buffers,
+              single.getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers);
+    EXPECT_TRUE(snapshot->buffer_range_index.overlaps());
+
+    auto eligible = [](const BufferDesc &buffer) {
+        return buffer.name != "foreign";
+    };
+    auto *duplicate = reinterpret_cast<void *>(0x2000);
+    const std::vector<void *> addresses{
+        duplicate, reinterpret_cast<void *>(0x4000), duplicate, duplicate,
+        reinterpret_cast<void *>(0x3000)};
+    std::vector<int> expected;
+    for (auto *addr : addresses)
+        expected.push_back(
+            single.removeLocalMemoryBuffer(addr, eligible, false));
+    std::vector<int> results;
+    EXPECT_EQ(
+        batch.removeLocalMemoryBuffers(addresses, eligible, true, &results),
+        ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_EQ(results, expected);
+
+    auto remaining = batch.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    auto single_remaining = single.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    EXPECT_EQ(remaining->buffers, single_remaining->buffers);
+    ASSERT_EQ(remaining->buffers.size(), 2U);
+    EXPECT_FALSE(remaining->buffer_range_index.overlaps());
+    for (uint64_t addr : {0x4000, 0x2000, 0x1000, 0x40ff, 0x4100}) {
+        EXPECT_EQ(remaining->buffer_range_index.findCovering(addr, 1),
+                  single_remaining->buffer_range_index.findCovering(addr, 1));
+    }
+    EXPECT_EQ(snapshot->buffers, buffers);
+    EXPECT_TRUE(snapshot->buffer_range_index.overlaps());
+
+    EXPECT_EQ(batch.addLocalMemoryBuffers({}, true), 0);
+    EXPECT_EQ(batch.removeLocalMemoryBuffers({}, eligible, true, &results), 0);
+    EXPECT_TRUE(results.empty());
+    EXPECT_EQ(batch.getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers,
+              remaining->buffers);
+}
+
+#ifdef USE_CXL
+TEST(TransferMetadataBatchTest, ConsumesCxlAliasInRequestOrder) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "local";
+    segment->cxl_base_addr = 0x8000;
+    ASSERT_EQ(
+        metadata.addLocalSegment(LOCAL_SEGMENT_ID, "local", std::move(segment)),
+        0);
+    auto first = makeTestBuffer("first", 0x1000, 0x100);
+    first.offset = 0x2000;
+    auto second = makeTestBuffer("second", 0xa000, 0x100);
+    second.offset = 0x3000;
+    const std::vector<TransferMetadata::BufferDesc> buffers{first, second};
+    ASSERT_EQ(metadata.addLocalMemoryBuffers(buffers, false), 0);
+
+    const std::vector<void *> aliases{reinterpret_cast<void *>(0xa000),
+                                      reinterpret_cast<void *>(0x1000)};
+    EXPECT_EQ(metadata.removeLocalMemoryBuffers(aliases, false),
+              ERR_ADDRESS_NOT_REGISTERED);
+    auto remaining = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_EQ(remaining->buffers.size(), 1U);
+    EXPECT_EQ(remaining->buffers.front(), buffers.back());
+    const std::vector<void *> last_alias{reinterpret_cast<void *>(0xb000)};
+    EXPECT_EQ(metadata.removeLocalMemoryBuffers(last_alias, false), 0);
+    EXPECT_TRUE(metadata.getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+}
+#endif
+
 TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
     TransferMetadata server(P2PHANDSHAKE);
     int sockfd = -1;

@@ -98,6 +98,10 @@ class ShmTransport : public Transport {
     bool getShmName(void* addr, std::string* name) const;
 
    private:
+    int describeLocalMemory(void* addr, size_t length,
+                            const std::string& location,
+                            TransferMetadata::BufferDesc& desc);
+
     struct OpenedShmEntry {
         void* shm_addr = nullptr;
         uint64_t length = 0;

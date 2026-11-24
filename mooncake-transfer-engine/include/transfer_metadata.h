@@ -29,6 +29,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -68,7 +69,7 @@ class TransferMetadata {
 
     struct BufferDesc {
         std::string name;
-        uint64_t addr;
+        uint64_t addr = 0;
         uint64_t length;
         int32_t device_id = -1;  // CUDA device (NCCL) or Ascend engine index
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -85,7 +86,7 @@ class TransferMetadata {
         std::vector<mr_key_t> lkey;  // for rdma/efa
         std::vector<mr_key_t> rkey;  // for rdma/efa
         std::string shm_name;  // nvlink/hip IPC blob, or POSIX shm object name
-        uint64_t offset;       // for cxl
+        uint64_t offset = 0;   // for cxl
         std::vector<std::string> tseg;      // for ub/urma
         std::vector<uint32_t> l_seg_index;  // for ub/urma
 
@@ -147,7 +148,7 @@ class TransferMetadata {
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
         // this is for cxl.
         std::string cxl_name;
-        uint64_t cxl_base_addr;
+        uint64_t cxl_base_addr = 0;
         // TODO : make these two a union or a std::variant
         std::string timestamp;
         // this is for ascend
@@ -283,6 +284,9 @@ class TransferMetadata {
     int addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                              bool update_metadata);
 
+    int addLocalMemoryBuffers(std::span<const BufferDesc> buffers,
+                              bool update_metadata);
+
     // Removes the local descriptor entry before optional metadata publication.
     // If publication fails, the local removal remains committed; a retry must
     // publish the updated descriptor rather than remove the entry again.
@@ -295,6 +299,18 @@ class TransferMetadata {
     int removeLocalMemoryBuffer(
         void *addr, const std::function<bool(const BufferDesc &)> &pred,
         bool update_metadata);
+
+    // Removes the first eligible entry per address, in request order. A
+    // missing entry does not prevent other removals, but takes precedence
+    // over a publish error in the return value. Empty batches are no-ops.
+    // pred tests eligibility for each candidate independently. When provided,
+    // results records 0 or ERR_ADDRESS_NOT_REGISTERED for each input address.
+    int removeLocalMemoryBuffers(std::span<void *const> addrs,
+                                 bool update_metadata);
+    int removeLocalMemoryBuffers(
+        std::span<void *const> addrs,
+        const std::function<bool(const BufferDesc &)> &pred,
+        bool update_metadata, std::vector<int> *results = nullptr);
 
     // Rebuilds interned NIC paths on `desc` before insert. The caller must
     // exclusively own `desc`; do not pass a live descriptor from the metadata

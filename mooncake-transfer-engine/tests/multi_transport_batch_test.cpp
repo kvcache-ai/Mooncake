@@ -17,6 +17,7 @@
 #include "common.h"
 #include "config.h"
 #include "multi_transport.h"
+#include "transfer_engine.h"
 #include "transfer_metadata.h"
 
 namespace mooncake {
@@ -26,8 +27,95 @@ class MultiTransportBatchTestPeer {
                         std::shared_ptr<Transport> transport) {
         multi.transport_map_[name] = std::move(transport);
     }
+
+    static int registerMemory(Transport& transport, void* addr, size_t length) {
+        return transport.registerLocalMemory(addr, length, "*", true, false);
+    }
+
+    static int unregisterMemory(Transport& transport, void* addr) {
+        return transport.unregisterLocalMemory(addr, false);
+    }
+
+    static int registerBatch(
+        Transport& transport,
+        const std::vector<Transport::BufferEntry>& entries) {
+        return transport.registerLocalMemoryBatch(entries, "*");
+    }
+
+    static int unregisterBatch(Transport& transport,
+                               const std::vector<void*>& addresses) {
+        return transport.unregisterLocalMemoryBatch(addresses);
+    }
 };
 namespace {
+#ifdef USE_TCP
+TEST(TcpMemoryBatchTest, RepeatedRegistrationAndMixedRemovalMatchSingles) {
+    using Peer = MultiTransportBatchTestPeer;
+    char buffer[32]{};
+    void* a = buffer;
+    void* b = buffer + 8;
+    void* missing = buffer + 16;
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0", "127.0.0.1", 0), 0);
+    auto* tcp = engine.installTransport("tcp", nullptr);
+    ASSERT_NE(tcp, nullptr);
+    auto metadata = tcp->meta();
+
+    TransferMetadata::BufferDesc foreign{};
+    foreign.name = "shm";
+    foreign.addr = reinterpret_cast<uint64_t>(a);
+    foreign.length = 8;
+    foreign.shm_name = "/shm-buffer";
+#ifdef ENABLE_MULTI_PROTOCOL
+    foreign.protocol = "shm";
+#endif
+    ASSERT_EQ(metadata->addLocalMemoryBuffer(foreign, false), 0);
+    const auto local = [&]() {
+        return metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    };
+    const std::vector<Transport::BufferEntry> entries{{a, 8}, {b, 8}};
+    for (int i = 0; i < 2; ++i) {
+        for (const auto& entry : entries)
+            ASSERT_EQ(Peer::registerMemory(*tcp, entry.addr, entry.length), 0);
+    }
+    auto registered = local();
+    for (void* addr : {a, b, a, b})
+        ASSERT_EQ(Peer::unregisterMemory(*tcp, addr), 0);
+    ASSERT_EQ(local()->buffers.size(), 1U);
+    ASSERT_EQ(local()->buffers.front(), foreign);
+
+    EXPECT_EQ(Peer::registerBatch(*tcp, {}), 0);
+    EXPECT_EQ(Peer::unregisterBatch(*tcp, {}), 0);
+    ASSERT_EQ(Peer::registerBatch(*tcp, entries), 0);
+    ASSERT_EQ(Peer::registerBatch(*tcp, entries), 0);
+    auto current = local();
+    ASSERT_EQ(current->buffers.size(), registered->buffers.size());
+    for (size_t i = 0; i < current->buffers.size(); ++i) {
+        const auto& actual = current->buffers[i];
+        const auto& expected = registered->buffers[i];
+        EXPECT_EQ(actual.addr, expected.addr);
+        EXPECT_EQ(actual.length, expected.length);
+        EXPECT_EQ(actual.name, expected.name);
+        EXPECT_EQ(actual.shm_name, expected.shm_name);
+#ifdef ENABLE_MULTI_PROTOCOL
+        EXPECT_EQ(actual.protocol, expected.protocol);
+#endif
+    }
+
+    EXPECT_EQ(Peer::unregisterBatch(*tcp, {a, missing, a, a, b}),
+              ERR_ADDRESS_NOT_REGISTERED);
+    ASSERT_EQ(local()->buffers.size(), 2U);
+    EXPECT_EQ(local()->buffers.front(), foreign);
+    EXPECT_EQ(local()->buffer_range_index.findCovering(
+                  reinterpret_cast<uint64_t>(b), 8),
+              1);
+    EXPECT_EQ(Peer::unregisterBatch(*tcp, {b}), 0);
+    EXPECT_EQ(Peer::unregisterBatch(*tcp, {a, b}), ERR_ADDRESS_NOT_REGISTERED);
+    ASSERT_EQ(local()->buffers.size(), 1U);
+    EXPECT_EQ(local()->buffers.front(), foreign);
+}
+#endif
+
 class RecordingTransport : public Transport {
    public:
     std::vector<uint64_t> addresses;
