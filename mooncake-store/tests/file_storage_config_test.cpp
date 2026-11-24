@@ -73,6 +73,15 @@ struct FileStorageEnvironment {
         "MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO"};
     ScopedEnvVar use_uring{"MOONCAKE_OFFLOAD_USE_URING"};
     ScopedEnvVar legacy_use_uring{"MOONCAKE_USE_URING"};
+    ScopedEnvVar local_streaming_read{"MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ"};
+    ScopedEnvVar stream_use_uring{"MOONCAKE_OFFLOAD_STREAM_USE_URING"};
+    ScopedEnvVar stream_fixed_buffers{"MOONCAKE_OFFLOAD_STREAM_FIXED_BUFFERS"};
+    ScopedEnvVar stream_slot_bytes{"MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES"};
+    ScopedEnvVar stream_slots{"MOONCAKE_OFFLOAD_STREAM_SLOTS"};
+    ScopedEnvVar stream_read_threads{"MOONCAKE_OFFLOAD_STREAM_READ_THREADS"};
+    ScopedEnvVar stream_write_threads{"MOONCAKE_OFFLOAD_STREAM_WRITE_THREADS"};
+    ScopedEnvVar stream_max_outstanding{
+        "MOONCAKE_OFFLOAD_STREAM_MAX_OUTSTANDING"};
 };
 
 void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
@@ -91,6 +100,14 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_TRUE(config.enable_disk_watermark_eviction);
     EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
     EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.80);
+    EXPECT_FALSE(config.streaming_read.enabled);
+    EXPECT_FALSE(config.streaming_read.use_uring);
+    EXPECT_FALSE(config.streaming_read.fixed_buffers);
+    EXPECT_EQ(config.streaming_read.slot_bytes, 1024u * 1024u);
+    EXPECT_EQ(config.streaming_read.slots, 4u);
+    EXPECT_EQ(config.streaming_read.read_workers, 4u);
+    EXPECT_EQ(config.streaming_read.write_workers, 2u);
+    EXPECT_EQ(config.streaming_read.max_outstanding, 64u);
 }
 
 class FileStorageConfigTest : public ::testing::Test {
@@ -369,6 +386,33 @@ TEST_F(FileStorageConfigTest, ValidateFailsOnInvalidLimits) {
 
     config.disk_eviction_low_watermark_ratio = 0.8;
     config.disk_eviction_high_watermark_ratio = 1.1;
+    EXPECT_FALSE(config.Validate());
+}
+
+TEST_F(FileStorageConfigTest, StreamingReadEnvAndValidation) {
+    env.storage_path.Set(data_path.c_str());
+    env.local_buffer_size.Set("16777216");
+    env.local_streaming_read.Set("true");
+    env.stream_use_uring.Set("true");
+    env.stream_fixed_buffers.Set("true");
+    env.stream_slot_bytes.Set("1048576");
+    env.stream_slots.Set("4");
+    env.stream_read_threads.Set("2");
+    env.stream_write_threads.Set("3");
+    env.stream_max_outstanding.Set("16");
+
+    auto config = FileStorageConfig::FromEnvironment();
+    EXPECT_TRUE(config.streaming_read.enabled);
+    EXPECT_TRUE(config.streaming_read.use_uring);
+    EXPECT_TRUE(config.streaming_read.fixed_buffers);
+    EXPECT_EQ(config.streaming_read.slot_bytes, 1048576u);
+    EXPECT_EQ(config.streaming_read.slots, 4u);
+    EXPECT_EQ(config.streaming_read.read_workers, 2u);
+    EXPECT_EQ(config.streaming_read.write_workers, 3u);
+    EXPECT_EQ(config.streaming_read.max_outstanding, 16u);
+    EXPECT_TRUE(config.Validate());
+
+    config.streaming_read.slots = 32;  // 32 * 1 MiB > 16 MiB arena
     EXPECT_FALSE(config.Validate());
 }
 

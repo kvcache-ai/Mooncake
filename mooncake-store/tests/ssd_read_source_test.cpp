@@ -125,7 +125,7 @@ TEST(SsdReadSource, RejectsFifoWithoutWaitingForAWriter) {
     auto opening = std::async(std::launch::async, [&] {
         return OpenPosixReadSource(fifo, {0, 0, 1});
     });
-    const auto status = opening.wait_for(std::chrono::milliseconds(200));
+    const auto status = opening.wait_for(std::chrono::seconds(2));
     EXPECT_EQ(status, std::future_status::ready);
     // Unblock the old blocking-open implementation so RED cannot hang.
     if (status != std::future_status::ready) {

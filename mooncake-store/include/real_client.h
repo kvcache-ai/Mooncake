@@ -1002,7 +1002,8 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
         const std::string &target_rpc_service_addr,
         std::unordered_map<std::string, std::vector<Slice>> &objects,
-        const OffloadReadRange *read_range = nullptr);
+        const OffloadReadRange *read_range = nullptr,
+        bool allow_local_streaming = true);
 
     // Owner restore for LOCAL_DISK: RPC batch_get_offload_object or
     // BatchGetLocal. Callers copy out of the restored arena (sequential

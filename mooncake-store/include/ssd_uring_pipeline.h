@@ -29,6 +29,7 @@ class UringReadExecutor {
     // Stops admission and drains before joining. Call externally, never from
     // a completion callback. An unprovable kernel drain can block indefinitely.
     void Shutdown();
+    bool healthy() const noexcept;
     size_t outstanding() const;
     size_t worker_count() const noexcept;
 

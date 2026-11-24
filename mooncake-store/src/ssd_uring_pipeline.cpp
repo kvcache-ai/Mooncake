@@ -24,6 +24,22 @@ bool Same(const SlotToken& a, const SlotToken& b) {
            a.slot_index == b.slot_index && a.generation == b.generation &&
            a.chunk_index == b.chunk_index;
 }
+bool RingSupportsOpcode(io_uring& ring, int opcode) noexcept {
+    io_uring_probe* probe = io_uring_get_probe_ring(&ring);
+    if (!probe) return false;
+    const bool supported = io_uring_opcode_supported(probe, opcode) != 0;
+    io_uring_free_probe(probe);
+    return supported;
+}
+std::chrono::steady_clock::time_point ClampedDeadline(
+    std::chrono::milliseconds timeout) noexcept {
+    const auto start = std::chrono::steady_clock::now();
+    const auto clamped = std::max(timeout, std::chrono::milliseconds::zero());
+    const auto max_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::time_point::max() - start);
+    return clamped >= max_ms ? std::chrono::steady_clock::time_point::max()
+                             : start + clamped;
+}
 }  // namespace
 
 struct UringReadExecutor::Impl {
@@ -48,6 +64,7 @@ struct UringReadExecutor::Impl {
             if (io_uring_queue_init(unsigned(active.size()), &ring, 0) < 0)
                 return false;
             initialized = true;
+            if (!RingSupportsOpcode(ring, IORING_OP_READ)) return false;
             signal = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
             return signal >= 0;
         }
@@ -57,7 +74,8 @@ struct UringReadExecutor::Impl {
             do {
                 result = ::write(signal, &one, sizeof(one));
             } while (result < 0 && errno == EINTR);
-            return result == sizeof(one) || (result < 0 && errno == EAGAIN);
+            return result == ssize_t(sizeof(one)) ||
+                   (result < 0 && errno == EAGAIN);
         }
         io_uring ring{};
         int signal{-1};
@@ -83,6 +101,7 @@ struct UringReadExecutor::Impl {
     }
     void Fail() noexcept {
         std::lock_guard lock(mutex);
+        if (failed) return;
         failed = stopping = true;
         credit.notify_all();
         for (auto& worker : workers) (void)worker->Wake();
@@ -123,7 +142,8 @@ struct UringReadExecutor::Impl {
                            op.offset + op.done);
         sqe->user_data = op.id;
     }
-    void Harvest(Worker& worker) {
+    bool Harvest(Worker& worker) {
+        bool prepared_retry = false;
         io_uring_cqe* cqe = nullptr;
         while (io_uring_peek_cqe(&worker.ring, &cqe) == 0) {
             const auto id = cqe->user_data;
@@ -148,7 +168,10 @@ struct UringReadExecutor::Impl {
                     op.done += size_t(completed);
                     op.retries = 0;
                     const auto info = op.source->info();
-                    const auto end = info.value_file_offset + info.object_bytes;
+                    const uint64_t end =
+                        info.object_bytes > UINT64_MAX - info.value_file_offset
+                            ? UINT64_MAX
+                            : info.value_file_offset + info.object_bytes;
                     const auto required =
                         op.offset < end ? std::min<uint64_t>(op.buffer.size(),
                                                              end - op.offset)
@@ -160,16 +183,22 @@ struct UringReadExecutor::Impl {
             }
             if (retry) {
                 std::lock_guard lock(mutex);
-                if (!stopping && worker.next_id != UINT64_MAX) {
+                if (!failed && worker.next_id != UINT64_MAX) {
                     if (auto* sqe = io_uring_get_sqe(&worker.ring)) {
                         PrepareRead(worker, sqe, op);
+                        prepared_retry = true;
                         continue;
                     }
                 }
                 error = Error::kIoError;
             }
-            Complete(std::move(*found), {op.done, error});
+            const int sys_errno = (error == Error::kIoError && completed < 0 &&
+                                   completed > std::numeric_limits<int>::min())
+                                      ? -completed
+                                      : 0;
+            Complete(std::move(*found), {op.done, error, sys_errno});
         }
+        return prepared_retry;
     }
     void Prepare(Worker& worker) {
         for (auto& active : worker.active) {
@@ -221,7 +250,7 @@ struct UringReadExecutor::Impl {
             }
             Prepare(worker);
             Flush(worker);
-            Harvest(worker);
+            if (Harvest(worker)) continue;
             {
                 std::lock_guard lock(mutex);
                 const bool idle = std::none_of(
@@ -310,7 +339,7 @@ bool UringReadExecutor::Submit(std::shared_ptr<ReadSource> source, int fd,
                                bool wait) noexcept {
     constexpr auto max_offset = uint64_t(std::numeric_limits<off_t>::max());
     if (!source || fd < 0 || source->native_read_fd() != fd || !buffer.data() ||
-        buffer.empty() || buffer.size() > UINT_MAX ||
+        buffer.empty() || buffer.size() > INT_MAX ||
         buffer.size() > std::numeric_limits<uintptr_t>::max() -
                             reinterpret_cast<uintptr_t>(buffer.data()) ||
         file_offset > max_offset || buffer.size() > max_offset - file_offset ||
@@ -331,6 +360,10 @@ bool UringReadExecutor::Submit(std::shared_ptr<ReadSource> source, int fd,
     }
 }
 void UringReadExecutor::Shutdown() { impl_->Shutdown(); }
+bool UringReadExecutor::healthy() const noexcept {
+    std::lock_guard lock(impl_->mutex);
+    return !impl_->stopping && !impl_->failed;
+}
 size_t UringReadExecutor::outstanding() const {
     std::lock_guard lock(impl_->mutex);
     return impl_->pending;
@@ -365,6 +398,7 @@ struct UringPipelineDriver::Impl {
           records(this->buffers.size()) {}
     bool Init(Options options) {
         if (options.reader && !options.fixed_buffers) {
+            if (!options.reader->healthy()) return false;
             reader = std::move(options.reader);
             return true;
         }
@@ -385,6 +419,9 @@ struct UringPipelineDriver::Impl {
                 io_uring_register_buffers(&ring, iovecs.data(),
                                           unsigned(buffers.size())) == 0;
         }
+        const int required_op =
+            buffers_registered ? IORING_OP_READ_FIXED : IORING_OP_READ;
+        if (!RingSupportsOpcode(ring, required_op)) return false;
         return true;
     }
     ~Impl() {
@@ -403,7 +440,10 @@ struct UringPipelineDriver::Impl {
             IoCompletion ignored;
             Wait(ignored, std::chrono::milliseconds(100));
         }
-        if (buffers_registered) (void)io_uring_unregister_buffers(&ring);
+        if (buffers_registered) {
+            while (io_uring_unregister_buffers(&ring) == -EINTR) {
+            }
+        }
         if (initialized) io_uring_queue_exit(&ring);
         if (signal >= 0) close(signal);
     }
@@ -440,19 +480,30 @@ struct UringPipelineDriver::Impl {
                buffer.data == buffers[token.slot_index].data &&
                buffer.capacity == buffers[token.slot_index].capacity &&
                chunk.read_bytes <= buffer.capacity &&
-               chunk.read_bytes <= UINT_MAX &&
+               chunk.read_bytes <= INT_MAX &&
                chunk.file_offset <=
                    uint64_t(std::numeric_limits<off_t>::max()) &&
                chunk.read_bytes <= uint64_t(std::numeric_limits<off_t>::max()) -
                                        chunk.file_offset;
     }
-    void Flush() noexcept {
+    bool Flush() noexcept {
         // SQPOLL is disabled: accepted reads are batched until the scheduler
         // next polls. Submission errors are not completion/drain evidence.
+        bool submitted_any = false;
         while (initialized && io_uring_sq_ready(&ring)) {
             const int submitted = io_uring_submit(&ring);
-            if (submitted <= 0) break;
+            if (submitted > 0) {
+                submitted_any = true;
+                continue;
+            }
+            if (submitted < 0 && submitted != -EINTR && submitted != -EAGAIN &&
+                submitted != -ENOMEM && submitted != -EBUSY) {
+                std::lock_guard lock(mutex);
+                stopping = true;
+            }
+            break;
         }
+        return submitted_any;
     }
     bool Read(const SlotToken& token, const ReadChunk& chunk,
               SlotBuffer buffer) noexcept {
@@ -460,9 +511,9 @@ struct UringPipelineDriver::Impl {
         std::unique_lock lock(mutex);
         auto& record = records[token.slot_index];
         if (stopping || record.stage != Stage::kIdle) return false;
-        const int fd = source_fds[chunk_sources.empty()
-                                      ? 0
-                                      : chunk_sources[token.chunk_index]];
+        const size_t source_index =
+            chunk_sources.empty() ? 0 : chunk_sources[token.chunk_index];
+        const int fd = source_fds[source_index];
         if (reader) {
             record.stage = Stage::kRead;
             record.cancelled = false;
@@ -472,17 +523,16 @@ struct UringPipelineDriver::Impl {
             bool accepted = false;
             try {
                 accepted = reader->WaitSubmit(
-                    sources[chunk_sources.empty()
-                                ? 0
-                                : chunk_sources[token.chunk_index]],
-                    fd, {buffer.data, chunk.read_bytes}, chunk.file_offset,
-                    [this, token](ReadResult result) {
+                    sources[source_index], fd, {buffer.data, chunk.read_bytes},
+                    chunk.file_offset, [this, token](ReadResult result) {
                         std::lock_guard lock(mutex);
                         auto& completed = records[token.slot_index];
                         completed.event.bytes = result.bytes;
                         completed.event.result = completed.cancelled
                                                      ? Error::kCancelled
                                                      : result.error;
+                        completed.event.sys_errno =
+                            completed.cancelled ? 0 : result.sys_errno;
                         completed.stage = Stage::kReady;
                         --reads_running;
                         // Last driver access, including notification, stays
@@ -500,6 +550,12 @@ struct UringPipelineDriver::Impl {
             }
             return accepted;
         }
+        if (sources[source_index]->info().io_mode == ReadIoMode::kDirect &&
+            (reinterpret_cast<uintptr_t>(buffer.data) % kDirectReadAlignment !=
+                 0 ||
+             chunk.read_bytes % kDirectReadAlignment != 0 ||
+             chunk.file_offset % kDirectReadAlignment != 0))
+            return false;
         record.fd = fd;
         record.buffer = buffer.data;
         record.offset = chunk.file_offset;
@@ -548,9 +604,16 @@ struct UringPipelineDriver::Impl {
                         // Signal is part of the callback's physical quiescence.
                         // Keep the lock/count until its last access to this
                         // ring.
-                        while (signal >= 0 &&
-                               ::write(signal, &one, sizeof(one)) < 0 &&
-                               errno == EINTR) {
+                        if (signal >= 0) {
+                            ssize_t written;
+                            do {
+                                written = ::write(signal, &one, sizeof(one));
+                            } while (written < 0 && errno == EINTR);
+                            if (written != ssize_t(sizeof(one)) &&
+                                !(written < 0 && errno == EAGAIN)) {
+                                stopping = true;
+                                wait_failed = true;
+                            }
                         }
                         --writes_running;
                         changed.notify_all();
@@ -591,7 +654,8 @@ struct UringPipelineDriver::Impl {
         sqe->user_data = slot + 1;
         return true;
     }
-    void Harvest() {
+    bool Harvest() {
+        bool prepared_retry = false;
         io_uring_cqe* cqe = nullptr;
         while (initialized && io_uring_peek_cqe(&ring, &cqe) == 0) {
             const auto id = cqe->user_data;
@@ -622,7 +686,10 @@ struct UringPipelineDriver::Impl {
                              ? 0
                              : chunk_sources[record.event.token.chunk_index]];
                     const auto info = source->info();
-                    const auto end = info.value_file_offset + info.object_bytes;
+                    const uint64_t end =
+                        info.object_bytes > UINT64_MAX - info.value_file_offset
+                            ? UINT64_MAX
+                            : info.value_file_offset + info.object_bytes;
                     const auto required =
                         record.offset < end
                             ? std::min<uint64_t>(record.requested,
@@ -635,17 +702,26 @@ struct UringPipelineDriver::Impl {
             }
             if (retry) {
                 if (!stopping && !record.cancelled &&
-                    PrepareRead(record, size_t(id - 1)))
+                    PrepareRead(record, size_t(id - 1))) {
+                    prepared_retry = true;
                     continue;
+                }
                 error = Error::kIoError;
             }
             record.event.bytes = record.done;
             record.event.result = record.cancelled ? Error::kCancelled : error;
+            record.event.sys_errno =
+                (!record.cancelled && error == Error::kIoError &&
+                 completed < 0 && completed > std::numeric_limits<int>::min())
+                    ? -completed
+                    : 0;
             record.stage = Stage::kReady;
             --reads_running;
         }
+        return prepared_retry;
     }
     bool Wait(IoCompletion& event, std::chrono::milliseconds timeout) {
+        const auto until = ClampedDeadline(timeout);
         if (reader) {
             std::unique_lock lock(mutex);
             auto ready = [&] {
@@ -654,7 +730,7 @@ struct UringPipelineDriver::Impl {
                                         return record.stage == Stage::kReady;
                                     });
             };
-            if (!changed.wait_for(lock, timeout, [&] {
+            if (!changed.wait_until(lock, until, [&] {
                     return ready() != records.end() ||
                            (!reads_running && !writes_running);
                 }))
@@ -665,11 +741,12 @@ struct UringPipelineDriver::Impl {
             found->stage = Stage::kIdle;
             return true;
         }
-        const auto until = std::chrono::steady_clock::now() +
-                           std::max(timeout, std::chrono::milliseconds::zero());
         for (;;) {
             Harvest();
-            Flush();
+            while (Flush()) {
+                if (!Harvest()) break;
+            }
+            bool failed_wait = false;
             {
                 std::lock_guard lock(mutex);
                 for (auto& record : records) {
@@ -679,6 +756,7 @@ struct UringPipelineDriver::Impl {
                     return true;
                 }
                 if (!reads_running && !writes_running) return false;
+                failed_wait = wait_failed;
             }
             const auto now = std::chrono::steady_clock::now();
             if (now >= until || signal < 0) return false;
@@ -686,7 +764,7 @@ struct UringPipelineDriver::Impl {
                 std::chrono::duration_cast<std::chrono::milliseconds>(until -
                                                                       now)
                     .count();
-            if (wait_failed) {
+            if (failed_wait) {
                 // A wake-channel failure cannot prove completion. Stop new
                 // admissions and keep harvesting actual CQEs/write records,
                 // with bounded backoff instead of spinning on a broken fd.
@@ -694,10 +772,10 @@ struct UringPipelineDriver::Impl {
                 continue;
             }
             pollfd wake[] = {{ring.ring_fd, POLLIN, 0}, {signal, POLLIN, 0}};
-            const int result = poll(
-                wake, 2,
-                int(std::min<int64_t>(io_uring_sq_ready(&ring) ? 1 : INT_MAX,
-                                      std::max<int64_t>(1, ms))));
+            const int result =
+                poll(wake, 2,
+                     int(std::min<int64_t>(io_uring_sq_ready(&ring) ? 1 : 100,
+                                           std::max<int64_t>(1, ms))));
             if ((result < 0 && errno != EINTR) ||
                 (result > 0 && ((wake[0].revents | wake[1].revents) &
                                 (POLLERR | POLLHUP | POLLNVAL)))) {
@@ -772,7 +850,7 @@ UringPipelineDriver::Creation UringPipelineDriver::CreateImpl(
     std::vector<int> source_fds;
     source_fds.reserve(sources.size());
     for (const auto& source : sources) {
-        if (!source) return {};
+        if (!source) return {Error::kInvalidArgument, {}};
         const auto fd = source->native_read_fd();
         if (!fd || *fd < 0 || fcntl(*fd, F_GETFD) < 0) return {};
         source_fds.push_back(*fd);
@@ -782,7 +860,7 @@ UringPipelineDriver::Creation UringPipelineDriver::CreateImpl(
     std::vector<std::pair<uintptr_t, uintptr_t>> spans;
     for (auto buffer : buffers) {
         auto begin = reinterpret_cast<uintptr_t>(buffer.data);
-        if (!begin || !buffer.capacity || buffer.capacity > UINT_MAX ||
+        if (!begin || !buffer.capacity || buffer.capacity > INT_MAX ||
             buffer.capacity > std::numeric_limits<uintptr_t>::max() - begin)
             return {Error::kInvalidArgument, {}};
         spans.emplace_back(begin, begin + buffer.capacity);
@@ -847,6 +925,7 @@ bool UringReadExecutor::WaitSubmit(std::shared_ptr<ReadSource>, int,
     return false;
 }
 void UringReadExecutor::Shutdown() {}
+bool UringReadExecutor::healthy() const noexcept { return false; }
 size_t UringReadExecutor::outstanding() const { return 0; }
 size_t UringReadExecutor::worker_count() const noexcept { return 0; }
 struct UringPipelineDriver::Impl {};

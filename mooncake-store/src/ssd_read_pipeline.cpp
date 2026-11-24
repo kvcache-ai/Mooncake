@@ -76,10 +76,7 @@ PlanResult BuildReadPlan(const ObjectRead& object, PlanOptions options) {
         uint64_t range_bytes = 0;
         for (const auto& destination : range.destinations) {
             if (destination.length == 0) continue;
-            if (destination.region_id == 0 || destination.generation == 0)
-                return fail(Error::kInvalidArgument);
-            if (destination.length > UINT64_MAX - destination.offset ||
-                !Add(range_bytes, destination.length))
+            if (!Add(range_bytes, destination.length))
                 return fail(Error::kOverflow);
         }
         if (range.source_offset > object.object_bytes ||

@@ -50,12 +50,13 @@ struct BoundedExecutor::Impl {
         }
     }
     bool Submit(std::function<void()> task, bool wait) noexcept {
+        if (!task) return false;
         try {
             std::unique_lock lock(mutex);
             if (wait) {
                 changed.wait(lock, [&] { return stopping || pending < limit; });
             }
-            if (stopping || pending == limit || !task) return false;
+            if (stopping || pending == limit) return false;
             tasks.push(std::move(task));
             ++pending;
             changed.notify_all();
@@ -183,6 +184,7 @@ struct ThreadedPipelineDriver::Impl {
                                            chunk_ptr->file_offset);
                         event.bytes = result.bytes;
                         event.result = result.error;
+                        event.sys_errno = result.sys_errno;
                     } else {
                         event.result =
                             target->WriteAndDrain(*chunk_ptr, buffer);
@@ -224,6 +226,15 @@ struct ThreadedPipelineDriver::Impl {
             record.cancelled = true;
     }
     bool Wait(IoCompletion& event, std::chrono::milliseconds timeout) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto clamped =
+            std::max(timeout, std::chrono::milliseconds::zero());
+        const auto max_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::time_point::max() - start);
+        const auto until = clamped >= max_ms
+                               ? std::chrono::steady_clock::time_point::max()
+                               : start + clamped;
         std::unique_lock lock(mutex);
         auto ready = [&] {
             return std::find_if(records.begin(), records.end(),
@@ -231,7 +242,7 @@ struct ThreadedPipelineDriver::Impl {
                                     return record.state == State::kReady;
                                 });
         };
-        if (!changed.wait_for(lock, timeout, [&] {
+        if (!changed.wait_until(lock, until, [&] {
                 return ready() != records.end() || running == 0;
             }))
             return false;

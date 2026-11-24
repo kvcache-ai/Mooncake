@@ -150,6 +150,19 @@ class FileStorageTest : public ::testing::Test {
             [](const auto&, auto&) { return ErrorCode::OK; }));
     }
 
+    void PrepareStreamingObjects(
+        FileStorage& storage,
+        const std::vector<std::pair<std::string, std::string*>>& objects) {
+        ASSERT_TRUE(storage.storage_backend_->Init());
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        for (const auto& [key, value] : objects) {
+            batch.emplace(key,
+                          std::vector<Slice>{{value->data(), value->size()}});
+        }
+        ASSERT_TRUE(storage.storage_backend_->BatchOffload(
+            batch, [](const auto&, auto&) { return ErrorCode::OK; }));
+    }
+
     std::string data_path;
 
     static uintmax_t StoredFileBytes(const std::string& path) {
@@ -1225,6 +1238,10 @@ class FileStorageTest : public ::testing::Test {
             };
         fileStorage.OnDiskError(EIO, first_op);
         return fileStorage.disk_fenced_.load();
+    }
+
+    static void SetDiskFenced(FileStorage& storage, bool fenced) {
+        storage.disk_fenced_.store(fenced);
     }
 
     void AssertHeartbeatEvictsAllKeys(
@@ -3595,8 +3612,163 @@ TEST_F(FileStorageTest, LocalStreamingUringModesCopyAcrossSlots) {
         EXPECT_EQ(std::string(destination.data(), 16), std::string(16, 'z'));
         EXPECT_EQ(std::string(destination.end() - 16, destination.end()),
                   std::string(16, 'z'));
+        std::vector<char> multi_a(4096, 'z'), multi_b(4096, 'z');
+        ASSERT_TRUE(storage.ReadLocalStreaming(
+            {{key, value.size(), 100, {{multi_a.data(), multi_a.size()}}},
+             {key, value.size(), 5000, {{multi_b.data(), multi_b.size()}}}}));
+        EXPECT_EQ(std::string(multi_a.data(), multi_a.size()),
+                  value.substr(100, multi_a.size()));
+        EXPECT_EQ(std::string(multi_b.data(), multi_b.size()),
+                  value.substr(5000, multi_b.size()));
         ASSERT_TRUE(storage.Shutdown());
         EXPECT_FALSE(storage.SupportsLocalStreamingRead());
+    }
+}
+
+TEST_F(FileStorageTest, LocalStreamingRejectsWhenDiskFenced) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.streaming_read.enabled = true;
+    FileStorage storage(config, nullptr, "local");
+    std::string value(4096, 'f');
+    PrepareStreamingObject(storage, "fenced-key", value);
+    SetDiskFenced(storage, true);
+    std::array<char, 16> destination;
+    destination.fill('z');
+    auto result = storage.ReadLocalStreaming(
+        {{"fenced-key", value.size(), 0, {{destination.data(), 16}}}});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::FILE_READ_FAIL);
+    EXPECT_EQ(std::string(destination.data(), 16), std::string(16, 'z'));
+}
+
+TEST_F(FileStorageTest, LocalStreamingPlanLimitsReturnNoAvailableHandle) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.streaming_read.enabled = true;
+    config.streaming_read.slot_bytes = 4096;
+    config.streaming_read.max_chunks = 2;
+    config.streaming_read.max_fragments = 1;
+    FileStorage storage(config, nullptr, "local");
+    std::string value(16384, 'p');
+    PrepareStreamingObject(storage, "plan-limit-key", value);
+
+    std::vector<char> big_dest(16384, 'z');
+    auto too_many_chunks =
+        storage.ReadLocalStreaming({{"plan-limit-key",
+                                     value.size(),
+                                     0,
+                                     {{big_dest.data(), big_dest.size()}}}});
+    ASSERT_FALSE(too_many_chunks);
+    EXPECT_EQ(too_many_chunks.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(big_dest.front(), 'z');
+
+    std::array<char, 8> frag_a, frag_b;
+    frag_a.fill('z');
+    frag_b.fill('z');
+    auto too_many_fragments = storage.ReadLocalStreaming(
+        {{"plan-limit-key",
+          value.size(),
+          0,
+          {{frag_a.data(), frag_a.size()}, {frag_b.data(), frag_b.size()}}}});
+    ASSERT_FALSE(too_many_fragments);
+    EXPECT_EQ(too_many_fragments.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(std::string(frag_a.data(), 8), std::string(8, 'z'));
+}
+
+TEST_F(FileStorageTest, LocalStreamingReapsExpiredRemoteLease) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 1024 * 1024;
+    config.client_buffer_gc_ttl_ms = 5000;
+    config.streaming_read.enabled = true;
+    config.streaming_read.slot_bytes = 512 * 1024;
+    config.streaming_read.slots = 1;
+    FileStorage storage(config, nullptr, "local");
+    std::string value(768 * 1024, 'r');
+    for (size_t i = 0; i < value.size(); ++i) value[i] = char(i % 251);
+    PrepareStreamingObject(storage, "lease-reap-key", value);
+
+    // Exhaust the staging arena with a remote lease, then expire it without
+    // running the background GC thread.
+    auto lease = storage.BatchGet({"lease-reap-key"},
+                                  {static_cast<int64_t>(value.size())});
+    ASSERT_TRUE(lease);
+    ASSERT_TRUE(ExpireClientBufferBatch(storage, lease->batch_id));
+
+    std::vector<char> destination(value.size(), 'z');
+    ASSERT_TRUE(storage.ReadLocalStreaming(
+        {{"lease-reap-key",
+          value.size(),
+          0,
+          {{destination.data(), destination.size()}}}}));
+    EXPECT_EQ(std::memcmp(destination.data(), value.data(), value.size()), 0);
+}
+
+TEST_F(FileStorageTest, LocalStreamingOverlapBeatsPlanLimitAndSmallBatchSlots) {
+    const std::string overlap_dir = data_path + "/overlap";
+    const std::string multi_dir = data_path + "/multi";
+    ASSERT_TRUE(fs::create_directories(overlap_dir));
+    ASSERT_TRUE(fs::create_directories(multi_dir));
+    std::string value(4096, 'm');
+
+    {
+        FileStorageConfig config;
+        config.storage_filepath = overlap_dir;
+        config.local_buffer_size = 512 * 1024;
+        config.streaming_read.enabled = true;
+        config.streaming_read.slot_bytes = 512 * 1024;
+        config.streaming_read.slots = 1;
+        config.streaming_read.max_chunks = 1;
+        FileStorage storage(config, nullptr, "local");
+        PrepareStreamingObjects(storage,
+                                {{"small-a", &value}, {"small-b", &value}});
+
+        // Overlapping destinations must return INVALID_PARAMS even when the
+        // batch also exceeds max_chunks (so RealClient will not fall back on
+        // overlap).
+        std::array<char, 8192> overlap_buf;
+        overlap_buf.fill('z');
+        auto overlap = storage.ReadLocalStreaming(
+            {{"small-a", value.size(), 0, {{overlap_buf.data(), value.size()}}},
+             {"small-b",
+              value.size(),
+              0,
+              {{overlap_buf.data() + 1024, value.size()}}}});
+        ASSERT_FALSE(overlap);
+        EXPECT_EQ(overlap.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(overlap_buf[0], 'z');
+    }
+
+    {
+        // A multi-object batch under partial staging pressure degrades
+        // gracefully to the remaining free slot instead of failing when a
+        // live 512 KiB remote lease occupies half of the 1 MiB arena.
+        FileStorageConfig config;
+        config.storage_filepath = multi_dir;
+        config.local_buffer_size = 1024 * 1024;
+        config.client_buffer_gc_ttl_ms = 60000;
+        config.streaming_read.enabled = true;
+        config.streaming_read.slot_bytes = 512 * 1024;
+        config.streaming_read.slots = 2;
+        config.streaming_read.max_chunks = 4;
+        FileStorage multi(config, nullptr, "local");
+        std::string occupy_value(512 * 1024, 'o');
+        PrepareStreamingObjects(multi, {{"occupy-slot", &occupy_value},
+                                        {"multi-a", &value},
+                                        {"multi-b", &value}});
+        auto lease = multi.BatchGet(
+            {"occupy-slot"}, {static_cast<int64_t>(occupy_value.size())});
+        ASSERT_TRUE(lease);
+        std::vector<char> out_a(value.size(), 'z'), out_b(value.size(), 'z');
+        ASSERT_TRUE(multi.ReadLocalStreaming(
+            {{"multi-a", value.size(), 0, {{out_a.data(), out_a.size()}}},
+             {"multi-b", value.size(), 0, {{out_b.data(), out_b.size()}}}}));
+        EXPECT_EQ(std::string(out_a.data(), out_a.size()), value);
+        EXPECT_EQ(std::string(out_b.data(), out_b.size()), value);
+        EXPECT_TRUE(multi.ReleaseBuffer(lease->batch_id));
     }
 }
 

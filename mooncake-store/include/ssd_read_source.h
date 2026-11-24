@@ -24,6 +24,7 @@ struct ReadSourceInfo {
 struct ReadResult {
     size_t bytes{0};
     Error error{Error::kOk};
+    int sys_errno{0};
 };
 
 class ReadSource {
@@ -42,6 +43,7 @@ class ReadSource {
 struct ReadSourceResult {
     Error error;
     std::shared_ptr<ReadSource> source;
+    int sys_errno{0};
 };
 
 // Buffered mode retains the legacy planner-only alignment contract. Direct

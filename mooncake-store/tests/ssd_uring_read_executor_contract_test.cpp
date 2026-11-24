@@ -240,12 +240,32 @@ size_t Fds() {
         std::distance(std::filesystem::directory_iterator("/proc/self/fd"),
                       std::filesystem::directory_iterator{}));
 }
+bool KernelUringAvailable() {
+    io_uring ring{};
+    const int rc = __real_io_uring_queue_init(2, &ring, 0);
+    if (rc == 0) {
+        io_uring_probe* probe = io_uring_get_probe_ring(&ring);
+        const bool supported =
+            probe && io_uring_opcode_supported(probe, IORING_OP_READ) != 0;
+        if (probe) io_uring_free_probe(probe);
+        __real_io_uring_queue_exit(&ring);
+        return supported;
+    }
+    return rc != -ENOSYS && rc != -EPERM && rc != -EACCES && rc != -ENOMEM;
+}
 
 class PersistentKernel
     : public testing::TestWithParam<std::tuple<size_t, bool>> {};
 TEST_P(PersistentKernel,
        ReusesWorkerRingsAcrossRequestsAndChecksEveryDestinationByte) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     const auto [workers, direct] = GetParam();
+    if (direct) {
+        File probe_file(1);
+        if (!Source(probe_file, true)) {
+            GTEST_SKIP() << "O_DIRECT unsupported on /tmp filesystem";
+        }
+    }
     Observation observation;
     Observe scope(observation);
     auto reader = UringReadExecutor::Create(workers, 8);
@@ -294,6 +314,7 @@ INSTANTIATE_TEST_SUITE_P(OneTwoFourWorkersBufferedAndDirect, PersistentKernel,
 
 TEST(SsdUringReadExecutorContract,
      DistinctRequestsWithSameSlotGenerationDoNotCrossDeliver) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     File first(11), second(191);
     auto source_a = Source(first), source_b = Source(second);
     ASSERT_TRUE(source_a && source_b);
@@ -336,6 +357,7 @@ TEST(SsdUringReadExecutorContract,
 
 TEST(SsdUringReadExecutorContract,
      CancelledRequestDoesNotCancelAnotherRequest) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     File first(9), second(109);
     Arena arena_a, arena_b;
     auto target_a = std::make_shared<Target>(),
@@ -366,6 +388,7 @@ TEST(SsdUringReadExecutorContract,
 
 TEST(SsdUringReadExecutorContract,
      BlockedWriteRetainsItsSlotWhileAnotherRequestCompletes) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     File first(27), second(163);
     Arena arena_a(1), arena_b(1);
     BoundedExecutor writes(2, 8);
@@ -411,6 +434,7 @@ TEST(SsdUringReadExecutorContract,
 }
 
 TEST(SsdUringReadExecutorContract, FixedOptionRetainsTheRequestLocalPath) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     Observation observation;
     Observe scope(observation);
     File file(59);
@@ -439,6 +463,7 @@ TEST(SsdUringReadExecutorContract, FixedOptionRetainsTheRequestLocalPath) {
 
 class SharedCredit : public testing::TestWithParam<size_t> {};
 TEST_P(SharedCredit, GlobalLimitIncludesQueuedRunningAndBlockedCallbacks) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     File file(33);
     auto source = Source(file);
     ASSERT_TRUE(source);
@@ -494,6 +519,7 @@ INSTANTIATE_TEST_SUITE_P(OneTwoFourWorkers, SharedCredit,
 
 TEST(SsdUringReadExecutorContract,
      CreditAndShutdownIncludeCompletionClosureDestruction) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     File file(51);
     auto source = Source(file);
     ASSERT_TRUE(source);
@@ -535,6 +561,7 @@ TEST(SsdUringReadExecutorContract,
 
 TEST(SsdUringReadExecutorContract,
      ThrowingCallbackDoesNotKillWorkerOrLeakCredit) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     File file(89);
     auto source = Source(file);
     ASSERT_TRUE(source);
@@ -562,6 +589,7 @@ TEST(SsdUringReadExecutorContract,
 }
 
 TEST(SsdUringReadExecutorContract, InvalidAdmissionAcceptsNoAccessOrCallback) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     File file(17);
     auto source = Source(file);
     ASSERT_TRUE(source);
@@ -602,6 +630,7 @@ TEST(SsdUringReadExecutorContract, InvalidConfigurationCreatesNoRing) {
 
 TEST(SsdUringReadExecutorContract,
      PartialStartupFailureClosesEverySuccessfulRing) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     for (bool fail_wakeup : {false, true}) {
         Observation observation;
         Observe scope(observation);

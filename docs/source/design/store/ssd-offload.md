@@ -139,14 +139,18 @@ file while a bounded set of staging slots reads and copies chunks into the
 caller's destinations. Whole objects and ranges can exceed the staging arena.
 The default is disabled.
 
+`MOONCAKE_OFFLOAD_READ_IO_THREADS` configures the dedicated restore RPC read
+executor pool size (default 64, valid range 1–128), keeping blocking legacy SSD
+reads off the `coro_rpc` I/O event loop.
+
 `MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES` defaults to 1 MiB and
 `MOONCAKE_OFFLOAD_STREAM_SLOTS` defaults to four. Read and copy executors
 default to four and two workers, configured with
 `MOONCAKE_OFFLOAD_STREAM_READ_THREADS` and
 `MOONCAKE_OFFLOAD_STREAM_WRITE_THREADS`.
-`MOONCAKE_OFFLOAD_STREAM_MAX_OUTSTANDING` bounds accepted tasks and source
-leases. Full executors apply backpressure. Shutdown waits for accepted local
-reads before releasing their staging memory.
+`MOONCAKE_OFFLOAD_STREAM_MAX_OUTSTANDING` (default 64) bounds accepted tasks
+and source leases. Full executors apply backpressure. Shutdown waits for
+accepted local reads before releasing their staging memory.
 
 The entire batch is checked for invalid ranges and overlapping destinations
 before copying. A preflight capacity failure can use the existing restore
@@ -161,11 +165,13 @@ slot until its completion is consumed. Partial reads continue from the
 completed offset, and transient completion errors have a finite retry budget.
 Submission backpressure keeps accepted work within the configured limit.
 
-`MOONCAKE_OFFLOAD_STREAM_FIXED_BUFFERS=true` uses a request-local ring with
+`MOONCAKE_OFFLOAD_STREAM_FIXED_BUFFERS=true` (when combined with
+`MOONCAKE_OFFLOAD_STREAM_USE_URING=true`) uses a per-object ring with
 the staging slots registered as fixed buffers. Registration failure uses
-ordinary READ on that ring. A build or kernel without io_uring uses the
-portable pread driver. Both drivers drain accepted work before source and
-staging release.
+ordinary READ on that ring. If `io_uring` is unavailable at build or runtime,
+or if the persistent `io_uring` read executor enters a failed state, local
+streaming falls back to the portable `pread` driver. Both drivers drain
+accepted work before source and staging release.
 
 ## Storage Backends
 

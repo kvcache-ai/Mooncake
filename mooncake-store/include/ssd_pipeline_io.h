@@ -53,6 +53,7 @@ struct IoCompletion {
     SlotStage stage{SlotStage::kFree};
     size_t bytes{0};
     Error result{Error::kOk};
+    int sys_errno{0};
 };
 
 class EventPipelineDriver : public PipelineDriver {

@@ -441,6 +441,8 @@ class FileStorage {
         return client_buffer_shards_[batch_id % kClientBufferShards];
     }
 
+    void ReapExpiredClientBuffers();
+
     std::atomic<uint64_t> next_batch_id_{1};
 
     /**

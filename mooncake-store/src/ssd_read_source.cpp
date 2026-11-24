@@ -40,6 +40,8 @@ class PosixReadSource final : public ReadSource {
             buffer.size() >
                 static_cast<size_t>(std::numeric_limits<ssize_t>::max()))
             return {0, Error::kOverflow};
+        if (!buffer.empty() && !buffer.data())
+            return {0, Error::kInvalidArgument};
         if (info_.io_mode == ReadIoMode::kDirect) {
             if (reinterpret_cast<uintptr_t>(buffer.data()) %
                         kDirectReadAlignment !=
@@ -56,7 +58,7 @@ class PosixReadSource final : public ReadSource {
                       static_cast<off_t>(file_offset + bytes));
             if (result < 0) {
                 if (errno == EINTR) continue;
-                return {bytes, Error::kIoError};
+                return {bytes, Error::kIoError, errno};
             }
             if (result == 0) break;
             bytes += static_cast<size_t>(result);
@@ -101,17 +103,21 @@ ReadSourceResult OpenPosixReadSource(const std::string& path,
         return {Error::kNotSupported, {}};
 #endif
     }
-    ScopedFd fd(open(path.c_str(), flags));
-    if (fd.get() < 0) return {Error::kIoError, {}};
+    int raw_fd = -1;
+    do {
+        raw_fd = open(path.c_str(), flags);
+    } while (raw_fd < 0 && errno == EINTR);
+    ScopedFd fd(raw_fd);
+    if (fd.get() < 0) return {Error::kIoError, {}, errno};
     struct stat metadata{};
-    if (fstat(fd.get(), &metadata) != 0) return {Error::kIoError, {}};
+    if (fstat(fd.get(), &metadata) != 0) return {Error::kIoError, {}, errno};
     if (!S_ISREG(metadata.st_mode) || metadata.st_size < 0 ||
         info.value_file_offset + info.object_bytes >
             static_cast<uint64_t>(metadata.st_size))
         return {Error::kInvalidArgument, {}};
     const int status = fcntl(fd.get(), F_GETFL);
     if (status < 0 || fcntl(fd.get(), F_SETFL, status & ~O_NONBLOCK) < 0)
-        return {Error::kIoError, {}};
+        return {Error::kIoError, {}, errno};
     auto source =
         std::make_shared<PosixReadSource>(fd.get(), info, std::move(lifetime));
     fd.Release();

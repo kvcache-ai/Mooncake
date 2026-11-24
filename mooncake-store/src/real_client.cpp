@@ -5218,30 +5218,38 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         void *dst = static_cast<char *>(buffer) + dst_offset;
         std::unordered_map<std::string, std::vector<Slice>> objects{
             {key, {{dst, size}}}};
-        if (can_use_pinned_restore_arena(endpoint, objects)) {
-            auto result = batch_get_into_offload_object_internal(
-                endpoint, objects, &read_range);
-            if (!result) return tl::unexpected(result.error());
-            return static_cast<int64_t>(size);
-        }
-        if (CanUseLocalStreamingRestore(file_storage_.get(), local_rpc_addr,
-                                        endpoint, objects)) {
+        bool use_pinned_restore = false;
+        bool tried_local_streaming = false;
+        if (endpoint == local_rpc_addr) {
             RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
             if (!inflight.ok()) {
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
-            const TenantId tenant_id(client_->tenant_id());
-            auto result = file_storage_->ReadLocalStreaming({{
-                tenant_id.MakeScopedKey(key),
-                uint64_t(read_range.object_size),
-                read_range.source_offset,
-                objects.at(key),
-            }});
-            if (result) return static_cast<int64_t>(size);
-            if (result.error() != ErrorCode::NO_AVAILABLE_HANDLE &&
-                result.error() != ErrorCode::NOT_SUPPORTED) {
-                return tl::unexpected(result.error());
+            use_pinned_restore =
+                can_use_pinned_restore_arena(endpoint, objects);
+            if (!use_pinned_restore &&
+                CanUseLocalStreamingRestore(file_storage_.get(), local_rpc_addr,
+                                            endpoint, objects)) {
+                tried_local_streaming = true;
+                const TenantId tenant_id(client_->tenant_id());
+                auto result = file_storage_->ReadLocalStreaming({{
+                    tenant_id.MakeScopedKey(key),
+                    uint64_t(read_range.object_size),
+                    read_range.source_offset,
+                    objects.at(key),
+                }});
+                if (result) return static_cast<int64_t>(size);
+                if (result.error() != ErrorCode::NO_AVAILABLE_HANDLE &&
+                    result.error() != ErrorCode::NOT_SUPPORTED) {
+                    return tl::unexpected(result.error());
+                }
             }
+        }
+        if (use_pinned_restore) {
+            auto result = batch_get_into_offload_object_internal(
+                endpoint, objects, &read_range);
+            if (!result) return tl::unexpected(result.error());
+            return static_cast<int64_t>(size);
         }
 
         return partial_disk_read(
@@ -5249,8 +5257,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 std::unordered_map<std::string, std::vector<Slice>> objects;
                 objects.emplace(key, std::vector<Slice>{
                                          {static_cast<char *>(tmp_buf), size}});
-                return batch_get_into_offload_object_internal(endpoint, objects,
-                                                              &read_range);
+                return batch_get_into_offload_object_internal(
+                    endpoint, objects, &read_range, !tried_local_streaming);
             },
             size);
     }
@@ -9623,7 +9631,7 @@ async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
 RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
                                      const std::vector<int64_t> &sizes) {
     RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
-    if (!inflight.ok()) {
+    if (!inflight.ok() || !file_storage_ || !client_) {
         co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
@@ -9655,7 +9663,7 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
     co_return BatchGetOffloadObjectResponse(
         result.value().batch_id, std::move(result.value().pointers),
         client_->GetSegmentEndpoint(),
-        file_storage_->config_.client_buffer_gc_ttl_ms);
+        state->file_storage->config_.client_buffer_gc_ttl_ms);
 }
 
 async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
@@ -9664,7 +9672,7 @@ RealClient::batch_get_offload_object_ranges(
     const std::vector<int64_t> &sizes,
     const std::vector<int64_t> &object_sizes) {
     RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
-    if (!inflight.ok()) {
+    if (!inflight.ok() || !file_storage_ || !client_) {
         co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
@@ -9700,7 +9708,7 @@ RealClient::batch_get_offload_object_ranges(
     co_return BatchGetOffloadObjectResponse(
         result.value().batch_id, std::move(result.value().pointers),
         client_->GetSegmentEndpoint(),
-        file_storage_->config_.client_buffer_gc_ttl_ms);
+        state->file_storage->config_.client_buffer_gc_ttl_ms);
 }
 
 bool RealClient::release_offload_buffer(uint64_t batch_id) {
@@ -9894,7 +9902,7 @@ RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
 bool RealClient::can_use_pinned_restore_arena(
     const std::string &target_rpc_service_addr,
     const std::unordered_map<std::string, std::vector<Slice>> &objects) const {
-    if (!file_storage_ || target_rpc_service_addr != local_rpc_addr ||
+    if (target_rpc_service_addr != local_rpc_addr || !file_storage_ ||
         !file_storage_->HasPinnedRestoreArena()) {
         return false;
     }
@@ -9986,9 +9994,17 @@ tl::expected<void, ErrorCode>
 RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
     std::unordered_map<std::string, std::vector<Slice>> &objects,
-    const OffloadReadRange *read_range) {
-    RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
-    if (!inflight.ok()) return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    const OffloadReadRange *read_range, bool allow_local_streaming) {
+    // Only local-owner restores touch local file_storage_. Holding
+    // offload_rpc_drain_ across outbound remote peer RPCs would block
+    // tearDownAll_internal() behind dead-peer network timeouts.
+    std::optional<RpcDrainGuard::ScopedCall> local_inflight;
+    if (target_rpc_service_addr == local_rpc_addr) {
+        local_inflight.emplace(offload_rpc_drain_);
+        if (!local_inflight->ok()) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
     if (read_range && objects.size() != 1) {
@@ -10022,7 +10038,8 @@ RealClient::batch_get_into_offload_object_internal(
         sizes.emplace_back(storage_size);
     }
 
-    if (CanUseLocalStreamingRestore(file_storage_.get(), local_rpc_addr,
+    if (allow_local_streaming && local_inflight.has_value() &&
+        CanUseLocalStreamingRestore(file_storage_.get(), local_rpc_addr,
                                     target_rpc_service_addr, objects)) {
         const TenantId tenant_id(client_->tenant_id());
         std::vector<FileStorage::LocalReadRequest> requests;

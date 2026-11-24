@@ -2176,8 +2176,13 @@ BucketStorageBackend::AcquireReadSource(const std::string& key,
         {expected_size, uint64_t(metadata.offset + metadata.key_size),
          alignment, mode},
         std::move(guard));
-    if (opened.error != ssd_offload::Error::kOk)
+    if (opened.error != ssd_offload::Error::kOk) {
+        if (opened.error == ssd_offload::Error::kIoError &&
+            opened.sys_errno != 0) {
+            NotifyDiskError(opened.sys_errno, "open");
+        }
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
     return std::move(opened.source);
 }
 

@@ -4,12 +4,16 @@
 #include <gtest/gtest.h>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <future>
 #include <fcntl.h>
 #include <limits>
 #include <thread>
 #include <unistd.h>
+#if defined(__linux__) && defined(USE_URING)
+#include <liburing.h>
+#endif
 
 namespace mooncake::ssd_offload {
 namespace {
@@ -54,6 +58,38 @@ struct Arena {
     }
 };
 #if defined(__linux__) && defined(USE_URING)
+bool KernelUringAvailable() {
+    io_uring ring{};
+    const int rc = io_uring_queue_init(2, &ring, 0);
+    if (rc == 0) {
+        io_uring_probe* probe = io_uring_get_probe_ring(&ring);
+        const bool supported =
+            probe && io_uring_opcode_supported(probe, IORING_OP_READ) != 0;
+        if (probe) io_uring_free_probe(probe);
+        io_uring_queue_exit(&ring);
+        return supported;
+    }
+    return rc != -ENOSYS && rc != -EPERM && rc != -EACCES && rc != -ENOMEM;
+}
+struct DriverBeforePlanRelease {
+    std::unique_ptr<UringPipelineDriver>& driver;
+    bool active{true};
+    void Disarm() { active = false; }
+    ~DriverBeforePlanRelease() {
+        if (active) driver.reset();
+    }
+};
+struct ReleaseTargetOnExit {
+    std::shared_ptr<Target> target;
+    bool released{false};
+    void Release() {
+        if (!released && target) {
+            released = true;
+            target->resume.set_value();
+        }
+    }
+    ~ReleaseTargetOnExit() { Release(); }
+};
 ReadPlan Plan() {
     return BuildReadPlan({30000, 37, {{0, {{1, 1, 32, 30000}}}}},
                          {4096, 1, 100})
@@ -105,6 +141,7 @@ TEST(SsdUringPipeline, InvalidDescriptorCannotBecomeAFixedFile) {
 }
 
 TEST(SsdUringPipeline, NativeCqeCopiesMultipleRollingSlotsAndEofTail) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     File file;
     auto source = OpenPosixReadSource(file.path, {30000, 37, 1}).source;
     ASSERT_TRUE(source);
@@ -117,6 +154,7 @@ TEST(SsdUringPipeline, NativeCqeCopiesMultipleRollingSlotsAndEofTail) {
     ASSERT_EQ(made.error, Error::kOk);
     ASSERT_TRUE(made.driver);
     ReadPipeline pipeline(1, 1, Plan(), arena.buffers(), *made.driver);
+    DriverBeforePlanRelease cleanup{made.driver};
     ASSERT_EQ(pipeline.Start(), Error::kOk);
     while (pipeline.inflight()) {
         IoCompletion event;
@@ -133,6 +171,7 @@ TEST(SsdUringPipeline, NativeCqeCopiesMultipleRollingSlotsAndEofTail) {
     }
 }
 TEST(SsdUringPipeline, ReadCqeProgressesWhileWriteIsBlockedAndCancelDrains) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     File file;
     auto source = OpenPosixReadSource(file.path, {30000, 37, 1}).source;
     auto target = std::make_shared<Target>();
@@ -144,6 +183,8 @@ TEST(SsdUringPipeline, ReadCqeProgressesWhileWriteIsBlockedAndCancelDrains) {
         UringPipelineDriver::Create(source, target, writes, arena.buffers());
     ASSERT_EQ(made.error, Error::kOk);
     ReadPipeline pipeline(1, 1, Plan(), arena.buffers(), *made.driver);
+    DriverBeforePlanRelease cleanup{made.driver};
+    ReleaseTargetOnExit release{target};
     ASSERT_EQ(pipeline.Start(), Error::kOk);
     IoCompletion first, second;
     const bool ready = made.driver->WaitForEvent(first, 2s);
@@ -157,7 +198,7 @@ TEST(SsdUringPipeline, ReadCqeProgressesWhileWriteIsBlockedAndCancelDrains) {
     pipeline.Cancel();
     if (next) Deliver(pipeline, second);
     EXPECT_NE(pipeline.inflight(), 0u);
-    target->resume.set_value();
+    release.Release();
     while (pipeline.inflight()) {
         IoCompletion event;
         ASSERT_TRUE(made.driver->WaitForEvent(event, 2s));
@@ -167,6 +208,7 @@ TEST(SsdUringPipeline, ReadCqeProgressesWhileWriteIsBlockedAndCancelDrains) {
 }
 
 TEST(SsdUringPipeline, RebindsDifferentFilesAfterDeliveredPipelineCompletions) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     File first, second;
     for (auto& byte : second.bytes) byte ^= std::byte{0x5A};
     int fd = open(second.path, O_WRONLY);
@@ -188,6 +230,7 @@ TEST(SsdUringPipeline, RebindsDifferentFilesAfterDeliveredPipelineCompletions) {
     source.reset();
     {
         ReadPipeline pipeline(1, 1, Plan(), arena.buffers(), *made.driver);
+        DriverBeforePlanRelease cleanup{made.driver};
         ASSERT_EQ(pipeline.Start(), Error::kOk);
         EXPECT_EQ(made.driver->RebindSource(next), Error::kInvalidState);
         while (pipeline.inflight()) {
@@ -199,6 +242,8 @@ TEST(SsdUringPipeline, RebindsDifferentFilesAfterDeliveredPipelineCompletions) {
         ASSERT_EQ(std::memcmp(target->bytes.data() + 32,
                               first.bytes.data() + 37, 30000),
                   0);
+        // Keep driver alive across the scope for the subsequent RebindSource.
+        cleanup.Disarm();
     }
     EXPECT_FALSE(retained.expired());
     ASSERT_EQ(made.driver->RebindSource(next), Error::kOk);
@@ -209,6 +254,7 @@ TEST(SsdUringPipeline, RebindsDifferentFilesAfterDeliveredPipelineCompletions) {
     ASSERT_EQ(planned.error, Error::kOk);
     ReadPipeline pipeline(1, 1, std::move(planned.plan), arena.buffers(),
                           *made.driver);
+    DriverBeforePlanRelease second_cleanup{made.driver};
     ASSERT_EQ(pipeline.Start(), Error::kOk);
     while (pipeline.inflight()) {
         IoCompletion event;
@@ -227,6 +273,7 @@ TEST(SsdUringPipeline, RebindsDifferentFilesAfterDeliveredPipelineCompletions) {
 }
 
 TEST(SsdUringPipeline, RebindRejectsBlockedWritesAndUndeliveredCompletions) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     File file;
     auto source = OpenPosixReadSource(file.path, {30000, 37, 1}).source;
     auto next = OpenPosixReadSource(file.path, {30000, 37, 1}).source;
@@ -239,12 +286,14 @@ TEST(SsdUringPipeline, RebindRejectsBlockedWritesAndUndeliveredCompletions) {
         UringPipelineDriver::Create(source, target, writes, arena.buffers());
     ASSERT_EQ(made.error, Error::kOk);
     auto chunk = Plan().chunks[0];
+    DriverBeforePlanRelease cleanup{made.driver};
+    ReleaseTargetOnExit release{target};
     ASSERT_TRUE(
         made.driver->SubmitWrite({1, 1, 0, 1, 0}, chunk, arena.buffers()[0]));
     const auto state = entered.wait_for(2s);
     EXPECT_EQ(state, std::future_status::ready);
     EXPECT_EQ(made.driver->RebindSource(next), Error::kInvalidState);
-    target->resume.set_value();
+    release.Release();
     const auto until = std::chrono::steady_clock::now() + 2s;
     while (writes.outstanding() && std::chrono::steady_clock::now() < until)
         std::this_thread::sleep_for(1ms);
@@ -259,6 +308,7 @@ TEST(SsdUringPipeline, RebindRejectsBlockedWritesAndUndeliveredCompletions) {
 }
 
 TEST(SsdUringPipeline, FailedRebindRetainsOldSourceAndStopsNewSubmissions) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     struct InvalidFd final : ReadSource {
         ReadSourceInfo info() const noexcept override { return {30000, 37, 1}; }
         std::optional<int> native_read_fd() const noexcept override {
@@ -293,6 +343,7 @@ TEST(SsdUringPipeline, FailedRebindRetainsOldSourceAndStopsNewSubmissions) {
 }
 
 TEST(SsdUringPipeline, NegativeRebindCannotRemoveTheRegisteredSource) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
     struct NegativeFd final : ReadSource {
         ReadSourceInfo info() const noexcept override { return {30000, 37, 1}; }
         std::optional<int> native_read_fd() const noexcept override {
@@ -315,6 +366,7 @@ TEST(SsdUringPipeline, NegativeRebindCannotRemoveTheRegisteredSource) {
     EXPECT_EQ(made.driver->RebindSource(std::make_shared<NegativeFd>()),
               Error::kNotSupported);
     ReadPipeline pipeline(1, 1, Plan(), arena.buffers(), *made.driver);
+    DriverBeforePlanRelease cleanup{made.driver};
     ASSERT_EQ(pipeline.Start(), Error::kOk);
     while (pipeline.inflight()) {
         IoCompletion event;

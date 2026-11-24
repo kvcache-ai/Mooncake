@@ -144,6 +144,8 @@ struct Kernel {
     size_t poll_entries{0}, poll_interruptions{0}, poll_eintr_delivered{0},
         fail_wakes{0};
     size_t registrations{0};
+    bool support_read_op{true};
+    bool support_read_fixed_op{true};
     std::shared_ptr<Ring> First() {
         std::lock_guard lock(mutex);
         return rings.at(0);
@@ -272,11 +274,37 @@ extern "C" int io_uring_register_buffers(io_uring*, const iovec*, unsigned) {
     return -ENOTSUP;
 }
 extern "C" int io_uring_unregister_buffers(io_uring*) { return 0; }
+extern "C" io_uring_probe* io_uring_get_probe_ring(io_uring*) {
+    auto* kernel = fake_uring::current.load();
+    if (!kernel) return nullptr;
+    bool allow_read = true;
+    bool allow_read_fixed = true;
+    {
+        std::lock_guard lock(kernel->mutex);
+        allow_read = kernel->support_read_op;
+        allow_read_fixed = kernel->support_read_fixed_op;
+    }
+    auto* probe = new io_uring_probe{};
+    probe->last_op = IORING_OP_READ;
+    probe->ops_len = IORING_OP_READ + 1;
+    if (allow_read) {
+        probe->ops[IORING_OP_READ].op = IORING_OP_READ;
+        probe->ops[IORING_OP_READ].flags = IO_URING_OP_SUPPORTED;
+    }
+    if (allow_read_fixed) {
+        probe->ops[IORING_OP_READ_FIXED].op = IORING_OP_READ_FIXED;
+        probe->ops[IORING_OP_READ_FIXED].flags = IO_URING_OP_SUPPORTED;
+    }
+    return probe;
+}
+extern "C" void io_uring_free_probe(io_uring_probe* probe) { delete probe; }
 extern "C" int eventfd(unsigned initial, int flags) noexcept {
     const int fd = int(syscall(SYS_eventfd2, initial, flags));
-    if (auto* kernel = fake_uring::current.load()) {
-        std::lock_guard lock(kernel->mutex);
-        kernel->wake_fds.insert(fd);
+    if (fd >= 0) {
+        if (auto* kernel = fake_uring::current.load()) {
+            std::lock_guard lock(kernel->mutex);
+            kernel->wake_fds.insert(fd);
+        }
     }
     return fd;
 }
@@ -600,10 +628,13 @@ TEST(SsdUringReadExecutorFault,
     EXPECT_FALSE(pool->TrySubmit(probe_source, *probe_source->native_read_fd(),
                                  {arena.slot(0).data, kSlot}, 0,
                                  [rejected](ReadResult) { ++*rejected; }));
-    for (const auto& [id, result] : results->values) {
-        EXPECT_NE(id, 0u);
-        EXPECT_EQ(result.error, Error::kIoError);
-        EXPECT_EQ(result.bytes, 0u);
+    {
+        std::lock_guard lock(results->mutex);
+        for (const auto& [id, result] : results->values) {
+            EXPECT_NE(id, 0u);
+            EXPECT_EQ(result.error, Error::kIoError);
+            EXPECT_EQ(result.bytes, 0u);
+        }
     }
     auto closing = std::async(std::launch::async, [&] { pool->Shutdown(); });
     EXPECT_EQ(closing.wait_for(20ms), std::future_status::timeout);
@@ -660,13 +691,18 @@ TEST(SsdUringReadExecutorFault, WakeFailureAfterAcceptanceNeverReturnsFalse) {
     }
     ASSERT_TRUE(results->Wait(1));
     ASSERT_TRUE(Pending(pool, 0));
+    size_t remaining_fail_wakes = 0;
     {
         std::lock_guard lock(kernel.mutex);
-        EXPECT_LE(kernel.fail_wakes, 98u);
-        EXPECT_GT(kernel.fail_wakes, 0u);
+        remaining_fail_wakes = kernel.fail_wakes;
     }
-    EXPECT_EQ(results->values[0].second.error,
-              submitted.empty() ? Error::kIoError : Error::kOk);
+    EXPECT_LE(remaining_fail_wakes, 98u);
+    EXPECT_GT(remaining_fail_wakes, 0u);
+    {
+        std::lock_guard lock(results->mutex);
+        EXPECT_EQ(results->values[0].second.error,
+                  submitted.empty() ? Error::kIoError : Error::kOk);
+    }
     pool->Shutdown();
     EXPECT_EQ(results->Count(), 1u);
     if (submitted.empty())
@@ -819,6 +855,7 @@ TEST_P(CompletionBoundary,
                            : GetParam() == 127 ? 1037u
                                                : size_t(GetParam()));
     EXPECT_EQ(event.result, GetParam() < 0 ? Error::kIoError : Error::kOk);
+    EXPECT_EQ(event.sys_errno, GetParam() < 0 ? -GetParam() : 0);
     EXPECT_EQ(pipeline.ReadDrained(event.token, event.bytes, event.result),
               Error::kOk);
     if (GetParam() == 1037 || GetParam() == 127) {
@@ -844,5 +881,62 @@ TEST_P(CompletionBoundary,
 }
 INSTANTIATE_TEST_SUITE_P(EofShortNegativeAndCoveredPadding, CompletionBoundary,
                          testing::Values(0, 127, -EIO, 1037));
+
+TEST(SsdUringReadExecutorFault, FailedExecutorRejectsNewDriversForFallback) {
+    fake_uring::Kernel kernel;
+    File file(23);
+    Arena arena(2);
+    auto source = Source(file);
+    ASSERT_TRUE(source);
+    auto pool = UringReadExecutor::Create(1, 2);
+    ASSERT_TRUE(pool);
+    EXPECT_TRUE(pool->healthy());
+    fake_uring::DrainOnExit cleanup{kernel};
+    auto ring = kernel.First();
+    // Inject a non-retryable submit error to latch failure on the shared pool.
+    {
+        std::lock_guard lock(ring->mutex);
+        ring->outcomes.push_back({-EINVAL, 0});
+    }
+    auto results = std::make_shared<Results>();
+    ASSERT_TRUE(pool->TrySubmit(
+        source, *source->native_read_fd(), {arena.data, kSlot}, 0,
+        [results](ReadResult result) { results->Add(0, result); }));
+    const auto until = std::chrono::steady_clock::now() + 2s;
+    while (pool->healthy() && std::chrono::steady_clock::now() < until)
+        std::this_thread::sleep_for(1ms);
+    EXPECT_FALSE(pool->healthy());
+    BoundedExecutor writes(1, 4);
+    auto target = std::make_shared<Target>();
+    auto made = UringPipelineDriver::Create(source, target, writes,
+                                            {arena.slot(1)}, {false, pool});
+    EXPECT_EQ(made.error, Error::kNotSupported);
+    EXPECT_FALSE(made.driver);
+    // Drain the accepted read so executor shutdown finishes cleanly.
+    ASSERT_TRUE(ring->WaitAccepted(1));
+    const auto submitted = ring->History();
+    ASSERT_TRUE(ring->Complete(submitted[0].user_data, -EIO));
+    ASSERT_TRUE(results->Wait(1));
+    pool->Shutdown();
+    pool.reset();
+    EXPECT_FALSE(pool);
+}
+
+TEST(SsdUringReadExecutorFault, UnsupportedReadOpcodeReturnsNullForFallback) {
+    fake_uring::Kernel kernel;
+    kernel.support_read_op = false;
+    EXPECT_FALSE(UringReadExecutor::Create(1, 2));
+
+    File file(23);
+    Arena arena(2);
+    auto source = Source(file);
+    ASSERT_TRUE(source);
+    BoundedExecutor writes(1, 4);
+    auto target = std::make_shared<Target>();
+    auto made =
+        UringPipelineDriver::Create(source, target, writes, {arena.slot(0)});
+    EXPECT_EQ(made.error, Error::kNotSupported);
+    EXPECT_FALSE(made.driver);
+}
 }  // namespace
 }  // namespace mooncake::ssd_offload
