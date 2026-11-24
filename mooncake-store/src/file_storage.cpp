@@ -189,6 +189,9 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     if (config_.streaming_read.enabled &&
         std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
         const auto& stream = config_.streaming_read;
+        if (stream.use_uring && !stream.fixed_buffers)
+            streaming_uring_reads_ = ssd_offload::UringReadExecutor::Create(
+                stream.read_workers, stream.max_outstanding);
         streaming_reads_ = std::make_unique<ssd_offload::BoundedExecutor>(
             stream.read_workers, stream.max_outstanding);
         streaming_writes_ = std::make_unique<ssd_offload::BoundedExecutor>(
@@ -260,6 +263,7 @@ tl::expected<void, ErrorCode> FileStorage::Shutdown() {
     {
         std::unique_lock lock(streaming_mutex_);
         streaming_stopped_ = true;
+        streaming_uring_reads_.reset();
         streaming_reads_.reset();
         streaming_writes_.reset();
     }
@@ -817,15 +821,24 @@ tl::expected<void, ErrorCode> FileStorage::ReadLocalStreaming(
         // Declare ownership before the driver so exceptional unwinding drains
         // the driver while its ReadChunk pointers still refer to a live plan.
         std::unique_ptr<ReadPipeline> pipeline;
-        ThreadedPipelineDriver driver(prepared[i].source, std::move(target),
-                                      *streaming_reads_, *streaming_writes_,
-                                      buffers.size());
+        std::unique_ptr<EventPipelineDriver> driver;
+        if (config.use_uring) {
+            auto native = UringPipelineDriver::Create(
+                prepared[i].source, target, *streaming_writes_, buffers,
+                UringPipelineDriver::Options{config.fixed_buffers,
+                                             streaming_uring_reads_});
+            driver = std::move(native.driver);
+        }
+        if (!driver)
+            driver = std::make_unique<ThreadedPipelineDriver>(
+                prepared[i].source, target, *streaming_reads_,
+                *streaming_writes_, buffers.size());
         pipeline = std::make_unique<ReadPipeline>(
-            1, 1, std::move(prepared[i].plan), buffers, driver);
+            1, 1, std::move(prepared[i].plan), buffers, *driver);
         pipeline->Start();
         while (pipeline->inflight()) {
             IoCompletion completion;
-            if (!driver.WaitForEvent(completion, std::chrono::seconds(1)))
+            if (!driver->WaitForEvent(completion, std::chrono::seconds(1)))
                 continue;  // A wait timeout never releases an accepted slot.
             if (completion.stage == SlotStage::kReading)
                 pipeline->ReadDrained(completion.token, completion.bytes,

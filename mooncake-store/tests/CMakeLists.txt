@@ -499,6 +499,34 @@ add_store_test(offload_read_executor_config_test
 add_store_test(ssd_read_pipeline_test ssd_read_pipeline_test.cpp)
 add_store_test(ssd_read_source_test ssd_read_source_test.cpp)
 add_store_test(ssd_pipeline_io_test ssd_pipeline_io_test.cpp)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET Mooncake::liburing)
+  add_store_test(ssd_uring_pipeline_test ssd_uring_pipeline_test.cpp)
+  add_store_test(ssd_uring_shutdown_test ssd_uring_shutdown_test.cpp)
+  add_store_test(ssd_uring_read_executor_contract_test
+                 ssd_uring_read_executor_contract_test.cpp)
+  target_link_options(
+    ssd_uring_read_executor_contract_test
+    PRIVATE
+    -Wl,--wrap=io_uring_queue_init
+    -Wl,--wrap=io_uring_queue_exit
+    -Wl,--wrap=io_uring_submit
+    -Wl,--wrap=io_uring_register_buffers
+    -Wl,--wrap=eventfd)
+  add_executable(
+    ssd_uring_read_executor_fault_test
+    ../src/ssd_read_pipeline.cpp ../src/ssd_read_source.cpp
+    ../src/ssd_pipeline_io.cpp ../src/ssd_uring_pipeline.cpp
+    ssd_uring_read_executor_fault_test.cpp)
+  target_include_directories(ssd_uring_read_executor_fault_test BEFORE
+                             PRIVATE fixtures/uring_read_executor ../include)
+  target_compile_definitions(ssd_uring_read_executor_fault_test
+                             PRIVATE USE_URING)
+  target_link_libraries(ssd_uring_read_executor_fault_test PRIVATE gtest_main
+                                                                   pthread)
+  add_test(NAME ssd_uring_read_executor_fault_test
+           COMMAND ssd_uring_read_executor_fault_test)
+  set_tests_properties(ssd_uring_read_executor_fault_test PROPERTIES TIMEOUT 60)
+endif()
 add_store_test(file_storage_config_test file_storage_config_test.cpp)
 add_store_test(fileread_worker_pool_config_test
                fileread_worker_pool_config_test.cpp)

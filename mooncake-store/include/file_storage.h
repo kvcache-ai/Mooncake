@@ -14,6 +14,7 @@
 #include "client_buffer.h"
 #include "storage_backend.h"
 #include "ssd_pipeline_io.h"
+#include "ssd_uring_pipeline.h"
 #include <shared_mutex>
 #include "pinned_buffer_pool.h"
 
@@ -413,6 +414,7 @@ class FileStorage {
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
     mutable std::shared_mutex streaming_mutex_;
     bool streaming_stopped_{false};
+    std::shared_ptr<ssd_offload::UringReadExecutor> streaming_uring_reads_;
     std::unique_ptr<ssd_offload::BoundedExecutor> streaming_reads_;
     std::unique_ptr<ssd_offload::BoundedExecutor> streaming_writes_;
     std::atomic<size_t> active_streaming_sources_{0};

@@ -166,6 +166,10 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.use_uring = ParseStrictBoolOr(use_uring, false);
 
     auto& stream = config.streaming_read;
+    stream.use_uring =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_STREAM_USE_URING, false);
+    stream.fixed_buffers = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_STREAM_FIXED_BUFFERS, false);
     stream.enabled = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ, stream.enabled);
     stream.slot_bytes = Environ::ReadOr(
