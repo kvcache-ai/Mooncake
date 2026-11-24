@@ -1,0 +1,97 @@
+# Master Memory Segment Benchmark
+
+`master_memory_bench` measures the Master metadata path on a large Memory
+Segment data set. It is an independent benchmark: it does not require the
+traffic recorder or replay tools.
+
+The default workload mounts two 64 GiB memory segments and creates one hundred
+million 512-byte objects with `BatchPutStart` / `BatchPutEnd`. It then reads
+random batches with `BatchExistKey` and `BatchGetReplicaList`. The payload is
+never written; the benchmark exercises object allocation, key lookup, replica
+listing, and the Master's metadata path.
+
+## Workload mix
+
+- Fill: 100% put. Every key gets one `BatchPutStart` and one `BatchPutEnd`; there
+  are no reads during fill.
+- Read: 50/50 by batch. Even batch numbers call `BatchExistKey`; odd batch
+  numbers call `BatchGetReplicaList`. Each batch contains 64 keys.
+- No data-plane `Get` and no object payload are involved. `BatchGetReplicaList`
+  returns replica descriptors only.
+- Random starts come from `mooncake::RandomEngine(seed + thread_id)` and
+  `mooncake::randomIndex`; the same seed and thread count reproduce the same
+  key sequence.
+- The 100M run uses `--read_rate=1000`, `--read_duration=10`,
+  `--fill_threads=16`, `--read_threads=16`, `--batch_size=64`, and
+  `--seed=1`.
+
+This is a fixed synthetic Master workload, not a recorded model trace. The
+`--model` label is result metadata; it does not change key size, mix, or
+schedule.
+
+## Build
+
+```bash
+cmake --build build --target master_memory_bench -j$(nproc)
+```
+
+## Run the 100M-key baseline
+
+Start a Master with enough memory for the metadata and disable eviction:
+
+```bash
+./build/mooncake-store/src/mooncake_master \
+  --port=50051 --rpc_thread_num=16 \
+  --memory_allocator=offset \
+  --eviction_high_watermark_ratio=1.0 \
+  --allow_evict_soft_pinned_objects=false
+```
+
+```bash
+./build/mooncake-store/benchmarks/master_memory_bench \
+  --master=127.0.0.1:50051 \
+  --keys=100000000 \
+  --object_bytes=512 \
+  --segments=2 \
+  --segment_bytes=68719476736 \
+  --fill_threads=16 \
+  --read_threads=16 \
+  --read_rate=1000 \
+  --read_duration=10 \
+  --amplify=1 \
+  --model=qwen3-8b \
+  --result_file=result-1x.json
+```
+
+The fill phase reports keys per second. The read phase reports batch and key
+throughput and p50/p90/p99/p999 latency. `--read_rate` is the target number of
+batch RPCs per second; 0 saturates. `--amplify` multiplies that rate, so
+`--amplify=2` and `--amplify=3` produce the 2x and 3x load points. Each
+invocation mounts its own segments and fills the data set; use a smaller
+`--keys` value while tuning the load points.
+
+## Release comparison
+
+`master_memory_gate.py` compares two result files from the same workload. It
+checks the object count, object size, segment layout, model label, read
+threads, read rate, and amplification. It fails when the read batch throughput
+drops by more than 5% or the read p99 rises by more than 10% by default.
+
+```bash
+python3 mooncake-store/benchmarks/master_memory_gate.py \
+  --baseline=base.json --current=pr.json
+```
+
+Exit codes are 0 for pass, 1 for a regression, and 2 for invalid input.
+
+## Scope and model size
+
+The 100M-key scenario is a metadata standard, not a model KV-page simulation.
+A 512-byte object keeps the complete data set near 100 GiB after allocator
+overhead.
+
+The `--model=qwen3-8b` label refers to the classic Qwen3-8B shape: 36 layers,
+8 KV heads, head dimension 128, BF16, 64-token pages. One such page is
+9,437,184 bytes (9 MiB). One hundred million pages would be about 944 TB, so
+they cannot fit on one host. Use a smaller key count when testing model-sized
+pages; the 100M baseline deliberately uses 512-byte metadata objects.

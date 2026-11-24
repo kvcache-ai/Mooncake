@@ -83,3 +83,14 @@ The benchmark also prints a one-line `Prefill summary`, `Fragmentation summary`,
 and `Size-class breakdown` after each result row, so reviewers can read the
 actual prefill utilization, fragmentation, and per-size-class latency numbers
 without manually deriving them from the table.
+
+## Master Memory Segment Benchmark
+
+`master_memory_bench` is a standalone Master metadata benchmark. It mounts
+memory segments, creates a large object set with `BatchPutStart` /
+`BatchPutEnd`, then reads the same keys with `BatchExistKey` and
+`BatchGetReplicaList`. It does not move KV payloads or depend on traffic
+recording.
+
+See `master_memory_bench.md` for the 100M-key baseline and the
+`--read_rate` / `--amplify` load sweep.
