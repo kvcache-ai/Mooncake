@@ -133,6 +133,8 @@ class TransferEngineImpl {
 
     int removeLocalSegment(const std::string& segment_name);
 
+    int enableMemoryRegistrationReuse();
+
     int registerLocalMemory(void* addr, size_t length,
                             const std::string& location = kWildcardLocation,
                             bool remote_accessible = true,
@@ -473,15 +475,36 @@ class TransferEngineImpl {
         return local_topology_;
     }
 
+    bool supportsParallelBatchSubmit(Transport::SegmentID peer) const {
+        return multi_transports_ &&
+               multi_transports_->supportsParallelBatchSubmit(peer);
+    }
+
    private:
     struct MemoryRegion {
         void* addr;
         uint64_t length;
         std::string location;
         bool remote_accessible;
+        size_t users = 0;
+        bool releasing = false;
     };
 
     using MemoryRegionMap = std::map<uintptr_t, MemoryRegion>;
+
+    int registerReusableMemory(const std::vector<BufferEntry>& buffers,
+                               const std::string& location);
+    int unregisterReusableMemory(const std::vector<void*>& addresses);
+    int releaseReusableRegions(const std::vector<void*>& regions);
+    void retryFailedRollbacks();
+    int registerLocalMemoryBatchImpl(const std::vector<BufferEntry>& buffers,
+                                     const std::string& location);
+    int unregisterLocalMemoryBatchImpl(const std::vector<void*>& addresses);
+
+    std::atomic<bool> memory_registration_reuse_{false};
+    std::mutex registration_reuse_mutex_;
+    std::map<uintptr_t, size_t> registration_users_;
+    std::vector<void*> failed_rollbacks_;
 
     bool hasOverlapLocked(uintptr_t addr, uint64_t length) const;
 
@@ -501,6 +524,11 @@ class TransferEngineImpl {
     // Full registered length for [addr, addr+length) overlap checks.
     // False when addr is not an exact registered base.
     bool lookupLocalRegionLength(void* addr, uint64_t* length);
+
+    // Returns ERR_BATCH_BUSY when transfers still reference this registered
+    // region. Unknown addresses return 0 and leave the transport's own
+    // not-registered result in place.
+    int quiesceBeforeDeregister(void* addr);
 
     void clearSkipRegistrationLocked(void* addr);
 

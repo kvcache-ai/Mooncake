@@ -171,6 +171,38 @@ impl ControlPlaneHandle {
         migration: Arc<dyn MigrationService>,
         cold_tier: Arc<dyn ColdTierControlService>,
     ) -> Result<Self> {
+        Self::spawn_with_migration_mode(
+            bind_host, authority, allocator, eviction, migration, cold_tier, false,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_legacy_contains(
+        bind_host: &str,
+        authority: Arc<dyn AuthorityService>,
+        allocator: Arc<dyn AllocatorService>,
+        eviction: Arc<dyn EvictionService>,
+    ) -> Result<Self> {
+        Self::spawn_with_migration_mode(
+            bind_host,
+            authority,
+            allocator,
+            eviction,
+            Arc::new(UnsupportedMigrationService),
+            Arc::new(UnsupportedColdTierControlService),
+            true,
+        )
+    }
+
+    fn spawn_with_migration_mode(
+        bind_host: &str,
+        authority: Arc<dyn AuthorityService>,
+        allocator: Arc<dyn AllocatorService>,
+        eviction: Arc<dyn EvictionService>,
+        migration: Arc<dyn MigrationService>,
+        cold_tier: Arc<dyn ColdTierControlService>,
+        legacy_contains: bool,
+    ) -> Result<Self> {
         let listener = std::net::TcpListener::bind((bind_host, 0)).map_err(|error| {
             StoreError::Transport(format!("control plane bind on {bind_host} failed: {error}"))
         })?;
@@ -199,6 +231,7 @@ impl ControlPlaneHandle {
             eviction,
             migration,
             cold_tier,
+            legacy_contains,
         };
         let thread = thread::Builder::new()
             .name(format!("store-control-{address}"))
@@ -255,6 +288,7 @@ struct ControlPlaneServices {
     eviction: Arc<dyn EvictionService>,
     migration: Arc<dyn MigrationService>,
     cold_tier: Arc<dyn ColdTierControlService>,
+    legacy_contains: bool,
 }
 
 #[derive(Default)]
@@ -291,7 +325,8 @@ fn run_server(
         services.eviction,
         services.migration,
         services.cold_tier,
-    );
+    )
+    .with_legacy_contains(services.legacy_contains);
     let result = runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
             StoreError::Transport(format!("control plane listener conversion failed: {error}"))
@@ -318,6 +353,7 @@ pub(super) struct GrpcControlPlaneService {
     eviction: Arc<dyn EvictionService>,
     migration: Arc<dyn MigrationService>,
     cold_tier: Arc<dyn ColdTierControlService>,
+    legacy_contains: bool,
     stats: Arc<ControlPlaneServerStats>,
 }
 
@@ -349,8 +385,14 @@ impl GrpcControlPlaneService {
             eviction,
             migration,
             cold_tier,
+            legacy_contains: false,
             stats: Arc::new(ControlPlaneServerStats::default()),
         }
+    }
+
+    fn with_legacy_contains(mut self, legacy_contains: bool) -> Self {
+        self.legacy_contains = legacy_contains;
+        self
     }
 }
 
@@ -602,6 +644,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         request: Request<pb::BatchContainsRoutesRequest>,
     ) -> std::result::Result<Response<pb::BatchContainsRoutesReply>, Status> {
         let request = request.into_inner();
+        let include_presence = request.include_presence && !self.legacy_contains;
         let keys = request
             .keys
             .into_iter()
@@ -612,6 +655,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             namespace: request.namespace,
             authority: ClientStableId::new(request.authority),
             keys,
+            include_presence,
         };
         let replies = match serve_route_control_request(self.authority.as_ref(), route_request) {
             Ok(RouteControlResponse::BatchContains(results)) => results
@@ -620,10 +664,35 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     Ok(exists) => pb::ContainsRouteReply {
                         exists,
                         error: None,
+                        presence: None,
                     },
                     Err(error) => pb::ContainsRouteReply {
                         exists: false,
                         error: Some(pb_error(error)),
+                        presence: None,
+                    },
+                })
+                .collect(),
+            Ok(RouteControlResponse::BatchGetPresence(results)) => results
+                .into_iter()
+                .map(|result| match result {
+                    Ok(presence) => {
+                        let exists = presence.live_version.is_some_and(|live| {
+                            presence.delete_version.is_none_or(|delete| live > delete)
+                        });
+                        pb::ContainsRouteReply {
+                            exists,
+                            error: None,
+                            presence: Some(pb::RoutePresenceSummary {
+                                live_version: presence.live_version.map(|version| version.0),
+                                delete_version: presence.delete_version.map(|version| version.0),
+                            }),
+                        }
+                    }
+                    Err(error) => pb::ContainsRouteReply {
+                        exists: false,
+                        error: Some(pb_error(error)),
+                        presence: None,
                     },
                 })
                 .collect(),
@@ -636,6 +705,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     .map(|_| pb::ContainsRouteReply {
                         exists: false,
                         error: Some(detail.clone()),
+                        presence: None,
                     })
                     .collect()
             }
@@ -645,6 +715,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     .map(|_| pb::ContainsRouteReply {
                         exists: false,
                         error: Some(detail.clone()),
+                        presence: None,
                     })
                     .collect()
             }
@@ -1373,7 +1444,8 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             self.authority.clone(),
             self.allocator.clone(),
             self.eviction.clone(),
-        );
+        )
+        .with_legacy_contains(self.legacy_contains);
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
         let stats = self.stats.clone();

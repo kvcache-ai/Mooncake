@@ -131,6 +131,8 @@ class RdmaTransport : public Transport {
 
     std::shared_ptr<Config> config() const { return conf_; }
 
+    bool supportsParallelBatchSubmit() const override { return true; }
+
    private:
     // Builds context_set_ with one slot per NicID; returns how many RNICs
     // came up. Remaining slots hold inert contexts.

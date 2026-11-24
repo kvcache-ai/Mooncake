@@ -14,12 +14,16 @@
 
 #include "shared_segment_py.h"
 
-#include <pybind11/stl.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/variant.h>
+#include <nanobind/stl/vector.h>
 
 #include <stdexcept>
 #include <utility>
 
-namespace py = pybind11;
+namespace py = nanobind;
 
 namespace mooncake {
 namespace {
@@ -53,23 +57,33 @@ std::pair<std::shared_ptr<SharedSegment>, py::bytes> SegmentCreate(
         status = SharedSegment::Create(name, size, options, segment, blob);
     }
     ThrowIfError(status);
-    return {std::move(segment), py::bytes(blob)};
+    return {std::move(segment), py::bytes(blob.data(), blob.size())};
 }
 
+using PythonBlob = std::variant<py::bytes, py::bytearray, std::string>;
+
 void SegmentComplete(const std::shared_ptr<SharedSegment>& segment,
-                     const std::vector<std::string>& blobs) {
+                     const std::vector<PythonBlob>& blobs) {
+    std::vector<std::string> binary_blobs;
+    binary_blobs.reserve(blobs.size());
+    for (const auto& blob : blobs) {
+        std::visit(
+            [&binary_blobs](const auto& value) {
+                binary_blobs.emplace_back(value.c_str(), value.size());
+            },
+            blob);
+    }
     Status status = Status::OK();
     {
         py::gil_scoped_release release;
-        status = segment->Complete(blobs);
+        status = segment->Complete(binary_blobs);
     }
     ThrowIfError(status);
 }
 }  // namespace
 
 void bind_shared_segment(py::module_& m) {
-    py::class_<SharedSegment, std::shared_ptr<SharedSegment>>(m,
-                                                              "SharedSegment")
+    py::class_<SharedSegment>(m, "SharedSegment")
         .def_static("create", &SegmentCreate, py::arg("name"), py::arg("size"),
                     py::arg("world_size"), py::arg("rank_id"),
                     py::arg("owner_rank") = 0, py::arg("device_id") = 0,
