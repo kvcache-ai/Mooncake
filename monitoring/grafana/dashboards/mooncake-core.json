@@ -2505,6 +2505,304 @@
         "x": 0,
         "y": 86
       },
+      "id": 49,
+      "panels": [],
+      "title": "TE rails",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Post-to-observed-completion latency in microseconds per retired work request.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 87
+      },
+      "id": 50,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "rate(mooncake_te_rail_latency_us_sum{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]) / (rate(mooncake_te_rail_completions_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]) > 0)",
+          "legendFormat": "{{instance}} {{local_nic}} → {{peer}}/{{peer_nic}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Mean latency per rail",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Payload bytes of retired RDMA work requests per second.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 87
+      },
+      "id": 51,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "rate(mooncake_te_rail_bytes_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} {{local_nic}} → {{peer}}/{{peer_nic}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Rail bytes/s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Non-flush error CQEs per second.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "suffix:errors/s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 95
+      },
+      "id": 52,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "rate(mooncake_te_rail_errors_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} {{local_nic}} → {{peer}}/{{peer_nic}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Rail errors/s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Each active rail's mean divided by the median of active rails on the same instance and local NIC. Overflow is excluded.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "suffix:×"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 95
+      },
+      "id": 53,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "(rate(mooncake_te_rail_latency_us_sum{job=~\"$job\",instance=~\"$instance\",peer!=\"other\"}[$__rate_interval]) / (rate(mooncake_te_rail_completions_total{job=~\"$job\",instance=~\"$instance\",peer!=\"other\"}[$__rate_interval]) > 0)) / on (instance, local_nic) group_left () (quantile by (instance, local_nic) (0.5, rate(mooncake_te_rail_latency_us_sum{job=~\"$job\",instance=~\"$instance\",peer!=\"other\"}[$__rate_interval]) / (rate(mooncake_te_rail_completions_total{job=~\"$job\",instance=~\"$instance\",peer!=\"other\"}[$__rate_interval]) > 0)) > 0)",
+          "legendFormat": "{{instance}} {{local_nic}} → {{peer}}/{{peer_nic}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Rail latency deviation from local NIC median",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Completion-weighted mean across all instances in the selected jobs. The instance selector and overflow series are excluded.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 103
+      },
+      "id": 54,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (peer, peer_nic) (rate(mooncake_te_rail_latency_us_sum{job=~\"$job\",peer!=\"other\"}[$__rate_interval])) / (sum by (peer, peer_nic) (rate(mooncake_te_rail_completions_total{job=~\"$job\",peer!=\"other\"}[$__rate_interval])) > 0)",
+          "legendFormat": "{{peer}}/{{peer_nic}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Mean latency by remote NIC across all instances",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 111
+      },
       "id": 32,
       "panels": [],
       "title": "Master",
@@ -2570,7 +2868,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 87
+        "y": 112
       },
       "id": 33,
       "options": {
@@ -2699,7 +2997,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 87
+        "y": 112
       },
       "id": 34,
       "options": {
@@ -2810,7 +3108,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 95
+        "y": 120
       },
       "id": 35,
       "options": {
@@ -2939,7 +3237,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 95
+        "y": 120
       },
       "id": 36,
       "options": {
@@ -3059,7 +3357,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 103
+        "y": 128
       },
       "id": 37,
       "options": {
@@ -3188,7 +3486,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 103
+        "y": 128
       },
       "id": 38,
       "options": {
@@ -3299,7 +3597,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 111
+        "y": 136
       },
       "id": 39,
       "options": {
@@ -3428,7 +3726,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 111
+        "y": 136
       },
       "id": 40,
       "options": {
@@ -3539,7 +3837,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 119
+        "y": 144
       },
       "id": 41,
       "options": {
@@ -3641,7 +3939,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 119
+        "y": 144
       },
       "id": 42,
       "options": {
@@ -3734,7 +4032,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 127
+        "y": 152
       },
       "id": 43,
       "options": {
@@ -3827,7 +4125,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 127
+        "y": 152
       },
       "id": 44,
       "options": {
@@ -3920,7 +4218,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 135
+        "y": 160
       },
       "id": 45,
       "options": {
@@ -4013,7 +4311,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 135
+        "y": 160
       },
       "id": 46,
       "options": {
@@ -4106,7 +4404,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 143
+        "y": 168
       },
       "id": 47,
       "options": {
@@ -4199,7 +4497,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 143
+        "y": 168
       },
       "id": 48,
       "options": {

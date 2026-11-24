@@ -76,6 +76,8 @@ class MetricsExporter {
 
     void addCounter(ylt::metric::counter_t* counter);
     void addHistogram(Histogram* histogram);
+    // Like the fixed metrics, register text sources before start().
+    void addTextSource(std::function<void(std::string&)> source);
     void setSummaryProvider(std::function<std::string()> provider);
 
     void start(const ExporterConfig& config);
@@ -101,6 +103,7 @@ class MetricsExporter {
 
     std::vector<ylt::metric::counter_t*> counters_;
     std::vector<Histogram*> histograms_;
+    std::vector<std::function<void(std::string&)>> text_sources_;
     std::function<std::string()> summary_provider_;
 
     std::unique_ptr<cinatra::coro_http_server> http_server_;

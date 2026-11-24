@@ -14,6 +14,10 @@
 
 #include "transport/rdma_transport/rdma_endpoint.h"
 
+#ifdef WITH_METRICS
+#include "rail_metrics.h"
+#endif
+
 #include <glog/logging.h>
 
 #include <algorithm>
@@ -378,6 +382,13 @@ void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
         return;
     }
     peer_nic_path_ = peer_nic_path;
+#ifdef WITH_METRICS
+    if (auto *registry = RailMetricsRegistry::instanceIfEnabled()) {
+        rail_counters_.store(
+            registry->getOrAdd(context_.deviceName(), peer_nic_path_),
+            std::memory_order_relaxed);
+    }
+#endif
 }
 
 std::string RdmaEndPoint::peerNicPath() const {

@@ -17,6 +17,7 @@ FORBIDDEN_METRICS = (
     "master_batch_get_replica_list_successful_bytes_total",
     "master_batch_put_end_successful_bytes_total",
 )
+REMOTE_RAIL_PANEL = "Mean latency by remote NIC across all instances"
 
 
 class CoreDashboardContractTest(unittest.TestCase):
@@ -42,10 +43,11 @@ class CoreDashboardContractTest(unittest.TestCase):
                 "Store",
                 "TE task results and latency",
                 "TE request rate and throughput",
+                "TE rails",
                 "Master",
             ],
         )
-        self.assertEqual(len(self.panels), len(rows) + 43)
+        self.assertEqual(len(self.panels), len(rows) + 48)
 
     def test_panel_ids_and_grid_do_not_overlap(self) -> None:
         ids = [panel["id"] for panel in self.panels]
@@ -98,6 +100,9 @@ class CoreDashboardContractTest(unittest.TestCase):
             if target["expr"].startswith("up{"):
                 continue
             self.assertIn('job=~"$job"', target["expr"], panel["title"])
+            if panel["title"] == REMOTE_RAIL_PANEL:
+                self.assertNotIn("instance=", target["expr"])
+                continue
             self.assertIn('instance=~"$instance"', target["expr"], panel["title"])
 
     def test_store_queries_preserve_operation_name(self) -> None:
@@ -176,6 +181,8 @@ class CoreDashboardContractTest(unittest.TestCase):
 
     def test_latency_and_non_success_ratio_contracts(self) -> None:
         for panel, target in self.targets:
+            if "mooncake_te_rail_" in target["expr"]:
+                continue
             if (
                 "latency" in panel["title"].lower()
                 or "p50" in panel["title"]
@@ -187,6 +194,39 @@ class CoreDashboardContractTest(unittest.TestCase):
             if "non-success ratio" in panel["title"]:
                 self.assertIn("clamp_min", target["expr"])
                 self.assertIn("> 0", target["expr"])
+
+    def test_rail_queries_use_counters_and_group_by_nic(self) -> None:
+        targets = {
+            panel["title"]: target
+            for panel, target in self.targets
+            if "mooncake_te_rail_" in target["expr"]
+        }
+        self.assertEqual(len(targets), 5)
+        for title, counter in (
+            ("Rail bytes/s", "bytes_total"),
+            ("Rail errors/s", "errors_total"),
+        ):
+            self.assertTrue(
+                targets[title]["expr"].startswith(f"rate(mooncake_te_rail_{counter}")
+            )
+        for title in (
+            "Mean latency per rail",
+            "Rail latency deviation from local NIC median",
+            REMOTE_RAIL_PANEL,
+        ):
+            expr = targets[title]["expr"]
+            self.assertIn("rate(mooncake_te_rail_latency_us_sum", expr)
+            self.assertIn("rate(mooncake_te_rail_completions_total", expr)
+            self.assertIn("> 0", expr)
+            self.assertNotIn("histogram_quantile", expr)
+        deviation = targets["Rail latency deviation from local NIC median"]["expr"]
+        self.assertIn("quantile by (instance, local_nic) (0.5,", deviation)
+        self.assertIn("on (instance, local_nic) group_left", deviation)
+        self.assertIn('peer!="other"', deviation)
+        self.assertEqual(
+            targets[REMOTE_RAIL_PANEL]["expr"].count("sum by (peer, peer_nic)"), 2
+        )
+        self.assertIn('peer!="other"', targets[REMOTE_RAIL_PANEL]["expr"])
 
     def test_aggregated_stats_do_not_reference_dropped_labels(self) -> None:
         for panel in self.panels:

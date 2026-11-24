@@ -21,6 +21,7 @@
 #include <thread>
 #include <vector>
 
+#include "rail_metrics.h"
 #include "transfer_engine_impl.h"
 #include "transfer_engine_metrics.h"
 #include "transport/transport.h"
@@ -71,6 +72,83 @@ class TransferEngineImplTestPeer {
 };
 
 namespace {
+
+TEST(RailMetricsTest, KeepsEntriesAndSharesOneOverflowAcrossLocalNics) {
+    RailMetricsRegistry registry(2);
+    auto* first = registry.getOrAdd("mlx5_0", "server:1234@mlx5_1");
+    ASSERT_NE(first, nullptr);
+    first->completions.fetch_add(3, std::memory_order_relaxed);
+    auto* second = registry.getOrAdd("mlx5_1", "server:1234@mlx5_1");
+    EXPECT_NE(second, first);
+    auto* overflow = registry.getOrAdd("mlx5_0", "third@mlx5_2");
+    ASSERT_NE(overflow, nullptr);
+    EXPECT_EQ(overflow, registry.getOrAdd("mlx5_1", "fourth@mlx5_3"));
+    EXPECT_NE(overflow, first);
+    EXPECT_NE(overflow, second);
+    EXPECT_EQ(registry.getOrAdd("mlx5_0", "server:1234@mlx5_1"), first);
+    EXPECT_EQ(first->completions.load(), 3);
+    EXPECT_EQ(registry.getOrAdd("mlx5_0", "invalid"), nullptr);
+    EXPECT_EQ(registry.getOrAdd("mlx5_0", "server:1234@"), nullptr);
+    overflow->bytes.fetch_add(32, std::memory_order_relaxed);
+
+    std::string text;
+    registry.appendPrometheus(text);
+    EXPECT_NE(
+        text.find(
+            "mooncake_te_rail_bytes_total"
+            "{local_nic=\"other\",peer=\"other\",peer_nic=\"other\"} 32\n"),
+        std::string::npos);
+    EXPECT_EQ(text.find("third"), std::string::npos);
+    EXPECT_EQ(text.find("fourth"), std::string::npos);
+}
+
+TEST(RailMetricsTest, WritesCounterFamiliesWithEscapedLabels) {
+    RailMetricsRegistry registry(1);
+    auto* counters = registry.getOrAdd("mlx\\5", "[::1]:15001@nic\"\n0");
+    ASSERT_NE(counters, nullptr);
+    counters->latency_ns.fetch_add(1234, std::memory_order_relaxed);
+
+    std::string text;
+    registry.appendPrometheus(text);
+    const std::string labels =
+        R"({local_nic="mlx\\5",peer="[::1]:15001",peer_nic="nic\"\n0"})";
+    for (const auto* suffix : {"completions_total", "bytes_total",
+                               "latency_us_sum", "errors_total"}) {
+        const std::string name = std::string("mooncake_te_rail_") + suffix;
+        EXPECT_NE(text.find("# HELP " + name + " "), std::string::npos);
+        EXPECT_NE(text.find("# TYPE " + name + " counter\n" + name + labels),
+                  std::string::npos);
+    }
+    EXPECT_NE(
+        text.find("mooncake_te_rail_latency_us_sum" + labels + " 1.234\n"),
+        std::string::npos);
+}
+
+TEST(RailMetricsDeathTest, OptInRegistersTextSourceAfterFixedMetrics) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(
+        {
+            setenv("MC_TE_METRIC_RAIL", "1", 1);
+            setenv("MC_TE_METRIC_RAIL_MAX", "0", 1);
+            auto& metrics = TransferEngineMetrics::instance();
+            auto* registry = RailMetricsRegistry::instanceIfEnabled();
+            if (!registry) std::exit(1);
+            auto* overflow = registry->getOrAdd("mlx5_0", "peer@mlx5_1");
+            if (!overflow) std::exit(1);
+            overflow->completions.fetch_add(2, std::memory_order_relaxed);
+            const auto text = metrics.prometheusText();
+            EXPECT_LT(text.find("mooncake_te_write_size_bytes_count"),
+                      text.find("# HELP mooncake_te_rail_completions_total"));
+            EXPECT_NE(text.find("mooncake_te_rail_completions_total"
+                                "{local_nic=\"other\",peer=\"other\",peer_nic="
+                                "\"other\"} 2\n"),
+                      std::string::npos);
+            EXPECT_EQ(metrics.jsonText().find("mooncake_te_rail_"),
+                      std::string::npos);
+            std::exit(::testing::Test::HasFailure() ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
 
 // Reports `task_status[task_id]` if set, else `status` (COMPLETED by default),
 // and marks the task finished on COMPLETED or FAILED as real transports do.
@@ -161,6 +239,7 @@ TEST(EngineMetricsDeathTest, DisabledCollectionDoesNotRecordTransfers) {
         {
             unsetenv("MC_TE_METRIC");
             unsetenv("MC_TE_METRIC_HTTP_PORT");
+            unsetenv("MC_TE_METRIC_RAIL");
             auto check = ([] {
                 ASSERT_FALSE(TransferEngineMetrics::isEnabled());
                 TransferEngineImpl engine(false);
@@ -185,6 +264,10 @@ TEST(EngineMetricsDeathTest, DisabledCollectionDoesNotRecordTransfers) {
                 EXPECT_TRUE(
                     TransferEngineImplTestPeer::freeBatch(engine, batch).ok());
                 EXPECT_FALSE(TransferEngineMetrics::isEnabled());
+                EXPECT_EQ(
+                    TransferEngineMetrics::instance().prometheusText().find(
+                        "mooncake_te_rail_"),
+                    std::string::npos);
                 for (auto direction : {Direction::Read, Direction::Write}) {
                     EXPECT_EQ(requestsTotal(direction), 0);
                     EXPECT_EQ(bytesTotal(direction), 0);

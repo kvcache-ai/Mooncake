@@ -14,6 +14,10 @@
 
 #include "transport/rdma_transport/worker_pool.h"
 
+#ifdef WITH_METRICS
+#include "rail_metrics.h"
+#endif
+
 #include <sys/epoll.h>
 
 #include <algorithm>
@@ -1474,6 +1478,13 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
         Transport::Slice *completed = (Transport::Slice *)wc[i].wr_id;
         if (!completed) continue;
         assert(postingThreadForPeer(completed->peerNicPath()) == thread_id);
+#ifdef WITH_METRICS
+        // Capture the registry entry before retiring the WRs that keep the
+        // endpoint alive. The entry remains valid after endpoint reclamation.
+        auto *rail = completed->rdma.endpoint
+                         ? completed->rdma.endpoint->railCounters()
+                         : nullptr;
+#endif
         drained.clear();
         if (use_fifo && completed->rdma.endpoint) {
             const size_t n = completed->rdma.endpoint->collectPostedCompletions(
@@ -1489,6 +1500,27 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
                                                     std::memory_order_acq_rel);
         }
         wr_retired += static_cast<int>(drained.size());
+#ifdef WITH_METRICS
+        if (rail) {
+            uint64_t bytes = 0;
+            for (const auto *slice : drained) bytes += slice->length;
+            rail->bytes.fetch_add(bytes, std::memory_order_relaxed);
+            const auto post_ts = completed->ts;
+            if (post_ts > 0 && static_cast<uint64_t>(post_ts) < poll_ts) {
+                // Use the completing WR's timestamp for the drained prefix,
+                // weighted by WR count so signal batching does not skew the
+                // mean when dividing by the completion count.
+                rail->latency_ns.fetch_add((poll_ts - post_ts) * drained.size(),
+                                           std::memory_order_relaxed);
+            }
+            if (wc[i].status != IBV_WC_SUCCESS &&
+                wc[i].status != IBV_WC_WR_FLUSH_ERR) {
+                rail->errors.fetch_add(1, std::memory_order_relaxed);
+            }
+            rail->completions.fetch_add(drained.size(),
+                                        std::memory_order_relaxed);
+        }
+#endif
         if (globalConfig().track_rdma_posted_slices) {
             std::lock_guard<std::mutex> lock(posted_slices_mutex_);
             for (auto *slice : drained) posted_slices_.erase(slice);
