@@ -32,6 +32,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"
+#include "random.h"
 #include "common/timestamp.h"
 #include "common/file_util.h"
 #include "utils/common.h"
@@ -7565,6 +7566,59 @@ TEST_F(StorageBackendTest, AlignedDirectBucketBatchLoadWithUring) {
 }
 #endif
 
+// Incompressible, so st_blocks reflects the size on any file system.
+std::string IncompressibleBytes(size_t bytes, uint64_t seed) {
+    std::string payload(bytes, '\0');
+    RandomEngine engine(seed);
+    for (auto& c : payload) {
+        c = static_cast<char>(randomUniform(0, 255, engine));
+    }
+    return payload;
+}
+
+// st_blocks of every bucket data and metadata file directly under root.
+int64_t BucketFileBytes(const std::string& root) {
+    int64_t total = 0;
+    for (const auto& entry : fs::directory_iterator(root)) {
+        const auto extension = entry.path().extension();
+        struct stat st{};
+        if (entry.is_regular_file() &&
+            (extension == ".bucket" || extension == ".meta") &&
+            ::stat(entry.path().c_str(), &st) == 0) {
+            total += static_cast<int64_t>(st.st_blocks) * 512;
+        }
+    }
+    return total;
+}
+
+// Never below the files on disk; at most one block over per committed file.
+void ExpectProjectionCovers(int64_t projected, int64_t on_disk,
+                            int tracked_files) {
+    EXPECT_GE(projected, on_disk);
+    EXPECT_LE(projected, on_disk + int64_t{4096} * tracked_files);
+}
+
+tl::expected<int64_t, ErrorCode> OffloadOne(
+    BucketStorageBackend& backend, const std::string& key,
+    const std::string& value, std::vector<std::string>* evicted = nullptr,
+    ErrorCode notify_error = ErrorCode::OK) {
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(key, std::vector<Slice>{Slice{const_cast<char*>(value.data()),
+                                                value.size()}});
+    return backend.BatchOffload(
+        batch, NoopCompleteHandler(),
+        [&](const std::vector<std::string>& keys)
+            -> tl::expected<void, ErrorCode> {
+            if (notify_error != ErrorCode::OK) {
+                return tl::make_unexpected(notify_error);
+            }
+            if (evicted) {
+                *evicted = keys;
+            }
+            return {};
+        });
+}
+
 // The physical-usage scan is cached outside the metadata lock. A cached
 // value is reused until FinalizeEviction invalidates it, after which the
 // next check re-measures the directory.
@@ -7581,53 +7635,105 @@ TEST_F(StorageBackendTest, BucketPhysicalUsageCacheInvalidatedByEviction) {
     BucketStorageBackend storage_backend(config, bucket_config);
     ASSERT_TRUE(storage_backend.Init());
 
-    const auto write_file = [&](const std::string& name, size_t bytes) {
-        std::ofstream out(fs::path(data_path) / name, std::ios::binary);
-        ASSERT_TRUE(out.is_open());
-        // Incompressible, so st_blocks reflects the size on any file system.
-        std::string payload(bytes, '\0');
-        uint64_t state = 0x9E3779B97F4A7C15ull;
-        for (auto& c : payload) {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            c = static_cast<char>(state);
-        }
-        out.write(payload.data(), static_cast<std::streamsize>(bytes));
-    };
-    constexpr size_t kProbeBytes = 1 << 20;
+    constexpr int64_t kProbeBytes = 1 << 20;
     const int64_t before = storage_backend.ActualDiskBytesUsedForTest(0);
-    write_file("physical_usage_probe", kProbeBytes);
+    {
+        std::ofstream out(fs::path(data_path) / "physical_usage_probe",
+                          std::ios::binary);
+        ASSERT_TRUE(out.is_open());
+        out << IncompressibleBytes(kProbeBytes, 42);
+    }
     // Still the cached measurement: the probe file is not counted yet.
     EXPECT_EQ(storage_backend.ActualDiskBytesUsedForTest(0), before);
 
-    std::string first_value(6 * 1024, 'A');
-    std::unordered_map<std::string, std::vector<Slice>> first_batch;
-    first_batch.emplace(
-        "first_key",
-        std::vector<Slice>{Slice{first_value.data(), first_value.size()}});
-    ASSERT_TRUE(storage_backend.BatchOffload(first_batch, NoopCompleteHandler())
-                    .has_value());
-    std::string second_value(6 * 1024, 'B');
-    std::unordered_map<std::string, std::vector<Slice>> second_batch;
-    second_batch.emplace(
-        "second_key",
-        std::vector<Slice>{Slice{second_value.data(), second_value.size()}});
+    ASSERT_TRUE(OffloadOne(storage_backend, "first_key",
+                           IncompressibleBytes(6 * 1024, 1)));
     std::vector<std::string> evicted;
-    ASSERT_TRUE(storage_backend
-                    .BatchOffload(second_batch, NoopCompleteHandler(),
-                                  [&](const std::vector<std::string>& keys)
-                                      -> tl::expected<void, ErrorCode> {
-                                      evicted = keys;
-                                      return {};
-                                  })
-                    .has_value());
+    ASSERT_TRUE(OffloadOne(storage_backend, "second_key",
+                           IncompressibleBytes(6 * 1024, 2), &evicted));
     ASSERT_EQ(evicted, std::vector<std::string>{"first_key"});
 
-    // FinalizeEviction deleted files and invalidated the cache: the next
-    // measurement is a fresh scan, which now sees the probe file.
+    // FinalizeEviction invalidated the cache: the next measurement is a
+    // fresh scan, which now sees the probe file.
     EXPECT_GE(storage_backend.ActualDiskBytesUsedForTest(0),
-              before + static_cast<int64_t>(kProbeBytes));
+              before + kProbeBytes);
+}
+
+// A stale cached sample must not cause extra eviction: each write over a
+// two-bucket cap evicts exactly the oldest bucket.
+TEST_F(StorageBackendTest, BucketPhysicalCapUsesCurrentUsageAfterEviction) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 1;
+    bucket_config.max_total_size = int64_t{1} << 30;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    constexpr size_t kValueBytes = 64 * 1024;
+
+    int64_t base = 0;
+    int64_t bucket_bytes = 0;
+    {
+        bucket_config.max_physical_bytes = int64_t{1} << 40;
+        bucket_config.disk_scan_cache_ms = 0;
+        BucketStorageBackend probe(config, bucket_config);
+        ASSERT_TRUE(probe.Init());
+        base = probe.ActualDiskBytesUsedForTest(0);
+        ASSERT_TRUE(OffloadOne(probe, "probe_key",
+                               IncompressibleBytes(kValueBytes, 0)));
+        bucket_bytes = BucketFileBytes(data_path);
+        ASSERT_GT(bucket_bytes, 0);
+        probe.RemoveAll();
+    }
+
+    bucket_config.max_physical_bytes =
+        base + 2 * bucket_bytes + bucket_bytes / 2;
+    bucket_config.disk_scan_cache_ms = 3600 * 1000;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    for (int i = 0; i < 2; ++i) {
+        std::vector<std::string> evicted;
+        ASSERT_TRUE(OffloadOne(storage_backend, "key" + std::to_string(i),
+                               IncompressibleBytes(kValueBytes, i + 1),
+                               &evicted));
+        EXPECT_TRUE(evicted.empty()) << i;
+    }
+    for (int i = 2; i < 5; ++i) {
+        std::vector<std::string> evicted;
+        ASSERT_TRUE(OffloadOne(storage_backend, "key" + std::to_string(i),
+                               IncompressibleBytes(kValueBytes, i + 1),
+                               &evicted));
+        EXPECT_EQ(evicted,
+                  std::vector<std::string>{"key" + std::to_string(i - 2)});
+        EXPECT_LE(BucketFileBytes(data_path), bucket_config.max_physical_bytes);
+    }
+}
+
+// A failed eviction notification restores the projection.
+TEST_F(StorageBackendTest, BucketPhysicalUsageRestoredOnNotifyFailure) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 10 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.max_physical_bytes = int64_t{1} << 40;
+    bucket_config.disk_scan_cache_ms = 3600 * 1000;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    const int64_t before = storage_backend.ProjectedPhysicalBytesForTest(0);
+    ASSERT_TRUE(OffloadOne(storage_backend, "first_key",
+                           IncompressibleBytes(6 * 1024, 1)));
+    const int64_t after_first =
+        storage_backend.ProjectedPhysicalBytesForTest(0);
+    ExpectProjectionCovers(after_first, before + BucketFileBytes(data_path), 2);
+
+    EXPECT_FALSE(OffloadOne(storage_backend, "second_key",
+                            IncompressibleBytes(6 * 1024, 2), nullptr,
+                            ErrorCode::INTERNAL_ERROR));
+    EXPECT_EQ(storage_backend.ProjectedPhysicalBytesForTest(0), after_first);
 }
 
 TEST_F(StorageBackendTest, BucketIndexGrowthPreservesRollbackAndRecovery) {

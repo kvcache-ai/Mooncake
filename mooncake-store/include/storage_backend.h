@@ -829,6 +829,8 @@ struct DiskState {
     int64_t total_size = 0;
     int64_t pending_write_size = 0;
     int64_t pending_eviction_size = 0;
+    // Physical footprint of reserved writes (upper bound).
+    int64_t pending_physical_write = 0;
     // FIFO eviction index: bucket ids on this disk, ascending = oldest first.
     // buckets_ alone is not enough once buckets live on several disks, since
     // its begin() may point at a bucket on a different disk.
@@ -838,18 +840,32 @@ struct DiskState {
     std::set<std::pair<int64_t, int64_t>> lru_index;
 };
 
+// One directory scan, with the written counter read before the walk and the
+// cache generation it belongs to.
+struct DiskUsageSample {
+    int64_t bytes = 0;
+    int64_t written_base = 0;
+    uint64_t generation = 0;
+};
+
 // Cached physical usage of one disk's offload directory, filled by
 // BucketStorageBackend::ActualDiskBytesUsed(). Kept out of DiskState so the
 // directory walk runs without BucketStorageBackend::mutex_; the own mutex is
-// held across the walk, guarding the value and serialising scans of the disk.
+// held across the walk, guarding the sample and serialising scans of the disk.
 struct DiskUsageCache {
     Mutex mutex;
-    int64_t bytes = -1;  // -1 = not measured, rescan on next query
+    DiskUsageSample sample;
+    bool valid = false;  // false = rescan on next query
     std::chrono::steady_clock::time_point taken_at{};
+    // Committed bucket bytes; covers writes since the sample was taken.
+    std::atomic<int64_t> written{0};
+    // Bumped by Invalidate(), so a sample taken before it is detectably stale.
+    std::atomic<uint64_t> generation{0};
 
     void Invalidate() {
         MutexLocker lock(&mutex);
-        bytes = -1;
+        valid = false;
+        generation.fetch_add(1, std::memory_order_acq_rel);
     }
 };
 
@@ -859,8 +875,8 @@ struct DiskSpaceSnapshot {
     // fs::space() succeeded; available is meaningful only then.
     bool space_known = false;
     uint64_t available = 0;
-    // Result of ActualDiskBytesUsed(); 0 when max_physical_bytes is off.
-    int64_t physical_used = 0;
+    // Result of ActualDiskBytesUsed(); empty when max_physical_bytes is off.
+    DiskUsageSample usage;
 };
 
 class BucketStorageBackend : public StorageBackendInterface {
@@ -1153,6 +1169,8 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<std::string> skipped_keys;
         int64_t evicted_size = 0;
         int64_t write_size = 0;
+        // Share of DiskState::pending_physical_write.
+        int64_t physical_write_size = 0;
         // Disk this reservation belongs to. PrepareEviction picks it before
         // reserving anything, and every Restore/Commit/Release step credits
         // that same disk's counters. -1 only ever survives on a default-
@@ -1237,7 +1255,12 @@ class BucketStorageBackend : public StorageBackendInterface {
      *
      * @param disk_index The disk whose root is scanned.
      */
-    int64_t ActualDiskBytesUsed(int disk_index) const;
+    DiskUsageSample ActualDiskBytesUsed(int disk_index) const;
+
+    // Sample plus writes committed since it and writes still reserved.
+    // Caller must hold mutex_.
+    int64_t ProjectedPhysicalBytesLocked(int disk_index,
+                                         const DiskUsageSample& sample) const;
 
     /**
      * @brief Collect the free space and physical usage PrepareEviction needs
@@ -1305,8 +1328,11 @@ class BucketStorageBackend : public StorageBackendInterface {
     // Test-only: the cached physical-usage measurement PrepareEviction uses
     // for one disk, so cache reuse and invalidation are observable.
     int64_t ActualDiskBytesUsedForTest(int disk_index) const {
-        return ActualDiskBytesUsed(disk_index);
+        return ActualDiskBytesUsed(disk_index).bytes;
     }
+
+    // Test-only: the physical usage PrepareEviction would project right now.
+    int64_t ProjectedPhysicalBytesForTest(int disk_index);
 
     // Test-only: open aligned direct bucket files as on a file system that
     // refuses O_DIRECT.

@@ -60,11 +60,10 @@ struct BucketBackendConfig {
     int64_t max_physical_bytes = 0;
 
     // How long ActualDiskBytesUsed() caches its directory-scan result
-    // (milliseconds). Bounds scan cost under a high offload rate; larger =
-    // cheaper but a staler physical bound (disk may momentarily exceed the cap
-    // by roughly one interval's worth of writes), smaller = tighter but scans
-    // more often. <=0 disables caching (scan every check). Only relevant when
-    // max_physical_bytes > 0.
+    // (milliseconds). Bounds scan cost under a high offload rate; this
+    // backend's own writes are counted on top of the cached value, so the
+    // interval only bounds how long other files go unseen. <=0 disables caching
+    // (scan every check). Only relevant when max_physical_bytes > 0.
     int64_t disk_scan_cache_ms = 500;
 
     // Write the final partial bucket in the current offload cycle instead of
