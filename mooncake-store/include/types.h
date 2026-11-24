@@ -21,10 +21,11 @@
 
 namespace mooncake {
 
-enum class ProbeLeaseMode : uint8_t { None = 0, LastHitOnly = 1 };
+enum class ProbeLeaseMode : uint8_t { None = 0, LastHitOnly = 1, AllHits = 2 };
 
 // Candidates are consecutive groups of candidate_size keys in caller order.
 // None preserves the lease-free existence probe and ignores candidate_size.
+// AllHits grants a read lease to every readable key (standard ExistKey).
 struct GrantLeasePolicy {
     ProbeLeaseMode lease_mode{ProbeLeaseMode::None};
     uint64_t candidate_size{1};

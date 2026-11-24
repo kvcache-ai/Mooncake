@@ -91,6 +91,21 @@ struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaListV2> {
+    static constexpr const char* value = "BatchGetReplicaListV2";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPutStartV2> {
+    static constexpr const char* value = "BatchPutStartV2";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPutFinish> {
+    static constexpr const char* value = "BatchPutFinish";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PutStart> {
     static constexpr const char* value = "PutStart";
 };
@@ -826,6 +841,43 @@ MasterClient::BatchGetReplicaListReadOnly(
         invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaListForAdmin,
                          GetReplicaListResponse>(object_keys.size(),
                                                  object_keys, tenant_id);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+std::vector<tl::expected<GetReplicaResponse, ErrorCode>>
+MasterClient::BatchGetReplicaList(
+    const std::vector<GetReplicaRequest>& requests) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList(unified)");
+    timer.LogRequest("requests_count=", requests.size());
+
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaListV2,
+                                   GetReplicaResponse>(
+        requests.size(), tenant_id_.value(), requests);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+std::vector<tl::expected<PutStartResponse, ErrorCode>>
+MasterClient::BatchPutStart(const std::vector<PutStartItem>& items,
+                            const ReplicateConfig& config) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchPutStart(unified)");
+    timer.LogRequest("items_count=", items.size());
+
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutStartV2,
+                                   PutStartResponse>(
+        items.size(), client_id_, tenant_id_.value(), items, config);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutFinish(
+    const std::vector<PutFinishRequest>& requests) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchPutFinish");
+    timer.LogRequest("requests_count=", requests.size());
+
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutFinish, void>(
+        requests.size(), client_id_, tenant_id_.value(), requests);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

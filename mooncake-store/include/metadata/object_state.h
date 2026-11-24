@@ -27,6 +27,8 @@ struct ObjectState {
     // An in-place overwrite invalidates the old contents even if a pending
     // REMOVED replica still retains their tier. Consumed on write release.
     bool kv_content_invalidated{false};
+    // Present only while is_processing is true (RangeTarget / PiecePut).
+    HeapOptional<RangeWriteState> range_write;
     HeapOptional<ReplicationTask> replication_task;
     HeapOptional<OffloadingTask> offloading_task;
     HeapOptional<PromotionTask> promotion_task;

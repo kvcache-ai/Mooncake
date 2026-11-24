@@ -57,6 +57,7 @@
 #include "crc_checksum.h"
 #include "config/client_numa_config.h"
 #include "storage/distributed/distributed_storage_backend.h"
+#include "unified_io_validation.h"
 
 namespace mooncake {
 
@@ -1371,54 +1372,6 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     return Get(object_key, query_result.value(), slices);
 }
 
-std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
-    const std::vector<std::string>& object_keys,
-    std::unordered_map<std::string, std::vector<Slice>>& slices) {
-    auto batched_query_results = BatchQuery(object_keys);
-
-    // If any queries failed, return error results immediately for failed
-    // queries
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(object_keys.size());
-
-    std::vector<QueryResult> valid_query_results;
-    std::vector<size_t> valid_indices;
-    std::vector<std::string> valid_keys;
-
-    for (size_t i = 0; i < batched_query_results.size(); ++i) {
-        if (batched_query_results[i]) {
-            valid_query_results.emplace_back(batched_query_results[i].value());
-            valid_indices.emplace_back(i);
-            valid_keys.emplace_back(object_keys[i]);
-            results.emplace_back();  // placeholder for successful results
-        } else {
-            results.emplace_back(
-                tl::unexpected(batched_query_results[i].error()));
-        }
-    }
-
-    // If we have any valid queries, process them
-    if (!valid_keys.empty()) {
-        std::unordered_map<std::string, std::vector<Slice>> valid_slices;
-        for (const auto& key : valid_keys) {
-            auto it = slices.find(key);
-            if (it != slices.end()) {
-                valid_slices[key] = it->second;
-            }
-        }
-
-        auto valid_results =
-            BatchGet(valid_keys, valid_query_results, valid_slices);
-
-        // Merge results back
-        for (size_t i = 0; i < valid_indices.size(); ++i) {
-            results[valid_indices[i]] = valid_results[i];
-        }
-    }
-
-    return results;
-}
-
 tl::expected<
     std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
     ErrorCode>
@@ -1778,164 +1731,163 @@ std::optional<StoreScatterTransferOperation> Client::SubmitScatterNative(
     return transfer_submitter_->submitNativeScatter(transfers, intent);
 }
 
-std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
-    const std::vector<std::string>& object_keys,
-    const std::vector<QueryResult>& query_results,
-    std::unordered_map<std::string, std::vector<Slice>>& slices,
-    bool group_by_target) {
+void Client::ExecuteBatchGetTransfers(
+    std::vector<ResolvedGetTransfer>& transfers,
+    std::vector<tl::expected<void, ErrorCode>>& results, bool group_by_target) {
+    if (transfers.empty()) {
+        return;
+    }
+    auto record_error = [&](size_t result_index, ErrorCode err) {
+        if (results[result_index].has_value()) {
+            results[result_index] = tl::unexpected(err);
+        }
+    };
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
-        std::vector<tl::expected<void, ErrorCode>> results;
-        results.reserve(object_keys.size());
-        for (size_t i = 0; i < object_keys.size(); ++i) {
-            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+        for (const auto& t : transfers) {
+            record_error(t.result_index, ErrorCode::INVALID_PARAMS);
         }
-        return results;
+        return;
     }
 
-    // Validate input size consistency
-    if (query_results.size() != object_keys.size()) {
-        LOG(ERROR) << "Query results size (" << query_results.size()
-                   << ") doesn't match object keys size (" << object_keys.size()
-                   << ")";
-        std::vector<tl::expected<void, ErrorCode>> results;
-        results.reserve(object_keys.size());
-        for (size_t i = 0; i < object_keys.size(); ++i) {
-            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
-        }
-        return results;
-    }
-
-    // Collect all transfer operations for parallel execution
-    // Tuple: (index, key, future, replica, cache_used)
-    std::vector<std::tuple<size_t, std::string, TransferFuture,
-                           Replica::Descriptor, bool>>
+    // Collect all transfer operations for parallel execution.
+    // Tuple: (transfer_index, future, replica, cache_used)
+    std::vector<std::tuple<size_t, TransferFuture, Replica::Descriptor, bool>>
         pending_transfers;
     struct TargetReadGroup {
-        std::vector<size_t> indexes;
+        std::vector<size_t> transfer_indexes;
         std::vector<Replica::Descriptor> replicas;
         std::vector<std::vector<Slice>> slices;
         std::vector<bool> cache_used;
     };
     std::unordered_map<std::string, TargetReadGroup> target_groups;
     std::vector<DfsReadRequest> dfs_read_requests;
-    std::vector<size_t> dfs_read_indices;
+    std::vector<size_t> dfs_read_transfer_indices;
     std::vector<Replica::Descriptor> dfs_read_replicas;
-    std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
-    // Record batch get transfer latency (Submit + Wait)
+
     auto t0_batch_get = std::chrono::steady_clock::now();
-
-    // Collect cache hit statistics for the entire batch
     size_t total_cache_hits = 0;
-
     auto select_replica = MakeReadReplicaSelector();
-    // Submit all transfers in parallel
-    for (size_t i = 0; i < object_keys.size(); ++i) {
-        const auto& key = object_keys[i];
-        const auto& query_result = query_results[i];
 
-        auto slices_it = slices.find(key);
-        if (slices_it == slices.end()) {
-            LOG(ERROR) << "Slices not found for key: " << key;
-            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+    for (size_t i = 0; i < transfers.size(); ++i) {
+        auto& t = transfers[i];
+        if (!results[t.result_index].has_value()) {
             continue;
         }
-        // Select a complete replica for this key's destination.
+
         Replica::Descriptor replica;
         ErrorCode err =
-            select_replica(query_result.replicas, slices_it->second, replica);
+            select_replica(t.query_result.replicas, t.slices, replica);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
-                LOG(ERROR) << "no_complete_replicas_found key=" << key;
+                LOG(ERROR) << "no_complete_replicas_found key=" << t.key;
             }
-            results[i] = tl::unexpected(err);
+            record_error(t.result_index, err);
             continue;
         }
 
         // Validate the requested length without accessing the replica's
         // buffer. A malformed request keeps its transfer error even when the
         // lease has expired.
-        if (replica.is_memory_replica() &&
-            CalculateSliceSize(slices_it->second) !=
-                replica.get_memory_descriptor().buffer_descriptor.size_) {
-            LOG(ERROR) << "Transfer length mismatch for key: " << key;
-            results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
-            continue;
+        if (t.src_offset == 0) {
+            if (replica.is_memory_replica() &&
+                CalculateSliceSize(t.slices) !=
+                    replica.get_memory_descriptor().buffer_descriptor.size_) {
+                LOG(ERROR) << "Transfer length mismatch for key: " << t.key;
+                record_error(t.result_index, ErrorCode::TRANSFER_FAIL);
+                continue;
+            }
+        } else {
+            if (!replica.is_memory_replica()) {
+                LOG(ERROR) << "Range read only supported for memory replicas, "
+                           << "key=" << t.key;
+                record_error(t.result_index, ErrorCode::INVALID_REPLICA);
+                continue;
+            }
+            const uint64_t buf_size =
+                replica.get_memory_descriptor().buffer_descriptor.size_;
+            const uint64_t req_size = CalculateSliceSize(t.slices);
+            if (t.src_offset > buf_size || req_size > buf_size - t.src_offset) {
+                LOG(ERROR) << "Range read out of bounds for key: " << t.key;
+                record_error(t.result_index, ErrorCode::TRANSFER_FAIL);
+                continue;
+            }
         }
-        if (query_result.IsLeaseExpired()) {
-            results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+
+        if (t.query_result.IsLeaseExpired()) {
+            record_error(t.result_index, ErrorCode::LEASE_EXPIRED);
             continue;
         }
 
         bool cache_used = false;
-        if (hot_cache_ && replica.is_memory_replica()) {
-            cache_used = RedirectToHotCache(key, replica);
+        if (t.allow_hot_cache && hot_cache_ && replica.is_memory_replica()) {
+            cache_used = RedirectToHotCache(t.key, replica);
             if (cache_used) {
                 total_cache_hits++;
             }
         }
 
-        // Submit transfer operation asynchronously
         std::optional<TransferFuture> future;
-        if (replica.is_dfs_replica()) {
+        if (t.src_offset > 0) {
+            future = SubmitRangeRead(replica, t.slices, t.src_offset);
+        } else if (replica.is_dfs_replica()) {
             if (!dfs_storage_backend_) {
                 LOG(ERROR) << "DFS backend is not initialized";
                 if (auto* dfs_metric = GetDfsMetricPtr()) {
                     dfs_metric->RecordReadErrors(
                         toString(ErrorCode::DFS_SERVICE_UNAVAILABLE));
                 }
-                results[i] = tl::unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+                record_error(t.result_index,
+                             ErrorCode::DFS_SERVICE_UNAVAILABLE);
                 continue;
             }
             const auto& desc = replica.get_dfs_descriptor();
             dfs_read_requests.push_back(
-                DfsReadRequest{.key = key,
+                DfsReadRequest{.key = t.key,
                                .descriptor = desc,
-                               .slices = slices_it->second,
+                               .slices = t.slices,
                                .source_replica_id = replica.id});
-            dfs_read_indices.push_back(i);
+            dfs_read_transfer_indices.push_back(i);
             dfs_read_replicas.push_back(replica);
             continue;
         } else if (replica.is_nof_replica()) {
-            auto contiguous_range = GetContiguousSliceRange(slices_it->second);
+            auto contiguous_range = GetContiguousSliceRange(t.slices);
             if (!contiguous_range.has_value()) {
                 LOG(ERROR) << "NoF transfer requires contiguous slices";
-                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                record_error(t.result_index, ErrorCode::INVALID_PARAMS);
                 continue;
             }
             future = transfer_submitter_->submit(
-                replica, slices_it->second, TransferRequest::READ,
-                contiguous_range->ptr, contiguous_range->size,
-                TransferIntent::kForegroundGet);
+                replica, t.slices, TransferRequest::READ, contiguous_range->ptr,
+                contiguous_range->size, TransferIntent::kForegroundGet);
         } else if (group_by_target && replica.is_memory_replica()) {
             auto& group =
                 target_groups[replica.get_memory_descriptor()
                                   .buffer_descriptor.transport_endpoint_];
-            group.indexes.push_back(i);
+            group.transfer_indexes.push_back(i);
             group.replicas.push_back(replica);
-            group.slices.push_back(slices_it->second);
+            group.slices.push_back(t.slices);
             group.cache_used.push_back(cache_used);
             continue;
         } else {
             future = transfer_submitter_->submit(
-                replica, slices_it->second, TransferRequest::READ, nullptr, 0,
+                replica, t.slices, TransferRequest::READ, nullptr, 0,
                 TransferIntent::kForegroundGet);
         }
+
         if (!future) {
-            // Release cache block if submit failed
             if (hot_cache_ && cache_used) {
-                hot_cache_->ReleaseHotKey(key);
+                hot_cache_->ReleaseHotKey(t.key);
             }
             LOG(ERROR) << "Failed to submit transfer operation for key: "
-                       << key;
-            results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                       << t.key;
+            record_error(t.result_index, ErrorCode::TRANSFER_FAIL);
             continue;
         }
 
-        VLOG(1) << "Submitted transfer for key " << key
+        VLOG(1) << "Submitted transfer for key " << t.key
                 << " using strategy: " << static_cast<int>(future->strategy());
-
-        pending_transfers.emplace_back(i, key, std::move(*future), replica,
+        pending_transfers.emplace_back(i, std::move(*future), replica,
                                        cache_used);
     }
 
@@ -1943,23 +1895,22 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         auto future = transfer_submitter_->submit_batch(
             group.replicas, group.slices, TransferRequest::READ,
             TransferIntent::kForegroundGet);
-        for (size_t j = 0; j < group.indexes.size(); ++j) {
-            const size_t index = group.indexes[j];
-            const auto& key = object_keys[index];
+        for (size_t j = 0; j < group.transfer_indexes.size(); ++j) {
+            const size_t t_idx = group.transfer_indexes[j];
+            const auto& t = transfers[t_idx];
             if (!future) {
                 if (hot_cache_ && group.cache_used[j]) {
-                    hot_cache_->ReleaseHotKey(key);
+                    hot_cache_->ReleaseHotKey(t.key);
                 }
                 LOG(ERROR) << "Failed to submit batch transfer to " << endpoint
-                           << " for key: " << key;
-                results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                           << " for key: " << t.key;
+                record_error(t.result_index, ErrorCode::TRANSFER_FAIL);
                 continue;
             }
-            pending_transfers.emplace_back(index, key, future->share(),
-                                           group.replicas[j],
-                                           group.cache_used[j]);
+            pending_transfers.emplace_back(
+                t_idx, future->share(), group.replicas[j], group.cache_used[j]);
         }
-        VLOG(1) << "Submitted batch read of " << group.indexes.size()
+        VLOG(1) << "Submitted batch read of " << group.transfer_indexes.size()
                 << " keys from " << endpoint;
     }
 
@@ -1974,17 +1925,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             LOG(ERROR) << "DFS BatchRead response size mismatch: expected "
                        << dfs_read_requests.size() << ", got "
                        << dfs_results.size();
-            for (size_t index : dfs_read_indices) {
-                results[index] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            for (size_t t_idx : dfs_read_transfer_indices) {
+                record_error(transfers[t_idx].result_index,
+                             ErrorCode::INTERNAL_ERROR);
             }
             if (dfs_metric) {
                 dfs_metric->RecordReadErrors(
                     toString(ErrorCode::INTERNAL_ERROR),
-                    static_cast<int64_t>(dfs_read_indices.size()));
+                    static_cast<int64_t>(dfs_read_transfer_indices.size()));
             }
         } else {
             for (size_t i = 0; i < dfs_results.size(); ++i) {
-                const size_t index = dfs_read_indices[i];
+                const auto& t = transfers[dfs_read_transfer_indices[i]];
                 const auto& request = dfs_read_requests[i];
                 if (!dfs_results[i]) {
                     LOG(WARNING) << "DFS read failed, action=batch_read, key="
@@ -1996,32 +1948,29 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                         dfs_metric->RecordReadErrors(
                             toString(dfs_results[i].error()));
                     }
-                    results[index] = tl::unexpected(dfs_results[i].error());
+                    record_error(t.result_index, dfs_results[i].error());
                     if (dfs_results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
-                        ReconcileMissingKvcsReplica(request.key,
-                                                    query_results[index],
+                        ReconcileMissingKvcsReplica(request.key, t.query_result,
                                                     dfs_read_replicas[i]);
                     }
                     continue;
                 }
-                // The I/O itself delivered these bytes, so they count even if
-                // the checksum below rejects the payload; a checksum mismatch
-                // is additionally recorded as an error so the two are
-                // distinguishable.
                 ++dfs_success_keys;
                 dfs_success_bytes += request.descriptor.object_size;
-                auto checksum_result = VerifyObjectChecksum(
-                    request.key, request.slices, request.descriptor.object_size,
-                    query_results[index].object_checksum);
-                if (!checksum_result) {
-                    if (dfs_metric) {
-                        dfs_metric->RecordReadErrors(
-                            toString(checksum_result.error()));
+                if (t.verify_checksum) {
+                    auto checksum_result =
+                        VerifyObjectChecksum(request.key, request.slices,
+                                             request.descriptor.object_size,
+                                             t.query_result.object_checksum);
+                    if (!checksum_result) {
+                        if (dfs_metric) {
+                            dfs_metric->RecordReadErrors(
+                                toString(checksum_result.error()));
+                        }
+                        record_error(t.result_index, checksum_result.error());
+                        continue;
                     }
-                    results[index] = tl::unexpected(checksum_result.error());
-                    continue;
                 }
-                results[index] = {};
             }
         }
         if (dfs_metric && dfs_success_keys > 0) {
@@ -2036,57 +1985,45 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << ", latency_us=" << dfs_read_latency_us;
     }
 
-    // Wait for all transfers to complete
-    for (auto& [index, key, future, stored_replica, cache_used] :
+    for (auto& [t_idx, future, stored_replica, cache_used] :
          pending_transfers) {
+        auto& t = transfers[t_idx];
         ErrorCode result = future.get();
 
-        // Release the cache block after transfer completes (memcpy is done)
         if (hot_cache_ && cache_used) {
-            hot_cache_->ReleaseHotKey(key);
+            hot_cache_->ReleaseHotKey(t.key);
         }
         if (result != ErrorCode::OK) {
-            LOG(ERROR) << "Transfer failed for key: " << key
+            LOG(ERROR) << "Transfer failed for key: " << t.key
                        << " with error: " << static_cast<int>(result);
-            results[index] = tl::unexpected(result);
-        } else {
-            VLOG(1) << "Transfer completed successfully for key: " << key;
+            record_error(t.result_index, result);
+            continue;
+        }
 
-            auto slices_it = slices.find(key);
-            if (slices_it == slices.end()) {
-                results[index] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-                continue;
-            }
+        VLOG(1) << "Transfer completed successfully for key: " << t.key;
+        if (t.verify_checksum) {
             auto checksum_result = VerifyObjectChecksum(
-                key, slices_it->second, calculate_total_size(stored_replica),
-                query_results[index].object_checksum);
+                t.key, t.slices, calculate_total_size(stored_replica),
+                t.query_result.object_checksum);
             if (!checksum_result) {
-                results[index] = tl::unexpected(checksum_result.error());
+                record_error(t.result_index, checksum_result.error());
                 continue;
             }
-            results[index] = {};
-
-            // Frequency admission: only promote frequently accessed keys.
-            // Skip when cache was used (data served from local cache).
-            if (hot_cache_) {
-                auto slices_it = slices.find(key);
-                if (slices_it != slices.end() &&
-                    ShouldAdmitToHotCache(key, cache_used)) {
-                    ProcessSlicesAsync(key, slices_it->second, stored_replica);
-                }
-            }
+        }
+        if (t.allow_hot_cache && hot_cache_ &&
+            ShouldAdmitToHotCache(t.key, cache_used)) {
+            ProcessSlicesAsync(t.key, t.slices, stored_replica);
         }
     }
 
-    // As lease expired is a rare case, we check all the results with the same
-    // time_point to avoid too many syscalls
     std::chrono::steady_clock::time_point now =
         std::chrono::steady_clock::now();
-    for (size_t i = 0; i < object_keys.size(); ++i) {
-        if (results[i].has_value() && query_results[i].IsLeaseExpired(now)) {
+    for (const auto& t : transfers) {
+        if (results[t.result_index].has_value() &&
+            t.query_result.IsLeaseExpired(now)) {
             LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
-                         << object_keys[i];
-            results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+                         << t.key;
+            results[t.result_index] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
         }
     }
 
@@ -2096,14 +2033,56 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     if (metrics_) {
         metrics_->transfer_metric.batch_get_latency_us.observe(us_batch_get);
     }
-
-    // Log overall cache hit statistics for the entire batch
     if (hot_cache_) {
-        VLOG(1) << "BatchGet completed: num_keys=" << object_keys.size()
+        VLOG(1) << "BatchGet completed: num_transfers=" << transfers.size()
                 << " total_cache_hits=" << total_cache_hits;
     } else {
-        VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
+        VLOG(1) << "BatchGet completed for " << transfers.size()
+                << " transfers";
     }
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
+    const std::vector<std::string>& object_keys,
+    const std::vector<QueryResult>& query_results,
+    std::unordered_map<std::string, std::vector<Slice>>& slices,
+    bool group_by_target) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            object_keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    if (query_results.size() != object_keys.size()) {
+        LOG(ERROR) << "Query results size (" << query_results.size()
+                   << ") doesn't match object keys size (" << object_keys.size()
+                   << ")";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            object_keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
+    std::vector<ResolvedGetTransfer> transfers;
+    transfers.reserve(object_keys.size());
+    for (size_t i = 0; i < object_keys.size(); ++i) {
+        const auto& key = object_keys[i];
+        auto slices_it = slices.find(key);
+        if (slices_it == slices.end()) {
+            LOG(ERROR) << "Slices not found for key: " << key;
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+        transfers.push_back(ResolvedGetTransfer{
+            .result_index = i,
+            .key = key,
+            .slices = slices_it->second,
+            .query_result = query_results[i],
+            .src_offset = 0,
+            .allow_hot_cache = true,
+            .verify_checksum = true,
+        });
+    }
+    ExecuteBatchGetTransfers(transfers, results, group_by_target);
     return results;
 }
 
@@ -5340,6 +5319,341 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
         results[i] = tl::unexpected(entry_errors[i].value());
     }
     return results;
+}
+
+namespace {
+
+ReplicateConfig StripPerKeyHints(const ReplicateConfig& config) {
+    ReplicateConfig base = config;
+    base.group_ids.reset();
+    base.session_ids.reset();
+    base.per_key_preferred_hca_names.reset();
+    base.residency_affinity_ids.reset();
+    return base;
+}
+
+}  // namespace
+
+tl::expected<void, ErrorCode> Client::Put(const PutItem& item,
+                                          const ReplicateConfig& config) {
+    return BatchPut(std::span<const PutItem>(&item, 1), config).front();
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
+    std::span<const PutItem> items, const ReplicateConfig& config) {
+    constexpr size_t kWindowSize = 64;
+    std::vector<tl::expected<void, ErrorCode>> results(
+        items.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (items.empty() || !config.HasValidKeyHints(items.size()) ||
+        !config.ValidSessionIds(items.size())) {
+        return results;
+    }
+
+    const auto put_caps = detail::ResolveUnifiedPutCapabilities(
+        transfer_engine_ != nullptr, protocol_,
+        transfer_engine_ && transfer_engine_->isUsingTent(),
+        object_checksum_enabled_, detail::IsLegacyTcpProtoForced(), config);
+    const ReplicateConfig base_config = AttachHostId(StripPerKeyHints(config));
+    const auto hca_infer = MakeHcaAffinity();
+    auto lookup_tcp_proto_version =
+        [metadata =
+             transfer_engine_ ? transfer_engine_->getMetadata() : nullptr](
+            const std::string& endpoint) -> std::optional<int> {
+        if (!metadata) {
+            return std::nullopt;
+        }
+        const auto target = metadata->getSegmentDescByName(endpoint);
+        return target ? std::optional<int>(target->tcp_proto_version)
+                      : std::nullopt;
+    };
+
+    struct PendingPut {
+        size_t item_index{0};
+        uint64_t length{0};
+        std::optional<uint64_t> checksum{};
+        bool is_range{false};
+        bool started{false};
+        ErrorCode error{ErrorCode::OK};
+        PutFinishRequest finish_req{};
+    };
+
+    for (size_t begin = 0; begin < items.size(); begin += kWindowSize) {
+        const size_t end = std::min(items.size(), begin + kWindowSize);
+        std::vector<PendingPut> pending;
+        std::vector<PutStartItem> start_items;
+        pending.reserve(end - begin);
+        start_items.reserve(end - begin);
+
+        // 1. Validate inputs and build BatchPutStart items.
+        for (size_t index = begin; index < end; ++index) {
+            const auto& item = items[index];
+            const auto length = detail::ValidatePutItem(item, put_caps);
+            if (!length) {
+                results[index] = tl::unexpected(length.error());
+                continue;
+            }
+
+            const bool is_range =
+                std::holds_alternative<RangeTarget>(item.target);
+            std::optional<uint64_t> checksum;
+            if (object_checksum_enabled_ && !is_range) {
+                auto computed = ComputeObjectChecksumForSlices(
+                    item.key, item.slices, *length);
+                if (!computed) {
+                    results[index] = tl::unexpected(computed.error());
+                    continue;
+                }
+                checksum = *computed;
+            }
+
+            if (hot_cache_) {
+                hot_cache_->RemoveHotKey(item.key);
+            }
+
+            PutStartItem start_item{
+                .key = item.key,
+                .size = *length,
+                .target = item.target,
+            };
+            if (config.group_ids) {
+                start_item.group_id = config.group_ids->at(index);
+            }
+            if (config.session_ids) {
+                start_item.session_id = config.session_ids->at(index);
+            }
+            if (config.residency_affinity_ids) {
+                start_item.residency_affinity_id =
+                    config.residency_affinity_ids->at(index);
+            }
+            if (config.per_key_preferred_hca_names) {
+                start_item.preferred_hca_names =
+                    config.per_key_preferred_hca_names->at(index);
+            } else if (!base_config.preferred_hca_names && hca_infer) {
+                start_item.preferred_hca_names = hca_infer(item.slices);
+            }
+            start_items.push_back(std::move(start_item));
+            pending.push_back(PendingPut{
+                .item_index = index,
+                .length = *length,
+                .checksum = checksum,
+                .is_range = is_range,
+            });
+        }
+
+        if (pending.empty()) {
+            continue;
+        }
+
+        // 2. Start writes on Master and validate returned memory descriptors.
+        auto starts = master_client_.BatchPutStart(start_items, base_config);
+        std::vector<size_t> transfer_idx;
+        std::vector<std::vector<Replica::Descriptor>> transfer_replicas;
+        std::vector<std::vector<Slice>> transfer_slices;
+        std::vector<std::vector<uint64_t>> transfer_offsets;
+
+        for (size_t i = 0; i < pending.size(); ++i) {
+            auto& p = pending[i];
+            if (i >= starts.size()) {
+                results[p.item_index] = tl::unexpected(ErrorCode::RPC_FAIL);
+                continue;
+            }
+            if (!starts[i]) {
+                results[p.item_index] = tl::unexpected(starts[i].error());
+                continue;
+            }
+            auto& start = *starts[i];
+            p.started = true;
+            p.finish_req = PutFinishRequest{
+                .token = std::move(start.token),
+                .commit = false,
+                .replica_type =
+                    p.is_range ? ReplicaType::MEMORY : ReplicaType::ALL,
+                .checksum = p.checksum,
+            };
+            p.error = detail::ValidateAllocatedWriteReplicas(
+                start.replicas, p.length, p.is_range, lookup_tcp_proto_version);
+            if (p.error != ErrorCode::OK) {
+                continue;
+            }
+
+            // Master already sliced RangeTarget descriptors to
+            // `[base + offset, length)`, so every mode writes from offset 0.
+            transfer_idx.push_back(i);
+            transfer_replicas.push_back(std::move(start.replicas));
+            transfer_slices.push_back(items[p.item_index].slices);
+            transfer_offsets.push_back(
+                detail::BuildZeroBasedSliceOffsets(items[p.item_index].slices));
+        }
+
+        // 3. Transfer payload data for all valid started items.
+        if (!transfer_idx.empty()) {
+            auto writes = BatchTransferWriteRanges(
+                transfer_replicas, transfer_slices, transfer_offsets);
+            for (size_t i = 0; i < transfer_idx.size(); ++i) {
+                auto& p = pending[transfer_idx[i]];
+                if (writes.size() == transfer_idx.size() &&
+                    writes[i].has_value()) {
+                    p.finish_req.commit = true;
+                } else {
+                    p.error = writes.size() == transfer_idx.size()
+                                  ? writes[i].error()
+                                  : ErrorCode::TRANSFER_FAIL;
+                }
+            }
+        }
+
+        // 4. Commit successful writes and abort failed started writes.
+        std::vector<size_t> finish_idx;
+        std::vector<PutFinishRequest> finish_reqs;
+        finish_idx.reserve(pending.size());
+        finish_reqs.reserve(pending.size());
+        for (size_t i = 0; i < pending.size(); ++i) {
+            if (!pending[i].started) {
+                continue;
+            }
+            finish_idx.push_back(i);
+            finish_reqs.push_back(std::move(pending[i].finish_req));
+        }
+        if (finish_reqs.empty()) {
+            continue;
+        }
+        auto confirmed = master_client_.BatchPutFinish(finish_reqs);
+        for (size_t i = 0; i < finish_idx.size(); ++i) {
+            const auto& p = pending[finish_idx[i]];
+            if (p.error != ErrorCode::OK) {
+                results[p.item_index] = tl::unexpected(p.error);
+                continue;
+            }
+            if (i >= confirmed.size()) {
+                results[p.item_index] = tl::unexpected(ErrorCode::RPC_FAIL);
+                continue;
+            }
+            results[p.item_index] = confirmed[i];
+            if (hot_cache_ && results[p.item_index]) {
+                hot_cache_->RemoveHotKey(items[p.item_index].key);
+            }
+        }
+    }
+    return results;
+}
+
+tl::expected<void, ErrorCode> Client::Get(const GetItem& item) {
+    return BatchGet(std::span<const GetItem>(&item, 1)).front();
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
+    std::span<const GetItem> items, bool group_by_target) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        items.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (items.empty()) {
+        return results;
+    }
+
+    std::vector<size_t> request_indices;
+    std::vector<GetReplicaRequest> requests;
+    request_indices.reserve(items.size());
+    requests.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (const auto err = detail::ValidateGetItem(items[i]);
+            err != ErrorCode::OK) {
+            results[i] = tl::unexpected(err);
+            continue;
+        }
+        request_indices.push_back(i);
+        requests.push_back(GetReplicaRequest{
+            .key = items[i].key,
+            .target = items[i].target,
+        });
+    }
+    if (requests.empty()) {
+        return results;
+    }
+
+    const auto query_start = std::chrono::steady_clock::now();
+    auto responses = master_client_.BatchGetReplicaList(requests);
+    std::vector<ResolvedGetTransfer> transfers;
+    transfers.reserve(requests.size());
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const size_t item_index = request_indices[i];
+        if (i >= responses.size()) {
+            results[item_index] = tl::unexpected(ErrorCode::RPC_FAIL);
+            continue;
+        }
+        if (!responses[i]) {
+            results[item_index] = tl::unexpected(responses[i].error());
+            continue;
+        }
+        auto& resp = *responses[i];
+        if (resp.parts.empty()) {
+            results[item_index] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
+        }
+
+        const auto lease_timeout =
+            query_start + std::chrono::milliseconds(resp.lease_ttl_ms);
+        const auto& item = items[item_index];
+        const bool is_whole_target =
+            std::holds_alternative<WholeObject>(item.target);
+
+        if (resp.parts.size() == 1) {
+            auto& part = resp.parts[0];
+            results[item_index] = {};
+            transfers.push_back(ResolvedGetTransfer{
+                .result_index = item_index,
+                .key = item.key,
+                .slices = item.slices,
+                .query_result = QueryResult(std::move(part.replicas),
+                                            lease_timeout, part.checksum,
+                                            std::move(resp.resolved_tenant_id)),
+                .src_offset = item.src_offset,
+                .allow_hot_cache = is_whole_target && item.src_offset == 0,
+                .verify_checksum = (item.src_offset == 0),
+            });
+            continue;
+        }
+
+        auto plans = detail::PlanMultiPartReadSlices(resp.parts, item.slices,
+                                                     item.src_offset);
+        if (!plans) {
+            results[item_index] = tl::unexpected(plans.error());
+            continue;
+        }
+        results[item_index] = {};
+        for (auto& plan : *plans) {
+            auto& part = resp.parts[plan.part_index];
+            transfers.push_back(ResolvedGetTransfer{
+                .result_index = item_index,
+                .key = item.key,
+                .slices = std::move(plan.slices),
+                .query_result =
+                    QueryResult(std::move(part.replicas), lease_timeout,
+                                part.checksum, resp.resolved_tenant_id),
+                .src_offset = plan.part_src_offset,
+                .allow_hot_cache = false,
+                .verify_checksum = plan.full_part,
+            });
+        }
+    }
+
+    ExecuteBatchGetTransfers(transfers, results, group_by_target);
+    return results;
+}
+
+std::vector<tl::expected<bool, ErrorCode>> Client::BatchExist(
+    std::span<const std::string> keys, const GrantLeasePolicy& lease_policy) {
+    if (keys.empty()) {
+        return {};
+    }
+    auto response = master_client_.BatchProbeKey(
+        std::vector<std::string>(keys.begin(), keys.end()), lease_policy);
+    if (response.size() != keys.size()) {
+        LOG(ERROR) << "BatchExist response size mismatch. Expected: "
+                   << keys.size() << ", Got: " << response.size();
+        return std::vector<tl::expected<bool, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::RPC_FAIL));
+    }
+    return response;
 }
 
 ErrorCode Client::TransferReadInternal(

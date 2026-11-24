@@ -415,6 +415,11 @@ class MasterService {
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const TenantId& tenant_id);
 
+    // Unified AoS batch replica lookup with explicit ReadTarget.
+    std::vector<tl::expected<GetReplicaResponse, ErrorCode>>
+    BatchGetReplicaList(const TenantId& tenant_id,
+                        const std::vector<GetReplicaRequest>& requests);
+
     /**
      * @brief Read-only batch replica list query for admin use.
      * Unlike BatchGetReplicaList, this does not grant leases, trigger
@@ -423,6 +428,16 @@ class MasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                                 const TenantId& tenant_id);
+
+    // Unified AoS batch write start/finish supporting WholeObject, PartTarget,
+    // and RangeTarget (multi-producer PiecePut).
+    std::vector<tl::expected<PutStartResponse, ErrorCode>> BatchPutStart(
+        const UUID& client_id, const TenantId& tenant_id,
+        const std::vector<PutStartItem>& items, const ReplicateConfig& config);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutFinish(
+        const UUID& client_id, const TenantId& tenant_id,
+        const std::vector<PutFinishRequest>& requests);
 
     /**
      * @brief Start a put operation for an object
@@ -1511,6 +1526,61 @@ class MasterService {
         std::string group_id;
         std::string residency_affinity_id;
     };
+
+    // RangeTarget (PiecePut) write lifecycle helpers. Active assembly state
+    // lives in ObjectState::range_write under the key write guard while
+    // ObjectState::is_processing is true.
+    bool IsRangeWriteExpired(
+        const ObjectMetadata& metadata,
+        const std::chrono::system_clock::time_point& now) const noexcept;
+    ErrorCode ValidateRangePutRequest(const PutStartItem& item,
+                                      const RangeTarget& target,
+                                      const ReplicateConfig& config) const;
+    static RangeWriteSpec MakeRangeWriteSpec(uint64_t total_size,
+                                             const ReplicateConfig& config,
+                                             const WriteStartPlan& plan);
+    ErrorCode JoinRangeWriteLocked(MetadataAccessorRW& accessor,
+                                   RangeWriteState& range,
+                                   const UUID& client_id,
+                                   const PutStartItem& item,
+                                   const RangeTarget& target,
+                                   const RangeWriteSpec& spec);
+    auto BeginRangeWriteLocked(MetadataAccessorRW& accessor,
+                               const UUID& client_id, const PutStartItem& item,
+                               const RangeTarget& target,
+                               const ReplicateConfig& config,
+                               const WriteStartPlan& plan,
+                               const RangeWriteSpec& spec,
+                               const std::chrono::system_clock::time_point& now)
+        -> tl::expected<RangeWriteState*, ErrorCode>;
+    auto BuildRangePutStartResponseLocked(MetadataAccessorRW& accessor,
+                                          const RangeWriteState& range,
+                                          const std::string& key,
+                                          const RangeTarget& target,
+                                          uint64_t piece_size)
+        -> tl::expected<PutStartResponse, ErrorCode>;
+    auto StartRangePut(const UUID& client_id, const PutStartItem& item,
+                       const ReplicateConfig& config, const TenantId& tenant_id)
+        -> tl::expected<PutStartResponse, ErrorCode>;
+    auto FinishRangePut(const UUID& client_id, const PutFinishRequest& request,
+                        const TenantId& tenant_id)
+        -> tl::expected<void, ErrorCode>;
+    auto FinishWholePut(const UUID& client_id, const PutFinishRequest& request,
+                        const TenantId& tenant_id)
+        -> tl::expected<void, ErrorCode>;
+    auto PutEndImpl(const UUID& client_id, const ObjectMeta& object_meta,
+                    const TenantId& tenant_id, ReplicaType replica_type,
+                    const std::vector<ReplicaID>* expected_replica_ids)
+        -> tl::expected<void, ErrorCode>;
+    auto PutRevokeImpl(const UUID& client_id, const std::string& key,
+                       const TenantId& tenant_id, ReplicaType replica_type,
+                       const std::vector<ReplicaID>* expected_replica_ids)
+        -> tl::expected<void, ErrorCode>;
+    void DiscardRangeWriteReplicasLocked(ObjectMetadata& metadata,
+                                         route::ObjectState& state);
+    void DiscardExpiredProcessingObjectLocked(MetadataAccessorRW& accessor);
+    void FinishWritePublicationLocked(MetadataAccessorRW& accessor,
+                                      ReplicaType replica_type);
     // The checks and setup PutStart and UpsertStart share before they take the
     // key: validates `config` for a write of `slice_length` bytes, records the
     // client's host, resolves the soft pin, the writer's host and the group,
@@ -1758,6 +1828,12 @@ class MasterService {
             return IsPublished() && guard_->state().is_processing;
         }
 
+        RangeWriteState* GetRangeWrite() {
+            return IsPublished() && guard_->state().range_write
+                       ? &*guard_->state().range_write
+                       : nullptr;
+        }
+
         bool HasReplicationTask() const {
             return IsPublished() && guard_->state().replication_task;
         }
@@ -1812,6 +1888,7 @@ class MasterService {
         void EraseFromProcessing() {
             if (IsPublished()) {
                 guard_->state().is_processing = false;
+                guard_->state().range_write.reset();
             }
         }
 

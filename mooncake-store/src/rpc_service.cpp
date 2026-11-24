@@ -241,15 +241,45 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchProbeKey(
     const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
     const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "BatchProbeKey");
-    timer.LogRequest("keys_count=", keys.size());
+    const size_t total_keys = keys.size();
+    timer.LogRequest("keys_count=", total_keys);
+    const bool record_exist_metrics =
+        (policy.lease_mode == ProbeLeaseMode::AllHits);
+    if (record_exist_metrics) {
+        MasterMetricManager::instance().inc_batch_exist_key_requests(
+            total_keys);
+    }
 
-    return WithRequestTenantBatch(
+    auto result = WithRequestTenantBatch(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
         keys.size(), [&](const TenantId& resolved_tenant_id) {
             return master_service_.BatchProbeKey(policy, keys,
                                                  resolved_tenant_id);
         });
+
+    if (record_exist_metrics) {
+        size_t failure_count = 0;
+        for (size_t i = 0; i < result.size(); ++i) {
+            if (!result[i].has_value()) {
+                failure_count++;
+                LOG(ERROR) << "BatchProbeKey(AllHits) failed for key[" << i
+                           << "] '" << keys[i]
+                           << "': " << toString(result[i].error());
+            }
+        }
+        if (failure_count == total_keys) {
+            MasterMetricManager::instance().inc_batch_exist_key_failures(
+                failure_count);
+        } else if (failure_count != 0) {
+            MasterMetricManager::instance().inc_batch_exist_key_partial_success(
+                failure_count);
+        }
+        timer.LogResponse("total=", result.size(),
+                          ", success=", result.size() - failure_count,
+                          ", failures=", failure_count);
+    }
+    return result;
 }
 
 tl::expected<
@@ -478,6 +508,189 @@ WrappedMasterService::GetReplicaListForAdmin(const std::string& key,
                 });
         },
         [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
+}
+
+std::vector<tl::expected<GetReplicaResponse, ErrorCode>>
+WrappedMasterService::BatchGetReplicaListV2(
+    const std::string& tenant_id,
+    const std::vector<GetReplicaRequest>& requests) {
+    ScopedVLogTimer timer(1, "BatchGetReplicaListV2");
+    const size_t total_requests = requests.size();
+    timer.LogRequest("requests_count=", total_requests);
+    MasterMetricManager::instance().inc_batch_get_replica_list_requests(
+        total_requests);
+
+    auto results = WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        requests.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchGetReplicaList(resolved_tenant_id,
+                                                       requests);
+        });
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            failure_count++;
+            auto error = results[i].error();
+            if (error == ErrorCode::OBJECT_NOT_FOUND ||
+                error == ErrorCode::REPLICA_IS_NOT_READY) {
+                VLOG(1) << "BatchGetReplicaListV2 failed for key[" << i << "] '"
+                        << requests[i].key << "': " << toString(error);
+            } else {
+                LOG(ERROR) << "BatchGetReplicaListV2 failed for key[" << i
+                           << "] '" << requests[i].key
+                           << "': " << toString(error);
+            }
+        }
+    }
+
+    if (failure_count == total_requests) {
+        MasterMetricManager::instance().inc_batch_get_replica_list_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance()
+            .inc_batch_get_replica_list_partial_success(failure_count);
+    }
+
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
+}
+
+std::vector<tl::expected<PutStartResponse, ErrorCode>>
+WrappedMasterService::BatchPutStartV2(const UUID& client_id,
+                                      const std::string& tenant_id,
+                                      const std::vector<PutStartItem>& items,
+                                      const ReplicateConfig& config) {
+    ScopedVLogTimer timer(1, "BatchPutStartV2");
+    const size_t total_items = items.size();
+    timer.LogRequest("client_id=", client_id, ", items_count=", total_items);
+    MasterMetricManager::instance().inc_batch_put_start_requests(total_items);
+
+    std::vector<tl::expected<PutStartResponse, ErrorCode>> results;
+    auto resolved = ResolveTenantIdForWrite(
+        tenant_id, master_service_.IsTenantQuotaEnabled());
+    if (!resolved) {
+        results.assign(items.size(), tl::make_unexpected(resolved.error()));
+    } else {
+        results =
+            master_service_.BatchPutStart(client_id, *resolved, items, config);
+    }
+
+    size_t failure_count = 0;
+    int64_t already_exists_count = 0;
+    int no_available_handle_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            failure_count++;
+            auto error = results[i].error();
+            if (error == ErrorCode::OBJECT_ALREADY_EXISTS) {
+                ++already_exists_count;
+            } else if (error == ErrorCode::NO_AVAILABLE_HANDLE) {
+                no_available_handle_count++;
+            } else {
+                LOG(ERROR) << "BatchPutStartV2 failed for key[" << i << "] '"
+                           << items[i].key << "': " << toString(error);
+            }
+        }
+    }
+
+    MasterMetricManager::instance().inc_batch_put_start_object_already_exists(
+        already_exists_count);
+    if (no_available_handle_count > 0) {
+        LOG(WARNING) << "BatchPutStartV2 failed for "
+                     << no_available_handle_count << " keys"
+                     << PUT_NO_SPACE_HELPER_STR;
+    }
+    if (failure_count == total_items) {
+        MasterMetricManager::instance().inc_batch_put_start_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_put_start_partial_success(
+            failure_count);
+    }
+
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutFinish(
+    const UUID& client_id, const std::string& tenant_id,
+    const std::vector<PutFinishRequest>& requests) {
+    ScopedVLogTimer timer(1, "BatchPutFinish");
+    size_t commit_total = 0;
+    size_t abort_total = 0;
+    for (const auto& req : requests) {
+        if (req.commit) {
+            ++commit_total;
+        } else {
+            ++abort_total;
+        }
+    }
+    timer.LogRequest("client_id=", client_id,
+                     ", requests_count=", requests.size(),
+                     ", commits=", commit_total, ", aborts=", abort_total);
+    if (commit_total > 0) {
+        MasterMetricManager::instance().inc_batch_put_end_requests(
+            commit_total);
+    }
+    if (abort_total > 0) {
+        MasterMetricManager::instance().inc_batch_put_revoke_requests(
+            abort_total);
+    }
+
+    auto results = WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        requests.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchPutFinish(client_id, resolved_tenant_id,
+                                                  requests);
+        });
+
+    size_t commit_failures = 0;
+    size_t abort_failures = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            if (requests[i].commit) {
+                ++commit_failures;
+            } else {
+                ++abort_failures;
+            }
+            LOG(ERROR) << "BatchPutFinish("
+                       << (requests[i].commit ? "commit" : "abort")
+                       << ") failed for key[" << i << "] '"
+                       << requests[i].token.key
+                       << "': " << toString(results[i].error());
+        }
+    }
+    if (commit_total > 0) {
+        if (commit_failures == commit_total) {
+            MasterMetricManager::instance().inc_batch_put_end_failures(
+                commit_failures);
+        } else if (commit_failures != 0) {
+            MasterMetricManager::instance().inc_batch_put_end_partial_success(
+                commit_failures);
+        }
+    }
+    if (abort_total > 0) {
+        if (abort_failures == abort_total) {
+            MasterMetricManager::instance().inc_batch_put_revoke_failures(
+                abort_failures);
+        } else if (abort_failures != 0) {
+            MasterMetricManager::instance()
+                .inc_batch_put_revoke_partial_success(abort_failures);
+        }
+    }
+
+    const size_t failure_count = commit_failures + abort_failures;
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
@@ -2131,8 +2344,11 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::GetReplicaListByRegex,
         &WrappedMasterService::GetReplicaList,
         &WrappedMasterService::BatchGetReplicaList,
-        &WrappedMasterService::PutStart, &WrappedMasterService::PutEnd,
-        &WrappedMasterService::PutRevoke, &WrappedMasterService::BatchPutStart,
+        &WrappedMasterService::BatchGetReplicaListV2,
+        &WrappedMasterService::BatchPutStartV2,
+        &WrappedMasterService::BatchPutFinish, &WrappedMasterService::PutStart,
+        &WrappedMasterService::PutEnd, &WrappedMasterService::PutRevoke,
+        &WrappedMasterService::BatchPutStart,
         &WrappedMasterService::BatchPutEnd,
         &WrappedMasterService::BatchPutRevoke,
         &WrappedMasterService::UpsertStart, &WrappedMasterService::UpsertEnd,

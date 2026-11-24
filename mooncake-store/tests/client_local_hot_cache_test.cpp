@@ -1113,19 +1113,24 @@ TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabled) {
         }
     }
 
-    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+    std::vector<Client::GetItem> get_items;
+    get_items.reserve(test_keys.size());
     std::vector<std::vector<char>> batch_buffers;  // Keep buffers alive
+    batch_buffers.reserve(test_keys.size());
     for (size_t i = 0; i < test_keys.size(); ++i) {
         const auto& key = test_keys[i];
         const auto& expected_data = test_data[i];
         // Allocate buffer with the same size as the data we put
         batch_buffers.emplace_back(expected_data.size());
-        batch_slices[key].emplace_back(
-            Slice{batch_buffers.back().data(), expected_data.size()});
+        get_items.push_back(Client::GetItem{
+            .key = key,
+            .slices = {Slice{batch_buffers.back().data(),
+                             expected_data.size()}},
+        });
     }
 
-    // Use BatchGet without query_results parameter (it will query internally)
-    auto batch_get_result = client->BatchGet(test_keys, batch_slices);
+    // Use unified BatchGet (queries Master internally)
+    auto batch_get_result = client->BatchGet(get_items);
     ASSERT_EQ(batch_get_result.size(), test_keys.size());
     for (const auto& result : batch_get_result) {
         ASSERT_TRUE(result.has_value()) << "BatchGet should succeed";
@@ -1136,14 +1141,11 @@ TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabled) {
         const auto& key = test_keys[i];
         const auto& expected_data = test_data[i];
 
-        auto slices_it = batch_slices.find(key);
-        ASSERT_NE(slices_it, batch_slices.end())
-            << "Slices should exist for key: " << key;
-        ASSERT_GE(slices_it->second.size(), 1)
+        ASSERT_GE(get_items[i].slices.size(), 1u)
             << "At least one slice should exist for key: " << key;
 
         // Verify the first slice contains the expected data
-        const auto& slice = slices_it->second[0];
+        const auto& slice = get_items[i].slices[0];
         ASSERT_GE(slice.size, expected_data.size())
             << "Slice size should be at least expected data size";
         EXPECT_EQ(
@@ -1297,15 +1299,17 @@ TEST_F(LocalHotCacheTest, BatchGetSkipsHotCacheWritebackForDeviceDestination) {
 
     ASSERT_LT(dev_data.size(), sizeof(fake_device_storage));
     std::vector<char> host_buffer(host_data.size());
-    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
-    batch_slices[dev_key].emplace_back(
-        Slice{fake_device_storage, dev_data.size()});
-    batch_slices[host_key].emplace_back(
-        Slice{host_buffer.data(), host_buffer.size()});
+    std::vector<Client::GetItem> get_items{
+        Client::GetItem{
+            .key = dev_key,
+            .slices = {Slice{fake_device_storage, dev_data.size()}}},
+        Client::GetItem{
+            .key = host_key,
+            .slices = {Slice{host_buffer.data(), host_buffer.size()}}},
+    };
 
-    const std::vector<std::string> keys = {dev_key, host_key};
-    auto results = reader->BatchGet(keys, batch_slices);
-    ASSERT_EQ(results.size(), keys.size());
+    auto results = reader->BatchGet(get_items);
+    ASSERT_EQ(results.size(), get_items.size());
     for (const auto& result : results) {
         ASSERT_TRUE(result.has_value()) << "BatchGet should succeed";
     }

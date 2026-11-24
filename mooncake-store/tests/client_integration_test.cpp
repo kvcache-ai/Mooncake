@@ -1415,17 +1415,17 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
               << "us";
 
     start = std::chrono::high_resolution_clock::now();
-    std::unordered_map<std::string, std::vector<Slice>> target_batched_slices;
+    std::vector<Client::GetItem> get_items;
+    get_items.reserve(batch_sz);
     for (int i = 0; i < batch_sz; i++) {
-        std::vector<Slice> target_slices;
         target_buffer =
             client_buffer_allocator_->allocate(test_data_list[i].size());
-        target_slices.emplace_back(
-            Slice{target_buffer, test_data_list[i].size()});
-        target_batched_slices.emplace(keys[i], target_slices);
+        get_items.push_back(Client::GetItem{
+            .key = keys[i],
+            .slices = {Slice{target_buffer, test_data_list[i].size()}},
+        });
     }
-    auto batch_get_results =
-        test_client_->BatchGet(keys, target_batched_slices);
+    auto batch_get_results = test_client_->BatchGet(get_items);
     for (const auto& result : batch_get_results) {
         ASSERT_TRUE(result.has_value()) << "BatchGet operation failed";
     }
@@ -1437,13 +1437,12 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
               << "us";
 
     for (int i = 0; i < batch_sz; i++) {
-        ASSERT_EQ(target_batched_slices[keys[i]][0].size,
-                  test_data_list[i].size());
-        ASSERT_EQ(memcmp(target_batched_slices[keys[i]][0].ptr,
-                         test_data_list[i].data(), test_data_list[i].size()),
+        ASSERT_EQ(get_items[i].slices[0].size, test_data_list[i].size());
+        ASSERT_EQ(memcmp(get_items[i].slices[0].ptr, test_data_list[i].data(),
+                         test_data_list[i].size()),
                   0);
-        client_buffer_allocator_->deallocate(
-            target_batched_slices[keys[i]][0].ptr, test_data_list[i].size());
+        client_buffer_allocator_->deallocate(get_items[i].slices[0].ptr,
+                                             test_data_list[i].size());
     }
 }
 

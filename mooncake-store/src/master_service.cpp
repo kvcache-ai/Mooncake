@@ -2137,6 +2137,14 @@ void MasterService::CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor) {
         return;
     }
     ObjectMetadata& metadata = accessor.Get();
+    // Losing any fixed target replica aborts an active RangeTarget assembly.
+    if (accessor.GetRangeWrite() != nullptr &&
+        metadata.HasReplica([](const Replica& replica) {
+            return replica.has_invalid_mem_handle();
+        })) {
+        accessor.Erase();
+        return;
+    }
     // Erase invalid memory replicas (those with unmounted segments).
     std::vector<ReplicaID> removed_replica_ids;
     EraseReplicasWithCacheTotalAccounting(
@@ -2164,6 +2172,7 @@ void MasterService::EraseMetadata(metadata::Namespace& ns,
     auto& state = hold.state();
     const std::string& key = hold.key();
     const TenantId& tenant_id = ns.id();
+    DiscardRangeWriteReplicasLocked(metadata, state);
     if (erase_mode == EraseMode::kFull) {
         ns.BeforeTearDown(hold);
     }
@@ -2992,6 +3001,9 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchProbeKey(
     const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
     const TenantId& tenant_id) {
     if (keys.empty()) return {};
+    if (policy.lease_mode == ProbeLeaseMode::AllHits) {
+        return BatchExistKeyImpl(keys, tenant_id, /*grant_lease=*/true);
+    }
     std::string_view invalid_reason;
     if (policy.lease_mode != ProbeLeaseMode::None &&
         policy.lease_mode != ProbeLeaseMode::LastHitOnly) {
@@ -4700,6 +4712,9 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
                                     const ObjectMetadata& metadata,
                                     ReadFollowUps& follow_ups)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
+    if (metadata.PartCount() > 1) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     auto replica_list = GetReadableReplicaDescriptors(metadata);
     if (dfs_allocator_) {
         for (const auto& replica : replica_list) {
@@ -4802,6 +4817,9 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
 
 auto MasterService::ReadReplicaListForAdmin(const ObjectMetadata& metadata)
     const -> tl::expected<GetReplicaListResponse, ErrorCode> {
+    if (metadata.PartCount() > 1) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     auto replica_list = GetReadableReplicaDescriptors(metadata);
 
     if (replica_list.empty()) {
@@ -4838,6 +4856,66 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
         results[i] = ReadReplicaList(normalized_tenant, keys[i], accessor.Get(),
                                      follow_ups);
+    }
+    follow_ups.Run(*this);
+    return results;
+}
+
+std::vector<tl::expected<GetReplicaResponse, ErrorCode>>
+MasterService::BatchGetReplicaList(
+    const TenantId& tenant_id, const std::vector<GetReplicaRequest>& requests) {
+    using GetResult = tl::expected<GetReplicaResponse, ErrorCode>;
+    assert(tenant_id.IsValid());
+
+    std::vector<GetResult> results(
+        requests.size(), tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    if (requests.empty()) {
+        return results;
+    }
+
+    const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
+    ReadFollowUps follow_ups;
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& req = requests[i];
+        MasterMetricManager::instance().inc_total_get_nums();
+        MetadataAccessorRO accessor(this, normalized_tenant, req.key);
+        if (!accessor.Exists()) {
+            VLOG(1) << "key=" << req.key << ", info=object_not_found";
+            continue;
+        }
+        const auto& metadata = accessor.Get();
+        const size_t part_count = metadata.PartCount();
+        if (part_count == 0) {
+            results[i] = tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+            continue;
+        }
+        if (const auto* part = std::get_if<PartIndex>(&req.target);
+            part != nullptr && part->index >= part_count) {
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+        if (part_count > 1) {
+            results[i] = tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+            continue;
+        }
+        const uint64_t part_length = metadata.GetPart(0).length();
+        auto legacy =
+            ReadReplicaList(normalized_tenant, req.key, metadata, follow_ups);
+        if (!legacy) {
+            results[i] = tl::make_unexpected(legacy.error());
+            continue;
+        }
+        results[i] = GetReplicaResponse{
+            .parts = {PartReplicaInfo{
+                .replicas = std::move(legacy->replicas),
+                .length = part_length,
+                .checksum = legacy->object_checksum,
+            }},
+            .lease_ttl_ms = legacy->lease_ttl_ms,
+            .part_count = static_cast<uint32_t>(part_count),
+            .resolved_tenant_id = normalized_tenant.value(),
+        };
     }
     follow_ups.Run(*this);
     return results;
@@ -5342,6 +5420,504 @@ auto MasterService::AdmitWithDfsRecovery(const ReplicateConfig& config,
     return result;
 }
 
+namespace {
+
+bool RangeWriteTargetsValid(ObjectMetadata& metadata,
+                            const RangeWriteState& range) {
+    if (range.replica_ids.empty() ||
+        metadata.GetAllReplicas().size() != range.replica_ids.size()) {
+        return false;
+    }
+    for (const auto id : range.replica_ids) {
+        const auto* replica = metadata.GetReplicaByID(id);
+        if (replica == nullptr || !replica->is_memory_replica() ||
+            !replica->is_processing() || replica->has_invalid_mem_handle()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool HasExpectedReplicaIds(ObjectMetadata& metadata,
+                           const std::vector<ReplicaID>* expected_replica_ids) {
+    if (expected_replica_ids == nullptr || expected_replica_ids->empty()) {
+        return true;
+    }
+    for (const auto id : *expected_replica_ids) {
+        if (metadata.GetReplicaByID(id) == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+bool MasterService::IsRangeWriteExpired(
+    const ObjectMetadata& metadata,
+    const std::chrono::system_clock::time_point& now) const noexcept {
+    return metadata.put_start_time + put_start_discard_timeout_sec_ <= now;
+}
+
+ErrorCode MasterService::ValidateRangePutRequest(
+    const PutStartItem& item, const RangeTarget& target,
+    const ReplicateConfig& config) const {
+    if (item.key.empty() ||
+        ValidateRangeBounds(target, item.size) != ErrorCode::OK ||
+        config.replica_num == 0) {
+        VLOG(1) << "RangeTarget put rejected: invalid key, range bounds, or "
+                   "replica_num"
+                << ", key=" << item.key
+                << ", write_id_len=" << target.write_id.size()
+                << ", offset=" << target.offset << ", size=" << item.size
+                << ", total_size=" << target.total_size
+                << ", replica_num=" << config.replica_num;
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (enable_ha_ || enable_oplog_ || use_disk_replica_ ||
+        allocation_strategy_type_ == AllocationStrategyType::CXL) {
+        LOG(WARNING) << "RangeTarget put rejected: unsupported master mode"
+                     << ", key=" << item.key << ", ha=" << enable_ha_
+                     << ", oplog=" << enable_oplog_
+                     << ", disk=" << use_disk_replica_ << ", cxl="
+                     << (allocation_strategy_type_ ==
+                         AllocationStrategyType::CXL);
+        return ErrorCode::NOT_SUPPORTED;
+    }
+    if (config.prefer_alloc_in_same_node || config.nof_replica_num != 0 ||
+        config.dfs_replica_num != 0) {
+        VLOG(1) << "RangeTarget put rejected: unsupported ReplicateConfig"
+                << ", key=" << item.key
+                << ", prefer_same_node=" << config.prefer_alloc_in_same_node
+                << ", nof_replica_num=" << config.nof_replica_num
+                << ", dfs_replica_num=" << config.dfs_replica_num;
+        return ErrorCode::NOT_SUPPORTED;
+    }
+    return ErrorCode::OK;
+}
+
+RangeWriteSpec MasterService::MakeRangeWriteSpec(uint64_t total_size,
+                                                 const ReplicateConfig& config,
+                                                 const WriteStartPlan& plan) {
+    return RangeWriteSpec{
+        .total_size = total_size,
+        .replica_num = config.replica_num,
+        .data_type = config.data_type,
+        .hard_pinned = config.with_hard_pin,
+        .group_id = plan.group_id,
+        .residency_affinity_id = plan.residency_affinity_id,
+        .session_id = config.SessionId(),
+        .soft_pin_action = plan.soft_pin_request.action,
+        .soft_pin_ttl = plan.soft_pin_request.ttl,
+    };
+}
+
+void MasterService::DiscardRangeWriteReplicasLocked(ObjectMetadata& metadata,
+                                                    route::ObjectState& state) {
+    if (!state.range_write) {
+        return;
+    }
+    auto replicas = PopReplicasWithCacheTotalAccounting(metadata);
+    if (!replicas.empty()) {
+        std::lock_guard lock(discarded_replicas_mutex_);
+        discarded_replicas_.emplace_back(
+            std::move(replicas),
+            std::chrono::system_clock::now() + put_start_release_timeout_sec_);
+    }
+    state.range_write.reset();
+}
+
+void MasterService::DiscardExpiredProcessingObjectLocked(
+    MetadataAccessorRW& accessor) {
+    auto& metadata = accessor.Get();
+    auto stale_replicas = PopReplicasWithCacheTotalAccounting(
+        metadata, &Replica::fn_is_processing);
+    if (!stale_replicas.empty()) {
+        FreeDfsReplicas(accessor.GetKey(), stale_replicas);
+        std::lock_guard lock(discarded_replicas_mutex_);
+        discarded_replicas_.emplace_back(
+            std::move(stale_replicas),
+            metadata.put_start_time + put_start_release_timeout_sec_);
+    }
+    accessor.Erase();
+}
+
+ErrorCode MasterService::JoinRangeWriteLocked(MetadataAccessorRW& accessor,
+                                              RangeWriteState& range,
+                                              const UUID& client_id,
+                                              const PutStartItem& item,
+                                              const RangeTarget& target,
+                                              const RangeWriteSpec& spec) {
+    if (range.write_id != target.write_id) {
+        VLOG(1) << "RangeTarget join rejected: write_id mismatch"
+                << ", key=" << item.key << ", active=" << range.write_id
+                << ", incoming=" << target.write_id;
+        return ErrorCode::OBJECT_ALREADY_EXISTS;
+    }
+    auto& metadata = accessor.Get();
+    if (!RangeWriteTargetsValid(metadata, range)) {
+        accessor.Erase();
+        return ErrorCode::INVALID_VERSION;
+    }
+    if (range.spec != spec) {
+        VLOG(1) << "RangeTarget join rejected: config mismatch"
+                << ", key=" << item.key << ", write_id=" << target.write_id;
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (range.HasOverlap(target.offset, item.size)) {
+        VLOG(1) << "RangeTarget join rejected: overlapping span"
+                << ", key=" << item.key << ", offset=" << target.offset
+                << ", size=" << item.size;
+        return ErrorCode::OBJECT_ALREADY_EXISTS;
+    }
+    if (range.spans.size() >= RangeWriteState::kMaxSpans) {
+        return ErrorCode::NO_AVAILABLE_HANDLE;
+    }
+    range.spans.push_back(RangeSpan{
+        .offset = target.offset,
+        .length = item.size,
+        .writer = client_id,
+        .completed = false,
+    });
+    return ErrorCode::OK;
+}
+
+auto MasterService::BeginRangeWriteLocked(
+    MetadataAccessorRW& accessor, const UUID& client_id,
+    const PutStartItem& item, const RangeTarget& target,
+    const ReplicateConfig& config, const WriteStartPlan& plan,
+    const RangeWriteSpec& spec,
+    const std::chrono::system_clock::time_point& now)
+    -> tl::expected<RangeWriteState*, ErrorCode> {
+    if (accessor.IsPublished()) {
+        const auto& metadata = accessor.Get();
+        if (metadata.HasReplica(&Replica::fn_is_completed) ||
+            metadata.put_start_time + put_start_discard_timeout_sec_ >= now) {
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
+        DiscardExpiredProcessingObjectLocked(accessor);
+    }
+
+    auto allocated = AllocateAndInsertMetadata(
+        accessor, client_id, target.total_size, config, plan.writer_host_id,
+        plan.group_id, plan.residency_affinity_id, now, plan.soft_pin_request);
+    if (!allocated || allocated->size() != config.replica_num) {
+        if (accessor.IsPublished()) {
+            accessor.Erase();
+        }
+        return tl::make_unexpected(allocated ? ErrorCode::NO_AVAILABLE_HANDLE
+                                             : allocated.error());
+    }
+
+    RangeWriteState state;
+    state.write_id = target.write_id;
+    state.spec = spec;
+    state.replica_ids.reserve(config.replica_num);
+    for (const auto& replica : accessor.Get().GetAllReplicas()) {
+        state.replica_ids.push_back(replica.id());
+    }
+    state.spans.push_back(RangeSpan{
+        .offset = target.offset,
+        .length = item.size,
+        .writer = client_id,
+        .completed = false,
+    });
+    return &accessor.GetState().range_write.emplace(std::move(state));
+}
+
+auto MasterService::BuildRangePutStartResponseLocked(
+    MetadataAccessorRW& accessor, const RangeWriteState& range,
+    const std::string& key, const RangeTarget& target, uint64_t piece_size)
+    -> tl::expected<PutStartResponse, ErrorCode> {
+    auto& metadata = accessor.Get();
+    PutStartResponse response;
+    response.replicas.reserve(range.replica_ids.size());
+    for (const auto id : range.replica_ids) {
+        const auto* replica = metadata.GetReplicaByID(id);
+        if (replica == nullptr) {
+            accessor.Erase();
+            return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+        }
+        response.replicas.push_back(
+            replica->get_sliced_descriptor(target.offset, piece_size));
+    }
+    response.token = WriteToken{
+        .key = key,
+        .target = target,
+        .replica_ids = range.replica_ids,
+    };
+    return response;
+}
+
+auto MasterService::StartRangePut(const UUID& client_id,
+                                  const PutStartItem& item,
+                                  const ReplicateConfig& config,
+                                  const TenantId& tenant_id)
+    -> tl::expected<PutStartResponse, ErrorCode> {
+    const auto& target = std::get<RangeTarget>(item.target);
+    if (const auto err = ValidateRangePutRequest(item, target, config);
+        err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    const auto object_id = MakeObjectIdentityForRequest(item.key, tenant_id);
+    auto plan = PrepareWriteStart(client_id, item.key, object_id.tenant_id,
+                                  target.total_size, config, "put_start_range");
+    if (!plan) {
+        return tl::make_unexpected(plan.error());
+    }
+    if (!plan->group_id.empty() &&
+        weight_manager_.IsManagedGroup(plan->group_id)) {
+        VLOG(1) << "RangeTarget put rejected: managed weight group"
+                << ", key=" << item.key << ", group_id=" << plan->group_id;
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    const auto spec = MakeRangeWriteSpec(target.total_size, config, *plan);
+
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    MetadataAccessorRW accessor(this, object_id,
+                                MetadataAccessorRW::CreateKey{});
+    if (auto admitted = accessor.Grow(0); !admitted) {
+        return tl::make_unexpected(admitted.error());
+    }
+    if (auto cleaned =
+            CleanupStaleBeforeWrite("StartRangePut(stale cleanup)", accessor);
+        !cleaned) {
+        return tl::make_unexpected(cleaned.error());
+    }
+
+    const auto now = std::chrono::system_clock::now();
+    auto* range = accessor.GetRangeWrite();
+    if (range != nullptr && IsRangeWriteExpired(accessor.Get(), now)) {
+        const bool same_write_id = (range->write_id == target.write_id);
+        accessor.Erase();
+        if (same_write_id) {
+            VLOG(1) << "RangeTarget round expired, key=" << item.key
+                    << ", write_id=" << target.write_id;
+            return tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
+        }
+        range = nullptr;
+    }
+
+    if (range != nullptr) {
+        if (const auto err = JoinRangeWriteLocked(accessor, *range, client_id,
+                                                  item, target, spec);
+            err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+    } else {
+        auto started = BeginRangeWriteLocked(accessor, client_id, item, target,
+                                             config, *plan, spec, now);
+        if (!started) {
+            return tl::make_unexpected(started.error());
+        }
+        range = *started;
+    }
+
+    return BuildRangePutStartResponseLocked(accessor, *range, item.key, target,
+                                            item.size);
+}
+
+auto MasterService::FinishRangePut(const UUID& client_id,
+                                   const PutFinishRequest& request,
+                                   const TenantId& tenant_id)
+    -> tl::expected<void, ErrorCode> {
+    if (request.checksum.has_value()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto& token = request.token;
+    const auto& target = std::get<RangeTarget>(token.target);
+    if (token.key.empty() || target.write_id.empty() ||
+        target.total_size == 0 || token.replica_ids.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const auto object_id = MakeObjectIdentityForRequest(token.key, tenant_id);
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    MetadataAccessorRW accessor(this, object_id);
+    if (!accessor.Exists()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    auto* range = accessor.GetRangeWrite();
+    if (range == nullptr) {
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
+    auto& metadata = accessor.Get();
+    const auto now = std::chrono::system_clock::now();
+    if (IsRangeWriteExpired(metadata, now)) {
+        VLOG(1) << "RangeTarget finish rejected: round expired"
+                << ", key=" << token.key << ", write_id=" << target.write_id;
+        accessor.Erase();
+        return tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
+    }
+    if (range->write_id != target.write_id ||
+        metadata.TotalLength() != target.total_size ||
+        range->replica_ids != token.replica_ids) {
+        VLOG(1) << "RangeTarget finish rejected: token incarnation mismatch"
+                << ", key=" << token.key << ", write_id=" << target.write_id;
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+    if (!RangeWriteTargetsValid(metadata, *range)) {
+        accessor.Erase();
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+
+    auto* span = range->FindSpanByOffset(target.offset);
+    if (span == nullptr) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (span->writer != client_id) {
+        VLOG(1) << "RangeTarget finish rejected: illegal client"
+                << ", key=" << token.key << ", client_id=" << client_id
+                << ", owner=" << span->writer;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
+    // An already-confirmed span is never undone by a late failure or duplicate.
+    if (span->completed) {
+        return {};
+    }
+    if (!request.commit) {
+        accessor.Erase();
+        return {};
+    }
+
+    span->completed = true;
+    range->completed_bytes += span->length;
+    if (range->completed_bytes != metadata.TotalLength()) {
+        return {};
+    }
+
+    // All disjoint in-bound spans cover `[0, total_size)`. Publish all fixed
+    // replicas together and drop the transient runtime assembly state.
+    for (const auto id : range->replica_ids) {
+        auto* replica = metadata.GetReplicaByID(id);
+        metadata.CommitSessionTag(id);
+        replica->mark_complete();
+    }
+    const auto pin = metadata.CommitPendingSoftPin(now);
+    ApplySoftPinEvaluation(metadata, pin);
+    accessor.EraseFromProcessing();
+    FinishWritePublicationLocked(accessor, ReplicaType::MEMORY);
+    return {};
+}
+
+auto MasterService::FinishWholePut(const UUID& client_id,
+                                   const PutFinishRequest& request,
+                                   const TenantId& tenant_id)
+    -> tl::expected<void, ErrorCode> {
+    const auto& token = request.token;
+    if (token.key.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto* expected_ids =
+        token.replica_ids.empty() ? nullptr : &token.replica_ids;
+    if (request.commit) {
+        return PutEndImpl(client_id, ObjectMeta{token.key, request.checksum},
+                          tenant_id, request.replica_type, expected_ids);
+    }
+    return PutRevokeImpl(client_id, token.key, tenant_id, request.replica_type,
+                         expected_ids);
+}
+
+std::vector<tl::expected<PutStartResponse, ErrorCode>>
+MasterService::BatchPutStart(const UUID& client_id, const TenantId& tenant_id,
+                             const std::vector<PutStartItem>& items,
+                             const ReplicateConfig& config) {
+    assert(tenant_id.IsValid());
+    if (!config.HasValidKeyHints(items.size()) ||
+        !config.ValidSessionIds(items.size())) {
+        return std::vector<tl::expected<PutStartResponse, ErrorCode>>(
+            items.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    ReplicateConfig base_config = config;
+    base_config.group_ids.reset();
+    base_config.session_ids.reset();
+    base_config.per_key_preferred_hca_names.reset();
+    base_config.residency_affinity_ids.reset();
+
+    std::vector<tl::expected<PutStartResponse, ErrorCode>> results;
+    results.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        const auto& item = items[i];
+        ReplicateConfig key_config = base_config;
+        key_config.SetKeyIds(config, i);
+        if (!item.group_id.empty()) {
+            key_config.group_ids = std::vector<std::string>{item.group_id};
+        }
+        if (!item.session_id.empty()) {
+            key_config.session_ids = std::vector<std::string>{item.session_id};
+        }
+        if (!item.residency_affinity_id.empty()) {
+            key_config.residency_affinity_ids =
+                std::vector<std::string>{item.residency_affinity_id};
+        }
+        if (!item.preferred_hca_names.empty()) {
+            key_config.preferred_hca_names = item.preferred_hca_names;
+        }
+
+        if (std::holds_alternative<RangeTarget>(item.target)) {
+            results.emplace_back(
+                StartRangePut(client_id, item, key_config, tenant_id));
+            continue;
+        }
+        if (const auto* part = std::get_if<PartTarget>(&item.target)) {
+            if (const auto err = ValidateSinglePartTarget(*part);
+                err != ErrorCode::OK) {
+                results.emplace_back(tl::make_unexpected(err));
+                continue;
+            }
+        }
+        auto started =
+            PutStart(client_id, item.key, tenant_id, item.size, key_config);
+        if (!started) {
+            results.emplace_back(tl::make_unexpected(started.error()));
+            continue;
+        }
+        std::vector<ReplicaID> ids;
+        ids.reserve(started->size());
+        for (const auto& desc : *started) {
+            ids.push_back(desc.id);
+        }
+        results.emplace_back(PutStartResponse{
+            .replicas = std::move(*started),
+            .token =
+                WriteToken{
+                    .key = item.key,
+                    .target = item.target,
+                    .replica_ids = std::move(ids),
+                },
+        });
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutFinish(
+    const UUID& client_id, const TenantId& tenant_id,
+    const std::vector<PutFinishRequest>& requests) {
+    assert(tenant_id.IsValid());
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(requests.size());
+    for (const auto& request : requests) {
+        if (std::holds_alternative<RangeTarget>(request.token.target)) {
+            results.emplace_back(FinishRangePut(client_id, request, tenant_id));
+            continue;
+        }
+        if (const auto* part = std::get_if<PartTarget>(&request.token.target)) {
+            if (const auto err = ValidateSinglePartTarget(*part);
+                err != ErrorCode::OK) {
+                results.emplace_back(tl::make_unexpected(err));
+                continue;
+            }
+        }
+        results.emplace_back(FinishWholePut(client_id, request, tenant_id));
+    }
+    return results;
+}
+
 auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const TenantId& tenant_id,
                              const uint64_t slice_length,
@@ -5400,16 +5976,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     return tl::make_unexpected(err.error());
                 }
             }
-            auto replicas = PopReplicasWithCacheTotalAccounting(
-                metadata, &Replica::fn_is_processing);
-            if (!replicas.empty()) {
-                FreeDfsReplicas(key, replicas);
-                std::lock_guard lock(discarded_replicas_mutex_);
-                discarded_replicas_.emplace_back(
-                    std::move(replicas),
-                    metadata.put_start_time + put_start_release_timeout_sec_);
-            }
-            accessor.Erase();
+            DiscardExpiredProcessingObjectLocked(accessor);
         }
 
         return AllocateAndInsertMetadata(
@@ -5430,6 +5997,14 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    return PutEndImpl(client_id, object_meta, tenant_id, replica_type, nullptr);
+}
+
+auto MasterService::PutEndImpl(
+    const UUID& client_id, const ObjectMeta& object_meta,
+    const TenantId& tenant_id, ReplicaType replica_type,
+    const std::vector<ReplicaID>* expected_replica_ids)
+    -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -5439,7 +6014,14 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
+    if (accessor.GetRangeWrite() != nullptr) {
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
     auto& metadata = accessor.Get();
+    if (!HasExpectedReplicaIds(metadata, expected_replica_ids)) {
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
     if (client_id != metadata.client_id) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutEnd key " << key
                    << ", was PutStart-ed by " << metadata.client_id;
@@ -5555,6 +6137,34 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         metadata.MutablePart(0).SetChecksum(object_meta.object_checksum);
     }
 
+    // If the object is completed, remove it from the processing set.
+    if (metadata.AllReplicas(&Replica::fn_is_completed) &&
+        accessor.InProcessing()) {
+        accessor.EraseFromProcessing();
+    }
+
+    FinishWritePublicationLocked(accessor, replica_type);
+
+    if (enable_oplog_ && ordered_oplog_writer_) {
+        std::string payload = SerializeMetadataForOpLog(metadata);
+        auto result = AppendOpLogVisibleBeforeDurable(
+            OpType::PUT_END, object_id.tenant_id.value(), key, payload);
+        if (!result) {
+            LOG(WARNING) << "PutEnd: OpLog queue failed for key=" << key
+                         << ", err=" << static_cast<int>(result.error());
+        }
+    }
+    if (advanced_primary_write) {
+        import_write->Accept();
+    }
+    return {};
+}
+
+void MasterService::FinishWritePublicationLocked(MetadataAccessorRW& accessor,
+                                                 ReplicaType replica_type) {
+    auto& metadata = accessor.Get();
+    const std::string& key = accessor.GetKey();
+    const ObjectIdentity object_id{accessor.GetTenantId(), key};
     if (replica_type != ReplicaType::DFS && enable_offload_ &&
         !offload_on_evict_ && !metadata.HasReplica([](const Replica& replica) {
             return replica.is_dfs_replica() && replica.is_processing();
@@ -5583,29 +6193,9 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         }
     }
 
-    // If the object is completed, remove it from the processing set.
-    if (metadata.AllReplicas(&Replica::fn_is_completed) &&
-        accessor.InProcessing()) {
-        accessor.EraseFromProcessing();
-    }
-
     SyncCacheTotalAccounting(metadata);
     // TODO: add inc_nof_cache_nums() (ranhaojia)
     metadata.GrantReadLease(std::chrono::milliseconds::zero());
-
-    if (enable_oplog_ && ordered_oplog_writer_) {
-        std::string payload = SerializeMetadataForOpLog(metadata);
-        auto result = AppendOpLogVisibleBeforeDurable(
-            OpType::PUT_END, object_id.tenant_id.value(), key, payload);
-        if (!result) {
-            LOG(WARNING) << "PutEnd: OpLog queue failed for key=" << key
-                         << ", err=" << static_cast<int>(result.error());
-        }
-    }
-    if (advanced_primary_write) {
-        import_write->Accept();
-    }
-    return {};
 }
 
 auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
@@ -5654,6 +6244,9 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     const ObjectIdentity object_id{normalized_tenant, key};
     MetadataAccessorRW accessor(this, object_id,
                                 MetadataAccessorRW::CreateKey{});
+    if (accessor.GetRangeWrite() != nullptr) {
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
     if (!accessor.IsPublished()) {
         accessor.Publish(
             client_id, std::chrono::system_clock::now(),
@@ -5740,6 +6333,14 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    return PutRevokeImpl(client_id, key, tenant_id, replica_type, nullptr);
+}
+
+auto MasterService::PutRevokeImpl(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    ReplicaType replica_type,
+    const std::vector<ReplicaID>* expected_replica_ids)
+    -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -5748,7 +6349,14 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
+    if (accessor.GetRangeWrite() != nullptr) {
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
     auto& metadata = accessor.Get();
+    if (!HasExpectedReplicaIds(metadata, expected_replica_ids)) {
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
     if (client_id != metadata.client_id) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutRevoke key "
                    << key << ", was PutStart-ed by " << metadata.client_id;
@@ -6046,6 +6654,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                             now + put_start_release_timeout_sec_);
                     }
                     state.is_processing = false;
+                    state.range_write.reset();
 
                     // If no COMPLETE replicas survive the preemption, this key
                     // effectively does not exist — fall through to Case A.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <variant>
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -20,6 +21,126 @@ struct ObjectMeta {
     std::optional<uint64_t> object_checksum;
 };
 YLT_REFL(ObjectMeta, key, object_checksum);
+
+// Shared whole-object tag for both read and write targets. Using std::monostate
+// gives zero wire bytes in struct_pack variants while staying explicit in C++.
+using WholeObject = std::monostate;
+
+// Independent multi-part write target: each part allocates its own replicas and
+// is read back by PartIndex.
+struct PartTarget {
+    uint32_t part_index{0};
+    uint32_t part_count{1};
+};
+YLT_REFL(PartTarget, part_index, part_count);
+
+// Contiguous multi-producer write target (PiecePut): the first producer
+// allocates one contiguous MEMORY object of `total_size` bytes; each producer
+// writes a disjoint range `[offset, offset + size)` sharing `write_id`. Once
+// every byte is committed, the object becomes an ordinary single-part object.
+struct RangeTarget {
+    uint64_t offset{0};
+    uint64_t total_size{0};
+    std::string write_id;
+};
+YLT_REFL(RangeTarget, offset, total_size, write_id);
+
+inline constexpr size_t kMaxRangeWriteIdLength = 256;
+
+inline ErrorCode ValidateSinglePartTarget(const PartTarget& part) {
+    if (part.part_count == 0 || part.part_index >= part.part_count) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (part.part_count > 1) {
+        return ErrorCode::NOT_SUPPORTED;
+    }
+    return ErrorCode::OK;
+}
+
+inline ErrorCode ValidateRangeBounds(const RangeTarget& target,
+                                     uint64_t length) {
+    if (target.write_id.empty() ||
+        target.write_id.size() > kMaxRangeWriteIdLength ||
+        target.total_size == 0 || length == 0 ||
+        target.offset >= target.total_size ||
+        length > target.total_size - target.offset) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    return ErrorCode::OK;
+}
+
+using WriteTarget = std::variant<WholeObject, PartTarget, RangeTarget>;
+
+// Read target for a specific part of a multi-part object.
+struct PartIndex {
+    uint32_t index{0};
+};
+YLT_REFL(PartIndex, index);
+
+using ReadTarget = std::variant<WholeObject, PartIndex>;
+
+// Write token minted by PutStart and returned verbatim to PutFinish. Monotonic
+// `replica_ids` scope commit/abort to this exact allocation incarnation.
+struct WriteToken {
+    std::string key;
+    WriteTarget target{WholeObject{}};
+    std::vector<ReplicaID> replica_ids;
+};
+YLT_REFL(WriteToken, key, target, replica_ids);
+
+// Per-item descriptor for unified BatchPutStartV2. Batch-shared placement and
+// replication settings live in the single ReplicateConfig passed alongside the
+// item list instead of being duplicated per item.
+struct PutStartItem {
+    std::string key;
+    uint64_t size{0};
+    WriteTarget target{WholeObject{}};
+    std::string group_id;
+    std::string session_id;
+    std::string residency_affinity_id;
+    std::vector<std::string> preferred_hca_names;
+};
+YLT_REFL(PutStartItem, key, size, target, group_id, session_id,
+         residency_affinity_id, preferred_hca_names);
+
+struct PutStartResponse {
+    std::vector<Replica::Descriptor> replicas;
+    WriteToken token;
+};
+YLT_REFL(PutStartResponse, replicas, token);
+
+struct PutFinishRequest {
+    WriteToken token;
+    bool commit{true};  // true = PutEnd, false = PutRevoke / abort
+    ReplicaType replica_type{ReplicaType::ALL};
+    std::optional<uint64_t> checksum{};
+};
+YLT_REFL(PutFinishRequest, token, commit, replica_type, checksum);
+
+struct GetReplicaRequest {
+    std::string key;
+    ReadTarget target{WholeObject{}};
+};
+YLT_REFL(GetReplicaRequest, key, target);
+
+// Per-part replica descriptor set and metadata returned by
+// BatchGetReplicaListV2. WholeObject queries on a multi-part object return all
+// parts in index order; PartIndex queries return only the requested part.
+struct PartReplicaInfo {
+    std::vector<Replica::Descriptor> replicas;
+    uint64_t length{0};
+    std::optional<uint64_t> checksum{};
+};
+YLT_REFL(PartReplicaInfo, replicas, length, checksum);
+
+struct GetReplicaResponse {
+    std::vector<PartReplicaInfo> parts;
+    uint64_t lease_ttl_ms{0};
+    uint32_t part_count{1};
+    std::string resolved_tenant_id;
+};
+YLT_REFL(GetReplicaResponse, parts, lease_ttl_ms, part_count,
+         resolved_tenant_id);
 
 enum class ReplicaActionType {
     ADD = 0,
