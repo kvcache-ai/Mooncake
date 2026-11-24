@@ -218,7 +218,10 @@ if(WITH_STORE)
     add_executable(store_key_py_test tests/store_key_py_test.cpp)
     target_include_directories(store_key_py_test
                                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(store_key_py_test PRIVATE pybind11::headers
+    # nanobind has no pybind11-style embed target; build a static helper and
+    # initialize the interpreter with the CPython C API in the test.
+    nanobind_build_library(store_key_py_nanobind)
+    target_link_libraries(store_key_py_test PRIVATE store_key_py_nanobind
                                                      Python3::Python)
     add_test(NAME store_key_py_test COMMAND store_key_py_test)
   endif()

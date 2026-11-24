@@ -16,12 +16,14 @@
 #include <map>
 #include <string>
 
-#include <pybind11/embed.h>
-#include <pybind11/stl.h>
+#include <Python.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/map.h>
+#include <nanobind/stl/string.h>
 
 #include "store/store_key_py.h"
 
-namespace py = pybind11;
+namespace py = nanobind;
 
 namespace {
 
@@ -42,7 +44,12 @@ const char* TypeName(const py::handle& obj) {
 }  // namespace
 
 int main() {
-    py::scoped_interpreter guard{};
+    Py_InitializeEx(0);
+    if (!Py_IsInitialized()) {
+        std::cerr << "failed to initialize Python\n";
+        return 1;
+    }
+
     int failures = 0;
     const auto expect = [&failures](bool condition, const char* message) {
         if (!condition) {
@@ -51,51 +58,69 @@ int main() {
         }
     };
 
-    const py::object text_key = mooncake::StoreKeyToPy("mooncake_key");
-    std::cout << "utf8 key -> " << TypeName(text_key) << '\n';
-    expect(py::isinstance<py::str>(text_key), "utf8 key must be str");
-    expect(!py::isinstance<py::bytes>(text_key), "utf8 key must not be bytes");
-    expect(text_key.cast<std::string>() == "mooncake_key",
-           "utf8 key must round-trip");
-
-    const std::string binary = Sha256ImageKey();
-    expect(binary.size() == 32 && static_cast<unsigned char>(binary[2]) == 0xd6,
-           "fixture must be the reported sha256 digest");
-    const py::object binary_key = mooncake::StoreKeyToPy(binary);
-    std::cout << "sha256 key -> " << TypeName(binary_key) << '\n';
-    expect(py::isinstance<py::bytes>(binary_key), "binary key must be bytes");
-    expect(!py::isinstance<py::str>(binary_key), "binary key must not be str");
-    expect(binary_key.cast<std::string>() == binary,
-           "binary key must keep its bytes");
-
-    const std::string embedded_nul("a\0b", 3);
-    const py::object nul_key = mooncake::StoreKeyToPy(embedded_nul);
-    std::cout << "embedded nul -> " << TypeName(nul_key) << '\n';
-    expect(py::isinstance<py::str>(nul_key), "nul inside utf8 must stay str");
-    expect(nul_key.cast<std::string>() == embedded_nul,
-           "nul inside utf8 must be preserved");
-
-    py::dict batch;
-    batch[text_key] = 1;
-    batch[binary_key] = 2;
-    std::cout << "batch size -> " << batch.size() << '\n';
-    expect(batch.size() == 2, "one binary key must not drop the other key");
-    expect(batch["mooncake_key"].cast<int>() == 1, "str key lookup failed");
-    expect(batch[py::bytes(binary.data(), binary.size())].cast<int>() == 2,
-           "bytes key lookup failed");
-
-    bool map_caster_rejects_binary = false;
     try {
-        py::object mapped = py::cast(std::map<std::string, int>{{binary, 1}});
-        (void)mapped;
-    } catch (const py::error_already_set& error) {
-        const std::string text = error.what();
-        map_caster_rejects_binary =
-            text.find("UnicodeDecodeError") != std::string::npos;
-        std::cout << "map caster -> " << text << '\n';
+        const py::object text_key = mooncake::StoreKeyToPy("mooncake_key");
+        std::cout << "utf8 key -> " << TypeName(text_key) << '\n';
+        expect(py::isinstance<py::str>(text_key), "utf8 key must be str");
+        expect(!py::isinstance<py::bytes>(text_key),
+               "utf8 key must not be bytes");
+        expect(text_key.cast<std::string>() == "mooncake_key",
+               "utf8 key must round-trip");
+
+        const std::string binary = Sha256ImageKey();
+        expect(binary.size() == 32 &&
+                   static_cast<unsigned char>(binary[2]) == 0xd6,
+               "fixture must be the reported sha256 digest");
+        const py::object binary_key = mooncake::StoreKeyToPy(binary);
+        std::cout << "sha256 key -> " << TypeName(binary_key) << '\n';
+        expect(py::isinstance<py::bytes>(binary_key),
+               "binary key must be bytes");
+        expect(!py::isinstance<py::str>(binary_key),
+               "binary key must not be str");
+        expect(binary_key.cast<std::string>() == binary,
+               "binary key must keep its bytes");
+
+        const std::string embedded_nul("a\0b", 3);
+        const py::object nul_key = mooncake::StoreKeyToPy(embedded_nul);
+        std::cout << "embedded nul -> " << TypeName(nul_key) << '\n';
+        expect(py::isinstance<py::str>(nul_key),
+               "nul inside utf8 must stay str");
+        expect(nul_key.cast<std::string>() == embedded_nul,
+               "nul inside utf8 must be preserved");
+
+        py::dict batch;
+        batch[text_key] = 1;
+        batch[binary_key] = 2;
+        std::cout << "batch size -> " << batch.size() << '\n';
+        expect(batch.size() == 2, "one binary key must not drop the other key");
+        expect(batch["mooncake_key"].cast<int>() == 1, "str key lookup failed");
+        expect(batch[py::bytes(binary.data(), binary.size())].cast<int>() == 2,
+               "bytes key lookup failed");
+
+        bool map_caster_rejects_binary = false;
+        try {
+            py::object mapped =
+                py::cast(std::map<std::string, int>{{binary, 1}});
+            (void)mapped;
+        } catch (const py::python_error& error) {
+            const std::string text = error.what();
+            map_caster_rejects_binary =
+                text.find("UnicodeDecodeError") != std::string::npos;
+            std::cout << "map caster -> " << text << '\n';
+        }
+        expect(map_caster_rejects_binary,
+               "std::map caster must still reject a binary key");
+    } catch (const py::python_error& error) {
+        std::cerr << "python error: " << error.what() << '\n';
+        ++failures;
+    } catch (const std::exception& error) {
+        std::cerr << "error: " << error.what() << '\n';
+        ++failures;
     }
-    expect(map_caster_rejects_binary,
-           "std::map caster must still reject a binary key");
+
+    if (Py_IsInitialized()) {
+        Py_FinalizeEx();
+    }
 
     if (failures != 0) {
         std::cerr << failures << " check(s) failed\n";

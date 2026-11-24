@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include <pybind11/pybind11.h>
+#include <nanobind/nanobind.h>
 
 #include <string>
 
@@ -22,16 +22,16 @@ namespace mooncake {
 
 // Caller must hold the GIL. Valid UTF-8 stays str so existing dict lookups
 // keep working. Any other byte string becomes bytes. Returning
-// std::map<std::string, ...> from pybind would UTF-8-decode every key and
+// std::map<std::string, ...> from the binding would UTF-8-decode every key and
 // raise UnicodeDecodeError for the whole batch.
-inline pybind11::object StoreKeyToPy(const std::string& key) {
+inline nanobind::object StoreKeyToPy(const std::string& key) {
     PyObject* decoded = PyUnicode_DecodeUTF8(
         key.data(), static_cast<Py_ssize_t>(key.size()), nullptr);
     if (decoded != nullptr) {
-        return pybind11::reinterpret_steal<pybind11::object>(decoded);
+        return nanobind::steal<nanobind::object>(decoded);
     }
     PyErr_Clear();
-    return pybind11::bytes(key.data(), key.size());
+    return nanobind::bytes(key.data(), key.size());
 }
 
 }  // namespace mooncake
