@@ -520,7 +520,8 @@ int TcpTransport::registerLocalMemoryBatch(
         descs.push_back(
             makeTcpBufferDesc(buffer.addr, buffer.length, local_server_name_));
     }
-    metadata_->addLocalMemoryBuffers(descs, false);
+    int ret = metadata_->addLocalMemoryBuffers(descs, false);
+    if (ret) return ret;
     return metadata_->updateLocalSegmentDesc();
 }
 

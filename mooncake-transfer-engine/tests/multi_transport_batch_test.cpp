@@ -18,6 +18,7 @@
 #include "config.h"
 #include "multi_transport.h"
 #include "transfer_engine.h"
+#include "transfer_engine_impl.h"
 #include "transfer_metadata.h"
 
 namespace mooncake {
@@ -55,7 +56,7 @@ TEST(TcpMemoryBatchTest, RepeatedRegistrationAndMixedRemovalMatchSingles) {
     void* a = buffer;
     void* b = buffer + 8;
     void* missing = buffer + 16;
-    TransferEngine engine(false);
+    TransferEngineImpl engine(false);
     ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0", "127.0.0.1", 0), 0);
     auto* tcp = engine.installTransport("tcp", nullptr);
     ASSERT_NE(tcp, nullptr);

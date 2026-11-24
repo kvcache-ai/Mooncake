@@ -206,23 +206,54 @@ TEST(TransferMetadataBatchTest, ConsumesCxlAliasInRequestOrder) {
     ASSERT_EQ(
         metadata.addLocalSegment(LOCAL_SEGMENT_ID, "local", std::move(segment)),
         0);
-    auto first = makeTestBuffer("first", 0x1000, 0x100);
-    first.offset = 0x2000;
-    auto second = makeTestBuffer("second", 0xa000, 0x100);
-    second.offset = 0x3000;
-    const std::vector<TransferMetadata::BufferDesc> buffers{first, second};
+
+    auto tcp_first = makeTestBuffer("tcp_first", 0x1000, 0x100);
+#ifdef ENABLE_MULTI_PROTOCOL
+    tcp_first.protocol = "tcp";
+#endif
+    auto cxl_base = makeTestBuffer("cxl_base", 0, 0x100);
+    cxl_base.offset = 0;
+    auto cxl_second = makeTestBuffer("cxl_second", 0, 0x100);
+    cxl_second.offset = 0x2000;
+#ifdef ENABLE_MULTI_PROTOCOL
+    cxl_base.protocol = "cxl";
+    cxl_second.protocol = "cxl";
+#endif
+    const std::vector<TransferMetadata::BufferDesc> buffers{tcp_first, cxl_base,
+                                                            cxl_second};
     ASSERT_EQ(metadata.addLocalMemoryBuffers(buffers, false), 0);
 
-    const std::vector<void *> aliases{reinterpret_cast<void *>(0xa000),
-                                      reinterpret_cast<void *>(0x1000)};
+    // Removing the CXL base address must not consume the earlier TCP buffer
+    // whose default offset is also 0.
+    const std::vector<void *> aliases{reinterpret_cast<void *>(0x8000),
+                                      reinterpret_cast<void *>(0x8000)};
     EXPECT_EQ(metadata.removeLocalMemoryBuffers(aliases, false),
               ERR_ADDRESS_NOT_REGISTERED);
     auto remaining = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
-    ASSERT_EQ(remaining->buffers.size(), 1U);
-    EXPECT_EQ(remaining->buffers.front(), buffers.back());
-    const std::vector<void *> last_alias{reinterpret_cast<void *>(0xb000)};
-    EXPECT_EQ(metadata.removeLocalMemoryBuffers(last_alias, false), 0);
+    ASSERT_EQ(remaining->buffers.size(), 2U);
+    EXPECT_EQ(remaining->buffers.front(), tcp_first);
+    EXPECT_EQ(remaining->buffers.back(), cxl_second);
+
+    const std::vector<void *> cleanup{reinterpret_cast<void *>(0xa000),
+                                      reinterpret_cast<void *>(0x1000)};
+    EXPECT_EQ(metadata.removeLocalMemoryBuffers(cleanup, false), 0);
     EXPECT_TRUE(metadata.getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+
+    // Without a CXL segment (cxl_base_addr == 0), nullptr must not match an
+    // ordinary buffer whose default offset is 0.
+    TransferMetadata non_cxl(P2PHANDSHAKE);
+    auto non_cxl_seg = std::make_shared<TransferMetadata::SegmentDesc>();
+    non_cxl_seg->name = "local";
+    ASSERT_EQ(non_cxl.addLocalSegment(LOCAL_SEGMENT_ID, "local",
+                                      std::move(non_cxl_seg)),
+              0);
+    ASSERT_EQ(non_cxl.addLocalMemoryBuffers({&tcp_first, 1}, false), 0);
+    void *null_addr = nullptr;
+    EXPECT_EQ(non_cxl.removeLocalMemoryBuffers({&null_addr, 1}, false),
+              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_EQ(non_cxl.removeLocalMemoryBuffer(nullptr, false),
+              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_EQ(non_cxl.getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.size(), 1U);
 }
 #endif
 

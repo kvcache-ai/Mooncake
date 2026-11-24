@@ -1836,6 +1836,16 @@ int TransferMetadata::removeLocalSegment(const std::string &segment_name) {
     return 0;
 }
 
+#ifdef USE_CXL
+static bool isCxlBuffer(const TransferMetadata::SegmentDesc &segment_desc,
+                        const TransferMetadata::BufferDesc &buffer) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (!buffer.protocol.empty()) return buffer.protocol == "cxl";
+#endif
+    return segment_desc.cxl_base_addr != 0 && buffer.addr == 0;
+}
+#endif
+
 int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                                            bool update_metadata) {
     return addLocalMemoryBuffers({&buffer_desc, 1}, update_metadata);
@@ -1846,7 +1856,12 @@ int TransferMetadata::addLocalMemoryBuffers(std::span<const BufferDesc> buffers,
     if (buffers.empty()) return 0;
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
-        auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+        auto it = segment_id_to_desc_map_.find(LOCAL_SEGMENT_ID);
+        if (it == segment_id_to_desc_map_.end() || !it->second) {
+            LOG(ERROR) << "Local segment descriptor not found";
+            return ERR_METADATA;
+        }
+        auto &segment_desc = it->second;
         auto new_segment_desc = std::make_shared<SegmentDesc>(*segment_desc);
         new_segment_desc->buffers.insert(new_segment_desc->buffers.end(),
                                          buffers.begin(), buffers.end());
@@ -1869,16 +1884,22 @@ int TransferMetadata::removeLocalMemoryBuffer(
     bool addr_exist = false;
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
-        auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+        auto it = segment_id_to_desc_map_.find(LOCAL_SEGMENT_ID);
+        if (it == segment_id_to_desc_map_.end() || !it->second) {
+            LOG(ERROR) << "Local segment descriptor not found";
+            return ERR_METADATA;
+        }
+        auto &segment_desc = it->second;
         auto new_segment_desc = std::make_shared<SegmentDesc>(*segment_desc);
         for (auto iter = new_segment_desc->buffers.begin();
              iter != new_segment_desc->buffers.end(); ++iter) {
             if ((iter->addr == (uint64_t)addr
 #ifdef USE_CXL
-                 || (iter->offset + new_segment_desc->cxl_base_addr) ==
-                        (uint64_t)addr
+                 || (isCxlBuffer(*new_segment_desc, *iter) &&
+                     (iter->offset + new_segment_desc->cxl_base_addr) ==
+                         (uint64_t)addr)
 #endif
-                 ) &&
+                     ) &&
                 pred(*iter)) {
                 new_segment_desc->buffers.erase(iter);
                 addr_exist = true;
@@ -1917,7 +1938,12 @@ int TransferMetadata::removeLocalMemoryBuffers(
     size_t removed_count = 0;
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
-        auto &segment_desc = segment_id_to_desc_map_.at(LOCAL_SEGMENT_ID);
+        auto it = segment_id_to_desc_map_.find(LOCAL_SEGMENT_ID);
+        if (it == segment_id_to_desc_map_.end() || !it->second) {
+            LOG(ERROR) << "Local segment descriptor not found";
+            return ERR_METADATA;
+        }
+        auto &segment_desc = it->second;
         const auto &buffers = segment_desc->buffers;
         // Collect indices in reverse order so each request can pop the
         // earliest matching entry, including repeated addresses.
@@ -1925,8 +1951,11 @@ int TransferMetadata::removeLocalMemoryBuffers(
             const auto &buffer = buffers[i - 1];
             auto match = candidates.find(buffer.addr);
 #ifdef USE_CXL
-            auto alias =
-                candidates.find(buffer.offset + segment_desc->cxl_base_addr);
+            auto alias = candidates.end();
+            if (isCxlBuffer(*segment_desc, buffer)) {
+                alias = candidates.find(buffer.offset +
+                                        segment_desc->cxl_base_addr);
+            }
             if (match == candidates.end() && alias == candidates.end())
                 continue;
 #else
