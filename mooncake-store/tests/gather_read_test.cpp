@@ -536,7 +536,12 @@ TEST_P(StoreGatherReadTest, InterleavedKeysSnapshotAndScatterFallback) {
             << "Set MC_GATHER_TEST_DEVICE to run the RDMA Store integration";
     setenv("MC_STORE_MEMCPY", "0", 1);
     mooncake::testing::InProcMaster master;
-    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
+    // Keep the snapshot valid across both read modes even when CTest sets
+    // DEFAULT_KV_LEASE_TTL=500 for tests that exercise lease expiry.
+    ASSERT_TRUE(
+        master.Start(InProcMasterConfigBuilder()
+                         .set_default_kv_lease_ttl(DEFAULT_DEFAULT_KV_LEASE_TTL)
+                         .build()));
     auto owner = RealClient::create(), reader = RealClient::create();
     ASSERT_EQ(owner->setup_real("127.0.0.1:0", P2PHANDSHAKE, 16 << 20, 8 << 20,
                                 protocol, device ? device : "",
