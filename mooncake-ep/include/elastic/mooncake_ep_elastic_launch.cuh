@@ -48,6 +48,8 @@ struct ElasticLaunchContext {
     void* mapped_host_workspace = nullptr;
     int rank = 0;
     int num_ranks = 1;
+    const int32_t* logical_to_transport_slots = nullptr;
+    int qps_per_rank = 1;
     int scaleout_rank_idx = 0;
     int scaleup_rank_idx = 0;
     int num_scaleout_ranks = 1;

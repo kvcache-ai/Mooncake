@@ -1,3 +1,11 @@
+"""EP grid tests; --local-p2p runs native healthy-rank cases without RDMA.
+
+Example: python test_ep_grid.py --local-p2p --num-ranks 2 --iterations 3
+The default invocation retains the full Mooncake-PG grid and fault tests.
+"""
+
+import argparse
+import sys
 import os
 import itertools
 import unittest
@@ -59,7 +67,6 @@ def run_test_iteration(
     num_experts: int,
     top_k: int,
     use_fp8: bool,
-    zero_copy: bool,
     async_finish: bool,
     return_recv_hook: bool,
     use_fallback: bool,
@@ -175,12 +182,7 @@ def run_test_iteration(
     expert_out = expert_out.to(torch.bfloat16)
 
     # Combine
-    if zero_copy:
-        cb_buf = buf.get_next_combine_buffer(handle)
-        cb_buf.copy_(expert_out)
-        expert_to_pass = cb_buf.contiguous()
-    else:
-        expert_to_pass = expert_out.contiguous()
+    expert_to_pass = expert_out.contiguous()
 
     out_tensor = torch.zeros_like(x)
     combined_x, event, hook = buf.combine(
@@ -190,7 +192,6 @@ def run_test_iteration(
         active_ranks,
         timeout_us=timeout_us,
         handle=handle,
-        zero_copy=zero_copy,
         async_finish=async_finish,
         return_recv_hook=return_recv_hook,
         out=out_tensor,
@@ -216,7 +217,7 @@ def run_test_iteration(
         dist.barrier(group)
 
 
-def worker(rank, world_size, config_dict):
+def worker(rank, world_size, config_dict, local_p2p=False, iterations=1):
     import_torchada_if_needed()
 
     # Device filter
@@ -225,26 +226,47 @@ def worker(rank, world_size, config_dict):
         for f in os.getenv("DEVICE_FILTER", "mlx5_1,mlx5_2,mlx5_3,mlx5_4").split(",")
         if f
     ]
-    if device_filter:
+    if device_filter and not local_p2p:
         pg.set_device_filter(device_filter)
 
     torch.cuda.set_device(rank)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
 
-    dist.init_process_group(backend="mooncake", rank=rank, world_size=world_size)
+    dist.init_process_group(
+        backend="nccl" if local_p2p else "mooncake", rank=rank, world_size=world_size
+    )
     group = dist.group.WORLD
 
+    buf = None
     try:
-        run_test_iteration(
-            group=group,
-            rank=rank,
-            num_ranks=world_size,
-            **config_dict,
-        )
+        if local_p2p:
+            buf = Buffer(
+                group,
+                Buffer.get_ep_buffer_size_hint(
+                    config_dict["max_tokens"],
+                    config_dict["hidden"],
+                    world_size,
+                    config_dict["num_experts"],
+                ),
+            )
+            assert not buf._use_fallback, "Native P2P EP is required"
+            print(f"rank={rank} native EP connected; fallback=False", flush=True)
+        for _ in range(iterations):
+            run_test_iteration(
+                group=group,
+                rank=rank,
+                num_ranks=world_size,
+                buf=buf,
+                **config_dict,
+            )
     except Exception:
         traceback.print_exc()
         raise
+    finally:
+        if local_p2p:
+            del buf
+            dist.destroy_process_group()
 
     os._exit(0)
 
@@ -290,7 +312,6 @@ def run_stale_data_test(
         num_experts=num_experts,
         top_k=top_k,
         use_fp8=False,
-        zero_copy=False,
         async_finish=True,
         return_recv_hook=False,
         use_fallback=False,
@@ -407,22 +428,28 @@ def stale_data_worker(rank, world_size):
 
 
 class TestMooncakeEPBuffer(unittest.TestCase):
+    local_p2p = False
+    num_ranks = None
+    iterations = 1
+
     def setUp(self):
         import_torchada_if_needed()
-        self.world_size = torch.cuda.device_count()
+        self.world_size = self.num_ranks or torch.cuda.device_count()
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
 
     def run_single_config(self, config_dict):
         mp.spawn(
             worker,
-            args=(self.world_size, config_dict),
+            args=(self.world_size, config_dict, self.local_p2p, self.iterations),
             nprocs=self.world_size,
             join=True,
             daemon=False,
         )
 
     def test_combine_stale_data(self):
+        if self.local_p2p:
+            self.skipTest("local P2P profile covers healthy-rank communication")
         mp.spawn(
             stale_data_worker,
             args=(self.world_size,),
@@ -438,8 +465,6 @@ def make_test_name(cfg):
     flags = []
     if cfg["use_fp8"]:
         flags.append("fp8")
-    if cfg["zero_copy"]:
-        flags.append("0copy")
     if cfg["async_finish"]:
         flags.append("async")
     if cfg["return_recv_hook"]:
@@ -468,11 +493,10 @@ def make_test_name(cfg):
     return "_".join(parts)
 
 
-def generate_tests():
-    fp8_options = [False] if using_maca_backend() else [False, True]
+def generate_tests(local_p2p=False):
+    fp8_options = [False, True]
     test_grid = {
         "use_fp8": fp8_options,
-        "zero_copy": [False],
         "async_finish": [False, True],
         "return_recv_hook": [False, True],
         "use_fallback": [False, True],
@@ -482,6 +506,11 @@ def generate_tests():
             {"max_tokens": 256, "hidden": 2048, "num_experts": 288, "top_k": 8},
         ],
     }
+
+    if local_p2p:
+        # With neither RDMA nor P2P there is no native data path. Fault cases
+        # remain in the full grid; this profile uses fixed NCCL membership.
+        test_grid.update(use_fallback=[False], fail_rank=[-1], disable_p2p=[False])
 
     keys = list(test_grid.keys())
     config_tuples = list(itertools.product(*[test_grid[k] for k in keys]))
@@ -512,5 +541,15 @@ def generate_tests():
 
 if __name__ == "__main__":
     faulthandler.enable()
-    generate_tests()
-    unittest.main(verbosity=2)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--local-p2p", action="store_true")
+    parser.add_argument("--num-ranks", type=int)
+    parser.add_argument("--iterations", type=int, default=1)
+    args, remaining = parser.parse_known_args()
+    if args.iterations < 1 or (args.num_ranks is not None and args.num_ranks < 2):
+        parser.error("iterations must be positive and num-ranks must be at least 2")
+    TestMooncakeEPBuffer.local_p2p = args.local_p2p
+    TestMooncakeEPBuffer.num_ranks = args.num_ranks
+    TestMooncakeEPBuffer.iterations = args.iterations
+    generate_tests(local_p2p=args.local_p2p)
+    unittest.main(argv=[sys.argv[0], *remaining], verbosity=2)

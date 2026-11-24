@@ -18,18 +18,14 @@
 #include "bench_runner.h"
 #include "utils.h"
 
+#include <optional>
 #include <string>
 #include <vector>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
 #include <functional>
-#include <fcntl.h>
-#include <gflags/gflags.h>
+#include <utility>
 #include <glog/logging.h>
-#include <signal.h>
-#include <sys/time.h>
 #include <memory>
+#include <atomic>
 
 #include "tent/transfer_engine.h"
 #include "tent/common/utils/random.h"
@@ -46,30 +42,53 @@ class TENTBenchRunner : public BenchRunner {
     TENTBenchRunner(const TENTBenchRunner&) = delete;
     TENTBenchRunner& operator=(const TENTBenchRunner&) = delete;
 
+    // Mixed mode spreads workers over the targets first and the seg_types
+    // second: worker w uses target w % T and seg_type (w / T) % M on both the
+    // local and the target side, so the memory types always match and every
+    // target sees every type. Public so the rule can be unit-tested.
+    static size_t mixTypeIndex(int thread_id, size_t targets, size_t types) {
+        return static_cast<size_t>(thread_id) / targets % types;
+    }
+
+    // Index of the worker among the local workers with the same seg_type.
+    static size_t mixLocalOrdinal(int thread_id, size_t targets, size_t types) {
+        const size_t w = static_cast<size_t>(thread_id);
+        return w / (targets * types) * targets + w % targets;
+    }
+
+    // Index of this worker's target buffer among the target's buffers of its
+    // seg_type: the first same-type worker starts at --target_gpu_id, so the
+    // flag only shifts which buffer is used, not the type.
+    static size_t mixTargetOrdinal(int thread_id, size_t targets,
+                                   size_t types) {
+        return static_cast<size_t>(
+                   std::max(0, XferBenchConfig::target_gpu_id)) +
+               static_cast<size_t>(thread_id) / targets / types;
+    }
+
     void pinThread(int thread_id);
 
     int runTarget();
 
     int startInitiator(int num_threads);
 
-    int stopInitiator();
-
-    int runInitiatorTasks(const std::function<int(int /* thread_id */)>& func);
-
     std::string getSegmentName() const { return engine_->getSegmentName(); }
 
-    uint64_t getLocalBufferBase(int thread_id, uint64_t block_size,
-                                uint64_t batch_size) const {
+    std::optional<uint64_t> getLocalBufferBase(int thread_id,
+                                               uint64_t stride) const {
+        const uint64_t length = XferBenchConfig::total_buffer_size;
         if (seg_type_mix_.empty()) {
             // Single seg_type mode: original behavior.
             const size_t num_buffers = pinned_buffer_list_.size();
-            return (uint64_t)pinned_buffer_list_[thread_id % num_buffers] +
-                   block_size * batch_size * (thread_id / num_buffers);
+            return slotAddress(
+                (uint64_t)pinned_buffer_list_[thread_id % num_buffers], length,
+                stride, thread_id / num_buffers);
         }
-        // Mixed mode: pick this thread's seg_type by round-robin, then index
-        // into the subset of pinned_buffer_list_ matching that seg_type.
-        const std::string& seg_type =
-            seg_type_mix_[thread_id % seg_type_mix_.size()];
+        // Mixed mode: use this worker's seg_type (the same as its target
+        // buffer's, see mixTypeIndex), then index into the subset of
+        // pinned_buffer_list_ matching that seg_type.
+        const std::string& seg_type = seg_type_mix_[mixTypeIndex(
+            thread_id, getTargetCount(), seg_type_mix_.size())];
         size_t base = 0, count = 0;
         for (size_t i = 0; i < pinned_buffer_seg_type_.size(); ++i) {
             if (pinned_buffer_seg_type_[i] == seg_type) {
@@ -81,58 +100,30 @@ class TENTBenchRunner : public BenchRunner {
             LOG(FATAL) << "No local buffer of seg_type " << seg_type
                        << " for thread " << thread_id;
         }
-        size_t slot = (thread_id / seg_type_mix_.size()) % count;
-        return (uint64_t)pinned_buffer_list_[base + slot] +
-               block_size * batch_size *
-                   ((thread_id / seg_type_mix_.size()) / count);
+        const size_t ordinal =
+            mixLocalOrdinal(thread_id, getTargetCount(), seg_type_mix_.size());
+        return slotAddress(
+            (uint64_t)pinned_buffer_list_[base + ordinal % count], length,
+            stride, ordinal / count);
     }
 
-    size_t getTargetCount() const;
-
-    size_t getTargetIndex(int thread_id) const {
-        return targetIndex(thread_id);
-    }
-
-    uint64_t getTargetSegmentId(int thread_id) const;
-
-    uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,
-                                 uint64_t batch_size) const {
-        const size_t target_idx = targetIndex(thread_id);
-        const int local_thread_id = localTargetThreadId(thread_id);
-        const auto& info = target_infos_[target_idx];
+    std::optional<uint64_t> getTargetBufferBase(int thread_id,
+                                                uint64_t window) const {
+        const auto& info = target_infos_[getTargetIndex(thread_id)];
         if (seg_type_mix_.empty()) {
             // Single seg_type mode: original behavior.
-            const size_t buffer_idx = local_thread_id % info.buffers.size();
-            const uint64_t bytes =
-                checkedMul(block_size, batch_size, "target operation size");
-            const uint64_t relative_offset =
-                checkedMul(bytes, local_thread_id / info.buffers.size(),
-                           "target relative offset");
-            const auto& buffer = info.buffers[buffer_idx];
-            if (XferBenchConfig::target_range_size != 0 &&
-                !rangeContains(relative_offset, bytes,
-                               XferBenchConfig::target_range_size)) {
-                LOG(FATAL) << "Target range too small for thread " << thread_id;
-            }
-            if (XferBenchConfig::target_offset > buffer.length ||
-                !rangeContains(
-                    relative_offset, bytes,
-                    buffer.length - XferBenchConfig::target_offset)) {
-                LOG(FATAL) << "Target buffer too small for thread "
-                           << thread_id;
-            }
-            return checkedAdd(
-                buffer.base,
-                checkedAdd(XferBenchConfig::target_offset, relative_offset,
-                           "target address offset"),
-                "target address");
+            const int local_thread_id = localTargetThreadId(thread_id);
+            const auto& buffer =
+                info.buffers[local_thread_id % info.buffers.size()];
+            return targetSlotAddress(buffer.base, buffer.length, window,
+                                     local_thread_id / info.buffers.size());
         }
-        // Mixed mode: pick this thread's seg_type, then index into the
+        // Mixed mode: pick this worker's seg_type, then index into the
         // subset of target segment buffers matching that seg_type. Use
         // LocationParser to classify each buffer as host (cpu) vs device
         // (cuda/rocm/supa/...) rather than hard-coding a vendor prefix.
-        const std::string& seg_type =
-            seg_type_mix_[local_thread_id % seg_type_mix_.size()];
+        const std::string& seg_type = seg_type_mix_[mixTypeIndex(
+            thread_id, getTargetCount(), seg_type_mix_.size())];
         bool want_device = (seg_type == "vram");
         std::vector<size_t> matches;
         for (size_t i = 0; i < info.buffers.size(); ++i) {
@@ -147,49 +138,37 @@ class TENTBenchRunner : public BenchRunner {
             LOG(FATAL) << "No target buffer of seg_type " << seg_type
                        << " for thread " << thread_id;
         }
-        size_t slot = (local_thread_id / seg_type_mix_.size()) % matches.size();
-        const uint64_t bytes =
-            checkedMul(block_size, batch_size, "target operation size");
-        const uint64_t relative_offset = checkedMul(
-            bytes, (local_thread_id / seg_type_mix_.size()) / matches.size(),
-            "target relative offset");
-        const auto& buffer = info.buffers[matches[slot]];
-        if (XferBenchConfig::target_range_size != 0 &&
-            !rangeContains(relative_offset, bytes,
-                           XferBenchConfig::target_range_size)) {
-            LOG(FATAL) << "Target range too small for thread " << thread_id;
-        }
-        if (XferBenchConfig::target_offset > buffer.length ||
-            !rangeContains(relative_offset, bytes,
-                           buffer.length - XferBenchConfig::target_offset)) {
-            LOG(FATAL) << "Target buffer too small for thread " << thread_id;
-        }
-        return checkedAdd(buffer.base,
-                          checkedAdd(XferBenchConfig::target_offset,
-                                     relative_offset, "target address offset"),
-                          "target address");
+        // Index among this target's workers of this seg_type, starting at
+        // --target_gpu_id.
+        const size_t ordinal =
+            mixTargetOrdinal(thread_id, getTargetCount(), seg_type_mix_.size());
+        const auto& buffer = info.buffers[matches[ordinal % matches.size()]];
+        return targetSlotAddress(buffer.base, buffer.length, window,
+                                 ordinal / matches.size());
     }
 
-    // Returns elapsed microseconds on success, or a negative value if the
-    // transfer failed. Never calls exit() — workers set g_tent_running so
-    // main can join threads and stop the engine first.
     double runSingleTransfer(uint64_t local_addr, uint64_t target_id,
                              uint64_t target_addr, uint64_t block_size,
                              uint64_t batch_size, OpCode opcode,
                              uint64_t deadline_ns, IntentType intent_type);
 
    private:
+    // Tests register their own buffers on an engine with a fake transport.
+    friend class TENTBenchRunnerTestPeer;
+    explicit TENTBenchRunner(std::unique_ptr<TransferEngine> engine)
+        : engine_(std::move(engine)) {}
+
     int allocateBuffers();
 
     int freeBuffers();
 
-    int runner(int thread_id);
-
-    void noteTransferFailed();
-
-    size_t targetIndex(int thread_id) const;
-
-    int localTargetThreadId(int thread_id) const;
+    // Polls batch_id until it is terminal. A stop (failed worker, SIGINT,
+    // SIGTERM) does not end the wait early: the transports may still be
+    // writing into the local buffers. Returns with status PENDING only if the
+    // batch did not finish within the drain timeout after the stop; the batch
+    // is then counted in abandoned_batches_.
+    Status waitForBatch(BatchID batch_id, TransferStatus& status,
+                        uint64_t& polls);
 
    private:
     std::unique_ptr<TransferEngine> engine_;
@@ -201,17 +180,13 @@ class TENTBenchRunner : public BenchRunner {
     // Parsed --seg_type_mix (e.g. ["dram", "vram"]). Empty when --seg_type_mix
     // is not set → single-seg_type mode (existing behavior).
     std::vector<std::string> seg_type_mix_;
-    std::vector<SegmentID> target_handles_;
     std::vector<SegmentInfo> target_infos_;
     TransportType transport_hint_{UNSPEC};
     IntentType intent_type_{IntentType::INTENT_UNSPEC};
-
-    std::vector<std::function<int(int)>> current_task_;
-    std::vector<std::thread> threads_;
-    std::mutex mtx_;
-    std::condition_variable cv_task_;
-    std::condition_variable cv_done_;
-    int pending_ = 0;
+    // Batches that may still be in flight (see waitForBatch); while non-zero
+    // teardown retains both the engine and its local buffers until process
+    // exit.
+    std::atomic<uint64_t> abandoned_batches_{0};
 };
 
 }  // namespace tent

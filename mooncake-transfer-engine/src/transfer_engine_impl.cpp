@@ -19,12 +19,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
+#include <set>
 #include <string>
 #include <sys/resource.h>
 #include <unistd.h>
 #ifdef WITH_METRICS
 #include <iomanip>
 #include <sstream>
+#include "transfer_engine_metrics.h"
 #endif
 
 #include "transfer_metadata_plugin.h"
@@ -32,6 +35,9 @@
 #include "transport/transport.h"
 #include "transport/rdma_twosided/rdma_twosided_transport.h"
 #include "transport/shm_transport/shm_transport.h"
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+#include "transport/rdma_transport/rdma_transport.h"
+#endif
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
 #endif
@@ -128,12 +134,11 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #endif
 
-#ifdef USE_ASCEND
-    // The only difference in initializing the Ascend Transport is that the
-    // `local_server_name` must include the physical NPU card ID. The format
-    // changes from `ip:port` to `ip:port:npu_x`, e.g., `"0.0.0.0:12345:npu_2"`.
-    // While the desc_name stored in the metadata remains in the format of
-    // ip:port.
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+    // Ascend builds also accept the legacy `ip:port:npu_x` local_server_name
+    // form. The NPU id is only informational now (the Ascend Direct transport
+    // selects devices through ACL/adxl); the segment name stored in the
+    // metadata stays in the `ip:port` form.
     int devicePhyId = -1;
     auto [host_name, port] =
         parseHostNameWithPortAscend(local_server_name, &devicePhyId);
@@ -174,15 +179,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                 LOG(ERROR) << "P2P: No valid port found for local TCP service.";
                 return -1;
             }
-#if defined(USE_ASCEND)
-            // The current version of Ascend Transport does not support IPv6,
-            // but it will be added in a future release.
-            local_server_name_ =
-                desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
-#else
             local_server_name_ = maybeWrapIpV6(desc.ip_or_host_name) + ":" +
                                  std::to_string(desc.rpc_port);
-#endif
         }
     } else {
         rpc_binding_method = "new RPC mapping";
@@ -221,15 +219,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
               << "";
 
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
-#ifdef USE_ASCEND
-    std::string mutable_server_name =
-        local_server_name_ + ":npu_" + std::to_string(devicePhyId);
-    multi_transports_ =
-        std::make_shared<MultiTransport>(metadata_, mutable_server_name);
-#else
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
-#endif
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
@@ -274,13 +265,22 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
 
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
-    Transport* ascend_transport =
-        multi_transports_->installTransport("ascend", local_topology_);
-    if (!ascend_transport) {
-        LOG(ERROR) << "Failed to install Ascend transport";
-        return -1;
+    if (shouldInstallAscendTransport(auto_discover_config_.protocol)) {
+        Transport* ascend_transport =
+            multi_transports_->installTransport("ascend", local_topology_);
+        if (!ascend_transport) {
+            LOG(ERROR) << "Failed to install Ascend transport";
+            return -1;
+        }
+        maybeInstallShmTransport(multi_transports_.get(), local_topology_);
+        return 0;
     }
-#else
+    // The hint asked for a host transport. Discovery installs it below when
+    // enabled; with discovery off the caller installs it explicitly, the way
+    // Store and the Python binding do.
+    LOG(INFO) << "protocol=" << auto_discover_config_.protocol
+              << ", skipping Ascend Direct for the host transports";
+#endif
 
 #ifdef USE_UBSHMEM
     Transport* ubshmem_transport =
@@ -292,8 +292,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     auto_discover_config_.enabled = false;
 #endif
 
-#if defined(USE_CXL) && !defined(USE_ASCEND) && \
-    !defined(USE_ASCEND_HETEROGENEOUS)
+#if defined(USE_CXL) && !defined(USE_ASCEND_HETEROGENEOUS)
     if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
         Transport* cxl_transport =
             multi_transports_->installTransport("cxl", local_topology_);
@@ -306,22 +305,52 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
     if (auto_discover_config_.enabled) {
         LOG(INFO) << "Auto-discovering topology...";
+        // RDMA discovery drops EFA NICs (they expose SRD only, not the RC QPs
+        // the RDMA transport needs), but EFA discovery must keep them.
+        const bool use_efa = autoDiscoverUsesEfa();
         if (getenv("MC_CUSTOM_TOPO_JSON")) {
             auto path = getenv("MC_CUSTOM_TOPO_JSON");
             LOG(INFO) << "Using custom topology from: " << path;
             auto topo_json = loadTopologyJsonFile(path);
             if (!topo_json.empty()) {
-                local_topology_->parse(topo_json);
+                ret = local_topology_->parse(topo_json, filter_);
+                if (ret == 0 && !filter_.empty() &&
+                    local_topology_->getHcaList().empty()) {
+                    std::string names;
+                    for (const auto& name : filter_)
+                        names += (names.empty() ? "" : ",") + name;
+                    LOG(ERROR) << "No HCA in " << path
+                               << " matches device filter [" << names << "]";
+                    return ERR_DEVICE_NOT_FOUND;
+                }
             } else {
                 LOG(WARNING) << "Failed to load custom topology from " << path
                              << ", falling back to auto-detect.";
-                local_topology_->discover(filter_);
+                local_topology_->discover(filter_, /*exclude_efa=*/!use_efa);
             }
         } else {
-            local_topology_->discover(filter_);
+            local_topology_->discover(filter_, /*exclude_efa=*/!use_efa);
         }
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
+
+#ifdef USE_EFA
+        // Install EFA before the per-build transport selection below. The
+        // NVLink/MNNVL branch never installs EFA, so builds that combine
+        // USE_EFA with it (the default CUDA wheels) would otherwise fall back
+        // to TCP, or to RDMA on the host's non-EFA NICs.
+        if (use_efa) {
+            Transport* efa_transport =
+                multi_transports_->installTransport("efa", local_topology_);
+            if (!efa_transport) {
+                LOG(ERROR) << "Failed to install EFA transport";
+                return -1;
+            }
+            LOG(INFO) << "installTransport, type=efa";
+            maybeInstallShmTransport(multi_transports_.get(), local_topology_);
+            return 0;
+        }
+#endif
 
 #ifdef USE_UB
         Transport* ub_transport =
@@ -431,13 +460,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(INFO) << "Using " << gpu_p2p_name << " transport "
                       << "(forced or no HCA detected)";
         } else if (!no_hca || force_hca) {
-            Transport* t =
-                multi_transports_->installTransport("rdma", local_topology_);
+            const char* rdma_protocol =
+                globalConfig().use_rdma_twosided ? "rdma_twosided" : "rdma";
+            Transport* t = multi_transports_->installTransport(rdma_protocol,
+                                                               local_topology_);
             if (!t) {
                 LOG(ERROR) << "Failed to install RDMA transport";
                 return -1;
             }
-            LOG(INFO) << "Using RDMA transport (RoCE/iWARP)";
+            LOG(INFO) << "Using RDMA transport, type=" << rdma_protocol;
         } else {
 #ifdef USE_TCP
             Transport* t = multi_transports_->installTransport("tcp", nullptr);
@@ -492,10 +523,25 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
         // TODO: install other transports automatically
 
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+        // Opt-in: MC_ENABLE_HYLINK=1 (default off). After RDMA/TCP so the
+        // segment protocol becomes "rdma,hylink" or "tcp,hylink". Install
+        // HipTransport below only if HyLink was not installed.
+        if (envFlagEnabled("MC_ENABLE_HYLINK")) {
+            Transport* hylink_transport =
+                multi_transports_->installTransport("hylink", nullptr);
+            if (!hylink_transport) {
+                LOG(WARNING) << "MC_ENABLE_HYLINK is set but failed to install "
+                                "HyLink transport (HSL unavailable)";
+            } else {
+                LOG(INFO) << "MC_ENABLE_HYLINK is set, HyLink transport "
+                             "installed";
+            }
+        }
+#endif
+
 #ifdef USE_HIP
-        // HIP transport handles intra-node GPU P2P via XGMI/IPC and can
-        // coexist with the cross-node transport (RDMA/TCP) selected above.
-        {
+        if (!multi_transports_->getTransport("hylink")) {
             Transport* hip_transport =
                 multi_transports_->installTransport("hip", nullptr);
             if (!hip_transport) {
@@ -507,7 +553,6 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 #endif
     }
-#endif
 
     maybeInstallShmTransport(multi_transports_.get(), local_topology_);
     return 0;
@@ -521,6 +566,10 @@ int TransferEngineImpl::freeEngine() {
     return 0;
 }
 
+static bool supportsRegistrationReuse(const std::string& proto) {
+    return proto != "nvmeof" && proto != "barex";
+}
+
 // Only for testing
 Transport* TransferEngineImpl::installTransport(const std::string& proto,
                                                 void** args) {
@@ -528,6 +577,11 @@ Transport* TransferEngineImpl::installTransport(const std::string& proto,
     if (transport) {
         LOG(WARNING) << "Transport " << proto << " already installed";
         return transport;
+    }
+    if (memory_registration_reuse_ && !supportsRegistrationReuse(proto)) {
+        LOG(ERROR) << "Transport " << proto
+                   << " does not support memory registration reuse";
+        return nullptr;
     }
 #ifdef USE_NCCL_HOST
     if (proto == "nccl" && !local_memory_regions_.empty()) {
@@ -748,10 +802,147 @@ bool TransferEngineImpl::checkOverlap(void* addr, uint64_t length) {
     return hasOverlapLocked(reinterpret_cast<uintptr_t>(addr), length);
 }
 
+int TransferEngineImpl::enableMemoryRegistrationReuse() {
+    std::lock_guard<std::mutex> transaction(registration_reuse_mutex_);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (memory_registration_reuse_) return 0;
+    if (!registering_memory_regions_.empty()) return ERR_INVALID_ARGUMENT;
+    for (auto transport : multi_transports_->listTransports())
+        if (!supportsRegistrationReuse(transport->getName()))
+            return ERR_NOT_IMPLEMENTED;
+    for (auto& [base, region] : local_memory_regions_) {
+        region.users = 1;
+        ++registration_users_[base];
+    }
+    memory_registration_reuse_ = true;
+    return 0;
+}
+
+int TransferEngineImpl::registerReusableMemory(
+    const std::vector<BufferEntry>& buffers, const std::string& location) {
+    std::lock_guard<std::mutex> transaction(registration_reuse_mutex_);
+    retryFailedRollbacks();
+    std::vector<BufferEntry> new_buffers;
+    std::vector<uintptr_t> bases;
+    std::set<uintptr_t> addresses;
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        for (const auto& buffer : buffers) {
+            auto addr = reinterpret_cast<uintptr_t>(buffer.addr);
+            if (!buffer.length ||
+                buffer.length > std::numeric_limits<uintptr_t>::max() - addr ||
+                !addresses.insert(addr).second)
+                return ERR_INVALID_ARGUMENT;
+            auto next = local_memory_regions_.upper_bound(addr);
+            if (next != local_memory_regions_.begin()) {
+                const auto& [base, region] = *std::prev(next);
+                if (addr - base < region.length &&
+                    buffer.length <= region.length - (addr - base)) {
+                    if (region.releasing) return ERR_CONTEXT;
+                    if (region.location != location)
+                        return ERR_INVALID_ARGUMENT;
+                    if (!region.remote_accessible)
+                        return ERR_ADDRESS_OVERLAPPED;
+                    bases.push_back(base);
+                    continue;
+                }
+            }
+            new_buffers.push_back(buffer);
+            bases.push_back(addr);
+        }
+    }
+    if (!new_buffers.empty()) {
+        int ret = registerLocalMemoryBatchImpl(new_buffers, location);
+        if (ret) return ret;
+    }
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        ++local_memory_regions_.at(bases[i]).users;
+        ++registration_users_[reinterpret_cast<uintptr_t>(buffers[i].addr)];
+    }
+    return 0;
+}
+
+int TransferEngineImpl::unregisterReusableMemory(
+    const std::vector<void*>& addresses) {
+    std::lock_guard<std::mutex> transaction(registration_reuse_mutex_);
+    retryFailedRollbacks();
+    std::map<uintptr_t, size_t> releases;
+    std::set<uintptr_t> unique;
+    std::vector<void*> expired;
+    {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        for (auto ptr : addresses) {
+            auto addr = reinterpret_cast<uintptr_t>(ptr);
+            if (!unique.insert(addr).second) return ERR_INVALID_ARGUMENT;
+            if (!registration_users_.count(addr))
+                return ERR_ADDRESS_NOT_REGISTERED;
+            auto region = std::prev(local_memory_regions_.upper_bound(addr));
+            ++releases[region->first];
+        }
+        for (const auto& [base, count] : releases) {
+            auto& region = local_memory_regions_.at(base);
+            if (region.users == count) {
+                region.releasing = true;
+                expired.push_back(reinterpret_cast<void*>(base));
+            }
+        }
+    }
+    if (!expired.empty()) {
+        int ret = releaseReusableRegions(expired);
+        if (ret) return ret;
+    }
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    for (const auto& [base, count] : releases) {
+        auto region = local_memory_regions_.find(base);
+        if (region != local_memory_regions_.end())
+            region->second.users -= count;
+    }
+    for (auto ptr : addresses) {
+        auto user = registration_users_.find(reinterpret_cast<uintptr_t>(ptr));
+        if (user != registration_users_.end() && --user->second == 0)
+            registration_users_.erase(user);
+    }
+    return 0;
+}
+
+int TransferEngineImpl::releaseReusableRegions(
+    const std::vector<void*>& regions) {
+    // On retry, some transports may have already unregistered the region.
+    auto transports = multi_transports_->listTransports();
+    int first_error = 0;
+    for (auto transport : transports) {
+        for (auto addr : regions) {
+            int ret = transport->unregisterLocalMemory(addr, false);
+            if (ret && ret != ERR_ADDRESS_NOT_REGISTERED && !first_error)
+                first_error = ret;
+        }
+    }
+    if (!transports.empty()) {
+        int metadata_ret = metadata_->updateLocalSegmentDesc();
+        if (!first_error) first_error = metadata_ret;
+    }
+    if (first_error) return first_error;
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    for (auto addr : regions) {
+        clearSkipRegistrationLocked(addr);
+        eraseMemoryRegionLocked(addr);
+    }
+    return 0;
+}
+
+void TransferEngineImpl::retryFailedRollbacks() {
+    if (failed_rollbacks_.empty()) return;
+    if (releaseReusableRegions(failed_rollbacks_) == 0)
+        failed_rollbacks_.clear();
+}
+
 int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
                                             const std::string& location,
                                             bool remote_accessible,
                                             bool update_metadata) {
+    if (memory_registration_reuse_)
+        return registerReusableMemory({{addr, length}}, location);
     if (length == 0) {
         LOG(ERROR)
             << "Transfer Engine does not support zero length memory region";
@@ -797,6 +988,7 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
 
 int TransferEngineImpl::unregisterLocalMemory(void* addr,
                                               bool update_metadata) {
+    if (memory_registration_reuse_) return unregisterReusableMemory({addr});
     // Best-effort: try every transport so one failure can't leave the region
     // registered on the others; mirrors unregisterLocalMemoryBatch (#2869).
     int first_error = 0;
@@ -807,6 +999,7 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
     if (first_error) return first_error;
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    clearSkipRegistrationLocked(addr);
     eraseMemoryRegionLocked(addr);
     return 0;
 }
@@ -817,6 +1010,7 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
 int TransferEngineImpl::mp_registerLocalMemory(
     std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
         buffer_map) {
+    if (memory_registration_reuse_) return ERR_NOT_IMPLEMENTED;
     // ========== Phase 1: Pre-check ==========
     for (const auto& entry : buffer_map) {
         for (const auto& buffer : entry.second) {
@@ -899,11 +1093,16 @@ void TransferEngineImpl::rollbackAllRegistrations(
             record.transport->unregisterLocalMemory(record.addr, true);
         }
     }
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    for (const auto& record : records) {
+        clearSkipRegistrationLocked(record.addr);
+    }
 }
 
 int TransferEngineImpl::mp_unregisterLocalMemory(
     std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
         buffer_map) {
+    if (memory_registration_reuse_) return ERR_NOT_IMPLEMENTED;
     for (const auto& buffer_entry : buffer_map) {
         const std::string& protocol = buffer_entry.first;
         const std::vector<RegisteredBuffer>& buffer_list = buffer_entry.second;
@@ -924,6 +1123,7 @@ int TransferEngineImpl::mp_unregisterLocalMemory(
 
         std::unique_lock<std::shared_mutex> lock(mutex_);
         for (const auto& buffer : buffer_list) {
+            if (protocol == "rdma") clearSkipRegistrationLocked(buffer.addr);
             eraseMemoryRegionLocked(buffer.addr);
         }
     }
@@ -932,6 +1132,13 @@ int TransferEngineImpl::mp_unregisterLocalMemory(
 #endif
 
 int TransferEngineImpl::registerLocalMemoryBatch(
+    const std::vector<BufferEntry>& buffer_list, const std::string& location) {
+    if (memory_registration_reuse_)
+        return registerReusableMemory(buffer_list, location);
+    return registerLocalMemoryBatchImpl(buffer_list, location);
+}
+
+int TransferEngineImpl::registerLocalMemoryBatchImpl(
     const std::vector<BufferEntry>& buffer_list, const std::string& location) {
     std::vector<BufferEntry> sorted_buffers = buffer_list;
     std::sort(sorted_buffers.begin(), sorted_buffers.end(),
@@ -979,17 +1186,34 @@ int TransferEngineImpl::registerLocalMemoryBatch(
         attempted_transports.push_back(transport);
         int ret = transport->registerLocalMemoryBatch(buffer_list, location);
         if (ret) {
+            // The transport only reports the regions that failed. The ones
+            // that did register are released below too, so say so here.
+            LOG(ERROR) << "Failed to register a batch of " << buffer_list.size()
+                       << " memory region(s) with transport "
+                       << transport->getName() << " (ret=" << ret
+                       << "); unregistering the whole batch, so none of its "
+                          "regions stays registered";
+            bool rollback_failed = false;
             for (auto it = attempted_transports.rbegin();
                  it != attempted_transports.rend(); ++it) {
                 int rollback_ret = (*it)->unregisterLocalMemoryBatch(addr_list);
                 if (rollback_ret != 0 &&
                     rollback_ret != ERR_ADDRESS_NOT_REGISTERED) {
+                    rollback_failed = true;
                     LOG(WARNING)
                         << "Failed to roll back batch registration for "
                         << (*it)->getName() << ", ret=" << rollback_ret;
                 }
             }
-            releaseMemoryRegions(regions);
+            if (rollback_failed && memory_registration_reuse_) {
+                for (auto& region : regions) {
+                    region.releasing = true;
+                    failed_rollbacks_.push_back(region.addr);
+                }
+                commitMemoryRegions(regions);
+            } else {
+                releaseMemoryRegions(regions);
+            }
             return ret;
         }
     }
@@ -1000,6 +1224,12 @@ int TransferEngineImpl::registerLocalMemoryBatch(
 
 int TransferEngineImpl::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
+    if (memory_registration_reuse_) return unregisterReusableMemory(addr_list);
+    return unregisterLocalMemoryBatchImpl(addr_list);
+}
+
+int TransferEngineImpl::unregisterLocalMemoryBatchImpl(
+    const std::vector<void*>& addr_list) {
     int first_error = 0;
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemoryBatch(addr_list);
@@ -1009,6 +1239,7 @@ int TransferEngineImpl::unregisterLocalMemoryBatch(
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (auto& addr : addr_list) {
+        clearSkipRegistrationLocked(addr);
         eraseMemoryRegionLocked(addr);
     }
     return 0;
@@ -1079,6 +1310,7 @@ void TransferEngineImpl::releaseMemoryRegions(
     const std::vector<MemoryRegion>& regions) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (const auto& region : regions) {
+        clearSkipRegistrationLocked(region.addr);
         registering_memory_regions_.erase(
             reinterpret_cast<uintptr_t>(region.addr));
     }
@@ -1090,6 +1322,15 @@ void TransferEngineImpl::insertMemoryRegionLocked(const MemoryRegion& region) {
 
 void TransferEngineImpl::eraseMemoryRegionLocked(void* addr) {
     local_memory_regions_.erase(reinterpret_cast<uintptr_t>(addr));
+}
+
+void TransferEngineImpl::clearSkipRegistrationLocked(void* addr) {
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+    // Clear the skip record before releasing mutex_ and allowing address reuse.
+    auto* rdma =
+        dynamic_cast<RdmaTransport*>(multi_transports_->getTransport("rdma"));
+    if (rdma) rdma->clearSkipRegistration(addr);
+#endif
 }
 
 #ifdef WITH_METRICS
@@ -1131,6 +1372,11 @@ void TransferEngineImpl::InitializeMetricsConfig() {
                          << interval_env
                          << ", using default: " << metrics_interval_seconds_;
         }
+    }
+
+    if (metrics_enabled_) {
+        TransferEngineMetrics::enable();
+        TransferEngineMetrics::instance().initializeFromEnv();
     }
 }
 

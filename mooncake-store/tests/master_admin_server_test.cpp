@@ -24,8 +24,9 @@
 #include "ha/ha_types.h"
 #include "master_admin_service.h"
 #include "master_config.h"
+#include "master_metric_manager.h"
 #include "rpc_service.h"
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 #include "version.h"
 
@@ -738,6 +739,12 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
     EXPECT_EQ(seg_status.http_status, 503);
     EXPECT_NE(seg_status.body.find(unavailable_msg), std::string::npos);
 
+    auto set_seg_status =
+        HttpPutJson(port, "/api/v1/segments/status?segment=foo",
+                    R"({"status":"DRAINING"})");
+    EXPECT_EQ(set_seg_status.http_status, 503);
+    EXPECT_NE(set_seg_status.body.find(unavailable_msg), std::string::npos);
+
     auto tenant_quotas = HttpGet(port, "/api/v1/tenant_quotas");
     EXPECT_EQ(tenant_quotas.http_status, 503);
     EXPECT_NE(tenant_quotas.body.find(unavailable_msg), std::string::npos);
@@ -986,6 +993,13 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
         return {result.status, std::string(result.resp_body)};
     }
 
+    HttpResponse HttpPutJson(const std::string& path, const std::string& body) {
+        coro_http::coro_http_client client;
+        auto result = async_simple::coro::syncAwait(client.async_put(
+            BaseUrl() + path, body, coro_http::req_content_type::json));
+        return {result.status, std::string(result.resp_body)};
+    }
+
     static std::string BaseUrl() {
         return "http://127.0.0.1:" + std::to_string(port_);
     }
@@ -1006,6 +1020,63 @@ Segment MasterAdminServerWithServiceTest::segment_;
 // -----------------------------------------------------------------------
 // GET /get_all_keys
 // -----------------------------------------------------------------------
+
+TEST_F(MasterAdminServerWithServiceTest, StandaloneSoftPinHttp) {
+    auto pin = HttpPostJson("/api/v1/soft_pin",
+                            std::string("{\"keys\":[\"") + kDefaultKey +
+                                "\",\"absent-pin-key\"],\"ttl_ms\":60000}");
+    ASSERT_EQ(pin.http_status, 200);
+    EXPECT_NE(pin.body.find("\"error_code\":0"), std::string::npos);
+    EXPECT_NE(pin.body.find("-704"), std::string::npos);
+    auto unpin =
+        HttpPostJson("/api/v1/soft_unpin",
+                     std::string("{\"keys\":[\"") + kDefaultKey + "\"]}");
+    ASSERT_EQ(unpin.http_status, 200);
+    EXPECT_NE(unpin.body.find("\"error_code\":0"), std::string::npos);
+    EXPECT_TRUE(service_->ExistKey(kDefaultKey).value());
+    for (const auto& body :
+         {"not-json", "{}", "{\"keys\":[\"a\"]}", "{\"keys\":[],\"ttl_ms\":1}",
+          "{\"keys\":[\"a\"],\"ttl_ms\":-1}"}) {
+        EXPECT_EQ(HttpPostJson("/api/v1/soft_pin", body).http_status, 400);
+    }
+    EXPECT_EQ(
+        HttpPostJson("/api/v1/soft_unpin", "{\"keys\":[\"a\"],\"ttl_ms\":1}")
+            .http_status,
+        400);
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       SoftPinRejectsTrailingContentWithoutChangingState) {
+    const auto pin =
+        std::string("{\"keys\":[\"") + kDefaultKey + "\"],\"ttl_ms\":60000}";
+    const auto unpin = std::string("{\"keys\":[\"") + kDefaultKey + "\"]}";
+    ASSERT_EQ(HttpPostJson("/api/v1/soft_unpin", unpin).http_status, 200);
+    const auto baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+    const std::vector<std::string> suffixes = {
+        " trailing-garbage", " {}", "\n[]", std::string(1, '\0'), "\v"};
+    for (const auto& suffix : suffixes) {
+        EXPECT_EQ(HttpPostJson("/api/v1/soft_pin", pin + suffix).http_status,
+                  400);
+        EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+                  baseline);
+    }
+    ASSERT_EQ(HttpPostJson("/api/v1/soft_pin", pin + " \t\r\n").http_status,
+              200);
+    ASSERT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline + 1);
+    for (const auto& suffix : suffixes) {
+        EXPECT_EQ(
+            HttpPostJson("/api/v1/soft_unpin", unpin + suffix).http_status,
+            400);
+        EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+                  baseline + 1);
+    }
+    ASSERT_EQ(HttpPostJson("/api/v1/soft_unpin", unpin + " \t\r\n").http_status,
+              200);
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+}
 
 TEST_F(MasterAdminServerWithServiceTest, GetAllKeysReturnsKeys) {
     auto resp = HttpGet("/get_all_keys");
@@ -1218,6 +1289,76 @@ TEST_F(MasterAdminServerWithServiceTest, CancelDrainJobSucceeds) {
     EXPECT_EQ(cancel_parsed.status, "CANCELED");
 }
 
+TEST_F(MasterAdminServerTest, CancelDrainJobReportsInFlightStatus) {
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 0;
+    config.enable_metric_reporting = false;
+    config.client_active_ttl_sec = 3600;
+    auto service = std::make_shared<WrappedMasterService>(config);
+    const UUID source_client = generate_uuid();
+    Segment source;
+    source.id = generate_uuid();
+    source.name = "admin_cancel_source";
+    source.te_endpoint = source.name;
+    source.base = 0x300000000;
+    source.size = 8 * 1024 * 1024;
+    Segment target;
+    target.id = generate_uuid();
+    target.name = "admin_cancel_target";
+    target.te_endpoint = target.name;
+    target.base = 0x400000000;
+    target.size = 8 * 1024 * 1024;
+    ASSERT_TRUE(service->MountSegment(source, source_client));
+    ASSERT_TRUE(service->MountSegment(target, generate_uuid()));
+    ReplicateConfig replica_config;
+    replica_config.replica_num = 1;
+    replica_config.preferred_segments = {source.name};
+    ASSERT_TRUE(service->PutStart(source_client, "admin_cancel_key", 1024,
+                                  replica_config));
+    ASSERT_TRUE(service->PutEnd(source_client,
+                                ObjectMeta{"admin_cancel_key", std::nullopt},
+                                ReplicaType::MEMORY));
+
+    CreateDrainJobRequest request;
+    request.segments = {source.name};
+    request.target_segments = {target.name};
+    request.max_concurrency = 1;
+    auto job_id = service->CreateDrainJob(request);
+    ASSERT_TRUE(job_id);
+    std::vector<TaskAssignment> assignments;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (assignments.empty() && std::chrono::steady_clock::now() < deadline) {
+        auto fetched = service->FetchTasks(source_client, 1);
+        ASSERT_TRUE(fetched);
+        assignments = std::move(*fetched);
+        if (assignments.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_EQ(assignments.size(), 1u);
+
+    const int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+    auto response = HttpPostJson(
+        port, "/api/v1/drain_jobs/cancel?job_id=" + UuidToString(*job_id), "");
+    ASSERT_EQ(response.http_status, 200);
+    HttpCancelDrainJobResponse parsed;
+    struct_json::from_json(parsed, response.body);
+    EXPECT_TRUE(parsed.success);
+    EXPECT_EQ(parsed.status, "CANCELING");
+
+    TaskCompleteRequest completion;
+    completion.id = assignments.front().id;
+    completion.status = TaskStatus::CANCELED;
+    ASSERT_TRUE(service->MarkTaskToComplete(source_client, completion));
+    admin.Stop();
+}
+
 TEST_F(MasterAdminServerWithServiceTest, CancelDrainJobFailsWithInvalidJobId) {
     auto resp = HttpPostJson("/api/v1/drain_jobs/cancel?job_id=not-a-uuid", "");
     EXPECT_EQ(resp.http_status, 400);
@@ -1253,6 +1394,82 @@ TEST_F(MasterAdminServerWithServiceTest,
        SegmentStatusReturnsErrorForNonexistentSegment) {
     auto resp = HttpGet("/api/v1/segments/status?segment=no_such_segment");
     EXPECT_EQ(resp.http_status, 404);
+}
+
+// -----------------------------------------------------------------------
+// PUT /api/v1/segments/status
+// -----------------------------------------------------------------------
+
+TEST_F(MasterAdminServerWithServiceTest,
+       SetSegmentStatusSwitchesBetweenOkAndDraining) {
+    std::string seg = "set_status_seg_" + UuidToString(generate_uuid());
+    Segment s;
+    s.id = generate_uuid();
+    s.name = seg;
+    s.base = 0xB00000000;
+    s.size = 4 * 1024 * 1024;
+    (void)service_->MountSegment(s, generate_uuid());
+    const std::string path = "/api/v1/segments/status?segment=" + seg;
+
+    for (const std::string target : {"DRAINING", "DRAINING", "OK"}) {
+        auto put_resp = HttpPutJson(path, R"({"status":")" + target + R"("})");
+        ASSERT_EQ(put_resp.http_status, 200);
+        HttpSegmentStatusResponse put_parsed;
+        struct_json::from_json(put_parsed, put_resp.body);
+        EXPECT_TRUE(put_parsed.success);
+        EXPECT_EQ(put_parsed.segment, seg);
+        EXPECT_EQ(put_parsed.status_name, target);
+
+        auto get_resp = HttpGet(path);
+        ASSERT_EQ(get_resp.http_status, 200);
+        HttpSegmentStatusResponse get_parsed;
+        struct_json::from_json(get_parsed, get_resp.body);
+        EXPECT_EQ(get_parsed.status_name, target);
+    }
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       SetSegmentStatusRejectsInvalidRequests) {
+    const std::string path = "/api/v1/segments/status?segment=" + segment_.name;
+    EXPECT_EQ(HttpPutJson(path, R"({"status":"DRAINED"})").http_status, 400);
+    EXPECT_EQ(HttpPutJson(path, R"({"status":"UNMOUNTING"})").http_status, 400);
+    EXPECT_EQ(HttpPutJson(path, "{}").http_status, 400);
+    EXPECT_EQ(HttpPutJson(path, "not json").http_status, 400);
+    EXPECT_EQ(HttpPutJson("/api/v1/segments/status", R"({"status":"DRAINING"})")
+                  .http_status,
+              400);
+
+    auto get_resp = HttpGet(path);
+    ASSERT_EQ(get_resp.http_status, 200);
+    HttpSegmentStatusResponse parsed;
+    struct_json::from_json(parsed, get_resp.body);
+    EXPECT_EQ(parsed.status_name, "OK");
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       SetSegmentStatusReturns404ForNonexistentSegment) {
+    auto resp = HttpPutJson("/api/v1/segments/status?segment=no_such_segment",
+                            R"({"status":"DRAINING"})");
+    EXPECT_EQ(resp.http_status, 404);
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       SetSegmentStatusReturns409ForSegmentUnderDrainJob) {
+    std::string seg = "set_status_drain_seg_" + UuidToString(generate_uuid());
+    Segment s;
+    s.id = generate_uuid();
+    s.name = seg;
+    s.base = 0xC00000000;
+    s.size = 4 * 1024 * 1024;
+    (void)service_->MountSegment(s, generate_uuid());
+
+    auto create_resp = HttpPostJson("/api/v1/drain_jobs",
+                                    R"({"segments":[")" + seg + R"("]})");
+    ASSERT_EQ(create_resp.http_status, 200);
+
+    auto resp = HttpPutJson("/api/v1/segments/status?segment=" + seg,
+                            R"({"status":"OK"})");
+    EXPECT_EQ(resp.http_status, 409);
 }
 
 // -----------------------------------------------------------------------

@@ -47,7 +47,7 @@ connector 和传输行为，但在
 ### 1. 脚本封装要求
 
 - **必须使用 Shell 脚本封装**：无论使用 Python 还是其他语言编写测试，最终都需要用 Shell 脚本封装
-- **脚本位置**：放置在 `scripts/` 目录下
+- **脚本位置**：共享用例放置在 `scripts/e2e/scripts/` 目录下
 - **命名规范**：以 `test_` 开头（例如：`test_1p1d_erdma.sh`）
 
 ### 2. 变量声明要求
@@ -192,7 +192,7 @@ run_test()
 
     echo "Running tests in container and saving output to: $log_file"
     ${docker_exec} "\
-        cd /test_workspace && \
+        cd /test_run/e2e/python && \
         python3 -m pytest test_demo.py -v -s --tb=long" | tee "$log_file"
 
     return ${PIPESTATUS[0]}

@@ -260,6 +260,77 @@ TEST(DeviceSelectorAvailabilityTest, PriorityFallbackKeepsUnavailableOut) {
     EXPECT_FALSE(sel->allocate(kMiB, 1, kMiB, "cpu:0", dev_ids, 2).ok());
 }
 
+// ---------------------------------------------------------------------------
+// closest_tier_only: smart mode keeps slices on the closest rank that holds an
+// eligible NIC, and moves to the next rank only when that one has none.
+// ---------------------------------------------------------------------------
+
+constexpr uint64_t kTierSlice = 64 << 10;
+constexpr uint32_t kTierSlices = 32;
+
+// "cuda:0" reaches dev0 directly (rank 0) and dev1 only across the host
+// bridge (rank 2), like a GPU with one PIX NIC.
+std::unique_ptr<DeviceSelector> makeTieredSelector(bool closest_tier_only) {
+    auto topo = twoRdmaNics();
+    Topology::MemEntry gpu;
+    gpu.name = "cuda:0";
+    gpu.type = Topology::MEM_CUDA;
+    gpu.numa_node = 0;
+    gpu.device_list[0] = {kDev0};
+    gpu.device_list[2] = {kDev1};
+    topo->mem_list_.push_back(gpu);
+
+    auto sel = std::make_unique<DeviceSelector>();
+    EXPECT_TRUE(sel->loadTopology(topo).ok());
+    DeviceSelector::SchedulingParams params;
+    params.closest_tier_only = closest_tier_only;
+    params.enable_priority_filtering = false;
+    sel->setSchedulingParams(params);
+    return sel;
+}
+
+Status allocateSlices(DeviceSelector& sel, std::vector<int>& devs,
+                      uint64_t device_mask = ~0ULL) {
+    return sel.allocate(kTierSlices * kTierSlice, kTierSlices, kTierSlice,
+                        "cuda:0", devs, PRIO_HIGH, device_mask);
+}
+
+int countOn(const std::vector<int>& devs, int dev) {
+    return static_cast<int>(std::count(devs.begin(), devs.end(), dev));
+}
+
+TEST(DeviceSelectorClosestTierTest, SmartModeKeepsSlicesOnClosestRank) {
+    std::vector<int> devs;
+    // Control: idle NICs score 1:10 by rank weight, so default spraying
+    // already sends some slices to the rank-2 NIC.
+    auto spray = makeTieredSelector(/*closest_tier_only=*/false);
+    ASSERT_TRUE(allocateSlices(*spray, devs).ok());
+    EXPECT_GT(countOn(devs, kDev1), 0);
+
+    // Never released, so dev0's backlog keeps growing; 200 calls also cover
+    // the every-100th round-robin probe.
+    auto pinned = makeTieredSelector(/*closest_tier_only=*/true);
+    for (int i = 0; i < 200; ++i) {
+        ASSERT_TRUE(allocateSlices(*pinned, devs).ok());
+        ASSERT_EQ(countOn(devs, kDev0), static_cast<int>(kTierSlices))
+            << "call " << i;
+    }
+}
+
+// The flag narrows the choice instead of pinning rank 0: a closest NIC that
+// is down or masked off by the rail must not fail the transfer.
+TEST(DeviceSelectorClosestTierTest, FallsThroughWhenClosestRankIsIneligible) {
+    std::vector<int> devs;
+    auto masked = makeTieredSelector(/*closest_tier_only=*/true);
+    ASSERT_TRUE(allocateSlices(*masked, devs, ~(1ULL << kDev0)).ok());
+    EXPECT_EQ(countOn(devs, kDev1), static_cast<int>(kTierSlices));
+
+    auto down = makeTieredSelector(/*closest_tier_only=*/true);
+    ASSERT_TRUE(down->setDeviceAvailable(kDev0, false).ok());
+    ASSERT_TRUE(allocateSlices(*down, devs).ok());
+    EXPECT_EQ(countOn(devs, kDev1), static_cast<int>(kTierSlices));
+}
+
 // The reviewer's scenario for a link that renegotiates lower: the learned
 // EWMA and the clamp derived from the old speed must both be replaced.
 TEST(DeviceSelectorBandwidthTest, ReseedOnLinkSpeedChangeReleasesStaleClamp) {

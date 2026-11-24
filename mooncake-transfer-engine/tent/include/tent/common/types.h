@@ -59,6 +59,10 @@ enum TransportType : int {
     MPCOMM,
     HP_TCP,
     XPU,
+    HYLINK,
+    FABRIC,
+    MLU,
+    MEMFABRIC,
     // Sentinel: must remain the last enumerator.
     kNumTransportTypes,
 };
@@ -100,8 +104,16 @@ inline const char* transportTypeName(TransportType type) {
             return "mpcomm";
         case HP_TCP:
             return "hp_tcp";
+        case MLU:
+            return "mlu";
         case XPU:
             return "xpu";
+        case HYLINK:
+            return "hylink";
+        case FABRIC:
+            return "fabric";
+        case MEMFABRIC:
+            return "memfabric";
         case kNumTransportTypes:
             return "unknown";
     }
@@ -124,6 +136,10 @@ inline TransportType parseTransportType(const std::string& str) {
     if (str == "mpcomm") return MPCOMM;
     if (str == "hp_tcp") return HP_TCP;
     if (str == "xpu") return XPU;
+    if (str == "mlu") return MLU;
+    if (str == "hylink") return HYLINK;
+    if (str == "fabric") return FABRIC;
+    if (str == "memfabric") return MEMFABRIC;
     return UNSPEC;
 }
 
@@ -161,6 +177,15 @@ struct Request {
     // and docs/source/design/tent/deadline-scheduling.md.
     uint64_t deadline_ns = 0;
     IntentType intent_type = IntentType::INTENT_UNSPEC;
+    // Optional producer-completion event (a cudaEvent_t on CUDA platforms).
+    // When set, the copy is ordered after the work captured by the event's
+    // most recent record, on the device and without blocking the caller, so
+    // the source may be produced on any application stream. The event must
+    // stay valid and must not be re-recorded until the request completes.
+    // Only transports reporting supportsProducerEvent() honor it; a request
+    // whose route cannot honor it (including staged routes) is rejected
+    // rather than submitted without the dependency.
+    void* producer_event = nullptr;
 };
 
 enum TransferStatusEnum {

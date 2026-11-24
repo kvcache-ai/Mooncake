@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -65,6 +66,36 @@ class StandbyMetadataStore final : public MetadataStore {
     size_t GetKeyCount() const override;
     void Clear();
 
+    bool PutWeightMetadata(const WeightRevisionMetadata& metadata) override;
+    bool PutWeightMetadataAndOperation(
+        const WeightRevisionMetadata& metadata,
+        const std::optional<WeightResidencyOperation>& operation) override;
+    std::optional<WeightRevisionMetadata> GetWeightMetadata(
+        const WeightRevisionIdentity& identity) const override;
+    std::optional<uint64_t> GetWeightMetadataTombstoneGeneration(
+        const WeightRevisionIdentity& identity) const override;
+    bool RemoveWeightMetadata(const WeightRevisionIdentity& identity,
+                              uint64_t metadata_generation) override;
+    bool PutWeightLease(const WeightRevisionLease& lease) override;
+    std::optional<WeightRevisionLease> GetWeightLease(
+        uint64_t lease_id) const override;
+    std::optional<WeightRevisionLease> GetWeightLeaseTombstone(
+        uint64_t lease_id) const override;
+    bool RemoveWeightLease(uint64_t lease_id,
+                           const WeightRevisionIdentity& identity,
+                           uint64_t fenced_metadata_generation) override;
+    bool PutWeightOperation(const WeightResidencyOperation& operation) override;
+    std::optional<WeightResidencyOperation> GetWeightOperation(
+        uint64_t operation_id) const override;
+    bool RestoreWeightMetadata(const WeightMetadataSnapshot& snapshot);
+    WeightMetadataSnapshot SnapshotWeightMetadata() const;
+    bool ApplyObjectReplicaMutation(
+        const std::string& tenant_id, const std::string& key,
+        const ObjectReplicaMutation& mutation) override;
+    bool RestoreObjectReplicas(const ObjectReplicaSnapshot& snapshot);
+    ObjectReplicaSnapshot SnapshotObjectReplicas() const;
+    bool HasObjectReplicaState() const;
+
     void Snapshot(std::vector<StandbyObjectEntry>& out) const;
     bool ValidateReplicaIds(ReplicaID& max_replica_id) const;
     bool DrainChunk(size_t count, std::vector<StandbyObjectEntry>& out);
@@ -76,6 +107,16 @@ class StandbyMetadataStore final : public MetadataStore {
    private:
     mutable std::mutex mutex_;
     TenantStore store_;
+    std::optional<ObjectReplicaTarget> object_storage_target_;
+    std::map<std::string, ObjectUploadRecord> object_uploads_;
+    std::unordered_map<ReplicaID, std::string> object_upload_names_;
+    std::map<WeightRevisionIdentity, WeightRevisionMetadata> weight_metadata_;
+    std::map<WeightRevisionIdentity, uint64_t> weight_metadata_tombstones_;
+    std::unordered_map<uint64_t, WeightRevisionLease> weight_leases_;
+    std::unordered_map<uint64_t, WeightRevisionLease> weight_lease_tombstones_;
+    std::unordered_map<uint64_t, WeightResidencyOperation> weight_operations_;
+    uint64_t next_weight_lease_id_{1};
+    uint64_t next_weight_operation_id_{1};
 };
 
 }  // namespace mooncake

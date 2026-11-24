@@ -50,6 +50,8 @@ class Transport {
         SubBatch() : device_mask(~0ULL) {}
         virtual ~SubBatch() {}
         virtual size_t size() const = 0;
+        // Opt in when completion cannot emit a second progress wake.
+        virtual bool needsProgressPolling() const { return false; }
         void notifyProgress() {
             if (notify_progress) notify_progress(progress_batch_id);
         }
@@ -128,6 +130,10 @@ class Transport {
     // task reaches a terminal state.
     virtual bool supportsCancellation() const { return false; }
 
+    // True when submitTransferTasks() orders each copy after
+    // Request::producer_event on the device.
+    virtual bool supportsProducerEvent() const { return false; }
+
     virtual Status cancelTransferTask(SubBatchRef batch, int task_id) {
         return Status::NotImplemented(
             "cancelTransferTask not implemented" LOC_MARK);
@@ -190,6 +196,10 @@ class Transport {
     virtual Status getNicLoadStats(std::vector<NicLoadStats>&) const {
         return Status::OK();
     }
+
+    // Worker submission must preserve caller-thread context and execution
+    // dependencies. Ordinary failure/timeout and cleanup semantics still apply.
+    virtual bool supportsParallelBatchSubmit() const { return false; }
 
    protected:
     Capabilities caps;

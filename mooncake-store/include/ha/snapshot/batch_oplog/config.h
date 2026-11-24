@@ -23,6 +23,12 @@ inline std::optional<std::string> ValidateBatchOpLogSnapshotConfig(
     if (config.snapshot_chunk_object_count == 0) {
         return "snapshot_chunk_object_count must be greater than 0";
     }
+    if (config.oplog_prune_chunk_batch_count == 0) {
+        return "oplog_prune_chunk_batch_count must be greater than 0";
+    }
+    if (config.oplog_prune_max_batches_per_second == 0) {
+        return "oplog_prune_max_batches_per_second must be greater than 0";
+    }
     if (ha::BuildBatchOpLogSnapshotRoot(config.cluster_id).empty()) {
         return "enable_oplog_snapshot requires a valid cluster_id";
     }

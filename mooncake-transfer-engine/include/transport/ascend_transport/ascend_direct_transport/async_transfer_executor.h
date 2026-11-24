@@ -45,6 +45,9 @@ class AsyncTransferExecutor : public TransferExecutorBase {
         adxl::TransferOp operation,
         const std::vector<Transport::Slice*>& slice_list) override;
 
+   protected:
+    void drainInFlightTransfers() override;
+
    private:
     struct QueryBatch {
         std::vector<Transport::Slice*> slices;
@@ -66,6 +69,9 @@ class AsyncTransferExecutor : public TransferExecutorBase {
 
     void queryThreadLoop();
     void fetchPendingBatches(std::vector<QueryBatch>& out_batches);
+    // Fails batches still queued or unfinished when the query thread stops,
+    // and drops their active_async_tasks_ count.
+    void abandonInFlightBatches(std::vector<QueryBatch>& pending);
     void processOneBatch(QueryBatch& batch, BatchPollResult& result);
     void failAllPendingOnRoute(size_t engine_idx, const std::string& target,
                                std::vector<QueryBatch>& pending,

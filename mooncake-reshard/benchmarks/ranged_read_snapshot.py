@@ -49,7 +49,7 @@ def import_store():
     runtime = os.environ["RUNTIME_PY"]
     if runtime not in sys.path:
         sys.path.insert(0, runtime)
-    import store
+    from mooncake import _store as store
 
     return store
 

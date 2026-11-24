@@ -248,6 +248,43 @@ AttemptResult RestorePointer(
         return Invalid();
     }
 
+    if (manifest.object_storage) {
+        const auto& objects = *manifest.object_storage;
+        if (objects.key != ha::BuildBatchOpLogSnapshotObjectStorageKey(
+                               snapshot_root, descriptor.snapshot_id))
+            return Invalid();
+        std::vector<uint8_t> bytes;
+        auto read =
+            ReadVerifiedObject(object_store, objects.key, objects.stored_size,
+                               objects.crc32c, bytes);
+        if (read.disposition != AttemptDisposition::kSuccess) return read;
+        ObjectReplicaSnapshot restored;
+        if (struct_pack::deserialize_to(restored, bytes) !=
+                struct_pack::errc::ok ||
+            !metadata.RestoreObjectReplicas(restored))
+            return Invalid(ErrorCode::DESERIALIZE_FAIL);
+    }
+    if (manifest.weight_metadata) {
+        const auto& weights = *manifest.weight_metadata;
+        if (weights.key != ha::BuildBatchOpLogSnapshotWeightMetadataKey(
+                               snapshot_root, descriptor.snapshot_id)) {
+            return Invalid();
+        }
+        std::vector<uint8_t> weight_bytes;
+        auto read_weights =
+            ReadVerifiedObject(object_store, weights.key, weights.stored_size,
+                               weights.crc32c, weight_bytes);
+        if (read_weights.disposition != AttemptDisposition::kSuccess) {
+            return read_weights;
+        }
+        auto decoded_weights =
+            DecodeBatchOpLogSnapshotWeightMetadata(weight_bytes);
+        if (!decoded_weights ||
+            !metadata.RestoreWeightMetadata(*decoded_weights)) {
+            return Invalid(ErrorCode::DESERIALIZE_FAIL);
+        }
+    }
+
     std::unique_ptr<OpLogApplier> owned_applier;
     OpLogApplier* applier = supplied_applier;
     if (applier == nullptr) {
@@ -320,6 +357,10 @@ AttemptResult RestorePointer(
         metrics.chunk_bytes = chunk_bytes;
         metrics.snapshot_bytes =
             metrics.chunk_bytes + manifest.segments.stored_size +
+            (manifest.weight_metadata ? manifest.weight_metadata->stored_size
+                                      : 0) +
+            (manifest.object_storage ? manifest.object_storage->stored_size
+                                     : 0) +
             descriptor.manifest_size + pointer_bytes.size();
     });
     return {AttemptDisposition::kSuccess,
