@@ -204,6 +204,10 @@ int TransferEngine::removeLocalSegment(const std::string& segment_name) {
     return impl_->removeLocalSegment(segment_name);
 }
 
+int TransferEngine::enableMemoryRegistrationReuse() {
+    return impl_->enableMemoryRegistrationReuse();
+}
+
 int TransferEngine::registerLocalMemory(void* addr, size_t length,
                                         const std::string& location,
                                         bool remote_accessible,
@@ -896,6 +900,11 @@ int TransferEngine::removeLocalSegment(const std::string& segment_name) {
         return 0;
     else
         return impl_->removeLocalSegment(segment_name);
+}
+
+int TransferEngine::enableMemoryRegistrationReuse() {
+    if (use_tent_) return ERR_NOT_IMPLEMENTED;
+    return impl_->enableMemoryRegistrationReuse();
 }
 
 int TransferEngine::registerLocalMemory(void* addr, size_t length,
