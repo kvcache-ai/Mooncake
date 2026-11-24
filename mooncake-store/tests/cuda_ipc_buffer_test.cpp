@@ -58,8 +58,8 @@ int Export(int fd, void *&allocation) {
         return 2;
     }
     auto handle = mooncake::device::ExportCudaIpcBuffer(allocation, kBytes);
-    if (!handle || !handle->has_device_uuid) return 3;
-    // An invalid exporter ordinal forces the importer to use the UUID.
+    if (!handle || !handle->has_pci_bus_id) return 3;
+    // An invalid exporter ordinal forces the importer to use the PCI bus ID.
     handle->device_id = -1;
     return Transfer(fd, *handle, true) ? 0 : 4;
 }
@@ -98,6 +98,6 @@ int main() {
         return 1;
     }
     std::puts(
-        "PASS: uninitialized importer resolved UUID and read exact bytes");
+        "PASS: uninitialized importer resolved PCI bus ID and read exact bytes");
     return 0;
 }

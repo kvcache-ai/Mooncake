@@ -10,15 +10,20 @@
 namespace mooncake {
 
 constexpr size_t kCudaIpcHandleSize = 64;
-constexpr size_t kCudaDeviceUuidSize = 16;
+// cudaDeviceGetPCIBusId writes a null-terminated bus ID; 32 bytes is enough.
+constexpr size_t kCudaPciBusIdSize = 32;
 
 struct CudaIpcBufferHandle {
     std::array<uint8_t, kCudaIpcHandleSize> handle{};
     uint64_t offset = 0;
     uint64_t size = 0;
+    // Exporter-local ordinal under its CUDA_VISIBLE_DEVICES; keep for logging
+    // / backward compatibility. Prefer pci_bus_id when opening.
     int32_t device_id = -1;
-    std::array<uint8_t, kCudaDeviceUuidSize> device_uuid{};
-    bool has_device_uuid = false;
+    // Stable GPU identity across CUDA_VISIBLE_DEVICES remapping
+    // (cudaDeviceGetPCIBusId). has_pci_bus_id false means a legacy exporter.
+    std::array<char, kCudaPciBusIdSize> pci_bus_id{};
+    bool has_pci_bus_id = false;
 };
 
 struct CudaIpcShmBufferRef {
@@ -42,7 +47,7 @@ struct CudaIpcReadRequest {
 }  // namespace mooncake
 
 YLT_REFL(mooncake::CudaIpcBufferHandle, handle, offset, size, device_id,
-         device_uuid, has_device_uuid);
+         pci_bus_id, has_pci_bus_id);
 YLT_REFL(mooncake::CudaIpcShmBufferRef, ptr, size);
 YLT_REFL(mooncake::CudaIpcWriteRequest, key, metadata, payload);
 YLT_REFL(mooncake::CudaIpcReadRequest, key, destination, source_offset, size);
