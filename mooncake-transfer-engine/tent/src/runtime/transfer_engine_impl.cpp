@@ -3305,10 +3305,6 @@ Status TransferEngineImpl::refillDispatchWindow() {
     // Queue is off by default; skip the global lock on the poll hot path.
     if (!runtime_queue_config_.enabled) return Status::OK();
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
-    // No bounded wait is linked on the common path. An expired node stays
-    // linked until that waitTransfer returns, so a refill before the return
-    // still refuses the batch. One batch can be canceled twice when two of
-    // its waits have expired; the second call finds nothing queued.
     if (bounded_waits_ != nullptr) {
         const auto now = std::chrono::steady_clock::now();
         for (BoundedWait* wait = bounded_waits_; wait != nullptr;
@@ -4322,17 +4318,12 @@ Status TransferEngineImpl::waitTransfer(
     // A poll can outlast this deadline and complete the in-window request
     // before the loop below notices. Link the deadline first so the refill
     // that follows that completion cancels owners still in the queue.
-    // The node is on this stack. A second waiter links its own, and this
-    // guard unlinks only this one.
     BoundedWait bounded_wait;
     struct WaitDeadlineGuard {
         TransferEngineImpl& engine;
         BoundedWait& wait;
         ~WaitDeadlineGuard() { engine.unlinkBoundedWait(wait); }
     };
-    // timeout_ms == 0 is an unbounded wait: its deadline is "now", but
-    // timed_out() stays false. Do not arm admission off that value. With the
-    // queue disabled, refill never reads the list.
     if (runtime_queue_config_.enabled && timeout_ms != 0 &&
         deadline != std::chrono::steady_clock::time_point::max()) {
         bounded_wait.batch_id = batch_id;

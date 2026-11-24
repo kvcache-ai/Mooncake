@@ -560,8 +560,7 @@ class TransferEngineImpl {
 
     // One node per bounded waitTransfer, living on that call's stack. Refill
     // walks bounded_waits_ instead of every queued owner. The node stays
-    // linked until its own wait returns, so a second wait cannot overwrite
-    // this deadline and one return cannot clear the other.
+    // linked until its own wait returns.
     struct BoundedWait {
         BoundedWait* next = nullptr;
         BatchID batch_id = 0;

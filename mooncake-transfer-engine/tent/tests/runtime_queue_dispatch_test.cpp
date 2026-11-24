@@ -743,8 +743,7 @@ TEST(RuntimeQueueDispatch, EarlierDeadlineStillCancelsWhenAnotherWaitIsArmed) {
     // The poll runs under the queue lock, so the first poll must return
     // quickly. Otherwise the second waitTransfer cannot link its own
     // deadline. Once both threads have polled, the next poll sleeps past the
-    // shorter deadline and completes the in-window request. Refill has to
-    // honor that shorter deadline even if the longer wait linked last.
+    // shorter deadline and completes the in-window request.
     struct SeenWaiters {
         std::mutex mu;
         std::thread::id ids[2]{};
