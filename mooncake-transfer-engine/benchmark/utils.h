@@ -107,6 +107,7 @@ struct XferBenchConfig {
     static size_t hugepage_size;
     static std::string hugetlbfs_path;
     static bool notifi;
+    static bool poll_backoff;
     static std::string tent_transport_hint;
     static std::string tent_intent_type;
 

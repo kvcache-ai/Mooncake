@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #include "tent_backend.h"
-#include "tent_polling.h"
 #include "utils.h"
 #include "split_output.h"
 #include "char_util.h"
@@ -401,23 +400,6 @@ int TENTBenchRunner::startInitiator(int num_threads) {
         target_infos_.push_back(std::move(info));
     }
     LOG(INFO) << "Opened " << target_handles_.size() << " target segments";
-    initiator_threads_ = num_threads;
-    host_rdma_waits_ =
-        (transport_hint_ == RDMA || XferBenchConfig::xport_type == "rdma") &&
-        !pinned_buffer_seg_type_.empty() &&
-        std::all_of(pinned_buffer_seg_type_.begin(),
-                    pinned_buffer_seg_type_.end(),
-                    [](const auto& type) { return type == "dram"; }) &&
-        std::all_of(
-            target_infos_.begin(), target_infos_.end(), [](const auto& info) {
-                return !info.buffers.empty() &&
-                       std::all_of(
-                           info.buffers.begin(), info.buffers.end(),
-                           [](const auto& buffer) {
-                               return LocationParser(buffer.location).type() ==
-                                      "cpu";
-                           });
-            });
     startWorkers(num_threads);
     return 0;
 }
@@ -591,9 +573,8 @@ double TENTBenchRunner::runSingleTransfer(
     const uint64_t submit_ns = splitOutputEnabled() ? timer.lap_ns(false) : 0;
     uint64_t polls = 0;
     TransferStatus overall_status;
-    const bool backoff = useTentPollingBackoff(
-        host_rdma_waits_, initiator_threads_, block_size, batch_size);
-    auto polled = waitForBatch(batch_id, overall_status, polls, backoff);
+    auto polled = waitForBatch(batch_id, overall_status, polls,
+                               XferBenchConfig::poll_backoff);
     if (!polled.ok()) {
         LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
         noteTransferFailed();

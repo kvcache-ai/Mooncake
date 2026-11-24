@@ -155,6 +155,10 @@ DEFINE_string(
     "default (/dev/hugepages, /dev/hugepages-512M, /dev/hugepages-1G).");
 DEFINE_bool(notifi, false,
             "Enable RDMA notification for performance measurement.");
+DEFINE_bool(poll_backoff, false,
+            "tent only: back off between batch status polls (128 busy polls, "
+            "then 1 us sleeps) to cut initiator CPU. Off keeps hot polling, "
+            "so results stay comparable across thread counts and sizes.");
 DEFINE_string(tent_transport_hint, "unspec",
               "tent only: per-request transport_hint. "
               "unspec|rdma|tcp|hp_tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|"
@@ -206,6 +210,7 @@ bool XferBenchConfig::use_hugepage = false;
 size_t XferBenchConfig::hugepage_size = 0;
 std::string XferBenchConfig::hugetlbfs_path;
 bool XferBenchConfig::notifi = false;
+bool XferBenchConfig::poll_backoff = false;
 std::string XferBenchConfig::tent_transport_hint;
 std::string XferBenchConfig::tent_intent_type;
 
@@ -301,6 +306,7 @@ void XferBenchConfig::loadFromFlags() {
     hugepage_size = parsed_hp.value_or(static_cast<size_t>(-1));
     hugetlbfs_path = FLAGS_hugetlbfs_path;
     notifi = FLAGS_notifi;
+    poll_backoff = FLAGS_poll_backoff;
     tent_transport_hint = FLAGS_tent_transport_hint;
     tent_intent_type = FLAGS_tent_intent_type;
 

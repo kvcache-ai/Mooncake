@@ -183,8 +183,6 @@ class TENTBenchRunner : public BenchRunner {
     std::vector<SegmentInfo> target_infos_;
     TransportType transport_hint_{UNSPEC};
     IntentType intent_type_{IntentType::INTENT_UNSPEC};
-    int initiator_threads_{0};
-    bool host_rdma_waits_{false};
     // Batches that may still be in flight (see waitForBatch); while non-zero
     // teardown retains both the engine and its local buffers until process
     // exit.
