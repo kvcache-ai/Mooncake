@@ -788,7 +788,7 @@ jobs:
             metrics_flags: ''
             build_targets: >-
               mooncake-transfer-engine/all
-              transfer_task_test standalone_client_test
+              transfer_task_test standalone_client_test engine
           - name: cuda-off-metrics-on
             cmake_flags: '-DUSE_CUDA=OFF -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF'
             need_cuda: false
