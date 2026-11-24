@@ -248,6 +248,7 @@ Status MluTransport::uninstall() {
     metadata_.reset();
     platform_ = nullptr;
     installed_ = false;
+    ipc_enabled_ = false;
     machine_id_.clear();
     return Status::OK();
 }
@@ -703,6 +704,9 @@ Status MluTransport::freeLocalMemory(void *addr, size_t size) {
 
 Status MluTransport::addMemoryBuffer(BufferDesc &desc,
                                      const MemoryOptions &options) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!installed_ || !platform_)
+        return Status::InvalidArgument("MLU transport is not installed");
     LocationParser location(desc.location);
     if (location.type() != "mlu" && location.type() != "cpu" &&
         location.type() != kWildcardLocation) {
@@ -780,8 +784,7 @@ bool MluTransport::mayMapRemoteBuffer(SegmentID target_id,
         machine_id_.empty() || segment.machine_id != machine_id_)
         return false;
     auto it = entry.transport_attrs.find(MLU);
-    IpcAttr attr;
-    return it != entry.transport_attrs.end() && parseIpcAttr(it->second, attr);
+    return it != entry.transport_attrs.end() && !it->second.empty();
 }
 
 bool MluTransport::prepareRemoteBuffer(SegmentID target_id,

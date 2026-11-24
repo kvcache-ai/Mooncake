@@ -518,7 +518,7 @@ TEST_F(MluTransportTest, RejectsLegacyAndMalformedIpcAttributesBeforeMapping) {
         auto entry = ipcBuffer(0x1000, kChunk, 101);
         entry.transport_attrs[MLU] = text;
         auto segment = ipcSnapshot(1, {entry});
-        EXPECT_FALSE(transport_.mayMapRemoteBuffer(target_id, segment, entry));
+        EXPECT_TRUE(transport_.mayMapRemoteBuffer(target_id, segment, entry));
         EXPECT_FALSE(transport_.prepareRemoteBuffer(
             target_id, segment, entry, source.data(), Request::WRITE));
     }

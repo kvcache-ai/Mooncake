@@ -109,18 +109,22 @@ Status MluPlatform::deviceByPciBusId(const std::string& identity, int& device) {
     device = -1;
     if (identity.empty())
         return Status::InvalidArgument("Empty MLU PCI bus identity");
+    std::string normalized(identity);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
     std::lock_guard<std::mutex> lock(pci_devices_mutex_);
-    const auto found = pci_devices_.find(identity);
+    const auto found = pci_devices_.find(normalized);
     if (found != pci_devices_.end()) {
         device = found->second;
         return Status::OK();
     }
     int resolved = -1;
-    CHECK_STATUS(checked(cnrtDeviceGetByPCIBusId(&resolved, identity.c_str())));
+    CHECK_STATUS(
+        checked(cnrtDeviceGetByPCIBusId(&resolved, normalized.c_str())));
     if (resolved < 0)
         return Status::InternalError("Invalid MLU device ordinal");
     // Cache only successful lookups so runtime errors remain retryable.
-    pci_devices_.emplace(identity, resolved);
+    pci_devices_.emplace(std::move(normalized), resolved);
     device = resolved;
     return Status::OK();
 }
