@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <initializer_list>
 #include <iostream>
-#include <string>
 
-#include "transfer_engine/transfer_engine_py.h"
+#include "transfer_engine/cuda_host_func_guard.h"
 
 int main() {
+    using mooncake::isCudaHostFuncUnsupportedProtocol;
+
     int failures = 0;
     const auto expect = [&failures](bool condition, const char* message) {
         if (!condition) {
@@ -28,7 +30,7 @@ int main() {
 
     expect(isCudaHostFuncUnsupportedProtocol("nvlink_intra"),
            "nvlink_intra must be rejected before cudaLaunchHostFunc");
-    for (const std::string& protocol : {"", "tcp", "rdma", "shm"}) {
+    for (const char* protocol : {"", "tcp", "rdma", "shm"}) {
         expect(!isCudaHostFuncUnsupportedProtocol(protocol),
                "non-NVLink transport must remain available");
     }

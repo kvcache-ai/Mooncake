@@ -174,6 +174,8 @@ class TcpTransport : public Transport {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 
+    bool supportsParallelBatchSubmit() const override { return true; }
+
    private:
     int install(std::string &local_server_name,
                 std::shared_ptr<TransferMetadata> meta,

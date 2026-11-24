@@ -303,6 +303,62 @@ peer publishes its own topology and may not run this policy, so failing a slice
 because another host has no local rail would turn a local setting into a
 cross-node outage.
 
+### Closest Tier Only
+
+```json
+{
+  "transports": {
+    "rdma": {
+      "closest_tier_only": true
+    }
+  }
+}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `closest_tier_only` | bool | `false` | Use only the closest NIC tier on both ends of a slice |
+
+Two choices can put a slice on a NIC farther from the GPU than needed. The
+remote NIC comes from the rail mapping and is kept from any tier of the target
+buffer, so a sender on another rail can write through a receiver NIC off the
+target GPU's PCIe switch. In smart mode the local NIC is also scored across
+every tier: even with idle NICs about one slice in eleven (`1 / (1 + 10)` with
+the default penalties) leaves through a farther NIC, and the every-100th probe
+round-robins over all tiers. For GPU memory a farther NIC is not free: it moves
+every byte through the root complex, and as a receiver it cannot drain at line
+rate and back-pressures the fabric with PFC.
+
+With `closest_tier_only`:
+
+- The local NIC comes only from the closest tier that has a usable, unmasked
+  NIC (same-NUMA too under `strict_local_numa`). Smart scoring and the probe
+  still balance within that tier. A tier with no eligible NIC is skipped, so a
+  NIC failure degrades the transfer instead of failing it.
+- The remote NIC picked by the rail mapping is kept only if it is in the target
+  buffer's closest non-empty tier; otherwise a NIC from that tier is used.
+- After a rail error the failover path (`selectFallbackDevice`) still tries
+  every tier pair.
+- A remote NIC pinned by `dest_device_affinity` is kept as is.
+
+Measured on 8x H20 with 4x 400G CX7 (each NIC PIX to two GPUs), GPU-to-GPU
+`write` with 64 KiB slices into GPU4; 1:1 is GPU0, GPU2 or GPU6 alone, 3:1 is
+all three at once:
+
+| Scheduling | `closest_tier_only` | 1:1 GB/s | 3:1 aggregate GB/s | 3:1 P99 latency | 3:1 PFC pause frames |
+|------------|---------------------|----------|--------------------|-----------------|----------------------|
+| round-robin (default) | `false` | 21.9-48.8 | 52.4 (35.0 / 8.0 / 9.3) | 258-2913 us | 161667 |
+| round-robin (default) | `true` | 48.7-48.8 | 48.7 (16.3 / 16.4 / 16.1) | 546-553 us | 0 |
+| smart | `false` | 26.0-32.6 | 35.3 | 1163-1269 us | 12452 |
+| smart | `true` | 48.8 | 48.7 | 537-544 us | 0 |
+
+In the default mode without the flag, GPU2 and GPU6 are mapped to a receiver
+NIC off GPU4's switch: alone they reach 21.9 and 33.6 GB/s, and under 3:1 that
+NIC's PFC pauses hold them to 8.0 and 9.3 GB/s. The aggregate tops one NIC's
+line rate only because two receiver NICs carry it. `closest_tier_only` matches
+pinning each process to its PIX NIC with `MC_TE_FILTERS`, and `ib_write_bw` on
+the same NICs.
+
 ### Bandwidth Estimation
 
 ```json
