@@ -27,6 +27,8 @@
 #include "mutex.h"
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
+#include "ssd_read_source.h"
+#include "ssd_streaming_config.h"
 
 namespace mooncake {
 struct FileRecord {
@@ -279,6 +281,8 @@ struct FileStorageConfig {
     bool enable_disk_watermark_eviction = true;
     double disk_eviction_high_watermark_ratio = 0.90;
     double disk_eviction_low_watermark_ratio = 0.80;
+
+    ssd_offload::StreamingReadConfig streaming_read;
 
     // Validates the configuration for correctness and consistency
     bool Validate() const;
@@ -898,6 +902,12 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<void, ErrorCode> GetBucketKeys(
         int64_t bucket_id, std::vector<std::string>& bucket_keys);
+
+    // Pins the bucket and file while streaming readers hold the source.
+    tl::expected<std::shared_ptr<ssd_offload::ReadSource>, ErrorCode>
+    AcquireReadSource(
+        const std::string& key, uint64_t expected_size,
+        ssd_offload::ReadIoMode mode = ssd_offload::ReadIoMode::kBuffered);
 
     /**
      * @brief Initializes the bucket storage backend.

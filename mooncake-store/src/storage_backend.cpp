@@ -2135,6 +2135,52 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
     return {};
 }
 
+tl::expected<std::shared_ptr<ssd_offload::ReadSource>, ErrorCode>
+BucketStorageBackend::AcquireReadSource(const std::string& key,
+                                        uint64_t expected_size,
+                                        ssd_offload::ReadIoMode mode) {
+    StorageObjectMetadata metadata;
+    std::shared_ptr<BucketReadGuard> guard;
+    int disk_index = 0;
+    {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        auto object = object_bucket_map_.find(key);
+        if (!object) return tl::make_unexpected(ErrorCode::INVALID_KEY);
+        metadata = *object;
+        if (metadata.data_size < 0 || metadata.offset < 0 ||
+            metadata.key_size < 0 ||
+            uint64_t(metadata.data_size) != expected_size ||
+            metadata.offset >
+                std::numeric_limits<int64_t>::max() - metadata.key_size)
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        auto bucket = buckets_.find(metadata.bucket_id);
+        if (bucket == buckets_.end())
+            return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+        disk_index = bucket->second->disk_index;
+        guard = std::make_shared<BucketReadGuard>(bucket->second);
+        if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::LRU)
+            bucket->second->last_access_ns_.store(
+                std::chrono::steady_clock::now().time_since_epoch().count(),
+                std::memory_order_relaxed);
+    }
+    auto path = GetBucketDataPath(metadata.bucket_id, disk_index);
+    if (!path) return tl::make_unexpected(path.error());
+    // Match the native bucket read's 4 KiB plan for explicitly direct sources.
+    // Both synchronous pread and io_uring retain the same source/guard
+    // lifetime.
+    const size_t alignment = mode == ssd_offload::ReadIoMode::kDirect
+                                 ? ssd_offload::kDirectReadAlignment
+                                 : 1;
+    auto opened = ssd_offload::OpenPosixReadSource(
+        *path,
+        {expected_size, uint64_t(metadata.offset + metadata.key_size),
+         alignment, mode},
+        std::move(guard));
+    if (opened.error != ssd_offload::Error::kOk)
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    return std::move(opened.source);
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::GetBucketKeys(
     int64_t bucket_id, std::vector<std::string>& bucket_keys) {
     SharedMutexLocker locker(&mutex_, shared_lock);

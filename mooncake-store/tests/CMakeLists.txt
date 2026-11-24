@@ -496,6 +496,9 @@ add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(offload_read_executor_config_test
                offload_read_executor_config_test.cpp)
+add_store_test(ssd_read_pipeline_test ssd_read_pipeline_test.cpp)
+add_store_test(ssd_read_source_test ssd_read_source_test.cpp)
+add_store_test(ssd_pipeline_io_test ssd_pipeline_io_test.cpp)
 add_store_test(file_storage_config_test file_storage_config_test.cpp)
 add_store_test(fileread_worker_pool_config_test
                fileread_worker_pool_config_test.cpp)

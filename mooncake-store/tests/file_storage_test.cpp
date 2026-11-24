@@ -142,6 +142,14 @@ class DelayedReadBackend : public BucketStorageBackend {
 
 class FileStorageTest : public ::testing::Test {
    protected:
+    void PrepareStreamingObject(FileStorage& storage, const std::string& key,
+                                std::string& value) {
+        ASSERT_TRUE(storage.storage_backend_->Init());
+        ASSERT_TRUE(storage.storage_backend_->BatchOffload(
+            {{key, {{value.data(), value.size()}}}},
+            [](const auto&, auto&) { return ErrorCode::OK; }));
+    }
+
     std::string data_path;
 
     static uintmax_t StoredFileBytes(const std::string& path) {
@@ -3450,6 +3458,117 @@ TEST_F(FileStorageTest,
     EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u)
         << "Abandoned shared staging buffers must be reclaimed once their "
            "lease expires, otherwise the memory leaks for good";
+}
+
+TEST_F(FileStorageTest, LocalStreamingRestoreExceedsStagingArenaCapacity) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.streaming_read.enabled = true;
+    FileStorage storage(config, nullptr, "local");
+    std::string value(20 * 1024 * 1024, 's');
+    for (size_t i = 0; i < value.size(); ++i) value[i] = char(i % 251);
+    PrepareStreamingObject(storage, "stream-key", value);
+    ASSERT_TRUE(storage.SupportsLocalStreamingRead());
+    std::vector<char> first(12 * 1024 * 1024), second(8 * 1024 * 1024);
+    ASSERT_TRUE(storage.ReadLocalStreaming(
+        {{"stream-key",
+          value.size(),
+          0,
+          {{first.data(), first.size()}, {second.data(), second.size()}}}}));
+    EXPECT_EQ(std::memcmp(first.data(), value.data(), first.size()), 0);
+    EXPECT_EQ(
+        std::memcmp(second.data(), value.data() + first.size(), second.size()),
+        0);
+}
+
+TEST_F(FileStorageTest, LocalStreamingRangeAndInvalidRange) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.streaming_read.enabled = true;
+    FileStorage storage(config, nullptr, "local");
+    std::string value(12000, 'x');
+    value.replace(300, 5, "hello");
+    PrepareStreamingObject(storage, "range-key", value);
+    std::array<char, 5> destination{};
+    ASSERT_TRUE(storage.ReadLocalStreaming(
+        {{"range-key",
+          value.size(),
+          300,
+          {{destination.data(), destination.size()}}}}));
+    EXPECT_EQ(std::string(destination.data(), destination.size()), "hello");
+    destination.fill('z');
+    auto invalid = storage.ReadLocalStreaming(
+        {{"range-key",
+          value.size(),
+          value.size(),
+          {{destination.data(), destination.size()}}}});
+    ASSERT_FALSE(invalid);
+    EXPECT_EQ(invalid.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(std::string(destination.data(), destination.size()), "zzzzz");
+}
+
+TEST_F(FileStorageTest, LocalStreamingRemainsOptIn) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    FileStorage storage(config, nullptr, "local");
+    EXPECT_FALSE(storage.SupportsLocalStreamingRead());
+    auto result = storage.ReadLocalStreaming({});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::NOT_SUPPORTED);
+}
+
+TEST_F(FileStorageTest, LocalStreamingPreflightsBatchAndRejectsOverlap) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.streaming_read.enabled = true;
+    FileStorage storage(config, nullptr, "local");
+    std::string value(12000, 's');
+    PrepareStreamingObject(storage, "valid-key", value);
+    std::array<char, 16> destination;
+    destination.fill('z');
+    auto bad_key = storage.ReadLocalStreaming(
+        {{"valid-key", value.size(), 0, {{destination.data(), 8}}},
+         {"missing-key", value.size(), 0, {{destination.data() + 8, 8}}}});
+    ASSERT_FALSE(bad_key);
+    EXPECT_EQ(bad_key.error(), ErrorCode::INVALID_KEY);
+    EXPECT_EQ(std::string(destination.data(), 16), std::string(16, 'z'));
+    auto overlap = storage.ReadLocalStreaming(
+        {{"valid-key", value.size(), 0, {{destination.data(), 8}}},
+         {"valid-key", value.size(), 8, {{destination.data() + 4, 8}}}});
+    ASSERT_FALSE(overlap);
+    EXPECT_EQ(overlap.error(), ErrorCode::INVALID_PARAMS);
+    auto null = storage.ReadLocalStreaming(
+        {{"valid-key", value.size(), 0, {{nullptr, 1}}}});
+    ASSERT_FALSE(null);
+    EXPECT_EQ(null.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_TRUE(storage.ReadLocalStreaming({}));
+}
+
+TEST_F(FileStorageTest, LocalStreamingBoundsOpenSourcesBeforeWriting) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.streaming_read.enabled = true;
+    config.streaming_read.max_outstanding = 8;
+    FileStorage storage(config, nullptr, "local");
+    std::string value(12000, 's');
+    PrepareStreamingObject(storage, "bounded-key", value);
+    std::array<char, 9> destination;
+    destination.fill('z');
+    std::vector<FileStorage::LocalReadRequest> requests;
+    for (size_t i = 0; i < destination.size(); ++i)
+        requests.push_back(
+            {"bounded-key", value.size(), i, {{destination.data() + i, 1}}});
+    auto rejected = storage.ReadLocalStreaming(requests);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(std::string(destination.data(), 9), std::string(9, 'z'));
+    requests.pop_back();
+    EXPECT_TRUE(storage.ReadLocalStreaming(requests));
 }
 
 }  // namespace mooncake

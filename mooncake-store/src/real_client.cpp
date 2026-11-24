@@ -109,6 +109,21 @@ coro_io::ExecutorWrapper<> *GetOffloadReadExecutor() {
     return pool->get_executor();
 }
 
+bool CanUseLocalStreamingRestore(
+    const FileStorage *storage, const std::string &local_rpc_addr,
+    const std::string &target_rpc_addr,
+    const RealClient::LocalDiskOffloadObjects &objects) {
+    if (!storage || target_rpc_addr != local_rpc_addr ||
+        !storage->SupportsLocalStreamingRead())
+        return false;
+    auto accelerators = device::GetAcceleratorRegistry().RuntimeAccelerators();
+    for (const auto &[key, slices] : objects)
+        for (const auto &slice : slices)
+            if (slice.size && accelerators.FindDeviceForPointer(slice.ptr))
+                return false;
+    return true;
+}
+
 size_t DivideRoundUp(size_t value, size_t divisor) {
     return value / divisor + (value % divisor != 0);
 }
@@ -5209,6 +5224,25 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             if (!result) return tl::unexpected(result.error());
             return static_cast<int64_t>(size);
         }
+        if (CanUseLocalStreamingRestore(file_storage_.get(), local_rpc_addr,
+                                        endpoint, objects)) {
+            RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
+            if (!inflight.ok()) {
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            const TenantId tenant_id(client_->tenant_id());
+            auto result = file_storage_->ReadLocalStreaming({{
+                tenant_id.MakeScopedKey(key),
+                uint64_t(read_range.object_size),
+                read_range.source_offset,
+                objects.at(key),
+            }});
+            if (result) return static_cast<int64_t>(size);
+            if (result.error() != ErrorCode::NO_AVAILABLE_HANDLE &&
+                result.error() != ErrorCode::NOT_SUPPORTED) {
+                return tl::unexpected(result.error());
+            }
+        }
 
         return partial_disk_read(
             [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
@@ -9953,6 +9987,8 @@ RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
     std::unordered_map<std::string, std::vector<Slice>> &objects,
     const OffloadReadRange *read_range) {
+    RpcDrainGuard::ScopedCall inflight(offload_rpc_drain_);
+    if (!inflight.ok()) return tl::unexpected(ErrorCode::INVALID_PARAMS);
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
     if (read_range && objects.size() != 1) {
@@ -9984,6 +10020,25 @@ RealClient::batch_get_into_offload_object_internal(
             }
         }
         sizes.emplace_back(storage_size);
+    }
+
+    if (CanUseLocalStreamingRestore(file_storage_.get(), local_rpc_addr,
+                                    target_rpc_service_addr, objects)) {
+        const TenantId tenant_id(client_->tenant_id());
+        std::vector<FileStorage::LocalReadRequest> requests;
+        requests.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            requests.push_back({tenant_id.MakeScopedKey(keys[i]),
+                                read_range ? uint64_t(read_range->object_size)
+                                           : uint64_t(sizes[i]),
+                                read_range ? read_range->source_offset : 0,
+                                objects.at(keys[i])});
+        }
+        auto result = file_storage_->ReadLocalStreaming(requests);
+        if (result || (result.error() != ErrorCode::NO_AVAILABLE_HANDLE &&
+                       result.error() != ErrorCode::NOT_SUPPORTED)) {
+            return result;
+        }
     }
 
     std::vector<int64_t> value_offsets;
