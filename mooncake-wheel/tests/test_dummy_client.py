@@ -1,9 +1,11 @@
+import contextlib
 import json
 import math
 import os
 import threading
 import time
 import unittest
+import uuid
 
 try:
     import torch
@@ -1347,6 +1349,48 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         config_str = str(config)
         self.assertIsInstance(config_str, str)
         self.assertIn("3", config_str)  # Should contain replica_num
+
+
+@unittest.skipUnless(os.getenv("MC_CUDA_REAL_CLIENT"), "requires a separate daemon")
+@unittest.skipUnless(torch is not None and torch.cuda.is_available(), "requires CUDA")
+class TestDummyClientCudaSessions(unittest.TestCase):
+    def test_registered_cuda_fragments(self):
+        store = MooncakeDistributedStore()
+        self.addCleanup(store.close)
+        self.assertEqual(
+            store.setup_dummy(0, 4 << 20, os.environ["MC_CUDA_REAL_CLIENT"]), 0
+        )
+        key = f"cuda_session_{uuid.uuid4().hex}"
+        self.addCleanup(store.remove, key, force=True)
+
+        # Keep both tensors alive until the registrations are released.
+        source = torch.arange(64, dtype=torch.uint8, device="cuda")
+        dest = torch.zeros_like(source)
+        torch.cuda.synchronize()
+        with contextlib.ExitStack() as cleanup:
+            for tensor in (source, dest):
+                self.assertEqual(store.register_buffer(tensor.data_ptr(), 64), 0)
+                cleanup.callback(store.unregister_buffer, tensor.data_ptr())
+
+            src, dst = source.data_ptr(), dest.data_ptr()
+            self.assertEqual(store.batch_put_session_start([key], [64]), [0])
+            cleanup.callback(store.batch_put_session_revoke, [key])
+            self.assertEqual(
+                store.batch_put_from_multi_buffer_ranges(
+                    [key], [[src, src + 17]], [[17, 47]], [[0, 17]]
+                ),
+                [64],
+            )
+            self.assertEqual(store.batch_put_session_end([key]), [0])
+            self.assertEqual(store.batch_get_session_start([key]), [0])
+            cleanup.callback(store.batch_get_session_end, [key])
+            self.assertEqual(
+                store.batch_get_into_multi_buffer_ranges(
+                    [key], [[dst + 17, dst]], [[47, 17]], [[17, 0]]
+                ),
+                [64],
+            )
+            self.assertTrue(torch.equal(dest, source))
 
 
 if __name__ == "__main__":

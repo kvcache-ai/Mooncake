@@ -1,17 +1,24 @@
 // dummy_client_get_buffer_test.cpp
 // Verifies DummyClient::get_buffer / batch_get_buffer correctness,
-// including hot-cache shm path and allocator fallback path.
+// including hot-cache SHM, allocator fallback, and Dummy session ranges.
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <shared_mutex>
+#include <span>
+#include <utility>
 #include <string>
 #include <thread>
 #include <vector>
@@ -24,6 +31,7 @@
 #include "dummy_client.h"
 #include "../src/config/client_object_checksum_config.h"
 #include "real_client.h"
+#include "shm_helper.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
@@ -62,6 +70,11 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::release_buffer_dummy>(&rc);
     server.register_handler<&RealClient::batch_acquire_buffer_dummy>(&rc);
     server.register_handler<&RealClient::batch_get_query_results>(&rc);
+    server.register_handler<&RealClient::batch_get_session_start_dummy_helper,
+                            &RealClient::batch_get_session_end_dummy_helper,
+                            &RealClient::batch_put_session_start_dummy_helper,
+                            &RealClient::finish_dummy_put_sessions,
+                            &RealClient::execute_dummy_session_ranges>(&rc);
 }
 
 static constexpr size_t kMB = 1024ULL * 1024;
@@ -80,13 +93,6 @@ static constexpr size_t kHotWarmCount = 4;    // keys to warm into hot cache
 
 class DummyClientGetBufferTest : public ::testing::Test {
    protected:
-    static void SetUpTestSuite() {
-        google::InitGoogleLogging("DummyClientGetBufferTest");
-        FLAGS_logtostderr = 1;
-    }
-
-    static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
-
     void SetUp() override {
         if (getenv("PROTOCOL")) FLAGS_protocol = getenv("PROTOCOL");
         if (getenv("DEVICE_NAME")) FLAGS_device_name = getenv("DEVICE_NAME");
@@ -765,11 +771,207 @@ TEST_F(DummyClientGetBufferTest, Perf_BatchHotVsCold) {
         << "Batch hot cache path should be faster than fallback";
 }
 
+class DummyClientSessionTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+        real_ = RealClient::create();
+        const auto port = std::to_string(getFreeTcpPort());
+        ipc_ = "@dummy_sessions_" + std::to_string(getpid()) + "_" + port;
+        ASSERT_EQ(real_->setup_real("localhost:" + port, "P2PHANDSHAKE",
+                                    16 * kMB, 4 * kMB, "tcp", "",
+                                    master_.master_address(), nullptr, ipc_),
+                  0);
+        const int rpc_port = getFreeTcpPort();
+        address_ = "127.0.0.1:" + std::to_string(rpc_port);
+        server_ = std::make_unique<coro_rpc::coro_rpc_server>(
+            2, rpc_port, "127.0.0.1", std::chrono::seconds(0), true);
+        RegisterRpcHandlers(*server_, *real_);
+        ASSERT_FALSE(server_->async_start().hasResult());
+    }
+
+    std::shared_ptr<DummyClient> Connect(size_t pool_size = 4 * kMB) {
+        auto dummy = std::make_shared<DummyClient>();
+        if (dummy->setup_dummy(0, pool_size, address_, ipc_) != 0) return {};
+        return dummy;
+    }
+
+    std::shared_ptr<char> SharedBuffer(std::shared_ptr<DummyClient> dummy,
+                                       size_t size) {
+        auto *helper = ShmHelper::getInstance();
+        auto *ptr = static_cast<char *>(helper->allocate(size));
+        if (!ptr) return {};
+        if (dummy->register_buffer(ptr, size) != 0) {
+            helper->free(ptr);
+            return {};
+        }
+        return {ptr, [dummy, helper](char *p) {
+                    EXPECT_EQ(dummy->unregister_buffer(p), 0);
+                    EXPECT_EQ(helper->free(p), 0);
+                }};
+    }
+
+    auto LockSession() {
+        std::shared_lock lock(real_->dummy_client_mutex_);
+        return std::unique_lock(
+            real_->shm_contexts_.begin()->second.sessions.mutex);
+    }
+
+    // An exclusive lock ensures the range handler has finished its write.
+    bool LateReadCompleted(const char *destination) {
+        std::unique_lock lock(real_->dummy_client_mutex_);
+        for (const auto &shm :
+             real_->shm_contexts_.begin()->second.mapped_shms) {
+            if (shm.dummy_base_addr !=
+                    reinterpret_cast<uintptr_t>(destination) &&
+                shm.shm_size >= 64 &&
+                std::memcmp(shm.shm_buffer, payload_.data(), 64) == 0)
+                return true;
+        }
+        return false;
+    }
+
+    const std::string payload_ = std::string(64, 'a');
+    InProcMaster master_;
+    std::shared_ptr<RealClient> real_;
+    std::unique_ptr<coro_rpc::coro_rpc_server> server_;
+    std::string ipc_, address_;
+};
+
+TEST_F(DummyClientSessionTest, FragmentedRangesPreserveRowResultsAndBounds) {
+    // With no local pool, use a separate SHM mapping, even for a large batch.
+    auto dummy = Connect(0);
+    ASSERT_NE(dummy, nullptr);
+    constexpr int size = 4 * kMB + 64;
+    auto dest = SharedBuffer(dummy, size + 2);
+    ASSERT_NE(dest, nullptr);
+    std::memset(dest.get(), '?', size + 2);
+    std::vector<char> src(size, 'x');
+    std::fill_n(src.begin(), 17, 'a');
+
+    const std::vector<std::string> keys{"valid", "bad_row"};
+    const std::vector<int> partial{size, toInt(ErrorCode::INVALID_PARAMS)};
+    const std::vector<std::vector<size_t>> sizes{{size - 17, 17}, {2}};
+    const std::vector<std::vector<size_t>> offsets{{17, 0}, {0}};
+    ASSERT_EQ(dummy->batch_put_session_start(keys, {size, size}),
+              std::vector<int>(2, 0));
+    ASSERT_EQ(dummy->register_buffer(src.data(), size), 0);
+    EXPECT_EQ(dummy->batch_put_from_multi_buffer_ranges(
+                  keys, {{src.data() + 17, src.data()}, {}}, sizes, offsets),
+              partial);
+    ASSERT_EQ(dummy->batch_put_session_end({keys[0]}), std::vector<int>{0});
+    EXPECT_EQ(dummy->batch_put_session_revoke({keys[1]}), std::vector<int>{0});
+    ASSERT_EQ(dummy->batch_get_session_start({keys[0]}), std::vector<int>{0});
+
+    // A different key has no get session; it must not overwrite the guard.
+    auto *out = dest.get() + 1;
+    auto result = dummy->batch_get_into_multi_buffer_ranges(
+        keys, {{out + 17, out}, {dest.get()}}, sizes, offsets);
+    EXPECT_EQ(result, partial);
+    EXPECT_EQ(std::memcmp(out, src.data(), size), 0);
+    EXPECT_EQ(dest.get()[0], '?');
+    EXPECT_EQ(out[size], '?');
+    EXPECT_EQ(dummy->batch_get_into_multi_buffer_ranges(
+                  {keys[0]}, {{src.data() + size - 1}}, {{2}}, {{0}}),
+              std::vector<int>{toInt(ErrorCode::INVALID_PARAMS)});
+    EXPECT_EQ(dummy->batch_get_into_multi_buffer_ranges({keys[0]}, {{out}},
+                                                        {{1}}, {{size}}),
+              std::vector<int>{toInt(ErrorCode::INVALID_PARAMS)});
+    EXPECT_EQ(dummy->batch_get_session_end(keys), 0);
+    EXPECT_EQ(dummy->unregister_buffer(src.data()), 0);
+}
+
+TEST_F(DummyClientSessionTest, TimedOutReadCannotOverwriteReusedSharedBuffer) {
+    const char *previous = std::getenv("MC_RPC_TIMEOUT_MS");
+    const std::optional<std::string> saved =
+        previous ? std::optional<std::string>(previous) : std::nullopt;
+    ASSERT_EQ(setenv("MC_RPC_TIMEOUT_MS", "1000", 1), 0);
+    auto dummy = Connect(0);
+    if (saved)
+        setenv("MC_RPC_TIMEOUT_MS", saved->c_str(), 1);
+    else
+        unsetenv("MC_RPC_TIMEOUT_MS");
+    ASSERT_NE(dummy, nullptr);
+
+    const std::vector<std::string> keys{"late_read"};
+    ASSERT_EQ(real_->put(keys[0], std::span<const char>(payload_)), 0);
+    auto dest = SharedBuffer(dummy, 64);
+    ASSERT_NE(dest, nullptr);
+    ASSERT_EQ(dummy->batch_get_session_start(keys), std::vector<int>{0});
+    auto lock = LockSession();
+    auto read = std::async(std::launch::async, [&] {
+        return dummy->batch_get_into_multi_buffer_ranges(keys, {{dest.get()}},
+                                                         {{64}}, {{0}});
+    });
+    if (read.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        lock.unlock();
+        FAIL() << "Range RPC did not time out";
+    }
+    EXPECT_EQ(read.get(), std::vector<int>{toInt(ErrorCode::RPC_FAIL)});
+    std::memset(dest.get(), 'z', 64);
+    lock.unlock();
+
+    // Require proof that the daemon actually finished the late read.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!LateReadCompleted(dest.get())) {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(std::string(dest.get(), 64), std::string(64, 'z'));
+    EXPECT_EQ(dummy->batch_get_session_end(keys), 0);
+}
+
+TEST_F(DummyClientSessionTest, ClientsOwnTheirSessionsAcrossDisconnect) {
+    auto first = Connect();
+    auto second = Connect();
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    const std::vector<std::string> keys{"shared"};
+    ASSERT_EQ(real_->put(keys[0], std::span<const char>(payload_)), 0);
+    char output[64]{};
+    ASSERT_EQ(second->register_buffer(output, sizeof(output)), 0);
+    ASSERT_EQ(first->batch_get_session_start(keys), std::vector<int>{0});
+    auto read = [&](void *ptr) {
+        return second->batch_get_into_multi_buffer_ranges(
+            keys, {{ptr}}, {{sizeof(output)}}, {{0}});
+    };
+    const std::vector<int> invalid{toInt(ErrorCode::INVALID_PARAMS)};
+    EXPECT_EQ(read(output), invalid);
+    ASSERT_EQ(second->batch_get_session_start(keys), std::vector<int>{0});
+    {
+        auto foreign = SharedBuffer(first, sizeof(output));
+        ASSERT_NE(foreign, nullptr);
+        EXPECT_EQ(read(foreign.get()), invalid);
+        ASSERT_EQ(second->unregister_buffer(output), 0);
+        EXPECT_EQ(read(output), invalid);
+        ASSERT_EQ(second->register_buffer(output, sizeof(output)), 0);
+    }
+
+    const std::vector<std::string> pending{"pending"};
+    ASSERT_EQ(first->batch_put_session_start(pending, {64}),
+              std::vector<int>{0});
+    EXPECT_EQ(second->batch_put_session_start(pending, {64}), invalid);
+    EXPECT_EQ(second->batch_put_session_revoke(pending), invalid);
+    first.reset();
+    EXPECT_EQ(read(output), std::vector<int>{64});
+    EXPECT_EQ(std::string(output, 64), payload_);
+    EXPECT_EQ(second->batch_get_session_end(keys), 0);
+    EXPECT_EQ(second->batch_put_session_start(pending, {64}),
+              std::vector<int>{0});
+    EXPECT_EQ(second->batch_put_session_revoke(pending), std::vector<int>{0});
+    EXPECT_EQ(second->unregister_buffer(output), 0);
+}
+
 }  // namespace testing
 }  // namespace mooncake
 
 int main(int argc, char **argv) {
+    google::InitGoogleLogging(argv[0]);
+    FLAGS_logtostderr = 1;
     ::testing::InitGoogleTest(&argc, argv);
     gflags::ParseCommandLineFlags(&argc, &argv, false);
-    return RUN_ALL_TESTS();
+    const int result = RUN_ALL_TESTS();
+    google::ShutdownGoogleLogging();
+    return result;
 }

@@ -41,7 +41,11 @@ class RealClient;
 
 namespace test {
 class PrefetchTeardownTest;
+class RealClientTeardownTest;
 }  // namespace test
+namespace testing {
+class DummyClientSessionTest;
+}  // namespace testing
 class NvlinkHostNumaAllocation;
 struct EgmStorePoolConfig;
 class RegisteredPinnedRegion;
@@ -302,6 +306,24 @@ class RealClient : public PyClient {
 
     std::vector<int> batch_put_session_revoke(
         const std::vector<std::string> &keys) override;
+
+    // Session metadata and pointers are scoped to the calling DummyClient.
+    std::vector<int> batch_get_session_start_dummy_helper(
+        const std::vector<std::string> &keys, const UUID &client_id);
+    int batch_get_session_end_dummy_helper(const std::vector<std::string> &keys,
+                                           const UUID &client_id);
+    std::vector<int> batch_put_session_start_dummy_helper(
+        const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config, const UUID &client_id);
+    std::vector<int> finish_dummy_put_sessions(
+        const std::vector<std::string> &keys, const UUID &client_id,
+        bool commit);
+    std::vector<int> execute_dummy_session_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<uint64_t>> &addresses,
+        const std::vector<std::vector<size_t>> &sizes,
+        const std::vector<std::vector<size_t>> &offsets, int32_t device_id,
+        const UUID &client_id, bool is_write);
 
     int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values,
@@ -879,7 +901,8 @@ class RealClient : public PyClient {
     std::vector<tl::expected<void, ErrorCode>> batchRemove_internal(
         const std::vector<std::string> &keys, bool force = false);
 
-    tl::expected<void, ErrorCode> tearDownAll_internal();
+    tl::expected<void, ErrorCode> tearDownAll_internal(
+        bool final_teardown = false);
 
     // Idempotently releases this client's NoF registrations for all recorded
     // user buffers; failures keep their records and latch
@@ -1232,7 +1255,30 @@ class RealClient : public PyClient {
         std::string ipc_key_data;
     };
 
+    // Each DummyClient owns a separate session namespace while all transfers
+    // use this RealClient's existing Client and TransferEngine.
+    struct PutSessionEntry {
+        std::vector<Replica::Descriptor> replicas;
+        uint64_t object_size{0};
+        ReplicaWriteMode write_mode{ReplicaWriteMode::SINGLE_REPLICA};
+        bool memory_finalized{false};
+        bool writable{true};
+        size_t inflight_transfers{0};
+    };
+    struct SessionState {
+        // Serialize control RPCs so a late end/revoke cannot act on a new put.
+        std::mutex put_control_mutex;
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::unordered_map<std::string, QueryResult> get_sessions;
+        std::unordered_map<std::string, PutSessionEntry> put_sessions;
+    };
+
     struct ShmContext {
+        SessionState sessions;
+        // Closed before cleanup; failed revocations retain this context for
+        // retry.
+        bool sessions_closing = false;
         // List of all mapped shared memory for this client
         std::vector<MappedShm> mapped_shms;
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
@@ -1259,29 +1305,41 @@ class RealClient : public PyClient {
         registered_buffer_sizes_;
     std::optional<WritableBufferRegion> local_buffer_region_;
 
-    // KV transfer sessions (process-local; not shared with DummyClient).
-    // get_sessions_ stores a FilterQueryResult'd QueryResult (single complete
-    // supported replica + lease); ranges only compare lease locally (no
-    // Master). MEMORY uses BatchTransferReadRanges; DFS reads through
-    // request-scoped staging; LOCAL_DISK restores on the owner then
-    // BatchTransferReadOffloadRanges; DISK BatchGets into a temp buffer then
-    // scatters by src_offset.
-    // Put sessions track writable + inflight so end/revoke can seal the
-    // session and wait for outstanding range writes before finalize/free.
-    struct PutSessionEntry {
-        std::vector<Replica::Descriptor> replicas;
-        uint64_t object_size{0};
-        ReplicaWriteMode write_mode{ReplicaWriteMode::SINGLE_REPLICA};
-        bool writable{true};
-        size_t inflight_transfers{0};
-    };
-    mutable std::mutex session_mutex_;
-    std::condition_variable session_cv_;
-    std::unordered_map<std::string, QueryResult> get_sessions_;
-    std::unordered_map<std::string, PutSessionEntry> put_sessions_;
+    SessionState real_sessions_;
+    std::mutex session_put_owners_mutex_;
+    std::unordered_map<std::string, SessionState *> session_put_owners_;
+    bool claim_session_put_owner(SessionState &sessions,
+                                 const std::string &key);
+    void release_session_put_owner(SessionState &sessions,
+                                   const std::string &key);
 
-    void wait_session_put_idle(std::unique_lock<std::mutex> &lock,
+    void wait_session_put_idle(SessionState &sessions,
+                               std::unique_lock<std::mutex> &lock,
                                const std::vector<std::string> &keys);
+    std::vector<int> batch_get_session_start_impl(
+        SessionState &sessions, const std::vector<std::string> &keys);
+    int batch_get_session_end_impl(SessionState &sessions,
+                                   const std::vector<std::string> &keys);
+    std::vector<int> batch_get_into_multi_buffer_ranges_impl(
+        SessionState &sessions, const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_src_offsets);
+    std::vector<int> batch_put_session_start_impl(
+        SessionState &sessions, const std::vector<std::string> &keys,
+        const std::vector<size_t> &sizes, const ReplicateConfig &config);
+    std::vector<int> batch_put_from_multi_buffer_ranges_impl(
+        SessionState &sessions, const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_dst_offsets);
+    std::vector<int> batch_put_session_end_impl(
+        SessionState &sessions, const std::vector<std::string> &keys);
+    std::vector<int> batch_put_session_revoke_impl(
+        SessionState &sessions, const std::vector<std::string> &keys);
+    ErrorCode cleanup_dummy_sessions(ShmContext &context);
+    ErrorCode cleanup_session_state(SessionState &sessions);
+    ShmContext *find_open_dummy_context_locked(const UUID &client_id);
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
@@ -1391,6 +1449,7 @@ class RealClient : public PyClient {
         std::vector<size_t> source_offsets;
         size_t transferred_bytes;
         std::chrono::steady_clock::time_point lease_deadline;
+        SessionState *session_state;
     };
 
     struct SessionRangeReadPlan {
@@ -1417,7 +1476,7 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_src_offsets) const;
 
     std::vector<SessionRangeReadRequest> prepare_session_range_read_requests(
-        const std::vector<std::string> &keys,
+        SessionState &sessions, const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const std::vector<std::vector<size_t>> &all_src_offsets,
@@ -1483,6 +1542,8 @@ class RealClient : public PyClient {
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;
+    friend class test::RealClientTeardownTest;
+    friend class testing::DummyClientSessionTest;
     friend class RangedDiskLeaseTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,

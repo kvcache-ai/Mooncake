@@ -3271,6 +3271,16 @@ before talking to Master.
 Store-managed registered memory. DFS session reads use temporary staging; the
 staging allocation is released after the synchronous read and scatter finish.
 
+After `setup_dummy`, each DummyClient has its own sessions on the shared
+RealClient daemon. Disconnect cleanup revokes that client's unfinished puts.
+Use matching builds of DummyClient and the daemon for the session RPCs.
+
+Range calls copy registered buffers through one private SHM allocation per
+batch, using a temporary segment if the local pool is absent or too small.
+Keep buffers registered until the call returns and synchronize device producer
+streams before writes. After a timeout, the caller can reuse its buffers while
+the daemon retains the staging memory until the mapping is released.
+
 #### batch_get_session_start()
 
 Query replicas once and open a get session for the given keys.

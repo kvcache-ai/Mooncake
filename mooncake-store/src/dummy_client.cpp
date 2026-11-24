@@ -23,6 +23,7 @@
 #include "types.h"
 #include "default_config.h"
 #include "config.h"
+#include "master_client.h"
 #include "device/cuda_ipc_buffer.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_ASCEND_DIRECT
@@ -31,6 +32,21 @@
 #endif
 
 namespace {
+std::vector<int> session_results(
+    tl::expected<std::vector<int>, mooncake::ErrorCode> result,
+    size_t expected_size) {
+    if (!result) {
+        return std::vector<int>(expected_size, mooncake::toInt(result.error()));
+    }
+    if (result->size() != expected_size) {
+        LOG(ERROR) << "Dummy session RPC response size mismatch: expected "
+                   << expected_size << ", got " << result->size();
+        return std::vector<int>(expected_size,
+                                mooncake::toInt(mooncake::ErrorCode::RPC_FAIL));
+    }
+    return std::move(*result);
+}
+
 size_t sum_value_sizes(const std::vector<std::span<const char>>& values) {
     size_t total = 0;
     for (const auto& value : values) {
@@ -159,6 +175,13 @@ std::vector<std::vector<uint64_t>> void_ptr_rows_to_u64_nested(
     return nested;
 }
 
+mooncake::RpcClientPool::PoolConfig dummy_rpc_pool_config() {
+    mooncake::RpcClientPool::PoolConfig config;
+    mooncake::detail::ApplyRpcTimeoutOverrides(
+        config.client_config, mooncake::RpcTimeoutConfig::FromEnvironment());
+    return config;
+}
+
 }  // namespace
 
 namespace mooncake {
@@ -268,7 +291,8 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
 }
 
 DummyClient::DummyClient()
-    : client_accessor_(GetStoreRpcClientIoContextPool()),
+    : client_accessor_(GetStoreRpcClientIoContextPool(),
+                       dummy_rpc_pool_config()),
       client_id_(generate_uuid()),
       metrics_(ClientMetric::Create(merge_labels({{"client_mode", "dummy"}}),
                                     false)) {
@@ -438,6 +462,11 @@ int DummyClient::register_ascend_shm(const ShmHelper::ShmSegment* shm,
     return 0;
 }
 
+int DummyClient::map_shm(const ShmHelper::ShmSegment* shm, bool local) {
+    return globalConfig().ascend_agent_mode ? register_ascend_shm(shm, local)
+                                            : register_shm_via_ipc(shm, local);
+}
+
 int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
                                       bool is_local) {
     if (shm->fd < 0) {
@@ -553,25 +582,12 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
             return -1;
         }
 
-        if (globalConfig().ascend_agent_mode) {
-            if (register_ascend_shm(local_buffer_shm.get(), true) != 0) {
-                LOG(ERROR) << "Failed to register SHM via IPC";
-                // Register failed, cleanup
-                shm_helper_->free(local_buffer_shm->base_addr);
-                local_buffer_base_ = nullptr;
-                return -1;
-            }
-        } else {
-            if (register_shm_via_ipc(local_buffer_shm.get(), true) != 0) {
-                LOG(ERROR) << "Failed to register SHM via IPC";
-                // Register failed, cleanup
-                shm_helper_->free(local_buffer_shm->base_addr);
-                local_buffer_base_ = nullptr;
-                return -1;
-            }
+        if (map_shm(local_buffer_shm.get(), true) != 0) {
+            shm_helper_->free(base_addr);
+            local_buffer_base_ = nullptr;
+            return -1;
         }
-        local_buffer_shm->registered = true;
-        local_buffer_shm->is_local = true;
+        registered_shms_.emplace(base_addr, std::move(local_buffer_shm));
 
         // Best-effort: request hot cache shm from real client
         if (request_hot_cache_fd() != 0) {
@@ -593,12 +609,16 @@ int DummyClient::tearDownAll() {
         ping_thread_.join();
     }
 
-    void* local_buffer_base = local_buffer_base_;
     unregister_shm();
-    if (local_buffer_base && shm_helper_ &&
-        shm_helper_->get_shm(local_buffer_base) &&
-        shm_helper_->free(local_buffer_base) != 0) {
-        LOG(ERROR) << "Failed to free dummy local shared memory";
+    if (local_buffer_base_) {
+        std::lock_guard lock(shm_mutex_);
+        if (registered_shms_.contains(local_buffer_base_)) {
+            LOG(ERROR)
+                << "Retaining dummy local shared memory after failed unmap";
+        } else if (shm_helper_ && shm_helper_->get_shm(local_buffer_base_) &&
+                   shm_helper_->free(local_buffer_base_) != 0) {
+            LOG(ERROR) << "Failed to free dummy local shared memory";
+        }
     }
     local_buffer_base_ = nullptr;
 
@@ -643,14 +663,18 @@ std::optional<BufferHandle> DummyClient::allocate_client_buffer(size_t size) {
                                             std::move(release));
 }
 
-bool DummyClient::is_dummy_shm_buffer(void* buffer, size_t size) const {
-    if (buffer == nullptr || shm_helper_ == nullptr) return false;
+bool DummyClient::is_dummy_shm_buffer(void* buffer, size_t size,
+                                      bool* uses_pool) const {
+    if (!buffer || !shm_helper_) return false;
     auto shm = shm_helper_->get_shm(buffer);
-    if (!shm) return false;
-    const uintptr_t base = reinterpret_cast<uintptr_t>(shm->base_addr);
-    const uintptr_t address = reinterpret_cast<uintptr_t>(buffer);
-    if (address < base || address - base > shm->size) return false;
-    return size <= shm->size - (address - base);
+    if (!shm || is_device_buffer(buffer)) return false;
+    std::lock_guard lock(shm_mutex_);
+    auto it = registered_shms_.find(shm->base_addr);
+    if (it == registered_shms_.end() || it->second != shm) return false;
+    if (uses_pool && shm->base_addr == local_buffer_base_) *uses_pool = true;
+    const auto offset = reinterpret_cast<uintptr_t>(buffer) -
+                        reinterpret_cast<uintptr_t>(shm->base_addr);
+    return size <= shm->size - offset;
 }
 
 bool DummyClient::is_device_buffer(void* buffer) const {
@@ -778,15 +802,8 @@ std::optional<DummyClient::PreparedBuffer> DummyClient::prepare_buffer(
         return PreparedBuffer{buffer, buffer, size, nullptr, false};
     }
 #endif
-    if (shm_helper_ != nullptr) {
-        auto shm = shm_helper_->get_shm(buffer);
-        if (shm != nullptr && !is_device_buffer(buffer)) {
-            if (!is_dummy_shm_buffer(buffer, size)) {
-                return std::nullopt;
-            } else {
-                return PreparedBuffer{buffer, buffer, size, nullptr, false};
-            }
-        }
+    if (is_dummy_shm_buffer(buffer, size)) {
+        return PreparedBuffer{buffer, buffer, size, nullptr, false};
     }
     auto remaining = external_buffer_remaining(buffer);
     if (!remaining.has_value() || size > *remaining) return std::nullopt;
@@ -906,15 +923,19 @@ DummyClient::prepare_multi_buffers(
 
 int64_t DummyClient::unregister_shm() {
     LOG(INFO) << "[unregister_shm] client_id=" << client_id_;
-#if defined(USE_ASCEND_DIRECT)
-    if (globalConfig().ascend_agent_mode) {
-        return to_py_ret(
-            invoke_rpc<&RealClient::ascend_unmap_shm_internal, void>(
-                client_id_));
+    std::lock_guard lock(shm_mutex_);
+    auto result =
+        globalConfig().ascend_agent_mode
+            ? invoke_rpc<&RealClient::ascend_unmap_shm_internal, void>(
+                  client_id_)
+            : invoke_rpc<&RealClient::unmap_shm_internal, void>(client_id_);
+    if (result) {
+        registered_shms_.clear();
+        std::erase_if(pending_session_staging_, [this](void* address) {
+            return shm_helper_->free(address) == 0;
+        });
     }
-#endif
-    return to_py_ret(
-        invoke_rpc<&RealClient::unmap_shm_internal, void>(client_id_));
+    return to_py_ret(result);
 }
 
 #if defined(USE_ASCEND_DIRECT)
@@ -1079,13 +1100,10 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         return -1;
     }
 
-    // If this shm is not registered with RealClient yet, do it now
-    if (!shm->registered) {
-        if (register_shm_via_ipc(shm.get(), shm->is_local) != 0) {
-            LOG(ERROR) << "Failed to implicitly register new SHM via IPC";
-            return -1;
-        }
-        shm->registered = true;
+    std::lock_guard lock(shm_mutex_);
+    if (!registered_shms_.contains(buffer)) {
+        if (map_shm(shm.get(), buffer == local_buffer_base_) != 0) return -1;
+        registered_shms_.emplace(buffer, std::move(shm));
     }
 
     return 0;
@@ -1138,7 +1156,8 @@ int DummyClient::unregister_buffer(void* buffer) {
     if (!shm) {
         return unregister_external_buffer(buffer);
     }
-    if (!shm->registered) {
+    std::lock_guard lock(shm_mutex_);
+    if (!registered_shms_.contains(buffer)) {
         LOG(ERROR) << "Buffer is not registered with RealClient";
         return -1;
     }
@@ -1163,7 +1182,7 @@ int DummyClient::unregister_buffer(void* buffer) {
     if (ret.has_value() ||
         (!ret.has_value() && (ret.error() == ErrorCode::INTERNAL_ERROR ||
                               ret.error() == ErrorCode::INVALID_PARAMS))) {
-        shm->registered = false;
+        registered_shms_.erase(buffer);
     }
     return to_py_ret(ret);
 }
@@ -1855,6 +1874,227 @@ std::vector<int64_t> DummyClient::batch_get_into(
     return results;
 }
 
+std::vector<int> DummyClient::batch_get_session_start(
+    const std::vector<std::string>& keys) {
+    return session_results(
+        invoke_rpc<&RealClient::batch_get_session_start_dummy_helper,
+                   std::vector<int>>(keys, client_id_),
+        keys.size());
+}
+
+int DummyClient::batch_get_session_end(const std::vector<std::string>& keys) {
+    auto result =
+        invoke_rpc<&RealClient::batch_get_session_end_dummy_helper, int>(
+            keys, client_id_);
+    return result ? *result : toInt(result.error());
+}
+
+std::vector<int> DummyClient::batch_put_session_start(
+    const std::vector<std::string>& keys, const std::vector<size_t>& sizes,
+    const ReplicateConfig& config) {
+    if (keys.size() != sizes.size()) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
+    return session_results(
+        invoke_rpc<&RealClient::batch_put_session_start_dummy_helper,
+                   std::vector<int>>(keys, sizes, config, client_id_),
+        keys.size());
+}
+
+std::vector<int> DummyClient::batch_put_session_end(
+    const std::vector<std::string>& keys) {
+    return session_results(
+        invoke_rpc<&RealClient::finish_dummy_put_sessions, std::vector<int>>(
+            keys, client_id_, true),
+        keys.size());
+}
+
+std::vector<int> DummyClient::batch_put_session_revoke(
+    const std::vector<std::string>& keys) {
+    return session_results(
+        invoke_rpc<&RealClient::finish_dummy_put_sessions, std::vector<int>>(
+            keys, client_id_, false),
+        keys.size());
+}
+
+std::vector<int> DummyClient::batch_get_into_multi_buffer_ranges(
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes,
+    const std::vector<std::vector<size_t>>& all_src_offsets) {
+    return transfer_session_ranges(keys, all_buffers, all_sizes,
+                                   all_src_offsets, false);
+}
+
+std::vector<int> DummyClient::batch_put_from_multi_buffer_ranges(
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes,
+    const std::vector<std::vector<size_t>>& all_dst_offsets) {
+    return transfer_session_ranges(keys, all_buffers, all_sizes,
+                                   all_dst_offsets, true);
+}
+
+std::vector<int> DummyClient::transfer_session_ranges(
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes,
+    const std::vector<std::vector<size_t>>& all_offsets, bool is_write) {
+    std::vector<int> results(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size() ||
+        keys.size() != all_offsets.size()) {
+        return results;
+    }
+
+    // Record the expected byte count for each valid row. Negative results
+    // are skipped both when constructing the RPC and when unpacking its reply.
+    size_t total = 0;
+    bool caller_uses_pool = false;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& sizes = all_sizes[i];
+        if (sizes.size() != all_buffers[i].size() ||
+            sizes.size() != all_offsets[i].size())
+            continue;
+        size_t bytes = 0;
+        size_t j = 0;
+        for (; j < sizes.size(); ++j) {
+            void* buffer = all_buffers[i][j];
+            if (sizes[j] > std::numeric_limits<int>::max() - bytes ||
+                sizes[j] >
+                    std::numeric_limits<size_t>::max() - all_offsets[i][j] ||
+                !(is_dummy_shm_buffer(buffer, sizes[j], &caller_uses_pool) ||
+                  is_registered_buffer(buffer, sizes[j])))
+                break;
+            bytes += sizes[j];
+        }
+        if (j == sizes.size() &&
+            bytes <= std::numeric_limits<size_t>::max() - total) {
+            results[i] = static_cast<int>(bytes);
+            total += bytes;
+        }
+    }
+    if (std::none_of(results.begin(), results.end(),
+                     [](int result) { return result >= 0; }))
+        return results;
+    auto fail = [&](ErrorCode error) {
+        for (int& result : results)
+            if (result >= 0) result = toInt(error);
+        return results;
+    };
+    if (!shm_helper_) return fail(ErrorCode::INVALID_PARAMS);
+
+    // Keep a private allocation even for SHM callers: a timed-out RPC can
+    // still read/write its buffers after the synchronous API has returned.
+    const size_t capacity = std::max<size_t>(total, 1);
+    uint64_t address = 0;
+    if (local_buffer_base_ && !caller_uses_pool) {
+        auto allocation =
+            invoke_rpc<&RealClient::allocate_buffer_dummy,
+                       std::tuple<uint64_t, size_t>>(capacity, client_id_);
+        if (allocation) {
+            address = std::get<0>(*allocation);
+        } else if (allocation.error() != ErrorCode::NO_AVAILABLE_HANDLE) {
+            return fail(allocation.error());
+        }
+    }
+    const bool pooled = address != 0;
+    if (!pooled) {
+        address = alloc_from_mem_pool(capacity);
+        if (!address) return fail(ErrorCode::NO_AVAILABLE_HANDLE);
+        auto shm = shm_helper_->get_shm(reinterpret_cast<void*>(address));
+        if (map_shm(shm.get(), false) != 0) {
+            // A late registration can still refer to this VA. Leave it
+            // reserved.
+            return fail(ErrorCode::RPC_FAIL);
+        }
+    }
+
+    const auto& runtime =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    std::vector<std::vector<uint64_t>> addresses(keys.size());
+    size_t offset = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto& row = addresses[i];
+        if (results[i] < 0) {
+            row = {0};  // An unmappable row must never submit a partial write.
+            continue;
+        }
+        row.reserve(all_sizes[i].size());
+        for (size_t j = 0; j < all_sizes[i].size(); ++j) {
+            const size_t size = all_sizes[i][j];
+            const uint64_t slice = size ? address + offset : address;
+            if (is_write && size &&
+                !runtime.CopyToHost(reinterpret_cast<void*>(slice),
+                                    all_buffers[i][j], size)) {
+                results[i] = toInt(ErrorCode::INTERNAL_ERROR);
+                row = {0};
+                break;
+            }
+            row.push_back(slice);
+            offset += size;
+        }
+    }
+
+    const auto start_time = std::chrono::steady_clock::now();
+    auto reply = session_results(
+        invoke_rpc<&RealClient::execute_dummy_session_ranges, std::vector<int>>(
+            keys, addresses, all_sizes, all_offsets, device_id_, client_id_,
+            is_write),
+        keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] < 0) continue;
+        if (reply[i] >= 0 && reply[i] != results[i]) {
+            results[i] = toInt(ErrorCode::INTERNAL_ERROR);
+            continue;
+        }
+        results[i] = reply[i];
+        if (is_write || results[i] <= 0) continue;
+        for (size_t j = 0; j < addresses[i].size(); ++j) {
+            const size_t size = all_sizes[i][j];
+            if (size && !runtime.CopyFromHost(
+                            all_buffers[i][j],
+                            reinterpret_cast<void*>(addresses[i][j]), size)) {
+                results[i] = toInt(ErrorCode::INTERNAL_ERROR);
+                break;
+            }
+        }
+    }
+    // A transport failure can leave the handler or a lower-level transfer
+    // using staging. Unmapping the client reclaims these allocations.
+    const bool uncertain = std::any_of(reply.begin(), reply.end(), [](int rc) {
+        return rc == toInt(ErrorCode::RPC_FAIL) ||
+               rc == toInt(ErrorCode::RPC_TIMEOUT) ||
+               rc == toInt(ErrorCode::TRANSFER_FAIL) ||
+               rc == toInt(ErrorCode::WRITE_FAIL) ||
+               rc == toInt(ErrorCode::INTERNAL_ERROR);
+    });
+    if (pooled && !uncertain) {
+        (void)invoke_rpc<&RealClient::release_buffer_dummy, void>(address,
+                                                                  client_id_);
+    } else if (!pooled) {
+        void* buffer = reinterpret_cast<void*>(address);
+        bool retry_free = uncertain;
+        if (!uncertain) {
+            auto unmapped =
+                invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
+                    address, client_id_);
+            // An unconfirmed unregister can still arrive after client teardown.
+            // Keep its VA reserved; only a confirmed unregister permits reuse.
+            retry_free = unmapped && shm_helper_->free(buffer) != 0;
+        }
+        if (retry_free) {
+            std::lock_guard lock(shm_mutex_);
+            pending_session_staging_.push_back(buffer);
+        }
+    }
+    ObserveTransferMetric(
+        is_write ? TransferOperationKind::kWrite : TransferOperationKind::kRead,
+        is_write ? "batch_put_from_multi_buffer_ranges"
+                 : "batch_get_into_multi_buffer_ranges",
+        sum_positive_results(results), elapsed_us_since(start_time), true);
+    return results;
+}
+
 std::vector<int64_t> DummyClient::batch_get_into_cuda_ipc(
     const std::vector<mooncake::CudaIpcReadRequest>& requests) {
     const auto start_time = std::chrono::steady_clock::now();
@@ -2167,29 +2407,16 @@ void DummyClient::ping_thread_main() {
 
             // Reconnection Loop
             while (ping_running_) {
-                // Re-register ALL shms
-                bool all_registered = true;
-                const auto& shms = shm_helper_->get_shms();
-                for (const auto& shm_ptr : shms) {
-                    if (shm_ptr->registered) {
-                        if (globalConfig().ascend_agent_mode) {
-                            if (register_ascend_shm(shm_ptr.get(),
-                                                    shm_ptr->is_local) != 0) {
-                                LOG(WARNING)
-                                    << "Failed to re-register Ascend shared "
-                                       "memory during reconnection";
-                                all_registered = false;
-                                break;
-                            }
-                        } else if (register_shm_via_ipc(
-                                       shm_ptr.get(), shm_ptr->is_local) != 0) {
-                            LOG(WARNING)
-                                << "Failed to re-register shared memory "
-                                   "during reconnection";
-                            all_registered = false;
-                            break;
-                        }
-                    }
+                bool all_registered;
+                {
+                    std::lock_guard lock(shm_mutex_);
+                    all_registered = std::all_of(
+                        registered_shms_.begin(), registered_shms_.end(),
+                        [this](const auto& item) {
+                            return map_shm(item.second.get(),
+                                           item.first == local_buffer_base_) ==
+                                   0;
+                        });
                 }
 
 #if defined(USE_ASCEND_DIRECT)

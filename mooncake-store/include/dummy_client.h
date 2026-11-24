@@ -115,6 +115,27 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
+    std::vector<int> batch_get_session_start(
+        const std::vector<std::string> &keys) override;
+    std::vector<int> batch_get_into_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_src_offsets) override;
+    int batch_get_session_end(const std::vector<std::string> &keys) override;
+    std::vector<int> batch_put_session_start(
+        const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) override;
+    std::vector<int> batch_put_from_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_dst_offsets) override;
+    std::vector<int> batch_put_session_end(
+        const std::vector<std::string> &keys) override;
+    std::vector<int> batch_put_session_revoke(
+        const std::vector<std::string> &keys) override;
+
     std::vector<int> batch_put_from_cuda_ipc(
         const std::vector<CudaIpcWriteRequest> &requests,
         const ReplicateConfig &config = ReplicateConfig{});
@@ -253,7 +274,8 @@ class DummyClient : public PyClient {
     };
 
     bool is_device_buffer(void *buffer) const;
-    bool is_dummy_shm_buffer(void *buffer, size_t size) const;
+    bool is_dummy_shm_buffer(void *buffer, size_t size,
+                             bool *uses_pool = nullptr) const;
     std::optional<size_t> external_buffer_remaining(void *buffer) const;
     bool is_registered_buffer(void *buffer, size_t size) const;
     int register_external_buffer(void *buffer, size_t size);
@@ -280,6 +302,12 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         bool copy_to_staging = true, bool copy_back = false);
 
+    std::vector<int> transfer_session_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_offsets, bool is_write);
+
     struct ExternalBufferRegistration {
         size_t size = 0;
         size_t references = 0;
@@ -300,6 +328,7 @@ class DummyClient : public PyClient {
     int register_ascend_shm(const ShmHelper::ShmSegment *shm,
                             bool is_local = false);
 
+    int map_shm(const ShmHelper::ShmSegment *shm, bool local);
     int register_shm_via_ipc(const ShmHelper::ShmSegment *shm,
                              bool is_local = false);
 
@@ -369,6 +398,10 @@ class DummyClient : public PyClient {
     ShmHelper *shm_helper_ = nullptr;
     std::string ipc_socket_path_;
     void *local_buffer_base_ = nullptr;
+    mutable std::mutex shm_mutex_;
+    std::unordered_map<void *, std::shared_ptr<ShmHelper::ShmSegment>>
+        registered_shms_;
+    std::vector<void *> pending_session_staging_;
 
     // Hot cache shm mapping (obtained from real client via IPC)
     void *hot_cache_base_ = nullptr;
