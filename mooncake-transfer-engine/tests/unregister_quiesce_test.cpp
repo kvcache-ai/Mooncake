@@ -18,7 +18,6 @@
 #include "multi_transport.h"
 
 namespace mooncake {
-namespace {
 
 class UnregisterQuiesceTestPeer {
    public:
@@ -49,6 +48,8 @@ class UnregisterQuiesceTestPeer {
         return mt.memoryBusy(addr, length);
     }
 };
+
+namespace {
 
 Transport::BatchDesc* newBatch() {
     auto* batch = new Transport::BatchDesc;
