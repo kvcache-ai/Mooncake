@@ -3,6 +3,7 @@
 
 #include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
+#include <cmath>
 #include <csignal>
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
@@ -290,7 +291,7 @@ DEFINE_double(offload_cap_ratio, 0.5,
               "Controls how many objects can be queued for offload in a single "
               "eviction cycle before falling back to force-evict");
 DEFINE_validator(offload_cap_ratio, [](const char* flagname, double value) {
-    if (value < 0.0 || value > 1.0) {
+    if (std::isnan(value) || value < 0.0 || value > 1.0) {
         LOG(FATAL) << "offload_cap_ratio must be between 0.0 and 1.0";
         return false;
     }
@@ -302,6 +303,19 @@ DEFINE_bool(promotion_on_hit, false,
 DEFINE_uint32(promotion_admission_threshold, 2,
               "Min CountMinSketch count for a key before promotion fires "
               "(set 1 to disable second-touch gating)");
+DEFINE_validator(promotion_admission_threshold, [](const char* flagname,
+                                                   uint32_t value) {
+    if (value < mooncake::PromotionConfig::kMinAdmissionThreshold ||
+        value > mooncake::PromotionConfig::kMaxAdmissionThreshold) {
+        LOG(FATAL) << "promotion_admission_threshold must be between "
+                   << mooncake::PromotionConfig::kMinAdmissionThreshold
+                   << " and "
+                   << mooncake::PromotionConfig::kMaxAdmissionThreshold
+                   << ", current value: " << value;
+        return false;
+    }
+    return true;
+});
 DEFINE_uint32(promotion_queue_limit, 50000,
               "Max in-flight promotion tasks across all shards");
 DEFINE_uint32(promotion_max_per_heartbeat, 1,
@@ -310,6 +324,16 @@ DEFINE_uint32(promotion_max_per_heartbeat, 1,
               "SSD-read + RDMA-write on the client; serializing them avoids "
               "blocking past the client-liveness window. Default 1 is "
               "conservative.");
+DEFINE_validator(promotion_max_per_heartbeat, [](const char* flagname,
+                                                 uint32_t value) {
+    if (value < mooncake::PromotionConfig::kMinMaxPerHeartbeat) {
+        LOG(FATAL) << "promotion_max_per_heartbeat must be at least "
+                   << mooncake::PromotionConfig::kMinMaxPerHeartbeat
+                   << ", current value: " << value;
+        return false;
+    }
+    return true;
+});
 DEFINE_string(dynamic_replication_mode, "off",
               "Dynamic MEMORY replica fanout mode: off, observe, or enforce");
 DEFINE_uint32(dynamic_replication_heat_window_seconds, 10,
@@ -1122,19 +1146,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.kv_events_queue_capacity = FLAGS_kv_events_queue_capacity;
-    }
-    // Clamp promotion_admission_threshold into the sketch counter's
-    // representable range. The CountMinSketch uses 8-bit saturating
-    // counters (max 255) so any threshold beyond that would silently
-    // make the gate unreachable; clamping at parse time fails loudly and
-    // gives the gate a stable contract to compare uint8_t against.
-    if (master_config.promotion_admission_threshold > 255) {
-        LOG(WARNING) << "promotion_admission_threshold="
-                     << master_config.promotion_admission_threshold
-                     << " exceeds the CountMinSketch counter max (255). "
-                     << "Clamping to 255. Lower the configured value to "
-                     << "silence this warning.";
-        master_config.promotion_admission_threshold = 255;
     }
     if (master_config.dynamic_replication_mode != "off" &&
         master_config.dynamic_replication_mode != "observe" &&

@@ -34,12 +34,13 @@
 #include "client_offboarding.h"
 #include "client_session_event.h"
 #include "client_session_registry.h"
-#include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "dynamic_replication_controller.h"
 #include "lease.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
+#include "offload_manager.h"
+#include "promotion_manager.h"
 #include "segment.h"
 #include "local_ssd/manager.h"
 #include "tenant/quota_policy.h"
@@ -51,7 +52,6 @@
 #include "metadata/namespace_table.h"
 #include "metadata/object_route.h"
 #include "metadata/object_state.h"
-#include "promotion_candidate_tracker.h"
 #include "rpc_types.h"
 #include "replica.h"
 #include "ha/ha_types.h"
@@ -1181,7 +1181,8 @@ class MasterService {
     auto AddReplicaForRetainedClient(const UUID& client_id,
                                      const std::string& key,
                                      const TenantId& tenant_id,
-                                     Replica& replica)
+                                     Replica& replica,
+                                     bool record_usage = false)
         -> tl::expected<bool, ErrorCode>;
 
     void ClearInvalidHandles();
@@ -1313,9 +1314,6 @@ class MasterService {
 
     mutable SoftPinDeadlineIndex soft_pin_deadline_index_;
 
-    static bool HasCompletedMemoryCacheReplica(const ObjectMetadata& metadata);
-    static bool HasCompletedDiskCacheReplica(const ObjectMetadata& metadata);
-    static void SyncCacheTotalAccounting(ObjectMetadata& metadata);
     static void AccountCacheTotalRemoval(ObjectMetadata& metadata);
     std::vector<Replica> PopReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
@@ -1350,7 +1348,6 @@ class MasterService {
         const WeightRevisionMetadata& metadata,
         const std::vector<std::string>& member_keys);
 
-    void ReleaseLocalDiskUsage(std::span<const Replica> replicas);
     // How an erase is published to KV-event subscribers: as the object's
     // removal, or, when an upsert replaces it under the same lock, as the
     // state the replacement starts from.
@@ -1456,15 +1453,6 @@ class MasterService {
         ObjectMetadata& metadata, route::ObjectState& state,
         const std::function<bool(const Replica&)>& is_stale);
 
-    // True when client_id currently has a LOCAL_DISK registration.
-    // Momentarily takes the LocalSsdManager registry lock, so callers must not
-    // hold it; call before taking a key's lock. Callers that need the
-    // answer to stay true across a later metadata write must hold
-    // master_state_mutex_ (shared) across both -- UnmountLocalDiskSegment
-    // deregisters the client under the exclusive lock, so the check and the
-    // write cannot straddle a deregistration.
-    bool HasMountedLocalDiskSegment(const UUID& client_id);
-
     // Allocate the physical replicas without changing object metadata.  This
     // is used by leased upserts to prove that replacement storage is available
     // before the old metadata is removed.
@@ -1545,8 +1533,15 @@ class MasterService {
     void DiscardExpiredProcessingReplicas(
         const metadata::Namespace& ns,
         const std::chrono::system_clock::time_point& now);
+    // Scans global offload and promotion task tables once per round,
+    // re-checking each expired candidate under its per-object write lock.
+    void DiscardExpiredOffloadAndPromotionTasks(
+        const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          std::span<const Replica> replicas);
+    bool AllowsLocalDiskRegistration(const UUID& client_id) const;
+    std::optional<int64_t> UnregisterLocalDiskClient(const UUID& client_id);
+    void ReleaseLocalDiskUsage(std::span<const Replica> replicas);
     void RunDfsEviction();
     void RunShardDfsEviction();
     void RunBucketDfsEviction();
@@ -1572,21 +1567,6 @@ class MasterService {
     bool ProbeNoFSegment(const std::string& te_endpoint,
                          std::string* error_reason);
 
-    // Pushes an offload mirror for `replica` onto its host client's LocalSSD
-    // mailbox. When `mirror_clients` is non-null, the destination client is
-    // appended to it on success.
-    tl::expected<void, ErrorCode> PushOffloadingQueue(
-        const ObjectIdentity& object_id, Replica& replica,
-        std::vector<UUID>* mirror_clients = nullptr);
-
-    // Cancels the offload task on `object_id`, releasing the source refcnt
-    // and dropping the task marker along with its mirrors. Returns false
-    // without touching the task if any mirror has already been drained by a
-    // store worker.
-    bool CancelQueuedOffloadTask(ObjectMetadata& metadata,
-                                 route::ObjectState& state,
-                                 const ObjectIdentity& object_id);
-
     struct GracefulUnmountDeadlineRecord {
         UUID segment_id;
         UUID client_id;
@@ -1599,15 +1579,6 @@ class MasterService {
     const bool enable_async_segment_cleanup_;
 
     /**
-     * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an
-     * task into the holder client's LocalSSD mailbox.
-     * Caller is responsible for refcnt-pinning the source replica and
-     * recording the task on the object.
-     */
-    tl::expected<void, ErrorCode> PushPromotionQueue(
-        const ObjectIdentity& object_id, Replica& source_replica);
-
-    /**
      * @brief Helper invoked from GetReplicaList when an only-LOCAL_DISK key is
      * observed. Applies the gating chain (frequency / watermark / dedup /
      * cap), refcnt-pins the source LOCAL_DISK replica, records a
@@ -1618,26 +1589,7 @@ class MasterService {
     PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
                                                bool record_candidate = true,
                                                bool force = false);
-    void EraseCandidate(const ObjectIdentity& object_id);
-    void BackoffCandidate(const ObjectIdentity& object_id,
-                          PromotionQueueResult result);
     size_t RunPromotionCandidateRetry();
-
-    // Erase the object's in-flight PromotionTask and decrement the
-    // cluster-wide in-flight counter. Safe no-op if no task exists.
-    void ErasePromotionTaskIfPresent(route::ObjectState& state)
-        NO_THREAD_SAFETY_ANALYSIS {
-        if (state.promotion_task) {
-            state.promotion_task.reset();
-            promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
-            MasterMetricManager::instance().dec_promotion_in_flight();
-            MasterMetricManager::instance().inc_promotion_cancelled();
-        }
-    }
-    void CancelPromotionTaskForRemovedReplicas(
-        ObjectMetadata& metadata, route::ObjectState& state,
-        const std::vector<ReplicaID>& removed_replica_ids)
-        NO_THREAD_SAFETY_ANALYSIS;
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
@@ -1960,44 +1912,6 @@ class MasterService {
     // if high availability features enabled
     const bool enable_ha_;
 
-    const bool enable_offload_;
-
-    // Offload-on-evict: defer disk offload to eviction time
-    // (config: offload_on_evict)
-    bool offload_on_evict_{false};
-
-    // Promotion-on-hit: opt-in flag enabling LOCAL_DISK -> MEMORY promotion
-    // when a Get observes a key with only LOCAL_DISK replicas.
-    bool promotion_on_hit_{false};
-    uint32_t promotion_admission_threshold_{2};
-    uint32_t promotion_queue_limit_{50000};
-    uint32_t promotion_max_per_heartbeat_{1};
-    // Global in-flight task counter, checked against promotion_queue_limit_
-    // as the gate cap. Promotion specifically targets skewed
-    // access (hot keys re-accessed after eviction), so the global counter
-    // is the correct primitive. Incremented in TryPushPromotionQueue after
-    // successful enqueue; decremented in NotifyPromotionSuccess and in the
-    // promotion task reaper after the task entry is erased. Relaxed memory
-    // order is safe — the value is an advisory soft cap, not a barrier.
-    std::atomic<uint64_t> promotion_in_flight_{0};
-    // Promotion retry candidates: the index of due keys and the retry rules.
-    PromotionCandidateTracker promotion_candidates_;
-    // At most this many due candidates are tried per retry round.
-    static constexpr size_t kPromotionRetryBatchSize = 128;
-    // Bound on self-sustaining execution-failure cycles: a key whose
-    // promotion keeps failing at execution time (AllocStart under DRAM
-    // pressure, TE-write flake, SSD error) is re-recorded at most this many
-    // times. Bounds a persistently-failing ("poison") key to this many
-    // delivery slots (~this many heartbeat ticks, ~30s at the 10s default)
-    // before it stops re-queueing itself; genuine reads can still re-admit
-    // it afterwards with a fresh count.
-    static constexpr uint32_t kMaxPromotionExecutionFailures = 3;
-
-    // Master-side frequency sketch. Constructed only when promotion_on_hit_ is
-    // true. CountMinSketch is mutex-protected internally so we can call into it
-    // from any GetReplicaList caller without additional locking.
-    std::unique_ptr<CountMinSketch> promotion_sketch_;
-
     // Hot-object MEMORY replication: heat admission, placement and the leases
     // a client copies inside. The pending task of a key stays on its record.
     DynamicReplicationController dynamic_replication_;
@@ -2082,9 +1996,26 @@ class MasterService {
     // a different frozen bucket.
     std::mutex dfs_bucket_recovery_mutex_;
 
-    // Segment management
+    class OffloadHostView final : public OffloadManager::HostView {
+       public:
+        explicit OffloadHostView(MasterService& service) : service_(service) {}
+
+        bool IsReplicaReadable(const Replica& replica) const override;
+        bool ResolveSegmentOwners(
+            std::span<const std::string_view> segment_names,
+            std::span<UUID> out_owners) const override;
+
+       private:
+        MasterService& service_;
+    };
+
+    // Segment & LocalSSD management
+    const OffloadConfig offload_config_;
     SegmentManager segment_manager_;
     LocalSsdManager local_ssd_manager_;
+    OffloadHostView offload_host_view_;
+    OffloadManager offload_manager_;
+    PromotionManager promotion_manager_;
     NoFSegmentManager nof_segment_manager_;
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
@@ -2148,7 +2079,6 @@ class MasterService {
     std::mutex discarded_replicas_mutex_;
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
-    size_t offloading_queue_limit_ = 50000;
 
     // Task manager
     ClientTaskManager task_manager_;

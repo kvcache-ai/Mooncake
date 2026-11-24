@@ -6,8 +6,10 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -271,13 +273,19 @@ TEST_F(EvictorTest, ARunCutShortLeavesTheRestToTheNextRun) {
 
     // Shares of one each; the second reclaim fails, as an OpLog write would.
     reclaimer_.fail_at = 1;
-    EXPECT_TRUE(evictor.Run(Scope::All(), goal).stopped);
+    const auto failed = evictor.Run(Scope::All(), goal);
+    EXPECT_TRUE(failed.StoppedByError());
+    EXPECT_EQ(failed.stop_reason, eviction::StopReason::kReclaimError);
+    EXPECT_EQ(failed.stop_error, ErrorCode::INTERNAL_ERROR);
     ASSERT_EQ(reclaimer_.applied.size(), 1u);
     const char first = reclaimer_.applied.front()[0];
 
     reclaimer_.fail_at = -1;
     reclaimer_.applied.clear();
-    EXPECT_FALSE(evictor.Run(Scope::All(), goal).stopped);
+    const auto ok = evictor.Run(Scope::All(), goal);
+    EXPECT_FALSE(ok.Stopped());
+    EXPECT_EQ(ok.stop_reason, eviction::StopReason::kNone);
+    EXPECT_EQ(ok.stop_error, ErrorCode::OK);
     ASSERT_EQ(reclaimer_.applied.size(), 2u);
     EXPECT_NE(reclaimer_.applied.front()[0], first);
 }
@@ -406,7 +414,9 @@ TEST_F(EvictorTest, AFailedReclaimStopsTheRun) {
 
     const auto report = Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
 
-    EXPECT_TRUE(report.stopped);
+    EXPECT_TRUE(report.StoppedByError());
+    EXPECT_EQ(report.stop_reason, eviction::StopReason::kReclaimError);
+    EXPECT_EQ(report.stop_error, ErrorCode::INTERNAL_ERROR);
     EXPECT_EQ(reclaimer_.applied, std::vector<std::string>{"k1"});
     EXPECT_EQ(reclaimer_.applies, 2u);
 }
@@ -565,18 +575,24 @@ TEST_F(EvictorTest, AScopedRunStaysInItsNamespace) {
 // Accepts the first `capacity` offloads.
 class FakeOffloadQueue final : public eviction::OffloadQueue {
    public:
-    bool Push(const TenantId&, const std::string& key, Replica&,
-              std::vector<UUID>* mirror_clients) override {
-        if (pushed.size() >= capacity) {
+    bool HasInFlight(const TenantId&, const std::string& key) const override {
+        return in_flight.contains(key);
+    }
+
+    bool StartOffload(const TenantId&, const std::string& key,
+                      Replica& source) override {
+        if (in_flight.contains(key) || pushed.size() >= capacity) {
             return false;
         }
+        source.inc_refcnt();
         pushed.push_back(key);
-        mirror_clients->push_back(UUID{7, 7});
+        in_flight[key] = source.id();
         return true;
     }
 
     size_t capacity = SIZE_MAX;
     std::vector<std::string> pushed;
+    std::unordered_map<std::string, ReplicaID> in_flight;
 };
 
 class OffloadingReclaimerTest : public EvictorTest {
@@ -593,8 +609,11 @@ class OffloadingReclaimerTest : public EvictorTest {
         auto plan = policy_.Decide(candidate);
         EXPECT_TRUE(plan.has_value());
         auto effect = reclaimer.Apply(ns, *hold, *plan, so_far);
-        if (effect && hold->state().offloading_task.has_value()) {
-            offloading_source_ = hold->state().offloading_task->source_id;
+        if (effect) {
+            if (auto it = queue_.in_flight.find(key);
+                it != queue_.in_flight.end()) {
+                offloading_source_ = it->second;
+            }
         }
         return effect;
     }
@@ -698,6 +717,138 @@ TEST_F(OffloadingReclaimerTest, PastTheCapAForcedRunDropsWithoutOffload) {
     EXPECT_EQ(effect->outcome, Outcome::kDropped);
     EXPECT_EQ(effect->reason, eviction::DropReason::kOffloadCap);
     EXPECT_TRUE(queue_.pushed.empty());
+}
+
+TEST_F(OffloadingReclaimerTest, NonForcedRunStopsScanAtCapOrSaturation) {
+    // Non-forced run stops scanning as soon as `cap` offloads are queued.
+    Publish("a", "k1", seconds(10));
+    Publish("a", "k2", seconds(10));
+    Publish("a", "k3", seconds(10));
+    {
+        eviction::OffloadingReclaimer reclaimer(
+            inner_, queue_, {.cap = 2, .force_evict = false});
+        reclaimer.OnRunBegin();
+        eviction::Evictor evictor(namespaces_, policy_, reclaimer, {},
+                                  /*worker_threads=*/1);
+        const auto report = evictor.Run(
+            Scope::All(), ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+        EXPECT_EQ(report.Count(Outcome::kOffloadQueued), 2u);
+        EXPECT_EQ(report.visited, 2u);
+        EXPECT_TRUE(report.Stopped());
+        EXPECT_FALSE(report.StoppedByError());
+        EXPECT_EQ(report.stop_reason, eviction::StopReason::kOffloadCap);
+        EXPECT_EQ(report.stop_error, ErrorCode::OK);
+    }
+
+    // Saturated queue (capacity=0) in non-forced mode stops after
+    // kMaxConsecutiveRejections instead of scanning the remaining keys.
+    FakeOffloadQueue full_queue;
+    full_queue.capacity = 0;
+    const size_t total =
+        eviction::OffloadingReclaimer::kMaxConsecutiveRejections + 100;
+    for (size_t i = 0; i < total; ++i) {
+        Publish("b", "sat_" + std::to_string(i), seconds(10));
+    }
+    eviction::OffloadingReclaimer reclaimer(
+        inner_, full_queue, {.cap = 1000, .force_evict = false});
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer, {},
+                              /*worker_threads=*/1);
+    const auto report =
+        evictor.Run(Scope::Of(TenantId("b")),
+                    ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+    EXPECT_EQ(report.Count(Outcome::kOffloadQueued), 0u);
+    EXPECT_EQ(report.visited,
+              eviction::OffloadingReclaimer::kMaxConsecutiveRejections);
+    EXPECT_TRUE(report.Stopped());
+    EXPECT_FALSE(report.StoppedByError());
+    EXPECT_EQ(report.stop_reason, eviction::StopReason::kOffloadSaturated);
+    EXPECT_EQ(report.stop_error, ErrorCode::OK);
+}
+
+TEST_F(OffloadingReclaimerTest, ParallelRunHonorsOffloadCapAcrossWorkers) {
+    class ThreadSafeOffloadQueue final : public eviction::OffloadQueue {
+       public:
+        bool HasInFlight(const TenantId&,
+                         const std::string& key) const override {
+            std::lock_guard lock(mu);
+            return in_flight.contains(key);
+        }
+        bool StartOffload(const TenantId&, const std::string& key,
+                          Replica& source) override {
+            std::lock_guard lock(mu);
+            if (in_flight.contains(key)) return false;
+            source.inc_refcnt();
+            in_flight.insert(key);
+            return true;
+        }
+        mutable std::mutex mu;
+        std::unordered_set<std::string> in_flight;
+    };
+
+    class ParallelFakePolicy final : public eviction::EvictionPolicy {
+       public:
+        bool SupportsParallel() const override { return true; }
+        tl::expected<eviction::Plan, SkipReason> Decide(
+            const eviction::Candidate& candidate) const override {
+            eviction::Plan plan;
+            for (const Replica& replica : candidate.metadata.GetAllReplicas()) {
+                if (replica.is_memory_replica() && replica.is_completed() &&
+                    replica.get_refcnt() == 0) {
+                    plan.release.push_back(replica.id());
+                }
+            }
+            if (plan.release.empty()) {
+                return tl::make_unexpected(SkipReason::kNothingToRelease);
+            }
+            return plan;
+        }
+    };
+
+    class ParallelFakeReclaimer final : public eviction::Reclaimer {
+       public:
+        bool SupportsParallel() const override { return true; }
+        tl::expected<eviction::Effect, ErrorCode> Apply(
+            metadata::Namespace&, const route::WriteGuard& hold,
+            const eviction::Plan& plan, const eviction::Report&) override {
+            eviction::Effect e;
+            e.detached = hold.metadata().PopReplicas([&](const Replica& r) {
+                return std::find(plan.release.begin(), plan.release.end(),
+                                 r.id()) != plan.release.end();
+            });
+            e.released_bytes =
+                hold.metadata().TotalLength() * e.detached.size();
+            e.needs_teardown = !hold.metadata().IsValid();
+            e.outcome =
+                e.needs_teardown ? Outcome::kDropped : Outcome::kDemoted;
+            return e;
+        }
+        void TearDown(metadata::Namespace& ns,
+                      const route::WriteGuard& hold) override {
+            ns.BeforeTearDown(hold);
+            hold.TearDown();
+        }
+    };
+
+    for (size_t i = 0; i < 400; ++i) {
+        Publish("p", "pk_" + std::to_string(i), seconds(10));
+    }
+    ThreadSafeOffloadQueue ts_queue;
+    ParallelFakePolicy par_policy;
+    ParallelFakeReclaimer par_inner;
+    eviction::OffloadingReclaimer reclaimer(par_inner, ts_queue,
+                                            {.cap = 25, .force_evict = true});
+    EXPECT_TRUE(reclaimer.SupportsParallel());
+
+    eviction::Evictor evictor(namespaces_, par_policy, reclaimer, {},
+                              /*worker_threads=*/4);
+    const auto report =
+        evictor.Run(Scope::Of(TenantId("p")),
+                    ObjectGoal{.target_ratio = 0.5, .min_ratio = 0.25});
+    EXPECT_EQ(report.Count(Outcome::kOffloadQueued), 25u);
+    EXPECT_EQ(ts_queue.in_flight.size(), 25u);
+    EXPECT_GE(report.evicted_objects, 200u);
+    EXPECT_GT(report.offload_cap_drops, 0u);
+    EXPECT_EQ(report.workers, 4u);
 }
 
 // --- Report observers --------------------------------------------------------

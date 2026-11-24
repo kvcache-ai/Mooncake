@@ -607,22 +607,22 @@ TEST(ObjectRouteTest, WriteCursorChangesMetadataAndState) {
     for (const char* key : {"k1", "k2"}) {
         auto guard = route.WriteKey(key);
         test::PublishEnvelope(guard);
-        guard.state().offloading_task.emplace();
+        guard.state().replication_task.emplace();
     }
 
     // A write cursor may change a task, but not whether the object has work
     // in flight: it does not run the observer.
     for (auto object : route.WriteCursor()) {
         object.metadata().MutablePart(0).SetChecksum(42);
-        object.state().offloading_task->mirror_clients.push_back(UUID{3, 4});
+        object.state().replication_task->replica_ids.push_back(42);
     }
     for (const char* key : {"k1", "k2"}) {
         auto guard = route.Read(key);
         ASSERT_TRUE(guard.has_value());
         ASSERT_TRUE(guard->metadata().GetPart(0).checksum().has_value());
         EXPECT_EQ(*guard->metadata().GetPart(0).checksum(), 42u);
-        ASSERT_TRUE(guard->state().offloading_task.has_value());
-        EXPECT_EQ(guard->state().offloading_task->mirror_clients.size(), 1u);
+        ASSERT_TRUE(guard->state().replication_task.has_value());
+        EXPECT_EQ(guard->state().replication_task->replica_ids.size(), 1u);
     }
 }
 

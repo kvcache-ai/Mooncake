@@ -300,8 +300,10 @@ add_store_test(object_route_test object_route_test.cpp)
 add_store_test(heap_optional_test heap_optional_test.cpp)
 add_store_test(dynamic_replication_controller_test
                dynamic_replication_controller_test.cpp)
+add_store_test(offload_manager_test offload_manager_test.cpp)
 add_store_test(promotion_candidate_tracker_test
                promotion_candidate_tracker_test.cpp)
+add_store_test(promotion_manager_test promotion_manager_test.cpp)
 add_store_test(dynamic_replication_lease_table_test
                dynamic_replication_lease_table_test.cpp)
 add_store_test(group_index_test group_index_test.cpp)

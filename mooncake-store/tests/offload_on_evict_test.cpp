@@ -96,8 +96,8 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsQueuedOffloadWithOffloadOnEvict) {
     // PutEnd.
     const uint64_t kv_lease_ttl = 500;
     MasterServiceConfig config;
-    config.enable_offload = true;
-    config.offload_on_evict = true;
+    config.offload_config.enable_offload = true;
+    config.offload_config.offload_on_evict = true;
     config.default_kv_lease_ttl = kv_lease_ttl;
     auto service = std::make_unique<MasterService>(config);
 

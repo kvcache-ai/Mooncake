@@ -40,7 +40,7 @@ class MasterServiceTestPeer {
     static constexpr auto kDynamicReplicationWindowEntryLimit =
         DynamicReplicationController::kWindowEntryLimit;
     static constexpr auto kMaxPromotionExecutionFailures =
-        MasterService::kMaxPromotionExecutionFailures;
+        PromotionManager::kMaxPromotionExecutionFailures;
     static constexpr auto kPromotionCandidateMaxRetries =
         PromotionCandidateTracker::kMaxRetries;
 
@@ -270,26 +270,43 @@ class MasterServiceTestPeer {
         return service.ordered_oplog_writer_;
     }
 
-    static auto& PromotionAdmissionThreshold(MasterService& service) {
-        return service.promotion_admission_threshold_;
-    }
-    static const auto& PromotionAdmissionThreshold(
-        const MasterService& service) {
-        return service.promotion_admission_threshold_;
-    }
-
     static auto& PromotionCandidateCount(MasterService& service) {
-        return service.promotion_candidates_.count_;
+        return service.promotion_manager_.promotion_candidates_.count_;
     }
     static const auto& PromotionCandidateCount(const MasterService& service) {
-        return service.promotion_candidates_.count_;
+        return service.promotion_manager_.promotion_candidates_.count_;
     }
 
     static auto& PromotionInFlight(MasterService& service) {
-        return service.promotion_in_flight_;
+        return service.promotion_manager_.tasks_.CountAtomic();
     }
     static const auto& PromotionInFlight(const MasterService& service) {
-        return service.promotion_in_flight_;
+        return service.promotion_manager_.tasks_.CountAtomic();
+    }
+
+    static bool HasPromotionTask(const MasterService& service,
+                                 const TenantId& tenant_id,
+                                 const std::string& key) {
+        return service.promotion_manager_.HasTask(tenant_id, key);
+    }
+
+    static std::optional<PromotionTask> FindPromotionTask(
+        const MasterService& service, const TenantId& tenant_id,
+        const std::string& key) {
+        return service.promotion_manager_.FindTask(tenant_id, key);
+    }
+
+    static std::optional<PromotionCandidate> FindPromotionCandidate(
+        const MasterService& service, const TenantId& tenant_id,
+        const std::string& key) {
+        return service.promotion_manager_.FindCandidate(tenant_id, key);
+    }
+
+    static void SeedPromotionTask(MasterService& service,
+                                  const TenantId& tenant_id,
+                                  const std::string& key, PromotionTask task) {
+        service.promotion_manager_.SeedTaskForTesting(tenant_id, key,
+                                                      std::move(task));
     }
 
     static auto& ReplicaCleanupWorker(MasterService& service) {
@@ -456,6 +473,7 @@ class MasterServiceTestPeer {
                 service_.namespaces_.Lookup(tenant_id)) {
             service_.DiscardExpiredProcessingReplicas(*ns, now);
         }
+        service_.DiscardExpiredOffloadAndPromotionTasks(now);
     }
 
     uint32_t DynamicReplicationAdmissionMinHits() const {
@@ -553,10 +571,10 @@ class MasterServiceTestPeer {
         return service_.ProcessClientOffboardingJob(job);
     }
 
-    tl::expected<void, ErrorCode> PushOffloadingQueue(
-        const ObjectIdentity& object_id, Replica& replica,
-        std::vector<UUID>* mirror_clients = nullptr) {
-        return service_.PushOffloadingQueue(object_id, replica, mirror_clients);
+    bool StartOffloadForReplica(const ObjectIdentity& object_id,
+                                Replica& replica) {
+        return service_.offload_manager_.StartOffload(
+            object_id.tenant_id, object_id.user_key, replica);
     }
 
     const TenantId& ResolveRequestTenantId(const TenantId& tenant_id) const {

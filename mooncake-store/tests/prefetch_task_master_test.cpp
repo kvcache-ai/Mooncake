@@ -8,6 +8,7 @@
 // chain itself.
 
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -91,16 +92,12 @@ class PrefetchTaskMasterTest : public ::testing::Test {
         ASSERT_TRUE(put_end.has_value()) << "PutEnd failed for key=" << key;
     }
 
-    // Friend funnels (PrefetchTaskMasterTest is friended on MasterService).
-    // In-flight tasks live on the object's runtime state.
+    // Friend funnels through MasterServiceTestPeer.
     static bool HasPromotionTaskForTesting(MasterService* service,
                                            const TenantId& tenant_id,
                                            const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
-                                                   .user_key = key});
-        return accessor.Exists() &&
-               accessor.GetState().promotion_task.has_value();
+        return MasterServiceTestPeer::HasPromotionTask(*service, tenant_id,
+                                                       key);
     }
 
     static bool IsLeaseAliveForTesting(MasterService* service,
@@ -119,52 +116,30 @@ class PrefetchTaskMasterTest : public ::testing::Test {
     static std::optional<uint32_t> CandidateFailuresForTesting(
         MasterService* service, const TenantId& tenant_id,
         const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
-                                                   .user_key = key});
-        if (!accessor.Exists() ||
-            !accessor.GetState().promotion_candidate.has_value()) {
+        auto candidate = MasterServiceTestPeer::FindPromotionCandidate(
+            *service, tenant_id, key);
+        if (!candidate.has_value()) {
             return std::nullopt;
         }
-        return accessor.GetState().promotion_candidate->execution_failures;
+        return candidate->execution_failures;
     }
 
     // The in-flight task's execution-failure count if a task exists.
     static std::optional<uint32_t> TaskFailuresForTesting(
         MasterService* service, const TenantId& tenant_id,
         const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
-                                                   .user_key = key});
-        if (!accessor.Exists() ||
-            !accessor.GetState().promotion_task.has_value()) {
+        auto task =
+            MasterServiceTestPeer::FindPromotionTask(*service, tenant_id, key);
+        if (!task.has_value()) {
             return std::nullopt;
         }
-        return accessor.GetState().promotion_task->execution_failures;
-    }
-
-    // Seed an on-hit candidate carrying a prior execution-failure history,
-    // the way the retry pipeline leaves it after a failed chain.
-    static void SeedCandidateForTesting(MasterService* service,
-                                        const TenantId& tenant_id,
-                                        const std::string& key,
-                                        uint32_t failures) {
-        MasterService::MetadataAccessorRW accessor(
-            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
-                                                   .user_key = key});
-        if (!accessor.Exists()) {
-            return;
-        }
-        service->promotion_candidates_.RecordLocked(
-            tenant_id, key, accessor.GetState(), /*sketch_score=*/0,
-            PromotionCandidateReason::kExecutionFailed, ErrorCode::OK,
-            failures);
+        return task->execution_failures;
     }
 };
 
 TEST_F(PrefetchTaskMasterTest, RegisterSuccessThenDuplicateSkips) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.default_kv_lease_ttl = 2000;
     auto service = std::make_unique<MasterService>(config);
 
@@ -197,7 +172,7 @@ TEST_F(PrefetchTaskMasterTest, RegisterSuccessThenDuplicateSkips) {
 
 TEST_F(PrefetchTaskMasterTest, MissingKeyNotFound) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     auto service = std::make_unique<MasterService>(config);
 
     UUID holder = PrepareHolderClient(*service, "prefetch_seg_2");
@@ -211,7 +186,7 @@ TEST_F(PrefetchTaskMasterTest, MissingKeyNotFound) {
 
 TEST_F(PrefetchTaskMasterTest, NonHolderRejected) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     auto service = std::make_unique<MasterService>(config);
 
     UUID holder = PrepareHolderClient(*service, "prefetch_seg_3");
@@ -230,7 +205,7 @@ TEST_F(PrefetchTaskMasterTest, NonHolderRejected) {
 
 TEST_F(PrefetchTaskMasterTest, MemoryReplicaPresentSkips) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     auto service = std::make_unique<MasterService>(config);
 
     UUID holder = PrepareHolderClient(*service, "prefetch_seg_4");
@@ -246,7 +221,7 @@ TEST_F(PrefetchTaskMasterTest, MemoryReplicaPresentSkips) {
 
 TEST_F(PrefetchTaskMasterTest, NotifyPromotionSuccessGrantsLeaseForPrefetch) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.default_kv_lease_ttl = 2000;  // ms
     auto service = std::make_unique<MasterService>(config);
 
@@ -289,7 +264,7 @@ TEST_F(PrefetchTaskMasterTest, NotifyPromotionSuccessGrantsLeaseForPrefetch) {
 
 TEST_F(PrefetchTaskMasterTest, PrefetchFailureDoesNotRecordCandidate) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     auto service = std::make_unique<MasterService>(config);
 
     UUID holder = PrepareHolderClient(*service, "prefetch_seg_leak");
@@ -314,15 +289,34 @@ TEST_F(PrefetchTaskMasterTest, PrefetchFailureDoesNotRecordCandidate) {
 
 TEST_F(PrefetchTaskMasterTest, RegisterPropagatesCandidateFailureCount) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
+    config.promotion_config.promotion_on_hit = true;
+    config.promotion_config.promotion_admission_threshold = 1;
     auto service = std::make_unique<MasterService>(config);
+    // Stop background eviction/retry so the candidate recorded by
+    // NotifyPromotionFailure cannot be consumed before assertions and
+    // RegisterPrefetchTask run.
+    MasterServiceTestPeer::EvictionRunning(*service).store(
+        false, std::memory_order_relaxed);
+    if (MasterServiceTestPeer::EvictionThread(*service).joinable()) {
+        MasterServiceTestPeer::EvictionThread(*service).join();
+    }
 
     UUID holder = PrepareHolderClient(*service, "prefetch_seg_prop");
     ASSERT_TRUE(InjectLocalDiskOnlyKey(*service, holder, "pkp", 1024,
                                        "prefetch_seg_prop"));
-    // A previous chain (e.g. on-hit retries) already failed twice on this
-    // key; the candidate carries that history.
-    SeedCandidateForTesting(service.get(), TenantId::Default(), "pkp", 2);
+    // Drive two real on-hit promotion execution failures through public APIs so
+    // the candidate carries a failure history of 2.
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_TRUE(
+            service->GetReplicaList("pkp", TenantId::Default()).has_value());
+        ASSERT_TRUE(
+            service->NotifyPromotionFailure(holder, "pkp", TenantId::Default())
+                .has_value());
+    }
+    ASSERT_EQ(
+        CandidateFailuresForTesting(service.get(), TenantId::Default(), "pkp"),
+        std::optional<uint32_t>(2));
 
     ASSERT_TRUE(
         service->RegisterPrefetchTask(holder, "pkp", TenantId::Default())
