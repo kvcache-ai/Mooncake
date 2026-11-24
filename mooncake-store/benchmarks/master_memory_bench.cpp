@@ -46,7 +46,7 @@ constexpr uintptr_t kSegmentBase = 0x100000000ULL;
 
 DEFINE_string(master, "127.0.0.1:50051", "Master server address");
 DEFINE_string(model, "qwen3-8b",
-              "Model label recorded in the result; does not change workload");
+              "Model label written to the result; does not change workload");
 DEFINE_uint64(keys, 100000000, "Number of objects in the memory segment");
 DEFINE_uint64(object_bytes, 512, "Allocated bytes per object");
 DEFINE_uint64(batch_size, 64, "Keys per batch RPC");
@@ -272,7 +272,6 @@ void Read(const std::string& master, uint64_t keys, uint64_t batch_size,
           uint64_t threads, uint64_t duration_s, uint64_t rate,
           uint64_t amplify, uint64_t seed, LatencyStats& total) {
     std::atomic<uint64_t> next_batch{0};
-    std::atomic<bool> stop{false};
     const uint64_t batches = std::max<uint64_t>(1, keys / batch_size);
     const uint64_t target_rate = rate * amplify;
     const auto deadline =
@@ -287,7 +286,7 @@ void Read(const std::string& master, uint64_t keys, uint64_t batch_size,
                 mooncake::MasterClient client(mooncake::generate_uuid());
                 auto ec = client.Connect(master);
                 if (ec != mooncake::ErrorCode::OK) {
-                    return;
+                    throw std::runtime_error("read client connect failed");
                 }
 
                 mooncake::RandomEngine engine(seed + thread_id);
@@ -297,7 +296,7 @@ void Read(const std::string& master, uint64_t keys, uint64_t batch_size,
                         : std::chrono::nanoseconds(static_cast<uint64_t>(
                               1e9 * threads / target_rate));
 
-                while (!stop.load()) {
+                while (true) {
                     const auto now = std::chrono::steady_clock::now();
                     if (now >= deadline) {
                         break;
@@ -502,7 +501,8 @@ int main(int argc, char** argv) {
         output << json.str();
     }
 
-    if (fill.errors != 0 || read.errors != 0 || read.missing.load() != 0) {
+    if (fill.errors != 0 || read.errors != 0 || read.missing.load() != 0 ||
+        read.batches.load() == 0) {
         return 1;
     }
     return 0;
