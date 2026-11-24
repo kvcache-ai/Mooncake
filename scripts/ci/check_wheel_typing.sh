@@ -34,6 +34,27 @@ for marker in py.typed engine.pyi; do
     fi
 done
 
+"$python_bin" -I - <<'PYTHON'
+from operator import index
+
+from mooncake import engine
+
+for value in (
+    engine.TransferOpcode.Read,
+    engine.TransferStatus.COMPLETED,
+    engine.ScatterTransferCompletionStatus.COMPLETED,
+):
+    assert int(value) == index(value) == value.value
+    assert value != value.value
+
+assert engine.TransferOpcode.Read < engine.TransferOpcode.Write
+
+assert callable(engine.create_rpc_client)
+assert callable(engine.create_rpc_server)
+assert callable(engine.SharedSegment.create)
+assert isinstance(engine.SharedSegment.supported(), bool)
+PYTHON
+
 "$python_bin" -m mypy.stubtest mooncake.engine \
     --allowlist "$typing_dir/engine_stubtest_allowlist.txt" \
     --ignore-unused-allowlist

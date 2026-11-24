@@ -710,7 +710,10 @@ class RealClient : public PyClient {
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
         int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
-        bool enable_embedded_master = false);
+        bool enable_embedded_master = false, bool enable_ssd_prefetch = false,
+        int64_t ssd_prefetch_cooldown_sec = DEFAULT_SSD_PREFETCH_COOLDOWN_SEC,
+        int64_t ssd_prefetch_dedup_ttl_sec =
+            DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -887,6 +890,13 @@ class RealClient : public PyClient {
     ErrorCode CleanupNofRegisteredBuffers();
 
     tl::expected<bool, ErrorCode> isExist_internal(const std::string &key);
+
+    // Additive RPCs keep the legacy exist wire signatures unchanged.
+    tl::expected<bool, ErrorCode> isExistWithOptions_internal(
+        const std::string &key, const ExistOptions &options);
+
+    std::vector<tl::expected<bool, ErrorCode>> batchIsExistWithOptions_internal(
+        const std::vector<std::string> &keys, const ExistOptions &options);
 
     std::vector<tl::expected<bool, ErrorCode>> batchIsExist_internal(
         const std::vector<std::string> &keys);
@@ -1251,6 +1261,7 @@ class RealClient : public PyClient {
     mutable std::shared_mutex registered_buffer_mutex_;
     struct BufferRegistrationRecord {
         size_t size;
+        bool te_released = false;
     };
     // A present record means "registered OR cleanup-pending": a record is
     // retained when NoF/TE cleanup failed, in which case the buffer must
@@ -1479,7 +1490,8 @@ class RealClient : public PyClient {
         bool enable_ssd_offload, bool start_offload_rpc_server,
         const std::string &ssd_offload_path, const std::string &tenant_id,
         bool enable_client_http_server, int client_http_port,
-        bool enable_embedded_master);
+        bool enable_embedded_master, bool enable_ssd_prefetch,
+        int64_t ssd_prefetch_cooldown_sec, int64_t ssd_prefetch_dedup_ttl_sec);
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;

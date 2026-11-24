@@ -328,7 +328,15 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 
     static void global_init_once() {
         static std::once_flag once;
-        std::call_once(once, [] { curl_global_init(CURL_GLOBAL_ALL); });
+        std::call_once(once, [] {
+            curl_global_init(CURL_GLOBAL_ALL);
+            // Warm up authToken() so its function-local static initialises
+            // here, during plugin construction, instead of lazily on the
+            // first HTTP request. The getenv(3) call inside authToken() then
+            // runs before the embedding process can start spawning worker
+            // threads that race setenv(3) against it.
+            (void)authToken();
+        });
     }
 
     struct ThreadLocalCurl {

@@ -80,6 +80,7 @@ struct XferBenchConfig {
     static size_t start_batch_size;
     static size_t max_batch_size;
     static int duration;
+    static int warmup_ms;
     static int max_num_threads;
     static int start_num_threads;
     static size_t target_offset;

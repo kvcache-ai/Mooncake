@@ -60,6 +60,7 @@ int processBatchSizes(
     const bool read_verify = op_mode.read_verify;
     const OpCode opcode = op_mode.opcode;
     const bool random_access = op_mode.random_access;
+    const uint64_t warmup_ns = XferBenchConfig::warmup_ms * 1000000ull;
 
     XferBenchStats stats;
     std::vector<XferBenchStats> qos_stats(qos_classes.size());
@@ -189,7 +190,7 @@ int processBatchSizes(
 
         XferBenchTimer timer;
         setSplitWarmup(true);
-        while (timer.lap_ns(false) < 1000ull * 1000 * 1000) {  // 1 s
+        while (timer.lap_ns(false) < warmup_ns) {
             if (runner.runSingleTransfer(
                     local_addr, target_id, nextTargetAddr(), thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type) < 0) {
@@ -212,13 +213,9 @@ int processBatchSizes(
         if (mixed_opcode) {
             while (timer.lap_us(false) <
                    XferBenchConfig::duration * 1000000ull) {
-                const size_t bytes =
-                    checkedMul(thread_block_size, thread_batch_size,
-                               "consistency payload size");
-                const uint64_t batch_bytes = bytes;
                 uint8_t pattern = 0;
                 if (XferBenchConfig::check_consistency)
-                    pattern = fillData((void*)local_addr, bytes);
+                    pattern = fillData((void*)local_addr, op_bytes);
                 // Read back from where this iteration wrote.
                 const uint64_t op_target_addr = nextTargetAddr();
                 paceRequest();
@@ -226,37 +223,28 @@ int processBatchSizes(
                     local_addr, target_id, op_target_addr, thread_block_size,
                     thread_batch_size, WRITE, deadlineNs(), intent_type);
                 if (val < 0) return failTask();
-                thread_instant_bandwidth.push_back(
-                    gbPerSecond(batch_bytes, val));
+                thread_instant_bandwidth.push_back(gbPerSecond(op_bytes, val));
                 transfer_duration.push_back(val);
                 // Clobber the local copy so the READ must bring the data
                 // back; a value distinct from pattern keeps a no-op READ
                 // from passing verification.
                 if (XferBenchConfig::check_consistency)
-                    fillData((void*)local_addr, bytes, pattern ^ 0xFF);
+                    fillData((void*)local_addr, op_bytes, pattern ^ 0xFF);
                 paceRequest();
                 val = runner.runSingleTransfer(
                     local_addr, target_id, op_target_addr, thread_block_size,
                     thread_batch_size, READ, deadlineNs(), intent_type);
                 if (val < 0) return failTask();
-                thread_instant_bandwidth.push_back(
-                    gbPerSecond(batch_bytes, val));
+                thread_instant_bandwidth.push_back(gbPerSecond(op_bytes, val));
                 if (XferBenchConfig::check_consistency)
-                    verifyData((void*)local_addr,
-                               checkedMul(thread_block_size, thread_batch_size,
-                                          "consistency payload size"),
-                               pattern);
+                    verifyData((void*)local_addr, op_bytes, pattern);
                 transfer_duration.push_back(val);
             }
         } else {
             while (timer.lap_us(false) <
                    XferBenchConfig::duration * 1000000ull) {
-                const size_t bytes =
-                    checkedMul(thread_block_size, thread_batch_size,
-                               "operation payload size");
-                const uint64_t batch_bytes = bytes;
                 if (write_seed) {
-                    fillData((void*)local_addr, bytes,
+                    fillData((void*)local_addr, op_bytes,
                              stableDataSeed(target_addr));
                 }
                 paceRequest();
@@ -264,21 +252,17 @@ int processBatchSizes(
                     local_addr, target_id, nextTargetAddr(), thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type);
                 if (val < 0) return failTask();
-                thread_instant_bandwidth.push_back(
-                    gbPerSecond(batch_bytes, val));
+                thread_instant_bandwidth.push_back(gbPerSecond(op_bytes, val));
                 if (read_verify) {
-                    verifyData((void*)local_addr, bytes,
+                    verifyData((void*)local_addr, op_bytes,
                                stableDataSeed(target_addr));
                 }
                 transfer_duration.push_back(val);
             }
         }
         auto total_duration = timer.lap_us();
-        const uint64_t bytes_per_operation = checkedMul(
-            thread_block_size, thread_batch_size, "operation payload size");
-        const uint64_t transferred_bytes =
-            checkedMul(bytes_per_operation, transfer_duration.size(),
-                       "thread transferred bytes");
+        const uint64_t transferred_bytes = checkedMul(
+            op_bytes, transfer_duration.size(), "thread transferred bytes");
         std::lock_guard<std::mutex> lock(mutex);
         stats.total_duration.add(total_duration);
         stats.transfer_duration.add(transfer_duration);
