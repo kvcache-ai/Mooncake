@@ -739,3 +739,7 @@ add_store_test(ssd_fixed_l2_requester_test ssd_fixed_l2_requester_test.cpp)
 add_store_test(ssd_control_wire_test ssd_control_wire_test.cpp)
 
 add_store_test(ssd_tcp_write_target_test ssd_tcp_write_target_test.cpp)
+
+add_store_test(ssd_control_rpc_test ssd_control_rpc_test.cpp)
+
+add_store_test(ssd_peer_directory_test ssd_peer_directory_test.cpp)

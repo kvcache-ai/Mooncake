@@ -157,6 +157,27 @@ DestinationError SsdDirectReadOwner::UpsertPeer(SsdFixedL2Peer peer) {
     impl_->peers.push_back(std::move(peer));
     return DestinationError::kOk;
 }
+std::optional<WriteCredential> SsdDirectReadOwner::LookupCredential(
+    PeerIdentity identity) const {
+    if (!Valid(identity)) return {};
+    {
+        std::lock_guard lock(impl_->mutex);
+        const auto known = std::find_if(
+            impl_->peers.begin(), impl_->peers.end(),
+            [&](const auto& peer) { return peer.identity == identity; });
+        if (known != impl_->peers.end()) return known->credential;
+    }
+    if (!impl_->resolve_peer) return {};
+    try {
+        auto resolved = impl_->resolve_peer(identity);
+        if (resolved && resolved->identity == identity &&
+            ValidPeers({*resolved})) {
+            return resolved->credential;
+        }
+    } catch (...) {
+    }
+    return {};
+}
 SsdControlReply SsdDirectReadOwner::Execute(
     const SsdControlMessage& message,
     std::chrono::steady_clock::time_point received) {
