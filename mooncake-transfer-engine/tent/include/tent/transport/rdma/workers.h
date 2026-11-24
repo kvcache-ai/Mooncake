@@ -18,11 +18,13 @@
 #include <future>
 #include <memory>
 #include <queue>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <numeric>
 
 #include "context.h"
@@ -80,6 +82,12 @@ class Workers {
 
     DeviceSelector* getDeviceSelector() const { return device_selector_.get(); }
 
+    // Submit-side allocation with pinned peer metadata. An empty result leaves
+    // allocation to each worker slice (e.g. a request spans memory locations).
+    Status allocateDevices(const Request& request, uint32_t num_slices,
+                           uint64_t slice_bytes, uint64_t device_mask,
+                           std::vector<int>& slice_dev_ids);
+
    private:
     using Task = std::function<void()>;
     struct WorkerContext;
@@ -98,7 +106,9 @@ class Workers {
     // partway through a group of completions that share one timestamp.
     void handleCompletion(WorkerContext& worker, RdmaContext& context,
                           const ibv_wc& wc, uint64_t poll_ts,
-                          bool last_in_pass = true);
+                          bool last_in_pass = true,
+                          bool queue_already_drained = false,
+                          bool completion_owed = true);
 
     // The lane whose inflight_slice_set holds `slice`'s entry, or nullptr
     // when it cannot be resolved (no lane recorded, or the worker array is
@@ -247,6 +257,9 @@ class Workers {
     Status getRouteHint(RouteHint& hint, SegmentID segment_id, uint64_t addr,
                         uint64_t length);
 
+    uint64_t allocationDeviceMask(const RouteHint& source,
+                                  const RouteHint& target);
+
     Status selectOptimalDevice(RouteHint& source, RouteHint& target,
                                RdmaSlice* slice);
 
@@ -382,10 +395,9 @@ class Workers {
         // so parked entries can never starve behind contending producers.
         std::vector<std::pair<int, RdmaSliceList>> requeue_overflow;
 
-        // Values are held via unique_ptr so that map rehashing does not
-        // invalidate pointers into RailMonitor stored on in-flight slices
-        // (see RdmaSlice::rail_monitor).
-        std::unordered_map<std::string, std::unique_ptr<RailMonitor>> rails;
+        // Shared ownership keeps the monitor alive while a slice is retained
+        // by an endpoint through delayed teardown.
+        std::unordered_map<std::string, std::shared_ptr<RailMonitor>> rails;
         PerfMetricSummary perf;
         uint64_t padding[15];
     };
@@ -411,7 +423,17 @@ class Workers {
     // File contents loaded once from workers.rail_topo_path and shared by all
     // per-worker/per-peer RailMonitor instances.
     std::string rail_topo_json_;
+    // Separate from worker-owned dynamic rail state. Submitters only query
+    // static compatibility, refreshing pinned snapshots under the write lock.
+    std::shared_mutex allocation_rails_mutex_;
+    std::unordered_map<std::string, std::unique_ptr<RailMonitor>>
+        allocation_rails_;
     bool always_tier1_ = false;
+    // MC_ENABLE_DEST_DEVICE_AFFINITY: pin the remote NIC to the same name.
+    bool dest_device_affinity_ = false;
+    // One-shot warning for a peer that has no same-name NIC at all. Read on the
+    // selection hot path, so it is a plain atomic exchange rather than a lock.
+    std::atomic<bool> affinity_miss_warned_{false};
     // Opt-in deadline-aware bandwidth arbitration within a priority tier
     // (RFC #2792). Default false = original FIFO order (equal bandwidth split).
     bool deadline_bw_arbitration_ = false;

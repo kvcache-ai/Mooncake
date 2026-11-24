@@ -31,10 +31,16 @@ struct PromotionContext {
     std::vector<StandbyObjectEntry> objects;
     std::vector<StandbySegmentInfo> segments;
     WeightMetadataSnapshot weight_metadata;
+    ObjectReplicaSnapshot object_storage;
     std::unique_ptr<StandbyMetadataStore> metadata_store;
     DurablePrefix applied_cursor;
     ViewVersionId producer_view_version{0};
     ReplicaID max_replica_id{0};
+
+    bool HasObjectReplicaState() const {
+        return metadata_store ? metadata_store->HasObjectReplicaState()
+                              : object_storage.target.has_value();
+    }
 };
 
 class StandbyController {
@@ -69,6 +75,12 @@ class StandbyController {
 
     virtual void SetStandbyRuntimeStateCallback(
         RuntimeStateCallback callback) = 0;
+
+    // Put a detached promotion handoff back onto the standby so the next
+    // StartStandby resumes from that cursor instead of an older snapshot.
+    virtual ErrorCode RestorePromotionBaseline(PromotionContext) {
+        return ErrorCode::OK;
+    }
 };
 
 std::unique_ptr<StandbyController> CreateStandbyController(

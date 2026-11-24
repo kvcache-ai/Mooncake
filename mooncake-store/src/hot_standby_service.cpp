@@ -85,13 +85,18 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     if (!metadata_store_) {
         metadata_store_ = std::make_unique<StandbyMetadataStore>();
     }
+    const bool preserve_baseline = preserve_promotion_baseline_;
     batch_standby_reader_.reset();
-    batch_standby_kv_backend_.reset();
-    batch_snapshot_baseline_.reset();
-    batch_snapshot_producer_view_version_ = 0;
-    {
-        std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
-        last_applied_batch_snapshot_prefix_.reset();
+    if (!preserve_baseline) {
+        batch_standby_kv_backend_.reset();
+        batch_snapshot_baseline_.reset();
+        batch_snapshot_producer_view_version_ = 0;
+        preserved_segments_.clear();
+        {
+            std::lock_guard<std::mutex> cursor_lock(
+                batch_snapshot_cursor_mutex_);
+            last_applied_batch_snapshot_prefix_.reset();
+        }
     }
 
     last_error_.store(ErrorCode::OK, std::memory_order_release);
@@ -104,9 +109,11 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         return ErrorCode::INTERNAL_ERROR;  // State machine rejected START
     }
 
-    HAMetricManager::instance().reset_snapshot_runtime(
-        config_.enable_snapshot_bootstrap &&
-        batch_oplog_snapshot_provider_ != nullptr);
+    if (!preserve_baseline) {
+        HAMetricManager::instance().reset_snapshot_runtime(
+            config_.enable_snapshot_bootstrap &&
+            batch_oplog_snapshot_provider_ != nullptr);
+    }
     config_.primary_address = primary_address;
     oplog_endpoints_ = oplog_endpoints;
     cluster_id_ = cluster_id;
@@ -119,6 +126,8 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
             spec.type = oplog_backend_type_;
             spec.connstring = oplog_endpoints;
             spec.cluster_namespace = cluster_id;
+            spec.ha_redis_expected_replicas_per_shard =
+                config_.ha_redis_expected_replicas_per_shard;
             auto backend = CreateHaKvBackend(spec);
             if (!backend) {
                 if (backend.error() == ErrorCode::UNAVAILABLE_IN_CURRENT_MODE) {
@@ -179,6 +188,31 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
     oplog_applier_ =
         std::make_unique<OpLogApplier>(metadata_store_.get(), cluster_id_);
     if (batch_oplog_snapshot_provider_ && config_.enable_snapshot_bootstrap) {
+        if (preserve_promotion_baseline_ && metadata_store_ &&
+            batch_snapshot_baseline_) {
+            const uint64_t preserved_seq = batch_snapshot_baseline_->last_seq;
+            oplog_applier_->Recover(preserved_seq);
+            if (!preserved_segments_.empty()) {
+                oplog_applier_->LoadSegmentRegistry(preserved_segments_);
+            }
+            preserved_segments_.clear();
+            preserve_promotion_baseline_ = false;
+            applied_seq_id_.store(preserved_seq, std::memory_order_release);
+            primary_seq_id_.store(preserved_seq, std::memory_order_release);
+            HAMetricManager::instance().set_oplog_applied_sequence_id(
+                static_cast<int64_t>(preserved_seq));
+            baseline_seq_id = preserved_seq;
+            {
+                std::lock_guard<std::mutex> cursor_lock(
+                    batch_snapshot_cursor_mutex_);
+                last_applied_batch_snapshot_prefix_ = *batch_snapshot_baseline_;
+            }
+            LOG(INFO) << "Standby restart resumes preserved promotion cursor, "
+                      << "applied_seq=" << preserved_seq
+                      << ", batch_id=" << batch_snapshot_baseline_->batch_id;
+            return ErrorCode::OK;
+        }
+        preserve_promotion_baseline_ = false;
         return LoadBatchOpLogSnapshotBaselineLocked(baseline_seq_id);
     }
     if (has_recoverable_local_state) {
@@ -196,6 +230,8 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
 
     applied_seq_id_.store(baseline_seq_id, std::memory_order_release);
     primary_seq_id_.store(baseline_seq_id, std::memory_order_release);
+    HAMetricManager::instance().set_oplog_applied_sequence_id(
+        static_cast<int64_t>(baseline_seq_id));
     return ErrorCode::OK;
 }
 
@@ -237,6 +273,8 @@ ErrorCode HotStandbyService::LoadBatchOpLogSnapshotBaselineLocked(
     });
     applied_seq_id_.store(baseline_seq_id, std::memory_order_release);
     primary_seq_id_.store(baseline_seq_id, std::memory_order_release);
+    HAMetricManager::instance().set_oplog_applied_sequence_id(
+        static_cast<int64_t>(baseline_seq_id));
     return ErrorCode::OK;
 }
 
@@ -481,6 +519,8 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
     spec.type = oplog_backend_type_;
     spec.connstring = oplog_endpoints_;
     spec.cluster_namespace = cluster_id_;
+    spec.ha_redis_expected_replicas_per_shard =
+        config_.ha_redis_expected_replicas_per_shard;
     auto backend = CreateHaKvBackend(spec);
     if (!backend) {
         LOG(ERROR) << "Final OpLog catch-up failed to open backend: "
@@ -567,6 +607,61 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
             return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
         }
     }
+}
+
+void HotStandbyService::MarkAppliedCursorForRestart() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!metadata_store_ || !oplog_applier_) {
+        return;
+    }
+    const uint64_t applied_seq = GetLocalLastAppliedSequenceIdLocked();
+    std::optional<DurablePrefix> cursor =
+        batch_standby_reader_
+            ? batch_standby_reader_->GetLastAppliedDurablePrefix()
+            : batch_snapshot_baseline_;
+    if (!cursor || cursor->last_seq != applied_seq || applied_seq == 0) {
+        return;
+    }
+    batch_snapshot_baseline_ = *cursor;
+    preserved_segments_ = oplog_applier_->GetSegmentRegistry().GetAllSegments();
+    {
+        std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
+        last_applied_batch_snapshot_prefix_ = *cursor;
+    }
+    preserve_promotion_baseline_ = true;
+    LOG(INFO) << "Preserving standby cursor across restart, applied_seq="
+              << applied_seq << ", batch_id=" << cursor->batch_id;
+}
+
+ErrorCode HotStandbyService::PreservePromotionBaseline(
+    std::unique_ptr<StandbyMetadataStore> metadata_store,
+    DurablePrefix applied_cursor, ViewVersionId producer_view_version,
+    std::vector<StandbySegmentInfo> segments) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const StandbyState state = GetState();
+    if (state != StandbyState::STOPPED && state != StandbyState::FAILED) {
+        LOG(ERROR) << "Cannot preserve promotion cursor from state "
+                   << StandbyStateToString(state);
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    if (!metadata_store || applied_cursor.last_seq == 0) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    metadata_store_ = std::move(metadata_store);
+    batch_snapshot_baseline_ = applied_cursor;
+    batch_snapshot_producer_view_version_ = producer_view_version;
+    preserved_segments_ = std::move(segments);
+    {
+        std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
+        last_applied_batch_snapshot_prefix_ = applied_cursor;
+    }
+    applied_seq_id_.store(applied_cursor.last_seq, std::memory_order_release);
+    primary_seq_id_.store(applied_cursor.last_seq, std::memory_order_release);
+    preserve_promotion_baseline_ = true;
+    LOG(INFO) << "Reinstalled detached promotion baseline, applied_seq="
+              << applied_cursor.last_seq
+              << ", batch_id=" << applied_cursor.batch_id;
+    return ErrorCode::OK;
 }
 
 ErrorCode HotStandbyService::Promote() {
@@ -688,9 +783,11 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
     if (metadata_store_) {
         metadata_store_->Snapshot(out.objects);
         out.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+        out.object_storage = metadata_store_->SnapshotObjectReplicas();
     } else {
         out.objects.clear();
         out.weight_metadata = WeightMetadataSnapshot{};
+        out.object_storage = ObjectReplicaSnapshot{};
     }
     if (oplog_applier_) {
         out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
@@ -835,9 +932,11 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
     if (metadata_store_) {
         metadata_store_->Snapshot(out.objects);
         out.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+        out.object_storage = metadata_store_->SnapshotObjectReplicas();
     } else {
         out.objects.clear();
         out.weight_metadata = WeightMetadataSnapshot{};
+        out.object_storage = ObjectReplicaSnapshot{};
     }
 
     // Export segments from OpLogApplier's registry (Patch B)
@@ -932,6 +1031,7 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
             metadata_store_->BeginSnapshotTraversal(), state->generation,
             state);
         capture.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+        capture.object_storage = metadata_store_->SnapshotObjectReplicas();
         ready_snapshot_capture_ = std::move(capture);
         state->active = true;
     }
@@ -1072,6 +1172,8 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
     }
     applied_seq_id_.store(cursor->last_seq);
     primary_seq_id_.store(cursor->last_seq);
+    HAMetricManager::instance().set_oplog_applied_sequence_id(
+        static_cast<int64_t>(cursor->last_seq));
     last_error_.store(ErrorCode::OK);
     recovering_.store(false, std::memory_order_release);
     return metric_timer.Success(ErrorCode::OK);

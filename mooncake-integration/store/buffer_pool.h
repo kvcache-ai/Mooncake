@@ -1,11 +1,11 @@
 #pragma once
 
-#include <pybind11/pybind11.h>
+#include <nanobind/nanobind.h>
 
-namespace py = pybind11;
+namespace py = nanobind;
 
 namespace mooncake {
 
-void bind_buffer_pool(py::module &m);
+void bind_buffer_pool(py::module_ &m);
 
 }  // namespace mooncake

@@ -54,7 +54,17 @@ class TenantQuotaAccount {
     static constexpr uint64_t kMaxChargedBytes = kChargedBytesMask;
 
     TenantQuotaChargeResult TryCharge(uint64_t bytes);
+    // Charges `bytes` whatever the quota and the admission state, saturating
+    // at kMaxChargedBytes: for memory already in use that was not charged up
+    // front.
+    void ChargeUnchecked(uint64_t bytes);
     TenantQuotaResult Release(uint64_t bytes);
+
+    // A write to the tenant begins: refused with kTenantNotRegistered once
+    // admission is closed. Until the matching EndWrite, the tenant's policy
+    // cannot be disabled, even while the write has charged nothing.
+    TenantQuotaResult BeginWrite();
+    void EndWrite();
 
     uint64_t ChargedBytes() const;
     uint64_t EffectiveQuotaBytes() const;
@@ -71,6 +81,8 @@ class TenantQuotaAccount {
 
     // Bit 63 closes admission; bits 0..62 contain charged bytes.
     alignas(64) std::atomic<uint64_t> charged_state_{kAdmissionClosed};
+    // Writes between BeginWrite and EndWrite.
+    std::atomic<uint64_t> writes_in_flight_{0};
 
     // Keep control-plane writes off the charged-state cache line.
     alignas(64) std::atomic<uint64_t> effective_quota_bytes_{0};

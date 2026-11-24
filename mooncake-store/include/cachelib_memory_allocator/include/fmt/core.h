@@ -2709,7 +2709,10 @@ class format_string_checker {
 
   FMT_CONSTEXPR auto on_format_specs(int id, const Char* begin, const Char*)
       -> const Char* {
-    context_.advance_to(context_.begin() + (begin - &*context_.begin()));
+    // Upstream fmt fix (>= 8.1): `&*context_.begin()` is not a constant
+    // expression under recent clang-based compilers (including icpx) and
+    // breaks consteval FMT_STRING checks.
+    context_.advance_to(begin);
     // id >= 0 check is a workaround for gcc 10 bug (#2065).
     return id >= 0 && id < num_args ? parse_funcs_[id](context_) : begin;
   }
@@ -2842,7 +2845,10 @@ template <typename Char, typename... Args> class basic_format_string {
     if constexpr (detail::count_named_args<Args...>() == 0) {
       using checker = detail::format_string_checker<Char, detail::error_handler,
                                                     remove_cvref_t<Args>...>;
-      detail::parse_format_string<true>(str_, checker(s, {}));
+      // Parse and check the same view: converting `s` a second time yields a
+      // distinct constant-evaluated literal object, and clang-based compilers
+      // (including icpx) reject pointer arithmetic across the two.
+      detail::parse_format_string<true>(str_, checker(str_, {}));
     }
 #else
     detail::check_format_string<Args...>(s);

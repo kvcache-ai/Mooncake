@@ -573,12 +573,26 @@ curl -X PUT http://localhost:9003/api/v1/dfs/shard_count \
 
 ### Drain Job Endpoints
 
-Drain jobs migrate all objects away from one or more segments so they can be
-unmounted safely. Job states follow `CREATED -> PLANNING -> RUNNING ->
-SUCCEEDED | FAILED | CANCELED`.
+Drain jobs move replicas, including those of hard-pinned or soft-pinned objects, off one or
+more segments so the segments can be unmounted safely. Hard-pinned and soft-pinned objects
+retain their eviction protection and TTL after the move.
+
+A job starts in `CREATED` and normally progresses through `PLANNING` and
+`RUNNING`. It reaches `SUCCEEDED` once the source segments are empty and their
+allocations have been reclaimed. If the sources are already empty, it can go
+directly from `CREATED` to `SUCCEEDED`. It reaches `FAILED` when all remaining
+migration units have exhausted their retry budgets.
+
+A cancellation request or an expired deadline moves a job from `CREATED`,
+`PLANNING`, or `RUNNING` to `CANCELING`. Once in-flight tasks have stopped and
+cleanup is complete, the job reaches `CANCELED` for a user cancellation or
+`TIMED_OUT` for a deadline. After a timeout, unfinished source segments stay
+`DRAINING` so a new job can resume draining them.
 
 #### `POST /api/v1/drain_jobs`
-Create a drain job for the given segments.
+Create an untimed drain job for the given segments. To set a deadline, use
+{ref}`the Python DrainJob API <python-timed-drain-job>` with `timeout_ms`, or use
+`mooncake_store_create_timed_drain_job()` in C.
 
 **Method**: `POST`
 **Content-Type**: `application/json; charset=utf-8`
@@ -614,7 +628,8 @@ curl -X POST http://localhost:9003/api/v1/drain_jobs \
 ```
 
 #### `GET /api/v1/drain_jobs/query`
-Query the status and progress of a drain job.
+Query the status and progress of a drain job, including timed jobs created
+through the native APIs.
 
 **Method**: `GET`
 **Parameters**: `job_id` (query parameter) - UUID returned by the create call
@@ -648,7 +663,9 @@ curl "http://localhost:9003/api/v1/drain_jobs/query?job_id=00000000-0000-0000-00
 
 **Fields**:
 - `type` / `type_name` (integer / string): Job type; currently always `DRAIN` (0)
-- `status` / `status_name` (integer / string): Job status. One of `CREATED` (0), `PLANNING` (1), `RUNNING` (2), `SUCCEEDED` (3), `FAILED` (4), `CANCELED` (5)
+- `status` / `status_name` (integer / string): Job status. One of
+  `CREATED` (0), `PLANNING` (1), `RUNNING` (2), `SUCCEEDED` (3),
+  `FAILED` (4), `CANCELED` (5), `CANCELING` (6), or `TIMED_OUT` (7).
 - `succeeded_units` / `failed_units` / `blocked_units` / `active_units` (integer): Per-object migration counters
 - `migrated_bytes` (integer): Total bytes migrated so far
 - `message` (string): Additional status or error message
@@ -663,8 +680,9 @@ curl "http://localhost:9003/api/v1/drain_jobs/query?job_id=00000000-0000-0000-00
 ```
 
 #### `POST /api/v1/drain_jobs/cancel`
-Cancel a running drain job. Objects already migrated stay migrated; objects not
-yet migrated remain on the source segments.
+Request cancellation of a drain job. Objects already migrated stay migrated.
+The response can report `CANCELING` while in-flight tasks stop and cleanup
+finishes. Query the job to check its terminal state.
 
 **Method**: `POST`
 **Parameters**: `job_id` (query parameter) - UUID returned by the create call
@@ -797,6 +815,55 @@ curl -X DELETE "http://localhost:9003/api/v1/tenant_quotas?tenant_id=tenant-a"
   "data": null
 }
 ```
+
+### Soft-Pin Control Endpoints
+
+`POST /api/v1/soft_pin` and `POST /api/v1/soft_unpin` update existing
+objects without another Put or Upsert. They are served on the master's admin
+HTTP port, not the Store RPC or Transfer Engine metadata port.
+
+```bash
+curl -X POST http://localhost:9003/api/v1/soft_pin \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"default","keys":["object-a","object-b"],"ttl_ms":60000}'
+
+curl -X POST http://localhost:9003/api/v1/soft_unpin \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"default","keys":["object-a","object-b"]}'
+```
+
+- `keys` contains 1–4096 exact object keys. Logical KV pages split into multiple
+  component objects require every relevant key to be supplied.
+- `tenant_id` defaults to `default`, with the same tenant resolution as Store
+  operations. When multi-tenancy is disabled, operations use the default tenant.
+- `ttl_ms` is required for `soft_pin` and must be absent for `soft_unpin`.
+  Each successful pin replaces the deadline with the master's current time plus
+  this TTL, so a repeated command can extend or shorten protection. The master's
+  `max_kv_soft_pin_ttl` limit applies. Zero TTL clears the soft pin.
+- Unpin clears the object's soft pin regardless of which sessions use it. The
+  caller owns sharing policy and command ordering. Neither operation changes
+  hard pins, read leases, session tags, or object data.
+- TTL expiration makes the object eligible for normal eviction; it does not
+  delete the object. Eviction checks the deadline directly; the soft-pin count
+  metric can lag until the existing periodic cleanup runs. Pressure eviction
+  still follows `allow_evict_soft_pinned_objects`. These soft pins are volatile master state,
+  following existing write-time soft-pin behavior; they are not persisted in
+  the metadata OpLog for failover.
+
+HTTP 200 contains one result per input key, in input order. A batch is not
+atomic and HTTP 200 does not mean that every key succeeded:
+
+```json
+{"results":[{"key":"object-a","error_code":0},{"key":"object-b","error_code":-704}]}
+```
+
+`0` means success, `-704` means the object was not found, `-703` means a write
+is in progress or there is no completed replica, and `-600` means invalid
+parameters (including TTL above the configured limit). Missing objects are
+not created. Repeated unpin succeeds while the object still exists.
+Malformed requests return HTTP 400. An inactive service plane returns HTTP
+503. A transport timeout leaves the result unknown; callers must coordinate
+retries with newer commands because replaying a pin resets its deadline.
 
 ### Data Deletion Endpoints
 

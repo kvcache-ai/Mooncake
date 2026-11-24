@@ -441,6 +441,15 @@ QueueOwnerInput makeDegradationEligibleOwnerWithDeadline(size_t public_task_id,
     return owner;
 }
 
+QueueOwnerInput makeTransportDegradationOwnerWithDeadline(
+    size_t public_task_id, size_t length, uint64_t deadline_ns,
+    TransportType transport) {
+    QueueOwnerInput owner = makeDegradationEligibleOwnerWithDeadline(
+        public_task_id, length, deadline_ns);
+    owner.transport = transport;
+    return owner;
+}
+
 TEST(AdmissionQueueTest, DeadlineAwareDispatchesEarliestDeadlineFirst) {
     QueueLimits limits{4, 4096, 0, 0};
     limits.deadline_aware = true;
@@ -977,6 +986,75 @@ TEST(AdmissionQueueTest, Step3DynamicBandwidthProvider) {
     ASSERT_EQ(picked.size(), 1u);
     EXPECT_TRUE(dropped.empty());
     EXPECT_EQ(hook_calls, 1);
+}
+
+TEST(AdmissionQueueTest, Step3UsesBandwidthForEachOwnersTransport) {
+    LocalTransferAdmissionQueue queue(step3Limits(1.5));
+    int rdma_queries = 0;
+    int ub_queries = 0;
+    queue.setTransportDegradationPolicy(
+        [&](TransportType type) {
+            if (type == RDMA) {
+                ++rdma_queries;
+                return 1e9;  // 16 B takes 16 ns: MLU 1.6, so drop.
+            }
+            if (type == UB) {
+                ++ub_queries;
+                return 1e10;  // 16 B takes 1.6 ns: MLU 0.16, so dispatch.
+            }
+            return -1.0;
+        },
+        DegradationHooks{}, [] { return uint64_t{1'000'000'000}; });
+
+    std::vector<QueueOwnerId> admitted_ids;
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 2,
+                                  {makeTransportDegradationOwnerWithDeadline(
+                                       0, 16, 1'000'000'010, RDMA),
+                                   makeTransportDegradationOwnerWithDeadline(
+                                       1, 16, 1'000'000'010, UB)}),
+                       admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 2u);
+
+    std::vector<QueueOwnerId> dropped;
+    auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+    const std::vector<QueueOwnerId> expected_picked{2};
+    const std::vector<QueueOwnerId> expected_dropped{1};
+    EXPECT_EQ(picked, expected_picked);
+    EXPECT_EQ(dropped, expected_dropped);
+    EXPECT_EQ(rdma_queries, 1);
+    EXPECT_EQ(ub_queries, 1);
+}
+
+TEST(AdmissionQueueTest, Step3DoesNotDropUbWithoutBandwidthSample) {
+    for (double no_sample : {0.0, -1.0}) {
+        SCOPED_TRACE(no_sample);
+        LocalTransferAdmissionQueue queue(step3Limits(1.5));
+        int ub_queries = 0;
+        queue.setTransportDegradationPolicy(
+            [&](TransportType type) {
+                EXPECT_EQ(type, UB);
+                ++ub_queries;
+                return no_sample;
+            },
+            DegradationHooks{}, [] { return uint64_t{1'000'000'000}; });
+
+        std::vector<QueueOwnerId> admitted_ids;
+        auto status = queue.tryAdmit(
+            makeSubmit(1, 1,
+                       {makeTransportDegradationOwnerWithDeadline(
+                           0, 16, 1'000'000'010, UB)}),
+            admitted_ids);
+        ASSERT_EQ(status.code(), Status::Code::kOk);
+
+        std::vector<QueueOwnerId> dropped;
+        auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+        const std::vector<QueueOwnerId> expected_picked{1};
+        EXPECT_EQ(picked, expected_picked);
+        EXPECT_TRUE(dropped.empty());
+        EXPECT_EQ(ub_queries, 1);
+    }
 }
 
 TEST(AdmissionQueueTest, Step3SkipsNonRdmaOwner) {

@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
+#include <limits>
 #include <sstream>
 
 namespace mooncake {
@@ -51,9 +53,16 @@ Status Config::load(const std::string& content) {
     try {
         config_data_ = json::parse(content);
         return Status::OK();
-    } catch (const std::exception& e) {
-        return Status::InvalidArgument(std::string("Invalid JSON: ") +
-                                       e.what() + LOC_MARK);
+    } catch (const json::parse_error& e) {
+        // what() includes the last input token, which may contain credentials.
+        return Status::InvalidArgument("Invalid JSON: parse error " +
+                                       std::to_string(e.id) + " at byte " +
+                                       std::to_string(e.byte) + LOC_MARK);
+    } catch (const json::exception& e) {
+        return Status::InvalidArgument("Invalid JSON: parse error " +
+                                       std::to_string(e.id) + LOC_MARK);
+    } catch (const std::exception&) {
+        return Status::InvalidArgument("Invalid JSON: parsing failed" LOC_MARK);
     }
 }
 
@@ -121,6 +130,58 @@ std::vector<std::string> Config::paths() const {
     return paths;
 }
 
+static inline const char* getEnvWithFallback(const char* primary,
+                                             const char* fallback,
+                                             const char* extra = nullptr) {
+    for (const char* name : {primary, fallback, extra}) {
+        if (!name) continue;
+        const char* val = std::getenv(name);
+        if (val != nullptr && val[0] != '\0') return val;
+    }
+    return nullptr;
+}
+
+static inline void setStringConfigWithFallback(Config& config,
+                                               const char* primary,
+                                               const char* fallback,
+                                               const std::string& config_key,
+                                               const char* extra = nullptr) {
+    const char* val = getEnvWithFallback(primary, fallback, extra);
+    if (val) config.set(config_key, std::string(val));
+}
+
+static inline void setBoolConfigWithFallback(Config& config,
+                                             const char* primary,
+                                             const char* fallback,
+                                             const std::string& config_key) {
+    const char* val = getEnvWithFallback(primary, fallback);
+    if (!val) return;
+    config.set(config_key,
+               ConfigHelper::parseBool(val, config.get(config_key, false)));
+}
+
+static inline void setBoundedIntConfigWithFallback(
+    Config& config, const char* primary, const char* fallback,
+    const std::string& config_key, int64_t min_val, int64_t max_val) {
+    const char* val = getEnvWithFallback(primary, fallback);
+    if (!val) return;
+    try {
+        size_t parsed = 0;
+        long long int_val = std::stoll(val, &parsed);
+        if (parsed != std::strlen(val) || int_val < min_val ||
+            int_val > max_val) {
+            LOG(WARNING) << "Invalid value '" << val << "' for " << primary
+                         << "/" << fallback << " (expected [" << min_val << ", "
+                         << max_val << "]), ignoring";
+            return;
+        }
+        config.set(config_key, int_val);
+    } catch (const std::exception&) {
+        LOG(WARNING) << "Invalid integer '" << val << "' for " << primary << "/"
+                     << fallback << ", ignoring";
+    }
+}
+
 static inline void setConfig(Config& config, const std::string& env_key,
                              const std::string& config_key) {
     const char* val = std::getenv(env_key.c_str());
@@ -157,10 +218,23 @@ static inline void setArrayConfig(Config& config, const std::string& env_key,
 
 void ConfigHelper::forceTcp(Config& config) {
     config.set("transports/force_tcp", true);
+    config.set("transports/force_fabric", false);
     config.set("transports/tcp/enable", true);
     config.set("transports/rdma/enable", false);
     config.set("transports/hp_tcp/enable", false);
     config.set("transports/fabric/enable", false);
+}
+
+void ConfigHelper::forceFabric(Config& config, const std::string& provider) {
+    // Memory routing is pinned separately; leave file/platform paths available.
+    config.set("transports/force_tcp", false);
+    config.set("transports/force_fabric", true);
+    config.set("transports/tcp/enable", false);
+    config.set("transports/rdma/enable", false);
+    config.set("transports/hp_tcp/enable", false);
+    config.set("transports/shm/enable", false);
+    config.set("transports/fabric/enable", true);
+    config.set("transports/fabric/provider", provider);
 }
 
 Status ConfigHelper::loadFromEnv(Config& config) {
@@ -172,9 +246,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
         try {
             is_file = std::filesystem::exists(conf);
         } catch (const std::filesystem::filesystem_error& e) {
-            LOG(WARNING) << "Failed to check file existence for MC_TENT_CONF="
-                         << conf << ": " << e.what()
-                         << ", treating as JSON string";
+            LOG(WARNING) << "Failed to check MC_TENT_CONF as a file: "
+                         << e.code().message() << ", treating as JSON string";
         }
         if (is_file) {
             status = config.loadFile(conf);
@@ -202,6 +275,24 @@ Status ConfigHelper::loadFromEnv(Config& config) {
             << "MC_FORCE_TCP is set, forcing TENT memory transfers to use TCP";
     }
     setBoolConfig(config, "MC_MNNVL_EGM", "transports/mnnvl/egm");
+    // Fail closed on malformed new controls instead of silently disabling them.
+    for (const auto& entry : {std::pair{"MC_MNNVL_REQUIRE_FABRIC",
+                                        "transports/mnnvl/require_fabric"}}) {
+        const char* value = std::getenv(entry.first);
+        if (!value) continue;
+        std::string normalized(value);
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (normalized != "true" && normalized != "false" &&
+            normalized != "1" && normalized != "0" && normalized != "yes" &&
+            normalized != "no" && normalized != "on" && normalized != "off") {
+            return Status::InvalidArgument(std::string("Invalid boolean: ") +
+                                           entry.first);
+        }
+        config.set(entry.second, parseBool(normalized));
+    }
+    if (const char* mode = std::getenv("MC_MNNVL_SYNC_MODE"))
+        config.set("transports/mnnvl/sync_mode", std::string(mode));
     setConfig(config, "MC_RDMA_BIND_ADDRESS", "transports/rdma/bind_address");
     setConfig(config, "MC_NUM_CQ_PER_CTX",
               "transports/rdma/device/num_cq_list");
@@ -217,6 +308,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
               "transports/rdma/endpoint/qp_mul_factor");
     setConfig(config, "MC_MAX_SGE", "transports/rdma/endpoint/max_sge");
     setConfig(config, "MC_MAX_WR", "transports/rdma/endpoint/max_qp_wr");
+    setConfig(config, "MC_TENT_RDMA_SIGNAL_INTERVAL",
+              "transports/rdma/endpoint/signal_interval");
     setConfig(config, "MC_MAX_INLINE",
               "transports/rdma/endpoint/max_inline_bytes");
     setConfig(config, "MC_PKEY_INDEX", "transports/rdma/endpoint/pkey_index");
@@ -230,12 +323,15 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     setConfig(config, "MC_SLICE_SIZE", "transports/rdma/workers/block_size");
     setConfig(config, "MC_RETRY_CNT",
               "transports/rdma/workers/max_retry_count");
-    setConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
-              "transports/rdma/disable_gpu_direct_rdma");
-    setConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
-              "transports/rdma/log_slice_affinity");
+    setBoolConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
+                  "transports/rdma/disable_gpu_direct_rdma");
+    setBoolConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
+                  "transports/rdma/log_slice_affinity");
     setBoolConfig(config, "MC_STRICT_LOCAL_NUMA",
                   "transports/rdma/strict_local_numa");
+    // Same-name remote NIC affinity. Workers read this key when selecting.
+    setBoolConfig(config, "MC_ENABLE_DEST_DEVICE_AFFINITY",
+                  "transports/rdma/dest_device_affinity");
     // Restrict which RDMA NICs the engine discovers/uses (comma-separated
     // device names). MC_TE_FILTERS is an allow-list — same name and semantics
     // as the legacy Transfer Engine's device whitelist, so a single env works
@@ -254,7 +350,107 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     // defaults to several threads so concurrent bulk transfers are not
     // serialized on one io_context.
     setConfig(config, "MC_TENT_RPC_THREADS", "rpc_server_threads");
+    // io_uring staging pool: pinned host slots allocated once at install()
+    // for requests that need a bounce buffer (device memory or unaligned
+    // host memory). The size keys only apply when pinned_staging is on.
+    setBoolConfig(config, "MC_IOURING_PINNED_STAGING",
+                  "transports/io_uring/pinned_staging");
+    setConfig(config, "MC_IOURING_STAGING_SLOT_KB",
+              "transports/io_uring/staging_slot_kb");
+    setConfig(config, "MC_IOURING_STAGING_SLOTS",
+              "transports/io_uring/staging_slots");
+    // Ascend Direct transport env vars (MC_ASCEND_* with ASCEND_* fallback).
+    setBoundedIntConfigWithFallback(
+        config, "MC_ASCEND_TRANSFER_TIMEOUT", "ASCEND_TRANSFER_TIMEOUT",
+        "transports/ascend_direct/transfer_timeout_ms", 1,
+        std::numeric_limits<int32_t>::max());
+    setBoundedIntConfigWithFallback(
+        config, "MC_ASCEND_BASE_PORT", "ASCEND_BASE_PORT",
+        "transports/ascend_direct/base_port", 1024, 65535 - 100);
+    setBoundedIntConfigWithFallback(
+        config, "MC_ASCEND_THREAD_POOL_SIZE", "ASCEND_THREAD_POOL_SIZE",
+        "transports/ascend_direct/thread_pool_size", 1, 32);
+    setStringConfigWithFallback(config, "MC_ASCEND_RDMA_TC", "ASCEND_RDMA_TC",
+                                "transports/ascend_direct/rdma_tc",
+                                "HCCL_RDMA_TC");
+    setStringConfigWithFallback(config, "MC_ASCEND_RDMA_SL", "ASCEND_RDMA_SL",
+                                "transports/ascend_direct/rdma_sl",
+                                "HCCL_RDMA_SL");
+    setStringConfigWithFallback(config, "MC_ASCEND_LOCAL_COMM_RES",
+                                "ASCEND_LOCAL_COMM_RES",
+                                "transports/ascend_direct/local_comm_res");
+    setStringConfigWithFallback(
+        config, "MC_ASCEND_GLOBAL_RESOURCE_CONFIG",
+        "ASCEND_GLOBAL_RESOURCE_CONFIG",
+        "transports/ascend_direct/global_resource_config");
+    if (config.get("transports/ascend_direct/store_te_init", false)) {
+        setBoolConfigWithFallback(config, "MC_ASCEND_ENABLE_USE_FABRIC_MEM",
+                                  "ASCEND_ENABLE_USE_FABRIC_MEM",
+                                  "transports/ascend_direct/fabric_mem");
+    }
+    setBoolConfigWithFallback(config, "MC_ASCEND_USE_SHMEM", "ASCEND_USE_SHMEM",
+                              "transports/ascend_direct/use_shmem");
+    setBoolConfigWithFallback(
+        config, "MC_ASCEND_STANDALONE_SINGLE_SEGMENT",
+        "ASCEND_STANDALONE_SINGLE_SEGMENT",
+        "transports/ascend_direct/standalone_single_segment");
     return status;
+}
+
+Status parseMnnvlConfig(const Config& config, MnnvlConfig& options) {
+    MnnvlConfig parsed;
+    const auto paths = config.paths();
+    auto configured = [&](const char* key) {
+        return std::binary_search(paths.begin(), paths.end(), std::string(key));
+    };
+    auto read_bool = [&](const char* key, bool& value) -> Status {
+        std::string text;
+        if (!config.dumpSubtree(key, &text)) {
+            if (configured(key))
+                return Status::InvalidArgument(std::string(key) +
+                                               " must be boolean");
+            return Status::OK();
+        }
+        if (text != "true" && text != "false")
+            return Status::InvalidArgument(std::string(key) +
+                                           " must be boolean");
+        value = text == "true";
+        return Status::OK();
+    };
+    CHECK_STATUS(
+        read_bool("transports/mnnvl/require_fabric", parsed.require_fabric));
+    const auto mode = config.get("transports/mnnvl/sync_mode", "cpu_block");
+    if ((configured("transports/mnnvl/sync_mode") &&
+         config.get<json>("transports/mnnvl/sync_mode", json()).type() !=
+             json::value_t::string) ||
+        (mode != "cpu_block" && mode != "gpu_wait"))
+        return Status::InvalidArgument(
+            "MNNVL sync_mode must be cpu_block or gpu_wait");
+    parsed.gpu_wait = mode == "gpu_wait";
+    if (parsed.gpu_wait) {
+        bool queue_enabled = false;
+        CHECK_STATUS(read_bool("enable_runtime_queue", queue_enabled));
+        if (queue_enabled)
+            return Status::InvalidArgument(
+                "MNNVL gpu_wait requires direct caller-thread dispatch "
+                "(enable_runtime_queue=false)");
+    }
+    parsed.egm_enabled = config.get("transports/mnnvl/egm", false);
+    if (parsed.require_fabric) {
+        CHECK_STATUS(read_bool("transports/mnnvl/egm", parsed.egm_enabled));
+        bool enabled = true, force_tcp = false;
+        CHECK_STATUS(read_bool("transports/mnnvl/enable", enabled));
+        CHECK_STATUS(read_bool("transports/force_tcp", force_tcp));
+        if (!enabled || force_tcp ||
+            (configured("transports/nvlink/handle_type") &&
+             config.get<json>("transports/nvlink/handle_type", json()) !=
+                 json("fabric")))
+            return Status::InvalidArgument(
+                "Strict MNNVL requires enabled MNNVL and FABRIC handles "
+                "without force_tcp");
+    }
+    options = parsed;
+    return Status::OK();
 }
 
 bool ConfigHelper::parseBool(const std::string& str, bool default_value) {

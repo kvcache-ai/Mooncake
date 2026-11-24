@@ -38,6 +38,8 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
         .enable_oplog_following = capabilities.has_oplog_following,
         .oplog_poll_interval_ms = config.oplog_poll_interval_ms,
         .batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec,
+        .ha_redis_expected_replicas_per_shard =
+            config.ha_redis_expected_replicas_per_shard,
     });
 }
 
@@ -278,6 +280,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
 
         ErrorCode err = standby_service_->Promote();
         if (err != ErrorCode::OK) {
+            standby_service_->MarkAppliedCursorForRestart();
             standby_service_->Stop();
         }
         if (err == ErrorCode::OK && batch_oplog_snapshot_coordinator_) {
@@ -312,6 +315,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         if (standby_service_->IsBatchOpLogSnapshotMode()) {
             auto handoff = standby_service_->PromoteAndDetachBatchOpLogStore();
             if (!handoff) {
+                standby_service_->MarkAppliedCursorForRestart();
                 standby_service_->Stop();
                 {
                     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -347,6 +351,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         StandbySnapshot snapshot;
         ErrorCode err = standby_service_->PromoteAndExportSnapshot(snapshot);
         if (err != ErrorCode::OK) {
+            standby_service_->MarkAppliedCursorForRestart();
             {
                 std::lock_guard<std::mutex> lock(state_mutex_);
                 standby_running_ = false;
@@ -369,6 +374,8 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         ctx.segments = std::move(snapshot.segments);
         ctx.weight_metadata =
             snapshot.weight_metadata.value_or(WeightMetadataSnapshot{});
+        ctx.object_storage =
+            snapshot.object_storage.value_or(ObjectReplicaSnapshot{});
 
         return ctx;
     }
@@ -395,6 +402,15 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         }
         return MapStandbyRuntimeState(standby_service_->GetSyncStatus(),
                                       observed_leader, capabilities_);
+    }
+
+    ErrorCode RestorePromotionBaseline(PromotionContext context) override {
+        if (!context.metadata_store) {
+            return ErrorCode::OK;
+        }
+        return standby_service_->PreservePromotionBaseline(
+            std::move(context.metadata_store), context.applied_cursor,
+            context.producer_view_version, std::move(context.segments));
     }
 
     void SetStandbyRuntimeStateCallback(

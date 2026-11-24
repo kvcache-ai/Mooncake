@@ -27,7 +27,7 @@ jobs:
     strategy:
       max-parallel: 2
       matrix:
-        python-version: ['3.10']
+        python-version: ['3.10', '3.12']
 
     env:
       MUSA_BUILD: "1"
@@ -71,7 +71,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25.9'
+          go-version: '1.26.9'
           cache: false
 
       - name: Set Python bin
@@ -116,6 +116,7 @@ jobs:
           mkdir build
           cd build
           cmake_args=(
+            -DWITH_CONDUCTOR=ON
             -DUSE_MUSA=ON
             -DWITH_EP=ON
             -DUSE_HTTP=ON
@@ -213,3 +214,5 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: mooncake-wheel/dist-release/
+          # A backfill can add a wheel to a release that already has others.
+          skip-existing: ${{ github.event_name == 'workflow_dispatch' }}

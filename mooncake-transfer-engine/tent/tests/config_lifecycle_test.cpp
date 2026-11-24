@@ -13,8 +13,10 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include <glog/logging.h>
 
 #include <cstdlib>
+#include <mutex>
 #include <set>
 #include <string>
 
@@ -48,6 +50,58 @@ class EnvVarGuard {
     std::string old_value_;
     bool had_value_{false};
 };
+
+class ConfigLogSink : public google::LogSink {
+   public:
+    ConfigLogSink() { google::AddLogSink(this); }
+    ~ConfigLogSink() override { google::RemoveLogSink(this); }
+
+    void send(google::LogSeverity, const char*, const char*, int,
+              const std::tm*, const char* message, size_t length) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        messages_.append(message, length);
+    }
+
+    std::string messages() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return messages_;
+    }
+
+   private:
+    std::mutex mutex_;
+    std::string messages_;
+};
+
+TEST(ConfigLifecycleTest, ParseErrorDoesNotEchoPrivateInput) {
+    Config config;
+    config.set("merge_requests", false);
+    const auto status = config.load(R"({"token":"diagnostic-secret-42)");
+    ASSERT_TRUE(status.IsInvalidArgument());
+    const auto message = status.ToString();
+    EXPECT_EQ(message.find("diagnostic-secret-42"), std::string::npos);
+    EXPECT_NE(message.find("parse error 101"), std::string::npos);
+    EXPECT_NE(message.find("byte"), std::string::npos);
+    EXPECT_FALSE(config.get("merge_requests", true));
+}
+
+TEST(ConfigLifecycleTest, NumericParseFailureDoesNotEchoTheLiteral) {
+    Config config;
+    const auto status = config.load(R"({"private_value": 1e10000})");
+    ASSERT_TRUE(status.IsInvalidArgument());
+    EXPECT_EQ(status.ToString().find("1e10000"), std::string::npos);
+    EXPECT_NE(status.ToString().find("parse error 406"), std::string::npos);
+}
+
+TEST(ConfigLifecycleTest, LongInlineConfigIsNotPrintedByFileProbeFailure) {
+    const auto token = "diagnostic-secret-42" + std::string(512, 'x');
+    const auto input = json{{"token", token}}.dump();
+    EnvVarGuard conf_guard("MC_TENT_CONF", input.c_str());
+    ConfigLogSink sink;
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+    EXPECT_EQ(config.get("token", ""), token);
+    EXPECT_EQ(sink.messages().find("diagnostic-secret-42"), std::string::npos);
+}
 
 TEST(ConfigLifecycleTest, RuntimeAllowlistPathsAreUnique) {
     std::set<std::string_view> paths;
@@ -304,6 +358,73 @@ TEST(ConfigLifecycleTest, MnnvlEgmDefaultsOffAndFollowsEnv) {
         ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
         EXPECT_FALSE(config.get("transports/mnnvl/egm", true));
     }
+}
+
+TEST(MnnvlConfigTest, DefaultsAndBootstrapLifecycle) {
+    Config config;
+    MnnvlConfig options;
+    ASSERT_TRUE(parseMnnvlConfig(config, options).ok());
+    EXPECT_FALSE(options.require_fabric);
+    EXPECT_FALSE(options.gpu_wait);
+    for (const auto* key : {"require_fabric", "sync_mode"}) {
+        EXPECT_EQ(classifyConfigPath(std::string("transports/mnnvl/") + key),
+                  ConfigLifecycle::kBootstrapOnly);
+    }
+}
+
+TEST(MnnvlConfigTest, RejectsMalformedControlsWithoutUpdatingOptions) {
+    for (const auto& entry :
+         std::vector<std::pair<std::string, json>>{{"require_fabric", "true"},
+                                                   {"require_fabric", nullptr},
+                                                   {"sync_mode", true},
+                                                   {"sync_mode", "invalid"}}) {
+        Config config;
+        config.set("transports/mnnvl/" + entry.first, entry.second);
+        MnnvlConfig options;
+        options.egm_enabled = true;
+        EXPECT_TRUE(parseMnnvlConfig(config, options).IsInvalidArgument())
+            << entry.first;
+        EXPECT_TRUE(options.egm_enabled);
+    }
+}
+
+TEST(MnnvlConfigTest, StrictRejectsDisabledAndNonFabricConfigurations) {
+    for (const auto& entry : std::vector<std::pair<std::string, json>>{
+             {"transports/mnnvl/enable", false},
+             {"transports/mnnvl/enable", "true"},
+             {"transports/force_tcp", true},
+             {"transports/force_tcp", "false"},
+             {"transports/nvlink/handle_type", "posix_fd"},
+             {"transports/nvlink/handle_type", 0}}) {
+        Config config;
+        config.set("transports/mnnvl/require_fabric", true);
+        config.set(entry.first, entry.second);
+        MnnvlConfig options;
+        EXPECT_TRUE(parseMnnvlConfig(config, options).IsInvalidArgument())
+            << entry.first;
+    }
+}
+
+TEST(MnnvlConfigTest, GpuWaitRejectsDeferredDispatch) {
+    Config config;
+    config.set("transports/mnnvl/sync_mode", "gpu_wait");
+    config.set("enable_runtime_queue", true);
+    MnnvlConfig options;
+    EXPECT_TRUE(parseMnnvlConfig(config, options).IsInvalidArgument());
+    config.set("transports/mnnvl/sync_mode", "cpu_block");
+    EXPECT_TRUE(parseMnnvlConfig(config, options).ok());
+}
+
+TEST(MnnvlConfigTest, EnvironmentOverridesAndMalformedBooleans) {
+    EnvVarGuard conf_guard("MC_TENT_CONF", "{}");
+    EnvVarGuard strict_guard("MC_MNNVL_REQUIRE_FABRIC", "1");
+    EnvVarGuard sync_guard("MC_MNNVL_SYNC_MODE", "gpu_wait");
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+    EXPECT_TRUE(config.get("transports/mnnvl/require_fabric", false));
+    EXPECT_EQ(config.get("transports/mnnvl/sync_mode", ""), "gpu_wait");
+    EnvVarGuard invalid_guard("MC_MNNVL_REQUIRE_FABRIC", "tru");
+    EXPECT_TRUE(ConfigHelper().loadFromEnv(config).IsInvalidArgument());
 }
 
 TEST(ConfigLifecycleTest, PreservesLegacyEnvironmentPrecedence) {

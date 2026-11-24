@@ -112,6 +112,31 @@ TEST_F(EmbeddedMasterTest, AllListenersBindOnlyToLoopback) {
     }
 }
 
+// RFC #4700, slice 1: the embedded startup path must commit the restore
+// lifecycle before it serves RPCs, exactly like the non-HA master path.
+// Serving is the commitment point ("restore is refused from here on"), not a
+// statement that the endpoint has already accepted a request -- so a path
+// that publishes the service while still Constructed would make the contract
+// depend on how the master was started.
+TEST_F(EmbeddedMasterTest, StartCommitsRestoreLifecycleBeforeServing) {
+    EmbeddedMaster master;
+    ASSERT_TRUE(master.Start({}));
+
+    auto service = master.service();
+    ASSERT_NE(nullptr, service);
+    EXPECT_EQ(MasterService::RestoreLifecycleState::kServing,
+              service->GetRestoreLifecycleState());
+
+    // A restart builds a fresh WrappedMasterService, so the lifecycle is
+    // reopened and committed again instead of inheriting the old state.
+    master.Stop();
+    ASSERT_TRUE(master.Start({}));
+    auto restarted = master.service();
+    ASSERT_NE(nullptr, restarted);
+    EXPECT_EQ(MasterService::RestoreLifecycleState::kServing,
+              restarted->GetRestoreLifecycleState());
+}
+
 TEST_F(EmbeddedMasterTest, StopPreservesAddressesForRestart) {
     EmbeddedMaster master;
     ASSERT_TRUE(master.Start({}));

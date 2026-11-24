@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -27,34 +26,37 @@ class HostProxyRoute : public RouteProvider {
     static constexpr std::string_view kRouteKey = "host-proxy";
     static constexpr uint32_t kEndpointVersion = 1;
 
-    HostProxyRoute(TransferEngine& engine, LinkManager& link_manager,
-                   uint32_t max_world_size);
+    [[nodiscard]] static PGResult<std::unique_ptr<HostProxyRoute>> create(
+        int device_index, TransferEngine& engine, LinkManager& link_manager,
+        uint32_t max_world_size);
     ~HostProxyRoute() noexcept override;
 
-    [[nodiscard]] PGResult<void> initialize(int device_index);
-    [[nodiscard]] DeviceHostProxyContext deviceContext() const noexcept;
-
-    [[nodiscard]] std::string_view routeKey() const noexcept override;
-    [[nodiscard]] uint32_t routeVersion() const noexcept override;
     PGResult<void> registerRegion(DeviceRegionKind kind, void* addr,
                                   size_t size) override;
     PGResult<void> unregisterRegion(DeviceRegionKind kind, void* addr,
                                     size_t size) override;
     [[nodiscard]] std::optional<RouteEndpoint> localEndpoint() override;
-    [[nodiscard]] PGResult<std::vector<DeviceTransferRoute>> resolveRoutes(
-        std::span<const std::optional<DeviceTransferEndpoint>> endpoints)
+    PGResult<void> installEndpoints(const DeviceTransferSnapshot& snapshot,
+                                    uint64_t reclaim_before_version) override;
+    [[nodiscard]] PGResult<std::vector<DeviceTransferRoute>> updateRoutes()
         override;
+    void fillDeviceContext(DeviceRouteContext& context) const noexcept override;
 
     PGResult<void> shutdown() override;
 
    private:
+    HostProxyRoute(TransferEngine& engine,
+                   std::unique_ptr<HostTransferProxy> proxy,
+                   std::string device_location, uint32_t max_world_size,
+                   HostProxyCommandSlot* device_slots);
+
     TransferEngine& engine_;
     std::unique_ptr<HostTransferProxy> proxy_;
     std::string device_location_;
     uint32_t max_world_size_ = 0;
     HostProxyCommandSlot* device_slots_ = nullptr;
-    bool initialized_ = false;
     bool shutdown_requested_ = false;
+    std::vector<DeviceTransferRoute> pending_routes_;
 };
 
 }  // namespace mooncake
