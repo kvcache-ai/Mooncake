@@ -301,7 +301,9 @@ void TransportSelector::loadPolicies() {
 }
 
 TransportSelector::TransportSelector(std::shared_ptr<Config> config)
-    : config_(config), force_tcp_(config_->get("transports/force_tcp", false)) {
+    : config_(config),
+      force_tcp_(config_->get("transports/force_tcp", false)),
+      force_fabric_(config_->get("transports/force_fabric", false)) {
     loadPolicies();
 }
 
@@ -474,24 +476,33 @@ bool TransportSelector::isTransportAvailable(
         return false;
     }
 
-    // MLU requires process-local addresses. XPU also supports a same-host
-    // peer's buffer mapped into this process over IPC.
-    if (type == MLU && !context.local_segment) return false;
+    // Device IPC makes a same-host peer's buffer locally addressable.
+    const bool mlu_ipc =
+        type == MLU && !context.local_segment && context.mlu_ipc;
+    if (type == MLU && !context.local_segment &&
+        !(context.mlu_ipc && context.same_machine))
+        return false;
     const bool xpu_ipc =
         type == XPU && !context.local_segment && context.xpu_ipc;
     if (type == XPU && !context.local_segment &&
         !(context.xpu_ipc && context.same_machine))
         return false;
     if (context.xpu_ipc_only && type != XPU) return false;
-    if ((type == NVLINK || type == SHM || type == TPU) &&
-        !context.same_machine) {
+    if (context.mlu_ipc_only && type != MLU) return false;
+    if (!isPeerReachable(type, context.same_machine)) {
         return false;
     }
 
     const auto& caps = transport->capabilities();
+    if (context.local_mlu_staging) {
+        return type == MLU && context.local_segment &&
+               context.local_memory_type == MTYPE_MLU &&
+               context.remote_memory_type == MTYPE_MLU && caps.gpu_to_dram &&
+               caps.dram_to_gpu;
+    }
     // The IPC route copies the original buffers; only the network leg of a
     // staged request runs on host stage buffers.
-    if (context.host_staging && !xpu_ipc) {
+    if (context.host_staging && !xpu_ipc && !mlu_ipc) {
         return (type == RDMA || type == FABRIC || type == TCP ||
                 type == HP_TCP) &&
                caps.dram_to_dram;
@@ -502,10 +513,17 @@ bool TransportSelector::isTransportAvailable(
     // and the staging capability checks share one device-type list and cannot
     // disagree. TPU and Intel XPU are included so their device<->host staging
     // hop routes to the matching staging transport (gpu_to_dram / dram_to_gpu).
-    // XPU also satisfies gpu_to_gpu, but only for the local segment (checked
-    // above), so cross-node device traffic without GPUDirect RDMA is always
-    // staged through host DRAM.
+    // XPU also satisfies gpu_to_gpu locally (checked above). Cross-node XPU
+    // and MLU traffic uses direct RDMA only when both buffers registered on
+    // RDMA; otherwise the engine stages it through host DRAM.
     auto is_gpu = [](MemoryType t) { return isGpuMemoryType(t); };
+
+    if (type == RDMA && context.segment_type == SegmentType::Memory &&
+        !context.local_segment && !context.rdma_device_direct &&
+        (is_gpu(context.local_memory_type) ||
+         is_gpu(context.remote_memory_type))) {
+        return false;
+    }
 
     // For file segments, check file-specific capabilities (original logic)
     if (context.segment_type == SegmentType::File) {
@@ -578,8 +596,11 @@ SelectionResult TransportSelector::select(
     // transports as a fallback.
     static const std::vector<TransportType> kEmpty;
     static const std::vector<TransportType> kTcpOnly{TCP};
+    static const std::vector<TransportType> kFabricOnly{FABRIC};
     const auto& raw =
         force_tcp_ && context.segment_type == SegmentType::Memory ? kTcpOnly
+        : force_fabric_ && context.segment_type == SegmentType::Memory
+            ? kFabricOnly
         : !matching_policy->transports.empty() ? matching_policy->transports
         : context.buffer_transports            ? *context.buffer_transports
                                                : kEmpty;

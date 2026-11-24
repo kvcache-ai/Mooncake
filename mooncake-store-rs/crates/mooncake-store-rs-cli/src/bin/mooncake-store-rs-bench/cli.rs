@@ -47,6 +47,10 @@ pub struct GlobalArgs {
     pub eviction_high_watermark_percent: Option<u8>,
     #[arg(long, env = "MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT")]
     pub eviction_low_watermark_percent: Option<u8>,
+    #[arg(long, env = "MC_STORE_RS_MAX_PENDING_PUBLICATIONS")]
+    pub max_pending_publications: Option<usize>,
+    #[arg(long, env = "MC_STORE_RS_MAX_PENDING_PUBLICATION_BYTES")]
+    pub max_pending_publication_bytes: Option<u64>,
     #[arg(long, default_value = "bench", env = "MC_STORE_RS_TENANT")]
     pub tenant: String,
     #[arg(long, env = "MC_STORE_RS_TRACE_FILTER")]
@@ -67,6 +71,7 @@ pub struct GlobalArgs {
 pub enum Protocol {
     Tcp,
     Rdma,
+    Ascend,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -113,6 +118,8 @@ pub struct BenchArgs {
     pub no_prefill: bool,
     #[arg(long, default_value_t = 70, env = "MC_BENCH_READ_RATIO")]
     pub read_ratio: u8,
+    #[arg(long, default_value_t = 100, env = "MC_BENCH_HIT_RATIO")]
+    pub hit_ratio: u8,
     #[arg(long, default_value_t = 5, env = "MC_BENCH_REPORT_INTERVAL")]
     pub report_interval: u64,
     #[arg(long, default_value_t = 10000, env = "MC_BENCH_KEY_SPACE_SIZE")]
@@ -160,6 +167,10 @@ pub enum ReadInterface {
     BatchGet,
     #[value(alias = "batch_get_into")]
     BatchGetInto,
+    #[value(alias = "is_exist")]
+    IsExist,
+    #[value(alias = "batch_is_exist")]
+    BatchIsExist,
 }
 
 impl ReadInterface {
@@ -168,6 +179,8 @@ impl ReadInterface {
             Self::Get => "get",
             Self::BatchGet => "batch_get",
             Self::BatchGetInto => "batch_get_into",
+            Self::IsExist => "is_exist",
+            Self::BatchIsExist => "batch_is_exist",
         }
     }
 }
@@ -299,6 +312,9 @@ pub fn validate_bench_args(args: &BenchArgs) -> Result<(), Box<dyn Error>> {
     if args.read_ratio > 100 {
         return Err("--read-ratio must be 0..100".into());
     }
+    if args.hit_ratio > 100 {
+        return Err("--hit-ratio must be 0..100".into());
+    }
     if args.writers == 0 {
         return Err("--writers must be > 0".into());
     }
@@ -309,6 +325,12 @@ pub fn validate_bench_args(args: &BenchArgs) -> Result<(), Box<dyn Error>> {
 }
 
 pub fn validate_soak_args(args: &SoakArgs) -> Result<(), Box<dyn Error>> {
+    if matches!(
+        args.read_interface,
+        ReadInterface::IsExist | ReadInterface::BatchIsExist
+    ) {
+        return Err("is-exist and batch-is-exist are supported only by bench".into());
+    }
     if args.concurrency == 0 {
         return Err("--concurrency must be > 0".into());
     }
@@ -329,7 +351,9 @@ fn parse_write_interface(value: &str) -> Result<WriteInterface, String> {
 
 fn parse_read_interface(value: &str) -> Result<ReadInterface, String> {
     ReadInterface::from_str(value.trim(), true).map_err(|_| {
-        format!("invalid read interface '{value}': expected get, batch-get, or batch-get-into")
+        format!(
+            "invalid read interface '{value}': expected get, batch-get, batch-get-into, is-exist, or batch-is-exist"
+        )
     })
 }
 
@@ -457,6 +481,45 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn pending_publication_cli_env_precedence() {
+        const CHILD_ENV: &str = "MC_BENCH_TEST_PUBLICATION_LIMITS_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("cli::tests::pending_publication_cli_env_precedence")
+                .arg("--exact")
+                .env(CHILD_ENV, "1")
+                .env("MC_STORE_RS_MAX_PENDING_PUBLICATIONS", "17")
+                .env("MC_STORE_RS_MAX_PENDING_PUBLICATION_BYTES", "4096")
+                .status()
+                .expect("isolated CLI env test should start");
+            assert!(status.success());
+            return;
+        }
+        let env = Cli::try_parse_from([
+            "mooncake-store-rs-bench",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "bench",
+        ]);
+        let explicit = Cli::try_parse_from([
+            "mooncake-store-rs-bench",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "--max-pending-publications",
+            "3",
+            "--max-pending-publication-bytes",
+            "512",
+            "bench",
+        ]);
+        let env = env.unwrap().global;
+        assert_eq!(env.max_pending_publications, Some(17));
+        assert_eq!(env.max_pending_publication_bytes, Some(4096));
+        let explicit = explicit.unwrap().global;
+        assert_eq!(explicit.max_pending_publications, Some(3));
+        assert_eq!(explicit.max_pending_publication_bytes, Some(512));
+    }
 
     #[test]
     fn bench_cli_exposes_interface_selection_defaults() {
@@ -903,6 +966,7 @@ mod tests {
             warmup: 0,
             no_prefill: false,
             read_ratio: 70,
+            hit_ratio: 100,
             report_interval: 5,
             key_space_size: 10000,
             writers: 1,

@@ -5,7 +5,9 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "allocator_metric.h"
 #include "ylt/metric/counter.hpp"
@@ -145,6 +147,14 @@ class MasterMetricManager {
     int64_t get_key_count();
     int64_t get_soft_pin_key_count();
 
+    // Key Group Metrics
+    // spec: "group:prefix|suffix|contains:pattern,...", must be set before
+    // any object is created.
+    void configure_key_groups(const std::string& spec);
+    uint8_t classify_key_group(std::string_view key) const;
+    void inc_key_group(uint8_t group, int64_t value_bytes);
+    void dec_key_group(uint8_t group, int64_t value_bytes);
+
     // Cluster Metrics
     void inc_active_clients(int64_t val = 1);
     void dec_active_clients(int64_t val = 1);
@@ -154,7 +164,6 @@ class MasterMetricManager {
     void client_liveness_recovered();
     void client_liveness_became_offline();
     void on_client_liveness_record_removed(ClientLivenessState state);
-    void reset_client_liveness_metrics(int64_t active_records = 0);
     void inc_client_offboarding_queue_depth(int64_t jobs = 1);
     void dec_client_offboarding_queue_depth(int64_t jobs = 1);
     void inc_client_offboarding_retry();
@@ -625,6 +634,20 @@ class MasterMetricManager {
     ylt::metric::gauge_t key_count_;
     ylt::metric::gauge_t soft_pin_key_count_;
     ylt::metric::histogram_t value_size_distribution_;
+
+    // Key Group Metrics
+    static constexpr size_t kMaxKeyGroups = 32;
+    struct KeyGroupRule {
+        enum class Match { kPrefix, kSuffix, kContains };
+        Match match;
+        std::string pattern;
+        uint8_t group;
+    };
+    std::vector<KeyGroupRule> key_group_rules_;
+    // The last entry is "other".
+    std::vector<std::string> key_group_names_;
+    ylt::metric::dynamic_gauge_1t key_count_by_group_;
+    ylt::metric::dynamic_gauge_1t value_bytes_by_group_;
 
     // Cluster Metrics
     ylt::metric::gauge_t active_clients_;

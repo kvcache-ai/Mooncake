@@ -16,11 +16,13 @@
 #include "split_output.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
+#include "batch_submit.h"
 
 #include <gtest/gtest.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <optional>
 #include <unistd.h>
 
@@ -36,11 +38,13 @@ class TransferEngineImplTestPeer {
         const tent::TransferEngine& engine) {
         return engine.impl_->metadata_;
     }
+    static void enableParallelBatchSubmit(tent::TransferEngine& engine) {
+        engine.batch_submit_executor_ = std::make_shared<BatchSubmitExecutor>(
+            BatchSubmitExecutor::Config{1, 1, 4});
+    }
 };
 
 namespace tent {
-
-extern std::atomic<bool> g_tent_running;
 
 class TENTBenchRunnerTestPeer {
    public:
@@ -54,6 +58,11 @@ class TENTBenchRunnerTestPeer {
     }
     static uint64_t abandoned(const TENTBenchRunner& runner) {
         return runner.abandoned_batches_.load();
+    }
+    // What a failed worker or a stop signal does to a running transfer.
+    static void stop(TENTBenchRunner& runner) { runner.noteTransferFailed(); }
+    static bool running(const TENTBenchRunner& runner) {
+        return runner.running();
     }
 };
 
@@ -73,6 +82,7 @@ class NoQuiesceTransport : public Transport {
     Mode mode = Mode::Completed;
     int polls = 0, freed_batches = 0, removed_buffers = 0, freed_buffers = 0;
     Batch* pending = nullptr;
+    std::function<void()> on_stop;
 
     Status allocateSubBatch(SubBatchRef& batch, size_t) override {
         batch = new Batch;
@@ -109,7 +119,7 @@ class NoQuiesceTransport : public Transport {
             status = {TransferStatusEnum::COMPLETED,
                       static_cast<Batch*>(batch)->requests.at(task).length};
         } else {
-            g_tent_running.store(false);
+            if (on_stop) on_stop();
             status = {TransferStatusEnum::PENDING, 0};
         }
         return Status::OK();
@@ -132,6 +142,7 @@ class NoQuiesceTransport : public Transport {
         ++removed_buffers;
         return Status::OK();
     }
+    bool supportsParallelBatchSubmit() const override { return true; }
 };
 
 class TENTTeardownTest : public testing::TestWithParam<bool> {
@@ -146,8 +157,13 @@ class TENTTeardownTest : public testing::TestWithParam<bool> {
         config->set("rpc_server_hostname", "127.0.0.1");
         config->set("rpc_server_port", 0);
         config->set("log_level", "warning");
-        for (const auto* name : {"rdma", "tcp", "hp_tcp", "shm", "io_uring"})
-            config->set(std::string("transports/") + name + "/enable", false);
+        // Only the injected transport participates in admission and teardown.
+        for (int type = 1; type < kSupportedTransportTypes; ++type)
+            config->set("transports/" +
+                            std::string(transportTypeName(
+                                static_cast<TransportType>(type))) +
+                            "/enable",
+                        false);
         auto engine = std::make_unique<TransferEngine>(config);
         ASSERT_TRUE(engine->available());
         engine_ = engine.get();
@@ -167,7 +183,9 @@ class TENTTeardownTest : public testing::TestWithParam<bool> {
             std::string error;
             ASSERT_TRUE(openSplitOutput(path_, &error)) << error;
         }
-        g_tent_running.store(true);
+        transport_->on_stop = [this] {
+            if (runner_) TENTBenchRunnerTestPeer::stop(*runner_);
+        };
     }
     void TearDown() override {
         runner_.reset();
@@ -190,7 +208,6 @@ class TENTTeardownTest : public testing::TestWithParam<bool> {
             setenv("MC_TENT_CONF", saved_env_->c_str(), 1);
         else
             unsetenv("MC_TENT_CONF");
-        g_tent_running.store(true);
     }
     double transfer() {
         return runner_->runSingleTransfer(
@@ -227,6 +244,15 @@ TEST_P(TENTTeardownTest, PollErrorRetainsEngineAndBuffer) {
     expectRetained();
 }
 
+TEST_P(TENTTeardownTest, ParallelBatchPollErrorRetainsEngineAndBuffer) {
+    TransferEngineImplTestPeer::enableParallelBatchSubmit(*engine_);
+    ASSERT_TRUE(engine_->isBatchSubmitEligible(1));
+    ASSERT_TRUE(engine_->supportsParallelBatchSubmit(LOCAL_SEGMENT_ID));
+    transport_->mode = NoQuiesceTransport::Mode::PollError;
+    EXPECT_LT(transfer(), 0);
+    expectRetained();
+}
+
 TEST_P(TENTTeardownTest, DrainTimeoutRetainsEngineAndBuffer) {
     transport_->mode = NoQuiesceTransport::Mode::Pending;
     EXPECT_LT(transfer(), 0);
@@ -246,7 +272,7 @@ TEST_P(TENTTeardownTest, CompletedBatchReleasesEngineAndBuffer) {
 TEST_P(TENTTeardownTest, BatchDrainedAfterStopReleasesEngineAndBuffer) {
     transport_->mode = NoQuiesceTransport::Mode::CompleteAfterStop;
     EXPECT_GE(transfer(), 0);
-    EXPECT_FALSE(g_tent_running.load());
+    EXPECT_FALSE(TENTBenchRunnerTestPeer::running(*runner_));
     EXPECT_EQ(TENTBenchRunnerTestPeer::abandoned(*runner_), 0u);
     runner_.reset();
     EXPECT_TRUE(metadata_.expired());

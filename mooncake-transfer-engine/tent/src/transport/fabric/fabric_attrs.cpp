@@ -109,10 +109,12 @@ Status decodeFabricPeerAttr(const std::string& text, FabricPeerAttr& attr) {
 std::string encodeFabricBufferAttr(const FabricBufferAttr& attr) {
     json chunks = json::array();
     for (const auto& chunk : attr.chunks) {
-        chunks.push_back({{"off", chunk.offset},
-                          {"len", chunk.length},
-                          {"nics", chunk.nics},
-                          {"keys", chunk.keys}});
+        json entry = {{"off", chunk.offset},
+                      {"len", chunk.length},
+                      {"nics", chunk.nics},
+                      {"keys", chunk.keys}};
+        if (!chunk.near.empty()) entry["near"] = chunk.near;
+        chunks.push_back(std::move(entry));
     }
     return json{{"chunks", std::move(chunks)}}.dump();
 }
@@ -129,10 +131,19 @@ Status decodeFabricBufferAttr(const std::string& text, uint64_t buffer_length,
             chunk.length = item.at("len").get<uint64_t>();
             chunk.nics = item.at("nics").get<std::vector<int>>();
             chunk.keys = item.at("keys").get<std::vector<uint64_t>>();
+            if (item.contains("near"))
+                chunk.near = item.at("near").get<std::vector<int>>();
             if (chunk.offset != expected || chunk.length == 0 ||
                 chunk.nics.size() != chunk.keys.size() || chunk.nics.empty()) {
                 return Status::MalformedJson(
                     "Inconsistent fabric buffer chunks" LOC_MARK);
+            }
+            for (int nic : chunk.near) {
+                if (std::find(chunk.nics.begin(), chunk.nics.end(), nic) ==
+                    chunk.nics.end()) {
+                    return Status::MalformedJson(
+                        "Fabric chunk prefers an unregistered NIC" LOC_MARK);
+                }
             }
             expected += chunk.length;
             attr.chunks.push_back(std::move(chunk));

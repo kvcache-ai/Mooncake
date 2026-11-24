@@ -3,8 +3,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
+
+import pytest
 
 try:
     import tomllib
@@ -50,6 +53,40 @@ def test_scikit_build_core_is_the_only_build_backend() -> None:
     assert project["tool"]["scikit-build"]["cmake"]["define"]["USE_CUDA"] is False
     assert project["tool"]["scikit-build"]["cmake"]["define"]["WITH_EP"] is False
     assert project["tool"]["scikit-build"]["cmake"]["define"]["WITH_STORE_RS"] is False
+
+
+def test_conductor_only_abi3_configuration_is_rejected(tmp_path: Path) -> None:
+    cmake = shutil.which("cmake")
+    if cmake is None:
+        pytest.skip("CMake is required to configure the project")
+
+    result = subprocess.run(
+        [
+            cmake,
+            "-S",
+            str(REPOSITORY_ROOT),
+            "-B",
+            str(tmp_path),
+            "-DSKBUILD=ON",
+            "-DSKBUILD_SABI_COMPONENT=Development.SABIModule",
+            "-DSKBUILD_SABI_VERSION=3.12",
+            "-DWITH_TE=OFF",
+            "-DWITH_STORE=OFF",
+            "-DWITH_STORE_RUST=OFF",
+            "-DWITH_EP=OFF",
+            "-DWITH_CONDUCTOR=ON",
+            "-DUSE_TENT=OFF",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode != 0
+    assert (
+        "abi3 wheels currently require WITH_EP, WITH_CONDUCTOR and USE_TENT to be off"
+        in " ".join(result.stderr.split())
+    ), result.stdout + result.stderr
 
 
 def test_dependency_boundaries_are_declared() -> None:
@@ -302,7 +339,7 @@ def test_scikit_build_consumes_unified_python_sources() -> None:
     assert 'OUTPUT_NAME "_store"' in integration_cmake
     assert "../python/mooncake/store/" in integration_cmake
     binding = (REPOSITORY_ROOT / "mooncake-integration/store/store_py.cpp").read_text()
-    assert "PYBIND11_MODULE(_store, m)" in binding
+    assert "NB_MODULE(_store, m)" in binding
 
     store_rs = REPOSITORY_ROOT / "mooncake-store-rs"
     assert not (store_rs / "pyproject.toml").exists()
@@ -346,6 +383,25 @@ def test_cli_entry_points_remain_stable_across_build_interfaces() -> None:
         "mooncake-store-bench",
     }
     assert old_store_rs_commands.isdisjoint(scripts)
+
+
+def test_legacy_store_rs_wheel_build_is_explicitly_opt_in() -> None:
+    legacy_project = tomllib.loads(
+        (REPOSITORY_ROOT / "mooncake-wheel" / "pyproject.toml").read_text()
+    )
+    assert STORE_RS_CLI_ENTRY_POINTS.keys().isdisjoint(
+        legacy_project["project"]["scripts"]
+    )
+
+    legacy_builder = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    store_rs_builder = (
+        REPOSITORY_ROOT / "scripts" / "build_store_rs_wheel.sh"
+    ).read_text()
+    assert 'INCLUDE_STORE_RS="${INCLUDE_STORE_RS:-0}"' in legacy_builder
+    assert 'if [ "$INCLUDE_STORE_RS" = "1" ]' in legacy_builder
+    assert "--target" in store_rs_builder
+    assert "build_store_rs" in store_rs_builder
+    assert "INCLUDE_STORE_RS=1" in store_rs_builder
 
 
 def test_cli_build_inputs_use_the_canonical_sources() -> None:

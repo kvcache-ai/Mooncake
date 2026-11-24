@@ -1,12 +1,15 @@
 find_package(
   Python3
-  COMPONENTS Interpreter Development.Module NumPy
+  COMPONENTS Interpreter Development.Module NumPy ${SKBUILD_SABI_COMPONENT}
   REQUIRED)
 find_package(Threads REQUIRED)
 
 # Compile the structured-object copy helper from the canonical Python package.
 # CMake installs the native artifact into the backend-owned wheel tree.
-python3_add_library(_fast_copy MODULE WITH_SOABI
+if(SKBUILD_SABI_COMPONENT)
+  set(_fast_copy_sabi USE_SABI "${SKBUILD_SABI_VERSION}")
+endif()
+python3_add_library(_fast_copy MODULE ${_fast_copy_sabi} WITH_SOABI
                     "${CMAKE_CURRENT_SOURCE_DIR}/mooncake/_fast_copy.c")
 target_link_libraries(_fast_copy PRIVATE Python3::NumPy Threads::Threads)
 target_compile_options(_fast_copy PRIVATE -O2)
@@ -21,8 +24,9 @@ install(
   COMPONENT python
   FILES_MATCHING
   PATTERN "*.py"
+  PATTERN "pg.py" EXCLUDE
   PATTERN "__init__.py" EXCLUDE)
-if(WITH_EP)
+if(WITH_PG)
   install(
     FILES
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/src/pg_py.cpp"

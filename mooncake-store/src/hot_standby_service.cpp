@@ -126,6 +126,8 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
             spec.type = oplog_backend_type_;
             spec.connstring = oplog_endpoints;
             spec.cluster_namespace = cluster_id;
+            spec.ha_redis_expected_replicas_per_shard =
+                config_.ha_redis_expected_replicas_per_shard;
             auto backend = CreateHaKvBackend(spec);
             if (!backend) {
                 if (backend.error() == ErrorCode::UNAVAILABLE_IN_CURRENT_MODE) {
@@ -197,6 +199,8 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
             preserve_promotion_baseline_ = false;
             applied_seq_id_.store(preserved_seq, std::memory_order_release);
             primary_seq_id_.store(preserved_seq, std::memory_order_release);
+            HAMetricManager::instance().set_oplog_applied_sequence_id(
+                static_cast<int64_t>(preserved_seq));
             baseline_seq_id = preserved_seq;
             {
                 std::lock_guard<std::mutex> cursor_lock(
@@ -226,6 +230,8 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
 
     applied_seq_id_.store(baseline_seq_id, std::memory_order_release);
     primary_seq_id_.store(baseline_seq_id, std::memory_order_release);
+    HAMetricManager::instance().set_oplog_applied_sequence_id(
+        static_cast<int64_t>(baseline_seq_id));
     return ErrorCode::OK;
 }
 
@@ -267,6 +273,8 @@ ErrorCode HotStandbyService::LoadBatchOpLogSnapshotBaselineLocked(
     });
     applied_seq_id_.store(baseline_seq_id, std::memory_order_release);
     primary_seq_id_.store(baseline_seq_id, std::memory_order_release);
+    HAMetricManager::instance().set_oplog_applied_sequence_id(
+        static_cast<int64_t>(baseline_seq_id));
     return ErrorCode::OK;
 }
 
@@ -511,6 +519,8 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
     spec.type = oplog_backend_type_;
     spec.connstring = oplog_endpoints_;
     spec.cluster_namespace = cluster_id_;
+    spec.ha_redis_expected_replicas_per_shard =
+        config_.ha_redis_expected_replicas_per_shard;
     auto backend = CreateHaKvBackend(spec);
     if (!backend) {
         LOG(ERROR) << "Final OpLog catch-up failed to open backend: "
@@ -773,9 +783,11 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
     if (metadata_store_) {
         metadata_store_->Snapshot(out.objects);
         out.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+        out.object_storage = metadata_store_->SnapshotObjectReplicas();
     } else {
         out.objects.clear();
         out.weight_metadata = WeightMetadataSnapshot{};
+        out.object_storage = ObjectReplicaSnapshot{};
     }
     if (oplog_applier_) {
         out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
@@ -920,9 +932,11 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
     if (metadata_store_) {
         metadata_store_->Snapshot(out.objects);
         out.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+        out.object_storage = metadata_store_->SnapshotObjectReplicas();
     } else {
         out.objects.clear();
         out.weight_metadata = WeightMetadataSnapshot{};
+        out.object_storage = ObjectReplicaSnapshot{};
     }
 
     // Export segments from OpLogApplier's registry (Patch B)
@@ -1017,6 +1031,7 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
             metadata_store_->BeginSnapshotTraversal(), state->generation,
             state);
         capture.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+        capture.object_storage = metadata_store_->SnapshotObjectReplicas();
         ready_snapshot_capture_ = std::move(capture);
         state->active = true;
     }
@@ -1157,6 +1172,8 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
     }
     applied_seq_id_.store(cursor->last_seq);
     primary_seq_id_.store(cursor->last_seq);
+    HAMetricManager::instance().set_oplog_applied_sequence_id(
+        static_cast<int64_t>(cursor->last_seq));
     last_error_.store(ErrorCode::OK);
     recovering_.store(false, std::memory_order_release);
     return metric_timer.Success(ErrorCode::OK);

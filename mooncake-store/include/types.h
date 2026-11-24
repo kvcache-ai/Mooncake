@@ -106,6 +106,11 @@ static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 // the pre-existing behaviour, where only the pool-wide watermark can trigger
 // background eviction. Inert unless enable_multi_tenants is set.
 static constexpr double DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
+// Threads that walk the eviction index in one memory eviction pass. 0 picks
+// one per 16M filed keys each pass, clamped to [1, 64]; an explicit count in
+// that range overrides the automatic choice.
+static constexpr uint32_t DEFAULT_EVICTION_WORKER_THREADS = 0;
+static constexpr uint32_t MAX_EVICTION_WORKER_THREADS = 64;
 static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
@@ -421,6 +426,7 @@ enum class ErrorCode : int32_t {
     BUCKET_ALREADY_EXISTS = -1201,     ///< Bucket already exists.
     KEYS_EXCEED_BUCKET_LIMIT = -1202,  ///< Keys exceed bucket limit.
     KEYS_ULTRA_LIMIT = -1203,          ///< Keys ultra limit.
+    NO_AVAILABLE_DISK = -1204,  ///< No configured disk can hold the bucket.
     UNABLE_OFFLOAD = -1300,     ///< The offload functionality is not enabled
     UNABLE_OFFLOADING = -1301,  ///< Unable offloading.
 
@@ -433,6 +439,7 @@ enum class ErrorCode : int32_t {
     TASK_PENDING_LIMIT_EXCEEDED =
         -1401,              ///< Total pending tasks exceed the limit.
     JOB_NOT_FOUND = -1402,  ///< Job not found.
+    TASK_CANCELED = -1403,  ///< Task canceled before committing.
 
     // DFS errors (Range: -1600 to -1699)
     DFS_NETWORK_TIMEOUT = -1600,      ///< DFS network timeout.
