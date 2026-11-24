@@ -92,5 +92,6 @@ memory segments, creates a large object set with `BatchPutStart` /
 `BatchGetReplicaList`. It does not move KV payloads or depend on traffic
 recording.
 
-See `master_memory_bench.md` for the 100M-key baseline and the
-`--read_rate` / `--amplify` load sweep.
+See `master_memory_bench.md` for the 100M-key baseline, the
+`--read_rate` / `--amplify` load sweep, and the
+`master_memory_runner.py` base/current comparison.

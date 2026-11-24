@@ -91,6 +91,32 @@ python3 mooncake-store/benchmarks/master_memory_gate.py \
 
 Exit codes are 0 for pass, 1 for a regression, and 2 for invalid input.
 
+## Automated base/current comparison
+
+`master_memory_runner.py` runs the same workload against two prebuilt Master
+binaries. Build the base and current Masters separately, then point the runner
+at both binaries and one benchmark binary:
+
+```bash
+python3 mooncake-store/benchmarks/master_memory_runner.py \
+  --base-master=/tmp/base/mooncake_master \
+  --current-master=/tmp/current/mooncake_master \
+  --bench=./build/mooncake-store/benchmarks/master_memory_bench \
+  --keys=100000000 \
+  --runs=3 \
+  --workdir=/tmp/master-memory-run
+```
+
+The runner starts a fresh Master for every run, stops it before the next run,
+writes one result file per run, and aggregates the median fill/read throughput
+and latency values. It then calls `master_memory_gate.py` on the two median
+reports. The final exit code is the gate's exit code: 0 pass, 1 regression, 2
+invalid input or workload mismatch.
+
+Use `--runs=3` for a release check. A single run is enough for smoke tests.
+`--read-rate` and `--amplify` apply to both sides, so the workload is identical
+by construction; the gate still verifies the plan fields in each report.
+
 ## Scope and model size
 
 The 100M-key scenario is a metadata standard, not a model KV-page simulation.
