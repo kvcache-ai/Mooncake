@@ -18,7 +18,8 @@ pub use cold_tier::{
 };
 pub use compat::{
     CompatibilityDescriptor, ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY,
-    ROUTE_OWNER_LIST_PAGINATION_CAPABILITY, ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
+    ROUTE_FILTERED_PRESENCE_CAPABILITY, ROUTE_OWNER_LIST_PAGINATION_CAPABILITY,
+    ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
 };
 pub use error::{Result, StoreError};
 pub use hugepage::{parse_hugepage_size, HugePageConfig};

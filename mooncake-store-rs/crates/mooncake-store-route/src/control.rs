@@ -22,6 +22,7 @@ pub enum RouteControlRequest {
         authority: ClientStableId,
         keys: Vec<ObjectKey>,
         include_presence: bool,
+        require_filtered_presence: bool,
     },
     BatchCompareAndSwap {
         namespace: String,
@@ -147,11 +148,15 @@ pub fn serve_route_control_request(
             authority,
             keys,
             include_presence,
+            require_filtered_presence,
         } => {
             if include_presence {
-                Ok(RouteControlResponse::BatchGetPresence(
-                    service.batch_get_route_presence(&namespace, &authority, &keys),
-                ))
+                let replies = if require_filtered_presence {
+                    service.batch_get_filtered_route_presence(&namespace, &authority, &keys)
+                } else {
+                    service.batch_get_route_presence(&namespace, &authority, &keys)
+                };
+                Ok(RouteControlResponse::BatchGetPresence(replies))
             } else {
                 Ok(RouteControlResponse::BatchContains(
                     service.batch_contains_routes(&namespace, &authority, &keys),
@@ -215,6 +220,34 @@ pub(crate) struct RouteControlAuthorityClient {
 impl RouteControlAuthorityClient {
     pub(crate) fn new(transport: Arc<dyn RouteControlTransport>) -> Self {
         Self { transport }
+    }
+
+    fn route_presence(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+        require_filtered_presence: bool,
+    ) -> Result<Vec<Result<RouteAuthorityPresence>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let response = self.transport.send_route_control(
+            lease,
+            RouteControlRequest::BatchContains {
+                namespace: namespace.to_string(),
+                authority: authority.clone(),
+                keys: keys.to_vec(),
+                include_presence: true,
+                require_filtered_presence,
+            },
+        )?;
+        let RouteControlResponse::BatchGetPresence(replies) = response else {
+            return unexpected_response("batch_get_route_presence");
+        };
+        ensure_batch_len("batch_get_route_presence", keys.len(), replies.len())?;
+        Ok(replies)
     }
 }
 
@@ -286,23 +319,17 @@ impl RouteAuthorityClient for RouteControlAuthorityClient {
         authority: &ClientStableId,
         keys: &[ObjectKey],
     ) -> Result<Vec<Result<RouteAuthorityPresence>>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let response = self.transport.send_route_control(
-            lease,
-            RouteControlRequest::BatchContains {
-                namespace: namespace.to_string(),
-                authority: authority.clone(),
-                keys: keys.to_vec(),
-                include_presence: true,
-            },
-        )?;
-        let RouteControlResponse::BatchGetPresence(replies) = response else {
-            return unexpected_response("batch_get_route_presence");
-        };
-        ensure_batch_len("batch_get_route_presence", keys.len(), replies.len())?;
-        Ok(replies)
+        self.route_presence(lease, namespace, authority, keys, false)
+    }
+
+    fn batch_get_filtered_route_presence(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<Result<RouteAuthorityPresence>>> {
+        self.route_presence(lease, namespace, authority, keys, true)
     }
 
     fn batch_contains_routes(
@@ -322,6 +349,7 @@ impl RouteAuthorityClient for RouteControlAuthorityClient {
                 authority: authority.clone(),
                 keys: keys.to_vec(),
                 include_presence: false,
+                require_filtered_presence: false,
             },
         )?;
         let RouteControlResponse::BatchContains(replies) = response else {

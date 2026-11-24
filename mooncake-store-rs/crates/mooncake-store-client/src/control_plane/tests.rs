@@ -2439,6 +2439,7 @@ fn legacy_contains_stream_reply_is_unsupported_for_presence() {
             authority: ClientStableId::new("authority"),
             keys: vec![ObjectKey::new("legacy-live")],
             include_presence: true,
+            require_filtered_presence: false,
         },
     )
     .expect("legacy contains reply should cross the control stream");
@@ -2457,6 +2458,26 @@ fn legacy_contains_stream_reply_is_unsupported_for_presence() {
             .contains("legacy contains reply without presence"),
         "unexpected legacy presence error: {error}"
     );
+
+    let response = mooncake_store_route::RouteControlTransport::send_route_control(
+        &client,
+        &sample_lease(handle.address()),
+        mooncake_store_route::RouteControlRequest::BatchContains {
+            namespace: "ns-a".to_string(),
+            authority: ClientStableId::new("authority"),
+            keys: vec![ObjectKey::new("legacy-live")],
+            include_presence: true,
+            require_filtered_presence: true,
+        },
+    )
+    .expect("unconfirmed filtered presence should cross the control stream");
+    let mooncake_store_route::RouteControlResponse::BatchGetPresence(mut records) = response else {
+        panic!("expected presence response");
+    };
+    assert!(matches!(
+        records.pop().expect("unconfirmed filtered item"),
+        Err(StoreError::Unsupported(_))
+    ));
     handle.shutdown();
 }
 
@@ -2520,7 +2541,7 @@ fn versioned_delete_markers_cross_control_plane_without_tombstone_routes() {
             .map(|record| record.expect("record should decode"))
             .collect::<Vec<_>>()
     };
-    let read_presence = || {
+    let read_presence = |require_filtered_presence| {
         let response = client
             .send_route_control(
                 &lease,
@@ -2529,6 +2550,7 @@ fn versioned_delete_markers_cross_control_plane_without_tombstone_routes() {
                     authority: authority.clone(),
                     keys: keys.to_vec(),
                     include_presence: true,
+                    require_filtered_presence,
                 },
             )
             .expect("presence should cross the control plane");
@@ -2540,7 +2562,7 @@ fn versioned_delete_markers_cross_control_plane_without_tombstone_routes() {
             .map(|record| record.expect("presence should decode"))
             .collect::<Vec<_>>()
     };
-    for presence in read_presence() {
+    for presence in read_presence(false) {
         assert_eq!(presence, RouteAuthorityPresence::default());
     }
     replace(vec![RouteCasRequest {
@@ -2561,7 +2583,7 @@ fn versioned_delete_markers_cross_control_plane_without_tombstone_routes() {
         assert!(record.route.is_none());
         assert_eq!(record.delete_version, Some(RouteVersion(43)));
     }
-    for presence in read_presence() {
+    for presence in read_presence(false) {
         assert_eq!(presence.live_version, None);
         assert_eq!(presence.delete_version, Some(RouteVersion(43)));
     }
@@ -2599,7 +2621,11 @@ fn versioned_delete_markers_cross_control_plane_without_tombstone_routes() {
         assert_eq!(route.replicas[0].allocation_id, Some(71));
         assert_eq!(record.delete_version, None);
     }
-    for presence in read_presence() {
+    for presence in read_presence(false) {
+        assert_eq!(presence.live_version, Some(RouteVersion(44)));
+        assert_eq!(presence.delete_version, None);
+    }
+    for presence in read_presence(true) {
         assert_eq!(presence.live_version, Some(RouteVersion(44)));
         assert_eq!(presence.delete_version, None);
     }

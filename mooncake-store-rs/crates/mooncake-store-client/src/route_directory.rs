@@ -89,6 +89,14 @@ pub(crate) fn authority_get_presence_many(
     LocalRouteAuthority::new(namespace, authority.clone()).get_route_presence_many(keys)
 }
 
+pub(crate) fn authority_get_filtered_presence_many(
+    namespace: &str,
+    authority: &ClientStableId,
+    keys: &[ObjectKey],
+) -> Result<Vec<RouteAuthorityPresence>> {
+    LocalRouteAuthority::new(namespace, authority.clone()).get_filtered_route_presence_many(keys)
+}
+
 pub(crate) fn authority_get_allocation_route_references(
     namespace: &str,
     authority: &ClientStableId,

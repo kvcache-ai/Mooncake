@@ -10,7 +10,8 @@ use mooncake_store_core::{
     ClientLease, ClientRuntimeId, ClientStableId, MetadataBackend, NamespaceScope, ObjectKey,
     ObjectRoute, ReplicaRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory,
     RouteOwnerScanStatus, RouteReplicaReference, RouteState, RouteVersion, StoreError,
-    ROUTE_OWNER_LIST_PAGINATION_CAPABILITY, ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
+    ROUTE_FILTERED_PRESENCE_CAPABILITY, ROUTE_OWNER_LIST_PAGINATION_CAPABILITY,
+    ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
 };
 use tracing::{debug, trace, warn};
 
@@ -25,11 +26,11 @@ use crate::mesh::read_repair::{
 use crate::mesh::registry::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_contains_many,
     authority_get_allocation_route_reference_keys, authority_get_allocation_route_references,
-    authority_get_delete_marker, authority_get_delete_markers, authority_get_presence_many,
-    authority_get_records, authority_is_local, authority_list_reuse_candidates,
-    authority_list_routes, authority_list_routes_by_replica_owner_page,
-    authority_list_routes_in_scope, local_authority_service, register_local_authority,
-    unregister_local_authority,
+    authority_get_delete_marker, authority_get_delete_markers,
+    authority_get_filtered_presence_many, authority_get_presence_many, authority_get_records,
+    authority_is_local, authority_list_reuse_candidates, authority_list_routes,
+    authority_list_routes_by_replica_owner_page, authority_list_routes_in_scope,
+    local_authority_service, register_local_authority, unregister_local_authority,
 };
 use crate::mesh::selection::{
     authority_candidates, merge_authority_candidates, owner_scan_authority_candidates,
@@ -208,6 +209,26 @@ fn contains_version_from_authority_value(value: RouteAuthorityValue) -> Contains
         RouteAuthorityValue::Route(route) => ContainsVersion::Live(route.version),
         RouteAuthorityValue::DeleteMarker(version) => ContainsVersion::Delete(version),
     }
+}
+
+fn merge_contains_authority_baselines(
+    current: &[Vec<ClientLease>],
+    baseline: Option<&[Vec<ClientLease>]>,
+) -> Vec<Vec<ClientLease>> {
+    let mut merged = current.to_vec();
+    if let Some(baseline) = baseline {
+        for (authorities, baseline) in merged.iter_mut().zip(baseline) {
+            for authority in baseline {
+                if !authorities
+                    .iter()
+                    .any(|existing| existing.runtime.stable_id == authority.runtime.stable_id)
+                {
+                    authorities.push(authority.clone());
+                }
+            }
+        }
+    }
+    merged
 }
 
 struct RouteContainsProbe<'a> {
@@ -440,28 +461,50 @@ impl EmbeddedWrhRouteDirectory {
         &self,
         authority: &ClientLease,
         keys: &[ObjectKey],
+        filtered: bool,
     ) -> Result<Vec<Result<RouteAuthorityPresence>>> {
         if self.authority_is_local(authority) {
             if let Some(service) = self.local_authority_service(&authority.runtime.stable_id) {
-                return Ok(service.batch_get_route_presence(
+                return Ok(if filtered {
+                    service.batch_get_filtered_route_presence(
+                        &self.namespace,
+                        &authority.runtime.stable_id,
+                        keys,
+                    )
+                } else {
+                    service.batch_get_route_presence(
+                        &self.namespace,
+                        &authority.runtime.stable_id,
+                        keys,
+                    )
+                });
+            }
+            let results = if filtered {
+                authority_get_filtered_presence_many(
                     &self.namespace,
                     &authority.runtime.stable_id,
                     keys,
-                ));
-            }
-            return authority_get_presence_many(
+                )
+            } else {
+                authority_get_presence_many(&self.namespace, &authority.runtime.stable_id, keys)
+            };
+            return results.map(|results| results.into_iter().map(Ok).collect());
+        }
+        if filtered {
+            self.authority_client.batch_get_filtered_route_presence(
+                authority,
                 &self.namespace,
                 &authority.runtime.stable_id,
                 keys,
             )
-            .map(|results| results.into_iter().map(Ok).collect());
+        } else {
+            self.authority_client.batch_get_route_presence(
+                authority,
+                &self.namespace,
+                &authority.runtime.stable_id,
+                keys,
+            )
         }
-        self.authority_client.batch_get_route_presence(
-            authority,
-            &self.namespace,
-            &authority.runtime.stable_id,
-            keys,
-        )
     }
 
     fn get_allocation_route_references_from_authority(
@@ -1432,6 +1475,20 @@ impl EmbeddedWrhRouteDirectory {
         ranked_authorities: &[Vec<ClientLease>],
         baseline_ranked_authorities: Option<&[Vec<ClientLease>]>,
     ) -> Result<Vec<bool>> {
+        let validation_ranked =
+            merge_contains_authority_baselines(ranked_authorities, baseline_ranked_authorities);
+        if validation_ranked.iter().flatten().all(|authority| {
+            authority
+                .compatibility
+                .supports(ROUTE_FILTERED_PRESENCE_CAPABILITY)
+        }) {
+            if let Some(resolved) =
+                self.validate_contains_object_routes_presence(keys, &validation_ranked, true)?
+            {
+                return Ok(resolved);
+            }
+        }
+
         let start_rank = observer_start_rank(observer, self.route_topk);
         let mut resolved = vec![false; keys.len()];
         let mut probe_failed = vec![false; keys.len()];
@@ -1494,19 +1551,9 @@ impl EmbeddedWrhRouteDirectory {
             .collect::<Vec<_>>();
         let positive_ranked = positives
             .iter()
-            .map(|&index| ranked_authorities[index].clone())
+            .map(|&index| validation_ranked[index].clone())
             .collect::<Vec<_>>();
-        let positive_baseline_ranked = baseline_ranked_authorities.map(|baseline| {
-            positives
-                .iter()
-                .map(|&index| baseline[index].clone())
-                .collect::<Vec<_>>()
-        });
-        let validated = self.validate_contains_object_routes(
-            &positive_keys,
-            &positive_ranked,
-            positive_baseline_ranked.as_deref(),
-        )?;
+        let validated = self.validate_contains_object_routes(&positive_keys, &positive_ranked)?;
         for (index, present) in positives.into_iter().zip(validated) {
             resolved[index] = present;
         }
@@ -1517,36 +1564,23 @@ impl EmbeddedWrhRouteDirectory {
         &self,
         keys: &[ObjectKey],
         ranked_authorities: &[Vec<ClientLease>],
-        baseline_ranked_authorities: Option<&[Vec<ClientLease>]>,
     ) -> Result<Vec<bool>> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let mut ranked_authorities = ranked_authorities.to_vec();
-        if let Some(baseline_ranked) = baseline_ranked_authorities {
-            for (authorities, baseline) in ranked_authorities.iter_mut().zip(baseline_ranked) {
-                for authority in baseline {
-                    if !authorities
-                        .iter()
-                        .any(|existing| existing.runtime.stable_id == authority.runtime.stable_id)
-                    {
-                        authorities.push(authority.clone());
-                    }
-                }
-            }
-        }
         if let Some(resolved) =
-            self.validate_contains_object_routes_presence(keys, &ranked_authorities)?
+            self.validate_contains_object_routes_presence(keys, ranked_authorities, false)?
         {
             return Ok(resolved);
         }
-        self.validate_contains_object_routes_full(keys, &ranked_authorities)
+        self.validate_contains_object_routes_full(keys, ranked_authorities)
     }
 
     fn validate_contains_object_routes_presence(
         &self,
         keys: &[ObjectKey],
         ranked_authorities: &[Vec<ClientLease>],
+        filtered: bool,
     ) -> Result<Option<Vec<bool>>> {
         let rank_count = ranked_authorities.iter().map(Vec::len).max().unwrap_or(0);
         let mut resolved = vec![None; keys.len()];
@@ -1563,7 +1597,7 @@ impl EmbeddedWrhRouteDirectory {
             }
         }
         for (authority, batch_keys, assignments) in groups.into_values() {
-            let outcome = self.presence_authority_batch(&authority, &batch_keys);
+            let outcome = self.presence_authority_batch(&authority, &batch_keys, filtered);
             match outcome {
                 Ok(results) => {
                     if results.len() != batch_keys.len() {
@@ -1649,8 +1683,8 @@ impl EmbeddedWrhRouteDirectory {
                 }
             }
         }
-        if has_unsupported && unobserved_index.is_some() {
-            // Compatibility plus another presence failure retains the complete fallback.
+        if has_unsupported && (filtered || unobserved_index.is_some()) {
+            // Unconfirmed filtered presence or mixed failures require the complete fallback.
             return Ok(None);
         }
         if let Some(index) = unobserved_index {
@@ -2595,8 +2629,8 @@ mod owner_page_contract_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use mooncake_store_core::{
-        ClientEndpointSet, ClientEpoch, ClientLifecycleState, CompatibilityDescriptor,
-        ReplicaRoute, ReplicaTier, RouteState, SegmentName,
+        ClientEndpointSet, ClientEpoch, ClientLifecycleState, ColdBackingRoute, ColdBackingState,
+        CompatibilityDescriptor, ReplicaRoute, ReplicaTier, RouteState, SegmentName,
     };
     use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 
@@ -2873,8 +2907,11 @@ mod owner_page_contract_tests {
         inner: RecordingConfirmationClient,
         presence_queries: Arc<Mutex<Vec<String>>>,
         full_queries: Option<FullRouteQueries>,
+        probe_queries: Option<Arc<Mutex<Vec<String>>>>,
         item_failures: BTreeSet<String>,
         item_unsupported: BTreeSet<(String, String)>,
+        presence_misses: BTreeSet<(String, String)>,
+        filtered_presence: bool,
         malformed: bool,
         contains_present: bool,
         unsupported: BTreeSet<String>,
@@ -2930,11 +2967,31 @@ mod owner_page_contract_tests {
                         )));
                     }
                     Ok(RouteAuthorityPresence {
-                        live_version: route.as_ref().map(|route| route.version),
+                        live_version: route.as_ref().and_then(|route| {
+                            (!self
+                                .presence_misses
+                                .contains(&(authority.0.clone(), key.0.clone())))
+                            .then_some(route.version)
+                        }),
                         delete_version,
                     })
                 })
                 .collect())
+        }
+
+        fn batch_get_filtered_route_presence(
+            &self,
+            lease: &ClientLease,
+            namespace: &str,
+            authority: &ClientStableId,
+            keys: &[ObjectKey],
+        ) -> Result<Vec<Result<RouteAuthorityPresence>>> {
+            if !self.filtered_presence {
+                return Err(StoreError::Unsupported(
+                    "filtered presence is not confirmed".to_string(),
+                ));
+            }
+            self.batch_get_route_presence(lease, namespace, authority, keys)
         }
 
         fn batch_get_routes(
@@ -2955,9 +3012,12 @@ mod owner_page_contract_tests {
             &self,
             _lease: &ClientLease,
             _namespace: &str,
-            _authority: &ClientStableId,
+            authority: &ClientStableId,
             keys: &[ObjectKey],
         ) -> Result<Vec<Result<bool>>> {
+            if let Some(queries) = &self.probe_queries {
+                queries.lock().push(authority.0.clone());
+            }
             let present = self.contains_present;
             Ok(keys.iter().map(|_| Ok(present)).collect())
         }
@@ -3816,6 +3876,7 @@ mod owner_page_contract_tests {
             live.version = RouteVersion(live_version);
             let (live_rank, marker_rank) = if expected { (1, 0) } else { (0, 1) };
             let full_queries = Arc::new(Mutex::new(Vec::new()));
+            let probe_queries = Arc::new(Mutex::new(Vec::new()));
             let presence_queries = Arc::new(Mutex::new(Vec::new()));
             let directory = EmbeddedWrhRouteDirectory::new(
                 2,
@@ -3839,6 +3900,9 @@ mod owner_page_contract_tests {
                     },
                     presence_queries: presence_queries.clone(),
                     full_queries: None,
+                    probe_queries: Some(probe_queries.clone()),
+                    presence_misses: BTreeSet::new(),
+                    filtered_presence: true,
                     item_unsupported: BTreeSet::new(),
                     item_failures: BTreeSet::new(),
                     malformed: false,
@@ -3855,6 +3919,7 @@ mod owner_page_contract_tests {
                 expected
             );
             assert!(full_queries.lock().is_empty());
+            assert!(probe_queries.lock().is_empty());
             assert_eq!(presence_queries.lock().len(), 2);
             assert_eq!(
                 presence_queries
@@ -3868,6 +3933,80 @@ mod owner_page_contract_tests {
                     .collect::<BTreeSet<_>>()
             );
         }
+    }
+
+    #[test]
+    fn filtered_presence_evicts_unreadable_and_preserves_cold_routes() {
+        let observer = test_lease("filtered-presence-registry-observer");
+        let authority = test_lease("filtered-presence-registry-authority");
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let namespace = metadata.route_namespace();
+        let hot_key = ObjectKey::new("filtered-presence-registry-hot");
+        let cold_key = ObjectKey::new("filtered-presence-registry-cold");
+        register_local_authority(
+            &namespace,
+            &authority.runtime.stable_id,
+            DEFAULT_DELETE_MARKER_BUDGET_BYTES,
+        );
+        let mut hot = test_route(&hot_key.0, &observer.runtime);
+        hot.version = RouteVersion(6);
+        let mut cold = test_route(&cold_key.0, &observer.runtime);
+        cold.version = RouteVersion(7);
+        cold.replicas.clear();
+        cold.cold_backing = Some(ColdBackingRoute {
+            owner: authority.runtime.clone(),
+            cold_tier_id: "filtered-presence-device".to_string(),
+            object_locator: "filtered-presence-object".to_string(),
+            length: 1,
+            checksum: None,
+            state: ColdBackingState::Materialized,
+            replicas: Vec::new(),
+        });
+        crate::mesh::registry::authority_replace_many(
+            &namespace,
+            &authority.runtime.stable_id,
+            &[
+                RouteCasRequest {
+                    key: hot_key.clone(),
+                    expected: None,
+                    next: Some(hot),
+                },
+                RouteCasRequest {
+                    key: cold_key.clone(),
+                    expected: None,
+                    next: Some(cold),
+                },
+            ],
+        )
+        .unwrap();
+        crate::update_readable_filter(&namespace, Some(BTreeSet::new()));
+
+        let presence = authority_get_filtered_presence_many(
+            &namespace,
+            &authority.runtime.stable_id,
+            &[hot_key.clone(), cold_key.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            presence,
+            vec![
+                RouteAuthorityPresence {
+                    live_version: None,
+                    delete_version: Some(RouteVersion(6)),
+                },
+                RouteAuthorityPresence {
+                    live_version: Some(RouteVersion(7)),
+                    delete_version: None,
+                },
+            ]
+        );
+        assert_eq!(
+            authority_get_delete_marker(&namespace, &authority.runtime.stable_id, &hot_key),
+            Some(RouteVersion(6))
+        );
+
+        crate::update_readable_filter(&namespace, None);
+        unregister_local_authority(&namespace, &authority.runtime.stable_id);
     }
 
     #[test]
@@ -3904,6 +4043,9 @@ mod owner_page_contract_tests {
                 },
                 presence_queries: presence_queries.clone(),
                 full_queries: None,
+                probe_queries: None,
+                presence_misses: BTreeSet::new(),
+                filtered_presence: false,
                 item_unsupported: BTreeSet::new(),
                 item_failures: BTreeSet::new(),
                 malformed: false,
@@ -3919,6 +4061,203 @@ mod owner_page_contract_tests {
         assert!(!directory.contains_object_route(&observer, &key).unwrap());
         assert!(full_queries.lock().is_empty());
         assert!(presence_queries.lock().is_empty());
+    }
+
+    #[test]
+    fn contains_filtered_presence_skips_probe_for_mixed_batches() {
+        for topk in [1, 2] {
+            let observer = test_lease(&format!("contains-filtered-presence-observer-{topk}"));
+            let candidates = (0..4)
+                .map(|index| test_lease(&format!("contains-filtered-presence-{topk}-{index}")))
+                .collect::<Vec<_>>();
+            let keys = (0..16)
+                .map(|index| {
+                    ObjectKey::new(format!("contains-filtered-presence-key-{topk}-{index}"))
+                })
+                .collect::<Vec<_>>();
+            let expected = keys
+                .iter()
+                .enumerate()
+                .map(|(index, _)| index % 2 == 1)
+                .collect::<Vec<_>>();
+            let metadata = Arc::new(InMemoryMetadataBackend::new());
+            let namespace = metadata.route_namespace();
+            let ranked = keys
+                .iter()
+                .map(|key| ranked_top_authorities(&namespace, &candidates, key, topk))
+                .collect::<Vec<_>>();
+            let expected_queries = ranked
+                .iter()
+                .flatten()
+                .map(|authority| authority.runtime.stable_id.0.clone())
+                .collect::<BTreeSet<_>>();
+            let presence_misses = candidates
+                .iter()
+                .flat_map(|authority| {
+                    keys.iter().enumerate().filter_map(move |(index, key)| {
+                        (index % 2 == 0)
+                            .then_some((authority.runtime.stable_id.0.clone(), key.0.clone()))
+                    })
+                })
+                .collect();
+            let live = test_route("contains-filtered-presence-route", &observer.runtime);
+            let full_queries = Arc::new(Mutex::new(Vec::new()));
+            let probe_queries = Arc::new(Mutex::new(Vec::new()));
+            let presence_queries = Arc::new(Mutex::new(Vec::new()));
+            let directory = EmbeddedWrhRouteDirectory::new(
+                topk,
+                metadata,
+                &observer,
+                Arc::new(PresenceConfirmationClient {
+                    inner: RecordingConfirmationClient {
+                        routes: candidates
+                            .iter()
+                            .map(|authority| {
+                                (authority.runtime.stable_id.0.clone(), Some(live.clone()))
+                            })
+                            .collect(),
+                        delete_versions: BTreeMap::new(),
+                        read_failures: BTreeSet::new(),
+                        queried_authorities: Arc::new(Mutex::new(Vec::new())),
+                    },
+                    presence_queries: presence_queries.clone(),
+                    full_queries: Some(full_queries.clone()),
+                    probe_queries: Some(probe_queries.clone()),
+                    presence_misses,
+                    filtered_presence: true,
+                    item_failures: BTreeSet::new(),
+                    item_unsupported: BTreeSet::new(),
+                    malformed: false,
+                    contains_present: true,
+                    unsupported: BTreeSet::new(),
+                }),
+                Arc::new(TestMembership { leases: candidates }),
+            );
+
+            assert_eq!(
+                directory
+                    .contains_object_routes_bounded(&observer, &keys)
+                    .unwrap(),
+                expected
+            );
+            assert!(probe_queries.lock().is_empty());
+            assert!(full_queries.lock().is_empty());
+            assert_eq!(presence_queries.lock().len(), expected_queries.len());
+            assert_eq!(
+                presence_queries
+                    .lock()
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                expected_queries
+            );
+        }
+    }
+
+    #[test]
+    fn contains_unconfirmed_filtered_presence_retains_probe_first() {
+        let observer = test_lease("contains-unconfirmed-filtered-presence-observer");
+        let candidates = vec![
+            test_lease("contains-unconfirmed-filtered-presence-a"),
+            test_lease("contains-unconfirmed-filtered-presence-b"),
+        ];
+        let key = ObjectKey::new("contains-unconfirmed-filtered-presence-key");
+        let full_queries = Arc::new(Mutex::new(Vec::new()));
+        let probe_queries = Arc::new(Mutex::new(Vec::new()));
+        let presence_queries = Arc::new(Mutex::new(Vec::new()));
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(PresenceConfirmationClient {
+                inner: RecordingConfirmationClient {
+                    routes: candidates
+                        .iter()
+                        .map(|authority| {
+                            (
+                                authority.runtime.stable_id.0.clone(),
+                                Some(test_route(&key.0, &observer.runtime)),
+                            )
+                        })
+                        .collect(),
+                    delete_versions: BTreeMap::new(),
+                    read_failures: BTreeSet::new(),
+                    queried_authorities: Arc::new(Mutex::new(Vec::new())),
+                },
+                presence_queries: presence_queries.clone(),
+                full_queries: Some(full_queries.clone()),
+                probe_queries: Some(probe_queries.clone()),
+                presence_misses: BTreeSet::new(),
+                filtered_presence: false,
+                item_failures: BTreeSet::new(),
+                item_unsupported: BTreeSet::new(),
+                malformed: false,
+                contains_present: true,
+                unsupported: BTreeSet::new(),
+            }),
+            Arc::new(TestMembership { leases: candidates }),
+        );
+
+        assert!(directory.contains_object_route(&observer, &key).unwrap());
+        assert_eq!(probe_queries.lock().len(), 1);
+        assert_eq!(presence_queries.lock().len(), 2);
+        assert!(full_queries.lock().is_empty());
+    }
+
+    #[test]
+    fn contains_capability_less_authorities_keep_probe_first() {
+        let observer = test_lease("contains-capability-less-presence-observer");
+        let mut candidates = vec![
+            test_lease("contains-capability-less-presence-a"),
+            test_lease("contains-capability-less-presence-b"),
+        ];
+        for authority in &mut candidates {
+            authority
+                .compatibility
+                .capabilities
+                .remove(ROUTE_FILTERED_PRESENCE_CAPABILITY);
+        }
+        let key = ObjectKey::new("contains-capability-less-presence-key");
+        let full_queries = Arc::new(Mutex::new(Vec::new()));
+        let probe_queries = Arc::new(Mutex::new(Vec::new()));
+        let presence_queries = Arc::new(Mutex::new(Vec::new()));
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(PresenceConfirmationClient {
+                inner: RecordingConfirmationClient {
+                    routes: candidates
+                        .iter()
+                        .map(|authority| {
+                            (
+                                authority.runtime.stable_id.0.clone(),
+                                Some(test_route(&key.0, &observer.runtime)),
+                            )
+                        })
+                        .collect(),
+                    delete_versions: BTreeMap::new(),
+                    read_failures: BTreeSet::new(),
+                    queried_authorities: Arc::new(Mutex::new(Vec::new())),
+                },
+                presence_queries: presence_queries.clone(),
+                full_queries: Some(full_queries.clone()),
+                probe_queries: Some(probe_queries.clone()),
+                presence_misses: BTreeSet::new(),
+                filtered_presence: true,
+                item_failures: BTreeSet::new(),
+                item_unsupported: BTreeSet::new(),
+                malformed: false,
+                contains_present: true,
+                unsupported: BTreeSet::new(),
+            }),
+            Arc::new(TestMembership { leases: candidates }),
+        );
+
+        assert!(directory.contains_object_route(&observer, &key).unwrap());
+        assert_eq!(probe_queries.lock().len(), 1);
+        assert_eq!(presence_queries.lock().len(), 2);
+        assert!(full_queries.lock().is_empty());
     }
 
     #[test]
@@ -3943,6 +4282,9 @@ mod owner_page_contract_tests {
                 },
                 presence_queries: presence_queries.clone(),
                 full_queries: None,
+                probe_queries: None,
+                presence_misses: BTreeSet::new(),
+                filtered_presence: false,
                 item_unsupported: BTreeSet::new(),
                 item_failures: BTreeSet::new(),
                 malformed: false,
@@ -3973,6 +4315,7 @@ mod owner_page_contract_tests {
         let namespace = metadata.route_namespace();
         let ranked = ranked_top_authorities(&namespace, &candidates, &key, 2);
         let full_queries = Arc::new(Mutex::new(Vec::new()));
+        let probe_queries = Arc::new(Mutex::new(Vec::new()));
         let presence_queries = Arc::new(Mutex::new(Vec::new()));
         let directory = EmbeddedWrhRouteDirectory::new(
             2,
@@ -3990,6 +4333,9 @@ mod owner_page_contract_tests {
                 },
                 presence_queries: presence_queries.clone(),
                 full_queries: None,
+                probe_queries: Some(probe_queries.clone()),
+                presence_misses: BTreeSet::new(),
+                filtered_presence: true,
                 item_unsupported: BTreeSet::new(),
                 item_failures: BTreeSet::new(),
                 malformed: false,
@@ -4004,6 +4350,7 @@ mod owner_page_contract_tests {
             .expect_err("a live route must not hide an unavailable authority");
         assert!(matches!(error, StoreError::Transport(_)));
         assert!(full_queries.lock().is_empty());
+        assert!(probe_queries.lock().is_empty());
         assert_eq!(presence_queries.lock().len(), 2);
     }
 
@@ -4026,6 +4373,7 @@ mod owner_page_contract_tests {
             let namespace = metadata.route_namespace();
             let ranked = ranked_top_authorities(&namespace, &candidates, &key, 2);
             let full_queries = Arc::new(Mutex::new(Vec::new()));
+            let probe_queries = Arc::new(Mutex::new(Vec::new()));
             let presence_queries = Arc::new(Mutex::new(Vec::new()));
             let directory = EmbeddedWrhRouteDirectory::new(
                 2,
@@ -4043,6 +4391,9 @@ mod owner_page_contract_tests {
                     },
                     presence_queries: presence_queries.clone(),
                     full_queries: None,
+                    probe_queries: Some(probe_queries.clone()),
+                    presence_misses: BTreeSet::new(),
+                    filtered_presence: true,
                     item_unsupported: BTreeSet::new(),
                     item_failures: if item_failure {
                         BTreeSet::from([ranked[1].runtime.stable_id.0.clone()])
@@ -4061,6 +4412,7 @@ mod owner_page_contract_tests {
                 .expect_err("invalid presence observations must fail closed");
             assert!(matches!(error, StoreError::Transport(_)));
             assert!(full_queries.lock().is_empty());
+            assert!(probe_queries.lock().is_empty());
             assert_eq!(presence_queries.lock().len(), 2);
         }
     }
@@ -4093,6 +4445,9 @@ mod owner_page_contract_tests {
                 },
                 presence_queries: Arc::new(Mutex::new(Vec::new())),
                 full_queries: None,
+                probe_queries: None,
+                presence_misses: BTreeSet::new(),
+                filtered_presence: false,
                 item_failures: BTreeSet::from([candidates[1].runtime.stable_id.0.clone()]),
                 item_unsupported: BTreeSet::new(),
                 malformed: false,
@@ -4103,14 +4458,14 @@ mod owner_page_contract_tests {
         );
 
         let error = directory
-            .validate_contains_object_routes_presence(&keys, &ranked)
+            .validate_contains_object_routes_presence(&keys, &ranked, false)
             .expect_err("the failed presence item should fail closed");
         assert!(error.to_string().contains(&keys[1].0));
         assert!(!error.to_string().contains(&keys[0].0));
     }
 
     #[test]
-    fn contains_presence_unsupported_reads_only_the_legacy_authority() {
+    fn contains_mixed_filtered_and_legacy_presence_reads_only_legacy() {
         let observer = test_lease("contains-presence-legacy-observer");
         let candidates = vec![
             test_lease("contains-presence-legacy-a"),
@@ -4123,6 +4478,7 @@ mod owner_page_contract_tests {
         let mut live = test_route(&key.0, &observer.runtime);
         live.version = RouteVersion(6);
         let full_queries = Arc::new(Mutex::new(Vec::new()));
+        let probe_queries = Arc::new(Mutex::new(Vec::new()));
         let presence_queries = Arc::new(Mutex::new(Vec::new()));
         let directory = EmbeddedWrhRouteDirectory::new(
             2,
@@ -4143,6 +4499,9 @@ mod owner_page_contract_tests {
                 },
                 presence_queries: presence_queries.clone(),
                 full_queries: Some(full_queries.clone()),
+                probe_queries: Some(probe_queries.clone()),
+                presence_misses: BTreeSet::new(),
+                filtered_presence: true,
                 item_unsupported: BTreeSet::new(),
                 item_failures: BTreeSet::new(),
                 malformed: false,
@@ -4153,7 +4512,8 @@ mod owner_page_contract_tests {
         );
 
         assert!(directory.contains_object_route(&observer, &key).unwrap());
-        assert_eq!(presence_queries.lock().len(), 2);
+        assert_eq!(probe_queries.lock().len(), 1);
+        assert_eq!(presence_queries.lock().len(), 4);
         assert_eq!(
             full_queries.lock().as_slice(),
             &[(ranked[0].runtime.stable_id.0.clone(), vec![key])]
@@ -4215,6 +4575,9 @@ mod owner_page_contract_tests {
                 },
                 presence_queries: Arc::new(Mutex::new(Vec::new())),
                 full_queries: Some(full_queries.clone()),
+                probe_queries: None,
+                presence_misses: BTreeSet::new(),
+                filtered_presence: false,
                 item_unsupported: BTreeSet::from([(legacy_id.clone(), unsupported_key.0.clone())]),
                 item_failures: BTreeSet::new(),
                 malformed: false,
@@ -4280,6 +4643,9 @@ mod owner_page_contract_tests {
                     },
                     presence_queries: Arc::new(Mutex::new(Vec::new())),
                     full_queries: Some(full_queries.clone()),
+                    probe_queries: None,
+                    presence_misses: BTreeSet::new(),
+                    filtered_presence: false,
                     item_unsupported: BTreeSet::new(),
                     item_failures: BTreeSet::new(),
                     malformed: false,
@@ -4333,6 +4699,9 @@ mod owner_page_contract_tests {
                 },
                 presence_queries: Arc::new(Mutex::new(Vec::new())),
                 full_queries: Some(full_queries.clone()),
+                probe_queries: None,
+                presence_misses: BTreeSet::new(),
+                filtered_presence: false,
                 item_unsupported: BTreeSet::new(),
                 item_failures: BTreeSet::from([failed.runtime.stable_id.0.clone()]),
                 malformed: false,
@@ -4390,6 +4759,9 @@ mod owner_page_contract_tests {
                 },
                 presence_queries: Arc::new(Mutex::new(Vec::new())),
                 full_queries: Some(full_queries.clone()),
+                probe_queries: None,
+                presence_misses: BTreeSet::new(),
+                filtered_presence: false,
                 item_unsupported: BTreeSet::new(),
                 item_failures: BTreeSet::new(),
                 malformed: false,
@@ -4898,6 +5270,7 @@ mod owner_page_contract_tests {
                 leases: Mutex::new(vec![original.clone()]),
             });
             let full_queries = Arc::new(Mutex::new(Vec::new()));
+            let probe_queries = Arc::new(Mutex::new(Vec::new()));
             let presence_queries = Arc::new(Mutex::new(Vec::new()));
             let directory = EmbeddedWrhRouteDirectory::new(
                 2,
@@ -4918,6 +5291,9 @@ mod owner_page_contract_tests {
                     },
                     presence_queries: presence_queries.clone(),
                     full_queries: Some(full_queries.clone()),
+                    probe_queries: Some(probe_queries.clone()),
+                    presence_misses: BTreeSet::new(),
+                    filtered_presence: !legacy_baseline,
                     item_unsupported: BTreeSet::new(),
                     item_failures: BTreeSet::new(),
                     malformed: false,
@@ -4941,8 +5317,10 @@ mod owner_page_contract_tests {
                     full_queries.lock().as_slice(),
                     &[(original.runtime.stable_id.0.clone(), vec![key.clone()])]
                 );
+                assert!(!probe_queries.lock().is_empty());
             } else {
                 assert!(full_queries.lock().is_empty());
+                assert!(probe_queries.lock().is_empty());
             }
             let expected_queries = current_top
                 .iter()

@@ -78,6 +78,18 @@ pub(crate) trait RouteAuthorityClient: Send + Sync {
         ))
     }
 
+    fn batch_get_filtered_route_presence(
+        &self,
+        _lease: &ClientLease,
+        _namespace: &str,
+        _authority: &ClientStableId,
+        _keys: &[ObjectKey],
+    ) -> Result<Vec<Result<RouteAuthorityPresence>>> {
+        Err(StoreError::Unsupported(
+            "route authority client does not support filtered route presence queries".to_string(),
+        ))
+    }
+
     fn batch_contains_routes(
         &self,
         lease: &ClientLease,
@@ -166,6 +178,22 @@ pub trait RouteAuthorityService: Send + Sync {
             .map(|_| {
                 Err(StoreError::Unsupported(
                     "route authority does not implement route presence queries".to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    fn batch_get_filtered_route_presence(
+        &self,
+        _namespace: &str,
+        _authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Vec<Result<RouteAuthorityPresence>> {
+        keys.iter()
+            .map(|_| {
+                Err(StoreError::Unsupported(
+                    "route authority does not implement filtered route presence queries"
+                        .to_string(),
                 ))
             })
             .collect()

@@ -108,6 +108,26 @@ pub(crate) fn authority_get_presence_many(
     Ok(slot.table.get_presence_many(keys))
 }
 
+pub(crate) fn authority_get_filtered_presence_many(
+    namespace: &str,
+    authority: &ClientStableId,
+    keys: &[ObjectKey],
+) -> Result<Vec<RouteAuthorityPresence>> {
+    let mesh = route_mesh(namespace);
+    let filter = mesh.readable_filter.lock().clone();
+    let mut slot = mesh
+        .authorities
+        .get_mut(&authority.0)
+        .ok_or_else(|| not_attached(authority))?;
+    if slot.ref_count == 0 {
+        return Err(not_attached(authority));
+    }
+    if let Some(readable) = filter {
+        slot.table.evict_unreadable_routes(keys, &readable);
+    }
+    Ok(slot.table.get_presence_many(keys))
+}
+
 pub(crate) fn authority_contains_many(
     namespace: &str,
     authority: &ClientStableId,
