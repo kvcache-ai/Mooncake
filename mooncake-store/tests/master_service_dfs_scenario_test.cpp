@@ -1,3 +1,4 @@
+#include "master_service/primary_write_grants_for_testing.h"
 #include <gtest/gtest.h>
 
 #include <cstdlib>
@@ -232,18 +233,22 @@ TEST_F(ManagedWeightDfsEvictionTest,
         std::vector<std::string>{importing->manifest.payload_group_id};
     payload_config.residency_affinity_ids =
         std::vector<std::string>{payload_key};
-    ASSERT_TRUE(service.PutStart(client_id, payload_key, TenantId::Default(),
-                                 4096, payload_config));
-    ASSERT_TRUE(service.PutEnd(client_id, payload_key, TenantId::Default(),
-                               ReplicaType::ALL));
+    ASSERT_TRUE(PutStartWithGrantForTesting(service, client_id, payload_key,
+                                            TenantId::Default(), 4096,
+                                            payload_config));
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, client_id, payload_key,
+                                          TenantId::Default(),
+                                          ReplicaType::ALL));
 
     auto manifest_config = payload_config;
     manifest_config.data_type = ObjectDataType::METADATA;
     manifest_config.residency_affinity_ids.reset();
-    ASSERT_TRUE(service.PutStart(client_id, manifest_key, TenantId::Default(),
-                                 4096, manifest_config));
-    ASSERT_TRUE(service.PutEnd(client_id, manifest_key, TenantId::Default(),
-                               ReplicaType::ALL));
+    ASSERT_TRUE(PutStartWithGrantForTesting(service, client_id, manifest_key,
+                                            TenantId::Default(), 4096,
+                                            manifest_config));
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, client_id, manifest_key,
+                                          TenantId::Default(),
+                                          ReplicaType::ALL));
     ASSERT_TRUE(service.CommitWeightImport(CommitWeightImportRequest{
         .identity = identity,
         .expected_metadata_generation = importing->metadata_generation,

@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <thread>
 #include <stop_token>
+#include "offload_storage_key.h"
 
 #include <gflags/gflags.h>
 #include <dlfcn.h>  // for dlsym (Python detection)
@@ -519,7 +520,7 @@ inline QueryResult FilterQueryResult(const QueryResult &qr,
                                    StoreHcaAffinityEnabled()),
         qr.lease_timeout,
         include_object_checksum ? qr.object_checksum : std::nullopt,
-        qr.resolved_tenant_id);
+        qr.resolved_tenant_id, qr.object_generation);
 }
 
 bool IsLocalDiskMasterLeaseExpired(const QueryResult &query_result,
@@ -4131,8 +4132,13 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         std::unordered_map<std::string, std::vector<Slice>> objects;
         objects.emplace(
             key, std::vector<Slice>{{buffer_handle->ptr(), total_length}});
-        auto read_result =
-            batch_get_into_offload_object_internal(endpoint, objects);
+        auto read_result = batch_get_into_offload_object_internal(
+            endpoint, objects, nullptr, 0,
+            best_replica->get_local_disk_descriptor().client_id,
+            {{key,
+              best_replica->get_local_disk_descriptor().storage_key.value_or(
+                  "")}},
+            query_result.value().resolved_tenant_id.value_or(""));
         if (!read_result) {
             LOG(ERROR) << "SSD read failed for key '" << key
                        << "': " << toString(read_result.error());
@@ -4658,8 +4664,43 @@ RealClient::batch_get_buffer_internal(
             disk_ops.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
         for (auto &[endpoint, objects] : offload_objects) {
             if (objects.empty()) continue;
-            auto read_result =
-                batch_get_into_offload_object_internal(endpoint, objects);
+            std::optional<UUID> owner_id;
+            bool owner_mismatch = false;
+            std::string endpoint_tenant;
+            std::unordered_map<std::string, std::string> disk_storage_keys;
+            for (const auto &[key, slices] : objects) {
+                const auto &qr = disk_ops[disk_key_to_idx.at(key)].query_result;
+                if (endpoint_tenant.empty() &&
+                    qr.resolved_tenant_id.has_value() &&
+                    !qr.resolved_tenant_id->empty()) {
+                    endpoint_tenant = *qr.resolved_tenant_id;
+                }
+                for (const auto &candidate : qr.replicas) {
+                    if (!candidate.is_local_disk_replica()) continue;
+                    const auto &disk = candidate.get_local_disk_descriptor();
+                    if (disk.transport_endpoint != endpoint) continue;
+                    if (owner_id && *owner_id != disk.client_id) {
+                        owner_mismatch = true;
+                        break;
+                    }
+                    owner_id = disk.client_id;
+                    disk_storage_keys[key] = disk.storage_key.value_or("");
+                }
+                if (owner_mismatch) break;
+            }
+            if (owner_mismatch) {
+                for (const auto &[key, slices] : objects) {
+                    auto idx_it = disk_key_to_idx.find(key);
+                    if (idx_it != disk_key_to_idx.end()) {
+                        op_status[idx_it->second] =
+                            tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+                    }
+                }
+                continue;
+            }
+            auto read_result = batch_get_into_offload_object_internal(
+                endpoint, objects, nullptr, 0, owner_id.value_or(UUID{}),
+                disk_storage_keys, endpoint_tenant);
             for (auto &[key, slices] : objects) {
                 auto idx_it = disk_key_to_idx.find(key);
                 if (idx_it == disk_key_to_idx.end()) continue;
@@ -5087,8 +5128,12 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             objects.emplace(
                 key, std::vector<Slice>{
                          {static_cast<char *>(buffer) + dst_offset, size}});
-            auto result =
-                batch_get_into_offload_object_internal(endpoint, objects);
+            auto result = batch_get_into_offload_object_internal(
+                endpoint, objects, nullptr, 0,
+                replica.get_local_disk_descriptor().client_id,
+                {{key, replica.get_local_disk_descriptor().storage_key.value_or(
+                           "")}},
+                query_result.resolved_tenant_id.value_or(client_->tenant_id()));
             if (!result) return tl::unexpected(result.error());
             if (verify_checksum) {
                 auto checksum_result = client_->VerifyObjectChecksum(
@@ -5244,7 +5289,11 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             {key, {{dst, size}}}};
         if (can_use_pinned_restore_arena(endpoint, objects)) {
             auto result = batch_get_into_offload_object_internal(
-                endpoint, objects, &read_range);
+                endpoint, objects, &read_range, 0,
+                replica.get_local_disk_descriptor().client_id,
+                {{key, replica.get_local_disk_descriptor().storage_key.value_or(
+                           "")}},
+                query_result.resolved_tenant_id.value_or(client_->tenant_id()));
             if (!result) return tl::unexpected(result.error());
             return static_cast<int64_t>(size);
         }
@@ -5254,8 +5303,14 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 std::unordered_map<std::string, std::vector<Slice>> objects;
                 objects.emplace(key, std::vector<Slice>{
                                          {static_cast<char *>(tmp_buf), size}});
-                return batch_get_into_offload_object_internal(endpoint, objects,
-                                                              &read_range);
+                return batch_get_into_offload_object_internal(
+                    endpoint, objects, &read_range, 0,
+                    replica.get_local_disk_descriptor().client_id,
+                    {{key,
+                      replica.get_local_disk_descriptor().storage_key.value_or(
+                          "")}},
+                    query_result.resolved_tenant_id.value_or(
+                        client_->tenant_id()));
             },
             size);
     }
@@ -6971,8 +7026,39 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     const auto query_results = client_->BatchQuery(keys);
     return batch_get_into_internal(
         keys, buffers, sizes, query_results,
-        [this](const std::string &endpoint, LocalDiskOffloadObjects &objects) {
-            return batch_get_into_offload_object_internal(endpoint, objects);
+        [this, &query_results, &keys](
+            const std::string &endpoint,
+            LocalDiskOffloadObjects &objects) -> tl::expected<void, ErrorCode> {
+            std::optional<std::string> resolved_tenant;
+            std::optional<UUID> owner_id;
+            std::unordered_map<std::string, std::string> disk_storage_keys;
+            for (size_t i = 0; i < query_results.size(); ++i) {
+                if (!objects.contains(keys[i])) continue;
+                const auto &query = query_results[i];
+                if (!query) continue;
+                const auto scope =
+                    query->resolved_tenant_id.value_or(client_->tenant_id());
+                if (resolved_tenant && *resolved_tenant != scope)
+                    return tl::unexpected(ErrorCode::INVALID_REPLICA);
+                resolved_tenant = scope;
+                for (const auto &replica : query->replicas) {
+                    if (!replica.is_local_disk_replica()) continue;
+                    const auto &disk = replica.get_local_disk_descriptor();
+                    if (disk.transport_endpoint != endpoint) continue;
+                    if (owner_id && *owner_id != disk.client_id)
+                        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+                    owner_id = disk.client_id;
+                    const auto storage_key = disk.storage_key.value_or("");
+                    const auto [entry, inserted] =
+                        disk_storage_keys.emplace(keys[i], storage_key);
+                    if (!inserted && entry->second != storage_key)
+                        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+                }
+            }
+            if (!owner_id) return tl::unexpected(ErrorCode::INVALID_REPLICA);
+            return batch_get_into_offload_object_internal(
+                endpoint, objects, nullptr, 0, *owner_id, disk_storage_keys,
+                resolved_tenant.value_or(client_->tenant_id()));
         });
 }
 
@@ -7965,6 +8051,8 @@ void RealClient::execute_session_local_disk_range_reads(
     }
 
     for (const auto &[endpoint, keys] : endpoint_plans) {
+        std::vector<std::string> physical_keys;
+        std::optional<std::string> resolved_tenant;
         std::vector<std::string> restore_keys;
         std::vector<int64_t> restore_sizes;
         std::vector<int64_t> restore_offsets;
@@ -8003,6 +8091,22 @@ void RealClient::execute_session_local_disk_range_reads(
             }
             mutable_plan.window_offset = static_cast<int64_t>(window->offset);
             mutable_plan.window_length = static_cast<int64_t>(window->length);
+            const auto *request = plan.key_requests.front();
+            const auto physical =
+                request->selected_replica.get_local_disk_descriptor()
+                    .storage_key.value_or("");
+            const auto scope =
+                request->cached_query_result.resolved_tenant_id.value_or(
+                    client_->tenant_id());
+            if (physical.empty() ||
+                (resolved_tenant && *resolved_tenant != scope)) {
+                for (const auto *item : plan.key_requests)
+                    results[item->result_index] =
+                        toInt(ErrorCode::INVALID_REPLICA);
+                continue;
+            }
+            resolved_tenant = scope;
+            physical_keys.push_back(physical);
             restore_keys.push_back(key);
             restore_sizes.push_back(mutable_plan.window_length);
             restore_offsets.push_back(mutable_plan.window_offset);
@@ -8013,8 +8117,9 @@ void RealClient::execute_session_local_disk_range_reads(
         }
 
         auto restored = restore_offload_objects(
-            endpoint, restore_keys, restore_sizes, {},
-            /*allow_pinned=*/false, &restore_offsets, &object_sizes);
+            endpoint, physical_keys, restore_sizes, {},
+            /*allow_pinned=*/false, &restore_offsets, &object_sizes,
+            resolved_tenant.value_or(client_->tenant_id()));
         if (!restored) {
             for (const auto &key : restore_keys) {
                 for (const auto *request : keys.at(key).key_requests) {
@@ -8376,7 +8481,7 @@ std::vector<int> RealClient::batch_put_session_start(
 
     auto start_responses =
         client_->StartBatchPutForSizes(start_keys, start_sizes, start_config);
-    std::vector<std::string> keys_to_revoke;
+    std::vector<ObjectMeta> metas_to_revoke;
     std::vector<std::string> hot_keys_to_remove;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -8388,22 +8493,25 @@ std::vector<int> RealClient::batch_put_session_start(
                 continue;
             }
             auto replicas = std::move(start_responses[j].value());
-            bool has_memory_replica = false;
-            for (const auto &replica : replicas) {
-                if (replica.is_memory_replica()) {
-                    has_memory_replica = true;
-                    break;
-                }
-            }
-            if (!has_memory_replica) {
+            const auto write_generation =
+                GetOptionalPrimaryWriteGeneration(replicas);
+            if (!write_generation) {
                 hot_keys_to_remove.push_back(keys[i]);
-                keys_to_revoke.push_back(keys[i]);
+                metas_to_revoke.push_back({keys[i], std::nullopt, {}});
+                results[i] = static_cast<int>(toInt(write_generation.error()));
+                continue;
+            }
+            if (!HasMemoryReplica(replicas)) {
+                hot_keys_to_remove.push_back(keys[i]);
+                metas_to_revoke.push_back(
+                    {keys[i], std::nullopt, write_generation->value_or("")});
                 results[i] =
                     static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
                 continue;
             }
             put_sessions_[keys[i]] = PutSessionEntry{
                 .replicas = std::move(replicas),
+                .write_generation = write_generation->value_or(""),
                 .object_size = static_cast<uint64_t>(sizes[i]),
                 .write_mode = write_mode,
             };
@@ -8412,8 +8520,8 @@ std::vector<int> RealClient::batch_put_session_start(
     if (client_->GetHotCache() && !hot_keys_to_remove.empty()) {
         client_->GetHotCache()->RemoveHotKeys(hot_keys_to_remove);
     }
-    if (!keys_to_revoke.empty()) {
-        (void)client_->BatchPutRevoke(keys_to_revoke);
+    if (!metas_to_revoke.empty()) {
+        (void)client_->BatchPutRevoke(metas_to_revoke);
     }
     return results;
 }
@@ -8522,6 +8630,7 @@ std::vector<int> RealClient::batch_put_session_end(
     }
 
     std::vector<std::string> end_keys;
+    std::vector<ObjectMeta> end_metas;
     std::vector<size_t> end_indices;
     std::vector<char> has_nof;
     {
@@ -8550,6 +8659,8 @@ std::vector<int> RealClient::batch_put_session_end(
                 continue;
             }
             end_keys.push_back(keys[i]);
+            end_metas.push_back(
+                {keys[i], std::nullopt, it->second.write_generation});
             end_indices.push_back(i);
             has_nof.push_back(static_cast<char>(nof));
         }
@@ -8561,11 +8672,7 @@ std::vector<int> RealClient::batch_put_session_end(
         return ToPyResults(results);
     }
 
-    std::vector<ObjectMeta> end_metas;
-    end_metas.reserve(end_keys.size());
-    for (const auto &key : end_keys) {
-        end_metas.emplace_back(ObjectMeta{key, std::nullopt});
-    }
+    // Session put path does not compute checksums; leave object_checksum unset.
     auto end_responses = client_->BatchPutEnd(end_metas, ReplicaType::MEMORY);
     if (end_responses.size() != end_keys.size()) {
         for (size_t j = 0; j < end_keys.size(); ++j) {
@@ -8575,23 +8682,34 @@ std::vector<int> RealClient::batch_put_session_end(
     }
 
     std::vector<std::string> nof_revoke_keys;
+    std::vector<ObjectMeta> nof_revoke_metas;
     std::vector<size_t> nof_revoke_end_indices;
     nof_revoke_keys.reserve(end_keys.size());
     nof_revoke_end_indices.reserve(end_keys.size());
     for (size_t j = 0; j < end_keys.size(); ++j) {
         const size_t i = end_indices[j];
         if (!end_responses[j]) {
+            // The Master may have lost the reservation before this call (for
+            // example after an uncertain revoke). Keep the sealed session for
+            // a retry or an explicit revoke; dropping it here turns an
+            // OBJECT_NOT_FOUND response into a local INVALID_PARAMS result
+            // and prevents the caller from cleaning up its state.
             results[i] = tl::unexpected(end_responses[j].error());
             continue;
         }
         if (has_nof[j]) {
             nof_revoke_keys.push_back(end_keys[j]);
+            nof_revoke_metas.push_back(end_metas[j]);
             nof_revoke_end_indices.push_back(j);
             continue;
         }
         {
             std::lock_guard<std::mutex> lock(session_mutex_);
-            put_sessions_.erase(end_keys[j]);
+            const auto session = put_sessions_.find(end_keys[j]);
+            if (session != put_sessions_.end() &&
+                session->second.write_generation ==
+                    end_metas[j].write_generation.value_or(""))
+                put_sessions_.erase(session);
         }
         results[i] = {};
     }
@@ -8601,7 +8719,7 @@ std::vector<int> RealClient::batch_put_session_end(
     }
 
     auto nof_revoke_responses =
-        client_->BatchPutRevoke(nof_revoke_keys, ReplicaType::NOF_SSD);
+        client_->BatchPutRevoke(nof_revoke_metas, ReplicaType::NOF_SSD);
     if (nof_revoke_responses.size() != nof_revoke_keys.size()) {
         for (size_t k = 0; k < nof_revoke_keys.size(); ++k) {
             const size_t j = nof_revoke_end_indices[k];
@@ -8619,7 +8737,11 @@ std::vector<int> RealClient::batch_put_session_end(
         }
         {
             std::lock_guard<std::mutex> lock(session_mutex_);
-            put_sessions_.erase(nof_revoke_keys[k]);
+            const auto session = put_sessions_.find(nof_revoke_keys[k]);
+            if (session != put_sessions_.end() &&
+                session->second.write_generation ==
+                    nof_revoke_metas[k].write_generation.value_or(""))
+                put_sessions_.erase(session);
         }
         results[i] = {};
     }
@@ -8636,6 +8758,7 @@ std::vector<int> RealClient::batch_put_session_revoke(
     }
 
     std::vector<std::string> revoke_keys;
+    std::vector<ObjectMeta> revoke_metas;
     std::vector<size_t> revoke_indices;
     {
         std::unique_lock<std::mutex> lock(session_mutex_);
@@ -8647,6 +8770,8 @@ std::vector<int> RealClient::batch_put_session_revoke(
             }
             it->second.writable = false;
             revoke_keys.push_back(keys[i]);
+            revoke_metas.push_back(
+                {keys[i], std::nullopt, it->second.write_generation});
             revoke_indices.push_back(i);
         }
         if (!revoke_keys.empty()) {
@@ -8661,7 +8786,7 @@ std::vector<int> RealClient::batch_put_session_revoke(
         client_->GetHotCache()->RemoveHotKeys(revoke_keys);
     }
     auto revoke_responses =
-        client_->BatchPutRevoke(revoke_keys, ReplicaType::ALL);
+        client_->BatchPutRevoke(revoke_metas, ReplicaType::ALL);
     std::lock_guard<std::mutex> lock(session_mutex_);
     if (revoke_responses.size() != revoke_keys.size()) {
         for (size_t j = 0; j < revoke_keys.size(); ++j) {
@@ -8672,15 +8797,28 @@ std::vector<int> RealClient::batch_put_session_revoke(
     for (size_t j = 0; j < revoke_keys.size(); ++j) {
         const size_t i = revoke_indices[j];
         if (!revoke_responses[j]) {
-            if (revoke_responses[j].error() == ErrorCode::OBJECT_NOT_FOUND) {
-                put_sessions_.erase(revoke_keys[j]);
-                results[i] = {};
+            if (revoke_responses[j].error() == ErrorCode::OBJECT_NOT_FOUND ||
+                revoke_responses[j].error() == ErrorCode::INVALID_VERSION) {
+                // Nothing left on Master; drop the local session.
+                const auto session = put_sessions_.find(revoke_keys[j]);
+                if (session != put_sessions_.end() &&
+                    session->second.write_generation ==
+                        revoke_metas[j].write_generation.value_or(""))
+                    put_sessions_.erase(session);
+                if (revoke_responses[j].error() == ErrorCode::OBJECT_NOT_FOUND)
+                    results[i] = {};
+                else
+                    results[i] = tl::unexpected(revoke_responses[j].error());
             } else {
                 results[i] = tl::unexpected(revoke_responses[j].error());
             }
             continue;
         }
-        put_sessions_.erase(revoke_keys[j]);
+        const auto session = put_sessions_.find(revoke_keys[j]);
+        if (session != put_sessions_.end() &&
+            session->second.write_generation ==
+                revoke_metas[j].write_generation.value_or(""))
+            put_sessions_.erase(session);
         results[i] = {};
     }
     return ToPyResults(results);
@@ -9065,10 +9203,38 @@ RealClient::batch_get_into_multi_buffers_internal(
                     .emplace(key, std::move(user_slices));
             }
 
+            auto read_owner =
+                [this, &valid_local_disk_ops](
+                    const std::string &endpoint,
+                    auto &objects) -> tl::expected<void, ErrorCode> {
+                std::optional<std::string> resolved_tenant;
+                std::optional<UUID> owner_id;
+                std::unordered_map<std::string, std::string> disk_storage_keys;
+                for (const auto &[key, slices] : objects) {
+                    const auto scope =
+                        valid_local_disk_ops.at(key)
+                            .query_result.resolved_tenant_id.value_or(
+                                client_->tenant_id());
+                    if (resolved_tenant && *resolved_tenant != scope)
+                        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+                    resolved_tenant = scope;
+                    const auto &disk = valid_local_disk_ops.at(key)
+                                           .replica.get_local_disk_descriptor();
+                    if (owner_id && *owner_id != disk.client_id)
+                        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+                    owner_id = disk.client_id;
+                    disk_storage_keys[key] = disk.storage_key.value_or("");
+                }
+                if (!owner_id)
+                    return tl::unexpected(ErrorCode::INVALID_REPLICA);
+                auto result = batch_get_into_offload_object_internal(
+                    endpoint, objects, nullptr, 0, *owner_id, disk_storage_keys,
+                    resolved_tenant.value_or(client_->tenant_id()));
+                return result;
+            };
             for (auto &[endpoint, objects] : offload_objects) {
                 if (objects.empty()) continue;
-                auto read_result =
-                    batch_get_into_offload_object_internal(endpoint, objects);
+                auto read_result = read_owner(endpoint, objects);
                 // On success: results[original_index] was already pre-filled
                 // with total_size when valid_local_disk_ops was built; nothing
                 // to update. Only overwrite on failure.
@@ -9852,8 +10018,45 @@ RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
         // through.
         std::vector<uint8_t> states;
         states.reserve(s->raw_keys.size());
+        auto queries = s->client->BatchQueryReadOnly(s->raw_keys, s->tenant_id);
         for (size_t i = 0; i < s->raw_keys.size(); ++i) {
-            auto exists = s->file_storage->Exists(s->scoped_keys[i]);
+            if (i >= queries.size() || !queries[i]) {
+                states.push_back(i < queries.size() &&
+                                         queries[i].error() ==
+                                             ErrorCode::OBJECT_NOT_FOUND
+                                     ? 0
+                                     : 2);
+                continue;
+            }
+            if (i >= s->replica_ids.size()) {
+                states.push_back(2);
+                continue;
+            }
+            const auto &replicas = queries[i]->replicas;
+            auto observed = std::find_if(
+                replicas.begin(), replicas.end(), [&](const auto &replica) {
+                    return replica.id == s->replica_ids[i] &&
+                           replica.is_local_disk_replica() &&
+                           replica.get_local_disk_descriptor().client_id ==
+                               s->client->getClientId();
+                });
+            if (observed == replicas.end()) {
+                states.push_back(0);  // Superseded: re-query, never evict it.
+                continue;
+            }
+            std::string physical =
+                observed->get_local_disk_descriptor().storage_key.value_or("");
+            if (physical.empty()) {
+                physical = s->raw_keys[i];
+            }
+            if (physical.empty()) {
+                states.push_back(2);
+                continue;
+            }
+            const TenantId tenant(
+                queries[i]->resolved_tenant_id.value_or(s->tenant_id));
+            auto exists =
+                s->file_storage->Exists(tenant.MakeScopedKey(physical));
             if (!exists) {
                 states.push_back(2);
                 continue;
@@ -9959,7 +10162,8 @@ RealClient::restore_offload_objects(
     const std::vector<int64_t> &restore_sizes,
     const std::unordered_map<std::string, std::vector<Slice>> &objects,
     bool allow_pinned, const std::vector<int64_t> *value_offsets,
-    const std::vector<int64_t> *object_sizes) {
+    const std::vector<int64_t> *object_sizes,
+    std::string_view resolved_tenant) {
     if (keys.size() != restore_sizes.size() ||
         (value_offsets != nullptr && value_offsets->size() != keys.size()) ||
         (object_sizes != nullptr && object_sizes->size() != keys.size()) ||
@@ -9972,7 +10176,9 @@ RealClient::restore_offload_objects(
         allow_pinned &&
         can_use_pinned_restore_arena(target_rpc_service_addr, objects);
 
-    const TenantId tenant_id(client_->tenant_id());
+    const TenantId tenant_id(resolved_tenant.empty()
+                                 ? client_->tenant_id()
+                                 : std::string(resolved_tenant));
     std::vector<std::string> storage_keys;
     storage_keys.reserve(keys.size());
     for (const auto &key : keys) {
@@ -10027,14 +10233,37 @@ tl::expected<void, ErrorCode>
 RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
     std::unordered_map<std::string, std::vector<Slice>> &objects,
-    const OffloadReadRange *read_range) {
+    const OffloadReadRange *read_range, int64_t /*timeout_ms*/,
+    UUID /*owner_client_id*/,
+    const std::unordered_map<std::string, std::string> &disk_storage_keys,
+    std::string_view resolved_tenant) {
+    const TenantId tenant_id(resolved_tenant.empty()
+                                 ? client_->tenant_id()
+                                 : std::string(resolved_tenant));
     std::vector<std::string> keys;
+    std::vector<std::string> physical_keys;
     std::vector<int64_t> sizes;
     if (read_range && objects.size() != 1) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    keys.reserve(objects.size());
+    physical_keys.reserve(objects.size());
+    sizes.reserve(objects.size());
     for (const auto &object_it : objects) {
         keys.emplace_back(object_it.first);
+        const auto physical = disk_storage_keys.find(object_it.first);
+        if (physical != disk_storage_keys.end() && !physical->second.empty()) {
+            const auto identity = ParseOffloadStorageKey(physical->second);
+            if (!identity || identity->key != object_it.first ||
+                MakeOffloadStorageKey(identity->key, identity->generation) !=
+                    physical->second)
+                return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+            physical_keys.emplace_back(physical->second);
+        } else {
+            // Legacy/rolling-upgrade compatibility: when an older master omits
+            // storage_key, fall back to the logical key spelling.
+            physical_keys.emplace_back(object_it.first);
+        }
         uint64_t total = 0;
         for (const auto &slice : object_it.second) {
             if (slice.size > std::numeric_limits<uint64_t>::max() - total) {
@@ -10072,9 +10301,9 @@ RealClient::batch_get_into_offload_object_internal(
         offsets_arg = &value_offsets;
         object_sizes_arg = &object_sizes;
     }
-    auto restored =
-        restore_offload_objects(target_rpc_service_addr, keys, sizes, objects,
-                                true, offsets_arg, object_sizes_arg);
+    auto restored = restore_offload_objects(
+        target_rpc_service_addr, physical_keys, sizes, objects, true,
+        offsets_arg, object_sizes_arg, tenant_id.value());
     if (!restored) {
         return tl::unexpected(restored.error());
     }

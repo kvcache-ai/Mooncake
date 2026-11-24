@@ -108,7 +108,8 @@ class OrderedOpLogWriter {
     async_simple::Future<ErrorCode> AwaitDurable(uint64_t sequence);
 
     // Blocking bridges for synchronous Store RPC handlers. Zero waits until
-    // progress or shutdown; timeout never cancels the accepted log record.
+    // progress or shutdown; timeout returns RPC_TIMEOUT and never cancels the
+    // accepted log record. Must not be called from writer or callback threads.
     tl::expected<void, ErrorCode> WaitUntilDurable(
         uint64_t sequence, std::chrono::milliseconds timeout);
     // Includes ordered completion callbacks, needed before returning a delete
@@ -117,6 +118,7 @@ class OrderedOpLogWriter {
         uint64_t sequence, std::chrono::milliseconds timeout);
 
     uint64_t DurableSequence() const;
+    uint64_t FinalizedSequence() const;
     bool IsAccepting() const;
     ErrorCode LastError() const;
     std::optional<OrderedOpLogWriterTerminalState> GetTerminalState() const;

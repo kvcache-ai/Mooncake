@@ -19,6 +19,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #ifdef MOONCAKE_TEST_CUDA_H2D
 #include <cuda_runtime_api.h>
@@ -29,11 +30,15 @@
 #endif
 
 #include "config.h"
+#include "device/accelerator_registry.h"
 #include "real_client.h"
 #include "nof/dma_buffer_allocator.h"
 #include "nof/nvmeof_initiator.h"
 #include "tenant_id.h"
+#include <json/json.h>
+#include <future>
 #include "test_server_helpers.h"
+#include "tenant/quota_policy_store.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
@@ -100,6 +105,51 @@ TEST(TransportRegistrationLimitTest, ClassifiesProtocols) {
     EXPECT_EQ(GetTransportRegistrationLimit("efa"), kMaxMrSize);
     EXPECT_EQ(GetTransportRegistrationLimit("cxi"), kMaxMrSize);
     EXPECT_TRUE(GetTransportRegistrationLimit("ub").has_value());
+}
+
+// Host-backed test device: only an explicitly selected destination range is
+// classified as device memory. Registration happens before any client I/O.
+class StreamingTestDevice final : public device::AcceleratorDevice {
+   public:
+    device::AcceleratorVendor Vendor() const override {
+        return device::AcceleratorVendor::kSunrise;
+    }
+    bool Available(bool = false) const override { return true; }
+    device::PointerInfo QueryPointer(const void* ptr) const override {
+        const auto address = reinterpret_cast<uintptr_t>(ptr);
+        const auto start = begin.load();
+        return {start && address >= start && address - start < bytes.load()
+                    ? device::MemoryKind::kDevice
+                    : device::MemoryKind::kHost,
+                0};
+    }
+    int32_t CurrentDeviceId() const override { return 0; }
+    void SetContext(int32_t) const override {}
+    bool Copy(void* dst, const void* src, size_t size,
+              device::CopyDirection) const override {
+        ++copy_calls;
+        if (const auto delay = copy_delay_ms.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        std::memcpy(dst, src, size);
+        return true;
+    }
+    PinnedHostBuffer AllocatePinnedHost(size_t) const override { return {}; }
+    std::atomic<uintptr_t> begin{0};
+    std::atomic<size_t> bytes{0};
+    std::atomic<size_t> copy_delay_ms{0};
+    mutable std::atomic<size_t> copy_calls{0};
+};
+
+StreamingTestDevice* RegisterStreamingTestDevice() {
+    static StreamingTestDevice device;
+    static bool registered = [] {
+        if (device::GetAcceleratorRegistry().GetDevice(
+                device::AcceleratorVendor::kSunrise))
+            return false;
+        static device::AcceleratorDeviceRegistrar registrar(device);
+        return true;
+    }();
+    return registered ? &device : nullptr;
 }
 
 class RealClientTest : public ::testing::Test {
@@ -183,6 +233,25 @@ class RealClientTest : public ::testing::Test {
             << "Failed to resize temp segment file";
         close(fd);
         return path;
+    }
+    std::vector<tl::expected<QueryResult, ErrorCode>> QueryOnlyLocalDisk(
+        const std::vector<std::string>& keys) {
+        auto queries = py_client_->batch_query(keys);
+        std::vector<tl::expected<QueryResult, ErrorCode>> filtered;
+        for (const auto& query : queries) {
+            if (!query) {
+                filtered.push_back(tl::unexpected(query.error()));
+                continue;
+            }
+            std::vector<Replica::Descriptor> replicas;
+            for (const auto& replica : query->replicas)
+                if (replica.is_local_disk_replica())
+                    replicas.push_back(replica);
+            filtered.emplace_back(QueryResult(std::move(replicas),
+                                              query->lease_timeout,
+                                              query->object_checksum));
+        }
+        return filtered;
     }
 };
 
@@ -2396,7 +2465,16 @@ TEST_F(RealClientTest, TestPutSessionKeptAfterEndFailure) {
 
     // Drop Master reservation while keeping the local put session.
     ASSERT_NE(py_client_->client_, nullptr);
-    auto revoked = py_client_->client_->BatchPutRevoke(keys, ReplicaType::ALL);
+    std::vector<ObjectMeta> reservations;
+    {
+        std::lock_guard lock(py_client_->session_mutex_);
+        for (const auto& key : keys)
+            reservations.push_back(
+                {key, std::nullopt,
+                 py_client_->put_sessions_.at(key).write_generation});
+    }
+    auto revoked =
+        py_client_->client_->BatchPutRevoke(reservations, ReplicaType::ALL);
     ASSERT_EQ(revoked.size(), 1u);
     ASSERT_TRUE(revoked[0].has_value());
 
@@ -3770,6 +3848,66 @@ TEST_F(RealClientTest, DoubleTearDownIsIdempotent) {
     EXPECT_EQ(py_client_->tearDownAll(), 0) << "First teardown should succeed";
     EXPECT_EQ(py_client_->tearDownAll(), 0)
         << "Second teardown should also succeed (idempotent)";
+}
+
+TEST_F(RealClientTest, TearDownSsdStopsRpcAndBackgroundStorageBeforeReturning) {
+    ScopedEnvVar arena("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "1048576");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar gc("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS", "1");
+    ScopedEnvVar backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                         "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    char path[] = "/tmp/mooncake_ssd_close_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(py_client_->setup_real(
+                  "localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                  16 * 1024 * 1024, FLAGS_protocol, FLAGS_device_name,
+                  master_address_, nullptr, "", true, ssd_path_),
+              0);
+    const std::string key = "ssd-close-key";
+    std::vector<char> source(4096, 'c');
+    ASSERT_EQ(py_client_->put(key, source), 0);
+    std::string endpoint;
+    std::string physical;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (endpoint.empty() && std::chrono::steady_clock::now() < deadline) {
+        for (const auto& replica : py_client_->get_replica_desc(key))
+            if (replica.is_local_disk_replica() &&
+                replica.status == ReplicaStatus::COMPLETE) {
+                const auto& disk = replica.get_local_disk_descriptor();
+                endpoint = disk.transport_endpoint;
+                physical = disk.storage_key.value_or("");
+            }
+        if (endpoint.empty())
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_FALSE(endpoint.empty());
+    ClientRequester requester;
+    const auto storage_key = TenantId::Default().MakeScopedKey(physical);
+    auto before =
+        requester.batch_get_offload_object(endpoint, {storage_key}, {4096});
+    ASSERT_TRUE(before);
+    requester.release_offload_buffer(endpoint, before->batch_id);
+
+    std::weak_ptr<FileStorage> storage = py_client_->file_storage_;
+    std::weak_ptr<Client> client = py_client_->client_;
+    ASSERT_EQ(py_client_->tearDownAll(), 0);
+    // Keep the wrapper and master alive: explicit close must complete its own
+    // shutdown, independently of later wrapper GC or master shutdown.
+    EXPECT_TRUE(storage.expired());
+    EXPECT_TRUE(client.expired());
+    EXPECT_EQ(py_client_->health_check(), HC_NOT_INITIALIZED);
+    auto after =
+        requester.batch_get_offload_object(endpoint, {storage_key}, {4096});
+    EXPECT_FALSE(after);
+    EXPECT_EQ(py_client_->tearDownAll(), 0);
 }
 
 // ===================== Empty Batch Operations =====================
@@ -5234,3 +5372,5 @@ int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
     return RUN_ALL_TESTS();
 }
+
+namespace mooncake::testing {}  // namespace mooncake::testing

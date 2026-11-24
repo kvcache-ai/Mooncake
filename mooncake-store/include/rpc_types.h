@@ -41,6 +41,26 @@ inline tl::expected<std::string, ErrorCode> GetPrimaryWriteGeneration(
     return generation;
 }
 
+// Rolling-upgrade-safe variant for new clients talking to older masters that do
+// not populate write_generation. Returns std::nullopt when every descriptor
+// omits write_generation, a non-empty generation when all agree, or
+// INVALID_REPLICA when the list is empty or descriptors disagree.
+inline tl::expected<std::optional<std::string>, ErrorCode>
+GetOptionalPrimaryWriteGeneration(
+    const std::vector<Replica::Descriptor>& replicas) {
+    if (replicas.empty()) {
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+    const auto first = replicas.front().write_generation.value_or("");
+    for (const auto& replica : replicas) {
+        if (replica.write_generation.value_or("") != first) {
+            return tl::unexpected(ErrorCode::INVALID_REPLICA);
+        }
+    }
+    if (first.empty()) return std::optional<std::string>{std::nullopt};
+    return std::optional<std::string>{first};
+}
+
 enum class ReplicaActionType {
     ADD = 0,
 };

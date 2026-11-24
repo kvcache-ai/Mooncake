@@ -1,3 +1,4 @@
+#include "master_service/primary_write_grants_for_testing.h"
 #include "master_service.h"
 #include "master_service/master_service_test_peer.h"
 
@@ -69,22 +70,27 @@ void PutAndOffload(MasterService& service, const UUID& client_id,
                    const std::string& local_disk_endpoint) {
     ReplicateConfig config;
     config.replica_num = 1;
+    config.preferred_segments = {local_disk_endpoint};
 
-    ASSERT_TRUE(
-        service
-            .PutStart(client_id, key, TenantId::Default(), object_size, config)
-            .has_value());
-    ASSERT_TRUE(
-        service.PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(PutStartWithGrantForTesting(service, client_id, key,
+                                            TenantId::Default(), object_size,
+                                            config)
+                    .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, client_id, key,
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
+                    .has_value());
 
     StorageObjectMetadata metadata;
     metadata.data_size = object_size;
     metadata.transport_endpoint = local_disk_endpoint;
-    OffloadTaskItem task{.tenant_id = TenantId::Default().value(),
-                         .key = key,
-                         .size = object_size};
-    ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, {task}, {metadata})
+    auto delivered = service.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(delivered);
+    auto found =
+        std::find_if(delivered->begin(), delivered->end(),
+                     [&](const auto& task) { return task.key == key; });
+    ASSERT_NE(found, delivered->end());
+    ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, {*found}, {metadata})
                     .has_value());
 }
 
@@ -109,23 +115,23 @@ TEST_F(MasterServiceSSDTest, PutRevokeProcessingDiskKeepsSsdTotal) {
     ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
 
     std::string key = "revoke_processing_disk_metric_key";
-    ASSERT_TRUE(service_
-                    ->PutStart(client_id, key, TenantId::Default(), 1024,
-                               {.replica_num = 1})
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service_, client_id, key,
+                                            TenantId::Default(), 1024,
+                                            {.replica_num = 1})
                     .has_value());
-    EXPECT_TRUE(
-        service_
-            ->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
-            .has_value());
+    EXPECT_TRUE(PutEndWithGrantForTesting(*service_, client_id, key,
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
+                    .has_value());
 
     auto stats = metrics.calculate_cache_stats();
     EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], base_memory_total + 1);
     EXPECT_EQ(stats[CacheHitStat::SSD_TOTAL], base_ssd_total);
 
-    EXPECT_TRUE(
-        service_
-            ->PutRevoke(client_id, key, TenantId::Default(), ReplicaType::DISK)
-            .has_value());
+    EXPECT_TRUE(PutRevokeWithGrantForTesting(*service_, client_id, key,
+                                             TenantId::Default(),
+                                             ReplicaType::DISK)
+                    .has_value());
 
     stats = metrics.calculate_cache_stats();
     EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], base_memory_total + 1);
@@ -176,8 +182,9 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
                                       : ReplicaType::MEMORY;
 
         // Put key, should success.
-        auto put_start_result = service_->PutStart(
-            client_id, key, TenantId::Default(), slice_length, config);
+        auto put_start_result = PutStartWithGrantForTesting(
+            *service_, client_id, key, TenantId::Default(), slice_length,
+            config);
         EXPECT_TRUE(put_start_result.has_value());
         auto replica_list = put_start_result.value();
         EXPECT_EQ(replica_list.size(), kReplicaCnt);
@@ -186,8 +193,8 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
         }
 
         // Complete the reserved replica.
-        auto put_end_result =
-            service_->PutEnd(client_id, key, TenantId::Default(), reserve_type);
+        auto put_end_result = PutEndWithGrantForTesting(
+            *service_, client_id, key, TenantId::Default(), reserve_type);
         EXPECT_TRUE(put_end_result.has_value());
 
         // Wait for a while until the put-start expired.
@@ -205,8 +212,9 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
 
         // Put key again, should fail because the object has had an completed
         // replica.
-        put_start_result = service_->PutStart(
-            client_id, key, TenantId::Default(), slice_length, config);
+        put_start_result = PutStartWithGrantForTesting(*service_, client_id,
+                                                       key, TenantId::Default(),
+                                                       slice_length, config);
         EXPECT_FALSE(put_start_result.has_value());
         EXPECT_EQ(put_start_result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
 
@@ -224,8 +232,8 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
         }
 
         // PutEnd must reject a replica discarded after the write expired.
-        put_end_result =
-            service_->PutEnd(client_id, key, TenantId::Default(), discard_type);
+        put_end_result = PutEndWithGrantForTesting(
+            *service_, client_id, key, TenantId::Default(), discard_type);
         ASSERT_FALSE(put_end_result.has_value());
         EXPECT_EQ(put_end_result.error(), ErrorCode::INVALID_WRITE);
 
@@ -273,17 +281,18 @@ TEST_F(MasterServiceSSDTest, RemoveDecrementsCacheTotalMetrics) {
     ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
 
     std::string key = "remove_cache_total_metric_key";
-    ASSERT_TRUE(service_
-                    ->PutStart(client_id, key, TenantId::Default(), 1024,
-                               {.replica_num = 1})
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service_, client_id, key,
+                                            TenantId::Default(), 1024,
+                                            {.replica_num = 1})
                     .has_value());
-    EXPECT_TRUE(
-        service_
-            ->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
-            .has_value());
-    EXPECT_TRUE(
-        service_->PutEnd(client_id, key, TenantId::Default(), ReplicaType::DISK)
-            .has_value());
+    EXPECT_TRUE(PutEndWithGrantForTesting(*service_, client_id, key,
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_TRUE(PutEndWithGrantForTesting(*service_, client_id, key,
+                                          TenantId::Default(),
+                                          ReplicaType::DISK)
+                    .has_value());
 
     auto stats = metrics.calculate_cache_stats();
     EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], base_memory_total + 1);
@@ -490,15 +499,10 @@ TEST_F(LocalDiskUnmountInterleavingTest,
     // this mount would classify the replica stale and erase it, and with it
     // the key, since this disk replica is the key's only one.
     MountMemoryAndLocalDisk(*service, late, late_segment, 0x1400000000);
-    StorageObjectMetadata late_metadata;
-    late_metadata.data_size = 1024;
-    late_metadata.transport_endpoint = late_segment;
-    OffloadTaskItem late_task{.tenant_id = TenantId::Default().value(),
-                              .key = "ssd_interleave_late_key",
-                              .size = 1024};
-    ASSERT_TRUE(
-        service->NotifyOffloadSuccess(late, {late_task}, {late_metadata})
-            .has_value());
+    PutAndOffload(*service, late, "ssd_interleave_late_key", 1024,
+                  late_segment);
+    ASSERT_TRUE(service->BatchReplicaClear({"ssd_interleave_late_key"}, late,
+                                           late_segment));
 
     // Second half: the sweep.
     SweepHalf(*service, leaving);

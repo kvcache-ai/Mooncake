@@ -1,3 +1,4 @@
+#include "master_service/primary_write_grants_for_testing.h"
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -197,8 +198,8 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_mount_segment_failures(), 0);
 
     // Test PutStart and PutRevoke request
-    auto put_start_result1 =
-        service_.PutStart(client_id, key, value_length, config);
+    auto put_start_result1 = PutStartWithGrantForTesting(
+        service_, client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result1.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
@@ -207,7 +208,10 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_put_start_requests(), 1);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
     auto put_revoke_result =
-        service_.PutRevoke(client_id, key, ReplicaType::MEMORY);
+        service_.PutRevoke(client_id,
+                           CapturedPrimaryGrantsForTesting::Meta(
+                               &service_, client_id, key, TenantId::Default()),
+                           ReplicaType::MEMORY);
     ASSERT_TRUE(put_revoke_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
@@ -216,8 +220,8 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_put_revoke_failures(), 0);
 
     // Test PutStart and PutEnd request
-    auto put_start_result2 =
-        service_.PutStart(client_id, key, value_length, config);
+    auto put_start_result2 = PutStartWithGrantForTesting(
+        service_, client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result2.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
@@ -225,8 +229,9 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
               value_length);
     ASSERT_EQ(metrics.get_put_start_requests(), 2);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
-    auto put_end_result = service_.PutEnd(
-        client_id, ObjectMeta{key, std::nullopt}, ReplicaType::MEMORY);
+    auto put_end_result = PutEndWithGrantForTesting(
+        service_, client_id, ObjectMeta{key, std::nullopt},
+        ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
@@ -259,11 +264,12 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
 
     // Test RemoveAll request
-    auto put_start_result3 =
-        service_.PutStart(client_id, key, value_length, config);
+    auto put_start_result3 = PutStartWithGrantForTesting(
+        service_, client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result3.has_value());
-    auto put_end_result2 = service_.PutEnd(
-        client_id, ObjectMeta{key, std::nullopt}, ReplicaType::MEMORY);
+    auto put_end_result2 = PutEndWithGrantForTesting(
+        service_, client_id, ObjectMeta{key, std::nullopt},
+        ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result2.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(1, service_.RemoveAll());
@@ -274,11 +280,12 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
 
     // Test UnmountSegment request
-    auto put_start_result4 =
-        service_.PutStart(client_id, key, value_length, config);
+    auto put_start_result4 = PutStartWithGrantForTesting(
+        service_, client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result4.has_value());
-    auto put_end_result3 = service_.PutEnd(
-        client_id, ObjectMeta{key, std::nullopt}, ReplicaType::MEMORY);
+    auto put_end_result3 = PutEndWithGrantForTesting(
+        service_, client_id, ObjectMeta{key, std::nullopt},
+        ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result3.has_value());
     auto unmount_result = service_.UnmountSegment(segment_id, client_id);
     ASSERT_TRUE(unmount_result.has_value());
@@ -420,11 +427,12 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
 
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
-    auto put_start_result1 =
-        service_.PutStart(client_id, key, value_length, config);
+    auto put_start_result1 = PutStartWithGrantForTesting(
+        service_, client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result1.has_value());
-    auto put_end_result1 = service_.PutEnd(
-        client_id, ObjectMeta{key, std::nullopt}, ReplicaType::MEMORY);
+    auto put_end_result1 = PutEndWithGrantForTesting(
+        service_, client_id, ObjectMeta{key, std::nullopt},
+        ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result1.has_value());
     auto stats_dict = metrics.calculate_cache_stats();
 
@@ -596,9 +604,9 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     ReplicateConfig config;
     config.replica_num = 1;
     constexpr size_t kAllocationSize = 4096;
-    ASSERT_TRUE(service
-                    ->PutStart(client_id, "admin_metrics_projection_key",
-                               kAllocationSize, config)
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service, client_id,
+                                            "admin_metrics_projection_key",
+                                            kAllocationSize, config)
                     .has_value());
 
     const int http_port = getFreeTcpPort();
@@ -679,7 +687,11 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
               std::string::npos);
 
     ASSERT_TRUE(service
-                    ->PutRevoke(client_id, "admin_metrics_projection_key",
+                    ->PutRevoke(client_id,
+                                CapturedPrimaryGrantsForTesting::Meta(
+                                    service.get(), client_id,
+                                    std::string("admin_metrics_projection_key"),
+                                    TenantId::Default()),
                                 ReplicaType::MEMORY)
                     .has_value());
     ASSERT_TRUE(service->UnmountSegment(segment.id, client_id).has_value());
@@ -724,8 +736,8 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_exist_key_failed_items(), 0);
 
     // Test BatchPutStart request
-    auto batch_put_start_result =
-        service_.BatchPutStart(client_id, keys, value_lengths, config);
+    auto batch_put_start_result = BatchPutStartWithGrantForTesting(
+        service_, client_id, keys, value_lengths, config);
     ASSERT_EQ(batch_put_start_result.size(), 3);
     ASSERT_EQ(metrics.get_batch_put_start_requests(), 1);
     ASSERT_EQ(metrics.get_batch_put_start_partial_successes(), 0);
@@ -748,7 +760,8 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     for (const auto& key : keys) {
         object_metas.emplace_back(ObjectMeta{key, std::nullopt});
     }
-    auto batch_put_end_result = service_.BatchPutEnd(client_id, object_metas);
+    auto batch_put_end_result =
+        BatchPutEndWithGrantForTesting(service_, client_id, object_metas);
     ASSERT_EQ(batch_put_end_result.size(), 3);
     ASSERT_EQ(metrics.get_batch_put_end_requests(), 1);
     ASSERT_EQ(metrics.get_batch_put_end_partial_successes(), 0);
@@ -775,7 +788,8 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(), 3);
 
     // Test BatchPutRevoke request (should all fail)
-    auto batch_put_revoke_result = service_.BatchPutRevoke(client_id, keys);
+    auto batch_put_revoke_result =
+        service_.BatchPutRevoke(client_id, object_metas);
     ASSERT_EQ(batch_put_revoke_result.size(), 3);
     ASSERT_EQ(metrics.get_batch_put_revoke_requests(), 1);
     ASSERT_EQ(metrics.get_batch_put_revoke_partial_successes(), 0);
@@ -794,8 +808,8 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_get_replica_list_items(), 10);
     ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(), 4);
 
-    auto batch_put_start_result2 =
-        service_.BatchPutStart(client_id, keys, value_lengths, config);
+    auto batch_put_start_result2 = BatchPutStartWithGrantForTesting(
+        service_, client_id, keys, value_lengths, config);
     ASSERT_EQ(batch_put_start_result2.size(), 4);
     ASSERT_EQ(metrics.get_batch_put_start_requests(), 2);
     ASSERT_EQ(metrics.get_batch_put_start_partial_successes(), 1);
@@ -816,19 +830,18 @@ static std::string PutKeyAndOffload(MasterService& svc, const UUID& client_id,
                                     const std::string& key) {
     ReplicateConfig cfg;
     cfg.replica_num = 1;
-    auto put_start =
-        svc.PutStart(client_id, key, TenantId::Default(), value_size, cfg);
+    auto put_start = PutStartWithGrantForTesting(
+        svc, client_id, key, TenantId::Default(), value_size, cfg);
     if (!put_start) return "";
-    svc.PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY);
+    PutEndWithGrantForTesting(svc, client_id, key, TenantId::Default(),
+                              ReplicaType::MEMORY);
 
     StorageObjectMetadata meta;
     meta.data_size = static_cast<int64_t>(value_size);
     meta.transport_endpoint = "127.0.0.1:9999";
-    std::vector<OffloadTaskItem> tasks{
-        OffloadTaskItem{.tenant_id = "default",
-                        .key = key,
-                        .size = static_cast<int64_t>(value_size)}};
-    svc.NotifyOffloadSuccess(client_id, tasks, {meta});
+    auto tasks = svc.OffloadObjectHeartbeat(client_id, true);
+    if (!tasks || tasks->size() != 1) return "";
+    if (!svc.NotifyOffloadSuccess(client_id, *tasks, {meta})) return "";
     return key;
 }
 
@@ -921,8 +934,8 @@ TEST_F(MasterMetricsTest, PutStartReplicaAllocationFailureMetric) {
 
     ReplicateConfig config;
     config.replica_num = 1;
-    auto put_start_result = service_.PutStart(
-        generate_uuid(), "allocation_failure_key", 1024, config);
+    auto put_start_result = PutStartWithGrantForTesting(
+        service_, generate_uuid(), "allocation_failure_key", 1024, config);
 
     ASSERT_FALSE(put_start_result.has_value());
     ASSERT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
@@ -1040,11 +1053,12 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     // Step 1: Mount segment and create a completed MEMORY replica.
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
-    auto put_start_result =
-        service_.PutStart(client_id, key, value_length, config);
+    auto put_start_result = PutStartWithGrantForTesting(
+        service_, client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_.PutEnd(
-        client_id, ObjectMeta{key, std::nullopt}, ReplicaType::MEMORY);
+    auto put_end_result = PutEndWithGrantForTesting(
+        service_, client_id, ObjectMeta{key, std::nullopt},
+        ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // After PutEnd: MEMORY_TOTAL should increment by 1.
@@ -1062,9 +1076,13 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
         service_.MountLocalDiskSegment(client_id, /*enable_offloading=*/true);
     ASSERT_TRUE(mount_disk_result.has_value());
 
-    OffloadTaskItem task{.tenant_id = "default",
-                         .key = key,
-                         .size = static_cast<int64_t>(value_length)};
+    OffloadTaskItem task{
+        .tenant_id = "default",
+        .key = key,
+        .size = static_cast<int64_t>(value_length),
+        .object_generation = *GetPrimaryWriteGeneration(*put_start_result),
+        .task_id = {},
+        .restoring = true};
     StorageObjectMetadata obj_meta{
         .bucket_id = 0,
         .offset = 0,
@@ -1099,13 +1117,19 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     ASSERT_EQ(metrics.get_mem_cache_nums(), base_mem_cache_nums);
     ASSERT_EQ(metrics.get_file_cache_nums(), base_file_cache_nums);
 
-    // Step 4: Test SSD hit path by creating an object with only a LOCAL_DISK
-    // replica. Use NotifyOffloadSuccess with a key that has no existing
-    // metadata — AddReplica will create the metadata and add LOCAL_DISK.
+    // Create a regular object, finish its captured offload task, then remove
+    // its memory replica to measure an SSD-only hit.
     std::string ssd_only_key = "ssd_only_key";
-    OffloadTaskItem task2{.tenant_id = "default",
-                          .key = ssd_only_key,
-                          .size = static_cast<int64_t>(value_length)};
+    auto start_ssd = PutStartWithGrantForTesting(
+        service_, client_id, ssd_only_key, value_length, config);
+    ASSERT_TRUE(start_ssd);
+    ASSERT_TRUE(PutEndWithGrantForTesting(service_, client_id,
+                                          ObjectMeta{ssd_only_key, {}},
+                                          ReplicaType::MEMORY));
+    auto offloads = service_.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(offloads);
+    ASSERT_EQ(offloads->size(), 1u);
+    OffloadTaskItem task2 = offloads->front();
     StorageObjectMetadata obj_meta2{
         .bucket_id = 0,
         .offset = 0,
@@ -1115,6 +1139,11 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     auto offload_result2 =
         service_.NotifyOffloadSuccess(client_id, {task2}, {obj_meta2});
     ASSERT_TRUE(offload_result2.has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(110));
+    auto cleared =
+        service_.BatchReplicaClear({ssd_only_key}, client_id, segment_name);
+    ASSERT_TRUE(cleared);
+    ASSERT_EQ(cleared->size(), 1u);
 
     // Verify SSD_TOTAL incremented for the new key.
     stats = metrics.calculate_cache_stats();
@@ -1280,13 +1309,14 @@ TEST_F(MasterMetricsTest, DuplicatePutResponsesCountItemsWithoutPerKeyLogs) {
             const auto partial =
                 metrics.get_batch_put_start_partial_successes();
 
-            ASSERT_TRUE(service.PutStart(client_id, "existing", 1024, config));
-            ASSERT_TRUE(service.PutEnd(client_id,
-                                       ObjectMeta{"existing", std::nullopt},
-                                       ReplicaType::MEMORY));
+            ASSERT_TRUE(PutStartWithGrantForTesting(service, client_id,
+                                                    "existing", 1024, config));
+            ASSERT_TRUE(PutEndWithGrantForTesting(
+                service, client_id, ObjectMeta{"existing", std::nullopt},
+                ReplicaType::MEMORY));
             expect_duplicates(0, 0);
-            auto duplicate =
-                service.PutStart(client_id, "existing", 1024, config);
+            auto duplicate = PutStartWithGrantForTesting(
+                service, client_id, "existing", 1024, config);
             ASSERT_FALSE(duplicate);
             EXPECT_EQ(duplicate.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
             expect_duplicates(1, 0);
@@ -1315,7 +1345,8 @@ TEST_F(MasterMetricsTest, DuplicatePutResponsesCountItemsWithoutPerKeyLogs) {
 
             // Also count an unfinished duplicate and another attempt at the
             // key.
-            auto processing = service.PutStart(client_id, "new", 1024, config);
+            auto processing = PutStartWithGrantForTesting(service, client_id,
+                                                          "new", 1024, config);
             ASSERT_FALSE(processing);
             EXPECT_EQ(processing.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
             expect_duplicates(2, 3);
@@ -1380,11 +1411,12 @@ TEST_F(MasterMetricsTest, KeyGroupMetrics) {
     for (const auto& [key, length] :
          std::vector<std::pair<std::string, uint64_t>>{
              {"a_k", 1024}, {"b_k", 1024}, {"a_state", 4096}, {"c", 512}}) {
-        ASSERT_TRUE(
-            service_.PutStart(client_id, key, length, config).has_value());
-        ASSERT_TRUE(service_
-                        .PutEnd(client_id, ObjectMeta{key, std::nullopt},
-                                ReplicaType::MEMORY)
+        ASSERT_TRUE(PutStartWithGrantForTesting(service_, client_id, key,
+                                                length, config)
+                        .has_value());
+        ASSERT_TRUE(PutEndWithGrantForTesting(service_, client_id,
+                                              ObjectMeta{key, std::nullopt},
+                                              ReplicaType::MEMORY)
                         .has_value());
     }
 

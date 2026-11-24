@@ -1446,6 +1446,19 @@ tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
 tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchQuery(
     const std::vector<std::string>& keys,
     std::unordered_map<std::string, StorageObjectMetadata>& metadatas) {
+    auto decode_varint = [](const uint8_t* data, size_t len, size_t& pos,
+                            uint64_t& out) -> bool {
+        out = 0;
+        unsigned shift = 0;
+        while (pos < len && shift < 64) {
+            const uint8_t b = data[pos++];
+            out |= static_cast<uint64_t>(b & 0x7Fu) << shift;
+            if ((b & 0x80u) == 0) return true;
+            shift += 7;
+        }
+        return false;
+    };
+
     for (const auto& key : keys) {
         const auto path = FileUtil::ResolvePathFromKey(
             key, file_storage_config_.storage_filepath,
@@ -1454,6 +1467,63 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchQuery(
         const auto size = std::filesystem::file_size(path, error);
         if (error || size > uint64_t(INT64_MAX))
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+
+        // Fast path: KVEntry encodes field 1 (key) then field 2 (value). Read
+        // only the protobuf prefix so querying large values avoids reading the
+        // entire payload into memory.
+        bool parsed_fast = false;
+        const size_t prefix_cap =
+            static_cast<size_t>(std::min<uint64_t>(size, key.size() + 32));
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            FdGuard fd_guard(fd);
+            std::string prefix(prefix_cap, '\0');
+            size_t got = 0;
+            while (got < prefix_cap) {
+                const ssize_t n =
+                    ::pread(fd, prefix.data() + got, prefix_cap - got,
+                            static_cast<off_t>(got));
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) break;
+                got += static_cast<size_t>(n);
+            }
+            if (got == prefix_cap) {
+                const auto* buf =
+                    reinterpret_cast<const uint8_t*>(prefix.data());
+                size_t pos = 0;
+                uint64_t key_len = 0;
+                if (pos < got && buf[pos] == 0x0Au) {
+                    ++pos;
+                    if (decode_varint(buf, got, pos, key_len) &&
+                        key_len == key.size() && pos + key_len <= got &&
+                        std::memcmp(buf + pos, key.data(), key.size()) == 0) {
+                        pos += static_cast<size_t>(key_len);
+                        if (pos == size) {
+                            metadatas.emplace(
+                                key,
+                                StorageObjectMetadata{
+                                    -1, 0, static_cast<int64_t>(key.size()), 0,
+                                    ""});
+                            parsed_fast = true;
+                        } else if (pos < got && buf[pos] == 0x12u) {
+                            ++pos;
+                            uint64_t val_len = 0;
+                            if (decode_varint(buf, got, pos, val_len) &&
+                                pos + val_len == size) {
+                                metadatas.emplace(
+                                    key,
+                                    StorageObjectMetadata{
+                                        -1, 0, static_cast<int64_t>(key.size()),
+                                        static_cast<int64_t>(val_len), ""});
+                                parsed_fast = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (parsed_fast) continue;
+
         std::string bytes;
         auto read = storage_backend_->LoadObject(path, bytes,
                                                  static_cast<int64_t>(size));
@@ -4277,17 +4347,20 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
         if (fd >= 0 || errno != EEXIST) break;
     }
     if (fd < 0) {
+        const int err = errno;
+        NotifyDiskError(err, "open");
         LOG(ERROR) << "Failed to create temporary bucket metadata file for: "
-                   << meta_path << ", errno=" << errno << " ("
-                   << strerror(errno) << ")";
+                   << meta_path << ", errno=" << err << " (" << strerror(err)
+                   << ")";
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
     FdGuard file_guard(fd);
     auto remove_temp = [&]() {
         if (unlink(temp_path.c_str()) != 0 && errno != ENOENT) {
+            const int err = errno;
             LOG(ERROR) << "Failed to remove temporary metadata file "
-                       << temp_path << ", errno=" << errno << " ("
-                       << strerror(errno) << ")";
+                       << temp_path << ", errno=" << err << " ("
+                       << strerror(err) << ")";
         }
     };
     auto injected_failure = [&](MetadataFailurePointForTest point) {
@@ -4301,9 +4374,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
             write(fd, str.data() + written, str.size() - written);
         if (result < 0 && errno == EINTR) continue;
         if (result <= 0) {
+            const int err = result < 0 ? errno : EIO;
+            NotifyDiskError(err, "write");
             LOG(ERROR) << "Failed to write temporary bucket metadata: "
-                       << temp_path << ", errno=" << errno << " ("
-                       << strerror(errno) << ")";
+                       << temp_path << ", errno=" << err << " ("
+                       << strerror(err) << ")";
             remove_temp();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
@@ -4313,24 +4388,41 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
         remove_temp();
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
-    if (injected_failure(MetadataFailurePointForTest::kFileSync) ||
-        fsync(fd) != 0) {
+    if (injected_failure(MetadataFailurePointForTest::kFileSync)) {
+        LOG(ERROR) << "Injected file sync failure for temporary bucket "
+                      "metadata: "
+                   << temp_path;
+        remove_temp();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (fsync(fd) != 0) {
+        const int err = errno;
+        NotifyDiskError(err, "fsync");
         LOG(ERROR) << "Failed to sync temporary bucket metadata: " << temp_path
-                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+                   << ", errno=" << err << " (" << strerror(err) << ")";
         remove_temp();
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     if (close(file_guard.release()) != 0) {
+        const int err = errno;
+        NotifyDiskError(err, "close");
         LOG(ERROR) << "Failed to close temporary bucket metadata: " << temp_path
-                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+                   << ", errno=" << err << " (" << strerror(err) << ")";
         remove_temp();
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
-    if (injected_failure(MetadataFailurePointForTest::kRename) ||
-        rename(temp_path.c_str(), meta_path.c_str()) != 0) {
+    if (injected_failure(MetadataFailurePointForTest::kRename)) {
+        LOG(ERROR) << "Injected rename failure for bucket metadata: "
+                   << meta_path;
+        remove_temp();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (rename(temp_path.c_str(), meta_path.c_str()) != 0) {
+        const int err = errno;
+        NotifyDiskError(err, "rename");
         LOG(ERROR) << "Failed to publish bucket metadata " << meta_path
-                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+                   << ", errno=" << err << " (" << strerror(err) << ")";
         remove_temp();
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -4342,24 +4434,38 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
     const int dir_fd =
         open(parent_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dir_fd < 0) {
+        const int err = errno;
+        NotifyDiskError(err, "open_dir");
         LOG(ERROR) << "Failed to open bucket metadata directory " << parent_path
-                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+                   << ", errno=" << err << " (" << strerror(err) << ")";
         unlink(meta_path.c_str());
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     FdGuard dir_guard(dir_fd);
-    if (injected_failure(MetadataFailurePointForTest::kDirectorySync) ||
-        fsync(dir_fd) != 0) {
-        LOG(ERROR) << "Failed to sync bucket metadata directory " << parent_path
-                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+    const bool injected_dir_sync =
+        injected_failure(MetadataFailurePointForTest::kDirectorySync);
+    if (injected_dir_sync || fsync(dir_fd) != 0) {
+        if (injected_dir_sync) {
+            LOG(ERROR) << "Injected directory sync failure for bucket metadata "
+                          "directory "
+                       << parent_path;
+        } else {
+            const int err = errno;
+            NotifyDiskError(err, "fsync_dir");
+            LOG(ERROR) << "Failed to sync bucket metadata directory "
+                       << parent_path << ", errno=" << err << " ("
+                       << strerror(err) << ")";
+        }
         if (unlink(meta_path.c_str()) != 0 && errno != ENOENT) {
+            const int err = errno;
             LOG(ERROR) << "Failed to roll back bucket metadata " << meta_path
-                       << " after directory sync failure, errno=" << errno
-                       << " (" << strerror(errno) << ")";
+                       << " after directory sync failure, errno=" << err << " ("
+                       << strerror(err) << ")";
         } else if (fsync(dir_fd) != 0) {
+            const int err = errno;
             LOG(ERROR) << "Failed to sync bucket metadata rollback in "
-                       << parent_path << ", errno=" << errno << " ("
-                       << strerror(errno) << ")";
+                       << parent_path << ", errno=" << err << " ("
+                       << strerror(err) << ")";
         }
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }

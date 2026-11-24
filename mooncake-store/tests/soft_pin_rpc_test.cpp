@@ -61,10 +61,14 @@ class SoftPinRpcTest : public ::testing::Test {
         segment.size = 16 * 1024 * 1024;
         ASSERT_TRUE(service_->MountSegment(segment, client_id_));
         for (const std::string tenant : {"default", "tenant-a"}) {
-            ASSERT_TRUE(service_->PutStart(client_id_, "key", 1024,
-                                           ReplicateConfig{}, tenant));
-            ASSERT_TRUE(service_->PutEnd(client_id_, {"key", std::nullopt},
-                                         ReplicaType::MEMORY, tenant));
+            auto put_start = service_->PutStart(client_id_, "key", 1024,
+                                                ReplicateConfig{}, tenant);
+            ASSERT_TRUE(put_start);
+            auto write_generation = GetPrimaryWriteGeneration(*put_start);
+            ASSERT_TRUE(write_generation);
+            ASSERT_TRUE(service_->PutEnd(
+                client_id_, ObjectMeta{"key", std::nullopt, *write_generation},
+                ReplicaType::MEMORY, tenant));
         }
         ASSERT_TRUE(service_->PutStart(client_id_, "writing", 1024,
                                        ReplicateConfig{}, "tenant-a"));

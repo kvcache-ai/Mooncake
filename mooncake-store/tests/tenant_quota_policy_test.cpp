@@ -181,6 +181,19 @@ TEST(TenantQuotaPolicyChargeTest, ChargesEveryMemoryReplicaThatHoldsMemory) {
     EXPECT_EQ(TenantQuotaPolicy::MemoryCharge(metadata), 400u);
 }
 
+TEST(TenantQuotaPolicyChargeTest,
+     KeepsPendingInvalidationChargeWhileMetadataIsUnreadable) {
+    ObjectMetadata metadata(UUID{1, 2}, std::chrono::system_clock::now(), 100,
+                            MemoryReplicas({ReplicaStatus::COMPLETE}));
+    metadata.ha_invalidation_memory_charge =
+        TenantQuotaPolicy::MemoryCharge(metadata);
+    auto borrowed = metadata.PopReplicas();
+    EXPECT_EQ(TenantQuotaPolicy::MemoryCharge(metadata), 100u);
+    metadata.ha_invalidation_memory_charge = 0;
+    metadata.AddReplicas(std::move(borrowed));
+    EXPECT_EQ(TenantQuotaPolicy::MemoryCharge(metadata), 100u);
+}
+
 TEST(TenantQuotaPolicyChargeTest, SaturatesAtTheAccountingRange) {
     const ObjectMetadata metadata(
         UUID{1, 2}, std::chrono::system_clock::now(),

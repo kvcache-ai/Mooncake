@@ -137,6 +137,7 @@ struct MasterConfig {
     uint64_t oplog_prune_chunk_batch_count = 10;
     uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
+    uint64_t oplog_durable_wait_timeout_ms = 30000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t oplog_standby_max_batches_per_poll =
         kDefaultOpLogStandbyMaxBatchesPerPoll;
@@ -280,6 +281,7 @@ class MasterServiceSupervisorConfig {
     uint64_t oplog_prune_chunk_batch_count = 10;
     uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
+    uint64_t oplog_durable_wait_timeout_ms = 30000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t oplog_standby_max_batches_per_poll =
         kDefaultOpLogStandbyMaxBatchesPerPoll;
@@ -428,6 +430,7 @@ class MasterServiceSupervisorConfig {
         oplog_prune_max_batches_per_second =
             config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
+        oplog_durable_wait_timeout_ms = config.oplog_durable_wait_timeout_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         oplog_standby_max_batches_per_poll =
             config.oplog_standby_max_batches_per_poll;
@@ -547,6 +550,14 @@ class MasterServiceSupervisorConfig {
         if (!rpc_thread_num.IsSet()) {
             throw std::runtime_error("rpc_thread_num is not set");
         }
+        const uint64_t max_wait_ms = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::duration::max() / 2)
+                .count());
+        if (oplog_durable_wait_timeout_ms > max_wait_ms) {
+            throw std::runtime_error(
+                "oplog_durable_wait_timeout_ms exceeds supported clock range");
+        }
     }
 };
 
@@ -617,6 +628,7 @@ class WrappedMasterServiceConfig {
     uint64_t oplog_prune_chunk_batch_count = 10;
     uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
+    uint64_t oplog_durable_wait_timeout_ms = 30000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t oplog_standby_max_batches_per_poll =
         kDefaultOpLogStandbyMaxBatchesPerPoll;
@@ -723,6 +735,7 @@ class WrappedMasterServiceConfig {
         oplog_prune_max_batches_per_second =
             config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
+        oplog_durable_wait_timeout_ms = config.oplog_durable_wait_timeout_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         oplog_standby_max_batches_per_poll =
             config.oplog_standby_max_batches_per_poll;
@@ -857,6 +870,7 @@ class WrappedMasterServiceConfig {
         oplog_prune_max_batches_per_second =
             config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
+        oplog_durable_wait_timeout_ms = config.oplog_durable_wait_timeout_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         oplog_standby_max_batches_per_poll =
             config.oplog_standby_max_batches_per_poll;
@@ -931,6 +945,7 @@ class MasterServiceConfigBuilder {
     uint64_t oplog_prune_chunk_batch_count_ = 10;
     uint64_t oplog_prune_max_batches_per_second_ = 50;
     int oplog_poll_interval_ms_ = 1000;
+    uint64_t oplog_durable_wait_timeout_ms_ = 30000;
     uint32_t oplog_batch_max_entries_ = 1024;
     uint32_t oplog_standby_max_batches_per_poll_ =
         kDefaultOpLogStandbyMaxBatchesPerPoll;
@@ -1128,6 +1143,12 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_oplog_poll_interval_ms(int interval_ms) {
         oplog_poll_interval_ms_ = interval_ms;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_durable_wait_timeout_ms(
+        uint64_t timeout_ms) {
+        oplog_durable_wait_timeout_ms_ = timeout_ms;
         return *this;
     }
 
@@ -1347,6 +1368,7 @@ class MasterServiceConfig {
     uint64_t oplog_prune_chunk_batch_count = 10;
     uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
+    uint64_t oplog_durable_wait_timeout_ms = 30000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t oplog_standby_max_batches_per_poll =
         kDefaultOpLogStandbyMaxBatchesPerPoll;
@@ -1449,6 +1471,7 @@ class MasterServiceConfig {
         oplog_prune_max_batches_per_second =
             config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
+        oplog_durable_wait_timeout_ms = config.oplog_durable_wait_timeout_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         oplog_standby_max_batches_per_poll =
             config.oplog_standby_max_batches_per_poll;
@@ -1533,6 +1556,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.oplog_prune_max_batches_per_second =
         oplog_prune_max_batches_per_second_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
+    config.oplog_durable_wait_timeout_ms = oplog_durable_wait_timeout_ms_;
     config.oplog_batch_max_entries = oplog_batch_max_entries_;
     config.oplog_standby_max_batches_per_poll =
         oplog_standby_max_batches_per_poll_;

@@ -1,6 +1,8 @@
 #include "master_service.h"
 #include "common/shrink_buckets.h"
 #include "config/replica_selection_config.h"
+#include "offload_storage_key.h"
+#include "master_service/primary_write_grants_for_testing.h"
 #include "master_service/master_service_test_peer.h"
 #include "rpc_service.h"
 #include "storage/distributed/kvcs/kvcs_capacity_provider.h"
@@ -169,10 +171,12 @@ TEST_F(MasterServiceTest,
     replicate.replica_num = 1;
     replicate.dfs_replica_num = 1;
     constexpr std::string_view key = "kvcs-watermark";
-    ASSERT_TRUE(service.PutStart(context.client_id, std::string(key),
-                                 TenantId::Default(), 64, replicate));
-    ASSERT_TRUE(service.PutEnd(context.client_id, std::string(key),
-                               TenantId::Default(), ReplicaType::ALL));
+    ASSERT_TRUE(PutStartWithGrantForTesting(
+        service, context.client_id, std::string(key), TenantId::Default(), 64,
+        replicate));
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id,
+                                          std::string(key), TenantId::Default(),
+                                          ReplicaType::ALL));
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
     driver_state->fail_delete = true;
@@ -361,8 +365,9 @@ std::string GenerateKeyForSegment(const UUID& client_id,
         }
 
         // Attempt to put the key.
-        auto put_result = service->PutStart(client_id, key, TenantId::Default(),
-                                            {1024}, {.replica_num = 1});
+        auto put_result = PutStartWithGrantForTesting(
+            *service, client_id, key, TenantId::Default(), {1024},
+            {.replica_num = 1});
         if (put_result.has_value()) {
             replica_list = std::move(put_result.value());
         }
@@ -376,8 +381,8 @@ std::string GenerateKeyForSegment(const UUID& client_id,
             throw std::runtime_error("PutStart failed with code: " +
                                      std::to_string(static_cast<int>(code)));
         }
-        auto put_end_result = service->PutEnd(
-            client_id, key, TenantId::Default(), ReplicaType::MEMORY);
+        auto put_end_result = PutEndWithGrantForTesting(
+            *service, client_id, key, TenantId::Default(), ReplicaType::MEMORY);
         if (!put_end_result.has_value()) {
             throw std::runtime_error("PutEnd failed");
         }
@@ -412,8 +417,9 @@ TEST_F(MasterServiceTest, HcaHintFallsBackForLargeOffsetObject) {
     ASSERT_TRUE(service.MountSegment(original, owner));
     ReplicateConfig request;
     request.preferred_hca_names = std::vector<std::string>{"mlx5_0"};
-    const auto result = service.PutStart(
-        owner, "large-hca-object", TenantId::Default(), 24 * mib, request);
+    const auto result =
+        PutStartWithGrantForTesting(service, owner, "large-hca-object",
+                                    TenantId::Default(), 24 * mib, request);
     ASSERT_TRUE(result) << toString(result.error());
     const auto& buffer = (*result)[0].get_memory_descriptor().buffer_descriptor;
     EXPECT_EQ(buffer.size_, 24 * mib);
@@ -429,8 +435,8 @@ TEST_F(MasterServiceTest, ReplicaDescriptorCarriesTheMountedProtocol) {
     auto segment = MakeSegment("nvlink-provider");
     segment.protocol = "nvlink";
     ASSERT_TRUE(service.MountSegment(segment, owner));
-    const auto result =
-        service.PutStart(owner, "nvlink-object", TenantId::Default(), 1024, {});
+    const auto result = PutStartWithGrantForTesting(
+        service, owner, "nvlink-object", TenantId::Default(), 1024, {});
     ASSERT_TRUE(result) << toString(result.error());
     EXPECT_EQ((*result)[0].get_memory_descriptor().buffer_descriptor.protocol_,
               "nvlink");
@@ -454,8 +460,9 @@ TEST_F(MasterServiceTest, MixedGpuBatchUsesEachKeysHcaHint) {
     ReplicateConfig config;
     config.per_key_preferred_hca_names =
         std::vector<std::vector<std::string>>{{"mlx5_0"}, {"mlx5_1"}};
-    auto results = service.BatchUpsertStart(
-        owner, {"gpu0", "gpu1"}, TenantId::Default(), {1024, 1024}, config);
+    auto results = BatchUpsertStartWithGrantForTesting(
+        service, owner, {"gpu0", "gpu1"}, TenantId::Default(), {1024, 1024},
+        config);
     ASSERT_EQ(results.size(), 2);
     for (size_t i = 0; i < results.size(); ++i) {
         ASSERT_TRUE(results[i]);
@@ -464,9 +471,9 @@ TEST_F(MasterServiceTest, MixedGpuBatchUsesEachKeysHcaHint) {
         EXPECT_EQ(memory.locality->numa_node, i == 0 ? 7 : 0);
     }
     config.per_key_preferred_hca_names->pop_back();
-    results =
-        service.BatchUpsertStart(owner, {"invalid0", "invalid1"},
-                                 TenantId::Default(), {1024, 1024}, config);
+    results = BatchUpsertStartWithGrantForTesting(
+        service, owner, {"invalid0", "invalid1"}, TenantId::Default(),
+        {1024, 1024}, config);
     for (const auto& result : results) {
         ASSERT_FALSE(result);
         EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
@@ -491,8 +498,8 @@ TEST_F(MasterServiceTest, PutAndBatchUpsertHonorReceiverHcaLocality) {
     ASSERT_TRUE(service.MountSegment(matching, owner));
     ReplicateConfig request;
     request.preferred_hca_names = std::vector<std::string>{"mlx5_0"};
-    auto result = service.PutStart(owner, "hca-put", TenantId::Default(),
-                                   {1024}, request);
+    auto result = PutStartWithGrantForTesting(
+        service, owner, "hca-put", TenantId::Default(), {1024}, request);
     ASSERT_TRUE(result);
     const auto address =
         (*result)[0].get_memory_descriptor().buffer_descriptor.buffer_address_;
@@ -503,9 +510,9 @@ TEST_F(MasterServiceTest, PutAndBatchUpsertHonorReceiverHcaLocality) {
     auto remounted = service.ReMountSegment({conflicting}, owner);
     ASSERT_FALSE(remounted);
     EXPECT_EQ(remounted.error(), ErrorCode::INVALID_PARAMS);
-    auto batch =
-        service.BatchUpsertStart(owner, {"hca-upsert-a", "hca-upsert-b"},
-                                 TenantId::Default(), {1024, 1024}, request);
+    auto batch = BatchUpsertStartWithGrantForTesting(
+        service, owner, {"hca-upsert-a", "hca-upsert-b"}, TenantId::Default(),
+        {1024, 1024}, request);
     ASSERT_EQ(batch.size(), 2);
     for (const auto& entry : batch) {
         ASSERT_TRUE(entry);
@@ -534,8 +541,8 @@ TEST_F(MasterServiceTest, DisabledAffinityIgnoresExplicitHints) {
     ASSERT_TRUE(service.MountSegment(first, owner));
     ASSERT_TRUE(service.MountSegment(second, owner));
     const auto engine = threadLocalRandomEngine();
-    auto baseline =
-        service.PutStart(owner, "without-hint", TenantId::Default(), 1024, {});
+    auto baseline = PutStartWithGrantForTesting(service, owner, "without-hint",
+                                                TenantId::Default(), 1024, {});
     ASSERT_TRUE(baseline);
     const auto locality = baseline->front().get_memory_descriptor().locality;
     ASSERT_TRUE(locality);
@@ -543,8 +550,8 @@ TEST_F(MasterServiceTest, DisabledAffinityIgnoresExplicitHints) {
     request.preferred_hca_names = std::vector<std::string>{
         locality->numa_node == 0 ? "mlx5_1" : "mlx5_0"};
     threadLocalRandomEngine() = engine;
-    auto hinted = service.PutStart(owner, "with-hint", TenantId::Default(),
-                                   1024, request);
+    auto hinted = PutStartWithGrantForTesting(
+        service, owner, "with-hint", TenantId::Default(), 1024, request);
     ASSERT_TRUE(hinted);
     EXPECT_EQ(hinted->front().get_memory_descriptor().locality, locality);
 }
@@ -560,8 +567,8 @@ TEST_F(MasterServiceTest, DuplicateMountEnrichesOnlyUnknownLocality) {
     known.locality = SegmentLocality{7, {"mlx5_0"}};
     ASSERT_TRUE(service.MountSegment(known, owner));
     ASSERT_TRUE(service.MountSegment(legacy, owner));
-    auto replicas = service.PutStart(owner, "enriched-locality",
-                                     TenantId::Default(), 1024, {});
+    auto replicas = PutStartWithGrantForTesting(
+        service, owner, "enriched-locality", TenantId::Default(), 1024, {});
     ASSERT_TRUE(replicas);
     EXPECT_EQ(replicas->front().get_memory_descriptor().locality,
               known.locality);
@@ -602,8 +609,10 @@ TEST(MasterFabricPlacementTest, PutUpsertCopyMoveRespectFabricBoundary) {
     const auto original_address = start->front()
                                       .get_memory_descriptor()
                                       .buffer_descriptor.buffer_address_;
-    ASSERT_TRUE(service.PutEnd(client_id, "fabric-key", TenantId::Default(),
-                               ReplicaType::MEMORY));
+    auto start_generation = GetPrimaryWriteGeneration(*start);
+    ASSERT_TRUE(start_generation);
+    ASSERT_TRUE(service.PutEnd(client_id, {"fabric-key", {}, *start_generation},
+                               TenantId::Default(), ReplicaType::MEMORY));
     auto foreign = config;
     foreign.fabric_domain = "fabric-b";
     foreign.preferred_segments = {"b"};
@@ -622,8 +631,11 @@ TEST(MasterFabricPlacementTest, PutUpsertCopyMoveRespectFabricBoundary) {
                   .get_memory_descriptor()
                   .buffer_descriptor.buffer_address_,
               original_address);
-    ASSERT_TRUE(service.UpsertEnd(client_id, "fabric-key", TenantId::Default(),
-                                  ReplicaType::MEMORY));
+    auto reused_generation = GetPrimaryWriteGeneration(*reused);
+    ASSERT_TRUE(reused_generation);
+    ASSERT_TRUE(service.UpsertEnd(client_id,
+                                  {"fabric-key", {}, *reused_generation},
+                                  TenantId::Default(), ReplicaType::MEMORY));
     {
         auto access =
             MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
@@ -844,10 +856,12 @@ TEST_F(MasterServiceTest, StandaloneSoftPinLifecycle) {
     MasterService service(config);
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const auto client = generate_uuid();
-    ASSERT_TRUE(service.PutStart(client, "pin-key", TenantId::Default(), 1024,
-                                 ReplicateConfig{}));
-    ASSERT_TRUE(service.PutEnd(client, {"pin-key", std::nullopt},
-                               TenantId::Default(), ReplicaType::MEMORY));
+    ASSERT_TRUE(PutStartWithGrantForTesting(service, client, "pin-key",
+                                            TenantId::Default(), 1024,
+                                            ReplicateConfig{}));
+    ASSERT_TRUE(
+        PutEndWithGrantForTesting(service, client, {"pin-key", std::nullopt},
+                                  TenantId::Default(), ReplicaType::MEMORY));
     const auto baseline =
         MasterMetricManager::instance().get_soft_pin_key_count();
     auto results = service.BatchUpdateSoftPin({"pin-key", "missing", ""},
@@ -893,13 +907,14 @@ TEST_F(MasterServiceTest, StandaloneSoftPinRejectsPendingWriteAndInvalidTtl) {
     ReplicateConfig config;
     config.soft_pin_action = SoftPinAction::ENABLE;
     config.soft_pin_ttl_ms = 30000;
-    ASSERT_TRUE(service.PutStart(client, "pending-pin", TenantId::Default(),
-                                 1024, config));
+    ASSERT_TRUE(PutStartWithGrantForTesting(service, client, "pending-pin",
+                                            TenantId::Default(), 1024, config));
     auto pending =
         service.BatchUpdateSoftPin({"pending-pin"}, TenantId::Default(), 0);
     EXPECT_EQ(pending[0].error(), ErrorCode::REPLICA_IS_NOT_READY);
-    ASSERT_TRUE(service.PutEnd(client, {"pending-pin", std::nullopt},
-                               TenantId::Default(), ReplicaType::MEMORY));
+    ASSERT_TRUE(PutEndWithGrantForTesting(
+        service, client, {"pending-pin", std::nullopt}, TenantId::Default(),
+        ReplicaType::MEMORY));
     auto deadline = GetSoftPinDeadline(service, "pending-pin");
     ASSERT_TRUE(deadline);
     auto invalid =
@@ -919,10 +934,11 @@ TEST_F(MasterServiceTest,
     config.with_hard_pin = true;
     config.session_ids = std::vector<std::string>{"writing-session"};
     for (const auto& tenant : {TenantId("pin-a"), TenantId("pin-b")}) {
-        ASSERT_TRUE(
-            service.PutStart(client, "shared-key", tenant, 1024, config));
-        ASSERT_TRUE(service.PutEnd(client, {"shared-key", std::nullopt}, tenant,
-                                   ReplicaType::MEMORY));
+        ASSERT_TRUE(PutStartWithGrantForTesting(service, client, "shared-key",
+                                                tenant, 1024, config));
+        ASSERT_TRUE(PutEndWithGrantForTesting(service, client,
+                                              {"shared-key", std::nullopt},
+                                              tenant, ReplicaType::MEMORY));
     }
     auto read_deadline = [&]() {
         MasterServiceTestPeer::MetadataAccessorRO accessor(
@@ -964,13 +980,12 @@ TEST_F(MasterServiceTest, SoftPinZeroTtlSkipsSoftPinRegistration) {
         MasterMetricManager::instance().get_soft_pin_key_count();
     config.soft_pin_action = SoftPinAction::ENABLE;
     config.soft_pin_ttl_ms = 0;
-    ASSERT_TRUE(
-        service
-            ->PutStart(client_id, "zero_ttl", TenantId::Default(), 1024, config)
-            .has_value());
-    ASSERT_TRUE(service
-                    ->PutEnd(client_id, "zero_ttl", TenantId::Default(),
-                             ReplicaType::MEMORY)
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service, client_id, "zero_ttl",
+                                            TenantId::Default(), 1024, config)
+                    .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service, client_id, "zero_ttl",
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
                     .has_value());
     EXPECT_FALSE(GetSoftPinDeadline(*service, "zero_ttl").has_value());
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
@@ -1027,12 +1042,14 @@ TEST_F(MasterServiceTest, PutEndAllCompletesMemoryAndNoFReplicas) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.nof_replica_num = 1;
-    auto put_start_result = service_->PutStart(
-        client_id, "test_key_all", TenantId::Default(), 1024, config);
+    auto put_start_result =
+        PutStartWithGrantForTesting(*service_, client_id, "test_key_all",
+                                    TenantId::Default(), 1024, config);
     ASSERT_TRUE(put_start_result.has_value());
 
-    auto put_end_result = service_->PutEnd(
-        client_id, "test_key_all", TenantId::Default(), ReplicaType::ALL);
+    auto put_end_result =
+        PutEndWithGrantForTesting(*service_, client_id, "test_key_all",
+                                  TenantId::Default(), ReplicaType::ALL);
     ASSERT_TRUE(put_end_result.has_value());
 
     auto get_replica_result =
@@ -1066,12 +1083,14 @@ TEST_F(MasterServiceTest, PutEndMemoryDoesNotCompleteNoFReplica) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.nof_replica_num = 1;
-    auto put_start_result = service_->PutStart(
-        client_id, "test_key_split", TenantId::Default(), 1024, config);
+    auto put_start_result =
+        PutStartWithGrantForTesting(*service_, client_id, "test_key_split",
+                                    TenantId::Default(), 1024, config);
     ASSERT_TRUE(put_start_result.has_value());
 
-    auto put_end_result = service_->PutEnd(
-        client_id, "test_key_split", TenantId::Default(), ReplicaType::MEMORY);
+    auto put_end_result =
+        PutEndWithGrantForTesting(*service_, client_id, "test_key_split",
+                                  TenantId::Default(), ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     auto get_replica_result =
@@ -1081,8 +1100,9 @@ TEST_F(MasterServiceTest, PutEndMemoryDoesNotCompleteNoFReplica) {
     EXPECT_TRUE(get_replica_result->replicas[0].is_memory_replica());
     EXPECT_EQ(get_replica_result->replicas[0].status, ReplicaStatus::COMPLETE);
 
-    auto put_revoke_result = service_->PutRevoke(
-        client_id, "test_key_split", TenantId::Default(), ReplicaType::NOF_SSD);
+    auto put_revoke_result =
+        PutRevokeWithGrantForTesting(*service_, client_id, "test_key_split",
+                                     TenantId::Default(), ReplicaType::NOF_SSD);
     ASSERT_TRUE(put_revoke_result.has_value());
 
     auto final_replica_result =
@@ -1108,20 +1128,20 @@ TEST_F(MasterServiceTest, PartialRevokePreservesPendingSoftPin) {
     config.replica_num = 1;
     config.nof_replica_num = 1;
     config.soft_pin_action = SoftPinAction::ENABLE;
-    ASSERT_TRUE(service
-                    ->PutStart(client_id, "partial_revoke_soft_pin",
-                               TenantId::Default(), 1024, config)
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service, client_id,
+                                            "partial_revoke_soft_pin",
+                                            TenantId::Default(), 1024, config)
                     .has_value());
-    ASSERT_TRUE(service
-                    ->PutRevoke(client_id, "partial_revoke_soft_pin",
-                                TenantId::Default(), ReplicaType::MEMORY)
+    ASSERT_TRUE(PutRevokeWithGrantForTesting(
+                    *service, client_id, "partial_revoke_soft_pin",
+                    TenantId::Default(), ReplicaType::MEMORY)
                     .has_value());
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
               baseline);
 
-    ASSERT_TRUE(service
-                    ->PutEnd(client_id, "partial_revoke_soft_pin",
-                             TenantId::Default(), ReplicaType::NOF_SSD)
+    ASSERT_TRUE(PutEndWithGrantForTesting(
+                    *service, client_id, "partial_revoke_soft_pin",
+                    TenantId::Default(), ReplicaType::NOF_SSD)
                     .has_value());
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
               baseline + 1);
@@ -1141,22 +1161,22 @@ TEST_F(MasterServiceTest, LaterReplicaEndDoesNotRefreshSoftPin) {
     config.replica_num = 1;
     config.nof_replica_num = 1;
     config.soft_pin_action = SoftPinAction::ENABLE;
-    ASSERT_TRUE(service
-                    ->PutStart(client_id, "later_end_soft_pin",
-                               TenantId::Default(), 1024, config)
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service, client_id,
+                                            "later_end_soft_pin",
+                                            TenantId::Default(), 1024, config)
                     .has_value());
-    ASSERT_TRUE(service
-                    ->PutEnd(client_id, "later_end_soft_pin",
-                             TenantId::Default(), ReplicaType::MEMORY)
-                    .has_value());
+    ASSERT_TRUE(
+        PutEndWithGrantForTesting(*service, client_id, "later_end_soft_pin",
+                                  TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
     const auto first_deadline =
         GetSoftPinDeadline(*service, "later_end_soft_pin");
     ASSERT_TRUE(first_deadline.has_value());
 
-    ASSERT_TRUE(service
-                    ->PutEnd(client_id, "later_end_soft_pin",
-                             TenantId::Default(), ReplicaType::NOF_SSD)
-                    .has_value());
+    ASSERT_TRUE(
+        PutEndWithGrantForTesting(*service, client_id, "later_end_soft_pin",
+                                  TenantId::Default(), ReplicaType::NOF_SSD)
+            .has_value());
     EXPECT_EQ(GetSoftPinDeadline(*service, "later_end_soft_pin"),
               first_deadline);
 }
@@ -1169,8 +1189,9 @@ TEST_F(MasterServiceTest, PutStartOnePlusOneAllowsSingleAllocatedReplica) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.nof_replica_num = 1;
-    auto put_start_result = service_->PutStart(
-        client_id, "test_key_one_plus_one", TenantId::Default(), 1024, config);
+    auto put_start_result = PutStartWithGrantForTesting(
+        *service_, client_id, "test_key_one_plus_one", TenantId::Default(),
+        1024, config);
     ASSERT_TRUE(put_start_result.has_value());
     ASSERT_EQ(put_start_result->size(), 1u);
     EXPECT_TRUE(put_start_result->front().is_memory_replica());
@@ -1199,13 +1220,14 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
         config.replica_num = 1;
         config.dfs_replica_num = 1;
 
-        auto start = service.PutStart(context.client_id, "dfs_atomic",
-                                      TenantId::Default(), 4096, config);
+        auto start = PutStartWithGrantForTesting(
+            service, context.client_id, "dfs_atomic", TenantId::Default(), 4096,
+            config);
         ASSERT_TRUE(start.has_value());
         ASSERT_EQ(start->size(), 2);
-        ASSERT_TRUE(service
-                        .PutEnd(context.client_id, "dfs_atomic",
-                                TenantId::Default(), ReplicaType::ALL)
+        ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id,
+                                              "dfs_atomic", TenantId::Default(),
+                                              ReplicaType::ALL)
                         .has_value());
 
         auto query = service.GetReplicaList("dfs_atomic", TenantId::Default());
@@ -1216,15 +1238,16 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
         }
 
         ReplicateConfig mismatched_config;
-        auto leased_upsert = service.UpsertStart(
-            context.client_id, "dfs_atomic", TenantId::Default(), 4096, config);
+        auto leased_upsert = UpsertStartWithGrantForTesting(
+            service, context.client_id, "dfs_atomic", TenantId::Default(), 4096,
+            config);
         ASSERT_FALSE(leased_upsert.has_value());
         EXPECT_EQ(leased_upsert.error(), ErrorCode::OBJECT_HAS_LEASE);
 
         mismatched_config.replica_num = 1;
-        auto upsert =
-            service.UpsertStart(context.client_id, "dfs_atomic",
-                                TenantId::Default(), 4096, mismatched_config);
+        auto upsert = UpsertStartWithGrantForTesting(
+            service, context.client_id, "dfs_atomic", TenantId::Default(), 4096,
+            mismatched_config);
         ASSERT_FALSE(upsert.has_value());
         EXPECT_EQ(upsert.error(), ErrorCode::INVALID_PARAMS);
 
@@ -1235,12 +1258,13 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
             EXPECT_EQ(replica.status, ReplicaStatus::COMPLETE);
         }
 
-        auto revoke_start = service.PutStart(context.client_id, "dfs_revoke",
-                                             TenantId::Default(), 4096, config);
+        auto revoke_start = PutStartWithGrantForTesting(
+            service, context.client_id, "dfs_revoke", TenantId::Default(), 4096,
+            config);
         ASSERT_TRUE(revoke_start.has_value());
-        ASSERT_TRUE(service
-                        .PutRevoke(context.client_id, "dfs_revoke",
-                                   TenantId::Default(), ReplicaType::ALL)
+        ASSERT_TRUE(PutRevokeWithGrantForTesting(
+                        service, context.client_id, "dfs_revoke",
+                        TenantId::Default(), ReplicaType::ALL)
                         .has_value());
         auto revoked =
             service.GetReplicaList("dfs_revoke", TenantId::Default());
@@ -1255,21 +1279,21 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
         dfs_config.replica_num = 1;
         dfs_config.dfs_replica_num = 1;
 
-        auto failed = service.PutStart(context.client_id, "dfs_quota_failure",
-                                       TenantId::Default(),
-                                       kStrictTenantQuotaBytes, dfs_config);
+        auto failed = PutStartWithGrantForTesting(
+            service, context.client_id, "dfs_quota_failure",
+            TenantId::Default(), kStrictTenantQuotaBytes, dfs_config);
         ASSERT_FALSE(failed.has_value());
         EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
         ReplicateConfig memory_config;
         memory_config.replica_num = 1;
-        auto retry = service.PutStart(
-            context.client_id, "quota_after_dfs_failure", TenantId::Default(),
-            kStrictTenantQuotaBytes, memory_config);
+        auto retry = PutStartWithGrantForTesting(
+            service, context.client_id, "quota_after_dfs_failure",
+            TenantId::Default(), kStrictTenantQuotaBytes, memory_config);
         ASSERT_TRUE(retry.has_value()) << toString(retry.error());
-        ASSERT_TRUE(service
-                        .PutRevoke(context.client_id, "quota_after_dfs_failure",
-                                   TenantId::Default(), ReplicaType::ALL)
+        ASSERT_TRUE(PutRevokeWithGrantForTesting(
+                        service, context.client_id, "quota_after_dfs_failure",
+                        TenantId::Default(), ReplicaType::ALL)
                         .has_value());
     }
     std::error_code ec;
@@ -1320,37 +1344,37 @@ TEST_F(MasterServiceTest, DfsOnlyLifecyclePathsReleaseTheExtent) {
     const UUID writer = generate_uuid();
     const UUID other = generate_uuid();
 
-    auto start = service.PutStart(writer, "a", TenantId::Default(), kSize,
-                                  DfsOnlyConfig());
+    auto start = PutStartWithGrantForTesting(
+        service, writer, "a", TenantId::Default(), kSize, DfsOnlyConfig());
     ASSERT_TRUE(start.has_value()) << toString(start.error());
     ASSERT_EQ(start->size(), 1u);
     EXPECT_TRUE(start->front().is_dfs_replica());
     auto not_ready = service.GetReplicaList("a", TenantId::Default());
     ASSERT_FALSE(not_ready.has_value());
     EXPECT_EQ(not_ready.error(), ErrorCode::REPLICA_IS_NOT_READY);
-    auto full = service.PutStart(writer, "b", TenantId::Default(), kSize,
-                                 DfsOnlyConfig());
+    auto full = PutStartWithGrantForTesting(
+        service, writer, "b", TenantId::Default(), kSize, DfsOnlyConfig());
     ASSERT_FALSE(full.has_value());
     EXPECT_EQ(full.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
     // Revoke releases the extent.
-    ASSERT_TRUE(
-        service.PutRevoke(writer, "a", TenantId::Default(), ReplicaType::ALL));
+    ASSERT_TRUE(PutRevokeWithGrantForTesting(
+        service, writer, "a", TenantId::Default(), ReplicaType::ALL));
     auto revoked = service.GetReplicaList("a", TenantId::Default());
     ASSERT_FALSE(revoked.has_value());
     EXPECT_EQ(revoked.error(), ErrorCode::OBJECT_NOT_FOUND);
 
     // Upsert preemption releases the in-flight writer's extent.
-    ASSERT_TRUE(service.PutStart(writer, "b", TenantId::Default(), kSize,
-                                 DfsOnlyConfig()));
-    ASSERT_TRUE(service.UpsertStart(other, "b", TenantId::Default(), kSize,
-                                    DfsOnlyConfig()));
-    auto stale_end =
-        service.PutEnd(writer, "b", TenantId::Default(), ReplicaType::ALL);
+    ASSERT_TRUE(PutStartWithGrantForTesting(
+        service, writer, "b", TenantId::Default(), kSize, DfsOnlyConfig()));
+    ASSERT_TRUE(UpsertStartWithGrantForTesting(
+        service, other, "b", TenantId::Default(), kSize, DfsOnlyConfig()));
+    auto stale_end = PutEndWithGrantForTesting(
+        service, writer, "b", TenantId::Default(), ReplicaType::ALL);
     ASSERT_FALSE(stale_end.has_value());
     EXPECT_EQ(stale_end.error(), ErrorCode::ILLEGAL_CLIENT);
-    ASSERT_TRUE(
-        service.UpsertEnd(other, "b", TenantId::Default(), ReplicaType::ALL));
+    ASSERT_TRUE(UpsertEndWithGrantForTesting(
+        service, other, "b", TenantId::Default(), ReplicaType::ALL));
     auto complete = service.GetReplicaList("b", TenantId::Default());
     ASSERT_TRUE(complete.has_value());
     ASSERT_EQ(complete->replicas.size(), 1u);
@@ -1363,14 +1387,19 @@ TEST_F(MasterServiceTest, DfsOnlyLifecyclePathsReleaseTheExtent) {
     ASSERT_TRUE(service.Remove("b", TenantId::Default(), /*force=*/true));
 
     // An abandoned write is reaped after the release timeout.
-    ASSERT_TRUE(service.PutStart(writer, "c", TenantId::Default(), kSize,
-                                 DfsOnlyConfig()));
-    std::this_thread::sleep_for(std::chrono::seconds(4));
+    ASSERT_TRUE(PutStartWithGrantForTesting(
+        service, writer, "c", TenantId::Default(), kSize, DfsOnlyConfig()));
+    WaitUntil(
+        [&] {
+            auto query = service.GetReplicaList("c", TenantId::Default());
+            return !query && query.error() == ErrorCode::OBJECT_NOT_FOUND;
+        },
+        std::chrono::seconds(8));
     auto reaped = service.GetReplicaList("c", TenantId::Default());
     ASSERT_FALSE(reaped.has_value());
     EXPECT_EQ(reaped.error(), ErrorCode::OBJECT_NOT_FOUND);
-    auto reuse = service.PutStart(other, "d", TenantId::Default(), kSize,
-                                  DfsOnlyConfig());
+    auto reuse = PutStartWithGrantForTesting(
+        service, other, "d", TenantId::Default(), kSize, DfsOnlyConfig());
     ASSERT_TRUE(reuse.has_value()) << toString(reuse.error());
 
     std::error_code ec;
@@ -1391,19 +1420,19 @@ TEST_F(MasterServiceTest, DfsOnlyObjectsIgnoreMemoryEvictionAndSegmentLoss) {
     const auto context = PrepareSimpleSegment(service);
     const UUID writer = generate_uuid();
 
-    ASSERT_TRUE(service.PutStart(writer, "dfs_only", TenantId::Default(),
-                                 OneSlotDfsShardEnv::kObjectSize,
-                                 DfsOnlyConfig()));
-    ASSERT_TRUE(service.PutEnd(writer, "dfs_only", TenantId::Default(),
-                               ReplicaType::ALL));
+    ASSERT_TRUE(PutStartWithGrantForTesting(
+        service, writer, "dfs_only", TenantId::Default(),
+        OneSlotDfsShardEnv::kObjectSize, DfsOnlyConfig()));
+    ASSERT_TRUE(PutEndWithGrantForTesting(
+        service, writer, "dfs_only", TenantId::Default(), ReplicaType::ALL));
     ReplicateConfig memory_config;
     memory_config.replica_num = 1;
     for (int i = 0; i < 8; ++i) {
         const auto key = "memory_" + std::to_string(i);
-        ASSERT_TRUE(service.PutStart(writer, key, TenantId::Default(), 1 << 20,
-                                     memory_config));
-        ASSERT_TRUE(service.PutEnd(writer, key, TenantId::Default(),
-                                   ReplicaType::MEMORY));
+        ASSERT_TRUE(PutStartWithGrantForTesting(
+            service, writer, key, TenantId::Default(), 1 << 20, memory_config));
+        ASSERT_TRUE(PutEndWithGrantForTesting(
+            service, writer, key, TenantId::Default(), ReplicaType::MEMORY));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
@@ -1448,12 +1477,13 @@ TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
         config.dfs_replica_num = 1;
 
         for (const char* key : {"memory_full_a", "memory_full_b"}) {
-            auto start = service.PutStart(context.client_id, key,
-                                          TenantId::Default(), 4096, config);
+            auto start =
+                PutStartWithGrantForTesting(service, context.client_id, key,
+                                            TenantId::Default(), 4096, config);
             ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
-            ASSERT_TRUE(service
-                            .PutEnd(context.client_id, key, TenantId::Default(),
-                                    ReplicaType::ALL)
+            ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id,
+                                                  key, TenantId::Default(),
+                                                  ReplicaType::ALL)
                             .has_value());
         }
 
@@ -1461,8 +1491,9 @@ TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
             service.UnmountSegment(context.segment_id, context.client_id)
                 .has_value());
 
-        auto failed = service.PutStart(context.client_id, "memory_full_c",
-                                       TenantId::Default(), 4096, config);
+        auto failed = PutStartWithGrantForTesting(
+            service, context.client_id, "memory_full_c", TenantId::Default(),
+            4096, config);
         ASSERT_FALSE(failed.has_value());
         EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
@@ -1510,8 +1541,9 @@ TEST_F(MasterServiceTest, DfsBucketUpsertRestoresEvictedReplica) {
         std::optional<int> old_bucket_id;
         for (const std::string key :
              {"upsert_restore", "bucket_0_peer", "bucket_1_peer"}) {
-            auto start = service.PutStart(context.client_id, key,
-                                          TenantId::Default(), 4096, config);
+            auto start =
+                PutStartWithGrantForTesting(service, context.client_id, key,
+                                            TenantId::Default(), 4096, config);
             ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
             if (key == "upsert_restore") {
                 for (const auto& descriptor : *start) {
@@ -1525,9 +1557,9 @@ TEST_F(MasterServiceTest, DfsBucketUpsertRestoresEvictedReplica) {
                     }
                 }
             }
-            ASSERT_TRUE(service
-                            .PutEnd(context.client_id, key, TenantId::Default(),
-                                    ReplicaType::ALL)
+            ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id,
+                                                  key, TenantId::Default(),
+                                                  ReplicaType::ALL)
                             .has_value());
         }
         ASSERT_TRUE(old_memory_address.has_value());
@@ -1542,14 +1574,15 @@ TEST_F(MasterServiceTest, DfsBucketUpsertRestoresEvictedReplica) {
 
         auto mismatched_config = config;
         mismatched_config.replica_num = 2;
-        auto mismatched =
-            service.UpsertStart(context.client_id, "upsert_restore",
-                                TenantId::Default(), 4096, mismatched_config);
+        auto mismatched = UpsertStartWithGrantForTesting(
+            service, context.client_id, "upsert_restore", TenantId::Default(),
+            4096, mismatched_config);
         ASSERT_FALSE(mismatched.has_value());
         EXPECT_EQ(mismatched.error(), ErrorCode::INVALID_PARAMS);
 
-        auto restored = service.UpsertStart(context.client_id, "upsert_restore",
-                                            TenantId::Default(), 4096, config);
+        auto restored = UpsertStartWithGrantForTesting(
+            service, context.client_id, "upsert_restore", TenantId::Default(),
+            4096, config);
         ASSERT_TRUE(restored.has_value()) << restored.error();
         ASSERT_EQ(restored->size(), 2u);
         bool restored_memory = false;
@@ -1568,9 +1601,9 @@ TEST_F(MasterServiceTest, DfsBucketUpsertRestoresEvictedReplica) {
         }
         EXPECT_TRUE(restored_memory);
         EXPECT_TRUE(restored_dfs);
-        ASSERT_TRUE(service
-                        .UpsertEnd(context.client_id, "upsert_restore",
-                                   TenantId::Default(), ReplicaType::ALL)
+        ASSERT_TRUE(UpsertEndWithGrantForTesting(
+                        service, context.client_id, "upsert_restore",
+                        TenantId::Default(), ReplicaType::ALL)
                         .has_value());
 
         auto complete =
@@ -1622,12 +1655,13 @@ TEST_F(MasterServiceTest, DfsBucketEvictionKeepsBucketWithLeasedMember) {
         // The first two keys fill the first bucket, the third starts another.
         for (const std::string key :
              {"leased_member", "bucket_0_peer", "bucket_1_peer"}) {
-            auto start = service.PutStart(context.client_id, key,
-                                          TenantId::Default(), 4096, config);
+            auto start =
+                PutStartWithGrantForTesting(service, context.client_id, key,
+                                            TenantId::Default(), 4096, config);
             ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
-            ASSERT_TRUE(service
-                            .PutEnd(context.client_id, key, TenantId::Default(),
-                                    ReplicaType::ALL)
+            ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id,
+                                                  key, TenantId::Default(),
+                                                  ReplicaType::ALL)
                             .has_value());
         }
         // A read leases the member.
@@ -1695,13 +1729,13 @@ TEST_F(MasterServiceTest,
         }
 
         for (const auto& key : old_keys) {
-            auto start =
-                service.PutStart(context.client_id, key, TenantId::Default(),
-                                 kObjectSize, config);
+            auto start = PutStartWithGrantForTesting(service, context.client_id,
+                                                     key, TenantId::Default(),
+                                                     kObjectSize, config);
             ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
-            ASSERT_TRUE(service
-                            .PutEnd(context.client_id, key, TenantId::Default(),
-                                    ReplicaType::ALL)
+            ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id,
+                                                  key, TenantId::Default(),
+                                                  ReplicaType::ALL)
                             .has_value());
         }
 
@@ -1725,13 +1759,12 @@ TEST_F(MasterServiceTest,
             writers.emplace_back([&, i] {
                 start_barrier.arrive_and_wait();
                 auto result =
-                    i % 2 == 0
-                        ? service.PutStart(context.client_id, new_keys[i],
-                                           TenantId::Default(), kObjectSize,
-                                           config)
-                        : service.UpsertStart(context.client_id, new_keys[i],
-                                              TenantId::Default(), kObjectSize,
-                                              config);
+                    i % 2 == 0 ? PutStartWithGrantForTesting(
+                                     service, context.client_id, new_keys[i],
+                                     TenantId::Default(), kObjectSize, config)
+                               : UpsertStartWithGrantForTesting(
+                                     service, context.client_id, new_keys[i],
+                                     TenantId::Default(), kObjectSize, config);
                 if (!result) {
                     errors[i] = static_cast<int>(result.error());
                     return;
@@ -1791,12 +1824,13 @@ TEST_F(MasterServiceTest, LeasedUpsertAllocationFailurePreservesObject) {
     config.replica_num = 1;
 
     const std::string key = "leased_upsert_allocation_failure";
-    auto initial = service.PutStart(context.client_id, key, TenantId::Default(),
-                                    kSegmentSize, config);
+    auto initial =
+        PutStartWithGrantForTesting(service, context.client_id, key,
+                                    TenantId::Default(), kSegmentSize, config);
     ASSERT_TRUE(initial.has_value()) << toString(initial.error());
-    ASSERT_TRUE(service
-                    .PutEnd(context.client_id, key, TenantId::Default(),
-                            ReplicaType::MEMORY)
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id, key,
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
                     .has_value());
 
     // Retain a read lease so UpsertStart must allocate a replacement instead
@@ -1804,8 +1838,9 @@ TEST_F(MasterServiceTest, LeasedUpsertAllocationFailurePreservesObject) {
     auto snapshot = service.GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(snapshot.has_value());
 
-    auto failed = service.UpsertStart(
-        context.client_id, key, TenantId::Default(), kSegmentSize, config);
+    auto failed = UpsertStartWithGrantForTesting(service, context.client_id,
+                                                 key, TenantId::Default(),
+                                                 kSegmentSize, config);
     ASSERT_FALSE(failed.has_value());
     EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
@@ -1847,13 +1882,14 @@ TEST_F(MasterServiceTest, DfsReplicaNormalizesToDiskMediumForKvEvents) {
         config.replica_num = 1;
         config.dfs_replica_num = 1;
 
-        auto start = service.PutStart(context.client_id, "dfs_kv_media",
-                                      TenantId::Default(), 4096, config);
+        auto start = PutStartWithGrantForTesting(
+            service, context.client_id, "dfs_kv_media", TenantId::Default(),
+            4096, config);
         ASSERT_TRUE(start.has_value());
         ASSERT_EQ(start->size(), 2);
-        ASSERT_TRUE(service
-                        .PutEnd(context.client_id, "dfs_kv_media",
-                                TenantId::Default(), ReplicaType::ALL)
+        ASSERT_TRUE(PutEndWithGrantForTesting(
+                        service, context.client_id, "dfs_kv_media",
+                        TenantId::Default(), ReplicaType::ALL)
                         .has_value());
 
         // Memory + DFS collapse to the two logical KV media bits on the route.
@@ -1877,8 +1913,10 @@ TEST_F(MasterServiceTest, ProcessingReplicaRemainsUnannouncedOnRoute) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    auto start = service.PutStart(context.client_id, "processing_kv_media",
-                                  TenantId::Default(), 4096, config);
+    // PutStart without PutEnd leaves the replica PROCESSING.
+    auto start = PutStartWithGrantForTesting(service, context.client_id,
+                                             "processing_kv_media",
+                                             TenantId::Default(), 4096, config);
     ASSERT_TRUE(start.has_value());
 
     auto media = AnnouncedKvMediaForKey(service, "processing_kv_media");
@@ -1886,9 +1924,10 @@ TEST_F(MasterServiceTest, ProcessingReplicaRemainsUnannouncedOnRoute) {
     EXPECT_EQ(0u, *media) << "a PROCESSING replica is not yet available and "
                              "must not be marked announced";
 
-    ASSERT_TRUE(service
-                    .PutRevoke(context.client_id, "processing_kv_media",
-                               TenantId::Default(), ReplicaType::MEMORY)
+    ASSERT_TRUE(PutRevokeWithGrantForTesting(service, context.client_id,
+                                             std::string("processing_kv_media"),
+                                             TenantId::Default(),
+                                             ReplicaType::MEMORY)
                     .has_value());
     EXPECT_FALSE(
         AnnouncedKvMediaForKey(service, "processing_kv_media").has_value());
@@ -1912,14 +1951,22 @@ TEST_F(MasterServiceTest, RemoveAllKeepsObjectWhenOpLogReservationFails) {
 
     ReplicateConfig replicate_config;
     replicate_config.replica_num = 1;
-    ASSERT_TRUE(service
-                    ->PutStart(context.client_id, "reservation_fail_key",
-                               TenantId::Default(), 4096, replicate_config)
+    ASSERT_TRUE(PutStartWithGrantForTesting(
+                    *service, context.client_id, "reservation_fail_key",
+                    TenantId::Default(), 4096, replicate_config)
                     .has_value());
-    ASSERT_TRUE(service
-                    ->PutEnd(context.client_id, "reservation_fail_key",
-                             TenantId::Default(), ReplicaType::ALL)
-                    .has_value());
+    // Seed the completed publication directly: this fixture deliberately has
+    // no accepting writer and is testing RemoveAll admission, not PutEnd.
+    {
+        auto held = MasterServiceTestPeer::WriteObject(
+            *service, MasterServiceTestPeer::ObjectIdentity{
+                          TenantId::Default(), "reservation_fail_key"});
+        ASSERT_TRUE(held);
+        held->metadata().VisitReplicas(
+            [](const Replica&) { return true; },
+            [](Replica& replica) { replica.mark_complete(); });
+        held->state().is_processing = false;
+    }
 
     // force=true clears the lease gate, so the reservation is the only thing
     // left that can stop the removal.
@@ -1944,13 +1991,13 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    ASSERT_TRUE(service
-                    .PutStart(context.client_id, "victim_key",
-                              TenantId::Default(), 1024, config)
+    ASSERT_TRUE(PutStartWithGrantForTesting(service, context.client_id,
+                                            "victim_key", TenantId::Default(),
+                                            1024, config)
                     .has_value());
-    ASSERT_TRUE(service
-                    .PutEnd(context.client_id, "victim_key",
-                            TenantId::Default(), ReplicaType::ALL)
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id,
+                                          "victim_key", TenantId::Default(),
+                                          ReplicaType::ALL)
                     .has_value());
 
     bool committed = false;
@@ -1962,13 +2009,13 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
                 return;
             }
             committed = true;
-            ASSERT_TRUE(service
-                            .PutStart(context.client_id, "racer_key",
-                                      TenantId::Default(), 1024, config)
+            ASSERT_TRUE(PutStartWithGrantForTesting(
+                            service, context.client_id, "racer_key",
+                            TenantId::Default(), 1024, config)
                             .has_value());
-            ASSERT_TRUE(service
-                            .PutEnd(context.client_id, "racer_key",
-                                    TenantId::Default(), ReplicaType::ALL)
+            ASSERT_TRUE(PutEndWithGrantForTesting(
+                            service, context.client_id, "racer_key",
+                            TenantId::Default(), ReplicaType::ALL)
                             .has_value());
         });
 
@@ -1996,13 +2043,13 @@ TEST_F(MasterServiceTest, UncontendedScanStillPublishesClear) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    ASSERT_TRUE(service
-                    .PutStart(context.client_id, "lonely_key",
-                              TenantId::Default(), 1024, config)
+    ASSERT_TRUE(PutStartWithGrantForTesting(service, context.client_id,
+                                            "lonely_key", TenantId::Default(),
+                                            1024, config)
                     .has_value());
-    ASSERT_TRUE(service
-                    .PutEnd(context.client_id, "lonely_key",
-                            TenantId::Default(), ReplicaType::ALL)
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id,
+                                          "lonely_key", TenantId::Default(),
+                                          ReplicaType::ALL)
                     .has_value());
 
     service.RemoveAll(true);
@@ -2023,13 +2070,13 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    ASSERT_TRUE(service
-                    .PutStart(context.client_id, "scoped_victim",
-                              TenantId::Default(), 1024, config)
+    ASSERT_TRUE(PutStartWithGrantForTesting(service, context.client_id,
+                                            "scoped_victim",
+                                            TenantId::Default(), 1024, config)
                     .has_value());
-    ASSERT_TRUE(service
-                    .PutEnd(context.client_id, "scoped_victim",
-                            TenantId::Default(), ReplicaType::ALL)
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id,
+                                          "scoped_victim", TenantId::Default(),
+                                          ReplicaType::ALL)
                     .has_value());
 
     bool committed = false;
@@ -2039,13 +2086,13 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
                 return;
             }
             committed = true;
-            ASSERT_TRUE(service
-                            .PutStart(context.client_id, "scoped_racer",
-                                      TenantId::Default(), 1024, config)
+            ASSERT_TRUE(PutStartWithGrantForTesting(
+                            service, context.client_id, "scoped_racer",
+                            TenantId::Default(), 1024, config)
                             .has_value());
-            ASSERT_TRUE(service
-                            .PutEnd(context.client_id, "scoped_racer",
-                                    TenantId::Default(), ReplicaType::ALL)
+            ASSERT_TRUE(PutEndWithGrantForTesting(
+                            service, context.client_id, "scoped_racer",
+                            TenantId::Default(), ReplicaType::ALL)
                             .has_value());
         });
 
@@ -2200,9 +2247,14 @@ TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
 
     Replica replica(generate_uuid(), 128, "local://standby",
                     ReplicaStatus::COMPLETE);
+    const auto generation = UuidToString(generate_uuid());
+    replica.update_local_disk_descriptor(128, "local://standby",
+                                         MakeOffloadStorageKey(key, generation),
+                                         generation);
     StandbyObjectMetadata metadata;
     metadata.client_id = generate_uuid();
     metadata.size = 128;
+    metadata.object_generation = generation;
     metadata.replicas.push_back(replica.get_descriptor());
 
     ASSERT_TRUE(
@@ -2229,35 +2281,34 @@ TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
 
     ReplicateConfig config;
     config.replica_num = 1;
-    ASSERT_TRUE(
-        service_
-            ->PutStart(client_id, shared_key, TenantId::Default(), 1024, config)
-            .has_value());
-    ASSERT_TRUE(service_
-                    ->PutEnd(client_id, shared_key, TenantId::Default(),
-                             ReplicaType::MEMORY)
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service_, client_id, shared_key,
+                                            TenantId::Default(), 1024, config)
                     .has_value());
-    ASSERT_TRUE(service_
-                    ->PutStart(client_id, default_only_key, TenantId::Default(),
-                               1024, config)
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service_, client_id, shared_key,
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
                     .has_value());
-    ASSERT_TRUE(service_
-                    ->PutEnd(client_id, default_only_key, TenantId::Default(),
-                             ReplicaType::MEMORY)
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service_, client_id,
+                                            default_only_key,
+                                            TenantId::Default(), 1024, config)
                     .has_value());
-    ASSERT_TRUE(
-        service_->PutStart(client_id, shared_key, tenant_a, 1024, config)
-            .has_value());
-    ASSERT_TRUE(
-        service_->PutEnd(client_id, shared_key, tenant_a, ReplicaType::MEMORY)
-            .has_value());
-    ASSERT_TRUE(
-        service_->PutStart(client_id, tenant_only_key, tenant_a, 1024, config)
-            .has_value());
-    ASSERT_TRUE(
-        service_
-            ->PutEnd(client_id, tenant_only_key, tenant_a, ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service_, client_id,
+                                          default_only_key, TenantId::Default(),
+                                          ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service_, client_id, shared_key,
+                                            tenant_a, 1024, config)
+                    .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service_, client_id, shared_key,
+                                          tenant_a, ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service_, client_id,
+                                            tenant_only_key, tenant_a, 1024,
+                                            config)
+                    .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service_, client_id, tenant_only_key,
+                                          tenant_a, ReplicaType::MEMORY)
+                    .has_value());
 
     auto default_keys = service_->GetAllKeys(TenantId::Default());
     ASSERT_TRUE(default_keys.has_value());
@@ -2295,13 +2346,17 @@ TEST_F(MasterServiceTest, TenantScopedPutsAndRemovesUpdateGlobalKeyCount) {
     config.replica_num = 1;
 
     EXPECT_EQ(service_->GetKeyCount(), 0u);
-    ASSERT_TRUE(
-        service_->PutStart(client_id, key, tenant_a, 1024, config).has_value());
-    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service_, client_id, key, tenant_a,
+                                            1024, config)
                     .has_value());
-    ASSERT_TRUE(
-        service_->PutStart(client_id, key, tenant_b, 2048, config).has_value());
-    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service_, client_id, key, tenant_a,
+                                          ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service_, client_id, key, tenant_b,
+                                            2048, config)
+                    .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service_, client_id, key, tenant_b,
+                                          ReplicaType::MEMORY)
                     .has_value());
     EXPECT_EQ(service_->GetKeyCount(), 2u);
 
@@ -2368,34 +2423,35 @@ TEST_F(MasterServiceTest,
         incoming.host_id = "host-b";
         incoming.prefer_alloc_in_same_node = use_hint;
         incoming.preferred_segments = {"", "C", "C", "A", ""};
-        ASSERT_TRUE(service.PutStart(owner, "array", TenantId::Default(), 4096,
-                                     incoming));
+        ASSERT_TRUE(PutStartWithGrantForTesting(
+            service, owner, "array", TenantId::Default(), 4096, incoming));
         EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "A", "B"}));
-        ASSERT_TRUE(service.PutRevoke(owner, "array", TenantId::Default(),
-                                      ReplicaType::MEMORY));
+        ASSERT_TRUE(PutRevokeWithGrantForTesting(
+            service, owner, "array", TenantId::Default(), ReplicaType::MEMORY));
 
         // The singular preference takes precedence over the array, and its
         // remote host stays ahead of the automatically preferred local host.
         incoming.preferred_segment = "C";
-        ASSERT_TRUE(service.PutStart(owner, "single", TenantId::Default(), 4096,
-                                     incoming));
+        ASSERT_TRUE(PutStartWithGrantForTesting(
+            service, owner, "single", TenantId::Default(), 4096, incoming));
         EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "B", "A"}));
-        ASSERT_TRUE(service.PutRevoke(owner, "single", TenantId::Default(),
-                                      ReplicaType::MEMORY));
+        ASSERT_TRUE(PutRevokeWithGrantForTesting(service, owner, "single",
+                                                 TenantId::Default(),
+                                                 ReplicaType::MEMORY));
 
         incoming.preferred_segment.clear();
         incoming.preferred_segments.clear();
         const std::string key = "cross-host-duplicate";
-        ASSERT_TRUE(
-            service.PutStart(owner, key, TenantId::Default(), 4096, incoming));
+        ASSERT_TRUE(PutStartWithGrantForTesting(
+            service, owner, key, TenantId::Default(), 4096, incoming));
         // host-b comes first, then host-c's rotated A/C, then host-a's A.
         // The final A must not be appended again.
         const bool c_first = std::hash<std::string>{}(key) % 2 != 0;
         EXPECT_EQ(recorder->names,
                   (c_first ? std::vector<std::string>{"B", "C", "A"}
                            : std::vector<std::string>{"B", "A", "C"}));
-        ASSERT_TRUE(service.PutRevoke(owner, key, TenantId::Default(),
-                                      ReplicaType::MEMORY));
+        ASSERT_TRUE(PutRevokeWithGrantForTesting(
+            service, owner, key, TenantId::Default(), ReplicaType::MEMORY));
     }
 }
 
@@ -2441,11 +2497,12 @@ TEST_F(MasterServiceTest,
                                            ""};
             for (size_t request = 0; request < 2; ++request) {
                 const auto key = "many-appends-" + std::to_string(request);
-                ASSERT_TRUE(service.PutStart(owner, key, TenantId::Default(),
-                                             4096, incoming));
+                ASSERT_TRUE(PutStartWithGrantForTesting(
+                    service, owner, key, TenantId::Default(), 4096, incoming));
                 EXPECT_EQ(recorder->names, expected);
-                ASSERT_TRUE(service.PutRevoke(owner, key, TenantId::Default(),
-                                              ReplicaType::MEMORY));
+                ASSERT_TRUE(PutRevokeWithGrantForTesting(service, owner, key,
+                                                         TenantId::Default(),
+                                                         ReplicaType::MEMORY));
             }
         }
     }
@@ -2470,18 +2527,18 @@ TEST_F(MasterServiceTest,
     }
     ReplicateConfig incoming;
     incoming.host_id = "host-bb";
-    ASSERT_TRUE(service.PutStart(owner, "unknown", TenantId::Default(), 4096,
-                                 incoming));
+    ASSERT_TRUE(PutStartWithGrantForTesting(
+        service, owner, "unknown", TenantId::Default(), 4096, incoming));
     EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "A", "B"}));
-    ASSERT_TRUE(service.PutRevoke(owner, "unknown", TenantId::Default(),
-                                  ReplicaType::MEMORY));
+    ASSERT_TRUE(PutRevokeWithGrantForTesting(
+        service, owner, "unknown", TenantId::Default(), ReplicaType::MEMORY));
 
     incoming.host_id = "host-z";
-    ASSERT_TRUE(
-        service.PutStart(owner, "wrap", TenantId::Default(), 4096, incoming));
+    ASSERT_TRUE(PutStartWithGrantForTesting(
+        service, owner, "wrap", TenantId::Default(), 4096, incoming));
     EXPECT_EQ(recorder->names, (std::vector<std::string>{"A", "B", "C"}));
-    ASSERT_TRUE(service.PutRevoke(owner, "wrap", TenantId::Default(),
-                                  ReplicaType::MEMORY));
+    ASSERT_TRUE(PutRevokeWithGrantForTesting(
+        service, owner, "wrap", TenantId::Default(), ReplicaType::MEMORY));
 
     {
         auto access =
@@ -2490,15 +2547,15 @@ TEST_F(MasterServiceTest,
                   ErrorCode::OK);
     }
     incoming.host_id = "host-b";
-    ASSERT_TRUE(service.PutStart(owner, "draining", TenantId::Default(), 4096,
-                                 incoming));
+    ASSERT_TRUE(PutStartWithGrantForTesting(
+        service, owner, "draining", TenantId::Default(), 4096, incoming));
     EXPECT_EQ(recorder->names, (std::vector<std::string>{"C", "A"}));
-    ASSERT_TRUE(service.PutRevoke(owner, "draining", TenantId::Default(),
-                                  ReplicaType::MEMORY));
+    ASSERT_TRUE(PutRevokeWithGrantForTesting(
+        service, owner, "draining", TenantId::Default(), ReplicaType::MEMORY));
 
     ASSERT_TRUE(service.UnmountSegment(segments[2].id, owner));
-    ASSERT_TRUE(service.PutStart(owner, "unmounted", TenantId::Default(), 4096,
-                                 incoming));
+    ASSERT_TRUE(PutStartWithGrantForTesting(
+        service, owner, "unmounted", TenantId::Default(), 4096, incoming));
     EXPECT_EQ(recorder->names, (std::vector<std::string>{"A"}));
 }
 
@@ -2521,8 +2578,8 @@ TEST_F(MasterServiceTest,
         ReplicateConfig incoming;
         incoming.host_id = "unknown";
         incoming.preferred_segments = {"", "A", "A", ""};
-        ASSERT_TRUE(service.PutStart(owner, "no-host", TenantId::Default(),
-                                     4096, incoming));
+        ASSERT_TRUE(PutStartWithGrantForTesting(
+            service, owner, "no-host", TenantId::Default(), 4096, incoming));
         EXPECT_EQ(recorder->names, (std::vector<std::string>{"A"}));
     }
 }
@@ -2555,18 +2612,22 @@ TEST_F(MasterServiceTest, ProtectCopyMoveSourceFromEviction) {
     config.preferred_segment = "segment_1";
 
     // Put two objects for move and copy tests.
-    auto put_start_result = service_->PutStart(
-        client_id, copy_key, TenantId::Default(), slice_length, config);
+    auto put_start_result =
+        PutStartWithGrantForTesting(*service_, client_id, copy_key,
+                                    TenantId::Default(), slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(
-        client_id, copy_key, TenantId::Default(), ReplicaType::MEMORY);
+    auto put_end_result =
+        PutEndWithGrantForTesting(*service_, client_id, copy_key,
+                                  TenantId::Default(), ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
-    put_start_result = service_->PutStart(
-        client_id, move_key, TenantId::Default(), slice_length, config);
+    put_start_result =
+        PutStartWithGrantForTesting(*service_, client_id, move_key,
+                                    TenantId::Default(), slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    put_end_result = service_->PutEnd(client_id, move_key, TenantId::Default(),
-                                      ReplicaType::MEMORY);
+    put_end_result =
+        PutEndWithGrantForTesting(*service_, client_id, move_key,
+                                  TenantId::Default(), ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Start copy and move operations.
@@ -2582,11 +2643,13 @@ TEST_F(MasterServiceTest, ProtectCopyMoveSourceFromEviction) {
     config.preferred_segment = "";
     for (size_t i = 0; i < 128 * (kSegmentSize * 2 / slice_length); ++i) {
         std::string key = "test_key_" + std::to_string(i);
-        auto put_start_result = service_->PutStart(
-            client_id, key, TenantId::Default(), slice_length, config);
+        auto put_start_result = PutStartWithGrantForTesting(
+            *service_, client_id, key, TenantId::Default(), slice_length,
+            config);
         if (put_start_result.has_value()) {
-            auto put_end_result = service_->PutEnd(
-                client_id, key, TenantId::Default(), ReplicaType::MEMORY);
+            auto put_end_result = PutEndWithGrantForTesting(
+                *service_, client_id, key, TenantId::Default(),
+                ReplicaType::MEMORY);
             ASSERT_TRUE(put_end_result.has_value());
         } else {
             // wait for eviction to work
@@ -2642,18 +2705,22 @@ TEST_F(MasterServiceTest, DiscardTimeoutCopyMove) {
     config.preferred_segment = "segment_1";
 
     // Put two objects for move and copy tests.
-    auto put_start_result = service_->PutStart(
-        client_id, copy_key, TenantId::Default(), slice_length, config);
+    auto put_start_result =
+        PutStartWithGrantForTesting(*service_, client_id, copy_key,
+                                    TenantId::Default(), slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(
-        client_id, copy_key, TenantId::Default(), ReplicaType::MEMORY);
+    auto put_end_result =
+        PutEndWithGrantForTesting(*service_, client_id, copy_key,
+                                  TenantId::Default(), ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
-    put_start_result = service_->PutStart(
-        client_id, move_key, TenantId::Default(), slice_length, config);
+    put_start_result =
+        PutStartWithGrantForTesting(*service_, client_id, move_key,
+                                    TenantId::Default(), slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    put_end_result = service_->PutEnd(client_id, move_key, TenantId::Default(),
-                                      ReplicaType::MEMORY);
+    put_end_result =
+        PutEndWithGrantForTesting(*service_, client_id, move_key,
+                                  TenantId::Default(), ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Start copy and move operations.
@@ -2672,11 +2739,13 @@ TEST_F(MasterServiceTest, DiscardTimeoutCopyMove) {
     config.preferred_segment = "";
     for (size_t i = 0; i < 128 * (kSegmentSize * 2 / slice_length); ++i) {
         std::string key = "test_key_" + std::to_string(i);
-        auto put_start_result = service_->PutStart(
-            client_id, key, TenantId::Default(), slice_length, config);
+        auto put_start_result = PutStartWithGrantForTesting(
+            *service_, client_id, key, TenantId::Default(), slice_length,
+            config);
         if (put_start_result.has_value()) {
-            auto put_end_result = service_->PutEnd(
-                client_id, key, TenantId::Default(), ReplicaType::MEMORY);
+            auto put_end_result = PutEndWithGrantForTesting(
+                *service_, client_id, key, TenantId::Default(),
+                ReplicaType::MEMORY);
             ASSERT_TRUE(put_end_result.has_value());
         } else {
             // wait for eviction to work
@@ -2717,11 +2786,11 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
     config.replica_num = 1;  // One replica
 
     // Create the object
-    auto put_start_result = service_->PutStart(
-        client_id, key, TenantId::Default(), slice_length, config);
+    auto put_start_result = PutStartWithGrantForTesting(
+        *service_, client_id, key, TenantId::Default(), slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, TenantId::Default(),
-                                           ReplicaType::MEMORY);
+    auto put_end_result = PutEndWithGrantForTesting(
+        *service_, client_id, key, TenantId::Default(), ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Verify object exists
@@ -2746,11 +2815,11 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
 
     // Create another object
     std::string key2 = "another_segment_object";
-    auto put_start_result2 = service_->PutStart(
-        client_id, key2, TenantId::Default(), slice_length, config);
+    auto put_start_result2 = PutStartWithGrantForTesting(
+        *service_, client_id, key2, TenantId::Default(), slice_length, config);
     ASSERT_TRUE(put_start_result2.has_value());
-    auto put_end_result2 = service_->PutEnd(
-        client_id, key2, TenantId::Default(), ReplicaType::MEMORY);
+    auto put_end_result2 = PutEndWithGrantForTesting(
+        *service_, client_id, key2, TenantId::Default(), ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result2.has_value());
 
     // Verify we can get it
@@ -2782,6 +2851,13 @@ TEST_F(MasterServiceTest, StaleCleanupUsesLocalDiskSessionState) {
     const UUID disk_owner = generate_uuid();
     ASSERT_TRUE(service.MountSegment(disk_segment, disk_owner).has_value());
     Replica disk(disk_owner, 1024, "disk-endpoint", ReplicaStatus::COMPLETE);
+    auto object = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(object);
+    const auto generation = object->object_generation.value_or("");
+    ASSERT_FALSE(generation.empty());
+    disk.update_local_disk_descriptor(1024, "disk-endpoint",
+                                      MakeOffloadStorageKey(key, generation),
+                                      generation);
     ASSERT_TRUE(service.AddReplica(disk_owner, key, TenantId::Default(), disk)
                     .has_value());
     const auto record = FindClientLivenessForTest(service, disk_owner);
@@ -2889,12 +2965,12 @@ TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
     ASSERT_EQ(1u, service_->GetKeyCount());
 
     // Verify put key1 will put into segment2 rather than segment1
-    auto put_start_result = service_->PutStart(
-        client_id, key1, TenantId::Default(), slice_length, config);
+    auto put_start_result = PutStartWithGrantForTesting(
+        *service_, client_id, key1, TenantId::Default(), slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
-    auto put_end_result = service_->PutEnd(client_id, key1, TenantId::Default(),
-                                           ReplicaType::MEMORY);
+    auto put_end_result = PutEndWithGrantForTesting(
+        *service_, client_id, key1, TenantId::Default(), ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
     auto get_result3 = service_->GetReplicaList(key1, TenantId::Default());
     ASSERT_TRUE(get_result3.has_value());
@@ -2948,16 +3024,16 @@ TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsStripeAcrossLockBatches) {
         config.replica_num = 1;
         config.preferred_segments = {segment_name};
 
-        auto put_start = service->PutStart(client_id, key, TenantId::Default(),
-                                           1024, config);
+        auto put_start = PutStartWithGrantForTesting(
+            *service, client_id, key, TenantId::Default(), 1024, config);
         ASSERT_TRUE(put_start.has_value()) << "key=" << key;
         ASSERT_EQ(1u, put_start->size());
         ASSERT_EQ(segment_name, (*put_start)[0]
                                     .get_memory_descriptor()
                                     .buffer_descriptor.transport_endpoint_);
-        ASSERT_TRUE(service
-                        ->PutEnd(client_id, key, TenantId::Default(),
-                                 ReplicaType::MEMORY)
+        ASSERT_TRUE(PutEndWithGrantForTesting(*service, client_id, key,
+                                              TenantId::Default(),
+                                              ReplicaType::MEMORY)
                         .has_value());
         (on_stale_segment ? stale_keys : live_keys).push_back(key);
     }
@@ -3160,10 +3236,12 @@ TEST_F(MasterServiceTest, PutStartPartialMemoryAllocationDoesNotArmEviction) {
     ReplicateConfig fill;
     fill.replica_num = 1;
     fill.preferred_segment = "full";
-    ASSERT_TRUE(service.PutStart(full.client_id, "fill", TenantId::Default(),
-                                 kDefaultSegmentSize, fill));
-    ASSERT_TRUE(service.PutEnd(full.client_id, "fill", TenantId::Default(),
-                               ReplicaType::MEMORY));
+    ASSERT_TRUE(PutStartWithGrantForTesting(service, full.client_id, "fill",
+                                            TenantId::Default(),
+                                            kDefaultSegmentSize, fill));
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, full.client_id, "fill",
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY));
     ASSERT_FALSE(MasterServiceTestPeer::NeedMemEviction(service));
     {
         auto access =
@@ -3173,8 +3251,8 @@ TEST_F(MasterServiceTest, PutStartPartialMemoryAllocationDoesNotArmEviction) {
 
     ReplicateConfig config;
     config.replica_num = 2;
-    auto result = service.PutStart(full.client_id, "partial",
-                                   TenantId::Default(), 1024, config);
+    auto result = PutStartWithGrantForTesting(
+        service, full.client_id, "partial", TenantId::Default(), 1024, config);
     ASSERT_TRUE(result);
     ASSERT_EQ(result->size(), 1u);
     EXPECT_FALSE(MasterServiceTestPeer::NeedMemEviction(service));
@@ -3201,8 +3279,9 @@ TEST_F(MasterServiceTest, PutStartPartialAllocationIsObservable) {
     // put successful but the degradation must be recorded.
     ReplicateConfig config;
     config.replica_num = 3;
-    auto put_start_result = service_->PutStart(
-        client_id, "partial_alloc_key", TenantId::Default(), 1024, config);
+    auto put_start_result =
+        PutStartWithGrantForTesting(*service_, client_id, "partial_alloc_key",
+                                    TenantId::Default(), 1024, config);
     ASSERT_TRUE(put_start_result.has_value());
     ASSERT_EQ(2u, put_start_result->size());
     ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before + 1);
@@ -3210,8 +3289,9 @@ TEST_F(MasterServiceTest, PutStartPartialAllocationIsObservable) {
     // A fully satisfied allocation must not be counted as partial.
     ReplicateConfig full_config;
     full_config.replica_num = 2;
-    auto full_result = service_->PutStart(
-        client_id, "full_alloc_key", TenantId::Default(), 1024, full_config);
+    auto full_result =
+        PutStartWithGrantForTesting(*service_, client_id, "full_alloc_key",
+                                    TenantId::Default(), 1024, full_config);
     ASSERT_TRUE(full_result.has_value());
     ASSERT_EQ(2u, full_result->size());
     ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before + 1);
@@ -3343,13 +3423,13 @@ TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
         // full eviction below and the shrunk bucket count stays
         // observable.
         config.with_hard_pin = (&key == &keys.front());
-        ASSERT_TRUE(service_
-                        ->PutStart(client_id, key, TenantId::Default(),
-                                   object_size, config)
+        ASSERT_TRUE(PutStartWithGrantForTesting(*service_, client_id, key,
+                                                TenantId::Default(),
+                                                object_size, config)
                         .has_value());
-        ASSERT_TRUE(service_
-                        ->PutEnd(client_id, key, TenantId::Default(),
-                                 ReplicaType::MEMORY)
+        ASSERT_TRUE(PutEndWithGrantForTesting(*service_, client_id, key,
+                                              TenantId::Default(),
+                                              ReplicaType::MEMORY)
                         .has_value());
     }
 
@@ -3376,13 +3456,13 @@ TEST_F(MasterServiceTest, BatchEvictCountsARoundOnlyWhenItHadSomethingToDo) {
     const UUID client_id = generate_uuid();
     ReplicateConfig config;
     config.replica_num = 1;
-    ASSERT_TRUE(
-        service->PutStart(client_id, "key", TenantId::Default(), 1024, config)
-            .has_value());
-    ASSERT_TRUE(
-        service
-            ->PutEnd(client_id, "key", TenantId::Default(), ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service, client_id, "key",
+                                            TenantId::Default(), 1024, config)
+                    .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service, client_id, "key",
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
+                    .has_value());
     auto& metrics = MasterMetricManager::instance();
     const int64_t successes = metrics.get_mem_eviction_success();
     const int64_t attempts = metrics.get_mem_eviction_attempts();
@@ -3442,13 +3522,14 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
         config.replica_num = 1;
         config.preferred_segments = {segment_name};
 
-        ASSERT_TRUE(
-            service->PutStart(client_id, key, TenantId::Default(), 1024, config)
-                .has_value())
+        ASSERT_TRUE(PutStartWithGrantForTesting(*service, client_id, key,
+                                                TenantId::Default(), 1024,
+                                                config)
+                        .has_value())
             << "key=" << key;
-        ASSERT_TRUE(service
-                        ->PutEnd(client_id, key, TenantId::Default(),
-                                 ReplicaType::MEMORY)
+        ASSERT_TRUE(PutEndWithGrantForTesting(*service, client_id, key,
+                                              TenantId::Default(),
+                                              ReplicaType::MEMORY)
                         .has_value())
             << "key=" << key;
         (on_live ? live_keys : stale_keys).push_back(key);
@@ -3521,27 +3602,27 @@ TEST_F(MasterServiceTest, RemoveSoftPinObject) {
     config.soft_pin_action = SoftPinAction::ENABLE;
 
     // Verify soft pin does not block remove
-    ASSERT_TRUE(service_
-                    ->PutStart(client_id, key, TenantId::Default(),
-                               slice_length, config)
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service_, client_id, key,
+                                            TenantId::Default(), slice_length,
+                                            config)
                     .has_value());
-    ASSERT_TRUE(
-        service_
-            ->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service_, client_id, key,
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
+                    .has_value());
     EXPECT_EQ(SoftPinRegistrationCount(*service_), 1u);
     EXPECT_TRUE(service_->Remove(key, TenantId::Default()).has_value());
     EXPECT_EQ(SoftPinRegistrationCount(*service_), 0u);
 
     // Verify soft pin does not block RemoveAll
-    ASSERT_TRUE(service_
-                    ->PutStart(client_id, key, TenantId::Default(),
-                               slice_length, config)
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service_, client_id, key,
+                                            TenantId::Default(), slice_length,
+                                            config)
                     .has_value());
-    ASSERT_TRUE(
-        service_
-            ->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service_, client_id, key,
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
+                    .has_value());
     EXPECT_EQ(SoftPinRegistrationCount(*service_), 1u);
     EXPECT_EQ(1, service_->RemoveAll());
     EXPECT_EQ(SoftPinRegistrationCount(*service_), 0u);
@@ -3560,16 +3641,15 @@ TEST_F(MasterServiceTest, SoftPinActionsCommitOnFirstReadableUpsert) {
     ReplicateConfig enable;
     enable.soft_pin_action = SoftPinAction::ENABLE;
     enable.soft_pin_ttl_ms = 5000;
-    ASSERT_TRUE(service
-                    ->PutStart(client_id, "action_key", TenantId::Default(),
-                               1024, enable)
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service, client_id, "action_key",
+                                            TenantId::Default(), 1024, enable)
                     .has_value());
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
               baseline);
     const auto before_first_completion = std::chrono::system_clock::now();
-    ASSERT_TRUE(service
-                    ->PutEnd(client_id, "action_key", TenantId::Default(),
-                             ReplicaType::MEMORY)
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service, client_id, "action_key",
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
                     .has_value());
     const auto initial_deadline = GetSoftPinDeadline(*service, "action_key");
     ASSERT_TRUE(initial_deadline.has_value());
@@ -3581,29 +3661,29 @@ TEST_F(MasterServiceTest, SoftPinActionsCommitOnFirstReadableUpsert) {
               baseline + 1);
 
     ReplicateConfig preserve;
-    ASSERT_TRUE(service
-                    ->UpsertStart(client_id, "action_key", TenantId::Default(),
-                                  1024, preserve)
-                    .has_value());
+    ASSERT_TRUE(
+        UpsertStartWithGrantForTesting(*service, client_id, "action_key",
+                                       TenantId::Default(), 1024, preserve)
+            .has_value());
     EXPECT_EQ(GetSoftPinDeadline(*service, "action_key"), initial_deadline);
-    ASSERT_TRUE(service
-                    ->UpsertEnd(client_id, "action_key", TenantId::Default(),
-                                ReplicaType::MEMORY)
+    ASSERT_TRUE(UpsertEndWithGrantForTesting(*service, client_id, "action_key",
+                                             TenantId::Default(),
+                                             ReplicaType::MEMORY)
                     .has_value());
     EXPECT_EQ(GetSoftPinDeadline(*service, "action_key"), initial_deadline);
 
     ReplicateConfig disable;
     disable.soft_pin_action = SoftPinAction::DISABLE;
-    ASSERT_TRUE(service
-                    ->UpsertStart(client_id, "action_key", TenantId::Default(),
-                                  2048, disable)
-                    .has_value());
+    ASSERT_TRUE(
+        UpsertStartWithGrantForTesting(*service, client_id, "action_key",
+                                       TenantId::Default(), 2048, disable)
+            .has_value());
     EXPECT_TRUE(GetSoftPinDeadline(*service, "action_key").has_value());
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
               baseline + 1);
-    ASSERT_TRUE(service
-                    ->UpsertEnd(client_id, "action_key", TenantId::Default(),
-                                ReplicaType::MEMORY)
+    ASSERT_TRUE(UpsertEndWithGrantForTesting(*service, client_id, "action_key",
+                                             TenantId::Default(),
+                                             ReplicaType::MEMORY)
                     .has_value());
     EXPECT_FALSE(GetSoftPinDeadline(*service, "action_key").has_value());
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
@@ -3612,15 +3692,15 @@ TEST_F(MasterServiceTest, SoftPinActionsCommitOnFirstReadableUpsert) {
     ReplicateConfig enable_again;
     enable_again.soft_pin_action = SoftPinAction::ENABLE;
     enable_again.soft_pin_ttl_ms = 3000;
-    ASSERT_TRUE(service
-                    ->UpsertStart(client_id, "action_key", TenantId::Default(),
-                                  2048, enable_again)
-                    .has_value());
+    ASSERT_TRUE(
+        UpsertStartWithGrantForTesting(*service, client_id, "action_key",
+                                       TenantId::Default(), 2048, enable_again)
+            .has_value());
     EXPECT_FALSE(GetSoftPinDeadline(*service, "action_key").has_value());
     const auto before_enable_again = std::chrono::system_clock::now();
-    ASSERT_TRUE(service
-                    ->UpsertEnd(client_id, "action_key", TenantId::Default(),
-                                ReplicaType::MEMORY)
+    ASSERT_TRUE(UpsertEndWithGrantForTesting(*service, client_id, "action_key",
+                                             TenantId::Default(),
+                                             ReplicaType::MEMORY)
                     .has_value());
     const auto enabled_again_deadline =
         GetSoftPinDeadline(*service, "action_key");
@@ -3691,14 +3771,14 @@ TEST_F(MasterServiceTest, SoftPinTtlUpdateInvalidatesOldHeapEntry) {
     ASSERT_TRUE(first_deadline.has_value());
 
     enable.soft_pin_ttl_ms = 20000;
-    ASSERT_TRUE(service
-                    ->UpsertStart(client_id, "ttl_update_key",
-                                  TenantId::Default(), 1024, enable)
-                    .has_value());
-    ASSERT_TRUE(service
-                    ->UpsertEnd(client_id, "ttl_update_key",
-                                TenantId::Default(), ReplicaType::MEMORY)
-                    .has_value());
+    ASSERT_TRUE(
+        UpsertStartWithGrantForTesting(*service, client_id, "ttl_update_key",
+                                       TenantId::Default(), 1024, enable)
+            .has_value());
+    ASSERT_TRUE(
+        UpsertEndWithGrantForTesting(*service, client_id, "ttl_update_key",
+                                     TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
     const auto updated_deadline =
         GetSoftPinDeadline(*service, "ttl_update_key");
     ASSERT_TRUE(updated_deadline.has_value());
@@ -3735,10 +3815,10 @@ TEST_F(MasterServiceTest,
     SetSoftPinDeadlineForTest(*service, "resize_pending", inherited_deadline);
 
     ReplicateConfig preserve;
-    ASSERT_TRUE(service
-                    ->UpsertStart(client_id, "resize_pending",
-                                  TenantId::Default(), 2048, preserve)
-                    .has_value());
+    ASSERT_TRUE(
+        UpsertStartWithGrantForTesting(*service, client_id, "resize_pending",
+                                       TenantId::Default(), 2048, preserve)
+            .has_value());
     EXPECT_EQ(GetSoftPinDeadline(*service, "resize_pending"),
               inherited_deadline);
     EXPECT_EQ(SoftPinRegistrationCount(*service), 1u);
@@ -3748,10 +3828,10 @@ TEST_F(MasterServiceTest,
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
               baseline);
 
-    ASSERT_TRUE(service
-                    ->UpsertEnd(client_id, "resize_pending",
-                                TenantId::Default(), ReplicaType::MEMORY)
-                    .has_value());
+    ASSERT_TRUE(
+        UpsertEndWithGrantForTesting(*service, client_id, "resize_pending",
+                                     TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
     EXPECT_FALSE(GetSoftPinDeadline(*service, "resize_pending").has_value());
     EXPECT_EQ(SoftPinRegistrationCount(*service), 0u);
 }
@@ -3790,43 +3870,41 @@ TEST_F(MasterServiceTest,
     enable.soft_pin_ttl_ms = 10000;
     ReplicateConfig preserve;
 
-    ASSERT_TRUE(
-        service
-            ->PutStart(client_a, "preempted", TenantId::Default(), 1024, enable)
-            .has_value());
-    ASSERT_TRUE(service
-                    ->PutEnd(client_a, "preempted", TenantId::Default(),
-                             ReplicaType::MEMORY)
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service, client_a, "preempted",
+                                            TenantId::Default(), 1024, enable)
+                    .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service, client_a, "preempted",
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
                     .has_value());
     SetSoftPinDeadlineForTest(
         *service, "preempted",
         std::chrono::system_clock::now() - std::chrono::seconds(1));
-    ASSERT_TRUE(service
-                    ->UpsertStart(client_a, "preempted", TenantId::Default(),
-                                  1024, preserve)
+    ASSERT_TRUE(UpsertStartWithGrantForTesting(*service, client_a, "preempted",
+                                               TenantId::Default(), 1024,
+                                               preserve)
                     .has_value());
-    ASSERT_TRUE(service
-                    ->UpsertStart(client_b, "preempted", TenantId::Default(),
-                                  1024, preserve)
+    ASSERT_TRUE(UpsertStartWithGrantForTesting(*service, client_b, "preempted",
+                                               TenantId::Default(), 1024,
+                                               preserve)
                     .has_value());
     EXPECT_FALSE(GetSoftPinDeadline(*service, "preempted").has_value());
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
               baseline);
 
-    ASSERT_TRUE(
-        service
-            ->PutStart(client_a, "resized", TenantId::Default(), 1024, enable)
-            .has_value());
-    ASSERT_TRUE(service
-                    ->PutEnd(client_a, "resized", TenantId::Default(),
-                             ReplicaType::MEMORY)
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service, client_a, "resized",
+                                            TenantId::Default(), 1024, enable)
+                    .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service, client_a, "resized",
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
                     .has_value());
     SetSoftPinDeadlineForTest(
         *service, "resized",
         std::chrono::system_clock::now() - std::chrono::seconds(1));
-    ASSERT_TRUE(service
-                    ->UpsertStart(client_a, "resized", TenantId::Default(),
-                                  2048, preserve)
+    ASSERT_TRUE(UpsertStartWithGrantForTesting(*service, client_a, "resized",
+                                               TenantId::Default(), 2048,
+                                               preserve)
                     .has_value());
     EXPECT_FALSE(GetSoftPinDeadline(*service, "resized").has_value());
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
@@ -3841,20 +3919,19 @@ TEST_F(MasterServiceTest, RepeatedPutEndDoesNotRefreshSoftPin) {
     ReplicateConfig config;
     config.soft_pin_action = SoftPinAction::ENABLE;
     config.soft_pin_ttl_ms = 5000;
-    ASSERT_TRUE(service
-                    ->PutStart(client_id, "repeat_end", TenantId::Default(),
-                               1024, config)
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service, client_id, "repeat_end",
+                                            TenantId::Default(), 1024, config)
                     .has_value());
-    ASSERT_TRUE(service
-                    ->PutEnd(client_id, "repeat_end", TenantId::Default(),
-                             ReplicaType::MEMORY)
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service, client_id, "repeat_end",
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
                     .has_value());
     const auto first_deadline = GetSoftPinDeadline(*service, "repeat_end");
     ASSERT_TRUE(first_deadline.has_value());
 
-    ASSERT_TRUE(service
-                    ->PutEnd(client_id, "repeat_end", TenantId::Default(),
-                             ReplicaType::MEMORY)
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service, client_id, "repeat_end",
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
                     .has_value());
     EXPECT_EQ(GetSoftPinDeadline(*service, "repeat_end"), first_deadline);
 }
@@ -3879,15 +3956,15 @@ TEST_F(MasterServiceTest, SoftPinExpiresAndGetDoesNotReactivate) {
         MasterMetricManager::instance().get_soft_pin_key_count();
     ReplicateConfig config;
     config.soft_pin_action = SoftPinAction::ENABLE;
-    ASSERT_TRUE(service_
-                    ->PutStart(client_id, "pin_key", TenantId::Default(),
-                               value_size, config)
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service_, client_id, "pin_key",
+                                            TenantId::Default(), value_size,
+                                            config)
                     .has_value());
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
               baseline);
-    ASSERT_TRUE(service_
-                    ->PutEnd(client_id, "pin_key", TenantId::Default(),
-                             ReplicaType::MEMORY)
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service_, client_id, "pin_key",
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
                     .has_value());
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
               baseline + 1);
@@ -3938,8 +4015,8 @@ TEST_F(MasterServiceTest, ExistKeyLeasesPinSegmentButProbeKeyDoesNot) {
 
         ReplicateConfig trigger_config;
         trigger_config.replica_num = 1;
-        auto trigger_result = service_->PutStart(
-            client_id, "trigger_exist_eviction", TenantId::Default(),
+        auto trigger_result = PutStartWithGrantForTesting(
+            *service_, client_id, "trigger_exist_eviction", TenantId::Default(),
             kObjectSize, trigger_config);
         ASSERT_FALSE(trigger_result.has_value());
         EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger_result.error());
@@ -3974,8 +4051,9 @@ TEST_F(MasterServiceTest, ExistKeyLeasesPinSegmentButProbeKeyDoesNot) {
         trigger_config.replica_num = 1;
         bool allocated = false;
         for (int i = 0; i < 40 && !allocated; ++i) {
-            auto trigger_result = service_->PutStart(
-                client_id, "trigger_probe_eviction_" + std::to_string(i),
+            auto trigger_result = PutStartWithGrantForTesting(
+                *service_, client_id,
+                "trigger_probe_eviction_" + std::to_string(i),
                 TenantId::Default(), kObjectSize, trigger_config);
             allocated = trigger_result.has_value();
             if (!allocated) {
@@ -4031,28 +4109,29 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
 
     std::vector<std::string> tenant_keys = {tenant_key_a, tenant_key_b};
     std::vector<uint64_t> tenant_sizes = {1024, 2048};
-    auto tenant_put_start = service_.BatchPutStart(
-        client_id, tenant_keys, tenant_sizes, config, tenant_id.value());
+    auto tenant_put_start = BatchPutStartWithGrantForTesting(
+        service_, client_id, tenant_keys, tenant_sizes, config,
+        tenant_id.value());
     ASSERT_EQ(tenant_put_start.size(), tenant_keys.size());
     for (const auto& result : tenant_put_start) {
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
-    auto tenant_put_end =
-        service_.BatchPutEnd(client_id, MakeObjectMetas(tenant_keys),
-                             ReplicaType::MEMORY, tenant_id.value());
+    auto tenant_put_end = BatchPutEndWithGrantForTesting(
+        service_, client_id, MakeObjectMetas(tenant_keys), ReplicaType::MEMORY,
+        tenant_id.value());
     ASSERT_EQ(tenant_put_end.size(), tenant_keys.size());
     for (const auto& result : tenant_put_end) {
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
 
-    auto default_put_start =
-        service_.PutStart(client_id, default_only_key, 1024, config);
+    auto default_put_start = PutStartWithGrantForTesting(
+        service_, client_id, default_only_key, 1024, config);
     ASSERT_TRUE(default_put_start.has_value());
-    ASSERT_TRUE(service_
-                    .PutEnd(client_id,
-                            ObjectMeta{default_only_key, std::nullopt},
-                            ReplicaType::MEMORY)
-                    .has_value());
+    ASSERT_TRUE(
+        PutEndWithGrantForTesting(service_, client_id,
+                                  ObjectMeta{default_only_key, std::nullopt},
+                                  ReplicaType::MEMORY)
+            .has_value());
 
     auto& metrics = MasterMetricManager::instance();
     const auto base_requests = metrics.get_batch_exist_key_requests();
@@ -4085,14 +4164,14 @@ TEST_F(MasterServiceTest, WrappedWriteBoundaryRejectsInvalidTenantIds) {
     config.replica_num = 1;
     const UUID client_id = generate_uuid();
 
-    auto empty =
-        service.PutStart(client_id, "empty-tenant-key", 1024, config, "");
+    auto empty = PutStartWithGrantForTesting(
+        service, client_id, "empty-tenant-key", 1024, config, "");
     ASSERT_FALSE(empty.has_value());
     EXPECT_EQ(empty.error(), ErrorCode::TENANT_NOT_REGISTERED);
 
     const std::string control_tenant("tenant\0bad", 10);
-    auto invalid = service.PutStart(client_id, "invalid-tenant-key", 1024,
-                                    config, control_tenant);
+    auto invalid = PutStartWithGrantForTesting(
+        service, client_id, "invalid-tenant-key", 1024, config, control_tenant);
     ASSERT_FALSE(invalid.has_value());
     EXPECT_EQ(invalid.error(), ErrorCode::TENANT_NOT_REGISTERED);
 }
@@ -4182,8 +4261,8 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     config.replica_num = kReplicaCnt;
 
     // Put key_1, should success.
-    auto put_start_result = service_->PutStart(
-        client_id, key_1, TenantId::Default(), slice_length, config);
+    auto put_start_result = PutStartWithGrantForTesting(
+        *service_, client_id, key_1, TenantId::Default(), slice_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
@@ -4192,8 +4271,8 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     }
 
     // Put key_1 again, should fail because the key exists.
-    put_start_result = service_->PutStart(client_id, key_1, TenantId::Default(),
-                                          slice_length, config);
+    put_start_result = PutStartWithGrantForTesting(
+        *service_, client_id, key_1, TenantId::Default(), slice_length, config);
     EXPECT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
 
@@ -4208,8 +4287,8 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
 
     // Put key_1 again, should success because the old one has expired and will
     // be discarded by this put.
-    put_start_result = service_->PutStart(client_id, key_1, TenantId::Default(),
-                                          slice_length, config);
+    put_start_result = PutStartWithGrantForTesting(
+        *service_, client_id, key_1, TenantId::Default(), slice_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
@@ -4218,8 +4297,8 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     }
 
     // Complete key_1.
-    auto put_end_result = service_->PutEnd(
-        client_id, key_1, TenantId::Default(), ReplicaType::MEMORY);
+    auto put_end_result = PutEndWithGrantForTesting(
+        *service_, client_id, key_1, TenantId::Default(), ReplicaType::MEMORY);
     EXPECT_TRUE(put_end_result.has_value());
 
     // Protect key_1 from eviction.
@@ -4228,8 +4307,8 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
 
     // Put key_2, should fail because the key_1 occupied 12MB (6MB processing,
     // 6MB discarded but not yet released) on each segment.
-    put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
-                                          slice_length, config);
+    put_start_result = PutStartWithGrantForTesting(
+        *service_, client_id, key_2, TenantId::Default(), slice_length, config);
     EXPECT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
@@ -4249,8 +4328,8 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
 
     // Put key_2 again, should success because the discarded replica has been
     // released.
-    put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
-                                          slice_length, config);
+    put_start_result = PutStartWithGrantForTesting(
+        *service_, client_id, key_2, TenantId::Default(), slice_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
@@ -4278,8 +4357,8 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // that never comes.
     const int64_t eviction_attempts_before =
         MasterMetricManager::instance().get_mem_eviction_attempts();
-    put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
-                                          slice_length, config);
+    put_start_result = PutStartWithGrantForTesting(
+        *service_, client_id, key_2, TenantId::Default(), slice_length, config);
     EXPECT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
@@ -4294,8 +4373,8 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
         return MasterMetricManager::instance().get_mem_eviction_attempts() >
                eviction_attempts_before;
     });
-    put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
-                                          slice_length, config);
+    put_start_result = PutStartWithGrantForTesting(
+        *service_, client_id, key_2, TenantId::Default(), slice_length, config);
     ASSERT_TRUE(put_start_result.has_value())
         << toString(put_start_result.error());
     replica_list = put_start_result.value();
@@ -4305,8 +4384,8 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     }
 
     // Complete key_2.
-    put_end_result = service_->PutEnd(client_id, key_2, TenantId::Default(),
-                                      ReplicaType::MEMORY);
+    put_end_result = PutEndWithGrantForTesting(
+        *service_, client_id, key_2, TenantId::Default(), ReplicaType::MEMORY);
     EXPECT_TRUE(put_end_result.has_value());
 }
 
@@ -4326,13 +4405,13 @@ TEST_F(MasterServiceTest, TenantTasksCarryTenantInPayload) {
     config.replica_num = 1;
     config.preferred_segment = "segment_0";
 
-    ASSERT_TRUE(service
-                    ->PutStart(put_client_id, key, tenant_id,
-                               /*slice_length=*/1024, config)
+    ASSERT_TRUE(PutStartWithGrantForTesting(*service, put_client_id, key,
+                                            tenant_id,
+                                            /*slice_length=*/1024, config)
                     .has_value());
-    ASSERT_TRUE(
-        service->PutEnd(put_client_id, key, tenant_id, ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(*service, put_client_id, key,
+                                          tenant_id, ReplicaType::MEMORY)
+                    .has_value());
 
     auto copy_task_id = service->CreateCopyTask(key, tenant_id, {"segment_1"});
     ASSERT_TRUE(copy_task_id.has_value());
@@ -4413,18 +4492,18 @@ TEST_F(MasterServiceTest,
     config.replica_num = 1;
     config.preferred_segment = "segment_0";
 
-    auto put_result =
-        service_->PutStart(ctx0.client_id, "drain_skip_allocation_key",
-                           TenantId::Default(), 1024, config);
+    auto put_result = PutStartWithGrantForTesting(
+        *service_, ctx0.client_id, "drain_skip_allocation_key",
+        TenantId::Default(), 1024, config);
     ASSERT_TRUE(put_result.has_value());
     ASSERT_EQ(put_result->size(), 1u);
     EXPECT_EQ(put_result->front()
                   .get_memory_descriptor()
                   .buffer_descriptor.transport_endpoint_,
               "segment_1");
-    ASSERT_TRUE(service_
-                    ->PutEnd(ctx0.client_id, "drain_skip_allocation_key",
-                             TenantId::Default(), ReplicaType::MEMORY)
+    ASSERT_TRUE(PutEndWithGrantForTesting(
+                    *service_, ctx0.client_id, "drain_skip_allocation_key",
+                    TenantId::Default(), ReplicaType::MEMORY)
                     .has_value());
 }
 
@@ -4500,15 +4579,15 @@ TEST_F(MasterServiceTest, FailedMoveKeepsTheSourceAndSerializesUpsert) {
     placement.replica_num = 1;
     placement.preferred_segment = "move_source";
 
-    auto upsert =
-        service->UpsertStart(source.client_id, key, tenant, 1024, placement);
+    auto upsert = UpsertStartWithGrantForTesting(*service, source.client_id,
+                                                 key, tenant, 1024, placement);
     ASSERT_TRUE(upsert);
     auto premature_move = service->MoveStart(source.client_id, key, tenant,
                                              "move_source", "move_target");
     ASSERT_FALSE(premature_move);
     EXPECT_EQ(premature_move.error(), ErrorCode::REPLICA_NOT_FOUND);
-    ASSERT_TRUE(
-        service->UpsertEnd(source.client_id, key, tenant, ReplicaType::MEMORY));
+    ASSERT_TRUE(UpsertEndWithGrantForTesting(*service, source.client_id, key,
+                                             tenant, ReplicaType::MEMORY));
 
     auto before = service->GetReplicaList(key, tenant);
     ASSERT_TRUE(before);
@@ -4519,8 +4598,8 @@ TEST_F(MasterServiceTest, FailedMoveKeepsTheSourceAndSerializesUpsert) {
     ASSERT_TRUE(move);
     ASSERT_TRUE(move->target);
 
-    auto concurrent_upsert =
-        service->UpsertStart(source.client_id, key, tenant, 1024, placement);
+    auto concurrent_upsert = UpsertStartWithGrantForTesting(
+        *service, source.client_id, key, tenant, 1024, placement);
     ASSERT_FALSE(concurrent_upsert);
     EXPECT_EQ(concurrent_upsert.error(),
               ErrorCode::OBJECT_HAS_REPLICATION_TASK);
@@ -5567,8 +5646,9 @@ TEST_F(MasterServiceTest, FailedRemountPreservesCommittedClientHostId) {
 
     ReplicateConfig config;
     config.replica_num = 1;
-    auto put = service.PutStart(local_owner, "local_after_failed_remount",
-                                TenantId::Default(), 1024, config);
+    auto put = PutStartWithGrantForTesting(service, local_owner,
+                                           "local_after_failed_remount",
+                                           TenantId::Default(), 1024, config);
     ASSERT_TRUE(put.has_value()) << toString(put.error());
     ASSERT_EQ(put->size(), 1u);
     const auto addr =
@@ -5596,8 +5676,8 @@ TEST_F(MasterServiceTest,
                            std::chrono::seconds::zero(), std::chrono::hours(1)),
         ClientLivenessTransition::BECAME_SUSPECTED);
 
-    auto upsert =
-        service.UpsertStart(client_id, key, TenantId::Default(), 1024, config);
+    auto upsert = UpsertStartWithGrantForTesting(
+        service, client_id, key, TenantId::Default(), 1024, config);
     ASSERT_FALSE(upsert.has_value());
     EXPECT_EQ(upsert.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 

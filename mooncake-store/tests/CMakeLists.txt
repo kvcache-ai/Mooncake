@@ -696,3 +696,6 @@ target_link_libraries(hf3fs_resource_manager_test PRIVATE gtest gtest_main
 add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)
 
 add_store_test(ssd_generation_codec_test ssd_generation_codec_test.cpp)
+add_store_test(ssd_generation_master_test ssd_generation_master_test.cpp)
+target_include_directories(ssd_generation_master_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

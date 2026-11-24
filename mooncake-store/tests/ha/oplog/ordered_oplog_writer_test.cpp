@@ -1874,17 +1874,41 @@ TEST_F(OrderedOpLogWriterAwaitTest, BlockingFinalizationIncludesCallbackDrain) {
         FAIL() << "callback did not start";
     }
     EXPECT_TRUE(writer_->WaitUntilDurable(pending->sequence_id(),
-                                          std::chrono::milliseconds(20)));
+                                          std::chrono::milliseconds(50)));
     auto blocked = writer_->WaitUntilFinalized(pending->sequence_id(),
-                                               std::chrono::milliseconds(20));
+                                               std::chrono::milliseconds(50));
     EXPECT_FALSE(blocked);
-    if (!blocked) EXPECT_EQ(blocked.error(), ErrorCode::PERSISTENT_FAIL);
+    if (!blocked) EXPECT_EQ(blocked.error(), ErrorCode::RPC_TIMEOUT);
     release.set_value();
     EXPECT_TRUE(writer_->WaitUntilFinalized(pending->sequence_id(),
                                             std::chrono::seconds(2)));
     writer_->Stop();
     EXPECT_TRUE(writer_->WaitUntilFinalized(pending->sequence_id(),
                                             std::chrono::milliseconds(0)));
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest,
+       BlockingFinalizationRejectsSelfDeadlockFromCallbackThread) {
+    CreateWriter();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation);
+    std::promise<ErrorCode> callback_wait_err;
+    auto err_future = callback_wait_err.get_future();
+    auto pending = writer_->Commit(
+        std::move(*reservation), MakeEntry("self-wait"),
+        [&](const OpLogEntry& entry) {
+            auto res = writer_->WaitUntilFinalized(
+                entry.sequence_id, std::chrono::milliseconds(0));
+            callback_wait_err.set_value(res ? ErrorCode::OK : res.error());
+        });
+    ASSERT_TRUE(pending);
+    writer_->Start();
+    ASSERT_EQ(err_future.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_EQ(err_future.get(), ErrorCode::INVALID_PARAMS);
+    EXPECT_TRUE(writer_->WaitUntilFinalized(pending->sequence_id(),
+                                            std::chrono::seconds(2)));
+    writer_->Stop();
 }
 
 TEST_F(OrderedOpLogWriterAwaitTest, BlockingBarriersWakeOnStopBeforeStart) {
@@ -1935,9 +1959,9 @@ TEST_F(OrderedOpLogWriterAwaitTest,
     auto& waiter = Await(rejected->sequence_id());
     ExpectResult(waiter, ErrorCode::ETCD_TRANSACTION_FAIL);
     auto pending = writer_->WaitUntilFinalized(durable->sequence_id(),
-                                               std::chrono::milliseconds(20));
+                                               std::chrono::milliseconds(50));
     ASSERT_FALSE(pending);
-    EXPECT_EQ(pending.error(), ErrorCode::PERSISTENT_FAIL);
+    EXPECT_EQ(pending.error(), ErrorCode::RPC_TIMEOUT);
     ReleaseCallback();
     EXPECT_TRUE(writer_->WaitUntilFinalized(durable->sequence_id(),
                                             std::chrono::seconds(2)));

@@ -1,5 +1,11 @@
 #pragma once
 
+#include <algorithm>
+#include <cstdlib>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <vector>
 #include <string>
 #include <ylt/util/tl/expected.hpp>
 
@@ -11,7 +17,15 @@ namespace testing {
 
 // Tests historically constructed InProcMaster. The production implementation
 // now lives in EmbeddedMaster; keep the old name as an alias.
-using InProcMaster = EmbeddedMaster;
+class InProcMaster : public EmbeddedMaster {
+   public:
+    using EmbeddedMaster::Start;
+    bool Start(
+        InProcMasterConfig config,
+        const std::function<void(WrappedMasterServiceConfig&)>& customize) {
+        return StartImpl(std::move(config), customize);
+    }
+};
 
 // Helper: return all segments body or error
 inline tl::expected<std::string, int> GetAllSegments(const InProcMaster& m) {

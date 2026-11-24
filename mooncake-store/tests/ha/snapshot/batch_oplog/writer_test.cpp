@@ -747,9 +747,13 @@ TEST_F(BatchOpLogSnapshotWriterTest,
     ReplicateConfig replicate;
     replicate.residency_affinity_ids = std::vector<std::string>{"opaque-unit"};
     replicate.session_ids = std::vector<std::string>{"write-session"};
-    ASSERT_TRUE(primary.PutStart(client_id, key, tenant, 1024, replicate));
-    ASSERT_TRUE(primary.PutEnd(client_id, ObjectMeta{key, 0x1234}, tenant,
-                               ReplicaType::MEMORY));
+    auto put_start = primary.PutStart(client_id, key, tenant, 1024, replicate);
+    ASSERT_TRUE(put_start);
+    auto write_generation = GetPrimaryWriteGeneration(*put_start);
+    ASSERT_TRUE(write_generation);
+    ASSERT_TRUE(primary.PutEnd(client_id,
+                               ObjectMeta{key, 0x1234, *write_generation},
+                               tenant, ReplicaType::MEMORY));
     auto promise = std::make_shared<std::promise<ErrorCode>>();
     auto future = promise->get_future();
     MasterServiceTestPeer::OrderedOplogWriter(primary)
@@ -969,8 +973,11 @@ TEST_F(BatchOpLogSnapshotWriterTest,
         std::vector<std::string>{importing->manifest.payload_group_id};
     config.residency_affinity_ids =
         std::vector<std::string>{"inflight-import-affinity"};
-    ASSERT_TRUE(primary.PutStart(client, "inflight-import-payload",
-                                 TenantId::Default(), 1024, config));
+    auto inflight_start = primary.PutStart(client, "inflight-import-payload",
+                                           TenantId::Default(), 1024, config);
+    ASSERT_TRUE(inflight_start);
+    auto inflight_generation = GetPrimaryWriteGeneration(*inflight_start);
+    ASSERT_TRUE(inflight_generation);
     const auto now_ms = [] {
         return static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -986,7 +993,9 @@ TEST_F(BatchOpLogSnapshotWriterTest,
         ~ReleaseGate() { gate.Release(); }
     } release{*gate};
     ending = std::async(std::launch::async, [&] {
-        return primary.PutEnd(client, "inflight-import-payload",
+        return primary.PutEnd(client,
+                              ObjectMeta{"inflight-import-payload",
+                                         std::nullopt, *inflight_generation},
                               TenantId::Default(), ReplicaType::MEMORY);
     });
     ASSERT_TRUE(gate->WaitUntilEntered());
@@ -1083,11 +1092,15 @@ TEST_F(BatchOpLogSnapshotWriterTest,
         } else {
             replicate.residency_affinity_ids.reset();
         }
-        ASSERT_TRUE(primary.PutStart(client_id, key, TenantId::Default(),
-                                     key == payload_key ? 1024 : 128,
-                                     replicate));
-        ASSERT_TRUE(primary.PutEnd(client_id, key, TenantId::Default(),
-                                   ReplicaType::MEMORY));
+        auto put_start =
+            primary.PutStart(client_id, key, TenantId::Default(),
+                             key == payload_key ? 1024 : 128, replicate);
+        ASSERT_TRUE(put_start);
+        auto write_generation = GetPrimaryWriteGeneration(*put_start);
+        ASSERT_TRUE(write_generation);
+        ASSERT_TRUE(primary.PutEnd(
+            client_id, ObjectMeta{key, std::nullopt, *write_generation},
+            TenantId::Default(), ReplicaType::MEMORY));
         ASSERT_TRUE(wait_durable(put_sequence++));
     }
     const auto ready = primary.CommitWeightImport({

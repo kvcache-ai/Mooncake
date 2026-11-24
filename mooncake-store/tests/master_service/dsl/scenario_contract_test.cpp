@@ -250,6 +250,18 @@ TEST(MasterScenarioContractTest, ReportsWrongUpsertEndErrorCode) {
         "UpsertEnd(missing) failed with OBJECT_NOT_FOUND; expected "
         "ILLEGAL_CLIENT");
 }
+TEST(MasterScenarioContractTest, AdmissionHistoryIsScopedByActorTenantAndKey) {
+    MasterScenario("primary authority is actor, tenant and key scoped")
+        .Given(MemoryNode("memory"))
+        .When(PutStart("key", 1_KB).By("writer"))
+        .When(PutEnd("key").By("other").FromStart(0).ExpectError(
+            ErrorCode::ILLEGAL_CLIENT))
+        .When(PutEnd("key").By("writer").FromStart(99).ExpectError(
+            ErrorCode::INVALID_WRITE))
+        .Then(Object("key").IsNotReady())
+        .When(PutEnd("key").By("writer").FromStart(0))
+        .Then(Object("key").IsReadable());
+}
 
 TEST(MasterScenarioContractTest, ReportsWrongUpsertRevokeErrorCode) {
     EXPECT_NONFATAL_FAILURE(

@@ -16,6 +16,12 @@
 namespace mooncake {
 
 bool EmbeddedMaster::Start(InProcMasterConfig config) {
+    return StartImpl(std::move(config), {});
+}
+
+bool EmbeddedMaster::StartImpl(
+    InProcMasterConfig config,
+    const std::function<void(WrappedMasterServiceConfig&)>& customize) {
     if (server_) {
         LOG(ERROR) << "Embedded master is already running on port "
                    << rpc_port_;
@@ -132,6 +138,7 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
             }
         }
 
+        if (customize) customize(wms_cfg);
         wrapped_ = std::make_shared<WrappedMasterService>(wms_cfg);
         admin_server_->SetRuntimeState(ha::MasterRuntimeState::kServing);
         admin_server_->SetServiceDelegate(wrapped_);

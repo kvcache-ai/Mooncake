@@ -5,6 +5,7 @@
 // MasterService unchanged; each record is small state, not a container.
 
 #include <chrono>
+#include <map>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -49,6 +50,10 @@ struct OffloadingTask {
     // offload is pushed once per completed MEMORY replica and those
     // replicas may live on different clients.
     std::vector<UUID> mirror_clients;
+    std::string object_generation;
+    std::string task_id;
+    // One reference per delivered Owner, even if two Owners share a source.
+    std::map<UUID, ReplicaID> owner_sources;
 };
 
 // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
@@ -125,6 +130,7 @@ struct PromotionTask {
     // SSD prefetch admission. NotifyPromotionSuccess grants a read lease
     // so the promoted replica survives until the follow-up get.
     bool from_prefetch{false};
+    std::string task_id;
 };
 
 }  // namespace mooncake

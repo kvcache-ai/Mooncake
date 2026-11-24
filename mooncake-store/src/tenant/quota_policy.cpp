@@ -152,9 +152,10 @@ uint64_t TenantQuotaPolicy::MemoryCharge(const ObjectMetadata& metadata) {
     const unsigned __int128 charge =
         static_cast<unsigned __int128>(metadata.TotalLength()) *
         holding_replicas;
-    return charge > TenantQuotaAccount::kMaxChargedBytes
-               ? TenantQuotaAccount::kMaxChargedBytes
-               : static_cast<uint64_t>(charge);
+    return SaturatingAdd(metadata.ha_invalidation_memory_charge,
+                         charge > TenantQuotaAccount::kMaxChargedBytes
+                             ? TenantQuotaAccount::kMaxChargedBytes
+                             : static_cast<uint64_t>(charge));
 }
 
 TenantQuotaAccount& TenantQuotaPolicy::AccountOf(const PolicyContext& ctx) {

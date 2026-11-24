@@ -91,7 +91,8 @@ class LocalSsdManager {
                                 std::string_view key);
     bool CancelOffloadsIfAllPending(const std::vector<UUID>& client_ids,
                                     const TenantId& tenant_id,
-                                    std::string_view key);
+                                    std::string_view key,
+                                    std::string_view expected_task_id = {});
 
     ErrorCode EnqueuePromotion(const UUID& client_id, PromotionTaskItem task);
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode> TakePromotions(

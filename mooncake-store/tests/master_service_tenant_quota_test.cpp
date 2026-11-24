@@ -1,3 +1,5 @@
+#include "master_service/primary_write_grants_for_testing.h"
+#include "offload_storage_key.h"
 #include "master_service.h"
 #include "master_service/master_service_test_peer.h"
 
@@ -210,12 +212,34 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     void PutComplete(MasterService& service, const UUID& client_id,
                      const std::string& key, const TenantId& tenant_id,
                      uint64_t size) {
-        auto start =
-            service.PutStart(client_id, key, tenant_id, size, MemoryConfig());
+        auto start = PutStartWithGrantForTesting(
+            service, client_id, key, tenant_id, size, MemoryConfig());
         ASSERT_TRUE(start.has_value()) << toString(start.error());
-        auto end =
-            service.PutEnd(client_id, key, tenant_id, ReplicaType::MEMORY);
+        auto end = PutEndWithGrantForTesting(service, client_id, key, tenant_id,
+                                             ReplicaType::MEMORY);
         ASSERT_TRUE(end.has_value()) << toString(end.error());
+    }
+
+    std::vector<OffloadTaskItem> DeliverOffload(MasterService& service,
+                                                const UUID& owner) {
+        auto tasks = service.OffloadObjectHeartbeat(owner, true);
+        EXPECT_TRUE(tasks);
+        return tasks ? std::move(*tasks) : std::vector<OffloadTaskItem>{};
+    }
+
+    void SeedDiskOnly(MasterService& service, const UUID& owner,
+                      const std::string& key, const TenantId& tenant) {
+        ASSERT_TRUE(service.MountLocalDiskSegment(owner, true));
+        PutComplete(service, owner, key, tenant, 128);
+        auto tasks = DeliverOffload(service, owner);
+        ASSERT_EQ(tasks.size(), 1u);
+        ASSERT_TRUE(service.NotifyOffloadSuccess(
+            owner, tasks,
+            {StorageObjectMetadata{0, 0, 0, 128, "disk-endpoint"}}));
+        auto cleared = service.BatchReplicaClear({key}, owner, "quota_segment",
+                                                 tenant.value());
+        ASSERT_TRUE(cleared);
+        ASSERT_EQ(cleared->size(), 1u);
     }
 
     // MasterService befriends this fixture, but TEST_F bodies are a derived
@@ -328,6 +352,16 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
                                  const TenantId& tenant_id, uint64_t size) {
         Replica disk_replica(client_id, size, "disk-endpoint",
                              ReplicaStatus::COMPLETE);
+        {
+            MasterServiceTestPeer::MetadataAccessorRO held(
+                &service,
+                MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+            ASSERT_TRUE(held.Exists());
+            disk_replica.update_local_disk_descriptor(
+                size, "disk-endpoint",
+                MakeOffloadStorageKey(key, held.Get().object_generation),
+                held.Get().object_generation);
+        }
         auto result =
             service.AddReplica(client_id, key, tenant_id, disk_replica);
         ASSERT_TRUE(result.has_value()) << toString(result.error());
@@ -412,8 +446,9 @@ TEST_F(MasterServiceTenantQuotaTest,
     PutComplete(service, client_id, "shared-key", TenantId("tenant-a"), 800);
 
     EXPECT_TRUE(service.ExistKey("shared-key", TenantId("tenant-b")).value());
-    auto duplicate = service.PutStart(client_id, "shared-key",
-                                      TenantId("tenant-b"), 1, MemoryConfig());
+    auto duplicate =
+        PutStartWithGrantForTesting(service, client_id, "shared-key",
+                                    TenantId("tenant-b"), 1, MemoryConfig());
     ASSERT_FALSE(duplicate.has_value());
     EXPECT_EQ(duplicate.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
     EXPECT_TRUE(service
@@ -429,12 +464,14 @@ TEST_F(MasterServiceTenantQuotaTest,
     MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
     UUID client_id = MountSegment(service);
 
-    auto missing = service.PutStart(client_id, "missing", TenantId("tenant-b"),
-                                    10, MemoryConfig());
+    auto missing =
+        PutStartWithGrantForTesting(service, client_id, "missing",
+                                    TenantId("tenant-b"), 10, MemoryConfig());
     ASSERT_FALSE(missing.has_value());
     EXPECT_EQ(missing.error(), ErrorCode::TENANT_NOT_REGISTERED);
-    auto missing_upsert = service.UpsertStart(
-        client_id, "missing", TenantId("tenant-b"), 10, MemoryConfig());
+    auto missing_upsert = UpsertStartWithGrantForTesting(
+        service, client_id, "missing", TenantId("tenant-b"), 10,
+        MemoryConfig());
     ASSERT_FALSE(missing_upsert.has_value());
     EXPECT_EQ(missing_upsert.error(), ErrorCode::TENANT_NOT_REGISTERED);
     // A refused write leaves no namespace behind, which would stay for good.
@@ -442,8 +479,9 @@ TEST_F(MasterServiceTenantQuotaTest,
         MasterServiceTestPeer::Namespaces(service).Lookup(TenantId("tenant-b")),
         nullptr);
 
-    auto implicit_default = service.PutStart(
-        client_id, "default-key", TenantId::Default(), 10, MemoryConfig());
+    auto implicit_default =
+        PutStartWithGrantForTesting(service, client_id, "default-key",
+                                    TenantId::Default(), 10, MemoryConfig());
     ASSERT_FALSE(implicit_default.has_value());
     EXPECT_EQ(implicit_default.error(), ErrorCode::TENANT_NOT_REGISTERED);
 
@@ -461,7 +499,7 @@ TEST_F(MasterServiceTenantQuotaTest,
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
-       MultiTenantModeRejectsUnregisteredOffloadSuccess) {
+       MultiTenantModeIgnoresUnregisteredOffloadSuccess) {
     MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
     UUID client_id = MountSegment(service);
 
@@ -473,8 +511,7 @@ TEST_F(MasterServiceTenantQuotaTest,
 
     auto result = service.NotifyOffloadSuccess(client_id, tasks, {metadata});
 
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::TENANT_NOT_REGISTERED);
+    ASSERT_TRUE(result.has_value());
     auto missing = service.ExistKey("ghost", TenantId("tenant-b"));
     ASSERT_TRUE(missing.has_value()) << toString(missing.error());
     EXPECT_FALSE(missing.value());
@@ -482,18 +519,13 @@ TEST_F(MasterServiceTenantQuotaTest,
 
 TEST_F(MasterServiceTenantQuotaTest,
        MultiTenantModeAllowsRegisteredOffloadSuccess) {
-    MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
+    auto config = MakeConfig({{TenantId("tenant-a"), 1000}});
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 0;
+    MasterService service(config);
     UUID client_id = MountSegment(service);
+    SeedDiskOnly(service, client_id, "cold", TenantId("tenant-a"));
 
-    StorageObjectMetadata metadata;
-    metadata.data_size = 128;
-    metadata.transport_endpoint = "disk-endpoint";
-    std::vector<OffloadTaskItem> tasks{
-        OffloadTaskItem{.tenant_id = "tenant-a", .key = "cold", .size = 128}};
-
-    auto result = service.NotifyOffloadSuccess(client_id, tasks, {metadata});
-
-    ASSERT_TRUE(result.has_value()) << toString(result.error());
     auto exists = service.ExistKey("cold", TenantId("tenant-a"));
     ASSERT_TRUE(exists.has_value()) << toString(exists.error());
     EXPECT_TRUE(exists.value());
@@ -506,19 +538,15 @@ TEST_F(MasterServiceTenantQuotaTest,
         {{TenantId("tenant-a"), 1000}, {TenantId("tenant-b"), 1000}});
     auto config = MasterServiceConfig::builder()
                       .set_enable_multi_tenants(true)
+                      .set_enable_offload(true)
+                      .set_default_kv_lease_ttl(0)
                       .set_tenant_quota_connector_type("file")
                       .set_tenant_quota_connector_uri(initial_policy)
                       .build();
     MasterService service(config);
     UUID client_id = MountSegment(service);
 
-    StorageObjectMetadata metadata;
-    metadata.data_size = 128;
-    metadata.transport_endpoint = "disk-endpoint";
-    std::vector<OffloadTaskItem> tasks{
-        OffloadTaskItem{.tenant_id = "tenant-b", .key = "cold", .size = 128}};
-    ASSERT_TRUE(
-        service.NotifyOffloadSuccess(client_id, tasks, {metadata}).has_value());
+    SeedDiskOnly(service, client_id, "cold", TenantId("tenant-b"));
 
     {
         std::ofstream out(initial_policy);
@@ -553,6 +581,8 @@ TEST_F(MasterServiceTenantQuotaTest,
     UUID client_id = MountSegment(service);
     ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true).has_value());
     PutComplete(service, client_id, "warming", TenantId("tenant-b"), 128);
+    auto tasks = DeliverOffload(service, client_id);
+    ASSERT_EQ(tasks.size(), 1u);
 
     {
         std::ofstream out(initial_policy);
@@ -569,8 +599,6 @@ TEST_F(MasterServiceTenantQuotaTest,
     StorageObjectMetadata metadata;
     metadata.data_size = 128;
     metadata.transport_endpoint = "disk-endpoint";
-    std::vector<OffloadTaskItem> tasks{OffloadTaskItem{
-        .tenant_id = "tenant-b", .key = "warming", .size = 128}};
 
     auto result = service.NotifyOffloadSuccess(client_id, tasks, {metadata});
 
@@ -585,7 +613,7 @@ TEST_F(MasterServiceTenantQuotaTest,
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
-       NotifyOffloadSuccessRejectsOrphanObjectWithoutOffloadTask) {
+       NotifyOffloadSuccessIgnoresOrphanObjectWithoutOffloadTask) {
     const std::string initial_policy = WritePolicyFile(
         {{TenantId("tenant-a"), 1000}, {TenantId("tenant-b"), 1000}});
     auto config = MasterServiceConfig::builder()
@@ -614,12 +642,16 @@ TEST_F(MasterServiceTenantQuotaTest,
 
     auto result = service.NotifyOffloadSuccess(client_id, tasks, {metadata});
 
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::TENANT_NOT_REGISTERED);
+    ASSERT_TRUE(result.has_value());
+    auto query = service.GetReplicaList("warming", TenantId("tenant-b"));
+    ASSERT_TRUE(query);
+    EXPECT_TRUE(std::none_of(
+        query->replicas.begin(), query->replicas.end(),
+        [](const auto& replica) { return replica.is_local_disk_replica(); }));
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
-       NotifyOffloadSuccessDoesNotCountAddReplicaUpdateAsNewDiskUsage) {
+       NotifyOffloadSuccessIgnoresForeignTaskWithoutChargingDiskUsage) {
     const std::string policy = WritePolicyFile({{TenantId("tenant-a"), 1000}});
     auto config = MasterServiceConfig::builder()
                       .set_enable_multi_tenants(true)
@@ -633,11 +665,18 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_TRUE(service.MountLocalDiskSegment(client_a, true).has_value());
     ASSERT_TRUE(service.MountLocalDiskSegment(client_b, true).has_value());
 
+    auto replication = MemoryConfig();
+    replication.preferred_segment = "quota_segment_a";
+    ASSERT_TRUE(PutStartWithGrantForTesting(
+        service, client_a, "cold", TenantId("tenant-a"), 128, replication));
+    ASSERT_TRUE(PutEndWithGrantForTesting(
+        service, client_a, "cold", TenantId("tenant-a"), ReplicaType::MEMORY));
+    auto tasks = DeliverOffload(service, client_a);
+    ASSERT_FALSE(tasks.empty());
+
     StorageObjectMetadata first_metadata;
     first_metadata.data_size = 128;
     first_metadata.transport_endpoint = "disk-endpoint-a";
-    std::vector<OffloadTaskItem> tasks{
-        OffloadTaskItem{.tenant_id = "tenant-a", .key = "cold", .size = 128}};
     ASSERT_TRUE(service.NotifyOffloadSuccess(client_a, tasks, {first_metadata})
                     .has_value());
     EXPECT_EQ(LocalDiskUsedBytes(service, client_a), 128);
@@ -661,17 +700,17 @@ TEST_F(MasterServiceTenantQuotaTest,
 
     auto hard_pinned = MemoryConfig();
     hard_pinned.with_hard_pin = true;
-    auto first = service.PutStart(client_id, "key-a", TenantId("tenant-a"), 80,
-                                  hard_pinned);
+    auto first = PutStartWithGrantForTesting(
+        service, client_id, "key-a", TenantId("tenant-a"), 80, hard_pinned);
     ASSERT_TRUE(first.has_value()) << toString(first.error());
     EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 80);
-    ASSERT_TRUE(service
-                    .PutEnd(client_id, "key-a", TenantId("tenant-a"),
-                            ReplicaType::MEMORY)
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, client_id, "key-a",
+                                          TenantId("tenant-a"),
+                                          ReplicaType::MEMORY)
                     .has_value());
 
-    auto over = service.PutStart(client_id, "key-b", TenantId("tenant-a"), 30,
-                                 MemoryConfig());
+    auto over = PutStartWithGrantForTesting(
+        service, client_id, "key-b", TenantId("tenant-a"), 30, MemoryConfig());
 
     ASSERT_FALSE(over.has_value());
     EXPECT_EQ(over.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
@@ -685,19 +724,19 @@ TEST_F(MasterServiceTenantQuotaTest, PutRevokeRefundsStartCharge) {
     MasterService service(MakeConfig({{TenantId("tenant-a"), 100}}));
     UUID client_id = MountSegment(service);
 
-    auto start = service.PutStart(client_id, "key", TenantId("tenant-a"), 100,
-                                  MemoryConfig());
+    auto start = PutStartWithGrantForTesting(
+        service, client_id, "key", TenantId("tenant-a"), 100, MemoryConfig());
     ASSERT_TRUE(start.has_value()) << toString(start.error());
     EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 100);
 
-    auto over = service.PutStart(client_id, "other", TenantId("tenant-a"), 1,
-                                 MemoryConfig());
+    auto over = PutStartWithGrantForTesting(
+        service, client_id, "other", TenantId("tenant-a"), 1, MemoryConfig());
     ASSERT_FALSE(over.has_value());
     EXPECT_EQ(over.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
 
-    ASSERT_TRUE(service
-                    .PutRevoke(client_id, "key", TenantId("tenant-a"),
-                               ReplicaType::MEMORY)
+    ASSERT_TRUE(PutRevokeWithGrantForTesting(service, client_id, "key",
+                                             TenantId("tenant-a"),
+                                             ReplicaType::MEMORY)
                     .has_value());
     EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 0);
 }
@@ -709,13 +748,13 @@ TEST_F(MasterServiceTenantQuotaTest,
     UUID client_id = MountSegment(service);
     PutComplete(service, client_id, "key", tenant_id, 100);
 
-    auto upsert =
-        service.UpsertStart(client_id, "key", tenant_id, 200, MemoryConfig());
+    auto upsert = UpsertStartWithGrantForTesting(
+        service, client_id, "key", tenant_id, 200, MemoryConfig());
     ASSERT_TRUE(upsert.has_value()) << toString(upsert.error());
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 300);
 
-    auto end =
-        service.UpsertEnd(client_id, "key", tenant_id, ReplicaType::MEMORY);
+    auto end = UpsertEndWithGrantForTesting(service, client_id, "key",
+                                            tenant_id, ReplicaType::MEMORY);
     ASSERT_TRUE(end.has_value()) << toString(end.error());
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 200);
 }
@@ -735,13 +774,13 @@ TEST_F(MasterServiceTenantQuotaTest,
         service.NotifyOffloadSuccess(client_id, tasks, {metadata}).has_value());
     ASSERT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
 
-    auto upsert =
-        service.UpsertStart(client_id, "key", tenant_id, 200, MemoryConfig());
+    auto upsert = UpsertStartWithGrantForTesting(
+        service, client_id, "key", tenant_id, 200, MemoryConfig());
     ASSERT_TRUE(upsert.has_value()) << toString(upsert.error());
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 200);
 
-    auto end =
-        service.UpsertEnd(client_id, "key", tenant_id, ReplicaType::MEMORY);
+    auto end = UpsertEndWithGrantForTesting(service, client_id, "key",
+                                            tenant_id, ReplicaType::MEMORY);
     ASSERT_TRUE(end.has_value()) << toString(end.error());
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 200);
 }
@@ -753,13 +792,13 @@ TEST_F(MasterServiceTenantQuotaTest,
     UUID client_id = MountSegment(service);
     PutComplete(service, client_id, "key", tenant_id, 100);
 
-    auto upsert =
-        service.UpsertStart(client_id, "key", tenant_id, 200, MemoryConfig());
+    auto upsert = UpsertStartWithGrantForTesting(
+        service, client_id, "key", tenant_id, 200, MemoryConfig());
     ASSERT_TRUE(upsert.has_value()) << toString(upsert.error());
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 300);
 
-    auto revoke =
-        service.UpsertRevoke(client_id, "key", tenant_id, ReplicaType::MEMORY);
+    auto revoke = UpsertRevokeWithGrantForTesting(
+        service, client_id, "key", tenant_id, ReplicaType::MEMORY);
     ASSERT_TRUE(revoke.has_value()) << toString(revoke.error());
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
 }
@@ -770,8 +809,8 @@ TEST_F(MasterServiceTenantQuotaTest,
     MasterService service(MakeConfig({{tenant_id, 1000}}));
     UUID client_id = MountSegment(service);
 
-    auto start =
-        service.PutStart(client_id, "key", tenant_id, 100, MemoryConfig());
+    auto start = PutStartWithGrantForTesting(service, client_id, "key",
+                                             tenant_id, 100, MemoryConfig());
     ASSERT_TRUE(start.has_value()) << toString(start.error());
     AddCompletedDiskReplica(service, client_id, "key", tenant_id, 100);
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 100);
@@ -787,8 +826,8 @@ TEST_F(MasterServiceTenantQuotaTest,
     MasterService service(MakeConfig({{tenant_id, 1000}}));
     UUID client_id = MountSegment(service);
 
-    auto start =
-        service.PutStart(client_id, "key", tenant_id, 100, MemoryConfig());
+    auto start = PutStartWithGrantForTesting(service, client_id, "key",
+                                             tenant_id, 100, MemoryConfig());
     ASSERT_TRUE(start.has_value()) << toString(start.error());
     AddCompletedDiskReplica(service, client_id, "key", tenant_id, 100);
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 100);
@@ -805,14 +844,14 @@ TEST_F(MasterServiceTenantQuotaTest,
     UUID client_id = MountSegment(service);
     PutComplete(service, client_id, "key", tenant_id, 100);
 
-    auto upsert =
-        service.UpsertStart(client_id, "key", tenant_id, 200, MemoryConfig());
+    auto upsert = UpsertStartWithGrantForTesting(
+        service, client_id, "key", tenant_id, 200, MemoryConfig());
     ASSERT_TRUE(upsert.has_value()) << toString(upsert.error());
     AddCompletedDiskReplica(service, client_id, "key", tenant_id, 200);
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 300);
 
-    auto revoke =
-        service.UpsertRevoke(client_id, "key", tenant_id, ReplicaType::MEMORY);
+    auto revoke = UpsertRevokeWithGrantForTesting(
+        service, client_id, "key", tenant_id, ReplicaType::MEMORY);
 
     ASSERT_TRUE(revoke.has_value()) << toString(revoke.error());
     ExpectDiskOnlyObjectAndChargedBytes(service, tenant_id, "key", 0);
@@ -825,8 +864,8 @@ TEST_F(MasterServiceTenantQuotaTest,
     UUID client_id = MountSegment(service);
     PutComplete(service, client_id, "key", tenant_id, 100);
 
-    auto upsert =
-        service.UpsertStart(client_id, "key", tenant_id, 200, MemoryConfig());
+    auto upsert = UpsertStartWithGrantForTesting(
+        service, client_id, "key", tenant_id, 200, MemoryConfig());
     ASSERT_TRUE(upsert.has_value()) << toString(upsert.error());
     AddCompletedDiskReplica(service, client_id, "key", tenant_id, 200);
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 300);
@@ -843,13 +882,13 @@ TEST_F(MasterServiceTenantQuotaTest, CopyStartRequiresQuotaForNewReplica) {
 
     ReplicateConfig config = MemoryConfig();
     config.preferred_segment = "segment-a";
-    auto put_start =
-        service.PutStart(client_id, "key", TenantId("tenant-a"), 100, config);
+    auto put_start = PutStartWithGrantForTesting(
+        service, client_id, "key", TenantId("tenant-a"), 100, config);
     ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
-    ASSERT_TRUE(
-        service
-            .PutEnd(client_id, "key", TenantId("tenant-a"), ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, client_id, "key",
+                                          TenantId("tenant-a"),
+                                          ReplicaType::MEMORY)
+                    .has_value());
 
     auto copy = service.CopyStart(client_id, "key", TenantId("tenant-a"),
                                   "segment-a", {"segment-b"});
@@ -867,13 +906,13 @@ TEST_F(MasterServiceTenantQuotaTest, CopyEndRetainsAdditionalReplicaCharge) {
 
     ReplicateConfig config = MemoryConfig();
     config.preferred_segment = "segment-a";
-    auto put_start =
-        service.PutStart(client_id, "key", TenantId("tenant-a"), 100, config);
+    auto put_start = PutStartWithGrantForTesting(
+        service, client_id, "key", TenantId("tenant-a"), 100, config);
     ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
-    ASSERT_TRUE(
-        service
-            .PutEnd(client_id, "key", TenantId("tenant-a"), ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, client_id, "key",
+                                          TenantId("tenant-a"),
+                                          ReplicaType::MEMORY)
+                    .has_value());
 
     auto copy = service.CopyStart(client_id, "key", TenantId("tenant-a"),
                                   "segment-a", {"segment-b"});
@@ -894,13 +933,13 @@ TEST_F(MasterServiceTenantQuotaTest, CopyRevokeRefundsStartCharge) {
 
     ReplicateConfig config = MemoryConfig();
     config.preferred_segment = "segment-a";
-    auto put_start =
-        service.PutStart(client_id, "key", TenantId("tenant-a"), 100, config);
+    auto put_start = PutStartWithGrantForTesting(
+        service, client_id, "key", TenantId("tenant-a"), 100, config);
     ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
-    ASSERT_TRUE(
-        service
-            .PutEnd(client_id, "key", TenantId("tenant-a"), ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, client_id, "key",
+                                          TenantId("tenant-a"),
+                                          ReplicaType::MEMORY)
+                    .has_value());
 
     ASSERT_TRUE(service
                     .CopyStart(client_id, "key", TenantId("tenant-a"),
@@ -921,13 +960,13 @@ TEST_F(MasterServiceTenantQuotaTest,
 
     ReplicateConfig config = MemoryConfig();
     config.preferred_segment = "segment-a";
-    auto put_start =
-        service.PutStart(client_id, "key", TenantId("tenant-a"), 100, config);
+    auto put_start = PutStartWithGrantForTesting(
+        service, client_id, "key", TenantId("tenant-a"), 100, config);
     ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
-    ASSERT_TRUE(
-        service
-            .PutEnd(client_id, "key", TenantId("tenant-a"), ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, client_id, "key",
+                                          TenantId("tenant-a"),
+                                          ReplicaType::MEMORY)
+                    .has_value());
 
     auto move = service.MoveStart(client_id, "key", TenantId("tenant-a"),
                                   "segment-a", "segment-b");
@@ -945,13 +984,13 @@ TEST_F(MasterServiceTenantQuotaTest, MoveEndSettlesToFinalReplicaCharge) {
 
     ReplicateConfig config = MemoryConfig();
     config.preferred_segment = "segment-a";
-    ASSERT_TRUE(
-        service.PutStart(client_id, "key", TenantId("tenant-a"), 100, config)
-            .has_value());
-    ASSERT_TRUE(
-        service
-            .PutEnd(client_id, "key", TenantId("tenant-a"), ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(PutStartWithGrantForTesting(service, client_id, "key",
+                                            TenantId("tenant-a"), 100, config)
+                    .has_value());
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, client_id, "key",
+                                          TenantId("tenant-a"),
+                                          ReplicaType::MEMORY)
+                    .has_value());
 
     ASSERT_TRUE(service
                     .MoveStart(client_id, "key", TenantId("tenant-a"),
@@ -1036,6 +1075,15 @@ TEST_F(MasterServiceTenantQuotaTest,
     MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
     UUID client_id = MountSegment(service);
 
+    PutComplete(service, client_id, "cold", TenantId("tenant-a"), 128);
+    std::string generation;
+    {
+        MasterServiceTestPeer::MetadataAccessorRO held(
+            &service, MasterServiceTestPeer::ObjectIdentity{
+                          TenantId("tenant-a"), "cold"});
+        ASSERT_TRUE(held.Exists());
+        generation = held.Get().object_generation;
+    }
     TenantQuotaPolicySnapshot current_policy;
     current_policy.tenant_quotas = {{"tenant-a", 1000}};
     auto blocking_store =
@@ -1049,6 +1097,9 @@ TEST_F(MasterServiceTenantQuotaTest,
     std::thread add_thread([&] {
         Replica replica(client_id, 128, "disk-endpoint",
                         ReplicaStatus::COMPLETE);
+        replica.update_local_disk_descriptor(
+            128, "disk-endpoint", MakeOffloadStorageKey("cold", generation),
+            generation);
         add_result.emplace(service.AddReplica(client_id, "cold",
                                               TenantId("tenant-a"), replica));
     });
@@ -1109,8 +1160,8 @@ TEST_F(MasterServiceTenantQuotaTest,
         put_result;
     auto policy_lock = LockTenantQuotaPolicyForTest(service);
     std::thread put_thread([&] {
-        put_result.emplace(service.PutStart(client_id, "nof-key",
-                                            TenantId("tenant-a"), 128, config));
+        put_result.emplace(PutStartWithGrantForTesting(
+            service, client_id, "nof-key", TenantId("tenant-a"), 128, config));
     });
 
     if (allocation_started.wait_for(std::chrono::seconds(5)) !=
@@ -1213,8 +1264,8 @@ TEST_F(MasterServiceTenantQuotaTest,
 
     EXPECT_TRUE(
         service.GetReplicaList("orphan-key", TenantId("tenant-b")).has_value());
-    auto write = service.PutStart(client_id, "new-key", TenantId("tenant-b"), 1,
-                                  MemoryConfig());
+    auto write = PutStartWithGrantForTesting(
+        service, client_id, "new-key", TenantId("tenant-b"), 1, MemoryConfig());
     ASSERT_FALSE(write.has_value());
     EXPECT_EQ(write.error(), ErrorCode::TENANT_NOT_REGISTERED);
 

@@ -1,3 +1,4 @@
+#include "master_service/primary_write_grants_for_testing.h"
 #include "master_service_test_fixture.h"
 #include "metadata_store.h"
 #include "rpc_service.h"
@@ -21,9 +22,11 @@ TEST_F(MasterServiceTest, ResidencyAffinitySurvivesPutAndUpsert) {
     ReplicateConfig config;
     config.residency_affinity_ids = std::vector<std::string>{"opaque-unit"};
     config.session_ids = std::vector<std::string>{"write-session"};
-    ASSERT_TRUE(service.PutStart(context.client_id, key, tenant, 1024, config));
-    ASSERT_TRUE(service.PutEnd(context.client_id, ObjectMeta{key, 0x1234},
-                               tenant, ReplicaType::MEMORY));
+    ASSERT_TRUE(PutStartWithGrantForTesting(service, context.client_id, key,
+                                            tenant, 1024, config));
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id,
+                                          ObjectMeta{key, 0x1234}, tenant,
+                                          ReplicaType::MEMORY));
     auto check = [&](uint64_t size) {
         MasterServiceTestPeer::MetadataAccessorRO accessor(
             &service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
@@ -52,16 +55,16 @@ TEST_F(MasterServiceTest, ResidencyAffinitySurvivesPutAndUpsert) {
         auto conflicting = config;
         conflicting.residency_affinity_ids =
             std::vector<std::string>{"different-unit"};
-        auto rejected = service.UpsertStart(context.client_id, key, tenant,
-                                            size, conflicting);
+        auto rejected = UpsertStartWithGrantForTesting(
+            service, context.client_id, key, tenant, size, conflicting);
         ASSERT_FALSE(rejected);
         EXPECT_EQ(ErrorCode::INVALID_PARAMS, rejected.error());
         config.residency_affinity_ids.reset();
-        ASSERT_TRUE(
-            service.UpsertStart(context.client_id, key, tenant, size, config));
-        ASSERT_TRUE(service.UpsertEnd(context.client_id,
-                                      ObjectMeta{key, 0x1234}, tenant,
-                                      ReplicaType::MEMORY));
+        ASSERT_TRUE(UpsertStartWithGrantForTesting(service, context.client_id,
+                                                   key, tenant, size, config));
+        ASSERT_TRUE(UpsertEndWithGrantForTesting(service, context.client_id,
+                                                 ObjectMeta{key, 0x1234},
+                                                 tenant, ReplicaType::MEMORY));
         check(size);
     }
 }
@@ -73,16 +76,17 @@ TEST_F(MasterServiceTest, ResidencyAffinitySurvivesPreemptedUpsertRetry) {
     const std::string key = "affinity-upsert-retry";
     ReplicateConfig config;
     config.residency_affinity_ids = std::vector<std::string>{"opaque-unit"};
-    ASSERT_TRUE(service.PutStart(context.client_id, key, tenant, 1024, config));
-    ASSERT_TRUE(
-        service.PutEnd(context.client_id, key, tenant, ReplicaType::MEMORY));
+    ASSERT_TRUE(PutStartWithGrantForTesting(service, context.client_id, key,
+                                            tenant, 1024, config));
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id, key,
+                                          tenant, ReplicaType::MEMORY));
     config.residency_affinity_ids.reset();
-    ASSERT_TRUE(
-        service.UpsertStart(context.client_id, key, tenant, 1024, config));
-    ASSERT_TRUE(
-        service.UpsertStart(context.client_id, key, tenant, 1024, config));
-    ASSERT_TRUE(
-        service.UpsertEnd(context.client_id, key, tenant, ReplicaType::MEMORY));
+    ASSERT_TRUE(UpsertStartWithGrantForTesting(service, context.client_id, key,
+                                               tenant, 1024, config));
+    ASSERT_TRUE(UpsertStartWithGrantForTesting(service, context.client_id, key,
+                                               tenant, 1024, config));
+    ASSERT_TRUE(UpsertEndWithGrantForTesting(service, context.client_id, key,
+                                             tenant, ReplicaType::MEMORY));
     MasterServiceTestPeer::MetadataAccessorRO accessor(
         &service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
     ASSERT_TRUE(accessor.Exists());
@@ -96,26 +100,26 @@ TEST_F(MasterServiceTest, ResidencyAffinityBatchOrderAndInvalidCounts) {
     const std::vector<std::string> keys{"affinity-a", "affinity-b"};
     ReplicateConfig config;
     config.residency_affinity_ids = std::vector<std::string>{"unit-a", ""};
-    auto starts = service.BatchUpsertStart(context.client_id, keys, tenant,
-                                           {1024, 1024}, config);
+    auto starts = BatchUpsertStartWithGrantForTesting(
+        service, context.client_id, keys, tenant, {1024, 1024}, config);
     ASSERT_EQ(2u, starts.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         ASSERT_TRUE(starts[i]);
-        ASSERT_TRUE(service.PutEnd(context.client_id, keys[i], tenant,
-                                   ReplicaType::MEMORY));
+        ASSERT_TRUE(PutEndWithGrantForTesting(
+            service, context.client_id, keys[i], tenant, ReplicaType::MEMORY));
         MasterServiceTestPeer::MetadataAccessorRO accessor(
             &service, MasterServiceTestPeer::ObjectIdentity{tenant, keys[i]});
         ASSERT_TRUE(accessor.Exists());
         EXPECT_EQ(config.residency_affinity_ids->at(i),
                   accessor.Get().residency_affinity_id);
     }
-    auto upserts = service.BatchUpsertStart(context.client_id, keys, tenant,
-                                            {2048, 2048}, config);
+    auto upserts = BatchUpsertStartWithGrantForTesting(
+        service, context.client_id, keys, tenant, {2048, 2048}, config);
     ASSERT_EQ(2u, upserts.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         ASSERT_TRUE(upserts[i]);
-        ASSERT_TRUE(service.UpsertEnd(context.client_id, keys[i], tenant,
-                                      ReplicaType::MEMORY));
+        ASSERT_TRUE(UpsertEndWithGrantForTesting(
+            service, context.client_id, keys[i], tenant, ReplicaType::MEMORY));
         MasterServiceTestPeer::MetadataAccessorRO accessor(
             &service, MasterServiceTestPeer::ObjectIdentity{tenant, keys[i]});
         ASSERT_TRUE(accessor.Exists());
@@ -123,18 +127,18 @@ TEST_F(MasterServiceTest, ResidencyAffinityBatchOrderAndInvalidCounts) {
                   accessor.Get().residency_affinity_id);
     }
     config.residency_affinity_ids = std::vector<std::string>{"one"};
-    for (const auto& result : service.BatchUpsertStart(
-             context.client_id, keys, tenant, {1024, 1024}, config)) {
+    for (const auto& result : BatchUpsertStartWithGrantForTesting(
+             service, context.client_id, keys, tenant, {1024, 1024}, config)) {
         ASSERT_FALSE(result);
         EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
     }
     config.residency_affinity_ids = std::vector<std::string>{};
-    auto put = service.PutStart(context.client_id, "invalid-affinity", tenant,
-                                1024, config);
+    auto put = PutStartWithGrantForTesting(
+        service, context.client_id, "invalid-affinity", tenant, 1024, config);
     ASSERT_FALSE(put);
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put.error());
-    auto upsert =
-        service.UpsertStart(context.client_id, keys[0], tenant, 1024, config);
+    auto upsert = UpsertStartWithGrantForTesting(service, context.client_id,
+                                                 keys[0], tenant, 1024, config);
     ASSERT_FALSE(upsert);
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, upsert.error());
 }
@@ -299,9 +303,9 @@ TEST_F(MasterServiceTest, GroupedEvictionSkipsUnsafeMembersAndEvictsSafePeers) {
 
     ReplicateConfig trigger_config;
     trigger_config.replica_num = 1;
-    auto trigger_result =
-        service_->PutStart(client_id, "trigger_mixed_safety_group_eviction",
-                           TenantId::Default(), kObjectSize, trigger_config);
+    auto trigger_result = PutStartWithGrantForTesting(
+        *service_, client_id, "trigger_mixed_safety_group_eviction",
+        TenantId::Default(), kObjectSize, trigger_config);
     ASSERT_FALSE(trigger_result.has_value());
     EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger_result.error());
 
@@ -386,17 +390,17 @@ TEST_F(MasterServiceTest,
     ASSERT_TRUE(ready.has_value());
 
     auto extra_config = payload_config;
-    auto extra =
-        service.PutStart(client_id, "managed-weight-extra", TenantId::Default(),
-                         kObjectSize, extra_config);
+    auto extra = PutStartWithGrantForTesting(
+        service, client_id, "managed-weight-extra", TenantId::Default(),
+        kObjectSize, extra_config);
     ASSERT_FALSE(extra.has_value());
     EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, extra.error());
 
     ReplicateConfig trigger_config;
     trigger_config.replica_num = 1;
-    auto trigger =
-        service.PutStart(client_id, "managed-weight-pressure",
-                         TenantId::Default(), 3 * kObjectSize, trigger_config);
+    auto trigger = PutStartWithGrantForTesting(
+        service, client_id, "managed-weight-pressure", TenantId::Default(),
+        3 * kObjectSize, trigger_config);
     ASSERT_FALSE(trigger.has_value());
     EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger.error());
     EXPECT_TRUE(
@@ -463,13 +467,15 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     config.residency_affinity_ids =
         std::vector<std::string>{"unit-a", "", "unit-b"};
 
-    auto results = service_.BatchPutStart(client_id, keys, sizes, config);
+    auto results = BatchPutStartWithGrantForTesting(service_, client_id, keys,
+                                                    sizes, config);
     ASSERT_EQ(results.size(), keys.size());
     for (const auto& result : results) {
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
 
-    auto end_results = service_.BatchPutEnd(client_id, MakeObjectMetas(keys));
+    auto end_results = BatchPutEndWithGrantForTesting(service_, client_id,
+                                                      MakeObjectMetas(keys));
     ASSERT_EQ(end_results.size(), keys.size());
     for (const auto& result : end_results) {
         ASSERT_TRUE(result.has_value());
@@ -483,16 +489,16 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
 
     ReplicateConfig invalid_config = config;
     invalid_config.group_ids = std::vector<std::string>{"only_one"};
-    auto invalid_group_results =
-        service_.BatchPutStart(client_id, keys, sizes, invalid_config);
+    auto invalid_group_results = BatchPutStartWithGrantForTesting(
+        service_, client_id, keys, sizes, invalid_config);
     ASSERT_EQ(invalid_group_results.size(), keys.size());
     for (const auto& result : invalid_group_results) {
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
     }
 
-    auto invalid_size_results =
-        service_.BatchPutStart(client_id, keys, {1024}, config);
+    auto invalid_size_results = BatchPutStartWithGrantForTesting(
+        service_, client_id, keys, {1024}, config);
     ASSERT_EQ(invalid_size_results.size(), keys.size());
     for (const auto& result : invalid_size_results) {
         ASSERT_FALSE(result.has_value());
@@ -500,8 +506,8 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     }
     invalid_config = config;
     invalid_config.residency_affinity_ids = std::vector<std::string>{"one"};
-    auto invalid_affinity_results =
-        service_.BatchPutStart(client_id, keys, sizes, invalid_config);
+    auto invalid_affinity_results = BatchPutStartWithGrantForTesting(
+        service_, client_id, keys, sizes, invalid_config);
     ASSERT_EQ(invalid_affinity_results.size(), keys.size());
     for (const auto& result : invalid_affinity_results) {
         ASSERT_FALSE(result);
@@ -532,11 +538,13 @@ TEST_F(MasterServiceTest, TryEvictLeasedObject) {
         uint64_t slice_length = object_size;
         ReplicateConfig config;
         config.replica_num = 1;
-        auto put_start_result = service_->PutStart(
-            client_id, key, TenantId::Default(), slice_length, config);
+        auto put_start_result = PutStartWithGrantForTesting(
+            *service_, client_id, key, TenantId::Default(), slice_length,
+            config);
         if (put_start_result.has_value()) {
-            auto put_end_result = service_->PutEnd(
-                client_id, key, TenantId::Default(), ReplicaType::MEMORY);
+            auto put_end_result = PutEndWithGrantForTesting(
+                *service_, client_id, key, TenantId::Default(),
+                ReplicaType::MEMORY);
             ASSERT_TRUE(put_end_result.has_value());
             // the object is leased
             auto get_result =
@@ -575,11 +583,11 @@ TEST_F(MasterServiceTest, BatchReplicaClearWithLeaseActive) {
     uint64_t value_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
-    auto put_start_result = service_->PutStart(
-        client_id, key, TenantId::Default(), value_length, config);
+    auto put_start_result = PutStartWithGrantForTesting(
+        *service_, client_id, key, TenantId::Default(), value_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, TenantId::Default(),
-                                           ReplicaType::MEMORY);
+    auto put_end_result = PutEndWithGrantForTesting(
+        *service_, client_id, key, TenantId::Default(), ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Grant a lease by calling GetReplicaList (similar to normal usage)
@@ -778,11 +786,13 @@ TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
         uint64_t slice_length = 1024;
         ReplicateConfig config;
         config.replica_num = 1;
-        auto put_start_result = service_->PutStart(
-            client_id, key, TenantId::Default(), slice_length, config);
+        auto put_start_result = PutStartWithGrantForTesting(
+            *service_, client_id, key, TenantId::Default(), slice_length,
+            config);
         ASSERT_TRUE(put_start_result.has_value());
-        auto put_end_result = service_->PutEnd(
-            client_id, key, TenantId::Default(), ReplicaType::MEMORY);
+        auto put_end_result =
+            PutEndWithGrantForTesting(*service_, client_id, key,
+                                      TenantId::Default(), ReplicaType::MEMORY);
         ASSERT_TRUE(put_end_result.has_value());
         if (i >= 5) {
             auto exist_result = service_->ExistKey(key, TenantId::Default());

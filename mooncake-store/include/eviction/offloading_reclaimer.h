@@ -26,6 +26,7 @@
 #include "replica.h"
 #include "tenant_id.h"
 #include "types.h"
+#include "object_runtime_state.h"
 
 namespace mooncake {
 namespace eviction {
@@ -38,6 +39,15 @@ class OffloadQueue {
     // destinations are appended to `mirror_clients`.
     virtual bool Push(const TenantId& tenant_id, const std::string& key,
                       Replica& source, std::vector<UUID>* mirror_clients) = 0;
+    virtual bool PushFenced(const TenantId& tenant_id, const std::string& key,
+                            Replica& source, OffloadingTask& task) {
+        if (!Push(tenant_id, key, source, &task.mirror_clients)) return false;
+        for (const auto& owner : task.mirror_clients) {
+            if (task.owner_sources.emplace(owner, source.id()).second)
+                source.inc_refcnt();
+        }
+        return true;
+    }
 
    protected:
     ~OffloadQueue() = default;

@@ -435,6 +435,9 @@ DEFINE_uint32(oplog_standby_max_batches_per_poll,
               mooncake::kDefaultOpLogStandbyMaxBatchesPerPoll,
               "Maximum number of durable batch records fetched per standby "
               "poll.");
+DEFINE_uint64(oplog_durable_wait_timeout_ms, 30000,
+              "Maximum wait for HA write durability and delete finalization; "
+              "0 waits until completion or writer shutdown.");
 DEFINE_uint32(batch_oplog_retry_timeout_sec, 180,
               "Maximum time to retry transient batch OpLog standby errors.");
 
@@ -763,6 +766,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("oplog_standby_max_batches_per_poll",
                              &master_config.oplog_standby_max_batches_per_poll,
                              FLAGS_oplog_standby_max_batches_per_poll);
+    default_config.GetUInt64("oplog_durable_wait_timeout_ms",
+                             &master_config.oplog_durable_wait_timeout_ms,
+                             FLAGS_oplog_durable_wait_timeout_ms);
     default_config.GetUInt32("batch_oplog_retry_timeout_sec",
                              &master_config.batch_oplog_retry_timeout_sec,
                              FLAGS_batch_oplog_retry_timeout_sec);
@@ -1305,6 +1311,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.oplog_standby_max_batches_per_poll =
             FLAGS_oplog_standby_max_batches_per_poll;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_durable_wait_timeout_ms",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_durable_wait_timeout_ms =
+            FLAGS_oplog_durable_wait_timeout_ms;
     }
     if ((google::GetCommandLineFlagInfo("batch_oplog_retry_timeout_sec",
                                         &info) &&

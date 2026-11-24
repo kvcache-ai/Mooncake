@@ -53,16 +53,19 @@ class QueryResult {
     /** @brief Tenant scope the master resolved the query to, when the master
      * reports it; readers forward it to disk-replica verify requests */
     const std::optional<std::string> resolved_tenant_id;
+    const std::string object_generation;
 
     QueryResult(
         std::vector<Replica::Descriptor>&& replicas_param,
         std::chrono::steady_clock::time_point lease_timeout_param,
         std::optional<uint64_t> object_checksum_param = std::nullopt,
-        std::optional<std::string> resolved_tenant_id_param = std::nullopt)
+        std::optional<std::string> resolved_tenant_id_param = std::nullopt,
+        std::string generation = {})
         : replicas(std::move(replicas_param)),
           lease_timeout(lease_timeout_param),
           object_checksum(object_checksum_param),
-          resolved_tenant_id(std::move(resolved_tenant_id_param)) {}
+          resolved_tenant_id(std::move(resolved_tenant_id_param)),
+          object_generation(std::move(generation)) {}
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
@@ -232,11 +235,11 @@ class Client {
      * @brief Read-only variant of BatchQuery(); see QueryReadOnly() for the
      * lease/metrics semantics. Per-key results keep input order.
      */
-    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQueryReadOnly(
-        const std::vector<std::string>& object_keys);
-    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQueryReadOnly(
-        const std::vector<std::string>& object_keys,
-        const std::string& tenant_id);
+    virtual std::vector<tl::expected<QueryResult, ErrorCode>>
+    BatchQueryReadOnly(const std::vector<std::string>& object_keys);
+    virtual std::vector<tl::expected<QueryResult, ErrorCode>>
+    BatchQueryReadOnly(const std::vector<std::string>& object_keys,
+                       const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> VerifyObjectChecksum(
         const std::string& object_key, const std::vector<Slice>& slices,
@@ -457,11 +460,12 @@ class Client {
      * @param key The evicted object key
      * @param replica_type DISK or LOCAL_DISK
      */
-    tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
-                                                   ReplicaType replica_type);
-    tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
-                                                   const std::string& tenant_id,
-                                                   ReplicaType replica_type);
+    tl::expected<void, ErrorCode> EvictDiskReplica(
+        const std::string& key, ReplicaType replica_type,
+        bool physical_storage_key = false);
+    tl::expected<void, ErrorCode> EvictDiskReplica(
+        const std::string& key, const std::string& tenant_id,
+        ReplicaType replica_type, bool physical_storage_key = false);
 
     // Conditional variant: the master evicts only when its current record is
     // still the replica the caller failed on. See MasterClient for the
@@ -471,10 +475,11 @@ class Client {
         ReplicaType replica_type, ReplicaID expected_replica_id);
 
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
-        const std::vector<std::string>& keys, ReplicaType replica_type);
+        const std::vector<std::string>& keys, ReplicaType replica_type,
+        bool physical_storage_key = false);
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const std::vector<std::string>& keys, const std::string& tenant_id,
-        ReplicaType replica_type);
+        ReplicaType replica_type, bool physical_storage_key = false);
 
     /**
      * @brief Registers a memory segment to master for allocation
@@ -723,11 +728,15 @@ class Client {
      */
     virtual tl::expected<PromotionAllocStartResponse, ErrorCode>
     PromotionAllocStart(const std::string& key, uint64_t size,
-                        const std::vector<std::string>& preferred_segments);
+                        const std::vector<std::string>& preferred_segments,
+                        bool physical_storage_key = false,
+                        const std::string& expected_task_id = {});
     virtual tl::expected<PromotionAllocStartResponse, ErrorCode>
     PromotionAllocStart(const std::string& key, const std::string& tenant_id,
                         uint64_t size,
-                        const std::vector<std::string>& preferred_segments);
+                        const std::vector<std::string>& preferred_segments,
+                        bool physical_storage_key = false,
+                        const std::string& expected_task_id = {});
 
     /**
      * @brief Commit a staged MEMORY replica to COMPLETE; called after the
@@ -737,6 +746,13 @@ class Client {
         const std::string& key);
     virtual tl::expected<void, ErrorCode> NotifyPromotionSuccess(
         const std::string& key, const std::string& tenant_id);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const std::string& key, const std::string& expected_generation,
+        const std::string& expected_task_id);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& expected_generation,
+        const std::string& expected_task_id);
 
     /**
      * @brief Release master-side promotion task after a client-side failure
@@ -746,6 +762,13 @@ class Client {
         const std::string& key);
     virtual tl::expected<void, ErrorCode> NotifyPromotionFailure(
         const std::string& key, const std::string& tenant_id);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const std::string& key, const std::string& expected_generation,
+        const std::string& expected_task_id);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& expected_generation,
+        const std::string& expected_task_id);
 
     /**
      * @brief Write `slices` into the memory replica described by
@@ -972,6 +995,10 @@ class Client {
         const std::vector<ObjectMeta>& object_metas,
         ReplicaType replica_type = ReplicaType::ALL);
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
+        const std::vector<ObjectMeta>& object_metas,
+        ReplicaType replica_type = ReplicaType::MEMORY);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL);
 
@@ -1105,7 +1132,8 @@ class Client {
 
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices,
-                        const DiskDescriptor& disk_descriptor);
+                        const DiskDescriptor& disk_descriptor,
+                        const std::string& write_generation);
     /**
      * @brief Initialize local hot cache
      * @return ErrorCode::OK if disabled or initialized successfully;

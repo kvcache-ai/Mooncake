@@ -1,3 +1,4 @@
+#include "master_service/primary_write_grants_for_testing.h"
 // Regression test for a MetadataAccessorRW double-erase use-after-free (prod
 // incident 2026-08-03: mooncake_master segfaulted every ~5 minutes after a
 // snapshot restore, always at the same instruction inside
@@ -94,7 +95,8 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
         config.replica_num = 1;
         config.preferred_segment = segment.name;
         const std::string key = "orphan_processing_key";
-        if (!service.PutStart(client_id, key, TenantId::Default(), 1024, config)
+        if (!PutStartWithGrantForTesting(service, client_id, key,
+                                         TenantId::Default(), 1024, config)
                  .has_value()) {
             ::_exit(kExitPutStartFailed);
         }
@@ -115,8 +117,8 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
         // 4. Trigger: PutEnd constructs MetadataAccessorRW(service, key).
         //    The ctor erases the invalid replica, finds !IsValid() and
         //    erases the object, processing marker included.
-        (void)service.PutEnd(client_id, key, TenantId::Default(),
-                             ReplicaType::MEMORY);
+        (void)PutEndWithGrantForTesting(
+            service, client_id, key, TenantId::Default(), ReplicaType::MEMORY);
         ::_exit(kExitOk);  // only reachable on fixed code
     }
 };

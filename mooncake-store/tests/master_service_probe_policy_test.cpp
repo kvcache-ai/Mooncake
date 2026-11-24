@@ -1,3 +1,4 @@
+#include "master_service/primary_write_grants_for_testing.h"
 #include "master_service_test_fixture.h"
 #include "rpc_service.h"
 
@@ -113,18 +114,18 @@ TEST_F(BatchProbePolicyTest, IncompleteAndUnreadableCandidatesAreNotLeased) {
     ReplicateConfig config;
     config.replica_num = 1;
     PutCompletedObject(service, context.client_id, "complete", config);
-    ASSERT_TRUE(service
-                    .PutStart(context.client_id, "writing", TenantId::Default(),
-                              1024, config)
+    ASSERT_TRUE(PutStartWithGrantForTesting(service, context.client_id,
+                                            "writing", TenantId::Default(),
+                                            1024, config)
                     .has_value());
     const auto before = Deadline(service, "complete");
     const std::vector<std::string> keys = {"complete", "writing"};
     ExpectResults(service.BatchProbeKey(kLastPair, keys, TenantId::Default()),
                   {true, false});
     EXPECT_EQ(Deadline(service, "complete"), before);
-    ASSERT_TRUE(service
-                    .PutEnd(context.client_id, "writing", TenantId::Default(),
-                            ReplicaType::MEMORY)
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id, "writing",
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
                     .has_value());
     ASSERT_TRUE(service.UnmountSegment(context.segment_id, context.client_id)
                     .has_value());
@@ -219,11 +220,13 @@ TEST_F(BatchProbePolicyTest, TenantIsolationAndErrorsThroughWrapper) {
         const size_t offset = tenant == "left" ? 0 : 2;
         const std::vector<std::string> present = {keys[offset],
                                                   keys[offset + 1]};
-        auto started = service.BatchPutStart(client_id, present, {1024, 1024},
-                                             {.replica_num = 1}, tenant);
+        auto started = BatchPutStartWithGrantForTesting(
+            service, client_id, present, {1024, 1024}, {.replica_num = 1},
+            tenant);
         for (const auto& item : started) ASSERT_TRUE(item.has_value());
-        auto ended = service.BatchPutEnd(client_id, MakeObjectMetas(present),
-                                         ReplicaType::MEMORY, tenant);
+        auto ended = BatchPutEndWithGrantForTesting(
+            service, client_id, MakeObjectMetas(present), ReplicaType::MEMORY,
+            tenant);
         for (const auto& item : ended) ASSERT_TRUE(item.has_value());
     }
     ExpectResults(service.BatchProbeKey(kLastPair, keys, "left"),

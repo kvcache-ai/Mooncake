@@ -116,8 +116,18 @@ struct RpcNameTraits<&WrappedMasterService::PutRevoke> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::PutRevokeV2> {
+    static constexpr const char* value = "PutRevokeV2";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke> {
     static constexpr const char* value = "BatchPutRevoke";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPutRevokeV2> {
+    static constexpr const char* value = "BatchPutRevokeV2";
 };
 
 template <>
@@ -146,8 +156,18 @@ struct RpcNameTraits<&WrappedMasterService::UpsertRevoke> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::UpsertRevokeV2> {
+    static constexpr const char* value = "UpsertRevokeV2";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchUpsertRevoke> {
     static constexpr const char* value = "BatchUpsertRevoke";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchUpsertRevokeV2> {
+    static constexpr const char* value = "BatchUpsertRevokeV2";
 };
 
 template <>
@@ -281,6 +301,11 @@ struct RpcNameTraits<&WrappedMasterService::PromotionAllocStart> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::PromotionAllocStartV2> {
+    static constexpr const char* value = "PromotionAllocStartV2";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::RegisterPrefetchTask> {
     static constexpr const char* value = "RegisterPrefetchTask";
 };
@@ -291,8 +316,18 @@ struct RpcNameTraits<&WrappedMasterService::NotifyPromotionSuccess> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::NotifyPromotionSuccessV2> {
+    static constexpr const char* value = "NotifyPromotionSuccessV2";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::NotifyPromotionFailure> {
     static constexpr const char* value = "NotifyPromotionFailure";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::NotifyPromotionFailureV2> {
+    static constexpr const char* value = "NotifyPromotionFailureV2";
 };
 
 template <>
@@ -408,6 +443,11 @@ struct RpcNameTraits<&WrappedMasterService::EvictDiskReplica> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::EvictDiskReplicaV2> {
+    static constexpr const char* value = "EvictDiskReplicaV2";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::EvictDiskReplicaIfCurrent> {
     static constexpr const char* value = "EvictDiskReplicaIfCurrent";
 };
@@ -415,6 +455,11 @@ struct RpcNameTraits<&WrappedMasterService::EvictDiskReplicaIfCurrent> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplica> {
     static constexpr const char* value = "BatchEvictDiskReplica";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplicaV2> {
+    static constexpr const char* value = "BatchEvictDiskReplicaV2";
 };
 
 template <>
@@ -909,6 +954,21 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::PutRevoke(
+    const ObjectMeta& object_meta, ReplicaType replica_type) {
+    if (!object_meta.write_generation ||
+        object_meta.write_generation->empty()) {
+        return PutRevoke(object_meta.key, replica_type);
+    }
+    ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
+    timer.LogRequest("key=", object_meta.key);
+
+    auto result = invoke_rpc<&WrappedMasterService::PutRevokeV2, void>(
+        client_id_, object_meta, replica_type, tenant_id_.value());
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
     const std::vector<std::string>& keys, ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutRevoke");
@@ -916,6 +976,31 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
         keys.size(), client_id_, keys, replica_type, tenant_id_.value());
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
+    const std::vector<ObjectMeta>& object_metas, ReplicaType replica_type) {
+    const bool has_generation = std::any_of(
+        object_metas.begin(), object_metas.end(), [](const ObjectMeta& meta) {
+            return meta.write_generation && !meta.write_generation->empty();
+        });
+    if (!has_generation) {
+        std::vector<std::string> keys;
+        keys.reserve(object_metas.size());
+        for (const auto& meta : object_metas) {
+            keys.push_back(meta.key);
+        }
+        return BatchPutRevoke(keys, replica_type);
+    }
+    ScopedVLogTimer timer(1, "MasterClient::BatchPutRevoke");
+    timer.LogRequest("keys_count=", object_metas.size());
+
+    auto result =
+        invoke_batch_rpc<&WrappedMasterService::BatchPutRevokeV2, void>(
+            object_metas.size(), client_id_, object_metas, replica_type,
+            tenant_id_.value());
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -998,6 +1083,21 @@ tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
+    const ObjectMeta& object_meta, ReplicaType replica_type) {
+    if (!object_meta.write_generation ||
+        object_meta.write_generation->empty()) {
+        return UpsertRevoke(object_meta.key, replica_type);
+    }
+    ScopedVLogTimer timer(1, "MasterClient::UpsertRevoke");
+    timer.LogRequest("key=", object_meta.key);
+
+    auto result = invoke_rpc<&WrappedMasterService::UpsertRevokeV2, void>(
+        client_id_, object_meta, replica_type, tenant_id_.value());
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertRevoke(
     const std::vector<std::string>& keys) {
     ScopedVLogTimer timer(1, "MasterClient::BatchUpsertRevoke");
@@ -1006,6 +1106,30 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertRevoke(
     auto result =
         invoke_batch_rpc<&WrappedMasterService::BatchUpsertRevoke, void>(
             keys.size(), client_id_, keys, tenant_id_.value());
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertRevoke(
+    const std::vector<ObjectMeta>& object_metas) {
+    const bool has_generation = std::any_of(
+        object_metas.begin(), object_metas.end(), [](const ObjectMeta& meta) {
+            return meta.write_generation && !meta.write_generation->empty();
+        });
+    if (!has_generation) {
+        std::vector<std::string> keys;
+        keys.reserve(object_metas.size());
+        for (const auto& meta : object_metas) {
+            keys.push_back(meta.key);
+        }
+        return BatchUpsertRevoke(keys);
+    }
+    ScopedVLogTimer timer(1, "MasterClient::BatchUpsertRevoke");
+    timer.LogRequest("keys_count=", object_metas.size());
+
+    auto result =
+        invoke_batch_rpc<&WrappedMasterService::BatchUpsertRevokeV2, void>(
+            object_metas.size(), client_id_, object_metas, tenant_id_.value());
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -1353,22 +1477,30 @@ MasterClient::PromotionObjectHeartbeat(const UUID& client_id) {
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 MasterClient::PromotionAllocStart(
     const UUID& client_id, const std::string& key, uint64_t size,
-    const std::vector<std::string>& preferred_segments) {
+    const std::vector<std::string>& preferred_segments,
+    bool physical_storage_key, const std::string& expected_task_id) {
     return PromotionAllocStart(client_id, key, tenant_id_.value(), size,
-                               preferred_segments);
+                               preferred_segments, physical_storage_key,
+                               expected_task_id);
 }
 
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 MasterClient::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
-    uint64_t size, const std::vector<std::string>& preferred_segments) {
+    uint64_t size, const std::vector<std::string>& preferred_segments,
+    bool physical_storage_key, const std::string& expected_task_id) {
     ScopedVLogTimer timer(1, "MasterClient::PromotionAllocStart");
     timer.LogRequest("client_id=", client_id, ", key=", key,
                      ", tenant_id=", tenant_id, ", size=", size,
                      ", preferred_count=", preferred_segments.size());
-    auto result = invoke_rpc<&WrappedMasterService::PromotionAllocStart,
-                             PromotionAllocStartResponse>(
-        client_id, key, tenant_id, size, preferred_segments);
+    auto result = (!physical_storage_key && expected_task_id.empty())
+                      ? invoke_rpc<&WrappedMasterService::PromotionAllocStart,
+                                   PromotionAllocStartResponse>(
+                            client_id, key, tenant_id, size, preferred_segments)
+                      : invoke_rpc<&WrappedMasterService::PromotionAllocStartV2,
+                                   PromotionAllocStartResponse>(
+                            client_id, key, tenant_id, size, preferred_segments,
+                            physical_storage_key, expected_task_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1402,6 +1534,31 @@ tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccess(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccess(
+    const UUID& client_id, const std::string& key,
+    const std::string& expected_generation,
+    const std::string& expected_task_id) {
+    return NotifyPromotionSuccess(client_id, key, tenant_id_.value(),
+                                  expected_generation, expected_task_id);
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccess(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    const std::string& expected_generation,
+    const std::string& expected_task_id) {
+    if (expected_generation.empty() && expected_task_id.empty()) {
+        return NotifyPromotionSuccess(client_id, key, tenant_id);
+    }
+    ScopedVLogTimer timer(1, "MasterClient::NotifyPromotionSuccess");
+    timer.LogRequest("client_id=", client_id, ", key=", key,
+                     ", tenant_id=", tenant_id);
+    auto result =
+        invoke_rpc<&WrappedMasterService::NotifyPromotionSuccessV2, void>(
+            client_id, key, tenant_id, expected_generation, expected_task_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<void, ErrorCode> MasterClient::NotifyPromotionFailure(
     const UUID& client_id, const std::string& key) {
     return NotifyPromotionFailure(client_id, key, tenant_id_.value());
@@ -1416,6 +1573,31 @@ tl::expected<void, ErrorCode> MasterClient::NotifyPromotionFailure(
     auto result =
         invoke_rpc<&WrappedMasterService::NotifyPromotionFailure, void>(
             client_id, key, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyPromotionFailure(
+    const UUID& client_id, const std::string& key,
+    const std::string& expected_generation,
+    const std::string& expected_task_id) {
+    return NotifyPromotionFailure(client_id, key, tenant_id_.value(),
+                                  expected_generation, expected_task_id);
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyPromotionFailure(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    const std::string& expected_generation,
+    const std::string& expected_task_id) {
+    if (expected_generation.empty() && expected_task_id.empty()) {
+        return NotifyPromotionFailure(client_id, key, tenant_id);
+    }
+    ScopedVLogTimer timer(1, "MasterClient::NotifyPromotionFailure");
+    timer.LogRequest("client_id=", client_id, ", key=", key,
+                     ", tenant_id=", tenant_id);
+    auto result =
+        invoke_rpc<&WrappedMasterService::NotifyPromotionFailureV2, void>(
+            client_id, key, tenant_id, expected_generation, expected_task_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1678,19 +1860,26 @@ tl::expected<void, ErrorCode> MasterClient::MarkTaskToComplete(
 }
 
 tl::expected<void, ErrorCode> MasterClient::EvictDiskReplica(
-    const std::string& key, ReplicaType replica_type) {
-    return EvictDiskReplica(key, tenant_id_.value(), replica_type);
+    const std::string& key, ReplicaType replica_type,
+    bool physical_storage_key) {
+    return EvictDiskReplica(key, tenant_id_.value(), replica_type,
+                            physical_storage_key);
 }
 
 tl::expected<void, ErrorCode> MasterClient::EvictDiskReplica(
     const std::string& key, const std::string& tenant_id,
-    ReplicaType replica_type) {
+    ReplicaType replica_type, bool physical_storage_key) {
     ScopedVLogTimer timer(1, "MasterClient::EvictDiskReplica");
     timer.LogRequest("key=", key, ", tenant_id=", tenant_id,
                      ", replica_type=", replica_type);
 
-    auto result = invoke_rpc<&WrappedMasterService::EvictDiskReplica, void>(
-        client_id_, key, tenant_id, replica_type);
+    auto result =
+        physical_storage_key
+            ? invoke_rpc<&WrappedMasterService::EvictDiskReplicaV2, void>(
+                  client_id_, key, tenant_id, replica_type,
+                  physical_storage_key)
+            : invoke_rpc<&WrappedMasterService::EvictDiskReplica, void>(
+                  client_id_, key, tenant_id, replica_type);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1711,20 +1900,27 @@ tl::expected<bool, ErrorCode> MasterClient::EvictDiskReplicaIfCurrent(
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
-    const std::vector<std::string>& keys, ReplicaType replica_type) {
-    return BatchEvictDiskReplica(keys, tenant_id_.value(), replica_type);
+    const std::vector<std::string>& keys, ReplicaType replica_type,
+    bool physical_storage_key) {
+    return BatchEvictDiskReplica(keys, tenant_id_.value(), replica_type,
+                                 physical_storage_key);
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
     const std::vector<std::string>& keys, const std::string& tenant_id,
-    ReplicaType replica_type) {
+    ReplicaType replica_type, bool physical_storage_key) {
     ScopedVLogTimer timer(1, "MasterClient::BatchEvictDiskReplica");
     timer.LogRequest("keys_count=", keys.size(), ", tenant_id=", tenant_id,
                      ", replica_type=", replica_type);
 
     auto result =
-        invoke_batch_rpc<&WrappedMasterService::BatchEvictDiskReplica, void>(
-            keys.size(), client_id_, keys, tenant_id, replica_type);
+        physical_storage_key
+            ? invoke_batch_rpc<&WrappedMasterService::BatchEvictDiskReplicaV2,
+                               void>(keys.size(), client_id_, keys, tenant_id,
+                                     replica_type, physical_storage_key)
+            : invoke_batch_rpc<&WrappedMasterService::BatchEvictDiskReplica,
+                               void>(keys.size(), client_id_, keys, tenant_id,
+                                     replica_type);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

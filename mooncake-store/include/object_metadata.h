@@ -109,6 +109,15 @@ struct ObjectMetadata {
     UUID client_id;
     // Updated by UpsertStart (Case B) to reset the discard timeout.
     std::chrono::system_clock::time_point put_start_time;
+    // Persisted content incarnation, distinct from runtime WAL sequencing.
+    std::string object_generation;
+    // Runtime-only primary-write durability fence, guarded by the shard lock.
+    // nullopt: restored durable metadata; 0: no PUT_END record enqueued yet;
+    // otherwise: the sequence that must be durable before acknowledging PUT.
+    std::optional<uint64_t> put_oplog_sequence;
+    // Runtime charge for allocations owned by a pending HA invalidation.
+    // The metadata is unreadable while its old replicas are held outside it.
+    uint64_t ha_invalidation_memory_charge{0};
     const ObjectDataType data_type{ObjectDataType::UNKNOWN};
     const std::string group_id;
     const std::string residency_affinity_id;

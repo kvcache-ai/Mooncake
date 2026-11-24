@@ -464,6 +464,10 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
+    auto PutRevoke(const UUID& client_id, const ObjectMeta& object_meta,
+                   const TenantId& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
     auto PutRevoke(const UUID& client_id, const std::string& key,
                    const TenantId& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
@@ -482,6 +486,10 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
+        const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
+        const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL);
+
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
         const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL);
@@ -514,6 +522,10 @@ class MasterService {
     /**
      * @brief Revoke an upsert operation. Delegates to PutRevoke.
      */
+    auto UpsertRevoke(const UUID& client_id, const ObjectMeta& object_meta,
+                      const TenantId& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
     auto UpsertRevoke(const UUID& client_id, const std::string& key,
                       const TenantId& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
@@ -539,6 +551,10 @@ class MasterService {
      * @brief Revoke a batch of upsert operations. Delegates to BatchPutRevoke.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
+        const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
+        const TenantId& tenant_id);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
         const TenantId& tenant_id);
 
@@ -551,7 +567,8 @@ class MasterService {
      * @return ErrorCode::OK on success, OBJECT_NOT_FOUND if key missing
      */
     auto EvictDiskReplica(const UUID& client_id, const std::string& key,
-                          const TenantId& tenant_id, ReplicaType replica_type)
+                          const TenantId& tenant_id, ReplicaType replica_type,
+                          bool physical_storage_key = false)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -585,7 +602,8 @@ class MasterService {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const UUID& client_id, const std::vector<std::string>& keys,
-        const TenantId& tenant_id, ReplicaType replica_type);
+        const TenantId& tenant_id, ReplicaType replica_type,
+        bool physical_storage_key = false);
 
     /**
      * @brief Start a copy operation
@@ -745,6 +763,9 @@ class MasterService {
      * as on expiry; a store that comes back re-adopts its files through the
      * MountLocalDiskSegment/NotifyOffloadSuccess path, which recreates them.
      *
+     * A cleanup-log admission failure returns an error and keeps the mount
+     * registered so the Owner can continue serving and retry. Success means
+     * cleanup was accepted; it does not wait for HA durability/finalization.
      * The replica sweep targets exactly this owner (see
      * ClearLocalDiskHandlesOwnedBy), and the deregistration runs under the
      * exclusive master_state_mutex_ so no registration admitted against the old
@@ -814,7 +835,9 @@ class MasterService {
      */
     auto PromotionAllocStart(const UUID& client_id, const std::string& key,
                              const TenantId& tenant_id, uint64_t size,
-                             const std::vector<std::string>& preferred_segments)
+                             const std::vector<std::string>& preferred_segments,
+                             bool physical_storage_key = false,
+                             const std::string& expected_task_id = {})
         -> tl::expected<PromotionAllocStartResponse, ErrorCode>;
 
     /**
@@ -847,7 +870,9 @@ class MasterService {
      * NotifyOffloadSuccess.
      */
     auto NotifyPromotionSuccess(const UUID& client_id, const std::string& key,
-                                const TenantId& tenant_id)
+                                const TenantId& tenant_id,
+                                const std::string& expected_generation = {},
+                                const std::string& expected_task_id = {})
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -869,7 +894,9 @@ class MasterService {
      * holder's promotion_objects entry.
      */
     auto NotifyPromotionFailure(const UUID& client_id, const std::string& key,
-                                const TenantId& tenant_id)
+                                const TenantId& tenant_id,
+                                const std::string& expected_generation = {},
+                                const std::string& expected_task_id = {})
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -1153,7 +1180,8 @@ class MasterService {
     auto EvictDiskReplicaImpl(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
                               ReplicaType replica_type,
-                              const ReplicaID* expected_replica_id)
+                              const ReplicaID* expected_replica_id,
+                              bool physical_storage_key = false)
         -> tl::expected<bool, ErrorCode>;
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyImpl(
         const std::vector<std::string>& keys, const TenantId& tenant_id,
@@ -1189,7 +1217,8 @@ class MasterService {
     void ClearInvalidHandlesLocked();
     // Clear completed LOCAL_DISK replicas owned by exactly this client during
     // explicit unmount, even if its session still retains resources.
-    void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
+    tl::expected<void, ErrorCode> ClearLocalDiskHandlesOwnedBy(
+        const UUID& owner);
     // Walk shared by the two sweeps above; removes completed replicas
     // matching is_stale, erasing a key when no valid replica remains. Each
     // tenant is first read to pick the objects that match, and only those are
@@ -1407,7 +1436,7 @@ class MasterService {
     // Removes the object under HA with the oplog on: marks its completed
     // replicas removed and queues a REMOVE whose durable callback drops them,
     // and the object with them.
-    tl::expected<void, ErrorCode> MarkRemovedAndPersist(
+    tl::expected<uint64_t, ErrorCode> MarkRemovedAndPersist(
         const TenantId& tenant_id, const std::string& key,
         ObjectMetadata& metadata);
     // Returns why a remove may not take the object, or nothing if it may: its
@@ -1415,8 +1444,14 @@ class MasterService {
     // replication task reads it.
     static tl::expected<void, ErrorCode> CheckRemovable(
         const ObjectMetadata& metadata, const route::ObjectState& state,
-        bool force, std::chrono::system_clock::time_point now);
+        bool force, std::chrono::system_clock::time_point now,
+        bool ignore_offload = false);
+    tl::expected<void, ErrorCode> PrepareRemovable(
+        ObjectMetadata& metadata, route::ObjectState& state,
+        const ObjectIdentity& object_id, bool force,
+        std::chrono::system_clock::time_point now);
     struct RemoveResult {
+        uint64_t highest_sequence{0};
         long removed_count{0};
         int64_t freed_bytes{0};
         // Whether the walk reached any object, and whether it left any
@@ -1577,7 +1612,9 @@ class MasterService {
     // appended to it on success.
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
-        std::vector<UUID>* mirror_clients = nullptr);
+        const std::string& generation, const std::string& task_id,
+        std::vector<UUID>* mirror_clients = nullptr,
+        std::map<UUID, ReplicaID>* owner_sources = nullptr);
 
     // Cancels the offload task on `object_id`, releasing the source refcnt
     // and dropping the task marker along with its mirrors. Returns false
@@ -1605,7 +1642,8 @@ class MasterService {
      * recording the task on the object.
      */
     tl::expected<void, ErrorCode> PushPromotionQueue(
-        const ObjectIdentity& object_id, Replica& source_replica);
+        const ObjectIdentity& object_id, Replica& source_replica,
+        const std::string& task_id);
 
     /**
      * @brief Helper invoked from GetReplicaList when an only-LOCAL_DISK key is
@@ -2022,8 +2060,17 @@ class MasterService {
 
     const bool enable_oplog_;
     const bool weight_management_mutations_enabled_;
+    std::atomic<int64_t> oplog_durable_wait_timeout_ms_;
     const uint32_t oplog_batch_max_entries_;
     const uint64_t restore_repair_durable_timeout_ms_;
+
+    // Lock-free generation/task token generator: initialized once per master
+    // incarnation with a random prefix, avoiding per-write OS RNG syscalls and
+    // extra heap churn under shard write locks.
+    std::string generation_prefix_;
+    mutable std::atomic<uint64_t> next_generation_seq_{1};
+    std::string NextGenerationToken() const;
+    static int64_t ValidateOpLogDurableWaitTimeoutMs(uint64_t timeout_ms);
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
@@ -2301,6 +2348,32 @@ class MasterService {
                           const route::WriteGuard& guard);
     void PublishKvCleared(const TenantId& tenant_id);
 
+    // HA update admission owns the old allocations independently of their
+    // metadata while REMOVE is becoming durable. Timeouts, empty metadata,
+    // force erasure and writer shutdown cannot free a still-durable address.
+    struct HaUpsertAdmission {
+        TenantId tenant_id;
+        std::string key;
+        std::string generation;
+        std::chrono::system_clock::time_point release_at;
+        std::vector<Replica> replicas;
+        uint64_t sequence{0};
+        bool active{true};
+        bool durable{false};
+    };
+    mutable std::mutex ha_upsert_admissions_mutex_;
+    std::atomic<size_t> pending_ha_upsert_count_{0};
+    std::unordered_map<std::string, std::shared_ptr<HaUpsertAdmission>>
+        ha_upsert_admissions_;
+    bool HasPendingHaUpsertAdmission(const ObjectIdentity& object_id) const;
+    void CompleteHaUpsertInvalidation(
+        const std::string& scoped_key,
+        const std::shared_ptr<HaUpsertAdmission>& admission);
+
+    void RetireHaUpsertReplicas(
+        const std::shared_ptr<HaUpsertAdmission>& admission);
+    void ReleaseOffboardingTasksForClient(const UUID& client_id);
+
     // OpLog publishing
     std::shared_ptr<HaKvBackend> batch_oplog_kv_backend_;
     std::unique_ptr<OpLogBatchStorage> batch_oplog_storage_;
@@ -2313,6 +2386,13 @@ class MasterService {
     bool batch_oplog_pruning_stop_requested_{false};
     BatchOpLogWriterFactory batch_oplog_writer_factory_;
 
+    tl::expected<uint64_t, ErrorCode> PreparePutEnd(
+        const UUID& client_id, const ObjectMeta& object_meta,
+        const TenantId& tenant_id, ReplicaType replica_type);
+    tl::expected<void, ErrorCode> WaitForOpLogDurable(uint64_t sequence) const;
+    tl::expected<void, ErrorCode> WaitForOpLogFinalized(
+        uint64_t sequence) const;
+
     // OpLog publishing helpers
     std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
     std::string SerializeMetadataForOpLogFromReplicaDescriptors(
@@ -2322,6 +2402,10 @@ class MasterService {
                                          bool require_fenced_writer);
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
         OpType type, const std::string& tenant_id, const std::string& key,
+        const std::string& payload);
+    tl::expected<uint64_t, ErrorCode> AppendReservedOpLogVisibleBeforeDurable(
+        OrderedOpLogWriter::Reservation&& reservation, OpType type,
+        const std::string& tenant_id, const std::string& key,
         const std::string& payload);
     tl::expected<OpLogEntry, ErrorCode> AppendOpLogWithDurableFinalize(
         OpType type, const std::string& tenant_id, const std::string& key,

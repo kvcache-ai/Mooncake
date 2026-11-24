@@ -101,6 +101,36 @@ TEST(SsdGenerationCodec, WireSchemasPreserveStructPackCompatibility) {
     ASSERT_TRUE(decoded_disk);
     EXPECT_EQ(decoded_disk->transport_endpoint, "127.0.0.1:9000");
     EXPECT_FALSE(decoded_disk->storage_key.has_value());
+
+    // Verify nested compatible fields inside Replica::Descriptor (std::variant
+    // holding LocalDiskDescriptor + top-level write_generation) and
+    // GetReplicaListResponse round-trip cleanly.
+    Replica::Descriptor desc;
+    desc.id = 77;
+    desc.status = ReplicaStatus::COMPLETE;
+    desc.descriptor_variant = disk;
+    desc.write_generation = "gen-1";
+    GetReplicaListResponse resp;
+    resp.replicas.push_back(desc);
+    resp.lease_ttl_ms = 1234;
+    resp.object_checksum = uint64_t{99};
+    resp.resolved_tenant_id = "default";
+    resp.object_generation = "gen-1";
+    auto decoded_resp = struct_pack::deserialize<GetReplicaListResponse>(
+        struct_pack::serialize(resp));
+    ASSERT_TRUE(decoded_resp);
+    ASSERT_EQ(decoded_resp->replicas.size(), 1u);
+    EXPECT_EQ(decoded_resp->object_generation.value_or(""), "gen-1");
+    EXPECT_EQ(decoded_resp->replicas[0].write_generation.value_or(""), "gen-1");
+    ASSERT_TRUE(decoded_resp->replicas[0].is_local_disk_replica());
+    EXPECT_EQ(decoded_resp->replicas[0]
+                  .get_local_disk_descriptor()
+                  .storage_key.value_or(""),
+              MakeOffloadStorageKey("k", "gen-1"));
+    EXPECT_EQ(decoded_resp->replicas[0]
+                  .get_local_disk_descriptor()
+                  .object_generation.value_or(""),
+              "gen-1");
 }
 
 TEST(SsdGenerationCodec, PromotionAllocationReturnsCapturedAuthority) {
