@@ -2431,24 +2431,59 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
 #ifdef USE_URING
         UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
         if (uring_file != nullptr) {
+            // Min-copy read plan. Each object's byte range is read by ONE
+            // direct io_uring descriptor anchored on the block grid: from
+            // align_down(start) to align_up(end), straight into the
+            // destination. The head and tail neighbors (at most 4 KiB each
+            // side, and zero for an object that starts on the grid) ride
+            // along in the same batch — reading them costs a sliver of
+            // device bandwidth, while splitting them into per-object
+            // buffered preads would serialize a synchronous round trip per
+            // object, which loses far more on any high-latency backend.
+            // No user-space copy anywhere; the span pointer carries the
+            // anchor shift. The last object of a bucket may short-read at
+            // EOF inside its tail neighbor, so only the object's own bytes
+            // are required. An unaligned destination degrades that object
+            // to a buffered read instead of failing the batch.
             struct BatchReadPlan {
                 const ReadPlan* plan;
                 size_t offset_in_buffer;
                 size_t min_required;
             };
+            struct BufferedRead {
+                void* dest;
+                int64_t file_offset;
+                size_t length;
+            };
 
             std::vector<UringFile::ReadDesc> read_descs;
             std::vector<BatchReadPlan> batch_read_plans;
+            std::vector<BufferedRead> buffered_reads;
             read_descs.reserve(read_plans.size());
             batch_read_plans.reserve(read_plans.size());
+            buffered_reads.reserve(read_plans.size());
 
             for (const auto& plan : read_plans) {
                 int64_t actual_offset =
                     plan.offset + plan.key_size + plan.value_offset;
-                int64_t aligned_offset =
-                    align_down(actual_offset, kDirectIOAlignment);
                 int64_t data_end =
                     actual_offset + static_cast<int64_t>(plan.dest_slice.size);
+                char* const dest = static_cast<char*>(plan.dest_slice.ptr);
+                const bool dest_aligned =
+                    reinterpret_cast<uintptr_t>(dest) %
+                        kDirectIOAlignment ==
+                    0;
+
+                if (!dest_aligned) {
+                    // Degraded: one buffered read of the exact range; the
+                    // span keeps its destination.
+                    buffered_reads.push_back(
+                        {dest, actual_offset, plan.dest_slice.size});
+                    continue;
+                }
+
+                int64_t aligned_offset =
+                    align_down(actual_offset, kDirectIOAlignment);
                 int64_t aligned_end = static_cast<int64_t>(align_up(
                     static_cast<size_t>(data_end), kDirectIOAlignment));
                 size_t aligned_size =
@@ -2463,45 +2498,93 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                                   offset_in_buffer + plan.dest_slice.size});
             }
 
-            auto batch_read_result = uring_file->batch_read(
-                read_descs.data(), static_cast<int>(read_descs.size()));
-            if (!batch_read_result) {
-                NotifyDiskError(uring_file->sys_errno(), "read");
-                for (size_t i = 0; i < read_descs.size(); ++i) {
-                    if (read_descs[i].error == ErrorCode::OK) continue;
-                    LOG(ERROR)
-                        << "batch_read failed for key: "
-                        << batch_read_plans[i].plan->key
-                        << ", bucket_id=" << batch_read_plans[i].plan->bucket_id
-                        << ", error=" << read_descs[i].error
-                        << ErrnoSuffix(uring_file->sys_errno());
+            if (!read_descs.empty()) {
+                auto batch_read_result = uring_file->batch_read(
+                    read_descs.data(), static_cast<int>(read_descs.size()));
+                if (!batch_read_result) {
+                    NotifyDiskError(uring_file->sys_errno(), "read");
+                    for (size_t i = 0; i < read_descs.size(); ++i) {
+                        if (read_descs[i].error == ErrorCode::OK) continue;
+                        LOG(ERROR)
+                            << "batch_read failed for key: "
+                            << batch_read_plans[i].plan->key
+                            << ", bucket_id="
+                            << batch_read_plans[i].plan->bucket_id
+                            << ", error=" << read_descs[i].error
+                            << ErrnoSuffix(uring_file->sys_errno());
+                    }
+                    return tl::make_unexpected(batch_read_result.error());
                 }
-                return tl::make_unexpected(batch_read_result.error());
+
+                for (size_t i = 0; i < read_descs.size(); ++i) {
+                    const auto& desc = read_descs[i];
+                    const auto& batch_plan = batch_read_plans[i];
+                    const auto& plan = *batch_plan.plan;
+                    if (!desc.completed) {
+                        LOG(ERROR)
+                            << "batch_read did not complete for key: "
+                            << plan.key
+                            << ", bucket_id=" << plan.bucket_id;
+                        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                    }
+                    if (desc.bytes_read < batch_plan.min_required) {
+                        LOG(ERROR)
+                            << "batch_read short read for key: " << plan.key
+                            << ", bucket_id=" << plan.bucket_id
+                            << ", expected at least: "
+                            << batch_plan.min_required
+                            << " (aligned_size=" << desc.len
+                            << ", data_size=" << plan.dest_slice.size
+                            << "), got: " << desc.bytes_read;
+                        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                    }
+                    plan.destination->slice.ptr =
+                        static_cast<char*>(plan.dest_slice.ptr) +
+                        batch_plan.offset_in_buffer;
+                }
             }
 
-            for (size_t i = 0; i < read_descs.size(); ++i) {
-                const auto& desc = read_descs[i];
-                const auto& batch_plan = batch_read_plans[i];
-                const auto& plan = *batch_plan.plan;
-                if (!desc.completed) {
-                    LOG(ERROR)
-                        << "batch_read did not complete for key: " << plan.key
-                        << ", bucket_id=" << plan.bucket_id;
-                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            if (!buffered_reads.empty()) {
+                const int buffered_fd = ::open(
+                    filepath_res.value().c_str(), O_RDONLY | O_CLOEXEC);
+                if (buffered_fd < 0) {
+                    const int err = errno;
+                    NotifyDiskError(err, "open");
+                    LOG(ERROR) << "Failed to open buffered handle for "
+                                  "hybrid reads: "
+                               << filepath_res.value() << ", errno=" << err
+                               << " (" << strerror(err) << ")";
+                    return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
                 }
-                if (desc.bytes_read < batch_plan.min_required) {
-                    LOG(ERROR)
-                        << "batch_read short read for key: " << plan.key
-                        << ", bucket_id=" << plan.bucket_id
-                        << ", expected at least: " << batch_plan.min_required
-                        << " (aligned_size=" << desc.len
-                        << ", data_size=" << plan.dest_slice.size
-                        << "), got: " << desc.bytes_read;
-                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                FdGuard buffered_guard(buffered_fd);
+                for (const auto& read : buffered_reads) {
+                    size_t done = 0;
+                    while (done < read.length) {
+                        const ssize_t n = ::pread(
+                            buffered_fd,
+                            static_cast<char*>(read.dest) + done,
+                            read.length - done,
+                            read.file_offset + static_cast<off_t>(done));
+                        if (n < 0) {
+                            if (errno == EINTR) continue;
+                            const int err = errno;
+                            NotifyDiskError(err, "pread");
+                            LOG(ERROR) << "hybrid buffered read failed, "
+                                          "errno="
+                                       << err << " (" << strerror(err) << ")";
+                            return tl::make_unexpected(
+                                ErrorCode::FILE_READ_FAIL);
+                        }
+                        if (n == 0) {
+                            LOG(ERROR) << "hybrid buffered read hit EOF at "
+                                       << read.file_offset +
+                                              static_cast<off_t>(done);
+                            return tl::make_unexpected(
+                                ErrorCode::FILE_READ_FAIL);
+                        }
+                        done += static_cast<size_t>(n);
+                    }
                 }
-                plan.destination->slice.ptr =
-                    static_cast<char*>(plan.dest_slice.ptr) +
-                    batch_plan.offset_in_buffer;
             }
             return {};
         }
@@ -2584,11 +2667,12 @@ tl::expected<bool, ErrorCode> ReadPackedBucketDirectWrite() {
         std::string{"0"});
     if (setting == "0" || setting == "false") return false;
     if (setting == "packed" || setting == "true" || setting == "1") return true;
-    // BucketBackendConfig::FromEnvironment() turns aligned into
-    // aligned_direct_write.
-    if (setting == "aligned") return false;
+    // BucketBackendConfig::FromEnvironment() turns aligned and uring into
+    // aligned_direct_write; uring additionally selects the io_uring data
+    // file handle in OpenFile.
+    if (setting == "aligned" || setting == "uring") return false;
     LOG(ERROR) << "Invalid MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE='" << setting
-               << "'; expected 0/false, packed/true/1 or aligned";
+               << "'; expected 0/false, packed/true/1, aligned or uring";
     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 }
 }  // namespace
@@ -2620,6 +2704,23 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
 #else
             LOG(WARNING) << "Packed bucket direct writes require a build with "
                             "liburing; using buffered bucket writes";
+#endif
+        }
+        if (bucket_backend_config_.aligned_uring_write) {
+#ifdef USE_URING
+            if (!file_storage_config_.use_uring) {
+                LOG(WARNING)
+                    << "MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=uring requires "
+                       "MOONCAKE_OFFLOAD_USE_URING=true; using buffered bucket "
+                       "writes";
+            } else {
+                LOG(INFO) << "Hybrid bucket writes: interior blocks direct "
+                             "via io_uring, first/last 4 KiB blocks buffered";
+            }
+#else
+            LOG(WARNING) << "MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=uring "
+                            "requires a build with liburing; using buffered "
+                            "bucket writes";
 #endif
         }
 
@@ -3525,7 +3626,284 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
 
     // The UringFile branch below packs data_size bytes; it must not see the
     // padded iovecs of an aligned direct bucket.
-    if (direct_write) {
+    const bool hybrid_write =
+        bucket_backend_config_.aligned_uring_write &&
+        dynamic_cast<UringFile*>(file.get()) != nullptr;
+    if (hybrid_write) {
+        // Hybrid bucket write per the write-plan design. The plain bucket
+        // layout is one contiguous byte stream, and the plan is assembled
+        // over the stream's 4 KiB blocks: every block between the first
+        // and the last is 4 KiB-aligned in the file by construction (the
+        // file system maps 4 KiB-aligned offsets to 4 KiB-aligned physical
+        // blocks), so the interior goes out as direct io_uring writes —
+        // zero-copy runs where a slice's buffer sits on the block grid,
+        // whole-block fragments around them copied through the per-worker
+        // write-back buffer. Only the first and the last 4 KiB block can
+        // be misaligned (source pointer, or the final partial length);
+        // they go through buffered pwritev, at most two calls per plan.
+        // The trailing datasync shared by all branches below flushes those
+        // fragments and barriers the direct writes.
+        constexpr int64_t kBlock = kDirectIOAlignment;
+        int64_t total = 0;
+        for (const auto& iov : iovs) {
+            total += static_cast<int64_t>(iov.iov_len);
+        }
+        const int64_t interior_begin = std::min<int64_t>(kBlock, total);
+        const int64_t interior_end = total & ~(kBlock - 1);
+
+        // Buffered fragments: exactly the first and last 4 KiB blocks of
+        // the stream — at most two pwritev calls per plan.
+        struct BufferedRun {
+            int64_t offset;
+            int64_t length;
+        };
+        std::vector<BufferedRun> buffered;
+        if (interior_begin > 0) {
+            buffered.push_back({0, interior_begin});
+        }
+        if (interior_end < total) {
+            buffered.push_back({interior_end, total - interior_end});
+        }
+
+        // Per-worker write-back buffer: allocated once at the configured
+        // size and reused, so workers never repeatedly allocate and free
+        // scratch memory. Each sub batch is packed so its TOTAL size never
+        // exceeds this buffer (worst case, every byte misaligned), and the
+        // buffer is reused once a sub batch's batch_write has completed.
+        thread_local AlignedCopyBuffer write_back;
+        const int64_t cap = bucket_backend_config_.write_back_buffer_bytes;
+        const size_t want = static_cast<size_t>(
+            cap > 0 ? cap : std::max<int64_t>(total, kBlock));
+        if (want > write_back.capacity) {
+            void* wbuf = nullptr;
+            const int ret =
+                posix_memalign(&wbuf, kDirectIOAlignment, want);
+            if (ret != 0) {
+                LOG(ERROR) << "Failed to allocate " << want
+                           << " bytes for hybrid bucket writes: "
+                           << strerror(ret);
+                CleanupOrphanedBucket(bucket_id, disk_index);
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            write_back.data.reset(static_cast<char*>(wbuf));
+            write_back.capacity = want;
+        }
+
+        // Gather [from, from+len) of the byte stream into dst, walking the
+        // iov chain. A copied block may span several slices.
+        const auto gather = [&](int64_t from, int64_t len, char* dst) {
+            int64_t done = 0;
+            int64_t pos = 0;
+            for (const auto& iov : iovs) {
+                const int64_t iov_end =
+                    pos + static_cast<int64_t>(iov.iov_len);
+                if (iov_end > from && pos < from + len) {
+                    const int64_t s = std::max(pos, from);
+                    const int64_t e = std::min(iov_end, from + len);
+                    memcpy(dst + (s - from),
+                           static_cast<const char*>(iov.iov_base) +
+                               (s - pos),
+                           e - s);
+                    done += e - s;
+                    if (done >= len) break;
+                }
+                pos = iov_end;
+            }
+            return done;
+        };
+
+        // Walk the interior and enumerate the plan's pieces: maximal
+        // zero-copy runs where an iovec's source sits on the block grid
+        // (ptr(x) = base + (x - s) with x block-aligned, so the condition
+        // is (base - s) being a multiple of the block), and the whole-block
+        // copy regions between them. Pieces are then packed into sub
+        // batches whose TOTAL size never exceeds the write-back buffer —
+        // even a fully misaligned sub batch fits by construction, so
+        // nothing ever falls back from direct I/O — and never exceeds the
+        // ring depth in descriptors. Each sub batch is one batch_write;
+        // the buffer is reused once its sub batch has completed.
+        struct Piece {
+            char* src;  // nullptr: gather from the stream (misaligned)
+            int64_t off;
+            int64_t len;
+        };
+        std::vector<Piece> pieces;
+        pieces.reserve(iovs.size() + 8);
+        if (interior_end > interior_begin) {
+            int64_t gap_off = interior_begin;
+            int64_t pos = 0;
+            for (const auto& iov : iovs) {
+                const int64_t s = pos;
+                const int64_t e = pos + static_cast<int64_t>(iov.iov_len);
+                pos = e;
+                const int64_t cs = std::max(s, interior_begin);
+                const int64_t ce = std::min(e, interior_end);
+                if (ce <= cs) continue;
+                const bool on_grid =
+                    ((reinterpret_cast<intptr_t>(iov.iov_base) - s) %
+                     kBlock) == 0;
+                if (on_grid) {
+                    const int64_t b0 = (cs + kBlock - 1) & ~(kBlock - 1);
+                    const int64_t b1 = ce & ~(kBlock - 1);
+                    if (b1 > b0) {
+                        if (b0 > gap_off) {
+                            pieces.push_back({nullptr, gap_off, b0 - gap_off});
+                        }
+                        pieces.push_back(
+                            {static_cast<char*>(iov.iov_base) +
+                                 static_cast<int64_t>(b0 - s),
+                             b0, b1 - b0});
+                        gap_off = b1;
+                    }
+                }
+            }
+            if (interior_end > gap_off) {
+                pieces.push_back({nullptr, gap_off, interior_end - gap_off});
+            }
+        }
+
+        auto* uring_file = static_cast<UringFile*>(file.get());
+        std::vector<UringFile::ReadDesc> descs;
+        descs.reserve(33);
+        int64_t batch_bytes = 0;
+        char* wcur = write_back.data.get();
+        const int64_t batch_cap =
+            static_cast<int64_t>(write_back.capacity);
+        int64_t direct_written = 0;
+        const auto submit_sub_batch =
+            [&]() -> tl::expected<void, ErrorCode> {
+            if (descs.empty()) return {};
+            auto r = uring_file->batch_write(descs.data(),
+                                             static_cast<int>(descs.size()));
+            if (!r) {
+                NotifyDiskError(uring_file->sys_errno(), "write");
+                LOG(ERROR) << "hybrid batch write failed for: " << bucket_id
+                           << ", error: " << r.error()
+                           << ErrnoSuffix(uring_file->sys_errno());
+                return tl::make_unexpected(r.error());
+            }
+            for (const auto& d : descs) {
+                direct_written += static_cast<int64_t>(d.len);
+            }
+            descs.clear();
+            batch_bytes = 0;
+            wcur = write_back.data.get();
+            return {};
+        };
+        for (const auto& p : pieces) {
+            char* src = p.src;
+            int64_t off = p.off;
+            int64_t remaining = p.len;
+            while (remaining > 0) {
+                const int64_t chunk = std::min(remaining, batch_cap);
+                if (descs.size() >= 32 || batch_bytes + chunk > batch_cap) {
+                    auto r = submit_sub_batch();
+                    if (!r) {
+                        CleanupOrphanedBucket(bucket_id, disk_index);
+                        return r;
+                    }
+                }
+                if (src != nullptr) {
+                    descs.push_back(UringFile::ReadDesc{
+                        src, static_cast<size_t>(chunk),
+                        static_cast<off_t>(off), 0, ErrorCode::OK, false});
+                    src += chunk;
+                } else {
+                    gather(off, chunk, wcur);
+                    descs.push_back(UringFile::ReadDesc{
+                        wcur, static_cast<size_t>(chunk),
+                        static_cast<off_t>(off), 0, ErrorCode::OK, false});
+                    wcur += chunk;
+                }
+                batch_bytes += chunk;
+                off += chunk;
+                remaining -= chunk;
+            }
+        }
+        {
+            auto r = submit_sub_batch();
+            if (!r) {
+                CleanupOrphanedBucket(bucket_id, disk_index);
+                return r;
+            }
+        }
+
+        const int buffered_fd =
+            ::open(bucket_data_path.c_str(), O_WRONLY | O_CLOEXEC);
+        if (buffered_fd < 0) {
+            const int err = errno;
+            LOG(ERROR) << "Failed to open buffered handle for hybrid write: "
+                       << bucket_data_path << ", errno=" << err << " ("
+                       << strerror(err) << ")";
+            NotifyDiskError(err, "open");
+            CleanupOrphanedBucket(bucket_id, disk_index);
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        FdGuard buffered_guard(buffered_fd);
+
+        // Buffered fragments, one pwritev each, sliced straight from the
+        // original iovs: the first and last 4 KiB blocks.
+        int64_t written_total = 0;
+        for (const auto& run : buffered) {
+            std::vector<iovec> part;
+            part.reserve(4);
+            int64_t pos = 0;
+            for (const auto& iov : iovs) {
+                const int64_t s = pos;
+                const int64_t e = pos + static_cast<int64_t>(iov.iov_len);
+                pos = e;
+                if (e <= run.offset || s >= run.offset + run.length) {
+                    continue;
+                }
+                const int64_t bs = std::max(s, run.offset);
+                const int64_t be = std::min(e, run.offset + run.length);
+                part.push_back(iovec{
+                    static_cast<char*>(iov.iov_base) + (bs - s),
+                    static_cast<size_t>(be - bs)});
+            }
+            int64_t done = 0;
+            size_t idx = 0;
+            off_t off = static_cast<off_t>(run.offset);
+            while (done < run.length && idx < part.size()) {
+                const int cnt = static_cast<int>(
+                    std::min<size_t>(part.size() - idx, IOV_MAX));
+                ssize_t n = ::pwritev(buffered_fd, part.data() + idx, cnt,
+                                      off);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    const int err = errno;
+                    NotifyDiskError(err, "pwritev");
+                    LOG(ERROR) << "hybrid buffered write failed for: "
+                               << bucket_id << ", errno=" << err << " ("
+                               << strerror(err) << ")";
+                    CleanupOrphanedBucket(bucket_id, disk_index);
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                }
+                done += n;
+                off += static_cast<off_t>(n);
+                ssize_t adv = n;
+                while (idx < part.size() &&
+                       adv >= static_cast<ssize_t>(part[idx].iov_len)) {
+                    adv -= static_cast<ssize_t>(part[idx].iov_len);
+                    ++idx;
+                }
+                if (idx < part.size() && adv > 0) {
+                    part[idx].iov_base =
+                        static_cast<char*>(part[idx].iov_base) + adv;
+                    part[idx].iov_len -= static_cast<size_t>(adv);
+                }
+            }
+            written_total += done;
+        }
+
+        if (written_total + direct_written != total) {
+            LOG(ERROR) << "Hybrid write size mismatch for: " << bucket_id
+                       << ", expected: " << total
+                       << ", got: " << (written_total + direct_written);
+            CleanupOrphanedBucket(bucket_id, disk_index);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+    } else if (direct_write) {
         // One pwritev takes at most IOV_MAX iovecs.
         off_t offset = 0;
         for (size_t i = 0; i < iovs.size(); i += IOV_MAX) {
@@ -4921,8 +5299,15 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode,
         if (!packed) return tl::make_unexpected(packed.error());
         packed_write = packed.value();
     }
-    const bool use_direct = file_storage_config_.use_uring &&
-                            (mode == FileMode::Read || packed_write);
+    // Aligned uring buckets write their data file through UringFile: the
+    // block-aligned iovecs from BuildAlignedDirectBucket go out as queued
+    // write SQEs instead of a synchronous pwritev.
+    const bool aligned_uring_write =
+        bucket_backend_config_.aligned_uring_write &&
+        mode == FileMode::Write && path.ends_with(BUCKET_DATA_FILE_SUFFIX);
+    const bool use_direct =
+        file_storage_config_.use_uring &&
+        (mode == FileMode::Read || packed_write || aligned_uring_write);
     if (use_direct) {
         flags |= O_DIRECT;
     }

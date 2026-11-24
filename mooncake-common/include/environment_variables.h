@@ -66,6 +66,9 @@ struct BucketBackendEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS);
+    // Per write-worker thread-local write-back buffer cap for copying
+    // misaligned slices into aligned direct-write pieces.
+    MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_WRITE_BACK_BUFFER_BYTES);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_BUCKET_EVICTION_POLICY);
 };

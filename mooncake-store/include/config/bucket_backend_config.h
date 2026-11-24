@@ -91,6 +91,31 @@ struct BucketBackendConfig {
     // Set by MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=aligned.
     bool aligned_direct_write = false;
 
+    // Hybrid bucket writes: the plain bucket layout is written as one
+    // contiguous byte stream whose interior 4 KiB blocks are all
+    // file-aligned by construction. The interior goes out as direct
+    // io_uring writes — zero-copy runs where a slice's buffer sits on the
+    // block grid, whole-block fragments around them copied through a
+    // per-worker write-back buffer bounded by write_back_buffer_bytes.
+    // Only the first and the last 4 KiB block of the stream (at most two
+    // pwritev calls) are buffered. One trailing fdatasync makes both
+    // durable, so the per-bucket flush no longer waits for a full bucket
+    // writeback. Set by MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=uring;
+    // without MOONCAKE_OFFLOAD_USE_URING this degrades to buffered bucket
+    // writes.
+    bool aligned_uring_write = false;
+
+    // Cap of the per write-worker thread-local write-back buffer that
+    // misaligned slices are copied into so they can go out as aligned
+    // direct writes. The buffer is allocated once at this size on the
+    // worker's first bucket and reused, so workers never repeatedly
+    // allocate and free scratch memory. Objects whose copies would not
+    // fit are written buffered from their original buffers instead.
+    // 0 selects the legacy behavior: the buffer grows to the largest
+    // bucket seen (bounded by bucket_size_limit).
+    // Set by MOONCAKE_OFFLOAD_WRITE_BACK_BUFFER_BYTES.
+    int64_t write_back_buffer_bytes = 64LL * 1024 * 1024;
+
     bool Validate() const;
 
     /**

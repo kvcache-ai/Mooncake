@@ -24,6 +24,11 @@ bool BucketBackendConfig::Validate() const {
             << "BucketBackendConfig: invalid I/O workers or sub batch size";
         return false;
     }
+    if (write_back_buffer_bytes < 0) {
+        LOG(ERROR) << "BucketBackendConfig: write_back_buffer_bytes must "
+                      "be >= 0";
+        return false;
+    }
     if (bucket_keys_limit <= 0) {
         LOG(ERROR) << "BucketBackendConfig: bucket_keys_limit must > 0";
         return false;
@@ -75,10 +80,18 @@ BucketBackendConfig::FromEnvironment() {
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS,
                         config.flush_partial_buckets);
 
+    config.write_back_buffer_bytes = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_WRITE_BACK_BUFFER_BYTES,
+        config.write_back_buffer_bytes);
+
     // The other values of this variable are read by BucketStorageBackend.
-    config.aligned_direct_write =
-        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE,
-                        std::string{}) == "aligned";
+    {
+        const std::string direct =
+            Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE,
+                            std::string{});
+        config.aligned_direct_write = direct == "aligned";
+        config.aligned_uring_write = direct == "uring";
+    }
 
     config.bucket_keys_limit =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT,

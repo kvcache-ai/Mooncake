@@ -237,6 +237,12 @@ class UringFile : public StorageFile {
     };
     tl::expected<void, ErrorCode> batch_read(ReadDesc *descs, int cnt);
 
+    // Batched positioned writes: every descriptor is one O_DIRECT write at
+    // its own file offset, submitted with up to QUEUE_DEPTH others per
+    // io_uring_enter. Large descriptors are left whole — the block layer
+    // splits them — so one submission can queue a whole bucket's writes.
+    tl::expected<void, ErrorCode> batch_write(ReadDesc *descs, int cnt);
+
     // Flush data to stable storage via IORING_FSYNC_DATASYNC.
     // Must be called after write_aligned and before writing dependent metadata.
     tl::expected<void, ErrorCode> datasync() override;

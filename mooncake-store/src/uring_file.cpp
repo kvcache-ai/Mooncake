@@ -348,6 +348,59 @@ class SharedUringRing {
         return {};
     }
 
+    /// Mirror of batch_read for positioned writes: submit up to QUEUE_DEPTH
+    /// writes at once (each at its own offset), then collect completions.
+    /// Descriptors are left whole — the block layer splits large writes —
+    /// so one submission can queue a whole bucket's direct pieces.
+    tl::expected<void, ErrorCode> batch_write(int fd, ReadDesc* descs,
+                                              int cnt) {
+        cqe_errno_ = 0;
+        if (!initialized_)
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        for (int i = 0; i < cnt; ++i) {
+            descs[i].bytes_read = 0;
+            descs[i].error = ErrorCode::OK;
+            descs[i].completed = false;
+        }
+        int remaining = cnt;
+        int idx = 0;
+
+        while (remaining > 0) {
+            int batch = std::min(remaining, static_cast<int>(QUEUE_DEPTH));
+            if (io_uring_sq_space_left(&ring_) < static_cast<unsigned>(batch)) {
+                LOG(ERROR) << "[SharedUringRing] insufficient SQ space for "
+                           << batch << " batch writes";
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+            uint64_t op = next_operation_tag();
+
+            for (int i = 0; i < batch; ++i) {
+                struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+                if (!sqe) {
+                    LOG(ERROR) << "[SharedUringRing] SQ full (batch_write)";
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                }
+                auto& d = descs[idx + i];
+                io_uring_prep_write(sqe, fd, d.buf, d.len, d.off);
+                sqe->user_data = op | static_cast<uint64_t>(i + 1);
+            }
+
+            auto res = collect_batch(batch, op, descs + idx);
+            if (!res) return res;
+            for (int i = 0; i < batch; ++i) {
+                auto& d = descs[idx + i];
+                if (d.error != ErrorCode::OK || d.bytes_read != d.len) {
+                    LOG(ERROR) << "[SharedUringRing] batch write short: "
+                               << d.bytes_read << "/" << d.len;
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                }
+            }
+            idx += batch;
+            remaining -= batch;
+        }
+        return {};
+    }
+
     /// Issue IORING_FSYNC_DATASYNC.  Blocks until complete.
     tl::expected<void, ErrorCode> fsync(int fd) {
         cqe_errno_ = 0;
@@ -1107,6 +1160,26 @@ tl::expected<void, ErrorCode> UringFile::batch_read(ReadDesc* descs, int cnt) {
     }
 
     auto res = SharedUringRing::instance().batch_read(fd_, descs, cnt);
+    if (!res) record_ring_errno();
+    return res;
+}
+
+tl::expected<void, ErrorCode> UringFile::batch_write(ReadDesc* descs, int cnt) {
+    if (fd_ < 0) return make_error<void>(ErrorCode::FILE_NOT_FOUND);
+    if (!descs || cnt <= 0)
+        return make_error<void>(ErrorCode::FILE_INVALID_BUFFER);
+
+    for (int i = 0; i < cnt; ++i) {
+        if (!descs[i].buf || descs[i].len == 0)
+            return make_error<void>(ErrorCode::FILE_INVALID_BUFFER);
+        if (use_direct_io_ &&
+            (reinterpret_cast<uintptr_t>(descs[i].buf) % ALIGNMENT_ ||
+             descs[i].len % ALIGNMENT_ || descs[i].off % ALIGNMENT_)) {
+            return make_error<void>(ErrorCode::FILE_INVALID_BUFFER);
+        }
+    }
+
+    auto res = SharedUringRing::instance().batch_write(fd_, descs, cnt);
     if (!res) record_ring_errno();
     return res;
 }
