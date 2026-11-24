@@ -23,6 +23,7 @@
 #include <ylt/struct_pack.hpp>
 #include <ylt/util/utils.hpp>
 
+#include "ssd_peer_directory.h"
 #include "ssd_pipeline_io.h"
 
 namespace mooncake::ssd_offload {
@@ -106,7 +107,7 @@ std::string WrapReply(const SsdControlReply& reply,
                       const std::array<unsigned char, kHmacBytes>& req_tag) {
     auto encoded = EncodeSsdControlReply(reply, limits);
     if (encoded.error != DestinationError::kOk) {
-        SsdControlReply fallback{reply.command, encoded.error, {}, {}};
+        SsdControlReply fallback{reply.command, encoded.error, {}};
         encoded = EncodeSsdControlReply(fallback, limits);
     }
     if (!cred) {
@@ -135,15 +136,7 @@ std::string WrapReply(const SsdControlReply& reply,
 }
 
 bool IsWildcardAddress(const std::string& host) {
-    in_addr v4{};
-    if (inet_pton(AF_INET, host.c_str(), &v4) == 1) {
-        return v4.s_addr == htonl(INADDR_ANY);
-    }
-    in6_addr v6{};
-    if (inet_pton(AF_INET6, host.c_str(), &v6) == 1) {
-        return IN6_IS_ADDR_UNSPECIFIED(&v6);
-    }
-    return true;
+    return !IsNonWildcardNumericHost(host);
 }
 
 struct Socket {
@@ -247,11 +240,14 @@ std::error_code Wait(int fd, short event, Clock::time_point deadline) {
 }
 
 std::error_code Transfer(int fd, char* buffer, size_t size, bool write,
-                         Clock::time_point deadline) {
+                         Clock::time_point deadline,
+                         size_t* bytes_transferred = nullptr) {
     size_t position = 0;
     while (position < size) {
-        if (Clock::now() >= deadline)
+        if (Clock::now() >= deadline) {
+            if (bytes_transferred) *bytes_transferred = position;
             return std::make_error_code(std::errc::timed_out);
+        }
         const ssize_t count =
             write ? send(fd, buffer + position, size - position,
 #ifdef MSG_NOSIGNAL
@@ -263,14 +259,21 @@ std::error_code Transfer(int fd, char* buffer, size_t size, bool write,
                   : recv(fd, buffer + position, size - position, 0);
         if (count > 0)
             position += size_t(count);
-        else if (count == 0)
+        else if (count == 0) {
+            if (bytes_transferred) *bytes_transferred = position;
             return std::make_error_code(std::errc::connection_reset);
-        else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
             auto error = Wait(fd, write ? POLLOUT : POLLIN, deadline);
-            if (error) return error;
-        } else if (errno != EINTR)
+            if (error) {
+                if (bytes_transferred) *bytes_transferred = position;
+                return error;
+            }
+        } else if (errno != EINTR) {
+            if (bytes_transferred) *bytes_transferred = position;
             return {errno, std::generic_category()};
+        }
     }
+    if (bytes_transferred) *bytes_transferred = position;
     return {};
 }
 
@@ -345,7 +348,9 @@ SsdRequesterCallResult CallOnSocket(Socket& socket, const std::string& host,
                                     uint16_t port,
                                     const SsdControlMessage& message,
                                     std::chrono::milliseconds timeout,
-                                    SsdReadProtocolLimits limits) {
+                                    SsdReadProtocolLimits limits,
+                                    bool* wrote_any = nullptr) {
+    if (wrote_any) *wrote_any = false;
     SsdRequesterCallResult out{DestinationError::kInvalidArgument, {}};
     if ((message.command != SsdControlCommand::kReadInto &&
          message.command != SsdControlCommand::kRecoverReadInto) ||
@@ -410,7 +415,10 @@ SsdRequesterCallResult CallOnSocket(Socket& socket, const std::string& host,
         struct_pack::serialize<struct_pack::sp_config::DISABLE_ALL_META_INFO,
                                std::string>(request);
     head.append(body);
-    io_err = Transfer(socket.fd, head.data(), head.size(), true, deadline);
+    size_t sent_bytes = 0;
+    io_err = Transfer(socket.fd, head.data(), head.size(), true, deadline,
+                      &sent_bytes);
+    if (wrote_any) *wrote_any = (sent_bytes > 0);
     std::array<char, Protocol::RESP_HEAD_LEN> response_head{};
     if (!io_err) {
         io_err = Transfer(socket.fd, response_head.data(), response_head.size(),
@@ -523,7 +531,7 @@ void SsdReadIntoRpcEndpoint::Call(SsdDirectRpcContext context,
                                           DestinationError err) {
         const std::array<unsigned char, kHmacBytes> zero_tag{};
         ctx.response_msg(
-            WrapReply({cmd, err, {}, {}}, limits, std::nullopt, {}, zero_tag));
+            WrapReply({cmd, err, {}}, limits, std::nullopt, {}, zero_tag));
     };
 
     try {
@@ -542,7 +550,7 @@ void SsdReadIntoRpcEndpoint::Call(SsdDirectRpcContext context,
             frame.substr(kSsdControlAuthHeaderBytes);
 
         // Quick command peek before dispatching onto read vs recovery pool.
-        // The wire header is [version:4][flags:4][command:4].
+        // The wire header is [magic:4][version:4][command:4].
         SsdControlCommand hinted_command = SsdControlCommand::kReadInto;
         if (wire_body.size() >= 12) {
             uint32_t raw_cmd = 0;
@@ -570,14 +578,13 @@ void SsdReadIntoRpcEndpoint::Call(SsdDirectRpcContext context,
 
         const bool is_recovery =
             hinted_command == SsdControlCommand::kRecoverReadInto;
-        if (!is_recovery) ++read_requests_;
         auto& pool = is_recovery ? *recovery_workers_ : *workers_;
 
-        auto task = [owner = owner_, limits = limits_, work, received,
+        auto task = [this, owner = owner_, limits = limits_, work, received,
                      hinted_command] {
             std::optional<WriteCredential> cred;
             SsdControlReply reply{
-                hinted_command, DestinationError::kUnauthorized, {}, {}};
+                hinted_command, DestinationError::kUnauthorized, {}};
             try {
                 cred = owner->LookupCredential(work->claimed_requester);
                 std::array<unsigned char, kHmacBytes> expected_tag{};
@@ -607,6 +614,10 @@ void SsdReadIntoRpcEndpoint::Call(SsdDirectRpcContext context,
                         reply.command = message.command;
                         reply.error = DestinationError::kUnauthorized;
                     } else {
+                        if (message.command == SsdControlCommand::kReadInto) {
+                            read_requests_.fetch_add(1,
+                                                     std::memory_order_relaxed);
+                        }
                         // Restore the authenticated shared credential in memory
                         // for SsdDirectReadOwner::Execute.
                         message.reference.credential = *cred;
@@ -616,7 +627,6 @@ void SsdReadIntoRpcEndpoint::Call(SsdDirectRpcContext context,
             } catch (...) {
                 reply.error = DestinationError::kTransportError;
                 reply.snapshot.reset();
-                reply.destinations.clear();
             }
             work->context.response_msg(WrapReply(reply, limits, cred,
                                                  work->claimed_requester,
@@ -624,8 +634,23 @@ void SsdReadIntoRpcEndpoint::Call(SsdDirectRpcContext context,
         };
 
         if (!pool.TrySubmit(std::move(task))) {
-            send_unauth(std::move(context), hinted_command,
-                        DestinationError::kLimit);
+            // If the requester is already cached in memory and authenticated,
+            // return a signed kLimit reply so the requester distinguishes
+            // backpressure from kUnauthorized and can fall back cleanly.
+            std::optional<WriteCredential> cached =
+                owner_->LookupCachedCredential(claimed_requester);
+            if (cached) {
+                std::array<unsigned char, kHmacBytes> expected_tag{};
+                if (!ComputeHmac(*cached, "MCREQ1", claimed_requester, {},
+                                 wire_body, expected_tag) ||
+                    !ConstantTimeEqual(claimed_tag.data(), expected_tag.data(),
+                                       kHmacBytes)) {
+                    cached.reset();
+                }
+            }
+            context.response_msg(
+                WrapReply({hinted_command, DestinationError::kLimit, {}},
+                          limits_, cached, claimed_requester, claimed_tag));
         }
     } catch (...) {
         send_unauth(std::move(context), SsdControlCommand::kReadInto,
@@ -639,8 +664,26 @@ SsdRequesterControlCall MakeSsdRequesterControlCall(
     return [limits, pool](const std::string& host, uint16_t port,
                           const SsdControlMessage& message,
                           std::chrono::milliseconds timeout) {
+        const auto start = Clock::now();
         auto socket = pool->Take(host, port);
-        auto call = CallOnSocket(socket, host, port, message, timeout, limits);
+        const bool from_pool = (socket.fd >= 0);
+        bool wrote_any = false;
+        auto call = CallOnSocket(socket, host, port, message, timeout, limits,
+                                 &wrote_any);
+        if (from_pool && !wrote_any &&
+            call.error == DestinationError::kTransportError) {
+            // Stale pooled socket closed before a single byte was written;
+            // retry once on a fresh connection within the remaining timeout.
+            const auto elapsed =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - start);
+            const auto remaining = timeout - elapsed;
+            if (remaining > std::chrono::milliseconds::zero()) {
+                socket = Socket{};
+                call = CallOnSocket(socket, host, port, message, remaining,
+                                    limits, &wrote_any);
+            }
+        }
         if (call.error == DestinationError::kOk) {
             pool->Keep(host, port, std::move(socket));
         }

@@ -33,9 +33,15 @@ class SsdDirectReadOwner {
     // Incremental trusted import is safe during active work, but never changes
     // the endpoint, tenant or credential of an already known identity/epoch.
     DestinationError UpsertPeer(SsdFixedL2Peer);
+    // Atomic batch variant of UpsertPeer: preflights conflicts and capacity
+    // before mutating the trusted peer table.
+    DestinationError UpsertPeers(std::vector<SsdFixedL2Peer>);
     // Resolves the trusted shared credential for an authorized requester
     // identity (for per-frame transport HMAC authentication off the I/O loop).
     std::optional<WriteCredential> LookupCredential(PeerIdentity) const;
+    // Memory-only cached lookup (never performs directory/disk I/O), safe on
+    // the RPC I/O loop for signing backpressure replies to known peers.
+    std::optional<WriteCredential> LookupCachedCredential(PeerIdentity) const;
     void Close();
     SsdControlStats stats() const;
 

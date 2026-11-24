@@ -743,3 +743,5 @@ add_store_test(ssd_tcp_write_target_test ssd_tcp_write_target_test.cpp)
 add_store_test(ssd_control_rpc_test ssd_control_rpc_test.cpp)
 
 add_store_test(ssd_peer_directory_test ssd_peer_directory_test.cpp)
+
+add_store_test(ssd_direct_runtime_test ssd_direct_runtime_test.cpp)

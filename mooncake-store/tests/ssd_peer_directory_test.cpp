@@ -190,5 +190,83 @@ TEST_F(SsdPeerDirectoryTest, PureRequesterPublishesWithoutControlPort) {
     EXPECT_EQ(publisher.Unpublish(), DestinationError::kOk);
 }
 
+TEST_F(SsdPeerDirectoryTest,
+       SingleCorruptFileDoesNotPoisonHealthyPeerAndOmittedTopLevelCapHonored) {
+    SsdPeerDirectory writer(path), reader(path);
+    auto entry = Entry(7, 11);
+    entry.route.capability.max_batch_objects = 384;
+    ASSERT_EQ(writer.Publish(entry), DestinationError::kOk);
+
+    // Drop an unrelated corrupt peer file alongside the healthy publisher.
+    const auto corrupt =
+        path /
+        "ssd-peer-00000000000000ff-00000000000000ff-0000000000000001.json";
+    {
+        std::ofstream out(corrupt, std::ios::trunc);
+        out << "{invalid json";
+    }
+    ASSERT_EQ(chmod(corrupt.c_str(), 0600), 0);
+
+    // Healthy peer lookup must still succeed despite the corrupt sibling file.
+    auto found = reader.LookupLegacy("owner:100", "default", "tcp");
+    ASSERT_EQ(found.error, DestinationError::kOk);
+    ASSERT_TRUE(found.peer.has_value());
+    EXPECT_EQ(found.peer->fixed.identity, entry.fixed.identity);
+    EXPECT_EQ(found.peer->route.capability.max_batch_objects, 384u);
+
+    // Canonical codec honors capability.max_batch_objects when top-level
+    // max_batch_objects is omitted.
+    std::string encoded = EncodeSsdPeerDocument(entry);
+    Json::Value doc;
+    Json::CharReaderBuilder rb;
+    std::unique_ptr<Json::CharReader> parser(rb.newCharReader());
+    std::string errs;
+    ASSERT_TRUE(parser->parse(encoded.data(), encoded.data() + encoded.size(),
+                              &doc, &errs));
+    doc.removeMember("max_batch_objects");
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "";
+    auto decoded = DecodeSsdPeerDocument(Json::writeString(wb, doc));
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->route.capability.max_batch_objects, 384u);
+}
+
+TEST_F(SsdPeerDirectoryTest,
+       LookupRequesterSucceedsInO1Beyond256CrashLeftovers) {
+    // Seed 260 dead crash leftovers (unlocked .lock + .json files).
+    for (uint64_t epoch = 1; epoch <= 260; ++epoch) {
+        auto stale = Entry(50, epoch);
+        std::ostringstream stem;
+        stem << "ssd-peer-" << std::hex << std::setfill('0') << std::setw(16)
+             << stale.fixed.identity.client_id_high << '-' << std::setw(16)
+             << stale.fixed.identity.client_id_low << '-' << std::setw(16)
+             << stale.fixed.identity.boot_epoch;
+        const auto json_path = path / (stem.str() + ".json");
+        const auto lock_path = path / ("." + stem.str() + ".lock");
+        std::ofstream(json_path, std::ios::trunc)
+            << EncodeSsdPeerDocument(stale);
+        ASSERT_EQ(chmod(json_path.c_str(), 0600), 0);
+        std::ofstream(lock_path, std::ios::trunc);
+        ASSERT_EQ(chmod(lock_path.c_str(), 0600), 0);
+    }
+
+    SsdPeerDirectory live(path), reader(path);
+    auto current = Entry(50, 261);
+    ASSERT_EQ(live.Publish(current), DestinationError::kOk);
+
+    // O(1) LookupRequester finds live peer even with >256 prior crashes.
+    auto req = reader.LookupRequester(current.fixed.identity, "default", "tcp");
+    ASSERT_EQ(req.error, DestinationError::kOk);
+    ASSERT_TRUE(req.peer.has_value());
+    EXPECT_EQ(req.peer->fixed.identity.boot_epoch, 261u);
+
+    // Publish GC'd dead crash leftovers down to the bounded retention window.
+    size_t json_count = 0;
+    for (const auto& item : std::filesystem::directory_iterator(path)) {
+        if (item.path().extension() == ".json") ++json_count;
+    }
+    EXPECT_LE(json_count, 65u);
+}
+
 }  // namespace
 }  // namespace mooncake::ssd_offload

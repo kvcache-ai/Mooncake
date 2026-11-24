@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <glog/logging.h>
 #include <json/json.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -18,6 +19,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 #include "random.h"
 #include "tenant_id.h"
@@ -26,6 +28,7 @@ namespace mooncake::ssd_offload {
 namespace {
 
 constexpr size_t kMaxPeers = 256;
+constexpr size_t kMaxRetainedDeadLeftovers = 64;
 constexpr size_t kMaxDocumentBytes = 16384;
 constexpr uint64_t kMaxBatchObjects = 65536;
 
@@ -84,15 +87,7 @@ bool String(const std::string& value, size_t max = 4096) {
 }
 
 bool NonWildcardNumericHost(const std::string& host) {
-    in_addr v4{};
-    if (inet_pton(AF_INET, host.c_str(), &v4) == 1) {
-        return v4.s_addr != htonl(INADDR_ANY);
-    }
-    in6_addr v6{};
-    if (inet_pton(AF_INET6, host.c_str(), &v6) == 1) {
-        return !IN6_IS_ADDR_UNSPECIFIED(&v6);
-    }
-    return false;
+    return IsNonWildcardNumericHost(host);
 }
 
 bool Valid(const SsdPeerDirectoryEntry& entry) {
@@ -181,12 +176,11 @@ std::optional<SsdPeerDirectoryEntry> Decode(const std::string& bytes) {
           "max_inflight_bytes", "preferred_chunk_bytes"})
         if (!cap[field].isUInt64()) return {};
 
-    uint64_t max_objects = 64;
+    uint64_t max_objects = cap["max_batch_objects"].asUInt64();
+    if (max_objects == 0 || max_objects > kMaxBatchObjects) return {};
     if (value.isMember("max_batch_objects")) {
-        if (!value["max_batch_objects"].isUInt64()) return {};
-        max_objects = value["max_batch_objects"].asUInt64();
-        if (max_objects == 0 || max_objects > kMaxBatchObjects ||
-            cap["max_batch_objects"].asUInt64() != max_objects)
+        if (!value["max_batch_objects"].isUInt64() ||
+            value["max_batch_objects"].asUInt64() != max_objects)
             return {};
     }
 
@@ -254,6 +248,98 @@ struct SsdPeerDirectory::Impl {
         return fstat(directory.get(), &info) == 0 && Private(info, true);
     }
 
+    LookupResult ReadEntryFile(const std::string& name,
+                               bool skip_dead_leftovers) const {
+        File file(openat(directory.get(), name.c_str(),
+                         O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC));
+        if (file.get() < 0) {
+            if (errno == ENOENT) return {DestinationError::kNotFound, {}};
+            return {DestinationError::kUnauthorized, {}};
+        }
+        struct stat info{};
+        if (fstat(file.get(), &info) != 0 || !Private(info, false))
+            return {DestinationError::kUnauthorized, {}};
+        if (info.st_size <= 0 || uint64_t(info.st_size) > kMaxDocumentBytes)
+            return {DestinationError::kInvalidArgument, {}};
+        std::string bytes;
+        char buffer[4096];
+        for (;;) {
+            const auto got = read(file.get(), buffer, sizeof(buffer));
+            if (got < 0 && errno == EINTR) continue;
+            if (got < 0) return {DestinationError::kTransportError, {}};
+            if (!got) break;
+            bytes.append(buffer, size_t(got));
+            if (bytes.size() > kMaxDocumentBytes)
+                return {DestinationError::kInvalidArgument, {}};
+        }
+        auto entry = Decode(bytes);
+        if (!entry || Name(entry->fixed.identity) != name)
+            return {DestinationError::kInvalidArgument, {}};
+        if (skip_dead_leftovers &&
+            IsDeadCrashLeftover(directory.get(), entry->fixed.identity,
+                                lock_file_name)) {
+            return {DestinationError::kNotFound, {}};
+        }
+        return {DestinationError::kOk, std::move(entry)};
+    }
+
+    void GarbageCollectDeadLeftoversLocked() const {
+        int fd =
+            openat(directory.get(), ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd < 0) return;
+        DIR* raw = fdopendir(fd);
+        if (!raw) {
+            close(fd);
+            return;
+        }
+        std::unique_ptr<DIR, DirectoryClose> list(raw);
+        struct DeadEntry {
+            time_t mtime;
+            std::string json_name;
+            std::string lock_name;
+        };
+        std::vector<DeadEntry> dead;
+        while (auto* item = readdir(list.get())) {
+            const std::string name = item->d_name;
+            if (!name.starts_with("ssd-peer-") || !name.ends_with(".json"))
+                continue;
+            if (name == publication) continue;
+            const std::string stem = name.substr(0, name.size() - 5);
+            const std::string lock_name = "." + stem + ".lock";
+            if (!lock_file_name.empty() && lock_name == lock_file_name)
+                continue;
+            File lock_file(
+                openat(directory.get(), lock_name.c_str(),
+                       O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
+            if (lock_file.get() < 0) continue;
+            if (flock(lock_file.get(), LOCK_EX | LOCK_NB) != 0) continue;
+            struct stat info{};
+            time_t mtime = 0;
+            if (fstatat(directory.get(), name.c_str(), &info,
+                        AT_SYMLINK_NOFOLLOW) == 0) {
+                mtime = info.st_mtime;
+            }
+            flock(lock_file.get(), LOCK_UN);
+            dead.push_back({mtime, name, lock_name});
+        }
+        if (dead.size() <= kMaxRetainedDeadLeftovers) return;
+        std::sort(dead.begin(), dead.end(),
+                  [](const DeadEntry& a, const DeadEntry& b) {
+                      return a.mtime < b.mtime;
+                  });
+        const size_t to_remove = dead.size() - kMaxRetainedDeadLeftovers;
+        for (size_t i = 0; i < to_remove; ++i) {
+            File lock_file(
+                openat(directory.get(), dead[i].lock_name.c_str(),
+                       O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
+            if (lock_file.get() < 0) continue;
+            if (flock(lock_file.get(), LOCK_EX | LOCK_NB) != 0) continue;
+            (void)unlinkat(directory.get(), dead[i].json_name.c_str(), 0);
+            (void)unlinkat(directory.get(), dead[i].lock_name.c_str(), 0);
+            flock(lock_file.get(), LOCK_UN);
+        }
+    }
+
     LookupResult Lookup(
         const std::function<bool(const SsdPeerDirectoryEntry&)>& match,
         bool skip_dead_leftovers) const {
@@ -268,57 +354,63 @@ struct SsdPeerDirectory::Impl {
         }
         std::unique_ptr<DIR, DirectoryClose> list(raw);
         LookupResult result;
+        std::optional<DestinationError> first_file_error;
         size_t live_count = 0;
         errno = 0;
         while (auto* item = readdir(list.get())) {
             const std::string name = item->d_name;
             if (!name.starts_with("ssd-peer-") || !name.ends_with(".json"))
                 continue;
-            File file(openat(directory.get(), name.c_str(),
-                             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC));
-            if (file.get() < 0) {
-                if (errno == ENOENT) {
-                    errno = 0;
-                    continue;
-                }
-                return {DestinationError::kUnauthorized, {}};
+            auto loaded = ReadEntryFile(name, skip_dead_leftovers);
+            if (loaded.error == DestinationError::kNotFound) {
+                errno = 0;
+                continue;
             }
-            struct stat info{};
-            if (fstat(file.get(), &info) != 0 || !Private(info, false))
-                return {DestinationError::kUnauthorized, {}};
-            if (info.st_size <= 0 || uint64_t(info.st_size) > kMaxDocumentBytes)
-                return {DestinationError::kInvalidArgument, {}};
-            std::string bytes;
-            char buffer[4096];
-            for (;;) {
-                const auto got = read(file.get(), buffer, sizeof(buffer));
-                if (got < 0 && errno == EINTR) continue;
-                if (got < 0) return {DestinationError::kTransportError, {}};
-                if (!got) break;
-                bytes.append(buffer, size_t(got));
-                if (bytes.size() > kMaxDocumentBytes)
-                    return {DestinationError::kInvalidArgument, {}};
-            }
-            auto entry = Decode(bytes);
-            if (!entry || Name(entry->fixed.identity) != name)
-                return {DestinationError::kInvalidArgument, {}};
-            if (skip_dead_leftovers &&
-                IsDeadCrashLeftover(directory.get(), entry->fixed.identity,
-                                    lock_file_name)) {
+            if (loaded.error != DestinationError::kOk || !loaded.peer) {
+                // Skip isolated malformed/insecure files so one bad record does
+                // not poison discovery of healthy peers; fail closed with the
+                // recorded error if no healthy matching peer is found.
+                if (!first_file_error) first_file_error = loaded.error;
+                LOG(WARNING)
+                    << "Skipping invalid SSD peer directory entry '" << name
+                    << "' error=" << static_cast<int>(loaded.error);
                 errno = 0;
                 continue;
             }
             if (++live_count > kMaxPeers) return {DestinationError::kLimit, {}};
-            if (match(*entry)) {
+            if (match(*loaded.peer)) {
                 if (result.peer) return {DestinationError::kDuplicate, {}};
-                result = {DestinationError::kOk, std::move(entry)};
+                result = {DestinationError::kOk, std::move(loaded.peer)};
             }
             errno = 0;
         }
         if (errno) return {DestinationError::kTransportError, {}};
+        if (!result.peer && first_file_error) return {*first_file_error, {}};
         return result;
     }
 };
+
+bool IsNonWildcardNumericHost(const std::string& host) {
+    in_addr v4{};
+    if (inet_pton(AF_INET, host.c_str(), &v4) == 1) {
+        return v4.s_addr != htonl(INADDR_ANY);
+    }
+    in6_addr v6{};
+    if (inet_pton(AF_INET6, host.c_str(), &v6) == 1) {
+        return !IN6_IS_ADDR_UNSPECIFIED(&v6);
+    }
+    return false;
+}
+
+std::string EncodeSsdPeerDocument(const SsdPeerDirectoryEntry& entry) {
+    return Encode(entry);
+}
+
+std::optional<SsdPeerDirectoryEntry> DecodeSsdPeerDocument(
+    const std::string& bytes) {
+    if (bytes.size() > kMaxDocumentBytes) return std::nullopt;
+    return Decode(bytes);
+}
 
 SsdPeerDirectory::SsdPeerDirectory(std::string path) {
     while (path.size() > 1 && path.back() == '/') path.pop_back();
@@ -404,6 +496,7 @@ DestinationError SsdPeerDirectory::Publish(const SsdPeerDirectoryEntry& entry) {
     impl_->device = info.st_dev;
     impl_->inode = info.st_ino;
     cleanup();
+    impl_->GarbageCollectDeadLeftoversLocked();
     return DestinationError::kOk;
 }
 
@@ -424,14 +517,25 @@ SsdPeerDirectory::LookupResult SsdPeerDirectory::LookupLegacy(
 SsdPeerDirectory::LookupResult SsdPeerDirectory::LookupRequester(
     PeerIdentity identity, const std::string& tenant,
     const std::string& protocol) const {
+    if (!(identity.client_id_high || identity.client_id_low) ||
+        !identity.boot_epoch) {
+        return {DestinationError::kNotFound, {}};
+    }
     std::shared_lock lock(impl_->mutex);
-    return impl_->Lookup(
-        [&](const auto& entry) {
-            return entry.fixed.identity == identity &&
-                   entry.fixed.tenant_id == tenant &&
-                   entry.protocol == protocol;
-        },
-        /*skip_dead_leftovers=*/false);
+    if (!impl_->Secure()) return {DestinationError::kUnauthorized, {}};
+    // O(1) direct open by canonical identity filename: avoids O(N) directory
+    // scans and never fails with kLimit after accumulated crash leftovers.
+    auto loaded = impl_->ReadEntryFile(Name(identity),
+                                       /*skip_dead_leftovers=*/false);
+    if (loaded.error != DestinationError::kOk || !loaded.peer) {
+        return {loaded.error, {}};
+    }
+    if (loaded.peer->fixed.identity != identity ||
+        loaded.peer->fixed.tenant_id != tenant ||
+        loaded.peer->protocol != protocol) {
+        return {DestinationError::kNotFound, {}};
+    }
+    return loaded;
 }
 
 DestinationError SsdPeerDirectory::Unpublish() {

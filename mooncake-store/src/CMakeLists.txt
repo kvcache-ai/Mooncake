@@ -159,6 +159,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     ssd_file_storage_owner_reader.cpp
     ssd_control_rpc.cpp
     ssd_peer_directory.cpp
+    ssd_direct_runtime.cpp
     config/client_host_identity_config.cpp
     ssd_prefetcher.cpp
     config/client_metric_config.cpp

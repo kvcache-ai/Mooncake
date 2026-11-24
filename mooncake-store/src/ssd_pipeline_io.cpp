@@ -49,6 +49,19 @@ struct BoundedExecutor::Impl {
             }
         }
     }
+    bool TrySubmit(std::function<void()> task) noexcept {
+        if (!task) return false;
+        try {
+            std::lock_guard lock(mutex);
+            if (stopping || pending >= limit) return false;
+            tasks.push(std::move(task));
+            ++pending;
+            changed.notify_all();
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
     bool WaitSubmit(std::function<void()> task) noexcept {
         if (!task) return false;
         try {
@@ -85,6 +98,9 @@ struct BoundedExecutor::Impl {
 BoundedExecutor::BoundedExecutor(size_t workers, size_t max_outstanding)
     : impl_(std::make_unique<Impl>(workers, max_outstanding)) {}
 BoundedExecutor::~BoundedExecutor() { Shutdown(); }
+bool BoundedExecutor::TrySubmit(std::function<void()> task) noexcept {
+    return impl_->TrySubmit(std::move(task));
+}
 bool BoundedExecutor::WaitSubmit(std::function<void()> task) noexcept {
     return impl_->WaitSubmit(std::move(task));
 }

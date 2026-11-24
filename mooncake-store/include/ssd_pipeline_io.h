@@ -17,6 +17,8 @@ class BoundedExecutor {
     ~BoundedExecutor();
     BoundedExecutor(const BoundedExecutor&) = delete;
     BoundedExecutor& operator=(const BoundedExecutor&) = delete;
+    // Non-blocking submission; returns false immediately if stopping or full.
+    bool TrySubmit(std::function<void()> task) noexcept;
     // Wait for credit on the scheduler thread. Workers must never call this
     // method on their own executor.
     bool WaitSubmit(std::function<void()> task) noexcept;

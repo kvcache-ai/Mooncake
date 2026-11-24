@@ -18,11 +18,24 @@ struct SsdPeerDirectoryEntry {
     bool readable{false};
 };
 
-// Deployment-owned private shared directory. Documents contain shared HMAC
-// bootstrap secrets and must never be copied to public TransferEngine metadata
-// or diagnostics. Each live publisher holds an exclusive flock on a sidecar
-// lock file so crash-leftover records from SIGKILL/OOM never permanently poison
-// LookupLegacy with kDuplicate.
+// Returns true iff host is a valid numeric IPv4 or IPv6 address that is not a
+// wildcard bind address (0.0.0.0 / ::).
+bool IsNonWildcardNumericHost(const std::string& host);
+
+// Canonical version-1 JSON codec shared by SsdPeerDirectory and explicit
+// peer-bootstrap APIs. Documents contain 128-bit shared HMAC credentials and
+// must never be logged or exposed in public metrics.
+std::string EncodeSsdPeerDocument(const SsdPeerDirectoryEntry& entry);
+std::optional<SsdPeerDirectoryEntry> DecodeSsdPeerDocument(
+    const std::string& bytes);
+
+// Deployment-owned private local POSIX directory (single-node / co-located
+// deployment where flock() is honored by the local kernel; multi-node clusters
+// should use configure_ssd_push_peers over a private control plane). Documents
+// contain shared HMAC bootstrap secrets and must never be copied to public
+// TransferEngine metadata or diagnostics. Each live publisher holds an
+// exclusive flock on a sidecar lock file so crash-leftover records from
+// SIGKILL/OOM never permanently poison LookupLegacy with kDuplicate.
 class SsdPeerDirectory {
    public:
     struct LookupResult {

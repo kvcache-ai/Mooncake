@@ -435,5 +435,93 @@ TEST_F(SsdControlRpcTest, RejectsWildcardConnectAddress) {
     EXPECT_EQ(res6.error, DestinationError::kTransportError);
 }
 
+TEST_F(SsdControlRpcTest,
+       UnauthenticatedFramesDoNotIncrementReadRequestsAndQueueFullSignsLimit) {
+    std::promise<void> entered, release;
+    auto release_future = release.get_future().share();
+    auto owner = MakeOwner([&](const SsdReadRequestV1& req,
+                               std::shared_ptr<SourceDrainedWriteTarget>,
+                               std::chrono::steady_clock::time_point)
+                               -> std::optional<SsdReadResultV1> {
+        entered.set_value();
+        release_future.wait();
+        SsdReadResultV1 res{1, req.attempt, true, {}, req.requester};
+        res.objects.push_back(
+            {0, AttemptOutcome::kSucceeded, 1024, std::nullopt});
+        return res;
+    });
+
+    SsdControlRpcServer server(2, 0, "127.0.0.1", std::chrono::seconds(30));
+    // Max 1 queued/running request on workers_ so the 2nd request triggers
+    // backpressure kLimit.
+    SsdReadIntoRpcEndpoint endpoint(owner, {}, /*worker_threads=*/1,
+                                    /*max_outstanding=*/1);
+    server.register_handler<&SsdReadIntoRpcEndpoint::Call>(&endpoint);
+    server.async_start();
+    ASSERT_FALSE(server.get_errc());
+
+    // 1. Unauthenticated request (wrong secret) must NOT increment
+    // read_requests_.
+    {
+        auto bad_peer = req_peer_;
+        bad_peer.credential.high ^= 0x1;
+        SsdFixedL2Requester bad_req(bad_peer, "tcp",
+                                    MakeSsdRequesterControlCall());
+        auto buf = std::make_shared<std::vector<char>>(4096, 0);
+        const auto addr = reinterpret_cast<uint64_t>(buf->data());
+        auto reg = bad_req.Register(
+            {addr, buf->size(), addr, buf->size(), DestinationMemory::kHost},
+            buf);
+        ASSERT_EQ(reg.error, DestinationError::kOk);
+        auto res =
+            bad_req.Read(MakeRoute(server.port()),
+                         {{"k1", 1024, {}, {{0, {{reg.region, 0, 1024}}}}}},
+                         std::chrono::seconds(2));
+        EXPECT_EQ(res.error, DestinationError::kUnauthorized);
+        EXPECT_EQ(endpoint.read_requests(), 0u);
+        (void)bad_req.Close();
+    }
+
+    // 2. Saturate workers_ with 1 authenticated read, then send a 2nd
+    // authenticated read and verify it receives a signed kLimit (NOT
+    // kUnauthorized).
+    SsdFixedL2Requester requester(req_peer_, "tcp",
+                                  MakeSsdRequesterControlCall());
+    auto buf = std::make_shared<std::vector<char>>(8192, 0);
+    const auto addr = reinterpret_cast<uint64_t>(buf->data());
+    auto reg = requester.Register(
+        {addr, buf->size(), addr, buf->size(), DestinationMemory::kHost}, buf);
+    ASSERT_EQ(reg.error, DestinationError::kOk);
+
+    auto first = std::async(std::launch::async, [&] {
+        return requester.Read(
+            MakeRoute(server.port()),
+            {{"k1", 1024, {}, {{0, {{reg.region, 0, 1024}}}}}},
+            std::chrono::seconds(5));
+    });
+    ASSERT_EQ(entered.get_future().wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+
+    auto second =
+        requester.Read(MakeRoute(server.port()),
+                       {{"k2", 1024, {}, {{0, {{reg.region, 2048, 1024}}}}}},
+                       std::chrono::seconds(2));
+    EXPECT_EQ(second.error, DestinationError::kLimit);
+    EXPECT_EQ(endpoint.read_requests(), 1u);
+
+    release.set_value();
+    auto first_res = first.get();
+    EXPECT_EQ(first_res.error, DestinationError::kOk);
+    EXPECT_EQ(endpoint.read_requests(), 1u);
+
+    // Drain second's quarantined record via recovery so Revoke/Close succeed.
+    auto rec = requester.Recover(second.attempt, std::chrono::seconds(2));
+    EXPECT_TRUE(rec.result.has_value());
+    EXPECT_EQ(requester.Revoke(reg.region), DestinationError::kOk);
+    EXPECT_EQ(requester.Close(), DestinationError::kOk);
+    endpoint.CloseAndDrain();
+    server.stop();
+}
+
 }  // namespace
 }  // namespace mooncake::ssd_offload

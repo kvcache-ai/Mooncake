@@ -13,8 +13,8 @@ namespace {
 bool Valid(PeerIdentity p) {
     return (p.client_id_high || p.client_id_low) && p.boot_epoch;
 }
-bool ValidPeers(const std::vector<SsdFixedL2Peer>& peers) {
-    if (peers.size() > 64) return false;
+bool ValidPeers(const std::vector<SsdFixedL2Peer>& peers, size_t max_peers = 64) {
+    if (peers.size() > max_peers) return false;
     for (size_t i = 0; i < peers.size(); ++i) {
         const auto& p = peers[i];
         if (!Valid(p.identity) || p.tenant_id.empty() ||
@@ -47,16 +47,20 @@ struct SsdDirectReadOwner::Impl {
           target(std::move(target)),
           reader(std::move(reader)),
           ledger(owner, limits, protocol, true),
-          protocol(protocol) {}
+          protocol(protocol),
+          max_peers(std::max<size_t>(64, limits.max_sessions)) {}
     PeerIdentity owner;
     std::vector<SsdFixedL2Peer> peers;
     SsdOwnerCallbacks::TargetFactory target;
     SsdOwnerCallbacks::Reader reader;
     SsdOwnerRequestLedger ledger;
     SsdReadProtocolLimits protocol;
+    size_t max_peers{64};
     std::mutex mutex;
     std::condition_variable close_cv;
     TrustedPeerResolver resolve_peer;
+    std::vector<std::pair<PeerIdentity, std::chrono::steady_clock::time_point>>
+        negative_lookups;
     size_t active_calls{0};
     bool destroyed{false};
     std::atomic<bool> closing{false};
@@ -68,7 +72,8 @@ SsdDirectReadOwner::SsdDirectReadOwner(PeerIdentity owner,
                                        SsdControlLimits limits,
                                        SsdReadProtocolLimits protocol,
                                        TrustedPeerResolver resolver) {
-    if (!Valid(owner) || !ValidPeers(peers) || !target || !reader)
+    const size_t max_peers = std::max<size_t>(64, limits.max_sessions);
+    if (!Valid(owner) || !ValidPeers(peers, max_peers) || !target || !reader)
         throw std::invalid_argument(
             "Invalid fixed-L2 direct owner configuration");
     impl_ = std::make_unique<Impl>(owner, std::move(peers), std::move(target),
@@ -84,7 +89,8 @@ SsdDirectReadOwner::~SsdDirectReadOwner() {
 }
 DestinationError SsdDirectReadOwner::SetPeers(
     std::vector<SsdFixedL2Peer> peers) {
-    if (!ValidPeers(peers)) return DestinationError::kInvalidArgument;
+    if (!ValidPeers(peers, impl_->max_peers))
+        return DestinationError::kInvalidArgument;
     std::lock_guard lock(impl_->mutex);
     if (impl_->closing) return DestinationError::kClosing;
     if (impl_->ledger.stats().active_records != 0)
@@ -118,15 +124,58 @@ DestinationError SsdDirectReadOwner::SetPeers(
                 return DestinationError::kUnauthorized;
             continue;
         }
-        if (merged.size() >= 64 && !evict_dead_epoch(merged, peer.identity))
+        if (merged.size() >= impl_->max_peers &&
+            !evict_dead_epoch(merged, peer.identity))
             return DestinationError::kLimit;
         merged.push_back(std::move(peer));
     }
     impl_->peers.swap(merged);
+    impl_->negative_lookups.clear();
+    return DestinationError::kOk;
+}
+DestinationError SsdDirectReadOwner::UpsertPeers(
+    std::vector<SsdFixedL2Peer> peers) {
+    if (!ValidPeers(peers, impl_->max_peers))
+        return DestinationError::kInvalidArgument;
+    std::lock_guard lock(impl_->mutex);
+    if (impl_->closing) return DestinationError::kClosing;
+    auto evict_dead_epoch = [&](std::vector<SsdFixedL2Peer>& table,
+                                PeerIdentity incoming) -> bool {
+        for (auto it = table.begin(); it != table.end(); ++it) {
+            if (it->identity.client_id_high == incoming.client_id_high &&
+                it->identity.client_id_low == incoming.client_id_low &&
+                it->identity.boot_epoch < incoming.boot_epoch &&
+                !impl_->ledger.HasNonDrainedRecord(it->identity)) {
+                table.erase(it);
+                return true;
+            }
+        }
+        return false;
+    };
+    auto merged = impl_->peers;
+    for (auto& peer : peers) {
+        const auto known = std::find_if(
+            merged.begin(), merged.end(),
+            [&](const auto& old) { return old.identity == peer.identity; });
+        if (known != merged.end()) {
+            if (known->tenant_id != peer.tenant_id ||
+                known->transport_endpoint != peer.transport_endpoint ||
+                known->credential != peer.credential)
+                return DestinationError::kUnauthorized;
+            continue;
+        }
+        if (merged.size() >= impl_->max_peers &&
+            !evict_dead_epoch(merged, peer.identity))
+            return DestinationError::kLimit;
+        merged.push_back(std::move(peer));
+    }
+    impl_->peers.swap(merged);
+    impl_->negative_lookups.clear();
     return DestinationError::kOk;
 }
 DestinationError SsdDirectReadOwner::UpsertPeer(SsdFixedL2Peer peer) {
-    if (!ValidPeers({peer})) return DestinationError::kInvalidArgument;
+    if (!ValidPeers({peer}, impl_->max_peers))
+        return DestinationError::kInvalidArgument;
     std::lock_guard lock(impl_->mutex);
     if (impl_->closing) return DestinationError::kClosing;
     auto existing = std::find_if(
@@ -141,7 +190,7 @@ DestinationError SsdDirectReadOwner::UpsertPeer(SsdFixedL2Peer peer) {
             return DestinationError::kUnauthorized;
         return DestinationError::kOk;
     }
-    if (impl_->peers.size() >= 64) {
+    if (impl_->peers.size() >= impl_->max_peers) {
         auto dead = std::find_if(
             impl_->peers.begin(), impl_->peers.end(), [&](const auto& old) {
                 return old.identity.client_id_high ==
@@ -154,18 +203,41 @@ DestinationError SsdDirectReadOwner::UpsertPeer(SsdFixedL2Peer peer) {
         if (dead == impl_->peers.end()) return DestinationError::kLimit;
         impl_->peers.erase(dead);
     }
+    const auto id = peer.identity;
     impl_->peers.push_back(std::move(peer));
+    std::erase_if(impl_->negative_lookups,
+                  [&](const auto& entry) { return entry.first == id; });
     return DestinationError::kOk;
+}
+std::optional<WriteCredential> SsdDirectReadOwner::LookupCachedCredential(
+    PeerIdentity identity) const {
+    if (!Valid(identity)) return {};
+    std::lock_guard lock(impl_->mutex);
+    const auto known = std::find_if(
+        impl_->peers.begin(), impl_->peers.end(),
+        [&](const auto& peer) { return peer.identity == identity; });
+    if (known != impl_->peers.end()) return known->credential;
+    return {};
 }
 std::optional<WriteCredential> SsdDirectReadOwner::LookupCredential(
     PeerIdentity identity) const {
     if (!Valid(identity)) return {};
+    const auto now = std::chrono::steady_clock::now();
     {
         std::lock_guard lock(impl_->mutex);
         const auto known = std::find_if(
             impl_->peers.begin(), impl_->peers.end(),
             [&](const auto& peer) { return peer.identity == identity; });
         if (known != impl_->peers.end()) return known->credential;
+        // Rate-limit repeated failed lookups for unknown identities to prevent
+        // unauthenticated frames from hammering filesystem directory lookups.
+        std::erase_if(impl_->negative_lookups,
+                      [&](const auto& entry) { return entry.second <= now; });
+        if (std::any_of(
+                impl_->negative_lookups.begin(), impl_->negative_lookups.end(),
+                [&](const auto& entry) { return entry.first == identity; })) {
+            return {};
+        }
     }
     if (!impl_->resolve_peer) return {};
     try {
@@ -175,6 +247,16 @@ std::optional<WriteCredential> SsdDirectReadOwner::LookupCredential(
             return resolved->credential;
         }
     } catch (...) {
+    }
+    {
+        std::lock_guard lock(impl_->mutex);
+        constexpr size_t kMaxNegativeEntries = 256;
+        if (impl_->negative_lookups.size() >= kMaxNegativeEntries) {
+            impl_->negative_lookups.erase(impl_->negative_lookups.begin());
+        }
+        impl_->negative_lookups.emplace_back(
+            identity,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(50));
     }
     return {};
 }
@@ -304,7 +386,7 @@ SsdControlReply SsdDirectReadOwner::Execute(
                 return peer.identity == request.requester;
             });
         if (known == impl_->peers.end()) {
-            if (impl_->peers.size() >= 64) {
+            if (impl_->peers.size() >= impl_->max_peers) {
                 auto dead = std::find_if(
                     impl_->peers.begin(), impl_->peers.end(),
                     [&](const auto& old) {
@@ -320,7 +402,7 @@ SsdControlReply SsdDirectReadOwner::Execute(
                     impl_->peers.erase(dead);
                 }
             }
-            if (impl_->peers.size() < 64) {
+            if (impl_->peers.size() < impl_->max_peers) {
                 impl_->peers.push_back(*authorized_peer);
             }
         }
