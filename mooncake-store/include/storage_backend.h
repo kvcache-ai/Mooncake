@@ -419,6 +419,11 @@ class StorageBackendInterface {
         (void)key;
         return std::nullopt;
     }
+    virtual tl::expected<void, ErrorCode> BatchQuery(
+        const std::vector<std::string>&,
+        std::unordered_map<std::string, StorageObjectMetadata>&) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
 
     virtual tl::expected<bool, ErrorCode> IsEnableOffloading() = 0;
 
@@ -834,6 +839,10 @@ class StorageBackendAdaptor : public StorageBackendInterface {
         std::unordered_map<std::string, Slice>& batched_slices) override;
 
     tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
+    tl::expected<void, ErrorCode> BatchQuery(
+        const std::vector<std::string>& keys,
+        std::unordered_map<std::string, StorageObjectMetadata>& metadatas)
+        override;
 
     tl::expected<bool, ErrorCode> IsEnableOffloading() override;
 
@@ -955,7 +964,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> BatchQuery(
         const std::vector<std::string>& keys,
         std::unordered_map<std::string, StorageObjectMetadata>&
-            batch_object_metadata);
+            batch_object_metadata) override;
 
     /**
      * @brief Loads data for multiple objects in a batch operation.
@@ -1047,6 +1056,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> AllocateOffloadingBuckets(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
         std::vector<std::vector<std::string>>& buckets_keys,
+        bool flush_previous_carryover = false,
         std::vector<std::string>* deferred_keys = nullptr);
 
     void ClearUngroupedOffloadingObjects();
@@ -1061,6 +1071,10 @@ class BucketStorageBackend : public StorageBackendInterface {
     bool RemoveUngroupedOffloadingObject(const std::string& key);
 
     size_t UngroupedOffloadingObjectsSize() const;
+
+    // A grouping hint, not ownership of the Master's source replica lease.
+    // FileStorage retains the matching complete OffloadTaskItem until terminal.
+    std::unordered_map<std::string, int64_t> UngroupedOffloadingObjects() const;
 
     /**
      * @brief Iterate over the metadata of stored objects starting from a
@@ -1167,6 +1181,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
         std::vector<std::vector<std::string>>& buckets_keys,
+        bool flush_previous_carryover,
         std::vector<std::string>* deferred_keys = nullptr);
 
     tl::expected<void, ErrorCode> HandleNext(
@@ -1529,6 +1544,10 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
      * @return tl::expected<bool, ErrorCode> indicating existence status.
      */
     tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
+    tl::expected<void, ErrorCode> BatchQuery(
+        const std::vector<std::string>& keys,
+        std::unordered_map<std::string, StorageObjectMetadata>& metadatas)
+        override;
 
     /**
      * @brief Checks whether the backend is allowed to continue offloading.

@@ -1443,6 +1443,37 @@ tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
     return fs::exists(path);
 }
 
+tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchQuery(
+    const std::vector<std::string>& keys,
+    std::unordered_map<std::string, StorageObjectMetadata>& metadatas) {
+    for (const auto& key : keys) {
+        const auto path = FileUtil::ResolvePathFromKey(
+            key, file_storage_config_.storage_filepath,
+            file_per_key_config_.fsdir);
+        std::error_code error;
+        const auto size = std::filesystem::file_size(path, error);
+        if (error || size > uint64_t(INT64_MAX))
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        std::string bytes;
+        auto read = storage_backend_->LoadObject(path, bytes,
+                                                 static_cast<int64_t>(size));
+        if (!read) return tl::make_unexpected(read.error());
+        KVEntry entry;
+        try {
+            struct_pb::from_pb(entry, bytes);
+        } catch (...) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        if (entry.key != key)
+            return tl::make_unexpected(ErrorCode::INVALID_KEY);
+        metadatas.emplace(
+            key, StorageObjectMetadata{-1, 0, static_cast<int64_t>(key.size()),
+                                       static_cast<int64_t>(entry.value.size()),
+                                       ""});
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
     for (const auto& [key, slice] : batched_slices) {
@@ -1771,8 +1802,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // Commit to metadata maps under exclusive lock FIRST.
     // This ensures any concurrent BatchLoad arriving after Master redirects
     // reads to this node can find the key in object_bucket_map_.
-    // Even if complete_handler fails later, the read path is correct —
-    // RollbackCommittedBucket will undo the commit safely.
+    // FileStorage keeps the commit on uncertain notification results, since
+    // some Master entries may already point at these files.
     {
         SharedMutexLocker lock(&mutex_);
 
@@ -1855,11 +1886,10 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             LOG(ERROR) << "Complete handler failed: " << error_code
                        << ", Key count: " << committed_keys.size()
                        << ", Bucket id: " << bucket_id;
-            // Master was NOT notified. The local index has entries that
-            // Master doesn't know about — a "client can read but Master
-            // doesn't know" ghost replica. Rollback the local commit
-            // (removes index entries + waits for inflight reads + deletes
-            // on-disk files).
+            // A callback requesting rollback must guarantee that no remote
+            // replica was published. FileStorage acknowledges the local
+            // commit and retains its notification for retry when publication
+            // is uncertain; an aggregate RPC error is not such a guarantee.
             RollbackCommittedBucket(bucket_id, committed_keys, disk_index);
             return tl::make_unexpected(error_code);
         }
@@ -2715,9 +2745,9 @@ BucketStorageBackend::GetStoreMetadata() {
 tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
     std::vector<std::vector<std::string>>& buckets_keys,
-    std::vector<std::string>* deferred_keys) {
+    bool flush_previous_carryover, std::vector<std::string>* deferred_keys) {
     return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys,
-                                       deferred_keys);
+                                       flush_previous_carryover, deferred_keys);
 }
 
 void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
@@ -2736,12 +2766,18 @@ size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
     return ungrouped_offloading_objects_.size();
 }
 
+std::unordered_map<std::string, int64_t>
+BucketStorageBackend::UngroupedOffloadingObjects() const {
+    MutexLocker locker(&offloading_mutex_);
+    return ungrouped_offloading_objects_;
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
     std::vector<std::vector<std::string>>& buckets_keys,
-    std::vector<std::string>* deferred_keys) {
+    bool flush_previous_carryover, std::vector<std::string>* deferred_keys) {
     MutexLocker offloading_locker(&offloading_mutex_);
-    if (offloading_objects.empty()) {
+    if (offloading_objects.empty() && !flush_previous_carryover) {
         return {};
     }
     auto& ungrouped_offloading_objects = ungrouped_offloading_objects_;
@@ -2763,6 +2799,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         buckets_keys.push_back(std::move(replayed_keys));
         return {};
     }
+    ungrouped_offloading_objects.clear();
     bool carryover_loaded = false;
     auto it = offloading_objects.cbegin();
     int64_t residue_count = static_cast<int64_t>(offloading_objects.size() +
@@ -2774,10 +2811,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         return IsExist(key);
     };
 
-    while (it != offloading_objects.cend()) {
+    while (it != offloading_objects.cend() ||
+           (!carryover_loaded && !carryover_objects.empty())) {
         std::vector<std::string> bucket_keys;
         std::unordered_map<std::string, int64_t> bucket_objects;
         int64_t bucket_data_size = 0;
+        const bool contains_previous_carryover =
+            !carryover_loaded && !carryover_objects.empty();
 
         if (!carryover_loaded) {
             for (const auto& ungrouped_it : carryover_objects) {
@@ -2794,7 +2834,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         while (static_cast<int64_t>(bucket_keys.size()) <
                bucket_backend_config_.bucket_keys_limit) {
             if (it == offloading_objects.cend()) {
-                if (bucket_backend_config_.flush_partial_buckets) {
+                if (bucket_backend_config_.flush_partial_buckets ||
+                    (flush_previous_carryover && contains_previous_carryover)) {
                     // Keep these keys in the current cycle, while FileStorage
                     // still has their tasks and source replicas are pinned.
                     if (!bucket_keys.empty()) {
@@ -3256,8 +3297,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         LOG(ERROR) << "Failed to store bucket metadata, error: "
                    << store_bucket_metadata_result.error();
 
-        // A rename may succeed before directory sync fails. Clean both
-        // files so restart cannot recover an unacknowledged partial commit.
+        // A rename may have succeeded before a directory sync failure.
+        // Remove both files so a later Init() cannot recover a failed write.
+        // Cleanup remains best effort if the filesystem itself is failing.
         CleanupOrphanedBucket(bucket_id, disk_index);
 
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
@@ -3344,6 +3386,12 @@ void BucketStorageBackend::RollbackCommittedBucket(
         buckets_.erase(bucket_it);
     }
 
+    // Invalidate recovery before waiting for existing source leases.
+    if (auto path = GetBucketMetadataPath(bucket_id, disk_index); path) {
+        if (unlink(path->c_str()) != 0 && errno != ENOENT)
+            LOG(ERROR) << "Cannot invalidate rolled-back bucket metadata: "
+                       << *path;
+    }
     // Phase 2: Wait for inflight reads to drain.
     // Readers that found the key before we removed it from the map
     // hold a BucketReadGuard that keeps inflight_reads_ > 0.
@@ -4105,6 +4153,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
     }
     // Lock released - new readers can't find this bucket anymore
 
+    // A bounded source-drain timeout must not leave a recoverable marker.
+    if (auto path =
+            GetBucketMetadataPath(bucket_id, bucket_metadata->disk_index);
+        path) {
+        if (unlink(path->c_str()) != 0 && errno != ENOENT)
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
     // Step 2: Wait for in-flight reads to complete
     // Readers that started before we removed from buckets_ still hold guards
     constexpr int kMaxSpinIterations = 1000;
@@ -6233,6 +6288,24 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     }
 
     return static_cast<int64_t>(keys.size());
+}
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchQuery(
+    const std::vector<std::string>& keys,
+    std::unordered_map<std::string, StorageObjectMetadata>& metadatas) {
+    for (const auto& key : keys) {
+        auto& shard = shards_[ShardForKey(key)];
+        SharedMutexLocker lock(&shard.mutex, shared_lock);
+        auto entry = shard.map.find(key);
+        if (entry == shard.map.end())
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        metadatas.emplace(
+            key, StorageObjectMetadata{
+                     0, static_cast<int64_t>(entry->second.offset),
+                     static_cast<int64_t>(key.size()),
+                     static_cast<int64_t>(entry->second.value_size), ""});
+    }
+    return {};
 }
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
