@@ -96,6 +96,12 @@ bool ValidateOpLogBatchEntry(const OpLogEntry& entry, std::string* reason) {
         SetReason(reason, "object storage mutation requires a non-empty key");
         return false;
     }
+    if ((entry.op_type == OpType::LOCAL_DELETE_REMOVE ||
+         entry.op_type == OpType::LOCAL_DELETE_ACK) &&
+        entry.payload.empty()) {
+        SetReason(reason, "local disk deletion requires a payload");
+        return false;
+    }
     return ValidateOpLogEntrySize(entry, reason);
 }
 

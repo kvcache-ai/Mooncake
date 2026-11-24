@@ -566,6 +566,7 @@ TEST_F(EvictorTest, AScopedRunStaysInItsNamespace) {
 class FakeOffloadQueue final : public eviction::OffloadQueue {
    public:
     bool Push(const TenantId&, const std::string& key, Replica&,
+              ObjectIncarnation&, UUID&,
               std::vector<UUID>* mirror_clients) override {
         if (pushed.size() >= capacity) {
             return false;

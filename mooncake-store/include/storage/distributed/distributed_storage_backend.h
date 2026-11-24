@@ -86,7 +86,8 @@ class DistributedStorageBackend : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        EvictionHandler eviction_handler = nullptr) override;
+        EvictionHandler eviction_handler = nullptr,
+        const ObjectVersions* versions = nullptr) override;
 
     std::vector<tl::expected<void, ErrorCode>> BatchWrite(
         const std::vector<DfsWriteRequest>& requests);

@@ -537,6 +537,12 @@ add_store_test(mmap_arena_fallback_test mmap_arena_fallback_test.cpp)
 add_store_test(object_data_type_test object_data_type_test.cpp)
 add_subdirectory(e2e)
 
+add_executable(offset_delete_ha_client e2e/offset_delete_ha_client.cpp)
+target_link_libraries(
+  offset_delete_ha_client
+  PRIVATE mooncake_store transfer_engine cachelib_memory_allocator glog::glog
+          pthread ${ETCD_WRAPPER_LIB})
+
 add_executable(high_availability_test ha/leadership/high_availability_test.cpp)
 target_include_directories(high_availability_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

@@ -264,6 +264,23 @@ AttemptResult RestorePointer(
             !metadata.RestoreObjectReplicas(restored))
             return Invalid(ErrorCode::DESERIALIZE_FAIL);
     }
+    if (manifest.pending_local_deletes) {
+        const auto& tasks = *manifest.pending_local_deletes;
+        if (tasks.key != ha::BuildBatchOpLogSnapshotLocalDeletesKey(
+                             snapshot_root, descriptor.snapshot_id)) {
+            return Invalid();
+        }
+        std::vector<uint8_t> bytes;
+        const auto read = ReadVerifiedObject(
+            object_store, tasks.key, tasks.stored_size, tasks.crc32c, bytes);
+        if (read.disposition != AttemptDisposition::kSuccess) return read;
+        std::vector<LocalDeleteTask> restored;
+        if (struct_pack::deserialize_to(restored, bytes) !=
+                struct_pack::errc::ok ||
+            restored.empty() || !metadata.RestoreLocalDeleteTasks(restored)) {
+            return Invalid(ErrorCode::DESERIALIZE_FAIL);
+        }
+    }
     if (manifest.weight_metadata) {
         const auto& weights = *manifest.weight_metadata;
         if (weights.key != ha::BuildBatchOpLogSnapshotWeightMetadataKey(
@@ -361,6 +378,9 @@ AttemptResult RestorePointer(
                                       : 0) +
             (manifest.object_storage ? manifest.object_storage->stored_size
                                      : 0) +
+            (manifest.pending_local_deletes
+                 ? manifest.pending_local_deletes->stored_size
+                 : 0) +
             descriptor.manifest_size + pointer_bytes.size();
     });
     return {AttemptDisposition::kSuccess,

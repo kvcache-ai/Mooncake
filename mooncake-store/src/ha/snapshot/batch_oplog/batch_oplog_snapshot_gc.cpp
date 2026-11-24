@@ -125,6 +125,15 @@ ErrorCode BatchOpLogSnapshotGc::Run(
                               weights.crc32c))
                 return ErrorCode::INTERNAL_ERROR;
         }
+        if (manifest->pending_local_deletes) {
+            const auto& tasks = *manifest->pending_local_deletes;
+            if (tasks.key != ha::BuildBatchOpLogSnapshotLocalDeletesKey(
+                                 root_, descriptor->snapshot_id) ||
+                !VerifyObject(store_, tasks.key, tasks.stored_size,
+                              tasks.crc32c)) {
+                return ErrorCode::INTERNAL_ERROR;
+            }
+        }
         protected_prefixes.insert(prefix);
     }
 

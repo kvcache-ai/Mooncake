@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <future>
+#include <map>
 #include <list>
 #include <limits>
 #include <memory>
@@ -42,6 +44,7 @@
 #include "mutex.h"
 #include "segment.h"
 #include "local_ssd/manager.h"
+#include "local_delete_types.h"
 #include "tenant/quota_policy.h"
 #include "types.h"
 #include "weight_store_manager.h"
@@ -729,7 +732,8 @@ class MasterService {
      * @brief Mounts a file storage segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
-    auto MountLocalDiskSegment(const UUID& client_id, bool enable_offloading)
+    auto MountLocalDiskSegment(const UUID& client_id, bool enable_offloading,
+                               bool versioned = false)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -755,6 +759,15 @@ class MasterService {
      */
     auto UnmountLocalDiskSegment(const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
+
+    tl::expected<UUID, ErrorCode> MountOffsetDeleteStorage(
+        const UUID& client_id, bool enable_offloading, const UUID& storage_id);
+    tl::expected<std::vector<LocalDeleteTask>, ErrorCode> FetchLocalDeletes(
+        const UUID& client_id, const UUID& storage_id, const UUID& epoch,
+        uint32_t limit);
+    tl::expected<void, ErrorCode> AckLocalDeletes(
+        const UUID& client_id, const UUID& storage_id, const UUID& epoch,
+        const std::vector<UUID>& task_ids);
 
     /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
@@ -949,7 +962,8 @@ class MasterService {
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
-        const WeightMetadataSnapshot& weight_metadata = {});
+        const WeightMetadataSnapshot& weight_metadata = {},
+        const std::vector<LocalDeleteTask>& pending_local_deletes = {});
     // Copies objects out of the handoff. The caller keeps ownership so a
     // failed restore or a later lease loss can still PreservePromotionBaseline.
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
@@ -1105,7 +1119,8 @@ class MasterService {
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
         std::optional<ReplicaID> expected_max_replica_id,
-        const WeightMetadataSnapshot* legacy_weight_metadata);
+        const WeightMetadataSnapshot* legacy_weight_metadata,
+        const std::vector<LocalDeleteTask>* legacy_local_deletes = nullptr);
 
     // The restore implementation itself; entered only through
     // RestoreFromStandbyState above.
@@ -1178,10 +1193,10 @@ class MasterService {
                                                  uint64_t target_bytes);
 
     // Caller holds the Replica owner's retaining guard.
-    auto AddReplicaForRetainedClient(const UUID& client_id,
-                                     const std::string& key,
-                                     const TenantId& tenant_id,
-                                     Replica& replica)
+    auto AddReplicaForRetainedClient(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id, Replica& replica,
+        std::optional<ObjectIncarnation> scanned_incarnation = std::nullopt)
         -> tl::expected<bool, ErrorCode>;
 
     void ClearInvalidHandles();
@@ -1409,7 +1424,7 @@ class MasterService {
     // and the object with them.
     tl::expected<void, ErrorCode> MarkRemovedAndPersist(
         const TenantId& tenant_id, const std::string& key,
-        ObjectMetadata& metadata);
+        ObjectMetadata& metadata, std::future<ErrorCode>& finalized);
     // Returns why a remove may not take the object, or nothing if it may: its
     // lease is still held (unless `force`), a replica is incomplete, or a
     // replication task reads it.
@@ -1423,6 +1438,9 @@ class MasterService {
         // behind (not removable, or its removal could not be queued).
         bool saw_object{false};
         bool skipped_object{false};
+        std::vector<std::pair<int64_t, std::future<ErrorCode>>> finalizations;
+
+        void AwaitFinalizations();
     };
     // Removes each of the tenant's objects whose key `matches_key` accepts
     // (every key, if unset), excluding managed weights and objects that
@@ -1577,7 +1595,14 @@ class MasterService {
     // appended to it on success.
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
-        std::vector<UUID>* mirror_clients = nullptr);
+        const ObjectIncarnation& incarnation, const UUID& attempt_id,
+        std::vector<UUID>* mirror_clients);
+
+    // Removes a failed mirror and releases the source once the last one ends.
+    // The caller holds the object's key lock.
+    bool FailOffloadMirror(ObjectMetadata& metadata, route::ObjectState& state,
+                           const UUID& client_id,
+                           const OffloadTaskItem& report);
 
     // Cancels the offload task on `object_id`, releasing the source refcnt
     // and dropping the task marker along with its mirrors. Returns false
@@ -1961,6 +1986,7 @@ class MasterService {
     const bool enable_ha_;
 
     const bool enable_offload_;
+    const bool versioned_local_disk_;
 
     // Offload-on-evict: defer disk offload to eviction time
     // (config: offload_on_evict)
@@ -2312,6 +2338,23 @@ class MasterService {
     std::mutex batch_oplog_pruning_mutex_;
     bool batch_oplog_pruning_stop_requested_{false};
     BatchOpLogWriterFactory batch_oplog_writer_factory_;
+
+    struct OffsetDeleteMount {
+        UUID storage_id;
+        UUID epoch;
+    };
+    // Mounted holders are fenced by master_state_mutex_. The delete queue is
+    // also accessed by the OpLog writer's durable callbacks.
+    std::map<UUID, OffsetDeleteMount> offset_delete_mounts_;
+    using LocalDeleteTasks = std::map<std::pair<UUID, UUID>, LocalDeleteTask>;
+    std::mutex local_delete_mutex_;
+    LocalDeleteTasks pending_local_deletes_;
+    size_t reserved_local_deletes_{0};
+    bool SupportsOffsetDelete() const;
+    bool MatchesOffsetDeleteMount(const UUID& client_id, const UUID& storage_id,
+                                  const UUID& epoch) const;
+    void NotifyLocalDeletePersistenceFailure(
+        uint64_t sequence, std::shared_ptr<std::promise<ErrorCode>> completion);
 
     // OpLog publishing helpers
     std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;

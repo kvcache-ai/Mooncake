@@ -5,6 +5,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -28,15 +29,39 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#include <ylt/struct_pb.hpp>
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"
+#include "serializer.h"
 #include "common/timestamp.h"
 #include "common/file_util.h"
 #include "utils/common.h"
 
 namespace fs = std::filesystem;
+
+namespace mooncake {
+
+class OffsetAllocatorStorageBackendTestPeer {
+   public:
+    static std::shared_ptr<void> PinAllocation(
+        OffsetAllocatorStorageBackend& backend, const std::string& key) {
+        auto& shard = backend.shards_[backend.ShardForKey(key)];
+        SharedMutexLocker lock(&shard.mutex, shared_lock);
+        const auto it = shard.map.find(key);
+        return it == shard.map.end() ? nullptr : it->second.allocation;
+    }
+
+    static void SetDataFile(OffsetAllocatorStorageBackend& backend,
+                            std::shared_ptr<StorageFile> data_file) {
+        backend.data_file_ = std::move(data_file);
+    }
+};
+
+}  // namespace mooncake
+
 namespace mooncake::test {
 
 // Ignore the #3528 path lock when tests assert "empty" / file counts.
@@ -3130,6 +3155,87 @@ TEST_F(StorageBackendTest, BucketStorageBackend_BatchLoadSpanReadsWindow) {
     EXPECT_EQ(mismatch.error(), ErrorCode::INVALID_PARAMS);
 }
 
+TEST_F(StorageBackendTest, BucketReadsRejectStaleIncarnations) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, BucketBackendConfig{});
+    ASSERT_TRUE(backend.Init());
+
+    const std::string key = "reused-key";
+    const ObjectIncarnation old_version{1, 1};
+    const ObjectIncarnation new_version{1, 2};
+    std::string old_value = "old-data";
+    std::string new_value = "new-data";
+    auto offload = [&](std::string& value, ObjectIncarnation version) {
+        const std::unordered_map<std::string, std::vector<Slice>> batch{
+            {key, {{value.data(), value.size()}}}};
+        const StorageBackendInterface::ObjectVersions versions{{key, version}};
+        return backend.BatchOffload(batch, nullptr, nullptr, &versions);
+    };
+
+    auto legacy = offload(old_value, {});
+    ASSERT_TRUE(legacy);
+    std::string full(old_value.size(), '?');
+    std::unordered_map<std::string, Slice> full_read{
+        {key, {full.data(), full.size()}}};
+    ASSERT_TRUE(backend.BatchLoad(full_read));
+    EXPECT_EQ(full, old_value);
+    ASSERT_TRUE(backend.DeleteBucket(*legacy));
+
+    auto old_bucket = offload(old_value, old_version);
+    ASSERT_TRUE(old_bucket);
+    ASSERT_TRUE(backend.DeleteBucket(*old_bucket));
+    ASSERT_TRUE(offload(new_value, new_version));
+
+    std::fill(full.begin(), full.end(), '?');
+    for (const auto version : {ObjectIncarnation{}, old_version}) {
+        auto result = backend.BatchLoad(full_read, {{key, version}});
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_VERSION);
+        EXPECT_EQ(full, std::string(new_value.size(), '?'));
+        EXPECT_EQ(full_read.at(key).ptr, full.data());
+    }
+    auto legacy_read = backend.BatchLoad(full_read);
+    ASSERT_FALSE(legacy_read);
+    EXPECT_EQ(legacy_read.error(), ErrorCode::INVALID_VERSION);
+    full_read.at(key).size -= 1;
+    auto short_full = backend.BatchLoad(full_read, {{key, new_version}});
+    ASSERT_FALSE(short_full);
+    EXPECT_EQ(short_full.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(full, std::string(new_value.size(), '?'));
+    full_read.at(key).size = full.size();
+    ASSERT_TRUE(backend.BatchLoad(full_read, {{key, new_version}}));
+    EXPECT_EQ(full, new_value);
+
+    constexpr size_t kOffset = 2;
+    std::string window(4, '?');
+    std::unordered_map<std::string, StorageValueSpan> range_read{
+        {key,
+         {kOffset,
+          new_value.size(),
+          {window.data(), window.size()},
+          old_version}}};
+    auto stale_range = backend.BatchLoadSpans(range_read);
+    ASSERT_FALSE(stale_range);
+    EXPECT_EQ(stale_range.error(), ErrorCode::INVALID_VERSION);
+    EXPECT_EQ(window, "????");
+    EXPECT_EQ(range_read.at(key).slice.ptr, window.data());
+    range_read.at(key).expected_incarnation = {};
+    auto legacy_range = backend.BatchLoadSpans(range_read);
+    ASSERT_FALSE(legacy_range);
+    EXPECT_EQ(legacy_range.error(), ErrorCode::INVALID_VERSION);
+    EXPECT_EQ(window, "????");
+    range_read.at(key).expected_incarnation = new_version;
+    range_read.at(key).object_size += 1;
+    auto wrong_size = backend.BatchLoadSpans(range_read);
+    ASSERT_FALSE(wrong_size);
+    EXPECT_EQ(wrong_size.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(window, "????");
+    range_read.at(key).object_size = new_value.size();
+    ASSERT_TRUE(backend.BatchLoadSpans(range_read));
+    EXPECT_EQ(window, new_value.substr(kOffset, window.size()));
+}
+
 //-----------------------------------------------------------------------------
 // DeleteBucket Tests
 //-----------------------------------------------------------------------------
@@ -5060,7 +5166,493 @@ FileStorageConfig MakeOffsetPersistConfig(const std::string& data_path,
     return config;
 }
 
+tl::expected<int64_t, ErrorCode> PutVersionedOffset(
+    OffsetAllocatorStorageBackend& backend, const std::string& key,
+    std::string value, ObjectIncarnation version) {
+    StorageBackendInterface::ObjectVersions versions{{key, version}};
+    std::unordered_map<std::string, std::vector<Slice>> batch{
+        {key, {{value.data(), value.size()}}}};
+    int64_t offset = -1;
+    auto result = backend.BatchOffload(
+        batch,
+        [&](const auto&, auto& metadata) {
+            if (metadata.front().GetObjectIncarnation() != version) {
+                return ErrorCode::INVALID_VERSION;
+            }
+            offset = metadata.front().offset;
+            return ErrorCode::OK;
+        },
+        nullptr, &versions);
+    if (!result) return tl::make_unexpected(result.error());
+    return offset;
+}
+
+tl::expected<std::string, ErrorCode> ReadVersionedOffset(
+    OffsetAllocatorStorageBackend& backend, const std::string& key, size_t size,
+    ObjectIncarnation version) {
+    std::string value(size, '\0');
+    std::unordered_map<std::string, StorageValueSpan> spans{
+        {key, {0, size, {value.data(), size}, version}}};
+    auto result = backend.BatchLoadSpans(spans);
+    if (!result) return tl::make_unexpected(result.error());
+    return value;
+}
+
+std::string ReadOffsetFile(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(file), {}};
+}
+
+class PausedOffsetRead : public PosixFile {
+   public:
+    PausedOffsetRead(const std::string& path, int fd,
+                     std::shared_future<void> resume)
+        : PosixFile(path, fd), resume_(std::move(resume)) {
+        SetDeleteOnWriteFail(false);
+    }
+
+    tl::expected<size_t, ErrorCode> vector_read(const iovec* iov, int count,
+                                                off_t offset) override {
+        if (!paused_) {
+            paused_ = true;
+            entered.set_value();
+            resume_.wait();
+        }
+        return PosixFile::vector_read(iov, count, offset);
+    }
+
+    std::promise<void> entered;
+
+   private:
+    std::shared_future<void> resume_;
+    bool paused_ = false;
+};
+
 }  // namespace
+
+TEST_F(StorageBackendTest, OffsetVersionedDeleteSurvivesKillBeforeCheckpoint) {
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig cfg;
+    cfg.persist_mode = OffsetPersistMode::kStrict;
+    const std::string key = "delete-me";
+    // The optional version crosses the alignment boundary for this key.
+    const std::string sentinel(4064, 's');
+    const ObjectIncarnation first{1, 1}, next{2, 2};
+    const std::string old_value(4096, 'a'), new_value(4096, 'b');
+    const std::string journal = data_path + "/kv_cache.meta.delete.v1";
+    const auto child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const auto run = [&] {
+            OffsetAllocatorStorageBackend backend(config, cfg);
+            ASSERT_TRUE(backend.Init());
+            ASSERT_EQ(PutVersionedOffset(backend, key, old_value, first), 0);
+            const auto sentinel_offset =
+                PutVersionedOffset(backend, sentinel, "keep", next);
+            ASSERT_TRUE(sentinel_offset);
+            ASSERT_GE(*sentinel_offset, 0);
+            const auto before = ReadOffsetFile(data_path + "/kv_cache.data");
+            const auto checkpoint =
+                ReadOffsetFile(data_path + "/kv_cache.meta");
+            ASSERT_FALSE(checkpoint.empty());
+            ASSERT_TRUE(backend.DeleteVersions({{key, first}}));
+            ASSERT_EQ(ReadOffsetFile(data_path + "/kv_cache.data"), before);
+            ASSERT_EQ(ReadOffsetFile(data_path + "/kv_cache.meta"), checkpoint);
+            ASSERT_FALSE(ReadOffsetFile(journal).empty());
+            ASSERT_EQ(kill(getpid(), SIGKILL), 0);
+        };
+        run();
+        _exit(1);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFSIGNALED(status));
+    ASSERT_EQ(WTERMSIG(status), SIGKILL);
+
+    {
+        OffsetAllocatorStorageBackend recovered(config, cfg);
+        ASSERT_TRUE(recovered.Init());
+        EXPECT_FALSE(recovered.IsExist(key).value());
+        EXPECT_EQ(ReadVersionedOffset(recovered, sentinel, 4, next), "keep");
+        EXPECT_EQ(PutVersionedOffset(recovered, key, old_value, first), -1);
+        EXPECT_EQ(PutVersionedOffset(recovered, key, new_value, next), 0);
+        EXPECT_EQ(fs::file_size(journal), 0u);
+        ASSERT_TRUE(recovered.DeleteVersions({{key, first}, {key, first}}));
+        const auto stale = ReadVersionedOffset(recovered, key, 4096, first);
+        ASSERT_FALSE(stale);
+        EXPECT_EQ(stale.error(), ErrorCode::INVALID_VERSION);
+        EXPECT_EQ(ReadVersionedOffset(recovered, key, 4096, next), new_value);
+        ASSERT_GT(fs::file_size(journal), 0u);
+        recovered.SetSkipFinalCheckpointForTest();
+    }
+    OffsetAllocatorStorageBackend reopened(config, cfg);
+    ASSERT_TRUE(reopened.Init());
+    EXPECT_EQ(ReadVersionedOffset(reopened, key, 4096, next), new_value);
+}
+
+TEST_F(StorageBackendTest,
+       OffsetDeleteJournalsOldVersionAfterFailedCheckpoint) {
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig cfg;
+    cfg.persist_mode = OffsetPersistMode::kStrict;
+    const std::string key = "replaced";
+    const ObjectIncarnation old{1, 1}, current{2, 2};
+    const auto child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const auto run = [&] {
+            OffsetAllocatorStorageBackend backend(config, cfg);
+            ASSERT_TRUE(backend.Init());
+            const auto old_offset =
+                PutVersionedOffset(backend, key, "old", old);
+            const auto sentinel_offset =
+                PutVersionedOffset(backend, "sentinel", "safe", old);
+            ASSERT_TRUE(old_offset);
+            ASSERT_GE(*old_offset, 0);
+            ASSERT_TRUE(sentinel_offset);
+            ASSERT_GE(*sentinel_offset, 0);
+            backend.SetMetadataWriteFailure(1);
+            ASSERT_FALSE(PutVersionedOffset(backend, key, "new", current));
+            ASSERT_EQ(ReadVersionedOffset(backend, key, 3, current), "new");
+            ASSERT_TRUE(backend.DeleteVersions({{key, old}}));
+            ASSERT_EQ(ReadVersionedOffset(backend, key, 3, current), "new");
+            ASSERT_EQ(kill(getpid(), SIGKILL), 0);
+        };
+        run();
+        _exit(1);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFSIGNALED(status));
+    ASSERT_EQ(WTERMSIG(status), SIGKILL);
+    OffsetAllocatorStorageBackend recovered(config, cfg);
+    ASSERT_TRUE(recovered.Init());
+    EXPECT_FALSE(recovered.IsExist(key).value());
+    EXPECT_EQ(ReadVersionedOffset(recovered, "sentinel", 4, old), "safe");
+}
+
+TEST_F(StorageBackendTest, OffsetDeleteWaitsForActualReadBeforeExtentReuse) {
+    auto config = MakeOffsetPersistConfig(data_path, 16 * 1024);
+    OffsetAllocatorBackendConfig cfg;
+    cfg.eviction_policy = OffsetEvictionPolicy::NONE;
+    cfg.persist_mode = OffsetPersistMode::kStrict;
+    const std::string old_value(4096, 'a'), survivor(4096, 's'),
+        fresh(4096, 'b');
+    const ObjectIncarnation old{1, 1}, next{2, 2};
+    OffsetAllocatorStorageBackend backend(config, cfg);
+    ASSERT_TRUE(backend.Init());
+    const auto old_offset = PutVersionedOffset(backend, "key", old_value, old);
+    ASSERT_EQ(old_offset, 0);
+    ASSERT_EQ(PutVersionedOffset(backend, "neighbor", survivor, old), 8192);
+
+    const auto path = data_path + "/kv_cache.data";
+    const int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
+    ASSERT_GE(fd, 0);
+    std::promise<void> resume;
+    auto file = std::make_shared<PausedOffsetRead>(path, fd,
+                                                   resume.get_future().share());
+    auto entered = file->entered.get_future();
+    OffsetAllocatorStorageBackendTestPeer::SetDataFile(backend, file);
+    auto reading = std::async(std::launch::async, [&] {
+        return ReadVersionedOffset(backend, "key", old_value.size(), old);
+    });
+    const auto state = entered.wait_for(std::chrono::seconds(5));
+    if (state == std::future_status::ready) {
+        EXPECT_TRUE(backend.DeleteVersions({{"key", old}}));
+        EXPECT_FALSE(backend.IsExist("key").value_or(true));
+        EXPECT_EQ(PutVersionedOffset(backend, "key", fresh, next), -1);
+        std::error_code ec;
+        EXPECT_EQ(fs::file_size(data_path + "/kv_cache.meta.delete.v1", ec),
+                  0u);
+        EXPECT_FALSE(ec);
+    }
+    resume.set_value();
+    ASSERT_EQ(state, std::future_status::ready);
+    EXPECT_EQ(reading.get(), old_value);
+    EXPECT_EQ(PutVersionedOffset(backend, "key", fresh, next), *old_offset);
+    EXPECT_EQ(ReadVersionedOffset(backend, "neighbor", survivor.size(), old),
+              survivor);
+    EXPECT_EQ(ReadVersionedOffset(backend, "key", fresh.size(), next), fresh);
+}
+
+TEST_F(StorageBackendTest, OffsetDeleteCanBeFirstDurableOperation) {
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig cfg;
+    cfg.persist_mode = OffsetPersistMode::kStrict;
+    const auto child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        OffsetAllocatorStorageBackend backend(config, cfg);
+        if (!backend.Init() || !backend.DeleteVersions({{"absent", {1, 1}}})) {
+            _exit(1);
+        }
+        if (ReadOffsetFile(data_path + "/kv_cache.meta").empty() ||
+            ReadOffsetFile(data_path + "/kv_cache.meta.delete.v1").empty()) {
+            _exit(2);
+        }
+        _exit(0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    OffsetAllocatorStorageBackend reopened(config, cfg);
+    ASSERT_TRUE(reopened.Init());
+    EXPECT_FALSE(reopened.IsExist("absent").value());
+    EXPECT_EQ(PutVersionedOffset(reopened, "absent", "old", {1, 1}), -1);
+    EXPECT_EQ(PutVersionedOffset(reopened, "absent", "new", {2, 2}), 0);
+}
+
+TEST_F(StorageBackendTest, OffsetDeleteJournalTrimsOnlyIncompleteTail) {
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig cfg;
+    cfg.persist_mode = OffsetPersistMode::kStrict;
+    const auto journal = data_path + "/kv_cache.meta.delete.v1";
+    const auto data = data_path + "/kv_cache.data";
+    const ObjectIncarnation version{1, 1};
+    {
+        OffsetAllocatorStorageBackend backend(config, cfg);
+        ASSERT_TRUE(backend.Init());
+        ASSERT_NE(PutVersionedOffset(backend, "deleted", "old", version), -1);
+        ASSERT_NE(PutVersionedOffset(backend, "sentinel", "keep", version), -1);
+        ASSERT_TRUE(backend.DeleteVersions({{"deleted", version}}));
+        backend.SetSkipFinalCheckpointForTest();
+    }
+    const auto durable = ReadOffsetFile(journal);
+    const auto original_data = ReadOffsetFile(data);
+    ASSERT_FALSE(durable.empty());
+    {
+        std::ofstream append(journal, std::ios::binary | std::ios::app);
+        append << "torn";
+        ASSERT_TRUE(append);
+    }
+    {
+        OffsetAllocatorStorageBackend backend(config, cfg);
+        ASSERT_TRUE(backend.Init());
+        EXPECT_FALSE(backend.IsExist("deleted").value());
+        EXPECT_EQ(ReadVersionedOffset(backend, "sentinel", 4, version), "keep");
+        EXPECT_EQ(ReadOffsetFile(journal), durable);
+        backend.SetSkipFinalCheckpointForTest();
+    }
+    {
+        std::fstream corrupt(journal,
+                             std::ios::binary | std::ios::in | std::ios::out);
+        corrupt.seekp(-1, std::ios::end);
+        corrupt.put(static_cast<char>(durable.back() ^ 1));
+        ASSERT_TRUE(corrupt);
+    }
+    OffsetAllocatorStorageBackend failed(config, cfg);
+    EXPECT_FALSE(failed.Init());
+    EXPECT_EQ(ReadOffsetFile(data), original_data);
+    EXPECT_EQ(fs::file_size(journal), durable.size());
+}
+
+TEST_F(StorageBackendTest, OffsetDeleteRootRejectsSecondOwner) {
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig legacy_cfg;
+    legacy_cfg.persist_mode = OffsetPersistMode::kDisabled;
+    OffsetAllocatorStorageBackend legacy(config, legacy_cfg);
+    ASSERT_TRUE(legacy.Init());
+    OffsetAllocatorBackendConfig strict_cfg;
+    strict_cfg.persist_mode = OffsetPersistMode::kStrict;
+    OffsetAllocatorStorageBackend versioned(config, strict_cfg);
+    const auto result = versioned.Init();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::FILE_OPEN_FAIL);
+}
+
+TEST_F(StorageBackendTest, OffsetDeleteStorageIdentitySurvivesReopen) {
+    const auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig strict_cfg;
+    strict_cfg.persist_mode = OffsetPersistMode::kStrict;
+    const auto marker = data_path + "/kv_cache.storage.v1";
+    UUID id{};
+    {
+        OffsetAllocatorStorageBackend backend(config, strict_cfg);
+        ASSERT_TRUE(backend.Init());
+        const auto missing = backend.GetDeleteStorageId(false);
+        ASSERT_TRUE(missing);
+        EXPECT_FALSE(missing->has_value());
+        EXPECT_FALSE(fs::exists(marker));
+        const auto created = backend.GetDeleteStorageId(true);
+        ASSERT_TRUE(created);
+        ASSERT_TRUE(created->has_value());
+        id = **created;
+        EXPECT_NE(id, UUID{});
+        EXPECT_EQ(ReadOffsetFile(marker), UuidToString(id));
+        ASSERT_NE(PutVersionedOffset(backend, "sentinel", "keep", {1, 1}), -1);
+    }
+    {
+        OffsetAllocatorBackendConfig legacy_cfg;
+        legacy_cfg.persist_mode = OffsetPersistMode::kDisabled;
+        OffsetAllocatorStorageBackend legacy(config, legacy_cfg);
+        const auto disabled = legacy.Init();
+        ASSERT_FALSE(disabled);
+        EXPECT_EQ(disabled.error(), ErrorCode::NOT_SUPPORTED);
+    }
+    OffsetAllocatorStorageBackend reopened(config, strict_cfg);
+    ASSERT_TRUE(reopened.Init());
+    const auto stored = reopened.GetDeleteStorageId(true);
+    ASSERT_TRUE(stored);
+    ASSERT_TRUE(stored->has_value());
+    EXPECT_EQ(**stored, id);
+    EXPECT_EQ(ReadVersionedOffset(reopened, "sentinel", 4, {1, 1}), "keep");
+}
+
+TEST_F(
+    StorageBackendTest,
+    OffsetAllocatorStorageBackend_Persist_PinnedRetirementAcrossCheckpoints) {
+    auto config = MakeOffsetPersistConfig(data_path, 32 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
+    backend_cfg.high_watermark_bytes = 20000;
+    backend_cfg.low_watermark_bytes = 15000;
+    backend_cfg.persist_mode = OffsetPersistMode::kStrict;
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const auto run = [&] {
+            OffsetAllocatorStorageBackend backend(config, backend_cfg);
+            ASSERT_TRUE(backend.Init());
+            const auto put = [&](const std::string& key,
+                                 const std::string& value) {
+                std::vector<std::unique_ptr<char[]>> buffers;
+                auto batch = MakeSingleKeyBatch(key, value, buffers);
+                const auto result = backend.BatchOffload(
+                    batch, NoopCompleteHandler(), AcceptAllEvictionHandler());
+                return result && result.value() == 1;
+            };
+
+            ASSERT_TRUE(put("retired", std::string(8192, 'r')));
+            ASSERT_TRUE(put("sentinel", "s"));
+            // Hold the same allocation reference as an in-flight read plan.
+            auto pinned = OffsetAllocatorStorageBackendTestPeer::PinAllocation(
+                backend, "retired");
+            ASSERT_NE(pinned, nullptr);
+
+            // This write evicts only the oldest, larger record. Its extent
+            // remains allocated in this process while pinned is alive.
+            ASSERT_TRUE(put("replacement", std::string(4096, 'b')));
+            ASSERT_FALSE(backend.IsExist("retired").value());
+            ASSERT_TRUE(fs::exists(data_path + "/kv_cache.meta"));
+
+            // A second strict checkpoint must still exclude the retired
+            // extent even though the first save cleared the eviction set.
+            ASSERT_TRUE(put("later", "c"));
+            ASSERT_EQ(LoadOne(backend, "sentinel", 1),
+                      std::make_optional(std::string("s")));
+            // Abrupt exit: do not release the pin or run a final checkpoint.
+            _exit(0);
+        };
+        run();
+        _exit(1);
+    }
+
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    std::ifstream meta_file(data_path + "/kv_cache.meta", std::ios::binary);
+    ASSERT_TRUE(meta_file.is_open());
+    const std::string meta_bytes((std::istreambuf_iterator<char>(meta_file)),
+                                 std::istreambuf_iterator<char>());
+    OffsetAllocatorPersistedMetadata meta;
+    ASSERT_NO_THROW(struct_pb::from_pb(meta, meta_bytes));
+    ASSERT_EQ(meta.version, kOffsetAllocatorPersistVersion);
+    std::vector<SerializedByte> allocator_bytes(meta.allocator_state.begin(),
+                                                meta.allocator_state.end());
+    auto checkpoint =
+        deserialize_from<offset_allocator::OffsetAllocator>(allocator_bytes);
+    ASSERT_NE(checkpoint, nullptr);
+    bool retained_first_extent = false;
+    checkpoint->visit_used_nodes([&](uint64_t offset, uint64_t, uint32_t) {
+        retained_first_extent |= offset == 0;
+    });
+    EXPECT_FALSE(retained_first_extent);
+
+    // Recovery must use the actual checkpoint, not silently start fresh.
+    // Disable eviction so a failed reuse cannot be hidden by dropping a
+    // surviving object to make room.
+    backend_cfg.eviction_policy = OffsetEvictionPolicy::NONE;
+    OffsetAllocatorStorageBackend recovered(config, backend_cfg);
+    ASSERT_TRUE(recovered.Init());
+    EXPECT_FALSE(recovered.IsExist("retired").value());
+    EXPECT_EQ(LoadOne(recovered, "sentinel", 1),
+              std::make_optional(std::string("s")));
+    EXPECT_EQ(LoadOne(recovered, "replacement", 4096),
+              std::make_optional(std::string(4096, 'b')));
+    EXPECT_EQ(LoadOne(recovered, "later", 1),
+              std::make_optional(std::string("c")));
+
+    std::vector<std::unique_ptr<char[]>> buffers;
+    auto batch = MakeSingleKeyBatch("reused", std::string(8192, 'n'), buffers);
+    int64_t reused_offset = -1;
+    const auto result = recovered.BatchOffload(
+        batch, [&](const std::vector<std::string>&,
+                   std::vector<StorageObjectMetadata>& metadatas) {
+            reused_offset = metadatas.at(0).offset;
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result.value(), 1);
+    EXPECT_EQ(reused_offset, 0);
+    EXPECT_EQ(LoadOne(recovered, "reused", 8192),
+              std::make_optional(std::string(8192, 'n')));
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Persist_PinnedOverwriteKeepsNewValue) {
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.persist_mode = OffsetPersistMode::kStrict;
+    const std::string old_value(8192, 'a');
+    const std::string new_value(8192, 'b');
+    {
+        OffsetAllocatorStorageBackend backend(config, backend_cfg);
+        ASSERT_TRUE(backend.Init());
+        const auto put = [&](const std::string& key, const std::string& value) {
+            std::vector<std::unique_ptr<char[]>> buffers;
+            auto batch = MakeSingleKeyBatch(key, value, buffers);
+            const auto result =
+                backend.BatchOffload(batch, NoopCompleteHandler());
+            return result && result.value() == 1;
+        };
+        ASSERT_TRUE(put("same_key", old_value));
+        auto pinned = OffsetAllocatorStorageBackendTestPeer::PinAllocation(
+            backend, "same_key");
+        ASSERT_NE(pinned, nullptr);
+        ASSERT_TRUE(put("same_key", new_value));
+        ASSERT_TRUE(put("sentinel", "s"));
+
+        std::ifstream file(data_path + "/kv_cache.meta", std::ios::binary);
+        ASSERT_TRUE(file.is_open());
+        const std::string bytes((std::istreambuf_iterator<char>(file)),
+                                std::istreambuf_iterator<char>());
+        OffsetAllocatorPersistedMetadata meta;
+        ASSERT_NO_THROW(struct_pb::from_pb(meta, bytes));
+        const std::vector<SerializedByte> allocator_bytes(
+            meta.allocator_state.begin(), meta.allocator_state.end());
+        auto checkpoint = deserialize_from<offset_allocator::OffsetAllocator>(
+            allocator_bytes);
+        ASSERT_NE(checkpoint, nullptr);
+        EXPECT_EQ(checkpoint->get_metrics().allocated_num_, 2);
+        bool contains_old = false;
+        checkpoint->visit_used_nodes([&](uint64_t offset, uint64_t, uint32_t) {
+            contains_old |= offset == 0;
+        });
+        EXPECT_FALSE(contains_old);
+        EXPECT_EQ(LoadOne(backend, "same_key", new_value.size()),
+                  std::make_optional(new_value));
+    }
+    OffsetAllocatorStorageBackend recovered(config, backend_cfg);
+    ASSERT_TRUE(recovered.Init());
+    EXPECT_EQ(LoadOne(recovered, "same_key", new_value.size()),
+              std::make_optional(new_value));
+    EXPECT_EQ(LoadOne(recovered, "sentinel", 1),
+              std::make_optional(std::string("s")));
+}
 
 TEST_F(StorageBackendTest,
        OffsetAllocatorStorageBackend_Persist_RecoveryRoundtrip) {
@@ -5539,7 +6131,7 @@ TEST_F(StorageBackendTest,
     }
     ASSERT_EQ(metas.count("key_a"), 1u);
 
-    // Set flags = 0x02 (unknown bit, kFlagHasCrc clear) in key_a's header:
+    // Set flags = 0x04 (unknown bit, kFlagHasCrc clear) in key_a's header:
     // the flags field sits at byte offset 16 (u32 key_len, u32 value_len,
     // u64 seq), little-endian.
     {
@@ -5547,7 +6139,7 @@ TEST_F(StorageBackendTest,
         const std::string data_file = data_path + "/kv_cache.data";
         int fd = open(data_file.c_str(), O_RDWR);
         ASSERT_GE(fd, 0);
-        const char flag_byte = 0x02;
+        const char flag_byte = 0x04;
         ASSERT_EQ(
             pwrite(fd, &flag_byte, 1, static_cast<off_t>(meta.offset) + 16), 1);
         fsync(fd);

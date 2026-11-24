@@ -1624,6 +1624,72 @@ TEST_F(OffsetAllocatorTest, MetricsInterface) {
 
 // ========== Serialization TESTS ==========
 
+TEST_F(OffsetAllocatorTest,
+       SnapshotExcludesRetiredAllocationsWithoutFreeingThem) {
+    auto allocator = OffsetAllocator::create(0, 4096, 32, 64);
+    auto retired = allocator->allocate(1001);
+    auto live = allocator->allocate(513);
+    ASSERT_TRUE(retired.has_value());
+    ASSERT_TRUE(live.has_value());
+    const auto retired_offset = retired->address();
+    const auto before = allocator->get_metrics();
+
+    auto snapshot = allocator->snapshot({&live.value()});
+    ASSERT_NE(snapshot, nullptr);
+    EXPECT_EQ(snapshot->get_metrics().allocated_num_, 1);
+    EXPECT_EQ(snapshot->get_metrics().allocated_size_, 513);
+    EXPECT_EQ(allocator->get_metrics().allocated_num_, before.allocated_num_);
+    EXPECT_EQ(allocator->get_metrics().allocated_size_, before.allocated_size_);
+    EXPECT_EQ(allocator->get_metrics().total_free_space_,
+              before.total_free_space_);
+
+    std::vector<SerializedByte> bytes;
+    ASSERT_EQ(serialize_to(snapshot, bytes), ErrorCode::OK);
+    auto recovered = deserialize_from<OffsetAllocator>(bytes);
+    ASSERT_NE(recovered, nullptr);
+    bool contains_retired = false;
+    recovered->visit_used_nodes([&](uint64_t offset, uint64_t, uint32_t) {
+        contains_retired |= offset == retired_offset;
+    });
+    EXPECT_FALSE(contains_retired);
+    auto reused = recovered->allocate(1001);
+    ASSERT_TRUE(reused.has_value());
+    EXPECT_EQ(reused->address(), retired_offset);
+    EXPECT_EQ(allocator->get_metrics().allocated_num_, 2);
+}
+
+TEST_F(OffsetAllocatorTest, SnapshotCanExcludeAllAllocations) {
+    auto allocator = OffsetAllocator::create(0, 4096, 32, 64);
+    auto first = allocator->allocate(1001);
+    auto second = allocator->allocate(513);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+    auto snapshot = allocator->snapshot({});
+    ASSERT_NE(snapshot, nullptr);
+    EXPECT_EQ(snapshot->get_metrics().allocated_num_, 0);
+    EXPECT_EQ(snapshot->get_metrics().allocated_size_, 0);
+    auto full = snapshot->allocate(4096);
+    ASSERT_TRUE(full.has_value());
+    EXPECT_EQ(full->address(), 0);
+    EXPECT_EQ(allocator->get_metrics().allocated_num_, 2);
+}
+
+TEST_F(OffsetAllocatorTest, SnapshotRejectsForeignDuplicateAndInvalidHandles) {
+    auto allocator = OffsetAllocator::create(0, 4096, 32, 64);
+    auto other = OffsetAllocator::create(0, 4096, 32, 64);
+    auto live = allocator->allocate(513);
+    auto foreign = other->allocate(513);
+    ASSERT_TRUE(live.has_value());
+    ASSERT_TRUE(foreign.has_value());
+    OffsetAllocationHandle invalid;
+    EXPECT_EQ(allocator->snapshot({nullptr}), nullptr);
+    EXPECT_EQ(allocator->snapshot({&invalid}), nullptr);
+    EXPECT_EQ(allocator->snapshot({&foreign.value()}), nullptr);
+    EXPECT_EQ(allocator->snapshot({&live.value(), &live.value()}), nullptr);
+    EXPECT_EQ(allocator->get_metrics().allocated_num_, 1);
+    EXPECT_EQ(other->get_metrics().allocated_num_, 1);
+}
+
 TEST_F(OffsetAllocatorTest, SerializationEmptyAllocator) {
     // Create an empty allocator
     const uint64_t base = 1024 * 16;

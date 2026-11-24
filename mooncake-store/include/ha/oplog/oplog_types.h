@@ -24,6 +24,8 @@ enum class OpType : uint8_t {
     WEIGHT_LEASE_UPSERT = 10,
     WEIGHT_LEASE_DELETE = 11,
     OBJECT_STORAGE_MUTATION = 12,
+    LOCAL_DELETE_REMOVE = 13,
+    LOCAL_DELETE_ACK = 14,
     OP_TYPE_MAX,
 };
 

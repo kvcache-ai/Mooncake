@@ -15,6 +15,7 @@ namespace mooncake {
 class StandbyMetadataStore final : public MetadataStore {
     using ObjectStore = std::unordered_map<std::string, StandbyObjectMetadata>;
     using TenantStore = std::unordered_map<std::string, ObjectStore>;
+    using LocalDeleteTaskMap = std::map<std::pair<UUID, UUID>, LocalDeleteTask>;
 
    public:
     class SnapshotCursor {
@@ -96,6 +97,13 @@ class StandbyMetadataStore final : public MetadataStore {
     ObjectReplicaSnapshot SnapshotObjectReplicas() const;
     bool HasObjectReplicaState() const;
 
+    bool ApplyLocalDeleteRemove(const std::string& tenant_id,
+                                const std::string& key,
+                                const LocalDeleteRemove& removal) override;
+    bool ApplyLocalDeleteAck(const LocalDeleteAck& ack) override;
+    bool RestoreLocalDeleteTasks(const std::vector<LocalDeleteTask>& tasks);
+    std::vector<LocalDeleteTask> CopyLocalDeleteTasks() const;
+
     void Snapshot(std::vector<StandbyObjectEntry>& out) const;
     bool ValidateReplicaIds(ReplicaID& max_replica_id) const;
     bool DrainChunk(size_t count, std::vector<StandbyObjectEntry>& out);
@@ -110,6 +118,7 @@ class StandbyMetadataStore final : public MetadataStore {
     std::optional<ObjectReplicaTarget> object_storage_target_;
     std::map<std::string, ObjectUploadRecord> object_uploads_;
     std::unordered_map<ReplicaID, std::string> object_upload_names_;
+    LocalDeleteTaskMap pending_local_deletes_;
     std::map<WeightRevisionIdentity, WeightRevisionMetadata> weight_metadata_;
     std::map<WeightRevisionIdentity, uint64_t> weight_metadata_tombstones_;
     std::unordered_map<uint64_t, WeightRevisionLease> weight_leases_;

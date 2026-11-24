@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "local_delete_types.h"
 #include "replica.h"
 #include "types.h"
 #include "weight_metadata_store.h"
@@ -43,12 +44,14 @@ struct StandbyObjectMetadata {
     struct_pack::compatible<std::string, 2> session_id;
     struct_pack::compatible<uint64_t, 3> object_checksum;
     struct_pack::compatible<std::string, 4> residency_affinity_id;
+    struct_pack::compatible<ObjectIncarnation, 5> object_incarnation;
+    struct_pack::compatible<std::vector<UUID>, 6> offset_write_targets;
 
     StandbyObjectMetadata() = default;
 
     YLT_REFL(StandbyObjectMetadata, client_id, size, replicas, group_id,
              data_type, hard_pinned, session_id, object_checksum,
-             residency_affinity_id);
+             residency_affinity_id, object_incarnation, offset_write_targets);
 
     // Check if this metadata has valid replicas
     bool HasReplicas() const { return !replicas.empty(); }
@@ -94,9 +97,11 @@ struct StandbySnapshot {
     std::vector<StandbyObjectEntry> objects;
     struct_pack::compatible<WeightMetadataSnapshot, 1> weight_metadata;
     struct_pack::compatible<ObjectReplicaSnapshot, 2> object_storage;
+    struct_pack::compatible<std::vector<LocalDeleteTask>, 3>
+        pending_local_deletes;
 
     YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects,
-             weight_metadata, object_storage);
+             weight_metadata, object_storage, pending_local_deletes);
 };
 
 /**
@@ -116,9 +121,12 @@ struct MetadataPayload {
     struct_pack::compatible<std::string, 2> session_id;
     struct_pack::compatible<uint64_t, 3> object_checksum;
     struct_pack::compatible<std::string, 4> residency_affinity_id;
+    struct_pack::compatible<ObjectIncarnation, 5> object_incarnation;
+    struct_pack::compatible<std::vector<UUID>, 6> offset_write_targets;
 
     YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type,
-             hard_pinned, session_id, object_checksum, residency_affinity_id);
+             hard_pinned, session_id, object_checksum, residency_affinity_id,
+             object_incarnation, offset_write_targets);
 
     // Convert to StandbyObjectMetadata
     StandbyObjectMetadata ToStandbyMetadata() const {
@@ -132,6 +140,8 @@ struct MetadataPayload {
         meta.data_type = data_type.value_or(ObjectDataType::UNKNOWN);
         meta.hard_pinned = hard_pinned.value_or(false);
         meta.residency_affinity_id = residency_affinity_id.value_or("");
+        meta.object_incarnation = object_incarnation;
+        meta.offset_write_targets = offset_write_targets;
         return meta;
     }
 };
@@ -178,6 +188,13 @@ class MetadataStore {
         const ObjectReplicaMutation& mutation) {
         return false;
     }
+
+    virtual bool ApplyLocalDeleteRemove(const std::string&, const std::string&,
+                                        const LocalDeleteRemove&) {
+        return false;
+    }
+
+    virtual bool ApplyLocalDeleteAck(const LocalDeleteAck&) { return false; }
 
     // NEW: tenant-aware methods (primary API)
     virtual bool PutMetadata(const std::string& tenant_id,
