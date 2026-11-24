@@ -18,8 +18,28 @@ using WeightRpcResult =
 struct ObjectMeta {
     std::string key;
     std::optional<uint64_t> object_checksum;
+    struct_pack::compatible<std::string, 1> write_generation;
 };
-YLT_REFL(ObjectMeta, key, object_checksum);
+YLT_REFL(ObjectMeta, key, object_checksum, write_generation);
+
+// Extract the authority returned by one successful primary Start. A partial,
+// tokenless or inconsistent response must fail before submitting any writes;
+// looking up the current Query generation would authorize the wrong operation.
+inline tl::expected<std::string, ErrorCode> GetPrimaryWriteGeneration(
+    const std::vector<Replica::Descriptor>& replicas) {
+    if (replicas.empty() || !replicas.front().write_generation ||
+        replicas.front().write_generation->empty()) {
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+    const auto& generation = *replicas.front().write_generation;
+    for (const auto& replica : replicas) {
+        if (!replica.write_generation ||
+            *replica.write_generation != generation) {
+            return tl::unexpected(ErrorCode::INVALID_REPLICA);
+        }
+    }
+    return generation;
+}
 
 enum class ReplicaActionType {
     ADD = 0,
@@ -91,18 +111,21 @@ struct GetReplicaListResponse {
     // the exact scope the write path used. Empty when the master predates
     // this field.
     struct_pack::compatible<std::string, 1> resolved_tenant_id;
+    struct_pack::compatible<std::string, 2> object_generation;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(
         std::vector<Replica::Descriptor>&& replicas_param,
         uint64_t lease_ttl_ms_param,
-        std::optional<uint64_t> object_checksum_param = std::nullopt)
+        std::optional<uint64_t> object_checksum_param = std::nullopt,
+        std::string generation = {})
         : replicas(std::move(replicas_param)),
           lease_ttl_ms(lease_ttl_ms_param),
-          object_checksum(object_checksum_param) {}
+          object_checksum(object_checksum_param),
+          object_generation(std::move(generation)) {}
 };
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum,
-         resolved_tenant_id);
+         resolved_tenant_id, object_generation);
 
 struct CachedQueryResultResponse {
     bool success;
@@ -161,8 +184,12 @@ YLT_REFL(CopyStartResponse, source, targets);
  */
 struct PromotionAllocStartResponse {
     Replica::Descriptor memory_descriptor;
+    struct_pack::compatible<std::string, 1> object_generation;
+    struct_pack::compatible<std::string, 2> task_id;
+    struct_pack::compatible<std::string, 3> storage_key;
 };
-YLT_REFL(PromotionAllocStartResponse, memory_descriptor);
+YLT_REFL(PromotionAllocStartResponse, memory_descriptor, object_generation,
+         task_id, storage_key);
 
 /**
  * @brief Response structure for MoveStart operation

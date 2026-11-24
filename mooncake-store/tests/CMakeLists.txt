@@ -694,3 +694,5 @@ target_include_directories(hf3fs_resource_manager_test BEFORE
 target_link_libraries(hf3fs_resource_manager_test PRIVATE gtest gtest_main
                                                           pthread)
 add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)
+
+add_store_test(ssd_generation_codec_test ssd_generation_codec_test.cpp)

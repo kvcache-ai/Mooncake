@@ -358,6 +358,8 @@ struct LocalDiskReplicaData {
     // set before the replica is published and not changed while readers can
     // see it, so it needs no atomic access.
     ClientSessionSharedPtr owner_session;
+    std::string storage_key;
+    std::string object_generation;
 };
 
 struct DistributedFSDescriptor {
@@ -395,7 +397,10 @@ struct LocalDiskDescriptor {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
-    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
+    struct_pack::compatible<std::string, 1> storage_key;
+    struct_pack::compatible<std::string, 2> object_generation;
+    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint,
+             storage_key, object_generation);
 };
 
 class Replica {
@@ -579,6 +584,25 @@ class Replica {
         return replica.is_local_disk_replica();
     }
 
+    // Update the live descriptor, preserving identity, status, references and
+    // client-liveness ownership. get_descriptor() returns a value snapshot.
+    void update_local_disk_descriptor(
+        uint64_t object_size, const std::string& transport_endpoint,
+        const std::string& storage_key = {},
+        const std::string& object_generation = {}) {
+        auto& disk = LocalDiskData(data_);
+        disk.transport_endpoint = transport_endpoint;
+        disk.storage_key = storage_key;
+        disk.object_generation = object_generation;
+        if (disk.object_size != object_size) {
+            MasterMetricManager::instance().dec_allocated_file_size(
+                disk.object_size);
+            MasterMetricManager::instance().inc_allocated_file_size(
+                object_size);
+            disk.object_size = object_size;
+        }
+    }
+
     [[nodiscard]] bool is_dfs_replica() const {
         return std::holds_alternative<std::unique_ptr<DfsReplicaData>>(data_);
     }
@@ -760,7 +784,10 @@ class Replica {
                      LocalDiskDescriptor, DistributedFSDescriptor>
             descriptor_variant;
         ReplicaStatus status;
-        YLT_REFL(Descriptor, id, descriptor_variant, status);
+        // Only primary PutStart/UpsertStart responses carry this token.
+        // Ordinary Query descriptors are not authority to finish a write.
+        struct_pack::compatible<std::string, 1> write_generation;
+        YLT_REFL(Descriptor, id, descriptor_variant, status, write_generation);
 
         // Helper functions
         bool is_memory_replica() noexcept {
@@ -955,9 +982,13 @@ class Replica {
             std::string transport_endpoint, ReplicaStatus status,
             ClientSessionSharedPtr owner_session = nullptr)
         : id_(id),
-          data_(std::make_unique<LocalDiskReplicaData>(LocalDiskReplicaData{
-              client_id, object_size, std::move(transport_endpoint),
-              std::move(owner_session)})),
+          data_(std::make_unique<LocalDiskReplicaData>(
+              LocalDiskReplicaData{client_id,
+                                   object_size,
+                                   std::move(transport_endpoint),
+                                   std::move(owner_session),
+                                   {},
+                                   {}})),
           status_(status),
           refcnt_(0) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
@@ -1025,6 +1056,12 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         local_disk_desc.client_id = disk_data.client_id;
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
+        if (!disk_data.storage_key.empty()) {
+            local_disk_desc.storage_key = disk_data.storage_key;
+        }
+        if (!disk_data.object_generation.empty()) {
+            local_disk_desc.object_generation = disk_data.object_generation;
+        }
         desc.descriptor_variant = std::move(local_disk_desc);
     } else if (is_dfs_replica()) {
         desc.descriptor_variant = DfsData(data_).descriptor;

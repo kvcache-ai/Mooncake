@@ -274,25 +274,41 @@ struct OffloadTaskItem {
     std::string tenant_id;
     std::string key;
     int64_t size;
+    struct_pack::compatible<std::string, 1> object_generation;
+    struct_pack::compatible<std::string, 2> task_id;
+    struct_pack::compatible<bool, 3> restoring;
 
     bool operator==(const OffloadTaskItem& other) const {
         return tenant_id == other.tenant_id && key == other.key &&
-               size == other.size;
+               size == other.size &&
+               object_generation.value_or("") ==
+                   other.object_generation.value_or("") &&
+               task_id.value_or("") == other.task_id.value_or("") &&
+               restoring.value_or(false) == other.restoring.value_or(false);
     }
 };
-YLT_REFL(OffloadTaskItem, tenant_id, key, size);
+YLT_REFL(OffloadTaskItem, tenant_id, key, size, object_generation, task_id,
+         restoring);
 
 struct PromotionTaskItem {
     std::string tenant_id;
     std::string key;
     int64_t size;
+    struct_pack::compatible<std::string, 1> storage_key;
+    struct_pack::compatible<std::string, 2> object_generation;
+    struct_pack::compatible<std::string, 3> task_id;
 
     bool operator==(const PromotionTaskItem& other) const {
         return tenant_id == other.tenant_id && key == other.key &&
-               size == other.size;
+               size == other.size &&
+               storage_key.value_or("") == other.storage_key.value_or("") &&
+               object_generation.value_or("") ==
+                   other.object_generation.value_or("") &&
+               task_id.value_or("") == other.task_id.value_or("");
     }
 };
-YLT_REFL(PromotionTaskItem, tenant_id, key, size);
+YLT_REFL(PromotionTaskItem, tenant_id, key, size, storage_key,
+         object_generation, task_id);
 
 // Store client configuration validation limits
 static constexpr size_t MIN_SEGMENT_SIZE = 1024;                          // 1KB
