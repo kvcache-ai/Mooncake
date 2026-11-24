@@ -32,9 +32,10 @@ class AlgorithmProvider {
         return endpoint_version_;
     }
 
-    // The shared protocol instance must outlive the algorithm.
-    [[nodiscard]] const ProtocolProvider& protocol() const noexcept {
-        return protocol_;
+    // Shared protocol instances must outlive the algorithm.
+    [[nodiscard]] std::span<const ProtocolProvider* const> protocols()
+        const noexcept {
+        return protocols_;
     }
 
     [[nodiscard]] virtual AlgorithmEndpoint localEndpoint() const = 0;
@@ -65,10 +66,17 @@ class AlgorithmProvider {
                       uint32_t endpoint_version,
                       const ProtocolProvider& protocol,
                       std::initializer_list<OpType> operations)
+        : AlgorithmProvider(type, key, endpoint_version, {&protocol},
+                            operations) {}
+
+    AlgorithmProvider(DeviceCollectiveAlgorithm type, std::string_view key,
+                      uint32_t endpoint_version,
+                      std::initializer_list<const ProtocolProvider*> protocols,
+                      std::initializer_list<OpType> operations)
         : type_(type),
           key_(key),
           endpoint_version_(endpoint_version),
-          protocol_(protocol),
+          protocols_(protocols),
           supported_operations(operations) {}
 
     template <typename T>
@@ -138,7 +146,7 @@ class AlgorithmProvider {
     DeviceCollectiveAlgorithm type_;
     std::string_view key_;
     uint32_t endpoint_version_;
-    const ProtocolProvider& protocol_;
+    std::vector<const ProtocolProvider*> protocols_;
     std::vector<OpType> supported_operations;
 };
 

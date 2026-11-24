@@ -20,12 +20,15 @@ class DeviceTransferService;
 // One communicator's LL tag-recycle signals and per-channel progress.
 class LLProtocol final : public ProtocolProvider {
    public:
+    enum class Scope { Group, LocalHost };
+
     static constexpr std::string_view kProtocolKey = "ll";
+    static constexpr std::string_view kLocalHostProtocolKey = "ll-local-host";
     static constexpr uint32_t kEndpointVersion = 1;
 
     static PGResult<std::unique_ptr<LLProtocol>> create(
         DeviceTransferService& transfer_service, InGroupRank self_rank,
-        uint32_t max_group_size);
+        uint32_t max_group_size, Scope scope = Scope::Group);
 
     ~LLProtocol() noexcept override = default;
     LLProtocol(const LLProtocol&) = delete;
@@ -39,8 +42,8 @@ class LLProtocol final : public ProtocolProvider {
 
    private:
     LLProtocol(RegionSlice tag_recycle_signals, InGroupRank self_rank,
-               uint32_t max_group_size,
-               DeviceTransferService& transfer_service) noexcept;
+               uint32_t max_group_size, DeviceTransferService& transfer_service,
+               Scope scope) noexcept;
 
     PGResult<LLState> makeState(const ResolvedGroupView& view) const;
     PGResult<void> appendStateUpdate(ControlUpdateBuilder& builder,
@@ -51,6 +54,7 @@ class LLProtocol final : public ProtocolProvider {
     GpuBuffer<LLChannelProgress> progress_;
     GpuBuffer<LLState> state_;
     DeviceTransferService& transfer_service_;
+    Scope scope_;
     InGroupRank self_rank_ = kInvalidInGroupRank;
 };
 

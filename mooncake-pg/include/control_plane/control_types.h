@@ -127,6 +127,9 @@ struct DeviceTransferEndpoint {
     // request an installation or invalidate installed resources.
     uint64_t version = 0;
 
+    // Process identity for locality decisions. Older peers omit this field.
+    struct_pack::compatible<std::string, 1> host_id;
+
     bool operator==(const DeviceTransferEndpoint&) const = default;
 };
 

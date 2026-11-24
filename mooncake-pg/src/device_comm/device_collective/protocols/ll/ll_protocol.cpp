@@ -1,8 +1,10 @@
 #include "device_comm/device_collective/protocols/ll/ll_protocol.h"
 
+#include <limits>
 #include <utility>
 
 #include "device_comm/device_collective/device_control_update.h"
+#include "device_comm/device_collective/protocols/ll/ll_peer_scope.h"
 #include "device_comm/device_transfer/transfer_service.h"
 #include "gpu_runtime.h"
 #include "pg_utils.h"
@@ -20,16 +22,20 @@ struct LLEndpointMetadata {
 
 LLProtocol::LLProtocol(RegionSlice tag_recycle_signals, InGroupRank self_rank,
                        uint32_t max_group_size,
-                       DeviceTransferService& transfer_service) noexcept
-    : ProtocolProvider(kProtocolKey, kEndpointVersion),
+                       DeviceTransferService& transfer_service,
+                       Scope scope) noexcept
+    : ProtocolProvider(
+          scope == Scope::Group ? kProtocolKey : kLocalHostProtocolKey,
+          kEndpointVersion),
       tag_recycle_signals_(std::move(tag_recycle_signals)),
       max_group_size_(max_group_size),
       transfer_service_(transfer_service),
+      scope_(scope),
       self_rank_(self_rank) {}
 
 PGResult<std::unique_ptr<LLProtocol>> LLProtocol::create(
     DeviceTransferService& transfer_service, InGroupRank self_rank,
-    uint32_t max_group_size) {
+    uint32_t max_group_size, Scope scope) {
     PG_VALIDATE_ARG(max_group_size > 0 && max_group_size <= kMaxNumRanks,
                     "LL group capacity is outside the supported range");
     PG_VALIDATE_ARG(
@@ -42,7 +48,7 @@ PGResult<std::unique_ptr<LLProtocol>> LLProtocol::create(
                                          signal_bytes, alignof(uint64_t)));
     auto protocol = std::unique_ptr<LLProtocol>(
         new LLProtocol(std::move(tag_recycle_signals), self_rank,
-                       max_group_size, transfer_service));
+                       max_group_size, transfer_service, scope));
     PG_TRY(auto device_guard,
            GpuDeviceGuard::create(transfer_service.deviceIndex()));
     PG_TRY(protocol->progress_,
@@ -87,10 +93,19 @@ PGResult<LLState> LLProtocol::makeState(const ResolvedGroupView& view) const {
             static_cast<uint64_t*>(tag_recycle_signals_.addr()),
         .progress = progress_.get(),
     };
+    PG_VALIDATE_STATE(view.participants.size() <= max_group_size_,
+                      "LL participant count exceeds group capacity");
     if (view.self_active_index >= 0) {
+        const auto eligible_peers = scope_ == Scope::LocalHost
+                                        ? transfer_service_.localHostPeers()
+                                        : std::numeric_limits<uint64_t>::max();
         for (size_t index = 0; index < view.participants.size(); ++index) {
             const auto& peer = view.participants[index];
             if (peer.in_group_rank == self_rank_) continue;
+            if (scope_ == Scope::LocalHost &&
+                !llIncludesPeer(eligible_peers, peer.global_rank)) {
+                continue;
+            }
             PG_VALIDATE_STATE(
                 peer.in_group_rank >= 0 &&
                     static_cast<uint32_t>(peer.in_group_rank) < max_group_size_,
@@ -117,6 +132,7 @@ PGResult<LLState> LLProtocol::makeState(const ResolvedGroupView& view) const {
                                metadata.signal_offset, signal_bytes),
                 "LL peer signals overlap the shared payload workspace");
             next.tag_recycle_signal_offsets[index] = metadata.signal_offset;
+            next.barrier_peers |= uint64_t{1} << index;
         }
     }
     return next;

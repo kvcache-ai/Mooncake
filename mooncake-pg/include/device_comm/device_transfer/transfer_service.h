@@ -65,6 +65,8 @@ class DeviceTransferService {
 
     // Query the published route and its capabilities without GPU interaction.
     PGResult<DeviceTransferRouteInfo> routeInfo(GlobalRank rank) const;
+    // Global-rank mask from the last successfully installed endpoint snapshot.
+    [[nodiscard]] uint64_t localHostPeers() const;
 
     // Return route capabilities and any updated local endpoint.
     // Local DTS users are paused while routes are switched and published.
