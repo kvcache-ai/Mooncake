@@ -14,7 +14,7 @@ use crate::metrics::{
     record_authoritative_route_update, record_delete_marker_event, record_delete_marker_state,
 };
 use crate::table::{DeleteMarkerSnapshot, DeleteMarkerStore};
-use crate::RouteAuthorityRecord;
+use crate::{RouteAuthorityPresence, RouteAuthorityRecord};
 use crate::{RouteOwnerPage, DEFAULT_ROUTE_OWNER_PAGE_SIZE};
 
 fn route_has_materialized_cold_backing(route: &ObjectRoute) -> bool {
@@ -89,6 +89,17 @@ impl LocalRouteTable {
 
     pub(crate) fn get_records(&self, keys: &[ObjectKey]) -> Vec<RouteAuthorityRecord> {
         keys.iter().map(|key| self.get_record(key)).collect()
+    }
+
+    pub(crate) fn get_presence(&self, key: &ObjectKey) -> RouteAuthorityPresence {
+        RouteAuthorityPresence {
+            live_version: self.routes.get(&key.0).map(|route| route.version),
+            delete_version: self.delete_marker(key),
+        }
+    }
+
+    pub(crate) fn get_presence_many(&self, keys: &[ObjectKey]) -> Vec<RouteAuthorityPresence> {
+        keys.iter().map(|key| self.get_presence(key)).collect()
     }
 
     pub(crate) fn contains_many(&self, keys: &[ObjectKey]) -> Vec<bool> {
@@ -721,6 +732,32 @@ mod tests {
 
         table.replace(&key, None);
         assert!(sink.routes.lock().unwrap().get(&key.0).is_none());
+    }
+
+    #[test]
+    fn presence_reads_live_delete_and_missing_versions() {
+        let live_key = ObjectKey::new("presence-live");
+        let deleted_key = ObjectKey::new("presence-deleted");
+        let missing_key = ObjectKey::new("presence-missing");
+        let mut table = LocalRouteTable::default();
+        table.replace(&live_key, Some(&test_route(&live_key, 4)));
+        table.replace(&deleted_key, Some(&test_route(&deleted_key, 2)));
+        table.replace(&deleted_key, None);
+
+        assert_eq!(
+            table.get_presence_many(&[live_key, deleted_key, missing_key]),
+            vec![
+                RouteAuthorityPresence {
+                    live_version: Some(RouteVersion(4)),
+                    delete_version: None,
+                },
+                RouteAuthorityPresence {
+                    live_version: None,
+                    delete_version: Some(RouteVersion(2)),
+                },
+                RouteAuthorityPresence::default(),
+            ]
+        );
     }
 
     #[test]

@@ -2,7 +2,8 @@
 requires = [
     "scikit-build-core>=1.0",
     "pybind11>=2.13",
-    "numpy>=1.24",
+    "numpy>=2.0",
+    "nanobind>=2.13",
     # Retained for the legacy wheel helper and packaging test environment.
     "setuptools>=61",
     # Retained for the legacy wheel helper; PG Torch compilation is runtime JIT.

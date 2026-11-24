@@ -132,6 +132,8 @@ Workers::Workers(RdmaTransport* transport)
 
     params.strict_local_numa =
         conf->get("transports/rdma/strict_local_numa", false);
+    params.closest_tier_only =
+        conf->get("transports/rdma/closest_tier_only", false);
     dest_device_affinity_ =
         conf->get("transports/rdma/dest_device_affinity", false);
     if (dest_device_affinity_) {
@@ -1799,8 +1801,11 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
     if (!affinity_pinned && slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
+        // A receiver NIC outside the target's closest rank DMAs into GPU
+        // memory across the host bridge; at line rate that triggers PFC.
+        const bool closest_tier_only =
+            device_selector_->getSchedulingParams().closest_tier_only;
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
-            if (rank && always_tier1_) break;
             const auto& list = target.topo_entry->device_list[rank];
             if (list.empty()) continue;
             if (std::find(list.begin(), list.end(), mapped_dev_id) !=
@@ -1808,6 +1813,7 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
                 slice->target_dev_id = mapped_dev_id;
                 break;
             }
+            if (closest_tier_only) break;
         }
     }
 

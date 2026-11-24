@@ -174,7 +174,10 @@ and the data fill and verify of `--check_consistency`. `Avg Tx`, `P99 Tx`,
 `P999 Tx`, and `Avg Inst GB/s` time only the transfer itself, from submit to
 completion.
 
-A short (~1 second) warmup phase is executed before measurements begin.
+Each case warms up for `--warmup_ms` milliseconds (1000 by default) before
+measurements begin. Use `--warmup_ms=0` to measure without warmup, including
+the cost of the first transfer. All worker threads still synchronize before
+starting the measured workload.
 
 ### 4.1 QoS Metrics Baseline
 
@@ -301,7 +304,7 @@ When set, each completed transfer appends one JSON line:
 | Field | Meaning |
 | ----- | ------- |
 | `block_size`, `batch_size` | Shape of the transfer, identifying the sweep point |
-| `warmup` | `true` for transfers in the 1 s warmup before measurement |
+| `warmup` | `true` for transfers in the configured warmup before measurement |
 | `submit_us` | Time in `submitTransfer`, in microseconds with ns precision |
 | `wait_us` | Time from submit return until the batch reports COMPLETED, in microseconds with ns precision |
 | `polls` | Number of status polls in that wait |
@@ -396,6 +399,7 @@ Example:
 * `--start_batch_size`, `--max_batch_size` : batch size sweep (powers of two)
 * `--start_num_threads`, `--max_num_threads` : thread sweep (powers of two)
 * `--duration` : measurement time per case (seconds)
+* `--warmup_ms` : warmup time per case (milliseconds; default 1000, 0 disables)
 
 Each thread owns one fixed region in its local buffer and one in its target
 buffer, sized for the largest operation (`max_block_size × max_batch_size`, or

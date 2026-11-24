@@ -7,14 +7,15 @@
 #include <future>
 #include <unordered_map>
 #include <functional>
-#include <pybind11/pybind11.h>
-#include <pybind11/pytypes.h>
+#include <nanobind/nanobind.h>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/client_pool.hpp>
 #include <ylt/coro_io/coro_io.hpp>
 #include <async_simple/coro/Lazy.h>
 #include "config.h"
+
+namespace py = nanobind;
 
 namespace mooncake {
 
@@ -46,8 +47,7 @@ class RpcCommunicator {
     async_simple::coro::Lazy<RpcResult> sendDataAsync(
         const std::string& target_address, const void* data, size_t data_size);
 
-    int sendTensor(const std::string& target_address,
-                   const pybind11::object& tensor);
+    int sendTensor(const std::string& target_address, const py::object& tensor);
     async_simple::coro::Lazy<int> sendTensorAsync(
         const std::string& target_address, const TensorInfo& tensor);
 

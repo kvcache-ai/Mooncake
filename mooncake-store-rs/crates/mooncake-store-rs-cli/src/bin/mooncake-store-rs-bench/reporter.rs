@@ -119,6 +119,7 @@ impl BenchReport {
         for (label, pct) in [
             ("Latency p50", 50.0),
             ("Latency p90", 90.0),
+            ("Latency p95", 95.0),
             ("Latency p99", 99.0),
             ("Latency p999", 99.9),
         ] {
@@ -213,6 +214,7 @@ fn stats_to_json(stats: &mut LatencyRecorder) -> serde_json::Value {
         "throughput_mib_s": stats.throughput_mib_s(),
         "errors": stats.error_count(),
         "latency_p50_us": stats.percentile(50.0).as_micros(),
+        "latency_p95_us": stats.percentile(95.0).as_micros(),
         "latency_p90_us": stats.percentile(90.0).as_micros(),
         "latency_p99_us": stats.percentile(99.0).as_micros(),
         "latency_p999_us": stats.percentile(99.9).as_micros(),
@@ -228,6 +230,7 @@ fn print_csv_rows(op: &str, stats: &mut LatencyRecorder) {
     info!("{op},throughput_mib_s,{:.4}", stats.throughput_mib_s());
     info!("{op},errors,{}", stats.error_count());
     info!("{op},latency_p50_us,{}", stats.percentile(50.0).as_micros());
+    info!("{op},latency_p95_us,{}", stats.percentile(95.0).as_micros());
     info!("{op},latency_p90_us,{}", stats.percentile(90.0).as_micros());
     info!("{op},latency_p99_us,{}", stats.percentile(99.0).as_micros());
     info!(
