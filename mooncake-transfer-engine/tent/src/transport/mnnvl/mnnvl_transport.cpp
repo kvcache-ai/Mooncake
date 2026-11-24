@@ -262,12 +262,11 @@ Status drainMnnvlBatch(MnnvlSubBatch *batch) {
 
 /// Waits for producer work already queued on the caller's per-thread stream
 /// so the copy submitted on the transport's internal stream cannot read the
-/// source buffer before that work has executed. CPU-blocking
-/// cudaEventSynchronize mirrors IntraNodeNvlinkTransport and avoids the
-/// expensive cross-device cudaStreamWaitEvent on non-NVIDIA GPUs; it is
-/// complementary to (not a replacement for) the
-/// cudaMemcpySrcAccessOrderStream attribute applied at copy submission.
-Status syncWithCallerStream() {
+/// source buffer before that work has executed. The default CPU wait mirrors
+/// IntraNodeNvlinkTransport; gpu_wait enqueues the dependency on the internal
+/// stream. Neither mode replaces external fencing for application streams.
+Status syncWithCallerStream(cudaStream_t stream, int stream_device,
+                            bool gpu_wait) {
     int device_id = 0;
     CHECK_CUDA(cudaGetDevice(&device_id));
     cudaEvent_t event = tl_caller_sync_events.getOrCreate(device_id);
@@ -276,7 +275,15 @@ Status syncWithCallerStream() {
             "unable to create caller-sync event" LOC_MARK);
     }
     CHECK_CUDA(cudaEventRecord(event, cudaStreamPerThread));
-    CHECK_CUDA(cudaEventSynchronize(event));
+    if (gpu_wait) {
+        MnnvlDeviceGuard device(stream_device);
+        CHECK_CUDA(device.error());
+        // The wait captures this record; a later record on the thread-local
+        // event does not change work already waiting on this stream.
+        CHECK_CUDA(cudaStreamWaitEvent(stream, event, 0));
+    } else {
+        CHECK_CUDA(cudaEventSynchronize(event));
+    }
     return Status::OK();
 }
 
@@ -409,6 +416,7 @@ Status MnnvlTransport::install(std::string &local_segment_name,
               << (handle_type_ == CU_MEM_HANDLE_TYPE_FABRIC ? "fabric"
                                                             : "posix_fd")
               << " require_fabric=" << options_.require_fabric
+              << " sync_mode=" << (options_.gpu_wait ? "gpu_wait" : "cpu_block")
               << " egm=" << egm_enabled_ << " copy_api=" << copy_api
               << " cuda_runtime=" << CUDART_VERSION;
     return Status::OK();
@@ -594,7 +602,8 @@ Status MnnvlTransport::submitTransferTasks(
     }
 
     // Reserve all bookkeeping before enqueueing any copy. Record on the
-    // original caller device.
+    // original caller device; syncWithCallerStream restores it after a
+    // cross-device wait.
     std::vector<MnnvlTask *> new_tasks;
     new_tasks.reserve(validated.size());
     std::vector<void *> srcs, dsts;
@@ -612,13 +621,15 @@ Status MnnvlTransport::submitTransferTasks(
     mnnvl_batch->completion_groups.reserve(
         mnnvl_batch->completion_groups.size() + 1);
     // Requests carrying a producer_event are ordered on the device by
-    // startTransfer, so the CPU barrier on the caller's per-thread stream is
-    // skipped when every request has one.
+    // startTransfer, so the caller-stream sync is skipped when every request
+    // has one.
     const bool need_caller_sync = std::any_of(
         request_list.begin(), request_list.end(), [](const Request &request) {
             return request.producer_event == nullptr;
         });
-    if (need_caller_sync) CHECK_STATUS(syncWithCallerStream());
+    if (need_caller_sync)
+        CHECK_STATUS(
+            syncWithCallerStream(stream, stream_device, options_.gpu_wait));
     MnnvlDeviceGuard guard(stream_device);
     CHECK_CUDA(guard.error());
 
@@ -652,7 +663,9 @@ Status MnnvlTransport::submitTransferTasks(
                 << " local=" << local
                 << " remote=" << request_list.size() - local << " handle_type="
                 << (handle_type_ == CU_MEM_HANDLE_TYPE_FABRIC ? "fabric"
-                                                              : "posix_fd");
+                                                              : "posix_fd")
+                << " sync_mode="
+                << (options_.gpu_wait ? "gpu_wait" : "cpu_block");
     }
     startTransfer(new_tasks, srcs, dsts, sizes, mnnvl_batch,
                   *mnnvl_batch->completion_groups.back());

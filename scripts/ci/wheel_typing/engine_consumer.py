@@ -41,6 +41,7 @@ def exercise_transfer_engine(engine: TransferEngine) -> None:
     batch_id = engine.batch_transfer_async_read("peer:1", (buffer,), (0,), (4096,))
     assert_type(engine.get_batch_transfer_status([batch_id]), int)
     assert_type(engine.transfer_check_status(batch_id), int)
+    assert_type(engine.batch_transfer_check_status([batch_id]), list[int])
 
     assert_type(
         engine.transfer_sync(

@@ -35,6 +35,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment_allocator_registration.cpp
     client_offboarding.cpp
     client_session_registry.cpp
+    client_session_event_dispatcher.cpp
     dynamic_replication_controller.cpp
     eviction/evictor.cpp
     eviction/offloading_reclaimer.cpp
@@ -70,6 +71,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
     ha/common/redis/redis_connection.cpp
+    ha/common/redis/redis_cluster_client.cpp
     ha/leadership/backends/redis/redis_leader_coordinator.cpp
     ha/leadership/master_service_supervisor.cpp
     shutdown_request.cpp
@@ -94,6 +96,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/oplog/oplog_types.cpp
     ha/oplog/oplog_batch_codec.cpp
     ha/oplog/oplog_batch_storage.cpp
+    ha/oplog/batch_oplog_pruning_worker.cpp
     ha/oplog/oplog_batch_standby_reader.cpp
     ha/oplog/oplog_batch_types.cpp
     ha/oplog/ordered_oplog_writer.cpp
@@ -396,14 +399,14 @@ endif()
 # configuration so unit tests can exercise it without SPDK; both mooncake_store
 # and mooncake_nof_spdk link it (the latter cannot link mooncake_store — that
 # would be a cycle).
-add_library(mooncake_nof_core STATIC nof/page_registry.cpp
-                                     nof/probe_context_pool.cpp
-                                     config/spdk_controller_config.cpp)
+add_library(
+  mooncake_nof_core STATIC nof/page_registry.cpp nof/probe_context_pool.cpp
+                           config/spdk_controller_config.cpp)
 target_include_directories(mooncake_nof_core
                            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-target_link_libraries(mooncake_nof_core
-                      PUBLIC glog::glog yalantinglibs::yalantinglibs
-                             cachelib_memory_allocator mooncake_common)
+target_link_libraries(
+  mooncake_nof_core PUBLIC glog::glog yalantinglibs::yalantinglibs
+                           cachelib_memory_allocator mooncake_common)
 
 if(USE_NOF)
   set(SPDK_INCLUDE_DIR
@@ -497,11 +500,10 @@ if(USE_NOF)
   target_include_directories(
     mooncake_nof_spdk
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SPDK_INCLUDE_DIR}
-            ${DPDK_INCLUDE_DIR})
-  target_link_libraries(mooncake_nof_spdk
-                        PRIVATE ${SPDK_STATIC_LIBS} glog::glog
-                                mooncake_nof_core yalantinglibs::yalantinglibs)
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
+  target_link_libraries(
+    mooncake_nof_spdk PRIVATE ${SPDK_STATIC_LIBS} glog::glog mooncake_nof_core
+                              yalantinglibs::yalantinglibs)
 
   # spdk_mem_register (SPDK >= 22.05) compile-time probe.
   # CMAKE_TRY_COMPILE_TARGET_TYPE was added in CMake 3.6 (project requires
@@ -510,10 +512,8 @@ if(USE_NOF)
   set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
   include(CheckCXXSourceCompiles)
   set(CMAKE_REQUIRED_INCLUDES ${SPDK_INCLUDE_DIR})
-  check_cxx_source_compiles(
-    "#include <spdk/env.h>
-     int main() { (void)&spdk_mem_register; return 0; }"
-    HAVE_SPDK_MEM_REGISTER)
+  check_cxx_source_compiles("#include <spdk/env.h>
+     int main() { (void)&spdk_mem_register; return 0; }" HAVE_SPDK_MEM_REGISTER)
   unset(CMAKE_REQUIRED_INCLUDES)
   unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
   if(HAVE_SPDK_MEM_REGISTER)
@@ -521,11 +521,10 @@ if(USE_NOF)
                                PRIVATE HAVE_SPDK_MEM_REGISTER=1)
   else()
     message(
-      WARNING
-      "spdk_mem_register not found under ${SPDK_INCLUDE_DIR} "
-      "(SPDK < 22.05?). NoF-over-RDMA user-buffer registration (#3131) "
-      "will remain unfixed: pure-NoF writes over RDMA will fail with "
-      "'No translation for ptr' errors.")
+      WARNING "spdk_mem_register not found under ${SPDK_INCLUDE_DIR} "
+              "(SPDK < 22.05?). NoF-over-RDMA user-buffer registration (#3131) "
+              "will remain unfixed: pure-NoF writes over RDMA will fail with "
+              "'No translation for ptr' errors.")
   endif()
 endif()
 

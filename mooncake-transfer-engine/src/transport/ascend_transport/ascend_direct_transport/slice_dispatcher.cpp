@@ -18,6 +18,7 @@
 #include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
 #include "common.h"
+#include "config.h"
 
 #include <glog/logging.h>
 
@@ -108,16 +109,18 @@ size_t DefaultSliceDispatcher::resolveThreadPoolSize() const {
     if (transfer_executor_->getUseBufferPool()) {
         return kBufferModeThreadPoolSize;
     }
-    char* ascend_thread_pool_size_str = std::getenv("ASCEND_THREAD_POOL_SIZE");
+    const char* ascend_thread_pool_size_str = getEnvWithFallback(
+        "MC_ASCEND_THREAD_POOL_SIZE", "ASCEND_THREAD_POOL_SIZE");
     if (ascend_thread_pool_size_str) {
         auto opt = parseFromString<int32_t>(ascend_thread_pool_size_str);
         if (opt.has_value()) {
-            auto size = static_cast<size_t>(opt.value());
-            if (size <= kMaxThreadPoolSize) {
+            if (opt.value() > 0 &&
+                static_cast<size_t>(opt.value()) <= kMaxThreadPoolSize) {
+                auto size = static_cast<size_t>(opt.value());
                 LOG(INFO) << "Set thread pool size to:" << size;
                 return size;
             }
-            LOG(WARNING) << "Invalid thread pool size:" << size;
+            LOG(WARNING) << "Invalid thread pool size:" << opt.value();
         }
     }
     return kDefaultThreadPoolSize;

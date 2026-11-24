@@ -8,6 +8,7 @@
 #include <fcntl.h>     // For O_CREAT, O_RDWR
 #include <unistd.h>    // For ftruncate, close, shm_unlink
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <algorithm>
 #include <limits>
@@ -496,10 +497,15 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
 int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                              const std::string& server_address,
                              const std::string& ipc_socket_path) {
-    const char* use_fabric_mem_env =
-        std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
-    if (use_fabric_mem_env && std::string(use_fabric_mem_env) == "1") {
-        globalConfig().ascend_use_fabric_mem = true;
+    const char* use_fabric_mem_env = getEnvWithFallback(
+        "MC_ASCEND_ENABLE_USE_FABRIC_MEM", "ASCEND_ENABLE_USE_FABRIC_MEM");
+    if (use_fabric_mem_env) {
+        std::string val(use_fabric_mem_env);
+        std::transform(val.begin(), val.end(), val.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (val == "1" || val == "true") {
+            globalConfig().ascend_use_fabric_mem = true;
+        }
     }
 
     void* base_addr = nullptr;
@@ -2085,6 +2091,42 @@ tl::expected<UUID, ErrorCode> DummyClient::create_move_task(
     const std::string& key, const std::string& source,
     const std::string& target) {
     return invoke_rpc<&RealClient::create_move_task, UUID>(key, source, target);
+}
+
+tl::expected<UUID, ErrorCode> DummyClient::create_drain_job(
+    const CreateDrainJobRequest& request) {
+    return invoke_rpc<&RealClient::create_drain_job, UUID>(request);
+}
+
+tl::expected<UUID, ErrorCode> DummyClient::create_timed_drain_job(
+    const CreateDrainJobRequest& request, uint64_t timeout_ms) {
+    return invoke_rpc<&RealClient::create_timed_drain_job, UUID>(request,
+                                                                 timeout_ms);
+}
+
+tl::expected<QueryJobResponse, ErrorCode> DummyClient::query_drain_job(
+    const UUID& job_id) {
+    return invoke_rpc<&RealClient::query_drain_job, QueryJobResponse>(job_id);
+}
+
+tl::expected<void, ErrorCode> DummyClient::cancel_drain_job(
+    const UUID& job_id) {
+    return invoke_rpc<&RealClient::cancel_drain_job, void>(job_id);
+}
+
+tl::expected<ListDrainJobsResponse, ErrorCode> DummyClient::list_drain_jobs(
+    const DrainJobListRequest& request) {
+    return invoke_rpc<&RealClient::list_drain_jobs, ListDrainJobsResponse>(
+        request);
+}
+
+tl::expected<ListTasksResponse, ErrorCode> DummyClient::list_tasks(
+    const TaskListRequest& request) {
+    return invoke_rpc<&RealClient::list_tasks, ListTasksResponse>(request);
+}
+
+tl::expected<void, ErrorCode> DummyClient::cancel_task(const UUID& task_id) {
+    return invoke_rpc<&RealClient::cancel_task, void>(task_id);
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> DummyClient::query_task(

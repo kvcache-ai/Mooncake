@@ -771,9 +771,10 @@ if(USE_ASCEND_DIRECT)
   # implementations are included in the test file via anonymous namespace
   add_executable(ascend_direct_transport_test
                  ${WORKSPACE}/ascend_direct_transport_test.cpp)
-  target_link_libraries(ascend_direct_transport_test
-                        PUBLIC transfer_engine gtest gtest_main metadef)
-  # Allow shared library undefined symbols (Ascend libraries have circular deps)
+  target_link_libraries(
+    ascend_direct_transport_test PUBLIC transfer_engine gtest gtest_main
+                                        metadef glog::glog)
+  # Allow shared library undefined symbols (Ascend libraries have circular deps).
   set_target_properties(ascend_direct_transport_test
                         PROPERTIES LINK_FLAGS "-Wl,--allow-shlib-undefined")
 
@@ -837,6 +838,12 @@ add_executable(batch_counter_wait_test ${WORKSPACE}/batch_counter_wait_test.cpp)
 target_link_libraries(batch_counter_wait_test PUBLIC transfer_engine gtest
                                                      gtest_main)
 add_test(NAME batch_counter_wait_test COMMAND batch_counter_wait_test)
+
+add_executable(rdma_destination_local_test
+               ${WORKSPACE}/rdma_destination_local_test.cpp)
+target_link_libraries(rdma_destination_local_test PUBLIC transfer_engine gtest
+                                                         gtest_main)
+add_test(NAME rdma_destination_local_test COMMAND rdma_destination_local_test)
 
 # MC_RDMA_NIC_SELECTION: hardware-free map, knob and sparse-MR routing tests.
 add_executable(rdma_nic_selection_test ${WORKSPACE}/rdma_nic_selection_test.cpp)

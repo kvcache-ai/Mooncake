@@ -2,7 +2,6 @@
 
 #include <boost/functional/hash.hpp>
 #include <deque>
-#include <queue>
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -11,6 +10,7 @@
 #include "types.h"
 #include "mutex.h"
 #include "master_config.h"
+#include "tenant_id.h"
 
 namespace mooncake {
 enum class TaskType {
@@ -38,10 +38,12 @@ enum class TaskStatus {
     PROCESSING,
     FAILED,
     SUCCESS,
+    CANCELED,
 };
 
 inline bool is_finished_status(TaskStatus status) {
-    return status == TaskStatus::FAILED || status == TaskStatus::SUCCESS;
+    return status == TaskStatus::FAILED || status == TaskStatus::SUCCESS ||
+           status == TaskStatus::CANCELED;
 }
 
 inline std::ostream& operator<<(std::ostream& os, const TaskStatus& status) {
@@ -57,6 +59,9 @@ inline std::ostream& operator<<(std::ostream& os, const TaskStatus& status) {
             break;
         case TaskStatus::SUCCESS:
             os << "SUCCESS";
+            break;
+        case TaskStatus::CANCELED:
+            os << "CANCELED";
             break;
         default:
             os << "UNKNOWN_TASK_STATUS";
@@ -77,6 +82,11 @@ struct Task {
     UUID assigned_client;
     uint32_t max_retry_attempts;
 
+    bool cancellation_requested = false;
+    // A drain must observe the final result before this task can be pruned.
+    // In particular, a processing timeout is not proof that its worker stopped.
+    bool retained_by_drain = false;
+
     bool is_finished() const { return is_finished_status(status); }
 
     void mark_processing() {
@@ -89,6 +99,23 @@ struct Task {
         message = msg;
         last_updated_at = std::chrono::system_clock::now();
     }
+};
+
+struct TaskListRequest {
+    std::string tenant_id = "default";
+    std::optional<TaskStatus> status;
+    std::optional<TaskType> type;
+    std::optional<UUID> assigned_client;
+    std::optional<std::string> key;
+    std::string page_token;
+    uint32_t limit = 100;
+};
+YLT_REFL(TaskListRequest, tenant_id, status, type, assigned_client, key,
+         page_token, limit);
+
+struct TaskListPage {
+    std::vector<Task> tasks;
+    std::string next_page_token;
 };
 
 struct ReplicaCopyPayload {
@@ -146,6 +173,14 @@ class ScopedTaskReadAccess {
 
     std::optional<Task> find_task_by_id(const UUID& task_id) const;
 
+    tl::expected<bool, ErrorCode> is_cancellation_requested(
+        const UUID& client_id, const UUID& task_id) const;
+
+    // Lists currently retained tasks in UUID order. Continuations are live
+    // reads, so pruning and state changes can affect subsequent pages.
+    tl::expected<TaskListPage, ErrorCode> list_tasks(
+        const TaskListRequest& request) const;
+
     using task_iterator =
         std::unordered_map<UUID, Task, boost::hash<UUID>>::const_iterator;
 
@@ -171,15 +206,20 @@ class ScopedTaskWriteAccess {
     template <TaskType Type>
     tl::expected<UUID, ErrorCode> submit_task_typed(
         const UUID& client_id,
-        const typename TaskPayloadTraits<Type>::type& payload) {
+        const typename TaskPayloadTraits<Type>::type& payload,
+        bool retained_by_drain = false) {
         std::string json = serialize_payload(payload);
-        return submit_task(client_id, Type, json);
+        return submit_task(client_id, Type, json, retained_by_drain);
     }
 
     std::vector<Task> pop_tasks(const UUID& client_id, size_t batch_size);
 
     ErrorCode complete_task(const UUID& client_id, const UUID& task_id,
                             TaskStatus status, const std::string& message);
+
+    ErrorCode cancel_task(const UUID& task_id, const TenantId& tenant_id);
+
+    void release_drain_task(const UUID& task_id);
 
     ErrorCode fail_task_if_pending(const UUID& task_id,
                                    const std::string& message);
@@ -191,7 +231,8 @@ class ScopedTaskWriteAccess {
    private:
     tl::expected<UUID, ErrorCode> submit_task(const UUID& client_id,
                                               TaskType type,
-                                              const std::string& payload);
+                                              const std::string& payload,
+                                              bool retained_by_drain);
 
     ClientTaskManager* manager_;
     SharedMutexLocker lock_;
@@ -241,7 +282,7 @@ class ClientTaskManager {
 
     // Dispatch Queue (Pending)
     // Map: client_id -> queue of pending task_ids
-    std::unordered_map<UUID, std::queue<UUID>, boost::hash<UUID>> pending_tasks_
+    std::unordered_map<UUID, std::deque<UUID>, boost::hash<UUID>> pending_tasks_
         GUARDED_BY(mutex_);
 
     // Active Set (Processing)

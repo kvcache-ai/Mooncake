@@ -897,6 +897,70 @@ TEST(TransferEngineConfigOverrideTest,
 #endif
 }
 
+TEST(TransferEngineConfigOverrideTest, AscendEnvVarsConvertToTentConfig) {
+    EnvVarGuard timeout_guard("MC_ASCEND_TRANSFER_TIMEOUT", "4321");
+    EnvVarGuard legacy_timeout_guard("ASCEND_TRANSFER_TIMEOUT", "9999");
+    EnvVarGuard base_port_guard("MC_ASCEND_BASE_PORT", "21000");
+    EnvVarGuard legacy_port_guard("ASCEND_BASE_PORT", "22000");
+    EnvVarGuard pool_guard("MC_ASCEND_THREAD_POOL_SIZE", "8");
+    EnvVarGuard legacy_pool_guard("ASCEND_THREAD_POOL_SIZE", "4");
+    EnvVarGuard tc_guard("MC_ASCEND_RDMA_TC", "106");
+    EnvVarGuard sl_guard("MC_ASCEND_RDMA_SL", "3");
+    EnvVarGuard lcr_guard("MC_ASCEND_LOCAL_COMM_RES", R"({"version":"1.4"})");
+    EnvVarGuard grc_guard(
+        "MC_ASCEND_GLOBAL_RESOURCE_CONFIG",
+        R"({"comm_resource_config":{"protocol_desc":"roce:device"}})");
+    EnvVarGuard shmem_guard("MC_ASCEND_USE_SHMEM", "1");
+    EnvVarGuard single_seg_guard("MC_ASCEND_STANDALONE_SINGLE_SEGMENT", "true");
+    EnvVarGuard fabric_guard("MC_ASCEND_ENABLE_USE_FABRIC_MEM", "1");
+
+    Config p2p_conf;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(p2p_conf).ok());
+    EXPECT_EQ(p2p_conf.get("transports/ascend_direct/transfer_timeout_ms", 0),
+              4321);
+    EXPECT_EQ(p2p_conf.get("transports/ascend_direct/base_port", 0), 21000);
+    EXPECT_EQ(p2p_conf.get("transports/ascend_direct/thread_pool_size", 0), 8);
+    EXPECT_EQ(p2p_conf.get("transports/ascend_direct/rdma_tc", ""), "106");
+    EXPECT_EQ(p2p_conf.get("transports/ascend_direct/rdma_sl", ""), "3");
+    EXPECT_EQ(p2p_conf.get("transports/ascend_direct/local_comm_res", ""),
+              R"({"version":"1.4"})");
+    EXPECT_EQ(
+        p2p_conf.get("transports/ascend_direct/global_resource_config", ""),
+        R"({"comm_resource_config":{"protocol_desc":"roce:device"}})");
+    EXPECT_TRUE(p2p_conf.get("transports/ascend_direct/use_shmem", false));
+    EXPECT_TRUE(p2p_conf.get(
+        "transports/ascend_direct/standalone_single_segment", false));
+    EXPECT_FALSE(p2p_conf.get("transports/ascend_direct/fabric_mem", false));
+
+    Config store_conf;
+    store_conf.set("transports/ascend_direct/store_te_init", true);
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(store_conf).ok());
+    EXPECT_TRUE(store_conf.get("transports/ascend_direct/fabric_mem", false));
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     LegacyAscendEnvVarsFallbackWhenMcPrefixUnset) {
+    EnvVarGuard mc_timeout_guard("MC_ASCEND_TRANSFER_TIMEOUT", "");
+    EnvVarGuard mc_base_port_guard("MC_ASCEND_BASE_PORT", "");
+    EnvVarGuard mc_pool_guard("MC_ASCEND_THREAD_POOL_SIZE", "");
+    EnvVarGuard mc_tc_guard("MC_ASCEND_RDMA_TC", "");
+    EnvVarGuard mc_sl_guard("MC_ASCEND_RDMA_SL", "");
+    EnvVarGuard timeout_guard("ASCEND_TRANSFER_TIMEOUT", "3456");
+    EnvVarGuard base_port_guard("ASCEND_BASE_PORT", "23000");
+    EnvVarGuard pool_guard("ASCEND_THREAD_POOL_SIZE", "12");
+    EnvVarGuard tc_guard("ASCEND_RDMA_TC", "192");
+    EnvVarGuard sl_guard("ASCEND_RDMA_SL", "5");
+
+    Config conf;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(conf).ok());
+    EXPECT_EQ(conf.get("transports/ascend_direct/transfer_timeout_ms", 0),
+              3456);
+    EXPECT_EQ(conf.get("transports/ascend_direct/base_port", 0), 23000);
+    EXPECT_EQ(conf.get("transports/ascend_direct/thread_pool_size", 0), 12);
+    EXPECT_EQ(conf.get("transports/ascend_direct/rdma_tc", ""), "192");
+    EXPECT_EQ(conf.get("transports/ascend_direct/rdma_sl", ""), "5");
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake
