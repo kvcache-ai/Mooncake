@@ -61,6 +61,7 @@ endif()
 
 # Add subdirectories
 add_subdirectory(src)
+add_subdirectory(tools/traffic)
 
 if (STORE_USE_ETCD)
     add_subdirectory(tools)

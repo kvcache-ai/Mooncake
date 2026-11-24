@@ -5,18 +5,21 @@
 
 #include <array>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <set>
 #include <memory>
 #include <optional>
 #include <string>
 #include <system_error>
+#include <unistd.h>
 
 #include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
-
 #include "common/network.h"
 #include "embedded_master.h"
+#include "traffic/traffic_recorder.h"
 
 namespace mooncake::testing {
 namespace {
@@ -135,6 +138,52 @@ TEST_F(EmbeddedMasterTest, StartCommitsRestoreLifecycleBeforeServing) {
     ASSERT_NE(nullptr, restarted);
     EXPECT_EQ(MasterService::RestoreLifecycleState::kServing,
               restarted->GetRestoreLifecycleState());
+}
+
+TEST_F(EmbeddedMasterTest, RecordingConfigDoesNotEnableEmbeddedRecorder) {
+    const auto temp_dir =
+        std::filesystem::temp_directory_path() /
+        ("mooncake_embedded_traffic_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(temp_dir);
+    std::filesystem::create_directories(temp_dir);
+    const auto config_path = temp_dir / "traffic.json";
+    const auto ports = getFreeTcpPorts(1);
+    ASSERT_EQ(ports.size(), 1u);
+    {
+        std::ofstream out(config_path);
+        out << "{\"output_dir\":\"" << temp_dir.string() << "\",\"routes\":[\""
+            << "1\"],\"control\":{"
+               "\"host\":\"127.0.0.1\",\"port\":"
+            << ports.front() << ",\"token\":\"test-token\"}}";
+    }
+    const char* old_config = std::getenv("MOONCAKE_TRAFFIC_CONFIG");
+    const std::optional<std::string> previous_config =
+        old_config != nullptr ? std::optional<std::string>(old_config)
+                              : std::nullopt;
+    struct Cleanup {
+        std::filesystem::path path;
+        std::optional<std::string> previous_config;
+        ~Cleanup() {
+            mooncake::traffic::TrafficRecorder::Instance().Shutdown();
+            if (previous_config) {
+                setenv("MOONCAKE_TRAFFIC_CONFIG", previous_config->c_str(), 1);
+            } else {
+                unsetenv("MOONCAKE_TRAFFIC_CONFIG");
+            }
+            std::filesystem::remove_all(path);
+        }
+    } cleanup{temp_dir, previous_config};
+    ASSERT_EQ(setenv("MOONCAKE_TRAFFIC_CONFIG", config_path.c_str(), 1), 0);
+
+    EmbeddedMaster master;
+    ASSERT_TRUE(master.Start({}));
+    auto& recorder = mooncake::traffic::TrafficRecorder::Instance();
+    EXPECT_EQ(recorder.GetStatus().state, "disabled");
+    EXPECT_FALSE(recorder.Start());
+    master.Stop();
+    EXPECT_FALSE(httpGet("http://127.0.0.1:" + std::to_string(ports.front()) +
+                         "/v1/recording/health")
+                     .has_value());
 }
 
 TEST_F(EmbeddedMasterTest, StopPreservesAddressesForRestart) {

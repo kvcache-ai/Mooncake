@@ -185,6 +185,7 @@ getting_started/build
 
 deployment/mooncake-store-deployment-guide
 deployment/store-rs/index
+deployment/traffic-recording
 deployment/kubernetes-deployment-guide/index
 deployment/integrations/sglang/index
 deployment/integrations/vllm/index

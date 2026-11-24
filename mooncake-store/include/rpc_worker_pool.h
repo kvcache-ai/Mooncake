@@ -77,13 +77,13 @@ class RpcWorkerPool {
 
     // Registers Method under the route key coro_rpc derives from its name,
     // so clients call it exactly as before.
-    template <auto Method, typename Service>
-    void Register(coro_rpc::coro_rpc_server& server, Service& service) {
+    template <auto Method, typename Service, typename Server>
+    void Register(Server& server, Service& service) {
         using Handler = rpc_worker_pool_detail::PooledHandler<Method, Service>;
         auto handler =
             std::make_shared<Handler>(service, threads_.get_executor());
-        server.register_handler<&Handler::Handle>(handler.get(),
-                                                  coro_rpc::func_id<Method>());
+        server.template register_handler<&Handler::Handle>(
+            handler.get(), coro_rpc::func_id<Method>());
         handlers_.push_back(std::move(handler));
     }
 
