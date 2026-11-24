@@ -29,6 +29,14 @@ make -j
 sudo make install
 ```
 
+When the Go-based etcd wrapper or Kubernetes Lease backend is enabled, CMake
+prepares Go dependencies during configuration using copies of `go.mod` and
+`go.sum` in the build directory. CMake prefers Go on `PATH`, then checks the
+default installer location. Use `-DGO_EXECUTABLE=/path/to/go` to select a specific
+binary, or set `MOONCAKE_GO_INSTALL_PREFIX` for a custom installation prefix.
+Uncached modules or toolchains require network access.
+Other optional Go components can still download during build.
+
 (build-with-hpe-slingshot-cxi)=
 ### Build with HPE Slingshot (CXI)
 
@@ -436,6 +444,17 @@ sudo docker run --net=host --device=/dev/infiniband/uverbs0 --device=/dev/infini
 cd /Mooncake-main/build/mooncake-transfer-engine/example
 ./transfer_engine_bench --device_name=ibp6s0 --metadata_server=10.1.101.3:2379 --mode=target --local_server_name=10.1.100.3
 ```
+
+Both Docker build commands cache the verified YLT archive and pinned pybind11
+submodule before copying the source tree. The compilation stage runs without
+network access. `./docker/build-mooncake.sh` enables BuildKit, forwards proxy
+environment variables, and tags the image `mooncake:from-source` and
+`mooncake:<git short id>`. Direct `docker build` requires BuildKit (the
+default since Docker 23.0). Set `GH_MIRROR` when calling the helper or pass
+`--build-arg GH_MIRROR=...` directly to use a YLT download URL prefix.
+Use Docker build arguments to override the Python or Torch version for both
+builder and runtime, or to change `MOONCAKE_WORK_DIR`, `MOONCAKE_DEPS_DIR` and
+`MOONCAKE_GO_INSTALL_PREFIX`.
 
 For SGLang HiCache deployments inside Docker, reserve HugeTLB pages on the host before starting the container and pass the allocator settings through the container environment:
 

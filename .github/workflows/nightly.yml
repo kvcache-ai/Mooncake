@@ -181,11 +181,15 @@ jobs:
         run: git config --global --add safe.directory $GITHUB_WORKSPACE
         shell: bash
 
-      - name: Configure project
+      - name: Install dependencies
         run: |
           apt update -y
           apt install -y ninja-build
-          bash -x dependencies.sh -y
+          MOONCAKE_GO_PATH_FILE="$GITHUB_PATH" bash -x dependencies.sh -y
+        shell: bash
+
+      - name: Configure project
+        run: |
           mkdir build
           cd build
           cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DWITH_EP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF
@@ -215,6 +219,7 @@ jobs:
         uses: ./.github/actions/free-disk-space
 
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@v3
         with:
           # Avoid building the CUDA builder and runtime stages concurrently.
@@ -223,19 +228,56 @@ jobs:
               max-parallelism = 1
 
       - name: Build Docker image
+        env:
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+          CLEAN_BUILD_ARTIFACTS: ${{ vars.NIGHTLY_DOCKER_CLEAN_BUILD_ARTIFACTS || '1' }}
+          CLEAN_BUILD_CACHE: ${{ vars.NIGHTLY_DOCKER_CLEAN_BUILD_CACHE || '1' }}
+          BUILD_CACHE_MIN_FREE_GIB: ${{ vars.NIGHTLY_DOCKER_CACHE_MIN_FREE_GIB || '20' }}
         run: |
           free -h
           df -h
           vmstat -w 30 &
-          monitor_pid=$!
-          trap 'kill "$monitor_pid" 2>/dev/null || true; free -h; df -h' EXIT
+          monitor_pids=("$!")
+          stop_monitors() {
+            kill "${monitor_pids[@]}" 2>/dev/null || true
+            wait "${monitor_pids[@]}" 2>/dev/null || true
+            free -h
+            df -h
+          }
+          trap stop_monitors EXIT
+          if [ "$CLEAN_BUILD_CACHE" != "0" ]; then
+            # A single solve can run for hours. Reclaim unused cache while it runs.
+            docker_root=$(docker info --format '{{.DockerRootDir}}')
+            min_free_bytes=$(numfmt --from=iec "${BUILD_CACHE_MIN_FREE_GIB}G")
+            (
+              trap 'kill "$!" 2>/dev/null || true; wait "$!" 2>/dev/null || true; exit' TERM
+              while true; do
+                sleep 60 &
+                wait "$!"
+                df -h "$docker_root"
+                free_bytes=$(df -B1 --output=avail "$docker_root" | tail -1)
+                if [ "$free_bytes" -lt "$min_free_bytes" ]; then
+                  timeout 30s docker buildx prune --all --force &
+                  wait "$!" || echo "::warning::Could not reclaim idle Docker build cache"
+                fi
+              done
+            ) &
+            monitor_pids+=("$!")
+          fi
           # This job validates the build; avoid a second image copy in Docker's store.
           docker buildx build --output=type=cacheonly --progress=plain -f docker/mooncake.Dockerfile \
-            --build-arg PYTHON_VERSION=3.10 \
-            --build-arg TORCH_VERSION=2.14.1 \
             --build-arg BUILD_JOBS=2 \
-            --build-arg CLEAN_BUILD_ARTIFACTS=1 \
+            --build-arg ENABLE_DEBUG_SYMBOLS=OFF \
+            --build-arg CLEAN_BUILD_ARTIFACTS \
             -t mooncake:from-source .
+
+      - name: Reclaim Docker build cache
+        if: ${{ always() && steps.buildx.outcome == 'success' && vars.NIGHTLY_DOCKER_CLEAN_BUILD_CACHE != '0' }}
+        env:
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+        run: |
+          docker buildx prune --all --force
+          df -h
 
   ascend-test:
     uses: ./.github/workflows/ci_ascend.yml
@@ -346,11 +388,13 @@ jobs:
       - name: Set up compiler cache
         uses: ./.github/actions/setup-sccache
 
-      - name: Configure project (Release, no ASAN)
+      - name: Install dependencies
         run: |
           sudo apt update -y
-          sudo bash -x dependencies.sh -y
-          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          sudo env "MOONCAKE_GO_PATH_FILE=$GITHUB_PATH" bash -x dependencies.sh -y
+
+      - name: Configure project (Release, no ASAN)
+        run: |
           mkdir build && cd build
           cmake -G Ninja .. \
             -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DUSE_CUDA=ON \
@@ -613,10 +657,13 @@ jobs:
       - name: Set up compiler cache
         uses: ./.github/actions/setup-sccache
 
-      - name: Configure project with coverage support
+      - name: Install dependencies
         run: |
           sudo apt update -y
-          sudo bash -x dependencies.sh -y
+          sudo env "MOONCAKE_GO_PATH_FILE=$GITHUB_PATH" bash -x dependencies.sh -y
+
+      - name: Configure project with coverage support
+        run: |
           mkdir build
           cd build
           cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DENABLE_DEBUG_SYMBOLS=OFF
