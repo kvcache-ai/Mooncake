@@ -99,6 +99,11 @@ struct GlobalConfig {
     // torn-down pod IP) it stalls for the kernel's full SYN-retry cycle,
     // which is minutes. Override via MC_HANDSHAKE_CONNECT_TIMEOUT.
     int handshake_connect_timeout = 5;
+    // Receive timeout (seconds) on outbound handshake-port connections: how
+    // long a request waits for the peer's reply. A peer whose process is hung
+    // but whose kernel still accepts TCP holds the caller for the full value.
+    // Override via MC_HANDSHAKE_READ_TIMEOUT.
+    int handshake_read_timeout = 60;
     // Cooldown before retrying a failed RDMA peer rail. Override via
     // MC_RDMA_RAIL_PAUSE_SECONDS.
     uint64_t rdma_rail_pause_seconds = 30;

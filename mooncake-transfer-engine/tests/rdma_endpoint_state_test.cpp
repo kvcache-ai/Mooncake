@@ -178,6 +178,12 @@ class WorkerPoolTestPeer {
         pool.performPostSend(thread_id);
     }
 
+    static bool setupAdmitted(const WorkerPool &pool, const std::string &path) {
+        const auto &setups = pool.pending_setups_[0];
+        const auto it = setups.find(path);
+        return it != setups.end() && it->second.result.valid();
+    }
+
     static void waitForSetups(WorkerPool &pool) {
         for (auto &owner : pool.pending_setups_)
             for (auto &entry : owner)
@@ -1094,6 +1100,68 @@ TEST_F(PendingHandshakeTest, ZeroTtlAllowsNextHandshakeAfterRpcFailure) {
 }
 
 namespace {
+// The setup executor is shared by every local RNIC and engine in the process.
+// Engines on one machine share a host and differ only in their handshake port,
+// so a hung machine appears as several hung servers on one host. They must not
+// take every setup slot: a new connection to another host is still admitted.
+TEST(SetupAdmissionTest, HungHostLeavesSlotsForOtherHosts) {
+    const int old_conn_pause_ttl = globalConfig().conn_pause_ttl_ms;
+    globalConfig().conn_pause_ttl_ms = 0;
+    constexpr int kHungServers = 8;  // as many as the executor has threads
+    constexpr int kPeers = kHungServers + 1;
+    auto hung = std::make_shared<InProcessRdmaTransport::Barrier>();
+    auto other = std::make_shared<InProcessRdmaTransport::Barrier>();
+    hung->required_arrivals = other->required_arrivals = 1000;  // hold
+
+    FakeRdmaPeer peers[kPeers];
+    std::string paths[kPeers];
+    Transport::Slice slices[kPeers]{};
+    Transport::TransferTask tasks[kPeers];
+    int hung_admitted = 0;
+    for (int i = 0; i < kPeers; ++i) {
+        const bool is_other = i == kHungServers;
+        const auto id = std::to_string(i);
+        initFakePeer(peers[i], "admission-local" + id + ":10000", "local" + id,
+                     is_other ? other : hung);
+        peers[i].transport->fail_after_barrier_ = true;
+        const std::string server =
+            is_other ? "admission-other:20000"
+                     : "admission-hung:" + std::to_string(20001 + i);
+        paths[i] = MakeNicPath(server, "remote0");
+        installZeroQpEndpoint(peers[i], paths[i]);
+        queueHandshakeSlice(peers[i], paths[i], slices[i], tasks[i]);
+        WorkerPoolTestPeer::performPostSend(*peers[i].worker_pool, 0);
+        if (!is_other &&
+            WorkerPoolTestPeer::setupAdmitted(*peers[i].worker_pool, paths[i]))
+            ++hung_admitted;
+    }
+
+    auto arrivals_reach = [](InProcessRdmaTransport::Barrier &barrier,
+                             int count) {
+        std::unique_lock<std::mutex> lock(barrier.mutex);
+        barrier.cv.wait_for(lock, std::chrono::seconds(2),
+                            [&] { return barrier.arrivals >= count; });
+        return barrier.arrivals;
+    };
+    // The other host's handshake started while the hung host's are held.
+    EXPECT_EQ(arrivals_reach(*other, 1), 1);
+    EXPECT_EQ(hung_admitted, kHungServers / 2);
+    EXPECT_EQ(arrivals_reach(*hung, kHungServers / 2), kHungServers / 2);
+
+    for (auto &barrier : {hung, other}) {
+        {
+            std::lock_guard<std::mutex> lock(barrier->mutex);
+            barrier->released = true;
+        }
+        barrier->cv.notify_all();
+    }
+    for (auto &peer : peers) {
+        WorkerPoolTestPeer::waitForSetups(*peer.worker_pool);
+        WorkerPoolTestPeer::clearQueuedSlices(*peer.worker_pool);
+    }
+    globalConfig().conn_pause_ttl_ms = old_conn_pause_ttl;
+}
+
 class BlockingMetadataStorage : public MetadataStoragePlugin {
    public:
     bool get(const std::string &key, Json::Value &value) override {
