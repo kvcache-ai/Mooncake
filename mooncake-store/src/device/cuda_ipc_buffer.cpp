@@ -122,8 +122,7 @@ tl::expected<CudaIpcBufferHandle, ErrorCode> ExportCudaIpcBuffer(
     exported.size = payload_size;
     exported.device_id = attr.device;
     if (pci_ret == cudaSuccess && pci_bus_id[0] != '\0') {
-        std::memcpy(exported.pci_bus_id.data(), pci_bus_id,
-                    kCudaPciBusIdSize);
+        std::memcpy(exported.pci_bus_id.data(), pci_bus_id, kCudaPciBusIdSize);
         exported.has_pci_bus_id = true;
     } else {
         ClearCudaError();

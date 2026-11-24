@@ -98,6 +98,7 @@ int main() {
         return 1;
     }
     std::puts(
-        "PASS: uninitialized importer resolved PCI bus ID and read exact bytes");
+        "PASS: uninitialized importer resolved PCI bus ID and read exact "
+        "bytes");
     return 0;
 }
