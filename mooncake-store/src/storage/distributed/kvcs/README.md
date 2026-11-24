@@ -70,17 +70,40 @@ deployment variable is absent, the defaults are index `1` and mountpoint ID
 | `MOONCAKE_KVCS_MAX_VALUE_SIZE` | 4 MiB |
 | `MOONCAKE_KVCS_MAX_KEY_SIZE` | 256 bytes |
 | `MOONCAKE_KVCS_MAX_KEYS_PER_BATCH` | 8 |
-| `MOONCAKE_KVCS_GET_WORKERS` | 1 |
-| `MOONCAKE_KVCS_SET_WORKERS` | 1 |
-| `MOONCAKE_KVCS_SIMPLE_WORKERS` | 1 |
+| `MOONCAKE_KVCS_GET_WORKERS` | 4 |
+| `MOONCAKE_KVCS_SET_WORKERS` | 4 |
+| `MOONCAKE_KVCS_SIMPLE_WORKERS` | 8 |
+| `MOONCAKE_KVCS_READ_WINDOW` | 8 |
 | `MOONCAKE_KVCS_OPERATION_TIMEOUT_MS` | 30000 ms |
 
-With `MOONCAKE_KVCS_GET_WORKERS` greater than one, an adapter shares that many
-read-dispatch threads across callers. Each SDK call contains at most
-`MOONCAKE_KVCS_MAX_KEYS_PER_BATCH` keys; small batches can also use the configured
-concurrency. The default of one GET worker keeps each caller's serial dispatch
-without adding a global caller lock. Setting zero retains the SDK's disabled
-GET behavior. No separate read-worker setting is introduced.
+The three worker settings size pools inside the KVCS low-level SDK client
+(EFC), not DFS and not the Mooncake store server: GET dispatches read ring
+I/O, SET dispatches write ring I/O, and SIMPLE runs existence and layout
+queries. The SDK itself defaults to 4/4/2; Mooncake overrides them, because
+the generated config always carries a value and leaving it at one serializes
+a client the SDK expects to overlap four reads on.
+
+The Mooncake adapter that owns the client keeps a read window apart from
+those workers, set by `MOONCAKE_KVCS_READ_WINDOW`: it dispatches that many
+sub-batches at a time, and each SDK call carries at most
+`MOONCAKE_KVCS_MAX_KEYS_PER_BATCH` keys. The two layers therefore have two
+defaults, four ring workers and a window of eight. Four ring workers saturate
+the ring on a batch of 720 KiB values, so raising `MOONCAKE_KVCS_GET_WORKERS`
+above four adds shm without adding bandwidth; the window keeps the ring fed
+while a completed sub-batch is delivered, and it reserves no shm. Retune the
+workers when the EFC exposes more or fewer rings and raise the window with
+them; setting the worker count to zero retains the SDK's disabled GET
+behavior.
+
+The defaults are sized for throughput, which costs IOV shm: every worker
+reserves `MOONCAKE_KVCS_MAX_KEYS_PER_BATCH` times
+`MOONCAKE_KVCS_MAX_VALUE_SIZE`, and the adapter logs the resulting total at
+startup. With the defaults that is 512 MiB across 16 workers. The adapter read
+window reserves nothing here. Lower the worker counts, the batch depth, or the
+value ceiling on deployments with a smaller shm budget.
+`MOONCAKE_KVCS_MAX_VALUE_SIZE` is a split threshold as well as a shm input:
+objects above it take the manifest path, so raising it trades shm for
+fewer split writes rather than for read bandwidth.
 
 Completed sub-batches release matching in-flight DFS readers without waiting
 for unrelated sub-batches. Each consumer is validated and scatter destinations

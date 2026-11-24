@@ -92,9 +92,8 @@ tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::Init() {
         driver_->MaxKeySize() > kKvcsMaxKeySize)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     try {
-        if (driver_->ReadConcurrency() > 1)
-            read_workers_ =
-                std::make_unique<ThreadPool>(driver_->ReadConcurrency());
+        if (driver_->ReadWindow() > 1)
+            read_workers_ = std::make_unique<ThreadPool>(driver_->ReadWindow());
     } catch (...) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }

@@ -30,9 +30,23 @@ struct Config {
     uint64_t max_value_size = 4ULL * 1024 * 1024;
     uint32_t max_key_size = kKvcsDefaultMaxKeySize;
     int max_keys_per_batch = 8;
-    int get_workers = 1;
-    int set_workers = 1;
-    int simple_workers = 1;
+    // These size worker pools inside the KVCS low-level SDK client (EFC),
+    // not Mooncake and not DFS: GET dispatches read ring I/O, SET dispatches
+    // write ring I/O, and SIMPLE runs existence and layout queries. The SDK
+    // itself defaults to 4/4/2; Mooncake overrides that, because the
+    // generated config always carries a value and 1 would serialize a client
+    // the SDK expects to run four reads on.
+    //
+    // GET stays at 4: a batch of 720 KiB values from 16 clients measures no
+    // gain above four ring workers, so more workers would only reserve IOV
+    // shm.
+    int get_workers = 4;     // SDK default; four ring workers saturate
+    int set_workers = 4;     // SDK default; split writes overlap
+    int simple_workers = 8;  // SDK default is 2; queries fan out wider
+    // Sub-batches the Mooncake adapter keeps in flight over this client. The
+    // window hides per-call latency and holds no shm, so it is sized apart
+    // from the ring workers above. Zero keeps one sub-batch at a time.
+    int read_window = 8;
     uint64_t operation_timeout_ms = 30000;
 };
 
@@ -54,6 +68,8 @@ tl::expected<Config, ErrorCode> ReadConfig() {
                                          config.set_workers);
     config.simple_workers = Environ::ReadOr(
         Variables::MOONCAKE_KVCS_SIMPLE_WORKERS, config.simple_workers);
+    config.read_window = Environ::ReadOr(Variables::MOONCAKE_KVCS_READ_WINDOW,
+                                         config.read_window);
     config.operation_timeout_ms =
         Environ::ReadOr(Variables::MOONCAKE_KVCS_OPERATION_TIMEOUT_MS,
                         config.operation_timeout_ms);
@@ -66,11 +82,25 @@ tl::expected<Config, ErrorCode> ReadConfig() {
         max_key_size <= 0 || max_key_size > static_cast<int>(kKvcsMaxKeySize) ||
         config.max_keys_per_batch <= 0 || config.get_workers < 0 ||
         config.set_workers < 0 || config.simple_workers < 0 ||
-        config.operation_timeout_ms == 0 ||
+        config.read_window < 0 || config.operation_timeout_ms == 0 ||
         config.operation_timeout_ms > timeout_limit) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     config.max_key_size = static_cast<uint32_t>(max_key_size);
+    // Every ring worker reserves IOV shm sized by the batch depth and the
+    // value ceiling, so state the footprint: a registration that overruns
+    // the shm budget surfaces only as a failed driver creation.
+    const auto workers = static_cast<int64_t>(config.get_workers) +
+                         config.set_workers + config.simple_workers;
+    LOG(INFO) << "KVCS low-level IOV shm estimate: "
+              << (workers * config.max_keys_per_batch *
+                  static_cast<int64_t>(config.max_value_size)) /
+                     (1024 * 1024)
+              << " MiB (" << config.get_workers << " get + "
+              << config.set_workers << " set + " << config.simple_workers
+              << " simple workers x " << config.max_keys_per_batch << " keys x "
+              << config.max_value_size / (1024 * 1024)
+              << " MiB values), read window " << config.read_window;
     return config;
 }
 
@@ -191,6 +221,10 @@ class KvcsLowLevelDriver final : public KvcsDriver {
     uint32_t MaxKeySize() const override { return config_.max_key_size; }
     size_t MaxBatchKeys() const override { return config_.max_keys_per_batch; }
     size_t ReadConcurrency() const override { return config_.get_workers; }
+    size_t ReadWindow() const override {
+        if (config_.get_workers == 0) return 0;
+        return std::max<size_t>(1, static_cast<size_t>(config_.read_window));
+    }
 
     tl::expected<std::vector<KvcsMountpointStat>, ErrorCode>
     GetMountpointStats() override {
