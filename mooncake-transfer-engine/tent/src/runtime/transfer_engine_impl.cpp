@@ -3275,10 +3275,48 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     return markQueuedOwnerSubmitted(owner_id);
 }
 
+void TransferEngineImpl::linkBoundedWait(BoundedWait& wait) {
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (wait.linked || !isBatchAlive(wait.batch_id)) return;
+    wait.next = bounded_waits_;
+    bounded_waits_ = &wait;
+    wait.linked = true;
+}
+
+void TransferEngineImpl::unlinkBoundedWait(BoundedWait& wait) {
+    // The owning thread is the only writer of `linked`. Skip the global lock
+    // when this wait never armed, which is every wait with the queue off.
+    if (!wait.linked) return;
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (!wait.linked) return;
+    BoundedWait** link = &bounded_waits_;
+    while (*link != nullptr) {
+        if (*link == &wait) {
+            *link = wait.next;
+            break;
+        }
+        link = &(*link)->next;
+    }
+    wait.next = nullptr;
+    wait.linked = false;
+}
+
 Status TransferEngineImpl::refillDispatchWindow() {
     // Queue is off by default; skip the global lock on the poll hot path.
     if (!runtime_queue_config_.enabled) return Status::OK();
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    // No bounded wait is linked on the common path. An expired node stays
+    // linked until that waitTransfer returns, so a refill before the return
+    // still refuses the batch. One batch can be canceled twice when two of
+    // its waits have expired; the second call finds nothing queued.
+    if (bounded_waits_ != nullptr) {
+        const auto now = std::chrono::steady_clock::now();
+        for (BoundedWait* wait = bounded_waits_; wait != nullptr;
+             wait = wait->next) {
+            if (now < wait->deadline || !isBatchAlive(wait->batch_id)) continue;
+            CHECK_STATUS(cancelQueuedOwners(wait->batch_id));
+        }
+    }
     if (dispatch_inflight_owners_ >=
             runtime_queue_config_.max_dispatch_owners ||
         dispatch_inflight_bytes_ >= runtime_queue_config_.max_dispatch_bytes) {
@@ -4281,6 +4319,27 @@ Status TransferEngineImpl::waitTransfer(
     const auto timed_out = [&] {
         return timeout_ms != 0 && std::chrono::steady_clock::now() >= deadline;
     };
+    // A poll can outlast this deadline and complete the in-window request
+    // before the loop below notices. Link the deadline first so the refill
+    // that follows that completion cancels owners still in the queue.
+    // The node is on this stack. A second waiter links its own, and this
+    // guard unlinks only this one.
+    BoundedWait bounded_wait;
+    struct WaitDeadlineGuard {
+        TransferEngineImpl& engine;
+        BoundedWait& wait;
+        ~WaitDeadlineGuard() { engine.unlinkBoundedWait(wait); }
+    };
+    // timeout_ms == 0 is an unbounded wait: its deadline is "now", but
+    // timed_out() stays false. Do not arm admission off that value. With the
+    // queue disabled, refill never reads the list.
+    if (runtime_queue_config_.enabled && timeout_ms != 0 &&
+        deadline != std::chrono::steady_clock::time_point::max()) {
+        bounded_wait.batch_id = batch_id;
+        bounded_wait.deadline = deadline;
+        linkBoundedWait(bounded_wait);
+    }
+    [[maybe_unused]] WaitDeadlineGuard deadline_guard{*this, bounded_wait};
 
     TransferStatus overall_status{};
     for (uint64_t poll_count = 0;; ++poll_count) {
