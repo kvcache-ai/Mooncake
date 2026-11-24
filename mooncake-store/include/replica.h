@@ -139,8 +139,6 @@ struct ReplicateConfig {
         per_key_preferred_hca_names;
     // Per-key opaque residency affinity metadata.
     struct_pack::compatible<std::vector<std::string>, 4> residency_affinity_ids;
-    struct_pack::compatible<std::vector<std::string>, 5>
-        allowed_memory_segments;
 
     bool HasValidKeyHints(size_t key_count) const {
         return (!group_ids || group_ids->size() == key_count) &&
@@ -178,6 +176,16 @@ struct ReplicateConfig {
         }
         return result;
     }
+
+    // Versioned RPC additions: physical identity is separate from host_id and
+    // from the returned replica's routable transport endpoint. Version 4 is
+    // reserved for upstream residency affinity; placement starts at version 5.
+    struct_pack::compatible<std::string, 5> requester_self_id;
+    struct_pack::compatible<std::string, 5> fabric_domain;
+    struct_pack::compatible<PhysicalPlacement, 5> requester_placement;
+    // Preserve the released fabric extension's layout and version.
+    struct_pack::compatible<std::vector<std::string>, 6>
+        allowed_memory_segments;
 
     bool ValidSessionIds(size_t key_count) const {
         return !session_ids ||
@@ -264,6 +272,12 @@ struct ReplicateConfig {
            << ", data_type: " << config.data_type;
         if (!config.host_id.empty()) {
             os << ", host_id: " << config.host_id;
+        }
+        if (config.requester_self_id) {
+            os << ", requester_self_id: " << *config.requester_self_id;
+        }
+        if (config.fabric_domain) {
+            os << ", fabric_domain: " << *config.fabric_domain;
         }
         if (config.group_ids.has_value()) {
             os << ", group_ids: [";

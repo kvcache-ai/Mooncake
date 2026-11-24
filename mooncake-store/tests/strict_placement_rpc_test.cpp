@@ -47,7 +47,7 @@ class StrictPlacementRpc : public ::testing::Test {
     }
 
     void Mount(const std::string& name, uintptr_t base,
-               const std::string& endpoint) {
+               const std::string& endpoint, const std::string& domain = "") {
         Segment segment;
         segment.id = generate_uuid();
         segment.name = name;
@@ -55,7 +55,11 @@ class StrictPlacementRpc : public ::testing::Test {
         segment.base = base;
         segment.size = kCapacity;
         segment.te_endpoint = endpoint;
-        segment.protocol = "tcp";
+        segment.protocol = domain.empty() ? "tcp" : "mnnvl";
+        if (!domain.empty()) {
+            segment.physical_placement =
+                PhysicalPlacement{domain, "rack1", "tray1", 3, 0};
+        }
         ASSERT_TRUE(service->MountSegment(segment, writer));
     }
 
@@ -216,6 +220,94 @@ TEST_F(StrictPlacementRpc, OldMethodSetRejectsStrictButServesBestEffort) {
     ASSERT_EQ(soft_batch.size(), 1u);
     ASSERT_TRUE(soft_batch[0]);
     ExpectEndpoint(*soft_batch[0], kHomeEndpoint);
+}
+
+class StrictFabricPlacement : public StrictPlacementRpc,
+                              public ::testing::WithParamInterface<int> {};
+
+TEST_P(StrictFabricPlacement, BatchUsesOnlyAllowedNamesInRequestedFabric) {
+    ASSERT_NO_FATAL_FAILURE(Start());
+    const std::string allowed_endpoint = "127.0.0.1:21003";
+    ASSERT_NO_FATAL_FAILURE(
+        Mount("allowed-a", 0x500000000, allowed_endpoint, "fabric-a"));
+    ASSERT_NO_FATAL_FAILURE(
+        Mount("allowed-b", 0x600000000, "127.0.0.1:21004", "fabric-b"));
+    ASSERT_NO_FATAL_FAILURE(
+        Mount("disallowed-a", 0x700000000, "127.0.0.1:21005", "fabric-a"));
+    ReplicateConfig config;
+    config.allowed_memory_segments =
+        std::vector<std::string>{"allowed-b", "home", "allowed-a", "missing"};
+    if (GetParam() == 0) {
+        config.fabric_domain = "fabric-a";
+    } else if (GetParam() == 1) {
+        config.requester_placement =
+            PhysicalPlacement{"fabric-a", "rack1", "tray1", 3, 0};
+    } else {
+        config.fabric_domain = "fabric-a";
+        config.requester_self_id = "rack1.tray1#g3";
+    }
+    config.host_id = "home-host";
+    config.prefer_alloc_in_same_node = true;
+    config.preferred_segment = "disallowed-a";
+    config.with_hard_pin = true;
+    auto results =
+        client.BatchPutStart({"first", "no-room", "last"},
+                             {{12 * kMiB}, {8 * kMiB}, {kMiB}}, config);
+    ASSERT_EQ(results.size(), 3u);
+    ASSERT_TRUE(results[0]);
+    ASSERT_FALSE(results[1]);
+    EXPECT_EQ(results[1].error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    ASSERT_TRUE(results[2]);
+    ExpectEndpoint(*results[0], allowed_endpoint);
+    ExpectEndpoint(*results[2], allowed_endpoint);
+    const auto completed = client.BatchPutEnd(
+        {{"first", std::nullopt}, {"last", std::nullopt}}, ReplicaType::MEMORY);
+    ASSERT_EQ(completed.size(), 2u);
+    EXPECT_TRUE(completed[0]);
+    EXPECT_TRUE(completed[1]);
+    auto missing = client.GetReplicaList("no-room");
+    ASSERT_FALSE(missing);
+    EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+    ExpectUsage("allowed-a", 13 * kMiB);
+    for (const auto* name : {"home", "other", "allowed-b", "disallowed-a"}) {
+        ExpectUsage(name, 0);
+    }
+
+    // A nonempty allowlist with an empty fabric intersection cannot fall back
+    // to a mounted segment in the requested domain.
+    config.allowed_memory_segments =
+        std::vector<std::string>{"allowed-b", "home"};
+    auto empty = client.PutStart("empty-intersection", {kMiB}, config);
+    ASSERT_FALSE(empty);
+    EXPECT_EQ(empty.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    ExpectUsage("disallowed-a", 0);
+
+    // Ordinary physical requests must not gain incompatible host preferences.
+    config.allowed_memory_segments.reset();
+    config.preferred_segment = "allowed-a";
+    auto ordinary = client.PutStart("ordinary", {kMiB}, config);
+    ASSERT_TRUE(ordinary);
+    ExpectEndpoint(*ordinary, allowed_endpoint);
+}
+
+INSTANTIATE_TEST_SUITE_P(RequestIdentity, StrictFabricPlacement,
+                         ::testing::Values(0, 1, 2));
+
+TEST_F(StrictPlacementRpc, LegacyStrictRequestExcludesAllowedMnnvlSegments) {
+    ASSERT_NO_FATAL_FAILURE(Start());
+    ASSERT_NO_FATAL_FAILURE(
+        Mount("mnnvl", 0x500000000, "127.0.0.1:21003", "fabric-a"));
+    ReplicateConfig config;
+    config.allowed_memory_segments = std::vector<std::string>{"mnnvl", "home"};
+    auto result = client.PutStart("legacy", {kMiB}, config);
+    ASSERT_TRUE(result);
+    ExpectEndpoint(*result, kHomeEndpoint);
+    ExpectUsage("mnnvl", 0);
+    config.allowed_memory_segments = std::vector<std::string>{"mnnvl"};
+    auto empty = client.PutStart("no-legacy-segment", {kMiB}, config);
+    ASSERT_FALSE(empty);
+    EXPECT_EQ(empty.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    ExpectUsage("other", 0);
 }
 
 TEST(StrictPlacementProxy, RejectsBeforeContactingAnUnversionedProxy) {

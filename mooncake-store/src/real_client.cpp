@@ -1017,14 +1017,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
-    bool enable_embedded_master) {
-    return setup_internal(EgmStorePoolConfig{}, local_hostname, metadata_server,
-                          global_segment_size, local_buffer_size, protocol,
-                          rdma_devices, master_server_addr, transfer_engine,
-                          ipc_socket_path, local_rpc_port, enable_ssd_offload,
-                          start_offload_rpc_server, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port,
-                          enable_embedded_master);
+    bool enable_embedded_master, bool enable_ssd_prefetch,
+    int64_t ssd_prefetch_cooldown_sec, int64_t ssd_prefetch_dedup_ttl_sec) {
+    return setup_internal(
+        EgmStorePoolConfig{}, local_hostname, metadata_server,
+        global_segment_size, local_buffer_size, protocol, rdma_devices,
+        master_server_addr, transfer_engine, ipc_socket_path, local_rpc_port,
+        enable_ssd_offload, start_offload_rpc_server, ssd_offload_path,
+        tenant_id, enable_client_http_server, client_http_port,
+        enable_embedded_master, enable_ssd_prefetch, ssd_prefetch_cooldown_sec,
+        ssd_prefetch_dedup_ttl_sec);
 }
 
 tl::expected<void, ErrorCode> RealClient::setup_internal(
@@ -1037,13 +1039,26 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
-    bool enable_embedded_master) {
+    bool enable_embedded_master, bool enable_ssd_prefetch,
+    int64_t ssd_prefetch_cooldown_sec, int64_t ssd_prefetch_dedup_ttl_sec) {
     // Re-entry guard (mirrors initAll_internal): a second setup would
     // overwrite client_ and skip the first instance's ordered cleanup.
     if (client_) {
         LOG(ERROR) << "Client is already initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    constexpr int64_t max_prefetch_seconds =
+        std::numeric_limits<int64_t>::max() / 1000;
+    if (ssd_prefetch_cooldown_sec < 0 || ssd_prefetch_dedup_ttl_sec < 0 ||
+        ssd_prefetch_cooldown_sec > max_prefetch_seconds ||
+        ssd_prefetch_dedup_ttl_sec > max_prefetch_seconds) {
+        LOG(ERROR) << "SSD prefetch durations must be non-negative seconds "
+                      "representable in milliseconds";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    enable_ssd_prefetch_ = enable_ssd_prefetch;
+    ssd_prefetch_cooldown_sec_ = ssd_prefetch_cooldown_sec;
+    ssd_prefetch_dedup_ttl_sec_ = ssd_prefetch_dedup_ttl_sec;
     // A previous teardown that could not release NoF registrations leaves
     // caller-owned buffers whose DMA translation may still be live under the
     // OLD initiator's owner token. Re-init installs a fresh initiator whose
@@ -1871,7 +1886,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     // SSD prefetch knobs (all default off; see
     // docs/source/design/store/ssd-prefetch.md).
-    enable_ssd_prefetch_ =
+    const bool enable_ssd_prefetch =
         get_config_bool(config, CONFIG_KEY_ENABLE_SSD_PREFETCH, false);
     auto prefetch_cooldown_opt =
         get_config_size(config, CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC,
@@ -1883,10 +1898,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         !prefetch_dedup_ttl_opt.has_value()) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    ssd_prefetch_cooldown_sec_ =
-        static_cast<int64_t>(prefetch_cooldown_opt.value());
-    ssd_prefetch_dedup_ttl_sec_ =
-        static_cast<int64_t>(prefetch_dedup_ttl_opt.value());
 
     auto egm_config =
         ParseEgmStorePoolConfig(config, protocol, global_segment_size);
@@ -1897,7 +1908,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             local_buffer_size, protocol, rdma_devices, master_server_addr,
             nullptr, ipc_socket_path, 50052, enable_ssd_offload, true,
             ssd_offload_path, tenant_id, enable_client_http_server,
-            client_http_port, enable_embedded_master);
+            client_http_port, enable_embedded_master, enable_ssd_prefetch,
+            static_cast<int64_t>(*prefetch_cooldown_opt),
+            static_cast<int64_t>(*prefetch_dedup_ttl_opt));
         if (!result && egm_config->enabled) {
             (void)tearDownAll_internal();
         }
@@ -3088,20 +3101,37 @@ int RealClient::isExist(const std::string &key) {
     return isExist(key, ExistOptions{});
 }
 
-int RealClient::isExist(const std::string &key, const ExistOptions &options) {
+tl::expected<bool, ErrorCode> RealClient::isExistWithOptions_internal(
+    const std::string &key, const ExistOptions &options) {
     auto result = isExist_internal(key);
-
-    if (result.has_value()) {
-        // Best-effort SSD prefetch: synchronous part is a throttle dedup plus
-        // a pool enqueue; no RPC is added to the exist path.
-        if (options.prefetch_to_memory && *result && enable_ssd_prefetch_ &&
-            prefetcher_) {
-            prefetcher_->TriggerPrefetch({key});
-        }
-        return *result ? 1 : 0;  // 1 if exists, 0 if not
-    } else {
-        return toInt(result.error());
+    if (result && *result && options.prefetch_to_memory &&
+        enable_ssd_prefetch_ && prefetcher_) {
+        prefetcher_->TriggerPrefetch({key});
     }
+    return result;
+}
+
+int RealClient::isExist(const std::string &key, const ExistOptions &options) {
+    auto result = isExistWithOptions_internal(key, options);
+    return result ? (*result ? 1 : 0) : toInt(result.error());
+}
+
+std::vector<tl::expected<bool, ErrorCode>>
+RealClient::batchIsExistWithOptions_internal(
+    const std::vector<std::string> &keys, const ExistOptions &options) {
+    auto results = batchIsExist_internal(keys);
+    if (options.prefetch_to_memory && enable_ssd_prefetch_ && prefetcher_) {
+        std::vector<std::string> candidates;
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (results[i] && *results[i]) {
+                candidates.push_back(keys[i]);
+            }
+        }
+        if (!candidates.empty()) {
+            prefetcher_->TriggerPrefetch(candidates);
+        }
+    }
+    return results;
 }
 
 std::vector<int> RealClient::batchIsExist(
@@ -3111,29 +3141,12 @@ std::vector<int> RealClient::batchIsExist(
 
 std::vector<int> RealClient::batchIsExist(const std::vector<std::string> &keys,
                                           const ExistOptions &options) {
-    auto internal_results = batchIsExist_internal(keys);
+    auto internal_results = batchIsExistWithOptions_internal(keys, options);
     std::vector<int> results;
     results.reserve(internal_results.size());
-
-    const bool maybe_prefetch =
-        options.prefetch_to_memory && enable_ssd_prefetch_ && prefetcher_;
-    std::vector<std::string> prefetch_candidates;
-    for (size_t i = 0; i < internal_results.size(); ++i) {
-        const auto &result = internal_results[i];
-        if (result.has_value()) {
-            results.push_back(result.value() ? 1 : 0);  // 1 if exists, 0 if not
-            if (maybe_prefetch && result.value()) {
-                prefetch_candidates.push_back(keys[i]);
-            }
-        } else {
-            results.push_back(toInt(result.error()));
-        }
+    for (const auto &result : internal_results) {
+        results.push_back(result ? (*result ? 1 : 0) : toInt(result.error()));
     }
-
-    if (!prefetch_candidates.empty()) {
-        prefetcher_->TriggerPrefetch(prefetch_candidates);
-    }
-
     return results;
 }
 
