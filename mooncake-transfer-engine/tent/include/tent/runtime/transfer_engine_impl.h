@@ -362,6 +362,10 @@ class TransferEngineImpl {
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
 
+    Status isBatchDrained(BatchID batch_id, bool& drained);
+
+    bool canTransfer(const Request& request);
+
     Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;

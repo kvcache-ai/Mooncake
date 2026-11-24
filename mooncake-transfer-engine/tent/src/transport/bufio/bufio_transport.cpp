@@ -121,9 +121,24 @@ Status BufIoTransport::freeSubBatch(SubBatchRef& batch) {
     if (!buf_batch) {
         return Status::InvalidArgument("Invalid BufIo sub-batch" LOC_MARK);
     }
+    CopyCompletion::reclaimQuarantined();
+    Status status;
+    for (auto& task : buf_batch->task_list) {
+        if (!task.pending_copy) continue;
+        auto result = task.pending_copy->wait();
+        if (!result.ok()) {
+            LOG(ERROR) << "Retaining undrained BufIO staging: "
+                       << result.ToString();
+            CopyCompletion::quarantine(
+                task.pending_copy,
+                [buffer = task.staging.get()] { delete[] buffer; });
+            task.staging.release();
+            if (status.ok()) status = result;
+        }
+    }
     delete buf_batch;
     batch = nullptr;
-    return Status::OK();
+    return status;
 }
 
 std::string BufIoTransport::getBufIoFilePath(SegmentID target_id) {
@@ -225,8 +240,15 @@ Status BufIoTransport::submitTransferTasks(
                     continue;
                 }
 
-                platform.copy(req.source, host_buf.get(),
-                              static_cast<size_t>(io_ret));
+                if (!platform
+                         .copyWithCompletion(req.source, host_buf.get(),
+                                             static_cast<size_t>(io_ret),
+                                             task.pending_copy)
+                         .ok()) {
+                    if (task.pending_copy) task.staging = std::move(host_buf);
+                    task.status_word = TransferStatusEnum::FAILED;
+                    continue;
+                }
             } else {
                 io_ret = ::pread(fd, req.source, req.length,
                                  static_cast<off_t>(req.target_offset));
@@ -245,7 +267,14 @@ Status BufIoTransport::submitTransferTasks(
                     continue;
                 }
 
-                platform.copy(host_buf.get(), req.source, req.length);
+                if (!platform
+                         .copyWithCompletion(host_buf.get(), req.source,
+                                             req.length, task.pending_copy)
+                         .ok()) {
+                    if (task.pending_copy) task.staging = std::move(host_buf);
+                    task.status_word = TransferStatusEnum::FAILED;
+                    continue;
+                }
 
                 io_ret = ::pwrite(fd, host_buf.get(), req.length,
                                   static_cast<off_t>(req.target_offset));
@@ -287,6 +316,14 @@ Status BufIoTransport::getTransferStatus(SubBatchRef batch, int task_id,
         return Status::InvalidArgument("Invalid task ID");
     }
     auto& task = buf_batch->task_list[task_id];
+    if (task.pending_copy) {
+        bool finished = false;
+        status = TransferStatus{PENDING, 0};
+        auto result = task.pending_copy->query(finished);
+        if (!result.ok() || !finished) return result;
+        task.pending_copy.reset();
+        task.staging.reset();
+    }
     status = TransferStatus{task.status_word, task.transferred_bytes};
     return Status::OK();
 }

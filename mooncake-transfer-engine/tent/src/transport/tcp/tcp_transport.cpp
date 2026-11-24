@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <memory>
 #include <optional>
@@ -276,9 +277,20 @@ Status TcpTransport::freeSubBatch(SubBatchRef &batch) {
     auto tcp_batch = dynamic_cast<TcpSubBatch *>(batch);
     if (!tcp_batch)
         return Status::InvalidArgument("Invalid TCP sub-batch" LOC_MARK);
+    CopyCompletion::reclaimQuarantined();
+    Status status;
+    for (auto &task : tcp_batch->task_list) {
+        auto &read = task.device_read;
+        if (!read || !read->fence) continue;
+        auto result = read->fence->wait();
+        if (!result.ok()) {
+            CopyCompletion::quarantine(read->fence, [read] {});
+            if (status.ok()) status = result;
+        }
+    }
     Slab<TcpSubBatch>::Get().deallocate(tcp_batch);
     batch = nullptr;
-    return Status::OK();
+    return status;
 }
 
 Status TcpTransport::submitTransferTasks(
@@ -323,8 +335,22 @@ Status TcpTransport::getTransferStatus(SubBatchRef batch, int task_id,
     status.s = task.status_word.load(std::memory_order_acquire);
     status.transferred_bytes =
         task.transferred_bytes.load(std::memory_order_acquire);
-    if (status.s == TransferStatusEnum::FAILED && task.non_replayable_failure)
-        return Status::RpcServiceError("TCP WRITE outcome is unknown" LOC_MARK);
+    if (status.s == TransferStatusEnum::FAILED) {
+        if (task.non_replayable_failure)
+            return Status::RpcServiceError(
+                "TCP WRITE outcome is unknown" LOC_MARK);
+        auto read = std::atomic_load(&task.device_read);
+        if (read && read->fence) {
+            bool finished = false;
+            auto result = read->fence->query(finished);
+            if (!result.ok() || !finished)
+                status.s = TransferStatusEnum::PENDING;
+            else
+                std::atomic_store(&task.device_read,
+                                  std::shared_ptr<TcpTask::DeviceRead>{});
+            return result;
+        }
+    }
     return Status::OK();
 }
 
@@ -423,6 +449,25 @@ void TcpTransport::startTransfer(TcpTask *task) {
     if (notify_progress) notify_progress(progress_batch_id);
 }
 
+Status TcpTask::copyReadReply(std::string &reply) {
+    // V2 has a one-byte status prefix. Both protocols validate the size.
+    const auto offset = reply.size() - request.length;
+    auto &platform = Platform::getLoader();
+    if (platform.getMemoryType(request.source) == MTYPE_CPU) {
+        std::memcpy(request.source, reply.data() + offset, request.length);
+        return Status::OK();
+    }
+
+    // Move before submitting: even a short string must keep a stable address.
+    device_read = std::make_shared<DeviceRead>();
+    device_read->reply = std::move(reply);
+    auto status = platform.copyWithCompletion(
+        request.source, device_read->reply.data() + offset, request.length,
+        device_read->fence);
+    if (!device_read->fence) device_read.reset();
+    return status;
+}
+
 Status TcpTransport::doTransferWithRetry(TcpTask *task) {
     if (shutting_down_.load(std::memory_order_acquire))
         return Status::InternalError("Transport shutting down");
@@ -475,14 +520,12 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
                           rpc_server_addr, task->request.target_offset,
                           task->request.source, task->request.length);
         } else {
-            status =
-                identity
-                    ? ControlClient::recvDataV2(
-                          rpc_server_addr, task->request.target_offset,
-                          task->request.source, task->request.length, *identity)
-                    : ControlClient::recvData(
-                          rpc_server_addr, task->request.target_offset,
-                          task->request.source, task->request.length);
+            std::string reply;
+            status = ControlClient::recvDataReply(
+                rpc_server_addr, task->request.target_offset,
+                task->request.length, identity ? &*identity : nullptr, reply);
+            if (status.ok()) status = task->copyReadReply(reply);
+            if (task->device_read) return status;
         }
 
         if (status.ok()) return Status::OK();

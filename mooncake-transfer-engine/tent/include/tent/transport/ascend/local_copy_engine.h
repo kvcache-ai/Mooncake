@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "tent/common/status.h"
@@ -34,15 +35,16 @@ namespace tent {
 // Same-engine copies: one aclrtMemcpyAsync per slice spread over several
 // streams, each closed by a D2H of a host completion flag. A group is done
 // when every stream it used has set its flag, so nothing here waits on a
-// stream. Any submit/timeout failure destroys the streams, recreates them,
-// and fails every in-flight group on them.
+// stream. On failure, keep each group until its flags land or its streams
+// have been destroyed. New copies use fresh streams.
 class LocalCopyEngine {
    public:
     // Runs one stream's issue work. The transport supplies a pool so a group
     // spread over several streams does not issue one stream at a time.
     using TaskRunner = std::function<void(std::function<void()>)>;
 
-    LocalCopyEngine() = default;
+    explicit LocalCopyEngine(std::function<void()> release_inflight)
+        : release_inflight_(std::move(release_inflight)) {}
     ~LocalCopyEngine();
 
     LocalCopyEngine(const LocalCopyEngine&) = delete;
@@ -55,15 +57,13 @@ class LocalCopyEngine {
     // would leave most of them unused.
     Status initialize(aclrtContext context, int32_t device_id,
                       size_t local_engine_count);
-    void finalize();
+    Status finalize();
     void setTaskRunner(TaskRunner runner);
 
-    Status submit(bool write, const std::vector<HixlOpDesc>& ops, void*& req,
-                  std::vector<void*>& failed_handles);
+    Status submit(bool write, const std::vector<HixlOpDesc>& ops, void*& req);
 
-    TransferStatusEnum poll(void* req);
+    TransferStatusEnum poll(void* req, bool timed_out);
     void release(void* req);
-    std::vector<void*> failAndRecreate();
 
    private:
     struct Group {
@@ -71,7 +71,8 @@ class LocalCopyEngine {
         // never land their completion write in the same cache line.
         void* host_flags = nullptr;
         size_t stream_count = 0;
-        bool failed = false;
+        TransferStatusEnum failure = PENDING;
+        bool counted = false;
     };
 
     class ContextGuard {
@@ -87,12 +88,13 @@ class LocalCopyEngine {
 
     Status createStreamsLocked();
     void destroyStreamsLocked();
+    bool finishIfDrained(Group& group);
     bool issueGroupLocked(size_t stream_count,
                           const std::function<bool(size_t)>& issue_stream);
     Status allocHostFlags(Group& group);
-    void freeHostFlags(Group& group);
+    bool freeHostFlags(Group& group);
     static volatile uint32_t* flagAt(const Group& group, size_t index);
-    std::vector<void*> failAndRecreateLocked();
+    void failStreamsLocked(TransferStatusEnum failure);
     static aclrtMemcpyKind memcpyKind(void* src, void* dst);
 
     mutable std::mutex mutex_;
@@ -102,6 +104,8 @@ class LocalCopyEngine {
     void* device_one_{nullptr};
     std::unordered_map<void*, std::unique_ptr<Group>> groups_;
     TaskRunner task_runner_;
+    std::function<void()> release_inflight_;
+    bool retiring_{false};
     bool initialized_{false};
 };
 

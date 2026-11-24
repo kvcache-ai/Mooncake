@@ -332,14 +332,8 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
                                     NVLinkSubBatch* batch) {
     if (tasks.empty()) return;
 
-    // A single small copy completes faster with a blocking cudaMemcpy than
-    // with the async stream + completion-event pipeline: the sync call
-    // returns already-completed and saves the fixed event record/poll
-    // notification latency, while the copy itself runs at the same speed.
-    // Only single-task batches take this path: batched submissions amortize
-    // the per-copy submit cost across tasks, and blocking copies serialize
-    // inside the driver under concurrency, so multi-task batches and sizes
-    // at/above async_memcpy_threshold_ keep the async pipeline.
+    // Avoid a completion event for a single small copy. Use the batch stream
+    // even here: a D2D cudaMemcpy on the default stream may outlive the call.
     if (async_memcpy_threshold_ > 0 && tasks.size() == 1 &&
         tasks[0]->request.length < async_memcpy_threshold_) {
         NVLinkTask* task = tasks[0];
@@ -369,8 +363,10 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
                 return;
             }
         }
-        auto err =
-            cudaMemcpy(dst, src, task->request.length, cudaMemcpyDefault);
+        const auto stream = batch->async_stream.get();
+        auto err = cudaMemcpyAsync(dst, src, task->request.length,
+                                   cudaMemcpyDefault, stream);
+        if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
         if (saved_device >= 0 && saved_device != batch->stream_device_id) {
             cudaSetDevice(saved_device);
         }
@@ -531,6 +527,34 @@ Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
     // Read status AFTER the poll so a just-observed completion/failure is
     // reported on this call rather than one poll cycle late.
     status = TransferStatus{task.status_word, task.transferred_bytes};
+    return Status::OK();
+}
+
+Status NVLinkTransport::isSubBatchDrained(SubBatchRef batch, bool& drained) {
+    drained = false;
+    auto* nvlink_batch = dynamic_cast<NVLinkSubBatch*>(batch);
+    if (!nvlink_batch)
+        return Status::InvalidArgument("Invalid NVLink sub-batch" LOC_MARK);
+    bool terminal = false;
+    CHECK_STATUS(Transport::isSubBatchDrained(batch, terminal));
+    if (!terminal) return Status::OK();
+
+    // Partial submission or event setup failure can publish FAILED while
+    // copies are still running, even without a usable completion event.
+    if (auto stream = nvlink_batch->async_stream.get()) {
+        int saved_device;
+        CHECK_CUDA(cudaGetDevice(&saved_device));
+        if (saved_device != nvlink_batch->stream_device_id)
+            CHECK_CUDA(cudaSetDevice(nvlink_batch->stream_device_id));
+        auto result = cudaStreamQuery(stream);
+        if (saved_device != nvlink_batch->stream_device_id)
+            CHECK_CUDA(cudaSetDevice(saved_device));
+        if (result == cudaErrorNotReady) return Status::OK();
+        if (result != cudaSuccess)
+            return Status::InternalError(std::string("cudaStreamQuery: ") +
+                                         cudaGetErrorString(result) + LOC_MARK);
+    }
+    drained = true;
     return Status::OK();
 }
 

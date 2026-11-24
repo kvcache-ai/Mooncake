@@ -118,6 +118,23 @@ class Transport {
             "getTransferStatus not implemented" LOC_MARK);
     }
 
+    // Called after logical completion, including for superseded attempts.
+    // Transports that publish a terminal status before buffer access stops
+    // must override this query. A query error without terminal status never
+    // confirms that buffers are safe.
+    virtual Status isSubBatchDrained(SubBatchRef batch, bool& drained) {
+        drained = false;
+        for (size_t i = 0; i < batch->size(); ++i) {
+            TransferStatus status{PENDING, 0};
+            auto result = getTransferStatus(batch, i, status);
+            if (status.s == PENDING || status.s == INITIAL) return result;
+            // INVALID is a terminal transfer failure, not a query error.
+            // TCP can return a failure reason alongside a terminal status.
+        }
+        drained = true;
+        return Status::OK();
+    }
+
     virtual Status retryTransferTask(SubBatchRef batch, int task_id,
                                      const Request& request) {
         return Status::NotImplemented(
@@ -126,8 +143,8 @@ class Transport {
 
     // Cancellation is best effort: implementations must prevent work that has
     // not reached the device from being submitted, but work already posted to
-    // a device may still complete. Callers must continue polling until the
-    // task reaches a terminal state.
+    // a device may still complete. Callers must confirm isSubBatchDrained
+    // before releasing buffers.
     virtual bool supportsCancellation() const { return false; }
 
     // True when submitTransferTasks() orders each copy after

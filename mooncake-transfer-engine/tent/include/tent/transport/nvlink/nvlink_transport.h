@@ -84,6 +84,8 @@ class NVLinkTransport : public Transport {
     virtual Status getTransferStatus(SubBatchRef batch, int task_id,
                                      TransferStatus &status);
 
+    Status isSubBatchDrained(SubBatchRef batch, bool &drained) override;
+
     virtual Status addMemoryBuffer(BufferDesc &desc,
                                    const MemoryOptions &options);
 

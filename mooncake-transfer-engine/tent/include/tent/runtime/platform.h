@@ -15,6 +15,8 @@
 #ifndef PLATFORM_H
 #define PLATFORM_H
 
+#include <functional>
+
 #include "tent/runtime/topology.h"
 
 namespace mooncake {
@@ -60,6 +62,18 @@ struct DmabufExport {
 struct DmabufExportGuard {
     DmabufExport &handle;
     ~DmabufExportGuard() { handle.close(); }
+};
+
+// A failed copy may still be using the source and destination.
+class CopyCompletion {
+   public:
+    virtual ~CopyCompletion() = default;
+    virtual Status query(bool &finished) = 0;
+    Status wait();
+    // Run the staging release only after the stream confirms completion.
+    static void quarantine(std::shared_ptr<CopyCompletion> copy,
+                           std::function<void()> release_staging);
+    static void reclaimQuarantined();
 };
 
 class Platform {
@@ -109,6 +123,11 @@ class Platform {
     virtual Status allocatePinnedHost(void **pptr, size_t size);
 
     virtual Status freePinnedHost(void *ptr, size_t size);
+
+    using PendingCopy = std::shared_ptr<CopyCompletion>;
+    // Pass an empty pending handle. It owns any copy still in flight on error.
+    Status copyWithCompletion(void *dst, void *src, size_t length,
+                              PendingCopy &pending);
 
    protected:
     static std::vector<int> topologyDeviceIndices(const Topology *topology,

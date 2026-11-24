@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <string>
 #include <thread>
@@ -128,25 +129,29 @@ class CopyFailureIOUringTransport : public IOUringTransport {
    public:
     using IOUringTransport::stagingPool;
 
-    void failNextCopy() { fail_next_copy_ = true; }
+    void failNextCopy(Platform::PendingCopy pending = nullptr) {
+        failures_.push_back(std::move(pending));
+    }
 
     int copyCalls() const { return copy_calls_; }
 
    protected:
-    Status copyMemory(void* dst, void* src, size_t length) override {
+    Status copyMemory(void* dst, void* src, size_t length,
+                      Platform::PendingCopy& pending) override {
         (void)dst;
         (void)src;
         (void)length;
         ++copy_calls_;
-        if (fail_next_copy_) {
-            fail_next_copy_ = false;
+        if (!failures_.empty()) {
+            pending = std::move(failures_.front());
+            failures_.pop_front();
             return Status::InternalError("injected staging copy failure");
         }
         return Status::OK();
     }
 
    private:
-    bool fail_next_copy_ = false;
+    std::deque<Platform::PendingCopy> failures_;
     int copy_calls_ = 0;
 };
 
@@ -625,44 +630,170 @@ TEST(IOUringTransportTest, StagedWriteCopyFailureSubmitsNothing) {
     EXPECT_EQ(actual, original);
 }
 
-TEST(IOUringTransportTest, StagedReadCopybackFailureCannotReportSuccess) {
-    ScopedTempFile file(kPageSize);
+Status installPinnedStaging(IOUringTransport& transport,
+                            std::shared_ptr<ControlService>& metadata,
+                            size_t slot_kb, size_t slots) {
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/io_uring/pinned_staging", true);
+    conf->set("transports/io_uring/staging_slot_kb", slot_kb);
+    conf->set("transports/io_uring/staging_slots", slots);
+    std::string local_segment_name = "io_uring_test_segment";
+    return transport.install(local_segment_name, metadata, nullptr, conf);
+}
+
+enum class CopyFailure { Rejected, Pending, QueryError };
+
+class IOUringStagedCopyTest : public ::testing::TestWithParam<
+                                  std::tuple<Request::OpCode, CopyFailure>> {};
+
+TEST_P(IOUringStagedCopyTest, FailedCopyRetainsStagingWhileInFlight) {
+    const auto [opcode, failure] = GetParam();
+    ScopedTempFile file(2 * kPageSize);
     ASSERT_GE(file.fd(), 0);
     std::vector<uint8_t> contents(kPageSize, 0xA5);
     ASSERT_EQ(pwrite(file.fd(), contents.data(), kPageSize, 0),
               static_cast<ssize_t>(kPageSize));
     auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
     ASSERT_TRUE(
-        installLocalFileSegment(*metadata, file.path(), kPageSize).ok());
+        installLocalFileSegment(*metadata, file.path(), 2 * kPageSize).ok());
     CopyFailureIOUringTransport transport;
-    auto installed = installTransport(transport, metadata);
+    auto installed = installPinnedStaging(transport, metadata, 4, 1);
     if (!installed.ok()) GTEST_SKIP() << installed.message();
 
+    ASSERT_NE(transport.stagingPool(), nullptr);
     void* allocation = nullptr;
     ASSERT_EQ(posix_memalign(&allocation, kPageSize, kPageSize + 1), 0);
     std::unique_ptr<void, decltype(&free)> memory(allocation, free);
+    std::memset(allocation, 0x5A, kPageSize + 1);
     auto* destination = static_cast<uint8_t*>(allocation) + 1;
-    std::memset(destination, 0x5A, kPageSize);
     Transport::SubBatchRef batch = nullptr;
-    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 3).ok());
     Request request{};
-    request.opcode = Request::READ;
+    request.opcode = opcode;
     request.source = destination;
     request.target_id = LOCAL_SEGMENT_ID;
     request.length = kPageSize;
-    transport.failNextCopy();
-    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+    struct Completion : CopyCompletion {
+        bool done = false;
+        bool error = false;
+        Status query(bool& finished) override {
+            finished = done;
+            return error ? Status::InternalError("device unavailable")
+                         : Status::OK();
+        }
+    };
+    auto completion = std::make_shared<Completion>();
+    const bool accepted = failure != CopyFailure::Rejected;
+    transport.failNextCopy(accepted ? completion : nullptr);
+    std::vector<Request> requests{request};
+    if (opcode == Request::WRITE) {
+        // One more staged WRITE is rejected; an aligned sibling can proceed.
+        transport.failNextCopy();
+        requests.push_back(request);
+        requests.push_back(request);
+        requests.back().source = allocation;
+        requests.back().target_offset = kPageSize;
+    }
+    auto submitted = transport.submitTransferTasks(batch, requests);
+    if (!accepted && opcode == Request::WRITE) {
+        EXPECT_FALSE(submitted.ok());
+        EXPECT_EQ(batch->size(), 0u);
+        EXPECT_EQ(transport.stagingPool()->freeSlots(), 1u);
+        EXPECT_TRUE(transport.freeSubBatch(batch).ok());
+        return;
+    }
+    ASSERT_TRUE(submitted.ok());
     auto* uring_batch = static_cast<IOUringSubBatch*>(batch);
     ASSERT_NE(uring_batch->task_list[0].buffer, nullptr);
 
+    if (accepted) {
+        bool drained = true;
+        for (int i = 0; i < 10000; ++i) {
+            ASSERT_TRUE(transport.isSubBatchDrained(batch, drained).ok());
+            if (transport.copyCalls()) break;
+            usleep(1000);
+        }
+        EXPECT_EQ(transport.copyCalls(), opcode == Request::WRITE ? 2 : 1);
+        EXPECT_FALSE(drained);
+        EXPECT_EQ(transport.stagingPool()->freeSlots(), 0u);
+        EXPECT_NE(uring_batch->task_list[0].buffer, nullptr);
+        if (opcode == Request::WRITE) {
+            EXPECT_EQ(pollUntilSettled(transport, batch, 1).s, FAILED);
+            auto sibling = pollUntilSettled(transport, batch, 2);
+            EXPECT_EQ(sibling.s, COMPLETED);
+            std::vector<uint8_t> actual(kPageSize);
+            ASSERT_EQ(pread(file.fd(), actual.data(), actual.size(), 0),
+                      static_cast<ssize_t>(actual.size()));
+            EXPECT_EQ(actual, contents);
+            ASSERT_EQ(pread(file.fd(), actual.data(), actual.size(), kPageSize),
+                      static_cast<ssize_t>(actual.size()));
+            EXPECT_EQ(std::memcmp(actual.data(), allocation, kPageSize), 0);
+        }
+        if (failure == CopyFailure::QueryError) {
+            completion->error = true;
+            EXPECT_FALSE(transport.isSubBatchDrained(batch, drained).ok());
+            EXPECT_FALSE(drained);
+            EXPECT_FALSE(transport.freeSubBatch(batch).ok());
+            EXPECT_EQ(batch, nullptr);
+            EXPECT_EQ(transport.stagingPool()->freeSlots(), 0u);
+            // A later cleanup may reclaim the slot only after a positive fence.
+            completion->error = false;
+            ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+            ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+            EXPECT_EQ(transport.stagingPool()->freeSlots(), 0u);
+            completion->done = true;
+            ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+            ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+            EXPECT_EQ(transport.stagingPool()->freeSlots(), 1u);
+            return;
+        }
+        completion->done = true;
+    }
     const auto status = pollUntilSettled(transport, batch, 0);
     EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
     EXPECT_EQ(status.transferred_bytes, 0u);
-    EXPECT_EQ(transport.copyCalls(), 1);
+    EXPECT_EQ(transport.copyCalls(), opcode == Request::WRITE ? 2 : 1);
+    EXPECT_EQ(transport.stagingPool()->freeSlots(), 1u);
     EXPECT_EQ(uring_batch->task_list[0].buffer, nullptr);
     EXPECT_EQ(std::vector<uint8_t>(destination, destination + kPageSize),
               std::vector<uint8_t>(kPageSize, 0x5A));
     ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ReadAndWrite, IOUringStagedCopyTest,
+    ::testing::Combine(::testing::Values(Request::READ, Request::WRITE),
+                       ::testing::Values(CopyFailure::Rejected,
+                                         CopyFailure::Pending,
+                                         CopyFailure::QueryError)));
+
+TEST(IOUringStagingPoolTest, ReclaimsAllCompletedCopiesInOneSweep) {
+    struct Fence : CopyCompletion {
+        bool done = false;
+        int queries = 0;
+        Status query(bool& finished) override {
+            ++queries;
+            finished = done;
+            return Status::OK();
+        }
+    };
+    auto pool = std::make_shared<IOUringStagingPool>();
+    ASSERT_TRUE(pool->init(kPageSize, 3).ok());
+    auto pending = std::make_shared<Fence>();
+    auto complete = std::make_shared<Fence>();
+    complete->done = true;
+    for (const auto& fence : {pending, complete, complete}) {
+        auto* slot = pool->acquire(kPageSize);
+        ASSERT_NE(slot, nullptr);
+        CopyCompletion::quarantine(fence,
+                                   [pool, slot] { pool->release(slot); });
+    }
+    CopyCompletion::reclaimQuarantined();
+    EXPECT_EQ(pool->freeSlots(), 2u);
+    EXPECT_EQ(pending->queries, 1);
+    pending->done = true;
+    CopyCompletion::reclaimQuarantined();
+    EXPECT_EQ(pool->freeSlots(), 3u);
 }
 
 TEST(IOUringStagingPoolTest, LendsPageAlignedSlotsWithoutBlocking) {
@@ -786,17 +917,6 @@ class PinnedStagingIOUringTransport : public IOUringTransport {
    public:
     using IOUringTransport::stagingPool;
 };
-
-Status installPinnedStaging(IOUringTransport& transport,
-                            std::shared_ptr<ControlService>& metadata,
-                            size_t slot_kb, size_t slots) {
-    auto conf = std::make_shared<Config>();
-    conf->set("transports/io_uring/pinned_staging", true);
-    conf->set("transports/io_uring/staging_slot_kb", slot_kb);
-    conf->set("transports/io_uring/staging_slots", slots);
-    std::string local_segment_name = "io_uring_test_segment";
-    return transport.install(local_segment_name, metadata, nullptr, conf);
-}
 
 TEST(IOUringPinnedStagingTest, PoolIsOffByDefaultAndSizedFromConfig) {
     auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);

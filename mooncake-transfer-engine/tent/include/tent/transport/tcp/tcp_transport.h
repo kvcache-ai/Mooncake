@@ -56,7 +56,14 @@ struct TcpTask {
     std::atomic<TransferStatusEnum> status_word{TransferStatusEnum::PENDING};
     std::atomic<size_t> transferred_bytes{0};
     bool non_replayable_failure{false};  // Published by status_word.
+    struct DeviceRead {
+        std::string reply;
+        Platform::PendingCopy fence;
+    };
+    std::shared_ptr<DeviceRead> device_read;
     uint64_t target_addr = 0;
+
+    Status copyReadReply(std::string &reply);
 
     TcpTask() = default;
     TcpTask(TcpTask &&other) noexcept
@@ -67,6 +74,7 @@ struct TcpTask {
           transferred_bytes(
               other.transferred_bytes.load(std::memory_order_relaxed)),
           non_replayable_failure(other.non_replayable_failure),
+          device_read(std::move(other.device_read)),
           target_addr(other.target_addr) {}
     TcpTask(const TcpTask &) = delete;
     TcpTask &operator=(const TcpTask &) = delete;

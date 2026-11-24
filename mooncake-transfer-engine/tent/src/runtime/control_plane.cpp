@@ -243,23 +243,10 @@ Status ControlClient::sendData(const std::string& server_addr,
 Status ControlClient::recvData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
-    if (length > kTcpMaxReadBytes)
-        return Status::InvalidArgument("TCP READ exceeds RPC payload limit");
-    std::string request, response;
-    XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
-    request.resize(sizeof(XferDataDesc));
-    memcpy(&request[0], &desc, sizeof(desc));
-    auto status = tl_rpc_agent.call(server_addr, RecvData, request, response);
-    if (!status.ok()) return status;
-    if (response.size() == length) {
-        return Platform::getLoader().copy(local_mem_addr, response.data(),
-                                          length);
-    }
-    if (isLegacyTcpNeedsRefresh(response)) {
-        return Status::NeedsRefreshCache(response);
-    }
-    return Status::RpcServiceError(
-        response.empty() ? "RecvData failed: empty response" : response);
+    std::string response;
+    CHECK_STATUS(
+        recvDataReply(server_addr, peer_mem_addr, length, nullptr, response));
+    return Platform::getLoader().copy(local_mem_addr, response.data(), length);
 }
 
 Status ControlClient::sendDataV2(const std::string& server_addr,
@@ -303,12 +290,36 @@ Status ControlClient::recvDataV2(const std::string& server_addr,
                                  uint64_t peer_mem_addr, void* local_mem_addr,
                                  size_t length,
                                  const TcpDataPlaneIdentity& identity) {
-    if (length > kTcpMaxReadBytes) {
-        return Status::InvalidArgument("TCP READ exceeds RPC payload limit");
-    }
-    const auto desc = encodeTcpDataV2Desc(peer_mem_addr, length, identity);
-    std::string request(reinterpret_cast<const char*>(&desc), sizeof(desc));
     std::string response;
+    CHECK_STATUS(
+        recvDataReply(server_addr, peer_mem_addr, length, &identity, response));
+    return Platform::getLoader().copy(local_mem_addr, response.data() + 1,
+                                      length);
+}
+
+Status ControlClient::recvDataReply(const std::string& server_addr,
+                                    uint64_t peer_mem_addr, size_t length,
+                                    const TcpDataPlaneIdentity* identity,
+                                    std::string& response) {
+    if (length > kTcpMaxReadBytes)
+        return Status::InvalidArgument("TCP READ exceeds RPC payload limit");
+    if (!identity) {
+        std::string request;
+        XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
+        request.resize(sizeof(XferDataDesc));
+        memcpy(&request[0], &desc, sizeof(desc));
+        auto status =
+            tl_rpc_agent.call(server_addr, RecvData, request, response);
+        if (!status.ok()) return status;
+        if (response.size() == length) return Status::OK();
+        if (isLegacyTcpNeedsRefresh(response)) {
+            return Status::NeedsRefreshCache(response);
+        }
+        return Status::RpcServiceError(
+            response.empty() ? "RecvData failed: empty response" : response);
+    }
+    const auto desc = encodeTcpDataV2Desc(peer_mem_addr, length, *identity);
+    std::string request(reinterpret_cast<const char*>(&desc), sizeof(desc));
     auto status = tl_rpc_agent.call(server_addr, RecvDataV2, request, response);
     if (status.IsRpcFunctionNotFound()) {
         return Status::NeedsRefreshCache(
@@ -319,8 +330,7 @@ Status ControlClient::recvDataV2(const std::string& server_addr,
     if (response.size() != length + 1) {
         return Status::RpcServiceError("TCP data v2 response length mismatch");
     }
-    return Platform::getLoader().copy(local_mem_addr, response.data() + 1,
-                                      length);
+    return Status::OK();
 }
 
 inline void to_json(nlohmann::json& j, const Notification& n) {

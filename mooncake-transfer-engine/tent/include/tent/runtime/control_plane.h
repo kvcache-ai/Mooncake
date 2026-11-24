@@ -182,6 +182,12 @@ class ControlClient {
                            uint64_t peer_mem_addr, void* local_mem_addr,
                            size_t length);
 
+    // Return a validated wire reply so an asynchronous copy can keep it alive.
+    static Status recvDataReply(const std::string& server_addr,
+                                uint64_t peer_mem_addr, size_t length,
+                                const TcpDataPlaneIdentity* identity,
+                                std::string& response);
+
     static Status recvDataV2(const std::string& server_addr,
                              uint64_t peer_mem_addr, void* local_mem_addr,
                              size_t length,

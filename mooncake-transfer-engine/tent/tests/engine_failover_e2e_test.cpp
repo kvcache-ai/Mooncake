@@ -39,6 +39,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -424,6 +425,7 @@ std::shared_ptr<Config> makeMinimalP2PConfig() {
     cfg->set("transports/io_uring/enable", false);
     cfg->set("transports/nvlink/enable", false);
     cfg->set("transports/mnnvl/enable", false);
+    cfg->set("transports/mlu/enable", false);
     cfg->set("transports/gds/enable", false);
     cfg->set("transports/ascend_direct/enable", false);
 
@@ -1178,6 +1180,130 @@ TEST(EngineFailoverE2E, SubmitAndWaitTransferFreesBatchWhenSubmitFails) {
     EXPECT_EQ(engine.aliveBatchCountForTest(), alive_before)
         << "the batch allocated by submitAndWaitTransfer outlived the failed "
            "submit";
+}
+
+class DelayedDrainTransport : public FakeTransport {
+   public:
+    explicit DelayedDrainTransport(TransferStatusEnum terminal)
+        : FakeTransport(RDMA, [terminal](const Request&) {
+              return TransferStatus{terminal, 0};
+          }) {}
+
+    std::atomic<bool> drained{false};
+    std::atomic<int> drain_calls{0}, free_calls{0};
+
+    Status isSubBatchDrained(SubBatchRef, bool& result) override {
+        ++drain_calls;
+        result = drained.load();
+        return Status::OK();
+    }
+
+    Status freeSubBatch(SubBatchRef& batch) override {
+        EXPECT_TRUE(drained.load());
+        ++free_calls;
+        return FakeTransport::freeSubBatch(batch);
+    }
+};
+
+void expectSynchronousDrain(TransferStatusEnum terminal,
+                            bool partial_submit_failure) {
+    for (bool queued : {false, true}) {
+        SCOPED_TRACE(queued);
+        auto cfg = makeMinimalP2PConfig();
+        cfg->set("enable_runtime_queue", queued);
+        cfg->set("max_failover_attempts", 0);
+        TransferEngineImpl engine(cfg);
+        ASSERT_TRUE(engine.available());
+        auto rdma = std::make_shared<DelayedDrainTransport>(terminal);
+        engine.swapTransportForTest(RDMA, rdma);
+        auto tcp = std::make_shared<FakeTransport>(
+            TCP, FakeTransport::StatusFactory{},
+            FakeTransport::PollStatusFactory{}, true);
+        if (partial_submit_failure) engine.swapTransportForTest(TCP, tcp);
+
+        std::vector<uint8_t> source(64, 0xA1), target(64, 0);
+        ASSERT_TRUE(
+            engine.registerLocalMemory(source.data(), source.size()).ok());
+        ASSERT_TRUE(
+            engine.registerLocalMemory(target.data(), target.size()).ok());
+        Request request;
+        request.opcode = Request::WRITE;
+        request.source = source.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        request.length = source.size();
+        request.transport_hint = RDMA;
+        std::vector<Request> requests{request};
+        if (partial_submit_failure) {
+            // RDMA accepts work while TCP rejects its separate submission.
+            request.transport_hint = TCP;
+            requests.push_back(request);
+        }
+
+        const auto alive_before = engine.aliveBatchCountForTest();
+        std::atomic<bool> returned{false};
+        std::mutex buffer_mutex;
+        Status status;
+        std::thread caller([&] {
+            status = engine.submitAndWaitTransfer(requests);
+            // A caller may reuse its buffer as soon as the sync call returns.
+            std::lock_guard<std::mutex> lock(buffer_mutex);
+            std::fill(source.begin(), source.end(), 0xB2);
+            returned = true;
+        });
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!returned.load() && rdma->drain_calls.load() == 0 &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        EXPECT_GT(rdma->drain_calls.load(), 0);
+        EXPECT_FALSE(returned.load());
+        EXPECT_EQ(rdma->free_calls.load(), 0);
+        {
+            std::lock_guard<std::mutex> lock(buffer_mutex);
+            std::memcpy(target.data(), source.data(), source.size());
+        }
+        rdma->drained = true;
+        caller.join();
+
+        EXPECT_EQ(target, std::vector<uint8_t>(64, 0xA1));
+        EXPECT_EQ(status.code(), Status::Code::kInternalError);
+        EXPECT_EQ(status.message().find("Transfer via stage buffer failed"),
+                  0u);
+        EXPECT_EQ(rdma->submitted_request_count.load(), 1);
+        EXPECT_EQ(tcp->submit_calls.load(), partial_submit_failure ? 1 : 0);
+        EXPECT_EQ(rdma->free_calls.load(), 1);
+        EXPECT_EQ(engine.aliveBatchCountForTest(), alive_before);
+        EXPECT_TRUE(engine.unregisterLocalMemory(source.data()).ok());
+        EXPECT_TRUE(engine.unregisterLocalMemory(target.data()).ok());
+    }
+}
+
+TEST(EngineFailoverE2E, SubmitAndWaitTransferDrainsTerminalFailure) {
+    for (auto terminal : {FAILED, TIMEOUT}) {
+        SCOPED_TRACE(static_cast<int>(terminal));
+        expectSynchronousDrain(terminal, false);
+    }
+}
+
+TEST(EngineFailoverE2E, SubmitAndWaitTransferDrainsPartialSubmissionFailure) {
+    expectSynchronousDrain(FAILED, true);
+}
+
+TEST(EngineFailoverE2E, SubmitAndWaitTransferPreservesSubmitError) {
+    TransferEngineImpl engine(makeMinimalP2PConfig());
+    ASSERT_TRUE(engine.available());
+    Request request{};
+    request.transport_hint =
+        static_cast<TransportType>(kSupportedTransportTypes);
+    const auto alive_before = engine.aliveBatchCountForTest();
+    auto batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, 0u);
+    auto expected = engine.submitTransfer(batch, {request});
+    ASSERT_FALSE(expected.ok());
+    ASSERT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_EQ(engine.submitAndWaitTransfer({request}), expected);
+    EXPECT_EQ(engine.aliveBatchCountForTest(), alive_before);
 }
 
 TEST(EngineFailoverE2E, ProgressBatchAdvancesExactlyOneStepPerCall) {

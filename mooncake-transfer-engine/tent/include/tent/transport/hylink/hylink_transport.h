@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <type_traits>
 #include <vector>
 
 #include "tent/common/concurrent/ticket_lock.h"
@@ -54,10 +55,18 @@ struct HylinkTask {
     // Device of the source buffer. The remote handle import, the copy and
     // the completion event all run under this device's context.
     int device_id = -1;
+    hipStream_t pending_stream = nullptr;
     hipEvent_t completion_event = nullptr;
 };
 
+using HylinkStream = std::shared_ptr<std::remove_pointer_t<hipStream_t>>;
+
 struct HylinkSubBatch : public Transport::SubBatch {
+    struct DeviceStreams {
+        std::vector<HylinkStream> streams;
+        size_t next = 0;
+    };
+    std::unordered_map<int, DeviceStreams> device_streams;
     std::vector<HylinkTask> task_list;
     size_t max_size = 0;
     ~HylinkSubBatch() {
@@ -91,6 +100,8 @@ class HylinkTransport : public Transport {
     Status getTransferStatus(SubBatchRef batch, int task_id,
                              TransferStatus& status) override;
 
+    Status isSubBatchDrained(SubBatchRef batch, bool& drained) override;
+
     Status addMemoryBuffer(BufferDesc& desc,
                            const MemoryOptions& options) override;
 
@@ -123,19 +134,13 @@ class HylinkTransport : public Transport {
         std::unique_ptr<DtkFabricHandle> shareable;
     };
 
-    // Per-device copy streams, created lazily on first use (mirrors the
-    // classic hip transport's stream pool: every task runs on the device
-    // of its source buffer).
-    hipStream_t acquireStream(int device_id);
+    // Lease streams to one sub-batch so later batches cannot extend its drain.
+    hipStream_t acquireStream(HylinkSubBatch& batch, int device_id);
     // Issues the task's copy and records its completion event. Must be
     // called with task.device_id as the current device.
-    Status submitTaskCopy(HylinkTask& task);
-    // Handles one request end to end under the source buffer's device
-    // context: validate, open the remote handle, submit the copy. Mirrors
-    // the classic hip transport's startAsyncTransfer.
-    Status startAsyncTransfer(const Request& request,
-                              const SegmentDescRef& local_segment,
-                              HylinkTask& task);
+    Status submitTaskCopy(HylinkTask& task, hipStream_t stream);
+    Status prepareTask(HylinkSubBatch& batch, const Request& request,
+                       const SegmentDescRef& local_segment, HylinkTask& task);
 
     Status relocateSharedMemoryAddress(uint64_t& dest_addr, uint64_t length,
                                        uint64_t target_id,
@@ -174,8 +179,7 @@ class HylinkTransport : public Transport {
 
     static constexpr int kStreamsPerDevice = 8;
     std::mutex stream_pool_mutex_;
-    std::unordered_map<int, std::vector<hipStream_t>> stream_pools_;
-    std::unordered_map<int, size_t> stream_cursors_;
+    std::unordered_map<int, std::vector<HylinkStream>> stream_pools_;
 
     mutable std::mutex register_mutex_;
     // hipMalloc / VMM base -> serialized export blob. Sub-allocations inside

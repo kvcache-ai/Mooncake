@@ -101,7 +101,8 @@ and pinned host buffers.
 
 Start `mooncake_master` and create a `store` client as shown in
 {ref}`Start a Store Client <start-a-store-client>`. The following example
-offloads a Tensor to Store and reloads it into a new MLU allocation:
+offloads a Tensor to Store, reloads it into a new MLU allocation, and writes
+back an update to the registered Tensor:
 
 ```python
 from uuid import uuid4
@@ -111,7 +112,7 @@ import torch_mlu
 
 key = f"mlu-example-{uuid4().hex}"
 source = torch.arange(4096, dtype=torch.float32).to("mlu")
-torch.mlu.synchronize()  # Finish the producer before Store reads the pointer.
+torch.mlu.synchronize()  # Wait for the producer, including on the default stream.
 result = store.put_tensor(key, source)
 if result != 0:
     raise RuntimeError(f"put_tensor failed: {result}")
@@ -129,6 +130,11 @@ try:
             raise RuntimeError(f"get_tensor_into_cuda returned {result}, expected {size}")
         if not torch.equal(destination.cpu(), torch.arange(4096, dtype=torch.float32)):
             raise RuntimeError("Reloaded Tensor does not match the original data")
+        destination.add_(1)
+        torch.mlu.synchronize()  # Synchronize again after updating the Tensor.
+        result = store.upsert_tensor(key, destination)
+        if result != 0:
+            raise RuntimeError(f"upsert_tensor failed: {result}")
     finally:
         result = store.unregister_buffer(destination.data_ptr())
         if result != 0:
@@ -140,9 +146,35 @@ finally:
 ```
 
 Keep registered Tensor owners alive until transfers finish and buffers are
-unregistered. For a producer on a nondefault stream, synchronize its event or
-stream before calling Store. Tensor writes currently gather metadata and payload
-into host staging; registered-pointer writes use the Transfer Engine path.
+unregistered. Before writing a CUDA or MLU Tensor to Store, synchronize the
+producer stream or its completion event, including when using the default
+stream. Repeat this synchronization after each update to a registered Tensor
+before the next put/upsert call. Registering a buffer does not replace this
+synchronization.
+
+With the C++ Store backend, TENT (`MC_USE_TENT=1`) and `protocol="rdma"`,
+Tensor put/upsert APIs can retain registered CUDA and MLU payload pointers for
+ordinary memory replicas. Register the full source range with
+`store.register_buffer()` before writing; a registration may cover a larger
+contiguous Tensor containing the payload view. Metadata and unregistered slices
+use host staging. Noncontiguous inputs create temporary contiguous allocations,
+which keep the staging path unless those allocations are registered.
+
+This optimization applies to RealClient source registrations. CUDA IPC mappings
+imported from DummyClient are not registered through this path and retain host
+staging.
+
+TENT selects direct RDMA or staging according to the device and NIC capabilities.
+If no TENT route is available for a retained device pointer, Store uses host
+staging before submitting the write.
+TCP clients, classic Transfer Engine, CXL and mixed file/NoF replicas keep full
+Store staging. Object checksums still copy payload bytes to the host for CRC.
+Synchronous TENT writes wait for all transfers to stop accessing the buffers,
+including after a timeout or status-query failure. Cancellation is best effort,
+so this wait can exceed the transfer timeout. After the call returns, the source
+can be unregistered and released. Unregistration waits for concurrent Tensor
+writes using the registration; keep Tensor owners alive and finish all
+operations before closing Store.
 
 With `mooncake_master` running, run the real-device regression suite from the
 repository root:

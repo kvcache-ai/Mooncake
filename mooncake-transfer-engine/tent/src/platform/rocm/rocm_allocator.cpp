@@ -56,7 +56,33 @@ Status RocmPlatform::free(void* ptr, size_t size) {
     return Status::OK();
 }
 
+namespace {
+struct HipCopyCompletion final : CopyCompletion {
+    HIPStreamHandle stream;
+    int device;
+    Status query(bool& finished) override {
+        finished = false;
+        int saved;
+        CHECK_HIP(hipGetDevice(&saved));
+        if (saved != device) CHECK_HIP(hipSetDevice(device));
+        auto result = hipStreamQuery(stream.get());
+        if (saved != device) CHECK_HIP(hipSetDevice(saved));
+        if (result == hipErrorNotReady) return Status::OK();
+        if (result != hipSuccess)
+            return Status::InternalError(std::string("hipStreamQuery: ") +
+                                         hipGetErrorString(result));
+        finished = true;
+        return Status::OK();
+    }
+};
+}  // namespace
+
 Status RocmPlatform::copy(void* dst, void* src, size_t length) {
+    return copy(dst, src, length, nullptr);
+}
+
+Status RocmPlatform::copy(void* dst, void* src, size_t length,
+                          PendingCopy* pending) {
     // hipMemcpyAsync routes the copy through its stream's device context, so
     // the stream must live on the device owning the device-side buffer.
     // Control-plane RPC worker threads sit on device 0 while a registered
@@ -70,8 +96,27 @@ Status RocmPlatform::copy(void* dst, void* src, size_t length) {
 
     HIPStreamHandle stream;
     CHECK_STATUS(getStreamFromPool(stream, device_id));
+    std::shared_ptr<HipCopyCompletion> completion;
+    if (pending) {
+        try {
+            completion = std::make_shared<HipCopyCompletion>();
+        } catch (const std::bad_alloc&) {
+            return Status::InternalError("Unable to track HIP copy" LOC_MARK);
+        }
+        completion->device = device_id;
+        if (device_id == HIPStreamPool::kCurrentDevice)
+            CHECK_HIP(hipGetDevice(&completion->device));
+    }
     CHECK_HIP(hipMemcpyAsync(dst, src, length, hipMemcpyDefault, stream.get()));
-    CHECK_HIP(hipStreamSynchronize(stream.get()));
+    auto synced = hipStreamSynchronize(stream.get());
+    if (synced != hipSuccess) {
+        if (completion) {
+            completion->stream = std::move(stream);
+            *pending = std::move(completion);
+        }
+        return Status::InternalError(std::string("hipStreamSynchronize: ") +
+                                     hipGetErrorString(synced) + LOC_MARK);
+    }
     return Status::OK();
 }
 

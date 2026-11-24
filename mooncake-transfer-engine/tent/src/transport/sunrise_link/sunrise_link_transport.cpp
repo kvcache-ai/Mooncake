@@ -239,49 +239,62 @@ struct ScopedTangDeviceOps {
 
 }  // namespace
 
-class ThreadLocalTangStreamPool {
-   public:
-    tangStream_t getOrCreate(int device_id) {
-        if (device_id < 0) return nullptr;
-        auto it = streams_by_device_.find(device_id);
-        if (it != streams_by_device_.end()) return it->second;
+SunriseLinkSubBatch::~SunriseLinkSubBatch() {
+    if (streams.empty()) return;
+    SavedTangDevice saved;
+    for (auto [device, stream] : streams) {
+        tangSetDevice(device);
+        tangStreamDestroy(reinterpret_cast<tangStream_t>(stream));
+    }
+}
 
-        ScopedTangDeviceOps ctx_lock(device_id, device_id);
-        int saved_dev = -1;
-        tangGetDevice(&saved_dev);
-        tangError_t set_ret = tangSetDevice(device_id);
-        if (set_ret != tangSuccess) {
-            LOG(ERROR) << "tangSetDevice(" << device_id
-                       << ") failed for stream creation: " << set_ret << " "
-                       << tangGetErrorString(set_ret);
-            return nullptr;
-        }
-
+// Called on the copy's device. Each batch owns its streams through drain.
+static tangStream_t getOrCreateStream(SunriseLinkSubBatch& batch, int device) {
+    auto& slot = batch.streams[device];
+    if (!slot) {
         tangStream_t stream = nullptr;
-        tangError_t create_ret =
-            tangStreamCreateWithFlags(&stream, tangStreamNonBlocking);
-        if (saved_dev >= 0) tangSetDevice(saved_dev);
-        if (create_ret != tangSuccess) {
-            LOG(ERROR) << "tangStreamCreateWithFlags failed: " << create_ret
-                       << " " << tangGetErrorString(create_ret)
-                       << ", device=" << device_id;
+        auto result = tangStreamCreateWithFlags(&stream, tangStreamNonBlocking);
+        if (result != tangSuccess) {
+            batch.streams.erase(device);
+            LOG(ERROR) << "tangStreamCreateWithFlags failed: "
+                       << tangGetErrorString(result) << ", device=" << device;
             return nullptr;
         }
-        streams_by_device_[device_id] = stream;
-        return stream;
+        slot = reinterpret_cast<void*>(stream);
     }
+    return reinterpret_cast<tangStream_t>(slot);
+}
 
-    ~ThreadLocalTangStreamPool() {
-        for (const auto& kv : streams_by_device_) {
-            if (kv.second) tangStreamDestroy(kv.second);
+// A query error can publish FAILED before the device stops accessing memory.
+// Keep the device recorded until a later query confirms physical completion.
+static tangError_t pollAsyncCopy(SunriseLinkSubBatch& batch,
+                                 SunriseLinkTask& task) {
+    if (task.async_device < 0) return tangSuccess;
+    int previous = -1;
+    auto result = tangGetDevice(&previous);
+    if (result == tangSuccess) {
+        const bool switch_device = previous != task.async_device;
+        if (switch_device) result = tangSetDevice(task.async_device);
+        if (result == tangSuccess) {
+            result = tangStreamQuery(reinterpret_cast<tangStream_t>(
+                batch.streams.at(task.async_device)));
+            if (switch_device) {
+                auto restored = tangSetDevice(previous);
+                if (restored != tangSuccess) result = restored;
+            }
         }
     }
-
-   private:
-    std::unordered_map<int, tangStream_t> streams_by_device_;
-};
-
-thread_local ThreadLocalTangStreamPool tl_stream_pool;
+    if (result == tangSuccess) {
+        task.async_device = -1;
+        if (task.status_word == PENDING) {
+            task.transferred_bytes = task.request.length;
+            task.status_word = COMPLETED;
+        }
+    } else if (result != tangErrorNotReady) {
+        task.status_word = FAILED;
+    }
+    return result;
+}
 
 SunriseLinkTransport::SunriseLinkTransport() : installed_(false) {
     // Match NVLink-style caps: routing may see MTYPE_CPU if pointer probe fails
@@ -457,10 +470,6 @@ Status SunriseLinkTransport::allocateSubBatch(SubBatchRef& batch,
     shm_batch->task_list.clear();
     shm_batch->task_list.reserve(max_size);
     shm_batch->max_size = max_size;
-    // Synchronous copy path (can_async=false in startTransfer) does not rely on
-    // stream completion; avoid creating thread-local Tang stream here to reduce
-    // device-context coupling in worker threads.
-    shm_batch->stream = nullptr;
     return Status::OK();
 }
 
@@ -517,41 +526,55 @@ Status SunriseLinkTransport::submitTransferTasks(
         return -1;
     };
 
-    for (auto& request : request_list) {
-        shm_batch->task_list.push_back(SunriseLinkTask{});
-        auto& task = shm_batch->task_list[shm_batch->task_list.size() - 1];
-
+    const size_t first = shm_batch->size();
+    auto prepare = [&](const Request& request) -> Status {
         uint64_t target_addr = request.target_offset;
         int target_gpu_id = -1;
-        int local_gpu_id = infer_local_dev_best_effort(request.source);
-        if (local_gpu_id >= 0) {
-            tangError_t sd = tangSetDevice(local_gpu_id);
-            if (sd != tangSuccess) {
+        int local_device = infer_local_dev_best_effort(request.source);
+        if (local_device >= 0) {
+            if (tangSetDevice(local_device) != tangSuccess)
                 return Status::InternalError(
                     "Failed to set local Sunrise device before transfer");
-            }
+        } else if (tangGetDevice(&local_device) != tangSuccess) {
+            return Status::InternalError(
+                "Failed to get local Sunrise device before transfer");
         }
         if (request.target_id != LOCAL_SEGMENT_ID) {
-            auto status = relocateRemoteAddress(
-                target_addr, request.length, request.target_id, &target_gpu_id);
-            if (!status.ok()) return status;
+            CHECK_STATUS(relocateRemoteAddress(target_addr, request.length,
+                                               request.target_id,
+                                               &target_gpu_id));
         }
+        auto& task = shm_batch->task_list.emplace_back();
         task.target_addr = target_addr;
         task.request = request;
-        task.status_word = TransferStatusEnum::PENDING;
-        task.transferred_bytes = 0;
-        task.is_tang_ipc = (request.target_id != LOCAL_SEGMENT_ID);
+        task.status_word = PENDING;
+        task.is_tang_ipc = request.target_id != LOCAL_SEGMENT_ID;
         task.tang_gpu_id = target_gpu_id;
-
-        auto status = startTransfer(&task, shm_batch);
-        if (!status.ok()) return status;
+        task.local_device = local_device;
+        return Status::OK();
+    };
+    for (const auto& request : request_list) {
+        auto result = prepare(request);
+        if (!result.ok()) {
+            shm_batch->task_list.resize(first);
+            return result;
+        }
+    }
+    for (size_t i = first; i < shm_batch->size(); ++i) {
+        auto& task = shm_batch->task_list[i];
+        if (task.local_device >= 0 &&
+            tangSetDevice(task.local_device) != tangSuccess) {
+            task.status_word = FAILED;
+            continue;
+        }
+        startTransfer(&task, shm_batch);
     }
 
     return Status::OK();
 }
 
-Status SunriseLinkTransport::startTransfer(SunriseLinkTask* task,
-                                           SunriseLinkSubBatch* batch) {
+void SunriseLinkTransport::startTransfer(SunriseLinkTask* task,
+                                         SunriseLinkSubBatch* batch) {
     void* src = nullptr;
     void* dst = nullptr;
 
@@ -566,7 +589,6 @@ Status SunriseLinkTransport::startTransfer(SunriseLinkTask* task,
     }
 
     const size_t len = task->request.length;
-    tangStream_t stream = nullptr;
     int current_dev = -1;
     tangGetDevice(&current_dev);
     auto infer_local_dev = [&](void* ptr) -> int {
@@ -628,11 +650,11 @@ Status SunriseLinkTransport::startTransfer(SunriseLinkTask* task,
                     << ret << " " << tangGetErrorString(ret)
                     << " dev=" << src_dev;
                 task->status_word = TransferStatusEnum::FAILED;
-                return Status::InternalError("SunriseLink transfer failed");
+                return;
             }
             task->transferred_bytes = len;
             task->status_word = TransferStatusEnum::COMPLETED;
-            return Status::OK();
+            return;
         }
 
         tangError_t ret = tangSuccess;
@@ -667,11 +689,11 @@ Status SunriseLinkTransport::startTransfer(SunriseLinkTask* task,
                        << " remote_dev=" << remote_dev
                        << " local_dev=" << local_dev;
             task->status_word = TransferStatusEnum::FAILED;
-            return Status::InternalError("SunriseLink transfer failed");
+            return;
         }
         task->transferred_bytes = len;
         task->status_word = TransferStatusEnum::COMPLETED;
-        return Status::OK();
+        return;
     }
 
     tangPointerAttributes sa = {};
@@ -708,40 +730,7 @@ Status SunriseLinkTransport::startTransfer(SunriseLinkTask* task,
     }
 
     tangError_t ret = tangSuccess;
-    const int stream_dev = (dst_dev >= 0) ? dst_dev : src_dev;
-    if (stream_dev >= 0) {
-        stream = tl_stream_pool.getOrCreate(stream_dev);
-    }
-    const bool can_async =
-        stream && async_memcpy_threshold_ > 0 && len >= async_memcpy_threshold_;
-    batch->stream = reinterpret_cast<void*>(stream);
-
-    if (task->is_tang_ipc && src_dev >= 0 && dst_dev >= 0 &&
-        src_dev == dst_dev) {
-        ScopedTangDeviceOps ctx_lock(src_dev, dst_dev);
-        tangSetDevice(src_dev);
-        if (can_async) {
-            ret = tangMemcpyAsync(dst, src, len, tangMemcpyDeviceToDevice,
-                                  stream);
-            if (ret == tangSuccess) {
-                return Status::OK();
-            }
-        }
-        ret = tangMemcpy(dst, src, len, tangMemcpyDeviceToDevice);
-        if (ret != tangSuccess) {
-            LOG(ERROR)
-                << "SunriseLink IPC local-device memcpy failed, tang ret="
-                << ret << " " << tangGetErrorString(ret) << " dev=" << src_dev;
-            task->status_word = TransferStatusEnum::FAILED;
-            return Status::InternalError("SunriseLink transfer failed");
-        }
-        task->transferred_bytes = len;
-        task->status_word = TransferStatusEnum::COMPLETED;
-        return Status::OK();
-    }
-
-    if (src_dev >= 0 && dst_dev >= 0 &&
-        (src_dev != dst_dev || task->is_tang_ipc)) {
+    if (src_dev >= 0 && dst_dev >= 0 && src_dev != dst_dev) {
         auto collect_ports = [&](int local, int peer) {
             std::vector<int> ports;
             auto it = topology_map_.find(local);
@@ -792,7 +781,7 @@ Status SunriseLinkTransport::startTransfer(SunriseLinkTask* task,
             if (ret == tangSuccess) {
                 task->transferred_bytes = len;
                 task->status_word = TransferStatusEnum::COMPLETED;
-                return Status::OK();
+                return;
             }
         }
 
@@ -810,35 +799,26 @@ Status SunriseLinkTransport::startTransfer(SunriseLinkTask* task,
             return r;
         };
 
-        // Synchronous tangMemcpyPeer only (see can_async above).
-        (void)can_async;
         ret = peer_sync();
-    } else if (src_dev >= 0 && dst_dev >= 0 && src_dev == dst_dev) {
-        ScopedTangDeviceOps ctx_lock(src_dev, dst_dev);
-        tangSetDevice(src_dev);
-        if (can_async) {
-            ret = tangMemcpyAsync(dst, src, len, tangMemcpyDeviceToDevice,
-                                  stream);
-            if (ret == tangSuccess) {
-                return Status::OK();
-            }
-        }
-        ret = tangMemcpy(dst, src, len, tangMemcpyDeviceToDevice);
     } else {
         ScopedTangDeviceOps ctx_lock(src_dev, dst_dev);
-        if (src_dev >= 0) {
-            tangSetDevice(src_dev);
-        } else if (dst_dev >= 0) {
-            tangSetDevice(dst_dev);
-        }
-        tangMemcpyKind kind = MemcpyKindForPointers(sa.type, da.type);
-        if (can_async) {
-            ret = tangMemcpyAsync(dst, src, len, kind, stream);
-            if (ret == tangSuccess) {
-                return Status::OK();
+        const int device = src_dev >= 0 ? src_dev : dst_dev;
+        if (device >= 0) ret = tangSetDevice(device);
+        if (ret == tangSuccess) {
+            const auto kind = src_dev >= 0 && dst_dev >= 0
+                                  ? tangMemcpyDeviceToDevice
+                                  : MemcpyKindForPointers(sa.type, da.type);
+            if (device >= 0 && async_memcpy_threshold_ > 0 &&
+                len >= async_memcpy_threshold_) {
+                auto stream = getOrCreateStream(*batch, device);
+                if (stream && tangMemcpyAsync(dst, src, len, kind, stream) ==
+                                  tangSuccess) {
+                    task->async_device = device;
+                    return;
+                }
             }
+            ret = tangMemcpy(dst, src, len, kind);
         }
-        ret = tangMemcpy(dst, src, len, kind);
     }
 
     if (ret != tangSuccess) {
@@ -848,12 +828,11 @@ Status SunriseLinkTransport::startTransfer(SunriseLinkTask* task,
                    << " dst_attr_ret=" << dst_attr_ret
                    << " task.tang_gpu_id=" << task->tang_gpu_id;
         task->status_word = TransferStatusEnum::FAILED;
-        return Status::InternalError("SunriseLink transfer failed");
+        return;
     }
 
     task->transferred_bytes = len;
     task->status_word = TransferStatusEnum::COMPLETED;
-    return Status::OK();
 }
 
 Status SunriseLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
@@ -867,25 +846,29 @@ Status SunriseLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
         return Status::InvalidArgument("Invalid task id" LOC_MARK);
     }
     auto& task = shm_batch->task_list[task_id];
-    if (task.status_word == TransferStatusEnum::PENDING) {
-        tangStream_t stream = reinterpret_cast<tangStream_t>(shm_batch->stream);
-        if (stream) {
-            tangError_t err = tangStreamQuery(stream);
-            if (err == tangSuccess) {
-                tangStreamSynchronize(stream);
-                task.transferred_bytes = task.request.length;
-                task.status_word = TransferStatusEnum::COMPLETED;
-            } else if (err != tangErrorNotReady) {
-                task.status_word = TransferStatusEnum::FAILED;
-            }
-        } else {
-            LOG(ERROR)
-                << "SunriseLink getTransferStatus: PENDING with null stream; "
-                   "cannot complete async bookkeeping";
-            task.status_word = TransferStatusEnum::FAILED;
-        }
-    }
+    if (task.status_word == PENDING) pollAsyncCopy(*shm_batch, task);
     status = TransferStatus{task.status_word, task.transferred_bytes};
+    return Status::OK();
+}
+
+Status SunriseLinkTransport::isSubBatchDrained(SubBatchRef batch,
+                                               bool& drained) {
+    drained = false;
+    auto* shm_batch = dynamic_cast<SunriseLinkSubBatch*>(batch);
+    if (!shm_batch)
+        return Status::InvalidArgument(
+            "Invalid SunriseLink sub-batch" LOC_MARK);
+    for (auto& task : shm_batch->task_list) {
+        auto result = pollAsyncCopy(*shm_batch, task);
+        if (result == tangErrorNotReady) return Status::OK();
+        if (result != tangSuccess)
+            return Status::InternalError(
+                std::string("SunriseLink completion query: ") +
+                tangGetErrorString(result) + LOC_MARK);
+        if (task.status_word == PENDING || task.status_word == INITIAL)
+            return Status::OK();
+    }
+    drained = true;
     return Status::OK();
 }
 

@@ -33,15 +33,21 @@ struct SunriseLinkTask {
     uint64_t target_addr = 0;
     bool is_tang_ipc = false;
     int tang_gpu_id = -1;
+    int local_device = -1;
+    // Set only while an accepted async copy still needs a completion query.
+    int async_device = -1;
 };
 
 struct SunriseLinkSubBatch : public Transport::SubBatch {
+    SunriseLinkSubBatch() = default;
+    SunriseLinkSubBatch(const SunriseLinkSubBatch&) = delete;
+    SunriseLinkSubBatch& operator=(const SunriseLinkSubBatch&) = delete;
+    ~SunriseLinkSubBatch() override;
+
     std::vector<SunriseLinkTask> task_list;
     size_t max_size = 0;
-    /// Opaque `tangStream_t` when built with Tang; mirrors
-    /// NVLinkSubBatch::stream.
-    void* stream = nullptr;
-    virtual size_t size() const { return task_list.size(); }
+    std::unordered_map<int, void*> streams;
+    size_t size() const override { return task_list.size(); }
 };
 
 struct SunriseLinkDeviceInfo {
@@ -77,6 +83,8 @@ class SunriseLinkTransport : public Transport {
     Status getTransferStatus(SubBatchRef batch, int task_id,
                              TransferStatus& status) override;
 
+    Status isSubBatchDrained(SubBatchRef batch, bool& drained) override;
+
     Status addMemoryBuffer(BufferDesc& desc,
                            const MemoryOptions& options) override;
 
@@ -87,7 +95,8 @@ class SunriseLinkTransport : public Transport {
     bool supportNotification() const override { return true; }
 
    private:
-    Status startTransfer(SunriseLinkTask* task, SunriseLinkSubBatch* batch);
+    friend class SunriseLinkTransportTestPeer;
+    void startTransfer(SunriseLinkTask* task, SunriseLinkSubBatch* batch);
 
     // SunriseLink initialization
     Status initSunriseLink();

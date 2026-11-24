@@ -355,12 +355,8 @@ Status HixlEngine::getTransferStatus(void* req, HixlXferState& status) {
 
 Status HixlEngine::disconnectOnTimeout(const std::string& remote,
                                        int32_t timeout_ms) {
-    // HIXL serializes the calls of one peer internally: DestroyClient holds
-    // that remote's client mutex, and a racing submit observes NOT_CONNECTED
-    // (the transport maps it to FAILED/TIMEOUT), so Disconnect does not need to
-    // stop submits/polls to the other peers. A shared lock therefore keeps
-    // vendor_ alive across finalize() without freezing the transfer workers for
-    // up to the disconnect timeout, which an exclusive lock would.
+    // The transport gates submissions to this peer. Other peers can continue
+    // using the engine while Disconnect waits.
     std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!vendor_) {
         return Status::OK();

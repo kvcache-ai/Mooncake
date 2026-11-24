@@ -483,10 +483,20 @@ Status GdsTransport::submitTransferTasks(
         num_params += (request.length + kMaxSliceSize - 1) / kMaxSliceSize;
     if (first_param_index + num_params > io_batch_depth_)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+    const size_t first_task_index = gds_batch->io_param_ranges.size();
+    // A rejected submission must leave only previously accepted IOs to drain.
+    auto rollback = [&] {
+        gds_batch->io_params.resize(first_param_index);
+        gds_batch->cached_events.resize(first_param_index);
+        gds_batch->io_param_ranges.resize(first_task_index);
+        gds_batch->file_contexts.resize(first_task_index);
+    };
     for (auto& request : request_list) {
         auto context = findFileContext(request.target_id);
-        if (!context || !context->ready())
+        if (!context || !context->ready()) {
+            rollback();
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
+        }
         gds_batch->file_contexts.push_back(context);
         IOParamRange range;
         range.base = gds_batch->io_params.size();
@@ -520,10 +530,12 @@ Status GdsTransport::submitTransferTasks(
     auto result =
         cuFileBatchIOSubmit(gds_batch->batch_handle->handle, num_params,
                             &gds_batch->io_params[first_param_index], 0);
-    if (result.err != CU_FILE_SUCCESS)
+    if (result.err != CU_FILE_SUCCESS) {
+        rollback();
         return Status::InternalError(
             std::string("Failed to submit GDS batch IO: Code ") +
             std::to_string(result.err) + LOC_MARK);
+    }
     return Status::OK();
 }
 

@@ -109,7 +109,33 @@ Status CudaPlatform::freePinnedHost(void* ptr, size_t size) {
     return Status::OK();
 }
 
+namespace {
+struct CudaCopyCompletion final : CopyCompletion {
+    CUDAStreamHandle stream;
+    Status query(bool& finished) override {
+        finished = false;
+        CUcontext context;
+        CHECK_CU(cuStreamGetCtx(stream.get(), &context));
+        CHECK_CU(cuCtxPushCurrent(context));
+        auto result = cudaStreamQuery(stream.get());
+        CUcontext popped;
+        CHECK_CU(cuCtxPopCurrent(&popped));
+        if (result == cudaErrorNotReady) return Status::OK();
+        if (result != cudaSuccess)
+            return Status::InternalError(std::string("cudaStreamQuery: ") +
+                                         cudaGetErrorString(result));
+        finished = true;
+        return Status::OK();
+    }
+};
+}  // namespace
+
 Status CudaPlatform::copy(void* dst, void* src, size_t length) {
+    return copy(dst, src, length, nullptr);
+}
+
+Status CudaPlatform::copy(void* dst, void* src, size_t length,
+                          PendingCopy* pending) {
     // Use cudaMemcpyAsync with a non-blocking stream instead of cudaMemcpy(),
     // as the latter relies on the legacy default stream and can introduce
     // unintended synchronization or even deadlocks in downstream
@@ -153,14 +179,21 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
         (void)cudaGetLastError();
     }
 
+    // Reserve the owner before submission so retaining a live DMA cannot fail.
+    std::shared_ptr<CudaCopyCompletion> completion;
+    if (pending) {
+        try {
+            completion = std::make_shared<CudaCopyCompletion>();
+        } catch (const std::bad_alloc&) {
+            return Status::InternalError("Unable to track CUDA copy" LOC_MARK);
+        }
+    }
     Status status;
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess) {
         status = Status::InternalError(std::string("cudaSetDevice: ") +
                                        cudaGetErrorString(err) + LOC_MARK);
     } else {
-        // The handle returns the stream to the pool at the end of this scope,
-        // before the caller's state is restored below.
         CUDAStreamHandle stream;
         status = getStreamFromPool(stream, device_id);
         if (status.ok()) {
@@ -175,6 +208,10 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
         if (status.ok()) {
             err = cudaStreamSynchronize(stream.get());
             if (err != cudaSuccess) {
+                if (completion) {
+                    completion->stream = std::move(stream);
+                    *pending = std::move(completion);
+                }
                 status = Status::InternalError(
                     std::string("cudaStreamSynchronize: ") +
                     cudaGetErrorString(err) + LOC_MARK);

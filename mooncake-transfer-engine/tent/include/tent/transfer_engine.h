@@ -308,6 +308,10 @@ class TransferEngine {
 
     Status getSegmentInfo(SegmentID handle, SegmentInfo& info);
 
+    // Probe the current route without submitting a transfer. A true result
+    // does not reserve resources or guarantee that a later submit succeeds.
+    bool canTransfer(const Request& request);
+
    public:
     Status allocateLocalMemory(void** addr, size_t size,
                                Location location = kWildcardLocation);
@@ -370,7 +374,7 @@ class TransferEngine {
 
     // Best-effort task cancellation. Work that has not reached the transport
     // is prevented from being submitted. Device work already posted may still
-    // complete, so callers must continue polling for a terminal status.
+    // complete; isBatchDrained must confirm buffer safety before release.
     Status cancelTransfer(BatchID batch_id, size_t task_id);
 
     Status sendNotification(SegmentID target_id, const Notification& notifi);
@@ -387,13 +391,18 @@ class TransferEngine {
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
 
+    // Non-blocking buffer-lifetime query, separate from logical task status.
+    // True only after every attempt has stopped accessing caller memory.
+    // The caller must keep the batch and its buffers alive while polling.
+    Status isBatchDrained(BatchID batch_id, bool& drained);
+
     // Blocks until every task in the batch terminates. status_list gets one
     // entry per request; with a null status_list, a task that did not complete
     // fails the call. On timeout the queued tasks are canceled and in-flight
     // tasks are asked to stop; without status_list the call returns TimedOut,
     // so the caller must confirm the tasks stopped before reusing the buffers.
-    // A PENDING entry means the engine may still touch that request's memory
-    // (0 waits forever). The batch stays owned by the caller.
+    // Logical termination does not confirm buffer safety: use isBatchDrained
+    // before releasing memory. 0 waits forever; the caller owns the batch.
     Status waitTransfer(BatchID batch_id,
                         std::vector<TransferStatus>* status_list = nullptr,
                         uint64_t timeout_ms = 0);

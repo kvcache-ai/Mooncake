@@ -14,7 +14,11 @@
 
 #include "tent/runtime/platform.h"
 
+#include <atomic>
+#include <chrono>
+#include <list>
 #include <cstdlib>
+#include <thread>
 #include <mutex>
 #include <unordered_set>
 #include <utility>
@@ -49,6 +53,79 @@ void DmabufExport::close() {
     fd = -1;
     close_fd = false;
     if (::close(owned_fd) != 0) PLOG(WARNING) << "Failed to close dma-buf fd";
+}
+
+Status Platform::copyWithCompletion(void* dst, void* src, size_t length,
+                                    PendingCopy& pending) {
+#ifdef USE_CUDA
+    if (auto* cuda = dynamic_cast<CudaPlatform*>(this))
+        return cuda->copy(dst, src, length, &pending);
+#elif defined(USE_HIP)
+    if (auto* rocm = dynamic_cast<RocmPlatform*>(this))
+        return rocm->copy(dst, src, length, &pending);
+#endif
+    return copy(dst, src, length);
+}
+
+Status CopyCompletion::wait() {
+    for (;;) {
+        bool finished = false;
+        CHECK_STATUS(query(finished));
+        if (finished) return Status::OK();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+namespace {
+struct CopyQuarantine {
+    std::mutex mutex;
+    std::list<std::pair<std::shared_ptr<CopyCompletion>, std::function<void()>>>
+        copies;
+    std::atomic<bool> pending{false};
+};
+
+CopyQuarantine& copyQuarantine() {
+    // An unconfirmed DMA may outlive all transports and static destructors.
+    static auto* quarantine = new CopyQuarantine;
+    return *quarantine;
+}
+}  // namespace
+
+void CopyCompletion::quarantine(std::shared_ptr<CopyCompletion> copy,
+                                std::function<void()> release_staging) {
+    auto& queue = copyQuarantine();
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    queue.copies.emplace_back(std::move(copy), std::move(release_staging));
+    queue.pending = true;
+}
+
+void CopyCompletion::reclaimQuarantined() {
+    auto& queue = copyQuarantine();
+    if (!queue.pending.load(std::memory_order_relaxed)) return;
+    // Query each entry present at the start once, outside the queue lock.
+    decltype(queue.copies) copies;
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        copies.swap(queue.copies);
+        queue.pending = false;
+    }
+    for (auto it = copies.begin(); it != copies.end();) {
+        bool finished = false;
+        try {
+            if (it->first->query(finished).ok() && finished) {
+                it->second();
+                it = copies.erase(it);
+                continue;
+            }
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "Could not reclaim staging: " << error.what();
+        }
+        ++it;
+    }
+    if (copies.empty()) return;
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    queue.copies.splice(queue.copies.end(), copies);
+    queue.pending = true;
 }
 
 Platform& Platform::getLoader(std::shared_ptr<Config> conf) {

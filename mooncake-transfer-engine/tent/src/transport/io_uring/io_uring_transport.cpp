@@ -290,10 +290,26 @@ Status IOUringTransport::freeSubBatch(SubBatchRef& batch) {
     for (auto& task : io_uring_batch->task_list)
         if (task.status_word == TransferStatusEnum::PENDING) ++outstanding;
     waitForInFlight(&ring, outstanding);
+    CopyCompletion::reclaimQuarantined();
+    Status status;
+    for (auto& task : io_uring_batch->task_list) {
+        if (!task.pending_copy) continue;
+        auto result = task.pending_copy->wait();
+        if (!result.ok()) {
+            LOG(ERROR) << "Retaining undrained io_uring staging: "
+                       << result.ToString();
+            CopyCompletion::quarantine(
+                task.pending_copy, [pool = task.pool, buffer = task.buffer] {
+                    if (!pool || !pool->release(buffer)) std::free(buffer);
+                });
+            task.buffer = nullptr;
+            if (status.ok()) status = result;
+        }
+    }
     io_uring_queue_exit(&ring);
     Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
     batch = nullptr;
-    return Status::OK();
+    return status;
 }
 
 std::string IOUringTransport::getIOUringFilePath(SegmentID target_id) {
@@ -330,8 +346,9 @@ IOUringFileContext* IOUringTransport::findFileContext(SegmentID target_id) {
     return tl_file_context_map[target_id].get();
 }
 
-Status IOUringTransport::copyMemory(void* dst, void* src, size_t length) {
-    return Platform::getLoader().copy(dst, src, length);
+Status IOUringTransport::copyMemory(void* dst, void* src, size_t length,
+                                    Platform::PendingCopy& pending) {
+    return Platform::getLoader().copyWithCompletion(dst, src, length, pending);
 }
 
 Status IOUringTransport::submitTransferTasks(
@@ -393,37 +410,49 @@ Status IOUringTransport::submitTransferTasks(
         return Status::TooManyRequests("Insufficient SQE space" LOC_MARK);
     }
 
-    // Finish every staged WRITE copy before the commit phase. A failed copy
-    // must leave the task list, SQ ring and file untouched so failover cannot
-    // submit uninitialized staging contents or replay an accepted WRITE.
+    // Once a staging copy is in flight, retain it in its task and report
+    // individual failures through polling. No failed WRITE gets a file SQE.
+    auto& tasks = io_uring_batch->task_list;
+    const size_t first = tasks.size();
+    tasks.resize(first + request_list.size());
+    bool has_pending_copy = false;
     for (size_t i = 0; i < request_list.size(); ++i) {
         const auto& request = request_list[i];
-        if (!staging_buffers[i] || request.opcode != Request::WRITE) continue;
-        auto copy_status =
-            copyMemory(staging_buffers[i], request.source, request.length);
-        if (!copy_status.ok()) {
-            releaseStagingBuffers(staging_pool_.get(), staging_buffers);
-            return copy_status;
+        auto& task = tasks[first + i];
+        task.request = request;
+        task.buffer = std::exchange(staging_buffers[i], nullptr);
+        if (staging_pool_ && staging_pool_->owns(task.buffer))
+            task.pool = staging_pool_;
+        if (!task.buffer || request.opcode != Request::WRITE) continue;
+        auto result = copyMemory(task.buffer, request.source, request.length,
+                                 task.pending_copy);
+        if (!result.ok()) {
+            if (!has_pending_copy && !task.pending_copy) {
+                tasks.resize(first);
+                releaseStagingBuffers(staging_pool_.get(), staging_buffers);
+                return result;
+            }
+            has_pending_copy = true;
+            task.status_word = FAILED;
         }
     }
 
-    // Phase 2: commit. Tasks are appended and SQEs prepared; from here on
+    // Phase 2: commit. The SQEs are prepared here; from here on
     // this call must not return an error. A positive short io_uring_submit()
     // means part of the batch is already in flight, and an error return
     // would make the engine's failover re-execute it. Keep flushing the
     // remainder instead; a persistent failure defers the flush of the
     // queued SQEs to the next submit attempt from getTransferStatus()'s
     // PENDING path while the tasks stay PENDING.
+    int prepared = 0;
     for (size_t i = 0; i < request_list.size(); ++i) {
-        const auto& request = request_list[i];
-        io_uring_batch->task_list.push_back(IOUringTask{});
-        auto& task =
-            io_uring_batch->task_list[io_uring_batch->task_list.size() - 1];
-        task.request = request;
-        task.status_word = TransferStatusEnum::PENDING;
-        task.buffer = staging_buffers[i];
-        if (staging_pool_ && staging_pool_->owns(task.buffer))
-            task.pool = staging_pool_;
+        auto& task = tasks[first + i];
+        const auto& request = task.request;
+        if (task.status_word == FAILED) {
+            if (!task.pending_copy) task.releaseBuffer();
+            continue;
+        }
+        ++prepared;
         // Vectored ops with a single iovec: IORING_OP_READV/WRITEV have
         // existed since kernel 5.1, while the non-vectored READ/WRITE
         // opcodes used by io_uring_prep_read()/io_uring_prep_write() require
@@ -445,14 +474,14 @@ Status IOUringTransport::submitTransferTasks(
 
     int submitted = 0;
     int transient_retries = 0;
-    while (submitted < (int)request_list.size()) {
+    while (submitted < prepared) {
         int rc = submitSqes(&io_uring_batch->ring);
         if ((rc == -EINTR || rc == -EAGAIN) && transient_retries++ < 3)
             continue;
         if (rc <= 0) {
             LOG(ERROR) << "IOUringTransport: io_uring_submit "
                        << (rc < 0 ? strerror(-rc) : "made no progress")
-                       << "; deferring " << request_list.size() - submitted
+                       << "; deferring " << prepared - submitted
                        << " SQE(s) to the poll path";
             break;
         }
@@ -495,8 +524,9 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
                 Status copy_status;
                 if (cqe_task->buffer && completed_bytes != 0 &&
                     cqe_task->request.opcode == Request::READ) {
-                    copy_status = copyMemory(cqe_task->request.source,
-                                             cqe_task->buffer, completed_bytes);
+                    copy_status =
+                        copyMemory(cqe_task->request.source, cqe_task->buffer,
+                                   completed_bytes, cqe_task->pending_copy);
                 }
                 if (!copy_status.ok()) {
                     LOG(WARNING) << "IOUringTransport: READ copyback failed: "
@@ -511,12 +541,20 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
                             : TransferStatusEnum::FAILED;
                 }
             }
-            cqe_task->releaseBuffer();
+            if (!cqe_task->pending_copy) cqe_task->releaseBuffer();
         }
         io_uring_cqe_seen(&io_uring_batch->ring, cqe);
         batch->notifyProgress();
-        status = TransferStatus{task.status_word, task.transferred_bytes};
     }
+    if (task.pending_copy) {
+        bool finished = false;
+        status = TransferStatus{PENDING, 0};
+        auto result = task.pending_copy->query(finished);
+        if (!result.ok() || !finished) return result;
+        task.pending_copy.reset();
+        task.releaseBuffer();
+    }
+    status = TransferStatus{task.status_word, task.transferred_bytes};
     return Status::OK();
 }
 

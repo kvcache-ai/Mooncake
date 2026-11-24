@@ -108,6 +108,7 @@ class FakeTransport : public Transport {
     std::atomic<int> status_calls{0};
     std::atomic<int> cancel_calls{0};
     bool cancellation_supported{true};
+    bool hold_drain{false};
     bool producer_event_supported{false};
 
     Status install(std::string&, std::shared_ptr<ControlService>,
@@ -168,6 +169,12 @@ class FakeTransport : public Transport {
 
     bool supportsCancellation() const override {
         return cancellation_supported;
+    }
+
+    Status isSubBatchDrained(SubBatchRef batch, bool& drained) override {
+        auto result = Transport::isSubBatchDrained(batch, drained);
+        if (hold_drain) drained = false;
+        return result;
     }
 
     bool supportsProducerEvent() const override {
@@ -279,6 +286,47 @@ Request makeLocalWrite(uint8_t* ptr, size_t length) {
     request.length = length;
     request.transport_hint = RDMA;
     return request;
+}
+
+TEST(RuntimeQueueDispatch, DrainIncludesFailedAttemptAfterSuccessfulFailover) {
+    for (bool queued : {false, true}) {
+        auto cfg = makeRuntimeQueueConfig(1, 1024);
+        cfg->set("enable_runtime_queue", queued);
+        TransferEngineImpl engine(cfg);
+        ASSERT_TRUE(engine.available());
+        auto rdma = std::make_shared<FakeTransport>(
+            RDMA,
+            [](const Request&, int) { return TransferStatus{FAILED, 0}; });
+        rdma->hold_drain = true;
+        auto tcp = std::make_shared<FakeTransport>(TCP);
+        engine.swapTransportForTest(RDMA, rdma);
+        engine.swapTransportForTest(TCP, tcp);
+        std::vector<uint8_t> bytes(64);
+        ASSERT_TRUE(
+            engine.registerLocalMemory(bytes.data(), bytes.size()).ok());
+        auto request = makeLocalWrite(bytes.data(), bytes.size());
+        request.transport_hint = UNSPEC;
+        auto batch = engine.allocateBatch(1);
+        ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
+        TransferStatus status{};
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        do {
+            ASSERT_TRUE(engine.progressBatch(batch, status).ok());
+        } while (status.s == PENDING &&
+                 std::chrono::steady_clock::now() < deadline);
+        EXPECT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(rdma->submit_calls.load(), 1);
+        EXPECT_EQ(tcp->submit_calls.load(), 1);
+        bool drained = true;
+        ASSERT_TRUE(engine.isBatchDrained(batch, drained).ok());
+        EXPECT_FALSE(drained);
+        rdma->hold_drain = false;
+        ASSERT_TRUE(engine.isBatchDrained(batch, drained).ok());
+        EXPECT_TRUE(drained);
+        EXPECT_TRUE(engine.freeBatch(batch).ok());
+        EXPECT_TRUE(engine.unregisterLocalMemory(bytes.data()).ok());
+    }
 }
 
 TEST(RuntimeQueueDispatch, RejectsUnsupportedProducerEventBeforeSubmission) {
@@ -696,8 +744,13 @@ TEST(RuntimeQueueDispatch, TimeoutDoesNotDispatchQueuedRequestsOfBatch) {
     // owner and frees its dispatch window slot; a refill would submit the
     // queued owner of the same batch unless it has already been canceled.
     std::atomic<int> polls{0};
+    const auto waiter = std::this_thread::get_id();
     auto fake_rdma = std::make_shared<FakeTransport>(
-        RDMA, [&polls](const Request& request, int) {
+        RDMA, [&polls, waiter](const Request& request, int) {
+            // The queue's background worker may poll before waitTransfer()
+            // starts. Only the waiter advances this timeout scenario.
+            if (std::this_thread::get_id() != waiter)
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
             if (++polls == 1) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 return TransferStatus{TransferStatusEnum::PENDING, 0};

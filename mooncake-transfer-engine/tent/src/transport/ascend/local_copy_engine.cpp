@@ -58,21 +58,28 @@ LocalCopyEngine::ContextGuard::~ContextGuard() {
 LocalCopyEngine::~LocalCopyEngine() { finalize(); }
 
 void LocalCopyEngine::destroyStreamsLocked() {
-    for (aclrtStream stream : streams_) {
-        if (stream == nullptr) {
-            continue;
+    for (size_t i = 0; i < streams_.size(); ++i) {
+        auto& stream = streams_[i];
+        if (!stream) continue;
+        const bool aborted = aclrtStreamAbort(stream) == ACL_ERROR_NONE;
+        if (aclrtDestroyStream(stream) == ACL_ERROR_NONE) stream = nullptr;
+        if (!aborted && stream) continue;
+        // A partial submission may never have queued its completion flag.
+        for (auto& entry : groups_) {
+            auto& group = *entry.second;
+            if (i < group.stream_count) *flagAt(group, i) = kDoneFlag;
         }
-        // A failed submit or timeout can leave work queued on the old stream.
-        // Abort it before destroying the stream so a later device copy cannot
-        // observe stale work from the previous generation.
-        (void)aclrtStreamAbort(stream);
-        (void)aclrtDestroyStream(stream);
     }
-    streams_.clear();
+    retiring_ = std::any_of(streams_.begin(), streams_.end(),
+                            [](aclrtStream s) { return s != nullptr; });
+    if (!retiring_) streams_.clear();
+    for (auto& entry : groups_) {
+        auto& group = *entry.second;
+        if (group.counted) finishIfDrained(group);
+    }
 }
 
 Status LocalCopyEngine::createStreamsLocked() {
-    destroyStreamsLocked();
     streams_.reserve(kCopyStreamCount);
     for (size_t i = 0; i < kCopyStreamCount; ++i) {
         aclrtStream stream = nullptr;
@@ -107,18 +114,10 @@ Status LocalCopyEngine::initialize(aclrtContext context, int32_t device_id,
     if (!lazy_streams) {
         CHECK_STATUS(createStreamsLocked());
     }
-    auto tear_down = [this]() {
-        destroyStreamsLocked();
-        if (device_one_ != nullptr) {
-            (void)aclrtFree(device_one_);
-            device_one_ = nullptr;
-        }
-    };
     auto ret = aclrtMalloc(&device_one_, kFlagBytes, ACL_MEM_MALLOC_HUGE_FIRST);
     if (ret != ACL_ERROR_NONE || device_one_ == nullptr) {
         device_one_ = nullptr;
         LOG(ERROR) << "aclrtMalloc device flag failed, ret:" << ret;
-        tear_down();
         return Status::InternalError(
             "Alloc local copy device flag failed" LOC_MARK);
     }
@@ -127,7 +126,6 @@ Status LocalCopyEngine::initialize(aclrtContext context, int32_t device_id,
                       ACL_MEMCPY_HOST_TO_DEVICE);
     if (ret != ACL_ERROR_NONE) {
         LOG(ERROR) << "aclrtMemcpy device flag failed, ret:" << ret;
-        tear_down();
         return Status::InternalError(
             "Init local copy device flag failed" LOC_MARK);
     }
@@ -135,26 +133,37 @@ Status LocalCopyEngine::initialize(aclrtContext context, int32_t device_id,
     return Status::OK();
 }
 
-void LocalCopyEngine::finalize() {
+Status LocalCopyEngine::finalize() {
     std::lock_guard<std::mutex> lock(mutex_);
-    ContextGuard guard(context_);
     task_runner_ = nullptr;
     // Abort and destroy the streams before releasing the flags: a stream that
     // is still running may still be writing its group's host flag, and freeing
     // the flag first would leave that write pointing at released memory.
+    initialized_ = false;
+    if (streams_.empty() && groups_.empty() && !device_one_)
+        return Status::OK();
+    ContextGuard guard(context_);
+    if (!guard.ok())
+        return Status::InternalError("Set ACL context failed" LOC_MARK);
     destroyStreamsLocked();
-    for (auto& [handle, group] : groups_) {
-        (void)handle;
-        if (group) {
-            freeHostFlags(*group);
-        }
+    if (retiring_) {
+        return Status::InternalError(
+            "Local copy streams still own their completion flags" LOC_MARK);
     }
-    groups_.clear();
+    while (!groups_.empty()) {
+        auto it = groups_.begin();
+        if (!freeHostFlags(*it->second))
+            return Status::InternalError(
+                "Free local copy host flags failed" LOC_MARK);
+        groups_.erase(it);
+    }
     if (device_one_ != nullptr) {
-        (void)aclrtFree(device_one_);
+        if (aclrtFree(device_one_) != ACL_ERROR_NONE)
+            return Status::InternalError(
+                "Free local copy device flag failed" LOC_MARK);
         device_one_ = nullptr;
     }
-    initialized_ = false;
+    return Status::OK();
 }
 
 void LocalCopyEngine::setTaskRunner(TaskRunner runner) {
@@ -177,16 +186,16 @@ Status LocalCopyEngine::allocHostFlags(Group& group) {
     }
     group.host_flags = ptr;
     for (size_t i = 0; i < group.stream_count; ++i) {
-        *flagAt(group, i) = 0;
+        *flagAt(group, i) = kDoneFlag;
     }
     return Status::OK();
 }
 
-void LocalCopyEngine::freeHostFlags(Group& group) {
-    if (group.host_flags != nullptr) {
-        (void)aclrtFreeHost(group.host_flags);
-        group.host_flags = nullptr;
-    }
+bool LocalCopyEngine::freeHostFlags(Group& group) {
+    if (group.host_flags && aclrtFreeHost(group.host_flags) != ACL_ERROR_NONE)
+        return false;
+    group.host_flags = nullptr;
+    return true;
 }
 
 aclrtMemcpyKind LocalCopyEngine::memcpyKind(void* src, void* dst) {
@@ -214,33 +223,17 @@ aclrtMemcpyKind LocalCopyEngine::memcpyKind(void* src, void* dst) {
     return ACL_MEMCPY_DEVICE_TO_HOST;
 }
 
-std::vector<void*> LocalCopyEngine::failAndRecreateLocked() {
-    std::vector<void*> handles;
-    handles.reserve(groups_.size());
-    for (auto& [handle, group] : groups_) {
-        if (group) {
-            group->failed = true;
-        }
-        handles.push_back(handle);
+void LocalCopyEngine::failStreamsLocked(TransferStatusEnum failure) {
+    for (auto& entry : groups_) {
+        auto& group = *entry.second;
+        if (group.failure == PENDING) group.failure = failure;
     }
-    auto status = createStreamsLocked();
-    if (!status.ok()) {
-        LOG(ERROR) << "Recreate local copy streams failed: "
-                   << status.ToString();
-    }
-    return handles;
-}
-
-std::vector<void*> LocalCopyEngine::failAndRecreate() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    ContextGuard guard(context_);
-    return failAndRecreateLocked();
+    retiring_ = true;
 }
 
 Status LocalCopyEngine::submit(bool write, const std::vector<HixlOpDesc>& ops,
-                               void*& req, std::vector<void*>& failed_handles) {
+                               void*& req) {
     req = nullptr;
-    failed_handles.clear();
     std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_ || device_one_ == nullptr) {
         return Status::InternalError(
@@ -252,25 +245,28 @@ Status LocalCopyEngine::submit(bool write, const std::vector<HixlOpDesc>& ops,
     }
     // An engine of a multi-engine process creates its six streams on its first
     // submit, under the lock and with the device context already bound.
+    if (retiring_) {
+        destroyStreamsLocked();
+        if (retiring_)
+            return Status::InternalError(
+                "Local copy streams still retiring" LOC_MARK);
+    }
     if (streams_.empty()) {
         CHECK_STATUS(createStreamsLocked());
     }
 
-    auto group = std::make_unique<Group>();
+    auto owned = std::make_unique<Group>();
+    auto* group = owned.get();
+    groups_.emplace(group, std::move(owned));
     // An empty group still takes one stream, so that its flag reports the
     // copies that preceded it on that stream.
     group->stream_count =
         std::min(streams_.size(), std::max<size_t>(ops.size(), 1));
-    CHECK_STATUS(allocHostFlags(*group));
-
-    // Abort and destroy the streams first, then release this group's flags.
-    // failAndRecreateLocked() also fails every other group on the streams, so
-    // it has to run on every failure path exactly once; freeing the flags here
-    // cannot double-free because this group is not in groups_ yet.
-    auto fail_stream = [&]() {
-        failed_handles = failAndRecreateLocked();
-        freeHostFlags(*group);
-    };
+    auto allocated = allocHostFlags(*group);
+    if (!allocated.ok()) {
+        groups_.erase(group);
+        return allocated;
+    }
 
     // Each stream takes every stream_count-th op, then closes with the flag
     // copy. The stream keeps those in order, so the flag landing on the host
@@ -278,6 +274,8 @@ Status LocalCopyEngine::submit(bool write, const std::vector<HixlOpDesc>& ops,
     const size_t stream_count = group->stream_count;
     auto issue_stream = [&](size_t stream_index) {
         aclrtStream stream = streams_[stream_index];
+        auto* flag = flagAt(*group, stream_index);
+        *flag = 0;
         for (size_t i = stream_index; i < ops.size(); i += stream_count) {
             const auto& op = ops[i];
             void* local = reinterpret_cast<void*>(op.local_addr);
@@ -287,16 +285,18 @@ Status LocalCopyEngine::submit(bool write, const std::vector<HixlOpDesc>& ops,
             auto ret = aclrtMemcpyAsync(dst, op.len, src, op.len,
                                         memcpyKind(src, dst), stream);
             if (ret != ACL_ERROR_NONE) {
+                if (i == stream_index) *flag = kDoneFlag;
                 LOG(ERROR) << "aclrtMemcpyAsync failed, ret:" << ret
                            << ", errmsg:" << aclGetRecentErrMsg();
                 return false;
             }
         }
-        auto* host_flag = const_cast<uint32_t*>(flagAt(*group, stream_index));
+        auto* host_flag = const_cast<uint32_t*>(flag);
         auto ret =
             aclrtMemcpyAsync(host_flag, kFlagBytes, device_one_, kFlagBytes,
                              ACL_MEMCPY_DEVICE_TO_HOST, stream);
         if (ret != ACL_ERROR_NONE) {
+            if (stream_index >= ops.size()) *flag = kDoneFlag;
             LOG(ERROR) << "aclrtMemcpyAsync host flag failed, ret:" << ret
                        << ", errmsg:" << aclGetRecentErrMsg();
             return false;
@@ -304,13 +304,25 @@ Status LocalCopyEngine::submit(bool write, const std::vector<HixlOpDesc>& ops,
         return true;
     };
 
-    if (!issueGroupLocked(stream_count, issue_stream)) {
-        fail_stream();
-        return Status::InternalError("aclrtMemcpyAsync failed" LOC_MARK);
+    bool issued = false;
+    try {
+        issued = issueGroupLocked(stream_count, issue_stream);
+    } catch (const std::bad_alloc&) {
+        // Allocating the dispatch state can fail before the first worker runs.
+    }
+    if (!issued) {
+        failStreamsLocked(FAILED);
+        destroyStreamsLocked();
+        if (finishIfDrained(*group)) {
+            if (freeHostFlags(*group)) groups_.erase(group);
+            return Status::InternalError("aclrtMemcpyAsync failed" LOC_MARK);
+        }
     }
 
-    req = group.get();
-    groups_[req] = std::move(group);
+    // The submitter releases rejected groups. Accepted groups own the
+    // reservation until the last stream using their buffers is done.
+    group->counted = true;
+    req = group;
     return Status::OK();
 }
 
@@ -335,7 +347,7 @@ bool LocalCopyEngine::issueGroupLocked(
     };
     auto state = std::make_shared<IssueState>();
     for (size_t i = 0; i < stream_count; ++i) {
-        task_runner_([this, &issue_stream, state, i]() {
+        auto issue = [this, &issue_stream, state, i]() {
             // The worker issues on this engine's streams, so it needs the
             // engine's context, not whatever the pool thread last had.
             bool ok = false;
@@ -343,8 +355,9 @@ bool LocalCopyEngine::issueGroupLocked(
                 ContextGuard worker_guard(context_);
                 ok = worker_guard.ok() && issue_stream(i);
             } catch (...) {
-                // The submitter waits on this counter, so a thrown task must
-                // still report itself instead of leaving it blocked forever.
+                // The submitter waits on this counter, so a thrown task
+                // must still report itself instead of leaving it blocked
+                // forever.
                 ok = false;
             }
             {
@@ -353,7 +366,15 @@ bool LocalCopyEngine::issueGroupLocked(
                 ++state->done;
             }
             state->cv.notify_one();
-        });
+        };
+        try {
+            task_runner_(std::move(issue));
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->failed = true;
+            state->done += stream_count - i;
+            break;
+        }
     }
     std::unique_lock<std::mutex> wait_lock(state->mutex);
     state->cv.wait(wait_lock, [&state, stream_count] {
@@ -362,25 +383,28 @@ bool LocalCopyEngine::issueGroupLocked(
     return !state->failed;
 }
 
-TransferStatusEnum LocalCopyEngine::poll(void* req) {
+TransferStatusEnum LocalCopyEngine::poll(void* req, bool timed_out) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = groups_.find(req);
     if (it == groups_.end() || !it->second) {
         return TransferStatusEnum::FAILED;
     }
-    if (it->second->failed) {
-        return TransferStatusEnum::FAILED;
+    auto& group = *it->second;
+    if (timed_out && group.failure == PENDING) failStreamsLocked(TIMEOUT);
+    if (retiring_) {
+        ContextGuard guard(context_);
+        if (guard.ok()) destroyStreamsLocked();
     }
-    const auto& group = *it->second;
-    if (group.host_flags == nullptr) {
-        return TransferStatusEnum::PENDING;
-    }
+    if (!finishIfDrained(group)) return PENDING;
+    return group.failure == PENDING ? COMPLETED : group.failure;
+}
+
+bool LocalCopyEngine::finishIfDrained(Group& group) {
     for (size_t i = 0; i < group.stream_count; ++i) {
-        if (*flagAt(group, i) != kDoneFlag) {
-            return TransferStatusEnum::PENDING;
-        }
+        if (*flagAt(group, i) != kDoneFlag) return false;
     }
-    return TransferStatusEnum::COMPLETED;
+    if (std::exchange(group.counted, false)) release_inflight_();
+    return true;
 }
 
 void LocalCopyEngine::release(void* req) {
@@ -389,10 +413,7 @@ void LocalCopyEngine::release(void* req) {
     if (it == groups_.end()) {
         return;
     }
-    if (it->second) {
-        freeHostFlags(*it->second);
-    }
-    groups_.erase(it);
+    if (freeHostFlags(*it->second)) groups_.erase(it);
 }
 
 }  // namespace tent
