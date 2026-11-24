@@ -101,12 +101,13 @@ MasterServiceConfig DeathProbeConfig(int64_t active_ttl_sec = 1,
                                      int64_t suspicion_ttl_sec = 3600,
                                      int64_t interval_ms = 100,
                                      uint32_t timeout_ms = 200,
-                                     uint32_t failures_threshold = 2) {
+                                     uint32_t failures_threshold = 2,
+                                     bool enable_worker = true) {
     return MasterServiceConfig::builder()
         .set_memory_allocator(BufferAllocatorType::OFFSET)
         .set_client_active_ttl_sec(active_ttl_sec)
         .set_client_suspicion_ttl_sec(suspicion_ttl_sec)
-        .set_client_death_probe_enable(true)
+        .set_client_death_probe_enable(enable_worker)
         .set_client_death_probe_interval_ms(interval_ms)
         .set_client_death_probe_timeout_ms(timeout_ms)
         .set_client_death_probe_failures_threshold(failures_threshold)
@@ -185,7 +186,9 @@ TEST_F(MasterServiceTest, DeathProbeKeepsReachableSuspectedClient) {
 }
 
 TEST_F(MasterServiceTest, DeathProbeRetiresSegmentlessSuspectedClient) {
-    MasterService service(DeathProbeConfig(/*interval_ms=*/50));
+    MasterService service(DeathProbeConfig(/*active_ttl_sec=*/1,
+                                           /*suspicion_ttl_sec=*/3600,
+                                           /*interval_ms=*/50));
     Segment segment = MakeSegment("death_probe_segmentless_segment");
     const UUID client_id = generate_uuid();
     ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
@@ -206,6 +209,104 @@ TEST_F(MasterServiceTest, DeathProbeRetiresSegmentlessSuspectedClient) {
             return FindClientLivenessForTest(service, client_id) == nullptr;
         },
         std::chrono::seconds(5));
+}
+
+// Moves an ACTIVE record straight to SUSPECTED so a single synchronous probe
+// round sees it, without waiting for the active-TTL monitor.
+void MarkSuspectedForTest(MasterService& service, const UUID& client_id) {
+    const auto record = ClientSessionRegistryTestPeer::Find(
+        MasterServiceTestPeer::ClientSessions(service), client_id);
+    ASSERT_NE(record, nullptr);
+    ASSERT_EQ(record->Evaluate(ClientLivenessRecord::Clock::now(),
+                               std::chrono::seconds::zero(),
+                               std::chrono::hours(1)),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+}
+
+// The refused branch erases the probe bookkeeping before publishing OFFLINE.
+// Writing the next-probe deadline through the erased node was a use-after-free.
+TEST_F(MasterServiceTest, DeathProbeErasesBookkeepingOnRefusedRetirement) {
+    MasterService service(
+        DeathProbeConfig(/*active_ttl_sec=*/1, /*suspicion_ttl_sec=*/3600,
+                         /*interval_ms=*/100, /*timeout_ms=*/200,
+                         /*failures_threshold=*/2, /*enable_worker=*/false));
+    MasterServiceTestPeer peer(service);
+    const uint32_t dead_port = TakeFreeLocalPort();
+    Segment segment = MakeSegment("death_probe_refused_erase_segment");
+    segment.te_endpoint = "127.0.0.1:" + std::to_string(dead_port);
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    MarkSuspectedForTest(service, client_id);
+    peer.RunClientDeathProbeRoundForTesting();
+
+    EXPECT_FALSE(peer.ClientDeathProbeTrackedForTesting(client_id));
+    WaitUntil(
+        [&] {
+            return FindClientLivenessForTest(service, client_id) == nullptr;
+        },
+        std::chrono::seconds(5));
+    EXPECT_FALSE(service.QuerySegmentStatusById(segment.id).has_value());
+
+    // A later round must not resurrect or touch the retired bookkeeping.
+    peer.RunClientDeathProbeRoundForTesting();
+    EXPECT_FALSE(peer.ClientDeathProbeTrackedForTesting(client_id));
+}
+
+// The timeout-threshold branch also erases bookkeeping before publishing
+// OFFLINE; the erased node must never be dereferenced afterwards.
+TEST_F(MasterServiceTest, DeathProbeErasesBookkeepingOnTimeoutRetirement) {
+    MasterService service(
+        DeathProbeConfig(/*active_ttl_sec=*/1, /*suspicion_ttl_sec=*/3600,
+                         /*interval_ms=*/100, /*timeout_ms=*/100,
+                         /*failures_threshold=*/1, /*enable_worker=*/false));
+    MasterServiceTestPeer peer(service);
+    Segment segment = MakeSegment("death_probe_timeout_erase_segment");
+    // RFC 5737 documentation range: no route answers, so the probe times out.
+    segment.te_endpoint = "192.0.2.1:8341";
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    MarkSuspectedForTest(service, client_id);
+    peer.RunClientDeathProbeRoundForTesting();
+
+    EXPECT_FALSE(peer.ClientDeathProbeTrackedForTesting(client_id));
+    WaitUntil(
+        [&] {
+            return FindClientLivenessForTest(service, client_id) == nullptr;
+        },
+        std::chrono::seconds(5));
+    EXPECT_FALSE(service.QuerySegmentStatusById(segment.id).has_value());
+}
+
+// The retained-node path keeps the probe bookkeeping, resets failures and must
+// still advance the next-probe deadline on the live node.
+TEST_F(MasterServiceTest, DeathProbeRetainsBookkeepingForReachableClient) {
+    MasterService service(
+        DeathProbeConfig(/*active_ttl_sec=*/1, /*suspicion_ttl_sec=*/3600,
+                         /*interval_ms=*/100, /*timeout_ms=*/200,
+                         /*failures_threshold=*/2, /*enable_worker=*/false));
+    MasterServiceTestPeer peer(service);
+    LoopbackListener listener;
+    Segment segment = MakeSegment("death_probe_reachable_retain_segment");
+    segment.te_endpoint = "127.0.0.1:" + std::to_string(listener.Port());
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    MarkSuspectedForTest(service, client_id);
+    peer.RunClientDeathProbeRoundForTesting();
+
+    EXPECT_TRUE(peer.ClientDeathProbeTrackedForTesting(client_id));
+    EXPECT_EQ(peer.ClientDeathProbeFailuresForTesting(client_id), 0u);
+    const auto next_probe_at = peer.ClientDeathProbeNextProbeAtForTesting(
+        client_id);
+    ASSERT_TRUE(next_probe_at.has_value());
+    EXPECT_GT(*next_probe_at, ClientLivenessRecord::Clock::now());
+
+    const auto record = FindClientLivenessForTest(service, client_id);
+    ASSERT_NE(record, nullptr);
+    EXPECT_EQ(record->state(), ClientLivenessState::SUSPECTED);
+    EXPECT_TRUE(service.QuerySegmentStatusById(segment.id).has_value());
 }
 
 TEST_F(MasterServiceTest, DeathProbeRetiresSuspectedClientAfterTimeouts) {

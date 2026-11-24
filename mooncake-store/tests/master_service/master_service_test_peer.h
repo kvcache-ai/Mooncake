@@ -1,5 +1,8 @@
 #pragma once
 
+#include <chrono>
+#include <mutex>
+#include <optional>
 #include <utility>
 
 #include "client_session/client_session_registry_test_peer.h"
@@ -74,6 +77,31 @@ class MasterServiceTestPeer {
     MasterService::ClientDeathProbeOutcome ProbeClientEndpointsForTesting(
         const std::vector<std::string>& endpoints, uint32_t timeout_ms) {
         return service_.ProbeClientEndpoints(endpoints, timeout_ms);
+    }
+
+    // Whether the death probe still tracks this client. A retired client's
+    // bookkeeping must be erased; a retained one must keep its node.
+    bool ClientDeathProbeTrackedForTesting(const UUID& client_id) {
+        std::lock_guard<std::mutex> lock(service_.client_death_probe_mutex_);
+        return service_.client_death_probes_.count(client_id) != 0;
+    }
+
+    uint32_t ClientDeathProbeFailuresForTesting(const UUID& client_id) {
+        std::lock_guard<std::mutex> lock(service_.client_death_probe_mutex_);
+        auto it = service_.client_death_probes_.find(client_id);
+        return it == service_.client_death_probes_.end()
+                   ? 0
+                   : it->second.consecutive_failures;
+    }
+
+    std::optional<std::chrono::steady_clock::time_point>
+    ClientDeathProbeNextProbeAtForTesting(const UUID& client_id) {
+        std::lock_guard<std::mutex> lock(service_.client_death_probe_mutex_);
+        auto it = service_.client_death_probes_.find(client_id);
+        if (it == service_.client_death_probes_.end()) {
+            return std::nullopt;
+        }
+        return it->second.next_probe_at;
     }
 
     void RunNoFBatchEvictForTesting(double evict_ratio_target,

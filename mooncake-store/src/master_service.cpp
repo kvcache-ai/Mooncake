@@ -993,8 +993,13 @@ MasterService::~MasterService() {
     eviction_running_ = false;
     // Stop the death probe before the registry stops delivering transitions:
     // an OFFLINE it published afterwards would be dropped and its terminal
-    // cleanup would never run.
+    // cleanup would never run. Clearing the flag does not end a round that is
+    // already in flight, so join the thread first; only a joined probe thread
+    // is guaranteed not to publish after the session plane stops.
     client_death_probe_running_ = false;
+    if (client_death_probe_thread_.joinable()) {
+        client_death_probe_thread_.join();
+    }
     // Stop publishing transitions and deliver what is already queued, while
     // the offboarding worker can still accept the resulting jobs and the
     // members the listener touches are still alive.
@@ -1046,9 +1051,6 @@ MasterService::~MasterService() {
     }
     if (job_dispatch_thread_.joinable()) {
         job_dispatch_thread_.join();
-    }
-    if (client_death_probe_thread_.joinable()) {
-        client_death_probe_thread_.join();
     }
     dynamic_replication_.Stop();
 
@@ -10288,6 +10290,7 @@ void MasterService::ClientDeathProbeRound() {
             auto& probe = it->second;
             if (outcome == ClientDeathProbeOutcome::kReachable) {
                 probe.consecutive_failures = 0;
+                probe.next_probe_at = now + client_death_probe_interval_ms_;
             } else if (outcome == ClientDeathProbeOutcome::kRefused ||
                        outcome == ClientDeathProbeOutcome::kNoSegments) {
                 // A refused connection proves the owner process is gone;
@@ -10300,9 +10303,11 @@ void MasterService::ClientDeathProbeRound() {
                     client_death_probe_failures_threshold_) {
                     client_death_probes_.erase(it);
                     force_offline = true;
+                } else {
+                    probe.next_probe_at =
+                        now + client_death_probe_interval_ms_;
                 }
             }
-            probe.next_probe_at = now + client_death_probe_interval_ms_;
         }
 
         if (force_offline) {
