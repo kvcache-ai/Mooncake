@@ -95,9 +95,9 @@ int main() {
         expect(batch.size() == 2, "one binary key must not drop the other key");
         expect(py::cast<int>(batch["mooncake_key"]) == 1,
                "str key lookup failed");
-        expect(py::cast<int>(batch[py::bytes(binary.data(), binary.size())]) ==
-                   2,
-               "bytes key lookup failed");
+        expect(
+            py::cast<int>(batch[py::bytes(binary.data(), binary.size())]) == 2,
+            "bytes key lookup failed");
 
         bool map_caster_rejects_binary = false;
         try {
