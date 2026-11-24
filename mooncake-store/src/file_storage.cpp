@@ -43,20 +43,27 @@ void AppendFlightKeyUint64(std::string& destination, uint64_t value) {
 }
 
 std::optional<std::string> BuildColdReadFlightKey(
-    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
-    if (keys.empty() || keys.size() != sizes.size()) return std::nullopt;
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+    const std::vector<ObjectIncarnation>& expected_incarnations) {
+    const bool has_versions = !expected_incarnations.empty();
+    if (keys.empty() || keys.size() != sizes.size() ||
+        (has_versions && keys.size() != expected_incarnations.size())) {
+        return std::nullopt;
+    }
 
     std::vector<size_t> order(keys.size());
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(),
               [&](size_t lhs, size_t rhs) { return keys[lhs] < keys[rhs]; });
 
-    size_t encoded_size = sizeof(uint64_t);
+    size_t encoded_size = sizeof(uint64_t) + 1;
+    const size_t fields_per_key = has_versions ? 4 : 2;
     for (const auto& key : keys) {
-        encoded_size += 2 * sizeof(uint64_t) + key.size();
+        encoded_size += fields_per_key * sizeof(uint64_t) + key.size();
     }
     std::string flight_key;
     flight_key.reserve(encoded_size);
+    flight_key.push_back(has_versions ? '\1' : '\0');
     AppendFlightKeyUint64(flight_key, keys.size());
     for (size_t i = 0; i < order.size(); ++i) {
         const size_t index = order[i];
@@ -68,6 +75,11 @@ std::optional<std::string> BuildColdReadFlightKey(
         AppendFlightKeyUint64(flight_key, keys[index].size());
         flight_key.append(keys[index]);
         AppendFlightKeyUint64(flight_key, static_cast<uint64_t>(sizes[index]));
+        if (has_versions) {
+            const auto& version = expected_incarnations[index];
+            AppendFlightKeyUint64(flight_key, version.high);
+            AppendFlightKeyUint64(flight_key, version.low);
+        }
     }
     return flight_key;
 }
@@ -79,11 +91,13 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     tasks.reserve(storage_keys.size());
     for (size_t i = 0; i < storage_keys.size(); ++i) {
         auto [tenant_id, key] = TenantId::ParseScopedKey(storage_keys[i]);
-        const int64_t size =
-            i < metadatas.size() ? metadatas[i].data_size : int64_t{0};
-        tasks.push_back(OffloadTaskItem{.tenant_id = tenant_id.value(),
-                                        .key = std::move(key),
-                                        .size = size});
+        OffloadTaskItem task{
+            .tenant_id = tenant_id.value(), .key = std::move(key), .size = 0};
+        if (i < metadatas.size()) {
+            task.size = metadatas[i].data_size;
+            task.object_incarnation = metadatas[i].object_incarnation;
+        }
+        tasks.emplace_back(std::move(task));
     }
     return tasks;
 }
@@ -286,7 +300,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         MutexLocker locker(&offloading_mutex_);
         enable_offloading_ = enable_offloading_result.value();
         auto mount_file_storage_result =
-            client_->MountLocalDiskSegment(enable_offloading_);
+            MountLocalDiskSegment(enable_offloading_);
         if (!mount_file_storage_result) {
             LOG(ERROR) << "Failed to mount file storage: "
                        << mount_file_storage_result.error();
@@ -357,8 +371,27 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
 }
 
 tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
-FileStorage::LoadBatch(const std::vector<std::string>& keys,
-                       const std::vector<int64_t>& sizes, bool prefer_pinned) {
+FileStorage::LoadBatch(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+    bool prefer_pinned,
+    const std::vector<ObjectIncarnation>& expected_incarnations) {
+    StorageBackendInterface::ObjectVersions versions;
+    if (!expected_incarnations.empty()) {
+        if (keys.size() != expected_incarnations.size()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        versions.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const auto [it, inserted] =
+                versions.emplace(keys[i], expected_incarnations[i]);
+            if (!inserted && it->second != expected_incarnations[i]) {
+                return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+            }
+        }
+        std::erase_if(versions,
+                      [](const auto& item) { return item.second.IsZero(); });
+    }
+
     const bool use_pinned = prefer_pinned && pinned_restore_arena_allocator_;
     auto& allocator = use_pinned ? *pinned_restore_arena_allocator_
                                  : *client_buffer_allocator_;
@@ -373,7 +406,17 @@ FileStorage::LoadBatch(const std::vector<std::string>& keys,
         return tl::make_unexpected(allocate_res.error());
     }
     auto allocated_batch = std::move(allocate_res.value());
-    auto result = BatchLoad(allocated_batch->slices);
+    if (!expected_incarnations.empty()) {
+        // AllocateBatch shares one slice per key. Repeated keys can share
+        // that slice only when all corresponding requests have its size.
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (allocated_batch->slices.at(keys[i]).size !=
+                static_cast<size_t>(sizes[i])) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+    }
+    auto result = BatchLoad(allocated_batch->slices, versions);
     if (!result) {
         LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
         return tl::make_unexpected(result.error());
@@ -394,13 +437,15 @@ FileStorage::LoadBatch(const std::vector<std::string>& keys,
 }
 
 tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
-FileStorage::LoadRanges(const std::vector<std::string>& keys,
-                        const std::vector<int64_t>& offsets,
-                        const std::vector<int64_t>& lengths,
-                        const std::vector<int64_t>& object_sizes,
-                        bool prefer_pinned) {
+FileStorage::LoadRanges(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& offsets,
+    const std::vector<int64_t>& lengths,
+    const std::vector<int64_t>& object_sizes, bool prefer_pinned,
+    const std::vector<ObjectIncarnation>& expected_incarnations) {
     if (keys.size() != offsets.size() || keys.size() != lengths.size() ||
-        keys.size() != object_sizes.size()) {
+        keys.size() != object_sizes.size() ||
+        (!expected_incarnations.empty() &&
+         keys.size() != expected_incarnations.size())) {
         LOG(ERROR) << "Mismatched range load arguments";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -435,10 +480,23 @@ FileStorage::LoadRanges(const std::vector<std::string>& keys,
         if (it == allocated_batch->slices.end()) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
-        spans.emplace(keys[i],
-                      StorageValueSpan{static_cast<uint64_t>(offsets[i]),
-                                       static_cast<uint64_t>(object_sizes[i]),
-                                       it->second});
+        const auto incarnation = expected_incarnations.empty()
+                                     ? ObjectIncarnation{}
+                                     : expected_incarnations[i];
+        const auto [span, inserted] = spans.emplace(
+            keys[i], StorageValueSpan{static_cast<uint64_t>(offsets[i]),
+                                      static_cast<uint64_t>(object_sizes[i]),
+                                      it->second, incarnation});
+        if (!inserted && span->second.expected_incarnation != incarnation) {
+            return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+        }
+        if (!expected_incarnations.empty() && !inserted &&
+            (span->second.offset != static_cast<uint64_t>(offsets[i]) ||
+             span->second.object_size !=
+                 static_cast<uint64_t>(object_sizes[i]) ||
+             span->second.slice.size != static_cast<size_t>(lengths[i]))) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
     auto result = BatchLoadSpans(spans);
     if (!result) {
@@ -455,11 +513,12 @@ FileStorage::LoadRanges(const std::vector<std::string>& keys,
 }
 
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGetOnce(
-    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+    const std::vector<ObjectIncarnation>& expected_incarnations) {
     auto start_time = std::chrono::steady_clock::now();
     auto lease_timeout =
         start_time + std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
-    auto load_result = LoadBatch(keys, sizes, false);
+    auto load_result = LoadBatch(keys, sizes, false, expected_incarnations);
     if (!load_result) return tl::make_unexpected(load_result.error());
 
     auto allocated_batch = std::move(load_result.value());
@@ -539,9 +598,10 @@ struct FileStorage::ColdReadInvalidation {
 };
 
 tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
-FileStorage::LoadBatchShared(const std::vector<std::string>& keys,
-                             const std::vector<int64_t>& sizes,
-                             bool prefer_pinned, std::string flight_key) {
+FileStorage::LoadBatchShared(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+    bool prefer_pinned, std::string flight_key,
+    const std::vector<ObjectIncarnation>& expected_incarnations) {
     // Pinned and ordinary staging are separate source-buffer contracts.
     flight_key.push_back(prefer_pinned ? '\1' : '\0');
     auto flight = inflight_cold_reads_.Acquire(flight_key);
@@ -550,10 +610,10 @@ FileStorage::LoadBatchShared(const std::vector<std::string>& keys,
             return flight.Result().get();
         } catch (const std::future_error&) {
             // Preserve the existing abandoned-producer fallback.
-            return LoadBatch(keys, sizes, prefer_pinned);
+            return LoadBatch(keys, sizes, prefer_pinned, expected_incarnations);
         }
     }
-    auto result = LoadBatch(keys, sizes, prefer_pinned);
+    auto result = LoadBatch(keys, sizes, prefer_pinned, expected_incarnations);
     flight.Publish(result);
     return result;
 }
@@ -575,13 +635,15 @@ FileStorage::StagingPointersInOrder(const AllocatedBatch& batch,
 }
 
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
-    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
-    auto key = BuildColdReadFlightKey(keys, sizes);
-    if (!key) return BatchGetOnce(keys, sizes);
-    auto loaded = LoadBatchShared(keys, sizes, false, std::move(*key));
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+    const std::vector<ObjectIncarnation>& expected_incarnations) {
+    auto key = BuildColdReadFlightKey(keys, sizes, expected_incarnations);
+    if (!key) return BatchGetOnce(keys, sizes, expected_incarnations);
+    auto loaded = LoadBatchShared(keys, sizes, false, std::move(*key),
+                                  expected_incarnations);
     if (!loaded) return tl::make_unexpected(loaded.error());
     auto pointers = StagingPointersInOrder(**loaded, keys, sizes);
-    if (!pointers) return BatchGetOnce(keys, sizes);
+    if (!pointers) return BatchGetOnce(keys, sizes, expected_incarnations);
     // Register only the actual consumer's alias, not a hidden producer id.
     return ShareStagingBuffer(*loaded, std::move(*pointers));
 }
@@ -608,11 +670,13 @@ FileStorage::BatchGetResult FileStorage::ShareStagingBuffer(
 }
 
 tl::expected<FileStorage::LocalBatchResult, ErrorCode>
-FileStorage::BatchGetLocal(const std::vector<std::string>& keys,
-                           const std::vector<int64_t>& sizes) {
-    auto key = BuildColdReadFlightKey(keys, sizes);
-    auto loaded = key ? LoadBatchShared(keys, sizes, true, *key)
-                      : LoadBatch(keys, sizes, true);
+FileStorage::BatchGetLocal(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+    const std::vector<ObjectIncarnation>& expected_incarnations) {
+    auto key = BuildColdReadFlightKey(keys, sizes, expected_incarnations);
+    auto loaded = key ? LoadBatchShared(keys, sizes, true, std::move(*key),
+                                        expected_incarnations)
+                      : LoadBatch(keys, sizes, true, expected_incarnations);
     if (!loaded) return tl::make_unexpected(loaded.error());
     LocalBatchResult result;
     if (key) {
@@ -628,14 +692,16 @@ FileStorage::BatchGetLocal(const std::vector<std::string>& keys,
 }
 
 tl::expected<FileStorage::BatchGetResult, ErrorCode>
-FileStorage::BatchGetRanges(const std::vector<std::string>& keys,
-                            const std::vector<int64_t>& offsets,
-                            const std::vector<int64_t>& lengths,
-                            const std::vector<int64_t>& object_sizes) {
+FileStorage::BatchGetRanges(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& offsets,
+    const std::vector<int64_t>& lengths,
+    const std::vector<int64_t>& object_sizes,
+    const std::vector<ObjectIncarnation>& expected_incarnations) {
     const auto lease_timeout =
         std::chrono::steady_clock::now() +
         std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
-    auto load_result = LoadRanges(keys, offsets, lengths, object_sizes, false);
+    auto load_result = LoadRanges(keys, offsets, lengths, object_sizes, false,
+                                  expected_incarnations);
     if (!load_result) return tl::make_unexpected(load_result.error());
 
     auto allocated_batch = std::move(load_result.value());
@@ -649,11 +715,13 @@ FileStorage::BatchGetRanges(const std::vector<std::string>& keys,
 }
 
 tl::expected<FileStorage::LocalBatchResult, ErrorCode>
-FileStorage::BatchGetLocalRanges(const std::vector<std::string>& keys,
-                                 const std::vector<int64_t>& offsets,
-                                 const std::vector<int64_t>& lengths,
-                                 const std::vector<int64_t>& object_sizes) {
-    auto load_result = LoadRanges(keys, offsets, lengths, object_sizes, true);
+FileStorage::BatchGetLocalRanges(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& offsets,
+    const std::vector<int64_t>& lengths,
+    const std::vector<int64_t>& object_sizes,
+    const std::vector<ObjectIncarnation>& expected_incarnations) {
+    auto load_result = LoadRanges(keys, offsets, lengths, object_sizes, true,
+                                  expected_incarnations);
     if (!load_result) return tl::make_unexpected(load_result.error());
 
     auto batch = std::move(load_result.value());
@@ -666,6 +734,14 @@ FileStorage::BatchGetLocalRanges(const std::vector<std::string>& keys,
 bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
     return error == ErrorCode::INVALID_READ ||
            error == ErrorCode::OBJECT_ALREADY_EXISTS;
+}
+
+tl::expected<void, ErrorCode> FileStorage::MountLocalDiskSegment(
+    bool enable_offloading) {
+    const bool supports_versioned_offload =
+        dynamic_cast<BucketStorageBackend*>(storage_backend_.get()) != nullptr;
+    return client_->MountLocalDiskSegment(enable_offloading,
+                                          supports_versioned_offload);
 }
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
@@ -686,6 +762,19 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 
     auto bucket_backend =
         std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    if (!bucket_backend &&
+        std::any_of(offloading_objects.begin(), offloading_objects.end(),
+                    [](const OffloadTaskItem& task) {
+                        return task.attempt_id.has_value();
+                    })) {
+        std::vector<StorageObjectMetadata> failures(
+            offloading_objects.size(), StorageObjectMetadata{-1, 0, 0, -1, ""});
+        const auto rejected =
+            client_->NotifyOffloadSuccess(offloading_objects, failures);
+        if (!rejected) return rejected;
+        LOG(ERROR) << "Versioned offload requires the Bucket backend";
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
 
     // Merge in tasks carried across a bucket deferral (see
     // deferred_task_by_storage_key_): the backend's ungrouped pool will
@@ -901,13 +990,22 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             return res;
         };
+        StorageBackendInterface::ObjectVersions versions;
+        for (const auto& [key, _] : host_batch_object) {
+            const auto incarnation =
+                task_by_storage_key.at(key).GetObjectIncarnation();
+            if (!incarnation.IsZero()) {
+                versions.emplace(key, incarnation);
+            }
+        }
         auto offload_res = [&] {
             ColdReadInvalidation invalidate(*this);
             return storage_backend_->BatchOffload(
                 host_batch_object, bucket_complete_handler,
                 [this](const std::vector<std::string>& evicted_keys) {
                     return NotifyEvictedDiskReplicas(evicted_keys);
-                });
+                },
+                versions.empty() ? nullptr : &versions);
         }();
 
         // Release staging buffers back to pool.
@@ -1158,8 +1256,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                              << "SEGMENT_NOT_FOUND, attempting to "
                              << "re-register local disk segment and "
                              << "re-register object metadata";
-                auto remount_result =
-                    client_->MountLocalDiskSegment(enable_offloading_);
+                auto remount_result = MountLocalDiskSegment(enable_offloading_);
                 if (remount_result) {
                     // Report configured SSD capacity so the Master can
                     // restore file_total_capacity_ (the denominator in
@@ -1531,25 +1628,18 @@ tl::expected<void, ErrorCode> FileStorage::PromoteOneKeyFromLocalDisk(
     PromotionStateGuard guard(client_.get(), key, tenant_id);
 
     // (a) Allocate an O_DIRECT-aligned staging buffer and read the bytes
-    // from the local SSD backend into it. AllocateBatch returns a
+    // from the local SSD backend into it. LoadBatch returns a
     // shared_ptr<AllocatedBatch> whose BufferHandles RAII-release the
     // staging space when the local goes out of scope.
-    std::vector<std::string> single_key{storage_key};
-    std::vector<int64_t> single_size{size};
-    auto allocate_res =
-        AllocateBatch(single_key, single_size, *client_buffer_allocator_);
-    if (!allocate_res) {
-        LOG(WARNING) << "Promotion: AllocateBatch failed for key=" << key
-                     << ", error=" << allocate_res.error();
-        return tl::make_unexpected(allocate_res.error());
-    }
-    auto staging = allocate_res.value();
-    auto load_res = BatchLoad(staging->slices);
+    auto load_res = LoadBatch(
+        {storage_key}, {size}, false,
+        {alloc_result->object_incarnation.value_or(ObjectIncarnation{})});
     if (!load_res) {
         LOG(WARNING) << "Promotion: BatchLoad failed for key=" << key
                      << ", error=" << load_res.error();
         return tl::make_unexpected(load_res.error());
     }
+    const auto& staging = *load_res;
 
     // (b) TE-write from the staging slice into the freshly-allocated
     // MEMORY replica. Slice ptr may have been bumped by O_DIRECT offset
@@ -1703,10 +1793,20 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
 }
 
 tl::expected<void, ErrorCode> FileStorage::BatchLoad(
-    std::unordered_map<std::string, Slice>& batch_object) {
+    std::unordered_map<std::string, Slice>& batch_object,
+    const StorageBackendInterface::ObjectVersions& expected_incarnations) {
     if (disk_fenced_) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    auto* bucket =
+        expected_incarnations.empty()
+            ? nullptr
+            : dynamic_cast<BucketStorageBackend*>(storage_backend_.get());
+    if (!expected_incarnations.empty() && bucket == nullptr) {
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
     auto start_time = std::chrono::steady_clock::now();
-    auto result = storage_backend_->BatchLoad(batch_object);
+    auto result = bucket
+                      ? bucket->BatchLoad(batch_object, expected_incarnations)
+                      : storage_backend_->BatchLoad(batch_object);
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
                             end_time - start_time)

@@ -37,7 +37,8 @@ class OffloadQueue {
     // to its host's local disk. True when it was queued, in which case the
     // destinations are appended to `mirror_clients`.
     virtual bool Push(const TenantId& tenant_id, const std::string& key,
-                      Replica& source, std::vector<UUID>* mirror_clients) = 0;
+                      Replica& source, ObjectIncarnation& incarnation,
+                      UUID& attempt_id, std::vector<UUID>* mirror_clients) = 0;
 
    protected:
     ~OffloadQueue() = default;

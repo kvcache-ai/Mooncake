@@ -197,6 +197,7 @@ TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
         descriptor.client_id = generate_uuid();
         descriptor.object_size = object_size;
         descriptor.transport_endpoint = endpoint;
+        descriptor.object_incarnation = GenerateObjectIncarnation();
         replica.descriptor_variant = std::move(descriptor);
         replica.status = status;
         return replica;
@@ -230,6 +231,15 @@ TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
 
     for (auto& test_case : test_cases) {
         SCOPED_TRACE(test_case.name);
+        const auto expected = std::find_if(
+            test_case.replicas.begin(), test_case.replicas.end(),
+            [&](const auto& replica) {
+                return replica.get_local_disk_descriptor().transport_endpoint ==
+                       test_case.expected_endpoint;
+            });
+        ASSERT_NE(expected, test_case.replicas.end());
+        const auto expected_version =
+            expected->get_local_disk_descriptor().GetObjectIncarnation();
         std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
         query_results.emplace_back(QueryResult(
             std::move(test_case.replicas),
@@ -240,11 +250,18 @@ TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
         // Stop at the offload RPC boundary after recording its destination.
         // The injected error also prevents checksum verification of the
         // intentionally untouched destination buffer.
-        auto local_disk_reader = [&visited_endpoint](
-                                     const std::string& endpoint,
-                                     RealClient::LocalDiskOffloadObjects&)
+        auto local_disk_reader =
+            [&visited_endpoint, expected_version](
+                const std::string& endpoint,
+                RealClient::LocalDiskOffloadObjects&,
+                const RealClient::LocalDiskObjectVersions& versions)
             -> tl::expected<void, ErrorCode> {
             visited_endpoint = endpoint;
+            const auto it = versions.find("endpoint-selection-key");
+            EXPECT_NE(it, versions.end());
+            if (it != versions.end()) {
+                EXPECT_EQ(it->second, expected_version);
+            }
             return tl::make_unexpected(ErrorCode::RPC_FAIL);
         };
 
@@ -292,7 +309,8 @@ TEST_F(RealClientTest, BatchGetIntoRechecksLocalDiskLeasePerKeyBeforeFanOut) {
     size_t read_call_count = 0;
     auto local_disk_reader = [&read_call_count](
                                  const std::string&,
-                                 RealClient::LocalDiskOffloadObjects& objects)
+                                 RealClient::LocalDiskOffloadObjects& objects,
+                                 const RealClient::LocalDiskObjectVersions&)
         -> tl::expected<void, ErrorCode> {
         ++read_call_count;
         for (auto& [key, slices] : objects) {
@@ -412,6 +430,106 @@ TEST_F(RealClientTest, LocalDiskBufferReadsRejectExpiredMasterLeaseAfterIo) {
     EXPECT_EQ(results, (std::vector<int>{lease_expired, lease_expired}));
     EXPECT_TRUE(std::all_of(destinations.begin() + kSize, destinations.end(),
                             [](char value) { return value == '\0'; }));
+}
+TEST_F(RealClientTest, VersionedHolderRpcRejectsStaleFullAndRangeReads) {
+    ScopedEnvVar versioned("MOONCAKE_LOCAL_DISK_INCARNATIONS", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                         "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    ScopedEnvVar policy("MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY", "fifo");
+    // The quota admits one 64 KiB value at a time. A second key evicts the
+    // first bucket so the replacement can later use the same key and holder.
+    ScopedEnvVar quota("MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE", "98304");
+
+    char path[] = "/tmp/mooncake_versioned_holder_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_.master_address(), nullptr, "",
+                                     true, ssd_path_),
+              0);
+
+    auto wait_for_disk =
+        [&](const std::string& key) -> std::optional<LocalDiskDescriptor> {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(key)) {
+                if (replica.is_local_disk_replica()) {
+                    return replica.get_local_disk_descriptor();
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return std::nullopt;
+    };
+
+    constexpr int64_t size = 64 * 1024;
+    const std::string key = "same-key-after-eviction";
+    std::vector<char> value(size, 'a');
+    ASSERT_EQ(py_client_->put(key, value), 0);
+    const auto first = wait_for_disk(key);
+    ASSERT_TRUE(first);
+    ASSERT_FALSE(first->GetObjectIncarnation().IsZero());
+    ASSERT_EQ(py_client_->put("occupy-bucket", value), 0);
+    ASSERT_TRUE(wait_for_disk("occupy-bucket"));
+    ASSERT_EQ(py_client_->remove(key, true), 0);
+
+    for (int64_t i = 0; i < size; ++i) value[i] = 'A' + (i % 26);
+    ASSERT_EQ(py_client_->put(key, value), 0);
+    const auto current = wait_for_disk(key);
+    ASSERT_TRUE(current);
+    const auto& endpoint = current->transport_endpoint;
+    ASSERT_EQ(endpoint, first->transport_endpoint);
+    ASSERT_FALSE(current->GetObjectIncarnation().IsZero());
+    ASSERT_NE(first->GetObjectIncarnation(), current->GetObjectIncarnation());
+
+    ClientRequester requester;
+    const auto storage_key = TenantId::Default().MakeScopedKey(key);
+    for (const bool ranged : {false, true}) {
+        SCOPED_TRACE(ranged ? "range" : "full");
+        const int64_t offset = ranged ? 17 : 0;
+        const int64_t length = ranged ? 11 : size;
+        VersionedOffloadReadRequest request{
+            {storage_key}, {length}, {first->GetObjectIncarnation()}, {}, {}};
+        if (ranged) {
+            request.offsets = {offset};
+            request.object_sizes = {size};
+        }
+        auto stale =
+            requester.batch_get_versioned_offload_object(endpoint, request);
+        ASSERT_FALSE(stale);
+        EXPECT_EQ(stale.error(), ErrorCode::INVALID_VERSION);
+
+        const auto legacy = ranged
+                                ? requester.batch_get_offload_object_ranges(
+                                      endpoint, request.keys, request.offsets,
+                                      request.sizes, request.object_sizes)
+                                : requester.batch_get_offload_object(
+                                      endpoint, request.keys, request.sizes);
+        ASSERT_FALSE(legacy);
+        EXPECT_EQ(legacy.error(), ErrorCode::INVALID_VERSION);
+
+        request.incarnations[0] = current->GetObjectIncarnation();
+        auto matching =
+            requester.batch_get_versioned_offload_object(endpoint, request);
+        ASSERT_TRUE(matching);
+        ASSERT_EQ(matching->pointers.size(), 1u);
+        ASSERT_NE(matching->pointers.front(), 0u);
+        // The holder runs in this process. Its RPC lease keeps these bytes
+        // readable until the release, just as during a remote transfer.
+        EXPECT_EQ(std::memcmp(
+                      reinterpret_cast<const void*>(matching->pointers.front()),
+                      value.data() + offset, length),
+                  0);
+        requester.release_offload_buffer(endpoint, matching->batch_id);
+    }
 }
 
 TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {

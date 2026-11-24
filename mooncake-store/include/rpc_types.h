@@ -125,6 +125,7 @@ struct GetStorageConfigResponse {
     std::string fsdir;
     bool enable_disk_eviction;
     uint64_t quota_bytes;
+    struct_pack::compatible<bool, 1> requires_versioned_local_disk;
 
     GetStorageConfigResponse() : enable_disk_eviction(true), quota_bytes(0) {}
     GetStorageConfigResponse(const std::string& fsdir_param,
@@ -133,7 +134,8 @@ struct GetStorageConfigResponse {
           enable_disk_eviction(enable_eviction),
           quota_bytes(quota) {}
 };
-YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
+YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes,
+         requires_versioned_local_disk);
 
 struct NoFSegmentOwnerInfo {
     UUID segment_id;
@@ -161,8 +163,9 @@ YLT_REFL(CopyStartResponse, source, targets);
  */
 struct PromotionAllocStartResponse {
     Replica::Descriptor memory_descriptor;
+    struct_pack::compatible<ObjectIncarnation, 1> object_incarnation{};
 };
-YLT_REFL(PromotionAllocStartResponse, memory_descriptor);
+YLT_REFL(PromotionAllocStartResponse, memory_descriptor, object_incarnation);
 
 /**
  * @brief Response structure for MoveStart operation
@@ -344,6 +347,17 @@ struct TaskCompleteRequest {
     TaskCompleteRequest() = default;
 };
 YLT_REFL(TaskCompleteRequest, id, status, message);
+
+struct VersionedOffloadReadRequest {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::vector<ObjectIncarnation> incarnations;
+    // Empty for a whole-object read.
+    std::vector<int64_t> offsets;
+    std::vector<int64_t> object_sizes;
+};
+YLT_REFL(VersionedOffloadReadRequest, keys, sizes, incarnations, offsets,
+         object_sizes);
 
 struct BatchGetOffloadObjectResponse {
     uint64_t batch_id;

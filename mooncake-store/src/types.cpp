@@ -113,6 +113,11 @@ std::string UuidToString(const UUID& uuid) {
     return std::to_string(uuid.first) + "-" + std::to_string(uuid.second);
 }
 
+ObjectIncarnation GenerateObjectIncarnation() {
+    const auto [high, low] = generate_uuid();
+    return {high, low};
+}
+
 bool StringToUuid(const std::string& str, UUID& uuid) {
     size_t dashPos = str.find('-');
     if (dashPos == std::string::npos || dashPos == 0 ||

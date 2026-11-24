@@ -3130,6 +3130,87 @@ TEST_F(StorageBackendTest, BucketStorageBackend_BatchLoadSpanReadsWindow) {
     EXPECT_EQ(mismatch.error(), ErrorCode::INVALID_PARAMS);
 }
 
+TEST_F(StorageBackendTest, BucketReadsRejectStaleIncarnations) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, BucketBackendConfig{});
+    ASSERT_TRUE(backend.Init());
+
+    const std::string key = "reused-key";
+    const ObjectIncarnation old_version{1, 1};
+    const ObjectIncarnation new_version{1, 2};
+    std::string old_value = "old-data";
+    std::string new_value = "new-data";
+    auto offload = [&](std::string& value, ObjectIncarnation version) {
+        const std::unordered_map<std::string, std::vector<Slice>> batch{
+            {key, {{value.data(), value.size()}}}};
+        const StorageBackendInterface::ObjectVersions versions{{key, version}};
+        return backend.BatchOffload(batch, nullptr, nullptr, &versions);
+    };
+
+    auto legacy = offload(old_value, {});
+    ASSERT_TRUE(legacy);
+    std::string full(old_value.size(), '?');
+    std::unordered_map<std::string, Slice> full_read{
+        {key, {full.data(), full.size()}}};
+    ASSERT_TRUE(backend.BatchLoad(full_read));
+    EXPECT_EQ(full, old_value);
+    ASSERT_TRUE(backend.DeleteBucket(*legacy));
+
+    auto old_bucket = offload(old_value, old_version);
+    ASSERT_TRUE(old_bucket);
+    ASSERT_TRUE(backend.DeleteBucket(*old_bucket));
+    ASSERT_TRUE(offload(new_value, new_version));
+
+    std::fill(full.begin(), full.end(), '?');
+    for (const auto version : {ObjectIncarnation{}, old_version}) {
+        auto result = backend.BatchLoad(full_read, {{key, version}});
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_VERSION);
+        EXPECT_EQ(full, std::string(new_value.size(), '?'));
+        EXPECT_EQ(full_read.at(key).ptr, full.data());
+    }
+    auto legacy_read = backend.BatchLoad(full_read);
+    ASSERT_FALSE(legacy_read);
+    EXPECT_EQ(legacy_read.error(), ErrorCode::INVALID_VERSION);
+    full_read.at(key).size -= 1;
+    auto short_full = backend.BatchLoad(full_read, {{key, new_version}});
+    ASSERT_FALSE(short_full);
+    EXPECT_EQ(short_full.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(full, std::string(new_value.size(), '?'));
+    full_read.at(key).size = full.size();
+    ASSERT_TRUE(backend.BatchLoad(full_read, {{key, new_version}}));
+    EXPECT_EQ(full, new_value);
+
+    constexpr size_t kOffset = 2;
+    std::string window(4, '?');
+    std::unordered_map<std::string, StorageValueSpan> range_read{
+        {key,
+         {kOffset,
+          new_value.size(),
+          {window.data(), window.size()},
+          old_version}}};
+    auto stale_range = backend.BatchLoadSpans(range_read);
+    ASSERT_FALSE(stale_range);
+    EXPECT_EQ(stale_range.error(), ErrorCode::INVALID_VERSION);
+    EXPECT_EQ(window, "????");
+    EXPECT_EQ(range_read.at(key).slice.ptr, window.data());
+    range_read.at(key).expected_incarnation = {};
+    auto legacy_range = backend.BatchLoadSpans(range_read);
+    ASSERT_FALSE(legacy_range);
+    EXPECT_EQ(legacy_range.error(), ErrorCode::INVALID_VERSION);
+    EXPECT_EQ(window, "????");
+    range_read.at(key).expected_incarnation = new_version;
+    range_read.at(key).object_size += 1;
+    auto wrong_size = backend.BatchLoadSpans(range_read);
+    ASSERT_FALSE(wrong_size);
+    EXPECT_EQ(wrong_size.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(window, "????");
+    range_read.at(key).object_size = new_value.size();
+    ASSERT_TRUE(backend.BatchLoadSpans(range_read));
+    EXPECT_EQ(window, new_value.substr(kOffset, window.size()));
+}
+
 //-----------------------------------------------------------------------------
 // DeleteBucket Tests
 //-----------------------------------------------------------------------------
