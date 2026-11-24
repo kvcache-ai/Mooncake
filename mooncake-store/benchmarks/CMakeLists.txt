@@ -14,6 +14,12 @@ add_executable(master_bench master_bench.cpp)
 target_link_libraries(master_bench PRIVATE cachelib_memory_allocator
                                            mooncake_store)
 
+# Add a standalone Master benchmark for a large memory segment
+add_executable(master_memory_bench master_memory_bench.cpp)
+target_link_libraries(
+  master_memory_bench PRIVATE mooncake_store cachelib_memory_allocator
+                               gflags::gflags glog::glog pthread)
+
 # Add BatchGetReplicaList latency benchmark executable
 add_executable(batch_get_replica_bench batch_get_replica_bench.cpp)
 target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator

@@ -144,3 +144,14 @@ Output lines:
 - `PUTS`: with `--put_rate`, attempted and failed puts, put latency, and when
   the first put failed.
 - `FINAL`: keys written, live keys, and eviction passes.
+
+## Master Memory Segment Benchmark
+
+`master_memory_bench` is a standalone Master metadata benchmark. It mounts
+memory segments, creates a large object set with `BatchPutStart` /
+`BatchPutEnd`, then reads the same keys with `BatchExistKey` and
+`BatchGetReplicaList`. It does not move KV payloads.
+
+See `master_memory_bench.md` for the 100M-key run, read-rate amplification,
+multi-client runs, `master_memory_gate.py` release checks, and
+`master_memory_runner.py` base/current comparison.
