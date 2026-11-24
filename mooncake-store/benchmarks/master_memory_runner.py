@@ -18,7 +18,9 @@ def parse_args():
     parser.add_argument("--base-master", required=True)
     parser.add_argument("--current-master", required=True)
     parser.add_argument("--bench", required=True)
-    parser.add_argument("--gate", default=str(Path(__file__).with_name("master_memory_gate.py")))
+    parser.add_argument(
+        "--gate", default=str(Path(__file__).with_name("master_memory_gate.py"))
+    )
     parser.add_argument("--workdir", default="./master-memory-run")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--base-port", type=int, default=50101)
@@ -28,7 +30,9 @@ def parse_args():
     parser.add_argument("--object-bytes", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--segments", type=int, default=2)
-    parser.add_argument("--segment-bytes", type=int, default=64 * 1024 * 1024 * 1024)
+    parser.add_argument(
+        "--segment-bytes", type=int, default=64 * 1024 * 1024 * 1024
+    )
     parser.add_argument("--fill-threads", type=int, default=16)
     parser.add_argument("--read-threads", type=int, default=16)
     parser.add_argument("--read-duration", type=int, default=10)
@@ -83,7 +87,9 @@ def start_master(binary, port, log_path, args):
         *args.master_arg,
     ]
     log = open(log_path, "wb")
-    process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    process = subprocess.Popen(
+        command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+    )
     return process, log
 
 
@@ -108,7 +114,9 @@ def run_benchmark(binary, result_path, log_path, args, port):
     with open(log_path, "wb") as log:
         completed = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
     if completed.returncode != 0:
-        raise SystemExit(f"benchmark failed with exit code {completed.returncode}; see {log_path}")
+        raise SystemExit(
+            f"benchmark failed with exit code {completed.returncode}; see {log_path}"
+        )
     if not os.path.isfile(result_path):
         raise SystemExit(f"benchmark did not write {result_path}")
     with open(result_path, encoding="utf-8") as source:
@@ -128,9 +136,20 @@ def aggregate(runs, side):
         raise SystemExit(f"no runs for {side}")
     expected = runs[0]
     for report in runs[1:]:
-        for field in ("keys", "object_bytes", "batch_size", "fill_threads", "seed", "segments", "segment_bytes"):
+        for field in (
+            "keys",
+            "object_bytes",
+            "batch_size",
+            "fill_threads",
+            "seed",
+            "segments",
+            "segment_bytes",
+        ):
             if report[field] != expected[field]:
                 raise SystemExit(f"{side} runs disagree on {field}")
+    for report in runs:
+        if report["fill"]["completed"] != expected["keys"]:
+            raise SystemExit(f"{side} fill did not complete")
     result = copy.deepcopy(expected)
     result["runs"] = len(runs)
     result["aggregate"] = "median"
@@ -138,6 +157,10 @@ def aggregate(runs, side):
         result["fill"][field] = median([report["fill"][field] for report in runs])
     for field in ("seconds", "batches_per_second", "keys_per_second"):
         result["read"][field] = median([report["read"][field] for report in runs])
+    result["read"]["batches"] = median(
+        [report["read"]["batches"] for report in runs]
+    )
+    result["read"]["keys"] = median([report["read"]["keys"] for report in runs])
     for field in ("p50", "p90", "p99", "p999"):
         result["read"]["latency_us"][field] = median(
             [report["read"]["latency_us"][field] for report in runs]
@@ -180,6 +203,8 @@ def main():
     args = parse_args()
     if args.runs < 1:
         raise SystemExit("--runs must be at least 1")
+    if args.base_port == args.current_port:
+        raise SystemExit("--base-port and --current-port must differ")
     require_executable(args.base_master, "base master")
     require_executable(args.current_master, "current master")
     require_executable(args.bench, "benchmark")
