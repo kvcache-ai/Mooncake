@@ -53,7 +53,7 @@ namespace {
 
 Transport::BatchDesc* newBatch() {
     auto* batch = new Transport::BatchDesc;
-    batch->id = reinterpret_cast<BatchID>(batch);
+    batch->id = reinterpret_cast<Transport::BatchID>(batch);
     batch->batch_size = 1;
     batch->task_list.resize(1);
     batch->task_list[0].slice_count = 1;
@@ -152,7 +152,8 @@ TEST(UnregisterQuiesce, AlignedBatchAddressesSpreadAcrossShards) {
         auto* batch = new Transport::BatchDesc;
         batches.push_back(batch);
         buckets.insert(
-            UnregisterQuiesceTestPeer::shard(reinterpret_cast<BatchID>(batch)));
+            UnregisterQuiesceTestPeer::shard(
+                reinterpret_cast<Transport::BatchID>(batch)));
     }
     for (auto* batch : batches) delete batch;
     EXPECT_GT(buckets.size(), 4u);
