@@ -140,6 +140,21 @@ class DelayedReadBackend : public BucketStorageBackend {
     std::atomic<size_t> loads{0};
 };
 
+class FailingScanBackend : public BucketStorageBackend {
+   public:
+    using BucketStorageBackend::BucketStorageBackend;
+
+    tl::expected<void, ErrorCode> ScanMeta(
+        const std::function<ErrorCode(
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas)>& handler) override {
+        ++scan_calls;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    std::atomic<int> scan_calls{0};
+};
+
 class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
@@ -1563,6 +1578,57 @@ class FileStorageTest : public ::testing::Test {
         auto unmount = client.value()->UnmountSegment(seg_ptr, kSegSize);
         EXPECT_TRUE(unmount.has_value());
         std::free(seg_ptr);
+    }
+
+    void RunFailedMetadataRescanRetryGate() {
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                      std::nullopt, master.master_address());
+        ASSERT_TRUE(created);
+        auto client = *created;
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_filepath = data_path + "/failed_rescan_gate";
+        config.local_buffer_size = 1024 * 1024;
+        config.enable_disk_watermark_eviction = false;
+        fs::create_directories(config.storage_filepath);
+        FileStorage storage(config, client, endpoint);
+        BucketBackendConfig bucket_config;
+        auto backend = std::make_shared<FailingScanBackend>(config, bucket_config);
+        storage.storage_backend_ = backend;
+        ASSERT_TRUE(backend->Init());
+        {
+            MutexLocker locker(&storage.offloading_mutex_);
+            storage.enable_offloading_ = true;
+        }
+        storage.metadata_resync_pending_.store(true);
+
+        auto join_rescan = [&storage] {
+            if (storage.rescan_future_.valid()) storage.rescan_future_.wait();
+        };
+        for (int i = 0; i < 3; ++i) {
+            ASSERT_TRUE(storage.Heartbeat(false));
+            join_rescan();
+        }
+        EXPECT_EQ(backend->scan_calls.load(), 0)
+            << "offload-only ticks must not restart failed metadata scans";
+
+        ASSERT_TRUE(storage.Heartbeat(true));
+        join_rescan();
+        EXPECT_EQ(backend->scan_calls.load(), 1)
+            << "the regular maintenance tick owns the retry";
+        EXPECT_TRUE(storage.metadata_resync_pending_.load())
+            << "a failed scan remains eligible for the next maintenance tick";
+
+        ASSERT_TRUE(storage.Heartbeat(false));
+        join_rescan();
+        EXPECT_EQ(backend->scan_calls.load(), 1);
     }
 };
 
@@ -3470,6 +3536,10 @@ TEST_F(FileStorageTest,
     EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u)
         << "Abandoned shared staging buffers must be reclaimed once their "
            "lease expires, otherwise the memory leaks for good";
+}
+
+TEST_F(FileStorageTest, FailedMetadataRescanRetriesOnlyOnMaintenanceTicks) {
+    RunFailedMetadataRescanRetryGate();
 }
 
 TEST(FileStorageHeartbeatScheduleTest, BusyPollingPreservesRegularMaintenance) {

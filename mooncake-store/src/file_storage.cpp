@@ -1165,8 +1165,10 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat(bool run_maintenance,
         rescan_future_ = std::future<void>();
     }
 
-    // Retry metadata resync if previous attempt failed.
-    if (metadata_resync_pending_.load() && !rescan_future_.valid()) {
+    // Retry metadata resync on regular ticks. The initial scan after a
+    // successful remount below still starts immediately.
+    if (run_maintenance && metadata_resync_pending_.load() &&
+        !rescan_future_.valid()) {
         LOG(INFO) << "Retrying background metadata rescan";
         rescan_future_ = std::async(std::launch::async, [this]() {
             auto result = ReRegisterOffloadedObjects();
