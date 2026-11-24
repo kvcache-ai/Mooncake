@@ -14,6 +14,7 @@ from .errors import WeightStoreError
 StoreRecordType: TypeAlias = Literal["payload", "metadata"]
 StoreConfigFactory: TypeAlias = Callable[[Sequence[str], StoreRecordType], object]
 RangeResults: TypeAlias = tuple[tuple[tuple[int, ...], ...], ...]
+RangedReadSnapshot: TypeAlias = object
 
 
 class _NativeReplicateConfig(Protocol):
@@ -114,6 +115,27 @@ class StoreBackend:
     def unregister_buffer(self, address: int) -> int:
         return self._status("unregister_buffer", address)
 
+    def prepare_get_into_ranges_snapshot(
+        self, keys: Sequence[str]
+    ) -> Optional[RangedReadSnapshot]:
+        prepare = self._optional_method("prepare_get_into_ranges_snapshot")
+        read = self._optional_method("get_into_ranges_from_snapshot")
+        if prepare is None and read is None:
+            return None
+        if prepare is None or read is None:
+            raise WeightStoreError(
+                "Store backend must expose both ranged-read snapshot methods"
+            )
+        unique_keys = list(dict.fromkeys(keys))
+        snapshot = self._invoke(
+            prepare,
+            unique_keys,
+            operation="prepare_get_into_ranges_snapshot",
+        )
+        if snapshot is None:
+            raise WeightStoreError("Store returned an invalid ranged-read snapshot")
+        return snapshot
+
     def get_into_ranges(
         self,
         addresses: Sequence[int],
@@ -121,14 +143,26 @@ class StoreBackend:
         all_target_offsets: Sequence[Sequence[Sequence[int]]],
         all_source_offsets: Sequence[Sequence[Sequence[int]]],
         all_sizes: Sequence[Sequence[Sequence[int]]],
+        *,
+        snapshot: Optional[RangedReadSnapshot] = None,
     ) -> RangeResults:
-        result = self._call(
-            "get_into_ranges",
+        if snapshot is None:
+            method = self._required_method("get_into_ranges")
+            args: tuple[object, ...] = ()
+            operation = "get_into_ranges"
+        else:
+            method = self._required_method("get_into_ranges_from_snapshot")
+            args = (snapshot,)
+            operation = "get_into_ranges_from_snapshot"
+        result = self._invoke(
+            method,
+            *args,
             list(addresses),
             [list(keys) for keys in all_keys],
             [[list(offsets) for offsets in groups] for groups in all_target_offsets],
             [[list(offsets) for offsets in groups] for groups in all_source_offsets],
             [[list(sizes) for sizes in groups] for groups in all_sizes],
+            operation=operation,
         )
         return self._range_results(result)
 
@@ -216,6 +250,7 @@ class StoreBackend:
 
 __all__ = [
     "RangeResults",
+    "RangedReadSnapshot",
     "StoreBackend",
     "StoreConfigFactory",
     "StoreRecordType",

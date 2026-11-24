@@ -15,24 +15,29 @@
 #include "utils.h"
 
 #include <gflags/gflags.h>
+#include <numa.h>
 #include <cctype>
 #include <charconv>
 #include <iostream>
 #include <optional>
 #include <string_view>
 
+#ifdef USE_XPU
+#include "tent/runtime/platform.h"
+#endif
+
 DEFINE_string(seg_name, "", "Memory segment name for the local side");
 DEFINE_string(seg_type, "DRAM",
-              "Memory segment type for the target side: DRAM|VRAM");
+              "Memory segment type for the target side: DRAM|VRAM "
+              "(case-insensitive)");
 DEFINE_string(
     seg_type_mix, "",
     "Comma-separated segment types for mixed DRAM+VRAM runs, e.g. "
     "\"dram,vram\". When set, target registers buffers of each listed type "
     "in one segment, and initiator threads round-robin across them so a "
-    "single tebench process drives traffic over multiple memory types (and "
-    "thus multiple transports — SHM for DRAM, NVLink for VRAM) "
-    "concurrently. Empty falls back to --seg_type (single type, existing "
-    "behavior). Requires transports to be enabled via MC_TENT_CONF.");
+    "single tebench process drives traffic over multiple memory types "
+    "concurrently. Empty falls back to --seg_type. Select transports "
+    "with --xport_type or MC_TENT_CONF.");
 DEFINE_string(target_seg_name, "",
               "Target segment name for the initiator side. A comma-separated "
               "list enables multi-target initiator mode.");
@@ -40,7 +45,8 @@ DEFINE_string(
     op_type, "read",
     "Operation type to benchmark: read|write|mix|write_seed|read_verify");
 DEFINE_bool(check_consistency, false,
-            "Enable data consistency check after transfer.");
+            "Validate data with alternating WRITE/READ transfers; reports "
+            "op_type=mix regardless of --op_type=read|write|mix.");
 DEFINE_uint64(total_buffer_size, 1UL << 30,
               "Total buffer size for testing (in bytes).");
 DEFINE_uint64(start_block_size, 4096, "Start block size (in bytes).");
@@ -48,6 +54,8 @@ DEFINE_uint64(max_block_size, 1UL << 26, "Maximum block size (in bytes).");
 DEFINE_uint64(start_batch_size, 1, "Start batch size (number of requests).");
 DEFINE_uint64(max_batch_size, 1, "Maximum batch size (number of requests).");
 DEFINE_int32(duration, 5, "Number of duration per test case.");
+DEFINE_int32(warmup_ms, 1000,
+             "Warmup time per test case in milliseconds (0 disables warmup).");
 DEFINE_int32(start_num_threads, 1,
              "Start number of concurrent worker threads.");
 DEFINE_int32(max_num_threads, 1,
@@ -59,6 +67,18 @@ DEFINE_uint64(
     target_range_size, 0,
     "Per-initiator target range size. 0 disables range validation; "
     "non-zero requires every target address to stay inside the range.");
+DEFINE_string(target_access, "fixed",
+              "Target offset of each operation within the thread's window: "
+              "fixed (same offset every time) or random (a random "
+              "operation-aligned slot, never the previous one). Rewriting one "
+              "SSD block back to back can be far slower than writing "
+              "different blocks; random avoids that.");
+DEFINE_uint64(target_window_size, 0,
+              "Bytes of target each thread spreads its operations over, e.g. "
+              "file size / thread count. Requires --target_access=random "
+              "and a multiple of 4096. Threads' windows do not overlap. 0 "
+              "uses max_block_size x max_batch_size, which is also the "
+              "minimum.");
 DEFINE_string(
     qos_classes, "",
     "QoS classes as name:threads:slo_us:weight[:isolated_gbps],...; "
@@ -78,9 +98,18 @@ DEFINE_string(qos_output_jsonl, "",
 DEFINE_string(result_output_jsonl, "",
               "Append versioned benchmark result records, including "
               "per-target metrics, to this JSONL file.");
+DEFINE_string(
+    split_output_jsonl, "",
+    "Initiator only: append one JSONL line per transfer with submit_us, "
+    "wait_us, and polls. Empty (default) disables the log: no extra timers "
+    "and no I/O. Enable to split Avg Tx into submit vs completion wait.");
 DEFINE_uint64(request_interval_us, 0,
               "Per-thread delay before issuing each transfer batch, in "
-              "microseconds. 0 disables pacing.");
+              "microseconds. 0 disables pacing. Closed loop: the wait starts "
+              "after the previous transfer completes, so each thread issues "
+              "at most 1 / (interval + transfer latency) requests per "
+              "second. The wait busy-yields, so a pacing thread may keep "
+              "a core occupied.");
 DEFINE_uint64(deadline_us, 0,
               "tent only: relative per-transfer deadline in microseconds for "
               "tight worker threads (0 disables deadline tagging); cannot be "
@@ -91,8 +120,17 @@ DEFINE_int32(deadline_tight_threads, 0,
              "--workload_classes_json.");
 DEFINE_bool(deadline_bw_arbitration, false,
             "tent only: enable deadline-aware RDMA bandwidth arbitration.");
-DEFINE_int32(local_gpu_id, 0, "Local GPU ID to be used, -1 for all GPUs");
-DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used, -1 for all GPUs");
+DEFINE_int32(local_gpu_id, 0,
+             "Local device ordinal for VRAM, -1 for all visible devices. "
+             "Selects an MLU or XPU device with --backend=tent in USE_MLU "
+             "or USE_XPU builds.");
+DEFINE_int32(local_numa_id, -1,
+             "tent only: NUMA node for local DRAM buffers (including "
+             "--seg_type_mix). -1 allocates on all configured nodes; "
+             "a non-negative ID allocates one buffer on that node.");
+DEFINE_int32(target_gpu_id, 0,
+             "Offset for round-robin assignment across target buffers; "
+             "-1 uses 0.");
 DEFINE_string(metadata_type, "p2p",
               "Type of metadata service: p2p|etcd|redis|http");
 DEFINE_string(metadata_url_list, "",
@@ -103,7 +141,7 @@ DEFINE_int32(
 DEFINE_string(xport_type, "",
               "Transport type: "
               "rdma|tcp|hp_tcp|shm|mnnvl|nvlink|gds|iouring|ub|sunrise_link|"
-              "mpcomm|flagcx");
+              "mpcomm|flagcx|efa|fabric");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
 DEFINE_bool(use_hugepage, false,
             "classic DRAM: SHM allocates on hugetlbfs; RDMA allocates with "
@@ -123,7 +161,7 @@ DEFINE_bool(notifi, false,
 DEFINE_string(tent_transport_hint, "unspec",
               "tent only: per-request transport_hint. "
               "unspec|rdma|tcp|hp_tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|"
-              "ub|sunrise_link|mpcomm");
+              "ub|sunrise_link|mpcomm|fabric");
 DEFINE_string(tent_intent_type, "unspec",
               "tent only: intent_type attached to every benchmark request. "
               "unspec|foreground_get|background_prefetch|migration|checkpoint|"
@@ -144,16 +182,20 @@ size_t XferBenchConfig::max_block_size = 0;
 size_t XferBenchConfig::start_batch_size = 0;
 size_t XferBenchConfig::max_batch_size = 0;
 int XferBenchConfig::duration = 0;
+int XferBenchConfig::warmup_ms = 1000;
 int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
 size_t XferBenchConfig::target_offset = 0;
 size_t XferBenchConfig::target_range_size = 0;
+std::string XferBenchConfig::target_access;
+size_t XferBenchConfig::target_window_size = 0;
 std::string XferBenchConfig::qos_classes;
 std::string XferBenchConfig::qos_classes_json;
 std::string XferBenchConfig::workload_classes_json;
 double XferBenchConfig::qos_link_capacity_gbps = 0.0;
 std::string XferBenchConfig::qos_output_jsonl;
 std::string XferBenchConfig::result_output_jsonl;
+std::string XferBenchConfig::split_output_jsonl;
 uint64_t XferBenchConfig::request_interval_us = 0;
 uint64_t XferBenchConfig::deadline_us = 0;
 int XferBenchConfig::deadline_tight_threads = 0;
@@ -172,6 +214,7 @@ std::string XferBenchConfig::tent_transport_hint;
 std::string XferBenchConfig::tent_intent_type;
 
 int XferBenchConfig::local_gpu_id = 0;
+int XferBenchConfig::local_numa_id = -1;
 int XferBenchConfig::target_gpu_id = 0;
 
 namespace {
@@ -220,7 +263,11 @@ std::optional<size_t> parseHugepageSizeFlag(std::string_view raw) {
 }  // namespace
 
 void XferBenchConfig::loadFromFlags() {
+    // Case-insensitive, as TENT already accepted "dram"/"vram"; the backends
+    // compare against "DRAM"/"VRAM".
     seg_type = FLAGS_seg_type;
+    for (auto& c : seg_type)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     seg_type_mix = FLAGS_seg_type_mix;
     seg_name = FLAGS_seg_name;
     target_seg_name = FLAGS_target_seg_name;
@@ -236,17 +283,21 @@ void XferBenchConfig::loadFromFlags() {
     max_num_threads = FLAGS_max_num_threads;
     target_offset = FLAGS_target_offset;
     target_range_size = FLAGS_target_range_size;
+    target_access = FLAGS_target_access;
+    target_window_size = FLAGS_target_window_size;
     qos_classes = FLAGS_qos_classes;
     qos_classes_json = FLAGS_qos_classes_json;
     workload_classes_json = FLAGS_workload_classes_json;
     qos_link_capacity_gbps = FLAGS_qos_link_capacity_gbps;
     qos_output_jsonl = FLAGS_qos_output_jsonl;
     result_output_jsonl = FLAGS_result_output_jsonl;
+    split_output_jsonl = FLAGS_split_output_jsonl;
     request_interval_us = FLAGS_request_interval_us;
     deadline_us = FLAGS_deadline_us;
     deadline_tight_threads = FLAGS_deadline_tight_threads;
     deadline_bw_arbitration = FLAGS_deadline_bw_arbitration;
     duration = FLAGS_duration;
+    warmup_ms = FLAGS_warmup_ms;
 
     metadata_type = FLAGS_metadata_type;
     metadata_url_list = FLAGS_metadata_url_list;
@@ -263,15 +314,80 @@ void XferBenchConfig::loadFromFlags() {
     tent_intent_type = FLAGS_tent_intent_type;
 
     local_gpu_id = FLAGS_local_gpu_id;
+    local_numa_id = FLAGS_local_numa_id;
     target_gpu_id = FLAGS_target_gpu_id;
 }
 
-double XferMetricStats::percentile(double p) {
+bool XferBenchConfig::validateLocalNuma(std::string& error) {
+    error.clear();
+    if (local_numa_id == -1) return true;
+    if (local_numa_id < -1) {
+        error = "--local_numa_id must be -1 or a non-negative NUMA node ID";
+        return false;
+    }
+    if (backend != "tent") {
+        error = "--local_numa_id requires --backend=tent";
+        return false;
+    }
+    auto types = splitCommaSeparated(seg_type_mix);
+    if (types.empty()) types.push_back(seg_type);
+    if (std::none_of(types.begin(), types.end(), [](const auto& type) {
+            return equalsIgnoreCase(type, "dram");
+        })) {
+        error = "--local_numa_id requires DRAM in --seg_type or --seg_type_mix";
+        return false;
+    }
+    int start_idx = 0, num_buffers = 0;
+    return resolveDramNumaRange(start_idx, num_buffers, error);
+}
+
+bool XferBenchConfig::resolveDramNumaRange(int& start_idx, int& num_buffers,
+                                           std::string& error) {
+    error.clear();
+    start_idx = 0;
+    num_buffers = 0;
+    if (local_numa_id == -1) {
+        num_buffers = numa_num_configured_nodes();
+        return true;
+    }
+    if (local_numa_id < -1) {
+        error = "--local_numa_id must be -1 or a non-negative NUMA node ID";
+        return false;
+    }
+    // Check node IDs, not the node count: NUMA IDs can be sparse. This does
+    // not assert Fabric capability, which remains the transport's job.
+    if (numa_available() < 0 || local_numa_id > numa_max_node() ||
+        !numa_all_nodes_ptr ||
+        !numa_bitmask_isbitset(numa_all_nodes_ptr, local_numa_id)) {
+        error = "--local_numa_id=" + std::to_string(local_numa_id) +
+                " is not an available memory NUMA node";
+        return false;
+    }
+    long long free_bytes = 0;
+    if (numa_node_size64(local_numa_id, &free_bytes) <= 0) {
+        error = "--local_numa_id=" + std::to_string(local_numa_id) +
+                " has no usable host memory";
+        return false;
+    }
+    start_idx = local_numa_id;
+    num_buffers = 1;
+    return true;
+}
+
+const std::vector<double>& XferMetricStats::sortedSamples() const {
+    if (!sorted_valid) {
+        sorted_samples = samples;
+        std::sort(sorted_samples.begin(), sorted_samples.end());
+        sorted_valid = true;
+    }
+    return sorted_samples;
+}
+
+double XferMetricStats::percentile(double p) const {
     if (samples.empty()) return 0.0;
     if (p <= 0) return min();
     if (p >= 100) return max();
-    std::vector<double> sorted = samples;
-    std::sort(sorted.begin(), sorted.end());
+    const std::vector<double>& sorted = sortedSamples();
     double rank = (p / 100.0) * (sorted.size() - 1);
     size_t idx = static_cast<size_t>(rank);
     double frac = rank - idx;
@@ -298,16 +414,19 @@ void printStatsHeader() {
     // clang-format on
 }
 
-void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
-                int num_threads) {
+void printStats(size_t block_size, size_t batch_size,
+                const XferBenchStats& stats, int num_threads) {
     size_t total_data_transferred = 0;
     double avg_latency = 0, throughput_gb = 0;
     auto num_ops = stats.transfer_duration.count();
     double total_duration = stats.total_duration.avg();
     total_data_transferred = ((block_size * batch_size) * num_ops);
-    avg_latency = (total_duration * num_threads / num_ops);
-    throughput_gb = (((double)total_data_transferred / (1000 * 1000 * 1000)) /
-                     (total_duration / 1e6));  // In GB/Sec
+    // An empty run (e.g. --duration=0) keeps its row, with zero rates.
+    if (num_ops != 0) avg_latency = (total_duration * num_threads / num_ops);
+    if (total_duration > 0)
+        throughput_gb =
+            (((double)total_data_transferred / (1000 * 1000 * 1000)) /
+             (total_duration / 1e6));  // In GB/Sec
     const double avg_instant_gbps = stats.instant_bandwidth.avg();
 
     // Tabulate print with fixed width for each string
@@ -327,7 +446,7 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
 }
 
 void printDeadlineGroupStats(const char* group, size_t block_size,
-                             size_t batch_size, XferBenchStats& stats,
+                             size_t batch_size, const XferBenchStats& stats,
                              int num_threads, uint64_t deadline_us) {
     if (num_threads <= 0 || stats.transfer_duration.count() == 0) return;
     const double duration_s = stats.total_duration.avg() / 1e6;
@@ -362,6 +481,17 @@ uint8_t stableDataSeed(uint64_t target_addr) {
     uint8_t seed = static_cast<uint8_t>(value);
     return seed == 0 ? 1 : seed;
 }
+
+#ifdef USE_XPU
+bool isXpuMemory(void* ptr) {
+    return Platform::getLoader().getMemoryType(ptr) == MTYPE_XPU;
+}
+
+void copyXpuData(void* dst, void* src, size_t length) {
+    auto status = Platform::getLoader().copy(dst, src, length);
+    LOG_ASSERT(status.ok()) << "XPU copy failed: " << status.ToString();
+}
+#endif
 
 }  // namespace tent
 }  // namespace mooncake

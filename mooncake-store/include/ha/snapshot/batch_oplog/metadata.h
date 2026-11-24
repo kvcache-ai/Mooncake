@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -14,6 +15,13 @@ namespace mooncake::ha {
 inline constexpr uint32_t kBatchOpLogSnapshotSchemaVersion = 1;
 inline constexpr char kBatchOpLogSnapshotFormat[] =
     "standby-oplog-materialized/v1";
+inline constexpr uint32_t kBatchOpLogWeightSnapshotSchemaVersion = 2;
+inline constexpr char kBatchOpLogWeightSnapshotFormat[] =
+    "standby-oplog-materialized/v2";
+
+inline constexpr uint32_t kBatchOpLogObjectSnapshotSchemaVersion = 3;
+inline constexpr char kBatchOpLogObjectSnapshotFormat[] =
+    "standby-oplog-materialized/v3";
 
 struct BatchOpLogSnapshotDescriptor {
     uint32_t schema_version{kBatchOpLogSnapshotSchemaVersion};
@@ -51,6 +59,8 @@ struct BatchOpLogSnapshotManifest {
     ViewVersionId producer_view_version{0};
     BatchOpLogSnapshotObjectDescriptor segments;
     std::vector<BatchOpLogSnapshotChunkDescriptor> object_chunks;
+    std::optional<BatchOpLogSnapshotObjectDescriptor> weight_metadata;
+    std::optional<BatchOpLogSnapshotObjectDescriptor> object_storage;
 };
 
 std::string EncodeBatchOpLogSnapshotDescriptor(
@@ -85,5 +95,10 @@ std::string BuildBatchOpLogSnapshotSegmentsKey(const std::string& snapshot_root,
 std::string BuildBatchOpLogSnapshotObjectChunkKey(
     const std::string& snapshot_root, std::string_view snapshot_id,
     uint64_t chunk_index);
+std::string BuildBatchOpLogSnapshotWeightMetadataKey(
+    const std::string& snapshot_root, std::string_view snapshot_id);
+
+std::string BuildBatchOpLogSnapshotObjectStorageKey(
+    const std::string& snapshot_root, std::string_view snapshot_id);
 
 }  // namespace mooncake::ha

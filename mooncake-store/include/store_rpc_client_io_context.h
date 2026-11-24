@@ -1,12 +1,11 @@
 #pragma once
 
-#include "environ.h"
 #include "rpc_client_io_context.h"
 
 namespace mooncake {
 
 inline uint32_t GetStoreRpcClientIoThreads() {
-    return Environ::Get().GetStoreRpcClientIoThreads();
+    return RpcClientIoThreadsConfig::Process().store;
 }
 
 namespace detail {

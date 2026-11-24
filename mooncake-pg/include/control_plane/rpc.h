@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -17,6 +18,7 @@ namespace mooncake {
 
 inline constexpr auto kProposalAdmissionTimeout = std::chrono::seconds(20);
 inline constexpr auto kViewUpdateAckTimeout = std::chrono::seconds(20);
+inline constexpr auto kTransferEndpointUpdateTimeout = std::chrono::seconds(20);
 
 // Agent -> Coordinator RPC messages
 
@@ -26,6 +28,10 @@ struct RegisterAgentRequest {
     std::string te_server_name;
     uint64_t agent_session_id = 0;
     uint64_t warmup_recv_addr = 0;
+
+    std::optional<DeviceTransferEndpoint> transfer_service_endpoint;
+    std::optional<DeviceCollectiveWorkspaceEndpoint>
+        collective_workspace_endpoint;
 };
 
 struct RankConnectionMetadata {
@@ -34,6 +40,8 @@ struct RankConnectionMetadata {
     std::string agent_addr;
     std::string te_server_name;
     uint64_t warmup_recv_addr = 0;
+    std::optional<DeviceCollectiveWorkspaceEndpoint>
+        collective_workspace_endpoint;
 };
 
 struct RegisterAgentResponse {
@@ -94,6 +102,7 @@ struct RegisterGroupRequest {
     GroupBootstrapId group_bootstrap_id;
     int32_t max_group_size = 0;
     std::vector<GlobalRank> rank_order;
+    std::optional<GpuCollectiveBackend> preferred_gpu_collective_backend;
     GroupBootstrapIdResolvePolicy resolve_policy =
         GroupBootstrapIdResolvePolicy::CreateOrAttach;
     bool auto_deactivate = true;
@@ -194,6 +203,8 @@ struct PeerJoinedPush {
     uint64_t rank_epoch = 0;
     std::string te_server_name;
     uint64_t warmup_recv_addr = 0;
+    std::optional<DeviceCollectiveWorkspaceEndpoint>
+        collective_workspace_endpoint;
 };
 
 struct RankStatePush {
@@ -205,6 +216,28 @@ struct RankStatePush {
 
 struct ViewUpdatePush {
     GroupView view;
+};
+
+struct TransferEndpointUpdatePush {
+    DeviceTransferSnapshot snapshot;
+    // Agents may reclaim retired route resources from snapshot versions below
+    // this value during installation. The Coordinator sets it to the last
+    // snapshot ACKed by all participants whose sessions remain valid.
+    // Zero permits no reclamation.
+    uint64_t reclaim_before_version = 0;
+};
+
+struct TransferEndpointUpdateAck {
+    GlobalRank rank = kInvalidGlobalRank;
+    uint64_t rank_epoch = 0;
+    // Version of the input snapshot this ACK confirms.
+    uint64_t version = 0;
+    // True once local routes are installed and execution has resumed.
+    bool applied = false;
+    // Local endpoint after installation; omitted if unchanged. Installation
+    // may replenish bootstrap metadata, such as the next NCCL unique ID.
+    // The Coordinator saves this endpoint for future snapshots.
+    std::optional<DeviceTransferEndpoint> updated_endpoint;
 };
 
 struct ViewUpdateAck {
@@ -229,6 +262,10 @@ struct PushViewUpdate {
     GroupView view;
 };
 
+struct PushTransferEndpointUpdate {
+    TransferEndpointUpdatePush push;
+};
+
 struct ReplyProposal {
     uint64_t propose_id = 0;
     ProposeViewUpdateResponse response;
@@ -243,9 +280,21 @@ struct ShutdownCoordinatorHost {};
 
 using CoordinatorEffect =
     std::variant<BroadcastRankState, PushViewUpdate, ReplyProposal,
-                 BroadcastPeerJoined, ReplySync, ShutdownCoordinatorHost>;
+                 BroadcastPeerJoined, ReplySync, ShutdownCoordinatorHost,
+                 PushTransferEndpointUpdate>;
 
 // Agent effects
+
+struct InstallTransferEndpoints {
+    uint64_t request_id = 0;
+    DeviceTransferSnapshot snapshot;
+    uint64_t reclaim_before_version = 0;
+};
+
+struct InstallDeviceCollectiveWorkspaceEndpoint {
+    GlobalRank rank = kInvalidGlobalRank;
+    DeviceCollectiveWorkspaceEndpoint endpoint;
+};
 
 struct EnablePeerProbe {
     GlobalRank rank = kInvalidGlobalRank;
@@ -274,11 +323,23 @@ struct DisconnectAllLinks {};
 
 struct ClearAllPeerMetadata {};
 
-struct ApplyViewToCommunicator {
+// Full communicator update. The GroupView and its derived rank-state snapshot
+// are applied together before group/rank waiters are notified.
+struct ApplyGroupStateToCommunicator {
     GroupView view;
     std::vector<RankState> rank_states;
     std::vector<uint64_t> rank_epochs;
     std::vector<bool> activatable;
+};
+
+// Incremental rank-state update that leaves the applied GroupView unchanged.
+struct ApplyRankStateToCommunicator {
+    GroupId group_id;
+    GlobalRank rank = kInvalidGlobalRank;
+    InGroupRank in_group_rank = kInvalidInGroupRank;
+    RankState state = RankState::Offline;
+    uint64_t rank_epoch = 0;
+    bool activatable = false;
 };
 
 struct ResetPeerState {
@@ -303,11 +364,13 @@ struct NotifyRanksActivated {
 };
 
 using AgentEffect =
-    std::variant<EnablePeerProbe, DisconnectLink, RequestLinkHealthCheck,
-                 SendLinkEventReport, StopReconnect, DisconnectAllLinks,
-                 ClearAllPeerMetadata, ApplyViewToCommunicator, ResetPeerState,
-                 RefreshPeerLink, NotifyLinkRefreshed, NotifyGroupReady,
-                 NotifyRanksActivated>;
+    std::variant<InstallTransferEndpoints,
+                 InstallDeviceCollectiveWorkspaceEndpoint, EnablePeerProbe,
+                 DisconnectLink, RequestLinkHealthCheck, SendLinkEventReport,
+                 StopReconnect, DisconnectAllLinks, ClearAllPeerMetadata,
+                 ApplyGroupStateToCommunicator, ApplyRankStateToCommunicator,
+                 ResetPeerState, RefreshPeerLink, NotifyLinkRefreshed,
+                 NotifyGroupReady, NotifyRanksActivated>;
 
 // Results produced by the Coordinator/Agent state machine
 
@@ -363,6 +426,9 @@ class AgentRpcService {
     virtual void onRankStateUpdate(RankStatePush push) = 0;
     virtual void onViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
                               ViewUpdatePush push) = 0;
+    virtual void onTransferEndpointUpdate(
+        coro_rpc::context<TransferEndpointUpdateAck> ctx,
+        TransferEndpointUpdatePush push) = 0;
 };
 
 }  // namespace mooncake

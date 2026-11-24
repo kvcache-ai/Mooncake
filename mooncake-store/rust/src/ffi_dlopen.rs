@@ -14,7 +14,7 @@
 
 //! Runtime `dlopen` bindings for the Mooncake Store C API (`store_c.h`).
 //!
-//! The raw loader (types, layout checks, all `mooncake_store_*` symbols) is
+//! The raw loader (types, layout checks and required C symbols) is
 //! bindgen-generated from `store_c.h` (`dynamic_library_name`, see build.rs), so
 //! the ABI is never hand-maintained; this module wraps it in a process-global
 //! plus free-function shims so `crate::store` is backend-agnostic. The library
@@ -64,7 +64,7 @@ fn library_path() -> OsString {
 }
 
 /// Open the library and resolve every symbol up front (`dynamic_link_require_all`
-/// makes this fail if any `mooncake_store_*` symbol is missing).
+/// makes this fail if a required C symbol is missing).
 fn load(path: &OsStr) -> Result<sys::MooncakeStoreLib, StoreError> {
     unsafe { sys::MooncakeStoreLib::new(path) }.map_err(|e| StoreError::LibraryLoad(e.to_string()))
 }
@@ -183,6 +183,26 @@ shims! {
         buffers: *mut *mut c_void,
         sizes: *const usize,
         count: usize,
+        results_out: *mut i64,
+    ) -> c_int;
+    fn mooncake_store_batch_put_from_multi_buffers(
+        store: mooncake_store_t,
+        keys: *mut *const c_char,
+        buffers: *mut *mut c_void,
+        sizes: *const usize,
+        counts: *const usize,
+        count: usize,
+        config: *const mooncake_replicate_config_t,
+        results_out: *mut c_int,
+    ) -> c_int;
+    fn mooncake_store_batch_get_into_multi_buffers(
+        store: mooncake_store_t,
+        keys: *mut *const c_char,
+        buffers: *mut *mut c_void,
+        sizes: *const usize,
+        counts: *const usize,
+        count: usize,
+        prefer_alloc_in_same_node: c_int,
         results_out: *mut i64,
     ) -> c_int;
     fn mooncake_store_is_exist(store: mooncake_store_t, key: *const c_char) -> c_int;

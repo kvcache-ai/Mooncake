@@ -258,6 +258,7 @@ redirects = {
     "design/engram": "store/engram.html",
     "design/tent/tebench": "../../performance/mooncake/tebench.html",
     "deployment/ssd-offload": "ssd/ssd-offload.html",
+    "deployment/oss-offload": "object-storage-offload.html",
     "deployment/nvmf-ssd-deployment-guide": "ssd/nvmf-ssd-deployment-guide.html",
     "integrations/index": "../deployment/index.html",
     "integrations/lmcache": "../deployment/integrations/lmcache/index.html",
@@ -296,6 +297,34 @@ redirects = {
     "python-api-reference/transfer-engine": "../api-reference/python/transfer-engine.html",
     "http-api-reference/http-service": "../api-reference/http/http-service.html",
     "design/transfer-engine/cpp-api": "../../api-reference/cpp/transfer-engine.html",
+    "design/transfer-engine/efa_transport": "transport/efa_transport.html",
+    "design/transfer-engine/ascend_transport": "transport/ascend_transport.html",
+    "design/transfer-engine/ascend_direct_transport": "transport/ascend_direct_transport.html",
+    "design/transfer-engine/kunpeng_ub_transport": "transport/kunpeng_ub_transport.html",
+    "design/transfer-engine/sunrise_link_transport": "transport/sunrise_link_transport.html",
+    "design/transfer-engine/flagcx_transport": "transport/flagcx_transport.html",
+    "design/transfer-engine/mpcomm_transport": "transport/mpcomm_transport.html",
+    "design/transfer-engine/heterogeneous_ascend": "transport/heterogeneous_ascend.html",
     "design/tent/cpp-api": "../../api-reference/cpp/tent.html",
     "design/conductor/indexer-api-design": "../../api-reference/http/conductor-indexer.html",
 }
+
+# Pages that embed the live ecosystem PR dashboard; its assets load only there.
+PR_DASHBOARD_PAGES = {"community/ecosystem-prs"}
+
+
+def add_pr_dashboard_assets(app, pagename, templatename, context, doctree):
+    if pagename in PR_DASHBOARD_PAGES:
+        app.add_css_file("pr-dashboard.css")
+        app.add_js_file("pr-dashboard.js", loading_method="defer")
+
+
+def add_pypi_downloads_assets(app, pagename, templatename, context, doctree):
+    if pagename == "community/pypi-downloads":
+        app.add_css_file("pypi-downloads.css")
+        app.add_js_file("pypi-downloads.js", loading_method="defer")
+
+
+def setup(app):
+    app.connect("html-page-context", add_pr_dashboard_assets)
+    app.connect("html-page-context", add_pypi_downloads_assets)

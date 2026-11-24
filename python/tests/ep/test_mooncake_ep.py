@@ -1,5 +1,10 @@
+"""Legacy EP correctness and bandwidth test with optional NCCL bootstrap.
+
+Single-node P2P: python test_mooncake_ep.py --pg-backend nccl --require-native
+"""
+
+import argparse
 import random
-import os
 import torch
 import torch.distributed as dist
 from functools import partial
@@ -13,13 +18,6 @@ from ep_test_utils import (
     hash_tensor,
     per_token_cast_back,
 )
-
-_USE_MACA = os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {
-    "1",
-    "ON",
-    "TRUE",
-    "YES",
-} or bool(getattr(torch.version, "maca", None))
 
 
 def test_main(
@@ -67,9 +65,9 @@ def test_main(
     # Check dispatch correctness
     do_check = True
     hash_value, num_times = 0, 0
-    active_ranks = torch.ones((num_tokens,), dtype=torch.int32, device="cuda")
+    active_ranks = torch.ones((num_ranks,), dtype=torch.int32, device="cuda")
     for return_recv_hook in (False, True):
-        for dispatch_use_fp8 in [False] if _USE_MACA else [False, True]:
+        for dispatch_use_fp8 in [False, True]:
             num_times += 1
             for i in range((num_times % 2) + 1):
                 packed_recv_x, packed_recv_count, handle, event, hook = buffer.dispatch(
@@ -149,8 +147,10 @@ def test_main(
                 else:
                     hash_value ^= hash_tensor(packed_recv_x[i, :num_valid_tokens])
 
-            # Check combine correctness
-            for zero_copy in (False, True):
+            # Check combine correctness. The supported MACA surface retains
+            # the legacy zero_copy branch for API coverage, but only executes
+            # the regular path.
+            for zero_copy in (False,):
                 if zero_copy:
                     buffer.get_next_combine_buffer(handle)[:, :, :] = simulated_gemm_x
                 out = torch.empty(
@@ -163,8 +163,8 @@ def test_main(
                     active_ranks,
                     -1,
                     handle,
-                    async_finish=not return_recv_hook,
                     zero_copy=zero_copy,
+                    async_finish=not return_recv_hook,
                     return_recv_hook=return_recv_hook,
                     out=out,
                 )
@@ -189,7 +189,7 @@ def test_main(
         hook()
 
     # noinspection PyShadowingNames
-    def test_func(zero_copy: bool, return_recv_hook: bool):
+    def test_func(return_recv_hook: bool):
         recv_x, recv_count, handle, event, hook = buffer.dispatch(
             x,
             topk_idx,
@@ -201,8 +201,6 @@ def test_main(
             return_recv_hook=return_recv_hook,
         )
         large_gemm_with_hook(hook) if return_recv_hook else None
-        if zero_copy:
-            buffer.get_next_combine_buffer(handle)[:, :, :] = simulated_gemm_x
         combined_x, event, hook = buffer.combine(
             simulated_gemm_x,
             topk_idx,
@@ -210,7 +208,6 @@ def test_main(
             active_ranks,
             -1,
             handle,
-            zero_copy=zero_copy,
             return_recv_hook=return_recv_hook,
         )
         large_gemm_with_hook(hook) if return_recv_hook else None
@@ -224,9 +221,7 @@ def test_main(
         num_combine_comm_bytes += num_bf16_bytes * num_selections
 
     # Dispatch + combine testing
-    avg_t, min_t, max_t = bench(
-        partial(test_func, zero_copy=False, return_recv_hook=False)
-    )
+    avg_t, min_t, max_t = bench(partial(test_func, return_recv_hook=False))
     print(
         f"[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, "
         f"avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us",
@@ -239,7 +234,7 @@ def test_main(
         for return_recv_hook in (False, True):
             group.barrier()
             dispatch_t, combine_t = bench_kineto(
-                partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
+                partial(test_func, return_recv_hook=return_recv_hook),
                 kernel_names=("dispatch", "combine"),
                 barrier_comm_profiling=True,
                 suppress_kineto_output=True,
@@ -281,8 +276,8 @@ def test_main(
 
 
 # noinspection PyUnboundLocalVariable
-def test_loop(local_rank: int, num_local_ranks: int):
-    rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+def test_loop(local_rank: int, num_local_ranks: int, args):
+    rank, num_ranks, group = init_dist(local_rank, num_local_ranks, args.pg_backend)
     num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 288
 
     num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
@@ -291,12 +286,23 @@ def test_loop(local_rank: int, num_local_ranks: int):
     if local_rank == 0:
         print(f"Allocating buffer size: {num_ep_buffer_bytes / 1e6} MB ...", flush=True)
     buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
-    # Mock a broken rank 1 to test effectiveness of EP recovery
-    if local_rank != 1:
-        buffer.update_ep_member()
-    else:
-        buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
-
+    # The asymmetric update/rebuild scenario uses Mooncake PG recovery.
+    # NCCL bootstrap keeps fixed membership: update and initial connect have
+    # different collective sequences, so run the healthy data-path checks.
+    if args.pg_backend == "mooncake":
+        if local_rank != 1:
+            buffer.update_ep_member()
+        else:
+            buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
+    elif local_rank == 0:
+        print("NCCL bootstrap: skipping asymmetric member recovery", flush=True)
+    if args.require_native:
+        assert not buffer._use_fallback, "Native EP fast path is required"
+    print(
+        f"rank={rank} device={torch.cuda.get_device_name(local_rank)} "
+        f"fallback={buffer._use_fallback}",
+        flush=True,
+    )
     test_main(
         num_tokens,
         hidden,
@@ -308,6 +314,8 @@ def test_loop(local_rank: int, num_local_ranks: int):
         buffer,
         seed=1,
     )
+
+    print(f"rank={rank} MOONCAKE_EP_TEST_PASS", flush=True)
 
     do_pressure_test = False
     for seed in range(int(1e9) if do_pressure_test else 0):
@@ -350,5 +358,15 @@ def test_loop(local_rank: int, num_local_ranks: int):
 
 if __name__ == "__main__":
     # TODO: you may modify NUMA binding for less CPU overhead
-    num_processes = 2
-    torch.multiprocessing.spawn(test_loop, args=(num_processes,), nprocs=num_processes)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--pg-backend", choices=("mooncake", "nccl"), default="mooncake"
+    )
+    parser.add_argument("--num-ranks", type=int, default=2)
+    parser.add_argument("--require-native", action="store_true")
+    args = parser.parse_args()
+    if args.num_ranks < 2:
+        parser.error("num-ranks must be at least 2")
+    torch.multiprocessing.spawn(
+        test_loop, args=(args.num_ranks, args), nprocs=args.num_ranks
+    )

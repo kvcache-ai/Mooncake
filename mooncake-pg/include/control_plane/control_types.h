@@ -1,30 +1,21 @@
 #ifndef MOONCAKE_PG_CONTROL_PLANE_CONTROL_TYPES_H
 #define MOONCAKE_PG_CONTROL_PLANE_CONTROL_TYPES_H
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
 
-namespace mooncake {
+#include "common_types.h"
 
-// There are two rank namespaces that are easy to confuse:
-//
-//   * GlobalRank  - process-wide identifier, range 0 .. max_world_size-1.
-//                   Used for process-level states
-//   * InGroupRank - group-local identifier, range 0 .. group_size-1.
-//                   Used inside a single process group and mapped to a
-//                   GlobalRank through GroupView::rank_order.
-using GlobalRank = int32_t;
-using InGroupRank = int32_t;
+namespace mooncake {
 
 // Bootstrap ID: Backend type ("cpu:" or "device:") + PyTorch-assigned group_id.
 using GroupBootstrapId = std::string;
 // Coordinator-assigned unique group id
 using GroupId = std::string;
-
-constexpr GlobalRank kInvalidGlobalRank = -1;
-constexpr int kMaxNumRanks = 64;
+using DeviceUUID = std::array<uint8_t, 16>;
 
 // Resolves a registration only against runtime groups stored under the same
 // GroupBootstrapId, i.e. the same device kind and PyTorch group id.
@@ -55,6 +46,113 @@ enum class RankState : uint8_t {
     Healthy = 2,
 };
 
+// Route-specific bootstrap metadata published by one device transfer service.
+// `route_key` and `version` identify the in-process RouteProvider that can
+// interpret `metadata`. Unknown routes are intentionally preserved so peers
+// with different locally available hardware can still exchange endpoints.
+struct RouteEndpoint {
+    std::string route_key;
+    uint32_t version = 0;
+    std::vector<uint8_t> metadata;
+
+    bool operator==(const RouteEndpoint&) const = default;
+};
+
+// Process-level collective buffer in DTS's peer-accessible region.
+struct DeviceCollectiveWorkspaceEndpoint {
+    uint64_t buffer_offset = 0;
+    uint64_t buffer_size = 0;
+
+    bool operator==(const DeviceCollectiveWorkspaceEndpoint&) const = default;
+};
+
+// Process-level metadata for the device transfer service.
+struct DeviceTransferEndpoint {
+    uint64_t region_address = 0;
+    uint64_t region_size = 0;
+
+    std::vector<RouteEndpoint> routes;
+    // Orders publications within a rank epoch. Publishing alone does not
+    // request an installation or invalidate installed resources.
+    uint64_t version = 0;
+
+    bool operator==(const DeviceTransferEndpoint&) const = default;
+};
+
+// Process-level endpoints selected by the Coordinator for one installation.
+// endpoints and rank_epochs are indexed by GlobalRank.
+struct DeviceTransferSnapshot {
+    std::vector<std::optional<DeviceTransferEndpoint>> endpoints;
+    std::vector<uint64_t> rank_epochs;
+    std::vector<GlobalRank> participants;
+    uint64_t version = 0;
+
+    bool operator==(const DeviceTransferSnapshot&) const = default;
+};
+
+// Communicator-local signals interpreted by Simple primitives. Payload uses
+// the process-level collective workspace.
+struct SimpleEndpoint {
+    uint64_t signal_offset = 0;
+    uint32_t signal_count = 0;
+
+    bool operator==(const SimpleEndpoint&) const = default;
+};
+
+// Communicator-local control signals interpreted by LL primitives.
+struct LLEndpoint {
+    uint64_t signal_offset = 0;
+    uint32_t signal_count = 0;
+    DeviceUUID device_uuid{};
+    // Hardware peers supporting native atomics from this device.
+    std::vector<DeviceUUID> native_atomic_peer_uuids;
+
+    bool operator==(const LLEndpoint&) const = default;
+};
+
+// Private one-shot packet storage.
+struct OneShotEndpoint {
+    uint64_t buffer_offset = 0;
+    uint64_t buffer_size = 0;
+
+    bool operator==(const OneShotEndpoint&) const = default;
+};
+
+// Runtime, protocol and algorithm endpoints owned by one communicator.
+struct DeviceGroupEndpoint {
+    // Runtime-owned signal slice for synchronizing one GroupView incarnation.
+    // Each slot is written only by the peer with the matching InGroupRank.
+    uint64_t view_epoch_signal = 0;
+    uint32_t view_epoch_signal_count = 0;
+
+    std::optional<SimpleEndpoint> simple;
+    std::optional<LLEndpoint> ll;
+    std::optional<OneShotEndpoint> one_shot;
+
+    [[nodiscard]] bool empty() const noexcept {
+        return view_epoch_signal_count == 0 && !simple.has_value() &&
+               !ll.has_value() && !one_shot.has_value();
+    }
+
+    // Ring is the baseline; LL and one-shot resources are optional.
+    [[nodiscard]] bool hasAllRequiredEndpoints() const noexcept {
+        return view_epoch_signal_count != 0 && simple.has_value();
+    }
+
+    [[nodiscard]] bool supportsBackend(
+        GpuCollectiveBackend backend) const noexcept {
+        switch (backend) {
+            case GpuCollectiveBackend::Legacy:
+                return true;
+            case GpuCollectiveBackend::New:
+                return hasAllRequiredEndpoints();
+        }
+        return false;
+    }
+
+    bool operator==(const DeviceGroupEndpoint&) const = default;
+};
+
 // Group-level, per-(group_id, rank) buffer/sync/P2P addresses.
 struct GroupEndpointInfo {
     // Coordinator-assigned endpoint version.
@@ -71,6 +169,9 @@ struct GroupEndpointInfo {
     // p2p
     uint64_t p2p_credit_region = 0;
     uint64_t p2p_ack_region = 0;
+
+    // Empty for CPU communicators and ranks without device algorithms.
+    DeviceGroupEndpoint device_collective;
 
     bool operator==(const GroupEndpointInfo&) const = default;
 };
@@ -104,6 +205,9 @@ enum class GroupMemberState : uint8_t {
 // Rank state inside a single GroupView.
 struct GroupMember {
     GroupMemberState status = GroupMemberState::None;
+    // GPU ranks advertise a concrete preference at registration. CPU ranks
+    // leave it empty because this decision does not govern CPU collectives.
+    std::optional<GpuCollectiveBackend> preferred_gpu_collective_backend;
     std::optional<GroupEndpointInfo> endpoint;
 
     bool isNone() const { return status == GroupMemberState::None; }
@@ -138,12 +242,29 @@ enum class GroupStatus : uint8_t {
     Ready = 2,
 };
 
+enum class DeviceAllReduceAlgorithm : uint8_t {
+    Ring = 1,
+    OneShot = 2,
+};
+
+// Coordinator-provided upper bounds, in increasing byte order.
+struct DeviceAllReduceAlgorithmChoice {
+    uint64_t max_bytes = 0;
+    DeviceAllReduceAlgorithm algorithm = DeviceAllReduceAlgorithm::Ring;
+
+    bool operator==(const DeviceAllReduceAlgorithmChoice&) const = default;
+};
+
 // Runtime state for a group.
 struct GroupView {
     GroupId group_id;
     GroupStatus status = GroupStatus::Bootstrapping;
     uint64_t epoch = 0;
     bool auto_deactivate = true;
+    // Coordinator-selected implementation for active GPU group members. It is
+    // empty for CPU groups and until a GPU group leaves Bootstrapping.
+    std::optional<GpuCollectiveBackend> gpu_collective_backend;
+    std::vector<DeviceAllReduceAlgorithmChoice> all_reduce_algorithm_choices;
     int32_t max_group_size = 0;          // fixed in-group slot capacity
     std::vector<GlobalRank> rank_order;  // InGroupRank -> GlobalRank
     std::vector<GroupMember> members;    // indexed by GlobalRank

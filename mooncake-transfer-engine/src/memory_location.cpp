@@ -14,9 +14,109 @@
 
 #include "memory_location.h"
 
+#include <unistd.h>
+
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <fstream>
+
 #include "cuda_alike.h"
 
 namespace mooncake {
+
+size_t detectBufferPageSize(void *addr) {
+    const size_t fallback = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    std::ifstream smaps("/proc/self/smaps");
+    if (!smaps.is_open()) return fallback;
+
+    const uintptr_t target = reinterpret_cast<uintptr_t>(addr);
+    std::string line;
+    bool in_range = false;
+
+    while (std::getline(smaps, line)) {
+        // VMA header: "start-end perms offset dev inode [pathname]".
+        if (!line.empty() &&
+            std::isxdigit(static_cast<unsigned char>(line[0]))) {
+            unsigned long start = 0, end = 0;
+            if (std::sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
+                in_range = target >= start && target < end;
+            }
+        } else if (in_range && line.compare(0, 15, "KernelPageSize:") == 0) {
+            unsigned long kb = 0;
+            if (std::sscanf(line.c_str(), "KernelPageSize: %lu kB", &kb) == 1 &&
+                kb > 0) {
+                return kb * 1024;
+            }
+        }
+    }
+    return fallback;
+}
+
+// Parses a smaps VMA header ("start-end perms ..."). Field lines can start
+// with a hex digit too (e.g. "AnonHugePages:"), so a leading hex digit alone
+// does not identify a header.
+static bool parseVmaHeader(const std::string &line, unsigned long *start,
+                           unsigned long *end) {
+    char dash = 0;
+    return !line.empty() &&
+           std::isxdigit(static_cast<unsigned char>(line[0])) &&
+           std::sscanf(line.c_str(), "%lx%c%lx", start, &dash, end) == 3 &&
+           dash == '-';
+}
+
+bool hasHugepageAdvice(void *addr) {
+    std::ifstream smaps("/proc/self/smaps");
+    if (!smaps.is_open()) return false;
+
+    const uintptr_t target = reinterpret_cast<uintptr_t>(addr);
+    std::string line;
+    bool in_range = false;
+
+    while (std::getline(smaps, line)) {
+        unsigned long start = 0, end = 0;
+        if (parseVmaHeader(line, &start, &end)) {
+            in_range = target >= start && target < end;
+        } else if (in_range && line.compare(0, 8, "VmFlags:") == 0) {
+            // Two-letter flags separated by spaces; "hg" is MADV_HUGEPAGE.
+            return (line + " ").find(" hg ") != std::string::npos;
+        }
+    }
+    return false;
+}
+
+bool isThpBacked(void *addr, size_t length) {
+    std::ifstream smaps("/proc/self/smaps");
+    if (!smaps.is_open() || length == 0) return false;
+
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(addr);
+    const uintptr_t finish = begin + length;
+    std::string line;
+    bool overlaps = false;
+    size_t covered = 0;
+    long rss_kb = -1;
+
+    while (std::getline(smaps, line)) {
+        unsigned long start = 0, end = 0;
+        if (parseVmaHeader(line, &start, &end)) {
+            overlaps = start < finish && end > begin;
+            if (overlaps)
+                covered += std::min<uintptr_t>(end, finish) -
+                           std::max<uintptr_t>(start, begin);
+            rss_kb = -1;
+        } else if (overlaps && line.compare(0, 4, "Rss:") == 0) {
+            if (std::sscanf(line.c_str(), "Rss: %ld kB", &rss_kb) != 1)
+                return false;
+        } else if (overlaps && line.compare(0, 14, "AnonHugePages:") == 0) {
+            long thp_kb = -1;
+            if (std::sscanf(line.c_str(), "AnonHugePages: %ld kB", &thp_kb) !=
+                    1 ||
+                rss_kb <= 0 || thp_kb != rss_kb)
+                return false;
+        }
+    }
+    return covered == length;
+}
 
 uintptr_t alignPage(uintptr_t address) { return address & ~(pagesize - 1); }
 
@@ -32,7 +132,7 @@ std::string genGpuNodeName(int node) {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX) || defined(USE_SUNRISE)
+    defined(USE_COREX) || defined(USE_SUPA) || defined(USE_SUNRISE)
 // A GPU-less host (e.g. an RDMA-only sidecar) has no device for
 // cudaPointerGetAttributes to classify, yet a CUDA-enabled build probes
 // every buffer, each call failing and logging a per-buffer ERROR that
@@ -55,7 +155,7 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX) || defined(USE_SUNRISE)
+    defined(USE_COREX) || defined(USE_SUPA) || defined(USE_SUNRISE)
     static const bool cuda_device_present = detectCudaDevicePresent();
 
     if (cuda_device_present) {

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <sstream>
@@ -197,6 +198,13 @@ struct UbTransport::Impl {
                 static_cast<Topology::NicID>(id), found->second, adapter);
             status = context->initialize(params.jfc_per_context, jfc_options);
             if (!status.ok()) {
+                if (context->state() == ub::UbContext::State::kDraining) {
+                    // Initialization produced a native handle whose cleanup
+                    // also failed. Adopt it into the transport graph and abort
+                    // installation so uninstall can retry without a leak.
+                    contexts.push_back(std::move(context));
+                    return failInstall(status);
+                }
                 LOG(WARNING) << "Disable UB device " << nic->name << ": "
                              << status.ToString();
                 continue;
@@ -328,6 +336,14 @@ struct UbTransport::Impl {
             },
             [this](const std::shared_ptr<ub::UbEndpoint>& endpoint) {
                 if (endpoints) (void)endpoints->retire(endpoint);
+            },
+            [this](Topology::NicID local_topology_id) {
+                if (!endpoints) {
+                    return Status::InternalError(
+                        "UB endpoint store is unavailable during device "
+                        "failure cleanup" LOC_MARK);
+                }
+                return endpoints->retireLocalDevice(local_topology_id);
             });
         status = workers->start();
         if (!status.ok()) return failInstall(status);
@@ -342,17 +358,23 @@ struct UbTransport::Impl {
     }
 
     Status failInstall(Status failure) {
-        (void)shutdownUnlocked();
+        // Install now fails fast, so a failed rollback can leave native
+        // resources owned by this object. Surface that instead of silently
+        // discarding it, otherwise the leak is only visible as a later
+        // install/uninstall failure.
+        auto cleanup = shutdownUnlocked();
+        if (!cleanup.ok()) {
+            LOG(WARNING)
+                << "UB transport rollback after a failed install could "
+                   "not release every native resource: "
+                << cleanup.ToString();
+        }
         return failure;
     }
 
     Status shutdownUnlocked() {
         installed.store(false, std::memory_order_release);
         shutting_down.store(true, std::memory_order_release);
-        Status first_error = Status::OK();
-        auto remember = [&first_error](const Status& status) {
-            if (first_error.ok() && !status.ok()) first_error = status;
-        };
 
         // Callback replacement waits for a currently executing UB bootstrap
         // handler, fencing all control-plane access before resources retire.
@@ -382,7 +404,15 @@ struct UbTransport::Impl {
             buffers.reset();
         }
         for (auto it = contexts.rbegin(); it != contexts.rend(); ++it) {
-            if (*it) remember((*it)->shutdown());
+            if (!*it) continue;
+            auto status = (*it)->shutdown();
+            if (!status.ok()) {
+                // Keep the entire context vector and both lookup maps until
+                // every JFC and Context has been released. Some contexts may
+                // already be closed, but their idempotent shutdown keeps the
+                // ownership graph intact while the failed handle is retried.
+                return status;
+            }
         }
         contexts.clear();
         context_by_topology_id.clear();
@@ -390,7 +420,13 @@ struct UbTransport::Impl {
         rails.reset();
         quota.reset();
         if (adapter_initialized && adapter) {
-            remember(adapter->shutdown());
+            auto status = adapter->shutdown();
+            if (!status.ok()) {
+                // A failed provider shutdown remains an initialized adapter
+                // for lifecycle purposes. Do not permit reinstall or discard
+                // it; a later uninstall retries the provider operation.
+                return status;
+            }
             adapter_initialized = false;
         }
         metadata.reset();
@@ -398,7 +434,7 @@ struct UbTransport::Impl {
         conf.reset();
         local_segment_name.clear();
         shutting_down.store(false, std::memory_order_release);
-        return first_error;
+        return Status::OK();
     }
 
     Status publishLocalDevices() {
@@ -437,6 +473,21 @@ struct UbTransport::Impl {
         return manager.synchronizeLocal();
     }
 
+    void recordReadyEndpoint(const std::shared_ptr<ub::UbEndpoint>& endpoint) {
+        if (!endpoint || !endpoint->ready() || !rails) return;
+
+        // RailMonitor keeps the per-rail generation watermark and ignores
+        // generations it has already seen, so this is safe to call from every
+        // resolve as well as from converging or retried rebuild paths. Keeping
+        // the watermark there also means no peer-keyed state accumulates here
+        // across peer restarts, and the posting hot path takes only
+        // RailMonitor's lock instead of a second transport-wide one.
+        const auto& key = endpoint->key();
+        rails->recordEndpointRebuild(
+            ub::UbPostPath{key.local_topology_id, key.remote_segment_id,
+                           key.remote_topology_id, endpoint->generation()});
+    }
+
     Status resolveEndpoint(const ub::EndpointResolveRequest& request,
                            std::shared_ptr<ub::UbEndpoint>& endpoint) {
         endpoint.reset();
@@ -460,7 +511,10 @@ struct UbTransport::Impl {
                               request.remote_topology_id, peer_path};
         CHECK_STATUS(
             endpoints->getOrCreate(key, request.local_context, endpoint));
-        if (endpoint->ready()) return Status::OK();
+        if (endpoint->ready()) {
+            recordReadyEndpoint(endpoint);
+            return Status::OK();
+        }
 
         const std::string local_path =
             MakeNicPath(local_segment_name,
@@ -483,6 +537,7 @@ struct UbTransport::Impl {
             endpoint.reset();
             return status;
         }
+        recordReadyEndpoint(endpoint);
         return Status::OK();
     }
 
@@ -515,6 +570,9 @@ struct UbTransport::Impl {
             status = endpoint->makeBootstrapDesc(
                 local_segment_name, request.peer_nic_path,
                 request.local_nic_path, currentSegmentGeneration(), response);
+        }
+        if (status.ok()) {
+            recordReadyEndpoint(endpoint);
         }
         if (!status.ok()) {
             if (endpoint) (void)endpoints->retire(endpoint);
@@ -648,6 +706,7 @@ Status UbTransport::submitTransferTasks(
 
     const auto notify_progress = ub_batch->notify_progress;
     const auto progress_batch_id = ub_batch->progress_batch_id;
+    auto progress_armed = std::make_shared<std::atomic<bool>>(false);
     std::vector<ub::UbTask::Ptr> new_tasks;
     new_tasks.reserve(request_list.size());
     for (const auto& request : request_list) {
@@ -660,9 +719,12 @@ Status UbTransport::submitTransferTasks(
                 "transports/ub/max_slices_per_task" LOC_MARK);
         }
         auto task = ub::UbTask::create(
-            request,
-            [notify_progress, progress_batch_id](const TransferStatus&) {
-                if (notify_progress) notify_progress(progress_batch_id);
+            request, [notify_progress, progress_batch_id,
+                      progress_armed](const TransferStatus&) {
+                if (progress_armed->load(std::memory_order_acquire) &&
+                    notify_progress) {
+                    notify_progress(progress_batch_id);
+                }
             });
         size_t offset = 0;
         while (offset < request.length) {
@@ -684,15 +746,15 @@ Status UbTransport::submitTransferTasks(
         new_tasks.push_back(std::move(task));
     }
 
-    for (auto& task : new_tasks) {
-        ub_batch->task_list.push_back(task);
-        auto status = impl_->workers->submit(task, ub_batch->device_mask);
-        if (!status.ok()) {
-            for (auto& queued : new_tasks) {
-                if (queued) queued->requestCancellation();
-            }
-            return status;
-        }
+    CHECK_STATUS(impl_->workers->submitBatch(new_tasks, ub_batch->device_mask));
+    ub_batch->task_list.insert(ub_batch->task_list.end(), new_tasks.begin(),
+                               new_tasks.end());
+    progress_armed->store(true, std::memory_order_release);
+    // A very small task can finish between worker publication and the batch
+    // append above. Its callback intentionally stays disarmed until the task
+    // is queryable; this notification closes that race.
+    if (!new_tasks.empty() && notify_progress) {
+        notify_progress(progress_batch_id);
     }
     return Status::OK();
 }
@@ -778,6 +840,42 @@ double UbTransport::getEstimatedBandwidth() const {
     if (!impl_->params.enable_bandwidth_estimation || !impl_->rails)
         return -1.0;
     return impl_->rails->aggregateBandwidth();
+}
+
+Status UbTransport::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
+    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    if (!impl_->quota || !impl_->rails || !impl_->local_topology) {
+        return Status::OK();
+    }
+
+    std::unordered_map<Topology::NicID, double> bandwidth_by_device;
+    for (const auto& rail : impl_->rails->allStats()) {
+        if (rail.paused || rail.ewma_bandwidth_bytes_per_second < 0.0) {
+            continue;
+        }
+        auto [it, inserted] = bandwidth_by_device.emplace(
+            rail.key.local_topology_id, rail.ewma_bandwidth_bytes_per_second);
+        if (!inserted) {
+            it->second =
+                std::max(it->second, rail.ewma_bandwidth_bytes_per_second);
+        }
+    }
+
+    const auto device_stats = impl_->quota->allDeviceStats();
+    stats.reserve(stats.size() + device_stats.size());
+    for (const auto& device : device_stats) {
+        std::string name =
+            impl_->local_topology->getNicName(device.local_topology_id);
+        if (name.empty()) name = std::to_string(device.local_topology_id);
+        const auto bandwidth =
+            bandwidth_by_device.find(device.local_topology_id);
+        stats.push_back(NicLoadStats{
+            std::move(name),
+            device.usage.inflight_bytes,
+            bandwidth == bandwidth_by_device.end() ? 0.0 : bandwidth->second,
+        });
+    }
+    return Status::OK();
 }
 
 }  // namespace mooncake::tent

@@ -30,6 +30,16 @@ def cuda_available():
     return _torch is not None and _torch.cuda.is_available()
 
 
+def xpu_available():
+    return _torch is not None and hasattr(_torch, "xpu") and _torch.xpu.is_available()
+
+
+def tent_engine_selected():
+    # Intel XPU is only supported by the TENT engine. The store is created in
+    # setUpClass, so the selection must already be in the environment.
+    return bool(os.getenv("MC_USE_TENT") or os.getenv("MC_USE_TEV1"))
+
+
 # Define a test class for serialization
 class TestClass:
     def __init__(self, version=1, shape=(1, 2, 3)):
@@ -77,6 +87,13 @@ class TestDistributedObjectStore(unittest.TestCase):
         """Initialize the store once for all tests."""
         cls.store = MooncakeDistributedStore()
         get_client(cls.store)
+
+    @classmethod
+    def tearDownClass(cls):
+        # Close explicitly rather than relying on the process-exit backstop:
+        # tearing the client down from atexit, after the interpreter (and any
+        # accelerator runtime it pulled in) has finalized, is not reliable.
+        cls.store.close()
 
     def test_put_get_tensor(self):
         """Test storing and retrieving PyTorch tensors using put_tensor/get_tensor."""
@@ -251,6 +268,74 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.store.remove(upsert_key)
         for key in batch_put_keys + batch_upsert_keys:
             self.store.remove(key)
+        self.store.remove(raw_key)
+
+    @unittest.skipUnless(xpu_available(), "XPU is not available")
+    @unittest.skipUnless(
+        tent_engine_selected(), "XPU requires the TENT engine (set MC_USE_TENT=1)"
+    )
+    def test_xpu_local_copy_paths(self):
+        """Intel XPU tensors round-trip through the store via host staging.
+
+        Requires a wheel built with -DUSE_TENT=ON -DUSE_XPU=ON (icpx) and
+        MC_USE_TENT=1 in the environment. The tensors live in PyTorch-allocated
+        USM the store never saw before, so this exercises foreign-pointer
+        classification on both the store and Transfer Engine sides.
+        """
+        import torch
+
+        prefix = f"test_xpu_local_copy_{os.getpid()}"
+        put_key = f"{prefix}_put"
+        upsert_key = f"{prefix}_upsert"
+        raw_key = f"{prefix}_raw"
+
+        tensor = torch.arange(16, dtype=torch.float32, device="xpu")
+        torch.xpu.synchronize()
+        self.assertEqual(self.store.put_tensor(put_key, tensor), 0)
+        self.assertEqual(self.store.upsert_tensor(upsert_key, tensor), 0)
+        self.assertTrue(torch.equal(self.store.get_tensor(put_key), tensor.cpu()))
+        self.assertTrue(torch.equal(self.store.get_tensor(upsert_key), tensor.cpu()))
+
+        # get_tensor_into_cuda is device-agnostic: it writes straight into any
+        # registered accelerator buffer.
+        xpu_destination = torch.empty_like(tensor)
+        destination_bytes = tensor.numel() * tensor.element_size()
+        self.assertEqual(
+            self.store.register_buffer(xpu_destination.data_ptr(), destination_bytes),
+            0,
+        )
+        try:
+            self.assertEqual(
+                self.store.get_tensor_into_cuda(put_key, xpu_destination),
+                destination_bytes,
+            )
+            torch.xpu.synchronize()
+            self.assertTrue(torch.equal(xpu_destination, tensor))
+        finally:
+            self.store.unregister_buffer(xpu_destination.data_ptr())
+
+        # Larger than one staging chunk, random payload: byte-equality via
+        # put_from / get_into on registered XPU buffers.
+        big = torch.randint(0, 256, (4 << 20,), dtype=torch.uint8, device="xpu")
+        big_dst = torch.zeros_like(big)
+        torch.xpu.synchronize()
+        nbytes = big.numel()
+        self.assertEqual(self.store.register_buffer(big.data_ptr(), nbytes), 0)
+        self.assertEqual(self.store.register_buffer(big_dst.data_ptr(), nbytes), 0)
+        try:
+            self.assertEqual(self.store.put_from(raw_key, big.data_ptr(), nbytes), 0)
+            self.assertEqual(
+                self.store.get_into(raw_key, big_dst.data_ptr(), nbytes), nbytes
+            )
+            torch.xpu.synchronize()
+            self.assertTrue(torch.equal(big_dst, big))
+            self.assertEqual(self.store.get(raw_key), big.cpu().numpy().tobytes())
+        finally:
+            self.store.unregister_buffer(big.data_ptr())
+            self.store.unregister_buffer(big_dst.data_ptr())
+
+        self.store.remove(put_key)
+        self.store.remove(upsert_key)
         self.store.remove(raw_key)
 
     def test_put_get_tensor_with_metadata(self):

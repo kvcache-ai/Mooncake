@@ -36,9 +36,11 @@ class Status final {
         kTooManyRequests = 2,
         kAddressNotRegistered = 3,
         kBatchBusy = 4,
+        kBatchCleanupDeferred = 5,
         kDeviceNotFound = 6,
         kAddressOverlapped = 7,
         kNotSupportedTransport = 8,
+        kCompletionNotificationUnsupported = 9,
         kDns = 101,
         kSocket = 102,
         kMalformedJson = 103,
@@ -101,6 +103,11 @@ class Status final {
     // Returns true iff the status indicates a BatchBusy error.
     [[nodiscard]] bool IsBatchBusy() const { return Code::kBatchBusy == code_; }
 
+    // Returns true iff batch cleanup was deferred and the handle is invalid.
+    [[nodiscard]] bool IsBatchCleanupDeferred() const {
+        return Code::kBatchCleanupDeferred == code_;
+    }
+
     // Returns true iff the status indicates an DeviceNotFound error.
     [[nodiscard]] bool IsDeviceNotFound() const {
         return Code::kDeviceNotFound == code_;
@@ -155,6 +162,12 @@ class Status final {
         return Code::kNotSupportedTransport == code_;
     }
 
+    // Returns true iff completion notification cannot be used for this batch
+    // and the caller should poll instead.
+    [[nodiscard]] bool IsCompletionNotificationUnsupported() const {
+        return Code::kCompletionNotificationUnsupported == code_;
+    }
+
     // Return a combination of the error code name and message.
     std::string ToString() const;
 
@@ -174,6 +187,9 @@ class Status final {
     }
     static Status BatchBusy(std::string_view msg) {
         return Status(Code::kBatchBusy, msg);
+    }
+    static Status BatchCleanupDeferred(std::string_view msg) {
+        return Status(Code::kBatchCleanupDeferred, msg);
     }
     static Status DeviceNotFound(std::string_view msg) {
         return Status(Code::kDeviceNotFound, msg);
@@ -214,6 +230,9 @@ class Status final {
     }
     static Status NotSupportedTransport(std::string_view msg) {
         return Status(Code::kNotSupportedTransport, msg);
+    }
+    static Status CompletionNotificationUnsupported(std::string_view msg) {
+        return Status(Code::kCompletionNotificationUnsupported, msg);
     }
 
     // Return a human-readable name of the 'code'.

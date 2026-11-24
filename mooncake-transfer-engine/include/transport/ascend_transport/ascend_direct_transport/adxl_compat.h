@@ -52,10 +52,16 @@ enum MemType { MEM_DEVICE, MEM_HOST };
 
 enum TransferOp { READ, WRITE };
 
+// local_only reuses the first byte of the old reserved[128] so the struct
+// stays 144 bytes and matches the hixl MemDesc ABI. Default false means the
+// buffer may be exported. Zero-init of an older header stays compatible.
+// Mooncake's remote_accessible flag is the inverse: local_only =
+// !remote_accessible.
 struct MemDesc {
     uintptr_t addr;
     size_t len;
-    uint8_t reserved[128] = {};
+    bool local_only = false;
+    uint8_t reserved[127] = {};
 };
 
 struct TransferOpDesc {

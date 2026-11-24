@@ -215,9 +215,9 @@ tl::expected<PreparedRegionResource, ErrorCode> MemoryRegionDriver::PrepareOpen(
     }
 
     if (live_allocations.empty()) {
-        auto allocator =
-            CreateBufferAllocator(*allocator_type(), spec.name, spec.base,
-                                  spec.size, spec.transport_endpoint);
+        auto allocator = CreateBufferAllocator(
+            *allocator_type(), spec.name, spec.base, spec.size,
+            spec.transport_endpoint, spec.transport_protocol);
         if (!allocator) {
             return tl::make_unexpected(allocator.error());
         }
@@ -227,7 +227,7 @@ tl::expected<PreparedRegionResource, ErrorCode> MemoryRegionDriver::PrepareOpen(
     if (*allocator_type() == BufferAllocatorType::CACHELIB) {
         auto restored = ImportCachelibBufferAllocator(
             spec.name, spec.base, spec.size, spec.transport_endpoint,
-            live_allocations);
+            spec.transport_protocol, live_allocations);
         if (!restored) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -238,7 +238,7 @@ tl::expected<PreparedRegionResource, ErrorCode> MemoryRegionDriver::PrepareOpen(
     if (*allocator_type() == BufferAllocatorType::OFFSET) {
         auto restored = ImportOffsetBufferAllocator(
             spec.name, spec.base, spec.size, spec.transport_endpoint,
-            live_allocations);
+            spec.transport_protocol, live_allocations);
         if (!restored) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -256,6 +256,7 @@ MemoryRegionDriver::PrepareAdopt(
     if (!IsValidSpec(spec) || !allocator ||
         allocator->getSegmentName() != spec.name ||
         allocator->getTransportEndpoint() != spec.transport_endpoint ||
+        allocator->getTransportProtocol() != spec.transport_protocol ||
         allocator->base() != spec.base || allocator->capacity() != spec.size) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -309,7 +310,7 @@ tl::expected<RegionDriverRegistry, ErrorCode> CreateRegionDrivers(
     if (config.cxl) {
         auto allocator = CreateBufferAllocator(
             BufferAllocatorType::CACHELIB, config.cxl->path, DEFAULT_CXL_BASE,
-            config.cxl->size, config.cxl->path);
+            config.cxl->size, config.cxl->path, "cxl");
         if (!allocator) {
             return tl::make_unexpected(allocator.error());
         }

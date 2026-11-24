@@ -84,6 +84,25 @@ struct SelectionContext {
         policy_name;  // Optional: bind to specific policy by name
     IntentType intent_type{
         IntentType::INTENT_UNSPEC};  // Business intent for policy matching
+    // A peer on the same machine still has a different address space.
+    bool local_segment{false};
+    // Match policy against the original memory types, but select a network
+    // transport for the host-to-host leg of a staged request.
+    bool host_staging{false};
+    // A local MLU pair without direct access uses one host stage. Both legs
+    // are MLU copies; there is no host-to-host network leg.
+    bool local_mlu_staging{false};
+    // The peer's XPU buffer may be mapped into this process (Level Zero IPC),
+    // so XpuTransport can address it, unstaged, although the segment is not
+    // local. Other transports still follow host_staging.
+    bool xpu_ipc{false};
+    // A same-host MLU buffer has been mapped through CNRT IPC.
+    bool mlu_ipc{false};
+    // Only XpuTransport may carry the request: the device memory has neither
+    // a dma-buf RDMA registration nor a host staging route.
+    bool xpu_ipc_only{false};
+    bool mlu_ipc_only{false};
+    bool rdma_device_direct{true};
 };
 
 /**
@@ -156,6 +175,8 @@ struct SelectionResult {
     std::optional<int> traffic_class;
     // Consumed: names the QP pool the transfer is routed to.
     std::optional<std::string> qp_pool;
+    // Filled by the engine for device staging, never by select() itself.
+    std::vector<std::string> staging_params;
 };
 
 /**
@@ -201,6 +222,7 @@ class TransportSelector {
     bool isLegacyMode() const { return legacy_mode_; }
 
     bool isForceTcp() const { return force_tcp_; }
+    bool isForceFabric() const { return force_fabric_; }
 
     static std::optional<std::vector<TransportType>> reorderWithHint(
         const std::vector<TransportType>& raw, TransportType hint);
@@ -226,6 +248,7 @@ class TransportSelector {
     std::shared_ptr<Topology> topology_;
     std::vector<SelectionPolicy> policies_;
     bool force_tcp_{false};
+    bool force_fabric_{false};
     bool legacy_mode_{false};  // If true, skip selector and return empty result
 };
 

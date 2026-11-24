@@ -43,18 +43,22 @@ class AsyncBatchTransferTest(unittest.TestCase):
                 self.assertEqual(remote.raw, payload)
                 self.assertEqual(local.raw, payload)
 
-        for poll_single in (False, True):
+        for poll_single in ("wait", "single", "vector"):
             with self.subTest(poll_single=poll_single):
                 ctypes.memset(remote_addr, 0, size)
                 batch = initiator.transfer_submit_write(
                     name, local_addr, remote_addr, size
                 )
                 self.assertNotEqual(batch, 0)
-                if poll_single:
+                if poll_single != "wait":
                     deadline = time.monotonic() + 5
                     status = 0
                     while status == 0 and time.monotonic() < deadline:
-                        status = initiator.transfer_check_status(batch)
+                        status = (
+                            initiator.transfer_check_status(batch)
+                            if poll_single == "single"
+                            else initiator.batch_transfer_check_status([batch])[0]
+                        )
                         time.sleep(0.001)
                     self.assertEqual(status, 1)
                 else:

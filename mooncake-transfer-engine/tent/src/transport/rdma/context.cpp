@@ -18,9 +18,11 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/epoll.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #include <atomic>
 #include <cassert>
@@ -33,6 +35,7 @@
 #ifdef USE_CUDA
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "tent/platform/cuda_utils.h"
 #endif
 
 #include "ib_link_speed.h"
@@ -195,6 +198,7 @@ static inline std::string gidBytesToString(const uint8_t* raw) {
 // 3) RoCEv2/IB + no network device
 // 4) first non-zero GID (any type)
 static inline GidNetworkState getBestGidIndex(const std::string& device_name,
+                                              const IbvSymbols& verbs,
                                               struct ibv_context* context,
                                               ibv_port_attr& port_attr,
                                               uint8_t port, int& gid_index) {
@@ -210,7 +214,7 @@ static inline GidNetworkState getBestGidIndex(const std::string& device_name,
             << device_name << " port " << (int)port;
 
     for (i = 0; i < port_attr.gid_tbl_len; i++) {
-        if (ibv_query_gid_ex(context, port, i, &gid_entry, 0)) {
+        if (QueryGidEx(verbs, context, port, i, &gid_entry)) {
             continue;  // Skip invalid GID entries
         }
 
@@ -303,7 +307,11 @@ RdmaContext::RdmaContext(RdmaTransport& transport)
     std::call_once(g_once_flag, fork_init);
 }
 
-RdmaContext::~RdmaContext() { disable(); }
+RdmaContext::~RdmaContext() {
+    if (disable())
+        LOG(FATAL)
+            << "Cannot destroy RDMA context with live endpoint resources";
+}
 
 int RdmaContext::construct(const std::string& device_name,
                            std::shared_ptr<RdmaParams> params) {
@@ -466,6 +474,7 @@ void RdmaContext::cleanupResources() {
             if (ret) PLOG(ERROR) << "ibv_dereg_mr";
         }
         mr_set_.clear();
+        dmabuf_mr_set_.clear();
     }
     for (auto& entry : cq_list_) {
         delete entry;
@@ -531,21 +540,22 @@ int RdmaContext::resume() {
                : -1;
 }
 
-RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
-                                                int access) {
+RdmaContext::MemReg RdmaContext::registerMemReg(
+    void* addr, size_t length, int access, const DmabufExport* shared_export) {
     if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
         return nullptr;
     }
 
 #ifdef USE_CUDA
-    // Ensure CUDA context is current for GPU memory registration
-    // This is needed for worker threads or callers from non-CUDA threads
+    // Use ibv_reg_mr() directly only when a peer-memory module is active;
+    // otherwise fall through to the shared dma-buf export path below.
     CUmemorytype memType;
     CUresult result = cuPointerGetAttribute(
         &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
 
-    if (result == CUDA_SUCCESS && memType == CU_MEMORYTYPE_DEVICE) {
+    if (result == CUDA_SUCCESS && memType == CU_MEMORYTYPE_DEVICE &&
+        useCudaPeerMemoryModule()) {
         // Get device ordinal and set primary context current
         unsigned int devOrd = 0;
         result = cuPointerGetAttribute(
@@ -595,6 +605,57 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
         return entry;
     }
 #endif
+
+    // Register exported device memory so the NIC DMAs to VRAM directly.
+    // NotImplemented or InvalidArgument may describe ordinary host memory;
+    // the memory-type check below prevents an MLU pointer from reaching
+    // ibv_reg_mr if export is unavailable. Any other export failure, or a
+    // failed ibv_reg_dmabuf_mr, leaves the buffer to the staging route.
+    if (shared_export && shared_export->fd >= 0 && !supportsDmabuf())
+        return nullptr;
+    if (verbs_.ibv_reg_dmabuf_mr) {
+        DmabufExport handle;
+        Status s = Status::NotImplemented("No shared dma-buf export");
+        if (shared_export) {
+            handle = *shared_export;
+            handle.close_fd = false;
+            if (handle.fd >= 0) s = Status::OK();
+        } else {
+            s = exportDmabuf(addr, length, handle);
+        }
+        DmabufExportGuard export_guard{handle};
+        if (s.ok()) {
+            ibv_mr* entry = verbs_.ibv_reg_dmabuf_mr(
+                native_pd_, handle.offset, length,
+                reinterpret_cast<uint64_t>(addr), handle.fd, access);
+            // The MR takes its own reference to the dma-buf. Shared exports
+            // and Level Zero descriptors are borrowed; only a private,
+            // caller-owned export is closed by this guard.
+            if (!entry) {
+                const void* end = static_cast<const char*>(addr) + length;
+                PLOG(ERROR)
+                    << "Failed to register dma-buf device memory from " << addr
+                    << " to " << end << " in RDMA device " << device_name_;
+                return nullptr;
+            }
+            mr_set_mutex_.lock();
+            mr_set_.insert(entry);
+            dmabuf_mr_set_.insert(entry);
+            mr_set_mutex_.unlock();
+            return entry;
+        }
+        if (!s.IsNotImplemented() && !s.IsInvalidArgument()) {
+            LOG(ERROR) << "dma-buf export failed for device memory at " << addr
+                       << " (" << length << " bytes): " << s.message();
+            return nullptr;
+        }
+    }
+
+    // Device memory without peer-memory must not reach the plain host MR path
+    // when dma-buf verbs or export are unavailable. The engine may still use a
+    // separate host stage buffer.
+    const auto memory_type = Platform::getLoader().getMemoryType(addr);
+    if (memory_type == MTYPE_MLU || memory_type == MTYPE_CUDA) return nullptr;
 
     // Standard CPU memory registration
     ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
@@ -646,6 +707,7 @@ int RdmaContext::unregisterMemReg(MemReg id) {
     size_t region_length = entry->length;
     mr_set_mutex_.lock();
     mr_set_.erase(entry);
+    const bool is_dmabuf = dmabuf_mr_set_.erase(entry) != 0;
     mr_set_mutex_.unlock();
 
     if (verbs_.ibv_dereg_mr(entry)) {
@@ -654,16 +716,12 @@ int RdmaContext::unregisterMemReg(MemReg id) {
                    << " to " << end << " in RDMA device " << device_name_;
         return -1;
     }
-    // Restore mergeability after ibv_dereg_mr. ibv_reg_mr calls
-    // madvise(MADV_DONTFORK) on the registered range when fork protection
-    // is active; failing to undo this on unregister leaves VMAs permanently
-    // split, exhausting vm.max_map_count under high register/unregister churn.
-    // See issue #3639.
-    if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
-        PLOG(WARNING) << "Failed to restore fork state for memory region at "
-                      << region_addr << " (" << region_length
-                      << " bytes), deregister already succeeded";
-    }
+    // dma-buf MRs pin no host pages: rdma-core stores the dma-buf offset in
+    // `addr`, not a host VMA, so there is no fork state to restore.
+    if (is_dmabuf) return 0;
+    // No MADV_DOFORK here (reverted #3660): ibv_dereg_mr() already restores the
+    // fork state of a plain host MR through ibv_dofork_range(), and the extra
+    // call only failed with EINVAL/ENOMEM on dma-buf and device ranges.
 
     return 0;
 }
@@ -696,7 +754,8 @@ RdmaAddressRefreshResult RdmaContext::refreshAddress(
 
     int next_gid_index = params_->device.gid_index;
     if (next_gid_index < 0) {
-        if (getBestGidIndex(device_name_, native_context_, port_attr, port,
+        if (getBestGidIndex(device_name_, verbs_, native_context_, port_attr,
+                            port,
                             next_gid_index) == GidNetworkState::GID_NOT_FOUND) {
             LOG(WARNING) << "No suitable GID found while refreshing "
                          << device_name_ << "/" << static_cast<int>(port);
@@ -724,8 +783,13 @@ RdmaAddressRefreshResult RdmaContext::refreshAddress(
         return RdmaAddressRefreshResult::FAILED;
     }
 
-    RdmaAddressSnapshot next_address{
-        port_attr.lid, gidBytesToString(next_gid.raw), next_gid_index};
+#ifdef USE_SHCA
+    const uint32_t next_lid = u17_to_32(port_attr.lid);
+#else
+    const uint32_t next_lid = port_attr.lid;
+#endif
+    RdmaAddressSnapshot next_address{next_lid, gidBytesToString(next_gid.raw),
+                                     next_gid_index};
     if (current) *current = next_address;
     const bool changed = next_address.lid != old_address.lid ||
                          next_address.gid != old_address.gid ||
@@ -816,6 +880,24 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
         return -1;
     }
 
+    supports_rdma_atomic_ = device_attr.atomic_cap != IBV_ATOMIC_NONE;
+    max_qp_rd_atom_ = device_attr.max_qp_rd_atom;
+    max_qp_init_rd_atom_ = device_attr.max_qp_init_rd_atom;
+    if (!supports_rdma_atomic_) {
+        LOG(INFO) << "RNIC " << device_name
+                  << " reports no RDMA atomic; data QPs will not request "
+                     "IBV_ACCESS_REMOTE_ATOMIC";
+    }
+    if (max_qp_rd_atom_ < kIdealRdAtomicDepth ||
+        max_qp_init_rd_atom_ < kIdealRdAtomicDepth) {
+        LOG(WARNING) << "Device " << device_name
+                     << " advertises a reduced RD-atomic depth: max_qp_rd_atom="
+                     << max_qp_rd_atom_
+                     << ", max_qp_init_rd_atom=" << max_qp_init_rd_atom_
+                     << "; configured QP depths above this limit will be "
+                        "clamped";
+    }
+
     MIN(params_->device.max_cqe, device_attr.max_cqe);
     if (params_->device.num_cq_list + 1 > device_attr.max_cq) {
         LOG(ERROR) << "Device " << device_name << " supports at most "
@@ -831,7 +913,7 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
     if (params_->verbose) {
         for (int i = 0; i < port_attr.gid_tbl_len; i++) {
             struct ibv_gid_entry entry;
-            if (ibv_query_gid_ex(context.get(), port, i, &entry, 0)) {
+            if (QueryGidEx(verbs_, context.get(), port, i, &entry)) {
                 PLOG(WARNING)
                     << "Scan: Unable to query GID " << i << " on device "
                     << device_name << " port " << port;
@@ -850,8 +932,9 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
     if (gid_index_ < 0) {
         // Auto-select GID
         int found_gid_index = -1;
-        GidNetworkState gid_state = getBestGidIndex(
-            device_name, context.get(), port_attr, port, found_gid_index);
+        GidNetworkState gid_state =
+            getBestGidIndex(device_name, verbs_, context.get(), port_attr, port,
+                            found_gid_index);
         if (gid_state == GidNetworkState::GID_NOT_FOUND) {
             LOG(ERROR) << "No valid GID found for device " << device_name
                        << " port " << static_cast<int>(port);
@@ -886,8 +969,8 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
             has_issues = true;
         }
 
-        if (ibv_query_gid_ex(context.get(), port, gid_index_, &user_gid_entry,
-                             0) == 0) {
+        if (QueryGidEx(verbs_, context.get(), port, gid_index_,
+                       &user_gid_entry) == 0) {
             bool is_ipv4 =
                 ipv6_addr_v4mapped((struct in6_addr*)user_gid_entry.gid.raw);
             bool is_roce_v2 = user_gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2;
@@ -932,7 +1015,11 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
     }
 
     native_context_ = context.release();
+#ifdef USE_SHCA
+    lid_ = u17_to_32(port_attr.lid);
+#else
     lid_ = port_attr.lid;
+#endif
     recordPortSpeed(port_attr);
     queryEffectiveSpeed();
     return 0;

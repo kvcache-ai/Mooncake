@@ -2,10 +2,12 @@
 #include <csignal>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
+#include "allocator_status.h"
 #include "client_service.h"
 #include "common.h"
 #include "config.h"
 #include "common/byte_size.h"
+#include "glog_compat.h"
 #include "real_client.h"
 #include "version.h"
 
@@ -44,7 +46,12 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::batchRemove_internal>(&real_client);
     server.register_handler<&RealClient::isExist_internal>(&real_client);
     server.register_handler<&RealClient::batchIsExist_internal>(&real_client);
+    server.register_handler<&RealClient::probeKey_internal>(&real_client);
+    server.register_handler<&RealClient::batchProbeKey_internal>(&real_client);
     server.register_handler<&RealClient::getSize_internal>(&real_client);
+    server.register_handler<&RealClient::get_replica_desc>(&real_client);
+    server.register_handler<&RealClient::batch_get_replica_desc>(&real_client);
+    server.register_handler<&RealClient::batch_get_query_results>(&real_client);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(
         &real_client);
     server.register_handler<
@@ -100,8 +107,17 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::allocate_buffer_dummy>(&real_client);
     server.register_handler<&RealClient::create_copy_task>(&real_client);
     server.register_handler<&RealClient::create_move_task>(&real_client);
+    server.register_handler<&RealClient::create_drain_job>(&real_client);
+    server.register_handler<&RealClient::create_timed_drain_job>(&real_client);
+    server.register_handler<&RealClient::query_drain_job>(&real_client);
+    server.register_handler<&RealClient::cancel_drain_job>(&real_client);
+    server.register_handler<&RealClient::list_drain_jobs>(&real_client);
+    server.register_handler<&RealClient::list_tasks>(&real_client);
+    server.register_handler<&RealClient::cancel_task>(&real_client);
     server.register_handler<&RealClient::query_task>(&real_client);
     server.register_handler<&RealClient::batch_get_offload_object>(
+        &real_client);
+    server.register_handler<&RealClient::batch_get_offload_object_ranges>(
         &real_client);
     server.register_handler<&RealClient::release_offload_buffer>(&real_client);
 }
@@ -117,8 +133,12 @@ int main(int argc, char *argv[]) {
     gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     if (!FLAGS_log_dir.empty()) {
-        google::InitGoogleLogging(argv[0]);
+        // MC_LOG_DIR may have initialized glog (and set FLAGS_log_dir) from
+        // a static initializer before main — see glog_compat.h.
+        mooncake::InitGoogleLoggingOnce(argv[0]);
     }
+    mooncake::LogAllocatorStatus();
+    mooncake::InstallAllocatorStatsCollector();
 
     LOG(INFO) << "Mooncake real client version: "
               << mooncake::MOONCAKE_DISPLAY_VERSION;
