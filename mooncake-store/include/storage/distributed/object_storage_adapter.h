@@ -146,6 +146,13 @@ class ObjectStorageAdapter {
         }
         return PutV(logical_key, iov, iovcnt);
     }
+    // True when a single PUT may have created the object, including when its
+    // reply was lost. Adapters that cannot prove rejection stay conservative.
+    virtual tl::expected<void, ErrorCode> PutVOnceWithOutcome(
+        const std::string& key, const iovec* iov, int count, bool& may_exist) {
+        may_exist = true;
+        return PutVOnce(key, iov, count);
+    }
 };
 
 }  // namespace mooncake

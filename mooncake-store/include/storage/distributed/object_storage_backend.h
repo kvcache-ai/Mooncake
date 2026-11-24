@@ -56,6 +56,12 @@ class ObjectStorageBackend {
                      const IsHostMemory& is_host, const Copy& to_host,
                      bool* upload_started = nullptr);
 
+    // Also report whether the object may exist after a single PUT attempt.
+    ErrorCode WriteV(const std::string& object_key, uint64_t object_size,
+                     const std::vector<Slice>& slices,
+                     const IsHostMemory& is_host, const Copy& to_host,
+                     bool* upload_started, bool* may_exist);
+
     // Coalesce continuous object ranges across destination slice boundaries,
     // then scatter using at most min(4 MiB, max_staging_bytes) of
     // staging. Errors may leave destination slices partially written.

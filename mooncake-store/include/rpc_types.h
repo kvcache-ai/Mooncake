@@ -15,7 +15,12 @@ template <typename T>
 using WeightRpcResult =
     tl::expected<tl::expected<T, WeightManagementError>, ErrorCode>;
 
-enum class ObjectUploadOutcome : uint8_t { COMPLETE, NOT_STARTED, UNKNOWN };
+enum class ObjectUploadOutcome : uint8_t {
+    COMPLETE,
+    NOT_STARTED,
+    UNKNOWN,
+    NOT_WRITTEN = NOT_STARTED
+};
 
 struct ObjectMeta {
     std::string key;

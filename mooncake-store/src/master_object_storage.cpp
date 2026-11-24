@@ -229,7 +229,7 @@ MasterService::CommitObjectAware(OrderedOpLogWriter::Reservation&& reservation,
             old->second.upload_finished != record.upload_finished) {
             SetObjectWorkLocked(
                 name, record.phase == ObjectUploadPhase::RETIRED
-                          ? std::max(now, record.not_before_ms)
+                          ? ObjectCleanupDeadline(record, now)
                           : now + object_storage_config_.cleanup_interval_ms);
         }
     }
@@ -333,7 +333,7 @@ tl::expected<void, ErrorCode> MasterService::FinishObjectStorageUpload(
     const TenantId& tenant) {
     if (!object_uploads_) return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     if (outcome != ObjectUploadOutcome::COMPLETE &&
-        outcome != ObjectUploadOutcome::NOT_STARTED &&
+        outcome != ObjectUploadOutcome::NOT_WRITTEN &&
         outcome != ObjectUploadOutcome::UNKNOWN)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     auto record = object_uploads_->FindObjectUpload(name);
@@ -357,7 +357,7 @@ tl::expected<void, ErrorCode> MasterService::FinishObjectStorageUpload(
                 RetireObject(*record, default_kv_lease_ttl_, ObjectNowMs());
             }
             record->upload_finished =
-                outcome == ObjectUploadOutcome::NOT_STARTED;
+                outcome == ObjectUploadOutcome::NOT_WRITTEN;
         }
         ObjectReplicaMutation mutation;
         mutation.target = record->target;
@@ -557,6 +557,23 @@ MasterService::BeginObjectWriteRevocation(
     return result;
 }
 
+// A previous leader may have had a slower wall clock. Wait out its saved
+// read TTL on the new leader's monotonic clock before reclaiming the object.
+uint64_t MasterService::ObjectCleanupDeadline(const ObjectUploadRecord& record,
+                                              uint64_t now) const {
+    if (object_restore_time_ != std::chrono::steady_clock::time_point{}) {
+        const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+            object_restore_time_ +
+            std::chrono::milliseconds(
+                record.read_lease_ttl_ms.value_or(default_kv_lease_ttl_)) -
+            std::chrono::steady_clock::now());
+        if (remaining.count() > 0)
+            return std::max(record.not_before_ms,
+                            now + static_cast<uint64_t>(remaining.count()));
+    }
+    return std::max(now, record.not_before_ms);
+}
+
 // object_storage_mutex_ protects admission and both scheduling indexes.
 void MasterService::SetObjectWorkLocked(const std::string& name,
                                         std::optional<uint64_t> deadline) {
@@ -639,9 +656,14 @@ void MasterService::MaintainObjectStorage() {
                     }
                     return;
                 }
-                if (record->not_before_ms > ObjectNowMs()) return;
-                // Capture the fresh retirement sequence under the key lock.
                 std::lock_guard object_lock(object_storage_mutex_);
+                const auto now = ObjectNowMs();
+                const auto due = ObjectCleanupDeadline(*record, now);
+                if (due > now) {
+                    SetObjectWorkLocked(name, due);
+                    return;
+                }
+                // Capture the fresh retirement sequence under the key lock.
                 sequence = object_upload_sequences_.at(name);
             }
             // No destructive side effect for an undurable retirement, and no
@@ -743,6 +765,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreObjectStorageLocked(
     if (!valid) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     {
         std::lock_guard lock(object_storage_mutex_);
+        object_restore_time_ = std::chrono::steady_clock::now();
         object_upload_sequences_.clear();
         object_pending_deadlines_.clear();
         object_work_.clear();

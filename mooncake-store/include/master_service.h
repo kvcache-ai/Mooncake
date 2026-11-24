@@ -1556,7 +1556,11 @@ class MasterService {
     // the background eviction, so it cannot delete unrelated DFS data. Each
     // attempt takes the key afresh, since recovery evicts other keys.
     template <typename Admit>
-    auto AdmitWithDfsRecovery(const ReplicateConfig& config, const Admit& admit)
+    auto AdmitWithDfsRecovery(
+        const ReplicateConfig& config, const Admit& admit,
+        const std::shared_future<ErrorCode>& revocation,
+        std::optional<std::unique_lock<std::mutex>>& group_lock,
+        const std::string& group_id)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
     // The first step of an accessor that holds a key by name: drops the held
     // object's memory replicas whose segment is gone, and the object with them
@@ -2342,6 +2346,7 @@ class MasterService {
     std::shared_ptr<ObjectStorageAdapter> object_storage_adapter_;
     std::unique_ptr<StandbyMetadataStore> object_uploads_;
     std::mutex object_storage_mutex_;
+    std::chrono::steady_clock::time_point object_restore_time_;
     std::unordered_map<std::string, uint64_t> object_upload_sequences_;
     // Pending work only: committed, referenced objects consume no admission
     // slots. Both indexes are rebuilt from recovered records and metadata.
@@ -2353,6 +2358,8 @@ class MasterService {
         object_pending_deadlines_;
     uint64_t object_work_generation_{0};
     std::set<std::pair<uint64_t, std::string>> object_work_;
+    uint64_t ObjectCleanupDeadline(const ObjectUploadRecord&,
+                                   uint64_t now) const;
     void SetObjectWorkLocked(const std::string&, std::optional<uint64_t>);
     void ScheduleObjectWorkLocked();
     void InitObjectStorage(const MasterServiceConfig&);

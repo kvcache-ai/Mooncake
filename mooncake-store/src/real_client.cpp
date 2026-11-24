@@ -7669,6 +7669,10 @@ void RealClient::execute_session_object_range_reads(
         auto filtered = FilterQueryResult(request.cached_query_result,
                                           request.selected_replica, false);
         for (size_t i = 0; i < request.range_sizes.size(); ++i) {
+            if (invalidate_expired_get_session(request, results)) {
+                error = ErrorCode::LEASE_EXPIRED;
+                break;
+            }
             std::vector<Slice> slices{
                 {request.destination_buffers[i], request.range_sizes[i]}};
             auto read = client_->Get(request.object_key, filtered, slices,
@@ -7707,7 +7711,9 @@ void RealClient::execute_session_memory_range_reads(
     destination_slices.reserve(requests.size());
     source_offsets.reserve(requests.size());
     if (select_by_destination) query_results.reserve(requests.size());
+    auto earliest_deadline = requests.front().lease_deadline;
     for (const auto &request : requests) {
+        earliest_deadline = std::min(earliest_deadline, request.lease_deadline);
         std::vector<Slice> request_slices;
         std::vector<uint64_t> request_offsets;
         request_slices.reserve(request.destination_buffers.size());
@@ -7727,12 +7733,30 @@ void RealClient::execute_session_memory_range_reads(
         source_offsets.push_back(std::move(request_offsets));
     }
 
+    // Keep result slots aligned while excluding expired descriptors from the
+    // scatter submit.
+    const auto submit_time = std::chrono::steady_clock::now();
+    if (submit_time >= earliest_deadline) {
+        size_t expired = 0;
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        for (size_t i = 0; i < requests.size(); ++i) {
+            if (submit_time < requests[i].lease_deadline) continue;
+            mark_get_session_lease_expired_locked(requests[i], results);
+            destination_slices[i].clear();
+            source_offsets[i].clear();
+            ++expired;
+        }
+        if (expired == requests.size()) return;
+    }
     auto transfer_results = client_->BatchTransferReadRanges(
         replicas, destination_slices, source_offsets,
         TransferIntent::kUnspecified, query_results);
     if (!SessionBackendResultCountMatches(
             "Session memory range", requests.size(), transfer_results.size())) {
         for (const auto &request : requests) {
+            if (results[request.result_index] ==
+                toInt(ErrorCode::LEASE_EXPIRED))
+                continue;
             results[request.result_index] =
                 static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR));
         }
@@ -7744,6 +7768,7 @@ void RealClient::execute_session_memory_range_reads(
     for (size_t request_index = 0; request_index < requests.size();
          ++request_index) {
         const auto &request = requests[request_index];
+        if (destination_slices[request_index].empty()) continue;
         if (!transfer_results[request_index]) {
             results[request.result_index] = static_cast<int>(
                 toInt(transfer_results[request_index].error()));
@@ -8232,7 +8257,10 @@ void RealClient::mark_get_session_lease_expired_locked(
     const SessionRangeReadRequest &request, std::vector<int> &results) {
     results[request.result_index] =
         static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
-    get_sessions_.erase(request.object_key);
+    auto current = get_sessions_.find(request.object_key);
+    if (current != get_sessions_.end() &&
+        current->second.lease_timeout == request.lease_deadline)
+        get_sessions_.erase(current);
 }
 
 void RealClient::fail_file_backed_requests_for_key(
@@ -8262,8 +8290,8 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     auto read_plan =
         classify_session_range_read_requests(std::move(requests), results);
 
-    execute_session_object_range_reads(read_plan.object_requests, results);
     execute_session_memory_range_reads(read_plan.memory_requests, results);
+    execute_session_object_range_reads(read_plan.object_requests, results);
     execute_session_dfs_range_reads(read_plan.dfs_requests, results);
     execute_session_local_disk_range_reads(read_plan.local_disk_requests,
                                            results);

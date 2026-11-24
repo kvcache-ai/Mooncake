@@ -1349,7 +1349,132 @@ TEST_F(MasterServiceHATest, ObjectPutDoesNotSucceedOnQueuedStaleCleanup) {
     EXPECT_EQ(result.error(), ErrorCode::REPLICA_IS_NOT_READY);
 }
 
-enum class AbandonedWrite { Expiry, InvalidMemory, Preemption };
+TEST_F(MasterServiceHATest, StaleLocalDiskEvictionDuringObjectCommit) {
+    const std::string key = "stale-local-disk-evict";
+    auto config = MakeStrictHAConfig();
+    MasterService service(config);
+    MasterServiceTestPeer peer(service);
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto* log = InstallGatedWriter(service, backend);
+    ObjectStorageConfig storage;
+    storage.enabled = true;
+    storage.target = {
+        "s3", "https://example.test", "bucket", "region", "prefix", true};
+    peer.EnableObjectRecordsForTesting(storage);
+    ReplicateConfig placement;
+    placement.replica_num = 0;
+    placement.os_replica_num = 1;
+    const auto writer = generate_uuid();
+    auto original =
+        service.PutStart(writer, key, kDefaultTenant, 64, placement);
+    ASSERT_TRUE(original);
+    const auto attempt = *original->front().object_write_attempt;
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, config.cluster_id);
+    OpLogBatchStandbyReader reader(config.cluster_id, *backend, applier);
+    ASSERT_EQ(reader.PollOnce().error, ErrorCode::OK);
+    auto prefix = reader.GetLastAppliedDurablePrefix();
+    ASSERT_TRUE(prefix);
+    ASSERT_TRUE(log->PauseCallbacksAfter(prefix->last_seq));
+    auto end = std::async(std::launch::async, [&] {
+        return service.PutEnd(writer, ObjectMeta{key, std::nullopt, attempt},
+                              kDefaultTenant, ReplicaType::ALL);
+    });
+    auto submitted = log->WaitForSubmittedCount(2, std::chrono::seconds(3));
+    if (!submitted) log->ResumeCallbacks();
+    ASSERT_TRUE(submitted);
+    OpLogBatchStorage oplog(config.cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(oplog, 2, batch);
+    EXPECT_EQ(reader.PollOnce().error, ErrorCode::OK);
+    EXPECT_TRUE(standby.GetMetadata(kDefaultTenant.value(), key));
+    auto evicted = service.EvictDiskReplica(writer, key, kDefaultTenant,
+                                            ReplicaType::LOCAL_DISK);
+    log->ResumeCallbacks();
+    ASSERT_TRUE(evicted);
+    ASSERT_TRUE(end.get());
+    ASSERT_TRUE(service.PutStart(writer, "after-eviction", kDefaultTenant, 64,
+                                 placement));
+    ASSERT_EQ(reader.PollOnce().error, ErrorCode::OK);
+    auto live = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(live);
+    ASSERT_EQ(live->replicas.size(), 1);
+    ASSERT_TRUE(live->replicas.front().is_object_storage_replica());
+    auto record = standby.FindObjectUpload(attempt.token);
+    ASSERT_TRUE(record);
+    EXPECT_TRUE(standby.GetMetadata(kDefaultTenant.value(), key));
+    EXPECT_EQ(record->phase, ObjectUploadPhase::UPLOADED);
+}
+
+TEST_F(MasterServiceHATest, RecoveredMemorySurvivesObjectUpsertBeforeRemount) {
+    auto config = MakeStrictHAConfig();
+    config.default_kv_lease_ttl = 0;
+    MasterService service(config);
+    MasterServiceTestPeer peer(service);
+    ASSERT_EQ(peer.SetBatchOpLogBackendForTesting(
+                  std::make_shared<FakeBatchHaKvBackend>()),
+              ErrorCode::OK);
+    ObjectStorageConfig storage;
+    storage.enabled = true;
+    storage.target = {
+        "s3", "https://example.test", "bucket", "region", "prefix", true};
+    peer.EnableObjectRecordsForTesting(storage);
+    const std::string key = "recovered", endpoint = "recover-memory";
+    auto original = MakeStandbyObject(key, endpoint);
+    original.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        {original}, 0, {MakeStandbyMemorySegment(endpoint)}));
+    ReplicateConfig object;
+    object.replica_num = 0;
+    object.os_replica_num = 1;
+    const auto writer = generate_uuid();
+    auto early = service.UpsertStart(writer, key, kDefaultTenant, 64, object);
+    ASSERT_FALSE(early);
+    EXPECT_EQ(early.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, writer));
+    EXPECT_TRUE(service.UpsertStart(writer, key, kDefaultTenant, 64, object));
+}
+
+TEST_F(MasterServiceHATest, TrackedMemoryUpsertHonorsActiveReadLease) {
+    auto config = MakeStrictHAConfig();
+    config.default_kv_lease_ttl = 60000;
+    MasterService service(config);
+    MasterServiceTestPeer peer(service);
+    ASSERT_EQ(peer.SetBatchOpLogBackendForTesting(
+                  std::make_shared<FakeBatchHaKvBackend>()),
+              ErrorCode::OK);
+    ObjectStorageConfig storage;
+    storage.enabled = true;
+    storage.target = {
+        "s3", "https://example.test", "bucket", "region", "prefix", true};
+    peer.EnableObjectRecordsForTesting(storage);
+    const auto writer = PrepareSimpleSegment(service).client_id;
+    const std::string key = "object-then-memory";
+    ReplicateConfig object;
+    object.replica_num = 0;
+    object.os_replica_num = 1;
+    auto first = service.PutStart(writer, key, kDefaultTenant, 64, object);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(first->front().object_write_attempt);
+    ASSERT_TRUE(service.PutEnd(
+        writer, {key, std::nullopt, *first->front().object_write_attempt},
+        kDefaultTenant, ReplicaType::ALL));
+    ReplicateConfig memory;
+    auto next = service.UpsertStart(writer, key, kDefaultTenant, 64, memory);
+    ASSERT_TRUE(next);
+    ASSERT_TRUE(next->front().object_write_attempt);
+    ASSERT_TRUE(service.UpsertEnd(
+        writer, {key, std::nullopt, *next->front().object_write_attempt},
+        kDefaultTenant, ReplicaType::ALL));
+    ASSERT_TRUE(service.GetReplicaList(key, kDefaultTenant));
+    auto blocked = service.UpsertStart(writer, key, kDefaultTenant, 64, memory);
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error(), ErrorCode::OBJECT_HAS_LEASE);
+}
+
+enum class AbandonedWrite { Expiry, InvalidMemory, Preemption, StalePut };
 class AbandonedObjectUpsertTest
     : public MasterServiceHATest,
       public ::testing::WithParamInterface<AbandonedWrite> {};
@@ -1382,8 +1507,9 @@ TEST_P(AbandonedObjectUpsertTest, StaysRemovedAfterReplay) {
     const auto& committed = *original->front().object_write_attempt;
     ASSERT_TRUE(service.PutEnd(writer, ObjectMeta{key, std::nullopt, committed},
                                kDefaultTenant, ReplicaType::ALL));
-    auto replacement = service.UpsertStart(writer, key, kDefaultTenant, 64,
-                                           preempt ? object : memory);
+    auto replacement = service.UpsertStart(
+        writer, key, kDefaultTenant, 64,
+        (preempt || scenario == AbandonedWrite::StalePut) ? object : memory);
     ASSERT_TRUE(replacement);
     ASSERT_EQ(replacement->size(), 1u);
     ASSERT_TRUE(replacement->front().object_write_attempt.has_value());
@@ -1399,6 +1525,29 @@ TEST_P(AbandonedObjectUpsertTest, StaysRemovedAfterReplay) {
         // Case A cannot reserve the replacement after revoking the old attempt.
         auto result = service.UpsertStart(writer, key, kDefaultTenant,
                                           kStrictTenantQuotaBytes + 1, memory);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
+    } else if (scenario == AbandonedWrite::StalePut) {
+        {
+            MasterServiceTestPeer::MetadataAccessorRW current(
+                &service, {kDefaultTenant, key});
+            current.Get().put_start_time -=
+                std::chrono::seconds(config.put_start_discard_timeout_sec + 1);
+        }
+        auto prefix = reader.GetLastAppliedDurablePrefix();
+        ASSERT_TRUE(prefix);
+        ASSERT_TRUE(log->PauseCallbacksAfter(prefix->last_seq));
+        auto next = std::async(std::launch::async, [&] {
+            return service.PutStart(writer, key, kDefaultTenant,
+                                    kStrictTenantQuotaBytes + 1, memory);
+        });
+        // The callback still owns the old generation. Admission must wait.
+        EXPECT_TRUE(log->WaitForSubmittedCount(prefix->last_seq + 1,
+                                               std::chrono::seconds(2)));
+        EXPECT_EQ(next.wait_for(std::chrono::milliseconds(0)),
+                  std::future_status::timeout);
+        log->ResumeCallbacks();
+        auto result = next.get();
         ASSERT_FALSE(result);
         EXPECT_EQ(result.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
     } else {
@@ -1452,7 +1601,8 @@ TEST_P(AbandonedObjectUpsertTest, StaysRemovedAfterReplay) {
 INSTANTIATE_TEST_SUITE_P(HA, AbandonedObjectUpsertTest,
                          ::testing::Values(AbandonedWrite::Expiry,
                                            AbandonedWrite::InvalidMemory,
-                                           AbandonedWrite::Preemption));
+                                           AbandonedWrite::Preemption,
+                                           AbandonedWrite::StalePut));
 
 TEST_F(MasterServiceHATest, ObjectRetirementHonorsLeasesFromEarlierLeaders) {
     ObjectStorageConfig storage;
@@ -1474,12 +1624,22 @@ TEST_F(MasterServiceHATest, ObjectRetirementHonorsLeasesFromEarlierLeaders) {
                       std::make_shared<FakeBatchHaKvBackend>()),
                   ErrorCode::OK);
         auto& records = peer.EnableObjectRecordsForTesting(storage);
+        const auto takeover_ms = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        if (retirement_deadline) {
+            // Simulate a previous leader whose clock was well behind ours.
+            retirement_deadline = 1;
+            snapshot.records.front().not_before_ms = retirement_deadline;
+        }
         ASSERT_TRUE(
             service.RestoreFromStandbySnapshot(objects, 0, {}, {}, snapshot));
         if (retirement_deadline) {
             auto retired = records.FindObjectUpload(name);
             ASSERT_TRUE(retired);
             EXPECT_EQ(retired->not_before_ms, retirement_deadline);
+            EXPECT_GE(peer.ObjectCleanupDeadline(name), takeover_ms + 60000);
             continue;
         }
         if (objects.empty()) {

@@ -158,6 +158,17 @@ ErrorCode ObjectStorageBackend::WriteV(const std::string& object_key,
                                        const IsHostMemory& is_host,
                                        const Copy& to_host,
                                        bool* upload_started) {
+    return WriteV(object_key, object_size, slices, is_host, to_host,
+                  upload_started, nullptr);
+}
+
+ErrorCode ObjectStorageBackend::WriteV(const std::string& object_key,
+                                       uint64_t object_size,
+                                       const std::vector<Slice>& slices,
+                                       const IsHostMemory& is_host,
+                                       const Copy& to_host,
+                                       bool* upload_started, bool* may_exist) {
+    if (may_exist) *may_exist = false;
     if (upload_started != nullptr) {
         *upload_started = false;
     }
@@ -218,8 +229,11 @@ ErrorCode ObjectStorageBackend::WriteV(const std::string& object_key,
     if (upload_started != nullptr) {
         *upload_started = true;
     }
-    const auto result = adapter_->PutVOnce(object_key, iov.data(),
-                                           static_cast<int>(iov.size()));
+    const int count = static_cast<int>(iov.size());
+    const auto result = may_exist
+                            ? adapter_->PutVOnceWithOutcome(
+                                  object_key, iov.data(), count, *may_exist)
+                            : adapter_->PutVOnce(object_key, iov.data(), count);
     return result ? ErrorCode::OK : result.error();
 }
 

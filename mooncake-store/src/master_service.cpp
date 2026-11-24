@@ -5463,14 +5463,30 @@ auto MasterService::CleanupStaleBeforeWrite(const char* why,
 }
 
 template <typename Admit>
-auto MasterService::AdmitWithDfsRecovery(const ReplicateConfig& config,
-                                         const Admit& admit)
+auto MasterService::AdmitWithDfsRecovery(
+    const ReplicateConfig& config, const Admit& admit,
+    const std::shared_future<ErrorCode>& revocation,
+    std::optional<std::unique_lock<std::mutex>>& group_lock,
+    const std::string& group_id)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     // Set by AllocateReplicas only when DFS allocation itself failed with
     // capacity exhaustion; gates the forced bucket eviction retry below so
     // memory/NoF exhaustion cannot delete unrelated DFS data.
     bool dfs_allocation_failed = false;
     auto result = admit(&dfs_allocation_failed);
+    if (revocation.valid()) {
+        // Durable revocation removes the old generation under the key lock.
+        if (group_lock) group_lock->unlock();
+        auto error = revocation.get();
+        if (error != ErrorCode::OK) return tl::make_unexpected(error);
+        if (group_lock) {
+            group_lock->lock();
+            if (!weight_manager_.AllowsGroupMemberMutation(group_id))
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        result = admit(&dfs_allocation_failed);
+    }
     // Eviction locks keys one by one, so recover only after admit releases
     // the key. Serialize recovery and re-admit before deciding whether this
     // request still needs to evict one bucket.
@@ -5510,6 +5526,7 @@ auto MasterService::PutStartImpl(const UUID& client_id, const std::string& key,
         }
     }
 
+    std::shared_future<ErrorCode> revocation;
     auto admit = [&](bool* dfs_allocation_failed)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
         auto now = std::chrono::system_clock::now();
@@ -5518,6 +5535,8 @@ auto MasterService::PutStartImpl(const UUID& client_id, const std::string& key,
         // create, so no other writer of the key lands in between.
         MetadataAccessorRW accessor(this, object_id,
                                     MetadataAccessorRW::CreateKey{});
+        if (revocation.valid() && accessor.IsPublished())
+            return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
         if (auto admitted = accessor.Grow(0); !admitted) {
             return tl::make_unexpected(admitted.error());
         }
@@ -5549,6 +5568,14 @@ auto MasterService::PutStartImpl(const UUID& client_id, const std::string& key,
                 }
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
+            if (metadata.object_storage_write_attempt) {
+                auto pending = BeginObjectWriteRevocation(
+                    accessor,
+                    metadata.put_start_time + put_start_release_timeout_sec_);
+                if (!pending) return tl::make_unexpected(pending.error());
+                revocation = pending->share();
+                return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
+            }
             if (enable_oplog_ && ordered_oplog_writer_) {
                 auto err = PersistRemoveForHA("PutStart(stale cleanup REMOVE)",
                                               object_id.tenant_id, key);
@@ -5576,7 +5603,8 @@ auto MasterService::PutStartImpl(const UUID& client_id, const std::string& key,
 
     // Tenant over-quota remains a background-eviction concern. Bucket-count
     // exhaustion is different: see AdmitWithDfsRecovery.
-    auto result = AdmitWithDfsRecovery(config, admit);
+    auto result = AdmitWithDfsRecovery(
+        config, admit, revocation, weight_group_operation_lock, plan->group_id);
     if (result && weight_group_operation_lock) {
         weight_manager_.RecordImportWrite(object_id.tenant_id, plan->group_id);
     }
@@ -6357,12 +6385,25 @@ auto MasterService::UpsertStartImpl(const UUID& client_id,
 
                 const bool has_object_replica =
                     metadata.HasReplica(&Replica::fn_is_object_storage_replica);
+                const bool requires_fresh_object_replicas =
+                    config.os_replica_num || has_object_replica ||
+                    (object_uploads_ &&
+                     object_uploads_->FirstObjectUploadForKey(
+                         object_id.tenant_id.value(), key));
+                // Remount imports the ranges still published on each key.
+                // Keep recovered addresses reachable until their owner returns.
+                if (requires_fresh_object_replicas &&
+                    metadata.HasReplica([this](const Replica& replica) {
+                        return (replica.is_memory_replica() ||
+                                replica.is_nof_replica()) &&
+                               IsAwaitingRemount(replica);
+                    }))
+                    return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
                 const bool has_read_lease = !metadata.IsLeaseExpired(now);
                 if (has_read_lease) {
                     // HA replay cannot reserve the old memory address after
                     // an object-storage replacement commits.
-                    if (enable_ha_ &&
-                        (has_object_replica || config.os_replica_num) &&
+                    if (enable_ha_ && requires_fresh_object_replicas &&
                         metadata.HasReplica(&Replica::fn_is_memory_replica)) {
                         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
                     }
@@ -6375,11 +6416,6 @@ auto MasterService::UpsertStartImpl(const UUID& client_id,
                     }
                 }
 
-                const bool requires_fresh_object_replicas =
-                    config.os_replica_num || has_object_replica ||
-                    (object_uploads_ &&
-                     object_uploads_->FirstObjectUploadForKey(
-                         object_id.tenant_id.value(), key));
                 if (metadata.TotalLength() == slice_length && !has_read_lease &&
                     !requires_fresh_object_replicas &&
                     !(bucket_allocator_ != nullptr &&
@@ -6536,21 +6572,8 @@ auto MasterService::UpsertStartImpl(const UUID& client_id,
     // Over-quota is rejected outright. Making room is the namespace policy's
     // maintenance pass, not the write path's: this write fails, the evictor
     // builds headroom, the next one succeeds.
-    auto result = AdmitWithDfsRecovery(config, admit);
-    if (revocation.valid()) {
-        // The old attempt releases the key in its durable callback. Hold no
-        // key or group lock while waiting for that callback before admission.
-        if (weight_group_operation_lock) weight_group_operation_lock->unlock();
-        auto error = revocation.get();
-        if (error != ErrorCode::OK) return tl::make_unexpected(error);
-        if (weight_group_operation_lock) {
-            weight_group_operation_lock->lock();
-            if (!weight_manager_.AllowsGroupMemberMutation(group_id))
-                return tl::make_unexpected(
-                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-        }
-        result = AdmitWithDfsRecovery(config, admit);
-    }
+    auto result = AdmitWithDfsRecovery(config, admit, revocation,
+                                       weight_group_operation_lock, group_id);
     if (result && weight_group_operation_lock) {
         weight_manager_.RecordImportWrite(object_id.tenant_id, group_id);
     }
@@ -6699,8 +6722,9 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto target_pred = [this, replica_type, &client_id,
+    auto target_pred = [replica_type, &client_id,
                         expected_replica_id](const Replica& r) {
+        if (expected_replica_id && r.id() != *expected_replica_id) return false;
         if (replica_type == ReplicaType::DISK) {
             return r.is_disk_replica();
         } else if (replica_type == ReplicaType::LOCAL_DISK) {
@@ -6708,23 +6732,14 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
                    r.get_descriptor().get_local_disk_descriptor().client_id ==
                        client_id;
         } else if (replica_type == ReplicaType::DFS) {
-            return use_kvcs_ && expected_replica_id != nullptr &&
-                   r.is_dfs_replica() && r.id() == *expected_replica_id;
+            return r.is_dfs_replica();
         }
         return false;
     };
 
-    if (expected_replica_id != nullptr &&
-        !metadata.HasReplica([&](const Replica& r) {
-            return target_pred(r) && r.id() == *expected_replica_id;
-        })) {
-        // The replica the caller failed on is no longer the current record:
-        // it was replaced or already evicted. Leave whatever is there now
-        // untouched and report the precondition miss.
-        LOG(INFO) << "key=" << key << ", replica_id=" << *expected_replica_id
-                  << ", info=eviction_precondition_miss";
-        return false;
-    }
+    // An offloader may report a replica from an earlier generation.
+    // A miss must not append a logical REMOVE for a processing replacement.
+    if (!metadata.HasReplica(target_pred)) return false;
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         auto remaining =

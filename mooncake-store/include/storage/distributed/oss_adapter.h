@@ -48,6 +48,10 @@ class OssObjectStorageAdapter : public ObjectStorageAdapter {
     const char* GetName() const override { return "oss"; }
     bool SupportsSinglePutAttempt() const override { return true; }
     bool SupportsSinglePutVAttempt() const override { return true; }
+    tl::expected<void, ErrorCode> PutVOnceWithOutcome(const std::string& key,
+                                                      const iovec* iov,
+                                                      int count,
+                                                      bool& may_exist) override;
 
     // OSS-specific operations that are intentionally not part of the common
     // ObjectStorageAdapter contract.
@@ -82,7 +86,7 @@ class OssObjectStorageAdapter : public ObjectStorageAdapter {
         const char* body = nullptr, size_t body_size = 0,
         const std::string& range = "", const iovec* upload_iov = nullptr,
         int upload_iovcnt = 0, void* download_buffer = nullptr,
-        size_t download_capacity = 0) const;
+        size_t download_capacity = 0, bool* may_exist = nullptr) const;
 
     std::vector<tl::expected<size_t, ErrorCode>> RequestBatch(
         const std::vector<BatchRequest>& requests);

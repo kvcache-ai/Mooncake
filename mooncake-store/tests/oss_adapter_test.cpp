@@ -1737,6 +1737,47 @@ TEST(OssObjectStorageAdapterTest,
 }
 
 TEST(OssObjectStorageAdapterTest,
+     SinglePutDistinguishesRejectionFromLostReply) {
+    using Server = test::OssFaultHttpServer;
+    Server server({{"denied", Server::Reply(403, "denied")},
+                   {"empty", Server::Reply(403, "denied")},
+                   {"large", Server::Reply(413, "too large")},
+                   {"no-bucket", Server::Reply(404, "NoSuchBucket")},
+                   {"lost", Server::Reset()},
+                   {"busy", Server::Reply(503, "busy")}});
+    ScopedEnvironment environment;
+    ConfigureFaultEndpoint(environment, server.port());
+    auto adapter = std::make_shared<OssObjectStorageAdapter>("/backend-io/");
+    ASSERT_TRUE(adapter->Init());
+    ObjectStorageBackend backend({16, 16}, adapter);
+    char byte = 'a';
+    auto write = [&](const std::string& key, size_t size, bool& may_exist) {
+        return backend.WriteV(
+            key, size, {{&byte, size}}, [](const Slice&) { return true; }, {},
+            nullptr, &may_exist);
+    };
+    bool may_exist = true;
+    EXPECT_EQ(write("denied", 1, may_exist), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_FALSE(may_exist);
+    EXPECT_EQ(write("empty", 0, may_exist), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_FALSE(may_exist);
+    EXPECT_EQ(write("large", 1, may_exist), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_FALSE(may_exist);
+    EXPECT_EQ(write("no-bucket", 1, may_exist), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_FALSE(may_exist);
+    EXPECT_EQ(write("lost", 1, may_exist), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_TRUE(may_exist);
+    EXPECT_EQ(write("busy", 1, may_exist), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_TRUE(may_exist);
+    server.Stop();
+    ASSERT_TRUE(server.error().empty()) << server.error();
+    ASSERT_EQ(server.requests().size(), 6u);
+    EXPECT_EQ(write("refused", 1, may_exist),
+              ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_FALSE(may_exist);
+}
+
+TEST(OssObjectStorageAdapterTest,
      PreservesLarge416WithoutMaskingTruncatedResponses) {
     using Server = test::OssFaultHttpServer;
     Server server(

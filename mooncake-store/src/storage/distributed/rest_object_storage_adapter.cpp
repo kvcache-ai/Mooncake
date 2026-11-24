@@ -456,7 +456,8 @@ RestObjectStorageAdapter::Request(
     const std::map<std::string, std::string>& query, const char* body,
     size_t body_size, const std::string& range, const iovec* upload_iov,
     int upload_iovcnt, void* download_buffer, size_t download_capacity,
-    bool retry) const {
+    bool retry, bool* may_exist) const {
+    if (may_exist) *may_exist = false;
     if (!initialized_) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -477,6 +478,9 @@ RestObjectStorageAdapter::Request(
         const CURLcode result = curl_easy_perform(context.curl);
         curl_easy_getinfo(context.curl, CURLINFO_RESPONSE_CODE,
                           &response.status);
+        if (may_exist)
+            *may_exist =
+                object_storage_http::PutMayExist(result, response.status);
         response.transferred = context.download_context.transferred;
         response.body = std::move(context.error_body);
         // Preserve 404/416 when receiving their oversized bodies was aborted
@@ -542,14 +546,20 @@ tl::expected<void, ErrorCode> RestObjectStorageAdapter::PutVOnce(
     return PutVImpl(logical_key, iov, iovcnt, false);
 }
 
+tl::expected<void, ErrorCode> RestObjectStorageAdapter::PutVOnceWithOutcome(
+    const std::string& key, const iovec* iov, int count, bool& may_exist) {
+    return PutVImpl(key, iov, count, false, &may_exist);
+}
+
 tl::expected<void, ErrorCode> RestObjectStorageAdapter::PutVImpl(
-    const std::string& logical_key, const iovec* iov, int iovcnt, bool retry) {
+    const std::string& logical_key, const iovec* iov, int iovcnt, bool retry,
+    bool* may_exist) {
+    if (may_exist) *may_exist = false;
     auto total = GetIovecSize(iov, iovcnt);
     if (!total) return tl::make_unexpected(total.error());
-    if (*total == 0) return PutImpl(logical_key, {}, retry);
-    auto response =
-        Request("PUT", LogicalToPhysicalKey(logical_key), {}, nullptr, *total,
-                "", iov, iovcnt, nullptr, 0, retry);
+    auto response = Request("PUT", LogicalToPhysicalKey(logical_key), {},
+                            nullptr, *total, "", *total ? iov : nullptr, iovcnt,
+                            nullptr, 0, retry, may_exist);
     if (!response) return tl::make_unexpected(response.error());
     if (!IsSuccess(response->status))
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <curl/curl.h>
+
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -9,6 +11,27 @@
 #include <string_view>
 
 namespace mooncake::object_storage_http {
+
+// Single request, redirects disabled. A lost reply or a server error can
+// follow a successful write. Pre-request transport failures and explicit HTTP
+// request rejections cannot.
+inline bool PutMayExist(CURLcode result, long status) {
+    if (result == CURLE_OK) {
+        switch (status) {
+            case 401:  // Unauthorized
+            case 403:  // Forbidden
+            case 404:  // Destination bucket/path does not exist
+            case 413:  // Payload too large
+                return false;
+            default:
+                return true;
+        }
+    }
+    return result != CURLE_COULDNT_RESOLVE_PROXY &&
+           result != CURLE_COULDNT_RESOLVE_HOST &&
+           result != CURLE_COULDNT_CONNECT &&
+           result != CURLE_PEER_FAILED_VERIFICATION;
+}
 
 struct ContentRange {
     uint64_t first;

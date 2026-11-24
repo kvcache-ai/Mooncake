@@ -34,7 +34,7 @@ ErrorCode Client::WriteObjectStorageReplica(const Replica::Descriptor& replica,
                                        : ErrorCode::NOT_SUPPORTED;
     }
     auto runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
-    bool started = false;
+    bool may_exist = false;
     auto start = std::chrono::steady_clock::now();
     auto error = object_storage_backend_->WriteV(
         object.object_key, object.object_size, slices,
@@ -44,7 +44,7 @@ ErrorCode Client::WriteObjectStorageReplica(const Replica::Descriptor& replica,
         [&](void* dst, const void* src, size_t size) {
             return runtime.CopyToHost(dst, src, size);
         },
-        &started);
+        nullptr, &may_exist);
     if (metrics_)
         metrics_->transfer_metric.object_put_latency_us.observe(
             elapsed_us_since(start));
@@ -56,8 +56,8 @@ ErrorCode Client::WriteObjectStorageReplica(const Replica::Descriptor& replica,
             object.object_key, ObjectUploadOutcome::COMPLETE);
     } else {
         ReportObjectStorageUpload(object.object_key,
-                                  started ? ObjectUploadOutcome::UNKNOWN
-                                          : ObjectUploadOutcome::NOT_STARTED);
+                                  may_exist ? ObjectUploadOutcome::UNKNOWN
+                                            : ObjectUploadOutcome::NOT_WRITTEN);
     }
     return error;
 }
