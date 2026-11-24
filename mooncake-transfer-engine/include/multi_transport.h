@@ -42,12 +42,14 @@ class TransferEngineImpl;
 class TransferEngineImplTestPeer;
 class MultiTransportTestPeer;
 class MultiTransportBatchTestPeer;
+class UnregisterQuiesceTestPeer;
 
 class MultiTransport {
     friend class TransferEngineImpl;
     friend class TransferEngineImplTestPeer;
     friend class MultiTransportTestPeer;
     friend class MultiTransportBatchTestPeer;
+    friend class UnregisterQuiesceTestPeer;
 
    public:
     using BatchID = Transport::BatchID;

@@ -8,6 +8,11 @@ if(USE_TENT)
 endif()
 add_test(NAME batch_submit_test COMMAND batch_submit_test)
 
+add_executable(unregister_quiesce_test ${WORKSPACE}/unregister_quiesce_test.cpp)
+target_link_libraries(unregister_quiesce_test PRIVATE transfer_engine gtest
+                                                     gtest_main pthread)
+add_test(NAME unregister_quiesce_test COMMAND unregister_quiesce_test)
+
 if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
   add_executable(task_congestion_observation_test
                  ${WORKSPACE}/task_congestion_observation_test.cpp)
