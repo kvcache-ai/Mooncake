@@ -138,7 +138,7 @@ class StorageFile {
     }
 
     // errno of the first failed syscall; 0 for logical failures (e.g. EOF).
-    int sys_errno() const { return sys_errno_; }
+    int sys_errno() const { return sys_errno_.load(std::memory_order_relaxed); }
 
     /**
      * @brief file locking mechanism
@@ -159,7 +159,9 @@ class StorageFile {
 
    protected:
     void record_sys_errno(int err) {
-        if (sys_errno_ == 0) sys_errno_ = err;
+        int expected = 0;
+        sys_errno_.compare_exchange_strong(expected, err,
+                                           std::memory_order_relaxed);
     }
 
     bool delete_on_write_fail_ = true;
@@ -168,7 +170,7 @@ class StorageFile {
     // Atomic so parallel offload writers (PR #5020) can publish status read
     // from other threads.
     std::atomic<ErrorCode> error_code_{ErrorCode::OK};
-    int sys_errno_ = 0;
+    std::atomic<int> sys_errno_{0};
     std::atomic<bool> is_locked_{false};
 };
 

@@ -24,9 +24,12 @@ bool BucketBackendConfig::Validate() const {
             << "BucketBackendConfig: invalid I/O workers or sub batch size";
         return false;
     }
-    if (write_back_buffer_bytes < 0) {
-        LOG(ERROR) << "BucketBackendConfig: write_back_buffer_bytes must "
-                      "be >= 0";
+    if (write_back_buffer_bytes < 0 ||
+        (write_back_buffer_bytes > 0 &&
+         (write_back_buffer_bytes < 4096 ||
+          write_back_buffer_bytes % 4096 != 0))) {
+        LOG(ERROR) << "BucketBackendConfig: write_back_buffer_bytes must be 0 "
+                      "or a positive multiple of 4096";
         return false;
     }
     if (bucket_keys_limit <= 0) {

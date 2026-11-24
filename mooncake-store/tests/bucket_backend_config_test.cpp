@@ -261,32 +261,41 @@ TEST_F(BucketBackendConfigTest, ValidationPreservesExistingBounds) {
     config.max_physical_bytes = -1;
     config.disk_scan_cache_ms = -1;
     EXPECT_TRUE(config.Validate());
+
+    for (const int64_t invalid : {-1, 1, 4095, 4097, 8191}) {
+        config.write_back_buffer_bytes = invalid;
+        EXPECT_FALSE(config.Validate()) << invalid;
+    }
+    for (const int64_t valid : {0, 4096, 8192, 64 * 1024 * 1024}) {
+        config.write_back_buffer_bytes = valid;
+        EXPECT_TRUE(config.Validate()) << valid;
+    }
 }
 
 TEST_F(BucketBackendConfigTest, WriteWorkersAreOptionalAndIndependent) {
-    auto config = BucketBackendConfig::FromEnvironment();
+    auto config = BucketBackendConfig::FromEnvironment().value();
     EXPECT_EQ(config.write_io_workers, 0);
     EXPECT_EQ(config.write_sub_batch_max_iovecs, 32);
     EXPECT_EQ(config.write_io_backoff_ms, 300);
     env.write_sub_batch.Set("0");
-    EXPECT_TRUE(BucketBackendConfig::FromEnvironment().Validate());
+    EXPECT_TRUE(BucketBackendConfig::FromEnvironment().value().Validate());
     env.write_workers.Set("3");
-    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().Validate());
+    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().value().Validate());
     env.write_sub_batch.Set("9");
     env.write_backoff.Set("17");
-    config = BucketBackendConfig::FromEnvironment();
+    config = BucketBackendConfig::FromEnvironment().value();
     EXPECT_TRUE(config.Validate());
     EXPECT_EQ(config.write_io_workers, 3);
     EXPECT_EQ(config.write_sub_batch_max_iovecs, 9);
     EXPECT_EQ(config.write_io_backoff_ms, 17);
     for (const auto* bad : {"-1", "", "invalid", "9223372036854775808"}) {
         env.write_workers.Set(bad);
-        EXPECT_FALSE(BucketBackendConfig::FromEnvironment().Validate());
+        EXPECT_FALSE(BucketBackendConfig::FromEnvironment().value().Validate());
     }
     env.write_workers.Set("0");
     for (const auto* bad : {"0", "-1", "invalid"}) {
         env.write_backoff.Set(bad);
-        EXPECT_FALSE(BucketBackendConfig::FromEnvironment().Validate());
+        EXPECT_FALSE(BucketBackendConfig::FromEnvironment().value().Validate());
     }
 }
 

@@ -496,6 +496,28 @@ TEST(BatchIoSchedulerTest, FailedWriteGroupDoesNotCancelOtherBuckets) {
     EXPECT_EQ(finished, 2);
 }
 
+TEST(BatchIoSchedulerTest, IndividualTasksShareOneCompletionGroup) {
+    auto created = BatchIoScheduler::Create(3);
+    ASSERT_TRUE(created);
+    BatchIoScheduler::PendingBatch batch;
+    std::vector<size_t> visits(37, 0);
+    size_t finished = 0;
+    ASSERT_TRUE(created.value()->PrepareSubBatchTasks(
+        batch, visits.size(),
+        [&](size_t begin, size_t end) -> IoResult {
+            EXPECT_EQ(end, begin + 1);
+            ++visits.at(begin);
+            return {};
+        },
+        [&](IoResult result) -> IoResult {
+            ++finished;
+            return result;
+        }));
+    EXPECT_TRUE(created.value()->SubmitAndWait(batch));
+    EXPECT_EQ(finished, 1);
+    for (const auto visit : visits) EXPECT_EQ(visit, 1);
+}
+
 TEST(BatchIoSchedulerTest, WaitIncludesIndependentGroupFinalizers) {
     auto created = BatchIoScheduler::Create(2);
     ASSERT_TRUE(created);

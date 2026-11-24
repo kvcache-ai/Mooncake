@@ -108,11 +108,11 @@ struct BucketBackendConfig {
     // Cap of the per write-worker thread-local write-back buffer that
     // misaligned slices are copied into so they can go out as aligned
     // direct writes. The buffer is allocated once at this size on the
-    // worker's first bucket and reused, so workers never repeatedly
-    // allocate and free scratch memory. Objects whose copies would not
-    // fit are written buffered from their original buffers instead.
-    // 0 selects the legacy behavior: the buffer grows to the largest
-    // bucket seen (bounded by bucket_size_limit).
+    // worker's first direct sub-batch and reused, so workers never repeatedly
+    // allocate and free scratch memory. Sub-batches are split at this bound;
+    // positive values must be multiples of 4096.
+    // 0 selects a buffer large enough for the largest bucket seen (bounded by
+    // bucket_size_limit).
     // Set by MOONCAKE_OFFLOAD_WRITE_BACK_BUFFER_BYTES.
     int64_t write_back_buffer_bytes = 64LL * 1024 * 1024;
 

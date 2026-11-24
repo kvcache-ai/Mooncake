@@ -99,6 +99,10 @@ bool PathContainsOrEquals(const std::string& base, const std::string& other) {
     return true;
 }
 
+// The calling thread's buffer for the bytes a hybrid direct write copies, or
+// nullptr when it cannot be grown to `capacity`.
+char* HybridWriteBackBuffer(size_t capacity);
+
 }  // namespace
 
 std::string StorageBackend::GetActualFsdir() const {
@@ -1725,6 +1729,15 @@ struct BucketStorageBackend::WritePlan {
     bool committed = false;
     bool file_created = false;
     std::unique_ptr<StorageFile> file;
+    struct HybridWriteRange {
+        size_t offset;
+        size_t length;
+        bool direct;
+    };
+    bool hybrid_write = false;
+    size_t hybrid_buffer_capacity = 0;
+    FdGuard hybrid_buffered_fd{-1};
+    std::vector<HybridWriteRange> hybrid_ranges;
 
     ~WritePlan() {
         // Also handles exceptions and a published batch rejected at shutdown.
@@ -1793,15 +1806,71 @@ tl::expected<void, ErrorCode> BucketStorageBackend::PrepareOffload(
             BuildBucket(plan->id, plan->objects, plan->iovs, plan->metadatas);
         if (!built) return fail(built.error());
         plan->bucket = std::move(built.value());
-        auto result = write_io_scheduler_->PrepareSubBatches(
-            state.batch, plan->slice_ends.size(),
-            bucket_backend_config_.write_sub_batch_max_iovecs,
-            [this, plan](size_t begin, size_t end) {
-                return ExecuteWriteRange(*plan, begin, end);
-            },
-            [this, plan](tl::expected<void, ErrorCode> result) {
-                return FinishWritePlan(*plan, result);
-            });
+        for (const auto& iov : plan->iovs) {
+            plan->iov_ends.push_back(
+                (plan->iov_ends.empty() ? 0 : plan->iov_ends.back()) +
+                iov.iov_len);
+        }
+#ifdef USE_URING
+        plan->hybrid_write = bucket_backend_config_.aligned_uring_write &&
+                             file_storage_config_.use_uring;
+#endif
+        auto complete = [this, plan](tl::expected<void, ErrorCode> result) {
+            return FinishWritePlan(*plan, result);
+        };
+        tl::expected<void, ErrorCode> result;
+        if (plan->hybrid_write) {
+            constexpr size_t kBlock = kDirectIOAlignment;
+            constexpr size_t kMaxSourceIovs = 31;
+            const size_t total = plan->slice_ends.back();
+            const size_t configured_cap = static_cast<size_t>(
+                bucket_backend_config_.write_back_buffer_bytes);
+            plan->hybrid_buffer_capacity =
+                configured_cap > 0 ? configured_cap : std::max(total, kBlock);
+            const size_t interior_begin = std::min(kBlock, total);
+            const size_t interior_end = total & ~(kBlock - 1);
+            plan->hybrid_ranges.push_back({0, interior_begin, false});
+            for (size_t cursor = interior_begin; cursor < interior_end;) {
+                size_t end =
+                    plan->hybrid_buffer_capacity >= interior_end - cursor
+                        ? interior_end
+                        : cursor + plan->hybrid_buffer_capacity;
+                auto first = std::upper_bound(plan->iov_ends.begin(),
+                                              plan->iov_ends.end(), cursor);
+                if (static_cast<size_t>(std::distance(
+                        first, plan->iov_ends.end())) > kMaxSourceIovs) {
+                    // The cut is the block edge before the end of the 31st
+                    // iovec, so a range of small iovecs takes more of them.
+                    const size_t iov_end =
+                        first[kMaxSourceIovs - 1] & ~(kBlock - 1);
+                    if (iov_end > cursor) end = std::min(end, iov_end);
+                }
+                if (end <= cursor) return fail(ErrorCode::INTERNAL_ERROR);
+                plan->hybrid_ranges.push_back({cursor, end - cursor, true});
+                cursor = end;
+            }
+            if (total > kBlock && interior_end < total) {
+                plan->hybrid_ranges.push_back(
+                    {interior_end, total - interior_end, false});
+            }
+            result = write_io_scheduler_->PrepareSubBatchTasks(
+                state.batch, plan->hybrid_ranges.size(),
+                [this, plan](size_t begin,
+                             size_t end) -> tl::expected<void, ErrorCode> {
+                    if (end != begin + 1)
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    return ExecuteHybridWriteRange(*plan, begin);
+                },
+                complete);
+        } else {
+            result = write_io_scheduler_->PrepareSubBatches(
+                state.batch, plan->slice_ends.size(),
+                bucket_backend_config_.write_sub_batch_max_iovecs,
+                [this, plan](size_t begin, size_t end) {
+                    return ExecuteWriteRange(*plan, begin, end);
+                },
+                complete);
+        }
         if (!result) return fail(result.error());
         return {};
     } catch (const std::bad_alloc&) {
@@ -1850,6 +1919,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::InitializeWritePlan(
         if (!built) return tl::make_unexpected(built.error());
         plan.bucket = std::move(built.value());
     }
+    plan.iov_ends.clear();
     size_t end = 0;
     for (const auto& iov : plan.iovs) {
         end += iov.iov_len;
@@ -1900,12 +1970,25 @@ tl::expected<void, ErrorCode> BucketStorageBackend::InitializeWritePlan(
         LOG(WARNING) << "Offload eviction cleanup: " << finalized.error();
     auto path = GetBucketDataPath(plan.id, plan.disk_index);
     if (!path) return tl::make_unexpected(path.error());
-    // Existing OpenFile writes are buffered POSIX, even with use_uring set.
     // Open/truncate once per bucket, never once per sub batch.
     auto opened = OpenFile(*path, FileMode::Write);
     if (!opened) return tl::make_unexpected(opened.error());
     plan.file = std::move(*opened);
     plan.file_created = true;
+#ifdef USE_URING
+    if (plan.hybrid_write) {
+        if (dynamic_cast<UringFile*>(plan.file.get()) == nullptr) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        plan.hybrid_buffered_fd.fd =
+            ::open(path->c_str(), O_WRONLY | O_CLOEXEC);
+        if (plan.hybrid_buffered_fd.fd < 0) {
+            const int err = errno;
+            NotifyDiskError(err, "open");
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+    }
+#endif
     return {};
 }
 
@@ -1955,12 +2038,178 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ExecuteWriteRange(
         if (iovs.empty()) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         auto written = plan.file->vector_write(
             iovs.data(), static_cast<int>(iovs.size()), offset);
-        if (!written) return tl::make_unexpected(written.error());
+        if (!written) {
+            NotifyDiskError(plan.file->sys_errno(), "pwritev");
+            return tl::make_unexpected(written.error());
+        }
         if (*written != bytes)
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         offset += bytes;
     }
     return {};
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::ExecuteHybridWriteRange(
+    WritePlan& plan, size_t range_index) {
+    if (range_index >= plan.hybrid_ranges.size()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::call_once(plan.initialized, [&] {
+        try {
+            auto result = InitializeWritePlan(plan);
+            if (!result) plan.init_error = result.error();
+        } catch (...) {
+            plan.init_error = ErrorCode::INTERNAL_ERROR;
+        }
+    });
+    if (plan.init_error) return tl::make_unexpected(*plan.init_error);
+#ifdef USE_URING
+    const auto& range = plan.hybrid_ranges[range_index];
+    const size_t range_end = range.offset + range.length;
+    if (!range.direct) {
+        std::vector<iovec> parts;
+        for (size_t index = 0; index < plan.iovs.size(); ++index) {
+            const size_t source_begin =
+                index == 0 ? 0 : plan.iov_ends[index - 1];
+            const size_t source_end = plan.iov_ends[index];
+            const size_t begin = std::max(range.offset, source_begin);
+            const size_t end = std::min(range_end, source_end);
+            if (begin < end) {
+                parts.push_back({static_cast<char*>(plan.iovs[index].iov_base) +
+                                     begin - source_begin,
+                                 end - begin});
+            }
+        }
+        size_t done = 0;
+        size_t index = 0;
+        while (done < range.length && index < parts.size()) {
+            const int count = static_cast<int>(
+                std::min<size_t>(parts.size() - index, IOV_MAX));
+            const ssize_t written =
+                ::pwritev(plan.hybrid_buffered_fd.fd, parts.data() + index,
+                          count, static_cast<off_t>(range.offset + done));
+            if (written < 0) {
+                if (errno == EINTR) continue;
+                const int err = errno;
+                NotifyDiskError(err, "pwritev");
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+            if (written == 0) {
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+            done += static_cast<size_t>(written);
+            ssize_t advance = written;
+            while (index < parts.size() &&
+                   advance >= static_cast<ssize_t>(parts[index].iov_len)) {
+                advance -= static_cast<ssize_t>(parts[index].iov_len);
+                ++index;
+            }
+            if (index < parts.size() && advance > 0) {
+                parts[index].iov_base =
+                    static_cast<char*>(parts[index].iov_base) + advance;
+                parts[index].iov_len -= static_cast<size_t>(advance);
+            }
+        }
+        if (done != range.length) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        return {};
+    }
+
+    constexpr size_t kBlock = kDirectIOAlignment;
+    if (range.offset % kBlock != 0 || range.length % kBlock != 0 ||
+        range.length > plan.hybrid_buffer_capacity) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    char* const write_back = HybridWriteBackBuffer(plan.hybrid_buffer_capacity);
+    if (write_back == nullptr) {
+        LOG(ERROR) << "Failed to allocate hybrid write-back buffer for "
+                      "bucket "
+                   << plan.id;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto* file = dynamic_cast<UringFile*>(plan.file.get());
+    if (file == nullptr) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    std::vector<UringFile::ReadDesc> descs;
+    descs.reserve(32);
+    size_t copied = 0;
+    const auto append_copy =
+        [&](size_t offset, size_t length,
+            std::vector<UringFile::ReadDesc>& descriptors,
+            size_t& copied_bytes) -> tl::expected<void, ErrorCode> {
+        if (copied_bytes + length > plan.hybrid_buffer_capacity) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        size_t gathered = 0;
+        for (size_t index = 0; index < plan.iovs.size(); ++index) {
+            const size_t source_begin =
+                index == 0 ? 0 : plan.iov_ends[index - 1];
+            const size_t source_end = plan.iov_ends[index];
+            const size_t begin = std::max(offset, source_begin);
+            const size_t end = std::min(offset + length, source_end);
+            if (begin < end) {
+                std::memcpy(write_back + copied_bytes + gathered,
+                            static_cast<char*>(plan.iovs[index].iov_base) +
+                                begin - source_begin,
+                            end - begin);
+                gathered += end - begin;
+            }
+        }
+        if (gathered != length) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        descriptors.push_back(UringFile::ReadDesc{
+            write_back + copied_bytes, length, static_cast<off_t>(offset), 0,
+            ErrorCode::OK, false});
+        copied_bytes += length;
+        return tl::expected<void, ErrorCode>{};
+    };
+
+    size_t gap = range.offset;
+    for (size_t index = 0; index < plan.iovs.size(); ++index) {
+        const size_t source_begin = index == 0 ? 0 : plan.iov_ends[index - 1];
+        const size_t source_end = plan.iov_ends[index];
+        const size_t begin = std::max(range.offset, source_begin);
+        const size_t end = std::min(range_end, source_end);
+        if (begin >= end) continue;
+        const bool on_grid =
+            ((reinterpret_cast<intptr_t>(plan.iovs[index].iov_base) -
+              static_cast<int64_t>(source_begin)) %
+             static_cast<int64_t>(kBlock)) == 0;
+        if (!on_grid) continue;
+        const size_t direct_begin = align_up(begin, kBlock);
+        const size_t direct_end = end & ~(kBlock - 1);
+        if (direct_begin >= direct_end) continue;
+        if (direct_begin > gap) {
+            auto result = append_copy(gap, direct_begin - gap, descs, copied);
+            if (!result) return result;
+        }
+        descs.push_back(UringFile::ReadDesc{
+            static_cast<char*>(plan.iovs[index].iov_base) + direct_begin -
+                source_begin,
+            direct_end - direct_begin, static_cast<off_t>(direct_begin), 0,
+            ErrorCode::OK, false});
+        gap = direct_end;
+    }
+    if (gap < range_end) {
+        auto result = append_copy(gap, range_end - gap, descs, copied);
+        if (!result) return result;
+    }
+    if (descs.empty()) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    auto result =
+        file->batch_write(descs.data(), static_cast<int>(descs.size()));
+    if (!result) {
+        NotifyDiskError(file->sys_errno(), "write");
+        LOG(ERROR) << "Parallel hybrid batch write failed for bucket "
+                   << plan.id << ": " << result.error()
+                   << ErrnoSuffix(file->sys_errno());
+        return result;
+    }
+    return {};
+#else
+    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+#endif
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::FinishWritePlan(
@@ -1969,6 +2218,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinishWritePlan(
     try {
         if (result) {
             result = plan.file->datasync();
+            if (!result) NotifyDiskError(plan.file->sys_errno(), "fdatasync");
             if (test_datasync_failure_.load(std::memory_order_relaxed))
                 result = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
@@ -3498,6 +3748,18 @@ struct AlignedCopyBuffer {
     size_t capacity = 0;
 };
 
+char* HybridWriteBackBuffer(size_t capacity) {
+    constexpr size_t kBlock = 4096;  // BucketStorageBackend::kDirectIOAlignment
+    thread_local AlignedCopyBuffer write_back;
+    if (capacity > write_back.capacity) {
+        void* buffer = nullptr;
+        posix_memalign(&buffer, kBlock, capacity);
+        write_back.data.reset(static_cast<char*>(buffer));
+        write_back.capacity = buffer ? capacity : 0;
+    }
+    return write_back.data.get();
+}
+
 }  // namespace
 
 // Each object takes whole 4 KiB blocks: zeros and then the key, so that the
@@ -3661,7 +3923,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         if (interior_begin > 0) {
             buffered.push_back({0, interior_begin});
         }
-        if (interior_end < total) {
+        if (total > kBlock && interior_end < total) {
             buffered.push_back({interior_end, total - interior_end});
         }
 
@@ -5299,9 +5561,8 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode,
         if (!packed) return tl::make_unexpected(packed.error());
         packed_write = packed.value();
     }
-    // Aligned uring buckets write their data file through UringFile: the
-    // block-aligned iovecs from BuildAlignedDirectBucket go out as queued
-    // write SQEs instead of a synchronous pwritev.
+    // Hybrid bucket writes open their data files with O_DIRECT. The write
+    // planner supplies block-aligned descriptors for queued write SQEs.
     const bool aligned_uring_write =
         bucket_backend_config_.aligned_uring_write &&
         mode == FileMode::Write && path.ends_with(BUCKET_DATA_FILE_SUFFIX);

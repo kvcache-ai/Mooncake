@@ -6670,19 +6670,25 @@ void ExpectAlignedLayout(BucketStorageBackend& backend,
            "with zeros elsewhere";
 }
 
+// Loads every object back and compares it with its value. Each destination
+// is 4 KiB-aligned with a spare block on each side, like the store's read
+// buffers: the io_uring read path reads whole 4 KiB blocks around the value
+// and moves the slice pointer to where the value landed.
 void ExpectLoadsBack(BucketStorageBackend& backend,
                      const std::vector<AlignedTestObject>& objects) {
-    std::vector<std::string> loaded(objects.size());
+    std::vector<AlignedTestBuffer> buffers;
     std::unordered_map<std::string, Slice> load_batch;
-    for (size_t i = 0; i < objects.size(); ++i) {
-        loaded[i].resize(objects[i].value.size());
-        load_batch.emplace(objects[i].key,
-                           Slice{loaded[i].data(), loaded[i].size()});
+    for (const auto& object : objects) {
+        buffers.push_back(AllocateAligned(object.value.size() + 2 * 4096));
+        load_batch.emplace(object.key,
+                           Slice{buffers.back().get(), object.value.size()});
     }
     ASSERT_TRUE(backend.BatchLoad(load_batch).has_value());
-    for (size_t i = 0; i < objects.size(); ++i) {
-        EXPECT_TRUE(loaded[i] == objects[i].value)
-            << objects[i].key.substr(0, 16);
+    for (const auto& object : objects) {
+        const auto& loaded = load_batch.at(object.key);
+        EXPECT_TRUE(std::string_view(static_cast<char*>(loaded.ptr),
+                                     loaded.size) == object.value)
+            << object.key.substr(0, 16);
     }
 }
 
@@ -6921,6 +6927,145 @@ TEST_F(StorageBackendTest, AlignedDirectBucketBatchLoadWithUring) {
                                      loaded.size) == object.value)
             << object.key.substr(0, 16);
     }
+}
+
+TEST_F(StorageBackendTest, HybridOffloadSmallBucketRoundTrip) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+    BucketBackendConfig bucket_config;
+    bucket_config.aligned_uring_write = true;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    std::vector<AlignedTestObject> objects;
+    objects.push_back(MakeAlignedTestObject("tiny", {{13, 1000}}, 1));
+    ASSERT_TRUE(backend.BatchOffload(BatchOf(objects), AcceptAll));
+    ExpectLoadsBack(backend, objects);
+}
+
+TEST_F(StorageBackendTest, ParallelHybridOffloadRoundTrip) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+    BucketBackendConfig bucket_config;
+    bucket_config.write_io_workers = 4;
+    bucket_config.aligned_uring_write = true;
+    bucket_config.write_back_buffer_bytes = 4096;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    std::vector<std::pair<size_t, size_t>> pieces;
+    for (size_t i = 0; i < 40; ++i) {
+        pieces.push_back({i % 3 == 0 ? 0 : 17, 1024 + i});
+    }
+    std::vector<AlignedTestObject> objects;
+    objects.push_back(MakeAlignedTestObject("hybrid_first", pieces, 2));
+    objects.push_back(MakeAlignedTestObject(
+        "hybrid_second", {{0, 12288}, {31, 5000}, {0, 4096}}, 3));
+    std::vector<std::pair<size_t, size_t>> small_pieces;
+    for (size_t i = 0; i < 80; ++i) small_pieces.push_back({i % 2, 64});
+    objects.push_back(
+        MakeAlignedTestObject("hybrid_many_iovs", small_pieces, 4));
+    BucketStorageBackend::PendingOffloads pending;
+    ASSERT_TRUE(backend.PrepareOffload(
+        pending, {{objects[0].key, objects[0].slices}}, AcceptAll));
+    ASSERT_TRUE(backend.PrepareOffload(
+        pending, {{objects[1].key, objects[1].slices}}, AcceptAll));
+    ASSERT_TRUE(backend.PrepareOffload(
+        pending, {{objects[2].key, objects[2].slices}}, AcceptAll));
+    ASSERT_TRUE(backend.SubmitOffloadsAndWait(pending));
+    ExpectLoadsBack(backend, objects);
+}
+
+TEST_F(StorageBackendTest, ParallelHybridOffloadKeepsSourceLoadingLazy) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+    BucketBackendConfig bucket_config;
+    bucket_config.write_io_workers = 2;
+    bucket_config.aligned_uring_write = true;
+    bucket_config.write_back_buffer_bytes = 4096;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    std::vector<AlignedTestObject> objects;
+    objects.push_back(MakeAlignedTestObject(
+        "hybrid_lazy", {{0, 8192}, {19, 9000}, {0, 4096}}, 4));
+    BucketStorageBackend::OffloadObjects unloaded{
+        {objects[0].key, objects[0].slices}};
+    for (auto& [key, slices] : unloaded) {
+        for (auto& slice : slices) slice.ptr = nullptr;
+    }
+    const BucketStorageBackend::OffloadObjects loaded_objects{
+        {objects[0].key, objects[0].slices}};
+    size_t loads = 0;
+    BucketStorageBackend::PendingOffloads pending;
+    ASSERT_TRUE(backend.PrepareOffload(
+        pending, unloaded, AcceptAll, nullptr, [loaded_objects, &loads]() {
+            ++loads;
+            return tl::expected<BucketStorageBackend::OffloadObjects,
+                                ErrorCode>(loaded_objects);
+        }));
+    EXPECT_EQ(loads, 0);
+    ASSERT_TRUE(backend.SubmitOffloadsAndWait(pending));
+    EXPECT_EQ(loads, 1);
+    ExpectLoadsBack(backend, objects);
+}
+
+// One direct range can need more than 32 descriptors: each slice here starts
+// on a 4 KiB boundary of the stream and ends 100 bytes into a block, so it
+// takes one zero-copy descriptor plus one copy descriptor for the rest of
+// that block.
+TEST_F(StorageBackendTest, ParallelHybridOffloadManyDescriptors) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+    BucketBackendConfig bucket_config;
+    bucket_config.write_io_workers = 2;
+    bucket_config.aligned_uring_write = true;
+    bucket_config.write_back_buffer_bytes = 1 << 20;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    const std::string key = "hybrid_descriptors";
+    std::vector<std::pair<size_t, size_t>> pieces;
+    size_t offset = key.size() % 4096;
+    for (size_t i = 0; i < 31; ++i) {
+        pieces.push_back({offset, 8192 + 100});
+        offset = (offset + 100) % 4096;
+    }
+    std::vector<AlignedTestObject> objects;
+    objects.push_back(MakeAlignedTestObject(key, pieces, 5));
+    BucketStorageBackend::PendingOffloads pending;
+    ASSERT_TRUE(backend.PrepareOffload(
+        pending, {{objects[0].key, objects[0].slices}}, AcceptAll));
+    ASSERT_TRUE(backend.SubmitOffloadsAndWait(pending));
+    ExpectLoadsBack(backend, objects);
+}
+
+// A direct range is cut at the block edge before the end of its 31st source
+// iovec. Each slice here is on the block grid but ends 12 bytes into a block,
+// so it takes one zero-copy descriptor and one copy descriptor.
+TEST_F(StorageBackendTest, ParallelHybridOffloadKeepsRangesOnBlockEdges) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+    BucketBackendConfig bucket_config;
+    bucket_config.write_io_workers = 2;
+    bucket_config.aligned_uring_write = true;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    const std::string key = "hybrid_edges";
+    std::vector<std::pair<size_t, size_t>> pieces;
+    for (size_t i = 0; i < 80; ++i) pieces.push_back({key.size(), 8192});
+    std::vector<AlignedTestObject> objects;
+    objects.push_back(MakeAlignedTestObject(key, pieces, 6));
+    BucketStorageBackend::PendingOffloads pending;
+    ASSERT_TRUE(backend.PrepareOffload(
+        pending, {{objects[0].key, objects[0].slices}}, AcceptAll));
+    ASSERT_TRUE(backend.SubmitOffloadsAndWait(pending));
+    ExpectLoadsBack(backend, objects);
 }
 #endif
 

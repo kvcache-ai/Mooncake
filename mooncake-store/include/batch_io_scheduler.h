@@ -59,6 +59,12 @@ class BatchIoScheduler {
     tl::expected<void, ErrorCode> PrepareSubBatches(
         PendingBatch& batch, size_t slice_count, size_t sub_batch_size,
         const Execute& execute, const Complete& complete = {});
+    // Prepare one task for each index in [0, task_count). Each task receives
+    // [index, index + 1), allowing callers to pre-partition work by bytes or
+    // submission capabilities instead of Slice count.
+    tl::expected<void, ErrorCode> PrepareSubBatchTasks(
+        PendingBatch& batch, size_t task_count, const Execute& execute,
+        const Complete& complete = {});
     // With complete, each nonempty preparation is an independent failure group.
     // Its callback runs once, after all group tasks terminate (including
     // skipped tasks), outside scheduler locks. A group failure does not cancel

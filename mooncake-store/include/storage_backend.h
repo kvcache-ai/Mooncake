@@ -1175,6 +1175,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     struct WritePlan;
     tl::expected<void, ErrorCode> InitializeWritePlan(WritePlan&);
     tl::expected<void, ErrorCode> ExecuteWriteRange(WritePlan&, size_t, size_t);
+    tl::expected<void, ErrorCode> ExecuteHybridWriteRange(WritePlan&, size_t);
     tl::expected<void, ErrorCode> FinishWritePlan(
         WritePlan&, tl::expected<void, ErrorCode>);
     tl::expected<int64_t, ErrorCode> CommitOffloadedBucket(

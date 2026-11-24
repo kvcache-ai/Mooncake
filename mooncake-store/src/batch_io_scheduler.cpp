@@ -287,6 +287,35 @@ tl::expected<void, ErrorCode> BatchIoScheduler::PrepareSubBatches(
     return tl::make_unexpected(*batch.error_);
 }
 
+tl::expected<void, ErrorCode> BatchIoScheduler::PrepareSubBatchTasks(
+    PendingBatch& batch, size_t task_count, const Execute& execute,
+    const Complete& complete) {
+    if (batch.error_) return tl::make_unexpected(*batch.error_);
+    if (!execute) {
+        batch.error_ = ErrorCode::INVALID_PARAMS;
+        return tl::make_unexpected(*batch.error_);
+    }
+    try {
+        auto group = complete ? std::make_shared<Impl::Group>() : nullptr;
+        if (group) group->complete = complete;
+        for (size_t index = 0; index < task_count; ++index) {
+            auto result =
+                AddSubBatch(batch, SubBatch{index, index + 1, execute});
+            if (!result) return result;
+            if (group) {
+                batch.state_->tasks.back().group = group;
+                ++group->remaining;
+            }
+        }
+        return {};
+    } catch (const std::bad_alloc&) {
+        batch.error_ = ErrorCode::NO_AVAILABLE_HANDLE;
+    } catch (...) {
+        batch.error_ = ErrorCode::INTERNAL_ERROR;
+    }
+    return tl::make_unexpected(*batch.error_);
+}
+
 tl::expected<void, ErrorCode> BatchIoScheduler::SubmitAndWait(
     PendingBatch& batch) {
     auto state = std::move(batch.state_);
