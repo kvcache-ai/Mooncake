@@ -142,7 +142,9 @@ TEST(LocalSsdManagerTest, TouchPromotionIsClientScoped) {
 TEST(LocalSsdManagerTest, ManagesRegistrationCapacityAndUsage) {
     LocalSsdManager manager;
     UUID client{1, 2};
+    EXPECT_FALSE(manager.HasClient(client));
     EXPECT_TRUE(manager.RegisterClient(client, true) == ErrorCode::OK);
+    EXPECT_TRUE(manager.HasClient(client));
     EXPECT_TRUE(manager.RegisterClient(client, false) ==
                 ErrorCode::SEGMENT_ALREADY_EXISTS);
 
@@ -159,8 +161,68 @@ TEST(LocalSsdManagerTest, ManagesRegistrationCapacityAndUsage) {
     auto capacity = manager.UnregisterClient(client);
     ASSERT_TRUE(capacity.has_value());
     EXPECT_EQ(*capacity, 1024);
+    EXPECT_FALSE(manager.HasClient(client));
     EXPECT_FALSE(manager.GetUsage(client).has_value());
     EXPECT_FALSE(manager.AdjustUsedBytes(client, 1));
+    EXPECT_FALSE(manager.UnregisterClient(client).has_value());
+}
+
+TEST(LocalSsdManagerTest, ReportsCapacityDeltasAndConsumesRemoveAll) {
+    LocalSsdManager manager;
+    UUID client_a{20, 21};
+    UUID client_b{22, 23};
+    UUID unknown{24, 25};
+
+    auto bad_unknown_cap = manager.ReportCapacity(unknown, 1024);
+    ASSERT_FALSE(bad_unknown_cap.has_value());
+    EXPECT_TRUE(bad_unknown_cap.error() == ErrorCode::SEGMENT_NOT_FOUND);
+
+    auto bad_unknown_poll = manager.ConsumeRemoveAll(unknown);
+    ASSERT_FALSE(bad_unknown_poll.has_value());
+    EXPECT_TRUE(bad_unknown_poll.error() == ErrorCode::SEGMENT_NOT_FOUND);
+
+    ASSERT_TRUE(manager.RegisterClient(client_a, true) == ErrorCode::OK);
+    ASSERT_TRUE(manager.RegisterClient(client_b, true) == ErrorCode::OK);
+
+    auto negative_cap = manager.ReportCapacity(client_a, -1);
+    ASSERT_FALSE(negative_cap.has_value());
+    EXPECT_TRUE(negative_cap.error() == ErrorCode::INVALID_PARAMS);
+
+    auto c1 = manager.ReportCapacity(client_a, 4096);
+    ASSERT_TRUE(c1.has_value());
+    EXPECT_EQ(c1->previous_bytes, 0);
+    EXPECT_EQ(c1->current_bytes, 4096);
+
+    auto c2 = manager.ReportCapacity(client_a, 4096);
+    ASSERT_TRUE(c2.has_value());
+    EXPECT_EQ(c2->previous_bytes, 4096);
+    EXPECT_EQ(c2->current_bytes, 4096);
+
+    auto c3 = manager.ReportCapacity(client_a, 8192);
+    ASSERT_TRUE(c3.has_value());
+    EXPECT_EQ(c3->previous_bytes, 4096);
+    EXPECT_EQ(c3->current_bytes, 8192);
+
+    auto c4 = manager.ReportCapacity(client_a, 0);
+    ASSERT_TRUE(c4.has_value());
+    EXPECT_EQ(c4->previous_bytes, 8192);
+    EXPECT_EQ(c4->current_bytes, 0);
+
+    auto poll1 = manager.ConsumeRemoveAll(client_a);
+    ASSERT_TRUE(poll1.has_value());
+    EXPECT_FALSE(*poll1);
+
+    manager.RequestRemoveAll({client_a});
+    auto poll2 = manager.ConsumeRemoveAll(client_a);
+    ASSERT_TRUE(poll2.has_value());
+    EXPECT_TRUE(*poll2);
+    auto poll3 = manager.ConsumeRemoveAll(client_a);
+    ASSERT_TRUE(poll3.has_value());
+    EXPECT_FALSE(*poll3);
+
+    auto poll_b = manager.ConsumeRemoveAll(client_b);
+    ASSERT_TRUE(poll_b.has_value());
+    EXPECT_FALSE(*poll_b);
 }
 
 TEST(LocalSsdManagerTest, UnregisterSerializesWithConcurrentOperations) {

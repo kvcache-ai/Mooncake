@@ -456,6 +456,7 @@ class MasterServiceTestPeer {
                 service_.namespaces_.Lookup(tenant_id)) {
             service_.DiscardExpiredProcessingReplicas(*ns, now);
         }
+        service_.DiscardExpiredOffloadTasks(now);
     }
 
     uint32_t DynamicReplicationAdmissionMinHits() const {
@@ -553,10 +554,10 @@ class MasterServiceTestPeer {
         return service_.ProcessClientOffboardingJob(job);
     }
 
-    tl::expected<void, ErrorCode> PushOffloadingQueue(
-        const ObjectIdentity& object_id, Replica& replica,
-        std::vector<UUID>* mirror_clients = nullptr) {
-        return service_.PushOffloadingQueue(object_id, replica, mirror_clients);
+    bool StartOffloadForReplica(const ObjectIdentity& object_id,
+                                Replica& replica) {
+        return service_.offload_manager_.StartOffload(
+            object_id.tenant_id, object_id.user_key, replica);
     }
 
     const TenantId& ResolveRequestTenantId(const TenantId& tenant_id) const {
