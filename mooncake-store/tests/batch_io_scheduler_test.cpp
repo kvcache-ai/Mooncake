@@ -518,6 +518,62 @@ TEST(BatchIoSchedulerTest, WaitIncludesIndependentGroupFinalizers) {
     EXPECT_TRUE(submitted.get());
 }
 
+TEST(BatchIoSchedulerTest, CallerDefinedTasksSupportIndependentFilePlans) {
+    auto created = BatchIoScheduler::Create(2);
+    ASSERT_TRUE(created);
+    auto& scheduler = *created.value();
+    BatchIoScheduler::PendingBatch batch;
+    std::vector<size_t> first_file(3, 0);
+    std::vector<size_t> second_file(2, 0);
+    std::atomic<size_t> finished{0};
+    auto prepare = [&](std::vector<size_t>& visits) {
+        return scheduler.PrepareTasks(
+            batch, visits.size(),
+            [&visits](size_t begin, size_t end) -> IoResult {
+                EXPECT_EQ(begin + 1, end);
+                if (end > visits.size()) {
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                ++visits[begin];
+                return {};
+            },
+            [&](IoResult result) -> IoResult {
+                EXPECT_TRUE(result);
+                ++finished;
+                return result;
+            });
+    };
+    ASSERT_TRUE(prepare(first_file));
+    ASSERT_TRUE(prepare(second_file));
+    EXPECT_EQ(first_file, (std::vector<size_t>{0, 0, 0}));
+    EXPECT_EQ(second_file, (std::vector<size_t>{0, 0}));
+    EXPECT_EQ(finished.load(), 0);
+    ASSERT_TRUE(scheduler.SubmitAndWait(batch));
+    EXPECT_EQ(first_file, (std::vector<size_t>{1, 1, 1}));
+    EXPECT_EQ(second_file, (std::vector<size_t>{1, 1}));
+    EXPECT_EQ(finished.load(), 2);
+}
+
+TEST(BatchIoSchedulerTest,
+     CallerDefinedTasksRejectInvalidCallbackAndEmptyGroup) {
+    auto created = BatchIoScheduler::Create(1);
+    ASSERT_TRUE(created);
+    auto& scheduler = *created.value();
+    BatchIoScheduler::PendingBatch batch;
+    size_t finished = 0;
+    auto complete = [&](IoResult result) -> IoResult {
+        ++finished;
+        return result;
+    };
+    ExpectError(scheduler.PrepareTasks(batch, 1, {}, complete),
+                ErrorCode::INVALID_PARAMS);
+    ExpectError(scheduler.SubmitAndWait(batch), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(finished, 0);
+    ASSERT_TRUE(scheduler.PrepareTasks(batch, 0, Succeed, complete));
+    EXPECT_TRUE(scheduler.SubmitAndWait(batch));
+    EXPECT_EQ(finished, 0);
+}
+
 TEST(BatchIoSchedulerTest,
      ReadBusyDefersNextTaskButAllowsRunningWriteToFinish) {
     std::atomic<bool> busy{false}, observed_busy{false};

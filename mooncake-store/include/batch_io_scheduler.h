@@ -23,11 +23,14 @@ class BatchIoScheduler {
 
     using Complete = std::function<tl::expected<void, ErrorCode>(
         tl::expected<void, ErrorCode>)>;
+    // Called outside scheduler locks before claiming each task. Returning false
+    // defers the task and rechecks after the configured backoff. Already
+    // running callbacks are not interrupted.
     using Ready = std::function<bool()>;
 
     // Create a scheduler with workers > 0 concurrent workers.
-    // Returns INVALID_PARAMS for zero workers, INTERNAL_ERROR on startup
-    // failure.
+    // Returns INVALID_PARAMS for zero workers or a non-positive backoff, and
+    // INTERNAL_ERROR on startup failure.
     static tl::expected<std::unique_ptr<BatchIoScheduler>, ErrorCode> Create(
         size_t workers, Ready ready = {},
         std::chrono::milliseconds backoff = std::chrono::milliseconds(300),
@@ -54,21 +57,31 @@ class BatchIoScheduler {
 
     // Split one file's logical Slice plans into groups of sub_batch_size (>=
     // 4). A final group of at most floor(sub_batch_size / 4) Slices joins the
-    // previous group. Append directly to unpublished task nodes.
-    // No callback runs here. Any error invalidates the entire pending batch.
+    // previous group when one exists; otherwise the single group executes as
+    // one task. Append directly to unpublished task nodes. No callback runs
+    // here. Any error invalidates the entire pending batch.
     tl::expected<void, ErrorCode> PrepareSubBatches(
         PendingBatch& batch, size_t slice_count, size_t sub_batch_size,
         const Execute& execute, const Complete& complete = {});
+    // Prepare one task for each caller-defined item in [0, task_count). Task i
+    // receives [i, i + 1), local to this preparation; no regrouping or tail
+    // merge is applied. No callback runs here. Any error invalidates the entire
+    // pending batch.
+    tl::expected<void, ErrorCode> PrepareTasks(PendingBatch& batch,
+                                               size_t task_count,
+                                               const Execute& execute,
+                                               const Complete& complete = {});
     // With complete, each nonempty preparation is an independent failure group.
     // Its callback runs once, after all group tasks terminate (including
     // skipped tasks), outside scheduler locks. A group failure does not cancel
     // other groups. Unpublished/rejected batches never run completion
     // callbacks.
 
-    // Publish all prepared tasks without allocating, then wait for every
-    // started callback to finish. Consumes the batch, including on error.
-    // Callbacks may execute concurrently and out of order; referenced plans
-    // and buffers must remain valid until this returns. Without groups, first
+    // Publish all prepared tasks without allocating, then wait until every
+    // published task has terminated and all started execute and completion
+    // callbacks have finished. Consumes the batch, including on error.
+    // Callbacks may execute concurrently and out of order; referenced plans and
+    // buffers must remain valid until this returns. Without groups, first
     // callback errors cancel the batch's queued tasks; callback exceptions
     // return INTERNAL_ERROR.
     tl::expected<void, ErrorCode> SubmitAndWait(PendingBatch& batch);
