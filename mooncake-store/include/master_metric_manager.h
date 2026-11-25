@@ -418,6 +418,9 @@ class MasterMetricManager {
     // Copy reports whose token no task carries any more: not registered.
     void inc_offload_evict_stale_landing(int64_t val = 1);
     int64_t get_offload_evict_stale_landing();
+    // Sources of copies a store had taken, kept when their object went.
+    void inc_offload_evict_parked(int64_t val = 1);
+    int64_t get_offload_evict_parked();
 
     // Promotion-on-hit Metrics Getters
     int64_t get_promotion_in_flight();
@@ -855,6 +858,7 @@ class MasterMetricManager {
     ylt::metric::dynamic_counter_1t offload_evict_kept_total_;
     ylt::metric::dynamic_counter_1t offload_evict_round_skipped_total_;
     ylt::metric::counter_t offload_evict_stale_landings_total_;
+    ylt::metric::counter_t offload_evict_parked_total_;
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     ylt::metric::counter_t copy_start_requests_;

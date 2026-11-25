@@ -1604,6 +1604,21 @@ class MasterService {
     // meanwhile. Returns the replicas taken, to be freed once the key is let
     // go.
     std::vector<Replica> FreeLandedOffloadSource(MetadataAccessorRW& accessor);
+    // Async, under the key's lock, as the object (or the replica the copy
+    // reads) goes: cancels a copy still queued, or, when a store already
+    // took it, parks the source replica until the copy is reported, so its
+    // memory is not reused while the store reads it. Either way the task
+    // goes.
+    void ParkOrCancelOffload(ObjectMetadata& metadata,
+                             route::ObjectState& state,
+                             const ObjectIdentity& object_id);
+    // Async: frees the source parked for the copy `token`, if any.
+    void DropParkedOffload(uint64_t token);
+    // Async: frees the parked sources whose copies would have expired by
+    // `now`, or (with `owner`) every one queued to that owner. Returns how
+    // many went.
+    size_t DropParkedOffloads(std::chrono::system_clock::time_point now,
+                              const UUID* owner = nullptr);
     // Async: ends the offloads queued to `owner`, whose disk tier is gone, so
     // their sources and the owner's room are not held until the reaper.
     void EndOffloadsQueuedTo(const UUID& owner);
@@ -2234,6 +2249,19 @@ class MasterService {
         std::chrono::system_clock::time_point ttl_;
         uint64_t mem_size_;
     };
+    // Async offload-on-evict: the source replica of a copy a store had taken
+    // when its object was removed or cleared, by the copy's token. Freed when
+    // the copy is reported, when its owner's disk goes, or when the copy
+    // would have expired; the copy itself is never registered.
+    struct ParkedOffloadSource {
+        std::vector<Replica> replicas;
+        std::shared_ptr<void> credit;
+        std::vector<UUID> owners;
+        std::chrono::system_clock::time_point expires;
+    };
+    std::mutex parked_offloads_mutex_;
+    std::unordered_map<uint64_t, ParkedOffloadSource> parked_offloads_
+        GUARDED_BY(parked_offloads_mutex_);
     std::mutex discarded_replicas_mutex_;
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);

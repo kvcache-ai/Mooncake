@@ -2249,7 +2249,10 @@ void MasterService::EraseMetadata(metadata::Namespace& ns,
     // When BatchEvict deletes metadata, Store Worker may still have an
     // in-flight offload for this key. Without this cleanup the task
     // becomes an orphan that only expires after 600s.
-    if (state.offloading_task) {
+    if (state.offloading_task && offload_async_) {
+        // A store may be reading the source right now.
+        ParkOrCancelOffload(metadata, state, ObjectIdentity{tenant_id, key});
+    } else if (state.offloading_task) {
         auto source = metadata.GetReplicaByID(state.offloading_task->source_id);
         if (source != nullptr) {
             source->dec_refcnt();
@@ -4642,6 +4645,17 @@ auto MasterService::BatchReplicaClear(
                 }
             }
 
+            // Async: a store may be reading the source of the object's copy
+            // from this segment.
+            if (offload_async_ && accessor.GetState().offloading_task) {
+                const Replica* source = metadata.GetReplicaByID(
+                    accessor.GetState().offloading_task->source_id);
+                if (source != nullptr && match_replica_on_segment(*source)) {
+                    ParkOrCancelOffload(
+                        metadata, accessor.GetState(),
+                        MakeObjectIdentity(key, normalized_tenant));
+                }
+            }
             EraseReplicasWithCacheTotalAccounting(metadata,
                                                   match_replica_on_segment);
 
@@ -8462,6 +8476,10 @@ auto MasterService::NotifyOffloadSuccess(
             std::shared_lock<std::shared_mutex> shared_lock(
                 master_state_mutex_);
             MetadataAccessorRW accessor(this, request_object_id);
+            // A failed copy of a removed object frees its parked source.
+            if (token != 0) {
+                DropParkedOffload(token);
+            }
             if (accessor.Exists()) {
                 auto& offloading_task = accessor.GetState().offloading_task;
                 if (offloading_task && is_this_copy(*offloading_task)) {
@@ -8586,7 +8604,9 @@ auto MasterService::NotifyOffloadSuccess(
             // A copy the master no longer waits for: its object was removed
             // or replaced, or its task ended (failed, expired, unmounted).
             // Its source may have been freed and reused meanwhile, so its
-            // bytes are never registered, nor do they create the key.
+            // bytes are never registered, nor do they create the key. A
+            // source parked for it is freed now.
+            DropParkedOffload(token);
             MasterMetricManager::instance().inc_offload_evict_stale_landing();
             continue;
         }
@@ -10118,7 +10138,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
 uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
     const std::chrono::system_clock::time_point& now) {
-    uint64_t released_cnt = 0;
+    // Async: parked sources of copies that would have expired by now.
+    uint64_t released_cnt = offload_async_ ? DropParkedOffloads(now) : 0;
     std::lock_guard lock(discarded_replicas_mutex_);
     discarded_replicas_.remove_if(
         [&now, &released_cnt](const DiscardedReplicas& item) {
@@ -10320,6 +10341,86 @@ std::vector<Replica> MasterService::FreeLandedOffloadSource(
     return std::move(effect->detached);
 }
 
+void MasterService::ParkOrCancelOffload(ObjectMetadata& metadata,
+                                        route::ObjectState& state,
+                                        const ObjectIdentity& object_id) {
+    OffloadingTask& task = *state.offloading_task;
+    // Still queued: no store reads the source; drop the mirrors.
+    if (task.mirror_clients.empty() ||
+        local_ssd_manager_.CancelOffloadsIfAllPending(
+            task.mirror_clients, object_id.tenant_id, object_id.user_key)) {
+        if (Replica* source = metadata.GetReplicaByID(task.source_id)) {
+            source->dec_refcnt();
+        }
+        if (!task.mirror_clients.empty()) {
+            MasterMetricManager::instance().inc_offload_cancelled(
+                UuidToString(task.mirror_clients[0]));
+        }
+        state.offloading_task.reset();
+        return;
+    }
+    // A store took the copy and may be reading the source: keep its memory,
+    // and the owner's room, until the copy is reported or expires.
+    const ReplicaID source_id = task.source_id;
+    ParkedOffloadSource parked{
+        .replicas = PopReplicasWithCacheTotalAccounting(
+            metadata,
+            [source_id](const Replica& replica) {
+                return replica.id() == source_id;
+            }),
+        .credit = std::move(task.credit),
+        .owners = task.mirror_clients,
+        .expires = task.start_time + put_start_release_timeout_sec_};
+    for (Replica& source : parked.replicas) {
+        source.dec_refcnt();
+    }
+    const uint64_t token = task.token;
+    state.offloading_task.reset();
+    // Any other mirror's entry, as the non-async erase drops it.
+    local_ssd_manager_.RemoveOffloadFromAll(object_id.tenant_id,
+                                            object_id.user_key);
+    MasterMetricManager::instance().inc_offload_evict_parked();
+    std::lock_guard lock(parked_offloads_mutex_);
+    parked_offloads_[token] = std::move(parked);
+}
+
+void MasterService::DropParkedOffload(uint64_t token) {
+    std::optional<ParkedOffloadSource> dropped;
+    {
+        std::lock_guard lock(parked_offloads_mutex_);
+        const auto it = parked_offloads_.find(token);
+        if (it == parked_offloads_.end()) {
+            return;
+        }
+        dropped = std::move(it->second);
+        parked_offloads_.erase(it);
+    }
+    // Freed here, outside the map's lock.
+}
+
+size_t MasterService::DropParkedOffloads(
+    std::chrono::system_clock::time_point now, const UUID* owner) {
+    std::vector<ParkedOffloadSource> dropped;
+    {
+        std::lock_guard lock(parked_offloads_mutex_);
+        for (auto it = parked_offloads_.begin();
+             it != parked_offloads_.end();) {
+            const auto& owners = it->second.owners;
+            const bool goes = owner != nullptr
+                                  ? std::find(owners.begin(), owners.end(),
+                                              *owner) != owners.end()
+                                  : it->second.expires <= now;
+            if (goes) {
+                dropped.push_back(std::move(it->second));
+                it = parked_offloads_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    return dropped.size();
+}
+
 void MasterService::EndOffloadsQueuedTo(const UUID& owner) {
     if (!offload_async_) {
         return;
@@ -10348,6 +10449,7 @@ void MasterService::EndOffloadsQueuedTo(const UUID& owner) {
             ++ended;
         }
     });
+    ended += DropParkedOffloads(std::chrono::system_clock::now(), &owner);
     if (ended > 0) {
         LOG(INFO) << "client_id=" << owner
                   << ", action=end_offloads_queued_to_unmounted_disk"

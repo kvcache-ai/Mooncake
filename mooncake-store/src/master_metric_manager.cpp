@@ -534,6 +534,11 @@ MasterMetricManager::MasterMetricManager()
           "Copy reports for a copy the master no longer waits for (removed, "
           "replaced, failed or expired); never registered "
           "(--offload_on_evict_async)"),
+      offload_evict_parked_total_(
+          "master_offload_evict_parked_total",
+          "Sources of copies a store had taken, kept until the copy is "
+          "reported when their object was removed or cleared "
+          "(--offload_on_evict_async)"),
 
       // Initialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd,
       // MoveRevoke Counters
@@ -1675,6 +1680,14 @@ int64_t MasterMetricManager::get_offload_evict_stale_landing() {
     return offload_evict_stale_landings_total_.value();
 }
 
+void MasterMetricManager::inc_offload_evict_parked(int64_t val) {
+    offload_evict_parked_total_.inc(val);
+}
+
+int64_t MasterMetricManager::get_offload_evict_parked() {
+    return offload_evict_parked_total_.value();
+}
+
 int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
 }
@@ -2551,6 +2564,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(offload_evict_kept_total_);
     serialize_metric(offload_evict_round_skipped_total_);
     serialize_metric(offload_evict_stale_landings_total_);
+    serialize_metric(offload_evict_parked_total_);
     serialize_metric(weight_revisions_by_availability_);
     serialize_metric(weight_revisions_by_residency_);
     serialize_metric(weight_active_leases_);
