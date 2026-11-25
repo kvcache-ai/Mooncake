@@ -1123,11 +1123,18 @@ TEST(ReplicaDfsTest, HelpersAndDescriptor) {
     replica.mark_processing();
     EXPECT_TRUE(replica.is_processing());
 
-    EXPECT_EQ(replica.get_refcnt(), 0);
-    replica.inc_refcnt();
-    EXPECT_TRUE(replica.is_busy());
-    replica.dec_refcnt();
-    EXPECT_FALSE(replica.is_busy());
+    EXPECT_EQ(replica.get_refcnt(), 0u);
+    {
+        auto pin = replica.Pin();
+        EXPECT_TRUE(pin.Active());
+        EXPECT_EQ(pin.replica_id(), replica.id());
+        EXPECT_EQ(replica.get_refcnt(), 1u);
+        EXPECT_TRUE(replica.is_busy());
+        pin.Reset();
+        EXPECT_FALSE(pin.Active());
+        EXPECT_EQ(replica.get_refcnt(), 0u);
+        EXPECT_FALSE(replica.is_busy());
+    }
 
     ReplicateConfig config;
     config.replica_num = 1;
