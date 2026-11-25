@@ -263,7 +263,7 @@ class AllocatorManager {
                     registrations.begin(), registrations.end(),
                     [storage_level](const auto& registration) {
                         const auto allocator = registration->GetAllocator();
-                        return registration->IsServing() && allocator &&
+                        return registration->IsAllocatable() && allocator &&
                                allocator->getStorageLevel() == storage_level;
                     })) {
                 serving_names.push_back(name);
