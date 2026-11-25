@@ -410,7 +410,7 @@ TEST_F(BufferAllocatorTest, CachelibImportRejectsNonMemoryReplicaType) {
 
     EXPECT_FALSE(ImportCachelibBufferAllocator(
                      "cachelib-memory-only", kBase, kCapacity, endpoint, "tcp",
-                     allocations, ReplicaType::NOF_SSD)
+                     allocations, StorageLevel::RAM, ReplicaType::NOF_SSD)
                      .has_value());
 }
 
