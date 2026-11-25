@@ -2169,13 +2169,17 @@ class MasterService {
         size_t bytes;
     };
 
+    enum class DrainSourceState {
+        kPendingScan,
+        kAwaitingReclamation,
+        kExhausted,
+        kDrained,
+    };
+
     struct DrainSourceProgress {
-        // Includes ready candidates, delayed candidates, and active tasks.
+        // Queued and active candidates keep the source in kPendingScan.
         size_t outstanding{0};
-        bool drained{false};
-        bool awaiting_reclamation{false};
-        bool scan_incomplete{false};
-        uint64_t registration_version{0};
+        DrainSourceState state{DrainSourceState::kPendingScan};
         std::chrono::steady_clock::time_point verify_after{};
         std::unordered_map<std::string, route::Generation> exhausted_attempts;
     };
@@ -2186,7 +2190,6 @@ class MasterService {
         std::deque<DrainCandidate> ready;
         std::deque<DrainCandidate> delayed;
         uint64_t blocked_units{0};
-        uint64_t checked_registration_version{0};
     };
 
     enum class DrainStopReason { NONE, USER, TIMEOUT };
@@ -2232,8 +2235,7 @@ class MasterService {
     tl::expected<UUID, ErrorCode> CreateMoveTaskInternal(
         const std::string& key, const TenantId& tenant_id,
         const std::string& source, const std::string& target,
-        bool retained_by_drain,
-        std::optional<route::Generation> expected_generation = std::nullopt);
+        bool retained_by_drain);
     void ProcessDrainJobs();
     void ProcessDrainJobStop(DrainJob& job);
     void HandleDrainJobTimeout(const std::weak_ptr<DrainJob>& job);
@@ -2244,11 +2246,14 @@ class MasterService {
     void RequestDrainTaskCancellation(DrainJob& job);
     bool FinishDrainJobCancellation(DrainJob& job);
     void ScheduleDrainJobTasks(DrainJob& job);
+    std::vector<bool> ScanDrainSources(
+        DrainJob& job, const std::vector<size_t>& source_indices);
     bool MaybeCompleteDrainJob(DrainJob& job);
     tl::expected<DrainMove, ErrorCode> PlanDrainMove(
         DrainCandidate& candidate, const CreateDrainJobRequest& request);
     std::optional<std::string> SelectDrainTargetForKey(
         const std::vector<std::string>& existing_segments,
+        const std::string& source_segment,
         const CreateDrainJobRequest& request);
 
     std::thread job_dispatch_thread_;

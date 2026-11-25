@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <boost/functional/hash.hpp>
 #include <chrono>
 #include <map>
@@ -11,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "allocation_strategy.h"
@@ -222,8 +222,10 @@ class ScopedSegmentAccess {
     ErrorCode SetSegmentStatusByName(const std::string& segment_name,
                                      SegmentStatus status);
 
-    // Zero denotes a name with no mounted registrations.
-    uint64_t GetRegistrationVersion(const std::string& segment_name) const;
+    // An explicit job owns the name until it finishes, even if the last
+    // registration is removed before the job reaches a terminal state.
+    void FenceDrainSource(const std::string& segment_name);
+    void ReleaseDrainSourceFence(const std::string& segment_name);
 
     // Drain jobs own a source name, which may contain several mounted IDs.
     // Preserve already-drained registrations when closing them to allocation.
@@ -231,7 +233,6 @@ class ScopedSegmentAccess {
                               SegmentStatus status);
 
    private:
-    void RecordRegistration(const Segment& segment);
     ErrorCode SetSegmentStatus(MountedSegment& mounted, SegmentStatus status);
     void ReindexSegmentNameAfterRemoval(const UUID& removed_segment_id,
                                         const std::string& segment_name);
@@ -422,12 +423,6 @@ class SegmentManager {
         return usage_tracker_->GetUsage();
     }
 
-    // Used as a fast check before the drain scheduler takes segment_mutex_.
-    // Per-name versions are read under ScopedSegmentAccess.
-    [[nodiscard]] uint64_t GetRegistrationVersion() const noexcept {
-        return registration_version_.load(std::memory_order_relaxed);
-    }
-
     ErrorCode initializeCxlAllocator(const std::string& cxl_path,
                                      size_t cxl_size);
 
@@ -459,12 +454,8 @@ class SegmentManager {
         client_by_name_;  // segment name -> client_id
     std::unordered_map<std::string, UUID>
         segment_id_by_name_;             // segment name -> segment_id
-    struct Registrations {
-        std::set<UUID> ids;
-        uint64_t version{0};
-    };
-    std::unordered_map<std::string, Registrations> registrations_by_name_;
-    std::atomic<uint64_t> registration_version_{0};
+    std::unordered_map<std::string, std::set<UUID>> registrations_by_name_;
+    std::unordered_set<std::string> fenced_drain_sources_;
     HostSegmentIndex segments_by_host_;  // host_id -> segment name -> segment
                                          // ids for allocatable segments
     friend class ScopedSegmentAccess;
