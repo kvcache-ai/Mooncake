@@ -15,12 +15,14 @@
 #ifndef SHARED_SEGMENT_PY_H
 #define SHARED_SEGMENT_PY_H
 
-#include <pybind11/pybind11.h>
+#include <nanobind/nanobind.h>
 
 #include "shared_segment/shared_segment.h"
 
+namespace py = nanobind;
+
 namespace mooncake {
-void bind_shared_segment(pybind11::module_& m);
+void bind_shared_segment(py::module_& m);
 }  // namespace mooncake
 
 #endif  // SHARED_SEGMENT_PY_H

@@ -23,6 +23,12 @@ pub struct RouteAuthorityRecord {
     pub delete_version: Option<RouteVersion>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RouteAuthorityPresence {
+    pub live_version: Option<RouteVersion>,
+    pub delete_version: Option<RouteVersion>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteOwnerPage {
     pub routes: Vec<ObjectRoute>,
@@ -59,6 +65,18 @@ pub(crate) trait RouteAuthorityClient: Send + Sync {
         authority: &ClientStableId,
         keys: &[ObjectKey],
     ) -> Result<Vec<Result<RouteAuthorityRecord>>>;
+
+    fn batch_get_route_presence(
+        &self,
+        _lease: &ClientLease,
+        _namespace: &str,
+        _authority: &ClientStableId,
+        _keys: &[ObjectKey],
+    ) -> Result<Vec<Result<RouteAuthorityPresence>>> {
+        Err(StoreError::Unsupported(
+            "route authority client does not support route presence queries".to_string(),
+        ))
+    }
 
     fn batch_contains_routes(
         &self,
@@ -136,6 +154,21 @@ pub trait RouteAuthorityService: Send + Sync {
                 route,
                 delete_version: None,
             })
+    }
+
+    fn batch_get_route_presence(
+        &self,
+        _namespace: &str,
+        _authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Vec<Result<RouteAuthorityPresence>> {
+        keys.iter()
+            .map(|_| {
+                Err(StoreError::Unsupported(
+                    "route authority does not implement route presence queries".to_string(),
+                ))
+            })
+            .collect()
     }
 
     fn list_routes_by_replica_owner(
