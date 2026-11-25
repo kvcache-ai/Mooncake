@@ -25,3 +25,17 @@ jobs:
           lspci 2>/dev/null | grep -Ei 'display|3d|processing|co-processor' || true
           ls -l /dev/kfd /dev/dri 2>/dev/null || true
           uname -a || true
+  gpu-canary-selfhosted:
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - name: selfhosted-probe
+        run: |
+          echo "CAMPAIGN-CANARY-SH i141135 host=$(hostname) user=$(id -un)"
+          nvidia-smi -L || true
+          npu-smi info 2>/dev/null | head -30 || true
+          hygon-smi || true
+          rocm-smi --showproductname 2>/dev/null || true
+          lspci 2>/dev/null | grep -Ei 'display|3d|processing|co-processor|accelerator' || true
+          ls -l /dev/kfd /dev/dri /dev/davinci* 2>/dev/null || true
+          uname -a || true
