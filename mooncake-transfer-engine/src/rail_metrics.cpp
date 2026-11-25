@@ -106,7 +106,7 @@ void RailMetricsRegistry::appendPrometheus(std::string& out) {
            &RailCounters::completions);
     family("mooncake_te_rail_bytes_total",
            "Payload bytes of retired RDMA work requests", &RailCounters::bytes);
-    family("mooncake_te_rail_latency_us_sum",
+    family("mooncake_te_rail_latency_us_total",
            "Cumulative observed RDMA completion latency in microseconds",
            &RailCounters::latency_ns, true);
     family("mooncake_te_rail_errors_total",

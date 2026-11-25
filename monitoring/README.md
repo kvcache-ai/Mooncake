@@ -137,7 +137,7 @@ A rail connects one local RDMA NIC to one remote RDMA NIC. Set `MC_TE_METRIC_RAI
 | --- | --- |
 | `mooncake_te_rail_completions_total` | Retired RDMA work requests (WRs), including errors and flushes |
 | `mooncake_te_rail_bytes_total` | Payload bytes of those WRs, including failed attempts and retries |
-| `mooncake_te_rail_latency_us_sum` | Sum of post-to-observed-completion time, in microseconds |
+| `mooncake_te_rail_latency_us_total` | Sum of post-to-observed-completion time, in microseconds |
 | `mooncake_te_rail_errors_total` | Error CQEs excluding `IBV_WC_WR_FLUSH_ERR` |
 
 For a CQE that retires several WRs, the latency sum uses the completing WR's post timestamp for each retired WR. Missing or non-earlier timestamps add zero to the sum. Rate of the sum divided by rate of completions gives the mean latency per WR. This includes time until software polls the CQ.
@@ -203,4 +203,4 @@ wait "$load_pid"
 wait "$bench_pid"
 ```
 
-For each rail with completions in both windows, divide the change in `mooncake_te_rail_latency_us_sum` by the change in `mooncake_te_rail_completions_total`. Compare the two results for the rails on `hot_nic` and for the unchanged reference NIC. Record the `ib_write_bw` throughput with the comparison.
+For each rail with completions in both windows, divide the change in `mooncake_te_rail_latency_us_total` by the change in `mooncake_te_rail_completions_total`. Compare the two results for the rails on `hot_nic` and for the unchanged reference NIC. Record the `ib_write_bw` throughput with the comparison.

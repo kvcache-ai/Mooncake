@@ -215,7 +215,7 @@ class CoreDashboardContractTest(unittest.TestCase):
             REMOTE_RAIL_PANEL,
         ):
             expr = targets[title]["expr"]
-            self.assertIn("rate(mooncake_te_rail_latency_us_sum", expr)
+            self.assertIn("rate(mooncake_te_rail_latency_us_total", expr)
             self.assertIn("rate(mooncake_te_rail_completions_total", expr)
             self.assertIn("> 0", expr)
             self.assertNotIn("histogram_quantile", expr)

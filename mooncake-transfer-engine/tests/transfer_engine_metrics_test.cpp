@@ -113,14 +113,14 @@ TEST(RailMetricsTest, WritesCounterFamiliesWithEscapedLabels) {
     const std::string labels =
         R"({local_nic="mlx\\5",peer="[::1]:15001",peer_nic="nic\"\n0"})";
     for (const auto* suffix : {"completions_total", "bytes_total",
-                               "latency_us_sum", "errors_total"}) {
+                               "latency_us_total", "errors_total"}) {
         const std::string name = std::string("mooncake_te_rail_") + suffix;
         EXPECT_NE(text.find("# HELP " + name + " "), std::string::npos);
         EXPECT_NE(text.find("# TYPE " + name + " counter\n" + name + labels),
                   std::string::npos);
     }
     EXPECT_NE(
-        text.find("mooncake_te_rail_latency_us_sum" + labels + " 1.234\n"),
+        text.find("mooncake_te_rail_latency_us_total" + labels + " 1.234\n"),
         std::string::npos);
 }
 

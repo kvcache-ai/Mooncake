@@ -2559,7 +2559,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "rate(mooncake_te_rail_latency_us_sum{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]) / (rate(mooncake_te_rail_completions_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]) > 0)",
+          "expr": "rate(mooncake_te_rail_latency_us_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]) / (rate(mooncake_te_rail_completions_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]) > 0)",
           "legendFormat": "{{instance}} {{local_nic}} → {{peer}}/{{peer_nic}}",
           "refId": "A"
         }
@@ -2730,7 +2730,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "(rate(mooncake_te_rail_latency_us_sum{job=~\"$job\",instance=~\"$instance\",peer!=\"other\"}[$__rate_interval]) / (rate(mooncake_te_rail_completions_total{job=~\"$job\",instance=~\"$instance\",peer!=\"other\"}[$__rate_interval]) > 0)) / on (instance, local_nic) group_left () (quantile by (instance, local_nic) (0.5, rate(mooncake_te_rail_latency_us_sum{job=~\"$job\",instance=~\"$instance\",peer!=\"other\"}[$__rate_interval]) / (rate(mooncake_te_rail_completions_total{job=~\"$job\",instance=~\"$instance\",peer!=\"other\"}[$__rate_interval]) > 0)) > 0)",
+          "expr": "(rate(mooncake_te_rail_latency_us_total{job=~\"$job\",instance=~\"$instance\",peer!=\"other\"}[$__rate_interval]) / (rate(mooncake_te_rail_completions_total{job=~\"$job\",instance=~\"$instance\",peer!=\"other\"}[$__rate_interval]) > 0)) / on (instance, local_nic) group_left () (quantile by (instance, local_nic) (0.5, rate(mooncake_te_rail_latency_us_total{job=~\"$job\",instance=~\"$instance\",peer!=\"other\"}[$__rate_interval]) / (rate(mooncake_te_rail_completions_total{job=~\"$job\",instance=~\"$instance\",peer!=\"other\"}[$__rate_interval]) > 0)) > 0)",
           "legendFormat": "{{instance}} {{local_nic}} → {{peer}}/{{peer_nic}}",
           "refId": "A"
         }
@@ -2787,7 +2787,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum by (peer, peer_nic) (rate(mooncake_te_rail_latency_us_sum{job=~\"$job\",peer!=\"other\"}[$__rate_interval])) / (sum by (peer, peer_nic) (rate(mooncake_te_rail_completions_total{job=~\"$job\",peer!=\"other\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (peer, peer_nic) (rate(mooncake_te_rail_latency_us_total{job=~\"$job\",peer!=\"other\"}[$__rate_interval])) / (sum by (peer, peer_nic) (rate(mooncake_te_rail_completions_total{job=~\"$job\",peer!=\"other\"}[$__rate_interval])) > 0)",
           "legendFormat": "{{peer}}/{{peer_nic}}",
           "refId": "A"
         }
