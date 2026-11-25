@@ -179,24 +179,29 @@ class Evictor::Pass {
             }
             Evict(std::move(hold), &entry);
         }
-        if (deferred_.back().empty()) {
+        if (deferred_.back().refs.empty()) {
             deferred_.pop_back();
         }
     }
 
     void TakeDeferred(Pass& other) {
-        for (auto& refs : other.deferred_) {
-            deferred_.push_back(std::move(refs));
+        for (auto& deferred : other.deferred_) {
+            deferred_.push_back(std::move(deferred));
         }
         other.deferred_.clear();
     }
 
     void RunFallback() {
-        for (const std::vector<route::ObjectRef>& refs : deferred_) {
+        // Lowest eviction priority first; the walk's order within one.
+        std::stable_sort(deferred_.begin(), deferred_.end(),
+                         [](const Deferred& a, const Deferred& b) {
+                             return a.priority < b.priority;
+                         });
+        for (const Deferred& deferred : deferred_) {
             if (report_.stopped || Met(/*fallback=*/true)) {
                 break;
             }
-            for (const route::ObjectRef& ref : refs) {
+            for (const route::ObjectRef& ref : deferred.refs) {
                 if (report_.stopped) {
                     break;
                 }
@@ -276,7 +281,12 @@ class Evictor::Pass {
             }
             reason = plan.error();
             if (reason == SkipReason::kDeferred && !fallback) {
-                deferred_.back().push_back(hold.ref());
+                Deferred& deferred = deferred_.back();
+                deferred.refs.push_back(hold.ref());
+                // A group goes together, so it is kept as long as its most
+                // valued member.
+                deferred.priority =
+                    std::max(deferred.priority, metadata.eviction_priority);
             }
         }
         Skip(hold, reason);
@@ -305,8 +315,14 @@ class Evictor::Pass {
     const Aim& aim_;
     Report& report_;
     const Clock::time_point now_;
-    // In the order the walk met them, one list for each entry that had any.
-    std::vector<std::vector<route::ObjectRef>> deferred_;
+    // One for each entry that had any, in the order the walk met them until
+    // the fallback orders them by priority.
+    struct Deferred {
+        // The highest eviction priority among `refs`.
+        uint32_t priority{0};
+        std::vector<route::ObjectRef> refs;
+    };
+    std::vector<Deferred> deferred_;
 };
 
 Evictor::Evictor(metadata::NamespaceTable& namespaces,
