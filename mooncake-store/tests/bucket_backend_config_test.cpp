@@ -41,6 +41,8 @@ class ScopedEnvVar {
 struct BucketBackendEnvironment {
     ScopedEnvVar write_workers{"MOONCAKE_OFFLOAD_WRITE_IO_WORKERS"};
     ScopedEnvVar write_sub_batch{"MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS"};
+    ScopedEnvVar write_sub_batch_bytes{
+        "MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_BYTES"};
     ScopedEnvVar write_backoff{"MOONCAKE_OFFLOAD_WRITE_IO_BACKOFF_MS"};
     ScopedEnvVar keys_limit{"MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT"};
     ScopedEnvVar size_limit{"MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES"};
@@ -275,17 +277,20 @@ TEST_F(BucketBackendConfigTest, ValidationPreservesExistingBounds) {
 TEST_F(BucketBackendConfigTest, WriteWorkersAreOptionalAndIndependent) {
     auto config = BucketBackendConfig::FromEnvironment().value();
     EXPECT_EQ(config.write_io_workers, 0);
-    EXPECT_EQ(config.write_sub_batch_max_iovecs, 32);
+    EXPECT_EQ(config.write_sub_batch_bytes, 8 << 20);
+    EXPECT_EQ(config.write_sub_batch_max_iovecs, 1024);
     EXPECT_EQ(config.write_io_backoff_ms, 300);
     env.write_sub_batch.Set("0");
     EXPECT_TRUE(BucketBackendConfig::FromEnvironment().value().Validate());
     env.write_workers.Set("3");
     EXPECT_FALSE(BucketBackendConfig::FromEnvironment().value().Validate());
     env.write_sub_batch.Set("9");
+    env.write_sub_batch_bytes.Set("4194304");
     env.write_backoff.Set("17");
     config = BucketBackendConfig::FromEnvironment().value();
     EXPECT_TRUE(config.Validate());
     EXPECT_EQ(config.write_io_workers, 3);
+    EXPECT_EQ(config.write_sub_batch_bytes, 4194304);
     EXPECT_EQ(config.write_sub_batch_max_iovecs, 9);
     EXPECT_EQ(config.write_io_backoff_ms, 17);
     for (const auto* bad : {"-1", "", "invalid", "9223372036854775808"}) {
@@ -295,6 +300,12 @@ TEST_F(BucketBackendConfigTest, WriteWorkersAreOptionalAndIndependent) {
     env.write_workers.Set("0");
     for (const auto* bad : {"0", "-1", "invalid"}) {
         env.write_backoff.Set(bad);
+        EXPECT_FALSE(BucketBackendConfig::FromEnvironment().value().Validate());
+    }
+    env.write_backoff.Unset();
+    env.write_workers.Set("2");
+    for (const auto* bad : {"0", "-1"}) {
+        env.write_sub_batch_bytes.Set(bad);
         EXPECT_FALSE(BucketBackendConfig::FromEnvironment().value().Validate());
     }
 }

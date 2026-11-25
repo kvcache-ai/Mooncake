@@ -6950,7 +6950,7 @@ TEST_F(StorageBackendTest, ParallelHybridOffloadRoundTrip) {
     BucketBackendConfig bucket_config;
     bucket_config.write_io_workers = 4;
     bucket_config.aligned_uring_write = true;
-    bucket_config.write_back_buffer_bytes = 4096;
+    bucket_config.write_sub_batch_bytes = 4096;
     BucketStorageBackend backend(config, bucket_config);
     ASSERT_TRUE(backend.Init());
 
@@ -6984,7 +6984,7 @@ TEST_F(StorageBackendTest, ParallelHybridOffloadKeepsSourceLoadingLazy) {
     BucketBackendConfig bucket_config;
     bucket_config.write_io_workers = 2;
     bucket_config.aligned_uring_write = true;
-    bucket_config.write_back_buffer_bytes = 4096;
+    bucket_config.write_sub_batch_bytes = 4096;
     BucketStorageBackend backend(config, bucket_config);
     ASSERT_TRUE(backend.Init());
 
@@ -7012,18 +7012,15 @@ TEST_F(StorageBackendTest, ParallelHybridOffloadKeepsSourceLoadingLazy) {
     ExpectLoadsBack(backend, objects);
 }
 
-// One direct range can need more than 32 descriptors: each slice here starts
-// on a 4 KiB boundary of the stream and ends 100 bytes into a block, so it
-// takes one zero-copy descriptor plus one copy descriptor for the rest of
-// that block.
-TEST_F(StorageBackendTest, ParallelHybridOffloadManyDescriptors) {
+// A single SQE gathers the range from many iovecs with different offsets.
+TEST_F(StorageBackendTest, ParallelHybridOffloadGathersManyIovecs) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.use_uring = true;
     BucketBackendConfig bucket_config;
     bucket_config.write_io_workers = 2;
     bucket_config.aligned_uring_write = true;
-    bucket_config.write_back_buffer_bytes = 1 << 20;
+    bucket_config.write_sub_batch_bytes = 1 << 20;
     BucketStorageBackend backend(config, bucket_config);
     ASSERT_TRUE(backend.Init());
 
@@ -7043,8 +7040,34 @@ TEST_F(StorageBackendTest, ParallelHybridOffloadManyDescriptors) {
     ExpectLoadsBack(backend, objects);
 }
 
-// A direct range is cut at the block edge before the end of its 31st source
-// iovec. Each slice here is on the block grid but ends 12 bytes into a block,
+TEST_F(StorageBackendTest, ParallelHybridOffloadAcrossFourMiBBoundaries) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+    BucketBackendConfig bucket_config;
+    bucket_config.write_io_workers = 4;
+    bucket_config.aligned_uring_write = true;
+    bucket_config.write_sub_batch_bytes = 128 << 20;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    constexpr size_t kChunk = 4 << 20;
+    const std::string key = "hybrid_sqe_boundaries";
+    std::vector<AlignedTestObject> objects;
+    // The first two chunks fit in one aligned source. The following chunks
+    // either straddle two sources or have a misaligned source address.
+    objects.push_back(MakeAlignedTestObject(
+        key, {{key.size(), 2 * kChunk + 4096}, {17, kChunk}, {0, kChunk + 17}},
+        7));
+    BucketStorageBackend::PendingOffloads pending;
+    ASSERT_TRUE(backend.PrepareOffload(
+        pending, {{objects[0].key, objects[0].slices}}, AcceptAll));
+    ASSERT_TRUE(backend.SubmitOffloadsAndWait(pending));
+    ExpectLoadsBack(backend, objects);
+}
+
+// A direct range is cut on a block edge, inside a slice when the target lands
+// there. Each slice here is on the block grid but ends 12 bytes into a block,
 // so it takes one zero-copy descriptor and one copy descriptor.
 TEST_F(StorageBackendTest, ParallelHybridOffloadKeepsRangesOnBlockEdges) {
     FileStorageConfig config;
@@ -7053,6 +7076,7 @@ TEST_F(StorageBackendTest, ParallelHybridOffloadKeepsRangesOnBlockEdges) {
     BucketBackendConfig bucket_config;
     bucket_config.write_io_workers = 2;
     bucket_config.aligned_uring_write = true;
+    bucket_config.write_sub_batch_bytes = 3 * 4096;
     BucketStorageBackend backend(config, bucket_config);
     ASSERT_TRUE(backend.Init());
 
@@ -7074,12 +7098,12 @@ TEST_F(StorageBackendTest, ParallelWriteRangesStayWithinTheirBucketFile) {
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
     bucket_config.write_io_workers = 4;
-    bucket_config.write_sub_batch_max_iovecs = 4;
+    bucket_config.write_sub_batch_bytes = 2100;
     BucketStorageBackend backend(config, bucket_config);
     ASSERT_TRUE(backend.Init());
     BucketStorageBackend::PendingOffloads pending;
-    // Five slices merge their small tail locally; the next file's single
-    // slice must stay separate. The third file has two independent ranges.
+    // Under a 2100-byte target the five slices of about 1 KiB form three
+    // ranges and the six form four; the single slice stands alone.
     const std::vector<size_t> counts{5, 1, 6};
     std::vector<std::vector<std::string>> payloads(counts.size());
     std::vector<std::string> expected(counts.size());
@@ -7123,7 +7147,7 @@ TEST_F(StorageBackendTest, ParallelOffloadPlansAreLazyAndRoundTripAllSlices) {
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
     bucket_config.write_io_workers = 4;
-    bucket_config.write_sub_batch_max_iovecs = 4;
+    bucket_config.write_sub_batch_bytes = 2100;
     BucketStorageBackend backend(config, bucket_config);
     ASSERT_TRUE(backend.Init());
     BucketStorageBackend::PendingOffloads pending;

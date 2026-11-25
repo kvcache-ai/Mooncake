@@ -245,6 +245,9 @@ class UringFile : public StorageFile {
     // splits them — so one submission can queue a whole bucket's writes.
     tl::expected<void, ErrorCode> batch_write(ReadDesc *descs, int cnt);
 
+    // The request owner keeps this file alive until its completion.
+    int fd_for_async_write() const { return fd_; }
+
     // Flush data to stable storage via IORING_FSYNC_DATASYNC.
     // Must be called after write_aligned and before writing dependent metadata.
     tl::expected<void, ErrorCode> datasync() override;

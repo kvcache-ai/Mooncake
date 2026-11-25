@@ -19,7 +19,8 @@ bool BucketBackendConfig::Validate() const {
     if (read_io_workers < 0 ||
         (read_io_workers > 0 && read_sub_batch_max_iovecs < 4) ||
         write_io_workers < 0 || write_io_backoff_ms <= 0 ||
-        (write_io_workers > 0 && write_sub_batch_max_iovecs < 4)) {
+        (write_io_workers > 0 &&
+         (write_sub_batch_bytes <= 0 || write_sub_batch_max_iovecs < 1))) {
         LOG(ERROR)
             << "BucketBackendConfig: invalid I/O workers or sub batch size";
         return false;
@@ -72,6 +73,9 @@ BucketBackendConfig::FromEnvironment() {
                 config.read_sub_batch_max_iovecs);
     config.write_io_workers = read_io(
         Variables::MOONCAKE_OFFLOAD_WRITE_IO_WORKERS, config.write_io_workers);
+    config.write_sub_batch_bytes =
+        read_io(Variables::MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_BYTES,
+                config.write_sub_batch_bytes);
     config.write_sub_batch_max_iovecs =
         read_io(Variables::MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS,
                 config.write_sub_batch_max_iovecs);

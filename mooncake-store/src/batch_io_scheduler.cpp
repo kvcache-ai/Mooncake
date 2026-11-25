@@ -1,6 +1,8 @@
 #include "batch_io_scheduler.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstring>
 #include <list>
@@ -13,6 +15,11 @@
 #include <vector>
 
 #include <glog/logging.h>
+#include <xxhash.h>
+#ifdef USE_URING
+#include <liburing.h>
+#include "uring_submit.h"
+#endif
 #if defined(__linux__) || defined(__APPLE__)
 #include <pthread.h>
 #endif
@@ -35,10 +42,17 @@ class BatchIoScheduler::Impl {
         size_t remaining = 0;
         Complete complete;
     };
+    struct WriteFile {
+        PrepareWriteFile prepare;
+        size_t queue = 0;
+        bool queued = false;
+        bool initialized = false;
+    };
     struct Task {
         std::shared_ptr<Batch> batch;
         SubBatch sub_batch;
         std::shared_ptr<Group> group;
+        std::shared_ptr<WriteFile> write_file;
     };
     tl::expected<void, ErrorCode> Init(size_t workers, Ready ready,
                                        std::chrono::milliseconds backoff,
@@ -47,6 +61,7 @@ class BatchIoScheduler::Impl {
         backoff_ = backoff;
         try {
             workers_.resize(workers);
+            write_queues_.resize(workers);
             for (size_t i = 0; i < workers; ++i) {
                 auto name = std::string(worker_name_prefix) + std::to_string(i);
                 // Linux thread names include a terminating NUL in 16 bytes.
@@ -72,7 +87,7 @@ class BatchIoScheduler::Impl {
                         LOG(INFO) << "I/O worker started: name=" << name
                                   << " worker_index=" << i
                                   << " workers=" << workers << " tid=" << tid;
-                        Work();
+                        Work(i);
                     });
             }
         } catch (...) {
@@ -93,7 +108,20 @@ class BatchIoScheduler::Impl {
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
         batch->remaining = tasks.size();
-        queue_.splice(queue_.end(), tasks);
+        while (!tasks.empty()) {
+            auto task = tasks.begin();
+            if (task->write_file) {
+                auto& file = *task->write_file;
+                if (!file.queued) {
+                    file.queue = next_write_queue_++ % workers_.size();
+                    file.queued = true;
+                }
+                write_queues_[file.queue].splice(
+                    write_queues_[file.queue].end(), tasks, task);
+            } else {
+                queue_.splice(queue_.end(), tasks, task);
+            }
+        }
         changed_.notify_all();
         batch->done.wait(lock, [&] { return batch->remaining == 0; });
         if (batch->error) return tl::make_unexpected(*batch->error);
@@ -115,15 +143,216 @@ class BatchIoScheduler::Impl {
     }
 
    private:
-    void Work() {
+    void FinishTask(Task& task, tl::expected<void, ErrorCode> result,
+                    std::unique_lock<std::mutex>& lock) {
+        if (!result) {
+            if (!task.batch->error) task.batch->error = result.error();
+            if (task.group && !task.group->error)
+                task.group->error = result.error();
+        }
+        if (task.group && --task.group->remaining == 0) {
+            auto group_result =
+                task.group->error ? tl::expected<void, ErrorCode>(
+                                        tl::make_unexpected(*task.group->error))
+                                  : tl::expected<void, ErrorCode>();
+            lock.unlock();
+            try {
+                result = task.group->complete(group_result);
+            } catch (...) {
+                result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            lock.lock();
+            if (!result && !task.batch->error)
+                task.batch->error = result.error();
+        }
+        auto batch = task.batch;
+        // Callback owners may release staging or file reservations. Destroy
+        // them outside the queue lock and before waking the caller.
+        lock.unlock();
+        task = {};
+        lock.lock();
+        if (--batch->remaining == 0) batch->done.notify_all();
+    }
+
+#ifdef USE_URING
+    // Keep this ring private to the worker and separate from synchronous
+    // UringFile calls (such as a completed bucket's datasync).
+    struct WriteRing {
+        static constexpr size_t kDepth = 32;
+
+        struct Slot {
+            std::optional<Task> task;
+            std::optional<WriteRequest> request;
+        };
+
+        ~WriteRing() { Reset(); }
+
+        bool Init() {
+            if (initialized) return true;
+            if (!scratch) {
+                void* buffer = nullptr;
+                if (posix_memalign(&buffer, 4096, kDepth * kWriteSqeBytes) != 0)
+                    return false;
+                scratch.reset(static_cast<char*>(buffer));
+            }
+            const int ret = io_uring_queue_init(kDepth, &ring, 0);
+            if (ret < 0) {
+                LOG(ERROR) << "Failed to initialize async write ring: "
+                           << strerror(-ret);
+                return false;
+            }
+            initialized = true;
+            return true;
+        }
+
+        void Reset() {
+            if (initialized) io_uring_queue_exit(&ring);
+            initialized = false;
+        }
+
+        size_t FreeSlot() const {
+            for (size_t i = 0; i < slots.size(); ++i) {
+                if (!slots[i].task) return i;
+            }
+            return slots.size();
+        }
+
+        std::span<char> Buffer(size_t slot) {
+            return {scratch.get() + slot * kWriteSqeBytes, kWriteSqeBytes};
+        }
+
+        int Wait(io_uring_cqe** cqe) {
+            unsigned retries = 0;
+            int ret;
+            do {
+                ret = io_uring_wait_cqe(&ring, cqe);
+            } while ((ret == -EINTR || ret == -EAGAIN) && retries++ < 64);
+            return ret;
+        }
+
+        io_uring ring{};
+        std::array<Slot, kDepth> slots;
+        size_t active = 0;
+        bool initialized = false;
+        std::unique_ptr<char, decltype(&std::free)> scratch{nullptr,
+                                                            &std::free};
+    };
+
+    void RetireWrite(WriteRing& writer, io_uring_cqe* cqe,
+                     std::unique_lock<std::mutex>& lock) {
+        auto& slot = *static_cast<WriteRing::Slot*>(io_uring_cqe_get_data(cqe));
+        const int status = cqe->res;
+        io_uring_cqe_seen(&writer.ring, cqe);
+        tl::expected<void, ErrorCode> result;
+        if (status < 0 || static_cast<size_t>(status) != slot.request->length) {
+            LOG(ERROR) << "Async bucket write failed: result=" << status
+                       << " length=" << slot.request->length
+                       << " offset=" << slot.request->offset;
+            if (status < 0 && slot.request->report_error) {
+                try {
+                    slot.request->report_error(-status);
+                } catch (...) {
+                    LOG(ERROR) << "Async write error handler failed";
+                }
+            }
+            result = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        slot.request.reset();
+        --writer.active;
+        lock.lock();
+        FinishTask(*slot.task, result, lock);
+        slot.task.reset();
+        lock.unlock();
+    }
+
+    void ReapWrite(WriteRing& writer, std::unique_lock<std::mutex>& lock) {
+        lock.unlock();
+        const auto submit = detail::submit_all_pending(
+            [&] { return io_uring_sq_ready(&writer.ring); },
+            [&](unsigned) { return io_uring_submit(&writer.ring); },
+            [] { std::this_thread::yield(); });
+        io_uring_cqe* cqe = nullptr;
+        if (submit.error == 0 && writer.Wait(&cqe) == 0) {
+            RetireWrite(writer, cqe, lock);
+            lock.lock();
+            return;
+        }
+
+        LOG(ERROR) << "Async write ring submission or completion failed: "
+                   << "pending=" << submit.pending << " error=" << submit.error;
+        // Before releasing any buffers, collect the requests that the kernel
+        // accepted. Requests still in the SQ are failed with the ring reset.
+        size_t submitted =
+            writer.active - std::min<size_t>(writer.active, submit.pending);
+        while (submitted != 0 && writer.Wait(&cqe) == 0) {
+            RetireWrite(writer, cqe, lock);
+            --submitted;
+        }
+        writer.Reset();
+        writer.active = 0;
+        lock.lock();
+        for (auto& slot : writer.slots) {
+            if (!slot.task) continue;
+            slot.request.reset();
+            FinishTask(*slot.task,
+                       tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL), lock);
+            slot.task.reset();
+        }
+    }
+
+    // Called without the scheduler lock. SQE ownership transfers only on
+    // success, so synchronous work and preparation errors use FinishTask.
+    tl::expected<void, ErrorCode> QueueWrite(WriteRing& writer, Task& task,
+                                             bool& queued) {
+        if (!writer.Init())
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        const size_t slot = writer.FreeSlot();
+        auto prepared = task.sub_batch.prepare_write(
+            task.sub_batch.slice_idx_begin, writer.Buffer(slot));
+        if (!prepared) return tl::make_unexpected(prepared.error());
+        if (!*prepared) return {};
+
+        auto& request = **prepared;
+        auto* sqe = io_uring_get_sqe(&writer.ring);
+        if (!sqe) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        io_uring_prep_write(sqe, request.fd, request.data, request.length,
+                            request.offset);
+        io_uring_sqe_set_data(sqe, &writer.slots[slot]);
+        writer.slots[slot].request.emplace(std::move(request));
+        writer.slots[slot].task.emplace(std::move(task));
+        ++writer.active;
+        queued = true;
+        return {};
+    }
+#endif
+
+    void Work(size_t worker_index) {
+#ifdef USE_URING
+        WriteRing writer;
+#endif
+        auto& write_queue = write_queues_[worker_index];
         std::unique_lock<std::mutex> lock(mutex_);
         for (;;) {
-            changed_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
-            if (queue_.empty()) return;
-            auto& front = queue_.front();
-            const bool cancelled =
-                stopping_ || (front.group ? front.group->error.has_value()
-                                          : front.batch->error.has_value());
+#ifdef USE_URING
+            if (writer.active != 0 &&
+                (writer.active == WriteRing::kDepth ||
+                 (queue_.empty() && write_queue.empty()) || stopping_)) {
+                // Refill on each completion, including completions from a
+                // different bucket than the task next at the queue head.
+                ReapWrite(writer, lock);
+                continue;
+            }
+#endif
+            changed_.wait(lock, [&] {
+                return stopping_ || !queue_.empty() || !write_queue.empty();
+            });
+            if (queue_.empty() && write_queue.empty()) return;
+            bool from_write_queue = !write_queue.empty();
+            auto* front =
+                from_write_queue ? &write_queue.front() : &queue_.front();
+            bool cancelled =
+                stopping_ || (front->group ? front->group->error.has_value()
+                                           : front->batch->error.has_value());
             bool readiness_failed = false;
             if (!cancelled && ready_) {
                 lock.unlock();
@@ -134,14 +363,73 @@ class BatchIoScheduler::Impl {
                     readiness_failed = true;
                     ready = true;
                 }
+#ifdef USE_URING
+                if (!ready && writer.active != 0) {
+                    lock.lock();
+                    ReapWrite(writer, lock);
+                    continue;
+                }
+#endif
                 if (!ready) std::this_thread::sleep_for(backoff_);
                 lock.lock();
                 // Queue/state may have changed while checking readiness.
-                if (!ready || stopping_ || queue_.empty()) continue;
+                if (!ready || stopping_ ||
+                    (queue_.empty() && write_queue.empty()))
+                    continue;
+                from_write_queue = !write_queue.empty();
+                front =
+                    from_write_queue ? &write_queue.front() : &queue_.front();
+                cancelled = front->group ? front->group->error.has_value()
+                                         : front->batch->error.has_value();
             }
-            auto task = std::move(queue_.front());
-            queue_.pop_front();
+            if (!cancelled && front->write_file &&
+                !front->write_file->initialized) {
+                auto file = front->write_file;
+                lock.unlock();
+                auto inode = tl::expected<uint64_t, ErrorCode>(
+                    tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+                try {
+                    inode = file->prepare();
+                } catch (...) {
+                }
+                lock.lock();
+                if (!inode) {
+                    auto task = std::move(*front);
+                    write_queue.pop_front();
+                    FinishTask(task, tl::make_unexpected(inode.error()), lock);
+                    continue;
+                }
+                if (!stopping_) {
+                    file->initialized = true;
+                    const uint64_t value = *inode;
+                    file->queue =
+                        XXH3_64bits(&value, sizeof(value)) % workers_.size();
+                    if (file->queue != worker_index) {
+                        auto& target = write_queues_[file->queue];
+                        for (auto it = write_queue.begin();
+                             it != write_queue.end();) {
+                            if (it->write_file == file) {
+                                auto current = it++;
+                                target.splice(target.end(), write_queue,
+                                              current);
+                            } else {
+                                ++it;
+                            }
+                        }
+                        changed_.notify_all();
+                        continue;
+                    }
+                }
+                continue;
+            }
+            auto task = std::move(*front);
+            if (from_write_queue) {
+                write_queue.pop_front();
+            } else {
+                queue_.pop_front();
+            }
             tl::expected<void, ErrorCode> result;
+            bool queued = false;
             if (readiness_failed) {
                 result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             } else if (stopping_) {
@@ -154,42 +442,22 @@ class BatchIoScheduler::Impl {
             } else {
                 lock.unlock();
                 try {
-                    result =
-                        task.sub_batch.execute(task.sub_batch.slice_idx_begin,
-                                               task.sub_batch.slice_idx_end);
+#ifdef USE_URING
+                    if (task.sub_batch.prepare_write) {
+                        result = QueueWrite(writer, task, queued);
+                    } else
+#endif
+                    {
+                        result = task.sub_batch.execute(
+                            task.sub_batch.slice_idx_begin,
+                            task.sub_batch.slice_idx_end);
+                    }
                 } catch (...) {
                     result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
                 }
                 lock.lock();
             }
-            if (!result) {
-                if (!task.batch->error) task.batch->error = result.error();
-                if (task.group && !task.group->error)
-                    task.group->error = result.error();
-            }
-            if (task.group && --task.group->remaining == 0) {
-                auto group_result =
-                    task.group->error
-                        ? tl::expected<void, ErrorCode>(
-                              tl::make_unexpected(*task.group->error))
-                        : tl::expected<void, ErrorCode>();
-                lock.unlock();
-                try {
-                    result = task.group->complete(group_result);
-                } catch (...) {
-                    result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-                }
-                lock.lock();
-                if (!result && !task.batch->error)
-                    task.batch->error = result.error();
-            }
-            auto batch = task.batch;
-            // Callback owners may release staging or file reservations. Destroy
-            // them outside the queue lock and before waking the caller.
-            lock.unlock();
-            task = {};
-            lock.lock();
-            if (--batch->remaining == 0) batch->done.notify_all();
+            if (!queued) FinishTask(task, result, lock);
         }
     }
 
@@ -200,6 +468,8 @@ class BatchIoScheduler::Impl {
     Ready ready_;
     std::chrono::milliseconds backoff_{300};
     std::list<Task> queue_;
+    std::vector<std::list<Task>> write_queues_;
+    size_t next_write_queue_ = 0;
     std::vector<std::thread> workers_;
 };
 
@@ -237,7 +507,7 @@ tl::expected<void, ErrorCode> BatchIoScheduler::AddSubBatch(
     PendingBatch& batch, SubBatch&& sub_batch) {
     if (batch.error_) return tl::make_unexpected(*batch.error_);
     if (sub_batch.slice_idx_end < sub_batch.slice_idx_begin ||
-        !sub_batch.execute) {
+        (!sub_batch.execute && !sub_batch.prepare_write)) {
         batch.error_ = ErrorCode::INVALID_PARAMS;
     } else {
         try {
@@ -287,25 +557,107 @@ tl::expected<void, ErrorCode> BatchIoScheduler::PrepareSubBatches(
     return tl::make_unexpected(*batch.error_);
 }
 
+tl::expected<void, ErrorCode> BatchIoScheduler::PrepareSubBatchesByBytes(
+    PendingBatch& batch, std::span<const size_t> slice_sizes,
+    size_t sub_batch_bytes, size_t max_slices, const Execute& execute,
+    const Complete& complete) {
+    if (batch.error_) return tl::make_unexpected(*batch.error_);
+    if (sub_batch_bytes == 0 || max_slices == 0 || !execute) {
+        batch.error_ = ErrorCode::INVALID_PARAMS;
+        return tl::make_unexpected(*batch.error_);
+    }
+    try {
+        struct Group {
+            size_t begin;
+            size_t end;
+            size_t bytes;
+        };
+        std::vector<Group> groups;
+        Group current{0, 0, 0};
+        for (size_t index = 0; index < slice_sizes.size(); ++index) {
+            if (index > current.begin &&
+                (current.bytes + slice_sizes[index] > sub_batch_bytes ||
+                 index + 1 - current.begin > max_slices)) {
+                groups.push_back(current);
+                current = Group{index, index, 0};
+            }
+            current.end = index + 1;
+            current.bytes += slice_sizes[index];
+        }
+        if (current.begin < current.end) groups.push_back(current);
+        if (groups.size() > 1) {
+            Group& previous = groups[groups.size() - 2];
+            const Group tail = groups.back();
+            if (tail.bytes <= sub_batch_bytes / 4 &&
+                previous.end - previous.begin + tail.end - tail.begin <=
+                    max_slices) {
+                previous.end = tail.end;
+                groups.pop_back();
+            }
+        }
+        auto group = complete ? std::make_shared<Impl::Group>() : nullptr;
+        if (group) group->complete = complete;
+        for (const auto& item : groups) {
+            auto result =
+                AddSubBatch(batch, SubBatch{item.begin, item.end, execute});
+            if (!result) return result;
+            if (group) {
+                batch.state_->tasks.back().group = group;
+                ++group->remaining;
+            }
+        }
+        return {};
+    } catch (const std::bad_alloc&) {
+        batch.error_ = ErrorCode::NO_AVAILABLE_HANDLE;
+    } catch (...) {
+        batch.error_ = ErrorCode::INTERNAL_ERROR;
+    }
+    return tl::make_unexpected(*batch.error_);
+}
+
 tl::expected<void, ErrorCode> BatchIoScheduler::PrepareSubBatchTasks(
     PendingBatch& batch, size_t task_count, const Execute& execute,
     const Complete& complete) {
+    return PrepareIndexedTasks(batch, task_count, execute, {}, {}, complete);
+}
+
+tl::expected<void, ErrorCode> BatchIoScheduler::PrepareWriteTasks(
+    PendingBatch& batch, size_t task_count,
+    const PrepareWriteFile& prepare_file, const PrepareWrite& prepare,
+    const Complete& complete) {
+#ifdef USE_URING
+    return PrepareIndexedTasks(batch, task_count, {}, prepare_file, prepare,
+                               complete);
+#else
+    batch.error_ = ErrorCode::INVALID_PARAMS;
+    return tl::make_unexpected(*batch.error_);
+#endif
+}
+
+tl::expected<void, ErrorCode> BatchIoScheduler::PrepareIndexedTasks(
+    PendingBatch& batch, size_t task_count, const Execute& execute,
+    const PrepareWriteFile& prepare_file, const PrepareWrite& prepare_write,
+    const Complete& complete) {
     if (batch.error_) return tl::make_unexpected(*batch.error_);
-    if (!execute) {
+    if ((!execute && !prepare_write) || (prepare_write && !prepare_file)) {
         batch.error_ = ErrorCode::INVALID_PARAMS;
         return tl::make_unexpected(*batch.error_);
     }
     try {
         auto group = complete ? std::make_shared<Impl::Group>() : nullptr;
         if (group) group->complete = complete;
+        auto write_file =
+            prepare_write ? std::make_shared<Impl::WriteFile>() : nullptr;
+        if (write_file) write_file->prepare = prepare_file;
         for (size_t index = 0; index < task_count; ++index) {
-            auto result =
-                AddSubBatch(batch, SubBatch{index, index + 1, execute});
+            auto result = AddSubBatch(
+                batch, SubBatch{index, index + 1, execute, prepare_write});
             if (!result) return result;
             if (group) {
                 batch.state_->tasks.back().group = group;
                 ++group->remaining;
             }
+            batch.state_->tasks.back().write_file = write_file;
         }
         return {};
     } catch (const std::bad_alloc&) {

@@ -34,9 +34,13 @@ struct BucketBackendConfig {
     int64_t read_io_workers = 0;
     int64_t read_sub_batch_max_iovecs = 32;
     int64_t write_io_workers = 0;
-    int64_t write_sub_batch_max_iovecs = 32;  // Matches the per-worker
-        // io_uring submission depth (QUEUE_DEPTH in uring_file.cpp); larger
-        // values only split into serial 32-SQE rounds per sub batch.
+    // Target size of a write sub batch in bytes. A sub batch takes whole
+    // Slices up to this size. Hybrid direct ranges use the smaller of this
+    // target and the 4 MiB SQE size, cut on a 4 KiB block edge.
+    // Set by MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_BYTES.
+    int64_t write_sub_batch_bytes = 8LL << 20;
+    // The most Slices a write sub batch takes, whatever their size.
+    int64_t write_sub_batch_max_iovecs = 1024;
     int64_t write_io_backoff_ms = 300;
     int64_t bucket_size_limit =
         256LL * 1024 * 1024;  // Max total size of a single bucket (256 MB)
@@ -95,24 +99,20 @@ struct BucketBackendConfig {
     // contiguous byte stream whose interior 4 KiB blocks are all
     // file-aligned by construction. The interior goes out as direct
     // io_uring writes — zero-copy runs where a slice's buffer sits on the
-    // block grid, whole-block fragments around them copied through a
-    // per-worker write-back buffer bounded by write_back_buffer_bytes.
-    // Only the first and the last 4 KiB block of the stream (at most two
-    // pwritev calls) are buffered. One trailing fdatasync makes both
-    // durable, so the per-bucket flush no longer waits for a full bucket
-    // writeback. Set by MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=uring;
-    // without MOONCAKE_OFFLOAD_USE_URING this degrades to buffered bucket
-    // writes.
+    // block grid, whole-block fragments around them copied into the SQE's
+    // 4 MiB aligned scratch buffer. Only the first and the last 4 KiB block
+    // of the stream (at most two pwritev calls) are buffered. One trailing
+    // fdatasync makes both durable, so the per-bucket flush no longer waits for
+    // a full bucket writeback. Set by
+    // MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=uring; without
+    // MOONCAKE_OFFLOAD_USE_URING this degrades to buffered bucket writes.
     bool aligned_uring_write = false;
 
-    // Cap of the per write-worker thread-local write-back buffer that
-    // misaligned slices are copied into so they can go out as aligned
-    // direct writes. The buffer is allocated once at this size on the
-    // worker's first direct sub-batch and reused, so workers never repeatedly
-    // allocate and free scratch memory. Sub-batches are split at this bound;
-    // positive values must be multiples of 4096.
-    // 0 selects a buffer large enough for the largest bucket seen (bounded by
-    // bucket_size_limit).
+    // Bound of the sub batches of a sequential hybrid write, the one made
+    // without write workers: no sub batch copies more bytes than this into
+    // the thread's write-back buffer. Positive values must be multiples of
+    // 4096. 0 selects a buffer large enough for the largest bucket seen
+    // (bounded by bucket_size_limit).
     // Set by MOONCAKE_OFFLOAD_WRITE_BACK_BUFFER_BYTES.
     int64_t write_back_buffer_bytes = 64LL * 1024 * 1024;
 

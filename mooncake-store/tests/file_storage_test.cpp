@@ -651,7 +651,7 @@ class FileStorageTest : public ::testing::Test {
         // The parallel scenario has 25 inputs (24 real keys plus a missing
         // source), and expects every real key to persist in this call.
         bucket_config.flush_partial_buckets = write_workers > 0;
-        bucket_config.write_sub_batch_max_iovecs = 4;
+        bucket_config.write_sub_batch_bytes = 600;
         std::unordered_set<std::string> duplicates;
         for (size_t i = 0; i < duplicate_count; ++i) {
             duplicates.insert(TenantId::Default().MakeScopedKey(keys[i]));

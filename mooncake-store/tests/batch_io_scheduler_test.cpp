@@ -2,9 +2,11 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <future>
 #include <limits>
 #include <mutex>
@@ -43,6 +45,107 @@ IoResult PrepareAndWait(BatchIoScheduler& scheduler, size_t slice_count,
     if (!result) return result;
     return scheduler.SubmitAndWait(batch);
 }
+
+#ifdef USE_URING
+TEST(BatchIoSchedulerTest, AsyncWritesRefillAndPreserveSlotBuffers) {
+    auto created = BatchIoScheduler::Create(1);
+    ASSERT_TRUE(created);
+    auto& scheduler = **created;
+    auto file = std::unique_ptr<std::FILE, decltype(&std::fclose)>(
+        std::tmpfile(), &std::fclose);
+    ASSERT_TRUE(file);
+
+    constexpr size_t kFiles = 2;
+    constexpr size_t kWritesPerGroup = 48;
+    BatchIoScheduler::PendingBatch batch;
+    size_t completed = 0;
+    for (size_t group = 0; group < kFiles; ++group) {
+        ASSERT_TRUE(scheduler.PrepareWriteTasks(
+            batch, kWritesPerGroup,
+            [group]() -> tl::expected<uint64_t, ErrorCode> {
+                return static_cast<uint64_t>(group + 1);
+            },
+            [&, group](size_t index, std::span<char> scratch)
+                -> tl::expected<std::optional<BatchIoScheduler::WriteRequest>,
+                                ErrorCode> {
+                const size_t offset = group * kWritesPerGroup + index;
+                scratch[0] = static_cast<char>(offset + 1);
+                return std::optional<BatchIoScheduler::WriteRequest>{
+                    {fileno(file.get()),
+                     scratch.data(),
+                     1,
+                     static_cast<int64_t>(offset),
+                     {}}};
+            },
+            [&](IoResult status) {
+                ++completed;
+                return status;
+            }));
+    }
+    ASSERT_TRUE(scheduler.SubmitAndWait(batch));
+    EXPECT_EQ(completed, kFiles);
+    std::array<char, kFiles * kWritesPerGroup> actual{};
+    ASSERT_EQ(std::fread(actual.data(), 1, actual.size(), file.get()),
+              actual.size());
+    for (size_t i = 0; i < actual.size(); ++i)
+        EXPECT_EQ(actual[i], static_cast<char>(i + 1));
+}
+
+TEST(BatchIoSchedulerTest, AsyncWritesUsePerWorkerInodeQueues) {
+    auto created = BatchIoScheduler::Create(4);
+    ASSERT_TRUE(created);
+    auto& scheduler = **created;
+    auto file = std::unique_ptr<std::FILE, decltype(&std::fclose)>(
+        std::tmpfile(), &std::fclose);
+    ASSERT_TRUE(file);
+
+    constexpr size_t kFiles = 8;
+    constexpr size_t kWritesPerGroup = 40;
+    std::mutex mutex;
+    std::array<std::set<std::thread::id>, kFiles> file_workers;
+    std::array<size_t, kFiles> initialized{};
+    std::array<size_t, kFiles> completed{};
+    BatchIoScheduler::PendingBatch batch;
+    for (size_t group = 0; group < kFiles; ++group) {
+        ASSERT_TRUE(scheduler.PrepareWriteTasks(
+            batch, kWritesPerGroup,
+            [&, group]() -> tl::expected<uint64_t, ErrorCode> {
+                std::lock_guard<std::mutex> lock(mutex);
+                ++initialized[group];
+                return static_cast<uint64_t>(group + 1);
+            },
+            [&, group](size_t index, std::span<char> scratch)
+                -> tl::expected<std::optional<BatchIoScheduler::WriteRequest>,
+                                ErrorCode> {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    file_workers[group].insert(std::this_thread::get_id());
+                }
+                scratch[0] = static_cast<char>(group + index + 1);
+                return std::optional<BatchIoScheduler::WriteRequest>{
+                    {fileno(file.get()),
+                     scratch.data(),
+                     1,
+                     static_cast<int64_t>(group * kWritesPerGroup + index),
+                     {}}};
+            },
+            [&, group](IoResult status) {
+                std::lock_guard<std::mutex> lock(mutex);
+                ++completed[group];
+                return status;
+            }));
+    }
+    ASSERT_TRUE(scheduler.SubmitAndWait(batch));
+    std::set<std::thread::id> used_workers;
+    for (size_t group = 0; group < kFiles; ++group) {
+        EXPECT_EQ(initialized[group], 1);
+        EXPECT_EQ(completed[group], 1);
+        ASSERT_EQ(file_workers[group].size(), 1);
+        used_workers.insert(*file_workers[group].begin());
+    }
+    EXPECT_GT(used_workers.size(), 1);
+}
+#endif
 
 #if defined(__linux__) || defined(__APPLE__)
 TEST(BatchIoSchedulerTest, NamedWorkersExecuteConcurrently) {
@@ -516,6 +619,53 @@ TEST(BatchIoSchedulerTest, IndividualTasksShareOneCompletionGroup) {
     EXPECT_TRUE(created.value()->SubmitAndWait(batch));
     EXPECT_EQ(finished, 1);
     for (const auto visit : visits) EXPECT_EQ(visit, 1);
+}
+
+TEST(BatchIoSchedulerTest, SubBatchesByBytesTakeWholeSlices) {
+    auto created = BatchIoScheduler::Create(1);
+    ASSERT_TRUE(created);
+    auto& scheduler = *created.value();
+    using Range = std::pair<size_t, size_t>;
+    std::vector<Range> ranges;
+    size_t completions = 0;
+    const auto run = [&](std::vector<size_t> sizes, size_t target,
+                         size_t max_slices) {
+        ranges.clear();
+        completions = 0;
+        BatchIoScheduler::PendingBatch batch;
+        const auto execute = [&](size_t begin, size_t end) -> IoResult {
+            ranges.emplace_back(begin, end);
+            return {};
+        };
+        const auto complete = [&](IoResult result) -> IoResult {
+            ++completions;
+            return result;
+        };
+        if (!scheduler.PrepareSubBatchesByBytes(batch, sizes, target,
+                                                max_slices, execute, complete))
+            return false;
+        return scheduler.SubmitAndWait(batch).has_value();
+    };
+
+    // Thirteen Slices of 4 bytes take 16 each; the last one joins the third.
+    ASSERT_TRUE(run(std::vector<size_t>(13, 4), 16, 8));
+    EXPECT_EQ(ranges, (std::vector<Range>{{0, 4}, {4, 8}, {8, 13}}));
+    EXPECT_EQ(completions, 1);
+    // The Slice cap holds the last Slices apart although they are small.
+    ASSERT_TRUE(run(std::vector<size_t>(10, 1), 100, 3));
+    EXPECT_EQ(ranges, (std::vector<Range>{{0, 3}, {3, 6}, {6, 9}, {9, 10}}));
+    // A Slice larger than the target stands alone.
+    ASSERT_TRUE(run({50, 4, 4, 4}, 16, 8));
+    EXPECT_EQ(ranges, (std::vector<Range>{{0, 1}, {1, 4}}));
+
+    BatchIoScheduler::PendingBatch invalid;
+    const std::vector<size_t> sizes(4, 1);
+    ExpectError(
+        scheduler.PrepareSubBatchesByBytes(invalid, sizes, 0, 8, Succeed),
+        ErrorCode::INVALID_PARAMS);
+    ExpectError(
+        scheduler.PrepareSubBatchesByBytes(invalid, sizes, 8, 0, Succeed),
+        ErrorCode::INVALID_PARAMS);
 }
 
 TEST(BatchIoSchedulerTest, WaitIncludesIndependentGroupFinalizers) {
