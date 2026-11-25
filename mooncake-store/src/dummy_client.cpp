@@ -8,6 +8,7 @@
 #include <fcntl.h>     // For O_CREAT, O_RDWR
 #include <unistd.h>    // For ftruncate, close, shm_unlink
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <algorithm>
 #include <limits>
@@ -496,10 +497,15 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
 int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                              const std::string& server_address,
                              const std::string& ipc_socket_path) {
-    const char* use_fabric_mem_env =
-        std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
-    if (use_fabric_mem_env && std::string(use_fabric_mem_env) == "1") {
-        globalConfig().ascend_use_fabric_mem = true;
+    const char* use_fabric_mem_env = getEnvWithFallback(
+        "MC_ASCEND_ENABLE_USE_FABRIC_MEM", "ASCEND_ENABLE_USE_FABRIC_MEM");
+    if (use_fabric_mem_env) {
+        std::string val(use_fabric_mem_env);
+        std::transform(val.begin(), val.end(), val.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (val == "1" || val == "true") {
+            globalConfig().ascend_use_fabric_mem = true;
+        }
     }
 
     void* base_addr = nullptr;
@@ -572,6 +578,22 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
             LOG(INFO)
                 << "Hot cache shm not available (real client may not have it)";
         }
+    } else {
+        // Zero-buffer startup has no control SHM registration. A fresh UUID
+        // can be asked to remount, and there are no buffers to replay yet.
+        auto initial_ping =
+            invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+        if (initial_ping &&
+            initial_ping->client_status == ClientStatus::NEED_REMOUNT) {
+            initial_ping =
+                invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+        }
+        if (!initial_ping || initial_ping->client_status != ClientStatus::OK) {
+            connected_.store(false);
+            LOG(ERROR) << "Initial dummy client heartbeat failed";
+            return -1;
+        }
+        last_ping_healthy_.store(true);
     }
 
     ping_running_ = true;
@@ -580,6 +602,13 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
 }
 
 int DummyClient::tearDownAll() {
+    // Reconnection iterates the SHM registry. Join it before free() erases
+    // segments or releases their mappings and FDs.
+    ping_running_ = false;
+    if (ping_thread_.joinable()) {
+        ping_thread_.join();
+    }
+
     void* local_buffer_base = local_buffer_base_;
     unregister_shm();
     if (local_buffer_base && shm_helper_ &&
@@ -600,12 +629,6 @@ int DummyClient::tearDownAll() {
         hot_cache_fd_ = -1;
     }
 
-    if (ping_running_) {
-        ping_running_ = false;
-        if (ping_thread_.joinable()) {
-            ping_thread_.join();
-        }
-    }
     connected_.store(false);
     last_ping_healthy_.store(false);
     std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
@@ -956,7 +979,17 @@ int DummyClient::unregister_device_buffer_for_reconnect(void* buffer) {
 
     auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
         static_cast<uint64_t>(buffer_addr), client_id_);
-    if (ret.has_value()) registered_device_buffers_.erase(buffer_addr);
+    // Same contract as unregister_buffer: the receiver removes the mapping on
+    // INTERNAL_ERROR too (unmapped, or quarantined when the SPDK or transfer
+    // engine unregister fails), and INVALID_PARAMS means the server has no such
+    // mapping, so drop the local bookkeeping then; keep it on RPC_FAIL /
+    // RPC_TIMEOUT where the server may not have run (see unregister_buffer).
+    // No extra locking here: the function-scope lock above is already held.
+    if (ret.has_value() ||
+        (!ret.has_value() && (ret.error() == ErrorCode::INTERNAL_ERROR ||
+                              ret.error() == ErrorCode::INVALID_PARAMS))) {
+        registered_device_buffers_.erase(buffer_addr);
+    }
     return to_py_ret(ret);
 }
 
@@ -1045,14 +1078,20 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         }
         size = align_up(size, alignment);
     }
-    // Check bounds
+    // Check bounds. The buffer must be the segment base and the size must match
+    // either the caller's original request (ShmSegment::requested_size) or the
+    // padded mapping size (shm->size, aligned up to the hugepage/2MB boundary
+    // for SPDK registration). Both are valid: IPC always sends shm->size, and
+    // legacy callers may pass the padded size directly.
     if (reinterpret_cast<uint8_t*>(buffer) !=
             reinterpret_cast<uint8_t*>(shm->base_addr) ||
-        size != shm->size) {
+        (size != shm->requested_size && size != shm->size)) {
         LOG(ERROR) << "Invalid buffer address or size for registration: "
                       "Buffer addr: "
                    << buffer << ", need addr: " << shm->base_addr
-                   << ", buffer size: " << size << ", need size: " << shm->size;
+                   << ", buffer size: " << size
+                   << ", need size: " << shm->requested_size
+                   << " (padded: " << shm->size << ")";
         return -1;
     }
 
@@ -1126,7 +1165,20 @@ int DummyClient::unregister_buffer(void* buffer) {
     }
     auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
         reinterpret_cast<uint64_t>(buffer), client_id_);
-    if (ret.has_value()) {
+    // INTERNAL_ERROR means the receiver still executed the teardown and removed
+    // the segment from its active mappings: it unmaps normally, or -- when the
+    // SPDK or transfer engine unregister fails -- quarantines the mapping
+    // (retained, never reused for new registrations). Either way the old
+    // mapping is no longer usable on the receiver, so drop the local flag for
+    // INTERNAL_ERROR and for INVALID_PARAMS (server has no such mapping). Keep
+    // it on RPC_FAIL / RPC_TIMEOUT: the RPC may never have reached the server,
+    // or the receiver may have refused before touching anything (Ascend context
+    // setup failure in unregister_shm_buffer_internal returns RPC_FAIL for
+    // exactly that reason), so the mapping can still be alive and a retry must
+    // reach the receiver.
+    if (ret.has_value() ||
+        (!ret.has_value() && (ret.error() == ErrorCode::INTERNAL_ERROR ||
+                              ret.error() == ErrorCode::INVALID_PARAMS))) {
         shm->registered = false;
     }
     return to_py_ret(ret);
@@ -1273,6 +1325,20 @@ int DummyClient::isExist(const std::string& key) {
     }
 }
 
+int DummyClient::isExist(const std::string& key, const ExistOptions& options) {
+    if (!options.prefetch_to_memory) {
+        return isExist(key);
+    }
+    auto result = invoke_rpc<&RealClient::isExistWithOptions_internal, bool>(
+        key, options);
+    // Prefetch is best-effort, including during a rolling upgrade to a
+    // server that does not yet expose the additive options RPC.
+    if (!result && result.error() == ErrorCode::RPC_FAIL) {
+        return isExist(key);
+    }
+    return result ? (*result ? 1 : 0) : toInt(result.error());
+}
+
 std::vector<int> DummyClient::batchIsExist(
     const std::vector<std::string>& keys) {
     auto internal_results =
@@ -1290,6 +1356,58 @@ std::vector<int> DummyClient::batchIsExist(
         }
     }
 
+    return results;
+}
+
+int DummyClient::probeKey(const std::string& key) {
+    auto result = invoke_rpc<&RealClient::probeKey_internal, bool>(key);
+
+    if (result.has_value()) {
+        return *result ? 1 : 0;  // 1 if exists, 0 if not
+    } else {
+        return toInt(result.error());
+    }
+}
+
+std::vector<int> DummyClient::batchProbeKey(
+    const std::vector<std::string>& keys, const GrantLeasePolicy& policy) {
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batchProbeKey_internal, bool>(
+            keys.size(), keys, policy);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+
+    for (const auto& result : internal_results) {
+        if (result.has_value()) {
+            results.push_back(result.value() ? 1 : 0);
+        } else {
+            LOG(ERROR) << "Batch probeKey failed: " << toString(result.error());
+            results.push_back(-1);
+        }
+    }
+
+    return results;
+}
+
+std::vector<int> DummyClient::batchIsExist(const std::vector<std::string>& keys,
+                                           const ExistOptions& options) {
+    if (!options.prefetch_to_memory || keys.empty()) {
+        return batchIsExist(keys);
+    }
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batchIsExistWithOptions_internal, bool>(
+            keys.size(), keys, options);
+    if (std::all_of(internal_results.begin(), internal_results.end(),
+                    [](const auto& result) {
+                        return !result && result.error() == ErrorCode::RPC_FAIL;
+                    })) {
+        return batchIsExist(keys);
+    }
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto& result : internal_results) {
+        results.push_back(result ? (*result ? 1 : 0) : -1);
+    }
     return results;
 }
 
@@ -1586,6 +1704,18 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
                               total_bytes, elapsed_us_since(start_time), true);
     }
     return results;
+}
+
+std::vector<std::vector<std::vector<int64_t>>>
+DummyClient::get_into_ranges_from_snapshot(
+    const std::vector<void*>& buffers,
+    const std::vector<std::vector<std::string>>& all_keys,
+    const std::vector<std::vector<std::vector<size_t>>>& all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>>& all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>>& all_sizes,
+    const QueryResultCache& query_result_cache) {
+    return get_into_ranges(buffers, all_keys, all_dst_offsets, all_src_offsets,
+                           all_sizes, &query_result_cache);
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> DummyClient::batch_query(
@@ -1996,6 +2126,42 @@ tl::expected<UUID, ErrorCode> DummyClient::create_move_task(
     const std::string& key, const std::string& source,
     const std::string& target) {
     return invoke_rpc<&RealClient::create_move_task, UUID>(key, source, target);
+}
+
+tl::expected<UUID, ErrorCode> DummyClient::create_drain_job(
+    const CreateDrainJobRequest& request) {
+    return invoke_rpc<&RealClient::create_drain_job, UUID>(request);
+}
+
+tl::expected<UUID, ErrorCode> DummyClient::create_timed_drain_job(
+    const CreateDrainJobRequest& request, uint64_t timeout_ms) {
+    return invoke_rpc<&RealClient::create_timed_drain_job, UUID>(request,
+                                                                 timeout_ms);
+}
+
+tl::expected<QueryJobResponse, ErrorCode> DummyClient::query_drain_job(
+    const UUID& job_id) {
+    return invoke_rpc<&RealClient::query_drain_job, QueryJobResponse>(job_id);
+}
+
+tl::expected<void, ErrorCode> DummyClient::cancel_drain_job(
+    const UUID& job_id) {
+    return invoke_rpc<&RealClient::cancel_drain_job, void>(job_id);
+}
+
+tl::expected<ListDrainJobsResponse, ErrorCode> DummyClient::list_drain_jobs(
+    const DrainJobListRequest& request) {
+    return invoke_rpc<&RealClient::list_drain_jobs, ListDrainJobsResponse>(
+        request);
+}
+
+tl::expected<ListTasksResponse, ErrorCode> DummyClient::list_tasks(
+    const TaskListRequest& request) {
+    return invoke_rpc<&RealClient::list_tasks, ListTasksResponse>(request);
+}
+
+tl::expected<void, ErrorCode> DummyClient::cancel_task(const UUID& task_id) {
+    return invoke_rpc<&RealClient::cancel_task, void>(task_id);
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> DummyClient::query_task(

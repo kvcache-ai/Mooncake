@@ -127,6 +127,8 @@ class BarexTransport : public Transport {
     Status CheckStatus(SegmentID sid) override;
 
    private:
+    void shutdownResources();
+
     int allocateLocalSegmentID();
 
    public:

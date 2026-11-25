@@ -15,14 +15,16 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
-#include <cstdlib>
 #include <memory>
 #include <string>
 #include <unistd.h>
 #include <vector>
 
 #include "common.h"
+#include "shm_hugepage_test_util.h"
+#include "task_congestion_status.h"
 #include "transfer_engine.h"
+#include "transfer_engine_c.h"
 #include "transfer_metadata.h"
 #include "transport/shm_transport/shm_transport.h"
 
@@ -126,6 +128,28 @@ void ExpectShmWriteAndRead(TransferEngine& owner, TransferEngine& peer,
         write.length = length;
         ASSERT_TRUE(peer.submitTransfer(batch, {write}).ok());
         ASSERT_TRUE(WaitCompleted(peer, batch));
+        TaskCongestionState congestion_state = TaskCongestionState::kNormal;
+        ASSERT_TRUE(
+            peer.getTaskCongestionState(batch, 0, congestion_state).ok());
+        EXPECT_EQ(congestion_state, TaskCongestionState::kUnknown);
+        TaskCongestionDetail congestion_detail;
+        ASSERT_TRUE(
+            peer.getTaskCongestionDetail(batch, 0, congestion_detail).ok());
+        EXPECT_EQ(congestion_detail.state, TaskCongestionState::kUnknown);
+        EXPECT_FALSE(congestion_detail.reason.observed);
+        int c_state = TASK_CONGESTION_NORMAL;
+        EXPECT_EQ(getTaskCongestionState(static_cast<transfer_engine_t>(&peer),
+                                         batch, 0, &c_state),
+                  0);
+        EXPECT_EQ(c_state, TASK_CONGESTION_UNKNOWN);
+        task_congestion_detail_t c_detail{};
+        size_t required_path_length = 1;
+        EXPECT_EQ(getTaskCongestionDetail(static_cast<transfer_engine_t>(&peer),
+                                          batch, 0, &c_detail, nullptr, 0,
+                                          &required_path_length),
+                  0);
+        EXPECT_EQ(c_detail.state, c_state);
+        EXPECT_EQ(required_path_length, 0u);
         ASSERT_TRUE(peer.freeBatchID(batch).ok());
     }
 
@@ -197,6 +221,83 @@ TEST(ShmTransportE2E, WriteAndReadBetweenEngines) {
     ASSERT_NO_FATAL_FAILURE(ExpectShmWriteAndRead(*engine_a, *engine_b, remote,
                                                   remote_base, length));
     ASSERT_EQ(engine_a->freeSharedMemory(remote), 0);
+}
+
+class ShmHugepageE2ETest : public ::testing::TestWithParam<size_t> {};
+
+TEST_P(ShmHugepageE2ETest, WriteAndRead) {
+    const size_t length = GetParam();
+    auto mount = FindHugetlbfsMount(length);
+    if (!mount) {
+        GTEST_SKIP() << "No writable " << HugepageSizeLabel(length)
+                     << " hugetlbfs mount";
+    }
+
+    const uint16_t extra =
+        length == SharedMemoryOptions::kHugepage2MB
+            ? 30
+            : (length == SharedMemoryOptions::kHugepage512MB ? 34 : 32);
+    auto engine_a = MakeEngine(UniqueServerName(extra));
+    auto engine_b = MakeEngine(UniqueServerName(extra + 1));
+    ASSERT_TRUE(engine_a);
+    ASSERT_TRUE(engine_b);
+
+    SharedMemoryOptions opt;
+    opt.use_hugepage = true;
+    opt.hugepage_size = length;
+    opt.hugetlbfs_path = *mount;
+    opt.populate = false;
+
+    void* remote = engine_a->allocateSharedMemory(length, opt);
+    if (!remote) {
+        GTEST_SKIP() << HugepageSizeLabel(length)
+                     << " hugetlbfs mount present but allocation failed "
+                        "(no free hugepages?)";
+    }
+    ASSERT_EQ(engine_a->registerLocalMemory(remote, length, "cpu:0"), 0);
+
+    auto desc = engine_a->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_TRUE(desc);
+    auto* shm_buffer = FindPosixShmBuffer(*desc);
+    ASSERT_NE(shm_buffer, nullptr);
+    EXPECT_TRUE(isFilesystemShmPath(shm_buffer->shm_name));
+    EXPECT_EQ(shm_buffer->shm_name.rfind(*mount, 0), 0u);
+
+    auto segment_id = engine_b->openSegment(engine_a->getLocalIpAndPort());
+    auto remote_desc = engine_b->getMetadata()->getSegmentDescByID(segment_id);
+    ASSERT_TRUE(remote_desc);
+    auto* remote_shm = FindPosixShmBuffer(*remote_desc);
+    ASSERT_NE(remote_shm, nullptr);
+    EXPECT_TRUE(isFilesystemShmPath(remote_shm->shm_name));
+
+    ASSERT_NO_FATAL_FAILURE(ExpectShmWriteAndRead(*engine_a, *engine_b, remote,
+                                                  remote_shm->addr, length));
+    ASSERT_EQ(engine_a->freeSharedMemory(remote), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(HugepageSizes, ShmHugepageE2ETest,
+                         ::testing::Values(SharedMemoryOptions::kHugepage2MB,
+                                           SharedMemoryOptions::kHugepage512MB,
+                                           SharedMemoryOptions::kHugepage1GB),
+                         [](const testing::TestParamInfo<size_t>& info) {
+                             return HugepageSizeTestName(info.param);
+                         });
+
+TEST(ShmTransportE2E, CongestionQueryRejectsInvalidBatch) {
+    auto engine = MakeEngine(UniqueServerName(20), false);
+    ASSERT_TRUE(engine);
+    TaskCongestionState state = TaskCongestionState::kNormal;
+    EXPECT_TRUE(
+        engine->getTaskCongestionState(0, 0, state).IsInvalidArgument());
+    TaskCongestionDetail detail;
+    EXPECT_TRUE(
+        engine->getTaskCongestionDetail(0, 0, detail).IsInvalidArgument());
+    EXPECT_TRUE(
+        engine->getTaskCongestionState(static_cast<BatchID>(-1), 0, state)
+            .IsInvalidArgument());
+    EXPECT_TRUE(
+        engine->getTaskCongestionDetail(static_cast<BatchID>(-1), 0, detail)
+            .IsInvalidArgument());
 }
 
 TEST(ShmTransportE2E, WriteAndRead4K) {
@@ -510,6 +611,16 @@ TEST(ShmTransportE2E, MallocBufferUsesTcp) {
     write.length = length;
     ASSERT_TRUE(engine_b->submitTransfer(batch, {write}).ok());
     ASSERT_TRUE(WaitCompleted(*engine_b, batch));
+    TaskCongestionState congestion_state = TaskCongestionState::kNormal;
+    ASSERT_TRUE(
+        engine_b->getTaskCongestionState(batch, 0, congestion_state).ok());
+    EXPECT_EQ(congestion_state, TaskCongestionState::kUnknown);
+    TaskCongestionDetail congestion_detail;
+    ASSERT_TRUE(
+        engine_b->getTaskCongestionDetail(batch, 0, congestion_detail).ok());
+    EXPECT_EQ(congestion_detail.state, TaskCongestionState::kUnknown);
+
+    EXPECT_FALSE(congestion_detail.reason.observed);
     ASSERT_TRUE(engine_b->freeBatchID(batch).ok());
 
     auto* shm = dynamic_cast<ShmTransport*>(engine_b->getTransport("shm"));

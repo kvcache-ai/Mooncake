@@ -19,6 +19,10 @@ namespace {
 
 class FakeHaKvBackend : public HaKvBackend {
    public:
+    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     ErrorCode Get(std::string_view key, std::string& value) override {
         if (next_get_error_ != ErrorCode::OK) {
             auto error = next_get_error_;
@@ -387,12 +391,14 @@ TEST(OpLogBatchStandbyReaderTest, FullPageContinuesOnNextPoll) {
     auto first = reader.PollOnce(/*max_batches=*/2);
     ASSERT_EQ(ErrorCode::OK, first.error);
     EXPECT_EQ(2u, first.applied_entries);
+    EXPECT_EQ(2u, first.applied_batches);
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
     EXPECT_FALSE(reader.GetLastAppliedDurablePrefix().has_value());
 
     auto second = reader.PollOnce(/*max_batches=*/2);
     ASSERT_EQ(ErrorCode::OK, second.error);
     EXPECT_EQ(1u, second.applied_entries);
+    EXPECT_EQ(1u, second.applied_batches);
     EXPECT_EQ(4u, applier.GetExpectedSequenceId());
     auto applied_prefix = reader.GetLastAppliedDurablePrefix();
     ASSERT_TRUE(applied_prefix.has_value());
@@ -500,6 +506,7 @@ TEST(OpLogBatchStandbyReaderTest, FailsWhenLaterBatchHasSequenceGap) {
 
     EXPECT_NE(ErrorCode::OK, result.error);
     EXPECT_EQ(2u, result.applied_entries);
+    EXPECT_EQ(1u, result.applied_batches);
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
     EXPECT_FALSE(reader.GetLastAppliedDurablePrefix().has_value());
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,10 @@ class OpLogBatchStorage {
     ErrorCode ReadBatch(uint64_t batch_id, OpLogBatchRecord& batch);
     ErrorCode ReadBatchesAfter(uint64_t after_batch_id, size_t limit,
                                std::vector<OpLogBatchRecord>& batches);
+    ErrorCode FindOldestBatchId(std::optional<uint64_t>& batch_id);
+    // Delete an inclusive bounded range of batch IDs from this cluster only.
+    // Caller must first publish a reader-visible floor covering the range.
+    ErrorCode DeleteBatchesInRange(uint64_t first_id, uint64_t last_id);
 
    private:
     bool IsValidClusterId() const;

@@ -24,6 +24,8 @@ class HttpMetadataServer {
     HttpMetadataServer(uint16_t port, const std::string& host = "0.0.0.0");
     ~HttpMetadataServer();
 
+    uint16_t port() const { return server_->port(); }
+
     // Start the HTTP metadata server
     bool start();
 

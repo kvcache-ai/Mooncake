@@ -41,7 +41,8 @@ def load_test_module():
     )
 
     module_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[2]
+        / "e2e"
         / "python"
         / "test_hicache_storage_mooncake_backend.py"
     )
@@ -71,6 +72,39 @@ class TestModelSelection(unittest.TestCase):
                 self.module.HiCacheStorageMooncakeBackendBaseMixin._get_model_name(),
                 "Qwen/Qwen3-8B",
             )
+
+    def test_store_rs_uses_redis_metadata_and_selected_rdma_device(self):
+        mixin = self.module.HiCacheStorageMooncakeBackendBaseMixin
+        mixin.mooncake_master_port = 16379
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MOONCAKE_STORE_BACKEND": "rs",
+                "MOONCAKE_TRANSFER_DEVICE": "erdma_0",
+            },
+            clear=True,
+        ):
+            _, environment = mixin._get_additional_server_args_and_env()
+
+        self.assertEqual(environment["MOONCAKE_STORE_BACKEND"], "rs")
+        self.assertEqual(
+            environment["MC_STORE_RS_METADATA_URL"], "redis://127.0.0.1:16379/0"
+        )
+        self.assertEqual(environment["MOONCAKE_PROTOCOL"], "rdma")
+        self.assertEqual(environment["MOONCAKE_DEVICE"], "erdma_0")
+        self.assertEqual(environment["MC_STORE_RS_TRANSPORT_BACKEND"], "classic-te")
+
+    def test_store_rs_reuses_mc_use_tent_backend_selection(self):
+        mixin = self.module.HiCacheStorageMooncakeBackendBaseMixin
+        mixin.mooncake_master_port = 16379
+        with mock.patch.dict(
+            os.environ,
+            {"MOONCAKE_STORE_BACKEND": "rs", "MC_USE_TENT": "1"},
+            clear=True,
+        ):
+            _, environment = mixin._get_additional_server_args_and_env()
+
+        self.assertEqual(environment["MC_STORE_RS_TRANSPORT_BACKEND"], "tent")
 
 
 if __name__ == "__main__":

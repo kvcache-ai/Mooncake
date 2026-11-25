@@ -67,13 +67,21 @@ vllm serve Qwen/Qwen2.5-7B-Instruct \
 **Proxy Server:**
 
 ```bash
-# In vllm root directory.
-python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
-  --prefiller-host 192.168.0.2 --prefiller-port 8010 \
-  --decoder-host 192.168.0.3 --decoder-port 8020
+# From a vLLM repository checkout. The proxy lives under examples/ and is
+# not included in the pip wheel.
+python examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py \
+  --port 8000 \
+  --prefill http://192.168.0.2:8010 8998 \
+  --decode http://192.168.0.3:8020
 ```
 
-> NOTE: The Mooncake Connector currently uses the proxy from nixl_integration. This will be replaced with a self-developed proxy in the future.
+> NOTE: `MooncakeConnector` requires a router that generates a `transfer_id`
+> and forwards the prefiller bootstrap address to the decoder
+> ([vllm-project/vllm#31034](https://github.com/vllm-project/vllm/pull/31034)).
+> The toy proxy under `tests/v1/kv_connector/nixl_integration/` does not
+> implement this contract: outputs stay correct, but KV caches are silently
+> recomputed on the decoder instead of transferred. The bootstrap port must
+> match the prefiller's `VLLM_MOONCAKE_BOOTSTRAP_PORT` (default: 8998).
 
 Now you can send requests to the proxy server through port 8000.
 

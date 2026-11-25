@@ -4,8 +4,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
-#include <cstring>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -14,6 +12,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "types.h"
+#include "config/ha_cluster_namespace_config.h"
 
 namespace mooncake {
 namespace ha {
@@ -214,8 +213,11 @@ EtcdLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
         return tl::make_unexpected(err);
     }
 
+    const int64_t lease_ttl_sec = spec_.leader_lease_ttl_sec > 0
+                                      ? spec_.leader_lease_ttl_sec
+                                      : DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     EtcdLeaseId lease_id = 0;
-    err = EtcdHelper::GrantLease(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC, lease_id);
+    err = EtcdHelper::GrantLease(lease_ttl_sec, lease_id);
     if (err != ErrorCode::OK) {
         (void)ResetConnection();
         return tl::make_unexpected(err);
@@ -258,7 +260,7 @@ EtcdLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
         .view = MasterView{.leader_address = leader_address,
                            .view_version = view_version},
         .owner_token = owner_token,
-        .lease_ttl = std::chrono::seconds(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC),
+        .lease_ttl = std::chrono::seconds(lease_ttl_sec),
     };
 
     {
@@ -619,14 +621,7 @@ ClusterNamespace EtcdLeaderCoordinator::ResolveClusterNamespace(
         return cluster_namespace;
     }
 
-    std::string resolved_namespace;
-    const char* env_cluster_id = std::getenv("MC_STORE_CLUSTER_ID");
-    if (env_cluster_id != nullptr && std::strlen(env_cluster_id) > 0) {
-        resolved_namespace = env_cluster_id;
-    } else {
-        resolved_namespace = DEFAULT_CLUSTER_ID;
-    }
-    return resolved_namespace;
+    return HaClusterNamespaceConfig::FromEnvironment().cluster_namespace;
 }
 
 std::string EtcdLeaderCoordinator::BuildMasterViewKey(

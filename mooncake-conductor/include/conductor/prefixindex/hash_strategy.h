@@ -59,9 +59,11 @@ class HashStrategy {
 };
 
 // Resolves a supported source profile and derives its root digest. Returns an
-// empty string on success.
+// empty string on success. When provided, error_field identifies an invalid
+// configuration field and is cleared on success or non-field errors.
 std::string ResolveHashProfile(const common::HashProfileConfig& config,
-                               HashProfile* out);
+                               HashProfile* out,
+                               std::string* error_field = nullptr);
 
 // Returns an empty string when the resolved profile is supported, well formed,
 // and its root digest matches a fresh derivation from python_hash_seed.

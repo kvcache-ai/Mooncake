@@ -1,0 +1,54 @@
+/* Scoped to the downloads widget; navigation and theme stay Sphinx-native. */
+.pypi-downloads { margin: 1.2rem 0 1.6rem; }
+.pypi-downloads button, .pypi-downloads select {
+  font: inherit; font-size: .8rem; color: var(--pst-color-text-base);
+  border: 1px solid var(--pst-color-border); border-radius: .35rem;
+  padding: .3rem .55rem; background: var(--pst-color-background);
+}
+.pypi-downloads button { cursor: pointer; }
+.pypi-downloads :focus-visible { outline: 2px solid var(--pst-color-primary); outline-offset: 2px; }
+.pypi-downloads .pypi-status { color: var(--pst-color-text-muted); font-size: .76rem; line-height: 1.6; margin: .6rem 0; }
+.pypi-controls { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; font-size: .8rem; }
+.pypi-controls label { display: flex; align-items: center; gap: .35rem; margin: 0; }
+.pypi-controls button { margin-left: auto; }
+.pypi-packages { display: flex; gap: .35rem; flex-wrap: wrap; margin: .8rem 0 1.3rem; }
+.pypi-packages button[aria-pressed="true"] { color: var(--pst-color-primary); background: var(--pst-color-surface); border-color: var(--pst-color-primary); }
+.pypi-packages button[aria-pressed="false"] { opacity: .6; }
+.pypi-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .7rem; }
+.pypi-metrics > div { padding: .8rem 1rem; border: 1px solid var(--pst-color-border); border-radius: .45rem; }
+.pypi-metrics span, .pypi-metrics small { display: block; color: var(--pst-color-text-muted); font-size: .75rem; }
+.pypi-metrics strong { display: block; font-size: 1.6rem; font-weight: 600; margin: .3rem 0; font-variant-numeric: tabular-nums; }
+.pypi-metrics small { font-size: .65rem; }
+.pypi-chart-heading { display: flex; justify-content: space-between; gap: .8rem; flex-wrap: wrap; align-items: baseline; margin-top: 1.5rem; }
+.pypi-chart-heading strong { font-size: .95rem; }
+.pypi-chart-heading span { font-size: .7rem; color: var(--pst-color-text-muted); }
+.pypi-chart svg { width: 100%; height: auto; display: block; }
+.pypi-chart svg text { font: 11px sans-serif; fill: var(--pst-color-text-muted); }
+.pypi-grid { stroke: var(--pst-color-border); stroke-width: 1; stroke-dasharray: 3 4; }
+.pypi-point { opacity: .2; }
+.pypi-point:hover, .pypi-point:focus { opacity: 1; r: 5; outline: none; }
+.pypi-legend { display: flex; flex-wrap: wrap; gap: .8rem; font-size: .7rem; color: var(--pst-color-text-muted); }
+.pypi-legend span { display: flex; align-items: center; gap: .3rem; }
+.pypi-legend i { width: .4rem; height: .4rem; border-radius: 50%; }
+.pypi-table { overflow-x: auto; margin-top: 1rem; }
+.pypi-table table { width: 100%; border-collapse: collapse; font-size: .78rem; }
+.pypi-table th, .pypi-table td { padding: .55rem .65rem; border-bottom: 1px solid var(--pst-color-border); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.pypi-table th:first-child { text-align: left; }
+.pypi-table thead th { color: var(--pst-color-text-muted); font-size: .7rem; font-weight: 500; }
+.pypi-table tbody th { font-weight: 500; }
+.pypi-environment { border-top: 1px solid var(--pst-color-border); padding-top: .8rem; margin-top: 1.3rem; }
+.pypi-environment summary { cursor: pointer; font-size: .85rem; font-weight: 600; }
+.pypi-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; margin-top: 1rem; }
+.pypi-columns h2 { font-size: .9rem; margin: 0 0 .6rem; }
+.pypi-bar { margin: .8rem 0; }
+.pypi-bar > span { display: flex; justify-content: space-between; gap: .5rem; font-size: .7rem; }
+.pypi-bar meter { width: 100%; height: .5rem; display: block; margin-top: .25rem; accent-color: var(--pst-color-primary); }
+.pypi-downloads .pypi-warning { font-size: .8rem; border-left: 3px solid var(--pst-color-warning); padding: .5rem .8rem; }
+@media (max-width: 600px) {
+  .pypi-metrics { gap: .4rem; }
+  .pypi-metrics > div { padding: .65rem .5rem; }
+  .pypi-metrics strong { font-size: 1.25rem; }
+  .pypi-metrics span { font-size: .65rem; }
+  .pypi-columns { grid-template-columns: 1fr; gap: 1rem; }
+  .pypi-controls { gap: .5rem; }
+}

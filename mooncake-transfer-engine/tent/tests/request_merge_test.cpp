@@ -1,7 +1,6 @@
 #include <array>
 #include <cstdint>
 #include <limits>
-#include <map>
 #include <optional>
 #include <vector>
 
@@ -29,7 +28,7 @@ struct RequestBoundaryInfo {
 
 struct MergeResult {
     std::vector<Request> request_list;
-    std::map<size_t, size_t> task_lookup;
+    std::vector<size_t> task_lookup;
 };
 
 MergeResult mergeRequests(const std::vector<Request>& requests,
@@ -186,7 +185,7 @@ TEST(RequestMergeTest, KeepsDifferentSelectionAttributesSplit) {
         const char* name;
         void (*set_different)(Request&, Request&);
     };
-    const std::array<AttributeCase, 3> cases = {{
+    const std::array<AttributeCase, 4> cases = {{
         {"priority",
          [](Request& first, Request& second) {
              first.priority = PRIO_HIGH;
@@ -201,6 +200,11 @@ TEST(RequestMergeTest, KeepsDifferentSelectionAttributesSplit) {
          [](Request& first, Request& second) {
              first.intent_type = IntentType::FOREGROUND_GET;
              second.intent_type = IntentType::MIGRATION;
+         }},
+        {"producer_event",
+         [](Request& first, Request& second) {
+             first.producer_event = reinterpret_cast<void*>(uintptr_t{1});
+             second.producer_event = reinterpret_cast<void*>(uintptr_t{2});
          }},
     }};
 
@@ -237,6 +241,7 @@ TEST(RequestMergeTest, MergesMatchingSelectionAttributes) {
         request.priority = PRIO_LOW;
         request.policy_name = "background";
         request.intent_type = IntentType::MIGRATION;
+        request.producer_event = reinterpret_cast<void*>(uintptr_t{1});
     }
     std::vector<RequestBoundaryInfo> boundaries = {
         {makeBufferKey(source_addr, source.size()), makeBufferKey(4096, 2048)},
@@ -247,6 +252,8 @@ TEST(RequestMergeTest, MergesMatchingSelectionAttributes) {
 
     ASSERT_EQ(merged.request_list.size(), 1u);
     EXPECT_EQ(merged.request_list[0].length, 2048u);
+    EXPECT_EQ(merged.request_list[0].producer_event,
+              reinterpret_cast<void*>(uintptr_t{1}));
     EXPECT_EQ(merged.task_lookup.at(0), merged.task_lookup.at(1));
 }
 
@@ -290,6 +297,58 @@ TEST(RequestMergeTest, MixedHintBatchStillMergesPerHint) {
     EXPECT_EQ(merged.task_lookup.at(0), merged.task_lookup.at(2));
     EXPECT_EQ(merged.task_lookup.at(1), merged.task_lookup.at(3));
     EXPECT_NE(merged.task_lookup.at(0), merged.task_lookup.at(1));
+}
+
+TEST(RequestMergeTest, EmptyInputHasNoTaskMapping) {
+    for (bool merge : {false, true}) {
+        auto result = mergeRequests({}, {}, merge);
+        EXPECT_TRUE(result.request_list.empty());
+        EXPECT_TRUE(result.task_lookup.empty());
+    }
+}
+
+TEST(RequestMergeTest, PassThroughKeepsOriginalOrder) {
+    std::array<char, 1024> source{};
+    std::vector<Request> requests = {
+        makeWriteRequest(source.data(), 512, 8192, 32),
+        makeWriteRequest(source.data(), 0, 4096, 16),
+        makeWriteRequest(source.data(), 16, 4112, 48),
+    };
+    // Both explicitly disabled merging and missing boundaries take the
+    // pass-through path, even when some requests could otherwise merge.
+    for (bool merge : {false, true}) {
+        auto result = mergeRequests(requests, {}, merge);
+        ASSERT_EQ(result.task_lookup.size(), requests.size());
+        ASSERT_EQ(result.request_list.size(), requests.size());
+        for (size_t i = 0; i < requests.size(); ++i) {
+            EXPECT_EQ(result.task_lookup.at(i), i);
+            EXPECT_EQ(result.request_list[i].source, requests[i].source);
+            EXPECT_EQ(result.request_list[i].length, requests[i].length);
+        }
+    }
+}
+
+TEST(RequestMergeTest, ShuffledRequestsMapBackToOriginalIndices) {
+    std::array<char, 1024> source{};
+    std::vector<Request> requests = {
+        makeWriteRequest(source.data(), 160, 4256, 16),
+        makeWriteRequest(source.data(), 0, 4096, 16),
+        makeWriteRequest(source.data(), 128, 4224, 32),
+        makeWriteRequest(source.data(), 16, 4112, 48),
+    };
+    std::vector<RequestBoundaryInfo> boundaries(
+        requests.size(),
+        {makeBufferKey(reinterpret_cast<uintptr_t>(source.data()),
+                       source.size()),
+         makeBufferKey(4096, source.size())});
+    auto result = mergeRequests(requests, boundaries, true);
+    ASSERT_EQ(result.request_list.size(), 2u);
+    EXPECT_EQ(result.request_list[0].length, 64u);
+    EXPECT_EQ(result.request_list[1].length, 48u);
+    ASSERT_EQ(result.task_lookup.size(), requests.size());
+    const std::array<size_t, 4> owners{1, 0, 1, 0};
+    for (size_t i = 0; i < owners.size(); ++i)
+        EXPECT_EQ(result.task_lookup.at(i), owners[i]);
 }
 
 }  // namespace

@@ -20,21 +20,33 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
 #include "memory_location.h"
 #include "multi_transport.h"
+#include "task_congestion_status.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {
 class ShutdownToken;
 class TransferEngineImpl;
+class BatchSubmitExecutor;
 namespace tent {
+class Config;
 class TransferEngine;
-};
+};  // namespace tent
+
+namespace transfer_intent_values {
+inline constexpr int kUnspecified = 0;
+inline constexpr int kForegroundGet = 1;
+inline constexpr int kBackgroundPrefetch = 2;
+inline constexpr int kMigration = 3;
+}  // namespace transfer_intent_values
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
 namespace device {
@@ -57,6 +69,12 @@ const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 using BufferEntry = Transport::BufferEntry;
 using NicLoadStats = Transport::NicLoadStats;
 
+struct SegmentBufferInfo {
+    uint64_t addr;
+    uint64_t length;
+    std::string location;
+};
+
 enum class PeerLiveness : uint8_t {
     Alive = 0,
     Unreachable = 1,
@@ -64,6 +82,10 @@ enum class PeerLiveness : uint8_t {
 
 struct AutoDiscoverConfig {
     bool enabled = false;
+    // Transport hint, read whether or not auto-discovery is enabled: "efa"
+    // selects EFA, and on an Ascend Direct build the hint decides between
+    // Ascend Direct and the host transports. Written by setAutoDiscover(), or
+    // by the protocol argument of init() when that is not empty.
     std::string protocol;
 };
 
@@ -120,8 +142,26 @@ class TransferEngine {
     int getRpcPort();
 
     bool isUsingTent() const { return use_tent_; }
+    // Expose the internal TENT engine so callers (Store, TransferSubmitter)
+    // can call tent::TransferEngine native API directly, bypassing the
+    // compat-layer type conversion. Returns nullptr when not in TENT mode.
+    std::shared_ptr<mooncake::tent::TransferEngine> getTentEngine() const {
+        return use_tent_ ? impl_tent_ : nullptr;
+    }
+
+    // Configuration of the successfully initialized engine, for clients that
+    // reuse it without repeating the metadata connection string.
+    const std::string& getMetadataConnectionString() const {
+        return metadata_conn_string_;
+    }
 
     SegmentHandle openSegment(const std::string& segment_name);
+
+    // Replace buffers with a snapshot of the segment's memory buffers.
+    // Return 0 on success (including an empty segment), or a negative ERR_*.
+    // On error, buffers is empty. Does not close the segment handle.
+    int getSegmentBuffers(SegmentHandle handle,
+                          std::vector<SegmentBufferInfo>& buffers);
 
     Status CheckSegmentStatus(SegmentID sid);
 
@@ -129,16 +169,39 @@ class TransferEngine {
 
     int removeLocalSegment(const std::string& segment_name);
 
+    // Do not call concurrently with memory registration.
+    int enableMemoryRegistrationReuse();
+
+    // Register [addr, addr + length) for local and (when remote_accessible)
+    // remote RDMA access.
+    //
+    // HugeTLB sub-views: RDMA transports that madvise the registered range
+    // (RDMA transports call ibv_fork_init, whose MADV_DONTFORK the kernel
+    // refuses to apply to a hugetlb VMA split inside a huge page) first try
+    // the range as given. Only if that is rejected with EINVAL is the
+    // registration retried over the enclosing huge pages. The resulting MR —
+    // and the rkey/lkey handed to peers — therefore covers whole huge pages,
+    // including padding outside [addr, addr + length). Access rights are
+    // per-MR, not per-range: a peer that holds the key can address that
+    // padding, which may contain application data that was never registered.
+    // The published description advertises only the requested range, but that
+    // is a cooperative boundary, not an enforced one. A caller unwilling to
+    // expose neighbouring bytes must register the whole hugepage-aligned
+    // mapping itself (whose sub-ranges it then owns exclusively) rather than
+    // passing a sub-view.
     int registerLocalMemory(void* addr, size_t length,
                             const std::string& location = kWildcardLocation,
                             bool remote_accessible = true,
                             bool update_metadata = true);
 
-    // Allocate POSIX shm that ShmTransport can export to same-host peers.
+    // Allocate shared memory that ShmTransport can export to same-host peers.
     // Requires ShmTransport (MC_FORCE_SHM=1 or installTransport("shm")).
     // Caller must registerLocalMemory before remote access. Returns nullptr
-    // on failure.
+    // on failure. Default: POSIX /dev/shm. With
+    // SharedMemoryOptions.use_hugepage and hugepage_size 2MB/512MB/1GB:
+    // matching hugetlbfs (no silent tmpfs fallback).
     void* allocateSharedMemory(size_t length);
+    void* allocateSharedMemory(size_t length, const SharedMemoryOptions& opt);
 
     int freeSharedMemory(void* addr);
 
@@ -146,6 +209,27 @@ class TransferEngine {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries);
+
+    using SubBatchRequestBuilder =
+        std::function<std::vector<TransferRequest>(size_t begin, size_t end)>;
+
+    struct ParallelBatchTransferFailureInfo {
+        // At least one engine submit API returned an error.
+        bool submit_failed = false;
+        // Only native FAILED/TIMEOUT errors, without parent expiry/shutdown.
+        bool retryable = false;
+    };
+
+    // Opt-in synchronous path for independent ranges to one peer.
+    // nullopt means disabled, below threshold, or unsupported before publish.
+    // The builder runs once per sub-batch and must return the requested range
+    // as valid READ/WRITE requests to peer, preserving every request field.
+    // The caller must ensure that all requests can execute independently;
+    // these preconditions are not checked by scanning the built requests.
+    std::optional<Status> tryParallelBatchTransfer(
+        SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
+        std::chrono::nanoseconds timeout,
+        ParallelBatchTransferFailureInfo* failure_info = nullptr);
 
     struct ScatterTransferRange {
         TransferRequest::OpCode opcode;
@@ -158,6 +242,7 @@ class TransferEngine {
         std::span<const size_t> remote_offsets;
         std::span<const size_t> lengths;
         std::function<void(size_t, const Status&)> on_fragment_complete;
+        int intent_type = 0;
     };
 
     class ScatterTransferOperation {
@@ -188,6 +273,10 @@ class TransferEngine {
         friend class TransferEngine;
     };
 
+    // Under TENT, scatter pins a direct transport route that supports
+    // post-submit cancellation. Non-cancellable and staged routes are
+    // rejected before transport work is published; runtime queue admission
+    // and automatic failover are not used for this operation.
     ScatterTransferOperation submitScatter(
         const std::vector<ScatterTransferRange>& ranges);
     Status transferScatter(const std::vector<ScatterTransferRange>& ranges);
@@ -223,10 +312,14 @@ class TransferEngine {
 
     BatchID allocateBatchID(size_t batch_size);
 
+    // An OK or BatchCleanupDeferred return invalidates batch_id. A deferred
+    // cleanup means in-flight transport work may still own transfer buffers.
     Status freeBatchID(BatchID batch_id);
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
 
+    // RDMA success means queued on the notification QP, not remote delivery.
+    // Completion errors are processed asynchronously; TCP fallback is sync.
     int sendNotifyByID(SegmentID target_id,
                        TransferMetadata::NotifyDesc notify_msg);
 
@@ -238,7 +331,39 @@ class TransferEngine {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status);
 
+    Status getTaskCongestionState(BatchID batch_id, size_t task_id,
+                                  TaskCongestionState& state) const;
+
+    Status getTaskCongestionDetail(BatchID batch_id, size_t task_id,
+                                   TaskCongestionDetail& detail) const;
+
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
+
+    // Engine-owned counter-mode eventfd for batch completion. -1 on
+    // non-Linux, when eventfd() failed, or when this engine is the TENT
+    // runtime. The caller may dup the fd. Destroying the engine closes
+    // the original.
+    //
+    // A non-negative fd means the engine has a notification facility. It
+    // does not mean a particular batch can finish without polling. Call
+    // enableBatchCompletionNotification after allocateBatchID and before
+    // the single submitTransfer. Only that opted-in, counter-capable path
+    // writes the fd. See RFC #5164. Timeout still requires
+    // getTransferStatus; an application deadline ends the wait only.
+    int completionFd() const;
+
+    // Opt in before the first submitTransfer. Fails when the facility is
+    // unavailable, when slice timeouts require foreground polling, or when
+    // the batch already has submitted tasks. A second submitTransfer on an
+    // event-enabled batch is rejected.
+    Status enableBatchCompletionNotification(BatchID batch_id);
+
+    // Non-blocking drain of terminal batches. See BatchCompletion.
+    // Does not free batch handles and does not send peer notify.
+    // One caller at a time. Concurrent calls race the queue tail and
+    // split one wake. CompletionNotificationUnsupported when
+    // completionFd() is -1.
+    Status drainCompletions(std::vector<BatchCompletion>& out);
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
@@ -293,10 +418,31 @@ class TransferEngine {
     void enableGracefulShutdown();
     std::string showLinks(bool json = false) const;
 
+    bool supportsParallelBatchSubmit(SegmentID peer) const;
+
+    bool isBatchSubmitEligible(size_t count) const;
+
    private:
+    struct TESubBatchAdapter;
+
+    Status submitScatterTransfer(BatchID batch_id,
+                                 const std::vector<TransferRequest>& entries);
+
+    std::shared_ptr<mooncake::tent::Config> buildTentConfig(
+        const std::string& metadata_conn_string,
+        const std::string& local_server_name) const;
+
     std::shared_ptr<TransferEngineImpl> impl_;
+    std::shared_ptr<BatchSubmitExecutor> batch_submit_executor_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
+    std::unique_ptr<Transport> tent_compat_transport_;
+    std::mutex tent_compat_transport_mutex_;
+    std::once_flag tent_compat_log_once_;
     std::shared_ptr<ShutdownToken> shutdown_token_;
+    // Classic callers provide this through TransferEngine(auto_discover,
+    // filter) before init() creates the native TENT engine.
+    std::vector<std::string> tent_device_filter_;
+    std::string metadata_conn_string_;
     bool use_tent_{false};
     friend class TransferEngineImplTestPeer;
 };

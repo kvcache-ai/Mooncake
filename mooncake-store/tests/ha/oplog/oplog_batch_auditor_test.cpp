@@ -19,6 +19,10 @@ namespace {
 
 class RangeBackend : public HaKvBackend {
    public:
+    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     explicit RangeBackend(std::vector<KvPair> values)
         : values_(std::move(values)) {}
 

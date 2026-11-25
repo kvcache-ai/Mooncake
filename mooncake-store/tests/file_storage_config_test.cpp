@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 
+#include "config.h"
 #include "storage_backend.h"
 
 namespace mooncake {
@@ -118,6 +119,40 @@ TEST_F(FileStorageConfigTest, DefaultValuesWhenNoEnvSet) {
     ExpectDefaultFileStorageConfig(config);
 }
 
+TEST_F(FileStorageConfigTest, FabricMemRoundsDefaultLocalBufferUpToOneGiB) {
+    auto& fabric = globalConfig().ascend_use_fabric_mem;
+    const bool previous = fabric;
+    fabric = true;
+    const auto config = FileStorageConfig::FromEnvironment();
+    fabric = previous;
+
+    // The ordinary default is 1280 MiB. The next 1GiB boundary is 2 GiB.
+    EXPECT_EQ(config.local_buffer_size, int64_t{2} * 1024 * 1024 * 1024);
+    EXPECT_EQ(config.local_buffer_size % (1024 * 1024 * 1024), 0);
+}
+
+TEST_F(FileStorageConfigTest, FabricMemKeepsAlignedLocalBuffer) {
+    auto& fabric = globalConfig().ascend_use_fabric_mem;
+    const bool previous = fabric;
+    fabric = true;
+    env.local_buffer_size.Set("1073741824");
+    const auto config = FileStorageConfig::FromEnvironment();
+    fabric = previous;
+
+    EXPECT_EQ(config.local_buffer_size, 1073741824);
+}
+
+TEST_F(FileStorageConfigTest, FabricMemRoundsUnalignedLocalBufferUp) {
+    auto& fabric = globalConfig().ascend_use_fabric_mem;
+    const bool previous = fabric;
+    fabric = true;
+    env.local_buffer_size.Set("1342177280");
+    const auto config = FileStorageConfig::FromEnvironment();
+    fabric = previous;
+
+    EXPECT_EQ(config.local_buffer_size, int64_t{2} * 1024 * 1024 * 1024);
+}
+
 TEST_F(FileStorageConfigTest, ReadsValidValues) {
     env.storage_backend_descriptor.Set("distributed_storage_backend");
     env.storage_path.Set("/tmp/storage");
@@ -136,7 +171,7 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
 
     const auto config = FileStorageConfig::FromEnvironment();
     EXPECT_EQ(config.storage_backend_type, StorageBackendType::kDistributed);
-    EXPECT_TRUE(config.enable_dfs);
+    EXPECT_FALSE(config.enable_dfs);
     EXPECT_EQ(config.storage_filepath, "/tmp/storage");
     EXPECT_EQ(config.local_buffer_size, 2147483648);
     EXPECT_EQ(config.pinned_restore_arena_size, 64 * 1024 * 1024);

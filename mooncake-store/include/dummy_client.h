@@ -71,6 +71,15 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const QueryResultCache *query_result_cache = nullptr) override;
 
+    std::vector<std::vector<std::vector<int64_t>>>
+    get_into_ranges_from_snapshot(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache &query_result_cache) override;
+
     std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
         const std::vector<std::string> &keys) override;
 
@@ -85,7 +94,7 @@ class DummyClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool prefer_alloc_in_same_node);
 
     int put_from(const std::string &key, void *buffer, size_t size,
                  const ReplicateConfig &config = ReplicateConfig{});
@@ -172,7 +181,18 @@ class DummyClient : public PyClient {
 
     int isExist(const std::string &key);
 
+    // Forward prefetch options to the real client using additive RPCs;
+    // older servers fall back to the legacy existence checks.
+    int isExist(const std::string &key, const ExistOptions &options) override;
+    std::vector<int> batchIsExist(const std::vector<std::string> &keys,
+                                  const ExistOptions &options) override;
+
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
+
+    int probeKey(const std::string &key);
+
+    std::vector<int> batchProbeKey(const std::vector<std::string> &keys,
+                                   const GrantLeasePolicy &policy = {});
 
     int64_t getSize(const std::string &key);
 
@@ -197,11 +217,32 @@ class DummyClient : public PyClient {
                                                    const std::string &source,
                                                    const std::string &target);
 
+    tl::expected<UUID, ErrorCode> create_drain_job(
+        const CreateDrainJobRequest &request) override;
+
+    tl::expected<UUID, ErrorCode> create_timed_drain_job(
+        const CreateDrainJobRequest &request, uint64_t timeout_ms) override;
+
+    tl::expected<QueryJobResponse, ErrorCode> query_drain_job(
+        const UUID &job_id) override;
+
+    tl::expected<void, ErrorCode> cancel_drain_job(const UUID &job_id) override;
+
+    tl::expected<ListDrainJobsResponse, ErrorCode> list_drain_jobs(
+        const DrainJobListRequest &request) override;
+
+    tl::expected<ListTasksResponse, ErrorCode> list_tasks(
+        const TaskListRequest &request) override;
+
+    tl::expected<void, ErrorCode> cancel_task(const UUID &task_id) override;
+
     tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
 
     std::optional<BufferHandle> allocate_client_buffer(size_t size) override;
 
    private:
+    friend class DummyClientTeardownTestPeer;
+
     struct PreparedBuffer {
         void *original = nullptr;
         void *dummy = nullptr;

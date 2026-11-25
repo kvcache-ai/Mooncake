@@ -18,6 +18,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "task_congestion_status_c.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif  // __cplusplus
@@ -27,6 +29,7 @@ extern "C" {
 #define batch_id_t uint64_t
 #define LOCAL_SEGMENT (0)
 #define INVALID_BATCH UINT64_MAX
+#define BATCH_CLEANUP_DEFERRED (5)
 
 #define OPCODE_READ (0)
 #define OPCODE_WRITE (1)
@@ -161,6 +164,36 @@ int genNotifyInEngine(transfer_engine_t engine, uint64_t target_id,
 int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
                       size_t task_id, struct transfer_status *status);
 
+int getTaskCongestionState(transfer_engine_t engine, batch_id_t batch_id,
+                           size_t task_id, int *state);
+
+// The required path length includes the NUL byte when a path was observed;
+// otherwise it is zero. Call with path_buf=NULL and path_capacity=0 to size
+// the buffer, then retry with at least the reported capacity. A short buffer
+// returns an argument error without truncating the path.
+int getTaskCongestionDetail(transfer_engine_t engine, batch_id_t batch_id,
+                            size_t task_id, task_congestion_detail_t *detail,
+                            char *path_buf, size_t path_capacity,
+                            size_t *required_path_length);
+
+/*
+ * Aggregate status of the whole batch in one call, instead of one
+ * getTransferStatus() per task. On the classic engine, while an RDMA-only
+ * batch is in flight (and MC_SLICE_TIMEOUT is unset), this does not walk the
+ * task list and reports transferred_bytes as 0; the real total is filled in
+ * once the batch is COMPLETED. The call that observes COMPLETED may send the
+ * batch's pending notification synchronously. FAILED can be reported while
+ * other tasks are still in flight. It does not wait. *status is written only
+ * when 0 is returned.
+ */
+int getBatchTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
+                           struct transfer_status *status);
+
+/*
+ * Returns 0 when cleanup completes immediately, or BATCH_CLEANUP_DEFERRED when
+ * cleanup ownership is accepted but physical cleanup must wait. Both results
+ * invalidate batch_id; the caller must not use it again.
+ */
 int freeBatchID(transfer_engine_t engine, batch_id_t batch_id);
 
 int syncSegmentCache(transfer_engine_t engine);

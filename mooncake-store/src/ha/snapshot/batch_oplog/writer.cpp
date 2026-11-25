@@ -11,6 +11,8 @@
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "hot_standby_service.h"
 
+#include "ha_metric_manager.h"
+
 namespace mooncake {
 
 namespace {
@@ -54,6 +56,8 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     HotStandbyService& standby, BatchOpLogSnapshotCapture& capture,
     const std::string& snapshot_root, const std::string& snapshot_id,
     size_t chunk_object_count, int64_t created_at_ms) {
+    HAMetricManager::SnapshotOperationTimer metric_timer(
+        HAMetricManager::SnapshotOperation::Upload);
     bool capture_active = true;
     bool candidate_touched = false;
     const std::string prefix =
@@ -99,6 +103,17 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     }
 
     ha::BatchOpLogSnapshotManifest manifest;
+    const bool has_weight_state =
+        capture.weight_metadata != WeightMetadataSnapshot{} ||
+        capture.object_storage.target.has_value();
+    if (has_weight_state) {
+        manifest.schema_version = ha::kBatchOpLogWeightSnapshotSchemaVersion;
+        manifest.snapshot_format = ha::kBatchOpLogWeightSnapshotFormat;
+    }
+    if (capture.object_storage.target) {
+        manifest.schema_version = ha::kBatchOpLogObjectSnapshotSchemaVersion;
+        manifest.snapshot_format = ha::kBatchOpLogObjectSnapshotFormat;
+    }
     manifest.snapshot_id = snapshot_id;
     manifest.last_included_seq = capture.last_included_seq;
     manifest.last_included_batch_id = capture.last_included_batch_id;
@@ -119,6 +134,39 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     }
     std::vector<uint8_t>().swap(segments);
 
+    if (has_weight_state) {
+        const std::string weights_key =
+            ha::BuildBatchOpLogSnapshotWeightMetadataKey(snapshot_root,
+                                                         snapshot_id);
+        auto weights =
+            EncodeBatchOpLogSnapshotWeightMetadata(capture.weight_metadata);
+        manifest.weight_metadata = ha::BatchOpLogSnapshotObjectDescriptor{
+            .key = weights_key,
+            .stored_size = weights.size(),
+            .crc32c = Crc32cValue(weights.data(), weights.size()),
+        };
+        upload = object_store_.UploadBuffer(weights_key, weights);
+        if (!upload) {
+            return fail("Failed to upload snapshot weight metadata: " +
+                        upload.error());
+        }
+        std::vector<uint8_t>().swap(weights);
+    }
+
+    if (capture.object_storage.target) {
+        auto bytes = struct_pack::serialize<std::vector<uint8_t>>(
+            capture.object_storage);
+        const auto key = ha::BuildBatchOpLogSnapshotObjectStorageKey(
+            snapshot_root, snapshot_id);
+        manifest.object_storage = ha::BatchOpLogSnapshotObjectDescriptor{
+            .key = key,
+            .stored_size = bytes.size(),
+            .crc32c = Crc32cValue(bytes.data(), bytes.size())};
+        upload = object_store_.UploadBuffer(key, bytes);
+        if (!upload)
+            return fail("Failed to upload object storage state: " +
+                        upload.error());
+    }
     uint64_t chunk_index = 0;
     while (!capture.done()) {
         std::vector<StandbyObjectEntry> objects;
@@ -158,6 +206,20 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     if (!verify) {
         return fail(std::move(verify.error()));
     }
+    if (manifest.object_storage) {
+        const auto& objects = *manifest.object_storage;
+        verify = VerifyObject(object_store_, objects.key, objects.stored_size,
+                              objects.crc32c);
+        if (!verify) return fail(std::move(verify.error()));
+    }
+    if (manifest.weight_metadata) {
+        verify = VerifyObject(object_store_, manifest.weight_metadata->key,
+                              manifest.weight_metadata->stored_size,
+                              manifest.weight_metadata->crc32c);
+        if (!verify) {
+            return fail(std::move(verify.error()));
+        }
+    }
     for (const auto& chunk : manifest.object_chunks) {
         verify = VerifyObject(object_store_, chunk.key, chunk.stored_size,
                               chunk.crc32c);
@@ -183,6 +245,8 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     }
 
     ha::BatchOpLogSnapshotDescriptor descriptor;
+    descriptor.schema_version = manifest.schema_version;
+    descriptor.snapshot_format = manifest.snapshot_format;
     descriptor.snapshot_id = snapshot_id;
     descriptor.last_included_seq = capture.last_included_seq;
     descriptor.last_included_batch_id = capture.last_included_batch_id;
@@ -206,7 +270,21 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     if (!verify) {
         return fail(std::move(verify.error()));
     }
-    return descriptor_json;
+    uint64_t chunk_bytes = 0;
+    for (const auto& chunk : manifest.object_chunks)
+        chunk_bytes += chunk.stored_size;
+    HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+        metrics.chunk_count = manifest.object_chunks.size();
+        metrics.chunk_bytes = chunk_bytes;
+        metrics.snapshot_bytes =
+            metrics.chunk_bytes + manifest.segments.stored_size +
+            (manifest.weight_metadata ? manifest.weight_metadata->stored_size
+                                      : 0) +
+            (manifest.object_storage ? manifest.object_storage->stored_size
+                                     : 0) +
+            manifest_json.size() + descriptor_json.size();
+    });
+    return metric_timer.Success(descriptor_json);
 }
 
 }  // namespace mooncake

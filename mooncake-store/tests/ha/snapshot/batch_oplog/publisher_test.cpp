@@ -21,6 +21,10 @@ namespace {
 
 class FakeBackend final : public HaKvBackend {
    public:
+    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     ErrorCode Get(std::string_view key, std::string& value) override {
         auto it = values.find(std::string(key));
         if (it == values.end()) return ErrorCode::ETCD_KEY_NOT_EXIST;
@@ -126,6 +130,22 @@ TEST(BatchOpLogSnapshotPublisherTest, PublishesAndRotatesPointersAtomically) {
     EXPECT_EQ(
         first,
         backend.values[ha::BuildBatchOpLogSnapshotFallbackKey("cluster")]);
+}
+
+TEST(BatchOpLogSnapshotPublisherTest, CapturesPublishedFallbackState) {
+    FakeBackend backend;
+    auto lease = SnapshotMaintenanceLease::MakeForTesting("cluster", "101");
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(ha::BuildBatchOpLogSnapshotMaintenanceKey("cluster"),
+                          "101"));
+    BatchOpLogSnapshotPublisher publisher(backend, "cluster");
+    std::optional<std::string> fallback;
+    const auto first = MakeDescriptor(1);
+    ASSERT_EQ(ErrorCode::OK, publisher.Publish(*lease, first, &fallback));
+    EXPECT_FALSE(fallback.has_value());
+    const auto second = MakeDescriptor(2);
+    ASSERT_EQ(ErrorCode::OK, publisher.Publish(*lease, second, &fallback));
+    EXPECT_EQ(first, fallback.value());
 }
 
 TEST(BatchOpLogSnapshotPublisherTest,

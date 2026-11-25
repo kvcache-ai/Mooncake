@@ -1,4 +1,5 @@
 #include "ha_metric_manager.h"
+#include "standby_state_machine.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -49,6 +50,99 @@ class HAMetricManagerTest : public ::testing::Test {
 
     HAMetricManager& M() { return HAMetricManager::instance(); }
 };
+
+TEST_F(HAMetricManagerTest,
+       SnapshotActivityFollowsStandbyLifecycleWithoutDroppingCounters) {
+    M().reset_snapshot_runtime(true);
+    using Operation = HAMetricManager::SnapshotOperation;
+    for (const auto state :
+         {StandbyState::CONNECTING, StandbyState::WATCHING,
+          StandbyState::PROMOTING, StandbyState::PROMOTED, StandbyState::FAILED,
+          StandbyState::STOPPED, StandbyState::CONNECTING}) {
+        M().set_standby_state(static_cast<int64_t>(state));
+        const bool active = state == StandbyState::CONNECTING ||
+                            state == StandbyState::WATCHING;
+        EXPECT_EQ(active ? 1 : 0,
+                  FindSerializedMetricValue(M().serialize_metrics(),
+                                            "ha_snapshot_active"));
+        const auto before =
+            M().get_snapshot_operation(Operation::Publish).total;
+        M().record_snapshot_operation(Operation::Publish, 0,
+                                      std::chrono::steady_clock::now());
+        EXPECT_EQ(before + 1,
+                  M().get_snapshot_operation(Operation::Publish).total);
+    }
+    M().reset_snapshot_runtime(false);
+    EXPECT_EQ(0, FindSerializedMetricValue(M().serialize_metrics(),
+                                           "ha_snapshot_active"));
+    M().set_standby_state(static_cast<int64_t>(StandbyState::STOPPED));
+}
+
+TEST_F(HAMetricManagerTest, SnapshotMetricsResetGaugesAndKeepCounters) {
+    using Operation = HAMetricManager::SnapshotOperation;
+    using Skip = HAMetricManager::SnapshotSkipReason;
+    M().reset_snapshot_runtime(true);
+    const auto before = M().get_snapshot_operation(Operation::Publish);
+    M().update_snapshot_runtime([](auto& metrics) {
+        metrics.latest_created_at_ms = 0;  // Epoch zero is a valid timestamp.
+        metrics.fallback_created_at_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count() +
+            60000;
+        metrics.durable_batch = 7;
+        metrics.compaction_floor = 3;
+    });
+    M().record_snapshot_skip(Skip::LeaseBusy);
+    {
+        HAMetricManager::SnapshotOperationTimer timer(Operation::Publish);
+        timer.Success(0);
+    }
+    try {
+        HAMetricManager::SnapshotOperationTimer timer(Operation::Publish);
+        throw 1;
+    } catch (int) {
+    }
+    const auto after = M().get_snapshot_operation(Operation::Publish);
+    EXPECT_EQ(before.total + 2, after.total);
+    EXPECT_EQ(before.errors + 1, after.errors);
+    const auto upload_before = M().get_snapshot_operation(Operation::Upload);
+    M().record_snapshot_operation(
+        Operation::Upload, 0,
+        std::chrono::steady_clock::now() - std::chrono::seconds(2));
+    EXPECT_GE(M().get_snapshot_operation(Operation::Upload).elapsed_us -
+                  upload_before.elapsed_us,
+              2000000u);
+    auto text = M().serialize_metrics();
+    EXPECT_EQ(2, FindSerializedMetricValue(text, "ha_snapshot_count"));
+    EXPECT_EQ(1, FindSerializedMetricValue(text, "ha_snapshot_latest_present"));
+    EXPECT_GT(
+        *FindSerializedMetricValue(text, "ha_snapshot_latest_age_seconds"), 0);
+    EXPECT_EQ(
+        0, FindSerializedMetricValue(text, "ha_snapshot_fallback_age_seconds"));
+    EXPECT_EQ(
+        4, FindSerializedMetricValue(text, "ha_snapshot_uncompacted_batches"));
+    EXPECT_EQ(1, FindSerializedMetricValue(
+                     text, "ha_snapshot_skip_reason{reason=\"lease_busy\"}"));
+    M().reset_snapshot_runtime(false);
+    M().update_snapshot_runtime(
+        [](auto& metrics) { metrics.snapshot_bytes = 100; });
+    M().record_snapshot_operation(Operation::Publish, 0,
+                                  std::chrono::steady_clock::now());
+    EXPECT_EQ(after.total,
+              M().get_snapshot_operation(Operation::Publish).total);
+    text = M().serialize_metrics();
+    EXPECT_EQ(0, FindSerializedMetricValue(text, "ha_snapshot_enabled"));
+    EXPECT_EQ(0, FindSerializedMetricValue(text, "ha_snapshot_bytes"));
+    EXPECT_EQ(0, FindSerializedMetricValue(text, "ha_snapshot_count"));
+    EXPECT_EQ(1, FindSerializedMetricValue(
+                     text, "ha_snapshot_skip_reason{reason=\"disabled\"}"));
+    M().reset_snapshot_runtime(true);
+    M().update_snapshot_runtime(
+        [](auto& metrics) { metrics.compaction_floor = 100; });
+    EXPECT_EQ(0, FindSerializedMetricValue(M().serialize_metrics(),
+                                           "ha_snapshot_uncompacted_batches"));
+}
 
 // ========== 7.1.1 Metric update tests ==========
 
@@ -211,8 +305,49 @@ TEST_F(HAMetricManagerTest, TestBatchRecordMetrics) {
         EXPECT_NE(std::string::npos, text.find(name)) << name;
     }
 }
+
+TEST_F(HAMetricManagerTest, BatchRecordPhaseLatenciesIncludeZeroSamples) {
+    const struct {
+        const char* name;
+        void (HAMetricManager::*observe)(int64_t);
+    } metrics[] = {
+        {"ha_batch_record_encode_latency_us",
+         &HAMetricManager::observe_batch_record_encode_latency_us},
+        {"ha_batch_record_decode_latency_us",
+         &HAMetricManager::observe_batch_record_decode_latency_us},
+        {"ha_batch_record_backend_txn_latency_us",
+         &HAMetricManager::observe_batch_record_backend_txn_latency_us},
+    };
+    for (const auto& metric : metrics) {
+        SCOPED_TRACE(metric.name);
+        const std::string count_name = std::string(metric.name) + "_count";
+        const std::string sum_name = std::string(metric.name) + "_sum";
+        const auto before = M().serialize_metrics();
+        const auto count_before =
+            FindSerializedMetricValue(before, count_name).value_or(0);
+        const auto sum_before =
+            FindSerializedMetricValue(before, sum_name).value_or(0);
+
+        (M().*metric.observe)(0);
+        const auto after_zero = M().serialize_metrics();
+        EXPECT_EQ(count_before + 1,
+                  FindSerializedMetricValue(after_zero, count_name));
+        EXPECT_EQ(sum_before, FindSerializedMetricValue(after_zero, sum_name));
+
+        (M().*metric.observe)(125);
+
+        const auto after = M().serialize_metrics();
+        EXPECT_EQ(count_before + 2,
+                  FindSerializedMetricValue(after, count_name));
+        EXPECT_EQ(sum_before + 125, FindSerializedMetricValue(after, sum_name));
+    }
+}
 #else
 TEST_F(HAMetricManagerTest, BatchRecordMetricsAreAbsentWhenDisabled) {
+    M().observe_batch_record_batch_bytes(1024);
+    M().observe_batch_record_encode_latency_us(10);
+    M().observe_batch_record_decode_latency_us(20);
+    M().observe_batch_record_backend_txn_latency_us(100);
     EXPECT_EQ(std::string::npos,
               M().serialize_metrics().find("ha_batch_record_"));
 }

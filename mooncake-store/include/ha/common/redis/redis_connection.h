@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -45,9 +46,17 @@ tl::expected<RedisEndpoint, ErrorCode> ParseRedisEndpoint(
 
 std::string SanitizeHashTagComponent(std::string component);
 
+// CRC-16/XMODEM as used by the Redis Cluster key-to-slot mapping: polynomial
+// 0x1021, init 0, no input/output reflection, no final xor. Adapted from
+// redis/src/crc16.c; the algorithm is frozen by the protocol, so this must
+// stay bit-compatible -- a different CRC routes keys to the wrong shard.
+uint16_t Crc16Xmodem(std::string_view data);
+
 tl::expected<RedisContextPtr, ErrorCode> ConnectRedis(
     std::string_view connstring,
-    ErrorCode connection_error = ErrorCode::PERSISTENT_FAIL);
+    ErrorCode connection_error = ErrorCode::PERSISTENT_FAIL,
+    std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::time_point::max());
 
 }  // namespace redis
 }  // namespace common

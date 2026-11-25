@@ -8,6 +8,8 @@
 #pragma once
 
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
+#include "object_test_helpers.h"
 #include "types.h"
 
 #include <glog/logging.h>
@@ -50,28 +52,46 @@ class MasterServiceTest : public ::testing::Test {
     static constexpr uint64_t kStrictTenantQuotaBytes = 4 * 1024 * 1024;
 
     void PauseReplicaCleanup(MasterService& service) {
-        service.replica_cleanup_worker_.Stop();
+        MasterServiceTestPeer::ReplicaCleanupWorker(service).Stop();
     }
 
     void ResumeReplicaCleanup(MasterService& service) {
-        service.replica_cleanup_worker_.Start();
-        service.replica_cleanup_worker_.Schedule();
+        MasterServiceTestPeer::ReplicaCleanupWorker(service).Start();
+        MasterServiceTestPeer::ReplicaCleanupWorker(service).Schedule();
     }
 
     std::shared_ptr<ClientLivenessRecord> FindClientLivenessForTest(
         MasterService& service, const UUID& client_id) {
-        return service.FindClientRecord(client_id);
+        return ClientSessionRegistryTestPeer::Find(
+            MasterServiceTestPeer::ClientSessions(service), client_id);
+    }
+
+    // Stop publishing and delivering transitions, leaving residual offboarding
+    // running.
+    void QuiesceClientSessionsForTest(MasterService& service) {
+        MasterServiceTestPeer::ClientSessions(service).Stop();
+    }
+
+    void StopClientSessionsForTest(MasterService& service) {
+        QuiesceClientSessionsForTest(service);
+        MasterServiceTestPeer::ClientOffboarding(service).Stop();
+    }
+
+    bool HasPendingOffboardingForTest(MasterService& service) {
+        return MasterServiceTestPeer::ClientSessions(service)
+            .HasRetiredSession();
     }
 
     bool ProcessClientOffboardingForTest(MasterService& service,
                                          ClientOffboardingJob& job) {
-        return service.ProcessClientOffboardingJob(job);
+        return MasterServiceTestPeer(service).ProcessClientOffboardingJob(job);
     }
 
     ErrorCode PrepareUnmountSegmentForTest(MasterService& service,
                                            const UUID& segment_id,
                                            size_t& metrics_dec_capacity) {
-        auto access = service.segment_manager_.getSegmentAccess();
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
         return access.PrepareUnmountSegment(segment_id, metrics_dec_capacity);
     }
 
@@ -79,7 +99,8 @@ class MasterServiceTest : public ::testing::Test {
                                           const UUID& segment_id,
                                           const UUID& client_id,
                                           size_t metrics_dec_capacity) {
-        auto access = service.segment_manager_.getSegmentAccess();
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
         return access.CommitUnmountSegment(segment_id, client_id,
                                            metrics_dec_capacity);
     }
@@ -93,10 +114,9 @@ class MasterServiceTest : public ::testing::Test {
         return ClientOffboardingWorker::ShouldAlert(retry_count);
     }
 
-    // Runs the stale-handle sweep inline. The fixture is a friend of
-    // MasterService, the classes gtest derives from it are not.
+    // Run the stale-handle sweep synchronously through the test peer.
     void ClearInvalidHandlesForTest(MasterService& service) {
-        service.ClearInvalidHandles();
+        MasterServiceTestPeer(service).ClearInvalidHandles();
     }
 
     void ExpectKeyHiddenFromReadApis(MasterService& service,
@@ -124,39 +144,45 @@ class MasterServiceTest : public ::testing::Test {
         MasterService& service, const std::string& key,
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
-            service.ResolveRequestTenantId(TenantId(tenant_id));
-        const size_t shard_idx = service.getShardIndex(normalized_tenant, key);
-        MasterService::MetadataShardAccessorRO shard(&service, shard_idx);
-        const auto tenant_it = shard->tenants.find(normalized_tenant);
-        if (tenant_it == shard->tenants.end()) {
+            MasterServiceTestPeer(service).ResolveRequestTenantId(
+                TenantId(tenant_id));
+        auto hold = MasterServiceTestPeer::ReadObject(
+            service,
+            MasterServiceTestPeer::ObjectIdentity{normalized_tenant, key});
+        if (!hold) {
             return std::nullopt;
         }
-        const auto metadata_it = tenant_it->second.metadata.find(key);
-        if (metadata_it == tenant_it->second.metadata.end()) {
-            return std::nullopt;
-        }
-        return metadata_it->second.GetCommittedSoftPinTimeout();
+        return hold->metadata().GetCommittedSoftPinTimeout();
     }
 
     void CleanupExpiredSoftPinsAt(
         MasterService& service,
         const std::chrono::system_clock::time_point& now) {
-        service.CleanupExpiredSoftPins(now);
+        MasterServiceTestPeer(service).CleanupExpiredSoftPins(now);
     }
 
-    size_t MetadataShardIndex(MasterService& service, const std::string& key,
-                              const TenantId& tenant_id = TenantId::Default()) {
-        return service.getShardIndex(tenant_id, key);
+    std::unique_lock<std::mutex> AcquireWeightGroupOperationLockForTest(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& group_id) {
+        return MasterServiceTestPeer::WeightManager(service).LockGroup(
+            tenant_id, group_id);
     }
 
-    size_t MetadataBucketCount(
-        MasterService& service, size_t shard_idx,
+    // The stripe of the tenant's route that `key` lives in.
+    size_t RouteStripeIndex(const std::string& key) {
+        return ObjectRouteTestPeer::StripeIndex(key);
+    }
+
+    // The bucket count of one stripe of the tenant's route; zero when the
+    // tenant has no namespace.
+    size_t RouteStripeBucketCount(
+        MasterService& service, size_t stripe_idx,
         const TenantId& tenant_id = TenantId::Default()) {
-        MasterService::MetadataShardAccessorRO shard(&service, shard_idx);
-        const auto tenant_it = shard->tenants.find(tenant_id);
-        return tenant_it == shard->tenants.end()
-                   ? 0
-                   : tenant_it->second.metadata.bucket_count();
+        const metadata::Namespace* ns =
+            MasterServiceTestPeer::Namespaces(service).Lookup(tenant_id);
+        return ns == nullptr ? 0
+                             : ObjectRouteTestPeer::StripeBucketCount(
+                                   ns->objects, stripe_idx);
     }
 
     void SetSoftPinDeadlineForTest(
@@ -164,32 +190,35 @@ class MasterServiceTest : public ::testing::Test {
         const std::chrono::system_clock::time_point& deadline,
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
-            service.ResolveRequestTenantId(TenantId(tenant_id));
-        const size_t shard_idx = service.getShardIndex(normalized_tenant, key);
-        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
-        auto& metadata = shard->tenants.at(normalized_tenant).metadata.at(key);
+            MasterServiceTestPeer(service).ResolveRequestTenantId(
+                TenantId(tenant_id));
         {
-            SpinLocker locker(&metadata.lock);
-            metadata.soft_pin_timeout = deadline;
+            auto hold = MasterServiceTestPeer::WriteObject(
+                service,
+                MasterServiceTestPeer::ObjectIdentity{normalized_tenant, key});
+            ASSERT_TRUE(hold.has_value());
+            SpinLocker locker(&hold->metadata().lock);
+            hold->metadata().soft_pin_timeout = deadline;
         }
-        service.soft_pin_deadline_index_.Upsert(
-            normalized_tenant.MakeScopedKey(key), shard_idx, deadline);
+        MasterServiceTestPeer::SoftPinDeadlineIndex(service).Upsert(
+            normalized_tenant.MakeScopedKey(key), deadline);
     }
 
     size_t SoftPinDeadlineHeapSize(MasterService& service) {
-        return service.soft_pin_deadline_index_.HeapSizeForTest();
+        return MasterServiceTestPeer(service).SoftPinHeapSize();
     }
 
     size_t SoftPinRegistrationCount(MasterService& service) {
-        return service.soft_pin_deadline_index_.RegistrationCountForTest();
+        return MasterServiceTestPeer(service).SoftPinRegistrationCount();
     }
 
     std::optional<uint32_t> GetReplicaRefcntBySegmentName(
         MasterService& service, const std::string& key,
         const std::string& segment_name) {
-        MasterService::MetadataAccessorRO accessor(
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
             &service,
-            service.MakeObjectIdentityForRequest(key, TenantId::Default()));
+            MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
+                key, TenantId::Default()));
         if (!accessor.Exists()) {
             return std::nullopt;
         }
@@ -204,57 +233,41 @@ class MasterServiceTest : public ::testing::Test {
         return std::nullopt;
     }
 
-    // Exposes the private medium-normalization helpers to test bodies: the
-    // fixture is a friend of MasterService, but the classes gtest derives from
-    // it are not, so TEST_F cannot reach them without this hop.
-    std::optional<std::vector<std::string>> KvMediaForKey(
+    // Inspect the route-tracked KV media bitmask under a read guard.
+    std::optional<uint8_t> AnnouncedKvMediaForKey(
         MasterService& service, const std::string& key,
         const TenantId& tenant_id = TenantId::Default()) {
-        MasterService::MetadataAccessorRO accessor(
-            &service, service.MakeObjectIdentityForRequest(key, tenant_id));
-        if (!accessor.Exists()) {
+        MasterServiceTestPeer peer(service);
+        const auto identity = peer.MakeObjectIdentityForRequest(key, tenant_id);
+        auto guard = peer.GetOrCreateNamespace(identity.tenant_id)
+                         .objects.Read(identity.user_key);
+        if (!guard.has_value()) {
             return std::nullopt;
         }
-        return MasterService::KvMediaForMetadata(accessor.Get());
-    }
-
-    std::optional<std::vector<std::string>> KvRemovalMediaForKey(
-        MasterService& service, const std::string& key,
-        const TenantId& tenant_id = TenantId::Default()) {
-        MasterService::MetadataAccessorRO accessor(
-            &service, service.MakeObjectIdentityForRequest(key, tenant_id));
-        if (!accessor.Exists()) {
-            return std::nullopt;
-        }
-        return MasterService::KvMediaForRemoval(accessor.Get());
-    }
-
-    // Lets a test line up a key with a shard the RemoveAll scan has already
-    // passed, which is the only way to reproduce the commit/clear ordering race
-    // deterministically.
-    size_t ShardIndexForKey(MasterService& service, const std::string& key,
-                            const TenantId& tenant_id = TenantId::Default()) {
-        return service.getShardIndex(tenant_id, key);
+        return guard->state().announced_kv_media;
     }
 
     void UpsertSoftPinDeadlineIndexForTest(
-        MasterService& service, const std::string& key, size_t shard_idx,
+        MasterService& service, const std::string& key,
         const std::chrono::system_clock::time_point& deadline,
         const std::string& tenant_id = "default") {
-        service.soft_pin_deadline_index_.Upsert(
-            TenantId(tenant_id).MakeScopedKey(key), shard_idx, deadline);
+        MasterServiceTestPeer::SoftPinDeadlineIndex(service).Upsert(
+            TenantId(tenant_id).MakeScopedKey(key), deadline);
     }
 
     size_t PopExpiredSoftPinDeadlinesForTest(
         MasterService& service,
         const std::chrono::system_clock::time_point& now) {
-        return service.soft_pin_deadline_index_.PopExpired(now).size();
+        return MasterServiceTestPeer::SoftPinDeadlineIndex(service)
+            .PopExpired(now)
+            .size();
     }
 
     std::chrono::system_clock::time_point ComputeSoftPinDeadlineForTest(
-        const std::chrono::system_clock::time_point& now, uint64_t ttl_ms) {
-        return MasterService::ObjectMetadata::ComputeSoftPinDeadline(now,
-                                                                     ttl_ms);
+        const std::chrono::system_clock::time_point& now,
+        std::chrono::milliseconds ttl) {
+        return MasterServiceTestPeer::ObjectMetadata::ComputeSoftPinDeadline(
+            now, ttl);
     }
 
     std::string WriteTenantPolicyFile(
@@ -364,21 +377,6 @@ class MasterServiceTest : public ::testing::Test {
                                 ReplicaType::MEMORY)
                         .has_value());
         return key;
-    }
-
-    std::string FindGroupIdOnDifferentShard(const std::string& key) const {
-        static constexpr size_t kMetadataShardCountForTest = 1024;
-        const size_t key_shard =
-            std::hash<std::string>{}(key) % kMetadataShardCountForTest;
-        for (int i = 0; i < 10000; ++i) {
-            std::string group_id = key + "_group_" + std::to_string(i);
-            if (std::hash<std::string>{}(group_id) %
-                    kMetadataShardCountForTest !=
-                key_shard) {
-                return group_id;
-            }
-        }
-        return key + "_fallback_group";
     }
 
     void PutCompletedObject(MasterService& service, const UUID& client_id,
@@ -507,97 +505,37 @@ class MasterServiceTest : public ::testing::Test {
         MasterService& service, const std::string& group_id,
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
-            service.ResolveRequestTenantId(TenantId(tenant_id));
-        MasterService::GroupDomainAccessorRO gs(&service);
-        auto it = gs->groups.find(normalized_tenant.MakeScopedKey(group_id));
-        if (it == gs->groups.end()) {
+            MasterServiceTestPeer(service).ResolveRequestTenantId(
+                TenantId(tenant_id));
+        // Membership is per tenant, so the group id alone is not enough.
+        const metadata::Namespace* ns =
+            MasterServiceTestPeer::Namespaces(service).Lookup(
+                normalized_tenant);
+        if (ns == nullptr) {
             return {};
         }
-        return {it->second.member_keys.begin(), it->second.member_keys.end()};
-    }
-
-    void ClearGroupStateForTest(MasterService& service) {
-        MasterService::GroupDomainAccessorRW gs(&service);
-        gs->groups.clear();
-    }
-
-    void RebuildGroupStateForTest(MasterService& service) {
-        service.RebuildGroupState();
+        return ns->objects.GroupMembers(group_id);
     }
 
     std::shared_ptr<Lease> GetGroupLeaseForTest(
         MasterService& service, const std::string& group_id,
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
-            service.ResolveRequestTenantId(TenantId(tenant_id));
-        MasterService::GroupDomainAccessorRO gs(&service);
-        auto it = gs->groups.find(normalized_tenant.MakeScopedKey(group_id));
-        return it == gs->groups.end() ? nullptr : it->second.lease;
-    }
-
-    void ReRouteRestoredObjectsMigrationForTest(MasterService& service) {
-        const UUID client_id = generate_uuid();
-        const std::string grouped_key = "reroute_grouped_key";
-        const std::string ungrouped_key = "reroute_ungrouped_key";
-        const std::string group_id = FindGroupIdOnDifferentShard(grouped_key);
-
-        ReplicateConfig grouped_config;
-        grouped_config.replica_num = 1;
-        grouped_config.group_ids = std::vector<std::string>{group_id};
-        ReplicateConfig ungrouped_config;
-        ungrouped_config.replica_num = 1;
-
-        PutCompletedObject(service, client_id, grouped_key, grouped_config);
-        PutCompletedObject(service, client_id, ungrouped_key, ungrouped_config);
-
-        const TenantId tenant = TenantId::Default();
-        const size_t grouped_correct =
-            service.getShardIndex(tenant, grouped_key);
-        const size_t wrong = (grouped_correct + 1) %
-                             static_cast<size_t>(MasterService::kNumShards);
-
-        // Reachable initially (placed on the correct hash(tenant, key) shard).
-        EXPECT_TRUE(service.ExistKey(grouped_key, tenant).value_or(false));
-
-        // Simulate an old snapshot that placed grouped_key on a stale shard.
-        {
-            MasterService::MetadataShardAccessorRW src(&service,
-                                                       grouped_correct);
-            auto tenant_it = src->tenants.find(tenant);
-            ASSERT_NE(tenant_it, src->tenants.end());
-            auto obj_it = tenant_it->second.metadata.find(grouped_key);
-            ASSERT_NE(obj_it, tenant_it->second.metadata.end());
-            auto node = tenant_it->second.metadata.extract(obj_it);
-            ASSERT_FALSE(node.empty());
-            MasterService::MetadataShardAccessorRW dst(&service, wrong);
-            auto& dst_tenant =
-                service.GetOrCreateTenantState(dst.get(), tenant);
-            dst_tenant.metadata.insert(std::move(node));
+            MasterServiceTestPeer(service).ResolveRequestTenantId(
+                TenantId(tenant_id));
+        // Every member points at the group's one shared lease.
+        const metadata::Namespace* ns =
+            MasterServiceTestPeer::Namespaces(service).Lookup(
+                normalized_tenant);
+        if (ns == nullptr) {
+            return nullptr;
         }
-
-        // Now unreachable via hash(tenant, key) lookup (the old-snapshot
-        // problem).
-        EXPECT_FALSE(service.ExistKey(grouped_key, tenant).value_or(true));
-
-        // Run the migration.
-        service.ReRouteRestoredObjectsByKey();
-
-        // Reachable again, and back on the correct shard.
-        EXPECT_TRUE(service.ExistKey(grouped_key, tenant).value_or(false));
-        MasterService::MetadataShardAccessorRW shard(&service, grouped_correct);
-        auto tenant_it = shard->tenants.find(tenant);
-        ASSERT_NE(tenant_it, shard->tenants.end());
-        EXPECT_NE(tenant_it->second.metadata.find(grouped_key),
-                  tenant_it->second.metadata.end());
-        // The stale shard no longer holds it.
-        MasterService::MetadataShardAccessorRW stale(&service, wrong);
-        auto stale_it = stale->tenants.find(tenant);
-        if (stale_it != stale->tenants.end()) {
-            EXPECT_EQ(stale_it->second.metadata.find(grouped_key),
-                      stale_it->second.metadata.end());
+        for (const auto& member_key : ns->objects.GroupMembers(group_id)) {
+            if (auto hold = ns->objects.Read(member_key)) {
+                return hold->metadata().lease_;
+            }
         }
-        // The correctly-placed ungrouped object is unaffected.
-        EXPECT_TRUE(service.ExistKey(ungrouped_key, tenant).value_or(false));
+        return nullptr;
     }
 };
 

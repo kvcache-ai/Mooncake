@@ -1,5 +1,6 @@
 import unittest
 import os
+import ctypes
 from mooncake.engine import TransferEngine
 
 
@@ -175,6 +176,218 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
             f"[✓] {circles} rounds of batch_write_read passed, batch size {batch_size}."
         )
 
+    def test_scatter_write_read(self):
+        """Transfer allocation-bounded offset vectors through one operation."""
+
+        adaptor = self.adaptor
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        payloads = (b"scatter-range-a", b"scatter-range-b", b"scatter-range-c")
+        write_local_offsets = ((0, 128), (1024,))
+        remote_offsets = ((256, 512), (1536,))
+        lengths = ((len(payloads[0]), len(payloads[1])), (len(payloads[2]),))
+        for address, payload in zip(
+            (
+                base_src_addr + write_local_offsets[0][0],
+                base_src_addr + write_local_offsets[0][1],
+                base_src_addr + write_local_offsets[1][0],
+            ),
+            payloads,
+            strict=True,
+        ):
+            self.assertEqual(
+                adaptor.write_bytes_to_buffer(address, payload, len(payload)),
+                0,
+            )
+
+        write_ticket = adaptor.scatter_transfer_sync_write_with_ticket(
+            self.target_server_name,
+            [base_src_addr, base_src_addr],
+            [4096, 4096],
+            [base_dst_addr, base_dst_addr],
+            [4096, 4096],
+            [list(offsets) for offsets in write_local_offsets],
+            [list(offsets) for offsets in remote_offsets],
+            [list(sizes) for sizes in lengths],
+        )
+        self.assertTrue(write_ticket.drained)
+        self.assertIn("COMPLETED", str(write_ticket.status))
+
+        read_local_offsets = ((2048, 2304), (3072,))
+        read_ticket = adaptor.scatter_transfer_sync_read_with_ticket(
+            self.target_server_name,
+            [base_src_addr, base_src_addr],
+            [4096, 4096],
+            [base_dst_addr, base_dst_addr],
+            [4096, 4096],
+            [list(offsets) for offsets in read_local_offsets],
+            [list(offsets) for offsets in remote_offsets],
+            [list(sizes) for sizes in lengths],
+        )
+        self.assertTrue(read_ticket.drained)
+        self.assertIn("COMPLETED", str(read_ticket.status))
+
+        for address, payload in zip(
+            (
+                base_src_addr + read_local_offsets[0][0],
+                base_src_addr + read_local_offsets[0][1],
+                base_src_addr + read_local_offsets[1][0],
+            ),
+            payloads,
+            strict=True,
+        ):
+            self.assertEqual(
+                adaptor.read_bytes_from_buffer(address, len(payload)),
+                payload,
+            )
+
+    def test_scatter_submit_write_read(self):
+        """Submit scatter transfers without draining them in the binding."""
+
+        adaptor = self.adaptor
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        payload = b"scatter-submit"
+        self.assertEqual(
+            adaptor.write_bytes_to_buffer(base_src_addr, payload, len(payload)),
+            0,
+        )
+
+        write_ticket = adaptor.submit_scatter_write(
+            self.target_server_name,
+            [base_src_addr],
+            [4096],
+            [base_dst_addr],
+            [4096],
+            [[0]],
+            [[256]],
+            [[len(payload)]],
+        )
+        self.assertFalse(write_ticket.drained)
+        self.assertIn("COMPLETED", str(write_ticket.drain(30_000)))
+        self.assertTrue(write_ticket.drained)
+
+        self.assertEqual(
+            adaptor.write_bytes_to_buffer(
+                base_src_addr + 512, bytes(len(payload)), len(payload)
+            ),
+            0,
+        )
+        read_ticket = adaptor.submit_scatter_read(
+            self.target_server_name,
+            [base_src_addr],
+            [4096],
+            [base_dst_addr],
+            [4096],
+            [[512]],
+            [[256]],
+            [[len(payload)]],
+        )
+        self.assertFalse(read_ticket.drained)
+        self.assertIn("COMPLETED", str(read_ticket.drain(30_000)))
+        self.assertTrue(read_ticket.drained)
+        self.assertEqual(
+            adaptor.read_bytes_from_buffer(base_src_addr + 512, len(payload)),
+            payload,
+        )
+
+    def test_scatter_rejects_mismatched_fragment_vectors(self):
+        adaptor = self.adaptor
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        ticket = adaptor.scatter_transfer_sync_write_with_ticket(
+            self.target_server_name,
+            [base_src_addr],
+            [4096],
+            [base_dst_addr],
+            [4096],
+            [[0, 128]],
+            [[256]],
+            [[16, 16]],
+        )
+        self.assertTrue(ticket.drained)
+        self.assertIn("FAILED_DRAINED", str(ticket.status))
+
+    def test_scatter_rejects_fragment_outside_allocation(self):
+        adaptor = self.adaptor
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        ticket = adaptor.scatter_transfer_sync_write_with_ticket(
+            self.target_server_name,
+            [base_src_addr],
+            [4096],
+            [base_dst_addr],
+            [4096],
+            [[4088]],
+            [[0]],
+            [[16]],
+        )
+        self.assertTrue(ticket.drained)
+        self.assertIn("FAILED_DRAINED", str(ticket.status))
+
+    def test_scatter_rejects_local_allocation_address_overflow(self):
+        adaptor = self.adaptor
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+        max_address = (1 << 64) - 1
+        stderr_read, stderr_write = os.pipe()
+        saved_stderr = os.dup(2)
+        try:
+            os.dup2(stderr_write, 2)
+            for transfer in (
+                adaptor.scatter_transfer_sync_write_with_ticket,
+                adaptor.scatter_transfer_sync_read_with_ticket,
+            ):
+                ticket = transfer(
+                    self.target_server_name,
+                    [max_address],
+                    [1],
+                    [base_dst_addr],
+                    [1],
+                    [[0]],
+                    [[0]],
+                    [[1]],
+                )
+                self.assertTrue(ticket.drained)
+                self.assertIn("FAILED_DRAINED", str(ticket.status))
+        finally:
+            os.dup2(saved_stderr, 2)
+            os.close(saved_stderr)
+            os.close(stderr_write)
+        native_stderr = os.read(stderr_read, 64 * 1024)
+        os.close(stderr_read)
+        self.assertNotIn(hex(max_address).encode(), native_stderr)
+
+    def test_scatter_rejects_local_address_range_overflow(self):
+        max_local_address = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
+
+        for direction in ("write", "read"):
+            with self.subTest(direction=direction):
+                transfer = getattr(
+                    self.adaptor,
+                    f"scatter_transfer_sync_{direction}_with_ticket",
+                )
+                ticket = transfer(
+                    self.target_server_name,
+                    [max_local_address],
+                    [2],
+                    [0],
+                    [0],
+                    [[0]],
+                    [[0]],
+                    [[0]],
+                )
+                self.assertTrue(ticket.drained)
+                self.assertIn("FAILED_DRAINED", str(ticket.status))
+
     def test_async_batch_write_read(self):
         """Test batch_transfer_async_write and batch_transfer_async_read for batch write/read consistency."""
         import random
@@ -292,6 +505,116 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
             0,
             f"transfer_submit_write to unknown peer returned {batch_id}",
         )
+        self.assertEqual(self.adaptor.transfer_check_status(0), -1)
+        self.assertEqual(self.adaptor.batch_transfer_check_status([0]), [-1])
+        self.assertEqual(self.adaptor.get_batch_transfer_status([0]), -1)
+
+    def test_async_batch_arrays_with_nonblocking_check_status(self):
+        """Test batch_transfer_async_{write,read}_arrays with transfer_check_status and batch_transfer_check_status."""
+        from array import array
+        import time
+
+        adaptor = self.adaptor
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        def wait_single(batch_id: int, label: str, timeout_s: float = 30.0) -> int:
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                rc = adaptor.transfer_check_status(batch_id)
+                if rc != 0:
+                    return rc
+                time.sleep(0.0005)
+            self.fail(f"Timed out waiting for {label} batch {batch_id}")
+
+        # Empty 0-descriptor batch should complete cleanly with status 1.
+        empty = array("Q")
+        empty_bid = adaptor.batch_transfer_async_write_arrays(
+            self.target_server_name, empty, empty, empty
+        )
+        self.assertNotEqual(empty_bid, 0)
+        self.assertEqual(wait_single(empty_bid, "empty write"), 1)
+
+        # Submit two multi-chunk array write batches and poll them together via
+        # vectorized batch_transfer_check_status.
+        chunks_per_batch = 16
+        chunk_size = 512
+        stride = 1024
+        expected = []
+        write_bids = []
+        for b in range(2):
+            src_addrs = array(
+                "Q",
+                [
+                    base_src_addr + (b * chunks_per_batch + i) * stride
+                    for i in range(chunks_per_batch)
+                ],
+            )
+            dst_addrs = array(
+                "Q",
+                [
+                    base_dst_addr + (b * chunks_per_batch + i) * stride
+                    for i in range(chunks_per_batch)
+                ],
+            )
+            lengths = array("Q", [chunk_size] * chunks_per_batch)
+            for i in range(chunks_per_batch):
+                payload = f"batch-{b}-item-{i:02d}-".encode("ascii") * 40
+                payload = payload[:chunk_size]
+                expected.append(payload)
+                self.assertEqual(
+                    adaptor.write_bytes_to_buffer(src_addrs[i], payload, chunk_size), 0
+                )
+            bid = adaptor.batch_transfer_async_write_arrays(
+                self.target_server_name, src_addrs, dst_addrs, lengths
+            )
+            self.assertNotEqual(bid, 0)
+            write_bids.append(bid)
+
+        pending = list(write_bids)
+        write_deadline = time.monotonic() + 30.0
+        while pending:
+            self.assertLess(
+                time.monotonic(),
+                write_deadline,
+                f"Timed out waiting for vectorized write batches {pending}",
+            )
+            statuses = adaptor.batch_transfer_check_status(pending)
+            self.assertEqual(len(statuses), len(pending))
+            still_pending = []
+            for bid, st in zip(pending, statuses):
+                if st == 0:
+                    still_pending.append(bid)
+                else:
+                    self.assertEqual(st, 1, f"write batch {bid} failed with {st}")
+            pending = still_pending
+            if pending:
+                time.sleep(0.0005)
+
+        # Read all chunks back in a single array batch and poll with transfer_check_status.
+        total_chunks = 2 * chunks_per_batch
+        read_base = base_src_addr + total_chunks * stride
+        read_addrs = array("Q", [read_base + i * stride for i in range(total_chunks)])
+        remote_addrs = array(
+            "Q", [base_dst_addr + i * stride for i in range(total_chunks)]
+        )
+        read_lengths = array("Q", [chunk_size] * total_chunks)
+        for addr in read_addrs:
+            self.assertEqual(
+                adaptor.write_bytes_to_buffer(addr, b"\x00" * chunk_size, chunk_size), 0
+            )
+
+        read_bid = adaptor.batch_transfer_async_read_arrays(
+            self.target_server_name, read_addrs, remote_addrs, read_lengths
+        )
+        self.assertNotEqual(read_bid, 0)
+        self.assertEqual(wait_single(read_bid, "array read"), 1)
+
+        for i, addr in enumerate(read_addrs):
+            self.assertEqual(
+                adaptor.read_bytes_from_buffer(addr, chunk_size), expected[i]
+            )
 
     def test_send_probe_reachable_peer(self):
         """send_probe against a registered, reachable peer returns 0."""

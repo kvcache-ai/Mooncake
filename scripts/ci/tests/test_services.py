@@ -88,6 +88,30 @@ ci_wait_service master 50051
         self.assertIn("exited before becoming ready", result.stdout)
         self.assertIn("startup-failed", result.stdout)
 
+    def test_startup_error_annotation_contains_only_recent_log_lines(self):
+        result = self.run_suite(
+            """
+source "$SERVICES"
+trap 'ci_cleanup_services "$?"' EXIT
+ci_start_service master "$SUITE_TMP/master.log" bash -c '
+  for i in {1..25}; do echo "line-$i"; done
+  echo "bind failed: 100% address in use"
+  exit 7
+'
+wait "${CI_SERVICE_PIDS[master]}" || true
+ci_wait_service master 50051
+"""
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        annotation = next(
+            line for line in result.stdout.splitlines() if line.startswith("::error")
+        )
+        self.assertIn("line-25", annotation)
+        self.assertIn("bind failed: 100%25 address in use", annotation)
+        self.assertNotIn("line-1%0A", annotation)
+        self.assertNotIn("line-6%0A", annotation)
+        self.assertIn("%0A", annotation)
+
     def test_readiness_timeout_fails_without_wall_clock_delay(self):
         result = self.run_suite(
             """

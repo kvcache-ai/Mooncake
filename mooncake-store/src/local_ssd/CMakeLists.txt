@@ -7,5 +7,5 @@ target_include_directories(
                             $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>)
 
 target_link_libraries(
-  mooncake_local_ssd PUBLIC cachelib_memory_allocator
+  mooncake_local_ssd PUBLIC Mooncake::boost cachelib_memory_allocator
                             yalantinglibs::yalantinglibs Threads::Threads)

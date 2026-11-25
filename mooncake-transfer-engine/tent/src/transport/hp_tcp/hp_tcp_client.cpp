@@ -323,6 +323,9 @@ class HighPerformanceTcpClient::Lane
         auto self = shared_from_this();
         asio::async_read(
             socket_, asio::buffer(data, chunk),
+            [chunk](const std::error_code& error, size_t received) -> size_t {
+                return error ? 0 : chunk - received;
+            },
             [self, epoch, chunk](const std::error_code& error, size_t bytes) {
                 self->runHandler(epoch, [&] {
                     if (self->finishForcedIfAny()) return;
@@ -360,8 +363,10 @@ class HighPerformanceTcpClient::Lane
 
     void cancelTimer() {
         ++timer_generation_;
-        std::error_code ignored;
-        timer_.cancel(ignored);
+        try {
+            timer_.cancel();
+        } catch (const std::exception&) {
+        }
     }
 
     void armIdleTimer() {
