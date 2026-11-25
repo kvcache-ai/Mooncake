@@ -5527,8 +5527,11 @@ class _MooncakePayloadTransport:
                     ) in _payload_range_fragments(
                         chunks, source_offset, byte_length, destination_offset
                     ):
-                        if key != cached_key:
+                        if cached_view is None or key != cached_key:
                             data = self._store.get(key)
+                            # cast("B") holds its own export of data's buffer, so
+                            # releasing raw_view keeps data_view valid without
+                            # retaining an extra export on data.
                             with memoryview(data) as raw_view:
                                 data_view = raw_view.cast("B")
                             actual_size = len(data_view)
@@ -5541,7 +5544,6 @@ class _MooncakePayloadTransport:
                                 cached_view.release()
                             cached_key = key
                             cached_view = data_view
-                        assert cached_view is not None
                         destination_bytes[
                             fragment_destination_offset : fragment_destination_offset
                             + size
