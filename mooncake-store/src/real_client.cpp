@@ -38,6 +38,7 @@
 #include "client_buffer.h"
 #include "replica_selection.h"
 #include "batch_read_fanout.h"
+#include "offload_read_scheduler.h"
 #include "common.h"
 #include "config.h"
 #include "config/distributed_storage_config.h"
@@ -4630,14 +4631,24 @@ RealClient::batch_get_buffer_internal(
 
         std::vector<tl::expected<int64_t, ErrorCode>> op_status(
             disk_ops.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        const auto lease_expired = [&disk_ops,
+                                    &disk_key_to_idx](const std::string &key) {
+            return IsLocalDiskMasterLeaseExpired(
+                disk_ops[disk_key_to_idx.at(key)].query_result, key);
+        };
         for (auto &[endpoint, objects] : offload_objects) {
             if (objects.empty()) continue;
-            auto read_result =
-                batch_get_into_offload_object_internal(endpoint, objects);
+            const auto read =
+                read_local_disk_objects(endpoint, objects, lease_expired);
             for (auto &[key, slices] : objects) {
                 auto idx_it = disk_key_to_idx.find(key);
                 if (idx_it == disk_key_to_idx.end()) continue;
                 auto &op = disk_ops[idx_it->second];
+                const auto failed_it = read.failed_keys.find(key);
+                const tl::expected<void, ErrorCode> read_result =
+                    failed_it == read.failed_keys.end()
+                        ? tl::expected<void, ErrorCode>{}
+                        : tl::make_unexpected(failed_it->second);
                 if (read_result) {
                     auto checksum_result = client_->VerifyObjectChecksum(
                         key, slices, op.total_size,
@@ -4651,7 +4662,8 @@ RealClient::batch_get_buffer_internal(
                             tl::make_unexpected(checksum_result.error());
                         continue;
                     }
-                    if (IsLocalDiskMasterLeaseExpired(op.query_result, key)) {
+                    if (!read.lease_checked &&
+                        IsLocalDiskMasterLeaseExpired(op.query_result, key)) {
                         op_status[idx_it->second] =
                             tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
                         continue;
@@ -4663,6 +4675,13 @@ RealClient::batch_get_buffer_internal(
                                << "': " << toString(read_result.error());
                     op_status[idx_it->second] =
                         tl::make_unexpected(read_result.error());
+                    // A chunked read rechecks the master lease after each
+                    // chunk and stops once it has run out. Like an expired
+                    // lease found after an unsplit read above, that fails the
+                    // key without healing: the replica is not suspect.
+                    if (read_result.error() == ErrorCode::LEASE_EXPIRED) {
+                        continue;
+                    }
                     // A dead LOCAL_DISK replica must not stay failed forever:
                     // the owner is asked over the offload RPC whether the
                     // backing file is gone, a proven-gone answer evicts the
@@ -4671,16 +4690,17 @@ RealClient::batch_get_buffer_internal(
                     // survives, the retry surfaces a real miss. The failed
                     // replica is matched by the endpoint this batch read
                     // from, so a sibling replica on another owner is never
-                    // blamed. A batch read also dies wholesale, so a key whose
-                    // file provably exists is retried as-is: its failure came
-                    // from a sibling's wiped bucket file, not from its own
-                    // data. The retry runs with healing off so a replica whose
-                    // file exists but keeps failing (e.g. a truncated bucket)
-                    // surfaces its error instead of recursing until the stack
-                    // or the allocator gives out. On success the bytes land in
-                    // this op's own buffer and op_status flips to success, so
-                    // the duplicate fan-out and handle assembly below treat
-                    // the healed key like any other successful read.
+                    // blamed. A batch read (or one chunk of it) also dies
+                    // wholesale, so a key whose file provably exists is
+                    // retried as-is: its failure came from a sibling's wiped
+                    // bucket file, not from its own data. The retry runs with
+                    // healing off so a replica whose file exists but keeps
+                    // failing (e.g. a truncated bucket) surfaces its error
+                    // instead of recursing until the stack or the allocator
+                    // gives out. On success the bytes land in this op's own
+                    // buffer and op_status flips to success, so the duplicate
+                    // fan-out and handle assembly below treat the healed key
+                    // like any other successful read.
                     if (client_ && heal_dangling_disk_replica) {
                         const Replica::Descriptor *failed_replica = nullptr;
                         for (const auto &r : op.query_result.replicas) {
@@ -6943,11 +6963,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     }
 
     const auto query_results = client_->BatchQuery(keys);
-    return batch_get_into_internal(
-        keys, buffers, sizes, query_results,
-        [this](const std::string &endpoint, LocalDiskOffloadObjects &objects) {
-            return batch_get_into_offload_object_internal(endpoint, objects);
-        });
+    return batch_get_into_internal(keys, buffers, sizes, query_results,
+                                   LocalDiskOffloadReader{});
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
@@ -7300,23 +7317,32 @@ RealClient::batch_get_into_internal(
     [[maybe_unused]] size_t offload_object_count = 0;
     [[maybe_unused]] auto start_read_store_time =
         std::chrono::steady_clock::now();
+    const auto lease_expired =
+        [&valid_local_disk_operations](const std::string &key) {
+            return IsLocalDiskMasterLeaseExpired(
+                valid_local_disk_operations.at(key).query_result, key);
+        };
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
-        auto batch_get_offload_result = local_disk_reader(
-            offload_objects_it.first, offload_objects_it.second);
-        if (!batch_get_offload_result) {
-            LOG(ERROR) << "Batch get store object failed with error: "
-                       << batch_get_offload_result.error();
-            for (const auto &offload_object_it : offload_objects_it.second) {
-                results[valid_local_disk_operations.at(offload_object_it.first)
-                            .original_index] =
-                    tl::make_unexpected(batch_get_offload_result.error());
-            }
-            continue;
+        const auto read = read_local_disk_objects(
+            offload_objects_it.first, offload_objects_it.second, lease_expired,
+            local_disk_reader ? &local_disk_reader : nullptr);
+        if (!read.failed_keys.empty()) {
+            LOG(ERROR) << "Batch get store object from "
+                       << offload_objects_it.first << " failed for "
+                       << read.failed_keys.size() << " of "
+                       << offload_objects_it.second.size() << " keys ("
+                       << FormatOffloadReadErrorCounts(read.failed_keys) << ")";
         }
         for (const auto &offload_object_it : offload_objects_it.second) {
             const auto &op =
                 valid_local_disk_operations.at(offload_object_it.first);
+            if (auto failed = read.failed_keys.find(offload_object_it.first);
+                failed != read.failed_keys.end()) {
+                results[op.original_index] =
+                    tl::make_unexpected(failed->second);
+                continue;
+            }
             auto checksum_result = client_->VerifyObjectChecksum(
                 offload_object_it.first, offload_object_it.second,
                 op.total_size, op.query_result.object_checksum);
@@ -7325,7 +7351,8 @@ RealClient::batch_get_into_internal(
                     tl::make_unexpected(checksum_result.error());
                 continue;
             }
-            if (IsLocalDiskMasterLeaseExpired(op.query_result,
+            if (!read.lease_checked &&
+                IsLocalDiskMasterLeaseExpired(op.query_result,
                                               offload_object_it.first)) {
                 results[op.original_index] =
                     tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
@@ -9039,28 +9066,30 @@ RealClient::batch_get_into_multi_buffers_internal(
                     .emplace(key, std::move(user_slices));
             }
 
+            const auto lease_expired =
+                [&valid_local_disk_ops](const std::string &key) {
+                    return IsLocalDiskMasterLeaseExpired(
+                        valid_local_disk_ops.at(key).query_result, key);
+                };
             for (auto &[endpoint, objects] : offload_objects) {
                 if (objects.empty()) continue;
-                auto read_result =
-                    batch_get_into_offload_object_internal(endpoint, objects);
+                const auto read =
+                    read_local_disk_objects(endpoint, objects, lease_expired);
                 // On success: results[original_index] was already pre-filled
                 // with total_size when valid_local_disk_ops was built; nothing
                 // to update. Only overwrite on failure.
-                if (!read_result) {
-                    for (auto &[key, slices] : objects) {
-                        auto disk_it = valid_local_disk_ops.find(key);
-                        if (disk_it == valid_local_disk_ops.end()) continue;
-                        LOG(ERROR) << "SSD read failed for key '" << key
-                                   << "': " << toString(read_result.error());
-                        results[disk_it->second.original_index] =
-                            tl::make_unexpected(read_result.error());
-                    }
-                    continue;
-                }
                 for (auto &[key, slices] : objects) {
                     auto disk_it = valid_local_disk_ops.find(key);
                     if (disk_it == valid_local_disk_ops.end()) continue;
                     auto &op = disk_it->second;
+                    if (auto failed = read.failed_keys.find(key);
+                        failed != read.failed_keys.end()) {
+                        LOG(ERROR) << "SSD read failed for key '" << key
+                                   << "': " << toString(failed->second);
+                        results[op.original_index] =
+                            tl::make_unexpected(failed->second);
+                        continue;
+                    }
                     auto checksum_result = client_->VerifyObjectChecksum(
                         key, slices, op.total_size,
                         op.query_result.object_checksum);
@@ -9069,7 +9098,8 @@ RealClient::batch_get_into_multi_buffers_internal(
                             tl::make_unexpected(checksum_result.error());
                         continue;
                     }
-                    if (IsLocalDiskMasterLeaseExpired(op.query_result, key)) {
+                    if (!read.lease_checked &&
+                        IsLocalDiskMasterLeaseExpired(op.query_result, key)) {
                         results[op.original_index] =
                             tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
                     }
@@ -9952,11 +9982,37 @@ RealClient::restore_offload_objects(
     return lease;
 }
 
+RealClient::LocalDiskReadResult RealClient::read_local_disk_objects(
+    const std::string &endpoint, LocalDiskOffloadObjects &objects,
+    const LocalDiskLeaseCheck &lease_expired,
+    const LocalDiskOffloadReader *read_chunk) {
+    const auto &config = offload_read_chunk_config_;
+    const bool split = OffloadReadIsSplit(objects, config.chunk_bytes);
+    const LocalDiskOffloadReader owner_reader =
+        [this, split](const std::string &target,
+                      LocalDiskOffloadObjects &chunk) {
+            return batch_get_into_offload_object_internal(
+                target, chunk, /*read_range=*/nullptr,
+                /*chunk_of_split_read=*/split);
+        };
+    OffloadKeyCheck check_lease;
+    if (lease_expired) {
+        check_lease = [&lease_expired](const std::string &key) {
+            return lease_expired(key) ? ErrorCode::LEASE_EXPIRED
+                                      : ErrorCode::OK;
+        };
+    }
+    auto read = ReadOffloadObjectsInChunks(
+        endpoint, objects, config.chunk_bytes, config.chunk_concurrency,
+        read_chunk ? *read_chunk : owner_reader, check_lease);
+    return LocalDiskReadResult{std::move(read.failed_keys), read.keys_checked};
+}
+
 tl::expected<void, ErrorCode>
 RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
     std::unordered_map<std::string, std::vector<Slice>> &objects,
-    const OffloadReadRange *read_range) {
+    const OffloadReadRange *read_range, bool chunk_of_split_read) {
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
     if (read_range && objects.size() != 1) {
@@ -10014,12 +10070,13 @@ RealClient::batch_get_into_offload_object_internal(
         lease.local_batch() ? OffloadBufferAccess::kLocalAddress
                             : OffloadBufferAccess::kTransferEngine);
     const auto elapsed_time = lease.ElapsedMs();
-    LOG(INFO) << "Time taken for batch_get_into_offload_object_internal: "
-              << elapsed_time
-              << "ms, with target_rpc_service_addr: " << target_rpc_service_addr
-              << ", key size: " << objects.size()
-              << ", batch_id: " << lease.response().batch_id
-              << ", gc ttl: " << lease.response().gc_ttl_ms << "ms.";
+    if (!chunk_of_split_read || VLOG_IS_ON(1)) {
+        LOG(INFO) << "Time taken for batch_get_into_offload_object_internal: "
+                  << elapsed_time << "ms, with target_rpc_service_addr: "
+                  << target_rpc_service_addr << ", key size: " << objects.size()
+                  << ", batch_id: " << lease.response().batch_id
+                  << ", gc ttl: " << lease.response().gc_ttl_ms << "ms.";
+    }
 
     if (!result) {
         LOG(ERROR) << "Batch get into offload object failed with error: "

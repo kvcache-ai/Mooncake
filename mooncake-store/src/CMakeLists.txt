@@ -135,6 +135,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     transfer_task.cpp
     config/nof_debug_config.cpp
     config/fileread_worker_pool_config.cpp
+    config/offload_read_chunk_config.cpp
     config/nof_worker_pool_config.cpp
     posix_file.cpp
     client_buffer.cpp

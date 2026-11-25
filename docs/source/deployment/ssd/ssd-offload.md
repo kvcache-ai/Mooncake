@@ -149,6 +149,25 @@ The `MOONCAKE_OFFLOAD_*` watermark names are preferred. Short aliases `MOONCAKE_
 
 The pinned restore quota is separate from `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`; it does not convert the normal FileStorage arena to pinned memory. It is allocated only when `MC_STORE_MEMCPY=1`. The arena is selected when the current process owns the SSD replica and the restore destination is GPU memory, and is also used as request-scoped staging for DFS ranged-session reads into device memory. Tensor payload ranges are copied from their source offset without an additional FileStorage staging allocation. Remote and CPU-destination reads continue to use the existing path. If the pinned quota is exhausted, the request uses the normal client buffer arena; if the quota cannot be pinned at startup, the optimization remains disabled. io_uring disables the pinned restore arena. The file-per-key backend may still use its own temporary pageable buffer internally; the bucket and offset-allocator backends can read into the supplied restore buffer directly.
 
+### Read chunking
+
+These settings apply on the reading client (the process that calls `batch_get_into`, `batch_get_into_multi_buffers` or `batch_get_buffer`), not on the owner. They are read when the client is created. Chunking is off by default.
+
+| Environment Variable | Default | Description |
+|---|---|---|
+| `MOONCAKE_OFFLOAD_READ_CHUNK_BYTES` | `0` (off) | Maximum bytes per owner RPC when a batch read gets LOCAL_DISK objects from one owner. `0` sends all of an owner's objects in one RPC |
+| `MOONCAKE_OFFLOAD_READ_CHUNK_CONCURRENCY` | `4` | Chunks of one owner's read in flight at once, from `1` to `64`; a number outside that range is clamped with a warning. Used only when `MOONCAKE_OFFLOAD_READ_CHUNK_BYTES` is set |
+
+The owner stages each SSD read in its staging buffer (`MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`) until the reader has pulled the data. If all of a batch's objects on one owner go in one RPC and add up to more than the free part of that buffer, the RPC fails with `BUFFER_OVERFLOW` for all of them. With chunking, each chunk is its own RPC, transfer and release, so one batch read holds at most about `MOONCAKE_OFFLOAD_READ_CHUNK_CONCURRENCY` x `MOONCAKE_OFFLOAD_READ_CHUNK_BYTES` of an owner's buffer (an object larger than the cap is read as a chunk of its own). A batch whose objects on an owner fit in one chunk is still read with one RPC.
+
+Turn chunking on when a batch's objects on one owner can add up to more than that owner's staging buffer. A starting point is `MOONCAKE_OFFLOAD_READ_CHUNK_BYTES=67108864` (64 MiB) with the default concurrency of `4`, which holds at most about 256 MiB of an owner's buffer per batch read. When several readers share an owner, keep the sum of their concurrency x chunk bytes well below the owner's buffer size.
+
+With `MOONCAKE_OFFLOAD_USE_URING=true`, the owner pads each object's staging allocation for O_DIRECT reads: the object is rounded up to 4 KiB, plus 8 KiB. A chunk of many small objects therefore takes more of the staging buffer than its byte count, so leave room for the padding when you choose the chunk size.
+
+The objects of a read are put into chunks in key order, so concurrent readers of the same batch send the same chunks. The owner reads a chunk that several readers request at the same time from SSD once for all of them, as it does for identical unchunked batches.
+
+When a chunk fails with an error about the owner or the read as a whole (for example `RPC_FAIL`, `TRANSFER_FAIL`, `BUFFER_OVERFLOW`, `OBJECT_HAS_LEASE` or `LEASE_EXPIRED`), the owner's chunks that have not started are not sent, and the chunks in flight finish. A chunk that fails because the owner could not find or read its objects (`INVALID_KEY`, `OBJECT_NOT_FOUND`, `BUCKET_NOT_FOUND`, `FILE_NOT_FOUND`, `FILE_OPEN_FAIL` or `FILE_READ_FAIL`) fails only its own objects, and the read goes on. Objects from chunks that were read keep their data. A failed chunk's objects fail with its error, and the unsent objects fail with the error of the failed chunk with the lowest index among those that stopped the read. The master lease of each object is checked right after its chunk is read: an object whose lease has run out fails with `LEASE_EXPIRED`, and no further chunk is sent. Single-key reads (`get_buffer`, `get_into`, ranged reads) and Get Session range reads are not chunked.
+
 ### Bucket backend settings
 
 Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend`.

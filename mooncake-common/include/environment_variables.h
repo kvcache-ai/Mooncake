@@ -38,6 +38,12 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_USE_URING);
 };
 
+struct OffloadReadChunkEnvironmentVariables {
+    // Keep the raw strings so an invalid value can be warned about.
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_READ_CHUNK_BYTES);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_READ_CHUNK_CONCURRENCY);
+};
+
 struct FilePerKeyEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_FSDIR);
     MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFLOAD_ENABLE_EVICTION);

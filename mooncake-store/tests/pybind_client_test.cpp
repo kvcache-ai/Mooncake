@@ -14,8 +14,10 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -412,6 +414,820 @@ TEST_F(RealClientTest, LocalDiskBufferReadsRejectExpiredMasterLeaseAfterIo) {
     EXPECT_EQ(results, (std::vector<int>{lease_expired, lease_expired}));
     EXPECT_TRUE(std::all_of(destinations.begin() + kSize, destinations.end(),
                             [](char value) { return value == '\0'; }));
+}
+
+namespace {
+
+// A COMPLETE LOCAL_DISK replica on `endpoint` holding `object_size` bytes.
+QueryResult MakeLocalDiskQueryResult(
+    const std::string& endpoint, size_t object_size,
+    std::chrono::steady_clock::time_point lease_timeout) {
+    LocalDiskDescriptor descriptor;
+    descriptor.client_id = generate_uuid();
+    descriptor.object_size = object_size;
+    descriptor.transport_endpoint = endpoint;
+    Replica::Descriptor replica;
+    replica.descriptor_variant = std::move(descriptor);
+    replica.status = ReplicaStatus::COMPLETE;
+    return QueryResult({std::move(replica)}, lease_timeout);
+}
+
+// Calls of a fake LOCAL_DISK reader: the keys of each chunk it was given.
+struct LocalDiskReadCalls {
+    std::mutex mu;
+    std::vector<std::set<std::string>> chunks;
+
+    size_t Record(const RealClient::LocalDiskOffloadObjects& objects) {
+        std::set<std::string> keys;
+        for (const auto& object : objects) keys.insert(object.first);
+        std::lock_guard<std::mutex> lock(mu);
+        chunks.push_back(std::move(keys));
+        return chunks.size();
+    }
+};
+
+// Fills every destination slice of `objects` with the key's last character.
+void FillWithKeyTag(RealClient::LocalDiskOffloadObjects& objects) {
+    for (auto& [key, slices] : objects) {
+        for (auto& slice : slices) {
+            std::memset(slice.ptr, key.back(), slice.size);
+        }
+    }
+}
+
+// Puts each key with its value into `owner`'s own segment, waits until it has
+// a COMPLETE LOCAL_DISK replica, and clears its memory replica, so that every
+// read of it goes to the owner's SSD. lease_ms is the master's KV lease:
+// clearing a memory replica waits for the lease that querying it granted.
+::testing::AssertionResult PutDiskOnly(RealClient& owner,
+                                       const std::string& owner_addr,
+                                       const std::vector<std::string>& keys,
+                                       const std::vector<std::string>& values,
+                                       int lease_ms) {
+    ReplicateConfig config;
+    config.preferred_segment = owner_addr;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (owner.put(keys[i], std::span<const char>(values[i]), config) != 0) {
+            return ::testing::AssertionFailure() << "put failed: " << keys[i];
+        }
+    }
+    for (const auto& key : keys) {
+        bool ready = false;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (!ready && std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : owner.get_replica_desc(key)) {
+                ready |= replica.is_local_disk_replica() &&
+                         replica.status == ReplicaStatus::COMPLETE;
+            }
+            if (!ready) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+        if (!ready) {
+            return ::testing::AssertionFailure()
+                   << "no LOCAL_DISK replica: " << key;
+        }
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(lease_ms + 50));
+        owner.batch_replica_clear(keys, owner_addr);
+        bool disk_only = true;
+        for (const auto& key : keys) {
+            const auto replicas = owner.get_replica_desc(key);
+            disk_only &= replicas.size() == 1 &&
+                         replicas.front().is_local_disk_replica();
+        }
+        if (disk_only) return ::testing::AssertionSuccess();
+    }
+    return ::testing::AssertionFailure() << "memory replicas not cleared";
+}
+
+// `size` bytes that differ per key index.
+std::string MakeValue(size_t index, size_t size) {
+    std::string value(size, '\0');
+    for (size_t i = 0; i < size; ++i) {
+        value[i] = static_cast<char>((i * 7 + index * 13 + i / 4096) % 251);
+    }
+    return value;
+}
+
+// Destinations of a batch read, laid out back to back in one registered
+// buffer, and each object also split into two slices for
+// batch_get_into_multi_buffers.
+struct BatchDestinations {
+    std::string bytes;
+    std::vector<void*> buffers;
+    std::vector<size_t> sizes;
+    std::vector<std::vector<void*>> split_buffers;
+    std::vector<std::vector<size_t>> split_sizes;
+    std::vector<size_t> offsets;
+
+    explicit BatchDestinations(const std::vector<std::string>& values) {
+        size_t total = 0;
+        for (const auto& value : values) total += value.size();
+        bytes.assign(total, 'Z');
+        size_t offset = 0;
+        for (const auto& value : values) {
+            char* base = bytes.data() + offset;
+            const size_t head = value.size() / 4;
+            offsets.push_back(offset);
+            buffers.push_back(base);
+            sizes.push_back(value.size());
+            split_buffers.push_back({base, base + head});
+            split_sizes.push_back({head, value.size() - head});
+            offset += value.size();
+        }
+    }
+
+    void Reset() { std::fill(bytes.begin(), bytes.end(), 'Z'); }
+
+    std::string Of(size_t index) const {
+        return bytes.substr(offsets[index], sizes[index]);
+    }
+};
+
+}  // namespace
+
+TEST_F(RealClientTest, BatchGetIntoSplitsLocalDiskReadsIntoBoundedChunks) {
+    StartMasterAndSetupClient();
+
+    constexpr size_t kObjectSize = 16;
+    constexpr size_t kKeys = 7;
+    std::vector<std::string> keys;
+    std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
+    std::vector<std::vector<char>> destinations(kKeys);
+    std::vector<void*> buffers;
+    for (size_t i = 0; i < kKeys; ++i) {
+        keys.push_back("chunked_" + std::to_string(i));
+        query_results.emplace_back(MakeLocalDiskQueryResult(
+            "local-disk-endpoint", kObjectSize,
+            std::chrono::steady_clock::now() + std::chrono::minutes(1)));
+        destinations[i].assign(kObjectSize, '\0');
+        buffers.push_back(destinations[i].data());
+    }
+    const std::vector<size_t> sizes(kKeys, kObjectSize);
+    LocalDiskReadCalls calls;
+    auto reader = [&calls](const std::string& endpoint,
+                           RealClient::LocalDiskOffloadObjects& objects)
+        -> tl::expected<void, ErrorCode> {
+        EXPECT_EQ(endpoint, "local-disk-endpoint");
+        calls.Record(objects);
+        FillWithKeyTag(objects);
+        return {};
+    };
+
+    // Two objects per owner RPC, two RPCs in flight: 7 keys take 4 reads,
+    // formed in key order.
+    py_client_->offload_read_chunk_config_ = OffloadReadChunkConfig{
+        .chunk_bytes = 2 * kObjectSize, .chunk_concurrency = 2};
+    auto results = py_client_->batch_get_into_internal(keys, buffers, sizes,
+                                                       query_results, reader);
+    const std::set<std::set<std::string>> expected_chunks = {
+        {"chunked_0", "chunked_1"},
+        {"chunked_2", "chunked_3"},
+        {"chunked_4", "chunked_5"},
+        {"chunked_6"}};
+    ASSERT_EQ(calls.chunks.size(), 4u);
+    EXPECT_EQ(std::set<std::set<std::string>>(calls.chunks.begin(),
+                                              calls.chunks.end()),
+              expected_chunks);
+    ASSERT_EQ(results.size(), kKeys);
+    for (size_t i = 0; i < kKeys; ++i) {
+        ASSERT_TRUE(results[i].has_value()) << keys[i];
+        EXPECT_EQ(*results[i], static_cast<int64_t>(kObjectSize));
+        EXPECT_EQ(destinations[i],
+                  std::vector<char>(kObjectSize, static_cast<char>('0' + i)));
+    }
+
+    // Chunk bytes 0, the default: one read with every key of the owner, as
+    // before chunking.
+    EXPECT_EQ(OffloadReadChunkConfig{}.chunk_bytes, 0u);
+    calls.chunks.clear();
+    py_client_->offload_read_chunk_config_ = OffloadReadChunkConfig{};
+    results = py_client_->batch_get_into_internal(keys, buffers, sizes,
+                                                  query_results, reader);
+    ASSERT_EQ(calls.chunks.size(), 1u);
+    EXPECT_EQ(calls.chunks[0], std::set<std::string>(keys.begin(), keys.end()));
+    for (const auto& result : results) {
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(*result, static_cast<int64_t>(kObjectSize));
+    }
+}
+
+TEST_F(RealClientTest, BatchGetIntoFailedLocalDiskChunkFailsOnlyItsKeys) {
+    StartMasterAndSetupClient();
+
+    constexpr size_t kObjectSize = 16;
+    constexpr size_t kKeys = 6;
+    std::vector<std::string> keys;
+    std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
+    std::vector<std::vector<char>> destinations(kKeys);
+    std::vector<void*> buffers;
+    for (size_t i = 0; i < kKeys; ++i) {
+        keys.push_back("chunk_failure_" + std::to_string(i));
+        query_results.emplace_back(MakeLocalDiskQueryResult(
+            "local-disk-endpoint", kObjectSize,
+            std::chrono::steady_clock::now() + std::chrono::minutes(1)));
+        buffers.push_back(nullptr);
+    }
+    // Chunks of two keys in key order, read one after another; the second
+    // one (keys 2 and 3) fails.
+    py_client_->offload_read_chunk_config_ = OffloadReadChunkConfig{
+        .chunk_bytes = 2 * kObjectSize, .chunk_concurrency = 1};
+    for (const ErrorCode error :
+         {ErrorCode::BUFFER_OVERFLOW, ErrorCode::FILE_READ_FAIL}) {
+        // An error about the owner stops the read; one about the chunk's
+        // keys does not.
+        const bool stops = error == ErrorCode::BUFFER_OVERFLOW;
+        SCOPED_TRACE(toString(error));
+        for (size_t i = 0; i < kKeys; ++i) {
+            destinations[i].assign(kObjectSize, '\0');
+            buffers[i] = destinations[i].data();
+        }
+        LocalDiskReadCalls calls;
+        auto reader = [&calls, error](
+                          const std::string&,
+                          RealClient::LocalDiskOffloadObjects& objects)
+            -> tl::expected<void, ErrorCode> {
+            if (calls.Record(objects) == 2) return tl::make_unexpected(error);
+            FillWithKeyTag(objects);
+            return {};
+        };
+
+        std::vector<tl::expected<int64_t, ErrorCode>> results;
+        {
+            GLogMuter muter;
+            results = py_client_->batch_get_into_internal(
+                keys, buffers, std::vector<size_t>(kKeys, kObjectSize),
+                query_results, reader);
+        }
+
+        ASSERT_EQ(calls.chunks.size(), stops ? 2u : 3u);
+        EXPECT_EQ(calls.chunks[1], (std::set<std::string>{"chunk_failure_2",
+                                                          "chunk_failure_3"}));
+        ASSERT_EQ(results.size(), kKeys);
+        for (size_t i = 0; i < kKeys; ++i) {
+            SCOPED_TRACE(keys[i]);
+            const bool read = i < 2 || (!stops && i >= 4);
+            if (read) {
+                ASSERT_TRUE(results[i].has_value());
+                EXPECT_EQ(*results[i], static_cast<int64_t>(kObjectSize));
+                EXPECT_EQ(
+                    destinations[i],
+                    std::vector<char>(kObjectSize, static_cast<char>('0' + i)));
+            } else {
+                ASSERT_FALSE(results[i].has_value());
+                EXPECT_EQ(results[i].error(), error);
+                EXPECT_EQ(destinations[i],
+                          std::vector<char>(kObjectSize, '\0'));
+            }
+        }
+    }
+}
+
+// With chunking, the master lease of each key is rechecked right after its
+// own chunk was read (#5228). A key read within its lease keeps its data even
+// if the lease runs out while a later chunk is read; once a chunk finds an
+// expired lease, no further chunk is sent. Unsplit, the lease is checked per
+// key after the whole read, as before chunking.
+TEST_F(RealClientTest, BatchGetIntoRechecksLocalDiskLeaseAfterEachChunk) {
+    StartMasterAndSetupClient();
+
+    constexpr size_t kObjectSize = 16;
+    const auto now = std::chrono::steady_clock::now();
+    const auto lease_a = now + std::chrono::milliseconds(500);
+    const auto live = now + std::chrono::minutes(1);
+    const auto expired = now - std::chrono::seconds(1);
+    const std::vector<std::string> keys = {"lease_a", "lease_b", "lease_c",
+                                           "lease_d", "lease_e", "lease_a",
+                                           "lease_c"};
+    const std::vector<std::chrono::steady_clock::time_point> leases = {
+        lease_a, live, expired, live, live, lease_a, expired};
+    std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
+    for (const auto& lease : leases) {
+        query_results.emplace_back(MakeLocalDiskQueryResult(
+            "local-disk-endpoint", kObjectSize, lease));
+    }
+    std::vector<std::vector<char>> destinations(keys.size());
+    std::vector<void*> buffers(keys.size());
+    auto reset = [&]() {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            destinations[i].assign(kObjectSize, '\0');
+            buffers[i] = destinations[i].data();
+        }
+    };
+    LocalDiskReadCalls calls;
+    const auto reader = [&calls, lease_a](
+                            const std::string&,
+                            RealClient::LocalDiskOffloadObjects& objects)
+        -> tl::expected<void, ErrorCode> {
+        calls.Record(objects);
+        if (objects.count("lease_b")) {
+            // lease_a's chunk was read before; its lease runs out now.
+            std::this_thread::sleep_until(lease_a +
+                                          std::chrono::milliseconds(10));
+        }
+        FillWithKeyTag(objects);
+        return {};
+    };
+    const auto read = [&]() {
+        GLogMuter muter;
+        return py_client_->batch_get_into_internal(
+            keys, buffers, std::vector<size_t>(keys.size(), kObjectSize),
+            query_results, reader);
+    };
+    std::vector<tl::expected<int64_t, ErrorCode>> results;
+    const auto expect_lease_expired = [&results](size_t i) {
+        ASSERT_FALSE(results[i].has_value()) << i;
+        EXPECT_EQ(results[i].error(), ErrorCode::LEASE_EXPIRED) << i;
+    };
+
+    // One key per owner RPC, read in key order one after another.
+    py_client_->offload_read_chunk_config_ = OffloadReadChunkConfig{
+        .chunk_bytes = kObjectSize, .chunk_concurrency = 1};
+    reset();
+    results = read();
+    // lease_c's chunk finds its lease expired: lease_d and lease_e are not
+    // sent.
+    EXPECT_EQ(calls.chunks, (std::vector<std::set<std::string>>{
+                                {"lease_a"}, {"lease_b"}, {"lease_c"}}));
+    ASSERT_EQ(results.size(), keys.size());
+    for (size_t i : {0, 1, 5}) {
+        ASSERT_TRUE(results[i].has_value()) << i;
+        EXPECT_EQ(*results[i], static_cast<int64_t>(kObjectSize));
+        EXPECT_EQ(destinations[i],
+                  std::vector<char>(kObjectSize, keys[i].back()));
+    }
+    for (size_t i : {2, 3, 4, 6}) expect_lease_expired(i);
+    for (size_t i : {3, 4, 6}) {
+        EXPECT_EQ(destinations[i], std::vector<char>(kObjectSize, '\0')) << i;
+    }
+
+    // Unsplit: every key is read, then each lease is checked; lease_a has
+    // run out by now.
+    calls.chunks.clear();
+    py_client_->offload_read_chunk_config_ = OffloadReadChunkConfig{};
+    reset();
+    results = read();
+    ASSERT_EQ(calls.chunks.size(), 1u);
+    for (size_t i : {0, 2, 5, 6}) expect_lease_expired(i);
+    for (size_t i : {1, 3, 4}) {
+        ASSERT_TRUE(results[i].has_value()) << i;
+        EXPECT_EQ(destinations[i],
+                  std::vector<char>(kObjectSize, keys[i].back()));
+    }
+    // A duplicate gets neither a result nor bytes from an expired primary.
+    EXPECT_EQ(destinations[5], std::vector<char>(kObjectSize, '\0'));
+    EXPECT_EQ(destinations[6], std::vector<char>(kObjectSize, '\0'));
+}
+
+// The owner stages a LOCAL_DISK read in its offload buffer before the reader
+// pulls it. A batch larger than that buffer fails as one owner RPC and is
+// read in bounded chunks with chunking on, through every batch read path.
+TEST_F(RealClientTest, LocalDiskBatchLargerThanOwnerStagingIsReadInChunks) {
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    constexpr size_t kStagingBytes = 1 << 20;
+    ScopedEnvVar staging("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                         std::to_string(kStagingBytes).c_str());
+    char path[] = "/tmp/mooncake_ssd_chunked_read_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    constexpr int kLeaseMs = 1000;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(kLeaseMs)
+                                  .build()));
+    master_address_ = master_.master_address();
+    const std::string owner = "localhost:17834";
+    ASSERT_EQ(py_client_->setup_real(
+                  owner, "P2PHANDSHAKE", 64 * 1024 * 1024, 16 * 1024 * 1024,
+                  "tcp", "", master_address_, nullptr, "", true, ssd_path_),
+              0);
+    auto reader = RealClient::create();
+    ASSERT_EQ(reader->setup_real("localhost:17835", "P2PHANDSHAKE", 0,
+                                 16 * 1024 * 1024, "tcp", "", master_address_),
+              0);
+
+    // 16 objects of 128 KiB: 2 MiB on one owner with a 1 MiB staging buffer.
+    constexpr size_t kObjectSize = 128 * 1024;
+    constexpr size_t kKeys = 16;
+    static_assert(kKeys * kObjectSize > kStagingBytes);
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    for (size_t i = 0; i < kKeys; ++i) {
+        keys.push_back("chunked_ssd_" + std::to_string(i));
+        values.push_back(MakeValue(i, kObjectSize));
+    }
+    ASSERT_TRUE(PutDiskOnly(*py_client_, owner, keys, values, kLeaseMs));
+
+    BatchDestinations dst(values);
+    ASSERT_EQ(reader->register_buffer(dst.bytes.data(), dst.bytes.size()), 0);
+    const int64_t overflow = toInt(ErrorCode::BUFFER_OVERFLOW);
+
+    // One owner RPC for all 2 MiB: the owner cannot stage it.
+    reader->offload_read_chunk_config_ =
+        OffloadReadChunkConfig{.chunk_bytes = 0, .chunk_concurrency = 2};
+    auto before = reader->get_offload_rpc_read_count();
+    EXPECT_EQ(reader->batch_get_into(keys, dst.buffers, dst.sizes),
+              std::vector<int64_t>(kKeys, overflow));
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before + 1);
+    before = reader->get_offload_rpc_read_count();
+    EXPECT_EQ(reader->batch_get_into_multi_buffers(keys, dst.split_buffers,
+                                                   dst.split_sizes, false),
+              std::vector<int>(kKeys, static_cast<int>(overflow)));
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before + 1);
+    EXPECT_EQ(dst.bytes, std::string(dst.bytes.size(), 'Z'));
+
+    // Chunks of two objects, two in flight: at most 512 KiB staged at once.
+    reader->offload_read_chunk_config_ = OffloadReadChunkConfig{
+        .chunk_bytes = 2 * kObjectSize, .chunk_concurrency = 2};
+    before = reader->get_offload_rpc_read_count();
+    EXPECT_EQ(reader->batch_get_into(keys, dst.buffers, dst.sizes),
+              std::vector<int64_t>(kKeys, kObjectSize));
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before + kKeys / 2);
+    for (size_t i = 0; i < kKeys; ++i) EXPECT_EQ(dst.Of(i), values[i]) << i;
+
+    dst.Reset();
+    before = reader->get_offload_rpc_read_count();
+    EXPECT_EQ(reader->batch_get_into_multi_buffers(keys, dst.split_buffers,
+                                                   dst.split_sizes, false),
+              std::vector<int>(kKeys, kObjectSize));
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before + kKeys / 2);
+    for (size_t i = 0; i < kKeys; ++i) EXPECT_EQ(dst.Of(i), values[i]) << i;
+
+    before = reader->get_offload_rpc_read_count();
+    const auto handles = reader->batch_get_buffer(keys);
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before + kKeys / 2);
+    ASSERT_EQ(handles.size(), kKeys);
+    for (size_t i = 0; i < kKeys; ++i) {
+        ASSERT_NE(handles[i], nullptr) << keys[i];
+        EXPECT_EQ(std::string(static_cast<const char*>(handles[i]->ptr()),
+                              handles[i]->size()),
+                  values[i])
+            << keys[i];
+    }
+
+    ASSERT_EQ(reader->unregister_buffer(dst.bytes.data()), 0);
+    EXPECT_EQ(reader->tearDownAll(), 0);
+}
+
+// A chunk the owner cannot stage, through every batch path with a real
+// owner: the chunk before it keeps its data, the chunk after it is not sent,
+// and batch_get_buffer heals the failed and unsent keys by rereading them one
+// by one. The owner's staging is free again afterwards.
+TEST_F(RealClientTest, LocalDiskChunkFailureThroughEveryBatchPath) {
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    constexpr size_t kStagingBytes = 1 << 20;
+    ScopedEnvVar staging("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                         std::to_string(kStagingBytes).c_str());
+    // Leaked staging would stay allocated for the rest of the test instead of
+    // being collected after the default 5 s.
+    ScopedEnvVar staging_ttl("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
+                             "600000");
+    char path[] = "/tmp/mooncake_ssd_chunk_failure_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    constexpr int kLeaseMs = 1000;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(kLeaseMs)
+                                  .build()));
+    master_address_ = master_.master_address();
+    const std::string owner = "localhost:17834";
+    ASSERT_EQ(py_client_->setup_real(
+                  owner, "P2PHANDSHAKE", 64 * 1024 * 1024, 16 * 1024 * 1024,
+                  "tcp", "", master_address_, nullptr, "", true, ssd_path_),
+              0);
+    auto reader = RealClient::create();
+    ASSERT_EQ(reader->setup_real("localhost:17835", "P2PHANDSHAKE", 0,
+                                 16 * 1024 * 1024, "tcp", "", master_address_),
+              0);
+
+    // With 1280 KiB chunks in key order: 00-05 (768 KiB, fits the 1 MiB
+    // staging), 06-08 (640 + 512 + 128 KiB: BUFFER_OVERFLOW, which stops the
+    // read) and 09-11 (not sent).
+    constexpr size_t kKiB = 1024;
+    std::vector<size_t> sizes(12, 128 * kKiB);
+    sizes[6] = 640 * kKiB;
+    sizes[7] = 512 * kKiB;
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        keys.push_back("chunk_fail_" + std::string(i < 10 ? "0" : "") +
+                       std::to_string(i));
+        values.push_back(MakeValue(i, sizes[i]));
+    }
+    ASSERT_TRUE(PutDiskOnly(*py_client_, owner, keys, values, kLeaseMs));
+
+    BatchDestinations dst(values);
+    ASSERT_EQ(reader->register_buffer(dst.bytes.data(), dst.bytes.size()), 0);
+    const int64_t overflow = toInt(ErrorCode::BUFFER_OVERFLOW);
+    std::vector<int64_t> expected;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        expected.push_back(i < 6 ? static_cast<int64_t>(sizes[i]) : overflow);
+    }
+    auto check_destinations = [&]() {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            EXPECT_EQ(dst.Of(i), i < 6 ? values[i] : std::string(sizes[i], 'Z'))
+                << keys[i];
+        }
+    };
+
+    reader->offload_read_chunk_config_ = OffloadReadChunkConfig{
+        .chunk_bytes = 1280 * kKiB, .chunk_concurrency = 1};
+    auto before = reader->get_offload_rpc_read_count();
+    {
+        GLogMuter muter;
+        EXPECT_EQ(reader->batch_get_into(keys, dst.buffers, dst.sizes),
+                  expected);
+    }
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before + 2);
+    check_destinations();
+
+    dst.Reset();
+    before = reader->get_offload_rpc_read_count();
+    {
+        GLogMuter muter;
+        EXPECT_EQ(reader->batch_get_into_multi_buffers(keys, dst.split_buffers,
+                                                       dst.split_sizes, false),
+                  std::vector<int>(expected.begin(), expected.end()));
+    }
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before + 2);
+    check_destinations();
+
+    // batch_get_buffer asks the owner whether each failed key's file exists
+    // and, as it does, rereads the key on its own: 2 chunk RPCs, then one RPC
+    // for each of the 3 failed and 3 unsent keys.
+    before = reader->get_offload_rpc_read_count();
+    std::vector<std::shared_ptr<BufferHandle>> handles;
+    {
+        GLogMuter muter;
+        handles = reader->batch_get_buffer(keys);
+    }
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before + 2 + 6);
+    ASSERT_EQ(handles.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_NE(handles[i], nullptr) << keys[i];
+        EXPECT_EQ(std::string(static_cast<const char*>(handles[i]->ptr()),
+                              handles[i]->size()),
+                  values[i])
+            << keys[i];
+    }
+
+    // Neither the failed chunk nor the chunks read before it left staging
+    // allocated: one RPC that needs 896 of the owner's 1024 KiB succeeds.
+    const std::vector<size_t> big = {7, 0, 1, 2};
+    std::vector<std::string> big_keys;
+    std::vector<void*> big_buffers;
+    std::vector<size_t> big_sizes;
+    for (const size_t i : big) {
+        big_keys.push_back(keys[i]);
+        big_buffers.push_back(dst.buffers[i]);
+        big_sizes.push_back(sizes[i]);
+    }
+    reader->offload_read_chunk_config_ = OffloadReadChunkConfig{};
+    dst.Reset();
+    before = reader->get_offload_rpc_read_count();
+    EXPECT_EQ(reader->batch_get_into(big_keys, big_buffers, big_sizes),
+              std::vector<int64_t>(big_sizes.begin(), big_sizes.end()));
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before + 1);
+    for (const size_t i : big) EXPECT_EQ(dst.Of(i), values[i]) << keys[i];
+
+    ASSERT_EQ(reader->unregister_buffer(dst.bytes.data()), 0);
+    EXPECT_EQ(reader->tearDownAll(), 0);
+}
+
+// Each owner's keys are chunked on their own: a batch over two owners, each
+// with a 1 MiB staging buffer, sends one owner's 2 MiB in 8 chunks and the
+// other's 768 KiB in 3, and gets every byte through every batch path.
+TEST_F(RealClientTest, LocalDiskBatchAcrossTwoOwnersIsChunkedPerOwner) {
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    ScopedEnvVar staging("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                         std::to_string(1 << 20).c_str());
+    char path_a[] = "/tmp/mooncake_ssd_owner_a_XXXXXX";
+    char path_b[] = "/tmp/mooncake_ssd_owner_b_XXXXXX";
+    ASSERT_NE(mkdtemp(path_a), nullptr);
+    ssd_path_ = path_a;
+    ASSERT_NE(mkdtemp(path_b), nullptr);
+    struct RemoveDir {
+        std::string path;
+        ~RemoveDir() { std::filesystem::remove_all(path); }
+    } remove_b{path_b};
+    constexpr int kLeaseMs = 1000;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(kLeaseMs)
+                                  .build()));
+    master_address_ = master_.master_address();
+    const std::string owner_a = "localhost:17834";
+    const std::string owner_b = "localhost:17836";
+    ASSERT_EQ(py_client_->setup_real(
+                  owner_a, "P2PHANDSHAKE", 64 * 1024 * 1024, 16 * 1024 * 1024,
+                  "tcp", "", master_address_, nullptr, "", true, ssd_path_),
+              0);
+    auto second_owner = RealClient::create();
+    ASSERT_EQ(second_owner->setup_real(
+                  owner_b, "P2PHANDSHAKE", 64 * 1024 * 1024, 16 * 1024 * 1024,
+                  "tcp", "", master_address_, nullptr, "", true, path_b),
+              0);
+    auto reader = RealClient::create();
+    ASSERT_EQ(reader->setup_real("localhost:17835", "P2PHANDSHAKE", 0,
+                                 16 * 1024 * 1024, "tcp", "", master_address_),
+              0);
+
+    constexpr size_t kObjectSize = 128 * 1024;
+    std::vector<std::string> keys_a, values_a, keys_b, values_b;
+    for (size_t i = 0; i < 16; ++i) {
+        keys_a.push_back("owner_a_" + std::to_string(i));
+        values_a.push_back(MakeValue(i, kObjectSize));
+    }
+    for (size_t i = 0; i < 6; ++i) {
+        keys_b.push_back("owner_b_" + std::to_string(i));
+        values_b.push_back(MakeValue(100 + i, kObjectSize));
+    }
+    ASSERT_TRUE(PutDiskOnly(*py_client_, owner_a, keys_a, values_a, kLeaseMs));
+    ASSERT_TRUE(
+        PutDiskOnly(*second_owner, owner_b, keys_b, values_b, kLeaseMs));
+    auto disk_endpoint = [&](const std::string& key) {
+        for (const auto& replica : reader->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) {
+                return replica.get_local_disk_descriptor().transport_endpoint;
+            }
+        }
+        return std::string();
+    };
+    const std::string endpoint_a = disk_endpoint(keys_a[0]);
+    const std::string endpoint_b = disk_endpoint(keys_b[0]);
+    ASSERT_FALSE(endpoint_a.empty());
+    ASSERT_FALSE(endpoint_b.empty());
+    ASSERT_NE(endpoint_a, endpoint_b);
+    for (const auto& key : keys_a) EXPECT_EQ(disk_endpoint(key), endpoint_a);
+    for (const auto& key : keys_b) EXPECT_EQ(disk_endpoint(key), endpoint_b);
+
+    // The batch interleaves the owners' keys.
+    std::vector<std::string> keys, values;
+    std::vector<bool> on_a;
+    for (size_t i = 0; i < keys_a.size(); ++i) {
+        keys.push_back(keys_a[i]);
+        values.push_back(values_a[i]);
+        on_a.push_back(true);
+        if (i < keys_b.size()) {
+            keys.push_back(keys_b[i]);
+            values.push_back(values_b[i]);
+            on_a.push_back(false);
+        }
+    }
+    BatchDestinations dst(values);
+    ASSERT_EQ(reader->register_buffer(dst.bytes.data(), dst.bytes.size()), 0);
+
+    // Unchunked, one RPC per owner: owner A cannot stage its 2 MiB, owner B
+    // can stage its 768 KiB.
+    reader->offload_read_chunk_config_ = OffloadReadChunkConfig{};
+    auto before = reader->get_offload_rpc_read_count();
+    std::vector<int64_t> results;
+    {
+        GLogMuter muter;
+        results = reader->batch_get_into(keys, dst.buffers, dst.sizes);
+    }
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before + 2);
+    ASSERT_EQ(results.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_EQ(results[i], on_a[i] ? toInt(ErrorCode::BUFFER_OVERFLOW)
+                                      : static_cast<int64_t>(kObjectSize))
+            << keys[i];
+    }
+
+    // Chunks of two objects, two in flight, per owner: 8 RPCs to A, 3 to B.
+    reader->offload_read_chunk_config_ = OffloadReadChunkConfig{
+        .chunk_bytes = 2 * kObjectSize, .chunk_concurrency = 2};
+    dst.Reset();
+    before = reader->get_offload_rpc_read_count();
+    EXPECT_EQ(reader->batch_get_into(keys, dst.buffers, dst.sizes),
+              std::vector<int64_t>(keys.size(), kObjectSize));
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before + 8 + 3);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_EQ(dst.Of(i), values[i]) << keys[i];
+    }
+
+    dst.Reset();
+    before = reader->get_offload_rpc_read_count();
+    EXPECT_EQ(reader->batch_get_into_multi_buffers(keys, dst.split_buffers,
+                                                   dst.split_sizes, false),
+              std::vector<int>(keys.size(), kObjectSize));
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before + 8 + 3);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_EQ(dst.Of(i), values[i]) << keys[i];
+    }
+
+    before = reader->get_offload_rpc_read_count();
+    const auto handles = reader->batch_get_buffer(keys);
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before + 8 + 3);
+    ASSERT_EQ(handles.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_NE(handles[i], nullptr) << keys[i];
+        EXPECT_EQ(std::string(static_cast<const char*>(handles[i]->ptr()),
+                              handles[i]->size()),
+                  values[i])
+            << keys[i];
+    }
+
+    ASSERT_EQ(reader->unregister_buffer(dst.bytes.data()), 0);
+    EXPECT_EQ(reader->tearDownAll(), 0);
+    EXPECT_EQ(second_owner->tearDownAll(), 0);
+}
+
+// A master lease that runs out during a chunked read stops it at the first
+// chunk on every batch path: the unsent keys fail with LEASE_EXPIRED instead
+// of being read for nothing, and batch_get_buffer does not reread them.
+TEST_F(RealClientTest, ChunkedLocalDiskReadStopsAtAnExpiredMasterLease) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    char path[] = "/tmp/mooncake_ssd_chunk_lease_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    // A zero TTL makes every QueryResult expire at its query-start timestamp,
+    // so the lease check after the first chunk fails without any timing.
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(0)
+                                  .set_eviction_high_watermark_ratio(1.0)
+                                  .build()));
+    master_address_ = master_.master_address();
+    const std::string owner = "localhost:17813";
+    ASSERT_EQ(py_client_->setup_real(
+                  owner, "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
+                  "tcp", "", master_address_, nullptr, "", true, ssd_path_),
+              0);
+
+    constexpr size_t kObjectSize = 4096;
+    constexpr size_t kKeys = 8;
+    std::vector<std::string> keys, values;
+    for (size_t i = 0; i < kKeys; ++i) {
+        keys.push_back("chunk_lease_" + std::to_string(i));
+        values.push_back(MakeValue(i, kObjectSize));
+    }
+    ASSERT_TRUE(PutDiskOnly(*py_client_, owner, keys, values, 0));
+    BatchDestinations dst(values);
+    ASSERT_EQ(py_client_->register_buffer(dst.bytes.data(), dst.bytes.size()),
+              0);
+    const int64_t lease_expired = toInt(ErrorCode::LEASE_EXPIRED);
+
+    // Two keys per chunk, one chunk at a time: only the first is read.
+    py_client_->offload_read_chunk_config_ = OffloadReadChunkConfig{
+        .chunk_bytes = 2 * kObjectSize, .chunk_concurrency = 1};
+    auto before = py_client_->get_offload_rpc_read_count();
+    {
+        GLogMuter muter;
+        EXPECT_EQ(py_client_->batch_get_into(keys, dst.buffers, dst.sizes),
+                  std::vector<int64_t>(kKeys, lease_expired));
+    }
+    EXPECT_EQ(py_client_->get_offload_rpc_read_count(), before + 1);
+
+    before = py_client_->get_offload_rpc_read_count();
+    {
+        GLogMuter muter;
+        EXPECT_EQ(py_client_->batch_get_into_multi_buffers(
+                      keys, dst.split_buffers, dst.split_sizes, false),
+                  std::vector<int>(kKeys, static_cast<int>(lease_expired)));
+    }
+    EXPECT_EQ(py_client_->get_offload_rpc_read_count(), before + 1);
+
+    before = py_client_->get_offload_rpc_read_count();
+    std::vector<std::shared_ptr<BufferHandle>> handles;
+    {
+        GLogMuter muter;
+        handles = py_client_->batch_get_buffer(keys);
+    }
+    EXPECT_EQ(py_client_->get_offload_rpc_read_count(), before + 1);
+    EXPECT_EQ(handles,
+              std::vector<std::shared_ptr<BufferHandle>>(kKeys, nullptr));
+
+    // Unsplit, every key is read and then fails its lease check, as before
+    // chunking.
+    py_client_->offload_read_chunk_config_ = OffloadReadChunkConfig{};
+    before = py_client_->get_offload_rpc_read_count();
+    {
+        GLogMuter muter;
+        EXPECT_EQ(py_client_->batch_get_into(keys, dst.buffers, dst.sizes),
+                  std::vector<int64_t>(kKeys, lease_expired));
+    }
+    EXPECT_EQ(py_client_->get_offload_rpc_read_count(), before + 1);
+    EXPECT_EQ(py_client_->unregister_buffer(dst.bytes.data()), 0);
 }
 
 TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
