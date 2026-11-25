@@ -151,9 +151,8 @@ TEST(UnregisterQuiesce, AlignedBatchAddressesSpreadAcrossShards) {
     for (int i = 0; i < 256; ++i) {
         auto* batch = new Transport::BatchDesc;
         batches.push_back(batch);
-        buckets.insert(
-            UnregisterQuiesceTestPeer::shard(
-                reinterpret_cast<Transport::BatchID>(batch)));
+        buckets.insert(UnregisterQuiesceTestPeer::shard(
+            reinterpret_cast<Transport::BatchID>(batch)));
     }
     for (auto* batch : batches) delete batch;
     EXPECT_GT(buckets.size(), 4u);
