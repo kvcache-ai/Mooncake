@@ -5288,3 +5288,95 @@ def test_session_config_expands_with_physical_keys_without_mutating_input():
         _config_for_grouped_keys(
             SimpleNamespace(per_key_preferred_hca_names=[["mlx5_0"], []]), 2
         )
+
+
+def test_dataproto_indexed_copy_fallback_preserves_bytes_and_reuses_chunk() -> None:
+    store, transfer = make_transfer(PlainStore())
+    values = np.arange(49, 58, dtype=np.uint8)
+    ref = transfer.put_dataproto(
+        SimpleDataProto(batch={"field": values}), chunk_bytes=4
+    )
+    chunks = ref.stage_refs["default"].manifest["buffers"]["batch.field"]["chunks"]
+    chunk_index_by_key = {chunk["key"]: idx for idx, chunk in enumerate(chunks)}
+
+    rows = [0, 2, 2, 5, 0]
+    destination = np.empty_like(values[rows])
+    store.events.clear()
+
+    result = transfer.get_dataproto(ref, rows=rows, destinations={"field": destination})
+
+    assert result["batch"]["field"] is destination
+    assert np.array_equal(destination, values[rows])
+    payload_chunk_gets = [
+        chunk_index_by_key[key]
+        for op, key in store.events
+        if op == "get" and key in chunk_index_by_key
+    ]
+    assert payload_chunk_gets == [0, 1, 0]
+
+    # Empty selection performs zero payload chunk fetches.
+    empty_dst = np.empty((0,), dtype=np.uint8)
+    store.events.clear()
+    empty_result = transfer.get_dataproto(
+        ref, rows=[], destinations={"field": empty_dst}
+    )
+    assert empty_result["batch"]["field"] is empty_dst
+    assert empty_dst.shape == (0,)
+    assert not [
+        key for op, key in store.events if op == "get" and key in chunk_index_by_key
+    ]
+
+
+def test_dataproto_indexed_copy_fallback_handles_binary_int16_bytearray_and_short_read() -> (
+    None
+):
+    store, transfer = make_transfer(PlainStore())
+    binary = np.array([-32768, -1, 0x01FF, 0x7F00, 12345, -256], dtype=np.int16)
+    ref = transfer.put_dataproto(
+        SimpleDataProto(batch={"field": binary}), chunk_bytes=4
+    )
+    payload_spec = ref.stage_refs["default"].manifest["buffers"]["batch.field"]
+    chunks = payload_spec["chunks"]
+    chunk_index_by_key = {chunk["key"]: idx for idx, chunk in enumerate(chunks)}
+
+    rows = [5, 0, 0, 3, 2, 2, 5]
+    expected = binary[rows]
+
+    # Explicit NumPy destination with non-ASCII binary bytes, reverse & duplicate rows.
+    destination = np.empty_like(expected)
+    store.events.clear()
+    transfer.get_dataproto(ref, rows=rows, destinations={"field": destination})
+    assert np.array_equal(destination, expected)
+    payload_chunk_gets = [
+        chunk_index_by_key[key]
+        for op, key in store.events
+        if op == "get" and key in chunk_index_by_key
+    ]
+    assert payload_chunk_gets == [2, 0, 1, 2]
+
+    # Implicit allocation path matches as well.
+    inferred = transfer.get_dataproto(ref, rows=rows)
+    assert np.array_equal(inferred["batch"]["field"], expected)
+
+    # Direct bytearray destination path preserves exact bytes, reuses consecutive chunks,
+    # and releases exported memoryviews cleanly so the bytearray remains resizable.
+    raw_dst = bytearray(expected.nbytes)
+    ranges = [(row * 2, idx * 2, 2) for idx, row in enumerate(rows)]
+    store.events.clear()
+    transfer._bundle_store.read_payload_ranges_into_bytearray(
+        payload_spec, raw_dst, ranges
+    )
+    assert bytes(raw_dst) == expected.tobytes()
+    assert [
+        chunk_index_by_key[key]
+        for op, key in store.events
+        if op == "get" and key in chunk_index_by_key
+    ] == [2, 0, 1, 2]
+    raw_dst.append(0)
+    assert len(raw_dst) == expected.nbytes + 1
+
+    # Truncated chunk still raises RuntimeError instead of silently writing short data.
+    truncated_key = chunks[0]["key"]
+    store.objects[truncated_key] = store.objects[truncated_key][:-1]
+    with pytest.raises(RuntimeError, match="expected 4 bytes, got 3"):
+        transfer.get_dataproto(ref, rows=[0, 0])

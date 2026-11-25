@@ -5510,24 +5510,47 @@ class _MooncakePayloadTransport:
         destination: bytearray | np.ndarray,
         ranges: Sequence[tuple[int, int, int]],
     ) -> None:
-        for source_offset, destination_offset, byte_length in ranges:
-            for (
-                key,
-                chunk_size,
-                fragment_destination_offset,
-                fragment_source_offset,
-                size,
-            ) in _payload_range_fragments(
-                chunks, source_offset, byte_length, destination_offset
-            ):
-                data = self._store.get(key)
-                if len(data) != chunk_size:
-                    raise RuntimeError(
-                        f"get failed for {key}: expected {chunk_size} bytes, got {len(data)}"
-                    )
-                destination[
-                    fragment_destination_offset : fragment_destination_offset + size
-                ] = data[fragment_source_offset : fragment_source_offset + size]
+        with (
+            memoryview(destination) as destination_raw,
+            destination_raw.cast("B") as destination_bytes,
+        ):
+            cached_key: str | None = None
+            cached_view: memoryview | None = None
+            try:
+                for source_offset, destination_offset, byte_length in ranges:
+                    for (
+                        key,
+                        chunk_size,
+                        fragment_destination_offset,
+                        fragment_source_offset,
+                        size,
+                    ) in _payload_range_fragments(
+                        chunks, source_offset, byte_length, destination_offset
+                    ):
+                        if key != cached_key:
+                            data = self._store.get(key)
+                            with memoryview(data) as raw_view:
+                                data_view = raw_view.cast("B")
+                            actual_size = len(data_view)
+                            if actual_size != chunk_size:
+                                data_view.release()
+                                raise RuntimeError(
+                                    f"get failed for {key}: expected {chunk_size} bytes, got {actual_size}"
+                                )
+                            if cached_view is not None:
+                                cached_view.release()
+                            cached_key = key
+                            cached_view = data_view
+                        assert cached_view is not None
+                        destination_bytes[
+                            fragment_destination_offset : fragment_destination_offset
+                            + size
+                        ] = cached_view[
+                            fragment_source_offset : fragment_source_offset + size
+                        ]
+            finally:
+                if cached_view is not None:
+                    cached_view.release()
 
     def _copy_payload_range_into_bytearray(
         self,
