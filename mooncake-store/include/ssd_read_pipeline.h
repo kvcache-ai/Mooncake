@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -17,33 +18,26 @@ enum class Error {
     kStaleEvent,
     kIoError,
     kTransferError,
-    kCancelled,
     kNotSupported,
 };
 
-// Opaque registry identity, not a pointer or an RNIC access key.
 struct DestinationSlice {
-    uint64_t region_id;
-    uint64_t generation;
+    size_t destination_index;
     uint64_t offset;
     uint64_t length;
-};
-
-struct ReadRange {
-    uint64_t source_offset;
-    std::vector<DestinationSlice> destinations;
 };
 
 struct ObjectRead {
     uint64_t object_bytes;
     uint64_t value_file_offset;
-    std::vector<ReadRange> ranges;
+    uint64_t source_offset;
+    std::vector<DestinationSlice> destinations;
 };
 
 struct PlanOptions {
     size_t slot_bytes;
-    size_t alignment;
-    size_t max_chunks;
+    size_t alignment{1};
+    size_t max_chunks{65536};
     size_t max_fragments{65536};
 };
 
@@ -77,13 +71,26 @@ struct PlanResult {
 // Any failure returns an empty plan; no partial plan may be submitted.
 PlanResult BuildReadPlan(const ObjectRead& object, PlanOptions options);
 
+// Pure completion classifier for buffered io_uring read CQEs: handles short
+// reads, transient -EINTR/-EAGAIN retries, EOF, and over-long completions.
+struct UringReadStep {
+    bool retry{false};
+    size_t next_done{0};
+    unsigned next_retries{0};
+    Error error{Error::kOk};
+    int sys_errno{0};
+};
+
+UringReadStep ClassifyUringReadResult(int completed, size_t done,
+                                      size_t requested, unsigned retries,
+                                      unsigned max_retries = 3) noexcept;
+
 enum class SlotStage { kFree, kReading, kWriting };
 enum class PipelineState {
     kReady,
     kRunning,
     kDraining,
     kSucceeded,
-    kCancelled,
     kFailed,
 };
 
@@ -93,11 +100,17 @@ struct SlotBuffer {
 };
 
 struct SlotToken {
-    uint64_t request_id;
-    uint64_t attempt_id;
     size_t slot_index;
     uint64_t generation;
     size_t chunk_index;
+};
+
+struct IoCompletion {
+    SlotToken token{};
+    SlotStage stage{SlotStage::kFree};
+    size_t bytes{0};
+    Error result{Error::kOk};
+    int sys_errno{0};
 };
 
 class PipelineDriver {
@@ -105,33 +118,31 @@ class PipelineDriver {
     virtual ~PipelineDriver() = default;
 
     // Called on the scheduler thread. No inline completion callbacks.
-    // false means rejected with NO outstanding device access. After true,
-    // the driver must deliver a staging-drained event even on
-    // cancellation/error. Destination drain is independently tracked by the
-    // remote write target. ReadChunk and buffers stay alive until that event
-    // has been consumed.
+    // false means rejected with NO outstanding I/O. After true, the driver
+    // borrows both buffer and chunk until the completion event is delivered or
+    // the driver is destroyed (so the owning ReadPlan must outlive the driver).
     virtual bool SubmitRead(const SlotToken& token, const ReadChunk& chunk,
                             SlotBuffer buffer) noexcept = 0;
     virtual bool SubmitWrite(const SlotToken& token, const ReadChunk& chunk,
                              SlotBuffer buffer) noexcept = 0;
-    // Best effort only. This call does not release a slot.
-    virtual void RequestCancel(const SlotToken&, SlotStage) noexcept {}
+    virtual bool WaitForEvent(IoCompletion&, std::chrono::milliseconds) {
+        return false;
+    }
 };
 
-// Single scheduler thread. Other workers enqueue events for that thread.
-// Caller owns arena/MRs and driver; keep them and this object alive until
-// inflight()==0. A software timeout is NOT a drained completion.
+// Single scheduler thread; worker threads deliver completions via WaitForEvent.
+// Caller owns staging slots and driver and keeps them alive until inflight()==0
+// (or relies on driver destruction draining accepted I/O first).
 class ReadPipeline {
    public:
-    ReadPipeline(uint64_t request_id, uint64_t attempt_id, ReadPlan plan,
-                 std::vector<SlotBuffer> buffers, PipelineDriver& driver);
+    ReadPipeline(ReadPlan plan, std::vector<SlotBuffer> buffers,
+                 PipelineDriver& driver);
     ReadPipeline(const ReadPipeline&) = delete;
     ReadPipeline& operator=(const ReadPipeline&) = delete;
     ReadPipeline(ReadPipeline&&) = delete;
     ReadPipeline& operator=(ReadPipeline&&) = delete;
 
     Error Start();
-    void Cancel();
     Error ReadDrained(const SlotToken& token, size_t bytes_read,
                       Error result = Error::kOk);
     Error WriteDrained(const SlotToken& token, Error result = Error::kOk);
@@ -139,9 +150,6 @@ class ReadPipeline {
     PipelineState state() const { return state_; }
     Error error() const { return error_; }
     size_t inflight() const { return inflight_; }
-    // Successfully written bytes, including writes drained after cancellation.
-    // Only kSucceeded permits publication of the complete destination object.
-    uint64_t completed_bytes() const { return completed_bytes_; }
 
    private:
     struct Slot {
@@ -158,14 +166,12 @@ class ReadPipeline {
     bool Matches(const SlotToken& token, SlotStage stage) const;
     SlotToken Token(size_t slot_index) const;
 
-    uint64_t request_id_, attempt_id_;
     ReadPlan plan_;
     PipelineDriver& driver_;
     std::vector<Slot> slots_;
     PipelineState state_{PipelineState::kReady};
     Error error_{Error::kOk};
     size_t next_chunk_{0}, inflight_{0}, completed_chunks_{0};
-    uint64_t completed_bytes_{0};
 };
 
 }  // namespace mooncake::ssd_offload

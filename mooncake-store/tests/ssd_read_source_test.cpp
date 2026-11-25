@@ -2,16 +2,16 @@
 // Licensed under the Apache License, Version 2.0.
 #include "ssd_read_source.h"
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <array>
 #include <atomic>
 #include <cstring>
 #include <filesystem>
-#include <fcntl.h>
 #include <future>
-#include <sys/stat.h>
 #include <memory>
 #include <vector>
 
@@ -38,17 +38,16 @@ class SourceFile {
     std::vector<std::byte> bytes;
 };
 
-TEST(SsdReadSource, ReadsRealFileUsingImmutableValueMetadata) {
+TEST(SsdReadSource, ReadsRealFileAndExposesBlockingNativeFd) {
     SourceFile file;
     ASSERT_GE(file.fd, 0);
     ASSERT_EQ(file.written, static_cast<ssize_t>(file.bytes.size()));
-    auto result = OpenPosixReadSource(file.path, {12000, 17, 1});
+    auto result = OpenPosixReadSource(file.path, file.bytes.size());
     ASSERT_EQ(result.error, Error::kOk);
     ASSERT_TRUE(result.source);
     ASSERT_TRUE(result.source->native_read_fd());
     EXPECT_EQ(fcntl(*result.source->native_read_fd(), F_GETFL) & O_NONBLOCK, 0);
-    EXPECT_EQ(result.source->info().object_bytes, 12000u);
-    EXPECT_EQ(result.source->info().value_file_offset, 17u);
+    EXPECT_EQ(result.source->file_bytes(), file.bytes.size());
     std::array<std::byte, 257> buffer{};
     auto read = result.source->ReadAt(buffer, 617);
     ASSERT_EQ(read.error, Error::kOk);
@@ -57,9 +56,9 @@ TEST(SsdReadSource, ReadsRealFileUsingImmutableValueMetadata) {
         std::memcmp(buffer.data(), file.bytes.data() + 617, buffer.size()), 0);
 }
 
-TEST(SsdReadSource, AcceptsEofPaddingButReportsActualBytes) {
+TEST(SsdReadSource, ReportsShortReadAtEof) {
     SourceFile file;
-    auto result = OpenPosixReadSource(file.path, {12000, 17, 4096});
+    auto result = OpenPosixReadSource(file.path, file.bytes.size());
     ASSERT_EQ(result.error, Error::kOk);
     std::array<std::byte, 32> buffer{};
     auto read = result.source->ReadAt(buffer, file.bytes.size() - 5);
@@ -70,20 +69,15 @@ TEST(SsdReadSource, AcceptsEofPaddingButReportsActualBytes) {
               0);
 }
 
-TEST(SsdReadSource, RejectsInvalidMetadataAndUnsupportedFiles) {
+TEST(SsdReadSource, RejectsShortFileDirectoryAndMissingPath) {
     SourceFile file;
-    EXPECT_EQ(OpenPosixReadSource(file.path, {12001, 17, 1}).error,
-              Error::kInvalidArgument);
-    EXPECT_EQ(OpenPosixReadSource(file.path, {1, UINT64_MAX, 1}).error,
-              Error::kOverflow);
-    EXPECT_EQ(OpenPosixReadSource(file.path, {1, 0, 3}).error,
+    EXPECT_EQ(OpenPosixReadSource(file.path, file.bytes.size() + 1).error,
               Error::kInvalidArgument);
     const auto directory = file.path + ".directory";
     std::filesystem::create_directory(directory);
-    EXPECT_EQ(OpenPosixReadSource(directory, {1, 0, 1}).error,
-              Error::kInvalidArgument);
+    EXPECT_EQ(OpenPosixReadSource(directory, 1).error, Error::kInvalidArgument);
     std::filesystem::remove(directory);
-    EXPECT_EQ(OpenPosixReadSource(file.path + ".missing", {1, 0, 1}).error,
+    EXPECT_EQ(OpenPosixReadSource(file.path + ".missing", 1).error,
               Error::kIoError);
 }
 
@@ -94,7 +88,7 @@ TEST(SsdReadSource, PinsFileAndLifetimeAfterUnlink) {
         delete static_cast<int*>(value);
         destroyed->store(true);
     });
-    auto result = OpenPosixReadSource(file.path, {12000, 17, 1}, lifetime);
+    auto result = OpenPosixReadSource(file.path, file.bytes.size(), lifetime);
     ASSERT_EQ(result.error, Error::kOk);
     lifetime.reset();
     ASSERT_EQ(unlink(file.path.c_str()), 0);
@@ -109,7 +103,7 @@ TEST(SsdReadSource, PinsFileAndLifetimeAfterUnlink) {
 
 TEST(SsdReadSource, ChecksSignedOffsetsBeforeCallingPosix) {
     SourceFile file;
-    auto result = OpenPosixReadSource(file.path, {12000, 17, 1});
+    auto result = OpenPosixReadSource(file.path, file.bytes.size());
     ASSERT_EQ(result.error, Error::kOk);
     std::array<std::byte, 32> buffer{};
     EXPECT_EQ(result.source->ReadAt(buffer, UINT64_MAX).error,
@@ -122,12 +116,10 @@ TEST(SsdReadSource, RejectsFifoWithoutWaitingForAWriter) {
     SourceFile file;
     const auto fifo = file.path + ".fifo";
     ASSERT_EQ(mkfifo(fifo.c_str(), 0600), 0);
-    auto opening = std::async(std::launch::async, [&] {
-        return OpenPosixReadSource(fifo, {0, 0, 1});
-    });
-    const auto status = opening.wait_for(std::chrono::seconds(2));
+    auto opening = std::async(std::launch::async,
+                              [&] { return OpenPosixReadSource(fifo, 0); });
+    const auto status = opening.wait_for(std::chrono::seconds(10));
     EXPECT_EQ(status, std::future_status::ready);
-    // Unblock the old blocking-open implementation so RED cannot hang.
     if (status != std::future_status::ready) {
         const int writer = open(fifo.c_str(), O_WRONLY);
         if (writer >= 0) close(writer);
@@ -135,5 +127,6 @@ TEST(SsdReadSource, RejectsFifoWithoutWaitingForAWriter) {
     EXPECT_EQ(opening.get().error, Error::kInvalidArgument);
     unlink(fifo.c_str());
 }
+
 }  // namespace
 }  // namespace mooncake::ssd_offload

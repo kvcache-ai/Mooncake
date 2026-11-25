@@ -150,31 +150,33 @@ default to four and two workers, configured with
 `MOONCAKE_OFFLOAD_STREAM_READ_THREADS` and
 `MOONCAKE_OFFLOAD_STREAM_WRITE_THREADS`.
 `MOONCAKE_OFFLOAD_STREAM_MAX_OUTSTANDING` (default 64) bounds accepted tasks
-and source leases. Full executors apply backpressure. Shutdown waits for
-accepted local reads before releasing their staging memory.
+and unique open bucket leases (keys in the same bucket share one open file
+descriptor and `BucketReadGuard`). Full executors apply backpressure. Shutdown
+waits for accepted local reads before releasing their staging memory.
 
 The entire batch is checked for invalid ranges and overlapping destinations
-before copying. A preflight capacity failure can use the existing restore
-path. An I/O failure after copying starts reports failure after accepted work
-has drained. Publish the destination data only after the read succeeds.
+before copying. Overlapping destinations and preflight capacity limits fall back
+to the existing sequential restore path; invalid ranges, arena-aliasing
+destinations, and post-preflight I/O errors fail directly. An I/O failure after
+copying starts reports failure after accepted work has drained. Publish the
+destination data only after the read succeeds.
 
 ### Optional streaming io_uring
 
 Set `MOONCAKE_OFFLOAD_STREAM_USE_URING=true` together with local streaming
-to use persistent ordinary-READ workers. The worker retains each file and
-slot until its completion is consumed. Partial reads continue from the
-completed offset, and transient completion errors have a finite retry budget.
-Submission backpressure keeps accepted work within the configured limit.
+to use persistent ordinary-READ `io_uring` workers. Each worker owns one ring
+and retains every source and staging slot until its CQE is consumed. Partial
+reads continue from the completed offset, and transient `-EINTR`/`-EAGAIN`
+completions have a finite retry budget. Submission backpressure keeps accepted
+work within the configured limit.
 
-`MOONCAKE_OFFLOAD_STREAM_FIXED_BUFFERS=true` (when combined with
-`MOONCAKE_OFFLOAD_STREAM_USE_URING=true`) uses a per-batch ring with
-the staging slots registered as fixed buffers. Registration failure uses
-ordinary READ on that ring. If `io_uring` is unavailable at build or runtime,
-or if a previous batch left the persistent `io_uring` read executor in a failed
-state, subsequent local streaming batches fall back to the portable `pread`
-driver (an in-flight batch whose ring fails drains and returns
-`FILE_READ_FAIL`). Both drivers drain accepted work before source and staging
-release.
+If `io_uring` is unavailable at build or runtime, or if a previous batch left
+the persistent `io_uring` read executor in a failed state, a warning is logged
+and subsequent local streaming batches fall back to the portable `pread` driver
+(queued operations on a failed worker complete with `FILE_READ_FAIL`, while
+already-prepared SQEs keep their source and buffer pinned until their CQEs
+arrive). Both drivers drain accepted work before releasing source leases or
+staging slots.
 
 ## Storage Backends
 

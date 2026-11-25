@@ -14,7 +14,9 @@
 #include "client_buffer.h"
 #include "storage_backend.h"
 #include "ssd_pipeline_io.h"
+#if defined(__linux__) && defined(USE_URING)
 #include "ssd_uring_pipeline.h"
+#endif
 #include <shared_mutex>
 #include "pinned_buffer_pool.h"
 
@@ -419,7 +421,9 @@ class FileStorage {
     mutable std::shared_mutex streaming_mutex_;
     mutable std::mutex streaming_reads_init_mutex_;
     bool streaming_stopped_{false};
+#if defined(__linux__) && defined(USE_URING)
     std::shared_ptr<ssd_offload::UringReadExecutor> streaming_uring_reads_;
+#endif
     std::unique_ptr<ssd_offload::BoundedExecutor> streaming_reads_;
     std::unique_ptr<ssd_offload::BoundedExecutor> streaming_writes_;
     std::atomic<size_t> active_streaming_sources_{0};

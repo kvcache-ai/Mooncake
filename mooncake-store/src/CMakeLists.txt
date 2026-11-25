@@ -149,7 +149,6 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     ssd_read_pipeline.cpp
     ssd_read_source.cpp
     ssd_pipeline_io.cpp
-    ssd_uring_pipeline.cpp
     config/client_host_identity_config.cpp
     ssd_prefetcher.cpp
     config/client_metric_config.cpp
@@ -352,6 +351,9 @@ endif()
 set(MOONCAKE_HAVE_NVME_URING_CMD OFF)
 if(TARGET Mooncake::liburing)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES uring_file.cpp)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND MOONCAKE_STORE_CLIENT_SOURCES ssd_uring_pipeline.cpp)
+  endif()
 
   include(CheckCXXSourceCompiles)
   get_target_property(MOONCAKE_LIBURING_INCLUDE_DIRS Mooncake::liburing

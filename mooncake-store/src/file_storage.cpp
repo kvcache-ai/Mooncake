@@ -28,20 +28,17 @@ namespace mooncake {
 
 namespace {
 
-class CpuStreamingTarget final : public ssd_offload::DrainedWriteTarget {
+class CpuStreamingTarget final : public ssd_offload::WriteTarget {
    public:
     explicit CpuStreamingTarget(std::vector<Slice> destinations)
         : destinations_(std::move(destinations)) {}
-    ssd_offload::Error WriteAndDrain(
-        const ssd_offload::ReadChunk& chunk,
-        ssd_offload::SlotBuffer buffer) noexcept override {
+    ssd_offload::Error Write(const ssd_offload::ReadChunk& chunk,
+                             ssd_offload::SlotBuffer buffer) noexcept override {
         for (const auto& fragment : chunk.fragments) {
             const auto& destination = fragment.destination;
-            if (destination.region_id == 0 ||
-                destination.region_id > destinations_.size() ||
-                destination.generation != 1)
+            if (destination.destination_index >= destinations_.size())
                 return ssd_offload::Error::kInvalidArgument;
-            const auto& slice = destinations_[destination.region_id - 1];
+            const auto& slice = destinations_[destination.destination_index];
             if (destination.offset > slice.size ||
                 destination.length > slice.size - destination.offset ||
                 fragment.buffer_offset > buffer.capacity ||
@@ -189,9 +186,17 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     if (config_.streaming_read.enabled &&
         std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
         const auto& stream = config_.streaming_read;
-        if (stream.use_uring && !stream.fixed_buffers)
+#if defined(__linux__) && defined(USE_URING)
+        if (stream.use_uring) {
             streaming_uring_reads_ = ssd_offload::UringReadExecutor::Create(
                 stream.read_workers, stream.max_outstanding);
+        }
+#else
+        if (stream.use_uring) {
+            LOG(WARNING) << "MOONCAKE_OFFLOAD_STREAM_USE_URING is set, but "
+                            "io_uring support is not built in; using pread";
+        }
+#endif
         streaming_writes_ = std::make_unique<ssd_offload::BoundedExecutor>(
             stream.write_workers, stream.max_outstanding);
     }
@@ -261,7 +266,9 @@ tl::expected<void, ErrorCode> FileStorage::Shutdown() {
     {
         std::unique_lock lock(streaming_mutex_);
         streaming_stopped_ = true;
+#if defined(__linux__) && defined(USE_URING)
         streaming_uring_reads_.reset();
+#endif
         streaming_reads_.reset();
         streaming_writes_.reset();
     }
@@ -758,40 +765,27 @@ tl::expected<void, ErrorCode> FileStorage::ReadLocalStreaming(
     if (!buckets) return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     if (!config.Validate(client_buffer_allocator_->size()))
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    // Reserve source credits across callers before opening any file. This
-    // bounds descriptors and bucket leases independently of payload slots.
-    size_t active = active_streaming_sources_.load(std::memory_order_relaxed);
-    do {
-        if (active > config.max_outstanding ||
-            requests.size() > config.max_outstanding - active)
-            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-    } while (!active_streaming_sources_.compare_exchange_weak(
-        active, active + requests.size(), std::memory_order_relaxed));
-    struct SourceCredits {
-        std::atomic<size_t>& active;
-        size_t count;
-        ~SourceCredits() { active.fetch_sub(count, std::memory_order_relaxed); }
-    } source_credits{active_streaming_sources_, requests.size()};
     if (requests.size() > config.max_fragments)
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
 
-    std::vector<ReadRange> ranges;
-    ranges.reserve(requests.size());
+    std::vector<std::vector<DestinationSlice>> request_destinations;
+    request_destinations.reserve(requests.size());
     std::vector<Slice> all_destinations;
     std::vector<std::pair<uintptr_t, uintptr_t>> intervals;
     size_t destination_count = 0;
     const auto arena_begin =
         reinterpret_cast<uintptr_t>(client_buffer_allocator_->getBase());
     const auto arena_end = arena_begin + client_buffer_allocator_->size();
-    // Validate and reject overlapping or arena-aliasing destinations before
-    // opening any source files or checking plan limits.
+    // Validate destinations before opening any bucket files. Overlapping
+    // destinations return NOT_SUPPORTED so RealClient can fall back to the
+    // sequential restore path.
     for (const auto& request : requests) {
         if (request.destinations.size() >
             config.max_fragments - destination_count)
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         destination_count += request.destinations.size();
-        ReadRange range{request.source_offset, {}};
-        range.destinations.reserve(request.destinations.size());
+        std::vector<DestinationSlice> dst_slices;
+        dst_slices.reserve(request.destinations.size());
         for (const auto& slice : request.destinations) {
             if (slice.size && !slice.ptr)
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -802,36 +796,62 @@ tl::expected<void, ErrorCode> FileStorage::ReadLocalStreaming(
             if (slice.size && begin < arena_end && end > arena_begin)
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             if (slice.size) intervals.emplace_back(begin, end);
+            const size_t dst_index = all_destinations.size();
             all_destinations.push_back(slice);
-            range.destinations.push_back(
-                {all_destinations.size(), 1, 0, slice.size});
+            dst_slices.push_back({dst_index, 0, slice.size});
         }
-        ranges.push_back(std::move(range));
+        request_destinations.push_back(std::move(dst_slices));
     }
     std::sort(intervals.begin(), intervals.end());
-    for (size_t i = 1; i < intervals.size(); ++i)
+    for (size_t i = 1; i < intervals.size(); ++i) {
         if (intervals[i].first < intervals[i - 1].second)
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
 
-    std::vector<std::shared_ptr<ReadSource>> sources;
-    sources.reserve(requests.size());
+    // Reserve open-file credits against deduplicated bucket sources before
+    // opening any descriptors.
+    struct SourceCredits {
+        std::atomic<size_t>& active;
+        size_t count{0};
+        ~SourceCredits() {
+            if (count) active.fetch_sub(count, std::memory_order_relaxed);
+        }
+    } source_credits{active_streaming_sources_};
+
+    std::vector<BucketStorageBackend::ReadSourceRequest> source_requests;
+    source_requests.reserve(requests.size());
+    for (const auto& request : requests) {
+        source_requests.push_back({request.storage_key, request.expected_size});
+    }
+    auto acquired = buckets->AcquireReadSources(
+        source_requests, [&](size_t unique_sources) {
+            size_t active =
+                active_streaming_sources_.load(std::memory_order_relaxed);
+            do {
+                if (active > config.max_outstanding ||
+                    unique_sources > config.max_outstanding - active)
+                    return false;
+            } while (!active_streaming_sources_.compare_exchange_weak(
+                active, active + unique_sources, std::memory_order_relaxed));
+            source_credits.count = unique_sources;
+            return true;
+        });
+    if (!acquired) return tl::make_unexpected(acquired.error());
+
     std::vector<size_t> chunk_sources;
     ReadPlan batch_plan;
     batch_plan.slot_bytes = config.slot_bytes;
+    batch_plan.alignment = 1;
     size_t fragments = 0;
     // Preflight the complete batch before writing any destination, merging all
     // objects into one multi-source plan so small-object batches read in
-    // parallel and amortize driver/fixed-buffer setup across the batch.
+    // parallel while sharing deduplicated bucket file descriptors.
     for (size_t i = 0; i < requests.size(); ++i) {
-        const auto& request = requests[i];
-        auto source = buckets->AcquireReadSource(request.storage_key,
-                                                 request.expected_size);
-        if (!source) return tl::make_unexpected(source.error());
-        const auto info = (*source)->info();
+        const auto& loc = acquired->locations[i];
         auto result = BuildReadPlan(
-            {info.object_bytes, info.value_file_offset, {std::move(ranges[i])}},
-            {config.slot_bytes, info.alignment, config.max_chunks,
-             config.max_fragments});
+            {loc.object_bytes, loc.value_file_offset, requests[i].source_offset,
+             std::move(request_destinations[i])},
+            {config.slot_bytes, 1, config.max_chunks, config.max_fragments});
         if (result.error == Error::kPlanLimit ||
             result.plan.chunks.size() >
                 config.max_chunks - batch_plan.chunks.size())
@@ -850,17 +870,9 @@ tl::expected<void, ErrorCode> FileStorage::ReadLocalStreaming(
         }
         batch_plan.payload_bytes += result.plan.payload_bytes;
         batch_plan.io_bytes += result.plan.io_bytes;
-        if (!result.plan.chunks.empty()) {
-            batch_plan.alignment =
-                batch_plan.alignment == 0
-                    ? result.plan.alignment
-                    : std::min(batch_plan.alignment, result.plan.alignment);
-            const size_t source_index = sources.size();
-            sources.push_back(std::move(*source));
-            for (auto& chunk : result.plan.chunks) {
-                batch_plan.chunks.push_back(std::move(chunk));
-                chunk_sources.push_back(source_index);
-            }
+        for (auto& chunk : result.plan.chunks) {
+            batch_plan.chunks.push_back(std::move(chunk));
+            chunk_sources.push_back(loc.source_index);
         }
     }
     if (batch_plan.chunks.empty()) return {};
@@ -897,23 +909,29 @@ tl::expected<void, ErrorCode> FileStorage::ReadLocalStreaming(
     // Declare ownership before the driver so exceptional unwinding drains the
     // driver while its ReadChunk pointers still refer to a live plan.
     std::unique_ptr<ReadPipeline> pipeline;
-    std::unique_ptr<EventPipelineDriver> driver;
-    if (config.use_uring && (config.fixed_buffers || streaming_uring_reads_)) {
+    std::unique_ptr<PipelineDriver> driver;
+#if defined(__linux__) && defined(USE_URING)
+    if (config.use_uring && streaming_uring_reads_) {
         auto native = UringPipelineDriver::Create(
-            sources, chunk_sources, target, *streaming_writes_, buffers,
-            UringPipelineDriver::Options{config.fixed_buffers,
-                                         streaming_uring_reads_});
+            acquired->sources, chunk_sources, target, streaming_uring_reads_,
+            *streaming_writes_, buffers);
         driver = std::move(native.driver);
     }
+#endif
     if (!driver) {
+        if (config.use_uring) {
+            LOG_FIRST_N(WARNING, 5)
+                << "Local streaming io_uring driver unavailable; falling back "
+                   "to pread executor";
+        }
         auto* reads = GetOrCreateStreamingReadsLocked();
         if (!reads) return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         driver = std::make_unique<ThreadedPipelineDriver>(
-            sources, chunk_sources, target, *reads, *streaming_writes_,
-            buffers.size());
+            std::move(acquired->sources), std::move(chunk_sources), target,
+            *reads, *streaming_writes_, buffers.size());
     }
-    pipeline = std::make_unique<ReadPipeline>(1, 1, std::move(batch_plan),
-                                              buffers, *driver);
+    pipeline =
+        std::make_unique<ReadPipeline>(std::move(batch_plan), buffers, *driver);
     const auto start_err = pipeline->Start();
     if (start_err != Error::kOk && !pipeline->inflight())
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);

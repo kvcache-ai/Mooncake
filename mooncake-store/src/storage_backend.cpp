@@ -2135,55 +2135,93 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
     return {};
 }
 
-tl::expected<std::shared_ptr<ssd_offload::ReadSource>, ErrorCode>
-BucketStorageBackend::AcquireReadSource(const std::string& key,
-                                        uint64_t expected_size,
-                                        ssd_offload::ReadIoMode mode) {
-    StorageObjectMetadata metadata;
-    std::shared_ptr<BucketReadGuard> guard;
-    int disk_index = 0;
+tl::expected<BucketStorageBackend::AcquiredReadSources, ErrorCode>
+BucketStorageBackend::AcquireReadSources(
+    const std::vector<ReadSourceRequest>& requests,
+    const std::function<bool(size_t)>& reserve_credits) {
+    AcquiredReadSources result;
+    if (requests.empty()) return result;
+
+    struct PendingBucket {
+        int64_t bucket_id;
+        int disk_index;
+        uint64_t min_file_bytes;
+        std::shared_ptr<BucketReadGuard> guard;
+    };
+    std::vector<PendingBucket> pending_buckets;
+    std::unordered_map<int64_t, size_t> bucket_to_source;
+    result.locations.reserve(requests.size());
     {
         SharedMutexLocker lock(&mutex_, shared_lock);
-        auto object = object_bucket_map_.find(key);
-        if (!object) return tl::make_unexpected(ErrorCode::INVALID_KEY);
-        metadata = *object;
-        if (metadata.data_size < 0 || metadata.offset < 0 ||
-            metadata.key_size < 0 ||
-            uint64_t(metadata.data_size) != expected_size ||
-            metadata.offset >
-                std::numeric_limits<int64_t>::max() - metadata.key_size)
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        auto bucket = buckets_.find(metadata.bucket_id);
-        if (bucket == buckets_.end())
-            return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
-        disk_index = bucket->second->disk_index;
-        guard = std::make_shared<BucketReadGuard>(bucket->second);
-        if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::LRU)
-            bucket->second->last_access_ns_.store(
-                std::chrono::steady_clock::now().time_since_epoch().count(),
-                std::memory_order_relaxed);
-    }
-    auto path = GetBucketDataPath(metadata.bucket_id, disk_index);
-    if (!path) return tl::make_unexpected(path.error());
-    // Match the native bucket read's 4 KiB plan for explicitly direct sources.
-    // Both synchronous pread and io_uring retain the same source/guard
-    // lifetime.
-    const size_t alignment = mode == ssd_offload::ReadIoMode::kDirect
-                                 ? ssd_offload::kDirectReadAlignment
-                                 : 1;
-    auto opened = ssd_offload::OpenPosixReadSource(
-        *path,
-        {expected_size, uint64_t(metadata.offset + metadata.key_size),
-         alignment, mode},
-        std::move(guard));
-    if (opened.error != ssd_offload::Error::kOk) {
-        if (opened.error == ssd_offload::Error::kIoError &&
-            opened.sys_errno != 0) {
-            NotifyDiskError(opened.sys_errno, "open");
+        const bool update_lru =
+            bucket_backend_config_.eviction_policy == BucketEvictionPolicy::LRU;
+        const int64_t now_ns =
+            update_lru
+                ? std::chrono::steady_clock::now().time_since_epoch().count()
+                : 0;
+        for (const auto& req : requests) {
+            auto object = object_bucket_map_.find(std::string(req.key));
+            if (!object) return tl::make_unexpected(ErrorCode::INVALID_KEY);
+            const auto& metadata = *object;
+            if (metadata.data_size < 0 || metadata.offset < 0 ||
+                metadata.key_size < 0 ||
+                uint64_t(metadata.data_size) != req.expected_size ||
+                metadata.offset >
+                    std::numeric_limits<int64_t>::max() - metadata.key_size) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            const uint64_t value_file_offset =
+                uint64_t(metadata.offset) + uint64_t(metadata.key_size);
+            if (req.expected_size >
+                uint64_t(std::numeric_limits<int64_t>::max()) -
+                    value_file_offset) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            const uint64_t end_offset = value_file_offset + req.expected_size;
+            auto [it, inserted] = bucket_to_source.emplace(
+                metadata.bucket_id, pending_buckets.size());
+            if (inserted) {
+                auto bucket = buckets_.find(metadata.bucket_id);
+                if (bucket == buckets_.end()) {
+                    return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+                }
+                if (update_lru) {
+                    bucket->second->last_access_ns_.store(
+                        now_ns, std::memory_order_relaxed);
+                }
+                pending_buckets.push_back(
+                    {metadata.bucket_id, bucket->second->disk_index, end_offset,
+                     std::make_shared<BucketReadGuard>(bucket->second)});
+            } else {
+                auto& pending = pending_buckets[it->second];
+                pending.min_file_bytes =
+                    std::max(pending.min_file_bytes, end_offset);
+            }
+            result.locations.push_back(
+                {it->second, req.expected_size, value_file_offset});
         }
-        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
-    return std::move(opened.source);
+
+    if (reserve_credits && !reserve_credits(pending_buckets.size())) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    result.sources.reserve(pending_buckets.size());
+    for (auto& pending : pending_buckets) {
+        auto path = GetBucketDataPath(pending.bucket_id, pending.disk_index);
+        if (!path) return tl::make_unexpected(path.error());
+        auto opened = ssd_offload::OpenPosixReadSource(
+            *path, pending.min_file_bytes, std::move(pending.guard));
+        if (opened.error != ssd_offload::Error::kOk) {
+            if (opened.error == ssd_offload::Error::kIoError &&
+                opened.sys_errno != 0) {
+                NotifyDiskError(opened.sys_errno, "open");
+            }
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        result.sources.push_back(std::move(opened.source));
+    }
+    return result;
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::GetBucketKeys(

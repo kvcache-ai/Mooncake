@@ -75,7 +75,6 @@ struct FileStorageEnvironment {
     ScopedEnvVar legacy_use_uring{"MOONCAKE_USE_URING"};
     ScopedEnvVar local_streaming_read{"MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ"};
     ScopedEnvVar stream_use_uring{"MOONCAKE_OFFLOAD_STREAM_USE_URING"};
-    ScopedEnvVar stream_fixed_buffers{"MOONCAKE_OFFLOAD_STREAM_FIXED_BUFFERS"};
     ScopedEnvVar stream_slot_bytes{"MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES"};
     ScopedEnvVar stream_slots{"MOONCAKE_OFFLOAD_STREAM_SLOTS"};
     ScopedEnvVar stream_read_threads{"MOONCAKE_OFFLOAD_STREAM_READ_THREADS"};
@@ -102,7 +101,6 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.80);
     EXPECT_FALSE(config.streaming_read.enabled);
     EXPECT_FALSE(config.streaming_read.use_uring);
-    EXPECT_FALSE(config.streaming_read.fixed_buffers);
     EXPECT_EQ(config.streaming_read.slot_bytes, 1024u * 1024u);
     EXPECT_EQ(config.streaming_read.slots, 4u);
     EXPECT_EQ(config.streaming_read.read_workers, 4u);
@@ -394,7 +392,6 @@ TEST_F(FileStorageConfigTest, StreamingReadEnvAndValidation) {
     env.local_buffer_size.Set("16777216");
     env.local_streaming_read.Set("true");
     env.stream_use_uring.Set("true");
-    env.stream_fixed_buffers.Set("true");
     env.stream_slot_bytes.Set("1048576");
     env.stream_slots.Set("4");
     env.stream_read_threads.Set("2");
@@ -404,7 +401,6 @@ TEST_F(FileStorageConfigTest, StreamingReadEnvAndValidation) {
     auto config = FileStorageConfig::FromEnvironment();
     EXPECT_TRUE(config.streaming_read.enabled);
     EXPECT_TRUE(config.streaming_read.use_uring);
-    EXPECT_TRUE(config.streaming_read.fixed_buffers);
     EXPECT_EQ(config.streaming_read.slot_bytes, 1048576u);
     EXPECT_EQ(config.streaming_read.slots, 4u);
     EXPECT_EQ(config.streaming_read.read_workers, 2u);
@@ -414,6 +410,27 @@ TEST_F(FileStorageConfigTest, StreamingReadEnvAndValidation) {
 
     config.streaming_read.slots = 32;  // 32 * 1 MiB > 16 MiB arena
     EXPECT_FALSE(config.Validate());
+
+    // OffsetAllocator rounds non-exact bin sizes up (1150976 -> 1179648) and
+    // our config helper stays in lockstep with OffsetAllocator itself.
+    config.streaming_read.slots = 4;
+    config.streaming_read.slot_bytes = 1150976;  // 1 MiB + 100 KiB
+    config.local_buffer_size = 4 * 1150976;
+    EXPECT_FALSE(config.Validate());
+    config.local_buffer_size = 4 * 1179648;
+    EXPECT_TRUE(config.Validate());
+
+    for (uint64_t arena : {4ULL * 1024 * 1024, 8ULL * 1024 * 1024 * 1024}) {
+        auto allocator =
+            mooncake::offset_allocator::OffsetAllocator::create(0, arena);
+        for (size_t slot : {size_t{4096}, size_t{1048576}, size_t{1150976},
+                            size_t{2097151}, size_t{64ULL * 1024 * 1024}}) {
+            const auto [normalized, _] =
+                ssd_offload::OffsetAllocatorSlotBudget(slot, arena);
+            EXPECT_EQ(normalized, allocator->normalizedAllocationSize(slot))
+                << "arena=" << arena << " slot=" << slot;
+        }
+    }
 }
 
 }  // namespace

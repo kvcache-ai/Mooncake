@@ -27,10 +27,10 @@ class ScopedFd {
 
 class PosixReadSource final : public ReadSource {
    public:
-    PosixReadSource(int fd, ReadSourceInfo info, std::shared_ptr<void> lifetime)
-        : fd_(fd), info_(info), lifetime_(std::move(lifetime)) {}
+    PosixReadSource(int fd, uint64_t file_bytes, std::shared_ptr<void> lifetime)
+        : fd_(fd), file_bytes_(file_bytes), lifetime_(std::move(lifetime)) {}
     ~PosixReadSource() override { close(fd_); }
-    ReadSourceInfo info() const noexcept override { return info_; }
+    uint64_t file_bytes() const noexcept override { return file_bytes_; }
     std::optional<int> native_read_fd() const noexcept override { return fd_; }
     ReadResult ReadAt(std::span<std::byte> buffer,
                       uint64_t file_offset) noexcept override {
@@ -42,15 +42,6 @@ class PosixReadSource final : public ReadSource {
             return {0, Error::kOverflow};
         if (!buffer.empty() && !buffer.data())
             return {0, Error::kInvalidArgument};
-        if (info_.io_mode == ReadIoMode::kDirect) {
-            if (reinterpret_cast<uintptr_t>(buffer.data()) %
-                        kDirectReadAlignment !=
-                    0 ||
-                buffer.size() % kDirectReadAlignment != 0 ||
-                file_offset % kDirectReadAlignment != 0)
-                return {0, Error::kInvalidArgument};
-            if (buffer.empty()) return {};
-        }
         size_t bytes = 0;
         while (bytes < buffer.size()) {
             const auto result =
@@ -62,64 +53,41 @@ class PosixReadSource final : public ReadSource {
             }
             if (result == 0) break;
             bytes += static_cast<size_t>(result);
-            // An unaligned direct read can be the final file block. The
-            // planner checks that all payload bytes are present.
-            if (info_.io_mode == ReadIoMode::kDirect &&
-                size_t(result) % kDirectReadAlignment != 0)
-                break;
         }
         return {bytes, Error::kOk};
     }
 
    private:
     int fd_;
-    const ReadSourceInfo info_;
+    const uint64_t file_bytes_;
     std::shared_ptr<void> lifetime_;
 };
 
 }  // namespace
 
 ReadSourceResult OpenPosixReadSource(const std::string& path,
-                                     ReadSourceInfo info,
+                                     uint64_t min_file_bytes,
                                      std::shared_ptr<void> lifetime) {
-    if (info.alignment == 0 || (info.alignment & (info.alignment - 1)) != 0)
-        return {Error::kInvalidArgument, {}};
-    if (info.io_mode != ReadIoMode::kBuffered &&
-        info.io_mode != ReadIoMode::kDirect)
-        return {Error::kInvalidArgument, {}};
-    if (info.io_mode == ReadIoMode::kDirect &&
-        info.alignment != kDirectReadAlignment)
-        return {Error::kInvalidArgument, {}};
     constexpr uint64_t max_offset = std::numeric_limits<off_t>::max();
-    if (info.value_file_offset > max_offset ||
-        info.object_bytes > max_offset - info.value_file_offset)
-        return {Error::kOverflow, {}};
+    if (min_file_bytes > max_offset) return {Error::kOverflow, {}};
 
-    int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
-    if (info.io_mode == ReadIoMode::kDirect) {
-#ifdef O_DIRECT
-        flags |= O_DIRECT;
-#else
-        return {Error::kNotSupported, {}};
-#endif
-    }
     int raw_fd = -1;
     do {
-        raw_fd = open(path.c_str(), flags);
+        raw_fd =
+            open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     } while (raw_fd < 0 && errno == EINTR);
     ScopedFd fd(raw_fd);
     if (fd.get() < 0) return {Error::kIoError, {}, errno};
     struct stat metadata{};
     if (fstat(fd.get(), &metadata) != 0) return {Error::kIoError, {}, errno};
     if (!S_ISREG(metadata.st_mode) || metadata.st_size < 0 ||
-        info.value_file_offset + info.object_bytes >
-            static_cast<uint64_t>(metadata.st_size))
+        min_file_bytes > static_cast<uint64_t>(metadata.st_size))
         return {Error::kInvalidArgument, {}};
     const int status = fcntl(fd.get(), F_GETFL);
     if (status < 0 || fcntl(fd.get(), F_SETFL, status & ~O_NONBLOCK) < 0)
         return {Error::kIoError, {}, errno};
-    auto source =
-        std::make_shared<PosixReadSource>(fd.get(), info, std::move(lifetime));
+    auto source = std::make_shared<PosixReadSource>(
+        fd.get(), static_cast<uint64_t>(metadata.st_size), std::move(lifetime));
     fd.Release();
     return {Error::kOk, std::move(source)};
 }

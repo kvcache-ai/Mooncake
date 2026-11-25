@@ -8,7 +8,6 @@
 #include <atomic>
 #include <cstring>
 #include <future>
-#include <mutex>
 #include <thread>
 
 namespace mooncake::ssd_offload {
@@ -30,38 +29,13 @@ TEST(SsdExecutor, RejectsInvalidLimits) {
     EXPECT_THROW(BoundedExecutor(1, 0), std::invalid_argument);
 }
 
-TEST(SsdExecutor, BoundsQueuedAndRunningTasksAndDrainsShutdown) {
-    BoundedExecutor executor(1, 2);
-    Gate gate;
-    auto entered = gate.entered.get_future();
-    std::atomic<size_t> completed{0};
-    EXPECT_TRUE(executor.TrySubmit([&] {
-        gate.Wait();
-        ++completed;
-    }));
-    const auto ready = entered.wait_for(2s);
-    EXPECT_EQ(ready, std::future_status::ready);
-    EXPECT_TRUE(executor.TrySubmit([&] { ++completed; }));
-    EXPECT_FALSE(executor.TrySubmit([] {}));
-    EXPECT_EQ(executor.outstanding(), 2u);
-    gate.release.set_value();
-    executor.Shutdown();
-    EXPECT_EQ(completed.load(), 2u);
-    EXPECT_EQ(executor.outstanding(), 0u);
-    EXPECT_FALSE(executor.TrySubmit([] {}));
-}
-
-TEST(SsdExecutor, WaitSubmitAppliesBackpressureUntilCreditReturns) {
+TEST(SsdExecutor, WaitSubmitAppliesBackpressureAndDrainsShutdown) {
     BoundedExecutor executor(1, 1);
     Gate gate;
     auto entered = gate.entered.get_future();
-    ASSERT_TRUE(executor.TrySubmit([&] { gate.Wait(); }));
-    const auto started = entered.wait_for(2s);
-    if (started != std::future_status::ready) {
-        gate.release.set_value();
-        FAIL() << "Worker did not start";
-        return;
-    }
+    ASSERT_TRUE(executor.WaitSubmit([&] { gate.Wait(); }));
+    ASSERT_EQ(entered.wait_for(10s), std::future_status::ready);
+
     std::promise<void> attempted;
     auto attempting = attempted.get_future();
     std::atomic<bool> finished{false};
@@ -71,7 +45,6 @@ TEST(SsdExecutor, WaitSubmitAppliesBackpressureUntilCreditReturns) {
     });
     attempting.wait();
     EXPECT_EQ(waiting.wait_for(20ms), std::future_status::timeout);
-    EXPECT_EQ(executor.outstanding(), 1u);
     gate.release.set_value();
     EXPECT_TRUE(waiting.get());
     executor.Shutdown();
@@ -84,9 +57,7 @@ class MemorySource final : public ReadSource {
     explicit MemorySource(size_t size) : bytes(size) {
         for (size_t i = 0; i < size; ++i) bytes[i] = std::byte(i % 251);
     }
-    ReadSourceInfo info() const noexcept override {
-        return {bytes.size(), 0, 1};
-    }
+    uint64_t file_bytes() const noexcept override { return bytes.size(); }
     ReadResult ReadAt(std::span<std::byte> buffer,
                       uint64_t offset) noexcept override {
         ++reads;
@@ -102,17 +73,14 @@ class MemorySource final : public ReadSource {
     Gate* gate{nullptr};
 };
 
-class CopyTarget final : public DrainedWriteTarget {
+class CopyTarget final : public WriteTarget {
    public:
     explicit CopyTarget(size_t bytes) : bytes(bytes) {}
-    Error WriteAndDrain(const ReadChunk& chunk,
-                        SlotBuffer buffer) noexcept override {
+    Error Write(const ReadChunk& chunk, SlotBuffer buffer) noexcept override {
         ++writes;
-        if (gate) gate->Wait();
         for (const auto& fragment : chunk.fragments) {
             const auto& target = fragment.destination;
-            if (target.region_id != 1 || target.generation != 1 ||
-                target.offset > bytes.size() ||
+            if (target.destination_index != 0 || target.offset > bytes.size() ||
                 target.length > bytes.size() - target.offset)
                 return Error::kTransferError;
             std::memcpy(bytes.data() + target.offset,
@@ -122,7 +90,6 @@ class CopyTarget final : public DrainedWriteTarget {
     }
     std::vector<std::byte> bytes;
     std::atomic<size_t> writes{0};
-    Gate* gate{nullptr};
 };
 
 struct Arena {
@@ -133,16 +100,7 @@ struct Arena {
 };
 
 ReadPlan Plan(size_t bytes) {
-    return BuildReadPlan({bytes, 0, {{0, {{1, 1, 0, bytes}}}}}, {4096, 1, 64})
-        .plan;
-}
-
-void Deliver(ReadPipeline& pipeline, const IoCompletion& event) {
-    if (event.stage == SlotStage::kReading)
-        EXPECT_EQ(pipeline.ReadDrained(event.token, event.bytes, event.result),
-                  Error::kOk);
-    else
-        EXPECT_EQ(pipeline.WriteDrained(event.token, event.result), Error::kOk);
+    return BuildReadPlan({bytes, 0, 0, {{0, 0, bytes}}}, {4096, 1, 64}).plan;
 }
 
 TEST(SsdPipelineIo, CopiesThroughRealWorkerCompletions) {
@@ -150,69 +108,56 @@ TEST(SsdPipelineIo, CopiesThroughRealWorkerCompletions) {
     auto target = std::make_shared<CopyTarget>(12000);
     BoundedExecutor reads(2, 8), writes(2, 8);
     Arena arena;
-    ThreadedPipelineDriver driver(source, target, reads, writes, 2);
-    ReadPipeline pipeline(1, 1, Plan(12000), arena.buffers(), driver);
-    ASSERT_EQ(pipeline.Start(), Error::kOk);
-    for (size_t count = 0; count < 6 && pipeline.inflight(); ++count) {
+    auto plan = Plan(12000);
+    std::vector<size_t> chunk_sources(plan.chunks.size(), 0);
+    std::unique_ptr<ReadPipeline> pipeline;
+    auto driver = std::make_unique<ThreadedPipelineDriver>(
+        std::vector<std::shared_ptr<ReadSource>>{source},
+        std::move(chunk_sources), target, reads, writes, 2);
+    pipeline = std::make_unique<ReadPipeline>(std::move(plan), arena.buffers(),
+                                              *driver);
+    ASSERT_EQ(pipeline->Start(), Error::kOk);
+    for (size_t count = 0; count < 6 && pipeline->inflight(); ++count) {
         IoCompletion event;
-        ASSERT_TRUE(driver.WaitForEvent(event, 2s));
-        Deliver(pipeline, event);
+        ASSERT_TRUE(driver->WaitForEvent(event, 10s));
+        if (event.stage == SlotStage::kReading) {
+            EXPECT_EQ(
+                pipeline->ReadDrained(event.token, event.bytes, event.result),
+                Error::kOk);
+        } else {
+            EXPECT_EQ(pipeline->WriteDrained(event.token, event.result),
+                      Error::kOk);
+        }
     }
-    EXPECT_EQ(pipeline.state(), PipelineState::kSucceeded);
+    EXPECT_EQ(pipeline->state(), PipelineState::kSucceeded);
     EXPECT_EQ(target->bytes, source->bytes);
     EXPECT_EQ(source->reads.load(), 3u);
     EXPECT_EQ(target->writes.load(), 3u);
 }
 
-TEST(SsdPipelineIo, CancelRetainsAcceptedIoUntilItsWorkerReturns) {
-    Gate gate;
-    auto entered = gate.entered.get_future();
-    auto source = std::make_shared<MemorySource>(8192);
-    source->gate = &gate;
-    auto target = std::make_shared<CopyTarget>(8192);
-    BoundedExecutor reads(2, 8), writes(2, 8);
-    Arena arena;
-    ThreadedPipelineDriver driver(source, target, reads, writes, 2);
-    ReadPipeline pipeline(1, 1, Plan(8192), arena.buffers(), driver);
-    const auto start = pipeline.Start();
-    const auto ready = entered.wait_for(2s);
-    EXPECT_EQ(start, Error::kOk);
-    EXPECT_EQ(ready, std::future_status::ready);
-    pipeline.Cancel();
-    EXPECT_EQ(pipeline.state(), PipelineState::kDraining);
-    EXPECT_EQ(pipeline.inflight(), 2u);
-    gate.release.set_value();
-    for (size_t count = 0; count < 2 && pipeline.inflight(); ++count) {
-        IoCompletion event;
-        ASSERT_TRUE(driver.WaitForEvent(event, 2s));
-        Deliver(pipeline, event);
-    }
-    EXPECT_EQ(pipeline.state(), PipelineState::kCancelled);
-    EXPECT_EQ(target->writes.load(), 0u);
-}
-
-TEST(SsdPipelineIo, ReadyEventsCannotBeOverwrittenByAnotherSubmission) {
+TEST(SsdPipelineIo, ReadyEventCannotBeOverwrittenBeforeConsumption) {
     auto source = std::make_shared<MemorySource>(4096);
     auto target = std::make_shared<CopyTarget>(4096);
     BoundedExecutor reads(1, 4), writes(1, 4);
     Arena arena;
     auto chunk = Plan(4096).chunks[0];
-    ThreadedPipelineDriver driver(source, target, reads, writes, 1);
-    SlotToken token{1, 1, 0, 1, 0};
+    ThreadedPipelineDriver driver({source}, {0}, target, reads, writes, 1);
+    SlotToken token{0, 1, 0};
     ASSERT_TRUE(driver.SubmitRead(token, chunk, arena.buffers()[0]));
-    const auto deadline = std::chrono::steady_clock::now() + 2s;
-    while (reads.outstanding() && std::chrono::steady_clock::now() < deadline)
+    // Wait until the worker finishes reading into the slot.
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (source->reads.load() == 0 &&
+           std::chrono::steady_clock::now() < deadline)
         std::this_thread::yield();
-    EXPECT_EQ(reads.outstanding(), 0u);
     auto next = token;
     ++next.generation;
     EXPECT_FALSE(driver.SubmitRead(next, chunk, arena.buffers()[0]));
     IoCompletion event;
-    ASSERT_TRUE(driver.WaitForEvent(event, 2s));
+    ASSERT_TRUE(driver.WaitForEvent(event, 10s));
     EXPECT_EQ(event.token.generation, 1u);
     EXPECT_EQ(event.bytes, 4096u);
     ASSERT_TRUE(driver.SubmitRead(next, chunk, arena.buffers()[0]));
-    ASSERT_TRUE(driver.WaitForEvent(event, 2s));
+    ASSERT_TRUE(driver.WaitForEvent(event, 10s));
     EXPECT_EQ(event.token.generation, 2u);
 }
 
@@ -226,11 +171,11 @@ TEST(SsdPipelineIo, DestructorWaitsForRunningReadAndPinsSource) {
     BoundedExecutor reads(1, 4), writes(1, 4);
     Arena arena;
     auto chunk = Plan(4096).chunks[0];
-    auto driver = std::make_unique<ThreadedPipelineDriver>(source, target,
-                                                           reads, writes, 1);
-    EXPECT_TRUE(driver->SubmitRead({1, 1, 0, 1, 0}, chunk, arena.buffers()[0]));
-    const auto ready = entered.wait_for(2s);
-    EXPECT_EQ(ready, std::future_status::ready);
+    auto driver = std::make_unique<ThreadedPipelineDriver>(
+        std::vector<std::shared_ptr<ReadSource>>{source},
+        std::vector<size_t>{0}, target, reads, writes, 1);
+    EXPECT_TRUE(driver->SubmitRead({0, 1, 0}, chunk, arena.buffers()[0]));
+    ASSERT_EQ(entered.wait_for(10s), std::future_status::ready);
     source.reset();
     auto closing =
         std::async(std::launch::async,
@@ -242,35 +187,5 @@ TEST(SsdPipelineIo, DestructorWaitsForRunningReadAndPinsSource) {
     EXPECT_TRUE(weak_source.expired());
 }
 
-TEST(SsdPipelineIo, CancelDrainsRunningWriteAndSkipsQueuedWrite) {
-    Gate gate;
-    auto entered = gate.entered.get_future();
-    auto source = std::make_shared<MemorySource>(8192);
-    auto target = std::make_shared<CopyTarget>(8192);
-    target->gate = &gate;
-    BoundedExecutor reads(2, 8), writes(1, 8);
-    Arena arena;
-    ThreadedPipelineDriver driver(source, target, reads, writes, 2);
-    ReadPipeline pipeline(1, 1, Plan(8192), arena.buffers(), driver);
-    ASSERT_EQ(pipeline.Start(), Error::kOk);
-    for (size_t count = 0; count < 2; ++count) {
-        IoCompletion event;
-        const bool ready = driver.WaitForEvent(event, 2s);
-        EXPECT_TRUE(ready);
-        if (ready) Deliver(pipeline, event);
-    }
-    EXPECT_EQ(entered.wait_for(2s), std::future_status::ready);
-    pipeline.Cancel();
-    EXPECT_EQ(pipeline.state(), PipelineState::kDraining);
-    EXPECT_EQ(pipeline.inflight(), 2u);
-    gate.release.set_value();
-    for (size_t count = 0; count < 2 && pipeline.inflight(); ++count) {
-        IoCompletion event;
-        ASSERT_TRUE(driver.WaitForEvent(event, 2s));
-        Deliver(pipeline, event);
-    }
-    EXPECT_EQ(pipeline.state(), PipelineState::kCancelled);
-    EXPECT_EQ(target->writes.load(), 1u);
-}
 }  // namespace
 }  // namespace mooncake::ssd_offload

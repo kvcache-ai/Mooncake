@@ -35,8 +35,8 @@ struct BoundedExecutor::Impl {
                 task = std::move(tasks.front());
                 tasks.pop();
             }
-            // I/O tasks encode their errors in completions. Keep this generic
-            // executor alive if a non-I/O task unexpectedly throws.
+            // I/O tasks encode their errors in completions. Keep this executor
+            // alive if a callback unexpectedly throws.
             try {
                 task();
             } catch (...) {
@@ -49,14 +49,12 @@ struct BoundedExecutor::Impl {
             }
         }
     }
-    bool Submit(std::function<void()> task, bool wait) noexcept {
+    bool WaitSubmit(std::function<void()> task) noexcept {
         if (!task) return false;
         try {
             std::unique_lock lock(mutex);
-            if (wait) {
-                changed.wait(lock, [&] { return stopping || pending < limit; });
-            }
-            if (stopping || pending == limit) return false;
+            changed.wait(lock, [&] { return stopping || pending < limit; });
+            if (stopping) return false;
             tasks.push(std::move(task));
             ++pending;
             changed.notify_all();
@@ -87,36 +85,19 @@ struct BoundedExecutor::Impl {
 BoundedExecutor::BoundedExecutor(size_t workers, size_t max_outstanding)
     : impl_(std::make_unique<Impl>(workers, max_outstanding)) {}
 BoundedExecutor::~BoundedExecutor() { Shutdown(); }
-bool BoundedExecutor::TrySubmit(std::function<void()> task) noexcept {
-    return impl_->Submit(std::move(task), false);
-}
 bool BoundedExecutor::WaitSubmit(std::function<void()> task) noexcept {
-    return impl_->Submit(std::move(task), true);
+    return impl_->WaitSubmit(std::move(task));
 }
 void BoundedExecutor::Shutdown() { impl_->Shutdown(); }
-size_t BoundedExecutor::outstanding() const {
-    std::lock_guard lock(impl_->mutex);
-    return impl_->pending;
-}
-
-namespace {
-bool SameToken(const SlotToken& a, const SlotToken& b) {
-    return a.request_id == b.request_id && a.attempt_id == b.attempt_id &&
-           a.slot_index == b.slot_index && a.generation == b.generation &&
-           a.chunk_index == b.chunk_index;
-}
-}  // namespace
 
 struct ThreadedPipelineDriver::Impl {
     enum class State { kIdle, kRunning, kReady };
     struct Record {
         State state{State::kIdle};
         IoCompletion event;
-        bool cancelled{false};
     };
     Impl(std::vector<std::shared_ptr<ReadSource>> sources,
-         std::vector<size_t> chunk_sources, bool mapped_sources,
-         std::shared_ptr<SourceDrainedWriteTarget> target,
+         std::vector<size_t> chunk_sources, std::shared_ptr<WriteTarget> target,
          BoundedExecutor& reads, BoundedExecutor& writes, size_t count)
         : sources(std::move(sources)),
           chunk_sources(std::move(chunk_sources)),
@@ -127,7 +108,7 @@ struct ThreadedPipelineDriver::Impl {
         if (this->sources.empty() ||
             std::any_of(this->sources.begin(), this->sources.end(),
                         [](const auto& source) { return !source; }) ||
-            (mapped_sources && this->chunk_sources.empty()) ||
+            this->chunk_sources.empty() ||
             std::any_of(this->chunk_sources.begin(), this->chunk_sources.end(),
                         [&](size_t source) {
                             return source >= this->sources.size();
@@ -140,63 +121,49 @@ struct ThreadedPipelineDriver::Impl {
     ~Impl() {
         std::unique_lock lock(mutex);
         stopping = true;
-        for (auto& record : records) record.cancelled = true;
         changed.wait(lock, [&] { return running == 0; });
     }
     bool Submit(const SlotToken& token, const ReadChunk& chunk,
                 SlotBuffer buffer, SlotStage stage) noexcept {
-        if (!token.request_id || !token.attempt_id || !token.generation ||
-            token.slot_index >= records.size() || !buffer.data ||
-            !chunk.read_bytes || chunk.read_bytes > buffer.capacity ||
-            (!chunk_sources.empty() &&
-             token.chunk_index >= chunk_sources.size()))
+        if (!token.generation || token.slot_index >= records.size() ||
+            !buffer.data || !chunk.read_bytes ||
+            chunk.read_bytes > buffer.capacity ||
+            token.chunk_index >= chunk_sources.size())
             return false;
-        // Resolve before acceptance; a queued read owns this exact fd/lease,
-        // independent of any other source progressing in the shared slots.
         std::shared_ptr<ReadSource> source;
         if (stage == SlotStage::kReading)
-            source = sources[chunk_sources.empty()
-                                 ? 0
-                                 : chunk_sources[token.chunk_index]];
+            source = sources[chunk_sources[token.chunk_index]];
         {
             std::lock_guard lock(mutex);
             auto& record = records[token.slot_index];
             if (stopping || record.state != State::kIdle) return false;
             record.event = {token, stage, 0, Error::kOk};
-            record.cancelled = false;
             record.state = State::kRunning;
             ++running;
         }
         bool accepted = false;
         try {
-            auto task = [this, token, stage, buffer, chunk_ptr = &chunk,
+            const size_t read_bytes = chunk.read_bytes;
+            const uint64_t file_offset = chunk.file_offset;
+            auto task = [this, token, stage, buffer, read_bytes, file_offset,
+                         chunk_ptr = &chunk,
                          source = std::move(source)]() mutable {
-                bool cancelled;
-                {
-                    std::lock_guard lock(mutex);
-                    cancelled = records[token.slot_index].cancelled;
+                IoCompletion event{token, stage, 0, Error::kOk};
+                if (stage == SlotStage::kReading) {
+                    const auto result =
+                        source->ReadAt({buffer.data, read_bytes}, file_offset);
+                    event.bytes = result.bytes;
+                    event.result = result.error;
+                    event.sys_errno = result.sys_errno;
+                } else {
+                    event.result = target->Write(*chunk_ptr, buffer);
+                    event.bytes = event.result == Error::kOk
+                                      ? chunk_ptr->payload_bytes
+                                      : 0;
                 }
-                IoCompletion event{token, stage, 0, Error::kCancelled};
-                if (!cancelled) {
-                    if (stage == SlotStage::kReading) {
-                        const auto result =
-                            source->ReadAt({buffer.data, chunk_ptr->read_bytes},
-                                           chunk_ptr->file_offset);
-                        event.bytes = result.bytes;
-                        event.result = result.error;
-                        event.sys_errno = result.sys_errno;
-                    } else {
-                        event.result =
-                            target->WriteAndDrain(*chunk_ptr, buffer);
-                    }
-                }
-                // No source access remains after ReadAt returns. Drop the
-                // job's extra fd/lease hold before publishing its completion;
-                // the immutable source table still pins it through teardown.
                 source.reset();
-                // Notification is inside the lock: after the scheduler can
-                // consume this event, the worker never accesses this driver
-                // again. Driver destruction cannot race a late notify().
+                // Notify under mutex so destructor drain cannot race a late
+                // notify().
                 std::lock_guard lock(mutex);
                 auto& record = records[token.slot_index];
                 record.event = event;
@@ -207,7 +174,6 @@ struct ThreadedPipelineDriver::Impl {
             accepted = (stage == SlotStage::kReading ? reads : writes)
                            .WaitSubmit(std::move(task));
         } catch (...) {
-            // Task allocation failed before executor acceptance.
         }
         if (!accepted) {
             std::lock_guard lock(mutex);
@@ -216,14 +182,6 @@ struct ThreadedPipelineDriver::Impl {
             changed.notify_all();
         }
         return accepted;
-    }
-    void Cancel(const SlotToken& token, SlotStage stage) {
-        std::lock_guard lock(mutex);
-        if (token.slot_index >= records.size()) return;
-        auto& record = records[token.slot_index];
-        if (record.state == State::kRunning && record.event.stage == stage &&
-            SameToken(record.event.token, token))
-            record.cancelled = true;
     }
     bool Wait(IoCompletion& event, std::chrono::milliseconds timeout) {
         const auto start = std::chrono::steady_clock::now();
@@ -254,7 +212,7 @@ struct ThreadedPipelineDriver::Impl {
     }
     const std::vector<std::shared_ptr<ReadSource>> sources;
     const std::vector<size_t> chunk_sources;
-    std::shared_ptr<SourceDrainedWriteTarget> target;
+    std::shared_ptr<WriteTarget> target;
     BoundedExecutor& reads;
     BoundedExecutor& writes;
     std::vector<Record> records;
@@ -265,20 +223,11 @@ struct ThreadedPipelineDriver::Impl {
 };
 
 ThreadedPipelineDriver::ThreadedPipelineDriver(
-    std::shared_ptr<ReadSource> source,
-    std::shared_ptr<SourceDrainedWriteTarget> target, BoundedExecutor& reads,
-    BoundedExecutor& writes, size_t slot_count)
-    : impl_(std::make_unique<Impl>(
-          std::vector<std::shared_ptr<ReadSource>>{std::move(source)},
-          std::vector<size_t>{}, false, std::move(target), reads, writes,
-          slot_count)) {}
-ThreadedPipelineDriver::ThreadedPipelineDriver(
     std::vector<std::shared_ptr<ReadSource>> sources,
-    std::vector<size_t> chunk_sources,
-    std::shared_ptr<SourceDrainedWriteTarget> target, BoundedExecutor& reads,
-    BoundedExecutor& writes, size_t slot_count)
+    std::vector<size_t> chunk_sources, std::shared_ptr<WriteTarget> target,
+    BoundedExecutor& reads, BoundedExecutor& writes, size_t slot_count)
     : impl_(std::make_unique<Impl>(std::move(sources), std::move(chunk_sources),
-                                   true, std::move(target), reads, writes,
+                                   std::move(target), reads, writes,
                                    slot_count)) {}
 ThreadedPipelineDriver::~ThreadedPipelineDriver() = default;
 bool ThreadedPipelineDriver::SubmitRead(const SlotToken& token,
@@ -290,10 +239,6 @@ bool ThreadedPipelineDriver::SubmitWrite(const SlotToken& token,
                                          const ReadChunk& chunk,
                                          SlotBuffer buffer) noexcept {
     return impl_->Submit(token, chunk, buffer, SlotStage::kWriting);
-}
-void ThreadedPipelineDriver::RequestCancel(const SlotToken& token,
-                                           SlotStage stage) noexcept {
-    impl_->Cancel(token, stage);
 }
 bool ThreadedPipelineDriver::WaitForEvent(IoCompletion& event,
                                           std::chrono::milliseconds timeout) {
