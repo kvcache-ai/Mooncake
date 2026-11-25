@@ -354,7 +354,7 @@ When a `PutStart` request fails due to insufficient memory, or when the eviction
 
 Memory eviction uses a sharded lease-bucket index (`LeaseEvictionIndex`); there is no index-selection switch. It partitions keys across cacheline-aligned shards using intrusive list hooks on each route slot, filing lease deadlines in 100 ms buckets so eviction visits the oldest expired buckets first without scanning the entire keyspace. Reads can extend the authoritative lease without eagerly updating the filed bucket. Every candidate is revalidated under its key lock; active leases and hard pins remain protected, and incomplete memory replicas are not eviction candidates.
 
-Workers claim disjoint shard-bucket ranges in ascending deadline order and reclaim their own candidates rather than receiving per-key tasks from a central producer. The embedded `MasterServiceConfig::eviction_worker_threads` setting defaults to `0`: automatic sizing selects `ceil(filed keys / 16,000,000)` per namespace, clamped to 1–64. The count is recomputed before each namespace scan, and the pool is resized when it changes. Explicit values `1`–`64` override automatic sizing for testing or diagnostics. This is not a master command-line flag. Policies, reclaimers and observers must explicitly support concurrent callbacks. Otherwise, including for OpLog and offloading reclaimers, the same index is traversed serially, preserving the shared run report and budgets.
+Workers claim disjoint shard-bucket ranges in ascending deadline order and reclaim their own candidates rather than receiving per-key tasks from a central producer. `MasterServiceConfig::eviction_worker_threads` (configured via the master's `--eviction_worker_threads` flag or config key `eviction_worker_threads`) defaults to `0`: automatic sizing selects `ceil(filed keys / 16,000,000)` per namespace, clamped to 1–64. The count is recomputed before each namespace scan, and the pool is resized when it changes. Explicit values `1`–`64` override automatic sizing for testing or diagnostics (validated to `[0, 64]`). Policies, reclaimers and observers must explicitly support concurrent callbacks. Otherwise, including for OpLog and offloading reclaimers, the same index is traversed serially, preserving the shared run report and budgets.
 
 For grouped objects, memory eviction resolves the current group membership and attempts to reclaim eligible members together. A target does not deliberately stop halfway through a group, but this is not an atomic all-or-nothing operation: busy, renewed or failed members may survive. Groups and already-in-flight work can exceed the requested target. Detached buffers are released outside key locks, and all workers finish before soft-pin fallback runs.
 
@@ -474,9 +474,13 @@ and NoF replicas:
 - `DISK` is the legacy shared-filesystem persistence path enabled by the
   master's `--root_fs_dir` flag.
 - `LOCAL_DISK` replicas are owned by a real client and use the asynchronous SSD
-  offload and heartbeat protocol.
-- `DFS` replicas occupy globally allocated ranges in shard files on a shared
-  distributed filesystem. Any correctly configured client can access them.
+  offload and heartbeat protocol. Object-storage offload backends (`oss` / `s3`
+  via `DistributedStorageBackend`) also run under this `LOCAL_DISK` offload
+  model; see [Object Storage Offload](../../deployment/object-storage-offload.md).
+- `DFS` replicas cover both filesystem-backed distributed allocations (shared
+  shard files or immutable bucket files on a shared distributed filesystem) and
+  the `kvcs-lowlevel` distributed object-storage path. Any correctly configured
+  client can access them.
 
 These models have independent placement, metadata, and lifecycle rules.
 
@@ -502,46 +506,101 @@ covered by the general fault-tolerance, HA continuity, durability, or
 multi-tenant guarantees described elsewhere in this design document.
 ```
 
-The master owns DFS placement metadata and an allocator for the shared shard
-files. During `PutStart` or `UpsertStart`, it allocates an aligned range and
-returns a descriptor containing the shard path, shard index, offset, object
-size, and aligned size. The replica remains `PROCESSING` until the request is
-finalized. Removal, revocation, replacement, and allocator eviction release
-the range, with a configurable deferred-free interval preventing immediate
-offset reuse.
+The master owns DFS placement metadata and selects one of three DFS paths based
+on configuration:
 
-The shard set can grow online through the master admin API. Expansion prepares
-new shard files and allocator state, then atomically publishes the complete
-ready set; existing shard paths and ranges remain unchanged. Allocation tries
-the hash-selected shard first and falls back to other ready shards, so added
-capacity can relieve full shards. Startup discovers the existing contiguous
-layout to retain the expanded capacity; it does not recover allocation or key
-metadata.
+- **Shared shard files (`MOONCAKE_DFS_ALLOCATOR=shard`, default):** The master
+  runs `ShardAllocator` over shared shard files. During `PutStart` or
+  `UpsertStart`, it allocates an aligned range and returns a descriptor
+  containing the shard path, shard index, offset, object size, and aligned size.
+  Removal, revocation, replacement, and allocator eviction release the range,
+  with a configurable deferred-free interval preventing immediate offset reuse.
+- **Immutable bucket files (`MOONCAKE_DFS_ALLOCATOR=bucket`):** The master runs
+  `ImmutableBucketAllocator` over append-only bucket files, carrying the bucket
+  ID in `shard_idx`. See
+  [Immutable Bucket Allocator for DFS Replicas](immutable-dfs-bucket-allocator.md).
+- **KVCS distributed object storage (`MOONCAKE_DFS_FS_ADAPTER=kvcs-lowlevel`):**
+  Reuses the `DFS` replica type without a filesystem extent allocator. During
+  `PutStart` or `UpsertStart`, the master synthesizes a descriptor with
+  `shard_idx = -1` and `aligned_size = object_size`, and the client delegates
+  object I/O to `KvcsObjectStorageAdapter`. See the
+  [KVCS backend README](gh-file:mooncake-store/src/storage/distributed/kvcs/README.md)
+  for its build prerequisites, configuration, and limitations. (By contrast,
+  `oss` and `s3` adapters in `DistributedStorageBackend` use the `LOCAL_DISK`
+  offload model; see
+  [Object Storage Offload](../../deployment/object-storage-offload.md).)
 
-The client owns the DFS data plane. `DistributedStorageBackend` validates the
-descriptor and delegates positional I/O to either `PosixFsAdapter` or
-`Hf3fsAdapter`. The master and clients must use the same DFS root and shard
-layout so that a descriptor identifies the same physical file everywhere.
-Clients do not open or create shard files during initialization. They open a
-shard only when first using its published descriptor, validating the path,
-shard index, and file capacity before caching the file handle. This prevents
-clients from retaining files that an unsuccessful expansion rolls back.
+Filesystem-backed DFS (`shard` and `bucket`) requires enabling
+`MOONCAKE_ENABLE_DFS` (e.g., `1` or `true`; legacy `MOONCAKE_DFS_ENABLED` is a
+fallback when unset or invalid) and fails master startup if OpLog recovery is
+active, whereas `kvcs-lowlevel` is enabled by adapter selection. All DFS modes
+require `MOONCAKE_DFS_SINGLE_TENANT=true`, and DFS writes require the resolved
+tenant to be `default` (rejected with `INVALID_PARAMS` when
+`enable_multi_tenants=true` and the resolved tenant is non-default).
 
-For a write, the client first completes the requested memory and NoF transfers,
-then writes the DFS replica. `Put`, `BatchPut`, `Upsert`, and `BatchUpsert`
-acknowledge success only after the requested DFS `WriteAt` operations return
-successfully. This is request-synchronous acknowledgement, not an `fsync`
-durability guarantee. If either an existing object or an incoming same-size
+In all three paths, the replica remains `PROCESSING` until a whole-object write
+(`Put`, `BatchPut`, `Upsert`, or `BatchUpsert`) finalizes it; ranged Put
+sessions reject explicit `dfs_replica_num > 0` with `INVALID_PARAMS` and write
+and finalize only `MEMORY` replicas.
+
+For the shared shard allocator, the shard set can grow online through the master
+admin API. Expansion prepares new shard files and allocator state, then
+atomically publishes the complete ready set; existing shard paths and ranges
+remain unchanged. Allocation tries the hash-selected shard first and falls back
+to other ready shards, so added capacity can relieve full shards. Startup
+discovers the existing contiguous layout to retain the expanded capacity; it
+does not recover allocation or key metadata.
+
+The client owns the DFS data plane. For filesystem-backed DFS,
+`DistributedStorageBackend` validates the descriptor and delegates positional
+I/O to either `PosixFsAdapter` or `Hf3fsAdapter`; the master and clients must
+use the same DFS root and shard/bucket layout so that a descriptor identifies
+the same physical file everywhere. Clients do not open or create shard or bucket
+files during initialization: shard mode opens and caches a shard handle on first
+use (after validating the path, shard index, and capacity, avoiding stale
+handles from rolled-back expansions), while bucket mode opens and closes bucket
+handles per operation or batch.
+
+For a filesystem DFS write, the client first completes the requested memory and
+NoF transfers, then writes the DFS replica. On a new write or replacement,
+`Put`, `BatchPut`, `Upsert`, and `BatchUpsert` finalize only after the requested
+DFS write operations return successfully (request-synchronous finalization, not
+an `fsync` durability guarantee); an idempotent `Put` or `BatchPut` on an
+already-existing key (`OBJECT_ALREADY_EXISTS`) returns success without writing
+or adding a DFS replica. If either an existing object or an incoming same-size
 `Upsert` has a DFS replica, the requested memory, NoF, and DFS replica counts
-must match the existing topology.
+must match the existing topology—except that `ImmutableBucketAllocator` allows a
+same-size `Upsert` to add a DFS replica when the object currently has zero DFS
+replicas and the memory and NoF counts match.
 
 For a read, the master returns the readable replica list through the normal
-query path. The client selects the first complete replica; if that replica is a
-DFS replica, it uses the descriptor to read the requested range directly from
-the shared shard file.
+query path:
 
-See the {ref}`Mooncake Store deployment guide <dfs-storage>` for
-configuration, usage, and current limitations.
+- **Replica selection:** `RealClient` read entrypoints that call
+  `SelectBestReplica` prioritize `COMPLETE` replicas in order: local `MEMORY` >
+  local `NOF_SSD` > remote `MEMORY` (with remote replica scoring when enabled) >
+  remote `NOF_SSD` > `LOCAL_DISK` > `DFS` > `DISK`. `Client::ReadReplicaSelector`
+  paths fall back to `FindFirstCompleteReplica` (the first `COMPLETE` replica)
+  when HCA affinity is disabled, the transport is not RDMA, at most one replica
+  is returned, or no destination HCA can be inferred; otherwise they call
+  `SelectBestReplica` with the inferred destination HCAs. Distributed DFS I/O
+  runs only when a `DFS` replica is selected.
+- **Direct host-buffer reads vs. staging:** On `RealClient` read paths guarded
+  by `can_use_direct_dfs_read`, a `DFS` read bypasses `RealClient`'s staging
+  buffer and passes the caller's buffers directly to the DFS backend when all
+  three conditions hold: (1) the backend supports arbitrary host read buffers
+  (`PosixFsAdapter::SupportsArbitraryHostReadBuffers()` returns `true`;
+  `Hf3fsAdapter` and object-storage adapters return `false`), (2) the
+  destination buffer count is at most `IOV_MAX`, and (3) every destination
+  pointer is host memory (not a device pointer detected by the accelerator
+  runtime). Otherwise, these paths stage the read through a contiguous buffer
+  from `client_buffer_allocator_` and copy or scatter into the caller's
+  destination buffers.
+
+For shared-shard DFS configuration, usage, and current limitations, see the
+{ref}`Mooncake Store deployment guide <dfs-storage>`; for immutable bucket
+allocator configuration, see
+[Immutable Bucket Allocator for DFS Replicas](immutable-dfs-bucket-allocator.md).
 
 ### HF3FS USRBIO Adapter (Experimental)
 
