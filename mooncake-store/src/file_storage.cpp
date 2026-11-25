@@ -268,6 +268,7 @@ tl::expected<void, ErrorCode> FileStorage::Shutdown() {
         streaming_uring_init_attempted_ = true;
 #endif
         streaming_reads_.reset();
+        streaming_writes_.reset();
     }
     heartbeat_running_ = false;
     WakeHeartbeat();
@@ -744,6 +745,22 @@ ssd_offload::BoundedExecutor* FileStorage::GetOrCreateStreamingReadsLocked() {
     return streaming_reads_.get();
 }
 
+ssd_offload::BoundedExecutor* FileStorage::GetOrCreateStreamingWritesLocked() {
+    std::lock_guard init_lock(streaming_init_mutex_);
+    if (!streaming_writes_) {
+        const auto& stream = config_.streaming_read;
+        try {
+            streaming_writes_ = std::make_unique<ssd_offload::BoundedExecutor>(
+                stream.write_workers, stream.max_outstanding);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to initialize streaming write pool: "
+                       << e.what();
+            return nullptr;
+        }
+    }
+    return streaming_writes_.get();
+}
+
 #if defined(__linux__) && defined(USE_URING)
 std::shared_ptr<ssd_offload::UringReadExecutor>
 FileStorage::GetOrCreateStreamingUringReadsLocked() {
@@ -850,7 +867,7 @@ FileStorage::ReadOwnerStreaming(
     batch_keys.reserve(request.objects.size());
     batch_sizes.reserve(request.objects.size());
     unique_keys.reserve(request.objects.size());
-    bool whole_batch = !request.objects.empty() &&
+    bool whole_batch = !config.use_uring && !request.objects.empty() &&
                        request.objects.size() <= config.max_outstanding;
     for (const auto& object : request.objects) {
         if (!whole_batch) break;
@@ -938,9 +955,13 @@ FileStorage::ReadOwnerStreaming(
         uintptr_t begin;
         size_t read_bytes;
         if (shared) {
-            const auto& slice = shared->slices.at(batch_keys.front());
-            begin = reinterpret_cast<uintptr_t>(slice.ptr);
-            read_bytes = slice.size;
+            const auto it = shared->slices.find(batch_keys.front());
+            if (it == shared->slices.end() ||
+                it->second.size != static_cast<size_t>(batch_sizes.front())) {
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            begin = reinterpret_cast<uintptr_t>(it->second.ptr);
+            read_bytes = it->second.size;
         } else {
             // Lay values out by destination registration/offset. Adjacent
             // destinations can share a wire WRITE after authorization.

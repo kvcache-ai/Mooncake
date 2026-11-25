@@ -154,75 +154,106 @@ class ClassicTcpWriteTarget final : public SourceDrainedWriteTarget {
                     req.target_id = remote_segment_;
                     req.target_offset = dst_addr;
                     req.length = length;
-                    req.task_group_id = 1;
                     entries.push_back(req);
                 }
             }
             if (entries.empty()) return Error::kOk;
 
-            const BatchID batch = engine_->allocateBatchID(entries.size());
-            if (batch == INVALID_BATCH_ID) {
-                return Error::kTransferError;
-            }
-            const auto submitted =
-                engine_->submitAcknowledgedTcpWrite(batch, entries);
-            if (!submitted.ok()) {
-                // Pre-dispatch rejection leaves no transport work owning slot.
-                (void)engine_->freeBatchID(batch);
-                return Error::kTransferError;
-            }
-
-            // Drain every submitted entry until every transport task reaches
-            // COMPLETED or FAILED before returning or freeing the batch, so the
-            // staging slot is never reused while TCP I/O may still read it.
+            // Submit in bounded waves with distinct non-zero task_group_ids so
+            // entries reuse fixed TCP lanes (even if general pooling is off),
+            // execute concurrently across lanes within a wave, and stop
+            // immediately on the first failed wave instead of amplifying a dead
+            // peer's 30s timeout by entries.size().
+            constexpr size_t kMaxWaveEntries = 4;
             bool all_succeeded = true;
-            std::vector<bool> done(entries.size(), false);
-            size_t remaining = entries.size();
-            unsigned polls = 0;
-            while (remaining > 0) {
-                bool progressed = false;
-                for (size_t i = 0; i < entries.size(); ++i) {
-                    if (done[i]) continue;
-                    TransferStatus status{};
-                    const auto queried =
-                        engine_->getTransferStatus(batch, i, status);
-                    if (!queried.ok()) {
-                        // Only stop polling a task if the batch/task ID is
-                        // invalid; transient lookup failures must not release
-                        // the staging slot while transport I/O may be active.
-                        if (queried.IsInvalidArgument()) {
-                            all_succeeded = false;
-                            done[i] = true;
-                            --remaining;
-                            progressed = true;
-                        }
-                        continue;
-                    }
-                    if (!IsTerminalStatus(status.s)) continue;
-                    if (status.s != TransferStatusEnum::COMPLETED) {
-                        all_succeeded = false;
-                    }
-                    done[i] = true;
-                    --remaining;
-                    progressed = true;
+            for (size_t wave_start = 0;
+                 wave_start < entries.size() && all_succeeded;
+                 wave_start += kMaxWaveEntries) {
+                const size_t wave_count =
+                    std::min(kMaxWaveEntries, entries.size() - wave_start);
+                std::vector<TransferRequest> wave;
+                wave.reserve(wave_count);
+                for (size_t k = 0; k < wave_count; ++k) {
+                    auto req = entries[wave_start + k];
+                    req.task_group_id = static_cast<uint64_t>(k + 1);
+                    wave.push_back(req);
                 }
-                if (remaining > 0 && !progressed) {
-                    if (polls < 32) {
-                        ++polls;
-                        std::this_thread::yield();
-                    } else {
-                        std::this_thread::sleep_for(
-                            std::chrono::microseconds(50));
-                    }
-                }
-            }
 
-            const auto freed = engine_->freeBatchID(batch);
-            // Once all tasks reached COMPLETED, Status::BatchCleanupDeferred
-            // reflects the benign CompletionCallbackPin unwind window in
-            // Slice::markSuccess() and is NOT a transfer failure.
-            if (!freed.ok() && !freed.IsBatchCleanupDeferred()) {
-                all_succeeded = false;
+                const BatchID batch = engine_->allocateBatchID(wave.size());
+                if (batch == INVALID_BATCH_ID) {
+                    if (wave_start > 0) {
+                        destinations_drained_.store(false,
+                                                    std::memory_order_release);
+                    }
+                    return Error::kTransferError;
+                }
+                const auto submitted =
+                    engine_->submitReceiverVisibleWrite(batch, wave);
+                if (!submitted.ok()) {
+                    // Pre-dispatch rejection leaves no transport work owning
+                    // slot for this wave.
+                    (void)engine_->freeBatchID(batch);
+                    if (wave_start > 0) {
+                        destinations_drained_.store(false,
+                                                    std::memory_order_release);
+                    }
+                    return Error::kTransferError;
+                }
+
+                // Drain every submitted entry until every transport task
+                // reaches COMPLETED or FAILED before returning or freeing the
+                // batch, so the staging slot is never reused while TCP I/O may
+                // still read it.
+                std::vector<bool> done(wave.size(), false);
+                size_t remaining = wave.size();
+                unsigned polls = 0;
+                while (remaining > 0) {
+                    bool progressed = false;
+                    for (size_t i = 0; i < wave.size(); ++i) {
+                        if (done[i]) continue;
+                        TransferStatus status{};
+                        const auto queried =
+                            engine_->getTransferStatus(batch, i, status);
+                        if (!queried.ok()) {
+                            // Only stop polling a task if the batch/task ID is
+                            // invalid; transient lookup failures must not
+                            // release the staging slot while transport I/O may
+                            // be active.
+                            if (queried.IsInvalidArgument()) {
+                                all_succeeded = false;
+                                done[i] = true;
+                                --remaining;
+                                progressed = true;
+                            }
+                            continue;
+                        }
+                        if (!IsTerminalStatus(status.s)) continue;
+                        if (status.s != TransferStatusEnum::COMPLETED) {
+                            all_succeeded = false;
+                        }
+                        done[i] = true;
+                        --remaining;
+                        progressed = true;
+                    }
+                    if (remaining > 0 && !progressed) {
+                        if (polls < 32) {
+                            ++polls;
+                            std::this_thread::yield();
+                        } else {
+                            std::this_thread::sleep_for(
+                                std::chrono::microseconds(50));
+                        }
+                    }
+                }
+
+                const auto freed = engine_->freeBatchID(batch);
+                // Once all tasks reached COMPLETED,
+                // Status::BatchCleanupDeferred reflects the benign
+                // CompletionCallbackPin unwind window in Slice::markSuccess()
+                // and is NOT a transfer failure.
+                if (!freed.ok() && !freed.IsBatchCleanupDeferred()) {
+                    all_succeeded = false;
+                }
             }
             if (all_succeeded) return Error::kOk;
             destinations_drained_.store(false, std::memory_order_release);

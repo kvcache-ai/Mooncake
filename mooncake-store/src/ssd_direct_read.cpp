@@ -93,6 +93,19 @@ DestinationError SsdDirectReadOwner::SetPeers(
     // recovery. Refresh adds bindings; it does not revoke or rotate epochs.
     // Preflight into a copy so conflicts, capacity and allocation failures
     // cannot partially discard the authentication needed by old attempts.
+    auto evict_dead_epoch = [&](std::vector<SsdFixedL2Peer>& table,
+                                PeerIdentity incoming) -> bool {
+        for (auto it = table.begin(); it != table.end(); ++it) {
+            if (it->identity.client_id_high == incoming.client_id_high &&
+                it->identity.client_id_low == incoming.client_id_low &&
+                it->identity.boot_epoch < incoming.boot_epoch &&
+                !impl_->ledger.HasNonDrainedRecord(it->identity)) {
+                table.erase(it);
+                return true;
+            }
+        }
+        return false;
+    };
     auto merged = impl_->peers;
     for (auto& peer : peers) {
         const auto known = std::find_if(
@@ -105,7 +118,8 @@ DestinationError SsdDirectReadOwner::SetPeers(
                 return DestinationError::kUnauthorized;
             continue;
         }
-        if (merged.size() >= 64) return DestinationError::kLimit;
+        if (merged.size() >= 64 && !evict_dead_epoch(merged, peer.identity))
+            return DestinationError::kLimit;
         merged.push_back(std::move(peer));
     }
     impl_->peers.swap(merged);
@@ -127,7 +141,19 @@ DestinationError SsdDirectReadOwner::UpsertPeer(SsdFixedL2Peer peer) {
             return DestinationError::kUnauthorized;
         return DestinationError::kOk;
     }
-    if (impl_->peers.size() >= 64) return DestinationError::kLimit;
+    if (impl_->peers.size() >= 64) {
+        auto dead = std::find_if(
+            impl_->peers.begin(), impl_->peers.end(), [&](const auto& old) {
+                return old.identity.client_id_high ==
+                           peer.identity.client_id_high &&
+                       old.identity.client_id_low ==
+                           peer.identity.client_id_low &&
+                       old.identity.boot_epoch < peer.identity.boot_epoch &&
+                       !impl_->ledger.HasNonDrainedRecord(old.identity);
+            });
+        if (dead == impl_->peers.end()) return DestinationError::kLimit;
+        impl_->peers.erase(dead);
+    }
     impl_->peers.push_back(std::move(peer));
     return DestinationError::kOk;
 }
@@ -256,8 +282,26 @@ SsdControlReply SsdDirectReadOwner::Execute(
             impl_->peers.begin(), impl_->peers.end(), [&](const auto& peer) {
                 return peer.identity == request.requester;
             });
-        if (known == impl_->peers.end() && impl_->peers.size() < 64) {
-            impl_->peers.push_back(*authorized_peer);
+        if (known == impl_->peers.end()) {
+            if (impl_->peers.size() >= 64) {
+                auto dead = std::find_if(
+                    impl_->peers.begin(), impl_->peers.end(),
+                    [&](const auto& old) {
+                        return old.identity.client_id_high ==
+                                   authorized_peer->identity.client_id_high &&
+                               old.identity.client_id_low ==
+                                   authorized_peer->identity.client_id_low &&
+                               old.identity.boot_epoch <
+                                   authorized_peer->identity.boot_epoch &&
+                               !impl_->ledger.HasNonDrainedRecord(old.identity);
+                    });
+                if (dead != impl_->peers.end()) {
+                    impl_->peers.erase(dead);
+                }
+            }
+            if (impl_->peers.size() < 64) {
+                impl_->peers.push_back(*authorized_peer);
+            }
         }
     }
 

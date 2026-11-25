@@ -112,24 +112,11 @@ struct SsdOwnerRequestLedger::State {
     }
     size_t PerSessionRangeCap() const {
         if (limits.max_sessions <= 1) return limits.max_retired_ranges;
-        const size_t share = limits.max_retired_ranges /
-                             std::min<size_t>(limits.max_sessions, 4);
-        return std::max<size_t>(1, share);
+        return std::max<size_t>(
+            1, limits.max_retired_ranges / limits.max_sessions);
     }
-    bool CanRetire(const RetiredRanges& ranges, uint64_t id) const {
-        auto next = ranges.upper_bound(id);
-        auto previous = next == ranges.begin() ? ranges.end() : std::prev(next);
-        if (previous != ranges.end() && previous->second >= id) return true;
-        const bool left = previous != ranges.end() &&
-                          previous->second != UINT64_MAX &&
-                          previous->second + 1 == id;
-        const bool right =
-            next != ranges.end() && id != UINT64_MAX && next->first == id + 1;
-        if (left || right) return true;
-        return retired_range_count < limits.max_retired_ranges &&
-               ranges.size() < PerSessionRangeCap();
-    }
-    bool Retire(RetiredRanges& ranges, uint64_t id) {
+    bool Retire(RetiredRanges& ranges, uint64_t id,
+                bool allow_coalesce_on_cap = false) {
         auto next = ranges.upper_bound(id);
         auto previous = next == ranges.begin() ? ranges.end() : std::prev(next);
         if (previous != ranges.end() && previous->second >= id) return true;
@@ -144,34 +131,90 @@ struct SsdOwnerRequestLedger::State {
                 ranges.erase(next);
                 --retired_range_count;
             }
-        } else if (right) {
+            return true;
+        }
+        if (right) {
             auto node = ranges.extract(next);
             node.key() = id;
             ranges.insert(std::move(node));
-        } else {
-            if (retired_range_count >= limits.max_retired_ranges ||
-                ranges.size() >= PerSessionRangeCap())
-                return false;
-            ranges.emplace(id, id);
-            ++retired_range_count;
+            return true;
         }
+        if (retired_range_count >= limits.max_retired_ranges ||
+            ranges.size() >= PerSessionRangeCap()) {
+            if (!allow_coalesce_on_cap) return false;
+            // Conservatively advance/coalesce existing retired ranges so a
+            // fragmented peer can never pin kDrained records and wedge Admit()
+            // for itself or other peers. Every retired ID remains covered.
+            if (ranges.size() >= 2) {
+                auto first = ranges.begin();
+                auto second = std::next(first);
+                first->second = second->second;
+                ranges.erase(second);
+                --retired_range_count;
+                if (id >= first->first && id <= first->second) return true;
+            } else if (ranges.size() == 1) {
+                auto first = ranges.begin();
+                if (id < first->first) {
+                    auto node = ranges.extract(first);
+                    node.key() = id;
+                    ranges.insert(std::move(node));
+                } else if (id > first->second) {
+                    first->second = id;
+                }
+                return true;
+            } else {
+                // ranges is empty yet global retired_range_count hit the limit
+                // (only possible if max_retired_ranges < max_sessions).
+                bool freed = false;
+                for (auto& [_, peer_ranges] : replay_floors) {
+                    if (peer_ranges.size() >= 2) {
+                        auto first = peer_ranges.begin();
+                        auto second = std::next(first);
+                        first->second = second->second;
+                        peer_ranges.erase(second);
+                        --retired_range_count;
+                        freed = true;
+                        break;
+                    }
+                }
+                if (!freed) return false;
+            }
+        }
+        ranges.emplace(id, id);
+        ++retired_range_count;
         return true;
     }
-    bool HasActiveOrTrackedRecordForPeer(
+    bool HasNonDrainedRecordForPeer(
         const decltype(PeerKey({}))& peer_key) const {
         return std::any_of(
             records.begin(), records.end(), [&](const auto& entry) {
-                return PeerKey(entry.second->reference.requester) == peer_key;
+                return PeerKey(entry.second->reference.requester) == peer_key &&
+                       entry.second->state != SsdOwnerRequestState::kDrained;
             });
     }
     // When max_sessions is reached and a client restarts with a newer boot
-    // epoch, retire its dead earlier epoch once it has no tracked records.
+    // epoch, retire its dead earlier epoch once it has no active/quarantined
+    // records, cleaning up any cached kDrained summaries for that dead epoch.
     bool TryEvictDeadSessionFor(PeerIdentity incoming) {
         for (auto it = replay_floors.begin(); it != replay_floors.end(); ++it) {
             if (std::get<0>(it->first) == incoming.client_id_high &&
                 std::get<1>(it->first) == incoming.client_id_low &&
                 std::get<2>(it->first) < incoming.boot_epoch &&
-                !HasActiveOrTrackedRecordForPeer(it->first)) {
+                !HasNonDrainedRecordForPeer(it->first)) {
+                const auto dead_key = it->first;
+                for (auto rec_it = records.begin(); rec_it != records.end();) {
+                    auto& r = *rec_it->second;
+                    if (PeerKey(r.reference.requester) == dead_key) {
+                        metadata -= r.metadata;
+                        r.forgotten = true;
+                        r.request = {};
+                        r.result.reset();
+                        r.destinations.clear();
+                        rec_it = records.erase(rec_it);
+                    } else {
+                        ++rec_it;
+                    }
+                }
                 retired_range_count -= it->second.size();
                 replay_floors.erase(it);
                 return true;
@@ -255,23 +298,25 @@ SsdOwnerRequestLedger::Admission SsdOwnerRequestLedger::Admit(
             if (candidate->second->state != SsdOwnerRequestState::kDrained)
                 continue;
             const auto& cand_ref = candidate->second->reference;
-            const bool sibling_active = std::any_of(
-                state_->records.begin(), state_->records.end(),
-                [&](const auto& other) {
-                    return other.second->reference.requester ==
-                               cand_ref.requester &&
-                           other.second->reference.attempt.request_id ==
-                               cand_ref.attempt.request_id &&
-                           other.second->state !=
-                               SsdOwnerRequestState::kDrained;
-                });
+            bool sibling_active = false;
+            const auto sibling_begin =
+                std::tuple(PeerKey(cand_ref.requester),
+                           AttemptKey({cand_ref.attempt.owner,
+                                       cand_ref.attempt.request_id, 0}));
+            for (auto sib = state_->records.lower_bound(sibling_begin);
+                 sib != state_->records.end() &&
+                 sib->second->reference.requester == cand_ref.requester &&
+                 sib->second->reference.attempt.owner ==
+                     cand_ref.attempt.owner &&
+                 sib->second->reference.attempt.request_id ==
+                     cand_ref.attempt.request_id;
+                 ++sib) {
+                if (sib->second->state != SsdOwnerRequestState::kDrained) {
+                    sibling_active = true;
+                    break;
+                }
+            }
             if (sibling_active) continue;
-            const auto floor_it =
-                state_->replay_floors.find(PeerKey(cand_ref.requester));
-            if (floor_it != state_->replay_floors.end() &&
-                !state_->CanRetire(floor_it->second,
-                                   cand_ref.attempt.request_id))
-                continue;
             if (retired == state_->records.end() ||
                 candidate->second->completed_at <
                     retired->second->completed_at) {
@@ -282,7 +327,9 @@ SsdOwnerRequestLedger::Admission SsdOwnerRequestLedger::Admit(
         auto& old = *retired->second;
         auto& floor =
             state_->replay_floors.at(PeerKey(old.reference.requester));
-        if (!state_->Retire(floor, old.reference.attempt.request_id)) break;
+        if (!state_->Retire(floor, old.reference.attempt.request_id,
+                            /*allow_coalesce_on_cap=*/true))
+            break;
         const auto evict_requester = old.reference.requester;
         const uint64_t evict_request_id = old.reference.attempt.request_id;
         for (auto it = state_->records.begin(); it != state_->records.end();) {
@@ -506,9 +553,6 @@ DestinationError SsdOwnerRequestLedger::Operation::Complete(
                         }))
             return DestinationError::kInvalidArgument;
         auto copy = result;
-        if (record_->state == SsdOwnerRequestState::kQuarantined) {
-            --state_->quarantined_records;
-        }
         record_->result = std::move(copy);
         record_->rejected = {};
         record_->state = SsdOwnerRequestState::kDrained;
@@ -518,6 +562,10 @@ DestinationError SsdOwnerRequestLedger::Operation::Complete(
     }
     state_->cv.notify_all();
     return DestinationError::kOk;
+}
+bool SsdOwnerRequestLedger::HasNonDrainedRecord(PeerIdentity requester) const {
+    std::lock_guard lock(state_->mutex);
+    return state_->HasNonDrainedRecordForPeer(PeerKey(requester));
 }
 std::chrono::milliseconds SsdOwnerRequestLedger::Operation::RemainingTimeout()
     const {

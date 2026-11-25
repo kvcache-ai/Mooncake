@@ -484,5 +484,69 @@ TEST_F(SsdTcpWriteTargetTest, AdjacentMrsNeverBypassSingleTcpBufferPreflight) {
     EXPECT_EQ(source->unregisterLocalMemory(staging.data(), true), 0);
 }
 
+TEST_F(SsdTcpWriteTargetTest,
+       MultiWaveScatterSucceedsAndWaveFailureClearsDrain) {
+    auto source = MakeTcpEngine();
+    auto peer = MakeTcpEngine();
+    ASSERT_TRUE(source);
+    ASSERT_TRUE(peer);
+
+    // 10 non-mergeable fragments with guard gaps between each destination span
+    // 3 bounded waves (kMaxWaveEntries = 4 -> 4 + 4 + 2).
+    constexpr size_t kFragments = 10;
+    constexpr size_t kFragBytes = 128;
+    constexpr size_t kStride = 256;
+    std::vector<std::byte> staging(kFragments * kFragBytes);
+    for (size_t i = 0; i < staging.size(); ++i) {
+        staging[i] = static_cast<std::byte>((i * 53 + 11) % 251);
+    }
+    std::vector<std::byte> destination(kFragments * kStride, std::byte{0xCC});
+    ASSERT_EQ(source->registerLocalMemory(staging.data(), staging.size(),
+                                          "cpu:0", false, true),
+              0);
+    ASSERT_EQ(peer->registerLocalMemory(destination.data(), destination.size(),
+                                        "cpu:0", true, true),
+              0);
+
+    std::vector<ResolvedDestination> views;
+    views.reserve(kFragments);
+    ReadChunk chunk{0, 0, staging.size(), 0, staging.size(), {}};
+    chunk.fragments.reserve(kFragments);
+    const auto dst_base = reinterpret_cast<uint64_t>(destination.data());
+    for (size_t i = 0; i < kFragments; ++i) {
+        views.push_back({peer->getLocalIpAndPort(), dst_base + i * kStride,
+                         kFragBytes, DestinationMemory::kHost});
+        chunk.fragments.push_back({i * kFragBytes, {i, 0, kFragBytes}});
+    }
+
+    auto made = PrepareSsdTcpWriteTarget(source, views);
+    ASSERT_EQ(made.error, DestinationError::kOk);
+    ASSERT_TRUE(made.target);
+    ASSERT_EQ(
+        made.target->WriteAndDrain(chunk, {staging.data(), staging.size()}),
+        Error::kOk);
+    EXPECT_TRUE(made.target->DestinationsDrained());
+    for (size_t i = 0; i < kFragments; ++i) {
+        EXPECT_EQ(std::memcmp(destination.data() + i * kStride,
+                              staging.data() + i * kFragBytes, kFragBytes),
+                  0);
+        for (size_t g = kFragBytes; g < kStride; ++g) {
+            EXPECT_EQ(destination[i * kStride + g], std::byte{0xCC});
+        }
+    }
+
+    // Tear down the peer so wave 0 fails; WriteAndDrain must abort remaining
+    // waves and clear DestinationsDrained().
+    EXPECT_EQ(peer->unregisterLocalMemory(destination.data(), true), 0);
+    peer.reset();
+    EXPECT_NE(
+        made.target->WriteAndDrain(chunk, {staging.data(), staging.size()}),
+        Error::kOk);
+    EXPECT_FALSE(made.target->DestinationsDrained());
+
+    made.target.reset();
+    EXPECT_EQ(source->unregisterLocalMemory(staging.data(), true), 0);
+}
+
 }  // namespace
 }  // namespace mooncake::ssd_offload

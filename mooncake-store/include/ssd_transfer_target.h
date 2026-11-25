@@ -21,7 +21,7 @@ struct SsdTransferTargetPreparation {
 
 // Trusted Owner setup only: views come from exact requester grant resolution.
 // Classic host TCP v2 only, using explicit
-// TransferEngine::submitAcknowledgedTcpWrite. Accepted writes wait for terminal
+// TransferEngine::submitReceiverVisibleWrite. Accepted writes wait for terminal
 // batch completion before releasing source buffers; any failed write clears
 // DestinationsDrained().
 SsdTransferTargetPreparation PrepareSsdTcpWriteTarget(

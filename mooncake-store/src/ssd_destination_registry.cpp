@@ -245,9 +245,9 @@ DestinationRegistry::AcquireResult DestinationRegistry::Acquire(
         return {DestinationError::kStaleRequest, {}};
     if (peer == state_->replay_floors.end() &&
         state_->replay_floors.size() == state_->limits.max_owner_sessions) {
-        // Retire a dead earlier boot epoch of the same client (or an idle
-        // owner with no tracked attempts) so peer restarts do not permanently
-        // exhaust max_owner_sessions.
+        // Retire only a dead earlier boot epoch of the same owner client once
+        // it has no tracked attempts. Never evict a different live owner's
+        // replay floor, which would break ForgetRequest replay fencing.
         auto evict_it = state_->replay_floors.end();
         for (auto it = state_->replay_floors.begin();
              it != state_->replay_floors.end(); ++it) {
@@ -263,7 +263,6 @@ DestinationRegistry::AcquireResult DestinationRegistry::Acquire(
                 evict_it = it;
                 break;
             }
-            if (evict_it == state_->replay_floors.end()) evict_it = it;
         }
         if (evict_it != state_->replay_floors.end()) {
             state_->replay_floors.erase(evict_it);
@@ -433,13 +432,14 @@ bool DestinationRegistry::HasPendingWrite(uint64_t address,
                                           uint64_t bytes) const {
     if (bytes == 0) return false;
     if (bytes > UINT64_MAX - address) return true;
+    const std::pair<uint64_t, uint64_t> query{address, address + bytes};
     std::lock_guard lock(state_->mutex);
-    for (const auto& [identity, record] : state_->records) {
-        (void)identity;
-        if (record->stage == DestinationAttemptState::kDrained) continue;
-        for (auto interval : record->intervals)
-            if (Overlap({address, address + bytes}, interval)) return true;
-    }
+    auto next = state_->active_intervals.upper_bound(address);
+    if (next != state_->active_intervals.begin() &&
+        Overlap(query, *std::prev(next)))
+        return true;
+    if (next != state_->active_intervals.end() && Overlap(query, *next))
+        return true;
     return false;
 }
 

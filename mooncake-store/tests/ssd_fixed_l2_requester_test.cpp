@@ -50,7 +50,7 @@ class SsdFixedL2Test : public ::testing::Test {
                         requester};
                     if (delay_reply)
                         std::this_thread::sleep_for(
-                            std::chrono::milliseconds(30));
+                            std::chrono::milliseconds(80));
                     if (lose_reply) return SsdRequesterCallResult{};
                 }
                 if (message.command == SsdControlCommand::kRecoverReadInto &&
@@ -146,7 +146,7 @@ TEST_F(SsdFixedL2Test, OnlyTimelyOriginalRejectionPermitsLegacyFallback) {
     lose_reply = false;
     delay_reply = true;
     auto late = client->ReadWithRecovery(Peer(), Objects(),
-                                         std::chrono::milliseconds(10));
+                                         std::chrono::milliseconds(20));
     EXPECT_FALSE(late.allow_fallback);
     EXPECT_EQ(late.error, DestinationError::kTimedOut);
     EXPECT_EQ((*pool)[8], std::byte{0});
@@ -360,7 +360,7 @@ class SsdFixedL2SafeReturnTest : public ::testing::Test {
                     return SsdRequesterCallResult{};
                 }
                 EXPECT_EQ(message.command, SsdControlCommand::kRecoverReadInto);
-                EXPECT_LE(timeout, std::chrono::milliseconds(30));
+                EXPECT_LE(timeout, std::chrono::milliseconds(60));
                 ++recover_calls;
                 if (reject_recovery) {
                     ++invalid_replies;
@@ -410,12 +410,12 @@ TEST_F(SsdFixedL2SafeReturnTest,
     auto started = entered.get_future();
     auto result = std::async(std::launch::async, [this] {
         return client->ReadWithRecovery(
-            Peer(), Objects(), std::chrono::milliseconds(30),
-            {std::chrono::milliseconds(30), std::chrono::milliseconds(2)});
+            Peer(), Objects(), std::chrono::milliseconds(60),
+            {std::chrono::milliseconds(60), std::chrono::milliseconds(5)});
     });
     EXPECT_EQ(started.wait_for(std::chrono::seconds(1)),
               std::future_status::ready);
-    EXPECT_EQ(result.wait_for(std::chrono::milliseconds(100)),
+    EXPECT_EQ(result.wait_for(std::chrono::milliseconds(150)),
               std::future_status::timeout);
     EXPECT_TRUE(client->HasPendingWrite(
         reinterpret_cast<uint64_t>(pool->data()) + 8, 32));
@@ -442,9 +442,9 @@ TEST_F(SsdFixedL2SafeReturnTest,
     Create();
     reject_recovery = true;
     auto result = client->ReadWithRecovery(
-        Peer(), Objects(), std::chrono::milliseconds(30),
-        {std::chrono::milliseconds(30), std::chrono::milliseconds(2),
-         std::chrono::milliseconds(50)});
+        Peer(), Objects(), std::chrono::milliseconds(60),
+        {std::chrono::milliseconds(60), std::chrono::milliseconds(5),
+         std::chrono::milliseconds(150)});
     EXPECT_NE(result.error, DestinationError::kOk);
     EXPECT_FALSE(result.result);
     EXPECT_GT(invalid_replies, 0u);
@@ -508,6 +508,126 @@ TEST(SsdFixedL2ContractTest, RejectsRdmaAndCloseDoesNotBlockOnHungRpc) {
     auto result = in_flight.get();
     EXPECT_EQ(result.error, DestinationError::kTransportError);
     EXPECT_FALSE(result.result);
+}
+
+TEST(SsdFixedL2ContractTest, RecoverHonorsTimeoutWhileReadHoldsPendingLock) {
+    std::promise<void> entered, release;
+    auto started = entered.get_future();
+    auto released = release.get_future().share();
+    SsdFixedL2Requester fixed(
+        {requester, "default", "requester-te", {7, 8}}, "tcp",
+        [&](const auto&, auto, const auto& msg, auto) {
+            if (msg.command == SsdControlCommand::kReadInto) {
+                entered.set_value();
+                released.wait();
+            }
+            return SsdRequesterCallResult{};
+        });
+    auto pool = std::make_shared<std::array<std::byte, 64>>();
+    const auto base = reinterpret_cast<uint64_t>(pool->data());
+    auto reg = fixed.Register({base, pool->size(), base, pool->size()}, pool);
+    ASSERT_EQ(reg.error, DestinationError::kOk);
+    SsdPushPeerInfo peer{owner,
+                         "default",
+                         "legacy",
+                         "127.0.0.1",
+                         9001,
+                         "owner-te",
+                         {1, owner, 15, 64, 4096, 64, 4096, 4096, {"tcp"}}};
+    auto in_flight = std::async(std::launch::async, [&] {
+        return fixed.Read(peer, {{"key", 32, {}, {{0, {{reg.region, 8, 32}}}}}},
+                          std::chrono::seconds(30));
+    });
+    ASSERT_EQ(started.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    auto pending = fixed.PendingAttempts();
+    ASSERT_EQ(pending.size(), 1u);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto rec = fixed.Recover(pending.front(), std::chrono::milliseconds(50));
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    EXPECT_EQ(rec.error, DestinationError::kTimedOut);
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+    release.set_value();
+    (void)in_flight.get();
+}
+
+TEST(SsdFixedL2ContractTest,
+     ReadWithRecoveryReusesConcurrentRecoverTerminalWithoutToctou) {
+    std::promise<void> read_entered, read_release;
+    auto read_started = read_entered.get_future();
+    auto read_go = read_release.get_future().share();
+    std::atomic<size_t> recover_calls{0};
+    SsdFixedL2Requester fixed(
+        {requester, "default", "requester-te", {7, 8}}, "tcp",
+        [&](const auto&, auto, const auto& msg, auto) {
+            if (msg.command == SsdControlCommand::kReadInto) {
+                read_entered.set_value();
+                read_go.wait();
+                return SsdRequesterCallResult{};
+            }
+            ++recover_calls;
+            SsdReadResultV1 done{1,
+                                 msg.reference.attempt,
+                                 true,
+                                 {{0, AttemptOutcome::kSucceeded, 32, {}}},
+                                 requester};
+            return SsdRequesterCallResult{
+                DestinationError::kOk,
+                SsdControlReply{msg.command, DestinationError::kOk,
+                                SsdOwnerRequestSnapshot{
+                                    DestinationError::kOk,
+                                    SsdOwnerRequestState::kDrained, done}}};
+        });
+    auto pool = std::make_shared<std::array<std::byte, 64>>();
+    const auto base = reinterpret_cast<uint64_t>(pool->data());
+    auto reg = fixed.Register({base, pool->size(), base, pool->size()}, pool);
+    ASSERT_EQ(reg.error, DestinationError::kOk);
+    SsdPushPeerInfo peer{owner,
+                         "default",
+                         "legacy",
+                         "127.0.0.1",
+                         9001,
+                         "owner-te",
+                         {1, owner, 15, 64, 4096, 64, 4096, 4096, {"tcp"}}};
+    auto rwr = std::async(std::launch::async, [&] {
+        return fixed.ReadWithRecovery(
+            peer, {{"key", 32, {}, {{0, {{reg.region, 8, 32}}}}}},
+            std::chrono::seconds(5),
+            {std::chrono::seconds(1), std::chrono::milliseconds(10),
+             std::chrono::seconds(2)});
+    });
+    ASSERT_EQ(read_started.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    auto pending = fixed.PendingAttempts();
+    ASSERT_EQ(pending.size(), 1u);
+    // Start a concurrent Recover() waiting on pending->mutex so it acquires
+    // the lock and removes the map entry right as ReadInternal returns.
+    std::promise<void> recover_launched;
+    auto recover_started = recover_launched.get_future();
+    auto external_recover = std::async(std::launch::async, [&] {
+        recover_launched.set_value();
+        return fixed.Recover(pending.front(), std::chrono::seconds(2));
+    });
+    ASSERT_EQ(recover_started.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    read_release.set_value();
+    auto ext_res = external_recover.get();
+    auto rwr_res = rwr.get();
+    // If external_recover entered before rwr removed the entry, it must return
+    // the terminal result; if rwr won under scheduling jitter, external_recover
+    // legitimately sees kNotFound while rwr still observes the single terminal.
+    EXPECT_TRUE(ext_res.result.has_value() ||
+                ext_res.error == DestinationError::kNotFound);
+    if (ext_res.result.has_value()) {
+        EXPECT_EQ(ext_res.result->objects[0].outcome,
+                  AttemptOutcome::kSucceeded);
+    }
+    ASSERT_TRUE(rwr_res.result.has_value());
+    EXPECT_EQ(rwr_res.result->objects[0].outcome, AttemptOutcome::kSucceeded);
+    EXPECT_FALSE(rwr_res.allow_fallback);
+    EXPECT_EQ(recover_calls.load(), 1u);
+    EXPECT_EQ(fixed.Close(), DestinationError::kOk);
 }
 
 }  // namespace

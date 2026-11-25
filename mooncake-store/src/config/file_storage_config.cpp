@@ -255,7 +255,7 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
-    if (streaming_read.enabled &&
+    if ((streaming_read.enabled || streaming_read.push_enabled) &&
         storage_backend_type == StorageBackendType::kBucket &&
         (local_buffer_size <= 0 ||
          !streaming_read.Validate(local_buffer_size))) {

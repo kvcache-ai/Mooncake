@@ -37,7 +37,7 @@ DestinationDrainAck Ack(const SsdReadResultV1& result) {
 }  // namespace
 struct SsdFixedL2Requester::State {
     struct Pending {
-        std::mutex mutex;
+        std::timed_mutex mutex;
         SsdControlMessage message;
         SsdPushPeerInfo route;
         DestinationRegistry::Attempt attempt;
@@ -184,12 +184,17 @@ DestinationRegistry::RegistrationResult SsdFixedL2Requester::Register(
 SsdFixedL2ReadResult SsdFixedL2Requester::Read(
     const SsdPushPeerInfo& peer, std::vector<SsdObjectReadV1> objects,
     std::chrono::milliseconds timeout) {
+    return ReadInternal(peer, std::move(objects), timeout, nullptr);
+}
+SsdFixedL2ReadResult SsdFixedL2Requester::ReadInternal(
+    const SsdPushPeerInfo& peer, std::vector<SsdObjectReadV1> objects,
+    std::chrono::milliseconds timeout, std::shared_ptr<void>* out_pending) {
     const uint64_t max_timeout_ms = state_->wire.max_timeout_ms;
     if (timeout.count() <= 0 || uint64_t(timeout.count()) > max_timeout_ms)
         return {};
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     auto pending = std::make_shared<State::Pending>();
-    std::lock_guard serial(pending->mutex);
+    std::lock_guard<std::timed_mutex> serial(pending->mutex);
     {
         std::lock_guard lock(state_->mutex);
         if (state_->closing.load(std::memory_order_acquire))
@@ -295,6 +300,7 @@ SsdFixedL2ReadResult SsdFixedL2Requester::Read(
         return result;
     }
     pending->message.request->relative_timeout_ms = uint64_t(remaining.count());
+    if (out_pending) *out_pending = pending;
     try {
         return state_->Finish(
             pending,
@@ -314,6 +320,7 @@ SsdFixedL2ReadResult SsdFixedL2Requester::Recover(
     const uint64_t max_timeout_ms = state_->wire.max_timeout_ms;
     if (timeout.count() <= 0 || uint64_t(timeout.count()) > max_timeout_ms)
         return {};
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     std::shared_ptr<State::Pending> pending;
     {
         std::lock_guard lock(state_->mutex);
@@ -322,7 +329,10 @@ SsdFixedL2ReadResult SsdFixedL2Requester::Recover(
             return {DestinationError::kNotFound, false, attempt, {}};
         pending = found->second;
     }
-    std::lock_guard serial(pending->mutex);
+    std::unique_lock<std::timed_mutex> serial(pending->mutex, deadline);
+    if (!serial.owns_lock()) {
+        return {DestinationError::kTimedOut, true, attempt, {}};
+    }
     try {
         // A concurrent recovery may have obtained this record before another
         // caller completed it and removed it from the pending map. Its trusted
@@ -333,10 +343,16 @@ SsdFixedL2ReadResult SsdFixedL2Requester::Recover(
             result.allow_fallback = false;
             return result;
         }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+        if (remaining.count() <= 0) {
+            return {DestinationError::kTimedOut, true, attempt, {}};
+        }
         return state_->Finish(
             pending,
             state_->Call(*pending, SsdControlCommand::kRecoverReadInto,
-                         timeout),
+                         remaining),
             SsdControlCommand::kRecoverReadInto);
     } catch (...) {
         pending->timed_out.store(true, std::memory_order_release);
@@ -355,19 +371,14 @@ SsdFixedL2ReadResult SsdFixedL2Requester::ReadWithRecovery(
         options.recovery_budget.count() <= 0 ||
         uint64_t(options.recovery_budget.count()) > max_timeout_ms)
         return {};
-    auto result = Read(owner, std::move(objects), timeout);
+    std::shared_ptr<void> tracked_raw;
+    auto result =
+        ReadInternal(owner, std::move(objects), timeout, &tracked_raw);
     if (!result.may_have_submitted || result.result) return result;
-    // Retain the Pending handle if still registered so a concurrent Recover()
-    // that completes and removes the map entry still yields its terminal result
-    // instead of returning nullopt to the original caller.
-    std::shared_ptr<State::Pending> tracked;
-    {
-        std::lock_guard lock(state_->mutex);
-        if (auto it = state_->pending_reads.find(Key(result.attempt));
-            it != state_->pending_reads.end()) {
-            tracked = it->second;
-        }
-    }
+    // tracked is captured inside ReadInternal before pending->mutex is released
+    // so a concurrent Recover() that completes and erases the pending_reads map
+    // entry in between still yields its cached terminal result with no TOCTOU.
+    auto tracked = std::static_pointer_cast<State::Pending>(tracked_raw);
     const auto until =
         std::chrono::steady_clock::now() + options.recovery_budget;
     for (;;) {
@@ -391,7 +402,7 @@ SsdFixedL2ReadResult SsdFixedL2Requester::ReadWithRecovery(
             if (!state_->pending_reads.contains(Key(result.attempt))) {
                 lock.unlock();
                 if (tracked) {
-                    std::lock_guard serial(tracked->mutex);
+                    std::lock_guard<std::timed_mutex> serial(tracked->mutex);
                     if (tracked->terminal && tracked->terminal->result) {
                         result.result = tracked->terminal->result;
                         result.allow_fallback = false;

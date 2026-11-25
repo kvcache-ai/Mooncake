@@ -98,6 +98,7 @@ class SsdOwnerRequestLedger {
         const std::vector<ResolvedDestination>& destinations = {});
     void Close();
     SsdControlStats stats() const;
+    bool HasNonDrainedRecord(PeerIdentity requester) const;
 
    private:
     std::shared_ptr<State> state_;

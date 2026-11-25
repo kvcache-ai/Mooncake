@@ -447,6 +447,14 @@ TEST(SsdDestinationRegistry, EvictsIdleOwnerSessionOnRestartWhenAtCapacity) {
     ASSERT_EQ(first.attempt.Complete(Ack(1)), DestinationError::kOk);
     ASSERT_EQ(registry.ForgetRequest(owner, 1), DestinationError::kOk);
 
+    // A different live owner must NEVER evict an existing owner's replay floor
+    // entry at max_owner_sessions capacity (only a restarted epoch of the same
+    // logical owner may evict an idle replay floor).
+    auto different_owner = Key(1);
+    different_owner.owner.client_id_low += 1;
+    EXPECT_EQ(registry.Acquire(different_owner, {{region.region, 0, 8}}).error,
+              DestinationError::kLimit);
+
     // After all attempts for the old owner epoch are drained and forgotten, a
     // restarted owner epoch can evict the idle replay floor entry.
     auto restarted = Key(1);

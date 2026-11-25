@@ -74,6 +74,7 @@ struct FileStorageEnvironment {
     ScopedEnvVar use_uring{"MOONCAKE_OFFLOAD_USE_URING"};
     ScopedEnvVar legacy_use_uring{"MOONCAKE_USE_URING"};
     ScopedEnvVar local_streaming_read{"MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ"};
+    ScopedEnvVar ssd_push{"MOONCAKE_OFFLOAD_SSD_PUSH"};
     ScopedEnvVar stream_use_uring{"MOONCAKE_OFFLOAD_STREAM_USE_URING"};
     ScopedEnvVar stream_slot_bytes{"MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES"};
     ScopedEnvVar stream_slots{"MOONCAKE_OFFLOAD_STREAM_SLOTS"};
@@ -100,6 +101,7 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
     EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.80);
     EXPECT_FALSE(config.streaming_read.enabled);
+    EXPECT_FALSE(config.streaming_read.push_enabled);
     EXPECT_FALSE(config.streaming_read.use_uring);
     EXPECT_EQ(config.streaming_read.slot_bytes, 1024u * 1024u);
     EXPECT_EQ(config.streaming_read.slots, 4u);
@@ -433,6 +435,39 @@ TEST_F(FileStorageConfigTest, StreamingReadEnvAndValidation) {
         minimal.streaming_read.max_outstanding = 1;
         EXPECT_EQ(minimal.streaming_read.write_workers, 2u);
         EXPECT_TRUE(minimal.Validate());
+
+        // Standalone owner-push (enabled=false, push_enabled=true) must still
+        // run StreamingReadConfig::Validate() from FileStorageConfig::Validate.
+        minimal.streaming_read.enabled = false;
+        minimal.streaming_read.push_enabled = true;
+        minimal.streaming_read.slots = 1;
+        minimal.streaming_read.max_outstanding = 2;
+        minimal.streaming_read.write_workers = 3;
+        EXPECT_FALSE(minimal.Validate());
+        minimal.streaming_read.write_workers = 2;
+        minimal.streaming_read.max_outstanding = 1;  // < 2 * slots
+        EXPECT_FALSE(minimal.Validate());
+        minimal.streaming_read.max_outstanding = 2;
+        EXPECT_TRUE(minimal.Validate());
+        EXPECT_EQ(minimal.streaming_read.ProtocolLimits().max_objects, 2u);
+        minimal.streaming_read.max_outstanding = 1024;
+        EXPECT_EQ(minimal.streaming_read.ProtocolLimits().max_objects,
+                  ssd_offload::StreamingReadConfig::kPushMaxBatchObjects);
+    }
+
+    // MOONCAKE_OFFLOAD_SSD_PUSH=true alone raises DefaultMaxOutstanding to 512.
+    {
+        FileStorageEnvironment push_env;
+        push_env.storage_path.Set(data_path.c_str());
+        push_env.ssd_push.Set("true");
+        const auto push_cfg = FileStorageConfig::FromEnvironment();
+        EXPECT_FALSE(push_cfg.streaming_read.enabled);
+        EXPECT_TRUE(push_cfg.streaming_read.push_enabled);
+        EXPECT_EQ(push_cfg.streaming_read.max_outstanding,
+                  ssd_offload::StreamingReadConfig::kPushMaxBatchObjects);
+        EXPECT_EQ(push_cfg.streaming_read.ProtocolLimits().max_objects,
+                  ssd_offload::StreamingReadConfig::kPushMaxBatchObjects);
+        EXPECT_TRUE(push_cfg.Validate());
     }
 
     // OffsetAllocator rounds non-exact bin sizes up (1150976 -> 1179648) and

@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -42,7 +43,8 @@ struct StreamingReadConfig {
     SsdReadProtocolLimits ProtocolLimits() const {
         SsdReadProtocolLimits limits;
         if (push_enabled) {
-            limits.max_objects = kPushMaxBatchObjects;
+            limits.max_objects =
+                std::min(kPushMaxBatchObjects, max_outstanding);
         }
         return limits;
     }
@@ -57,7 +59,8 @@ struct StreamingReadConfig {
             max_fragments == 0) {
             return false;
         }
-        if (push_enabled && max_outstanding < 2 * slots) {
+        if (push_enabled &&
+            (max_outstanding < 2 * slots || write_workers > max_outstanding)) {
             return false;
         }
         const auto [normalized_slot, effective_arena] =

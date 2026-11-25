@@ -4508,4 +4508,52 @@ TEST_F(FileStorageTest, EndToEndFileStorageOwnerPushOverTcpV2) {
     EXPECT_EQ(owner_te->unregisterLocalMemory(staging_base, true), 0);
 }
 
+TEST_F(FileStorageTest, OwnerStreamingReadWithStreamingUringEnabled) {
+    auto config = SmallConfig(data_path + "/owner-stream-uring");
+    fs::create_directories(config.storage_filepath);
+    config.streaming_read.use_uring = true;
+    config.streaming_read.slot_bytes = 16384;
+    config.streaming_read.slots = 4;
+    FileStorage storage(config, nullptr, "owner");
+
+    auto make_pattern = [](size_t len, uint8_t seed) {
+        std::string out(len, '\0');
+        for (size_t i = 0; i < len; ++i) {
+            out[i] = static_cast<char>((i * 97 + seed) % 251);
+        }
+        return out;
+    };
+    // Include one small whole object (would hit bulk path if streaming
+    // use_uring didn't route through the streaming pipeline) and one
+    // multi-chunk object (> slot_bytes).
+    const std::vector<std::string> values{make_pattern(4096, 13),
+                                          make_pattern(40000, 71)};
+    SeedPushBatch(storage, values);
+    auto request = SmallRequest(values, true);
+    std::vector<std::vector<char>> output;
+    auto target = std::make_shared<SmallBatchTarget>();
+    for (const auto& value : values) output.emplace_back(value.size(), '?');
+    for (auto& buf : output) {
+        const size_t half = buf.size() / 2;
+        target->views.push_back({buf.data(), half});
+        target->views.push_back({buf.data() + half, buf.size() - half});
+    }
+    auto result = storage.ReadOwnerStreaming(
+        request, target,
+        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    ASSERT_TRUE(result);
+    EXPECT_EQ(ssd_offload::ValidateSsdReadResultV1(
+                  request, *result, config.streaming_read.ProtocolLimits()),
+              ssd_offload::DestinationError::kOk);
+    for (size_t i = 0; i < values.size(); ++i) {
+        EXPECT_EQ(result->objects[i].outcome,
+                  ssd_offload::AttemptOutcome::kSucceeded);
+        EXPECT_EQ(std::string(output[i].begin(), output[i].end()), values[i]);
+    }
+    // Streaming pipeline splits into per-chunk writes rather than a single
+    // bulk WriteAndDrain call.
+    EXPECT_GE(target->writes, 3u);
+    ASSERT_TRUE(storage.Shutdown());
+}
+
 }  // namespace mooncake

@@ -404,11 +404,8 @@ void Reply(IO& io, const SsdControlReply* source, SsdControlReply* destination,
                    limits);
         }
     }
-    const bool success = error == uint32_t(DestinationError::kOk),
-               duplicate = error == uint32_t(DestinationError::kDuplicate);
-    if (snapshot !=
-        (success || (command == SsdControlCommand::kReadInto && duplicate)))
-        io.Fail();
+    const bool success = error == uint32_t(DestinationError::kOk);
+    if (snapshot != success) io.Fail();
 }
 template <typename T, typename Walk>
 DestinationError Decode(std::string_view bytes, T& output,

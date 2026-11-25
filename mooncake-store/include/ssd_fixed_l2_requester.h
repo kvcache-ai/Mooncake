@@ -9,8 +9,12 @@ struct SsdFixedL2ReadResult {
     bool may_have_submitted{false};
     AttemptIdentity attempt;
     std::optional<SsdReadResultV1> result;
-    // Only the original, timely, complete preflight rejection permits legacy
-    // fallback. A recovered/late result never starts another read attempt.
+    // Legacy fallback is safe ONLY when `!may_have_submitted ||
+    // allow_fallback`:
+    //   - `!may_have_submitted`: failed locally before issuing any RPC.
+    //   - `allow_fallback`: the original, timely, complete preflight rejection
+    //     from the owner proved zero writes occurred.
+    // A recovered/late result or uncertain timeout never permits fallback.
     bool allow_fallback{false};
 };
 struct SsdFixedL2DrainOptions {
@@ -51,5 +55,9 @@ class SsdFixedL2Requester {
    private:
     struct State;
     std::shared_ptr<State> state_;
+    SsdFixedL2ReadResult ReadInternal(const SsdPushPeerInfo& owner,
+                                      std::vector<SsdObjectReadV1>,
+                                      std::chrono::milliseconds timeout,
+                                      std::shared_ptr<void>* out_pending);
 };
 }  // namespace mooncake::ssd_offload

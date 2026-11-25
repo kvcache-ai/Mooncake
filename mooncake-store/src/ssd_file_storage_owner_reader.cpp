@@ -17,8 +17,8 @@ SsdOwnerCallbacks::Reader MakeFileStorageOwnerReader(
         auto read =
             storage->ReadOwnerStreaming(request, std::move(target), deadline);
         // ReadOwnerStreaming error returns are complete preflight failures.
-        // Post-submission or direct_io failures return a shaped result with
-        // explicit drain status.
+        // Post-submission failures return a shaped result with explicit drain
+        // status.
         if (!read) {
             VLOG(1) << "SSD owner streaming read preflight rejected request="
                     << request.attempt.request_id

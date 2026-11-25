@@ -74,7 +74,7 @@ class SsdDirectReadTest : public ::testing::Test {
                     request.attempt,
                     sink->DestinationsDrained(),
                     {{0, AttemptOutcome::kSucceeded, 32, {}}},
-                    requester};
+                    request.requester};
             },
             limits, SsdReadProtocolLimits{}, std::move(resolver));
     }
@@ -543,15 +543,44 @@ TEST(SsdOwnerRequestLedgerTest,
         auto [r11, ref11, v11] = make_req(noisy, 11, 8);
         EXPECT_EQ(ledger.Recover(r11, ref11, v11).error, DestinationError::kOk);
 
-        // Healthy peer can still be admitted even when noisy is at its
-        // per-session retired range cap.
+        // Noisy peer at its per-session retired range cap completing many
+        // requests must NOT wedge Admit() for healthy peers: kDrained eviction
+        // coalesces noisy's retired ranges rather than leaving kDrained records
+        // un-evictable.
+        for (uint64_t id = 20; id <= 30; id += 2) {
+            auto [rm, refm, vm] = make_req(noisy, id, 8);
+            auto adm =
+                ledger.Admit(rm, refm, std::chrono::steady_clock::now(), vm);
+            ASSERT_EQ(adm.error, DestinationError::kOk) << "id=" << id;
+            ASSERT_EQ(adm.operation.Start(), DestinationError::kOk);
+            SsdReadResultV1 done{1,
+                                 refm.attempt,
+                                 true,
+                                 {{0, AttemptOutcome::kSucceeded, 8, {}}},
+                                 noisy};
+            ASSERT_EQ(adm.operation.Complete(done), DestinationError::kOk);
+        }
+        EXPECT_LE(ledger.stats().retired_range_count,
+                  limits.max_retired_ranges);
+
+        // Healthy peer can still be admitted even when noisy saturated its
+        // per-session retired range cap and filled max_records with kDrained
+        // entries.
         auto [rh, refh, vh] = make_req(healthy, 1, 8);
         auto admitted =
             ledger.Admit(rh, refh, std::chrono::steady_clock::now(), vh);
-        EXPECT_EQ(admitted.error, DestinationError::kOk);
+        ASSERT_EQ(admitted.error, DestinationError::kOk);
+        ASSERT_EQ(admitted.operation.Start(), DestinationError::kOk);
+        SsdReadResultV1 hdone{1,
+                              refh.attempt,
+                              true,
+                              {{0, AttemptOutcome::kSucceeded, 8, {}}},
+                              healthy};
+        ASSERT_EQ(admitted.operation.Complete(hdone), DestinationError::kOk);
 
         // When max_sessions (3) is full, noisy restarting with a newer boot
-        // epoch evicts its idle older epoch session instead of hitting kLimit.
+        // epoch evicts its idle older epoch session (and that dead epoch's
+        // cached kDrained records) instead of hitting kLimit.
         PeerIdentity noisy_restarted{noisy.client_id_high, noisy.client_id_low,
                                      noisy.boot_epoch + 1};
         auto [rn, refn, vn] = make_req(noisy_restarted, 1, 8);
@@ -559,6 +588,36 @@ TEST(SsdOwnerRequestLedgerTest,
             ledger.Admit(rn, refn, std::chrono::steady_clock::now(), vn);
         EXPECT_EQ(restarted_admitted.error, DestinationError::kOk);
     }
+}
+
+TEST_F(SsdDirectReadTest,
+       PeerTableAtCapacityEvictsIdleDeadEpochOnClientRestart) {
+    Create();
+    // Fill remaining 63 slots (requester already occupies slot 0 -> total 64).
+    for (uint64_t id = 100; id < 163; ++id) {
+        ASSERT_EQ(
+            service->UpsertPeer({{id, 2, 3}, "default", "other-te", {7, 8}}),
+            DestinationError::kOk);
+    }
+    // Complete a request from `requester` so it leaves a kDrained record in the
+    // ledger.
+    ASSERT_EQ(service->Execute(Message(1)).error, DestinationError::kOk);
+    // An unrelated 65th peer is rejected with kLimit.
+    EXPECT_EQ(service->UpsertPeer({{999, 2, 3}, "default", "extra-te", {7, 8}}),
+              DestinationError::kLimit);
+    // `requester` restarting with a newer boot_epoch evicts its idle earlier
+    // epoch cleanly from both `peers` and the ledger's `replay_floors`.
+    PeerIdentity restarted{requester.client_id_high, requester.client_id_low,
+                           requester.boot_epoch + 1};
+    EXPECT_EQ(
+        service->UpsertPeer({restarted, "default", "requester-te", {7, 8}}),
+        DestinationError::kOk);
+    auto msg = Message(1);
+    msg.request->requester = restarted;
+    msg.reference.requester = restarted;
+    msg.request->objects[0].ranges[0].destinations[0].region.requester =
+        restarted;
+    EXPECT_EQ(service->Execute(msg).error, DestinationError::kOk);
 }
 }  // namespace
 }  // namespace mooncake::ssd_offload

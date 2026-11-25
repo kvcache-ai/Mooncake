@@ -434,6 +434,7 @@ class FileStorage {
     // streaming_mutex_ (shared); serialized internally by
     // streaming_init_mutex_.
     ssd_offload::BoundedExecutor* GetOrCreateStreamingReadsLocked();
+    ssd_offload::BoundedExecutor* GetOrCreateStreamingWritesLocked();
 #if defined(__linux__) && defined(USE_URING)
     std::shared_ptr<ssd_offload::UringReadExecutor>
     GetOrCreateStreamingUringReadsLocked();
@@ -448,6 +449,7 @@ class FileStorage {
     std::shared_ptr<ssd_offload::UringReadExecutor> streaming_uring_reads_;
 #endif
     std::unique_ptr<ssd_offload::BoundedExecutor> streaming_reads_;
+    std::unique_ptr<ssd_offload::BoundedExecutor> streaming_writes_;
     std::atomic<size_t> active_streaming_sources_{0};
     // Whether client_buffer_allocator_'s buffer is the io_uring fixed buffer,
     // which the destructor must unregister before the buffer is freed.
