@@ -625,6 +625,46 @@ TEST_F(OrderedOpLogWriterAwaitTest, CompletesWaitersInSequenceOrder) {
 }
 
 TEST_F(OrderedOpLogWriterAwaitTest,
+       CompletesMixedTimedAndUntimedWaitersInSequenceOrder) {
+    storage_.BlockWrites();
+    CreateWriter({.max_entries_per_batch = 4});
+    for (int i = 0; i < 4; ++i) {
+        auto reservation = writer_->Reserve();
+        ASSERT_TRUE(reservation.has_value());
+        ASSERT_TRUE(writer_->Commit(std::move(*reservation), MakeEntry(), {})
+                        .has_value());
+    }
+    std::mutex mutex;
+    std::vector<std::pair<uint64_t, bool>> completed;
+    auto register_waiter = [&](uint64_t sequence, bool timed) {
+        auto future =
+            timed ? writer_->AwaitDurable(sequence, std::chrono::hours(1))
+                  : writer_->AwaitDurable(sequence);
+        waiters_.push_back(
+            std::move(future).thenValue([&, sequence, timed](ErrorCode error) {
+                std::lock_guard<std::mutex> lock(mutex);
+                completed.emplace_back(sequence, timed);
+                return error;
+            }));
+    };
+    register_waiter(4, true);
+    register_waiter(2, true);
+    register_waiter(3, false);
+    register_waiter(1, true);
+    register_waiter(2, false);
+
+    writer_->Start();
+    EXPECT_TRUE(storage_.WaitForBlockedWrite());
+    storage_.UnblockWrites();
+    for (auto& waiter : waiters_) ExpectResult(waiter, ErrorCode::OK);
+    writer_->Stop();
+    std::lock_guard<std::mutex> lock(mutex);
+    EXPECT_EQ(completed,
+              (std::vector<std::pair<uint64_t, bool>>{
+                  {1, true}, {2, false}, {2, true}, {3, false}, {4, true}}));
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest,
        OutstandingWaitAllowsOtherWorkOnSameExecutorThread) {
     storage_.BlockWrites();
     CreateWriter();

@@ -259,7 +259,9 @@ struct OrderedOpLogWriter::Impl {
     }
 
     // A continuation may run inline and reenter the writer, so never call
-    // this while holding mutex. Merge both maps to preserve sequence order.
+    // this while holding mutex. Merge both maps to preserve sequence order;
+    // for identical sequences, untimed waiters complete before timed waiters
+    // while registration order within each map is preserved.
     static void CompleteWaiters(TakenWaiters waiters, ErrorCode error) {
         auto untimed_it = waiters.untimed.begin();
         auto timed_it = waiters.timed.begin();
