@@ -115,6 +115,17 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
+    std::vector<int> batch_put(
+        std::span<const Client::PutItem> items,
+        const ReplicateConfig& config = ReplicateConfig{}) override;
+
+    std::vector<int> batch_get(std::span<const Client::GetItem> items,
+                               bool group_by_target = false) override;
+
+    std::vector<int> batch_exist(std::span<const std::string> keys,
+                                 const GrantLeasePolicy& lease_policy = {
+                                     ProbeLeaseMode::AllHits, 1}) override;
+
     std::vector<int> batch_put_from_cuda_ipc(
         const std::vector<CudaIpcWriteRequest> &requests,
         const ReplicateConfig &config = ReplicateConfig{});

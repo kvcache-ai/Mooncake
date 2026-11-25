@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -450,6 +451,18 @@ class PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    // Unified coarse-grained AoS entry points (zero-copy registered buffers).
+    virtual std::vector<int> batch_put(
+        std::span<const Client::PutItem> items,
+        const ReplicateConfig& config = ReplicateConfig{}) = 0;
+
+    virtual std::vector<int> batch_get(std::span<const Client::GetItem> items,
+                                       bool group_by_target = false) = 0;
+
+    virtual std::vector<int> batch_exist(std::span<const std::string> keys,
+                                         const GrantLeasePolicy& lease_policy =
+                                             {ProbeLeaseMode::AllHits, 1}) = 0;
 
     // Put/get sessions. Default stubs keep DummyClient unchanged; RealClient
     // overrides with the real implementations.

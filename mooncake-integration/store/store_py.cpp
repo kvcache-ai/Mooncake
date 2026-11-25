@@ -2,9 +2,12 @@
 #include <pybind11/stl.h>
 #include <numa.h>
 
+#include <bit>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <span>
+#include <string_view>
 #include <unordered_set>
 
 #include "pyclient.h"
@@ -2238,6 +2241,593 @@ class MooncakeDistributedNoFRegisterPyWrapper {
     MooncakeDistributedNoFRegisterPyWrapper() = default;
 };
 
+namespace {
+
+bool is_integer_like(const py::handle& obj) {
+    return !py::isinstance<py::bool_>(obj) && PyIndex_Check(obj.ptr()) != 0;
+}
+
+uint64_t extract_nonneg_u64(const py::handle& obj, const char* field_name) {
+    if (!is_integer_like(obj)) {
+        throw py::type_error(std::string(field_name) + " must be an integer");
+    }
+    PyObject* long_obj = obj.ptr();
+    py::object owned_long;
+    if (!PyLong_CheckExact(long_obj)) {
+        PyObject* indexed = PyNumber_Index(long_obj);
+        if (!indexed) {
+            throw py::error_already_set();
+        }
+        owned_long = py::reinterpret_steal<py::object>(indexed);
+        long_obj = owned_long.ptr();
+    }
+    const unsigned long long val = PyLong_AsUnsignedLongLong(long_obj);
+    if (val == static_cast<unsigned long long>(-1) && PyErr_Occurred()) {
+        PyErr_Clear();
+        throw py::value_error(std::string(field_name) +
+                              " must be in range [0, 2^64 - 1]");
+    }
+    return static_cast<uint64_t>(val);
+}
+
+struct U64BufferView {
+    py::buffer_info info;
+    bool is_signed{false};
+    size_t count{0};
+
+    uint64_t at(size_t i, const char* field_name) const {
+        if (!is_signed) {
+            return static_cast<const uint64_t*>(info.ptr)[i];
+        }
+        const int64_t val = static_cast<const int64_t*>(info.ptr)[i];
+        if (val < 0) {
+            throw py::value_error(std::string(field_name) +
+                                  " values must be non-negative");
+        }
+        return static_cast<uint64_t>(val);
+    }
+};
+
+std::optional<U64BufferView> try_acquire_u64_buffer(const py::object& obj,
+                                                    const char* field_name) {
+    if (py::isinstance<py::bytes>(obj) || py::isinstance<py::bytearray>(obj) ||
+        py::isinstance<py::str>(obj)) {
+        throw py::type_error(
+            std::string(field_name) +
+            " must be a 1D uint64/int64 buffer or sequence of integers, not "
+            "bytes or str");
+    }
+    if (!PyObject_CheckBuffer(obj.ptr())) {
+        return std::nullopt;
+    }
+    py::buffer_info info =
+        py::reinterpret_borrow<py::buffer>(obj).request(/*writable=*/false);
+    if (info.ndim != 1) {
+        throw py::value_error(std::string(field_name) +
+                              " buffer must be 1-dimensional");
+    }
+    const size_t count = static_cast<size_t>(info.shape[0]);
+    if (count > 1 && info.strides[0] != info.itemsize) {
+        throw py::value_error(std::string(field_name) +
+                              " buffer must be contiguous");
+    }
+    std::string_view fmt(info.format);
+    if (!fmt.empty()) {
+        const char prefix = fmt[0];
+        if (prefix == '@' || prefix == '=') {
+            fmt.remove_prefix(1);
+        } else if (prefix == '<') {
+            if constexpr (std::endian::native != std::endian::little) {
+                throw py::value_error(std::string(field_name) +
+                                      " buffer must use native byte order");
+            }
+            fmt.remove_prefix(1);
+        } else if (prefix == '>' || prefix == '!') {
+            if constexpr (std::endian::native != std::endian::big) {
+                throw py::value_error(std::string(field_name) +
+                                      " buffer must use native byte order");
+            }
+            fmt.remove_prefix(1);
+        }
+    }
+    if (fmt.size() != 1) {
+        throw py::value_error(std::string(field_name) +
+                              " buffer must have uint64 or int64 dtype");
+    }
+    const char code = fmt[0];
+    bool is_signed = false;
+    if ((code == 'Q' || (code == 'L' && sizeof(unsigned long) == 8)) &&
+        info.itemsize == sizeof(uint64_t)) {
+        is_signed = false;
+    } else if ((code == 'q' || (code == 'l' && sizeof(long) == 8)) &&
+               info.itemsize == sizeof(int64_t)) {
+        is_signed = true;
+    } else {
+        throw py::value_error(std::string(field_name) +
+                              " buffer must have uint64 or int64 dtype");
+    }
+    return U64BufferView{std::move(info), is_signed, count};
+}
+
+std::vector<Slice> build_slices_from_py(const py::object& ptrs_obj,
+                                        const py::object& sizes_obj) {
+    if (py::isinstance<py::bool_>(ptrs_obj)) {
+        throw py::type_error("ptrs must not be a bool");
+    }
+    if (py::isinstance<py::bool_>(sizes_obj)) {
+        throw py::type_error("sizes must not be a bool");
+    }
+    if (is_integer_like(ptrs_obj)) {
+        if (is_integer_like(sizes_obj)) {
+            const uint64_t ptr = extract_nonneg_u64(ptrs_obj, "ptr");
+            const uint64_t size = extract_nonneg_u64(sizes_obj, "size");
+            return {Slice{reinterpret_cast<void*>(static_cast<uintptr_t>(ptr)),
+                          static_cast<size_t>(size)}};
+        }
+        throw py::type_error(
+            "ptrs must be a 1D uint64/int64 buffer or sequence of integers "
+            "(or pass scalar ptr and scalar size)");
+    }
+
+    auto ptrs_buf = try_acquire_u64_buffer(ptrs_obj, "ptrs");
+    std::optional<py::sequence> ptrs_seq;
+    size_t n = 0;
+    if (ptrs_buf) {
+        n = ptrs_buf->count;
+    } else if (PySequence_Check(ptrs_obj.ptr())) {
+        ptrs_seq = py::reinterpret_borrow<py::sequence>(ptrs_obj);
+        n = py::len(*ptrs_seq);
+    } else {
+        throw py::type_error(
+            "ptrs must be a 1D uint64/int64 buffer or sequence of integers");
+    }
+
+    if (is_integer_like(sizes_obj)) {
+        const size_t scalar_size =
+            static_cast<size_t>(extract_nonneg_u64(sizes_obj, "sizes"));
+        std::vector<Slice> slices;
+        slices.reserve(n);
+        if (ptrs_buf) {
+            for (size_t i = 0; i < n; ++i) {
+                const uint64_t p = ptrs_buf->at(i, "ptrs");
+                slices.push_back(
+                    Slice{reinterpret_cast<void*>(static_cast<uintptr_t>(p)),
+                          scalar_size});
+            }
+        } else {
+            for (size_t i = 0; i < n; ++i) {
+                const uint64_t p = extract_nonneg_u64((*ptrs_seq)[i], "ptrs");
+                slices.push_back(
+                    Slice{reinterpret_cast<void*>(static_cast<uintptr_t>(p)),
+                          scalar_size});
+            }
+        }
+        return slices;
+    }
+
+    auto sizes_buf = try_acquire_u64_buffer(sizes_obj, "sizes");
+    std::optional<py::sequence> sizes_seq;
+    size_t n_sizes = 0;
+    if (sizes_buf) {
+        n_sizes = sizes_buf->count;
+    } else if (PySequence_Check(sizes_obj.ptr())) {
+        sizes_seq = py::reinterpret_borrow<py::sequence>(sizes_obj);
+        n_sizes = py::len(*sizes_seq);
+    } else {
+        throw py::type_error(
+            "sizes must be a non-negative integer, 1D uint64/int64 buffer, or "
+            "sequence of integers");
+    }
+    if (n_sizes != n) {
+        throw py::value_error("ptrs and sizes must have the same length (" +
+                              std::to_string(n) +
+                              " != " + std::to_string(n_sizes) + ")");
+    }
+
+    std::vector<Slice> slices;
+    slices.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const uint64_t p = ptrs_buf
+                               ? ptrs_buf->at(i, "ptrs")
+                               : extract_nonneg_u64((*ptrs_seq)[i], "ptrs");
+        const uint64_t s = sizes_buf
+                               ? sizes_buf->at(i, "sizes")
+                               : extract_nonneg_u64((*sizes_seq)[i], "sizes");
+        slices.push_back(
+            Slice{reinterpret_cast<void*>(static_cast<uintptr_t>(p)),
+                  static_cast<size_t>(s)});
+    }
+    return slices;
+}
+
+WriteTarget parse_write_target(const py::object& obj) {
+    if (obj.is_none()) {
+        return WholeObject{};
+    }
+    if (py::isinstance<RangeTarget>(obj)) {
+        return obj.cast<RangeTarget>();
+    }
+    if (py::isinstance<PartTarget>(obj)) {
+        return obj.cast<PartTarget>();
+    }
+    throw py::type_error("target must be None, RangeTarget, or PartTarget");
+}
+
+py::object write_target_to_py(const WriteTarget& target) {
+    return std::visit(
+        [](const auto& value) -> py::object {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, WholeObject>) {
+                return py::none();
+            } else {
+                return py::cast(value);
+            }
+        },
+        target);
+}
+
+ReadTarget parse_read_target(const py::object& obj) {
+    if (obj.is_none()) {
+        return WholeObject{};
+    }
+    if (py::isinstance<PartIndex>(obj)) {
+        return obj.cast<PartIndex>();
+    }
+    throw py::type_error("target must be None or PartIndex");
+}
+
+py::object read_target_to_py(const ReadTarget& target) {
+    return std::visit(
+        [](const auto& value) -> py::object {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, WholeObject>) {
+                return py::none();
+            } else {
+                return py::cast(value);
+            }
+        },
+        target);
+}
+
+uint64_t compute_total_slice_bytes(const std::vector<Slice>& slices) {
+    uint64_t total = 0;
+    for (const auto& slice : slices) {
+        total += static_cast<uint64_t>(slice.size);
+    }
+    return total;
+}
+
+std::vector<uintptr_t> slices_to_ptrs(const std::vector<Slice>& slices) {
+    std::vector<uintptr_t> ptrs;
+    ptrs.reserve(slices.size());
+    for (const auto& slice : slices) {
+        ptrs.push_back(reinterpret_cast<uintptr_t>(slice.ptr));
+    }
+    return ptrs;
+}
+
+std::vector<size_t> slices_to_sizes(const std::vector<Slice>& slices) {
+    std::vector<size_t> sizes;
+    sizes.reserve(slices.size());
+    for (const auto& slice : slices) {
+        sizes.push_back(slice.size);
+    }
+    return sizes;
+}
+
+void bind_unified_aos_store_api(py::module_& m,
+                                py::class_<MooncakeStorePyWrapper>& store_cls) {
+    py::class_<RangeTarget>(
+        m, "RangeTarget",
+        "Contiguous multi-producer write target (PiecePut). Producers write "
+        "disjoint [offset, offset + size) ranges sharing write_id into a "
+        "total_size-byte object.")
+        .def(py::init([](uint64_t offset, uint64_t total_size,
+                         std::string write_id) {
+                 return RangeTarget{offset, total_size, std::move(write_id)};
+             }),
+             py::arg("offset"), py::arg("total_size"), py::arg("write_id"))
+        .def_readwrite("offset", &RangeTarget::offset)
+        .def_readwrite("total_size", &RangeTarget::total_size)
+        .def_readwrite("write_id", &RangeTarget::write_id)
+        .def("__eq__",
+             [](const RangeTarget& a, const RangeTarget& b) {
+                 return a.offset == b.offset && a.total_size == b.total_size &&
+                        a.write_id == b.write_id;
+             })
+        .def("__repr__", [](const RangeTarget& t) {
+            return "RangeTarget(offset=" + std::to_string(t.offset) +
+                   ", total_size=" + std::to_string(t.total_size) +
+                   ", write_id=" +
+                   py::repr(py::str(t.write_id)).cast<std::string>() + ")";
+        });
+
+    py::class_<PartTarget>(
+        m, "PartTarget",
+        "Multi-part write target specifying part_index within part_count.")
+        .def(py::init([](uint32_t part_index, uint32_t part_count) {
+                 return PartTarget{part_index, part_count};
+             }),
+             py::arg("part_index") = 0, py::arg("part_count") = 1)
+        .def_readwrite("part_index", &PartTarget::part_index)
+        .def_readwrite("part_count", &PartTarget::part_count)
+        .def("__eq__",
+             [](const PartTarget& a, const PartTarget& b) {
+                 return a.part_index == b.part_index &&
+                        a.part_count == b.part_count;
+             })
+        .def("__repr__", [](const PartTarget& t) {
+            return "PartTarget(part_index=" + std::to_string(t.part_index) +
+                   ", part_count=" + std::to_string(t.part_count) + ")";
+        });
+
+    py::class_<PartIndex>(
+        m, "PartIndex",
+        "Read target for a specific part of a multi-part object.")
+        .def(py::init([](uint32_t index) { return PartIndex{index}; }),
+             py::arg("index") = 0)
+        .def_readwrite("index", &PartIndex::index)
+        .def("__eq__", [](const PartIndex& a,
+                          const PartIndex& b) { return a.index == b.index; })
+        .def("__repr__", [](const PartIndex& t) {
+            return "PartIndex(index=" + std::to_string(t.index) + ")";
+        });
+
+    py::enum_<ProbeLeaseMode>(m, "ProbeLeaseMode",
+                              "Lease-granting mode for batch_exist.")
+        .value("NONE", ProbeLeaseMode::None)
+        .value("LAST_HIT_ONLY", ProbeLeaseMode::LastHitOnly)
+        .value("ALL_HITS", ProbeLeaseMode::AllHits);
+
+    py::class_<GrantLeasePolicy>(
+        m, "GrantLeasePolicy",
+        "Lease policy for batch_exist. Candidates are consecutive groups of "
+        "candidate_size keys in caller order.")
+        .def(py::init([](ProbeLeaseMode lease_mode, uint64_t candidate_size) {
+                 return GrantLeasePolicy{lease_mode, candidate_size};
+             }),
+             py::arg("lease_mode") = ProbeLeaseMode::AllHits,
+             py::arg("candidate_size") = 1)
+        .def_readwrite("lease_mode", &GrantLeasePolicy::lease_mode)
+        .def_readwrite("candidate_size", &GrantLeasePolicy::candidate_size)
+        .def("__eq__",
+             [](const GrantLeasePolicy& a, const GrantLeasePolicy& b) {
+                 return a.lease_mode == b.lease_mode &&
+                        a.candidate_size == b.candidate_size;
+             })
+        .def("__repr__", [](const GrantLeasePolicy& p) {
+            const char* mode_str = "UNKNOWN";
+            switch (p.lease_mode) {
+                case ProbeLeaseMode::None:
+                    mode_str = "ProbeLeaseMode.NONE";
+                    break;
+                case ProbeLeaseMode::LastHitOnly:
+                    mode_str = "ProbeLeaseMode.LAST_HIT_ONLY";
+                    break;
+                case ProbeLeaseMode::AllHits:
+                    mode_str = "ProbeLeaseMode.ALL_HITS";
+                    break;
+            }
+            return std::string("GrantLeasePolicy(lease_mode=") + mode_str +
+                   ", candidate_size=" + std::to_string(p.candidate_size) + ")";
+        });
+
+    py::class_<Client::PutItem>(
+        m, "PutItem",
+        "Coarse-grained write descriptor referencing registered memory "
+        "buffer(s). Callers must keep backing buffers alive until batch_put "
+        "returns.")
+        .def(py::init([](std::string key, py::int_ ptr, py::int_ size,
+                         py::object target) {
+                 const uint64_t ptr_val = extract_nonneg_u64(ptr, "ptr");
+                 const uint64_t size_val = extract_nonneg_u64(size, "size");
+                 return Client::PutItem{
+                     .key = std::move(key),
+                     .slices = {Slice{reinterpret_cast<void*>(
+                                          static_cast<uintptr_t>(ptr_val)),
+                                      static_cast<size_t>(size_val)}},
+                     .target = parse_write_target(target),
+                 };
+             }),
+             py::arg("key"), py::arg("ptr"), py::arg("size"), py::kw_only(),
+             py::arg("target") = py::none(),
+             "Create a PutItem from a single registered buffer (ptr, size).")
+        .def(py::init([](std::string key, py::object ptrs, py::object sizes,
+                         py::object target) {
+                 return Client::PutItem{
+                     .key = std::move(key),
+                     .slices = build_slices_from_py(ptrs, sizes),
+                     .target = parse_write_target(target),
+                 };
+             }),
+             py::arg("key"), py::arg("ptrs"), py::arg("sizes"), py::kw_only(),
+             py::arg("target") = py::none(),
+             "Create a PutItem from multiple registered buffers. ptrs accepts "
+             "a 1D C-contiguous uint64/int64 buffer or sequence of ints; "
+             "sizes accepts a scalar int (broadcast to all ptrs), 1D buffer, "
+             "or sequence of ints.")
+        .def_readwrite("key", &Client::PutItem::key)
+        .def_property(
+            "target",
+            [](const Client::PutItem& self) {
+                return write_target_to_py(self.target);
+            },
+            [](Client::PutItem& self, const py::object& target) {
+                self.target = parse_write_target(target);
+            })
+        .def_property_readonly(
+            "num_slices",
+            [](const Client::PutItem& self) { return self.slices.size(); })
+        .def_property_readonly(
+            "total_size",
+            [](const Client::PutItem& self) {
+                return compute_total_slice_bytes(self.slices);
+            })
+        .def_property_readonly("ptrs",
+                               [](const Client::PutItem& self) {
+                                   return slices_to_ptrs(self.slices);
+                               })
+        .def_property_readonly("sizes",
+                               [](const Client::PutItem& self) {
+                                   return slices_to_sizes(self.slices);
+                               })
+        .def("__repr__", [](const Client::PutItem& self) {
+            return "PutItem(key=" +
+                   py::repr(py::str(self.key)).cast<std::string>() +
+                   ", num_slices=" + std::to_string(self.slices.size()) +
+                   ", total_size=" +
+                   std::to_string(compute_total_slice_bytes(self.slices)) +
+                   ", target=" +
+                   py::repr(write_target_to_py(self.target))
+                       .cast<std::string>() +
+                   ")";
+        });
+
+    py::class_<Client::GetItem>(
+        m, "GetItem",
+        "Coarse-grained read descriptor referencing registered destination "
+        "buffer(s). Callers must keep backing buffers alive until batch_get "
+        "returns.")
+        .def(py::init([](std::string key, py::int_ ptr, py::int_ size,
+                         py::object target, uint64_t src_offset) {
+                 const uint64_t ptr_val = extract_nonneg_u64(ptr, "ptr");
+                 const uint64_t size_val = extract_nonneg_u64(size, "size");
+                 return Client::GetItem{
+                     .key = std::move(key),
+                     .slices = {Slice{reinterpret_cast<void*>(
+                                          static_cast<uintptr_t>(ptr_val)),
+                                      static_cast<size_t>(size_val)}},
+                     .target = parse_read_target(target),
+                     .src_offset = src_offset,
+                 };
+             }),
+             py::arg("key"), py::arg("ptr"), py::arg("size"), py::kw_only(),
+             py::arg("target") = py::none(), py::arg("src_offset") = 0,
+             "Create a GetItem from a single registered buffer (ptr, size).")
+        .def(py::init([](std::string key, py::object ptrs, py::object sizes,
+                         py::object target, uint64_t src_offset) {
+                 return Client::GetItem{
+                     .key = std::move(key),
+                     .slices = build_slices_from_py(ptrs, sizes),
+                     .target = parse_read_target(target),
+                     .src_offset = src_offset,
+                 };
+             }),
+             py::arg("key"), py::arg("ptrs"), py::arg("sizes"), py::kw_only(),
+             py::arg("target") = py::none(), py::arg("src_offset") = 0,
+             "Create a GetItem from multiple registered buffers. ptrs accepts "
+             "a 1D C-contiguous uint64/int64 buffer or sequence of ints; "
+             "sizes accepts a scalar int (broadcast to all ptrs), 1D buffer, "
+             "or sequence of ints.")
+        .def_readwrite("key", &Client::GetItem::key)
+        .def_property(
+            "target",
+            [](const Client::GetItem& self) {
+                return read_target_to_py(self.target);
+            },
+            [](Client::GetItem& self, const py::object& target) {
+                self.target = parse_read_target(target);
+            })
+        .def_readwrite("src_offset", &Client::GetItem::src_offset)
+        .def_property_readonly(
+            "num_slices",
+            [](const Client::GetItem& self) { return self.slices.size(); })
+        .def_property_readonly(
+            "total_size",
+            [](const Client::GetItem& self) {
+                return compute_total_slice_bytes(self.slices);
+            })
+        .def_property_readonly("ptrs",
+                               [](const Client::GetItem& self) {
+                                   return slices_to_ptrs(self.slices);
+                               })
+        .def_property_readonly("sizes",
+                               [](const Client::GetItem& self) {
+                                   return slices_to_sizes(self.slices);
+                               })
+        .def("__repr__", [](const Client::GetItem& self) {
+            return "GetItem(key=" +
+                   py::repr(py::str(self.key)).cast<std::string>() +
+                   ", num_slices=" + std::to_string(self.slices.size()) +
+                   ", total_size=" +
+                   std::to_string(compute_total_slice_bytes(self.slices)) +
+                   ", target=" +
+                   py::repr(read_target_to_py(self.target))
+                       .cast<std::string>() +
+                   ", src_offset=" + std::to_string(self.src_offset) + ")";
+        });
+
+    store_cls
+        .def(
+            "batch_put",
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<Client::PutItem>& items,
+               const ReplicateConfig& config) {
+                if (items.empty()) {
+                    return std::vector<int>{};
+                }
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>(
+                        items.size(),
+                        static_cast<int>(to_py_ret(ErrorCode::INVALID_PARAMS)));
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_put(items, config);
+            },
+            py::arg("items"), py::arg("config") = ReplicateConfig{},
+            "Unified zero-copy batch put for a sequence of PutItem "
+            "descriptors (supports mixing WholeObject, PartTarget, and "
+            "RangeTarget). Returns per-item status codes (0 on success, "
+            "negative ErrorCode on failure).")
+        .def(
+            "batch_get",
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<Client::GetItem>& items,
+               bool group_by_target) {
+                if (items.empty()) {
+                    return std::vector<int>{};
+                }
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>(
+                        items.size(),
+                        static_cast<int>(to_py_ret(ErrorCode::INVALID_PARAMS)));
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get(items, group_by_target);
+            },
+            py::arg("items"), py::arg("group_by_target") = false,
+            "Unified zero-copy batch get for a sequence of GetItem "
+            "descriptors. Returns per-item status codes (0 on success, "
+            "negative ErrorCode on failure).")
+        .def(
+            "batch_exist",
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys,
+               const GrantLeasePolicy& lease_policy) {
+                if (keys.empty()) {
+                    return std::vector<int>{};
+                }
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>(
+                        keys.size(),
+                        static_cast<int>(to_py_ret(ErrorCode::INVALID_PARAMS)));
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_exist(keys, lease_policy);
+            },
+            py::arg("keys"),
+            py::arg("lease_policy") =
+                GrantLeasePolicy{ProbeLeaseMode::AllHits, 1},
+            "Unified existence check combining exist (ALL_HITS) and probe "
+            "(NONE / LAST_HIT_ONLY). Returns per-key status: 1 if readable, "
+            "0 if missing, negative ErrorCode on failure.");
+}
+
+}  // namespace
+
 PYBIND11_MODULE(_store, m) {
     m.def("_serialize_tensor", &serialize_tensor_metadata,
           "Inspect a torch tensor as Mooncake tensor metadata, data pointer, "
@@ -3850,6 +4440,10 @@ PYBIND11_MODULE(_store, m) {
 
     m.def("get_alloc_func_addr", &get_alloc_func_addr);
     m.def("get_free_func_addr", &get_free_func_addr);
+
+    auto store_cls = py::reinterpret_borrow<py::class_<MooncakeStorePyWrapper>>(
+        m.attr("MooncakeDistributedStore"));
+    bind_unified_aos_store_api(m, store_cls);
 }
 
 }  // namespace mooncake

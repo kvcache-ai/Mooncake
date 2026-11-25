@@ -10,6 +10,7 @@
 // dereferenced the null client_ and crashed the host process. Each call below
 // must instead return per-key errors without crashing.
 
+#include "dummy_client.h"
 #include "real_client.h"
 
 #include <gtest/gtest.h>
@@ -99,6 +100,49 @@ TEST_F(RealClientUninitializedTest, GetIntoRangesDoesNotCrash) {
     auto results = client_->get_into_ranges(range_buffers, all_keys, offsets,
                                             offsets, range_sizes);
     ASSERT_EQ(results.size(), 1u);
+}
+
+TEST_F(RealClientUninitializedTest, UnifiedBatchApisReturnErrorsWithoutCrash) {
+    std::vector<Client::PutItem> put_items{
+        {.key = keys_[0], .slices = {Slice{data_, sizeof(data_)}}},
+        {.key = keys_[1], .slices = {Slice{data_, sizeof(data_)}}},
+    };
+    std::vector<Client::GetItem> get_items{
+        {.key = keys_[0], .slices = {Slice{data_, sizeof(data_)}}},
+        {.key = keys_[1], .slices = {Slice{data_, sizeof(data_)}}},
+    };
+
+    ExpectAllFailed(client_->batch_put(put_items), put_items.size());
+    ExpectAllFailed(client_->batch_get(get_items), get_items.size());
+    ExpectAllFailed(client_->batch_exist(keys_), keys_.size());
+
+    EXPECT_TRUE(client_->batch_put({}).empty());
+    EXPECT_TRUE(client_->batch_get({}).empty());
+    EXPECT_TRUE(client_->batch_exist({}).empty());
+}
+
+TEST_F(RealClientUninitializedTest, DummyClientUnifiedBatchApisNotSupported) {
+    auto dummy = std::make_shared<DummyClient>();
+    std::vector<Client::PutItem> put_items{
+        {.key = keys_[0], .slices = {Slice{data_, sizeof(data_)}}},
+        {.key = keys_[1], .slices = {Slice{data_, sizeof(data_)}}},
+    };
+    std::vector<Client::GetItem> get_items{
+        {.key = keys_[0], .slices = {Slice{data_, sizeof(data_)}}},
+        {.key = keys_[1], .slices = {Slice{data_, sizeof(data_)}}},
+    };
+
+    const int expected = static_cast<int>(toInt(ErrorCode::NOT_SUPPORTED));
+    EXPECT_EQ(dummy->batch_put(put_items),
+              (std::vector<int>{expected, expected}));
+    EXPECT_EQ(dummy->batch_get(get_items),
+              (std::vector<int>{expected, expected}));
+    EXPECT_EQ(dummy->batch_exist(keys_),
+              (std::vector<int>{expected, expected}));
+
+    EXPECT_TRUE(dummy->batch_put({}).empty());
+    EXPECT_TRUE(dummy->batch_get({}).empty());
+    EXPECT_TRUE(dummy->batch_exist({}).empty());
 }
 
 }  // namespace testing

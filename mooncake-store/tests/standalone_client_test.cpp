@@ -240,5 +240,104 @@ TEST_F(StandaloneClientTest, EnvVarEnablesStandaloneWithoutKwarg) {
     unsetenv("MOONCAKE_ENABLE_EMBEDDED_MASTER");
 }
 
+TEST_F(StandaloneClientTest, UnifiedAoSBatchPutGetExistAndRangeTarget) {
+    auto setup = client_->setup_internal(
+        "localhost", "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
+        FLAGS_protocol, rdma_devices(),
+        /*master_server_addr=*/"",
+        /*transfer_engine=*/nullptr,
+        /*ipc_socket_path=*/"",
+        /*local_rpc_port=*/50052,
+        /*enable_ssd_offload=*/false,
+        /*start_offload_rpc_server=*/true,
+        /*ssd_offload_path=*/"",
+        /*tenant_id=*/"default",
+        /*enable_client_http_server=*/false,
+        /*client_http_port=*/DEFAULT_CLIENT_HTTP_PORT,
+        /*enable_embedded_master=*/true);
+    ASSERT_TRUE(setup.has_value());
+
+    constexpr size_t kChunk = 4096;
+    std::vector<char> src(kChunk * 4);
+    std::vector<char> dst(kChunk * 4, 0);
+    for (size_t i = 0; i < src.size(); ++i) {
+        src[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    ASSERT_EQ(client_->register_buffer(src.data(), src.size()), 0);
+    ASSERT_EQ(client_->register_buffer(dst.data(), dst.size()), 0);
+
+    // Mix a multi-slice WholeObject and the first piece of a RangeTarget object
+    // in a single batch_put call.
+    std::vector<Client::PutItem> batch1{
+        {
+            .key = "aos_whole",
+            .slices = {Slice{src.data(), kChunk},
+                       Slice{src.data() + kChunk, kChunk}},
+            .target = WholeObject{},
+        },
+        {
+            .key = "aos_piece",
+            .slices = {Slice{src.data() + kChunk * 2, kChunk}},
+            .target = RangeTarget{.offset = 0,
+                                  .total_size = kChunk * 2,
+                                  .write_id = "w-cpp-1"},
+        },
+    };
+    EXPECT_EQ(client_->batch_put(batch1), (std::vector<int>{0, 0}));
+
+    // aos_piece is still incomplete until the second piece commits.
+    const std::vector<std::string> probe_keys{"aos_whole", "aos_piece",
+                                              "aos_missing"};
+    EXPECT_EQ(client_->batch_exist(probe_keys, {ProbeLeaseMode::None, 1}),
+              (std::vector<int>{1, 0, 0}));
+
+    // Commit the second half of aos_piece.
+    Client::PutItem piece2{
+        .key = "aos_piece",
+        .slices = {Slice{src.data() + kChunk * 3, kChunk}},
+        .target = RangeTarget{.offset = kChunk,
+                              .total_size = kChunk * 2,
+                              .write_id = "w-cpp-1"},
+    };
+    EXPECT_EQ(client_->batch_put(std::span<const Client::PutItem>(&piece2, 1)),
+              (std::vector<int>{0}));
+
+    EXPECT_EQ(client_->batch_exist(probe_keys, {ProbeLeaseMode::AllHits, 1}),
+              (std::vector<int>{1, 1, 0}));
+
+    // Read both objects back in one batch_get call (including a sub-range
+    // crossing the RangeTarget piece boundary).
+    std::vector<Client::GetItem> gets{
+        {
+            .key = "aos_whole",
+            .slices = {Slice{dst.data(), kChunk * 2}},
+        },
+        {
+            .key = "aos_piece",
+            .slices = {Slice{dst.data() + kChunk * 2, kChunk * 2}},
+        },
+    };
+    EXPECT_EQ(client_->batch_get(gets, /*group_by_target=*/true),
+              (std::vector<int>{0, 0}));
+    EXPECT_EQ(src, dst);
+
+    std::vector<char> sub_dst(kChunk, 0);
+    ASSERT_EQ(client_->register_buffer(sub_dst.data(), sub_dst.size()), 0);
+    Client::GetItem sub_get{
+        .key = "aos_piece",
+        .slices = {Slice{sub_dst.data(), kChunk}},
+        .src_offset = kChunk / 2,
+    };
+    EXPECT_EQ(client_->batch_get(std::span<const Client::GetItem>(&sub_get, 1)),
+              (std::vector<int>{0}));
+    EXPECT_EQ(std::memcmp(sub_dst.data(), src.data() + kChunk * 2 + kChunk / 2,
+                          kChunk),
+              0);
+
+    ASSERT_EQ(client_->unregister_buffer(sub_dst.data()), 0);
+    ASSERT_EQ(client_->unregister_buffer(dst.data()), 0);
+    ASSERT_EQ(client_->unregister_buffer(src.data()), 0);
+}
+
 }  // namespace testing
 }  // namespace mooncake

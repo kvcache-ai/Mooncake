@@ -2298,4 +2298,35 @@ int DummyClient::request_hot_cache_fd() {
     return 0;
 }
 
+std::vector<int> DummyClient::batch_put(std::span<const Client::PutItem> items,
+                                        const ReplicateConfig& /*config*/) {
+    if (items.empty()) {
+        return {};
+    }
+    LOG(WARNING) << "DummyClient::batch_put is not supported";
+    return std::vector<int>(items.size(),
+                            static_cast<int>(toInt(ErrorCode::NOT_SUPPORTED)));
+}
+
+std::vector<int> DummyClient::batch_get(std::span<const Client::GetItem> items,
+                                        bool /*group_by_target*/) {
+    if (items.empty()) {
+        return {};
+    }
+    LOG(WARNING) << "DummyClient::batch_get is not supported";
+    return std::vector<int>(items.size(),
+                            static_cast<int>(toInt(ErrorCode::NOT_SUPPORTED)));
+}
+
+std::vector<int> DummyClient::batch_exist(
+    std::span<const std::string> keys,
+    const GrantLeasePolicy& /*lease_policy*/) {
+    if (keys.empty()) {
+        return {};
+    }
+    LOG(WARNING) << "DummyClient::batch_exist is not supported";
+    return std::vector<int>(keys.size(),
+                            static_cast<int>(toInt(ErrorCode::NOT_SUPPORTED)));
+}
+
 }  // namespace mooncake

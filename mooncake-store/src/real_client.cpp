@@ -432,6 +432,21 @@ size_t sum_successful_nested_sizes(
     return total;
 }
 
+template <typename Item>
+size_t sum_successful_item_sizes(
+    const std::vector<tl::expected<void, ErrorCode>>& results,
+    std::span<const Item> items) {
+    size_t total = 0;
+    for (size_t i = 0; i < results.size() && i < items.size(); ++i) {
+        if (results[i].has_value()) {
+            for (const auto& slice : items[i].slices) {
+                total += slice.size;
+            }
+        }
+    }
+    return total;
+}
+
 size_t sum_positive_results(const std::vector<int64_t> &results) {
     size_t total = 0;
     for (int64_t result : results) {
@@ -7439,6 +7454,63 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
                     sum_successful_nested_sizes(py_results, sizes), latency_us);
             });
     return ToPyResults(internal_results);
+}
+
+std::vector<int> RealClient::batch_put(std::span<const Client::PutItem> items,
+                                       const ReplicateConfig& config) {
+    if (items.empty()) {
+        return {};
+    }
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<int>(
+            items.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+    auto internal_results =
+        execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
+            [&]() { return client_->BatchPut(items, config); },
+            [this](const auto&) { return client_ != nullptr; },
+            [&](uint64_t latency_us, const auto& ret) {
+                client_->ObserveTransferOperation(
+                    TransferOperationKind::kWrite, "batch_put",
+                    sum_successful_item_sizes(ret, items), latency_us);
+            });
+    return ToPyResults(internal_results);
+}
+
+std::vector<int> RealClient::batch_get(std::span<const Client::GetItem> items,
+                                       bool group_by_target) {
+    if (items.empty()) {
+        return {};
+    }
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<int>(
+            items.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+    auto internal_results =
+        execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
+            [&]() { return client_->BatchGet(items, group_by_target); },
+            [this](const auto&) { return client_ != nullptr; },
+            [&](uint64_t latency_us, const auto& ret) {
+                client_->ObserveTransferOperation(
+                    TransferOperationKind::kRead, "batch_get",
+                    sum_successful_item_sizes(ret, items), latency_us);
+            });
+    return ToPyResults(internal_results);
+}
+
+std::vector<int> RealClient::batch_exist(std::span<const std::string> keys,
+                                         const GrantLeasePolicy& lease_policy) {
+    if (keys.empty()) {
+        return {};
+    }
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+    return ToPyResults(client_->BatchExist(keys, lease_policy));
 }
 
 std::vector<int> RealClient::batch_get_session_start(
