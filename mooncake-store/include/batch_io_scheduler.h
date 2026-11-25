@@ -13,37 +13,56 @@
 
 namespace mooncake {
 
-// Executes batches synchronously. Callers keep referenced plans and buffers
-// valid until SubmitAndWait returns. Callback failures are returned as
-// ErrorCode.
+// Owns resident workers and a shared queue. Each SubmitAndWait call publishes
+// a set of prepared tasks, blocks until that set has terminated, and returns
+// its first reported error. Callers keep all data referenced by their
+// callbacks valid until SubmitAndWait returns.
 class BatchIoScheduler {
    public:
-    using Execute = std::function<tl::expected<void, ErrorCode>(
-        size_t slice_idx_begin, size_t slice_idx_end)>;
+    // Executes one caller-defined task index. An accepted task is executed at
+    // most once; a cancelled task is not executed. Tasks may run concurrently
+    // and out of order, including tasks from the same PendingBatch. Exceptions
+    // are converted to INTERNAL_ERROR.
+    using Execute =
+        std::function<tl::expected<void, ErrorCode>(size_t task_index)>;
 
+    // Finalizes one nonempty PrepareTasks call after all its tasks terminate.
+    // The argument is its first task error, or success. This callback runs once
+    // for each accepted, published group, including a group cancelled after
+    // publication. It runs outside scheduler locks; its errors and exceptions
+    // join the batch result (exceptions become INTERNAL_ERROR).
     using Complete = std::function<tl::expected<void, ErrorCode>(
         tl::expected<void, ErrorCode>)>;
-    // Called outside scheduler locks before claiming each task. Returning false
-    // defers the task and rechecks after the configured backoff. Already
-    // running callbacks are not interrupted.
+
+    // Gates task claiming without holding scheduler locks. Returning false
+    // defers the task and rechecks after the configured backoff. Exceptions
+    // fail the task with INTERNAL_ERROR. Already running callbacks are not
+    // interrupted.
     using Ready = std::function<bool()>;
 
-    // Create a scheduler with workers > 0 concurrent workers.
+    // Starts the worker threads. An empty ready callback accepts tasks
+    // immediately. Workers are named with worker_name_prefix followed by their
+    // zero-based index, truncated to platform limits.
     // Returns INVALID_PARAMS for zero workers or a non-positive backoff, and
-    // INTERNAL_ERROR on startup failure.
+    // INTERNAL_ERROR if allocation or thread startup fails.
     static tl::expected<std::unique_ptr<BatchIoScheduler>, ErrorCode> Create(
         size_t workers, Ready ready = {},
         std::chrono::milliseconds backoff = std::chrono::milliseconds(300),
         std::string_view worker_name_prefix = "mc-io-");
+
+    // Stops the scheduler and joins its workers. The scheduler must outlive all
+    // SubmitAndWait calls using it.
     ~BatchIoScheduler();
     BatchIoScheduler(const BatchIoScheduler&) = delete;
     BatchIoScheduler& operator=(const BatchIoScheduler&) = delete;
 
-    // Private, unpublished tasks. Destroying this object cancels them without
-    // executing callbacks. Do not access the same batch concurrently.
+    // Owns tasks that have not yet been published. A default-constructed or
+    // consumed batch is empty and may be reused. Do not access one PendingBatch
+    // concurrently.
     class PendingBatch {
        public:
         PendingBatch();
+        // Discards unpublished tasks without running Execute or Complete.
         ~PendingBatch();
         PendingBatch(const PendingBatch&) = delete;
         PendingBatch& operator=(const PendingBatch&) = delete;
@@ -55,56 +74,47 @@ class BatchIoScheduler {
         std::optional<ErrorCode> error_;
     };
 
-    // Split one file's logical Slice plans into groups of sub_batch_size (>=
-    // 4). A final group of at most floor(sub_batch_size / 4) Slices joins the
-    // previous group when one exists; otherwise the single group executes as
-    // one task. Append directly to unpublished task nodes. No callback runs
-    // here. Any error invalidates the entire pending batch.
-    tl::expected<void, ErrorCode> PrepareSubBatches(
-        PendingBatch& batch, size_t slice_count, size_t sub_batch_size,
-        const Execute& execute, const Complete& complete = {});
-    // Prepare one task for each caller-defined item in [0, task_count). Task i
-    // receives [i, i + 1), local to this preparation; no regrouping or tail
-    // merge is applied. No callback runs here. Any error invalidates the entire
-    // pending batch.
+    // Appends task_count unpublished tasks. Task i receives index i; indices
+    // are local to this call, so independent task groups can share one
+    // PendingBatch. No callback runs during preparation. task_count == 0
+    // appends nothing and never runs complete; execute must still be nonempty.
+    //
+    // A nonempty complete creates an independent failure group for this call.
+    // Without complete, the tasks share the batch-wide cancellation domain.
+    // Returns INVALID_PARAMS for an empty execute, NO_AVAILABLE_HANDLE on
+    // allocation failure, or INTERNAL_ERROR for another preparation exception.
+    // Any error invalidates all tasks accumulated in this PendingBatch; later
+    // preparations return the same error until SubmitAndWait consumes it.
     tl::expected<void, ErrorCode> PrepareTasks(PendingBatch& batch,
                                                size_t task_count,
                                                const Execute& execute,
                                                const Complete& complete = {});
-    // With complete, each nonempty preparation is an independent failure group.
-    // Its callback runs once, after all group tasks terminate (including
-    // skipped tasks), outside scheduler locks. A group failure does not cancel
-    // other groups. Unpublished/rejected batches never run completion
-    // callbacks.
 
-    // Publish all prepared tasks without allocating, then wait until every
-    // published task has terminated and all started execute and completion
-    // callbacks have finished. Consumes the batch, including on error.
-    // Callbacks may execute concurrently and out of order; referenced plans and
-    // buffers must remain valid until this returns. Without groups, first
-    // callback errors cancel the batch's queued tasks; callback exceptions
-    // return INTERNAL_ERROR.
+    // Consumes the PendingBatch and publishes all its prepared tasks without
+    // further allocation. Preparation errors are returned without publication
+    // or completion callbacks. An empty batch succeeds; a nonempty batch
+    // submitted after Shutdown returns UNAVAILABLE_IN_CURRENT_STATUS without
+    // running callbacks. The consumed batch is empty and reusable in every
+    // case.
+    //
+    // For an accepted publication, waits until every task has terminated and
+    // all started Execute and Complete callbacks have finished. Ungrouped task
+    // errors cancel queued ungrouped tasks in this batch. A group error cancels
+    // only that group's queued tasks; other groups continue. Returns the first
+    // reported task error, or success when every task and finalizer succeeds.
     tl::expected<void, ErrorCode> SubmitAndWait(PendingBatch& batch);
 
-    // Stop accepting work, cancel queued work, and join running callbacks.
-    // Safe to call repeatedly; callers must still ensure
-    // the scheduler object outlives every SubmitAndWait invocation.
+    // Stops accepting nonempty publications, cancels queued tasks without
+    // running Execute, lets running callbacks finish, runs Complete for groups
+    // already published, and joins the workers. Safe to call repeatedly and
+    // concurrently with SubmitAndWait. Does not interrupt an in-progress
+    // backoff sleep or a running callback.
     void Shutdown();
 
    private:
-    // Slice-index range [slice_idx_begin, slice_idx_end) within one file's
-    // plan list for one sub batch.
-    // Each index selects one whole Slice. This is not a buffer address range;
-    // the selected Slices may point to separate, noncontiguous buffers.
-    struct SubBatch {
-        size_t slice_idx_begin;
-        size_t slice_idx_end;
-        Execute execute{};
-    };
-
-    // Append an already prepared range without publishing it.
-    tl::expected<void, ErrorCode> AddSubBatch(PendingBatch& batch,
-                                              SubBatch&& sub_batch);
+    tl::expected<void, ErrorCode> AddTask(PendingBatch& batch,
+                                          size_t task_index,
+                                          const Execute& execute);
 
     class Impl;
     explicit BatchIoScheduler(std::unique_ptr<Impl> impl) noexcept;

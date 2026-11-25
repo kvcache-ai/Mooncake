@@ -37,7 +37,8 @@ class BatchIoScheduler::Impl {
     };
     struct Task {
         std::shared_ptr<Batch> batch;
-        SubBatch sub_batch;
+        size_t index = 0;
+        Execute execute;
         std::shared_ptr<Group> group;
     };
     tl::expected<void, ErrorCode> Init(size_t workers, Ready ready,
@@ -154,9 +155,7 @@ class BatchIoScheduler::Impl {
             } else {
                 lock.unlock();
                 try {
-                    result =
-                        task.sub_batch.execute(task.sub_batch.slice_idx_begin,
-                                               task.sub_batch.slice_idx_end);
+                    result = task.execute(task.index);
                 } catch (...) {
                     result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
                 }
@@ -233,51 +232,18 @@ struct BatchIoScheduler::PendingBatch::State {
 BatchIoScheduler::PendingBatch::PendingBatch() = default;
 BatchIoScheduler::PendingBatch::~PendingBatch() = default;
 
-tl::expected<void, ErrorCode> BatchIoScheduler::AddSubBatch(
-    PendingBatch& batch, SubBatch&& sub_batch) {
+tl::expected<void, ErrorCode> BatchIoScheduler::AddTask(
+    PendingBatch& batch, size_t task_index, const Execute& execute) {
     if (batch.error_) return tl::make_unexpected(*batch.error_);
-    if (sub_batch.slice_idx_end < sub_batch.slice_idx_begin ||
-        !sub_batch.execute) {
-        batch.error_ = ErrorCode::INVALID_PARAMS;
-    } else {
-        try {
-            if (!batch.state_)
-                batch.state_ = std::make_unique<PendingBatch::State>();
-            batch.state_->tasks.push_back(
-                Impl::Task{batch.state_->batch, std::move(sub_batch), {}});
-            return {};
-        } catch (const std::bad_alloc&) {
-            batch.error_ = ErrorCode::NO_AVAILABLE_HANDLE;
-        } catch (...) {
-            batch.error_ = ErrorCode::INTERNAL_ERROR;
-        }
-    }
-    return tl::make_unexpected(*batch.error_);
-}
-
-tl::expected<void, ErrorCode> BatchIoScheduler::PrepareSubBatches(
-    PendingBatch& batch, size_t slice_count, size_t sub_batch_size,
-    const Execute& execute, const Complete& complete) {
-    if (batch.error_) return tl::make_unexpected(*batch.error_);
-    if (sub_batch_size < 4 || !execute) {
+    if (!execute) {
         batch.error_ = ErrorCode::INVALID_PARAMS;
         return tl::make_unexpected(*batch.error_);
     }
     try {
-        auto group = complete ? std::make_shared<Impl::Group>() : nullptr;
-        if (group) group->complete = complete;
-        for (size_t begin = 0; begin < slice_count;) {
-            size_t end = begin + std::min(sub_batch_size, slice_count - begin);
-            // Merge the small tail before allocating the final task node.
-            if (slice_count - end <= sub_batch_size / 4) end = slice_count;
-            auto result = AddSubBatch(batch, SubBatch{begin, end, execute});
-            if (!result) return result;
-            if (group) {
-                batch.state_->tasks.back().group = group;
-                ++group->remaining;
-            }
-            begin = end;
-        }
+        if (!batch.state_)
+            batch.state_ = std::make_unique<PendingBatch::State>();
+        batch.state_->tasks.push_back(
+            Impl::Task{batch.state_->batch, task_index, execute, {}});
         return {};
     } catch (const std::bad_alloc&) {
         batch.error_ = ErrorCode::NO_AVAILABLE_HANDLE;
@@ -299,8 +265,7 @@ tl::expected<void, ErrorCode> BatchIoScheduler::PrepareTasks(
         auto group = complete ? std::make_shared<Impl::Group>() : nullptr;
         if (group) group->complete = complete;
         for (size_t index = 0; index < task_count; ++index) {
-            auto result =
-                AddSubBatch(batch, SubBatch{index, index + 1, execute});
+            auto result = AddTask(batch, index, execute);
             if (!result) return result;
             if (group) {
                 batch.state_->tasks.back().group = group;
