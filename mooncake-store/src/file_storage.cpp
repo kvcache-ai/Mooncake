@@ -192,8 +192,6 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         if (stream.use_uring && !stream.fixed_buffers)
             streaming_uring_reads_ = ssd_offload::UringReadExecutor::Create(
                 stream.read_workers, stream.max_outstanding);
-        streaming_reads_ = std::make_unique<ssd_offload::BoundedExecutor>(
-            stream.read_workers, stream.max_outstanding);
         streaming_writes_ = std::make_unique<ssd_offload::BoundedExecutor>(
             stream.write_workers, stream.max_outstanding);
     }
@@ -713,7 +711,23 @@ FileStorage::BatchGetLocalRanges(const std::vector<std::string>& keys,
 
 bool FileStorage::SupportsLocalStreamingRead() const {
     std::shared_lock lock(streaming_mutex_);
-    return !streaming_stopped_ && streaming_reads_ != nullptr;
+    return !streaming_stopped_ && streaming_writes_ != nullptr;
+}
+
+ssd_offload::BoundedExecutor* FileStorage::GetOrCreateStreamingReadsLocked() {
+    std::lock_guard init_lock(streaming_reads_init_mutex_);
+    if (!streaming_reads_) {
+        const auto& stream = config_.streaming_read;
+        try {
+            streaming_reads_ = std::make_unique<ssd_offload::BoundedExecutor>(
+                stream.read_workers, stream.max_outstanding);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to initialize local streaming read pool: "
+                       << e.what();
+            return nullptr;
+        }
+    }
+    return streaming_reads_.get();
 }
 
 void FileStorage::ReapExpiredClientBuffers() {
@@ -734,7 +748,7 @@ tl::expected<void, ErrorCode> FileStorage::ReadLocalStreaming(
     const std::vector<LocalReadRequest>& requests) {
     using namespace ssd_offload;
     std::shared_lock lock(streaming_mutex_);
-    if (streaming_stopped_ || !streaming_reads_)
+    if (streaming_stopped_ || !streaming_writes_)
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     if (disk_fenced_.load())
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
@@ -891,10 +905,13 @@ tl::expected<void, ErrorCode> FileStorage::ReadLocalStreaming(
                                          streaming_uring_reads_});
         driver = std::move(native.driver);
     }
-    if (!driver)
+    if (!driver) {
+        auto* reads = GetOrCreateStreamingReadsLocked();
+        if (!reads) return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         driver = std::make_unique<ThreadedPipelineDriver>(
-            sources, chunk_sources, target, *streaming_reads_,
-            *streaming_writes_, buffers.size());
+            sources, chunk_sources, target, *reads, *streaming_writes_,
+            buffers.size());
+    }
     pipeline = std::make_unique<ReadPipeline>(1, 1, std::move(batch_plan),
                                               buffers, *driver);
     const auto start_err = pipeline->Start();

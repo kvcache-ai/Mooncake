@@ -139,9 +139,10 @@ file while a bounded set of staging slots reads and copies chunks into the
 caller's destinations. Whole objects and ranges can exceed the staging arena.
 The default is disabled.
 
-`MOONCAKE_OFFLOAD_READ_IO_THREADS` configures the dedicated restore RPC read
-executor pool size (default 64, valid range 1–128), keeping blocking legacy SSD
-reads off the `coro_rpc` I/O event loop.
+`MOONCAKE_OFFLOAD_READ_IO_THREADS` configures the per-client restore RPC read
+thread pool size (default 64, valid range 1–128), initialized lazily on first
+offload read call and joined on teardown to keep blocking legacy SSD reads off
+the `coro_rpc` I/O event loop.
 
 `MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES` defaults to 1 MiB and
 `MOONCAKE_OFFLOAD_STREAM_SLOTS` defaults to four. Read and copy executors
@@ -166,12 +167,14 @@ completed offset, and transient completion errors have a finite retry budget.
 Submission backpressure keeps accepted work within the configured limit.
 
 `MOONCAKE_OFFLOAD_STREAM_FIXED_BUFFERS=true` (when combined with
-`MOONCAKE_OFFLOAD_STREAM_USE_URING=true`) uses a per-object ring with
+`MOONCAKE_OFFLOAD_STREAM_USE_URING=true`) uses a per-batch ring with
 the staging slots registered as fixed buffers. Registration failure uses
 ordinary READ on that ring. If `io_uring` is unavailable at build or runtime,
-or if the persistent `io_uring` read executor enters a failed state, local
-streaming falls back to the portable `pread` driver. Both drivers drain
-accepted work before source and staging release.
+or if a previous batch left the persistent `io_uring` read executor in a failed
+state, subsequent local streaming batches fall back to the portable `pread`
+driver (an in-flight batch whose ring fails drains and returns
+`FILE_READ_FAIL`). Both drivers drain accepted work before source and staging
+release.
 
 ## Storage Backends
 

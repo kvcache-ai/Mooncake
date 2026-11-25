@@ -1376,9 +1376,15 @@ class RealClient : public PyClient {
     tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
         bool enable_ssd_offload);
 
+    class OffloadReadThreadPool;
+    OffloadReadThreadPool *GetOrCreateOffloadReadPool();
+    void StopOffloadReadPool();
+
     std::mutex teardown_mutex_;
     ErrorCode storage_shutdown_error_ = ErrorCode::OK;
     RpcDrainGuard offload_rpc_drain_;
+    std::mutex offload_read_pool_mutex_;
+    std::unique_ptr<OffloadReadThreadPool> offload_read_pool_;
     friend class RealClientShutdownTestPeer;
     std::unique_ptr<class EmbeddedMaster> embedded_master_;
 

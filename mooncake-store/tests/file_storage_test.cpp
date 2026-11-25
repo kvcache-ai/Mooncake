@@ -1244,6 +1244,17 @@ class FileStorageTest : public ::testing::Test {
         storage.disk_fenced_.store(fenced);
     }
 
+    static bool HasStreamingReadPool(const FileStorage& storage) {
+        std::shared_lock lock(storage.streaming_mutex_);
+        std::lock_guard init_lock(storage.streaming_reads_init_mutex_);
+        return storage.streaming_reads_ != nullptr;
+    }
+
+    static bool HasStreamingUringReadPool(const FileStorage& storage) {
+        std::shared_lock lock(storage.streaming_mutex_);
+        return storage.streaming_uring_reads_ != nullptr;
+    }
+
     void AssertHeartbeatEvictsAllKeys(
         FileStorage& fileStorage, const std::vector<std::string>& expected_keys,
         const std::unordered_map<std::string, std::vector<Slice>>&
@@ -3769,6 +3780,89 @@ TEST_F(FileStorageTest, LocalStreamingOverlapBeatsPlanLimitAndSmallBatchSlots) {
         EXPECT_EQ(std::string(out_a.data(), out_a.size()), value);
         EXPECT_EQ(std::string(out_b.data(), out_b.size()), value);
         EXPECT_TRUE(multi.ReleaseBuffer(lease->batch_id));
+    }
+}
+
+TEST_F(FileStorageTest, LocalStreamingDefersFallbackReadPoolUntilNeeded) {
+    const std::string posix_dir = data_path + "/lazy-posix";
+    const std::string uring_dir = data_path + "/lazy-uring";
+    const std::string fixed_dir = data_path + "/lazy-uring-fixed";
+    ASSERT_TRUE(fs::create_directories(posix_dir));
+    ASSERT_TRUE(fs::create_directories(uring_dir));
+    ASSERT_TRUE(fs::create_directories(fixed_dir));
+    std::string value(4096, 'l');
+
+    {
+        FileStorageConfig config;
+        config.storage_filepath = posix_dir;
+        config.local_buffer_size = 8 * 1024 * 1024;
+        config.streaming_read.enabled = true;
+        config.streaming_read.use_uring = false;
+        FileStorage storage(config, nullptr, "local");
+        EXPECT_TRUE(storage.SupportsLocalStreamingRead());
+        EXPECT_FALSE(HasStreamingReadPool(storage));
+        PrepareStreamingObject(storage, "lazy-posix-key", value);
+        std::vector<char> out(value.size(), 'z');
+        ASSERT_TRUE(storage.ReadLocalStreaming(
+            {{"lazy-posix-key", value.size(), 0, {{out.data(), out.size()}}}}));
+        EXPECT_EQ(std::string(out.data(), out.size()), value);
+        EXPECT_TRUE(HasStreamingReadPool(storage));
+        ASSERT_TRUE(storage.Shutdown());
+        EXPECT_FALSE(HasStreamingReadPool(storage));
+        EXPECT_FALSE(storage.SupportsLocalStreamingRead());
+    }
+
+    bool uring_available = false;
+    {
+        FileStorageConfig config;
+        config.storage_filepath = uring_dir;
+        config.local_buffer_size = 8 * 1024 * 1024;
+        config.streaming_read.enabled = true;
+        config.streaming_read.use_uring = true;
+        config.streaming_read.fixed_buffers = false;
+        FileStorage storage(config, nullptr, "local");
+        EXPECT_TRUE(storage.SupportsLocalStreamingRead());
+        EXPECT_FALSE(HasStreamingReadPool(storage));
+        uring_available = HasStreamingUringReadPool(storage);
+        PrepareStreamingObject(storage, "lazy-uring-key", value);
+        std::vector<char> out(value.size(), 'z');
+        ASSERT_TRUE(storage.ReadLocalStreaming(
+            {{"lazy-uring-key", value.size(), 0, {{out.data(), out.size()}}}}));
+        EXPECT_EQ(std::string(out.data(), out.size()), value);
+        if (uring_available) {
+            EXPECT_FALSE(HasStreamingReadPool(storage));
+        } else {
+            EXPECT_TRUE(HasStreamingReadPool(storage));
+        }
+        ASSERT_TRUE(storage.Shutdown());
+        EXPECT_FALSE(HasStreamingUringReadPool(storage));
+        EXPECT_FALSE(HasStreamingReadPool(storage));
+    }
+
+    {
+        FileStorageConfig config;
+        config.storage_filepath = fixed_dir;
+        config.local_buffer_size = 8 * 1024 * 1024;
+        config.streaming_read.enabled = true;
+        config.streaming_read.use_uring = true;
+        config.streaming_read.fixed_buffers = true;
+        FileStorage storage(config, nullptr, "local");
+        EXPECT_TRUE(storage.SupportsLocalStreamingRead());
+        EXPECT_FALSE(HasStreamingReadPool(storage));
+        EXPECT_FALSE(HasStreamingUringReadPool(storage));
+        PrepareStreamingObject(storage, "lazy-fixed-key", value);
+        std::vector<char> out(value.size(), 'z');
+        ASSERT_TRUE(storage.ReadLocalStreaming(
+            {{"lazy-fixed-key", value.size(), 0, {{out.data(), out.size()}}}}));
+        EXPECT_EQ(std::string(out.data(), out.size()), value);
+        if (uring_available) {
+            EXPECT_FALSE(HasStreamingReadPool(storage));
+        }
+#ifndef USE_URING
+        EXPECT_TRUE(HasStreamingReadPool(storage));
+#endif
+        ASSERT_TRUE(storage.Shutdown());
+        EXPECT_FALSE(HasStreamingReadPool(storage));
     }
 }
 

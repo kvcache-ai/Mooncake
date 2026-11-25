@@ -412,7 +412,12 @@ class FileStorage {
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
+    // Lazily initializes streaming_reads_ while caller holds streaming_mutex_
+    // (shared); serialized internally by streaming_reads_init_mutex_.
+    ssd_offload::BoundedExecutor* GetOrCreateStreamingReadsLocked();
+
     mutable std::shared_mutex streaming_mutex_;
+    mutable std::mutex streaming_reads_init_mutex_;
     bool streaming_stopped_{false};
     std::shared_ptr<ssd_offload::UringReadExecutor> streaming_uring_reads_;
     std::unique_ptr<ssd_offload::BoundedExecutor> streaming_reads_;

@@ -52,6 +52,10 @@ class RealClientShutdownTestPeer {
         return std::make_unique<RpcDrainGuard::ScopedCall>(
             c.offload_rpc_drain_);
     }
+    static bool HasOffloadReadPool(RealClient& c) {
+        std::lock_guard lock(c.offload_read_pool_mutex_);
+        return c.offload_read_pool_ != nullptr;
+    }
 };
 namespace {
 using namespace std::chrono_literals;
@@ -167,6 +171,7 @@ class BlockedReadBackend : public BucketStorageBackend {
 };
 
 TEST_F(RealClientShutdownTest, CloseDrainsOffloadCallsBeforeStoppingExecutor) {
+    EXPECT_FALSE(RealClientShutdownTestPeer::HasOffloadReadPool(*client));
     std::promise<void> release;
     auto backend = std::make_shared<BlockedReadBackend>(
         client->file_storage_->config_, release.get_future().share());
@@ -183,6 +188,7 @@ TEST_F(RealClientShutdownTest, CloseDrainsOffloadCallsBeforeStoppingExecutor) {
         read.wait();
         FAIL() << "Read did not reach the backend gate";
     }
+    EXPECT_TRUE(RealClientShutdownTestPeer::HasOffloadReadPool(*client));
     const auto port = client->offload_rpc_server_->port();
     auto closed =
         std::async(std::launch::async, [&] { return client->tearDownAll(); });
@@ -196,9 +202,78 @@ TEST_F(RealClientShutdownTest, CloseDrainsOffloadCallsBeforeStoppingExecutor) {
     release.set_value();
     EXPECT_FALSE(read.get().has_value());
     EXPECT_EQ(closed.get(), 0);
+    EXPECT_FALSE(RealClientShutdownTestPeer::HasOffloadReadPool(*client));
     EXPECT_EQ(status, std::future_status::timeout);
     EXPECT_FALSE(connected);
     EXPECT_TRUE(response.has_value());
+}
+
+TEST_F(RealClientShutdownTest,
+       OffloadReadRpcRunsOffCoroRpcIoThreadAndJoinsOnTeardown) {
+    // Re-create the single-threaded offload RPC server with
+    // batch_get_offload_object registered so we exercise the real coro_rpc
+    // executor + coro_io::post + Yield resumption path end-to-end.
+    client->offload_rpc_server_->stop();
+    client->offload_rpc_server_ =
+        std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "127.0.0.1");
+    client->offload_rpc_server_
+        ->register_handler<&RealClient::batch_get_offload_object>(client.get());
+    client->offload_rpc_server_
+        ->register_handler<&RealClient::release_offload_buffer>(client.get());
+    client->offload_rpc_server_->async_start();
+    ASSERT_FALSE(client->offload_rpc_server_->get_errc());
+
+    EXPECT_FALSE(RealClientShutdownTestPeer::HasOffloadReadPool(*client));
+    std::promise<void> release;
+    auto backend = std::make_shared<BlockedReadBackend>(
+        client->file_storage_->config_, release.get_future().share());
+    FileStorageShutdownTestPeer::SetBackend(*client->file_storage_, backend);
+    const auto port = client->offload_rpc_server_->port();
+
+    auto rpc_read = std::async(std::launch::async, [&] {
+        coro_rpc::coro_rpc_client rpc_client;
+        auto conn = async_simple::coro::syncAwait(
+            rpc_client.connect("127.0.0.1", std::to_string(port)));
+        if (conn) {
+            return tl::expected<BatchGetOffloadObjectResponse, ErrorCode>(
+                tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+        auto res = async_simple::coro::syncAwait(
+            rpc_client.call<&RealClient::batch_get_offload_object>(
+                std::vector<std::string>{"blocked"}, std::vector<int64_t>{64}));
+        if (!res.has_value()) {
+            return tl::expected<BatchGetOffloadObjectResponse, ErrorCode>(
+                tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+        return res.value();
+    });
+
+    auto entered = backend->entered.get_future().wait_for(5s);
+    if (entered != std::future_status::ready) {
+        release.set_value();
+        rpc_read.wait();
+        FAIL() << "RPC read did not reach the backend gate";
+    }
+    EXPECT_TRUE(RealClientShutdownTestPeer::HasOffloadReadPool(*client));
+
+    // A second RPC on the same 1-thread server must succeed while BatchLoad
+    // is blocked on the offload read thread pool.
+    coro_rpc::coro_rpc_client probe;
+    auto connected = async_simple::coro::syncAwait(
+        probe.connect("127.0.0.1", std::to_string(port)));
+    auto probe_response = async_simple::coro::syncAwait(
+        probe.call<&RealClient::release_offload_buffer>(uint64_t{0}));
+    release.set_value();
+
+    auto rpc_result = rpc_read.get();
+    EXPECT_FALSE(connected);
+    EXPECT_TRUE(probe_response.has_value());
+    EXPECT_FALSE(rpc_result.has_value());
+    if (!rpc_result.has_value()) {
+        EXPECT_EQ(rpc_result.error(), ErrorCode::FILE_READ_FAIL);
+    }
+    EXPECT_EQ(client->tearDownAll(), 0);
+    EXPECT_FALSE(RealClientShutdownTestPeer::HasOffloadReadPool(*client));
 }
 
 TEST_F(RealClientShutdownTest, ReinitializationAcceptsOffloadCalls) {

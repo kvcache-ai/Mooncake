@@ -8,6 +8,7 @@
 #include <thread>
 #include <stop_token>
 
+#include <asio/thread_pool.hpp>
 #include <gflags/gflags.h>
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
@@ -91,11 +92,49 @@ DEFINE_int32(http_port, 9300,
              "(only effective when --enable_http_server=true).");
 
 namespace mooncake {
-namespace {
-constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
 
-coro_io::ExecutorWrapper<> *GetOffloadReadExecutor() {
-    static const auto pool = [] {
+class RealClient::OffloadReadThreadPool {
+   public:
+    explicit OffloadReadThreadPool(size_t thread_count) : pool_(0) {
+        const size_t count = std::max<size_t>(thread_count, 1);
+        workers_.reserve(count);
+        try {
+            for (size_t i = 0; i < count; ++i) {
+                workers_.emplace_back([this] { pool_.attach(); });
+            }
+        } catch (...) {
+            Stop();
+            throw;
+        }
+    }
+
+    ~OffloadReadThreadPool() { Stop(); }
+
+    OffloadReadThreadPool(const OffloadReadThreadPool &) = delete;
+    OffloadReadThreadPool &operator=(const OffloadReadThreadPool &) = delete;
+
+    asio::thread_pool::executor_type executor() noexcept {
+        return pool_.get_executor();
+    }
+
+    void Stop() noexcept {
+        pool_.stop();
+        for (auto &worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        workers_.clear();
+    }
+
+   private:
+    asio::thread_pool pool_;
+    std::vector<std::thread> workers_;
+};
+
+RealClient::OffloadReadThreadPool *RealClient::GetOrCreateOffloadReadPool() {
+    std::lock_guard lock(offload_read_pool_mutex_);
+    if (!offload_read_pool_) {
         const char *value = std::getenv("MOONCAKE_OFFLOAD_READ_IO_THREADS");
         const auto configured = detail::ParseOffloadReadIoThreads(value);
         const auto threads =
@@ -104,10 +143,31 @@ coro_io::ExecutorWrapper<> *GetOffloadReadExecutor() {
             LOG(WARNING) << "Invalid MOONCAKE_OFFLOAD_READ_IO_THREADS; using "
                          << threads << " threads";
         }
-        return CreateRpcClientIoContextPool(threads);
-    }();
-    return pool->get_executor();
+        try {
+            offload_read_pool_ =
+                std::make_unique<OffloadReadThreadPool>(threads);
+        } catch (const std::exception &e) {
+            LOG(ERROR) << "Failed to initialize offload read thread pool: "
+                       << e.what();
+            return nullptr;
+        }
+    }
+    return offload_read_pool_.get();
 }
+
+void RealClient::StopOffloadReadPool() {
+    std::unique_ptr<OffloadReadThreadPool> pool;
+    {
+        std::lock_guard lock(offload_read_pool_mutex_);
+        pool = std::move(offload_read_pool_);
+    }
+    if (pool) {
+        pool->Stop();
+    }
+}
+
+namespace {
+constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
 
 bool CanUseLocalStreamingRestore(
     const FileStorage *storage, const std::string &local_rpc_addr,
@@ -1986,6 +2046,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         offload_rpc_server_->stop();
         offload_rpc_server_.reset();
     }
+    StopOffloadReadPool();
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     if (file_storage_) {
         auto result = file_storage_->Shutdown();
@@ -9635,6 +9696,11 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
         co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
+    auto *read_pool = GetOrCreateOffloadReadPool();
+    if (!read_pool) {
+        co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     // Run SSD I/O on a dedicated thread pool so the coro_rpc IO thread is
     // free to handle ping and other RPCs. Same heap-owned state pattern as
     // batch_get_into_dummy_helper: the lambda captures only a raw pointer.
@@ -9650,7 +9716,7 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
     auto *s = state.get();
     auto try_result = co_await coro_io::post(
         [s]() { return s->file_storage->BatchGet(s->keys, s->sizes); },
-        GetOffloadReadExecutor());
+        read_pool->executor());
     if (co_await async_simple::CurrentExecutor{}) {
         co_await async_simple::coro::Yield{};
     }
@@ -9676,6 +9742,11 @@ RealClient::batch_get_offload_object_ranges(
         co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
+    auto *read_pool = GetOrCreateOffloadReadPool();
+    if (!read_pool) {
+        co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     struct CallState {
         std::vector<std::string> keys;
         std::vector<int64_t> offsets;
@@ -9695,7 +9766,7 @@ RealClient::batch_get_offload_object_ranges(
             return s->file_storage->BatchGetRanges(s->keys, s->offsets,
                                                    s->sizes, s->object_sizes);
         },
-        GetOffloadReadExecutor());
+        read_pool->executor());
     if (co_await async_simple::CurrentExecutor{}) {
         co_await async_simple::coro::Yield{};
     }
