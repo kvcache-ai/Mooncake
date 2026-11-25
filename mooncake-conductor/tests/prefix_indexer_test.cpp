@@ -392,7 +392,7 @@ TEST(Query, BatchedCandidatesMatchIndependentTierOracleAcrossSourceChanges) {
                 EXPECT_EQ(table.Query(context, tokens),
                           ReferenceQuery(table, context, tokens));
                 for (const auto& filter :
-                     {"instance-0", "instance-7", "absent"}) {
+                     {"instance-0", "instance-4", "instance-7", "absent"}) {
                     EXPECT_EQ(
                         table.Query(context, tokens, std::nullopt, filter),
                         ReferenceQuery(table, context, tokens, filter));
@@ -422,6 +422,65 @@ TEST(Query, BatchedGlobalMissRetainsEveryRegisteredRank) {
     for (const auto& tokens : {Tokens(97), std::vector<int32_t>{}}) {
         EXPECT_EQ(table.Query(TestContext(), tokens),
                   ReferenceQuery(table, TestContext(), tokens));
+    }
+}
+
+TEST(Query, SmallSelectionAndSingleInstanceMultiRankMatchOracle) {
+    std::mt19937 random(20261125);
+    PrefixCacheTable table;
+    const auto context = TestContext();
+    const auto profile = SglangProfile();
+    const auto tokens = Tokens(97);
+    std::string error;
+    auto strategy =
+        mooncake::conductor::prefixindex::CreateHashStrategy(profile, &error);
+    ASSERT_TRUE(strategy) << error;
+    std::vector<HashBlock> blocks;
+    ASSERT_EQ(strategy->Compute(context, tokens, std::nullopt, &blocks), "");
+
+    // Register 4 instances x 1 rank first to exercise the small multi-instance
+    // direct path, then expand to 10 instances x 4 ranks to exercise filtered
+    // multi-rank queries across beginning/middle/end of the owner set.
+    for (int instance = 0; instance < 4; ++instance) {
+        const std::string id = "replica-" + std::to_string(instance);
+        auto registration = Registration(id, 0);
+        registration.profile = profile;
+        RegisterOrFail(table, registration);
+    }
+    for (const auto& block : blocks) {
+        ASSERT_EQ(table.StoreEngine(Device({block.projected},
+                                           DeviceOwner("replica-0", 0, "s0"))),
+                  "");
+        ASSERT_EQ(table.StoreShared(
+                      Shared({block.projected}, StorageTier::kCpuShare)),
+                  "");
+    }
+    EXPECT_EQ(table.Query(context, tokens),
+              ReferenceQuery(table, context, tokens));
+
+    for (int instance = 0; instance < 10; ++instance) {
+        const std::string id = "replica-" + std::to_string(instance);
+        for (int rank = 0; rank < 4; ++rank) {
+            if (instance < 4 && rank == 0) continue;
+            auto registration = Registration(id, rank);
+            registration.profile = profile;
+            RegisterOrFail(table, registration);
+        }
+        for (int rank = 0; rank < 4; ++rank) {
+            for (const auto& block : blocks) {
+                if (random() % 4 == 0) continue;
+                ASSERT_EQ(
+                    table.StoreEngine(Device({block.projected},
+                                             DeviceOwner(id, rank, "s-" + id))),
+                    "");
+            }
+        }
+    }
+    EXPECT_EQ(table.Query(context, tokens),
+              ReferenceQuery(table, context, tokens));
+    for (const auto& filter : {"replica-0", "replica-5", "replica-9"}) {
+        EXPECT_EQ(table.Query(context, tokens, std::nullopt, filter),
+                  ReferenceQuery(table, context, tokens, filter));
     }
 }
 

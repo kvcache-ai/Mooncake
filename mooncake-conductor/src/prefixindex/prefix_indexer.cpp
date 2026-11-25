@@ -692,16 +692,32 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
         };
         std::vector<Candidate> candidates;
         candidates.reserve(candidate_count);
+        for (const auto& [instance_id, ranks] : selected_instances) {
+            for (int64_t rank : ranks) {
+                candidates.push_back({&instance_id, rank});
+            }
+        }
+
+        // Skip the hash-map projection index when a single instance or a small
+        // candidate set is selected: direct checks avoid map allocation and
+        // hashing overhead while still scanning each block's owners at most
+        // once and stopping as soon as every active candidate hits device.
+        constexpr size_t kDirectCandidateThreshold = 4;
+        const bool single_instance = selected_instances.size() == 1;
+        const bool use_hash_index =
+            !single_instance && candidate_count > kDirectCandidateThreshold;
         std::unordered_map<std::string_view,
                            std::unordered_map<int64_t, size_t>>
             candidate_index;
-        candidate_index.reserve(selected_instances.size());
-        for (const auto& [instance_id, ranks] : selected_instances) {
-            auto& rank_index = candidate_index[instance_id];
-            rank_index.reserve(ranks.size());
-            for (int64_t rank : ranks) {
-                rank_index.emplace(rank, candidates.size());
-                candidates.push_back({&instance_id, rank});
+        if (use_hash_index) {
+            candidate_index.reserve(selected_instances.size());
+            size_t idx = 0;
+            for (const auto& [instance_id, ranks] : selected_instances) {
+                auto& rank_index = candidate_index[instance_id];
+                rank_index.reserve(ranks.size());
+                for (int64_t rank : ranks) {
+                    rank_index.emplace(rank, idx++);
+                }
             }
         }
 
@@ -718,57 +734,80 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
             if (block == state->blocks.end()) break;
             for (size_t i : active_candidates) presence[i] = 0;
             const auto& owners = block->second;
-            if (active_candidates.size() == 1) {
-                const size_t i = active_candidates.front();
-                const auto& candidate = candidates[i];
-                auto matches = [&](const EngineOwner& owner) {
-                    return owner.instance_id == *candidate.instance_id &&
-                           owner.dp_rank == candidate.rank;
-                };
-                if (std::any_of(owners.device_owners.begin(),
-                                owners.device_owners.end(), matches)) {
-                    presence[i] = 0xf;
-                } else if (std::any_of(owners.cpu_local_owners.begin(),
-                                       owners.cpu_local_owners.end(),
-                                       matches)) {
-                    presence[i] = 0xe;
-                } else if (!owners.cpu_share_owners.empty()) {
-                    presence[i] = 0xc;
-                } else {
-                    for (const auto& owner : owners.disk_owners) {
-                        const auto* engine = std::get_if<EngineOwner>(&owner);
-                        if (!engine || matches(*engine)) {
-                            presence[i] = 0x8;
-                            break;
-                        }
-                    }
+            size_t remaining_device = active_candidates.size();
+            auto mark_candidate = [&](size_t idx, uint8_t tiers) {
+                if ((candidates[idx].active & tiers) == 0) return;
+                const uint8_t prev = presence[idx];
+                presence[idx] = prev | tiers;
+                if (tiers == 0xf && (prev & 0x1) == 0) {
+                    --remaining_device;
                 }
-            } else {
-                auto mark_engine = [&](const EngineOwner& owner,
-                                       uint8_t tiers) {
-                    auto instance = candidate_index.find(owner.instance_id);
-                    if (instance == candidate_index.end()) return;
-                    auto rank = instance->second.find(owner.dp_rank);
-                    if (rank != instance->second.end()) {
-                        presence[rank->second] |= tiers;
-                    }
-                };
+            };
+            auto scan_owners = [&](auto&& lookup) {
                 for (const auto& owner : owners.device_owners) {
-                    mark_engine(owner, 0xf);
+                    const size_t idx = lookup(owner);
+                    if (idx != candidate_count) {
+                        mark_candidate(idx, 0xf);
+                        if (remaining_device == 0) return;
+                    }
                 }
                 for (const auto& owner : owners.cpu_local_owners) {
-                    mark_engine(owner, 0xe);
+                    const size_t idx = lookup(owner);
+                    if (idx != candidate_count) {
+                        mark_candidate(idx, 0xe);
+                    }
                 }
                 uint8_t shared_tiers =
                     owners.cpu_share_owners.empty() ? 0 : 0xc;
                 for (const auto& owner : owners.disk_owners) {
                     if (const auto* engine = std::get_if<EngineOwner>(&owner)) {
-                        mark_engine(*engine, 0x8);
+                        const size_t idx = lookup(*engine);
+                        if (idx != candidate_count) {
+                            mark_candidate(idx, 0x8);
+                        }
                     } else {
                         shared_tiers |= 0x8;
                     }
                 }
-                for (size_t i : active_candidates) presence[i] |= shared_tiers;
+                if (shared_tiers != 0) {
+                    for (size_t i : active_candidates) {
+                        presence[i] |= shared_tiers;
+                    }
+                }
+            };
+            if (single_instance) {
+                const std::string& target_instance =
+                    selected_instances.begin()->first;
+                scan_owners([&](const EngineOwner& owner) -> size_t {
+                    if (owner.instance_id != target_instance) {
+                        return candidate_count;
+                    }
+                    for (size_t i : active_candidates) {
+                        if (candidates[i].rank == owner.dp_rank) return i;
+                    }
+                    return candidate_count;
+                });
+            } else if (!use_hash_index ||
+                       active_candidates.size() <= kDirectCandidateThreshold) {
+                scan_owners([&](const EngineOwner& owner) -> size_t {
+                    for (size_t i : active_candidates) {
+                        if (candidates[i].rank == owner.dp_rank &&
+                            *candidates[i].instance_id == owner.instance_id) {
+                            return i;
+                        }
+                    }
+                    return candidate_count;
+                });
+            } else {
+                scan_owners([&](const EngineOwner& owner) -> size_t {
+                    auto instance = candidate_index.find(owner.instance_id);
+                    if (instance == candidate_index.end()) {
+                        return candidate_count;
+                    }
+                    auto rank = instance->second.find(owner.dp_rank);
+                    return rank == instance->second.end() ? candidate_count
+                                                          : rank->second;
+                });
             }
             for (size_t offset = 0; offset < active_candidates.size();) {
                 const size_t i = active_candidates[offset];

@@ -19,8 +19,9 @@ using Clock = std::chrono::steady_clock;
 int main(int argc, char** argv) {
     if (argc < 5) {
         std::cerr << "usage: query_benchmark replicas tokens iterations "
-                     "common|disjoint|miss|filtered [token_file|-] [readers] "
-                     "[writer] [block_size]\n";
+                     "common|disjoint|miss|filtered|shared [token_file|-] "
+                     "[readers] [writer] [block_size] [dp_ranks] "
+                     "[filter_replica]\n";
         return 2;
     }
     try {
@@ -31,10 +32,13 @@ int main(int argc, char** argv) {
         const int readers = argc > 6 ? std::stoi(argv[6]) : 1;
         const bool writer_enabled = argc > 7 && std::stoi(argv[7]) != 0;
         const int block_size = argc > 8 ? std::stoi(argv[8]) : 16;
+        const int dp_ranks = argc > 9 ? std::stoi(argv[9]) : 1;
+        const std::string filter_arg = argc > 10 ? argv[10] : "replica-0";
         if (replicas <= 0 || token_count <= 0 || iterations <= 0 ||
-            readers <= 0 || block_size <= 0 ||
+            readers <= 0 || block_size <= 0 || dp_ranks <= 0 ||
             (pattern != "common" && pattern != "disjoint" &&
-             pattern != "miss" && pattern != "filtered")) {
+             pattern != "miss" && pattern != "filtered" &&
+             pattern != "shared")) {
             throw std::invalid_argument("invalid benchmark arguments");
         }
         std::vector<int32_t> tokens(token_count);
@@ -61,24 +65,49 @@ int main(int argc, char** argv) {
         };
         for (int i = 0; i < replicas; ++i) {
             const std::string id = "replica-" + std::to_string(i);
-            require(
-                table.Register({context, profile, id, 0, block_size, 0}).error);
             auto owned_tokens = tokens;
             if (pattern == "disjoint" && i != 0) owned_tokens[0] += i;
             std::vector<pi::HashBlock> blocks;
             require(strategy->Compute(context, owned_tokens, std::nullopt,
                                       &blocks));
-            pi::EngineMutation mutation{.context = context,
-                                        .owner = {"publisher-" + id, id, 0},
-                                        .effective_block_size = block_size,
-                                        .cache_group = 0};
+            std::vector<pi::ProjectedPrefix> prefixes;
+            prefixes.reserve(blocks.size());
             for (const auto& block : blocks)
-                mutation.prefixes.push_back(block.projected);
-            require(table.StoreEngine(mutation));
+                prefixes.push_back(block.projected);
+            for (int rank = 0; rank < dp_ranks; ++rank) {
+                require(
+                    table.Register({context, profile, id, rank, block_size, 0})
+                        .error);
+                if (pattern == "shared" && (i != 0 || rank != 0)) continue;
+                pi::EngineMutation mutation{
+                    .context = context,
+                    .prefixes = prefixes,
+                    .owner = {"publisher-" + id + "-" + std::to_string(rank),
+                              id, rank},
+                    .effective_block_size = block_size,
+                    .cache_group = 0};
+                require(table.StoreEngine(mutation));
+            }
+        }
+        if (pattern == "shared") {
+            std::vector<pi::HashBlock> blocks;
+            require(strategy->Compute(context, tokens, std::nullopt, &blocks));
+            std::vector<pi::ProjectedPrefix> prefixes;
+            prefixes.reserve(blocks.size());
+            for (const auto& block : blocks)
+                prefixes.push_back(block.projected);
+            pi::SharedMutation shared{
+                .context = context,
+                .prefixes = std::move(prefixes),
+                .tier = pi::StorageTier::kCpuShare,
+                .owner = {"mooncake-store", "backend", "shared-obj"},
+                .effective_block_size = block_size,
+                .cache_group = 0};
+            require(table.StoreShared(shared));
         }
         if (pattern == "miss") tokens[0] += 32000;
         const std::optional<std::string> filter =
-            pattern == "filtered" ? std::optional<std::string>("replica-0")
+            pattern == "filtered" ? std::optional<std::string>(filter_arg)
                                   : std::nullopt;
         const auto expected =
             table.Query(context, tokens, std::nullopt, filter);
@@ -86,12 +115,18 @@ int main(int argc, char** argv) {
             throw std::runtime_error("fixture lost a registered candidate");
         }
         for (const auto& [instance, hit] : expected) {
-            const int64_t wanted =
+            if (hit.dp.size() != static_cast<size_t>(dp_ranks)) {
+                throw std::runtime_error("fixture lost a registered DP rank");
+            }
+            const int64_t wanted_device =
                 pattern != "miss" &&
-                        (pattern != "disjoint" || instance == "replica-0")
+                        ((pattern != "disjoint" && pattern != "shared") ||
+                         instance == "replica-0")
                     ? token_count
                     : 0;
-            if (hit.device != wanted) {
+            const int64_t wanted_share =
+                pattern == "shared" ? token_count : wanted_device;
+            if (hit.device != wanted_device || hit.cpu_share != wanted_share) {
                 throw std::runtime_error(
                     "fixture prefix coverage is incorrect");
             }
