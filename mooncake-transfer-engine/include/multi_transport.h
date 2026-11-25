@@ -69,6 +69,8 @@ class MultiTransport {
     // An OK or BatchCleanupDeferred return invalidates batch_id. A deferred
     // cleanup means in-flight transport work may still own transfer buffers.
     Status freeBatchID(BatchID batch_id);
+    // Released batches whose transport work has not been confirmed complete.
+    bool hasPendingBatchCleanup() const;
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries);
@@ -192,7 +194,8 @@ class MultiTransport {
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
 
-    std::mutex deferred_cleanup_mutex_;
+    mutable std::mutex deferred_cleanup_mutex_;
+    bool batch_cleanup_failed_ = false;
     std::condition_variable deferred_cleanup_cv_;
     std::unordered_map<BatchID, std::function<void()>>
         deferred_cleanup_batches_;

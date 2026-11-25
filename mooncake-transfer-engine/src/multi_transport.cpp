@@ -163,6 +163,20 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     return batch_desc->id;
 }
 
+bool MultiTransport::hasPendingBatchCleanup() const {
+    std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
+    if (batch_cleanup_failed_) return true;
+    for (const auto& entry : deferred_cleanup_batches_) {
+        for (const auto& task : Transport::toBatchDesc(entry.first).task_list) {
+            // A terminal CQ callback may still pin the descriptor after
+            // all DMA to caller-owned memory has completed.
+            if (!__atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE))
+                return true;
+        }
+    }
+    return false;
+}
+
 Status MultiTransport::freeBatchID(BatchID batch_id) {
     return freeBatchID(batch_id, std::function<void()>());
 }
@@ -180,6 +194,7 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
 
     Status status = tryFreeBatchID(batch_id, before_delete);
     if (!status.IsBatchBusy()) {
+        if (!status.ok()) batch_cleanup_failed_ = true;
         return status;
     }
 
@@ -457,6 +472,7 @@ void MultiTransport::deferredCleanupLoop() {
             } else if (!status.IsBatchBusy()) {
                 // A permanent error (e.g. a stale task reference) will never
                 // resolve on retry; drop the entry instead of polling forever.
+                batch_cleanup_failed_ = true;
                 LOG(ERROR) << "Dropping deferred cleanup for batch "
                            << it->first << ": " << status.ToString();
                 it = deferred_cleanup_batches_.erase(it);

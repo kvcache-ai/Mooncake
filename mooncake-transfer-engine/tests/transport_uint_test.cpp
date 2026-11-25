@@ -44,6 +44,7 @@
 #include "transfer_engine_c.h"
 #include "transfer_engine_impl.h"
 #include "task_congestion_status.h"
+#include "transport/rdma_transport/rdma_context.h"
 #include "transport/transport.h"
 #ifdef USE_TENT
 #include "tent/common/config.h"
@@ -1261,8 +1262,10 @@ TEST_F(TransportTest, RealSliceTimeoutDefersBatchCleanup) {
               Status::OK());
     EXPECT_EQ(status.s, Transport::TransferStatusEnum::TIMEOUT);
 
+    EXPECT_FALSE(multi_transport.hasPendingBatchCleanup());
     Status free_status = multi_transport.freeBatchID(batch_id);
     EXPECT_TRUE(free_status.IsBatchCleanupDeferred());
+    EXPECT_TRUE(multi_transport.hasPendingBatchCleanup());
     EXPECT_EQ(free_status.ToString(),
               "BatchCleanupDeferred: BatchID is invalid because cleanup has "
               "been deferred");
@@ -1281,6 +1284,7 @@ TEST_F(TransportTest, RealSliceTimeoutDefersBatchCleanup) {
     }
     EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
                                                                batch_id));
+    EXPECT_FALSE(multi_transport.hasPendingBatchCleanup());
 }
 
 TEST_F(TransportTest, TimedOutBatchIsReclaimedAfterCallbacksFinish) {
@@ -1623,6 +1627,40 @@ TEST_F(TransportTest, MemoryRegistrationReuseAdoptsExistingRegistrations) {
     ASSERT_EQ(engine.unregisterLocalMemory(base + 64), 0);
     EXPECT_FALSE(engine.checkOverlap(base, 128));
     ASSERT_EQ(engine.unregisterLocalMemory(base + 128), 0);
+    EXPECT_FALSE(engine.checkOverlap(base, allocation.size()));
+}
+
+TEST_F(TransportTest, MemoryRegistrationReuseKeepsCudaImportsExclusive) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    ASSERT_NE(installRegistrationReuseTcp(engine), nullptr);
+    std::array<char, 192> allocation{};
+    auto* base = allocation.data();
+    auto registerImport = [&](char* addr) {
+        // TCP leaves the descriptor untouched; only the import marker matters.
+        RdmaContext::setExternalDmabufForThread(0);
+        int result = engine.registerLocalMemory(addr, 64);
+        RdmaContext::setExternalDmabufForThread(-1);
+        return result;
+    };
+    ASSERT_EQ(registerImport(base), 0);
+    ASSERT_EQ(engine.enableMemoryRegistrationReuse(), 0);
+    ASSERT_EQ(registerImport(base + 64), 0);
+    auto* shared = base + 128;
+    ASSERT_EQ(engine.registerLocalMemory(shared, 64), 0);
+    ASSERT_EQ(engine.registerLocalMemory(shared + 16, 16), 0);
+    EXPECT_EQ(registerImport(shared), ERR_ADDRESS_OVERLAPPED);
+    for (auto* imported : {base, base + 64}) {
+        EXPECT_EQ(engine.registerLocalMemory(imported, 64),
+                  ERR_ADDRESS_OVERLAPPED);
+        EXPECT_EQ(engine.registerLocalMemoryBatch({{imported + 16, 16}}, "*"),
+                  ERR_ADDRESS_OVERLAPPED);
+        ASSERT_EQ(engine.unregisterLocalMemory(imported), 0);
+        EXPECT_FALSE(engine.checkOverlap(imported, 64));
+        ASSERT_EQ(engine.registerLocalMemory(imported, 64), 0);
+        EXPECT_EQ(engine.unregisterLocalMemory(imported), 0);
+    }
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({shared, shared + 16}), 0);
     EXPECT_FALSE(engine.checkOverlap(base, allocation.size()));
 }
 

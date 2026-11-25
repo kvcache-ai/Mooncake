@@ -22,6 +22,7 @@
 #include <limits>
 #include <set>
 #include <string>
+#include <string_view>
 #include <sys/resource.h>
 #include <unistd.h>
 #ifdef WITH_METRICS
@@ -33,6 +34,7 @@
 #include "transfer_metadata_plugin.h"
 #include "common.h"
 #include "transport/transport.h"
+#include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_twosided/rdma_twosided_transport.h"
 #include "transport/shm_transport/shm_transport.h"
 #if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
@@ -566,6 +568,13 @@ int TransferEngineImpl::freeEngine() {
     return 0;
 }
 
+// TCP and SHM remove only a descriptor. Classic RDMA also tracks pending
+// MR deregistration. Other backends may lose the descriptor before the MR.
+static bool missingRegistrationConfirmsRemoval(std::string_view transport) {
+    return transport == "tcp" || transport == "shm" || transport == "rdma" ||
+           transport == "rdma_twosided";
+}
+
 static bool supportsRegistrationReuse(const std::string& proto) {
     return proto != "nvmeof" && proto != "barex";
 }
@@ -648,6 +657,7 @@ int TransferEngineImpl::freeSharedMemory(void* addr) {
         LOG(WARNING) << "unregisterLocalMemory failed before freeSharedMemory, "
                         "ret="
                      << uret;
+        return uret;
     }
     return shm->freeSharedMemory(addr);
 }
@@ -806,7 +816,9 @@ int TransferEngineImpl::enableMemoryRegistrationReuse() {
     std::lock_guard<std::mutex> transaction(registration_reuse_mutex_);
     std::unique_lock<std::shared_mutex> lock(mutex_);
     if (memory_registration_reuse_) return 0;
-    if (!registering_memory_regions_.empty()) return ERR_INVALID_ARGUMENT;
+    if (!registering_memory_regions_.empty() ||
+        !unregistering_addresses_.empty())
+        return ERR_INVALID_ARGUMENT;
     for (auto transport : multi_transports_->listTransports())
         if (!supportsRegistrationReuse(transport->getName()))
             return ERR_NOT_IMPLEMENTED;
@@ -822,6 +834,7 @@ int TransferEngineImpl::registerReusableMemory(
     const std::vector<BufferEntry>& buffers, const std::string& location) {
     std::lock_guard<std::mutex> transaction(registration_reuse_mutex_);
     retryFailedRollbacks();
+    const bool importing = RdmaContext::hasExternalDmabufForThread();
     std::vector<BufferEntry> new_buffers;
     std::vector<uintptr_t> bases;
     std::set<uintptr_t> addresses;
@@ -841,7 +854,8 @@ int TransferEngineImpl::registerReusableMemory(
                     if (region.releasing) return ERR_CONTEXT;
                     if (region.location != location)
                         return ERR_INVALID_ARGUMENT;
-                    if (!region.remote_accessible)
+                    if (region.exclusive || importing ||
+                        !region.remote_accessible)
                         return ERR_ADDRESS_OVERLAPPED;
                     bases.push_back(base);
                     continue;
@@ -914,8 +928,16 @@ int TransferEngineImpl::releaseReusableRegions(
     for (auto transport : transports) {
         for (auto addr : regions) {
             int ret = transport->unregisterLocalMemory(addr, false);
-            if (ret && ret != ERR_ADDRESS_NOT_REGISTERED && !first_error)
-                first_error = ret;
+            if (ret == ERR_ADDRESS_NOT_REGISTERED) {
+                if (missingRegistrationConfirmsRemoval(transport->getName()))
+                    continue;
+                std::shared_lock lock(mutex_);
+                if (!local_memory_regions_.at(reinterpret_cast<uintptr_t>(addr))
+                         .exclusive)
+                    continue;
+                ret = ERR_CONTEXT;
+            }
+            if (ret && !first_error) first_error = ret;
         }
     }
     if (!transports.empty()) {
@@ -950,7 +972,8 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
     }
 
     std::vector<MemoryRegion> regions = {
-        {addr, length, location, remote_accessible}};
+        {addr, length, location, remote_accessible,
+         RdmaContext::hasExternalDmabufForThread()}};
     if (!tryReserveMemoryRegions(regions)) {
         LOG(ERROR)
             << "Transfer Engine does not support overlapped memory region";
@@ -989,16 +1012,40 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
 int TransferEngineImpl::unregisterLocalMemory(void* addr,
                                               bool update_metadata) {
     if (memory_registration_reuse_) return unregisterReusableMemory({addr});
+    UnregisterClaim claim(*this, {&addr, 1});
+    if (!claim.acquired()) return ERR_CONTEXT;
     // Best-effort: try every transport so one failure can't leave the region
     // registered on the others; mirrors unregisterLocalMemoryBatch (#2869).
     int first_error = 0;
+    bool already_removed = false;
+    bool unconfirmed_removal = false;
     for (auto& transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemory(addr, update_metadata);
-        if (ret && !first_error) first_error = ret;
+        if (ret == ERR_ADDRESS_NOT_REGISTERED) {
+            already_removed = true;
+            if (!missingRegistrationConfirmsRemoval(transport->getName()))
+                unconfirmed_removal = true;
+        } else if (ret && !first_error) {
+            first_error = ret;
+        }
     }
     if (first_error) return first_error;
 
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (already_removed) {
+        {
+            std::shared_lock lock(mutex_);
+            if (!local_memory_regions_.count(reinterpret_cast<uintptr_t>(addr)))
+                return ERR_ADDRESS_NOT_REGISTERED;
+        }
+        if (unconfirmed_removal) return ERR_CONTEXT;
+        // A transport may have removed its local descriptor before an earlier
+        // publish failed. Keep the range reserved until peers can see removal.
+        if (update_metadata) {
+            int ret = metadata_->updateLocalSegmentDesc();
+            if (ret) return ret;
+        }
+    }
+    std::unique_lock lock(mutex_);
     clearSkipRegistrationLocked(addr);
     eraseMemoryRegionLocked(addr);
     return 0;
@@ -1103,6 +1150,12 @@ int TransferEngineImpl::mp_unregisterLocalMemory(
     std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
         buffer_map) {
     if (memory_registration_reuse_) return ERR_NOT_IMPLEMENTED;
+    std::vector<void*> addresses;
+    for (const auto& [_, buffers] : buffer_map)
+        for (const auto& buffer : buffers) addresses.push_back(buffer.addr);
+    UnregisterClaim claim(*this, addresses);
+    if (!claim.acquired()) return ERR_CONTEXT;
+
     for (const auto& buffer_entry : buffer_map) {
         const std::string& protocol = buffer_entry.first;
         const std::vector<RegisteredBuffer>& buffer_list = buffer_entry.second;
@@ -1171,8 +1224,10 @@ int TransferEngineImpl::registerLocalMemoryBatchImpl(
     std::vector<void*> addr_list;
     regions.reserve(buffer_list.size());
     addr_list.reserve(buffer_list.size());
+    const bool importing = RdmaContext::hasExternalDmabufForThread();
     for (const auto& buffer : buffer_list) {
-        regions.push_back({buffer.addr, buffer.length, location, true});
+        regions.push_back(
+            {buffer.addr, buffer.length, location, true, importing});
         addr_list.push_back(buffer.addr);
     }
     if (!tryReserveMemoryRegions(regions)) {
@@ -1198,7 +1253,9 @@ int TransferEngineImpl::registerLocalMemoryBatchImpl(
                  it != attempted_transports.rend(); ++it) {
                 int rollback_ret = (*it)->unregisterLocalMemoryBatch(addr_list);
                 if (rollback_ret != 0 &&
-                    rollback_ret != ERR_ADDRESS_NOT_REGISTERED) {
+                    (rollback_ret != ERR_ADDRESS_NOT_REGISTERED ||
+                     (importing &&
+                      !missingRegistrationConfirmsRemoval((*it)->getName())))) {
                     rollback_failed = true;
                     LOG(WARNING)
                         << "Failed to roll back batch registration for "
@@ -1230,6 +1287,8 @@ int TransferEngineImpl::unregisterLocalMemoryBatch(
 
 int TransferEngineImpl::unregisterLocalMemoryBatchImpl(
     const std::vector<void*>& addr_list) {
+    UnregisterClaim claim(*this, addr_list);
+    if (!claim.acquired()) return ERR_CONTEXT;
     int first_error = 0;
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemoryBatch(addr_list);
@@ -1245,8 +1304,37 @@ int TransferEngineImpl::unregisterLocalMemoryBatchImpl(
     return 0;
 }
 
+TransferEngineImpl::UnregisterClaim::UnregisterClaim(
+    TransferEngineImpl& engine, std::span<void* const> addresses)
+    : engine_(engine), addresses_(addresses) {
+    // Allocate before updating shared state so even a failed batch allocation
+    // leaves no claims behind. Repeated addresses within a call share a claim.
+    std::set<uintptr_t> pending;
+    for (void* addr : addresses)
+        pending.insert(reinterpret_cast<uintptr_t>(addr));
+    std::unique_lock lock(engine_.mutex_);
+    for (auto addr : pending) {
+        if (engine_.unregistering_addresses_.count(addr) ||
+            engine_.registering_memory_regions_.count(addr))
+            return;
+    }
+    engine_.unregistering_addresses_.merge(pending);
+    acquired_ = true;
+}
+
+TransferEngineImpl::UnregisterClaim::~UnregisterClaim() {
+    if (!acquired_) return;
+    std::unique_lock lock(engine_.mutex_);
+    for (void* addr : addresses_)
+        engine_.unregistering_addresses_.erase(
+            reinterpret_cast<uintptr_t>(addr));
+}
+
 bool TransferEngineImpl::hasOverlapLocked(uintptr_t addr,
                                           uint64_t length) const {
+    auto next = unregistering_addresses_.lower_bound(addr);
+    if (next != unregistering_addresses_.end() && *next - addr < length)
+        return true;
     return hasOverlapInMapLocked(local_memory_regions_, addr, length) ||
            hasOverlapInMapLocked(registering_memory_regions_, addr, length);
 }

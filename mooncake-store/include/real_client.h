@@ -20,7 +20,7 @@
 #include "common/client_buffer_allocation.h"
 #include "client_buffer.h"
 #include "client_service.h"
-#include "device/cuda_ipc_buffer_handle.h"
+#include "device/cuda_ipc_buffer.h"
 #include "mutex.h"
 #include "common/network.h"
 #include "pyclient.h"
@@ -41,7 +41,11 @@ class RealClient;
 
 namespace test {
 class PrefetchTeardownTest;
+class RealClientTeardownTest;
 }  // namespace test
+namespace testing {
+class DummyClientSessionTest;
+}  // namespace testing
 class NvlinkHostNumaAllocation;
 struct EgmStorePoolConfig;
 class RegisteredPinnedRegion;
@@ -302,6 +306,24 @@ class RealClient : public PyClient {
 
     std::vector<int> batch_put_session_revoke(
         const std::vector<std::string> &keys) override;
+
+    // Session metadata and pointers are scoped to the calling DummyClient.
+    std::vector<int> batch_get_session_start_dummy_helper(
+        const std::vector<std::string> &keys, const UUID &client_id);
+    int batch_get_session_end_dummy_helper(const std::vector<std::string> &keys,
+                                           const UUID &client_id);
+    std::vector<int> batch_put_session_start_dummy_helper(
+        const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config, const UUID &client_id);
+    std::vector<int> finish_dummy_put_sessions(
+        const std::vector<std::string> &keys, const UUID &client_id,
+        bool commit);
+    std::vector<int> execute_dummy_session_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<uint64_t>> &addresses,
+        const std::vector<std::vector<size_t>> &sizes,
+        const std::vector<std::vector<size_t>> &offsets, int32_t device_id,
+        const UUID &client_id, bool is_write);
 
     int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values,
@@ -772,7 +794,8 @@ class RealClient : public PyClient {
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
-        const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        bool stage_nof_device_reads = false);
 
     using LocalDiskOffloadObjects =
         std::unordered_map<std::string, std::vector<Slice>>;
@@ -785,7 +808,8 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
-        const LocalDiskOffloadReader &local_disk_reader);
+        const LocalDiskOffloadReader &local_disk_reader,
+        bool stage_nof_device_reads = false);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
@@ -882,7 +906,8 @@ class RealClient : public PyClient {
     std::vector<tl::expected<void, ErrorCode>> batchRemove_internal(
         const std::vector<std::string> &keys, bool force = false);
 
-    tl::expected<void, ErrorCode> tearDownAll_internal();
+    tl::expected<void, ErrorCode> tearDownAll_internal(
+        bool final_teardown = false);
 
     // Idempotently releases this client's NoF registrations for all recorded
     // user buffers; failures keep their records and latch
@@ -951,6 +976,8 @@ class RealClient : public PyClient {
         const std::string &segment_name = "") override;
 
     tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
+    tl::expected<PingResponse, ErrorCode> ping_persistent_dummy(
+        const UUID &client_id, bool establish_context);
 
     async_simple::coro::Lazy<
         tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
@@ -1217,6 +1244,7 @@ class RealClient : public PyClient {
     NofRuntime nof_runtime_{};
 
     struct MappedShm {
+        UUID owner{};
         std::string shm_name;
         // Offset = real_base - dummy_base
         uintptr_t shm_addr_offset = 0;
@@ -1242,7 +1270,48 @@ class RealClient : public PyClient {
         std::string ipc_key_data;
     };
 
+    // Each DummyClient owns a separate session namespace while all transfers
+    // use this RealClient's existing Client and TransferEngine.
+    struct PutSessionEntry {
+        std::vector<Replica::Descriptor> replicas;
+        uint64_t object_size{0};
+        ReplicaWriteMode write_mode{ReplicaWriteMode::SINGLE_REPLICA};
+        bool memory_finalized{false};
+        bool writable{true};
+        size_t inflight_transfers{0};
+    };
+    struct SessionState {
+        // Serialize control RPCs so a late end/revoke cannot act on a new put.
+        std::mutex put_control_mutex;
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::unordered_map<std::string, QueryResult> get_sessions;
+        std::unordered_map<std::string, PutSessionEntry> put_sessions;
+    };
+
+    enum class CudaRegistrationState {
+        kQuarantined,  // Initial registration did not confirm MR ownership.
+        kRegistered,
+        kUnregisterPending,
+        kClosePending,  // No MR remains; only the CUDA import needs closing.
+    };
+    struct CudaRegisteredAllocation {
+        device::CudaIpcBufferMapping mapping;
+        CudaRegistrationState state = CudaRegistrationState::kQuarantined;
+    };
+    struct CudaRegisteredBuffer {
+        CudaIpcBufferHandle handle;
+        std::shared_ptr<CudaRegisteredAllocation> allocation;
+    };
     struct ShmContext {
+        // A persistent client re-establishes this flag after its context
+        // expires.
+        bool persistent_dummy = false;
+        std::unordered_map<uint64_t, CudaRegisteredBuffer> cuda_buffers;
+        SessionState sessions;
+        // Closed before cleanup; failed revocations retain this context for
+        // retry.
+        bool sessions_closing = false;
         // List of all mapped shared memory for this client
         std::vector<MappedShm> mapped_shms;
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
@@ -1257,6 +1326,25 @@ class RealClient : public PyClient {
     };
     mutable std::shared_mutex dummy_client_mutex_;
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
+    // Protected by dummy_client_mutex_. Logical registrations share one MR
+    // and IPC mapping for each physical CUDA allocation, even across Dummies.
+    std::unordered_map<std::string, std::shared_ptr<CudaRegisteredAllocation>>
+        cuda_allocations_;
+    // Remember uncertain imports after releasing the client's other resources.
+    // An unmap acknowledgement would allow the exporter to free its allocation.
+    std::unordered_set<UUID, boost::hash<UUID>> clients_with_quarantined_cuda_;
+    bool dummy_cuda_io_pending(const ShmContext &context) const;
+    template <typename T>
+    T confirm_dummy_cuda_io(const ShmContext &context, T result) const;
+    bool retry_dummy_quarantine_locked(const UUID &client_id);
+    tl::expected<void, ErrorCode> unregister_cuda_buffer_locked(
+        ShmContext &context, uint64_t dummy_addr);
+    tl::expected<void, ErrorCode> register_cuda_buffer_with_fd(
+        uint64_t dummy_addr, const CudaIpcBufferHandle &handle,
+        const UUID &client_id, int fd);
+    tl::expected<void, ErrorCode> unregister_cuda_buffer_internal(
+        uint64_t dummy_addr, const CudaIpcBufferHandle &handle,
+        const UUID &client_id);
 
     mutable std::shared_mutex registered_buffer_mutex_;
     struct BufferRegistrationRecord {
@@ -1270,29 +1358,42 @@ class RealClient : public PyClient {
         registered_buffer_sizes_;
     std::optional<WritableBufferRegion> local_buffer_region_;
 
-    // KV transfer sessions (process-local; not shared with DummyClient).
-    // get_sessions_ stores a FilterQueryResult'd QueryResult (single complete
-    // supported replica + lease); ranges only compare lease locally (no
-    // Master). MEMORY uses BatchTransferReadRanges; DFS reads through
-    // request-scoped staging; LOCAL_DISK restores on the owner then
-    // BatchTransferReadOffloadRanges; DISK BatchGets into a temp buffer then
-    // scatters by src_offset.
-    // Put sessions track writable + inflight so end/revoke can seal the
-    // session and wait for outstanding range writes before finalize/free.
-    struct PutSessionEntry {
-        std::vector<Replica::Descriptor> replicas;
-        uint64_t object_size{0};
-        ReplicaWriteMode write_mode{ReplicaWriteMode::SINGLE_REPLICA};
-        bool writable{true};
-        size_t inflight_transfers{0};
-    };
-    mutable std::mutex session_mutex_;
-    std::condition_variable session_cv_;
-    std::unordered_map<std::string, QueryResult> get_sessions_;
-    std::unordered_map<std::string, PutSessionEntry> put_sessions_;
+    SessionState real_sessions_;
+    std::mutex session_put_owners_mutex_;
+    std::unordered_map<std::string, SessionState *> session_put_owners_;
+    bool claim_session_put_owner(SessionState &sessions,
+                                 const std::string &key);
+    void release_session_put_owner(SessionState &sessions,
+                                   const std::string &key);
 
-    void wait_session_put_idle(std::unique_lock<std::mutex> &lock,
+    void wait_session_put_idle(SessionState &sessions,
+                               std::unique_lock<std::mutex> &lock,
                                const std::vector<std::string> &keys);
+    std::vector<int> batch_get_session_start_impl(
+        SessionState &sessions, const std::vector<std::string> &keys);
+    int batch_get_session_end_impl(SessionState &sessions,
+                                   const std::vector<std::string> &keys);
+    std::vector<int> batch_get_into_multi_buffer_ranges_impl(
+        SessionState &sessions, const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_src_offsets);
+    std::vector<int> batch_put_session_start_impl(
+        SessionState &sessions, const std::vector<std::string> &keys,
+        const std::vector<size_t> &sizes, const ReplicateConfig &config);
+    std::vector<int> batch_put_from_multi_buffer_ranges_impl(
+        SessionState &sessions, const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_dst_offsets);
+    std::vector<int> batch_put_session_end_impl(
+        SessionState &sessions, const std::vector<std::string> &keys);
+    std::vector<int> batch_put_session_revoke_impl(
+        SessionState &sessions, const std::vector<std::string> &keys);
+    ErrorCode cleanup_dummy_sessions(ShmContext &context);
+    ErrorCode unregister_dummy_cuda_buffers(ShmContext &context);
+    ErrorCode cleanup_session_state(SessionState &sessions);
+    ShmContext *find_open_dummy_context_locked(const UUID &client_id);
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
@@ -1346,6 +1447,8 @@ class RealClient : public PyClient {
     std::atomic<int64_t> offload_rpc_read_count_{0};
 
     // Dummy Client manage related members
+    tl::expected<PingResponse, ErrorCode> ping_dummy(const UUID &client_id,
+                                                     bool require_context);
     void dummy_client_monitor_func();
     int start_dummy_client_monitor();
     void stop_dummy_client_monitor();
@@ -1369,13 +1472,15 @@ class RealClient : public PyClient {
     std::string ipc_socket_path_;
     std::unique_ptr<UdsAcceptor> uds_acceptor_;
     int start_ipc_server();
-    int stop_ipc_server();
+    int stop_ipc_server(bool retain_socket_name);
     // Embedded HTTP server for health-check / metrics
     std::unique_ptr<coro_http::coro_http_server> http_server_;
     int start_http_server(int port);
     void stop_http_server();
 
     void handle_ipc_shm_register(UdsConnection &connection);
+    void handle_ipc_cuda_request(UdsConnection &connection,
+                                 IpcRequestType type);
     void handle_ipc_shm_fd_request(UdsConnection &connection);
 
     void teardown_ascend_shm_buffer(MappedShm &shm);
@@ -1402,6 +1507,7 @@ class RealClient : public PyClient {
         std::vector<size_t> source_offsets;
         size_t transferred_bytes;
         std::chrono::steady_clock::time_point lease_deadline;
+        SessionState *session_state;
     };
 
     struct SessionRangeReadPlan {
@@ -1428,7 +1534,7 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_src_offsets) const;
 
     std::vector<SessionRangeReadRequest> prepare_session_range_read_requests(
-        const std::vector<std::string> &keys,
+        SessionState &sessions, const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const std::vector<std::vector<size_t>> &all_src_offsets,
@@ -1493,8 +1599,11 @@ class RealClient : public PyClient {
         bool enable_embedded_master, bool enable_ssd_prefetch,
         int64_t ssd_prefetch_cooldown_sec, int64_t ssd_prefetch_dedup_ttl_sec);
 
+    friend class DummyClientCudaLifecycleTest;
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;
+    friend class test::RealClientTeardownTest;
+    friend class testing::DummyClientSessionTest;
     friend class RangedDiskLeaseTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,

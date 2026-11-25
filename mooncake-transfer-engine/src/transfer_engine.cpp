@@ -1404,6 +1404,10 @@ std::string TransferEngine::showLinks(bool json) const {
 
 namespace mooncake {
 
+bool TransferEngine::hasPendingBatchCleanup() const {
+    return impl_ && impl_->hasPendingBatchCleanup();
+}
+
 bool TransferEngine::isBatchSubmitEligible(size_t count) const {
 #ifdef USE_TENT
     if (use_tent_)

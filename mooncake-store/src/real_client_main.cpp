@@ -91,6 +91,12 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &RealClient::batch_get_into_multi_buffers_dummy_helper>(&real_client);
     server.register_handler<&RealClient::batch_get_into_cuda_ipc_dummy_helper>(
         &real_client);
+    server.register_handler<&RealClient::batch_get_session_start_dummy_helper,
+                            &RealClient::batch_get_session_end_dummy_helper,
+                            &RealClient::batch_put_session_start_dummy_helper,
+                            &RealClient::finish_dummy_put_sessions,
+                            &RealClient::execute_dummy_session_ranges>(
+        &real_client);
     server.register_handler<&RealClient::get_into_range_shm_helper>(
         &real_client);
     server.register_handler<&RealClient::get_into_ranges_shm_helper>(
@@ -108,6 +114,7 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &real_client);
     server.register_handler<&RealClient::service_ready_internal>(&real_client);
     server.register_handler<&RealClient::ping>(&real_client);
+    server.register_handler<&RealClient::ping_persistent_dummy>(&real_client);
     server.register_handler<&RealClient::acquire_hot_cache>(&real_client);
     server.register_handler<&RealClient::release_hot_cache>(&real_client);
     server.register_handler<&RealClient::batch_acquire_hot_cache>(&real_client);
