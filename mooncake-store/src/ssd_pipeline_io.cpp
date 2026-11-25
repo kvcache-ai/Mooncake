@@ -98,7 +98,7 @@ struct ThreadedPipelineDriver::Impl {
     };
     Impl(std::vector<std::shared_ptr<ReadSource>> sources,
          std::vector<size_t> chunk_sources, std::shared_ptr<WriteTarget> target,
-         BoundedExecutor& reads, BoundedExecutor& writes, size_t count)
+         BoundedExecutor& reads, BoundedExecutor* writes, size_t count)
         : sources(std::move(sources)),
           chunk_sources(std::move(chunk_sources)),
           target(std::move(target)),
@@ -130,6 +130,23 @@ struct ThreadedPipelineDriver::Impl {
             chunk.read_bytes > buffer.capacity ||
             token.chunk_index >= chunk_sources.size())
             return false;
+        if (stage == SlotStage::kWriting && writes == nullptr) {
+            {
+                std::lock_guard lock(mutex);
+                auto& record = records[token.slot_index];
+                if (stopping || record.state != State::kIdle) return false;
+                record.event = {token, stage, 0, Error::kOk};
+                record.state = State::kRunning;
+            }
+            const auto result = target->Write(chunk, buffer);
+            std::lock_guard lock(mutex);
+            auto& record = records[token.slot_index];
+            record.event.result = result;
+            record.event.bytes = result == Error::kOk ? chunk.payload_bytes : 0;
+            record.state = State::kReady;
+            changed.notify_all();
+            return true;
+        }
         std::shared_ptr<ReadSource> source;
         if (stage == SlotStage::kReading)
             source = sources[chunk_sources[token.chunk_index]];
@@ -171,7 +188,7 @@ struct ThreadedPipelineDriver::Impl {
                 --running;
                 changed.notify_all();
             };
-            accepted = (stage == SlotStage::kReading ? reads : writes)
+            accepted = (stage == SlotStage::kReading ? reads : *writes)
                            .WaitSubmit(std::move(task));
         } catch (...) {
         }
@@ -214,7 +231,7 @@ struct ThreadedPipelineDriver::Impl {
     const std::vector<size_t> chunk_sources;
     std::shared_ptr<WriteTarget> target;
     BoundedExecutor& reads;
-    BoundedExecutor& writes;
+    BoundedExecutor* writes;
     std::vector<Record> records;
     std::mutex mutex;
     std::condition_variable changed;
@@ -225,7 +242,7 @@ struct ThreadedPipelineDriver::Impl {
 ThreadedPipelineDriver::ThreadedPipelineDriver(
     std::vector<std::shared_ptr<ReadSource>> sources,
     std::vector<size_t> chunk_sources, std::shared_ptr<WriteTarget> target,
-    BoundedExecutor& reads, BoundedExecutor& writes, size_t slot_count)
+    BoundedExecutor& reads, BoundedExecutor* writes, size_t slot_count)
     : impl_(std::make_unique<Impl>(std::move(sources), std::move(chunk_sources),
                                    std::move(target), reads, writes,
                                    slot_count)) {}

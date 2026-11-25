@@ -414,18 +414,24 @@ class FileStorage {
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
-    // Lazily initializes streaming_reads_ while caller holds streaming_mutex_
-    // (shared); serialized internally by streaming_reads_init_mutex_.
+    // Lazily initializes streaming executors while caller holds
+    // streaming_mutex_ (shared); serialized internally by
+    // streaming_init_mutex_.
     ssd_offload::BoundedExecutor* GetOrCreateStreamingReadsLocked();
+#if defined(__linux__) && defined(USE_URING)
+    std::shared_ptr<ssd_offload::UringReadExecutor>
+    GetOrCreateStreamingUringReadsLocked();
+#endif
 
     mutable std::shared_mutex streaming_mutex_;
-    mutable std::mutex streaming_reads_init_mutex_;
+    mutable std::mutex streaming_init_mutex_;
+    bool streaming_bucket_ready_{false};
     bool streaming_stopped_{false};
 #if defined(__linux__) && defined(USE_URING)
+    bool streaming_uring_init_attempted_{false};
     std::shared_ptr<ssd_offload::UringReadExecutor> streaming_uring_reads_;
 #endif
     std::unique_ptr<ssd_offload::BoundedExecutor> streaming_reads_;
-    std::unique_ptr<ssd_offload::BoundedExecutor> streaming_writes_;
     std::atomic<size_t> active_streaming_sources_{0};
     // Whether client_buffer_allocator_'s buffer is the io_uring fixed buffer,
     // which the destructor must unregister before the buffer is freed.

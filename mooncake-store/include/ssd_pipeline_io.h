@@ -38,12 +38,22 @@ class WriteTarget {
 class ThreadedPipelineDriver final : public PipelineDriver {
    public:
     // One immutable source index per global chunk. Every source and mapping
-    // entry is validated before work can be accepted.
+    // entry is validated before work can be accepted. Passing writes == nullptr
+    // runs WriteTarget::Write inline on the scheduler thread (ideal for pure
+    // CPU memcpy targets without spawning an extra write thread pool).
+    ThreadedPipelineDriver(std::vector<std::shared_ptr<ReadSource>> sources,
+                           std::vector<size_t> chunk_sources,
+                           std::shared_ptr<WriteTarget> target,
+                           BoundedExecutor& reads, BoundedExecutor* writes,
+                           size_t slot_count);
     ThreadedPipelineDriver(std::vector<std::shared_ptr<ReadSource>> sources,
                            std::vector<size_t> chunk_sources,
                            std::shared_ptr<WriteTarget> target,
                            BoundedExecutor& reads, BoundedExecutor& writes,
-                           size_t slot_count);
+                           size_t slot_count)
+        : ThreadedPipelineDriver(std::move(sources), std::move(chunk_sources),
+                                 std::move(target), reads, &writes,
+                                 slot_count) {}
     ~ThreadedPipelineDriver() override;
     bool SubmitRead(const SlotToken&, const ReadChunk&,
                     SlotBuffer) noexcept override;

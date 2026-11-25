@@ -9,9 +9,10 @@
 
 namespace mooncake::detail {
 
-// Validated with concurrent multi-rank SSD restores. Do not scale this pool
-// directly with host CPU count: disk and RDMA concurrency are separate limits.
-inline constexpr uint32_t kDefaultOffloadReadIoThreads = 64;
+// Conservative per-client default to avoid thread explosion in multi-client
+// processes; override via MOONCAKE_OFFLOAD_READ_IO_THREADS (1..128) for
+// high-concurrency multi-rank SSD restores.
+inline constexpr uint32_t kDefaultOffloadReadIoThreads = 8;
 inline constexpr uint32_t kMaxOffloadReadIoThreads = 128;
 
 inline std::optional<uint32_t> ParseOffloadReadIoThreads(const char* value) {

@@ -54,6 +54,7 @@ struct UringReadExecutor::Impl {
         uint64_t id{0};
         unsigned retries{0};
         size_t done{0};
+        bool submitted{false};
     };
 
     struct Worker {
@@ -124,9 +125,14 @@ struct UringReadExecutor::Impl {
         io_uring ring{};
         int signal{-1};
         bool initialized{false};
+        bool submit_broken{false};
+        bool ring_poll_broken{false};
+        bool signal_broken{false};
+        int broken_errno{0};
         uint64_t next_id{0};
         std::deque<std::unique_ptr<Operation>> queued;   // executor mutex
         std::vector<std::unique_ptr<Operation>> active;  // ring owner only
+        std::deque<Operation*> pending_submit;           // ring owner only
         std::thread thread;
     };
 
@@ -153,6 +159,7 @@ struct UringReadExecutor::Impl {
             std::lock_guard lock(mutex);
             if (!failed) {
                 failed = stopping = true;
+                failure_errno = err;
                 latched = true;
                 credit.notify_all();
                 for (auto& worker : workers) (void)worker->Wake();
@@ -198,13 +205,30 @@ struct UringReadExecutor::Impl {
     void PrepareRead(Worker& worker, io_uring_sqe* sqe, Operation& op) {
         // A new ID distinguishes this submission from a retired CQE.
         op.id = ++worker.next_id;
+        op.submitted = false;
         io_uring_prep_read(sqe, op.fd, op.buffer.data() + op.done,
                            unsigned(op.buffer.size() - op.done),
                            op.offset + op.done);
         sqe->user_data = op.id;
+        worker.pending_submit.push_back(&op);
+    }
+
+    void FailUnsubmittedActive(Worker& worker, int err) {
+        worker.pending_submit.clear();
+        for (auto& slot : worker.active) {
+            if (!slot || slot->submitted) continue;
+            const size_t done = slot->done;
+            Complete(std::move(slot), {done, Error::kIoError, err});
+        }
+    }
+
+    static bool HasActiveOps(const Worker& worker) noexcept {
+        return std::any_of(worker.active.begin(), worker.active.end(),
+                           [](const auto& op) { return bool(op); });
     }
 
     bool Harvest(Worker& worker) {
+        if (!worker.initialized) return false;
         bool prepared_retry = false;
         io_uring_cqe* cqe = nullptr;
         while (io_uring_peek_cqe(&worker.ring, &cqe) == 0) {
@@ -216,6 +240,8 @@ struct UringReadExecutor::Impl {
                 [id](const auto& op) { return op && op->id == id; });
             if (found == worker.active.end()) {
                 Fail("unexpected cqe user_data");
+                worker.submit_broken = true;
+                FailUnsubmittedActive(worker, worker.broken_errno);
                 continue;
             }
             auto& op = **found;
@@ -228,21 +254,33 @@ struct UringReadExecutor::Impl {
             int sys_errno = step.sys_errno;
             if (step.retry) {
                 bool id_exhausted = false;
+                bool requeued = false;
                 {
                     std::lock_guard lock(mutex);
-                    if (!failed) {
+                    if (!failed && !worker.submit_broken) {
                         if (worker.next_id == UINT64_MAX) {
                             id_exhausted = true;
                         } else if (auto* sqe = io_uring_get_sqe(&worker.ring)) {
                             PrepareRead(worker, sqe, op);
                             prepared_retry = true;
                             continue;
+                        } else {
+                            // SQ ring is temporarily full; push back to the
+                            // front of queued so the next Flush/Prepare cycle
+                            // retries without failing the read spuriously.
+                            (*found)->submitted = false;
+                            worker.queued.push_front(std::move(*found));
+                            requeued = true;
                         }
                     }
                 }
+                if (requeued) {
+                    prepared_retry = true;
+                    continue;
+                }
                 if (id_exhausted) Fail("sqe id exhausted");
                 error = Error::kIoError;
-                sys_errno = 0;
+                sys_errno = sys_errno ? sys_errno : worker.broken_errno;
             }
             Complete(std::move(*found), {op.done, error, sys_errno});
         }
@@ -250,6 +288,7 @@ struct UringReadExecutor::Impl {
     }
 
     void Prepare(Worker& worker) {
+        if (!worker.initialized || worker.submit_broken) return;
         bool id_exhausted = false;
         for (auto& active : worker.active) {
             if (active) continue;
@@ -270,16 +309,31 @@ struct UringReadExecutor::Impl {
     }
 
     void Flush(Worker& worker) {
+        if (!worker.initialized || worker.submit_broken) return;
         for (unsigned attempt = 0;
              attempt < 4 && io_uring_sq_ready(&worker.ring); ++attempt) {
             const int result = io_uring_submit(&worker.ring);
-            if (result > 0) continue;  // Includes partial submissions.
+            if (result > 0) {
+                const size_t accepted = std::min(static_cast<size_t>(result),
+                                                 worker.pending_submit.size());
+                for (size_t i = 0; i < accepted; ++i) {
+                    worker.pending_submit.front()->submitted = true;
+                    worker.pending_submit.pop_front();
+                }
+                continue;  // Includes partial submissions.
+            }
             if (result < 0 && result != -EINTR && result != -EAGAIN &&
                 result != -ENOMEM && result != -EBUSY) {
+                worker.submit_broken = true;
+                if (worker.broken_errno == 0) worker.broken_errno = -result;
                 Fail("io_uring_submit failed", -result);
+                // Any SQEs still in pending_submit were never accepted by the
+                // kernel; fail them immediately, while keeping
+                // already-submitted operations pinned until their CQEs arrive
+                // so kernel DMA/io-wq never writes into freed caller staging
+                // buffers.
+                FailUnsubmittedActive(worker, -result);
             }
-            // Every prepared/published operation stays active until its CQE.
-            // A failed enter does not prove which SQEs the kernel accepted.
             break;
         }
     }
@@ -289,49 +343,91 @@ struct UringReadExecutor::Impl {
             Harvest(worker);
             // Only queued operations have never been prepared or published.
             // A permanent failure can safely complete these with an error.
-            for (size_t i = 0; i < worker.active.size(); ++i) {
+            for (;;) {
                 std::unique_ptr<Operation> rejected;
+                int err = 0;
                 {
                     std::lock_guard lock(mutex);
                     if (!failed || worker.queued.empty()) break;
                     rejected = std::move(worker.queued.front());
                     worker.queued.pop_front();
+                    err = worker.broken_errno ? worker.broken_errno
+                                              : failure_errno;
                 }
-                Complete(std::move(rejected), {0, Error::kIoError});
+                Complete(std::move(rejected), {0, Error::kIoError, err});
             }
             Prepare(worker);
             Flush(worker);
             if (Harvest(worker)) continue;
+            bool idle = false;
             {
                 std::lock_guard lock(mutex);
-                const bool idle = std::none_of(
-                    worker.active.begin(), worker.active.end(),
-                    [](const auto& operation) { return bool(operation); });
+                idle = !HasActiveOps(worker);
                 if (stopping && worker.queued.empty() && idle) return;
                 if (failed && !worker.queued.empty()) continue;
-                if (!worker.queued.empty() &&
+                if (!failed && !worker.submit_broken &&
+                    !worker.queued.empty() &&
                     std::any_of(
                         worker.active.begin(), worker.active.end(),
                         [](const auto& operation) { return !operation; }) &&
                     io_uring_sq_space_left(&worker.ring))
                     continue;
             }
-            pollfd wake[] = {{worker.ring.ring_fd, POLLIN, 0},
-                             {worker.signal, POLLIN, 0}};
-            // Retry SQ submissions without a CQE. A bounded backup poll also
-            // makes queued work/shutdown progress if an eventfd write fails.
-            const int result =
-                poll(wake, 2, io_uring_sq_ready(&worker.ring) ? 1 : 100);
-            if ((result < 0 && errno != EINTR) ||
-                (result > 0 && ((wake[0].revents | wake[1].revents) &
-                                (POLLERR | POLLHUP | POLLNVAL)))) {
-                Fail("poll failed", result < 0 ? errno : 0);
+            if (worker.ring_poll_broken) {
+                // Keep harvesting CQEs directly from the shared CQ ring until
+                // every already-submitted kernel I/O completes; never tear down
+                // the ring or release buffers while submitted ops remain.
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
             }
-            if (result > 0 && (wake[1].revents & POLLIN)) {
-                uint64_t value;
-                while (::read(worker.signal, &value, sizeof(value)) < 0 &&
-                       errno == EINTR) {
+            pollfd wake[] = {
+                {worker.initialized ? worker.ring.ring_fd : -1, POLLIN, 0},
+                {worker.signal_broken ? -1 : worker.signal, POLLIN, 0}};
+            // When completely idle with no queued or active SQEs, block in
+            // poll() without periodic wakeups until eventfd signals new work or
+            // shutdown. Keep a 1 ms retry poll when SQEs are pending submission
+            // under transient backpressure, and a 100 ms safety net while I/O
+            // is in flight.
+            int timeout_ms = -1;
+            if (!worker.submit_broken && worker.initialized &&
+                io_uring_sq_ready(&worker.ring)) {
+                timeout_ms = 1;
+            } else if (!idle) {
+                timeout_ms = 100;
+            }
+            const int result = poll(wake, 2, timeout_ms);
+            if (result < 0) {
+                if (errno == EINTR) continue;
+                const int err = errno;
+                worker.submit_broken = true;
+                worker.ring_poll_broken = true;
+                if (worker.broken_errno == 0) worker.broken_errno = err;
+                Fail("poll failed", err);
+                FailUnsubmittedActive(worker, err);
+                continue;
+            }
+            if (result > 0) {
+                const bool ring_err =
+                    (wake[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
+                const bool sig_err =
+                    (wake[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
+                if (sig_err) {
+                    worker.signal_broken = true;
+                    worker.submit_broken = true;
+                    Fail("eventfd poll failed", 0);
+                    FailUnsubmittedActive(worker, worker.broken_errno);
+                }
+                if (ring_err) {
+                    worker.submit_broken = true;
+                    worker.ring_poll_broken = true;
+                    Fail("ring_fd poll failed", 0);
+                    FailUnsubmittedActive(worker, worker.broken_errno);
+                }
+                if (!sig_err && (wake[1].revents & POLLIN)) {
+                    uint64_t value;
+                    while (::read(worker.signal, &value, sizeof(value)) < 0 &&
+                           errno == EINTR) {
+                    }
                 }
             }
         }
@@ -353,6 +449,7 @@ struct UringReadExecutor::Impl {
     const size_t limit;
     size_t pending{0}, next_worker{0};
     bool stopping{false}, failed{false};
+    int failure_errno{0};
     mutable std::mutex mutex;
     std::condition_variable credit;
     std::mutex shutdown_mutex;
@@ -420,7 +517,7 @@ struct UringPipelineDriver::Impl {
     Impl(std::vector<std::shared_ptr<ReadSource>> sources,
          std::vector<size_t> chunk_sources, std::vector<int> source_fds,
          std::shared_ptr<WriteTarget> target,
-         std::shared_ptr<UringReadExecutor> reader, BoundedExecutor& writes,
+         std::shared_ptr<UringReadExecutor> reader, BoundedExecutor* writes,
          std::vector<SlotBuffer> buffers)
         : sources(std::move(sources)),
           chunk_sources(std::move(chunk_sources)),
@@ -495,6 +592,24 @@ struct UringPipelineDriver::Impl {
     bool Write(const SlotToken& token, const ReadChunk& chunk,
                SlotBuffer buffer) noexcept {
         if (!Valid(token, chunk, buffer)) return false;
+        if (writes == nullptr) {
+            {
+                std::lock_guard lock(mutex);
+                auto& record = records[token.slot_index];
+                if (stopping || record.stage != Stage::kIdle) return false;
+                record.stage = Stage::kWrite;
+                record.event = {token, SlotStage::kWriting, 0, Error::kOk};
+            }
+            const auto result = target->Write(chunk, buffer);
+            std::lock_guard lock(mutex);
+            auto& completed = records[token.slot_index];
+            completed.event.result = result;
+            completed.event.bytes =
+                result == Error::kOk ? chunk.payload_bytes : 0;
+            completed.stage = Stage::kReady;
+            changed.notify_all();
+            return true;
+        }
         {
             std::lock_guard lock(mutex);
             auto& record = records[token.slot_index];
@@ -507,7 +622,7 @@ struct UringPipelineDriver::Impl {
         bool accepted = false;
         try {
             accepted =
-                writes.WaitSubmit([this, token, buffer, chunk_ptr = &chunk] {
+                writes->WaitSubmit([this, token, buffer, chunk_ptr = &chunk] {
                     const auto result = target->Write(*chunk_ptr, buffer);
                     std::lock_guard done_lock(mutex);
                     auto& completed = records[token.slot_index];
@@ -555,7 +670,7 @@ struct UringPipelineDriver::Impl {
     std::vector<int> source_fds;
     std::shared_ptr<WriteTarget> target;
     std::shared_ptr<UringReadExecutor> reader;
-    BoundedExecutor& writes;
+    BoundedExecutor* writes;
     std::vector<SlotBuffer> buffers;
     std::vector<Record> records;
     std::mutex mutex;
@@ -567,7 +682,7 @@ struct UringPipelineDriver::Impl {
 UringPipelineDriver::Creation UringPipelineDriver::Create(
     std::vector<std::shared_ptr<ReadSource>> sources,
     std::vector<size_t> chunk_sources, std::shared_ptr<WriteTarget> target,
-    std::shared_ptr<UringReadExecutor> reader, BoundedExecutor& writes,
+    std::shared_ptr<UringReadExecutor> reader, BoundedExecutor* writes,
     std::vector<SlotBuffer> buffers) {
     if (!reader || !reader->healthy()) return {Error::kNotSupported, {}};
     if (sources.empty() || chunk_sources.empty() ||

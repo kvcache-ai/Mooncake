@@ -411,6 +411,30 @@ TEST_F(FileStorageConfigTest, StreamingReadEnvAndValidation) {
     config.streaming_read.slots = 32;  // 32 * 1 MiB > 16 MiB arena
     EXPECT_FALSE(config.Validate());
 
+    config.streaming_read.slots = 4;
+    config.streaming_read.max_outstanding = 4;
+    config.streaming_read.read_workers = 8;  // read_workers > max_outstanding
+    EXPECT_FALSE(config.Validate());
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    EXPECT_TRUE(config.Validate());  // non-bucket ignores streaming limits
+    config.storage_backend_type = StorageBackendType::kBucket;
+    config.streaming_read.read_workers = 2;
+    config.streaming_read.max_outstanding = 16;
+
+    // Minimal single-slot / single-reader configuration must validate without
+    // overriding the unused default write_workers value.
+    {
+        FileStorageConfig minimal;
+        minimal.storage_filepath = data_path;
+        minimal.local_buffer_size = 16 * 1024 * 1024;
+        minimal.streaming_read.enabled = true;
+        minimal.streaming_read.slots = 1;
+        minimal.streaming_read.read_workers = 1;
+        minimal.streaming_read.max_outstanding = 1;
+        EXPECT_EQ(minimal.streaming_read.write_workers, 2u);
+        EXPECT_TRUE(minimal.Validate());
+    }
+
     // OffsetAllocator rounds non-exact bin sizes up (1150976 -> 1179648) and
     // our config helper stays in lockstep with OffsetAllocator itself.
     config.streaming_read.slots = 4;

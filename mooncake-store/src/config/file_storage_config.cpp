@@ -254,6 +254,7 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 
 bool FileStorageConfig::Validate() const {
     if (streaming_read.enabled &&
+        storage_backend_type == StorageBackendType::kBucket &&
         (local_buffer_size <= 0 ||
          !streaming_read.Validate(local_buffer_size))) {
         LOG(ERROR) << "Invalid SSD streaming limits or staging arena size";

@@ -38,6 +38,7 @@ class FileStorageShutdownTestPeer {
     static void* Staging(FileStorage& s) {
         return s.client_buffer_allocator_->getBase();
     }
+    static auto Backend(FileStorage& s) { return s.storage_backend_; }
     static void SetBackend(FileStorage& s,
                            std::shared_ptr<StorageBackendInterface> backend) {
         s.storage_backend_ = std::move(backend);
@@ -55,6 +56,24 @@ class RealClientShutdownTestPeer {
     static bool HasOffloadReadPool(RealClient& c) {
         std::lock_guard lock(c.offload_read_pool_mutex_);
         return c.offload_read_pool_ != nullptr;
+    }
+    static tl::expected<int64_t, ErrorCode> ExecuteLocalDiskRangedRead(
+        RealClient& c, const std::string& key, void* buffer, size_t dst_offset,
+        size_t src_offset, size_t size, uint64_t total_size,
+        const std::string& endpoint) {
+        Replica::Descriptor replica;
+        replica.id = 1;
+        replica.status = ReplicaStatus::COMPLETE;
+        replica.descriptor_variant =
+            LocalDiskDescriptor{UUID{1, 1}, total_size, endpoint};
+        RealClient::RangedReadMetadata meta{
+            QueryResult(
+                std::vector<Replica::Descriptor>{replica},
+                std::chrono::steady_clock::now() + std::chrono::seconds(60)),
+            replica, total_size};
+        return c.execute_ranged_read(key, buffer, dst_offset, src_offset, size,
+                                     meta, /*size_is_buffer_capacity=*/false,
+                                     /*verify_checksum=*/false);
     }
 };
 namespace {
@@ -281,6 +300,132 @@ TEST_F(RealClientShutdownTest, ReinitializationAcceptsOffloadCalls) {
     ASSERT_TRUE(client->setup_internal(config));
     auto inflight = RealClientShutdownTestPeer::Enter(*client);
     EXPECT_TRUE(inflight->ok());
+}
+
+TEST_F(RealClientShutdownTest, LocalStreamingEndToEndAndFallbackSemantics) {
+    // Register full offload RPC handlers so the fallback path exercises the
+    // real legacy offload RPC + TransferEngine path end-to-end.
+    client->offload_rpc_server_->stop();
+    client->offload_rpc_server_ =
+        std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "127.0.0.1");
+    client->offload_rpc_server_
+        ->register_handler<&RealClient::batch_get_offload_object>(client.get());
+    client->offload_rpc_server_
+        ->register_handler<&RealClient::batch_get_offload_object_ranges>(
+            client.get());
+    client->offload_rpc_server_
+        ->register_handler<&RealClient::release_offload_buffer>(client.get());
+    client->offload_rpc_server_->async_start();
+    ASSERT_FALSE(client->offload_rpc_server_->get_errc());
+
+    FileStorageConfig stream_config = FileStorageConfig::FromEnvironment();
+    stream_config.storage_filepath = path.string();
+    stream_config.local_buffer_size = 2 * 1024 * 1024;
+    stream_config.streaming_read.enabled = true;
+    stream_config.streaming_read.use_uring = false;
+    stream_config.streaming_read.slot_bytes = 256 * 1024;
+    stream_config.streaming_read.slots = 2;
+    stream_config.streaming_read.max_fragments = 16;
+
+    const std::string local_addr =
+        "127.0.0.1:" + std::to_string(client->offload_rpc_server_->port());
+    client->local_rpc_addr = local_addr;
+    client->file_storage_ = std::make_shared<FileStorage>(
+        stream_config, client->client_, local_addr);
+    ASSERT_TRUE(FileStorageShutdownTestPeer::Register(*client->file_storage_));
+    auto storage_backend =
+        FileStorageShutdownTestPeer::Backend(*client->file_storage_);
+    ASSERT_TRUE(storage_backend->Init());
+
+    // Store an object larger than the entire 2 MiB staging arena plus a smaller
+    // object for the legacy fallback check directly in the local bucket
+    // backend.
+    const std::string key = "e2e-local-streaming-key";
+    std::string payload(3 * 1024 * 1024 + 137, '\0');
+    for (size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<char>((i * 31) % 251);
+    }
+    const std::string fallback_key = "e2e-local-fallback-key";
+    std::string fallback_payload(8192, '\0');
+    for (size_t i = 0; i < fallback_payload.size(); ++i) {
+        fallback_payload[i] = static_cast<char>((i * 17 + 5) % 251);
+    }
+    const TenantId tenant(client->client_->tenant_id());
+    ASSERT_TRUE(storage_backend->BatchOffload(
+        {{tenant.MakeScopedKey(key), {{payload.data(), payload.size()}}},
+         {tenant.MakeScopedKey(fallback_key),
+          {{fallback_payload.data(), fallback_payload.size()}}}},
+        nullptr));
+
+    // 1) Happy path: local streaming copies the >2 MiB object without spawning
+    // the legacy offload RPC read thread pool.
+    std::vector<char> out(payload.size(), '\0');
+    std::unordered_map<std::string, std::vector<Slice>> req{
+        {key, {{out.data(), out.size()}}}};
+    auto ok = client->batch_get_into_offload_object_internal(local_addr, req);
+    ASSERT_TRUE(ok.has_value()) << ok.error();
+    EXPECT_EQ(std::memcmp(out.data(), payload.data(), payload.size()), 0);
+    EXPECT_FALSE(RealClientShutdownTestPeer::HasOffloadReadPool(*client));
+
+    // 2) Range read through both batch_get_into_offload_object_internal and
+    // execute_ranged_read stays on local streaming without spawning the legacy
+    // read pool.
+    std::vector<char> range_out(4096, '\0');
+    std::unordered_map<std::string, std::vector<Slice>> range_req{
+        {key, {{range_out.data(), range_out.size()}}}};
+    RealClient::OffloadReadRange read_range{
+        1024 * 1024 + 77, static_cast<int64_t>(payload.size())};
+    auto range_ok = client->batch_get_into_offload_object_internal(
+        local_addr, range_req, &read_range);
+    ASSERT_TRUE(range_ok.has_value()) << range_ok.error();
+    EXPECT_EQ(std::memcmp(range_out.data(), payload.data() + 1024 * 1024 + 77,
+                          range_out.size()),
+              0);
+    std::vector<char> ranged_direct_out(4096 + 64, '\0');
+    auto ranged_direct = RealClientShutdownTestPeer::ExecuteLocalDiskRangedRead(
+        *client, key, ranged_direct_out.data(), /*dst_offset=*/32,
+        /*src_offset=*/2 * 1024 * 1024 + 19, /*size=*/4096, payload.size(),
+        local_addr);
+    ASSERT_TRUE(ranged_direct.has_value()) << ranged_direct.error();
+    EXPECT_EQ(*ranged_direct, 4096);
+    EXPECT_EQ(std::memcmp(ranged_direct_out.data() + 32,
+                          payload.data() + 2 * 1024 * 1024 + 19, 4096),
+              0);
+    EXPECT_FALSE(RealClientShutdownTestPeer::HasOffloadReadPool(*client));
+
+    // 3) Direct error propagation: missing key fails directly with INVALID_KEY
+    // rather than falling back to the legacy RPC pool.
+    std::vector<char> missing_out(64, '\0');
+    std::unordered_map<std::string, std::vector<Slice>> missing_req{
+        {"missing-key", {{missing_out.data(), missing_out.size()}}}};
+    auto missing =
+        client->batch_get_into_offload_object_internal(local_addr, missing_req);
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(missing.error(), ErrorCode::INVALID_KEY);
+    EXPECT_FALSE(RealClientShutdownTestPeer::HasOffloadReadPool(*client));
+
+    // 4) Real legacy fallback: 32 disjoint 256-byte slices exceed
+    // max_fragments (16) so ReadLocalStreaming returns NO_AVAILABLE_HANDLE and
+    // RealClient falls back to the legacy offload RPC + TransferEngine path
+    // with disjoint destination writes (race-free under multi-lane TCP).
+    std::vector<char> fallback_out(fallback_payload.size(), '\0');
+    std::vector<Slice> fallback_slices;
+    fallback_slices.reserve(32);
+    for (size_t i = 0; i < 32; ++i) {
+        fallback_slices.push_back({fallback_out.data() + i * 256, 256});
+    }
+    std::unordered_map<std::string, std::vector<Slice>> fallback_req{
+        {fallback_key, std::move(fallback_slices)}};
+    auto fallback_ok = client->batch_get_into_offload_object_internal(
+        local_addr, fallback_req);
+    ASSERT_TRUE(fallback_ok.has_value()) << fallback_ok.error();
+    EXPECT_TRUE(RealClientShutdownTestPeer::HasOffloadReadPool(*client));
+    EXPECT_EQ(std::memcmp(fallback_out.data(), fallback_payload.data(),
+                          fallback_payload.size()),
+              0);
+
+    EXPECT_EQ(client->tearDownAll(), 0);
+    EXPECT_FALSE(RealClientShutdownTestPeer::HasOffloadReadPool(*client));
 }
 
 TEST(FileStorageShutdownTest, UnregistersStagingWithAnExternalTransferEngine) {

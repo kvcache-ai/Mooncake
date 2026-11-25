@@ -50,14 +50,25 @@ class UringPipelineDriver final : public PipelineDriver {
         Error error{Error::kNotSupported};
         std::unique_ptr<UringPipelineDriver> driver;
     };
-    // Executes reads on the shared UringReadExecutor and copies through writes.
+    // Executes reads on the shared UringReadExecutor and copies through writes
+    // (or inline on the scheduler thread when writes == nullptr).
     // chunk_sources maps each chunk index to an index in sources.
     static Creation Create(std::vector<std::shared_ptr<ReadSource>> sources,
                            std::vector<size_t> chunk_sources,
                            std::shared_ptr<WriteTarget> target,
                            std::shared_ptr<UringReadExecutor> reader,
-                           BoundedExecutor& writes,
+                           BoundedExecutor* writes,
                            std::vector<SlotBuffer> buffers);
+    static Creation Create(std::vector<std::shared_ptr<ReadSource>> sources,
+                           std::vector<size_t> chunk_sources,
+                           std::shared_ptr<WriteTarget> target,
+                           std::shared_ptr<UringReadExecutor> reader,
+                           BoundedExecutor& writes,
+                           std::vector<SlotBuffer> buffers) {
+        return Create(std::move(sources), std::move(chunk_sources),
+                      std::move(target), std::move(reader), &writes,
+                      std::move(buffers));
+    }
     ~UringPipelineDriver() override;
     bool SubmitRead(const SlotToken&, const ReadChunk&,
                     SlotBuffer) noexcept override;

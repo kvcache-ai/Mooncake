@@ -144,11 +144,12 @@ TEST(SsdPipelineIo, ReadyEventCannotBeOverwrittenBeforeConsumption) {
     ThreadedPipelineDriver driver({source}, {0}, target, reads, writes, 1);
     SlotToken token{0, 1, 0};
     ASSERT_TRUE(driver.SubmitRead(token, chunk, arena.buffers()[0]));
-    // Wait until the worker finishes reading into the slot.
-    const auto deadline = std::chrono::steady_clock::now() + 10s;
-    while (source->reads.load() == 0 &&
-           std::chrono::steady_clock::now() < deadline)
-        std::this_thread::yield();
+    // Drain the single-worker read executor with a barrier task so the first
+    // task is guaranteed to have transitioned the slot record to State::kReady
+    // before testing that a duplicate SubmitRead is rejected.
+    std::promise<void> barrier;
+    ASSERT_TRUE(reads.WaitSubmit([&] { barrier.set_value(); }));
+    ASSERT_EQ(barrier.get_future().wait_for(10s), std::future_status::ready);
     auto next = token;
     ++next.generation;
     EXPECT_FALSE(driver.SubmitRead(next, chunk, arena.buffers()[0]));
@@ -159,6 +160,38 @@ TEST(SsdPipelineIo, ReadyEventCannotBeOverwrittenBeforeConsumption) {
     ASSERT_TRUE(driver.SubmitRead(next, chunk, arena.buffers()[0]));
     ASSERT_TRUE(driver.WaitForEvent(event, 10s));
     EXPECT_EQ(event.token.generation, 2u);
+}
+
+TEST(SsdPipelineIo, InlineWriteModeCopiesWithoutWriteThreadPool) {
+    auto source = std::make_shared<MemorySource>(12000);
+    auto target = std::make_shared<CopyTarget>(12000);
+    BoundedExecutor reads(2, 8);
+    Arena arena;
+    auto plan = Plan(12000);
+    std::vector<size_t> chunk_sources(plan.chunks.size(), 0);
+    std::unique_ptr<ReadPipeline> pipeline;
+    auto driver = std::make_unique<ThreadedPipelineDriver>(
+        std::vector<std::shared_ptr<ReadSource>>{source},
+        std::move(chunk_sources), target, reads, nullptr, 2);
+    pipeline = std::make_unique<ReadPipeline>(std::move(plan), arena.buffers(),
+                                              *driver);
+    ASSERT_EQ(pipeline->Start(), Error::kOk);
+    for (size_t count = 0; count < 6 && pipeline->inflight(); ++count) {
+        IoCompletion event;
+        ASSERT_TRUE(driver->WaitForEvent(event, 10s));
+        if (event.stage == SlotStage::kReading) {
+            EXPECT_EQ(
+                pipeline->ReadDrained(event.token, event.bytes, event.result),
+                Error::kOk);
+        } else {
+            EXPECT_EQ(pipeline->WriteDrained(event.token, event.result),
+                      Error::kOk);
+        }
+    }
+    EXPECT_EQ(pipeline->state(), PipelineState::kSucceeded);
+    EXPECT_EQ(target->bytes, source->bytes);
+    EXPECT_EQ(source->reads.load(), 3u);
+    EXPECT_EQ(target->writes.load(), 3u);
 }
 
 TEST(SsdPipelineIo, DestructorWaitsForRunningReadAndPinsSource) {

@@ -1421,6 +1421,7 @@ class RealClient : public PyClient {
     RpcDrainGuard offload_rpc_drain_;
     std::mutex offload_read_pool_mutex_;
     std::unique_ptr<OffloadReadThreadPool> offload_read_pool_;
+    std::atomic<OffloadReadThreadPool *> offload_read_pool_fast_{nullptr};
     friend class RealClientShutdownTestPeer;
     std::unique_ptr<class EmbeddedMaster> embedded_master_;
 

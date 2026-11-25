@@ -520,6 +520,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET Mooncake::liburing)
     PRIVATE
     -Wl,--wrap=io_uring_queue_init
     -Wl,--wrap=io_uring_queue_exit
+    -Wl,--wrap=io_uring_submit
+    -Wl,--wrap=poll
     -Wl,--wrap=eventfd)
   add_test(NAME ssd_uring_read_executor_contract_test
            COMMAND ssd_uring_read_executor_contract_test)

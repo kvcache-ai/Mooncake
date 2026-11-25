@@ -3530,6 +3530,13 @@ BucketStorageBackend::SelectEvictionCandidate(int disk_index) {
                     ++pos;
                     continue;
                 }
+                if (bucket_it->second->inflight_reads_.load(
+                        std::memory_order_acquire) > 0) {
+                    VLOG(1) << "SelectEvictionCandidate: skipping read-pinned "
+                            << "bucket_id=" << bucket_it->first;
+                    ++pos;
+                    continue;
+                }
                 return bucket_it;
             }
             return buckets_.end();
@@ -3565,6 +3572,13 @@ BucketStorageBackend::SelectEvictionCandidate(int disk_index) {
                 if (bucket_it->second->scan_pins_.load(
                         std::memory_order_relaxed) > 0) {
                     VLOG(1) << "SelectEvictionCandidate: skipping scan-pinned "
+                            << "bucket_id=" << id;
+                    ++it;
+                    continue;
+                }
+                if (bucket_it->second->inflight_reads_.load(
+                        std::memory_order_acquire) > 0) {
+                    VLOG(1) << "SelectEvictionCandidate: skipping read-pinned "
                             << "bucket_id=" << id;
                     ++it;
                     continue;

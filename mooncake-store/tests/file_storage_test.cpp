@@ -1251,13 +1251,14 @@ class FileStorageTest : public ::testing::Test {
 
     static bool HasStreamingReadPool(const FileStorage& storage) {
         std::shared_lock lock(storage.streaming_mutex_);
-        std::lock_guard init_lock(storage.streaming_reads_init_mutex_);
+        std::lock_guard init_lock(storage.streaming_init_mutex_);
         return storage.streaming_reads_ != nullptr;
     }
 
     static bool HasStreamingUringReadPool(const FileStorage& storage) {
 #if defined(__linux__) && defined(USE_URING)
         std::shared_lock lock(storage.streaming_mutex_);
+        std::lock_guard init_lock(storage.streaming_init_mutex_);
         return storage.streaming_uring_reads_ != nullptr;
 #else
         (void)storage;
@@ -3843,6 +3844,11 @@ TEST_F(FileStorageTest, LocalStreamingDefersFallbackReadPoolUntilNeeded) {
         ASSERT_TRUE(storage.Shutdown());
         EXPECT_FALSE(HasStreamingReadPool(storage));
         EXPECT_FALSE(storage.SupportsLocalStreamingRead());
+        auto after_shutdown = storage.ReadLocalStreaming(
+            {{"lazy-posix-key", value.size(), 0, {{out.data(), out.size()}}}});
+        ASSERT_FALSE(after_shutdown);
+        EXPECT_EQ(after_shutdown.error(),
+                  ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
     {
@@ -3854,13 +3860,13 @@ TEST_F(FileStorageTest, LocalStreamingDefersFallbackReadPoolUntilNeeded) {
         FileStorage storage(config, nullptr, "local");
         EXPECT_TRUE(storage.SupportsLocalStreamingRead());
         EXPECT_FALSE(HasStreamingReadPool(storage));
-        const bool uring_available = HasStreamingUringReadPool(storage);
+        EXPECT_FALSE(HasStreamingUringReadPool(storage));
         PrepareStreamingObject(storage, "lazy-uring-key", value);
         std::vector<char> out(value.size(), 'z');
         ASSERT_TRUE(storage.ReadLocalStreaming(
             {{"lazy-uring-key", value.size(), 0, {{out.data(), out.size()}}}}));
         EXPECT_EQ(std::string(out.data(), out.size()), value);
-        if (uring_available) {
+        if (HasStreamingUringReadPool(storage)) {
             EXPECT_FALSE(HasStreamingReadPool(storage));
         } else {
             EXPECT_TRUE(HasStreamingReadPool(storage));

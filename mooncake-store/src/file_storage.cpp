@@ -146,12 +146,12 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       client_(client),
       ssd_metric_(ssd_metric),
       local_rpc_addr_(local_rpc_addr),
-      pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
-      client_buffer_allocator_(AlignedClientBufferAllocator::create(
-          config.local_buffer_size, client ? client->GetProtocol() : "")) {
+      pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()) {
     if (!config_.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
+    client_buffer_allocator_ = AlignedClientBufferAllocator::create(
+        config.local_buffer_size, client ? client->GetProtocol() : "");
 
     if (config.pinned_restore_arena_size > 0) {
         if (config.use_uring) {
@@ -183,23 +183,15 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     }
 
     storage_backend_ = create_storage_backend_result.value();
-    if (config_.streaming_read.enabled &&
-        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
-        const auto& stream = config_.streaming_read;
-#if defined(__linux__) && defined(USE_URING)
-        if (stream.use_uring) {
-            streaming_uring_reads_ = ssd_offload::UringReadExecutor::Create(
-                stream.read_workers, stream.max_outstanding);
-        }
-#else
-        if (stream.use_uring) {
-            LOG(WARNING) << "MOONCAKE_OFFLOAD_STREAM_USE_URING is set, but "
-                            "io_uring support is not built in; using pread";
-        }
-#endif
-        streaming_writes_ = std::make_unique<ssd_offload::BoundedExecutor>(
-            stream.write_workers, stream.max_outstanding);
+    streaming_bucket_ready_ = config_.streaming_read.enabled &&
+                              std::dynamic_pointer_cast<BucketStorageBackend>(
+                                  storage_backend_) != nullptr;
+#if !(defined(__linux__) && defined(USE_URING))
+    if (streaming_bucket_ready_ && config_.streaming_read.use_uring) {
+        LOG(WARNING) << "MOONCAKE_OFFLOAD_STREAM_USE_URING is set, but "
+                        "io_uring support is not built in; using pread";
     }
+#endif
     if (auto distributed_backend =
             std::dynamic_pointer_cast<DistributedStorageBackend>(
                 storage_backend_)) {
@@ -268,9 +260,9 @@ tl::expected<void, ErrorCode> FileStorage::Shutdown() {
         streaming_stopped_ = true;
 #if defined(__linux__) && defined(USE_URING)
         streaming_uring_reads_.reset();
+        streaming_uring_init_attempted_ = true;
 #endif
         streaming_reads_.reset();
-        streaming_writes_.reset();
     }
     heartbeat_running_ = false;
     WakeHeartbeat();
@@ -717,12 +709,13 @@ FileStorage::BatchGetLocalRanges(const std::vector<std::string>& keys,
 }
 
 bool FileStorage::SupportsLocalStreamingRead() const {
+    if (!streaming_bucket_ready_) return false;
     std::shared_lock lock(streaming_mutex_);
-    return !streaming_stopped_ && streaming_writes_ != nullptr;
+    return !streaming_stopped_;
 }
 
 ssd_offload::BoundedExecutor* FileStorage::GetOrCreateStreamingReadsLocked() {
-    std::lock_guard init_lock(streaming_reads_init_mutex_);
+    std::lock_guard init_lock(streaming_init_mutex_);
     if (!streaming_reads_) {
         const auto& stream = config_.streaming_read;
         try {
@@ -736,6 +729,20 @@ ssd_offload::BoundedExecutor* FileStorage::GetOrCreateStreamingReadsLocked() {
     }
     return streaming_reads_.get();
 }
+
+#if defined(__linux__) && defined(USE_URING)
+std::shared_ptr<ssd_offload::UringReadExecutor>
+FileStorage::GetOrCreateStreamingUringReadsLocked() {
+    std::lock_guard init_lock(streaming_init_mutex_);
+    if (!streaming_uring_init_attempted_) {
+        streaming_uring_init_attempted_ = true;
+        const auto& stream = config_.streaming_read;
+        streaming_uring_reads_ = ssd_offload::UringReadExecutor::Create(
+            stream.read_workers, stream.max_outstanding);
+    }
+    return streaming_uring_reads_;
+}
+#endif
 
 void FileStorage::ReapExpiredClientBuffers() {
     auto gc_now = std::chrono::steady_clock::now();
@@ -754,9 +761,11 @@ void FileStorage::ReapExpiredClientBuffers() {
 tl::expected<void, ErrorCode> FileStorage::ReadLocalStreaming(
     const std::vector<LocalReadRequest>& requests) {
     using namespace ssd_offload;
-    std::shared_lock lock(streaming_mutex_);
-    if (streaming_stopped_ || !streaming_writes_)
+    if (!streaming_bucket_ready_)
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    std::shared_lock lock(streaming_mutex_);
+    if (streaming_stopped_)
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     if (disk_fenced_.load())
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     const auto start = std::chrono::steady_clock::now();
@@ -894,7 +903,7 @@ tl::expected<void, ErrorCode> FileStorage::ReadLocalStreaming(
         }
         if (!handle) {
             if (handles.empty())
-                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
             // Degrade gracefully to the slots already reserved when concurrent
             // remote leases occupy part of the shared staging arena.
             break;
@@ -908,14 +917,19 @@ tl::expected<void, ErrorCode> FileStorage::ReadLocalStreaming(
         std::make_shared<CpuStreamingTarget>(std::move(all_destinations));
     // Declare ownership before the driver so exceptional unwinding drains the
     // driver while its ReadChunk pointers still refer to a live plan.
+    // Local CPU memcpy runs inline on this scheduler thread (writes == nullptr)
+    // to avoid spawning a separate write thread pool for local restores.
     std::unique_ptr<ReadPipeline> pipeline;
     std::unique_ptr<PipelineDriver> driver;
 #if defined(__linux__) && defined(USE_URING)
-    if (config.use_uring && streaming_uring_reads_) {
-        auto native = UringPipelineDriver::Create(
-            acquired->sources, chunk_sources, target, streaming_uring_reads_,
-            *streaming_writes_, buffers);
-        driver = std::move(native.driver);
+    if (config.use_uring) {
+        auto uring_reads = GetOrCreateStreamingUringReadsLocked();
+        if (uring_reads) {
+            auto native = UringPipelineDriver::Create(
+                acquired->sources, chunk_sources, target,
+                std::move(uring_reads), nullptr, buffers);
+            driver = std::move(native.driver);
+        }
     }
 #endif
     if (!driver) {
@@ -925,10 +939,10 @@ tl::expected<void, ErrorCode> FileStorage::ReadLocalStreaming(
                    "to pread executor";
         }
         auto* reads = GetOrCreateStreamingReadsLocked();
-        if (!reads) return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        if (!reads) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         driver = std::make_unique<ThreadedPipelineDriver>(
             std::move(acquired->sources), std::move(chunk_sources), target,
-            *reads, *streaming_writes_, buffers.size());
+            *reads, nullptr, buffers.size());
     }
     pipeline =
         std::make_unique<ReadPipeline>(std::move(batch_plan), buffers, *driver);

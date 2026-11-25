@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <liburing.h>
+#include <poll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
@@ -26,7 +27,14 @@
 namespace {
 struct Observation {
     std::atomic<size_t> init_calls{0}, init_ok{0}, exits{0}, eventfds{0};
+    std::atomic<size_t> submit_calls{0}, submit_ok{0}, poll_calls{0};
     size_t fail_init_at{0}, fail_eventfd_at{0};
+    std::atomic<size_t> fail_submit_at{0};
+    std::atomic<int> fail_submit_rc{0};
+    std::atomic<size_t> fail_poll_at{0};
+    std::atomic<int> fail_poll_errno{0};
+    std::atomic<short> inject_ring_revents{0};
+    std::atomic<short> inject_signal_revents{0};
 };
 std::atomic<Observation*> observed{nullptr};
 struct Observe {
@@ -37,6 +45,8 @@ struct Observe {
 
 extern "C" int __real_io_uring_queue_init(unsigned, io_uring*, unsigned);
 extern "C" void __real_io_uring_queue_exit(io_uring*);
+extern "C" int __real_io_uring_submit(io_uring*);
+extern "C" int __real_poll(pollfd*, nfds_t, int);
 extern "C" int __real_eventfd(unsigned, int);
 
 extern "C" int __wrap_io_uring_queue_init(unsigned depth, io_uring* ring,
@@ -51,6 +61,47 @@ extern "C" int __wrap_io_uring_queue_init(unsigned depth, io_uring* ring,
 extern "C" void __wrap_io_uring_queue_exit(io_uring* ring) {
     __real_io_uring_queue_exit(ring);
     if (auto* observation = observed.load()) ++observation->exits;
+}
+extern "C" int __wrap_io_uring_submit(io_uring* ring) {
+    if (auto* observation = observed.load()) {
+        const size_t call = ++observation->submit_calls;
+        const size_t target = observation->fail_submit_at.load();
+        if (target != 0 && call >= target) {
+            return observation->fail_submit_rc.load();
+        }
+        const int rc = __real_io_uring_submit(ring);
+        if (rc > 0) observation->submit_ok.fetch_add(size_t(rc));
+        return rc;
+    }
+    return __real_io_uring_submit(ring);
+}
+extern "C" int __wrap_poll(pollfd* fds, nfds_t nfds, int timeout) {
+    if (auto* observation = observed.load()) {
+        if (nfds == 2) {
+            const size_t call = ++observation->poll_calls;
+            const size_t target = observation->fail_poll_at.load();
+            if (target != 0 && call >= target) {
+                const int err = observation->fail_poll_errno.load();
+                if (err != 0) {
+                    errno = err;
+                    return -1;
+                }
+                const short ring_ev = observation->inject_ring_revents.load();
+                const short sig_ev = observation->inject_signal_revents.load();
+                if (ring_ev != 0 && fds[0].fd >= 0) {
+                    fds[0].revents = ring_ev;
+                    fds[1].revents = 0;
+                    return 1;
+                }
+                if (sig_ev != 0 && fds[1].fd >= 0) {
+                    fds[0].revents = 0;
+                    fds[1].revents = sig_ev;
+                    return 1;
+                }
+            }
+        }
+    }
+    return __real_poll(fds, nfds, timeout);
 }
 extern "C" int __wrap_eventfd(unsigned initial, int flags) {
     auto* observation = observed.load();
@@ -213,9 +264,28 @@ bool KernelUringAvailable() {
     io_uring ring{};
     if (__real_io_uring_queue_init(2, &ring, 0) < 0) return false;
     io_uring_probe* probe = io_uring_get_probe_ring(&ring);
-    const bool supported =
+    bool supported =
         probe && io_uring_opcode_supported(probe, IORING_OP_READ) != 0;
     if (probe) io_uring_free_probe(probe);
+    if (supported) {
+        auto* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) {
+            supported = false;
+        } else {
+            io_uring_prep_nop(sqe);
+            int enter_rc;
+            do {
+                enter_rc = io_uring_submit_and_wait(&ring, 1);
+            } while (enter_rc == -EINTR);
+            io_uring_cqe* cqe = nullptr;
+            if (enter_rc < 0 || io_uring_peek_cqe(&ring, &cqe) != 0) {
+                supported = false;
+            } else {
+                supported = cqe->res >= 0;
+                io_uring_cqe_seen(&ring, cqe);
+            }
+        }
+    }
     __real_io_uring_queue_exit(&ring);
     return supported;
 }
@@ -422,6 +492,199 @@ TEST(SsdUringReadExecutorContract,
         EXPECT_EQ(partial.init_ok.load(), partial.exits.load());
         EXPECT_GE(partial.init_ok.load(), 1u);
         EXPECT_EQ(OpenFdCount(), before);
+    }
+}
+
+struct PipeReadSource final : ReadSource {
+    int rfd{-1};
+    int wfd{-1};
+    PipeReadSource() {
+        int fds[2] = {-1, -1};
+        if (pipe2(fds, O_CLOEXEC) != 0) throw std::runtime_error("pipe2");
+        rfd = fds[0];
+        wfd = fds[1];
+    }
+    ~PipeReadSource() override {
+        if (rfd >= 0) close(rfd);
+        if (wfd >= 0) close(wfd);
+    }
+    uint64_t file_bytes() const noexcept override { return 4096; }
+    ReadResult ReadAt(std::span<std::byte>, uint64_t) noexcept override {
+        return {0, Error::kNotSupported, 0};
+    }
+    std::optional<int> native_read_fd() const noexcept override { return rfd; }
+    void WriteBytes(std::byte fill, size_t n) const {
+        std::vector<std::byte> buf(n, fill);
+        size_t off = 0;
+        while (off < n) {
+            const ssize_t written = ::write(wfd, buf.data() + off, n - off);
+            if (written < 0 && errno == EINTR) continue;
+            ASSERT_GT(written, 0);
+            off += size_t(written);
+        }
+    }
+};
+
+template <typename Predicate>
+bool WaitUntil(Predicate&& pred, std::chrono::milliseconds timeout = 5000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) return true;
+        std::this_thread::sleep_for(1ms);
+    }
+    return pred();
+}
+
+TEST(SsdUringReadExecutorContract,
+     PermanentSubmitFailureFailsUnsubmittedAndDrainsSubmittedSafely) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
+
+    // Case 1: permanent io_uring_submit error with no prior submitted ops.
+    {
+        File file(91);
+        auto source = OpenSource(file);
+        ASSERT_TRUE(source);
+        Arena arena(1);
+        Observation observation;
+        Observe scope(observation);
+        auto reader = UringReadExecutor::Create(1, 4);
+        ASSERT_TRUE(reader);
+        observation.fail_submit_rc.store(-EACCES);
+        observation.fail_submit_at.store(1);
+
+        auto done = std::make_shared<std::promise<ReadResult>>();
+        auto future = done->get_future();
+        ASSERT_TRUE(reader->WaitSubmit(
+            source, *source->native_read_fd(), {arena.data, kSlot}, 0,
+            [done](ReadResult r) { done->set_value(r); }));
+        ASSERT_EQ(future.wait_for(5s), std::future_status::ready);
+        const auto res = future.get();
+        EXPECT_EQ(res.error, Error::kIoError);
+        EXPECT_EQ(res.sys_errno, EACCES);
+        EXPECT_FALSE(reader->healthy());
+        reader->Shutdown();
+        reader.reset();
+        EXPECT_EQ(observation.exits.load(), 1u);
+    }
+
+    // Case 2: one op is actively in flight in the kernel when a second op hits
+    // a permanent io_uring_submit failure. The unsubmitted op must fail
+    // immediately while the already-submitted op stays pinned (and the ring
+    // stays alive) until its real CQE arrives, preventing kernel DMA UAF.
+    {
+        auto pipe_source = std::make_shared<PipeReadSource>();
+        File file(97);
+        auto file_source = OpenSource(file);
+        ASSERT_TRUE(file_source);
+        Arena arena(2);
+        Observation observation;
+        Observe scope(observation);
+        auto reader = UringReadExecutor::Create(1, 4);
+        ASSERT_TRUE(reader);
+
+        auto op1_done = std::make_shared<std::promise<ReadResult>>();
+        auto op1_future = op1_done->get_future();
+        ASSERT_TRUE(reader->WaitSubmit(
+            pipe_source, *pipe_source->native_read_fd(), {arena.data, 16}, 0,
+            [op1_done](ReadResult r) { op1_done->set_value(r); }));
+        ASSERT_TRUE(
+            WaitUntil([&] { return observation.submit_ok.load() >= 1u; }));
+        // If kernel immediately rejected pipe read at offset 0, skip only this
+        // sub-case cleanly rather than asserting on a completed op.
+        if (op1_future.wait_for(20ms) == std::future_status::timeout) {
+            observation.fail_submit_rc.store(-EACCES);
+            observation.fail_submit_at.store(observation.submit_calls.load() +
+                                             1);
+
+            auto op2_done = std::make_shared<std::promise<ReadResult>>();
+            auto op2_future = op2_done->get_future();
+            ASSERT_TRUE(reader->WaitSubmit(
+                file_source, *file_source->native_read_fd(),
+                {arena.data + kSlot, kSlot}, 0,
+                [op2_done](ReadResult r) { op2_done->set_value(r); }));
+            ASSERT_EQ(op2_future.wait_for(5s), std::future_status::ready);
+            const auto res2 = op2_future.get();
+            EXPECT_EQ(res2.error, Error::kIoError);
+            EXPECT_EQ(res2.sys_errno, EACCES);
+            EXPECT_FALSE(reader->healthy());
+            // The in-flight op1 must NOT be prematurely failed or its ring
+            // torn down while the kernel still holds op1's buffer.
+            EXPECT_EQ(op1_future.wait_for(50ms), std::future_status::timeout);
+            EXPECT_EQ(observation.exits.load(), 0u);
+
+            pipe_source->WriteBytes(std::byte{0x42}, 16);
+            ASSERT_EQ(op1_future.wait_for(5s), std::future_status::ready);
+            const auto res1 = op1_future.get();
+            EXPECT_EQ(res1.error, Error::kOk);
+            EXPECT_EQ(res1.bytes, 16u);
+            for (size_t i = 0; i < 16; ++i) {
+                EXPECT_EQ(arena.data[i], std::byte{0x42});
+            }
+        } else {
+            pipe_source->WriteBytes(std::byte{0x42}, 16);
+        }
+        reader->Shutdown();
+        reader.reset();
+        EXPECT_EQ(observation.exits.load(), 1u);
+    }
+}
+
+TEST(SsdUringReadExecutorContract,
+     PollErrorsDrainInFlightSubmittedOpsWithoutRingTeardownUaf) {
+    if (!KernelUringAvailable()) GTEST_SKIP() << "io_uring unavailable";
+    enum class PollFault { kErrnoEio, kEventfdErr, kRingFdErr };
+    for (PollFault fault : {PollFault::kErrnoEio, PollFault::kEventfdErr,
+                            PollFault::kRingFdErr}) {
+        auto pipe_source = std::make_shared<PipeReadSource>();
+        Arena arena(1);
+        Observation observation;
+        Observe scope(observation);
+        auto reader = UringReadExecutor::Create(1, 4);
+        ASSERT_TRUE(reader);
+
+        auto op_done = std::make_shared<std::promise<ReadResult>>();
+        auto op_future = op_done->get_future();
+        ASSERT_TRUE(reader->WaitSubmit(
+            pipe_source, *pipe_source->native_read_fd(), {arena.data, 16}, 0,
+            [op_done](ReadResult r) { op_done->set_value(r); }));
+        ASSERT_TRUE(
+            WaitUntil([&] { return observation.submit_ok.load() >= 1u; }));
+        if (op_future.wait_for(20ms) != std::future_status::timeout) {
+            pipe_source->WriteBytes(std::byte{0x5A}, 16);
+            reader->Shutdown();
+            reader.reset();
+            continue;
+        }
+
+        // Wait until worker enters poll() for the in-flight op, then inject
+        // the poll error on the next poll call and wake via Shutdown/eventfd.
+        if (fault == PollFault::kErrnoEio) {
+            observation.fail_poll_errno.store(EIO);
+        } else if (fault == PollFault::kEventfdErr) {
+            observation.inject_signal_revents.store(POLLERR);
+        } else {
+            observation.inject_ring_revents.store(POLLERR);
+        }
+        observation.fail_poll_at.store(observation.poll_calls.load() + 1);
+        // Submit a second op (or let 100ms poll timeout expire) so the worker
+        // invokes poll() and hits the injected fault.
+        ASSERT_TRUE(WaitUntil([&] { return !reader->healthy(); }));
+        // The ring must NOT have exited and op must NOT have completed before
+        // the kernel finishes writing into arena.data.
+        EXPECT_EQ(op_future.wait_for(50ms), std::future_status::timeout);
+        EXPECT_EQ(observation.exits.load(), 0u);
+
+        pipe_source->WriteBytes(std::byte{0x5A}, 16);
+        ASSERT_EQ(op_future.wait_for(5s), std::future_status::ready);
+        const auto res = op_future.get();
+        EXPECT_EQ(res.error, Error::kOk);
+        EXPECT_EQ(res.bytes, 16u);
+        for (size_t i = 0; i < 16; ++i) {
+            EXPECT_EQ(arena.data[i], std::byte{0x5A});
+        }
+        reader->Shutdown();
+        reader.reset();
+        EXPECT_EQ(observation.exits.load(), 1u);
     }
 }
 
