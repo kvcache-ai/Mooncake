@@ -21,8 +21,10 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <unordered_set>
+#include <sys/types.h>
 #include <cn_api.h>
 
 #include "tent/platform/mlu.h"
@@ -41,6 +43,7 @@ struct ImportEntry {
     uint64_t base = 0;
     uint64_t size = 0;
     std::shared_ptr<void> mapping;
+    pid_t pid = 0;  // Zero for legacy attributes without exporter identity.
 };
 }  // namespace mlu_detail
 
@@ -144,6 +147,8 @@ class MluTransport : public Transport {
     Status drainBuffer(uint64_t addr, size_t size);
     std::shared_ptr<void> relocate(SegmentID target_id, uint64_t &addr,
                                    size_t length);
+    bool watchExporterLocked(pid_t pid);
+    void watchExporters();
 
     std::mutex mutex_;
     // D2H/D2D on the source context, H2D on the destination context.
@@ -152,6 +157,12 @@ class MluTransport : public Transport {
     std::map<SegmentID, std::vector<mlu_detail::ImportEntry>> imports_;
     std::map<SegmentID, uint64_t> high_water_;
     std::string machine_id_;
+    std::string pid_namespace_;
+    // Guarded by mutex_. Start watching on the first cross-process import.
+    std::map<pid_t, int> exporters_;
+    bool stop_watcher_ = false;
+    int watcher_wakeup_fd_ = -1;
+    std::thread watcher_;
     bool installed_ = false;
     bool ipc_enabled_ = true;
     MluPlatform *platform_ = nullptr;

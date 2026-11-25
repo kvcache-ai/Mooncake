@@ -18,6 +18,9 @@
 #include <cnrt.h>
 #include <numa.h>
 #include <sched.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <cerrno>
 
 #include <algorithm>
 #include <cstdint>
@@ -229,6 +232,37 @@ class MluTransportTestPeer {
                !transport.high_water_.count(target_id);
     }
 
+    static bool mutexAvailable(MluTransport &transport) {
+        std::unique_lock<std::mutex> lock(transport.mutex_, std::try_to_lock);
+        return lock.owns_lock();
+    }
+
+    static bool watch(MluTransport &transport, pid_t pid) {
+        std::lock_guard<std::mutex> lock(transport.mutex_);
+        return transport.watchExporterLocked(pid);
+    }
+
+    static size_t exporterCount(MluTransport &transport) {
+        std::lock_guard<std::mutex> lock(transport.mutex_);
+        return transport.exporters_.size();
+    }
+
+    static size_t importCount(MluTransport &transport, SegmentID id) {
+        std::lock_guard<std::mutex> lock(transport.mutex_);
+        auto it = transport.imports_.find(id);
+        return it == transport.imports_.end() ? 0 : it->second.size();
+    }
+
+    static bool watcherStopped(MluTransport &transport) {
+        return !transport.watcher_.joinable() &&
+               transport.watcher_wakeup_fd_ == -1 &&
+               exporterCount(transport) == 0;
+    }
+
+    static const std::string &pidNamespace(MluTransport &transport) {
+        return transport.pid_namespace_;
+    }
+
     static void seedImportCache(MluTransport &transport, SegmentID target_id,
                                 std::vector<mlu_detail::ImportEntry> entries,
                                 uint64_t generation) {
@@ -399,6 +433,139 @@ TEST_P(MluImportCleanupTest, DestroysCachedMappingsOutsideTransportLock) {
 INSTANTIATE_TEST_SUITE_P(CloseAndUninstall, MluImportCleanupTest,
                          ::testing::Bool());
 
+// The child only uses async-signal-safe calls: other tests may have already
+// started SDK threads. Keep it alive until explicitly killed, and always reap
+// it.
+class ExporterProcess {
+   public:
+    ExporterProcess() {
+        pid = fork();
+        if (pid == 0) {
+            for (;;) pause();
+        }
+    }
+    ~ExporterProcess() {
+        if (pid <= 0) return;
+        kill(pid, SIGKILL);
+        while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
+        }
+    }
+    void exitWithoutReaping() { ASSERT_EQ(kill(pid, SIGKILL), 0); }
+    pid_t pid;
+};
+
+template <typename Predicate>
+bool waitForWatcher(Predicate ready) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+        if (ready()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return ready();
+}
+
+TEST(MluExitWatcherTest, LegacyAndSelfDoNotStartWatcher) {
+    MluTransport transport;
+    EXPECT_TRUE(MluTransportTestPeer::watch(transport, 0));
+    EXPECT_TRUE(MluTransportTestPeer::watch(transport, getpid()));
+    EXPECT_TRUE(MluTransportTestPeer::watcherStopped(transport));
+}
+
+TEST(MluExitWatcherTest,
+     ExitEvictsOnlyExporterMappingsAndPreservesTaskReference) {
+    ExporterProcess exporter;
+    ASSERT_GT(exporter.pid, 0);
+    std::atomic<int> released{0};
+    MluTransport transport;
+    ASSERT_TRUE(MluTransportTestPeer::watch(transport, exporter.pid));
+    if (!MluTransportTestPeer::exporterCount(transport))
+        GTEST_SKIP() << "pidfd monitoring unavailable";
+    // Repeated imports from one exporter share a single watcher entry.
+    ASSERT_TRUE(MluTransportTestPeer::watch(transport, exporter.pid));
+    EXPECT_EQ(MluTransportTestPeer::exporterCount(transport), 1);
+    auto mapping = [&] {
+        return std::shared_ptr<void>(new int(0), [&](void *ptr) {
+            // Destruction must run outside the transport lock.
+            auto check = std::async(std::launch::async, [&] {
+                return waitForWatcher([&] {
+                    return MluTransportTestPeer::mutexAvailable(transport);
+                });
+            });
+            EXPECT_TRUE(check.get());
+            delete static_cast<int *>(ptr);
+            ++released;
+        });
+    };
+    MluTask pending;
+    pending.imported_target = mapping();
+    MluTransportTestPeer::seedImportCache(
+        transport, 42,
+        {{"pending", 0x1000, kChunk, pending.imported_target, exporter.pid},
+         {"legacy", 0x20000, kChunk, std::make_shared<int>(0), 0},
+         {"self", 0x30000, kChunk, std::make_shared<int>(0), getpid()}},
+        1);
+    MluTransportTestPeer::seedImportCache(
+        transport, 43, {{"idle", 0x1000, kChunk, mapping(), exporter.pid}}, 1);
+    exporter.exitWithoutReaping();
+    ASSERT_TRUE(waitForWatcher([&] { return released.load() == 1; }));
+    EXPECT_EQ(MluTransportTestPeer::importCount(transport, 42), 2);
+    EXPECT_EQ(MluTransportTestPeer::importCount(transport, 43), 0);
+    EXPECT_NE(pending.imported_target, nullptr);
+    // Old metadata must not reinstall a watcher for a zombie exporter.
+    EXPECT_FALSE(MluTransportTestPeer::watch(transport, exporter.pid));
+    pending.imported_target.reset();
+    EXPECT_EQ(released.load(), 2);
+}
+
+TEST(MluExitWatcherTest, UninstallWakesWatcherWhileExporterIsAlive) {
+    ExporterProcess exporter;
+    ASSERT_GT(exporter.pid, 0);
+    MluTransport transport;
+    ASSERT_TRUE(MluTransportTestPeer::watch(transport, exporter.pid));
+    if (!MluTransportTestPeer::exporterCount(transport))
+        GTEST_SKIP() << "pidfd monitoring unavailable";
+    std::weak_ptr<void> imported;
+    {
+        auto mapping = std::make_shared<int>(0);
+        imported = mapping;
+        MluTransportTestPeer::seedImportCache(
+            transport, 42, {{"test", 0x1000, kChunk, mapping, exporter.pid}},
+            1);
+    }
+    ASSERT_TRUE(transport.uninstall().ok());
+    EXPECT_TRUE(imported.expired());
+    EXPECT_TRUE(MluTransportTestPeer::watcherStopped(transport));
+    EXPECT_EQ(kill(exporter.pid, 0), 0);
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
+class MluTerminalMappingTest
+    : public ::testing::TestWithParam<TransferStatusEnum> {};
+
+TEST_P(MluTerminalMappingTest, PollReleasesMappingBeforeFreeSubBatch) {
+    MluTransport transport;
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    auto *mlu_batch = static_cast<MluSubBatch *>(batch);
+    mlu_batch->task_list.emplace_back();
+    auto &task = mlu_batch->task_list.back();
+    task.imported_target = std::make_shared<int>(0);
+    std::weak_ptr<void> imported = task.imported_target;
+    task.status_word = GetParam();
+    task.transferred_bytes = GetParam() == COMPLETED ? kChunk : 0;
+    mlu_batch->published_size = 1;
+    TransferStatus status{};
+    EXPECT_TRUE(transport.getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, GetParam());
+    EXPECT_TRUE(imported.expired());
+    EXPECT_TRUE(transport.getTransferStatus(batch, 0, status).ok());
+    EXPECT_TRUE(transport.freeSubBatch(batch).ok());
+}
+
+INSTANTIATE_TEST_SUITE_P(CompletedAndFailed, MluTerminalMappingTest,
+                         ::testing::Values(COMPLETED, FAILED));
+
 TEST_F(MluTransportTest, DroppedIpcAttributeIsNotReturnedByLaterPrepare) {
     // Cache reconciliation is independent of device peer accessibility.
     std::vector<uint8_t> source(kChunk);
@@ -513,7 +680,13 @@ TEST_F(MluTransportTest, RejectsLegacyAndMalformedIpcAttributesBeforeMapping) {
          {"4096:65536:101:0", "2|4096|65536|101|0000:11:00.0", "4096|65536|101",
           "4096|65536|101|", "4096|65536|0|0000:11:00.0",
           "4096|0|101|0000:11:00.0", "invalid|65536|101|0000:11:00.0",
-          "4096|65536|101|0000:11:00.0|extra"}) {
+          "4096|65536|101|0000:11:00.0|extra",
+          "4096|65536|101|0000:11:00.0|0|pid:[1]",
+          "4096|65536|101|0000:11:00.0|-1|pid:[1]",
+          "4096|65536|101|0000:11:00.0|abc|pid:[1]",
+          "4096|65536|101|0000:11:00.0|999999999999999999999|pid:[1]",
+          "4096|65536|101|0000:11:00.0|1|",
+          "4096|65536|101|0000:11:00.0|1|pid:[1]|extra"}) {
         SCOPED_TRACE(text);
         auto entry = ipcBuffer(0x1000, kChunk, 101);
         entry.transport_attrs[MLU] = text;
@@ -522,6 +695,28 @@ TEST_F(MluTransportTest, RejectsLegacyAndMalformedIpcAttributesBeforeMapping) {
         EXPECT_FALSE(transport_.prepareRemoteBuffer(
             target_id, segment, entry, source.data(), Request::WRITE));
     }
+    EXPECT_EQ(ipc_map_calls.load(), maps_before);
+}
+
+TEST_F(MluTransportTest, ProcessIdentityRequiresMatchingPidNamespace) {
+    const auto &ns = MluTransportTestPeer::pidNamespace(transport_);
+    ASSERT_FALSE(ns.empty());
+    std::vector<uint8_t> source(kChunk);
+    auto entry = ipcBuffer(0x1000, kChunk, 101);
+    entry.transport_attrs[MLU] += '|' + std::to_string(getpid()) + '|' + ns;
+    MluTransportTestPeer::seedImportCache(
+        transport_, 42,
+        {{entry.transport_attrs.at(MLU), entry.addr, entry.length,
+          std::make_shared<int>(0), getpid()}},
+        1);
+    auto snapshot = ipcSnapshot(1, {entry});
+    EXPECT_TRUE(transport_.prepareRemoteBuffer(42, snapshot, entry,
+                                               source.data(), Request::WRITE));
+    entry.transport_attrs[MLU] += "-different";
+    snapshot = ipcSnapshot(2, {entry});
+    const int maps_before = ipc_map_calls;
+    EXPECT_FALSE(transport_.prepareRemoteBuffer(42, snapshot, entry,
+                                                source.data(), Request::WRITE));
     EXPECT_EQ(ipc_map_calls.load(), maps_before);
 }
 
@@ -639,6 +834,48 @@ class QueueGate {
     std::condition_variable cv_;
     bool released_ = false;
 };
+
+TEST_F(MluTransportTest, RetiredMappingLivesUntilPendingCopyCompletes) {
+    uint8_t *dev = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kBufSize));
+    RegisteredHost host(transport_, kBufSize);
+    ASSERT_TRUE(host.status.ok());
+    auto request = makeRequest(Request::WRITE, host.bytes.data(),
+                               reinterpret_cast<uint64_t>(dev), kBufSize);
+    auto queue = queueFor(request);
+    std::fill(host.bytes.begin(), host.bytes.end(), 0x6D);
+    std::weak_ptr<void> imported;
+    {
+        auto mapping = std::shared_ptr<void>(dev, [](void *) {});
+        imported = mapping;
+        MluTransportTestPeer::seedImportCache(
+            transport_, 42, {{"test", 0x1000, kBufSize, mapping}}, 1);
+    }
+    request.target_id = 42;
+    request.target_offset = 0x1000;
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
+    {
+        QueueGate gate(queue);
+        ASSERT_TRUE(transport_.submitTransferTasks(batch, {request}).ok());
+        transport_.closeRemoteSegment(42);
+        TransferStatus status{};
+        ASSERT_TRUE(transport_.getTransferStatus(batch, 0, status).ok());
+        EXPECT_EQ(status.s, PENDING);
+        EXPECT_FALSE(imported.expired());
+        gate.release();
+        EXPECT_EQ(wait(batch).s, COMPLETED);
+        // Polling completion releases the task's final reference even though
+        // the sub-batch has not yet been freed.
+        EXPECT_TRUE(imported.expired());
+    }
+    EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+    std::vector<uint8_t> actual(kBufSize);
+    EXPECT_TRUE(loader_->copy(actual.data(), dev, kBufSize).ok());
+    EXPECT_TRUE(std::equal(actual.begin(), actual.end(), host.bytes.begin(),
+                           host.bytes.end()));
+    EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
+}
 
 // Delay TCP publication while an earlier MLU task remains pending. A poller
 // must not inspect the batch until this submit has published all of its state.

@@ -16,8 +16,13 @@
 
 #include <glog/logging.h>
 #include <cnrt.h>
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <sstream>
 #include <unordered_set>
@@ -30,36 +35,67 @@
 namespace mooncake {
 namespace tent {
 namespace {
+std::string pidNamespace() {
+    char buf[64];
+    const auto size = readlink("/proc/self/ns/pid", buf, sizeof(buf));
+    return size > 0 && size < static_cast<ssize_t>(sizeof(buf))
+               ? std::string(buf, size)
+               : std::string();
+}
+
+void wakeExitWatcher(int fd) {
+    const uint64_t one = 1;
+    ssize_t result;
+    do {
+        result = write(fd, &one, sizeof(one));
+    } while (result < 0 && errno == EINTR);
+    if (result < 0 && errno != EAGAIN)
+        PLOG(WARNING) << "MluTransport: cannot wake exit watcher";
+}
+
 struct IpcAttr {
     uint64_t base = 0;
     uint64_t size = 0;
     uintptr_t handle = 0;
     std::string pci_bus_id;
+    pid_t pid = 0;
+    std::string pid_namespace;
 };
 
 std::string formatIpcAttr(const IpcAttr &attr) {
     // Use '|' because PCI bus IDs contain ':'.
     return std::to_string(attr.base) + '|' + std::to_string(attr.size) + '|' +
-           std::to_string(attr.handle) + '|' + attr.pci_bus_id;
+           std::to_string(attr.handle) + '|' + attr.pci_bus_id + '|' +
+           std::to_string(attr.pid) + '|' + attr.pid_namespace;
 }
 
 bool parseIpcAttr(const std::string &text, IpcAttr &attr) {
     // Legacy ordinal-only attributes cannot safely identify a remapped
     // device. Reject them and let the planner select another route.
-    std::array<std::string_view, 4> fields;
+    std::array<std::string_view, 6> fields;
     size_t start = 0;
+    size_t count = 0;
     for (size_t i = 0; i < fields.size(); ++i) {
         const size_t end = text.find('|', start);
-        if (i + 1 < fields.size() && end == std::string::npos) return false;
         if (i + 1 == fields.size() && end != std::string::npos) return false;
         fields[i] = std::string_view(text).substr(start, end - start);
+        ++count;
+        if (end == std::string::npos) break;
         start = end + 1;
     }
+    // Older exporters have no process identity; retain their existing
+    // segment-based cleanup without trying to watch an unrelated PID.
+    if (count != 4 && count != 6) return false;
     auto number = [](std::string_view field, auto &value) {
         auto [end, ec] =
             std::from_chars(field.data(), field.data() + field.size(), value);
         return ec == std::errc() && end == field.data() + field.size();
     };
+    if (count == 6) {
+        if (!number(fields[4], attr.pid) || attr.pid <= 0 || fields[5].empty())
+            return false;
+        attr.pid_namespace = std::string(fields[5]);
+    }
     attr.pci_bus_id = std::string(fields[3]);
     return number(fields[0], attr.base) && number(fields[1], attr.size) &&
            number(fields[2], attr.handle) && attr.size && attr.handle &&
@@ -216,6 +252,8 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
     }
     metadata_ = std::move(metadata);
     ipc_enabled_ = !(conf && conf->get("transports/mlu/disable_ipc", false));
+    pid_namespace_ = pidNamespace();
+    stop_watcher_ = false;
     if (metadata_) {
         auto local = metadata_->segmentManager().getLocal();
         if (local) machine_id_ = local->machine_id;
@@ -240,8 +278,22 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
 Status MluTransport::uninstall() {
     // Declared before the lock so cached mappings are unmapped after unlock.
     decltype(imports_) dropped;
-    std::lock_guard<std::mutex> lock(mutex_);
-    CHECK_STATUS(quiesceLocked());
+    std::unique_lock<std::mutex> lock(mutex_);
+    auto drained = quiesceLocked();
+    stop_watcher_ = true;
+    // The watcher also takes mutex_: wake and join it outside the lock,
+    // even if draining failed, before any thread members can be destroyed.
+    lock.unlock();
+    if (watcher_.joinable()) {
+        wakeExitWatcher(watcher_wakeup_fd_);
+        watcher_.join();
+    }
+    lock.lock();
+    for (auto &[pid, pidfd] : exporters_) close(pidfd);
+    exporters_.clear();
+    if (watcher_wakeup_fd_ >= 0) close(watcher_wakeup_fd_);
+    watcher_wakeup_fd_ = -1;
+    CHECK_STATUS(drained);
     dropped.swap(imports_);
     high_water_.clear();
     queues_.clear();
@@ -250,6 +302,7 @@ Status MluTransport::uninstall() {
     installed_ = false;
     ipc_enabled_ = false;
     machine_id_.clear();
+    pid_namespace_.clear();
     return Status::OK();
 }
 
@@ -281,6 +334,7 @@ Status MluTransport::drainTask(MluTask &task) {
     if (task.drain_on_error) CHECK_STATUS(task.queue->synchronize());
     task.transferred_bytes = task.drain_on_error ? 0 : task.request.length;
     task.status_word = task.drain_on_error ? FAILED : COMPLETED;
+    task.imported_target.reset();
     return Status::OK();
 }
 
@@ -338,7 +392,7 @@ Status MluTransport::freeSubBatch(SubBatchRef &batch) {
 Status MluTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request> &request_list) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!installed_)
+    if (!installed_ || stop_watcher_)
         return Status::InvalidArgument("MLU transport is not installed");
     auto mlu_batch = dynamic_cast<MluSubBatch *>(batch);
     if (!mlu_batch)
@@ -370,6 +424,7 @@ Status MluTransport::submitTransferTasks(
         task.status_word = TransferStatusEnum::PENDING;
         task.transferred_bytes = 0;
         startTransfer(&task);
+        if (task.status_word.load() != PENDING) task.imported_target.reset();
     }
     mlu_batch->published_size.store(mlu_batch->task_list.size());
     mlu_batch->notifyProgress();
@@ -613,6 +668,9 @@ Status MluTransport::enqueueCopy(MluTask &task,
 
 Status MluTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                        TransferStatus &status) {
+    // A completed task must not pin a retired import until freeSubBatch().
+    // The last reference may unmap it, so release outside mutex_.
+    std::shared_ptr<void> dropped;
     status = TransferStatus{PENDING, 0};
     // Submission holds mutex_ until all task fields and notifiers are ready.
     // Polling a submission in progress must neither block nor inspect them.
@@ -644,6 +702,8 @@ Status MluTransport::getTransferStatus(SubBatchRef batch, int task_id,
             return task.queue->error;
         }
     }
+    if (task.status_word.load() != PENDING)
+        dropped = std::move(task.imported_target);
     status =
         TransferStatus{task.status_word.load(), task.transferred_bytes.load()};
     return Status::OK();
@@ -717,8 +777,9 @@ Status MluTransport::addMemoryBuffer(BufferDesc &desc,
         desc.transports.push_back(TransportType::MLU);
     }
     desc.transport_attrs.erase(MLU);
-    if (ipc_enabled_ && options.perm == kGlobalReadWrite &&
-        location.type() == "mlu" && desc.length) {
+    if (ipc_enabled_ && !pid_namespace_.empty() &&
+        options.perm == kGlobalReadWrite && location.type() == "mlu" &&
+        desc.length) {
         const auto address = static_cast<CNaddr>(desc.addr);
         CNcontext context = nullptr;
         int device = -1;
@@ -749,7 +810,7 @@ Status MluTransport::addMemoryBuffer(BufferDesc &desc,
             if (status.ok() && handle) {
                 desc.transport_attrs[MLU] = formatIpcAttr(
                     {base, size, reinterpret_cast<uintptr_t>(handle),
-                     pci_bus_id});
+                     pci_bus_id, getpid(), pid_namespace_});
             }
         }
         if (!status.ok()) {
@@ -805,6 +866,7 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
     const auto &attr_text = entry.transport_attrs.at(MLU);
     IpcAttr attr;
     if (!parseIpcAttr(attr_text, attr) ||
+        (attr.pid && attr.pid_namespace != pid_namespace_) ||
         !rangeWithin(entry.addr, entry.length, attr.base, attr.size))
         return false;
 
@@ -831,6 +893,7 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
     // call into the driver and must not stall submission or status polling.
     std::vector<std::shared_ptr<void>> dropped;
     std::lock_guard<std::mutex> lock(mutex_);
+    if (stop_watcher_) return false;
     auto &entries = imports_[target_id];
     auto &watermark = high_water_[target_id];
     if (generation < watermark) {
@@ -895,10 +958,110 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
         }
         logError(status);
     });
-    entries.push_back({attr_text, attr.base, attr.size, std::move(mapping)});
+    if (!watchExporterLocked(attr.pid)) {
+        dropped.push_back(std::move(mapping));
+        return false;
+    }
+    entries.push_back(
+        {attr_text, attr.base, attr.size, std::move(mapping), attr.pid});
     LOG(INFO) << "MLU IPC mapped peer buffer " << (void *)attr.base << " of "
               << segment.name << " at " << mapped << " on mlu:" << device;
     return true;
+}
+
+bool MluTransport::watchExporterLocked(pid_t pid) {
+    if (!pid || pid == getpid() || exporters_.count(pid)) return true;
+#ifdef SYS_pidfd_open
+    if (watcher_wakeup_fd_ < 0) {
+        watcher_wakeup_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (watcher_wakeup_fd_ < 0) {
+            PLOG(WARNING) << "MluTransport: cannot watch peer processes; "
+                             "mappings remain until their segment is closed";
+            return true;
+        }
+    }
+    const int pidfd = static_cast<int>(syscall(SYS_pidfd_open, pid, 0));
+    if (pidfd < 0) {
+        if (errno == ESRCH) return false;
+        PLOG_EVERY_N(WARNING, 1000)
+            << "MluTransport: cannot watch process " << pid
+            << "; its mappings remain until its segment is closed";
+        return true;
+    }
+    // pidfd_open also succeeds for a zombie. Do not cache its mapping again
+    // if an old metadata snapshot is used after the watcher handled its exit.
+    pollfd fd{pidfd, POLLIN, 0};
+    if (poll(&fd, 1, 0) > 0 && fd.revents) {
+        close(pidfd);
+        return false;
+    }
+    exporters_.emplace(pid, pidfd);
+    if (!watcher_.joinable())
+        watcher_ = std::thread(&MluTransport::watchExporters, this);
+    wakeExitWatcher(watcher_wakeup_fd_);
+#endif
+    return true;
+}
+
+void MluTransport::watchExporters() {
+    std::vector<pollfd> fds;
+    std::vector<pid_t> pids;
+    for (;;) {
+        fds.assign(1, pollfd{watcher_wakeup_fd_, POLLIN, 0});
+        pids.clear();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stop_watcher_) return;
+            for (auto &[pid, pidfd] : exporters_) {
+                fds.push_back(pollfd{pidfd, POLLIN, 0});
+                pids.push_back(pid);
+            }
+        }
+        if (poll(fds.data(), fds.size(), -1) < 0) {
+            if (errno == EINTR) continue;
+            PLOG(ERROR) << "MluTransport: exit watcher stopped; mappings "
+                           "remain until their segment is closed";
+            return;
+        }
+        if (fds[0].revents) {
+            uint64_t count;
+            if (read(watcher_wakeup_fd_, &count, sizeof(count)) < 0 &&
+                errno != EAGAIN && errno != EINTR)
+                PLOG(WARNING) << "MluTransport: exit watcher wake-up";
+        }
+        // Drop only the cache's reference. Pending tasks retain the mapping
+        // until their notifier (or queue drain on error) proves DMA is over.
+        std::vector<mlu_detail::ImportEntry> dropped;
+        std::vector<std::pair<size_t, size_t>> exited;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stop_watcher_) return;
+            for (size_t i = 1; i < fds.size(); ++i) {
+                if (!fds[i].revents) continue;
+                const pid_t pid = pids[i - 1];
+                exporters_.erase(pid);
+                const size_t before = dropped.size();
+                for (auto &[target_id, entries] : imports_) {
+                    for (auto entry = entries.begin();
+                         entry != entries.end();) {
+                        if (entry->pid != pid) {
+                            ++entry;
+                            continue;
+                        }
+                        dropped.push_back(std::move(*entry));
+                        entry = entries.erase(entry);
+                    }
+                }
+                exited.emplace_back(i, dropped.size() - before);
+            }
+        }
+        for (auto [i, count] : exited) {
+            close(fds[i].fd);
+            LOG(INFO) << "MluTransport: peer process " << pids[i - 1]
+                      << " exited; closing its " << count
+                      << " mapped buffer(s)";
+        }
+    }
 }
 
 std::shared_ptr<void> MluTransport::relocate(SegmentID target_id,
