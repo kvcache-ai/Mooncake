@@ -840,6 +840,38 @@ class ParallelReclaimer final : public eviction::Reclaimer {
     }
 };
 
+// Queues every object for offload and releases nothing, as the
+// OffloadingReclaimer does with an object's one memory replica, but on the
+// range walk; with `keep`, it keeps every object instead (Outcome::kKept). From
+// the `exhaust_at`-th Apply on, counting from one, it says nothing more can be
+// taken (Effect::exhausted), as a full set of destinations does until a copy
+// lands.
+class QueueingReclaimer final : public eviction::Reclaimer {
+   public:
+    bool SupportsParallel() const override { return true; }
+
+    tl::expected<eviction::Effect, ErrorCode> Apply(
+        metadata::Namespace&, const route::WriteGuard& hold,
+        const eviction::Plan&, const eviction::Report&) override {
+        const uint64_t n = applies.fetch_add(1, std::memory_order_relaxed) + 1;
+        eviction::Effect effect;
+        effect.exhausted = exhaust_at != 0 && n >= exhaust_at;
+        if (keep) {
+            effect.outcome = eviction::Outcome::kKept;
+            return effect;
+        }
+        effect.outcome = eviction::Outcome::kOffloadQueued;
+        effect.offload_bytes = hold.metadata().TotalLength();
+        return effect;
+    }
+
+    void TearDown(metadata::Namespace&, const route::WriteGuard&) override {}
+
+    uint64_t exhaust_at = 0;
+    bool keep = false;
+    std::atomic<uint64_t> applies{0};
+};
+
 class ParallelEvictorNativeTest : public ::testing::Test {
    protected:
     std::shared_ptr<OffsetBufferAllocator> allocator_ =
@@ -864,6 +896,15 @@ class ParallelEvictorNativeTest : public ::testing::Test {
         SpinLocker locker(&guard.metadata().lock);
         guard.metadata().lease_->SetDeadline(
             live ? Clock::now() + std::chrono::hours(1) : Clock::time_point{});
+    }
+
+    // How many (rank, shard) work units the first wave of a range walk now
+    // has, for a run whose namespace goal is `target` keys.
+    uint64_t FirstWaveUnits(size_t target) {
+        return namespaces_.GetOrCreate(TenantId{})
+            .eviction_index()
+            .ScanRanges(Clock::now(), target)
+            ->Limit();
     }
 };
 
@@ -1107,6 +1148,166 @@ TEST_F(ParallelEvictorNativeTest,
     EXPECT_EQ(report.visited, 0u);
     EXPECT_EQ(report.evicted_objects, 0u);
     EXPECT_LE(report.scan_waves, 1u);
+}
+
+// With count_queued, a queued offload counts toward the goal on the range walk
+// as Met() counts it on the serial walk, so the workers stop at the share
+// instead of queueing every key they meet.
+TEST_F(ParallelEvictorNativeTest,
+       QueuedOffloadsCountTowardTheGoalOnTheRangeWalk) {
+    // One thread files a run of keys in one shard before it moves to the
+    // next: enough keys to spread over more shards than there are workers.
+    for (int i = 0; i < 4000; ++i) {
+        Publish(std::to_string(i));
+    }
+    QueueingReclaimer queueing;
+    eviction::Evictor evictor(namespaces_, policy_, queueing, {}, 4);
+    constexpr auto kQueued = eviction::Outcome::kOffloadQueued;
+    // Enough work units for every worker to take part.
+    EXPECT_GE(FirstWaveUnits(400), 4u);
+
+    auto report = evictor.Run(eviction::Scope::All(),
+                              {.target_ratio = .1, .count_queued = true});
+    EXPECT_EQ(report.workers, 4u);
+    EXPECT_GE(report.scan_waves, 1u);
+    // At most one entry in flight per other worker past the goal.
+    EXPECT_GE(report.Count(kQueued), 400u);
+    EXPECT_LE(report.Count(kQueued), 403u);
+    EXPECT_EQ(report.evicted_objects, 0u);
+    EXPECT_EQ(report.offload_bytes, report.Count(kQueued) * 128);
+
+    // Not counted, the walk goes on through every key.
+    report = evictor.Run(eviction::Scope::All(), {.target_ratio = .1});
+    EXPECT_EQ(report.Count(kQueued), 4000u);
+
+    // A byte goal counts the bytes pinned for offload.
+    report = evictor.Run(
+        TenantId{},
+        eviction::ByteGoal{.target_bytes = 50 * 128, .count_queued = true});
+    EXPECT_GE(report.offload_bytes, 50u * 128);
+    EXPECT_LE(report.offload_bytes, 53u * 128);
+    EXPECT_EQ(report.released_bytes, 0u);
+}
+
+// A reclaimer that can take nothing more ends the range walk, as it ends the
+// serial one: each other worker applies at most once more, and that Apply
+// tells it too, and no worker reads further buckets. So does an object it
+// keeps, which makes no progress (an object kept because every destination
+// is full).
+TEST_F(ParallelEvictorNativeTest, AnExhaustedReclaimerEndsTheRangeWalk) {
+    for (int i = 0; i < 4000; ++i) {
+        Publish(std::to_string(i));
+    }
+    EXPECT_GE(FirstWaveUnits(4000), 4u);
+    for (const bool keep : {false, true}) {
+        SCOPED_TRACE(keep ? "kept" : "queued");
+        QueueingReclaimer queueing;
+        queueing.exhaust_at = 10;
+        queueing.keep = keep;
+        eviction::Evictor evictor(namespaces_, policy_, queueing, {}, 4);
+
+        const auto report =
+            evictor.Run(eviction::Scope::All(),
+                        {.target_ratio = 1.0, .count_queued = true});
+
+        EXPECT_EQ(report.workers, 4u);
+        EXPECT_TRUE(report.exhausted);
+        EXPECT_LE(queueing.applies.load(), 10u + 3u);
+        // The bucket each worker had in hand when it stopped, not the rest.
+        EXPECT_LT(report.scanned_slots, 4000u);
+        EXPECT_EQ(report.Count(keep ? eviction::Outcome::kKept
+                                    : eviction::Outcome::kOffloadQueued),
+                  queueing.applies.load());
+    }
+}
+
+// An exhausted range walk leaves the namespaces after its own to the next run,
+// which starts one namespace further on, as a serial walk does: the workers
+// of the next namespace start with reports of their own.
+TEST_F(ParallelEvictorNativeTest,
+       AnExhaustedRangeWalkLeavesTheRestToTheNextRun) {
+    struct AppliedIn final : eviction::EvictionObserver {
+        bool SupportsParallel() const override { return true; }
+        void OnApplied(const eviction::ObjectView& view,
+                       const eviction::Effect&) override {
+            std::lock_guard lock(mutex);
+            tenants.insert(view.tenant_id.value());
+        }
+        std::set<std::string> Take() {
+            std::lock_guard lock(mutex);
+            return std::exchange(tenants, {});
+        }
+        std::mutex mutex;
+        std::set<std::string> tenants;
+    } applied_in;
+    for (const std::string tenant : {"a", "b"}) {
+        auto& ns = namespaces_.GetOrCreate(TenantId(tenant));
+        for (int i = 0; i < 2000; ++i) {
+            const std::string key = tenant + std::to_string(i);
+            auto guard = ns.objects.WriteKey(key);
+            std::vector<Replica> replicas;
+            replicas.emplace_back(allocator_->allocate(128),
+                                  ReplicaStatus::COMPLETE);
+            (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
+                                std::move(replicas), std::nullopt, false,
+                                ObjectDataType::UNKNOWN, "", TenantId(tenant),
+                                key);
+            SpinLocker locker(&guard.metadata().lock);
+            guard.metadata().lease_->SetDeadline(Clock::time_point{});
+        }
+    }
+    // Every Apply says nothing more can be taken.
+    QueueingReclaimer queueing;
+    queueing.exhaust_at = 1;
+    eviction::Evictor evictor(namespaces_, policy_, queueing, {&applied_in}, 4);
+    const eviction::ObjectGoal all{.target_ratio = 1.0, .count_queued = true};
+
+    auto report = evictor.Run(eviction::Scope::All(), all);
+    EXPECT_EQ(report.workers, 4u);
+    EXPECT_TRUE(report.exhausted);
+    EXPECT_LE(queueing.applies.load(), 4u);
+    const auto first = applied_in.Take();
+    ASSERT_EQ(first.size(), 1u);
+
+    report = evictor.Run(eviction::Scope::All(), all);
+    EXPECT_TRUE(report.exhausted);
+    const auto second = applied_in.Take();
+    ASSERT_EQ(second.size(), 1u);
+    EXPECT_NE(*second.begin(), *first.begin());
+}
+
+// What a worker's pass queued without releasing memory is not in its report;
+// the pass the fallback runs in takes it over (TakeFrom), so a minimum the
+// workers' queued offloads met takes no deferred key.
+TEST_F(ParallelEvictorNativeTest, TheFallbackCountsWhatTheWorkersQueued) {
+    struct DeferredApplies final : eviction::EvictionObserver {
+        bool SupportsParallel() const override { return true; }
+        void OnApplied(const eviction::ObjectView& view,
+                       const eviction::Effect&) override {
+            if (view.key.starts_with("soft")) {
+                n.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        std::atomic<uint64_t> n{0};
+    } deferred;
+    // The walk meets the deferred keys first, then those it queues.
+    for (int i = 0; i < 100; ++i) {
+        Publish("soft" + std::to_string(i));
+    }
+    for (int i = 0; i < 100; ++i) {
+        Publish(std::to_string(i));
+    }
+    QueueingReclaimer queueing;
+    eviction::Evictor evictor(namespaces_, policy_, queueing, {&deferred}, 4);
+
+    // Target and minimum are both half of the 200 keys: the 100 the workers
+    // queue meet the minimum.
+    const auto report = evictor.Run(
+        eviction::Scope::All(),
+        {.target_ratio = .5, .min_ratio = .5, .count_queued = true});
+    EXPECT_EQ(report.workers, 4u);
+    EXPECT_EQ(deferred.n.load(), 0u);
+    EXPECT_EQ(report.Count(eviction::Outcome::kOffloadQueued), 100u);
 }
 
 // A writer that keeps taking and letting go of postponed keys, changing

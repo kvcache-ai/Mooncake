@@ -72,12 +72,22 @@ struct ObjectGoal {
     // short of this share, and only once nothing else qualifies. A minimum
     // above the target is lowered to it.
     double min_ratio = 0;
+    // Count an object queued for offload (Outcome::kOffloadQueued) as freed:
+    // its memory goes once the copy lands, and a run that did not count it
+    // would walk on past its share and queue everything it meets. An object
+    // the reclaimer keeps (Outcome::kKept) keeps its rank, so the oldest
+    // objects stay first in line for the room that frees up next. A range
+    // walk counts them the same way, though the OffloadingReclaimer, the one
+    // that queues offloads, keeps its runs serial.
+    bool count_queued = false;
 };
 
 // How much a run in one namespace frees, in released bytes: from the objects
 // the policy takes outright, then from those it deferred.
 struct ByteGoal {
     uint64_t target_bytes = 0;
+    // As ObjectGoal::count_queued, in the bytes pinned for offload.
+    bool count_queued = false;
 };
 
 class Evictor {
@@ -104,7 +114,8 @@ class Evictor {
     Evictor& operator=(const Evictor&) = delete;
 
     // Evicts within `scope`, or in `tenant_id`'s namespace, until `goal` is
-    // met, nothing more qualifies, or an OpLog write fails. Namespaces created
+    // met, nothing more qualifies, an OpLog write fails, or the reclaimer can
+    // take nothing more (Report::exhausted). Namespaces created
     // during the run join the next one.
     Report Run(const Scope& scope, const ObjectGoal& goal);
     Report Run(const TenantId& tenant_id, const ByteGoal& goal);
