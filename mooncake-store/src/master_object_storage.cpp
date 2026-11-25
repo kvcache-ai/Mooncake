@@ -372,11 +372,13 @@ auto MasterService::UpsertStart(const UUID& writer, const std::string& key,
 tl::expected<void, ErrorCode> MasterService::FinishObjectStorageUpload(
     const UUID& writer, const std::string& name, ObjectUploadOutcome outcome,
     const TenantId& tenant) {
-    if (!object_uploads_) return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     if (outcome != ObjectUploadOutcome::COMPLETE &&
         outcome != ObjectUploadOutcome::NOT_WRITTEN &&
         outcome != ObjectUploadOutcome::UNKNOWN)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    // A leader with object storage disabled can serve only after recovery
+    // confirms that there are no uploads left to finish.
+    if (!object_uploads_) return {};
     auto record = object_uploads_->FindObjectUpload(name);
     // Forgotten immutable attempts are terminal. A lost completion reply may
     // be retried after GC; acknowledging it cannot authorize another PUT.

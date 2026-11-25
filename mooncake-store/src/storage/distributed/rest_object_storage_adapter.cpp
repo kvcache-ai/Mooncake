@@ -479,8 +479,8 @@ RestObjectStorageAdapter::Request(
         curl_easy_getinfo(context.curl, CURLINFO_RESPONSE_CODE,
                           &response.status);
         if (may_exist)
-            *may_exist =
-                object_storage_http::PutMayExist(result, response.status);
+            *may_exist = object_storage_http::PutMayExist(
+                result, response.status, context.error_body);
         response.transferred = context.download_context.transferred;
         response.body = std::move(context.error_body);
         // Preserve 404/416 when receiving their oversized bodies was aborted

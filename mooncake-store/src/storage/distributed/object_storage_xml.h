@@ -34,6 +34,9 @@ struct ListObjectsPage {
 tl::expected<ListObjectsPage, std::string> ParseListObjectsV2(
     std::string_view body);
 
+// Returns the unique text-only Code of an Error document, or an empty string.
+std::string ParseErrorCode(std::string_view body);
+
 // Returns "Code: Message" from an Error document, or an empty string when
 // the body carries neither.
 std::string ErrorCodeAndMessage(std::string_view body);

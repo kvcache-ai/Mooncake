@@ -185,6 +185,14 @@ tl::expected<ListObjectsPage, std::string> ParseListObjectsV2(
     return page;
 }
 
+std::string ParseErrorCode(std::string_view body) {
+    if (body.find('\0') != std::string_view::npos) return {};
+    const auto document = ReadDocument(body, nullptr);
+    if (!document) return {};
+    const ptree::ptree* root = Root(*document, "Error");
+    return root ? OnlyChildText(*root, "Code").value_or("") : "";
+}
+
 std::string ErrorCodeAndMessage(std::string_view body) {
     const auto document = ReadDocument(body, nullptr);
     if (!document) return {};
