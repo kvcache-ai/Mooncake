@@ -5341,7 +5341,6 @@ tl::expected<void, ErrorCode> Client::Put(const PutItem& item,
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     std::span<const PutItem> items, const ReplicateConfig& config) {
-    constexpr size_t kWindowSize = 64;
     std::vector<tl::expected<void, ErrorCode>> results(
         items.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     if (items.empty() || !config.HasValidKeyHints(items.size()) ||
@@ -5377,161 +5376,155 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         PutFinishRequest finish_req{};
     };
 
-    for (size_t begin = 0; begin < items.size(); begin += kWindowSize) {
-        const size_t end = std::min(items.size(), begin + kWindowSize);
-        std::vector<PendingPut> pending;
-        std::vector<PutStartItem> start_items;
-        pending.reserve(end - begin);
-        start_items.reserve(end - begin);
+    std::vector<PendingPut> pending;
+    std::vector<PutStartItem> start_items;
+    pending.reserve(items.size());
+    start_items.reserve(items.size());
 
-        // 1. Validate inputs and build BatchPutStart items.
-        for (size_t index = begin; index < end; ++index) {
-            const auto& item = items[index];
-            const auto length = detail::ValidatePutItem(item, put_caps);
-            if (!length) {
-                results[index] = tl::unexpected(length.error());
-                continue;
-            }
-
-            const bool is_range =
-                std::holds_alternative<RangeTarget>(item.target);
-            std::optional<uint64_t> checksum;
-            if (object_checksum_enabled_ && !is_range) {
-                auto computed = ComputeObjectChecksumForSlices(
-                    item.key, item.slices, *length);
-                if (!computed) {
-                    results[index] = tl::unexpected(computed.error());
-                    continue;
-                }
-                checksum = *computed;
-            }
-
-            if (hot_cache_) {
-                hot_cache_->RemoveHotKey(item.key);
-            }
-
-            PutStartItem start_item{
-                .key = item.key,
-                .size = *length,
-                .target = item.target,
-            };
-            if (config.group_ids) {
-                start_item.group_id = config.group_ids->at(index);
-            }
-            if (config.session_ids) {
-                start_item.session_id = config.session_ids->at(index);
-            }
-            if (config.residency_affinity_ids) {
-                start_item.residency_affinity_id =
-                    config.residency_affinity_ids->at(index);
-            }
-            if (config.per_key_preferred_hca_names) {
-                start_item.preferred_hca_names =
-                    config.per_key_preferred_hca_names->at(index);
-            } else if (!base_config.preferred_hca_names && hca_infer) {
-                start_item.preferred_hca_names = hca_infer(item.slices);
-            }
-            start_items.push_back(std::move(start_item));
-            pending.push_back(PendingPut{
-                .item_index = index,
-                .length = *length,
-                .checksum = checksum,
-                .is_range = is_range,
-            });
-        }
-
-        if (pending.empty()) {
+    // 1. Validate inputs and build BatchPutStart items.
+    for (size_t index = 0; index < items.size(); ++index) {
+        const auto& item = items[index];
+        const auto length = detail::ValidatePutItem(item, put_caps);
+        if (!length) {
+            results[index] = tl::unexpected(length.error());
             continue;
         }
 
-        // 2. Start writes on Master and validate returned memory descriptors.
-        auto starts = master_client_.BatchPutStart(start_items, base_config);
-        std::vector<size_t> transfer_idx;
-        std::vector<std::vector<Replica::Descriptor>> transfer_replicas;
-        std::vector<std::vector<Slice>> transfer_slices;
-        std::vector<std::vector<uint64_t>> transfer_offsets;
-
-        for (size_t i = 0; i < pending.size(); ++i) {
-            auto& p = pending[i];
-            if (i >= starts.size()) {
-                results[p.item_index] = tl::unexpected(ErrorCode::RPC_FAIL);
+        const bool is_range = std::holds_alternative<RangeTarget>(item.target);
+        std::optional<uint64_t> checksum;
+        if (object_checksum_enabled_ && !is_range) {
+            auto computed =
+                ComputeObjectChecksumForSlices(item.key, item.slices, *length);
+            if (!computed) {
+                results[index] = tl::unexpected(computed.error());
                 continue;
             }
-            if (!starts[i]) {
-                results[p.item_index] = tl::unexpected(starts[i].error());
-                continue;
-            }
-            auto& start = *starts[i];
-            p.started = true;
-            p.finish_req = PutFinishRequest{
-                .token = std::move(start.token),
-                .commit = false,
-                .replica_type =
-                    p.is_range ? ReplicaType::MEMORY : ReplicaType::ALL,
-                .checksum = p.checksum,
-            };
-            p.error = detail::ValidateAllocatedWriteReplicas(
-                start.replicas, p.length, p.is_range, lookup_tcp_proto_version);
-            if (p.error != ErrorCode::OK) {
-                continue;
-            }
-
-            // Master already sliced RangeTarget descriptors to
-            // `[base + offset, length)`, so every mode writes from offset 0.
-            transfer_idx.push_back(i);
-            transfer_replicas.push_back(std::move(start.replicas));
-            transfer_slices.push_back(items[p.item_index].slices);
-            transfer_offsets.push_back(
-                detail::BuildZeroBasedSliceOffsets(items[p.item_index].slices));
+            checksum = *computed;
         }
 
-        // 3. Transfer payload data for all valid started items.
-        if (!transfer_idx.empty()) {
-            auto writes = BatchTransferWriteRanges(
-                transfer_replicas, transfer_slices, transfer_offsets);
-            for (size_t i = 0; i < transfer_idx.size(); ++i) {
-                auto& p = pending[transfer_idx[i]];
-                if (writes.size() == transfer_idx.size() &&
-                    writes[i].has_value()) {
-                    p.finish_req.commit = true;
-                } else {
-                    p.error = writes.size() == transfer_idx.size()
-                                  ? writes[i].error()
-                                  : ErrorCode::TRANSFER_FAIL;
-                }
-            }
+        if (hot_cache_) {
+            hot_cache_->RemoveHotKey(item.key);
         }
 
-        // 4. Commit successful writes and abort failed started writes.
-        std::vector<size_t> finish_idx;
-        std::vector<PutFinishRequest> finish_reqs;
-        finish_idx.reserve(pending.size());
-        finish_reqs.reserve(pending.size());
-        for (size_t i = 0; i < pending.size(); ++i) {
-            if (!pending[i].started) {
-                continue;
-            }
-            finish_idx.push_back(i);
-            finish_reqs.push_back(std::move(pending[i].finish_req));
+        PutStartItem start_item{
+            .key = item.key,
+            .size = *length,
+            .target = item.target,
+        };
+        if (config.group_ids) {
+            start_item.group_id = config.group_ids->at(index);
         }
-        if (finish_reqs.empty()) {
+        if (config.session_ids) {
+            start_item.session_id = config.session_ids->at(index);
+        }
+        if (config.residency_affinity_ids) {
+            start_item.residency_affinity_id =
+                config.residency_affinity_ids->at(index);
+        }
+        if (config.per_key_preferred_hca_names) {
+            start_item.preferred_hca_names =
+                config.per_key_preferred_hca_names->at(index);
+        } else if (!base_config.preferred_hca_names && hca_infer) {
+            start_item.preferred_hca_names = hca_infer(item.slices);
+        }
+        start_items.push_back(std::move(start_item));
+        pending.push_back(PendingPut{
+            .item_index = index,
+            .length = *length,
+            .checksum = checksum,
+            .is_range = is_range,
+        });
+    }
+
+    if (pending.empty()) {
+        return results;
+    }
+
+    // 2. Start writes on Master and validate returned memory descriptors.
+    auto starts = master_client_.BatchPutStart(start_items, base_config);
+    std::vector<size_t> transfer_idx;
+    std::vector<std::vector<Replica::Descriptor>> transfer_replicas;
+    std::vector<std::vector<Slice>> transfer_slices;
+    std::vector<std::vector<uint64_t>> transfer_offsets;
+
+    for (size_t i = 0; i < pending.size(); ++i) {
+        auto& p = pending[i];
+        if (i >= starts.size()) {
+            results[p.item_index] = tl::unexpected(ErrorCode::RPC_FAIL);
             continue;
         }
-        auto confirmed = master_client_.BatchPutFinish(finish_reqs);
-        for (size_t i = 0; i < finish_idx.size(); ++i) {
-            const auto& p = pending[finish_idx[i]];
-            if (p.error != ErrorCode::OK) {
-                results[p.item_index] = tl::unexpected(p.error);
-                continue;
+        if (!starts[i]) {
+            results[p.item_index] = tl::unexpected(starts[i].error());
+            continue;
+        }
+        auto& start = *starts[i];
+        p.started = true;
+        p.finish_req = PutFinishRequest{
+            .token = std::move(start.token),
+            .commit = false,
+            .replica_type = p.is_range ? ReplicaType::MEMORY : ReplicaType::ALL,
+            .checksum = p.checksum,
+        };
+        p.error = detail::ValidateAllocatedWriteReplicas(
+            start.replicas, p.length, p.is_range, lookup_tcp_proto_version);
+        if (p.error != ErrorCode::OK) {
+            continue;
+        }
+
+        // Master already sliced RangeTarget descriptors to
+        // `[base + offset, length)`, so every mode writes from offset 0.
+        transfer_idx.push_back(i);
+        transfer_replicas.push_back(std::move(start.replicas));
+        transfer_slices.push_back(items[p.item_index].slices);
+        transfer_offsets.push_back(
+            detail::BuildZeroBasedSliceOffsets(items[p.item_index].slices));
+    }
+
+    // 3. Transfer payload data for all valid started items.
+    if (!transfer_idx.empty()) {
+        auto writes = BatchTransferWriteRanges(
+            transfer_replicas, transfer_slices, transfer_offsets);
+        for (size_t i = 0; i < transfer_idx.size(); ++i) {
+            auto& p = pending[transfer_idx[i]];
+            if (writes.size() == transfer_idx.size() && writes[i].has_value()) {
+                p.finish_req.commit = true;
+            } else {
+                p.error = writes.size() == transfer_idx.size()
+                              ? writes[i].error()
+                              : ErrorCode::TRANSFER_FAIL;
             }
-            if (i >= confirmed.size()) {
-                results[p.item_index] = tl::unexpected(ErrorCode::RPC_FAIL);
-                continue;
-            }
-            results[p.item_index] = confirmed[i];
-            if (hot_cache_ && results[p.item_index]) {
-                hot_cache_->RemoveHotKey(items[p.item_index].key);
-            }
+        }
+    }
+
+    // 4. Commit successful writes and abort failed started writes.
+    std::vector<size_t> finish_idx;
+    std::vector<PutFinishRequest> finish_reqs;
+    finish_idx.reserve(pending.size());
+    finish_reqs.reserve(pending.size());
+    for (size_t i = 0; i < pending.size(); ++i) {
+        if (!pending[i].started) {
+            continue;
+        }
+        finish_idx.push_back(i);
+        finish_reqs.push_back(std::move(pending[i].finish_req));
+    }
+    if (finish_reqs.empty()) {
+        return results;
+    }
+    auto confirmed = master_client_.BatchPutFinish(finish_reqs);
+    for (size_t i = 0; i < finish_idx.size(); ++i) {
+        const auto& p = pending[finish_idx[i]];
+        if (p.error != ErrorCode::OK) {
+            results[p.item_index] = tl::unexpected(p.error);
+            continue;
+        }
+        if (i >= confirmed.size()) {
+            results[p.item_index] = tl::unexpected(ErrorCode::RPC_FAIL);
+            continue;
+        }
+        results[p.item_index] = confirmed[i];
+        if (hot_cache_ && results[p.item_index]) {
+            hot_cache_->RemoveHotKey(items[p.item_index].key);
         }
     }
     return results;
