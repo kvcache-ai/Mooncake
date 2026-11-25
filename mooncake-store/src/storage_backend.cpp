@@ -2661,19 +2661,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
         UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
         if (uring_file != nullptr) {
             // Min-copy read plan. Each object's byte range is read by ONE
-            // direct io_uring descriptor anchored on the block grid: from
-            // align_down(start) to align_up(end), straight into the
-            // destination. The head and tail neighbors (at most 4 KiB each
-            // side, and zero for an object that starts on the grid) ride
-            // along in the same batch — reading them costs a sliver of
-            // device bandwidth, while splitting them into per-object
-            // buffered preads would serialize a synchronous round trip per
-            // object, which loses far more on any high-latency backend.
-            // No user-space copy anywhere; the span pointer carries the
-            // anchor shift. The last object of a bucket may short-read at
-            // EOF inside its tail neighbor, so only the object's own bytes
-            // are required. An unaligned destination degrades that object
-            // to a buffered read instead of failing the batch.
+            // direct io_uring descriptor anchored on the block grid. An exact
+            // grid-aligned destination stays zero-copy. A range with a partial
+            // head or tail uses aligned scratch and copies only the requested
+            // bytes, so the read never writes beyond the caller's Slice. The
+            // last object of a bucket may short-read at EOF inside its tail
+            // neighbor, so only the object's own bytes are required. An
+            // unaligned destination degrades that object to a buffered read
+            // instead of failing the batch.
             struct BatchReadPlan {
                 const ReadPlan* plan;
                 size_t offset_in_buffer;
@@ -2688,9 +2683,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
             std::vector<UringFile::ReadDesc> read_descs;
             std::vector<BatchReadPlan> batch_read_plans;
             std::vector<BufferedRead> buffered_reads;
+            using BounceBuffer = std::unique_ptr<void, decltype(&std::free)>;
+            std::vector<BounceBuffer> bounce_buffers;
             read_descs.reserve(read_plans.size());
             batch_read_plans.reserve(read_plans.size());
             buffered_reads.reserve(read_plans.size());
+            bounce_buffers.reserve(read_plans.size());
 
             for (const auto& plan : read_plans) {
                 int64_t actual_offset =
@@ -2720,8 +2718,22 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                 size_t offset_in_buffer =
                     static_cast<size_t>(actual_offset - aligned_offset);
 
-                read_descs.push_back(UringFile::ReadDesc{
-                    plan.dest_slice.ptr, aligned_size, aligned_offset});
+                void* target = plan.dest_slice.ptr;
+                const bool exact = offset_in_buffer == 0 &&
+                                   aligned_size == plan.dest_slice.size;
+                if (!exact) {
+                    // A direct read must not write head/tail bytes beyond the
+                    // caller's Slice. Read that window into aligned scratch and
+                    // copy only the requested range after completion.
+                    if (posix_memalign(&target, kDirectIOAlignment,
+                                       aligned_size) != 0) {
+                        return tl::make_unexpected(
+                            ErrorCode::NO_AVAILABLE_HANDLE);
+                    }
+                    bounce_buffers.emplace_back(target, &std::free);
+                }
+                read_descs.push_back(
+                    UringFile::ReadDesc{target, aligned_size, aligned_offset});
                 batch_read_plans.push_back(
                     BatchReadPlan{&plan, offset_in_buffer,
                                   offset_in_buffer + plan.dest_slice.size});
@@ -2767,9 +2779,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                             << "), got: " << desc.bytes_read;
                         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                     }
-                    plan.destination->slice.ptr =
-                        static_cast<char*>(plan.dest_slice.ptr) +
-                        batch_plan.offset_in_buffer;
+                    if (desc.buf == plan.dest_slice.ptr) {
+                        plan.destination->slice.ptr =
+                            static_cast<char*>(plan.dest_slice.ptr) +
+                            batch_plan.offset_in_buffer;
+                    } else {
+                        std::memcpy(plan.dest_slice.ptr,
+                                    static_cast<const char*>(desc.buf) +
+                                        batch_plan.offset_in_buffer,
+                                    plan.dest_slice.size);
+                    }
                 }
             }
 

@@ -31,7 +31,7 @@ inline std::ostream& operator<<(std::ostream& os,
 }
 
 struct BucketBackendConfig {
-    int64_t read_io_workers = 0;
+    int64_t read_io_workers = 8;
     int64_t read_sub_batch_max_iovecs = 32;
     int64_t write_io_workers = 32;
     // Target size of a write sub batch in bytes. A sub batch takes whole

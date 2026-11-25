@@ -5761,7 +5761,10 @@ TEST_F(StorageBackendTest, BucketBackendReportsUringReadErrno) {
         reported.emplace_back(err, op);
     });
 
-    const std::string key = "uring_errno_key";
+    // A 4096-byte key makes the direct read exactly aligned. The inaccessible
+    // destination therefore fails in the kernel with EFAULT rather than in a
+    // user-space copy used by the partial-block fallback.
+    const std::string key(kValueSize, 'k');
     std::string value(kValueSize, 'u');
     std::unordered_map<std::string, std::vector<Slice>> offload_batch{
         {key, std::vector<Slice>{Slice{value.data(), value.size()}}}};
@@ -6946,6 +6949,41 @@ TEST_F(StorageBackendTest, HybridOffloadSmallBucketRoundTrip) {
     objects.push_back(MakeAlignedTestObject("tiny", {{13, 1000}}, 1));
     ASSERT_TRUE(backend.BatchOffload(BatchOf(objects), AcceptAll));
     ExpectLoadsBack(backend, objects);
+}
+
+TEST_F(StorageBackendTest, HybridReadPreservesDestinationBounds) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+    BucketBackendConfig bucket_config;
+    bucket_config.aligned_uring_write = true;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    constexpr size_t kValueSize = 1001;
+    const std::string key = "bounded_read";
+    const std::string value(kValueSize, 'v');
+    ASSERT_TRUE(backend.BatchOffload(
+        {{key, {{const_cast<char*>(value.data()), value.size()}}}}, AcceptAll));
+
+    std::vector<unsigned char> storage(16 * 1024, 0x5a);
+    constexpr size_t kAlignment = 4096;
+    const auto address = reinterpret_cast<uintptr_t>(storage.data());
+    auto* destination =
+        reinterpret_cast<char*>((address + kAlignment - 1) & ~(kAlignment - 1));
+    std::unordered_map<std::string, Slice> load{
+        {key, {destination, kValueSize}}};
+    ASSERT_TRUE(backend.BatchLoad(load));
+    EXPECT_EQ(std::memcmp(load.at(key).ptr, value.data(), kValueSize), 0);
+    const auto destination_address = reinterpret_cast<uintptr_t>(destination);
+    for (size_t i = 0; i < storage.size(); ++i) {
+        const auto current = reinterpret_cast<uintptr_t>(storage.data() + i);
+        if (current >= destination_address &&
+            current < destination_address + kValueSize) {
+            continue;
+        }
+        ASSERT_EQ(storage[i], 0x5a) << "destination overwritten at " << i;
+    }
 }
 
 TEST_F(StorageBackendTest, ParallelHybridOffloadRoundTrip) {

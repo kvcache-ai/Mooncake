@@ -39,6 +39,8 @@ class ScopedEnvVar {
 };
 
 struct BucketBackendEnvironment {
+    ScopedEnvVar read_workers{"MOONCAKE_OFFLOAD_READ_IO_WORKERS"};
+    ScopedEnvVar read_sub_batch{"MOONCAKE_OFFLOAD_READ_SUB_BATCH_MAX_IOVECS"};
     ScopedEnvVar write_workers{"MOONCAKE_OFFLOAD_WRITE_IO_WORKERS"};
     ScopedEnvVar write_sub_batch_bytes{
         "MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_BYTES"};
@@ -73,13 +75,17 @@ TEST_F(BucketBackendConfigTest, UsesExistingDefaultsWhenEnvironmentIsUnset) {
     EXPECT_EQ(config.max_total_size, 0);
     EXPECT_EQ(config.max_physical_bytes, 0);
     EXPECT_EQ(config.disk_scan_cache_ms, 500);
+    EXPECT_EQ(config.read_io_workers, 8);
+    EXPECT_EQ(config.read_sub_batch_max_iovecs, 32);
     EXPECT_EQ(config.eviction_policy, BucketEvictionPolicy::FIFO);
     EXPECT_FALSE(config.flush_partial_buckets);
     EXPECT_FALSE(config.aligned_direct_write);
     EXPECT_TRUE(config.aligned_uring_write);
 
+    env.read_workers.Set("0");
     env.direct_write.Set("0");
     const auto buffered = BucketBackendConfig::FromEnvironment().value();
+    EXPECT_EQ(buffered.read_io_workers, 0);
     EXPECT_FALSE(buffered.aligned_direct_write);
     EXPECT_FALSE(buffered.aligned_uring_write);
 }

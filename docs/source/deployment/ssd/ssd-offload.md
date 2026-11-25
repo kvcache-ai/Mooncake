@@ -155,7 +155,7 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `MOONCAKE_OFFLOAD_READ_IO_WORKERS` | `0` (disabled) | Shared reader count across bucket files and their sub batches. `0` retains the caller-driven read path; positive values enable parallel full-object and range reads through `BatchIoScheduler`. |
+| `MOONCAKE_OFFLOAD_READ_IO_WORKERS` | `8` | Shared reader count across bucket files and their sub batches. The default enables parallel full-object and range reads through `BatchIoScheduler`; `0` retains the caller-driven read path. |
 | `MOONCAKE_OFFLOAD_READ_SUB_BATCH_MAX_IOVECS` | `32` | Maximum read plans (one per object or range) per read sub batch; minimum `4` when readers are enabled. Each sub batch stays within one bucket file. |
 | `MOONCAKE_OFFLOAD_WRITE_IO_WORKERS` | `32` | Shared writer count across buckets and their sub batches. The default enables parallel offload through `BatchIoScheduler`; `0` retains sequential offload. |
 | `MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_BYTES` | `4194304` (4 MiB) | Target size of a write sub batch in bytes. A sub batch takes whole Slices up to this size; a hybrid direct range ends on the 4 KiB block edge below it and is capped at 4 MiB per SQE. A final group of at most a quarter of it joins the previous group within the same bucket. Must be positive when writers are enabled. |
@@ -185,7 +185,7 @@ The performance-oriented defaults use 32 workers and 4 MiB sub batches. Set the 
 
 Write sub batches are formed within each bucket file and take whole Slices up to `MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_BYTES`; a Slice larger than that stands alone or ends its group. A final group of at most a quarter of the target joins the previous group. Different bucket files' tails are never merged. Invalid write controls fail backend initialization.
 
-### Optional parallel Bucket offload reads
+### Parallel Bucket offload reads
 
 Set the read controls in the **Real Client** environment before starting the embedded Real Client:
 
@@ -195,7 +195,7 @@ export MOONCAKE_OFFLOAD_READ_IO_WORKERS=8
 export MOONCAKE_OFFLOAD_READ_SUB_BATCH_MAX_IOVECS=32
 ```
 
-Leave the reader count unset or set it to `0` to retain the caller-driven read path. Positive values enable a shared read worker pool. All read sub batches in a request are published together, allowing full-object and range reads from multiple bucket files to have I/O in flight together. Bucket guards and destination buffers remain valid until the request finishes. With io_uring enabled, read workers use independent thread-local rings.
+The default uses eight shared read workers. Set the reader count to `0` to retain the caller-driven read path. All read sub batches in a request are published together, allowing full-object and range reads from multiple bucket files to have I/O in flight together. Bucket guards and destination buffers remain valid until the request finishes. With io_uring enabled, read workers use independent thread-local rings.
 
 Read sub batches never span bucket files, and the configured maximum is a strict per-sub-batch limit; small tails form their own sub batches rather than joining a full preceding group. Invalid read controls fail backend initialization. Foreground reads retain priority over new offload-write admission, independently of the read worker count.
 
