@@ -74,6 +74,8 @@ class ShmTransport : public Transport {
 
     virtual Status freeLocalMemory(void *addr, size_t size);
 
+    bool supportsParallelBatchSubmit() const override { return true; }
+
    private:
     friend class ShmTransportTestPeer;
 

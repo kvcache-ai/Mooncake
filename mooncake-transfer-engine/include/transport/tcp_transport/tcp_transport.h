@@ -181,6 +181,8 @@ class TcpTransport : public Transport {
     Status submitAcknowledgedWriteTasks(
         const std::vector<TransferTask *> &task_list);
 
+    bool supportsParallelBatchSubmit() const override { return true; }
+
    private:
     int install(std::string &local_server_name,
                 std::shared_ptr<TransferMetadata> meta,

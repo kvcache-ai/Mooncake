@@ -1,7 +1,9 @@
 // Private CUDA implementation; the public API is mooncake.engram.EngramStore.
-#include <pybind11/numpy.h>
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include <algorithm>
 #include <limits>
@@ -12,7 +14,7 @@
 
 #include "engram_local_cuda.h"
 
-namespace py = pybind11;
+namespace py = nanobind;
 namespace {
 void check(cudaError_t rc) {
     if (rc != cudaSuccess) throw std::runtime_error(cudaGetErrorString(rc));
@@ -37,17 +39,21 @@ void require_warmup(uintptr_t stream) {
 }
 
 struct LocalTable {
-    py::array owner;
+    using ByteTable = py::ndarray<py::numpy, const uint8_t, py::c_contig,
+                                  py::device::cpu, py::ndim<2>>;
+    ByteTable owner;
     int64_t count;
     size_t width;
     void* host;
-    explicit LocalTable(py::array array) : owner(std::move(array)) {
-        if (owner.ndim() != 2 || !owner.dtype().is(py::dtype::of<uint8_t>()) ||
-            !(owner.flags() & py::array::c_style))
+    explicit LocalTable(py::handle array) {
+        auto ndarray = py::module_::import_("numpy").attr("ndarray");
+        if (!py::isinstance(array, ndarray) ||
+            !py::try_cast(array, owner, false)) {
             throw std::invalid_argument("Expected contiguous uint8 table");
+        }
         count = owner.shape(0);
         width = owner.shape(1);
-        host = const_cast<void*>(owner.data());
+        host = const_cast<uint8_t*>(owner.data());
         if (owner.nbytes())
             check(cudaHostRegister(
                 host, owner.nbytes(),
@@ -65,12 +71,12 @@ struct View {
     size_t span;
     std::vector<size_t> shape, strides;
     View(py::object tensor, const std::string& dtype, size_t element_size) {
-        if (!tensor.attr("is_cuda").cast<bool>() ||
-            py::str(tensor.attr("dtype")).cast<std::string>() != dtype)
+        if (!py::cast<bool>(tensor.attr("is_cuda")) ||
+            py::cast<std::string>(py::str(tensor.attr("dtype"))) != dtype)
             throw std::invalid_argument("Unexpected tensor device or dtype");
-        shape = tensor.attr("shape").cast<std::vector<size_t>>();
-        strides = tensor.attr("stride")().cast<std::vector<size_t>>();
-        address = tensor.attr("data_ptr")().cast<uintptr_t>();
+        shape = py::cast<std::vector<size_t>>(tensor.attr("shape"));
+        strides = py::cast<std::vector<size_t>>(tensor.attr("stride")());
+        address = py::cast<uintptr_t>(tensor.attr("data_ptr")());
         span = element_size;
         for (size_t i = 0; i < shape.size(); ++i) {
             if (shape[i] && strides[i] > (SIZE_MAX - span) / element_size /
@@ -80,8 +86,8 @@ struct View {
         }
         if (std::find(shape.begin(), shape.end(), 0) != shape.end()) span = 0;
         auto storage = tensor.attr("untyped_storage")();
-        const auto base = storage.attr("data_ptr")().cast<uintptr_t>();
-        const auto size = storage.attr("nbytes")().cast<size_t>();
+        const auto base = py::cast<uintptr_t>(storage.attr("data_ptr")());
+        const auto size = py::cast<size_t>(storage.attr("nbytes")());
         if (span && (address < base || address - base > size ||
                      span > size - (address - base)))
             throw std::invalid_argument("Tensor exceeds backing allocation");
@@ -142,11 +148,11 @@ class Lookup {
         int device;
         check(cudaGetDevice(&device));
         if (device != device_ ||
-            ids.attr("device").attr("index").cast<int>() != device_ ||
+            py::cast<int>(ids.attr("device").attr("index")) != device_ ||
             !ids.attr("device").equal(output.attr("device")))
             throw std::invalid_argument(
                 "IDs, output and current CUDA device must match");
-        const auto dtype = py::str(ids.attr("dtype")).cast<std::string>();
+        const auto dtype = py::cast<std::string>(py::str(ids.attr("dtype")));
         if (dtype != "torch.int32" && dtype != "torch.int64")
             throw std::invalid_argument("IDs must be int32 or int64");
         View input(ids, dtype, dtype == "torch.int64" ? 8 : 4);
@@ -180,10 +186,10 @@ class Lookup {
 };
 }  // namespace
 
-PYBIND11_MODULE(_engram_cuda, m) {
+NB_MODULE(_engram_cuda, m) {
     m.def("require_warmup", &require_warmup);
-    py::class_<LocalTable, std::shared_ptr<LocalTable>>(m, "LocalTable")
-        .def(py::init<py::array>(), py::arg("array").noconvert());
+    py::class_<LocalTable>(m, "LocalTable")
+        .def(py::init<py::handle>(), py::arg("array").noconvert());
     py::class_<Lookup>(m, "Lookup")
         .def(py::init<std::vector<std::shared_ptr<LocalTable>>,
                       const std::vector<int64_t>&>())

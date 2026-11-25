@@ -47,7 +47,8 @@ static PyObject *concat_arrays_into(PyObject *self, PyObject *args) {
                           &nthreads))
         return NULL;
 
-    Py_ssize_t list_len = PyList_GET_SIZE(list_obj);
+    Py_ssize_t list_len = PyList_Size(list_obj);
+    if (list_len < 0) return NULL;
     if (start < 0) start = 0;
     if (start > list_len) start = list_len;
     if (count < 0 || start + count > list_len) count = list_len - start;
@@ -69,7 +70,8 @@ static PyObject *concat_arrays_into(PyObject *self, PyObject *args) {
     Py_ssize_t held = 0;
     size_t total_input_bytes = 0;
     for (Py_ssize_t i = 0; i < count; i++) {
-        PyObject *item = PyList_GET_ITEM(list_obj, start + i);
+        PyObject *item = PyList_GetItem(list_obj, start + i);
+        if (!item) goto fail;
         if (!PyArray_Check(item)) {
             PyErr_Format(PyExc_TypeError, "arrays[%zd] is not an ndarray",
                          start + i);

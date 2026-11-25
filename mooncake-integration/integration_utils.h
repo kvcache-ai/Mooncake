@@ -1,8 +1,7 @@
 #pragma once
 
-#include <pybind11/numpy.h>
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 
 #include <algorithm>
 #include <array>
@@ -15,12 +14,12 @@
 #include <span>
 #include <vector>
 
-namespace py = pybind11;
+namespace py = nanobind;
 
 namespace mooncake {
 
 // Avoid global py::module_ objects
-inline py::module_ torch_module() { return py::module_::import("torch"); }
+inline py::module_ torch_module() { return py::module_::import_("torch"); }
 
 enum class TensorDtype : int32_t {
     FLOAT32 = 0,
@@ -43,20 +42,22 @@ enum class TensorDtype : int32_t {
 };
 
 template <typename T>
-py::array create_typed_array(char *exported_data, size_t offset,
-                             size_t total_length, bool take_ownership) {
+py::object create_typed_array(char *exported_data, size_t offset,
+                              size_t total_length, bool take_ownership) {
+    py::capsule owner;
     if (take_ownership) {
-        py::capsule free_when_done(
-            exported_data, [](void *p) { delete[] static_cast<char *>(p); });
-        return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
-                              (T *)(exported_data + offset), free_when_done);
+        owner = py::capsule(exported_data, [](void *data) noexcept {
+            delete[] static_cast<char *>(data);
+        });
     }
-
-    return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
-                          (T *)(exported_data + offset), py::none());
+    const py::ndarray<py::numpy, T, py::device::cpu> array(
+        reinterpret_cast<T *>(exported_data + offset),
+        {total_length / sizeof(T)}, owner);
+    return py::cast(array, py::rv_policy::reference);
 }
 
-using ArrayCreatorFunc = std::function<py::array(char *, size_t, size_t, bool)>;
+using ArrayCreatorFunc =
+    std::function<py::object(char *, size_t, size_t, bool)>;
 
 static const std::array<ArrayCreatorFunc, 15> array_creators = {{
     create_typed_array<float>,     // FLOAT32 = 0
