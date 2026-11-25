@@ -11350,6 +11350,7 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
     std::unordered_map<std::string_view, SourceScan> scans;
     bool all_idle = true;
     bool reconciling = false;
+    bool wait_for_busy_keys = false;
     {
         auto segments = segment_manager_.getSegmentAccess();
         plan.checked_registration_version =
@@ -11393,10 +11394,12 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
             }
         }
         if (all_idle && !scans.empty()) {
-            // Use the same walk to confirm earlier failures before deciding
-            // the overall job outcome.
+            // Include every unfinished source in the final verification.
+            // Exhausted candidates require checking busy keys before FAILED.
             for (size_t i = 0; i < plan.sources.size(); ++i) {
-                if (!plan.sources[i].drained) {
+                const auto& source = plan.sources[i];
+                if (!source.drained) {
+                    wait_for_busy_keys |= !source.exhausted_attempts.empty();
                     const auto& name = job.request.segments[i];
                     scans.try_emplace(
                         name,
@@ -11439,7 +11442,9 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
             if (DrainJobStopRequested(job)) {
                 return;
             }
-            auto cursor = ns.objects.ReadCursorSkippingBusyKeys();
+            auto cursor = wait_for_busy_keys
+                              ? ns.objects.ReadCursor()
+                              : ns.objects.ReadCursorSkippingBusyKeys();
             for (auto object : cursor) {
                 if (DrainJobStopRequested(job)) {
                     return;

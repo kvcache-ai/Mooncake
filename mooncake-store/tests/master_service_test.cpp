@@ -5708,6 +5708,61 @@ TEST_F(MasterServiceTest, DrainJobFailsAfterRetryBudgetExhausted) {
     EXPECT_EQ(segment_status.value(), SegmentStatus::OK);
 }
 
+TEST_F(MasterServiceTest, DrainJobWaitsForBusyKeyWhenConfirmingFailure) {
+    const TenantId unrelated_tenant("unrelated-tenant");
+    auto config = MakeStrictTenantConfig(
+        {TenantId::Default().value(), unrelated_tenant.value()});
+    config.default_kv_lease_ttl = 0;
+    MasterService service(config);
+    MasterServiceTestPeer::StopDrainDispatchForTesting(service);
+    const auto source = PrepareSimpleSegment(service, "source", 0x300000000);
+    const auto target = PrepareSimpleSegment(service, "target", 0x400000000);
+    PutObjectOnSegment(service, source.client_id, "source");
+
+    const std::string busy_key = "unrelated";
+    ReplicateConfig placement;
+    placement.preferred_segments = {"target"};
+    PutCompletedObject(service, target.client_id, busy_key, unrelated_tenant,
+                       placement);
+    auto* other_namespace =
+        MasterServiceTestPeer::Namespaces(service).Lookup(unrelated_tenant);
+    ASSERT_NE(other_namespace, nullptr);
+
+    CreateDrainJobRequest request;
+    request.segments = {"source"};
+    request.target_segments = {"target"};
+    request.max_concurrency = 1;
+    auto job_id = service.CreateDrainJob(request);
+    ASSERT_TRUE(job_id);
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        MasterServiceTestPeer::RunDrainRoundForTesting(service);
+        ASSERT_TRUE(FailPendingMoveTasks(service, source.client_id));
+    }
+
+    std::promise<void> round_started;
+    auto started = round_started.get_future();
+    std::future<void> round;
+    {
+        auto write = other_namespace->objects.Write(busy_key);
+        ASSERT_TRUE(write);
+        round = std::async(std::launch::async, [&] {
+            round_started.set_value();
+            MasterServiceTestPeer::RunDrainRoundForTesting(service);
+        });
+        started.get();
+        EXPECT_EQ(round.wait_for(std::chrono::milliseconds(100)),
+                  std::future_status::timeout);
+    }
+    round.get();
+
+    auto job = service.QueryDrainJob(*job_id);
+    ASSERT_TRUE(job);
+    EXPECT_EQ(job->status, JobStatus::FAILED);
+    EXPECT_EQ(job->active_units, 0u);
+    EXPECT_EQ(job->failed_units, 3u);
+    EXPECT_EQ(service.QuerySegmentStatus("source").value(), SegmentStatus::OK);
+}
+
 TEST_F(MasterServiceTest, SetSegmentStatusStopsAndRestoresAllocation) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
