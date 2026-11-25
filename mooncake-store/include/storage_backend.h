@@ -1052,13 +1052,16 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<iovec>& iovs,
         std::vector<StorageObjectMetadata>& metadatas);
 
+    // serialized_meta: the bucket's encoded metadata, as reserved by
+    // BatchOffload (bucket_metadata->meta_size); written to the .meta file as
+    // is.
     tl::expected<void, ErrorCode> WriteBucket(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
-        std::vector<iovec>& iovs, int disk_index);
+        std::vector<iovec>& iovs, int disk_index,
+        const std::string& serialized_meta);
 
     tl::expected<void, ErrorCode> StoreBucketMetadata(
-        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
-        int disk_index);
+        int64_t bucket_id, int disk_index, const std::string& serialized_meta);
 
     tl::expected<void, ErrorCode> LoadBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
