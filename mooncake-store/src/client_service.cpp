@@ -79,6 +79,14 @@ namespace {
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
 
+std::string SegmentNameForProtocol(const std::string& hostname,
+                                   const std::string& protocol) {
+    // Segment names are allocator identities on the master. RAM and CXL from
+    // the same client therefore need distinct names even though they share a
+    // transfer endpoint.
+    return protocol == "cxl" ? hostname + "/cxl" : hostname;
+}
+
 class ScopedObjectChecksumBuffer {
    public:
     ScopedObjectChecksumBuffer(PinnedBufferPool& pool, size_t size)
@@ -2333,14 +2341,16 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     ReplicateConfig client_cfg = AttachHostId(config);
     AttachHcaAffinity(client_cfg, slices);
 #ifdef ENABLE_MULTI_PROTOCOL
-    if (client_cfg.preferred_storage_level == StorageLevel::CXL) {
-        client_cfg.preferred_segment = local_hostname_;
+    if (client_cfg.PreferredStorageLevel() == StorageLevel::CXL) {
+        client_cfg.preferred_segment =
+            SegmentNameForProtocol(local_hostname_, "cxl");
     } else
 #endif
     {
         if (protocol_ == "cxl") {
             client_cfg.preferred_storage_level = StorageLevel::CXL;
-            client_cfg.preferred_segment = local_hostname_;
+            client_cfg.preferred_segment =
+                SegmentNameForProtocol(local_hostname_, protocol_);
         }
     }
 
@@ -4041,14 +4051,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     }
     ReplicateConfig client_cfg = AttachHostId(config);
 #ifdef ENABLE_MULTI_PROTOCOL
-    if (client_cfg.preferred_storage_level == StorageLevel::CXL) {
-        client_cfg.preferred_segment = local_hostname_;
+    if (client_cfg.PreferredStorageLevel() == StorageLevel::CXL) {
+        client_cfg.preferred_segment =
+            SegmentNameForProtocol(local_hostname_, "cxl");
     } else
 #endif
     {
         if (protocol_ == "cxl") {
             client_cfg.preferred_storage_level = StorageLevel::CXL;
-            client_cfg.preferred_segment = local_hostname_;
+            client_cfg.preferred_segment =
+                SegmentNameForProtocol(local_hostname_, protocol_);
         }
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
@@ -4467,7 +4479,7 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
 
         Segment segment;
         segment.id = generate_uuid();
-        segment.name = local_hostname_;
+        segment.name = SegmentNameForProtocol(local_hostname_, protocol);
         segment.base = reinterpret_cast<uintptr_t>(buffer);
         segment.size = size;
         segment.protocol = protocol;

@@ -2352,6 +2352,10 @@ class MasterService {
         standby_allocator_keepalive_;
     std::vector<StandbySegmentInfo> standby_memory_segments_;
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
+    // Tier for each entry above. The standby segment registry predates tiered
+    // storage, so restore derives this from each live buffer descriptor.
+    std::unordered_map<std::string, StorageLevel>
+        standby_accounted_memory_levels_;
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 

@@ -99,7 +99,11 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
         wms_cfg.root_fs_dir = config.root_fs_dir.has_value()
                                   ? config.root_fs_dir.value()
                                   : DEFAULT_ROOT_FS_DIR;
-        wms_cfg.memory_allocator = BufferAllocatorType::OFFSET;
+        // CXL uses the shared CacheLib-backed allocator. Keep the lightweight
+        // offset allocator for the ordinary embedded-master path.
+        wms_cfg.memory_allocator = config.enable_cxl.value_or(false)
+                                       ? BufferAllocatorType::CACHELIB
+                                       : BufferAllocatorType::OFFSET;
         if (config.enable_disk_eviction.has_value()) {
             wms_cfg.enable_disk_eviction = config.enable_disk_eviction.value();
         }

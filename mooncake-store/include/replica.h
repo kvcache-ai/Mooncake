@@ -121,7 +121,6 @@ struct ReplicateConfig {
     std::vector<std::string>
         preferred_nof_segments{};  // Preferred NoF segments for allocation
     bool prefer_alloc_in_same_node{false};
-    StorageLevel preferred_storage_level{StorageLevel::RAM};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
     std::string host_id{};
     // Optional per-key group IDs. Empty string keeps that key
@@ -184,6 +183,13 @@ struct ReplicateConfig {
     struct_pack::compatible<std::string, 5> requester_self_id;
     struct_pack::compatible<std::string, 5> fabric_domain;
     struct_pack::compatible<PhysicalPlacement, 5> requester_placement;
+    // Versioned so peers predating tiered storage keep the legacy RAM default
+    // instead of failing to decode the request's base wire layout.
+    struct_pack::compatible<StorageLevel, 6> preferred_storage_level;
+
+    StorageLevel PreferredStorageLevel() const {
+        return preferred_storage_level.value_or(StorageLevel::RAM);
+    }
 
     bool ValidSessionIds(size_t key_count) const {
         return !session_ids ||
@@ -267,7 +273,7 @@ struct ReplicateConfig {
         os << "]";
         os << ", prefer_alloc_in_same_node: "
            << config.prefer_alloc_in_same_node;
-        os << ", preferred_storage_level: " << config.preferred_storage_level
+        os << ", preferred_storage_level: " << config.PreferredStorageLevel()
            << ", data_type: " << config.data_type;
         if (!config.host_id.empty()) {
             os << ", host_id: " << config.host_id;

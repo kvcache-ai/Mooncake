@@ -114,15 +114,18 @@ TEST(PlacementRpcTest, LegacyLayoutsRemainCompatibleInBothDirections) {
     ASSERT_TRUE(decoded);
     EXPECT_EQ(decoded->host_id, "host1");
     EXPECT_EQ(decoded->SessionId(), "session1");
+    EXPECT_EQ(decoded->PreferredStorageLevel(), StorageLevel::RAM);
     EXPECT_FALSE(decoded->requester_placement);
     EXPECT_FALSE(decoded->fabric_domain);
     decoded->requester_self_id = "rack1.host1#g3";
     decoded->fabric_domain = "fabric1";
     decoded->requester_placement =
         PhysicalPlacement{"fabric1", "rack1", "host1", 3, 2};
+    decoded->preferred_storage_level = StorageLevel::CXL;
     const auto bytes = struct_pack::serialize(*decoded);
     auto restored = struct_pack::deserialize<ReplicateConfig>(bytes);
     ASSERT_TRUE(restored);
+    EXPECT_EQ(restored->PreferredStorageLevel(), StorageLevel::CXL);
     ASSERT_TRUE(restored->requester_placement);
     EXPECT_EQ(*restored->requester_placement, *decoded->requester_placement);
     EXPECT_EQ(*restored->requester_self_id, "rack1.host1#g3");

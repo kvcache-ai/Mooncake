@@ -66,6 +66,39 @@ namespace mooncake {
 
 namespace {
 
+StorageLevel MemoryStorageLevelForProtocol(const std::string& protocol) {
+    return protocol == "cxl" ? StorageLevel::CXL : StorageLevel::RAM;
+}
+
+StorageLevel AccountedStorageLevel(
+    const std::unordered_map<std::string, StorageLevel>& levels,
+    const std::string& segment) {
+    const auto it = levels.find(segment);
+    return it == levels.end() ? StorageLevel::RAM : it->second;
+}
+
+void IncStandbyMemoryMetrics(const std::string& segment, uint64_t bytes,
+                             StorageLevel level) {
+    auto& metrics = MasterMetricManager::instance();
+    metrics.inc_allocated_mem_size(segment, static_cast<int64_t>(bytes));
+    if (level == StorageLevel::CXL) {
+        metrics.inc_allocated_cxl_size(segment, static_cast<int64_t>(bytes));
+    } else {
+        metrics.inc_allocated_dram_size(segment, static_cast<int64_t>(bytes));
+    }
+}
+
+void DecStandbyMemoryMetrics(const std::string& segment, uint64_t bytes,
+                             StorageLevel level) {
+    auto& metrics = MasterMetricManager::instance();
+    metrics.dec_allocated_mem_size(segment, static_cast<int64_t>(bytes));
+    if (level == StorageLevel::CXL) {
+        metrics.dec_allocated_cxl_size(segment, static_cast<int64_t>(bytes));
+    } else {
+        metrics.dec_allocated_dram_size(segment, static_cast<int64_t>(bytes));
+    }
+}
+
 tl::expected<OpLogEntry, ErrorCode> BuildSegmentMountOpLogEntry(
     const Segment& segment, const std::string& key) {
     SegmentMountOp op;
@@ -1044,8 +1077,9 @@ MasterService::~MasterService() {
 
     client_offboarding_worker_.Stop();
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
-        MasterMetricManager::instance().dec_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
+        DecStandbyMemoryMetrics(
+            segment, bytes,
+            AccountedStorageLevel(standby_accounted_memory_levels_, segment));
         MasterMetricManager::instance().remove_segment_metrics(segment);
     }
 
@@ -1526,14 +1560,17 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         }
         for (auto& restore : restores) {
             if (restore.imported_size != 0) {
-                MasterMetricManager::instance().dec_allocated_mem_size(
-                    restore.segment.name,
-                    static_cast<int64_t>(restore.imported_size));
+                DecStandbyMemoryMetrics(
+                    restore.segment.name, restore.imported_size,
+                    AccountedStorageLevel(standby_accounted_memory_levels_,
+                                           restore.segment.name));
                 auto accounted =
                     standby_accounted_memory_bytes_.find(restore.segment.name);
                 accounted->second -= restore.imported_size;
                 if (accounted->second == 0) {
                     standby_accounted_memory_bytes_.erase(accounted);
+                    standby_accounted_memory_levels_.erase(
+                        restore.segment.name);
                 }
             }
             for (size_t i = 0; i < restore.replicas.size(); ++i) {
@@ -3937,6 +3974,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     std::unordered_map<const StandbySegmentInfo*, std::map<uintptr_t, uint64_t>>
         bounded_memory_ranges;
     std::unordered_map<std::string, uint64_t> restored_accounted_memory_bytes;
+    std::unordered_map<std::string, StorageLevel>
+        restored_accounted_memory_levels;
     size_t restored_object_count = 0;
     size_t dropped_stale_replica_count = 0;
     size_t skipped_stale_object_count = 0;
@@ -4022,6 +4061,20 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                     const auto* segment = segment_it->second;
                     if (desc.status != ReplicaStatus::REMOVED &&
                         desc.status != ReplicaStatus::FAILED) {
+                        const auto storage_level =
+                            MemoryStorageLevelForProtocol(buffer.protocol_);
+                        auto [level_it, level_inserted] =
+                            restored_accounted_memory_levels.emplace(
+                                segment->segment_name, storage_level);
+                        if (!level_inserted &&
+                            level_it->second != storage_level) {
+                            LOG(ERROR)
+                                << "RestoreFromStandbySnapshot: mixed memory "
+                                   "tiers for segment="
+                                << segment->segment_name;
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_PARAMS);
+                        }
                         auto& bytes =
                             restored_accounted_memory_bytes[segment
                                                                 ->segment_name];
@@ -4191,6 +4244,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
 
     const auto prev_standby_accounted_memory_bytes =
         standby_accounted_memory_bytes_;
+    const auto prev_standby_accounted_memory_levels =
+        standby_accounted_memory_levels_;
     const auto prev_standby_memory_segments = standby_memory_segments_;
     const auto prev_standby_allocator_keepalive = standby_allocator_keepalive_;
     const auto prev_invalid_replica_endpoints = invalid_replica_endpoints_;
@@ -4210,6 +4265,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
             }
         }
         standby_accounted_memory_bytes_ = prev_standby_accounted_memory_bytes;
+        standby_accounted_memory_levels_ =
+            prev_standby_accounted_memory_levels;
         standby_memory_segments_ = prev_standby_memory_segments;
         standby_allocator_keepalive_ = prev_standby_allocator_keepalive;
         invalid_replica_endpoints_ = prev_invalid_replica_endpoints;
@@ -4218,6 +4275,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
 
     standby_accounted_memory_bytes_ =
         std::move(restored_accounted_memory_bytes);
+    standby_accounted_memory_levels_ =
+        std::move(restored_accounted_memory_levels);
     standby_memory_segments_ = std::move(restored_memory_segments);
     standby_allocator_keepalive_ = std::move(restored_allocators);
     invalid_replica_endpoints_ = std::move(restored_invalid_endpoints);
@@ -4346,12 +4405,15 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     // the client/snapshot mutexes held here mean no concurrent reader can see
     // the gauge drift between the map swap and this commit.
     for (const auto& [segment, bytes] : prev_standby_accounted_memory_bytes) {
-        MasterMetricManager::instance().dec_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
+        DecStandbyMemoryMetrics(
+            segment, bytes,
+            AccountedStorageLevel(prev_standby_accounted_memory_levels,
+                                   segment));
     }
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
-        MasterMetricManager::instance().inc_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
+        IncStandbyMemoryMetrics(
+            segment, bytes,
+            AccountedStorageLevel(standby_accounted_memory_levels_, segment));
     }
 
     LOG(INFO) << "Restored from standby: " << restored_object_count
@@ -4922,7 +4984,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
     size_t allocated_nof_replicas = 0;
     bool has_enough_memory_segments = false;
     const StorageLevel memory_storage_level =
-        config.preferred_storage_level == StorageLevel::CXL
+        config.PreferredStorageLevel() == StorageLevel::CXL
             ? StorageLevel::CXL
             : StorageLevel::RAM;
     auto request_memory_eviction = [this, memory_storage_level]() {
