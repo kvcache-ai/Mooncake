@@ -377,10 +377,10 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
 
 TEST_F(AllocationStrategyTest, ServingNamesCanBeFilteredByStorageLevel) {
     auto ram_allocator = std::make_shared<OffsetBufferAllocator>(
-        "ram_segment", 0x100000000, 64 * MiB, "ram_segment",
+        "ram_segment", 0x100000000, 64 * MiB, "ram_segment", "tcp",
         StorageLevel::RAM);
     auto cxl_allocator = std::make_shared<OffsetBufferAllocator>(
-        "cxl_segment", 0x110000000, 64 * MiB, "cxl_segment",
+        "cxl_segment", 0x110000000, 64 * MiB, "cxl_segment", "cxl",
         StorageLevel::CXL);
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("ram_segment", ram_allocator);
@@ -397,10 +397,10 @@ TEST_F(AllocationStrategyTest, ServingNamesCanBeFilteredByStorageLevel) {
 TEST_F(AllocationStrategyTest, NoFAllocationSelectsSsdAllocator) {
     constexpr size_t kSliceLength = 1024;
     auto ram_allocator = std::make_shared<OffsetBufferAllocator>(
-        "shared_segment", 0x100000000, 64 * MiB, "ram_endpoint",
+        "shared_segment", 0x100000000, 64 * MiB, "ram_endpoint", "tcp",
         StorageLevel::RAM, ReplicaType::MEMORY);
     auto nof_allocator = std::make_shared<OffsetBufferAllocator>(
-        "shared_segment", 0x110000000, 64 * MiB, "nof_endpoint",
+        "shared_segment", 0x110000000, 64 * MiB, "nof_endpoint", "nvmeof",
         StorageLevel::SSD, ReplicaType::NOF_SSD);
 
     AllocatorManager allocator_manager;
@@ -463,10 +463,10 @@ TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
 
     auto suspected_cxl_allocator = std::make_shared<OffsetBufferAllocator>(
         "shared-cxl", DEFAULT_CXL_BASE + 128 * MiB, 64 * MiB,
-        "suspected-cxl", StorageLevel::CXL);
+        "suspected-cxl", "cxl", StorageLevel::CXL);
     auto active_cxl_allocator = std::make_shared<OffsetBufferAllocator>(
         "shared-cxl", DEFAULT_CXL_BASE + 192 * MiB, 64 * MiB, "active-cxl",
-        StorageLevel::CXL);
+        "cxl", StorageLevel::CXL);
     AllocatorManager cxl_allocator_manager;
     cxl_allocator_manager.addAllocator("shared-cxl", suspected_cxl_allocator,
                                        suspected);
