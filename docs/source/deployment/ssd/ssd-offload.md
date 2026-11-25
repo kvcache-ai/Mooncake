@@ -115,6 +115,7 @@ These flags control when the master asks clients to persist objects to SSD, whet
 | `--offload_force_evict` | `false` | If offload-on-evict exceeds the per-cycle offload cap, force-evict excess objects instead of leaving them in DRAM |
 | `--offloading_queue_limit` | `50000` | Maximum pending offload objects per local disk segment. Must be greater than `0` and at most `100000000` |
 | `--offload_cap_ratio` | `0.5` | Per-eviction-cycle cap as a fraction of `offloading_queue_limit`; range `[0.0, 1.0]`. Default cap is `25000` objects per cycle |
+| `--offload_ordered_buckets` | `false` | Hand each client its offload tasks in the order they were queued instead of hash order. Takes effect with `--enable_offload=true`; pair it with `MOONCAKE_OFFLOAD_ORDERED_BUCKETS=1` on the clients — see {ref}`Ordered bucket packing <ssd-offload-ordered-buckets>` |
 | `--promotion_on_hit` | `false` | Promote SSD-resident objects back to DRAM after read hits |
 | `--promotion_admission_threshold` | `2` | Minimum CountMinSketch count before promotion is admitted. Set `1` to disable second-touch gating |
 | `--promotion_max_per_heartbeat` | `1` | Maximum promotion tasks returned to one client per heartbeat. Keep conservative for large objects because each task does SSD read plus memory write |
@@ -164,6 +165,7 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`, applied **per disk** when several are configured. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
 | `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
+| `MOONCAKE_OFFLOAD_ORDERED_BUCKETS` | `0` | Pack objects into buckets in the order the master delivered them instead of hash order. Set it on every real client and start the master with `--offload_ordered_buckets=true` — see {ref}`Ordered bucket packing <ssd-offload-ordered-buckets>` |
 
 For `packed` direct bucket writes, each writing thread retains a 4096-byte-aligned buffer
 that grows to fit its largest bucket and is released when the thread exits.
@@ -202,6 +204,36 @@ size of written buckets count only keys and values, so it suits large values.
 Offloaded data is not left in the page cache. Where the filesystem refuses
 `O_DIRECT`, the same aligned writes go through the page cache. Buckets written
 this way remain readable with the option off.
+
+(ssd-offload-ordered-buckets)=
+
+### Ordered bucket packing
+
+By default a bucket holds an arbitrary subset of the objects queued for one
+client between two heartbeats: the master's offload queue and the client's
+bucket grouping both iterate hash maps. Objects written together, such as the
+KV blocks of one prefix, end up in several buckets. Reading them back then
+touches several bucket files, and with `lru` eviction a read also refreshes the
+unrelated objects that share those buckets.
+
+Start the master with `--offload_ordered_buckets=true` (or
+`offload_ordered_buckets: true` in its config file) and set
+`MOONCAKE_OFFLOAD_ORDERED_BUCKETS=1` on every real client to keep the order:
+
+- The master hands each client its offload tasks in the order they were
+  queued: at `PutEnd`, or by eviction with `--offload_on_evict=true`. A task
+  removed before the heartbeat is skipped; one queued again takes its new
+  place.
+- The client packs buckets in that order. With
+  `MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS=0` (the default), the partial last
+  bucket of one heartbeat opens the first bucket of the next, so objects
+  queued on either side of a heartbeat still share a bucket.
+
+Only which objects share a bucket follows the order; the layout of the objects
+inside a bucket file is unchanged. Each side logs a line at startup when its
+setting is on. With it on one side only, nothing breaks, but buckets are still
+packed in hash order. The on-disk format does not change, and buckets written
+either way stay readable.
 
 (ssd-offload-multiple-disks)=
 
