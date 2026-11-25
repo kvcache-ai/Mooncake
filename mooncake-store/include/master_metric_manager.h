@@ -421,6 +421,20 @@ class MasterMetricManager {
     // Sources of copies a store had taken, kept when their object went.
     void inc_offload_evict_parked(int64_t val = 1);
     int64_t get_offload_evict_parked();
+    // Ticks that waited for the landings in flight instead of queueing
+    // another round (round_skipped{reason="wait_for_landings"}).
+    void inc_offload_evict_waited_for_frees(int64_t val = 1);
+    int64_t get_offload_evict_waited_for_frees();
+    // Eviction queued the offload -> its copy registered, and -> its memory
+    // freed as the copy landed, in microseconds (exported in ms); landed
+    // copies whose memory stayed because a read lease was live
+    // (kept{reason="read_again"}).
+    void observe_offload_evict_write_latency(int64_t us);
+    void observe_offload_evict_free_latency(int64_t us);
+    int64_t get_offload_evict_write_latency_count();
+    int64_t get_offload_evict_free_latency_count();
+    void inc_offload_evict_lease_wait(int64_t val = 1);
+    int64_t get_offload_evict_lease_wait();
 
     // Promotion-on-hit Metrics Getters
     int64_t get_promotion_in_flight();
@@ -859,6 +873,10 @@ class MasterMetricManager {
     ylt::metric::dynamic_counter_1t offload_evict_round_skipped_total_;
     ylt::metric::counter_t offload_evict_stale_landings_total_;
     ylt::metric::counter_t offload_evict_parked_total_;
+    ylt::metric::counter_t offload_evict_waited_for_frees_total_;
+    ylt::metric::histogram_t offload_evict_write_latency_ms_;
+    ylt::metric::histogram_t offload_evict_free_latency_ms_;
+    ylt::metric::counter_t offload_evict_lease_wait_total_;
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     ylt::metric::counter_t copy_start_requests_;

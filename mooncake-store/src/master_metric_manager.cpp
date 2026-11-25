@@ -539,6 +539,28 @@ MasterMetricManager::MasterMetricManager()
           "Sources of copies a store had taken, kept until the copy is "
           "reported when their object was removed or cleared "
           "(--offload_on_evict_async)"),
+      offload_evict_waited_for_frees_total_(
+          "master_offload_evict_waited_for_frees_total",
+          "Eviction ticks that waited for the offloads in flight to land "
+          "instead of queueing another round (--offload_on_evict_async)"),
+      offload_evict_write_latency_ms_(
+          "master_offload_evict_write_latency_ms",
+          "Eviction queued the offload -> SSD copy registered, ms "
+          "(--offload_on_evict_async)",
+          {1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 20000,
+           60000}),
+      offload_evict_free_latency_ms_(
+          "master_offload_evict_free_latency_ms",
+          "Eviction queued the offload -> memory freed as the copy landed, "
+          "ms; copies whose memory stayed are not observed "
+          "(--offload_on_evict_async)",
+          {1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 20000,
+           60000}),
+      offload_evict_lease_wait_total_(
+          "master_offload_evict_lease_wait_total",
+          "Landed eviction offloads whose memory stayed because a read lease "
+          "was granted while the copy was written; eviction frees it later "
+          "(--offload_on_evict_async)"),
 
       // Initialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd,
       // MoveRevoke Counters
@@ -1688,6 +1710,48 @@ int64_t MasterMetricManager::get_offload_evict_parked() {
     return offload_evict_parked_total_.value();
 }
 
+void MasterMetricManager::inc_offload_evict_waited_for_frees(int64_t val) {
+    offload_evict_waited_for_frees_total_.inc(val);
+}
+
+int64_t MasterMetricManager::get_offload_evict_waited_for_frees() {
+    return offload_evict_waited_for_frees_total_.value();
+}
+
+void MasterMetricManager::observe_offload_evict_write_latency(int64_t us) {
+    offload_evict_write_latency_ms_.observe(us / 1000);
+}
+
+void MasterMetricManager::observe_offload_evict_free_latency(int64_t us) {
+    offload_evict_free_latency_ms_.observe(us / 1000);
+}
+
+namespace {
+int64_t HistogramCount(ylt::metric::histogram_t& histogram) {
+    int64_t count = 0;
+    for (const auto& bucket : histogram.get_bucket_counts()) {
+        count += bucket->value();
+    }
+    return count;
+}
+}  // namespace
+
+int64_t MasterMetricManager::get_offload_evict_write_latency_count() {
+    return HistogramCount(offload_evict_write_latency_ms_);
+}
+
+int64_t MasterMetricManager::get_offload_evict_free_latency_count() {
+    return HistogramCount(offload_evict_free_latency_ms_);
+}
+
+void MasterMetricManager::inc_offload_evict_lease_wait(int64_t val) {
+    offload_evict_lease_wait_total_.inc(val);
+}
+
+int64_t MasterMetricManager::get_offload_evict_lease_wait() {
+    return offload_evict_lease_wait_total_.value();
+}
+
 int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
 }
@@ -2565,6 +2629,10 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(offload_evict_round_skipped_total_);
     serialize_metric(offload_evict_stale_landings_total_);
     serialize_metric(offload_evict_parked_total_);
+    serialize_metric(offload_evict_waited_for_frees_total_);
+    serialize_metric(offload_evict_write_latency_ms_);
+    serialize_metric(offload_evict_free_latency_ms_);
+    serialize_metric(offload_evict_lease_wait_total_);
     serialize_metric(weight_revisions_by_availability_);
     serialize_metric(weight_revisions_by_residency_);
     serialize_metric(weight_active_leases_);

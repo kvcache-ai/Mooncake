@@ -155,6 +155,13 @@ tl::expected<std::string, ErrorCode> GetResidencyAffinityIdForKey(
     return config.residency_affinity_ids->at(key_index);
 }
 
+// Microseconds of the system clock since `since`.
+int64_t MicrosSince(std::chrono::system_clock::time_point since) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::system_clock::now() - since)
+        .count();
+}
+
 }  // namespace
 
 // Defined unconditionally (CreateNofRuntime() exists in every build and
@@ -8552,6 +8559,11 @@ auto MasterService::NotifyOffloadSuccess(
                     if (source != nullptr) {
                         source->dec_refcnt();
                     }
+                    // Async: when eviction queued this copy.
+                    const auto evict_queued_at =
+                        offloading_task->token != 0
+                            ? std::optional(offloading_task->start_time)
+                            : std::nullopt;
                     offloading_task.reset();
 
                     if (!segment_mounted) {
@@ -8593,7 +8605,13 @@ auto MasterService::NotifyOffloadSuccess(
                     // Under the key's lock, so the release that publishes
                     // the KV delta reports the memory gone.
                     if (offload_async_ && segment_mounted) {
-                        freed_on_landing = FreeLandedOffloadSource(accessor);
+                        if (evict_queued_at) {
+                            MasterMetricManager::instance()
+                                .observe_offload_evict_write_latency(
+                                    MicrosSince(*evict_queued_at));
+                        }
+                        freed_on_landing =
+                            FreeLandedOffloadSource(accessor, evict_queued_at);
                     }
                     handled_existing_object = true;
                 }
@@ -10293,13 +10311,15 @@ MasterService::AsyncEvictionTick MasterService::RunAsyncOffloadEvictionTick() {
         // The next failed allocation raises the flag again.
         need_mem_eviction_.store(false, std::memory_order_relaxed);
         metrics.inc_offload_evict_round_skipped("wait_for_landings");
+        metrics.inc_offload_evict_waited_for_frees();
         return AsyncEvictionTick::kWaitForLandings;
     }
     return AsyncEvictionTick::kRan;
 }
 
 std::vector<Replica> MasterService::FreeLandedOffloadSource(
-    MetadataAccessorRW& accessor) {
+    MetadataAccessorRW& accessor,
+    std::optional<std::chrono::system_clock::time_point> evict_queued_at) {
     ObjectMetadata& metadata = accessor.Get();
     // A refused registration landed nothing, and an object with no memory
     // left has nothing to free.
@@ -10320,6 +10340,7 @@ std::vector<Replica> MasterService::FreeLandedOffloadSource(
     }
     if (!metadata.IsLeaseExpired(now)) {
         metrics.inc_offload_evict_kept("read_again");
+        metrics.inc_offload_evict_lease_wait();
         return {};
     }
     auto plan = memory_eviction_->policy.Decide(eviction::Candidate{
@@ -10338,6 +10359,10 @@ std::vector<Replica> MasterService::FreeLandedOffloadSource(
     }
     metrics.inc_offload_evict_freed(
         static_cast<int64_t>(effect->released_bytes));
+    if (evict_queued_at) {
+        metrics.observe_offload_evict_free_latency(
+            MicrosSince(*evict_queued_at));
+    }
     return std::move(effect->detached);
 }
 

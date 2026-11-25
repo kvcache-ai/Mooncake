@@ -1600,10 +1600,12 @@ class MasterService {
     // Async: what eviction has queued for offload and not yet seen end.
     const eviction::OffloadLedger& offload_ledger() const;
     // Async: frees the memory of the object `accessor` holds, whose offload
-    // eviction queued has just landed, unless it was read, pinned or taken
-    // meanwhile. Returns the replicas taken, to be freed once the key is let
-    // go.
-    std::vector<Replica> FreeLandedOffloadSource(MetadataAccessorRW& accessor);
+    // eviction queued (at `evict_queued_at`, when it was eviction's copy) has
+    // just landed, unless it was read, pinned or taken meanwhile. Returns the
+    // replicas taken, to be freed once the key is let go.
+    std::vector<Replica> FreeLandedOffloadSource(
+        MetadataAccessorRW& accessor,
+        std::optional<std::chrono::system_clock::time_point> evict_queued_at);
     // Async, under the key's lock, as the object (or the replica the copy
     // reads) goes: cancels a copy still queued, or, when a store already
     // took it, parks the source replica until the copy is reported, so its
