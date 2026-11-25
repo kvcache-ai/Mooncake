@@ -358,9 +358,12 @@ impl ClassicTransferEngine {
         })
     }
 
+    /// Relinquish the batch handle, including when native cleanup is deferred.
+    /// Success invalidates the handle; it does not imply that an unfinished
+    /// transfer has stopped accessing its buffers. Callers must wait separately.
     pub fn free_batch(&self, batch_id: u64) -> Result<()> {
         let rc = unsafe { ffi::freeBatchID(self.raw, batch_id) };
-        check_zero(rc, "freeBatchID")
+        check_batch_release(rc)
     }
 
     pub fn sync_segment_cache(&self) -> Result<()> {
@@ -486,6 +489,19 @@ fn check_zero(rc: i32, operation: &str) -> Result<()> {
     }
 }
 
+fn check_batch_release(rc: i32) -> Result<()> {
+    // Classic C API returns mooncake::Status::Code. Unlike kBatchBusy (4),
+    // kBatchCleanupDeferred (5) invalidates the handle and transfers cleanup
+    // ownership to the engine. It can occur after COMPLETED while the final
+    // completion callback is still unwinding.
+    const BATCH_CLEANUP_DEFERRED: i32 = 5;
+    if rc == BATCH_CLEANUP_DEFERRED {
+        Ok(())
+    } else {
+        check_zero(rc, "freeBatchID")
+    }
+}
+
 fn encode_opcode(opcode: Opcode) -> i32 {
     match opcode {
         Opcode::Read => ffi::OPCODE_READ,
@@ -533,9 +549,9 @@ mod tests {
     use mooncake_store_rs_transport_sys::classic as ffi;
 
     use super::{
-        check_zero, classic_engine_create_lock, decode_status, encode_opcode, encode_request,
-        encode_requests, read_c_buffer, to_cstring, ClassicCreateEnvGuard, ClassicEngineConfig,
-        ClassicTransferEngine, ClassicTransportProtocol,
+        check_batch_release, check_zero, classic_engine_create_lock, decode_status, encode_opcode,
+        encode_request, encode_requests, read_c_buffer, to_cstring, ClassicCreateEnvGuard,
+        ClassicEngineConfig, ClassicTransferEngine, ClassicTransportProtocol,
     };
     use crate::{Opcode, TransferRequest, TransferStatus};
 
@@ -556,6 +572,25 @@ mod tests {
         check_zero(0, "demo").expect("zero rc should succeed");
         let error = check_zero(-1, "demo").expect_err("non-zero rc should fail");
         assert!(error.to_string().contains("demo failed"));
+    }
+
+    #[test]
+    fn batch_release_accepts_native_cleanup_ownership() {
+        check_batch_release(0).expect("released batch");
+        check_batch_release(5).expect("engine owns deferred cleanup");
+        // This exception belongs only to batch release, not other C API calls.
+        assert!(check_zero(5, "submitTransfer").is_err());
+    }
+
+    #[test]
+    fn batch_release_preserves_busy_and_unexpected_errors() {
+        for rc in [-1, 1, 2, 3, 4, 6, i32::MAX] {
+            let error = check_batch_release(rc).expect_err("release must fail");
+            assert_eq!(
+                error.to_string(),
+                format!("transport error: freeBatchID failed with rc={rc}")
+            );
+        }
     }
 
     #[test]
