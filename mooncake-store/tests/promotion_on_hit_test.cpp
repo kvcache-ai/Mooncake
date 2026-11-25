@@ -875,8 +875,8 @@ TEST_F(PromotionOnHitTest, RemoveDuringPromotion) {
     EXPECT_EQ(notify.error(), ErrorCode::OBJECT_NOT_FOUND);
 
     // Wait for the reaper; it must tolerate the missing metadata entry
-    // (the source replica it would dec_refcnt is already gone). 3s for
-    // CI-safe margin over the 1s release timeout.
+    // (the source replica whose ReplicaPin is being released is already gone).
+    // 3s for CI-safe margin over the 1s release timeout.
     std::this_thread::sleep_for(std::chrono::seconds(3));
 
     // Re-injecting the key and re-triggering must work end-to-end, proving

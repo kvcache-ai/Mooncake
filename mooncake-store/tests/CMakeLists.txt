@@ -298,6 +298,7 @@ add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(object_part_test object_part_test.cpp)
 add_store_test(object_route_test object_route_test.cpp)
 add_store_test(heap_optional_test heap_optional_test.cpp)
+add_store_test(replica_pin_test replica_pin_test.cpp)
 add_store_test(dynamic_replication_controller_test
                dynamic_replication_controller_test.cpp)
 add_store_test(promotion_candidate_tracker_test
