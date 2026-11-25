@@ -96,6 +96,58 @@ TEST_F(HttpMetadataServerTest, RejectsChangedRpcMetaRepublish) {
     server.stop();
 }
 
+// Clients URL-encode the key (curl_easy_escape), so the server must store it
+// decoded for in-process removal by name (MasterService::cleanupHttpMetadata)
+// to find it.
+TEST_F(HttpMetadataServerTest, StoresUrlEncodedKeysDecoded) {
+    int port = getFreeTcpPort();
+    HttpMetadataServer server(static_cast<uint16_t>(port), "127.0.0.1");
+    ASSERT_TRUE(server.start());
+    WaitUntilReady(port);
+
+    const std::string encoded_path =
+        "/metadata?key=mooncake%2Fram%2F10.0.0.1%3A12384";
+    const std::string body = R"({"buffers":[]})";
+
+    ASSERT_EQ(Put(port, encoded_path, body).status, 200);
+
+    // Encoded and plain spellings address the same entry.
+    auto plain = Get(port, "/metadata?key=mooncake/ram/10.0.0.1:12384");
+    EXPECT_EQ(plain.status, 200);
+    EXPECT_EQ(plain.body, body);
+
+    EXPECT_TRUE(server.removeKey("mooncake/ram/10.0.0.1:12384"));
+    EXPECT_EQ(Get(port, encoded_path).status, 404);
+
+    server.stop();
+}
+
+// A client that crashed keeps its host:port; once its rpc_meta key is removed
+// by name, the restarted client's new rpc_meta must be accepted.
+TEST_F(HttpMetadataServerTest, RpcMetaRepublishSucceedsAfterRemoveByName) {
+    int port = getFreeTcpPort();
+    HttpMetadataServer server(static_cast<uint16_t>(port), "127.0.0.1");
+    ASSERT_TRUE(server.start());
+    WaitUntilReady(port);
+
+    const std::string path =
+        "/metadata?key=mooncake%2Frpc_meta%2F10.0.0.1%3A12384";
+    const std::string original =
+        R"({"ip_or_host_name":"10.0.0.1","rpc_port":15228})";
+    const std::string restarted =
+        R"({"ip_or_host_name":"10.0.0.1","rpc_port":16000})";
+
+    ASSERT_EQ(Put(port, path, original).status, 200);
+    EXPECT_TRUE(server.removeKey("mooncake/rpc_meta/10.0.0.1:12384"));
+
+    auto republish = Put(port, path, restarted);
+    EXPECT_EQ(republish.status, 200);
+    EXPECT_EQ(republish.body, "metadata updated");
+    EXPECT_EQ(Get(port, path).body, restarted);
+
+    server.stop();
+}
+
 TEST_F(HttpMetadataServerTest, StartReportsBindFailure) {
     int port = getFreeTcpPort();
     HttpMetadataServer first(static_cast<uint16_t>(port), "127.0.0.1");

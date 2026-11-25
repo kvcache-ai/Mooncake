@@ -1,6 +1,8 @@
 #include "master_service.h"
+#include "common/network.h"
 #include "common/shrink_buckets.h"
 #include "config/replica_selection_config.h"
+#include "http_metadata_server.h"
 #include "master_service/master_service_test_peer.h"
 #include "rpc_service.h"
 #include "storage/distributed/kvcs/kvcs_capacity_provider.h"
@@ -8,6 +10,8 @@
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <async_simple/coro/SyncAwait.h>
+#include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/struct_json/json_reader.h>
 
 #include <algorithm>
@@ -6050,6 +6054,47 @@ TEST_F(MasterServiceTest, StopHttpMetadataCleanupIsNoOpWhenNeverStarted) {
     // Cleanup stays disabled: neither a co-located server nor a remote URL.
     MasterServiceTestPeer(service).CleanupHttpMetadataForTesting("segment_a");
     service.StopHttpMetadataCleanup();
+}
+
+// Keys reach the co-located server URL-encoded, as transfer engine clients
+// send them; in-process cleanup must still remove both of the segment's keys.
+TEST_F(MasterServiceTest, CoLocatedHttpMetadataCleanupRemovesClientKeys) {
+    const int port = getFreeTcpPort();
+    HttpMetadataServer server(static_cast<uint16_t>(port), "127.0.0.1");
+    ASSERT_TRUE(server.start());
+
+    const std::string base = "http://127.0.0.1:" + std::to_string(port);
+    auto put = [&](const std::string& path, const std::string& body) {
+        coro_http::coro_http_client client;
+        return async_simple::coro::syncAwait(
+                   client.async_put(base + path, body,
+                                    coro_http::req_content_type::json))
+            .status;
+    };
+    auto get = [&](const std::string& path) {
+        coro_http::coro_http_client client;
+        return async_simple::coro::syncAwait(client.async_get(base + path))
+            .status;
+    };
+
+    const std::string ram_path =
+        "/metadata?key=mooncake%2Fram%2F127.0.0.1%3A17777";
+    const std::string rpc_path =
+        "/metadata?key=mooncake%2Frpc_meta%2F127.0.0.1%3A17777";
+    ASSERT_EQ(200, put(ram_path, R"({"buffers":[]})"));
+    ASSERT_EQ(200, put(rpc_path, R"({"ip_or_host_name":"127.0.0.1"})"));
+
+    {
+        MasterService service;
+        service.setHttpMetadataServer(&server);
+        MasterServiceTestPeer(service).CleanupHttpMetadataForTesting(
+            "127.0.0.1:17777");
+    }
+
+    EXPECT_EQ(404, get(ram_path)) << "ram key survived cleanup";
+    EXPECT_EQ(404, get(rpc_path)) << "rpc_meta key survived cleanup";
+
+    server.stop();
 }
 
 TEST_F(MasterServiceTest,
