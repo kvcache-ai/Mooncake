@@ -4665,7 +4665,7 @@ bool MasterService::IsEvictableMemoryReplica(const Replica& replica) const {
 bool MasterService::IsEvictableMemoryReplicaAtLevel(
     const Replica& replica, StorageLevel target_level) const {
     return IsEvictableMemoryReplica(replica) &&
-           replica.get_storage_level() == target_level;
+           replica.get_descriptor().get_storage_level() == target_level;
 }
 
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
