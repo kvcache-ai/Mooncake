@@ -201,6 +201,68 @@ TEST_F(MasterServiceTest,
     EXPECT_EQ(usage.capacity_bytes, 100u);
 }
 
+// The KVCS DFS watermark evictor walks the eviction index memory eviction
+// walks. A memory-only key has nothing for it to release; skipping it must
+// not hide the key from the memory eviction that comes next.
+TEST_F(MasterServiceTest,
+       KvcsWatermarkRunLeavesMemoryOnlyKeysToMemoryEviction) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar clear_adapter("MOONCAKE_DFS_FS_ADAPTER");
+
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 1;
+    MasterService service(config);
+    const auto context = PrepareSimpleSegment(service);
+    MasterServiceTestPeer peer(service);
+    peer.EvictionRunning(service).store(false, std::memory_order_relaxed);
+    if (peer.EvictionThread(service).joinable()) {
+        peer.EvictionThread(service).join();
+    }
+    auto driver_state = std::make_shared<KvcsWatermarkDriverState>();
+    peer.ConfigureKvcsCapacityForTesting(
+        std::make_unique<KvcsCapacityProvider>(
+            1, "target-mp",
+            std::make_unique<KvcsWatermarkDriver>(driver_state)),
+        true, 0.9, 0.7);
+
+    constexpr size_t kKeys = 16;
+    std::vector<std::string> keys;
+    ReplicateConfig replicate;
+    replicate.replica_num = 1;  // memory only, no DFS replica
+    for (size_t i = 0; i < kKeys; ++i) {
+        keys.push_back("memory-only-" + std::to_string(i));
+        ASSERT_TRUE(service.PutStart(context.client_id, keys.back(),
+                                     TenantId::Default(), 1024, replicate));
+        ASSERT_TRUE(service.PutEnd(context.client_id, keys.back(),
+                                   TenantId::Default(), ReplicaType::MEMORY));
+    }
+    // Read without a lease.
+    const auto memory_replicas = [&] {
+        size_t count = 0;
+        for (const auto& listed :
+             service.BatchGetReplicaListForAdmin(keys, TenantId::Default())) {
+            if (listed) {
+                for (const auto& replica : listed->replicas) {
+                    count += replica.is_memory_replica();
+                }
+            }
+        }
+        return count;
+    };
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    ASSERT_EQ(memory_replicas(), kKeys);
+
+    // DFS usage 95% is over the 90% watermark: a KVCS run walks the keys and
+    // finds no DFS replica to delete.
+    peer.RefreshKvcsDfsUsageForTesting();
+    EXPECT_TRUE(driver_state->deleted_keys.empty());
+
+    // Memory eviction right after it still meets, and takes, every key.
+    peer.RunBatchEvictForTesting(1.0, 1.0);
+    EXPECT_EQ(memory_replicas(), 0u);
+}
+
 TEST_F(MasterServiceTest,
        FilesystemStorageModeRetainsAllocatorRecoveryRestriction) {
     ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");

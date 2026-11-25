@@ -176,13 +176,15 @@ class EvictorTest : public ::testing::Test {
 
     eviction::Report Run(const ObjectGoal& goal) {
         eviction::Evictor evictor(namespaces_, policy_, reclaimer_,
-                                  {&observer_});
+                                  {&observer_}, /*worker_threads=*/0,
+                                  postpone_skipped_);
         return evictor.Run(Scope::All(), goal);
     }
 
     eviction::Report Run(const ByteGoal& goal) {
         eviction::Evictor evictor(namespaces_, policy_, reclaimer_,
-                                  {&observer_});
+                                  {&observer_}, /*worker_threads=*/0,
+                                  postpone_skipped_);
         return evictor.Run(TenantId("a"), goal);
     }
 
@@ -196,6 +198,8 @@ class EvictorTest : public ::testing::Test {
     FakePolicy policy_;
     FakeReclaimer reclaimer_;
     RecordingObserver observer_;
+    // As memory eviction builds its evictor.
+    Clock::duration postpone_skipped_ = eviction::Evictor::kSkippedKeyBackoff;
 };
 
 // Each namespace gives up its own share first, however much older another
@@ -614,6 +618,41 @@ TEST_F(EvictorTest, AGroupIsNotPostponed) {
         Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
         EXPECT_EQ(observer_.skipped.size(), 2u);
     }
+}
+
+// An evictor that does not postpone (the KVCS DFS evictor, which walks memory
+// eviction's index) leaves the keys it skips filed where they were: the next
+// run meets them again, and so would memory eviction.
+TEST_F(EvictorTest, AnEvictorThatDoesNotPostponeLeavesSkippedKeysFiled) {
+    Publish("a", "pinned", seconds(10));
+    Publish("a", "held", seconds(10));
+    policy_.soft_pinned = {"pinned"};
+    metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
+    {
+        auto hold = ns.objects.Write("held");
+        ASSERT_TRUE(hold.has_value());
+        hold->metadata()
+            .GetReplicaByID(hold->metadata().GetAllReplicas()[0].id())
+            ->inc_refcnt();
+    }
+    postpone_skipped_ = Clock::duration::zero();
+    using Skips = std::set<std::pair<std::string, SkipReason>>;
+    const Skips skips{{"pinned", SkipReason::kSoftPinned},
+                      {"held", SkipReason::kNothingToRelease}};
+
+    for (int run = 0; run < 2; ++run) {
+        observer_.skipped.clear();
+        Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+        EXPECT_EQ(Skips(observer_.skipped.begin(), observer_.skipped.end()),
+                  skips)
+            << run;
+    }
+    size_t due = 0;
+    const auto cursor = ns.eviction_index().Scan(Clock::now());
+    while (cursor->Next().has_value()) {
+        ++due;
+    }
+    EXPECT_EQ(due, 2u);
 }
 
 TEST_F(EvictorTest, ObserversHearOfEachObjectAndTheRun) {

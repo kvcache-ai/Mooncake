@@ -385,7 +385,8 @@ struct MasterService::MemoryEviction {
                   : settings.offload_on_evict
                       ? static_cast<eviction::Reclaimer&>(offloading)
                       : static_cast<eviction::Reclaimer&>(immediate),
-                  {&metrics, &log}, settings.worker_threads) {}
+                  {&metrics, &log}, settings.worker_threads,
+                  eviction::Evictor::kSkippedKeyBackoff) {}
 
     static bool InPlan(const eviction::Plan& plan, const Replica& replica) {
         return std::find(plan.release.begin(), plan.release.end(),
@@ -443,6 +444,9 @@ struct MasterService::KvcsDfsEviction {
         : policy(service, allow_soft_pinned,
                  MemoryEviction::ReplicaKind::kKvcsDfs),
           reclaimer(service),
+          // Postpones nothing: it walks the index memory eviction walks, and
+          // a memory-only key it skips (nothing to release for it) is one
+          // memory eviction may take.
           evictor(service.namespaces_, policy, reclaimer, {&metrics}) {}
 
     MemoryEviction::Policy policy;

@@ -244,9 +244,10 @@ class Evictor::Pass {
         }
         auto plan = Judge(hold, /*fallback=*/entry == nullptr);
         if (!plan) {
-            if (Lasts(plan.error())) {
+            if (evictor_.postpone_skipped_ > Clock::duration::zero() &&
+                Lasts(plan.error())) {
                 ns_.eviction_index().Postpone(
-                    hold, now_ + Evictor::kSkippedKeyBackoff);
+                    hold, now_ + evictor_.postpone_skipped_);
             }
             return {};
         }
@@ -323,13 +324,14 @@ class Evictor::Pass {
 Evictor::Evictor(metadata::NamespaceTable& namespaces,
                  const EvictionPolicy& policy, Reclaimer& reclaimer,
                  std::vector<EvictionObserver*> observers,
-                 uint32_t worker_threads)
+                 uint32_t worker_threads, Clock::duration postpone_skipped)
     : namespaces_(namespaces),
       policy_(policy),
       reclaimer_(reclaimer),
       observers_(std::move(observers)),
       parallel_safe_(CanRunInParallel(policy_, reclaimer_, observers_)),
-      worker_threads_(worker_threads) {
+      worker_threads_(worker_threads),
+      postpone_skipped_(postpone_skipped) {
     if (worker_threads > kMaxEvictionWorkers) {
         throw std::invalid_argument("eviction workers must be in [0, 64]");
     }

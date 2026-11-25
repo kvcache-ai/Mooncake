@@ -78,15 +78,23 @@ struct ByteGoal {
 
 class Evictor {
    public:
-    // Keys skipped as soft-pinned or with nothing to release are passed over
-    // this long (or until written), so runs under pressure don't re-lock them.
+    // How long memory eviction passes over a key it skipped as soft-pinned
+    // or with nothing to release (or until the key is written), so runs
+    // under pressure don't re-lock it.
     static constexpr Clock::duration kSkippedKeyBackoff =
         std::chrono::seconds(1);
 
-    // Everything given outlives the evictor.
+    // Everything given outlives the evictor. With `postpone_skipped` above
+    // zero, a run postpones each key it skips as soft-pinned or with nothing
+    // to release that long (EvictionIndex::Postpone). The key moves in its
+    // namespace's index, which every evictor over that namespace walks, so an
+    // evictor whose skips do not hold for memory eviction (the KVCS DFS
+    // evictor, for which a memory-only key has nothing to release) must
+    // leave it at zero, the default.
     Evictor(metadata::NamespaceTable& namespaces, const EvictionPolicy& policy,
             Reclaimer& reclaimer, std::vector<EvictionObserver*> observers,
-            uint32_t worker_threads = 0);
+            uint32_t worker_threads = 0,
+            Clock::duration postpone_skipped = Clock::duration::zero());
     ~Evictor();
     Evictor(const Evictor&) = delete;
     Evictor& operator=(const Evictor&) = delete;
@@ -117,6 +125,8 @@ class Evictor {
     // 0 = ceil(filed keys / 16M), capped at 64. Explicit values aid local
     // scaling tests. Policy/reclaimer/observers must permit parallel callbacks.
     const uint32_t worker_threads_;
+    // Zero: skipped keys stay where they are filed.
+    const Clock::duration postpone_skipped_;
     std::unique_ptr<ThreadPool> workers_;
     std::mutex run_mutex_;
 };
