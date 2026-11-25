@@ -57,7 +57,9 @@ class TestKeyProber(unittest.TestCase):
 
     def test_matches_batch_calls(self):
         indices = [np.arange(6, dtype=np.int64), np.array([4, 0, 5], dtype=np.int64)]
-        expected = [self.store.batch_is_exist(self._keys(g, indices[g])) for g in (0, 1)]
+        expected = [
+            self.store.batch_is_exist(self._keys(g, indices[g])) for g in (0, 1)
+        ]
         self.assertEqual(expected[0][:8], [1, 1, 1, 1, 1, 1, 1, 0])
         self.assertEqual(expected[1], [1, 1, 1, 1, 0, 0])
         for call in (self.prober.is_exist, self.prober.probe):
