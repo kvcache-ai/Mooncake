@@ -977,8 +977,8 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
 
 tl::expected<void, ErrorCode> RealClient::start_auxiliary_services(
     bool enable_ssd_offload, bool start_offload_rpc_server,
-    const std::string &ssd_offload_path, bool enable_client_http_server,
-    int client_http_port) {
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port) {
     // Start IPC server to accept FD from dummy clients
     if (!ipc_socket_path_.empty()) {
         if (start_ipc_server() != 0) {
@@ -1314,7 +1314,7 @@ tl::expected<void, ErrorCode> RealClient::mp_setup_internal(
 
     return start_auxiliary_services(enable_ssd_offload,
                                     start_offload_rpc_server, ssd_offload_path,
-                                    enable_client_http_server,
+                                    tenant_id, enable_client_http_server,
                                     client_http_port);
 }
 #endif  // ENABLE_MULTI_PROTOCOL
