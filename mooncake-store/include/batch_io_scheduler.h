@@ -13,10 +13,13 @@
 
 namespace mooncake {
 
-// Owns resident workers and a shared queue. Each SubmitAndWait call publishes
-// a set of prepared tasks, blocks until that set has terminated, and returns
-// its first reported error. Callers keep all data referenced by their
-// callbacks valid until SubmitAndWait returns.
+// Owns resident workers, each with a private task queue. A task runs on the
+// worker selected by its caller-supplied affinity key, so all tasks prepared
+// from one source (for example, one file) land on one worker and that worker
+// owns the source's state. Each SubmitAndWait call publishes a set of prepared
+// tasks, blocks until that set has terminated, and returns its first reported
+// error. Callers keep all data referenced by their callbacks valid until
+// SubmitAndWait returns.
 class BatchIoScheduler {
    public:
     // Executes one caller-defined task index. An accepted task is executed at
@@ -74,10 +77,13 @@ class BatchIoScheduler {
         std::optional<ErrorCode> error_;
     };
 
-    // Appends task_count unpublished tasks. Task i receives index i; indices
-    // are local to this call, so independent task groups can share one
-    // PendingBatch. No callback runs during preparation. task_count == 0
-    // appends nothing and never runs complete; execute must still be nonempty.
+    // Appends task_count unpublished tasks to the queue of the worker selected
+    // by affinity_key % worker count. Callers pass a stable identity of the
+    // work (for this design, the bucket file's inode), so one source's tasks
+    // all run on one worker and that worker owns the source's state. Task i
+    // receives index i; indices are local to this call. No callback runs
+    // during preparation. task_count == 0 appends nothing and never runs
+    // complete; execute must still be nonempty.
     //
     // A nonempty complete creates an independent failure group for this call.
     // Without complete, the tasks share the batch-wide cancellation domain.
@@ -87,15 +93,16 @@ class BatchIoScheduler {
     // preparations return the same error until SubmitAndWait consumes it.
     tl::expected<void, ErrorCode> PrepareTasks(PendingBatch& batch,
                                                size_t task_count,
+                                               uint64_t affinity_key,
                                                const Execute& execute,
                                                const Complete& complete = {});
 
-    // Consumes the PendingBatch and publishes all its prepared tasks without
-    // further allocation. Preparation errors are returned without publication
-    // or completion callbacks. An empty batch succeeds; a nonempty batch
-    // submitted after Shutdown returns UNAVAILABLE_IN_CURRENT_STATUS without
-    // running callbacks. The consumed batch is empty and reusable in every
-    // case.
+    // Consumes the PendingBatch and publishes all its prepared tasks to their
+    // worker queues without further allocation. Preparation errors are
+    // returned without publication or completion callbacks. An empty batch
+    // succeeds; a nonempty batch submitted after Shutdown returns
+    // UNAVAILABLE_IN_CURRENT_STATUS without running callbacks. The consumed
+    // batch is empty and reusable in every case.
     //
     // For an accepted publication, waits until every task has terminated and
     // all started Execute and Complete callbacks have finished. Ungrouped task
@@ -112,10 +119,6 @@ class BatchIoScheduler {
     void Shutdown();
 
    private:
-    tl::expected<void, ErrorCode> AddTask(PendingBatch& batch,
-                                          size_t task_index,
-                                          const Execute& execute);
-
     class Impl;
     explicit BatchIoScheduler(std::unique_ptr<Impl> impl) noexcept;
     std::unique_ptr<Impl> impl_;

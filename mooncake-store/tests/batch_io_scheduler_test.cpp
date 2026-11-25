@@ -35,9 +35,10 @@ void ExpectError(const tl::expected<T, ErrorCode>& result, ErrorCode error) {
 IoResult Succeed(size_t) { return {}; }
 
 IoResult PrepareAndWait(BatchIoScheduler& scheduler, size_t task_count,
+                        uint64_t key,
                         const BatchIoScheduler::Execute& execute) {
     BatchIoScheduler::PendingBatch batch;
-    auto result = scheduler.PrepareTasks(batch, task_count, execute);
+    auto result = scheduler.PrepareTasks(batch, task_count, key, execute);
     if (!result) return result;
     return scheduler.SubmitAndWait(batch);
 }
@@ -64,7 +65,12 @@ TEST(BatchIoSchedulerTest, NamedWorkersExecuteConcurrently) {
         }
         return {};
     };
-    ASSERT_TRUE(PrepareAndWait(*created.value(), 8, execute));
+    BatchIoScheduler::PendingBatch batch;
+    // One file per worker: eight single-task groups with distinct keys.
+    for (size_t key = 0; key < 8; ++key) {
+        ASSERT_TRUE(created.value()->PrepareTasks(batch, 1, key, execute));
+    }
+    EXPECT_TRUE(created.value()->SubmitAndWait(batch));
     EXPECT_EQ(names.size(), 8);
     for (size_t i = 0; i < 8; ++i) {
         EXPECT_EQ(names.count("test-wio-" + std::to_string(i)), 1);
@@ -82,8 +88,8 @@ TEST(BatchIoSchedulerTest, PreparationDefersExecutionUntilSubmission) {
         indices.push_back(index);
         return {};
     };
-    ASSERT_TRUE(scheduler.PrepareTasks(batch, 2, execute));
-    ASSERT_TRUE(scheduler.PrepareTasks(batch, 3, execute));
+    ASSERT_TRUE(scheduler.PrepareTasks(batch, 2, 0, execute));
+    ASSERT_TRUE(scheduler.PrepareTasks(batch, 3, 0, execute));
     EXPECT_TRUE(indices.empty());
     ASSERT_TRUE(scheduler.SubmitAndWait(batch));
     EXPECT_EQ(indices, (std::vector<size_t>{0, 1, 0, 1, 2}));
@@ -92,7 +98,7 @@ TEST(BatchIoSchedulerTest, PreparationDefersExecutionUntilSubmission) {
     EXPECT_EQ(indices.size(), 5);
     {
         BatchIoScheduler::PendingBatch abandoned;
-        ASSERT_TRUE(scheduler.PrepareTasks(abandoned, 1, execute));
+        ASSERT_TRUE(scheduler.PrepareTasks(abandoned, 1, 0, execute));
     }
     EXPECT_EQ(indices.size(), 5);
 }
@@ -111,22 +117,22 @@ TEST(BatchIoSchedulerTest, AllocationFailurePreventsPublishingEntireBatch) {
     auto& scheduler = *created.value();
     BatchIoScheduler::PendingBatch batch;
     std::atomic<size_t> calls{0};
-    ASSERT_TRUE(scheduler.PrepareTasks(batch, 1, [&](size_t) -> IoResult {
+    ASSERT_TRUE(scheduler.PrepareTasks(batch, 1, 0, [&](size_t) -> IoResult {
         ++calls;
         return {};
     }));
     bool fail = false;
     BatchIoScheduler::Execute execute = ThrowOnCopy(&fail);
     fail = true;
-    ExpectError(scheduler.PrepareTasks(batch, 256, std::move(execute)),
+    ExpectError(scheduler.PrepareTasks(batch, 256, 0, std::move(execute)),
                 ErrorCode::NO_AVAILABLE_HANDLE);
     // Ignoring the preparation error must not allow later work to be added.
-    ExpectError(scheduler.PrepareTasks(batch, 1, Succeed),
+    ExpectError(scheduler.PrepareTasks(batch, 1, 0, Succeed),
                 ErrorCode::NO_AVAILABLE_HANDLE);
     ExpectError(scheduler.SubmitAndWait(batch), ErrorCode::NO_AVAILABLE_HANDLE);
     EXPECT_EQ(calls, 0);
     // Submission clears the failed preparation state so the object is reusable.
-    EXPECT_TRUE(scheduler.PrepareTasks(batch, 1, Succeed));
+    EXPECT_TRUE(scheduler.PrepareTasks(batch, 1, 0, Succeed));
     EXPECT_TRUE(scheduler.SubmitAndWait(batch));
 }
 
@@ -145,7 +151,7 @@ TEST(BatchIoSchedulerTest, InvalidParametersRejectBeforeExecution) {
     ASSERT_TRUE(created.has_value());
     auto& scheduler = *created.value();
     BatchIoScheduler::PendingBatch invalid_callback;
-    ExpectError(scheduler.PrepareTasks(invalid_callback, 1, {}),
+    ExpectError(scheduler.PrepareTasks(invalid_callback, 1, 0, {}),
                 ErrorCode::INVALID_PARAMS);
     ExpectError(scheduler.SubmitAndWait(invalid_callback),
                 ErrorCode::INVALID_PARAMS);
@@ -155,10 +161,10 @@ TEST(BatchIoSchedulerTest, InvalidParametersRejectBeforeExecution) {
         return {};
     };
     BatchIoScheduler::PendingBatch batch;
-    ASSERT_TRUE(scheduler.PrepareTasks(batch, 1, execute));
-    ExpectError(scheduler.PrepareTasks(batch, 1, {}),
+    ASSERT_TRUE(scheduler.PrepareTasks(batch, 1, 0, execute));
+    ExpectError(scheduler.PrepareTasks(batch, 1, 0, {}),
                 ErrorCode::INVALID_PARAMS);
-    ExpectError(scheduler.PrepareTasks(batch, 1, execute),
+    ExpectError(scheduler.PrepareTasks(batch, 1, 0, execute),
                 ErrorCode::INVALID_PARAMS);
     ExpectError(scheduler.SubmitAndWait(batch), ErrorCode::INVALID_PARAMS);
     EXPECT_EQ(calls, 0);
@@ -170,14 +176,14 @@ TEST(BatchIoSchedulerTest, EmptyBatchDoesNotExecute) {
     auto& scheduler = *created.value();
     BatchIoScheduler::PendingBatch batch;
     EXPECT_TRUE(scheduler.SubmitAndWait(batch));
-    ASSERT_TRUE(scheduler.PrepareTasks(batch, 0, [](size_t) -> IoResult {
+    ASSERT_TRUE(scheduler.PrepareTasks(batch, 0, 0, [](size_t) -> IoResult {
         ADD_FAILURE();
         return {};
     }));
     EXPECT_TRUE(scheduler.SubmitAndWait(batch));
 }
 
-TEST(BatchIoSchedulerTest, DynamicQueueReusesWorkersAcrossBatches) {
+TEST(BatchIoSchedulerTest, DistinctKeysRunOnDistinctWorkers) {
     auto created = BatchIoScheduler::Create(3);
     ASSERT_TRUE(created.has_value());
     auto& scheduler = *created.value();
@@ -190,28 +196,30 @@ TEST(BatchIoSchedulerTest, DynamicQueueReusesWorkersAcrossBatches) {
     std::promise<void> release;
     auto gate = release.get_future().share();
     std::vector<std::future<void>> batches;
-    for (size_t i = 0; i < 3; ++i) {
-        batches.push_back(std::async(std::launch::async, [&] {
-            BatchIoScheduler::PendingBatch batch;
-            ASSERT_TRUE(
-                scheduler.PrepareTasks(batch, 16, [&](size_t) -> IoResult {
-                    const auto count = ++active;
-                    auto old = peak.load();
-                    while (old < count &&
-                           !peak.compare_exchange_weak(old, count)) {
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(mutex);
-                        threads.insert(std::this_thread::get_id());
-                    }
-                    ++entered;
-                    EXPECT_EQ(gate.wait_for(5s), std::future_status::ready);
-                    ++calls;
-                    --active;
-                    return {};
-                }));
-            EXPECT_TRUE(scheduler.SubmitAndWait(batch));
-        }));
+    for (size_t key = 0; key < 3; ++key) {
+        batches.push_back(std::async(
+            std::launch::async, [this, &scheduler, &mutex, &threads, &active,
+                                 &peak, &entered, &calls, gate, key] {
+                BatchIoScheduler::PendingBatch batch;
+                ASSERT_TRUE(scheduler.PrepareTasks(
+                    batch, 16, key, [&](size_t) -> IoResult {
+                        const auto count = ++active;
+                        auto old = peak.load();
+                        while (old < count &&
+                               !peak.compare_exchange_weak(old, count)) {
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(mutex);
+                            threads.insert(std::this_thread::get_id());
+                        }
+                        ++entered;
+                        EXPECT_EQ(gate.wait_for(5s), std::future_status::ready);
+                        ++calls;
+                        --active;
+                        return {};
+                    }));
+                EXPECT_TRUE(scheduler.SubmitAndWait(batch));
+            }));
     }
     const auto deadline = std::chrono::steady_clock::now() + 2s;
     while (entered < 3 && std::chrono::steady_clock::now() < deadline)
@@ -222,14 +230,14 @@ TEST(BatchIoSchedulerTest, DynamicQueueReusesWorkersAcrossBatches) {
     EXPECT_EQ(calls, 16 * 3);
     EXPECT_EQ(peak, 3);
     EXPECT_EQ(threads.size(), 3);
-    // A later batch uses the same resident threads.
-    EXPECT_TRUE(PrepareAndWait(scheduler, 1, [&](size_t) -> IoResult {
+    // The same key keeps using the same worker.
+    EXPECT_TRUE(PrepareAndWait(scheduler, 1, 0, [&](size_t) -> IoResult {
         EXPECT_EQ(threads.count(std::this_thread::get_id()), 1);
         return {};
     }));
 }
 
-TEST(BatchIoSchedulerTest, DifferentFilesRunTogetherWithLocalTaskIndices) {
+TEST(BatchIoSchedulerTest, IndependentPlansRunTogetherWithLocalTaskIndices) {
     auto created = BatchIoScheduler::Create(2);
     ASSERT_TRUE(created.has_value());
     auto& scheduler = *created.value();
@@ -241,17 +249,17 @@ TEST(BatchIoSchedulerTest, DifferentFilesRunTogetherWithLocalTaskIndices) {
     auto second_started_future = second_started.get_future();
     BatchIoScheduler::PendingBatch batch;
     ASSERT_TRUE(scheduler.PrepareTasks(
-        batch, first_visits.size(), [&](size_t index) -> IoResult {
+        batch, first_visits.size(), 0, [&](size_t index) -> IoResult {
             EXPECT_EQ(index, 0);
             ++first_visits.at(index);
             first_started.set_value();
-            // The second file must run while this file is still in flight.
+            // The second plan must run while this plan is still in flight.
             EXPECT_EQ(second_started_future.wait_for(2s),
                       std::future_status::ready);
             return {};
         }));
     ASSERT_TRUE(scheduler.PrepareTasks(
-        batch, second_visits.size(), [&](size_t index) -> IoResult {
+        batch, second_visits.size(), 1, [&](size_t index) -> IoResult {
             EXPECT_LT(index, second_visits.size());
             ++second_visits.at(index);
             if (index == 0) {
@@ -273,19 +281,19 @@ TEST(BatchIoSchedulerTest, EachTaskIsProcessedExactlyOnce) {
     for (size_t count : {1u, 5u, 160u, 161u, 513u}) {
         std::vector<size_t> visits(count, 0);
         BatchIoScheduler::PendingBatch batch;
-        ASSERT_TRUE(
-            scheduler.PrepareTasks(batch, count, [&](size_t index) -> IoResult {
-                EXPECT_LT(index, visits.size());
-                ++visits.at(index);
-                return {};
-            }));
+        ASSERT_TRUE(scheduler.PrepareTasks(batch, count, count,
+                                           [&](size_t index) -> IoResult {
+                                               EXPECT_LT(index, visits.size());
+                                               ++visits.at(index);
+                                               return {};
+                                           }));
         EXPECT_TRUE(scheduler.SubmitAndWait(batch));
         for (auto visits_for_entry : visits) EXPECT_EQ(visits_for_entry, 1);
     }
 }
 
-TEST(BatchIoSchedulerTest, FirstErrorCancelsQueuedWorkAndWaitsForInflight) {
-    auto created = BatchIoScheduler::Create(2);
+TEST(BatchIoSchedulerTest, FirstErrorCancelsQueuedWorkOnTheSameWorker) {
+    auto created = BatchIoScheduler::Create(1);
     ASSERT_TRUE(created.has_value());
     auto& scheduler = *created.value();
     std::promise<void> entered;
@@ -295,21 +303,19 @@ TEST(BatchIoSchedulerTest, FirstErrorCancelsQueuedWorkAndWaitsForInflight) {
     std::atomic<size_t> unexpected{0};
     auto batch = std::async(std::launch::async, [&] {
         auto result =
-            PrepareAndWait(scheduler, 16, [&](size_t index) -> IoResult {
+            PrepareAndWait(scheduler, 16, 0, [&](size_t index) -> IoResult {
                 if (index == 0) {
                     entered.set_value();
                     EXPECT_EQ(release_future.wait_for(5s),
                               std::future_status::ready);
                     return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-                } else if (index == 1) {
-                    EXPECT_EQ(entered_future.wait_for(2s),
-                              std::future_status::ready);
-                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
                 ++unexpected;
                 return {};
             });
-        ExpectError(result, ErrorCode::FILE_READ_FAIL);
+        // One worker runs this file's tasks in order: the first error cancels
+        // every task of the file queued behind it.
+        ExpectError(result, ErrorCode::FILE_OPEN_FAIL);
     });
     EXPECT_EQ(entered_future.wait_for(2s), std::future_status::ready);
     EXPECT_EQ(batch.wait_for(50ms), std::future_status::timeout);
@@ -318,7 +324,7 @@ TEST(BatchIoSchedulerTest, FirstErrorCancelsQueuedWorkAndWaitsForInflight) {
     EXPECT_EQ(unexpected, 0);
     // Errors are local to the parent batch; the shared pool remains usable.
     EXPECT_TRUE(
-        PrepareAndWait(scheduler, 1, [](size_t) -> IoResult { return {}; }));
+        PrepareAndWait(scheduler, 1, 0, [](size_t) -> IoResult { return {}; }));
 }
 
 TEST(BatchIoSchedulerTest, WorkerExceptionReturnsErrorAndPoolRemainsUsable) {
@@ -326,21 +332,21 @@ TEST(BatchIoSchedulerTest, WorkerExceptionReturnsErrorAndPoolRemainsUsable) {
     ASSERT_TRUE(created.has_value());
     auto& scheduler = *created.value();
     std::atomic<size_t> calls{0};
-    ExpectError(PrepareAndWait(scheduler, 2,
+    ExpectError(PrepareAndWait(scheduler, 2, 0,
                                [&](size_t) -> IoResult {
                                    ++calls;
                                    throw std::logic_error("worker failed");
                                }),
                 ErrorCode::INTERNAL_ERROR);
     EXPECT_EQ(calls, 1);
-    ExpectError(PrepareAndWait(scheduler, 1,
+    ExpectError(PrepareAndWait(scheduler, 1, 0,
                                [&](size_t) -> IoResult {
                                    ++calls;
                                    throw 42;
                                }),
                 ErrorCode::INTERNAL_ERROR);
     EXPECT_EQ(calls, 2);
-    EXPECT_TRUE(PrepareAndWait(scheduler, 1, [&](size_t) -> IoResult {
+    EXPECT_TRUE(PrepareAndWait(scheduler, 1, 0, [&](size_t) -> IoResult {
         ++calls;
         return {};
     }));
@@ -357,7 +363,7 @@ TEST(BatchIoSchedulerTest, ShutdownWaitsForRunningTaskAndRejectsNewWork) {
     auto gate = release.get_future().share();
     std::atomic<size_t> calls{0};
     auto batch = std::async(std::launch::async, [&] {
-        auto result = PrepareAndWait(scheduler, 2, [&](size_t) -> IoResult {
+        auto result = PrepareAndWait(scheduler, 2, 0, [&](size_t) -> IoResult {
             ++calls;
             entered.set_value();
             EXPECT_EQ(gate.wait_for(5s), std::future_status::ready);
@@ -374,7 +380,7 @@ TEST(BatchIoSchedulerTest, ShutdownWaitsForRunningTaskAndRejectsNewWork) {
     batch.get();
     shutdown.get();
     EXPECT_EQ(calls, 1);
-    ExpectError(PrepareAndWait(scheduler, 1,
+    ExpectError(PrepareAndWait(scheduler, 1, 0,
                                [&](size_t) -> IoResult {
                                    ++calls;
                                    return {};
@@ -391,7 +397,7 @@ TEST(BatchIoSchedulerTest, FailedGroupDoesNotCancelOtherGroups) {
     BatchIoScheduler::PendingBatch batch;
     size_t bad_calls = 0, good_calls = 0, finished = 0;
     ASSERT_TRUE(scheduler.PrepareTasks(
-        batch, 3,
+        batch, 3, 0,
         [&](size_t) -> IoResult {
             ++bad_calls;
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
@@ -402,7 +408,7 @@ TEST(BatchIoSchedulerTest, FailedGroupDoesNotCancelOtherGroups) {
             return result;
         }));
     ASSERT_TRUE(scheduler.PrepareTasks(
-        batch, 3,
+        batch, 3, 1,
         [&](size_t) -> IoResult {
             ++good_calls;
             return {};
@@ -424,7 +430,7 @@ TEST(BatchIoSchedulerTest, WaitIncludesIndependentGroupFinalizers) {
     BatchIoScheduler::PendingBatch batch;
     std::promise<void> finalizer_started, release;
     auto released = release.get_future().share();
-    ASSERT_TRUE(created.value()->PrepareTasks(batch, 1, Succeed,
+    ASSERT_TRUE(created.value()->PrepareTasks(batch, 1, 0, Succeed,
                                               [&](IoResult result) -> IoResult {
                                                   finalizer_started.set_value();
                                                   released.wait();
@@ -448,9 +454,9 @@ TEST(BatchIoSchedulerTest, IndependentPlansUseLocalTaskIndices) {
     std::vector<size_t> first_file(3, 0);
     std::vector<size_t> second_file(2, 0);
     std::atomic<size_t> finished{0};
-    auto prepare = [&](std::vector<size_t>& visits) {
+    auto prepare = [&](std::vector<size_t>& visits, size_t key) {
         return scheduler.PrepareTasks(
-            batch, visits.size(),
+            batch, visits.size(), key,
             [&visits](size_t index) -> IoResult {
                 EXPECT_LT(index, visits.size());
                 ++visits.at(index);
@@ -462,8 +468,8 @@ TEST(BatchIoSchedulerTest, IndependentPlansUseLocalTaskIndices) {
                 return result;
             });
     };
-    ASSERT_TRUE(prepare(first_file));
-    ASSERT_TRUE(prepare(second_file));
+    ASSERT_TRUE(prepare(first_file, 0));
+    ASSERT_TRUE(prepare(second_file, 1));
     EXPECT_EQ(first_file, (std::vector<size_t>{0, 0, 0}));
     EXPECT_EQ(second_file, (std::vector<size_t>{0, 0}));
     EXPECT_EQ(finished.load(), 0);
@@ -478,7 +484,7 @@ TEST(BatchIoSchedulerTest, EmptyTaskGroupDoesNotRunComplete) {
     ASSERT_TRUE(created);
     BatchIoScheduler::PendingBatch batch;
     size_t finished = 0;
-    ASSERT_TRUE(created.value()->PrepareTasks(batch, 0, Succeed,
+    ASSERT_TRUE(created.value()->PrepareTasks(batch, 0, 0, Succeed,
                                               [&](IoResult result) -> IoResult {
                                                   ++finished;
                                                   return result;
@@ -502,16 +508,16 @@ TEST(BatchIoSchedulerTest, NotReadyDefersNextTaskButAllowsRunningTaskToFinish) {
         5ms);
     ASSERT_TRUE(created);
     BatchIoScheduler::PendingBatch batch;
-    ASSERT_TRUE(
-        created.value()->PrepareTasks(batch, 2, [&](size_t index) -> IoResult {
-            ++calls;
-            if (index == 0) {
-                started.set_value();
-                released.wait();
-                finished.set_value();
-            }
-            return {};
-        }));
+    ASSERT_TRUE(created.value()->PrepareTasks(batch, 2, 0,
+                                              [&](size_t index) -> IoResult {
+                                                  ++calls;
+                                                  if (index == 0) {
+                                                      started.set_value();
+                                                      released.wait();
+                                                      finished.set_value();
+                                                  }
+                                                  return {};
+                                              }));
     auto submitted = std::async(std::launch::async, [&] {
         return created.value()->SubmitAndWait(batch);
     });
@@ -541,7 +547,7 @@ TEST(BatchIoSchedulerTest, ReadinessBackoffRechecksAndShutdownDrainsGroups) {
     ASSERT_TRUE(created);
     BatchIoScheduler::PendingBatch batch;
     ASSERT_TRUE(created.value()->PrepareTasks(
-        batch, 3,
+        batch, 3, 0,
         [&](size_t) -> IoResult {
             ++called;
             return {};
@@ -567,7 +573,7 @@ TEST(BatchIoSchedulerTest, ReadinessBackoffRechecksAndShutdownDrainsGroups) {
     busy = true;
     BatchIoScheduler::PendingBatch cancelled;
     ASSERT_TRUE(created.value()->PrepareTasks(
-        cancelled, 3,
+        cancelled, 3, 1,
         [&](size_t) -> IoResult {
             ++called;
             return {};

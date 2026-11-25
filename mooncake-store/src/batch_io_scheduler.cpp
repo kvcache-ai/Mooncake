@@ -1,8 +1,8 @@
 #include "batch_io_scheduler.h"
 
-#include <algorithm>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <list>
 #include <mutex>
 #include <new>
@@ -38,14 +38,23 @@ class BatchIoScheduler::Impl {
     struct Task {
         std::shared_ptr<Batch> batch;
         size_t index = 0;
+        size_t queue = 0;
         Execute execute;
         std::shared_ptr<Group> group;
+    };
+    // One queue per worker. A worker claims tasks only from its own queue;
+    // affinity dispatch keeps one source's tasks on one worker.
+    struct Slot {
+        std::deque<Task> tasks;
+        std::condition_variable ready;
     };
     tl::expected<void, ErrorCode> Init(size_t workers, Ready ready,
                                        std::chrono::milliseconds backoff,
                                        std::string_view worker_name_prefix) {
         ready_ = std::move(ready);
         backoff_ = backoff;
+        slots_.resize(workers);
+        for (auto& slot : slots_) slot = std::make_unique<Slot>();
         try {
             workers_.resize(workers);
             for (size_t i = 0; i < workers; ++i) {
@@ -73,7 +82,7 @@ class BatchIoScheduler::Impl {
                         LOG(INFO) << "I/O worker started: name=" << name
                                   << " worker_index=" << i
                                   << " workers=" << workers << " tid=" << tid;
-                        Work();
+                        Work(i);
                     });
             }
         } catch (...) {
@@ -87,15 +96,21 @@ class BatchIoScheduler::Impl {
 
     tl::expected<void, ErrorCode> SubmitAndWait(
         const std::shared_ptr<Batch>& batch, std::list<Task>& tasks) {
-        if (tasks.empty()) return {};
         std::unique_lock<std::mutex> lock(mutex_);
+        // A latched preparation error poisons the batch even when no task was
+        // appended; report it instead of treating the batch as empty.
+        if (batch->error) return tl::make_unexpected(*batch->error);
+        if (tasks.empty()) return {};
         if (stopping_) {
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
         batch->remaining = tasks.size();
-        queue_.splice(queue_.end(), tasks);
-        changed_.notify_all();
+        for (auto& task : tasks) {
+            auto& slot = *slots_[task.queue];
+            slot.tasks.push_back(std::move(task));
+            slot.ready.notify_all();
+        }
         batch->done.wait(lock, [&] { return batch->remaining == 0; });
         if (batch->error) return tl::make_unexpected(*batch->error);
         return {};
@@ -106,7 +121,10 @@ class BatchIoScheduler::Impl {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             stopping_ = true;
-            changed_.notify_all();
+        }
+        for (auto& slot : slots_) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            slot->ready.notify_all();
         }
         // Workers drain cancelled nodes without executing their I/O callbacks.
         // Group completion still runs, and is part of SubmitAndWait's wait.
@@ -116,12 +134,16 @@ class BatchIoScheduler::Impl {
     }
 
    private:
-    void Work() {
+    void Work(size_t worker_index) {
+        auto& slot = *slots_[worker_index];
         std::unique_lock<std::mutex> lock(mutex_);
         for (;;) {
-            changed_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
-            if (queue_.empty()) return;
-            auto& front = queue_.front();
+            slot.ready.wait(lock,
+                            [&] { return stopping_ || !slot.tasks.empty(); });
+            if (slot.tasks.empty()) return;
+            // Peek the front task and pass the readiness gate before claiming
+            // it; a deferred task stays queued and is retried after backoff.
+            auto& front = slot.tasks.front();
             const bool cancelled =
                 stopping_ || (front.group ? front.group->error.has_value()
                                           : front.batch->error.has_value());
@@ -138,10 +160,10 @@ class BatchIoScheduler::Impl {
                 if (!ready) std::this_thread::sleep_for(backoff_);
                 lock.lock();
                 // Queue/state may have changed while checking readiness.
-                if (!ready || stopping_ || queue_.empty()) continue;
+                if (!ready || stopping_ || slot.tasks.empty()) continue;
             }
-            auto task = std::move(queue_.front());
-            queue_.pop_front();
+            auto task = std::move(slot.tasks.front());
+            slot.tasks.pop_front();
             tl::expected<void, ErrorCode> result;
             if (readiness_failed) {
                 result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -192,13 +214,47 @@ class BatchIoScheduler::Impl {
         }
     }
 
+   public:
+    tl::expected<void, ErrorCode> PrepareTasks(
+        const std::shared_ptr<Batch>& batch, std::list<Task>& tasks,
+        size_t task_count, uint64_t affinity_key, const Execute& execute,
+        const Complete& complete) {
+        if (!execute) {
+            batch->error = ErrorCode::INVALID_PARAMS;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        // A latched preparation error poisons the whole batch until
+        // SubmitAndWait consumes it.
+        if (batch->error) return tl::make_unexpected(*batch->error);
+        const size_t queue = affinity_key % slots_.size();
+        try {
+            auto group = complete ? std::make_shared<Group>() : nullptr;
+            if (group) group->complete = complete;
+            for (size_t index = 0; index < task_count; ++index) {
+                try {
+                    tasks.push_back(Task{batch, index, queue, execute, group});
+                } catch (const std::bad_alloc&) {
+                    batch->error = ErrorCode::NO_AVAILABLE_HANDLE;
+                    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                } catch (...) {
+                    batch->error = ErrorCode::INTERNAL_ERROR;
+                    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                if (group) ++group->remaining;
+            }
+            return {};
+        } catch (...) {
+            batch->error = ErrorCode::INTERNAL_ERROR;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+
     std::mutex mutex_;
     std::mutex shutdown_mutex_;
-    std::condition_variable changed_;
+    std::vector<std::unique_ptr<Slot>> slots_;
     bool stopping_ = false;
     Ready ready_;
     std::chrono::milliseconds backoff_{300};
-    std::list<Task> queue_;
     std::vector<std::thread> workers_;
 };
 
@@ -232,53 +288,12 @@ struct BatchIoScheduler::PendingBatch::State {
 BatchIoScheduler::PendingBatch::PendingBatch() = default;
 BatchIoScheduler::PendingBatch::~PendingBatch() = default;
 
-tl::expected<void, ErrorCode> BatchIoScheduler::AddTask(
-    PendingBatch& batch, size_t task_index, const Execute& execute) {
-    if (batch.error_) return tl::make_unexpected(*batch.error_);
-    if (!execute) {
-        batch.error_ = ErrorCode::INVALID_PARAMS;
-        return tl::make_unexpected(*batch.error_);
-    }
-    try {
-        if (!batch.state_)
-            batch.state_ = std::make_unique<PendingBatch::State>();
-        batch.state_->tasks.push_back(
-            Impl::Task{batch.state_->batch, task_index, execute, {}});
-        return {};
-    } catch (const std::bad_alloc&) {
-        batch.error_ = ErrorCode::NO_AVAILABLE_HANDLE;
-    } catch (...) {
-        batch.error_ = ErrorCode::INTERNAL_ERROR;
-    }
-    return tl::make_unexpected(*batch.error_);
-}
-
 tl::expected<void, ErrorCode> BatchIoScheduler::PrepareTasks(
-    PendingBatch& batch, size_t task_count, const Execute& execute,
-    const Complete& complete) {
-    if (batch.error_) return tl::make_unexpected(*batch.error_);
-    if (!execute) {
-        batch.error_ = ErrorCode::INVALID_PARAMS;
-        return tl::make_unexpected(*batch.error_);
-    }
-    try {
-        auto group = complete ? std::make_shared<Impl::Group>() : nullptr;
-        if (group) group->complete = complete;
-        for (size_t index = 0; index < task_count; ++index) {
-            auto result = AddTask(batch, index, execute);
-            if (!result) return result;
-            if (group) {
-                batch.state_->tasks.back().group = group;
-                ++group->remaining;
-            }
-        }
-        return {};
-    } catch (const std::bad_alloc&) {
-        batch.error_ = ErrorCode::NO_AVAILABLE_HANDLE;
-    } catch (...) {
-        batch.error_ = ErrorCode::INTERNAL_ERROR;
-    }
-    return tl::make_unexpected(*batch.error_);
+    PendingBatch& batch, size_t task_count, uint64_t affinity_key,
+    const Execute& execute, const Complete& complete) {
+    if (!batch.state_) batch.state_ = std::make_unique<PendingBatch::State>();
+    return impl_->PrepareTasks(batch.state_->batch, batch.state_->tasks,
+                               task_count, affinity_key, execute, complete);
 }
 
 tl::expected<void, ErrorCode> BatchIoScheduler::SubmitAndWait(
