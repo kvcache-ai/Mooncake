@@ -1601,7 +1601,7 @@ int TransferEnginePy::disconnectAllPeers() {
         return -1;
     }
     auto* transport = static_cast<AscendDirectTransport*>(base_transport);
-    pybind11::gil_scoped_release release;
+    py::gil_scoped_release release;
     return transport->disconnectAllPeers();
 #else
     LOG(ERROR) << "Mooncake was built without Ascend Direct transport";
