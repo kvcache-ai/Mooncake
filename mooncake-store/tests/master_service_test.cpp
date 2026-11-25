@@ -674,7 +674,11 @@ TEST(MasterFabricPlacementTest, CxlAllocationBypassesRamPhysicalPlacement) {
     MasterService service(service_config);
     const auto client_id = generate_uuid();
 
-    auto cxl_segment = MakeSegment("cxl-placement-client");
+    Segment cxl_segment;
+    cxl_segment.id = generate_uuid();
+    cxl_segment.name = "cxl-placement-client";
+    cxl_segment.base = 0x300000000ULL;
+    cxl_segment.size = kCxlSize;
     cxl_segment.protocol = "cxl";
     cxl_segment.te_endpoint = cxl_segment.name;
     ASSERT_TRUE(service.MountSegment(cxl_segment, client_id));
@@ -3436,17 +3440,12 @@ TEST_F(MasterServiceTest, BatchEvictOnlyRemovesTargetMemoryTier) {
         replicas.emplace_back(std::move(cxl_buffer), ReplicaStatus::COMPLETE);
         {
             MasterServiceTestPeer peer(*service);
-            const size_t shard_idx = peer.getShardIndex(tenant_id, key);
-            MasterServiceTestPeer::MetadataShardAccessorRW shard(service.get(),
-                                                                 shard_idx);
-            auto& tenant_state =
-                peer.GetOrCreateTenantState(shard.get(), tenant_id);
-            tenant_state.metadata.emplace(
-                std::piecewise_construct, std::forward_as_tuple(key),
-                std::forward_as_tuple(
-                    client_id, std::chrono::system_clock::time_point{},
-                    kObjectSize, std::move(replicas), std::nullopt, false,
-                    ObjectDataType::UNKNOWN, "", tenant_id, key));
+            auto guard =
+                peer.GetOrCreateNamespace(tenant_id).objects.WriteKey(key);
+            (void)guard.Publish(
+                client_id, std::chrono::system_clock::time_point{},
+                kObjectSize, std::move(replicas), std::nullopt, false,
+                ObjectDataType::UNKNOWN, "", tenant_id, key);
         }
 
         MasterServiceTestPeer(*service).RunBatchEvictForTesting(
