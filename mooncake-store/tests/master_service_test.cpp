@@ -663,6 +663,41 @@ TEST(MasterFabricPlacementTest, PutUpsertCopyMoveRespectFabricBoundary) {
     EXPECT_EQ(escaped.error(), ErrorCode::INVALID_PARAMS);
 }
 
+TEST(MasterFabricPlacementTest, CxlAllocationBypassesRamPhysicalPlacement) {
+    constexpr size_t kCxlSize = 16 * 1024 * 1024;
+    const auto service_config =
+        MasterServiceConfig::builder()
+            .set_enable_cxl(true)
+            .set_cxl_path("shared-cxl-pool")
+            .set_cxl_size(kCxlSize)
+            .build();
+    MasterService service(service_config);
+    const auto client_id = generate_uuid();
+
+    auto cxl_segment = MakeSegment("cxl-placement-client");
+    cxl_segment.protocol = "cxl";
+    cxl_segment.te_endpoint = cxl_segment.name;
+    ASSERT_TRUE(service.MountSegment(cxl_segment, client_id));
+
+    ReplicateConfig request;
+    request.preferred_storage_level = StorageLevel::CXL;
+    request.preferred_segment = cxl_segment.name;
+    // This is meaningful for RAM/MNNVL placement, but a shared CXL pool must
+    // not be forced through the per-segment AllocateFrom() path.
+    request.requester_placement =
+        PhysicalPlacement{"fabric-a", "rack1", "tray1", 3, 0};
+
+    auto result = service.PutStart(client_id, "cxl-with-placement",
+                                   TenantId::Default(), 1024, request);
+    ASSERT_TRUE(result) << toString(result.error());
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ(result->front().get_storage_level(), StorageLevel::CXL);
+    EXPECT_EQ(result->front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.protocol_,
+              "cxl");
+}
+
 TEST(MasterFabricPlacementTest, EvictionHintStaysWithinRequestedFabric) {
     MasterServiceConfig service_config;
     service_config.memory_allocator = BufferAllocatorType::OFFSET;

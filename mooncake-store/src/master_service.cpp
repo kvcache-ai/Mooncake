@@ -4991,15 +4991,22 @@ auto MasterService::AllocateReplicas(const std::string& key,
                 config.preferred_hca_names.value_or(
                     std::vector<std::string>{}));
         }
-        std::shared_ptr<AllocationStrategy> strategy = allocation_strategy_;
-        if (memory_storage_level == StorageLevel::CXL) {
-            if (!cxl_allocation_strategy_) {
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        auto allocation_result = [&]()
+            -> tl::expected<std::vector<Replica>, ErrorCode> {
+            if (memory_storage_level == StorageLevel::CXL) {
+                if (!cxl_allocation_strategy_) {
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                // CXL is one shared pool. RAM-only rack/tray/GPU placement
+                // must not route it through AllocateFrom(), which deliberately
+                // has no meaning for the shared CXL allocator.
+                return cxl_allocation_strategy_->Allocate(
+                    allocator_snapshot, value_length, config.replica_num,
+                    preferred_segments, {}, ReplicaType::MEMORY);
             }
-            strategy = cxl_allocation_strategy_;
-        }
-        auto allocation_result = strategy->AllocateForRequest(
-            allocator_snapshot, value_length, config, preferred_segments);
+            return allocation_strategy_->AllocateForRequest(
+                allocator_snapshot, value_length, config, preferred_segments);
+        }();
 
         // Only failed or short allocations need this eviction hint. Count on
         // the retained snapshot after releasing the segment read lock, within
@@ -5009,13 +5016,22 @@ auto MasterService::AllocateReplicas(const std::string& key,
              allocation_result.error() != ErrorCode::INVALID_PARAMS) ||
             (allocation_result &&
              allocation_result->size() != config.replica_num)) {
-            const auto resolved = AllocationStrategy::ResolvePlacement(config);
-            has_enough_memory_segments =
-                allocator_snapshot
-                    .FilterForFabric(resolved ? resolved->fabric_domain
-                                              : std::string{})
-                    .getServingNames(memory_storage_level)
-                    .size() >= config.replica_num;
+            if (memory_storage_level == StorageLevel::CXL) {
+                // CXL capacity pressure belongs to the shared pool and is not
+                // scoped by the RAM requester's fabric placement.
+                has_enough_memory_segments =
+                    allocator_snapshot.getServingNames(StorageLevel::CXL)
+                        .size() >= config.replica_num;
+            } else {
+                const auto resolved =
+                    AllocationStrategy::ResolvePlacement(config);
+                has_enough_memory_segments =
+                    allocator_snapshot
+                        .FilterForFabric(resolved ? resolved->fabric_domain
+                                                  : std::string{})
+                        .getServingNames(StorageLevel::RAM)
+                        .size() >= config.replica_num;
+            }
         }
 
         if (!allocation_result.has_value()) {
