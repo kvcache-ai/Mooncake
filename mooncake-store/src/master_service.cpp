@@ -497,7 +497,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
       nof_heartbeat_failures_threshold_(
           config.nof_heartbeat_failures_threshold),
       enable_ha_(config.enable_ha),
-      enable_offload_(config.enable_offload),
       dynamic_replication_(config.dynamic_replication_mode,
                            config.dynamic_replication_heat_window_seconds,
                            config.dynamic_replication_admission_qps_threshold,
@@ -515,6 +514,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
       enable_multi_tenants_(config.enable_multi_tenants),
+      offload_config_(config.offload_config),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
@@ -525,7 +525,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                                     local_ssd_manager_)),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
-      offloading_queue_limit_(config.offloading_queue_limit),
       task_manager_(config.task_manager_config),
       drain_job_deadline_scheduler_([this](const std::weak_ptr<DrainJob>& job) {
           HandleDrainJobTimeout(job);
@@ -602,21 +601,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     // Validate offload tuning knobs here (not only via gflags validator),
     // because values loaded from a configuration file bypass the gflags
     // validator chain.
-    if (config.offload_cap_ratio < 0.0 || config.offload_cap_ratio > 1.0) {
-        LOG(ERROR) << "offload_cap_ratio must be between 0.0 and 1.0, "
-                   << "current value: " << config.offload_cap_ratio;
-        throw std::invalid_argument("Invalid offload_cap_ratio");
-    }
-    if (offloading_queue_limit_ == 0) {
-        LOG(ERROR) << "offloading_queue_limit must be greater than 0";
-        throw std::invalid_argument("Invalid offloading_queue_limit");
-    }
-    if (offloading_queue_limit_ > 100'000'000ULL) {
-        LOG(ERROR) << "offloading_queue_limit must be <= 100000000 to avoid "
-                   << "overflow when computing offload_cap, current value: "
-                   << offloading_queue_limit_;
-        throw std::invalid_argument("Invalid offloading_queue_limit");
-    }
+    offload_config_.Validate();
 
     if (put_start_release_timeout_sec_ <= put_start_discard_timeout_sec_) {
         LOG(ERROR) << "put_start_release_timeout="
@@ -648,12 +633,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
 #endif
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
-    offload_on_evict_ = enable_offload_ && config.offload_on_evict;
-    if (offload_on_evict_) {
+    const bool offload_on_evict = offload_config_.ShouldOffloadOnEvict();
+    if (offload_on_evict) {
         LOG(INFO) << "Offload-on-evict mode enabled: DRAM offload to "
                      "LOCAL_DISK will occur at eviction time instead of "
                      "PutEnd";
-        if (config.offload_force_evict) {
+        if (offload_config_.offload_force_evict) {
             LOG(INFO) << "Force-evict enabled: objects exceeding offload "
                          "cap will be evicted without disk offload";
         }
@@ -667,14 +652,14 @@ MasterService::MasterService(const MasterServiceConfig& config)
             .worker_threads = config.eviction_worker_threads,
             .through_oplog = enable_oplog_,
             .allow_evict_soft_pinned = allow_evict_soft_pinned_objects_,
-            .offload_on_evict = offload_on_evict_,
-            .offload = {.cap = static_cast<long>(offloading_queue_limit_ *
-                                                 config.offload_cap_ratio),
-                        .force_evict = config.offload_force_evict}});
+            .offload_on_evict = offload_on_evict,
+            .offload = {.cap = offload_config_.OffloadCap(),
+                        .force_evict = offload_config_.offload_force_evict}});
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY. Only meaningful when offload is enabled
     // (otherwise no LOCAL_DISK replicas exist in the first place).
-    promotion_on_hit_ = enable_offload_ && config.promotion_on_hit;
+    promotion_on_hit_ =
+        offload_config_.enable_offload && config.promotion_on_hit;
     promotion_admission_threshold_ = config.promotion_admission_threshold;
     promotion_queue_limit_ = config.promotion_queue_limit;
     promotion_max_per_heartbeat_ = config.promotion_max_per_heartbeat;
@@ -693,7 +678,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     } else if (promotion_admission_threshold_ > 255) {
         promotion_admission_threshold_ = 255;
     }
-    if (config.promotion_on_hit && !enable_offload_) {
+    if (config.promotion_on_hit && !offload_config_.enable_offload) {
         LOG(WARNING) << "promotion_on_hit=true was requested but "
                      << "enable_offload=false; promotion is silently "
                      << "disabled because it requires offload to produce "
@@ -5555,8 +5540,9 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         metadata.MutablePart(0).SetChecksum(object_meta.object_checksum);
     }
 
-    if (replica_type != ReplicaType::DFS && enable_offload_ &&
-        !offload_on_evict_ && !metadata.HasReplica([](const Replica& replica) {
+    if (replica_type != ReplicaType::DFS &&
+        offload_config_.ShouldOffloadOnPutEnd() &&
+        !metadata.HasReplica([](const Replica& replica) {
             return replica.is_dfs_replica() && replica.is_processing();
         })) {
         auto& state = accessor.GetState();
@@ -5648,7 +5634,8 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     // deregistration can race; with the subsystem off both the mount and
     // unmount RPCs refuse, so there is nothing to check against and no race
     // to close.
-    if (enable_offload_ && !HasMountedLocalDiskSegment(client_id)) {
+    if (offload_config_.enable_offload &&
+        !HasMountedLocalDiskSegment(client_id)) {
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
     const ObjectIdentity object_id{normalized_tenant, key};
@@ -8141,7 +8128,7 @@ MasterService::GetStorageConfig() const {
 auto MasterService::MountLocalDiskSegment(const UUID& client_id,
                                           bool enable_offloading)
     -> tl::expected<void, ErrorCode> {
-    if (!enable_offload_) {
+    if (!offload_config_.enable_offload) {
         LOG(ERROR) << "	The offload functionality is not enabled";
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
@@ -8164,7 +8151,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
 
 auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    if (!enable_offload_) {
+    if (!offload_config_.enable_offload) {
         LOG(ERROR) << "The offload functionality is not enabled";
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
@@ -8370,8 +8357,8 @@ auto MasterService::NotifyOffloadSuccess(
             // deregistration can race; with the subsystem off both the mount
             // and unmount RPCs refuse, so there is nothing to check against
             // and no race to close.
-            const bool segment_mounted =
-                !enable_offload_ || HasMountedLocalDiskSegment(client_id);
+            const bool segment_mounted = !offload_config_.enable_offload ||
+                                         HasMountedLocalDiskSegment(client_id);
             MetadataAccessorRW accessor(this, request_object_id);
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
@@ -8540,7 +8527,7 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             OffloadTaskItem{.tenant_id = object_id.tenant_id.value(),
                             .key = object_id.user_key,
                             .size = size},
-            offloading_queue_limit_);
+            offload_config_.offloading_queue_limit);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
             return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
         }

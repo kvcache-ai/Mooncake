@@ -17,7 +17,7 @@ MasterServiceConfig LeaseConfig(uint64_t lease_ttl_ms) {
 
 MasterServiceConfig OffloadEnabledConfig() {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     return config;
 }
 
