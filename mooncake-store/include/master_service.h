@@ -2369,7 +2369,8 @@ class MasterService {
     void InitObjectStorage(const MasterServiceConfig&);
     void MaintainObjectStorage();
     tl::expected<void, ErrorCode> RestoreObjectStorageLocked(
-        const ObjectReplicaSnapshot&);
+        const StandbyMetadataStore* source,
+        const ObjectReplicaSnapshot* snapshot, size_t chunk_size);
     tl::expected<void, ErrorCode> AuthorizeObjectStorage(const UUID&,
                                                          const TenantId&,
                                                          const std::string&,
@@ -2383,7 +2384,8 @@ class MasterService {
         std::future<ErrorCode>* deferred = nullptr);
     tl::expected<std::future<ErrorCode>, ErrorCode> BeginObjectWriteRevocation(
         MetadataAccessorRW&, std::chrono::system_clock::time_point release_at);
-    tl::expected<void, ErrorCode> WaitObjectDurable(uint64_t);
+    tl::expected<void, ErrorCode> WaitObjectDurable(uint64_t sequence,
+                                                    uint64_t timeout_ms = 0);
     tl::expected<OrderedOpLogWriter::PendingHandle, ErrorCode>
     CommitObjectAware(OrderedOpLogWriter::Reservation&&, OpLogEntry,
                       DurableFinalizeCallback,

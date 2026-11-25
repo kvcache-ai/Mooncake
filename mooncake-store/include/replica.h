@@ -120,7 +120,6 @@ struct ReplicateConfig {
     size_t replica_num{1};
     size_t nof_replica_num{0};
     size_t dfs_replica_num{0};
-    size_t os_replica_num{0};
     SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
     // Optional request-level override. When omitted, ENABLE uses the
     // master's default soft-pin TTL.
@@ -151,6 +150,8 @@ struct ReplicateConfig {
         per_key_preferred_hca_names;
     // Per-key opaque residency affinity metadata.
     struct_pack::compatible<std::vector<std::string>, 4> residency_affinity_ids;
+
+    size_t os_replica_num{0};
 
     bool HasValidKeyHints(size_t key_count) const {
         return (!group_ids || group_ids->size() == key_count) &&
@@ -296,6 +297,14 @@ struct ReplicateConfig {
         return os;
     }
 };
+
+// Preserve the RPC field order independently of aggregate initialization.
+YLT_REFL(ReplicateConfig, replica_num, nof_replica_num, dfs_replica_num,
+         os_replica_num, soft_pin_action, soft_pin_ttl_ms, with_hard_pin,
+         preferred_segments, preferred_segment, preferred_nof_segments,
+         prefer_alloc_in_same_node, data_type, host_id, group_ids, session_ids,
+         preferred_hca_names, per_key_preferred_hca_names,
+         residency_affinity_ids);
 
 enum class ReplicaWriteMode {
     SINGLE_REPLICA,

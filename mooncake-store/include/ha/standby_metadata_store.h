@@ -94,6 +94,9 @@ class StandbyMetadataStore final : public MetadataStore {
         const std::string& tenant_id, const std::string& key,
         const ObjectReplicaMutation& mutation) override;
     bool RestoreObjectReplicas(const ObjectReplicaSnapshot& snapshot);
+    // Copy the frozen promotion handoff directly into the serving indexes.
+    bool RestoreObjectReplicas(const StandbyMetadataStore& source,
+                               const ObjectReplicaTarget& expected_target);
     ObjectReplicaSnapshot SnapshotObjectReplicas() const;
     bool HasObjectReplicaState() const;
     std::optional<ObjectUploadRecord> FindObjectUpload(

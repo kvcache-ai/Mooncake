@@ -891,10 +891,15 @@ void Client::EnterHaRuntimeMode() {
 }
 
 ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
-    if (!metrics_) return master_client_.Connect(address);
-
-    return metrics_->master_heartbeat_metric.ObserveConnect(
-        [this, &address] { return master_client_.Connect(address); });
+    auto connect = [this, &address] { return master_client_.Connect(address); };
+    auto result =
+        metrics_ ? metrics_->master_heartbeat_metric.ObserveConnect(connect)
+                 : connect();
+    if (result == ErrorCode::OK) {
+        std::lock_guard lock(object_storage_init_mutex_);
+        object_storage_config_current_ = false;
+    }
+    return result;
 }
 
 ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
@@ -1390,7 +1395,6 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     }
 
     client->InitTransferSubmitter();
-    if (!client->GetObjectStorageBackend()) return std::nullopt;
     // Initialize local hot cache
     err = client->InitLocalHotCache();
     if (err != ErrorCode::OK) {

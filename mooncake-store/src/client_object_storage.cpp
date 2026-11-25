@@ -7,10 +7,10 @@
 
 namespace mooncake {
 tl::expected<std::shared_ptr<ObjectStorageBackend>, ErrorCode>
-Client::GetObjectStorageBackend(const std::string* namespace_id) {
+Client::GetObjectStorageBackend(const std::string& namespace_id) {
     std::lock_guard lock(object_storage_init_mutex_);
-    if (object_storage_backend_ &&
-        (!namespace_id || *namespace_id == object_storage_namespace_))
+    if (object_storage_config_current_ && object_storage_backend_ &&
+        namespace_id == object_storage_namespace_)
         return object_storage_backend_;
     if (!transfer_submitter_) return tl::unexpected(ErrorCode::NOT_SUPPORTED);
 
@@ -18,13 +18,16 @@ Client::GetObjectStorageBackend(const std::string* namespace_id) {
     // Only install the target the master confirms for this descriptor.
     auto config = master_client_.GetObjectStorageConfig();
     if (!config) return tl::unexpected(config.error());
-    if (!config->enabled) {
-        if (namespace_id) return tl::unexpected(ErrorCode::NOT_SUPPORTED);
-        return std::shared_ptr<ObjectStorageBackend>{};
-    }
+    if (!config->enabled) return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     auto target_namespace = config->NamespaceId();
-    if (namespace_id && *namespace_id != target_namespace)
+    if (namespace_id != target_namespace)
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    if (object_storage_backend_ &&
+        object_storage_namespace_ == target_namespace) {
+        object_storage_backend_->SetMaxStagingBytes(config->max_staging_bytes);
+        object_storage_config_current_ = true;
+        return object_storage_backend_;
+    }
     auto adapter = CreateObjectReplicaAdapter(*config);
     if (!adapter) return tl::unexpected(adapter.error());
     object_storage_backend_ = std::make_shared<ObjectStorageBackend>(
@@ -35,13 +38,14 @@ Client::GetObjectStorageBackend(const std::string* namespace_id) {
             .max_staging_bytes = config->max_staging_bytes},
         *adapter);
     object_storage_namespace_ = std::move(target_namespace);
+    object_storage_config_current_ = true;
     EnsureStorageControlPlaneStarted();
     return object_storage_backend_;
 }
 ErrorCode Client::WriteObjectStorageReplica(const Replica::Descriptor& replica,
                                             const std::vector<Slice>& slices) {
     const auto& object = replica.get_object_storage_descriptor();
-    auto backend = GetObjectStorageBackend(&object.namespace_id);
+    auto backend = GetObjectStorageBackend(object.namespace_id);
     if (!backend) {
         ReportObjectStorageUpload(object.object_key,
                                   ObjectUploadOutcome::NOT_STARTED);
@@ -79,7 +83,7 @@ ErrorCode Client::ReadObjectStorageReplica(const Replica::Descriptor& replica,
                                            const std::vector<Slice>& slices,
                                            uint64_t offset) {
     const auto& object = replica.get_object_storage_descriptor();
-    auto backend = GetObjectStorageBackend(&object.namespace_id);
+    auto backend = GetObjectStorageBackend(object.namespace_id);
     if (!backend) return backend.error();
     auto runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
     auto start = std::chrono::steady_clock::now();

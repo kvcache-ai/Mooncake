@@ -4382,10 +4382,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                   << total;
     }
 
-    auto object_result =
-        metadata_store ? RestoreObjectStorageLocked(
-                             metadata_store->SnapshotObjectReplicas())
-                       : RestoreObjectStorageLocked(*legacy_object_storage);
+    auto object_result = RestoreObjectStorageLocked(
+        metadata_store, legacy_object_storage,
+        metadata_store ? chunk_object_count
+                       : std::max<size_t>(1, oplog_batch_max_entries_));
     if (!object_result) {
         rollback_restored_state();
         return object_result;

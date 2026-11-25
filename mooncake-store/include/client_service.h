@@ -1064,9 +1064,9 @@ class Client {
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, TransferRequest::OpCode op_code,
         TransferIntent intent = TransferIntent::kUnspecified);
-    // Startup probes without a descriptor and accepts a disabled backend.
+    // Resolve the descriptor against the current master on first object I/O.
     tl::expected<std::shared_ptr<ObjectStorageBackend>, ErrorCode>
-    GetObjectStorageBackend(const std::string* namespace_id = nullptr);
+    GetObjectStorageBackend(const std::string& namespace_id);
     ErrorCode WriteObjectStorageReplica(const Replica::Descriptor&,
                                         const std::vector<Slice>&);
     ErrorCode ReadObjectStorageReplica(const Replica::Descriptor&,
@@ -1077,6 +1077,7 @@ class Client {
     void AcknowledgeObjectStorageWrite(const std::vector<Replica::Descriptor>&);
     // Publish the namespace and its backend together. I/O retains the backend.
     std::mutex object_storage_init_mutex_;
+    bool object_storage_config_current_{false};
     std::shared_ptr<ObjectStorageBackend> object_storage_backend_;
     std::string object_storage_namespace_;
     std::mutex object_storage_completions_mutex_;

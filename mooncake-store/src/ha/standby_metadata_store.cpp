@@ -213,6 +213,23 @@ bool StandbyMetadataStore::RestoreObjectReplicas(
     return true;
 }
 
+bool StandbyMetadataStore::RestoreObjectReplicas(
+    const StandbyMetadataStore& source,
+    const ObjectReplicaTarget& expected_target) {
+    if (this == &source) return false;
+    std::scoped_lock lock(mutex_, source.mutex_);
+    if (source.object_storage_target_ &&
+        *source.object_storage_target_ != expected_target)
+        return false;
+    object_storage_target_ = source.object_storage_target_;
+    object_uploads_ = source.object_uploads_;
+    object_upload_names_ = source.object_upload_names_;
+    object_upload_keys_ = source.object_upload_keys_;
+    active_object_upload_keys_ = source.active_object_upload_keys_;
+    retired_object_upload_names_ = source.retired_object_upload_names_;
+    return true;
+}
+
 std::optional<ObjectUploadRecord> StandbyMetadataStore::FindObjectUpload(
     const std::string& name) const {
     std::lock_guard lock(mutex_);

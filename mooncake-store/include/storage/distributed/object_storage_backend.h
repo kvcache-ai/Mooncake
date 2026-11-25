@@ -39,6 +39,10 @@ class ObjectStorageBackend {
     ObjectStorageBackend(ObjectStorageBackendConfig config,
                          std::shared_ptr<ObjectStorageAdapter> adapter);
 
+    // In-flight reservations remain charged when a new leader changes the
+    // limit.
+    void SetMaxStagingBytes(uint64_t limit);
+
     // Gather a full object before issuing one PUT. upload_started is reset on
     // entry and set just before invoking PutOnce: true means PUT may have
     // begun, including when the adapter returns an error.
@@ -82,6 +86,7 @@ class ObjectStorageBackend {
    private:
     const ObjectStorageBackendConfig config_;
     const std::shared_ptr<ObjectStorageAdapter> adapter_;
+    std::atomic<uint64_t> max_staging_bytes_;
     std::atomic<uint64_t> staging_bytes_{0};
 };
 

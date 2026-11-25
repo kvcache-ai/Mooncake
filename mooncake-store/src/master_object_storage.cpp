@@ -74,12 +74,18 @@ MasterService::GetObjectStorageConfig() {
 }
 
 tl::expected<void, ErrorCode> MasterService::WaitObjectDurable(
-    uint64_t sequence) {
+    uint64_t sequence, uint64_t timeout_ms) {
     auto done = std::make_shared<std::promise<ErrorCode>>();
     auto result = done->get_future();
     [[maybe_unused]] auto waiter =
         ordered_oplog_writer_->AwaitDurable(sequence).thenValue(
             [done](ErrorCode error) { done->set_value(error); });
+    if (timeout_ms && result.wait_for(std::chrono::milliseconds(timeout_ms)) !=
+                          std::future_status::ready) {
+        LOG(ERROR) << "Timed out waiting for durable object repair, sequence="
+                   << sequence;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     auto error = result.get();
     if (error != ErrorCode::OK) return tl::make_unexpected(error);
     return {};
@@ -754,19 +760,25 @@ void MasterService::MaintainObjectStorage() {
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreObjectStorageLocked(
-    const ObjectReplicaSnapshot& snapshot) {
+    const StandbyMetadataStore* source, const ObjectReplicaSnapshot* snapshot,
+    size_t chunk_size) {
     if (!object_uploads_) {
         // The log retains the target identity even after the last forget.
         // Live object descriptors are rejected during metadata restoration.
-        if (!snapshot.records.empty())
+        if (source ? source->ObjectUploadCount() != 0
+                   : !snapshot->records.empty())
             return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
         return {};
     }
-    if (snapshot.target && *snapshot.target != object_storage_config_.target)
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     object_uploads_->Clear();
-    if (!object_uploads_->RestoreObjectReplicas(snapshot))
+    const auto& target = object_storage_config_.target;
+    if (source) {
+        if (!object_uploads_->RestoreObjectReplicas(*source, target))
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    } else if ((snapshot->target && *snapshot->target != target) ||
+               !object_uploads_->RestoreObjectReplicas(*snapshot)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     bool valid = true;
     VisitNamespaces([&](const TenantId& tenant, metadata::Namespace& ns) {
         for (auto object : ns.objects.ReadCursor()) {
@@ -804,55 +816,78 @@ tl::expected<void, ErrorCode> MasterService::RestoreObjectStorageLocked(
         object_pending_deadlines_.clear();
         object_work_.clear();
     }
-    if (!snapshot.target) return {};
     const auto now = ObjectNowMs();
     uint64_t pending_sequence = 0;
     size_t pending_count = 0;
-    for (auto record : snapshot.records) {
-        if (pending_count && pending_count >= oplog_batch_max_entries_) {
-            auto durable = WaitObjectDurable(pending_sequence);
-            if (!durable) return durable;
-            pending_count = 0;
+    std::string after;
+    for (;;) {
+        auto records = object_uploads_->ObjectUploadChunk(after, chunk_size);
+        if (records.empty()) break;
+        after = records.back().object.object_key;
+        for (auto& record : records) {
+            if (pending_count && pending_count >= oplog_batch_max_entries_) {
+                auto durable = WaitObjectDurable(
+                    pending_sequence, restore_repair_durable_timeout_ms_);
+                if (!durable) return durable;
+                pending_count = 0;
+            }
+            MetadataAccessorRW accessor(
+                this, {TenantId(record.tenant_id), record.key});
+            const auto* replica =
+                accessor.Exists()
+                    ? accessor.Get().GetReplicaByID(record.replica_id)
+                    : nullptr;
+            if (replica && replica->is_completed()) {
+                if (!replica->is_object_storage_replica() ||
+                    record.phase != ObjectUploadPhase::UPLOADED ||
+                    replica->get_object_storage_descriptor().object_key !=
+                        record.object.object_key ||
+                    replica->get_object_storage_descriptor().object_size !=
+                        record.object.object_size)
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                accessor.Get().GrantReadLease(std::chrono::milliseconds(
+                    ObjectLeaseTtl(record, default_kv_lease_ttl_)));
+                auto encoded = SerializeMetadataForOpLog(accessor.Get());
+                MetadataPayload payload;
+                if (struct_pack::deserialize_to(payload, encoded) !=
+                        struct_pack::errc::ok ||
+                    !object_uploads_->PutMetadata(record.tenant_id, record.key,
+                                                  payload.ToStandbyMetadata()))
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                if (*record.read_lease_ttl_ms >= default_kv_lease_ttl_)
+                    continue;
+                // Persist the larger ceiling before this leader can grant it.
+                record.read_lease_ttl_ms = default_kv_lease_ttl_;
+            } else if (record.phase == ObjectUploadPhase::RETIRED) {
+                // The handoff already includes the durable retirement.
+                // Reinstate the previous leader's lease window before allowing
+                // deletion.
+                std::lock_guard lock(object_storage_mutex_);
+                const auto deadline =
+                    object_restore_time_ +
+                    std::chrono::milliseconds(record.read_lease_ttl_ms.value_or(
+                        default_kv_lease_ttl_));
+                object_upload_sequences_[record.object.object_key] = 0;
+                SetObjectWorkLocked(record.object.object_key, deadline,
+                                    deadline);
+                continue;
+            } else {
+                RetireObject(record, default_kv_lease_ttl_, now);
+            }
+            ObjectReplicaMutation mutation;
+            mutation.target = record.target;
+            mutation.records.push_back(record);
+            auto appended = AppendOpLogWithDurableFinalize(
+                OpType::OBJECT_STORAGE_MUTATION, record.tenant_id, record.key,
+                EncodeObjectMutation(mutation), {});
+            if (!appended) return tl::make_unexpected(appended.error());
+            pending_sequence = appended->sequence_id;
+            ++pending_count;
         }
-        MetadataAccessorRW accessor(this,
-                                    {TenantId(record.tenant_id), record.key});
-        const auto* replica =
-            accessor.Exists() ? accessor.Get().GetReplicaByID(record.replica_id)
-                              : nullptr;
-        if (replica && replica->is_completed()) {
-            if (!replica->is_object_storage_replica() ||
-                record.phase != ObjectUploadPhase::UPLOADED ||
-                replica->get_object_storage_descriptor().object_key !=
-                    record.object.object_key ||
-                replica->get_object_storage_descriptor().object_size !=
-                    record.object.object_size)
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            accessor.Get().GrantReadLease(std::chrono::milliseconds(
-                ObjectLeaseTtl(record, default_kv_lease_ttl_)));
-            auto encoded = SerializeMetadataForOpLog(accessor.Get());
-            MetadataPayload payload;
-            if (struct_pack::deserialize_to(payload, encoded) !=
-                    struct_pack::errc::ok ||
-                !object_uploads_->PutMetadata(record.tenant_id, record.key,
-                                              payload.ToStandbyMetadata()))
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            if (*record.read_lease_ttl_ms >= default_kv_lease_ttl_) continue;
-            // Persist the larger ceiling before this leader can grant it.
-            record.read_lease_ttl_ms = default_kv_lease_ttl_;
-        } else if (record.phase != ObjectUploadPhase::RETIRED) {
-            RetireObject(record, default_kv_lease_ttl_, now);
-        }
-        ObjectReplicaMutation mutation;
-        mutation.target = record.target;
-        mutation.records.push_back(record);
-        auto appended = AppendOpLogWithDurableFinalize(
-            OpType::OBJECT_STORAGE_MUTATION, record.tenant_id, record.key,
-            EncodeObjectMutation(mutation), {});
-        if (!appended) return tl::make_unexpected(appended.error());
-        pending_sequence = appended->sequence_id;
-        ++pending_count;
     }
-    if (pending_count) return WaitObjectDurable(pending_sequence);
+    if (pending_count)
+        return WaitObjectDurable(pending_sequence,
+                                 restore_repair_durable_timeout_ms_);
     return {};
 }
 auto MasterService::RemoveObject(const std::string& key, const TenantId& tenant,
