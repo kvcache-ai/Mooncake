@@ -161,15 +161,6 @@ class Client {
                                       std::vector<Slice>& slices);
 
     /**
-     * @brief Batch retrieve data for multiple keys
-     * @param object_keys Keys to query
-     * @param slices Map of object keys to their data slices
-     */
-    std::vector<tl::expected<void, ErrorCode>> BatchGet(
-        const std::vector<std::string>& object_keys,
-        std::unordered_map<std::string, std::vector<Slice>>& slices);
-
-    /**
      * @brief Batch query IP addresses for multiple client IDs.
      * @param client_ids Vector of client UUIDs to query.
      * @return An expected object containing a map from client_id to their IP
@@ -304,6 +295,45 @@ class Client {
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
         bool group_by_target = false);
+
+    struct PutItem {
+        ObjectKey key;
+        std::vector<Slice> slices;
+        WriteTarget target{WholeObject{}};
+    };
+
+    struct GetItem {
+        ObjectKey key;
+        std::vector<Slice> slices;
+        ReadTarget target{WholeObject{}};
+        uint64_t src_offset{0};
+    };
+
+    /**
+     * @brief Unified single/multi-producer put entry point supporting
+     * WholeObject, PartTarget, and RangeTarget (PiecePut).
+     */
+    tl::expected<void, ErrorCode> Put(const PutItem& item,
+                                      const ReplicateConfig& config = {});
+    std::vector<tl::expected<void, ErrorCode>> BatchPut(
+        std::span<const PutItem> items, const ReplicateConfig& config = {});
+
+    /**
+     * @brief Unified get entry point supporting WholeObject (single-part and
+     * multi-part) and PartIndex, plus optional byte-range `src_offset` reads
+     * on memory replicas.
+     */
+    tl::expected<void, ErrorCode> Get(const GetItem& item);
+    std::vector<tl::expected<void, ErrorCode>> BatchGet(
+        std::span<const GetItem> items, bool group_by_target = false);
+
+    /**
+     * @brief Unified existence check combining Exist (AllHits) and Probe
+     * (None / LastHitOnly).
+     */
+    std::vector<tl::expected<bool, ErrorCode>> BatchExist(
+        std::span<const std::string> keys,
+        const GrantLeasePolicy& lease_policy = {ProbeLeaseMode::AllHits, 1});
 
     /**
      * @brief Stores data with replication
@@ -974,6 +1004,21 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL);
+
+    struct ResolvedGetTransfer {
+        size_t result_index{0};
+        std::string key;
+        std::vector<Slice> slices;
+        QueryResult query_result;
+        uint64_t src_offset{0};
+        bool allow_hot_cache{true};
+        bool verify_checksum{true};
+    };
+
+    void ExecuteBatchGetTransfers(
+        std::vector<ResolvedGetTransfer>& transfers,
+        std::vector<tl::expected<void, ErrorCode>>& results,
+        bool group_by_target);
 
     // What the dangling-replica probe established for one key. The Put path
     // retries only on kEvicted; the batch-get path also retries on kPresent,

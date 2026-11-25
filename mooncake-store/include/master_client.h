@@ -157,8 +157,8 @@ class MasterClient {
         const std::vector<std::string>& object_keys);
 
     /**
-     * @brief Probe multiple objects, optionally leasing the last complete
-     * candidate. LastHitOnly leases the last all-true candidate in the results.
+     * @brief Probe multiple objects with configurable lease policy (None,
+     * LastHitOnly, or AllHits).
      * @param object_keys Vector of keys to query
      * @return Per-key existence results in input order
      */
@@ -258,6 +258,16 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaListReadOnly(const std::vector<std::string>& object_keys,
                                 const std::string& tenant_id);
+
+    [[nodiscard]] std::vector<tl::expected<GetReplicaResponse, ErrorCode>>
+    BatchGetReplicaList(const std::vector<GetReplicaRequest>& requests);
+
+    [[nodiscard]] std::vector<tl::expected<PutStartResponse, ErrorCode>>
+    BatchPutStart(const std::vector<PutStartItem>& items,
+                  const ReplicateConfig& config);
+
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutFinish(
+        const std::vector<PutFinishRequest>& requests);
 
     /**
      * @brief Starts a put operation

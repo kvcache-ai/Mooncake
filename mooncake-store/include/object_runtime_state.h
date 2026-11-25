@@ -10,10 +10,69 @@
 #include <string>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+
 #include "replica.h"
 #include "types.h"
 
 namespace mooncake {
+
+// One producer's contiguous byte contribution within an in-flight RangeTarget
+// assembly. Lives only in ObjectState while writing and disappears on publish.
+struct RangeSpan {
+    uint64_t offset{0};
+    uint64_t length{0};
+    UUID writer{};
+    bool completed{false};
+};
+
+// Normalized placement and policy spec captured when the first producer opens
+// a RangeTarget round; joining producers compare against it directly.
+struct RangeWriteSpec {
+    uint64_t total_size{0};
+    size_t replica_num{0};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    bool hard_pinned{false};
+    std::string group_id;
+    std::string residency_affinity_id;
+    std::string session_id;
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::chrono::milliseconds soft_pin_ttl{0};
+
+    bool operator==(const RangeWriteSpec&) const = default;
+};
+
+// Runtime assembly progress for a RangeTarget (PiecePut) write. Ordinary
+// ObjectMetadata owns the fixed full-size MEMORY replicas, TotalLength(), and
+// put_start_time.
+struct RangeWriteState {
+    static constexpr size_t kMaxSpans = 128;
+
+    std::string write_id;
+    RangeWriteSpec spec;
+    uint64_t completed_bytes{0};
+    std::vector<ReplicaID> replica_ids;
+    boost::container::small_vector<RangeSpan, 8> spans;
+
+    bool HasOverlap(uint64_t offset, uint64_t length) const noexcept {
+        for (const auto& span : spans) {
+            if (offset < span.offset + span.length &&
+                span.offset < offset + length) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    RangeSpan* FindSpanByOffset(uint64_t offset) noexcept {
+        for (auto& span : spans) {
+            if (span.offset == offset) {
+                return &span;
+            }
+        }
+        return nullptr;
+    }
+};
 
 struct DynamicReplicaPending {
     UUID proposal_id{};

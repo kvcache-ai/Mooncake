@@ -484,6 +484,11 @@ class Replica {
 
     [[nodiscard]] Descriptor get_descriptor() const;
 
+    // Descriptor shifted to a sub-range `[offset, offset + length)` of a
+    // memory replica's backing buffer. Callers validate bounds before calling.
+    [[nodiscard]] Descriptor get_sliced_descriptor(uint64_t offset,
+                                                   uint64_t length) const;
+
     // The endpoint get_descriptor() would send a reader to, without building
     // the descriptor; none for kinds whose descriptor names no endpoint.
     [[nodiscard]] std::optional<std::string> transport_endpoint() const;
@@ -1030,6 +1035,19 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         desc.descriptor_variant = DfsData(data_).descriptor;
     }
 
+    return desc;
+}
+
+inline Replica::Descriptor Replica::get_sliced_descriptor(
+    uint64_t offset, uint64_t length) const {
+    auto desc = get_descriptor();
+    if (desc.is_memory_replica()) {
+        auto& buf = desc.get_memory_descriptor().buffer_descriptor;
+        DCHECK_LE(offset, buf.size_);
+        DCHECK_LE(length, buf.size_ - offset);
+        buf.buffer_address_ += offset;
+        buf.size_ = length;
+    }
     return desc;
 }
 

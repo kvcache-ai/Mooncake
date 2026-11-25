@@ -115,6 +115,9 @@ endif()
 add_subdirectory(master_service)
 
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(unified_piece_put_master_test unified_piece_put_master_test.cpp)
+add_store_test(unified_piece_put_integration_test
+               unified_piece_put_integration_test.cpp)
 add_store_test(master_service_restore_lifecycle_test
                master_service_restore_lifecycle_test.cpp)
 add_store_test(master_service_probe_policy_test

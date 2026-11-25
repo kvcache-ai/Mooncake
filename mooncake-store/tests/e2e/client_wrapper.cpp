@@ -199,21 +199,23 @@ ErrorCode ClientTestWrapper::BatchSmoke(const std::string& key_prefix) {
     }
 
     std::vector<std::unique_ptr<SliceGuard>> get_guards;
-    std::unordered_map<std::string, std::vector<Slice>> get_slices;
+    std::vector<Client::GetItem> get_items;
+    get_items.reserve(mixed_keys.size());
     for (size_t i = 0; i < mixed_keys.size(); ++i) {
         const size_t size = i < kCount ? values[i].size() : 1;
         auto guard = std::make_unique<SliceGuard>(size, allocator_);
-        get_slices.emplace(mixed_keys[i], guard->slices_);
+        get_items.push_back(
+            Client::GetItem{.key = mixed_keys[i], .slices = guard->slices_});
         get_guards.push_back(std::move(guard));
     }
-    auto get_results = client_->BatchGet(mixed_keys, get_slices);
+    auto get_results = client_->BatchGet(get_items);
     if (get_results.size() != mixed_keys.size()) {
         return ErrorCode::INTERNAL_ERROR;
     }
     for (size_t i = 0; i < kCount; ++i) {
         if (!get_results[i]) return get_results[i].error();
         std::string actual;
-        for (const auto& slice : get_slices.at(keys[i])) {
+        for (const auto& slice : get_items[i].slices) {
             actual.append(static_cast<const char*>(slice.ptr), slice.size);
         }
         if (actual != values[i]) return ErrorCode::INTERNAL_ERROR;

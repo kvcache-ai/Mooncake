@@ -97,6 +97,10 @@ class WrappedMasterService {
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const std::string& tenant_id = "default");
 
+    std::vector<tl::expected<GetReplicaResponse, ErrorCode>>
+    BatchGetReplicaListV2(const std::string& tenant_id,
+                          const std::vector<GetReplicaRequest>& requests);
+
     // Read-only admin variants: no lease grants, no promotion, no metric
     // updates.
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
@@ -105,6 +109,14 @@ class WrappedMasterService {
 
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListForAdmin(
         const std::string& key, const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<PutStartResponse, ErrorCode>> BatchPutStartV2(
+        const UUID& client_id, const std::string& tenant_id,
+        const std::vector<PutStartItem>& items, const ReplicateConfig& config);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutFinish(
+        const UUID& client_id, const std::string& tenant_id,
+        const std::vector<PutFinishRequest>& requests);
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,

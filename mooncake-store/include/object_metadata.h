@@ -216,6 +216,8 @@ struct ObjectMetadata {
 
     // Read under the owner's shared lock, change under its exclusive lock. A
     // replica pointer taken from a part is invalidated by any add or pop on it.
+    size_t PartCount() const { return parts_.size(); }
+
     const ObjectPart& GetPart(size_t index) const { return parts_.at(index); }
 
     ObjectPart& MutablePart(size_t index) { return parts_.at(index); }
