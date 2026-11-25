@@ -492,6 +492,9 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_MAX_INLINE` The maximum Inline write data volume (bytes) supported per QP, default value 64 (or the highest value supported by the platform)
 - `MC_MTU` The MTU length used per device instance, can be 512, 1024, 2048, 4096, default value 4096 (or the maximum length supported by the platform)
 - `MC_WORKERS_PER_CTX` The number of asynchronous worker threads corresponding to each device instance
+- `MC_BATCH_SUBMIT_THREADS` Worker threads per engine for synchronous batch preparation and submission. Unset or `0` keeps the original path and starts no batch-submit workers; `1` measures the single-sub-batch executor overhead, and `2` or `4` splits an eligible batch into independent sub-batches. Values must be integers in `0..32`. This is separate from classic posting workers and TENT lanes.
+- `MC_BATCH_SUBMIT_MIN_SIZE` Minimum number of descriptors in an input batch required to use batch-submit worker threads, default `4096`, positive integer. The unit is descriptors, not bytes. Both settings are read when the engine is initialized. The pool admits at most 16 parent calls; further callers wait within their existing transfer deadline.
+
 - `MC_RDMA_WORKER_IDLE_SPIN_US` How long (in microseconds) an RDMA worker thread keeps busy-polling after its device instance becomes idle before it sleeps, default value 100000 (100 ms), range 0-10000000. Each polling worker occupies a whole CPU core, so a lower value saves CPU when transfers are intermittent, at the cost of a thread wake-up when the next transfer arrives. 0 sleeps as soon as the device instance is idle
 - `MC_SLICE_SIZE` The segmentation granularity of user requests in Transfer Engine
 - `MC_RETRY_CNT` The maximum number of retries in Transfer Engine

@@ -34,19 +34,22 @@ struct IpcAttr {
     uint64_t base = 0;
     uint64_t size = 0;
     uintptr_t handle = 0;
-    int device = -1;
+    std::string pci_bus_id;
 };
 
 std::string formatIpcAttr(const IpcAttr &attr) {
-    return std::to_string(attr.base) + ':' + std::to_string(attr.size) + ':' +
-           std::to_string(attr.handle) + ':' + std::to_string(attr.device);
+    // Use '|' because PCI bus IDs contain ':'.
+    return std::to_string(attr.base) + '|' + std::to_string(attr.size) + '|' +
+           std::to_string(attr.handle) + '|' + attr.pci_bus_id;
 }
 
 bool parseIpcAttr(const std::string &text, IpcAttr &attr) {
+    // Legacy ordinal-only attributes cannot safely identify a remapped
+    // device. Reject them and let the planner select another route.
     std::array<std::string_view, 4> fields;
     size_t start = 0;
     for (size_t i = 0; i < fields.size(); ++i) {
-        const size_t end = text.find(':', start);
+        const size_t end = text.find('|', start);
         if (i + 1 < fields.size() && end == std::string::npos) return false;
         if (i + 1 == fields.size() && end != std::string::npos) return false;
         fields[i] = std::string_view(text).substr(start, end - start);
@@ -57,9 +60,10 @@ bool parseIpcAttr(const std::string &text, IpcAttr &attr) {
             std::from_chars(field.data(), field.data() + field.size(), value);
         return ec == std::errc() && end == field.data() + field.size();
     };
+    attr.pci_bus_id = std::string(fields[3]);
     return number(fields[0], attr.base) && number(fields[1], attr.size) &&
-           number(fields[2], attr.handle) && number(fields[3], attr.device) &&
-           attr.size && attr.handle && attr.device >= 0;
+           number(fields[2], attr.handle) && attr.size && attr.handle &&
+           !attr.pci_bus_id.empty();
 }
 
 bool rangeWithin(uint64_t addr, uint64_t length, uint64_t base, uint64_t size) {
@@ -244,6 +248,7 @@ Status MluTransport::uninstall() {
     metadata_.reset();
     platform_ = nullptr;
     installed_ = false;
+    ipc_enabled_ = false;
     machine_id_.clear();
     return Status::OK();
 }
@@ -699,6 +704,9 @@ Status MluTransport::freeLocalMemory(void *addr, size_t size) {
 
 Status MluTransport::addMemoryBuffer(BufferDesc &desc,
                                      const MemoryOptions &options) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!installed_ || !platform_)
+        return Status::InvalidArgument("MLU transport is not installed");
     LocationParser location(desc.location);
     if (location.type() != "mlu" && location.type() != "cpu" &&
         location.type() != kWildcardLocation) {
@@ -726,6 +734,8 @@ Status MluTransport::addMemoryBuffer(BufferDesc &desc,
         if (status.ok() && !rangeWithin(desc.addr, desc.length, base, size))
             status =
                 Status::InvalidArgument("MLU IPC buffer exceeds allocation");
+        std::string pci_bus_id;
+        if (status.ok()) status = platform_->devicePciBusId(device, pci_bus_id);
         if (status.ok()) {
             ContextGuard guard;
             status = guard.use(context);
@@ -738,7 +748,8 @@ Status MluTransport::addMemoryBuffer(BufferDesc &desc,
             }
             if (status.ok() && handle) {
                 desc.transport_attrs[MLU] = formatIpcAttr(
-                    {base, size, reinterpret_cast<uintptr_t>(handle), device});
+                    {base, size, reinterpret_cast<uintptr_t>(handle),
+                     pci_bus_id});
             }
         }
         if (!status.ok()) {
@@ -797,17 +808,22 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
         !rangeWithin(entry.addr, entry.length, attr.base, attr.size))
         return false;
 
+    // Peer checks and runtime device selection both use this process's
+    // ordinal, even when the exporter exposes its devices in another order.
+    int device = -1;
+    if (!platform_->deviceByPciBusId(attr.pci_bus_id, device).ok())
+        return false;
     cnrtPointerAttributes_t source{};
     auto queried = cnrtPointerGetAttributes(&source, local_source);
     if (queried != cnrtSuccess) return false;
-    if (source.type == cnrtMemTypeDevice && source.device != attr.device) {
+    if (source.type == cnrtMemTypeDevice && source.device != device) {
         unsigned int accessible = 0;
         // submitPeerCopy queues READ on the peer's context after swapping
         // the endpoints. Check that same direction before committing IPC.
         const bool read = opcode == Request::READ;
-        auto result = cnrtGetPeerAccessibility(
-            &accessible, read ? attr.device : source.device,
-            read ? source.device : attr.device);
+        auto result =
+            cnrtGetPeerAccessibility(&accessible, read ? device : source.device,
+                                     read ? source.device : device);
         if (result != cnrtSuccess || !accessible) return false;
     }
 
@@ -852,7 +868,7 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
     ContextGuard guard;
     RuntimeDeviceGuard device_guard;
     if (!guard.use(nullptr).ok()) return false;
-    auto selected = device_guard.use(attr.device);
+    auto selected = device_guard.use(device);
     if (selected != cnrtSuccess) return false;
     void *mapped = nullptr;
     auto result = cnrtMapMemHandle(
@@ -881,7 +897,7 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
     });
     entries.push_back({attr_text, attr.base, attr.size, std::move(mapping)});
     LOG(INFO) << "MLU IPC mapped peer buffer " << (void *)attr.base << " of "
-              << segment.name << " at " << mapped << " on mlu:" << attr.device;
+              << segment.name << " at " << mapped << " on mlu:" << device;
     return true;
 }
 

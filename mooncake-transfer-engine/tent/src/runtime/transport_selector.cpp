@@ -489,8 +489,7 @@ bool TransportSelector::isTransportAvailable(
         return false;
     if (context.xpu_ipc_only && type != XPU) return false;
     if (context.mlu_ipc_only && type != MLU) return false;
-    if ((type == NVLINK || type == SHM || type == TPU) &&
-        !context.same_machine) {
+    if (!isPeerReachable(type, context.same_machine)) {
         return false;
     }
 
