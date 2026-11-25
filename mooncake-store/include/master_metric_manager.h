@@ -131,6 +131,8 @@ class MasterMetricManager {
     void dec_total_dram_capacity(int64_t val = 1);
     int64_t get_allocated_dram_size();
     int64_t get_total_dram_capacity();
+    void reset_segment_allocated_dram_size(const std::string& segment);
+    void reset_segment_total_dram_capacity(const std::string& segment);
     int64_t get_segment_allocated_dram_size(const std::string& segment);
     int64_t get_segment_total_dram_capacity(const std::string& segment);
 
@@ -141,6 +143,8 @@ class MasterMetricManager {
     void dec_total_cxl_capacity(int64_t val = 1);
     int64_t get_allocated_cxl_size();
     int64_t get_total_cxl_capacity();
+    void reset_segment_allocated_cxl_size(const std::string& segment);
+    void reset_segment_total_cxl_capacity(const std::string& segment);
     int64_t get_segment_allocated_cxl_size(const std::string& segment);
     int64_t get_segment_total_cxl_capacity(const std::string& segment);
 
@@ -613,6 +617,8 @@ class MasterMetricManager {
     std::mutex storage_projection_mutex_;
     std::set<std::string> projected_mem_segments_;
     std::set<std::string> projected_nof_segments_;
+    std::set<std::string> projected_ram_segments_;
+    std::set<std::string> projected_cxl_segments_;
 
     AllocatorMetric allocator_metric_;
 

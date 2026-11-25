@@ -172,6 +172,25 @@ class AllocatorManager {
         return serving_names;
     }
 
+    [[nodiscard]] std::vector<std::string> getServingNames(
+        StorageLevel storage_level) const {
+        std::vector<std::string> serving_names;
+        serving_names.reserve(names_.size());
+        for (const auto& name : names_) {
+            const auto& registrations = allocators_.at(name);
+            if (std::any_of(
+                    registrations.begin(), registrations.end(),
+                    [storage_level](const auto& registration) {
+                        const auto allocator = registration->GetAllocator();
+                        return registration->IsServing() && allocator &&
+                               allocator->getStorageLevel() == storage_level;
+                    })) {
+                serving_names.push_back(name);
+            }
+        }
+        return serving_names;
+    }
+
     /**
      * @brief Get allocator registrations belonging to the given segment name.
      * @return a vector of registrations belonging to the segment name

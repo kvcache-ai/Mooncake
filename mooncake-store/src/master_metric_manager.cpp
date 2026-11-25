@@ -863,6 +863,16 @@ int64_t MasterMetricManager::get_total_dram_capacity() {
     return dram_total_capacity_.value();
 }
 
+void MasterMetricManager::reset_segment_allocated_dram_size(
+    const std::string& segment) {
+    dram_allocated_size_per_segment_.update({segment}, 0);
+}
+
+void MasterMetricManager::reset_segment_total_dram_capacity(
+    const std::string& segment) {
+    dram_total_capacity_per_segment_.update({segment}, 0);
+}
+
 // CXL Storage Metrics
 void MasterMetricManager::inc_allocated_cxl_size(const std::string& segment,
                                                  int64_t val) {
@@ -901,6 +911,16 @@ int64_t MasterMetricManager::get_allocated_cxl_size() {
 }
 int64_t MasterMetricManager::get_total_cxl_capacity() {
     return cxl_total_capacity_.value();
+}
+
+void MasterMetricManager::reset_segment_allocated_cxl_size(
+    const std::string& segment) {
+    cxl_allocated_size_per_segment_.update({segment}, 0);
+}
+
+void MasterMetricManager::reset_segment_total_cxl_capacity(
+    const std::string& segment) {
+    cxl_total_capacity_per_segment_.update({segment}, 0);
 }
 
 int64_t MasterMetricManager::get_segment_allocated_dram_size(
@@ -1029,6 +1049,12 @@ void MasterMetricManager::project_storage_usage(
     project_tier(snapshot.nof, nof_allocated_size_, nof_total_capacity_,
                  nof_allocated_size_per_segment_,
                  nof_total_capacity_per_segment_, projected_nof_segments_);
+    project_tier(snapshot.ram, dram_allocated_size_, dram_total_capacity_,
+                 dram_allocated_size_per_segment_,
+                 dram_total_capacity_per_segment_, projected_ram_segments_);
+    project_tier(snapshot.cxl, cxl_allocated_size_, cxl_total_capacity_,
+                 cxl_allocated_size_per_segment_,
+                 cxl_total_capacity_per_segment_, projected_cxl_segments_);
 }
 
 int64_t MasterMetricManager::get_segment_allocated_nof_size(

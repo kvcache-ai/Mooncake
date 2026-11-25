@@ -115,6 +115,15 @@ msgpack::object& SnapshotField(msgpack::object& root, std::string_view name) {
     throw std::runtime_error("missing snapshot field");
 }
 
+msgpack::object& AllocatorStateField(msgpack::object& allocator) {
+    if (allocator.type != msgpack::type::ARRAY ||
+        (allocator.via.array.size != 6 && allocator.via.array.size != 7)) {
+        throw std::runtime_error("invalid allocator snapshot layout");
+    }
+    const uint32_t state_index = allocator.via.array.size == 7 ? 6 : 5;
+    return allocator.via.array.ptr[state_index];
+}
+
 std::string PackLocalSsd(const LocalSsdPersistedState& state) {
     msgpack::sbuffer buffer;
     MsgpackPacker packer(&buffer);
@@ -490,7 +499,7 @@ TEST(StoreResourceSnapshotCodecTest,
                  SnapshotField(root, "ms").via.map.ptr[1].val.via.array.ptr[7];
              auto usage = msgpack::object(uint64_t{kRegionSize + 1});
              allocator.via.array.ptr[3] = usage;
-             allocator.via.array.ptr[5].via.array.ptr[3] = usage;
+             AllocatorStateField(allocator).via.array.ptr[3] = usage;
          }},
         {"usage overflows metrics",
          [](auto& root, auto&) {
@@ -498,7 +507,7 @@ TEST(StoreResourceSnapshotCodecTest,
                  SnapshotField(root, "ms").via.map.ptr[1].val.via.array.ptr[7];
              auto usage = msgpack::object(std::numeric_limits<uint64_t>::max());
              allocator.via.array.ptr[3] = usage;
-             allocator.via.array.ptr[5].via.array.ptr[3] = usage;
+             AllocatorStateField(allocator).via.array.ptr[3] = usage;
          }},
         {"second adoption fails",
          [&](auto& root, auto& zone) {
@@ -621,11 +630,11 @@ TEST(StoreResourceSnapshotCodecTest, CorruptAllocatorCapacityIsRejected) {
     for (const auto& [element, value] : corruptions) {
         SCOPED_TRACE(element);
         auto corrupted = RewriteSnapshot(*encoded, [&](auto& root, auto&) {
-            // region[7] = OffsetBufferAllocator, [5] = OffsetAllocator, [5] =
-            // __Allocator.
+            // region[7] = OffsetBufferAllocator, whose state field contains
+            // the OffsetAllocator; state[5] = __Allocator.
             auto& region = SnapshotField(root, "ms").via.map.ptr[0].val;
             auto& allocator = region.via.array.ptr[7];
-            auto& offset_allocator = allocator.via.array.ptr[5];
+            auto& offset_allocator = AllocatorStateField(allocator);
             auto& layout = offset_allocator.via.array.ptr[5];
             layout.via.array.ptr[element] = msgpack::object(value);
         });
@@ -736,13 +745,12 @@ TEST(StoreResourceSnapshotCodecTest,
     for (const uint32_t element : {7U, 8U}) {
         SCOPED_TRACE(element);
         auto corrupted = RewriteSnapshot(*encoded, [&](auto& root, auto& zone) {
-            // region[7] = OffsetBufferAllocator, [5] = OffsetAllocator, [5] =
-            // __Allocator.
-            auto& layout = SnapshotField(root, "ms")
-                               .via.map.ptr[0]
-                               .val.via.array.ptr[7]
-                               .via.array.ptr[5]
-                               .via.array.ptr[5];
+            // region[7] = OffsetBufferAllocator, whose state field contains
+            // the OffsetAllocator; state[5] = __Allocator.
+            auto& allocator =
+                SnapshotField(root, "ms").via.map.ptr[0].val.via.array.ptr[7];
+            auto& layout =
+                AllocatorStateField(allocator).via.array.ptr[5];
             layout.via.array.ptr[element] = msgpack::object(
                 msgpack::type::raw_ref(
                     reinterpret_cast<const char*>(frame.data()), frame.size()),
@@ -794,11 +802,11 @@ TEST(StoreResourceSnapshotCodecTest, CorruptAllocatorInternalsAreRejected) {
     for (const auto& corruption : corruptions) {
         SCOPED_TRACE(corruption.name);
         auto corrupted = RewriteSnapshot(*encoded, [&](auto& root, auto&) {
-            // region[7] = OffsetBufferAllocator, [5] = OffsetAllocator; element
-            // 3 of the OffsetBufferAllocator is the outer used_bytes.
+            // region[7] = OffsetBufferAllocator; its state field contains the
+            // OffsetAllocator. Element 3 of the outer allocator is used_bytes.
             auto& allocator_field =
                 SnapshotField(root, "ms").via.map.ptr[0].val.via.array.ptr[7];
-            auto& state = allocator_field.via.array.ptr[5];
+            auto& state = AllocatorStateField(allocator_field);
             state.via.array.ptr[corruption.element] =
                 msgpack::object(corruption.value);
             if (corruption.mirror_usage) {
@@ -838,20 +846,18 @@ TEST(StoreResourceSnapshotCodecTest,
     auto corrupted = RewriteSnapshot(*encoded, [](auto& root, auto&) {
         // Element 4 of the OffsetAllocator array is allocated_num; it cannot
         // exceed the single used node.
-        auto& state = SnapshotField(root, "ms")
-                          .via.map.ptr[0]
-                          .val.via.array.ptr[7]
-                          .via.array.ptr[5];
+        auto& allocator =
+            SnapshotField(root, "ms").via.map.ptr[0].val.via.array.ptr[7];
+        auto& state = AllocatorStateField(allocator);
         state.via.array.ptr[4] = msgpack::object(uint64_t{2});
     });
     const auto bytes = zstd_decompress(corrupted);
     auto unpacked = msgpack::unpack(reinterpret_cast<const char*>(bytes.data()),
                                     bytes.size());
     auto root = unpacked.get();
-    auto& offset_allocator_object = SnapshotField(root, "ms")
-                                        .via.map.ptr[0]
-                                        .val.via.array.ptr[7]
-                                        .via.array.ptr[5];
+    auto& allocator_object =
+        SnapshotField(root, "ms").via.map.ptr[0].val.via.array.ptr[7];
+    auto& offset_allocator_object = AllocatorStateField(allocator_object);
     auto decoded = Serializer<offset_allocator::OffsetAllocator>::deserialize(
         offset_allocator_object);
     ASSERT_FALSE(decoded.has_value());

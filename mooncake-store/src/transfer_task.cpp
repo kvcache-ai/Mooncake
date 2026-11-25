@@ -12,7 +12,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include "gpu_staging_utils.h"
 #include "replica.h"
 #include "config/transfer_submitter_config.h"
 #include "config/fileread_worker_pool_config.h"

@@ -26,8 +26,10 @@ void MasterServiceTestPeer::SetBatchOpLogWriterFactoryForTesting(
 }
 
 void MasterServiceTestPeer::RunBatchEvictForTesting(
-    double evict_ratio_target, double evict_ratio_lowerbound) {
-    service_.BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+    double evict_ratio_target, double evict_ratio_lowerbound,
+    StorageLevel target_level) {
+    service_.BatchEvict(evict_ratio_target, evict_ratio_lowerbound,
+                        target_level);
 }
 
 void MasterServiceTestPeer::RunNoFBatchEvictForTesting(
@@ -41,6 +43,12 @@ void MasterServiceTestPeer::RunDfsEvictionForTesting() {
 
 void MasterServiceTestPeer::RunTenantEvictForTesting() {
     service_.EvictTenantsOverWatermark();
+}
+
+tl::expected<void, SerializationError>
+MasterServiceTestPeer::ApplySnapshotStateForTesting(
+    const std::chrono::system_clock::time_point& now) {
+    return service_.ApplySnapshotState(now);
 }
 
 void MasterServiceTestPeer::SetKvTenantEpochTrackingForTesting(bool enabled) {

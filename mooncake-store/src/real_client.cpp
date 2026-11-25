@@ -970,12 +970,13 @@ tl::expected<void, ErrorCode> RealClient::mp_setup_internal(
         }
         client_ = *client_opt;
     } else {
-        const int kMaxRetries =
-            GetEnvOr<int>("MC_STORE_CLIENT_SETUP_RETRIES", 20);
+        const auto auto_port_config = ClientAutoPortConfig::FromEnvironment();
+        const int kMaxRetries = auto_port_config.max_retries;
         bool success = false;
 
         for (int retry = 0; retry < kMaxRetries; ++retry) {
-            port_binder_ = std::make_unique<AutoPortBinder>();
+            port_binder_ = std::make_unique<AutoPortBinder>(
+                auto_port_config.min_port, auto_port_config.max_port);
             int port = port_binder_->getPort();
             if (port < 0) {
                 LOG(WARNING) << "Failed to bind available port, retry "

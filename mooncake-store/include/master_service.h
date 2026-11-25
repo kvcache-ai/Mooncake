@@ -993,7 +993,8 @@ class MasterService {
     // evict ratio target. If the actual evicted ratio is less than
     // evict_ratio_lowerbound, the second pass will be triggered and try to
     // fulfill evict ratio lowerbound.
-    void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound,
+                    StorageLevel target_level = StorageLevel::RAM);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
     struct TenantQuotaEvictionResult {
@@ -1649,8 +1650,8 @@ class MasterService {
     const bool allow_evict_soft_pinned_objects_;
 
     // Eviction related members
-    std::atomic<bool> need_mem_eviction_{
-        false};  // Set to trigger memory eviction when allocation fails
+    std::atomic<bool> need_ram_eviction_{false};  // RAM allocation pressure
+    std::atomic<bool> need_cxl_eviction_{false};  // CXL allocation pressure
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
     const double eviction_ratio_;                     // in range [0.0, 1.0]
@@ -2513,6 +2514,8 @@ class MasterService {
     bool IsReplicaReadable(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
+    bool IsEvictableMemoryReplicaAtLevel(
+        const Replica& replica, StorageLevel target_level) const;
 
     /**
      * Segment lifecycle persist helper. Tries to durably persist the

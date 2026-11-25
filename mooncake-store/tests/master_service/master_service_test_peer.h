@@ -49,7 +49,8 @@ class MasterServiceTestPeer {
 
     // Drive one eviction cycle synchronously, without the periodic worker.
     void RunBatchEvictForTesting(double evict_ratio_target,
-                                 double evict_ratio_lowerbound);
+                                 double evict_ratio_lowerbound,
+                                 StorageLevel target_level = StorageLevel::RAM);
 
     void RunNoFBatchEvictForTesting(double evict_ratio_target,
                                     double evict_ratio_lowerbound);
@@ -58,6 +59,9 @@ class MasterServiceTestPeer {
 
     // Drive one tenant watermark eviction pass without the periodic worker.
     void RunTenantEvictForTesting();
+
+    tl::expected<void, SerializationError> ApplySnapshotStateForTesting(
+        const std::chrono::system_clock::time_point& now);
 
     // Enable epoch bookkeeping without starting a live KV event publisher.
     void SetKvTenantEpochTrackingForTesting(bool enabled);
@@ -168,10 +172,16 @@ class MasterServiceTestPeer {
     }
 
     static auto& NeedMemEviction(MasterService& service) {
-        return service.need_mem_eviction_;
+        return service.need_ram_eviction_;
     }
     static const auto& NeedMemEviction(const MasterService& service) {
-        return service.need_mem_eviction_;
+        return service.need_ram_eviction_;
+    }
+    static auto& NeedCxlEviction(MasterService& service) {
+        return service.need_cxl_eviction_;
+    }
+    static const auto& NeedCxlEviction(const MasterService& service) {
+        return service.need_cxl_eviction_;
     }
 
     static auto& NofSegmentManager(MasterService& service) {

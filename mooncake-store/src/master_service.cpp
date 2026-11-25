@@ -788,6 +788,8 @@ TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
     return {
         .memory = segment_manager_.GetMemoryUsageSnapshot(),
         .nof = nof_segment_manager_.GetUsageSnapshot(),
+        .ram = segment_manager_.GetMemoryUsageSnapshot(StorageLevel::RAM),
+        .cxl = segment_manager_.GetMemoryUsageSnapshot(StorageLevel::CXL),
     };
 }
 
@@ -3788,7 +3790,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                     if (!alloc) {
                         alloc = std::make_shared<DummyBufferAllocator>(
                             buffer.transport_endpoint_,
-                            buffer.transport_endpoint_);
+                            buffer.transport_endpoint_, StorageLevel::SSD);
                     }
                     auto restored_buffer =
                         std::make_unique<AllocatedBuffer>(alloc, buffer);
@@ -4297,6 +4299,12 @@ bool MasterService::IsEvictableMemoryReplica(const Replica& replica) const {
            replica.get_refcnt() == 0;
 }
 
+bool MasterService::IsEvictableMemoryReplicaAtLevel(
+    const Replica& replica, StorageLevel target_level) const {
+    return IsEvictableMemoryReplica(replica) &&
+           replica.get_descriptor().get_storage_level() == target_level;
+}
+
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
                                           const TenantId& tenant_id)
     -> tl::expected<
@@ -4710,6 +4718,17 @@ auto MasterService::AllocateReplicas(const std::string& key,
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
     bool has_enough_memory_segments = false;
+    const StorageLevel memory_storage_level =
+        config.preferred_storage_level == StorageLevel::CXL
+            ? StorageLevel::CXL
+            : StorageLevel::RAM;
+    auto request_memory_eviction = [this, memory_storage_level]() {
+        if (memory_storage_level == StorageLevel::CXL) {
+            need_cxl_eviction_.store(true, std::memory_order_relaxed);
+        } else {
+            need_ram_eviction_.store(true, std::memory_order_relaxed);
+        }
+    };
 
     if (config.replica_num > 0) {
         std::vector<std::string> preferred_segments;
@@ -4732,9 +4751,10 @@ auto MasterService::AllocateReplicas(const std::string& key,
         {
             ScopedAllocatorAccess allocator_access =
                 segment_manager_.getAllocatorAccess();
-            has_enough_memory_segments = allocator_access.getAllocatorManager()
-                                             .getServingNames()
-                                             .size() >= config.replica_num;
+            has_enough_memory_segments =
+                allocator_access.getAllocatorManager()
+                    .getServingNames(memory_storage_level)
+                    .size() >= config.replica_num;
             if (!writer_host_id.empty()) {
                 auto host_ordered_segments =
                     allocator_access.GetHostOrderedSegments(writer_host_id,
@@ -4773,7 +4793,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
             if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
                 MasterMetricManager::instance().inc_put_start_alloc_failures();
                 if (has_enough_memory_segments) {
-                    need_mem_eviction_ = true;
+                    request_memory_eviction();
                 }
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
             }
@@ -4827,7 +4847,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
             if (config.replica_num > 0 &&
                 allocated_memory_replicas != config.replica_num &&
                 has_enough_memory_segments) {
-                need_mem_eviction_ = true;
+                request_memory_eviction();
             }
             if (config.nof_replica_num > 0 &&
                 allocated_nof_replicas != config.nof_replica_num) {
@@ -10458,21 +10478,43 @@ void MasterService::EvictionThreadFunc() {
     auto next_tenant_eviction_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
-        double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
-        if (used_ratio > eviction_high_watermark_ratio_ ||
-            (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
-            LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
-                      << " high_watermark=" << eviction_high_watermark_ratio_
-                      << " need_mem_eviction=" << need_mem_eviction_
-                      << " eviction_ratio=" << eviction_ratio_;
-            double evict_ratio_target = std::max(
-                eviction_ratio_,
-                used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_);
-            double evict_ratio_lowerbound =
-                std::max(evict_ratio_target * 0.5,
-                         used_ratio - eviction_high_watermark_ratio_);
-            BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
-            LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
+        auto run_tier_eviction =
+            [&, this](StorageLevel storage_level, const char* tier,
+                      std::atomic<bool>& allocation_pressure) {
+                const double used_ratio =
+                    segment_manager_.GetMemoryUsage(storage_level).used_ratio();
+                const bool need_eviction =
+                    allocation_pressure.load(std::memory_order_relaxed);
+                if (used_ratio <= eviction_high_watermark_ratio_ &&
+                    (!need_eviction || eviction_ratio_ <= 0.0)) {
+                    return false;
+                }
+
+                LOG(INFO) << "[EVICT-TRIGGER] tier=" << tier
+                          << " used_ratio=" << used_ratio
+                          << " high_watermark="
+                          << eviction_high_watermark_ratio_
+                          << " allocation_pressure=" << need_eviction
+                          << " eviction_ratio=" << eviction_ratio_;
+                const double evict_ratio_target = std::max(
+                    eviction_ratio_, used_ratio -
+                                         eviction_high_watermark_ratio_ +
+                                         eviction_ratio_);
+                const double evict_ratio_lowerbound =
+                    std::max(evict_ratio_target * 0.5,
+                             used_ratio - eviction_high_watermark_ratio_);
+                BatchEvict(evict_ratio_target, evict_ratio_lowerbound,
+                           storage_level);
+                LOG(INFO) << "[EVICT-DONE] tier=" << tier
+                          << " BatchEvict execution completed.";
+                return true;
+            };
+
+        const bool ram_evicted =
+            run_tier_eviction(StorageLevel::RAM, "RAM", need_ram_eviction_);
+        const bool cxl_evicted =
+            run_tier_eviction(StorageLevel::CXL, "CXL", need_cxl_eviction_);
+        if (ram_evicted || cxl_evicted) {
             last_discard_time = now;
         } else if (now - last_discard_time > put_start_release_timeout_sec_) {
             // Try discarding expired processing keys and ongoing replication
@@ -10974,6 +11016,20 @@ void MasterService::RestoreState() {
 }
 
 void MasterService::ResetStateAfterFailedRestoreAttempt() {
+    std::unordered_set<std::string> memory_metric_segments;
+    for (const auto& [segment_name, usage] :
+         segment_manager_.GetMemoryUsageSnapshot().segments) {
+        (void)usage;
+        memory_metric_segments.insert(segment_name);
+    }
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        std::vector<std::string> segment_names;
+        segment_access.GetAllSegmentNames(segment_names);
+        memory_metric_segments.insert(segment_names.begin(),
+                                      segment_names.end());
+    }
     SegmentSerializer segment_serializer(&segment_manager_);
     MetadataSerializer metadata_serializer(this);
     TaskManagerSerializer task_manager_serializer(&task_manager_);
@@ -10990,10 +11046,24 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
         client_liveness_records_.clear();
     }
 
-    MasterMetricManager::instance().reset_allocated_mem_size();
-    MasterMetricManager::instance().reset_total_mem_capacity();
-    MasterMetricManager::instance().reset_cache_total_nums();
-    MasterMetricManager::instance().reset_client_liveness_metrics();
+    auto& metrics = MasterMetricManager::instance();
+    metrics.reset_allocated_mem_size();
+    metrics.reset_total_mem_capacity();
+    metrics.reset_allocated_dram_size();
+    metrics.reset_total_dram_capacity();
+    metrics.reset_allocated_cxl_size();
+    metrics.reset_total_cxl_capacity();
+    for (const auto& segment_name : memory_metric_segments) {
+        metrics.reset_segment_allocated_mem_size(segment_name);
+        metrics.reset_segment_total_mem_capacity(segment_name);
+        metrics.reset_segment_allocated_dram_size(segment_name);
+        metrics.reset_segment_total_dram_capacity(segment_name);
+        metrics.reset_segment_allocated_cxl_size(segment_name);
+        metrics.reset_segment_total_cxl_capacity(segment_name);
+        metrics.remove_segment_metrics(segment_name);
+    }
+    metrics.reset_cache_total_nums();
+    metrics.reset_client_liveness_metrics();
 }
 
 tl::expected<void, SerializationError>
@@ -11112,7 +11182,13 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
             segment_manager_.getSegmentAccess();
         segment_access.GetAllSegmentNames(segment_names);
     }
-
+    std::unordered_set<std::string> memory_metric_segments(
+        segment_names.begin(), segment_names.end());
+    for (const auto& [segment_name, usage] :
+         segment_manager_.GetMemoryUsageSnapshot().segments) {
+        (void)usage;
+        memory_metric_segments.insert(segment_name);
+    }
     // Cleanup expired metadata (unless test environment disables it)
     {
         const bool skip_cleanup =
@@ -11145,11 +11221,15 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
         }
 
         // Rebuild allocated memory metrics
-        MasterMetricManager::instance().reset_allocated_mem_size();
+        auto& metrics = MasterMetricManager::instance();
+        metrics.reset_allocated_mem_size();
+        metrics.reset_allocated_dram_size();
+        metrics.reset_allocated_cxl_size();
         RebuildCacheTotalAccounting();
-        for (auto& segment_name : segment_names) {
-            MasterMetricManager::instance().reset_segment_allocated_mem_size(
-                segment_name);
+        for (const auto& segment_name : memory_metric_segments) {
+            metrics.reset_segment_allocated_mem_size(segment_name);
+            metrics.reset_segment_allocated_dram_size(segment_name);
+            metrics.reset_segment_allocated_cxl_size(segment_name);
         }
 
         for (auto& shard : metadata_shards_) {
@@ -11167,12 +11247,24 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                         if (!temp_segment_names[0].has_value()) {
                             continue;
                         }
-                        auto buffer_descriptor = replica.get_descriptor()
-                                                     .get_memory_descriptor()
-                                                     .buffer_descriptor;
-                        MasterMetricManager::instance().inc_allocated_mem_size(
-                            temp_segment_names[0].value(),
-                            static_cast<int64_t>(buffer_descriptor.size_));
+                        const auto descriptor = replica.get_descriptor();
+                        const auto& buffer_descriptor =
+                            descriptor.get_memory_descriptor()
+                                .buffer_descriptor;
+                        const auto segment_name =
+                            temp_segment_names[0].value();
+                        const auto allocated_size =
+                            static_cast<int64_t>(buffer_descriptor.size_);
+                        metrics.inc_allocated_mem_size(segment_name,
+                                                       allocated_size);
+                        if (descriptor.get_storage_level() ==
+                            StorageLevel::CXL) {
+                            metrics.inc_allocated_cxl_size(segment_name,
+                                                           allocated_size);
+                        } else {
+                            metrics.inc_allocated_dram_size(segment_name,
+                                                            allocated_size);
+                        }
                     }
                     ++it;
                 }
@@ -11188,32 +11280,60 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
 
     // Rebuild total capacity metrics
     {
-        MasterMetricManager::instance().reset_total_mem_capacity();
-        for (auto& segment_name : segment_names) {
-            MasterMetricManager::instance().reset_segment_total_mem_capacity(
-                segment_name);
+        const auto cxl_global_allocator =
+            segment_manager_.GetCxlGlobalAllocatorUsage();
+        auto& metrics = MasterMetricManager::instance();
+        std::vector<std::pair<Segment, UUID>> unready_segments;
+        {
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
+            segment_access.GetUnreadySegments(unready_segments);
+        }
+        for (const auto& [segment, client_id] : unready_segments) {
+            UnmountSegment(segment.id, client_id);
         }
 
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        std::vector<std::pair<Segment, UUID>> unready_segments;
-        if (segment_access.GetUnreadySegments(unready_segments) ==
-            ErrorCode::OK) {
-            for (const auto& [segment, client_id] : unready_segments) {
-                UnmountSegment(segment.id, client_id);
-            }
+        // Unmounting adjusts the live gauges. Clear them only after removing
+        // unready segments so those decrements cannot make the rebuilt totals
+        // negative.
+        metrics.reset_total_mem_capacity();
+        metrics.reset_total_dram_capacity();
+        metrics.reset_total_cxl_capacity();
+        for (const auto& segment_name : memory_metric_segments) {
+            metrics.reset_segment_total_mem_capacity(segment_name);
+            metrics.reset_segment_total_dram_capacity(segment_name);
+            metrics.reset_segment_total_cxl_capacity(segment_name);
         }
 
         std::vector<std::pair<Segment, UUID>> all_segments;
-        auto err = segment_access.GetAllSegments(all_segments);
+        ErrorCode err;
+        {
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
+            err = segment_access.GetAllSegments(all_segments);
+        }
 
         if (err == ErrorCode::OK) {
             int64_t total_size = 0;
             for (const auto& [segment, client_id] : all_segments) {
                 Ping(client_id);
+                if (segment.protocol == "cxl") {
+                    // CXL client mounts share one master-owned allocator. Its
+                    // capacity is accounted once below (or by initialization
+                    // after constructor-time restore), not once per client.
+                    continue;
+                }
                 total_size += static_cast<int64_t>(segment.size);
-                MasterMetricManager::instance().inc_total_mem_capacity(
-                    segment.name, segment.size);
+                metrics.inc_total_mem_capacity(segment.name, segment.size);
+                metrics.inc_total_dram_capacity(segment.name, segment.size);
+            }
+            if (cxl_global_allocator) {
+                const auto& [segment_name, usage] = *cxl_global_allocator;
+                total_size += static_cast<int64_t>(usage.capacity_bytes);
+                metrics.inc_total_mem_capacity(segment_name,
+                                               usage.capacity_bytes);
+                metrics.inc_total_cxl_capacity(segment_name,
+                                               usage.capacity_bytes);
             }
             LOG(INFO) << "[Restore] Total capacity size after restore: "
                       << total_size;
@@ -11521,11 +11641,15 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
 }
 
 void MasterService::BatchEvict(double evict_ratio_target,
-                               double evict_ratio_lowerbound) {
+                               double evict_ratio_lowerbound,
+                               StorageLevel target_level) {
     // Consume the allocation-pressure signal before this pass. A new failure
     // during the pass remains visible to the next iteration.
+    auto& allocation_pressure_signal =
+        target_level == StorageLevel::CXL ? need_cxl_eviction_
+                                          : need_ram_eviction_;
     const bool allocation_pressure =
-        need_mem_eviction_.exchange(false, std::memory_order_relaxed);
+        allocation_pressure_signal.exchange(false, std::memory_order_relaxed);
 
     if (evict_ratio_target < evict_ratio_lowerbound) {
         LOG(ERROR) << "evict_ratio_target=" << evict_ratio_target
@@ -11536,8 +11660,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     auto now = std::chrono::system_clock::now();
 
-    auto is_evictable_memory_replica = [this](const Replica& replica) {
-        return IsEvictableMemoryReplica(replica);
+    auto is_evictable_memory_replica =
+        [this, target_level](const Replica& replica) {
+            return IsEvictableMemoryReplicaAtLevel(replica, target_level);
     };
 
     auto can_evict_replicas = [&](const ObjectMetadata& metadata) {
@@ -12333,7 +12458,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     const bool success = made_progress || offload_deferred_count > 0;
     if (allocation_pressure && !stop_eviction_scan && !success &&
         total_eviction_base > 0) {
-        need_mem_eviction_.store(true, std::memory_order_relaxed);
+        allocation_pressure_signal.store(true, std::memory_order_relaxed);
     }
 
     if (success) {
@@ -12346,6 +12471,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         MasterMetricManager::instance().inc_mem_eviction_fail();
     }
     VLOG(1) << "action=evict_objects"
+            << ", target_level=" << target_level
             << ", evicted_count=" << evicted_count
             << ", offload_deferred=" << offload_deferred_count
             << ", offload_cap_forced=" << offload_cap_forced_count
@@ -12368,7 +12494,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
             << (long)std::ceil(object_count * evict_ratio_target)
             << " ideal_evict_num_correct="
             << (long)std::ceil(total_eviction_base * evict_ratio_target);
-    LOG(INFO) << "[EVICT-RESULT] evicted_count=" << evicted_count
+    LOG(INFO) << "[EVICT-RESULT] target_level=" << target_level
+              << ", evicted_count=" << evicted_count
               << ", eviction_base=" << total_eviction_base
               << ", actual_evict_ratio="
               << (total_eviction_base > 0

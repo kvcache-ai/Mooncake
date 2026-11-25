@@ -140,17 +140,40 @@ StorageUsageSnapshot SegmentManager::GetMemoryUsageSnapshot() const {
     return snapshot;
 }
 
+StorageUsageSnapshot SegmentManager::GetMemoryUsageSnapshot(
+    StorageLevel storage_level) const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    StorageUsageSnapshot snapshot;
+    std::unordered_set<const BufferAllocatorBase*> counted_allocators;
+
+    auto add_if_matching =
+        [&](const std::shared_ptr<BufferAllocatorBase>& allocator) {
+        if (allocator && allocator->getStorageLevel() == storage_level) {
+            AddAllocatorUsage(snapshot, allocator, counted_allocators);
+        }
+    };
+
+    add_if_matching(cxl_global_allocator_);
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        (void)segment_id;
+        add_if_matching(mounted_segment.buf_allocator);
+    }
+    return snapshot;
+}
+
 void SegmentManager::AttachMountedUsageTrackers() {
     std::unordered_set<const BufferAllocatorBase*> attached_allocators;
     if (cxl_global_allocator_) {
-        cxl_global_allocator_->AttachUsageTracker(usage_tracker_);
+        cxl_global_allocator_->AttachUsageTracker(
+            GetUsageTracker(cxl_global_allocator_->getStorageLevel()));
         attached_allocators.insert(cxl_global_allocator_.get());
     }
     for (auto& [segment_id, mounted_segment] : mounted_segments_) {
         (void)segment_id;
         auto& allocator = mounted_segment.buf_allocator;
         if (allocator && attached_allocators.insert(allocator.get()).second) {
-            allocator->AttachUsageTracker(usage_tracker_);
+            allocator->AttachUsageTracker(
+                GetUsageTracker(allocator->getStorageLevel()));
         }
     }
 }
@@ -254,7 +277,8 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     }
     auto allocator = std::move(*created);
 
-    allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
+    allocator->AttachUsageTracker(segment_manager_->GetUsageTracker(
+        allocator->getStorageLevel()));
     auto registration = segment_manager_->allocator_manager_.addAllocator(
         segment.name, allocator, std::move(client_liveness));
     segment_manager_->client_segments_[client_id].push_back(segment.id);
@@ -397,7 +421,8 @@ bool ScopedSegmentAccess::ReplaceAllocators(
     for (const auto& replacement : replacements) {
         if (replacement.expected != replacement.replacement) {
             replacement.replacement->AttachUsageTracker(
-                segment_manager_->usage_tracker_);
+                segment_manager_->GetUsageTracker(
+                    replacement.replacement->getStorageLevel()));
         }
         segment_manager_->mounted_segments_.at(replacement.segment_id)
             .buf_allocator = replacement.replacement;
@@ -1568,7 +1593,8 @@ ErrorCode SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
         return created.error();
     }
     auto allocator = std::move(*created);
-    allocator->AttachUsageTracker(usage_tracker_);
+    allocator->AttachUsageTracker(
+        GetUsageTracker(allocator->getStorageLevel()));
     {
         std::unique_lock<std::shared_mutex> lock(segment_mutex_);
         cxl_global_allocator_ = std::move(allocator);

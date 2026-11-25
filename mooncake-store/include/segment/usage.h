@@ -14,6 +14,8 @@ struct StorageUsageSnapshot : StorageUsage {
 struct TieredStorageUsageSnapshot {
     StorageUsageSnapshot memory;
     StorageUsageSnapshot nof;
+    StorageUsageSnapshot ram;
+    StorageUsageSnapshot cxl;
 };
 
 }  // namespace mooncake

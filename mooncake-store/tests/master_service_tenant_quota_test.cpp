@@ -1279,8 +1279,8 @@ TEST_F(MasterServiceTenantQuotaTest,
 // This pass is the only thing that makes room for a tenant. A tenant whose
 // effective quota sits at or below the pool-wide eviction_high_watermark_ratio
 // reaches its own ceiling before the pool crosses the pool-wide watermark:
-// EvictionThreadFunc gates on a pool-global used_ratio (strictly greater), and
-// the quota path cannot arm it either -- need_mem_eviction_ is only set next to
+// EvictionThreadFunc's pool-pressure path gates on per-tier used_ratio, and the
+// quota path cannot arm it either -- tier pressure flags are only set next to
 // inc_put_start_alloc_failures(), and a quota rejection returns before
 // allocation is attempted. Admission itself does not evict; it rejects with
 // TENANT_QUOTA_EXCEEDED and leaves the headroom to this pass.

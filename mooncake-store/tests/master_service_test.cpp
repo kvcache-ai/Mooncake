@@ -265,6 +265,85 @@ TEST_F(MasterServiceTest, MountUnmountSegmentWithOffsetAllocator) {
     EXPECT_TRUE(unmount_result4.has_value());
 }
 
+TEST_F(MasterServiceTest, SnapshotApplyRebuildsRamAndCxlMetrics) {
+    auto& metrics = MasterMetricManager::instance();
+    metrics.reset_allocated_mem_size();
+    metrics.reset_total_mem_capacity();
+    metrics.reset_allocated_dram_size();
+    metrics.reset_total_dram_capacity();
+    metrics.reset_allocated_cxl_size();
+    metrics.reset_total_cxl_capacity();
+
+    constexpr size_t kRamObjectSize = 4096;
+    constexpr size_t kCxlObjectSize = 8192;
+    const std::string cxl_path = "snapshot-restore-cxl";
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_memory_allocator(BufferAllocatorType::OFFSET)
+            .set_enable_cxl(true)
+            .set_cxl_path(cxl_path)
+            .set_cxl_size(kDefaultSegmentSize)
+            .set_eviction_high_watermark_ratio(1.0)
+            .build();
+    auto service = std::make_unique<MasterService>(service_config);
+
+    const UUID client_id = generate_uuid();
+    auto ram_segment = MakeSegment("snapshot-restore-ram");
+    ASSERT_TRUE(service->MountSegment(ram_segment, client_id).has_value());
+    auto cxl_segment = MakeSegment("snapshot-restore-cxl-client");
+    cxl_segment.protocol = "cxl";
+    ASSERT_TRUE(service->MountSegment(cxl_segment, client_id).has_value());
+
+    ReplicateConfig ram_config;
+    ram_config.preferred_segment = ram_segment.name;
+    ASSERT_TRUE(service
+                    ->PutStart(client_id, "restore-ram-key",
+                               TenantId::Default(), kRamObjectSize, ram_config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "restore-ram-key",
+                             TenantId::Default(), ReplicaType::MEMORY)
+                    .has_value());
+
+    ReplicateConfig cxl_config;
+    cxl_config.preferred_segment = cxl_segment.name;
+    cxl_config.preferred_storage_level = StorageLevel::CXL;
+    ASSERT_TRUE(service
+                    ->PutStart(client_id, "restore-cxl-key",
+                               TenantId::Default(), kCxlObjectSize, cxl_config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "restore-cxl-key",
+                             TenantId::Default(), ReplicaType::MEMORY)
+                    .has_value());
+
+    // Simulate stale process-lifetime gauges left before applying a decoded
+    // snapshot. ApplySnapshotState must replace, rather than accumulate, them.
+    metrics.inc_allocated_dram_size(ram_segment.name, 17);
+    metrics.inc_allocated_cxl_size(cxl_path, 19);
+    metrics.inc_total_dram_capacity(ram_segment.name, 23);
+    metrics.inc_total_cxl_capacity(cxl_path, 29);
+
+    ScopedEnvVar skip_snapshot_cleanup(
+        "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP", "1");
+    auto apply_result = MasterServiceTestPeer(*service)
+                            .ApplySnapshotStateForTesting(
+                                std::chrono::system_clock::now());
+    ASSERT_TRUE(apply_result.has_value()) << apply_result.error().message;
+
+    EXPECT_EQ(metrics.get_allocated_mem_size(),
+              kRamObjectSize + kCxlObjectSize);
+    EXPECT_EQ(metrics.get_allocated_dram_size(), kRamObjectSize);
+    EXPECT_EQ(metrics.get_allocated_cxl_size(), kCxlObjectSize);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 2 * kDefaultSegmentSize);
+    EXPECT_EQ(metrics.get_total_dram_capacity(), kDefaultSegmentSize);
+    EXPECT_EQ(metrics.get_total_cxl_capacity(), kDefaultSegmentSize);
+    EXPECT_EQ(metrics.get_segment_allocated_dram_size(ram_segment.name),
+              kRamObjectSize);
+    EXPECT_EQ(metrics.get_segment_allocated_cxl_size(cxl_path),
+              kCxlObjectSize);
+}
+
 TEST_F(MasterServiceTest, SoftPinZeroTtlSkipsSoftPinRegistration) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_soft_pin_ttl(50)
@@ -1991,6 +2070,66 @@ TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
     EXPECT_LT(buckets_after, buckets_before / 2);
 }
 
+TEST_F(MasterServiceTest, BatchEvictOnlyRemovesTargetMemoryTier) {
+    auto verify_target_tier = [](StorageLevel target_level,
+                                 StorageLevel retained_level) {
+        SCOPED_TRACE(::testing::Message()
+                     << "target_level=" << target_level
+                     << ", retained_level=" << retained_level);
+        constexpr size_t kCapacity = 16 * 1024 * 1024;
+        constexpr size_t kObjectSize = 1024;
+        auto ram_allocator = std::make_shared<OffsetBufferAllocator>(
+            "evict_ram", 0x500000000, kCapacity, "evict_ram",
+            StorageLevel::RAM);
+        auto cxl_allocator = std::make_shared<OffsetBufferAllocator>(
+            "evict_cxl", 0x510000000, kCapacity, "evict_cxl",
+            StorageLevel::CXL);
+
+        auto ram_buffer = ram_allocator->allocate(kObjectSize);
+        auto cxl_buffer = cxl_allocator->allocate(kObjectSize);
+        ASSERT_NE(ram_buffer, nullptr);
+        ASSERT_NE(cxl_buffer, nullptr);
+
+        auto service_config =
+            MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+        auto service = std::make_unique<MasterService>(service_config);
+        const TenantId tenant_id = TenantId::Default();
+        const UUID client_id = generate_uuid();
+        const std::string key = target_level == StorageLevel::RAM
+                                    ? "evict_only_ram"
+                                    : "evict_only_cxl";
+
+        std::vector<Replica> replicas;
+        replicas.emplace_back(std::move(ram_buffer), ReplicaStatus::COMPLETE);
+        replicas.emplace_back(std::move(cxl_buffer), ReplicaStatus::COMPLETE);
+        {
+            MasterServiceTestPeer peer(*service);
+            const size_t shard_idx = peer.getShardIndex(tenant_id, key);
+            MasterServiceTestPeer::MetadataShardAccessorRW shard(service.get(),
+                                                                 shard_idx);
+            auto& tenant_state =
+                peer.GetOrCreateTenantState(shard.get(), tenant_id);
+            tenant_state.metadata.emplace(
+                std::piecewise_construct, std::forward_as_tuple(key),
+                std::forward_as_tuple(
+                    client_id, std::chrono::system_clock::time_point{},
+                    kObjectSize, std::move(replicas), std::nullopt, false,
+                    ObjectDataType::UNKNOWN, "", tenant_id, key));
+        }
+
+        MasterServiceTestPeer(*service).RunBatchEvictForTesting(
+            1.0, 1.0, target_level);
+
+        auto result = service->GetReplicaList(key, tenant_id);
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result->replicas.size(), 1u);
+        EXPECT_EQ(result->replicas.front().get_storage_level(), retained_level);
+    };
+
+    verify_target_tier(StorageLevel::RAM, StorageLevel::CXL);
+    verify_target_tier(StorageLevel::CXL, StorageLevel::RAM);
+}
+
 TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     // Regression for the lease-expire / client-offboarding delete path.
     // ClearInvalidHandles -> ClearStaleHandles can erase tens of millions of
@@ -2877,7 +3016,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     EXPECT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
-    // The failed PutStart above sets need_mem_eviction_, and the eviction
+    // The failed PutStart above sets need_ram_eviction_, and the eviction
     // thread answers with an asynchronous BatchEvict. Polling PutStart for up
     // to put_start_release_timeout_sec cannot tell that path apart from the
     // periodic DiscardExpiredProcessingReplicas fallback, which releases the

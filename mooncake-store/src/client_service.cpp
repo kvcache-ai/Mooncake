@@ -990,37 +990,19 @@ ErrorCode Client::InitMultiProtocolTransferEngine(
 
     bool auto_discover = false;
     if (!use_tent) {
-        // Get auto_discover and filters from env (non-TENT only)
-        std::optional<bool> env_auto_discover = get_auto_discover();
-        if (env_auto_discover.has_value()) {
-            // Use user-specified auto-discover setting
-            auto_discover = env_auto_discover.value();
-        } else {
-            // Enable auto-discover for RDMA if no devices are specified
-            bool has_rdma = std::find(protocols.begin(), protocols.end(),
-                                      "rdma") != protocols.end();
-            if (has_rdma && !device_names.has_value()) {
-                LOG(INFO)
-                    << "Set auto discovery ON by default for RDMA protocol, "
-                       "since no "
-                       "device names provided";
-                auto_discover = true;
-            }
-        }
+        const bool has_rdma = std::find(protocols.begin(), protocols.end(),
+                                        "rdma") != protocols.end();
+        auto config = ClientAutoDiscoveryConfig::FromEnvironment(
+            has_rdma ? "rdma" : "", device_names.has_value());
+        auto_discover = config.enabled;
         transfer_engine_->setAutoDiscover(auto_discover);
 
-        // Honor filters when auto-discovery is enabled; otherwise warn once
         if (auto_discover) {
             LOG(INFO) << "Transfer engine auto discovery is enabled";
-            auto filters = get_auto_discover_filters();
-            transfer_engine_->setWhitelistFilters(std::move(filters));
-        } else {
-            const char* env_filters = std::getenv("MC_MS_FILTERS");
-            if (env_filters && *env_filters != '\0') {
-                LOG(WARNING)
-                    << "MC_MS_FILTERS is set but auto discovery is disabled; "
-                    << "ignoring whitelist: " << env_filters;
-            }
+        }
+        config.LoadFiltersFromEnvironment();
+        if (auto_discover) {
+            transfer_engine_->setWhitelistFilters(std::move(config.filters));
         }
     }
 
@@ -1068,7 +1050,7 @@ ErrorCode Client::InitMultiProtocolTransferEngine(
                           << device_names.value();
 
                 std::vector<std::string> devices =
-                    splitString(device_names.value(), ',', /*skip_empty=*/true);
+                    ParseDeviceNames(device_names.value());
 
                 // Manually discover topology with specified devices only
                 auto topology = transfer_engine_->getLocalTopology();

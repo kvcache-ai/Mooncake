@@ -433,6 +433,12 @@ OffsetBufferAllocator::OffsetBufferAllocator(
 
 tl::expected<void, std::string>
 OffsetBufferAllocatorSnapshot::ValidateMetadata() const {
+    if (storage_level != StorageLevel::RAM &&
+        storage_level != StorageLevel::CXL) {
+        return tl::make_unexpected(fmt::format(
+            "invalid storage level {} for memory allocator",
+            static_cast<int>(storage_level)));
+    }
     if (allocation_state.base != base ||
         allocation_state.capacity != capacity) {
         return tl::make_unexpected(fmt::format(
@@ -482,10 +488,16 @@ OffsetBufferAllocator::Restore(OffsetBufferAllocatorSnapshot snapshot) {
             std::move(snapshot), std::move(*offset_allocator)));
     // No allocation handles exist yet. Pair restored usage with the same
     // accounting that allocate()/destruction use, before publishing the object.
-    MasterMetricManager::instance().inc_allocated_mem_size(
-        allocator->segment_name_, static_cast<int64_t>(used_bytes));
-    MasterMetricManager::instance().inc_allocated_dram_size(
-        allocator->segment_name_, static_cast<int64_t>(used_bytes));
+    auto& metrics = MasterMetricManager::instance();
+    const auto restored_bytes = static_cast<int64_t>(used_bytes);
+    metrics.inc_allocated_mem_size(allocator->segment_name_, restored_bytes);
+    if (allocator->storage_level_ == StorageLevel::CXL) {
+        metrics.inc_allocated_cxl_size(allocator->segment_name_,
+                                       restored_bytes);
+    } else {
+        metrics.inc_allocated_dram_size(allocator->segment_name_,
+                                        restored_bytes);
+    }
     allocator->SetUsageBytesForRestore(used_bytes);
     return allocator;
 }

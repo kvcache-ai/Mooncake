@@ -123,6 +123,54 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
     EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
+TEST_F(AllocationStrategyTest, ServingNamesCanBeFilteredByStorageLevel) {
+    auto ram_allocator = std::make_shared<OffsetBufferAllocator>(
+        "ram_segment", 0x100000000, 64 * MiB, "ram_segment",
+        StorageLevel::RAM);
+    auto cxl_allocator = std::make_shared<OffsetBufferAllocator>(
+        "cxl_segment", 0x110000000, 64 * MiB, "cxl_segment",
+        StorageLevel::CXL);
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("ram_segment", ram_allocator);
+    allocator_manager.addAllocator("cxl_segment", cxl_allocator);
+
+    EXPECT_EQ(allocator_manager.getServingNames(StorageLevel::RAM),
+              std::vector<std::string>{"ram_segment"});
+    EXPECT_EQ(allocator_manager.getServingNames(StorageLevel::CXL),
+              std::vector<std::string>{"cxl_segment"});
+    EXPECT_TRUE(
+        allocator_manager.getServingNames(StorageLevel::SSD).empty());
+}
+
+TEST_F(AllocationStrategyTest, NoFAllocationSelectsSsdAllocator) {
+    constexpr size_t kSliceLength = 1024;
+    auto ram_allocator = std::make_shared<OffsetBufferAllocator>(
+        "shared_segment", 0x100000000, 64 * MiB, "ram_endpoint",
+        StorageLevel::RAM, ReplicaType::MEMORY);
+    auto nof_allocator = std::make_shared<OffsetBufferAllocator>(
+        "shared_segment", 0x110000000, 64 * MiB, "nof_endpoint",
+        StorageLevel::SSD, ReplicaType::NOF_SSD);
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("shared_segment", ram_allocator);
+    allocator_manager.addAllocator("shared_segment", nof_allocator);
+
+    auto result = strategy_->Allocate(
+        allocator_manager, kSliceLength, 1, {"shared_segment"}, {},
+        ReplicaType::NOF_SSD);
+
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1u);
+    const auto descriptor = result->front().get_descriptor();
+    EXPECT_TRUE(descriptor.is_nof_replica());
+    EXPECT_EQ(descriptor.get_storage_level(), StorageLevel::SSD);
+    EXPECT_EQ(descriptor.get_nof_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "nof_endpoint");
+    EXPECT_EQ(ram_allocator->size(), 0u);
+    EXPECT_EQ(nof_allocator->size(), kSliceLength);
+}
+
 TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
     const auto initial = ClientLivenessRecord::TimePoint{};
     auto suspected = std::make_shared<ClientLivenessRecord>(initial);
@@ -141,26 +189,44 @@ TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
     allocator_manager.addAllocator("shared", active_allocator, active);
 
     // No SSD usage is registered: the SSD strategy still picks the serving
-    // registration.
+    // RAM registration.
     LocalSsdManager local_ssd;
     for (const auto strategy_type :
          {AllocationStrategyType::RANDOM,
           AllocationStrategyType::FREE_RATIO_FIRST,
-          AllocationStrategyType::SSD_FREE_RATIO_FIRST,
-          AllocationStrategyType::CXL}) {
+          AllocationStrategyType::SSD_FREE_RATIO_FIRST}) {
         auto strategy = CreateAllocationStrategy(strategy_type, local_ssd);
         auto result =
             strategy->Allocate(allocator_manager, 1024, 1, {"shared"}, {});
         ASSERT_TRUE(result.has_value());
         ASSERT_EQ(result->size(), 1);
-        const auto expected_endpoint =
-            strategy_type == AllocationStrategyType::CXL ? "shared" : "active";
         EXPECT_EQ((*result)[0]
                       .get_descriptor()
                       .get_memory_descriptor()
                       .buffer_descriptor.transport_endpoint_,
-                  expected_endpoint);
+                  "active");
     }
+
+    auto suspected_cxl_allocator = std::make_shared<OffsetBufferAllocator>(
+        "shared-cxl", DEFAULT_CXL_BASE + 128 * MiB, 64 * MiB,
+        "suspected-cxl", StorageLevel::CXL);
+    auto active_cxl_allocator = std::make_shared<OffsetBufferAllocator>(
+        "shared-cxl", DEFAULT_CXL_BASE + 192 * MiB, 64 * MiB, "active-cxl",
+        StorageLevel::CXL);
+    AllocatorManager cxl_allocator_manager;
+    cxl_allocator_manager.addAllocator("shared-cxl", suspected_cxl_allocator,
+                                       suspected);
+    cxl_allocator_manager.addAllocator("shared-cxl", active_cxl_allocator,
+                                       active);
+
+    auto cxl_strategy =
+        CreateAllocationStrategy(AllocationStrategyType::CXL, local_ssd);
+    auto cxl_result = cxl_strategy->Allocate(
+        cxl_allocator_manager, 1024, 1, {"shared-cxl"}, {});
+    ASSERT_TRUE(cxl_result.has_value());
+    ASSERT_EQ(cxl_result->size(), 1);
+    EXPECT_EQ(suspected_cxl_allocator->size(), 0u);
+    EXPECT_EQ(active_cxl_allocator->size(), 1024u);
 }
 
 // Test preferred segment allocation when available

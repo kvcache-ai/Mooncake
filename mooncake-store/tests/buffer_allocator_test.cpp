@@ -286,7 +286,9 @@ TEST_F(BufferAllocatorTest, CachelibCreateRejectsInvalidMemoryLayout) {
 
 TEST_F(BufferAllocatorTest, OffsetRestoreFactoryRejectsInvalidState) {
     auto& metrics = MasterMetricManager::instance();
-    const auto baseline = metrics.get_allocated_mem_size();
+    const auto baseline_mem = metrics.get_allocated_mem_size();
+    const auto baseline_dram = metrics.get_allocated_dram_size();
+    const auto baseline_cxl = metrics.get_allocated_cxl_size();
     const std::string segment_name = "restore-factory";
     constexpr size_t kBase = 0x100000000ULL;
     constexpr size_t kCapacity = 16U * 1024 * 1024;
@@ -325,7 +327,12 @@ TEST_F(BufferAllocatorTest, OffsetRestoreFactoryRejectsInvalidState) {
     auto wrong_alloc_size = snapshot();
     wrong_alloc_size.allocation_state.allocated_size = kCapacity;
     expect_rejected(std::move(wrong_alloc_size));
-    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
+    auto invalid_storage_level = snapshot();
+    invalid_storage_level.storage_level = StorageLevel::SSD;
+    expect_rejected(std::move(invalid_storage_level));
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline_mem);
+    EXPECT_EQ(metrics.get_allocated_dram_size(), baseline_dram);
+    EXPECT_EQ(metrics.get_allocated_cxl_size(), baseline_cxl);
 
     {
         auto restored = OffsetBufferAllocator::Restore(snapshot());
@@ -336,9 +343,71 @@ TEST_F(BufferAllocatorTest, OffsetRestoreFactoryRejectsInvalidState) {
         auto buffer = (*restored)->allocate(4096);
         ASSERT_NE(buffer, nullptr);
         EXPECT_EQ((*restored)->size(), 4096U);
-        EXPECT_EQ(metrics.get_allocated_mem_size(), baseline + 4096);
+        EXPECT_EQ(metrics.get_allocated_mem_size(), baseline_mem + 4096);
+        EXPECT_EQ(metrics.get_allocated_dram_size(), baseline_dram + 4096);
+        EXPECT_EQ(metrics.get_allocated_cxl_size(), baseline_cxl);
     }
-    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline_mem);
+    EXPECT_EQ(metrics.get_allocated_dram_size(), baseline_dram);
+    EXPECT_EQ(metrics.get_allocated_cxl_size(), baseline_cxl);
+}
+
+TEST_F(BufferAllocatorTest, OffsetRestoreAccountsUsageByStorageLevel) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline_mem = metrics.get_allocated_mem_size();
+    const auto baseline_dram = metrics.get_allocated_dram_size();
+    const auto baseline_cxl = metrics.get_allocated_cxl_size();
+    constexpr size_t kBase = 0x100000000ULL;
+    constexpr size_t kCapacity = 16U * 1024 * 1024;
+    constexpr size_t kUsedBytes = 4097;
+
+    const auto make_snapshot = [&](const std::string& segment_name,
+                                   StorageLevel storage_level) {
+        auto state =
+            offset_allocator::OffsetAllocator::create(kBase, kCapacity);
+        EXPECT_NE(state, nullptr);
+        auto allocation = state->allocate(kUsedBytes);
+        EXPECT_TRUE(allocation.has_value());
+        return OffsetBufferAllocatorSnapshot{
+            .segment_name = segment_name,
+            .base = kBase,
+            .capacity = kCapacity,
+            .used_bytes = kUsedBytes,
+            .transport_endpoint = segment_name + "-endpoint",
+            .allocation_state = state->CaptureSnapshot(),
+            .storage_level = storage_level,
+        };
+    };
+
+    {
+        auto restored = OffsetBufferAllocator::Restore(
+            make_snapshot("restore-dram", StorageLevel::RAM));
+        ASSERT_TRUE(restored.has_value());
+        EXPECT_EQ((*restored)->getStorageLevel(), StorageLevel::RAM);
+        EXPECT_EQ(metrics.get_allocated_mem_size(),
+                  baseline_mem + kUsedBytes);
+        EXPECT_EQ(metrics.get_allocated_dram_size(),
+                  baseline_dram + kUsedBytes);
+        EXPECT_EQ(metrics.get_allocated_cxl_size(), baseline_cxl);
+    }
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline_mem);
+    EXPECT_EQ(metrics.get_allocated_dram_size(), baseline_dram);
+    EXPECT_EQ(metrics.get_allocated_cxl_size(), baseline_cxl);
+
+    {
+        auto restored = OffsetBufferAllocator::Restore(
+            make_snapshot("restore-cxl", StorageLevel::CXL));
+        ASSERT_TRUE(restored.has_value());
+        EXPECT_EQ((*restored)->getStorageLevel(), StorageLevel::CXL);
+        EXPECT_EQ(metrics.get_allocated_mem_size(),
+                  baseline_mem + kUsedBytes);
+        EXPECT_EQ(metrics.get_allocated_dram_size(), baseline_dram);
+        EXPECT_EQ(metrics.get_allocated_cxl_size(),
+                  baseline_cxl + kUsedBytes);
+    }
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline_mem);
+    EXPECT_EQ(metrics.get_allocated_dram_size(), baseline_dram);
+    EXPECT_EQ(metrics.get_allocated_cxl_size(), baseline_cxl);
 }
 
 TEST_F(BufferAllocatorTest,

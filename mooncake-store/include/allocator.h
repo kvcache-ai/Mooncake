@@ -234,10 +234,16 @@ class BufferAllocatorBase {
 class DummyBufferAllocator final : public BufferAllocatorBase {
    public:
     explicit DummyBufferAllocator(std::string segment_name,
-                                  std::string transport_endpoint)
+                                  std::string transport_endpoint,
+                                  StorageLevel storage_level =
+                                      StorageLevel::RAM)
         : segment_name_(std::move(segment_name)),
-          transport_endpoint_(std::move(transport_endpoint)) {}
+          transport_endpoint_(std::move(transport_endpoint)),
+          storage_level_(storage_level) {}
 
+    StorageLevel getStorageLevel() const override {
+        return storage_level_;
+    }
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
         return nullptr;
     }
@@ -256,6 +262,7 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
    private:
     std::string segment_name_;
     std::string transport_endpoint_;
+    StorageLevel storage_level_;
 };
 
 /**

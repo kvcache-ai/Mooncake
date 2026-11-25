@@ -23,6 +23,9 @@ class TestBufferAllocator final
           base_(base),
           allow_allocation_(allow_allocation_promise_.get_future().share()) {}
 
+    StorageLevel getStorageLevel() const override {
+        return StorageLevel::RAM;
+    }
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
         allocation_calls_.fetch_add(1, std::memory_order_relaxed);
         if (block_next_.exchange(false, std::memory_order_acq_rel)) {
