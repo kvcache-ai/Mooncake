@@ -17,6 +17,22 @@
 // machine and its test hooks; it is intentionally not a standalone translation
 // unit so this review-only split does not change linkage or initialization.
 
+struct TcpTransport::OneShotSession {
+    std::mutex mutex;
+    asio::ip::tcp::socket::executor_type executor;
+    std::shared_ptr<asio::ip::tcp::socket> socket;
+    std::shared_ptr<ClientSession> session;
+    std::optional<TcpWorkItem> work;
+    bool cancelled = false;
+
+    OneShotSession(asio::ip::tcp::socket::executor_type executor_arg,
+                   std::shared_ptr<asio::ip::tcp::socket> socket_arg,
+                   TcpWorkItem work_arg)
+        : executor(std::move(executor_arg)),
+          socket(std::move(socket_arg)),
+          work(std::move(work_arg)) {}
+};
+
 namespace {
 constexpr size_t kMaxConcurrentLaneProbes = 1;
 // Conservative fixed policy for the first rate-limited implementation. The

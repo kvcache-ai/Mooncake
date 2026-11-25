@@ -175,14 +175,13 @@ class TcpTransport : public Transport {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 
-   private:
-    friend class MultiTransport;
-
     Status validateAcknowledgedWriteEntries(
         const std::vector<TransferRequest> &entries) const;
 
     Status submitAcknowledgedWriteTasks(
         const std::vector<TransferTask *> &task_list);
+
+   private:
     int install(std::string &local_server_name,
                 std::shared_ptr<TransferMetadata> meta,
                 std::shared_ptr<Topology> topo);
@@ -408,21 +407,7 @@ class TcpTransport : public Transport {
         std::shared_ptr<FailureCounters> failure_counters;
     };
 
-    struct OneShotSession {
-        std::mutex mutex;
-        asio::ip::tcp::socket::executor_type executor;
-        std::shared_ptr<asio::ip::tcp::socket> socket;
-        std::shared_ptr<ClientSession> session;
-        std::optional<TcpWorkItem> work;
-        bool cancelled = false;
-
-        OneShotSession(asio::ip::tcp::socket::executor_type executor_arg,
-                       std::shared_ptr<asio::ip::tcp::socket> socket_arg,
-                       TcpWorkItem work_arg)
-            : executor(std::move(executor_arg)),
-              socket(std::move(socket_arg)),
-              work(std::move(work_arg)) {}
-    };
+    struct OneShotSession;
 
     struct ConnectionLaneState {
         std::mutex mutex;

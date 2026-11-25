@@ -597,12 +597,8 @@ Status TcpTransport::validateAcknowledgedWriteEntries(
     }
     std::optional<SegmentID> last_target_id;
     for (const auto& entry : entries) {
-        if (entry.opcode != TransferRequest::WRITE) {
-            return Status::InvalidArgument(
-                "acknowledged TCP submission requires TCP WRITE entries");
-        }
         if (last_target_id && *last_target_id == entry.target_id) continue;
-        auto desc = metadata_->getCachedSegmentDescByID(entry.target_id);
+        auto desc = metadata_->getSegmentDescByID(entry.target_id);
         if (!desc) {
             return Status::InvalidArgument(
                 "acknowledged TCP write target segment not found");
@@ -810,12 +806,12 @@ void TcpTransport::startTransfer(Slice* slice,
     const bool force_legacy = forceLegacyTcpProto();
     const bool use_v2 = desc->tcp_proto_version >= 2 && !force_legacy;
     if (require_ack && (slice->opcode != TransferRequest::WRITE || !use_v2)) {
-        LOG(ERROR) << "TcpTransport::startTransfer rejected acknowledged write "
-                      "for segment "
-                   << desc->name
-                   << " (opcode=" << static_cast<int>(slice->opcode)
-                   << ", tcp_proto_version=" << desc->tcp_proto_version
-                   << ", force_legacy=" << force_legacy << ")";
+        LOG_EVERY_N(ERROR, 100)
+            << "TcpTransport::startTransfer rejected acknowledged write "
+               "for segment "
+            << desc->name << " (opcode=" << static_cast<int>(slice->opcode)
+            << ", tcp_proto_version=" << desc->tcp_proto_version
+            << ", force_legacy=" << force_legacy << ")";
         finish(TransferStatusEnum::FAILED);
         return;
     }

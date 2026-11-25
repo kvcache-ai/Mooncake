@@ -202,10 +202,12 @@ class TransferEngine {
 
     int unregisterLocalMemory(void* addr, bool update_metadata = true);
 
-    // Submit classic TCP WRITEs that require a receiver ACK. A legacy
-    // peer cannot complete this operation through an unacknowledged write.
-    // Zero-length entries still validate TCP WRITE and peer v2 framing, then
-    // complete locally as no-ops without a wire round-trip or ordering barrier.
+    // Strict classic-TCP WRITE submission that fails closed instead of silently
+    // downgrading to unacknowledged v1 framing. TCP v2 framing already awaits a
+    // receiver ACK for every WRITE; this entry point rejects legacy v1 peers
+    // (tcp_proto_version < 2), MC_TCP_PROTO=1, non-TCP routes, READs, and TENT
+    // (NotImplemented). Zero-length entries still validate TCP WRITE and peer
+    // v2 framing, then complete locally without a wire round-trip or barrier.
     Status submitAcknowledgedTcpWrite(
         BatchID batch_id, const std::vector<TransferRequest>& entries);
 

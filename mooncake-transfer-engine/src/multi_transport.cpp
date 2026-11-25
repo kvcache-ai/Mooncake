@@ -708,9 +708,10 @@ Status MultiTransport::submitTransfer(
     for (auto& entry : submit_tasks) {
         Status status;
 #ifdef USE_TCP
-        if (acknowledged)
+        if (acknowledged) {
+            assert(entry.first == acknowledged);
             status = acknowledged->submitAcknowledgedWriteTasks(entry.second);
-        else
+        } else
 #endif
             status = entry.first->submitTransferTask(entry.second);
         for (auto* task : entry.second) {
