@@ -5,6 +5,19 @@
 #include "ssd_pipeline_io.h"
 #include <functional>
 namespace mooncake::ssd_offload {
+class SourceDrainedWriteTarget : public WriteTarget {
+   public:
+    ~SourceDrainedWriteTarget() override = default;
+    // WriteAndDrain guarantees the staging slot is no longer read once it
+    // returns (including on error). DestinationsDrained reports whether every
+    // accepted destination write has also drained on the receiver.
+    virtual Error WriteAndDrain(const ReadChunk&, SlotBuffer) noexcept = 0;
+    virtual bool DestinationsDrained() const noexcept = 0;
+    Error Write(const ReadChunk& chunk,
+                SlotBuffer buffer) noexcept final override {
+        return WriteAndDrain(chunk, buffer);
+    }
+};
 struct SsdOwnerCallbacks {
     using TargetFactory =
         std::function<std::shared_ptr<SourceDrainedWriteTarget>(

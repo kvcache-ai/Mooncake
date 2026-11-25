@@ -19,7 +19,7 @@ class Target final : public SourceDrainedWriteTarget {
     Error WriteAndDrain(const ReadChunk& chunk,
                         SlotBuffer slot) noexcept override {
         for (const auto& f : chunk.fragments) {
-            const auto& view = views[f.destination.region_id - 1];
+            const auto& view = views[f.destination.destination_index];
             std::memcpy(
                 reinterpret_cast<void*>(view.address + f.destination.offset),
                 slot.data + f.buffer_offset, size_t(f.destination.length));
@@ -64,9 +64,8 @@ class SsdDirectReadTest : public ::testing::Test {
                 }
                 std::array<std::byte, 32> source;
                 source.fill(std::byte{42});
-                auto chunk =
-                    BuildReadPlan({32, 0, {{0, {{1, 1, 0, 32}}}}}, {32, 1, 2})
-                        .plan.chunks[0];
+                auto chunk = BuildReadPlan({32, 0, 0, {{0, 0, 32}}}, {32, 1, 2})
+                                 .plan.chunks[0];
                 EXPECT_EQ(
                     sink->WriteAndDrain(chunk, {source.data(), source.size()}),
                     Error::kOk);
@@ -394,6 +393,172 @@ TEST_F(SsdDirectReadTest,
     for (auto& thread : threads) thread.join();
     EXPECT_GT(completed.size(), 100u);
     EXPECT_EQ(lost, 0u);
+}
+TEST_F(SsdDirectReadTest, CloseRejectsNewReadsButStillServesRecovery) {
+    Create();
+    ASSERT_EQ(service->Execute(Message(1)).error, DestinationError::kOk);
+    service->Close();
+    EXPECT_EQ(service->Execute(Message(2)).error, DestinationError::kClosing);
+    auto recover = Message(1);
+    recover.command = SsdControlCommand::kRecoverReadInto;
+    auto reply = service->Execute(recover);
+    ASSERT_EQ(reply.error, DestinationError::kOk);
+    ASSERT_TRUE(reply.snapshot && reply.snapshot->result);
+    EXPECT_TRUE(reply.snapshot->result->dma_drained);
+}
+TEST_F(SsdDirectReadTest, CloseAndDestructionDrainConcurrentExecuteWithoutUaf) {
+    Create();
+    block = true;
+    auto waiting = entered.get_future();
+    auto in_flight = std::async(std::launch::async,
+                                [&] { return service->Execute(Message(1)); });
+    ASSERT_EQ(waiting.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    auto closing = std::async(std::launch::async, [&] {
+        service->Close();
+        service.reset();
+    });
+    EXPECT_EQ(closing.wait_for(std::chrono::milliseconds(30)),
+              std::future_status::timeout);
+    resume.set_value();
+    auto reply = in_flight.get();
+    ASSERT_EQ(reply.error, DestinationError::kOk);
+    ASSERT_TRUE(reply.snapshot && reply.snapshot->result);
+    EXPECT_TRUE(reply.snapshot->result->dma_drained);
+    closing.get();
+}
+
+TEST(SsdOwnerRequestLedgerTest,
+     AdmitAbandonLimitsWaitForTerminalAndPerSessionRetiredCap) {
+    SsdControlLimits limits;
+    limits.max_records = 4;
+    limits.max_sessions = 3;
+    limits.max_retired_ranges = 6;
+    limits.max_active_payload_bytes = 64;
+    limits.max_metadata_bytes = 4096;
+    SsdOwnerRequestLedger ledger(owner, limits, SsdReadProtocolLimits{}, true);
+
+    auto make_req = [](PeerIdentity req_peer, uint64_t id, uint64_t bytes) {
+        SsdReadRequestV1 req{
+            1,
+            req_peer,
+            {owner, id, 1},
+            "default",
+            1000,
+            0,
+            {{"k", bytes, {}, {{0, {{{req_peer, 1, 1, {9, 10}}, 0, bytes}}}}}}};
+        SsdGrantReferenceV1 ref{req_peer, req.attempt, {7, 8}};
+        std::vector<ResolvedDestination> views{
+            {"requester-te", 4096, bytes, DestinationMemory::kHost}};
+        return std::tuple{std::move(req), ref, std::move(views)};
+    };
+
+    // 1. Abandoning an admitted (unstarted) operation releases credits and
+    // records a drained rejected terminal result.
+    {
+        auto [req, ref, views] = make_req(requester, 1, 32);
+        {
+            auto admitted =
+                ledger.Admit(req, ref, std::chrono::steady_clock::now(), views);
+            ASSERT_EQ(admitted.error, DestinationError::kOk);
+            EXPECT_EQ(ledger.stats().active_records, 1u);
+            EXPECT_EQ(ledger.stats().active_payload_bytes, 32u);
+        }
+        EXPECT_EQ(ledger.stats().active_records, 0u);
+        EXPECT_EQ(ledger.stats().active_payload_bytes, 0u);
+        auto snap = ledger.Query(ref);
+        ASSERT_EQ(snap.error, DestinationError::kOk);
+        EXPECT_EQ(snap.state, SsdOwnerRequestState::kDrained);
+        ASSERT_TRUE(snap.result);
+        EXPECT_EQ(snap.result->objects[0].outcome, AttemptOutcome::kRejected);
+    }
+
+    // 2. Abandoning a running operation quarantines it and retains payload
+    // credits.
+    {
+        auto [req, ref, views] = make_req(requester, 2, 32);
+        {
+            auto admitted =
+                ledger.Admit(req, ref, std::chrono::steady_clock::now(), views);
+            ASSERT_EQ(admitted.error, DestinationError::kOk);
+            ASSERT_EQ(admitted.operation.Start(), DestinationError::kOk);
+        }
+        auto snap = ledger.Query(ref);
+        ASSERT_EQ(snap.error, DestinationError::kOk);
+        EXPECT_EQ(snap.state, SsdOwnerRequestState::kQuarantined);
+        EXPECT_FALSE(snap.result);
+        EXPECT_EQ(ledger.stats().quarantined_records, 1u);
+        EXPECT_EQ(ledger.stats().active_payload_bytes, 32u);
+    }
+
+    // 3. Active payload budget rejects requests that would exceed 64 bytes.
+    {
+        auto [req, ref, views] = make_req(requester, 3, 40);
+        auto admitted =
+            ledger.Admit(req, ref, std::chrono::steady_clock::now(), views);
+        EXPECT_EQ(admitted.error, DestinationError::kLimit);
+    }
+
+    // 4. WaitForTerminal wakes promptly via condition variable when completed.
+    {
+        auto [req, ref, views] = make_req(requester, 4, 16);
+        auto admitted =
+            ledger.Admit(req, ref, std::chrono::steady_clock::now(), views);
+        ASSERT_EQ(admitted.error, DestinationError::kOk);
+        ASSERT_EQ(admitted.operation.Start(), DestinationError::kOk);
+        auto waiter = std::async(std::launch::async, [&] {
+            return ledger.WaitForTerminal(
+                ref,
+                std::chrono::steady_clock::now() + std::chrono::seconds(2));
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        SsdReadResultV1 done{1,
+                             ref.attempt,
+                             true,
+                             {{0, AttemptOutcome::kSucceeded, 16, {}}},
+                             requester};
+        ASSERT_EQ(admitted.operation.Complete(done), DestinationError::kOk);
+        auto waited = waiter.get();
+        EXPECT_EQ(waited.error, DestinationError::kOk);
+        EXPECT_EQ(waited.state, SsdOwnerRequestState::kDrained);
+        ASSERT_TRUE(waited.result);
+        EXPECT_EQ(waited.result->objects[0].outcome,
+                  AttemptOutcome::kSucceeded);
+    }
+
+    // 5. Per-session retired range cap isolates one requester's fragmented
+    // recoveries from wedging another requester.
+    PeerIdentity noisy{10, 20, 30};
+    PeerIdentity healthy{11, 21, 31};
+    {
+        auto [r10, ref10, v10] = make_req(noisy, 10, 8);
+        auto [r12, ref12, v12] = make_req(noisy, 12, 8);
+        auto [r14, ref14, v14] = make_req(noisy, 14, 8);
+        EXPECT_EQ(ledger.Recover(r10, ref10, v10).error, DestinationError::kOk);
+        EXPECT_EQ(ledger.Recover(r12, ref12, v12).error, DestinationError::kOk);
+        // 3rd disjoint range exceeds noisy's per-session cap of 2.
+        EXPECT_EQ(ledger.Recover(r14, ref14, v14).error,
+                  DestinationError::kLimit);
+        // Coalescing adjacent ID (11 bridges [10,10] and [12,12]) still works.
+        auto [r11, ref11, v11] = make_req(noisy, 11, 8);
+        EXPECT_EQ(ledger.Recover(r11, ref11, v11).error, DestinationError::kOk);
+
+        // Healthy peer can still be admitted even when noisy is at its
+        // per-session retired range cap.
+        auto [rh, refh, vh] = make_req(healthy, 1, 8);
+        auto admitted =
+            ledger.Admit(rh, refh, std::chrono::steady_clock::now(), vh);
+        EXPECT_EQ(admitted.error, DestinationError::kOk);
+
+        // When max_sessions (3) is full, noisy restarting with a newer boot
+        // epoch evicts its idle older epoch session instead of hitting kLimit.
+        PeerIdentity noisy_restarted{noisy.client_id_high, noisy.client_id_low,
+                                     noisy.boot_epoch + 1};
+        auto [rn, refn, vn] = make_req(noisy_restarted, 1, 8);
+        auto restarted_admitted =
+            ledger.Admit(rn, refn, std::chrono::steady_clock::now(), vn);
+        EXPECT_EQ(restarted_admitted.error, DestinationError::kOk);
+    }
 }
 }  // namespace
 }  // namespace mooncake::ssd_offload

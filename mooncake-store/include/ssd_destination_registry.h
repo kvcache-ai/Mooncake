@@ -27,6 +27,9 @@ enum class DestinationError {
     kStaleRequest,
     kNotSupported,
     kTransportError,
+    kTimedOut,
+    kNotClosing,
+    kFailed,
 };
 
 struct PeerIdentity {
@@ -72,6 +75,7 @@ struct ResolvedDestination {
     uint64_t address{0};
     uint64_t length{0};
     DestinationMemory memory{DestinationMemory::kHost};
+    bool operator==(const ResolvedDestination&) const = default;
 };
 
 struct AttemptIdentity {

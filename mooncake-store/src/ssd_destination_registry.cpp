@@ -99,6 +99,9 @@ struct DestinationRegistry::State : std::enable_shared_from_this<State> {
             record.stage == DestinationAttemptState::kQuarantined)
             --exposed;
         for (auto& entry : record.entries) --entry->references;
+        for (const auto& interval : record.intervals) {
+            active_intervals.erase(interval.first);
+        }
         active_bytes -= record.bytes;
         active_fragments -= record.fragments;
         --active_attempts;
@@ -153,6 +156,9 @@ struct DestinationRegistry::State : std::enable_shared_from_this<State> {
     std::vector<Slot> slots;
     std::map<AttemptIdentity, std::shared_ptr<Record>, AttemptLess> records;
     std::map<PeerIdentity, uint64_t, PeerLess> replay_floors;
+    // Disjoint active destination intervals [begin, end) maintained across
+    // in-flight/quarantined attempts so Acquire checks overlaps in O(k log F).
+    std::map<uint64_t, uint64_t> active_intervals;
     size_t active_attempts{0}, active_fragments{0}, exposed{0};
     uint64_t active_bytes{0};
     std::shared_ptr<State> drain_hold;
@@ -237,6 +243,32 @@ DestinationRegistry::AcquireResult DestinationRegistry::Acquire(
     if (peer != state_->replay_floors.end() &&
         identity.request_id <= peer->second)
         return {DestinationError::kStaleRequest, {}};
+    if (peer == state_->replay_floors.end() &&
+        state_->replay_floors.size() == state_->limits.max_owner_sessions) {
+        // Retire a dead earlier boot epoch of the same client (or an idle
+        // owner with no tracked attempts) so peer restarts do not permanently
+        // exhaust max_owner_sessions.
+        auto evict_it = state_->replay_floors.end();
+        for (auto it = state_->replay_floors.begin();
+             it != state_->replay_floors.end(); ++it) {
+            const bool has_records =
+                std::any_of(state_->records.begin(), state_->records.end(),
+                            [&](const auto& entry) {
+                                return entry.first.owner == it->first;
+                            });
+            if (has_records) continue;
+            if (it->first.client_id_high == identity.owner.client_id_high &&
+                it->first.client_id_low == identity.owner.client_id_low &&
+                it->first.boot_epoch < identity.owner.boot_epoch) {
+                evict_it = it;
+                break;
+            }
+            if (evict_it == state_->replay_floors.end()) evict_it = it;
+        }
+        if (evict_it != state_->replay_floors.end()) {
+            state_->replay_floors.erase(evict_it);
+        }
+    }
     if (state_->records.size() == state_->limits.max_tracked_attempts ||
         destinations.size() >
             state_->limits.max_active_fragments - state_->active_fragments ||
@@ -270,29 +302,35 @@ DestinationRegistry::AcquireResult DestinationRegistry::Acquire(
     for (size_t i = 1; i < record->intervals.size(); ++i)
         if (Overlap(record->intervals[i - 1], record->intervals[i]))
             return {DestinationError::kOverlap, {}};
-    std::vector<std::pair<uint64_t, uint64_t>> reserved;
-    reserved.reserve(state_->active_fragments);
-    for (const auto& [key, existing] : state_->records) {
-        (void)key;
-        reserved.insert(reserved.end(), existing->intervals.begin(),
-                        existing->intervals.end());
-    }
-    std::sort(reserved.begin(), reserved.end());
-    size_t previous = 0;
     for (const auto& interval : record->intervals) {
-        while (previous < reserved.size() &&
-               reserved[previous].second <= interval.first)
-            ++previous;
-        if (previous < reserved.size() && Overlap(interval, reserved[previous]))
+        auto next = state_->active_intervals.lower_bound(interval.first);
+        if (next != state_->active_intervals.end() &&
+            Overlap(interval, *next)) {
             return {DestinationError::kOverlap, {}};
+        }
+        if (next != state_->active_intervals.begin()) {
+            auto prev = std::prev(next);
+            if (Overlap(interval, *prev)) {
+                return {DestinationError::kOverlap, {}};
+            }
+        }
     }
     // All validation and allocations precede reference/credit changes. Roll
-    // back a newly inserted owner session if map insertion throws.
+    // back newly inserted state if map insertion throws.
     auto [owner_it, new_owner] =
         state_->replay_floors.try_emplace(identity.owner, 0);
+    std::vector<uint64_t> inserted_intervals;
+    inserted_intervals.reserve(record->intervals.size());
     try {
+        for (const auto& interval : record->intervals) {
+            state_->active_intervals.emplace(interval.first, interval.second);
+            inserted_intervals.push_back(interval.first);
+        }
         state_->records.emplace(identity, record);
     } catch (...) {
+        for (uint64_t begin : inserted_intervals) {
+            state_->active_intervals.erase(begin);
+        }
         if (new_owner) state_->replay_floors.erase(owner_it);
         throw;
     }
@@ -320,7 +358,7 @@ DestinationError DestinationRegistry::Retire(
         std::lock_guard lock(state_->mutex);
         auto error = state_->Find(reference, entry);
         if (error != DestinationError::kOk) return error;
-        if (!entry->closing) return DestinationError::kClosing;
+        if (!entry->closing) return DestinationError::kNotClosing;
         if (entry->references || entry->retiring)
             return DestinationError::kBusy;
         entry->retiring = true;

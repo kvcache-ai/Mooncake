@@ -170,6 +170,8 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_STREAM_USE_URING, false);
     stream.enabled = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ, stream.enabled);
+    stream.push_enabled =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_SSD_PUSH, false);
     const uint64_t slot_bytes =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES,
                         uint64_t(stream.slot_bytes));
@@ -186,7 +188,7 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
                         uint32_t(stream.write_workers));
     stream.max_outstanding =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_STREAM_MAX_OUTSTANDING,
-                        uint32_t(stream.max_outstanding));
+                        uint32_t(stream.DefaultMaxOutstanding()));
 
     return config;
 }

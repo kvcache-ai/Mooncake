@@ -30,12 +30,13 @@ bool SingleBufferCovers(const TransferMetadata::SegmentDesc& desc,
         });
 }
 
+bool IsInvalidSegment(SegmentHandle segment) noexcept {
+    return static_cast<int64_t>(segment) < 0;
+}
+
 bool IsTerminalStatus(TransferStatusEnum state) noexcept {
     return state == TransferStatusEnum::COMPLETED ||
-           state == TransferStatusEnum::FAILED ||
-           state == TransferStatusEnum::TIMEOUT ||
-           state == TransferStatusEnum::CANCELED ||
-           state == TransferStatusEnum::INVALID;
+           state == TransferStatusEnum::FAILED;
 }
 
 class ClassicTcpWriteTarget final : public SourceDrainedWriteTarget {
@@ -53,8 +54,7 @@ class ClassicTcpWriteTarget final : public SourceDrainedWriteTarget {
           remote_desc_(std::move(remote_desc)) {}
 
     ~ClassicTcpWriteTarget() override {
-        if (engine_ && remote_segment_ !=
-                           static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT)) {
+        if (engine_ && !IsInvalidSegment(remote_segment_)) {
             (void)engine_->closeSegment(remote_segment_);
         }
     }
@@ -72,8 +72,11 @@ class ClassicTcpWriteTarget final : public SourceDrainedWriteTarget {
                 std::numeric_limits<uintptr_t>::max() - source_begin) {
                 return Error::kInvalidArgument;
             }
-            const auto local =
-                engine_->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+            const auto metadata = engine_->getMetadata();
+            if (!metadata) {
+                return Error::kInvalidArgument;
+            }
+            const auto local = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
             if (!local || !SingleBufferCovers(
                               *local, reinterpret_cast<uint64_t>(slot.data),
                               slot.capacity)) {
@@ -83,11 +86,10 @@ class ClassicTcpWriteTarget final : public SourceDrainedWriteTarget {
             // Validate every fragment before submitting any network write.
             for (const auto& fragment : chunk.fragments) {
                 const auto& d = fragment.destination;
-                if (!d.region_id || d.region_id > views_.size() ||
-                    d.generation != 1) {
+                if (d.destination_index >= views_.size()) {
                     return Error::kInvalidArgument;
                 }
-                const auto& view = views_[d.region_id - 1];
+                const auto& view = views_[d.destination_index];
                 if (d.offset > view.length ||
                     d.length > view.length - d.offset ||
                     fragment.buffer_offset > chunk.read_bytes ||
@@ -103,8 +105,7 @@ class ClassicTcpWriteTarget final : public SourceDrainedWriteTarget {
             }
 
             if (chunk.fragments.empty()) return Error::kOk;
-            if (!remote_desc_ || remote_segment_ == static_cast<SegmentHandle>(
-                                                        ERR_INVALID_ARGUMENT)) {
+            if (!remote_desc_ || IsInvalidSegment(remote_segment_)) {
                 return Error::kInvalidArgument;
             }
 
@@ -126,11 +127,13 @@ class ClassicTcpWriteTarget final : public SourceDrainedWriteTarget {
                 const auto* fragment = chunk.fragments.size() == 1
                                            ? &chunk.fragments.front()
                                            : ordered[i];
-                const auto& view = views_[fragment->destination.region_id - 1];
+                const auto& view =
+                    views_[fragment->destination.destination_index];
                 const auto dst_addr =
                     view.address + fragment->destination.offset;
                 const auto length =
                     static_cast<size_t>(fragment->destination.length);
+                if (length == 0) continue;
                 auto* src_ptr = slot.data + fragment->buffer_offset;
                 // Merge only exact adjacency at both ends within one registered
                 // remote BufferDesc; gaps never gain write authority.
@@ -155,6 +158,7 @@ class ClassicTcpWriteTarget final : public SourceDrainedWriteTarget {
                     entries.push_back(req);
                 }
             }
+            if (entries.empty()) return Error::kOk;
 
             const BatchID batch = engine_->allocateBatchID(entries.size());
             if (batch == INVALID_BATCH_ID) {
@@ -168,9 +172,9 @@ class ClassicTcpWriteTarget final : public SourceDrainedWriteTarget {
                 return Error::kTransferError;
             }
 
-            // Drain every submitted entry before returning or freeing the
-            // batch, so the staging slot is never reused while a write is
-            // still running.
+            // Drain every submitted entry until every transport task reaches
+            // COMPLETED or FAILED before returning or freeing the batch, so the
+            // staging slot is never reused while TCP I/O may still read it.
             bool all_succeeded = true;
             std::vector<bool> done(entries.size(), false);
             size_t remaining = entries.size();
@@ -183,10 +187,15 @@ class ClassicTcpWriteTarget final : public SourceDrainedWriteTarget {
                     const auto queried =
                         engine_->getTransferStatus(batch, i, status);
                     if (!queried.ok()) {
-                        all_succeeded = false;
-                        done[i] = true;
-                        --remaining;
-                        progressed = true;
+                        // Only stop polling a task if the batch/task ID is
+                        // invalid; transient lookup failures must not release
+                        // the staging slot while transport I/O may be active.
+                        if (queried.IsInvalidArgument()) {
+                            all_succeeded = false;
+                            done[i] = true;
+                            --remaining;
+                            progressed = true;
+                        }
                         continue;
                     }
                     if (!IsTerminalStatus(status.s)) continue;
@@ -209,20 +218,23 @@ class ClassicTcpWriteTarget final : public SourceDrainedWriteTarget {
             }
 
             const auto freed = engine_->freeBatchID(batch);
-            if (freed.IsBatchCleanupDeferred()) {
+            // Once all tasks reached COMPLETED, Status::BatchCleanupDeferred
+            // reflects the benign CompletionCallbackPin unwind window in
+            // Slice::markSuccess() and is NOT a transfer failure.
+            if (!freed.ok() && !freed.IsBatchCleanupDeferred()) {
                 all_succeeded = false;
             }
             if (all_succeeded) return Error::kOk;
-            destinations_drained_.store(false, std::memory_order_relaxed);
+            destinations_drained_.store(false, std::memory_order_release);
             return Error::kTransferError;
         } catch (...) {
-            destinations_drained_.store(false, std::memory_order_relaxed);
+            destinations_drained_.store(false, std::memory_order_release);
             return Error::kTransferError;
         }
     }
 
     bool DestinationsDrained() const noexcept override {
-        return destinations_drained_.load(std::memory_order_relaxed);
+        return destinations_drained_.load(std::memory_order_acquire);
     }
 
    private:
@@ -286,8 +298,12 @@ SsdTransferTargetPreparation PrepareSsdTcpWriteTarget(
     SegmentHandle segment = static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT);
     std::shared_ptr<TransferMetadata::SegmentDesc> remote;
     if (!views.empty()) {
+        const auto metadata = engine->getMetadata();
+        if (!metadata) {
+            return {DestinationError::kNotSupported, {}};
+        }
         segment = engine->openSegment(endpoint);
-        if (segment == static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT)) {
+        if (IsInvalidSegment(segment)) {
             return {DestinationError::kNotSupported, {}};
         }
         bool keep_segment = false;
@@ -300,7 +316,7 @@ SsdTransferTargetPreparation PrepareSsdTcpWriteTarget(
             }
         } guard{*engine, segment, keep_segment};
 
-        auto desc = engine->getMetadata()->getSegmentDescByID(segment);
+        auto desc = metadata->getSegmentDescByID(segment);
         if (!desc || desc->protocol != "tcp" || desc->tcp_proto_version < 2) {
             return {DestinationError::kNotSupported, {}};
         }
@@ -311,7 +327,7 @@ SsdTransferTargetPreparation PrepareSsdTcpWriteTarget(
                 });
         };
         if (!covered()) {
-            desc = engine->getMetadata()->getSegmentDescByID(segment, true);
+            desc = metadata->getSegmentDescByID(segment, true);
         }
         if (!desc || desc->protocol != "tcp" || desc->tcp_proto_version < 2) {
             return {DestinationError::kNotSupported, {}};
@@ -320,11 +336,12 @@ SsdTransferTargetPreparation PrepareSsdTcpWriteTarget(
             return {DestinationError::kInvalidArgument, {}};
         }
         remote = std::move(desc);
-        const auto local =
-            engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
-        local_destination = local &&
-                            remote->tcp_data_host == local->tcp_data_host &&
-                            remote->tcp_data_port == local->tcp_data_port;
+        const auto local = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        local_destination =
+            segment == LOCAL_SEGMENT_ID ||
+            (local && (remote->name == local->name ||
+                       (remote->tcp_data_host == local->tcp_data_host &&
+                        remote->tcp_data_port == local->tcp_data_port)));
         keep_segment = true;
     }
 

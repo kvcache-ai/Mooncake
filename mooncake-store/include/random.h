@@ -19,7 +19,15 @@ namespace mooncake {
 // OS cryptographic entropy; false never falls back to the shared PRNG.
 inline bool secureRandomBytes(std::span<std::byte> bytes) noexcept {
     size_t offset = 0;
-    std::array<std::byte, 256> entropy;
+    std::array<std::byte, 256> entropy{};
+    struct WipeGuard {
+        std::array<std::byte, 256>& buf;
+        ~WipeGuard() noexcept {
+            volatile unsigned char* p =
+                reinterpret_cast<volatile unsigned char*>(buf.data());
+            for (size_t i = 0; i < buf.size(); ++i) p[i] = 0;
+        }
+    } wipe{entropy};
     while (offset < bytes.size()) {
 #if defined(__linux__) || defined(__APPLE__)
         // getentropy limits each request to 256 bytes. It either fills the

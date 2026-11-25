@@ -425,5 +425,39 @@ TEST(SsdDestinationRegistry,
               DestinationError::kStaleRequest);
 }
 
+TEST(SsdDestinationRegistry, RetireBeforeBeginRevokeReturnsNotClosing) {
+    DestinationRegistry registry(requester, "receiver");
+    auto region = registry.Register(Binding(), credential, Lifetime());
+    ASSERT_EQ(region.error, DestinationError::kOk);
+    EXPECT_EQ(registry.Retire(region.region), DestinationError::kNotClosing);
+    EXPECT_EQ(registry.BeginRevoke(region.region), DestinationError::kOk);
+    EXPECT_EQ(registry.Retire(region.region), DestinationError::kOk);
+}
+
+TEST(SsdDestinationRegistry, EvictsIdleOwnerSessionOnRestartWhenAtCapacity) {
+    DestinationRegistryLimits limits;
+    limits.max_owner_sessions = 1;
+    DestinationRegistry registry(requester, "receiver", limits);
+    auto region = registry.Register(Binding(), credential, Lifetime());
+    ASSERT_EQ(region.error, DestinationError::kOk);
+    auto first = registry.Acquire(Key(1), {{region.region, 0, 8}});
+    ASSERT_EQ(first.error, DestinationError::kOk);
+    std::vector<ResolvedDestination> views;
+    ASSERT_EQ(first.attempt.Publish(views), DestinationError::kOk);
+    ASSERT_EQ(first.attempt.Complete(Ack(1)), DestinationError::kOk);
+    ASSERT_EQ(registry.ForgetRequest(owner, 1), DestinationError::kOk);
+
+    // After all attempts for the old owner epoch are drained and forgotten, a
+    // restarted owner epoch can evict the idle replay floor entry.
+    auto restarted = Key(1);
+    restarted.owner.boot_epoch++;
+    auto second = registry.Acquire(restarted, {{region.region, 0, 8}});
+    ASSERT_EQ(second.error, DestinationError::kOk);
+    ASSERT_EQ(second.attempt.Publish(views), DestinationError::kOk);
+    auto ack = Ack(1);
+    ack.attempt = restarted;
+    EXPECT_EQ(second.attempt.Complete(ack), DestinationError::kOk);
+}
+
 }  // namespace
 }  // namespace mooncake::ssd_offload

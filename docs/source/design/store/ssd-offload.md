@@ -183,32 +183,40 @@ and subsequent local streaming batches fall back to the portable `pread` driver
 Both drivers drain accepted work before releasing source leases or staging
 slots.
 
-## Storage Backends
+## Owner-push streaming reads (development)
 
-### Owner-read controller development
+`MOONCAKE_OFFLOAD_SSD_PUSH=true` enables the owner-push streaming read engine
+for RFC #5768. In this path, a requester registers destination regions in
+`DestinationRegistry` and sends a `kReadInto` request with inline resolved
+views; the owner runs `SsdDirectReadOwner` backed by
+`FileStorage::ReadOwnerStreaming` (with `PrepareSsdTcpWriteTarget` over
+acknowledged TCP v2) and returns a drained `SsdReadResultV1`.
 
 The owner-read controller provides request validation, bounded admission,
-terminal-result caching, and destination-registration lifetime tracking for
-the owner-push work in RFC #5768. Integration supplies the trusted peer
-bindings, a control-call adapter, an SSD reader and a transport write target.
-The adapter must authenticate both directions before interpreting a reply
-as evidence of drain.
+terminal-result caching, and destination-registration lifetime tracking.
+Integration supplies the trusted peer bindings, a control-call adapter, an SSD
+reader, and a transport write target. The adapter must authenticate both
+directions before interpreting a reply as evidence of drain.
 
-`SsdFixedL2Requester::ReadWithRecovery` makes bounded recovery attempts.
-A result without a terminal snapshot retains the registered allocation owner
-and records the attempt as pending. Only managed allocations may use this
-API. A raw borrowed application pointer requires an independent receiver
-fence before the application can reuse it after a failed call.
+`SsdFixedL2Requester::ReadWithRecovery` makes bounded recovery attempts (and
+stops promptly if the requester closes). A result without a terminal snapshot
+retains the registered allocation owner and records the attempt as pending; if
+a concurrent `Recover` drains the attempt, `ReadWithRecovery` surfaces the
+observed terminal snapshot. Only managed allocations may use this API. A raw
+borrowed application pointer requires an independent receiver fence before the
+application can reuse it after a failed call.
 
-Retired owner request IDs are stored as bounded, coalesced ranges. Recovering
-one ID retires that ID alone, allowing earlier requests to arrive out of order.
-The terminal cache evicts by completion time. Running attempts retain their
-resource credits, while an admitted operation abandoned before start returns
-its credits with a rejected result.
+Retired owner request IDs are stored as per-session bounded, coalesced ranges.
+Recovering one ID retires that ID alone, allowing earlier requests to arrive
+out of order. The terminal cache evicts by completion time. Running attempts
+retain their resource credits, while an admitted operation abandoned before
+start returns its credits with a rejected result.
 
 This component is exercised through injected transport and storage adapters.
 The network listener, authenticated bootstrap, epoch retirement, and the
 public managed-buffer API are integration work tracked by RFC #5768.
+
+## Storage Backends
 
 ### BucketStorageBackend (default)
 

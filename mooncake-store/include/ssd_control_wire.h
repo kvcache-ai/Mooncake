@@ -6,32 +6,27 @@
 
 namespace mooncake::ssd_offload {
 inline constexpr size_t kSsdControlMaxWireBytes = 2 * 1024 * 1024;
-enum class SsdControlCommand : uint32_t {
-    kResolve = 1,
-    kSubmit = 2,
-    kQuery = 3,
-    kForget = 4,
-    kReadInto = 5,
-    kRecoverReadInto = 6
-};
+enum class SsdControlCommand : uint32_t { kReadInto = 5, kRecoverReadInto = 6 };
 struct SsdControlMessage {
-    SsdControlCommand command{SsdControlCommand::kQuery};
+    SsdControlCommand command{SsdControlCommand::kReadInto};
     SsdGrantReferenceV1 reference;
     std::optional<SsdReadRequestV1> request;
-    // Fixed-L2 direct reads carry locally resolved views inline. Legacy
-    // Submit/Resolve/Query/Forget frames remain byte-for-byte unchanged.
+    // Fixed-L2 direct reads carry locally resolved views inline.
     std::vector<ResolvedDestination> destinations{};
 };
 struct SsdControlReply {
-    SsdControlCommand command{SsdControlCommand::kQuery};
+    SsdControlCommand command{SsdControlCommand::kReadInto};
     DestinationError error{DestinationError::kInvalidArgument};
     std::optional<SsdOwnerRequestSnapshot> snapshot;
-    std::vector<ResolvedDestination> destinations;
 };
 struct SsdControlEncoded {
     DestinationError error{DestinationError::kInvalidArgument};
     std::string bytes;
 };
+// Validates a control message and verifies its serialized wire footprint fits
+// within kSsdControlMaxWireBytes without allocating an output buffer.
+DestinationError ValidateSsdControlMessageWireSize(const SsdControlMessage&,
+                                                   SsdReadProtocolLimits = {});
 SsdControlEncoded EncodeSsdControlMessage(const SsdControlMessage&,
                                           SsdReadProtocolLimits = {});
 SsdControlEncoded EncodeSsdControlReply(const SsdControlReply&,

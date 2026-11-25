@@ -232,6 +232,12 @@ Error ReadPipeline::Start() {
     return error_;
 }
 
+void ReadPipeline::Cancel() {
+    if (state_ == PipelineState::kReady || state_ == PipelineState::kRunning) {
+        Abort(Error::kCancelled);
+    }
+}
+
 SlotToken ReadPipeline::Token(size_t slot_index) const {
     const auto& slot = slots_[slot_index];
     return {slot_index, slot.generation, slot.chunk_index};

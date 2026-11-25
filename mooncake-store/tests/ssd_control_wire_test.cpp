@@ -15,7 +15,10 @@ SsdControlMessage Message() {
         100,
         0,
         {{"key", 4096, 123, {{12, {{{requester, 1, 2, {11, 12}}, 16, 32}}}}}}};
-    return {SsdControlCommand::kSubmit, reference, request};
+    return {SsdControlCommand::kReadInto,
+            reference,
+            request,
+            {{"requester-te", 4096, 32, DestinationMemory::kHost}}};
 }
 void Put32(std::string& wire, size_t offset, uint32_t value) {
     ASSERT_LE(offset + 4, wire.size());
@@ -23,6 +26,8 @@ void Put32(std::string& wire, size_t offset, uint32_t value) {
 }
 TEST(SsdControlWire, RoundTripsExactRequestAndGrant) {
     auto request = Message();
+    EXPECT_EQ(ValidateSsdControlMessageWireSize(request),
+              DestinationError::kOk);
     auto wire = EncodeSsdControlMessage(request);
     ASSERT_EQ(wire.error, DestinationError::kOk);
     SsdControlMessage decoded;
@@ -31,7 +36,10 @@ TEST(SsdControlWire, RoundTripsExactRequestAndGrant) {
     EXPECT_EQ(decoded.reference, request.reference);
     ASSERT_TRUE(decoded.request);
     EXPECT_EQ(*decoded.request, *request.request);
-    request.command = SsdControlCommand::kResolve;
+    EXPECT_EQ(decoded.destinations, request.destinations);
+    request.command = SsdControlCommand::kRecoverReadInto;
+    EXPECT_EQ(ValidateSsdControlMessageWireSize(request),
+              DestinationError::kOk);
     EXPECT_EQ(EncodeSsdControlMessage(request).error, DestinationError::kOk);
 }
 TEST(SsdControlWire, DecodesUnalignedFramesAndRejectsEveryTruncation) {
@@ -45,16 +53,14 @@ TEST(SsdControlWire, DecodesUnalignedFramesAndRejectsEveryTruncation) {
     const auto encoded = EncodeSsdControlMessage(message);
     ASSERT_EQ(encoded.error, DestinationError::kOk);
     SsdControlReply reply{
-        SsdControlCommand::kReadInto,
-        DestinationError::kOk,
+        SsdControlCommand::kReadInto, DestinationError::kOk,
         SsdOwnerRequestSnapshot{
             DestinationError::kOk, SsdOwnerRequestState::kDrained,
             SsdReadResultV1{1,
                             message.reference.attempt,
                             true,
                             {{0, AttemptOutcome::kSucceeded, 32, UINT64_MAX}},
-                            message.reference.requester}},
-        {}};
+                            message.reference.requester}}};
     const auto terminal = EncodeSsdControlReply(reply);
     ASSERT_EQ(terminal.error, DestinationError::kOk);
     for (size_t offset = 0; offset < 8; ++offset) {
@@ -124,7 +130,7 @@ TEST(SsdControlWire, RejectsTruncationTrailingBytesVersionAndCrossedDirection) {
     EXPECT_NE(DecodeSsdControlReply(encoded.bytes, reply),
               DestinationError::kOk);
 }
-TEST(SsdControlWire, RoundTripsTerminalRecoveryAndAuthoritativeViews) {
+TEST(SsdControlWire, RoundTripsTerminalRecoveryAndErrorReplies) {
     auto message = Message();
     SsdReadResultV1 result{1,
                            message.reference.attempt,
@@ -132,11 +138,9 @@ TEST(SsdControlWire, RoundTripsTerminalRecoveryAndAuthoritativeViews) {
                            {{0, AttemptOutcome::kSucceeded, 32, 123}},
                            message.reference.requester};
     SsdControlReply reply{
-        SsdControlCommand::kQuery,
-        DestinationError::kOk,
+        SsdControlCommand::kRecoverReadInto, DestinationError::kOk,
         SsdOwnerRequestSnapshot{DestinationError::kOk,
-                                SsdOwnerRequestState::kDrained, result},
-        {}};
+                                SsdOwnerRequestState::kDrained, result}};
     auto wire = EncodeSsdControlReply(reply);
     ASSERT_EQ(wire.error, DestinationError::kOk);
     SsdControlReply decoded;
@@ -144,33 +148,31 @@ TEST(SsdControlWire, RoundTripsTerminalRecoveryAndAuthoritativeViews) {
               DestinationError::kOk);
     ASSERT_TRUE(decoded.snapshot);
     EXPECT_EQ(decoded.snapshot->result, result);
-    reply = {SsdControlCommand::kResolve,
-             DestinationError::kOk,
-             {},
-             {{"requester-te", 4096, 32, DestinationMemory::kHost}}};
-    wire = EncodeSsdControlReply(reply);
-    ASSERT_EQ(wire.error, DestinationError::kOk);
-    ASSERT_EQ(DecodeSsdControlReply(wire.bytes, decoded),
-              DestinationError::kOk);
-    ASSERT_EQ(decoded.destinations.size(), 1);
-    EXPECT_EQ(decoded.destinations[0].address, 4096);
-    EXPECT_EQ(decoded.destinations[0].length, 32);
+    for (auto err : {DestinationError::kTimedOut, DestinationError::kNotClosing,
+                     DestinationError::kFailed}) {
+        reply = {SsdControlCommand::kReadInto, err, {}};
+        wire = EncodeSsdControlReply(reply);
+        ASSERT_EQ(wire.error, DestinationError::kOk);
+        ASSERT_EQ(DecodeSsdControlReply(wire.bytes, decoded),
+                  DestinationError::kOk);
+        EXPECT_EQ(decoded.error, err);
+        EXPECT_FALSE(decoded.snapshot);
+    }
 }
-TEST(SsdControlWire, RejectsReplyMetadataLimitsAndUnknownState) {
+TEST(SsdControlWire, RejectsUnknownCommandAndUnknownSnapshotState) {
+    auto bad_message = Message();
+    bad_message.command = static_cast<SsdControlCommand>(1);
+    EXPECT_EQ(ValidateSsdControlMessageWireSize(bad_message),
+              DestinationError::kInvalidArgument);
+    EXPECT_EQ(EncodeSsdControlMessage(bad_message).error,
+              DestinationError::kInvalidArgument);
     SsdControlReply reply{
-        SsdControlCommand::kResolve,
-        DestinationError::kOk,
-        {},
-        {{"requester-te", UINT64_MAX, 32, DestinationMemory::kHost}}};
-    EXPECT_EQ(EncodeSsdControlReply(reply).error, DestinationError::kOverflow);
-    reply.destinations[0].address = 4096;
-    reply.destinations[0].transport_endpoint.assign(4097, 'x');
-    EXPECT_EQ(EncodeSsdControlReply(reply).error, DestinationError::kLimit);
-    reply = {SsdControlCommand::kQuery,
-             DestinationError::kOk,
-             SsdOwnerRequestSnapshot{
-                 DestinationError::kOk, SsdOwnerRequestState(99), {}},
-             {}};
+        SsdControlCommand::kRecoverReadInto, DestinationError::kOk,
+        SsdOwnerRequestSnapshot{
+            DestinationError::kOk, SsdOwnerRequestState(99), {}}};
+    EXPECT_EQ(EncodeSsdControlReply(reply).error,
+              DestinationError::kInvalidArgument);
+    reply = {static_cast<SsdControlCommand>(2), DestinationError::kOk, {}};
     EXPECT_EQ(EncodeSsdControlReply(reply).error,
               DestinationError::kInvalidArgument);
 }
@@ -196,16 +198,17 @@ TEST(SsdControlWire,
                            {{0, AttemptOutcome::kSucceeded, 32, 123}},
                            message.reference.requester};
     SsdControlReply reply{
-        SsdControlCommand::kReadInto,
-        DestinationError::kOk,
+        SsdControlCommand::kReadInto, DestinationError::kOk,
         SsdOwnerRequestSnapshot{DestinationError::kOk,
-                                SsdOwnerRequestState::kDrained, result},
-        {}};
+                                SsdOwnerRequestState::kDrained, result}};
     EXPECT_EQ(EncodeSsdControlReply(reply).error, DestinationError::kOk);
 }
 TEST(SsdControlWire, DirectReadRejectsMissingMismatchedOrOversizedInlineViews) {
     auto message = Message();
     message.command = SsdControlCommand::kReadInto;
+    message.destinations.clear();
+    EXPECT_EQ(ValidateSsdControlMessageWireSize(message),
+              DestinationError::kInvalidArgument);
     EXPECT_EQ(EncodeSsdControlMessage(message).error,
               DestinationError::kInvalidArgument);
     message.destinations = {
@@ -213,11 +216,14 @@ TEST(SsdControlWire, DirectReadRejectsMissingMismatchedOrOversizedInlineViews) {
     EXPECT_EQ(EncodeSsdControlMessage(message).error,
               DestinationError::kInvalidArgument);
     message.destinations[0].length = 32;
+    message.destinations[0].address = UINT64_MAX;
+    EXPECT_EQ(ValidateSsdControlMessageWireSize(message),
+              DestinationError::kOverflow);
+    message.destinations[0].address = 8192;
     message.destinations[0].transport_endpoint.assign(4097, 'x');
+    EXPECT_EQ(ValidateSsdControlMessageWireSize(message),
+              DestinationError::kLimit);
     EXPECT_EQ(EncodeSsdControlMessage(message).error, DestinationError::kLimit);
-    message.command = SsdControlCommand::kSubmit;
-    EXPECT_EQ(EncodeSsdControlMessage(message).error,
-              DestinationError::kInvalidArgument);
 }
 }  // namespace
 }  // namespace mooncake::ssd_offload

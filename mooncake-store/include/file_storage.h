@@ -13,7 +13,9 @@
 #include "common/read_singleflight.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
+#include "ssd_owner_callbacks.h"
 #include "ssd_pipeline_io.h"
+#include "ssd_read_protocol.h"
 #if defined(__linux__) && defined(USE_URING)
 #include "ssd_uring_pipeline.h"
 #endif
@@ -88,6 +90,18 @@ class FileStorage {
     // return drains accepted I/O before releasing staging or source leases.
     tl::expected<void, ErrorCode> ReadLocalStreaming(
         const std::vector<LocalReadRequest>& requests);
+
+    bool SupportsOwnerStreamingRead() const;
+    // Trusted owner worker only, after requester grant resolution. The target
+    // maps zero-based flat destination ordinals (object/range/destination
+    // order) to authoritative resolved views; planner offsets are relative to a
+    // view. Keep FileStorage alive through return. Preflight errors accept no
+    // writes. A result with dma_drained=false must leave the owner ledger
+    // quarantined.
+    tl::expected<ssd_offload::SsdReadResultV1, ErrorCode> ReadOwnerStreaming(
+        const ssd_offload::SsdReadRequestV1& request,
+        std::shared_ptr<ssd_offload::SourceDrainedWriteTarget> target,
+        std::chrono::steady_clock::time_point deadline);
 
     struct LocalBatchResult {
         std::vector<uint64_t> pointers;
@@ -225,7 +239,9 @@ class FileStorage {
         const std::vector<int64_t>& sizes);
     tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadBatchShared(
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
-        bool prefer_pinned, std::string flight_key);
+        bool prefer_pinned, std::string flight_key,
+        std::optional<std::chrono::steady_clock::time_point> deadline =
+            std::nullopt);
     static tl::expected<std::vector<uint64_t>, ErrorCode>
     StagingPointersInOrder(const AllocatedBatch& batch,
                            const std::vector<std::string>& keys,

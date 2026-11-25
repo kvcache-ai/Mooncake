@@ -19,6 +19,7 @@ enum class Error {
     kIoError,
     kTransferError,
     kNotSupported,
+    kCancelled,
 };
 
 struct DestinationSlice {
@@ -143,6 +144,7 @@ class ReadPipeline {
     ReadPipeline& operator=(ReadPipeline&&) = delete;
 
     Error Start();
+    void Cancel();
     Error ReadDrained(const SlotToken& token, size_t bytes_read,
                       Error result = Error::kOk);
     Error WriteDrained(const SlotToken& token, Error result = Error::kOk);

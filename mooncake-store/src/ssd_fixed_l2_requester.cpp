@@ -5,10 +5,10 @@
 #include "tenant_id.h"
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <stdexcept>
-#include <thread>
 #include <tuple>
 
 namespace mooncake::ssd_offload {
@@ -42,7 +42,7 @@ struct SsdFixedL2Requester::State {
         SsdPushPeerInfo route;
         DestinationRegistry::Attempt attempt;
         std::chrono::steady_clock::time_point deadline;
-        bool timed_out{false};
+        std::atomic<bool> timed_out{false};
         std::optional<SsdFixedL2ReadResult> terminal;
     };
     State(SsdFixedL2Peer self, std::string protocol,
@@ -57,8 +57,8 @@ struct SsdFixedL2Requester::State {
                                 std::chrono::milliseconds timeout) noexcept {
         try {
             // Read and recovery hold this attempt's mutex across the call.
-            // Only the command changes; retain the owned request for recovery
-            // without copying all keys and destination views on every RPC.
+            // Close() does not acquire pending.mutex so closing never stalls
+            // behind a hung network RPC.
             pending.message.command = command;
             return call(pending.route.control_host, pending.route.control_port,
                         pending.message, timeout);
@@ -71,7 +71,7 @@ struct SsdFixedL2Requester::State {
                                 SsdControlCommand expected) {
         const auto id = pending->message.reference.attempt;
         auto fail = [&](DestinationError error) {
-            pending->timed_out = true;
+            pending->timed_out.store(true, std::memory_order_release);
             pending->attempt.Timeout();
             return SsdFixedL2ReadResult{error, true, id, {}};
         };
@@ -91,19 +91,25 @@ struct SsdFixedL2Requester::State {
         const auto valid =
             ValidateSsdReadResultV1(*pending->message.request, result, wire);
         if (valid != DestinationError::kOk) return fail(valid);
-        if (closing || std::chrono::steady_clock::now() >= pending->deadline) {
-            pending->timed_out = true;
+        if (closing.load(std::memory_order_acquire) ||
+            std::chrono::steady_clock::now() >= pending->deadline) {
+            pending->timed_out.store(true, std::memory_order_release);
             pending->attempt.Timeout();
         }
         const auto completed = pending->attempt.Complete(Ack(result));
         if (completed != DestinationError::kOk) return fail(completed);
-        if (closing || std::chrono::steady_clock::now() >= pending->deadline)
-            pending->timed_out = true;
+        if (closing.load(std::memory_order_acquire) ||
+            std::chrono::steady_clock::now() >= pending->deadline)
+            pending->timed_out.store(true, std::memory_order_release);
+        const bool is_closing = closing.load(std::memory_order_acquire);
+        const bool is_timed_out =
+            pending->timed_out.load(std::memory_order_acquire);
         const bool publishable =
-            pending->attempt.snapshot().publishable && !pending->timed_out;
+            pending->attempt.snapshot().publishable && !is_timed_out;
         const bool allow_fallback =
-            expected == SsdControlCommand::kReadInto && !pending->timed_out &&
-            !closing && std::chrono::steady_clock::now() < pending->deadline &&
+            expected == SsdControlCommand::kReadInto && !is_timed_out &&
+            !is_closing &&
+            std::chrono::steady_clock::now() < pending->deadline &&
             std::all_of(
                 result.objects.begin(), result.objects.end(),
                 [](const auto& object) {
@@ -111,9 +117,13 @@ struct SsdFixedL2Requester::State {
                 });
         const auto forgotten = registry.ForgetRequest(id.owner, id.request_id);
         if (forgotten != DestinationError::kOk) return fail(forgotten);
+        const DestinationError terminal_error =
+            publishable    ? DestinationError::kOk
+            : is_closing   ? DestinationError::kClosing
+            : is_timed_out ? DestinationError::kTimedOut
+                           : DestinationError::kFailed;
         pending->terminal.emplace(SsdFixedL2ReadResult{
-            publishable ? DestinationError::kOk : DestinationError::kClosing,
-            true, id, std::move(result), allow_fallback});
+            terminal_error, true, id, std::move(result), allow_fallback});
         {
             std::lock_guard lock(mutex);
             pending_reads.erase(Key(id));
@@ -126,11 +136,11 @@ struct SsdFixedL2Requester::State {
     DestinationRegistry registry;
     SsdReadProtocolLimits wire;
     mutable std::mutex mutex;
+    std::condition_variable close_cv;
     std::map<decltype(Key({})), std::shared_ptr<Pending>> pending_reads;
     std::vector<DestinationRegion> regions;
     uint64_t next_id{1};
     std::atomic<bool> closing{false};
-    std::shared_ptr<State> quarantine;
 };
 SsdFixedL2Requester::SsdFixedL2Requester(SsdFixedL2Peer self,
                                          std::string protocol,
@@ -139,23 +149,25 @@ SsdFixedL2Requester::SsdFixedL2Requester(SsdFixedL2Peer self,
                                          SsdReadProtocolLimits wire) {
     if (!Valid(self.identity) || !TenantId(self.tenant_id).IsValid() ||
         self.credential == WriteCredential{} ||
-        self.transport_endpoint.empty() || !call ||
-        (protocol != "tcp" && protocol != "rdma"))
+        self.transport_endpoint.empty() || !call || protocol != "tcp")
         throw std::invalid_argument("Invalid fixed L2 requester configuration");
     state_ = std::make_shared<State>(std::move(self), std::move(protocol),
                                      std::move(call), limits, wire);
 }
 SsdFixedL2Requester::~SsdFixedL2Requester() {
     try {
-        if (Close() == DestinationError::kOk) return;
+        // DestinationRegistry::State::drain_hold already keeps exposed backing
+        // regions alive until physical drain without leaking
+        // SsdFixedL2Requester state or its RPC callback closure.
+        (void)Close();
     } catch (...) {
     }
-    state_->quarantine = state_;
 }
 DestinationRegistry::RegistrationResult SsdFixedL2Requester::Register(
     DestinationBinding binding, std::shared_ptr<void> mapping) {
     std::lock_guard lock(state_->mutex);
-    if (state_->closing) return {DestinationError::kClosing, {}};
+    if (state_->closing.load(std::memory_order_acquire))
+        return {DestinationError::kClosing, {}};
     if (binding.memory != DestinationMemory::kHost)
         return {DestinationError::kNotSupported, {}};
     WriteCredential credential;
@@ -172,13 +184,16 @@ DestinationRegistry::RegistrationResult SsdFixedL2Requester::Register(
 SsdFixedL2ReadResult SsdFixedL2Requester::Read(
     const SsdPushPeerInfo& peer, std::vector<SsdObjectReadV1> objects,
     std::chrono::milliseconds timeout) {
-    if (timeout.count() <= 0 || timeout > std::chrono::seconds(60)) return {};
+    const uint64_t max_timeout_ms = state_->wire.max_timeout_ms;
+    if (timeout.count() <= 0 || uint64_t(timeout.count()) > max_timeout_ms)
+        return {};
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     auto pending = std::make_shared<State::Pending>();
     std::lock_guard serial(pending->mutex);
     {
         std::lock_guard lock(state_->mutex);
-        if (state_->closing) return {DestinationError::kClosing, false, {}, {}};
+        if (state_->closing.load(std::memory_order_acquire))
+            return {DestinationError::kClosing, false, {}, {}};
         if (peer.tenant_id != state_->self.tenant_id || !peer.control_port ||
             !CanUseSsdPushV1(peer.capability, peer.owner, state_->protocol))
             return {DestinationError::kNotSupported, false, {}, {}};
@@ -246,11 +261,11 @@ SsdFixedL2ReadResult SsdFixedL2Requester::Read(
                 return {published, false, {}, {}};
             }
             locally_exposed = true;
-            const auto encoded =
-                EncodeSsdControlMessage(pending->message, state_->wire);
-            if (encoded.error != DestinationError::kOk) {
+            const auto wire_check = ValidateSsdControlMessageWireSize(
+                pending->message, state_->wire);
+            if (wire_check != DestinationError::kOk) {
                 abandon_unpublished();
-                return {encoded.error, false, {}, {}};
+                return {wire_check, false, {}, {}};
             }
         } catch (...) {
             abandon_unpublished();
@@ -271,11 +286,10 @@ SsdFixedL2ReadResult SsdFixedL2Requester::Read(
             pending,
             {DestinationError::kOk,
              SsdControlReply{
-                 SsdControlCommand::kReadInto,
-                 DestinationError::kOk,
+                 SsdControlCommand::kReadInto, DestinationError::kOk,
                  SsdOwnerRequestSnapshot{DestinationError::kOk,
-                                         SsdOwnerRequestState::kDrained, local},
-                 {}}},
+                                         SsdOwnerRequestState::kDrained,
+                                         local}}},
             SsdControlCommand::kReadInto);
         result.may_have_submitted = false;
         return result;
@@ -287,7 +301,7 @@ SsdFixedL2ReadResult SsdFixedL2Requester::Read(
             state_->Call(*pending, SsdControlCommand::kReadInto, remaining),
             SsdControlCommand::kReadInto);
     } catch (...) {
-        pending->timed_out = true;
+        pending->timed_out.store(true, std::memory_order_release);
         pending->attempt.Timeout();
         return {DestinationError::kTransportError,
                 true,
@@ -297,7 +311,9 @@ SsdFixedL2ReadResult SsdFixedL2Requester::Read(
 }
 SsdFixedL2ReadResult SsdFixedL2Requester::Recover(
     const AttemptIdentity& attempt, std::chrono::milliseconds timeout) {
-    if (timeout.count() <= 0 || timeout > std::chrono::seconds(60)) return {};
+    const uint64_t max_timeout_ms = state_->wire.max_timeout_ms;
+    if (timeout.count() <= 0 || uint64_t(timeout.count()) > max_timeout_ms)
+        return {};
     std::shared_ptr<State::Pending> pending;
     {
         std::lock_guard lock(state_->mutex);
@@ -323,7 +339,7 @@ SsdFixedL2ReadResult SsdFixedL2Requester::Recover(
                          timeout),
             SsdControlCommand::kRecoverReadInto);
     } catch (...) {
-        pending->timed_out = true;
+        pending->timed_out.store(true, std::memory_order_release);
         pending->attempt.Timeout();
         return {DestinationError::kTransportError, true, attempt, {}};
     }
@@ -331,21 +347,34 @@ SsdFixedL2ReadResult SsdFixedL2Requester::Recover(
 SsdFixedL2ReadResult SsdFixedL2Requester::ReadWithRecovery(
     const SsdPushPeerInfo& owner, std::vector<SsdObjectReadV1> objects,
     std::chrono::milliseconds timeout, SsdFixedL2DrainOptions options) {
+    const uint64_t max_timeout_ms = state_->wire.max_timeout_ms;
     if (options.recovery_timeout.count() <= 0 ||
-        options.recovery_timeout > std::chrono::seconds(60) ||
+        uint64_t(options.recovery_timeout.count()) > max_timeout_ms ||
         options.retry_interval.count() <= 0 ||
-        options.retry_interval > std::chrono::seconds(60) ||
+        uint64_t(options.retry_interval.count()) > max_timeout_ms ||
         options.recovery_budget.count() <= 0 ||
-        options.recovery_budget > std::chrono::seconds(60))
+        uint64_t(options.recovery_budget.count()) > max_timeout_ms)
         return {};
     auto result = Read(owner, std::move(objects), timeout);
     if (!result.may_have_submitted || result.result) return result;
+    // Retain the Pending handle if still registered so a concurrent Recover()
+    // that completes and removes the map entry still yields its terminal result
+    // instead of returning nullopt to the original caller.
+    std::shared_ptr<State::Pending> tracked;
+    {
+        std::lock_guard lock(state_->mutex);
+        if (auto it = state_->pending_reads.find(Key(result.attempt));
+            it != state_->pending_reads.end()) {
+            tracked = it->second;
+        }
+    }
     const auto until =
         std::chrono::steady_clock::now() + options.recovery_budget;
     for (;;) {
+        if (state_->closing.load(std::memory_order_acquire)) return result;
+        const auto now = std::chrono::steady_clock::now();
         const auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                until - std::chrono::steady_clock::now());
+            std::chrono::duration_cast<std::chrono::milliseconds>(until - now);
         if (remaining.count() <= 0) return result;
         // ReadInto has already ended. Its failed attempt remains pinned, and
         // recovery uses independent short-lived RPC connections. Never turn a
@@ -358,14 +387,26 @@ SsdFixedL2ReadResult SsdFixedL2Requester::ReadWithRecovery(
             return result;  // The original timeout/error cannot become success.
         }
         {
-            std::lock_guard lock(state_->mutex);
-            // Another recovery caller may have completed and removed this
-            // record. Submitted records leave this map only after a validated
-            // terminal result completes the destination registry.
-            if (!state_->pending_reads.contains(Key(result.attempt)))
+            std::unique_lock lock(state_->mutex);
+            if (!state_->pending_reads.contains(Key(result.attempt))) {
+                lock.unlock();
+                if (tracked) {
+                    std::lock_guard serial(tracked->mutex);
+                    if (tracked->terminal && tracked->terminal->result) {
+                        result.result = tracked->terminal->result;
+                        result.allow_fallback = false;
+                    }
+                }
                 return result;
+            }
+            if (state_->closing.load(std::memory_order_acquire)) return result;
+            const auto sleep_until =
+                std::min(until, std::chrono::steady_clock::now() +
+                                    options.retry_interval);
+            state_->close_cv.wait_until(lock, sleep_until, [&] {
+                return state_->closing.load(std::memory_order_acquire);
+            });
         }
-        std::this_thread::sleep_for(options.retry_interval);
     }
 }
 DestinationError SsdFixedL2Requester::Revoke(const DestinationRegion& region) {
@@ -387,16 +428,18 @@ DestinationError SsdFixedL2Requester::Close() {
     std::vector<DestinationRegion> regions;
     {
         std::lock_guard lock(state_->mutex);
-        state_->closing = true;
+        state_->closing.store(true, std::memory_order_release);
         for (const auto& [key, record] : state_->pending_reads) {
             (void)key;
             pending.push_back(record);
         }
         regions = state_->regions;
     }
+    state_->close_cv.notify_all();
     for (auto& record : pending) {
-        std::lock_guard serial(record->mutex);
-        record->timed_out = true;
+        // Non-blocking: do not acquire record->mutex across hung network RPCs.
+        // Attempt::Timeout() is thread-safe under DestinationRegistry's mutex.
+        record->timed_out.store(true, std::memory_order_release);
         record->attempt.Timeout();
     }
     auto result = DestinationError::kOk;

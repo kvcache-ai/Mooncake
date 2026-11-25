@@ -177,13 +177,23 @@ class SsdTcpWriteTargetTest : public ::testing::Test {
         char filename[] = "/tmp/mooncake-ssd-tcp-target-XXXXXX";
         const int file = mkstemp(filename);
         ASSERT_GE(file, 0);
+        struct TempFileGuard {
+            int fd;
+            const char* path;
+            ~TempFileGuard() {
+                if (fd >= 0) close(fd);
+                if (path) unlink(path);
+            }
+        } temp_guard{file, filename};
         std::vector<std::byte> expected(kPayloadBytes);
         for (size_t i = 0; i < expected.size(); ++i) expected[i] = Pattern(i);
         ASSERT_EQ(write(file, expected.data(), expected.size()),
                   ssize_t(expected.size()));
-        auto opened = OpenPosixReadSource(filename, {kPayloadBytes, 0, 1});
-        close(file);
+        auto opened = OpenPosixReadSource(filename, kPayloadBytes);
+        close(temp_guard.fd);
+        temp_guard.fd = -1;
         unlink(filename);
+        temp_guard.path = nullptr;
         ASSERT_EQ(opened.error, Error::kOk);
 
         constexpr size_t kSlotBytes = 64 * 1024;
@@ -197,7 +207,7 @@ class SsdTcpWriteTargetTest : public ::testing::Test {
         ASSERT_EQ(target.error, DestinationError::kOk);
         ASSERT_TRUE(target.target);
         auto plan =
-            BuildReadPlan({kPayloadBytes, 0, {{0, {{1, 1, 0, kPayloadBytes}}}}},
+            BuildReadPlan({kPayloadBytes, 0, 0, {{0, 0, kPayloadBytes}}},
                           {kSlotBytes, 1, 128});
         ASSERT_EQ(plan.error, Error::kOk);
         ASSERT_GT(plan.plan.chunks.size(), 1u);
@@ -255,11 +265,11 @@ TEST_F(SsdTcpWriteTargetTest, PreflightsEveryFragmentBeforeTransfer) {
     ASSERT_EQ(source->registerLocalMemory(slot.data(), slot.size(), "cpu:0",
                                           false, false),
               0);
-    auto plan = BuildReadPlan({32, 0, {{0, {{1, 1, 0, 32}}}}}, {4096, 1, 4});
+    auto plan = BuildReadPlan({32, 0, 0, {{0, 0, 32}}}, {4096, 1, 4});
     ASSERT_EQ(plan.error, Error::kOk);
 
     auto bad = plan.plan.chunks[0];
-    bad.fragments.push_back({0, {2, 1, 0, 1}});
+    bad.fragments.push_back({0, {1, 0, 1}});
     EXPECT_EQ(prepared.target->WriteAndDrain(bad, {slot.data(), slot.size()}),
               Error::kInvalidArgument);
     EXPECT_TRUE(prepared.target->DestinationsDrained());
@@ -307,21 +317,71 @@ TEST_F(SsdTcpWriteTargetTest, RejectsUnsafeViewsAndLegacyPeersBeforeWrite) {
     bad.address = base + backing.size();
     EXPECT_EQ(PrepareSsdTcpWriteTarget(source, {bad}).error,
               DestinationError::kInvalidArgument);
-
-    setenv("MC_TCP_PROTO", "1", 1);
-    EXPECT_EQ(PrepareSsdTcpWriteTarget(source, {view}).error,
-              DestinationError::kNotSupported);
-    unsetenv("MC_TCP_PROTO");
-
-    const auto segment = source->openSegment(view.transport_endpoint);
-    auto desc = source->getMetadata()->getSegmentDescByID(segment);
-    ASSERT_TRUE(desc);
-    desc->tcp_proto_version = 1;
-    EXPECT_EQ(PrepareSsdTcpWriteTarget(source, {view}).error,
-              DestinationError::kNotSupported);
-    desc->tcp_proto_version = 2;
-    EXPECT_EQ(source->closeSegment(segment), 0);
     EXPECT_EQ(peer->unregisterLocalMemory(backing.data(), true), 0);
+}
+
+TEST_F(SsdTcpWriteTargetTest, RejectsLegacyTcpProtoBeforeEngineStart) {
+    struct ScopedEnv {
+        explicit ScopedEnv(const char* value) {
+            setenv("MC_TCP_PROTO", value, 1);
+        }
+        ~ScopedEnv() { unsetenv("MC_TCP_PROTO"); }
+    };
+    // Guard declared before TransferEngine instances so every background
+    // engine thread is joined before restoring the process environment.
+    ScopedEnv legacy_env("1");
+    auto source = MakeTcpEngine();
+    auto peer = MakeTcpEngine();
+    ASSERT_TRUE(source);
+    ASSERT_TRUE(peer);
+    std::array<std::byte, 128> backing{};
+    ASSERT_EQ(peer->registerLocalMemory(backing.data(), backing.size(), "cpu:0",
+                                        true, true),
+              0);
+    const auto base = reinterpret_cast<uint64_t>(backing.data());
+    const ResolvedDestination view{peer->getLocalIpAndPort(), base + 16, 32,
+                                   DestinationMemory::kHost};
+    EXPECT_EQ(PrepareSsdTcpWriteTarget(source, {view}).error,
+              DestinationError::kNotSupported);
+    EXPECT_EQ(peer->unregisterLocalMemory(backing.data(), true), 0);
+}
+
+TEST_F(SsdTcpWriteTargetTest, MergesAdjacentFragmentsWithinSingleBuffer) {
+    auto source = MakeTcpEngine();
+    auto peer = MakeTcpEngine();
+    ASSERT_TRUE(source);
+    ASSERT_TRUE(peer);
+    std::array<std::byte, 64> staging{};
+    for (size_t i = 0; i < staging.size(); ++i) staging[i] = Pattern(i + 17);
+    std::array<std::byte, 128> destination;
+    destination.fill(std::byte{0xA5});
+    ASSERT_EQ(source->registerLocalMemory(staging.data(), staging.size(),
+                                          "cpu:0", false, true),
+              0);
+    ASSERT_EQ(peer->registerLocalMemory(destination.data(), destination.size(),
+                                        "cpu:0", true, true),
+              0);
+    const auto base = reinterpret_cast<uint64_t>(destination.data());
+    auto prepared = PrepareSsdTcpWriteTarget(
+        source,
+        {{peer->getLocalIpAndPort(), base + 16, 32, DestinationMemory::kHost},
+         {peer->getLocalIpAndPort(), base + 48, 32, DestinationMemory::kHost}});
+    ASSERT_EQ(prepared.error, DestinationError::kOk);
+    // Two adjacent fragments in the same destination MR and contiguous in the
+    // staging slot should coalesce into one transfer and preserve all bytes.
+    ReadChunk chunk{0, 0, 64, 0, 64, {{0, {0, 0, 32}}, {32, {1, 0, 32}}}};
+    ASSERT_EQ(
+        prepared.target->WriteAndDrain(chunk, {staging.data(), staging.size()}),
+        Error::kOk);
+    EXPECT_TRUE(prepared.target->DestinationsDrained());
+    EXPECT_TRUE(std::all_of(destination.begin(), destination.begin() + 16,
+                            [](auto b) { return b == std::byte{0xA5}; }));
+    EXPECT_EQ(std::memcmp(destination.data() + 16, staging.data(), 64), 0);
+    EXPECT_TRUE(std::all_of(destination.begin() + 80, destination.end(),
+                            [](auto b) { return b == std::byte{0xA5}; }));
+    prepared.target.reset();
+    EXPECT_EQ(peer->unregisterLocalMemory(destination.data(), true), 0);
+    EXPECT_EQ(source->unregisterLocalMemory(staging.data(), true), 0);
 }
 
 TEST_F(SsdTcpWriteTargetTest, WriteFailureClearsDestinationDrainProof) {
@@ -345,7 +405,7 @@ TEST_F(SsdTcpWriteTargetTest, WriteFailureClearsDestinationDrainProof) {
     ASSERT_EQ(source->registerLocalMemory(slot.data(), slot.size(), "cpu:0",
                                           false, false),
               0);
-    auto plan = BuildReadPlan({32, 0, {{0, {{1, 1, 0, 32}}}}}, {4096, 1, 4});
+    auto plan = BuildReadPlan({32, 0, 0, {{0, 0, 32}}}, {4096, 1, 4});
     ASSERT_EQ(plan.error, Error::kOk);
 
     ASSERT_EQ(peer->unregisterLocalMemory(backing.data(), true), 0);
@@ -371,8 +431,8 @@ TEST_F(SsdTcpWriteTargetTest, RejectsLoopbackSourceAliasBeforeSubmission) {
         {{engine->getLocalIpAndPort(), reinterpret_cast<uint64_t>(slot.data()),
           slot.size(), DestinationMemory::kHost}});
     ASSERT_EQ(prepared.error, DestinationError::kOk);
-    auto plan = BuildReadPlan({slot.size(), 0, {{0, {{1, 1, 0, slot.size()}}}}},
-                              {4096, 1, 4});
+    auto plan =
+        BuildReadPlan({slot.size(), 0, 0, {{0, 0, slot.size()}}}, {4096, 1, 4});
     ASSERT_EQ(plan.error, Error::kOk);
     EXPECT_EQ(prepared.target->WriteAndDrain(plan.plan.chunks[0],
                                              {slot.data(), slot.size()}),
@@ -413,7 +473,7 @@ TEST_F(SsdTcpWriteTargetTest, AdjacentMrsNeverBypassSingleTcpBufferPreflight) {
                   reinterpret_cast<uint64_t>(destination.data() + 32), 32,
                   DestinationMemory::kHost}});
     ASSERT_EQ(made.error, DestinationError::kOk);
-    ReadChunk chunk{0, 0, 64, 0, 64, {{32, {2, 1, 0, 32}}, {0, {1, 1, 0, 32}}}};
+    ReadChunk chunk{0, 0, 64, 0, 64, {{32, {1, 0, 32}}, {0, {0, 0, 32}}}};
     ASSERT_EQ(
         made.target->WriteAndDrain(chunk, {staging.data(), staging.size()}),
         Error::kOk);

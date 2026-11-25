@@ -3,6 +3,7 @@
 #pragma once
 
 #include "ssd_destination_registry.h"
+#include "ssd_owner_callbacks.h"
 #include "ssd_pipeline_io.h"
 
 #include <cstddef>

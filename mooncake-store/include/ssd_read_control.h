@@ -5,7 +5,7 @@
 #include "ssd_destination_registry.h"
 #include "ssd_read_protocol.h"
 #include <chrono>
-#include <string_view>
+#include <vector>
 
 namespace mooncake::ssd_offload {
 
@@ -26,16 +26,9 @@ struct SsdControlStats {
     size_t records{0};
     uint64_t metadata_bytes{0};
     uint64_t active_payload_bytes{0};
-};
-struct SsdGrantPreparation {
-    DestinationError error{DestinationError::kInvalidArgument};
-    SsdGrantReferenceV1 reference;
-};
-struct SsdGrantResolution {
-    DestinationError error{DestinationError::kInvalidArgument};
-    // Ordered by objects, ranges, destinations. Only the requester registry
-    // may produce these views; callers must not resolve a raw RPC address.
-    std::vector<ResolvedDestination> destinations;
+    size_t active_records{0};
+    size_t quarantined_records{0};
+    size_t retired_range_count{0};
 };
 
 enum class SsdOwnerRequestState { kAdmitted, kRunning, kQuarantined, kDrained };
@@ -78,7 +71,7 @@ class SsdOwnerRequestLedger {
     };
     SsdOwnerRequestLedger(PeerIdentity owner, SsdControlLimits = {},
                           SsdReadProtocolLimits = {},
-                          bool bounded_terminal_cache = false);
+                          bool bounded_terminal_cache = true);
     ~SsdOwnerRequestLedger();
     SsdOwnerRequestLedger(const SsdOwnerRequestLedger&) = delete;
     SsdOwnerRequestLedger& operator=(const SsdOwnerRequestLedger&) = delete;
@@ -87,16 +80,22 @@ class SsdOwnerRequestLedger {
     Admission Admit(const SsdReadRequestV1&, const SsdGrantReferenceV1&,
                     std::chrono::steady_clock::time_point received_at =
                         std::chrono::steady_clock::now(),
-                    std::string_view binding = {});
+                    const std::vector<ResolvedDestination>& destinations = {});
     SsdOwnerRequestSnapshot Query(const SsdGrantReferenceV1&) const;
+    // Blocks on a condition variable until the tracked attempt reaches a
+    // terminal state (kDrained/kQuarantined), the ledger closes, or deadline
+    // expires. Returns the observed terminal snapshot directly so callers do
+    // not race against subsequent cache eviction.
+    SsdOwnerRequestSnapshot WaitForTerminal(
+        const SsdGrantReferenceV1&,
+        std::chrono::steady_clock::time_point deadline) const;
     // Trusted direct endpoint only, after peer credential validation. Existing
-    // records must match the exact request/binding. Absence fences delayed
-    // admission and proves no writer remains for this attempt, never success.
-    SsdOwnerRequestSnapshot Recover(const SsdReadRequestV1&,
-                                    const SsdGrantReferenceV1&,
-                                    std::string_view binding = {});
-    // Explicit requester acknowledgment only; no TTL eviction or timer proof.
-    DestinationError Forget(const SsdGrantReferenceV1&);
+    // records must match the exact request and inline destinations. Absence
+    // fences delayed admission and proves no writer remains for this attempt,
+    // never success.
+    SsdOwnerRequestSnapshot Recover(
+        const SsdReadRequestV1&, const SsdGrantReferenceV1&,
+        const std::vector<ResolvedDestination>& destinations = {});
     void Close();
     SsdControlStats stats() const;
 

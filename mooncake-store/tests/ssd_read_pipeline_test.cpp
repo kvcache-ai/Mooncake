@@ -395,5 +395,40 @@ TEST(SsdReadPipeline, RestoresRealFileAcrossSlicesWithOutOfOrderCompletions) {
     EXPECT_EQ(second[6007], std::byte{0});
 }
 
+TEST(SsdReadPipeline, CancelTransitionsToFailedWithCancelledOnceDrained) {
+    // Cancel before Start moves directly to kFailed with kCancelled.
+    {
+        Arena arena;
+        RecordingDriver driver;
+        ReadPipeline pipeline(Plan(8192).plan, arena.Buffers(), driver);
+        pipeline.Cancel();
+        EXPECT_EQ(pipeline.state(), PipelineState::kFailed);
+        EXPECT_EQ(pipeline.error(), Error::kCancelled);
+        EXPECT_EQ(pipeline.Start(), Error::kInvalidState);
+    }
+    // Cancel while slots are inflight stops refilling and finishes as kFailed
+    // with kCancelled once all accepted work drains.
+    {
+        Arena arena;
+        RecordingDriver driver;
+        ReadPipeline pipeline(Plan(12000).plan, arena.Buffers(), driver);
+        ASSERT_EQ(pipeline.Start(), Error::kOk);
+        ASSERT_EQ(driver.reads.size(), 2u);
+        pipeline.Cancel();
+        EXPECT_EQ(pipeline.state(), PipelineState::kDraining);
+        EXPECT_EQ(pipeline.error(), Error::kCancelled);
+        EXPECT_EQ(pipeline.ReadDrained(driver.reads[0].token, 4096),
+                  Error::kOk);
+        EXPECT_TRUE(driver.writes.empty());
+        EXPECT_EQ(pipeline.state(), PipelineState::kDraining);
+        EXPECT_EQ(pipeline.ReadDrained(driver.reads[1].token, 4096),
+                  Error::kOk);
+        EXPECT_TRUE(driver.writes.empty());
+        EXPECT_EQ(pipeline.inflight(), 0u);
+        EXPECT_EQ(pipeline.state(), PipelineState::kFailed);
+        EXPECT_EQ(pipeline.error(), Error::kCancelled);
+    }
+}
+
 }  // namespace
 }  // namespace mooncake::ssd_offload

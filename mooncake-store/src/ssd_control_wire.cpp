@@ -12,26 +12,28 @@ constexpr uint32_t magic = 0x53534443, reply_magic = magic | 0x80000000;
 bool ValidPeer(PeerIdentity p) {
     return (p.client_id_high || p.client_id_low) && p.boot_epoch;
 }
-bool HasRequest(SsdControlCommand c) {
-    return c == SsdControlCommand::kSubmit ||
-           c == SsdControlCommand::kResolve ||
-           c == SsdControlCommand::kReadInto ||
-           c == SsdControlCommand::kRecoverReadInto;
+bool KnownCommand(uint32_t c) {
+    return c == uint32_t(SsdControlCommand::kReadInto) ||
+           c == uint32_t(SsdControlCommand::kRecoverReadInto);
 }
-bool KnownCommand(uint32_t c) { return c >= 1 && c <= 6; }
 class IO {
    public:
-    explicit IO(std::string_view input) : input(input) {}
-    IO() : writing(true) {}
+    enum class Mode { kRead, kWrite, kMeasure };
+    explicit IO(std::string_view input) : mode(Mode::kRead), input(input) {}
+    explicit IO(Mode m = Mode::kWrite) : mode(m) {}
     void Fail(DestinationError e = DestinationError::kInvalidArgument) {
         if (error == DestinationError::kOk) error = e;
     }
     bool Room(size_t n) {
         if (error != DestinationError::kOk) return false;
-        if (n > (writing ? kSsdControlMaxWireBytes - output.size()
-                         : input.size() - position)) {
-            Fail(writing ? DestinationError::kLimit
-                         : DestinationError::kInvalidArgument);
+        const size_t used = mode == Mode::kWrite     ? output.size()
+                            : mode == Mode::kMeasure ? measured
+                                                     : position;
+        const size_t cap =
+            mode == Mode::kRead ? input.size() : kSsdControlMaxWireBytes;
+        if (n > cap - used) {
+            Fail(mode == Mode::kRead ? DestinationError::kInvalidArgument
+                                     : DestinationError::kLimit);
             return false;
         }
         return true;
@@ -40,7 +42,11 @@ class IO {
     void Number(T& value) {
         static_assert(std::is_unsigned_v<T>);
         if (!Room(sizeof(T))) return;
-        if (writing) {
+        if (mode == Mode::kMeasure) {
+            measured += sizeof(T);
+            return;
+        }
+        if (mode == Mode::kWrite) {
             if constexpr (std::endian::native == std::endian::little)
                 output.append(reinterpret_cast<const char*>(&value), sizeof(T));
             else
@@ -69,11 +75,12 @@ class IO {
     void Count(uint32_t& count, size_t cap, size_t minimum_bytes) {
         Number(count);
         if (count > cap) Fail(DestinationError::kLimit);
-        if (!writing && minimum_bytes &&
+        if (mode == Mode::kRead && minimum_bytes &&
             count > (input.size() - position) / minimum_bytes)
             Fail();
     }
     void String(std::string_view& value, size_t cap) {
+        const bool writing = mode != Mode::kRead;
         if (writing && value.size() > UINT32_MAX) {
             Fail(DestinationError::kLimit);
             return;
@@ -85,17 +92,20 @@ class IO {
             return;
         }
         if (!Room(length)) return;
-        if (writing)
+        if (mode == Mode::kMeasure)
+            measured += length;
+        else if (mode == Mode::kWrite)
             output.append(value);
         else {
             value = input.substr(position, length);
             position += length;
         }
     }
-    bool writing{false};
+    Mode mode{Mode::kRead};
     DestinationError error{DestinationError::kOk};
     std::string_view input;
     size_t position{0};
+    size_t measured{0};
     std::string output;
 };
 void Peer(IO& io, PeerIdentity& value) {
@@ -327,43 +337,49 @@ void Views(IO& io, const std::vector<ResolvedDestination>* source,
                                  DestinationMemory(memory)};
     }
 }
+DestinationError ValidateMessageInlineViews(const SsdControlMessage& message) {
+    if (!message.request) return DestinationError::kInvalidArgument;
+    size_t index = 0;
+    for (const auto& object : message.request->objects)
+        for (const auto& range : object.ranges)
+            for (const auto& d : range.destinations)
+                if (index >= message.destinations.size() ||
+                    message.destinations[index++].length != d.length)
+                    return DestinationError::kInvalidArgument;
+    if (index != message.destinations.size())
+        return DestinationError::kInvalidArgument;
+    return DestinationError::kOk;
+}
 void Message(IO& io, const SsdControlMessage* source,
              SsdControlMessage* destination, SsdReadProtocolLimits limits) {
     CheckLimits(io, limits);
-    auto command = source ? source->command : SsdControlCommand::kQuery;
+    auto command = source ? source->command : SsdControlCommand::kReadInto;
     auto grant = source ? source->reference : SsdGrantReferenceV1{};
     Header(io, false, command);
     Grant(io, grant);
     if (io.error != DestinationError::kOk) return;
-    if (source && source->request.has_value() != HasRequest(command)) {
+    if (source && !source->request.has_value()) {
         io.Fail();
         return;
     }
     if (destination) {
         destination->command = command;
         destination->reference = grant;
+        destination->request.emplace();
     }
-    if (HasRequest(command)) {
-        if (destination) destination->request.emplace();
-        Request(io, source ? &*source->request : nullptr,
-                destination ? &*destination->request : nullptr, limits, grant);
-    }
-    const bool direct = command == SsdControlCommand::kReadInto ||
-                        command == SsdControlCommand::kRecoverReadInto;
-    if (direct)
-        Views(io, source ? &source->destinations : nullptr,
-              destination ? &destination->destinations : nullptr, limits);
-    else if (source && !source->destinations.empty())
-        io.Fail();
+    Request(io, source ? &*source->request : nullptr,
+            destination ? &*destination->request : nullptr, limits, grant);
+    Views(io, source ? &source->destinations : nullptr,
+          destination ? &destination->destinations : nullptr, limits);
 }
 void Reply(IO& io, const SsdControlReply* source, SsdControlReply* destination,
            SsdReadProtocolLimits limits) {
     CheckLimits(io, limits);
-    auto command = source ? source->command : SsdControlCommand::kQuery;
+    auto command = source ? source->command : SsdControlCommand::kReadInto;
     uint32_t error = source ? uint32_t(source->error) : 0;
     Header(io, true, command);
     io.Number(error);
-    if (error > uint32_t(DestinationError::kTransportError)) io.Fail();
+    if (error > uint32_t(DestinationError::kFailed)) io.Fail();
     bool snapshot = source && source->snapshot.has_value();
     io.Flag(snapshot);
     if (destination) {
@@ -388,46 +404,10 @@ void Reply(IO& io, const SsdControlReply* source, SsdControlReply* destination,
                    limits);
         }
     }
-    uint32_t count = source ? uint32_t(source->destinations.size()) : 0;
-    io.Count(count, limits.max_fragments, 25);
-    if (io.error != DestinationError::kOk) return;
-    if (destination) destination->destinations.resize(count);
-    uint64_t bytes = 0;
-    for (size_t i = 0; i < count && io.error == DestinationError::kOk; ++i) {
-        const auto* view = source ? &source->destinations[i] : nullptr;
-        std::string_view endpoint =
-            view ? std::string_view(view->transport_endpoint)
-                 : std::string_view{};
-        uint64_t address = view ? view->address : 0,
-                 length = view ? view->length : 0;
-        uint32_t memory = view ? uint32_t(view->memory) : 0;
-        io.String(endpoint, 4096);
-        io.Number(address);
-        io.Number(length);
-        io.Number(memory);
-        if (endpoint.empty() || endpoint.find('\0') != std::string_view::npos ||
-            !address || memory > uint32_t(DestinationMemory::kDevice))
-            io.Fail();
-        if (length > UINT64_MAX - address) io.Fail(DestinationError::kOverflow);
-        if (length > limits.max_payload_bytes - bytes)
-            io.Fail(DestinationError::kLimit);
-        if (io.error != DestinationError::kOk) return;
-        bytes += length;
-        if (destination)
-            destination->destinations[i] = {std::string(endpoint), address,
-                                            length, DestinationMemory(memory)};
-    }
     const bool success = error == uint32_t(DestinationError::kOk),
                duplicate = error == uint32_t(DestinationError::kDuplicate);
-    if (command == SsdControlCommand::kResolve) {
-        if (snapshot || (!success && count)) io.Fail();
-    } else if (command == SsdControlCommand::kForget) {
-        if (snapshot || count) io.Fail();
-    } else if (count ||
-               snapshot !=
-                   (success || ((command == SsdControlCommand::kSubmit ||
-                                 command == SsdControlCommand::kReadInto) &&
-                                duplicate)))
+    if (snapshot !=
+        (success || (command == SsdControlCommand::kReadInto && duplicate)))
         io.Fail();
 }
 template <typename T, typename Walk>
@@ -449,44 +429,34 @@ DestinationError Decode(std::string_view bytes, T& output,
                 *value.request, value.reference.attempt.owner, limits);
             if (error != DestinationError::kOk) return error;
         }
-        if (value.command == SsdControlCommand::kReadInto ||
-            value.command == SsdControlCommand::kRecoverReadInto) {
-            size_t index = 0;
-            for (const auto& object : value.request->objects)
-                for (const auto& range : object.ranges)
-                    for (const auto& d : range.destinations)
-                        if (index >= value.destinations.size() ||
-                            value.destinations[index++].length != d.length)
-                            return DestinationError::kInvalidArgument;
-            if (index != value.destinations.size())
-                return DestinationError::kInvalidArgument;
-        }
+        auto view_error = ValidateMessageInlineViews(value);
+        if (view_error != DestinationError::kOk) return view_error;
     }
     output = std::move(value);
     return DestinationError::kOk;
 }
 }  // namespace
+DestinationError ValidateSsdControlMessageWireSize(
+    const SsdControlMessage& message, SsdReadProtocolLimits limits) {
+    if (!message.request) return DestinationError::kInvalidArgument;
+    const auto error = ValidateSsdReadRequestV1(
+        *message.request, message.reference.attempt.owner, limits);
+    if (error != DestinationError::kOk) return error;
+    const auto view_error = ValidateMessageInlineViews(message);
+    if (view_error != DestinationError::kOk) return view_error;
+    IO measurer(IO::Mode::kMeasure);
+    Message(measurer, &message, nullptr, limits);
+    return measurer.error;
+}
 SsdControlEncoded EncodeSsdControlMessage(const SsdControlMessage& message,
                                           SsdReadProtocolLimits limits) {
-    if (message.request) {
-        const auto error = ValidateSsdReadRequestV1(
-            *message.request, message.reference.attempt.owner, limits);
-        if (error != DestinationError::kOk) return {error, {}};
-    }
-    if (message.command == SsdControlCommand::kReadInto ||
-        message.command == SsdControlCommand::kRecoverReadInto) {
-        if (!message.request) return {DestinationError::kInvalidArgument, {}};
-        size_t index = 0;
-        for (const auto& object : message.request->objects)
-            for (const auto& range : object.ranges)
-                for (const auto& d : range.destinations)
-                    if (index >= message.destinations.size() ||
-                        message.destinations[index++].length != d.length)
-                        return {DestinationError::kInvalidArgument, {}};
-        if (index != message.destinations.size())
-            return {DestinationError::kInvalidArgument, {}};
-    }
-    IO writer;
+    if (!message.request) return {DestinationError::kInvalidArgument, {}};
+    const auto error = ValidateSsdReadRequestV1(
+        *message.request, message.reference.attempt.owner, limits);
+    if (error != DestinationError::kOk) return {error, {}};
+    const auto view_error = ValidateMessageInlineViews(message);
+    if (view_error != DestinationError::kOk) return {view_error, {}};
+    IO writer(IO::Mode::kWrite);
     Message(writer, &message, nullptr, limits);
     return {writer.error, writer.error == DestinationError::kOk
                               ? std::move(writer.output)
@@ -494,7 +464,7 @@ SsdControlEncoded EncodeSsdControlMessage(const SsdControlMessage& message,
 }
 SsdControlEncoded EncodeSsdControlReply(const SsdControlReply& reply,
                                         SsdReadProtocolLimits limits) {
-    IO writer;
+    IO writer(IO::Mode::kWrite);
     Reply(writer, &reply, nullptr, limits);
     return {writer.error, writer.error == DestinationError::kOk
                               ? std::move(writer.output)

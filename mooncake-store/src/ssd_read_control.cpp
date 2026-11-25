@@ -3,6 +3,7 @@
 #include "ssd_read_control.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -31,10 +32,10 @@ bool ValidLimits(SsdControlLimits l) {
 bool SameCredential(WriteCredential a, WriteCredential b) {
     return ((a.high ^ b.high) | (a.low ^ b.low)) == 0;
 }
-// Conservative retained metadata credits, including terminal results and,
-// for grants, the registry's bounded 4096-byte endpoint in each cached view.
-// Does not claim to measure allocator or caller-held small handle overhead.
-bool Charge(const SsdReadRequestV1& request, bool grant, uint64_t cap,
+// Conservative retained metadata credits covering request structures,
+// terminal result summary, and resolved destination views.
+bool Charge(const SsdReadRequestV1& request,
+            const std::vector<ResolvedDestination>& destinations, uint64_t cap,
             uint64_t& bytes, uint64_t& payload) {
     bytes = 0;
     payload = 0;
@@ -52,12 +53,15 @@ bool Charge(const SsdReadRequestV1& request, bool grant, uint64_t cap,
             !add(object.ranges.size(), sizeof(SsdReadRangeV1)))
             return false;
         for (const auto& range : object.ranges) {
-            if (!add(range.destinations.size(),
-                     sizeof(RegisteredDestination) +
-                         (grant ? sizeof(ResolvedDestination) + 4096 : 0)))
+            if (!add(range.destinations.size(), sizeof(RegisteredDestination)))
                 return false;
             for (const auto& d : range.destinations) payload += d.length;
         }
+    }
+    for (const auto& view : destinations) {
+        if (!add(1, sizeof(ResolvedDestination)) ||
+            !add(view.transport_endpoint.size(), 1))
+            return false;
     }
     return true;
 }
@@ -80,7 +84,7 @@ struct SsdOwnerRequestLedger::Record {
     SsdReadResultV1 rejected;
     uint64_t metadata{0}, payload{0};
     bool forgotten{false};
-    std::string binding;
+    std::vector<ResolvedDestination> destinations;
     std::chrono::steady_clock::time_point deadline;
     std::chrono::steady_clock::time_point completed_at{};
 };
@@ -106,6 +110,25 @@ struct SsdOwnerRequestLedger::State {
         auto next = ranges.upper_bound(id);
         return next != ranges.begin() && std::prev(next)->second >= id;
     }
+    size_t PerSessionRangeCap() const {
+        if (limits.max_sessions <= 1) return limits.max_retired_ranges;
+        const size_t share = limits.max_retired_ranges /
+                             std::min<size_t>(limits.max_sessions, 4);
+        return std::max<size_t>(1, share);
+    }
+    bool CanRetire(const RetiredRanges& ranges, uint64_t id) const {
+        auto next = ranges.upper_bound(id);
+        auto previous = next == ranges.begin() ? ranges.end() : std::prev(next);
+        if (previous != ranges.end() && previous->second >= id) return true;
+        const bool left = previous != ranges.end() &&
+                          previous->second != UINT64_MAX &&
+                          previous->second + 1 == id;
+        const bool right =
+            next != ranges.end() && id != UINT64_MAX && next->first == id + 1;
+        if (left || right) return true;
+        return retired_range_count < limits.max_retired_ranges &&
+               ranges.size() < PerSessionRangeCap();
+    }
     bool Retire(RetiredRanges& ranges, uint64_t id) {
         auto next = ranges.upper_bound(id);
         auto previous = next == ranges.begin() ? ranges.end() : std::prev(next);
@@ -126,13 +149,38 @@ struct SsdOwnerRequestLedger::State {
             node.key() = id;
             ranges.insert(std::move(node));
         } else {
-            if (retired_range_count >= limits.max_retired_ranges) return false;
+            if (retired_range_count >= limits.max_retired_ranges ||
+                ranges.size() >= PerSessionRangeCap())
+                return false;
             ranges.emplace(id, id);
             ++retired_range_count;
         }
         return true;
     }
+    bool HasActiveOrTrackedRecordForPeer(
+        const decltype(PeerKey({}))& peer_key) const {
+        return std::any_of(
+            records.begin(), records.end(), [&](const auto& entry) {
+                return PeerKey(entry.second->reference.requester) == peer_key;
+            });
+    }
+    // When max_sessions is reached and a client restarts with a newer boot
+    // epoch, retire its dead earlier epoch once it has no tracked records.
+    bool TryEvictDeadSessionFor(PeerIdentity incoming) {
+        for (auto it = replay_floors.begin(); it != replay_floors.end(); ++it) {
+            if (std::get<0>(it->first) == incoming.client_id_high &&
+                std::get<1>(it->first) == incoming.client_id_low &&
+                std::get<2>(it->first) < incoming.boot_epoch &&
+                !HasActiveOrTrackedRecordForPeer(it->first)) {
+                retired_range_count -= it->second.size();
+                replay_floors.erase(it);
+                return true;
+            }
+        }
+        return false;
+    }
     mutable std::mutex mutex;
+    mutable std::condition_variable cv;
     PeerIdentity owner;
     SsdControlLimits limits;
     SsdReadProtocolLimits protocol;
@@ -140,6 +188,8 @@ struct SsdOwnerRequestLedger::State {
     std::map<decltype(GrantKey({})), std::shared_ptr<Record>> records;
     std::map<decltype(PeerKey({})), RetiredRanges> replay_floors;
     size_t retired_range_count{0};
+    size_t active_records{0};
+    size_t quarantined_records{0};
     uint64_t metadata{0}, active{0};
     bool closing{false};
 };
@@ -155,7 +205,7 @@ SsdOwnerRequestLedger::~SsdOwnerRequestLedger() { Close(); }
 SsdOwnerRequestLedger::Admission SsdOwnerRequestLedger::Admit(
     const SsdReadRequestV1& request, const SsdGrantReferenceV1& ref,
     std::chrono::steady_clock::time_point received_at,
-    std::string_view binding) {
+    const std::vector<ResolvedDestination>& destinations) {
     if (received_at < std::chrono::steady_clock::time_point{} ||
         received_at > std::chrono::steady_clock::now())
         return {DestinationError::kInvalidArgument, {}};
@@ -165,16 +215,13 @@ SsdOwnerRequestLedger::Admission SsdOwnerRequestLedger::Admit(
     error = Match(ref, request);
     if (error != DestinationError::kOk) return {error, {}};
     uint64_t metadata, payload;
-    if (!Charge(request, false, state_->limits.max_metadata_bytes, metadata,
-                payload))
+    if (!Charge(request, destinations, state_->limits.max_metadata_bytes,
+                metadata, payload))
         return {DestinationError::kLimit, {}};
-    if (binding.size() > state_->limits.max_metadata_bytes - metadata)
-        return {DestinationError::kLimit, {}};
-    metadata += binding.size();
     auto record = std::make_shared<Record>();
     record->request = request;
     record->reference = ref;
-    record->binding = binding;
+    record->destinations = destinations;
     record->metadata = metadata;
     record->payload = payload;
     record->rejected = {1, request.attempt, true, {}, request.requester};
@@ -186,7 +233,7 @@ SsdOwnerRequestLedger::Admission SsdOwnerRequestLedger::Admit(
     if (auto it = state_->records.find(GrantKey(ref));
         it != state_->records.end())
         return {it->second->request == request &&
-                        it->second->binding == binding &&
+                        it->second->destinations == destinations &&
                         SameCredential(ref.credential,
                                        it->second->reference.credential)
                     ? DestinationError::kDuplicate
@@ -197,36 +244,71 @@ SsdOwnerRequestLedger::Admission SsdOwnerRequestLedger::Admit(
         State::Retired(peer->second, ref.attempt.request_id))
         return {DestinationError::kStaleRequest, {}};
     // Terminal cache eviction is a metadata operation, never an I/O timeout.
-    // Retire only the completed ID so out-of-order requests retain admission.
+    // Retire only a completed ID when no sibling attempt for the same
+    // (requester, request_id) is still non-drained.
     while (state_->bounded_cache &&
            (state_->records.size() >= state_->limits.max_records ||
             metadata > state_->limits.max_metadata_bytes - state_->metadata)) {
         auto retired = state_->records.end();
         for (auto candidate = state_->records.begin();
              candidate != state_->records.end(); ++candidate) {
-            if (candidate->second->state == SsdOwnerRequestState::kDrained &&
-                (retired == state_->records.end() ||
-                 candidate->second->completed_at <
-                     retired->second->completed_at))
+            if (candidate->second->state != SsdOwnerRequestState::kDrained)
+                continue;
+            const auto& cand_ref = candidate->second->reference;
+            const bool sibling_active = std::any_of(
+                state_->records.begin(), state_->records.end(),
+                [&](const auto& other) {
+                    return other.second->reference.requester ==
+                               cand_ref.requester &&
+                           other.second->reference.attempt.request_id ==
+                               cand_ref.attempt.request_id &&
+                           other.second->state !=
+                               SsdOwnerRequestState::kDrained;
+                });
+            if (sibling_active) continue;
+            const auto floor_it =
+                state_->replay_floors.find(PeerKey(cand_ref.requester));
+            if (floor_it != state_->replay_floors.end() &&
+                !state_->CanRetire(floor_it->second,
+                                   cand_ref.attempt.request_id))
+                continue;
+            if (retired == state_->records.end() ||
+                candidate->second->completed_at <
+                    retired->second->completed_at) {
                 retired = candidate;
+            }
         }
         if (retired == state_->records.end()) break;
         auto& old = *retired->second;
         auto& floor =
             state_->replay_floors.at(PeerKey(old.reference.requester));
         if (!state_->Retire(floor, old.reference.attempt.request_id)) break;
-        state_->metadata -= old.metadata;
-        old.forgotten = true;
-        old.request = {};
-        old.result.reset();
-        old.binding.clear();
-        state_->records.erase(retired);
+        const auto evict_requester = old.reference.requester;
+        const uint64_t evict_request_id = old.reference.attempt.request_id;
+        for (auto it = state_->records.begin(); it != state_->records.end();) {
+            auto& r = *it->second;
+            if (r.reference.requester == evict_requester &&
+                r.reference.attempt.request_id == evict_request_id) {
+                state_->metadata -= r.metadata;
+                r.forgotten = true;
+                r.request = {};
+                r.result.reset();
+                r.destinations.clear();
+                it = state_->records.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
     // Eviction may have retired this exact ID since the first check.
     peer = state_->replay_floors.find(PeerKey(ref.requester));
     if (peer != state_->replay_floors.end() &&
         State::Retired(peer->second, ref.attempt.request_id))
         return {DestinationError::kStaleRequest, {}};
+    if (peer == state_->replay_floors.end() &&
+        state_->replay_floors.size() == state_->limits.max_sessions) {
+        (void)state_->TryEvictDeadSessionFor(ref.requester);
+    }
     if (state_->records.size() == state_->limits.max_records ||
         metadata > state_->limits.max_metadata_bytes - state_->metadata ||
         payload > state_->limits.max_active_payload_bytes - state_->active ||
@@ -252,6 +334,7 @@ SsdOwnerRequestLedger::Admission SsdOwnerRequestLedger::Admit(
             : now + std::chrono::milliseconds(request.relative_timeout_ms);
     state_->metadata += metadata;
     state_->active += payload;
+    ++state_->active_records;
     return {DestinationError::kOk, Operation(state_, record)};
 }
 SsdOwnerRequestSnapshot SsdOwnerRequestLedger::Query(
@@ -263,9 +346,40 @@ SsdOwnerRequestSnapshot SsdOwnerRequestLedger::Query(
                ? SsdOwnerRequestSnapshot{error, record->state, record->result}
                : SsdOwnerRequestSnapshot{error};
 }
+SsdOwnerRequestSnapshot SsdOwnerRequestLedger::WaitForTerminal(
+    const SsdGrantReferenceV1& ref,
+    std::chrono::steady_clock::time_point deadline) const {
+    std::unique_lock lock(state_->mutex);
+    auto is_ready = [&](std::shared_ptr<Record>& record,
+                        DestinationError& err) -> bool {
+        err = state_->Find(ref, record);
+        if (err != DestinationError::kOk) return true;
+        if (record->result ||
+            record->state == SsdOwnerRequestState::kQuarantined ||
+            record->state == SsdOwnerRequestState::kDrained ||
+            state_->closing) {
+            return true;
+        }
+        return false;
+    };
+    std::shared_ptr<Record> record;
+    DestinationError err = DestinationError::kNotFound;
+    while (!is_ready(record, err)) {
+        if (deadline == std::chrono::steady_clock::time_point::max()) {
+            state_->cv.wait(lock);
+        } else if (state_->cv.wait_until(lock, deadline) ==
+                   std::cv_status::timeout) {
+            is_ready(record, err);
+            break;
+        }
+    }
+    if (err != DestinationError::kOk) return SsdOwnerRequestSnapshot{err};
+    return SsdOwnerRequestSnapshot{DestinationError::kOk, record->state,
+                                   record->result};
+}
 SsdOwnerRequestSnapshot SsdOwnerRequestLedger::Recover(
     const SsdReadRequestV1& request, const SsdGrantReferenceV1& ref,
-    std::string_view binding) {
+    const std::vector<ResolvedDestination>& destinations) {
     auto error =
         ValidateSsdReadRequestV1(request, state_->owner, state_->protocol);
     if (error != DestinationError::kOk) return {error};
@@ -280,12 +394,17 @@ SsdOwnerRequestSnapshot SsdOwnerRequestLedger::Recover(
     std::shared_ptr<Record> record;
     error = state_->Find(ref, record);
     if (error == DestinationError::kOk) {
-        if (record->request != request || record->binding != binding)
+        if (record->request != request || record->destinations != destinations)
             return {DestinationError::kUnauthorized};
         return {DestinationError::kOk, record->state, record->result};
     }
     if (error != DestinationError::kNotFound) return {error};
     auto peer = state_->replay_floors.find(PeerKey(ref.requester));
+    if (peer == state_->replay_floors.end() &&
+        state_->replay_floors.size() == state_->limits.max_sessions) {
+        (void)state_->TryEvictDeadSessionFor(ref.requester);
+    }
+    peer = state_->replay_floors.find(PeerKey(ref.requester));
     if (peer == state_->replay_floors.end() &&
         state_->replay_floors.size() == state_->limits.max_sessions)
         return {DestinationError::kLimit};
@@ -301,43 +420,21 @@ SsdOwnerRequestSnapshot SsdOwnerRequestLedger::Recover(
     return {DestinationError::kOk, SsdOwnerRequestState::kDrained,
             std::move(cancelled)};
 }
-DestinationError SsdOwnerRequestLedger::Forget(const SsdGrantReferenceV1& ref) {
-    std::lock_guard lock(state_->mutex);
-    std::shared_ptr<Record> record;
-    const auto error = state_->Find(ref, record);
-    if (error != DestinationError::kOk) return error;
-    for (const auto& [key, r] : state_->records) {
-        (void)key;
-        if (r->reference.requester == ref.requester &&
-            r->reference.attempt.request_id == ref.attempt.request_id &&
-            r->state != SsdOwnerRequestState::kDrained)
-            return DestinationError::kBusy;
-    }
-    auto& floor = state_->replay_floors.at(PeerKey(ref.requester));
-    if (!state_->Retire(floor, ref.attempt.request_id))
-        return DestinationError::kLimit;
-    for (auto it = state_->records.begin(); it != state_->records.end();) {
-        auto& r = *it->second;
-        if (r.reference.requester == ref.requester &&
-            r.reference.attempt.request_id == ref.attempt.request_id) {
-            state_->metadata -= r.metadata;
-            r.forgotten = true;
-            r.request = {};
-            r.result.reset();
-            r.binding.clear();
-            it = state_->records.erase(it);
-        } else
-            ++it;
-    }
-    return DestinationError::kOk;
-}
 void SsdOwnerRequestLedger::Close() {
-    std::lock_guard lock(state_->mutex);
-    state_->closing = true;
+    {
+        std::lock_guard lock(state_->mutex);
+        state_->closing = true;
+    }
+    state_->cv.notify_all();
 }
 SsdControlStats SsdOwnerRequestLedger::stats() const {
     std::lock_guard lock(state_->mutex);
-    return {state_->records.size(), state_->metadata, state_->active};
+    return {state_->records.size(),
+            state_->metadata,
+            state_->active,
+            state_->active_records,
+            state_->quarantined_records,
+            state_->retired_range_count};
 }
 SsdOwnerRequestLedger::Operation::Operation(std::shared_ptr<State> state,
                                             std::shared_ptr<Record> record)
@@ -355,17 +452,27 @@ SsdOwnerRequestLedger::Operation& SsdOwnerRequestLedger::Operation::operator=(
 SsdOwnerRequestLedger::Operation::~Operation() { Abandon(); }
 void SsdOwnerRequestLedger::Operation::Abandon() noexcept {
     if (!state_ || !record_) return;
-    std::lock_guard lock(state_->mutex);
-    if (record_->forgotten || record_->state == SsdOwnerRequestState::kDrained)
-        return;
-    if (record_->state == SsdOwnerRequestState::kAdmitted) {
-        record_->result = std::move(record_->rejected);
-        record_->state = SsdOwnerRequestState::kDrained;
-        record_->completed_at = std::chrono::steady_clock::now();
-        state_->active -= record_->payload;
-    } else {
-        record_->state = SsdOwnerRequestState::kQuarantined;
+    bool notify = false;
+    {
+        std::lock_guard lock(state_->mutex);
+        if (record_->forgotten ||
+            record_->state == SsdOwnerRequestState::kDrained)
+            return;
+        if (record_->state == SsdOwnerRequestState::kAdmitted) {
+            record_->result = std::move(record_->rejected);
+            record_->rejected = {};
+            record_->state = SsdOwnerRequestState::kDrained;
+            record_->completed_at = std::chrono::steady_clock::now();
+            state_->active -= record_->payload;
+            --state_->active_records;
+            notify = true;
+        } else if (record_->state == SsdOwnerRequestState::kRunning) {
+            record_->state = SsdOwnerRequestState::kQuarantined;
+            ++state_->quarantined_records;
+            notify = true;
+        }
     }
+    if (notify) state_->cv.notify_all();
 }
 DestinationError SsdOwnerRequestLedger::Operation::Start() {
     if (!state_ || !record_) return DestinationError::kInvalidArgument;
@@ -374,34 +481,42 @@ DestinationError SsdOwnerRequestLedger::Operation::Start() {
     if (record_->state != SsdOwnerRequestState::kAdmitted)
         return DestinationError::kDuplicate;
     if (std::chrono::steady_clock::now() >= record_->deadline)
-        return DestinationError::kClosing;
+        return DestinationError::kTimedOut;
     record_->state = SsdOwnerRequestState::kRunning;
     return DestinationError::kOk;
 }
 DestinationError SsdOwnerRequestLedger::Operation::Complete(
     const SsdReadResultV1& result) {
     if (!state_ || !record_) return DestinationError::kInvalidArgument;
-    std::lock_guard lock(state_->mutex);
-    if (record_->forgotten) return DestinationError::kStaleRequest;
-    const auto error =
-        ValidateSsdReadResultV1(record_->request, result, state_->protocol);
-    if (error != DestinationError::kOk) return error;
-    if (record_->result)
-        return *record_->result == result ? DestinationError::kDuplicate
-                                          : DestinationError::kWrongAttempt;
-    if (record_->state == SsdOwnerRequestState::kAdmitted &&
-        std::any_of(result.objects.begin(), result.objects.end(),
-                    [](const auto& o) {
-                        return o.valid_bytes ||
-                               (o.outcome != AttemptOutcome::kRejected &&
-                                o.outcome != AttemptOutcome::kCancelled);
-                    }))
-        return DestinationError::kInvalidArgument;
-    auto copy = result;
-    record_->result = std::move(copy);
-    record_->state = SsdOwnerRequestState::kDrained;
-    record_->completed_at = std::chrono::steady_clock::now();
-    state_->active -= record_->payload;
+    {
+        std::lock_guard lock(state_->mutex);
+        if (record_->forgotten) return DestinationError::kStaleRequest;
+        const auto error =
+            ValidateSsdReadResultV1(record_->request, result, state_->protocol);
+        if (error != DestinationError::kOk) return error;
+        if (record_->result)
+            return *record_->result == result ? DestinationError::kDuplicate
+                                              : DestinationError::kWrongAttempt;
+        if (record_->state == SsdOwnerRequestState::kAdmitted &&
+            std::any_of(result.objects.begin(), result.objects.end(),
+                        [](const auto& o) {
+                            return o.valid_bytes ||
+                                   (o.outcome != AttemptOutcome::kRejected &&
+                                    o.outcome != AttemptOutcome::kCancelled);
+                        }))
+            return DestinationError::kInvalidArgument;
+        auto copy = result;
+        if (record_->state == SsdOwnerRequestState::kQuarantined) {
+            --state_->quarantined_records;
+        }
+        record_->result = std::move(copy);
+        record_->rejected = {};
+        record_->state = SsdOwnerRequestState::kDrained;
+        record_->completed_at = std::chrono::steady_clock::now();
+        state_->active -= record_->payload;
+        --state_->active_records;
+    }
+    state_->cv.notify_all();
     return DestinationError::kOk;
 }
 std::chrono::milliseconds SsdOwnerRequestLedger::Operation::RemainingTimeout()
