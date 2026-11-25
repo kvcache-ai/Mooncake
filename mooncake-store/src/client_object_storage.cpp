@@ -67,6 +67,8 @@ ErrorCode Client::WriteObjectStorageReplica(const Replica::Descriptor& replica,
         metrics_->transfer_metric.object_put_latency_us.observe(
             elapsed_us_since(start));
     if (error == ErrorCode::OK) {
+        if (metrics_)
+            metrics_->transfer_metric.total_write_bytes.inc(object.object_size);
         // Completion is normally persisted with PutEnd, avoiding another RPC
         // and log barrier. Retain only a notification in case PutEnd fails.
         std::lock_guard lock(object_storage_completions_mutex_);
@@ -95,9 +97,15 @@ ErrorCode Client::ReadObjectStorageReplica(const Replica::Descriptor& replica,
         [&](const Slice& slice) {
             return !runtime.FindDeviceForPointer(slice.ptr);
         });
-    if (metrics_)
+    if (metrics_) {
         metrics_->transfer_metric.object_get_latency_us.observe(
             elapsed_us_since(start));
+        if (result == ErrorCode::OK) {
+            uint64_t bytes_read = 0;
+            for (const auto& slice : slices) bytes_read += slice.size;
+            metrics_->transfer_metric.total_read_bytes.inc(bytes_read);
+        }
+    }
     return result;
 }
 void Client::ReportObjectStorageUpload(const std::string& name,
