@@ -15,6 +15,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <set>
 #include <unordered_set>
 #include <string>
 #include <thread>
@@ -124,6 +125,27 @@ class FailingReadBackend : public BucketStorageBackend {
    private:
     int read_errno_;
     DiskErrorObserver observer_;
+};
+
+// Records the keys of every bucket written.
+class RecordingBucketBackend : public BucketStorageBackend {
+   public:
+    using BucketStorageBackend::BucketStorageBackend;
+
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch,
+        std::function<ErrorCode(const std::vector<std::string>&,
+                                std::vector<StorageObjectMetadata>&)>
+            complete,
+        EvictionHandler eviction = nullptr) override {
+        std::set<std::string> keys;
+        for (const auto& [key, _] : batch) keys.insert(key);
+        buckets.push_back(std::move(keys));
+        return BucketStorageBackend::BatchOffload(batch, std::move(complete),
+                                                  std::move(eviction));
+    }
+
+    std::vector<std::set<std::string>> buckets;
 };
 
 class DelayedReadBackend : public BucketStorageBackend {
@@ -571,6 +593,122 @@ class FileStorageTest : public ::testing::Test {
             }
         }
         EXPECT_EQ(persisted_count, capacity_limit ? 2u : 0u);
+        allocator.deallocate(buffer, kValueSize);
+        EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+        EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
+    }
+
+    // --offload_ordered_buckets on the master and
+    // MOONCAKE_OFFLOAD_ORDERED_BUCKETS on the store: two heartbeats of six
+    // puts each, packed into four-key buckets.
+    void RunOrderedBucketsScenario(bool ordered) {
+        if (ordered) {
+            SetEnv("MOONCAKE_OFFLOAD_ORDERED_BUCKETS", "1");
+        } else {
+            UnsetEnv("MOONCAKE_OFFLOAD_ORDERED_BUCKETS");
+        }
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        UnsetEnv("MOONCAKE_OFFLOAD_ORDERED_BUCKETS");
+        EXPECT_EQ(config.ordered_buckets, ordered);
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_offload_ordered_buckets(ordered)
+                                     .set_default_kv_lease_ttl(0)
+                                     .set_root_fs_dir("")
+                                     .build()));
+
+        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+        std::unique_ptr<void, decltype(&std::free)> segment(
+            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+        ASSERT_NE(segment, nullptr);
+        SimpleAllocator allocator(kSegmentSize);
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                      std::nullopt, master.master_address());
+        ASSERT_TRUE(created);
+        auto client = created.value();
+        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+        ASSERT_TRUE(client->RegisterLocalMemory(
+            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+
+        config.storage_backend_type = StorageBackendType::kBucket;
+        config.storage_filepath = data_path + "/ordered_buckets";
+        config.local_buffer_size = 1024 * 1024;
+        fs::create_directories(config.storage_filepath);
+        FileStorage storage(config, client, endpoint);
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = 4;
+        bucket_config.flush_partial_buckets = false;
+        auto backend =
+            std::make_shared<RecordingBucketBackend>(config, bucket_config);
+        storage.storage_backend_ = backend;
+        storage.enable_offloading_ = true;
+        ASSERT_TRUE(backend->Init());
+
+        constexpr size_t kValueSize = 128;
+        void* buffer = allocator.allocate(kValueSize);
+        ASSERT_NE(buffer, nullptr);
+        std::memset(buffer, 'o', kValueSize);
+        std::vector<Slice> slices{{buffer, kValueSize}};
+        ReplicateConfig replicate;
+        replicate.replica_num = 1;
+        // Put order block_0, block_5, block_10, block_3, ...: neither name
+        // nor hash order.
+        auto key = [](size_t i) {
+            return "block_" + std::to_string(i * 5 % 12);
+        };
+        auto put_and_offload = [&](size_t begin, size_t end) {
+            for (size_t i = begin; i < end; ++i) {
+                ASSERT_TRUE(client->Put(key(i), slices, replicate));
+            }
+            std::vector<OffloadTaskItem> tasks;
+            ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
+            ASSERT_EQ(tasks.size(), end - begin);
+            if (ordered) {
+                for (size_t i = begin; i < end; ++i) {
+                    EXPECT_EQ(tasks[i - begin].key, key(i));
+                }
+            }
+            ASSERT_TRUE(storage.OffloadObjects(tasks));
+        };
+        // One bucket; the tail of two waits for the next heartbeat.
+        put_and_offload(0, 6);
+        EXPECT_EQ(backend->buckets.size(), 1u);
+        EXPECT_EQ(storage.deferred_task_by_storage_key_.size(), 2u);
+        // The tail and the first two new keys, then the next four.
+        put_and_offload(6, 12);
+        EXPECT_TRUE(storage.deferred_task_by_storage_key_.empty());
+
+        auto storage_key = [&](size_t i) {
+            return TenantId::Default().MakeScopedKey(key(i));
+        };
+        ASSERT_EQ(backend->buckets.size(), 3u);
+        std::set<std::string> written;
+        for (size_t b = 0; b < backend->buckets.size(); ++b) {
+            const auto& bucket = backend->buckets[b];
+            EXPECT_EQ(bucket.size(), 4u);
+            written.insert(bucket.begin(), bucket.end());
+            if (ordered) {
+                EXPECT_EQ(bucket,
+                          (std::set<std::string>{
+                              storage_key(4 * b), storage_key(4 * b + 1),
+                              storage_key(4 * b + 2), storage_key(4 * b + 3)}))
+                    << "bucket " << b;
+            }
+        }
+        EXPECT_EQ(written.size(), 12u);
+        for (size_t i = 0; i < 12; ++i) {
+            auto query = client->Query(key(i));
+            ASSERT_TRUE(query) << key(i);
+            EXPECT_TRUE(std::any_of(query->replicas.begin(),
+                                    query->replicas.end(),
+                                    [](const auto& replica) {
+                                        return replica.is_local_disk_replica();
+                                    }))
+                << key(i);
+        }
         allocator.deallocate(buffer, kValueSize);
         EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
         EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
@@ -1918,6 +2056,14 @@ TEST_F(FileStorageTest,
 
 TEST_F(FileStorageTest, EmptyHeartbeatFlushesDeferredTail) {
     RunDeferredHeartbeatTailScenario();
+}
+
+TEST_F(FileStorageTest, OrderedBucketsPackPutsInOrderAcrossHeartbeats) {
+    RunOrderedBucketsScenario(/*ordered=*/true);
+}
+
+TEST_F(FileStorageTest, UnorderedBucketsStillOffloadEveryPut) {
+    RunOrderedBucketsScenario(/*ordered=*/false);
 }
 
 TEST_F(FileStorageTest, OffloadObjects_capacity_limit_releases_deferred_tasks) {

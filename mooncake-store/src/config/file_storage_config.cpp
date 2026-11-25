@@ -165,6 +165,9 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_OFFLOAD_USE_URING, legacy_use_uring);
     config.use_uring = ParseStrictBoolOr(use_uring, false);
 
+    config.ordered_buckets = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_ORDERED_BUCKETS, config.ordered_buckets);
+
     return config;
 }
 

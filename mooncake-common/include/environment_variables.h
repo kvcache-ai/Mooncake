@@ -23,6 +23,8 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(uint32_t,
                       MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS);
     MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS);
+    // Pack offload tasks into buckets in the order the master delivered them.
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFLOAD_ORDERED_BUCKETS);
 
     // Keep legacy bool/ratio values as strings so their custom parsing and
     // silent invalid-value behavior remain unchanged.

@@ -15,6 +15,7 @@
 #include <new>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -2553,6 +2554,257 @@ TEST_F(StorageBackendTest, BucketStorageBackend_PartialFlushRespectsLimits) {
                   (std::vector<std::string>{"A", "B", "C", "D", "E"}));
         EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 0);
     }
+}
+
+// MOONCAKE_OFFLOAD_ORDERED_BUCKETS: with a key order, consecutive keys share a
+// bucket. Order entries that are not objects, and repeated entries, are
+// ignored; objects the order does not list follow it.
+TEST_F(StorageBackendTest, BucketStorageBackend_OrderedPackingFollowsKeyOrder) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 4;
+    bucket_config.bucket_size_limit = 1024 * 1024;
+    bucket_config.flush_partial_buckets = true;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    // Request order req7, req2, req9, ... is neither name nor hash order.
+    std::unordered_map<std::string, int64_t> objects;
+    std::vector<std::string> order;
+    for (int i = 0; i < 12; ++i) {
+        order.push_back("req" + std::to_string((i * 7 + 7) % 12));
+        objects.emplace(order.back(), 1000);
+    }
+    std::vector<std::string> key_order = order;
+    key_order.insert(key_order.begin() + 5, "not_an_object");
+    key_order.push_back(order[0]);
+    objects.emplace("unlisted", 1000);
+
+    std::vector<std::vector<std::string>> buckets;
+    std::vector<std::string> deferred;
+    ASSERT_TRUE(backend.AllocateOffloadingBuckets(objects, buckets, &deferred,
+                                                  &key_order));
+    EXPECT_TRUE(deferred.empty());
+    ASSERT_EQ(buckets.size(), 4u);
+    for (size_t b = 0; b < 3; ++b) {
+        EXPECT_EQ(buckets[b],
+                  std::vector<std::string>(order.begin() + 4 * b,
+                                           order.begin() + 4 * (b + 1)))
+            << "bucket " << b;
+    }
+    EXPECT_EQ(buckets[3], std::vector<std::string>{"unlisted"});
+}
+
+// The tail of one call is deferred and opens the next call's first bucket,
+// ahead of that call's keys, which keep their order.
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_OrderedPackingCarriesTailAcrossCalls) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 4;
+    bucket_config.bucket_size_limit = 1024 * 1024;
+    ASSERT_FALSE(bucket_config.flush_partial_buckets);
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    auto key = [](int i) { return "req" + std::to_string((i * 5) % 16); };
+    auto allocate = [&](int begin, int end,
+                        std::vector<std::vector<std::string>>& buckets,
+                        std::vector<std::string>& deferred) {
+        std::unordered_map<std::string, int64_t> objects;
+        std::vector<std::string> order;
+        for (int i = begin; i < end; ++i) {
+            objects.emplace(key(i), 1000);
+            order.push_back(key(i));
+        }
+        return backend.AllocateOffloadingBuckets(objects, buckets, &deferred,
+                                                 &order);
+    };
+
+    // First heartbeat: one full bucket, a deferred tail of two.
+    std::vector<std::vector<std::string>> buckets;
+    std::vector<std::string> deferred;
+    ASSERT_TRUE(allocate(0, 6, buckets, deferred));
+    ASSERT_EQ(buckets.size(), 1u);
+    EXPECT_EQ(buckets[0],
+              (std::vector<std::string>{key(0), key(1), key(2), key(3)}));
+    EXPECT_EQ(std::set<std::string>(deferred.begin(), deferred.end()),
+              (std::set<std::string>{key(4), key(5)}));
+    EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 2u);
+
+    // Second heartbeat: the tail and the first two new keys share a bucket.
+    buckets.clear();
+    deferred.clear();
+    ASSERT_TRUE(allocate(6, 14, buckets, deferred));
+    ASSERT_EQ(buckets.size(), 2u);
+    ASSERT_EQ(buckets[0].size(), 4u);
+    EXPECT_EQ(std::set<std::string>(buckets[0].begin(), buckets[0].begin() + 2),
+              (std::set<std::string>{key(4), key(5)}));
+    EXPECT_EQ(
+        std::vector<std::string>(buckets[0].begin() + 2, buckets[0].end()),
+        (std::vector<std::string>{key(6), key(7)}));
+    EXPECT_EQ(buckets[1],
+              (std::vector<std::string>{key(8), key(9), key(10), key(11)}));
+    EXPECT_EQ(std::set<std::string>(deferred.begin(), deferred.end()),
+              (std::set<std::string>{key(12), key(13)}));
+    EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 2u);
+}
+
+// A bucket closes when the next key in the order does not fit by size, or
+// once it is exactly full; that key opens the next bucket. An object over
+// bucket_size_limit is skipped without breaking the order.
+TEST_F(StorageBackendTest, BucketStorageBackend_OrderedPackingTruncatesBySize) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 8;
+    bucket_config.bucket_size_limit = 1000;
+    bucket_config.flush_partial_buckets = true;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    const std::vector<std::pair<std::string, int64_t>> queued{
+        {"q7", 400}, {"q2", 400}, {"q9", 300}, {"q0", 2000},
+        {"q5", 700}, {"q1", 200}, {"q8", 100},
+    };
+    std::unordered_map<std::string, int64_t> objects;
+    std::vector<std::string> order;
+    for (const auto& [key, size] : queued) {
+        objects.emplace(key, size);
+        order.push_back(key);
+    }
+
+    std::vector<std::vector<std::string>> buckets;
+    std::vector<std::string> deferred;
+    ASSERT_TRUE(
+        backend.AllocateOffloadingBuckets(objects, buckets, &deferred, &order));
+    EXPECT_EQ(buckets, (std::vector<std::vector<std::string>>{
+                           {"q7", "q2"}, {"q9", "q5"}, {"q1", "q8"}}));
+    EXPECT_TRUE(deferred.empty());
+}
+
+// Keys already persisted on this backend are skipped; the others keep their
+// order and fill the buckets.
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_OrderedPackingSkipsPersistedKeys) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 3;
+    bucket_config.bucket_size_limit = 1024 * 1024;
+    bucket_config.flush_partial_buckets = true;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    const std::string value(64, 'p');
+    std::unordered_map<std::string, std::vector<Slice>> persisted;
+    for (const char* key : {"p1", "p2"}) {
+        persisted.emplace(
+            key, std::vector<Slice>{
+                     Slice{const_cast<char*>(value.data()), value.size()}});
+    }
+    ASSERT_TRUE(backend.BatchOffload(
+        persisted,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    ASSERT_TRUE(backend.IsExist("p1").value_or(false));
+    ASSERT_TRUE(backend.IsExist("p2").value_or(false));
+
+    const std::vector<std::string> order{"n5", "p1", "n3", "n0",
+                                         "p2", "n4", "n1"};
+    std::unordered_map<std::string, int64_t> objects;
+    for (const auto& key : order) objects.emplace(key, 64);
+
+    std::vector<std::vector<std::string>> buckets;
+    std::vector<std::string> deferred;
+    ASSERT_TRUE(
+        backend.AllocateOffloadingBuckets(objects, buckets, &deferred, &order));
+    EXPECT_EQ(buckets, (std::vector<std::vector<std::string>>{
+                           {"n5", "n3", "n0"}, {"n4", "n1"}}));
+    EXPECT_TRUE(deferred.empty());
+}
+
+// A carried key that the next heartbeat delivers again (re-put while
+// deferred): FileStorage drops its pooled copy and passes it with the new
+// keys, but not the other carried keys. The carried keys open the first
+// bucket and the re-delivered key takes its new place in the order.
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_OrderedPackingRedrainedCarriedKey) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 4;
+    bucket_config.bucket_size_limit = 1024 * 1024;
+    ASSERT_FALSE(bucket_config.flush_partial_buckets);
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    auto key = [](int i) { return "req" + std::to_string((i * 7) % 16); };
+    std::vector<std::vector<std::string>> buckets;
+    std::vector<std::string> deferred;
+    {
+        std::unordered_map<std::string, int64_t> objects;
+        std::vector<std::string> order;
+        for (int i = 0; i < 6; ++i) {
+            objects.emplace(key(i), 1000);
+            order.push_back(key(i));
+        }
+        ASSERT_TRUE(backend.AllocateOffloadingBuckets(objects, buckets,
+                                                      &deferred, &order));
+    }
+    ASSERT_EQ(buckets.size(), 1u);
+    ASSERT_EQ(std::set<std::string>(deferred.begin(), deferred.end()),
+              (std::set<std::string>{key(4), key(5)}));
+
+    // Next heartbeat: key(5) comes again, between key(6) and key(7).
+    ASSERT_TRUE(backend.RemoveUngroupedOffloadingObject(key(5)));
+    const std::vector<std::string> order{key(6), key(5),  key(7), key(8),
+                                         key(9), key(10), key(11)};
+    std::unordered_map<std::string, int64_t> objects{{key(4), 1000}};
+    for (const auto& k : order) objects.emplace(k, 1000);
+    buckets.clear();
+    deferred.clear();
+    ASSERT_TRUE(
+        backend.AllocateOffloadingBuckets(objects, buckets, &deferred, &order));
+    EXPECT_EQ(buckets, (std::vector<std::vector<std::string>>{
+                           {key(4), key(6), key(5), key(7)},
+                           {key(8), key(9), key(10), key(11)}}));
+    EXPECT_TRUE(deferred.empty());
+    EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 0u);
+}
+
+// Knob off: without a key order the packing is unchanged, consecutive runs
+// of the map's iteration order.
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_UnorderedPackingKeepsHashOrder) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 4;
+    bucket_config.bucket_size_limit = 1024 * 1024;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    std::unordered_map<std::string, int64_t> objects;
+    for (int i = 0; i < 14; ++i) objects.emplace("req" + std::to_string(i), 1);
+    std::vector<std::string> iteration_order;
+    for (const auto& [key, _] : objects) iteration_order.push_back(key);
+
+    std::vector<std::vector<std::string>> buckets;
+    std::vector<std::string> deferred;
+    ASSERT_TRUE(backend.AllocateOffloadingBuckets(objects, buckets, &deferred));
+    ASSERT_EQ(buckets.size(), 3u);
+    for (size_t b = 0; b < 3; ++b) {
+        EXPECT_EQ(buckets[b], std::vector<std::string>(
+                                  iteration_order.begin() + 4 * b,
+                                  iteration_order.begin() + 4 * (b + 1)))
+            << "bucket " << b;
+    }
+    EXPECT_EQ(std::set<std::string>(deferred.begin(), deferred.end()),
+              std::set<std::string>(iteration_order.begin() + 12,
+                                    iteration_order.end()));
 }
 
 TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateKeyIdempotentSkip) {

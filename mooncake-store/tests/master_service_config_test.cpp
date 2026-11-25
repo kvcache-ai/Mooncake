@@ -311,6 +311,23 @@ TEST(MasterServiceConfigTest, EvictionWorkerThreadsPropagates) {
     EXPECT_EQ(8u, MasterServiceConfig(from_supervisor).eviction_worker_threads);
 }
 
+TEST(MasterServiceConfigTest, OffloadOrderedBucketsPropagates) {
+    EXPECT_FALSE(MasterConfig{}.offload_ordered_buckets);
+    EXPECT_FALSE(MasterServiceConfig{}.offload_ordered_buckets);
+
+    MasterConfig master_config{};
+    master_config.offload_ordered_buckets = true;
+    const WrappedMasterServiceConfig from_master(master_config, 1);
+    const MasterServiceSupervisorConfig supervisor_config(master_config);
+    const WrappedMasterServiceConfig from_supervisor(supervisor_config, 1);
+
+    EXPECT_TRUE(supervisor_config.offload_ordered_buckets);
+    EXPECT_TRUE(from_master.offload_ordered_buckets);
+    EXPECT_TRUE(from_supervisor.offload_ordered_buckets);
+    EXPECT_TRUE(MasterServiceConfig(from_master).offload_ordered_buckets);
+    EXPECT_TRUE(MasterServiceConfig(from_supervisor).offload_ordered_buckets);
+}
+
 TEST(MasterServiceConfigTest, OplogBatchMaxEntriesBuilderOverrideRespected) {
     auto config =
         MasterServiceConfig::builder().set_oplog_batch_max_entries(17).build();

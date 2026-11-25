@@ -125,6 +125,12 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     if (!config_.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
+    if (config_.ordered_buckets) {
+        LOG(INFO) << "MOONCAKE_OFFLOAD_ORDERED_BUCKETS: offload tasks are "
+                     "packed into buckets in delivery order (start the master "
+                     "with --offload_ordered_buckets=true too, so that "
+                     "delivery order is enqueue order)";
+    }
 
     if (config.pinned_restore_arena_size > 0) {
         if (config.use_uring) {
@@ -675,13 +681,23 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     }
     std::unordered_map<std::string, int64_t> storage_object_sizes;
     std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key;
+    // MOONCAKE_OFFLOAD_ORDERED_BUCKETS: this call's storage keys in delivery
+    // order. Keys carried from an earlier call are not listed; the backend's
+    // ungrouped pool opens the first bucket with them.
+    std::vector<std::string> storage_key_order;
     storage_object_sizes.reserve(offloading_objects.size());
     task_by_storage_key.reserve(offloading_objects.size());
+    if (config_.ordered_buckets) {
+        storage_key_order.reserve(offloading_objects.size());
+    }
     for (const auto& task : offloading_objects) {
         const auto storage_key =
             TenantId(task.tenant_id).MakeScopedKey(task.key);
         storage_object_sizes.emplace(storage_key, task.size);
         task_by_storage_key.emplace(storage_key, task);
+        if (config_.ordered_buckets) {
+            storage_key_order.push_back(storage_key);
+        }
     }
 
     auto bucket_backend =
@@ -719,7 +735,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     std::vector<std::string> deferred_keys;
     if (bucket_backend) {
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
-            storage_object_sizes, buckets_keys, &deferred_keys);
+            storage_object_sizes, buckets_keys, &deferred_keys,
+            config_.ordered_buckets ? &storage_key_order : nullptr);
         if (!allocate_res) {
             LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
                        << allocate_res.error();

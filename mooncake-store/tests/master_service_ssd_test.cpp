@@ -4,9 +4,11 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -40,9 +42,11 @@ class MasterServiceSSDTest : public ::testing::Test {
     }
 };
 
-std::unique_ptr<MasterService> CreateSsdAwareOffloadService() {
+std::unique_ptr<MasterService> CreateSsdAwareOffloadService(
+    bool offload_ordered_buckets = false) {
     MasterServiceConfig config;
     config.enable_offload = true;
+    config.offload_ordered_buckets = offload_ordered_buckets;
     config.default_kv_lease_ttl = 0;
     config.allocation_strategy_type =
         AllocationStrategyType::SSD_FREE_RATIO_FIRST;
@@ -569,6 +573,44 @@ TEST_F(MasterServiceSSDTest, PushOffloadingQueueReportsNoopAsFailure) {
     ASSERT_FALSE(r1.has_value())
         << "empty segment names must not report a silent success (issue #2997)";
     EXPECT_EQ(ErrorCode::UNABLE_OFFLOADING, r1.error());
+}
+
+// offload_ordered_buckets on the master: the heartbeat hands the store its
+// offload tasks in PutEnd order, so that keys put together can share a
+// bucket. Off, the same tasks come out in unspecified order.
+TEST_F(MasterServiceSSDTest, OrderedOffloadsReachTheStoreInPutOrder) {
+    for (const bool ordered : {true, false}) {
+        SCOPED_TRACE(ordered ? "ordered" : "unordered");
+        auto service = CreateSsdAwareOffloadService(ordered);
+        const UUID client_id = generate_uuid();
+        MountMemoryAndLocalDisk(*service, client_id, "ordered_offload_segment",
+                                0x330000000);
+
+        std::vector<std::string> put_order;
+        for (int i = 0; i < 64; ++i) {
+            put_order.push_back("prefix_block_" + std::to_string(i * 23 % 64));
+            ReplicateConfig config;
+            config.replica_num = 1;
+            ASSERT_TRUE(service
+                            ->PutStart(client_id, put_order.back(),
+                                       TenantId::Default(), 1024, config)
+                            .has_value());
+            ASSERT_TRUE(service
+                            ->PutEnd(client_id, put_order.back(),
+                                     TenantId::Default(), ReplicaType::MEMORY)
+                            .has_value());
+        }
+
+        auto tasks = service->OffloadObjectHeartbeat(client_id, true);
+        ASSERT_TRUE(tasks.has_value());
+        std::vector<std::string> delivered;
+        for (const auto& task : *tasks) delivered.push_back(task.key);
+        if (!ordered) {
+            std::sort(delivered.begin(), delivered.end());
+            std::sort(put_order.begin(), put_order.end());
+        }
+        EXPECT_EQ(delivered, put_order);
+    }
 }
 
 }  // namespace mooncake::test

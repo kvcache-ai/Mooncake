@@ -280,6 +280,11 @@ struct FileStorageConfig {
     double disk_eviction_high_watermark_ratio = 0.90;
     double disk_eviction_low_watermark_ratio = 0.80;
 
+    // MOONCAKE_OFFLOAD_ORDERED_BUCKETS: pack offload tasks into buckets in the
+    // order the master delivered them instead of hash order. The master needs
+    // --offload_ordered_buckets to deliver them in enqueue order.
+    bool ordered_buckets = false;
+
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 
@@ -962,12 +967,20 @@ class BucketStorageBackend : public StorageBackendInterface {
      * caller must keep their offload tasks alive across the deferral — a key
      * re-emitted from the pool arrives without a task otherwise
      * (neuralwatt: the silent deferred-tail loss, upstream #3006).
+     * @param key_order Optional (MOONCAKE_OFFLOAD_ORDERED_BUCKETS): keys of
+     * offloading_objects in the order to pack them, so that consecutive keys
+     * share a bucket. Entries that are not in offloading_objects are ignored;
+     * keys it does not list follow in hash order. Null packs in the hash
+     * order of offloading_objects. A deferred tail still opens the next
+     * call's first bucket, ahead of that call's keys. Only bucket membership
+     * follows the order; the layout inside a bucket file is unchanged.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> AllocateOffloadingBuckets(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
         std::vector<std::vector<std::string>>& buckets_keys,
-        std::vector<std::string>* deferred_keys = nullptr);
+        std::vector<std::string>* deferred_keys = nullptr,
+        const std::vector<std::string>* key_order = nullptr);
 
     void ClearUngroupedOffloadingObjects();
 
@@ -1081,7 +1094,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
         std::vector<std::vector<std::string>>& buckets_keys,
-        std::vector<std::string>* deferred_keys = nullptr);
+        std::vector<std::string>* deferred_keys = nullptr,
+        const std::vector<std::string>* key_order = nullptr);
 
     tl::expected<void, ErrorCode> HandleNext(
         const std::function<

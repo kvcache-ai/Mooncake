@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "local_ssd/manager.h"
 
@@ -116,6 +119,134 @@ TEST(LocalSsdTaskMailboxTest, TakePromotionsKeepsGlobalRecencyAcrossTicks) {
     EXPECT_EQ(rest[0], Promotion("t", "k4", 1));
     EXPECT_EQ(rest[1], Promotion("t", "k3", 1));
     EXPECT_EQ(rest[2], Promotion("t", "k1", 1));
+}
+
+std::vector<std::string> Keys(const std::vector<OffloadTaskItem>& tasks) {
+    std::vector<std::string> keys;
+    keys.reserve(tasks.size());
+    for (const auto& task : tasks) keys.push_back(task.key);
+    return keys;
+}
+
+// offload_ordered_buckets: offload tasks come out in enqueue order, so the
+// keys of one put stay adjacent and the store packs them into one bucket.
+TEST(LocalSsdTaskMailboxTest, OrderedOffloadsAreDeliveredInEnqueueOrder) {
+    LocalSsdTaskMailbox mailbox(true, /*ordered_offloads=*/true);
+    // Neither name order nor insertion into a hash map matches this order.
+    std::vector<std::string> enqueued;
+    for (int i = 0; i < 50; ++i) {
+        enqueued.push_back("k" + std::to_string((i * 37) % 50));
+        ASSERT_TRUE(mailbox.EnqueueOffload(Offload("t", enqueued.back(), i),
+                                           1000) == ErrorCode::OK);
+    }
+    // A removed key is skipped, a key removed and enqueued again goes last,
+    // and a duplicate enqueue is still rejected.
+    ASSERT_TRUE(mailbox.RemoveOffload(TenantId("t"), enqueued[3]));
+    ASSERT_TRUE(mailbox.RemoveOffload(TenantId("t"), enqueued[10]));
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("t", enqueued[10], 10), 1000) ==
+                ErrorCode::OK);
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("t", enqueued[5], 5), 1000) ==
+                ErrorCode::OBJECT_ALREADY_EXISTS);
+
+    std::vector<OffloadTaskItem> expected;
+    for (int i = 0; i < 50; ++i) {
+        if (i == 3 || i == 10) continue;
+        expected.push_back(Offload("t", enqueued[i], i));
+    }
+    expected.push_back(Offload("t", enqueued[10], 10));
+    EXPECT_EQ(mailbox.SetOffloadingAndTakePending(true), expected);
+    EXPECT_TRUE(mailbox.SetOffloadingAndTakePending(true).empty());
+
+    // The next take starts a fresh order, across tenants too.
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("t2", "z", 1), 1000) ==
+                ErrorCode::OK);
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("t", "a", 2), 1000) ==
+                ErrorCode::OK);
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("t2", "a", 3), 1000) ==
+                ErrorCode::OK);
+    EXPECT_EQ(mailbox.SetOffloadingAndTakePending(false),
+              (std::vector<OffloadTaskItem>{Offload("t2", "z", 1),
+                                            Offload("t", "a", 2),
+                                            Offload("t2", "a", 3)}));
+}
+
+// Enqueue/remove churn between two takes compacts the order list without
+// losing, duplicating or reordering queued tasks.
+TEST(LocalSsdTaskMailboxTest, OrderedOffloadsSurviveChurnCompaction) {
+    constexpr size_t kLimit = 8;
+    LocalSsdTaskMailbox mailbox(true, /*ordered_offloads=*/true);
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("t", "first", 0), kLimit) ==
+                ErrorCode::OK);
+    ASSERT_TRUE(mailbox.EnqueueOffload(Offload("t", "moved", 0), kLimit) ==
+                ErrorCode::OK);
+    for (int round = 0; round < 200; ++round) {
+        const std::string key = "churn" + std::to_string(round);
+        ASSERT_TRUE(mailbox.EnqueueOffload(Offload("t", key, 1), kLimit) ==
+                    ErrorCode::OK);
+        ASSERT_TRUE(mailbox.RemoveOffload(TenantId("t"), key));
+        // "moved" is removed and enqueued again in every round, leaving one
+        // stale entry each time.
+        ASSERT_TRUE(mailbox.RemoveOffload(TenantId("t"), "moved"));
+        ASSERT_TRUE(mailbox.EnqueueOffload(Offload("t", "moved", round),
+                                           kLimit) == ErrorCode::OK);
+    }
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE(mailbox.EnqueueOffload(
+                        Offload("t", "live" + std::to_string(i), i), kLimit) ==
+                    ErrorCode::OK);
+    }
+    EXPECT_EQ(mailbox.SetOffloadingAndTakePending(true),
+              (std::vector<OffloadTaskItem>{
+                  Offload("t", "first", 0), Offload("t", "moved", 199),
+                  Offload("t", "live0", 0), Offload("t", "live1", 1),
+                  Offload("t", "live2", 2), Offload("t", "live3", 3),
+                  Offload("t", "live4", 4)}));
+    EXPECT_TRUE(mailbox.SetOffloadingAndTakePending(true).empty());
+}
+
+// Knob off (the default): the same tasks as before, in unspecified order.
+TEST(LocalSsdTaskMailboxTest, UnorderedOffloadsDeliverTheSameSet) {
+    LocalSsdTaskMailbox mailbox(true);
+    std::vector<std::string> enqueued;
+    for (int i = 0; i < 20; ++i) {
+        enqueued.push_back("k" + std::to_string(i));
+        ASSERT_TRUE(mailbox.EnqueueOffload(Offload("t", enqueued.back(), i),
+                                           1000) == ErrorCode::OK);
+    }
+    ASSERT_TRUE(mailbox.RemoveOffload(TenantId("t"), "k7"));
+    enqueued.erase(enqueued.begin() + 7);
+    auto keys = Keys(mailbox.SetOffloadingAndTakePending(true));
+    std::sort(keys.begin(), keys.end());
+    std::sort(enqueued.begin(), enqueued.end());
+    EXPECT_EQ(keys, enqueued);
+    EXPECT_TRUE(mailbox.SetOffloadingAndTakePending(true).empty());
+}
+
+// The manager hands the setting to every client's mailbox, and a cancelled
+// mirror leaves no gap in the order.
+TEST(LocalSsdManagerTest, OrderedOffloadsApplyToEveryClient) {
+    LocalSsdManager manager(/*ordered_offloads=*/true);
+    EXPECT_TRUE(manager.ordered_offloads());
+    EXPECT_FALSE(LocalSsdManager().ordered_offloads());
+    const UUID client_a{1, 2};
+    const UUID client_b{3, 4};
+    ASSERT_TRUE(manager.RegisterClient(client_a, true) == ErrorCode::OK);
+    ASSERT_TRUE(manager.RegisterClient(client_b, true) == ErrorCode::OK);
+    const std::vector<std::string> order{"m", "c", "x", "a", "q", "b"};
+    for (const auto& key : order) {
+        ASSERT_TRUE(manager.EnqueueOffload(client_a, Offload("t", key, 1),
+                                           100) == ErrorCode::OK);
+        ASSERT_TRUE(manager.EnqueueOffload(client_b, Offload("t", key, 2),
+                                           100) == ErrorCode::OK);
+    }
+    ASSERT_TRUE(manager.CancelOffloadsIfAllPending({client_a, client_b},
+                                                   TenantId("t"), "x"));
+    const std::vector<std::string> expected{"m", "c", "a", "q", "b"};
+    for (const auto& client : {client_a, client_b}) {
+        auto tasks = manager.SetOffloadingAndTakePending(client, true);
+        ASSERT_TRUE(tasks.has_value());
+        EXPECT_EQ(Keys(*tasks), expected);
+    }
 }
 
 TEST(LocalSsdManagerTest, TouchPromotionIsClientScoped) {
