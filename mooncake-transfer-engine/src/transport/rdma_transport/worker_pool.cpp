@@ -1392,11 +1392,6 @@ void WorkerPool::performPostSend(int thread_id) {
             }
         } else {
 #endif
-            auto auto_gid_token = endpoint->autoGidCompletionToken();
-            for (auto *slice : entry.second) {
-                slice->rdma.endpoint = endpoint.get();
-                slice->rdma.auto_gid_token = auto_gid_token;
-            }
             endpoint->submitPostSend(entry.second, failed_slice_list);
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
         }

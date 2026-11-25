@@ -260,6 +260,8 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // retry loops and log flooding when ibv_destroy_qp fails permanently.
     static constexpr int kFinishDestroyMaxRetries = 3;
 
+    Transport::Slice::RdmaCompletionToken autoGidCompletionTokenLocked() const;
+
     RdmaContext &context_;
     const uint64_t endpoint_id_;
     std::atomic<Status> status_;
@@ -267,6 +269,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     mutable RWSpinlock lock_;
     std::vector<ibv_qp *> qp_list_;
     uint64_t qp_generation_;
+    uint64_t connected_submit_count_ = 0;
     // Protected by its own mutex so send-slot waits never hold lock_.
     struct NotifyState {
         int fail(int code, bool reconnect = false) {

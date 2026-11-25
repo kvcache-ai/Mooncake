@@ -279,6 +279,11 @@ class RdmaEndPointTestPeer {
         RWSpinlock::WriteGuard guard(endpoint.lock_);
         return endpoint.reconstruct();
     }
+
+    static uint64_t connectedSubmitCount(RdmaEndPoint &endpoint) {
+        RWSpinlock::ReadGuard guard(endpoint.lock_);
+        return endpoint.connected_submit_count_;
+    }
 };
 
 }  // namespace mooncake
@@ -973,10 +978,11 @@ TEST_F(PendingHandshakeTest, CompletedSetupSurvivesOtherRnicCooldown) {
     wait(1);
     post(1);
     EXPECT_EQ(slices[1].status, Transport::Slice::FAILED);
+    const auto submits = RdmaEndPointTestPeer::connectedSubmitCount(*endpoint);
     post(0);
     EXPECT_EQ(slices[0].status, Transport::Slice::PENDING);
-    EXPECT_EQ(slices[0].rdma.endpoint,
-              endpoint.get());  // Reached posting on zero QPs.
+    EXPECT_GT(RdmaEndPointTestPeer::connectedSubmitCount(*endpoint),
+              submits);  // Reached posting on zero QPs.
 }
 
 TEST_F(PendingHandshakeTest, ExpiredSetupDoesNotUseReleasedAdmission) {
@@ -1003,9 +1009,10 @@ TEST_F(PendingHandshakeTest, PassiveConnectionBypassesPendingAdmission) {
     auto endpoint = peers[1].context->findEndpoint(paths[1]);
     RdmaEndPointTestPeer::setStatus(*endpoint, RdmaEndPoint::CONNECTED);
     expire(1);
+    const auto submits = RdmaEndPointTestPeer::connectedSubmitCount(*endpoint);
     post(1);
     EXPECT_EQ(slices[1].status, Transport::Slice::PENDING);
-    EXPECT_EQ(slices[1].rdma.endpoint, endpoint.get());
+    EXPECT_GT(RdmaEndPointTestPeer::connectedSubmitCount(*endpoint), submits);
     release();
     wait(0);
     EXPECT_EQ(barrier->arrivals, 1);
@@ -1027,9 +1034,11 @@ TEST_F(PendingHandshakeTest, InFlightDeadlinePreservesPassiveAndNewSlices) {
     EXPECT_EQ(slices[0].status, Transport::Slice::PENDING);
     EXPECT_EQ(fresh.status, Transport::Slice::PENDING);
     result.set_value(0);
+    const auto submits = RdmaEndPointTestPeer::connectedSubmitCount(*endpoint);
     post(0);
-    EXPECT_EQ(slices[0].rdma.endpoint, endpoint.get());
-    EXPECT_EQ(fresh.rdma.endpoint, endpoint.get());
+    EXPECT_GT(RdmaEndPointTestPeer::connectedSubmitCount(*endpoint), submits);
+    EXPECT_EQ(slices[0].status, Transport::Slice::PENDING);
+    EXPECT_EQ(fresh.status, Transport::Slice::PENDING);
 }
 
 TEST_F(PendingHandshakeTest, NewSlicesDoNotInheritExpiredAdmission) {
@@ -1226,15 +1235,21 @@ class MetadataRetryTest : public PendingHandshakeTest {
         Transport::Slice healthy{};
         Transport::TransferTask healthy_task;
         queueHandshakeSlice(peers[0], healthy_path, healthy, healthy_task);
+        const auto healthy_submits =
+            RdmaEndPointTestPeer::connectedSubmitCount(*healthy_ep);
         post(0);
-        EXPECT_EQ(healthy.rdma.endpoint, healthy_ep.get());
+        EXPECT_GT(RdmaEndPointTestPeer::connectedSubmitCount(*healthy_ep),
+                  healthy_submits);
         EXPECT_EQ(slices[0].rdma.dest_rkey, 111u);
         EXPECT_EQ(slices[0].rdma.retry_cnt, 1);
         EXPECT_EQ(storage->reads, 1);
+        auto endpoint = peers[0].context->findEndpoint(paths[0]);
+        const auto submits =
+            RdmaEndPointTestPeer::connectedSubmitCount(*endpoint);
         finishRefresh();
         EXPECT_EQ(slices[0].rdma.dest_rkey, 222u);
-        EXPECT_EQ(slices[0].rdma.endpoint,
-                  peers[0].context->findEndpoint(paths[0]).get());
+        EXPECT_GT(RdmaEndPointTestPeer::connectedSubmitCount(*endpoint),
+                  submits);
         EXPECT_EQ(slices[0].status, Transport::Slice::PENDING);
         EXPECT_EQ(slices[0].rdma.retry_cnt, 1);
         EXPECT_EQ(WorkerPoolTestPeer::pendingRetries(*peers[0].worker_pool),

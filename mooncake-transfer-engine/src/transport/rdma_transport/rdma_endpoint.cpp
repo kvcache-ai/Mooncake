@@ -388,6 +388,11 @@ std::string RdmaEndPoint::peerNicPath() const {
 Transport::Slice::RdmaCompletionToken RdmaEndPoint::autoGidCompletionToken()
     const {
     RWSpinlock::ReadGuard guard(lock_);
+    return autoGidCompletionTokenLocked();
+}
+
+Transport::Slice::RdmaCompletionToken
+RdmaEndPoint::autoGidCompletionTokenLocked() const {
     if (!connected_auto_gid_ || !connected_auto_gid_->recovery_enabled) {
         return {0, 0, false, false};
     }
@@ -1348,6 +1353,7 @@ int RdmaEndPoint::submitPostSend(
 #endif
         return 0;
     }
+    ++connected_submit_count_;
 
     const size_t num_qp = qp_list_.size();
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
@@ -1370,6 +1376,7 @@ int RdmaEndPoint::submitPostSend(
         std::min({(size_t)max_wr_depth_, (size_t)cq_remaining, requested});
     std::vector<ibv_send_wr> wr_list(max_postable_per_qp, ibv_send_wr{});
     std::vector<ibv_sge> sge_list(max_postable_per_qp);
+    const auto auto_gid_token = autoGidCompletionTokenLocked();
     size_t total_posted = 0;
     size_t cursor = 0;
 
@@ -1417,6 +1424,8 @@ int RdmaEndPoint::submitPostSend(
             wr.wr.rdma.rkey = slice->rdma.dest_rkey;
             slice->ts = post_ts;
             slice->status = Transport::Slice::POSTED;
+            slice->rdma.endpoint = this;
+            slice->rdma.auto_gid_token = auto_gid_token;
             slice->rdma.qp_depth = &wr_depth_list_[qp_index];
             slice->rdma.qp_index = static_cast<int>(qp_index);
         }
