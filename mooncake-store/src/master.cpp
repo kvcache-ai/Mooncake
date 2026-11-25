@@ -307,6 +307,10 @@ DEFINE_uint64(offload_on_evict_stall_ms, 30000,
               "ended (landed, failed or been cancelled) for this long is "
               "stalled: it gets no new copies and its copies count as used "
               "memory. Keep it at least 3x the stores' heartbeat interval");
+DEFINE_uint64(offload_on_evict_backoff_ms, 200,
+              "Async offload-on-evict: how long an eviction round that queued "
+              "and freed nothing holds back the next one, unless a copy ends "
+              "sooner");
 DEFINE_bool(promotion_on_hit, false,
             "Promote LOCAL_DISK-only keys to MEMORY on read access (mirror of "
             "offload_on_evict)");
@@ -656,6 +660,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("offload_on_evict_stall_ms",
                              &master_config.offload_on_evict_stall_ms,
                              FLAGS_offload_on_evict_stall_ms);
+    default_config.GetUInt64("offload_on_evict_backoff_ms",
+                             &master_config.offload_on_evict_backoff_ms,
+                             FLAGS_offload_on_evict_backoff_ms);
     default_config.GetBool("promotion_on_hit", &master_config.promotion_on_hit,
                            FLAGS_promotion_on_hit);
     default_config.GetUInt32("promotion_admission_threshold",
@@ -1037,6 +1044,12 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.offload_on_evict_stall_ms =
             FLAGS_offload_on_evict_stall_ms;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_on_evict_backoff_ms", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_on_evict_backoff_ms =
+            FLAGS_offload_on_evict_backoff_ms;
     }
     if ((google::GetCommandLineFlagInfo("promotion_on_hit", &info) &&
          !info.is_default) ||
@@ -1752,6 +1765,8 @@ int main(int argc, char* argv[]) {
         << ", offload_on_evict_async=" << master_config.offload_on_evict_async
         << ", offload_on_evict_stall_ms="
         << master_config.offload_on_evict_stall_ms
+        << ", offload_on_evict_backoff_ms="
+        << master_config.offload_on_evict_backoff_ms
         << ", ha_backend_type=" << master_config.ha_backend_type
         << ", ha_backend_connstring=" << ha_backend_connstring_for_log
         << ", ha_leader_lease_ttl_sec=" << master_config.ha_leader_lease_ttl_sec

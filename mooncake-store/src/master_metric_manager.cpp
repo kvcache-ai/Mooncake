@@ -511,6 +511,24 @@ MasterMetricManager::MasterMetricManager()
           "Eviction offload pushes refused because the owner had "
           "offloading_queue_limit x offload_cap_ratio offloads in flight, "
           "or had stalled (--offload_on_evict_async)"),
+      offload_evict_freed_total_(
+          "master_offload_evict_freed_total",
+          "Objects whose memory was freed as their eviction offload landed "
+          "(--offload_on_evict_async)"),
+      offload_evict_freed_bytes_total_(
+          "master_offload_evict_freed_bytes_total",
+          "Memory freed as eviction offloads landed "
+          "(--offload_on_evict_async)"),
+      offload_evict_kept_total_(
+          "master_offload_evict_kept_total",
+          "Landed eviction offloads whose memory stayed, by reason "
+          "(--offload_on_evict_async)",
+          {"reason"}),
+      offload_evict_round_skipped_total_(
+          "master_offload_evict_round_skipped_total",
+          "Eviction ticks over the watermark that held a round back, by "
+          "reason (--offload_on_evict_async)",
+          {"reason"}),
 
       // Initialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd,
       // MoveRevoke Counters
@@ -1613,6 +1631,37 @@ int64_t MasterMetricManager::get_offload_evict_no_room() {
     return offload_evict_no_room_total_.value();
 }
 
+void MasterMetricManager::inc_offload_evict_freed(int64_t bytes) {
+    offload_evict_freed_total_.inc();
+    offload_evict_freed_bytes_total_.inc(bytes);
+}
+
+int64_t MasterMetricManager::get_offload_evict_freed() {
+    return offload_evict_freed_total_.value();
+}
+
+int64_t MasterMetricManager::get_offload_evict_freed_bytes() {
+    return offload_evict_freed_bytes_total_.value();
+}
+
+void MasterMetricManager::inc_offload_evict_kept(const std::string& reason) {
+    offload_evict_kept_total_.inc({reason});
+}
+
+int64_t MasterMetricManager::get_offload_evict_kept(const std::string& reason) {
+    return offload_evict_kept_total_.value({reason});
+}
+
+void MasterMetricManager::inc_offload_evict_round_skipped(
+    const std::string& reason) {
+    offload_evict_round_skipped_total_.inc({reason});
+}
+
+int64_t MasterMetricManager::get_offload_evict_round_skipped(
+    const std::string& reason) {
+    return offload_evict_round_skipped_total_.value({reason});
+}
+
 int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
 }
@@ -2484,6 +2533,10 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(offload_evict_pending_objects_);
     serialize_metric(offload_evict_stalled_bytes_);
     serialize_metric(offload_evict_no_room_total_);
+    serialize_metric(offload_evict_freed_total_);
+    serialize_metric(offload_evict_freed_bytes_total_);
+    serialize_metric(offload_evict_kept_total_);
+    serialize_metric(offload_evict_round_skipped_total_);
     serialize_metric(weight_revisions_by_availability_);
     serialize_metric(weight_revisions_by_residency_);
     serialize_metric(weight_active_leases_);

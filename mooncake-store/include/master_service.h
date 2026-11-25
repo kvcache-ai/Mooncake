@@ -1170,7 +1170,14 @@ class MasterService {
     // `evict_ratio_lowerbound`. It consumes the allocation-pressure signal and
     // raises it again when the round could free nothing that was there to
     // free.
-    void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    // Returns whether the round released or queued anything. Async
+    // offload-on-evict: `watermark_pressure` (usage past the trigger's
+    // force_evict line) lets force_evict drop what it cannot queue, as an
+    // allocation failure does; `queue_offloads` false (while waiting for
+    // landings) frees only what is already on disk.
+    bool BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound,
+                    bool watermark_pressure = false,
+                    bool queue_offloads = true);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
     using NamespaceEvictionResult = StoreControl::EvictionResult;
@@ -1570,6 +1577,21 @@ class MasterService {
     void EvictionThreadFunc();
     // Async offload-on-evict: the ledger's totals to its gauges.
     void PublishOffloadLedgerGauges();
+    // Async offload-on-evict's pool-wide round, which the eviction thread
+    // runs in place of the watermark check: judged on usage less the memory
+    // whose copy is in flight to an owner that is making progress, held back
+    // while no owner has room, or for offload_async_backoff_ after a round
+    // that got nothing done. While the live copies in flight cover a failed
+    // allocation and keep landing, the round only frees what is already on
+    // disk (kWaitForLandings).
+    enum class AsyncEvictionTick : uint8_t {
+        kIdle,
+        kRan,
+        kNoRoom,
+        kWaitForLandings,
+        kBackoff,
+    };
+    AsyncEvictionTick RunAsyncOffloadEvictionTick();
     // Async offload-on-evict: whether `owner` may be handed another copy
     // (fewer than offload_owner_room_ in flight and not stalled), and
     // whether any owner whose store accepts offloads may.
@@ -1577,6 +1599,14 @@ class MasterService {
     bool OffloadOwnerHasRoom(const UUID& owner) const;
     // Async: what eviction has queued for offload and not yet seen end.
     const eviction::OffloadLedger& offload_ledger() const;
+    // Async: frees the memory of the object `accessor` holds, whose offload
+    // eviction queued has just landed, unless it was read, pinned or taken
+    // meanwhile. Returns the replicas taken, to be freed once the key is let
+    // go.
+    std::vector<Replica> FreeLandedOffloadSource(MetadataAccessorRW& accessor);
+    // Async: ends the offloads queued to `owner`, whose disk tier is gone, so
+    // their sources and the owner's room are not held until the reaper.
+    void EndOffloadsQueuedTo(const UUID& owner);
     void NofHeartbeatThreadFunc();
     bool TryUnmountNoFSegmentByHeartbeat(
         const MountedNoFSegmentSnapshot& snapshot,
@@ -1800,6 +1830,11 @@ class MasterService {
         // Get metadata (only call when IsPublished() is true)
         ObjectMetadata& Get() { return guard_->metadata(); }
 
+        // The held key's guard and namespace, for eviction's index and
+        // reclaimers (only call when IsPublished() is true).
+        const route::WriteGuard& Guard() const { return *guard_; }
+        metadata::Namespace& Ns() const { return *ns_; }
+
         // The tasks in flight for the object (only call when IsPublished()
         // is true)
         route::ObjectState& GetState() { return guard_->state(); }
@@ -1994,8 +2029,27 @@ class MasterService {
     // freed.
     std::chrono::milliseconds offload_stall_window_{30'000};
     // offload_force_evict, async only: drop what cannot be queued, and only
-    // under pressure.
+    // under pressure: after a failed allocation, or with usage above
+    // (1 + eviction_high_watermark_ratio) / 2.
     bool offload_force_evict_{false};
+    // offload_on_evict_backoff_ms: how long a round that made no progress
+    // holds the next one back, unless an offload ends meanwhile.
+    std::chrono::milliseconds offload_async_backoff_{200};
+    // A key whose offload failed is passed over this long by eviction.
+    static constexpr std::chrono::seconds kOffloadNackBackoff{10};
+    // The last async round, for the backoff; eviction thread only.
+    bool async_last_round_progressed_{true};
+    std::chrono::steady_clock::time_point async_last_round_end_{};
+    uint64_t async_last_round_release_seq_{0};
+    // How recently a store must have landed a copy for a failed allocation
+    // to wait on its copies in flight: max(5 x backoff, 1 s), and never
+    // longer than the stall window.
+    std::chrono::steady_clock::duration MaxLandingWait() const {
+        return std::min<std::chrono::steady_clock::duration>(
+            std::max<std::chrono::steady_clock::duration>(
+                5 * offload_async_backoff_, std::chrono::seconds(1)),
+            offload_stall_window_);
+    }
 
     // Promotion-on-hit: opt-in flag enabling LOCAL_DISK -> MEMORY promotion
     // when a Get observes a key with only LOCAL_DISK replicas.

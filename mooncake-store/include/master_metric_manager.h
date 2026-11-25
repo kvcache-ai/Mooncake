@@ -403,6 +403,18 @@ class MasterMetricManager {
     // stalled.
     void inc_offload_evict_no_room(int64_t val = 1);
     int64_t get_offload_evict_no_room();
+    // Memory freed as an eviction offload landed.
+    void inc_offload_evict_freed(int64_t bytes);
+    int64_t get_offload_evict_freed();
+    int64_t get_offload_evict_freed_bytes();
+    // Landed offloads whose memory stayed: read_again (a lease was granted
+    // since eviction queued it), pinned or busy (another task holds it).
+    void inc_offload_evict_kept(const std::string& reason);
+    int64_t get_offload_evict_kept(const std::string& reason);
+    // Eviction ticks that held a round back: no_room, wait_for_landings,
+    // backoff.
+    void inc_offload_evict_round_skipped(const std::string& reason);
+    int64_t get_offload_evict_round_skipped(const std::string& reason);
 
     // Promotion-on-hit Metrics Getters
     int64_t get_promotion_in_flight();
@@ -835,6 +847,10 @@ class MasterMetricManager {
     ylt::metric::gauge_t offload_evict_pending_objects_;
     ylt::metric::gauge_t offload_evict_stalled_bytes_;
     ylt::metric::counter_t offload_evict_no_room_total_;
+    ylt::metric::counter_t offload_evict_freed_total_;
+    ylt::metric::counter_t offload_evict_freed_bytes_total_;
+    ylt::metric::dynamic_counter_1t offload_evict_kept_total_;
+    ylt::metric::dynamic_counter_1t offload_evict_round_skipped_total_;
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     ylt::metric::counter_t copy_start_requests_;
