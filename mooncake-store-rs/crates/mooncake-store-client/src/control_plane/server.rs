@@ -15,6 +15,7 @@ use mooncake_store_route::{
 };
 use prost::Message;
 use std::time::{Duration, Instant};
+use tonic::transport::server::TcpIncoming;
 
 const MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES: usize = 1024 * 1024;
 
@@ -331,10 +332,10 @@ fn run_server(
         let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
             StoreError::Transport(format!("control plane listener conversion failed: {error}"))
         })?;
+        let incoming = control_plane_incoming(listener)?;
         let server = Server::builder()
-            .tcp_nodelay(true)
             .add_service(pb::control_plane_service_server::ControlPlaneServiceServer::new(service))
-            .serve_with_incoming(TcpListenerStream::new(listener));
+            .serve_with_incoming(incoming);
         tokio::select! {
             result = server => result.map_err(|error| {
                 StoreError::Transport(format!("control plane gRPC server failed: {error}"))
@@ -345,6 +346,16 @@ fn run_server(
     if let Err(error) = result {
         warn!(error = %error, "control plane server terminated with error");
     }
+}
+
+pub(super) fn control_plane_incoming(listener: tokio::net::TcpListener) -> Result<TcpIncoming> {
+    // serve_with_incoming does not apply Server::tcp_nodelay to caller-owned
+    // sockets. Configure every accepted connection in the incoming stream.
+    TcpIncoming::from_listener(listener, true, None).map_err(|error| {
+        StoreError::Transport(format!(
+            "control plane incoming stream setup failed: {error}"
+        ))
+    })
 }
 
 pub(super) struct GrpcControlPlaneService {

@@ -11,7 +11,7 @@ use mooncake_store_client::MooncakeCompatibilityFacade;
 use mooncake_store_core::StoreError;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
-use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::server::TcpIncoming;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
@@ -355,11 +355,19 @@ pub fn start_dummy_store_server(
                         return;
                     }
                 };
+                // Caller-owned incoming streams must configure accepted sockets themselves.
+                let incoming = match TcpIncoming::from_listener(listener, true, None) {
+                    Ok(incoming) => incoming,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "dummy gRPC incoming stream setup failed");
+                        return;
+                    }
+                };
                 let result = Server::builder()
                     .add_service(
                         pb::dummy_store_service_server::DummyStoreServiceServer::new(service),
                     )
-                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    .serve_with_incoming_shutdown(incoming, async move {
                         let _ = shutdown_rx.await;
                     })
                     .await;

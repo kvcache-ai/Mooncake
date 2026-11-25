@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tokio_stream::wrappers::ReceiverStream;
 
+use super::server::control_plane_incoming;
 use super::{
     control_address, control_address_label, control_plane_server_threads_from_env, decode_error,
     ensure_batch_len, fail_stream_session, handle_control_stream_request, normalize_control_uri,
@@ -36,6 +37,41 @@ use mooncake_store_core::{
 use mooncake_store_route::RouteOwnerPageQuery;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
+
+#[test]
+fn control_plane_incoming_disables_nagle_on_each_accepted_socket() {
+    use tokio_stream::StreamExt;
+
+    RuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime should start")
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("listener should bind");
+                let address = listener.local_addr().expect("listener should have address");
+                let mut incoming =
+                    control_plane_incoming(listener).expect("incoming stream should start");
+                for _ in 0..3 {
+                    let _peer = tokio::net::TcpStream::connect(address)
+                        .await
+                        .expect("peer should connect");
+                    let accepted = incoming
+                        .next()
+                        .await
+                        .expect("incoming stream should stay open")
+                        .expect("connection should be accepted");
+                    assert!(accepted
+                        .nodelay()
+                        .expect("socket option should be readable"));
+                }
+            })
+            .await
+            .expect("socket acceptance should finish");
+        });
+}
 
 #[derive(Default)]
 struct TestAuthority {
@@ -593,19 +629,17 @@ impl ClosingStreamHandle {
                 runtime.block_on(async move {
                     let listener = tokio::net::TcpListener::from_std(listener)
                         .expect("listener conversion should succeed");
+                    let incoming =
+                        control_plane_incoming(listener).expect("incoming stream should start");
                     Server::builder()
-                        .tcp_nodelay(true)
                         .add_service(
                             pb::control_plane_service_server::ControlPlaneServiceServer::new(
                                 service,
                             ),
                         )
-                        .serve_with_incoming_shutdown(
-                            TcpListenerStream::new(listener),
-                            async move {
-                                let _ = shutdown_rx.await;
-                            },
-                        )
+                        .serve_with_incoming_shutdown(incoming, async move {
+                            let _ = shutdown_rx.await;
+                        })
                         .await
                         .expect("closing stream server should run");
                 });
@@ -914,19 +948,17 @@ impl DelayedUnaryHandle {
                 runtime.block_on(async move {
                     let listener = tokio::net::TcpListener::from_std(listener)
                         .expect("listener conversion should succeed");
+                    let incoming =
+                        control_plane_incoming(listener).expect("incoming stream should start");
                     Server::builder()
-                        .tcp_nodelay(true)
                         .add_service(
                             pb::control_plane_service_server::ControlPlaneServiceServer::new(
                                 service,
                             ),
                         )
-                        .serve_with_incoming_shutdown(
-                            TcpListenerStream::new(listener),
-                            async move {
-                                let _ = shutdown_rx.await;
-                            },
-                        )
+                        .serve_with_incoming_shutdown(incoming, async move {
+                            let _ = shutdown_rx.await;
+                        })
                         .await
                         .expect("delayed unary server should run");
                 });
@@ -1241,19 +1273,17 @@ impl InvalidMigrationStatusHandle {
                 runtime.block_on(async move {
                     let listener = tokio::net::TcpListener::from_std(listener)
                         .expect("listener conversion should succeed");
+                    let incoming =
+                        control_plane_incoming(listener).expect("incoming stream should start");
                     Server::builder()
-                        .tcp_nodelay(true)
                         .add_service(
                             pb::control_plane_service_server::ControlPlaneServiceServer::new(
                                 service,
                             ),
                         )
-                        .serve_with_incoming_shutdown(
-                            TcpListenerStream::new(listener),
-                            async move {
-                                let _ = shutdown_rx.await;
-                            },
-                        )
+                        .serve_with_incoming_shutdown(incoming, async move {
+                            let _ = shutdown_rx.await;
+                        })
                         .await
                         .expect("invalid status server should run");
                 });
