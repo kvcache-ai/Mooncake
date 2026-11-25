@@ -88,6 +88,8 @@ namespace {
 
 using SegmentDesc = TransferMetadata::SegmentDesc;
 using BufferDesc = TransferMetadata::BufferDesc;
+using TransferStatus = Transport::TransferStatus;
+using TransferStatusEnum = Transport::TransferStatusEnum;
 
 class ScopedUbConfig {
    public:
@@ -113,6 +115,9 @@ class FakeUbContext final : public UbContext {
         size_t length;
         Transport::TransferRequest::OpCode opcode;
         void* l_seg;
+        // Start address of the local chunk that owns l_seg. l_seg tokens are
+        // per-context, so tests compare chunks through this field instead.
+        uint64_t local_chunk_va;
     };
 
     FakeUbContext(UbTransport& engine, const std::string& device_name,
@@ -201,9 +206,13 @@ class FakeUbContext final : public UbContext {
         const std::vector<Transport::Slice*>& slice_list) override {
         std::lock_guard<std::mutex> lock(mu_);
         for (auto* slice : slice_list) {
+            uint64_t chunk_va = 0;
+            for (const auto& [_, region] : live_regions_) {
+                if (region.seg == slice->ub.l_seg) chunk_va = region.va;
+            }
             posted_slices.push_back({slice->source_addr, slice->ub.dest_addr,
                                      slice->length, slice->opcode,
-                                     slice->ub.l_seg});
+                                     slice->ub.l_seg, chunk_va});
             slice->markSuccess();
         }
         return 0;
@@ -299,12 +308,19 @@ class UbLargeSegUnitTest : public ::testing::Test {
         metadata_->addLocalSegment(target_id, name, std::move(desc));
     }
 
+    // Slices of a request whose source spans several chunks pick a device
+    // per slice (randomly at retry 0), so return them in source order rather
+    // than grouped by context.
     std::vector<FakeUbContext::PostedSlice> allPostedSlices() const {
         std::vector<FakeUbContext::PostedSlice> result;
         for (const auto& ctx : contexts_) {
             result.insert(result.end(), ctx->posted_slices.begin(),
                           ctx->posted_slices.end());
         }
+        std::sort(result.begin(), result.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.source_addr < b.source_addr;
+                  });
         return result;
     }
 };
@@ -506,7 +522,7 @@ TEST_F(UbLargeSegUnitTest, SubmitSplitsSourceStraddlingChunkBoundary) {
     EXPECT_EQ(slices[0].length, 600u);
     EXPECT_EQ(slices[1].source_addr, source_ptr + 600);
     EXPECT_EQ(slices[1].length, 900u);
-    EXPECT_NE(slices[0].l_seg, slices[1].l_seg);
+    EXPECT_NE(slices[0].local_chunk_va, slices[1].local_chunk_va);
 }
 
 TEST_F(UbLargeSegUnitTest, SubmitSplitsReadStraddlingBothSides) {
@@ -560,8 +576,8 @@ TEST_F(UbLargeSegUnitTest, SubmitSplitsReadStraddlingBothSides) {
     EXPECT_EQ(slices[2].source_addr, local_ptr + 700);
     EXPECT_EQ(slices[2].dest_addr, remote_ptr + 700);
 
-    EXPECT_NE(slices[0].l_seg, slices[1].l_seg);
-    EXPECT_EQ(slices[1].l_seg, slices[2].l_seg);
+    EXPECT_NE(slices[0].local_chunk_va, slices[1].local_chunk_va);
+    EXPECT_EQ(slices[1].local_chunk_va, slices[2].local_chunk_va);
 }
 
 TEST_F(UbLargeSegUnitTest,
@@ -822,9 +838,9 @@ TEST_F(UbLargeSegUnitTest, SubmitSplitsAcrossSliceSizeAndChunkSeam) {
     EXPECT_EQ(slices[1].length, 476u);
     EXPECT_EQ(slices[2].length, 1024u);
     EXPECT_EQ(slices[3].length, 476u);
-    EXPECT_EQ(slices[0].l_seg, slices[1].l_seg);
-    EXPECT_NE(slices[1].l_seg, slices[2].l_seg);
-    EXPECT_EQ(slices[2].l_seg, slices[3].l_seg);
+    EXPECT_EQ(slices[0].local_chunk_va, slices[1].local_chunk_va);
+    EXPECT_NE(slices[1].local_chunk_va, slices[2].local_chunk_va);
+    EXPECT_EQ(slices[2].local_chunk_va, slices[3].local_chunk_va);
 }
 
 TEST_F(UbLargeSegUnitTest, SubmitRefreshesStaleRemoteSegmentDesc) {
@@ -940,6 +956,9 @@ TEST_F(UbLargeSegUnitTest,
     Status s = transport_->submitTransfer(batch_id, {req});
     EXPECT_TRUE(s.IsAddressNotRegistered());
     EXPECT_TRUE(allPostedSlices().empty());
+    // freeBatchID() requires every task to have been observed terminal.
+    TransferStatus status;
+    ASSERT_EQ(transport_->getTransferStatus(batch_id, 0, status), Status::OK());
     EXPECT_EQ(transport_->freeBatchID(batch_id), Status::OK());
 }
 
@@ -956,7 +975,9 @@ TEST_F(UbLargeSegUnitTest, SubmitRespectsAdviseRetryCnt) {
     req.target_id = LOCAL_SEGMENT_ID;
     req.target_offset = reinterpret_cast<uint64_t>(local_base);
     req.length = 512;
-    req.advise_retry_cnt = 1;
+    // Topology::selectDevice() maps retry_count N > 0 to preferred device
+    // (N - 1) % count, so retry 2 deterministically lands on ub_1.
+    req.advise_retry_cnt = 2;
 
     ASSERT_EQ(transport_->submitTransfer(batch_id, {req}), Status::OK());
     TransferStatus status;
