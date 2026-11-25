@@ -85,12 +85,6 @@ void MasterServiceTestPeer::RunTenantEvictForTesting() {
     service_.tenant_quota_policy_->OnMaintenance();
 }
 
-tl::expected<void, SerializationError>
-MasterServiceTestPeer::ApplySnapshotStateForTesting(
-    const std::chrono::system_clock::time_point& now) {
-    return service_.ApplySnapshotState(now);
-}
-
 void MasterServiceTestPeer::SetKvTenantEpochTrackingForTesting(bool enabled) {
     service_.kv_track_tenant_epochs_ = enabled;
 }
