@@ -959,20 +959,22 @@ TEST_F(SegmentTest, MemoryUsageSeparatesRamAndCxlTiers) {
     ram_segment.name = "tier_usage_ram";
     ram_segment.size = kRamCapacity;
     ram_segment.base = 0x240000000;
+    ram_segment.te_endpoint = ram_segment.name;
+    ram_segment.protocol = "tcp";
     const UUID ram_client_id = generate_uuid();
 
     std::shared_ptr<BufferAllocatorBase> ram_allocator;
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(segment_access.MountSegment(ram_segment, ram_client_id,
-                                              client_liveness_),
+        ASSERT_EQ(segment_access.MountSegment(ram_segment,
+                                              SessionFor(ram_client_id)),
                   ErrorCode::OK);
         ram_allocator = segment_access.GetAllocator(ram_segment.id);
     }
     ASSERT_NE(ram_allocator, nullptr);
 
     auto cxl_allocator = std::make_shared<OffsetBufferAllocator>(
-        "tier_usage_cxl", 0x280000000, kCxlCapacity, "tier_usage_cxl",
+        "tier_usage_cxl", 0x280000000, kCxlCapacity, "tier_usage_cxl", "cxl",
         StorageLevel::CXL);
     InstallSharedCxlAllocatorForTesting(segment_manager, cxl_allocator, {});
 
