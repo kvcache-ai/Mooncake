@@ -753,7 +753,7 @@ RealClient::map_dummy_addrs_to_real_ptrs(
                        << sizes[i]
                        << ") not found in any mapped shared memory, client_id="
                        << client_id;
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            return tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED);
         }
         buffers.push_back(real_ptr);
         if (capacities) capacities->push_back(capacity);
@@ -792,7 +792,7 @@ RealClient::map_dummy_nested_addrs_to_real_ptrs(
                     << "Dummy buffer at " << row_addrs[j]
                     << " not found in any mapped shared memory for client "
                     << client_id;
-                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                return tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED);
             }
             row_real.push_back(real_ptr);
         }
@@ -2776,7 +2776,7 @@ tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED);
     }
     auto &context = it->second;
 #ifdef USE_ASCEND_DIRECT
@@ -2885,7 +2885,7 @@ tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED);
     }
     auto &context = it->second;
 #ifdef USE_ASCEND_DIRECT
@@ -2988,7 +2988,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED);
     }
     auto &context = it->second;
 #ifdef USE_ASCEND_DIRECT
@@ -3441,7 +3441,7 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::make_unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED);
     }
 
     auto &context = it->second;
@@ -3732,7 +3732,7 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "[ascend_unmap_shm] client_id=" << client_id
                    << ", error=shm_not_mapped";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::make_unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED);
     }
 
     auto &context = it->second;
@@ -5967,7 +5967,7 @@ RealClient::batch_put_from_dummy_helper(
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
         return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            keys.size(), tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED));
     }
     auto &context = it->second;
 
@@ -6133,7 +6133,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_dummy_helper(
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED);
     }
     auto &context = it->second;
     return upsert_internal(key, value, config, context.client_buffer_allocator);
@@ -6242,7 +6242,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_from_dummy_helper(
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED);
     }
     auto &context = it->second;
 
@@ -6253,7 +6253,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_from_dummy_helper(
         LOG(ERROR) << "Dummy buffer at " << dummy_buffer << " (size " << size
                    << ") not found in any mapped shared memory for client "
                    << client_id;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED);
     }
 
     return upsert_from_internal(key, real_buffer, size, config);
@@ -6270,7 +6270,7 @@ RealClient::batch_upsert_from_dummy_helper(
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
         return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            keys.size(), tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED));
     }
     auto &context = it->second;
 
@@ -6287,7 +6287,8 @@ RealClient::batch_upsert_from_dummy_helper(
                        << ") not found in any mapped shared memory for client "
                        << client_id;
             return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+                keys.size(),
+                tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED));
         }
         buffers.push_back(real_ptr);
     }
@@ -6375,7 +6376,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_parts_dummy_helper(
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED);
     }
     auto &context = it->second;
     return upsert_parts_internal(key, values, config,
@@ -6462,7 +6463,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_batch_dummy_helper(
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED);
     }
     auto &context = it->second;
 
@@ -6530,7 +6531,7 @@ RealClient::batch_get_into_dummy_helper(
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
         co_return std::vector<tl::expected<int64_t, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            keys.size(), tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED));
     }
     auto &context = it->second;
 
@@ -6598,7 +6599,7 @@ RealClient::batch_put_from_multi_buffers_dummy_helper(
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
         return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            keys.size(), tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED));
     }
     auto &context = it->second;
 
@@ -6638,7 +6639,8 @@ RealClient::batch_write_from_cuda_ipc_dummy_helper(
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
         return std::vector<tl::expected<void, ErrorCode>>(
-            requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            requests.size(),
+            tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED));
     }
 
     const ShmContext &context = it->second;
@@ -6683,7 +6685,8 @@ RealClient::batch_write_from_cuda_ipc_dummy_helper(
                            << ") not found in any mapped shared memory, "
                            << "client_id=" << client_id;
                 return std::vector<tl::expected<void, ErrorCode>>(
-                    requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+                    requests.size(),
+                    tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED));
             }
             all_buffers.push_back({metadata_ptr, payload_ptr});
             all_sizes.push_back({static_cast<size_t>(request.metadata.size),
@@ -6710,7 +6713,8 @@ RealClient::batch_get_into_cuda_ipc_dummy_helper(
         if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
             LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
             return std::vector<tl::expected<int64_t, ErrorCode>>(
-                requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+                requests.size(),
+                tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED));
         }
     }
 
@@ -6756,7 +6760,7 @@ RealClient::batch_upsert_from_multi_buffers_dummy_helper(
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
         return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            keys.size(), tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED));
     }
     auto &context = it->second;
 
@@ -6791,7 +6795,7 @@ RealClient::batch_get_into_multi_buffers_dummy_helper(
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
         return std::vector<tl::expected<int64_t, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            keys.size(), tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED));
     }
     auto &context = it->second;
 
@@ -6815,7 +6819,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED);
     }
     auto &context = it->second;
 
@@ -6826,7 +6830,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
                    << " (dst_offset=" << dst_offset << ", size=" << size
                    << ") not found in any mapped shared memory for client "
                    << client_id;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::unexpected(ErrorCode::DUMMY_BUFFER_NOT_MAPPED);
     }
 
     return get_into_range_internal(key, real_buffer, 0, src_offset, size,
@@ -6897,7 +6901,7 @@ RealClient::get_into_ranges_shm_helper_impl(
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
         return build_ranged_read_internal_error_results(
             dummy_buffers.size(), all_keys, all_dst_offsets,
-            ErrorCode::INVALID_PARAMS);
+            ErrorCode::DUMMY_BUFFER_NOT_MAPPED);
     }
 
     std::vector<size_t> mapped_capacities;
@@ -9251,6 +9255,22 @@ tl::expected<PingResponse, ErrorCode> RealClient::ping(const UUID &client_id) {
     return PingResponse(view_version_, client_status);
 }
 
+int64_t ResolveDummyClientLiveTtlSec() {
+    const char *env = std::getenv("MC_DUMMY_CLIENT_TTL_SEC");
+    if (env == nullptr || *env == '\0') {
+        return DEFAULT_CLIENT_LIVE_TTL_SEC;
+    }
+    const auto parsed =
+        TryParseInteger<int64_t>(env, {.trim_ascii_whitespace = true});
+    if (!parsed.has_value() || *parsed <= 0) {
+        LOG(ERROR) << "Invalid MC_DUMMY_CLIENT_TTL_SEC value: '" << env
+                   << "', falling back to default ("
+                   << DEFAULT_CLIENT_LIVE_TTL_SEC << "s)";
+        return DEFAULT_CLIENT_LIVE_TTL_SEC;
+    }
+    return *parsed;
+}
+
 void RealClient::dummy_client_monitor_func() {
     std::unordered_map<UUID, std::chrono::steady_clock::time_point,
                        boost::hash<UUID>>
@@ -9305,7 +9325,10 @@ int RealClient::start_dummy_client_monitor() {
         LOG(ERROR) << "Failed to start dummy_client_monitor_thread";
         return -1;
     }
-    LOG(INFO) << "start dummy_client_monitor_thread";
+    // Log the effective TTL once so deployments can verify
+    // the MC_DUMMY_CLIENT_TTL_SEC override took effect.
+    LOG(INFO) << "start dummy_client_monitor_thread (ttl="
+              << dummy_client_live_ttl_sec_ << "s)";
     return 0;
 }
 
