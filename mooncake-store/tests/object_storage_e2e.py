@@ -23,6 +23,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+from unittest.mock import patch
 
 
 def free_port():
@@ -219,6 +220,7 @@ class Environment:
         enabled=True,
         maintenance_batch_size=32,
         cleanup_interval_ms=200,
+        extra_flags=(),
     ):
         port = free_port()
         child = self.spawn(
@@ -253,6 +255,7 @@ class Environment:
                 "--ha_leader_lease_ttl_sec=5",
                 f"--put_start_discard_timeout_sec={2 if self.args.scenario == 'import' else 30}",
                 f"--put_start_release_timeout_sec={5 if self.args.scenario == 'import' else 600}",
+                *extra_flags,
             ],
             dict(
                 os.environ,
@@ -651,6 +654,113 @@ def run_cleanup(args):
         assert recovered.get("after-cleanup") == b"new"
         env.report("restart rebuilds pending work and resumes admission")
         assert owner is not None
+    finally:
+        env.close()
+
+
+def run_startup(args):
+    env = Environment(args)
+    try:
+
+        def current_view():
+            key = f"mooncake-store/{env.cluster}/master_view".encode()
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{env.etcd_port}/v3/kv/range",
+                data=json.dumps({"key": base64.b64encode(key).decode()}).encode(),
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return json.load(response).get("kvs", [])
+
+        point = "supervisor_after_term_release"
+        (env.failpoints / f"{point}.arm").touch()
+        broken, _ = env.master(
+            ready=False,
+            extra_flags=("--weight_import_idle_timeout_ms=0",),
+        )
+        try:
+            wait_for(current_view, "candidate acquired the term")
+            wait_for(
+                lambda: (env.failpoints / f"{point}.hit").exists()
+                or broken.poll() is not None,
+                point,
+                timeout=20,
+            )
+            assert (env.failpoints / f"{point}.hit").exists()
+            assert not current_view(), "failed promotion retained its lease"
+        finally:
+            (env.failpoints / f"{point}.release").touch()
+        assert broken.wait(timeout=15) == 255
+        assert (
+            b"weight_import_idle_timeout_ms must be positive"
+            in Path(env.logs[-1].name).read_bytes()
+        )
+        leader, _ = env.master()
+        assert current_view()
+        env.report("constructor failure releases acquired term before exit")
+        # The healthy leader holds the term throughout the candidate's startup.
+        with patch.dict(
+            os.environ,
+            {
+                "MOONCAKE_S3_ANONYMOUS": "false",
+                "MOONCAKE_S3_ACCESS_KEY_ID": "incomplete",
+                "MOONCAKE_S3_SECRET_ACCESS_KEY": "",
+            },
+        ):
+            candidate, _ = env.master(ready=False)
+        assert candidate.wait(timeout=15) == 255  # supervisor returns -1
+        assert (
+            b"Cannot initialize object replica adapter"
+            in Path(env.logs[-1].name).read_bytes()
+        )
+        assert leader.poll() is None
+        env.report("invalid local credentials rejected while another master leads")
+    finally:
+        env.close()
+
+
+def run_unmount(args):
+    env = Environment(args)
+    try:
+        env.master()
+        owner, writer = env.client(), env.client()
+        mixed = env.store.ReplicateConfig()
+        mixed.os_replica_num = 1
+        plain = env.store.ReplicateConfig()
+        point = "object_commit_durable_before_publish"
+        for replacement in (False, True):
+            mount = owner.allocate_and_mount_segment(64 << 20)
+            assert mount["ret"] == 0
+            key = "unmount-replacement" if replacement else "unmount-mixed"
+            if replacement:
+                assert writer.put(key, b"old", mixed) == 0
+            (env.failpoints / f"{point}.arm").touch()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                put = executor.submit(
+                    writer.upsert if replacement else writer.put,
+                    key,
+                    b"value",
+                    plain if replacement else mixed,
+                )
+                try:
+                    wait_for(lambda: (env.failpoints / f"{point}.hit").exists(), point)
+                    assert owner.unmount_and_free_segment(mount["segment_ids"]) == 0
+                    assert not put.done()
+                finally:
+                    (env.failpoints / f"{point}.release").touch()
+                assert put.result(timeout=30) == 0
+            if replacement:
+                object_only = env.store.ReplicateConfig()
+                object_only.replica_num = 0
+                object_only.os_replica_num = 1
+                wait_for(
+                    lambda: writer.put(key, b"next", object_only) == 0
+                    and writer.get(key) == b"next",
+                    "last invalid replica reclaimed",
+                )
+            else:
+                assert writer.get(key) == b"value"
+            wait_for(lambda: writer.remove(key, True) == 0, "remove after unmount")
+        env.report("durable finalization across segment unmount")
     finally:
         env.close()
 
@@ -1066,6 +1176,8 @@ def run(args):
         "budget": run_budget,
         "cleanup": run_cleanup,
         "faults": run_faults,
+        "unmount": run_unmount,
+        "startup": run_startup,
         "stale": run_stale,
         "snapshot": run_snapshot,
         "import": run_import,
@@ -1084,6 +1196,8 @@ if __name__ == "__main__":
             "budget",
             "cleanup",
             "faults",
+            "unmount",
+            "startup",
             "stale",
             "snapshot",
             "import",

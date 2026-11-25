@@ -740,16 +740,25 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 #endif
         }
 
-        mooncake::WrappedMasterServiceConfig wrapped_config(
-            config, leadership_session->view.view_version);
         // The serving primary handles heartbeats/unmounts, so forward the
         // metadata cleanup config here like the non-HA path does.
         // Keep the gate alive until after the service is destroyed because the
         // OpLog writer owned by the service invokes a callback that uses it.
         detail::ServingStateGate serving_state;
-        auto wrapped_master_service = std::make_shared<WrappedMasterService>(
-            wrapped_config, config.http_metadata_server,
-            config.http_metadata_remote_url);
+        std::shared_ptr<WrappedMasterService> wrapped_master_service;
+        try {
+            wrapped_master_service = std::make_shared<WrappedMasterService>(
+                WrappedMasterServiceConfig(
+                    config, leadership_session->view.view_version),
+                config.http_metadata_server, config.http_metadata_remote_url);
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "Master service construction failed: "
+                       << error.what();
+            renewal.Stop();
+            LogLeadershipReleaseWarning("service construction failure",
+                                        release_term("service_construction"));
+            return -1;
+        }
         // Runs the term's handlers once they are registered. It drains before
         // the service goes, so release the service through release_service.
         std::unique_ptr<RpcWorkerPool> worker_pool;
@@ -1119,6 +1128,10 @@ int MasterServiceSupervisor::Start() {
 
     std::unique_ptr<StandbyController> standby_controller;
     try {
+        if (config_.object_storage.enabled) {
+            MasterService::PrepareObjectStorageAdapter(
+                WrappedMasterServiceConfig(config_, 0));
+        }
         standby_controller = CreateStandbyController(*spec, config_);
     } catch (const std::exception& error) {
         LOG(ERROR) << "Standby dependency initialization failed: "

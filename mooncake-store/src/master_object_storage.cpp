@@ -3,6 +3,9 @@
 #include <future>
 #include <stdexcept>
 
+#include "config/dfs_enablement_config.h"
+#include "config/distributed_storage_config.h"
+#include "ha/ha_types.h"
 #include "ha/standby_metadata_store.h"
 #include "ha/oplog/oplog_test_failpoint.h"
 #include "storage/distributed/object_replica_io.h"
@@ -35,22 +38,33 @@ struct ObjectCompletion {
 };
 }  // namespace
 
-void MasterService::InitObjectStorage(const MasterServiceConfig& config) {
-    object_storage_config_ = config.object_storage;
-    if (!object_storage_config_.enabled) return;
-    if (!object_storage_config_.Validate() || !enable_ha_ || !enable_oplog_ ||
-        !ordered_oplog_writer_ || view_version_ == 0 || enable_dfs_ ||
-        !root_fs_dir_.empty()) {
+std::shared_ptr<ObjectStorageAdapter>
+MasterService::PrepareObjectStorageAdapter(const MasterServiceConfig& config) {
+    if (!config.object_storage.Validate() || !config.enable_ha ||
+        !config.enable_oplog || config.cluster_id.empty() ||
+        !ha::HaBackendSupportsOpLog(config.ha_backend_type) ||
+        DfsEnablementConfig::FromEnvironment().enabled ||
+        DistributedStorageConfig::FromEnvironment().UsesKvcs() ||
+        !config.root_fs_dir.empty()) {
         throw std::invalid_argument(
             "Object replicas require a valid target including an explicit "
-            "object_storage_region, fenced HA ordered-log recovery with DFS "
+            "object_storage_region, a nonempty cluster_id, and fenced HA "
+            "ordered-log recovery with DFS "
             "and legacy shared-file replicas disabled");
     }
-    auto adapter = CreateObjectReplicaAdapter(object_storage_config_);
+    auto adapter = CreateObjectReplicaAdapter(config.object_storage);
     if (!adapter)
         throw std::runtime_error("Cannot initialize object replica adapter: " +
                                  toString(adapter.error()));
-    object_storage_adapter_ = *adapter;
+    return *adapter;
+}
+
+void MasterService::InitObjectStorage(const MasterServiceConfig& config) {
+    object_storage_config_ = config.object_storage;
+    if (!object_storage_config_.enabled) return;
+    if (!ordered_oplog_writer_ || view_version_ == 0)
+        throw std::invalid_argument("Object replicas require a fenced writer");
+    object_storage_adapter_ = PrepareObjectStorageAdapter(config);
     object_uploads_ = std::make_unique<StandbyMetadataStore>();
 }
 
@@ -424,6 +438,7 @@ tl::expected<void, ErrorCode> MasterService::CommitObjectStorage(
             record->upload_finished = true;
         }
         std::vector<Replica::Descriptor> descriptors;
+        std::unordered_set<ReplicaID> committed_ids;
         for (const auto& target : metadata.GetAllReplicas()) {
             if (target.has_invalid_mem_handle() ||
                 target.has_invalid_nof_handle())
@@ -432,6 +447,7 @@ tl::expected<void, ErrorCode> MasterService::CommitObjectStorage(
                 return tl::make_unexpected(ErrorCode::INVALID_WRITE);
             auto descriptor = target.get_descriptor();
             descriptor.status = ReplicaStatus::COMPLETE;
+            committed_ids.insert(target.id());
             descriptors.push_back(std::move(descriptor));
         }
         MetadataPayload payload;
@@ -464,12 +480,12 @@ tl::expected<void, ErrorCode> MasterService::CommitObjectStorage(
         // atomically, without making completion depend on that history.
         auto appended = AppendOpLogWithDurableFinalize(
             commit_type, tenant.value(), meta.key, std::move(commit_payload),
-            [this, writer, meta, tenant, completion,
-             admission](const OpLogEntry&) {
+            [this, writer, meta, tenant, completion, admission,
+             committed_ids = std::move(committed_ids)](const OpLogEntry&) {
                 TestFailPoint::Wait("object_commit_durable_before_publish");
                 auto published =
-                    PutEndImpl(writer, meta, tenant, ReplicaType::ALL, false,
-                               admission.get());
+                    PutEndImpl(writer, meta, tenant, ReplicaType::ALL,
+                               &committed_ids, admission.get());
                 TestFailPoint::Wait("object_commit_after_publish_before_reply");
                 completion->Finish(published ? ErrorCode::OK
                                              : published.error());

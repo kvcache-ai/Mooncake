@@ -2511,6 +2511,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                 continue;
             }
             auto& metadata = accessor.Get();
+            if (accessor.GetState().object_storage_commit_pending) continue;
             const auto cleanup_plan =
                 BuildStaleHandleCleanupPlan(metadata, is_stale);
             if (!cleanup_plan.removed_ids.empty()) {
@@ -5611,17 +5612,17 @@ auto MasterService::PutStartImpl(const UUID& client_id, const std::string& key,
     return result;
 }
 
-auto MasterService::PutEndImpl(const UUID& client_id,
-                               const ObjectMeta& object_meta,
-                               const TenantId& tenant_id,
-                               ReplicaType replica_type, bool persist,
-                               WeightStoreManager::ImportWriteGuard* admission)
+auto MasterService::PutEndImpl(
+    const UUID& client_id, const ObjectMeta& object_meta,
+    const TenantId& tenant_id, ReplicaType replica_type,
+    const std::unordered_set<ReplicaID>* committed_ids,
+    WeightStoreManager::ImportWriteGuard* admission)
     -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
-    if (!accessor.Exists()) {
+    if (committed_ids ? !accessor.IsPublished() : !accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -5637,7 +5638,11 @@ auto MasterService::PutEndImpl(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    auto is_target_replica = [replica_type](const Replica& replica) {
+    auto is_target_replica = [replica_type,
+                              committed_ids](const Replica& replica) {
+        if (committed_ids) {
+            return committed_ids->contains(replica.id());
+        }
         if (replica_type == ReplicaType::ALL) {
             return (replica.is_memory_replica() &&
                     !replica.has_invalid_mem_handle()) ||
@@ -5762,7 +5767,8 @@ auto MasterService::PutEndImpl(const UUID& client_id,
         std::vector<UUID> mirror_clients;
         metadata.VisitReplicas(
             [](const Replica& replica) {
-                return replica.is_completed() && replica.is_memory_replica();
+                return replica.is_completed() && replica.is_memory_replica() &&
+                       !replica.has_invalid_mem_handle();
             },
             [this, &object_id, &source_id, &mirror_clients](Replica& replica) {
                 auto result =
@@ -5789,7 +5795,7 @@ auto MasterService::PutEndImpl(const UUID& client_id,
     // TODO: add inc_nof_cache_nums() (ranhaojia)
     metadata.GrantReadLease(std::chrono::milliseconds::zero());
 
-    if (persist && enable_oplog_ && ordered_oplog_writer_) {
+    if (!committed_ids && enable_oplog_ && ordered_oplog_writer_) {
         std::string payload = SerializeMetadataForOpLog(metadata);
         auto result = AppendOpLogVisibleBeforeDurable(
             OpType::PUT_END, object_id.tenant_id.value(), key, payload);
@@ -5799,6 +5805,12 @@ auto MasterService::PutEndImpl(const UUID& client_id,
         }
     }
     accessor.GetState().object_storage_commit_pending = false;
+    if (committed_ids && metadata.HasReplica([](const Replica& replica) {
+            return replica.has_invalid_mem_handle() ||
+                   replica.has_invalid_nof_handle();
+        })) {
+        replica_cleanup_worker_.Schedule();
+    }
     if (advanced_primary_write) {
         admission->Accept();
     }

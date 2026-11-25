@@ -121,6 +121,8 @@ class MasterService {
         std::function<std::unique_ptr<OrderedOpLogWriter>(
             OrderedOpLogWriterConfig, OrderedOpLogWriter::WriteBatchFn)>;
 
+    static std::shared_ptr<ObjectStorageAdapter> PrepareObjectStorageAdapter(
+        const MasterServiceConfig& config);
     tl::expected<ObjectStorageConfig, ErrorCode> GetObjectStorageConfig();
     tl::expected<void, ErrorCode> FinishObjectStorageUpload(const UUID&,
                                                             const std::string&,
@@ -2394,9 +2396,10 @@ class MasterService {
     auto UpsertStartImpl(const UUID&, const std::string&, const TenantId&,
                          uint64_t, const ReplicateConfig&)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
-    auto PutEndImpl(const UUID&, const ObjectMeta&, const TenantId&,
-                    ReplicaType, bool persist = true,
-                    WeightStoreManager::ImportWriteGuard* admission = nullptr)
+    auto PutEndImpl(
+        const UUID&, const ObjectMeta&, const TenantId&, ReplicaType,
+        const std::unordered_set<ReplicaID>* committed_ids = nullptr,
+        WeightStoreManager::ImportWriteGuard* admission = nullptr)
         -> tl::expected<void, ErrorCode>;
 
     // OpLog publishing helpers

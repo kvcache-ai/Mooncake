@@ -1678,6 +1678,11 @@ int main(int argc, char* argv[]) {
         loaded_default_config = &default_config;
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    if (master_config.object_storage.enabled && !master_config.enable_ha) {
+        LOG(ERROR) << "Object replicas require HA";
+        return 1;
+    }
+
     if (master_config.object_storage.enabled &&
         master_config.object_storage.target.region.empty()) {
         LOG(ERROR) << "object_storage_region must be explicitly set when "
@@ -1973,10 +1978,18 @@ int main(int argc, char* argv[]) {
                 << "RDMA RPC is disabled at compile time; using TCP RPC";
 #endif
         }
-        auto wrapped_master_service =
-            std::make_shared<mooncake::WrappedMasterService>(
-                mooncake::WrappedMasterServiceConfig(master_config, version),
-                metadata_server_ptr, http_metadata_remote_url);
+        std::shared_ptr<mooncake::WrappedMasterService> wrapped_master_service;
+        try {
+            wrapped_master_service =
+                std::make_shared<mooncake::WrappedMasterService>(
+                    mooncake::WrappedMasterServiceConfig(master_config,
+                                                         version),
+                    metadata_server_ptr, http_metadata_remote_url);
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "Master service construction failed: "
+                       << error.what();
+            return 1;
+        }
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics.port),
             master_config.metrics.enabled, master_config.metrics.host);
