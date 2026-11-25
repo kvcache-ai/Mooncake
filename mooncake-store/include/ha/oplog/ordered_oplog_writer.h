@@ -103,16 +103,20 @@ class OrderedOpLogWriter {
     // immediately ready with OK, even after terminal failure or Stop().
     // Otherwise, terminal failure completes it with the terminal error, and
     // Stop() completes it with UNAVAILABLE_IN_CURRENT_STATUS. Promises are
-    // fulfilled outside the writer mutex. Callers can co_await the future and
-    // use via(executor) to select the continuation's execution context.
+    // fulfilled outside the writer mutex without an implicit executor. For
+    // blocking continuations on timed or untimed waits, attach via(executor) or
+    // co_await from a coroutine bound to an executor.
     // A finite timeout ends only this wait, returning the last write error or
-    // PERSISTENT_FAIL. The mutation may still commit: timeout is not proof of
-    // rejection, and must not trigger an unconditional replay of the mutation.
-    // Finite waits use a shared four-thread executor for continuations. Their
-    // results become ready even if its workers are busy. Use via(executor) for
-    // blocking continuations; queued continuations may outlive Stop(). Resource
-    // initialization failures propagate to the caller without registering a
-    // wait. Zero polls the current prefix; max() retains the unbounded wait.
+    // PERSISTENT_FAIL (use GetTerminalState() to distinguish a per-wait timeout
+    // from terminal writer failure). The mutation may still commit: timeout is
+    // not proof of rejection, and must not trigger an unconditional replay of
+    // the mutation. Finite timeouts fire on a lazily created multi-threaded
+    // timer pool that Stop() cancels and joins. Do not destroy the writer from
+    // writer-owned threads (including inline continuations or thenValue
+    // captures that async_simple may destroy on the completing thread).
+    // Resource initialization failures propagate to the caller without
+    // registering a wait. Negative timeouts return INVALID_PARAMS; zero polls
+    // the current prefix; max() retains the unbounded wait.
     async_simple::Future<ErrorCode> AwaitDurable(
         uint64_t sequence,
         std::chrono::milliseconds timeout = std::chrono::milliseconds::max());

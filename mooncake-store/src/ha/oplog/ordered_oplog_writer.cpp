@@ -12,12 +12,13 @@
 #include <utility>
 #include <vector>
 
+#include <asio/steady_timer.hpp>
+#include <asio/thread_pool.hpp>
 #include <async_simple/Promise.h>
+#include <glog/logging.h>
 
 #include "ha/oplog/oplog_test_failpoint.h"
 #include "ha_metric_manager.h"
-#include "deadline_scheduler.h"
-#include "thread_pool.h"
 
 namespace mooncake {
 
@@ -25,115 +26,99 @@ namespace {
 
 thread_local const void* current_writer_worker = nullptr;
 
-class DurableWaitNotification {
-   public:
-    virtual ~DurableWaitNotification() = default;
-    virtual void Complete() = 0;
-
-    std::shared_ptr<DurableWaitNotification> next;
+struct WriterWorkerScope {
+    const void* previous;
+    explicit WriterWorkerScope(const void* current)
+        : previous(current_writer_worker) {
+        current_writer_worker = current;
+    }
+    ~WriterWorkerScope() { current_writer_worker = previous; }
 };
 
-class DurableWaitExecutor final : public async_simple::Executor {
+// Wraps asio::thread_pool(0) with explicit worker threads so a partial thread
+// creation failure stops the scheduler before joining already-started threads
+// (standalone asio::thread_pool(n) unwinds thread_group::join() without
+// stopping the scheduler).
+class DurableWaitTimerPool {
    public:
-    static DurableWaitExecutor& Instance() {
-        // Futures and their continuations can outlive any writer, including
-        // static owners. Keep this bounded executor alive for the process.
-        static auto* executor = new DurableWaitExecutor;
-        return *executor;
-    }
+    using Executor = asio::thread_pool::executor_type;
+    using Timer =
+        asio::basic_waitable_timer<std::chrono::steady_clock,
+                                   asio::wait_traits<std::chrono::steady_clock>,
+                                   Executor>;
 
-    bool schedule(Func task) override {
-        auto task_state = std::make_shared<Func>(std::move(task));
-        auto dispatch = [task_state]() mutable {
-            auto task = std::move(*task_state);
-            if (task) task();
-        };
-        if (TestFailPoint::Wait("durable_wait_before_dispatch_failure")) {
-            // async_simple runs a failed continuation inline. Keep that
-            // fallback off the notification drainer, which must remain free
-            // to publish later waiters while this continuation is blocked.
-            fallback_pool_.enqueue(std::move(dispatch));
-            return true;
-        }
+    explicit DurableWaitTimerPool(size_t thread_count) : pool_(0) {
+        threads_.reserve(thread_count);
         try {
-            pool_.enqueue(dispatch);
-        } catch (...) {
-            // Preserve the executor contract when the primary pool rejects
-            // dispatch; otherwise async_simple would run inline in Complete().
-            fallback_pool_.enqueue(std::move(dispatch));
-        }
-        return true;
-    }
-
-    // Promise completion is drained away from the deadline thread. If
-    // async_simple has to fall back to inline continuation execution after a
-    // dispatch failure, a blocking continuation therefore cannot pin timers.
-    void Notify(std::shared_ptr<DurableWaitNotification> notification) {
-        {
-            std::lock_guard<std::mutex> lock(notification_mutex_);
-            if (notification_tail_) {
-                notification_tail_->next = notification;
-            } else {
-                notification_head_ = notification;
+            for (size_t i = 0; i < thread_count; ++i) {
+                threads_.emplace_back([this] { pool_.attach(); });
             }
-            notification_tail_ = std::move(notification);
+        } catch (...) {
+            Stop();
+            throw;
         }
-        notification_cv_.notify_one();
     }
 
-    // Queue-only execution, without thread affinity or inline dispatch.
-    // A synchronous get() can wait for a timer result without another task.
-    bool currentThreadInExecutor() const override { return false; }
+    ~DurableWaitTimerPool() { Stop(); }
+
+    DurableWaitTimerPool(const DurableWaitTimerPool&) = delete;
+    DurableWaitTimerPool& operator=(const DurableWaitTimerPool&) = delete;
+
+    Executor get_executor() noexcept { return pool_.get_executor(); }
+
+    void Stop() {
+        pool_.stop();
+        for (auto& thread : threads_) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+        threads_.clear();
+    }
 
    private:
-    DurableWaitExecutor()
-        : pool_(4),
-          fallback_pool_(2),
-          notification_thread_([this] { NotificationLoop(); }) {}
+    asio::thread_pool pool_;
+    std::vector<std::thread> threads_;
+};
 
-    void NotificationLoop() {
-        while (true) {
-            std::shared_ptr<DurableWaitNotification> notification;
-            {
-                std::unique_lock<std::mutex> lock(notification_mutex_);
-                notification_cv_.wait(
-                    lock, [this] { return notification_head_ != nullptr; });
-                notification = std::move(notification_head_);
-                notification_head_ = std::move(notification->next);
-                if (!notification_head_) notification_tail_.reset();
-            }
-            notification->Complete();
+std::optional<std::chrono::steady_clock::time_point> ComputeWaitDeadline(
+    std::chrono::milliseconds timeout) {
+    if (timeout == std::chrono::milliseconds::max()) {
+        return std::nullopt;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto max_time = std::chrono::steady_clock::time_point::max();
+    if (now >= std::chrono::steady_clock::time_point{}) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(max_time -
+                                                                  now);
+        if (timeout >= remaining) {
+            return std::nullopt;
         }
     }
-
-    ThreadPool pool_;
-    ThreadPool fallback_pool_;
-    std::mutex notification_mutex_;
-    std::condition_variable notification_cv_;
-    std::shared_ptr<DurableWaitNotification> notification_head_;
-    std::shared_ptr<DurableWaitNotification> notification_tail_;
-    std::thread notification_thread_;
-};
+    const auto max_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::duration::max());
+    if (timeout >= max_ms) {
+        return std::nullopt;
+    }
+    return now + timeout;
+}
 
 }  // namespace
 
 struct OrderedOpLogWriter::Impl {
+    static constexpr size_t kTimerPoolThreads = 4;
+
     struct DurableWaiter;
-    using WaitDeadline = std::weak_ptr<DurableWaiter>;
-    using WaitScheduler = DeadlineScheduler<WaitDeadline>;
     using DurableWaiters =
         std::multimap<uint64_t, std::shared_ptr<DurableWaiter>>;
-    struct DurableWaiter : DurableWaitNotification {
+    struct DurableWaiter {
         async_simple::Promise<ErrorCode> promise;
-        ErrorCode completion_error{ErrorCode::OK};
-        WaitScheduler::Handle deadline;
+        // Constructed, armed, cancelled, and destroyed exclusively under mutex.
+        std::optional<DurableWaitTimerPool::Timer> timer;
         // Protected by mutex; position is valid only while pending is true.
         DurableWaiters::iterator position;
         bool pending{false};
-
-        void Complete() override {
-            promise.setValue(ErrorCode{completion_error});
-        }
     };
 
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
@@ -156,27 +141,7 @@ struct OrderedOpLogWriter::Impl {
                   TerminalCallback terminal_callback)
         : config(std::move(config)),
           write_batch(std::move(write_batch)),
-          terminal_callback(std::move(terminal_callback)),
-          waiter_deadlines([this](const WaitDeadline& expired) {
-              current_writer_worker = this;
-              TestFailPoint::Wait("durable_wait_before_timeout");
-              std::shared_ptr<DurableWaiter> timed_out;
-              ErrorCode error;
-              {
-                  std::lock_guard<std::mutex> lock(mutex);
-                  timed_out = expired.lock();
-                  if (!timed_out || !timed_out->pending) return;
-                  timed_out->pending = false;
-                  durable_waiters.erase(timed_out->position);
-                  error = last_error == ErrorCode::OK
-                              ? ErrorCode::PERSISTENT_FAIL
-                              : last_error;
-              }
-              if (timed_out) {
-                  timed_out->completion_error = error;
-                  DurableWaitExecutor::Instance().Notify(std::move(timed_out));
-              }
-          }) {
+          terminal_callback(std::move(terminal_callback)) {
         if (this->config.max_entries_per_batch == 0) {
             this->config.max_entries_per_batch = 1;
         }
@@ -187,6 +152,24 @@ struct OrderedOpLogWriter::Impl {
             return;
         }
         next_sequence_id = this->config.initial_durable_prefix.last_seq + 1;
+    }
+
+    void OnWaitTimeout(const std::weak_ptr<DurableWaiter>& weak_waiter) {
+        WriterWorkerScope worker_scope(this);
+        TestFailPoint::Wait("durable_wait_before_timeout");
+        std::shared_ptr<DurableWaiter> timed_out;
+        ErrorCode error = ErrorCode::PERSISTENT_FAIL;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            timed_out = weak_waiter.lock();
+            if (!timed_out || !timed_out->pending) return;
+            timed_out->pending = false;
+            timed_out->timer.reset();
+            durable_waiters.erase(timed_out->position);
+            error = last_error == ErrorCode::OK ? ErrorCode::PERSISTENT_FAIL
+                                                : last_error;
+        }
+        timed_out->promise.setValue(ErrorCode{error});
     }
 
     void PublishRuntime(bool activate = false) {
@@ -249,7 +232,7 @@ struct OrderedOpLogWriter::Impl {
         for (auto it = durable_waiters.begin(); it != end;) {
             auto current = it++;
             current->second->pending = false;
-            current->second->deadline.Cancel();
+            current->second->timer.reset();
             covered.insert(durable_waiters.extract(current));
         }
         return covered;
@@ -257,7 +240,10 @@ struct OrderedOpLogWriter::Impl {
 
     DurableWaiters TakeAllWaiters() {
         DurableWaiters waiters;
-        for (auto& waiter : durable_waiters) waiter.second->pending = false;
+        for (auto& waiter : durable_waiters) {
+            waiter.second->pending = false;
+            waiter.second->timer.reset();
+        }
         waiters.swap(durable_waiters);
         return waiters;
     }
@@ -301,7 +287,6 @@ struct OrderedOpLogWriter::Impl {
             callback = terminal_callback;
             state = terminal_state;
             waiters = TakeAllWaiters();
-            waiter_deadlines.RemoveIf([](const WaitDeadline&) { return true; });
         }
         cv.notify_all();
         CompleteWaiters(std::move(waiters), error);
@@ -334,7 +319,6 @@ struct OrderedOpLogWriter::Impl {
     uint64_t next_group_id{1};
     DurablePrefix durable_prefix{config.initial_durable_prefix};
     DurableWaiters durable_waiters;
-    WaitScheduler waiter_deadlines;
     size_t open_waiting_slots{0};
     std::unordered_set<uint64_t> active_reservations;
     std::deque<PendingEntry> committed_entries;
@@ -343,6 +327,7 @@ struct OrderedOpLogWriter::Impl {
     std::deque<PendingEntry> callback_entries;
     std::thread writer_thread;
     std::thread callback_thread;
+    std::unique_ptr<DurableWaitTimerPool> timer_pool;
 };
 
 namespace {
@@ -410,7 +395,11 @@ void OrderedOpLogWriter::ActivateRuntimeMetrics() {
     if (impl_->runtime_owner == 0) impl_->PublishRuntime(true);
 }
 
-OrderedOpLogWriter::~OrderedOpLogWriter() { Stop(); }
+OrderedOpLogWriter::~OrderedOpLogWriter() {
+    CHECK(current_writer_worker != impl_.get())
+        << "OrderedOpLogWriter cannot be destroyed on a writer-owned thread";
+    Stop();
+}
 
 tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
 OrderedOpLogWriter::Reserve() {
@@ -569,49 +558,69 @@ void OrderedOpLogWriter::Abort(Reservation&& reservation) {
 
 async_simple::Future<ErrorCode> OrderedOpLogWriter::AwaitDurable(
     uint64_t sequence, std::chrono::milliseconds timeout) {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (impl_->durable_prefix.last_seq >= sequence) {
-        return async_simple::makeReadyFuture<ErrorCode>(ErrorCode::OK);
-    }
-    if (impl_->terminal_state.has_value()) {
-        return async_simple::makeReadyFuture<ErrorCode>(
-            ErrorCode{impl_->terminal_state->error});
-    }
-    if (impl_->stop_requested) {
-        return async_simple::makeReadyFuture<ErrorCode>(
-            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    }
     if (timeout < std::chrono::milliseconds::zero()) {
         return async_simple::makeReadyFuture<ErrorCode>(
             ErrorCode::INVALID_PARAMS);
     }
-    if (timeout == std::chrono::milliseconds::zero()) {
-        return async_simple::makeReadyFuture<ErrorCode>(
-            impl_->last_error == ErrorCode::OK ? ErrorCode::PERSISTENT_FAIL
-                                               : impl_->last_error);
+    // Declared before lock so any unused spare pool is stopped and joined
+    // outside impl_->mutex.
+    std::unique_ptr<DurableWaitTimerPool> spare_pool;
+    std::unique_lock<std::mutex> lock(impl_->mutex);
+    auto check_ready = [&]() -> std::optional<async_simple::Future<ErrorCode>> {
+        if (impl_->durable_prefix.last_seq >= sequence) {
+            return async_simple::makeReadyFuture<ErrorCode>(ErrorCode::OK);
+        }
+        if (impl_->terminal_state.has_value()) {
+            return async_simple::makeReadyFuture<ErrorCode>(
+                ErrorCode{impl_->terminal_state->error});
+        }
+        if (impl_->stop_requested) {
+            return async_simple::makeReadyFuture<ErrorCode>(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        if (timeout == std::chrono::milliseconds::zero()) {
+            return async_simple::makeReadyFuture<ErrorCode>(
+                impl_->last_error == ErrorCode::OK ? ErrorCode::PERSISTENT_FAIL
+                                                   : impl_->last_error);
+        }
+        return std::nullopt;
+    };
+    if (auto ready = check_ready()) {
+        return std::move(*ready);
+    }
+    const auto deadline = ComputeWaitDeadline(timeout);
+    if (deadline.has_value() && !impl_->timer_pool) {
+        lock.unlock();
+        spare_pool =
+            std::make_unique<DurableWaitTimerPool>(Impl::kTimerPoolThreads);
+        lock.lock();
+        if (auto ready = check_ready()) {
+            return std::move(*ready);
+        }
+        if (!impl_->timer_pool) {
+            impl_->timer_pool = std::move(spare_pool);
+        }
     }
     auto waiter = std::make_shared<Impl::DurableWaiter>();
     auto future = waiter->promise.getFuture();
-    if (timeout != std::chrono::milliseconds::max()) {
-        future = std::move(future).via(&DurableWaitExecutor::Instance());
-    }
     waiter->position = impl_->durable_waiters.emplace(sequence, waiter);
     waiter->pending = true;
     const auto unregister = [this](Impl::DurableWaiter* pending) {
         pending->pending = false;
+        pending->timer.reset();
         impl_->durable_waiters.erase(pending->position);
     };
     std::unique_ptr<Impl::DurableWaiter, decltype(unregister)> registration(
         waiter.get(), unregister);
-    if (timeout != std::chrono::milliseconds::max()) {
-        const auto now = std::chrono::steady_clock::now();
-        const auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::time_point::max() - now);
-        const auto deadline = timeout >= remaining
-                                  ? std::chrono::steady_clock::time_point::max()
-                                  : now + timeout;
-        waiter->deadline = impl_->waiter_deadlines.Schedule(waiter, deadline);
+    if (deadline.has_value()) {
+        waiter->timer.emplace(impl_->timer_pool->get_executor(), *deadline);
+        waiter->timer->async_wait(
+            [impl = impl_.get(),
+             weak_waiter = std::weak_ptr<Impl::DurableWaiter>(waiter)](
+                const asio::error_code& ec) {
+                if (ec == asio::error::operation_aborted) return;
+                impl->OnWaitTimeout(weak_waiter);
+            });
     }
     registration.release();
     return future;
@@ -864,6 +873,7 @@ void OrderedOpLogWriter::Start() {
 
 void OrderedOpLogWriter::Stop() {
     bool running;
+    std::unique_ptr<DurableWaitTimerPool> pool_to_stop;
     const bool worker = current_writer_worker == impl_.get();
     Impl::DurableWaiters waiters;
     ErrorCode waiter_error;
@@ -883,12 +893,13 @@ void OrderedOpLogWriter::Stop() {
             return;
         }
         if (impl_->joined) return;
+        running = impl_->running;
+        waiters = impl_->TakeAllWaiters();
         if (!worker) {
             impl_->joining = true;
             impl_->join_owner = caller;
+            pool_to_stop = std::move(impl_->timer_pool);
         }
-        running = impl_->running;
-        waiters = impl_->TakeAllWaiters();
         waiter_error = impl_->terminal_state.has_value()
                            ? impl_->terminal_state->error
                            : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
@@ -896,7 +907,10 @@ void OrderedOpLogWriter::Stop() {
     impl_->cv.notify_all();
     Impl::CompleteWaiters(std::move(waiters), waiter_error);
     if (worker) return;
-    impl_->waiter_deadlines.Stop();
+    if (pool_to_stop) {
+        pool_to_stop->Stop();
+        pool_to_stop.reset();
+    }
     if (running && impl_->writer_thread.joinable()) {
         impl_->writer_thread.join();
     }
