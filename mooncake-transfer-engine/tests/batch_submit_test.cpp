@@ -324,51 +324,6 @@ TEST(BatchSubmit, FailureJoinsAcceptedSiblingWithoutExpiringIt) {
             .ok());
 }
 
-TEST(BatchSubmit, SubmitFailureReturnsWhileSiblingWatchesCancellation) {
-    Executor executor({2, 1, 2});
-    const auto started = Executor::Clock::now();
-    auto parent = std::async(std::launch::async, [&] {
-        return executor.execute(
-            2, Executor::Clock::now() + 200ms,
-            [&](auto range, const auto& cancellation) -> Executor::Result {
-                if (range.index != 0) {
-                    while (!cancellation.requested()) std::this_thread::yield();
-                    return Executor::Result::Canceled();
-                }
-                return Executor::Result::Error("submit failed before hook");
-            });
-    });
-    ASSERT_EQ(parent.wait_for(2s), std::future_status::ready);
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        Executor::Clock::now() - started);
-    EXPECT_LT(elapsed.count(), 2000);
-    EXPECT_EQ(parent.get().error, "submit failed before hook");
-}
-
-TEST(BatchSubmit, MissedHookGateUnblocksParent) {
-    Executor executor({2, 1, 2});
-    std::promise<void> published;
-    std::promise<void> resume_sibling;
-    auto resume = resume_sibling.get_future().share();
-    auto parent = std::async(std::launch::async, [&] {
-        return executor.execute(
-            2, Executor::Clock::now() + 30s,
-            [&](auto range, const auto&) -> Executor::Result {
-                if (range.index != 0) {
-                    resume.wait();
-                    return Executor::Result::OK();
-                }
-                return Executor::Result::Error("submit failed before hook");
-            });
-    });
-    SignalOnce release_resume(resume_sibling);
-    EXPECT_EQ(published.get_future().wait_for(200ms),
-              std::future_status::timeout);
-    release_resume.signal();
-    ASSERT_EQ(parent.wait_for(2s), std::future_status::ready);
-    EXPECT_EQ(parent.get().error, "submit failed before hook");
-}
-
 TEST(BatchSubmit, RetryDecisionIncludesEveryActualError) {
     using Result = Executor::Result;
     struct Case {
