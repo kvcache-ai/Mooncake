@@ -15,6 +15,7 @@ class ReadSingleFlight {
     struct State {
         std::shared_future<Value> result;
         bool joined = false;
+        int waiters = 0;
     };
 
    public:
@@ -32,6 +33,11 @@ class ReadSingleFlight {
         bool IsLeader() const { return producer_ != nullptr; }
         const std::shared_future<Value>& Result() const {
             return state_->result;
+        }
+        // Waiters that attached before the leader retires the flight.
+        int WaiterCount() const {
+            std::lock_guard lock(owner_->mutex_);
+            return state_->waiters;
         }
 
         // Retire before inspecting joined or snapshotting a borrowed buffer:
@@ -66,6 +72,7 @@ class ReadSingleFlight {
         if (it != flights_.end()) {
             ticket.state_ = it->second;
             ticket.state_->joined = true;
+            ++ticket.state_->waiters;
         } else {
             ticket.producer_ = std::make_unique<std::promise<Value>>();
             ticket.state_ = std::make_shared<State>();
