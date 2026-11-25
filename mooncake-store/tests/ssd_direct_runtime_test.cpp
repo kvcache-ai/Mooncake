@@ -30,6 +30,15 @@
 #include "ssd_peer_directory.h"
 #include "test_server_helpers.h"
 
+namespace mooncake {
+class RealClientShutdownTestPeer {
+   public:
+    static RpcDrainGuard& OffloadDrain(RealClient& c) {
+        return c.offload_rpc_drain_;
+    }
+};
+}  // namespace mooncake
+
 namespace mooncake::testing {
 namespace {
 
@@ -250,6 +259,13 @@ class RealClientTest : public ::testing::Test {
 
     auto& IncompleteRegs(RealClient& c) {
         return c.incomplete_buffer_registrations_;
+    }
+    auto& ActiveRegs(RealClient& c) { return c.active_buffer_registrations_; }
+    auto& OffloadDrain(RealClient& c) {
+        return RealClientShutdownTestPeer::OffloadDrain(c);
+    }
+    auto ResolveWritable(const RealClient& c, void* ptr) {
+        return c.resolve_writable_buffer_region(ptr);
     }
     auto RuntimeOf(RealClient& c) { return c.snapshot_ssd_direct(); }
     tl::expected<int64_t, ErrorCode> RangedReadDirect(RealClient& c,
@@ -474,14 +490,29 @@ TEST_F(RealClientTest,
     std::array<char, 4096> pool{};
     ASSERT_EQ(requester_->register_buffer(pool.data(), pool.size()), 0);
 
-    // Simulate an un-drained / incomplete registration lease so tearDownAll()
-    // returns OBJECT_HAS_LEASE.
+    // Simulate an in-flight / incomplete registration so
+    // resolve_writable_buffer_region skips it, unregister_buffer rejects
+    // active registrations, and tearDownAll() returns OBJECT_HAS_LEASE.
+    ActiveRegs(*requester_).insert(pool.data());
     IncompleteRegs(*requester_).insert(pool.data());
+    EXPECT_FALSE(ResolveWritable(*requester_, pool.data()).has_value());
+    EXPECT_EQ(requester_->unregister_buffer(pool.data()),
+              static_cast<int>(ErrorCode::OBJECT_HAS_LEASE));
+    EXPECT_EQ(requester_->tearDownAll(),
+              static_cast<int>(ErrorCode::OBJECT_HAS_LEASE));
+    ActiveRegs(*requester_).erase(pool.data());
+    // Incomplete registration still skipped by resolve_writable_buffer_region.
+    EXPECT_FALSE(ResolveWritable(*requester_, pool.data()).has_value());
     EXPECT_EQ(requester_->tearDownAll(),
               static_cast<int>(ErrorCode::OBJECT_HAS_LEASE));
 
-    // P0-3 regression: offload_rpc_drain_ must be resumed so peer-info,
-    // recovery, and unregister_buffer still succeed after OBJECT_HAS_LEASE!
+    // P1 #3 regression: offload_rpc_drain_ MUST remain open (never closed
+    // before committing to teardown) so peer-info, recovery, offload RPCs, and
+    // unregister_buffer still succeed after OBJECT_HAS_LEASE!
+    {
+        RpcDrainGuard::ScopedCall inflight(OffloadDrain(*requester_));
+        EXPECT_TRUE(inflight.ok());
+    }
     EXPECT_NE(requester_->get_ssd_push_peer_info(), "{}");
     EXPECT_EQ(requester_->recover_ssd_push(), 0);
     EXPECT_EQ(requester_->unregister_buffer(pool.data()), 0);
@@ -500,6 +531,7 @@ TEST_F(RealClientTest, BoundedRecoveryReturnsPromptlyAgainstUnreachableOwner) {
                                "tcp", "", master_.master_address()),
         0);
     std::array<char, 4096> pool{};
+    std::array<char, 1024> unregistered{};
     ASSERT_EQ(requester_->register_buffer(pool.data(), pool.size()), 0);
 
     // Configure a peer pointing at a closed ephemeral loopback port; Read must
@@ -529,12 +561,30 @@ TEST_F(RealClientTest, BoundedRecoveryReturnsPromptlyAgainstUnreachableOwner) {
           {"tcp"}}},
         "tcp",
         true};
+    // Duplicate legacy_rpc_endpoint across distinct readable peers must fail
+    // closed atomically without mutating configured peers.
+    auto dup_legacy = fake_entry;
+    dup_legacy.fixed.identity.client_id_low += 1;
+    dup_legacy.route.owner = dup_legacy.fixed.identity;
+    dup_legacy.route.capability.owner = dup_legacy.fixed.identity;
+    EXPECT_EQ(requester_->configure_ssd_push_peers(
+                  {ssd_offload::EncodeSsdPeerDocument(fake_entry),
+                   ssd_offload::EncodeSsdPeerDocument(dup_legacy)}),
+              -1);
     ASSERT_EQ(requester_->configure_ssd_push_peers(
                   {ssd_offload::EncodeSsdPeerDocument(fake_entry)}),
               0);
 
     auto runtime = RuntimeOf(*requester_);
     ASSERT_TRUE(runtime);
+    // Unregistered buffer must fall back immediately (std::nullopt) before peer
+    // resolution or submission.
+    EXPECT_FALSE(
+        runtime
+            ->Read(closed_endpoint,
+                   {{"missing", 1024, 0, {{unregistered.data(), 1024}}}},
+                   std::chrono::milliseconds(300))
+            .has_value());
     const auto start = std::chrono::steady_clock::now();
     auto res = runtime->Read(closed_endpoint,
                              {{"missing", 1024, 0, {{pool.data(), 1024}}}},
@@ -550,16 +600,29 @@ TEST_F(RealClientTest, BoundedRecoveryReturnsPromptlyAgainstUnreachableOwner) {
     // /Upsert/Session buffer APIs and unregister_buffer returns
     // OBJECT_HAS_LEASE.
     EXPECT_TRUE(runtime->HasPending(pool.data(), 1024));
+    EXPECT_EQ(requester_->get_into("blocked-get-single", pool.data(), 1024),
+              static_cast<int64_t>(ErrorCode::INVALID_PARAMS));
     EXPECT_EQ(requester_->put_from("blocked-put", pool.data(), 1024),
               static_cast<int>(ErrorCode::INVALID_PARAMS));
     EXPECT_EQ(
         requester_->put_from_with_metadata("blocked-meta-put", pool.data(),
                                            pool.data() + 2048, 1024, 64),
         static_cast<int>(ErrorCode::INVALID_PARAMS));
+    EXPECT_EQ(
+        requester_->upsert_from("blocked-upsert-single", pool.data(), 1024),
+        static_cast<int>(ErrorCode::INVALID_PARAMS));
+    auto bupsert = requester_->batch_upsert_from({"blocked-bupsert"},
+                                                 {pool.data()}, {1024});
+    ASSERT_EQ(bupsert.size(), 1u);
+    EXPECT_EQ(bupsert[0], static_cast<int>(ErrorCode::INVALID_PARAMS));
     auto bput =
         requester_->batch_put_from({"blocked-put"}, {pool.data()}, {1024});
     ASSERT_EQ(bput.size(), 1u);
     EXPECT_EQ(bput[0], static_cast<int>(ErrorCode::INVALID_PARAMS));
+    auto bmput = requester_->batch_put_from_multi_buffers(
+        {"blocked-mput"}, {{pool.data()}}, {{1024}});
+    ASSERT_EQ(bmput.size(), 1u);
+    EXPECT_EQ(bmput[0], static_cast<int>(ErrorCode::INVALID_PARAMS));
     auto bup = requester_->batch_upsert_from_multi_buffers(
         {"blocked-upsert"}, {{pool.data()}}, {{1024}});
     ASSERT_EQ(bup.size(), 1u);
@@ -568,10 +631,20 @@ TEST_F(RealClientTest, BoundedRecoveryReturnsPromptlyAgainstUnreachableOwner) {
         {"blocked-rget"}, {{pool.data()}}, {{1024}}, {{0}});
     ASSERT_EQ(brget.size(), 1u);
     EXPECT_EQ(brget[0], static_cast<int>(ErrorCode::INVALID_PARAMS));
+    auto brget_mismatch = requester_->batch_get_into_multi_buffer_ranges(
+        {"mismatch-rget"}, {{pool.data(), pool.data() + 1024}}, {{1024}},
+        {{0}});
+    ASSERT_EQ(brget_mismatch.size(), 1u);
+    EXPECT_EQ(brget_mismatch[0], static_cast<int>(ErrorCode::INVALID_PARAMS));
     auto brput = requester_->batch_put_from_multi_buffer_ranges(
         {"blocked-rput"}, {{pool.data()}}, {{1024}}, {{0}});
     ASSERT_EQ(brput.size(), 1u);
     EXPECT_EQ(brput[0], static_cast<int>(ErrorCode::INVALID_PARAMS));
+    auto brput_mismatch = requester_->batch_put_from_multi_buffer_ranges(
+        {"mismatch-rput"}, {{pool.data(), pool.data() + 1024}}, {{1024}},
+        {{0}});
+    ASSERT_EQ(brput_mismatch.size(), 1u);
+    EXPECT_EQ(brput_mismatch[0], static_cast<int>(ErrorCode::INVALID_PARAMS));
     auto bget =
         requester_->batch_get_into({"blocked-get"}, {pool.data()}, {1024});
     ASSERT_EQ(bget.size(), 1u);
@@ -580,12 +653,22 @@ TEST_F(RealClientTest, BoundedRecoveryReturnsPromptlyAgainstUnreachableOwner) {
         {"blocked-mget"}, {{pool.data()}}, {{1024}}, false);
     ASSERT_EQ(mget.size(), 1u);
     EXPECT_EQ(mget[0], static_cast<int>(ErrorCode::INVALID_PARAMS));
+    auto granges = requester_->get_into_ranges({pool.data()}, {{"blocked-rg"}},
+                                               {{{0}}}, {{{0}}}, {{{1024}}});
+    ASSERT_EQ(granges.size(), 1u);
+    ASSERT_EQ(granges[0].size(), 1u);
+    ASSERT_EQ(granges[0][0].size(), 1u);
+    EXPECT_EQ(granges[0][0][0], static_cast<int>(ErrorCode::INVALID_PARAMS));
     EXPECT_EQ(requester_->unregister_buffer(pool.data()),
               static_cast<int>(ErrorCode::OBJECT_HAS_LEASE));
     // Retryable tearDownAll reports OBJECT_HAS_LEASE WITHOUT closing the
-    // requester or wedging subsequent operations.
+    // requester or offload_rpc_drain_.
     EXPECT_EQ(requester_->tearDownAll(),
               static_cast<int>(ErrorCode::OBJECT_HAS_LEASE));
+    {
+        RpcDrainGuard::ScopedCall inflight(OffloadDrain(*requester_));
+        EXPECT_TRUE(inflight.ok());
+    }
     EXPECT_EQ(requester_->recover_ssd_push(), 1);
     EXPECT_NE(requester_->get_ssd_push_peer_info(), "{}");
     // Destructor teardown is non-retryable: quarantines un-drained region while

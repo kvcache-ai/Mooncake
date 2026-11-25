@@ -95,13 +95,11 @@ TransferEngine metadata.
 | `MOONCAKE_OFFLOAD_SSD_PUSH` | `false` | Enable opt-in TCP SSD Owner-Push |
 | `MOONCAKE_OFFLOAD_SSD_PEER_DIRECTORY` | Unset | Private `0700` peer directory for credential bootstrap |
 | `MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ` | `false` | Enable same-node bounded streaming restore |
-| `MOONCAKE_OFFLOAD_STREAM_USE_URING` | Enabled for push when built with liburing | Use persistent `io_uring` read workers |
-| `MOONCAKE_OFFLOAD_STREAM_DIRECT_IO` | `false` | Open SSD backing files with `O_DIRECT` |
-| `MOONCAKE_OFFLOAD_STREAM_FIXED_BUFFERS` | `false` | Register slot buffers with request-local `io_uring` |
+| `MOONCAKE_OFFLOAD_STREAM_USE_URING` | `false` | Use persistent `io_uring` read workers when built with liburing |
 | `MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES` | `1048576` (1 MiB) | Staging bytes per pipeline slot |
 | `MOONCAKE_OFFLOAD_STREAM_SLOTS` | `4` | Maximum concurrent slots per pipeline |
 | `MOONCAKE_OFFLOAD_STREAM_READ_THREADS` | `4` | Streaming read worker count |
 | `MOONCAKE_OFFLOAD_STREAM_WRITE_THREADS` | `2` | Streaming write worker count |
 | `MOONCAKE_OFFLOAD_STREAM_MAX_OUTSTANDING` | `64` (`512` with push) | Maximum queued streaming operations |
-| `MOONCAKE_OFFLOAD_READ_IO_THREADS` | `64` | Dedicated legacy restore RPC executor threads |
+| `MOONCAKE_OFFLOAD_READ_IO_THREADS` | `8` | Dedicated legacy restore RPC executor threads |
 | `MOONCAKE_OFFLOAD_READ_CONCURRENCY` | `1` | Concurrent Owner groups per batch (capped at `8`) |

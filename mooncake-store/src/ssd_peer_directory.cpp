@@ -397,7 +397,12 @@ bool IsNonWildcardNumericHost(const std::string& host) {
     }
     in6_addr v6{};
     if (inet_pton(AF_INET6, host.c_str(), &v6) == 1) {
-        return !IN6_IS_ADDR_UNSPECIFIED(&v6);
+        if (IN6_IS_ADDR_UNSPECIFIED(&v6)) return false;
+        if (IN6_IS_ADDR_V4MAPPED(&v6) && v6.s6_addr[12] == 0 &&
+            v6.s6_addr[13] == 0 && v6.s6_addr[14] == 0 && v6.s6_addr[15] == 0) {
+            return false;
+        }
+        return true;
     }
     return false;
 }
@@ -435,15 +440,22 @@ DestinationError SsdPeerDirectory::Publish(const SsdPeerDirectoryEntry& entry) {
     if (!impl_->Secure()) return DestinationError::kUnauthorized;
     if (!impl_->publication.empty()) return DestinationError::kDuplicate;
 
-    // Acquire an exclusive non-blocking flock on our epoch's sidecar lock file
-    // before publishing the discovery record so dead crash leftovers can be
-    // distinguished from live peers without unlinking other processes' files.
+    // Exclusively create and flock our epoch's sidecar lock file before
+    // publishing the discovery record so dead crash leftovers can be
+    // distinguished from live peers and an existing lock file is never
+    // clobbered or unlinked on duplicate publication.
     auto lock_name = LockName(entry.fixed.identity);
-    File liveness_lock(openat(impl_->directory.get(), lock_name.c_str(),
-                              O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600));
-    if (liveness_lock.get() < 0 ||
+    File liveness_lock(
+        openat(impl_->directory.get(), lock_name.c_str(),
+               O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+    if (liveness_lock.get() < 0) {
+        return errno == EEXIST ? DestinationError::kDuplicate
+                               : DestinationError::kTransportError;
+    }
+    if (fchmod(liveness_lock.get(), 0600) != 0 ||
         flock(liveness_lock.get(), LOCK_EX | LOCK_NB) != 0) {
-        return DestinationError::kDuplicate;
+        unlinkat(impl_->directory.get(), lock_name.c_str(), 0);
+        return DestinationError::kTransportError;
     }
 
     uint64_t nonce{};

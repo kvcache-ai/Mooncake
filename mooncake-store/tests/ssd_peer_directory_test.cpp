@@ -268,5 +268,31 @@ TEST_F(SsdPeerDirectoryTest,
     EXPECT_LE(json_count, 65u);
 }
 
+TEST_F(SsdPeerDirectoryTest,
+       RejectsIpv4MappedWildcardAndDuplicatePublishPreservesSidecarLock) {
+    EXPECT_FALSE(IsNonWildcardNumericHost("::ffff:0.0.0.0"));
+    EXPECT_TRUE(IsNonWildcardNumericHost("::ffff:127.0.0.1"));
+
+    // Seed an existing dead crash leftover (.json + unlocked .lock).
+    auto stale = Entry(77, 1);
+    std::ostringstream stem;
+    stem << "ssd-peer-" << std::hex << std::setfill('0') << std::setw(16)
+         << stale.fixed.identity.client_id_high << '-' << std::setw(16)
+         << stale.fixed.identity.client_id_low << '-' << std::setw(16)
+         << stale.fixed.identity.boot_epoch;
+    const auto json_path = path / (stem.str() + ".json");
+    const auto lock_path = path / ("." + stem.str() + ".lock");
+    std::ofstream(json_path, std::ios::trunc) << EncodeSsdPeerDocument(stale);
+    ASSERT_EQ(chmod(json_path.c_str(), 0600), 0);
+    std::ofstream(lock_path, std::ios::trunc);
+    ASSERT_EQ(chmod(lock_path.c_str(), 0600), 0);
+
+    // Duplicate Publish() with the same identity/epoch must fail closed with
+    // kDuplicate WITHOUT unlinking the sidecar .lock file.
+    SsdPeerDirectory dup_pub(path);
+    EXPECT_EQ(dup_pub.Publish(stale), DestinationError::kDuplicate);
+    EXPECT_TRUE(std::filesystem::exists(lock_path));
+}
+
 }  // namespace
 }  // namespace mooncake::ssd_offload

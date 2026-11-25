@@ -1284,6 +1284,7 @@ class RealClient : public PyClient {
     // stay mapped until the cleanup retry succeeds (or process exit).
     std::unordered_map<void *, BufferRegistrationRecord>
         registered_buffer_sizes_;
+    std::unordered_set<void *> active_buffer_registrations_;
     std::unordered_set<void *> incomplete_buffer_registrations_;
     std::optional<WritableBufferRegion> local_buffer_region_;
 

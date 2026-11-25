@@ -13,7 +13,8 @@ namespace {
 bool Valid(PeerIdentity p) {
     return (p.client_id_high || p.client_id_low) && p.boot_epoch;
 }
-bool ValidPeers(const std::vector<SsdFixedL2Peer>& peers, size_t max_peers = 64) {
+bool ValidPeers(const std::vector<SsdFixedL2Peer>& peers,
+                size_t max_peers = 64) {
     if (peers.size() > max_peers) return false;
     for (size_t i = 0; i < peers.size(); ++i) {
         const auto& p = peers[i];

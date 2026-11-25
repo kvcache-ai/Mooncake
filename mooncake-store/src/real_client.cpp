@@ -2237,7 +2237,8 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal(
         {
             std::shared_lock<std::shared_mutex> buffer_lock(
                 registered_buffer_mutex_);
-            if (!incomplete_buffer_registrations_.empty()) {
+            if (!active_buffer_registrations_.empty() ||
+                !incomplete_buffer_registrations_.empty()) {
                 return tl::unexpected(ErrorCode::OBJECT_HAS_LEASE);
             }
         }
@@ -2249,16 +2250,13 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal(
 
     // Serialize complete cleanup, including retries after a failed unregister.
     closed_.store(true, std::memory_order_release);
-    // Stop new offload work before draining any pool it can submit to.
-    while (!offload_rpc_drain_.drain_for(std::chrono::seconds(30))) {
-        LOG(WARNING) << "Waiting for in-flight offload RPCs during teardown";
-    }
 
-    // Close SsdDirectRuntime non-destructively first on retryable close so a
-    // racing Read() that started right before closed_=true cannot leave the
-    // requester half-closed. On non-retryable destructor teardown, force
-    // quarantine of any un-drained destination registrations and proceed with
-    // full thread/server/storage/segment cleanup.
+    // Close SsdDirectRuntime non-destructively BEFORE irreversibly closing
+    // offload_rpc_drain_ so a retryable OBJECT_HAS_LEASE bail-out leaves both
+    // SsdFixedL2Requester and offload_rpc_drain_ completely healthy for
+    // recovery and close() retries. On non-retryable destructor teardown,
+    // force quarantine of any un-drained destination registrations and proceed
+    // with full thread/server/storage/segment cleanup.
     std::shared_ptr<ssd_offload::SsdDirectRuntime> direct_to_close =
         snapshot_ssd_direct();
     bool direct_quarantined = false;
@@ -2268,7 +2266,8 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal(
             {
                 std::shared_lock<std::shared_mutex> buffer_lock(
                     registered_buffer_mutex_);
-                has_incomplete = !incomplete_buffer_registrations_.empty();
+                has_incomplete = !active_buffer_registrations_.empty() ||
+                                 !incomplete_buffer_registrations_.empty();
             }
             if (has_incomplete ||
                 direct_to_close->Close(/*force_quarantine=*/false) != 0) {
@@ -2282,10 +2281,17 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal(
     } else if (allow_retry) {
         std::shared_lock<std::shared_mutex> buffer_lock(
             registered_buffer_mutex_);
-        if (!incomplete_buffer_registrations_.empty()) {
+        if (!active_buffer_registrations_.empty() ||
+            !incomplete_buffer_registrations_.empty()) {
             closed_.store(false, std::memory_order_release);
             return tl::unexpected(ErrorCode::OBJECT_HAS_LEASE);
         }
+    }
+
+    // Committed to teardown: stop new offload work before draining any pool it
+    // can submit to.
+    while (!offload_rpc_drain_.drain_for(std::chrono::seconds(30))) {
+        LOG(WARNING) << "Waiting for in-flight offload RPCs during teardown";
     }
 
     // Drain the prefetch pool before any resource release below. Pool jobs
@@ -5184,20 +5190,31 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     // Reserve the buffer key under registered_buffer_mutex_, then release the
     // lock across slow TE / NoF / fixed-pool registration syscalls so
     // concurrent resolve_writable_buffer_region() lookups never stall.
+    // active_buffer_registrations_ prevents concurrent unregister_buffer() or
+    // resolve_writable_buffer_region() from observing a half-registered buffer.
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         if (closed_.load(std::memory_order_acquire) || !client_) {
             LOG(ERROR) << "Client is not initialized";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
+        if (active_buffer_registrations_.contains(buffer)) {
+            return tl::unexpected(ErrorCode::OBJECT_HAS_LEASE);
+        }
         if (registered_buffer_sizes_.count(buffer)) {
             LOG(ERROR) << "Buffer " << buffer << " is already registered";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
-        registered_buffer_sizes_.emplace(buffer,
-                                         BufferRegistrationRecord{size});
-        if (fixed_l2) {
+        auto [reg_it, _] = registered_buffer_sizes_.emplace(
+            buffer, BufferRegistrationRecord{size});
+        try {
+            active_buffer_registrations_.insert(buffer);
             incomplete_buffer_registrations_.insert(buffer);
+        } catch (...) {
+            active_buffer_registrations_.erase(buffer);
+            incomplete_buffer_registrations_.erase(buffer);
+            registered_buffer_sizes_.erase(reg_it);
+            throw;
         }
     }
 
@@ -5208,16 +5225,21 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
             try {
                 if ((fixed_l2 && direct_rt->RevokeFixedPool(buffer) != 0) ||
                     !client_->unregisterLocalMemory(buffer, true)) {
+                    std::unique_lock<std::shared_mutex> lock(
+                        registered_buffer_mutex_);
+                    active_buffer_registrations_.erase(buffer);
                     return tl::unexpected(ErrorCode::OBJECT_HAS_LEASE);
                 }
             } catch (...) {
+                std::unique_lock<std::shared_mutex> lock(
+                    registered_buffer_mutex_);
+                active_buffer_registrations_.erase(buffer);
                 return tl::unexpected(ErrorCode::OBJECT_HAS_LEASE);
             }
         }
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        if (fixed_l2) {
-            incomplete_buffer_registrations_.erase(buffer);
-        }
+        active_buffer_registrations_.erase(buffer);
+        incomplete_buffer_registrations_.erase(buffer);
         registered_buffer_sizes_.erase(buffer);
         return tl::unexpected(error);
     };
@@ -5253,13 +5275,16 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
                        "MC_NOF_BACKEND=none if NoF is not intended.";
             }
         }
-        if (fixed_l2) {
+        {
             std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+            active_buffer_registrations_.erase(buffer);
             incomplete_buffer_registrations_.erase(buffer);
         }
         return {};
     } catch (...) {
         if (registration_started && !registered) {
+            std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+            active_buffer_registrations_.erase(buffer);
             return tl::unexpected(ErrorCode::OBJECT_HAS_LEASE);
         }
         return rollback(ErrorCode::INTERNAL_ERROR);
@@ -5275,6 +5300,24 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    struct ActiveBufferOpGuard {
+        RealClient *self{nullptr};
+        void *buf{nullptr};
+        ~ActiveBufferOpGuard() {
+            if (!self) return;
+            std::unique_lock<std::shared_mutex> lock(
+                self->registered_buffer_mutex_);
+            self->active_buffer_registrations_.erase(buf);
+        }
+    } active_guard;
+    {
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        if (!active_buffer_registrations_.insert(buffer).second) {
+            return tl::unexpected(ErrorCode::OBJECT_HAS_LEASE);
+        }
+        active_guard.self = this;
+        active_guard.buf = buffer;
     }
     if (auto direct_rt = snapshot_ssd_direct();
         direct_rt && direct_rt->RevokeFixedPool(buffer) != 0) {
@@ -5348,6 +5391,10 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
     std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     const auto target = reinterpret_cast<uintptr_t>(buffer);
     for (const auto &[registered_buffer, record] : registered_buffer_sizes_) {
+        if (active_buffer_registrations_.contains(registered_buffer) ||
+            incomplete_buffer_registrations_.contains(registered_buffer)) {
+            continue;
+        }
         const auto base = reinterpret_cast<uintptr_t>(registered_buffer);
         if (target < base) {
             continue;
@@ -5802,6 +5849,20 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
     size_t size, bool size_is_buffer_capacity, bool verify_checksum) {
+    if (!buffer) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto address = reinterpret_cast<uintptr_t>(buffer);
+    if (dst_offset > UINTPTR_MAX - address ||
+        size > UINTPTR_MAX - address - dst_offset) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (auto direct_rt = snapshot_ssd_direct();
+        direct_rt &&
+        direct_rt->HasPending(reinterpret_cast<void *>(address + dst_offset),
+                              size)) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     auto metadata_result = resolve_ranged_read_metadata(key);
     if (!metadata_result) {
         if ((metadata_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
@@ -5930,6 +5991,26 @@ RealClient::get_into_ranges_internal(
                 dst_offsets.size() != sizes.size()) {
                 continue;
             }
+            if (auto direct_rt = snapshot_ssd_direct()) {
+                const auto address = reinterpret_cast<uintptr_t>(buffers[i]);
+                bool has_unblocked_range = false;
+                for (size_t k = 0; k < sizes.size(); ++k) {
+                    if (dst_offsets[k] > capacities[i] ||
+                        sizes[k] > capacities[i] - dst_offsets[k] ||
+                        dst_offsets[k] > UINTPTR_MAX - address ||
+                        sizes[k] > UINTPTR_MAX - address - dst_offsets[k] ||
+                        direct_rt->HasPending(
+                            reinterpret_cast<void *>(address + dst_offsets[k]),
+                            sizes[k])) {
+                        continue;
+                    }
+                    has_unblocked_range = true;
+                    break;
+                }
+                if (!has_unblocked_range) {
+                    continue;
+                }
+            }
             auto &metadata_result = metadata_for(keys[j]);
             if (!metadata_result) {
                 std::fill(range_results.begin(), range_results.end(),
@@ -6028,10 +6109,6 @@ RealClient::get_into_ranges_internal(
                 }
                 const auto &handle =
                     metadata.replica.get_memory_descriptor().buffer_descriptor;
-                auto [lease_it, inserted] = scatter_leases.try_emplace(keys[j]);
-                if (inserted)
-                    lease_it->second.expires_at =
-                        metadata.query_result.lease_timeout;
                 struct Fragments {
                     std::vector<size_t> offsets, sources, lengths, indices;
                 };
@@ -6058,6 +6135,10 @@ RealClient::get_into_ranges_internal(
                     }
                     if (selected_fragments->indices.empty()) continue;
                 }
+                auto [lease_it, inserted] = scatter_leases.try_emplace(keys[j]);
+                if (inserted)
+                    lease_it->second.expires_at =
+                        metadata.query_result.lease_timeout;
                 auto transfer = TransferEngine::ScatterTransferRange{
                     .opcode = TransferRequest::READ,
                     .remote_segment = handle.transport_endpoint_,
@@ -7734,136 +7815,163 @@ RealClient::batch_get_into_internal(
         batch_slices[op.key] = op.slices;
     }
     if (!valid_operations.empty()) {
-        // Execute batch transfer
-        const auto batch_get_results =
-            client_->BatchGet(batch_keys, batch_query_results, batch_slices);
-
-        // Process transfer results
-        for (size_t j = 0; j < batch_get_results.size(); ++j) {
-            const auto &op = valid_operations[dedup.primaries[j]];
-
-            if (!batch_get_results[j]) {
-                const auto error = batch_get_results[j].error();
-                LOG(ERROR) << "BatchGet failed for key '" << op.key
-                           << "': " << toString(error);
-                results[op.original_index] = tl::unexpected(error);
+        if (deadline.Expired()) {
+            for (const auto &op : valid_operations) {
+                results[op.original_index] =
+                    tl::unexpected(ErrorCode::TRANSFER_FAIL);
             }
-        }
+        } else {
+            // Execute batch transfer
+            const auto batch_get_results = client_->BatchGet(
+                batch_keys, batch_query_results, batch_slices);
+            const bool post_expired = deadline.Expired();
 
-        std::vector<DuplicateFanOutJob> dup_jobs;
-        for (const auto &[dup_idx, primary_idx] : dedup.duplicates) {
-            const auto &dup_op = valid_operations[dup_idx];
-            const auto &primary_op = valid_operations[primary_idx];
-            dup_jobs.push_back(DuplicateFanOutJob{
-                .dup_result_index = dup_op.original_index,
-                .primary_result_index = primary_op.original_index,
-                .key = dup_op.key,
-                .dup_bytes = dup_op.total_size,
-                .primary_bytes = primary_op.total_size,
-                .copy = [dst = dup_op.slices, src = primary_op.slices,
-                         size = dup_op.total_size, key = dup_op.key]() {
-                    return CopySlicesMaybeDevice(
-                        dst, src, size, "duplicate fan-out, key: " + key);
-                }});
+            // Process transfer results
+            for (size_t j = 0; j < batch_get_results.size(); ++j) {
+                const auto &op = valid_operations[dedup.primaries[j]];
+
+                if (!batch_get_results[j]) {
+                    const auto error = batch_get_results[j].error();
+                    LOG(ERROR) << "BatchGet failed for key '" << op.key
+                               << "': " << toString(error);
+                    results[op.original_index] = tl::unexpected(error);
+                } else if (post_expired) {
+                    results[op.original_index] =
+                        tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                }
+            }
+
+            std::vector<DuplicateFanOutJob> dup_jobs;
+            for (const auto &[dup_idx, primary_idx] : dedup.duplicates) {
+                const auto &dup_op = valid_operations[dup_idx];
+                const auto &primary_op = valid_operations[primary_idx];
+                dup_jobs.push_back(DuplicateFanOutJob{
+                    .dup_result_index = dup_op.original_index,
+                    .primary_result_index = primary_op.original_index,
+                    .key = dup_op.key,
+                    .dup_bytes = dup_op.total_size,
+                    .primary_bytes = primary_op.total_size,
+                    .copy = [dst = dup_op.slices, src = primary_op.slices,
+                             size = dup_op.total_size, key = dup_op.key]() {
+                        return CopySlicesMaybeDevice(
+                            dst, src, size, "duplicate fan-out, key: " + key);
+                    }});
+            }
+            FanOutDuplicates(dup_jobs, results);
         }
-        FanOutDuplicates(dup_jobs, results);
     }
 
     // ---- File-backed replicas: BatchGet into temp buffers, then scatter ----
     if (!disk_operations.empty()) {
-        std::vector<std::string> disk_batch_keys;
-        std::vector<QueryResult> disk_batch_qrs;
-        std::unordered_map<std::string, std::vector<Slice>> disk_batch_slices;
-        std::vector<size_t> disk_batch_indices;
-        std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
-            disk_temp_handles;
-        // Duplicate keys share the first occurrence's temp buffer; the
-        // verified bytes are scattered into every duplicate destination
-        // after the batch read.
-        const auto disk_dedup = PlanDuplicateKeys(disk_operations);
-
-        for (const size_t di : disk_dedup.primaries) {
-            auto &op = disk_operations[di];
-            const auto &replica = op.replica;
-            const char *replica_type =
-                replica.is_dfs_replica() ? "DFS" : "DISK";
-            auto alloc_result =
-                client_buffer_allocator_->allocate(op.total_size);
-            if (!alloc_result) {
-                LOG(ERROR) << "Failed to allocate temp buffer for "
-                           << replica_type << " read, key: " << op.key
-                           << ", size: " << op.total_size;
+        if (deadline.Expired()) {
+            for (const auto &op : disk_operations) {
                 results[op.original_index] =
-                    tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-                continue;
+                    tl::unexpected(ErrorCode::TRANSFER_FAIL);
             }
-            auto handle =
-                std::make_unique<BufferHandle>(std::move(*alloc_result));
-            std::vector<Slice> disk_slices;
-            allocateSlices(disk_slices, replica, handle->ptr());
-            disk_batch_keys.push_back(op.key);
-            disk_batch_qrs.push_back(
-                FilterQueryResult(op.query_result, replica));
-            disk_batch_slices[op.key] = std::move(disk_slices);
-            disk_batch_indices.push_back(di);
-            disk_temp_handles.emplace(op.key, std::move(handle));
-        }
+        } else {
+            std::vector<std::string> disk_batch_keys;
+            std::vector<QueryResult> disk_batch_qrs;
+            std::unordered_map<std::string, std::vector<Slice>>
+                disk_batch_slices;
+            std::vector<size_t> disk_batch_indices;
+            std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
+                disk_temp_handles;
+            // Duplicate keys share the first occurrence's temp buffer; the
+            // verified bytes are scattered into every duplicate destination
+            // after the batch read.
+            const auto disk_dedup = PlanDuplicateKeys(disk_operations);
 
-        if (!disk_batch_keys.empty()) {
-            auto disk_results = client_->BatchGet(
-                disk_batch_keys, disk_batch_qrs, disk_batch_slices);
-
-            for (size_t di = 0; di < disk_batch_indices.size(); ++di) {
-                const auto &key = disk_batch_keys[di];
-                auto &op = disk_operations[disk_batch_indices[di]];
-                auto handle_it = disk_temp_handles.find(key);
+            for (const size_t di : disk_dedup.primaries) {
+                auto &op = disk_operations[di];
+                const auto &replica = op.replica;
                 const char *replica_type =
-                    op.replica.is_dfs_replica() ? "DFS" : "DISK";
-                if (!disk_results[di]) {
-                    LOG(ERROR)
-                        << replica_type << " BatchGet failed for key '" << key
-                        << "': " << toString(disk_results[di].error());
+                    replica.is_dfs_replica() ? "DFS" : "DISK";
+                auto alloc_result =
+                    client_buffer_allocator_->allocate(op.total_size);
+                if (!alloc_result) {
+                    LOG(ERROR) << "Failed to allocate temp buffer for "
+                               << replica_type << " read, key: " << op.key
+                               << ", size: " << op.total_size;
                     results[op.original_index] =
-                        tl::unexpected(disk_results[di].error());
+                        tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
                     continue;
                 }
-                if (auto r = scatter_host_to_maybe_device(
-                        op.dst_buffer,
-                        static_cast<char *>(handle_it->second->ptr()),
-                        op.total_size,
-                        std::string(replica_type) + " read, key: " + key);
-                    !r) {
-                    results[op.original_index] = tl::make_unexpected(r.error());
+                auto handle =
+                    std::make_unique<BufferHandle>(std::move(*alloc_result));
+                std::vector<Slice> disk_slices;
+                allocateSlices(disk_slices, replica, handle->ptr());
+                disk_batch_keys.push_back(op.key);
+                disk_batch_qrs.push_back(
+                    FilterQueryResult(op.query_result, replica));
+                disk_batch_slices[op.key] = std::move(disk_slices);
+                disk_batch_indices.push_back(di);
+                disk_temp_handles.emplace(op.key, std::move(handle));
+            }
+
+            if (!disk_batch_keys.empty()) {
+                auto disk_results = client_->BatchGet(
+                    disk_batch_keys, disk_batch_qrs, disk_batch_slices);
+                const bool post_expired = deadline.Expired();
+
+                for (size_t di = 0; di < disk_batch_indices.size(); ++di) {
+                    const auto &key = disk_batch_keys[di];
+                    auto &op = disk_operations[disk_batch_indices[di]];
+                    auto handle_it = disk_temp_handles.find(key);
+                    const char *replica_type =
+                        op.replica.is_dfs_replica() ? "DFS" : "DISK";
+                    if (!disk_results[di]) {
+                        LOG(ERROR)
+                            << replica_type << " BatchGet failed for key '"
+                            << key
+                            << "': " << toString(disk_results[di].error());
+                        results[op.original_index] =
+                            tl::unexpected(disk_results[di].error());
+                        continue;
+                    }
+                    if (post_expired) {
+                        results[op.original_index] =
+                            tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                        continue;
+                    }
+                    if (auto r = scatter_host_to_maybe_device(
+                            op.dst_buffer,
+                            static_cast<char *>(handle_it->second->ptr()),
+                            op.total_size,
+                            std::string(replica_type) + " read, key: " + key);
+                        !r) {
+                        results[op.original_index] =
+                            tl::make_unexpected(r.error());
+                    }
                 }
             }
-        }
 
-        std::vector<DuplicateFanOutJob> dup_jobs;
-        for (const auto &[dup_di, primary_di] : disk_dedup.duplicates) {
-            const auto &dup_op = disk_operations[dup_di];
-            const auto &primary_op = disk_operations[primary_di];
-            dup_jobs.push_back(DuplicateFanOutJob{
-                .dup_result_index = dup_op.original_index,
-                .primary_result_index = primary_op.original_index,
-                .key = dup_op.key,
-                .dup_bytes = dup_op.total_size,
-                .primary_bytes = primary_op.total_size,
-                .copy = [&disk_temp_handles, dst = dup_op.dst_buffer,
-                         size = dup_op.total_size, key = dup_op.key,
-                         is_dfs = dup_op.replica.is_dfs_replica()]()
-                    -> tl::expected<void, ErrorCode> {
-                    auto handle_it = disk_temp_handles.find(key);
-                    if (handle_it == disk_temp_handles.end()) {
-                        return tl::make_unexpected(
-                            ErrorCode::NO_AVAILABLE_HANDLE);
-                    }
-                    return CopyMaybeDevice(
-                        dst, handle_it->second->ptr(), size,
-                        std::string(is_dfs ? "DFS" : "DISK") +
-                            " duplicate read, key: " + key);
-                }});
+            std::vector<DuplicateFanOutJob> dup_jobs;
+            for (const auto &[dup_di, primary_di] : disk_dedup.duplicates) {
+                const auto &dup_op = disk_operations[dup_di];
+                const auto &primary_op = disk_operations[primary_di];
+                dup_jobs.push_back(DuplicateFanOutJob{
+                    .dup_result_index = dup_op.original_index,
+                    .primary_result_index = primary_op.original_index,
+                    .key = dup_op.key,
+                    .dup_bytes = dup_op.total_size,
+                    .primary_bytes = primary_op.total_size,
+                    .copy = [&disk_temp_handles, dst = dup_op.dst_buffer,
+                             size = dup_op.total_size, key = dup_op.key,
+                             is_dfs = dup_op.replica.is_dfs_replica()]()
+                        -> tl::expected<void, ErrorCode> {
+                        auto handle_it = disk_temp_handles.find(key);
+                        if (handle_it == disk_temp_handles.end()) {
+                            return tl::make_unexpected(
+                                ErrorCode::NO_AVAILABLE_HANDLE);
+                        }
+                        return CopyMaybeDevice(
+                            dst, handle_it->second->ptr(), size,
+                            std::string(is_dfs ? "DFS" : "DISK") +
+                                " duplicate read, key: " + key);
+                    }});
+            }
+            FanOutDuplicates(dup_jobs, results);
         }
-        FanOutDuplicates(dup_jobs, results);
     }
 
     // Prepare batch transfer data structures
@@ -8849,6 +8957,9 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     }
     if (auto direct_rt = snapshot_ssd_direct()) {
         for (size_t i = 0; i < all_buffers.size(); ++i) {
+            if (all_buffers[i].size() != all_sizes[i].size()) {
+                continue;
+            }
             for (size_t j = 0; j < all_buffers[i].size(); ++j) {
                 if (direct_rt->HasPending(all_buffers[i][j], all_sizes[i][j])) {
                     return results;
@@ -9021,7 +9132,7 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges(
     if (auto direct_rt = snapshot_ssd_direct()) {
         for (size_t i = 0; i < all_buffers.size(); ++i) {
             if (all_buffers[i].size() != all_sizes[i].size()) {
-                return ToPyResults(results);
+                continue;
             }
             for (size_t j = 0; j < all_buffers[i].size(); ++j) {
                 if (direct_rt->HasPending(all_buffers[i][j], all_sizes[i][j])) {
@@ -9618,52 +9729,64 @@ RealClient::batch_get_into_multi_buffers_internal(
 
     // ---- Memory/NOF replica: existing BatchGet path ----
     if (!valid_operations.empty()) {
-        std::vector<std::string> batch_keys;
-        std::vector<QueryResult> batch_query_results;
-        std::unordered_map<std::string, std::vector<Slice>> batch_slices;
-        batch_keys.reserve(valid_operations.size());
-        batch_query_results.reserve(valid_operations.size());
-        // The slice map is keyed by string, so duplicate keys would collapse
-        // onto one destination. Transfer each unique key once (first
-        // occurrence as primary) and fan the verified bytes out locally.
-        const auto dedup = PlanDuplicateKeys(valid_operations);
-        for (const size_t op_idx : dedup.primaries) {
-            const auto &op = valid_operations[op_idx];
-            batch_keys.push_back(op.key);
-            batch_query_results.push_back(op.query_result);
-            batch_slices[op.key] = op.slices;
-        }
-
-        auto batch_get_results = client_->BatchGet(
-            batch_keys, batch_query_results, batch_slices, group_by_target);
-
-        for (size_t j = 0; j < batch_get_results.size(); ++j) {
-            const auto &op = valid_operations[dedup.primaries[j]];
-            if (!batch_get_results[j]) {
-                const auto error = batch_get_results[j].error();
-                LOG(ERROR) << "BatchGet failed for key '" << op.key
-                           << "': " << toString(error);
-                results[op.original_index] = tl::unexpected(error);
+        if (deadline.Expired()) {
+            for (const auto &op : valid_operations) {
+                results[op.original_index] =
+                    tl::unexpected(ErrorCode::TRANSFER_FAIL);
             }
-        }
+        } else {
+            std::vector<std::string> batch_keys;
+            std::vector<QueryResult> batch_query_results;
+            std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+            batch_keys.reserve(valid_operations.size());
+            batch_query_results.reserve(valid_operations.size());
+            // The slice map is keyed by string, so duplicate keys would
+            // collapse onto one destination. Transfer each unique key once
+            // (first occurrence as primary) and fan the verified bytes out
+            // locally.
+            const auto dedup = PlanDuplicateKeys(valid_operations);
+            for (const size_t op_idx : dedup.primaries) {
+                const auto &op = valid_operations[op_idx];
+                batch_keys.push_back(op.key);
+                batch_query_results.push_back(op.query_result);
+                batch_slices[op.key] = op.slices;
+            }
 
-        std::vector<DuplicateFanOutJob> dup_jobs;
-        for (const auto &[dup_idx, primary_idx] : dedup.duplicates) {
-            const auto &dup_op = valid_operations[dup_idx];
-            const auto &primary_op = valid_operations[primary_idx];
-            dup_jobs.push_back(DuplicateFanOutJob{
-                .dup_result_index = dup_op.original_index,
-                .primary_result_index = primary_op.original_index,
-                .key = dup_op.key,
-                .dup_bytes = dup_op.total_size,
-                .primary_bytes = primary_op.total_size,
-                .copy = [dst = dup_op.slices, src = primary_op.slices,
-                         size = dup_op.total_size, key = dup_op.key]() {
-                    return CopySlicesMaybeDevice(
-                        dst, src, size, "duplicate fan-out, key: " + key);
-                }});
+            auto batch_get_results = client_->BatchGet(
+                batch_keys, batch_query_results, batch_slices, group_by_target);
+            const bool post_expired = deadline.Expired();
+
+            for (size_t j = 0; j < batch_get_results.size(); ++j) {
+                const auto &op = valid_operations[dedup.primaries[j]];
+                if (!batch_get_results[j]) {
+                    const auto error = batch_get_results[j].error();
+                    LOG(ERROR) << "BatchGet failed for key '" << op.key
+                               << "': " << toString(error);
+                    results[op.original_index] = tl::unexpected(error);
+                } else if (post_expired) {
+                    results[op.original_index] =
+                        tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                }
+            }
+
+            std::vector<DuplicateFanOutJob> dup_jobs;
+            for (const auto &[dup_idx, primary_idx] : dedup.duplicates) {
+                const auto &dup_op = valid_operations[dup_idx];
+                const auto &primary_op = valid_operations[primary_idx];
+                dup_jobs.push_back(DuplicateFanOutJob{
+                    .dup_result_index = dup_op.original_index,
+                    .primary_result_index = primary_op.original_index,
+                    .key = dup_op.key,
+                    .dup_bytes = dup_op.total_size,
+                    .primary_bytes = primary_op.total_size,
+                    .copy = [dst = dup_op.slices, src = primary_op.slices,
+                             size = dup_op.total_size, key = dup_op.key]() {
+                        return CopySlicesMaybeDevice(
+                            dst, src, size, "duplicate fan-out, key: " + key);
+                    }});
+            }
+            FanOutDuplicates(dup_jobs, results);
         }
-        FanOutDuplicates(dup_jobs, results);
     }
 
     // ---- LOCAL_DISK / file-backed replica read paths ----
@@ -9786,7 +9909,19 @@ RealClient::batch_get_into_multi_buffers_internal(
         }
 
         // DISK/DFS: one batched BatchGet into temp buffers, then scatter.
-        {
+        if (deadline.Expired()) {
+            for (const auto &[key, op] : valid_local_disk_ops) {
+                if (op.is_local_disk) continue;
+                results[op.original_index] =
+                    tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            }
+            for (const auto &dup : duplicate_disk_ops) {
+                const auto &primary_op = valid_local_disk_ops.at(dup.key);
+                if (primary_op.is_local_disk) continue;
+                results[dup.original_index] =
+                    tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            }
+        } else {
             // Scatter temp buffer -> user multi_buffers (GPU or host).
             // Returns false and sets results[original_index] on error.
             auto scatter_to_buffers = [&](const std::string &key, char *src,
@@ -9853,6 +9988,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                 auto disk_results =
                     client_->BatchGet(disk_batch_keys, disk_batch_qrs,
                                       disk_batch_slices, group_by_target);
+                const bool post_expired = deadline.Expired();
 
                 for (size_t di = 0; di < disk_key_order.size(); ++di) {
                     const auto &key = disk_key_order[di];
@@ -9867,6 +10003,11 @@ RealClient::batch_get_into_multi_buffers_internal(
                             << "': " << toString(disk_results[di].error());
                         results[op.original_index] =
                             tl::make_unexpected(disk_results[di].error());
+                        continue;
+                    }
+                    if (post_expired) {
+                        results[op.original_index] =
+                            tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
                         continue;
                     }
                     if (!scatter_to_buffers(

@@ -523,5 +523,57 @@ TEST_F(SsdControlRpcTest,
     server.stop();
 }
 
+TEST_F(SsdControlRpcTest,
+       ServerClosesOversizedAndAttachmentFramesBeforeHandler) {
+    auto owner =
+        MakeOwner(
+            [](const SsdReadRequestV1&,
+               std::shared_ptr<SourceDrainedWriteTarget>,
+               std::chrono::steady_clock::time_point)
+                -> std::optional<SsdReadResultV1> {
+                ADD_FAILURE()
+                    << "Owner handler must never be invoked for invalid frame";
+                return std::nullopt;
+            });
+
+    SsdControlRpcServer server(2, 0, "127.0.0.1", std::chrono::seconds(30));
+    SsdReadIntoRpcEndpoint endpoint(owner);
+    server.register_handler<&SsdReadIntoRpcEndpoint::Call>(&endpoint);
+    server.async_start();
+    ASSERT_FALSE(server.get_errc());
+
+    auto send_bad_header = [&](uint32_t body_len, uint32_t attach_len) {
+        ScopedSocket sock = ConnectLoopback(server.port());
+        ASSERT_GE(sock.fd, 0);
+        coro_rpc::protocol::coro_rpc_protocol::req_header hdr{};
+        hdr.magic = coro_rpc::protocol::coro_rpc_protocol::magic_number;
+        hdr.version = 0;
+        hdr.serialize_type = 0;
+        hdr.msg_type = 0;
+        hdr.seq_num = 1;
+        hdr.function_id = 0;
+        hdr.length = body_len;
+        hdr.attach_length = attach_len;
+        auto raw = struct_pack::serialize<
+            struct_pack::sp_config::DISABLE_ALL_META_INFO>(hdr);
+        ASSERT_EQ(raw.size(), 20u);
+        ASSERT_TRUE(SendAll(sock.fd, raw.data(), raw.size()));
+        pollfd pfd{sock.fd, POLLIN, 0};
+        ASSERT_EQ(poll(&pfd, 1, 2000), 1);
+        char buf[64];
+        ssize_t n = recv(sock.fd, buf, sizeof(buf), 0);
+        // Server must close connection (EOF or ECONNRESET) without sending a
+        // normal handler reply.
+        EXPECT_LE(n, 0);
+    };
+
+    send_bad_header(static_cast<uint32_t>(kSsdControlMaxRpcBody + 1), 0);
+    send_bad_header(64, 1);
+    EXPECT_EQ(endpoint.read_requests(), 0u);
+
+    endpoint.CloseAndDrain();
+    server.stop();
+}
+
 }  // namespace
 }  // namespace mooncake::ssd_offload

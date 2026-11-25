@@ -94,7 +94,16 @@ struct SsdDirectRuntime::Impl {
     std::unique_ptr<SsdReadIntoRpcEndpoint> endpoint;
     std::unique_ptr<SsdFixedL2Requester> requester;
 
+    ~Impl() {
+        // Always drain endpoint worker threads and stop the RPC server before
+        // member destruction, including when SsdDirectRuntime's constructor
+        // unwinds on an exception after async_start().
+        if (endpoint) endpoint->CloseAndDrain();
+        if (server) server->stop();
+    }
+
     mutable std::mutex mutex;
+    std::mutex close_mutex;
     std::map<uintptr_t, Region> regions;
     std::vector<Peer> peers;
     size_t in_flight_reads{0};
@@ -173,8 +182,17 @@ SsdDirectRuntime::SsdDirectRuntime(std::shared_ptr<Client> client,
     StreamingReadConfig stream;
     if (storage) {
         stream = storage->config_.streaming_read;
+        stream.push_enabled = true;
+    } else {
+        stream.push_enabled = true;
+        const auto configured =
+            Environ::ReadOr(FileStorageEnvironmentVariables::
+                                MOONCAKE_OFFLOAD_STREAM_MAX_OUTSTANDING,
+                            uint32_t(stream.DefaultMaxOutstanding()));
+        stream.max_outstanding = (configured > 0 && configured <= 65536)
+                                     ? configured
+                                     : uint32_t(stream.DefaultMaxOutstanding());
     }
-    stream.push_enabled = true;
     impl_->wire = stream.ProtocolLimits();
     impl_->self.protocol = client->GetProtocol();
 
@@ -324,6 +342,15 @@ int SsdDirectRuntime::ConfigurePeers(
             }
             continue;
         }
+        // Reject distinct readable peers claiming the same legacy RPC endpoint
+        // so routing cannot silently shadow one peer with another.
+        if (peer->readable &&
+            std::any_of(peers.begin(), peers.end(), [&](const Peer& known) {
+                return known.readable && known.route.legacy_rpc_endpoint ==
+                                             peer->route.legacy_rpc_endpoint;
+            })) {
+            return -1;
+        }
         if (fixed.size() >= kMaxConfiguredPeers) return -1;
         fixed.push_back(peer->fixed);
         peers.push_back(std::move(*peer));
@@ -331,22 +358,8 @@ int SsdDirectRuntime::ConfigurePeers(
     std::lock_guard lock(impl_->mutex);
     if (impl_->closing) return -1;
     if (impl_->owner) {
-        // Preflight against already-configured immutable bindings before
-        // upserting so a conflict cannot partially update the owner table.
-        for (const auto& candidate : fixed) {
-            const auto prev = std::find_if(
-                impl_->peers.begin(), impl_->peers.end(), [&](const Peer& old) {
-                    return old.fixed.identity == candidate.identity;
-                });
-            if (prev != impl_->peers.end() &&
-                !SameFixedBinding(prev->fixed, candidate)) {
-                return -1;
-            }
-        }
-        for (const auto& candidate : fixed) {
-            if (impl_->owner->UpsertPeer(candidate) != DestinationError::kOk) {
-                return -1;
-            }
+        if (impl_->owner->UpsertPeers(fixed) != DestinationError::kOk) {
+            return -1;
         }
     }
     impl_->peers = std::move(peers);
@@ -419,6 +432,21 @@ std::optional<tl::expected<void, ErrorCode>> SsdDirectRuntime::Read(
     std::chrono::milliseconds timeout) {
     const auto start = std::chrono::steady_clock::now();
     if (timeout.count() <= 0) return tl::unexpected(ErrorCode::INVALID_PARAMS);
+
+    // Check fixed-pool destination coverage BEFORE scanning SsdPeerDirectory so
+    // non-fixed-pool reads never incur filesystem latency or fail on unrelated
+    // directory errors.
+    {
+        std::lock_guard lock(impl_->mutex);
+        if (impl_->closing) return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        for (const auto& object : objects) {
+            for (const auto& slice : object.destinations) {
+                if (!impl_->CoversRangeLocked(slice.ptr, slice.size)) {
+                    return std::nullopt;
+                }
+            }
+        }
+    }
 
     DestinationError peer_err = DestinationError::kNotFound;
     auto resolved_route = impl_->ResolveReadablePeer(endpoint, peer_err);
@@ -517,16 +545,33 @@ std::optional<tl::expected<void, ErrorCode>> SsdDirectRuntime::Read(
 }
 
 int SsdDirectRuntime::Recover() {
+    struct InFlightRecoverGuard {
+        Impl* impl{nullptr};
+        ~InFlightRecoverGuard() {
+            if (!impl) return;
+            std::lock_guard lock(impl->mutex);
+            --impl->in_flight_reads;
+        }
+    } recover_guard;
+    {
+        std::lock_guard lock(impl_->mutex);
+        if (impl_->closing || impl_->closed || !impl_->requester) return -1;
+        ++impl_->in_flight_reads;
+        recover_guard.impl = impl_.get();
+    }
     int pending = 0;
     for (const auto& attempt : impl_->requester->PendingAttempts()) {
         auto result =
             impl_->requester->Recover(attempt, std::chrono::seconds(1));
-        if (!result.result) ++pending;
+        if (!result.result && result.error != DestinationError::kNotFound) {
+            ++pending;
+        }
     }
     return pending;
 }
 
 int SsdDirectRuntime::Close(bool force_quarantine) {
+    std::lock_guard close_lock(impl_->close_mutex);
     {
         std::lock_guard lock(impl_->mutex);
         if (impl_->closed) return 0;

@@ -2901,11 +2901,21 @@ NB_MODULE(_store, m) {
                 }
                 // Keep the native client only on retryable OBJECT_HAS_LEASE
                 // (e.g. un-drained SSD push writes requiring recover_ssd_push
-                // before retrying close). All other outcomes release handles.
-                if (rc != to_py_ret(ErrorCode::OBJECT_HAS_LEASE)) {
-                    self.store_.reset();
-                    self.real_client_.reset();
+                // before retrying close). All other outcomes release handles
+                // only if this close still owns the active store instance, and
+                // drop the shared_ptrs with the GIL released.
+                if (rc != to_py_ret(ErrorCode::OBJECT_HAS_LEASE) &&
+                    self.store_ == store) {
+                    auto drop_store = std::move(self.store_);
+                    auto drop_real = std::move(self.real_client_);
                     self.use_dummy_client_ = false;
+                    py::gil_scoped_release release;
+                    store.reset();
+                    drop_store.reset();
+                    drop_real.reset();
+                } else if (store) {
+                    py::gil_scoped_release release;
+                    store.reset();
                 }
                 return rc;
             },
@@ -3368,14 +3378,19 @@ NB_MODULE(_store, m) {
                const std::vector<std::string> &keys,
                const std::vector<uintptr_t> &buffer_ptrs,
                const std::vector<size_t> &sizes, int64_t timeout_ms) {
+                auto store = self.store_;
+                if (!store) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int64_t>(
+                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                }
                 std::vector<void *> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
                     buffers.push_back(reinterpret_cast<void *>(ptr));
                 }
                 py::gil_scoped_release release;
-                return self.store_->batch_get_into(keys, buffers, sizes,
-                                                   timeout_ms);
+                return store->batch_get_into(keys, buffers, sizes, timeout_ms);
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
             py::arg("timeout_ms") = 0,
@@ -3535,8 +3550,14 @@ NB_MODULE(_store, m) {
                const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
                const std::vector<std::vector<size_t>> &all_sizes,
                bool prefer_alloc_in_same_node = false, int64_t timeout_ms = 0) {
+                auto store = self.store_;
+                if (!store) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>(
+                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                }
                 py::gil_scoped_release release;
-                return self.store_->batch_get_into_multi_buffers(
+                return store->batch_get_into_multi_buffers(
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
                     prefer_alloc_in_same_node, timeout_ms);
             },
