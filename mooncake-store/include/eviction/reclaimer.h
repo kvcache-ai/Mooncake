@@ -19,9 +19,12 @@ namespace eviction {
 
 class Reclaimer {
    public:
-    // Opt in only when Apply/TearDown are independent across keys and do not
-    // depend on the run-wide so_far report (offload caps/OpLog stay serial).
+    // Opt in only when Apply/TearDown are thread-safe across disjoint keys.
     virtual bool SupportsParallel() const { return false; }
+
+    // Called once at the beginning of each Evictor run before workers start,
+    // allowing reclaimers to reset run-scoped atomic state (e.g., offload cap).
+    virtual void OnRunBegin() {}
 
     // Takes `plan`'s replicas off the object `hold` holds, under that write
     // lock, which it neither lets go nor uses to reach the route. `so_far` is

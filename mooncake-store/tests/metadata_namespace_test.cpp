@@ -70,18 +70,18 @@ TEST(NamespaceTest, AKeyStaysListedWhileAnyWorkRemains) {
         auto guard = ns.objects.Write("k1");
         ASSERT_TRUE(guard.has_value());
         guard->state().is_processing = true;
-        guard->state().offloading_task =
-            OffloadingTask{1, std::chrono::system_clock::now(), {}};
+        guard->state().replication_task.emplace();
     }
 
-    // The write finished but the offload has not, so the key stays listed.
+    // The write finished but the replication task has not, so the key stays
+    // listed.
     SetProcessing(ns, "k1", false);
     EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k1"}));
 
     {
         auto guard = ns.objects.Write("k1");
         ASSERT_TRUE(guard.has_value());
-        guard->state().offloading_task.reset();
+        guard->state().replication_task.reset();
     }
     EXPECT_TRUE(ns.InFlightKeys().empty());
 }

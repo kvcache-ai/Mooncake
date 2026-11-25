@@ -114,7 +114,7 @@ class Evictor::Pass {
     // minimum is met; each also ends when an OpLog write fails or nothing is
     // left.
     void RunSerial() {
-        while (!report_.stopped && !Met(/*fallback=*/false)) {
+        while (!report_.Stopped() && !Met(/*fallback=*/false)) {
             std::optional<Entry> entry = cursor_.Next();
             if (!entry) {
                 break;
@@ -144,7 +144,7 @@ class Evictor::Pass {
             const uint64_t before =
                 aim_.in_bytes ? local.released_bytes : local.evicted_objects;
             worker_passes[worker].RunEntry(entry, /*nonblocking=*/true);
-            if (local.stopped) {
+            if (local.Stopped()) {
                 stop.Stop();
             }
             const uint64_t after =
@@ -169,7 +169,7 @@ class Evictor::Pass {
     void RunEntry(const Entry& entry, bool nonblocking) {
         deferred_.emplace_back();
         for (const std::string_view key : entry.keys) {
-            if (report_.stopped) {
+            if (report_.Stopped()) {
                 break;
             }
             auto hold = nonblocking ? ns_.objects.TryWrite(key)
@@ -193,11 +193,11 @@ class Evictor::Pass {
 
     void RunFallback() {
         for (const std::vector<route::ObjectRef>& refs : deferred_) {
-            if (report_.stopped || Met(/*fallback=*/true)) {
+            if (report_.Stopped() || Met(/*fallback=*/true)) {
                 break;
             }
             for (const route::ObjectRef& ref : refs) {
-                if (report_.stopped) {
+                if (report_.Stopped()) {
                     break;
                 }
                 // Only the publication the policy deferred: a replacement was
@@ -241,7 +241,7 @@ class Evictor::Pass {
         }
         auto effect = evictor_.reclaimer_.Apply(ns_, hold, *plan, report_);
         if (!effect) {
-            report_.stopped = true;
+            report_.RecordStop(StopReason::kReclaimError, effect.error());
             return {};
         }
         report_.Add(*effect);
@@ -385,6 +385,7 @@ Report Evictor::RunFor(const Scope& scope, const Aim& aim) {
     const std::vector<metadata::Namespace*> namespaces =
         CollectNamespaces(scope);
     const Clock::time_point now = Clock::now();
+    reclaimer_.OnRunBegin();
 
     Report report;
     // Snapshot every namespace's share before reclaiming any namespace, so
@@ -408,7 +409,7 @@ Report Evictor::RunFor(const Scope& scope, const Aim& aim) {
     }
 
     const size_t start = next_start_.fetch_add(1, std::memory_order_relaxed);
-    for (size_t n = 0; n < namespaces.size() && !report.stopped; ++n) {
+    for (size_t n = 0; n < namespaces.size() && !report.Stopped(); ++n) {
         const size_t i = (start + n) % namespaces.size();
         metadata::Namespace& ns = *namespaces[i];
         NamespaceScan& scan = scans[i];

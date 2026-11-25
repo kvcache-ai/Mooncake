@@ -42,18 +42,6 @@ struct ReplicationTask {
     ReplicaPin source_pin{};
 };
 
-struct OffloadingTask {
-    ReplicaID source_id;
-    std::chrono::system_clock::time_point start_time;
-    // Clients whose LocalDiskSegment::offloading_objects hold a mirror
-    // for this key. One marker can cover several mirrors, since the
-    // offload is pushed once per completed MEMORY replica and those
-    // replicas may live on different clients.
-    std::vector<UUID> mirror_clients;
-    // RAII pin on the source MEMORY replica; auto-unpins when erased.
-    ReplicaPin source_pin{};
-};
-
 // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
 // LOCAL_DISK replica is refcnt-pinned for the duration of the task
 // so it cannot be evicted.

@@ -17,8 +17,9 @@
 //   force_evict lets it go without one. With force_evict, a run that has
 //   queued `cap` offloads lets the rest go without one too.
 
+#include <atomic>
+#include <cstdint>
 #include <string>
-#include <vector>
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -30,14 +31,19 @@
 namespace mooncake {
 namespace eviction {
 
-// Where offloads are queued.
+// Where offloads are tracked and queued.
 class OffloadQueue {
    public:
+    // True when `(tenant_id, key)` already has an offload task in flight.
+    virtual bool HasInFlight(const TenantId& tenant_id,
+                             const std::string& key) const = 0;
+
     // Queues `source`, a memory replica of the object `key` names, for a copy
-    // to its host's local disk. True when it was queued, in which case the
-    // destinations are appended to `mirror_clients`.
-    virtual bool Push(const TenantId& tenant_id, const std::string& key,
-                      Replica& source, std::vector<UUID>* mirror_clients) = 0;
+    // to its host's local disk, pins `source` via ReplicaPin before making the
+    // task visible, and records the active offload task. True when the offload
+    // task was started (leaving `source` pinned until completion/cancellation).
+    virtual bool StartOffload(const TenantId& tenant_id, const std::string& key,
+                              Replica& source) = 0;
 
    protected:
     ~OffloadQueue() = default;
@@ -45,8 +51,14 @@ class OffloadQueue {
 
 class OffloadingReclaimer final : public Reclaimer {
    public:
+    // Stop scanning in non-forced mode after this many consecutive offload
+    // rejections without any reclaimed or queued object, preventing an O(N)
+    // full-table scan across saturated queues.
+    static constexpr uint64_t kMaxConsecutiveRejections = 256;
+
     struct Options {
-        // How many offloads one run may queue; enforced with force_evict.
+        // How many offloads one run may queue (0 = unlimited when
+        // force_evict=false; 0 = drop immediately when force_evict=true).
         long cap = 0;
         // Let an object go without its offload rather than keep it.
         bool force_evict = false;
@@ -55,6 +67,13 @@ class OffloadingReclaimer final : public Reclaimer {
     // `inner` and `queue` outlive the reclaimer.
     OffloadingReclaimer(Reclaimer& inner, OffloadQueue& queue, Options options)
         : inner_(inner), queue_(queue), options_(options) {}
+
+    bool SupportsParallel() const override { return inner_.SupportsParallel(); }
+
+    void OnRunBegin() override {
+        run_offloads_.store(0, std::memory_order_relaxed);
+        consecutive_rejections_.store(0, std::memory_order_relaxed);
+    }
 
     tl::expected<Effect, ErrorCode> Apply(metadata::Namespace& ns,
                                           const route::WriteGuard& hold,
@@ -66,6 +85,10 @@ class OffloadingReclaimer final : public Reclaimer {
     }
 
    private:
+    // Atomically reserves an offload slot up to `cap`. Returns the 1-based
+    // slot number if reserved, or 0 if the cap is already reached.
+    uint64_t TryReserveOffloadSlot(const Report& so_far);
+
     // The plan carried out by the inner reclaimer, without an offload.
     tl::expected<Effect, ErrorCode> WithoutOffload(
         metadata::Namespace& ns, const route::WriteGuard& hold,
@@ -74,6 +97,8 @@ class OffloadingReclaimer final : public Reclaimer {
     Reclaimer& inner_;
     OffloadQueue& queue_;
     const Options options_;
+    std::atomic<uint64_t> run_offloads_{0};
+    std::atomic<uint64_t> consecutive_rejections_{0};
 };
 
 }  // namespace eviction

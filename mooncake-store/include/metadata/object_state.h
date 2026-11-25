@@ -11,8 +11,8 @@ namespace route {
 
 // The per-object runtime state kept next to the object's metadata: the task
 // in flight for the key, at most one of each kind, and the promotion retry
-// candidate. It lives and dies with the object, under the same lock as its
-// metadata.
+// candidate. Offloading tasks are owned inside OffloadManager under its own
+// sharded locks.
 //
 // Every object carries one, and almost every object carries neither a task nor
 // a candidate, so each lives on the heap and costs a pointer while absent.
@@ -28,7 +28,6 @@ struct ObjectState {
     // REMOVED replica still retains their tier. Consumed on write release.
     bool kv_content_invalidated{false};
     HeapOptional<ReplicationTask> replication_task;
-    HeapOptional<OffloadingTask> offloading_task;
     HeapOptional<PromotionTask> promotion_task;
     // The dynamic replica proposal admitted for this key and not yet started
     // by its CopyStart, and how long the key waits before the next one. Owned
@@ -40,8 +39,7 @@ struct ObjectState {
     HeapOptional<PromotionCandidate> promotion_candidate;
 
     bool HasWorkInFlight() const {
-        return is_processing || replication_task || offloading_task ||
-               promotion_task;
+        return is_processing || replication_task || promotion_task;
     }
 };
 

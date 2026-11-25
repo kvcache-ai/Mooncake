@@ -906,6 +906,18 @@ TEST_F(MasterMetricsTest, LocalDiskSegmentCapacityHeartbeat) {
     // Idempotent: same capacity reported again — gauge must not change.
     ASSERT_TRUE(svc.ReportSsdCapacity(client_id, kCap2).has_value());
     EXPECT_EQ(metrics.get_total_file_capacity(), baseline + kCap2);
+
+    // Zeroing capacity drops the gauge back to baseline; re-reporting restores
+    // it; explicit unmount subtracts the client's reported capacity.
+    ASSERT_TRUE(svc.ReportSsdCapacity(client_id, 0).has_value());
+    EXPECT_EQ(metrics.get_total_file_capacity(), baseline);
+    ASSERT_TRUE(svc.ReportSsdCapacity(client_id, kCap2).has_value());
+    EXPECT_EQ(metrics.get_total_file_capacity(), baseline + kCap2);
+    ASSERT_TRUE(svc.UnmountLocalDiskSegment(client_id).has_value());
+    EXPECT_EQ(metrics.get_total_file_capacity(), baseline);
+    // Second unmount is idempotent and does not underflow the gauge.
+    ASSERT_TRUE(svc.UnmountLocalDiskSegment(client_id).has_value());
+    EXPECT_EQ(metrics.get_total_file_capacity(), baseline);
 }
 
 TEST_F(MasterMetricsTest, PutStartReplicaAllocationFailureMetric) {

@@ -776,7 +776,9 @@ TEST_F(ParallelEvictorNativeTest, ReclaimFailureCancelsWorkers) {
     eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {}, 4);
     const auto report =
         evictor.Run(eviction::Scope::All(), {.target_ratio = .5});
-    EXPECT_TRUE(report.stopped);
+    EXPECT_TRUE(report.StoppedByError());
+    EXPECT_EQ(report.stop_reason, eviction::StopReason::kReclaimError);
+    EXPECT_NE(report.stop_error, ErrorCode::OK);
     EXPECT_EQ(report.evicted_objects, 0u);
     EXPECT_LT(report.visited, 50u);
 }

@@ -56,7 +56,11 @@ void LogObserver::OnRunEnd(const Scope& scope, const Report& report) {
                   << ", lease_active=" << report.lease_active
                   << ", scanned_slots=" << report.scanned_slots
                   << ", scan_waves=" << report.scan_waves
-                  << ", workers=" << report.workers;
+                  << ", workers=" << report.workers
+                  << ", stop_reason=" << ToString(report.stop_reason)
+                  << (report.StoppedByError()
+                          ? ", stop_error=" + toString(report.stop_error)
+                          : std::string{});
     }
 
     const std::string prefix =

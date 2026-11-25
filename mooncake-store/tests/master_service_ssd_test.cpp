@@ -30,13 +30,15 @@ class MasterServiceSSDTest : public ::testing::Test {
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 
-    // Reach PushOffloadingQueue and its private identity type through the
-    // test peer to exercise replica states unavailable via PutStart (#2997).
-    static tl::expected<void, ErrorCode> CallPushOffloadingQueue(
-        MasterService& service, const TenantId& tenant, const std::string& key,
-        Replica& replica) {
+    // Reach OffloadManager::StartOffload through the test peer to exercise
+    // replica states unavailable via PutStart (#2997).
+    static bool CallStartOffloadForReplica(MasterService& service,
+                                           const TenantId& tenant,
+                                           const std::string& key,
+                                           Replica& replica) {
         const MasterServiceTestPeer::ObjectIdentity id{tenant, key};
-        return MasterServiceTestPeer(service).PushOffloadingQueue(id, replica);
+        return MasterServiceTestPeer(service).StartOffloadForReplica(id,
+                                                                     replica);
     }
 };
 
@@ -552,23 +554,21 @@ TEST_F(MasterServiceSSDTest, PushOffloadingQueueReportsNoopAsFailure) {
     // [nullopt] -> the loop enqueues nothing -> the !any_enqueued guard fires.
     Replica all_nullopt_replica(/*buffer=*/nullptr, ReplicaStatus::COMPLETE);
     ASSERT_FALSE(all_nullopt_replica.get_segment_names().empty());
-    auto r2 =
-        CallPushOffloadingQueue(*service, tenant, key, all_nullopt_replica);
-    ASSERT_FALSE(r2.has_value())
+    EXPECT_FALSE(
+        CallStartOffloadForReplica(*service, tenant, key, all_nullopt_replica))
         << "all-nullopt segment names must not report a silent success "
            "(issue #2997)";
-    EXPECT_EQ(ErrorCode::UNABLE_OFFLOADING, r2.error());
+    EXPECT_EQ(all_nullopt_replica.get_refcnt(), 0u);
 
     // Path 1: a non-MEMORY/non-NOF replica -> get_segment_names() is empty ->
     // the empty-source guard fires before the loop.
     Replica empty_names_replica(/*file_path=*/"/tmp/nonexistent_offload_src",
                                 /*object_size=*/1024, ReplicaStatus::COMPLETE);
     ASSERT_TRUE(empty_names_replica.get_segment_names().empty());
-    auto r1 =
-        CallPushOffloadingQueue(*service, tenant, key, empty_names_replica);
-    ASSERT_FALSE(r1.has_value())
+    EXPECT_FALSE(
+        CallStartOffloadForReplica(*service, tenant, key, empty_names_replica))
         << "empty segment names must not report a silent success (issue #2997)";
-    EXPECT_EQ(ErrorCode::UNABLE_OFFLOADING, r1.error());
+    EXPECT_EQ(empty_names_replica.get_refcnt(), 0u);
 }
 
 }  // namespace mooncake::test

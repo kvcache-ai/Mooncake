@@ -301,6 +301,7 @@ add_store_test(heap_optional_test heap_optional_test.cpp)
 add_store_test(replica_pin_test replica_pin_test.cpp)
 add_store_test(dynamic_replication_controller_test
                dynamic_replication_controller_test.cpp)
+add_store_test(offload_manager_test offload_manager_test.cpp)
 add_store_test(promotion_candidate_tracker_test
                promotion_candidate_tracker_test.cpp)
 add_store_test(dynamic_replication_lease_table_test
