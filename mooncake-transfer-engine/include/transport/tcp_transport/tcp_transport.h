@@ -175,15 +175,19 @@ class TcpTransport : public Transport {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 
+    bool supportsParallelBatchSubmit() const override {
+        return enable_connection_pool_;
+    }
+
+   private:
+    friend class MultiTransport;
+
     Status validateAcknowledgedWriteEntries(
         const std::vector<TransferRequest> &entries) const;
 
     Status submitAcknowledgedWriteTasks(
         const std::vector<TransferTask *> &task_list);
 
-    bool supportsParallelBatchSubmit() const override { return true; }
-
-   private:
     int install(std::string &local_server_name,
                 std::shared_ptr<TransferMetadata> meta,
                 std::shared_ptr<Topology> topo);
@@ -413,7 +417,7 @@ class TcpTransport : public Transport {
 
     struct ConnectionLaneState {
         std::mutex mutex;
-        bool shutting_down = false;
+        std::atomic<bool> shutting_down{false};
         size_t lanes_per_peer = 4;
         size_t max_queued_transfers_per_peer = 1024;
         size_t max_pending_admissions_per_peer = 1024;

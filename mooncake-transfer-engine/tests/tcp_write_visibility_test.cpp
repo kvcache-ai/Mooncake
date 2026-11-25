@@ -671,6 +671,33 @@ class LocalHttpMetadataServer {
         return rewritten == 1;
     }
 
+    bool rewriteStoredTcpProtoVersion(const std::string& segment_name,
+                                      int new_version,
+                                      bool zero_metadata_version) {
+        std::lock_guard<std::mutex> lock(values_mutex_);
+        const std::string target_key = "mooncake/ram/" + segment_name;
+        auto it = values_.find(target_key);
+        if (it == values_.end()) return false;
+        Json::CharReaderBuilder reader_builder;
+        Json::Value value;
+        std::string errors;
+        std::unique_ptr<Json::CharReader> reader(
+            reader_builder.newCharReader());
+        if (!reader->parse(it->second.data(),
+                           it->second.data() + it->second.size(), &value,
+                           &errors)) {
+            return false;
+        }
+        value["tcp_proto_version"] = new_version;
+        if (zero_metadata_version) {
+            value.removeMember("metadata_version");
+        }
+        Json::StreamWriterBuilder writer_builder;
+        writer_builder["indentation"] = "";
+        it->second = Json::writeString(writer_builder, value);
+        return true;
+    }
+
    private:
     static std::string decodeUrlComponent(const std::string& value) {
         auto hexDigit = [](char c) -> int {
@@ -1446,11 +1473,18 @@ struct EngineHandle {
     void init(const std::string& metadata_server,
               const std::string& server_name, size_t pool_size,
               const std::string& remote_segment_name = {},
-              bool enable_pool = true) {
-        // Exercise the pooled-connection path by default (default off in
+              bool configure_pool_env = true) {
+        // Exercise the pooled-connection path by default (default on in
         // production): connection reuse vs. discard-on-unclean-exchange is
-        // part of the contract under test.
-        setenv("MC_TCP_ENABLE_CONNECTION_POOL", enable_pool ? "1" : "0", 1);
+        // part of the contract under test. Avoid mutating environ if the
+        // caller already pinned it (e.g. via ScopedEnvVar before starting any
+        // engine threads).
+        if (configure_pool_env) {
+            const char* cur = std::getenv("MC_TCP_ENABLE_CONNECTION_POOL");
+            if (!cur || std::strcmp(cur, "1") != 0) {
+                setenv("MC_TCP_ENABLE_CONNECTION_POOL", "1", 1);
+            }
+        }
         engine = std::make_unique<TransferEngine>(false);
         auto hp = parseHostNameWithPort(server_name);
         int rc = engine->init(metadata_server, server_name, hp.first.c_str(),
@@ -2016,14 +2050,37 @@ TEST(TcpWriteVisibilityTest, GroupedScatterPreservesPartialFailureResults) {
 }
 
 TEST(TcpWriteVisibilityTest, ExplicitAcknowledgedWriteWaitsForReceiverAck) {
-    // Pooled single write
+    // Pooled single write + zero-length v2 write + empty entries
     {
+        ScopedEnvVar pooling("MC_TCP_ENABLE_CONNECTION_POOL", "1");
         ReusingWriteServer peer(/*hold_first_ack=*/true);
         ASSERT_TRUE(peer.ok());
         EngineHandle h;
-        h.init(P2PHANDSHAKE, "127.0.0.2:17991", kSmallLength);
+        h.init(P2PHANDSHAKE, "127.0.0.2:17991", kSmallLength, {},
+               /*configure_pool_env=*/false);
         ASSERT_TRUE(h.ok);
         pointTcpSegmentAt(h, peer.port());
+
+        // Empty entries succeed without mutating BatchDesc.
+        const auto empty_batch = h.engine->allocateBatchID(1);
+        EXPECT_TRUE(h.engine->submitAcknowledgedTcpWrite(empty_batch, {}).ok());
+        EXPECT_TRUE(Transport::toBatchDesc(empty_batch).task_list.empty());
+        EXPECT_TRUE(h.engine->freeBatchID(empty_batch).ok());
+
+        // Valid v2 zero-length write completes locally without wire I/O.
+        auto zero_req = makeWriteRequest(h, 0);
+        const auto zero_batch = h.engine->allocateBatchID(1);
+        ASSERT_TRUE(
+            h.engine->submitAcknowledgedTcpWrite(zero_batch, {zero_req}).ok());
+        TransferStatus zero_status;
+        ASSERT_TRUE(waitForTaskTerminal(h.engine.get(), zero_batch,
+                                        std::chrono::seconds(5),
+                                        &zero_status.s));
+        EXPECT_EQ(zero_status.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(peer.acceptedCount(), 0);
+        const auto zero_freed = h.engine->freeBatchID(zero_batch);
+        EXPECT_TRUE(zero_freed.ok() || zero_freed.IsBatchCleanupDeferred());
+
         const auto batch = h.engine->allocateBatchID(1);
         ASSERT_TRUE(h.engine
                         ->submitAcknowledgedTcpWrite(
@@ -2040,12 +2097,15 @@ TEST(TcpWriteVisibilityTest, ExplicitAcknowledgedWriteWaitsForReceiverAck) {
         const auto freed = h.engine->freeBatchID(batch);
         EXPECT_TRUE(freed.ok() || freed.IsBatchCleanupDeferred());
     }
-    // Grouped write sequence
+    // Grouped write sequence: task 1 stays WAITING behind task 0 ACK and
+    // reuses a single TCP connection.
     {
+        ScopedEnvVar pooling("MC_TCP_ENABLE_CONNECTION_POOL", "1");
         ReusingWriteServer peer(/*hold_first_ack=*/true);
         ASSERT_TRUE(peer.ok());
         EngineHandle h;
-        h.init(P2PHANDSHAKE, "127.0.0.2:17992", 4 * kSmallLength);
+        h.init(P2PHANDSHAKE, "127.0.0.2:17992", 4 * kSmallLength, {},
+               /*configure_pool_env=*/false);
         ASSERT_TRUE(h.ok);
         pointTcpSegmentAt(h, peer.port());
         auto* src0 = static_cast<char*>(h.pool) + 2 * kSmallLength;
@@ -2063,35 +2123,33 @@ TEST(TcpWriteVisibilityTest, ExplicitAcknowledgedWriteWaitsForReceiverAck) {
         ASSERT_TRUE(
             h.engine->submitAcknowledgedTcpWrite(batch, {req0, req1}).ok());
         EXPECT_TRUE(peer.waitForFirstRequest(std::chrono::seconds(5)));
-        TransferStatus status;
-        ASSERT_TRUE(h.engine->getTransferStatus(batch, 0, status).ok());
-        EXPECT_EQ(status.s, TransferStatusEnum::WAITING);
+        TransferStatus status0, status1;
+        ASSERT_TRUE(h.engine->getTransferStatus(batch, 0, status0).ok());
+        ASSERT_TRUE(h.engine->getTransferStatus(batch, 1, status1).ok());
+        EXPECT_EQ(status0.s, TransferStatusEnum::WAITING);
+        EXPECT_EQ(status1.s, TransferStatusEnum::WAITING);
         peer.releaseFirstAck();
-        for (size_t i = 0; i < 2; ++i) {
-            TransferStatusEnum terminal = TransferStatusEnum::WAITING;
-            const auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::seconds(5);
-            while (std::chrono::steady_clock::now() < deadline) {
-                ASSERT_TRUE(h.engine->getTransferStatus(batch, i, status).ok());
-                terminal = status.s;
-                if (terminal != TransferStatusEnum::WAITING) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            EXPECT_EQ(terminal, TransferStatusEnum::COMPLETED);
-        }
+        ASSERT_TRUE(waitForBatchTerminal(h.engine.get(), batch, 2,
+                                         std::chrono::seconds(5)));
+        ASSERT_TRUE(h.engine->getTransferStatus(batch, 0, status0).ok());
+        ASSERT_TRUE(h.engine->getTransferStatus(batch, 1, status1).ok());
+        EXPECT_EQ(status0.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(status1.s, TransferStatusEnum::COMPLETED);
         EXPECT_TRUE(peer.waitForRequests(2, std::chrono::seconds(5)));
+        EXPECT_EQ(peer.acceptedCount(), 1);
         const auto freed = h.engine->freeBatchID(batch);
         EXPECT_TRUE(freed.ok() || freed.IsBatchCleanupDeferred());
     }
-    // Unpooled write
+    // Unpooled write (and verify supportsParallelBatchSubmit is false)
     {
         ScopedEnvVar unpooled("MC_TCP_ENABLE_CONNECTION_POOL", "0");
         ReusingWriteServer peer(/*hold_first_ack=*/true);
         ASSERT_TRUE(peer.ok());
         EngineHandle h;
         h.init(P2PHANDSHAKE, "127.0.0.2:17993", kSmallLength, {},
-               /*enable_pool=*/false);
+               /*configure_pool_env=*/false);
         ASSERT_TRUE(h.ok);
+        EXPECT_FALSE(h.engine->supportsParallelBatchSubmit(h.segment_id));
         pointTcpSegmentAt(h, peer.port());
         const auto batch = h.engine->allocateBatchID(1);
         ASSERT_TRUE(h.engine
@@ -2113,12 +2171,14 @@ TEST(TcpWriteVisibilityTest, ExplicitAcknowledgedWriteWaitsForReceiverAck) {
 
 TEST(TcpWriteVisibilityTest,
      ExplicitAcknowledgedWriteRejectsLegacyAndInvalidRequests) {
-    // MC_TCP_PROTO=1 rejects both non-zero and zero-length writes while plain
-    // submitTransfer continues to work.
+    // MC_TCP_PROTO=1 rejects non-zero, zero-length, and empty submissions while
+    // plain submitTransfer continues to work.
     {
+        ScopedEnvVar pooling("MC_TCP_ENABLE_CONNECTION_POOL", "1");
         ScopedEnvVar legacy("MC_TCP_PROTO", "1");
         EngineHandle h;
-        h.init(P2PHANDSHAKE, "127.0.0.2:17994", 2 * kSmallLength);
+        h.init(P2PHANDSHAKE, "127.0.0.2:17994", 2 * kSmallLength, {},
+               /*configure_pool_env=*/false);
         ASSERT_TRUE(h.ok);
         auto* source = static_cast<char*>(h.pool) + kSmallLength;
         memset(source, 0x4b, kSmallLength);
@@ -2132,25 +2192,51 @@ TEST(TcpWriteVisibilityTest,
                         .IsNotImplemented());
         EXPECT_TRUE(h.engine->submitAcknowledgedTcpWrite(batch, {zero_request})
                         .IsNotImplemented());
+        EXPECT_TRUE(
+            h.engine->submitAcknowledgedTcpWrite(batch, {}).IsNotImplemented());
         EXPECT_TRUE(Transport::toBatchDesc(batch).task_list.empty());
         EXPECT_EQ(static_cast<char*>(h.pool)[0], 0);
         EXPECT_TRUE(h.engine->freeBatchID(batch).ok());
         EXPECT_EQ(runOne(h.engine.get(), request),
                   TransferStatusEnum::COMPLETED);
     }
-    // Legacy v1 peer, mixed v2+v1 batch, and READ / mixed WRITE+READ batch.
+    // Missing TCP transport -> NotSupportedTransport (even on empty entries).
     {
+        ScopedEnvVar pooling("MC_TCP_ENABLE_CONNECTION_POOL", "1");
+        auto engine = std::make_unique<TransferEngine>(false);
+        ASSERT_EQ(
+            engine->init(P2PHANDSHAKE, "127.0.0.2:17988", "127.0.0.2", 17988),
+            0);
+        const auto batch = engine->allocateBatchID(1);
+        EXPECT_TRUE(engine->submitAcknowledgedTcpWrite(batch, {})
+                        .IsNotSupportedTransport());
+        EXPECT_TRUE(engine->freeBatchID(batch).ok());
+    }
+    // Legacy v1 peer, mixed v2+v1 batch, READ / mixed WRITE+READ batch,
+    // producer_event, and non-TCP routes.
+    {
+        ScopedEnvVar pooling("MC_TCP_ENABLE_CONNECTION_POOL", "1");
+        LocalHttpMetadataServer metadata_server;
+        ASSERT_TRUE(metadata_server.ok());
         EngineHandle v2, legacy_peer;
-        v2.init(P2PHANDSHAKE, "127.0.0.2:17995", 2 * kSmallLength);
-        legacy_peer.init(P2PHANDSHAKE, "127.0.0.2:17996", kSmallLength);
+        v2.init(metadata_server.uri(), "127.0.0.2:17995", 2 * kSmallLength, {},
+                /*configure_pool_env=*/false);
+        legacy_peer.init(metadata_server.uri(), "127.0.0.2:17996", kSmallLength,
+                         {}, /*configure_pool_env=*/false);
         ASSERT_TRUE(v2.ok && legacy_peer.ok);
-        const auto legacy_id =
-            v2.engine->openSegment(legacy_peer.engine->getLocalIpAndPort());
+        const auto legacy_id = v2.engine->openSegment("127.0.0.2:17996");
         ASSERT_NE(legacy_id, static_cast<Transport::SegmentHandle>(-1));
-        auto legacy_desc =
-            v2.engine->getMetadata()->getSegmentDescByID(legacy_id);
-        ASSERT_NE(legacy_desc, nullptr);
-        legacy_desc->tcp_proto_version = 1;
+        {
+            auto current =
+                v2.engine->getMetadata()->getSegmentDescByID(legacy_id);
+            ASSERT_NE(current, nullptr);
+            auto downgraded = *current;
+            downgraded.tcp_proto_version = 1;
+            ASSERT_EQ(v2.engine->getMetadata()->updateSegmentDesc(current->name,
+                                                                  downgraded),
+                      0);
+            ASSERT_EQ(v2.engine->syncSegmentCache(current->name), 0);
+        }
 
         auto* source = static_cast<char*>(v2.pool) + kSmallLength;
         memset(source, 0x5c, kSmallLength);
@@ -2162,6 +2248,9 @@ TEST(TcpWriteVisibilityTest,
         legacy_write.target_offset = legacy_peer.remote_base;
         TransferRequest legacy_zero = legacy_write;
         legacy_zero.length = 0;
+        TransferRequest event_write = v2_write;
+        int dummy_event = 1;
+        event_write.producer_event = &dummy_event;
 
         const auto batch = v2.engine->allocateBatchID(2);
         EXPECT_TRUE(v2.engine->submitAcknowledgedTcpWrite(batch, {legacy_write})
@@ -2172,11 +2261,42 @@ TEST(TcpWriteVisibilityTest,
             v2.engine
                 ->submitAcknowledgedTcpWrite(batch, {v2_write, legacy_write})
                 .IsNotImplemented());
+        EXPECT_TRUE(v2.engine->submitAcknowledgedTcpWrite(batch, {event_write})
+                        .IsNotImplemented());
         EXPECT_TRUE(v2.engine->submitAcknowledgedTcpWrite(batch, {read_req})
                         .IsInvalidArgument());
         EXPECT_TRUE(
             v2.engine->submitAcknowledgedTcpWrite(batch, {v2_write, read_req})
                 .IsInvalidArgument());
+
+        // Install an actual non-TCP transport ("shm") alongside TCP so
+        // selectTransports() succeeds with a real ShmTransport* and exercises
+        // MultiTransport::submitAcknowledgedTcpWrite's non-TCP route check.
+        // Done after the TCP-only assertions above because
+        // ShmTransport::install rewrites the local segment's protocol to "shm"
+        // when ENABLE_MULTI_PROTOCOL is off.
+        ASSERT_NE(v2.engine->installTransport("shm", nullptr), nullptr);
+        auto shm_desc =
+            *v2.engine->getMetadata()->getSegmentDescByID(v2.segment_id);
+        shm_desc.name = "127.0.0.2:17989";
+        shm_desc.protocol = "shm";
+        ASSERT_EQ(v2.engine->getMetadata()->updateSegmentDesc(shm_desc.name,
+                                                              shm_desc),
+                  0);
+        const auto shm_id = v2.engine->openSegment(shm_desc.name);
+        ASSERT_NE(shm_id, static_cast<Transport::SegmentHandle>(-1));
+        TransferRequest shm_write = v2_write;
+        shm_write.target_id = shm_id;
+        const auto non_tcp_status =
+            v2.engine->submitAcknowledgedTcpWrite(batch, {shm_write});
+        EXPECT_TRUE(non_tcp_status.IsNotSupportedTransport());
+        EXPECT_NE(non_tcp_status.message().find("requires a TCP route"),
+                  std::string::npos);
+        const auto mixed_non_tcp_status = v2.engine->submitAcknowledgedTcpWrite(
+            batch, {legacy_write, shm_write});
+        EXPECT_TRUE(mixed_non_tcp_status.IsNotSupportedTransport());
+        EXPECT_NE(mixed_non_tcp_status.message().find("requires a TCP route"),
+                  std::string::npos);
         EXPECT_TRUE(Transport::toBatchDesc(batch).task_list.empty());
         EXPECT_EQ(static_cast<char*>(v2.pool)[0], 0);
         EXPECT_EQ(static_cast<char*>(legacy_peer.pool)[0], 0);
@@ -2187,66 +2307,71 @@ TEST(TcpWriteVisibilityTest,
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
 TEST(TcpWriteVisibilityTest,
      ExplicitAcknowledgedWriteRejectsMetadataDowngrade) {
-    static std::atomic<TransferMetadata::SegmentDesc*> target_desc{nullptr};
-    static std::atomic<int> trigger_on_call{0};
-    static std::atomic<int> call_count{0};
-    struct ScopedDowngradeHook {
-        ScopedDowngradeHook(TransferMetadata::SegmentDesc* desc, int trigger) {
-            call_count.store(0, std::memory_order_release);
-            trigger_on_call.store(trigger, std::memory_order_release);
-            target_desc.store(desc, std::memory_order_release);
+    struct SyncDowngradeContext {
+        TransferEngine* engine = nullptr;
+        std::string segment_name;
+        TransferMetadata::SegmentDesc downgraded;
+        std::atomic<int> call_count{0};
+        int trigger_on_call = 0;
+    };
+    static std::atomic<SyncDowngradeContext*> active_ctx{nullptr};
+    struct ScopedSyncDowngradeHook {
+        explicit ScopedSyncDowngradeHook(SyncDowngradeContext* ctx) {
+            active_ctx.store(ctx, std::memory_order_release);
             tcpTransportSetStartTransferMetadataHookForTest([]() noexcept {
-                if (call_count.fetch_add(1, std::memory_order_acq_rel) ==
-                    trigger_on_call.load(std::memory_order_acquire)) {
-                    if (auto* d = target_desc.load(std::memory_order_acquire))
-                        d->tcp_proto_version = 1;
+                try {
+                    auto* c = active_ctx.load(std::memory_order_acquire);
+                    if (!c) return;
+                    if (c->call_count.fetch_add(1, std::memory_order_acq_rel) ==
+                        c->trigger_on_call) {
+                        (void)c->engine->getMetadata()->updateSegmentDesc(
+                            c->segment_name, c->downgraded);
+                        (void)c->engine->syncSegmentCache(c->segment_name);
+                    }
+                } catch (...) {
                 }
             });
         }
-        ~ScopedDowngradeHook() {
+        ~ScopedSyncDowngradeHook() {
             tcpTransportSetStartTransferMetadataHookForTest(nullptr);
-            target_desc.store(nullptr, std::memory_order_release);
+            active_ctx.store(nullptr, std::memory_order_release);
         }
     };
 
-    // Single slice (non-zero and zero-length) downgraded between validation
-    // and dispatch.
-    {
+    // Grouped sequence where authoritative metadata downgrades to v1 via
+    // syncSegmentCache between slice 0 and slice 1 (both non-zero and
+    // zero-length second slice must fail closed).
+    ScopedEnvVar pooling("MC_TCP_ENABLE_CONNECTION_POOL", "1");
+    for (size_t second_length : {kSmallLength, size_t(0)}) {
+        LocalHttpMetadataServer metadata_server;
+        ASSERT_TRUE(metadata_server.ok());
+        const std::string logical_peer = "127.0.0.2:17997";
+        EngineHandle target;
+        target.init(metadata_server.uri(), logical_peer, 4 * kSmallLength, {},
+                    /*configure_pool_env=*/false);
+        ASSERT_TRUE(target.ok);
+        // Declare hook and context before `h` so `h` shuts down and joins its
+        // I/O threads while `ctx` and `hook` are still alive.
+        SyncDowngradeContext ctx;
+        ScopedSyncDowngradeHook hook(nullptr);
         EngineHandle h;
-        h.init(P2PHANDSHAKE, "127.0.0.2:17997", 2 * kSmallLength);
+        h.init(metadata_server.uri(), "127.0.0.2:17998", 4 * kSmallLength,
+               logical_peer, /*configure_pool_env=*/false);
         ASSERT_TRUE(h.ok);
-        auto desc = h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
-        ASSERT_NE(desc, nullptr);
-        auto* source = static_cast<char*>(h.pool) + kSmallLength;
-        memset(source, 0x6d, kSmallLength);
-        for (size_t length : {kSmallLength, size_t(0)}) {
-            desc->tcp_proto_version = 2;
-            ScopedDowngradeHook hook(desc.get(), 0);
-            auto request = makeWriteRequest(h, length);
-            request.source = source;
-            const auto batch = h.engine->allocateBatchID(1);
-            ASSERT_TRUE(
-                h.engine->submitAcknowledgedTcpWrite(batch, {request}).ok());
-            TransferStatusEnum status;
-            ASSERT_TRUE(waitForTaskTerminal(h.engine.get(), batch,
-                                            std::chrono::seconds(5), &status));
-            EXPECT_EQ(status, TransferStatusEnum::FAILED);
-            EXPECT_EQ(static_cast<char*>(h.pool)[0], 0);
-            const auto freed = h.engine->freeBatchID(batch);
-            EXPECT_TRUE(freed.ok() || freed.IsBatchCleanupDeferred());
-        }
-    }
-    // Grouped sequence downgraded before the second slice starts.
-    {
-        EngineHandle h;
-        h.init(P2PHANDSHAKE, "127.0.0.2:17998", 4 * kSmallLength);
-        ASSERT_TRUE(h.ok);
-        auto desc = h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
-        ASSERT_NE(desc, nullptr);
-        desc->tcp_proto_version = 2;
-        auto* base = static_cast<char*>(h.pool);
-        auto* src0 = base + 2 * kSmallLength;
-        auto* src1 = base + 3 * kSmallLength;
+        auto current =
+            h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
+        ASSERT_NE(current, nullptr);
+        ASSERT_GE(current->tcp_proto_version, 2);
+
+        ctx.engine = h.engine.get();
+        ctx.segment_name = current->name;
+        ctx.downgraded = *current;
+        ctx.downgraded.tcp_proto_version = 1;
+        ctx.trigger_on_call = 0;
+
+        auto* base = static_cast<char*>(target.pool);
+        auto* src0 = static_cast<char*>(h.pool) + 2 * kSmallLength;
+        auto* src1 = static_cast<char*>(h.pool) + 3 * kSmallLength;
         memset(base, 0x00, 2 * kSmallLength);
         memset(src0, 0x51, kSmallLength);
         memset(src1, 0x52, kSmallLength);
@@ -2254,29 +2379,21 @@ TEST(TcpWriteVisibilityTest,
         req0.source = src0;
         req0.task_group_id = 7;
         auto req1 =
-            makeWriteRequest(h, kSmallLength, h.remote_base + kSmallLength);
+            makeWriteRequest(h, second_length, h.remote_base + kSmallLength);
         req1.source = src1;
         req1.task_group_id = 7;
 
-        ScopedDowngradeHook hook(desc.get(), 1);
+        active_ctx.store(&ctx, std::memory_order_release);
         const auto batch = h.engine->allocateBatchID(2);
         ASSERT_TRUE(
             h.engine->submitAcknowledgedTcpWrite(batch, {req0, req1}).ok());
-        std::array<TransferStatusEnum, 2> statuses{TransferStatusEnum::WAITING,
-                                                   TransferStatusEnum::WAITING};
-        for (size_t i = 0; i < 2; ++i) {
-            const auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::seconds(5);
-            while (std::chrono::steady_clock::now() < deadline) {
-                TransferStatus s;
-                ASSERT_TRUE(h.engine->getTransferStatus(batch, i, s).ok());
-                statuses[i] = s.s;
-                if (statuses[i] != TransferStatusEnum::WAITING) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-        }
-        EXPECT_EQ(statuses[0], TransferStatusEnum::COMPLETED);
-        EXPECT_EQ(statuses[1], TransferStatusEnum::FAILED);
+        ASSERT_TRUE(waitForBatchTerminal(h.engine.get(), batch, 2,
+                                         std::chrono::seconds(5)));
+        TransferStatus s0, s1;
+        ASSERT_TRUE(h.engine->getTransferStatus(batch, 0, s0).ok());
+        ASSERT_TRUE(h.engine->getTransferStatus(batch, 1, s1).ok());
+        EXPECT_EQ(s0.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(s1.s, TransferStatusEnum::FAILED);
         EXPECT_EQ(base[0], 0x51);
         EXPECT_EQ(base[kSmallLength], 0x00);
         const auto freed = h.engine->freeBatchID(batch);
@@ -2341,6 +2458,53 @@ TEST(TcpWriteVisibilityTest, SegmentDescEqualityComparesTcpProtoVersion) {
     EXPECT_EQ(lhs, rhs);
     rhs.tcp_proto_version = 2;
     EXPECT_NE(lhs, rhs);
+
+    // End-to-end syncSegmentCache verification: mutating only tcp_proto_version
+    // in the authoritative metadata store without bumping metadata_version must
+    // exercise SegmentDesc::operator== in both shouldInstallFetchedSegmentDesc
+    // (rejecting conflicting unchanged-version metadata) and syncSegmentCache's
+    // change detection (replacing the cached snapshot when metadata_version is
+    // absent/0).
+    ScopedEnvVar pooling("MC_TCP_ENABLE_CONNECTION_POOL", "1");
+    LocalHttpMetadataServer metadata_server;
+    ASSERT_TRUE(metadata_server.ok());
+    const std::string remote_peer = "127.0.0.2:17990";
+    EngineHandle target;
+    target.init(metadata_server.uri(), remote_peer, kSmallLength, {},
+                /*configure_pool_env=*/false);
+    ASSERT_TRUE(target.ok);
+    EngineHandle h;
+    h.init(metadata_server.uri(), "127.0.0.2:17987", kSmallLength, remote_peer,
+           /*configure_pool_env=*/false);
+    ASSERT_TRUE(h.ok);
+    auto before = h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
+    ASSERT_NE(before, nullptr);
+    ASSERT_GE(before->tcp_proto_version, 2);
+    ASSERT_GT(before->metadata_version, 0u);
+
+    // 1) Same non-zero metadata_version with different tcp_proto_version:
+    //    shouldInstallFetchedSegmentDesc must detect `*old_desc != *new_desc`
+    //    and reject the conflicting snapshot.
+    ASSERT_TRUE(metadata_server.rewriteStoredTcpProtoVersion(
+        before->name, 1, /*zero_metadata_version=*/false));
+    ASSERT_EQ(h.engine->syncSegmentCache(before->name), 0);
+    auto conflict_rejected =
+        h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
+    ASSERT_NE(conflict_rejected, nullptr);
+    EXPECT_EQ(conflict_rejected.get(), before.get());
+    EXPECT_EQ(conflict_rejected->tcp_proto_version, before->tcp_proto_version);
+
+    // 2) Unversioned (metadata_version == 0) update changing only
+    //    tcp_proto_version: syncSegmentCache relies solely on `*old_desc !=
+    //    *desc` to install the new snapshot rather than treating it as
+    //    unchanged.
+    ASSERT_TRUE(metadata_server.rewriteStoredTcpProtoVersion(
+        before->name, 1, /*zero_metadata_version=*/true));
+    ASSERT_EQ(h.engine->syncSegmentCache(before->name), 0);
+    auto after = h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
+    ASSERT_NE(after, nullptr);
+    EXPECT_NE(after.get(), before.get());
+    EXPECT_EQ(after->tcp_proto_version, 1);
 }
 
 // Mixed-version quadrant: a pooled legacy (v1) initiator against the current

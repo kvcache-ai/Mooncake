@@ -209,10 +209,21 @@ class TransferEngine {
 
     // Strict classic-TCP WRITE submission that fails closed instead of silently
     // downgrading to unacknowledged v1 framing. TCP v2 framing already awaits a
-    // receiver ACK for every WRITE; this entry point rejects legacy v1 peers
-    // (tcp_proto_version < 2), MC_TCP_PROTO=1, non-TCP routes, READs, and TENT
-    // (NotImplemented). Zero-length entries still validate TCP WRITE and peer
-    // v2 framing, then complete locally without a wire round-trip or barrier.
+    // receiver ACK for every WRITE; this entry point rejects:
+    //   - NotImplemented: TENT backend, producer_event, MC_TCP_PROTO=1, or a
+    //     target peer with tcp_proto_version < 2.
+    //   - NotSupportedTransport: classic TCP transport is unavailable or any
+    //     entry routes to a non-TCP transport (e.g. RDMA, SHM, NVLink).
+    //   - InvalidArgument: invalid batch_id, READ opcode, missing/invalid
+    //     target_id, or event-enabled batch constraint violation.
+    //   - CompletionNotificationUnsupported: event-enabled batch when classic
+    //     TCP transport does not publish batch completion counters.
+    //   - TooManyRequests: batch capacity exceeded.
+    // Empty entries still validate batch_id, TENT, TCP availability, and
+    // MC_TCP_PROTO=1 (and reject event-enabled batches) before returning OK
+    // without mutating the batch. Zero-length entries still validate TCP WRITE
+    // and peer v2 framing, then complete locally (COMPLETED) without a wire
+    // round-trip or barrier.
     Status submitAcknowledgedTcpWrite(
         BatchID batch_id, const std::vector<TransferRequest>& entries);
 

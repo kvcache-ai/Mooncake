@@ -614,12 +614,112 @@ Status MultiTransport::submitTransfer(
 
 Status MultiTransport::submitAcknowledgedTcpWrite(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
-    return submitTransfer(batch_id, entries, nullptr, true);
+    if (!Transport::isValidBatchID(batch_id)) {
+        return Status::InvalidArgument("Invalid batch ID");
+    }
+    auto& batch_desc = *((BatchDesc*)(batch_id));
+    if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
+        return Status::TooManyRequests(
+            "Exceed the limitation of batch capacity");
+    }
+    if (batch_desc.event_enabled && !batch_desc.task_list.empty()) {
+        return Status::InvalidArgument(
+            "event-enabled batch allows only one submitTransfer; "
+            "freeBatchID and allocateBatchID again");
+    }
+    if (batch_desc.event_enabled && entries.empty()) {
+        return Status::InvalidArgument(
+            "event-enabled batch rejects an empty submit");
+    }
+
+#ifdef USE_TCP
+    auto* tcp = dynamic_cast<TcpTransport*>(getTransport("tcp"));
+    if (!tcp) {
+        return Status::NotSupportedTransport(
+            "classic TCP transport is unavailable");
+    }
+
+    std::vector<Transport*> transports;
+    auto select_status = selectTransports(entries, transports);
+    if (!select_status.ok()) return select_status;
+
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (transports[i] != tcp) {
+            return Status::NotSupportedTransport(
+                "acknowledged TCP submission requires a TCP route");
+        }
+        if (entries[i].opcode != TransferRequest::WRITE) {
+            return Status::InvalidArgument(
+                "acknowledged TCP submission requires WRITE entries");
+        }
+    }
+
+    auto ack_status = tcp->validateAcknowledgedWriteEntries(entries);
+    if (!ack_status.ok()) return ack_status;
+
+    if (entries.empty()) return Status::OK();
+
+    auto& task_list = batch_desc.task_list;
+    const bool all_counter = tcp->supportsBatchCompletionCounter();
+    if (batch_desc.event_enabled && !all_counter) {
+        return Status::CompletionNotificationUnsupported(
+            "event-enabled batch requires a transport that publishes "
+            "completion without foreground polling");
+    }
+    batch_desc.counter_eligible =
+        (task_list.empty() || batch_desc.counter_eligible) && all_counter;
+    batch_desc.status_cached.store(false, std::memory_order_relaxed);
+    batch_desc.is_finished.store(false, std::memory_order_relaxed);
+    batch_desc.finished_transfer_bytes.store(0, std::memory_order_relaxed);
+
+    task_list.reserve(task_list.size() + entries.size());
+    std::vector<Transport::TransferTask*> tcp_tasks;
+    tcp_tasks.reserve(entries.size());
+    for (size_t i = 0; i < entries.size(); ++i) {
+        auto& task = task_list.emplace_back();
+        task.batch_id = batch_id;
+        task.transport_ = tcp;
+#ifdef USE_ASCEND_HETEROGENEOUS
+        task.request = const_cast<Transport::TransferRequest*>(&entries[i]);
+#else
+        task.request = &entries[i];
+#endif
+        task.request_count = 1;
+        if (all_counter) Transport::Slice::unsealTaskSubmission(&task);
+        recordTaskStart(task, entries[i]);
+        tcp_tasks.push_back(&task);
+    }
+    if (batch_desc.event_enabled) {
+        batch_desc.pending.store(task_list.size() + 1,
+                                 std::memory_order_release);
+    }
+    Status overall_status = tcp->submitAcknowledgedWriteTasks(tcp_tasks);
+    for (auto* task : tcp_tasks) {
+        if ((__atomic_load_n(&task->completion_state, __ATOMIC_RELAXED) &
+             Transport::Slice::kCompletionSealBit) == 0)
+            Transport::Slice::sealTaskSubmission(task);
+    }
+    if (!overall_status.ok()) {
+        batch_desc.counter_eligible = false;
+    }
+    if (!batch_desc.event_enabled) return overall_status;
+    if (!overall_status.ok()) return overall_status;
+    batch_desc.active_completion_callbacks.fetch_add(1,
+                                                     std::memory_order_acq_rel);
+    batch_desc.releaseCompletionLatchToken();
+    batch_desc.active_completion_callbacks.fetch_sub(1,
+                                                     std::memory_order_acq_rel);
+    return overall_status;
+#else
+    (void)entries;
+    return Status::NotSupportedTransport(
+        "classic TCP transport is not compiled");
+#endif
 }
 
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
-    std::vector<size_t>* task_sizes, bool require_tcp_ack) {
+    std::vector<size_t>* task_sizes) {
     if (!Transport::isValidBatchID(batch_id)) {
         return Status::InvalidArgument("Invalid batch ID");
     }
@@ -643,37 +743,9 @@ Status MultiTransport::submitTransfer(
             "event-enabled batch rejects an empty submit");
     }
 
-#ifdef USE_TCP
-    TcpTransport* acknowledged = nullptr;
-    if (require_tcp_ack) {
-        acknowledged = dynamic_cast<TcpTransport*>(getTransport("tcp"));
-        if (!acknowledged)
-            return Status::NotImplemented(
-                "classic TCP transport is unavailable");
-    }
-#else
-    if (require_tcp_ack)
-        return Status::NotImplemented("classic TCP transport is unavailable");
-#endif
-
     std::vector<Transport*> transports;
     auto select_status = selectTransports(entries, transports);
     if (!select_status.ok()) return select_status;
-
-#ifdef USE_TCP
-    if (acknowledged) {
-        for (size_t i = 0; i < entries.size(); ++i) {
-            if (transports[i] != acknowledged ||
-                entries[i].opcode != TransferRequest::WRITE) {
-                return Status::InvalidArgument(
-                    "acknowledged TCP submission requires TCP WRITE entries");
-            }
-        }
-        auto ack_status =
-            acknowledged->validateAcknowledgedWriteEntries(entries);
-        if (!ack_status.ok()) return ack_status;
-    }
-#endif
 
     if (entries.empty()) return Status::OK();
     auto& task_list = batch_desc.task_list;
@@ -735,14 +807,7 @@ Status MultiTransport::submitTransfer(
     }
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
-        Status status;
-#ifdef USE_TCP
-        if (acknowledged) {
-            assert(entry.first == acknowledged);
-            status = acknowledged->submitAcknowledgedWriteTasks(entry.second);
-        } else
-#endif
-            status = entry.first->submitTransferTask(entry.second);
+        auto status = entry.first->submitTransferTask(entry.second);
         for (auto* task : entry.second) {
             if ((__atomic_load_n(&task->completion_state, __ATOMIC_RELAXED) &
                  Transport::Slice::kCompletionSealBit) == 0)

@@ -141,8 +141,7 @@ class MultiTransport {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries,
-                          std::vector<size_t> *task_sizes,
-                          bool require_tcp_ack = false);
+                          std::vector<size_t> *task_sizes);
 
     Status selectTransports(const std::vector<TransferRequest> &entries,
                             std::vector<Transport *> &transports);
