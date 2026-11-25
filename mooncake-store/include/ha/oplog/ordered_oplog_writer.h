@@ -110,13 +110,16 @@ class OrderedOpLogWriter {
     // PERSISTENT_FAIL (use GetTerminalState() to distinguish a per-wait timeout
     // from terminal writer failure). The mutation may still commit: timeout is
     // not proof of rejection, and must not trigger an unconditional replay of
-    // the mutation. Finite timeouts fire on a lazily created multi-threaded
-    // timer pool that Stop() cancels and joins. Do not destroy the writer from
-    // writer-owned threads (including inline continuations or thenValue
-    // captures that async_simple may destroy on the completing thread).
-    // Resource initialization failures propagate to the caller without
-    // registering a wait. Negative timeouts return INVALID_PARAMS; zero polls
-    // the current prefix; max() retains the unbounded wait.
+    // the mutation. Finite timeouts fire on a lazily created 4-thread timer
+    // pool that Stop() cancels and joins; Stop() waits for any in-flight inline
+    // timeout continuations on that pool, and blocking all 4 pool workers with
+    // inline continuations stalls further timeout notifications until one
+    // returns. Do not destroy the writer from writer-owned threads (including
+    // inline continuations or thenValue captures that async_simple may destroy
+    // on the completing thread). Resource initialization failures propagate to
+    // the caller without registering a wait. Negative timeouts return
+    // INVALID_PARAMS; zero polls the current prefix; max() retains the
+    // unbounded wait with no timer allocation.
     async_simple::Future<ErrorCode> AwaitDurable(
         uint64_t sequence,
         std::chrono::milliseconds timeout = std::chrono::milliseconds::max());
