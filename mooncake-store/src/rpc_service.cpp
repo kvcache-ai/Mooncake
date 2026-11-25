@@ -1034,6 +1034,20 @@ WrappedMasterService::BatchUpdateSoftPin(const std::vector<std::string>& keys,
         });
 }
 
+std::vector<tl::expected<MasterService::SoftPinOutcome, ErrorCode>>
+WrappedMasterService::BatchUpdateSoftPinWithOptions(
+    const std::vector<std::string>& keys, uint64_t ttl_ms,
+    const MasterService::SoftPinOptions& options,
+    const std::string& tenant_id) {
+    return WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        keys.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchUpdateSoftPin(keys, resolved_tenant_id,
+                                                      ttl_ms, options);
+        });
+}
+
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
     const std::vector<std::string>& keys, bool force,
     const std::string& tenant_id) {

@@ -2341,17 +2341,41 @@ auto MasterService::BatchUpdateSoftPin(const std::vector<std::string>& keys,
                                        const TenantId& tenant_id,
                                        uint64_t ttl_ms)
     -> std::vector<tl::expected<void, ErrorCode>> {
+    auto outcomes = BatchUpdateSoftPin(keys, tenant_id, ttl_ms, {});
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(outcomes.size());
+    for (auto& outcome : outcomes) {
+        if (outcome) {
+            results.emplace_back();
+        } else {
+            results.emplace_back(tl::make_unexpected(outcome.error()));
+        }
+    }
+    return results;
+}
+
+auto MasterService::BatchUpdateSoftPin(const std::vector<std::string>& keys,
+                                       const TenantId& tenant_id,
+                                       uint64_t ttl_ms,
+                                       const SoftPinOptions& options)
+    -> std::vector<tl::expected<SoftPinOutcome, ErrorCode>> {
     ReplicateConfig config;
     config.soft_pin_action = SoftPinAction::ENABLE;
     config.soft_pin_ttl_ms = ttl_ms;
     auto request = ResolveSoftPinRequest(config);
-    if (!tenant_id.IsValid() || !request) {
-        return std::vector<tl::expected<void, ErrorCode>>(
+    const bool has_options =
+        options.priority != 0 || options.extend_only || options.pending;
+    if (!tenant_id.IsValid() || !request || (has_options && ttl_ms == 0)) {
+        return std::vector<tl::expected<SoftPinOutcome, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     }
+    request->keep_later_deadline = options.extend_only;
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     const TenantId normalized_tenant = ResolveRequestTenantId(tenant_id);
-    std::vector<tl::expected<void, ErrorCode>> results;
+    const auto now = std::chrono::system_clock::now();
+    const auto deadline =
+        ObjectMetadata::ComputeSoftPinDeadline(now, request->ttl);
+    std::vector<tl::expected<SoftPinOutcome, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
         if (key.empty()) {
@@ -2359,26 +2383,104 @@ auto MasterService::BatchUpdateSoftPin(const std::vector<std::string>& keys,
                 tl::make_unexpected(ErrorCode::INVALID_PARAMS));
             continue;
         }
+        if (options.pending) {
+            // Held before the key is looked at, so a write that completes in
+            // between still finds the pin.
+            pending_pins_.Record(normalized_tenant.value(), key, deadline,
+                                 options.priority, now);
+        }
         MetadataAccessorRW accessor(this,
                                     ObjectIdentity{normalized_tenant, key});
-        if (!accessor.Exists()) {
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+        const bool exists = accessor.Exists();
+        if (!exists || accessor.InProcessing() ||
+            accessor.Get().pending_soft_pin_action ||
+            !accessor.Get().HasReplica(&Replica::fn_is_completed)) {
+            if (options.pending) {
+                pins_left_pending_.fetch_add(1, std::memory_order_relaxed);
+                results.emplace_back(SoftPinOutcome::kPending);
+            } else {
+                results.emplace_back(
+                    tl::make_unexpected(exists ? ErrorCode::REPLICA_IS_NOT_READY
+                                               : ErrorCode::OBJECT_NOT_FOUND));
+            }
             continue;
         }
-        auto& metadata = accessor.Get();
-        if (accessor.InProcessing() || metadata.pending_soft_pin_action ||
-            !metadata.HasReplica(&Replica::fn_is_completed)) {
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY));
-            continue;
+        if (options.pending) {
+            // The key is complete: the request applies, not the held copy.
+            pending_pins_.Take(normalized_tenant.value(), key, now);
+            pins_applied_at_once_.fetch_add(1, std::memory_order_relaxed);
         }
-        ApplySoftPinEvaluation(
-            metadata,
-            metadata.ApplySoftPin(*request, std::chrono::system_clock::now()));
-        results.emplace_back();
+        ApplySoftPinWithPriority(accessor.Get(), *request, options.priority,
+                                 now);
+        results.emplace_back(SoftPinOutcome::kPinned);
     }
     return results;
+}
+
+std::string MasterService::PinMetricsText() const {
+    const auto pending = pending_pins_.counters();
+    std::string text;
+    auto counter = [&text](const char* name, const char* help, uint64_t value) {
+        text += std::string("# HELP ") + name + " " + help + "\n# TYPE " +
+                name + " counter\n" + name + " " + std::to_string(value) + "\n";
+    };
+    counter("master_pin_applied_at_once_total",
+            "Pinned keys that were complete when the pin arrived",
+            pins_applied_at_once_.load(std::memory_order_relaxed));
+    counter("master_pin_left_pending_total",
+            "Pinned keys not complete yet when the pin arrived",
+            pins_left_pending_.load(std::memory_order_relaxed));
+    // Pins applied at once also pass through the table, so a write applied the
+    // rest.
+    const uint64_t at_once =
+        pins_applied_at_once_.load(std::memory_order_relaxed);
+    counter("master_pin_pending_applied_on_write_total",
+            "Pending pins a later write applied",
+            pending.applied > at_once ? pending.applied - at_once : 0);
+    counter("master_pin_pending_expired_total",
+            "Pending pins that ran out before their key was written",
+            pending.expired);
+    counter("master_pin_pending_dropped_full_total",
+            "Pending pins dropped because the table was full",
+            pending.dropped_full);
+    text +=
+        "# HELP master_pin_pending_keys Pins waiting for their key\n"
+        "# TYPE master_pin_pending_keys gauge\nmaster_pin_pending_keys " +
+        std::to_string(pending_pins_.Size()) + "\n";
+    return text;
+}
+
+void MasterService::ApplyPendingPin(ObjectMetadata& metadata,
+                                    const TenantId& tenant_id,
+                                    const std::string& key) {
+    const auto now = std::chrono::system_clock::now();
+    const auto pin = pending_pins_.Take(tenant_id.value(), key, now);
+    if (!pin) {
+        return;
+    }
+    // Rounded up, so the pin lasts at least as long as was asked.
+    const auto ttl =
+        std::chrono::ceil<std::chrono::milliseconds>(pin->deadline - now);
+    if (ttl <= std::chrono::milliseconds::zero()) {
+        return;
+    }
+    ApplySoftPinWithPriority(metadata,
+                             {.action = SoftPinAction::ENABLE,
+                              .ttl = ttl,
+                              .keep_later_deadline = true},
+                             pin->priority, now);
+}
+
+void MasterService::ApplySoftPinWithPriority(
+    ObjectMetadata& metadata, const ResolvedSoftPinRequest& request,
+    uint32_t priority, std::chrono::system_clock::time_point now) {
+    const auto committed = metadata.GetCommittedSoftPinTimeout();
+    const bool was_active = committed && *committed > now;
+    ApplySoftPinEvaluation(metadata, metadata.ApplySoftPin(request, now));
+    metadata.eviction_priority =
+        request.keep_later_deadline && was_active
+            ? std::max(metadata.eviction_priority, priority)
+            : priority;
 }
 
 void MasterService::ApplySoftPinMetricDelta(int metric_delta) {
@@ -5598,6 +5700,8 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     SyncCacheTotalAccounting(metadata);
     // TODO: add inc_nof_cache_nums() (ranhaojia)
     metadata.GrantReadLease(std::chrono::milliseconds::zero());
+    // A pin asked for before this write applies now that the key is here.
+    ApplyPendingPin(metadata, object_id.tenant_id, key);
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::string payload = SerializeMetadataForOpLog(metadata);

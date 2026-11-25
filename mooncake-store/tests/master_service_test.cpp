@@ -950,6 +950,177 @@ TEST_F(MasterServiceTest,
     EXPECT_EQ(read_deadline(), lease);
 }
 
+TEST_F(MasterServiceTest, SoftPinPendingPinsNowOrWhenTheKeyIsWritten) {
+    using Outcome = MasterService::SoftPinOutcome;
+    auto config = MasterServiceConfig::builder()
+                      .set_max_kv_soft_pin_ttl(60000)
+                      .set_default_kv_soft_pin_ttl(1000)
+                      .build();
+    MasterService service(config);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const auto client = generate_uuid();
+    ASSERT_TRUE(service.PutStart(client, "now", TenantId::Default(), 1024,
+                                 ReplicateConfig{}));
+    ASSERT_TRUE(service.PutEnd(client, {"now", std::nullopt},
+                               TenantId::Default(), ReplicaType::MEMORY));
+
+    const MasterService::SoftPinOptions options{
+        .priority = 7, .extend_only = true, .pending = true};
+    const auto before = std::chrono::system_clock::now();
+    auto results = service.BatchUpdateSoftPin(
+        {"now", "later", ""}, TenantId::Default(), 30000, options);
+    ASSERT_EQ(results.size(), 3);
+    ASSERT_TRUE(results[0]);
+    EXPECT_EQ(*results[0], Outcome::kPinned);
+    ASSERT_TRUE(results[1]);
+    EXPECT_EQ(*results[1], Outcome::kPending);
+    EXPECT_EQ(results[2].error(), ErrorCode::INVALID_PARAMS);
+    ASSERT_TRUE(GetSoftPinDeadline(service, "now"));
+    EXPECT_EQ(GetEvictionPriority(service, "now"), 7u);
+
+    // The pin waits for the write: none while it is in flight, applied, with
+    // its priority and the deadline asked for, once it completes.
+    ASSERT_TRUE(service.PutStart(client, "later", TenantId::Default(), 1024,
+                                 ReplicateConfig{}));
+    EXPECT_FALSE(GetSoftPinDeadline(service, "later"));
+    ASSERT_TRUE(service.PutEnd(client, {"later", std::nullopt},
+                               TenantId::Default(), ReplicaType::MEMORY));
+    const auto later = GetSoftPinDeadline(service, "later");
+    ASSERT_TRUE(later);
+    EXPECT_GE(*later, before + std::chrono::milliseconds(29000));
+    EXPECT_LE(*later, std::chrono::system_clock::now() +
+                          std::chrono::milliseconds(30000));
+    EXPECT_EQ(GetEvictionPriority(service, "later"), 7u);
+    const std::string metrics = service.PinMetricsText();
+    EXPECT_NE(metrics.find("master_pin_applied_at_once_total 1"),
+              std::string::npos);
+    EXPECT_NE(metrics.find("master_pin_left_pending_total 1"),
+              std::string::npos);
+    EXPECT_NE(metrics.find("master_pin_pending_applied_on_write_total 1"),
+              std::string::npos)
+        << metrics;
+
+    // A pin is taken once: the next write of the key is not pinned again.
+    ASSERT_TRUE(service.Remove("later", TenantId::Default(), true));
+    ASSERT_TRUE(service.PutStart(client, "later", TenantId::Default(), 1024,
+                                 ReplicateConfig{}));
+    ASSERT_TRUE(service.PutEnd(client, {"later", std::nullopt},
+                               TenantId::Default(), ReplicaType::MEMORY));
+    EXPECT_FALSE(GetSoftPinDeadline(service, "later"));
+
+    // Without `pending`, the same keys keep the plain per-key errors.
+    auto plain = service.BatchUpdateSoftPin({"absent"}, TenantId::Default(),
+                                            30000, {.priority = 7});
+    EXPECT_EQ(plain[0].error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(MasterServiceTest, SoftPinExtendOnlyKeepsLaterDeadlineAndPriority) {
+    auto config = MasterServiceConfig::builder()
+                      .set_max_kv_soft_pin_ttl(60000)
+                      .set_default_kv_soft_pin_ttl(1000)
+                      .build();
+    MasterService service(config);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const auto client = generate_uuid();
+    ASSERT_TRUE(service.PutStart(client, "pin-key", TenantId::Default(), 1024,
+                                 ReplicateConfig{}));
+    ASSERT_TRUE(service.PutEnd(client, {"pin-key", std::nullopt},
+                               TenantId::Default(), ReplicaType::MEMORY));
+    const auto pin = [&](uint64_t ttl_ms,
+                         const MasterService::SoftPinOptions& options) {
+        return service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(),
+                                          ttl_ms, options)[0];
+    };
+
+    ASSERT_TRUE(pin(30000, {.priority = 7, .extend_only = true}));
+    const auto first = GetSoftPinDeadline(service, "pin-key");
+    ASSERT_TRUE(first);
+    EXPECT_EQ(GetEvictionPriority(service, "pin-key"), 7u);
+
+    // A shorter, lower pin changes neither the deadline nor the priority.
+    ASSERT_TRUE(pin(10000, {.priority = 2, .extend_only = true}));
+    EXPECT_EQ(GetSoftPinDeadline(service, "pin-key"), first);
+    EXPECT_EQ(GetEvictionPriority(service, "pin-key"), 7u);
+
+    // A longer one extends the deadline.
+    ASSERT_TRUE(pin(50000, {.priority = 2, .extend_only = true}));
+    const auto extended = GetSoftPinDeadline(service, "pin-key");
+    ASSERT_TRUE(extended);
+    EXPECT_GT(*extended, *first);
+    EXPECT_EQ(GetEvictionPriority(service, "pin-key"), 7u);
+
+    // Without extend_only the request replaces both, as the plain update does.
+    ASSERT_TRUE(pin(10000, {.priority = 3}));
+    const auto replaced = GetSoftPinDeadline(service, "pin-key");
+    ASSERT_TRUE(replaced);
+    EXPECT_LT(*replaced, *extended);
+    EXPECT_EQ(GetEvictionPriority(service, "pin-key"), 3u);
+
+    // Options need a positive TTL within the master's maximum.
+    EXPECT_EQ(pin(0, {.priority = 3}).error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(pin(60001, {.extend_only = true}).error(),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_TRUE(service
+                    .BatchUpdateSoftPin({}, TenantId::Default(), 1000,
+                                        {.pending = true})
+                    .empty());
+}
+
+TEST_F(MasterServiceTest, SoftPinPendingPinRunsOut) {
+    auto config = MasterServiceConfig::builder()
+                      .set_max_kv_soft_pin_ttl(60000)
+                      .set_default_kv_soft_pin_ttl(1000)
+                      .build();
+    MasterService service(config);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const auto client = generate_uuid();
+    auto results = service.BatchUpdateSoftPin({"late"}, TenantId::Default(), 5,
+                                              {.priority = 3, .pending = true});
+    ASSERT_TRUE(results[0]);
+    EXPECT_EQ(*results[0], MasterService::SoftPinOutcome::kPending);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_TRUE(service.PutStart(client, "late", TenantId::Default(), 1024,
+                                 ReplicateConfig{}));
+    ASSERT_TRUE(service.PutEnd(client, {"late", std::nullopt},
+                               TenantId::Default(), ReplicaType::MEMORY));
+    EXPECT_FALSE(GetSoftPinDeadline(service, "late"));
+    EXPECT_EQ(GetEvictionPriority(service, "late"), 0u);
+}
+
+TEST(PendingPinsTest, BoundedLaterDeadlineTakenOnce) {
+    using Clock = PendingPins::Clock;
+    const auto now = Clock::now();
+    const auto soon = now + std::chrono::seconds(10);
+    const auto later = now + std::chrono::seconds(20);
+    PendingPins pins(2);
+
+    pins.Record("t", "a", later, 1, now);
+    pins.Record("t", "a", soon, 4, now);  // keeps the later deadline
+    auto a = pins.Take("t", "a", now);
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->deadline, later);
+    EXPECT_EQ(a->priority, 4u);
+    EXPECT_FALSE(pins.Take("t", "a", now));
+
+    // Tenants are separate keys; past capacity the oldest goes.
+    pins.Record("t", "a", soon, 0, now);
+    pins.Record("u", "a", soon, 0, now);
+    pins.Record("t", "b", soon, 0, now);
+    EXPECT_EQ(pins.Size(), 2u);
+    EXPECT_FALSE(pins.Take("t", "a", now));
+    EXPECT_TRUE(pins.Take("u", "a", now));
+
+    // A pin taken after its deadline is dropped.
+    EXPECT_FALSE(pins.Take("t", "b", soon));
+    EXPECT_EQ(pins.Size(), 0u);
+
+    const auto counters = pins.counters();
+    EXPECT_EQ(counters.recorded, 4u);
+    EXPECT_EQ(counters.applied, 2u);       // "a" first, then "u"/"a"
+    EXPECT_EQ(counters.expired, 1u);       // "b" taken at its deadline
+    EXPECT_EQ(counters.dropped_full, 1u);  // "t"/"a" pushed out at capacity
+}
+
 TEST_F(MasterServiceTest, SoftPinZeroTtlSkipsSoftPinRegistration) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_soft_pin_ttl(50)

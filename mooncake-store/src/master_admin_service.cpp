@@ -392,6 +392,10 @@ std::string MasterAdminServer::BuildMetricsText() const {
     std::string metrics = AppendMetricSections(
         MasterMetricManager::instance().serialize_metrics(),
         HAMetricManager::instance().serialize_metrics());
+    if (auto service = GetActiveService()) {
+        metrics =
+            AppendMetricSections(std::move(metrics), service->PinMetricsText());
+    }
     auto tenant_metrics = BuildTenantQuotaMetricsText();
     if (tenant_metrics.empty()) {
         return metrics;
@@ -1346,14 +1350,21 @@ struct HttpSoftPinRequest {
     std::string tenant_id{"default"};
     std::vector<std::string> keys;
     std::optional<uint64_t> ttl_ms;
+    // soft_pin only; see MasterService::SoftPinOptions.
+    std::optional<uint32_t> priority;
+    std::optional<bool> extend_only;
+    std::optional<bool> pending;
 };
-YLT_REFL(HttpSoftPinRequest, tenant_id, keys, ttl_ms);
+YLT_REFL(HttpSoftPinRequest, tenant_id, keys, ttl_ms, priority, extend_only,
+         pending);
 
 struct HttpSoftPinResult {
     std::string key;
     int32_t error_code{0};
+    // The pin is held until the key's write completes.
+    bool pending{false};
 };
-YLT_REFL(HttpSoftPinResult, key, error_code);
+YLT_REFL(HttpSoftPinResult, key, error_code, pending);
 
 struct HttpSoftPinResponse {
     std::vector<HttpSoftPinResult> results;
@@ -1383,25 +1394,37 @@ void MasterAdminServer::HandleSoftPin(coro_http::coro_http_request& req,
                            std::string("Invalid JSON body: ") + e.what());
         return;
     }
+    const MasterService::SoftPinOptions options{
+        .priority = request.priority.value_or(0),
+        .extend_only = request.extend_only.value_or(false),
+        .pending = request.pending.value_or(false)};
+    const bool has_options = request.priority.has_value() ||
+                             request.extend_only.has_value() ||
+                             request.pending.has_value();
     if (request.keys.empty() || request.keys.size() > 4096 ||
         !TenantId(request.tenant_id).IsValid() ||
-        (unpin ? request.ttl_ms.has_value() : !request.ttl_ms.has_value())) {
+        (unpin ? request.ttl_ms.has_value() : !request.ttl_ms.has_value()) ||
+        (has_options && (unpin || *request.ttl_ms == 0))) {
         WriteErrorResponse(resp, coro_http::status_type::bad_request,
                            ErrorCode::INVALID_PARAMS,
                            "Expected 1..4096 keys, a valid tenant, and ttl_ms "
-                           "only for soft_pin");
+                           "only for soft_pin; priority, extend_only, and "
+                           "pending need a positive ttl_ms");
         return;
     }
     WithActiveService(resp, [&](auto service) {
-        const auto results = service->BatchUpdateSoftPin(
-            request.keys, unpin ? 0 : *request.ttl_ms, request.tenant_id);
+        const auto results = service->BatchUpdateSoftPinWithOptions(
+            request.keys, unpin ? 0 : *request.ttl_ms, options,
+            request.tenant_id);
         HttpSoftPinResponse payload;
         payload.results.reserve(results.size());
         for (size_t i = 0; i < results.size(); ++i) {
             payload.results.push_back(
                 {request.keys[i],
                  static_cast<int32_t>(results[i] ? ErrorCode::OK
-                                                 : results[i].error())});
+                                                 : results[i].error()),
+                 results[i] &&
+                     *results[i] == MasterService::SoftPinOutcome::kPending});
         }
         WriteJsonResponse(resp, coro_http::status_type::ok, payload);
     });
