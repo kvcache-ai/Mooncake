@@ -178,6 +178,78 @@ TEST_F(ShardedLeaseIndexTest,
     }
 }
 
+// A serial walk reads each bucket as it reaches it, oldest first across the
+// shards, so a key refiled ahead of where the walk stands is met in its turn:
+// a read renewal rejected at its stale rank comes back before the newer
+// bucket, not after the walk.
+TEST_F(ShardedLeaseIndexTest, ASerialWalkMeetsARefiledKeyInItsTurn) {
+    const auto w = metadata::LeaseEvictionIndex::kBucketWidth;
+    PublishAt("renewed", now_ - 10 * w);
+    PublishAt("older", now_ - 8 * w);
+    PublishAt("newer", now_ - 4 * w);
+    {
+        auto guard = ns_.objects.Read("renewed");
+        guard->metadata().lease_->ExtendTo(now_ - 6 * w);
+    }
+    // Keys written from other threads land in other shards.
+    for (int t = 0; t < 4; ++t) {
+        std::thread([&, t] {
+            PublishAt("other" + std::to_string(t), now_ - (9 - 2 * t) * w);
+        }).join();
+    }
+
+    auto cursor = ns_.eviction_index().Scan(now_);
+    std::vector<std::string> walk;
+    std::vector<int64_t> ranks;
+    while (auto entry = cursor->Next()) {
+        const std::string key(entry->keys.front());
+        auto guard = ns_.objects.Write(key);
+        ASSERT_TRUE(guard);
+        // Rejected at its stale rank, refiled as the lock is let go.
+        EXPECT_EQ(cursor->StillAt(*guard, *entry),
+                  key != "renewed" || walk.size() > 1)
+            << key;
+        walk.push_back(key);
+        ranks.push_back(entry->rank);
+    }
+    EXPECT_EQ(walk, (std::vector<std::string>{"renewed", "other0", "older",
+                                              "other1", "renewed", "other2",
+                                              "newer", "other3"}));
+    EXPECT_TRUE(std::is_sorted(ranks.begin(), ranks.end()));
+}
+
+// The other side of moving only forward: a key refiled behind where its
+// shard's walk stands waits for the next walk. A postponed key that a writer
+// files by its lease again, changing nothing else, is not met twice.
+TEST_F(ShardedLeaseIndexTest, ASerialWalkDoesNotMeetAWrittenPostponedKeyTwice) {
+    const auto w = metadata::LeaseEvictionIndex::kBucketWidth;
+    PublishAt("pinned", now_ - 4 * w);
+    PublishAt("next", now_ - 2 * w);
+    auto cursor = ns_.eviction_index().Scan(now_);
+    std::vector<std::string> walk;
+    while (auto entry = cursor->Next()) {
+        const std::string key(entry->keys.front());
+        walk.push_back(key);
+        ASSERT_LT(walk.size(), 10u);
+        if (key == "pinned") {
+            {
+                auto guard = ns_.objects.Write(key);
+                ASSERT_TRUE(guard);
+                ns_.eviction_index().Postpone(*guard,
+                                              now_ + std::chrono::seconds(1));
+            }
+            // Filed by its lease again, behind the walk.
+            ASSERT_TRUE(ns_.objects.Write(key).has_value());
+        }
+    }
+    EXPECT_EQ(walk, (std::vector<std::string>{"pinned", "next"}));
+    // The next walk meets it.
+    auto next_walk = ns_.eviction_index().Scan(now_);
+    const auto next = next_walk->Next();
+    ASSERT_TRUE(next);
+    EXPECT_EQ(next->keys.front(), "pinned");
+}
+
 TEST_F(ShardedLeaseIndexTest,
        NegativeEpochCutoffRoundsTowardEarlierBucketAndExcludesFutureRanks) {
     const Clock::time_point before_epoch{std::chrono::milliseconds(-250)};
@@ -333,6 +405,17 @@ TEST_F(ShardedLeaseIndexTest,
             });
         }
     });
+    std::thread serial_scanner([&] {
+        while (!done.load(std::memory_order_relaxed)) {
+            auto cursor = ns_.eviction_index().Scan(now_);
+            while (auto entry = cursor->Next()) {
+                auto guard = ns_.objects.Write(entry->keys.front());
+                if (guard) {
+                    (void)cursor->StillAt(*guard, *entry);
+                }
+            }
+        }
+    });
 
     std::vector<std::thread> writers;
     for (int t = 0; t < 4; ++t) {
@@ -355,7 +438,122 @@ TEST_F(ShardedLeaseIndexTest,
     }
     done.store(true, std::memory_order_relaxed);
     scanner.join();
+    serial_scanner.join();
     EXPECT_EQ(ns_.objects.ObjectCount(), 64u);
+}
+
+// Once the heap first runs dry, a serial walk looks once more for buckets
+// filed ahead of where each shard's walk stands, and no more: a writer that
+// keeps filing a key ahead of the walk, into due buckets, cannot hold it.
+TEST_F(ShardedLeaseIndexTest, ASerialWalkLooksAheadOnceMoreAtMost) {
+    const auto w = metadata::LeaseEvictionIndex::kBucketWidth;
+    PublishAt("moving", now_ - 20 * w);
+    auto cursor = ns_.eviction_index().Scan(now_);
+    int visits = 0;
+    while (auto entry = cursor->Next()) {
+        ASSERT_EQ(entry->keys.front(), "moving");
+        ++visits;
+        ASSERT_LT(visits, 10);
+        // Filed ahead of the walk: two buckets later, still due.
+        auto guard = ns_.objects.Write("moving");
+        ASSERT_TRUE(guard);
+        SpinLocker locker(&guard->metadata().lock);
+        guard->metadata().lease_->SetDeadline(now_ - (20 - 2 * visits) * w);
+    }
+    EXPECT_EQ(visits, 2);
+}
+
+// A bucket a serial walk queued that is gone when the walk gets to it is
+// passed over: a key filed into it again once the walk is past is behind the
+// walk, and waits for the next one.
+TEST_F(ShardedLeaseIndexTest, ASerialWalkMovesPastABucketThatWent) {
+    const auto w = metadata::LeaseEvictionIndex::kBucketWidth;
+    PublishAt("first", now_ - 10 * w);
+    PublishAt("last", now_ - 4 * w);
+    // Written from another thread, so filed in another shard.
+    std::thread([&] { PublishAt("moved", now_ - 8 * w); }).join();
+    const auto file_moved_at = [&](Clock::time_point deadline) {
+        auto guard = ns_.objects.Write("moved");
+        ASSERT_TRUE(guard);
+        SpinLocker locker(&guard->metadata().lock);
+        guard->metadata().lease_->SetDeadline(deadline);
+    };
+    const auto walk = [&](const auto& after_each) {
+        std::vector<std::string> keys;
+        auto cursor = ns_.eviction_index().Scan(now_);
+        while (auto entry = cursor->Next()) {
+            keys.emplace_back(entry->keys.front());
+            after_each(keys.back());
+            if (keys.size() >= 10) {
+                break;
+            }
+        }
+        return keys;
+    };
+    EXPECT_EQ(walk([&](const std::string& key) {
+                  if (key == "first") {
+                      // Its bucket goes before the walk gets to it, ...
+                      file_moved_at(now_ + std::chrono::seconds(10));
+                  } else if (key == "last") {
+                      // ... and comes back once the walk is past it.
+                      file_moved_at(now_ - 8 * w);
+                  }
+              }),
+              (std::vector<std::string>{"first", "last"}));
+    EXPECT_EQ(walk([](const std::string&) {}),
+              (std::vector<std::string>{"first", "moved", "last"}));
+}
+
+// Writers that keep moving keys between due buckets and later ones, and that
+// tear keys down and publish them again, make buckets go and come back as a
+// serial walk reaches them. Every walk still ends, and meets each key once at
+// most: a key published again after the walk began is left out.
+TEST_F(ShardedLeaseIndexTest, ASerialWalkEndsWhileWritersMoveItsBuckets) {
+    constexpr int kKeys = 256;
+    constexpr int kWriters = 4;
+    const auto w = metadata::LeaseEvictionIndex::kBucketWidth;
+    const auto due_at = [&](int i) { return now_ - (1 + i % 32) * w; };
+    for (int i = 0; i < kKeys; ++i) {
+        PublishAt("k" + std::to_string(i), due_at(i));
+    }
+    std::atomic<bool> done{false};
+    std::vector<std::thread> writers;
+    for (int t = 0; t < kWriters; ++t) {
+        writers.emplace_back([&, t] {
+            // Each writer owns the keys k(t), k(t + kWriters), ...
+            for (uint64_t n = 0; !done.load(std::memory_order_relaxed); ++n) {
+                const int i = static_cast<int>((n * kWriters + t) % kKeys);
+                const std::string key = "k" + std::to_string(i);
+                if (n % 8 == 0) {
+                    {
+                        auto guard = ns_.objects.Write(key);
+                        ASSERT_TRUE(guard);
+                        guard->TearDown();
+                    }
+                    PublishAt(key, due_at(i));
+                    continue;
+                }
+                auto guard = ns_.objects.Write(key);
+                ASSERT_TRUE(guard);
+                SpinLocker locker(&guard->metadata().lock);
+                guard->metadata().lease_->SetDeadline(
+                    n % 2 == 0 ? due_at(i) : now_ + std::chrono::seconds(10));
+            }
+        });
+    }
+    for (int walk = 0; walk < 200; ++walk) {
+        std::set<std::string> met;
+        auto cursor = ns_.eviction_index().Scan(now_);
+        while (auto entry = cursor->Next()) {
+            EXPECT_TRUE(met.emplace(entry->keys.front()).second)
+                << entry->keys.front();
+        }
+    }
+    done.store(true, std::memory_order_relaxed);
+    for (auto& writer : writers) {
+        writer.join();
+    }
+    EXPECT_EQ(ns_.objects.ObjectCount(), static_cast<size_t>(kKeys));
 }
 
 // A mock live range cursor: first wave exposes only 20 slots; after widening

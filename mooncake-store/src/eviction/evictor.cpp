@@ -406,11 +406,20 @@ Report Evictor::RunFor(const Scope& scope, const Aim& aim) {
     scans.reserve(namespaces.size());
     for (metadata::Namespace* ns : namespaces) {
         NamespaceScan scan;
-        // Byte goals have no key-count estimate: 0 visits all due ranks.
-        scan.ranges =
-            ns->eviction_index().ScanRanges(now, [&](size_t filed) -> size_t {
-                return aim.in_bytes ? 0 : aim.NamespaceGoal(filed);
-            });
+        // A run whose callbacks all support concurrency takes the range
+        // cursor, which schedules the due buckets before the walk starts, on
+        // one worker or several. A serial run (a policy, reclaimer or
+        // observer that cannot run concurrently: an OpLog, offload-on-evict
+        // or KVCS DFS run) walks the serial cursor, which reads the index as
+        // the walk goes, so a run that meets its goal early pays for what it
+        // read.
+        if (parallel_safe_) {
+            // Byte goals have no key-count estimate: 0 visits all due ranks.
+            scan.ranges = ns->eviction_index().ScanRanges(
+                now, [&](size_t filed) -> size_t {
+                    return aim.in_bytes ? 0 : aim.NamespaceGoal(filed);
+                });
+        }
         if (!scan.ranges) {
             scan.serial = ns->eviction_index().Scan(now);
         }
@@ -425,7 +434,7 @@ Report Evictor::RunFor(const Scope& scope, const Aim& aim) {
         const size_t i = (start + n) % namespaces.size();
         metadata::Namespace& ns = *namespaces[i];
         NamespaceScan& scan = scans[i];
-        if (!scan.ranges || !parallel_safe_) {
+        if (!scan.ranges) {
             Pass(*this, ns, scan.Cursor(), aim, report, now).RunSerial();
             continue;
         }

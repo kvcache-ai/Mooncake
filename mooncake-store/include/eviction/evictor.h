@@ -29,7 +29,11 @@
 // entries, so it never stops halfway through a group's deferred members.
 //
 // Serial execution holds at most one key lock at a time. Range workers hold
-// one per worker; callbacks must support parallel execution. All
+// one per worker; callbacks must support parallel execution. A run whose
+// callbacks support it walks the index's range cursor, which schedules the
+// due part of the index before it starts, on one worker or several; a serial
+// run walks the index's serial cursor, which reads the index only as far as
+// the walk goes. All
 // replicas are freed outside their key lock and workers join before fallback.
 // Parallel runs serialize access to their persistent pool. What the caller
 // holds across Run, it holds for the whole run.

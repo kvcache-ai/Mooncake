@@ -21,8 +21,12 @@
 //   route deterministically by Fibonacci-hashing their shared `Lease*` pointer
 //   (`LockShardForGroup`).
 // - Subsequent rank updates and removals go straight to `LockRecordedShard`.
-// - A scan schedules due (rank, shard) buckets in ascending rank order, taking
-//   only the oldest age band needed for small targets and widening on demand.
+// - A serial walk (Scan) takes due (rank, shard) buckets in ascending rank
+//   order as it reaches them: each shard also keeps its bucket ranks in order,
+//   so a run that stops early reads only what it got to. A range scan
+//   (ScanRanges), for a run whose callbacks all support concurrency (on one
+//   worker or several), schedules them before the workers start, taking only
+//   the oldest age band needed for small targets and widening on demand.
 //
 // Postpone moves a lone key to a later bucket of the shard it is filed in until
 // its next write, through the same refile a rank update takes, so serial and
@@ -74,6 +78,7 @@ class LeaseEvictionIndex final : public EvictionIndex {
     struct Shard;
     struct LockedShard;
     class ShardedCursor;
+    class SerialCursor;
 
     // Symmetric shard-locking entry points for the three write cases:
     // - fresh standalone key: any uncontended shard (sticky thread-local hint);
@@ -85,6 +90,9 @@ class LeaseEvictionIndex final : public EvictionIndex {
         const route::SlotEvictionState& state) const;
 
     static uint16_t ShardForGroupLease(const Lease* group_lease);
+    // Cursor::StillAt for either cursor.
+    static bool StillFiledAt(const route::WriteGuard& guard,
+                             const Entry& entry);
     static Rank RankOf(const ObjectMetadata& metadata);
     static Rank BucketOf(Clock::time_point deadline);
 
