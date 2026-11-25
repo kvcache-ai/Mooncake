@@ -4683,6 +4683,15 @@ TEST_F(MasterServiceTest, DrainJobFencesSameNameMountsUntilTheJobFinishes) {
     ASSERT_TRUE(
         service.UnmountSegment(source_a.segment_id, source_a.client_id));
     ASSERT_NO_FATAL_FAILURE(expect_mount_rejected());
+    const auto change_status = service.SetSegmentStatus("a", SegmentStatus::OK);
+    ASSERT_FALSE(change_status);
+    EXPECT_EQ(change_status.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    auto overlapping = request;
+    overlapping.segments = {"a"};
+    const auto duplicate = service.CreateDrainJob(overlapping);
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
     ASSERT_TRUE(ExecutePendingMoveTasks(service, source_b.client_id));
     MasterServiceTestPeer::RunDrainRoundForTesting(service);
     ASSERT_EQ(service.QueryDrainJob(*job_id).value().status,
@@ -5805,6 +5814,42 @@ TEST_F(MasterServiceTest, SetSegmentStatusRejectsSegmentUnderDrainJob) {
     auto status = service_->QuerySegmentStatus("segment_0");
     ASSERT_TRUE(status.has_value());
     EXPECT_EQ(status.value(), SegmentStatus::DRAINING);
+}
+
+TEST_F(MasterServiceTest, DrainSourceOperationsDoNotWaitForJobLock) {
+    MasterService service;
+    MasterServiceTestPeer::StopDrainDispatchForTesting(service);
+    PrepareSimpleSegment(service, "source", 0x300000000);
+    PrepareSimpleSegment(service, "other", 0x400000000);
+    PrepareSimpleSegment(service, "target", 0x500000000);
+    CreateDrainJobRequest request;
+    request.segments = {"source"};
+    request.target_segments = {"target"};
+    auto job_id = service.CreateDrainJob(request);
+    ASSERT_TRUE(job_id);
+    auto held = MasterServiceTestPeer::LockDrainJobForTesting(service, *job_id);
+    ASSERT_TRUE(held.owns_lock());
+
+    auto operations = std::async(std::launch::async, [&] {
+        EXPECT_TRUE(service.SetSegmentStatus("other", SegmentStatus::DRAINING));
+        const auto change_status =
+            service.SetSegmentStatus("source", SegmentStatus::OK);
+        ASSERT_FALSE(change_status);
+        EXPECT_EQ(change_status.error(),
+                  ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
+        const auto duplicate = service.CreateDrainJob(request);
+        ASSERT_FALSE(duplicate);
+        EXPECT_EQ(duplicate.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
+        auto disjoint = request;
+        disjoint.segments = {"other"};
+        EXPECT_TRUE(service.CreateDrainJob(disjoint));
+    });
+    const auto completion = operations.wait_for(std::chrono::seconds(2));
+    held.unlock();
+    EXPECT_EQ(completion, std::future_status::ready);
+    operations.get();
 }
 
 // ===================== Client Offboarding Tests =====================

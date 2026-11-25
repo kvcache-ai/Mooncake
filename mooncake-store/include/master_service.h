@@ -2244,7 +2244,7 @@ class MasterService {
     void DelayDrainCandidate(DrainPlan& plan, DrainCandidate candidate,
                              bool blocked);
     void RequestDrainTaskCancellation(DrainJob& job);
-    bool FinishDrainJobCancellation(DrainJob& job);
+    void FinishDrainJobCancellation(DrainJob& job);
     void ScheduleDrainJobTasks(DrainJob& job);
     std::vector<bool> ScanDrainSources(
         DrainJob& job, const std::vector<size_t>& source_indices);

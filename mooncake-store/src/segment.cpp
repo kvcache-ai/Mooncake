@@ -215,7 +215,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
             return ErrorCode::INVALID_PARAMS;
         }
     }
-    if (segment_manager_->fenced_drain_sources_.contains(segment.name)) {
+    if (IsDrainSourceFenced(segment.name)) {
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
     const auto registrations =
@@ -918,6 +918,11 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     }
 
     return SetSegmentStatus(mounted_segment_it->second, status);
+}
+
+bool ScopedSegmentAccess::IsDrainSourceFenced(
+    const std::string& segment_name) const {
+    return segment_manager_->fenced_drain_sources_.contains(segment_name);
 }
 
 void ScopedSegmentAccess::FenceDrainSource(const std::string& segment_name) {

@@ -224,6 +224,7 @@ class ScopedSegmentAccess {
 
     // An explicit job owns the name until it finishes, even if the last
     // registration is removed before the job reaches a terminal state.
+    bool IsDrainSourceFenced(const std::string& segment_name) const;
     void FenceDrainSource(const std::string& segment_name);
     void ReleaseDrainSourceFence(const std::string& segment_name);
 
