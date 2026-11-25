@@ -1623,7 +1623,9 @@ class MasterService {
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr,
-        std::shared_ptr<void>* credit = nullptr);
+        std::shared_ptr<void>* credit = nullptr, uint64_t token = 0);
+    // Async offload-on-evict: a fresh id for one queued copy, never 0.
+    uint64_t NextOffloadToken();
 
     // Cancels the offload task on `object_id`, releasing the source refcnt
     // and dropping the task marker along with its mirrors. Returns false
@@ -2032,6 +2034,8 @@ class MasterService {
     // under pressure: after a failed allocation, or with usage above
     // (1 + eviction_high_watermark_ratio) / 2.
     bool offload_force_evict_{false};
+    // The next copy's OffloadTaskItem::token; seeded at random at startup.
+    std::atomic<uint64_t> next_offload_token_{1};
     // offload_on_evict_backoff_ms: how long a round that made no progress
     // holds the next one back, unless an offload ends meanwhile.
     std::chrono::milliseconds offload_async_backoff_{200};

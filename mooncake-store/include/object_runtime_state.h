@@ -54,6 +54,10 @@ struct OffloadingTask {
     // (eviction::OffloadLedger::Credit), given back when the task goes.
     // Empty otherwise.
     std::shared_ptr<void> credit;
+    // Async offload-on-evict: the id the copy was queued with
+    // (OffloadTaskItem::token); a report with another one is not this
+    // copy's. 0 otherwise.
+    uint64_t token{0};
 };
 
 // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source

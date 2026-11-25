@@ -165,6 +165,10 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_OFFLOAD_USE_URING, legacy_use_uring);
     config.use_uring = ParseStrictBoolOr(use_uring, false);
 
+    config.lease_free_offload_source_read =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_LEASE_FREE_SOURCE_READ,
+                        config.lease_free_offload_source_read);
+
     return config;
 }
 

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <future>
+#include <limits>
 #include <random>
 #include <thread>
 
@@ -67,6 +68,22 @@ TEST(RandomTest, RandomUniformSupportsNarrowIntegers) {
     }
     EXPECT_FALSE(randomUniform<bool>(false, false, engine));
     EXPECT_TRUE(randomUniform<bool>(true, true, engine));
+}
+
+TEST(RandomTest, RandomUniformSupportsFullUint64Range) {
+    constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
+    std::mt19937_64 engine(42);
+    bool saw_high_bit = false;
+    for (size_t i = 0; i < 1000; ++i) {
+        uint64_t value = 0;
+        EXPECT_NO_THROW(value = randomUniform<uint64_t>(1, kMax, engine));
+        EXPECT_GE(value, uint64_t{1});
+        saw_high_bit = saw_high_bit || (value >> 63) != 0;
+        EXPECT_NO_THROW(randomUniform<uint64_t>(0, kMax, engine));
+    }
+    // Draws span all 64 bits, not just the low 32.
+    EXPECT_TRUE(saw_high_bit);
+    EXPECT_EQ(randomUniform<uint64_t>(kMax, kMax, engine), kMax);
 }
 
 TEST(RandomTest, RejectsInvalidBounds) {

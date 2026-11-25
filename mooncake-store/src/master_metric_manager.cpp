@@ -529,6 +529,11 @@ MasterMetricManager::MasterMetricManager()
           "Eviction ticks over the watermark that held a round back, by "
           "reason (--offload_on_evict_async)",
           {"reason"}),
+      offload_evict_stale_landings_total_(
+          "master_offload_evict_stale_landings_total",
+          "Copy reports for a copy the master no longer waits for (removed, "
+          "replaced, failed or expired); never registered "
+          "(--offload_on_evict_async)"),
 
       // Initialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd,
       // MoveRevoke Counters
@@ -1662,6 +1667,14 @@ int64_t MasterMetricManager::get_offload_evict_round_skipped(
     return offload_evict_round_skipped_total_.value({reason});
 }
 
+void MasterMetricManager::inc_offload_evict_stale_landing(int64_t val) {
+    offload_evict_stale_landings_total_.inc(val);
+}
+
+int64_t MasterMetricManager::get_offload_evict_stale_landing() {
+    return offload_evict_stale_landings_total_.value();
+}
+
 int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
 }
@@ -2537,6 +2550,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(offload_evict_freed_bytes_total_);
     serialize_metric(offload_evict_kept_total_);
     serialize_metric(offload_evict_round_skipped_total_);
+    serialize_metric(offload_evict_stale_landings_total_);
     serialize_metric(weight_revisions_by_availability_);
     serialize_metric(weight_revisions_by_residency_);
     serialize_metric(weight_active_leases_);

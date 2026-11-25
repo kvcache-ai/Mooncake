@@ -358,11 +358,14 @@ struct MasterService::MemoryEviction {
                     Replica& source,
                     std::vector<UUID>* mirror_clients) override {
             Pushed pushed;
+            const uint64_t token =
+                service_.offload_async_ ? service_.NextOffloadToken() : 0;
             const auto queued = service_.PushOffloadingQueue(
                 ObjectIdentity{tenant_id, key}, source, mirror_clients,
-                service_.offload_async_ ? &pushed.credit : nullptr);
+                service_.offload_async_ ? &pushed.credit : nullptr, token);
             if (queued) {
                 pushed.result = Pushed::Result::kQueued;
+                pushed.token = token;
             } else if (queued.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
                 pushed.result = Pushed::Result::kOwnerFull;
             }
@@ -708,6 +711,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
             }
             offload_async_ = true;
             offload_force_evict_ = config.offload_force_evict;
+            // Random, so a copy queued before a restart is never taken for
+            // one queued after it.
+            next_offload_token_.store(
+                randomUniform<uint64_t>(1,
+                                        std::numeric_limits<uint64_t>::max()),
+                std::memory_order_relaxed);
             offload_async_backoff_ =
                 std::chrono::milliseconds(config.offload_on_evict_backoff_ms);
             offload_stall_window_ =
@@ -5656,7 +5665,8 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         if (source_id.has_value() && !state.offloading_task) {
             state.offloading_task =
                 OffloadingTask{*source_id, std::chrono::system_clock::now(),
-                               std::move(mirror_clients), /*credit=*/{}};
+                               std::move(mirror_clients), /*credit=*/{},
+                               /*token=*/0};
         }
     }
 
@@ -8438,6 +8448,13 @@ auto MasterService::NotifyOffloadSuccess(
                                          : TenantId::Default();
         const auto request_object_id =
             MakeObjectIdentityForRequest(task.key, task_tenant);
+        // Async: the report is for the copy queued with this token, and only
+        // the task that still carries it is that copy's (0: no token, any
+        // task, as before).
+        const uint64_t token = task.token.value_or(0);
+        const auto is_this_copy = [token](const OffloadingTask& offload) {
+            return token == 0 || offload.token == token;
+        };
 
         // NACK sentinel: offload failed on worker. Clean up the
         // offloading_task + dec_refcnt but skip AddReplica.
@@ -8447,7 +8464,7 @@ auto MasterService::NotifyOffloadSuccess(
             MetadataAccessorRW accessor(this, request_object_id);
             if (accessor.Exists()) {
                 auto& offloading_task = accessor.GetState().offloading_task;
-                if (offloading_task) {
+                if (offloading_task && is_this_copy(*offloading_task)) {
                     auto source = accessor.Get().GetReplicaByID(
                         offloading_task->source_id);
                     if (source != nullptr) {
@@ -8500,8 +8517,9 @@ auto MasterService::NotifyOffloadSuccess(
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
                 auto& offloading_task = accessor.GetState().offloading_task;
-                if (offloading_task &&
-                    replica.type() != ReplicaType::LOCAL_DISK) {
+                const bool ours =
+                    offloading_task && is_this_copy(*offloading_task);
+                if (ours && replica.type() != ReplicaType::LOCAL_DISK) {
                     LOG(ERROR) << "Invalid replica type: " << replica.type()
                                << ". Expected ReplicaType::LOCAL_DISK.";
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -8510,7 +8528,7 @@ auto MasterService::NotifyOffloadSuccess(
                 // Existing orphan objects can only bypass tenant registration
                 // for a master-admitted offload completion. Without this task
                 // marker, fall through to the regular registration check.
-                if (offloading_task) {
+                if (ours) {
                     auto source =
                         obj_metadata.GetReplicaByID(offloading_task->source_id);
                     if (source != nullptr) {
@@ -8564,6 +8582,14 @@ auto MasterService::NotifyOffloadSuccess(
             }
         }
 
+        if (!handled_existing_object && token != 0) {
+            // A copy the master no longer waits for: its object was removed
+            // or replaced, or its task ended (failed, expired, unmounted).
+            // Its source may have been freed and reused meanwhile, so its
+            // bytes are never registered, nor do they create the key.
+            MasterMetricManager::instance().inc_offload_evict_stale_landing();
+            continue;
+        }
         if (!handled_existing_object) {
             auto normalized_tenant_result =
                 ResolveTenantIdForWrite(request_object_id.tenant_id);
@@ -8611,7 +8637,8 @@ auto MasterService::NotifyOffloadSuccess(
 
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     const ObjectIdentity& object_id, Replica& replica,
-    std::vector<UUID>* mirror_clients, std::shared_ptr<void>* credit) {
+    std::vector<UUID>* mirror_clients, std::shared_ptr<void>* credit,
+    uint64_t token) {
     const auto& segment_names = replica.get_segment_names();
     // No source segment names means there is no usable source segment to
     // offload from. Returning a silent {} here caused the caller to record an
@@ -8685,12 +8712,15 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         }
         const int64_t size =
             source_descriptor.get_memory_descriptor().buffer_descriptor.size_;
+        OffloadTaskItem item{.tenant_id = object_id.tenant_id.value(),
+                             .key = object_id.user_key,
+                             .size = size,
+                             .token = {}};
+        if (token != 0) {
+            item.token = token;
+        }
         auto err = local_ssd_manager_.EnqueueOffload(
-            *client_id,
-            OffloadTaskItem{.tenant_id = object_id.tenant_id.value(),
-                            .key = object_id.user_key,
-                            .size = size},
-            offloading_queue_limit_);
+            *client_id, std::move(item), offloading_queue_limit_);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
             return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
         }
@@ -10136,6 +10166,14 @@ void MasterService::PublishOffloadLedgerGauges() {
                                            offload_stall_window_);
     metrics.set_offload_evict_stalled_bytes(
         static_cast<int64_t>(bytes > live ? bytes - live : 0));
+}
+
+uint64_t MasterService::NextOffloadToken() {
+    uint64_t token;
+    do {
+        token = next_offload_token_.fetch_add(1, std::memory_order_relaxed);
+    } while (token == 0);
+    return token;
 }
 
 const eviction::OffloadLedger& MasterService::offload_ledger() const {

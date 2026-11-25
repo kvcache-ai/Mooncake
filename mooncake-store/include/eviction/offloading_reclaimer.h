@@ -57,6 +57,8 @@ class OffloadQueue {
         // Held by the offload's task, and given back when it goes; empty
         // unless the queue keeps a ledger (see OffloadLedger).
         std::shared_ptr<void> credit;
+        // The id the copy was queued with, kept on the task; 0 for none.
+        uint64_t token = 0;
 
         [[nodiscard]] bool queued() const { return result == Result::kQueued; }
     };

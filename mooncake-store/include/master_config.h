@@ -1582,6 +1582,8 @@ struct InProcMasterConfig {
     std::optional<int> http_metadata_port;
     std::optional<uint64_t> default_kv_lease_ttl;
     std::optional<bool> enable_offload;
+    std::optional<bool> offload_on_evict;
+    std::optional<bool> offload_on_evict_async;
     std::optional<bool> enable_cxl;
     std::optional<std::string> cxl_path;
     std::optional<size_t> cxl_size;
@@ -1601,6 +1603,8 @@ class InProcMasterConfigBuilder {
     std::optional<int> http_metadata_port_ = std::nullopt;
     std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
     std::optional<bool> enable_offload_ = std::nullopt;
+    std::optional<bool> offload_on_evict_ = std::nullopt;
+    std::optional<bool> offload_on_evict_async_ = std::nullopt;
     std::optional<bool> enable_cxl_ = std::nullopt;
     std::optional<std::string> cxl_path_ = std::nullopt;
     std::optional<size_t> cxl_size_ = std::nullopt;
@@ -1636,6 +1640,16 @@ class InProcMasterConfigBuilder {
 
     InProcMasterConfigBuilder& set_enable_offload(bool enable) {
         enable_offload_ = enable;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_offload_on_evict(bool enable) {
+        offload_on_evict_ = enable;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_offload_on_evict_async(bool enable) {
+        offload_on_evict_async_ = enable;
         return *this;
     }
 
@@ -1700,6 +1714,8 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.http_metadata_port = http_metadata_port_;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
     config.enable_offload = enable_offload_;
+    config.offload_on_evict = offload_on_evict_;
+    config.offload_on_evict_async = offload_on_evict_async_;
     config.enable_cxl = enable_cxl_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;

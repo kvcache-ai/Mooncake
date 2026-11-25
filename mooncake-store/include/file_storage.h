@@ -336,9 +336,11 @@ class FileStorage {
         const std::vector<int64_t>& lengths,
         const std::vector<int64_t>& object_sizes, bool prefer_pinned);
 
+    // `lease_free`: query without granting the objects a read lease.
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
         const std::vector<std::string>& keys, const std::string& tenant_id,
-        std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
+        std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
+        bool lease_free);
 
     tl::expected<void, ErrorCode> RegisterLocalMemory();
 

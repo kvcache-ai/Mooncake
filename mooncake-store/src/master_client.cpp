@@ -1323,8 +1323,10 @@ tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
     std::vector<OffloadTaskItem> tasks;
     tasks.reserve(keys.size());
     for (const auto& key : keys) {
-        tasks.push_back(OffloadTaskItem{
-            .tenant_id = tenant_id_.value(), .key = key, .size = 0});
+        tasks.push_back(OffloadTaskItem{.tenant_id = tenant_id_.value(),
+                                        .key = key,
+                                        .size = 0,
+                                        .token = {}});
     }
     return NotifyOffloadSuccess(client_id, tasks, metadatas);
 }

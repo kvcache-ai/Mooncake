@@ -64,8 +64,9 @@ tl::expected<Effect, ErrorCode> OffloadingReclaimer::Apply(
         }
         source->inc_refcnt();
         state.offload_retry_after = 0;
-        state.offloading_task = OffloadingTask{
-            id, now, std::move(mirror_clients), std::move(pushed.credit)};
+        state.offloading_task =
+            OffloadingTask{id, now, std::move(mirror_clients),
+                           std::move(pushed.credit), pushed.token};
 
         Plan rest;
         for (const ReplicaID other : plan.release) {
