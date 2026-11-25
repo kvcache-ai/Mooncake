@@ -296,7 +296,10 @@ int UrmaContext::buildLocalBufferDesc(uint64_t addr,
 
 void* UrmaContext::localSegWithIndex(unsigned value) {
     RWSpinlock::ReadGuard guard(seg_region_lock_);
-    return local_tseg_list_.at(value);
+    if (value >= local_tseg_list_.size()) {
+        return nullptr;
+    }
+    return local_tseg_list_[value];
 }
 
 int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {

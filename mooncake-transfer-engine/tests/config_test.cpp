@@ -18,6 +18,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <optional>
+#include <string>
 #include <thread>
 
 #include "config.h"
@@ -1254,7 +1256,22 @@ TEST(RdAtomicResolveTest, RequestMayExceedHistoricalCapUpToDeviceLimit) {
 
 class MaxSegSizeEnvTest : public ::testing::Test {
    protected:
-    void TearDown() override { ::unsetenv("MC_MAX_SEG_SIZE"); }
+    void SetUp() override {
+        if (const char* prev = std::getenv("MC_MAX_SEG_SIZE")) {
+            saved_env_ = prev;
+        }
+    }
+
+    void TearDown() override {
+        if (saved_env_.has_value()) {
+            ::setenv("MC_MAX_SEG_SIZE", saved_env_->c_str(), 1);
+        } else {
+            ::unsetenv("MC_MAX_SEG_SIZE");
+        }
+    }
+
+   private:
+    std::optional<std::string> saved_env_;
 };
 
 TEST_F(MaxSegSizeEnvTest, UnsetKeepsDefault) {

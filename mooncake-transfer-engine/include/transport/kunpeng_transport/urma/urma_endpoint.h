@@ -118,7 +118,6 @@ class UrmaContext : public UbContext {
     urma_token_t urma_token = {.token = 0xACFE};
     urma_context_t* urma_context_ = nullptr;
     // ibv_pd *pd_ = nullptr;
-    uint64_t max_seg_size{};
     urma_mtu active_mtu_;
     urma_eid_t eid_{};
     urma_device_attr_t dev_attr_{};

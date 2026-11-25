@@ -29,11 +29,13 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common.h"
@@ -126,15 +128,20 @@ class UBLargeSegTest : public ::testing::Test {
             return TransferStatusEnum::FAILED;
         }
 
-        const int kMaxPollIterations = 10000000;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
         TransferStatus status;
         status.s = TransferStatusEnum::WAITING;
-        for (int i = 0; i < kMaxPollIterations; ++i) {
+        for (uint64_t iter = 0; std::chrono::steady_clock::now() < deadline;
+             ++iter) {
             if (!engine->getTransferStatus(batch_id, 0, status).ok()) {
                 engine->freeBatchID(batch_id);
                 return TransferStatusEnum::FAILED;
             }
             if (status.s != TransferStatusEnum::WAITING) break;
+            if ((iter & 0x3FFu) == 0x3FFu) {
+                std::this_thread::yield();
+            }
         }
         Status fs = engine->freeBatchID(batch_id);
         if (!fs.ok() && !fs.IsBatchCleanupDeferred()) {
@@ -231,10 +238,16 @@ TEST_F(UBLargeSegTest, WriteWithSourceStraddlingChunkBoundary) {
 }
 
 // READ pulls from a remote range straddling seam 0->1 into a local range
-// straddling seam 1->2, forcing slices to split at both boundaries.
+// straddling seam 1->2 at different offsets, forcing slices to split at both
+// boundaries independently.
 TEST_F(UBLargeSegTest, ReadStraddlesChunkBoundaryOnBothSides) {
-    const size_t kRemoteOffset = kMaxSegSize - kDataLength / 2 + 1;
-    const size_t kLocalOffset = 2 * kMaxSegSize - kDataLength / 2 + 1;
+    const size_t kRemoteOffset = kMaxSegSize - kDataLength / 4 + 1;
+    const size_t kLocalOffset = 2 * kMaxSegSize - (3 * kDataLength) / 4 + 1;
+    ASSERT_LT(kRemoteOffset, kMaxSegSize);
+    ASSERT_GT(kRemoteOffset + kDataLength, kMaxSegSize);
+    ASSERT_LT(kLocalOffset, 2 * kMaxSegSize);
+    ASSERT_GT(kLocalOffset + kDataLength, 2 * kMaxSegSize);
+    ASSERT_NE(kMaxSegSize - kRemoteOffset, 2 * kMaxSegSize - kLocalOffset);
 
     fillSource(kRemoteOffset);
     memset(static_cast<char*>(addr) + kLocalOffset, 0, kDataLength);

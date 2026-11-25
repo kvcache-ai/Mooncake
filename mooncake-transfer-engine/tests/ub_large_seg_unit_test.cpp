@@ -13,19 +13,25 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "common.h"
 #include "config.h"
+#include "memory_location.h"
 #include "topology.h"
 #include "transfer_metadata.h"
+#include "transfer_metadata_plugin.h"
 #include "transport/kunpeng_transport/ub_context.h"
 #include "transport/kunpeng_transport/ub_transport.h"
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
@@ -114,6 +120,7 @@ class FakeUbContext final : public UbContext {
         : UbContext(engine, device_name, 16), seg_tag_base_(seg_tag_base) {}
 
     int registerMemoryRegion(uint64_t va, size_t length) override {
+        std::lock_guard<std::mutex> lock(mu_);
         const int call_idx = register_call_count++;
         register_calls.emplace_back(va, length);
         if (fail_on_register_call >= 0 && call_idx == fail_on_register_call) {
@@ -127,7 +134,13 @@ class FakeUbContext final : public UbContext {
     }
 
     int unregisterMemoryRegion(uint64_t va) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        const int call_idx = unregister_call_count++;
         unregister_calls.push_back(va);
+        if (fail_on_unregister_call >= 0 &&
+            call_idx == fail_on_unregister_call) {
+            return ERR_CONTEXT;
+        }
         for (auto it = live_regions_.begin(); it != live_regions_.end(); ++it) {
             if (it->second.va <= va && va < it->second.va + it->second.length) {
                 local_segs_[it->second.index] = nullptr;
@@ -140,6 +153,7 @@ class FakeUbContext final : public UbContext {
 
     int buildLocalBufferDesc(uint64_t addr,
                              UbTransport::BufferDesc& buffer_desc) override {
+        std::lock_guard<std::mutex> lock(mu_);
         const int call_idx = build_desc_call_count++;
         if (fail_on_build_desc_call >= 0 &&
             call_idx == fail_on_build_desc_call) {
@@ -157,7 +171,11 @@ class FakeUbContext final : public UbContext {
     }
 
     void* localSegWithIndex(unsigned value) override {
-        return local_segs_.at(value);
+        std::lock_guard<std::mutex> lock(mu_);
+        if (value >= local_segs_.size()) {
+            return nullptr;
+        }
+        return local_segs_[value];
     }
 
     std::shared_ptr<UbEndPoint> makeEndpoint() override { return nullptr; }
@@ -181,6 +199,7 @@ class FakeUbContext final : public UbContext {
 
     int submitPostSend(
         const std::vector<Transport::Slice*>& slice_list) override {
+        std::lock_guard<std::mutex> lock(mu_);
         for (auto* slice : slice_list) {
             posted_slices.push_back({slice->source_addr, slice->ub.dest_addr,
                                      slice->length, slice->opcode,
@@ -197,9 +216,12 @@ class FakeUbContext final : public UbContext {
         void* seg;
     };
 
+    std::mutex mu_;
     int register_call_count = 0;
+    int unregister_call_count = 0;
     int build_desc_call_count = 0;
     int fail_on_register_call = -1;
+    int fail_on_unregister_call = -1;
     int fail_on_build_desc_call = -1;
     std::vector<std::pair<uint64_t, size_t>> register_calls;
     std::vector<uint64_t> unregister_calls;
@@ -599,6 +621,351 @@ TEST_F(UbLargeSegUnitTest, SubmitFailureMarksQueuedUnpostedSlicesFailed) {
     ASSERT_EQ(transport_->getTransferStatus(batch_id, 0, status), Status::OK());
     EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
     EXPECT_EQ(transport_->freeBatchID(batch_id), Status::OK());
+}
+
+TEST_F(UbLargeSegUnitTest, UrmaContextLocalSegWithIndexOutOfRangeReturnsNull) {
+    UrmaContext urma_ctx(*transport_, "mock_urma_device", 1);
+    EXPECT_EQ(urma_ctx.localSegWithIndex(0), nullptr);
+    EXPECT_EQ(urma_ctx.localSegWithIndex(999), nullptr);
+}
+
+TEST_F(UbLargeSegUnitTest, RegisterRollbackDoesNotTouchLaterContexts) {
+    void* base = reinterpret_cast<void*>(0x380000);
+    const size_t total_len = kMaxSegSize * 2 + 128;
+
+    contexts_[1]->fail_on_register_call = 0;
+    EXPECT_NE(UbTransportTestPeer::registerLocalMemory(*transport_, base,
+                                                       total_len, "cpu:0"),
+              0);
+    EXPECT_TRUE(contexts_[0]->live_regions_.empty());
+    EXPECT_EQ(contexts_[0]->unregister_calls.size(), 1u);
+    EXPECT_TRUE(contexts_[1]->unregister_calls.empty());
+    EXPECT_EQ(UbTransportTestPeer::chunkMapSize(*transport_), 0u);
+}
+
+TEST_F(UbLargeSegUnitTest, RegisterWildcardLocationResolvesAfterPinning) {
+    std::vector<char> backing(kMaxSegSize * 2 + 512, 0);
+    void* base = backing.data();
+
+    ASSERT_EQ(UbTransportTestPeer::registerLocalMemory(
+                  *transport_, base, backing.size(), kWildcardLocation),
+              0);
+
+    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(desc, nullptr);
+    ASSERT_EQ(desc->buffers.size(), 3u);
+    EXPECT_FALSE(desc->buffers[0].name.empty());
+    for (const auto& buf : desc->buffers) {
+        EXPECT_EQ(buf.name, desc->buffers[0].name);
+    }
+
+    ASSERT_EQ(UbTransportTestPeer::unregisterLocalMemory(*transport_, base), 0);
+    EXPECT_TRUE(
+        metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+    EXPECT_EQ(UbTransportTestPeer::chunkMapSize(*transport_), 0u);
+    for (const auto& ctx : contexts_) {
+        EXPECT_TRUE(ctx->live_regions_.empty());
+    }
+}
+
+TEST_F(UbLargeSegUnitTest, UnregisterChunkedRetriesCleanlyAfterPartialFailure) {
+    void* base = reinterpret_cast<void*>(0x3A0000);
+    const size_t total_len = kMaxSegSize * 3;
+    ASSERT_EQ(UbTransportTestPeer::registerLocalMemory(*transport_, base,
+                                                       total_len, "cpu:0"),
+              0);
+    ASSERT_EQ(UbTransportTestPeer::chunkMapSize(*transport_), 1u);
+
+    // Fail chunk 1 unregistration on context 1 (call 0 = chunk 0, call 1 =
+    // chunk 1).
+    contexts_[1]->fail_on_unregister_call = 1;
+    EXPECT_NE(UbTransportTestPeer::unregisterLocalMemory(*transport_, base), 0);
+    EXPECT_EQ(UbTransportTestPeer::chunkMapSize(*transport_), 1u);
+    EXPECT_TRUE(contexts_[0]->live_regions_.empty());
+    EXPECT_EQ(contexts_[1]->live_regions_.size(), 1u);
+
+    // Retrying unregister must finish tearing down the surviving chunk and
+    // clean up chunk_map_.
+    contexts_[1]->fail_on_unregister_call = -1;
+    ASSERT_EQ(UbTransportTestPeer::unregisterLocalMemory(*transport_, base), 0);
+    EXPECT_EQ(UbTransportTestPeer::chunkMapSize(*transport_), 0u);
+    EXPECT_TRUE(
+        metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+    for (const auto& ctx : contexts_) {
+        EXPECT_TRUE(ctx->live_regions_.empty());
+    }
+}
+
+TEST_F(UbLargeSegUnitTest, UnregisterSingleSegmentRetriesAfterPartialFailure) {
+    void* base = reinterpret_cast<void*>(0x3C0000);
+    ASSERT_EQ(UbTransportTestPeer::registerLocalMemory(*transport_, base,
+                                                       kMaxSegSize, "cpu:0"),
+              0);
+    ASSERT_EQ(UbTransportTestPeer::chunkMapSize(*transport_), 0u);
+
+    contexts_[1]->fail_on_unregister_call = 0;
+    EXPECT_NE(UbTransportTestPeer::unregisterLocalMemory(*transport_, base), 0);
+    EXPECT_TRUE(
+        metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+    EXPECT_TRUE(contexts_[0]->live_regions_.empty());
+    EXPECT_EQ(contexts_[1]->live_regions_.size(), 1u);
+
+    // The BufferDesc is already removed; the retry must still release the
+    // surviving URMA segment instead of returning ERR_ADDRESS_NOT_REGISTERED.
+    contexts_[1]->fail_on_unregister_call = -1;
+    ASSERT_EQ(UbTransportTestPeer::unregisterLocalMemory(*transport_, base), 0);
+    EXPECT_EQ(UbTransportTestPeer::chunkMapSize(*transport_), 0u);
+    for (const auto& ctx : contexts_) {
+        EXPECT_TRUE(ctx->live_regions_.empty());
+    }
+
+    // A fully released address is unknown again.
+    EXPECT_EQ(UbTransportTestPeer::unregisterLocalMemory(*transport_, base),
+              ERR_ADDRESS_NOT_REGISTERED);
+}
+
+TEST_F(UbLargeSegUnitTest, HugeTlbPageCheckOnlyAppliesToChunkedBuffers) {
+    constexpr size_t kHugepageSize = 2ull << 20;
+    constexpr int kHuge2MBFlag = 21 << MAP_HUGE_SHIFT;
+    void* huge =
+        mmap(nullptr, kHugepageSize, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | kHuge2MBFlag, -1, 0);
+    if (huge == MAP_FAILED) {
+        GTEST_SKIP() << "cannot map a 2 MiB huge page (no hugetlb pages "
+                        "reserved?)";
+    }
+    static_cast<char*>(huge)[0] = 1;  // fault the page in for smaps
+    if (detectBufferPageSize(huge) != kHugepageSize) {
+        munmap(huge, kHugepageSize);
+        GTEST_SKIP() << "mapping is not reported as a 2 MiB HugeTLB VMA";
+    }
+
+    // max_seg_size below the huge page size: buffers that fit in one segment
+    // must still register, only buffers that need chunking are rejected.
+    globalConfig().max_seg_size = kHugepageSize / 2;
+    const size_t small_len = kHugepageSize / 4;
+    EXPECT_EQ(UbTransportTestPeer::registerLocalMemory(*transport_, huge,
+                                                       small_len, "cpu:0"),
+              0);
+    EXPECT_EQ(UbTransportTestPeer::unregisterLocalMemory(*transport_, huge), 0);
+
+    EXPECT_EQ(UbTransportTestPeer::registerLocalMemory(*transport_, huge,
+                                                       kHugepageSize, "cpu:0"),
+              ERR_INVALID_ARGUMENT);
+    for (const auto& ctx : contexts_) {
+        EXPECT_TRUE(ctx->live_regions_.empty());
+    }
+
+    munmap(huge, kHugepageSize);
+}
+
+TEST_F(UbLargeSegUnitTest, RegisterAndUnregisterBatchHandlesOversizedBuffers) {
+    void* buf0 = reinterpret_cast<void*>(0x1000000);
+    const size_t len0 = kMaxSegSize * 2 + 128;  // 3 chunks
+    void* buf1 = reinterpret_cast<void*>(0x2000000);
+    const size_t len1 = kMaxSegSize + 256;  // 2 chunks
+
+    ASSERT_EQ(transport_->registerLocalMemoryBatch({{buf0, len0}, {buf1, len1}},
+                                                   "cpu:0"),
+              0);
+    EXPECT_EQ(UbTransportTestPeer::chunkMapSize(*transport_), 2u);
+    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(desc, nullptr);
+    EXPECT_EQ(desc->buffers.size(), 5u);
+
+    ASSERT_EQ(transport_->unregisterLocalMemoryBatch({buf0, buf1}), 0);
+    EXPECT_EQ(UbTransportTestPeer::chunkMapSize(*transport_), 0u);
+    EXPECT_TRUE(
+        metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+    for (const auto& ctx : contexts_) {
+        EXPECT_TRUE(ctx->live_regions_.empty());
+    }
+}
+
+TEST_F(UbLargeSegUnitTest, SubmitSplitsAcrossSliceSizeAndChunkSeam) {
+    void* local_base = reinterpret_cast<void*>(0x480000);
+    ASSERT_EQ(UbTransportTestPeer::registerLocalMemory(
+                  *transport_, local_base, kMaxSegSize * 2, "cpu:0"),
+              0);
+
+    const Transport::SegmentID kRemoteSegId = 45;
+    const uint64_t kRemoteBase = 0xB00000;
+    addRemoteSegment(kRemoteSegId, "remote-node:5678",
+                     {{kRemoteBase, kMaxSegSize * 2}});
+
+    // kSliceSize=1024, kFragmentLimit=256:
+    //   [0, 1024)    -> 1024 (remaining 3000 > 1280)
+    //   [1024, 1500) -> 476  (capped by local chunk 0->1 seam at 1500)
+    //   [1500, 2524) -> 1024 (remaining 1500 > 1280)
+    //   [2524, 3000) -> 476  (final <= 1280)
+    char* source_ptr = static_cast<char*>(local_base) + kMaxSegSize - 1500;
+    const size_t req_len = 3000;
+
+    auto batch_id = transport_->allocateBatchID(1);
+    Transport::TransferRequest req;
+    req.opcode = Transport::TransferRequest::WRITE;
+    req.source = source_ptr;
+    req.target_id = kRemoteSegId;
+    req.target_offset = kRemoteBase;
+    req.length = req_len;
+
+    ASSERT_EQ(transport_->submitTransfer(batch_id, {req}), Status::OK());
+    TransferStatus status;
+    ASSERT_EQ(transport_->getTransferStatus(batch_id, 0, status), Status::OK());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, req_len);
+    ASSERT_EQ(transport_->freeBatchID(batch_id), Status::OK());
+
+    const auto slices = allPostedSlices();
+    ASSERT_EQ(slices.size(), 4u);
+    EXPECT_EQ(slices[0].length, 1024u);
+    EXPECT_EQ(slices[1].length, 476u);
+    EXPECT_EQ(slices[2].length, 1024u);
+    EXPECT_EQ(slices[3].length, 476u);
+    EXPECT_EQ(slices[0].l_seg, slices[1].l_seg);
+    EXPECT_NE(slices[1].l_seg, slices[2].l_seg);
+    EXPECT_EQ(slices[2].l_seg, slices[3].l_seg);
+}
+
+TEST_F(UbLargeSegUnitTest, SubmitRefreshesStaleRemoteSegmentDesc) {
+    globalConfig().metacache = true;
+
+    void* local_base = reinterpret_cast<void*>(0x580000);
+    ASSERT_EQ(UbTransportTestPeer::registerLocalMemory(*transport_, local_base,
+                                                       kMaxSegSize, "cpu:0"),
+              0);
+
+    TransferMetadata peer_meta(P2PHANDSHAKE);
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_NE(port, 0);
+    const std::string host = globalConfig().use_ipv6 ? "::1" : "127.0.0.1";
+    const std::string peer_name =
+        maybeWrapIpV6(host) + ":" + std::to_string(port);
+
+    auto peer_desc = std::make_shared<SegmentDesc>();
+    peer_desc->name = peer_name;
+    peer_desc->protocol = "ub";
+    peer_desc->topology = *topology_;
+    for (const auto& ctx : contexts_) {
+        TransferMetadata::DeviceDesc dev;
+        dev.name = ctx->deviceName();
+        dev.eid = ctx->getEid();
+        peer_desc->devices.push_back(dev);
+    }
+    ASSERT_EQ(peer_meta.addLocalSegment(LOCAL_SEGMENT_ID, peer_name,
+                                        std::move(peer_desc)),
+              0);
+
+    TransferMetadata::RpcMetaDesc rpc{};
+    rpc.ip_or_host_name = host;
+    rpc.rpc_port = port;
+    rpc.sockfd = sockfd;
+    ASSERT_EQ(peer_meta.addRpcMetaEntry(peer_name, rpc), 0);
+    const int daemon_rc = peer_meta.startHandshakeDaemon(
+        [](const TransferMetadata::HandShakeDesc&,
+           TransferMetadata::HandShakeDesc&) { return 0; },
+        port, sockfd);
+    if (daemon_rc != 0 && sockfd >= 0) {
+        close(sockfd);
+    }
+    ASSERT_EQ(daemon_rc, 0);
+
+    // Cache the peer's initially empty SegmentDesc before it mounts chunks.
+    const Transport::SegmentID peer_id = metadata_->getSegmentID(peer_name);
+    ASSERT_GE(peer_id, 0);
+    ASSERT_TRUE(metadata_->getSegmentDescByID(peer_id)->buffers.empty());
+
+    const uint64_t kRemoteBase = 0xC00000;
+    for (size_t chunk = 0; chunk < 2; ++chunk) {
+        BufferDesc buf;
+        buf.name = "cpu:0";
+        buf.addr = kRemoteBase + chunk * kMaxSegSize;
+        buf.length = kMaxSegSize;
+        for (const auto& ctx : contexts_) {
+            buf.tseg.push_back("remote:" + ctx->deviceName() + ":" +
+                               std::to_string(buf.addr));
+        }
+        ASSERT_EQ(
+            peer_meta.addLocalMemoryBuffer(buf, /*update_metadata=*/false), 0);
+    }
+
+    const uint64_t target_offset = kRemoteBase + kMaxSegSize - 200;
+    auto batch_id = transport_->allocateBatchID(1);
+    Transport::TransferRequest req;
+    req.opcode = Transport::TransferRequest::WRITE;
+    req.source = local_base;
+    req.target_id = peer_id;
+    req.target_offset = target_offset;
+    req.length = 512;
+
+    ASSERT_EQ(transport_->submitTransfer(batch_id, {req}), Status::OK());
+    TransferStatus status;
+    ASSERT_EQ(transport_->getTransferStatus(batch_id, 0, status), Status::OK());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, 512u);
+    ASSERT_EQ(transport_->freeBatchID(batch_id), Status::OK());
+
+    const auto slices = allPostedSlices();
+    ASSERT_EQ(slices.size(), 2u);
+    EXPECT_EQ(slices[0].dest_addr, target_offset);
+    EXPECT_EQ(slices[0].length, 200u);
+    EXPECT_EQ(slices[1].dest_addr, kRemoteBase + kMaxSegSize);
+    EXPECT_EQ(slices[1].length, 312u);
+}
+
+TEST_F(UbLargeSegUnitTest,
+       SubmitReturnsAddressNotRegisteredWhenLocalSegUnregistered) {
+    void* local_base = reinterpret_cast<void*>(0x680000);
+    ASSERT_EQ(UbTransportTestPeer::registerLocalMemory(*transport_, local_base,
+                                                       kMaxSegSize, "cpu:0"),
+              0);
+
+    // Simulate concurrent context unregistration while metadata still holds the
+    // stale BufferDesc snapshot.
+    for (const auto& ctx : contexts_) {
+        ASSERT_EQ(
+            ctx->unregisterMemoryRegion(reinterpret_cast<uint64_t>(local_base)),
+            0);
+    }
+
+    auto batch_id = transport_->allocateBatchID(1);
+    Transport::TransferRequest req;
+    req.opcode = Transport::TransferRequest::WRITE;
+    req.source = local_base;
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(local_base);
+    req.length = 512;
+
+    Status s = transport_->submitTransfer(batch_id, {req});
+    EXPECT_TRUE(s.IsAddressNotRegistered());
+    EXPECT_TRUE(allPostedSlices().empty());
+    EXPECT_EQ(transport_->freeBatchID(batch_id), Status::OK());
+}
+
+TEST_F(UbLargeSegUnitTest, SubmitRespectsAdviseRetryCnt) {
+    void* local_base = reinterpret_cast<void*>(0x780000);
+    ASSERT_EQ(UbTransportTestPeer::registerLocalMemory(*transport_, local_base,
+                                                       kMaxSegSize, "cpu:0"),
+              0);
+
+    auto batch_id = transport_->allocateBatchID(1);
+    Transport::TransferRequest req;
+    req.opcode = Transport::TransferRequest::WRITE;
+    req.source = local_base;
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(local_base);
+    req.length = 512;
+    req.advise_retry_cnt = 1;
+
+    ASSERT_EQ(transport_->submitTransfer(batch_id, {req}), Status::OK());
+    TransferStatus status;
+    ASSERT_EQ(transport_->getTransferStatus(batch_id, 0, status), Status::OK());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    ASSERT_EQ(transport_->freeBatchID(batch_id), Status::OK());
+
+    EXPECT_TRUE(contexts_[0]->posted_slices.empty());
+    ASSERT_EQ(contexts_[1]->posted_slices.size(), 1u);
 }
 
 }  // namespace

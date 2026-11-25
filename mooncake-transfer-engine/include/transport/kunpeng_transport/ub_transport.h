@@ -130,7 +130,9 @@ class UbTransport : public Transport {
     // Mooncake#3503: buffers larger than max_seg_size are split into multiple
     // <= max_seg_size URMA segments (one BufferDesc per chunk).
     // unregisterLocalMemory() only receives the base addr, so remember each
-    // base buffer's chunk start-addresses for cleanup.
+    // base buffer's chunk start-addresses for cleanup. A single-segment buffer
+    // whose URMA unregistration partially failed is also tracked here so that
+    // a retry can finish tearing it down.
     std::mutex chunk_map_mutex_;
     std::unordered_map<uint64_t, std::vector<uint64_t>> chunk_map_;
 };
