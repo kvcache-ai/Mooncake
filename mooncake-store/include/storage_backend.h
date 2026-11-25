@@ -1177,8 +1177,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<uint64_t, ErrorCode> PrepareHybridWriteFile(WritePlan&);
     tl::expected<void, ErrorCode> ExecuteWriteRange(WritePlan&, size_t, size_t);
     tl::expected<std::optional<BatchIoScheduler::WriteRequest>, ErrorCode>
-    PrepareHybridWriteRange(WritePlan&, size_t,
-                            const BatchIoScheduler::Scratch&);
+    PrepareHybridWriteRange(WritePlan&, size_t, std::span<char>);
     tl::expected<void, ErrorCode> FinishWritePlan(
         WritePlan&, tl::expected<void, ErrorCode>);
     tl::expected<int64_t, ErrorCode> CommitOffloadedBucket(
