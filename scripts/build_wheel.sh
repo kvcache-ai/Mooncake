@@ -367,6 +367,7 @@ MIGRATED_PYTHON_MODULES=(
     __init__.py
     py.typed
     engine.pyi
+    _store.pyi
     structured_object_store.py
     _structured_ranges.py
     _fast_copy.c

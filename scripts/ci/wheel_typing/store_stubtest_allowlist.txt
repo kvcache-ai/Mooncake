@@ -1,0 +1,14 @@
+# mypy.stubtest allowlist for python/mooncake/_store.pyi.
+#
+# Nanobind extension classes use a native metaclass and a disjoint layout.
+# Stubtest reports these differences against the class objects.
+mooncake\._store\.(BufferHandle|BufferLease|BufferLeaseView|BufferPool|Descriptor|DiskDescriptor|ExistOptions|ListDrainJobsResponse|ListTasksResponse|MemoryDescriptor|MooncakeDistributedNoFRegister|MooncakeDistributedStore|MooncakeHostMemAllocator|PhysicalPlacement|QueryJobResponse|QueryTaskResponse|RangedReadSnapshot|ReplicaDescriptor|ReplicateConfig)
+
+# No py::init is bound, so these cannot be constructed from Python.
+mooncake\._store\.(BufferHandle|BufferLease|BufferLeaseView|DiskDescriptor|ListDrainJobsResponse|ListTasksResponse|MemoryDescriptor|QueryJobResponse|RangedReadSnapshot|ReplicaDescriptor)\.__init__
+
+# Nanobind attaches a private capsule to the Python enum classes.
+mooncake\._store\.(JobStatus|JobType|ObjectDataType|ReplicaStatus|SoftPinAction|TaskStatus|TaskType)\.__nb_enum__
+
+# stubtest does not recognize nanobind.nb_func objects as builtin functions.
+mooncake\._store\.(bind_to_numa_node|get_alloc_func_addr|get_free_func_addr|_deserialize_tensor|_serialize_tensor|_tensor_metadata_size)
