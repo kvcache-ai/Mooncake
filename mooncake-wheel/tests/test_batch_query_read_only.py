@@ -106,9 +106,7 @@ class TestBatchQueryReadOnly(unittest.TestCase):
             for key in keys:
                 self.assertIn(key, read_only)
                 self.assertIn(key, leased)
-                self.assertEqual(
-                    tier_tags(read_only[key]), tier_tags(leased[key])
-                )
+                self.assertEqual(tier_tags(read_only[key]), tier_tags(leased[key]))
         finally:
             for key in keys:
                 self.store.remove(key)
@@ -135,14 +133,10 @@ class TestBatchQueryReadOnly(unittest.TestCase):
     def test_missing_keys_omitted(self):
         """Keys that fail the query must be absent from the result dict,
         matching batch_get_replica_desc semantics."""
-        read_only = self.store.batch_query_read_only(
-            ["test_ro_query_never_written"]
-        )
+        read_only = self.store.batch_query_read_only(["test_ro_query_never_written"])
         self.assertNotIn("test_ro_query_never_written", read_only)
 
-        leased = self.store.batch_get_replica_desc(
-            ["test_ro_query_never_written"]
-        )
+        leased = self.store.batch_get_replica_desc(["test_ro_query_never_written"])
         self.assertNotIn("test_ro_query_never_written", leased)
 
     def test_empty_batch(self):

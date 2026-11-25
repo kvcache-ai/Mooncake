@@ -412,8 +412,8 @@ class PyClient {
     // trigger promotion-on-hit. Intended for metadata classification
     // (e.g. tier-aware admission control in KV connectors) that must not
     // perturb hot-path state.
-    virtual std::vector<tl::expected<QueryResult, ErrorCode>> batch_query_read_only(
-        const std::vector<std::string> &keys) = 0;
+    virtual std::vector<tl::expected<QueryResult, ErrorCode>>
+    batch_query_read_only(const std::vector<std::string> &keys) = 0;
 
     RangedReadSnapshot prepare_get_into_ranges_snapshot(
         const std::vector<std::string> &keys) {

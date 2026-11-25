@@ -9519,7 +9519,8 @@ std::vector<CachedQueryResultResponse>
 RealClient::batch_get_query_results_read_only(
     const std::vector<std::string> &keys) {
     if (!client_) {
-        LOG(ERROR) << "batch_get_query_results_read_only: client not initialized";
+        LOG(ERROR)
+            << "batch_get_query_results_read_only: client not initialized";
         return std::vector<CachedQueryResultResponse>(
             keys.size(), CachedQueryResultResponse(ErrorCode::INVALID_PARAMS));
     }
