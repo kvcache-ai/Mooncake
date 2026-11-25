@@ -10304,8 +10304,7 @@ void MasterService::ClientDeathProbeRound() {
                     client_death_probes_.erase(it);
                     force_offline = true;
                 } else {
-                    probe.next_probe_at =
-                        now + client_death_probe_interval_ms_;
+                    probe.next_probe_at = now + client_death_probe_interval_ms_;
                 }
             }
         }

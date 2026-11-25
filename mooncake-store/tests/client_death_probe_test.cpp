@@ -217,10 +217,10 @@ void MarkSuspectedForTest(MasterService& service, const UUID& client_id) {
     const auto record = ClientSessionRegistryTestPeer::Find(
         MasterServiceTestPeer::ClientSessions(service), client_id);
     ASSERT_NE(record, nullptr);
-    ASSERT_EQ(record->Evaluate(ClientLivenessRecord::Clock::now(),
-                               std::chrono::seconds::zero(),
-                               std::chrono::hours(1)),
-              ClientLivenessTransition::BECAME_SUSPECTED);
+    ASSERT_EQ(
+        record->Evaluate(ClientLivenessRecord::Clock::now(),
+                         std::chrono::seconds::zero(), std::chrono::hours(1)),
+        ClientLivenessTransition::BECAME_SUSPECTED);
 }
 
 // The refused branch erases the probe bookkeeping before publishing OFFLINE.
@@ -298,8 +298,8 @@ TEST_F(MasterServiceTest, DeathProbeRetainsBookkeepingForReachableClient) {
 
     EXPECT_TRUE(peer.ClientDeathProbeTrackedForTesting(client_id));
     EXPECT_EQ(peer.ClientDeathProbeFailuresForTesting(client_id), 0u);
-    const auto next_probe_at = peer.ClientDeathProbeNextProbeAtForTesting(
-        client_id);
+    const auto next_probe_at =
+        peer.ClientDeathProbeNextProbeAtForTesting(client_id);
     ASSERT_TRUE(next_probe_at.has_value());
     EXPECT_GT(*next_probe_at, ClientLivenessRecord::Clock::now());
 
