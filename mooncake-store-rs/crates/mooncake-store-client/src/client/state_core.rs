@@ -1061,6 +1061,25 @@ impl LocalAllocatorState {
             })
     }
 
+    fn can_fit_after_eviction(
+        &self,
+        segment_name: Option<&SegmentName>,
+        length_bytes: u64,
+    ) -> bool {
+        match segment_name {
+            Some(segment_name) => self
+                .segments
+                .get(segment_name)
+                .filter(|segment| segment.announcement.state == SegmentLifecycleState::Active)
+                .is_some_and(|segment| segment.can_fit_after_eviction(length_bytes)),
+            None => self
+                .segments
+                .values()
+                .filter(|segment| segment.announcement.state == SegmentLifecycleState::Active)
+                .any(|segment| segment.can_fit_after_eviction(length_bytes)),
+        }
+    }
+
     fn allocations(&self) -> Vec<AllocationSpan> {
         self.segments
             .values()
@@ -1995,6 +2014,13 @@ impl SegmentAllocator {
             .saturating_sub(self.announcement.used_bytes)
     }
 
+    fn can_fit_after_eviction(&self, length_bytes: u64) -> bool {
+        // Zero-length requests are invalid even when capacity is available.
+        length_bytes > 0
+            && align_up_u64(length_bytes, self.announcement.alignment_bytes.max(1))
+                <= self.announcement.capacity_bytes
+    }
+
     fn allocations(&self) -> Vec<AllocationSpan> {
         self.allocations
             .iter()
@@ -2016,7 +2042,7 @@ impl SegmentAllocator {
     fn take_allocation_id(&mut self) -> Result<u64> {
         let allocation_id = self.next_allocation_id.max(1);
         self.next_allocation_id = allocation_id.checked_add(1).ok_or_else(|| {
-            StoreError::Allocator("segment allocation generation exhausted".to_string())
+            StoreError::InvalidState("segment allocation generation exhausted".to_string())
         })?;
         Ok(allocation_id)
     }
@@ -2048,7 +2074,7 @@ impl SegmentAllocator {
                 .used_bytes
                 .checked_add(reserved_len)
                 .ok_or_else(|| {
-                StoreError::Allocator("segment reservation overflow".to_string())
+                StoreError::InvalidState("segment reservation overflow".to_string())
             })?;
             self.allocations.insert(offset_bytes, SegmentAllocation { length_bytes, allocation_id });
             return Ok(mooncake_store_core::SegmentReservation {
@@ -2063,7 +2089,7 @@ impl SegmentAllocator {
         let offset = align_up_u64(self.cursor_bytes, alignment);
         let next_cursor = offset
             .checked_add(reserved_len)
-            .ok_or_else(|| StoreError::Allocator("segment reservation overflow".to_string()))?;
+            .ok_or_else(|| StoreError::InvalidState("segment reservation overflow".to_string()))?;
         if next_cursor > self.announcement.capacity_bytes {
             return Err(StoreError::Allocator(format!(
                 "segment capacity exhausted for {}:{} requested={} remaining={}",
@@ -2078,7 +2104,7 @@ impl SegmentAllocator {
             .announcement
             .used_bytes
             .checked_add(reserved_len)
-            .ok_or_else(|| StoreError::Allocator("segment reservation overflow".to_string()))?;
+            .ok_or_else(|| StoreError::InvalidState("segment reservation overflow".to_string()))?;
         self.allocations.insert(
             offset,
             SegmentAllocation {

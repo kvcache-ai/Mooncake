@@ -276,8 +276,11 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     }
     setBoolConfig(config, "MC_MNNVL_EGM", "transports/mnnvl/egm");
     // Fail closed on malformed new controls instead of silently disabling them.
-    for (const auto& entry : {std::pair{"MC_MNNVL_REQUIRE_FABRIC",
-                                        "transports/mnnvl/require_fabric"}}) {
+    for (const auto& entry :
+         {std::pair{"MC_MNNVL_REQUIRE_FABRIC",
+                    "transports/mnnvl/require_fabric"},
+          std::pair{"MC_MNNVL_COMPLETION_EVENT_POOL",
+                    "transports/mnnvl/completion_event_pool"}}) {
         const char* value = std::getenv(entry.first);
         if (!value) continue;
         std::string normalized(value);
@@ -419,6 +422,22 @@ Status parseMnnvlConfig(const Config& config, MnnvlConfig& options) {
     };
     CHECK_STATUS(
         read_bool("transports/mnnvl/require_fabric", parsed.require_fabric));
+    CHECK_STATUS(read_bool("transports/mnnvl/completion_event_pool",
+                           parsed.completion_event_pool));
+    std::string text;
+    if (config.dumpSubtree("transports/mnnvl/completion_event_pool_capacity",
+                           &text)) {
+        auto value = json::parse(text);
+        if (!value.is_number_integer() ||
+            (!value.is_number_unsigned() && value.get<int64_t>() < 0) ||
+            value.get<uint64_t>() > 1048576)
+            return Status::InvalidArgument(
+                "MNNVL event pool capacity must be an integer in [0, 1048576]");
+        parsed.completion_event_pool_capacity = value.get<size_t>();
+    } else if (configured("transports/mnnvl/completion_event_pool_capacity")) {
+        return Status::InvalidArgument(
+            "MNNVL event pool capacity must be an integer");
+    }
     const auto mode = config.get("transports/mnnvl/sync_mode", "cpu_block");
     if ((configured("transports/mnnvl/sync_mode") &&
          config.get<json>("transports/mnnvl/sync_mode", json()).type() !=

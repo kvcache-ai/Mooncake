@@ -514,7 +514,7 @@ Status UbTransport::submitTransferTask(
     const int kMaxRetryCount = globalConfig().retry_cnt;
     const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark =
-        globalConfig().max_wr * globalConfig().num_qp_per_ep;
+        globalConfig().max_wr * globalConfig().num_jetty_per_ep;
     uint64_t nr_slices = 0;
 
     auto fail_unposted_slices = [&]() {

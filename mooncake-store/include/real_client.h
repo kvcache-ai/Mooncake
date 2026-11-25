@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <boost/lockfree/queue.hpp>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -710,7 +709,10 @@ class RealClient : public PyClient {
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
         int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
-        bool enable_embedded_master = false);
+        bool enable_embedded_master = false, bool enable_ssd_prefetch = false,
+        int64_t ssd_prefetch_cooldown_sec = DEFAULT_SSD_PREFETCH_COOLDOWN_SEC,
+        int64_t ssd_prefetch_dedup_ttl_sec =
+            DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -887,6 +889,13 @@ class RealClient : public PyClient {
     ErrorCode CleanupNofRegisteredBuffers();
 
     tl::expected<bool, ErrorCode> isExist_internal(const std::string &key);
+
+    // Additive RPCs keep the legacy exist wire signatures unchanged.
+    tl::expected<bool, ErrorCode> isExistWithOptions_internal(
+        const std::string &key, const ExistOptions &options);
+
+    std::vector<tl::expected<bool, ErrorCode>> batchIsExistWithOptions_internal(
+        const std::vector<std::string> &keys, const ExistOptions &options);
 
     std::vector<tl::expected<bool, ErrorCode>> batchIsExist_internal(
         const std::vector<std::string> &keys);
@@ -1251,6 +1260,7 @@ class RealClient : public PyClient {
     mutable std::shared_mutex registered_buffer_mutex_;
     struct BufferRegistrationRecord {
         size_t size;
+        bool te_released = false;
     };
     // A present record means "registered OR cleanup-pending": a record is
     // retained when NoF/TE cleanup failed, in which case the buffer must
@@ -1342,16 +1352,42 @@ class RealClient : public PyClient {
     std::atomic<bool> dummy_client_monitor_running_{false};
     static constexpr uint64_t kDummyClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
-    // boost lockfree queue requires trivial assignment operator
-    struct PodUUID {
-        uint64_t first;
-        uint64_t second;
+   private:
+    friend class RealClientHeartbeatTestPeer;
+    struct DummyClientHeartbeat {
+        std::chrono::steady_clock::time_point last_seen;
+        bool needs_remount = false;
     };
-    static constexpr size_t kDummyClientPingQueueSize =
-        128 * 1024;  // Size of the client ping queue
-    boost::lockfree::queue<PodUUID> dummy_client_ping_queue_{
-        kDummyClientPingQueueSize};
+    // Never hold this mutex while waiting for dummy_client_mutex_ or doing
+    // memory registration/teardown. Ping must make progress during those calls.
+    std::mutex dummy_heartbeat_mutex_;
+    std::unordered_map<UUID, DummyClientHeartbeat, boost::hash<UUID>>
+        dummy_heartbeats_;
+    std::weak_ptr<Client> dummy_ping_client_;
+    std::unordered_map<UUID, size_t, boost::hash<UUID>>
+        pending_dummy_registrations_;
     const int64_t dummy_client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    class DummyRegistrationGuard {
+       public:
+        DummyRegistrationGuard(RealClient &owner, const UUID &client_id);
+        ~DummyRegistrationGuard();
+        DummyRegistrationGuard(const DummyRegistrationGuard &) = delete;
+        DummyRegistrationGuard &operator=(const DummyRegistrationGuard &) =
+            delete;
+
+        void mark_registered(bool is_local_buffer);
+
+       private:
+        RealClient &owner_;
+        UUID client_id_;
+    };
+    // Call with dummy_client_mutex_ held exclusively.
+    tl::expected<void, ErrorCode> unmap_shm_locked(const UUID &client_id);
+    tl::expected<void, ErrorCode> ascend_unmap_shm_locked(
+        const UUID &client_id);
+    bool try_expire_dummy_client(const UUID &client_id);
+
+   public:
     int64_t view_version_ = 0;
 
     // IPC Server members for receiving FD from Dummy Clients
@@ -1479,7 +1515,8 @@ class RealClient : public PyClient {
         bool enable_ssd_offload, bool start_offload_rpc_server,
         const std::string &ssd_offload_path, const std::string &tenant_id,
         bool enable_client_http_server, int client_http_port,
-        bool enable_embedded_master);
+        bool enable_embedded_master, bool enable_ssd_prefetch,
+        int64_t ssd_prefetch_cooldown_sec, int64_t ssd_prefetch_dedup_ttl_sec);
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;
