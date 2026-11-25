@@ -1,5 +1,7 @@
 #include "master_metric_manager.h"
 
+#include <algorithm>
+#include <array>
 #include <glog/logging.h>
 #include <cstdint>
 #include <iomanip>  // For std::fixed, std::setprecision
@@ -7,10 +9,12 @@
 #include <sstream>  // For string building during serialization
 #include <vector>   // Required by histogram serialization
 #include <cmath>
+#include <stdexcept>
 
 #include "common/byte_size.h"
 #include "segment.h"
 #include "version.h"
+#include "weight_metadata_store.h"
 
 namespace mooncake {
 
@@ -74,6 +78,15 @@ MasterMetricManager::MasterMetricManager()
       cxl_total_capacity_per_segment_(
           "segment_total_cxl_capacity_bytes",
           "Total cxl capacity of the mounted segment", {"segment"}),
+      dfs_allocated_size_("master_dfs_allocated_bytes",
+                          "Total bytes currently allocated by the DFS "
+                          "allocator (shard/bucket mode)"),
+      dfs_total_capacity_("master_dfs_total_capacity_bytes",
+                          "Total capacity of the DFS allocator "
+                          "(shard/bucket mode)"),
+      dfs_file_count_("master_dfs_file_count",
+                      "Number of DFS backing files (shard files in shard "
+                      "mode, bucket files in bucket mode)"),
       key_count_("master_key_count",
                  "Total number of keys managed by the master"),
       soft_pin_key_count_(
@@ -83,6 +96,15 @@ MasterMetricManager::MasterMetricManager()
       value_size_distribution_(
           "master_value_size_bytes", "Distribution of object value sizes",
           {4096, 65536, 262144, 1048576, 4194304, 16777216, 67108864}),
+      key_count_by_group_(
+          "master_key_count_by_group",
+          "Total number of keys managed by the master, by configured key group",
+          {"group"}),
+      value_bytes_by_group_(
+          "master_value_bytes_by_group",
+          "Total logical value bytes of the keys managed by the master, by "
+          "configured key group; counted once per key regardless of replicas",
+          {"group"}),
       // Initialize cluster metrics
       active_clients_("master_active_clients",
                       "Total number of active clients"),
@@ -474,6 +496,9 @@ MasterMetricManager::MasterMetricManager()
       tenant_evict_bytes_total_(
           "mooncake_tenant_evict_bytes_total",
           "Total bytes evicted by tenant-scoped quota eviction", {"tenant_id"}),
+      standby_restore_rejected_objects_total_(
+          "mooncake_ha_standby_restore_rejected_objects_total",
+          "Standby-restore objects skipped by validation reason", {"reason"}),
       offload_enqueued_total_(
           "master_offload_enqueued_total",
           "SSD offload tasks successfully enqueued (per store worker)",
@@ -491,17 +516,6 @@ MasterMetricManager::MasterMetricManager()
       offload_enqueue_rejected_total_(
           "master_offload_enqueue_rejected_total",
           "SSD offload tasks rejected at enqueue (queue full)", {"client_id"}),
-
-      // Snapshot Metrics
-      snapshot_duration_ms_(
-          "master_snapshot_duration_ms",
-          "Distribution of snapshot operation durations in milliseconds",
-          {0, 500, 1000, 5000, 10000, 30000, 60000, 120000, 180000, 240000,
-           300000}),
-      snapshot_success_("master_snapshot_success",
-                        "Total number of successful snapshot operations"),
-      snapshot_fail_("master_snapshot_fail",
-                     "Total number of failed snapshot operations"),
 
       // Initialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd,
       // MoveRevoke Counters
@@ -562,6 +576,23 @@ MasterMetricManager::MasterMetricManager()
       mark_task_to_complete_failures_(
           "master_update_task_failures_total",
           "Total number of failed MarkTaskToComplete requests"),
+      weight_revisions_by_availability_(
+          "master_weight_revisions",
+          "Current managed weight revisions by availability", {"availability"}),
+      weight_revisions_by_residency_(
+          "master_weight_revision_residency",
+          "Current managed weight revisions by residency", {"residency"}),
+      weight_active_leases_("master_weight_active_leases",
+                            "Current unexpired managed weight revision leases"),
+      weight_pending_operations_(
+          "master_weight_pending_operations",
+          "Current unfinished managed weight residency operations"),
+      weight_oldest_operation_age_ms_(
+          "master_weight_oldest_operation_age_ms",
+          "Age in milliseconds of the oldest unfinished weight operation"),
+      weight_reconciliation_failures_(
+          "master_weight_reconciliation_failures_total",
+          "Total managed weight reconciliation failures"),
       build_info_("mooncake_build_info",
                   "Build version of the running master; the value is always 1 "
                   "and the version strings are carried by the labels",
@@ -586,6 +617,9 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     dram_total_capacity_.update(0);
     cxl_allocated_size_.update(0);
     cxl_total_capacity_.update(0);
+    dfs_allocated_size_.update(0);
+    dfs_total_capacity_.update(0);
+    dfs_file_count_.update(0);
     key_count_.update(0);
     soft_pin_key_count_.update(0);
     active_clients_.update(0);
@@ -597,6 +631,10 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     file_cache_nums_.update(0);
     put_start_discarded_staging_size_.update(0);
     promotion_in_flight_metric_.update(0);
+    weight_active_leases_.update(0);
+    weight_pending_operations_.update(0);
+    weight_oldest_operation_age_ms_.update(0);
+    weight_reconciliation_failures_.inc(0);
 
     // Update Counters (use inc(0) to mark as changed)
     promotion_admitted_.inc(0);
@@ -1055,6 +1093,11 @@ void MasterMetricManager::project_storage_usage(
     project_tier(snapshot.cxl, cxl_allocated_size_, cxl_total_capacity_,
                  cxl_allocated_size_per_segment_,
                  cxl_total_capacity_per_segment_, projected_cxl_segments_);
+
+    dfs_allocated_size_.update(static_cast<int64_t>(snapshot.dfs.used_bytes));
+    dfs_total_capacity_.update(
+        static_cast<int64_t>(snapshot.dfs.capacity_bytes));
+    dfs_file_count_.update(static_cast<int64_t>(snapshot.dfs.file_count));
 }
 
 int64_t MasterMetricManager::get_segment_allocated_nof_size(
@@ -1119,6 +1162,18 @@ double MasterMetricManager::get_global_file_used_ratio(void) {
     return allocated / capacity;
 }
 
+int64_t MasterMetricManager::get_dfs_allocated_bytes() {
+    return dfs_allocated_size_.value();
+}
+
+int64_t MasterMetricManager::get_dfs_total_capacity() {
+    return dfs_total_capacity_.value();
+}
+
+int64_t MasterMetricManager::get_dfs_file_count() {
+    return dfs_file_count_.value();
+}
+
 // Key/Value Metrics
 void MasterMetricManager::inc_key_count(int64_t val) { key_count_.inc(val); }
 void MasterMetricManager::dec_key_count(int64_t val) { key_count_.dec(val); }
@@ -1135,6 +1190,103 @@ void MasterMetricManager::observe_value_size(int64_t size) {
 }
 
 int64_t MasterMetricManager::get_key_count() { return key_count_.value(); }
+
+void MasterMetricManager::configure_key_groups(const std::string& spec) {
+    std::vector<KeyGroupRule> rules;
+    std::vector<std::string> names;
+    std::stringstream ss(spec);
+    std::string rule;
+    while (std::getline(ss, rule, ',')) {
+        const size_t first = rule.find(':');
+        const size_t second = rule.find(':', first + 1);
+        const std::string group = rule.substr(0, first);
+        const std::string match =
+            second == std::string::npos
+                ? ""
+                : rule.substr(first + 1, second - first - 1);
+        KeyGroupRule parsed;
+        if (match == "prefix") {
+            parsed.match = KeyGroupRule::Match::kPrefix;
+        } else if (match == "suffix") {
+            parsed.match = KeyGroupRule::Match::kSuffix;
+        } else if (match == "contains") {
+            parsed.match = KeyGroupRule::Match::kContains;
+        } else {
+            throw std::invalid_argument("invalid metrics_key_groups rule: " +
+                                        rule);
+        }
+        parsed.pattern = rule.substr(second + 1);
+        if (group.empty() || group == "other" || parsed.pattern.empty()) {
+            throw std::invalid_argument("invalid metrics_key_groups rule: " +
+                                        rule);
+        }
+        auto it = std::find(names.begin(), names.end(), group);
+        if (it == names.end()) {
+            if (names.size() == kMaxKeyGroups) {
+                throw std::invalid_argument("too many metrics_key_groups");
+            }
+            it = names.insert(names.end(), group);
+        }
+        parsed.group = static_cast<uint8_t>(it - names.begin());
+        rules.push_back(std::move(parsed));
+    }
+    if (!rules.empty()) {
+        names.push_back("other");
+    }
+
+    for (const auto& name : key_group_names_) {
+        key_count_by_group_.remove_label_value({{"group", name}});
+        value_bytes_by_group_.remove_label_value({{"group", name}});
+    }
+    key_group_rules_ = std::move(rules);
+    key_group_names_ = std::move(names);
+    for (const auto& name : key_group_names_) {
+        key_count_by_group_.update({name}, 0);
+        value_bytes_by_group_.update({name}, 0);
+    }
+}
+
+uint8_t MasterMetricManager::classify_key_group(std::string_view key) const {
+    if (key_group_names_.empty()) {
+        return 0xFF;
+    }
+    for (const auto& rule : key_group_rules_) {
+        bool matched = false;
+        switch (rule.match) {
+            case KeyGroupRule::Match::kPrefix:
+                matched = key.substr(0, rule.pattern.size()) == rule.pattern;
+                break;
+            case KeyGroupRule::Match::kSuffix:
+                matched = key.size() >= rule.pattern.size() &&
+                          key.substr(key.size() - rule.pattern.size()) ==
+                              rule.pattern;
+                break;
+            case KeyGroupRule::Match::kContains:
+                matched = key.find(rule.pattern) != std::string_view::npos;
+                break;
+        }
+        if (matched) {
+            return rule.group;
+        }
+    }
+    return static_cast<uint8_t>(key_group_names_.size() - 1);
+}
+
+void MasterMetricManager::inc_key_group(uint8_t group, int64_t value_bytes) {
+    if (group >= key_group_names_.size()) {
+        return;
+    }
+    key_count_by_group_.inc({key_group_names_[group]}, 1);
+    value_bytes_by_group_.inc({key_group_names_[group]}, value_bytes);
+}
+
+void MasterMetricManager::dec_key_group(uint8_t group, int64_t value_bytes) {
+    if (group >= key_group_names_.size()) {
+        return;
+    }
+    key_count_by_group_.dec({key_group_names_[group]}, 1);
+    value_bytes_by_group_.dec({key_group_names_[group]}, value_bytes);
+}
 
 int64_t MasterMetricManager::get_soft_pin_key_count() {
     return soft_pin_key_count_.value();
@@ -1187,21 +1339,6 @@ void MasterMetricManager::on_client_liveness_record_removed(
         case ClientLivenessState::OFFLINE:
             client_liveness_offline_clients_.dec(1);
             break;
-    }
-}
-
-void MasterMetricManager::reset_client_liveness_metrics(
-    int64_t active_records) {
-    client_liveness_active_clients_.dec(
-        client_liveness_active_clients_.value());
-    client_liveness_suspected_clients_.dec(
-        client_liveness_suspected_clients_.value());
-    client_liveness_offline_clients_.dec(
-        client_liveness_offline_clients_.value());
-    pending_client_offboarding_jobs_metric_.dec(
-        pending_client_offboarding_jobs_metric_.value());
-    if (active_records > 0) {
-        client_liveness_active_clients_.inc(active_records);
     }
 }
 
@@ -1580,6 +1717,11 @@ void MasterMetricManager::inc_tenant_quota_reject(const std::string& tenant_id,
     tenant_quota_reject_total_.inc({tenant_id, reason}, val);
 }
 
+void MasterMetricManager::inc_standby_restore_rejected_objects(
+    const std::string& reason, int64_t val) {
+    standby_restore_rejected_objects_total_.inc({reason}, val);
+}
+
 void MasterMetricManager::inc_tenant_evict_bytes(const std::string& tenant_id,
                                                  int64_t bytes) {
     tenant_evict_bytes_total_.inc({tenant_id}, bytes);
@@ -1609,14 +1751,6 @@ void MasterMetricManager::inc_offload_enqueue_rejected(
     const std::string& client_id, int64_t val) {
     offload_enqueue_rejected_total_.inc({client_id}, val);
 }
-
-void MasterMetricManager::set_snapshot_duration_ms(int64_t size) {
-    snapshot_duration_ms_.observe(size);
-}
-
-void MasterMetricManager::inc_snapshot_success() { snapshot_success_.inc(); }
-
-void MasterMetricManager::inc_snapshot_fail() { snapshot_fail_.inc(); }
 
 int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
@@ -2179,6 +2313,95 @@ int64_t MasterMetricManager::get_update_task_failures() {
     return mark_task_to_complete_failures_.value();
 }
 
+void MasterMetricManager::project_weight_metadata(
+    const WeightMetadataSnapshot& snapshot, uint64_t now_ms) {
+    static constexpr std::array availability_labels{
+        std::pair{WeightAvailabilityState::IMPORTING, "importing"},
+        std::pair{WeightAvailabilityState::READY, "ready"},
+        std::pair{WeightAvailabilityState::DEGRADED, "degraded"},
+        std::pair{WeightAvailabilityState::DELETING, "deleting"},
+        std::pair{WeightAvailabilityState::DELETED, "deleted"},
+    };
+    static constexpr std::array residency_labels{
+        std::pair{WeightResidencyState::UNKNOWN, "unknown"},
+        std::pair{WeightResidencyState::HOT, "hot"},
+        std::pair{WeightResidencyState::COLD, "cold"},
+        std::pair{WeightResidencyState::MIXED, "mixed"},
+        std::pair{WeightResidencyState::ABSENT, "absent"},
+    };
+
+    for (const auto& [state, label] : availability_labels) {
+        const auto count =
+            std::count_if(snapshot.metadata.begin(), snapshot.metadata.end(),
+                          [state](const auto& metadata) {
+                              return metadata.availability == state;
+                          });
+        weight_revisions_by_availability_.update({label},
+                                                 static_cast<int64_t>(count));
+    }
+    for (const auto& [state, label] : residency_labels) {
+        const auto count =
+            std::count_if(snapshot.metadata.begin(), snapshot.metadata.end(),
+                          [state](const auto& metadata) {
+                              return metadata.residency == state;
+                          });
+        weight_revisions_by_residency_.update({label},
+                                              static_cast<int64_t>(count));
+    }
+
+    const auto active_leases = std::count_if(
+        snapshot.leases.begin(), snapshot.leases.end(),
+        [now_ms](const auto& lease) { return lease.expires_at_ms > now_ms; });
+    weight_active_leases_.update(static_cast<int64_t>(active_leases));
+
+    int64_t pending_operations = 0;
+    uint64_t oldest_age_ms = 0;
+    for (const auto& operation : snapshot.operations) {
+        if (operation.message == "completed") {
+            continue;
+        }
+        ++pending_operations;
+        if (now_ms >= operation.started_at_ms) {
+            oldest_age_ms =
+                std::max(oldest_age_ms, now_ms - operation.started_at_ms);
+        }
+    }
+    weight_pending_operations_.update(pending_operations);
+    weight_oldest_operation_age_ms_.update(static_cast<int64_t>(
+        std::min(oldest_age_ms,
+                 static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))));
+}
+
+void MasterMetricManager::inc_weight_reconciliation_failures(int64_t val) {
+    weight_reconciliation_failures_.inc(val);
+}
+
+int64_t MasterMetricManager::get_weight_revision_count(
+    const std::string& availability) {
+    return weight_revisions_by_availability_.value({availability});
+}
+
+int64_t MasterMetricManager::get_weight_residency_count(
+    const std::string& residency) {
+    return weight_revisions_by_residency_.value({residency});
+}
+
+int64_t MasterMetricManager::get_weight_active_leases() {
+    return weight_active_leases_.value();
+}
+
+int64_t MasterMetricManager::get_weight_pending_operations() {
+    return weight_pending_operations_.value();
+}
+
+int64_t MasterMetricManager::get_weight_oldest_operation_age_ms() {
+    return weight_oldest_operation_age_ms_.value();
+}
+
+int64_t MasterMetricManager::get_weight_reconciliation_failures() {
+    return weight_reconciliation_failures_.value();
+}
+
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
     // Note: Following Prometheus style, metrics with value 0 that haven't
@@ -2217,7 +2440,12 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(cxl_total_capacity_);
     serialize_metric(cxl_allocated_size_per_segment_);
     serialize_metric(cxl_total_capacity_per_segment_);
+    serialize_metric(dfs_allocated_size_);
+    serialize_metric(dfs_total_capacity_);
+    serialize_metric(dfs_file_count_);
     serialize_metric(key_count_);
+    serialize_metric(key_count_by_group_);
+    serialize_metric(value_bytes_by_group_);
     serialize_metric(soft_pin_key_count_);
     serialize_metric(active_clients_);
     serialize_metric(client_liveness_active_clients_);
@@ -2392,18 +2620,20 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_candidate_expired_unevaluated_);
     serialize_metric(promotion_candidate_dropped_limit_);
     serialize_metric(tenant_quota_reject_total_);
+    serialize_metric(standby_restore_rejected_objects_total_);
     serialize_metric(tenant_evict_bytes_total_);
     serialize_metric(offload_enqueued_total_);
     serialize_metric(offload_completed_total_);
     serialize_metric(offload_failed_total_);
     serialize_metric(offload_cancelled_total_);
     serialize_metric(offload_enqueue_rejected_total_);
+    serialize_metric(weight_revisions_by_availability_);
+    serialize_metric(weight_revisions_by_residency_);
+    serialize_metric(weight_active_leases_);
+    serialize_metric(weight_pending_operations_);
+    serialize_metric(weight_oldest_operation_age_ms_);
+    serialize_metric(weight_reconciliation_failures_);
     serialize_metric(build_info_);
-
-    // Serialize Snapshot Metrics
-    serialize_metric(snapshot_duration_ms_);
-    serialize_metric(snapshot_success_);
-    serialize_metric(snapshot_fail_);
 
     return ss.str();
 }
@@ -2505,6 +2735,9 @@ std::string MasterMetricManager::get_summary_string(
     int64_t nof_capacity = nof_total_capacity_.value();
     int64_t file_allocated = file_allocated_size_.value();
     [[maybe_unused]] int64_t file_capacity = file_total_capacity_.value();
+    int64_t dfs_allocated = dfs_allocated_size_.value();
+    int64_t dfs_capacity = dfs_total_capacity_.value();
+    int64_t dfs_files = dfs_file_count_.value();
     int64_t keys = key_count_.value();
     int64_t soft_pin_keys = soft_pin_key_count_.value();
     int64_t active_clients = active_clients_.value();
@@ -2816,6 +3049,16 @@ std::string MasterMetricManager::get_summary_string(
     }
     ss << " | SSD Storage: " << byte_size_to_string(file_allocated) << " / "
        << byte_size_to_string(file_display_capacity);
+    if (dfs_capacity > 0 || dfs_allocated > 0 || dfs_files > 0) {
+        ss << " | DFS: " << byte_size_to_string(dfs_allocated) << " / "
+           << byte_size_to_string(dfs_capacity);
+        if (dfs_capacity > 0) {
+            ss << " (" << std::fixed << std::setprecision(1)
+               << ((double)dfs_allocated / (double)dfs_capacity * 100.0)
+               << "%)";
+        }
+        ss << " files=" << dfs_files;
+    }
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
     ss << " | Clients: " << active_clients;
 
@@ -3064,11 +3307,6 @@ std::string MasterMetricManager::get_summary_string(
        << "rejected(freq/wm/cap)=" << promotion_rejected_frequency_.value()
        << "/" << promotion_rejected_watermark_.value() << "/"
        << promotion_rejected_cap_.value();
-
-    // Snapshot summary
-    ss << " | Snapshots: "
-       << "Success=" << snapshot_success_.value() << ", "
-       << "Fail=" << snapshot_fail_.value();
 
     return ss.str();
 }

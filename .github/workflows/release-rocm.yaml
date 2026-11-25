@@ -33,7 +33,7 @@ jobs:
     strategy:
       max-parallel: 2
       matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
 
     env:
       HIP_BUILD: "1"
@@ -65,7 +65,7 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: .release-ci
           persist-credentials: false
-          sparse-checkout: scripts/tone_tests/python/verify_rocm_wheel.py
+          sparse-checkout: scripts/e2e/python/verify_rocm_wheel.py
           sparse-checkout-cone-mode: false
 
       - name: Mark repository as safe
@@ -145,7 +145,7 @@ jobs:
           export PATH="/opt/rocm/bin:$PATH"   # hipify-perl for USE_HIP
           rm -rf build && mkdir build && cd build
           cmake -G Ninja .. \
-            -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF \
+            -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DWITH_CONDUCTOR=ON \
             -DENABLE_MULTI_PROTOCOL=ON \
             -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON \
             -DBUILD_UNIT_TESTS=OFF -DENABLE_DEBUG_SYMBOLS=OFF \
@@ -202,7 +202,7 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
-          # Install the actual per-matrix release artifact (cp310-cp313) into a
+          # Install the actual per-matrix release artifact (cp310-cp314) into a
           # fresh venv and exercise the packaged binary, so packaging/ELF-layout
           # failures in any version are caught before this wheel reaches PyPI.
           # Import both native bindings as well as exercising the packaged
@@ -213,7 +213,7 @@ jobs:
             mooncake-wheel/dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
           export LD_LIBRARY_PATH="/opt/rocm/lib:/usr/local/lib:${LD_LIBRARY_PATH:-}"
           "$smoke_venv/bin/python" \
-            .release-ci/scripts/tone_tests/python/verify_rocm_wheel.py
+            .release-ci/scripts/e2e/python/verify_rocm_wheel.py
           site="$("$smoke_venv/bin/python" -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))')"
           "$site/mooncake_master" --version
 

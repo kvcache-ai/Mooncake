@@ -78,6 +78,44 @@ TEST(RWSpinlockTest, DowngradePublishesToReadersAndBlocksWriters) {
 }
 
 //------------------------------------------------------------------------------
+// writeFullySocket
+//------------------------------------------------------------------------------
+
+TEST(WriteFullySocketTest, DeliversBytesIntactOnHealthySocket) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    const char payload[] = "handshake-reply-bytes";
+
+    ssize_t rc = writeFullySocket(fds[0], payload, sizeof(payload));
+    ASSERT_EQ(rc, (ssize_t)sizeof(payload));
+
+    char buf[sizeof(payload)] = {0};
+    ASSERT_EQ(read(fds[1], buf, sizeof(buf)), (ssize_t)sizeof(buf));
+    EXPECT_STREQ(buf, payload);
+    close(fds[0]);
+    close(fds[1]);
+}
+
+TEST(WriteFullySocketTest, PeerResetYieldsEpipeInsteadOfSigpipe) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    const char payload[] = "handshake-reply-bytes";
+    // Peer goes away before the answer is written. The first write may still
+    // succeed (the close has not been noticed yet), but a later write must
+    // report EPIPE. Without SIGPIPE suppression the process dies right here,
+    // which is exactly the handshake-daemon kill from #4454.
+    close(fds[1]);
+
+    ssize_t rc = 0;
+    for (int attempt = 0; attempt < 4 && rc != -1; ++attempt) {
+        rc = writeFullySocket(fds[0], payload, sizeof(payload));
+    }
+    ASSERT_EQ(rc, -1);
+    EXPECT_EQ(errno, EPIPE);
+    close(fds[0]);
+}
+
+//------------------------------------------------------------------------------
 // parseFromString<T>
 //------------------------------------------------------------------------------
 

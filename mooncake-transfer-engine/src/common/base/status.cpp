@@ -59,6 +59,8 @@ std::string_view Status::CodeToString(Status::Code code) {
             return "AddressNotRegistered";
         case Code::kBatchBusy:
             return "BatchBusy";
+        case Code::kBatchCleanupDeferred:
+            return "BatchCleanupDeferred";
         case Code::kDeviceNotFound:
             return "DeviceNotFound";
         case Code::kAddressOverlapped:
@@ -87,6 +89,8 @@ std::string_view Status::CodeToString(Status::Code code) {
             return "NotImplemented";
         case Code::kNotSupportedTransport:
             return "NotSupportedTransport";
+        case Code::kCompletionNotificationUnsupported:
+            return "CompletionNotificationUnsupported";
         default:
             LOG(ERROR) << "Unknown code: " << static_cast<uint16_t>(code);
             return "UnknownCode";

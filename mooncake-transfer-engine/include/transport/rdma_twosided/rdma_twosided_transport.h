@@ -61,6 +61,9 @@ class RdmaTwoSidedTransport : public RdmaTransport {
 
     uint64_t localCtrlSessionId() const { return local_ctrl_session_id_; }
 
+    // The control-channel lifecycle has not opted in to worker submission.
+    bool supportsParallelBatchSubmit() const override { return false; }
+
    private:
     int onSetupCtrlChannel(const HandShakeDesc &peer_desc,
                            HandShakeDesc &local_desc);

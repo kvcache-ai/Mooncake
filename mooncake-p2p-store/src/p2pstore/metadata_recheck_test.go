@@ -240,3 +240,49 @@ func TestGetReplicaRejectsLayoutChangesAndReleasesRegistration(t *testing.T) {
 		})
 	}
 }
+
+func TestGetReplicaRejectsCallerLayoutMismatch(t *testing.T) {
+	source := Location{SegmentName: "source", Offset: 0}
+	truncatedShards := payloadWithLayout(8192, source)
+	truncatedShards.Shards = truncatedShards.Shards[:1]
+	zeroShardSize := payloadWithLayout(4096, source)
+	zeroShardSize.MaxShardSize = 0
+
+	tests := []struct {
+		name     string
+		payload  *Payload
+		sizeList []uint64
+	}{
+		{name: "larger than stored", payload: payloadWithLayout(4096, source), sizeList: []uint64{8192}},
+		{name: "smaller than stored", payload: payloadWithLayout(4096, source), sizeList: []uint64{1024}},
+		{name: "same total split differently", payload: payloadWithLayout(4096, source), sizeList: []uint64{2048, 2048}},
+		{name: "extra buffer", payload: payloadWithLayout(4096, source), sizeList: []uint64{4096, 4096}},
+		{name: "shard list shorter than layout", payload: truncatedShards, sizeList: []uint64{8192}},
+		{name: "zero max shard size", payload: zeroShardSize, sizeList: []uint64{4096}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metadata := &scriptedMetadata{results: []metadataResult{
+				{payload: tt.payload, revision: 10},
+			}}
+			store, engine := newMetadataRecheckStore(metadata)
+			addrList := make([]uintptr, len(tt.sizeList))
+			for i := range addrList {
+				addrList[i] = uintptr(0x100000 * (i + 1))
+			}
+
+			err := store.GetReplica(context.Background(), "payload", addrList, tt.sizeList)
+			if !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("GetReplica error=%v, want ErrInvalidArgument", err)
+			}
+			if engine.reg != 0 || len(store.memory.bufferList) != 0 {
+				t.Fatalf("memory registered before the layout check: registrations=%d list=%+v",
+					engine.reg, store.memory.bufferList)
+			}
+			if metadata.updateCalls != 0 {
+				t.Fatalf("metadata updates=%d, want 0", metadata.updateCalls)
+			}
+		})
+	}
+}

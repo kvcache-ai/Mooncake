@@ -1,0 +1,54 @@
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <ylt/util/tl/expected.hpp>
+
+#include "conductor/client/types.h"
+
+namespace mooncake::conductor {
+
+struct ConductorClientConfig {
+    std::string conductor_addr;  // RPC server address, "host:port"
+    // Negative disables the timeout. Setup rejects 0 and values above
+    // INT64_MAX / 1000000 with INVALID_PARAMS.
+    int64_t connect_timeout_ms = 1000;
+    int64_t request_timeout_ms = 3000;
+};
+
+// Thread-safety: v1 serializes all calls on an internal mutex around a single
+// coro_rpc_client. Sufficient for control-plane rates; a pooled variant
+// (mirroring store's MasterClient client_accessor_) is the hot-path upgrade.
+//
+// The pimpl idiom keeps coro_rpc headers out of this public header; wire types
+// come solely from conductor/client/types.h.
+class ConductorClient {
+   public:
+    ConductorClient();
+    ~ConductorClient();  // calls Close() internally
+    ConductorClient(const ConductorClient&) = delete;
+    ConductorClient& operator=(const ConductorClient&) = delete;
+
+    // Replaces the previous connection; failure leaves the client unconnected.
+    tl::expected<void, ErrorCode> Setup(const ConductorClientConfig& config);
+    void Close();  // drains socket cleanup; idempotent; Setup may reconnect
+    bool HealthCheck();  // healthy if one ListServices call succeeds
+
+    tl::expected<QueryResult, ErrorCode> Query(const QueryRequest& request);
+    tl::expected<RegisterResult, ErrorCode> Register(
+        const common::ServiceConfig& config);
+    tl::expected<UnregisterResult, ErrorCode> Unregister(
+        const std::string& instance_id, const std::string& tenant_id,
+        int dp_rank);
+    tl::expected<prefixindex::GlobalView, ErrorCode> GetGlobalView();
+    tl::expected<std::vector<common::ServiceConfig>, ErrorCode> ListServices();
+
+   private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace mooncake::conductor

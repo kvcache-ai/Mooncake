@@ -15,13 +15,14 @@
 #endif
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include "ascend_allocator.h"
+#elif defined(USE_MEMFABRIC)
+#include "memfabric_allocator.h"
 #endif
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
 #endif
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
-#endif
+
+#include "nof/dma_buffer_allocator.h"
 
 namespace mooncake {
 namespace {
@@ -94,7 +95,8 @@ size_t get_hugepage_size_from_env(unsigned int *out_flags, bool use_memfd) {
 
 void *allocate_buffer_allocator_memory(size_t total_size,
                                        const std::string &protocol,
-                                       size_t alignment, bool use_spdk_dma) {
+                                       size_t alignment,
+                                       DmaBufferAllocator *dma_allocator) {
     const size_t default_alignment = facebook::cachelib::Slab::kSize;
     // Ensure total_size is a multiple of alignment
     if (alignment == default_alignment && total_size < alignment) {
@@ -104,6 +106,10 @@ void *allocate_buffer_allocator_memory(size_t total_size,
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_allocate_memory(total_size, protocol);
+    }
+#elif defined(USE_MEMFABRIC)
+    if (protocol == "ascend") {
+        return memfabric_allocate_memory(total_size, protocol);
     }
 #endif
 #if defined(USE_SUNRISE)
@@ -118,12 +124,11 @@ void *allocate_buffer_allocator_memory(size_t total_size,
         return mooncake::ub_allocate_memory(alignment, total_size);
     }
 #endif
-#ifdef USE_NOF
-    if (use_spdk_dma && total_size > 0) {
-        return mooncake::SpdkWrapper::GetInstance().Alloc(total_size, alignment,
-                                                          -1);
+    // A DMA-specialized allocator (SPDK hugepage pool) takes precedence over
+    // the generic fallback; nullptr keeps the historical path below.
+    if (dma_allocator && total_size > 0) {
+        return dma_allocator->Alloc(total_size, alignment, -1);
     }
-#endif
 #ifdef USE_VRAM_SEGMENT
     auto ret = allocate_vram_memory(total_size, protocol);
     if (!ret) {
@@ -136,10 +141,15 @@ void *allocate_buffer_allocator_memory(size_t total_size,
     return aligned_alloc(alignment, total_size);
 }
 
-void free_memory(const std::string &protocol, void *ptr, bool use_spdk_dma) {
+void free_memory(const std::string &protocol, void *ptr,
+                 DmaBufferAllocator *dma_allocator) {
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_free_memory(protocol, ptr);
+    }
+#elif defined(USE_MEMFABRIC)
+    if (protocol == "ascend") {
+        return memfabric_free_memory(protocol, ptr);
     }
 #endif
 #if defined(USE_SUNRISE)
@@ -153,15 +163,14 @@ void free_memory(const std::string &protocol, void *ptr, bool use_spdk_dma) {
         return;
     }
 #endif
-#ifdef USE_NOF
-    // Mirror allocate_buffer_allocator_memory(): a buffer taken from the SPDK
-    // hugepage pool (spdk_zmalloc) must be released with spdk_free, not glibc
-    // free(), which would abort with "free(): invalid pointer".
-    if (use_spdk_dma) {
-        mooncake::SpdkWrapper::GetInstance().Free(ptr);
+    // Mirror allocate_buffer_allocator_memory(): a buffer taken from a
+    // DMA-specialized allocator (spdk_zmalloc) must be released by that same
+    // allocator (spdk_free), never glibc free(). The mirror contract is now
+    // guaranteed by the allocator object identity.
+    if (dma_allocator) {
+        dma_allocator->Free(ptr);
         return;
     }
-#endif
 #ifdef USE_VRAM_SEGMENT
 #ifdef USE_INTRA_NVLINK
     freeFabricMemory_intra(ptr);

@@ -60,11 +60,34 @@ class AllocationStrategyParameterizedTest
         size_t size = 64 * MiB) {
         const size_t base = 0x100000000ULL + base_offset;  // 4GB + offset
         auto allocator = CreateBufferAllocator(allocator_type_, segment_name,
-                                               base, size, segment_name);
+                                               base, size, segment_name, "tcp");
         if (!allocator) {
             throw std::invalid_argument("Invalid allocator test parameters");
         }
         return std::move(*allocator);
+    }
+
+    // Registrations bound to the returned record are not serving.
+    static std::shared_ptr<ClientLivenessRecord> MakeSuspectedRecord() {
+        const auto initial = ClientLivenessRecord::TimePoint{};
+        auto record =
+            std::make_shared<ClientLivenessRecord>(generate_uuid(), initial);
+        EXPECT_EQ(
+            record->Evaluate(initial + std::chrono::seconds(1),
+                             std::chrono::seconds(1), std::chrono::seconds(10)),
+            ClientLivenessTransition::BECAME_SUSPECTED);
+        return record;
+    }
+
+    // Adds non-serving segments suspected<first> .. suspected<first+count-1>.
+    void AddSuspectedSegments(AllocatorManager& allocator_manager, size_t first,
+                              size_t count) {
+        const auto suspected = MakeSuspectedRecord();
+        for (size_t i = first; i < first + count; ++i) {
+            const auto name = "suspected" + std::to_string(i);
+            allocator_manager.addAllocator(
+                name, CreateTestAllocator(name, i * 64 * MiB), suspected);
+        }
     }
 
     BufferAllocatorType allocator_type_;
@@ -99,6 +122,235 @@ INSTANTIATE_TEST_SUITE_P(
                                                               : "Offset";
         return strategy_str + "_" + allocator_str;
     });
+
+TEST(AllocatorManagerTest, ReplacesDistinctRegistrationSlots) {
+    for (const std::string second_name : {"second", "first"}) {
+        SCOPED_TRACE(second_name);
+        auto first_allocator =
+            std::make_shared<DummyBufferAllocator>("first", "first");
+        auto second_allocator =
+            std::make_shared<DummyBufferAllocator>(second_name, second_name);
+        AllocatorManager manager;
+        const auto first = manager.addAllocator("first", first_allocator);
+        const auto second = manager.addAllocator(second_name, second_allocator);
+        AllocatorManager replacements;
+        const auto next_first =
+            replacements.addAllocator("first", first_allocator);
+        const auto next_second =
+            replacements.addAllocator(second_name, second_allocator);
+
+        // Cover both separate per-name vectors (including checked iterators)
+        // and distinct slots in the same vector.
+        ASSERT_TRUE(
+            manager.replaceRegistrations({{"first", first, next_first},
+                                          {second_name, second, next_second}}));
+        ASSERT_NE(manager.getAllocators("first"), nullptr);
+        ASSERT_NE(manager.getAllocators(second_name), nullptr);
+        EXPECT_EQ(manager.getAllocators("first")->front(), next_first);
+        EXPECT_EQ(manager.getAllocators(second_name)->back(), next_second);
+    }
+}
+
+TEST(AllocatorManagerTest,
+     DuplicateReplacementLeavesAllRegistrationsUnchanged) {
+    auto first_allocator =
+        std::make_shared<DummyBufferAllocator>("first", "first");
+    auto second_allocator =
+        std::make_shared<DummyBufferAllocator>("second", "second");
+    AllocatorManager manager;
+    const auto first = manager.addAllocator("first", first_allocator);
+    const auto second = manager.addAllocator("second", second_allocator);
+    AllocatorManager replacements;
+    const auto next_first = replacements.addAllocator("first", first_allocator);
+    const auto next_second =
+        replacements.addAllocator("second", second_allocator);
+
+    EXPECT_FALSE(manager.replaceRegistrations({{"first", first, next_first},
+                                               {"second", second, next_second},
+                                               {"first", first, next_first}}));
+    ASSERT_NE(manager.getAllocators("first"), nullptr);
+    ASSERT_NE(manager.getAllocators("second"), nullptr);
+    EXPECT_EQ(manager.getAllocators("first")->front(), first);
+    EXPECT_EQ(manager.getAllocators("second")->front(), second);
+
+    // A rejected batch must also leave both slots usable by a later batch.
+    ASSERT_TRUE(manager.replaceRegistrations(
+        {{"first", first, next_first}, {"second", second, next_second}}));
+    EXPECT_EQ(manager.getAllocators("first")->front(), next_first);
+    EXPECT_EQ(manager.getAllocators("second")->front(), next_second);
+}
+
+class FabricPlacementTest : public AllocationStrategyTest {
+   protected:
+    void Add(const std::string& name, const PhysicalPlacement& placement,
+             const std::string& protocol = "mnnvl") {
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = name;
+        segment.base = 0x100000000ULL + manager_.getNames().size() * 64 * MiB;
+        segment.size = 64 * MiB;
+        segment.te_endpoint = "10.0.0.1:18060";
+        segment.protocol = protocol;
+        segment.physical_placement = placement;
+        manager_.addAllocator(name, std::make_shared<OffsetBufferAllocator>(
+                                        name, segment.base, segment.size,
+                                        segment.te_endpoint, segment.protocol));
+        manager_.SetSegmentMetadata(segment);
+    }
+
+    ReplicateConfig Request(size_t count = 1) {
+        ReplicateConfig config;
+        config.replica_num = count;
+        config.requester_placement =
+            PhysicalPlacement{"fabric-a", "rack1", "tray1", 3, -1};
+        return config;
+    }
+
+    std::string Name(const Replica& replica) {
+        return *replica.get_segment_names().front();
+    }
+    AllocatorManager manager_;
+};
+
+TEST_F(FabricPlacementTest, FabricSnapshotsPreserveHcaAffinity) {
+    Add("local", {"fabric-a", "rack1", "tray1", 3, 0});
+    Add("foreign", {"fabric-b", "rack1", "tray1", 3, 0});
+    const std::vector<std::string> hcas{"mlx5_0"};
+    manager_.SetHcaAffinity(hcas);
+    auto snapshot = manager_.Snapshot();
+    EXPECT_EQ(snapshot.GetHcaAffinity(), hcas);
+    auto filtered = snapshot.FilterForFabric("fabric-a");
+    EXPECT_EQ(filtered.GetHcaAffinity(), hcas);
+    EXPECT_EQ(filtered.getNames(), (std::vector<std::string>{"local"}));
+}
+
+TEST_F(FabricPlacementTest, PhysicalLocalityTiersAndRoutableEndpoint) {
+    Add("local", {"fabric-a", "rack1", "tray1", 3, 0});
+    Add("same-rack", {"fabric-a", "rack1", "tray2", 3, 0});
+    Add("remote-same-gpu", {"fabric-a", "rack2", "tray3", 3, 0});
+    Add("remote-fallback", {"fabric-a", "rack3", "tray4", 1, 0});
+    Add("foreign", {"fabric-b", "rack1", "tray1", 3, 0});
+    auto result = strategy_->AllocateForRequest(manager_, 1024, Request(4), {});
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 4);
+    EXPECT_EQ(Name((*result)[0]), "local");
+    EXPECT_EQ(Name((*result)[1]), "same-rack");
+    EXPECT_EQ(Name((*result)[2]), "remote-same-gpu");
+    EXPECT_EQ(Name((*result)[3]), "remote-fallback");
+    for (const auto& replica : *result) {
+        EXPECT_EQ(replica.get_descriptor()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  "10.0.0.1:18060");
+    }
+}
+
+TEST_F(FabricPlacementTest, CrossRackFallbackDeduplicatesRacks) {
+    Add("same-gpu", {"fabric-a", "rack2", "tray2", 3, 0});
+    Add("same-gpu-alt", {"fabric-a", "rack2", "tray5", 3, 0});
+    Add("same-rack-other-gpu", {"fabric-a", "rack2", "tray3", 2, 0});
+    Add("other-rack", {"fabric-a", "rack3", "tray4", 2, 0});
+    auto result = strategy_->AllocateForRequest(manager_, 1024, Request(4), {});
+    ASSERT_TRUE(result);
+    // Without rack dedup all four segments would be picked. Rack2 must
+    // contribute exactly one replica whichever candidate the shuffle visits
+    // first, and the cross-rack fallback must never revisit rack2.
+    ASSERT_EQ(result->size(), 2);
+    const auto first = Name((*result)[0]);
+    EXPECT_TRUE(first == "same-gpu" || first == "same-gpu-alt") << first;
+    EXPECT_EQ(Name((*result)[1]), "other-rack");
+}
+
+TEST_F(FabricPlacementTest, ExplicitPreferencesRemainOrderedWithinDomain) {
+    Add("first", {"fabric-a", "rack1", "tray1", 3, 0});
+    Add("second", {"fabric-a", "rack1", "tray1", 3, 1});
+    auto result = strategy_->AllocateForRequest(manager_, 1024, Request(2),
+                                                {"second", "first"});
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 2);
+    EXPECT_EQ(Name((*result)[0]), "second");
+    EXPECT_EQ(Name((*result)[1]), "first");
+}
+
+TEST_F(FabricPlacementTest, RestrictedSnapshotBlocksExplicitAndFallbackEscape) {
+    Add("local", {"fabric-a", "rack1", "tray1", 3, 0});
+    Add("foreign", {"fabric-b", "rack2", "tray2", 3, 0});
+    Add("tcp", {"fabric-a", "rack1", "tray1", 3, 0}, "tcp");
+    auto eligible = manager_.FilterForFabric("fabric-a");
+    ASSERT_EQ(eligible.getNames(), (std::vector<std::string>{"local"}));
+    EXPECT_EQ(eligible.getAllocators("foreign"), nullptr);
+    EXPECT_FALSE(strategy_->AllocateFrom(eligible, 1024, "foreign"));
+    for (const auto* name : {"foreign", "tcp"}) {
+        auto result =
+            strategy_->AllocateForRequest(manager_, 1024, Request(), {name});
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+    ReplicateConfig legacy;
+    auto result =
+        strategy_->AllocateForRequest(manager_, 1024, legacy, {"local"});
+    ASSERT_TRUE(result);
+    EXPECT_EQ(Name(result->front()), "tcp");
+    auto snapshot = manager_.Snapshot();
+    ASSERT_NE(snapshot.GetSegmentMetadata("local"), nullptr);
+    EXPECT_EQ(
+        snapshot.GetSegmentMetadata("local")->physical_placement->physical_gpu,
+        3);
+}
+
+TEST_F(FabricPlacementTest, NoEligibleCapacityNeverFallsOutsideDomain) {
+    Add("foreign", {"fabric-b", "rack1", "tray1", 3, 0});
+    auto result = strategy_->AllocateForRequest(manager_, 1024, Request(), {});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+}
+
+TEST_F(FabricPlacementTest, SelfIdRequiresDomainAndConsistentPhysicalIdentity) {
+    ReplicateConfig config;
+    config.requester_self_id = "rack1.10.0.0.1:18060#g3";
+    EXPECT_FALSE(AllocationStrategy::ResolvePlacement(config));
+    config.fabric_domain = "fabric-a";
+    auto resolved = AllocationStrategy::ResolvePlacement(config);
+    ASSERT_TRUE(resolved);
+    ASSERT_TRUE(resolved->requester);
+    EXPECT_EQ(resolved->requester->tray, "10.0.0.1");
+    EXPECT_EQ(resolved->requester->physical_gpu, 3);
+    config.requester_placement =
+        PhysicalPlacement{"fabric-a", "rack1", "10.0.0.1", 0, -1};
+    EXPECT_FALSE(AllocationStrategy::ResolvePlacement(config));
+    config.requester_placement->physical_gpu = 3;
+    config.requester_placement->fabric_domain = "fabric-b";
+    EXPECT_FALSE(AllocationStrategy::ResolvePlacement(config));
+    config.fabric_domain = "";
+    EXPECT_FALSE(AllocationStrategy::ResolvePlacement(config));
+    for (const auto* id : {"rack1.host", "rack1.host#g-1", "rack1.host#g3x",
+                           "rack1.#g0", ".host#g0"}) {
+        EXPECT_FALSE(PhysicalPlacement::FromSelfId(id)) << id;
+    }
+}
+
+TEST_F(FabricPlacementTest, CopyMoveAndReuseShareFabricEligibility) {
+    Add("a", {"fabric-a", "rack1", "tray1", 3, 0});
+    Add("a2", {"fabric-a", "rack2", "tray2", 3, 0});
+    Add("b", {"fabric-b", "rack2", "tray2", 3, 0});
+    Add("tcp", {"fabric-a", "rack1", "tray1", 3, 0}, "tcp");
+    EXPECT_TRUE(manager_.CanCopyWithinFabric("a", "a2"));
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("a", "b"));
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("a", "tcp"));
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("tcp", "a"));
+    EXPECT_TRUE(manager_.CanCopyWithinFabric("tcp", "tcp"));
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("missing", "tcp"));
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("tcp", "missing"));
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("missing", "missing"));
+    EXPECT_FALSE(manager_.IsFabricEligible("a", "fabric-b"));
+    EXPECT_FALSE(manager_.IsFabricEligible("a", ""));
+    EXPECT_TRUE(manager_.IsFabricEligible("a", "fabric-a"));
+    auto registration = manager_.getAllocators("a")->front();
+    EXPECT_TRUE(manager_.removeAllocator("a", registration));
+    EXPECT_EQ(manager_.GetSegmentMetadata("a"), nullptr);
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("a", "tcp"));
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("a", "a2"));
+}
 
 // Test basic functionality with empty allocators map (non-parameterized)
 TEST_F(AllocationStrategyTest, EmptyAllocatorsMap) {
@@ -173,17 +425,19 @@ TEST_F(AllocationStrategyTest, NoFAllocationSelectsSsdAllocator) {
 
 TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    auto suspected = std::make_shared<ClientLivenessRecord>(initial);
+    auto suspected =
+        std::make_shared<ClientLivenessRecord>(generate_uuid(), initial);
     ASSERT_EQ(
         suspected->Evaluate(initial + std::chrono::seconds(1),
                             std::chrono::seconds(1), std::chrono::seconds(10)),
         ClientLivenessTransition::BECAME_SUSPECTED);
-    auto active = std::make_shared<ClientLivenessRecord>(initial);
+    auto active =
+        std::make_shared<ClientLivenessRecord>(generate_uuid(), initial);
 
     auto suspected_allocator = std::make_shared<OffsetBufferAllocator>(
-        "shared", DEFAULT_CXL_BASE, 64 * MiB, "suspected");
+        "shared", DEFAULT_CXL_BASE, 64 * MiB, "suspected", "tcp");
     auto active_allocator = std::make_shared<OffsetBufferAllocator>(
-        "shared", DEFAULT_CXL_BASE + 64 * MiB, 64 * MiB, "active");
+        "shared", DEFAULT_CXL_BASE + 64 * MiB, 64 * MiB, "active", "tcp");
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("shared", suspected_allocator, suspected);
     allocator_manager.addAllocator("shared", active_allocator, active);
@@ -446,7 +700,7 @@ TEST_P(AllocationStrategyParameterizedTest, VeryLargeSizeAllocation) {
 // Test invalid replication count
 TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MiB, "segment1");
+        "segment1", 0x100000000ULL, 64 * MiB, "segment1", "tcp");
 
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator);
@@ -463,9 +717,10 @@ TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
 // count
 TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
     auto allocator1 = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MiB, "segment1");
+        "segment1", 0x100000000ULL, 64 * MiB, "segment1", "tcp");
     auto allocator2 = std::make_shared<OffsetBufferAllocator>(
-        "segment2", 0x100000000ULL + 0x10000000ULL, 64 * MiB, "segment2");
+        "segment2", 0x100000000ULL + 0x10000000ULL, 64 * MiB, "segment2",
+        "tcp");
 
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator1);
@@ -570,7 +825,7 @@ TEST_P(AllocationStrategyParameterizedTest, ExcludedSegmentsAllocation) {
 // Test allocation when all available segments are excluded
 TEST_F(AllocationStrategyTest, AllSegmentsExcluded) {
     auto allocator1 = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MiB, "segment1");
+        "segment1", 0x100000000ULL, 64 * MiB, "segment1", "tcp");
 
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator1);
@@ -661,6 +916,96 @@ TEST_P(AllocationStrategyParameterizedTest,
             "segment1");  // Should not be allocated from excluded segments
         EXPECT_TRUE(segment_ep == "segment2" || segment_ep == "segment3");
         EXPECT_EQ(mem_desc.buffer_descriptor.size_, 1024);
+    }
+}
+
+TEST_P(AllocationStrategyParameterizedTest,
+       NonServingSegmentsDoNotUseUpRetries) {
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("serving",
+                                   CreateTestAllocator("serving-suspected", 0),
+                                   MakeSuspectedRecord());
+    allocator_manager.addAllocator("serving",
+                                   CreateTestAllocator("serving", 64 * MiB));
+    AddSuspectedSegments(allocator_manager, 2, 200);
+    // These fill FreeRatioFirst's candidate sample, so it falls back to the
+    // random walk.
+    std::set<std::string> excluded;
+    for (size_t i = 0; i < 6; ++i) {
+        const auto name = "excluded" + std::to_string(i);
+        allocator_manager.addAllocator(
+            name, CreateTestAllocator(name, (i + 202) * 64 * MiB));
+        excluded.insert(name);
+    }
+
+    for (int i = 0; i < 20; ++i) {
+        auto result =
+            strategy_->Allocate(allocator_manager, 1024, 1, {}, excluded);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ((*result)[0]
+                      .get_descriptor()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  "serving");
+    }
+}
+
+TEST_P(AllocationStrategyParameterizedTest,
+       NonServingRunDoesNotFavorTheNextSegment) {
+    AllocatorManager allocator_manager;
+    for (size_t i = 0; i < 12; ++i) {
+        if (i == 6) {
+            AddSuspectedSegments(allocator_manager, 12, 4);
+        }
+        const auto name = "serving" + std::to_string(i);
+        allocator_manager.addAllocator(name,
+                                       CreateTestAllocator(name, i * 64 * MiB));
+    }
+
+    constexpr int kAllocations = 3000;
+    std::unordered_map<std::string, int> picks;
+    for (int i = 0; i < kAllocations; ++i) {
+        auto result = strategy_->Allocate(allocator_manager, 1024);
+        ASSERT_TRUE(result.has_value());
+        ++picks[(*result)[0]
+                    .get_descriptor()
+                    .get_memory_descriptor()
+                    .buffer_descriptor.transport_endpoint_];
+    }
+    for (const auto& [name, count] : picks) {
+        EXPECT_LT(count, kAllocations * 15 / 100) << name;
+    }
+}
+
+TEST_P(AllocationStrategyParameterizedTest,
+       FreeRatioFirstRanksOnlyServingSegments) {
+    auto [strategy_type, allocator_type] = GetParam();
+    if (strategy_type != AllocationStrategyType::FREE_RATIO_FIRST) {
+        GTEST_SKIP();
+    }
+
+    auto busy = CreateTestAllocator("busy", 0);
+    std::vector<std::unique_ptr<AllocatedBuffer>> held;
+    for (int i = 0; i < 32; ++i) {
+        held.push_back(busy->allocate(MiB));
+        ASSERT_NE(held.back(), nullptr);
+    }
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("busy", busy);
+    AddSuspectedSegments(allocator_manager, 1, 100);
+    allocator_manager.addAllocator("idle",
+                                   CreateTestAllocator("idle", 101 * 64 * MiB));
+    AddSuspectedSegments(allocator_manager, 102, 100);
+
+    for (int i = 0; i < 20; ++i) {
+        auto result = strategy_->Allocate(allocator_manager, 1024);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ((*result)[0]
+                      .get_descriptor()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  "idle");
     }
 }
 
@@ -767,8 +1112,8 @@ TEST_F(AllocationStrategyTest, PerformanceComparison) {
     for (size_t i = 0; i < kNumSegments; i++) {
         const auto name = "segment_" + std::to_string(i);
         allocator_manager.addAllocator(
-            name, std::make_shared<OffsetBufferAllocator>(name, kSegmentBase,
-                                                          kSegmentSize, name));
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, kSegmentBase, kSegmentSize, name, "tcp"));
     }
 
     // Test Random strategy
@@ -830,8 +1175,8 @@ TEST_F(AllocationStrategyTest, PerformanceTest) {
     for (size_t i = 0; i < kNumSegments; i++) {
         const auto name = "segment_" + std::to_string(i);
         allocator_manager.addAllocator(
-            name, std::make_shared<OffsetBufferAllocator>(name, kSegmentBase,
-                                                          kSegmentSize, name));
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, kSegmentBase, kSegmentSize, name, "tcp"));
     }
 
     std::vector<std::vector<Replica>> replicas;
@@ -867,7 +1212,7 @@ class SsdPlacementTestState {
         allocators.addAllocator(
             name, std::make_shared<OffsetBufferAllocator>(
                       name, 0x100000000ULL + index * segment_size, segment_size,
-                      name));
+                      name, "tcp"));
         const UUID client_id{index + 1, index + 100};
         client_by_name.emplace(name, client_id);
         ASSERT_EQ(local_ssd.RegisterClient(client_id, true), ErrorCode::OK);
@@ -878,8 +1223,8 @@ class SsdPlacementTestState {
 
     void AddSegmentWithoutSsd(const std::string& name, size_t segment_size) {
         allocators.addAllocator(
-            name, std::make_shared<OffsetBufferAllocator>(name, 0x100000000ULL,
-                                                          segment_size, name));
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, 0x100000000ULL, segment_size, name, "tcp"));
         client_by_name.emplace(name, UUID{1, 100});
     }
 
@@ -1086,6 +1431,107 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstVsRandomStrategyPerformance) {
         << "Overhead ratio:      " << std::setprecision(2) << overhead_ratio
         << "x  (" << std::setprecision(1) << (overhead_ratio - 1.0) * 100.0
         << "% slower)\n\n";
+}
+
+TEST_P(AllocationStrategyParameterizedTest, HcaNameSelectsReceiverLocalNuma) {
+    auto other = CreateTestAllocator("receiver", 0);
+    auto matching = CreateTestAllocator("receiver", 0x10000000ULL);
+    auto unknown = CreateTestAllocator("receiver", 0x20000000ULL);
+    other->SetLocality(SegmentLocality{0, {"mlx5_1"}});
+    matching->SetLocality(SegmentLocality{7, {"mlx5_0", "mlx5_2"}});
+    AllocatorManager manager;
+    manager.SetHcaAffinity({"mlx5_0"});
+    manager.addAllocator("receiver", other);
+    manager.addAllocator("receiver", unknown);
+    manager.addAllocator("receiver", matching);
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        auto result =
+            strategy_->Allocate(manager, 1024, 1, {}, {}, ReplicaType::MEMORY);
+        ASSERT_TRUE(result);
+        ASSERT_EQ(result->size(), 1);
+        const auto address = (*result)[0]
+                                 .get_descriptor()
+                                 .get_memory_descriptor()
+                                 .buffer_descriptor.buffer_address_;
+        EXPECT_GE(address, matching->base());
+        EXPECT_LT(address, matching->base() + matching->capacity());
+    }
+}
+
+TEST_P(AllocationStrategyParameterizedTest, FullHcaTargetFallsBackToUnknown) {
+    auto matching = CreateTestAllocator("receiver", 0);
+    std::vector<std::unique_ptr<AllocatedBuffer>> occupied;
+    while (auto buffer = matching->allocate(MiB)) {
+        occupied.push_back(std::move(buffer));
+    }
+    ASSERT_FALSE(occupied.empty());
+    auto unknown = CreateTestAllocator("receiver", 0x10000000ULL);
+    auto other = CreateTestAllocator("receiver", 0x20000000ULL);
+    matching->SetLocality(SegmentLocality{7, {"mlx5_0"}});
+    other->SetLocality(SegmentLocality{0, {"mlx5_1"}});
+    AllocatorManager manager;
+    manager.SetHcaAffinity({"mlx5_0"});
+    manager.addAllocator("receiver", other);
+    manager.addAllocator("receiver", matching);
+    const auto unknown_registration = manager.addAllocator("receiver", unknown);
+    auto result =
+        strategy_->Allocate(manager, MiB, 1, {}, {}, ReplicaType::MEMORY);
+    ASSERT_TRUE(result);
+    auto address = (*result)[0]
+                       .get_descriptor()
+                       .get_memory_descriptor()
+                       .buffer_descriptor.buffer_address_;
+    EXPECT_GE(address, unknown->base());
+    EXPECT_LT(address, unknown->base() + unknown->capacity());
+    manager.removeAllocator("receiver", unknown_registration);
+    result = strategy_->Allocate(manager, MiB, 1, {}, {}, ReplicaType::MEMORY);
+    ASSERT_TRUE(result);
+    address = (*result)[0]
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_;
+    EXPECT_GE(address, other->base());
+    EXPECT_LT(address, other->base() + other->capacity());
+}
+
+TEST_P(AllocationStrategyParameterizedTest,
+       HcaAffinityPreservesReplicaDomains) {
+    AllocatorManager manager;
+    manager.SetHcaAffinity({"mlx5_0"});
+    std::unordered_map<std::string, uintptr_t> matching_bases;
+    for (size_t node = 0; node < 2; ++node) {
+        const auto name = "receiver" + std::to_string(node);
+        auto other = CreateTestAllocator(name, node * 0x20000000ULL);
+        auto matching =
+            CreateTestAllocator(name, node * 0x20000000ULL + 0x10000000ULL);
+        other->SetLocality(SegmentLocality{0, {"mlx5_1"}});
+        matching->SetLocality(SegmentLocality{7, {"mlx5_0"}});
+        manager.addAllocator(name, other);
+        manager.addAllocator(name, matching);
+        matching_bases[name] = matching->base();
+    }
+    auto result = strategy_->Allocate(manager, 1024, 2, {"receiver0"}, {},
+                                      ReplicaType::MEMORY);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 2);
+    std::set<std::string> names;
+    for (const auto& replica : *result) {
+        const auto descriptor =
+            replica.get_descriptor().get_memory_descriptor().buffer_descriptor;
+        names.insert(descriptor.transport_endpoint_);
+        const auto base = matching_bases.at(descriptor.transport_endpoint_);
+        EXPECT_GE(descriptor.buffer_address_, base);
+        EXPECT_LT(descriptor.buffer_address_, base + 64 * MiB);
+    }
+    EXPECT_EQ(names.size(), 2);
+    result = strategy_->Allocate(manager, 1024, 1, {"receiver0"}, {"receiver0"},
+                                 ReplicaType::MEMORY);
+    ASSERT_TRUE(result);
+    EXPECT_EQ((*result)[0]
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "receiver1");
 }
 
 }  // namespace mooncake

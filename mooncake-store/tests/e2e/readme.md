@@ -150,6 +150,27 @@ python3 store_client_e2e.py \
 - `--duration-sec`: total workload duration
 - `--sleep-ms`: interval between operations
 
+### In-process master e2e (no `mooncake_master`)
+
+Linux CI (`test-wheel-ubuntu`) runs `scripts/run_standalone_store_e2e.sh` before
+starting `mooncake_master`. This covers `EmbeddedMaster` plumbing used by tests.
+The Store client owns the master in the same process; no `mooncake_master` or
+metadata-service process is launched. The existing client hosting options remain
+unchanged, and this is not a documented user deployment mode.
+
+The CTest targets `embedded_master_test` and `standalone_client_test` also cover
+loopback-only listeners, kernel-assigned ports during concurrent startup, and
+same-port restart after stopping a master. TransferEngine reuse is checked with
+both HTTP metadata and `P2PHANDSHAKE`; the latter deliberately uses different
+Store and engine names and checks the published replica endpoint. The TENT
+`cuda-off` CI job runs the same metadata-reuse cases with `MC_USE_TENT=1`.
+In embedded mode, the legacy external `master_server_addr` argument is ignored
+so multiple clients can keep its default without competing for port 50051.
+
+```bash
+bash scripts/run_standalone_store_e2e.sh
+```
+
 ### run_oplog_snapshot_smoke.sh
 
 Runs the batch OpLog snapshot path with two real master processes and a local
@@ -165,8 +186,8 @@ surviving and removed objects.
 
 Set `--failpoint-dir` to verify the same launcher environment path used by
 crash tests. The script requires `mooncake_master`, `oplog_ha_client`,
-`oplog_batch_inspector`, `hot_standby_snapshot_bootstrap_test`, `etcd`,
-`etcdctl`, `curl`, `setsid`, and Python `aiohttp`. It is a manual real-etcd
+`oplog_batch_inspector`, `standby_controller_test`, `etcd`, `etcdctl`, `curl`,
+`setsid`, and Python `aiohttp`. It is a manual real-etcd
 check and is not registered in CI/nightly.
 
 The run directory must be new. The script stores configurations, master and
@@ -186,6 +207,23 @@ must not serve if its recovery history cannot be proven complete.
 This smoke does not cover the full crash/corruption/lease-contention matrix,
 S3 outages, large-scale memory/freeze-time measurements, or safe OpLog pruning.
 Keep batch history until retention/pruning has its own verified recovery gate.
+
+## Redis Cluster routing and OpLog integration
+
+Build `redis_ha_kv_backend_test`, `high_availability_test`, `mooncake_master`, and
+`oplog_ha_client` with `STORE_USE_REDIS=ON`. From the repository root, run:
+
+```bash
+bash mooncake-store/tests/e2e/run_oplog_batch_cluster_test.sh --redis-cluster build
+```
+
+The same entry point retains its offline script tests when called without
+arguments. Redis mode starts a private three-primary, six-replica cluster and a
+standalone primary/replica pair. It tests routing, migration, replica confirmation,
+controlled failover, and two Masters with OpLog enabled. All processes started by
+the fixture are stopped on exit; logs are retained in its temporary directory.
+It requires Python 3 and Redis binaries with `redis-cli --json` support. Override
+`REDIS_SERVER`, `REDIS_CLI`, or `REDIS_TEST_BASE_PORT` as needed.
 
 ## Batch OpLog capacity tests
 

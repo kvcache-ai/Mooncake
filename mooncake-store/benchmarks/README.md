@@ -83,3 +83,64 @@ The benchmark also prints a one-line `Prefill summary`, `Fragmentation summary`,
 and `Size-class breakdown` after each result row, so reviewers can read the
 actual prefill utilization, fragmentation, and per-size-class latency numbers
 without manually deriving them from the table.
+
+## Existence Lookup and Eviction Benchmark
+
+`exists_evict_bench` measures `BatchExistKey` latency while memory eviction
+runs, and whether eviction keeps up with a stream of new keys. It drives an
+in-process `MasterService` over one synthetic segment: metadata and allocator
+handles are real, but there is no RPC and no payload I/O.
+
+The benchmark prefills `--num_objects` 1 KiB keys, measures lookups alone for
+`--baseline_sec`, then runs eviction every `--eviction_interval_sec` for
+`--duration_sec`. Each successful `BatchExistKey` grants a read lease, so this
+also shows how lease renewal by readers interacts with eviction.
+
+By default, readers look up 80% of keys (spread over write order, including
+new keys), so the other 20% go cold and can be evicted, while writers add 50k
+new keys/s for the whole run. The run reports failed puts when eviction falls
+behind.
+
+```bash
+cmake --build build --target exists_evict_bench -j$(nproc)
+
+# Defaults: 10M keys, 8 reader threads, 200-key batches, 80% of keys read,
+# 50k new keys/s, 5% eviction every 10 s. Use a production-length key prefix.
+./build/mooncake-store/benchmarks/exists_evict_bench \
+  --key_prefix=$(printf 'p%.0s' $(seq 150))
+
+# Every key is read and nothing new is written: lookup latency during eviction
+# alone.
+./build/mooncake-store/benchmarks/exists_evict_bench \
+  --key_prefix=$(printf 'p%.0s' $(seq 150)) \
+  --lookup_fraction=1 --put_rate=0
+```
+
+Workload flags:
+
+- `--lookup_fraction` (default 0.8): readers only draw from this fraction of
+  keys; the rest are never read after they are written.
+- `--lookup_subset` (default `interleaved`): `interleaved` reads a hash-chosen
+  subset spread over write order, including keys added by writers; `prefix`
+  reads the first keys written and never the new ones.
+- `--put_rate` (default 50000), `--put_threads` (default 4): write new keys at
+  this rate for the whole run; 0 disables writes.
+- `--segment_headroom`: segment capacity beyond `num_objects` x 1 KiB. With
+  `--put_rate`, this is how far writes can run ahead of eviction before
+  `PutStart` fails.
+- `--eviction_worker_threads`: eviction workers (default 0, automatic: one per
+  16M filed keys, so 1 at the default 10M keys).
+- `--lookup_mode=probe`: use `BatchProbeKey` instead, without granting a lease.
+- `--skip_eviction`: never evict; a control for lookup and put latency.
+- `--key_prefix`: prepended to every key; use a production-length prefix so
+  keys are heap-allocated like real keys.
+
+Output lines:
+
+- `EVICTION`: one line per eviction pass, with its duration and key counts.
+- `RESULT`: lookup batch latency (p50, p95, p99, max), throughput, and hit
+  rate for the `baseline`, `periodic_eviction`, `overlapping_eviction` (batches
+  that overlap a pass), and `between_evictions` phases.
+- `PUTS`: with `--put_rate`, attempted and failed puts, put latency, and when
+  the first put failed.
+- `FINAL`: keys written, live keys, and eviction passes.

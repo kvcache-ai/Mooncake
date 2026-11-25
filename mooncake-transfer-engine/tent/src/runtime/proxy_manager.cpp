@@ -107,7 +107,12 @@ Status ProxyManager::deconstruct() {
         return Status::OK();
     }
     for (size_t i = 0; i < kShards; ++i) {
-        shards_[i].cv.notify_all();
+        {
+            // Pair with the waiter's predicate check so shutdown cannot
+            // notify between that check and entering the condition wait.
+            std::lock_guard<std::mutex> lk(shards_[i].mu);
+            shards_[i].cv.notify_all();
+        }
         if (shards_[i].thread.joinable()) shards_[i].thread.join();
     }
 
@@ -435,6 +440,32 @@ void ProxyManager::runner(size_t id) {
         auto status =
             transferEventLoop(task, &cache, buffers_safe_to_release,
                               undrained_batches, undrained_remote_operations);
+        // A failed sibling does not stop copies already using the caller's
+        // buffer. Keep the parent PENDING until those copies are terminal.
+        // Shutdown still uses the existing bounded deferred-teardown path.
+        uint64_t drain_polls = 0;
+        while (!buffers_safe_to_release &&
+               running_.load(std::memory_order_acquire)) {
+            for (auto it = undrained_batches.begin();
+                 it != undrained_batches.end();) {
+                TransferStatus child_status;
+                auto polled = impl_->progressBatch(*it, child_status);
+                if (polled.ok() && child_status.s != PENDING) {
+                    impl_->releaseBatch(reinterpret_cast<Batch*>(*it));
+                    it = undrained_batches.erase(it);
+                } else {
+                    if (!polled.ok()) {
+                        LOG_EVERY_N(WARNING, 100)
+                            << "Failed to drain staging copy: " << polled;
+                    }
+                    ++it;
+                }
+            }
+            internal::pollRemoteOperations(undrained_remote_operations);
+            buffers_safe_to_release = undrained_batches.empty() &&
+                                      undrained_remote_operations.empty();
+            if (!buffers_safe_to_release) waitBeforeNextPoll(drain_polls++);
+        }
         if (buffers_safe_to_release) {
             cache.reset();
         } else {
@@ -458,9 +489,11 @@ void ProxyManager::runner(size_t id) {
                 has_pending_cleanups_.store(true, std::memory_order_relaxed);
             }
         }
-        task.native->staging_status.store(status.ok() ? COMPLETED : FAILED,
-                                          std::memory_order_release);
-        impl_->notifyBatchMaybeReady(task.batch);
+        if (buffers_safe_to_release) {
+            task.native->staging_status.store(status.ok() ? COMPLETED : FAILED,
+                                              std::memory_order_release);
+            impl_->notifyBatchMaybeReady(task.batch);
+        }
     }
 }
 
@@ -881,9 +914,36 @@ Status ProxyManager::allocateStageBuffers(const std::string& location) {
     if (stage_buffers_.count(location)) return Status::OK();
     StageBuffers buf;
     auto total_size = chunk_size_ * chunk_count_;
-    CHECK_STATUS(
-        impl_->allocateLocalMemory(&buf.chunks, total_size, location, true));
-    CHECK_STATUS(impl_->registerLocalMemory(buf.chunks, total_size));
+    // The node owning this pool selects its local device-copy allocator.
+    if (impl_->transport_list_[MLU]) {
+        MemoryOptions options;
+        options.location = location;
+        options.type = MLU;
+        options.internal = true;
+        CHECK_STATUS(
+            impl_->allocateLocalMemory(&buf.chunks, total_size, options));
+    } else {
+        CHECK_STATUS(impl_->allocateLocalMemory(&buf.chunks, total_size,
+                                                location, true));
+    }
+    // Registration options determine visibility in getSegmentInfo().
+    MemoryOptions options;
+    options.internal = true;
+    auto registered =
+        impl_->registerLocalMemory({buf.chunks}, {total_size}, options);
+    if (!registered.ok()) {
+        // Registration may have succeeded locally before metadata publication
+        // failed. Keep the allocation alive if its registrations cannot drain.
+        auto removed = impl_->unregisterLocalMemory(buf.chunks, total_size);
+        if (!removed.ok()) {
+            LOG(WARNING) << "Retaining failed staging allocation " << buf.chunks
+                         << " because registration rollback failed: "
+                         << removed;
+            return registered;
+        }
+        impl_->freeLocalMemory(buf.chunks);
+        return registered;
+    }
     buf.bitmap = new std::atomic_flag[chunk_count_];
     for (size_t i = 0; i < chunk_count_; ++i)
         buf.bitmap[i].clear(std::memory_order_relaxed);

@@ -300,7 +300,7 @@ class PutAllocationFixture {
         : capacity_(capacity),
           allocator_(std::make_shared<OffsetBufferAllocator>(
               kSegmentName, kBenchmarkBaseAddress, capacity,
-              "benchmark-endpoint", StorageLevel::RAM,
+              "benchmark-endpoint", "tcp", StorageLevel::RAM,
               ReplicaType::MEMORY)) {
         allocator_manager_.addAllocator(kSegmentName, allocator_);
     }

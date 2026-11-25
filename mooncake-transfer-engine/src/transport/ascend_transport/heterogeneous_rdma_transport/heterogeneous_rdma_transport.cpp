@@ -90,7 +90,7 @@ void HeterogeneousRdmaTransport::transferLoop() {
             host_offset_ += request.length;
         }
 
-        s = transport_->submitTransferTask(task_list);
+        s = transport_->submitTransferTaskWithSeal(task_list);
         if (!s.ok()) {
             LOG(ERROR)
                 << "HeterogeneousRdmaTransport: Rdma submitTransferTask error";
@@ -344,7 +344,7 @@ Status HeterogeneousRdmaTransport::noAggTransport(
             "batch id: ");
     }
 
-    return transport_->submitTransferTask(task_list);
+    return transport_->submitTransferTaskWithSeal(task_list);
 }
 
 Status HeterogeneousRdmaTransport::aggTransport(
@@ -425,7 +425,7 @@ Status HeterogeneousRdmaTransport::submitTransferTask(
     auto &request = *task.request;
 
     if (isCpuMemory(request.source)) {
-        return transport_->submitTransferTask(task_list);
+        return transport_->submitTransferTaskWithSeal(task_list);
     }
 
     auto ret = checkAndCreateStreamCopy();

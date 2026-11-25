@@ -19,17 +19,17 @@ case "${MOONCAKE_STORE_GO_SANITIZED:-0}" in
         ;;
 esac
 
-# The Go test client publishes rpc_meta over HTTP to the master's embedded
-# metadata server (see integration_test.go's run instructions). Older runs
-# got 8080 served by an unrelated shared master that no longer exists in this
-# job, so this master must serve metadata itself.
+# The Go test client publishes rpc_meta to this master's embedded metadata
+# server. Nightly jobs also keep a shared metadata server on port 8080 for
+# later tests, so give the Go-only master a separate HTTP port.
 ci_start_service master "$RUNNER_TEMP/mooncake-master.log" \
     "$GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master" \
     --eviction_high_watermark_ratio=0.95 \
     --cluster_id="$MOONCAKE_STORE_CLUSTER_ID" \
     --port 50051 \
+    --http_metadata_server_port=18080 \
     --enable_http_metadata_server=true
-ci_wait_service master 50051
+ci_wait_service master 50051 18080
 
 cd "$GITHUB_WORKSPACE/mooncake-store/go"
 export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/build/mooncake-common:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:${LD_LIBRARY_PATH:-}"
@@ -96,7 +96,7 @@ if ldconfig -p 2>/dev/null | grep -q libzmq; then
     export CGO_LDFLAGS="$CGO_LDFLAGS -lzmq"
 fi
 
-test_env=(MC_METADATA_SERVER=http://127.0.0.1:8080/metadata)
+test_env=(MC_METADATA_SERVER=http://127.0.0.1:18080/metadata)
 if $sanitized; then
     test_env=(ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 "${test_env[@]}")
 fi
