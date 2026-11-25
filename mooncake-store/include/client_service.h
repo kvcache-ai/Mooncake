@@ -1340,7 +1340,8 @@ class Client {
                                        const std::string& source,
                                        const std::string& target,
                                        const UUID* task_id = nullptr,
-                                       bool drain_move = false);
+                                       bool drain_move = false,
+                                       bool* drain_start_rpc_failed = nullptr);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;

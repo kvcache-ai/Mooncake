@@ -76,6 +76,10 @@ namespace {
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
 
+bool IsRpcTransportError(ErrorCode error) {
+    return error == ErrorCode::RPC_FAIL || error == ErrorCode::RPC_TIMEOUT;
+}
+
 class ScopedObjectChecksumBuffer {
    public:
     ScopedObjectChecksumBuffer(PinnedBufferPool& pool, size_t size)
@@ -4819,8 +4823,8 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& tenant_id,
                                            const std::string& source,
                                            const std::string& target,
-                                           const UUID* task_id,
-                                           bool drain_move) {
+                                           const UUID* task_id, bool drain_move,
+                                           bool* drain_start_rpc_failed) {
     if (IsTaskCancellationRequested(task_id)) {
         return tl::unexpected(ErrorCode::TASK_CANCELED);
     }
@@ -4833,10 +4837,13 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         drain_move ? master_client_.StartDrainMove(*task_id)
                    : master_client_.MoveStart(key, tenant_id, source, target);
     if (!move_start_result.has_value()) {
-        ErrorCode error = move_start_result.error();
+        const auto error = move_start_result.error();
+        if (drain_move && drain_start_rpc_failed &&
+            IsRpcTransportError(error)) {
+            *drain_start_rpc_failed = true;
+        }
         LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
                    << ", error=move_start_failed" << ", error_code=" << error;
-        // MoveStart already validated existence, so we just return the error
         return tl::unexpected(error);
     }
 
@@ -5694,6 +5701,7 @@ void Client::SubmitTask(const TaskAssignment& assignment) {
 void Client::ExecuteTask(const ClientTask& client_task) {
     const auto& assignment = client_task.assignment;
     ErrorCode result = ErrorCode::OK;
+    bool drain_start_rpc_failed = false;
 
     try {
         switch (assignment.type) {
@@ -5721,7 +5729,8 @@ void Client::ExecuteTask(const ClientTask& client_task) {
                 auto move_result =
                     Move(payload.key, payload.tenant_id, payload.source,
                          payload.target, &assignment.id,
-                         assignment.type == TaskType::DRAIN_MOVE);
+                         assignment.type == TaskType::DRAIN_MOVE,
+                         &drain_start_rpc_failed);
                 if (move_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
@@ -5744,23 +5753,48 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         result = ErrorCode::INTERNAL_ERROR;
     }
 
+    constexpr auto kTaskRpcRetryDelay = std::chrono::milliseconds(250);
+    auto should_retry_rpc = [&](ErrorCode error) {
+        return task_running_.load() &&
+               (IsRpcTransportError(error) ||
+                error == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    };
     auto report_completion = [&](const TaskCompleteRequest& request) {
         for (;;) {
             auto completion = master_client_.MarkTaskToComplete(request);
-            if (completion) {
-                return;
+            if (completion ||
+                (drain_start_rpc_failed &&
+                 completion.error() == ErrorCode::TASK_NOT_FOUND)) {
+                break;
             }
             LOG(WARNING) << "action=task_complete_failed"
                          << ", task_id=" << assignment.id
                          << ", error_code=" << completion.error();
-            if (!task_running_.load() ||
-                (completion.error() != ErrorCode::RPC_FAIL &&
-                 completion.error() != ErrorCode::RPC_TIMEOUT &&
-                 completion.error() !=
-                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS)) {
+            if (!should_retry_rpc(completion.error())) {
                 return;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            std::this_thread::sleep_for(kTaskRpcRetryDelay);
+        }
+
+        if (!drain_start_rpc_failed) {
+            return;
+        }
+        // Start may have protected a target before its response was lost.
+        // The worker never submitted a write. Settling the task first fences
+        // a delayed Start so it cannot leave a new reservation after release.
+        for (;;) {
+            auto release = master_client_.FinishDrainMove(
+                assignment.id, /*commit=*/false, /*writes_drained=*/true);
+            if (release || release.error() == ErrorCode::TASK_NOT_FOUND) {
+                return;
+            }
+            LOG(WARNING) << "action=drain_target_release_failed"
+                         << ", task_id=" << assignment.id
+                         << ", error_code=" << release.error();
+            if (!should_retry_rpc(release.error())) {
+                return;
+            }
+            std::this_thread::sleep_for(kTaskRpcRetryDelay);
         }
     };
 
