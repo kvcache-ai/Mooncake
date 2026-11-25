@@ -1018,7 +1018,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
     bool enable_embedded_master, bool enable_ssd_prefetch,
-    int64_t ssd_prefetch_cooldown_sec, int64_t ssd_prefetch_dedup_ttl_sec) {
+    int64_t ssd_prefetch_cooldown_sec, int64_t ssd_prefetch_dedup_ttl_sec,
+    const std::string &metadata_cluster_id) {
     return setup_internal(
         EgmStorePoolConfig{}, local_hostname, metadata_server,
         global_segment_size, local_buffer_size, protocol, rdma_devices,
@@ -1026,7 +1027,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         enable_ssd_offload, start_offload_rpc_server, ssd_offload_path,
         tenant_id, enable_client_http_server, client_http_port,
         enable_embedded_master, enable_ssd_prefetch, ssd_prefetch_cooldown_sec,
-        ssd_prefetch_dedup_ttl_sec);
+        ssd_prefetch_dedup_ttl_sec, metadata_cluster_id);
 }
 
 tl::expected<void, ErrorCode> RealClient::setup_internal(
@@ -1040,7 +1041,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
     bool enable_embedded_master, bool enable_ssd_prefetch,
-    int64_t ssd_prefetch_cooldown_sec, int64_t ssd_prefetch_dedup_ttl_sec) {
+    int64_t ssd_prefetch_cooldown_sec, int64_t ssd_prefetch_dedup_ttl_sec,
+    const std::string &metadata_cluster_id) {
     // Re-entry guard (mirrors initAll_internal): a second setup would
     // overwrite client_ and skip the first instance's ordered cleanup.
     if (client_) {
@@ -1159,7 +1161,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, resolved_metadata_server, protocol,
             device_name, resolved_master_server_addr, transfer_engine,
-            {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
+            {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator,
+            metadata_cluster_id);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1190,7 +1193,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, resolved_metadata_server, protocol,
                 device_name, resolved_master_server_addr, transfer_engine,
-                {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
+                {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator,
+                metadata_cluster_id);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -1822,6 +1826,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 
     // Extract optional parameters with defaults
+    const std::string metadata_cluster_id =
+        get_config(config, CONFIG_KEY_METADATA_CLUSTER_ID);
     auto global_segment_size_opt = get_config_size(
         config, CONFIG_KEY_GLOBAL_SEGMENT_SIZE, DEFAULT_GLOBAL_SEGMENT_SIZE);
     if (!global_segment_size_opt.has_value()) {
@@ -1910,7 +1916,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             ssd_offload_path, tenant_id, enable_client_http_server,
             client_http_port, enable_embedded_master, enable_ssd_prefetch,
             static_cast<int64_t>(*prefetch_cooldown_opt),
-            static_cast<int64_t>(*prefetch_dedup_ttl_opt));
+            static_cast<int64_t>(*prefetch_dedup_ttl_opt), metadata_cluster_id);
         if (!result && egm_config->enabled) {
             (void)tearDownAll_internal();
         }

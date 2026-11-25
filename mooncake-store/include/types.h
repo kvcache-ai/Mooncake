@@ -231,6 +231,7 @@ using ConfigDict = std::unordered_map<std::string, std::string>;
 // Store client configuration keys
 constexpr const char* CONFIG_KEY_LOCAL_HOSTNAME = "local_hostname";
 constexpr const char* CONFIG_KEY_METADATA_SERVER = "metadata_server";
+constexpr const char* CONFIG_KEY_METADATA_CLUSTER_ID = "metadata_cluster_id";
 constexpr const char* CONFIG_KEY_GLOBAL_SEGMENT_SIZE = "global_segment_size";
 constexpr const char* CONFIG_KEY_LOCAL_BUFFER_SIZE = "local_buffer_size";
 constexpr const char* CONFIG_KEY_PROTOCOL = "protocol";

@@ -973,8 +973,8 @@ void Client::EnsureStorageControlPlaneStarted() {
 
 ErrorCode Client::InitTransferEngine(
     const std::string& local_hostname, const std::string& metadata_connstring,
-    const std::string& protocol,
-    const std::optional<std::string>& device_names) {
+    const std::string& protocol, const std::optional<std::string>& device_names,
+    const std::string& metadata_cluster_id) {
     // TEs created through the Store entry (Client::Create ->
     // InitTransferEngine) are tagged so ascend_direct can resolve a per-role
     // link config (e.g. Store=RoCE/D2H, P2P=HCCS/D2D). The flag only needs to
@@ -1036,8 +1036,9 @@ ErrorCode Client::InitTransferEngine(
         }
     }
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
+    // Keep the protocol already selected by setAutoDiscover().
     int rc = transfer_engine_->init(metadata_connstring, local_hostname,
-                                    hostname, port);
+                                    hostname, port, "", metadata_cluster_id);
     if (rc != 0) {
         LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
         return ErrorCode::INTERNAL_ERROR;
@@ -1247,7 +1248,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& master_server_entry,
     const std::shared_ptr<TransferEngine>& transfer_engine,
     std::map<std::string, std::string> labels, const std::string& tenant_id,
-    std::shared_ptr<NVMeoFInitiator> nof_initiator) {
+    std::shared_ptr<NVMeoFInitiator> nof_initiator,
+    const std::string& metadata_cluster_id) {
     // Reused engines retain their metadata mode. In particular, P2PHANDSHAKE
     // must publish the engine's actual endpoint rather than the Store hostname.
     const auto& resolved_metadata =
@@ -1351,7 +1353,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     if (transfer_engine == nullptr) {
         client->transfer_engine_ = std::make_shared<TransferEngine>();
         err = client->InitTransferEngine(local_hostname, metadata_connstring,
-                                         protocol, device_names);
+                                         protocol, device_names,
+                                         metadata_cluster_id);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to initialize transfer engine";
             return std::nullopt;

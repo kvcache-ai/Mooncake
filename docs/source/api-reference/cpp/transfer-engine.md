@@ -452,6 +452,19 @@ The general form is `[proto]://[hostname:port]`. For example, the following meta
 - `ip_or_host_name`: Optional explicit bind address or hostname for the RPC service.
 - `rpc_port`: Optional explicit RPC port.
 
+With centralized metadata, a classic engine can override `MC_METADATA_CLUSTER_ID`
+for the lifetime of the instance. Pass an empty protocol to keep automatic
+transport selection. An empty ID preserves the environment fallback.
+Classic P2P handshakes ignore the ID. TENT currently rejects a nonempty ID
+with `ERR_NOT_IMPLEMENTED`.
+
+```cpp
+int init(const std::string &metadata_conn_string,
+         const std::string &local_server_name,
+         const std::string &ip_or_host_name, uint64_t rpc_port,
+         const std::string &protocol, const std::string &metadata_cluster_id = "");
+```
+
 ```cpp
   ~TransferEngine();
 ```

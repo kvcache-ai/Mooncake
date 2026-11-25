@@ -174,7 +174,9 @@ TEST_P(ReusedTransferEngineTest, PreservesMetadataModeWithoutConnectionString) {
         /*tenant_id=*/"default",
         /*enable_client_http_server=*/false,
         /*client_http_port=*/DEFAULT_CLIENT_HTTP_PORT,
-        /*enable_embedded_master=*/false);
+        /*enable_embedded_master=*/false, /*enable_ssd_prefetch=*/false,
+        DEFAULT_SSD_PREFETCH_COOLDOWN_SEC, DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC,
+        /*metadata_cluster_id=*/"unused");
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(transfer_engine->getLocalIpAndPort(), endpoint);
     EXPECT_EQ(transfer_engine->getRpcPort(), rpc_port);

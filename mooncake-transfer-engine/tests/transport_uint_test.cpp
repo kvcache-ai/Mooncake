@@ -226,6 +226,15 @@ class ScopedUnsetEnvVar {
     std::optional<std::string> old_value_;
 };
 
+TEST(TransferEngineTentCompatibilityTest, RejectsExplicitMetadataClusterId) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    TransferEngine engine;
+    ASSERT_TRUE(engine.isUsingTent());
+    EXPECT_EQ(engine.init("http://127.0.0.1/metadata", "local", "", 0, "tcp",
+                          "cluster"),
+              ERR_NOT_IMPLEMENTED);
+}
+
 TEST(TransferEngineTentCompatibilityTest,
      ConstructorDeviceFilterIsForwardedToTentConfig) {
     ScopedEnvVar use_tent("MC_USE_TENT", "1");
