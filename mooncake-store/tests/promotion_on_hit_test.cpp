@@ -271,7 +271,7 @@ class PromotionOnHitTest : public ::testing::Test {
 // Sanity: with promotion disabled, no path mutates promotion_objects.
 TEST_F(PromotionOnHitTest, DefaultOffNoPromotion) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = false;  // explicitly off
     config.default_kv_lease_ttl = 2000;
     auto service = std::make_unique<MasterService>(config);
@@ -299,7 +299,7 @@ TEST_F(PromotionOnHitTest, DefaultOffNoPromotion) {
 // should fire (the trigger gate any_local_disk is false).
 TEST_F(PromotionOnHitTest, NoLocalDiskNoPromotion) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;  // promote on first touch
     config.default_kv_lease_ttl = 2000;
@@ -327,7 +327,7 @@ TEST_F(PromotionOnHitTest, NoLocalDiskNoPromotion) {
 // promote (any_memory=true → trigger gate fails).
 TEST_F(PromotionOnHitTest, MemoryReplicaPresentNoPromotion) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;  // first-touch
     config.default_kv_lease_ttl = 2000;
@@ -357,7 +357,7 @@ TEST_F(PromotionOnHitTest, MemoryReplicaPresentNoPromotion) {
 
 TEST_F(PromotionOnHitTest, BatchGetReplicaListPromotesLocalDiskOnlyObject) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.promotion_max_per_heartbeat = 2;
@@ -411,7 +411,7 @@ TEST_F(PromotionOnHitTest, BatchGetReplicaListPromotesLocalDiskOnlyObject) {
 TEST_F(PromotionOnHitTest,
        BatchGetReplicaListForAdminDoesNotPromoteLocalDiskOnlyObject) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.promotion_max_per_heartbeat = 2;
@@ -454,7 +454,7 @@ TEST_F(PromotionOnHitTest,
 TEST_F(PromotionOnHitTest,
        BatchGetReplicaListForAdminDoesNotUpdateCacheHitMetrics) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.default_kv_lease_ttl = 2000;
     auto service = std::make_unique<MasterService>(config);
 
@@ -493,7 +493,7 @@ TEST_F(PromotionOnHitTest,
 // LocalDisk mailbox is consulted.
 TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     auto service = std::make_unique<MasterService>(config);
 
@@ -506,7 +506,7 @@ TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {
 // An unknown Client is rejected before object metadata is consulted.
 TEST_F(PromotionOnHitTest, AllocStartUnknownKey) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     auto service = std::make_unique<MasterService>(config);
 
@@ -518,7 +518,7 @@ TEST_F(PromotionOnHitTest, AllocStartUnknownKey) {
 
 TEST_F(PromotionOnHitTest, InvalidPrimaryEndCannotCompletePromotionReplica) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     auto service = std::make_unique<MasterService>(config);
@@ -586,7 +586,7 @@ TEST_F(PromotionOnHitTest, InvalidPrimaryEndCannotCompletePromotionReplica) {
 
 TEST_F(PromotionOnHitTest, PrimaryWriteBlocksPromotionAdmission) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     auto service = std::make_unique<MasterService>(config);
@@ -616,7 +616,7 @@ TEST_F(PromotionOnHitTest, PrimaryWriteBlocksPromotionAdmission) {
 
 TEST_F(PromotionOnHitTest, StalePromotionReplicaCleanupErasesTask) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     auto service = std::make_unique<MasterService>(config);
@@ -692,7 +692,7 @@ TEST_F(PromotionOnHitTest, StalePromotionReplicaCleanupErasesTask) {
 // An unknown Client is rejected before promotion metadata is consulted.
 TEST_F(PromotionOnHitTest, NotifyUnknownKey) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     auto service = std::make_unique<MasterService>(config);
 
@@ -710,7 +710,7 @@ TEST_F(PromotionOnHitTest, NotifyUnknownKey) {
 // double-queue.
 TEST_F(PromotionOnHitTest, RacingReadersDedup) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;  // first-touch fires the gate
     config.default_kv_lease_ttl = 2000;
@@ -758,7 +758,7 @@ TEST_F(PromotionOnHitTest, RacingReadersDedup) {
 //       the same key for retry.
 TEST_F(PromotionOnHitTest, StalePromotionReaper) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 2000;
@@ -832,7 +832,7 @@ TEST_F(PromotionOnHitTest, StalePromotionReaper) {
 // missing entry.
 TEST_F(PromotionOnHitTest, RemoveDuringPromotion) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 100;  // short lease: Remove won't block
@@ -902,7 +902,7 @@ TEST_F(PromotionOnHitTest, RemoveDuringPromotion) {
 // host boundary cleanly.
 TEST_F(PromotionOnHitTest, MultiSegmentAllocPicksAvailableSegment) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 2000;
@@ -957,7 +957,7 @@ TEST_F(PromotionOnHitTest, MultiSegmentAllocPicksAvailableSegment) {
 // PromotionAllocStart respects them for clients biasing toward locality.
 TEST_F(PromotionOnHitTest, MultiSegmentAllocRespectsPreferred) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     auto service = std::make_unique<MasterService>(config);
@@ -999,7 +999,7 @@ TEST_F(PromotionOnHitTest, MultiSegmentAllocRespectsPreferred) {
 // succeed; just no new task is enqueued).
 TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.promotion_queue_limit = 1;  // any 1 task saturates the cap
@@ -1055,7 +1055,7 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
 // silently discarded leftovers.
 TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 2000;
@@ -1133,7 +1133,7 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
 // NotifyPromotionSuccess on a reaped task must also fail cleanly.
 TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.enable_multi_tenants = true;
     config.tenant_quota_connector_type = "file";
     config.tenant_quota_connector_uri =
@@ -1256,7 +1256,7 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
 // replicas from the response.
 TEST_F(PromotionOnHitTest, AllocStartResetsTaskDeadline) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 8000;
@@ -1339,7 +1339,7 @@ TEST_F(PromotionOnHitTest, AllocStartResetsTaskDeadline) {
 // NotifyPromotionSuccess in the suite.
 TEST_F(PromotionOnHitTest, NotifySuccessDecrementsCounter) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.promotion_queue_limit = 1;  // 1 in-flight task globally
@@ -1398,7 +1398,7 @@ TEST_F(PromotionOnHitTest, NotifySuccessDecrementsCounter) {
 TEST_F(PromotionOnHitTest, TenantQuotaChargesAtAllocStartAndSettlesLifecycle) {
     const TenantId tenant_id("tenant-a");
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.enable_multi_tenants = true;
     config.tenant_quota_connector_type = "file";
     config.tenant_quota_connector_uri =
@@ -1450,7 +1450,7 @@ TEST_F(PromotionOnHitTest, TenantQuotaChargesAtAllocStartAndSettlesLifecycle) {
 TEST_F(PromotionOnHitTest, UpsertStartRejectsActivePromotionTask) {
     const TenantId tenant_id("tenant-a");
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.enable_multi_tenants = true;
     config.tenant_quota_connector_type = "file";
     config.tenant_quota_connector_uri =
@@ -1500,7 +1500,7 @@ TEST_F(PromotionOnHitTest, UpsertStartRejectsActivePromotionTask) {
 // leaks until the object is removed or evicted.
 TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 2000;
@@ -1563,7 +1563,7 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
 // data to readers.
 TEST_F(PromotionOnHitTest, NotifyRejectsNonHolder) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 2000;
@@ -1642,7 +1642,7 @@ TEST_F(PromotionOnHitTest, NotifyRejectsNonHolder) {
 // would produce.
 TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.promotion_queue_limit = 1;  // cap=1 makes the slot observable
@@ -1756,7 +1756,7 @@ TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
 // way: candidate consumed, key re-queued for the holder.
 TEST_F(PromotionOnHitTest, NotifyFailureRecordsCandidateAndRetries) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 5000;
@@ -1816,7 +1816,7 @@ TEST_F(PromotionOnHitTest, NotifyFailureRecordsCandidateAndRetries) {
 // re-admits with a fresh count.
 TEST_F(PromotionOnHitTest, NotifyFailureGivesUpAfterMaxExecutionFailures) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 5000;
@@ -1909,7 +1909,7 @@ TEST_F(PromotionOnHitTest, NotifyFailureGivesUpAfterMaxExecutionFailures) {
 // Notify-Success path.
 TEST_F(PromotionOnHitTest, NotifyFailureRejectsNonHolder) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 5000;
@@ -1961,7 +1961,7 @@ TEST_F(PromotionOnHitTest, NotifyFailureRejectsNonHolder) {
 // — they'd just sit pinned until reaper TTL.
 TEST_F(PromotionOnHitTest, AllocStartRejectsNonHolder) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 5000;
@@ -2018,7 +2018,7 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsNonHolder) {
 // wasted DRAM pinned until reaper TTL).
 TEST_F(PromotionOnHitTest, AllocStartRejectsSizeMismatch) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 5000;
@@ -2084,7 +2084,7 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsSizeMismatch) {
 // client.
 TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.promotion_queue_limit = 1;  // cap=1 makes the slot observable
@@ -2184,7 +2184,7 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
 // embedded users). Verify the clamp lifts 0 → 1.
 TEST_F(PromotionOnHitTest, AdmissionThresholdZeroClampsToOne) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 0;  // would bypass the gate
     auto service = std::make_unique<MasterService>(config);
@@ -2200,7 +2200,7 @@ TEST_F(PromotionOnHitTest, AdmissionThresholdZeroClampsToOne) {
 // clamps high too.
 TEST_F(PromotionOnHitTest, AdmissionThresholdAboveMaxClampsToMax) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1000;  // > 255
     auto service = std::make_unique<MasterService>(config);
@@ -2217,7 +2217,7 @@ TEST_F(PromotionOnHitTest, AdmissionThresholdAboveMaxClampsToMax) {
 // succeeds if the slot was freed.
 TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.promotion_queue_limit = 1;  // makes the slot observable
@@ -2275,7 +2275,7 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
 // exercises the regex path, which walks the namespaces.
 TEST_F(PromotionOnHitTest, RemoveByRegexErasesPromotionTask) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.promotion_queue_limit = 1;
@@ -2325,7 +2325,7 @@ TEST_F(PromotionOnHitTest, RemoveByRegexErasesPromotionTask) {
 // MasterService::RemoveAll, which walks every namespace.
 TEST_F(PromotionOnHitTest, RemoveAllErasesPromotionTask) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.promotion_queue_limit = 1;
@@ -2378,7 +2378,7 @@ TEST_F(PromotionOnHitTest, RemoveAllErasesPromotionTask) {
 // PromotionTask must drop the task entry while its holder remains Active.
 TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.promotion_queue_limit = 1;
@@ -2434,7 +2434,7 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
 // drop the task entry after its holder becomes Offline.
 TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.promotion_queue_limit = 1;
@@ -2501,7 +2501,7 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
 // in_flight back to 0.
 TEST_F(PromotionOnHitTest, MetricsFunnelTracksSuccessfulPromotion) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 2000;
@@ -2546,7 +2546,7 @@ TEST_F(PromotionOnHitTest, MetricsFunnelTracksSuccessfulPromotion) {
 // own counter when its branch fires.
 TEST_F(PromotionOnHitTest, MetricsRejectionCountersIncrementOnGateMiss) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     // Threshold > 1 so the first Get is rejected on frequency.
     config.promotion_admission_threshold = 2;
@@ -2597,7 +2597,7 @@ TEST_F(PromotionOnHitTest, MetricsRejectionCountersIncrementOnGateMiss) {
     // usage trips it. threshold = 1 makes the first Get clear the
     // frequency gate and reach the watermark check.
     MasterServiceConfig wm_config;
-    wm_config.enable_offload = true;
+    wm_config.offload_config.enable_offload = true;
     wm_config.promotion_on_hit = true;
     wm_config.promotion_admission_threshold = 1;
     wm_config.promotion_queue_limit = 50;
@@ -2622,7 +2622,7 @@ TEST_F(PromotionOnHitTest, MetricsRejectionCountersIncrementOnGateMiss) {
 
 TEST_F(PromotionOnHitTest, WatermarkUsesAllocatorStateAfterMetricsReset) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.eviction_high_watermark_ratio = 0.5;
@@ -2666,7 +2666,7 @@ TEST_F(PromotionOnHitTest, WatermarkUsesAllocatorStateAfterMetricsReset) {
 
 TEST_F(PromotionOnHitTest, AdmissionFrequencyIsTenantScoped) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.enable_multi_tenants = true;
     config.tenant_quota_connector_type = "file";
     config.promotion_on_hit = true;
@@ -2721,7 +2721,7 @@ TEST_F(PromotionOnHitTest, AdmissionFrequencyIsTenantScoped) {
 // verify the master returns up to 3 tasks per heartbeat.
 TEST_F(PromotionOnHitTest, MaxPerHeartbeatKnobControlsBatchSize) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.promotion_max_per_heartbeat = 3;  // raise from default 1
@@ -2765,7 +2765,7 @@ TEST_F(PromotionOnHitTest, MaxPerHeartbeatKnobControlsBatchSize) {
 // delivery.
 TEST_F(PromotionOnHitTest, MaxPerHeartbeatZeroClampsToOne) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.promotion_max_per_heartbeat = 0;  // pathological
@@ -2797,7 +2797,7 @@ TEST_F(PromotionOnHitTest, MaxPerHeartbeatZeroClampsToOne) {
 // holds. Exercises the EraseMetadataEntry path.
 TEST_F(PromotionOnHitTest, MetricsRemoveMidPromotionCountsAsCancelled) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 2000;
@@ -2836,7 +2836,7 @@ TEST_F(PromotionOnHitTest, MetricsRemoveMidPromotionCountsAsCancelled) {
 // can later see and process it.
 TEST_F(PromotionOnHitTest, RetryCandidate_WatermarkRejectionRecordsCandidate) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 2000;
@@ -2883,7 +2883,7 @@ TEST_F(PromotionOnHitTest, RetryCandidate_WatermarkRejectionRecordsCandidate) {
 // active slot is released and the retry scanner reaches it.
 TEST_F(PromotionOnHitTest, RetryCandidate_CapRejectedThenQueuedOnRetry) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 2000;
@@ -2954,7 +2954,7 @@ TEST_F(PromotionOnHitTest, RetryCandidate_CapRejectedThenQueuedOnRetry) {
 TEST_F(PromotionOnHitTest,
        RetryCandidate_NoCandidatesOrTransientRejectionQueuesNothing) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 2000;
@@ -2988,7 +2988,7 @@ TEST_F(PromotionOnHitTest,
 // Candidate is cleaned up after kPromotionCandidateMaxRetries scans.
 TEST_F(PromotionOnHitTest, RetryCandidate_ExhaustedAfterMaxRetries) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 2000;
@@ -3036,7 +3036,7 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ExhaustedAfterMaxRetries) {
 // cleans up the candidate without promoting.
 TEST_F(PromotionOnHitTest, RetryCandidate_ObjectRemovedMidRetry) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 2000;
@@ -3079,7 +3079,7 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ObjectRemovedMidRetry) {
 // Records multiple candidates and verifies per-key tracking is correct.
 TEST_F(PromotionOnHitTest, RetryCandidate_MultipleKeysTracked) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 2000;

@@ -1960,12 +1960,6 @@ class MasterService {
     // if high availability features enabled
     const bool enable_ha_;
 
-    const bool enable_offload_;
-
-    // Offload-on-evict: defer disk offload to eviction time
-    // (config: offload_on_evict)
-    bool offload_on_evict_{false};
-
     // Promotion-on-hit: opt-in flag enabling LOCAL_DISK -> MEMORY promotion
     // when a Get observes a key with only LOCAL_DISK replicas.
     bool promotion_on_hit_{false};
@@ -2082,7 +2076,8 @@ class MasterService {
     // a different frozen bucket.
     std::mutex dfs_bucket_recovery_mutex_;
 
-    // Segment management
+    // Segment & LocalSSD management
+    const OffloadConfig offload_config_;
     SegmentManager segment_manager_;
     LocalSsdManager local_ssd_manager_;
     NoFSegmentManager nof_segment_manager_;
@@ -2148,7 +2143,6 @@ class MasterService {
     std::mutex discarded_replicas_mutex_;
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
-    size_t offloading_queue_limit_ = 50000;
 
     // Task manager
     ClientTaskManager task_manager_;

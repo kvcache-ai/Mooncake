@@ -837,7 +837,7 @@ static std::string PutKeyAndOffload(MasterService& svc, const UUID& client_id,
 TEST_F(MasterMetricsTest, LocalDiskReplicaAllocatedSize) {
     auto& metrics = MasterMetricManager::instance();
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     MasterService svc(config);
 
     constexpr size_t kBuf = 0x400000000;
@@ -873,7 +873,7 @@ TEST_F(MasterMetricsTest, LocalDiskReplicaAllocatedSize) {
 TEST_F(MasterMetricsTest, LocalDiskSegmentCapacityHeartbeat) {
     auto& metrics = MasterMetricManager::instance();
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     MasterService svc(config);
 
     constexpr size_t kBuf = 0x500000000;

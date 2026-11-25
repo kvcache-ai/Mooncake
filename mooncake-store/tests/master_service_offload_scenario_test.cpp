@@ -10,20 +10,20 @@ namespace {
 
 MasterServiceConfig OffloadConfig(uint64_t lease_ttl_ms = 2000) {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.default_kv_lease_ttl = lease_ttl_ms;
     return config;
 }
 
 MasterServiceConfig OffloadOnEvictConfig() {
     MasterServiceConfig config = OffloadConfig();
-    config.offload_on_evict = true;
+    config.offload_config.offload_on_evict = true;
     return config;
 }
 
 MasterServiceConfig OffloadForceEvictConfig() {
     MasterServiceConfig config = OffloadOnEvictConfig();
-    config.offload_force_evict = true;
+    config.offload_config.offload_force_evict = true;
     return config;
 }
 
@@ -48,7 +48,7 @@ MasterServiceConfig PressureOffloadConfig() {
 
 MasterServiceConfig PressureOffloadOnEvictConfig() {
     MasterServiceConfig config = PressureOffloadConfig();
-    config.offload_on_evict = true;
+    config.offload_config.offload_on_evict = true;
     return config;
 }
 
@@ -138,7 +138,8 @@ TEST(MasterServiceOffloadScenarioTest,
 
 TEST(MasterServiceOffloadScenarioTest, ForceEvictAloneKeepsDefaultQueueing) {
     MasterServiceConfig config = OffloadConfig();
-    config.offload_force_evict = true;  // on_evict is false, so it is ignored
+    config.offload_config.offload_force_evict =
+        true;  // on_evict is false, so it is ignored
     MasterScenario("offload_force_evict alone behaves like the default mode",
                    config)
         .Given(MemoryNode("node"))
@@ -523,7 +524,8 @@ TEST(MasterServiceOffloadScenarioTest,
         return "combo_d_" + std::to_string(index);
     };
     MasterServiceConfig config = PressureOffloadConfig();
-    config.offload_force_evict = true;  // on_evict is false, so it is ignored
+    config.offload_config.offload_force_evict =
+        true;  // on_evict is false, so it is ignored
     MasterScenario scenario(
         "offload_force_evict alone leaves pressure eviction unchanged", config);
     scenario.Given(MemoryNode("node").Capacity(16 * 1024 * 1024))
@@ -599,7 +601,7 @@ TEST(MasterServiceOffloadScenarioTest,
         return "combo_c_" + std::to_string(index);
     };
     MasterServiceConfig config = PressureOffloadOnEvictConfig();
-    config.offload_force_evict = true;
+    config.offload_config.offload_force_evict = true;
     MasterScenario scenario(
         "offload_force_evict reclaims memory when the queue push fails",
         config);
