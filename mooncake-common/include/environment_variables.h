@@ -14,6 +14,10 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_FILE_STORAGE_PATH);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES);
+    // Opt-in HugeTLB backing of the staging buffer above (1/0, true/false,
+    // yes/no, on/off). Kept as a string so an invalid value can be warned
+    // about.
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE);
     MC_DEFINE_ENV_VAR(int64_t, MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT);

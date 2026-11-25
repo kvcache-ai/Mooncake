@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <limits>
 #include <locale>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -60,6 +61,20 @@ bool ParseStrictBoolOr(const std::string& raw_value, bool default_value) {
         .value_or(default_value);
 }
 
+// MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE is off when unset; an unparsable value
+// is ignored with a warning, like MC_STORE_MADV_HUGEPAGE.
+bool ParseStagingUseHugepage(const std::string& value) {
+    if (value.empty()) return false;
+    const std::optional<bool> parsed = TryParseBool(value);
+    if (!parsed.has_value()) {
+        LOG(WARNING)
+            << "Ignoring invalid MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE='"
+            << value << "'; accepted values: 1/0, true/false, yes/no, on/off";
+        return false;
+    }
+    return *parsed;
+}
+
 }  // namespace
 
 FileStorageConfig FileStorageConfig::FromEnvironment() {
@@ -98,6 +113,8 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     if (globalConfig().ascend_use_fabric_mem) {
         config.local_buffer_size = AlignUpToOneGiB(config.local_buffer_size);
     }
+    config.staging_use_hugepage = ParseStagingUseHugepage(Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE, std::string{}));
 
     config.pinned_restore_arena_size =
         Environ::ReadOr(Variables::MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES,

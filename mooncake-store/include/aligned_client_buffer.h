@@ -43,6 +43,13 @@ class AlignedClientBufferAllocator : public ClientBufferAllocator {
     [[nodiscard]] size_t get_total_size() const { return size(); }
 
     /**
+     * Whether create() takes memory for this protocol from the protocol's own
+     * allocator (ascend, ubshmem, sunrise_link), which ignores use_hugepage.
+     */
+    [[nodiscard]] static bool uses_protocol_allocator(
+        const std::string& protocol);
+
+    /**
      * Destructor - properly frees the aligned memory
      */
     ~AlignedClientBufferAllocator();

@@ -10,6 +10,8 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -19,6 +21,7 @@
 #include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
 #include "common/client_buffer_allocation.h"
+#include "config/hugepage_config.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_URING
 #include "file_interface.h"
@@ -88,6 +91,81 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     return tasks;
 }
 
+// Allocates the staging buffer. MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE moves it
+// onto the MC_STORE_USE_HUGEPAGE HugeTLB path (MC_STORE_HUGEPAGE_SIZE pages):
+// the buffer is registered with the NIC, and NICs that budget
+// memory-registration translations per 4 KiB page (e.g. ionic) cannot
+// register a multi-GiB base-page buffer. As for the HugeTLB global segment,
+// an explicit request never falls back to base pages. When the switch is
+// ignored, the allocation is the same as without it.
+std::shared_ptr<AlignedClientBufferAllocator> CreateStagingBufferAllocator(
+    const FileStorageConfig& config, const std::string& protocol) {
+    bool use_hugepage = config.staging_use_hugepage;
+    if (use_hugepage && !HugepageConfig::IsEnabledFromEnvironment()) {
+        LOG(WARNING) << "Ignoring MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE: "
+                        "MC_STORE_USE_HUGEPAGE is not set, so the SSD offload "
+                        "staging buffer keeps base pages";
+        use_hugepage = false;
+    }
+    if (use_hugepage &&
+        AlignedClientBufferAllocator::uses_protocol_allocator(protocol)) {
+        LOG(WARNING) << "Ignoring MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE: "
+                        "protocol "
+                     << protocol << " allocates the staging buffer itself";
+        use_hugepage = false;
+    }
+    if (!use_hugepage) {
+        return AlignedClientBufferAllocator::create(config.local_buffer_size,
+                                                    protocol);
+    }
+    if (config.local_buffer_size <= 0) {
+        const std::string message =
+            "Invalid MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=" +
+            std::to_string(config.local_buffer_size) +
+            ": the HugeTLB staging buffer "
+            "(MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE) needs a positive size";
+        LOG(ERROR) << message;
+        throw std::invalid_argument(message);
+    }
+
+    const size_t usable = static_cast<size_t>(config.local_buffer_size);
+    const size_t page_size = get_hugepage_size_from_env();
+    const size_t mapped = align_up(usable, page_size);
+    const size_t pages = mapped / page_size;
+    auto allocator = AlignedClientBufferAllocator::create(
+        usable, protocol, /*use_hugepage=*/true);
+    if (!allocator) {
+        const std::string message =
+            "Failed to allocate the " + std::to_string(usable) +
+            "-byte SSD offload staging buffer from HugeTLB pages "
+            "(MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE): it needs " +
+            std::to_string(pages) +
+            " free pages in /sys/kernel/mm/hugepages/hugepages-" +
+            std::to_string(page_size / 1024) +
+            "kB. Reserve them or unset MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE";
+        LOG(ERROR) << message;
+        throw std::runtime_error(message);
+    }
+    if (is_mmap_arena_allocation(allocator->getBase())) {
+        // The arena pool is a HugeTLB mapping of the same page size, and the
+        // buffer takes only its own bytes from it.
+        LOG(INFO) << "SSD offload staging buffer: " << usable
+                  << " bytes from the mmap arena's " << page_size / 1024
+                  << " kB HugeTLB pool";
+        return allocator;
+    }
+    LOG(INFO) << "SSD offload staging buffer: " << mapped << " bytes mapped in "
+              << pages << " HugeTLB pages of " << page_size / 1024 << " kB";
+    if (mapped != usable) {
+        LOG(WARNING) << "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=" << usable
+                     << " is not a multiple of the " << page_size / 1024
+                     << " kB hugepage size: the staging buffer maps " << mapped
+                     << " bytes, " << usable << " of them usable and "
+                     << mapped - usable << " wasted";
+    }
+    return allocator;
+}
+
 }  // namespace
 
 FileStorage::DiskErrorAction FileStorage::ClassifyDiskErrno(int err) {
@@ -120,8 +198,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       ssd_metric_(ssd_metric),
       local_rpc_addr_(local_rpc_addr),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
-      client_buffer_allocator_(AlignedClientBufferAllocator::create(
-          config.local_buffer_size, client ? client->GetProtocol() : "")) {
+      client_buffer_allocator_(CreateStagingBufferAllocator(
+          config, client ? client->GetProtocol() : "")) {
     if (!config_.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }

@@ -322,6 +322,12 @@ struct FileStorageConfig {
     // Size of the local client-side buffer (used for caching or batching)
     int64_t local_buffer_size = 1280 * kMB;  // ~1.2 GB
 
+    // Allocate the buffer above from HugeTLB pages (MC_STORE_USE_HUGEPAGE /
+    // MC_STORE_HUGEPAGE_SIZE). It is registered with the NIC, and NICs that
+    // budget memory-registration translations per 4 KiB page cannot register
+    // a multi-GiB base-page buffer.
+    bool staging_use_hugepage = false;
+
     int64_t pinned_restore_arena_size = 0;
 
     // Limits for scanning and iteration operations

@@ -133,6 +133,7 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `/data/file_storage` | Absolute path to the SSD storage directory. `bucket_storage_backend` also accepts a comma-separated list of paths to spread offload across several disks — see {ref}`Multiple disks <ssd-offload-multiple-disks>` |
 | `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | Storage backend type (see below) |
 | `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | `1342177280` (1.25 GB) | Client-side staging buffer size |
+| `MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE` | unset (off) | Set `1` to allocate the staging buffer from HugeTLB pages. Requires `MC_STORE_USE_HUGEPAGE`; the page size is `MC_STORE_HUGEPAGE_SIZE`. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`). See below |
 | `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES` | `0` | Size of the additional preallocated pinned-host arena for same-process SSD-to-GPU restores and DFS ranged-session reads into device memory. See the constraints below |
 | `MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT` | `20000` | Max keys processed per iteration when scanning existing SSD metadata on startup |
 | `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | `2199023255552` (2 TB) | Maximum disk usage |
@@ -148,6 +149,14 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 The `MOONCAKE_OFFLOAD_*` watermark names are preferred. Short aliases `MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO` and `MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO` are also accepted. The high watermark must be greater than the low watermark.
 
 The pinned restore quota is separate from `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`; it does not convert the normal FileStorage arena to pinned memory. It is allocated only when `MC_STORE_MEMCPY=1`. The arena is selected when the current process owns the SSD replica and the restore destination is GPU memory, and is also used as request-scoped staging for DFS ranged-session reads into device memory. Tensor payload ranges are copied from their source offset without an additional FileStorage staging allocation. Remote and CPU-destination reads continue to use the existing path. If the pinned quota is exhausted, the request uses the normal client buffer arena; if the quota cannot be pinned at startup, the optimization remains disabled. io_uring disables the pinned restore arena. The file-per-key backend may still use its own temporary pageable buffer internally; the bucket and offset-allocator backends can read into the supplied restore buffer directly.
+
+The staging buffer is registered with the NIC so that remote readers can fetch SSD-loaded objects from it. By default it is backed by base pages, and some NICs (e.g. Pensando ionic) budget memory-registration translations per 4 KiB page: a multi-GiB staging buffer then fails to register or uses up the host-wide budget. Set `MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE=1` together with `MC_STORE_USE_HUGEPAGE=1` to allocate the staging buffer from HugeTLB pages of `MC_STORE_HUGEPAGE_SIZE`; with `MC_STORE_HUGEPAGE_SIZE=1GB`, an 8 GiB staging buffer needs 8 translations instead of about two million.
+
+- Reserve these pages in addition to those that `MC_STORE_USE_HUGEPAGE` already takes for the global segment and the client (local) buffer.
+- The mapping is rounded up to whole pages, so make `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` a multiple of the page size. The default (1.25 GiB) is a multiple of 2 MB pages but not of 512 MB or 1 GB pages: with 1 GB pages it maps 2 GiB. Startup logs a warning with the mapped, usable and wasted bytes when the size is not a multiple.
+- With the mmap arena enabled (`MC_MMAP_ARENA_POOL_SIZE`), the staging buffer is taken from the arena's HugeTLB pool when it fits, and is then released only when the process exits; otherwise it is mapped directly.
+- If the pages are not available, client setup fails with an error naming the page size and count; the staging buffer does not fall back to base pages.
+- Without `MC_STORE_USE_HUGEPAGE`, or with a protocol that allocates the staging buffer itself (`ascend`, `ubshmem`, `sunrise_link`), the switch is ignored with a warning. `MC_STORE_USE_HUGEPAGE` alone does not change the staging buffer.
 
 ### Bucket backend settings
 
