@@ -438,9 +438,7 @@ tl::expected<void, ErrorCode> MasterService::CommitObjectStorage(
                                            ? ErrorCode::OBJECT_NOT_FOUND
                                            : ErrorCode::INVALID_WRITE);
         auto& metadata = accessor.Get();
-        auto* replica =
-            metadata.GetReplicaByID(meta.object_storage_target->replica_id);
-        if (metadata.client_id != writer || !replica ||
+        if (metadata.client_id != writer ||
             !metadata.object_storage_write_attempt ||
             *metadata.object_storage_write_attempt !=
                 *meta.object_storage_target ||
@@ -448,10 +446,15 @@ tl::expected<void, ErrorCode> MasterService::CommitObjectStorage(
             return tl::make_unexpected(ErrorCode::INVALID_WRITE);
         if (accessor.GetState().object_storage_commit_pending)
             return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
-        // A committed memory-only replacement can outlive the object store
-        // configuration on the leader that receives its retry.
-        if (replica->is_completed()) return {};
-        if (!object_uploads_)
+        if (!accessor.InProcessing()) {
+            // The token identifies the committed write even after its first
+            // memory replica is unmounted or the new leader disables storage.
+            if (metadata.HasReplica(&Replica::fn_is_completed)) return {};
+            return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+        }
+        auto* replica =
+            metadata.GetReplicaByID(meta.object_storage_target->replica_id);
+        if (!object_uploads_ || !replica)
             return tl::make_unexpected(ErrorCode::INVALID_WRITE);
         // Reserve import admission before the durable commit. Abort/timeout may
         // close the group while the upload is in flight; publication must not
