@@ -2047,10 +2047,21 @@ void MasterService::ReleaseOffboardingTasksForClient(const UUID& client_id) {
                 }
                 if (state.promotion_task->alloc_id != 0) {
                     const ReplicaID alloc_id = state.promotion_task->alloc_id;
-                    EraseReplicasWithCacheTotalAccounting(
+                    auto popped = PopReplicasWithCacheTotalAccounting(
                         metadata, [alloc_id](const Replica& replica) {
                             return replica.id() == alloc_id;
                         });
+                    if (!popped.empty()) {
+                        // Defer freeing staged promotion DRAM buffers across
+                        // the writer release grace window so a partitioned
+                        // client's in-flight RDMA write cannot corrupt a
+                        // reallocated buffer.
+                        std::lock_guard lock(discarded_replicas_mutex_);
+                        discarded_replicas_.emplace_back(
+                            std::move(popped),
+                            std::chrono::system_clock::now() +
+                                put_start_release_timeout_sec_);
+                    }
                 }
                 state.promotion_task.reset();
                 promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
@@ -2666,7 +2677,10 @@ void MasterService::ClearInvalidHandlesLocked() {
 
 tl::expected<void, ErrorCode> MasterService::ClearLocalDiskHandlesOwnedBy(
     const UUID& owner) {
-    ReleaseOffboardingTasksForClient(owner);
+    // Do NOT run ReleaseOffboardingTasksForClient here: UnmountLocalDiskSegment
+    // is invoked by a live serving client whose heartbeat worker may still be
+    // reading offload source buffers or RDMA-writing into staged promotion
+    // alloc_ids, and ClearStaleHandles failure must retain the mount untouched.
     return ClearStaleHandles([&owner](const Replica& replica) {
         return replica.is_local_disk_replica() && replica.is_completed() &&
                replica.get_local_disk_client_id() == owner;
@@ -3395,6 +3409,16 @@ std::pair<TenantId, std::string> ResolveStandbyObject(
     return std::make_pair(std::move(tenant_id), std::move(user_key));
 }
 
+bool IsFencedStandbyLocalDisk(const StandbyObjectMetadata& standby_meta,
+                              std::string_view user_key,
+                              const LocalDiskDescriptor& local_disk_desc) {
+    const auto generation = standby_meta.object_generation.value_or("");
+    return !generation.empty() &&
+           local_disk_desc.object_generation.value_or("") == generation &&
+           local_disk_desc.storage_key.value_or("") ==
+               MakeOffloadStorageKey(user_key, generation);
+}
+
 }  // namespace
 
 struct MasterService::PreparedObject {
@@ -3443,6 +3467,7 @@ struct MasterService::LegacyRestoreContext {
         pending_ranges;
     std::unordered_map<size_t, std::unordered_set<size_t>> discarded_replicas;
     std::vector<PreparedObject> prepared;
+    size_t cold_skipped_count{0};
 };
 
 void MasterService::NoteLegacyStandbyRejection(LegacyRestoreContext& ctx,
@@ -3563,6 +3588,7 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
         }
         const auto discarded_it = ctx.discarded_replicas.find(owner);
         size_t reliable = 0;
+        bool has_unfenced_local_disk = false;
         for (size_t desc_idx = 0;
              desc_idx < accepted_entry.entry->metadata.replicas.size();
              ++desc_idx) {
@@ -3574,9 +3600,24 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
                  discarded_it->second.contains(desc_idx))) {
                 continue;
             }
+            if (desc.is_local_disk_replica() &&
+                !IsFencedStandbyLocalDisk(accepted_entry.entry->metadata,
+                                          accepted_entry.user_key,
+                                          desc.get_local_disk_descriptor())) {
+                has_unfenced_local_disk = true;
+                continue;
+            }
             ++reliable;
         }
         if (reliable == 0) {
+            if (has_unfenced_local_disk &&
+                discarded_it == ctx.discarded_replicas.end()) {
+                // Old unfenced disk-only metadata resumes cold (matching
+                // RestoreFromBatchOpLogPromotion) rather than failing failover.
+                ++ctx.cold_skipped_count;
+                accepted_entry.entry = nullptr;
+                continue;
+            }
             // Covers both overlap casualties and objects that arrived with
             // every replica already REMOVED/FAILED: an object with no
             // readable replica is dropped instead of lingering as
@@ -3678,6 +3719,12 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                                            disk_desc.object_size, desc.status));
             } else if (desc.is_local_disk_replica()) {
                 const auto& local_disk_desc = desc.get_local_disk_descriptor();
+                if (!IsFencedStandbyLocalDisk(standby_meta,
+                                              accepted_entry.user_key,
+                                              local_disk_desc)) {
+                    // Old unfenced disk metadata resumes cold.
+                    continue;
+                }
                 if (local_disk_desc.object_size != standby_meta.size) {
                     NoteLegacyStandbyRejection(ctx, entry,
                                                "invalid_local_disk_descriptor");
@@ -3689,6 +3736,11 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     local_disk_desc.object_size,
                     local_disk_desc.transport_endpoint, desc.status,
                     ctx.owners.FindOrCreate(local_disk_desc.client_id)));
+                replicas.back().update_local_disk_descriptor(
+                    local_disk_desc.object_size,
+                    local_disk_desc.transport_endpoint,
+                    local_disk_desc.storage_key.value_or(""),
+                    local_disk_desc.object_generation.value_or(""));
             } else if (desc.is_dfs_replica()) {
                 const auto& dfs_desc = desc.get_dfs_descriptor();
                 if (!use_kvcs_ || dfs_desc.object_size != standby_meta.size) {
@@ -3707,6 +3759,10 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
             }
         }
         if (!construction_ok) {
+            continue;
+        }
+        if (replicas.empty()) {
+            NoteLegacyStandbyRejection(ctx, entry, "no_surviving_replicas");
             continue;
         }
         for (const auto& [segment_name, bytes] : object_bytes) {
@@ -3729,7 +3785,8 @@ tl::expected<size_t, ErrorCode> MasterService::InstallLegacyStandbyObjects(
     // exception, since their state is present already. How partial
     // restores gate serving is N07/N08 scope (#3808), not this stop-gap.
     if (!ctx.objects.empty() && restored_count == 0 &&
-        ctx.already_existing_count < ctx.objects.size()) {
+        ctx.already_existing_count + ctx.cold_skipped_count <
+            ctx.objects.size()) {
         LOG(ERROR) << "RestoreFromStandbySnapshot: every standby object "
                    << "was rejected, objects=" << ctx.objects.size()
                    << ", rejected=" << ctx.rejected_count;
@@ -4262,14 +4319,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                 } else if (desc.is_local_disk_replica()) {
                     const auto& local_disk_desc =
                         desc.get_local_disk_descriptor();
-                    const auto generation =
-                        standby_meta.object_generation.value_or("");
-                    if (generation.empty() ||
-                        local_disk_desc.object_generation.value_or("") !=
-                            generation ||
-                        local_disk_desc.storage_key.value_or("") !=
-                            MakeOffloadStorageKey(user_key, generation))
+                    if (!IsFencedStandbyLocalDisk(standby_meta, user_key,
+                                                  local_disk_desc)) {
+                        dropped_stale_replica = true;
                         continue;  // Old unfenced disk metadata resumes cold.
+                    }
                     if (local_disk_desc.object_size != standby_meta.size) {
                         LOG(ERROR)
                             << "RestoreFromStandbySnapshot: invalid local disk "
@@ -5612,6 +5666,17 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         }
         if (accessor.IsPublished()) {
             auto& metadata = accessor.Get();
+            if (enable_oplog_ &&
+                metadata.HasReplica([](const Replica& replica) {
+                    return replica.status() == ReplicaStatus::REMOVED;
+                })) {
+                if (!ordered_oplog_writer_ ||
+                    !ordered_oplog_writer_->IsAccepting()) {
+                    return tl::make_unexpected(
+                        ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                }
+                return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+            }
             if (metadata.HasReplica(&Replica::fn_is_completed) ||
                 metadata.put_start_time + put_start_discard_timeout_sec_ >=
                     now) {
@@ -5756,7 +5821,8 @@ auto MasterService::PreparePutEnd(const UUID& client_id,
         }
         if (has_target_replica && all_target_replicas_complete) {
             if (!enable_oplog_) return uint64_t{0};
-            if (metadata.put_oplog_sequence.value_or(0) != 0)
+            if (!metadata.put_oplog_sequence.has_value()) return uint64_t{0};
+            if (*metadata.put_oplog_sequence != 0)
                 return *metadata.put_oplog_sequence;
             auto queued = AppendOpLogVisibleBeforeDurable(
                 OpType::PUT_END, object_id.tenant_id.value(), key,
@@ -6418,6 +6484,14 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     std::string allocation_residency_affinity_id = residency_affinity_id;
     std::optional<std::chrono::system_clock::time_point>
         allocation_committed_soft_pin_timeout;
+    std::optional<std::vector<Replica>> ha_replacement_replicas;
+    AdmissionExit free_unused_ha_replacements{[&] {
+        if (ha_replacement_replicas.has_value()) {
+            FreeDfsReplicas(key, *ha_replacement_replicas);
+            ha_replacement_replicas.reset();
+        }
+    }};
+    bool ha_case_c_replaced = false;
     auto admit = [&](bool* dfs_allocation_failed)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
         auto now = std::chrono::system_clock::now();
@@ -6436,7 +6510,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 HasPendingHaUpsertAdmission(object_id))
                 return tl::make_unexpected(
                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-            if (ha_admission && ha_remove_durable) {
+            if (ha_admission && ha_remove_durable && !ha_case_c_replaced) {
                 if (!accessor.IsPublished() ||
                     accessor.Get().object_generation !=
                         ha_admission->generation ||
@@ -6653,15 +6727,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
                 }
 
-                if (require_ha_invalidation && !ha_remove_durable) {
-                    auto prepared = prepare_invalidation(metadata);
-                    if (!prepared) return tl::make_unexpected(prepared.error());
-                    return std::vector<Replica::Descriptor>{};
-                }
-
                 bool restore_missing_bucket_dfs = false;
                 if (metadata.TotalLength() == slice_length) {
-                    // Validate same-size DFS topology before changing storage.
+                    // Validate same-size DFS topology before changing storage
+                    // or appending an HA invalidation REMOVE.
                     const size_t existing_dfs_replicas =
                         metadata.CountReplicas(&Replica::fn_is_dfs_replica);
                     if (config.dfs_replica_num > 0 ||
@@ -6705,6 +6774,41 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // File-backed reads can resolve storage by key, so they
                     // cannot retain an old version across replacement.
                     return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+                }
+
+                if (require_ha_invalidation && !ha_remove_durable) {
+                    if (has_read_lease) {
+                        // Pre-allocate leased replacement memory before
+                        // recording an HA invalidation REMOVE so allocation
+                        // failure leaves the existing leased object intact and
+                        // readable.
+                        auto prealloc_config = config;
+                        prealloc_config.with_hard_pin =
+                            prealloc_config.with_hard_pin ||
+                            metadata.IsHardPinned();
+                        auto grown = accessor.Grow(SaturatingMultiply(
+                            slice_length, prealloc_config.replica_num));
+                        if (!grown) {
+                            return tl::make_unexpected(grown.error());
+                        }
+                        auto prealloc = AllocateReplicas(
+                            key, slice_length, prealloc_config, writer_host_id,
+                            dfs_allocation_failed);
+                        if (!prealloc) {
+                            return tl::make_unexpected(prealloc.error());
+                        }
+                        ha_replacement_replicas.emplace(
+                            std::move(prealloc.value()));
+                    }
+                    auto prepared = prepare_invalidation(metadata);
+                    if (!prepared) {
+                        if (ha_replacement_replicas.has_value()) {
+                            FreeDfsReplicas(key, *ha_replacement_replicas);
+                            ha_replacement_replicas.reset();
+                        }
+                        return tl::make_unexpected(prepared.error());
+                    }
+                    return std::vector<Replica::Descriptor>{};
                 }
 
                 const bool has_bucket_dfs_replica =
@@ -6786,7 +6890,25 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // old metadata so an allocation failure leaves the old object
                 // readable instead of turning it into OBJECT_NOT_FOUND.
                 std::optional<std::vector<Replica>> replacement_replicas;
-                if (has_read_lease) {
+                if (ha_replacement_replicas.has_value()) {
+                    const bool all_valid = std::all_of(
+                        ha_replacement_replicas->begin(),
+                        ha_replacement_replicas->end(),
+                        [](const Replica& replica) {
+                            return replica.is_available() &&
+                                   !replica.has_invalid_mem_handle() &&
+                                   !replica.has_invalid_nof_handle();
+                        });
+                    if (all_valid) {
+                        replacement_replicas =
+                            std::move(ha_replacement_replicas);
+                        ha_replacement_replicas.reset();
+                    } else {
+                        FreeDfsReplicas(key, *ha_replacement_replicas);
+                        ha_replacement_replicas.reset();
+                    }
+                }
+                if (!replacement_replicas.has_value() && has_read_lease) {
                     auto grown = accessor.Grow(SaturatingMultiply(
                         slice_length, allocation_config.replica_num));
                     if (!grown) {
@@ -6826,6 +6948,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // reader or writer finds the key between the two objects.
                 // `metadata` is not used past this point.
                 accessor.Erase(EraseMode::kReplace);
+                if (ha_admission && ha_remove_durable) {
+                    ha_case_c_replaced = true;
+                }
 
                 VLOG(1) << "key=" << key
                         << ", action=upsert_start_case_c_reallocate";
@@ -7051,30 +7176,35 @@ auto MasterService::EvictDiskReplicaImpl(
             removed_ids.push_back(replica.id());
             replica.mark_removed();
         });
+        auto cancel_removed = [&] {
+            metadata.VisitReplicas(
+                [&removed_ids](const Replica& replica) {
+                    return std::find(removed_ids.begin(), removed_ids.end(),
+                                     replica.id()) != removed_ids.end();
+                },
+                [](Replica& replica) { replica.cancel_remove(); });
+        };
 
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
             persist_result = AppendReservedOpLogWithDurableFinalize(
                 std::move(reservation.value()), OpType::REMOVE,
-                metadata.tenant_id.value(), key, {},
-                [this, removed_ids = std::move(removed_ids)](
-                    const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(durable_entry,
-                                                        removed_ids);
+                metadata.tenant_id.value(), object_id.user_key, {},
+                [this, ids = removed_ids](const OpLogEntry& durable_entry) {
+                    FinalizeRemovedReplicasAfterDurable(durable_entry, ids);
                 });
         } else {
             persist_result = AppendReservedOpLogWithDurableFinalize(
                 std::move(reservation.value()), OpType::PUT_END,
-                metadata.tenant_id.value(), key,
+                metadata.tenant_id.value(), object_id.user_key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
                                                                 remaining),
-                [this, removed_ids = std::move(removed_ids)](
-                    const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(durable_entry,
-                                                        removed_ids);
+                [this, ids = removed_ids](const OpLogEntry& durable_entry) {
+                    FinalizeRemovedReplicasAfterDurable(durable_entry, ids);
                 });
         }
         if (!persist_result) {
+            cancel_removed();
             return tl::make_unexpected(persist_result.error());
         }
         return true;

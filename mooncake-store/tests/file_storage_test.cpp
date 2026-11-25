@@ -3277,6 +3277,17 @@ TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {
         for (const auto& replica : before->replicas)
             ASSERT_TRUE(replica.is_local_disk_replica());
     }
+    // Pre-upgrade legacy (non-@mcssd2:) eviction keys must NOT wedge disk
+    // eviction with INVALID_PARAMS and must NOT evict newer fenced replicas.
+    std::vector<std::string> legacy_keys{
+        TenantId("tenant_a").MakeScopedKey(key),
+        TenantId("tenant_b").MakeScopedKey("absent_legacy_key")};
+    ASSERT_TRUE(FileStorageNotifyEvictedDiskReplicas(storage, legacy_keys));
+    for (const auto& writer : writers) {
+        auto still_present = writer->Query(key);
+        ASSERT_TRUE(still_present);
+    }
+
     std::vector<std::string> physical;
     for (const auto& task : tasks)
         physical.push_back(

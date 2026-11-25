@@ -3143,17 +3143,23 @@ TEST_F(MasterServiceHATest,
     // and is conflict-dropped, which is what puts the repair set on the
     // durable path at all.
     const UUID disk_owner = generate_uuid();
+    const std::string survivor_key = "standby_repair_reject_ld_survivor";
+    const std::string survivor_gen = "gen-repair-survivor-1";
     StandbyObjectMetadata survivor_meta;
     survivor_meta.client_id = generate_uuid();
     survivor_meta.size = 1024;
-    survivor_meta.replicas.push_back(
-        MakeStandbyLocalDiskReplica(disk_owner, endpoint));
+    survivor_meta.object_generation = survivor_gen;
+    auto fenced_disk = MakeStandbyLocalDiskReplica(disk_owner, endpoint);
+    fenced_disk.get_local_disk_descriptor().object_generation = survivor_gen;
+    fenced_disk.get_local_disk_descriptor().storage_key =
+        MakeOffloadStorageKey(survivor_key, survivor_gen);
+    survivor_meta.replicas.push_back(std::move(fenced_disk));
     auto survivor_conflict = MakeStandbyMemoryReplica(endpoint);
     survivor_conflict.id = 2;
     survivor_conflict.get_memory_descriptor()
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
     survivor_meta.replicas.push_back(std::move(survivor_conflict));
-    StandbyObjectEntry survivor{"default", "standby_repair_reject_ld_survivor",
+    StandbyObjectEntry survivor{"default", survivor_key,
                                 std::move(survivor_meta)};
     auto lost = MakeStandbyObject("standby_repair_reject_ld_lost", endpoint);
     lost.metadata.replicas.front()
@@ -10782,6 +10788,271 @@ TEST_F(MasterServiceHATest,
         EXPECT_EQ(service.RemoveAll(kDefaultTenant, force), 1);
         PutObjectOnSegment(service, source.client_id, key, "delete_source");
         EXPECT_EQ(service.RemoveAll(force), 1);
+    }
+}
+
+TEST_F(MasterServiceHATest,
+       EvictDiskReplicaPhysicalKeyWritesLogicalKeyToOpLogAndReplaysCleanly) {
+    const std::string cluster = "evict_ha_logical_cluster";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_enable_offload(true)
+                              .set_cluster_id(cluster)
+                              .set_oplog_batch_max_entries(1)
+                              .set_default_kv_lease_ttl(0)
+                              .build());
+    ASSERT_EQ(
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend),
+        ErrorCode::OK);
+    const auto owner = PrepareSimpleSegment(service, "evict_ha_source");
+    ASSERT_TRUE(service.MountLocalDiskSegment(owner.client_id, false));
+    OpLogBatchStorage storage(cluster, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    const std::string key = "evict_ha_logical_key";
+    PutObjectOnSegment(service, owner.client_id, key, "evict_ha_source");
+    ReadBatchEventually(storage, 2, batch);
+    auto query = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(query);
+    const std::string physical =
+        MakeOffloadStorageKey(key, query->object_generation.value_or(""));
+    ASSERT_FALSE(physical.empty());
+    Replica disk(owner.client_id, 1024, "evict_ha_disk",
+                 ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(AddFencedDiskReplicaForTesting(service, owner.client_id, key,
+                                               kDefaultTenant, disk));
+    ReadBatchEventually(storage, 3, batch);
+
+    ASSERT_TRUE(service.EvictDiskReplica(owner.client_id, physical,
+                                         kDefaultTenant,
+                                         ReplicaType::LOCAL_DISK, true));
+    // Wait until the ordered writer persists and finalizes the eviction batch.
+    ReadBatchEventually(storage, 4, batch);
+    ASSERT_TRUE(
+        MasterServiceTestPeer::OrderedOplogWriter(service)->WaitUntilFinalized(
+            batch.last_seq, std::chrono::seconds(5)));
+
+    // Every OpLog entry for this eviction must carry the logical user key,
+    // never the physical "@mcssd2:..." storage key.
+    ASSERT_FALSE(batch.entries.empty());
+    EXPECT_EQ(batch.entries.back().object_key, key);
+    EXPECT_NE(batch.entries.back().object_key, physical);
+    EXPECT_EQ(InspectOffload(service, key).completed_disk, 0u);
+
+    // Replay onto Standby must match Primary cleanly with 1 memory replica and
+    // 0 disk replicas.
+    MockMetadataStore replayed_store;
+    ReplayThrough(storage, 4, replayed_store, cluster);
+    auto replayed = replayed_store.GetMetadata(kDefaultTenant.value(), key);
+    ASSERT_TRUE(replayed);
+    ASSERT_EQ(replayed->replicas.size(), 1u);
+    EXPECT_TRUE(replayed->replicas.front().is_memory_replica());
+
+    // Subsequent UpsertStart must not be wedged by a stranded REMOVED replica.
+    ReplicateConfig replicate;
+    replicate.preferred_segments = {"evict_ha_source"};
+    auto upsert = UpsertStartWithGrant(service, owner.client_id, key,
+                                       kDefaultTenant, 1024, replicate);
+    ASSERT_TRUE(upsert) << toString(upsert.error());
+    ASSERT_TRUE(UpsertEndWithGrant(service, owner.client_id, key,
+                                   kDefaultTenant, ReplicaType::MEMORY));
+}
+
+TEST_F(MasterServiceHATest,
+       PutStartRefusesToErasePendingRemovedReplicaOlderThanDiscardTimeout) {
+    const std::string cluster = "put_removed_pending_cluster";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster)
+                              .set_oplog_batch_max_entries(1)
+                              .set_put_start_discard_timeout_sec(0)
+                              .set_default_kv_lease_ttl(0)
+                              .build());
+    ASSERT_EQ(
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend),
+        ErrorCode::OK);
+    const auto owner = PrepareSimpleSegment(service, "put_removed_source");
+    const std::string key = "put_removed_pending_key";
+    PutObjectOnSegment(service, owner.client_id, key, "put_removed_source");
+
+    backend->BlockTxn();
+    auto removing = std::async(std::launch::async, [&] {
+        return service.Remove(key, kDefaultTenant, true);
+    });
+    ASSERT_TRUE(backend->WaitForBlockedTxn());
+
+    ReplicateConfig replicate;
+    replicate.preferred_segments = {"put_removed_source"};
+    auto retry_put =
+        service.PutStart(owner.client_id, key, kDefaultTenant, 1024, replicate);
+    EXPECT_FALSE(retry_put);
+    if (!retry_put) {
+        EXPECT_EQ(retry_put.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    backend->AllowTxn();
+    ASSERT_TRUE(removing.get());
+}
+
+TEST_F(MasterServiceHATest,
+       UpsertStartRefusedPreconditionDoesNotDurablyDeleteExistingObject) {
+    const std::string cluster = "upsert_refused_precond_cluster";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_enable_offload(true)
+                              .set_cluster_id(cluster)
+                              .set_oplog_batch_max_entries(1)
+                              .set_default_kv_lease_ttl(60000)
+                              .build());
+    ASSERT_EQ(
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend),
+        ErrorCode::OK);
+    const auto owner = PrepareSimpleSegment(service, "upsert_lease_source");
+    ASSERT_TRUE(service.MountLocalDiskSegment(owner.client_id, false));
+    OpLogBatchStorage storage(cluster, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    const std::string key = "upsert_leased_disk_key";
+    PutObjectOnSegment(service, owner.client_id, key, "upsert_lease_source");
+    ReadBatchEventually(storage, 2, batch);
+    Replica disk(owner.client_id, 1024, "upsert_lease_disk",
+                 ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(AddFencedDiskReplicaForTesting(service, owner.client_id, key,
+                                               kDefaultTenant, disk));
+    ReadBatchEventually(storage, 3, batch);
+    // Grant an active read lease on the non-memory-backed object.
+    ASSERT_TRUE(service.GetReplicaList(key, kDefaultTenant));
+    DurablePrefix prefix_before;
+    ASSERT_EQ(storage.ReadDurablePrefix(prefix_before), ErrorCode::OK);
+
+    ReplicateConfig replicate;
+    replicate.preferred_segments = {"upsert_lease_source"};
+    auto refused = UpsertStartWithGrant(service, owner.client_id, key,
+                                        kDefaultTenant, 1024, replicate);
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error(), ErrorCode::OBJECT_HAS_LEASE);
+    DurablePrefix prefix_after;
+    ASSERT_EQ(storage.ReadDurablePrefix(prefix_after), ErrorCode::OK);
+    EXPECT_EQ(prefix_after.last_seq, prefix_before.last_seq);
+    auto still_there = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(still_there);
+    EXPECT_GE(still_there->replicas.size(), 1u);
+}
+
+TEST_F(MasterServiceHATest,
+       StandbyRestorePreservesFencedLocalDiskAndSkipsUnfencedDiskOnlyObjects) {
+    // 1) RestoreFromStandbySnapshot preserves generation-scoped LOCAL_DISK
+    //    storage_key and object_generation.
+    {
+        MasterService service(MasterServiceConfig::builder()
+                                  .set_enable_ha(false)
+                                  .set_enable_offload(true)
+                                  .build());
+        StandbyObjectEntry entry;
+        entry.tenant_id = kDefaultTenant.value();
+        entry.key = "fenced_snap_key";
+        entry.metadata.client_id = generate_uuid();
+        entry.metadata.size = 1024;
+        entry.metadata.object_generation = "gen-snap-1";
+        Replica::Descriptor disk_desc;
+        disk_desc.id = 501;
+        disk_desc.status = ReplicaStatus::COMPLETE;
+        LocalDiskDescriptor ld;
+        ld.client_id = entry.metadata.client_id;
+        ld.object_size = 1024;
+        ld.transport_endpoint = "127.0.0.1:9999";
+        ld.storage_key = MakeOffloadStorageKey("fenced_snap_key", "gen-snap-1");
+        ld.object_generation = "gen-snap-1";
+        disk_desc.descriptor_variant = ld;
+        entry.metadata.replicas.push_back(disk_desc);
+
+        ASSERT_TRUE(service.RestoreFromStandbySnapshot({entry}, 10, {}));
+        auto restored =
+            service.GetReplicaList("fenced_snap_key", kDefaultTenant);
+        ASSERT_TRUE(restored) << toString(restored.error());
+        ASSERT_EQ(restored->replicas.size(), 1u);
+        ASSERT_TRUE(restored->replicas[0].is_local_disk_replica());
+        EXPECT_EQ(restored->replicas[0]
+                      .get_local_disk_descriptor()
+                      .storage_key.value_or(""),
+                  MakeOffloadStorageKey("fenced_snap_key", "gen-snap-1"));
+        EXPECT_EQ(restored->replicas[0]
+                      .get_local_disk_descriptor()
+                      .object_generation.value_or(""),
+                  "gen-snap-1");
+    }
+
+    // 2) RestoreFromBatchOpLogPromotion skips an unfenced legacy disk-only
+    //    object instead of publishing a 0-replica zombie.
+    {
+        MasterService service(MasterServiceConfig::builder()
+                                  .set_enable_ha(false)
+                                  .set_enable_offload(true)
+                                  .build());
+        StandbyObjectEntry unfenced;
+        unfenced.tenant_id = kDefaultTenant.value();
+        unfenced.key = "legacy_unfenced_disk_only";
+        unfenced.metadata.client_id = generate_uuid();
+        unfenced.metadata.size = 1024;
+        Replica::Descriptor disk_desc;
+        disk_desc.id = 601;
+        disk_desc.status = ReplicaStatus::COMPLETE;
+        LocalDiskDescriptor ld;
+        ld.client_id = unfenced.metadata.client_id;
+        ld.object_size = 1024;
+        ld.transport_endpoint = "127.0.0.1:9998";
+        disk_desc.descriptor_variant = ld;
+        unfenced.metadata.replicas.push_back(disk_desc);
+
+        auto source = std::make_unique<StandbyMetadataStore>();
+        ASSERT_TRUE(source->PutMetadata(unfenced.tenant_id, unfenced.key,
+                                        unfenced.metadata));
+        BatchOpLogPromotionHandoff handoff;
+        handoff.metadata_store = std::move(source);
+        handoff.applied_cursor = {.batch_id = 11, .last_seq = 11};
+        handoff.max_replica_id = disk_desc.id;
+
+        ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(handoff, 1));
+        auto missing =
+            service.GetReplicaList("legacy_unfenced_disk_only", kDefaultTenant);
+        ASSERT_FALSE(missing);
+        EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    // 3) RestoreFromStandbySnapshot on an all-unfenced-disk-only snapshot
+    //    resumes cold cleanly (returns OK, 0 objects) rather than failing
+    //    failover with INVALID_PARAMS.
+    {
+        MasterService service(MasterServiceConfig::builder()
+                                  .set_enable_ha(false)
+                                  .set_enable_offload(true)
+                                  .build());
+        StandbyObjectEntry unfenced;
+        unfenced.tenant_id = kDefaultTenant.value();
+        unfenced.key = "legacy_snap_unfenced_disk_only";
+        unfenced.metadata.client_id = generate_uuid();
+        unfenced.metadata.size = 1024;
+        Replica::Descriptor disk_desc;
+        disk_desc.id = 701;
+        disk_desc.status = ReplicaStatus::COMPLETE;
+        LocalDiskDescriptor ld;
+        ld.client_id = unfenced.metadata.client_id;
+        ld.object_size = 1024;
+        ld.transport_endpoint = "127.0.0.1:9997";
+        disk_desc.descriptor_variant = ld;
+        unfenced.metadata.replicas.push_back(disk_desc);
+
+        ASSERT_TRUE(service.RestoreFromStandbySnapshot({unfenced}, 12, {}));
+        auto missing = service.GetReplicaList("legacy_snap_unfenced_disk_only",
+                                              kDefaultTenant);
+        ASSERT_FALSE(missing);
+        EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
     }
 }
 

@@ -1892,20 +1892,25 @@ TEST_F(OrderedOpLogWriterAwaitTest,
     CreateWriter();
     auto reservation = writer_->Reserve();
     ASSERT_TRUE(reservation);
-    std::promise<ErrorCode> callback_wait_err;
-    auto err_future = callback_wait_err.get_future();
+    std::promise<std::pair<ErrorCode, ErrorCode>> callback_wait_errs;
+    auto err_future = callback_wait_errs.get_future();
     auto pending = writer_->Commit(
         std::move(*reservation), MakeEntry("self-wait"),
         [&](const OpLogEntry& entry) {
-            auto res = writer_->WaitUntilFinalized(
+            auto fin = writer_->WaitUntilFinalized(
                 entry.sequence_id, std::chrono::milliseconds(0));
-            callback_wait_err.set_value(res ? ErrorCode::OK : res.error());
+            auto dur = writer_->WaitUntilDurable(entry.sequence_id + 1,
+                                                 std::chrono::milliseconds(0));
+            callback_wait_errs.set_value({fin ? ErrorCode::OK : fin.error(),
+                                          dur ? ErrorCode::OK : dur.error()});
         });
     ASSERT_TRUE(pending);
     writer_->Start();
     ASSERT_EQ(err_future.wait_for(std::chrono::seconds(2)),
               std::future_status::ready);
-    EXPECT_EQ(err_future.get(), ErrorCode::INVALID_PARAMS);
+    const auto [fin_err, dur_err] = err_future.get();
+    EXPECT_EQ(fin_err, ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(dur_err, ErrorCode::INVALID_PARAMS);
     EXPECT_TRUE(writer_->WaitUntilFinalized(pending->sequence_id(),
                                             std::chrono::seconds(2)));
     writer_->Stop();

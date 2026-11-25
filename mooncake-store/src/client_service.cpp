@@ -2757,10 +2757,10 @@ void Client::healDanglingLocalDiskBatchStarts(
     if (replica_lists.size() != candidate_keys.size()) {
         return;
     }
-    std::vector<std::string> evict_keys;
-    std::vector<size_t> evict_positions;
-    bool evict_physical_keys = false;
-    bool evict_legacy_keys = false;
+    std::vector<std::string> physical_evict_keys;
+    std::vector<size_t> physical_evict_positions;
+    std::vector<std::string> legacy_evict_keys;
+    std::vector<size_t> legacy_evict_positions;
     for (size_t j = 0; j < candidate_keys.size(); ++j) {
         if (!replica_lists[j] || !HasOnlyClientLocalDiskReplicas(
                                      replica_lists[j]->replicas, client_id_)) {
@@ -2795,38 +2795,52 @@ void Client::healDanglingLocalDiskBatchStarts(
         if (file_gone != true) {
             continue;
         }
-        evict_physical_keys |= has_physical_key;
-        evict_legacy_keys |= has_legacy_key;
-        evict_keys.emplace_back(probe_key);
-        evict_positions.emplace_back(j);
+        if (has_physical_key) {
+            physical_evict_keys.emplace_back(probe_key);
+            physical_evict_positions.emplace_back(j);
+        } else {
+            legacy_evict_keys.emplace_back(probe_key);
+            legacy_evict_positions.emplace_back(j);
+        }
     }
-    if (evict_keys.empty() || (evict_physical_keys && evict_legacy_keys)) {
-        return;
-    }
-    auto evicted = master_client_.BatchEvictDiskReplica(
-        evict_keys, ReplicaType::LOCAL_DISK, evict_physical_keys);
-    if (evicted.size() != evict_keys.size()) {
+    if (physical_evict_keys.empty() && legacy_evict_keys.empty()) {
         return;
     }
     std::vector<std::string> retry_keys;
     std::vector<std::vector<uint64_t>> retry_slices;
     std::vector<size_t> retry_positions;
     std::vector<size_t> retry_config_indices;
-    for (size_t j = 0; j < evict_keys.size(); ++j) {
-        if (!evicted[j]) {
-            LOG(WARNING) << "Failed to evict dangling LOCAL_DISK replica for "
-                         << "key=" << evict_keys[j] << ": "
-                         << toString(evicted[j].error());
-            continue;
+    auto evict_batch = [&](const std::vector<std::string>& batch_evict_keys,
+                           const std::vector<size_t>& batch_evict_positions,
+                           bool is_physical) {
+        if (batch_evict_keys.empty()) return;
+        auto evicted = master_client_.BatchEvictDiskReplica(
+            batch_evict_keys, ReplicaType::LOCAL_DISK, is_physical);
+        if (evicted.size() != batch_evict_keys.size()) {
+            return;
         }
-        LOG(WARNING) << "Evicted dangling LOCAL_DISK replica for key="
-                     << evict_keys[j] << " (backing file already gone)";
-        retry_positions.emplace_back(evict_positions[j]);
-        retry_config_indices.push_back(already_exists[evict_positions[j]]);
-        retry_keys.emplace_back(keys[already_exists[evict_positions[j]]]);
-        retry_slices.emplace_back(
-            slice_lengths[already_exists[evict_positions[j]]]);
-    }
+        for (size_t j = 0; j < batch_evict_keys.size(); ++j) {
+            if (!evicted[j]) {
+                LOG(WARNING)
+                    << "Failed to evict dangling LOCAL_DISK replica for "
+                    << "key=" << batch_evict_keys[j] << ": "
+                    << toString(evicted[j].error());
+                continue;
+            }
+            LOG(WARNING) << "Evicted dangling LOCAL_DISK replica for key="
+                         << batch_evict_keys[j]
+                         << " (backing file already gone)";
+            retry_positions.emplace_back(batch_evict_positions[j]);
+            retry_config_indices.push_back(
+                already_exists[batch_evict_positions[j]]);
+            retry_keys.emplace_back(
+                keys[already_exists[batch_evict_positions[j]]]);
+            retry_slices.emplace_back(
+                slice_lengths[already_exists[batch_evict_positions[j]]]);
+        }
+    };
+    evict_batch(physical_evict_keys, physical_evict_positions, true);
+    evict_batch(legacy_evict_keys, legacy_evict_positions, false);
     if (retry_keys.empty()) {
         return;
     }

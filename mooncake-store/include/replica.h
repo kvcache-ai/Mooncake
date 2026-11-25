@@ -397,8 +397,8 @@ struct LocalDiskDescriptor {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
-    struct_pack::compatible<std::string, 1> storage_key;
-    struct_pack::compatible<std::string, 2> object_generation;
+    struct_pack::compatible<std::string, 5> storage_key;
+    struct_pack::compatible<std::string, 5> object_generation;
     YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint,
              storage_key, object_generation);
 };
@@ -786,7 +786,7 @@ class Replica {
         ReplicaStatus status;
         // Only primary PutStart/UpsertStart responses carry this token.
         // Ordinary Query descriptors are not authority to finish a write.
-        struct_pack::compatible<std::string, 1> write_generation;
+        struct_pack::compatible<std::string, 5> write_generation;
         YLT_REFL(Descriptor, id, descriptor_variant, status, write_generation);
 
         // Helper functions

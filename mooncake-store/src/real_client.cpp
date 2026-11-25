@@ -8092,14 +8092,15 @@ void RealClient::execute_session_local_disk_range_reads(
             mutable_plan.window_offset = static_cast<int64_t>(window->offset);
             mutable_plan.window_length = static_cast<int64_t>(window->length);
             const auto *request = plan.key_requests.front();
-            const auto physical =
+            const auto raw_physical =
                 request->selected_replica.get_local_disk_descriptor()
                     .storage_key.value_or("");
+            const std::string physical =
+                !raw_physical.empty() ? raw_physical : key;
             const auto scope =
                 request->cached_query_result.resolved_tenant_id.value_or(
                     client_->tenant_id());
-            if (physical.empty() ||
-                (resolved_tenant && *resolved_tenant != scope)) {
+            if (resolved_tenant && *resolved_tenant != scope) {
                 for (const auto *item : plan.key_requests)
                     results[item->result_index] =
                         toInt(ErrorCode::INVALID_REPLICA);
@@ -10028,17 +10029,16 @@ RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
                                      : 2);
                 continue;
             }
-            if (i >= s->replica_ids.size()) {
-                states.push_back(2);
-                continue;
-            }
+            const bool has_replica_id = i < s->replica_ids.size();
             const auto &replicas = queries[i]->replicas;
             auto observed = std::find_if(
                 replicas.begin(), replicas.end(), [&](const auto &replica) {
-                    return replica.id == s->replica_ids[i] &&
-                           replica.is_local_disk_replica() &&
-                           replica.get_local_disk_descriptor().client_id ==
-                               s->client->getClientId();
+                    if (!replica.is_local_disk_replica() ||
+                        replica.get_local_disk_descriptor().client_id !=
+                            s->client->getClientId()) {
+                        return false;
+                    }
+                    return !has_replica_id || replica.id == s->replica_ids[i];
                 });
             if (observed == replicas.end()) {
                 states.push_back(0);  // Superseded: re-query, never evict it.
@@ -10076,8 +10076,8 @@ RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
             // evict a possibly healthy replica.
             if (!s->exact_scope &&
                 s->tenant_id != TenantId::Default().value()) {
-                auto default_exists =
-                    s->file_storage->Exists(s->default_scoped_keys[i]);
+                auto default_exists = s->file_storage->Exists(
+                    TenantId::Default().MakeScopedKey(physical));
                 if (!default_exists || *default_exists) {
                     states.push_back(2);
                     continue;

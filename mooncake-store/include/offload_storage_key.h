@@ -10,7 +10,7 @@ namespace mooncake {
 // redirect a read to another incarnation's bytes.
 inline std::string MakeOffloadStorageKey(std::string_view key,
                                          std::string_view generation) {
-    if (generation.empty()) return {};
+    if (generation.empty() || generation.size() > 64) return {};
     return "@mcssd2:" + std::to_string(generation.size()) + ":" +
            std::string(generation) + std::string(key);
 }

@@ -107,51 +107,6 @@ TEST(TransportRegistrationLimitTest, ClassifiesProtocols) {
     EXPECT_TRUE(GetTransportRegistrationLimit("ub").has_value());
 }
 
-// Host-backed test device: only an explicitly selected destination range is
-// classified as device memory. Registration happens before any client I/O.
-class StreamingTestDevice final : public device::AcceleratorDevice {
-   public:
-    device::AcceleratorVendor Vendor() const override {
-        return device::AcceleratorVendor::kSunrise;
-    }
-    bool Available(bool = false) const override { return true; }
-    device::PointerInfo QueryPointer(const void* ptr) const override {
-        const auto address = reinterpret_cast<uintptr_t>(ptr);
-        const auto start = begin.load();
-        return {start && address >= start && address - start < bytes.load()
-                    ? device::MemoryKind::kDevice
-                    : device::MemoryKind::kHost,
-                0};
-    }
-    int32_t CurrentDeviceId() const override { return 0; }
-    void SetContext(int32_t) const override {}
-    bool Copy(void* dst, const void* src, size_t size,
-              device::CopyDirection) const override {
-        ++copy_calls;
-        if (const auto delay = copy_delay_ms.load())
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-        std::memcpy(dst, src, size);
-        return true;
-    }
-    PinnedHostBuffer AllocatePinnedHost(size_t) const override { return {}; }
-    std::atomic<uintptr_t> begin{0};
-    std::atomic<size_t> bytes{0};
-    std::atomic<size_t> copy_delay_ms{0};
-    mutable std::atomic<size_t> copy_calls{0};
-};
-
-StreamingTestDevice* RegisterStreamingTestDevice() {
-    static StreamingTestDevice device;
-    static bool registered = [] {
-        if (device::GetAcceleratorRegistry().GetDevice(
-                device::AcceleratorVendor::kSunrise))
-            return false;
-        static device::AcceleratorDeviceRegistrar registrar(device);
-        return true;
-    }();
-    return registered ? &device : nullptr;
-}
-
 class RealClientTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
@@ -233,25 +188,6 @@ class RealClientTest : public ::testing::Test {
             << "Failed to resize temp segment file";
         close(fd);
         return path;
-    }
-    std::vector<tl::expected<QueryResult, ErrorCode>> QueryOnlyLocalDisk(
-        const std::vector<std::string>& keys) {
-        auto queries = py_client_->batch_query(keys);
-        std::vector<tl::expected<QueryResult, ErrorCode>> filtered;
-        for (const auto& query : queries) {
-            if (!query) {
-                filtered.push_back(tl::unexpected(query.error()));
-                continue;
-            }
-            std::vector<Replica::Descriptor> replicas;
-            for (const auto& replica : query->replicas)
-                if (replica.is_local_disk_replica())
-                    replicas.push_back(replica);
-            filtered.emplace_back(QueryResult(std::move(replicas),
-                                              query->lease_timeout,
-                                              query->object_checksum));
-        }
-        return filtered;
     }
 };
 

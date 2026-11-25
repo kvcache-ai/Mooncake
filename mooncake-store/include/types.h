@@ -274,9 +274,9 @@ struct OffloadTaskItem {
     std::string tenant_id;
     std::string key;
     int64_t size;
-    struct_pack::compatible<std::string, 1> object_generation;
-    struct_pack::compatible<std::string, 2> task_id;
-    struct_pack::compatible<bool, 3> restoring;
+    struct_pack::compatible<std::string, 5> object_generation;
+    struct_pack::compatible<std::string, 5> task_id;
+    struct_pack::compatible<bool, 5> restoring;
 
     bool operator==(const OffloadTaskItem& other) const {
         return tenant_id == other.tenant_id && key == other.key &&
@@ -294,9 +294,9 @@ struct PromotionTaskItem {
     std::string tenant_id;
     std::string key;
     int64_t size;
-    struct_pack::compatible<std::string, 1> storage_key;
-    struct_pack::compatible<std::string, 2> object_generation;
-    struct_pack::compatible<std::string, 3> task_id;
+    struct_pack::compatible<std::string, 5> storage_key;
+    struct_pack::compatible<std::string, 5> object_generation;
+    struct_pack::compatible<std::string, 5> task_id;
 
     bool operator==(const PromotionTaskItem& other) const {
         return tenant_id == other.tenant_id && key == other.key &&

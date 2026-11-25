@@ -455,7 +455,7 @@ tl::expected<void, ErrorCode> OrderedOpLogWriter::WaitUntilDurable(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     std::unique_lock lock(impl_->mutex);
     const auto self = std::this_thread::get_id();
-    if (self == impl_->writer_thread_id) {
+    if (self == impl_->writer_thread_id || self == impl_->callback_thread_id) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto ready = [&] {
@@ -571,10 +571,22 @@ void OrderedOpLogWriter::Start() {
                 impl->callback_thread_id = std::thread::id{};
             }
         } id_reset{impl_.get()};
+        std::optional<uint64_t> completed_sequence;
         while (true) {
             Impl::PendingEntry callback_entry;
+            bool notify_waiters = false;
             {
                 std::unique_lock<std::mutex> lock(impl_->mutex);
+                if (completed_sequence) {
+                    impl_->finalized_sequence = *completed_sequence;
+                    completed_sequence.reset();
+                    notify_waiters = impl_->blocking_waiters > 0;
+                }
+                if (notify_waiters) {
+                    lock.unlock();
+                    impl_->waiter_cv.notify_all();
+                    lock.lock();
+                }
                 impl_->cv.wait(lock, [&] {
                     return impl_->callback_stop_requested ||
                            !impl_->callback_entries.empty();
@@ -604,13 +616,7 @@ void OrderedOpLogWriter::Start() {
 #endif
                 callback_entry.callback(callback_entry.entry);
             }
-            bool notify_waiters = false;
-            {
-                std::lock_guard lock(impl_->mutex);
-                impl_->finalized_sequence = callback_entry.entry.sequence_id;
-                notify_waiters = impl_->blocking_waiters > 0;
-            }
-            if (notify_waiters) impl_->waiter_cv.notify_all();
+            completed_sequence = callback_entry.entry.sequence_id;
         }
     });
     impl_->writer_thread = std::thread([this] {

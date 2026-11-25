@@ -1509,7 +1509,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchQuery(
                             ++pos;
                             uint64_t val_len = 0;
                             if (decode_varint(buf, got, pos, val_len) &&
-                                pos + val_len == size) {
+                                val_len == size - pos) {
                                 metadatas.emplace(
                                     key,
                                     StorageObjectMetadata{

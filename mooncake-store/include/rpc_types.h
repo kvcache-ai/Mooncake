@@ -18,7 +18,7 @@ using WeightRpcResult =
 struct ObjectMeta {
     std::string key;
     std::optional<uint64_t> object_checksum;
-    struct_pack::compatible<std::string, 1> write_generation;
+    struct_pack::compatible<std::string, 5> write_generation;
 };
 YLT_REFL(ObjectMeta, key, object_checksum, write_generation);
 
@@ -131,7 +131,7 @@ struct GetReplicaListResponse {
     // the exact scope the write path used. Empty when the master predates
     // this field.
     struct_pack::compatible<std::string, 1> resolved_tenant_id;
-    struct_pack::compatible<std::string, 2> object_generation;
+    struct_pack::compatible<std::string, 5> object_generation;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(
@@ -204,9 +204,9 @@ YLT_REFL(CopyStartResponse, source, targets);
  */
 struct PromotionAllocStartResponse {
     Replica::Descriptor memory_descriptor;
-    struct_pack::compatible<std::string, 1> object_generation;
-    struct_pack::compatible<std::string, 2> task_id;
-    struct_pack::compatible<std::string, 3> storage_key;
+    struct_pack::compatible<std::string, 5> object_generation;
+    struct_pack::compatible<std::string, 5> task_id;
+    struct_pack::compatible<std::string, 5> storage_key;
 };
 YLT_REFL(PromotionAllocStartResponse, memory_descriptor, object_generation,
          task_id, storage_key);

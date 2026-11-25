@@ -639,11 +639,28 @@ bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::vector<OffloadTaskItem>& received_offloading_objects) {
     std::vector<OffloadTaskItem> offloading_objects;
+    std::vector<OffloadTaskItem> unfenced_tasks;
     for (const auto& task : received_offloading_objects) {
+        if (task.restoring.value_or(false)) continue;
         if (!task.object_generation.value_or("").empty() &&
-            !task.task_id.value_or("").empty() &&
-            !task.restoring.value_or(false))
+            !task.task_id.value_or("").empty()) {
             offloading_objects.push_back(task);
+        } else {
+            // Older masters that omit generation/task tokens still hold source
+            // refcounts until the task is NACKed; notify failure instead of
+            // silently dropping.
+            unfenced_tasks.push_back(task);
+        }
+    }
+
+    if (!unfenced_tasks.empty() && client_) {
+        std::vector<StorageObjectMetadata> failed(
+            unfenced_tasks.size(), StorageObjectMetadata{-1, 0, 0, -1, ""});
+        auto nack = client_->NotifyOffloadSuccess(unfenced_tasks, failed);
+        if (!nack) {
+            LOG(WARNING) << "Unfenced legacy offload NACK failed: "
+                         << nack.error();
+        }
     }
 
     MutexLocker task_locker(&offload_tasks_mutex_);
@@ -1076,19 +1093,25 @@ FileStorage::RetryPendingOffloadNotificationLocked() {
 
 void FileStorage::CancelPendingOffloadsLocked(
     const std::vector<OffloadTaskItem>& additional) {
-    for (const auto& task : additional) {
-        pending_offload_tasks_.emplace(
-            TenantId(task.tenant_id)
-                .MakeScopedKey(MakeOffloadStorageKey(
-                    task.key, task.object_generation.value_or(""))),
-            task);
-    }
     std::vector<OffloadTaskItem> tasks;
-    tasks.reserve(pending_offload_tasks_.size());
+    tasks.reserve(pending_offload_tasks_.size() + additional.size());
+    std::set<std::tuple<std::string, std::string, std::string, std::string>>
+        seen;
+    auto push_unique = [&](OffloadTaskItem task) {
+        auto id = std::make_tuple(task.tenant_id, task.key,
+                                  task.object_generation.value_or(""),
+                                  task.task_id.value_or(""));
+        if (seen.insert(std::move(id)).second) {
+            tasks.push_back(std::move(task));
+        }
+    };
     for (auto& [key, task] : pending_offload_tasks_) {
-        tasks.push_back(std::move(task));
+        push_unique(std::move(task));
     }
     pending_offload_tasks_.clear();
+    for (const auto& task : additional) {
+        push_unique(task);
+    }
     if (auto bucket =
             std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
         bucket->ClearUngroupedOffloadingObjects();
@@ -1109,15 +1132,25 @@ tl::expected<void, ErrorCode> FileStorage::NotifyEvictedDiskReplicas(
 
     std::optional<ErrorCode> first_error;
     std::unordered_map<TenantId, std::vector<std::string>, TenantIdHash>
-        keys_by_tenant;
+        physical_keys_by_tenant;
+    std::unordered_map<TenantId, std::vector<std::string>, TenantIdHash>
+        legacy_keys_by_tenant;
     for (const auto& storage_key : evicted_keys) {
         auto [tenant_id, key] = TenantId::ParseScopedKey(storage_key);
-        keys_by_tenant[tenant_id].push_back(key);
+        if (ParseOffloadStorageKey(key).has_value()) {
+            physical_keys_by_tenant[tenant_id].push_back(std::move(key));
+        } else {
+            legacy_keys_by_tenant[tenant_id].push_back(std::move(key));
+        }
     }
 
-    for (const auto& [tenant_id, keys] : keys_by_tenant) {
-        auto results = client_->BatchEvictDiskReplica(
-            keys, tenant_id.value(), ReplicaType::LOCAL_DISK, true);
+    auto notify_batch = [&](const TenantId& tenant_id,
+                            const std::vector<std::string>& keys,
+                            bool physical_storage_key) {
+        if (keys.empty()) return;
+        auto results = client_->BatchEvictDiskReplica(keys, tenant_id.value(),
+                                                      ReplicaType::LOCAL_DISK,
+                                                      physical_storage_key);
         if (results.size() != keys.size()) {
             LOG(ERROR) << "BatchEvictDiskReplica returned " << results.size()
                        << " result(s) for " << keys.size()
@@ -1125,9 +1158,8 @@ tl::expected<void, ErrorCode> FileStorage::NotifyEvictedDiskReplicas(
             if (!first_error.has_value()) {
                 first_error = ErrorCode::INTERNAL_ERROR;
             }
-            continue;
+            return;
         }
-
         for (size_t i = 0; i < results.size(); ++i) {
             if (!results[i]) {
                 if (results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
@@ -1145,7 +1177,56 @@ tl::expected<void, ErrorCode> FileStorage::NotifyEvictedDiskReplicas(
                     << ", error: " << results[i].error();
             }
         }
+    };
+
+    for (const auto& [tenant_id, keys] : physical_keys_by_tenant) {
+        notify_batch(tenant_id, keys, /*physical_storage_key=*/true);
     }
+
+    // Legacy (non-@mcssd2:) buckets recovered from pre-upgrade storage must not
+    // be sent with physical_storage_key=true (Master rejects with
+    // INVALID_PARAMS) and must not blindly evict a newer generation's replica.
+    // Query Master read-only and only evict keys that still carry an unfenced
+    // LOCAL_DISK replica owned by this client.
+    for (const auto& [tenant_id, legacy_keys] : legacy_keys_by_tenant) {
+        auto queries =
+            client_->BatchQueryReadOnly(legacy_keys, tenant_id.value());
+        if (queries.size() != legacy_keys.size()) {
+            LOG(ERROR) << "BatchQueryReadOnly returned " << queries.size()
+                       << " result(s) for " << legacy_keys.size()
+                       << " legacy evicted key(s), tenant_id=" << tenant_id;
+            if (!first_error.has_value()) {
+                first_error = ErrorCode::INTERNAL_ERROR;
+            }
+            continue;
+        }
+        std::vector<std::string> legacy_to_evict;
+        for (size_t i = 0; i < legacy_keys.size(); ++i) {
+            if (!queries[i]) {
+                if (queries[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
+                    continue;
+                }
+                if (!first_error.has_value()) {
+                    first_error = queries[i].error();
+                }
+                continue;
+            }
+            const bool owns_unfenced_local_disk = std::any_of(
+                queries[i]->replicas.begin(), queries[i]->replicas.end(),
+                [&](const Replica::Descriptor& r) {
+                    if (!r.is_local_disk_replica()) return false;
+                    const auto& ld = r.get_local_disk_descriptor();
+                    return ld.client_id == client_->getClientId() &&
+                           ld.storage_key.value_or("").empty();
+                });
+            if (owns_unfenced_local_disk) {
+                legacy_to_evict.push_back(legacy_keys[i]);
+            }
+        }
+        notify_batch(tenant_id, legacy_to_evict,
+                     /*physical_storage_key=*/false);
+    }
+
     if (first_error.has_value()) {
         return tl::make_unexpected(first_error.value());
     }
@@ -1587,27 +1668,51 @@ class PromotionStateGuard {
 tl::expected<void, ErrorCode> FileStorage::PromoteOneKeyFromLocalDisk(
     const std::string& key, const std::string& tenant_id, int64_t size,
     bool* dram_pressure) {
+    auto release_unallocated_slot = [&](const std::string& generation) {
+        auto release =
+            client_->NotifyPromotionFailure(key, tenant_id, generation, {});
+        if (!release) {
+            VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
+                    << key << ", error=" << release.error()
+                    << "; master reaper will reclaim on TTL expiry";
+        }
+    };
+
     const auto query = client_->BatchQueryReadOnly({key}, tenant_id);
-    if (query.size() != 1 || !query[0])
+    if (query.size() != 1 || !query[0]) {
+        release_unallocated_slot("");
         return tl::make_unexpected(query.empty() ? ErrorCode::RPC_FAIL
                                                  : query[0].error());
-    std::string physical_key;
+    }
+    const std::string query_generation = query[0]->object_generation;
+    bool found_local_disk = false;
+    std::string raw_storage_key;
     for (const auto& replica : query[0]->replicas) {
         if (replica.is_local_disk_replica() &&
             replica.status == ReplicaStatus::COMPLETE &&
             replica.get_local_disk_descriptor().client_id ==
                 client_->getClientId()) {
-            physical_key =
+            found_local_disk = true;
+            raw_storage_key =
                 replica.get_local_disk_descriptor().storage_key.value_or("");
             break;
         }
     }
-    if (physical_key.empty())
+    if (!found_local_disk) {
+        release_unallocated_slot(query_generation);
         return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
-    const auto storage_key = TenantId(tenant_id).MakeScopedKey(physical_key);
+    }
+    // Rolling-upgrade compatibility: older masters omit storage_key on
+    // LOCAL_DISK descriptors; fall back to the logical key and legacy RPCs.
+    const bool physical_key = !raw_storage_key.empty();
+    const std::string& effective_storage_key =
+        physical_key ? raw_storage_key : key;
+    const auto storage_key =
+        TenantId(tenant_id).MakeScopedKey(effective_storage_key);
     if (size <= 0) {
         LOG(WARNING) << "Promotion: skipping key=" << key
                      << " with non-positive size=" << size;
+        release_unallocated_slot(query_generation);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -1616,8 +1721,8 @@ tl::expected<void, ErrorCode> FileStorage::PromoteOneKeyFromLocalDisk(
     const std::vector<std::string> preferred_segments;
 
     auto alloc_result = client_->PromotionAllocStart(
-        physical_key, tenant_id, static_cast<uint64_t>(size),
-        preferred_segments, true, {});
+        effective_storage_key, tenant_id, static_cast<uint64_t>(size),
+        preferred_segments, physical_key, {});
     if (!alloc_result) {
         // AllocStart failed (typically NO_AVAILABLE_HANDLE under
         // DRAM pressure). No staged buffer to release, but the
@@ -1634,13 +1739,7 @@ tl::expected<void, ErrorCode> FileStorage::PromoteOneKeyFromLocalDisk(
             alloc_result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
             *dram_pressure = true;
         }
-        auto release = client_->NotifyPromotionFailure(
-            key, tenant_id, query[0]->object_generation, {});
-        if (!release) {
-            VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
-                    << key << ", error=" << release.error()
-                    << "; master reaper will reclaim on TTL expiry";
-        }
+        release_unallocated_slot(query_generation);
         return tl::make_unexpected(alloc_result.error());
     }
 
