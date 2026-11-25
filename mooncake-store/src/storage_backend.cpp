@@ -1857,8 +1857,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::PrepareOffload(
                 state.batch, plan->slice_sizes,
                 static_cast<size_t>(
                     bucket_backend_config_.write_sub_batch_bytes),
-                static_cast<size_t>(
-                    bucket_backend_config_.write_sub_batch_max_iovecs),
                 [this, plan](size_t begin, size_t end) {
                     return ExecuteWriteRange(*plan, begin, end);
                 },

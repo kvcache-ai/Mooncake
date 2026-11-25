@@ -33,14 +33,12 @@ inline std::ostream& operator<<(std::ostream& os,
 struct BucketBackendConfig {
     int64_t read_io_workers = 0;
     int64_t read_sub_batch_max_iovecs = 32;
-    int64_t write_io_workers = 0;
+    int64_t write_io_workers = 32;
     // Target size of a write sub batch in bytes. A sub batch takes whole
     // Slices up to this size. Hybrid direct ranges use the smaller of this
     // target and the 4 MiB SQE size, cut on a 4 KiB block edge.
     // Set by MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_BYTES.
-    int64_t write_sub_batch_bytes = 8LL << 20;
-    // The most Slices a write sub batch takes, whatever their size.
-    int64_t write_sub_batch_max_iovecs = 1024;
+    int64_t write_sub_batch_bytes = 4LL << 20;
     int64_t write_io_backoff_ms = 300;
     int64_t bucket_size_limit =
         256LL * 1024 * 1024;  // Max total size of a single bucket (256 MB)
@@ -106,7 +104,7 @@ struct BucketBackendConfig {
     // a full bucket writeback. Set by
     // MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=uring; without
     // MOONCAKE_OFFLOAD_USE_URING this degrades to buffered bucket writes.
-    bool aligned_uring_write = false;
+    bool aligned_uring_write = true;
 
     // Bound of the sub batches of a sequential hybrid write, the one made
     // without write workers: no sub batch copies more bytes than this into

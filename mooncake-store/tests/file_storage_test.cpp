@@ -519,6 +519,7 @@ class FileStorageTest : public ::testing::Test {
         fs::create_directories(config.storage_filepath);
         FileStorage file_storage(config, client, endpoint);
         BucketBackendConfig bucket_config;
+        bucket_config.write_io_workers = 0;
         bucket_config.bucket_keys_limit = 2;
         bucket_config.flush_partial_buckets = false;
         std::shared_ptr<BucketStorageBackend> backend;
@@ -1614,6 +1615,7 @@ TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
 
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
+    file_storage_config.use_uring = false;
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));

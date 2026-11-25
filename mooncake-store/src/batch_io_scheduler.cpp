@@ -559,10 +559,9 @@ tl::expected<void, ErrorCode> BatchIoScheduler::PrepareSubBatches(
 
 tl::expected<void, ErrorCode> BatchIoScheduler::PrepareSubBatchesByBytes(
     PendingBatch& batch, std::span<const size_t> slice_sizes,
-    size_t sub_batch_bytes, size_t max_slices, const Execute& execute,
-    const Complete& complete) {
+    size_t sub_batch_bytes, const Execute& execute, const Complete& complete) {
     if (batch.error_) return tl::make_unexpected(*batch.error_);
-    if (sub_batch_bytes == 0 || max_slices == 0 || !execute) {
+    if (sub_batch_bytes == 0 || !execute) {
         batch.error_ = ErrorCode::INVALID_PARAMS;
         return tl::make_unexpected(*batch.error_);
     }
@@ -576,8 +575,7 @@ tl::expected<void, ErrorCode> BatchIoScheduler::PrepareSubBatchesByBytes(
         Group current{0, 0, 0};
         for (size_t index = 0; index < slice_sizes.size(); ++index) {
             if (index > current.begin &&
-                (current.bytes + slice_sizes[index] > sub_batch_bytes ||
-                 index + 1 - current.begin > max_slices)) {
+                current.bytes + slice_sizes[index] > sub_batch_bytes) {
                 groups.push_back(current);
                 current = Group{index, index, 0};
             }
@@ -588,9 +586,7 @@ tl::expected<void, ErrorCode> BatchIoScheduler::PrepareSubBatchesByBytes(
         if (groups.size() > 1) {
             Group& previous = groups[groups.size() - 2];
             const Group tail = groups.back();
-            if (tail.bytes <= sub_batch_bytes / 4 &&
-                previous.end - previous.begin + tail.end - tail.begin <=
-                    max_slices) {
+            if (tail.bytes <= sub_batch_bytes / 4) {
                 previous.end = tail.end;
                 groups.pop_back();
             }

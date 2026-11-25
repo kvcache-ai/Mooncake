@@ -75,7 +75,8 @@ struct FileStorageEnvironment {
     ScopedEnvVar legacy_use_uring{"MOONCAKE_USE_URING"};
 };
 
-void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
+void ExpectDefaultFileStorageConfig(const FileStorageConfig& config,
+                                    bool use_uring = true) {
     EXPECT_EQ(config.storage_backend_type, StorageBackendType::kBucket);
     EXPECT_EQ(config.storage_filepath, "/data/file_storage");
     EXPECT_EQ(config.local_buffer_size, 1280 * 1024 * 1024);
@@ -86,7 +87,7 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
     EXPECT_EQ(config.client_buffer_gc_interval_seconds, 1u);
     EXPECT_EQ(config.client_buffer_gc_ttl_ms, 5000u);
-    EXPECT_FALSE(config.use_uring);
+    EXPECT_EQ(config.use_uring, use_uring);
     EXPECT_FALSE(config.enable_dfs);
     EXPECT_TRUE(config.enable_disk_watermark_eviction);
     EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
@@ -263,7 +264,7 @@ TEST_F(FileStorageConfigTest, InvalidValuesUseDefaultsAndPreserveDiagnostics) {
     const auto config = FileStorageConfig::FromEnvironment();
     const std::string logs = ::testing::internal::GetCapturedStderr();
 
-    ExpectDefaultFileStorageConfig(config);
+    ExpectDefaultFileStorageConfig(config, /*use_uring=*/false);
     for (const char* name : {
              "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
              "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES",

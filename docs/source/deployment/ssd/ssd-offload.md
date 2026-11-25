@@ -140,7 +140,7 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` | `10` | Interval for offload heartbeat to master (seconds) |
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS` | `1` | Interval for reclaiming expired offload buffers; defaults to the heartbeat interval in the current implementation |
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS` | `5000` | Lease time for buffers returned by `batch_get_offload_object` before GC reclaims them |
-| `MOONCAKE_OFFLOAD_USE_URING` | `false` | Enable io_uring for async file I/O |
+| `MOONCAKE_OFFLOAD_USE_URING` | `true` | Enable io_uring for async file I/O; set `false` to use POSIX file I/O |
 | `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION` | `true` | Enable proactive local-disk eviction from the FileStorage heartbeat |
 | `MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO` | `0.90` | Trigger proactive disk eviction when backend usage exceeds this ratio of its quota |
 | `MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO` | `0.80` | Target backend usage ratio for proactive disk eviction |
@@ -157,13 +157,12 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 |---|---|---|
 | `MOONCAKE_OFFLOAD_READ_IO_WORKERS` | `0` (disabled) | Shared reader count across bucket files and their sub batches. `0` retains the caller-driven read path; positive values enable parallel full-object and range reads through `BatchIoScheduler`. |
 | `MOONCAKE_OFFLOAD_READ_SUB_BATCH_MAX_IOVECS` | `32` | Maximum read plans (one per object or range) per read sub batch; minimum `4` when readers are enabled. Each sub batch stays within one bucket file. |
-| `MOONCAKE_OFFLOAD_WRITE_IO_WORKERS` | `0` (disabled) | Shared writer count across buckets and their sub batches. `0` retains sequential offload; positive values enable parallel offload through `BatchIoScheduler`. |
-| `MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_BYTES` | `8388608` (8 MiB) | Target size of a write sub batch in bytes. A sub batch takes whole Slices up to this size; a hybrid direct range ends on the 4 KiB block edge below it and is capped at 4 MiB per SQE. A final group of at most a quarter of it joins the previous group within the same bucket. Must be positive when writers are enabled. |
-| `MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS` | `1024` | The most Slices a write sub batch takes, whatever their size. Minimum `1` when writers are enabled. |
+| `MOONCAKE_OFFLOAD_WRITE_IO_WORKERS` | `32` | Shared writer count across buckets and their sub batches. The default enables parallel offload through `BatchIoScheduler`; `0` retains sequential offload. |
+| `MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_BYTES` | `4194304` (4 MiB) | Target size of a write sub batch in bytes. A sub batch takes whole Slices up to this size; a hybrid direct range ends on the 4 KiB block edge below it and is capped at 4 MiB per SQE. A final group of at most a quarter of it joins the previous group within the same bucket. Must be positive when writers are enabled. |
 | `MOONCAKE_OFFLOAD_WRITE_IO_BACKOFF_MS` | `300` | Positive delay in milliseconds before writers recheck pending or in-flight reads. |
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | `268435456` (256 MB) | Max size per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
-| `MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE` | `0` | Write mode: `0`/`false` keeps buffered writes; `packed` enables packed O_DIRECT/io_uring writes (`true`/`1` are aliases). Packed writes require a build with io_uring support and `MOONCAKE_OFFLOAD_USE_URING=true`; otherwise writes remain buffered. `aligned` enables aligned O_DIRECT writes, which do not need io_uring (see below). Unknown values fail backend initialization. `.meta` writes stay buffered with their exact protobuf length. |
+| `MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE` | `uring` | Write mode: the default `uring` enables min-copy hybrid io_uring writes on the plain bucket layout; `0`/`false` keeps buffered writes; `packed` enables packed O_DIRECT/io_uring writes (`true`/`1` are aliases). Packed and hybrid writes require io_uring support and `MOONCAKE_OFFLOAD_USE_URING=true` (the default); `aligned` enables aligned O_DIRECT writes without io_uring. Unknown values fail backend initialization. `.meta` writes stay buffered with their exact protobuf length. |
 | `MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS` | `1` | Threads used only by `packed` direct writes, clamped to 1–8; invalid values use 1. Buckets smaller than 16 MiB always use one thread. |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes, applied **per disk**. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST` | empty | Per-disk eviction thresholds as a comma-separated list, positionally aligned with the paths in `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; when set, it needs exactly one entry per path. Empty applies `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` to every disk. See {ref}`Multiple disks <ssd-offload-multiple-disks>` |
@@ -171,18 +170,18 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`, applied **per disk** when several are configured. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
 | `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | Delay between completed background scans. The `mc-ssd-scan` thread performs all directory traversal (per disk) outside metadata locks; I/O workers only read the published per-disk and global estimates, which also budget writes admitted since the scan began. `<= 0` selects a 1 ms interval. |
 
-### Optional parallel Bucket offload writes
+### Parallel Bucket offload writes
 
 Set the write controls in the **Real Client** environment before starting the embedded Real Client:
 
 ```bash
 export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
-export MOONCAKE_OFFLOAD_WRITE_IO_WORKERS=8
-export MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_BYTES=8388608
+export MOONCAKE_OFFLOAD_WRITE_IO_WORKERS=32
+export MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_BYTES=4194304
 export MOONCAKE_OFFLOAD_WRITE_IO_BACKOFF_MS=300
 ```
 
-Leave the worker count unset or set it to `0` to retain sequential offload. Positive values enable a shared write worker pool across buckets. Benchmark throughput, tail latency, and CPU usage on the target volume to select a worker count. Parallel offload prepares all bucket plans in memory, publishes their sub batches together, and commits each bucket independently after its data writes and sync complete. Writers defer new sub batches while reads are active; this setting does not change master-side DRAM eviction policy. Parallel reads are configured independently as described below. `MOONCAKE_OFFLOAD_USE_URING` selects the file I/O implementation separately.
+The performance-oriented defaults use 32 workers and 4 MiB sub batches. Set the worker count to `0` to retain sequential offload. Benchmark throughput, tail latency, and CPU usage on the target volume to select a worker count. Parallel offload prepares all bucket plans in memory, publishes their sub batches together, and commits each bucket independently after its data writes and sync complete. Hybrid `uring` writes assign every sub batch of a file to the worker queue selected by XXH3(inode), with up to 32 asynchronous SQEs per worker. Writers defer new sub batches while reads are active; this setting does not change master-side DRAM eviction policy. Parallel reads are configured independently as described below. `MOONCAKE_OFFLOAD_USE_URING` selects the file I/O implementation separately.
 
 Write sub batches are formed within each bucket file and take whole Slices up to `MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_BYTES`; a Slice larger than that stands alone or ends its group. A final group of at most a quarter of the target joins the previous group. Different bucket files' tails are never merged. Invalid write controls fail backend initialization.
 
@@ -215,10 +214,10 @@ export MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=packed
 export MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS=8
 ```
 
-Unset `MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE` or set it to `0`/`false` and restart the
-owner to return to buffered writes. Set `MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS=1`
-to retain direct writes with serial packing. Previously written buckets remain
-readable with either configuration.
+Set `MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=0`/`false` and restart the owner to
+return to buffered writes; the default is `uring`. Set
+`MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS=1` to use packed direct writes with serial
+packing. Previously written buckets remain readable with either configuration.
 
 Parallel packing competes for CPU and memory bandwidth and creates up to seven
 helper threads per bucket. All copies finish before I/O submission. If a helper

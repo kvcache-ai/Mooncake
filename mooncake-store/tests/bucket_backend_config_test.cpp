@@ -40,7 +40,6 @@ class ScopedEnvVar {
 
 struct BucketBackendEnvironment {
     ScopedEnvVar write_workers{"MOONCAKE_OFFLOAD_WRITE_IO_WORKERS"};
-    ScopedEnvVar write_sub_batch{"MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS"};
     ScopedEnvVar write_sub_batch_bytes{
         "MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_BYTES"};
     ScopedEnvVar write_backoff{"MOONCAKE_OFFLOAD_WRITE_IO_BACKOFF_MS"};
@@ -77,6 +76,12 @@ TEST_F(BucketBackendConfigTest, UsesExistingDefaultsWhenEnvironmentIsUnset) {
     EXPECT_EQ(config.eviction_policy, BucketEvictionPolicy::FIFO);
     EXPECT_FALSE(config.flush_partial_buckets);
     EXPECT_FALSE(config.aligned_direct_write);
+    EXPECT_TRUE(config.aligned_uring_write);
+
+    env.direct_write.Set("0");
+    const auto buffered = BucketBackendConfig::FromEnvironment().value();
+    EXPECT_FALSE(buffered.aligned_direct_write);
+    EXPECT_FALSE(buffered.aligned_uring_write);
 }
 
 TEST_F(BucketBackendConfigTest, ReadsAlignedFromDirectWriteMode) {
@@ -274,24 +279,22 @@ TEST_F(BucketBackendConfigTest, ValidationPreservesExistingBounds) {
     }
 }
 
-TEST_F(BucketBackendConfigTest, WriteWorkersAreOptionalAndIndependent) {
+TEST_F(BucketBackendConfigTest, WriteWorkersCanBeDisabledAndConfigured) {
     auto config = BucketBackendConfig::FromEnvironment().value();
-    EXPECT_EQ(config.write_io_workers, 0);
-    EXPECT_EQ(config.write_sub_batch_bytes, 8 << 20);
-    EXPECT_EQ(config.write_sub_batch_max_iovecs, 1024);
+    EXPECT_EQ(config.write_io_workers, 32);
+    EXPECT_EQ(config.write_sub_batch_bytes, 4 << 20);
     EXPECT_EQ(config.write_io_backoff_ms, 300);
-    env.write_sub_batch.Set("0");
+    env.write_workers.Set("0");
+    env.write_sub_batch_bytes.Set("0");
     EXPECT_TRUE(BucketBackendConfig::FromEnvironment().value().Validate());
     env.write_workers.Set("3");
     EXPECT_FALSE(BucketBackendConfig::FromEnvironment().value().Validate());
-    env.write_sub_batch.Set("9");
     env.write_sub_batch_bytes.Set("4194304");
     env.write_backoff.Set("17");
     config = BucketBackendConfig::FromEnvironment().value();
     EXPECT_TRUE(config.Validate());
     EXPECT_EQ(config.write_io_workers, 3);
     EXPECT_EQ(config.write_sub_batch_bytes, 4194304);
-    EXPECT_EQ(config.write_sub_batch_max_iovecs, 9);
     EXPECT_EQ(config.write_io_backoff_ms, 17);
     for (const auto* bad : {"-1", "", "invalid", "9223372036854775808"}) {
         env.write_workers.Set(bad);

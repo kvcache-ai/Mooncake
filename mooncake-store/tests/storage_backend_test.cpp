@@ -1785,6 +1785,7 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_OutOfSpace) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.use_uring = false;
     config.total_size_limit = 50 * 1024;  // Small: 50KB
     config.total_keys_limit = 10000;
 
@@ -1925,6 +1926,7 @@ TEST_F(StorageBackendTest,
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.use_uring = false;
     config.total_size_limit = 50 * 1024;  // 50KB
     config.total_keys_limit = 5;          // Small limit
 
@@ -2080,6 +2082,7 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_PartialSuccess) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.use_uring = false;
     config.total_size_limit = 50 * 1024;  // Very small: 50KB
     config.total_keys_limit = 1000;
 
@@ -5004,6 +5007,7 @@ FileStorageConfig MakeOffsetPersistConfig(const std::string& data_path,
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.use_uring = false;
     config.total_size_limit = size_limit;
     config.total_keys_limit = 100;
     return config;
@@ -5844,6 +5848,7 @@ TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
 TEST_F(StorageBackendTest, BucketBackendReportsFailedSyscallErrno) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
+    config.use_uring = false;
     BucketBackendConfig bucket_config;
     BucketStorageBackend storage_backend(config, bucket_config);
     std::vector<std::pair<int, std::string>> reported;
@@ -7231,6 +7236,7 @@ TEST_F(StorageBackendTest, ParallelOffloadCommitsBeforeAnotherBucketLoads) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
+    bucket_config.aligned_uring_write = false;
     bucket_config.write_io_workers = 2;
     BucketStorageBackend backend(config, bucket_config);
     ASSERT_TRUE(backend.Init());
@@ -7326,7 +7332,9 @@ TEST_F(StorageBackendTest, ParallelOffloadSplitsPhysicalIovLimit) {
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
     bucket_config.write_io_workers = 2;
-    bucket_config.write_sub_batch_max_iovecs = 4096;
+    // One 1-byte Slice per byte: a 2048-byte target puts more Slices in a
+    // sub batch than one pwritev takes.
+    bucket_config.write_sub_batch_bytes = 2048;
     BucketStorageBackend backend(config, bucket_config);
     ASSERT_TRUE(backend.Init());
     BucketStorageBackend::PendingOffloads pending;

@@ -19,8 +19,7 @@ bool BucketBackendConfig::Validate() const {
     if (read_io_workers < 0 ||
         (read_io_workers > 0 && read_sub_batch_max_iovecs < 4) ||
         write_io_workers < 0 || write_io_backoff_ms <= 0 ||
-        (write_io_workers > 0 &&
-         (write_sub_batch_bytes <= 0 || write_sub_batch_max_iovecs < 1))) {
+        (write_io_workers > 0 && write_sub_batch_bytes <= 0)) {
         LOG(ERROR)
             << "BucketBackendConfig: invalid I/O workers or sub batch size";
         return false;
@@ -76,9 +75,6 @@ BucketBackendConfig::FromEnvironment() {
     config.write_sub_batch_bytes =
         read_io(Variables::MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_BYTES,
                 config.write_sub_batch_bytes);
-    config.write_sub_batch_max_iovecs =
-        read_io(Variables::MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS,
-                config.write_sub_batch_max_iovecs);
     config.write_io_backoff_ms =
         read_io(Variables::MOONCAKE_OFFLOAD_WRITE_IO_BACKOFF_MS,
                 config.write_io_backoff_ms);
@@ -95,7 +91,7 @@ BucketBackendConfig::FromEnvironment() {
     {
         const std::string direct =
             Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE,
-                            std::string{});
+                            std::string{"uring"});
         config.aligned_direct_write = direct == "aligned";
         config.aligned_uring_write = direct == "uring";
     }

@@ -78,15 +78,14 @@ class BatchIoScheduler {
         PendingBatch& batch, size_t slice_count, size_t sub_batch_size,
         const Execute& execute, const Complete& complete = {});
     // Split one file's logical Slice plans into groups of whole Slices of at
-    // most sub_batch_bytes, and never more than max_slices Slices. A Slice
-    // is never split, so one larger than sub_batch_bytes stands alone or
-    // ends its group. A final group of at most floor(sub_batch_bytes / 4)
-    // bytes joins the previous group. Append directly to unpublished task
-    // nodes. No callback runs here. Any error invalidates the entire pending
-    // batch.
+    // most sub_batch_bytes. A Slice is never split, so one larger than
+    // sub_batch_bytes stands alone or ends its group. A final group of at
+    // most floor(sub_batch_bytes / 4) bytes joins the previous group. Append
+    // directly to unpublished task nodes. No callback runs here. Any error
+    // invalidates the entire pending batch.
     tl::expected<void, ErrorCode> PrepareSubBatchesByBytes(
         PendingBatch& batch, std::span<const size_t> slice_sizes,
-        size_t sub_batch_bytes, size_t max_slices, const Execute& execute,
+        size_t sub_batch_bytes, const Execute& execute,
         const Complete& complete = {});
     // Prepare one task for each index in [0, task_count). Each task receives
     // [index, index + 1), allowing callers to pre-partition work by bytes or

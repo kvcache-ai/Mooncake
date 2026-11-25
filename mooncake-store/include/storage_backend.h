@@ -273,7 +273,7 @@ struct FileStorageConfig {
     uint64_t client_buffer_gc_ttl_ms = 5000;
 
     // Use io_uring for file I/O instead of POSIX pread/pwrite
-    bool use_uring = false;
+    bool use_uring = true;
 
     // DFS control-plane mode. Enabled for filesystem-mode distributed storage
     // and KVCS; other object stores use the regular offload control plane.

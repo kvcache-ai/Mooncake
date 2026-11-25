@@ -160,7 +160,7 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         low_watermark_ratio_or_alias, config.disk_eviction_low_watermark_ratio);
 
     const auto legacy_use_uring =
-        Environ::ReadOr(Variables::MOONCAKE_USE_URING, std::string{"false"});
+        Environ::ReadOr(Variables::MOONCAKE_USE_URING, std::string{"true"});
     const auto use_uring = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_USE_URING, legacy_use_uring);
     config.use_uring = ParseStrictBoolOr(use_uring, false);

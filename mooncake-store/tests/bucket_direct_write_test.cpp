@@ -92,6 +92,7 @@ class BucketDirectWriteTest : public ::testing::TestWithParam<WriteMode> {
         path_ = directory;
         file_config_.storage_filepath = path_.string();
         file_config_.use_uring = GetParam().use_uring;
+        bucket_config_.aligned_uring_write = GetParam().direct == nullptr;
         bucket_config_.max_total_size = 128 * 1024 * 1024;
         bucket_config_.eviction_policy = BucketEvictionPolicy::LRU;
     }
@@ -101,12 +102,18 @@ class BucketDirectWriteTest : public ::testing::TestWithParam<WriteMode> {
         if (!path_.empty()) std::filesystem::remove_all(path_, ec);
     }
 
-    bool DirectEnabled() const {
+    bool PackedDirectEnabled() const {
         const auto mode = GetParam();
         return mode.use_uring && mode.direct &&
                (std::string(mode.direct) == "true" ||
                 std::string(mode.direct) == "packed" ||
                 std::string(mode.direct) == "1");
+    }
+
+    bool DirectEnabled() const {
+        const auto mode = GetParam();
+        return PackedDirectEnabled() ||
+               (mode.use_uring && mode.direct == nullptr);
     }
 
     static Values MakeValues(int round, int count) {
@@ -174,7 +181,7 @@ class BucketDirectWriteTest : public ::testing::TestWithParam<WriteMode> {
         }
         const auto stem = std::to_string(metadata.front().bucket_id);
         const auto bucket_path = path_ / (stem + ".bucket");
-        const auto physical_size = DirectEnabled()
+        const auto physical_size = PackedDirectEnabled()
                                        ? (logical_size + 4095) / 4096 * 4096
                                        : logical_size;
         ASSERT_EQ(std::filesystem::file_size(bucket_path), physical_size);

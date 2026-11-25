@@ -628,8 +628,7 @@ TEST(BatchIoSchedulerTest, SubBatchesByBytesTakeWholeSlices) {
     using Range = std::pair<size_t, size_t>;
     std::vector<Range> ranges;
     size_t completions = 0;
-    const auto run = [&](std::vector<size_t> sizes, size_t target,
-                         size_t max_slices) {
+    const auto run = [&](std::vector<size_t> sizes, size_t target) {
         ranges.clear();
         completions = 0;
         BatchIoScheduler::PendingBatch batch;
@@ -641,31 +640,27 @@ TEST(BatchIoSchedulerTest, SubBatchesByBytesTakeWholeSlices) {
             ++completions;
             return result;
         };
-        if (!scheduler.PrepareSubBatchesByBytes(batch, sizes, target,
-                                                max_slices, execute, complete))
+        if (!scheduler.PrepareSubBatchesByBytes(batch, sizes, target, execute,
+                                                complete))
             return false;
         return scheduler.SubmitAndWait(batch).has_value();
     };
 
     // Thirteen Slices of 4 bytes take 16 each; the last one joins the third.
-    ASSERT_TRUE(run(std::vector<size_t>(13, 4), 16, 8));
+    ASSERT_TRUE(run(std::vector<size_t>(13, 4), 16));
     EXPECT_EQ(ranges, (std::vector<Range>{{0, 4}, {4, 8}, {8, 13}}));
     EXPECT_EQ(completions, 1);
-    // The Slice cap holds the last Slices apart although they are small.
-    ASSERT_TRUE(run(std::vector<size_t>(10, 1), 100, 3));
-    EXPECT_EQ(ranges, (std::vector<Range>{{0, 3}, {3, 6}, {6, 9}, {9, 10}}));
+    // A final group above a quarter of the target stays on its own.
+    ASSERT_TRUE(run({4, 4, 4, 4, 3}, 12));
+    EXPECT_EQ(ranges, (std::vector<Range>{{0, 3}, {3, 5}}));
     // A Slice larger than the target stands alone.
-    ASSERT_TRUE(run({50, 4, 4, 4}, 16, 8));
+    ASSERT_TRUE(run({50, 4, 4, 4}, 16));
     EXPECT_EQ(ranges, (std::vector<Range>{{0, 1}, {1, 4}}));
 
     BatchIoScheduler::PendingBatch invalid;
     const std::vector<size_t> sizes(4, 1);
-    ExpectError(
-        scheduler.PrepareSubBatchesByBytes(invalid, sizes, 0, 8, Succeed),
-        ErrorCode::INVALID_PARAMS);
-    ExpectError(
-        scheduler.PrepareSubBatchesByBytes(invalid, sizes, 8, 0, Succeed),
-        ErrorCode::INVALID_PARAMS);
+    ExpectError(scheduler.PrepareSubBatchesByBytes(invalid, sizes, 0, Succeed),
+                ErrorCode::INVALID_PARAMS);
 }
 
 TEST(BatchIoSchedulerTest, WaitIncludesIndependentGroupFinalizers) {
