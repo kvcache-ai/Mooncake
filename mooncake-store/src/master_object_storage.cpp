@@ -425,7 +425,6 @@ auto MasterService::PutEnd(const UUID& writer, const ObjectMeta& meta,
 tl::expected<void, ErrorCode> MasterService::CommitObjectStorage(
     const UUID& writer, const ObjectMeta& meta, const TenantId& tenant,
     ReplicaType type, std::future<ErrorCode>* deferred) {
-    if (!object_uploads_) return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     TestFailPoint::Wait("object_before_commit_append");
     auto completion = std::make_shared<ObjectCompletion>();
     auto result = completion->promise.get_future();
@@ -435,7 +434,9 @@ tl::expected<void, ErrorCode> MasterService::CommitObjectStorage(
         MetadataAccessorRW accessor(
             this, MakeObjectIdentityForRequest(meta.key, tenant));
         if (!accessor.Exists())
-            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            return tl::make_unexpected(object_uploads_
+                                           ? ErrorCode::OBJECT_NOT_FOUND
+                                           : ErrorCode::INVALID_WRITE);
         auto& metadata = accessor.Get();
         auto* replica =
             metadata.GetReplicaByID(meta.object_storage_target->replica_id);
@@ -447,7 +448,11 @@ tl::expected<void, ErrorCode> MasterService::CommitObjectStorage(
             return tl::make_unexpected(ErrorCode::INVALID_WRITE);
         if (accessor.GetState().object_storage_commit_pending)
             return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
+        // A committed memory-only replacement can outlive the object store
+        // configuration on the leader that receives its retry.
         if (replica->is_completed()) return {};
+        if (!object_uploads_)
+            return tl::make_unexpected(ErrorCode::INVALID_WRITE);
         // Reserve import admission before the durable commit. Abort/timeout may
         // close the group while the upload is in flight; publication must not
         // perform another fallible admission after its metadata is durable.
