@@ -504,6 +504,12 @@ bool TransportSelector::isTransportAvailable(
     // The IPC route copies the original buffers; only the network leg of a
     // staged request runs on host stage buffers.
     if (context.host_staging && !xpu_ipc && !mlu_ipc) {
+        if (context.buffer_transports &&
+            std::find(context.buffer_transports->begin(),
+                      context.buffer_transports->end(),
+                      type) == context.buffer_transports->end()) {
+            return false;
+        }
         return (type == RDMA || type == FABRIC || type == TCP ||
                 type == HP_TCP) &&
                caps.dram_to_dram;
@@ -598,13 +604,32 @@ SelectionResult TransportSelector::select(
     static const std::vector<TransportType> kEmpty;
     static const std::vector<TransportType> kTcpOnly{TCP};
     static const std::vector<TransportType> kFabricOnly{FABRIC};
-    const auto& raw =
+    const bool local_tpu_copy =
+        context.local_segment && (context.local_memory_type == MTYPE_TPU ||
+                                  context.remote_memory_type == MTYPE_TPU);
+    const auto& base_raw =
         force_tcp_ && context.segment_type == SegmentType::Memory ? kTcpOnly
         : force_fabric_ && context.segment_type == SegmentType::Memory
             ? kFabricOnly
         : !matching_policy->transports.empty() ? matching_policy->transports
         : context.buffer_transports            ? *context.buffer_transports
                                                : kEmpty;
+    // A local HBM<->host copy is not a network hop. When force_tcp,
+    // force_fabric, or a matching policy lists only network transports, keep
+    // TpuTransport first so local staging copies stay off TCP's RPC fallback
+    // and do not fail when the policy names only RDMA/HP TCP/Fabric.
+    std::vector<TransportType> local_tpu_raw;
+    const auto* raw_ptr = &base_raw;
+    if (local_tpu_copy && context.segment_type == SegmentType::Memory &&
+        std::find(base_raw.begin(), base_raw.end(), TPU) == base_raw.end() &&
+        (force_tcp_ || force_fabric_ || !matching_policy->transports.empty())) {
+        local_tpu_raw.reserve(base_raw.size() + 1);
+        local_tpu_raw.push_back(TPU);
+        local_tpu_raw.insert(local_tpu_raw.end(), base_raw.begin(),
+                             base_raw.end());
+        raw_ptr = &local_tpu_raw;
+    }
+    const auto& raw = *raw_ptr;
 
     if (transport_index < 0) return result;
     const int original_index = transport_index;

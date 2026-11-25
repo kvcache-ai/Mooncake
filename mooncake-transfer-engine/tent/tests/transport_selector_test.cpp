@@ -262,6 +262,123 @@ TEST(TransportSelectorTest, ForceTcpDoesNotOverrideFileTransportPolicy) {
     EXPECT_EQ(selector.select(ctx, transports).transport, GDS);
 }
 
+// A local HBM<->host copy is not a network hop. TCP claims device
+// capabilities on a TPU platform, so it would otherwise carry the copy.
+TEST(TransportSelectorTest, ForceTcpKeepsLocalTpuCopiesOnTheTpuTransport) {
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/force_tcp", true);
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    for (auto type : {TPU, TCP}) {
+        transports[type] = std::make_shared<FakeTransport>(type);
+        auto* fake = static_cast<FakeTransport*>(transports[type].get());
+        fake->setGpuToDram(true);
+        fake->setDramToGpu(true);
+    }
+
+    // The buffer's own order does not matter: force_tcp ignores it.
+    std::vector<TransportType> buffer_transports = {TCP, TPU};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = true;
+    ctx.local_segment = true;
+    ctx.local_memory_type = MTYPE_TPU;  // HBM -> host stage
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+    EXPECT_EQ(selector.select(ctx, transports).transport, TPU);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, TCP);
+    EXPECT_EQ(selector.select(ctx, transports, 0, TCP).transport, TCP);
+
+    ctx.local_memory_type = MTYPE_CPU;  // host stage -> HBM
+    ctx.remote_memory_type = MTYPE_TPU;
+    EXPECT_EQ(selector.select(ctx, transports).transport, TPU);
+}
+
+TEST(TransportSelectorTest,
+     PolicyAndForceFabricKeepLocalTpuCopiesOnTheTpuTransport) {
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    for (auto type : {TPU, TCP, RDMA, FABRIC}) {
+        transports[type] = std::make_shared<FakeTransport>(type);
+        auto* fake = static_cast<FakeTransport*>(transports[type].get());
+        fake->setGpuToDram(true);
+        fake->setDramToGpu(true);
+    }
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = true;
+    ctx.local_segment = true;
+    ctx.local_memory_type = MTYPE_TPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+
+    auto rdma_policy_conf = std::make_shared<Config>();
+    ASSERT_TRUE(
+        rdma_policy_conf
+            ->load(
+                R"({"policy":[{"name":"tpu_rdma","segment_type":"memory","transports":["rdma"]}]})")
+            .ok());
+    TransportSelector rdma_policy_selector(rdma_policy_conf);
+    EXPECT_EQ(rdma_policy_selector.select(ctx, transports).transport, TPU);
+    EXPECT_EQ(rdma_policy_selector.select(ctx, transports, 0, TCP).transport,
+              UNSPEC);
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_TPU;
+    EXPECT_EQ(rdma_policy_selector.select(ctx, transports).transport, TPU);
+
+    auto tcp_policy_conf = std::make_shared<Config>();
+    ASSERT_TRUE(
+        tcp_policy_conf
+            ->load(
+                R"({"policy":[{"name":"tpu_tcp","segment_type":"memory","transports":["tcp"]}]})")
+            .ok());
+    TransportSelector tcp_policy_selector(tcp_policy_conf);
+    ctx.local_memory_type = MTYPE_TPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    EXPECT_EQ(tcp_policy_selector.select(ctx, transports, 0).transport, TPU);
+    EXPECT_EQ(tcp_policy_selector.select(ctx, transports, 1).transport, TCP);
+    EXPECT_EQ(tcp_policy_selector.select(ctx, transports, 0, TCP).transport,
+              TCP);
+
+    auto fabric_conf = std::make_shared<Config>();
+    fabric_conf->set("transports/force_fabric", true);
+    TransportSelector fabric_selector(fabric_conf);
+    EXPECT_EQ(fabric_selector.select(ctx, transports).transport, TPU);
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_TPU;
+    EXPECT_EQ(fabric_selector.select(ctx, transports).transport, TPU);
+}
+
+TEST(TransportSelectorTest,
+     HostStagingRespectsBufferTransportsUnderExplicitPolicy) {
+    auto conf = std::make_shared<Config>();
+    ASSERT_TRUE(
+        conf->load(
+                R"({"policy":[{"name":"tpu_net","segment_type":"memory","transports":["rdma","tcp"]}]})")
+            .ok());
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    for (auto type : {RDMA, TCP}) {
+        transports[type] = std::make_shared<FakeTransport>(type);
+        static_cast<FakeTransport*>(transports[type].get())
+            ->setDramToDram(true);
+    }
+
+    std::vector<TransportType> staged_transports = {TCP};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.host_staging = true;
+    ctx.local_memory_type = MTYPE_TPU;
+    ctx.remote_memory_type = MTYPE_TPU;
+    ctx.buffer_transports = &staged_transports;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, TCP);
+    EXPECT_EQ(selector.select(ctx, transports, 0, RDMA).transport, UNSPEC);
+}
+
 // ---------------------------------------------------------------------------
 // Test transport type name parsing
 // ---------------------------------------------------------------------------

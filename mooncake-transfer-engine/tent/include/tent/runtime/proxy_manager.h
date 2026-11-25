@@ -30,6 +30,7 @@ namespace mooncake {
 namespace tent {
 class TransferEngineImpl;
 class TaskInfo;
+struct StagedRoute;
 struct StageBufferCache;
 namespace internal {
 class RemoteStageOperation;
@@ -39,6 +40,8 @@ struct StagingTask {
     TaskInfo* native{nullptr};
     BatchID batch{0};
     std::vector<std::string> params;
+    // Route for the host-to-host hops; null routes each hop by itself.
+    std::shared_ptr<const StagedRoute> route;
 };
 
 class ProxyManager {
@@ -59,7 +62,8 @@ class ProxyManager {
     Status deconstruct();
 
     Status submit(TaskInfo* task, BatchID batch,
-                  const std::vector<std::string>& params);
+                  const std::vector<std::string>& params,
+                  std::shared_ptr<const StagedRoute> route = nullptr);
 
     Status getStatus(TaskInfo* task, TransferStatus& task_status);
 
@@ -72,7 +76,8 @@ class ProxyManager {
 
     Status transferEventLoop(
         StagingTask& task, StageBufferCache* cache,
-        bool& buffers_safe_to_release, std::vector<BatchID>& undrained_batches,
+        bool& buffers_safe_to_release, bool& suppress_failover,
+        std::vector<BatchID>& undrained_batches,
         std::vector<std::shared_ptr<internal::RemoteStageOperation>>&
             undrained_remote_operations);
 
@@ -83,6 +88,7 @@ class ProxyManager {
     Status freeStageBuffers(const std::string& location);
 
     BatchID submitCrossStage(const Request& request,
+                             const std::shared_ptr<const StagedRoute>& route,
                              uint64_t local_stage_buffer,
                              uint64_t remote_stage_buffer,
                              uint64_t chunk_length);

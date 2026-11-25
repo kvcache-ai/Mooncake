@@ -877,7 +877,7 @@ Status HighPerformanceTcpTransport::addMemoryBuffer(
         Platform::getLoader().getMemoryType(
             reinterpret_cast<void*>(desc.addr)) != MTYPE_CPU) {
         return Status::InvalidArgument(
-            "HP TCP v1 supports CPU DRAM only" LOC_MARK);
+            "HP TCP supports CPU DRAM only" LOC_MARK);
     }
 
     uint64_t registration_id = 0;
