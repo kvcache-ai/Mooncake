@@ -35,11 +35,13 @@ class BatchIoScheduler {
         int64_t offset;
         std::function<void(int)> report_error;
     };
-    // The scratch span belongs to this SQE until its CQE is collected.
-    // An empty request means the callback already did the I/O synchronously.
+    // Scratch is allocated on first use and belongs to this SQE until its CQE
+    // is collected. Zero-copy requests never invoke the factory. An empty
+    // request means the callback already did the I/O synchronously.
+    using Scratch = std::function<std::span<char>()>;
     using PrepareWrite =
         std::function<tl::expected<std::optional<WriteRequest>, ErrorCode>(
-            size_t index, std::span<char> scratch)>;
+            size_t index, const Scratch& scratch)>;
     // Initialize one file lazily and return the inode used for worker affinity.
     using PrepareWriteFile = std::function<tl::expected<uint64_t, ErrorCode>()>;
 

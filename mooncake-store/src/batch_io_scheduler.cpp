@@ -183,18 +183,14 @@ class BatchIoScheduler::Impl {
         struct Slot {
             std::optional<Task> task;
             std::optional<WriteRequest> request;
+            std::unique_ptr<char, decltype(&std::free)> scratch{nullptr,
+                                                                &std::free};
         };
 
         ~WriteRing() { Reset(); }
 
         bool Init() {
             if (initialized) return true;
-            if (!scratch) {
-                void* buffer = nullptr;
-                if (posix_memalign(&buffer, 4096, kDepth * kWriteSqeBytes) != 0)
-                    return false;
-                scratch.reset(static_cast<char*>(buffer));
-            }
             const int ret = io_uring_queue_init(kDepth, &ring, 0);
             if (ret < 0) {
                 LOG(ERROR) << "Failed to initialize async write ring: "
@@ -217,8 +213,14 @@ class BatchIoScheduler::Impl {
             return slots.size();
         }
 
-        std::span<char> Buffer(size_t slot) {
-            return {scratch.get() + slot * kWriteSqeBytes, kWriteSqeBytes};
+        std::span<char> Buffer(Slot& slot) {
+            if (!slot.scratch) {
+                void* buffer = nullptr;
+                if (posix_memalign(&buffer, 4096, kWriteSqeBytes) != 0)
+                    return {};
+                slot.scratch.reset(static_cast<char*>(buffer));
+            }
+            return {slot.scratch.get(), kWriteSqeBytes};
         }
 
         int Wait(io_uring_cqe** cqe) {
@@ -232,10 +234,12 @@ class BatchIoScheduler::Impl {
 
         io_uring ring{};
         std::array<Slot, kDepth> slots;
+        // One extra task may prepare while every SQE is occupied. Its slot has
+        // a stable address, so submitting it later needs no task/buffer move.
+        Slot prepared;
+        bool prepared_pending = false;
         size_t active = 0;
         bool initialized = false;
-        std::unique_ptr<char, decltype(&std::free)> scratch{nullptr,
-                                                            &std::free};
     };
 
     void RetireWrite(WriteRing& writer, io_uring_cqe* cqe,
@@ -298,6 +302,13 @@ class BatchIoScheduler::Impl {
                        tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL), lock);
             slot.task.reset();
         }
+        if (writer.prepared.task) {
+            writer.prepared.request.reset();
+            FinishTask(*writer.prepared.task,
+                       tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL), lock);
+            writer.prepared.task.reset();
+        }
+        writer.prepared_pending = false;
     }
 
     // Called without the scheduler lock. SQE ownership transfers only on
@@ -306,22 +317,46 @@ class BatchIoScheduler::Impl {
                                              bool& queued) {
         if (!writer.Init())
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        const size_t slot = writer.FreeSlot();
+        auto* slot = writer.active == WriteRing::kDepth
+                         ? &writer.prepared
+                         : &writer.slots[writer.FreeSlot()];
+        Scratch scratch = [&writer, slot] { return writer.Buffer(*slot); };
         auto prepared = task.sub_batch.prepare_write(
-            task.sub_batch.slice_idx_begin, writer.Buffer(slot));
+            task.sub_batch.slice_idx_begin, scratch);
         if (!prepared) return tl::make_unexpected(prepared.error());
         if (!*prepared) return {};
 
         auto& request = **prepared;
+        if (writer.active == WriteRing::kDepth) {
+            slot->request.emplace(std::move(request));
+            slot->task.emplace(std::move(task));
+            writer.prepared_pending = true;
+            queued = true;
+            return {};
+        }
+
         auto* sqe = io_uring_get_sqe(&writer.ring);
         if (!sqe) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         io_uring_prep_write(sqe, request.fd, request.data, request.length,
                             request.offset);
-        io_uring_sqe_set_data(sqe, &writer.slots[slot]);
-        writer.slots[slot].request.emplace(std::move(request));
-        writer.slots[slot].task.emplace(std::move(task));
+        io_uring_sqe_set_data(sqe, slot);
+        slot->request.emplace(std::move(request));
+        slot->task.emplace(std::move(task));
         ++writer.active;
         queued = true;
+        return {};
+    }
+
+    tl::expected<void, ErrorCode> SubmitPrepared(WriteRing& writer) {
+        auto& slot = writer.prepared;
+        auto* sqe = io_uring_get_sqe(&writer.ring);
+        if (!sqe) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        const auto& request = *slot.request;
+        io_uring_prep_write(sqe, request.fd, request.data, request.length,
+                            request.offset);
+        io_uring_sqe_set_data(sqe, &slot);
+        ++writer.active;
+        writer.prepared_pending = false;
         return {};
     }
 #endif
@@ -334,13 +369,53 @@ class BatchIoScheduler::Impl {
         std::unique_lock<std::mutex> lock(mutex_);
         for (;;) {
 #ifdef USE_URING
+            if (writer.prepared_pending) {
+                auto& task = *writer.prepared.task;
+                tl::expected<void, ErrorCode> cancelled;
+                if (stopping_) {
+                    cancelled = tl::make_unexpected(
+                        ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                } else if (task.group && task.group->error) {
+                    cancelled = tl::make_unexpected(*task.group->error);
+                } else if (!task.group && task.batch->error) {
+                    cancelled = tl::make_unexpected(*task.batch->error);
+                }
+                if (!cancelled) {
+                    FinishTask(task, cancelled, lock);
+                    writer.prepared = {};
+                    writer.prepared_pending = false;
+                    continue;
+                }
+                if (writer.active < WriteRing::kDepth) {
+                    auto submitted = SubmitPrepared(writer);
+                    if (!submitted) {
+                        FinishTask(task, submitted, lock);
+                        writer.prepared = {};
+                        writer.prepared_pending = false;
+                    }
+                    continue;
+                }
+            }
+            const bool has_work = !queue_.empty() || !write_queue.empty();
             if (writer.active != 0 &&
-                (writer.active == WriteRing::kDepth ||
-                 (queue_.empty() && write_queue.empty()) || stopping_)) {
-                // Refill on each completion, including completions from a
-                // different bucket than the task next at the queue head.
+                ((writer.active == WriteRing::kDepth && writer.prepared.task) ||
+                 !has_work || stopping_)) {
+                // Refill on each completion. With a full ring and queued work,
+                // prepare one task first so its copy overlaps in-flight I/O.
                 ReapWrite(writer, lock);
                 continue;
+            }
+            if (writer.active == WriteRing::kDepth && !writer.prepared.task &&
+                has_work) {
+                // Do not delay an already-arrived CQE behind the next copy.
+                lock.unlock();
+                io_uring_cqe* cqe = nullptr;
+                if (io_uring_peek_cqe(&writer.ring, &cqe) == 0) {
+                    RetireWrite(writer, cqe, lock);
+                    lock.lock();
+                    continue;
+                }
+                lock.lock();
             }
 #endif
             changed_.wait(lock, [&] {

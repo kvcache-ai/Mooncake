@@ -65,14 +65,15 @@ TEST(BatchIoSchedulerTest, AsyncWritesRefillAndPreserveSlotBuffers) {
             [group]() -> tl::expected<uint64_t, ErrorCode> {
                 return static_cast<uint64_t>(group + 1);
             },
-            [&, group](size_t index, std::span<char> scratch)
+            [&, group](size_t index, const BatchIoScheduler::Scratch& scratch)
                 -> tl::expected<std::optional<BatchIoScheduler::WriteRequest>,
                                 ErrorCode> {
                 const size_t offset = group * kWritesPerGroup + index;
-                scratch[0] = static_cast<char>(offset + 1);
+                auto buffer = scratch();
+                buffer[0] = static_cast<char>(offset + 1);
                 return std::optional<BatchIoScheduler::WriteRequest>{
                     {fileno(file.get()),
-                     scratch.data(),
+                     buffer.data(),
                      1,
                      static_cast<int64_t>(offset),
                      {}}};
@@ -89,6 +90,32 @@ TEST(BatchIoSchedulerTest, AsyncWritesRefillAndPreserveSlotBuffers) {
               actual.size());
     for (size_t i = 0; i < actual.size(); ++i)
         EXPECT_EQ(actual[i], static_cast<char>(i + 1));
+}
+
+TEST(BatchIoSchedulerTest, ZeroCopyWriteDoesNotNeedScratch) {
+    auto created = BatchIoScheduler::Create(1);
+    ASSERT_TRUE(created);
+    auto file = std::unique_ptr<std::FILE, decltype(&std::fclose)>(
+        std::tmpfile(), &std::fclose);
+    ASSERT_TRUE(file);
+    alignas(4096) std::array<char, 4096> content{};
+    content.fill('z');
+
+    BatchIoScheduler::PendingBatch batch;
+    ASSERT_TRUE(created.value()->PrepareWriteTasks(
+        batch, 1, []() -> tl::expected<uint64_t, ErrorCode> { return 1; },
+        [&](size_t, const BatchIoScheduler::Scratch&)
+            -> tl::expected<std::optional<BatchIoScheduler::WriteRequest>,
+                            ErrorCode> {
+            return std::optional<BatchIoScheduler::WriteRequest>{
+                {fileno(file.get()), content.data(), content.size(), 0, {}}};
+        },
+        {}));
+    ASSERT_TRUE(created.value()->SubmitAndWait(batch));
+    std::array<char, 4096> actual{};
+    ASSERT_EQ(std::fread(actual.data(), 1, actual.size(), file.get()),
+              actual.size());
+    EXPECT_EQ(actual, content);
 }
 
 TEST(BatchIoSchedulerTest, AsyncWritesUsePerWorkerInodeQueues) {
@@ -114,17 +141,18 @@ TEST(BatchIoSchedulerTest, AsyncWritesUsePerWorkerInodeQueues) {
                 ++initialized[group];
                 return static_cast<uint64_t>(group + 1);
             },
-            [&, group](size_t index, std::span<char> scratch)
+            [&, group](size_t index, const BatchIoScheduler::Scratch& scratch)
                 -> tl::expected<std::optional<BatchIoScheduler::WriteRequest>,
                                 ErrorCode> {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     file_workers[group].insert(std::this_thread::get_id());
                 }
-                scratch[0] = static_cast<char>(group + index + 1);
+                auto buffer = scratch();
+                buffer[0] = static_cast<char>(group + index + 1);
                 return std::optional<BatchIoScheduler::WriteRequest>{
                     {fileno(file.get()),
-                     scratch.data(),
+                     buffer.data(),
                      1,
                      static_cast<int64_t>(group * kWritesPerGroup + index),
                      {}}};

@@ -1848,7 +1848,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::PrepareOffload(
             result = write_io_scheduler_->PrepareWriteTasks(
                 state.batch, plan->hybrid_ranges.size(),
                 [this, plan]() { return PrepareHybridWriteFile(*plan); },
-                [this, plan](size_t index, std::span<char> scratch) {
+                [this, plan](size_t index,
+                             const BatchIoScheduler::Scratch& scratch) {
                     return PrepareHybridWriteRange(*plan, index, scratch);
                 },
                 complete);
@@ -2094,9 +2095,9 @@ tl::expected<uint64_t, ErrorCode> BucketStorageBackend::PrepareHybridWriteFile(
 }
 
 tl::expected<std::optional<BatchIoScheduler::WriteRequest>, ErrorCode>
-BucketStorageBackend::PrepareHybridWriteRange(WritePlan& plan,
-                                              size_t range_index,
-                                              std::span<char> scratch) {
+BucketStorageBackend::PrepareHybridWriteRange(
+    WritePlan& plan, size_t range_index,
+    const BatchIoScheduler::Scratch& scratch) {
     if (range_index >= plan.hybrid_ranges.size()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -2157,7 +2158,7 @@ BucketStorageBackend::PrepareHybridWriteRange(WritePlan& plan,
 
     constexpr size_t kBlock = kDirectIOAlignment;
     if (range.offset % kBlock != 0 || range.length % kBlock != 0 ||
-        range.length == 0 || range.length > scratch.size()) {
+        range.length == 0 || range.length > BatchIoScheduler::kWriteSqeBytes) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto* file = dynamic_cast<UringFile*>(plan.file.get());
@@ -2171,17 +2172,21 @@ BucketStorageBackend::PrepareHybridWriteRange(WritePlan& plan,
                          (range.offset - source_begin);
     if (range_end > plan.iov_ends[first] ||
         reinterpret_cast<uintptr_t>(buffer) % kBlock != 0) {
+        auto scratch_buffer = scratch();
+        if (range.length > scratch_buffer.size()) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
         for (size_t pos = range.offset, i = first; pos < range_end; ++i) {
             const size_t piece_end = std::min(range_end, plan.iov_ends[i]);
             if (pos == piece_end) continue;
             const size_t begin = i == 0 ? 0 : plan.iov_ends[i - 1];
             const auto* source =
                 static_cast<const char*>(plan.iovs[i].iov_base);
-            std::memcpy(scratch.data() + (pos - range.offset),
+            std::memcpy(scratch_buffer.data() + (pos - range.offset),
                         source + (pos - begin), piece_end - pos);
             pos = piece_end;
         }
-        buffer = scratch.data();
+        buffer = scratch_buffer.data();
     }
     return std::optional<BatchIoScheduler::WriteRequest>{
         {file->fd_for_async_write(), buffer, range.length,
