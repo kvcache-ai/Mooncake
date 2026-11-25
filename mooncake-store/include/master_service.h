@@ -2353,16 +2353,18 @@ class MasterService {
     // Pending work only: committed, referenced objects consume no admission
     // slots. Both indexes are rebuilt from recovered records and metadata.
     struct ObjectPendingWork {
-        uint64_t deadline_ms;
+        BackgroundWorker::Clock::time_point run_at;
         uint64_t generation;
+        BackgroundWorker::Clock::time_point lease_deadline{};
     };
     std::unordered_map<std::string, ObjectPendingWork>
         object_pending_deadlines_;
     uint64_t object_work_generation_{0};
-    std::set<std::pair<uint64_t, std::string>> object_work_;
-    uint64_t ObjectCleanupDeadline(const ObjectUploadRecord&,
-                                   uint64_t now) const;
-    void SetObjectWorkLocked(const std::string&, std::optional<uint64_t>);
+    std::set<std::pair<BackgroundWorker::Clock::time_point, std::string>>
+        object_work_;
+    void SetObjectWorkLocked(
+        const std::string&, std::optional<BackgroundWorker::Clock::time_point>,
+        BackgroundWorker::Clock::time_point lease_deadline = {});
     void ScheduleObjectWorkLocked();
     void InitObjectStorage(const MasterServiceConfig&);
     void MaintainObjectStorage();

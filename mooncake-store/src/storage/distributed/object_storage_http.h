@@ -16,16 +16,13 @@ namespace mooncake::object_storage_http {
 // follow a successful write. Pre-request transport failures and explicit HTTP
 // request rejections cannot.
 inline bool PutMayExist(CURLcode result, long status) {
-    if (result == CURLE_OK) {
-        switch (status) {
-            case 401:  // Unauthorized
-            case 403:  // Forbidden
-            case 404:  // Destination bucket/path does not exist
-            case 413:  // Payload too large
-                return false;
-            default:
-                return true;
-        }
+    // A final rejection still applies if reading its response body failed.
+    switch (status) {
+        case 401:  // Unauthorized
+        case 403:  // Forbidden
+        case 404:  // Destination bucket/path does not exist
+        case 413:  // Payload too large
+            return false;
     }
     return result != CURLE_COULDNT_RESOLVE_PROXY &&
            result != CURLE_COULDNT_RESOLVE_HOST &&

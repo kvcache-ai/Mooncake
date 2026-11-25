@@ -1390,7 +1390,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     }
 
     client->InitTransferSubmitter();
-    if (client->InitObjectStorage() != ErrorCode::OK) return std::nullopt;
+    if (!client->GetObjectStorageBackend()) return std::nullopt;
     // Initialize local hot cache
     err = client->InitLocalHotCache();
     if (err != ErrorCode::OK) {
@@ -1876,7 +1876,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     // Decide before submitting any transfer: an earlier memory read may
     // otherwise still be writing when an overlapping object GET starts.
     const bool serialize_reads =
-        object_storage_backend_ && object_keys.size() > 1 &&
+        object_keys.size() > 1 &&
         std::any_of(query_results.begin(), query_results.end(),
                     [](const auto& q) {
                         return std::any_of(

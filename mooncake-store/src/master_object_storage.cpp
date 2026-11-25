@@ -218,7 +218,7 @@ MasterService::CommitObjectAware(OrderedOpLogWriter::Reservation&& reservation,
             pending->sequence_id();
     const auto logical =
         object_uploads_->GetMetadata(entry.tenant_id, entry.object_key);
-    const auto now = ObjectNowMs();
+    const auto now = BackgroundWorker::Clock::now();
     for (const auto& record : mutation.records) {
         const auto& name = record.object.object_key;
         const bool committed =
@@ -237,14 +237,35 @@ MasterService::CommitObjectAware(OrderedOpLogWriter::Reservation&& reservation,
             continue;
         }
         const auto old = old_records.find(name);
-        if (!object_pending_deadlines_.contains(name) ||
+        const auto work = object_pending_deadlines_.find(name);
+        if (work == object_pending_deadlines_.end() ||
             old == old_records.end() || old->second.phase != record.phase ||
             old->second.not_before_ms != record.not_before_ms ||
             old->second.upload_finished != record.upload_finished) {
-            SetObjectWorkLocked(
-                name, record.phase == ObjectUploadPhase::RETIRED
-                          ? ObjectCleanupDeadline(record, now)
-                          : now + object_storage_config_.cleanup_interval_ms);
+            if (record.phase != ObjectUploadPhase::RETIRED) {
+                SetObjectWorkLocked(
+                    name,
+                    now + std::chrono::milliseconds(
+                              object_storage_config_.cleanup_interval_ms));
+                continue;
+            }
+            // Preserve the original lease window on completion notifications.
+            // Recovered retirements wait out the previous leader's saved TTL.
+            std::chrono::steady_clock::time_point lease_deadline;
+            if (old != old_records.end() &&
+                old->second.phase == ObjectUploadPhase::RETIRED) {
+                lease_deadline =
+                    work != object_pending_deadlines_.end()
+                        ? work->second.lease_deadline
+                        : object_restore_time_ +
+                              std::chrono::milliseconds(
+                                  record.read_lease_ttl_ms.value_or(
+                                      default_kv_lease_ttl_));
+            } else {
+                lease_deadline = now + std::chrono::milliseconds(ObjectLeaseTtl(
+                                           record, default_kv_lease_ttl_));
+            }
+            SetObjectWorkLocked(name, lease_deadline, lease_deadline);
         }
     }
     for (const auto& name : mutation.forget) {
@@ -573,45 +594,27 @@ MasterService::BeginObjectWriteRevocation(
     return result;
 }
 
-// A previous leader may have had a slower wall clock. Wait out its saved
-// read TTL on the new leader's monotonic clock before reclaiming the object.
-uint64_t MasterService::ObjectCleanupDeadline(const ObjectUploadRecord& record,
-                                              uint64_t now) const {
-    if (object_restore_time_ != std::chrono::steady_clock::time_point{}) {
-        const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
-            object_restore_time_ +
-            std::chrono::milliseconds(
-                record.read_lease_ttl_ms.value_or(default_kv_lease_ttl_)) -
-            std::chrono::steady_clock::now());
-        if (remaining.count() > 0)
-            return std::max(record.not_before_ms,
-                            now + static_cast<uint64_t>(remaining.count()));
-    }
-    return std::max(now, record.not_before_ms);
-}
-
 // object_storage_mutex_ protects admission and both scheduling indexes.
-void MasterService::SetObjectWorkLocked(const std::string& name,
-                                        std::optional<uint64_t> deadline) {
+void MasterService::SetObjectWorkLocked(
+    const std::string& name,
+    std::optional<BackgroundWorker::Clock::time_point> run_at,
+    BackgroundWorker::Clock::time_point lease_deadline) {
     auto existing = object_pending_deadlines_.find(name);
     if (existing != object_pending_deadlines_.end()) {
-        object_work_.erase({existing->second.deadline_ms, name});
+        object_work_.erase({existing->second.run_at, name});
         object_pending_deadlines_.erase(existing);
     }
-    if (deadline) {
+    if (run_at) {
         object_pending_deadlines_.emplace(
-            name, ObjectPendingWork{*deadline, ++object_work_generation_});
-        object_work_.emplace(*deadline, name);
+            name, ObjectPendingWork{*run_at, ++object_work_generation_,
+                                    lease_deadline});
+        object_work_.emplace(*run_at, name);
     }
 }
 
 void MasterService::ScheduleObjectWorkLocked() {
     if (object_work_.empty()) return;
-    const auto now = ObjectNowMs();
-    const auto due = object_work_.begin()->first;
-    const auto delay = due > now ? due - now : 0;
-    object_storage_worker_.ScheduleAt(BackgroundWorker::Clock::now() +
-                                      std::chrono::milliseconds(delay));
+    object_storage_worker_.ScheduleAt(object_work_.begin()->first);
 }
 
 void MasterService::MaintainObjectStorage() {
@@ -632,7 +635,7 @@ void MasterService::MaintainObjectStorage() {
         {
             std::lock_guard lock(object_storage_mutex_);
             if (object_work_.empty() ||
-                object_work_.begin()->first > ObjectNowMs())
+                object_work_.begin()->first > BackgroundWorker::Clock::now())
                 break;
             name = object_work_.begin()->second;
             sequence = object_upload_sequences_.at(name);
@@ -673,10 +676,22 @@ void MasterService::MaintainObjectStorage() {
                     return;
                 }
                 std::lock_guard object_lock(object_storage_mutex_);
-                const auto now = ObjectNowMs();
-                const auto due = ObjectCleanupDeadline(*record, now);
-                if (due > now) {
-                    SetObjectWorkLocked(name, due);
+                const auto lease_deadline =
+                    object_pending_deadlines_.at(name).lease_deadline;
+                const auto steady_now = BackgroundWorker::Clock::now();
+                // A retirement racing with work selection installed a new
+                // deadline.
+                if (steady_now < lease_deadline) return;
+                const auto wall_now = ObjectNowMs();
+                if (record->not_before_ms > wall_now) {
+                    // Recheck the persisted deadline if the wall clock was set
+                    // back.
+                    const auto delay =
+                        std::min(record->not_before_ms - wall_now,
+                                 object_storage_config_.cleanup_interval_ms);
+                    SetObjectWorkLocked(
+                        name, steady_now + std::chrono::milliseconds(delay),
+                        lease_deadline);
                     return;
                 }
                 // Capture the fresh retirement sequence under the key lock.
@@ -726,9 +741,12 @@ void MasterService::MaintainObjectStorage() {
                 current->second.generation == generation)
                 SetObjectWorkLocked(
                     name,
-                    std::max(current->second.deadline_ms,
-                             ObjectNowMs() +
-                                 object_storage_config_.cleanup_interval_ms));
+                    std::max(
+                        current->second.run_at,
+                        BackgroundWorker::Clock::now() +
+                            std::chrono::milliseconds(
+                                object_storage_config_.cleanup_interval_ms)),
+                    current->second.lease_deadline);
         }
     }
     std::lock_guard lock(object_storage_mutex_);

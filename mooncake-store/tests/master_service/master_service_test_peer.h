@@ -68,9 +68,9 @@ class MasterServiceTestPeer {
     void RunBatchEvictForTesting(double evict_ratio_target,
                                  double evict_ratio_lowerbound);
 
-    uint64_t ObjectCleanupDeadline(const std::string& name) {
+    auto ObjectCleanupDeadline(const std::string& name) {
         std::lock_guard lock(service_.object_storage_mutex_);
-        return service_.object_pending_deadlines_.at(name).deadline_ms;
+        return service_.object_pending_deadlines_.at(name).run_at;
     }
 
     void RunNoFBatchEvictForTesting(double evict_ratio_target,

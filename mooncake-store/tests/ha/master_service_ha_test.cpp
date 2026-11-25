@@ -1624,10 +1624,7 @@ TEST_F(MasterServiceHATest, ObjectRetirementHonorsLeasesFromEarlierLeaders) {
                       std::make_shared<FakeBatchHaKvBackend>()),
                   ErrorCode::OK);
         auto& records = peer.EnableObjectRecordsForTesting(storage);
-        const auto takeover_ms = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch())
-                .count());
+        const auto takeover = std::chrono::steady_clock::now();
         if (retirement_deadline) {
             // Simulate a previous leader whose clock was well behind ours.
             retirement_deadline = 1;
@@ -1639,7 +1636,8 @@ TEST_F(MasterServiceHATest, ObjectRetirementHonorsLeasesFromEarlierLeaders) {
             auto retired = records.FindObjectUpload(name);
             ASSERT_TRUE(retired);
             EXPECT_EQ(retired->not_before_ms, retirement_deadline);
-            EXPECT_GE(peer.ObjectCleanupDeadline(name), takeover_ms + 60000);
+            EXPECT_GE(peer.ObjectCleanupDeadline(name),
+                      takeover + std::chrono::milliseconds(60000));
             continue;
         }
         if (objects.empty()) {
