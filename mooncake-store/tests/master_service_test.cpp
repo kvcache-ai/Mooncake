@@ -667,6 +667,7 @@ TEST(MasterFabricPlacementTest, CxlAllocationBypassesRamPhysicalPlacement) {
     constexpr size_t kCxlSize = 16 * 1024 * 1024;
     const auto service_config =
         MasterServiceConfig::builder()
+            .set_memory_allocator(BufferAllocatorType::CACHELIB)
             .set_enable_cxl(true)
             .set_cxl_path("shared-cxl-pool")
             .set_cxl_size(kCxlSize)
