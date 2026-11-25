@@ -2641,6 +2641,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ScanMeta(
     const std::function<
         ErrorCode(const std::vector<std::string>& keys,
                   std::vector<StorageObjectMetadata>& metadatas)>& handler) {
+    int64_t skipped_not_owned = 0;
     while (true) {
         auto has_next_res = HasNext();
         if (!has_next_res) {
@@ -2651,12 +2652,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ScanMeta(
         if (!has_next_res.value()) {
             break;
         }
-        auto add_all_object_res = HandleNext(handler);
+        auto add_all_object_res = HandleNext(handler, &skipped_not_owned);
         if (!add_all_object_res) {
             LOG(ERROR) << "Failed to add all object to master: "
                        << add_all_object_res.error();
             return add_all_object_res;
         }
+    }
+    if (skipped_not_owned > 0) {
+        LOG(INFO) << "[ScanMeta] skipped " << skipped_not_owned
+                  << " key(s) listed by a bucket that does not own them";
     }
     return {};
 }
@@ -2665,19 +2670,32 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     int64_t bucket_id, std::vector<std::string>& keys,
     std::vector<StorageObjectMetadata>& metadatas,
     std::vector<int64_t>& buckets, int64_t limit,
-    std::vector<BucketScanPin>* pins) {
+    std::vector<BucketScanPin>* pins, int64_t* skipped_not_owned) {
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto bucket_it = buckets_.lower_bound(bucket_id);
+    std::vector<size_t> owned;
     for (; bucket_it != buckets_.end(); ++bucket_it) {
-        if (static_cast<int64_t>(bucket_it->second->keys.size()) > limit) {
+        // Report only the keys this bucket owns, the rule eviction uses. A
+        // key skipped as a duplicate at commit is still listed here but
+        // indexed under another bucket, or under none once that bucket is
+        // evicted. Reporting it would re-register a replica BatchLoad rejects
+        // with INVALID_KEY, and evicting this bucket would never retract it.
+        const auto& bucket_keys = bucket_it->second->keys;
+        owned.clear();
+        for (size_t i = 0; i < bucket_keys.size(); i++) {
+            const auto* owner = object_bucket_map_.find(bucket_keys[i]);
+            if (owner != nullptr && owner->bucket_id == bucket_it->first) {
+                owned.push_back(i);
+            }
+        }
+        if (static_cast<int64_t>(owned.size()) > limit) {
             LOG(ERROR) << "Bucket key count exceeds limit: "
                        << "bucket_id=" << bucket_it->first
-                       << ", current_size=" << bucket_it->second->keys.size()
+                       << ", current_size=" << owned.size()
                        << ", limit=" << limit;
             return tl::make_unexpected(ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
         }
-        if (static_cast<int64_t>(bucket_it->second->keys.size() + keys.size()) >
-            limit) {
+        if (static_cast<int64_t>(owned.size() + keys.size()) > limit) {
             return bucket_it->first;
         }
         buckets.emplace_back(bucket_it->first);
@@ -2688,12 +2706,21 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
             // registers its keys with the master.
             pins->emplace_back(bucket_it->second);
         }
-        for (size_t i = 0; i < bucket_it->second->keys.size(); i++) {
-            keys.emplace_back(bucket_it->second->keys[i]);
+        for (size_t i : owned) {
+            keys.emplace_back(bucket_keys[i]);
             metadatas.emplace_back(StorageObjectMetadata{
                 bucket_it->first, bucket_it->second->metadatas[i].offset,
                 bucket_it->second->metadatas[i].key_size,
                 bucket_it->second->metadatas[i].data_size, ""});
+        }
+        const auto not_owned =
+            static_cast<int64_t>(bucket_keys.size() - owned.size());
+        if (not_owned > 0) {
+            VLOG(1) << "[ScanMeta] bucket " << bucket_it->first << ": skipped "
+                    << not_owned << " key(s) it does not own";
+            if (skipped_not_owned != nullptr) {
+                *skipped_not_owned += not_owned;
+            }
         }
     }
     return 0;
@@ -4412,7 +4439,8 @@ void BucketStorageBackend::ClearFileCache() {
 tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
     const std::function<
         ErrorCode(const std::vector<std::string>& keys,
-                  std::vector<StorageObjectMetadata>& metadatas)>& handler) {
+                  std::vector<StorageObjectMetadata>& metadatas)>& handler,
+    int64_t* skipped_not_owned) {
     MutexLocker locker(&iterator_mutex_);
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadatas;
@@ -4423,7 +4451,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
     std::vector<BucketScanPin> pins;
     auto key_iterator_result =
         BucketScan(next_bucket_, keys, metadatas, buckets,
-                   file_storage_config_.scanmeta_iterator_keys_limit, &pins);
+                   file_storage_config_.scanmeta_iterator_keys_limit, &pins,
+                   skipped_not_owned);
     if (!key_iterator_result) {
         LOG(ERROR) << "Bucket scan failed, error : "
                    << key_iterator_result.error();

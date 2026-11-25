@@ -2834,6 +2834,186 @@ TEST_F(StorageBackendTest, BucketEvictionDoesNotReportSkippedDuplicateKeys) {
 }
 
 //-----------------------------------------------------------------------------
+
+// ScanMeta is what a store re-registers with the master at startup and after
+// a master restart or failover, and the master then sends readers here for
+// those keys. A key skipped as a duplicate is still listed by the newer bucket
+// it was written into; once its own (older) bucket is evicted, re-reporting it
+// from the newer bucket advertises a key BatchLoad rejects with INVALID_KEY,
+// which fails the reader's whole batch.
+TEST_F(StorageBackendTest, ScanMetaReportsOnlyKeysTheBucketOwns) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 30 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+    auto complete = [](const std::vector<std::string>&,
+                       std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    };
+
+    // keyA goes to the older bucket. Offloading it again with keyB skips it
+    // as a duplicate, but the newer bucket's key list still carries it.
+    const std::string keyA = "keyA";
+    const std::string keyB = "keyB";
+    std::string valueA(6 * 1024, 'A');
+    std::string valueB(6 * 1024, 'B');
+    std::unordered_map<std::string, std::vector<Slice>> batch1{
+        {keyA, {Slice{valueA.data(), valueA.size()}}}};
+    auto older = storage_backend.BatchOffload(batch1, complete);
+    ASSERT_TRUE(older.has_value());
+    std::unordered_map<std::string, std::vector<Slice>> batch2{
+        {keyA, {Slice{valueA.data(), valueA.size()}}},
+        {keyB, {Slice{valueB.data(), valueB.size()}}}};
+    auto newer = storage_backend.BatchOffload(batch2, complete);
+    ASSERT_TRUE(newer.has_value());
+    ASSERT_NE(older.value(), newer.value());
+
+    // What the store would re-register, as key -> bucket.
+    auto rescan = [&storage_backend] {
+        std::vector<std::pair<std::string, int64_t>> reported;
+        storage_backend.ResetScanIterator();
+        auto result = storage_backend.ScanMeta(
+            [&reported](const std::vector<std::string>& keys,
+                        std::vector<StorageObjectMetadata>& metadatas) {
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    reported.emplace_back(keys[i], metadatas[i].bucket_id);
+                }
+                return ErrorCode::OK;
+            });
+        EXPECT_TRUE(result.has_value());
+        std::sort(reported.begin(), reported.end());
+        return reported;
+    };
+    using Reported = std::vector<std::pair<std::string, int64_t>>;
+    // Each key once, from the bucket that owns it.
+    EXPECT_EQ(rescan(),
+              (Reported{{keyA, older.value()}, {keyB, newer.value()}}));
+
+    // The scan limit counts the keys a bucket reports: the newer bucket lists
+    // two keys but reports one, so it fits a one-key batch.
+    {
+        Reported scanned;
+        int64_t next_bucket = 0;
+        do {
+            std::vector<std::string> keys;
+            std::vector<StorageObjectMetadata> metadatas;
+            std::vector<int64_t> buckets;
+            auto next = storage_backend.BucketScan(next_bucket, keys, metadatas,
+                                                   buckets, /*limit=*/1);
+            if (!next) {
+                ADD_FAILURE() << "BucketScan with limit 1: " << next.error();
+                break;
+            }
+            EXPECT_LE(keys.size(), 1u);
+            for (size_t i = 0; i < keys.size(); ++i) {
+                scanned.emplace_back(keys[i], metadatas[i].bucket_id);
+            }
+            next_bucket = next.value();
+        } while (next_bucket != 0);
+        EXPECT_EQ(scanned,
+                  (Reported{{keyA, older.value()}, {keyB, newer.value()}}));
+    }
+
+    // FIFO eviction takes the older bucket, and with it keyA.
+    std::vector<std::string> evicted;
+    auto evict_result = storage_backend.EvictAboveDiskWatermark(
+        /*high_watermark_ratio=*/0.30, /*low_watermark_ratio=*/0.30,
+        [&evicted](const std::vector<std::string>& keys) {
+            evicted.insert(evicted.end(), keys.begin(), keys.end());
+            return tl::expected<void, ErrorCode>{};
+        });
+    ASSERT_TRUE(evict_result.has_value());
+    ASSERT_EQ(evicted, std::vector<std::string>{keyA});
+    auto existA = storage_backend.IsExist(keyA);
+    ASSERT_TRUE(existA.has_value());
+    ASSERT_FALSE(existA.value());
+
+    auto reported = rescan();
+    EXPECT_EQ(reported, (Reported{{keyB, newer.value()}}))
+        << "keyA is still listed by the newer bucket but is no longer stored";
+
+    // A reader routed here for every reported key gets all of them.
+    std::vector<std::string> buffers(reported.size(),
+                                     std::string(6 * 1024, '\0'));
+    std::unordered_map<std::string, Slice> load;
+    for (size_t i = 0; i < reported.size(); ++i) {
+        load.emplace(reported[i].first,
+                     Slice{buffers[i].data(), buffers[i].size()});
+    }
+    auto load_result = storage_backend.BatchLoad(load);
+    EXPECT_TRUE(load_result.has_value()) << load_result.error();
+}
+
+// After a restart the index is rebuilt from the .meta files, where a key
+// skipped as a duplicate is listed by two buckets. The index maps it to one
+// of them, and the startup scan reports it once, from that bucket.
+TEST_F(StorageBackendTest, ScanMetaAfterRestartReportsEachKeyOnce) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    auto complete = [](const std::vector<std::string>&,
+                       std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    };
+    const std::string keyA = "keyA";
+    const std::string keyB = "keyB";
+    std::string valueA(6 * 1024, 'A');
+    std::string valueB(6 * 1024, 'B');
+    {
+        BucketStorageBackend storage_backend(config, bucket_config);
+        ASSERT_TRUE(storage_backend.Init());
+        std::unordered_map<std::string, std::vector<Slice>> batch1{
+            {keyA, {Slice{valueA.data(), valueA.size()}}}};
+        ASSERT_TRUE(storage_backend.BatchOffload(batch1, complete));
+        std::unordered_map<std::string, std::vector<Slice>> batch2{
+            {keyA, {Slice{valueA.data(), valueA.size()}}},
+            {keyB, {Slice{valueB.data(), valueB.size()}}}};
+        ASSERT_TRUE(storage_backend.BatchOffload(batch2, complete));
+    }
+
+    // Restart: a new backend on the same directory.
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+    std::vector<std::pair<std::string, int64_t>> reported;
+    auto result = storage_backend.ScanMeta(
+        [&reported](const std::vector<std::string>& keys,
+                    std::vector<StorageObjectMetadata>& metadatas) {
+            for (size_t i = 0; i < keys.size(); ++i) {
+                reported.emplace_back(keys[i], metadatas[i].bucket_id);
+            }
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(result.has_value());
+    std::sort(reported.begin(), reported.end());
+    ASSERT_EQ(reported.size(), 2u) << "each key must be reported exactly once";
+    EXPECT_EQ(reported[0].first, keyA);
+    EXPECT_EQ(reported[1].first, keyB);
+
+    // Each key is reported from the bucket its index entry points at, and a
+    // reader routed here for both gets their values.
+    std::unordered_map<std::string, StorageObjectMetadata> indexed;
+    ASSERT_TRUE(storage_backend.BatchQuery({keyA, keyB}, indexed));
+    EXPECT_EQ(reported[0].second, indexed.at(keyA).bucket_id);
+    EXPECT_EQ(reported[1].second, indexed.at(keyB).bucket_id);
+    std::string loadedA(valueA.size(), '\0');
+    std::string loadedB(valueB.size(), '\0');
+    std::unordered_map<std::string, Slice> load{
+        {keyA, Slice{loadedA.data(), loadedA.size()}},
+        {keyB, Slice{loadedB.data(), loadedB.size()}}};
+    auto load_result = storage_backend.BatchLoad(load);
+    ASSERT_TRUE(load_result.has_value()) << load_result.error();
+    EXPECT_EQ(loadedA, valueA);
+    EXPECT_EQ(loadedB, valueB);
+}
+
+//-----------------------------------------------------------------------------
 // BucketReadGuard RAII Behavior Tests (Phase 1 - D2)
 //-----------------------------------------------------------------------------
 
