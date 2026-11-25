@@ -37,6 +37,7 @@
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "dynamic_replication_controller.h"
+#include "eviction/coordinator.h"
 #include "lease.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
@@ -1167,7 +1168,7 @@ class MasterService {
     // `evict_ratio_lowerbound`. It consumes the allocation-pressure signal and
     // raises it again when the round could free nothing that was there to
     // free.
-    void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    bool BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
     using NamespaceEvictionResult = StoreControl::EvictionResult;
@@ -1542,7 +1543,7 @@ class MasterService {
     void CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor);
 
     // Discards the namespace's expired processing replicas and expired tasks.
-    void DiscardExpiredProcessingReplicas(
+    uint64_t DiscardExpiredProcessingReplicas(
         const metadata::Namespace& ns,
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,

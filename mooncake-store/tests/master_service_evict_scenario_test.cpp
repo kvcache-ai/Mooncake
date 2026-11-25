@@ -953,5 +953,85 @@ TEST_P(MasterServiceEvictScenarioTest,
         .Then(Object("grouped_leased_b").IsReadable());
 }
 
+TEST_P(MasterServiceEvictScenarioTest,
+       HighWatermarkWriteWakesEvictionImmediately) {
+    constexpr uint64_t kObjBytes = 1024 * 1024;
+    auto config = EvictConfig();
+    config.eviction_high_watermark_ratio = 0.80;
+    config.eviction_ratio = 0.25;
+    config.default_kv_lease_ttl = 0;
+
+    MasterService service(config);
+    const UUID owner_id = generate_uuid();
+    Segment seg;
+    seg.id = generate_uuid();
+    seg.name = "wake_memory_segment";
+    seg.base = 0x100000000ULL;
+    seg.size = 16 * kObjBytes;
+    seg.te_endpoint = "127.0.0.1:19999";
+    ASSERT_TRUE(service.MountSegment(seg, owner_id).has_value());
+
+    ReplicateConfig rep_cfg;
+    rep_cfg.replica_num = 1;
+
+    // Warm up one high-watermark wave before timing so worker-pool creation
+    // (when GetParam() == 4) does not skew wake-latency measurements.
+    auto trigger_and_wait_wave = [&](const std::string& prefix) {
+        size_t seq = 0;
+        // Top up to 12/16 MB (75%, strictly below 80% watermark).
+        while (service.GetKeyCount() < 12) {
+            const std::string key = prefix + "_fill_" + std::to_string(seq++);
+            ASSERT_TRUE(service
+                            .PutStart(owner_id, key, TenantId::Default(),
+                                      kObjBytes, rep_cfg)
+                            .has_value());
+            ASSERT_TRUE(service
+                            .PutEnd(owner_id, key, TenantId::Default(),
+                                    ReplicaType::MEMORY)
+                            .has_value());
+        }
+        // Writing the 13th 1MB object crosses 80% (13/16 = 81.25%) and
+        // immediately wakes eviction, which drops key count to <= 11.
+        const std::string trigger_key = prefix + "_trigger";
+        ASSERT_TRUE(service
+                        .PutStart(owner_id, trigger_key, TenantId::Default(),
+                                  kObjBytes, rep_cfg)
+                        .has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(owner_id, trigger_key, TenantId::Default(),
+                                ReplicaType::MEMORY)
+                        .has_value());
+
+        const auto wave_start = std::chrono::steady_clock::now();
+        bool evicted = false;
+        while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - wave_start)
+                   .count() < 200) {
+            if (service.GetKeyCount() <= 11) {
+                evicted = true;
+                break;
+            }
+            std::this_thread::yield();
+        }
+        ASSERT_TRUE(evicted)
+            << "prefix=" << prefix << " keys=" << service.GetKeyCount();
+    };
+
+    trigger_and_wait_wave("warmup");
+
+    // Run 8 separate high-watermark waves; 10ms fallback polling requires
+    // >= 70ms across 8 waves, whereas event-driven wakeup finishes in a few ms.
+    const auto t0 = std::chrono::steady_clock::now();
+    for (size_t wave = 0; wave < 8; ++wave) {
+        trigger_and_wait_wave("w_" + std::to_string(wave));
+    }
+    const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count();
+    EXPECT_LT(total_ms, 50)
+        << "8 high-watermark wakeup waves should complete well under 7x10ms "
+           "polling interval";
+}
+
 }  // namespace
 }  // namespace mooncake::test

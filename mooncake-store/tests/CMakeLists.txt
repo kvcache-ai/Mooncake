@@ -133,6 +133,7 @@ add_store_test(master_service_tenant_iteration_test
                master_service_tenant_iteration_test.cpp)
 add_store_test(master_service_batch_read_test
                master_service_batch_read_test.cpp)
+add_store_test(eviction_coordinator_test eviction_coordinator_test.cpp)
 add_ha_test(master_service_evict_scenario_test
             master_service_evict_scenario_test.cpp)
 target_link_libraries(master_service_evict_scenario_test

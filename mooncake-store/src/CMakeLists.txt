@@ -37,6 +37,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     client_session_registry.cpp
     client_session_event_dispatcher.cpp
     dynamic_replication_controller.cpp
+    eviction/coordinator.cpp
     eviction/evictor.cpp
     eviction/offloading_reclaimer.cpp
     eviction/report_observers.cpp

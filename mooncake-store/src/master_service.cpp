@@ -385,7 +385,12 @@ struct MasterService::MemoryEviction {
                   : settings.offload_on_evict
                       ? static_cast<eviction::Reclaimer&>(offloading)
                       : static_cast<eviction::Reclaimer&>(immediate),
-                  {&metrics, &log}, settings.worker_threads) {}
+                  {&metrics, &log}, settings.worker_threads),
+          coordinator(eviction::EvictionCoordinator::Options{
+              .idle_sleep = std::chrono::milliseconds(kEvictionThreadSleepMs),
+              .no_progress_backoff =
+                  std::chrono::milliseconds(kEvictionThreadSleepMs),
+          }) {}
 
     static bool InPlan(const eviction::Plan& plan, const Replica& replica) {
         return std::find(plan.release.begin(), plan.release.end(),
@@ -401,6 +406,7 @@ struct MasterService::MemoryEviction {
     eviction::LogObserver log;
     // Last, so everything it refers to is built first.
     eviction::Evictor evictor;
+    eviction::EvictionCoordinator coordinator;
 };
 
 // KVCS reuses the common replica evictor above. Provider deletion and the DFS
@@ -955,6 +961,9 @@ MasterService::~MasterService() {
     StopBatchOpLogPruningWorker();
     // Stop and join the threads
     eviction_running_ = false;
+    if (memory_eviction_) {
+        memory_eviction_->coordinator.Stop();
+    }
     // Stop publishing transitions and deliver what is already queued, while
     // the offboarding worker can still accept the resulting jobs and the
     // members the listener touches are still alive.
@@ -4969,6 +4978,10 @@ auto MasterService::AllocateReplicas(const std::string& key,
                 MasterMetricManager::instance().inc_put_start_alloc_failures();
                 if (has_enough_memory_segments) {
                     need_mem_eviction_ = true;
+                    if (eviction_ratio_ > 0.0) {
+                        memory_eviction_->coordinator
+                            .NotifyMemoryAllocFailure();
+                    }
                 }
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
             }
@@ -5023,6 +5036,9 @@ auto MasterService::AllocateReplicas(const std::string& key,
                 allocated_memory_replicas != config.replica_num &&
                 has_enough_memory_segments) {
                 need_mem_eviction_ = true;
+                if (eviction_ratio_ > 0.0) {
+                    memory_eviction_->coordinator.NotifyMemoryAllocFailure();
+                }
             }
             if (config.nof_replica_num > 0 &&
                 allocated_nof_replicas != config.nof_replica_num) {
@@ -5093,6 +5109,12 @@ auto MasterService::AllocateReplicas(const std::string& key,
             }
             replicas.emplace_back(std::move(*alloc), ReplicaStatus::PROCESSING);
         }
+    }
+
+    if (allocated_memory_replicas > 0 &&
+        segment_manager_.GetMemoryUsage().used_ratio() >
+            eviction_high_watermark_ratio_) {
+        memory_eviction_->coordinator.NotifyMemoryHighWatermark();
     }
 
     return replicas;
@@ -9556,23 +9578,35 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
 void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
+    auto& coordinator = memory_eviction_->coordinator;
+    auto needs_mem_eviction = [this, &coordinator](double ratio) {
+        return ratio > eviction_high_watermark_ratio_ ||
+               (need_mem_eviction_.load(std::memory_order_relaxed) &&
+                eviction_ratio_ > 0.0 &&
+                !coordinator.IsInMemoryAllocCooldown());
+    };
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
+#ifdef USE_NOF
+    auto next_nof_eviction_time = std::chrono::steady_clock::now();
+#endif
     while (eviction_running_) {
         // RFC #4700 slice 1: eviction, tenant watermark eviction, DFS/NoF
         // eviction, expired-processing discard and promotion retry all
         // mutate business metadata, so none of them runs while a promotion
         // restore is in flight.
         if (!AdmitsBusinessWorkers()) {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(kEvictionThreadSleepMs));
+            coordinator.WaitForNextCycle(/*keep_draining_memory=*/false);
             continue;
         }
 
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
-        if (used_ratio > eviction_high_watermark_ratio_ ||
-            (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
+        bool mem_freed = false;
+        if (!coordinator.IsInMemoryNoProgressBackoff() &&
+            needs_mem_eviction(used_ratio)) {
+            const bool above_hwm_before =
+                used_ratio > eviction_high_watermark_ratio_;
             LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
                       << " high_watermark=" << eviction_high_watermark_ratio_
                       << " need_mem_eviction=" << need_mem_eviction_
@@ -9583,7 +9617,13 @@ void MasterService::EvictionThreadFunc() {
             double evict_ratio_lowerbound =
                 std::max(evict_ratio_target * 0.5,
                          used_ratio - eviction_high_watermark_ratio_);
-            BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+            mem_freed = BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+            const bool above_hwm_after =
+                segment_manager_.GetMemoryUsage().used_ratio() >
+                eviction_high_watermark_ratio_;
+            coordinator.RecordMemoryRound(
+                mem_freed,
+                /*pace_alloc_failures=*/!above_hwm_before && !above_hwm_after);
             LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
             last_discard_time = now;
         } else if (now - last_discard_time > put_start_release_timeout_sec_) {
@@ -9609,17 +9649,24 @@ void MasterService::EvictionThreadFunc() {
         }
 
 #ifdef USE_NOF
-        double nof_used_ratio = nof_segment_manager_.GetUsage().used_ratio();
-        if (nof_used_ratio > nof_eviction_high_watermark_ratio_ ||
-            (need_nof_eviction_ && nof_eviction_ratio_ > 0.0)) {
-            double nof_evict_ratio_target =
-                std::max(nof_eviction_ratio_,
-                         nof_used_ratio - nof_eviction_high_watermark_ratio_ +
-                             nof_eviction_ratio_);
-            double nof_evict_ratio_lowerbound =
-                std::max(nof_evict_ratio_target * 0.5,
-                         nof_used_ratio - nof_eviction_high_watermark_ratio_);
-            NoFBatchEvict(nof_evict_ratio_target, nof_evict_ratio_lowerbound);
+        if (std::chrono::steady_clock::now() >= next_nof_eviction_time) {
+            double nof_used_ratio =
+                nof_segment_manager_.GetUsage().used_ratio();
+            if (nof_used_ratio > nof_eviction_high_watermark_ratio_ ||
+                (need_nof_eviction_ && nof_eviction_ratio_ > 0.0)) {
+                double nof_evict_ratio_target = std::max(
+                    nof_eviction_ratio_,
+                    nof_used_ratio - nof_eviction_high_watermark_ratio_ +
+                        nof_eviction_ratio_);
+                double nof_evict_ratio_lowerbound = std::max(
+                    nof_evict_ratio_target * 0.5,
+                    nof_used_ratio - nof_eviction_high_watermark_ratio_);
+                NoFBatchEvict(nof_evict_ratio_target,
+                              nof_evict_ratio_lowerbound);
+            }
+            next_nof_eviction_time =
+                std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(kEvictionThreadSleepMs);
         }
 #endif
 
@@ -9645,17 +9692,20 @@ void MasterService::EvictionThreadFunc() {
             RunPromotionCandidateRetry();
         }
 
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kEvictionThreadSleepMs));
+        const bool keep_draining =
+            mem_freed && segment_manager_.GetMemoryUsage().used_ratio() >
+                             eviction_high_watermark_ratio_;
+        coordinator.WaitForNextCycle(keep_draining);
     }
 
     VLOG(1) << "action=eviction_thread_stopped";
 }
 
-void MasterService::DiscardExpiredProcessingReplicas(
+uint64_t MasterService::DiscardExpiredProcessingReplicas(
     const metadata::Namespace& ns,
     const std::chrono::system_clock::time_point& now) {
     std::list<DiscardedReplicas> discarded_replicas;
+    uint64_t freed_memory_bytes = 0;
     const TenantId& tenant_id = ns.id();
 
     // Every task of the tenant lives on its own object, and the namespace
@@ -9874,10 +9924,16 @@ void MasterService::DiscardExpiredProcessingReplicas(
         }
         if (task->alloc_id != 0) {
             const ReplicaID alloc_id = task->alloc_id;
-            EraseReplicasWithCacheTotalAccounting(
+            const auto* alloc = metadata.GetReplicaByID(alloc_id);
+            const bool was_memory =
+                alloc != nullptr && alloc->is_memory_replica();
+            const size_t erased = EraseReplicasWithCacheTotalAccounting(
                 metadata, [alloc_id](const Replica& replica) {
                     return replica.id() == alloc_id;
                 });
+            if (was_memory && erased > 0) {
+                freed_memory_bytes += metadata.TotalLength();
+            }
         }
         LOG(WARNING) << "Promotion task expired for key: " << key;
         task.reset();
@@ -9891,6 +9947,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
         discarded_replicas_.splice(discarded_replicas_.end(),
                                    std::move(discarded_replicas));
     }
+    return freed_memory_bytes;
 }
 
 uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
@@ -9920,7 +9977,7 @@ MasterService::NamespaceEvictionResult MasterService::EvictNamespaceMemory(
             .evicted_objects = report.evicted_objects};
 }
 
-void MasterService::BatchEvict(double evict_ratio_target,
+bool MasterService::BatchEvict(double evict_ratio_target,
                                double evict_ratio_lowerbound) {
     // Consume the allocation-pressure signal before this round. A new failure
     // during the round remains visible to the next iteration.
@@ -9931,9 +9988,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // Writes that expired before they finished, and replicas whose release
     // was deferred, go first, so the round judges what is left.
     const auto now = std::chrono::system_clock::now();
+    uint64_t freed_expired_bytes = 0;
     VisitNamespaces(
         [&](const TenantId& /*tenant_id*/, metadata::Namespace& ns) {
-            DiscardExpiredProcessingReplicas(ns, now);
+            freed_expired_bytes += DiscardExpiredProcessingReplicas(ns, now);
         });
     const uint64_t released_discarded = ReleaseExpiredDiscardedReplicas(now);
     const eviction::Report report = memory_eviction_->evictor.Run(
@@ -9941,6 +9999,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
         eviction::ObjectGoal{.target_ratio = evict_ratio_target,
                              .min_ratio = evict_ratio_lowerbound});
     const bool made_progress = report.MadeProgress() || released_discarded > 0;
+    const bool has_pending_async_reclaim =
+        (enable_oplog_ && report.released_bytes > 0) ||
+        (offload_on_evict_ && report.offload_bytes > 0);
+    const bool freed_memory =
+        !has_pending_async_reclaim &&
+        (report.released_bytes > 0 || released_discarded > 0 ||
+         freed_expired_bytes > 0);
     if (allocation_pressure && !report.stopped && !made_progress &&
         report.filed > 0) {
         need_mem_eviction_.store(true, std::memory_order_relaxed);
@@ -9959,6 +10024,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         metrics.inc_eviction_fail();
         metrics.inc_mem_eviction_fail();
     }
+    return freed_memory;
 }
 
 void MasterService::NoFBatchEvict(double evict_ratio_target,
