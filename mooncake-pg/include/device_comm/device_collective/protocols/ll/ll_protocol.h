@@ -20,10 +20,10 @@ class DeviceTransferService;
 // One communicator's LL tag-recycle signals and per-channel progress.
 class LLProtocol final : public ProtocolProvider {
    public:
-    enum class Scope { Group, LocalHost };
+    enum class Scope { Group, DirectPeers };
 
     static constexpr std::string_view kProtocolKey = "ll";
-    static constexpr std::string_view kLocalHostProtocolKey = "ll-local-host";
+    static constexpr std::string_view kDirectPeersProtocolKey = "ll-direct";
     static constexpr uint32_t kEndpointVersion = 1;
 
     static PGResult<std::unique_ptr<LLProtocol>> create(

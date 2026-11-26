@@ -169,7 +169,6 @@ add_library(
 
 # The initial collective v2 runtime implementation is CUDA-only.
 if(USE_CUDA)
-  target_link_libraries(mooncake_pg PRIVATE OpenSSL::Crypto)
   target_sources(
     mooncake_pg
     PRIVATE

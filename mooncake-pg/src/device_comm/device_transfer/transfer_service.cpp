@@ -489,7 +489,6 @@ struct DeviceTransferService::DeviceState {
     MappedHostBuffer<DeviceTransferHandle::PauseMailbox> pause_mailbox;
     DeviceTransferHandle::PauseMailbox::PauseSlot::RequestHandle pause_request;
     std::optional<uint64_t> installed_version;
-    uint64_t local_host_peers = 0;
     DeviceMetadata device_metadata;
     // Pinned host image copied into device_metadata.routes.
     PinnedHostBuffer<DeviceTransferRoute> host_route_image;
@@ -539,7 +538,6 @@ struct DeviceTransferService::PublishedState {
     const DeviceTransferHandle* device_handle = nullptr;
     DeviceTransferEndpoint local_endpoint;
     std::vector<DeviceTransferRouteInfo> routes;
-    uint64_t local_host_peers = 0;
     DeviceTransferRegion* peer_accessible_region = nullptr;
     DeviceTransferRegion* local_staging_region = nullptr;
 };
@@ -597,7 +595,6 @@ void DeviceTransferService::publishHostState() {
     next->device_index = state.device_index;
     next->device_handle = state.device_metadata.handle;
     next->local_endpoint = state.local_endpoint;
-    next->local_host_peers = state.local_host_peers;
     next->routes =
         describeRoutes({state.host_route_image.get(), state.max_world_size});
     next->peer_accessible_region = &state.peer_accessible_region;
@@ -621,12 +618,6 @@ PGResult<DeviceTransferRouteInfo> DeviceTransferService::routeInfo(
         rank >= 0 && static_cast<size_t>(rank) < published_->routes.size(),
         "transfer rank is out of range");
     return published_->routes[rank];
-}
-
-uint64_t DeviceTransferService::localHostPeers() const {
-    std::lock_guard lock(published_mutex_);
-    PG_ASSERT(published_, "DTS is unavailable");
-    return published_->local_host_peers;
 }
 
 DeviceTransferEndpoint DeviceTransferService::localEndpoint() const {
@@ -697,7 +688,6 @@ PGResult<DeviceTransferInstallResult> DeviceTransferService::installEndpoints(
     PG_ASSERT_OK(state.updateRoutes());
     PG_ASSERT_OK(state.publishRoutes());
     state.installed_version = snapshot.version;
-    state.local_host_peers = localHostPeerMask(state.local_endpoint, snapshot);
     std::vector<RouteEndpoint> routes;
     for (const auto& route : state.route_providers) {
         if (auto endpoint = route->localEndpoint())

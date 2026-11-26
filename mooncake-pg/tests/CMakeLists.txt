@@ -13,5 +13,5 @@ target_include_directories(pg_collective_foundation_test PRIVATE
                            ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 target_compile_features(pg_collective_foundation_test PRIVATE cxx_std_20)
 target_link_libraries(pg_collective_foundation_test PRIVATE gtest_main
-                      yalantinglibs::yalantinglibs OpenSSL::Crypto)
+                      yalantinglibs::yalantinglibs)
 add_test(NAME pg_collective_foundation_test COMMAND pg_collective_foundation_test)
