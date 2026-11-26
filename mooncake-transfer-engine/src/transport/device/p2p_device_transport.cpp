@@ -263,13 +263,21 @@ bool macaP2pPairAllowed(int src_physical, int dst_physical) {
 
 namespace {
 
+// The P2P memory functions report a failed runtime call by their result. The
+// runtime also keeps that error pending on the calling thread, where the
+// caller's next cudaGetLastError() would return it, so take it off here.
+cudaError_t takeError(cudaError_t err) {
+    if (err != cudaSuccess) cudaGetLastError();
+    return err;
+}
+
 struct P2pMappingImpl : P2pMapping {
     ~P2pMappingImpl() override {
         if (!ptr) return;
         int previous_device = -1;
-        if (cudaGetDevice(&previous_device) != cudaSuccess ||
+        if (takeError(cudaGetDevice(&previous_device)) != cudaSuccess ||
             (previous_device != import_device &&
-             cudaSetDevice(import_device) != cudaSuccess)) {
+             takeError(cudaSetDevice(import_device)) != cudaSuccess)) {
             LOG(ERROR) << "[P2P] failed to select device for mapping cleanup";
             return;
         }
@@ -279,13 +287,13 @@ struct P2pMappingImpl : P2pMapping {
             cuMemAddressFree(reinterpret_cast<CUdeviceptr>(ptr), size);
             cuMemRelease(handle);
         } else {
-            cudaIpcCloseMemHandle(ptr);
+            takeError(cudaIpcCloseMemHandle(ptr));
         }
 #else
-        cudaIpcCloseMemHandle(ptr);
+        takeError(cudaIpcCloseMemHandle(ptr));
 #endif
         if (previous_device != import_device &&
-            cudaSetDevice(previous_device) != cudaSuccess)
+            takeError(cudaSetDevice(previous_device)) != cudaSuccess)
             LOG(ERROR)
                 << "[P2P] failed to restore device after mapping cleanup";
     }
@@ -309,7 +317,7 @@ std::vector<int32_t> exportIpcMemory(void* ptr) {
     }
 
     cudaPointerAttributes attr{};
-    cudaError_t attr_err = cudaPointerGetAttributes(&attr, ptr);
+    cudaError_t attr_err = takeError(cudaPointerGetAttributes(&attr, ptr));
     if (attr_err != cudaSuccess || attr.type != cudaMemoryTypeDevice ||
         attr.devicePointer == nullptr) {
         LOG(WARNING) << "[P2P] skip MACA IPC handle export for "
@@ -325,7 +333,7 @@ std::vector<int32_t> exportIpcMemory(void* ptr) {
     if (ipc_mode == "cross-v2" || ipc_mode == "cross_v2") {
         mcIpcCrossMemHandle_t handle;
         cudaError_t err = mcIpcGetMemHandleCross_v2(&handle, ptr);
-        if (err != cudaSuccess) {
+        if (takeError(err) != cudaSuccess) {
             LOG(ERROR) << "[P2P] mcIpcGetMemHandleCross_v2 failed: "
                        << cudaGetErrorString(err);
             return {};
@@ -346,7 +354,7 @@ std::vector<int32_t> exportIpcMemory(void* ptr) {
 #else
     cudaError_t err = cudaIpcGetMemHandle(&handle, ptr);
 #endif
-    if (err != cudaSuccess) {
+    if (takeError(err) != cudaSuccess) {
         LOG(ERROR) << "[P2P] IPC handle export failed: "
                    << cudaGetErrorString(err);
         return {};
@@ -393,7 +401,7 @@ void* importIpcMemory(const std::vector<int32_t>& payload) {
                                    cudaIpcMemLazyEnablePeerAccess);
 #endif
     }
-    if (err != cudaSuccess) {
+    if (takeError(err) != cudaSuccess) {
         LOG(WARNING) << "[P2P] IPC handle import failed: "
                      << cudaGetErrorString(err);
         return nullptr;
@@ -422,7 +430,8 @@ std::unique_ptr<P2pMapping> importFabricMemory(
     size_t size = 0;
     if (!deserializeFabricHandle(payload, &exported, &size)) return nullptr;
     auto mapping = std::make_unique<P2pMappingImpl>();
-    if (cudaGetDevice(&mapping->import_device) != cudaSuccess) return nullptr;
+    if (takeError(cudaGetDevice(&mapping->import_device)) != cudaSuccess)
+        return nullptr;
     CUmemGenericAllocationHandle handle = 0;
     auto result = cuMemImportFromShareableHandle(&handle, &exported,
                                                  CU_MEM_HANDLE_TYPE_FABRIC);
@@ -456,8 +465,8 @@ std::vector<int32_t> exportP2pMemory(void* ptr, size_t bytes) {
 #if defined(USE_CUDA)
     cudaPointerAttributes attributes{};
     int device = -1;
-    if (cudaGetDevice(&device) != cudaSuccess ||
-        cudaPointerGetAttributes(&attributes, ptr) != cudaSuccess ||
+    if (takeError(cudaGetDevice(&device)) != cudaSuccess ||
+        takeError(cudaPointerGetAttributes(&attributes, ptr)) != cudaSuccess ||
         attributes.type != cudaMemoryTypeDevice || attributes.device != device)
         return {};
     CUmemGenericAllocationHandle handle = 0;
@@ -502,14 +511,16 @@ std::unique_ptr<P2pMapping> importP2pMemory(
     if (kind == P2pHandleKind::Fabric) {
         CUmemAccessDesc access{};
         access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        if (cudaGetDevice(&access.location.id) != cudaSuccess) return nullptr;
+        if (takeError(cudaGetDevice(&access.location.id)) != cudaSuccess)
+            return nullptr;
         access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         return importFabricMemory(payload, &access, 1);
     }
 #endif
     if (kind != P2pHandleKind::Ipc) return nullptr;
     auto mapping = std::make_unique<P2pMappingImpl>();
-    if (cudaGetDevice(&mapping->import_device) != cudaSuccess) return nullptr;
+    if (takeError(cudaGetDevice(&mapping->import_device)) != cudaSuccess)
+        return nullptr;
     mapping->ptr = importIpcMemory(payload);
     if (!mapping->ptr) return nullptr;
     return mapping;
