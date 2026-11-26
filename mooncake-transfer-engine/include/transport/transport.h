@@ -785,7 +785,10 @@ class Transport {
 
     // Submit WRITE tasks with receiver-visible completion guarantees: when a
     // task reaches COMPLETED, the written bytes are ready for the receiver to
-    // consume.
+    // consume. Shares submitTransferTask()'s synchronous slice-publication
+    // contract: implementations must attach and count every slice (including
+    // any visibility flush slice) in task->slice_count before returning, with
+    // no background worker appending slices afterward.
     virtual Status submitReceiverVisibleWriteTasks(
         const std::vector<TransferTask *> &task_list) {
         (void)task_list;

@@ -139,10 +139,6 @@ class MultiTransport {
     Status freeBatchID(BatchID batch_id,
                        const std::function<void()> &before_delete);
 
-    Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest> &entries,
-                          std::vector<size_t> *task_sizes);
-
     Status submitTransferImpl(BatchID batch_id,
                               const std::vector<TransferRequest> &entries,
                               std::vector<size_t> *task_sizes,

@@ -593,6 +593,10 @@ Status TcpTransport::submitTransferTask(
 
 Status TcpTransport::validateReceiverVisibleWrites(
     const std::vector<TransferRequest>& entries) const {
+    if (!metadata_) {
+        return Status::InvalidArgument(
+            "receiver-visible TCP write metadata is unavailable");
+    }
     if (forceLegacyTcpProto()) {
         return Status::ProtocolUnsupported(
             "receiver-visible TCP write requires v2 framing (MC_TCP_PROTO=1)");
@@ -606,7 +610,8 @@ Status TcpTransport::validateReceiverVisibleWrites(
     // cached across stages.
     std::unordered_set<SegmentID> validated_targets;
     for (const auto& entry : entries) {
-        if (metacache && !validated_targets.insert(entry.target_id).second) {
+        if (metacache && entries.size() > 1 &&
+            !validated_targets.insert(entry.target_id).second) {
             continue;
         }
         auto desc = metadata_->getSegmentDescByID(entry.target_id);

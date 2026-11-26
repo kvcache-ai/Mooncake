@@ -619,13 +619,6 @@ Status MultiTransport::submitReceiverVisibleWrite(
                               /*require_receiver_visible=*/true);
 }
 
-Status MultiTransport::submitTransfer(
-    BatchID batch_id, const std::vector<TransferRequest>& entries,
-    std::vector<size_t>* task_sizes) {
-    return submitTransferImpl(batch_id, entries, task_sizes,
-                              /*require_receiver_visible=*/false);
-}
-
 Status MultiTransport::submitTransferImpl(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     std::vector<size_t>* task_sizes, bool require_receiver_visible) {
@@ -652,10 +645,6 @@ Status MultiTransport::submitTransferImpl(
             "event-enabled batch rejects an empty submit");
     }
 
-    std::vector<Transport*> transports;
-    auto select_status = selectTransports(entries, transports);
-    if (!select_status.ok()) return select_status;
-
     if (entries.empty()) return Status::OK();
 
     if (require_receiver_visible) {
@@ -665,6 +654,13 @@ Status MultiTransport::submitTransferImpl(
                     "receiver-visible submission requires WRITE entries");
             }
         }
+    }
+
+    std::vector<Transport*> transports;
+    auto select_status = selectTransports(entries, transports);
+    if (!select_status.ok()) return select_status;
+
+    if (require_receiver_visible) {
         bool single_transport = true;
         Transport* first_transport = transports[0];
         for (size_t i = 1; i < transports.size(); ++i) {
@@ -803,7 +799,9 @@ Status MultiTransport::submitScatter(
     if (!Transport::isValidBatchID(submission.batch_id))
         return Status::InvalidArgument(
             "failed to allocate scatter transfer batch");
-    return submitTransfer(submission.batch_id, entries, &submission.task_sizes);
+    return submitTransferImpl(submission.batch_id, entries,
+                              &submission.task_sizes,
+                              /*require_receiver_visible=*/false);
 }
 
 #ifdef ENABLE_MULTI_PROTOCOL

@@ -220,7 +220,8 @@ class TransferEngine {
     // Error taxonomy (all preflight errors return before mutating the batch):
     //   - NotImplemented: TENT backend or producer_event on classic TE.
     //   - NotSupportedTransport: any entry routes to a transport that does not
-    //     support receiver-visible writes.
+    //     support receiver-visible writes (or whose advertised transport is not
+    //     installed locally).
     //   - ProtocolUnsupported: the routed transport supports receiver-visible
     //     writes, but the active protocol override (MC_TCP_PROTO=1) or a
     //     target peer's protocol version (tcp_proto_version < 2) does not. A
@@ -232,10 +233,14 @@ class TransferEngine {
     //     transport does not publish batch completion counters.
     //   - TooManyRequests: batch capacity exceeded.
     //
-    // Empty non-event entries validate batch_id, TENT, and event-enabled
-    // constraints before returning OK without mutating the batch. Zero-length
+    // Empty entries validate TENT, batch_id, and event-enabled constraints
+    // before returning OK on a valid non-event classic batch without mutating
+    // it (regardless of installed transports or MC_TCP_PROTO). Zero-length
     // entries still validate the route, WRITE opcode, and peer protocol
-    // version, then complete locally (COMPLETED) without wire I/O.
+    // version, then complete locally (COMPLETED) without wire I/O. At dispatch
+    // time, TcpTransport::startTransfer() re-checks peer protocol eligibility
+    // and fails individual tasks (FAILED) if metadata downgraded after
+    // preflight.
     Status submitReceiverVisibleWrite(
         BatchID batch_id, const std::vector<TransferRequest>& entries);
 

@@ -52,6 +52,7 @@
 #include <vector>
 
 #include "common.h"
+#include "config.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -2075,6 +2076,14 @@ TEST(TcpWriteVisibilityTest, ReceiverVisibleWriteWaitsForReceiverAck) {
         // MultiTransport::submitTransferImpl: empty rejects with
         // InvalidArgument, and classic TCP (supportsBatchCompletionCounter ==
         // false) fails closed with CompletionNotificationUnsupported.
+        // Pin slice_timeout = -1 so MC_SLICE_TIMEOUT in the environment cannot
+        // prevent enableBatchCompletionNotification from enabling the batch.
+        const int64_t saved_slice_timeout = globalConfig().slice_timeout;
+        globalConfig().slice_timeout = -1;
+        struct RestoreSliceTimeout {
+            int64_t saved;
+            ~RestoreSliceTimeout() { globalConfig().slice_timeout = saved; }
+        } restore_slice_timeout{saved_slice_timeout};
         const auto event_batch = h.engine->allocateBatchID(1);
         ASSERT_TRUE(
             h.engine->enableBatchCompletionNotification(event_batch).ok());
@@ -2134,6 +2143,8 @@ TEST(TcpWriteVisibilityTest, ReceiverVisibleWriteWaitsForReceiverAck) {
 
 TEST(TcpWriteVisibilityTest,
      ReceiverVisibleWriteRejectsUnsupportedAndInvalidRequests) {
+    EXPECT_EQ(Status::CodeToString(Status::Code::kProtocolUnsupported),
+              "ProtocolUnsupported");
     // MC_TCP_PROTO=1 rejects non-zero and zero-length writes with
     // ProtocolUnsupported (distinct from NotImplemented), while empty entries
     // and plain submitTransfer still succeed.
@@ -2170,12 +2181,16 @@ TEST(TcpWriteVisibilityTest,
         ScopedEnvVar pooling("MC_TCP_ENABLE_CONNECTION_POOL", "1");
         LocalHttpMetadataServer metadata_server;
         ASSERT_TRUE(metadata_server.ok());
-        EngineHandle v2, legacy_peer;
+        EngineHandle v2, v2_peer, legacy_peer;
         v2.init(metadata_server.uri(), "127.0.0.2:17995", 2 * kSmallLength, {},
                 /*configure_pool_env=*/false);
+        v2_peer.init(metadata_server.uri(), "127.0.0.2:17986", kSmallLength, {},
+                     /*configure_pool_env=*/false);
         legacy_peer.init(metadata_server.uri(), "127.0.0.2:17996", kSmallLength,
                          {}, /*configure_pool_env=*/false);
-        ASSERT_TRUE(v2.ok && legacy_peer.ok);
+        ASSERT_TRUE(v2.ok && v2_peer.ok && legacy_peer.ok);
+        const auto v2_peer_id = v2.engine->openSegment("127.0.0.2:17986");
+        ASSERT_NE(v2_peer_id, static_cast<Transport::SegmentHandle>(-1));
         const auto legacy_id = v2.engine->openSegment("127.0.0.2:17996");
         ASSERT_NE(legacy_id, static_cast<Transport::SegmentHandle>(-1));
         {
@@ -2194,6 +2209,9 @@ TEST(TcpWriteVisibilityTest,
         memset(source, 0x5c, kSmallLength);
         auto v2_write = makeWriteRequest(v2, kSmallLength);
         v2_write.source = source;
+        TransferRequest v2_peer_write = v2_write;
+        v2_peer_write.target_id = v2_peer_id;
+        v2_peer_write.target_offset = v2_peer.remote_base;
         auto read_req = makeReadRequest(v2, source, kSmallLength);
         TransferRequest legacy_write = v2_write;
         legacy_write.target_id = legacy_id;
@@ -2204,7 +2222,7 @@ TEST(TcpWriteVisibilityTest,
         int dummy_event = 1;
         event_write.producer_event = &dummy_event;
 
-        const auto batch = v2.engine->allocateBatchID(2);
+        const auto batch = v2.engine->allocateBatchID(3);
         EXPECT_TRUE(v2.engine->submitReceiverVisibleWrite(batch, {legacy_write})
                         .IsProtocolUnsupported());
         EXPECT_TRUE(v2.engine->submitReceiverVisibleWrite(batch, {legacy_zero})
@@ -2248,12 +2266,19 @@ TEST(TcpWriteVisibilityTest,
             v2.engine
                 ->submitReceiverVisibleWrite(batch, {legacy_write, shm_write})
                 .IsProtocolUnsupported());
+        // Interleaved {TCP v2, SHM, TCP v1} exercises appending a non-adjacent
+        // entry to an existing transport group in MultiTransport.
+        EXPECT_TRUE(v2.engine
+                        ->submitReceiverVisibleWrite(
+                            batch, {v2_peer_write, shm_write, legacy_write})
+                        .IsProtocolUnsupported());
         EXPECT_TRUE(
             v2.engine
                 ->submitReceiverVisibleWrite(batch, {shm_write, legacy_write})
                 .IsNotSupportedTransport());
         EXPECT_TRUE(Transport::toBatchDesc(batch).task_list.empty());
         EXPECT_EQ(static_cast<char*>(v2.pool)[0], 0);
+        EXPECT_EQ(static_cast<char*>(v2_peer.pool)[0], 0);
         EXPECT_EQ(static_cast<char*>(legacy_peer.pool)[0], 0);
 
         // Upgrading the legacy peer back to v2 makes it eligible again without
@@ -2275,6 +2300,10 @@ TEST(TcpWriteVisibilityTest,
             v2.engine
                 ->submitReceiverVisibleWrite(batch, {legacy_write, shm_write})
                 .IsNotSupportedTransport());
+        EXPECT_TRUE(v2.engine
+                        ->submitReceiverVisibleWrite(
+                            batch, {v2_peer_write, shm_write, legacy_write})
+                        .IsNotSupportedTransport());
         EXPECT_TRUE(
             v2.engine
                 ->submitReceiverVisibleWrite(batch, {shm_write, legacy_write})
