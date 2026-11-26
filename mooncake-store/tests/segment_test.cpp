@@ -1909,4 +1909,144 @@ TEST_F(SegmentTest, QuerySegments) {
     ASSERT_EQ(capacity, 0);
 }
 
+TEST_F(SegmentTest,
+       SharedAllocatorSnapshotReusesPointerAndRefreshesOnMutations) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    const UUID client_id = generate_uuid();
+    auto session = SessionFor(client_id);
+
+    Segment seg1;
+    seg1.id = generate_uuid();
+    seg1.name = "cached_seg_1";
+    seg1.size = 16 * 1024 * 1024;
+    seg1.base = 0x100000000ULL;
+    seg1.protocol = "rdma";
+
+    {
+        auto access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(access.MountSegment(seg1, session), ErrorCode::OK);
+    }
+
+    // Repeated reads without topology changes reuse the exact same snapshot.
+    std::shared_ptr<const AllocatorManager> snap1;
+    std::shared_ptr<const AllocatorManager> snap2;
+    {
+        auto access = segment_manager.getAllocatorAccess();
+        snap1 = access.GetSharedAllocatorSnapshot();
+    }
+    {
+        auto access = segment_manager.getAllocatorAccess();
+        snap2 = access.GetSharedAllocatorSnapshot();
+    }
+    ASSERT_NE(snap1, nullptr);
+    EXPECT_EQ(snap1.get(), snap2.get());
+    EXPECT_EQ(snap1->getNames().size(), 1u);
+    EXPECT_EQ(snap1->GetOwnerClientId("cached_seg_1"), client_id);
+
+    // Status change to DRAINING removes it from the refreshed snapshot while
+    // keeping previously retained snapshots immutable.
+    {
+        auto access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(access.SetSegmentStatusByName("cached_seg_1",
+                                                SegmentStatus::DRAINING),
+                  ErrorCode::OK);
+    }
+    std::shared_ptr<const AllocatorManager> snap_draining;
+    {
+        auto access = segment_manager.getAllocatorAccess();
+        snap_draining = access.GetSharedAllocatorSnapshot();
+    }
+    EXPECT_NE(snap_draining.get(), snap1.get());
+    EXPECT_TRUE(snap_draining->getNames().empty());
+    EXPECT_EQ(snap1->getNames().size(), 1u);
+
+    // Draining source_segment lookup still resolves metadata via fallback,
+    // without adding the draining segment back to allocatable names.
+    std::shared_ptr<const AllocatorManager> snap_with_source;
+    {
+        auto access = segment_manager.getAllocatorAccess();
+        snap_with_source = access.GetSharedAllocatorSnapshot("cached_seg_1");
+    }
+    ASSERT_NE(snap_with_source, nullptr);
+    EXPECT_NE(snap_with_source->GetSegmentMetadata("cached_seg_1"), nullptr);
+    EXPECT_TRUE(snap_with_source->getNames().empty());
+
+    // Restoring status to OK publishes it again in the cached snapshot, and
+    // passing an active source_segment reuses the cached snapshot pointer.
+    {
+        auto access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(
+            access.SetSegmentStatusByName("cached_seg_1", SegmentStatus::OK),
+            ErrorCode::OK);
+    }
+    std::shared_ptr<const AllocatorManager> snap_restored;
+    std::shared_ptr<const AllocatorManager> snap_restored_src;
+    {
+        auto access = segment_manager.getAllocatorAccess();
+        snap_restored = access.GetSharedAllocatorSnapshot();
+        snap_restored_src = access.GetSharedAllocatorSnapshot("cached_seg_1");
+    }
+    EXPECT_EQ(snap_restored->getNames().size(), 1u);
+    EXPECT_EQ(snap_restored.get(), snap_restored_src.get());
+
+    // Unmounting refreshes the cached snapshot again.
+    {
+        auto access = segment_manager.getSegmentAccess();
+        size_t dec_cap = 0;
+        ASSERT_EQ(access.PrepareUnmountSegment(seg1.id, dec_cap),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.CommitUnmountSegment(seg1.id, client_id, dec_cap),
+                  ErrorCode::OK);
+    }
+    std::shared_ptr<const AllocatorManager> snap_unmounted;
+    {
+        auto access = segment_manager.getAllocatorAccess();
+        snap_unmounted = access.GetSharedAllocatorSnapshot();
+    }
+    EXPECT_NE(snap_unmounted.get(), snap_restored.get());
+    EXPECT_TRUE(snap_unmounted->getNames().empty());
+
+    // ScopedSegmentAccess move construction transfers ownership cleanly and
+    // refreshes the cache once when the moved-to guard exits.
+    Segment seg_a;
+    seg_a.id = generate_uuid();
+    seg_a.name = "shared_name_seg";
+    seg_a.size = 16 * 1024 * 1024;
+    seg_a.base = 0x200000000ULL;
+    seg_a.protocol = "rdma";
+
+    Segment seg_b = seg_a;
+    seg_b.id = generate_uuid();
+    seg_b.base = 0x210000000ULL;
+    {
+        auto moved_guard = std::make_unique<ScopedSegmentAccess>(
+            segment_manager.getSegmentAccess());
+        ASSERT_EQ(moved_guard->MountSegment(seg_a, session), ErrorCode::OK);
+        ASSERT_EQ(moved_guard->MountSegment(seg_b, session), ErrorCode::OK);
+    }
+    // Reverse-unmounting B while A shares the same name: indexed segment
+    // rebinds to A, and GetSharedAllocatorSnapshot(name) must match
+    // SnapshotAllocatorManager(name) metadata exactly.
+    {
+        auto access = segment_manager.getSegmentAccess();
+        size_t dec_cap = 0;
+        ASSERT_EQ(access.PrepareUnmountSegment(seg_b.id, dec_cap),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.CommitUnmountSegment(seg_b.id, client_id, dec_cap),
+                  ErrorCode::OK);
+    }
+    {
+        auto access = segment_manager.getAllocatorAccess();
+        auto shared_src = access.GetSharedAllocatorSnapshot("shared_name_seg");
+        auto direct_src = access.SnapshotAllocatorManager("shared_name_seg");
+        ASSERT_NE(shared_src, nullptr);
+        ASSERT_NE(shared_src->GetSegmentMetadata("shared_name_seg"), nullptr);
+        ASSERT_NE(direct_src.GetSegmentMetadata("shared_name_seg"), nullptr);
+        EXPECT_EQ(*shared_src->GetSegmentMetadata("shared_name_seg"),
+                  *direct_src.GetSegmentMetadata("shared_name_seg"));
+        EXPECT_EQ(shared_src->GetSegmentMetadata("shared_name_seg")->id,
+                  seg_a.id);
+    }
+}
+
 }  // namespace mooncake

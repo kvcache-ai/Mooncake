@@ -44,7 +44,11 @@ AllocationStrategy::AllocateForRequest(
     if (!resolved) return tl::unexpected(resolved.error());
     const auto& domain = resolved->fabric_domain;
     const auto& requester = resolved->requester;
-    auto eligible = manager.FilterForFabric(domain);
+    std::optional<AllocatorManager> filtered;
+    const AllocatorManager& eligible =
+        (domain.empty() && !manager.HasMnnvlSegments())
+            ? manager
+            : filtered.emplace(manager.FilterForFabric(domain));
     for (const auto& name : preferred_segments) {
         if (!domain.empty() && !eligible.getAllocators(name))
             return tl::unexpected(ErrorCode::INVALID_PARAMS);

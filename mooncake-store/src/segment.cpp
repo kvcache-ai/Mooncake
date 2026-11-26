@@ -129,6 +129,35 @@ AllocatorManager ScopedAllocatorAccess::SnapshotAllocatorManager(
     return snapshot;
 }
 
+std::shared_ptr<const AllocatorManager>
+ScopedAllocatorAccess::GetSharedAllocatorSnapshot(
+    const std::string& source_segment) const {
+    if (cached_snapshot_ && *cached_snapshot_) {
+        if (source_segment.empty()) {
+            return *cached_snapshot_;
+        }
+        const Segment* cached_meta =
+            (*cached_snapshot_)->GetSegmentMetadata(source_segment);
+        if (mounted_segments_ && segment_id_by_name_) {
+            auto indexed = segment_id_by_name_->find(source_segment);
+            if (indexed != segment_id_by_name_->end()) {
+                auto mounted = mounted_segments_->find(indexed->second);
+                if (mounted != mounted_segments_->end()) {
+                    if (cached_meta != nullptr &&
+                        *cached_meta == mounted->second.segment) {
+                        return *cached_snapshot_;
+                    }
+                    return std::make_shared<const AllocatorManager>(
+                        SnapshotAllocatorManager(source_segment));
+                }
+            }
+        }
+        return *cached_snapshot_;
+    }
+    return std::make_shared<const AllocatorManager>(
+        SnapshotAllocatorManager(source_segment));
+}
+
 std::vector<std::string> ScopedAllocatorAccess::GetHostOrderedSegments(
     const std::string& writer_host_id, const std::string& key) const {
     if (segments_by_host_ == nullptr) {
@@ -179,6 +208,21 @@ std::optional<UUID> ScopedAllocatorAccess::GetOwnerClientId(
         return std::nullopt;
     }
     return it->second;
+}
+
+ScopedSegmentAccess::~ScopedSegmentAccess() {
+    if (snapshot_dirty_ && segment_manager_ != nullptr && lock_.owns_lock()) {
+        try {
+            segment_manager_->cached_allocator_snapshot_ =
+                std::make_shared<const AllocatorManager>(
+                    segment_manager_->allocator_manager_.Snapshot(
+                        &segment_manager_->client_by_name_));
+        } catch (...) {
+            // Never throw out of a destructor; drop any stale cache so readers
+            // safely fall back to on-demand snapshots until the next mutation.
+            segment_manager_->cached_allocator_snapshot_.reset();
+        }
+    }
 }
 
 ErrorCode ScopedSegmentAccess::MountSegment(
@@ -249,6 +293,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
                 existing->second.buf_allocator->SetLocality(segment.locality);
             }
             segment_manager_->allocator_manager_.SetSegmentMetadata(mounted);
+            snapshot_dirty_ = true;
         }
         return ErrorCode::SEGMENT_ALREADY_EXISTS;
     }
@@ -265,6 +310,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
                 LOG(ERROR) << "Cxl global allocator has not been initialized.";
                 return ErrorCode::INTERNAL_ERROR;
             }
+            snapshot_dirty_ = true;
             auto registration =
                 segment_manager_->allocator_manager_.addAllocator(
                     segment.name, allocator, std::move(owner_session));
@@ -310,6 +356,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     allocator->SetLocality(segment.locality);
 
     allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
+    snapshot_dirty_ = true;
     auto registration = segment_manager_->allocator_manager_.addAllocator(
         segment.name, allocator, std::move(owner_session));
     segment_manager_->allocator_manager_.SetSegmentMetadata(segment);
@@ -351,6 +398,7 @@ void ScopedSegmentAccess::BindClientSession(
         if (in_allocator_manager) {
             CHECK(segment_manager_->allocator_manager_.replaceRegistrations(
                 {{mounted.segment.name, old_registration, next_registration}}));
+            snapshot_dirty_ = true;
         }
         mounted.allocator_registration = std::move(next_registration);
     }
@@ -480,6 +528,7 @@ bool ScopedSegmentAccess::ReplaceAllocators(
             manager_replacements)) {
         return false;
     }
+    snapshot_dirty_ = true;
     for (size_t i = 0; i < replacements.size(); ++i) {
         const auto& replacement = replacements[i];
         auto& mounted =
@@ -534,6 +583,7 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
                                  segment.name, registration)) {
         segment_manager_->allocator_manager_.removeAllocator(segment.name,
                                                              registration);
+        snapshot_dirty_ = true;
     }
     RemoveHostSegment(segment_manager_->segments_by_host_, segment);
 
@@ -585,6 +635,7 @@ ErrorCode ScopedSegmentAccess::PrepareGracefulUnmountSegment(
                                  segment.name, registration)) {
         segment_manager_->allocator_manager_.removeAllocator(segment.name,
                                                              registration);
+        snapshot_dirty_ = true;
     }
     registration->SetAllocatable(false);
     RemoveHostSegment(segment_manager_->segments_by_host_, segment);
@@ -604,6 +655,7 @@ void ScopedSegmentAccess::ReindexSegmentNameAfterRemoval(
 
     segment_manager_->segment_id_by_name_.erase(indexed);
     segment_manager_->client_by_name_.erase(segment_name);
+    snapshot_dirty_ = true;
 
     const auto bind_remaining = [&](bool require_ok) {
         for (const auto& [candidate_id, mounted] :
@@ -904,12 +956,14 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     const bool is_allocatable =
         HasAllocatorRegistration(allocator_manager, name, registration);
     if (should_be_allocatable && !is_allocatable && registration) {
+        snapshot_dirty_ = true;
         registration->SetAllocatable(true);
         allocator_manager.addRegistration(name, registration);
         allocator_manager.SetSegmentMetadata(mounted_segment.segment);
         AddHostSegment(segment_manager_->segments_by_host_,
                        mounted_segment.segment);
     } else if (!should_be_allocatable && is_allocatable) {
+        snapshot_dirty_ = true;
         allocator_manager.removeAllocator(name, registration);
         registration->SetAllocatable(false);
         RemoveHostSegment(segment_manager_->segments_by_host_,

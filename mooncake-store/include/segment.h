@@ -77,6 +77,14 @@ class ScopedSegmentAccess {
     explicit ScopedSegmentAccess(SegmentManager* segment_manager,
                                  std::shared_mutex& mutex)
         : segment_manager_(segment_manager), lock_(mutex) {}
+    ~ScopedSegmentAccess();
+    ScopedSegmentAccess(const ScopedSegmentAccess&) = delete;
+    ScopedSegmentAccess& operator=(const ScopedSegmentAccess&) = delete;
+    ScopedSegmentAccess(ScopedSegmentAccess&& other) noexcept
+        : segment_manager_(std::exchange(other.segment_manager_, nullptr)),
+          lock_(std::move(other.lock_)),
+          snapshot_dirty_(std::exchange(other.snapshot_dirty_, false)) {}
+    ScopedSegmentAccess& operator=(ScopedSegmentAccess&&) = delete;
 
     /**
      * @brief Mount a segment under its non-null owner's client ID.
@@ -227,6 +235,7 @@ class ScopedSegmentAccess {
 
     SegmentManager* segment_manager_;
     std::unique_lock<std::shared_mutex> lock_;
+    bool snapshot_dirty_{false};
 };
 
 class NoFSegmentManager;
@@ -318,12 +327,15 @@ class ScopedAllocatorAccess {
         const std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>*
             mounted_segments = nullptr,
         const std::unordered_map<std::string, UUID>* segment_id_by_name =
+            nullptr,
+        const std::shared_ptr<const AllocatorManager>* cached_snapshot =
             nullptr)
         : allocator_manager_(allocator_manager),
           segments_by_host_(&segments_by_host),
           client_by_name_(&client_by_name),
           mounted_segments_(mounted_segments),
           segment_id_by_name_(segment_id_by_name),
+          cached_snapshot_(cached_snapshot),
           lock_(mutex) {}
 
     const AllocatorManager& getAllocatorManager() const {
@@ -333,6 +345,12 @@ class ScopedAllocatorAccess {
     // A readable source may no longer have an allocation registration while
     // draining. Resolve its identity from mounted records under the same lock.
     AllocatorManager SnapshotAllocatorManager(
+        const std::string& source_segment = {}) const;
+
+    // Returns a shared immutable snapshot in O(1) without copying the segment
+    // maps, falling back to SnapshotAllocatorManager(source_segment) only when
+    // source_segment is draining and absent from the cached snapshot.
+    std::shared_ptr<const AllocatorManager> GetSharedAllocatorSnapshot(
         const std::string& source_segment = {}) const;
 
     std::vector<std::string> GetHostOrderedSegments(
@@ -347,6 +365,7 @@ class ScopedAllocatorAccess {
     const std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>*
         mounted_segments_{nullptr};
     const std::unordered_map<std::string, UUID>* segment_id_by_name_{nullptr};
+    const std::shared_ptr<const AllocatorManager>* cached_snapshot_{nullptr};
     std::shared_lock<std::shared_mutex> lock_;
 };
 
@@ -388,7 +407,8 @@ class SegmentManager {
     ScopedAllocatorAccess getAllocatorAccess() {
         return ScopedAllocatorAccess(allocator_manager_, segments_by_host_,
                                      client_by_name_, segment_mutex_,
-                                     &mounted_segments_, &segment_id_by_name_);
+                                     &mounted_segments_, &segment_id_by_name_,
+                                     &cached_allocator_snapshot_);
     }
 
     /**
@@ -434,6 +454,12 @@ class SegmentManager {
     std::shared_ptr<BufferAllocatorBase> cxl_global_allocator_;
     // allocator_manager_ only contains allocators whose segment status is OK.
     AllocatorManager allocator_manager_;
+    // Cached snapshot of allocator_manager_ containers and segment metadata
+    // rebuilt under unique_lock when topology or owner mappings change, so
+    // hot-path allocations copy a shared_ptr in O(1). Per-registration serving
+    // liveness remains dynamically synchronized on the registration objects.
+    std::shared_ptr<const AllocatorManager> cached_allocator_snapshot_ =
+        std::make_shared<const AllocatorManager>();
     std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>
         mounted_segments_;  // segment_id -> mounted segment
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
