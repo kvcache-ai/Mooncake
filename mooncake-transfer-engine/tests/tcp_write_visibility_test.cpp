@@ -2046,7 +2046,7 @@ TEST(TcpWriteVisibilityTest, GroupedScatterPreservesPartialFailureResults) {
 }
 
 TEST(TcpWriteVisibilityTest, SegmentDescEqualityComparesTcpProtoVersion) {
-    TransferMetadata::SegmentDesc lhs;
+    TransferMetadata::SegmentDesc lhs{};
     lhs.name = "127.0.0.2:17990";
     lhs.protocol = "tcp";
     lhs.tcp_data_host = "127.0.0.2";
@@ -2057,12 +2057,13 @@ TEST(TcpWriteVisibilityTest, SegmentDescEqualityComparesTcpProtoVersion) {
     rhs.tcp_proto_version = 2;
     EXPECT_NE(lhs, rhs);
 
-    // End-to-end syncSegmentCache verification: mutating only tcp_proto_version
+    // End-to-end metadata refresh verification: mutating only tcp_proto_version
     // in the authoritative metadata store without bumping metadata_version must
-    // exercise SegmentDesc::operator== in both shouldInstallFetchedSegmentDesc
-    // (rejecting conflicting unchanged-version metadata) and syncSegmentCache's
-    // change detection (replacing the cached snapshot when metadata_version is
-    // absent/0).
+    // exercise SegmentDesc::operator== in both:
+    //   1) shouldInstallFetchedSegmentDesc() via force-update fetch (rejecting
+    //      a conflicting descriptor with unchanged non-zero metadata_version),
+    //   2) syncSegmentCache()'s change detection (replacing the cached snapshot
+    //      for an unversioned metadata_version == 0 update).
     ScopedEnvVar pooling("MC_TCP_ENABLE_CONNECTION_POOL", "1");
     LocalHttpMetadataServer metadata_server;
     ASSERT_TRUE(metadata_server.ok());
@@ -2079,13 +2080,13 @@ TEST(TcpWriteVisibilityTest, SegmentDescEqualityComparesTcpProtoVersion) {
     ASSERT_GT(before->metadata_version, 0u);
 
     // 1) Same non-zero metadata_version with different tcp_proto_version:
-    //    shouldInstallFetchedSegmentDesc must detect `*old_desc != *new_desc`
-    //    and reject the conflicting snapshot.
+    //    force_update=true overwrites the cache unless
+    //    shouldInstallFetchedSegmentDesc() detects `*old_desc != *new_desc`
+    //    and rejects the conflicting snapshot.
     ASSERT_TRUE(metadata_server.rewriteStoredTcpProtoVersion(
         before->name, 1, /*zero_metadata_version=*/false));
-    ASSERT_EQ(h.engine->syncSegmentCache(before->name), 0);
-    auto conflict_rejected =
-        h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
+    auto conflict_rejected = h.engine->getMetadata()->getSegmentDescByID(
+        h.segment_id, /*force_update=*/true);
     ASSERT_NE(conflict_rejected, nullptr);
     EXPECT_EQ(conflict_rejected.get(), before.get());
     EXPECT_EQ(conflict_rejected->tcp_proto_version, before->tcp_proto_version);
