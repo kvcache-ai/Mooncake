@@ -36,13 +36,39 @@
 namespace mooncake {
 namespace tent {
 
-struct MnnvlCompletion {
+struct MnnvlCompletionEvent {
+    cudaEvent_t event{nullptr};
+    CUcontext context{nullptr};
+    // CUDA 12+ IDs distinguish contexts even if CUDA reuses their handles.
+    unsigned long long context_id{0};
+};
+
+class MnnvlCompletionEventPool {
+    friend class MnnvlTransportTestPeer;
+
+   public:
+    explicit MnnvlCompletionEventPool(size_t capacity) : capacity_(capacity) {}
+    ~MnnvlCompletionEventPool();
+    Status acquire(int device, MnnvlCompletionEvent &completion);
+    void release(int device, const MnnvlCompletionEvent &completion,
+                 bool completed);
+
+   private:
+    std::mutex mutex_;
+    size_t capacity_;
+    // Capacity is shared by all contexts on a device, not per context.
+    std::unordered_map<int, std::vector<MnnvlCompletionEvent>> idle_;
+};
+
+struct MnnvlCompletion : MnnvlCompletionEvent {
     MnnvlCompletion() = default;
     MnnvlCompletion(const MnnvlCompletion &) = delete;
     MnnvlCompletion &operator=(const MnnvlCompletion &) = delete;
-    cudaEvent_t event{nullptr};
+    std::shared_ptr<MnnvlCompletionEventPool> pool;
     int device{-1};
     cudaError_t result{cudaErrorNotReady};
+    bool recorded{false};
+    int last_polled_task{-1};
     ~MnnvlCompletion();
 };
 
@@ -61,6 +87,7 @@ struct MnnvlSubBatch : public Transport::SubBatch {
     CUDAStreamHandle async_stream;
     int stream_device_id = -1;
     mutable std::mutex mutex;
+    bool shared_polling{false};
     // One independently owned event per submission, even for appended work.
     std::vector<std::unique_ptr<MnnvlCompletion>> completion_groups;
     ~MnnvlSubBatch();
@@ -224,6 +251,7 @@ class MnnvlTransport : public Transport {
     // buffer that cannot be exported fails instead of staying local-only.
     bool egm_strict_ = false;
     MnnvlConfig options_;
+    std::shared_ptr<MnnvlCompletionEventPool> completion_pool_;
 };
 }  // namespace tent
 }  // namespace mooncake

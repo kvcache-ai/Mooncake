@@ -824,6 +824,13 @@ impl StoreClient {
                     }
                     Err(error) => return Err(error),
                 }
+                if !self
+                    .allocator
+                    .lock()
+                    .can_fit_after_eviction(segment_name, length_bytes)
+                {
+                    break;
+                }
                 if self.storage_owner.has_local_cold_tier_work() {
                     cold_tier::ColdTierHandle::kick_offload_for_allocator_eviction(
                         self.storage_owner.as_ref(),

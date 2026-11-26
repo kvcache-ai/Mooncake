@@ -143,12 +143,17 @@ int unregisterLocalMemoryBatch(transfer_engine_t engine, void **addr_list,
 }
 
 batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size) {
+    if (!engine) return INVALID_BATCH;
     TransferEngine *native = (TransferEngine *)engine;
     return (batch_id_t)native->allocateBatchID(batch_size);
 }
 
 int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
                    struct transfer_request *entries, size_t count) {
+    if (!engine || (!entries && count > 0) ||
+        !Transport::isValidBatchID(batch_id)) {
+        return static_cast<int>(Status::Code::kInvalidArgument);
+    }
     TransferEngine *native = (TransferEngine *)engine;
     std::vector<Transport::TransferRequest> native_entries;
     native_entries.resize(count);
@@ -168,6 +173,10 @@ int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
 int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
                              struct transfer_request *entries, size_t count,
                              notify_msg_t notify_msg) {
+    if (!engine || (!entries && count > 0) ||
+        !Transport::isValidBatchID(batch_id)) {
+        return static_cast<int>(Status::Code::kInvalidArgument);
+    }
     TransferEngine *native = (TransferEngine *)engine;
     std::vector<Transport::TransferRequest> native_entries;
     native_entries.resize(count);
@@ -189,6 +198,9 @@ int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
 
 int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
                       size_t task_id, struct transfer_status *status) {
+    if (!engine || !status || !Transport::isValidBatchID(batch_id)) {
+        return static_cast<int>(Status::Code::kInvalidArgument);
+    }
     TransferEngine *native = (TransferEngine *)engine;
     Transport::TransferStatus native_status;
     Status s = native->getTransferStatus((Transport::BatchID)batch_id, task_id,
@@ -202,7 +214,7 @@ int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
 
 int getBatchTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
                            struct transfer_status *status) {
-    if (!engine || !status || batch_id == INVALID_BATCH) {
+    if (!engine || !status || !Transport::isValidBatchID(batch_id)) {
         return static_cast<int>(Status::Code::kInvalidArgument);
     }
     auto *native = static_cast<TransferEngine *>(engine);
@@ -288,6 +300,9 @@ int genNotifyInEngine(transfer_engine_t engine, uint64_t target_id,
 }
 
 int freeBatchID(transfer_engine_t engine, batch_id_t batch_id) {
+    if (!engine || !Transport::isValidBatchID(batch_id)) {
+        return static_cast<int>(Status::Code::kInvalidArgument);
+    }
     TransferEngine *native = (TransferEngine *)engine;
     Status s = native->freeBatchID(batch_id);
     return (int)s.code();

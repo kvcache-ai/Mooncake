@@ -218,6 +218,43 @@ class MnnvlDeviceGuard {
     cudaError_t error_{cudaSuccess};
 };
 
+// Completion events retain their creation context independently of the
+// releasing thread's current context. Never replace it with a primary context.
+class MnnvlCompletionContextGuard {
+   public:
+    explicit MnnvlCompletionContextGuard(const MnnvlCompletionEvent &event) {
+        if (!event.context) {
+            error_ = CUDA_ERROR_INVALID_CONTEXT;
+            return;
+        }
+        error_ = cuCtxGetCurrent(&saved_);
+        if (error_ != CUDA_SUCCESS) return;
+#if CUDA_VERSION >= 12000
+        unsigned long long id = 0;
+        error_ = cuCtxGetId(event.context, &id);
+        if (error_ != CUDA_SUCCESS) return;
+        if (id != event.context_id) {
+            error_ = CUDA_ERROR_INVALID_CONTEXT;
+            return;
+        }
+#endif
+        if (saved_ == event.context) return;
+        error_ = cuCtxSetCurrent(event.context);
+        restore_ = error_ == CUDA_SUCCESS;
+    }
+    ~MnnvlCompletionContextGuard() {
+        if (restore_ && cuCtxSetCurrent(saved_) != CUDA_SUCCESS)
+            LOG(WARNING) << "MnnvlTransport: unable to restore caller CUDA "
+                            "context after completion event cleanup";
+    }
+    CUresult error() const { return error_; }
+
+   private:
+    CUcontext saved_{nullptr};
+    bool restore_{false};
+    CUresult error_{CUDA_SUCCESS};
+};
+
 /// Thread-local cache of one caller-sync event per device. Events are
 /// created lazily and released at thread exit; the destructor restores the
 /// device around each destroy because event teardown must run on the
@@ -296,10 +333,107 @@ uint64_t nextRelocateEpoch() {
 
 }  // namespace
 
-MnnvlCompletion::~MnnvlCompletion() {
-    if (!event) return;
+MnnvlCompletionEventPool::~MnnvlCompletionEventPool() {
+    for (auto &[device, events] : idle_) {
+        for (const auto &event : events) {
+            MnnvlCompletionContextGuard guard(event);
+            if (guard.error() == CUDA_SUCCESS)
+                (void)cudaEventDestroy(event.event);
+        }
+    }
+}
+
+Status MnnvlCompletionEventPool::acquire(int device,
+                                         MnnvlCompletionEvent &completion) {
     MnnvlDeviceGuard guard(device);
-    (void)cudaEventDestroy(event);
+    CHECK_CUDA(guard.error());
+    MnnvlCompletionEvent owner;
+    CHECK_CU(cuCtxGetCurrent(&owner.context));
+    if (!owner.context) {
+        CHECK_CUDA(cudaFree(nullptr));
+        CHECK_CU(cuCtxGetCurrent(&owner.context));
+    }
+    if (!owner.context)
+        return Status::InternalError("No current MNNVL completion context");
+#if CUDA_VERSION >= 12000
+    CHECK_CU(cuCtxGetId(owner.context, &owner.context_id));
+#endif
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto &events = idle_[device];
+        for (size_t i = events.size(); i > 0; --i) {
+            if (events[i - 1].context != owner.context ||
+                events[i - 1].context_id != owner.context_id)
+                continue;
+            completion = events[i - 1];
+            events[i - 1] = events.back();
+            events.pop_back();
+            TentMetrics::instance().recordMnnvlEvent(
+                TentMetrics::MnnvlEvent::PoolHit);
+            VLOG(1) << "MnnvlTransport: completion event pool hit device="
+                    << device;
+            return Status::OK();
+        }
+    }
+    CHECK_CUDA(cudaEventCreateWithFlags(&owner.event, cudaEventDisableTiming));
+    completion = owner;
+    TentMetrics::instance().recordMnnvlEvent(TentMetrics::MnnvlEvent::PoolMiss);
+    VLOG(1) << "MnnvlTransport: completion event pool miss device=" << device;
+    return Status::OK();
+}
+
+void MnnvlCompletionEventPool::release(int device,
+                                       const MnnvlCompletionEvent &completion,
+                                       bool completed) {
+    if (!completion.event) return;
+    MnnvlCompletionContextGuard guard(completion);
+    // A destroyed context already invalidated its events. Do not operate on
+    // an event through a new context that happens to reuse the old handle.
+    if (guard.error() != CUDA_SUCCESS) return;
+    if (completed && capacity_ != 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto &events = idle_[device];
+#if CUDA_VERSION >= 12000
+        // Contexts can die after returning events (or while another context
+        // has events in flight). Reclaim stale slots only under capacity
+        // pressure, without switching contexts or touching invalid events.
+        if (events.size() >= capacity_) {
+            events.erase(
+                std::remove_if(
+                    events.begin(), events.end(),
+                    [](const MnnvlCompletionEvent &event) {
+                        unsigned long long id = 0;
+                        const auto error = cuCtxGetId(event.context, &id);
+                        // Other errors do not establish that the owner died.
+                        return error == CUDA_ERROR_INVALID_CONTEXT ||
+                               error == CUDA_ERROR_CONTEXT_IS_DESTROYED ||
+                               (error == CUDA_SUCCESS &&
+                                id != event.context_id);
+                    }),
+                events.end());
+        }
+#endif
+        if (events.size() < capacity_) {
+            events.push_back(completion);
+            return;
+        }
+    }
+    (void)cudaEventDestroy(completion.event);
+}
+
+MnnvlCompletion::~MnnvlCompletion() {
+    // Default construction leaves both event and pool empty. Construction
+    // paths assign pool before acquiring or adopting an event, so a non-null
+    // event implies a non-null pool kept alive by shared ownership below.
+    if (!event) return;
+    MnnvlCompletionContextGuard guard(*this);
+    // Only completed, error-free records can enter the idle pool. Pending
+    // events and events that failed recording are never recycled.
+    const bool completed =
+        guard.error() == CUDA_SUCCESS && recorded &&
+        (result == cudaSuccess || result == cudaErrorNotReady) &&
+        cudaEventQuery(event) == cudaSuccess;
+    pool->release(device, *this, completed);
 }
 
 MnnvlSubBatch::~MnnvlSubBatch() {
@@ -338,6 +472,9 @@ Status MnnvlTransport::install(std::string &local_segment_name,
 
     if (!conf) conf = std::make_shared<Config>();
     CHECK_STATUS(parseMnnvlConfig(*conf, options_));
+    completion_pool_ = std::make_shared<MnnvlCompletionEventPool>(
+        options_.completion_event_pool ? options_.completion_event_pool_capacity
+                                       : 0);
     auto handle_type_str = conf->get("transports/nvlink/handle_type", "fabric");
     handle_type_ = handle_type_str == "fabric"
                        ? CU_MEM_HANDLE_TYPE_FABRIC
@@ -422,6 +559,11 @@ Status MnnvlTransport::install(std::string &local_segment_name,
               << (handle_type_ == CU_MEM_HANDLE_TYPE_FABRIC ? "fabric"
                                                             : "posix_fd")
               << " require_fabric=" << options_.require_fabric
+              << " completion_event_pool=" << options_.completion_event_pool
+              << " pool_capacity="
+              << (options_.completion_event_pool
+                      ? options_.completion_event_pool_capacity
+                      : 0)
               << " sync_mode=" << (options_.gpu_wait ? "gpu_wait" : "cpu_block")
               << " egm=" << egm_enabled_ << " copy_api=" << copy_api
               << " cuda_runtime=" << CUDART_VERSION;
@@ -492,6 +634,7 @@ Status MnnvlTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     batch = mnnvl_batch;
     mnnvl_batch->task_list.reserve(max_size);
     mnnvl_batch->max_size = max_size;
+    mnnvl_batch->shared_polling = options_.completion_event_pool;
     {
         std::lock_guard<std::mutex> lock(batch_mutex_);
         active_batches_.insert(mnnvl_batch);
@@ -508,9 +651,9 @@ Status MnnvlTransport::freeSubBatch(SubBatchRef &batch) {
     std::lock_guard<std::mutex> lock(batch_mutex_);
     CHECK_STATUS(drainMnnvlBatch(mnnvl_batch));
     active_batches_.erase(mnnvl_batch);
-    // Completion events are destroyed by ~MnnvlSubBatch(), which Slab's
-    // deallocate() invokes before returning the storage. Streams are
-    // pool-managed and not destroyed here.
+    // Completion leases are released by ~MnnvlSubBatch(), which Slab's
+    // deallocate() invokes before returning the storage. Completed events
+    // may return to their pool; streams are also pool-managed.
     Slab<MnnvlSubBatch>::Get().deallocate(mnnvl_batch);
     batch = nullptr;
     return Status::OK();
@@ -527,7 +670,7 @@ Status MnnvlTransport::submitTransferTasks(
         mnnvl_batch->max_size - mnnvl_batch->task_list.size())
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
     if (request_list.empty()) return Status::OK();
-    if (!metadata_ || !platform_)
+    if (!metadata_ || !platform_ || !completion_pool_)
         return Status::InvalidArgument("MNNVL is not installed" LOC_MARK);
 
     // Get local segment for buffer lookup
@@ -606,13 +749,9 @@ Status MnnvlTransport::submitTransferTasks(
                               ? mnnvl_batch->async_stream.get()
                               : new_stream.get();
     auto completion = std::make_unique<MnnvlCompletion>();
+    completion->pool = completion_pool_;
     completion->device = stream_device;
-    {
-        MnnvlDeviceGuard guard(stream_device);
-        CHECK_CUDA(guard.error());
-        CHECK_CUDA(cudaEventCreateWithFlags(&completion->event,
-                                            cudaEventDisableTiming));
-    }
+    CHECK_STATUS(completion_pool_->acquire(stream_device, *completion));
 
     // Reserve all bookkeeping before enqueueing any copy. Record on the
     // original caller device; syncWithCallerStream restores it after a
@@ -760,7 +899,10 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
         }
     }
 
-    if (err == cudaSuccess) err = cudaEventRecord(completion.event, stream);
+    if (err == cudaSuccess) {
+        err = cudaEventRecord(completion.event, stream);
+        completion.recorded = err == cudaSuccess;
+    }
     if (err != cudaSuccess) {
         // Batch memcpy may have accepted a prefix. Drain before terminal
         // failure allows runtime teardown or recovery to reuse these buffers.
@@ -791,8 +933,12 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
     if (task.status_word == TransferStatusEnum::PENDING) {
         auto &completion =
             *mnnvl_batch->completion_groups[task.completion_group];
-        if (completion.result == cudaErrorNotReady) {
+        if (completion.result == cudaErrorNotReady &&
+            (!mnnvl_batch->shared_polling || completion.last_polled_task < 0 ||
+             task_id <= completion.last_polled_task)) {
             MnnvlDeviceGuard guard(completion.device);
+            TentMetrics::instance().recordMnnvlEvent(
+                TentMetrics::MnnvlEvent::CompletionQuery);
             // Once copies are accepted, return terminal task status even if the
             // CUDA context fails; a poll error would invite redispatch.
             completion.result = guard.error() == cudaSuccess
@@ -817,6 +963,7 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
                         << " result=" << cudaGetErrorString(completion.result);
             }
         }
+        completion.last_polled_task = task_id;
         if (completion.result == cudaSuccess) {
             task.transferred_bytes = task.request.length;
             task.status_word = TransferStatusEnum::COMPLETED;

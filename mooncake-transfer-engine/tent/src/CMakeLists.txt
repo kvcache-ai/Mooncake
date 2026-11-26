@@ -4,6 +4,7 @@ add_library(tent_interface INTERFACE)
 target_include_directories(
   tent_interface
   INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../include>
             $<INSTALL_INTERFACE:include>)
 target_compile_features(tent_interface INTERFACE cxx_std_20)
 
@@ -13,7 +14,9 @@ target_compile_features(tent_interface INTERFACE cxx_std_20)
 if(USE_ASCEND OR USE_ASCEND_DIRECT)
   target_include_directories(
     tent_interface
-    INTERFACE ${TENT_REPOSITORY_ROOT}/mooncake-transfer-engine/allocator/ascend_allocator)
+    INTERFACE
+      ${TENT_REPOSITORY_ROOT}/mooncake-transfer-engine/allocator/ascend_allocator
+  )
 endif()
 
 if(TARGET asio_shared)
@@ -140,7 +143,8 @@ if(USE_FABRIC
     # USE_EFA/USE_CXI wheel builds may provision libfabric headers only (the
     # classic engine dlopens the library at runtime). With no linkable library,
     # build TENT without its fabric transport instead of failing the configure.
-    message(WARNING "libfabric library not found; TENT fabric transport disabled")
+    message(
+      WARNING "libfabric library not found; TENT fabric transport disabled")
     set(TENT_WITH_FABRIC
         OFF
         CACHE INTERNAL "")
@@ -151,7 +155,8 @@ if(USE_FABRIC
         CACHE INTERNAL "")
     message(STATUS "Fabric (libfabric): Enabled, ${LIBFABRIC_LIBRARY}")
     target_compile_definitions(tent_interface INTERFACE USE_FABRIC)
-    target_include_directories(tent_interface INTERFACE ${LIBFABRIC_INCLUDE_DIR})
+    target_include_directories(tent_interface
+                               INTERFACE ${LIBFABRIC_INCLUDE_DIR})
     target_link_libraries(tent_interface INTERFACE ${LIBFABRIC_LIBRARY})
   endif()
 else()

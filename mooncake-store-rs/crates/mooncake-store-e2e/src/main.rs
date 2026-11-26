@@ -1156,21 +1156,28 @@ fn verify_dynamic_expand_and_soft_shrink(
         )));
     }
 
-    let segments = target.list_segments()?;
-    let primary_state = segments
-        .iter()
-        .find(|segment| segment.segment_name == primary)
-        .ok_or_else(|| StoreError::NotFound(primary.0.clone()))?;
-    if primary_state.state != SegmentLifecycleState::Draining {
-        return Err(StoreError::InvalidState(
-            "primary elastic segment is not draining".to_string(),
-        ));
-    }
-    if primary_state.used_bytes != 0 {
-        return Err(StoreError::InvalidState(format!(
-            "primary elastic segment still has live bytes: {}",
-            primary_state.used_bytes
-        )));
+    let reclaim_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let segments = target.list_segments()?;
+        let primary_state = segments
+            .iter()
+            .find(|segment| segment.segment_name == primary)
+            .ok_or_else(|| StoreError::NotFound(primary.0.clone()))?;
+        if primary_state.state != SegmentLifecycleState::Draining {
+            return Err(StoreError::InvalidState(
+                "primary elastic segment is not draining".to_string(),
+            ));
+        }
+        if primary_state.used_bytes == 0 {
+            break;
+        }
+        if Instant::now() >= reclaim_deadline {
+            return Err(StoreError::InvalidState(format!(
+                "primary elastic segment was not reclaimed within 10s: used_bytes={}",
+                primary_state.used_bytes
+            )));
+        }
+        sleep(Duration::from_millis(100));
     }
     if !target.retire_segment(&primary)? {
         return Err(StoreError::InvalidState(

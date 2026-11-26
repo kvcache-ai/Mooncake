@@ -1456,6 +1456,39 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
     return batch_id;
 }
 
+bool TransferEngineImpl::supportsParallelBatchSubmit(SegmentID peer) const {
+    if (!available_) return false;
+    auto local = metadata_->segmentManager().getLocal();
+    SegmentDescRef remote;
+    if (peer == LOCAL_SEGMENT_ID)
+        remote = local;
+    else if (!metadata_->segmentManager().getRemoteCached(remote, peer).ok())
+        return false;
+    if (!local || !remote) return false;
+    // Equal unknown ids must remain conservative, matching the native selector.
+    const bool same_machine =
+        peer == LOCAL_SEGMENT_ID || local->machine_id == remote->machine_id;
+    bool found = false;
+    for (size_t i = 0; i < transport_list_.size(); ++i) {
+        const auto& transport = transport_list_[i];
+        if (!transport || !TransportSelector::isPeerReachable(
+                              static_cast<TransportType>(i), same_machine))
+            continue;
+        const auto caps = transport->capabilities();
+        const bool candidate = remote->type == SegmentType::File
+                                   ? caps.dram_to_file || caps.gpu_to_file
+                                   : caps.dram_to_dram || caps.dram_to_gpu ||
+                                         caps.gpu_to_dram || caps.gpu_to_gpu;
+        if (!candidate) continue;
+        // Cover possible direct submissions without planning requests. Native
+        // failover can select another candidate. Internal staging submissions
+        // remain on ProxyManager's own threads, as on the ordinary path.
+        if (!transport->supportsParallelBatchSubmit()) return false;
+        found = true;
+    }
+    return found;
+}
+
 Status TransferEngineImpl::freeBatch(BatchID batch_id) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
@@ -2062,8 +2095,7 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
                     if (type == XPU && request.target_id != LOCAL_SEGMENT_ID &&
                         !xpu_ipc)
                         continue;
-                    if ((type == NVLINK || type == SHM || type == TPU) &&
-                        !same_machine)
+                    if (!TransportSelector::isPeerReachable(type, same_machine))
                         continue;
                     const bool staged = host_staging &&
                                         !(xpu_ipc && type == XPU) &&

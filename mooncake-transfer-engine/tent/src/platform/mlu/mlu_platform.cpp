@@ -17,8 +17,11 @@
 #include <cnrt.h>
 #include <cn_api.h>
 
+#include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <string_view>
 #include <unistd.h>
@@ -88,6 +91,43 @@ Status deviceRange(void* ptr, size_t length, bool require_base = false) {
     return Status::OK();
 }
 }  // namespace
+
+Status MluPlatform::devicePciBusId(int device, std::string& identity) {
+    identity.clear();
+    char pci[32] = {};
+    CHECK_STATUS(checked(cnrtDeviceGetPCIBusId(pci, sizeof(pci), device)));
+    const auto end = std::find(std::begin(pci), std::end(pci), '\0');
+    if (end == std::begin(pci) || end == std::end(pci))
+        return Status::InternalError("Invalid MLU PCI bus identity");
+    identity.assign(pci, end);
+    std::transform(identity.begin(), identity.end(), identity.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return Status::OK();
+}
+
+Status MluPlatform::deviceByPciBusId(const std::string& identity, int& device) {
+    device = -1;
+    if (identity.empty())
+        return Status::InvalidArgument("Empty MLU PCI bus identity");
+    std::string normalized(identity);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    std::lock_guard<std::mutex> lock(pci_devices_mutex_);
+    const auto found = pci_devices_.find(normalized);
+    if (found != pci_devices_.end()) {
+        device = found->second;
+        return Status::OK();
+    }
+    int resolved = -1;
+    CHECK_STATUS(
+        checked(cnrtDeviceGetByPCIBusId(&resolved, normalized.c_str())));
+    if (resolved < 0)
+        return Status::InternalError("Invalid MLU device ordinal");
+    // Cache only successful lookups so runtime errors remain retryable.
+    pci_devices_.emplace(std::move(normalized), resolved);
+    device = resolved;
+    return Status::OK();
+}
 
 Status MluPlatform::probe(std::vector<Topology::NicEntry>& nics,
                           std::vector<Topology::MemEntry>& mems) {
