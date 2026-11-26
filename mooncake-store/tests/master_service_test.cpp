@@ -567,6 +567,144 @@ TEST_F(MasterServiceTest, DuplicateMountEnrichesOnlyUnknownLocality) {
               known.locality);
 }
 
+TEST(MasterFabricPlacementTest, PutUpsertCopyMoveRespectFabricBoundary) {
+    MasterServiceConfig service_config;
+    service_config.memory_allocator = BufferAllocatorType::OFFSET;
+    service_config.default_kv_lease_ttl = 0;
+    MasterService service(service_config);
+    const auto client_id = generate_uuid();
+    auto mount = [&](const std::string& name, const std::string& domain,
+                     const std::string& protocol) {
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = name;
+        segment.base = 0x300000000ULL;
+        segment.size = 64 * 1024 * 1024;
+        segment.te_endpoint = "10.0.0.1:18060";
+        segment.protocol = protocol;
+        if (protocol == "mnnvl")
+            segment.physical_placement =
+                PhysicalPlacement{domain, "rack1", name, 3, 0};
+        EXPECT_TRUE(service.MountSegment(segment, client_id));
+    };
+    mount("a", "fabric-a", "mnnvl");
+    mount("a2", "fabric-a", "mnnvl");
+    mount("b", "fabric-b", "mnnvl");
+    mount("tcp", "", "tcp");
+    ReplicateConfig config;
+    config.fabric_domain = "fabric-a";
+    config.requester_self_id = "rack1.a#g3";
+    config.preferred_segments = {"a"};
+    auto start = service.PutStart(client_id, "fabric-key", TenantId::Default(),
+                                  1024, config);
+    ASSERT_TRUE(start);
+    ASSERT_EQ(start->size(), 1);
+    const auto original_address = start->front()
+                                      .get_memory_descriptor()
+                                      .buffer_descriptor.buffer_address_;
+    ASSERT_TRUE(service.PutEnd(client_id, "fabric-key", TenantId::Default(),
+                               ReplicaType::MEMORY));
+    auto foreign = config;
+    foreign.fabric_domain = "fabric-b";
+    foreign.preferred_segments = {"b"};
+    auto rejected = service.UpsertStart(client_id, "fabric-key",
+                                        TenantId::Default(), 1024, foreign);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::INVALID_PARAMS);
+    rejected = service.UpsertStart(client_id, "fabric-key", TenantId::Default(),
+                                   1024, ReplicateConfig{});
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::INVALID_PARAMS);
+    auto reused = service.UpsertStart(client_id, "fabric-key",
+                                      TenantId::Default(), 1024, config);
+    ASSERT_TRUE(reused);
+    EXPECT_EQ(reused->front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_,
+              original_address);
+    ASSERT_TRUE(service.UpsertEnd(client_id, "fabric-key", TenantId::Default(),
+                                  ReplicaType::MEMORY));
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        ASSERT_EQ(access.SetSegmentStatusByName("a", SegmentStatus::DRAINING),
+                  ErrorCode::OK);
+        EXPECT_FALSE(access.IsSegmentAllocatable("a"));
+    }
+    auto copy = service.CopyStart(client_id, "fabric-key", TenantId::Default(),
+                                  "a", {"b"});
+    ASSERT_FALSE(copy);
+    EXPECT_EQ(copy.error(), ErrorCode::INVALID_PARAMS);
+    copy = service.CopyStart(client_id, "fabric-key", TenantId::Default(), "a",
+                             {"tcp"});
+    ASSERT_FALSE(copy);
+    EXPECT_EQ(copy.error(), ErrorCode::INVALID_PARAMS);
+    copy = service.CopyStart(client_id, "fabric-key", TenantId::Default(), "a",
+                             {"a2"});
+    ASSERT_TRUE(copy);
+    ASSERT_EQ(copy->targets.size(), 1);
+    ASSERT_TRUE(service.CopyEnd(client_id, "fabric-key", TenantId::Default()));
+    auto move = service.MoveStart(client_id, "fabric-key", TenantId::Default(),
+                                  "a", "b");
+    ASSERT_FALSE(move);
+    EXPECT_EQ(move.error(), ErrorCode::INVALID_PARAMS);
+    move = service.MoveStart(client_id, "fabric-key", TenantId::Default(), "a",
+                             "tcp");
+    ASSERT_FALSE(move);
+    EXPECT_EQ(move.error(), ErrorCode::INVALID_PARAMS);
+    move = service.MoveStart(client_id, "fabric-key", TenantId::Default(), "a",
+                             "a2");
+    ASSERT_TRUE(move);
+    ASSERT_TRUE(service.MoveEnd(client_id, "fabric-key", TenantId::Default()));
+    config.preferred_segments = {"b"};
+    auto escaped = service.PutStart(client_id, "foreign-preference",
+                                    TenantId::Default(), 1024, config);
+    ASSERT_FALSE(escaped);
+    EXPECT_EQ(escaped.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST(MasterFabricPlacementTest, EvictionHintStaysWithinRequestedFabric) {
+    MasterServiceConfig service_config;
+    service_config.memory_allocator = BufferAllocatorType::OFFSET;
+    service_config.default_kv_lease_ttl = 0;
+    service_config.eviction_ratio = 0;
+    service_config.eviction_high_watermark_ratio = 1;
+    MasterService service(service_config);
+    const auto client_id = generate_uuid();
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "a";
+    segment.base = 0x300000000ULL;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = "10.0.0.1:18060";
+    segment.protocol = "mnnvl";
+    segment.physical_placement =
+        PhysicalPlacement{"fabric-a", "rack1", "tray1", 3, 0};
+    ASSERT_TRUE(service.MountSegment(segment, client_id));
+
+    // A domain with no segments cannot be helped by evicting objects from
+    // healthy foreign fabrics, so the hint must stay disarmed.
+    ReplicateConfig empty;
+    empty.fabric_domain = "fabric-empty";
+    auto rejected = service.PutStart(client_id, "empty-domain",
+                                     TenantId::Default(), 1024, empty);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_FALSE(MasterServiceTestPeer::NeedMemEviction(service));
+
+    // Inside a fabric with serving segments, a capacity failure still arms
+    // eviction as before.
+    ReplicateConfig config;
+    config.fabric_domain = "fabric-a";
+    ASSERT_TRUE(service.PutStart(client_id, "fill", TenantId::Default(),
+                                 segment.size, config));
+    auto full = service.PutStart(client_id, "overflow", TenantId::Default(),
+                                 1024, config);
+    ASSERT_FALSE(full);
+    EXPECT_EQ(full.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_TRUE(MasterServiceTestPeer::NeedMemEviction(service));
+}
+
 TEST_F(MasterServiceTest, MountUnmountSegmentWithCachelibAllocator) {
     // Create a MasterService instance for testing.
     auto service_config =
@@ -4461,6 +4599,103 @@ TEST_F(MasterServiceTest, DrainJobMovesObjectsOfEveryTenant) {
     }
 }
 
+TEST_F(MasterServiceTest, MnnvlDrainSelectsOnlySameFabricAndConverges) {
+    for (bool explicit_targets : {true, false}) {
+        SCOPED_TRACE(explicit_targets);
+        MasterServiceConfig service_config;
+        service_config.memory_allocator = BufferAllocatorType::OFFSET;
+        service_config.default_kv_lease_ttl = 0;
+        MasterService service(service_config);
+        const auto client_id = generate_uuid();
+        size_t index = 0;
+        auto mount = [&](const std::string& name, const std::string& domain,
+                         const std::string& protocol) {
+            auto segment = MakeSegment(
+                name, kDefaultSegmentBase + index * kDefaultSegmentSize);
+            segment.te_endpoint =
+                "10.0.0." + std::to_string(++index) + ":18060";
+            segment.protocol = protocol;
+            if (protocol == "mnnvl")
+                segment.physical_placement =
+                    PhysicalPlacement{domain, "rack1", name, 3, 0};
+            EXPECT_TRUE(service.MountSegment(segment, client_id));
+        };
+        mount("source", "fabric-a", "mnnvl");
+        mount("target", "fabric-a", "mnnvl");
+        mount("foreign", "fabric-b", "mnnvl");
+        mount("tcp", "", "tcp");
+        ReplicateConfig config;
+        config.fabric_domain = "fabric-a";
+        config.preferred_segments = {"source"};
+        const std::string key = "fabric-drain-key";
+        ASSERT_NO_FATAL_FAILURE(
+            PutCompletedObject(service, client_id, key, config));
+        // Make the compatible target busier than the incompatible candidates.
+        // Automatic selection must filter by fabric before comparing load.
+        config.preferred_segments = {"target"};
+        ASSERT_NO_FATAL_FAILURE(
+            PutCompletedObject(service, client_id, "target-load", config));
+
+        CreateDrainJobRequest request;
+        request.segments = {"source"};
+        if (explicit_targets)
+            request.target_segments = {"foreign", "tcp", "target"};
+        request.max_concurrency = 1;
+        auto job_id = service.CreateDrainJob(request);
+        ASSERT_TRUE(job_id);
+        {
+            auto access = MasterServiceTestPeer::SegmentManager(service)
+                              .getSegmentAccess();
+            EXPECT_FALSE(access.IsSegmentAllocatable("source"));
+        }
+
+        auto fetched = service.FetchTasks(client_id, 16);
+        WaitUntil([&] {
+            if (fetched && !fetched->empty()) return true;
+            fetched = service.FetchTasks(client_id, 16);
+            return fetched && !fetched->empty();
+        });
+        ASSERT_TRUE(fetched);
+        ASSERT_EQ(fetched->size(), 1u);
+        const auto& assignment = fetched->front();
+        ASSERT_EQ(assignment.type, TaskType::REPLICA_MOVE);
+        ReplicaMovePayload payload;
+        struct_json::from_json(payload, assignment.payload);
+        EXPECT_EQ(payload.key, key);
+        EXPECT_EQ(payload.source, "source");
+        ASSERT_EQ(payload.target, "target");
+        const TenantId tenant_id(payload.tenant_id);
+        ASSERT_TRUE(tenant_id.IsValid());
+        ASSERT_TRUE(service.MoveStart(client_id, payload.key, tenant_id,
+                                      payload.source, payload.target));
+        ASSERT_TRUE(service.MoveEnd(client_id, payload.key, tenant_id));
+        TaskCompleteRequest complete;
+        complete.id = assignment.id;
+        complete.status = TaskStatus::SUCCESS;
+        complete.message = "move_done";
+        ASSERT_TRUE(service.MarkTaskToComplete(client_id, complete));
+        WaitUntil([&] {
+            auto job = service.QueryDrainJob(*job_id);
+            return job && job->status == JobStatus::SUCCEEDED;
+        });
+        auto job = service.QueryDrainJob(*job_id);
+        ASSERT_TRUE(job);
+        EXPECT_EQ(job->status, JobStatus::SUCCEEDED);
+        EXPECT_EQ(job->active_units, 0u);
+        EXPECT_EQ(job->succeeded_units, 1u);
+        auto status = service.QuerySegmentStatus("source");
+        ASSERT_TRUE(status);
+        EXPECT_EQ(*status, SegmentStatus::DRAINED);
+        auto replicas = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(replicas);
+        ASSERT_EQ(replicas->replicas.size(), 1u);
+        EXPECT_EQ(replicas->replicas.front()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  "10.0.0.2:18060");
+    }
+}
+
 TEST_F(MasterServiceTest, CancelDrainJobRestoresSegmentStatus) {
     auto service_ = std::make_unique<MasterService>();
 
@@ -5485,94 +5720,6 @@ TEST_F(MasterServiceTest, SessionManagerOwnsOffboardingShutdown) {
                                                   client_id, capacity));
         }
     }
-}
-
-// Manual fault-injection experiment for #3936; excluded from normal test runs.
-TEST_F(MasterServiceTest, DISABLED_Repro3936RemountKeepsHealthyPings) {
-    using namespace std::chrono_literals;
-    using Clock = std::chrono::steady_clock;
-    MasterServiceConfig config;
-    config.client_active_ttl_sec = 1;
-    config.client_suspicion_ttl_sec = 1;
-    MasterService service(config);
-    constexpr size_t count = 4;
-    std::vector<UUID> clients;
-    std::vector<Segment> segments;
-    std::vector<std::shared_ptr<ClientLivenessRecord>> records;
-    for (size_t i = 0; i < count; ++i) {
-        clients.push_back(generate_uuid());
-        segments.push_back(MakeSegment("repro3936_" + std::to_string(i)));
-        ASSERT_TRUE(service.MountSegment(segments.back(), clients.back()));
-        ASSERT_TRUE(service.ReMountSegment({segments.back()}, clients.back()));
-        records.push_back(FindClientLivenessForTest(service, clients.back()));
-        PutObjectOnSegment(service, clients.back(), segments.back().name);
-    }
-    const auto initial_keys = service.GetKeyCount();
-    std::atomic<bool> running{true};
-    std::atomic<size_t> completed{0};
-    std::atomic<size_t> need_remount{0};
-    std::atomic<int64_t> max_latency_ms{0};
-    std::vector<std::thread> pingers;
-    for (const auto& client : clients) {
-        pingers.emplace_back([&, client] {
-            while (running.load()) {
-                const auto start = Clock::now();
-                const auto result = service.Ping(client);
-                const auto elapsed =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        Clock::now() - start)
-                        .count();
-                auto previous = max_latency_ms.load();
-                while (
-                    elapsed > previous &&
-                    !max_latency_ms.compare_exchange_weak(previous, elapsed)) {
-                }
-                if (!result || result->client_status != ClientStatus::OK) {
-                    ++need_remount;
-                }
-                ++completed;
-                std::this_thread::sleep_for(20ms);
-            }
-        });
-    }
-    std::this_thread::sleep_for(200ms);
-    const auto baseline = completed.load();
-    // A real remount holds only its per-incarnation registration lock here.
-    // Holding snapshot_mutex_ models a slow restore/snapshot critical section.
-    std::unique_lock snapshot_lock(
-        MasterServiceTestPeer::MasterStateMutex(service));
-    bool remount_ok = false;
-    std::thread remounter([&] {
-        remount_ok =
-            service.ReMountSegment({segments[0]}, clients[0]).has_value();
-    });
-    std::this_thread::sleep_for(200ms);
-    const auto before_stall = completed.load();
-    std::this_thread::sleep_for(4s);
-    const auto during_stall = completed.load();
-    snapshot_lock.unlock();
-    remounter.join();
-    std::this_thread::sleep_for(3s);
-    running.store(false);
-    for (auto& pinger : pingers) pinger.join();
-    size_t offline = 0;
-    for (const auto& record : records) {
-        offline += record->state() == ClientLivenessState::OFFLINE;
-    }
-    const auto final_keys = service.GetKeyCount();
-    std::cout << "REPRO3936 baseline_pings=" << baseline
-              << " pings_during_4s_stall=" << during_stall - before_stall
-              << " max_ping_ms=" << max_latency_ms.load()
-              << " need_remount=" << need_remount.load()
-              << " offline=" << offline << "/" << count
-              << " keys=" << initial_keys << "->" << final_keys << std::endl;
-    EXPECT_GT(baseline, 0u);
-    EXPECT_TRUE(remount_ok);
-    EXPECT_GT(during_stall - before_stall, 100u);
-    EXPECT_LT(max_latency_ms.load(), 1000);
-    EXPECT_EQ(offline, 0u);
-    EXPECT_EQ(final_keys, initial_keys);
-    EXPECT_EQ(need_remount.load(), 0u);
 }
 
 // Localhost-only HTTP server that records DELETE request lines. A test picks

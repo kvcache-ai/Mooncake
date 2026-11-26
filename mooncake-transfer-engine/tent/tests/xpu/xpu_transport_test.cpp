@@ -31,9 +31,11 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include "tent/common/config.h"
@@ -82,13 +84,27 @@ class XpuTransportTest : public ::testing::Test {
         *out = static_cast<uint8_t *>(p);
     }
 
+    // Polls task `task_id` until it leaves PENDING (copies are enqueued
+    // asynchronously and complete on a later status poll).
+    TransferStatus wait(Transport::SubBatchRef batch, int task_id) {
+        TransferStatus status{};
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        do {
+            EXPECT_TRUE(
+                transport_.getTransferStatus(batch, task_id, status).ok());
+            if (status.s != TransferStatusEnum::PENDING) break;
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        return status;
+    }
+
     // Runs one request through the transport and returns its final status.
     TransferStatus run(const Request &request) {
         Transport::SubBatchRef batch = nullptr;
         EXPECT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
         EXPECT_TRUE(transport_.submitTransferTasks(batch, {request}).ok());
-        TransferStatus status{};
-        EXPECT_TRUE(transport_.getTransferStatus(batch, 0, status).ok());
+        TransferStatus status = wait(batch, 0);
         EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
         return status;
     }
@@ -205,6 +221,90 @@ TEST_F(XpuTransportTest, CopiesDeviceToDevice) {
 
     loader_->free(a, kBufSize);
     loader_->free(b, kBufSize);
+}
+
+// One submit carrying many requests in both directions, plus one that must
+// fail: the copies are enqueued together, each task completes with its own
+// bytes, and the failed one does not hold the others back.
+TEST_F(XpuTransportTest, BatchedSubmitCompletesEveryTask) {
+    constexpr size_t kTasks = 16;
+    constexpr size_t kLen = 4096 + 128;  // not a power of two
+    uint8_t *dev = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kTasks * kLen));
+    std::vector<uint8_t> seed(kTasks * kLen), host(kTasks * kLen, 0);
+    for (size_t i = 0; i < seed.size(); ++i) seed[i] = (uint8_t)(i % 233);
+    std::vector<uint8_t> zero(kTasks * kLen, 0);
+    ASSERT_TRUE(loader_->copy(dev, zero.data(), zero.size()).ok());
+    // Even chunks start on the host and are pushed to the device (H2D);
+    // odd chunks start on the device and are pulled to the host (D2H).
+    for (size_t t = 1; t < kTasks; t += 2) {
+        ASSERT_TRUE(
+            loader_->copy(dev + t * kLen, seed.data() + t * kLen, kLen).ok());
+    }
+    std::vector<uint8_t> src_host(seed);
+
+    std::vector<Request> requests;
+    for (size_t t = 0; t < kTasks; ++t) {
+        if (t % 2 == 0)
+            requests.push_back(
+                makeRequest(Request::READ, dev + t * kLen,
+                            (uint64_t)(src_host.data() + t * kLen), kLen));
+        else
+            requests.push_back(makeRequest(Request::WRITE, dev + t * kLen,
+                                           (uint64_t)(host.data() + t * kLen),
+                                           kLen));
+    }
+    std::vector<uint8_t> host_a(64, 1), host_b(64, 2);
+    requests.push_back(makeRequest(Request::WRITE, host_a.data(),
+                                   (uint64_t)host_b.data(), host_a.size()));
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, requests.size()).ok());
+    ASSERT_TRUE(transport_.submitTransferTasks(batch, requests).ok());
+    ASSERT_EQ(batch->size(), requests.size());
+    for (size_t t = 0; t < kTasks; ++t) {
+        auto status = wait(batch, (int)t);
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED) << "task " << t;
+        EXPECT_EQ(status.transferred_bytes, kLen) << "task " << t;
+    }
+    EXPECT_EQ(wait(batch, (int)kTasks).s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(host_b[0], 2);
+    EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+
+    std::vector<uint8_t> readback(kTasks * kLen, 0);
+    ASSERT_TRUE(loader_->copy(readback.data(), dev, readback.size()).ok());
+    for (size_t t = 0; t < kTasks; ++t) {
+        const uint8_t *got =
+            (t % 2 == 0 ? readback.data() : host.data()) + t * kLen;
+        EXPECT_EQ(0, std::memcmp(got, seed.data() + t * kLen, kLen))
+            << "task " << t;
+    }
+
+    loader_->free(dev, kTasks * kLen);
+}
+
+// Freeing a sub-batch whose copies were never polled waits for them, so the
+// caller may release the buffers right after freeSubBatch().
+TEST_F(XpuTransportTest, FreeSubBatchWaitsForPendingCopies) {
+    constexpr size_t kLarge = 64ul << 20;  // 64 MiB
+    uint8_t *dev = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kLarge));
+    std::vector<uint8_t> seed(kLarge);
+    for (size_t i = 0; i < kLarge; ++i) seed[i] = (uint8_t)(i % 241);
+    ASSERT_TRUE(loader_->copy(dev, seed.data(), kLarge).ok());
+
+    std::vector<uint8_t> host(kLarge, 0);
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
+    ASSERT_TRUE(transport_
+                    .submitTransferTasks(
+                        batch, {makeRequest(Request::WRITE, dev,
+                                            (uint64_t)host.data(), kLarge)})
+                    .ok());
+    ASSERT_TRUE(transport_.freeSubBatch(batch).ok());
+    EXPECT_EQ(0, std::memcmp(host.data(), seed.data(), kLarge));
+
+    loader_->free(dev, kLarge);
 }
 
 // A non-local target the transport has not mapped in (no prepareRemoteBuffer

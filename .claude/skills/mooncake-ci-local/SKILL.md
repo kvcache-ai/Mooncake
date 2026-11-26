@@ -1,159 +1,160 @@
 ---
 name: mooncake-ci-local
-description: Run Mooncake pre-PR local validation through scripts/run_ci_test.sh. Use this skill whenever the user wants to validate a branch before opening or submitting a PR, run local CI, run ci test, check changes before PR, reproduce GitHub Actions locally, or force a full pre-submit verification. Trigger on phrases like "提交 PR 前验证", "run ci test", "run local CI", "check my branch", "test before PR", "pre-submit validation", and "reproduce CI locally".
+description: Validate a Mooncake branch before a pull request by running the local checks from .github/workflows/ci.yml. Use when the user wants pre-PR validation, local CI, a ci test, a branch check before a PR, or a local reproduction of GitHub Actions. Trigger on "提交 PR 前验证", "run ci test", "run local CI", "check my branch", "test before PR", "pre-submit validation", and "reproduce CI locally".
 ---
 
-# Mooncake Pre-PR Local Validation
+# Mooncake pre-PR local validation
 
-Use `bash scripts/run_ci_test.sh` as the default entry point. This is the single local lane for PR-before-submit validation, and it already coordinates the reproducible parts of GitHub Actions.
+Run from the repository root. That directory contains `scripts/code_format.sh` and `.github/workflows/ci.yml`.
 
-## Default Entry Point
+Do not run `scripts/run_ci_test.sh`. That file is not in this repository.
 
-When the user asks for any of the following, run the repo script first instead of reconstructing the workflow by hand:
+Do not use build directories named `build-ci-local` or `build-wheel-local`. Those names are not in this repository.
 
-- 提交 PR 前本地验证
-- run ci test
-- run local CI
-- check my branch before PR
-- reproduce CI locally
+Read CMake flags from the job you are reproducing. Do not reconstruct them from memory.
 
-Default command:
+Use base ref `origin/main` unless the user names another ref. In the commands below, replace `origin/main` with that ref.
 
-```bash
-bash scripts/run_ci_test.sh
-```
+## Default checks
 
-What this script already covers:
+Run these checks on every pre-PR request. They are the unconditional `ci-gate` jobs that do not need a native build. `engram-cpu-contracts` also needs no native build, and `ci-gate` does not require it.
 
-- GitHub-like `paths-filter` against `origin/main`
-- `typos`
-- `scripts/code_format.sh --check`
-- default CMake configure/build/install in `build-ci-local`
-- `ctest`
-- wheel build in `build-wheel-local`
-- wheel installation validation
-- `scripts/run_tests.sh`
-- selected Python API and integration tests
-- per-stage summary and logs under `local_test/run-ci-logs/<timestamp>/`
-
-## Standard Agent Workflow
-
-1. Run `bash scripts/run_ci_test.sh` from the repo root unless the user explicitly asks for a narrower subset.
-2. Read the stage summary instead of dumping raw terminal output.
-3. Report these items back to the user:
-   - passed stages
-   - failed stages
-   - blocked stages
-   - unsupported stages
-   - whether `paths-filter` skipped downstream stages
-   - the log directory under `local_test/run-ci-logs/...`
-4. If there is a failure, inspect the corresponding stage log and summarize the root cause.
-
-## Common Options
-
-Force a full lane even if `paths-filter` would skip downstream stages:
+1. Fetch the base and list changed files.
 
 ```bash
-bash scripts/run_ci_test.sh --skip-path-filter
+git fetch origin main
+git diff --name-only --diff-filter=ACMR origin/main...HEAD
 ```
 
-Use another base ref:
+2. Run pre-commit on the changed files, as `CONTRIBUTING.md` requires. If the diff is empty, skip pre-commit and say the branch matches the base.
 
 ```bash
-bash scripts/run_ci_test.sh --base origin/main
+pre-commit run --files $(git diff --name-only --diff-filter=ACMR origin/main...HEAD)
 ```
 
-Auto-install missing dependencies:
+If `pre-commit` is missing, mark this check blocked. The install steps are in `CONTRIBUTING.md`. Do not install packages unless the user asked.
+
+Pre-commit may rewrite files. For a validation-only run, report those files and leave them unstaged. Stage them only when the user asked to fix the branch.
+
+The C/C++ pre-commit hook runs `scripts/code_format.sh --staged`. The `clang-format` job does not. Run the job command as well.
 
 ```bash
-bash scripts/run_ci_test.sh --install-deps
+./scripts/code_format.sh --check --changed-lines --base origin/main
 ```
 
-Keep services running for follow-up debugging:
+The job needs clang-format 20. If that binary is missing, mark `clang-format` blocked and give the install command from `CONTRIBUTING.md`.
+
+3. If the diff includes Python files outside `extern/` and `FAST25-release/`, run the `python-lint` commands. The workflow installs `ruff==0.6.9`.
 
 ```bash
-bash scripts/run_ci_test.sh --keep-services
+ruff check <changed-python-files>
+python scripts/ci/check_changed_python_format.py origin/main <changed-python-files>
 ```
 
-## Minimal Example
+If `ruff` is missing, mark `python-lint` blocked.
 
-User prompt:
-
-- 提交 PR 前，帮我跑一遍本地 CI 验证当前分支。
-
-Expected action:
+4. The `spell-check` job uses `crate-ci/typos@v1.30.2`. Codespell from pre-commit does not replace it.
 
 ```bash
-bash scripts/run_ci_test.sh
+typos
 ```
 
-If the user wants to ignore changed-path optimization and force the full lane:
+If `typos` is missing, mark `spell-check` blocked.
+
+5. Run `reshard-type-check`. The workflow installs `pyright==1.1.411` before this command.
 
 ```bash
-bash scripts/run_ci_test.sh --skip-path-filter
+bash scripts/check_reshard_types.sh
 ```
 
-See also `.claude/skills/mooncake-ci-local/examples/minimal.md`.
+If `pyright` is missing, mark `reshard-type-check` blocked.
 
-## How To Interpret Results
-
-- `passed`: the stage succeeded locally.
-- `failed`: the stage reproduced a real local failure and needs investigation.
-- `blocked`: local environment or dependency issue prevented execution.
-- `unsupported`: intentionally not run in the local lane because it needs external platforms, special hardware, or a non-default build.
-
-If `paths-filter` skips downstream stages, explain that the current branch changed only non-source paths relative to the selected base.
-
-## Current Local Coverage
-
-Included by default:
-
-- spell check
-- code format check
-- default ASan CMake lane in `build-ci-local`
-- `ctest`
-- wheel build and installation test
-- `scripts/run_tests.sh`
-- selected Python API tests
-
-Unsupported by design in the default local lane:
-
-- Ascend jobs
-- T-one integration jobs
-- MUSA jobs
-- Docker image build jobs
-- CUDA 13 wheel jobs
-- PG-backend tests absent from the default wheel build
-- Python drain-http API stage in the local ASan lane
-
-## Targeted Reruns For Debugging
-
-Use targeted reruns only after the full script identifies a failing area, or when the user explicitly asks for a smaller scope.
-
-Rerun a specific C++ test pattern:
+6. Run `ci-script-tests`. The workflow installs `packaging`, `pytest==8.3.5`, and `pyyaml` first. If those imports fail, mark the job blocked. If the unittest output says `jq: command not found`, mark the job blocked. Those nightly gate tests call `jq`, and the workflow does not install it.
 
 ```bash
-cd build-ci-local
-MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -R <pattern> --output-on-failure
+python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
+python -m unittest discover -s scripts/ci/tests -v
 ```
 
-Rerun the Python wheel integration lane:
+7. Run `tone-script-tests`.
 
 ```bash
-source test_env/bin/activate
-MC_STORE_MEMCPY=false TEST_SSD_OFFLOAD_IN_EVICT=true ./scripts/run_tests.sh
+bash scripts/tone_tests/tests/test_common_cleanup.sh
+python3 -m unittest discover -s scripts/tone_tests/tests -p 'test_*.py'
 ```
 
-Rerun the safetensor unittest:
+Do not pip install, apt install, or run `dependencies.sh` unless the user asked to install dependencies. A missing tool is a blocked job. Put the workflow install command in the report.
+
+## Path filters
+
+Read the `filters` block of job `check-paths` in `.github/workflows/ci.yml`. Compare it with the changed-file list. The filter names are `src`, `tent`, `store_rs`, and `docs`.
+
+On a normal pre-PR request, run a filtered job only when its filter matches. When the user asks for a full local run, also run the `src`, `tent`, `store_rs`, and `docs` jobs whose tools are present.
+
+## Docs job
+
+When `docs` matches, run `docs-check` from `docs/`.
 
 ```bash
-source test_env/bin/activate
-python -m unittest mooncake-wheel.tests.test_safetensor_functions
+make html SPHINXOPTS=-W
 ```
 
-## Notes For The Agent
+If Sphinx is missing, mark `docs-check` blocked. `docs/AGENTS.md` names `docs/requirements-docs.txt`.
 
-- Prefer the repo script over rebuilding the CI workflow step by step.
-- Preserve the separation between `build-ci-local` and `build-wheel-local`.
-- Summarize failing stages from their logs instead of pasting raw output.
-- If the user only asks whether the branch is safe before opening a PR, the default answer path is `bash scripts/run_ci_test.sh`.
+## Native jobs
+
+Run native jobs after the default checks. If a job configures with `-DUSE_CUDA=ON` and `nvcc` is missing, mark that job blocked. Do not install CUDA unless the user asked.
+
+For each job, run its `run` steps from `.github/workflows/ci.yml` in order. Keep that job's `env` and CMake arguments unchanged. Skip steps that only check out the repo, set up Python, free disk space, or configure sccache.
+
+Before a script under `.github/actions/`, export `GITHUB_WORKSPACE` to the repository root, `GITHUB_ENV` to a new temp file, and `GITHUB_ACTION_PATH` to that action's directory. After the script, export every `KEY=VALUE` line it appended to `GITHUB_ENV`.
+
+`.github/actions/setup-etcd/run.sh` always downloads etcd. If `etcd` and `etcdctl` are already on `PATH`, skip the download. Start etcd with the listen URLs and health check from that script.
+
+Filter `src` selects these jobs.
+
+- `unit-tests`. The build directory is `build`. Start metadata with `.github/actions/setup-metadata-server/run.sh`. Apply the CUDA driver with `.github/actions/setup-cuda-runtime/run.sh`. Run CTest with `.github/actions/run-ctest/run.sh` and these variables.
+
+```bash
+export RESERVE_RPC_PORT=true
+export JUNIT_REPORT=build/test-results/ctest.xml
+export CTEST_LABEL_EXCLUDE='^nvlink_gpu$'
+bash .github/actions/run-ctest/run.sh
+```
+
+- `build-wheel`, then `test-wheel-ubuntu`. Reproduce `.github/workflows/_build-wheel.yaml` for variant `cuda`, Python 3.10 and 3.12. After `bash scripts/test_installation.sh`, later steps activate `test_env`. Run `scripts/smoke_conductor_wheel.py`, `scripts/run_standalone_store_e2e.sh`, `scripts/ci/run_store_api_smoke.sh`, `scripts/ci/run_rpc_smoke.sh`, and `scripts/ci/run_ssd_offload_smoke.sh` with the environment from those steps.
+- `build-flags`. The job configures `mooncake-transfer-engine/build` and then deletes that directory. Do not reuse it for another job.
+- `efa-unit-tests`. Follow that job, including its libfabric header pin. The `ctest -R` step needs no EFA hardware. It still needs CUDA.
+
+Filter `tent` selects `tent-ci`. Its build directory is `build-tent`. The non-CUDA legs run `scripts/ci/run_transfer_engine_rust_smoke.sh`.
+
+Filter `store_rs` selects `store-rs-ci`. Copy that job's `env`, and use the repository root where the workflow uses `github.workspace`. Then run `./scripts/ci/run_store_rs_smoke.sh`. The script exits when those variables are unset. This job sets `-DUSE_CUDA=OFF`.
+
+## Not run on this machine
+
+Report these as not run. GitHub still runs the first four when `src` matches.
+
+- `build-wheel-cu13`
+- `build-wheel-cu13-arm64`
+- `build-wheel-rocm`
+- `build-wheel-xpu`
+- Workflows other than `.github/workflows/ci.yml`
+
+`scripts/run_tests.sh` is called from `.github/workflows/nightly.yml`. Do not use it for pull-request checks.
+
+## Report
+
+Use one row per job id from `.github/workflows/ci.yml`.
+
+- `passed`. The command exited 0.
+- `failed`. The command exited non-zero. Include the first error and the command that printed it.
+- `blocked`. A tool or service was missing, so the command did not run.
+- `not run`. The path filter skipped the job, or the job needs another architecture or GPU vendor.
+
+Say which of `src`, `tent`, `store_rs`, and `docs` matched.
+
+Stop a process this run started. Do not stop an etcd or metadata server that was already running.
+
+## Example
+
+See [examples/minimal.md](examples/minimal.md).
