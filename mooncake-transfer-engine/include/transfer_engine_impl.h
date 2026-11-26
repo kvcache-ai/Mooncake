@@ -147,9 +147,9 @@ class TransferEngineImpl {
         return multi_transports_->submitTransfer(batch_id, entries);
     }
 
-    Status submitAcknowledgedTcpWrite(
+    Status submitReceiverVisibleWrite(
         BatchID batch_id, const std::vector<TransferRequest>& entries) {
-        return multi_transports_->submitAcknowledgedTcpWrite(batch_id, entries);
+        return multi_transports_->submitReceiverVisibleWrite(batch_id, entries);
     }
 
     Status submitScatter(const std::vector<TransferRequest>& entries,
