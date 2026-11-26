@@ -112,7 +112,8 @@ PGResult<void> DeviceCollectiveDispatcher::installGroupView(
                 algorithm->supports(choice.operation),
                 "configured algorithm is unavailable for this op");
             selected_algorithms.insert(algorithm);
-            required_protocols.insert(&algorithm->protocol());
+            const auto protocols = algorithm->protocols();
+            required_protocols.insert(protocols.begin(), protocols.end());
         }
     }
 

@@ -66,8 +66,7 @@ bool groupSupportsOneShot(
         for (const auto destination : active) {
             if (source == destination) continue;
             const auto& route = routes[destination];
-            if (!route.directly_addressable || !route.native_atomics)
-                return false;
+            if (!route.supportsDirectLl()) return false;
         }
     }
     return true;

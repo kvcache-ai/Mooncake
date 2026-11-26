@@ -7,3 +7,11 @@ target_include_directories(
 target_compile_features(pg_host_ip_resolve_test PRIVATE cxx_std_20)
 target_link_libraries(pg_host_ip_resolve_test PUBLIC gtest gtest_main)
 add_test(NAME pg_host_ip_resolve_test COMMAND pg_host_ip_resolve_test)
+
+add_executable(pg_collective_foundation_test pg_collective_foundation_test.cpp)
+target_include_directories(pg_collective_foundation_test PRIVATE
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_compile_features(pg_collective_foundation_test PRIVATE cxx_std_20)
+target_link_libraries(pg_collective_foundation_test PRIVATE gtest_main
+                      yalantinglibs::yalantinglibs)
+add_test(NAME pg_collective_foundation_test COMMAND pg_collective_foundation_test)

@@ -12,6 +12,7 @@
 #include <transfer_engine.h>
 #include <transport/device/device_transport.h>
 
+#include "control_plane/host_identity.h"
 #include "device_comm/device_collective/strong_stream.h"
 #include "device_comm/device_utils/d2h_request_slot.h"
 #include "device_comm/device_utils/h2d_request_slot.h"
@@ -129,6 +130,7 @@ struct DeviceTransferService::DeviceState {
                 state->peer_accessible_region.addr()),
             .region_size = state->peer_accessible_region.size(),
             .routes = {},
+            .host_id = detectPGHostId(),
         };
         for (const auto& provider : state->route_providers) {
             if (auto endpoint = provider->localEndpoint()) {

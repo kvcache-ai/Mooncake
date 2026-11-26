@@ -127,6 +127,9 @@ struct DeviceTransferEndpoint {
     // request an installation or invalidate installed resources.
     uint64_t version = 0;
 
+    // Process identity for topology decisions. Empty when unavailable.
+    std::string host_id;
+
     bool operator==(const DeviceTransferEndpoint&) const = default;
 };
 
@@ -150,6 +153,10 @@ struct DeviceTransferRouteInfo {
     // Whether the source rank's GPU can issue CUDA system-scope atomics to
     // the destination rank's directly mapped GPU memory.
     bool native_atomics = false;
+
+    [[nodiscard]] bool supportsDirectLl() const noexcept {
+        return directly_addressable && native_atomics;
+    }
 
     bool operator==(const DeviceTransferRouteInfo&) const = default;
 };
