@@ -37,12 +37,15 @@ struct Config {
     // generated config always carries a value and 1 would serialize a client
     // the SDK expects to run four reads on.
     //
-    // GET stays at 4: a batch of 720 KiB values from 16 clients measures no
-    // gain above four ring workers, so more workers would only reserve IOV
-    // shm.
-    int get_workers = 4;     // SDK default; four ring workers saturate
-    int set_workers = 4;     // SDK default; split writes overlap
-    int simple_workers = 8;  // SDK default is 2; queries fan out wider
+    // GET defaults to 32. Cold 720 KiB reads from 16 processes measured
+    // 3259/3558/3366/2996 MiB/s on the bare SDK at 16/32/64/128 ring Get
+    // workers, and 3177/3212/3046/2886 MiB/s through this read path, so 32
+    // is the knee and doubling it again loses throughput. SET stays at the
+    // SDK default of 4. SIMPLE stays at 8, wider than the SDK default of 2,
+    // because existence and layout queries fan out.
+    int get_workers = 32;
+    int set_workers = 4;
+    int simple_workers = 8;
     // Sub-batches the Mooncake adapter keeps in flight over this client. The
     // window hides per-call latency and holds no shm, so it is sized apart
     // from the ring workers above. Zero keeps one sub-batch at a time.
