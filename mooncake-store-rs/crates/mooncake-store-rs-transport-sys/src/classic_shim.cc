@@ -287,6 +287,11 @@ extern "C" int mooncake_classic_cache_segment_descriptor_json(
     if (!desc) {
         return -1;
     }
+    // P2P handshake cache entries are built from the descriptor JSON alone:
+    // unlike TransferMetadata::getSegmentDescInternal, this path has no RPC
+    // metadata entry to copy tcp_data_host from. Recover it from open_name
+    // (typically bind_host:rpc_port) when a port is explicit; the data port
+    // still comes from tcp_data_port and an existing host is left untouched.
     if (desc->tcp_data_host.empty() && desc->tcp_data_port > 0 &&
         mooncake::hasExplicitPort(open_name)) {
         desc->tcp_data_host = mooncake::parseHostNameWithPort(open_name).first;
