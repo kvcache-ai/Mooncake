@@ -7,6 +7,8 @@ store:
   - changed-files:
     - any-glob-to-any-file:
       - 'mooncake-store/**/*'
+      - 'python/mooncake/_fast_copy.c'
+      - 'python/mooncake/structured_object_store.py'
       - 'python/mooncake/http_metadata_server.py'
       - 'python/tests/services/test_http_metadata_server.py'
       - 'python/mooncake/async_store.py'
@@ -48,6 +50,10 @@ Installation:
   - changed-files:
     - any-glob-to-any-file:
       - 'mooncake-wheel/**/*'
+      - 'python/mooncake/_fast_copy.c'
+      - 'python/mooncake/structured_object_store.py'
+      - 'python/tests/store/test_fast_copy.py'
+      - 'python/tests/store/test_structured_object_store.py'
       - 'python/mooncake/http_metadata_server.py'
       - 'python/mooncake/cli.py'
       - 'python/mooncake/cli_client.py'

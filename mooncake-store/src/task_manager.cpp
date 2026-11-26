@@ -1,9 +1,49 @@
 #include "task_manager.h"
+#include <algorithm>
 #include <glog/logging.h>
-#include <msgpack.hpp>
-#include "common/zstd_util.h"
+#include <queue>
 
 namespace mooncake {
+namespace {
+
+bool MatchesTaskPayload(const Task& task, const TenantId& tenant,
+                        const std::optional<std::string>& key = std::nullopt) {
+    try {
+        // Validate a complete object before using the typed reader's defaults.
+        if (task.payload.empty()) {
+            return false;
+        }
+        struct_json::jvalue value;
+        auto it = task.payload.begin();
+        auto end = task.payload.end();
+        struct_json::parse<true>(value, it, end, true);
+        if (it != end || !std::holds_alternative<struct_json::jobject>(value)) {
+            return false;
+        }
+        const auto matches = [&](const auto& payload) {
+            const TenantId payload_tenant(payload.tenant_id);
+            return payload_tenant.IsValid() && payload_tenant == tenant &&
+                   (!key || payload.key == *key);
+        };
+        switch (task.type) {
+            case TaskType::REPLICA_COPY: {
+                ReplicaCopyPayload payload;
+                struct_json::from_json(payload, task.payload);
+                return matches(payload);
+            }
+            case TaskType::REPLICA_MOVE: {
+                ReplicaMovePayload payload;
+                struct_json::from_json(payload, task.payload);
+                return matches(payload);
+            }
+        }
+    } catch (const std::exception&) {
+        // A malformed payload cannot be attributed to a tenant.
+    }
+    return false;
+}
+
+}  // namespace
 
 std::optional<Task> ScopedTaskReadAccess::find_task_by_id(
     const UUID& task_id) const {
@@ -12,6 +52,84 @@ std::optional<Task> ScopedTaskReadAccess::find_task_by_id(
         return it->second;
     }
     return std::nullopt;
+}
+
+tl::expected<bool, ErrorCode> ScopedTaskReadAccess::is_cancellation_requested(
+    const UUID& client_id, const UUID& task_id) const {
+    auto it = manager_->all_tasks_.find(task_id);
+    if (it == manager_->all_tasks_.end()) {
+        return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
+    }
+    if (it->second.assigned_client != client_id) {
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+    return it->second.cancellation_requested;
+}
+
+tl::expected<TaskListPage, ErrorCode> ScopedTaskReadAccess::list_tasks(
+    const TaskListRequest& request) const {
+    const TenantId tenant(request.tenant_id);
+    if (!tenant.IsValid() || request.limit == 0 || request.limit > 1000 ||
+        (request.status && *request.status != TaskStatus::PENDING &&
+         *request.status != TaskStatus::PROCESSING &&
+         !is_finished_status(*request.status)) ||
+        (request.type && *request.type != TaskType::REPLICA_COPY &&
+         *request.type != TaskType::REPLICA_MOVE)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::optional<UUID> after;
+    constexpr std::string_view prefix = "v1:";
+    if (!request.page_token.empty()) {
+        UUID id;
+        const auto token = std::string_view(request.page_token);
+        if (!token.starts_with(prefix) ||
+            !StringToUuid(std::string(token.substr(prefix.size())), id) ||
+            token.substr(prefix.size()) != UuidToString(id)) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        after = id;
+    }
+    const auto less = [](const Task* lhs, const Task* rhs) {
+        return lhs->id < rhs->id;
+    };
+    std::priority_queue<const Task*, std::vector<const Task*>, decltype(less)>
+        selected(less);
+    for (const auto& [id, task] : manager_->all_tasks_) {
+        if ((after && id <= *after) ||
+            (request.status && task.status != *request.status) ||
+            (request.type && task.type != *request.type) ||
+            (request.assigned_client &&
+             task.assigned_client != *request.assigned_client)) {
+            continue;
+        }
+        if (MatchesTaskPayload(task, tenant, request.key)) {
+            selected.push(&task);
+            if (selected.size() > static_cast<size_t>(request.limit) + 1) {
+                selected.pop();
+            }
+        }
+    }
+    const bool has_more = selected.size() > request.limit;
+    if (has_more) {
+        selected.pop();
+    }
+    std::vector<const Task*> ordered;
+    ordered.reserve(selected.size());
+    while (!selected.empty()) {
+        ordered.push_back(selected.top());
+        selected.pop();
+    }
+    std::reverse(ordered.begin(), ordered.end());
+    TaskListPage page;
+    page.tasks.reserve(ordered.size());
+    for (const Task* task : ordered) {
+        page.tasks.push_back(*task);
+    }
+    if (has_more) {
+        page.next_page_token =
+            std::string(prefix) + UuidToString(ordered.back()->id);
+    }
+    return page;
 }
 
 ScopedTaskReadAccess::task_iterator ScopedTaskReadAccess::begin() const {
@@ -27,7 +145,8 @@ size_t ScopedTaskReadAccess::size() const {
 }
 
 tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
-    const UUID& client_id, TaskType type, const std::string& payload) {
+    const UUID& client_id, TaskType type, const std::string& payload,
+    bool retained_by_drain) {
     if (manager_->total_pending_tasks_ >= manager_->max_total_pending_tasks_) {
         LOG(ERROR) << "Cannot submit new task: pending task limit reached ("
                    << manager_->total_pending_tasks_ << "/"
@@ -47,10 +166,11 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
                  .last_updated_at = now,
                  .message = "",
                  .assigned_client = client_id,
-                 .max_retry_attempts = manager_->max_retry_attempts_};
+                 .max_retry_attempts = manager_->max_retry_attempts_,
+                 .retained_by_drain = retained_by_drain};
     manager_->total_pending_tasks_++;
     manager_->all_tasks_[task.id] = task;
-    manager_->pending_tasks_[client_id].push(task.id);
+    manager_->pending_tasks_[client_id].push_back(task.id);
 
     return task.id;
 }
@@ -74,15 +194,14 @@ std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
         }
 
         const UUID task_id = queue.front();
-        queue.pop();
+        queue.pop_front();
 
         auto it = manager_->all_tasks_.find(task_id);
         if (it == manager_->all_tasks_.end()) {
-            LOG(ERROR) << "Task " << task_id
-                       << " not found in all_tasks_ while popping";
-            if (manager_->total_pending_tasks_ > 0) {
-                manager_->total_pending_tasks_--;
-            }
+            // Terminal tasks can be pruned before their queued IDs are
+            // consumed.
+            VLOG(1) << "Skipping stale pending queue entry for task "
+                    << task_id;
             continue;
         }
 
@@ -140,6 +259,10 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
         return ErrorCode::OK;
     }
 
+    if (task.status == TaskStatus::PENDING &&
+        manager_->total_pending_tasks_ > 0) {
+        manager_->total_pending_tasks_--;
+    }
     task.mark_complete(status, message);
 
     auto ps_it = manager_->processing_tasks_.find(client_id);
@@ -157,10 +280,18 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
 }
 
 void ScopedTaskWriteAccess::prune_finished_tasks() {
+    size_t examined = 0;
+    const size_t initial_size = manager_->finished_task_history_.size();
     while (manager_->finished_task_history_.size() >
-           manager_->max_total_finished_tasks_) {
+               manager_->max_total_finished_tasks_ &&
+           examined++ < initial_size) {
         UUID oldest_task_id = manager_->finished_task_history_.front();
         manager_->finished_task_history_.pop_front();
+        auto it = manager_->all_tasks_.find(oldest_task_id);
+        if (it != manager_->all_tasks_.end() && it->second.retained_by_drain) {
+            manager_->finished_task_history_.push_back(oldest_task_id);
+            continue;
+        }
         manager_->all_tasks_.erase(oldest_task_id);
     }
 }
@@ -173,17 +304,15 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
             std::chrono::seconds(manager_->pending_task_timeout_sec_);
 
         for (auto& [client_id, task_queue] : manager_->pending_tasks_) {
-            std::queue<UUID> keep_queue;
+            std::deque<UUID> keep_queue;
             while (!task_queue.empty()) {
                 const UUID task_id = task_queue.front();
-                task_queue.pop();
+                task_queue.pop_front();
 
                 auto it = manager_->all_tasks_.find(task_id);
                 if (it == manager_->all_tasks_.end()) {
-                    // Drop dangling id;
-                    if (manager_->total_pending_tasks_ > 0) {
-                        manager_->total_pending_tasks_--;
-                    }
+                    // The terminal transition already released the pending
+                    // slot.
                     continue;
                 }
 
@@ -204,7 +333,7 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
                     continue;
                 }
 
-                keep_queue.push(task_id);
+                keep_queue.push_back(task_id);
             }
             task_queue = std::move(keep_queue);
         }
@@ -241,6 +370,12 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
                 }
 
                 if (now - task.last_updated_at > processing_timeout) {
+                    if (task.retained_by_drain) {
+                        // A timeout cannot prove the worker stopped. Ask it
+                        // to cancel and wait for acknowledgment before retry.
+                        task.cancellation_requested = true;
+                        continue;
+                    }
                     task.mark_complete(TaskStatus::FAILED,
                                        "processing timeout");
                     to_remove.push_back(task_id);
@@ -257,30 +392,38 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
     }
 }
 
-void ScopedTaskWriteAccess::restore_task(Task&& task) {
-    const UUID task_id = task.id;
-    manager_->all_tasks_[task_id] = std::move(task);
-    Task& stored_task = manager_->all_tasks_[task_id];
+ErrorCode ScopedTaskWriteAccess::cancel_task(const UUID& task_id,
+                                             const TenantId& tenant_id) {
+    auto it = manager_->all_tasks_.find(task_id);
+    if (it == manager_->all_tasks_.end() ||
+        !MatchesTaskPayload(it->second, tenant_id)) {
+        return ErrorCode::TASK_NOT_FOUND;
+    }
 
-    const UUID client_id = stored_task.assigned_client;
-    const TaskStatus status = stored_task.status;
-
-    switch (status) {
+    Task& task = it->second;
+    switch (task.status) {
         case TaskStatus::PENDING: {
-            manager_->pending_tasks_[client_id].push(task_id);
-            manager_->total_pending_tasks_++;
-            break;
+            auto queue = manager_->pending_tasks_.find(task.assigned_client);
+            if (queue != manager_->pending_tasks_.end()) {
+                std::erase(queue->second, task_id);
+            }
+            return complete_task(task.assigned_client, task_id,
+                                 TaskStatus::CANCELED, "Task canceled");
         }
-        case TaskStatus::PROCESSING: {
-            manager_->processing_tasks_[client_id].insert(task_id);
-            manager_->total_processing_tasks_++;
-            break;
-        }
-        case TaskStatus::FAILED:
-        case TaskStatus::SUCCESS: {
-            manager_->finished_task_history_.push_back(task_id);
-            break;
-        }
+        case TaskStatus::PROCESSING:
+            task.cancellation_requested = true;
+            return ErrorCode::OK;
+        case TaskStatus::CANCELED:
+            return ErrorCode::OK;
+        default:
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+}
+
+void ScopedTaskWriteAccess::release_drain_task(const UUID& task_id) {
+    auto it = manager_->all_tasks_.find(task_id);
+    if (it != manager_->all_tasks_.end()) {
+        it->second.retained_by_drain = false;
     }
 }
 
@@ -304,164 +447,4 @@ ErrorCode ScopedTaskWriteAccess::fail_task_if_pending(
     return ErrorCode::OK;
 }
 
-void ScopedTaskWriteAccess::clear_all() {
-    manager_->all_tasks_.clear();
-    manager_->pending_tasks_.clear();
-    manager_->processing_tasks_.clear();
-    manager_->finished_task_history_.clear();
-    manager_->total_pending_tasks_ = 0;
-    manager_->total_processing_tasks_ = 0;
-}
-
-tl::expected<std::vector<uint8_t>, SerializationError>
-TaskManagerSerializer::Serialize() {
-    if (!task_manager_) {
-        return tl::make_unexpected(
-            SerializationError(ErrorCode::SERIALIZE_FAIL,
-                               "serialize TaskManager task_manager_ is null"));
-    }
-
-    auto read_access = task_manager_->get_read_access();
-
-    // Collect and sort task_ids for deterministic serialization order
-    std::vector<UUID> sorted_task_ids;
-    sorted_task_ids.reserve(read_access.size());
-    for (const auto& [task_id, _] : read_access) {
-        sorted_task_ids.push_back(task_id);
-    }
-    std::sort(sorted_task_ids.begin(), sorted_task_ids.end());
-
-    msgpack::sbuffer sbuf;
-    msgpack::packer<msgpack::sbuffer> packer(&sbuf);
-
-    packer.pack_array(read_access.size());
-
-    for (const auto& task_id : sorted_task_ids) {
-        auto task_opt = read_access.find_task_by_id(task_id);
-        if (!task_opt) continue;
-        const auto& task = *task_opt;
-        // Serialize Task as array: [id, type, status, payload, created_at,
-        // last_updated_at, message, assigned_client]
-        packer.pack_array(TaskManagerSerializer::kTaskSerializedFields);
-        packer.pack(UuidToString(task.id));
-        packer.pack(static_cast<int32_t>(task.type));
-        packer.pack(static_cast<int32_t>(task.status));
-        packer.pack(task.payload);
-        packer.pack(static_cast<int64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                task.created_at.time_since_epoch())
-                .count()));
-        packer.pack(static_cast<int64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                task.last_updated_at.time_since_epoch())
-                .count()));
-        packer.pack(task.message);
-        packer.pack(UuidToString(task.assigned_client));
-    }
-
-    // Compress entire data
-    std::vector<uint8_t> compressed_data = zstd_compress(
-        reinterpret_cast<const uint8_t*>(sbuf.data()), sbuf.size(), 3);
-
-    // Return compressed data
-    return compressed_data;
-}
-
-tl::expected<void, SerializationError> TaskManagerSerializer::Deserialize(
-    const std::vector<uint8_t>& data) {
-    if (!task_manager_) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "deserialize TaskManager task_manager_ is null"));
-    }
-
-    // Decompress data
-    std::vector<uint8_t> decompressed_data;
-    try {
-        decompressed_data = zstd_decompress(
-            reinterpret_cast<const uint8_t*>(data.data()), data.size(),
-            TaskManagerSerializer::kMaxDecompressedSize);
-    } catch (const std::exception& e) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "failed to decompress MessagePack data: " + std::string(e.what())));
-    }
-
-    // Parse MessagePack data
-    msgpack::object_handle oh;
-    try {
-        oh = msgpack::unpack(
-            reinterpret_cast<const char*>(decompressed_data.data()),
-            decompressed_data.size());
-    } catch (const std::exception& e) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "failed to unpack msgpack: " + std::string(e.what())));
-    }
-
-    const msgpack::object& obj = oh.get();
-    if (obj.type != msgpack::type::ARRAY) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "invalid MessagePack format: expected array of tasks"));
-    }
-
-    auto write_access = task_manager_->get_write_access();
-
-    // Clear existing tasks
-    write_access.clear_all();
-
-    // Deserialize each task
-    for (uint32_t i = 0; i < obj.via.array.size; ++i) {
-        const msgpack::object& task_obj = obj.via.array.ptr[i];
-        if (task_obj.type != msgpack::type::ARRAY ||
-            task_obj.via.array.size !=
-                TaskManagerSerializer::kTaskSerializedFields) {
-            LOG(WARNING) << "Invalid task format for task index " << i
-                         << ", skipping deserialization";
-            continue;
-        }
-
-        const msgpack::object* arr = task_obj.via.array.ptr;
-
-        Task task;
-        std::string id_str = arr[0].as<std::string>();
-        if (!StringToUuid(id_str, task.id)) {
-            LOG(WARNING) << "Invalid UUID format for task id " << id_str
-                         << ", skipping deserialization";
-            continue;
-        }
-        try {
-            task.type = static_cast<TaskType>(arr[1].as<int32_t>());
-            task.status = static_cast<TaskStatus>(arr[2].as<int32_t>());
-            task.payload = arr[3].as<std::string>();
-            task.created_at = std::chrono::system_clock::time_point(
-                std::chrono::milliseconds(arr[4].as<int64_t>()));
-            task.last_updated_at = std::chrono::system_clock::time_point(
-                std::chrono::milliseconds(arr[5].as<int64_t>()));
-            task.message = arr[6].as<std::string>();
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Invalid task field types for task index " << i
-                         << ": " << e.what() << ", skipping deserialization";
-            continue;
-        }
-
-        std::string assigned_str = arr[7].as<std::string>();
-        if (!StringToUuid(assigned_str, task.assigned_client)) {
-            LOG(WARNING) << "Invalid UUID format for assigned_client "
-                         << assigned_str << ", skipping deserialization";
-            continue;
-        }
-        write_access.restore_task(std::move(task));
-    }
-    return {};
-}
-
-void TaskManagerSerializer::Reset() {
-    if (!task_manager_) {
-        return;
-    }
-    auto write_access = task_manager_->get_write_access();
-    write_access.clear_all();
-}
 }  // namespace mooncake

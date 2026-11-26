@@ -18,6 +18,9 @@ namespace mooncake {
  */
 class EtcdHelper {
    public:
+    // Configure before the first store connection; resets reuse this limit.
+    static ErrorCode SetMaxSendMessageBytes(int32_t max_bytes);
+
     /*
      * @brief Connect to the etcd store client. There is a global etcd client in
      * libetcd. It is used for all the etcd operations for mooncake-store. This
@@ -197,16 +200,15 @@ class EtcdHelper {
      * @param end_key: End key (exclusive).
      * @param end_key_size: Size in bytes.
      * @param limit: Maximum number of kvs to return (0 means no limit).
+     * @param serializable: Serve the read locally without a Raft quorum read.
      * @param json: Output JSON string, format: [{"key":"...","value":"..."}]
      * @param revision_id: Output etcd revision of this read
      * (resp.Header.Revision).
      */
-    static ErrorCode GetRangeAsJson(const char* start_key,
-                                    const size_t start_key_size,
-                                    const char* end_key,
-                                    const size_t end_key_size, size_t limit,
-                                    std::string& json,
-                                    EtcdRevisionId& revision_id);
+    static ErrorCode GetRangeAsJson(
+        const char* start_key, const size_t start_key_size, const char* end_key,
+        const size_t end_key_size, size_t limit, std::string& json,
+        EtcdRevisionId& revision_id, bool serializable = false);
 
     /*
      * @brief Get the first key with a given prefix (sorted by key).

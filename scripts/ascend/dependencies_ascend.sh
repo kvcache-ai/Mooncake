@@ -69,6 +69,8 @@ if command -v apt-get &> /dev/null; then
             protobuf-compiler-grpc \
             libcurl4-openssl-dev \
             libhiredis-dev \
+            libmsgpack-dev \
+            libzmq3-dev \
             pkg-config \
             patchelf \
             mpich \
@@ -88,6 +90,8 @@ elif command -v yum &> /dev/null; then
             libcurl-devel \
             jsoncpp-devel \
             zstd-devel \
+            msgpack-devel \
+            zeromq-devel \
             mpich \
             mpich-devel
     # Install yaml-cpp
@@ -131,7 +135,7 @@ fi
 rm -rf build
 mkdir -p build
 cd build
-cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
+cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DWITH_CONDUCTOR=ON ..
 make -j
 make install -j
 cd ..

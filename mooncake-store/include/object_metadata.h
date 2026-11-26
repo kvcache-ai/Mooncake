@@ -4,8 +4,9 @@
 //
 // Moved out of MasterService so the service and the per-object metadata
 // module share one definition. The envelope owns the object identity, the
-// authoritative read lease, the replica list, the soft-pin state and the
-// tenant quota ledger.
+// authoritative read lease and the soft-pin state.
+// The object's content and the replicas holding it live in the envelope's
+// single ObjectPart.
 //
 // It has no ownership lock: whoever owns the envelope decides how the
 // envelope as a whole is guarded. The `lock` member below is internal and
@@ -16,21 +17,25 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <iterator>
 #include <memory>
 #include <optional>
+#include <ranges>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+
+#include "common/heap_optional.h"
 #include "lease.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
+#include "object_part.h"
 #include "replica.h"
 #include "tenant_id.h"
-#include "tenant_quota_ledger.h"
 #include "types.h"
 
 namespace mooncake {
@@ -57,6 +62,7 @@ struct ObjectMetadata {
     // RAII-style metric management
     ~ObjectMetadata() {
         MasterMetricManager::instance().dec_key_count(1);
+        MasterMetricManager::instance().dec_key_group(key_group, TotalLength());
         if (soft_pin_timeout) {
             MasterMetricManager::instance().dec_soft_pin_key_count(1);
         }
@@ -72,18 +78,22 @@ struct ObjectMetadata {
                    bool enable_hard_pin = false,
                    ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
                    std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
-                   std::string user_key_ = {})
+                   std::string user_key_ = {},
+                   std::string residency_affinity_id_ = "")
         : client_id(client_id_),
           put_start_time(put_start_time_),
-          size(value_length),
           data_type(data_type_),
           group_id(std::move(group_id_)),
+          residency_affinity_id(std::move(residency_affinity_id_)),
           tenant_id(std::move(tenant_id_)),
           user_key(std::move(user_key_)),
+          key_group(
+              MasterMetricManager::instance().classify_key_group(user_key)),
           soft_pin_timeout(std::move(committed_soft_pin_timeout)),
-          hard_pinned(enable_hard_pin),
-          replicas_(std::move(reps)) {
+          hard_pinned(enable_hard_pin) {
+        parts_.emplace_back(value_length, std::move(reps));
         MasterMetricManager::instance().inc_key_count(1);
+        MasterMetricManager::instance().inc_key_group(key_group, value_length);
         if (soft_pin_timeout) {
             MasterMetricManager::instance().inc_soft_pin_key_count(1);
         }
@@ -99,12 +109,48 @@ struct ObjectMetadata {
     UUID client_id;
     // Updated by UpsertStart (Case B) to reset the discard timeout.
     std::chrono::system_clock::time_point put_start_time;
-    const size_t size;
-    std::optional<uint64_t> object_checksum;
     const ObjectDataType data_type{ObjectDataType::UNKNOWN};
     const std::string group_id;
+    const std::string residency_affinity_id;
     const TenantId tenant_id;
     const std::string user_key;
+    const uint8_t key_group;
+
+    // Committed attribution only; protected by the key's lock.
+    std::string session_id;
+    struct PendingSessionTag {
+        std::string session_id;
+        std::unordered_set<ReplicaID> eligible_replica_ids;
+    };
+    HeapOptional<PendingSessionTag> pending_session_tag;
+
+    void BeginSessionTag(std::string id,
+                         const std::unordered_set<ReplicaID>& replicas) {
+        pending_session_tag.reset();
+        if (!id.empty()) {
+            pending_session_tag = PendingSessionTag{std::move(id), replicas};
+        }
+    }
+
+    void CommitSessionTag(ReplicaID replica_id) {
+        if (pending_session_tag &&
+            pending_session_tag->eligible_replica_ids.contains(replica_id)) {
+            session_id = std::move(pending_session_tag->session_id);
+            pending_session_tag.reset();
+        }
+    }
+
+    void ClearSessionTagIfNoViableReplica() {
+        if (pending_session_tag && !HasReplica([this](const Replica& replica) {
+                return pending_session_tag->eligible_replica_ids.contains(
+                           replica.id()) &&
+                       replica.is_processing() &&
+                       !replica.has_invalid_mem_handle() &&
+                       !replica.has_invalid_nof_handle();
+            })) {
+            pending_session_tag.reset();
+        }
+    }
 
     mutable SpinLock lock;
     // Authoritative lease: ungrouped objects own one; grouped objects share
@@ -117,11 +163,10 @@ struct ObjectMetadata {
     // Replica IDs scope this action to the current write. PutEnd does not
     // carry a generation token, so a stale End from the same client cannot
     // otherwise be distinguished from the current write.
-    std::optional<PendingSoftPinAction> pending_soft_pin_action;
+    HeapOptional<PendingSoftPinAction> pending_soft_pin_action;
     const bool hard_pinned{false};  // immutable, set at creation
     bool memory_cache_total_accounted{false};
     bool disk_cache_total_accounted{false};
-    TenantQuotaLedger quota_ledger;
 
     struct DynamicReplicaRecord {
         std::chrono::system_clock::time_point created_at;
@@ -131,84 +176,128 @@ struct ObjectMetadata {
         bool complete{false};
     };
 
-    std::unordered_map<ReplicaID, DynamicReplicaRecord> dynamic_replicas;
-    std::chrono::steady_clock::time_point dynamic_replication_recreate_after{};
+    // Invalidated by a later Mark, Forget, Set, or Reclaim on this object:
+    // those calls may free the state. Use it only under the object lock,
+    // before the next mutation.
+    const std::unordered_map<ReplicaID, DynamicReplicaRecord>& DynamicReplicas()
+        const {
+        static const std::unordered_map<ReplicaID, DynamicReplicaRecord> kEmpty;
+        return dynamic_replica_state_ ? dynamic_replica_state_->replicas
+                                      : kEmpty;
+    }
+
+    // True while a replica record or a still-active recreate deadline is
+    // stored on the heap.
+    bool HasDynamicReplicaState() const {
+        return static_cast<bool>(dynamic_replica_state_);
+    }
 
     void MarkDynamicReplica(ReplicaID replica_id, DynamicReplicaRecord record) {
-        dynamic_replicas[replica_id] = std::move(record);
+        EnsureDynamicReplicaState().replicas[replica_id] = std::move(record);
     }
 
     void MarkDynamicReplicasComplete(
         const std::vector<ReplicaID>& replica_ids) {
+        if (!dynamic_replica_state_) {
+            return;
+        }
+        auto& replicas = dynamic_replica_state_->replicas;
         for (const auto& replica_id : replica_ids) {
-            auto it = dynamic_replicas.find(replica_id);
-            if (it != dynamic_replicas.end()) {
+            auto it = replicas.find(replica_id);
+            if (it != replicas.end()) {
                 it->second.complete = true;
             }
         }
     }
 
     size_t ForgetDynamicReplicas(const std::vector<ReplicaID>& replica_ids) {
+        if (!dynamic_replica_state_) {
+            return 0;
+        }
+        auto& replicas = dynamic_replica_state_->replicas;
         size_t forgotten = 0;
         for (const auto& replica_id : replica_ids) {
-            forgotten += dynamic_replicas.erase(replica_id);
+            forgotten += replicas.erase(replica_id);
         }
+        // erase() leaves the map's buckets behind. Drop them when the map is
+        // empty, and drop the deadline too once it has expired.
+        ReleaseDynamicReplicaStateIfIdle(std::chrono::steady_clock::now(),
+                                         /*discard_buckets=*/true);
         return forgotten;
     }
 
-    size_t DynamicReplicaCount() const { return dynamic_replicas.size(); }
+    size_t DynamicReplicaCount() const {
+        return dynamic_replica_state_ ? dynamic_replica_state_->replicas.size()
+                                      : 0;
+    }
 
     bool DynamicReplicationRecreateBlocked(
         std::chrono::steady_clock::time_point now) const {
-        return now < dynamic_replication_recreate_after;
+        const auto recreate_after =
+            dynamic_replica_state_ ? dynamic_replica_state_->recreate_after
+                                   : std::chrono::steady_clock::time_point{};
+        return now < recreate_after;
     }
 
     void SetDynamicReplicationRecreateAfter(
         std::chrono::steady_clock::time_point deadline) {
-        dynamic_replication_recreate_after =
-            std::max(dynamic_replication_recreate_after, deadline);
+        if (!dynamic_replica_state_) {
+            if (deadline == std::chrono::steady_clock::time_point{}) {
+                return;
+            }
+            dynamic_replica_state_.emplace();
+        }
+        auto& recreate_after = dynamic_replica_state_->recreate_after;
+        recreate_after = std::max(recreate_after, deadline);
+        ReleaseDynamicReplicaStateIfIdle(std::chrono::steady_clock::now(),
+                                         /*discard_buckets=*/false);
     }
 
+    // Drops an empty state whose recreate deadline has expired. A deadline
+    // still in the future is kept. Call under the object's exclusive lock.
+    void ReclaimExpiredDynamicReplicaState(
+        std::chrono::steady_clock::time_point now) {
+        ReleaseDynamicReplicaStateIfIdle(now, /*discard_buckets=*/false);
+    }
+
+    // Read under the owner's shared lock, change under its exclusive lock. A
+    // replica pointer taken from a part is invalidated by any add or pop on it.
+    const ObjectPart& GetPart(size_t index) const { return parts_.at(index); }
+
+    ObjectPart& MutablePart(size_t index) { return parts_.at(index); }
+
+    size_t TotalLength() const {
+        size_t total = 0;
+        for (const auto& part : parts_) {
+            total += part.length();
+        }
+        return total;
+    }
+
+    // Temporary: these operate on part 0. The multi-part work replaces them
+    // with `parts()` and a flattened `replicas()` view, so each call site says
+    // which it means.
     void AddReplicas(std::vector<Replica>&& replicas) {
-        replicas_.insert(replicas_.end(), std::move_iterator(replicas.begin()),
-                         std::move_iterator(replicas.end()));
+        MutablePart(0).AddReplicas(std::move(replicas));
     }
 
     std::vector<Replica> PopReplicas(
         const std::function<bool(const Replica&)>& pred_fn) {
-        auto partition_point = std::partition(
-            replicas_.begin(), replicas_.end(),
-            [pred_fn](const Replica& replica) { return !pred_fn(replica); });
-
-        std::vector<Replica> popped_replicas;
-        if (partition_point != replicas_.end()) {
-            popped_replicas.reserve(
-                std::distance(partition_point, replicas_.end()));
-            std::move(partition_point, replicas_.end(),
-                      std::back_inserter(popped_replicas));
-            replicas_.erase(partition_point, replicas_.end());
-        }
-
-        return popped_replicas;
+        return MutablePart(0).PopReplicas(pred_fn);
     }
 
-    std::vector<Replica> PopReplicas() { return std::move(replicas_); }
+    std::vector<Replica> PopReplicas() { return MutablePart(0).PopReplicas(); }
 
     size_t EraseReplicas(const std::function<bool(const Replica&)>& pred_fn) {
-        auto erased_replicas = PopReplicas(pred_fn);
-        return erased_replicas.size();
+        return MutablePart(0).PopReplicas(pred_fn).size();
     }
 
-    size_t EraseReplicas() {
-        auto erased_replicas = PopReplicas();
-        return erased_replicas.size();
-    }
-
+    // visit_fn may modify the replica but must not add or pop replicas.
     size_t VisitReplicas(const std::function<bool(const Replica&)>& pred_fn,
                          const std::function<void(Replica&)>& visit_fn) {
         size_t num_visited = 0;
 
-        for (auto& replica : replicas_) {
+        for (auto& replica : MutablePart(0).replicas()) {
             if (pred_fn(replica)) {
                 visit_fn(replica);
                 num_visited++;
@@ -223,7 +312,7 @@ struct ObjectMetadata {
         const std::function<void(const Replica&)>& visit_fn) const {
         size_t num_visited = 0;
 
-        for (auto& replica : replicas_) {
+        for (const auto& replica : GetPart(0).replicas()) {
             if (pred_fn(replica)) {
                 visit_fn(replica);
                 num_visited++;
@@ -234,36 +323,30 @@ struct ObjectMetadata {
     }
 
     bool HasReplica(const std::function<bool(const Replica&)>& pred_fn) const {
-        return std::any_of(replicas_.begin(), replicas_.end(), pred_fn);
+        return std::ranges::any_of(GetPart(0).replicas(), pred_fn);
     }
 
     bool AllReplicas(const std::function<bool(const Replica&)>& pred_fn) const {
-        return std::all_of(replicas_.begin(), replicas_.end(), pred_fn);
+        return std::ranges::all_of(GetPart(0).replicas(), pred_fn);
     }
 
     size_t CountReplicas(
         const std::function<bool(const Replica&)>& pred_fn) const {
-        return std::count_if(replicas_.begin(), replicas_.end(), pred_fn);
+        return static_cast<size_t>(
+            std::ranges::count_if(GetPart(0).replicas(), pred_fn));
     }
 
-    size_t CountReplicas() const { return replicas_.size(); }
+    size_t CountReplicas() const { return GetPart(0).replicas().size(); }
 
-    const std::vector<Replica>& GetAllReplicas() const { return replicas_; }
-
-    std::optional<ReplicaStatus> HasDiffRepStatus(ReplicaStatus status) const {
-        for (const auto& replica : replicas_) {
-            if (replica.status() != status) {
-                return replica.status();
-            }
-        }
-        return {};
+    std::span<const Replica> GetAllReplicas() const {
+        return GetPart(0).replicas();
     }
 
     Replica* GetFirstReplica(
         const std::function<bool(const Replica&)>& pred_fn) {
-        const auto it =
-            std::find_if(replicas_.begin(), replicas_.end(), pred_fn);
-        return it != replicas_.end() ? &(*it) : nullptr;
+        auto replicas = MutablePart(0).replicas();
+        const auto it = std::ranges::find_if(replicas, pred_fn);
+        return it != replicas.end() ? &(*it) : nullptr;
     }
 
     Replica* GetReplicaByID(const ReplicaID& id) {
@@ -271,47 +354,13 @@ struct ObjectMetadata {
             [&id](const Replica& replica) { return replica.id() == id; });
     }
 
-    bool EraseReplicaByID(const ReplicaID& id) {
-        auto num_erased = EraseReplicas(
-            [&id](const Replica& replica) { return replica.id() == id; });
-        return num_erased > 0;
-    }
-
-    size_t EraseReplica(ReplicaType replica_type) {
-        return EraseReplicas([replica_type](const Replica& replica) {
-            if (replica_type == ReplicaType::ALL) {
-                return replica.is_memory_replica() ||
-                       replica.is_nof_replica() || replica.is_dfs_replica();
-            }
-            return replica.type() == replica_type;
-        });
-    }
-
-    bool HasMemReplica() const {
-        return HasReplica(&Replica::fn_is_memory_replica);
-    }
-
-    bool HasNoFReplica() const {
-        return HasReplica(&Replica::fn_is_nof_replica);
-    }
-
-    size_t GetMemReplicaCount() const {
-        return CountReplicas(&Replica::fn_is_memory_replica);
-    }
-
-    size_t GetNoFReplicaCount() const {
-        return CountReplicas(&Replica::fn_is_nof_replica);
-    }
-
     Replica* GetReplicaBySegmentName(const std::string& segment_name) {
         return GetFirstReplica([&segment_name](const Replica& replica) {
-            auto names = replica.get_segment_names();
-            for (auto& name_opt : names) {
-                if (name_opt == segment_name) {
-                    return true;
-                }
-            }
-            return false;
+            const auto names = replica.get_segment_names();
+            return std::ranges::any_of(names,
+                                       [&segment_name](const auto& name_opt) {
+                                           return name_opt == segment_name;
+                                       });
         });
     }
 
@@ -321,13 +370,6 @@ struct ObjectMetadata {
     void GrantReadLease(std::chrono::milliseconds ttl) const {
         SpinLocker locker(&lock);
         lease_->GrantReadLease(ttl);
-    }
-
-    // Whether the authoritative lease needs a refresh.
-    bool NeedsReadLeaseRefresh(std::chrono::milliseconds ttl) const {
-        SpinLocker locker(&lock);
-        const auto now = std::chrono::system_clock::now();
-        return lease_->ExpiresAt() <= now + ttl / 2;
     }
 
     // Whether the authoritative lease is expired.
@@ -341,7 +383,7 @@ struct ObjectMetadata {
         return lease_->IsExpired(now);
     }
 
-    // Lease deadline for the eviction census.
+    // Lease deadline eviction ranks the object by.
     std::chrono::system_clock::time_point EvictionDeadline() const {
         return lease_->ExpiresAt();
     }
@@ -421,6 +463,14 @@ struct ObjectMetadata {
             std::move(*pending_soft_pin_action);
         pending_soft_pin_action.reset();
 
+        return ApplySoftPin({pending.action, pending.ttl}, now);
+    }
+
+    // Caller holds the object's metadata write lock. Independent commands do
+    // not consume or replace a pending write's soft-pin action.
+    SoftPinEvaluation ApplySoftPin(
+        const ResolvedSoftPinRequest& request,
+        const std::chrono::system_clock::time_point& now) {
         SpinLocker locker(&lock);
         int metric_delta = 0;
         std::optional<std::chrono::system_clock::time_point> removed_deadline;
@@ -431,11 +481,11 @@ struct ObjectMetadata {
             --metric_delta;
         }
 
-        switch (pending.action) {
+        switch (request.action) {
             case SoftPinAction::PRESERVE:
                 break;
             case SoftPinAction::ENABLE:
-                if (pending.ttl == std::chrono::milliseconds::zero()) {
+                if (request.ttl == std::chrono::milliseconds::zero()) {
                     if (soft_pin_timeout) {
                         removed_deadline = *soft_pin_timeout;
                         soft_pin_timeout.reset();
@@ -445,7 +495,7 @@ struct ObjectMetadata {
                     if (!soft_pin_timeout) {
                         ++metric_delta;
                     }
-                    soft_pin_timeout = ComputeSoftPinDeadline(now, pending.ttl);
+                    soft_pin_timeout = ComputeSoftPinDeadline(now, request.ttl);
                     deadline_to_index = soft_pin_timeout;
                     // Upserting the latest registration supersedes any
                     // expired or previously active deadline.
@@ -471,9 +521,8 @@ struct ObjectMetadata {
             return;
         }
         const auto& eligible = pending_soft_pin_action->eligible_replica_ids;
-        const bool has_viable_replica = std::any_of(
-            replicas_.begin(), replicas_.end(),
-            [&eligible](const Replica& replica) {
+        const bool has_viable_replica =
+            HasReplica([&eligible](const Replica& replica) {
                 const bool belongs_to_write = eligible.contains(replica.id());
                 const bool valid_handle = !replica.has_invalid_mem_handle() &&
                                           !replica.has_invalid_nof_handle();
@@ -493,7 +542,8 @@ struct ObjectMetadata {
     // Valid means it has at least one valid replica and size is greater
     // than 0
     bool IsValid() const {
-        return size > 0 && HasReplica([](const Replica& replica) {
+        return GetPart(0).length() > 0 &&
+               HasReplica([](const Replica& replica) {
                    return !replica.is_memory_replica() ||
                           !replica.has_invalid_mem_handle();
                });
@@ -501,7 +551,7 @@ struct ObjectMetadata {
 
     std::vector<std::string> GetReplicaSegmentNames() const {
         std::vector<std::string> segment_names;
-        for (const auto& replica : replicas_) {
+        for (const auto& replica : GetPart(0).replicas()) {
             const auto& segment_name_options = replica.get_segment_names();
             for (const auto& segment_name_opt : segment_name_options) {
                 if (segment_name_opt.has_value()) {
@@ -513,8 +563,45 @@ struct ObjectMetadata {
     }
 
    private:
-    // Use the accessors to visit and modify the replicas.
-    std::vector<Replica> replicas_;
+    // Heap node for dynamic replication. Empty while the key has no replica
+    // record and no recreate deadline that is still in the future.
+    struct DynamicReplicaState {
+        std::unordered_map<ReplicaID, DynamicReplicaRecord> replicas;
+        std::chrono::steady_clock::time_point recreate_after{};
+    };
+    HeapOptional<DynamicReplicaState> dynamic_replica_state_;
+
+    DynamicReplicaState& EnsureDynamicReplicaState() {
+        if (!dynamic_replica_state_) {
+            dynamic_replica_state_.emplace();
+        }
+        return *dynamic_replica_state_;
+    }
+
+    // Map must be empty. An expired or unset deadline frees the node. A
+    // deadline still in the future stays; discard_buckets replaces the map
+    // so buckets left by erase() are freed.
+    void ReleaseDynamicReplicaStateIfIdle(
+        std::chrono::steady_clock::time_point now, bool discard_buckets) {
+        if (!dynamic_replica_state_ ||
+            !dynamic_replica_state_->replicas.empty()) {
+            return;
+        }
+        const auto deadline = dynamic_replica_state_->recreate_after;
+        if (now < deadline) {
+            if (!discard_buckets) {
+                return;
+            }
+            dynamic_replica_state_.reset();
+            dynamic_replica_state_.emplace();
+            dynamic_replica_state_->recreate_after = deadline;
+            return;
+        }
+        dynamic_replica_state_.reset();
+    }
+
+    // The first part sits in the object itself: every object has one today.
+    boost::container::small_vector<ObjectPart, 1> parts_;
 };
 
 }  // namespace mooncake

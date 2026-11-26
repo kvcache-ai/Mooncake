@@ -10,6 +10,8 @@
 
 #include "crc32c.h"
 #include "ha/kv/ha_kv_backend.h"
+#include "ha/oplog/batch_oplog_pruning_worker.h"
+#include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_publisher.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
@@ -115,6 +117,10 @@ class RecordingObjectStore final : public SnapshotObjectStore {
     tl::expected<void, std::string> DownloadBuffer(
         const std::string& key, std::vector<uint8_t>& bytes) override {
         ++buffer_downloads;
+        downloaded_keys.push_back(key);
+        if (key == failed_download_key) {
+            return tl::make_unexpected("download failed");
+        }
         auto it = objects.find(key);
         if (it == objects.end()) return tl::make_unexpected("missing");
         bytes = it->second;
@@ -165,12 +171,15 @@ class RecordingObjectStore final : public SnapshotObjectStore {
 
     bool checksums{true}, bad_checksum{false}, inspection_error{false};
     size_t buffer_downloads{0};
+    std::string failed_download_key;
+    std::vector<std::string> downloaded_keys;
     std::vector<std::string> deleted;
     std::map<std::string, std::vector<uint8_t>> objects;
 };
 
 std::string AddSnapshot(RecordingObjectStore& store, uint64_t batch,
-                        int64_t lease_id = 101, bool with_weights = false) {
+                        int64_t lease_id = 101, bool with_weights = false,
+                        bool with_objects = false) {
     ha::BatchOpLogSnapshotManifest manifest;
     manifest.snapshot_id = ha::BuildBatchOpLogSnapshotId(batch, lease_id);
     manifest.last_included_batch_id = batch;
@@ -186,7 +195,7 @@ std::string AddSnapshot(RecordingObjectStore& store, uint64_t batch,
                                       1, 1, Crc32cValue("o", 1)});
     store.objects[manifest.segments.key] = {'s'};
     store.objects[manifest.object_chunks[0].key] = {'o'};
-    if (with_weights) {
+    if (with_weights || with_objects) {
         manifest.schema_version = ha::kBatchOpLogWeightSnapshotSchemaVersion;
         manifest.snapshot_format = ha::kBatchOpLogWeightSnapshotFormat;
         manifest.weight_metadata = ha::BatchOpLogSnapshotObjectDescriptor{
@@ -194,6 +203,15 @@ std::string AddSnapshot(RecordingObjectStore& store, uint64_t batch,
                                                          manifest.snapshot_id),
             1, Crc32cValue("w", 1)};
         store.objects[manifest.weight_metadata->key] = {'w'};
+    }
+    if (with_objects) {
+        manifest.schema_version = ha::kBatchOpLogObjectSnapshotSchemaVersion;
+        manifest.snapshot_format = ha::kBatchOpLogObjectSnapshotFormat;
+        manifest.object_storage = ha::BatchOpLogSnapshotObjectDescriptor{
+            ha::BuildBatchOpLogSnapshotObjectStorageKey(root,
+                                                        manifest.snapshot_id),
+            1, Crc32cValue("a", 1)};
+        store.objects[manifest.object_storage->key] = {'a'};
     }
     const auto bytes = ha::EncodeBatchOpLogSnapshotManifest(manifest);
     ha::BatchOpLogSnapshotDescriptor descriptor;
@@ -260,7 +278,72 @@ TEST_F(PruningTest, MissingWeightArtifactDoesNotAdvanceFloorOrDeleteLog) {
     }
     EXPECT_EQ(ErrorCode::OK, Run());
     EXPECT_EQ("10", backend.values.at(floor_key));
-    EXPECT_EQ(1u, backend.delete_count);
+    EXPECT_EQ(0u, backend.delete_count);
+}
+
+TEST_F(PruningTest, MissingObjectArtifactDoesNotAdvanceFloorOrDeleteLog) {
+    latest = AddSnapshot(store, 20, 101, true, true);
+    fallback = AddSnapshot(store, 10, 101, true, true);
+    backend.Put(latest_key, latest);
+    backend.Put(fallback_key, fallback);
+    for (const auto& id : {"20-101", "10-101"}) {
+        const auto key =
+            ha::BuildBatchOpLogSnapshotObjectStorageKey("snapshots", id);
+        const auto bytes = store.objects.at(key);
+        store.objects.erase(key);
+        EXPECT_NE(ErrorCode::OK, Run());
+        EXPECT_FALSE(backend.values.contains(floor_key));
+        EXPECT_EQ(0u, backend.delete_count);
+        store.objects[key] = bytes;
+    }
+    EXPECT_EQ(ErrorCode::OK, Run());
+    EXPECT_EQ("10", backend.values.at(floor_key));
+    EXPECT_EQ(0u, backend.delete_count);
+}
+
+TEST_F(PruningTest, ObjectArtifactsWithoutChecksumsAreReadBackBeforePruning) {
+    backend.Put(latest_key, AddSnapshot(store, 20, 101, true, true));
+    backend.Put(fallback_key, AddSnapshot(store, 10, 101, true, true));
+    store.checksums = false;
+
+    ASSERT_EQ(ErrorCode::OK, Run());
+    const std::vector<std::string> expected{
+        ha::BuildBatchOpLogSnapshotObjectStorageKey("snapshots", "20-101"),
+        ha::BuildBatchOpLogSnapshotObjectStorageKey("snapshots", "10-101")};
+    EXPECT_EQ(expected, store.downloaded_keys);
+    EXPECT_EQ("10", backend.values.at(floor_key));
+    EXPECT_EQ(0u, backend.delete_count);
+}
+
+TEST_F(PruningTest, ObjectReadbackFailurePreservesFloorAndLog) {
+    backend.Put(latest_key, AddSnapshot(store, 20, 101, true, true));
+    backend.Put(fallback_key, AddSnapshot(store, 10, 101, true, true));
+    backend.Put(floor_key, "5");
+    store.checksums = false;
+
+    for (const auto& id : {"20-101", "10-101"}) {
+        SCOPED_TRACE(id);
+        const auto key =
+            ha::BuildBatchOpLogSnapshotObjectStorageKey("snapshots", id);
+        const auto original = store.objects.at(key);
+        store.objects[key][0] ^= 1;
+        ASSERT_NE(ErrorCode::OK, Run());
+        EXPECT_EQ("5", backend.values.at(floor_key));
+        EXPECT_EQ(0u, backend.txn_count);
+        EXPECT_EQ(0u, backend.delete_count);
+        store.objects[key] = original;
+
+        store.failed_download_key = key;
+        ASSERT_NE(ErrorCode::OK, Run());
+        EXPECT_EQ("5", backend.values.at(floor_key));
+        EXPECT_EQ(0u, backend.txn_count);
+        EXPECT_EQ(0u, backend.delete_count);
+        store.failed_download_key.clear();
+    }
+
+    EXPECT_EQ(ErrorCode::OK, Run());
+    EXPECT_EQ("10", backend.values.at(floor_key));
+    EXPECT_EQ(0u, backend.delete_count);
 }
 
 TEST_F(PruningTest, FirstSnapshotDoesNotPublishFloor) {
@@ -273,15 +356,15 @@ TEST_F(PruningTest, FirstSnapshotDoesNotPublishFloor) {
     EXPECT_EQ(0u, backend.delete_count);
 }
 
-TEST_F(PruningTest, PublishesFloorBeforeDeletionAndRotates) {
-    backend.before_delete = [&] { EXPECT_EQ("10", backend.values[floor_key]); };
+TEST_F(PruningTest, PublishesFloorAndLeavesPhysicalDeletionToWorker) {
     ASSERT_EQ(ErrorCode::OK, Run());
-    EXPECT_EQ(1u, backend.delete_count);
-    backend.before_delete = [&] { EXPECT_EQ("20", backend.values[floor_key]); };
+    EXPECT_EQ("10", backend.values[floor_key]);
+    EXPECT_EQ(0u, backend.delete_count);
     ASSERT_EQ(ErrorCode::OK, BatchOpLogSnapshotPublisher(backend, "cluster")
                                  .Publish(*lease, AddSnapshot(store, 30)));
     ASSERT_EQ(ErrorCode::OK, Run());
-    EXPECT_EQ(2u, backend.delete_count);
+    EXPECT_EQ("20", backend.values[floor_key]);
+    EXPECT_EQ(0u, backend.delete_count);
 }
 
 TEST_F(PruningTest, RequiresIndependentOrderedSnapshots) {
@@ -357,7 +440,7 @@ TEST_F(PruningTest, UnsupportedChecksumNeverDownloadsChunkBodies) {
     store.checksums = false;
     EXPECT_EQ(ErrorCode::OK, Run());
     EXPECT_EQ(0u, store.buffer_downloads);
-    EXPECT_EQ(1u, backend.delete_count);
+    EXPECT_EQ(0u, backend.delete_count);
 }
 
 TEST_F(PruningTest, CasFencesPointersLeaseAndRawFloor) {
@@ -388,7 +471,7 @@ TEST_F(PruningTest, FailedOrUnknownTxnDoesNotDelete) {
     }
 }
 
-TEST_F(PruningTest, DeleteFailureKeepsFloorAndRetries) {
+TEST_F(PruningTest, FloorPublicationDoesNotPerformPhysicalDeletion) {
     auto& metrics = HAMetricManager::instance();
     const auto before = metrics.get_snapshot_runtime().floor_advances_total;
     const auto errors =
@@ -396,22 +479,22 @@ TEST_F(PruningTest, DeleteFailureKeepsFloorAndRetries) {
             .get_snapshot_operation(HAMetricManager::SnapshotOperation::Prune)
             .errors;
     backend.delete_error = ErrorCode::ETCD_OPERATION_ERROR;
-    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, Run());
+    EXPECT_EQ(ErrorCode::OK, Run());
     EXPECT_EQ("10", backend.values[floor_key]);
     EXPECT_EQ(10u, metrics.get_snapshot_runtime().compaction_floor);
     EXPECT_EQ(before + 1, metrics.get_snapshot_runtime().floor_advances_total);
-    EXPECT_EQ(errors + 1, metrics
-                              .get_snapshot_operation(
-                                  HAMetricManager::SnapshotOperation::Prune)
-                              .errors);
+    EXPECT_EQ(errors, metrics
+                          .get_snapshot_operation(
+                              HAMetricManager::SnapshotOperation::Prune)
+                          .errors);
     backend.delete_error = ErrorCode::OK;
     EXPECT_EQ(ErrorCode::OK, Run());
     EXPECT_EQ(before + 1, metrics.get_snapshot_runtime().floor_advances_total);
-    EXPECT_EQ(errors + 1, metrics
-                              .get_snapshot_operation(
-                                  HAMetricManager::SnapshotOperation::Prune)
-                              .errors);
-    EXPECT_EQ(2u, backend.delete_count);
+    EXPECT_EQ(errors, metrics
+                          .get_snapshot_operation(
+                              HAMetricManager::SnapshotOperation::Prune)
+                          .errors);
+    EXPECT_EQ(0u, backend.delete_count);
     EXPECT_EQ("10", backend.values[floor_key]);
 }
 
@@ -423,7 +506,7 @@ TEST_F(PruningTest, CrashAfterCasLeavesReaderVisibleFloorForRetry) {
     EXPECT_EQ(0u, backend.delete_count);
     backend.after_txn = {};
     EXPECT_EQ(ErrorCode::OK, Run());
-    EXPECT_EQ(1u, backend.delete_count);
+    EXPECT_EQ(0u, backend.delete_count);
 }
 
 TEST_F(PruningTest, FloorNeverRegressesAndParsingIsStrict) {
@@ -451,7 +534,7 @@ TEST_F(PruningTest, CancelledOrReleasedLeaseDoesNotDelete) {
 }
 
 #ifdef STORE_USE_ETCD
-TEST(PruningRealEtcdTest, FloorPrecedesInclusiveDeleteAndProtectsControlKeys) {
+TEST(PruningRealEtcdTest, FloorPrecedesBoundedDeleteAndProtectsControlKeys) {
     constexpr char endpoints[] = "127.0.0.1:2379";
     ASSERT_EQ(ErrorCode::OK, EtcdHelper::ConnectToEtcdStoreClient(endpoints));
     const std::string cluster = "n12-test-" + std::to_string(getpid());
@@ -472,7 +555,7 @@ TEST(PruningRealEtcdTest, FloorPrecedesInclusiveDeleteAndProtectsControlKeys) {
     ASSERT_EQ(
         ErrorCode::OK,
         publisher.Publish(lease, AddSnapshot(store, 20, lease.lease_id())));
-    for (uint64_t id : {0, 1, 10, 11, 20, 21})
+    for (uint64_t id : {1, 10, 11, 20, 21})
         ASSERT_EQ(ErrorCode::OK,
                   backend.Put(BuildBatchRecordKey(cluster, id), "batch"));
     ASSERT_EQ(ErrorCode::OK,
@@ -485,7 +568,12 @@ TEST(PruningRealEtcdTest, FloorPrecedesInclusiveDeleteAndProtectsControlKeys) {
         backend.Get(ha::BuildBatchOpLogSnapshotCompactionFloorKey(cluster),
                     ignored));
     EXPECT_EQ("10", ignored);
-    for (uint64_t id : {0, 1, 10})
+    OpLogBatchStorage storage(cluster, backend);
+    BatchOpLogPruningWorker worker(storage, 10, 50);
+    bool deleted_chunk = false;
+    ASSERT_EQ(ErrorCode::OK, worker.RunOneChunk(deleted_chunk));
+    ASSERT_TRUE(deleted_chunk);
+    for (uint64_t id : {1, 10})
         EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
                   backend.Get(BuildBatchRecordKey(cluster, id), ignored));
     for (const auto& key :

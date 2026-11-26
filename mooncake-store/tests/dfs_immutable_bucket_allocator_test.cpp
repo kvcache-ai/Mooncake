@@ -215,6 +215,40 @@ TEST(ImmutableBucketAllocatorTest, RetiresWholeBucketAfterDelete) {
     EXPECT_FALSE(allocator.GetBucketIdForKey("cold"));
 }
 
+TEST(ImmutableBucketAllocatorTest, DeferredDeletionWaitsForItsTime) {
+    TempDir dir;
+    auto config = BucketConfig(dir);
+    config.bucket_capacity = 4096;
+    ImmutableBucketAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+
+    auto cold = allocator.Allocate("cold", 100);
+    auto active = allocator.Allocate("active", 100);
+    ASSERT_TRUE(cold);
+    ASSERT_TRUE(active);
+    ASSERT_TRUE(allocator.MarkCommitted("cold", *cold));
+    ASSERT_TRUE(allocator.MarkCommitted("active", *active));
+    auto eviction = allocator.PrepareEvictionForAllocationFailure();
+    ASSERT_FALSE(eviction.Empty());
+    const auto path = eviction.Candidates().front().descriptor.file_path;
+    auto logical = allocator.CommitEvictionLogical(std::move(eviction));
+    ASSERT_TRUE(logical);
+
+    const auto not_before =
+        std::chrono::system_clock::now() + std::chrono::milliseconds(200);
+    allocator.DeferDeletion(std::move(*logical), not_before);
+    // Until its time the file and its capacity stay.
+    EXPECT_EQ(allocator.RetryFailedEvictions(), 0u);
+    EXPECT_TRUE(std::filesystem::exists(path));
+    EXPECT_EQ(allocator.GetBucketCount(), 2u);
+    EXPECT_EQ(allocator.GetUsedBytes(), 2 * config.bucket_capacity);
+
+    std::this_thread::sleep_until(not_before);
+    EXPECT_EQ(allocator.RetryFailedEvictions(), 1u);
+    EXPECT_FALSE(std::filesystem::exists(path));
+    EXPECT_EQ(allocator.GetBucketCount(), 1u);
+}
+
 TEST(ImmutableBucketAllocatorTest,
      LogicalEvictionAllowsSameKeyBeforePhysicalDelete) {
     TempDir dir;

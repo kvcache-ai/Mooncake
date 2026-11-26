@@ -50,6 +50,10 @@
 #include "tent/transport/tpu/tpu_transport.h"
 #endif
 
+#ifdef USE_MLU
+#include "tent/transport/mlu/mlu_transport.h"
+#endif
+
 #ifdef USE_XPU
 #include "tent/transport/xpu/xpu_transport.h"
 #endif
@@ -62,10 +66,22 @@
 #include "tent/transport/hylink/hylink_transport.h"
 #endif
 
+#ifdef USE_FABRIC
+#include "tent/transport/fabric/fabric_transport.h"
+#endif
+
+#ifdef USE_MEMFABRIC
+#include "tent/transport/memfabric/memfabric_transport.h"
+#endif
+
 namespace mooncake {
 namespace tent {
 
 Status TransferEngineImpl::loadTransports() {
+#ifndef USE_CUDA
+    if (mnnvl_config_.require_fabric)
+        return Status::InvalidArgument("Strict MNNVL requires a CUDA build");
+#endif
     if (conf_->get("transports/tcp/enable", true))
         transport_list_[TCP] = std::make_shared<TcpTransport>();
 
@@ -98,7 +114,8 @@ Status TransferEngineImpl::loadTransports() {
 #endif
 
 #ifdef USE_CUDA
-    bool enable_mnnvl = getenv("MC_ENABLE_MNNVL") != nullptr;
+    bool enable_mnnvl =
+        mnnvl_config_.require_fabric || getenv("MC_ENABLE_MNNVL") != nullptr;
     if (enable_mnnvl) {
         if (conf_->get("transports/mnnvl/enable", true))
             transport_list_[MNNVL] = std::make_shared<MnnvlTransport>();
@@ -132,6 +149,11 @@ Status TransferEngineImpl::loadTransports() {
         transport_list_[TPU] = std::make_shared<TpuTransport>();
 #endif
 
+#ifdef USE_MLU
+    if (conf_->get("transports/mlu/enable", true))
+        transport_list_[MLU] = std::make_shared<MluTransport>();
+#endif
+
 #ifdef USE_XPU
     if (conf_->get("transports/xpu/enable", true))
         transport_list_[XPU] = std::make_shared<XpuTransport>();
@@ -145,6 +167,16 @@ Status TransferEngineImpl::loadTransports() {
 #ifdef USE_HYLINK
     if (conf_->get("transports/hylink/enable", false))
         transport_list_[HYLINK] = std::make_shared<HylinkTransport>();
+#endif
+
+#ifdef USE_FABRIC
+    if (conf_->get("transports/fabric/enable", true))
+        transport_list_[FABRIC] = std::make_shared<FabricTransport>();
+#endif
+
+#ifdef USE_MEMFABRIC
+    if (conf_->get("transports/memfabric/enable", false))
+        transport_list_[MEMFABRIC] = std::make_shared<MemFabricTransport>();
 #endif
 
     return Status::OK();

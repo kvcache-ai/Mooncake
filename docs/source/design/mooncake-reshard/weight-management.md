@@ -11,10 +11,12 @@ independent tensor-level management metadata.
 
 ## Delivery Status
 
-This stage integrates weight imports, publication, and revision leases with
-Master and HA replication and recovery. Managed payload-group reclamation,
-residency migration, and client RPCs are delivered as follow-up changes. The
-state machine remains independent of tensor geometry and physical placement.
+This stage provides Master RPC and C++ client access to revision management,
+managed-group removal protection, lease-fenced deletion, and basic residency
+operation reconciliation with HA recovery. Configurable residency policies,
+automatic migration, and the managed Python `WeightStore` facade remain
+follow-up work. The upload flow below describes the caller's responsibilities;
+the Python facade is not required to use the C++ interfaces.
 
 ## Authority Model
 
@@ -22,7 +24,7 @@ Three records have distinct authority:
 
 | Authority | Location | Owns | Does not own |
 | --- | --- | --- | --- |
-| Weight Metadata Store | Store Master memory, HA OpLog, and Master snapshot | exact revision discovery, availability, residency summary, operation progress, revision leases, manifest reference | tensor geometry, payload contents, physical replica addresses |
+| Weight Metadata Store | Store Master memory, HA OpLog, and standby-generated batch OpLog snapshot | exact revision discovery, availability, residency summary, operation progress, revision leases, manifest reference | tensor geometry, payload contents, physical replica addresses |
 | `StoredWeightManifest` | immutable Store `METADATA` object | tensor descriptors and tensor-fragment-to-object-range mapping | lifecycle state, leases, live runtime addresses |
 | Store object metadata | existing per-key Master metadata | replica placement and status in memory, local disk, DFS, or NoF | revision discovery, tensor meaning, serving activation |
 
@@ -43,10 +45,35 @@ absent. The manifest and every payload object share one `payload_group_id`.
 Generic eviction and removal paths recognize that group as managed and cannot
 independently reclaim one member.
 
+`RemoveAll` removes eligible object metadata without issuing a whole-client
+SSD wipe: a disk client may also hold managed weights or objects imported
+concurrently. As with single-key removal, physical disk space is reclaimed by
+the existing disk eviction path when eligible; successful metadata removal
+does not promise immediate physical erasure.
+
+Disk reclamation depends on the backend's eviction configuration and pressure
+thresholds. With watermark eviction enabled, the client heartbeat selects
+eligible disk records and asks the Master to release their replica metadata
+before reclaiming storage. A record already removed by the Master is eligible;
+a live managed-weight record is not. A physical bucket containing a live
+protected record cannot be reclaimed as a whole. Disk occupancy below the
+threshold may therefore remain after `RemoveAll`, and metadata accounting is
+not a measurement of physical free disk space.
+
+For independent files, a managed-weight rejection does not authorize deleting
+that file or prevent reclaiming unrelated files in the same batch. Protected
+files rotate behind other candidates so subsequent heartbeat passes can make
+progress. Communication failures retain the pending files for retry.
+
+New clients do not poll the legacy whole-client `PollRemoveAll` mailbox. Its
+RPC remains for older clients, but the Master no longer produces wipe requests:
+such a request cannot safely distinguish tenants, protected weights, or objects
+written after the request was issued.
+
 The group is a logical lifecycle boundary, not a distributed transaction.
 Physical work may be partial while an operation is running. The metadata store keeps
 the operation non-terminal until reconciliation observes the required state
-for every member.
+for every member, or an explicit delete cancels the operation.
 
 ## Revision Identity and Manifest Location
 
@@ -94,13 +121,23 @@ Availability, physical residency, and an in-progress operation are separate:
 | Residency | `UNKNOWN`, `HOT`, `COLD`, `MIXED`, `ABSENT` | observed placement across required group members |
 | Operation | `NONE`, `EVICTING`, `REHYDRATING`, `REPAIRING` | durable non-terminal group work |
 
+The current operation entry point starts `EVICTING` or `REHYDRATING`.
+`REPAIRING` is reserved for a follow-up recovery workflow.
+
 `READY` means the manifest and every required payload object have a readable
 replica. DRAM eviction changes residency but does not by itself make a revision
 unavailable. Missing required members produce `DEGRADED`; complete physical
 removal produces the retained `DELETED`/`ABSENT` tombstone.
 
-Every mutation is fenced by `expected_metadata_generation`. A stale writer
-fails with `STALE_GENERATION`. A retry of an uncertain import commit with the
+For an incomplete revision, residency describes the readable members still present;
+`DEGRADED` reports the missing required members. Missing members alone do not
+mean the remaining objects span multiple storage tiers.
+
+Commit, abort, lease acquisition, operation start, and deletion check the
+caller's `expected_metadata_generation`. Lease renewal and release use the
+lease identity; reconciliation prepares mutations against the generation it
+observes. A stale generation fails with `STALE_GENERATION`. A retry of an
+uncertain import commit with the
 same generation and immutable manifest reference is idempotent.
 
 ## Import and Publication
@@ -109,14 +146,22 @@ The managed upload sequence is:
 
 1. `BeginWeightImport` creates or returns the `IMPORTING` metadata record and
    Store-issued canonical payload group ID.
-2. `WeightStore` writes every payload object into that group.
+2. The caller writes every payload object into that group.
 3. The immutable `StoredWeightManifest` is committed last into the same group.
 4. `CommitWeightImport` validates exact group membership and the manifest
    reference, then durably publishes `READY`.
 5. `GetWeightRevision` or bounded `ListWeightRevisions` can discover it.
 
 `READY` is never inferred from key prefixes. An abandoned import is handled by
-the explicit abort/reconciliation policy.
+the explicit abort/reconciliation policy. `weight_import_idle_timeout_ms`
+(default `300000`, must be positive) bounds inactivity since the last accepted
+member `PutStart`/`UpsertStart` or write-progressing `PutEnd`/`UpsertEnd`.
+Failed requests, repeated Begin, and already-completed End retries do not extend
+the window. Activity remains local to the leader; recovery grants importing
+revisions a fresh full window. The timeout claim excludes admitted End calls and
+rejects new End calls once abandonment starts. Data-plane transfers between
+master requests are not observable activity: set this timeout above the longest
+expected interval between those requests, including a large single-object upload.
 
 ## Load and Revision Leases
 
@@ -149,29 +194,43 @@ per-object primitives:
 - deletion blocks new leases, waits for live leases, removes payload objects,
   removes the manifest last, verifies absence, and retains a tombstone.
 
+An explicit COLD request requires a readable cold copy of every member at
+admission; otherwise it returns `NOT_READY`. An explicit delete may cancel a
+pending residency operation, including one stalled by missing replicas or
+promotion capacity. After the ordinary generation and lease checks, cancellation
+and `DELETING` publish together in one durable record, before physical removal.
+Operation queries retain the original target and progress with message
+`cancelled`; they never report cancellation as successful convergence.
+
 Generic `BatchEvict`, quota eviction, explicit remove, and cleanup paths skip
 managed groups. Only the weight lifecycle path may change their aggregate
 residency or availability.
+
+Reconciliation runs on a dedicated Master worker, not the general task-cleanup
+thread, and is not exposed as a client RPC. A background pass shares a bounded
+number of member actions across revisions. This bounds physical action attempts,
+not the time required for a durable write or the cost of observing group metadata.
+Clients use operation and revision queries to observe convergence. The operation
+`cursor` reports progress; it is not a client-controlled resume token.
 
 ## Recovery and HA Rollout
 
 Weight metadata, leases, and operation records use durable-before-visible
 OpLog publication. Standby replay stores them in a separate weight-metadata
-namespace rather than encoding them as fake object metadata. Master snapshots
-carry an optional `weight_metadata` section; an older snapshot without the
-section restores empty Weight metadata while preserving ordinary KV metadata.
-Derived group indexes are rebuilt from restored metadata records.
+namespace rather than encoding them as fake object metadata. Batch OpLog
+snapshots capture that namespace with object and segment metadata at the same
+durable replay cursor. Derived group indexes are rebuilt from restored
+metadata records.
 
-Periodic Master snapshots capture the durable log boundary and weight state
-under a shared consistency boundary. Weight mutations hold a barrier from
-log submission through in-memory publication. If a mutation is still pending,
-the snapshot skips that cycle and retries at the next interval rather than
-waiting for publication while holding the global snapshot lock. Continuous
-overlapping weight mutations can therefore postpone snapshots. Weight state
-is frozen in the parent; the forked child only serializes the frozen value.
-Snapshots also skip capture when the OpLog writer is not accepting writes:
-a failed caller may have an uncertain durable outcome, which must remain
-recoverable from the log rather than be skipped by a new snapshot boundary.
+OpLog replay accepts both the legacy `WeightRevisionMetadata` payload and the
+metadata-plus-operation envelope, distinguished by their serialized type hashes.
+Legacy records can only describe metadata without an active operation. A valid
+envelope with invalid metadata or operation fields is rejected rather than
+retried as a legacy payload. Deploy new readers before enabling writers that
+publish operation envelopes; compatibility decoding does not make an old reader
+understand a new writer's format.
+The `cancelled` terminal message also requires upgraded readers before writers
+enable cancellation, even though the serialized envelope shape is unchanged.
 
 Batch-OpLog snapshots containing weight state use a version-2 manifest with a
 checksummed weight-state artifact captured at the same replay cursor as object
@@ -194,20 +253,15 @@ Clusters using HA plus the etcd batch OpLog fail closed for weight-management
 mutations unless the operator sets
 `weight_management_oplog_capability_confirmed=true`. Set it only after every
 configured standby runs a version that understands all weight metadata and
-lease OpLog entries. This is an explicit rolling-upgrade capability assertion,
+lease OpLog entries, including the `cancelled` operation terminal. This is an
+explicit rolling-upgrade capability assertion,
 not automatic standby discovery. Reads and ordinary KV operations are not
 gated by it.
 
 The capability flag admits new mutations; it is not a rollback switch.
-Disabling it does not remove existing weight state, including state loaded
-through snapshot restore or standby promotion. Such a cluster still requires
-readers that support its weight OpLog and snapshot formats.
-
-The metadata-only OpLog payload in this stage accepts revisions without an
-active residency operation (`operation=NONE`, `operation_id=0`). The applier
-rejects an active operation reference rather than accepting metadata whose
-operation record cannot be replicated. Residency operation publication and
-atomic replication of metadata with its operation record are follow-up work.
+Disabling it does not remove existing weight state loaded through batch
+snapshot restore or standby promotion. Such a cluster still requires readers
+that support its weight OpLog and batch snapshot formats.
 
 ## Serving-System Boundary
 
@@ -220,9 +274,11 @@ serving revision.
 
 ## Integration Boundary
 
-Follow-up changes expose the lifecycle primitives through the Master RPC and
-C++ client surfaces, then add a managed `WeightStore` Python facade for
-manifest upload and load. Framework adapters remain responsible for building
-and validating tensor manifests, holding runtime allocation guards, and
-activating revisions. Manifest-only objects without a Weight metadata record
-remain outside this lifecycle.
+This layer exposes the native lifecycle primitives through the Master RPC and
+C++ client surfaces. A follow-up change adds the managed `WeightStore` Python
+facade that composes these primitives with manifest upload and load. A
+framework adapter remains responsible for constructing and validating the
+immutable tensor manifest, holding runtime allocation guards, and activating a
+revision in the serving system. Manifest-only objects written without a Weight
+metadata record are outside this lifecycle and are not discovered
+automatically.

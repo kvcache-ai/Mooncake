@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <string_view>
 
 #include <glog/logging.h>
@@ -368,8 +369,15 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefixImpl(
     }
 
     const std::string durable_key = BuildDurablePrefixKey(cluster_id_);
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    const auto encode_started_at = std::chrono::steady_clock::now();
+#endif
     const std::string encoded_batch = EncodeOpLogBatchRecord(batch);
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    HAMetricManager::instance().observe_batch_record_encode_latency_us(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - encode_started_at)
+            .count());
     HAMetricManager::instance().observe_batch_record_batch_bytes(
         encoded_batch.size());
 #endif
@@ -392,7 +400,20 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefixImpl(
                             .batch_id = batch.batch_id,
                             .last_seq = batch.last_seq,
                         })});
-    ErrorCode err = backend_.Txn(txn);
+    auto execute_txn = [&] {
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+        const auto txn_started_at = std::chrono::steady_clock::now();
+#endif
+        const auto result = backend_.Txn(txn);
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+        HAMetricManager::instance().observe_batch_record_backend_txn_latency_us(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - txn_started_at)
+                .count());
+#endif
+        return result;
+    };
+    ErrorCode err = execute_txn();
     if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
         std::string raw_prefix;
         DurablePrefix decoded_prefix;
@@ -401,7 +422,7 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefixImpl(
             DecodeDurablePrefix(raw_prefix, &decoded_prefix) &&
             decoded_prefix == expected_prefix) {
             txn.compares[durable_compare_index].expected_value = raw_prefix;
-            err = backend_.Txn(txn);
+            err = execute_txn();
         }
     }
     if (err != ErrorCode::ETCD_TRANSACTION_FAIL && !IsAmbiguousTxnError(err)) {
@@ -447,10 +468,19 @@ ErrorCode OpLogBatchStorage::ReadBatch(uint64_t batch_id,
         return err;
     }
     std::string reason;
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    const auto decode_started_at = std::chrono::steady_clock::now();
+#endif
     if (!DecodeOpLogBatchRecord(value, &batch, &reason)) {
         LOG(ERROR) << "Failed to decode OpLog batch record: " << reason;
         return ErrorCode::INTERNAL_ERROR;
     }
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    HAMetricManager::instance().observe_batch_record_decode_latency_us(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - decode_started_at)
+            .count());
+#endif
     if (batch.batch_id != batch_id) {
         LOG(ERROR) << "OpLog batch id does not match key: requested="
                    << batch_id << ", payload=" << batch.batch_id;
@@ -461,7 +491,7 @@ ErrorCode OpLogBatchStorage::ReadBatch(uint64_t batch_id,
 
 ErrorCode OpLogBatchStorage::ReadBatchesAfter(
     uint64_t after_batch_id, size_t limit,
-    std::vector<OpLogBatchRecord>& batches) {
+    std::vector<OpLogBatchRecord>& batches, bool serializable) {
     batches.clear();
     if (!IsValidClusterId()) {
         return ErrorCode::INVALID_PARAMS;
@@ -472,7 +502,10 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
         std::vector<KvPair> kvs;
         const size_t remaining = limit == 0 ? 0 : limit - batches.size();
         ErrorCode err =
-            backend_.Range(begin_key, range.end_key, remaining, kvs);
+            serializable
+                ? backend_.RangeSerializable(begin_key, range.end_key,
+                                             remaining, kvs)
+                : backend_.Range(begin_key, range.end_key, remaining, kvs);
         if (err != ErrorCode::OK) {
             return err;
         }
@@ -483,11 +516,20 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
             }
             OpLogBatchRecord batch;
             std::string reason;
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+            const auto decode_started_at = std::chrono::steady_clock::now();
+#endif
             if (!DecodeOpLogBatchRecord(kv.value, &batch, &reason)) {
                 LOG(ERROR) << "Failed to decode OpLog batch record at key="
                            << kv.key << ": " << reason;
                 return ErrorCode::INTERNAL_ERROR;
             }
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+            HAMetricManager::instance().observe_batch_record_decode_latency_us(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - decode_started_at)
+                    .count());
+#endif
             if (batch.batch_id != key_batch_id) {
                 LOG(ERROR) << "OpLog batch id does not match key at key="
                            << kv.key;
@@ -503,15 +545,43 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
     return ErrorCode::OK;
 }
 
-ErrorCode OpLogBatchStorage::DeleteBatchesThrough(uint64_t batch_id) {
+ErrorCode OpLogBatchStorage::FindOldestBatchId(
+    std::optional<uint64_t>& batch_id) {
+    batch_id.reset();
     if (!IsValidClusterId()) {
         return ErrorCode::INVALID_PARAMS;
     }
-    // The suffix range starts immediately after the inclusive cutoff, and
-    // already handles UINT64_MAX without overflowing the batch ID.
-    const auto suffix = BuildBatchRecordRange(cluster_id_, batch_id);
-    return backend_.DeleteRange(BuildBatchRecordKey(cluster_id_, 0),
-                                suffix.begin_key);
+
+    const auto range = BuildBatchRecordRange(cluster_id_, 0);
+    std::vector<KvPair> kvs;
+    ErrorCode err = backend_.Range(range.begin_key, range.end_key, 1, kvs);
+    if (err != ErrorCode::OK || kvs.empty()) {
+        return err;
+    }
+    std::string expected_prefix = BuildBatchRecordKey(cluster_id_, 0);
+    expected_prefix.resize(expected_prefix.size() - kOpLogBatchIdWidth);
+    uint64_t parsed_batch_id = 0;
+    if (kvs.front().key.size() != expected_prefix.size() + kOpLogBatchIdWidth ||
+        kvs.front().key.compare(0, expected_prefix.size(), expected_prefix) !=
+            0 ||
+        !TryParseBatchIdFromKey(kvs.front().key, parsed_batch_id) ||
+        parsed_batch_id == 0) {
+        LOG(ERROR) << "Invalid oldest OpLog batch key: cluster=" << cluster_id_
+                   << ", key=" << kvs.front().key;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    batch_id = parsed_batch_id;
+    return ErrorCode::OK;
+}
+
+ErrorCode OpLogBatchStorage::DeleteBatchesInRange(uint64_t first_id,
+                                                  uint64_t last_id) {
+    if (!IsValidClusterId() || first_id == 0 || first_id > last_id) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    const auto end = BuildBatchRecordRange(cluster_id_, last_id);
+    return backend_.DeleteRange(BuildBatchRecordKey(cluster_id_, first_id),
+                                end.begin_key);
 }
 
 bool OpLogBatchStorage::IsValidClusterId() const { return cluster_id_valid_; }

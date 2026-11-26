@@ -14,31 +14,18 @@ endif()
 
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+option(WITH_CONDUCTOR_GO "build Go bindings for mooncake conductor" OFF)
+option(WITH_CONDUCTOR_C_SHARED
+       "build the conductor client C ABI shared library" OFF)
 
-# cppzmq and msgpack-cxx are header-only C++ bindings whose packaging varies:
-# some distributions ship a CMake package config, while Debian and Ubuntu up to
-# 22.04 bundle the headers into libzmq3-dev and libmsgpack-dev with no config at
-# all. Prefer the config when present and otherwise locate the headers directly,
-# so both layouts configure. cppzmq additionally needs the libzmq C library;
-# msgpack-cxx is header-only.
-find_package(cppzmq QUIET)
-if(TARGET cppzmq)
-  set(CONDUCTOR_ZMQ_LIBS cppzmq)
-  message(STATUS "conductor: cppzmq via package config")
-else()
-  find_path(CONDUCTOR_ZMQ_INCLUDE_DIR zmq.hpp)
-  find_library(CONDUCTOR_ZMQ_LIBRARY NAMES zmq libzmq)
-  if(NOT CONDUCTOR_ZMQ_INCLUDE_DIR OR NOT CONDUCTOR_ZMQ_LIBRARY)
-    message(
-      FATAL_ERROR
-        "cppzmq headers (zmq.hpp) or libzmq not found; install cppzmq-dev or libzmq3-dev"
-    )
-  endif()
-  set(CONDUCTOR_ZMQ_LIBS ${CONDUCTOR_ZMQ_LIBRARY})
-  set(CONDUCTOR_ZMQ_INCLUDES ${CONDUCTOR_ZMQ_INCLUDE_DIR})
-  message(
-    STATUS "conductor: cppzmq via headers in ${CONDUCTOR_ZMQ_INCLUDE_DIR}")
+# Standalone builds own their dependencies; the top-level build provides this
+# target before adding Conductor and Store.
+if(NOT TARGET Mooncake::libzmq)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Dependencies.cmake)
+  mooncake_provide_libzmq()
 endif()
+
+# msgpack-cxx is header-only; older distributions have no CMake config.
 
 find_package(msgpack-cxx QUIET)
 if(TARGET msgpack-cxx)
@@ -71,6 +58,7 @@ add_library(
   src/common/utils.cpp
   src/client/types.cpp
   src/client/conductor_client.cpp
+  src/client/conductor_c.cpp
   src/prefixindex/hash_strategy.cpp
   src/prefixindex/prefix_indexer.cpp
   src/zmq/msg_decoder.cpp
@@ -92,12 +80,12 @@ target_include_directories(
   conductor_cpp_core
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
          ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-common/include
-         ${CONDUCTOR_ZMQ_INCLUDES} ${CONDUCTOR_MSGPACK_INCLUDES})
+         ${CONDUCTOR_MSGPACK_INCLUDES})
 
 target_link_libraries(
   conductor_cpp_core
   PUBLIC OpenSSL::Crypto
-         ${CONDUCTOR_ZMQ_LIBS}
+         Mooncake::libzmq
          ${CONDUCTOR_MSGPACK_LIBS}
          yalantinglibs::yalantinglibs
          glog::glog
@@ -146,6 +134,47 @@ else()
   message(
     STATUS
       "conductor: SHA-256 backend = EVP (low-level API unavailable or forced)")
+endif()
+
+if(WITH_CONDUCTOR_C_SHARED OR WITH_CONDUCTOR_GO)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "Conductor C shared library currently supports Linux")
+  endif()
+  include(GNUInstallDirs)
+  add_library(mooncake_conductor_client SHARED src/client/conductor_c.cpp)
+  target_link_libraries(mooncake_conductor_client PRIVATE conductor_cpp_core)
+  set_target_properties(
+    mooncake_conductor_client
+    PROPERTIES VERSION 1.0.0
+               SOVERSION 1
+               INSTALL_RPATH "$ORIGIN"
+               LINK_DEPENDS
+               "${CMAKE_CURRENT_SOURCE_DIR}/src/client/conductor_c.map")
+  target_link_options(
+    mooncake_conductor_client
+    PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/client/conductor_c.map"
+  )
+  install(TARGETS mooncake_conductor_client
+          LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  install(FILES include/conductor/client/conductor_c.h
+          DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/conductor/client)
+endif()
+
+if(WITH_CONDUCTOR_GO)
+  find_program(CONDUCTOR_GO_EXECUTABLE go)
+  if(NOT CONDUCTOR_GO_EXECUTABLE)
+    message(FATAL_ERROR "WITH_CONDUCTOR_GO=ON requires the Go compiler")
+  endif()
+  add_custom_target(
+    build_conductor_go ALL
+    COMMAND
+      ${CMAKE_COMMAND} -E env "GO=${CONDUCTOR_GO_EXECUTABLE}" bash
+      ${CMAKE_CURRENT_SOURCE_DIR}/go/build.sh ${CMAKE_CURRENT_BINARY_DIR}
+      ${CMAKE_CURRENT_BINARY_DIR}/mooncake-conductor-go-example
+    DEPENDS mooncake_conductor_client
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/go
+    VERBATIM)
 endif()
 
 if(BUILD_UNIT_TESTS)

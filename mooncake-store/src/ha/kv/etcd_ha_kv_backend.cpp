@@ -28,26 +28,21 @@ EtcdHelper::TxnCompareKind ToEtcdCompareKind(KvCompareKind kind) {
     return EtcdHelper::TxnCompareKind::kValueEquals;
 }
 
-}  // namespace
-
-ErrorCode EtcdHaKvBackend::Get(std::string_view key, std::string& value) {
-    EtcdRevisionId revision_id = 0;
-    return EtcdHelper::Get(key.data(), key.size(), value, revision_id);
+ErrorCode LegacyWriteError(const KvWriteResult& result, const char* operation) {
+    if (result.status == KvWriteStatus::kOutcomeUnknown) {
+        LOG(WARNING) << "etcd " << operation << " outcome unknown";
+    }
+    return result.ToLegacyError();
 }
 
-ErrorCode EtcdHaKvBackend::Put(std::string_view key, std::string_view value) {
-    return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
-}
-
-ErrorCode EtcdHaKvBackend::Range(std::string_view begin_key,
-                                 std::string_view end_key, size_t limit,
-                                 std::vector<KvPair>& kvs) {
+ErrorCode ReadRange(std::string_view begin_key, std::string_view end_key,
+                    size_t limit, std::vector<KvPair>& kvs, bool serializable) {
     kvs.clear();
     std::string json;
     EtcdRevisionId revision_id = 0;
     ErrorCode err = EtcdHelper::GetRangeAsJson(
         begin_key.data(), begin_key.size(), end_key.data(), end_key.size(),
-        limit, json, revision_id);
+        limit, json, revision_id, serializable);
     if (err != ErrorCode::OK) {
         return err;
     }
@@ -74,23 +69,63 @@ ErrorCode EtcdHaKvBackend::Range(std::string_view begin_key,
     return ErrorCode::OK;
 }
 
+}  // namespace
+
+ErrorCode EtcdHaKvBackend::Get(std::string_view key, std::string& value) {
+    EtcdRevisionId revision_id = 0;
+    return EtcdHelper::Get(key.data(), key.size(), value, revision_id);
+}
+
+ErrorCode EtcdHaKvBackend::Put(std::string_view key, std::string_view value) {
+    return LegacyWriteError(PutWithResult(key, value), "PUT");
+}
+
+KvWriteResult EtcdHaKvBackend::PutWithResult(std::string_view key,
+                                             std::string_view value) {
+    return KvWriteResult::FromError(
+        EtcdHelper::Put(key.data(), key.size(), value.data(), value.size()));
+}
+
+ErrorCode EtcdHaKvBackend::Range(std::string_view begin_key,
+                                 std::string_view end_key, size_t limit,
+                                 std::vector<KvPair>& kvs) {
+    return ReadRange(begin_key, end_key, limit, kvs, false);
+}
+
+ErrorCode EtcdHaKvBackend::RangeSerializable(std::string_view begin_key,
+                                             std::string_view end_key,
+                                             size_t limit,
+                                             std::vector<KvPair>& kvs) {
+    return ReadRange(begin_key, end_key, limit, kvs, true);
+}
+
 bool EtcdHaKvBackend::SupportsTxn() const { return true; }
 
 ErrorCode EtcdHaKvBackend::DeleteRange(std::string_view begin_key,
                                        std::string_view end_key) {
+    return LegacyWriteError(DeleteRangeWithResult(begin_key, end_key),
+                            "DELETE_RANGE");
+}
+
+KvWriteResult EtcdHaKvBackend::DeleteRangeWithResult(std::string_view begin_key,
+                                                     std::string_view end_key) {
     // etcd treats an empty end as a single-key delete and NUL as unbounded.
     if (begin_key.empty() || end_key.empty() ||
         end_key == std::string_view("\0", 1) || begin_key > end_key) {
-        return ErrorCode::INVALID_PARAMS;
+        return KvWriteResult::FromError(ErrorCode::INVALID_PARAMS);
     }
     if (begin_key == end_key) {
-        return ErrorCode::OK;
+        return KvWriteResult::Committed();
     }
-    return EtcdHelper::DeleteRange(begin_key.data(), begin_key.size(),
-                                   end_key.data(), end_key.size());
+    return KvWriteResult::FromError(EtcdHelper::DeleteRange(
+        begin_key.data(), begin_key.size(), end_key.data(), end_key.size()));
 }
 
 ErrorCode EtcdHaKvBackend::Txn(const KvTxn& txn) {
+    return LegacyWriteError(TxnWithResult(txn), "TXN");
+}
+
+KvWriteResult EtcdHaKvBackend::TxnWithResult(const KvTxn& txn) {
     std::vector<EtcdHelper::TxnCompare> compares;
     compares.reserve(txn.compares.size());
     for (const auto& compare : txn.compares) {
@@ -105,7 +140,10 @@ ErrorCode EtcdHaKvBackend::Txn(const KvTxn& txn) {
     for (const auto& put : txn.puts) {
         puts.push_back({.key = put.key, .value = put.value});
     }
-    return EtcdHelper::TxnCompareAndPut(compares, puts);
+    // A wrapper error includes commits whose response was lost/timed out.
+    // Only ETCD_TRANSACTION_FAIL proves that the compares prevented the write.
+    return KvWriteResult::FromError(
+        EtcdHelper::TxnCompareAndPut(compares, puts));
 }
 
 }  // namespace mooncake

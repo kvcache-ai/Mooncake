@@ -18,8 +18,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <utility>
 #include <exception>
 #include <limits>
@@ -44,6 +46,10 @@ constexpr const char* kStoreKey = "store";
 constexpr const char* kFabricKey = "fabric_memory";
 constexpr const char* kFabricFlatPrefix = "fabric_memory.";
 constexpr const char* kRocePrefix = "roce:";
+constexpr const char* kCommResourceConfigKey = "comm_resource_config";
+constexpr const char* kNicTopoPathKey = "nic_topo_path";
+constexpr const char* kNicTopoPathFlatKey =
+    "comm_resource_config.nic_topo_path";
 
 using json = nlohmann::json;
 
@@ -71,6 +77,24 @@ int32_t ParseEnvInt(const char* name, int32_t fallback) {
     }
 }
 
+int32_t ParseEnvIntWithFallback(const char* primary, const char* fallback,
+                                int32_t default_val) {
+    const char* raw = std::getenv(primary);
+    if (raw != nullptr && raw[0] != '\0') {
+        return ParseEnvInt(primary, default_val);
+    }
+    return fallback != nullptr ? ParseEnvInt(fallback, default_val)
+                               : default_val;
+}
+
+bool ParseEnvBoolFlagWithFallback(const char* primary, const char* fallback) {
+    const char* raw = GetAscendEnv(primary, fallback);
+    if (raw == nullptr || raw[0] == '\0') {
+        return false;
+    }
+    return ConfigHelper::parseBool(raw, false);
+}
+
 bool ValidBasePort(int32_t base_port) {
     return base_port >= kMinListenPort &&
            base_port <= kMaxListenPort - kPortRange;
@@ -78,6 +102,11 @@ bool ValidBasePort(int32_t base_port) {
 
 std::string EnvOrEmpty(const char* name) {
     const char* raw = std::getenv(name);
+    return raw ? std::string(raw) : std::string();
+}
+
+std::string EnvOrEmptyWithFallback(const char* primary, const char* fallback) {
+    const char* raw = GetAscendEnv(primary, fallback);
     return raw ? std::string(raw) : std::string();
 }
 
@@ -152,10 +181,89 @@ std::string ResolveGlobalResourceConfig(const std::string& raw,
     return normal.dump();
 }
 
+// True when comm_resource_config.nic_topo_path is set to a non-empty string,
+// accepting either the flat key or the nested comm_resource_config object.
+// An explicit empty string counts as "not configured" (matching HIXL).
+bool NicTopoPathIsSet(const json& root) {
+    if (!root.is_object()) {
+        return false;
+    }
+    auto flat = root.find(kNicTopoPathFlatKey);
+    if (flat != root.end() && flat->is_string() &&
+        !flat->get<std::string>().empty()) {
+        return true;
+    }
+    auto comm = root.find(kCommResourceConfigKey);
+    if (comm != root.end() && comm->is_object()) {
+        auto nested = comm->find(kNicTopoPathKey);
+        if (nested != comm->end() && nested->is_string() &&
+            !nested->get<std::string>().empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
+
+const char* GetAscendEnv(const char* primary, const char* fallback) {
+    const char* raw = primary != nullptr ? std::getenv(primary) : nullptr;
+    if (raw != nullptr && raw[0] != '\0') {
+        return raw;
+    }
+    return fallback != nullptr ? std::getenv(fallback) : nullptr;
+}
 
 bool ParseEnvEnabled(const char* name) {
     return EnvFlagIsOne(std::getenv(name));
+}
+
+bool ParseEnvEnabled(const char* primary, const char* fallback) {
+    return EnvFlagIsOne(GetAscendEnv(primary, fallback));
+}
+
+std::string InjectNicTopoPathFromCustomTopoTent(
+    const std::string& resolved_config, const std::string& custom_topo_json) {
+    // TE support for configuring HIXL's comm_resource_config.nic_topo_path:
+    // the custom topology path is written into it when it is empty.
+    if (custom_topo_json.empty()) {
+        return resolved_config;
+    }
+
+    json root;
+    if (resolved_config.empty()) {
+        root = json::object();
+    } else {
+        root = json::parse(resolved_config, nullptr, false);
+        if (root.is_discarded() || !root.is_object()) {
+            LOG(WARNING)
+                << "Cannot inject custom topology path into "
+                   "comm_resource_config.nic_topo_path: GlobalResourceConfig "
+                   "is not a JSON object";
+            return resolved_config;
+        }
+    }
+
+    // An explicitly configured nic_topo_path always wins over the custom
+    // topology path.
+    if (NicTopoPathIsSet(root)) {
+        return resolved_config;
+    }
+
+    // Prefer the nested form when comm_resource_config already exists so HIXL
+    // sees a single representation; drop any stale flat key in that case
+    // (mirrors WithHixlListenPort).
+    auto comm = root.find(kCommResourceConfigKey);
+    if (comm != root.end() && comm->is_object()) {
+        (*comm)[kNicTopoPathKey] = custom_topo_json;
+        root.erase(kNicTopoPathFlatKey);
+    } else {
+        root[kNicTopoPathFlatKey] = custom_topo_json;
+    }
+    LOG(INFO) << "[AscendTE] comm_resource_config.nic_topo_path is empty, "
+                 "injecting custom topology path: "
+              << custom_topo_json;
+    return root.dump();
 }
 
 AscendDirectOptions LoadAscendDirectOptions(
@@ -172,24 +280,50 @@ AscendDirectOptions LoadAscendDirectOptions(
         options.transfer_timeout_ms = static_cast<int32_t>(
             conf->get("transports/ascend_direct/transfer_timeout_ms",
                       static_cast<long long>(kAscendDefaultTransferTimeoutMs)));
+    } else {
+        options.transfer_timeout_ms = ParseEnvIntWithFallback(
+            "MC_ASCEND_TRANSFER_TIMEOUT", "ASCEND_TRANSFER_TIMEOUT",
+            options.transfer_timeout_ms);
     }
-    options.transfer_timeout_ms =
-        ParseEnvInt("ASCEND_TRANSFER_TIMEOUT", options.transfer_timeout_ms);
     if (options.transfer_timeout_ms <= 0) {
         options.transfer_timeout_ms = kAscendDefaultTransferTimeoutMs;
     }
 
-    options.base_port = ParseEnvInt("ASCEND_BASE_PORT", kAscendDefaultBasePort);
     if (conf && conf->contains("transports/ascend_direct/base_port")) {
         options.base_port = static_cast<int32_t>(
             conf->get("transports/ascend_direct/base_port",
-                      static_cast<long long>(options.base_port)));
+                      static_cast<long long>(kAscendDefaultBasePort)));
+    } else {
+        options.base_port = ParseEnvIntWithFallback(
+            "MC_ASCEND_BASE_PORT", "ASCEND_BASE_PORT", kAscendDefaultBasePort);
     }
     if (!ValidBasePort(options.base_port)) {
-        LOG(WARNING) << "Invalid ASCEND_BASE_PORT/base_port="
-                     << options.base_port << ", using "
-                     << kAscendDefaultBasePort;
+        LOG(WARNING)
+            << "Invalid MC_ASCEND_BASE_PORT/ASCEND_BASE_PORT/base_port="
+            << options.base_port << ", using " << kAscendDefaultBasePort;
         options.base_port = kAscendDefaultBasePort;
+    }
+
+    int32_t thread_pool_size =
+        static_cast<int32_t>(kAscendDefaultThreadPoolSize);
+    if (conf && conf->contains("transports/ascend_direct/thread_pool_size")) {
+        thread_pool_size = static_cast<int32_t>(
+            conf->get("transports/ascend_direct/thread_pool_size",
+                      static_cast<long long>(kAscendDefaultThreadPoolSize)));
+    } else {
+        thread_pool_size = ParseEnvIntWithFallback("MC_ASCEND_THREAD_POOL_SIZE",
+                                                   "ASCEND_THREAD_POOL_SIZE",
+                                                   thread_pool_size);
+    }
+    if (thread_pool_size < 1 ||
+        static_cast<size_t>(thread_pool_size) > kAscendMaxThreadPoolSize) {
+        LOG(WARNING) << "Invalid MC_ASCEND_THREAD_POOL_SIZE/"
+                        "ASCEND_THREAD_POOL_SIZE/thread_pool_size="
+                     << thread_pool_size << ", using "
+                     << kAscendDefaultThreadPoolSize;
+        options.thread_pool_size = kAscendDefaultThreadPoolSize;
+    } else {
+        options.thread_pool_size = static_cast<size_t>(thread_pool_size);
     }
 
     if (conf) {
@@ -197,22 +331,30 @@ AscendDirectOptions LoadAscendDirectOptions(
         options.rdma_sl = conf->get("transports/ascend_direct/rdma_sl", "");
     }
     if (options.rdma_tc.empty()) {
-        options.rdma_tc = EnvOrEmpty("ASCEND_RDMA_TC");
+        options.rdma_tc =
+            EnvOrEmptyWithFallback("MC_ASCEND_RDMA_TC", "ASCEND_RDMA_TC");
     }
     if (options.rdma_tc.empty()) {
         options.rdma_tc = EnvOrEmpty("HCCL_RDMA_TC");
     }
     if (options.rdma_sl.empty()) {
-        options.rdma_sl = EnvOrEmpty("ASCEND_RDMA_SL");
+        options.rdma_sl =
+            EnvOrEmptyWithFallback("MC_ASCEND_RDMA_SL", "ASCEND_RDMA_SL");
     }
     if (options.rdma_sl.empty()) {
         options.rdma_sl = EnvOrEmpty("HCCL_RDMA_SL");
     }
 
-    const char* local_comm = std::getenv("ASCEND_LOCAL_COMM_RES");
-    options.local_comm_res = (local_comm && local_comm[0] != '\0')
-                                 ? local_comm
-                                 : kDefaultLocalCommRes;
+    std::string local_comm;
+    if (conf && conf->contains("transports/ascend_direct/local_comm_res")) {
+        local_comm = conf->get("transports/ascend_direct/local_comm_res", "");
+    }
+    if (local_comm.empty()) {
+        local_comm = EnvOrEmptyWithFallback("MC_ASCEND_LOCAL_COMM_RES",
+                                            "ASCEND_LOCAL_COMM_RES");
+    }
+    options.local_comm_res =
+        local_comm.empty() ? kDefaultLocalCommRes : local_comm;
 
     std::string raw_resource;
     if (conf &&
@@ -221,7 +363,9 @@ AscendDirectOptions LoadAscendDirectOptions(
             conf->get("transports/ascend_direct/global_resource_config", "");
     }
     if (raw_resource.empty()) {
-        raw_resource = EnvOrEmpty("ASCEND_GLOBAL_RESOURCE_CONFIG");
+        raw_resource =
+            EnvOrEmptyWithFallback("MC_ASCEND_GLOBAL_RESOURCE_CONFIG",
+                                   "ASCEND_GLOBAL_RESOURCE_CONFIG");
     }
     options.global_resource_config =
         ResolveGlobalResourceConfig(raw_resource, options.store_te_init);
@@ -231,15 +375,43 @@ AscendDirectOptions LoadAscendDirectOptions(
     json resolved = ParseResourceJson(options.global_resource_config);
     // Store isolation: the TENT shim copies fabric_mem onto Config only when
     // this engine is a Store TE. P2P TENT in the same process does not inherit
-    // ASCEND_ENABLE_USE_FABRIC_MEM unless store_te_init is set on this Config.
+    // (MC_)ASCEND_ENABLE_USE_FABRIC_MEM unless store_te_init is set on this
+    // Config.
     options.use_fabric_mem =
         conf_fabric ||
         (options.store_te_init &&
-         ParseEnvEnabled("ASCEND_ENABLE_USE_FABRIC_MEM")) ||
+         ParseEnvBoolFlagWithFallback("MC_ASCEND_ENABLE_USE_FABRIC_MEM",
+                                      "ASCEND_ENABLE_USE_FABRIC_MEM")) ||
         HasFabricMemory(resolved);
+
+    if (conf && conf->contains("transports/ascend_direct/use_shmem")) {
+        options.use_shmem =
+            conf->get("transports/ascend_direct/use_shmem", false);
+    } else {
+        options.use_shmem = ParseEnvBoolFlagWithFallback("MC_ASCEND_USE_SHMEM",
+                                                         "ASCEND_USE_SHMEM");
+    }
+
+    if (conf &&
+        conf->contains("transports/ascend_direct/standalone_single_segment")) {
+        options.standalone_single_segment = conf->get(
+            "transports/ascend_direct/standalone_single_segment", false);
+    } else {
+        options.standalone_single_segment =
+            ParseEnvBoolFlagWithFallback("MC_ASCEND_STANDALONE_SINGLE_SEGMENT",
+                                         "ASCEND_STANDALONE_SINGLE_SEGMENT");
+    }
 
     options.roce_mode = ParseEnvEnabled("HCCL_INTRA_ROCE_ENABLE") ||
                         HasRoceProtocolDesc(resolved);
+    // TE support for configuring HIXL's nic_topo_path from the custom topology
+    // path (topology/custom_json_path). HIXL decides whether to consume it
+    // based on protocol_desc.
+    const std::string custom_topo_json =
+        conf ? conf->get("topology/custom_json_path", std::string())
+             : std::string();
+    options.global_resource_config = InjectNicTopoPathFromCustomTopoTent(
+        options.global_resource_config, custom_topo_json);
     return options;
 }
 
@@ -321,7 +493,8 @@ std::string MakeHixlEngineName(const std::string& host_ip, uint16_t port) {
     return host_ip + ":" + std::to_string(port);
 }
 
-uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id) {
+uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id,
+                            const std::vector<uint16_t>& excluded_ports) {
     if (device_id < 0 || !ValidBasePort(base_port)) {
         LOG(ERROR) << "Invalid HIXL port range: base_port=" << base_port
                    << ", device_id=" << device_id;
@@ -337,7 +510,7 @@ uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id) {
                              static_cast<int64_t>(physical_dev_id) * kPortRange;
     const int64_t max_port =
         static_cast<int64_t>(base_port) +
-        (static_cast<int64_t>(physical_dev_id) + 1) * kPortRange;
+        (static_cast<int64_t>(physical_dev_id) + 1) * kPortRange - 1;
     if (min_port < kMinListenPort || max_port > kMaxListenPort) {
         LOG(ERROR) << "HIXL port range exceeds TCP port space: [" << min_port
                    << ", " << max_port << "]";
@@ -348,6 +521,10 @@ uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id) {
     std::uniform_int_distribution<int64_t> rand_dist(min_port, max_port);
     for (int attempt = 0; attempt < kMaxPortAttempts; ++attempt) {
         const int port = static_cast<int>(rand_dist(rand_gen));
+        if (std::find(excluded_ports.begin(), excluded_ports.end(), port) !=
+            excluded_ports.end()) {
+            continue;
+        }
         int sockfd = socket(AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
             continue;
@@ -388,6 +565,93 @@ std::vector<std::string> ParseHixlNames(const MemorySegmentDesc& detail) {
         return {name_it->second};
     }
     return {};
+}
+
+const std::string HixlNameResolver::empty_{};
+
+HixlNameResolver::HixlNameResolver(const MemorySegmentDesc& detail) {
+    names_ = ParseHixlNames(detail);
+    if (names_.size() <= 1) {
+        return;
+    }
+    ranges_.reserve(detail.buffers.size());
+    for (const auto& buf : detail.buffers) {
+        size_t name_idx = 0;
+        bool resolved = false;
+        auto attr = buf.transport_attrs.find(AscendDirect);
+        if (attr != buf.transport_attrs.end() && !attr->second.empty()) {
+            try {
+                const auto idx = static_cast<size_t>(std::stoul(attr->second));
+                if (idx < names_.size()) {
+                    name_idx = idx;
+                    resolved = true;
+                }
+            } catch (const std::exception&) {
+            }
+        }
+        if (!resolved) {
+            LocationParser location(buf.location);
+            if (location.type() == "npu" && location.index() >= 0) {
+                const auto idx = static_cast<size_t>(location.index());
+                if (idx < names_.size()) {
+                    name_idx = idx;
+                }
+            }
+        }
+        ranges_.push_back(BufferRange{buf.addr, buf.length, name_idx});
+    }
+}
+
+namespace {
+bool RangeCovers(uint64_t begin, uint64_t length, uint64_t offset,
+                 size_t request_length) {
+    if (request_length == 0) {
+        return offset >= begin && offset - begin < length;
+    }
+    return offset >= begin && request_length <= length &&
+           offset - begin <= length - request_length;
+}
+}  // namespace
+
+std::vector<size_t> HixlNameResolver::CoveringNameIndices(uint64_t dest_addr,
+                                                          size_t length) const {
+    if (names_.empty()) {
+        return {};
+    }
+    if (names_.size() == 1) {
+        return {0};
+    }
+    std::set<size_t> found;
+    for (const auto& range : ranges_) {
+        if (RangeCovers(range.begin, range.length, dest_addr, length) &&
+            range.name_idx < names_.size()) {
+            found.insert(range.name_idx);
+        }
+    }
+    return {found.begin(), found.end()};
+}
+
+const std::string& HixlNameResolver::NameAt(size_t index) const {
+    if (index >= names_.size()) {
+        return empty_;
+    }
+    return names_[index];
+}
+
+const std::string& HixlNameResolver::Resolve(uint64_t dest_addr) const {
+    if (names_.empty()) {
+        return empty_;
+    }
+    if (names_.size() == 1) {
+        return names_.front();
+    }
+    for (const auto& range : ranges_) {
+        if (dest_addr >= range.begin &&
+            dest_addr - range.begin < range.length) {
+            return names_[range.name_idx];
+        }
+    }
+    return names_.front();
 }
 
 std::string ResolveRemoteHixlName(const MemorySegmentDesc& detail,

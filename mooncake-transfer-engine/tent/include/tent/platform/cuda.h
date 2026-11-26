@@ -19,12 +19,20 @@
 #include "tent/common/config.h"
 #include "tent/common/concurrent/rw_spinlock.h"
 
+#include <cuda.h>
 #include <cuda_runtime.h>
+#include "tent/common/cuda_fabric_compat.h"
+
+#include <atomic>
+#include <memory>
+#include <cstdint>
+#include <vector>
 
 namespace mooncake {
 namespace tent {
 
 class CUDAStreamPool;
+struct CudaPointerInfo;
 
 // RAII Wrapper for cudaStream_t.
 // When this handle destructs, the stream is automatically returned to the pool.
@@ -100,6 +108,45 @@ class CUDAStreamPool {
     std::vector<std::unique_ptr<DevicePool>> devicePools_;
 };
 
+// VMM allocation and mapping resources. CUDA IPC remains transport-owned.
+class CudaSharedMemory {
+   public:
+    static Status create(const CUmemAllocationProp& properties, size_t size,
+                         std::unique_ptr<CudaSharedMemory>* out);
+    static Status importHandle(const std::string& handle,
+                               CUmemAllocationHandleType type, size_t size,
+                               std::unique_ptr<CudaSharedMemory>* out);
+    ~CudaSharedMemory();
+    CudaSharedMemory(const CudaSharedMemory&) = delete;
+    CudaSharedMemory& operator=(const CudaSharedMemory&) = delete;
+
+    Status exportHandle(CUmemAllocationHandleType type, std::string* out);
+    Status map(const std::vector<CUmemAccessDesc>& access,
+               uint64_t requested_address = 0);
+    Status setAccess(const std::vector<CUmemAccessDesc>& access);
+    Status release();
+    uint64_t address() const { return (uint64_t)address_; }
+    size_t size() const { return size_; }
+    size_t mappedSize() const { return mapped_size_; }
+    bool mapped() const { return mapped_; }
+
+    static CUmemAccessDesc deviceAccess(int device);
+    static Status allDeviceAccess(std::vector<CUmemAccessDesc>* access);
+
+   private:
+    CudaSharedMemory() = default;
+    Status setSize(size_t size, const CUmemAllocationProp& properties);
+    Status unmap();
+    CUmemGenericAllocationHandle handle_ = 0;
+    CUdeviceptr address_ = 0;
+    size_t size_ = 0;
+    size_t mapped_size_ = 0;
+    size_t granularity_ = 0;
+    int export_fd_ = -1;
+    bool reserved_ = false;
+    std::atomic<bool> mapped_{false};
+};
+
 class CudaPlatform : public Platform {
    public:
     CudaPlatform(std::shared_ptr<Config> config) : conf(std::move(config)) {}
@@ -122,14 +169,27 @@ class CudaPlatform : public Platform {
 
     virtual const std::string type() const { return "cuda"; }
 
+    Status validateMemoryRegistration(void* addr, CudaPointerInfo& info);
+    // Use the pointer information validated before transport warm-up.
+    std::vector<RangeLocation> getLocation(void* start, size_t len,
+                                           bool skip_prefault,
+                                           const CudaPointerInfo& info);
     Status synchronizeDevices(const Topology* topology) override;
+
+    Status exportDmabuf(void* addr, size_t length, DmabufExport& out) override;
+
+    // cudaHostAlloc(cudaHostAllocPortable): pinned for every CUDA context.
+    Status allocatePinnedHost(void** pptr, size_t size) override;
+
+    Status freePinnedHost(void* ptr, size_t size) override;
 
     Status getStreamFromPool(CUDAStreamHandle& outHandle,
                              int deviceId = CUDAStreamPool::kCurrentDevice);
 
    private:
-    // Device owning `addr`, or kCurrentDevice when `addr` is not device memory.
-    int getPointerDeviceId(void* addr);
+    // Returns the owning device for device or managed memory and
+    // kCurrentDevice for host memory.
+    Status getPointerDeviceId(void* addr, int& device);
 
     std::shared_ptr<Config> conf;
     CUDAStreamPool stream_pool;
