@@ -877,6 +877,7 @@ def test_confirmed_overlap_does_not_stay_in_the_retry_queue() -> None:
     other.register("train", ["a"], handle("owner", ["score"], batch_size=1))
     client.register("train", ["b"], handle("other", ["score"], batch_size=1))
     assert client._pending_publications == []
+    assert catalog._publications == {}
     plan = catalog.resolve("train", ["a", "b"], ["score"])
     assert [location[0] for location in plan["field_groups"][0]["locations"]] == [
         "manifest/owner",
@@ -991,3 +992,43 @@ def test_concat_field_preserves_jagged_nested_layout() -> None:
     assert getattr(merged, "_ragged_idx", None) == getattr(left, "_ragged_idx", None)
     for actual, expected in zip(merged.unbind(), rows):
         assert torch.equal(actual, expected)
+
+
+def test_failed_buffer_release_is_retried_before_the_next_read() -> None:
+    values = np.arange(4, dtype=np.float32).reshape(4, 1)
+
+    class _FlakyRelease(_OneSlotTransfer):
+        def __init__(self, fragments: dict[str, dict]) -> None:
+            super().__init__(fragments)
+            self.fail_release = True
+
+        def release_result(self, _part) -> None:
+            if self.fail_release:
+                self.fail_release = False
+                raise RuntimeError("release failed")
+            self.inflight -= 1
+
+    transfer = _FlakyRelease(sharded_fragments(values, 2))
+    _catalog, client = catalog_client(transfer)
+    keys = [f"k{i}" for i in range(4)]
+    client.register("train", keys[:2], handle("s0", ["score"]))
+    client.register("train", keys[2:], handle("s1", ["score"]))
+    with pytest.raises(RuntimeError, match="release failed"):
+        client.read("train", keys, ["score"])
+    assert transfer.inflight == 1
+    result = client.read("train", keys, ["score"])
+    np.testing.assert_array_equal(result["batch"]["score"], values)
+    assert transfer.inflight == 0
+    assert client._pending_results == []
+
+
+def test_concat_field_rejects_mismatched_jagged_layouts() -> None:
+    torch = pytest.importorskip("torch")
+    from mooncake.dataproto_catalog import _concat_field
+
+    rows = [torch.arange(length) for length in (2, 3)]
+    left = torch.nested.as_nested_tensor([rows[0]], layout=torch.jagged)
+    right = torch.nested.as_nested_tensor([rows[1]], layout=torch.jagged)
+    right._ragged_idx = getattr(left, "_ragged_idx", 1) + 1
+    with pytest.raises(ValueError, match="different layouts"):
+        _concat_field([left, right])

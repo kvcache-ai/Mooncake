@@ -150,7 +150,7 @@ for keys, handle in shards:
 batch = client.read("step-1", all_keys, fields=["old_log_probs"])
 ```
 
-`read()` resolves the keys, issues one ranged read per contiguous fragment run, and returns rows in `keys` order. Fragments stay ordinary immutable DataProto objects; the catalog only indexes `(key, field)` to `(fragment, row)`, so nothing is rewritten in place. `register()` accepts fragments written by other processes, while `put()` covers writers that publish through the same client.
+`read()` resolves the keys, issues one ranged read per contiguous fragment run, copies each run into memory owned by the result, releases that run's buffer, and returns rows in `keys` order. Fragments stay ordinary immutable DataProto objects; the catalog only indexes `(key, field)` to `(fragment, row)`, so nothing is rewritten in place. `register()` accepts fragments written by other processes, while `put()` covers writers that publish through the same client.
 
 Pass `data_cls` to `read()` to build a DataProto-like object instead of a plain dict; the same constructor rules as `get_dataproto()` apply. Each field's row count is checked against the number of keys, so a truncated fragment fails instead of returning a short batch.
 
@@ -158,7 +158,7 @@ All writers and the driver must use the same `key_prefix`, because bundle manife
 
 `register()` takes ownership of the fragment by default, so appended fields and cleanup follow the catalog lifecycle; pass `managed=False` to keep a fragment metadata-only.
 
-Registering a fragment that would take over a field already owned by another fragment fails, which catches a rank writing the wrong key range. Re-registering the same handle stays idempotent; pass `overwrite=True` when replacing a field is intended.
+Registering a fragment that would take over a field already owned by another fragment fails, which catches a rank writing the wrong key range. Registering the handle already stored for a fragment reuses that fragment, including after an append replaces its manifest key, and does not retire its objects. The same keys leave the mapping unchanged; a different key order updates it. Pass `overwrite=True` to replace a field with a different fragment.
 
 The keys passed to `register()` must follow the row order of that fragment; Mooncake does not store row ids inside the payload, so a mismatched order reads back mismatched rows.
 

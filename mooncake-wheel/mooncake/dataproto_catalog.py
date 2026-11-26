@@ -643,6 +643,8 @@ class DataProtoCatalogTransfer:
         released, including when a read fails. Returns a plain dict, or
         `data_cls` built from batch, non_tensor_batch, and meta_info.
         """
+        if callable(getattr(self.transfer, "release_result", None)):
+            self.discard_results(())
         self._retry_read_pins()
         plan = self.resolve(partition, keys, fields)
         batch: dict[str, list[Any]] = {}
@@ -680,6 +682,8 @@ class DataProtoCatalogTransfer:
                                 logger.exception(
                                     "Failed to release DataProto read buffer"
                                 )
+                                with self._cleanup_lock:
+                                    self._pending_results.append(part)
                                 raise
         finally:
             token = plan.get("read_token")
@@ -825,6 +829,9 @@ class DataProtoCatalogTransfer:
             )
         rejected = result.get("publication_rejected")
         if rejected:
+            # The client has the rejection. Ack it so the operation id does not
+            # stay in the catalog until drain.
+            self._ack_publication(operation_id)
             raise _ConfirmedPublicationError(rejected)
         if publication["method"] == "publish_append" and result.get("append_rejected"):
             self.transfer.cleanup_dataproto_append(
@@ -1037,6 +1044,12 @@ def _is_nested_tensor(value: Any) -> bool:
 def _concat_nested(parts: Sequence[Any]) -> Any:
     import torch
 
+    layouts = [getattr(part, "layout", None) for part in parts]
+    ragged = [getattr(part, "_ragged_idx", None) for part in parts]
+    if any(layout != layouts[0] for layout in layouts) or any(
+        index != ragged[0] for index in ragged
+    ):
+        raise ValueError("cannot concatenate jagged tensors with different layouts")
     rows = []
     for part in parts:
         for row in part.unbind():
