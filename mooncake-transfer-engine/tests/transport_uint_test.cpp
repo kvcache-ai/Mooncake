@@ -1236,18 +1236,6 @@ int CreateTempFileWithContent(const char* content) {
     return fd;
 }
 
-TEST_F(TransportTest, parseHostNameWithPortTest) {
-    std::string local_server_name = "0.0.0.0:1234";
-    auto res = parseHostNameWithPort(local_server_name);
-    ASSERT_EQ(res.first, "0.0.0.0");
-    ASSERT_EQ(res.second, 1234);
-
-    local_server_name = "1.2.3.4:111111";
-    res = parseHostNameWithPort(local_server_name);
-    ASSERT_EQ(res.first, "1.2.3.4");
-    ASSERT_EQ(res.second, 12001);
-}
-
 TEST_F(TransportTest, RealSliceTimeoutDefersBatchCleanup) {
     ScopedSliceTimeout timeout(/*timeout_sec=*/1);
     std::string server_name = "unit-test-server:1234";

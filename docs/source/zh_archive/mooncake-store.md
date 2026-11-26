@@ -950,7 +950,7 @@ python -m mooncake.mooncake_store_service --config=[config_path] --port=8081
 ## 范例代码
 
 #### Python 使用示例
-我们提供一个参考样例 `distributed_object_store_provider.py`，其位于 `mooncake-store/tests` 目录下。为了检测相关组件是否正常安装，可在相同的服务器上后台运行 etcd、Master Service（`mooncake_master`）等两个服务，然后在前台执行该 Python 程序，此时应输出测试成功的结果。
+我们提供一个参考样例 `test_distributed_object_store.py`，其位于 `mooncake-wheel/tests` 目录下。为了检测相关组件是否正常安装，可在相同的服务器上后台运行元数据服务和 Master Service（`mooncake_master`），然后在前台执行该 Python 程序，此时应输出测试成功的结果。
 
 #### C++ 使用示例
 

@@ -1354,12 +1354,6 @@ class AscendDirectTransportTest : public ::testing::Test {
 // Basic API tests
 // -----------------------------------------------------------------------------
 
-TEST_F(AscendDirectTransportTest, Basic_ConstructorAndName) {
-    auto transport = std::make_unique<AscendDirectTransport>();
-    ASSERT_NE(transport, nullptr);
-    EXPECT_STREQ(transport->getName(), "ascend_direct");
-}
-
 TEST_F(AscendDirectTransportTest, Basic_InstallSuccess) {
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);

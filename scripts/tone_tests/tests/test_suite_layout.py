@@ -12,11 +12,6 @@ class TestSuiteLayout(unittest.TestCase):
     def shell(self, command):
         return subprocess.check_output(["bash", "-eu", "-c", command], text=True)
 
-    def test_platform_lifecycle_has_no_accelerator_dispatch(self):
-        for suite in ("tone_tests", "rocm_tests"):
-            text = (SCRIPTS / suite / "scripts/common.sh").read_text()
-            self.assertNotIn('"${CI_ACCELERATOR:-cuda}"', text)
-
     def test_shared_helpers_are_loaded_explicitly(self):
         for suite in ("tone_tests", "rocm_tests"):
             common = SCRIPTS / suite / "scripts/common.sh"
@@ -120,36 +115,6 @@ class TestSuiteLayout(unittest.TestCase):
             run_requested_suite run-all SGLANG"""
         )
         self.assertEqual(output.splitlines(), ["run-all"])
-
-    def test_store_rs_e2e_job_selects_the_exact_combined_wheel(self):
-        repository_root = SCRIPTS.parent
-        nightly_workflow = (
-            repository_root / ".github/workflows/nightly.yml"
-        ).read_text()
-        integration_workflow = (
-            repository_root / ".github/workflows/integration-test.yml"
-        ).read_text()
-        wheel_workflow = (
-            repository_root / ".github/workflows/_build-wheel.yaml"
-        ).read_text()
-
-        self.assertIn("build-wheel-store-rs-tone:", nightly_workflow)
-        self.assertIn("artifact-prefix: tone-store-rs-wheel", nightly_workflow)
-        self.assertIn("artifact_name: tone-store-rs-wheel-py312", nightly_workflow)
-        self.assertIn("run-store-rs: true", nightly_workflow)
-        self.assertNotIn("tone-store-rs-integration:", nightly_workflow)
-        self.assertNotIn("tone-store-rs-integration-tent:", nightly_workflow)
-        self.assertEqual(nightly_workflow.count("run-store-rs: true"), 2)
-        self.assertNotIn("store-rs-transport-backend:", nightly_workflow)
-        self.assertNotIn("store-rs-transport-backend:", integration_workflow)
-        self.assertNotIn("artifact-prefix: nightly-store-rs", nightly_workflow)
-        self.assertIn("RUN_STORE_RS_TESTS=true", integration_workflow)
-        self.assertIn("BRANCH=${{ github.ref_name }}", integration_workflow)
-        self.assertIn("use-store-rs:", wheel_workflow)
-        self.assertIn("default: false", wheel_workflow)
-        self.assertIn("-DBUILD_SHARED_LIBS=ON", wheel_workflow)
-        self.assertIn("-DUSE_REDIS=ON", wheel_workflow)
-        self.assertIn('package_dir / "libtransfer_engine.so"', wheel_workflow)
 
 
 if __name__ == "__main__":

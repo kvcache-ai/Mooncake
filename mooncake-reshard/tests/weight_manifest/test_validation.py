@@ -135,12 +135,6 @@ def test_logical_validation_accepts_adjacent_n_dim_boxes() -> None:
     assert len(placement.fragments) == 4
 
 
-def test_complete_placement_validation_is_python_39_compatible() -> None:
-    placement = placement_manifest()
-
-    assert placement.fragments
-
-
 @pytest.mark.parametrize(
     ("tensor", "fragment", "message"),
     [

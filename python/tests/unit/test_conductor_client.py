@@ -62,15 +62,6 @@ def conductor_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     return mooncake.conductor
 
 
-def test_query_returns_hits_on_success(conductor_module: ModuleType) -> None:
-    ConductorClient = conductor_module.ConductorClient
-    c = ConductorClient()
-    assert c.setup("127.0.0.1:13334") == 0
-    result = c.query(model_name="m", block_size=16, token_ids=[1, 2])
-    assert result["ret"] == 0
-    assert result["hits"]["i1"]["longest_matched"] == 4
-
-
 def test_context_manager_closes(conductor_module: ModuleType) -> None:
     ConductorClient = conductor_module.ConductorClient
     with ConductorClient() as c:

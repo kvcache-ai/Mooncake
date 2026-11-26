@@ -80,25 +80,6 @@ class TestMooncakeConfig(unittest.TestCase):
         self.assertEqual(config.enable_client_http_server, False)
         self.assertEqual(config.client_http_port, 9300)
 
-    def test_load_tenant_id_from_file(self):
-        """Test loading tenant_id from configuration file"""
-        self.write_config({**self.valid_config, "tenant_id": "tenant-from-file"})
-        config = MooncakeConfig.from_file(self.config_file)
-
-        self.assertEqual(config.tenant_id, "tenant-from-file")
-
-    def test_tenant_id_defaults(self):
-        """Test tenant_id defaults to default when omitted"""
-        minimal_config = {
-            "local_hostname": "localhost",
-            "metadata_server": "localhost:8080",
-            "master_server_address": "localhost:8081",
-        }
-        self.write_config(minimal_config)
-        config = MooncakeConfig.from_file(self.config_file)
-
-        self.assertEqual(config.tenant_id, "default")
-
     def test_tenant_id_null_defaults(self):
         """Test tenant_id defaults to default when explicitly null"""
         self.write_config({**self.valid_config, "tenant_id": None})

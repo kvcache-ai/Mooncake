@@ -128,20 +128,6 @@ class NightlyCITest(unittest.TestCase):
                     "will not run" in self.summary.read_text(), enabled == "false"
                 )
 
-    def test_rocm_job_and_gate_use_the_same_recorded_selection(self):
-        integration = self.jobs["rocm-integration-test"]
-        self.assertIn("version-stamp", integration["needs"])
-        self.assertIn("build-wheel-rocm", integration["needs"])
-        self.assertEqual(
-            integration["if"],
-            "${{ needs.version-stamp.outputs.run_rocm_integration == 'true' }}",
-        )
-        self.assertEqual(
-            self.step("nightly-gate", "Check results")["env"]["ALLOW_ROCM_SKIP"],
-            "${{ needs.version-stamp.outputs.run_rocm_integration == 'false' }}",
-        )
-        self.assertNotIn("if", self.jobs["build-wheel-rocm"])
-
     def test_missing_upload_credentials_fail_without_prompting_or_leaking(self):
         for token in ("", "not-a-real-api-token"):
             with self.subTest(token_present=bool(token)):

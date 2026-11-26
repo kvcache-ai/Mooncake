@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import json
 import pickle
+from types import SimpleNamespace
 import weakref
 from dataclasses import replace
 
 import pytest
 
 from mooncake.reshard.contracts import StoredResourceManifest
+from mooncake.reshard.weight import WeightUploadPlan, plan_weight_upload
+from mooncake.reshard.weight._store.backend import default_config_factory
 from mooncake.reshard.weight.manifest import OwnershipAxis, ParallelRank
 from mooncake.reshard.weight.storage_manifest import StoredWeightManifest
+from mooncake.reshard.weight.store import WeightStore, WeightStoreError
+
+from model_weight_planner.helpers import tp_manifests
 
 from .helpers import (
     RuntimeInputs,
@@ -374,4 +380,87 @@ def test_plan_upload_rejects_dense_tp_shards_across_ep_replicas() -> None:
             sources,
             tensors=(tensor,),
             placement_fragments=fragments,
+        )
+
+
+def test_store_rejects_binding_for_different_placement_digest() -> None:
+    sources = source_manifests(dp=1, tp=1)
+
+    with pytest.raises(WeightStoreError, match="placement digest"):
+        WeightStore(object()).plan_upload(
+            sources.placement,
+            (replace(sources.bindings[0], placement_digest="0" * 64),),
+        )
+
+
+def test_native_store_requires_group_semantics_binding(monkeypatch) -> None:
+    class ReplicateConfigWithoutGroups:
+        __slots__ = ("with_hard_pin", "data_type")
+
+        def __init__(self) -> None:
+            self.with_hard_pin = False
+            self.data_type = None
+
+    class ObjectDataType:
+        WEIGHT = "weight"
+        METADATA = "metadata"
+
+    native_store_module = SimpleNamespace(
+        ReplicateConfig=ReplicateConfigWithoutGroups,
+        ObjectDataType=ObjectDataType,
+    )
+
+    monkeypatch.setattr(
+        "mooncake.reshard.weight._store.backend.import_module",
+        lambda _: native_store_module,
+    )
+
+    with pytest.raises(WeightStoreError, match="ReplicateConfig.group_ids"):
+        default_config_factory(("weight-group",), "payload")
+
+
+def test_upload_plan_preserves_tp_pp_and_ep_fragment_ownership() -> None:
+    sources = tp_manifests(
+        tp=2,
+        pp_rank=3,
+        ep_rank=2,
+        address_base=0x10000,
+        worker_prefix="source",
+    )
+
+    plan = plan_weight_upload(sources.placement, sources.bindings)
+
+    assert len(plan.operations) == 2
+    assert {operation.source_placement.rank.tp for operation in plan.operations} == {
+        0,
+        1,
+    }
+    assert {operation.source_placement.rank.pp for operation in plan.operations} == {3}
+    assert {operation.source_placement.rank.ep for operation in plan.operations} == {2}
+
+
+def test_upload_plan_rejects_payload_outside_its_upload_transaction() -> None:
+    sources = tp_manifests(
+        tp=1,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x10000,
+        worker_prefix="source",
+    )
+    plan = plan_weight_upload(sources.placement, sources.bindings)
+    target = replace(
+        plan.operations[0].target,
+        object_key=f"{plan.manifest.group_id}/payload/other-transaction/fragment",
+    )
+    manifest = replace(plan.manifest, fragments=(target,))
+    operation = replace(plan.operations[0], target=target)
+
+    with pytest.raises(ValueError, match="does not own payload members"):
+        WeightUploadPlan(
+            manifest=manifest,
+            source_placement_id=plan.source_placement_id,
+            source_placement_digest=plan.source_placement_digest,
+            transaction_group_id=plan.transaction_group_id,
+            control_key=plan.control_key,
+            operations=(operation,),
         )

@@ -55,15 +55,6 @@ static bool fd_is_closed(int fd) {
     return fcntl(fd, F_GETFD) == -1 && errno == EBADF;
 }
 
-// ── DmabufExport struct defaults ─────────────────────────────────────────────
-
-TEST(DmabufExport, DefaultIsHostRegWithNoFd) {
-    DmabufExport exp;
-    EXPECT_EQ(exp.method, DmabufExport::Method::kHostReg);
-    EXPECT_EQ(exp.fd, -1);
-    EXPECT_EQ(exp.offset, 0u);
-}
-
 // ── closeDmabufExport ────────────────────────────────────────────────────────
 
 TEST(CloseDmabufExport, NoOpWhenFdIsNegative) {

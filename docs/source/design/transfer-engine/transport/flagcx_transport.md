@@ -226,12 +226,6 @@ The internal range and descriptor-boundary test does not require FlagCX hardware
 ctest --test-dir build -R '^flagcx_transport_internal_test$' --output-on-failure
 ```
 
-The Python source integration check verifies that the binding recognizes and installs `flagcx`:
-
-```bash
-python3 -m unittest mooncake-wheel/tests/test_transfer_engine_flagcx_source.py
-```
-
 ---
 
 ## Runtime Configuration

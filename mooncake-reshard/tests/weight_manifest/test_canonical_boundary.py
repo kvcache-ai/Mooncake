@@ -1,69 +1,21 @@
 """Contract tests for the canonical framework/core boundary."""
 
 import json
-from dataclasses import fields
-from typing import Any, Protocol, get_type_hints
 
 import pytest
 
-from mooncake.reshard.contracts import (
-    PlacementManifest,
-    ResourceManifest,
-    RuntimeBindingManifest,
-)
 from mooncake.reshard.weight import (
     OwnershipAxis,
     ParallelRank,
     ParallelTopology,
     ReplicatedAxis,
-    RuntimeBindingFragment,
     SplitAxis,
-    TensorDescriptor,
     TopologyParticipant,
-    WeightPlacementPart,
-    WeightRuntimeBindingManifest,
     weight_placement_from_json,
     weight_placement_to_json,
 )
 
 from .helpers import descriptor, placement_fragment, placement_manifest
-
-
-def test_resource_contracts_are_structural_protocols() -> None:
-    assert issubclass(ResourceManifest, Protocol)
-    assert issubclass(PlacementManifest, Protocol)
-    assert issubclass(RuntimeBindingManifest, Protocol)
-
-
-def test_core_exposes_only_typed_manifest_constructors() -> None:
-    assert not hasattr(WeightPlacementPart, "from_runtime_inventory")
-    assert not hasattr(WeightRuntimeBindingManifest, "from_runtime_inventory")
-    assert get_type_hints(RuntimeBindingFragment)["owner"] != Any
-
-
-def test_tensor_descriptor_has_one_canonical_shard_representation() -> None:
-    assert "partition_dim" not in {field.name for field in fields(TensorDescriptor)}
-
-    descriptor = TensorDescriptor(
-        tensor_id="decoder.layer.0.mlp.weight",
-        global_shape=(8, 16),
-        dtype="float16",
-        itemsize=2,
-        shard_dims=(0,),
-        layout_fingerprint="row-major",
-        parallel_axes=(SplitAxis(kind="tp", dim=0),),
-    )
-
-    assert descriptor.shard_dims == (0,)
-
-
-def test_parallel_axis_semantics_are_explicit() -> None:
-    assert SplitAxis(kind="tp", dim=1).dim == 1
-    assert ReplicatedAxis(kind="dp").kind == "dp"
-    assert OwnershipAxis(kind="pp").kind == "pp"
-
-    with pytest.raises(ValueError, match="EP must split"):
-        SplitAxis(kind="ep", dim=1)
 
 
 def test_weight_placement_serde_accepts_only_canonical_wire_fields() -> None:

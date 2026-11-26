@@ -5,7 +5,6 @@ from math import prod
 
 import pytest
 
-import mooncake.reshard.weight._planner.contracts as planner_contracts
 from mooncake.reshard.weight._planner.contracts import (
     BoundWeightFragment,
     TransferRegion,
@@ -13,10 +12,6 @@ from mooncake.reshard.weight._planner.contracts import (
 from mooncake.reshard.weight.manifest import ParallelRank
 
 from .helpers import bound_fragment
-
-
-def test_canonical_contract_exposes_only_n_dim_transfer_regions() -> None:
-    assert not hasattr(planner_contracts, "CopyRange")
 
 
 def n_dim_fragment(

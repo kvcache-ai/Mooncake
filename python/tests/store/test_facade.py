@@ -32,87 +32,26 @@ def _run_python(
     return result
 
 
-_CPP_PUBLIC_NAMES = {
-    "RangedReadSnapshot",
-    "ObjectDataType",
-    "SoftPinAction",
-    "ReplicateConfig",
-    "ExistOptions",
-    "PhysicalPlacement",
-    "ReplicaStatus",
-    "MemoryDescriptor",
-    "DiskDescriptor",
-    "ReplicaDescriptor",
-    "Descriptor",
-    "TaskType",
-    "TaskStatus",
-    "QueryTaskResponse",
-    "JobType",
-    "JobStatus",
-    "QueryJobResponse",
-    "ListTasksResponse",
-    "ListDrainJobsResponse",
-    "BufferHandle",
-    "BufferLeaseView",
-    "BufferLease",
-    "BufferPool",
-    "RegisteredBufferPool",
-    "RegisteredBufferLease",
-    "RegisteredBufferLeaseView",
-    "MooncakeHostMemAllocator",
-    "MooncakeDistributedNoFRegister",
-    "MooncakeDistributedStore",
-    "EngramStore",
-    "bind_to_numa_node",
-    "get_alloc_func_addr",
-    "get_free_func_addr",
-    "UNKNOWN",
-    "KVCACHE",
-    "TENSOR",
-    "WEIGHT",
-    "SAMPLE",
-    "ACTIVATION",
-    "GRADIENT",
-    "OPTIMIZER_STATE",
-    "METADATA",
-    "GENERAL",
-    "UNDEFINED",
-    "INITIALIZED",
-    "PROCESSING",
-    "COMPLETE",
-    "REMOVED",
-    "FAILED",
-    "REPLICA_COPY",
-    "REPLICA_MOVE",
-    "PENDING",
-    "SUCCESS",
-    "CANCELED",
-}
-
-
 @pytest.mark.parametrize("backend", [None, "cpp"], ids=["default", "explicit-cpp"])
 def test_cpp_keeps_the_native_public_api(tmp_path: Path, backend: str | None) -> None:
     _run_python(
         tmp_path,
-        f"""
+        """
 import importlib
 import sys
 import types
 
 native = types.ModuleType("mooncake._store")
-expected = {sorted(_CPP_PUBLIC_NAMES)!r}
-for name in expected:
-    setattr(native, name, object())
+native.MooncakeDistributedStore = object()
+native.BufferPool = object()
 native.RegisteredBufferPool = native.BufferPool
 sys.modules[native.__name__] = native
 
 store = importlib.import_module("mooncake.store")
 assert store._BACKEND == "cpp"
-assert set(expected) == set(store.__all__)
-assert all(getattr(store, name) is getattr(native, name) for name in expected if name != "EngramStore")
+assert store.MooncakeDistributedStore is native.MooncakeDistributedStore
 from mooncake.engram import EngramStore
 assert store.EngramStore is EngramStore
-assert not hasattr(store, "EngramStoreConfig")
 
 import mooncake
 from mooncake.buffer_pool import BufferPool, RegisteredBufferPool

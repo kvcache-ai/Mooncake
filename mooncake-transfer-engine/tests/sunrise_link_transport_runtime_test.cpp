@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <memory>
 
 #include "gpu_vendor/sunrise.h"
 #include "transfer_engine.h"
+#include "transport/sunrise_link_transport/sunrise_link_transport.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
@@ -17,6 +19,20 @@ static tangError_t allocOnDevice(size_t size, void** buffer) {
 }
 
 }  // namespace
+
+TEST(SunriseLinkTransportUnitTest, RejectsWrappedRemoteRanges) {
+    EXPECT_FALSE(SunriseLinkTransport::requestRangeFitsInBufferForTest(
+        std::numeric_limits<uint64_t>::max() - 50, 80,
+        std::numeric_limits<uint64_t>::max() - 100, 64));
+}
+
+TEST(SunriseLinkTransportUnitTest, ParsesDeviceIdStrictly) {
+    EXPECT_EQ(SunriseLinkTransport::parseDeviceIdForTest("cuda:7"), 7);
+    EXPECT_EQ(SunriseLinkTransport::parseDeviceIdForTest("cuda:"), -1);
+    EXPECT_EQ(SunriseLinkTransport::parseDeviceIdForTest("cuda:not-a-number"),
+              -1);
+    EXPECT_EQ(SunriseLinkTransport::parseDeviceIdForTest("cuda:7x"), -1);
+}
 
 TEST(SunriseLinkTransportRuntimeTest,
      InstallDoesNotBreakFirstDeviceAllocation) {

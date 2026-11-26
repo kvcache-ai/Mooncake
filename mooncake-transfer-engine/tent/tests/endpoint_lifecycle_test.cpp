@@ -121,15 +121,6 @@ class EndpointStoreTestAccess {
 
 namespace {
 
-TEST(EndpointLifecycleTest, DefaultConstructedEndpointOwnsNoResources) {
-    RdmaEndPoint endpoint;
-
-    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_UNINIT);
-    EXPECT_TRUE(endpoint.qpNum().empty());
-    EXPECT_EQ(endpoint.getInflightSlices(), 0);
-    EXPECT_EQ(endpoint.notifyQpNum(), 0);
-}
-
 TEST(EndpointLifecycleTest, DefaultConstructedEndpointCanBeDestroyed) {
     RdmaEndPoint endpoint;
 

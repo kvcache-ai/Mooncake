@@ -13,7 +13,6 @@ import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 PYTHON_ROOT = REPOSITORY_ROOT / "python"
-CANONICAL_MODULE = PYTHON_ROOT / "mooncake" / "async_store.py"
 _MISSING = object()
 
 
@@ -53,16 +52,6 @@ def async_store_module() -> Iterator[ModuleType]:
             saved = saved_modules[name]
             if saved is not _MISSING:
                 sys.modules[name] = saved
-
-
-def test_source_tree_import_uses_canonical_module(
-    async_store_module: ModuleType,
-) -> None:
-    assert Path(async_store_module.__file__).resolve() == CANONICAL_MODULE
-    assert (
-        async_store_module.MooncakeDistributedStoreAsync.__module__
-        == "mooncake.async_store"
-    )
 
 
 def test_async_wrapper_forwards_arguments_and_is_cached(

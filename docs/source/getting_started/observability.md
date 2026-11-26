@@ -361,13 +361,3 @@ Master batch panels keep request outcomes and item outcomes on separate axes. Fu
 Eviction operations, evicted keys, and evicted logical bytes are rates of their respective counters. Evicted logical bytes are not a promise of an equal allocator RSS reduction in the same interval. Capacity utilization filters out zero or missing total capacity, and available capacity is clamped at zero for transient inconsistent samples.
 
 No panel uses request IDs, object keys, segment IDs, peer addresses, or raw pointers as labels. All rate panels use Grafana's `$__rate_interval` so the query window follows panel resolution and scrape configuration.
-
-### Dashboard Contract Test
-
-Run the structural checks from the repository root after changing the dashboard:
-
-```bash
-python3 monitoring/tests/test_core_dashboard.py
-```
-
-The test checks section and panel identity, unique IDs, non-overlapping grid layout, scoped queries, operation-name preservation, histogram unit conversion, non-success denominator behavior, and exclusion of nonexistent Master successful-byte counters. These static checks complement, rather than replace, executing the queries against the deployed Prometheus version and importing the dashboard into Grafana.

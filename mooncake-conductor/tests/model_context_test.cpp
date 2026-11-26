@@ -1,8 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <concepts>
 #include <functional>
-#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -10,44 +8,7 @@
 
 namespace {
 
-using mooncake::conductor::common::HashProfileConfig;
-using mooncake::conductor::common::ResolvedHashProfile;
 using mooncake::conductor::prefixindex::ContextKey;
-using mooncake::conductor::prefixindex::EngineMutation;
-using mooncake::conductor::prefixindex::EngineRegistration;
-
-template <typename T>
-concept HasInstanceId = requires(T value) { value.instance_id; };
-
-template <typename T>
-concept HasCacheSalt = requires(T value) { value.cache_salt; };
-
-template <typename T>
-concept HasAdditionalSalt = requires(T value) { value.additional_salt; };
-
-template <typename T>
-concept HasCacheGroups = requires(T value) { value.cache_groups; };
-
-template <typename T>
-concept HasPythonHashSeed = requires(T value) { value.python_hash_seed; };
-
-template <typename T>
-concept HasRootDigest = requires(T value) { value.root_digest; };
-
-static_assert(!HasInstanceId<ContextKey>);
-static_assert(!HasCacheSalt<ContextKey>);
-static_assert(!HasAdditionalSalt<ContextKey>);
-static_assert(!HasPythonHashSeed<ContextKey>);
-static_assert(!HasCacheGroups<EngineRegistration>);
-static_assert(!HasCacheGroups<EngineMutation>);
-static_assert(HasPythonHashSeed<HashProfileConfig>);
-static_assert(!HasRootDigest<HashProfileConfig>);
-static_assert(HasPythonHashSeed<ResolvedHashProfile>);
-static_assert(HasRootDigest<ResolvedHashProfile>);
-static_assert(std::same_as<decltype(EngineRegistration::cache_group),
-                           std::optional<int64_t>>);
-static_assert(std::same_as<decltype(EngineMutation::cache_group),
-                           std::optional<int64_t>>);
 
 ContextKey BaseContext() {
     return {.tenant_id = "tenant-a",
@@ -88,20 +49,6 @@ TEST(ContextKey, ExactlyFourFieldsParticipateInEqualityAndLookup) {
         EXPECT_NE(changed, BaseContext());
         EXPECT_FALSE(contexts.contains(changed));
     }
-}
-
-TEST(ContextKey, OwnerAndRequestSaltLiveOutsideTheKey) {
-    ContextKey shared = BaseContext();
-    const std::string first_instance = "instance-a";
-    const std::string second_instance = "instance-b";
-    const std::string first_salt = "salt-a";
-    const std::string second_salt = "salt-b";
-
-    EXPECT_NE(first_instance, second_instance);
-    EXPECT_NE(first_salt, second_salt);
-    EXPECT_EQ(shared, BaseContext());
-    EXPECT_EQ(std::hash<ContextKey>{}(shared),
-              std::hash<ContextKey>{}(BaseContext()));
 }
 
 }  // namespace

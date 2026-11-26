@@ -18,7 +18,6 @@ ci_start_service master "$RUNNER_TEMP/mooncake-master.log" mooncake_master \
 ci_wait_service master 50051 8080
 
 python scripts/test_upsert_api.py
-python -m unittest mooncake-wheel.tests.test_weight_snapshot_api
 python python/tests/store/async_store_integration.py
 python scripts/test_copy_move_api.py
 python -m unittest mooncake-wheel.tests.test_safetensor_functions

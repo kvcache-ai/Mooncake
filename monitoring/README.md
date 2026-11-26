@@ -122,9 +122,3 @@ The Store and TE endpoints can belong to the same process but remain independent
 - **Master** shows batch request and item outcomes, eviction, capacity, clients, and keys. Batch item rates use an `items/s` suffix, TE task rates use `tasks/s`, and evicted-key rates use `keys/s`; requests, items, tasks, operations, keys, bytes, ratios, and latency never share one axis.
 
 Derived non-success ratios have no denominator when there is no terminal TE traffic, so Grafana displays **No data** instead of a misleading zero. All rate queries use `$__rate_interval`, and Prometheus handles counter resets. The dashboard does not add request IDs, object keys, segment IDs, peer addresses, or raw pointers as labels.
-
-Run the static dashboard contract checks after editing the JSON:
-
-```bash
-python3 monitoring/tests/test_core_dashboard.py
-```

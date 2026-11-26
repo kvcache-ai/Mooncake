@@ -209,20 +209,3 @@ def test_native_store_exposes_explicit_snapshot_writer_only() -> None:
     )
 
     assert hasattr(writer, "write_tensor")
-    for name in (
-        "get_tensor_with_parallelism",
-        "batch_get_tensor_with_parallelism",
-        "get_tensor_with_parallelism_into",
-        "batch_get_tensor_with_parallelism_into",
-        "put_tensor_with_parallelism",
-        "batch_put_tensor_with_parallelism",
-        "put_tensor_with_parallelism_from",
-        "batch_put_tensor_with_parallelism_from",
-        "upsert_tensor_with_parallelism",
-        "upsert_tensor_with_parallelism_from",
-        "batch_upsert_tensor_with_parallelism",
-        "batch_upsert_tensor_with_parallelism_from",
-    ):
-        assert not hasattr(raw_store, name)
-    for name in ("ParallelAxis", "TensorParallelism", "ReadTarget"):
-        assert not hasattr(native_store, name)

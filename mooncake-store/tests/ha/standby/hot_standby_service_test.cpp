@@ -914,22 +914,6 @@ TEST_F(HotStandbyServiceTest, TestReplicationLoop_HandlesDisconnect) {
               service_->GetSyncStatus().last_error);
 }
 
-// ========== 6.1.8 Verification loop tests ==========
-// Production verification is not implemented yet (loop only VLOG-skips), so
-// these cases stay skipped until checksum comparison has an observable effect.
-
-TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenEnabled) {
-    GTEST_SKIP() << "Verification has no observable effect yet (loop only "
-                    "VLOG-skips); re-enable when checksum comparison is "
-                    "implemented";
-}
-
-TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenDisabled) {
-    GTEST_SKIP() << "Verification has no observable effect yet (loop only "
-                    "VLOG-skips); re-enable when checksum comparison is "
-                    "implemented";
-}
-
 // ========== Issue 2 fail-closed catch-up ==========
 
 TEST_F(HotStandbyServiceTest,

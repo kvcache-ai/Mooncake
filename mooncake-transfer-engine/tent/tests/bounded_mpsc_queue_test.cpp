@@ -66,40 +66,6 @@ TEST(BoundedMPSCQueueTest, PopDrainsInOrderAfterFull) {
     EXPECT_EQ(queue.pop().num_slices, 0);
 }
 
-TEST(BoundedMPSCQueueTest, ParkedEntryIsDrainedBeforeContendingProducers) {
-    // Model the production drain order: the worker consumes its local overflow
-    // before popping the shared queue, so a parked retry makes progress even
-    // while producers keep refilling freed slots (review feedback on #3683).
-    Queue queue;
-    for (int i = 0; i < 8; ++i) {
-        auto item = entry(1);
-        ASSERT_TRUE(queue.try_push(item));
-    }
-    std::vector<SliceList> overflow;
-    auto parked = entry(7);
-    ASSERT_FALSE(queue.try_push(parked));
-    overflow.push_back(parked);
-
-    // First tick drains the shared queue fully; a producer instantly refills.
-    std::vector<SliceList> first_batch;
-    queue.pop(first_batch);
-    ASSERT_EQ(first_batch.size(), 8u);
-    auto fresh = entry(9);
-    ASSERT_TRUE(queue.try_push(fresh));
-
-    // Second tick: overflow first, then the shared queue.
-    std::vector<SliceList> batch;
-    for (auto it = overflow.begin(); it != overflow.end();) {
-        batch.push_back(*it);
-        it = overflow.erase(it);
-    }
-    queue.pop(batch);
-    ASSERT_EQ(batch.size(), 2u);
-    EXPECT_EQ(batch[0].num_slices, 7);
-    EXPECT_EQ(batch[1].num_slices, 9);
-    EXPECT_TRUE(overflow.empty());
-}
-
 TEST(BoundedMPSCQueueTest, PushStillAcceptsAndEmptyPushIsANoop) {
     Queue queue;
     auto empty = entry(0);

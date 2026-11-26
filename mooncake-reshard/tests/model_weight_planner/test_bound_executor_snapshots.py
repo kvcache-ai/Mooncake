@@ -3,7 +3,6 @@ from __future__ import annotations
 from copy import copy
 from dataclasses import replace
 import gc
-import inspect
 import pickle
 from types import SimpleNamespace
 import weakref
@@ -19,14 +18,9 @@ from mooncake.reshard.weight import (
     plan_stored_transfer_to_target_placement,
 )
 from mooncake.reshard.weight._planner.binding import resolve_executor_plans
-from mooncake.reshard.weight._planner.bound_contracts import (
-    ExecutorTransferPlan,
-    TransferPlan,
-)
+from mooncake.reshard.weight._planner.bound_contracts import TransferPlan
 from mooncake.reshard.weight._planner.contracts import (
-    LogicalTransferPlan,
     PlanningLimits,
-    PlacementExecutorPlan,
     TransferRegion,
 )
 from mooncake.reshard.weight.storage_manifest import (
@@ -96,13 +90,6 @@ def _forge_executor_snapshot(snapshot, field: str):
 
 
 def test_execution_views_derive_operation_indices_and_pipeline_routes() -> None:
-    assert "operation_indices" not in inspect.signature(ExecutorTransferPlan).parameters
-    assert (
-        "operation_indices" not in inspect.signature(PlacementExecutorPlan).parameters
-    )
-    assert "pipeline_routes" not in inspect.signature(LogicalTransferPlan).parameters
-    assert "pipeline_routes" not in inspect.signature(TransferPlan).parameters
-
     source = tp_manifests(
         tp=1,
         pp_rank=0,
@@ -128,29 +115,6 @@ def test_execution_views_derive_operation_indices_and_pipeline_routes() -> None:
     assert [(route.source_pp, route.target_pp) for route in plan.pipeline_routes] == [
         (0, 1)
     ]
-
-
-def test_bound_plan_is_not_an_execution_or_lifetime_token() -> None:
-    source = tp_manifests(
-        tp=1,
-        pp_rank=0,
-        ep_rank=0,
-        address_base=0x10000,
-        worker_prefix="source",
-    )
-    target = tp_manifests(
-        tp=1,
-        pp_rank=1,
-        ep_rank=0,
-        address_base=0x40000,
-        worker_prefix="target",
-    )
-
-    plan = plan_transfer(source, target)
-
-    assert isinstance(plan, TransferPlan)
-    assert not hasattr(plan, "execute")
-    assert not hasattr(plan, "submit")
 
 
 def test_bound_plan_materializes_private_operation_views_once(

@@ -690,3 +690,37 @@ def test_global_placement_must_not_be_empty(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         placement_manifest(**overrides)
+
+
+def test_binding_rejects_partial_runtime_alias_overlap() -> None:
+    aliases = ("alias.a", "alias.b")
+    tensors = tuple(
+        descriptor(tensor_id=tensor_id, expert_id=None) for tensor_id in aliases
+    )
+    fragments = tuple(
+        placement_fragment(
+            placement_fragment_id=f"placement-{tensor_id}",
+            tensor_id=tensor_id,
+            aliases=aliases,
+        )
+        for tensor_id in aliases
+    )
+    placement = placement_manifest(tensors=tensors, fragments=fragments)
+    binding = binding_manifest(
+        placement=placement,
+        fragments=(
+            binding_fragment(
+                placement_fragment_id="placement-alias.a",
+                fragment_id="runtime-alias.a",
+                address=0x9000,
+            ),
+            binding_fragment(
+                placement_fragment_id="placement-alias.b",
+                fragment_id="runtime-alias.b",
+                address=0x9010,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="address ranges overlap"):
+        validate_runtime_binding(placement, binding)

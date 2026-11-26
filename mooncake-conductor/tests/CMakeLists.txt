@@ -9,9 +9,7 @@ endif()
 
 add_executable(
   conductor_test
-  client_types_test.cpp
   common_utils_test.cpp
-  json_uint64_test.cpp
   model_context_test.cpp
   compute_hash_test.cpp
   prefix_indexer_test.cpp
@@ -21,7 +19,6 @@ add_executable(
   zmq_transport_test.cpp
   event_manager_test.cpp
   conductor_service_test.cpp
-  wire_types_test.cpp
   client_server_e2e_test.cpp
   conductor_c_test.cpp
   conductor_c_extensions_test.cpp)

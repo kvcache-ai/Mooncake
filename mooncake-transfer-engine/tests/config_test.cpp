@@ -1266,6 +1266,10 @@ TEST_F(RdAtomicEnvTest, OutOfRangeIsIgnored) {
 }
 
 TEST(RdAtomicResolveTest, UnsetKeepsUpstreamDeviceDerivedDepth) {
+    EXPECT_EQ(clampRdAtomicDepth(-1), 1);
+    EXPECT_EQ(clampRdAtomicDepth(0), 1);
+    EXPECT_EQ(clampRdAtomicDepth(8), 8);
+    EXPECT_EQ(clampRdAtomicDepth(32), kIdealRdAtomicDepth);
     // requested == 0 must match clampRdAtomicDepth() exactly (#4312 behavior).
     for (int dev : {-1, 0, 1, 2, 8, 16, 32, 255}) {
         EXPECT_EQ(resolveRdAtomicDepth(0, dev), clampRdAtomicDepth(dev))

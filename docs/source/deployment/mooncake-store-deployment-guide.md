@@ -102,7 +102,7 @@ The absence of errors indicates successful data transfer.
 
 ### Verify Installed Examples
 
-For a Python integration check, run `mooncake-store/tests/distributed_object_store_provider.py` after starting the metadata service and `mooncake_master`.
+For a Python integration check, run `mooncake-wheel/tests/test_distributed_object_store.py` after starting the metadata service and `mooncake_master`.
 
 For a C++ integration check, run `build/mooncake-store/tests/client_integration_test` after building tests and starting the required services.
 

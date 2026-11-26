@@ -80,8 +80,6 @@ class XpuPlatformTest : public ::testing::Test {
     int device_count_ = 0;
 };
 
-TEST_F(XpuPlatformTest, TypeString) { EXPECT_EQ(platform_->type(), "xpu"); }
-
 TEST_F(XpuPlatformTest, ProbeRegistersOneMemEntryPerDevice) {
     std::vector<Topology::NicEntry> nics;
     std::vector<Topology::MemEntry> mems;

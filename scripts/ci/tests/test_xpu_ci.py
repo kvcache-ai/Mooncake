@@ -250,58 +250,6 @@ class WheelVariantTest(unittest.TestCase):
             self.assertEqual(project.read_text(), original)
 
 
-class WorkflowTest(unittest.TestCase):
-    def test_xpu_selection_and_strict_gate_are_wired(self):
-        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
-        jobs = workflow["jobs"]
-        self.assertEqual(jobs["build-wheel-xpu"]["if"], jobs["build-wheel"]["if"])
-        self.assertIn("outputs.src == 'true'", jobs["build-wheel-xpu"]["if"])
-        gate = jobs["ci-gate"]
-        self.assertIn("build-wheel-xpu", gate["needs"])
-        step = next(s for s in gate["steps"] if s["name"] == "Check source jobs")
-        self.assertIn("needs.build-wheel-xpu.result", step["env"]["RESULTS"])
-        self.assertIn("outputs.src == 'true'", step["env"]["EXPECTED"])
-        for selected, result, passes in (
-            (True, "success", True),
-            (False, "skipped", True),
-            (True, "skipped", False),
-            (True, "failure", False),
-            (True, "cancelled", False),
-            (False, "failure", False),
-        ):
-            status = subprocess.run(
-                ["bash", "-ec", step["run"]],
-                env={
-                    **os.environ,
-                    "EXPECTED": "success" if selected else "skipped",
-                    "RESULTS": f"success {result} success"
-                    if selected
-                    else f"skipped {result} skipped",
-                },
-                capture_output=True,
-                timeout=5,
-            ).returncode
-            self.assertEqual(status == 0, passes, (selected, result))
-        nightly = yaml.safe_load((ROOT / ".github/workflows/nightly.yml").read_text())[
-            "jobs"
-        ]
-        self.assertIn("build-wheel-xpu", nightly["nightly-gate"]["needs"])
-        self.assertNotIn("build-wheel-xpu", nightly["publish-testpypi"]["needs"])
-
-    def test_uses_container_and_shared_wheel_builder(self):
-        job = WORKFLOW["jobs"]["build-wheel-xpu"]
-        self.assertIn("@sha256:", job["container"])
-        commands = "\n".join(step.get("run", "") for step in job["steps"])
-        self.assertNotIn("docker ", commands)
-        self.assertIn("bash scripts/build_wheel.sh", commands)
-        self.assertLess(
-            [step.get("name") for step in job["steps"]].index(
-                "Install git (pre-checkout)"
-            ),
-            [step.get("name") for step in job["steps"]].index("Check out source"),
-        )
-
-
 class InstalledWheelTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

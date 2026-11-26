@@ -106,13 +106,6 @@ target_include_directories(cq_timeout_diagnostic_test
 target_link_libraries(cq_timeout_diagnostic_test PRIVATE gtest gtest_main)
 add_test(NAME cq_timeout_diagnostic_test COMMAND cq_timeout_diagnostic_test)
 
-# Hardware-free checks that updateGlobalConfig() clamps the RD-atomic depths to
-# the device's advertised limits; no RDMA device required.
-add_executable(rdma_atomic_cap_test ${WORKSPACE}/rdma_atomic_cap_test.cpp)
-target_link_libraries(rdma_atomic_cap_test PUBLIC transfer_engine gtest
-                                                  gtest_main)
-add_test(NAME rdma_atomic_cap_test COMMAND rdma_atomic_cap_test)
-
 add_executable(task_congestion_c_abi_test
                ${CMAKE_CURRENT_SOURCE_DIR}/task_congestion_c_abi_test.c)
 target_include_directories(
@@ -206,16 +199,6 @@ target_link_libraries(endpoint_store_integration_test PUBLIC transfer_engine
 add_test(NAME endpoint_store_integration_test
          COMMAND endpoint_store_integration_test)
 set_tests_properties(endpoint_store_integration_test PROPERTIES LABELS "rdma")
-
-add_executable(rdma_transport_test2 ${WORKSPACE}/rdma_transport_test2.cpp)
-target_link_libraries(rdma_transport_test2 PUBLIC transfer_engine gtest
-                                                  gtest_main)
-# add_test(NAME rdma_transport_test2 COMMAND rdma_transport_test2)
-
-add_executable(rdma_loopback_test ${WORKSPACE}/rdma_loopback_test.cpp)
-target_link_libraries(rdma_loopback_test PUBLIC transfer_engine gtest
-                                                gtest_main)
-# add_test(NAME rdma_loopback_test COMMAND rdma_loopback_test)
 
 # Regression test for #2017 (registerLocalMemory must auto-chunk buffers larger
 # than the device max_mr_size; loopback WRITE past the boundary must succeed).
@@ -337,11 +320,6 @@ if(USE_NVMEOF)
   target_link_libraries(nvmeof_status_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME nvmeof_status_test COMMAND nvmeof_status_test)
-
-  add_executable(nvmeof_transport_test ${WORKSPACE}/nvmeof_transport_test.cpp)
-  target_link_libraries(nvmeof_transport_test PUBLIC transfer_engine gtest
-                                                     gtest_main)
-  # add_test(NAME nvmeof_transport_test COMMAND nvmeof_transport_test)
 endif()
 
 if(USE_TCP)
@@ -380,11 +358,6 @@ if(USE_TCP)
     add_test(NAME tcp_ascend_staging_test COMMAND tcp_ascend_staging_test)
   endif()
 endif()
-
-add_executable(tcp_address_validation_test
-               ${WORKSPACE}/tcp_address_validation_test.cpp)
-target_link_libraries(tcp_address_validation_test PUBLIC gtest gtest_main)
-add_test(NAME tcp_address_validation_test COMMAND tcp_address_validation_test)
 
 # Hardware-free unit test for the active-connect circuit-breaker state
 # (ConnectPauseTracker is header-only and clock-injectable), runs on every CI
@@ -578,7 +551,7 @@ if(USE_CXI)
                                                  gtest_main)
   target_link_libraries(cxi_unit_tests PUBLIC transfer_engine gtest gtest_main)
   add_test(NAME cxi_transport_test COMMAND cxi_transport_test)
-  add_test(NAME cxi_unit_tests COMMAND cxi_unit_test)
+  add_test(NAME cxi_unit_tests COMMAND cxi_unit_tests)
 endif()
 
 # UB transport test with URMA endpoint and mock support
@@ -616,18 +589,6 @@ if(USE_SUNRISE)
            ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
   add_test(NAME sunrise_link_transport_runtime_test
            COMMAND sunrise_link_transport_runtime_test)
-
-  add_executable(sunrise_link_transport_unit_test
-                 ${WORKSPACE}/sunrise_link_transport_unit_test.cpp)
-  target_include_directories(sunrise_link_transport_unit_test
-                             PRIVATE ${MC_TANGRT_ROOT}/include)
-  target_link_libraries(
-    sunrise_link_transport_unit_test
-    PUBLIC transfer_engine gtest gtest_main
-           ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
-  add_test(NAME sunrise_link_transport_unit_test
-           COMMAND sunrise_link_transport_unit_test)
 
   add_executable(sunrise_allocator_test ${WORKSPACE}/sunrise_allocator_test.cpp)
   target_include_directories(sunrise_allocator_test

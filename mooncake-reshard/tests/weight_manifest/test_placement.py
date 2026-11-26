@@ -308,3 +308,28 @@ def test_axis_semantic_kind_participates_in_placement_identity() -> None:
 
     assert replicated.placement_id != ownership.placement_id
     assert replicated.digest != ownership.digest
+
+
+def test_weight_placement_json_has_a_strict_resource_kind() -> None:
+    placement = placement_manifest()
+    payload = json.loads(weight_placement_to_json(placement))
+
+    assert payload["resource_kind"] == "model_weight"
+    payload["resource_kind"] = "kv_cache"
+
+    with pytest.raises(ValueError, match="resource_kind"):
+        weight_placement_from_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize("resource_kind", [None, "unknown"])
+def test_weight_placement_json_rejects_missing_or_unknown_resource_kind(
+    resource_kind: str | None,
+) -> None:
+    payload = json.loads(weight_placement_to_json(placement_manifest()))
+    if resource_kind is None:
+        del payload["resource_kind"]
+    else:
+        payload["resource_kind"] = resource_kind
+
+    with pytest.raises(ValueError):
+        weight_placement_from_json(json.dumps(payload))

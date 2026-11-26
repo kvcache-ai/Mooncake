@@ -9,7 +9,10 @@ from mooncake.reshard.weight._planner.bound_contracts import TransferPlan
 from mooncake.reshard.weight._planner.bound_validation import (
     _validate_target_physical_ranges,
 )
-from mooncake.reshard.weight._planner.contracts import TransferRegion
+from mooncake.reshard.weight._planner.contracts import (
+    LogicalTransferPlan,
+    TransferRegion,
+)
 from mooncake.reshard.weight.manifest import ParallelRank
 
 from .helpers import bound_fragment, tp_manifests
@@ -103,69 +106,56 @@ def test_physical_overlap_is_detected_for_logically_disjoint_regions() -> None:
         _validate_target_physical_ranges((left, right))
 
 
-def test_public_transfer_plan_rejects_conflicting_target_physical_ranges() -> None:
-    """The public executable-plan boundary must not rely on binder-only checks."""
-
-    left = strided_column_region(
-        tensor_id="left",
-        fragment_suffix="left",
-        target_fragment_id="shared-fragment",
-        target_address=0x40000,
-        column=0,
+def test_public_logical_plan_rejects_mutable_duck_typed_operation() -> None:
+    source_placement = tp_manifests(
+        tp=1,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x10000,
+        worker_prefix="source-placement",
+    ).placement
+    target_placement = tp_manifests(
+        tp=1,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x20000,
+        worker_prefix="target-placement",
+    ).placement
+    source = bound_fragment(
+        fragment_id="source-logical-fake",
+        tensor_id="fake",
+        global_offset=(0,),
+        local_shape=(4,),
+        address=0x30000,
+        nbytes=8,
+        worker_id="source-worker",
+        endpoint="source-worker:12345",
+        device="cuda:0",
+        rank=ParallelRank(),
     )
-    right = strided_column_region(
-        tensor_id="right",
-        fragment_suffix="right",
-        target_fragment_id="shared-fragment",
-        target_address=0x40000 - 2,
-        column=1,
-    )
-
-    with pytest.raises(ValueError, match="lacks an attested runtime binding"):
-        TransferPlan(
-            resource_id="resource",
-            revision="revision",
-            weight_generation=1,
-            target_placement=tp_manifests(
-                tp=1,
-                pp_rank=0,
-                ep_rank=0,
-                address_base=0x40000,
-                worker_prefix="target-placement",
-            ).placement,
-            operations=(left, right),
-        )
-
-
-def test_public_transfer_plan_accepts_disjoint_target_physical_ranges() -> None:
-    left = strided_column_region(
-        tensor_id="left",
-        fragment_suffix="left",
-        target_fragment_id="target-left",
-        target_address=0x40000,
-        column=0,
-    )
-    right = strided_column_region(
-        tensor_id="right",
-        fragment_suffix="right",
-        target_fragment_id="target-right",
-        target_address=0x40000,
-        column=1,
+    target = bound_fragment(
+        fragment_id="target-logical-fake",
+        tensor_id="fake",
+        global_offset=(0,),
+        local_shape=(4,),
+        address=0x40000,
+        nbytes=8,
+        worker_id="target-worker",
+        endpoint="target-worker:12345",
+        device="cuda:0",
+        instance_id="target-instance",
+        rank=ParallelRank(),
     )
 
-    with pytest.raises(ValueError, match="lacks an attested runtime binding"):
-        TransferPlan(
-            resource_id="resource",
-            revision="revision",
-            weight_generation=1,
-            target_placement=tp_manifests(
-                tp=1,
-                pp_rank=0,
-                ep_rank=0,
-                address_base=0x40000,
-                worker_prefix="target-placement",
-            ).placement,
-            operations=(left, right),
+    with pytest.raises(ValueError, match="canonical transfer operation"):
+        LogicalTransferPlan(
+            resource_id=source_placement.resource_id,
+            revision=source_placement.revision,
+            source_placement=source_placement,
+            target_placement=target_placement,
+            source_tensors=(),
+            target_tensors=(),
+            operations=(MutableOperation(source, target),),  # type: ignore[arg-type]
         )
 
 

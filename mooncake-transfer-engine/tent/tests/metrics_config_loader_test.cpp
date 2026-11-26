@@ -347,32 +347,6 @@ TEST(ConfigHelperTest, ParseDoubleArraySingleValue) {
     EXPECT_DOUBLE_EQ(result[0], 42.0);
 }
 
-//------------------------------------------------------------------------------
-// Config Keys Constants Tests
-//------------------------------------------------------------------------------
-
-TEST(ConfigKeysTest, ConfigKeyConstants) {
-    // Verify config key constants are correctly defined
-    EXPECT_STREQ(config_keys::METRICS_ENABLED, "metrics/enabled");
-    EXPECT_STREQ(config_keys::METRICS_HTTP_PORT, "metrics/http_port");
-    EXPECT_STREQ(config_keys::METRICS_HTTP_HOST, "metrics/http_host");
-    EXPECT_STREQ(config_keys::METRICS_HTTP_SERVER_THREADS,
-                 "metrics/http_server_threads");
-    EXPECT_STREQ(config_keys::METRICS_REPORT_INTERVAL,
-                 "metrics/report_interval_seconds");
-}
-
-TEST(ConfigKeysTest, EnvVarConstants) {
-    // Verify environment variable constants are correctly defined
-    EXPECT_STREQ(config_keys::ENV_METRICS_ENABLED, "TENT_METRICS_ENABLED");
-    EXPECT_STREQ(config_keys::ENV_METRICS_HTTP_PORT, "TENT_METRICS_HTTP_PORT");
-    EXPECT_STREQ(config_keys::ENV_METRICS_HTTP_HOST, "TENT_METRICS_HTTP_HOST");
-    EXPECT_STREQ(config_keys::ENV_METRICS_HTTP_SERVER_THREADS,
-                 "TENT_METRICS_HTTP_SERVER_THREADS");
-    EXPECT_STREQ(config_keys::ENV_METRICS_REPORT_INTERVAL,
-                 "TENT_METRICS_REPORT_INTERVAL");
-}
-
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

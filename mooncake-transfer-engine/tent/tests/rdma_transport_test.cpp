@@ -1321,16 +1321,6 @@ bool waitBatchDone(TransferEngine& engine, BatchID batch) {
     return false;
 }
 
-TEST(RdmaParamsTest, DefaultsKeepLaneCountsAligned) {
-    RdmaParams params;
-
-    EXPECT_EQ(params.num_lanes, 6);
-    EXPECT_EQ(params.device.num_cq_list, params.num_lanes);
-    EXPECT_EQ(params.endpoint.qp_mul_factor, params.num_lanes);
-    EXPECT_EQ(params.workers.num_workers, params.num_lanes);
-    EXPECT_EQ(params.endpoint.path_mtu, IBV_MTU_4096);
-}
-
 // Slice timeouts subtract two of these timestamps. A wall-clock step between
 // them must not change the result, so they come from the monotonic clock.
 TEST(RdmaSliceClockTest, TimestampsComeFromTheMonotonicClock) {

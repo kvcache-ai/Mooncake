@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import inspect
 import subprocess
 import sys
 import types
@@ -14,7 +13,6 @@ import torch.distributed as dist
 
 import mooncake.mooncake_elastic_buffer as elastic_buffer_module
 import mooncake.mooncake_ep_buffer as ep_buffer_module
-from mooncake.mooncake_ep_buffer import Buffer as LegacyBuffer
 from mooncake.mooncake_elastic_buffer import (
     ElasticBuffer,
     _bootstrap_collective_device,
@@ -25,11 +23,6 @@ from mooncake.mooncake_elastic_buffer import (
     _select_transport,
     _select_transport_for_group,
 )
-
-
-def test_legacy_buffer_requires_explicit_size() -> None:
-    parameter = inspect.signature(LegacyBuffer).parameters["num_ep_buffer_bytes"]
-    assert parameter.default is inspect.Parameter.empty
 
 
 @pytest.mark.parametrize(
@@ -68,12 +61,6 @@ raise SystemExit(1)
 """
     result = subprocess.run([sys.executable, "-c", script], check=False, timeout=30)
     assert result.returncode == 0
-
-
-def test_public_constructor_defaults_are_backward_compatible() -> None:
-    parameters = inspect.signature(ElasticBuffer).parameters
-    assert parameters["transport"].default == "auto"
-    assert parameters["explicitly_destroy"].default is False
 
 
 @pytest.mark.parametrize(

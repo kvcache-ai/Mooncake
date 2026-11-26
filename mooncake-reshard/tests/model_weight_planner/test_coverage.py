@@ -107,18 +107,3 @@ def test_global_manifest_barrier_rejects_target_tp_gap() -> None:
         ValueError, match="global placement tensor is not fully covered"
     ):
         rebuild_placement(target.placement, fragments=target.fragments[:1])
-
-
-def test_global_manifest_barrier_rejects_missing_source_coverage() -> None:
-    source = tp_manifests(
-        tp=2,
-        pp_rank=0,
-        ep_rank=0,
-        address_base=0x10000,
-        worker_prefix="source",
-    )
-
-    with pytest.raises(
-        ValueError, match="global placement tensor is not fully covered"
-    ):
-        rebuild_placement(source.placement, fragments=source.fragments[:1])

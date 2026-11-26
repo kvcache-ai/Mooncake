@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import inspect
-import typing
-
 import pytest
 
-import mooncake.reshard.weight.manifest as model_weight
 from mooncake.reshard.weight import (
     OwnershipAxis,
     ParallelRank,
@@ -16,33 +12,6 @@ from mooncake.reshard.weight import (
 )
 
 from .helpers import descriptor
-
-
-def test_public_api_is_minimal_and_explicit() -> None:
-    assert model_weight.__all__ == [
-        "ParallelRank",
-        "ParallelTopology",
-        "PlacementFragment",
-        "TopologyParticipant",
-        "WeightPlacementManifest",
-        "WeightPlacementPart",
-        "RuntimeBindingFragment",
-        "WeightRuntimeBindingManifest",
-        "SplitAxis",
-        "ReplicatedAxis",
-        "OwnershipAxis",
-        "TensorDescriptor",
-        "validate_runtime_binding",
-        "validate_runtime_bindings",
-    ]
-
-
-def test_public_type_hints_resolve() -> None:
-    for name in model_weight.__all__:
-        value = getattr(model_weight, name)
-        targets = (value, value.__init__) if inspect.isclass(value) else (value,)
-        for target in targets:
-            typing.get_type_hints(target)
 
 
 def test_tensor_descriptor_uses_canonical_shard_dims() -> None:

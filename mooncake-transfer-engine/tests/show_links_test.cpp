@@ -67,14 +67,6 @@ TEST(ShowLinksTest, AutoDiscoverShowsNics) {
     EXPECT_NE(result.find("Local NICs"), std::string::npos);
 }
 
-TEST(ShowLinksTest, OutputContainsTopologySection) {
-    auto engine = std::make_unique<TransferEngine>(true);
-    auto result = engine->showLinks();
-    // If RDMA devices exist, should show topology
-    // If not, gracefully show empty
-    EXPECT_FALSE(result.empty());
-}
-
 TEST(ShowLinksTest, JsonOutputIsValid) {
     auto engine = std::make_unique<TransferEngine>(true);
     auto result = engine->showLinks(true);
