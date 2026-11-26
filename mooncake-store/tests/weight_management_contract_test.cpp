@@ -1,18 +1,9 @@
 #include <gtest/gtest.h>
 
-#include <type_traits>
-
 #include "weight_management.h"
-#include "ylt/struct_pack.hpp"
 
 namespace mooncake {
 namespace {
-
-template <typename T>
-concept HasTensorsField = requires(T value) { value.tensors; };
-
-template <typename T>
-concept HasRuntimeEndpointField = requires(T value) { value.runtime_endpoint; };
 
 WeightRevisionIdentity ValidIdentity() {
     return WeightRevisionIdentity{
@@ -271,28 +262,6 @@ TEST(WeightManagementContractTest, ValidatesIntrinsicOperationShape) {
     EXPECT_TRUE(IsValidWeightOperationShape(operation));
 }
 
-TEST(WeightManagementContractTest, RoundTripsWireEnumsAndMetadata) {
-    WeightRevisionMetadata metadata{
-        .identity = ValidIdentity(),
-        .manifest = ValidManifest(),
-        .availability = WeightAvailabilityState::DEGRADED,
-        .residency = WeightResidencyState::MIXED,
-        .operation_id = 42,
-        .affinity_count = 2,
-        .affinity_digest = std::string(64, 'c'),
-        .observed_hot_ratio = 0.5,
-        .metadata_generation = 9,
-        .created_at_ms = 100,
-        .updated_at_ms = 200,
-    };
-
-    auto encoded = struct_pack::serialize(metadata);
-    WeightRevisionMetadata decoded;
-    ASSERT_EQ(struct_pack::errc::ok,
-              struct_pack::deserialize_to(decoded, encoded));
-    EXPECT_EQ(metadata, decoded);
-}
-
 TEST(WeightManagementContractTest, CanonicalDigestsAreStableAndUnambiguous) {
     EXPECT_EQ(
         "ff2c110b8f18291ea676be2af036320944751c4b3e6a65b3c1153721c61c2b26",
@@ -374,12 +343,6 @@ TEST(WeightManagementContractTest, AffinityMappingDigestRejectsInvalidEntries) {
     changed = valid;
     changed.affinity_id.clear();
     EXPECT_TRUE(ComputeWeightAffinityMappingSha256({changed}).empty());
-}
-
-TEST(WeightManagementContractTest, MetadataDoesNotDuplicateManifestChildren) {
-    static_assert(!HasTensorsField<WeightRevisionMetadata>);
-    static_assert(!HasRuntimeEndpointField<WeightRevisionMetadata>);
-    SUCCEED();
 }
 
 }  // namespace

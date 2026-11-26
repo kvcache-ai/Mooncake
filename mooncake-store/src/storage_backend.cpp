@@ -2664,7 +2664,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ScanMeta(
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     int64_t bucket_id, std::vector<std::string>& keys,
     std::vector<StorageObjectMetadata>& metadatas,
-    std::vector<int64_t>& buckets, int64_t limit) {
+    std::vector<int64_t>& buckets, int64_t limit,
+    std::vector<BucketScanPin>* pins) {
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto bucket_it = buckets_.lower_bound(bucket_id);
     for (; bucket_it != buckets_.end(); ++bucket_it) {
@@ -2680,6 +2681,13 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
             return bucket_it->first;
         }
         buckets.emplace_back(bucket_it->first);
+        if (pins != nullptr) {
+            // Pin inside this shared-lock section, together with the copy
+            // below: an eviction that ran after the copy but before the pin
+            // would still be able to delete the bucket before the caller
+            // registers its keys with the master.
+            pins->emplace_back(bucket_it->second);
+        }
         for (size_t i = 0; i < bucket_it->second->keys.size(); i++) {
             keys.emplace_back(bucket_it->second->keys[i]);
             metadatas.emplace_back(StorageObjectMetadata{
@@ -3405,7 +3413,7 @@ BucketStorageBackend::SelectEvictionCandidate(int disk_index) {
     switch (bucket_backend_config_.eviction_policy) {
         case BucketEvictionPolicy::FIFO: {
             // fifo_index holds this disk's bucket ids, and bucket ids increase
-            // monotonically, so begin() is the oldest bucket on this disk.
+            // monotonically, so the front is the oldest bucket on this disk.
             // buckets_.begin() cannot be used any more: it may well point at a
             // bucket on a different disk.
             // Pop-and-retry rather than a single lookup: a stale id would
@@ -3415,14 +3423,25 @@ BucketStorageBackend::SelectEvictionCandidate(int disk_index) {
             auto pos = disk.fifo_index.begin();
             while (pos != disk.fifo_index.end()) {
                 auto bucket_it = buckets_.find(*pos);
-                if (bucket_it != buckets_.end()) {
-                    if (bucket_it->second->offload_notification_pending_) {
-                        ++pos;
-                        continue;
-                    }
-                    return bucket_it;
+                if (bucket_it == buckets_.end()) {
+                    pos = disk.fifo_index.erase(pos);
+                    continue;
                 }
-                pos = disk.fifo_index.erase(pos);
+                // A bucket is not evictable while its offload notification is
+                // pending, or while a scan batch has copied it but not yet
+                // registered its keys with the master (scan_pins_).
+                if (bucket_it->second->offload_notification_pending_) {
+                    ++pos;
+                    continue;
+                }
+                if (bucket_it->second->scan_pins_.load(
+                        std::memory_order_relaxed) > 0) {
+                    VLOG(1) << "SelectEvictionCandidate: skipping scan-pinned "
+                            << "bucket_id=" << bucket_it->first;
+                    ++pos;
+                    continue;
+                }
+                return bucket_it;
             }
             return buckets_.end();
         }
@@ -3438,17 +3457,27 @@ BucketStorageBackend::SelectEvictionCandidate(int disk_index) {
             //     last_access_ns_, it is the true LRU candidate.
             //   - If stale, re-insert with the correct timestamp and retry.
             //   - If the bucket no longer exists, discard the entry.
+            //   - If the bucket is scan-pinned, skip it without repairing;
+            //     it stays in the index and becomes a candidate again once
+            //     the scan batch's registration finishes.
             auto& lru_index = disk.lru_index;
-            auto top_it = lru_index.begin();
-            while (top_it != lru_index.end()) {
-                auto [ts, id] = *top_it;
+            auto it = lru_index.begin();
+            while (it != lru_index.end()) {
+                auto [ts, id] = *it;
                 auto bucket_it = buckets_.find(id);
                 if (bucket_it == buckets_.end()) {
-                    top_it = lru_index.erase(top_it);
+                    it = lru_index.erase(it);
                     continue;
                 }
                 if (bucket_it->second->offload_notification_pending_) {
-                    ++top_it;
+                    ++it;
+                    continue;
+                }
+                if (bucket_it->second->scan_pins_.load(
+                        std::memory_order_relaxed) > 0) {
+                    VLOG(1) << "SelectEvictionCandidate: skipping scan-pinned "
+                            << "bucket_id=" << id;
+                    ++it;
                     continue;
                 }
                 int64_t actual_ts = bucket_it->second->last_access_ns_.load(
@@ -3456,10 +3485,11 @@ BucketStorageBackend::SelectEvictionCandidate(int disk_index) {
                 if (actual_ts == ts) {
                     return bucket_it;
                 }
-                // Stale: repair and retry to find the true minimum.
-                lru_index.erase(top_it);
+                // Stale: repair and restart from the front to find the true
+                // minimum (the corrected entry may sort before this position).
+                it = lru_index.erase(it);
                 lru_index.emplace(actual_ts, id);
-                top_it = lru_index.begin();
+                it = lru_index.begin();
             }
             return buckets_.end();
         }
@@ -4387,9 +4417,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadatas;
     std::vector<int64_t> buckets;
+    // Keep the scanned buckets pinned until the handler has finished
+    // registering the batch with the master. If the handler fails, the pins
+    // are released on this return path and eviction may proceed again.
+    std::vector<BucketScanPin> pins;
     auto key_iterator_result =
         BucketScan(next_bucket_, keys, metadatas, buckets,
-                   file_storage_config_.scanmeta_iterator_keys_limit);
+                   file_storage_config_.scanmeta_iterator_keys_limit, &pins);
     if (!key_iterator_result) {
         LOG(ERROR) << "Bucket scan failed, error : "
                    << key_iterator_result.error();
