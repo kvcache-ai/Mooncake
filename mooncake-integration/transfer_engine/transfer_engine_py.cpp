@@ -2088,11 +2088,12 @@ PYBIND11_MODULE(engine, m) {
             .def("reset_reshard_peers_quiescent",
                  &TransferEnginePy::resetReshardPeersQuiescent,
                  py::arg("peers"),
-                 "Experimental: close all intra-node NVLink IPC mappings and "
-                 "invalidate the listed remote metadata and Python handles. "
+                 "Experimental: close intra-node NVLink IPC mappings and "
+                 "invalidate metadata and Python handles for the listed peers. "
                  "Caller must globally fence completed transfers and prevent "
                  "concurrent submissions, registration, and unregistration. "
-                 "Returns 0 on success; failure may leave a partial reset.")
+                 "Returns 0 on success; failure may leave a partial reset and "
+                 "requires restarting the participating engines.")
             .def("get_engine_ptr", &TransferEnginePy::getEnginePtr);
 
     adaptor_cls

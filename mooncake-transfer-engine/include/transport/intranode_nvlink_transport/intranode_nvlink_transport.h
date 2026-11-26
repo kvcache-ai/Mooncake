@@ -31,7 +31,7 @@ class IntraNodeNvlinkTransport : public Transport {
     ~IntraNodeNvlinkTransport();
 
     // Caller must fence all transfers and prevent concurrent submissions.
-    int resetPeerMappingsQuiescent();
+    int resetPeerMappingsQuiescent(uint64_t peer_id);
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries) override;

@@ -484,8 +484,26 @@ std::shared_ptr<TransferMetadata::SegmentDesc> makeRdmaSegmentDesc(
 
 TEST(TransferMetadataInvalidationTest, UnknownRemoteIsIdempotent) {
     TransferMetadata metadata(P2PHANDSHAKE);
+    EXPECT_EQ(metadata.getCachedSegmentID("not-an-endpoint"),
+              static_cast<TransferMetadata::SegmentID>(-1));
     EXPECT_EQ(metadata.invalidateRemoteSegmentCache("127.0.0.1:0"), 0);
     EXPECT_EQ(metadata.invalidateRemoteSegmentCache("127.0.0.1:0"), 0);
+}
+
+TEST(TransferMetadataInvalidationTest, CachedLookupUsesTheRequestedName) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    constexpr TransferMetadata::SegmentID kRemoteID = 17;
+    auto remote = makeRdmaSegmentDesc("127.0.0.1:1234", 0x1000);
+    ASSERT_EQ(metadata.addLocalSegment(
+                  kRemoteID, "localhost:1234",
+                  std::shared_ptr<TransferMetadata::SegmentDesc>(remote)),
+              0);
+    EXPECT_EQ(metadata.getCachedSegmentID("localhost:1234"), kRemoteID);
+    EXPECT_EQ(metadata.getCachedSegmentID(remote->name),
+              static_cast<TransferMetadata::SegmentID>(-1));
+    ASSERT_EQ(metadata.invalidateRemoteSegmentCache("localhost:1234"), 0);
+    EXPECT_EQ(metadata.getCachedSegmentID("localhost:1234"),
+              static_cast<TransferMetadata::SegmentID>(-1));
 }
 
 TEST(TransferMetadataInvalidationTest, RejectsLocalAndPreservesDescriptor) {
@@ -498,6 +516,7 @@ TEST(TransferMetadataInvalidationTest, RejectsLocalAndPreservesDescriptor) {
               0);
 
     EXPECT_NE(metadata.invalidateRemoteSegmentCache(local_name), 0);
+    EXPECT_EQ(metadata.getCachedSegmentID(local_name), LOCAL_SEGMENT_ID);
     EXPECT_EQ(metadata.getSegmentID(local_name), LOCAL_SEGMENT_ID);
     EXPECT_EQ(metadata.getSegmentDescByID(LOCAL_SEGMENT_ID), local_desc);
     EXPECT_EQ(metadata.getSegmentDescByName(local_name), local_desc);

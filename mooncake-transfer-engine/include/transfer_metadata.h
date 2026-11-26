@@ -276,6 +276,14 @@ class TransferMetadata {
 
     SegmentID getSegmentID(const std::string &segment_name);
 
+    // Unlike getSegmentID, a cache miss must not fetch remote metadata.
+    SegmentID getCachedSegmentID(const std::string &segment_name) {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        auto it = segment_name_to_id_map_.find(segment_name);
+        return it == segment_name_to_id_map_.end() ? static_cast<SegmentID>(-1)
+                                                   : it->second;
+    }
+
     int syncSegmentCache(const std::string &segment_name);
 
     int removeSegmentDesc(const std::string &segment_name);

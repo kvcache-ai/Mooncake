@@ -322,10 +322,14 @@ class TransferEnginePy {
         auto *transport = dynamic_cast<mooncake::IntraNodeNvlinkTransport *>(
             engine_->getTransport("nvlink_intra"));
         if (!transport) return -1;
-        if (transport->resetPeerMappingsQuiescent() != 0) return -1;
+        auto metadata = engine_->getMetadata();
         for (const auto &peer : peers) {
-            if (engine_->getMetadata()->invalidateRemoteSegmentCache(peer) != 0)
+            auto peer_id = metadata->getCachedSegmentID(peer);
+            if (peer_id == LOCAL_SEGMENT_ID) return -1;
+            if (peer_id != static_cast<uint64_t>(-1) &&
+                transport->resetPeerMappingsQuiescent(peer_id) != 0)
                 return -1;
+            if (metadata->invalidateRemoteSegmentCache(peer) != 0) return -1;
             handle_map_.erase(peer);
         }
         return 0;

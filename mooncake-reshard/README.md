@@ -214,11 +214,30 @@ collective executor requires its caller to coordinate participant order and
 completion; local completion is not a world fence.
 
 The native `reset_reshard_peers_quiescent(peers)` method explicitly clears cached
-peer mappings and metadata. The caller must first drain transfers on all
-participants, prevent concurrent registration, submission and unregistration,
+IPC mappings, metadata and Python handles only for the listed peers. An empty
+list is a no-op; unknown or repeated peers are harmless. The caller must first
+drain transfers on all participants, prevent concurrent registration, submission
+and unregistration,
 and fence completion. The method is not a drain or cancellation API. A failure
 may leave only some peers reset and requires restarting the participating
 engines. Existing GPU and DRAM transfer paths never invoke it automatically.
+
+The opt-in public-binding regression needs three CUDA GPUs and the built
+Mooncake extension. From the repository root, with `CUDA_HOME` set:
+
+```bash
+mkdir -p build
+c++ -shared -fPIC -std=c++17 -I"$CUDA_HOME/include" \
+  mooncake-integration/tests/reshard_ipc_trace.cpp -ldl \
+  -o build/reshard_ipc_trace.so
+CUDA_VISIBLE_DEVICES=0,1,2 MC_INTRANODE_NVLINK=1 MC_RUN_RESHARD_IPC_TESTS=1 \
+  LD_PRELOAD="$PWD/build/reshard_ipc_trace.so" \
+  python mooncake-integration/tests/test_reshard_peer_reset.py
+```
+
+The trace library observes real CUDA IPC calls and can fail one close operation.
+The failure test destroys the engine without resuming transfers; it does not
+validate recovery after an unknown transfer completion.
 
 Model parameter semantics, framework tensor layouts, packing policy, and
 serving lifecycle belong in the framework integration. They are not part of
