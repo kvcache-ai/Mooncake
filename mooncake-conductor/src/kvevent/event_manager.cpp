@@ -831,9 +831,11 @@ void EventManager::PropagateDeployment(
         std::shared_lock lock(mu_);
         if (stopped_) return;
         for (const auto& [key, service] : active_configs_) {
-            // 池发布者（Mooncake）不持有 HBM 副本，注册 reader 会因“非 owner”失败，
-            // 它的池事件靠同 ContextKey 上已激活的 layout 进入 grouped 分支即可。
-            if (service.publisher_kind == common::PublisherKind::kMooncake) continue;
+            // 池发布者（Mooncake）不持有 HBM 副本，注册 reader 会因“非
+            // owner”失败， 它的池事件靠同 ContextKey 上已激活的 layout 进入
+            // grouped 分支即可。
+            if (service.publisher_kind == common::PublisherKind::kMooncake)
+                continue;
             if (ContextFromService(service) == context) {
                 selected.push_back(handlers_.at(key));
             }

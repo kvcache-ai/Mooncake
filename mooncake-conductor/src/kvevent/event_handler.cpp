@@ -312,14 +312,13 @@ PendingBatchUsage EstimatePendingUsage(const zmq::DecodedBatch& batch,
 
 KVEventHandler::KVEventHandler(EventManager* manager, common::ServiceConfig svc,
                                prefixindex::SourceLayout layout)
-    : manager_(manager),
-      service_(std::move(svc)),
-      layout_(std::move(layout)) {}
+    : manager_(manager), service_(std::move(svc)), layout_(std::move(layout)) {}
 
 bool KVEventHandler::AttachDeployment(
     const prefixindex::SourceLayout& binding) {
     // 注意：即使本实例已有 layout（可能与宣告者共享同一份），也必须走一遍
-    // ActivateDeployment 以登记 (instance, rank) 的 reader；否则该实例看不到池副本。
+    // ActivateDeployment 以登记 (instance, rank) 的
+    // reader；否则该实例看不到池副本。
     if (!binding.layout) {
         LOG(WARNING) << "Skip attaching deployment without layout instance="
                      << service_.instance_id;
@@ -341,14 +340,16 @@ bool KVEventHandler::AttachDeployment(
     }
     layout_ = binding;
     LOG(INFO) << "Attached propagated deployment instance="
-              << service_.instance_id << " groups=" << layout_.layout->groups.size()
+              << service_.instance_id
+              << " groups=" << layout_.layout->groups.size()
               << " readable_domains=" << layout_.readable_domains.size();
     return true;
 }
 
 bool KVEventHandler::EnsureDeployment() {
     if (layout_.layout) return true;
-    // 同 ContextKey 的其他实例可能已经宣告过布局（例如同一个 P 组内只有一个 rank 发声明）。
+    // 同 ContextKey 的其他实例可能已经宣告过布局（例如同一个 P 组内只有一个
+    // rank 发声明）。
     prefixindex::SourceLayout binding;
     if (!manager_->GetIndexer()->GetDeployment(ContextFromService(service_),
                                                &binding)) {
@@ -459,7 +460,8 @@ std::string KVEventHandler::HandleBatch(const zmq::DecodedBatch& batch,
         return "message endpoint conflicts with trusted registration";
     }
     std::unique_lock<std::mutex> grouped_lock;
-    if (grouped_context()) grouped_lock = std::unique_lock(grouped_dispatch_mu_);
+    if (grouped_context())
+        grouped_lock = std::unique_lock(grouped_dispatch_mu_);
     if (service_.publisher_kind == common::PublisherKind::kVllm) {
         const auto* vllm_batch = std::get_if<zmq::VllmEventBatch>(&batch);
         if (vllm_batch == nullptr) {
@@ -516,8 +518,10 @@ std::string KVEventHandler::HandleVllmBatch(
                      << " seq=" << metadata.sequence;
         return "batch data_parallel_rank conflicts with trusted registration";
     }
-    // kv_cache_layout 可能先于/后于数据事件到达，且它正是“是否启用分组路径”的输入，
-    // 所以这里必须无条件扫描；不能用 grouped_context() 作为门控（会形成循环依赖）。
+    // kv_cache_layout
+    // 可能先于/后于数据事件到达，且它正是“是否启用分组路径”的输入，
+    // 所以这里必须无条件扫描；不能用 grouped_context()
+    // 作为门控（会形成循环依赖）。
     {
         for (const auto& decoded : batch.events) {
             if (!decoded.ok()) continue;
@@ -543,9 +547,11 @@ std::string KVEventHandler::HandleVllmBatch(
                       << " instance=" << service_.instance_id
                       << " groups=" << layout_.layout->groups.size();
             manager_->RefreshMooncakeDeployments(ContextFromService(service_));
-            // 同一 ContextKey 的其他实例（还没收到过 layout 的 P、D、mc）也挂上这份部署，
-            // 否则它们既没有 hybrid 索引，也看不到池里的共享副本（cpu_share）。
-            manager_->PropagateDeployment(ContextFromService(service_), layout_);
+            // 同一 ContextKey 的其他实例（还没收到过 layout 的
+            // P、D、mc）也挂上这份部署， 否则它们既没有 hybrid
+            // 索引，也看不到池里的共享副本（cpu_share）。
+            manager_->PropagateDeployment(ContextFromService(service_),
+                                          layout_);
         }
     }
     if (layout_.layout && !layout_.layout->unavailable_reason.empty())
@@ -1330,7 +1336,8 @@ std::string KVEventHandler::ClearMooncakeBindings(
 std::string KVEventHandler::InvalidateEndpoint() {
     MarkUnavailable();
     std::unique_lock<std::mutex> grouped_lock;
-    if (grouped_context()) grouped_lock = std::unique_lock(grouped_dispatch_mu_);
+    if (grouped_context())
+        grouped_lock = std::unique_lock(grouped_dispatch_mu_);
     pending_.clear();
     pending_event_count_ = pending_bytes_ = 0;
     if (service_.publisher_kind == common::PublisherKind::kVllm ||
