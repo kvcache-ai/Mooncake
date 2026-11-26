@@ -400,6 +400,26 @@ fragment must fit within both declared capacities.
 **Returns:**
 - `ScatterTransferTicket`: A drainable completion handle for the native scatter operation.
 
+#### submit_scatter_write() / submit_scatter_read()
+
+These methods accept the same arguments as
+`scatter_transfer_sync_write_with_ticket()` and
+`scatter_transfer_sync_read_with_ticket()`. They submit the operation and
+return its `ScatterTransferTicket` without waiting for completion, allowing
+multiple operations to overlap.
+
+Keep both allocations and their registrations alive until the ticket reports
+`COMPLETED` or `FAILED_DRAINED`. Call `ticket.drain(timeout_ms)` to wait for a
+terminal result. `COMPLETION_UNKNOWN` retains the lifetime requirement and
+allows another drain attempt. A failed drain is not permission to release
+the buffers while completion remains unknown.
+
+Keep the ticket itself alive and explicitly drain it to a terminal status.
+Dropping the last reference to an unfinished ticket invokes the native
+destructor, which waits for physical completion with the Python GIL held and
+can block other Python threads. Destruction is not a bounded cancellation
+mechanism; retain tickets with unknown completion for explicit recovery.
+
 #### batch_transfer_sync()
 
 ```python
@@ -571,6 +591,13 @@ Reads bytes from a buffer at the specified address and returns them as a Python 
 
 ### Memory Registration
 
+#### enable_memory_registration_reuse()
+
+Enables {ref}`registration reuse <memory-registration-reuse>` on a classic
+engine. Call before sharing the engine with Store, not concurrently with
+memory registration.
+Returns `0` on success, a negative error code otherwise.
+
 #### register_memory()
 
 ```python
@@ -629,6 +656,33 @@ Unregisters multiple previously registered memory regions in a single batch oper
 **Returns:**
 - `int`: 0 on success, negative value on failure
 
+### Ascend Direct Peers
+
+#### disconnect_all_peers()
+
+```python
+disconnect_all_peers()
+```
+
+Disconnects every peer recorded by the Ascend Direct transport. The call
+waits until transfers that have already started finish, including
+synchronous transfers, asynchronous transfers that are still being
+polled, and same-host device copies that have already been submitted.
+A transfer submitted while the disconnect is in progress fails
+instead of starting, and the process keeps running. After the call
+returns, new transfers can connect to peers again.
+
+This method is available only when Mooncake is built with Ascend Direct
+transport. It returns -1 when the engine is not initialized, the Ascend
+transport is not installed, or the build does not include that transport.
+
+A peer that is already disconnected is removed and counts as success. If
+disconnecting any other peer fails, that peer stays recorded and the call
+returns -1. An empty peer table returns 0.
+
+**Returns:**
+- `int`: 0 when every recorded peer is removed, -1 on failure.
+
 ### Topology and Notification
 
 #### get_local_topology()
@@ -684,7 +738,7 @@ The Transfer Engine respects the following environment variables:
 - `MC_LEGACY_RPC_PORT_BINDING`: Enables legacy RPC port binding behavior
 - `MC_TCP_BIND_ADDRESS`: Specifies the TCP bind address
 - `MC_RDMA_BIND_ADDRESS`: Specifies the RDMA bind address for NIC path construction in dual-NIC environments. When set, RDMA NIC paths use this address while TCP handshake uses the address from `local_hostname`. This is useful when TCP and RDMA traffic use separate network interfaces (e.g., `eth0` for TCP and `rdma-net1` for RDMA).
-- `MC_CUSTOM_TOPO_JSON`: Path to custom topology JSON file (classic NIC priority matrix, or under TENT also native `nics`/`mems` JSON). Honored by classic Transfer Engine and by TENT when `MC_USE_TENT=1` (maps to `topology/custom_json_path`). For TENT, prefer inlining `topology/priority_matrix` in `MC_TENT_CONF` when possible; see the {ref}`TENT C++ API <custom-nic-priority-matrix>`.
+- `MC_CUSTOM_TOPO_JSON`: Path to custom topology JSON file (classic NIC priority matrix, or under TENT also native `nics`/`mems` JSON). Honored by classic Transfer Engine and by TENT when `MC_USE_TENT=1` (maps to `topology/custom_json_path`). For TENT, prefer inlining `topology/priority_matrix` in `MC_TENT_CONF` when possible; see the {ref}`TENT C++ API <custom-nic-priority-matrix>`. In classic Transfer Engine, a non-empty `device_name` keeps only the listed devices from this JSON, and initialization fails if none of them is listed.
 - `MC_TE_FILTERS`: Optional comma-separated whitelist of IB device names (e.g. `mlx5_0,mlx5_2`) for legacy Transfer Engine topology discovery. When unset, all available devices are discovered.
 - `MC_TE_METRIC`: Enables metrics reporting (set to "1", "true", "yes", or "on"). **Note:** Not supported when using Transfer Engine TENT.
 - `MC_TE_METRIC_INTERVAL_SECONDS`: Sets metrics reporting interval in seconds

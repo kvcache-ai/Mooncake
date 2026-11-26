@@ -458,7 +458,7 @@ class LocalDiskUnmountInterleavingTest : public MasterServiceSSDTest {
    protected:
     static void DeregisterHalf(MasterService& service, const UUID& client_id) {
         std::unique_lock<std::shared_mutex> snapshot_lock(
-            MasterServiceTestPeer::SnapshotMutex(service));
+            MasterServiceTestPeer::MasterStateMutex(service));
         MasterServiceTestPeer::LocalSsdManager(service).UnregisterClient(
             client_id);
     }
@@ -484,7 +484,7 @@ TEST_F(LocalDiskUnmountInterleavingTest,
     DeregisterHalf(*service, leaving);
 
     // The interleaving under test: another store mounts and registers a
-    // replica before the sweep reaches its shard. Whether the client monitor
+    // replica before the sweep reaches its key. Whether the client monitor
     // has admitted `late` to the alive set yet does not matter to an
     // owner-targeted sweep -- while a liveness-complement sweep taken before
     // this mount would classify the replica stale and erase it, and with it
@@ -530,9 +530,9 @@ TEST_F(LocalDiskUnmountInterleavingTest,
 //      yields a single nullopt entry and the loop body is skipped for it.
 //
 // In both cases the caller's `if (result)` branch fired and executed
-// inc_refcnt() + offloading_tasks.emplace() for work that was never submitted,
-// leaking the source replica's refcount until the 600s TTL reaper cleared the
-// phantom task. The fix returns UNABLE_OFFLOADING from both paths.
+// inc_refcnt() and recorded an offloading task for work that was never
+// submitted, leaking the source replica's refcount until the 600s TTL reaper
+// cleared the phantom task. The fix returns UNABLE_OFFLOADING from both paths.
 //
 // These two states cannot arise from the public PutStart/PutEnd path — that
 // path always produces a MEMORY replica with a valid buffer, whose

@@ -1865,6 +1865,55 @@ TEST(TcpWriteVisibilityTest, V2ReadRoundTripAndRejectedRead) {
     EXPECT_EQ(runOne(h.engine.get(), r), TransferStatusEnum::COMPLETED);
 }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+TEST(TcpWriteVisibilityTest,
+     ExplicitProtocolRoutingFailureLeavesBatchReusable) {
+    ScopedEnvVar tcp_version("MC_TCP_PROTO", "2");
+    ScopedEnvVar connection_pool("MC_TCP_ENABLE_CONNECTION_POOL", "1");
+    EngineHandle receiver;
+    receiver.init(P2PHANDSHAKE, "127.0.0.1:0", kSmallLength * 2);
+    ASSERT_TRUE(receiver.ok);
+    EngineHandle sender;
+    sender.init(P2PHANDSHAKE, "127.0.0.1:0", kSmallLength * 2,
+                receiver.engine->getLocalIpAndPort());
+    ASSERT_TRUE(sender.ok);
+
+    auto* source = static_cast<char*>(sender.pool);
+    memset(source, 'a', kSmallLength);
+    memset(source + kSmallLength, 'b', kSmallLength);
+    std::vector requests{
+        makeWriteRequest(sender, kSmallLength),
+        makeWriteRequest(sender, kSmallLength,
+                         sender.remote_base + kSmallLength),
+    };
+    requests[1].source = source + kSmallLength;
+    requests[1].target_id = static_cast<Transport::SegmentID>(-1);
+
+    auto& engine = *sender.engine;
+    const auto batch = engine.allocateBatchID(requests.size());
+    ASSERT_NE(batch, INVALID_BATCH_ID);
+    std::string protocol = "tcp";
+    auto rejected = engine.mp_submitTransfer(batch, requests, protocol);
+    EXPECT_TRUE(rejected.IsInvalidArgument()) << rejected.ToString();
+
+    requests[1].target_id = sender.segment_id;
+    auto retry = engine.mp_submitTransfer(batch, requests, protocol);
+    if (!retry.ok()) (void)engine.freeBatchID(batch);
+    ASSERT_TRUE(retry.ok()) << retry.ToString();
+    ASSERT_TRUE(waitForBatchTerminal(&engine, batch, requests.size(),
+                                     std::chrono::seconds(5)));
+    for (size_t i = 0; i < requests.size(); ++i) {
+        TransferStatus status;
+        ASSERT_TRUE(engine.getTransferStatus(batch, i, status).ok());
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kSmallLength);
+    }
+    EXPECT_EQ(memcmp(receiver.pool, sender.pool, kSmallLength * 2), 0);
+    auto freed = engine.freeBatchID(batch);
+    EXPECT_TRUE(freed.ok() || freed.IsBatchCleanupDeferred());
+}
+#endif
+
 TEST(TcpWriteVisibilityTest, GroupedScatterReadWritePreservesEveryFragment) {
     EngineHandle h;
     h.init(P2PHANDSHAKE, "127.0.0.1:17941", 4ull << 20);
@@ -3990,7 +4039,10 @@ TEST(TcpWriteVisibilityTest,
     EXPECT_EQ(final_status, TransferStatusEnum::FAILED);
     expectEverySliceCompletedExactlyOnce(batch_id);
     EXPECT_EQ(session_dirty_terminal_count.load(std::memory_order_acquire), 1);
-    ASSERT_TRUE(h.engine->freeBatchID(batch_id).ok());
+    // The terminal io callback may still hold its BatchDesc pin; a deferred
+    // cleanup is a legal outcome here.
+    Status free_status = h.engine->freeBatchID(batch_id);
+    ASSERT_TRUE(free_status.ok() || free_status.IsBatchCleanupDeferred());
     fake_peer.release();
 }
 
@@ -4029,7 +4081,10 @@ TEST(TcpWriteVisibilityTest, WritePayloadNoProgressFailsWithinBoundedDeadline) {
     if (waitForTaskTerminal(h.engine.get(), batch_id,
                             std::chrono::seconds(5))) {
         expectEverySliceCompletedExactlyOnce(batch_id);
-        EXPECT_TRUE(h.engine->freeBatchID(batch_id).ok());
+        // The terminal io callback may still hold its BatchDesc pin; a
+        // deferred cleanup is a legal outcome here.
+        Status free_status = h.engine->freeBatchID(batch_id);
+        EXPECT_TRUE(free_status.ok() || free_status.IsBatchCleanupDeferred());
     } else {
         h.engine.reset();
         reclaimBatchDescAfterEngineShutdownForTest(batch_id);
@@ -4075,7 +4130,10 @@ TEST(TcpWriteVisibilityTest,
     if (waitForTaskTerminal(h.engine.get(), batch_id,
                             std::chrono::seconds(5))) {
         expectEverySliceCompletedExactlyOnce(batch_id);
-        EXPECT_TRUE(h.engine->freeBatchID(batch_id).ok());
+        // The terminal io callback may still hold its BatchDesc pin; a
+        // deferred cleanup is a legal outcome here.
+        Status free_status = h.engine->freeBatchID(batch_id);
+        EXPECT_TRUE(free_status.ok() || free_status.IsBatchCleanupDeferred());
     } else {
         h.engine.reset();
         reclaimBatchDescAfterEngineShutdownForTest(batch_id);

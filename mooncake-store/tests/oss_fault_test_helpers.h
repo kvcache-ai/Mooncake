@@ -136,6 +136,11 @@ class OssFaultHttpServer {
         return requests_;
     }
 
+    void SetResponse(const std::string& target, Response response) {
+        std::lock_guard lock(mutex_);
+        routes_.insert_or_assign(target, std::move(response));
+    }
+
    private:
     using Clock = std::chrono::steady_clock;
 
@@ -257,20 +262,31 @@ class OssFaultHttpServer {
             request_keys_.push_back(key);
         }
         condition_.notify_all();
-        const auto response = routes_.find(key);
-        if (response == routes_.end()) {
-            SetError("unexpected request target");
-            SendReply(client, Reply(404, "unknown").wire);
-        } else if (response->second.action == Response::Action::kReset) {
+        // Full targets distinguish snapshot generations; method routes allow
+        // HEAD to succeed before a subsequent GET observes a missing object.
+        Response response;
+        {
+            std::lock_guard lock(mutex_);
+            auto route = routes_.find(request.substr(0, second_space));
+            if (route == routes_.end()) route = routes_.find(target);
+            if (route == routes_.end()) route = routes_.find(key);
+            if (route == routes_.end()) {
+                if (error_.empty()) error_ = "unexpected request target";
+                response = Reply(404, "unknown");
+            } else {
+                response = route->second;
+            }
+        }
+        if (response.action == Response::Action::kReset) {
             linger reset{1, 0};
             if (setsockopt(client, SOL_SOCKET, SO_LINGER, &reset,
                            sizeof(reset)) != 0)
                 SetError("reset setup failed");
-        } else if (response->second.action == Response::Action::kStall) {
+        } else if (response.action == Response::Action::kStall) {
             StallUntilPeerCloses(client);
-        } else if (response->second.action != Response::Action::kGate ||
+        } else if (response.action != Response::Action::kGate ||
                    WaitForRelease()) {
-            SendReply(client, response->second.wire);
+            SendReply(client, response.wire);
         }
     }
 
@@ -299,7 +315,7 @@ class OssFaultHttpServer {
         }
     }
 
-    const std::map<std::string, Response> routes_;
+    std::map<std::string, Response> routes_;
     const bool concurrent_;
     int listen_fd_ = -1;
     uint16_t port_ = 0;

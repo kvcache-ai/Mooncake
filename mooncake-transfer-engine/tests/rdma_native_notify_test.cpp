@@ -279,7 +279,10 @@ class NativeNotifyTest : public ::testing::Test {
             std::this_thread::yield();
         } while (std::chrono::steady_clock::now() < deadline);
         ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
-        ASSERT_TRUE(sender_->freeBatchID(batch).ok());
+        // A completion callback may still be unwinding here; both results
+        // invalidate the batch.
+        const Status free_status = sender_->freeBatchID(batch);
+        ASSERT_TRUE(free_status.ok() || free_status.IsBatchCleanupDeferred());
         EXPECT_EQ(source_, target_);
     }
 };

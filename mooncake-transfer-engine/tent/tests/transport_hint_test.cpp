@@ -29,11 +29,73 @@
 #include <string>
 #include <vector>
 
+#ifdef USE_CUDA
+#include <cuda.h>
+#include <cuda_runtime.h>
+#endif
+
 #include "tent/common/config.h"
 #include "tent/common/types.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
+
+#ifdef TENT_TEST_CUDA_POINTER_QUERY
+namespace {
+thread_local CUdeviceptr watched_pointer = 0;
+thread_local int pointer_queries = 0;
+thread_local int queries_before_failure = 0;
+}  // namespace
+
+extern "C" CUresult __real_cuPointerGetAttributes(
+    unsigned int count, CUpointer_attribute* attributes, void** values,
+    CUdeviceptr ptr);
+
+extern "C" CUresult __wrap_cuPointerGetAttributes(
+    unsigned int count, CUpointer_attribute* attributes, void** values,
+    CUdeviceptr ptr) {
+    if (watched_pointer && ptr == watched_pointer &&
+        ++pointer_queries > queries_before_failure)
+        return CUDA_ERROR_INVALID_CONTEXT;
+    return __real_cuPointerGetAttributes(count, attributes, values, ptr);
+}
+#endif
+
+#ifdef TENT_TEST_PLATFORM_LOADER
+#include "tent/platform/cpu.h"
+
+namespace mooncake {
+namespace tent {
+namespace {
+std::atomic<bool> use_unknown_host_platform{false};
+
+class UnknownHostPlatform : public CpuPlatform {
+   public:
+    explicit UnknownHostPlatform(std::shared_ptr<Config> conf)
+        : CpuPlatform(std::move(conf)) {}
+    MemoryType getMemoryType(void*) override { return MTYPE_UNKNOWN; }
+    const std::vector<RangeLocation> getLocation(void* addr, size_t size,
+                                                 bool) override {
+        return {{(uint64_t)addr, size, kWildcardLocation}};
+    }
+};
+}  // namespace
+
+Platform& realPlatformLoader(std::shared_ptr<Config>) asm(
+    "__real_" TENT_TEST_PLATFORM_LOADER);
+Platform& wrappedPlatformLoader(std::shared_ptr<Config>) asm(
+    "__wrap_" TENT_TEST_PLATFORM_LOADER);
+
+Platform& wrappedPlatformLoader(std::shared_ptr<Config> conf) {
+    if (use_unknown_host_platform) {
+        static UnknownHostPlatform platform(conf);
+        return platform;
+    }
+    return realPlatformLoader(std::move(conf));
+}
+}  // namespace tent
+}  // namespace mooncake
+#endif
 
 namespace mooncake {
 namespace tent {
@@ -59,6 +121,8 @@ class FakeTransport : public Transport {
     }
 
     std::atomic<int> submit_calls{0};
+    int warmup_calls = 0;
+    int registration_calls = 0;
     std::vector<uint64_t> submitted_device_masks;
     std::vector<std::string> submitted_qp_pools;
     std::vector<size_t> submitted_request_counts;
@@ -108,6 +172,7 @@ class FakeTransport : public Transport {
     }
 
     Status addMemoryBuffer(BufferDesc& desc, const MemoryOptions&) override {
+        ++registration_calls;
         desc.transports.push_back(self_type_);
         return Status::OK();
     }
@@ -131,7 +196,10 @@ class FakeTransport : public Transport {
         std::free(addr);
         return Status::OK();
     }
-    bool warmupMemory(void*, size_t) override { return false; }
+    bool warmupMemory(void*, size_t) override {
+        ++warmup_calls;
+        return false;
+    }
     const char* getName() const override {
         return self_type_ == RDMA ? "<fake-rdma>" : "<fake-tcp>";
     }
@@ -184,6 +252,96 @@ Request makeLocalWriteRequest(uint8_t* buf, size_t len) {
     r.length = len;
     return r;
 }
+
+#ifdef TENT_TEST_PLATFORM_LOADER
+TEST(TransportRegistration, NonCudaUnknownHostMemoryKeepsLocationFallback) {
+    use_unknown_host_platform = true;
+    struct ResetPlatform {
+        ~ResetPlatform() { use_unknown_host_platform = false; }
+    } reset;
+    TransferEngineImpl engine(makeMinimalP2PConfig());
+    ASSERT_TRUE(engine.available());
+    std::shared_ptr<FakeTransport> rdma, tcp;
+    installFakeRdmaAndTcp(engine, rdma, tcp);
+    std::vector<char> host(4096);
+    auto& platform = Platform::getLoader();
+    ASSERT_EQ(MTYPE_UNKNOWN, platform.getMemoryType(host.data()));
+    const auto locations = platform.getLocation(host.data(), host.size());
+    ASSERT_EQ(1, locations.size());
+    EXPECT_EQ(kWildcardLocation, locations[0].location);
+    ASSERT_TRUE(engine.registerLocalMemory(host.data(), host.size()).ok());
+    EXPECT_EQ(1, rdma->warmup_calls);
+    EXPECT_EQ(1, tcp->warmup_calls);
+    EXPECT_EQ(1, rdma->registration_calls);
+    EXPECT_EQ(1, tcp->registration_calls);
+    EXPECT_TRUE(engine.unregisterLocalMemory(host.data(), host.size()).ok());
+}
+#endif
+
+#ifdef USE_CUDA
+TEST(TransportRegistration, ManagedMemoryNeverReachesWarmupOrRegistration) {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) GTEST_SKIP();
+    TransferEngineImpl engine(makeMinimalP2PConfig());
+    ASSERT_TRUE(engine.available());
+    std::shared_ptr<FakeTransport> rdma, tcp;
+    installFakeRdmaAndTcp(engine, rdma, tcp);
+    void* ptr = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMallocManaged(&ptr, 4096));
+    std::shared_ptr<void> allocation(ptr, [](void* p) { cudaFree(p); });
+    for (const char* location : {"*", "cpu:0", "cuda:0"}) {
+        MemoryOptions options;
+        options.location = location;
+        auto status = engine.registerLocalMemory({ptr}, {4096}, options);
+        EXPECT_TRUE(status.IsInvalidArgument());
+        EXPECT_NE(status.message().find("CUDA Managed memory"),
+                  std::string_view::npos);
+    }
+    auto status = engine.registerLocalMemory(nullptr, 4096);
+    EXPECT_TRUE(status.IsInvalidArgument());
+    EXPECT_NE(status.message().find("CUresult " +
+                                    std::to_string(CUDA_ERROR_INVALID_VALUE)),
+              std::string_view::npos);
+    std::vector<char> host(4096);
+#ifdef TENT_TEST_CUDA_POINTER_QUERY
+    watched_pointer = reinterpret_cast<CUdeviceptr>(host.data());
+    pointer_queries = queries_before_failure = 0;
+    status = engine.registerLocalMemory(host.data(), host.size());
+    watched_pointer = 0;
+    EXPECT_EQ(1, pointer_queries);
+    EXPECT_TRUE(status.IsInvalidArgument());
+    EXPECT_NE(status.message().find("CUresult " +
+                                    std::to_string(CUDA_ERROR_INVALID_CONTEXT)),
+              std::string_view::npos);
+#endif
+    EXPECT_EQ(0, rdma->warmup_calls);
+    EXPECT_EQ(0, tcp->warmup_calls);
+    EXPECT_EQ(0, rdma->registration_calls);
+    EXPECT_EQ(0, tcp->registration_calls);
+#ifdef TENT_TEST_CUDA_POINTER_QUERY
+    watched_pointer = reinterpret_cast<CUdeviceptr>(host.data());
+    pointer_queries = 0;
+    queries_before_failure = 1;
+#endif
+    status = engine.registerLocalMemory(host.data(), host.size());
+#ifdef TENT_TEST_CUDA_POINTER_QUERY
+    watched_pointer = 0;
+    EXPECT_EQ(1, pointer_queries);
+#endif
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_EQ(1, rdma->registration_calls);
+    EXPECT_EQ(1, tcp->registration_calls);
+    EXPECT_TRUE(engine.unregisterLocalMemory(host.data(), host.size()).ok());
+    void* device = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&device, 4096));
+    std::shared_ptr<void> device_allocation(device,
+                                            [](void* p) { cudaFree(p); });
+    ASSERT_TRUE(engine.registerLocalMemory(device, 4096).ok());
+    EXPECT_EQ(2, rdma->registration_calls);
+    EXPECT_EQ(2, tcp->registration_calls);
+    EXPECT_TRUE(engine.unregisterLocalMemory(device, 4096).ok());
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // 1. hint=RDMA / hint=TCP routing

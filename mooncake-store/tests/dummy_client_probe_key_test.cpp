@@ -42,6 +42,10 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::unregister_shm_buffer_internal>(&rc);
     server.register_handler<&RealClient::probeKey_internal>(&rc);
     server.register_handler<&RealClient::batchProbeKey_internal>(&rc);
+    server.register_handler<&RealClient::create_drain_job>(&rc);
+    server.register_handler<&RealClient::create_timed_drain_job>(&rc);
+    server.register_handler<&RealClient::query_drain_job>(&rc);
+    server.register_handler<&RealClient::cancel_drain_job>(&rc);
 }
 
 static constexpr size_t kMB = 1024ULL * 1024;
@@ -133,6 +137,32 @@ TEST_F(DummyClientProbeKeyTest, ProbeKeyOverRpcReportsExistence) {
         << "probeKey should report a missing key as 0, not an error";
 }
 
+TEST_F(DummyClientProbeKeyTest, TimedDrainJobOverRpcCanBeRetried) {
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+    PutData("timed_drain_dummy_key", std::string(1024, 'd'));
+    CreateDrainJobRequest request;
+    request.segments = {real_client_->get_hostname()};
+    auto job_id = dummy_client_->create_timed_drain_job(request, 250);
+    ASSERT_TRUE(job_id);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool timed_out = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto job = dummy_client_->query_drain_job(*job_id);
+        ASSERT_TRUE(job);
+        if (job->status == JobStatus::TIMED_OUT) {
+            timed_out = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(timed_out);
+    auto retry = dummy_client_->create_drain_job(request);
+    ASSERT_TRUE(retry);
+    EXPECT_NE(*retry, *job_id);
+    ASSERT_TRUE(dummy_client_->cancel_drain_job(*retry));
+}
+
 TEST_F(DummyClientProbeKeyTest, BatchProbeKeyOverRpcReportsExistence) {
     ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
 
@@ -148,6 +178,25 @@ TEST_F(DummyClientProbeKeyTest, BatchProbeKeyOverRpcReportsExistence) {
     EXPECT_EQ(results[0], 1) << key_a << " should exist";
     EXPECT_EQ(results[1], 0) << "missing key should be 0, not an error";
     EXPECT_EQ(results[2], 1) << key_b << " should exist";
+}
+
+TEST_F(DummyClientProbeKeyTest, LastHitOnlyPolicySurvivesBothRpcBoundaries) {
+    ASSERT_TRUE(SetupStack());
+    for (const auto &key : {"a", "b", "c"}) PutData(key, "state");
+    const GrantLeasePolicy policy{ProbeLeaseMode::LastHitOnly, 2};
+    EXPECT_EQ(dummy_client_->batchProbeKey({"a", "b", "c", "missing"}, policy),
+              (std::vector<int>{1, 1, 1, 0}));
+    EXPECT_EQ(dummy_client_->batchProbeKey({"a", "missing", "b", "c"}, policy),
+              (std::vector<int>{1, 0, 1, 1}));
+    EXPECT_EQ(real_client_->batchProbeKey({"a", "b", "b", "c"}, policy),
+              (std::vector<int>{1, 1, 1, 1}));
+    EXPECT_EQ(dummy_client_->batchProbeKey({"a", "b", "c"}),
+              (std::vector<int>{1, 1, 1}));
+    EXPECT_TRUE(dummy_client_->batchProbeKey({}, policy).empty());
+    const auto invalid = dummy_client_->batchProbeKey(
+        {"a", "b"}, {ProbeLeaseMode::LastHitOnly, 0});
+    ASSERT_EQ(invalid.size(), 2u);
+    for (int value : invalid) EXPECT_LT(value, 0);
 }
 
 }  // namespace testing

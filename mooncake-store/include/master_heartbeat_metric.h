@@ -23,12 +23,12 @@ class MasterHeartbeatMetric {
         : status_ok_("mooncake_client_master_heartbeat_status_ok",
                      "Last observed Master Ping status: 1 for OK, 0 for "
                      "NEED_REMOUNT; absent when unknown",
-                     EscapeLabels(labels)),
+                     labels),
           timestamp_seconds_(
               "mooncake_client_master_heartbeat_observation_timestamp_seconds",
               "Client Unix receive time of the same Master Ping observation "
               "in seconds; absent when unknown",
-              EscapeLabels(labels)) {}
+              labels) {}
 
     template <typename Fn>
     ErrorCode ObserveConnect(Fn&& connect) {
@@ -106,24 +106,6 @@ class MasterHeartbeatMetric {
     }
 
    private:
-    // The pinned YLT static-gauge serializer writes label values verbatim.
-    static std::map<std::string, std::string> EscapeLabels(
-        std::map<std::string, std::string> labels) {
-        for (auto& [name, value] : labels) {
-            std::string escaped;
-            for (char ch : value) {
-                if (ch == '\\' || ch == '"') escaped += '\\';
-                if (ch == '\n') {
-                    escaped += "\\n";
-                } else {
-                    escaped += ch;
-                }
-            }
-            value = std::move(escaped);
-        }
-        return labels;
-    }
-
     mutable std::mutex mutex_;
     uint64_t generation_ = 0;
     bool connected_ = false;

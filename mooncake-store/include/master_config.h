@@ -8,6 +8,7 @@
 
 #include "config/metrics_bootstrap_config.h"
 #include "config_helper.h"
+#include "ha/oplog/oplog_batch_config.h"
 #include "types.h"
 
 namespace mooncake {
@@ -96,6 +97,7 @@ struct MasterConfig {
     MetricsBootstrapConfig metrics;
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
+    uint32_t handler_worker_thread_num;
     std::string rpc_address;
     std::string rpc_interface;
     int32_t rpc_conn_timeout_seconds;
@@ -108,6 +110,7 @@ struct MasterConfig {
     double eviction_ratio;
     double eviction_high_watermark_ratio;
     double tenant_eviction_high_watermark_ratio;
+    uint32_t eviction_worker_threads = DEFAULT_EVICTION_WORKER_THREADS;
     double nof_eviction_ratio;
     double nof_eviction_high_watermark_ratio;
     int64_t client_active_ttl_sec;
@@ -120,15 +123,23 @@ struct MasterConfig {
     bool enable_offload;
     std::string ha_backend_type;
     std::string ha_backend_connstring;
+    uint32_t ha_redis_expected_replicas_per_shard = 0;
+    int64_t ha_leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     std::string etcd_endpoints;
+    int32_t etcd_max_send_message_bytes = 2 * 1024 * 1024;
 
     // OpLog store configuration
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
+    uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
+    uint64_t oplog_prune_chunk_batch_count = 10;
+    uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    uint32_t oplog_standby_max_batches_per_poll =
+        kDefaultOpLogStandbyMaxBatchesPerPoll;
     uint32_t batch_oplog_retry_timeout_sec = 180;
 
     std::string cluster_id;
@@ -161,24 +172,11 @@ struct MasterConfig {
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
 
-    bool enable_snapshot_restore;
-    bool enable_snapshot;
-    std::string snapshot_backup_dir;
     uint64_t snapshot_interval_seconds;
-    uint64_t snapshot_child_timeout_seconds;
-    uint32_t snapshot_retention_count;
 
     // Snapshot object store type: "local" or "s3", required when
-    // snapshot or restore is enabled
+    // batch OpLog snapshot is enabled
     std::string snapshot_object_store_type;
-
-    // Snapshot catalog store type: ""/"embedded" or "redis". Empty keeps the
-    // embedded catalog behavior. "payload" remains a deprecated alias.
-    std::string snapshot_catalog_store_type;
-
-    // Optional connection string for snapshot catalog store. When empty, the
-    // implementation may fall back to a backend-specific default.
-    std::string snapshot_catalog_store_connstring;
 
     // Task manager configuration
     uint32_t max_total_finished_tasks;
@@ -260,21 +258,31 @@ class MasterServiceSupervisorConfig {
     // Parameters with default values (optional parameters)
     double tenant_eviction_high_watermark_ratio =
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
+    uint32_t eviction_worker_threads = DEFAULT_EVICTION_WORKER_THREADS;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     std::string rpc_address = "0.0.0.0";
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
+    // 0 = as many as rpc_thread_num.
+    uint32_t handler_worker_thread_num = 0;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
+    uint32_t ha_redis_expected_replicas_per_shard = 0;
+    int64_t ha_leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     std::string etcd_endpoints = "0.0.0.0:2379";
     // OpLog store configuration
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
+    uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
+    uint64_t oplog_prune_chunk_batch_count = 10;
+    uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    uint32_t oplog_standby_max_batches_per_poll =
+        kDefaultOpLogStandbyMaxBatchesPerPoll;
     uint32_t batch_oplog_retry_timeout_sec = 180;
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -299,16 +307,8 @@ class MasterServiceSupervisorConfig {
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
     uint32_t max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS;
 
-    bool enable_snapshot_restore = false;
-    bool enable_snapshot = false;
-    std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
-    uint64_t snapshot_child_timeout_seconds =
-        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
-    uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
     std::string snapshot_object_store_type;
-    std::string snapshot_catalog_store_type;
-    std::string snapshot_catalog_store_connstring;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
@@ -364,6 +364,7 @@ class MasterServiceSupervisorConfig {
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
+        eviction_worker_threads = config.eviction_worker_threads;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -409,17 +410,27 @@ class MasterServiceSupervisorConfig {
         rpc_conn_timeout =
             std::chrono::seconds(config.rpc_conn_timeout_seconds);
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
+        handler_worker_thread_num = config.handler_worker_thread_num;
         ha_backend_type = config.ha_backend_type;
+        ha_leader_lease_ttl_sec = config.ha_leader_lease_ttl_sec;
         etcd_endpoints = config.etcd_endpoints;
+        ha_redis_expected_replicas_per_shard =
+            config.ha_redis_expected_replicas_per_shard;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
         enable_oplog = config.enable_oplog;
         weight_management_oplog_capability_confirmed =
             config.weight_management_oplog_capability_confirmed;
+        weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
+        oplog_prune_chunk_batch_count = config.oplog_prune_chunk_batch_count;
+        oplog_prune_max_batches_per_second =
+            config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
+        oplog_standby_max_batches_per_poll =
+            config.oplog_standby_max_batches_per_poll;
         batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
@@ -463,16 +474,8 @@ class MasterServiceSupervisorConfig {
         tenant_quota_connector_type = config.tenant_quota_connector_type;
         tenant_quota_connector_uri = config.tenant_quota_connector_uri;
 
-        enable_snapshot_restore = config.enable_snapshot_restore;
-        enable_snapshot = config.enable_snapshot;
-        snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
-        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
-        snapshot_retention_count = config.snapshot_retention_count;
         snapshot_object_store_type = config.snapshot_object_store_type;
-        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
-        snapshot_catalog_store_connstring =
-            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -564,6 +567,7 @@ class WrappedMasterServiceConfig {
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
     double tenant_eviction_high_watermark_ratio =
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
+    uint32_t eviction_worker_threads = DEFAULT_EVICTION_WORKER_THREADS;
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
@@ -603,13 +607,19 @@ class WrappedMasterServiceConfig {
     uint32_t kv_events_queue_capacity = 65536;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
+    uint32_t ha_redis_expected_replicas_per_shard = 0;
     // OpLog store configuration
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
+    uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
+    uint64_t oplog_prune_chunk_batch_count = 10;
+    uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    uint32_t oplog_standby_max_batches_per_poll =
+        kDefaultOpLogStandbyMaxBatchesPerPoll;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -624,16 +634,8 @@ class WrappedMasterServiceConfig {
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
 
-    bool enable_snapshot_restore = false;
-    bool enable_snapshot = false;
-    std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
-    uint64_t snapshot_child_timeout_seconds =
-        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
-    uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
     std::string snapshot_object_store_type;
-    std::string snapshot_catalog_store_type;
-    std::string snapshot_catalog_store_connstring;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -665,6 +667,7 @@ class WrappedMasterServiceConfig {
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
+        eviction_worker_threads = config.eviction_worker_threads;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -705,16 +708,24 @@ class WrappedMasterServiceConfig {
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
+        ha_redis_expected_replicas_per_shard =
+            config.ha_redis_expected_replicas_per_shard;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
         enable_oplog = config.enable_oplog;
         weight_management_oplog_capability_confirmed =
             config.weight_management_oplog_capability_confirmed;
+        weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
+        oplog_prune_chunk_batch_count = config.oplog_prune_chunk_batch_count;
+        oplog_prune_max_batches_per_second =
+            config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
+        oplog_standby_max_batches_per_poll =
+            config.oplog_standby_max_batches_per_poll;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -756,16 +767,8 @@ class WrappedMasterServiceConfig {
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
-        enable_snapshot_restore = config.enable_snapshot_restore;
-        enable_snapshot = config.enable_snapshot;
-        snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
-        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
-        snapshot_retention_count = config.snapshot_retention_count;
         snapshot_object_store_type = config.snapshot_object_store_type;
-        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
-        snapshot_catalog_store_connstring =
-            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -797,6 +800,7 @@ class WrappedMasterServiceConfig {
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
+        eviction_worker_threads = config.eviction_worker_threads;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -838,16 +842,24 @@ class WrappedMasterServiceConfig {
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
+        ha_redis_expected_replicas_per_shard =
+            config.ha_redis_expected_replicas_per_shard;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
         enable_oplog = config.enable_oplog;
         weight_management_oplog_capability_confirmed =
             config.weight_management_oplog_capability_confirmed;
+        weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
+        oplog_prune_chunk_batch_count = config.oplog_prune_chunk_batch_count;
+        oplog_prune_max_batches_per_second =
+            config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
+        oplog_standby_max_batches_per_poll =
+            config.oplog_standby_max_batches_per_poll;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -861,16 +873,8 @@ class WrappedMasterServiceConfig {
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
-        enable_snapshot = config.enable_snapshot;
-        enable_snapshot_restore = config.enable_snapshot_restore;
-        snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
-        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
-        snapshot_retention_count = config.snapshot_retention_count;
         snapshot_object_store_type = config.snapshot_object_store_type;
-        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
-        snapshot_catalog_store_connstring =
-            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -900,6 +904,7 @@ class MasterServiceConfigBuilder {
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
     double tenant_eviction_high_watermark_ratio_ =
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
+    uint32_t eviction_worker_threads_ = DEFAULT_EVICTION_WORKER_THREADS;
     double nof_eviction_ratio_ = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio_ =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
@@ -916,13 +921,21 @@ class MasterServiceConfigBuilder {
     bool enable_offload_ = false;
     std::string ha_backend_type_ = "etcd";
     std::string ha_backend_connstring_;
+    uint32_t ha_redis_expected_replicas_per_shard_ = 0;
     // OpLog store configuration
     bool enable_oplog_ = false;
     bool weight_management_oplog_capability_confirmed_ = false;
+    uint64_t weight_import_idle_timeout_ms_ = 5 * 60 * 1000;
     bool enable_oplog_snapshot_ = false;
     uint64_t snapshot_chunk_object_count_ = 1000000;
+    uint64_t oplog_prune_chunk_batch_count_ = 10;
+    uint64_t oplog_prune_max_batches_per_second_ = 50;
     int oplog_poll_interval_ms_ = 1000;
     uint32_t oplog_batch_max_entries_ = 1024;
+    uint32_t oplog_standby_max_batches_per_poll_ =
+        kDefaultOpLogStandbyMaxBatchesPerPoll;
+    uint64_t restore_repair_durable_timeout_ms_ =
+        DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -936,16 +949,8 @@ class MasterServiceConfigBuilder {
     std::string tenant_quota_connector_uri_;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
-    bool enable_snapshot_restore_ = false;
-    bool enable_snapshot_ = false;
-    std::string snapshot_backup_dir_ = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
-    uint64_t snapshot_child_timeout_seconds_ =
-        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
-    uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
     std::string snapshot_object_store_type_;
-    std::string snapshot_catalog_store_type_;
-    std::string snapshot_catalog_store_connstring_;
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -995,6 +1000,11 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_tenant_eviction_high_watermark_ratio(
         double ratio) {
         tenant_eviction_high_watermark_ratio_ = ratio;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_eviction_worker_threads(uint32_t threads) {
+        eviction_worker_threads_ = threads;
         return *this;
     }
 
@@ -1064,9 +1074,21 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_ha_redis_expected_replicas_per_shard(
+        uint32_t replicas) {
+        ha_redis_expected_replicas_per_shard_ = replicas;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_ha_backend_connstring(
         const std::string& connstring) {
         ha_backend_connstring_ = connstring;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_weight_import_idle_timeout_ms(
+        uint64_t timeout_ms) {
+        weight_import_idle_timeout_ms_ = timeout_ms;
         return *this;
     }
 
@@ -1092,6 +1114,18 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_oplog_prune_chunk_batch_count(
+        uint64_t count) {
+        oplog_prune_chunk_batch_count_ = count;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_prune_max_batches_per_second(
+        uint64_t rate) {
+        oplog_prune_max_batches_per_second_ = rate;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_oplog_poll_interval_ms(int interval_ms) {
         oplog_poll_interval_ms_ = interval_ms;
         return *this;
@@ -1099,6 +1133,18 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_oplog_batch_max_entries(uint32_t entries) {
         oplog_batch_max_entries_ = entries;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_standby_max_batches_per_poll(
+        uint32_t batches) {
+        oplog_standby_max_batches_per_poll_ = batches;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_restore_repair_durable_timeout_ms(
+        uint64_t timeout_ms) {
+        restore_repair_durable_timeout_ms_ = timeout_ms;
         return *this;
     }
 
@@ -1159,36 +1205,9 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
-    MasterServiceConfigBuilder& set_enable_snapshot_restore(bool enable) {
-        enable_snapshot_restore_ = enable;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_enable_snapshot(bool enable) {
-        enable_snapshot_ = enable;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_backup_dir(
-        const std::string& dir) {
-        snapshot_backup_dir_ = dir;
-        return *this;
-    }
-
     MasterServiceConfigBuilder& set_snapshot_interval_seconds(
         uint64_t seconds) {
         snapshot_interval_seconds_ = seconds;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_child_timeout_seconds(
-        uint64_t seconds) {
-        snapshot_child_timeout_seconds_ = seconds;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_retention_count(uint32_t count) {
-        snapshot_retention_count_ = count;
         return *this;
     }
 
@@ -1196,39 +1215,6 @@ class MasterServiceConfigBuilder {
         const std::string& type) {
         snapshot_object_store_type_ = type;
         return *this;
-    }
-
-    // Deprecated compatibility shims for older tests and call sites.
-    MasterServiceConfigBuilder& set_snapshot_payload_store_type(
-        const std::string& type) {
-        return set_snapshot_object_store_type(type);
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_payload_backend_type(
-        const std::string& type) {
-        return set_snapshot_object_store_type(type);
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_catalog_store_type(
-        const std::string& type) {
-        snapshot_catalog_store_type_ = type;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_catalog_backend_type(
-        const std::string& type) {
-        return set_snapshot_catalog_store_type(type);
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_catalog_store_connstring(
-        const std::string& connstring) {
-        snapshot_catalog_store_connstring_ = connstring;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_catalog_backend_connstring(
-        const std::string& connstring) {
-        return set_snapshot_catalog_store_connstring(connstring);
     }
 
     MasterServiceConfigBuilder& set_max_total_finished_tasks(
@@ -1295,6 +1281,11 @@ struct TaskManagerConfig {
 
 class MasterServiceConfig {
    public:
+    // Parallel eviction workers. Callbacks that do not support concurrent
+    // execution stay serial. Default 0 = ceil(filed keys / 16M), clamped
+    // to [1, 64] each round; explicit counts [1, 64] override automatic sizing.
+    // Set from the master's -eviction_worker_threads flag or config key.
+    uint32_t eviction_worker_threads = DEFAULT_EVICTION_WORKER_THREADS;
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
@@ -1346,13 +1337,21 @@ class MasterServiceConfig {
     uint32_t kv_events_queue_capacity = 65536;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
+    uint32_t ha_redis_expected_replicas_per_shard = 0;
     // OpLog store configuration
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
+    uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
+    uint64_t oplog_prune_chunk_batch_count = 10;
+    uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    uint32_t oplog_standby_max_batches_per_poll =
+        kDefaultOpLogStandbyMaxBatchesPerPoll;
+    uint64_t restore_repair_durable_timeout_ms =
+        DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -1367,16 +1366,8 @@ class MasterServiceConfig {
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
 
-    bool enable_snapshot_restore = false;
-    bool enable_snapshot = false;
-    std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
-    uint64_t snapshot_child_timeout_seconds =
-        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
-    uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
     std::string snapshot_object_store_type;
-    std::string snapshot_catalog_store_type;
-    std::string snapshot_catalog_store_connstring;
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
@@ -1404,6 +1395,7 @@ class MasterServiceConfig {
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         tenant_eviction_high_watermark_ratio =
             config.tenant_eviction_high_watermark_ratio;
+        eviction_worker_threads = config.eviction_worker_threads;
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
@@ -1444,14 +1436,22 @@ class MasterServiceConfig {
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
+        ha_redis_expected_replicas_per_shard =
+            config.ha_redis_expected_replicas_per_shard;
         ha_backend_connstring = config.ha_backend_connstring;
         enable_oplog = config.enable_oplog;
         weight_management_oplog_capability_confirmed =
             config.weight_management_oplog_capability_confirmed;
+        weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
+        oplog_prune_chunk_batch_count = config.oplog_prune_chunk_batch_count;
+        oplog_prune_max_batches_per_second =
+            config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
+        oplog_standby_max_batches_per_poll =
+            config.oplog_standby_max_batches_per_poll;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -1466,16 +1466,8 @@ class MasterServiceConfig {
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
-        enable_snapshot_restore = config.enable_snapshot_restore;
-        enable_snapshot = config.enable_snapshot;
-        snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
-        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
-        snapshot_retention_count = config.snapshot_retention_count;
         snapshot_object_store_type = config.snapshot_object_store_type;
-        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
-        snapshot_catalog_store_connstring =
-            config.snapshot_catalog_store_connstring;
 
         task_manager_config.max_total_finished_tasks =
             config.max_total_finished_tasks;
@@ -1515,6 +1507,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
     config.tenant_eviction_high_watermark_ratio =
         tenant_eviction_high_watermark_ratio_;
+    config.eviction_worker_threads = eviction_worker_threads_;
     config.nof_eviction_ratio = nof_eviction_ratio_;
     config.nof_eviction_high_watermark_ratio =
         nof_eviction_high_watermark_ratio_;
@@ -1528,13 +1521,23 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_offload = enable_offload_;
     config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
+    config.ha_redis_expected_replicas_per_shard =
+        ha_redis_expected_replicas_per_shard_;
     config.enable_oplog = enable_oplog_;
     config.weight_management_oplog_capability_confirmed =
         weight_management_oplog_capability_confirmed_;
+    config.weight_import_idle_timeout_ms = weight_import_idle_timeout_ms_;
     config.enable_oplog_snapshot = enable_oplog_snapshot_;
     config.snapshot_chunk_object_count = snapshot_chunk_object_count_;
+    config.oplog_prune_chunk_batch_count = oplog_prune_chunk_batch_count_;
+    config.oplog_prune_max_batches_per_second =
+        oplog_prune_max_batches_per_second_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
     config.oplog_batch_max_entries = oplog_batch_max_entries_;
+    config.oplog_standby_max_batches_per_poll =
+        oplog_standby_max_batches_per_poll_;
+    config.restore_repair_durable_timeout_ms =
+        restore_repair_durable_timeout_ms_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;
@@ -1547,16 +1550,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_multi_tenants = enable_multi_tenants_;
     config.tenant_quota_connector_type = tenant_quota_connector_type_;
     config.tenant_quota_connector_uri = tenant_quota_connector_uri_;
-    config.enable_snapshot_restore = enable_snapshot_restore_;
-    config.enable_snapshot = enable_snapshot_;
-    config.snapshot_backup_dir = snapshot_backup_dir_;
     config.snapshot_interval_seconds = snapshot_interval_seconds_;
-    config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;
-    config.snapshot_retention_count = snapshot_retention_count_;
     config.snapshot_object_store_type = snapshot_object_store_type_;
-    config.snapshot_catalog_store_type = snapshot_catalog_store_type_;
-    config.snapshot_catalog_store_connstring =
-        snapshot_catalog_store_connstring_;
     config.task_manager_config.max_total_finished_tasks =
         max_total_finished_tasks_;
     config.task_manager_config.max_total_pending_tasks =
@@ -1593,6 +1588,8 @@ struct InProcMasterConfig {
     std::optional<std::string> root_fs_dir;
     std::optional<bool> enable_disk_eviction;
     std::optional<uint64_t> quota_bytes;
+    std::optional<bool> enable_multi_tenants;
+    std::optional<std::string> tenant_quota_connector_uri;
 };
 
 // Builder class for InProcMasterConfig
@@ -1610,6 +1607,8 @@ class InProcMasterConfigBuilder {
     std::optional<std::string> root_fs_dir_ = std::nullopt;
     std::optional<bool> enable_disk_eviction_ = std::nullopt;
     std::optional<uint64_t> quota_bytes_ = std::nullopt;
+    std::optional<bool> enable_multi_tenants_ = std::nullopt;
+    std::optional<std::string> tenant_quota_connector_uri_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -1678,6 +1677,17 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_enable_multi_tenants(bool enable) {
+        enable_multi_tenants_ = enable;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_tenant_quota_connector_uri(
+        const std::string& uri) {
+        tenant_quota_connector_uri_ = uri;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -1696,6 +1706,8 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.root_fs_dir = root_fs_dir_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    config.enable_multi_tenants = enable_multi_tenants_;
+    config.tenant_quota_connector_uri = tenant_quota_connector_uri_;
     return config;
 }
 

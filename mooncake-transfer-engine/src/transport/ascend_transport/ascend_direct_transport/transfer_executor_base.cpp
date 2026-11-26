@@ -16,15 +16,20 @@
 #include "transport/ascend_transport/ascend_direct_transport/transfer_executor_base.h"
 #include "transport/ascend_transport/ascend_direct_transport/async_transfer_executor.h"
 #include "transport/ascend_transport/ascend_direct_transport/local_copy_engine.h"
+#include "transport/ascend_transport/ascend_direct_transport/shared_host_mapper.h"
 #include "transport/ascend_transport/ascend_direct_transport/sync_transfer_executor.h"
 #include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
 #include <glog/logging.h>
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <numeric>
+#include <thread>
 #include <unistd.h>
 
 #include "common.h"
@@ -32,11 +37,30 @@
 #include "transfer_metadata.h"
 
 namespace mooncake {
+
+namespace {
+
+bool EnvFlagEnabled(const char* primary, const char* fallback = nullptr) {
+    const char* value = getEnvWithFallback(primary, fallback);
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    std::string text(value);
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return text == "1" || text == "true" || text == "yes" || text == "on";
+}
+
+}  // namespace
 namespace {
 constexpr const char* kAutoConnect = "AutoConnect";
 constexpr const char* kEnabled = "1";
 constexpr const char* kDisabled = "0";
 constexpr int32_t kTransferRetryTimes = 2;
+constexpr int kMaxAdxlInitAttempts = 4;
+// Bit 63 of transfer_lifecycle_state_. The low 63 bits are the active count.
+constexpr uint64_t kQuiescedBit = uint64_t{1} << 63;
+constexpr uint64_t kActiveSyncMask = kQuiescedBit - 1;
 
 void markSlicesFailed(const std::vector<Transport::Slice*>& slice_list) {
     for (auto* slice : slice_list) {
@@ -44,37 +68,37 @@ void markSlicesFailed(const std::vector<Transport::Slice*>& slice_list) {
     }
 }
 
-std::string EngineNameForDestAddr(
+std::set<size_t> EngineIndicesForDestAddr(
     const std::vector<TransferMetadata::BufferDesc>& buffers,
-    const std::vector<std::string>& endpoints, uint64_t dest_addr) {
-    // A single-engine TE (embedded/standalone) publishes one endpoint at
-    // index 0, while buffer device_id is the logical NPU id and is often
-    // >= 1. That id is not an engine index.
-    if (endpoints.size() == 1) {
-        return endpoints.front();
-    }
+    const std::vector<std::string>& endpoints, uint64_t dest_addr,
+    size_t length) {
+    std::set<size_t> candidates;
     for (const auto& buf : buffers) {
-        if (dest_addr < buf.addr || dest_addr - buf.addr >= buf.length) {
+        if (!bufferCoversRange(buf.addr, buf.length, dest_addr, length)) {
             continue;
         }
         if (buf.device_id < 0) {
             LOG(WARNING) << "Dest buffer at " << dest_addr
                          << " has device_id=" << buf.device_id
                          << ", falling back to " << endpoints.front();
-            return endpoints.front();
+            return {0};
         }
         const auto idx = static_cast<size_t>(buf.device_id);
         if (idx < endpoints.size()) {
-            return endpoints[idx];
+            candidates.insert(idx);
+            continue;
         }
         LOG(WARNING) << "Dest buffer device_id=" << buf.device_id
                      << " >= endpoint count " << endpoints.size()
                      << ", falling back to " << endpoints.front();
-        return endpoints.front();
+        return {0};
+    }
+    if (!candidates.empty()) {
+        return candidates;
     }
     LOG(WARNING) << "Dest addr " << dest_addr
                  << " matches no buffer, falling back to " << endpoints.front();
-    return endpoints.front();
+    return {0};
 }
 
 int CurrentEngineIndex(size_t engine_count, size_t& engine_idx) {
@@ -96,7 +120,9 @@ int CurrentEngineIndex(size_t engine_count, size_t& engine_idx) {
 TransferExecutorBase::TransferExecutorBase(const InitParams& params)
     : params_(params),
       local_engine_contexts_(params.local_engine_contexts),
-      metadata_(params.metadata) {}
+      metadata_(params.metadata) {
+    use_shmem_ = EnvFlagEnabled("MC_ASCEND_USE_SHMEM", "ASCEND_USE_SHMEM");
+}
 
 TransferExecutorBase::~TransferExecutorBase() = default;
 
@@ -111,7 +137,8 @@ std::unique_ptr<TransferExecutorBase> TransferExecutorBase::Create(
 }
 
 void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
-    char* connect_timeout_str = std::getenv("ASCEND_CONNECT_TIMEOUT");
+    const char* connect_timeout_str = getEnvWithFallback(
+        "MC_ASCEND_CONNECT_TIMEOUT", "ASCEND_CONNECT_TIMEOUT");
     if (connect_timeout_str) {
         auto connect_timeout = parseFromString<int32_t>(connect_timeout_str);
         if (connect_timeout.has_value()) {
@@ -119,7 +146,8 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
             LOG(INFO) << "Set connection timeout to:" << params.connect_timeout;
         }
     }
-    char* transfer_timeout_str = std::getenv("ASCEND_TRANSFER_TIMEOUT");
+    const char* transfer_timeout_str = getEnvWithFallback(
+        "MC_ASCEND_TRANSFER_TIMEOUT", "ASCEND_TRANSFER_TIMEOUT");
     if (transfer_timeout_str) {
         auto transfer_timeout = parseFromString<int32_t>(transfer_timeout_str);
         if (transfer_timeout.has_value()) {
@@ -127,7 +155,48 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
             LOG(INFO) << "Set transfer timeout to:" << params.transfer_timeout;
         }
     }
-    char* use_short_connection_str = std::getenv("ASCEND_USE_SHORT_CONNECTION");
+    // A transfer that hits the timeout above is retried, so the inner budget
+    // can be spent kTransferRetryTimes times. The Python wrapper returns once
+    // its own MC_TRANSFER_TIMEOUT elapses, so if that deadline does not cover
+    // every attempt it can return while a later attempt is still writing the
+    // target buffer and the caller cannot tell that it has to keep that buffer.
+    {
+        constexpr int64_t kMillisPerSecond = 1000;
+        constexpr int64_t kTransferTimeoutFloorSeconds = 5;
+        constexpr int64_t kDefaultTransferTimeoutSeconds = 30;
+        int64_t outer_timeout_sec = kDefaultTransferTimeoutSeconds;
+        if (char* outer_timeout_str = std::getenv("MC_TRANSFER_TIMEOUT")) {
+            // Mirrors how the Python wrapper reads this variable (parse then
+            // clamp to the floor), so the value compared here is the deadline
+            // that wrapper actually uses.
+            const int parsed = std::atoi(outer_timeout_str);
+            outer_timeout_sec = parsed > kTransferTimeoutFloorSeconds
+                                    ? parsed
+                                    : kTransferTimeoutFloorSeconds;
+        }
+        // int64 so a large ASCEND_TRANSFER_TIMEOUT cannot overflow the
+        // multiplication and wrap the bound negative.
+        const int64_t required_outer_timeout_sec =
+            (static_cast<int64_t>(kTransferRetryTimes) *
+                 params.transfer_timeout +
+             kMillisPerSecond - 1) /
+            kMillisPerSecond;
+        if (outer_timeout_sec <= required_outer_timeout_sec) {
+            LOG_FIRST_N(WARNING, 1)
+                << "MC_TRANSFER_TIMEOUT (" << outer_timeout_sec
+                << "s) does not cover the Ascend transfer budget: a transfer "
+                   "that hits ASCEND_TRANSFER_TIMEOUT ("
+                << params.transfer_timeout << "ms) is retried up to "
+                << kTransferRetryTimes
+                << " times, so the outer deadline must be greater than "
+                << required_outer_timeout_sec
+                << "s, or a batch transfer can return while the Ascend "
+                   "transport is still writing the target buffer. Raise "
+                   "MC_TRANSFER_TIMEOUT or lower ASCEND_TRANSFER_TIMEOUT.";
+        }
+    }
+    const char* use_short_connection_str = getEnvWithFallback(
+        "MC_ASCEND_USE_SHORT_CONNECTION", "ASCEND_USE_SHORT_CONNECTION");
     if (use_short_connection_str) {
         auto use_short_connection =
             parseFromString<int32_t>(use_short_connection_str);
@@ -138,20 +207,29 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
                       << params.use_short_connection;
         }
     }
-    char* use_async = std::getenv("ASCEND_USE_ASYNC_TRANSFER");
+    const char* use_async = getEnvWithFallback("MC_ASCEND_USE_ASYNC_TRANSFER",
+                                               "ASCEND_USE_ASYNC_TRANSFER");
     if (use_async) {
-        params.use_async_transfer = true;
+        std::string text(use_async);
+        std::transform(text.begin(), text.end(), text.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (text != "0" && text != "false" && text != "off" && text != "no") {
+            params.use_async_transfer = true;
+        }
     }
-    char* auto_connect = std::getenv("ASCEND_AUTO_CONNECT");
+    const char* auto_connect =
+        getEnvWithFallback("MC_ASCEND_AUTO_CONNECT", "ASCEND_AUTO_CONNECT");
     if (auto_connect) {
         auto auto_connect_opt = parseFromString<int32_t>(auto_connect);
         if (!auto_connect_opt.has_value()) {
-            LOG(WARNING) << "ASCEND_AUTO_CONNECT is not valid, value:"
+            LOG(WARNING) << "MC_ASCEND_AUTO_CONNECT/ASCEND_AUTO_CONNECT is not "
+                            "valid, value:"
                          << auto_connect << ", defaulting to disabled";
             params.auto_connect = false;
         } else {
             params.auto_connect = (*auto_connect_opt == 1);
-            LOG(INFO) << "Set auto_connect from ASCEND_AUTO_CONNECT to: "
+            LOG(INFO) << "Set auto_connect from "
+                         "MC_ASCEND_AUTO_CONNECT/ASCEND_AUTO_CONNECT to: "
                       << *auto_connect_opt;
         }
     } else if (adxl::IsAdxlFeatureSupported(adxl::AUTO_CONNECT)) {
@@ -160,7 +238,8 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
     }
     params.client_server_mode =
         adxl::IsAdxlFeatureSupported(adxl::CLIENT_SERVER_COMM);
-    char* buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
+    const char* buffer_pool =
+        getEnvWithFallback("MC_ASCEND_BUFFER_POOL", "ASCEND_BUFFER_POOL");
     if (buffer_pool && std::strcmp(buffer_pool, "0:0") != 0) {
         params.use_buffer_pool = true;
     }
@@ -171,14 +250,28 @@ int TransferExecutorBase::initEngines() {
         LOG(ERROR) << "Buffer pool mode does not support async transfer.";
         return -1;
     }
-    local_copy_engine_ = std::make_unique<LocalCopyEngine>();
-    if (!local_copy_engine_) {
-        return ERR_MEMORY;
+    if (params_.use_buffer_pool && params_.client_server_mode) {
+        LOG(ERROR) << "Client-Server mode only supports BufferPool=0:0, got "
+                   << "a nonzero ASCEND_BUFFER_POOL. Unset ASCEND_BUFFER_POOL "
+                   << "or disable Client-Server mode.";
+        return -1;
     }
-    int ret = local_copy_engine_->Initialize(params_.transfer_timeout);
-    if (ret != 0) {
-        LOG(ERROR) << "Failed to initialize LocalCopyEngine, ret: " << ret;
-        return ret;
+    local_copy_engines_.reserve(local_engine_contexts_.size());
+    for (const auto& context : local_engine_contexts_) {
+        auto engine = std::make_unique<LocalCopyEngine>();
+        int ret = engine->Initialize(context, params_.transfer_timeout,
+                                     local_engine_contexts_.size());
+        if (ret != 0) {
+            LOG(ERROR) << "Failed to initialize LocalCopyEngine, ret: " << ret;
+            return ret;
+        }
+        local_copy_engines_.push_back(std::move(engine));
+    }
+    // Whether a destination can be copied locally is decided per buffer, from
+    // the memfd handle in shm_name. Install the mapper for every non-fabric
+    // engine so that check can run; a buffer without a handle stays on adxl.
+    if (!params_.use_fabric_mem && use_shmem_) {
+        shared_host_mapper_ = std::make_unique<SharedHostMapper>();
     }
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
@@ -196,43 +289,38 @@ int TransferExecutorBase::initEngines() {
     }
 
     std::map<adxl::AscendString, adxl::AscendString> options;
-    char* rdma_tc = std::getenv("ASCEND_RDMA_TC");
+    const char* rdma_tc =
+        getEnvWithFallback("MC_ASCEND_RDMA_TC", "ASCEND_RDMA_TC");
+    if (!rdma_tc) {
+        rdma_tc = std::getenv("HCCL_RDMA_TC");
+    }
     if (rdma_tc) {
         options["adxl.RdmaTrafficClass"] = rdma_tc;
         LOG(INFO) << "Set RdmaTrafficClass to:" << rdma_tc;
-    } else {
-        rdma_tc = std::getenv("HCCL_RDMA_TC");
-        if (rdma_tc) {
-            options["adxl.RdmaTrafficClass"] = rdma_tc;
-            LOG(INFO) << "Set RdmaTrafficClass to:" << rdma_tc;
-        }
     }
-    char* rdma_sl = std::getenv("ASCEND_RDMA_SL");
+    const char* rdma_sl =
+        getEnvWithFallback("MC_ASCEND_RDMA_SL", "ASCEND_RDMA_SL");
+    if (!rdma_sl) {
+        rdma_sl = std::getenv("HCCL_RDMA_SL");
+    }
     if (rdma_sl) {
         options["adxl.RdmaServiceLevel"] = rdma_sl;
         LOG(INFO) << "Set RdmaServiceLevel to:" << rdma_sl;
-    } else {
-        rdma_sl = std::getenv("HCCL_RDMA_SL");
-        if (rdma_sl) {
-            options["adxl.RdmaServiceLevel"] = rdma_sl;
-            LOG(INFO) << "Set RdmaServiceLevel to:" << rdma_sl;
-        }
     }
-    char* local_comm_res = std::getenv("ASCEND_LOCAL_COMM_RES");
+    const char* local_comm_res =
+        getEnvWithFallback("MC_ASCEND_LOCAL_COMM_RES", "ASCEND_LOCAL_COMM_RES");
     if (local_comm_res) {
         options["adxl.LocalCommRes"] = local_comm_res;
         LOG(INFO) << "Set LocalCommRes to:" << local_comm_res;
     } else if (params_.client_server_mode) {
         options["adxl.LocalCommRes"] = R"({"version":"1.3"})";
-        LOG(INFO) << "Client-Server mode enabled, set LocalCommRes to "
-                     "{\"version\":\"1.3\"}";
     }
 
     options[kAutoConnect] = params_.auto_connect ? kEnabled : kDisabled;
-    LOG(INFO) << "Set AutoConnect to: " << (params_.auto_connect ? "1" : "0");
 
     options["adxl.BufferPool"] = "0:0";
-    char* buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
+    const char* buffer_pool =
+        getEnvWithFallback("MC_ASCEND_BUFFER_POOL", "ASCEND_BUFFER_POOL");
     if (buffer_pool) {
         options["adxl.BufferPool"] = buffer_pool;
         if (std::strcmp(buffer_pool, "0:0") != 0) {
@@ -251,9 +339,14 @@ int TransferExecutorBase::initEngines() {
 
     const char* store_te =
         globalConfig().ascend_store_te_init ? "true" : "false";
-    char* global_resource_config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+    const char* global_resource_config = getEnvWithFallback(
+        "MC_ASCEND_GLOBAL_RESOURCE_CONFIG", "ASCEND_GLOBAL_RESOURCE_CONFIG");
     std::string resolved_resource_config =
         ResolveAscendGlobalResourceConfig(global_resource_config);
+    // TE support for configuring HIXL's nic_topo_path from MC_CUSTOM_TOPO_JSON
+    // (if set). HIXL decides whether to consume it based on protocol_desc.
+    resolved_resource_config =
+        InjectNicTopoPathFromCustomTopoEnvTe(resolved_resource_config);
     if (!resolved_resource_config.empty()) {
         options["GlobalResourceConfig"] = resolved_resource_config.c_str();
         LOG(INFO) << "[AscendTE] init adxl, te is created for store="
@@ -268,31 +361,70 @@ int TransferExecutorBase::initEngines() {
         LOG(INFO) << "Use async transfer";
     }
 
-    const auto& endpoints = local_segment_desc->rank_info.endpoints;
+    auto& endpoints = local_segment_desc->rank_info.endpoints;
     for (size_t idx = 0; idx < endpoints.size(); ++idx) {
-        if (idx >= local_engine_contexts_.size()) {
-            LOG(ERROR) << "Endpoint count exceeds local_engine_contexts size, "
+        if (idx >= local_engine_contexts_.size() ||
+            idx >= params_.local_engine_device_ids.size()) {
+            LOG(ERROR) << "Endpoint count exceeds local engine state, "
                        << "idx: " << idx << ", endpoints: " << endpoints.size()
                        << ", local_engine_contexts: "
-                       << local_engine_contexts_.size();
+                       << local_engine_contexts_.size()
+                       << ", local_engine_device_ids: "
+                       << params_.local_engine_device_ids.size();
             return -1;
         }
         CHECK_ACL(aclrtSetCurrentContext(local_engine_contexts_[idx]));
-        const auto& adxl_engine_name = endpoints[idx];
-        auto engine = std::make_shared<adxl::AdxlEngine>();
-        if (!engine) {
-            return ERR_MEMORY;
+        int32_t physical_id = -1;
+        if (aclrtGetPhyDevIdByLogicDevId(params_.local_engine_device_ids[idx],
+                                         &physical_id) != ACL_ERROR_NONE) {
+            physical_id = -1;
+            LOG(WARNING) << "Cannot resolve physical device id for engine "
+                         << idx;
         }
-        auto status = engine->Initialize(adxl_engine_name.c_str(), options);
-        if (status != adxl::SUCCESS) {
-            LOG(ERROR) << "Failed to initialize AdxlEngine, status: " << status
-                       << ", errmsg: " << aclGetRecentErrMsg();
-            return -1;
+        local_engine_physical_ids_.push_back(physical_id);
+        std::vector<uint16_t> excluded_ports;
+        for (int attempt = 0; attempt < kMaxAdxlInitAttempts; ++attempt) {
+            if (attempt > 0) {
+                // The probe and ADXL's listener bind are separate operations.
+                // Retry with a fresh candidate if another initializer won that
+                // race after the probe released the port.
+                const auto port = FindAdxlListenPort(
+                    params_.base_port, params_.local_engine_device_ids[idx],
+                    excluded_ports);
+                if (port == 0) {
+                    LOG(ERROR) << "Find available port failed for device: "
+                               << params_.local_engine_device_ids[idx];
+                    return -1;
+                }
+                endpoints[idx] = GenAdxlEngineName(
+                    local_segment_desc->rank_info.hostIp, port);
+            }
+            const auto& adxl_engine_name = endpoints[idx];
+            auto engine = std::make_shared<adxl::AdxlEngine>();
+            if (!engine) {
+                return ERR_MEMORY;
+            }
+            auto status = engine->Initialize(adxl_engine_name.c_str(), options);
+            if (status == adxl::SUCCESS) {
+                params_.local_adxl_engine_names.push_back(adxl_engine_name);
+                adxl_engines_.emplace_back(std::move(engine));
+                LOG(INFO) << "Success to initialize adxl engine:"
+                          << adxl_engine_name << ", pid:" << getpid();
+                break;
+            }
+            const auto parsed_name = parseHostNameWithPort(adxl_engine_name);
+            excluded_ports.push_back(static_cast<uint16_t>(parsed_name.second));
+            if (attempt + 1 == kMaxAdxlInitAttempts) {
+                LOG(ERROR) << "Failed to initialize AdxlEngine after "
+                           << kMaxAdxlInitAttempts
+                           << " attempts, status: " << status
+                           << ", errmsg: " << aclGetRecentErrMsg();
+                return -1;
+            }
+            LOG(WARNING) << "ADXL initialization failed for "
+                         << adxl_engine_name << ", status: " << status
+                         << "; retrying with a different listen port";
         }
-        params_.local_adxl_engine_names.push_back(adxl_engine_name);
-        adxl_engines_.emplace_back(std::move(engine));
-        LOG(INFO) << "Success to initialize adxl engine:" << adxl_engine_name
-                  << ", pid:" << getpid();
     }
     return 0;
 }
@@ -303,10 +435,15 @@ void TransferExecutorBase::finalizeEngines() {
             engine->Finalize();
         }
     }
-    if (local_copy_engine_) {
-        local_copy_engine_->Finalize();
-        local_copy_engine_.reset();
+    for (auto& engine : local_copy_engines_) {
+        if (engine) {
+            engine->Finalize();
+        }
     }
+    local_copy_engines_.clear();
+    // Released after the copy engine, so no copy can still be reading through
+    // one of the imported mappings when it is unmapped.
+    shared_host_mapper_.reset();
 }
 
 int TransferExecutorBase::checkAndConnect(
@@ -401,6 +538,139 @@ int TransferExecutorBase::disconnect(size_t engine_idx,
     return 0;
 }
 
+bool TransferExecutorBase::beginSyncTransfer() {
+    uint64_t state = transfer_lifecycle_state_.load(std::memory_order_acquire);
+    while ((state & kQuiescedBit) == 0) {
+        if (transfer_lifecycle_state_.compare_exchange_weak(
+                state, state + 1, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void TransferExecutorBase::endSyncTransfer() {
+    const uint64_t previous =
+        transfer_lifecycle_state_.fetch_sub(1, std::memory_order_acq_rel);
+    // The common path is not quiesced. Notify only the disconnect call, and
+    // only once the last in-flight transfer has left. Taking the mutex here
+    // closes the gap between that call's predicate check and its wait.
+    if ((previous & kQuiescedBit) == 0 || (previous & kActiveSyncMask) != 1) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(transfer_lifecycle_cv_mutex_);
+    transfer_lifecycle_cv_.notify_one();
+}
+
+void TransferExecutorBase::quiesceSyncTransfers() {
+    uint64_t state = transfer_lifecycle_state_.load(std::memory_order_acquire);
+    while (!transfer_lifecycle_state_.compare_exchange_weak(
+        state, state | kQuiescedBit, std::memory_order_acq_rel,
+        std::memory_order_acquire)) {
+    }
+    std::unique_lock<std::mutex> lock(transfer_lifecycle_cv_mutex_);
+    transfer_lifecycle_cv_.wait(lock, [this] {
+        return (transfer_lifecycle_state_.load(std::memory_order_acquire) &
+                kActiveSyncMask) == 0;
+    });
+}
+
+void TransferExecutorBase::resumeSyncTransfers() {
+    transfer_lifecycle_state_.fetch_and(~kQuiescedBit,
+                                        std::memory_order_release);
+}
+
+void TransferExecutorBase::drainLocalCopies() {
+    // Device copies keep running until Poll() sees their completion flags or
+    // their deadline. New copies stay rejected while the quiesce bit is set.
+    while (true) {
+        bool pending = false;
+        for (const auto& engine : local_copy_engines_) {
+            if (engine && engine->HasPending()) {
+                pending = true;
+                break;
+            }
+        }
+        if (!pending) {
+            return;
+        }
+        pollLocalCopies();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+int TransferExecutorBase::disconnectAllPeers() {
+    // Held for the whole call. execute() and local Copy() are counted in
+    // transfer_lifecycle_state_ until they return. connection_mutex_ is
+    // taken only for the peer walk.
+    std::lock_guard<std::mutex> disconnect_all(disconnect_all_mutex_);
+
+    // The caller may keep using this thread after the call, and the next
+    // unregister saves whatever context it finds. Put the caller's context
+    // back even though Disconnect below binds each engine's own context.
+    aclrtContext saved_ctx = nullptr;
+    if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
+        saved_ctx = nullptr;
+    }
+    MAKE_GUARD(ctx_restore, [saved_ctx]() {
+        if (saved_ctx != nullptr) {
+            (void)aclrtSetCurrentContext(saved_ctx);
+        }
+    });
+
+    quiesceSyncTransfers();
+
+    // Query-thread Disconnect runs before active_async_tasks_ drops to 0, so
+    // this returns only after those Adxl calls have finished. Do not hold
+    // connection_mutex_ across the wait: the query thread needs it.
+    drainInFlightTransfers();
+    drainLocalCopies();
+
+    int result = 0;
+    {
+        std::lock_guard<std::mutex> lock(connection_mutex_);
+        for (auto engine_it = connected_segments_.begin();
+             engine_it != connected_segments_.end();) {
+            const size_t engine_idx = engine_it->first;
+            if (engine_idx >= adxl_engines_.size() ||
+                engine_idx >= local_engine_contexts_.size() ||
+                adxl_engines_[engine_idx] == nullptr) {
+                LOG(ERROR)
+                    << "disconnectAllPeers skipped invalid engine index: "
+                    << engine_idx;
+                result = -1;
+                ++engine_it;
+                continue;
+            }
+            (void)aclrtSetCurrentContext(local_engine_contexts_[engine_idx]);
+            auto& peers = engine_it->second;
+            for (auto peer_it = peers.begin(); peer_it != peers.end();) {
+                const auto status = adxl_engines_[engine_idx]->Disconnect(
+                    peer_it->c_str(), params_.connect_timeout);
+                if (status != adxl::SUCCESS && status != adxl::NOT_CONNECTED) {
+                    LOG(ERROR)
+                        << "Failed to disconnect AdxlEngine: " << *peer_it
+                        << ", status: " << status
+                        << ", errmsg: " << aclGetRecentErrMsg();
+                    result = -1;
+                    ++peer_it;
+                } else {
+                    peer_it = peers.erase(peer_it);
+                }
+            }
+            if (peers.empty()) {
+                engine_it = connected_segments_.erase(engine_it);
+            } else {
+                ++engine_it;
+            }
+        }
+    }
+
+    resumeSyncTransfers();
+    return result;
+}
+
 void TransferExecutorBase::disconnectAllForEngine(size_t engine_idx) {
     if (engine_idx >= adxl_engines_.size() ||
         engine_idx >= local_engine_contexts_.size() ||
@@ -421,8 +691,7 @@ void TransferExecutorBase::disconnectAllForEngine(size_t engine_idx) {
                        << connected_segment
                        << ", errmsg: " << aclGetRecentErrMsg();
         } else {
-            LOG(INFO) << "Success to disconnect AdxlEngine:"
-                      << connected_segment;
+            VLOG(1) << "Success to disconnect AdxlEngine:" << connected_segment;
         }
     }
     connected_segments_.erase(it);
@@ -445,8 +714,8 @@ void TransferExecutorBase::cleanupConnections() {
                                << connected_segment
                                << ", errmsg: " << aclGetRecentErrMsg();
                 } else {
-                    LOG(INFO) << "Success to disconnect AdxlEngine:"
-                              << connected_segment;
+                    VLOG(1) << "Success to disconnect AdxlEngine:"
+                            << connected_segment;
                 }
             }
         }
@@ -455,29 +724,41 @@ void TransferExecutorBase::cleanupConnections() {
 }
 
 void TransferExecutorBase::rollbackRegisteredMem(
-    const std::vector<EngineMemHandle>& registered_mem_handles) {
+    void* addr, const std::vector<EngineMemHandle>& registered_mem_handles) {
+    std::vector<EngineMemHandle> retained_handles;
     for (const auto& [engine_idx, mem_handle] : registered_mem_handles) {
         if (engine_idx >= adxl_engines_.size() ||
             engine_idx >= local_engine_contexts_.size()) {
+            retained_handles.emplace_back(engine_idx, mem_handle);
             continue;
         }
         if (aclrtSetCurrentContext(local_engine_contexts_[engine_idx]) !=
             ACL_ERROR_NONE) {
             LOG(ERROR) << "Failed to restore context for rollback, engine_idx: "
                        << engine_idx << ", errmsg: " << aclGetRecentErrMsg();
+            retained_handles.emplace_back(engine_idx, mem_handle);
             continue;
         }
         auto status = adxl_engines_[engine_idx]->DeregisterMem(mem_handle);
         if (status != adxl::SUCCESS) {
             LOG(ERROR) << "Rollback deregister failed, engine_idx: "
                        << engine_idx << ", errmsg: " << aclGetRecentErrMsg();
+            retained_handles.emplace_back(engine_idx, mem_handle);
         }
+    }
+    if (!retained_handles.empty()) {
+        std::lock_guard<std::mutex> lock(mem_handle_mutex_);
+        auto& entry = addr_to_mem_handles_[addr];
+        entry.insert(entry.end(), retained_handles.begin(),
+                     retained_handles.end());
     }
 }
 
 int TransferExecutorBase::registerMem(void* addr, size_t length,
                                       adxl::MemType mem_type,
-                                      bool use_buffer_pool) {
+                                      bool use_buffer_pool,
+                                      bool remote_accessible,
+                                      bool all_engines) {
     if (mem_type == adxl::MEM_HOST && use_buffer_pool) {
         LOG(INFO) << "Ignore register host mem:" << addr
                   << " when buffer pool is enabled.";
@@ -485,6 +766,19 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
     }
     if (adxl_engines_.empty()) {
         LOG(ERROR) << "Adxl engine is not available.";
+        return -1;
+    }
+
+    bool has_retained = false;
+    {
+        std::lock_guard<std::mutex> lock(mem_handle_mutex_);
+        has_retained =
+            addr_to_mem_handles_.find(addr) != addr_to_mem_handles_.end();
+    }
+    if (has_retained && deregisterMem(addr) != 0) {
+        LOG(ERROR) << "Failed to clean up retained handles before "
+                      "re-registering addr: "
+                   << addr;
         return -1;
     }
 
@@ -503,10 +797,17 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
         return -1;
     }
     engine_indices = {engine_idx};
+    if (all_engines) {
+        engine_indices.resize(adxl_engines_.size());
+        std::iota(engine_indices.begin(), engine_indices.end(), 0);
+    }
 
     adxl::MemDesc mem_desc{};
     mem_desc.addr = reinterpret_cast<uintptr_t>(addr);
     mem_desc.len = length;
+    // HIXL MemDesc.local_only is the inverse of TransferEngine
+    // remote_accessible.
+    mem_desc.local_only = !remote_accessible;
 
     std::vector<EngineMemHandle> registered_mem_handles;
     registered_mem_handles.reserve(engine_indices.size());
@@ -514,7 +815,7 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
         if (engine_idx >= local_engine_contexts_.size()) {
             LOG(ERROR) << "Engine idx " << engine_idx
                        << " exceeds local_engine_contexts size";
-            rollbackRegisteredMem(registered_mem_handles);
+            rollbackRegisteredMem(addr, registered_mem_handles);
             return -1;
         }
         auto ctx_ret =
@@ -522,7 +823,7 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
         if (ctx_ret != ACL_ERROR_NONE) {
             LOG(ERROR) << "aclrtSetCurrentContext failed, engine_idx: "
                        << engine_idx << ", errmsg: " << aclGetRecentErrMsg();
-            rollbackRegisteredMem(registered_mem_handles);
+            rollbackRegisteredMem(addr, registered_mem_handles);
             return -1;
         }
         adxl::MemHandle mem_handle = nullptr;
@@ -533,13 +834,14 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
                        << ", length: " << length
                        << ", engine index: " << engine_idx
                        << ", errmsg: " << aclGetRecentErrMsg();
-            rollbackRegisteredMem(registered_mem_handles);
+            rollbackRegisteredMem(addr, registered_mem_handles);
             return -1;
         }
         registered_mem_handles.emplace_back(engine_idx, mem_handle);
         LOG(INFO) << "TransferExecutor register mem addr:" << addr
                   << ", length:" << length << ", mem type:"
                   << (mem_type == adxl::MEM_HOST ? "host" : "device")
+                  << ", local_only:" << mem_desc.local_only
                   << ", engine index:" << engine_idx;
     }
     std::lock_guard<std::mutex> lock(mem_handle_mutex_);
@@ -548,14 +850,22 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
 }
 
 int TransferExecutorBase::deregisterMem(void* addr) {
+    // A caller tearing the client down may hold no context at all; each handle
+    // is deregistered under the engine context it was registered with below, so
+    // the only thing a missing context costs is having nothing to restore.
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtGetCurrentContext failed, errmsg: "
-                   << aclGetRecentErrMsg();
-        return -1;
+        LOG_FIRST_N(WARNING, 1)
+            << "aclrtGetCurrentContext failed while deregistering memory (no "
+               "ACL context on this thread), errmsg: "
+            << aclGetRecentErrMsg();
+        saved_ctx = nullptr;
     }
-    MAKE_GUARD(ctx_restore,
-               [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
+    MAKE_GUARD(ctx_restore, [saved_ctx]() {
+        if (saved_ctx != nullptr) {
+            (void)aclrtSetCurrentContext(saved_ctx);
+        }
+    });
 
     std::lock_guard<std::mutex> lock(mem_handle_mutex_);
     auto it = addr_to_mem_handles_.find(addr);
@@ -573,8 +883,11 @@ int TransferExecutorBase::deregisterMem(void* addr) {
     }
 
     bool deregister_failed = false;
-    for (const auto& [engine_idx, mem_handle] : it->second) {
+    for (auto handle = it->second.begin(); handle != it->second.end();) {
+        const auto [engine_idx, mem_handle] = *handle;
         if (engine_idx >= local_engine_contexts_.size()) {
+            deregister_failed = true;
+            ++handle;
             continue;
         }
         CHECK_ACL(aclrtSetCurrentContext(local_engine_contexts_[engine_idx]));
@@ -584,6 +897,10 @@ int TransferExecutorBase::deregisterMem(void* addr) {
                        << ", status: " << status
                        << ", errmsg: " << aclGetRecentErrMsg();
             deregister_failed = true;
+            ++handle;
+        } else {
+            // A later retry must not deregister a successful handle twice.
+            handle = it->second.erase(handle);
         }
     }
     if (deregister_failed) {
@@ -595,16 +912,88 @@ int TransferExecutorBase::deregisterMem(void* addr) {
 
 std::string TransferExecutorBase::resolveTargetAdxlEngineName(
     const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
-    uint64_t dest_addr) const {
+    uint64_t dest_addr, size_t length, size_t local_engine_idx) const {
     const auto& endpoints = segment_desc->rank_info.endpoints;
     if (endpoints.empty()) return {};
-    return EngineNameForDestAddr(segment_desc->buffers, endpoints, dest_addr);
+    // A single-engine peer's logical device id need not be endpoint index 0.
+    if (endpoints.size() == 1) return endpoints.front();
+    const auto candidates = EngineIndicesForDestAddr(
+        segment_desc->buffers, endpoints, dest_addr, length);
+    if (candidates.size() == 1) return endpoints[*candidates.begin()];
+    if (local_engine_idx >= local_engine_physical_ids_.size()) return {};
+    const int32_t physical_id = local_engine_physical_ids_[local_engine_idx];
+    if (physical_id < 0) {
+        LOG(ERROR) << "Physical device id unavailable for multi-engine route";
+        return {};
+    }
+    const auto index =
+        ReverseDeviceIndex(static_cast<uint32_t>(physical_id),
+                           static_cast<uint32_t>(candidates.size()));
+    if (!index) return {};
+    const auto selected = *std::next(candidates.begin(), *index);
+    VLOG(1) << "ACL single-segment route physical=" << physical_id
+            << " S=" << candidates.size() << " index=" << *index
+            << " endpoint=" << endpoints[selected];
+    return endpoints[selected];
 }
 
-void TransferExecutorBase::processSliceList(
+bool TransferExecutorBase::resolveLocalCopyDestinations(
+    const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
+    const std::vector<Transport::Slice*>& slice_list,
+    std::vector<void*>& dest_addrs) {
+    if (!shared_host_mapper_ || slice_list.empty()) {
+        return false;
+    }
+    dest_addrs.clear();
+    dest_addrs.reserve(slice_list.size());
+    for (auto* slice : slice_list) {
+        void* local_addr = nullptr;
+        if (!shared_host_mapper_->Translate(segment_desc,
+                                            slice->ascend_direct.dest_addr,
+                                            slice->length, &local_addr)) {
+            size_t shm_buffers = 0;
+            for (const auto& buffer : segment_desc->buffers) {
+                if (!buffer.shm_name.empty()) {
+                    ++shm_buffers;
+                }
+            }
+            VLOG(1) << "classic local-copy miss target_segment="
+                    << slice->target_id
+                    << " dest=" << slice->ascend_direct.dest_addr
+                    << " len=" << slice->length
+                    << " buffers=" << segment_desc->buffers.size()
+                    << " shm_buffers=" << shm_buffers
+                    << " opcode=" << static_cast<int>(slice->opcode);
+            dest_addrs.clear();
+            return false;
+        }
+        dest_addrs.push_back(local_addr);
+    }
+    return true;
+}
+
+void TransferExecutorBase::setLocalCopyTaskRunner(
+    std::function<void(std::function<void()>)> runner) {
+    for (auto& engine : local_copy_engines_) {
+        if (engine) {
+            engine->SetTaskRunner(runner);
+        }
+    }
+}
+
+void TransferExecutorBase::pollLocalCopies() {
+    for (auto& engine : local_copy_engines_) {
+        if (engine) {
+            engine->Poll();
+        }
+    }
+}
+
+std::vector<std::vector<Transport::Slice*>>
+TransferExecutorBase::splitByTargetEngine(
     const std::vector<Transport::Slice*>& slice_list) {
     if (slice_list.empty()) {
-        return;
+        return {};
     }
     auto target_segment_desc =
         metadata_->getSegmentDescByID(slice_list[0]->target_id);
@@ -612,28 +1001,33 @@ void TransferExecutorBase::processSliceList(
         LOG(ERROR) << "Cannot find segment descriptor for target_id: "
                    << slice_list[0]->target_id;
         markSlicesFailed(slice_list);
-        return;
+        return {};
     }
 
     std::map<std::string, std::vector<Transport::Slice*>> groups;
     for (auto* slice : slice_list) {
-        groups[resolveTargetAdxlEngineName(target_segment_desc,
-                                           slice->ascend_direct.dest_addr)]
+        groups[resolveTargetAdxlEngineName(
+                   target_segment_desc, slice->ascend_direct.dest_addr,
+                   slice->length,
+                   params_.agent_mode ? slice->ascend_direct.engine_id : 0)]
             .push_back(slice);
     }
+    std::vector<std::vector<Transport::Slice*>> result;
+    result.reserve(groups.size());
     for (auto& [_, group] : groups) {
-        processHomogeneousSliceList(group);
+        result.push_back(std::move(group));
     }
+    return result;
 }
 
-void TransferExecutorBase::processHomogeneousSliceList(
+void TransferExecutorBase::processGroupedSliceList(
     const std::vector<Transport::Slice*>& slice_list) {
     if (slice_list.empty()) {
         return;
     }
     size_t local_engine_idx =
         params_.agent_mode ? slice_list[0]->ascend_direct.engine_id : 0;
-    VLOG(1) << "processSliceList for dev:" << local_engine_idx;
+    VLOG(1) << "processGroupedSliceList for dev:" << local_engine_idx;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     if (!local_segment_desc ||
         local_engine_idx >= local_segment_desc->rank_info.endpoints.size()) {
@@ -668,7 +1062,8 @@ void TransferExecutorBase::processHomogeneousSliceList(
             return;
         }
         target_adxl_engine_name = resolveTargetAdxlEngineName(
-            target_segment_desc, slice_list[0]->ascend_direct.dest_addr);
+            target_segment_desc, slice_list[0]->ascend_direct.dest_addr,
+            slice_list[0]->length, local_engine_idx);
         if (target_adxl_engine_name.empty()) {
             LOG(ERROR) << "Invalid local_engine_idx: " << local_engine_idx
                        << " target endpoint size:"
@@ -677,21 +1072,58 @@ void TransferExecutorBase::processHomogeneousSliceList(
             return;
         }
 
-        auto need_local_copy = !params_.use_fabric_mem &&
-                               (target_adxl_engine_name == local_engine_name);
-        if (need_local_copy && local_copy_engine_) {
+        // Two ways a transfer stays on this machine. The engine names matching
+        // means the target is this very process, so its addresses are already
+        // ours. Otherwise the target may still be a peer process here that
+        // shared its host segment, in which case the mapper gives us local
+        // addresses for the same physical pages. Either way we memcpy instead
+        // of going out through adxl.
+        std::vector<void*> local_dest_addrs;
+        bool need_local_copy =
+            !params_.use_fabric_mem &&
+            (target_adxl_engine_name == local_engine_name ||
+             resolveLocalCopyDestinations(target_segment_desc, slice_list,
+                                          local_dest_addrs));
+        auto* local_copy_engine =
+            local_engine_idx < local_copy_engines_.size()
+                ? local_copy_engines_[local_engine_idx].get()
+                : nullptr;
+        if (need_local_copy && local_copy_engine != nullptr) {
+            if (!beginSyncTransfer()) {
+                markSlicesFailed(slice_list);
+                return;
+            }
+            if (VLOG_IS_ON(1)) {
+                size_t copy_bytes = 0;
+                for (auto* slice : slice_list) {
+                    copy_bytes += slice->length;
+                }
+                VLOG(1) << "classic route local_copy=1 opcode="
+                        << static_cast<int>(slice_list[0]->opcode)
+                        << " slices=" << slice_list.size()
+                        << " bytes=" << copy_bytes
+                        << " target_engine=" << target_adxl_engine_name
+                        << " local_engine=" << local_engine_name;
+            }
             auto start = std::chrono::steady_clock::now();
-            local_copy_engine_->Copy(slice_list[0]->opcode, slice_list);
+            local_copy_engine->Copy(slice_list[0]->opcode, slice_list,
+                                    local_dest_addrs);
             VLOG(1) << "Local copy time: "
                     << std::chrono::duration_cast<std::chrono::microseconds>(
                            std::chrono::steady_clock::now() - start)
                            .count()
                     << "us";
+            endSyncTransfer();
             return;
         }
 
+        if (!beginSyncTransfer()) {
+            markSlicesFailed(slice_list);
+            return;
+        }
         result = execute(local_engine_idx, target_adxl_engine_name, operation,
                          slice_list);
+        endSyncTransfer();
         if (result.ret == 0 || !result.retryable ||
             retry + 1 >= kTransferRetryTimes) {
             break;

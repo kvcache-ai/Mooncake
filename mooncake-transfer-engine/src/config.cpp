@@ -63,6 +63,22 @@ bool parseBoolConfigEnv(const char* value, const char* env_name, bool& output) {
     return false;
 }
 
+// Parses an all|local NIC selection variable; an unset or invalid value
+// keeps the current setting.
+void parseNicSelectionEnv(const char* env_name, NicSelection& output) {
+    const char* value = std::getenv(env_name);
+    if (!value) return;
+    if (strcasecmp(value, "all") == 0) {
+        output = NicSelection::ALL;
+    } else if (strcasecmp(value, "local") == 0) {
+        output = NicSelection::LOCAL;
+    } else {
+        LOG(WARNING) << "Invalid " << env_name
+                     << " environment value: " << value
+                     << ", expected all|local, keeping default";
+    }
+}
+
 void parseNicPeerAffinity(
     const char* env,
     std::unordered_map<std::string, std::vector<std::string>>& affinity) {
@@ -105,7 +121,28 @@ void parseNicPeerAffinity(
 
 }  // namespace
 
+// Whether a GPU peer-memory kernel module is loaded: nvidia-peermem, or
+// nv_peer_mem from MLNX_OFED. ibv_reg_mr() on device memory needs one.
+static bool peerMemoryModuleLoaded() {
+    return std::filesystem::exists("/sys/module/nvidia_peermem") ||
+           std::filesystem::exists("/sys/module/nv_peer_mem");
+}
+
 void loadGlobalConfig(GlobalConfig& config) {
+    if (const char* value = std::getenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT");
+        value != nullptr && value[0] != '\0') {
+        parseBoolConfigEnv(value, "MC_ASCEND_STANDALONE_SINGLE_SEGMENT",
+                           config.ascend_standalone_single_segment);
+    } else if (const char* legacy =
+                   std::getenv("ASCEND_STANDALONE_SINGLE_SEGMENT")) {
+        parseBoolConfigEnv(legacy, "ASCEND_STANDALONE_SINGLE_SEGMENT",
+                           config.ascend_standalone_single_segment);
+    }
+    // Without a peer-memory module, ibv_reg_mr() fails with EFAULT at the
+    // first GPU buffer, so the dma_buf export is the default there;
+    // WITH_NVIDIA_PEERMEM below still decides when set.
+    config.with_nvidia_peermem = peerMemoryModuleLoaded();
+
     const char* num_cq_per_ctx_env = std::getenv("MC_NUM_CQ_PER_CTX");
     if (num_cq_per_ctx_env) {
         int val = atoi(num_cq_per_ctx_env);
@@ -183,9 +220,15 @@ void loadGlobalConfig(GlobalConfig& config) {
 
     const char* max_ep_per_ctx_env = std::getenv("MC_MAX_EP_PER_CTX");
     if (max_ep_per_ctx_env) {
-        size_t val = atoi(max_ep_per_ctx_env);
-        if (val > 0 && val <= UINT16_MAX)
-            config.max_ep_per_ctx = val;
+        // Ceiling is INT32_MAX, not UINT16_MAX: the field is an int whose
+        // default is already 65536, so a UINT16_MAX bound made the default
+        // value impossible to set explicitly.  The real RDMA constraint is
+        // enforced later against device_attr.max_qp; on EFA (SRD) this only
+        // sizes the AV table and the peer_map_ eviction cap, neither of which
+        // is 16-bit.
+        long long val = atoll(max_ep_per_ctx_env);
+        if (val > 0 && val <= INT32_MAX)
+            config.max_ep_per_ctx = static_cast<int>(val);
         else
             LOG(WARNING)
                 << "Ignore value from environment variable MC_MAX_EP_PER_CTX";
@@ -219,6 +262,36 @@ void loadGlobalConfig(GlobalConfig& config) {
         } else {
             LOG(WARNING) << "Ignore value from environment variable MC_MAX_WR";
         }
+    }
+
+    const char* max_recv_wr_env = std::getenv("MC_MAX_RECV_WR");
+    if (max_recv_wr_env) {
+        int val = atoi(max_recv_wr_env);
+        if (val > 0 && val <= UINT16_MAX)
+            config.max_recv_wr = val;
+        else
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_MAX_RECV_WR";
+    }
+
+    const char* max_rd_atomic_env = std::getenv("MC_MAX_RD_ATOMIC");
+    if (max_rd_atomic_env) {
+        int val = atoi(max_rd_atomic_env);
+        if (val > 0 && val <= UINT8_MAX)
+            config.max_rd_atomic = val;
+        else
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_MAX_RD_ATOMIC";
+    }
+
+    const char* max_dest_rd_atomic_env = std::getenv("MC_MAX_DEST_RD_ATOMIC");
+    if (max_dest_rd_atomic_env) {
+        int val = atoi(max_dest_rd_atomic_env);
+        if (val > 0 && val <= UINT8_MAX)
+            config.max_dest_rd_atomic = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_MAX_DEST_RD_ATOMIC";
     }
 
     const char* signal_interval_env = std::getenv("MC_RDMA_SIGNAL_INTERVAL");
@@ -567,6 +640,29 @@ void loadGlobalConfig(GlobalConfig& config) {
     parseNicPeerAffinity(std::getenv("MC_NIC_PEER_AFFINITY"),
                          config.nic_peer_affinity);
 
+    // Resolved before the clash below, so that next to
+    // MC_ENABLE_HCA_PEER_AFFINITY the option is ignored whatever
+    // MC_ENABLE_DEST_DEVICE_AFFINITY says, and that clash then applies as is.
+    if (const char* value = std::getenv("MC_RDMA_WRITE_PREFER_DEST_NIC")) {
+        parseBoolConfigEnv(value, "MC_RDMA_WRITE_PREFER_DEST_NIC",
+                           config.rdma_write_prefer_dest_nic);
+    }
+    if (config.rdma_write_prefer_dest_nic) {
+        if (config.enable_hca_peer_affinity) {
+            LOG(ERROR) << "MC_RDMA_WRITE_PREFER_DEST_NIC and "
+                          "MC_ENABLE_HCA_PEER_AFFINITY cannot be enabled at "
+                          "the same time; ignoring "
+                          "MC_RDMA_WRITE_PREFER_DEST_NIC.";
+            config.rdma_write_prefer_dest_nic = false;
+        } else {
+            // The sender's NIC then follows the destination, and the peer
+            // must answer on the NIC of the same name. A worker reuses its
+            // last peer pick across slices, so the pairing covers every
+            // operation rather than WRITEs alone.
+            config.enable_dest_device_affinity = true;
+        }
+    }
+
     if (config.enable_hca_peer_affinity && config.enable_dest_device_affinity) {
         LOG(ERROR) << "MC_ENABLE_HCA_PEER_AFFINITY and "
                       "MC_ENABLE_DEST_DEVICE_AFFINITY cannot be enabled at "
@@ -590,6 +686,25 @@ void loadGlobalConfig(GlobalConfig& config) {
         parseBoolConfigEnv(track_rdma_posted_slices_env,
                            "MC_TRACK_RDMA_POSTED_SLICES",
                            config.track_rdma_posted_slices);
+    }
+
+    const char* efa_homogeneous_peers_env =
+        std::getenv("MC_EFA_HOMOGENEOUS_PEERS");
+    if (efa_homogeneous_peers_env) {
+        parseBoolConfigEnv(efa_homogeneous_peers_env,
+                           "MC_EFA_HOMOGENEOUS_PEERS",
+                           config.efa_homogeneous_peers);
+    }
+
+    const char* efa_cq_drain_timeout_env =
+        std::getenv("MC_EFA_CQ_DRAIN_TIMEOUT_MS");
+    if (efa_cq_drain_timeout_env) {
+        config.efa_cq_drain_timeout_ms = atoll(efa_cq_drain_timeout_env);
+    }
+
+    const char* efa_stall_min_env = std::getenv("MC_EFA_STALL_MIN_MS");
+    if (efa_stall_min_env) {
+        config.efa_stall_min_ms = atoll(efa_stall_min_env);
     }
 
     const char* use_rdma_twosided_env = std::getenv("MC_USE_RDMA_TWOSIDED");
@@ -682,16 +797,19 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
-    const char* efa_nic_selection = std::getenv("MC_EFA_NIC_SELECTION");
-    if (efa_nic_selection) {
-        if (strcasecmp(efa_nic_selection, "all") == 0) {
-            config.efa_nic_selection = EfaNicSelection::ALL;
-        } else if (strcasecmp(efa_nic_selection, "local") == 0) {
-            config.efa_nic_selection = EfaNicSelection::LOCAL;
+    parseNicSelectionEnv("MC_EFA_NIC_SELECTION", config.efa_nic_selection);
+    parseNicSelectionEnv("MC_RDMA_NIC_SELECTION", config.rdma_nic_selection);
+
+    if (const char* value = std::getenv("MC_HIP_KFD_PIN_FIX")) {
+        const auto parsed = TryParseBool(value);
+        if (strcasecmp(value, "force") == 0) {
+            config.hip_kfd_pin_fix = HipKfdPinFix::FORCE;
+        } else if (parsed.has_value()) {
+            config.hip_kfd_pin_fix =
+                *parsed ? HipKfdPinFix::PROBE : HipKfdPinFix::OFF;
         } else {
-            LOG(WARNING) << "Invalid MC_EFA_NIC_SELECTION environment value: "
-                         << efa_nic_selection
-                         << ", expected all|local, keeping default";
+            LOG(WARNING) << "Invalid MC_HIP_KFD_PIN_FIX environment value: "
+                         << value << ", expected 0|1|force, keeping default";
         }
     }
 
@@ -709,7 +827,9 @@ void loadGlobalConfig(GlobalConfig& config) {
 
     for (const auto& [env_name, field] :
          {std::pair{"WITH_NVIDIA_PEERMEM", &config.with_nvidia_peermem},
-          std::pair{"MC_RDMA_DATA_DIRECT", &config.rdma_data_direct}}) {
+          std::pair{"MC_RDMA_DATA_DIRECT", &config.rdma_data_direct},
+          std::pair{"MC_RDMA_DATA_DIRECT_PAIRING",
+                    &config.rdma_data_direct_pairing}}) {
         const char* value = std::getenv(env_name);
         if (value == nullptr) {
             continue;
@@ -769,6 +889,18 @@ void loadGlobalConfig(GlobalConfig& config) {
         } catch (const std::exception& e) {
             LOG(WARNING) << "Invalid MC_IB_SL environment value: "
                          << service_level_env << ". Error: " << e.what();
+        }
+    }
+
+    if (const char* value = std::getenv("MC_IB_TIMEOUT")) {
+        const auto parsed = TryParseInteger<int>(
+            value, {.trim_ascii_whitespace = true, .allow_leading_plus = true});
+        if (parsed && *parsed >= 1 && *parsed <= 31) {
+            config.ib_timeout = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid MC_IB_TIMEOUT: " << value
+                         << "; expected an integer in [1, 31], keeping "
+                         << config.ib_timeout;
         }
     }
 
@@ -862,6 +994,8 @@ void updateGlobalConfig(ibv_device_attr& device_attr) {
         config.num_cq_per_ctx = device_attr.max_cq;
     if (config.max_wr > (size_t)device_attr.max_qp_wr)
         config.max_wr = device_attr.max_qp_wr;
+    if (config.max_recv_wr > (size_t)device_attr.max_qp_wr)
+        config.max_recv_wr = device_attr.max_qp_wr;
     if (config.max_sge > (size_t)device_attr.max_sge)
         config.max_sge = device_attr.max_sge;
     if (config.max_cqe > (size_t)device_attr.max_cqe)
@@ -885,15 +1019,33 @@ void dumpGlobalConfig() {
     LOG(INFO) << "num_qp_per_ep = " << config.num_qp_per_ep;
     LOG(INFO) << "max_sge = " << config.max_sge;
     LOG(INFO) << "max_wr = " << config.max_wr;
+    LOG(INFO) << "max_recv_wr = "
+              << (config.max_recv_wr ? std::to_string(config.max_recv_wr)
+                                     : std::string("<unset, = max_wr>"));
+    LOG(INFO) << "max_rd_atomic = "
+              << (config.max_rd_atomic
+                      ? std::to_string(config.max_rd_atomic)
+                      : std::string("<unset, device default>"));
+    LOG(INFO) << "max_dest_rd_atomic = "
+              << (config.max_dest_rd_atomic
+                      ? std::to_string(config.max_dest_rd_atomic)
+                      : std::string("<unset, device default>"));
     LOG(INFO) << "rdma_signal_interval = " << config.rdma_signal_interval;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
+    LOG(INFO) << "efa_homogeneous_peers = " << config.efa_homogeneous_peers;
+    LOG(INFO) << "efa_cq_drain_timeout_ms = " << config.efa_cq_drain_timeout_ms;
+    LOG(INFO) << "efa_stall_min_ms = " << config.efa_stall_min_ms;
     LOG(INFO) << "efa_nic_selection = "
               << (config.efa_nic_selection == EfaNicSelection::LOCAL ? "local"
                                                                      : "all");
+    LOG(INFO) << "rdma_nic_selection = "
+              << (config.rdma_nic_selection == NicSelection::LOCAL ? "local"
+                                                                   : "all");
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;
+    LOG(INFO) << "ib_timeout = " << config.ib_timeout;
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "
               << config.te_metadata_refresh_interval_seconds;
     LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
@@ -911,6 +1063,8 @@ void dumpGlobalConfig() {
     }
     LOG(INFO) << "mlx5_qp_lag_port_balance = "
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
+    LOG(INFO) << "rdma_write_prefer_dest_nic = "
+              << (config.rdma_write_prefer_dest_nic ? "true" : "false");
     LOG(INFO) << "log_rdma_slice_affinity = "
               << (config.log_rdma_slice_affinity ? "true" : "false");
     LOG(INFO) << "track_rdma_posted_slices = "

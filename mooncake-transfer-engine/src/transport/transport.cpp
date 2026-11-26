@@ -18,6 +18,15 @@
 #include "transfer_engine.h"
 
 namespace mooncake {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+void Transport::releaseCongestionPermit(Slice *slice) {
+    adaptive_congestion_control::complete(
+        slice->rdma_congestion_control_permit,
+        adaptive_congestion_control::OutcomeClass::kDerivedFlush,
+        adaptive_congestion_control::FailureScope::kOperation);
+}
+#endif
+
 thread_local static Transport::ThreadLocalSliceCache tl_slice_cache;
 
 Transport::ThreadLocalSliceCache &Transport::getSliceCache() {
@@ -40,6 +49,9 @@ Transport::BatchID Transport::allocateBatchID(size_t batch_size) {
 }
 
 Status Transport::freeBatchID(BatchID batch_id) {
+    if (!isValidBatchID(batch_id)) {
+        return Status::InvalidArgument("Invalid batch ID");
+    }
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
@@ -48,6 +60,13 @@ Status Transport::freeBatchID(BatchID batch_id) {
             return Status::BatchBusy(
                 "BatchID cannot be freed until all tasks are done");
         }
+    }
+    // Terminal tasks may still have completion callbacks unwinding while
+    // holding a pin on this BatchDesc; wait for the pin count to drain.
+    if (batch_desc.active_completion_callbacks.load(
+            std::memory_order_acquire) != 0) {
+        return Status::BatchBusy(
+            "BatchID cannot be freed until completion callbacks are quiescent");
     }
     delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET

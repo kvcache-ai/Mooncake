@@ -60,6 +60,7 @@ class UbTransport final : public Transport {
 
     const char* getName() const override { return "ub"; }
     double getEstimatedBandwidth() const override;
+    Status getNicLoadStats(std::vector<NicLoadStats>& stats) const override;
     bool supportNotification() const override { return false; }
 
    private:
