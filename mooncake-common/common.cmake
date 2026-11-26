@@ -817,11 +817,6 @@ if(USE_3FS)
   message(STATUS "3FS storage backend is enabled")
 endif()
 
-if(EXISTS "/usr/include/boost1.78")
-  include_directories(SYSTEM "/usr/include/boost1.78")
-  link_directories("/usr/lib64/boost1.78")
-endif()
-
 set(GFLAGS_USE_TARGET_NAMESPACE "true")
 find_package(yaml-cpp REQUIRED)
 find_package(gflags REQUIRED)

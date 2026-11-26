@@ -578,6 +578,22 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
             LOG(INFO)
                 << "Hot cache shm not available (real client may not have it)";
         }
+    } else {
+        // Zero-buffer startup has no control SHM registration. A fresh UUID
+        // can be asked to remount, and there are no buffers to replay yet.
+        auto initial_ping =
+            invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+        if (initial_ping &&
+            initial_ping->client_status == ClientStatus::NEED_REMOUNT) {
+            initial_ping =
+                invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+        }
+        if (!initial_ping || initial_ping->client_status != ClientStatus::OK) {
+            connected_.store(false);
+            LOG(ERROR) << "Initial dummy client heartbeat failed";
+            return -1;
+        }
+        last_ping_healthy_.store(true);
     }
 
     ping_running_ = true;

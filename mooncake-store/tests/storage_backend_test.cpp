@@ -3986,6 +3986,110 @@ TEST_F(StorageBackendTest, BucketWatermarkEvictionUsesHandlerAndKeepsNewest) {
     EXPECT_TRUE(newest_exists.value());
 }
 
+namespace {
+
+// Drives the rescan-vs-eviction race deterministically:
+//  1. write four one-key buckets;
+//  2. copy (and pin) the oldest bucket exactly as ScanMeta does before it
+//     sends NotifyOffloadSuccess;
+//  3. run watermark eviction and assert the pinned bucket is skipped;
+//  4. drop the pin and assert the bucket becomes evictable again.
+void RunPinnedScanEvictionScenario(BucketEvictionPolicy policy,
+                                   const std::string& data_path) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 1;  // one key per bucket
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 40 * 1024;
+    bucket_config.eviction_policy = policy;
+
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::vector<std::unique_ptr<char[]>> buffers;
+    std::vector<int64_t> bucket_ids;
+    for (int i = 0; i < 4; ++i) {
+        const std::string key = "pinned_key_" + std::to_string(i);
+        auto buffer = std::make_unique<char[]>(6 * 1024);
+        std::memset(buffer.get(), static_cast<int>('A' + i), 6 * 1024);
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(key, std::vector<Slice>{Slice{buffer.get(), 6 * 1024}});
+        buffers.push_back(std::move(buffer));
+
+        auto result = storage_backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(result.has_value());
+        bucket_ids.push_back(result.value());
+    }
+
+    // Copy and pin the oldest bucket, as the failover rescan does before the
+    // registration RPC is sent.
+    std::vector<std::string> scan_keys;
+    std::vector<StorageObjectMetadata> scan_metadatas;
+    std::vector<int64_t> scan_buckets;
+    std::vector<BucketScanPin> pins;
+    auto scan_res = storage_backend.BucketScan(0, scan_keys, scan_metadatas,
+                                               scan_buckets, 1, &pins);
+    ASSERT_TRUE(scan_res.has_value());
+    ASSERT_EQ(scan_buckets.size(), 1u);
+    ASSERT_EQ(scan_buckets.at(0), bucket_ids.at(0));
+    ASSERT_EQ(pins.size(), 1u);
+
+    std::vector<std::string> notified;
+    auto evict_res = storage_backend.EvictAboveDiskWatermark(
+        0.50, 0.25, [&](const std::vector<std::string>& keys) {
+            notified.insert(notified.end(), keys.begin(), keys.end());
+            return tl::expected<void, ErrorCode>{};
+        });
+    ASSERT_TRUE(evict_res.has_value());
+    ASSERT_EQ(notified.size(), 3u);
+    EXPECT_EQ(std::find(notified.begin(), notified.end(), "pinned_key_0"),
+              notified.end())
+        << "pinned bucket must not be evicted";
+
+    auto pinned_exists = storage_backend.IsExist("pinned_key_0");
+    ASSERT_TRUE(pinned_exists.has_value());
+    EXPECT_TRUE(pinned_exists.value());
+    for (int i = 1; i < 4; ++i) {
+        auto exists =
+            storage_backend.IsExist("pinned_key_" + std::to_string(i));
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_FALSE(exists.value());
+    }
+
+    // Once the registration batch returns, the pin is dropped and the bucket
+    // is an eviction candidate again.
+    pins.clear();
+    notified.clear();
+    auto evict_res2 = storage_backend.EvictAboveDiskWatermark(
+        0.10, 0.01, [&](const std::vector<std::string>& keys) {
+            notified.insert(notified.end(), keys.begin(), keys.end());
+            return tl::expected<void, ErrorCode>{};
+        });
+    ASSERT_TRUE(evict_res2.has_value());
+    EXPECT_NE(std::find(notified.begin(), notified.end(), "pinned_key_0"),
+              notified.end())
+        << "unpinned bucket must be evictable again";
+
+    auto gone = storage_backend.IsExist("pinned_key_0");
+    ASSERT_TRUE(gone.has_value());
+    EXPECT_FALSE(gone.value());
+}
+
+}  // namespace
+
+TEST_F(StorageBackendTest, BucketWatermarkEvictionSkipsPinnedScanBucketFifo) {
+    RunPinnedScanEvictionScenario(BucketEvictionPolicy::FIFO, data_path);
+}
+
+TEST_F(StorageBackendTest, BucketWatermarkEvictionSkipsPinnedScanBucketLru) {
+    RunPinnedScanEvictionScenario(BucketEvictionPolicy::LRU, data_path);
+}
+
 TEST_F(StorageBackendTest,
        BucketWatermarkEvictionDoesNotOverEvictForSharedDisk) {
     std::error_code ec;

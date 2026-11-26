@@ -407,8 +407,14 @@ if(USE_CUDA)
     target_compile_definitions(tent_mnnvl_transport_test
                                PRIVATE MNNVL_TEST_CUDA_WRAPPERS)
     target_link_options(
-      tent_mnnvl_transport_test PRIVATE "-Wl,--wrap=cudaEventRecord"
-      "-Wl,--wrap=cudaEventQuery")
+      tent_mnnvl_transport_test
+      PRIVATE
+      "-Wl,--wrap=cudaEventRecord"
+      "-Wl,--wrap=cudaEventQuery"
+      "-Wl,--wrap=cuDeviceGetAttribute"
+      "-Wl,--wrap=dlsym"
+      "-Wl,--wrap=cudaMemcpyAsync"
+      "-Wl,--wrap=cudaStreamSynchronize")
   endif()
   foreach(
     case
