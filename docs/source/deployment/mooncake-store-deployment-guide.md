@@ -239,10 +239,12 @@ replica count must match on every shard.
 `--ha_redis_expected_replicas_per_shard=N` explicitly (range **1..INT_MAX**;
 the default 0 means unconfigured and is rejected for Redis HA writes).
 This applies to KV writes and leader acquire, renew, and release operations.
-Confirmation uses `WAIT N` on the same connection as the write. Missing or
-excess acknowledgments return an unknown outcome; the backend never replays an
-uncertain write. Unconfirmed leadership writes cannot acquire or renew service,
-even if reading back the owner token shows that the write took effect.
+Confirmation follows the configured durability profile: `memory` uses `WAIT N`
+on the same connection as the write, and `persistent` adds `WAITAOF 1 N` (see
+**Durability profiles** below). Missing or excess acknowledgments return an
+unknown outcome; the backend never replays an uncertain write. Unconfirmed
+leadership writes cannot acquire or renew service, even if reading back the
+owner token shows that the write took effect.
 
 **Durability profiles:** `MC_REDIS_DURABILITY_PROFILE` accepts exactly `memory`
 or `persistent`. An unset variable explicitly defaults to `memory` for backward
@@ -553,7 +555,7 @@ With `ha_backend_type=etcd`, Mooncake Store supports a Primary-Standby HA model 
 HA leadership and metadata replication are configured separately:
 
 - The HA coordinator elects the active master. Configure it with `--enable_ha`, `--ha_backend_type`, `--ha_backend_connstring`, and `--cluster_id`. For `ha_backend_type=etcd`, legacy `--etcd_endpoints` is used only when `--ha_backend_connstring` is empty.
-- The optional batch-record OpLog records metadata mutations so standby masters can catch up and later be promoted. It is the etcd Primary-Standby path. Enable it explicitly with `--enable_oplog=true`; it is disabled by default. `ha_backend_type=etcd` requires a build with `STORE_USE_ETCD`. On etcd, acknowledged batches form the durable prefix used for promotion. `ha_backend_type=redis` requires a build with `STORE_USE_REDIS` and is an experimental HA log storage method. A successful Redis write only means Redis accepted the record. Do not treat Redis persistence, including AOF `appendfsync everysec`, as a strict durability guarantee.
+- The optional batch-record OpLog records metadata mutations so standby masters can catch up and later be promoted. It is the etcd Primary-Standby path. Enable it explicitly with `--enable_oplog=true`; it is disabled by default. `ha_backend_type=etcd` requires a build with `STORE_USE_ETCD`. On etcd, acknowledged batches form the durable prefix used for promotion. `ha_backend_type=redis` requires a build with `STORE_USE_REDIS` and is an experimental HA log storage method. Write success follows the configured Redis durability profile: `memory` requires only replica memory acknowledgments, and `persistent` additionally requires local and replica AOF fsync acknowledgments. Neither is a strict hardware-failure durability guarantee, including with AOF `appendfsync everysec`.
 - The optional standby-generated batch OpLog snapshot path is enabled with `--enable_oplog_snapshot=true` together with `--enable_oplog=true`. It uses the batch snapshot provider/coordinator and does not use the legacy catalog snapshot manager. Startup fails when the required etcd, cluster ID, object-store, or chunk configuration is invalid; a temporary upload failure leaves OpLog apply running for a later attempt.
 
 
@@ -995,8 +997,8 @@ mooncake_master \
 | `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
 | `--etcd_max_send_message_bytes` | `2097152` | Positive outgoing gRPC message limit in bytes for the HA store etcd client; configure before connection and keep requests within the etcd server byte limit |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
-| `--ha_leader_lease_ttl_sec` | `5` | Leadership lease TTL in seconds for `ha_backend_type=etcd` (range `2`-`60`; the JSON config key `ha_leader_lease_ttl_sec` is also accepted). Raise it to ride out etcd apply stalls longer than the default. A longer TTL delays failover: a new leader waits one full TTL before serving, and a standby waits for a crashed leader's lease to expire. Ignored by the Redis and k8s backends |
-| `--enable_oplog` | `false` | Enable the batch OpLog writer and reader; requires `enable_ha=true` and `ha_backend_type=etcd` or `redis`. etcd uses it for Primary-Standby promotion. Redis uses it as an experimental HA log store: a successful write only means Redis accepted the record |
+| `--ha_leader_lease_ttl_sec` | `5` | Leadership lease TTL in seconds for `ha_backend_type=etcd` and `redis` (range `2`-`60`; the JSON config key `ha_leader_lease_ttl_sec` is also accepted). With etcd, raise it to ride out apply stalls longer than the default. With Redis, the leader lease uses this TTL, and the effective replication (plus AOF under the `persistent` profile) acknowledgment budget must be strictly less than half of it. A longer TTL delays failover: a new leader waits one full TTL before serving, and a standby waits for a crashed leader's lease to expire. Ignored by the k8s backend |
+| `--enable_oplog` | `false` | Enable the batch OpLog writer and reader; requires `enable_ha=true` and `ha_backend_type=etcd` or `redis`. etcd uses it for Primary-Standby promotion. Redis uses it as an experimental HA log store; write success follows the configured Redis durability profile |
 | `--enable_oplog_snapshot` | `false` | Enable standby-generated batch OpLog snapshots; requires batch OpLog, HA/etcd, valid object-store configuration, and persistent local snapshot storage when applicable |
 | `--snapshot_chunk_object_count` | `1000000` | Maximum objects per batch OpLog snapshot chunk; must be positive when the new snapshot path is enabled |
 | `--oplog_poll_interval_ms` | `1000` | Base polling and retry delay for the batch standby, in milliseconds |
