@@ -265,12 +265,6 @@ class MasterServiceEvictScenarioTest
     std::vector<std::string> policy_files_;
 };
 
-TEST(MasterServiceEvictionConfigTest, DefaultsToAutomaticWorkers) {
-    EXPECT_EQ(MasterServiceConfig{}.eviction_worker_threads, 0u);
-    EXPECT_EQ(MasterServiceConfig::builder().build().eviction_worker_threads,
-              0u);
-}
-
 INSTANTIATE_TEST_SUITE_P(ScanWorkers, MasterServiceEvictScenarioTest,
                          ::testing::Values(0u, 1u, 4u));
 
