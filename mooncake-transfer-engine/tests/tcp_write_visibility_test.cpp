@@ -671,6 +671,33 @@ class LocalHttpMetadataServer {
         return rewritten == 1;
     }
 
+    bool rewriteStoredTcpProtoVersion(const std::string& segment_name,
+                                      int new_version,
+                                      bool zero_metadata_version) {
+        std::lock_guard<std::mutex> lock(values_mutex_);
+        const std::string target_key = "mooncake/ram/" + segment_name;
+        auto it = values_.find(target_key);
+        if (it == values_.end()) return false;
+        Json::CharReaderBuilder reader_builder;
+        Json::Value value;
+        std::string errors;
+        std::unique_ptr<Json::CharReader> reader(
+            reader_builder.newCharReader());
+        if (!reader->parse(it->second.data(),
+                           it->second.data() + it->second.size(), &value,
+                           &errors)) {
+            return false;
+        }
+        value["tcp_proto_version"] = new_version;
+        if (zero_metadata_version) {
+            value.removeMember("metadata_version");
+        }
+        Json::StreamWriterBuilder writer_builder;
+        writer_builder["indentation"] = "";
+        it->second = Json::writeString(writer_builder, value);
+        return true;
+    }
+
    private:
     static std::string decodeUrlComponent(const std::string& value) {
         auto hexDigit = [](char c) -> int {
@@ -1448,8 +1475,12 @@ struct EngineHandle {
               const std::string& remote_segment_name = {}) {
         // Exercise the pooled-connection path (default off): connection
         // reuse vs. discard-on-unclean-exchange is part of the contract
-        // under test.
-        setenv("MC_TCP_ENABLE_CONNECTION_POOL", "1", 1);
+        // under test. Avoid mutating environ when already set to "1" (e.g.
+        // under ScopedEnvVar before engine threads start) to stay TSan-clean.
+        const char* cur = std::getenv("MC_TCP_ENABLE_CONNECTION_POOL");
+        if (!cur || std::strcmp(cur, "1") != 0) {
+            setenv("MC_TCP_ENABLE_CONNECTION_POOL", "1", 1);
+        }
         engine = std::make_unique<TransferEngine>(false);
         auto hp = parseHostNameWithPort(server_name);
         int rc = engine->init(metadata_server, server_name, hp.first.c_str(),
@@ -2012,6 +2043,64 @@ TEST(TcpWriteVisibilityTest, GroupedScatterPreservesPartialFailureResults) {
                              lengths[i]),
                       0);
     }
+}
+
+TEST(TcpWriteVisibilityTest, SegmentDescEqualityComparesTcpProtoVersion) {
+    TransferMetadata::SegmentDesc lhs;
+    lhs.name = "127.0.0.2:17990";
+    lhs.protocol = "tcp";
+    lhs.tcp_data_host = "127.0.0.2";
+    lhs.tcp_data_port = 17990;
+    lhs.tcp_proto_version = 1;
+    TransferMetadata::SegmentDesc rhs = lhs;
+    EXPECT_EQ(lhs, rhs);
+    rhs.tcp_proto_version = 2;
+    EXPECT_NE(lhs, rhs);
+
+    // End-to-end syncSegmentCache verification: mutating only tcp_proto_version
+    // in the authoritative metadata store without bumping metadata_version must
+    // exercise SegmentDesc::operator== in both shouldInstallFetchedSegmentDesc
+    // (rejecting conflicting unchanged-version metadata) and syncSegmentCache's
+    // change detection (replacing the cached snapshot when metadata_version is
+    // absent/0).
+    ScopedEnvVar pooling("MC_TCP_ENABLE_CONNECTION_POOL", "1");
+    LocalHttpMetadataServer metadata_server;
+    ASSERT_TRUE(metadata_server.ok());
+    const std::string remote_peer = "127.0.0.2:17990";
+    EngineHandle target;
+    target.init(metadata_server.uri(), remote_peer, kSmallLength);
+    ASSERT_TRUE(target.ok);
+    EngineHandle h;
+    h.init(metadata_server.uri(), "127.0.0.2:17987", kSmallLength, remote_peer);
+    ASSERT_TRUE(h.ok);
+    auto before = h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
+    ASSERT_NE(before, nullptr);
+    ASSERT_GE(before->tcp_proto_version, 2);
+    ASSERT_GT(before->metadata_version, 0u);
+
+    // 1) Same non-zero metadata_version with different tcp_proto_version:
+    //    shouldInstallFetchedSegmentDesc must detect `*old_desc != *new_desc`
+    //    and reject the conflicting snapshot.
+    ASSERT_TRUE(metadata_server.rewriteStoredTcpProtoVersion(
+        before->name, 1, /*zero_metadata_version=*/false));
+    ASSERT_EQ(h.engine->syncSegmentCache(before->name), 0);
+    auto conflict_rejected =
+        h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
+    ASSERT_NE(conflict_rejected, nullptr);
+    EXPECT_EQ(conflict_rejected.get(), before.get());
+    EXPECT_EQ(conflict_rejected->tcp_proto_version, before->tcp_proto_version);
+
+    // 2) Unversioned (metadata_version == 0) update changing only
+    //    tcp_proto_version: syncSegmentCache relies solely on `*old_desc !=
+    //    *desc` to install the new snapshot rather than treating it as
+    //    unchanged.
+    ASSERT_TRUE(metadata_server.rewriteStoredTcpProtoVersion(
+        before->name, 1, /*zero_metadata_version=*/true));
+    ASSERT_EQ(h.engine->syncSegmentCache(before->name), 0);
+    auto after = h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
+    ASSERT_NE(after, nullptr);
+    EXPECT_NE(after.get(), before.get());
+    EXPECT_EQ(after->tcp_proto_version, 1);
 }
 
 // Mixed-version quadrant: a pooled legacy (v1) initiator against the current
