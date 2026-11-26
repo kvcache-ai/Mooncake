@@ -839,6 +839,9 @@ PYBIND11_MODULE(tent, m) {
                     } else {
                         BatchGuard guard(&self,
                                          static_cast<uint64_t>(batch_id));
+                        constexpr const char* kUnsafeReuseWarning =
+                            "; the batch may still access src and dst, so do "
+                            "not reuse them";
                         const auto settle =
                             [&](std::vector<TransferStatus>* out = nullptr,
                                 Status* settle_err = nullptr) {
@@ -854,11 +857,9 @@ PYBIND11_MODULE(tent, m) {
                             self.submitTransfer(batch_id, request_list);
                         if (!submit_status.ok()) {
                             if (!settle()) {
-                                wait_error =
-                                    "submitTransfer failed: " +
-                                    submit_status.ToString() +
-                                    "; the batch may still access src and dst, "
-                                    "so do not reuse them";
+                                wait_error = "submitTransfer failed: " +
+                                             submit_status.ToString() +
+                                             kUnsafeReuseWarning;
                             }
                         } else {
                             std::vector<TransferStatus> status_list;
@@ -868,21 +869,18 @@ PYBIND11_MODULE(tent, m) {
                                 wait_error = "waitTransfer failed: " +
                                              wait_status.ToString();
                                 if (!settle()) {
-                                    wait_error +=
-                                        "; the batch may still access src and "
-                                        "dst, so do not reuse them";
+                                    wait_error += kUnsafeReuseWarning;
                                 }
                             } else if (status_list.size() != count) {
                                 wait_error =
                                     "waitTransfer returned " +
                                     std::to_string(status_list.size()) +
                                     " statuses for " + std::to_string(count) +
-                                    " descriptors" LOC_MARK;
+                                    " descriptors";
                                 if (!settle()) {
-                                    wait_error +=
-                                        "; the batch may still access src and "
-                                        "dst, so do not reuse them";
+                                    wait_error += kUnsafeReuseWarning;
                                 }
+                                wait_error += LOC_MARK;
                             } else {
                                 Status settle_err;
                                 if (!AllTerminal(status_list, count) &&
@@ -899,9 +897,10 @@ PYBIND11_MODULE(tent, m) {
                                                       settle_err.ToString() +
                                                       ")";
                                     }
-                                    wait_error +=
-                                        "; the batch may still access src and "
-                                        "dst, so do not reuse them";
+                                    wait_error += kUnsafeReuseWarning;
+                                    if (settle_err.ok()) {
+                                        wait_error += LOC_MARK;
+                                    }
                                 } else {
                                     for (size_t i = 0; i < count; ++i) {
                                         states[i] = static_cast<uint8_t>(
