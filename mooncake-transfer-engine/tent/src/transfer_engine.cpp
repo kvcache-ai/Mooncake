@@ -119,13 +119,16 @@ std::optional<Status> TransferEngine::tryParallelBatchTransfer(
     const auto cuda_status = cudaGetDevice(&device);
     if (cuda_status == cudaErrorNoDevice ||
         cuda_status == cudaErrorInsufficientDriver ||
-        cuda_status == cudaErrorInitializationError) {
-        // Host-only transfers also work without an initialized CUDA runtime.
+        cuda_status == cudaErrorInitializationError ||
+        cuda_status == cudaErrorStubLibrary) {
+        // Host-only transfers also work without an initialized CUDA runtime,
+        // including hosts that only provide the stub libcuda (no driver).
         device = -1;
         (void)cudaGetLastError();
     } else if (cuda_status != cudaSuccess) {
         return Status::InternalError(
-            "Could not capture batch submit CUDA device");
+            std::string("Could not capture batch submit CUDA device: ") +
+            cudaGetErrorName(cuda_status));
     }
 #endif
     std::vector<std::vector<Request>> request_storage(

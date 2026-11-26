@@ -1535,12 +1535,16 @@ std::optional<Status> TransferEngine::tryParallelBatchTransfer(
     const auto cuda_status = cudaGetDevice(&device);
     if (cuda_status == cudaErrorNoDevice ||
         cuda_status == cudaErrorInsufficientDriver ||
-        cuda_status == cudaErrorInitializationError) {
-        // Host-only transfers also work without an initialized CUDA runtime.
+        cuda_status == cudaErrorInitializationError ||
+        cuda_status == cudaErrorStubLibrary) {
+        // Host-only transfers also work without an initialized CUDA runtime,
+        // including hosts that only provide the stub libcuda (no driver).
         device = -1;
         (void)cudaGetLastError();
     } else if (cuda_status != cudaSuccess) {
-        return Status::Context("Could not capture batch submit CUDA device");
+        return Status::Context(
+            std::string("Could not capture batch submit CUDA device: ") +
+            cudaGetErrorName(cuda_status));
     }
 #endif
     // Workers mutate distinct vectors; retain every vector until parent join.
