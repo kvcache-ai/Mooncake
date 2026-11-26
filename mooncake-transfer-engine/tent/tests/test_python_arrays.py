@@ -104,9 +104,24 @@ class ArrayEntryPointTest(unittest.TestCase):
                 source, target, lengths, 0, tent.OpCode.WRITE
             )
 
+    def test_empty_batch_accepts_timeout_ms(self):
+        empty = np.zeros(0, dtype=np.uint64)
+        states = self.engine.transfer_sync_arrays(
+            empty, empty, empty, 0, tent.OpCode.WRITE, timeout_ms=100
+        )
+        self.assertEqual(states.dtype, np.uint8)
+        self.assertEqual(states.shape, (0,))
+
+    def test_negative_timeout_raises_type_error(self):
+        empty = np.zeros(0, dtype=np.uint64)
+        with self.assertRaises(TypeError):
+            self.engine.transfer_sync_arrays(
+                empty, empty, empty, 0, tent.OpCode.WRITE, timeout_ms=-1
+            )
+
 
 class ArrayTransferTest(unittest.TestCase):
-    def test_write_and_read_move_bytes(self):
+    def _assert_write_and_read_move_bytes(self, write_transfer, read_transfer):
         with tempfile.TemporaryDirectory() as directory:
             server = tent.TransferEngine(write_config(directory, "server.json"))
             client = tent.TransferEngine(write_config(directory, "client.json"))
@@ -125,16 +140,12 @@ class ArrayTransferTest(unittest.TestCase):
                 target = np.array([server_base], dtype=np.uint64)
                 lengths = np.array([buffer_size], dtype=np.uint64)
 
-                states = client.transfer_sync_arrays(
-                    source, target, lengths, segment, tent.OpCode.WRITE
-                )
+                states = write_transfer(client, source, target, lengths, segment)
                 self.assertEqual(states.tolist(), [COMPLETED])
                 self.assertEqual(ctypes.string_at(server_addr, buffer_size), pattern)
 
                 ctypes.memset(client_addr, 0, buffer_size)
-                states = client.transfer_sync_arrays(
-                    source, target, lengths, segment, tent.OpCode.READ
-                )
+                states = read_transfer(client, source, target, lengths, segment)
                 self.assertEqual(states.tolist(), [COMPLETED])
                 self.assertEqual(ctypes.string_at(client_addr, buffer_size), pattern)
             finally:
@@ -144,6 +155,26 @@ class ArrayTransferTest(unittest.TestCase):
                 server.unregister_local_memory(server_addr, buffer_size)
                 client.free_local_memory(client_addr)
                 server.free_local_memory(server_addr)
+
+    def test_write_and_read_move_bytes(self):
+        self._assert_write_and_read_move_bytes(
+            lambda client, src, dst, lengths, seg: client.transfer_sync_arrays(
+                src, dst, lengths, seg, tent.OpCode.WRITE
+            ),
+            lambda client, src, dst, lengths, seg: client.transfer_sync_arrays(
+                src, dst, lengths, seg, tent.OpCode.READ
+            ),
+        )
+
+    def test_write_and_read_with_explicit_timeout_ms(self):
+        self._assert_write_and_read_move_bytes(
+            lambda client, src, dst, lengths, seg: client.transfer_sync_arrays(
+                src, dst, lengths, seg, tent.OpCode.WRITE, timeout_ms=5000
+            ),
+            lambda client, src, dst, lengths, seg: client.transfer_sync_arrays(
+                src, dst, lengths, seg, tent.OpCode.READ, 5000
+            ),
+        )
 
 
 if __name__ == "__main__":
