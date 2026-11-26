@@ -735,6 +735,57 @@ TEST(RuntimeQueueDispatch, TimeoutDoesNotDispatchQueuedRequestsOfBatch) {
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
+// Same race as TimeoutDoesNotDispatchQueuedRequestsOfBatch, but without a
+// status_list: refill cancels the last queued owner inside progressBatch, so
+// overall_status leaves PENDING before waitTransfer's own timed_out() branch.
+// Callers that omit status_list must still see TimedOut, not InternalError.
+TEST(RuntimeQueueDispatch, TimeoutWithoutStatusListPreservesTimedOut) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    std::atomic<int> polls{0};
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, [&polls](const Request& request, int) {
+            if (++polls == 1)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        });
+    installFakeRdma(engine, fake_rdma);
+
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> buffer(kReqLen * 2, 0x6d);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(2);
+    ASSERT_NE(batch, (BatchID)0);
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch,
+                            {makeLocalWrite(buffer.data(), kReqLen),
+                             makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
+            .ok());
+    ASSERT_EQ(fake_rdma->submit_calls.load(), 1);
+    ASSERT_EQ(TransferEngineImplTestPeer::windowOwners(engine), 1U);
+    ASSERT_EQ(TransferEngineImplTestPeer::queuedOwners(engine), 2U);
+
+    Status st = engine.waitTransfer(batch, nullptr, 1);
+    EXPECT_TRUE(st.IsTimedOut()) << st.ToString();
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(TransferEngineImplTestPeer::windowOwners(engine), 0U);
+    EXPECT_EQ(TransferEngineImplTestPeer::queuedOwners(engine), 0U);
+
+    std::vector<TransferStatus> statuses;
+    ASSERT_TRUE(engine.getTransferStatus(batch, statuses).ok());
+    ASSERT_EQ(statuses.size(), 2U);
+    EXPECT_EQ(statuses[0].s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(statuses[1].s, TransferStatusEnum::CANCELED);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
 TEST(RuntimeQueueDispatch, EarlierDeadlineStillCancelsWhenAnotherWaitIsArmed) {
     auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
     TransferEngineImpl engine(cfg);

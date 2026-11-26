@@ -4357,10 +4357,14 @@ Status TransferEngineImpl::waitTransfer(
     }
 
     if (status_list) return getTransferStatus(batch_id, *status_list);
-    return overall_status.s == COMPLETED
-               ? Status::OK()
-               : Status::InternalError(
-                     "Transfer via stage buffer failed" LOC_MARK);
+    if (overall_status.s == COMPLETED) return Status::OK();
+    // progressBatch can finish the in-window request after the deadline and
+    // refill then cancels the last queued owner. overall_status leaves
+    // PENDING there, so the loop never reaches the timed_out() branch
+    // above. Keep TimedOut for callers that did not ask for a status list.
+    if (timeout_ms != 0 && timed_out())
+        return Status::TimedOut("waitTransfer timed out" LOC_MARK);
+    return Status::InternalError("Transfer via stage buffer failed" LOC_MARK);
 }
 
 Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
