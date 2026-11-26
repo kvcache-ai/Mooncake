@@ -388,6 +388,11 @@ std::string RdmaEndPoint::peerNicPath() const {
 Transport::Slice::RdmaCompletionToken RdmaEndPoint::autoGidCompletionToken()
     const {
     RWSpinlock::ReadGuard guard(lock_);
+    return autoGidCompletionTokenLocked();
+}
+
+Transport::Slice::RdmaCompletionToken
+RdmaEndPoint::autoGidCompletionTokenLocked() const {
     if (!connected_auto_gid_ || !connected_auto_gid_->recovery_enabled) {
         return {0, 0, false, false};
     }
@@ -1359,6 +1364,7 @@ int RdmaEndPoint::submitPostSend(
     int cq_remaining = int(globalConfig().max_cqe) -
                        cq_outstanding_->load(std::memory_order_relaxed);
     if (cq_remaining <= 0) return 0;
+    const auto auto_gid_token = autoGidCompletionTokenLocked();
     const int signal_interval = globalConfig().rdma_signal_interval;
     const bool use_fifo = signal_interval > 1;
     const int period = rdmaSignalPeriod(signal_interval, max_wr_depth_);
@@ -1396,6 +1402,8 @@ int RdmaEndPoint::submitPostSend(
         const int64_t post_ts = getCurrentTimeInNano();
         for (int i = 0; i < wr_count; ++i) {
             auto *slice = slice_list[start + i];
+            slice->rdma.endpoint = this;
+            slice->rdma.auto_gid_token = auto_gid_token;
             auto &sge = sge_list[i];
             sge.addr = (uint64_t)slice->source_addr;
             sge.length = slice->length;
