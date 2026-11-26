@@ -266,7 +266,13 @@ bool KernelUringAvailable() {
     io_uring_probe* probe = io_uring_get_probe_ring(&ring);
     bool supported =
         probe && io_uring_opcode_supported(probe, IORING_OP_READ) != 0;
-    if (probe) io_uring_free_probe(probe);
+    if (probe) {
+#if defined(IO_URING_VERSION_MAJOR) && IO_URING_VERSION_MAJOR >= 2
+        io_uring_free_probe(probe);
+#else
+        std::free(probe);
+#endif
+    }
     if (supported) {
         auto* sqe = io_uring_get_sqe(&ring);
         if (!sqe) {

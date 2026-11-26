@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <climits>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <mutex>
@@ -22,11 +23,21 @@
 namespace mooncake::ssd_offload {
 namespace {
 
+void FreeUringProbe(io_uring_probe* probe) noexcept {
+    // liburing < 2.0 (e.g., EL8 liburing 1.0.7) allocates probes via calloc()
+    // and does not provide io_uring_free_probe().
+#if defined(IO_URING_VERSION_MAJOR) && IO_URING_VERSION_MAJOR >= 2
+    io_uring_free_probe(probe);
+#else
+    std::free(probe);
+#endif
+}
+
 bool RingSupportsOpcode(io_uring& ring, int opcode) noexcept {
     io_uring_probe* probe = io_uring_get_probe_ring(&ring);
     if (!probe) return false;
     const bool supported = io_uring_opcode_supported(probe, opcode) != 0;
-    io_uring_free_probe(probe);
+    FreeUringProbe(probe);
     return supported;
 }
 
