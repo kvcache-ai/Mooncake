@@ -762,6 +762,13 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         // Runs the term's handlers once they are registered. It drains before
         // the service goes, so release the service through release_service.
         std::unique_ptr<RpcWorkerPool> worker_pool;
+        auto drain_rpc_workers = [&]() {
+            // Release durability waits before joining their RPC handlers.
+            // Keep writes and callbacks alive until the writer stops below.
+            if (worker_pool)
+                wrapped_master_service->CancelBatchOpLogDurabilityWaits();
+            worker_pool.reset();
+        };
         // Stops the term's resources that exist, in the serving-exit order,
         // and keeps the service, the index and the gate alive through the
         // exit. Each step is a no-op on a resource not yet created or
@@ -773,7 +780,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 // captures wrapped_master_service by reference.
                 serving_state.RequestShutdown([] {});
                 wrapped_master_service->RequestStopBatchOpLogPruningWorker();
-                worker_pool.reset();
+                drain_rpc_workers();
                 StopLeadershipMonitor(monitor);
                 wrapped_master_service->StopBatchOpLogPruningWorker();
                 wrapped_master_service->StopBatchOpLogWriter();
@@ -794,7 +801,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             }
             serving_state.RequestShutdown([] {});
             wrapped_master_service->RequestStopBatchOpLogPruningWorker();
-            worker_pool.reset();
+            drain_rpc_workers();
             wrapped_master_service->StopBatchOpLogPruningWorker();
             wrapped_master_service->StopBatchOpLogWriter();
             wrapped_master_service.reset();
@@ -1075,9 +1082,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto server_err = std::move(ec.value()).get();
         shutdown_trigger.Stop();
         wrapped_master_service->RequestStopBatchOpLogPruningWorker();
-        // Finish the calls the workers still hold before the term's OpLog
-        // writer and leadership go, as inline handlers would have.
-        worker_pool.reset();
+        drain_rpc_workers();
         LOG(ERROR) << "Master service stopped: " << server_err;
 
         StopLeadershipMonitor(leadership_monitor_handle);

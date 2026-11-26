@@ -38,6 +38,7 @@ class WrappedMasterService {
                                            uint64_t max_batches_per_second);
     void RequestStopBatchOpLogPruningWorker();
     void StopBatchOpLogPruningWorker();
+    void CancelBatchOpLogDurabilityWaits();
     void StopBatchOpLogWriter();
     void StopHttpMetadataCleanup();
     // Restore lifecycle hooks (RFC #4700, slice 1). Serving means "committed

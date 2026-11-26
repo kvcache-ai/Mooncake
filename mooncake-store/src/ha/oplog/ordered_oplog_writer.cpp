@@ -176,6 +176,7 @@ struct OrderedOpLogWriter::Impl {
     bool running{false};
     bool stop_requested{false};
     bool callback_stop_requested{false};
+    bool durability_waits_cancelled{false};
     ErrorCode last_error{ErrorCode::OK};
     uint64_t retry_count{0};
     uint64_t runtime_owner{0};
@@ -429,7 +430,7 @@ async_simple::Future<ErrorCode> OrderedOpLogWriter::AwaitDurable(
         return async_simple::makeReadyFuture<ErrorCode>(
             ErrorCode{impl_->terminal_state->error});
     }
-    if (impl_->stop_requested) {
+    if (impl_->stop_requested || impl_->durability_waits_cancelled) {
         return async_simple::makeReadyFuture<ErrorCode>(
             ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -437,6 +438,17 @@ async_simple::Future<ErrorCode> OrderedOpLogWriter::AwaitDurable(
     auto future = promise.getFuture();
     impl_->durable_waiters.emplace(sequence, std::move(promise));
     return future;
+}
+
+void OrderedOpLogWriter::CancelDurabilityWaits() {
+    Impl::DurableWaiters waiters;
+    {
+        std::lock_guard lock(impl_->mutex);
+        impl_->durability_waits_cancelled = true;
+        waiters.swap(impl_->durable_waiters);
+    }
+    Impl::CompleteWaiters(std::move(waiters),
+                          ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
 bool OrderedOpLogWriter::IsAccepting() const {

@@ -1077,6 +1077,10 @@ void MasterService::StopBatchOpLogPruningWorker() {
     if (worker) worker->Stop();
 }
 
+void MasterService::CancelBatchOpLogDurabilityWaits() {
+    if (ordered_oplog_writer_) ordered_oplog_writer_->CancelDurabilityWaits();
+}
+
 void MasterService::StopBatchOpLogWriter() {
     if (ordered_oplog_writer_) ordered_oplog_writer_->Stop();
 }

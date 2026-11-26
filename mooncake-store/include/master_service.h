@@ -180,6 +180,7 @@ class MasterService {
                                            uint64_t max_batches_per_second);
     void RequestStopBatchOpLogPruningWorker();
     void StopBatchOpLogPruningWorker();
+    void CancelBatchOpLogDurabilityWaits();
     void StopBatchOpLogWriter();
 
     /**

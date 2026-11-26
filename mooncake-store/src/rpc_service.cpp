@@ -139,6 +139,10 @@ void WrappedMasterService::StopBatchOpLogPruningWorker() {
     master_service_.StopBatchOpLogPruningWorker();
 }
 
+void WrappedMasterService::CancelBatchOpLogDurabilityWaits() {
+    master_service_.CancelBatchOpLogDurabilityWaits();
+}
+
 void WrappedMasterService::StopBatchOpLogWriter() {
     master_service_.StopBatchOpLogWriter();
 }
