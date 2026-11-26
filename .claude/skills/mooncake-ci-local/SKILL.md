@@ -17,7 +17,7 @@ Use base ref `origin/main` unless the user names another ref. In the commands be
 
 ## Default checks
 
-Run these checks on every pre-PR request. They are the `ci.yml` jobs that do not need a native build.
+Run these checks on every pre-PR request. They are the unconditional `ci-gate` jobs that do not need a native build. `engram-cpu-contracts` also needs no native build, and `ci-gate` does not require it.
 
 1. Fetch the base and list changed files.
 
@@ -69,7 +69,7 @@ bash scripts/check_reshard_types.sh
 
 If `pyright` is missing, mark `reshard-type-check` blocked.
 
-6. Run `ci-script-tests`. The workflow installs `packaging`, `pytest==8.3.5`, and `pyyaml` first. If those imports fail, mark the job blocked.
+6. Run `ci-script-tests`. The workflow installs `packaging`, `pytest==8.3.5`, and `pyyaml` first. If those imports fail, mark the job blocked. If the unittest output says `jq: command not found`, mark the job blocked. Those nightly gate tests call `jq`, and the workflow does not install it.
 
 ```bash
 python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
