@@ -90,6 +90,9 @@ class RedisClusterClient {
     // performs the one-time full-shard capability check.
     void InvalidateStaleCapabilities();
     bool ValidateAllShards();
+    // Standalone deployments have no topology reply: discover replicas from
+    // the primary's INFO replication and probe each one before serving.
+    ErrorCode ValidateStandaloneReplicas();
     bool LeaseConnectionValid(const Lease& lease) const;
     bool ValidateAcknowledgement(Lease& lease);
     RedisReplyPtr Acknowledge(Lease& lease, std::vector<std::string> command,

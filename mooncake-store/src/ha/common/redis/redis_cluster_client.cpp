@@ -104,6 +104,59 @@ std::optional<std::string_view> InfoField(const redisReply* reply,
     return result;
 }
 
+// INFO replication advertises connected replicas as slaveN:ip=...,port=...
+// Parse the complete field list so a malformed entry fails closed instead of
+// being mistaken for "no replica".
+std::optional<std::vector<std::string>> InfoReplicas(const redisReply* reply) {
+    if (!reply || reply->type != REDIS_REPLY_STRING || !reply->str)
+        return std::nullopt;
+    std::vector<std::string> replicas;
+    std::set<std::string> endpoints;
+    std::string_view text(reply->str, reply->len);
+    while (!text.empty()) {
+        const auto end = text.find('\n');
+        auto line = text.substr(0, end);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        if (!line.empty() && line.front() != '#') {
+            const auto colon = line.find(':');
+            if (colon == 0 || colon == std::string_view::npos)
+                return std::nullopt;
+            if (line.substr(0, colon).rfind("slave", 0) == 0) {
+                std::string host;
+                std::optional<int> port;
+                std::string_view fields = line.substr(colon + 1);
+                while (!fields.empty()) {
+                    const auto comma = fields.find(',');
+                    const auto field = fields.substr(0, comma);
+                    const auto equals = field.find('=');
+                    if (equals == 0 || equals == std::string_view::npos)
+                        return std::nullopt;
+                    const auto name = field.substr(0, equals);
+                    const auto value = field.substr(equals + 1);
+                    if (name == "ip") {
+                        if (!host.empty()) return std::nullopt;
+                        host = std::string(value);
+                    } else if (name == "port") {
+                        if (port) return std::nullopt;
+                        const auto parsed = ParsePositiveInt(value, 1, 65535);
+                        if (!parsed) return std::nullopt;
+                        port = *parsed;
+                    }
+                    if (comma == std::string_view::npos) break;
+                    fields.remove_prefix(comma + 1);
+                }
+                if (host.empty() || !port) return std::nullopt;
+                const auto endpoint = Address({host, *port});
+                if (!endpoints.insert(endpoint).second) return std::nullopt;
+                replicas.push_back(endpoint);
+            }
+        }
+        if (end == std::string_view::npos) break;
+        text.remove_prefix(end + 1);
+    }
+    return replicas;
+}
+
 std::optional<bool> SupportsWaitAof(std::string_view version) {
     std::array<unsigned, 3> components{};
     for (size_t i = 0; i < components.size(); ++i) {
@@ -303,9 +356,49 @@ ErrorCode RedisClusterClient::ConnectLocked(std::string connstring,
         topology_valid_ = false;
         return kError;
     }
-    return Connection(seeds_[0]) && ValidateNode(seeds_[0], seeds_[0])
-               ? ErrorCode::OK
-               : kError;
+    if (!Connection(seeds_[0]) || !ValidateNode(seeds_[0], seeds_[0]))
+        return kError;
+    return ValidateStandaloneReplicas();
+#endif
+}
+
+ErrorCode RedisClusterClient::ValidateStandaloneReplicas() {
+#ifndef STORE_USE_REDIS
+    return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+#else
+    if (!require_aof_) return ErrorCode::OK;
+    auto* context = Connection(seeds_[0]);
+    if (!context) {
+        refresh_error_ = RoutingError::Transport;
+        return kError;
+    }
+    const auto replication = Run(context, {"INFO", "replication"});
+    if (const auto permission = PermissionRoutingError(replication.get())) {
+        refresh_error_ = *permission;
+        LogProbeFailure(seeds_[0], "INFO replication", *permission,
+                        replication.get());
+        return kError;
+    }
+    const auto replicas = InfoReplicas(replication.get());
+    if (!replicas) {
+        refresh_error_ = RoutingError::InvalidDurabilityResponse;
+        LogProbeFailure(seeds_[0], "INFO replication", refresh_error_,
+                        replication.get());
+        return kError;
+    }
+    // Bind each replica's capability to the current replica set so a
+    // replacement node is probed again instead of reusing another node's
+    // result.
+    std::string membership = seeds_[0] + "\n";
+    for (const auto& endpoint : *replicas) membership += endpoint + "\n";
+    for (const auto& endpoint : *replicas) {
+        if (!ValidateNode(endpoint, membership, true)) {
+            if (refresh_error_ == RoutingError::None)
+                refresh_error_ = RoutingError::Transport;
+            return kError;
+        }
+    }
+    return ErrorCode::OK;
 #endif
 }
 

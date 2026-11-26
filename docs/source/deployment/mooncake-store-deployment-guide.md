@@ -262,6 +262,10 @@ inferred from the server's AOF setting.
   configuration. Unsupported commands, old/unknown versions, disabled AOF or ACL
   denial fail closed; there is **no downgrade to memory**. Topology changes
   require validation of new nodes, not reuse of another shard's capability.
+  Cluster deployments probe every shard member. Standalone deployments
+  discover replicas from the primary's `INFO replication` and probe each
+  listed replica at startup, so a replica without AOF or `WAITAOF` is rejected
+  before the first business write.
 
 For persistent writes the sequence on the physical write connection is Lua/write,
 `WAIT N timeout`, then `WAITAOF 1 N timeout`. Success requires exactly N memory
