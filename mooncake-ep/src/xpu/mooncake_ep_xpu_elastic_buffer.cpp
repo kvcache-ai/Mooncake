@@ -60,6 +60,23 @@ ElasticMsgLayout default_msg(int64_t hidden, int64_t num_topk, bool use_fp8) {
         static_cast<int>(std::max<int64_t>(1, num_topk)));
 }
 
+// As on CUDA: the members map to distinct slots, this rank's to its own.
+void checkMembership(const std::vector<int32_t>& slots, int logical_rank,
+                     int logical_num_ranks, int capacity, int transport_rank) {
+    XPU_EP_CHECK(logical_num_ranks > 0 &&
+                     static_cast<int>(slots.size()) == logical_num_ranks &&
+                     logical_rank >= 0 && logical_rank < logical_num_ranks &&
+                     slots[logical_rank] == transport_rank,
+                 "invalid ElasticBuffer rank or world size");
+    std::vector<int32_t> sorted = slots;
+    std::sort(sorted.begin(), sorted.end());
+    XPU_EP_CHECK(
+        sorted.front() >= 0 && sorted.back() < capacity &&
+            std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end(),
+        "logical ElasticBuffer members must map to distinct "
+        "capacity slots");
+}
+
 }  // namespace
 
 MooncakeEpXpuElasticBuffer::MooncakeEpXpuElasticBuffer(
@@ -123,6 +140,39 @@ MooncakeEpXpuElasticBuffer::MooncakeEpXpuElasticBuffer(
         static_cast<int>(dev.get_info<sycl::info::device::max_compute_units>());
 }
 
+MooncakeEpXpuElasticBuffer::MooncakeEpXpuElasticBuffer(
+    int transport_rank, int capacity_ranks, int logical_rank,
+    int logical_num_ranks, int64_t num_buffer_bytes,
+    int64_t num_max_tokens_per_rank, int64_t hidden, int64_t num_topk,
+    bool use_fp8_dispatch, bool deterministic, bool allow_hybrid_mode,
+    bool allow_multiple_reduction, bool prefer_overlap_with_compute, int sl_idx,
+    int num_allocated_qps, int num_cpu_timeout_secs, int num_gpu_timeout_secs,
+    const std::string& transport, const std::vector<int32_t>& nccl_unique_id,
+    const std::vector<int32_t>& logical_to_transport_slots, uint64_t stream_ptr)
+    // The IPC buffer, and the size, cover every slot.
+    : MooncakeEpXpuElasticBuffer(
+          transport_rank, capacity_ranks, num_buffer_bytes,
+          num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch,
+          deterministic, allow_hybrid_mode, allow_multiple_reduction,
+          prefer_overlap_with_compute, sl_idx, num_allocated_qps,
+          num_cpu_timeout_secs, num_gpu_timeout_secs, transport, nccl_unique_id,
+          stream_ptr) {
+    checkMembership(logical_to_transport_slots, logical_rank, logical_num_ranks,
+                    capacity_ranks, transport_rank);
+    planned_ = true;
+    transport_rank_ = transport_rank;
+    capacity_ranks_ = capacity_ranks;
+    rank_ = logical_rank;
+    num_ranks_ = logical_num_ranks;
+    slots_ = logical_to_transport_slots;
+    slot_connected_.assign(capacity_ranks, 0);
+    slot_connected_[transport_rank] = 1;
+    d_slots_ = sycl::malloc_device<int32_t>(capacity_ranks, queue_);
+    d_logical_bases_ = sycl::malloc_device<void*>(capacity_ranks, queue_);
+    XPU_EP_CHECK(d_slots_ && d_logical_bases_, "peer table allocation failed");
+    refreshPeerTable();
+}
+
 MooncakeEpXpuElasticBuffer::~MooncakeEpXpuElasticBuffer() {
     try {
         destroy();
@@ -146,9 +196,13 @@ void MooncakeEpXpuElasticBuffer::destroy() {
     if (workspace_) sycl::free(workspace_, queue_);
     if (d_remote_) sycl::free(d_remote_, queue_);
     if (host_counts_) sycl::free(host_counts_, queue_);
+    if (d_slots_) sycl::free(d_slots_, queue_);
+    if (d_logical_bases_) sycl::free(d_logical_bases_, queue_);
     workspace_ = nullptr;
     d_remote_ = nullptr;
     host_counts_ = nullptr;
+    d_slots_ = nullptr;
+    d_logical_bases_ = nullptr;
     hybrid_ = false;
     ipc_.reset();
 }
@@ -158,7 +212,131 @@ void MooncakeEpXpuElasticBuffer::checkAlive() const {
 }
 
 bool MooncakeEpXpuElasticBuffer::use_fast_path() const {
-    return ipc_ && ipc_->allPeersAccessible();
+    if (!ipc_) return false;
+    if (!planned_) return ipc_->allPeersAccessible();
+    for (int32_t slot : slots_)
+        if (!slot_connected_[slot]) return false;
+    return true;
+}
+
+void MooncakeEpXpuElasticBuffer::quiesce() {
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        last_event_.wait();
+    }
+    queue_.wait();
+    drainProxy();
+}
+
+void MooncakeEpXpuElasticBuffer::refreshPeerTable() {
+    queue_.memcpy(d_slots_, slots_.data(), slots_.size() * sizeof(int32_t))
+        .wait();
+    const int n = num_ranks_;
+    const int32_t* slots = d_slots_;
+    void* const* bases = ipc_->peerBases();
+    void** out = d_logical_bases_;
+    queue_
+        .single_task([=] {
+            for (int l = 0; l < n; ++l) out[l] = bases[slots[l]];
+        })
+        .wait();
+}
+
+void MooncakeEpXpuElasticBuffer::checkMembersConnected() const {
+    if (!planned_) return;
+    for (int32_t slot : slots_)
+        XPU_EP_CHECK(slot_connected_[slot],
+                     "member slot " + std::to_string(slot) +
+                         " is not connected (connect_peer)");
+}
+
+void MooncakeEpXpuElasticBuffer::connect_peer(
+    int peer_rank, int64_t raddr, int32_t rkey, int64_t subnet_prefix,
+    int64_t interface_id, const std::vector<int32_t>& qpns,
+    const std::vector<int32_t>& lids, const std::vector<int32_t>& ipc_handle) {
+    checkAlive();
+    XPU_EP_CHECK(planned_, "connect_peer needs a capacity-aware ElasticBuffer");
+    XPU_EP_CHECK(peer_rank >= 0 && peer_rank < capacity_ranks_ &&
+                     peer_rank != transport_rank_,
+                 "peer_rank must be another slot within capacity_ranks");
+    XPU_EP_CHECK(!slot_connected_[peer_rank],
+                 "slot " + std::to_string(peer_rank) + " is already connected");
+    XPU_EP_CHECK(raddr == 0 && rkey == 0 && subnet_prefix == 0 &&
+                     interface_id == 0 && qpns.empty() && lids.empty(),
+                 "the XPU ElasticBuffer has no IBGDA transport");
+    XPU_EP_CHECK(!ipc_handle.empty(),
+                 "slot " + std::to_string(peer_rank) +
+                     " is on another host; a capacity-aware XPU "
+                     "ElasticBuffer reaches peers over Level Zero IPC only");
+    ipc_->stagePeer(peer_rank, ipc_handle);
+    try {
+        quiesce();
+    } catch (...) {
+        ipc_->discardStagedPeer(peer_rank);
+        throw;
+    }
+    ipc_->publishPeer(peer_rank);
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        slot_connected_[peer_rank] = 1;
+    }
+    refreshPeerTable();
+}
+
+void MooncakeEpXpuElasticBuffer::disconnect_peer(int peer_rank) {
+    checkAlive();
+    XPU_EP_CHECK(planned_,
+                 "disconnect_peer needs a capacity-aware ElasticBuffer");
+    XPU_EP_CHECK(peer_rank >= 0 && peer_rank < capacity_ranks_ &&
+                     peer_rank != transport_rank_ && slot_connected_[peer_rank],
+                 "peer_rank must be another connected slot");
+    quiesce();
+    ipc_->disconnectPeer(peer_rank);
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        slot_connected_[peer_rank] = 0;
+    }
+    refreshPeerTable();
+}
+
+void MooncakeEpXpuElasticBuffer::drain_queue_pairs() {
+    checkAlive();
+    quiesce();
+}
+
+void MooncakeEpXpuElasticBuffer::set_ibgda_membership(
+    int logical_rank, int logical_num_ranks,
+    const std::vector<int32_t>& logical_to_transport_slots) {
+    checkAlive();
+    XPU_EP_CHECK(planned_,
+                 "set_ibgda_membership needs a capacity-aware ElasticBuffer");
+    checkMembership(logical_to_transport_slots, logical_rank, logical_num_ranks,
+                    capacity_ranks_, transport_rank_);
+    quiesce();
+    // Peers flag this rank by logical rank, which may now name another slot,
+    // so start afresh: no flag set, on the first half, as a new buffer.
+    // Uncached stores, as XpuIpcBuffer zeroes: a write-back of cached zeros
+    // could later erase a flag a peer has written.
+    auto* base = static_cast<uint8_t*>(ipc_->base());
+    int* half0 = reinterpret_cast<int*>(base);
+    int* half1 = reinterpret_cast<int*>(base + half_stride_);
+    const size_t ints = static_cast<size_t>(capacity_ranks_) * kReadyStride;
+    queue_
+        .parallel_for(sycl::range<1>(ints),
+                      [=](sycl::id<1> i) {
+                          uc_store(half0 + i[0], 0);
+                          uc_store(half1 + i[0], 0);
+                      })
+        .wait();
+    queue_.memset(workspace_, 0, kWorkspaceBytes).wait();
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        rank_ = logical_rank;
+        num_ranks_ = logical_num_ranks;
+        slots_ = logical_to_transport_slots;
+        buffer_idx_ = 0;
+    }
+    refreshPeerTable();
 }
 
 int64_t MooncakeEpXpuElasticBuffer::calculate_buffer_size(
@@ -189,6 +367,9 @@ bool MooncakeEpXpuElasticBuffer::rdma_available() {
 std::vector<int32_t> MooncakeEpXpuElasticBuffer::init_rdma(
     const std::vector<int>& remote) {
     checkAlive();
+    XPU_EP_CHECK(!planned_,
+                 "a capacity-aware XPU ElasticBuffer connects peers with "
+                 "connect_peer, over Level Zero IPC only");
     XPU_EP_CHECK(
         static_cast<int>(remote.size()) == num_ranks_ && !remote[rank_],
         "remote must have one entry per rank, 0 for this rank");
@@ -220,6 +401,9 @@ void MooncakeEpXpuElasticBuffer::connect_rdma(
     const std::vector<std::vector<int32_t>>& infos,
     const std::vector<int>& active_ranks_mask) {
     checkAlive();
+    XPU_EP_CHECK(!planned_,
+                 "a capacity-aware XPU ElasticBuffer connects peers with "
+                 "connect_peer, over Level Zero IPC only");
 #if MOONCAKE_EP_XPU_RDMA
     XPU_EP_CHECK(proxy_ != nullptr, "connect_rdma needs init_rdma first");
     XPU_EP_CHECK(static_cast<int>(active_ranks_mask.size()) == num_ranks_,
@@ -267,6 +451,9 @@ void MooncakeEpXpuElasticBuffer::sync_nvlink_ipc_handles(
     const std::vector<std::vector<int32_t>>& remote_handles,
     const std::vector<int>& active_ranks_mask) {
     checkAlive();
+    XPU_EP_CHECK(!planned_,
+                 "a capacity-aware XPU ElasticBuffer connects peers with "
+                 "connect_peer, over Level Zero IPC only");
     // Remapping peers closes the old mappings, which launched kernels may
     // still be reading.
     {
@@ -338,7 +525,8 @@ int MooncakeEpXpuElasticBuffer::maxWgs(int num_sms) const {
 }
 
 PeerView MooncakeEpXpuElasticBuffer::peerView() const {
-    return PeerView{ipc_->base(), ipc_->peerBases(),
+    return PeerView{ipc_->base(),
+                    planned_ ? d_logical_bases_ : ipc_->peerBases(),
                     hybrid_ ? d_remote_ : nullptr};
 }
 
@@ -439,6 +627,7 @@ std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::dispatch(
                                hybrid_);
 
     std::lock_guard<std::mutex> lock(mu_);
+    checkMembersConnected();
     const Half half = takeHalf(hl.ready_bytes + hl.dispatch_end);
     sycl::queue& launch_q = launchQueue(q);
 
@@ -540,6 +729,7 @@ std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::combine(
                                hidden, hybrid_);
 
     std::lock_guard<std::mutex> lock(mu_);
+    checkMembersConnected();
     const Half half = takeHalf(hl.ready_bytes + hl.combine_end);
     sycl::queue& launch_q = launchQueue(q);
 

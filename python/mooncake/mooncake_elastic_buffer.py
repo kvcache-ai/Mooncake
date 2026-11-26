@@ -104,6 +104,12 @@ def _current_device_index() -> int:
     return torch.cuda.current_device()
 
 
+def _device_context(index: int):
+    if _ep_device_type() == "xpu":
+        return torch.xpu.device(index)
+    return torch.cuda.device(index)
+
+
 def _nccl_topology_supported(
     num_ranks: int,
     num_rdma_ranks: int,
@@ -633,11 +639,7 @@ class ElasticBuffer:
         the synchronous ``set_membership`` wrapper. IBGDA keeps its quiescent
         transition path. This API does not provide rank-failure recovery.
         """
-        if _ep_device_type() == "xpu":
-            raise NotImplementedError(
-                "ElasticBuffer.create_elastic is not supported on XPU yet; "
-                "use ElasticBuffer(group, ...)"
-            )
+        on_xpu = _ep_device_type() == "xpu"
         if not allow_multiple_reduction:
             raise NotImplementedError(
                 "Mooncake ElasticBuffer currently supports only "
@@ -678,7 +680,7 @@ class ElasticBuffer:
         self.group = None
         self.rank_idx = members.index(rank)
         self.num_ranks = len(members)
-        self._device_index = torch.cuda.current_device()
+        self._device_index = _current_device_index()
         self._planned_scaling = planned_scaling
         self._capacity_ranks = capacity
         self._transport_rank = int(rank)
@@ -691,7 +693,11 @@ class ElasticBuffer:
         self._tcp_store = clone_tcp_store(tcp_store_group)
         self._store_namespace = store_namespace
         self._store_timeout_secs = store_timeout_secs
-        self.requested_transport = _requested_transport(transport)
+        self.requested_transport = (
+            _requested_xpu_transport(transport)
+            if on_xpu
+            else _requested_transport(transport)
+        )
         self.allow_hybrid_mode = allow_hybrid_mode
         self.allow_multiple_reduction = allow_multiple_reduction
         self.prefer_overlap_with_compute = prefer_overlap_with_compute
@@ -780,7 +786,7 @@ class ElasticBuffer:
             self.runtime = self._construct_capacity_runtime(
                 ep, nccl_unique_id, status_callback
             )
-            with torch.cuda.device(self._device_index):
+            with _device_context(self._device_index):
                 self._finish_native_runtime_initialization(staged_candidate=True)
             if joining_nccl:
                 self._finish_joining_membership()
@@ -807,8 +813,9 @@ class ElasticBuffer:
                 num_gpu_timeout_secs,
                 self.transport,
                 nccl_unique_id,
+                **({"stream_ptr": _native_current_stream_ptr()} if on_xpu else {}),
             )
-        with torch.cuda.device(self._device_index):
+        with _device_context(self._device_index):
             self._finish_native_runtime_initialization(staged_candidate=False)
         return self
 
@@ -823,6 +830,14 @@ class ElasticBuffer:
                 raise RuntimeError(
                     "ElasticBuffer Store members disagree on the ordered stable slots"
                 )
+        if _ep_device_type() == "xpu":
+            # One transport, so nothing to agree on.
+            if required_transport not in (None, "ipc"):
+                raise RuntimeError(
+                    f"XPU ElasticBuffer cannot join a {required_transport!r} "
+                    "membership"
+                )
+            return "ipc"
         nccl_available = bool(ep.has_nccl_device_support())
         local_auto_choice = _select_transport(
             "auto",
@@ -1042,8 +1057,9 @@ class ElasticBuffer:
         if self._planned_scaling:
             self._connect_native_from_store_planned(ep, peer_ranks)
             return
+        on_xpu = _ep_device_type() == "xpu"
         was_disabled = bool(self.runtime.ibgda_disabled())
-        if is_update:
+        if is_update and not on_xpu:
             self.runtime.update_local_qpns()
         ibgda_disabled = bool(self.runtime.ibgda_disabled())
 
@@ -1135,6 +1151,8 @@ class ElasticBuffer:
                 )
 
         handles = [list(peer[4]) for peer in peers]
+        if on_xpu:
+            self._connect_xpu_rdma(handles, [1] * self.num_ranks, None)
         try:
             self.runtime.sync_nvlink_ipc_handles(handles, [1] * self.num_ranks)
         except Exception as exc:
@@ -1216,6 +1234,13 @@ class ElasticBuffer:
                 )
 
         local_hostname = socket.gethostname()
+        if _ep_device_type() == "xpu" and any(
+            record[1] != local_hostname for record in records
+        ):
+            raise RuntimeError(
+                "capacity-aware XPU ElasticBuffer members must share one host "
+                "(Level Zero IPC); use a fixed-world buffer across nodes"
+            )
         for peer_slot in peers_to_connect:
             peer = by_slot[peer_slot]
             _, peer_hostname, _, peer_metadata, _, peer_handle = peer
@@ -1273,7 +1298,7 @@ class ElasticBuffer:
         self,
         handles: List[List[int]],
         active_ranks_mask: List[int],
-        device: Union[str, torch.device],
+        device: Optional[Union[str, torch.device]],
     ) -> None:
         """Connect the ranks on other nodes over RDMA (XPU only).
 
@@ -1281,8 +1306,10 @@ class ElasticBuffer:
         handle comes from another host or pid namespace (words 3 and 4 of the
         handle), or, with MC_EP_RANKS_PER_NODE=n, if rank // n differs. Unlike
         the Buffer, the ElasticBuffer has no fallback path: if any rank cannot
-        connect, every rank raises.
+        connect, every rank raises. A Store buffer (create_elastic) agrees
+        through its Store, which needs no device.
         """
+        store = self._store_collectives
         per_node = int(os.environ.get("MC_EP_RANKS_PER_NODE", "0") or 0)
         if per_node > 0:
             nodes = [r // per_node for r in range(self.num_ranks)]
@@ -1294,9 +1321,15 @@ class ElasticBuffer:
             return
 
         def agree(error: str) -> None:
-            ok = torch.tensor([int(not error)], dtype=torch.int32, device=device)
-            dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=self.group)
-            if not ok.item():
+            if store is not None:
+                ok = all(store.all_gather("xpu-rdma-status", not error))
+            else:
+                ok_tensor = torch.tensor(
+                    [int(not error)], dtype=torch.int32, device=device
+                )
+                dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN, group=self.group)
+                ok = bool(ok_tensor.item())
+            if not ok:
                 raise _XpuRdmaError(
                     f"[Rank {self.rank_idx}] ElasticBuffer ranks span several "
                     "nodes, which XPU reaches over RDMA, and "
@@ -1316,11 +1349,15 @@ class ElasticBuffer:
             except Exception as e:
                 error = f"its setup failed: {e}"
         agree(error)
-        local = torch.tensor(info, dtype=torch.int32, device=device)
-        infos = [torch.empty_like(local) for _ in range(self.num_ranks)]
-        dist.all_gather(infos, local, group=self.group)
+        if store is not None:
+            infos = [list(i) for i in store.all_gather("xpu-rdma-info", info)]
+        else:
+            local = torch.tensor(info, dtype=torch.int32, device=device)
+            gathered = [torch.empty_like(local) for _ in range(self.num_ranks)]
+            dist.all_gather(gathered, local, group=self.group)
+            infos = [t.tolist() for t in gathered]
         try:
-            self.runtime.connect_rdma([t.tolist() for t in infos], active_ranks_mask)
+            self.runtime.connect_rdma(infos, active_ranks_mask)
         except Exception as e:
             error = f"connecting failed: {e}"
         agree(error)
@@ -1446,6 +1483,8 @@ class ElasticBuffer:
             nccl_unique_id,
             self._members,
         )
+        if _ep_device_type() == "xpu":
+            return ep.ElasticBuffer(*args, stream_ptr=_native_current_stream_ptr())
         if init_status_callback is None:
             return ep.ElasticBuffer(*args)
         return ep.ElasticBuffer(*args, init_status_callback)
@@ -1454,7 +1493,7 @@ class ElasticBuffer:
         self._refresh_topology_from_runtime()
         self._connect_native()
         self._active_ranks = torch.ones(
-            self.num_ranks, dtype=torch.int32, device="cuda"
+            self.num_ranks, dtype=torch.int32, device=_ep_device_type()
         )
         self._active_ranks_ready = None
         if staged_candidate:
@@ -1482,7 +1521,7 @@ class ElasticBuffer:
                     "target ranks: " + "; ".join(event_errors)
                 )
         else:
-            torch.cuda.synchronize()
+            _synchronize_device()
         self._store_collectives.barrier("initialize")
         if staged_candidate:
             if self.rank_idx == 0:
@@ -1491,7 +1530,7 @@ class ElasticBuffer:
                     b"1",
                 )
         else:
-            torch.cuda.synchronize()
+            _synchronize_device()
 
     def _destroy_runtime_local(self) -> None:
         runtime = self.runtime
@@ -1862,8 +1901,8 @@ class ElasticBuffer:
                 self.transport.encode(),
             )
 
-        with torch.cuda.device(self._device_index):
-            torch.cuda.synchronize()
+        with _device_context(self._device_index):
+            _synchronize_device()
             if self.transport != "nccl":
                 self.runtime.drain_queue_pairs()
             old_collectives.barrier("membership-old-drained")
@@ -1935,11 +1974,11 @@ class ElasticBuffer:
                 self._generation = tuple(store_namespace.encode())
             self._refresh_topology_from_runtime()
             self._active_ranks = torch.ones(
-                self.num_ranks, dtype=torch.int32, device="cuda"
+                self.num_ranks, dtype=torch.int32, device=_ep_device_type()
             )
-            torch.cuda.synchronize()
+            _synchronize_device()
             self._store_collectives.barrier("initialize")
-            torch.cuda.synchronize()
+            _synchronize_device()
 
     def update_ep_member(self) -> None:
         if self._planned_scaling:

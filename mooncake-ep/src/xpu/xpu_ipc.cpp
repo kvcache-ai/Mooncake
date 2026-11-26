@@ -23,6 +23,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <glog/logging.h>
 #include <string>
 
@@ -97,7 +98,8 @@ XpuIpcBuffer::XpuIpcBuffer(sycl::queue& queue, size_t bytes, int rank,
       num_ranks_(num_ranks),
       bytes_(bytes),
       alloc_bytes_(bytes + kProbeBytes),
-      imports_(num_ranks, nullptr) {
+      imports_(num_ranks, nullptr),
+      staged_(num_ranks, nullptr) {
     XPU_EP_CHECK(queue.get_backend() == sycl::backend::ext_oneapi_level_zero,
                  "the queue must use the Level Zero backend");
     ze_ctx_ = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
@@ -166,9 +168,11 @@ XpuIpcBuffer::~XpuIpcBuffer() {
 }
 
 void XpuIpcBuffer::closeImports() {
-    for (auto& p : imports_) {
-        if (p) zeMemCloseIpcHandle(ze_ctx_, p);
-        p = nullptr;
+    for (auto* v : {&imports_, &staged_}) {
+        for (auto& p : *v) {
+            if (p) zeMemCloseIpcHandle(ze_ctx_, p);
+            p = nullptr;
+        }
     }
 }
 
@@ -191,6 +195,58 @@ std::vector<int32_t> XpuIpcBuffer::exportHandle() {
     std::memcpy(out.data() + kHeaderWords, exported_->data,
                 sizeof(exported_->data));
     return out;
+}
+
+void* XpuIpcBuffer::openPeer(int r, const std::vector<int32_t>& h,
+                             std::string* why) {
+    const pid_t pid = static_cast<pid_t>(h[0]);
+    const size_t size =
+        static_cast<uint32_t>(h[1]) |
+        (static_cast<size_t>(static_cast<uint32_t>(h[2])) << 32);
+    // Peers are addressed, and probed, at this rank's offsets.
+    if (size != alloc_bytes_) {
+        *why = "rank " + std::to_string(r) + " has a " + std::to_string(size) +
+               "-byte EP buffer, this rank " + std::to_string(alloc_bytes_) +
+               "; every rank must use the same size";
+        return nullptr;
+    }
+    ze_ipc_mem_handle_t ipc{};
+    std::memcpy(ipc.data, h.data() + kHeaderWords, sizeof(ipc.data));
+    int64_t exporter_fd = 0;
+    std::memcpy(&exporter_fd, ipc.data + kIpcHandleFdOffset,
+                sizeof(exporter_fd));
+    const int fd = fetchFd(pid, static_cast<int>(exporter_fd));
+    if (fd < 0) {
+        *why = "pidfd_getfd from rank " + std::to_string(r) +
+               " failed: " + strerror(errno);
+        return nullptr;
+    }
+    const uint64_t local_fd = static_cast<uint64_t>(fd);
+    const uint64_t mirror = ~uint64_t{0};
+    std::memcpy(ipc.data + kIpcHandleFdOffset, &local_fd, sizeof(local_fd));
+    std::memcpy(ipc.data + kIpcHandleMirrorOffset, &mirror, sizeof(mirror));
+    void* p = nullptr;
+    ze_result_t res = zeMemOpenIpcHandle(ze_ctx_, ze_dev_, ipc, 0, &p);
+    // The import holds its own reference on the dma-buf.
+    close(fd);
+    if (res != ZE_RESULT_SUCCESS || !p) {
+        std::ostringstream msg;
+        msg << "zeMemOpenIpcHandle for rank " << r << " failed: 0x" << std::hex
+            << res;
+        *why = msg.str();
+        return nullptr;
+    }
+    void* range_base = nullptr;
+    size_t range_size = 0;
+    if (zeMemGetAddressRange(ze_ctx_, p, &range_base, &range_size) !=
+            ZE_RESULT_SUCCESS ||
+        range_base != p || range_size < size) {
+        *why = "mapping of rank " + std::to_string(r) +
+               " is smaller than its buffer";
+        zeMemCloseIpcHandle(ze_ctx_, p);
+        return nullptr;
+    }
+    return p;
 }
 
 void XpuIpcBuffer::importPeers(const std::vector<std::vector<int32_t>>& handles,
@@ -217,49 +273,10 @@ void XpuIpcBuffer::importPeers(const std::vector<std::vector<int32_t>>& handles,
                       << " is on another host or pid namespace; not mapped";
             continue;
         }
-        const pid_t pid = static_cast<pid_t>(h[0]);
-        const size_t size =
-            static_cast<uint32_t>(h[1]) |
-            (static_cast<size_t>(static_cast<uint32_t>(h[2])) << 32);
-        // Peers are addressed, and probed, at this rank's offsets.
-        if (size != alloc_bytes_) {
-            LOG(WARNING) << "[EP XPU] rank " << r << " has a " << size
-                         << "-byte EP buffer, this rank " << alloc_bytes_
-                         << "; every rank must use the same size";
-            continue;
-        }
-        ze_ipc_mem_handle_t ipc{};
-        std::memcpy(ipc.data, h.data() + kHeaderWords, sizeof(ipc.data));
-        int64_t exporter_fd = 0;
-        std::memcpy(&exporter_fd, ipc.data + kIpcHandleFdOffset,
-                    sizeof(exporter_fd));
-        const int fd = fetchFd(pid, static_cast<int>(exporter_fd));
-        if (fd < 0) {
-            LOG(WARNING) << "[EP XPU] pidfd_getfd from rank " << r
-                         << " failed: " << strerror(errno);
-            continue;
-        }
-        const uint64_t local_fd = static_cast<uint64_t>(fd);
-        const uint64_t mirror = ~uint64_t{0};
-        std::memcpy(ipc.data + kIpcHandleFdOffset, &local_fd, sizeof(local_fd));
-        std::memcpy(ipc.data + kIpcHandleMirrorOffset, &mirror, sizeof(mirror));
-        void* p = nullptr;
-        ze_result_t res = zeMemOpenIpcHandle(ze_ctx_, ze_dev_, ipc, 0, &p);
-        // The import holds its own reference on the dma-buf.
-        close(fd);
-        if (res != ZE_RESULT_SUCCESS || !p) {
-            LOG(WARNING) << "[EP XPU] zeMemOpenIpcHandle for rank " << r
-                         << " failed: 0x" << std::hex << res;
-            continue;
-        }
-        void* range_base = nullptr;
-        size_t range_size = 0;
-        if (zeMemGetAddressRange(ze_ctx_, p, &range_base, &range_size) !=
-                ZE_RESULT_SUCCESS ||
-            range_base != p || range_size < size) {
-            LOG(WARNING) << "[EP XPU] mapping of rank " << r
-                         << " is smaller than its buffer";
-            zeMemCloseIpcHandle(ze_ctx_, p);
+        std::string why;
+        void* p = openPeer(r, h, &why);
+        if (!p) {
+            LOG(WARNING) << "[EP XPU] " << why;
             continue;
         }
         imports_[r] = p;
@@ -305,6 +322,65 @@ void XpuIpcBuffer::importPeers(const std::vector<std::vector<int32_t>>& handles,
         }
     }
     queue_.memcpy(d_bases, bases.data(), num_ranks_ * sizeof(void*)).wait();
+}
+
+void XpuIpcBuffer::stagePeer(int peer, const std::vector<int32_t>& h) {
+    const std::string who = "rank " + std::to_string(peer);
+    XPU_EP_CHECK(peer >= 0 && peer < num_ranks_ && peer != rank_,
+                 "invalid IPC peer " + who);
+    XPU_EP_CHECK(!imports_[peer] && !staged_[peer], who + " is already mapped");
+    XPU_EP_CHECK(static_cast<int>(h.size()) == kHeaderWords + kHandleWords,
+                 "malformed IPC handle from " + who);
+    const uint64_t peer_ns =
+        static_cast<uint32_t>(h[3]) |
+        (static_cast<uint64_t>(static_cast<uint32_t>(h[4])) << 32);
+    XPU_EP_CHECK(peer_ns == pidNamespaceId(),
+                 who + " is on another host or pid namespace");
+    std::string why;
+    void* p = openPeer(peer, h, &why);
+    XPU_EP_CHECK(p != nullptr, why);
+
+    // As in importPeers: a mapping that opens may still be unreadable.
+    int32_t* d_probe = sycl::malloc_device<int32_t>(1, queue_);
+    if (!d_probe) zeMemCloseIpcHandle(ze_ctx_, p);
+    XPU_EP_CHECK(d_probe != nullptr, "probe allocation failed");
+    const auto* word = reinterpret_cast<const int32_t*>(
+        static_cast<const uint8_t*>(p) + bytes_);
+    int32_t probe = 0;
+    queue_.single_task([=] { *d_probe = uc_load(word); }).wait();
+    queue_.memcpy(&probe, d_probe, sizeof(probe)).wait();
+    sycl::free(d_probe, queue_);
+    if (probe != probeValue(peer)) {
+        zeMemCloseIpcHandle(ze_ctx_, p);
+        XPU_EP_CHECK(false, who + " is mapped but not readable over P2P");
+    }
+    staged_[peer] = p;
+}
+
+void XpuIpcBuffer::setPeerBase(int peer, void* base) {
+    queue_.memcpy(d_peer_bases_ + peer, &base, sizeof(base)).wait();
+}
+
+void XpuIpcBuffer::publishPeer(int peer) {
+    XPU_EP_CHECK(peer >= 0 && peer < num_ranks_ && staged_[peer],
+                 "rank " + std::to_string(peer) + " is not staged");
+    setPeerBase(peer, staged_[peer]);
+    imports_[peer] = staged_[peer];
+    staged_[peer] = nullptr;
+}
+
+void XpuIpcBuffer::discardStagedPeer(int peer) {
+    if (peer < 0 || peer >= num_ranks_ || !staged_[peer]) return;
+    zeMemCloseIpcHandle(ze_ctx_, staged_[peer]);
+    staged_[peer] = nullptr;
+}
+
+void XpuIpcBuffer::disconnectPeer(int peer) {
+    if (peer < 0 || peer >= num_ranks_ || peer == rank_ || !imports_[peer])
+        return;
+    setPeerBase(peer, nullptr);
+    zeMemCloseIpcHandle(ze_ctx_, imports_[peer]);
+    imports_[peer] = nullptr;
 }
 
 }  // namespace xpu_ep

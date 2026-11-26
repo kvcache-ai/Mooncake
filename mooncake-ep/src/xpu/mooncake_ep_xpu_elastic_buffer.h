@@ -56,6 +56,22 @@ class MooncakeEpXpuElasticBuffer {
         int sl_idx, int num_allocated_qps, int num_cpu_timeout_secs,
         int num_gpu_timeout_secs, const std::string& transport,
         const std::vector<int32_t>& nccl_unique_id, uint64_t stream_ptr);
+    // Capacity-aware construction, CUDA's planned membership: the buffer
+    // owns stable slot `transport_rank` of `capacity_ranks`, sized for all
+    // of them, and the kernels run on the logical_num_ranks members, logical
+    // rank l being slot logical_to_transport_slots[l]. Peers are connected
+    // a slot at a time with connect_peer, over Level Zero IPC only.
+    MooncakeEpXpuElasticBuffer(
+        int transport_rank, int capacity_ranks, int logical_rank,
+        int logical_num_ranks, int64_t num_buffer_bytes,
+        int64_t num_max_tokens_per_rank, int64_t hidden, int64_t num_topk,
+        bool use_fp8_dispatch, bool deterministic, bool allow_hybrid_mode,
+        bool allow_multiple_reduction, bool prefer_overlap_with_compute,
+        int sl_idx, int num_allocated_qps, int num_cpu_timeout_secs,
+        int num_gpu_timeout_secs, const std::string& transport,
+        const std::vector<int32_t>& nccl_unique_id,
+        const std::vector<int32_t>& logical_to_transport_slots,
+        uint64_t stream_ptr);
     ~MooncakeEpXpuElasticBuffer();
     MooncakeEpXpuElasticBuffer(const MooncakeEpXpuElasticBuffer&) = delete;
     MooncakeEpXpuElasticBuffer& operator=(const MooncakeEpXpuElasticBuffer&) =
@@ -99,6 +115,25 @@ class MooncakeEpXpuElasticBuffer {
     void sync_nvlink_ipc_handles(
         const std::vector<std::vector<int32_t>>& remote_handles,
         const std::vector<int>& active_ranks_mask);
+
+    // Capacity-aware buffers only, with CUDA's names and arguments; the RDMA
+    // ones (raddr to lids) must be empty, and so must ipc_handle only for a
+    // peer on another host, which is rejected. connect_peer maps slot
+    // `peer_rank` and checks it is readable; disconnect_peer unmaps it.
+    // drain_queue_pairs waits for this buffer's calls. set_ibgda_membership
+    // installs new members once every one of them has drained: it also
+    // clears the ready flags and restarts on the first buffer half, so all
+    // members must call it (or be new) before any of them dispatches.
+    void connect_peer(int peer_rank, int64_t raddr, int32_t rkey,
+                      int64_t subnet_prefix, int64_t interface_id,
+                      const std::vector<int32_t>& qpns,
+                      const std::vector<int32_t>& lids,
+                      const std::vector<int32_t>& ipc_handle);
+    void disconnect_peer(int peer_rank);
+    void drain_queue_pairs();
+    void set_ibgda_membership(
+        int logical_rank, int logical_num_ranks,
+        const std::vector<int32_t>& logical_to_transport_slots);
 
     // num_sms is accepted for API compatibility and ignored: the kernels size
     // their grids from the device's compute units. Both launch on the
@@ -146,6 +181,12 @@ class MooncakeEpXpuElasticBuffer {
         uint8_t* staging;
     };
     void checkAlive() const;
+    // Waits for every launched call and the proxy's writes.
+    void quiesce();
+    // Capacity-aware: rebuilds the logical peer table from the slot table
+    // (queue_ must be idle), and checks every member is connected (mu_ held).
+    void refreshPeerTable();
+    void checkMembersConnected() const;
     sycl::queue& queueFor(uint64_t stream_ptr);
     // All need mu_ held. launchQueue orders the call after the previous ones
     // and returns the queue to launch on; finish records the launch and
@@ -163,6 +204,8 @@ class MooncakeEpXpuElasticBuffer {
     // Waits for the proxy's writes (with mu_ not held).
     void drainProxy();
 
+    // Logical rank and member count (the slot and capacity unless
+    // capacity-aware).
     int rank_, num_ranks_;
     size_t half_stride_;
     int64_t timeout_ticks_;
@@ -194,6 +237,16 @@ class MooncakeEpXpuElasticBuffer {
 #if MOONCAKE_EP_XPU_RDMA
     std::unique_ptr<XpuEpProxy> proxy_;
 #endif
+
+    // Capacity-aware buffers only: ipc_ is indexed by slot, the kernels by
+    // logical rank, through d_logical_bases_ (each member's buffer).
+    bool planned_ = false;
+    int transport_rank_ = 0;
+    int capacity_ranks_ = 0;
+    std::vector<int32_t> slots_;           // [num_ranks_], logical to slot
+    std::vector<uint8_t> slot_connected_;  // [capacity_ranks_]
+    int32_t* d_slots_ = nullptr;
+    void** d_logical_bases_ = nullptr;
 };
 
 }  // namespace xpu_ep
