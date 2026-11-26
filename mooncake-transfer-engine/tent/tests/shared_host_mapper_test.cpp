@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstring>
@@ -68,6 +69,7 @@ class SharedHostMapping {
 
     void* base() const { return base_; }
     uint64_t length() const { return length_; }
+    int fd() const { return fd_; }
     const std::string& handle() const { return handle_; }
 
    private:
@@ -88,6 +90,28 @@ TEST(SharedHostMapperTest, SameProcessBufferIsUsedInPlace) {
     const auto target = reinterpret_cast<uint64_t>(mapping.base()) + 128;
     EXPECT_TRUE(mapper.Translate(segment, target, 64, &local));
     EXPECT_EQ(local, static_cast<char*>(mapping.base()) + 128);
+}
+
+TEST(SharedHostMapperTest, SamePidFromAnotherNamespaceFallsBack) {
+    SharedHostMapping mapping;
+    ASSERT_TRUE(mapping.Create());
+    struct stat st = {};
+    ASSERT_EQ(fstat(mapping.fd(), &st), 0);
+    // A peer in another PID namespace on this host can export a handle with
+    // our pid and fd number but its own memfd inode. Its address is not ours.
+    const std::string peer_handle =
+        "/proc/" + std::to_string(getpid()) + "/fd/" +
+        std::to_string(mapping.fd()) + ":" +
+        std::to_string(static_cast<unsigned long long>(st.st_ino) + 1) + ":" +
+        host_memfd::LocalBootId();
+    const auto segment =
+        MakeSharedSegment(mapping.base(), mapping.length(), peer_handle);
+
+    SharedHostMapper mapper;
+    void* local = nullptr;
+    EXPECT_FALSE(mapper.Translate(
+        segment, reinterpret_cast<uint64_t>(mapping.base()), 64, &local));
+    EXPECT_EQ(local, nullptr);
 }
 
 TEST(SharedHostMapperTest, InvalidHandleFallsBack) {
