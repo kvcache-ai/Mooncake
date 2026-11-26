@@ -1,6 +1,7 @@
 #include "transfer_engine.h"
 #include "transfer_engine_c.h"
 #include "config.h"
+#include "common.h"
 
 #include <cstring>
 #include <memory>
@@ -13,7 +14,11 @@ int encodeSegmentDescForStore(
     Json::Value &segmentJSON) {
     segmentJSON["name"] = desc.name;
     segmentJSON["protocol"] = desc.protocol;
+    if (!desc.tcp_data_host.empty()) {
+        segmentJSON["tcp_data_host"] = desc.tcp_data_host;
+    }
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
+    segmentJSON["tcp_proto_version"] = desc.tcp_proto_version;
     segmentJSON["timestamp"] = desc.timestamp;
 
     if (desc.protocol == "rdma" || desc.protocol == "barex" ||
@@ -71,7 +76,17 @@ decodeSegmentDescForStore(Json::Value &segmentJSON,
     auto desc = std::make_shared<mooncake::TransferMetadata::SegmentDesc>();
     desc->name = segment_name;
     desc->protocol = segmentJSON["protocol"].asString();
-    desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
+    if (segmentJSON.isMember("tcp_data_host") &&
+        segmentJSON["tcp_data_host"].isString()) {
+        desc->tcp_data_host = segmentJSON["tcp_data_host"].asString();
+    }
+    if (segmentJSON["tcp_data_port"].isInt()) {
+        desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
+    }
+    if (segmentJSON.isMember("tcp_proto_version") &&
+        segmentJSON["tcp_proto_version"].isInt()) {
+        desc->tcp_proto_version = segmentJSON["tcp_proto_version"].asInt();
+    }
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
 
@@ -271,6 +286,10 @@ extern "C" int mooncake_classic_cache_segment_descriptor_json(
     auto desc = decodeSegmentDescForStore(segmentJSON, open_name);
     if (!desc) {
         return -1;
+    }
+    if (desc->tcp_data_host.empty() && desc->tcp_data_port > 0 &&
+        mooncake::hasExplicitPort(open_name)) {
+        desc->tcp_data_host = mooncake::parseHostNameWithPort(open_name).first;
     }
     return metadata->addLocalSegment(segmentCacheId(open_name), open_name,
                                      std::move(desc));
