@@ -1285,13 +1285,19 @@ TEST_F(RedisHaKvProtocolTest,
     EXPECT_EQ(ErrorCode::OK, coordinator.ReleaseLeadership(*acquired->session));
 }
 
-TEST_F(RedisHaKvProtocolTest, RealClusterKvAndLeadershipAcrossAllShards) {
-    const auto* seeds = std::getenv("MC_TEST_REDIS_CLUSTER_SEEDS");
-    if (!seeds)
-        GTEST_SKIP()
-            << "Set MC_TEST_REDIS_CLUSTER_SEEDS for the nine-node test";
-    RedisHaKvBackend backend({.replicas_required = 2});
-    ASSERT_EQ(ErrorCode::OK, backend.Connect(seeds));
+KvWriteDurabilityPolicy RealClusterPolicy(bool persistent) {
+    KvWriteDurabilityPolicy policy{.replicas_required = 2};
+    if (persistent) {
+        policy.require_local_aof = true;
+        policy.replica_aof_required = 2;
+    }
+    return policy;
+}
+
+void RunRealClusterKvAndLeadership(std::string_view seeds, bool persistent) {
+    const std::string connstring(seeds);
+    RedisHaKvBackend backend(RealClusterPolicy(persistent));
+    ASSERT_EQ(ErrorCode::OK, backend.Connect(connstring));
     for (const auto& tag : {"b", "c", "a"}) {
         const auto cluster = std::string(tag);
         const auto key =
@@ -1299,6 +1305,10 @@ TEST_F(RedisHaKvProtocolTest, RealClusterKvAndLeadershipAcrossAllShards) {
         const auto result = backend.PutWithResult(key, "value");
         ASSERT_EQ(KvWriteStatus::kCommitted, result.status);
         EXPECT_EQ(2u, result.replicas_acked);
+        if (persistent) {
+            EXPECT_TRUE(result.local_aof_acked);
+            EXPECT_EQ(2u, result.replica_aof_acked);
+        }
         std::string value;
         ASSERT_EQ(ErrorCode::OK, backend.Get(key, value));
         EXPECT_EQ("value", value);
@@ -1315,7 +1325,7 @@ TEST_F(RedisHaKvProtocolTest, RealClusterKvAndLeadershipAcrossAllShards) {
         ASSERT_EQ(ErrorCode::OK, backend.DeleteRange(key, key + "0"));
         ha::backends::redis::RedisLeaderCoordinator coordinator(
             {.type = ha::HABackendType::REDIS,
-             .connstring = seeds,
+             .connstring = connstring,
              .cluster_namespace = cluster,
              .ha_redis_expected_replicas_per_shard = 2});
         ASSERT_EQ(ErrorCode::OK, coordinator.Connect());
@@ -1334,16 +1344,18 @@ TEST_F(RedisHaKvProtocolTest, RealClusterKvAndLeadershipAcrossAllShards) {
         EXPECT_EQ(ErrorCode::OK,
                   coordinator.ReleaseLeadership(*acquired->session));
     }
-    RedisHaKvBackend mismatch({.replicas_required = 3});
-    EXPECT_NE(ErrorCode::OK, mismatch.Connect(seeds));
+    KvWriteDurabilityPolicy mismatch{.replicas_required = 3};
+    if (persistent) {
+        mismatch.require_local_aof = true;
+        mismatch.replica_aof_required = 3;
+    }
+    RedisHaKvBackend mismatch_backend(mismatch);
+    EXPECT_NE(ErrorCode::OK, mismatch_backend.Connect(connstring));
 }
 
-TEST_F(RedisHaKvProtocolTest, RealClusterReshardingAndReplicaOnlySeed) {
-    const auto* seeds = std::getenv("MC_TEST_REDIS_CLUSTER_SEEDS");
-    if (!seeds)
-        GTEST_SKIP() << "Requires the private nine-node Cluster fixture";
+void RunRealClusterResharding(std::string_view seeds, bool persistent) {
     using namespace ha::common::redis;
-    std::string seed(seeds + std::string("redis+cluster://").size());
+    std::string seed(seeds.substr(std::string_view("redis+cluster://").size()));
     seed = seed.substr(0, seed.find(','));
     auto control = ConnectRedis(seed);
     ASSERT_TRUE(control);
@@ -1385,8 +1397,8 @@ TEST_F(RedisHaKvProtocolTest, RealClusterReshardingAndReplicaOnlySeed) {
     ASSERT_TRUE(target_context);
     ASSERT_EQ(0, setenv("MC_REDIS_TOPOLOGY_REFRESH_MS", "60000", 1));
     RedisClusterClient client;
-    ASSERT_EQ(ErrorCode::OK,
-              client.Connect("redis+cluster://" + replica_seed, 2));
+    ASSERT_EQ(ErrorCode::OK, client.Connect("redis+cluster://" + replica_seed,
+                                            2, false, persistent));
     const auto command = [](redisContext* context, const char* state,
                             const std::string& id) {
         RedisReplyPtr reply(static_cast<redisReply*>(redisCommand(
@@ -1401,9 +1413,17 @@ TEST_F(RedisHaKvProtocolTest, RealClusterReshardingAndReplicaOnlySeed) {
         ASSERT_TRUE(lease.reply);
         ASSERT_EQ(REDIS_REPLY_STATUS, lease.reply->type);
         EXPECT_EQ(target->endpoint, lease.endpoint);
-        auto ack = client.Wait(lease, 2, std::chrono::milliseconds(1000));
-        ASSERT_TRUE(ack);
-        EXPECT_EQ(2u, *ack);
+        if (persistent) {
+            auto aof =
+                client.WaitAof(lease, 2, std::chrono::milliseconds(1000));
+            ASSERT_TRUE(aof);
+            EXPECT_EQ(1u, aof->first);
+            EXPECT_EQ(2u, aof->second);
+        } else {
+            auto ack = client.Wait(lease, 2, std::chrono::milliseconds(1000));
+            ASSERT_TRUE(ack);
+            EXPECT_EQ(2u, *ack);
+        }
     }
     // No old keys occupy this slot in the private fixture at this point.
     for (const auto& primary : primaries) {
@@ -1422,13 +1442,23 @@ TEST_F(RedisHaKvProtocolTest, RealClusterReshardingAndReplicaOnlySeed) {
     RedisReplyPtr removed(static_cast<redisReply*>(
         redisCommand(target_context->get(), "DEL %s", key.c_str())));
     ASSERT_TRUE(removed);
+    if (persistent) {
+        RedisHaKvBackend backend(RealClusterPolicy(true));
+        ASSERT_EQ(ErrorCode::OK, backend.Connect(std::string(seeds)));
+        const auto after_key =
+            "/oplog/bar/reshard-" + UuidToString(generate_uuid());
+        const auto written = backend.PutWithResult(after_key, "after-reshard");
+        EXPECT_EQ(KvWriteStatus::kCommitted, written.status);
+        EXPECT_TRUE(written.local_aof_acked);
+        EXPECT_EQ(2u, written.replica_aof_acked);
+        EXPECT_EQ(ErrorCode::OK,
+                  backend.DeleteRange(after_key, after_key + "0"));
+    }
 }
 
-TEST_F(RedisHaKvProtocolTest, RealClusterReplicaPauseAndPrimaryFailover) {
-    const auto* seeds = std::getenv("MC_TEST_REDIS_CLUSTER_SEEDS");
-    if (!seeds)
-        GTEST_SKIP() << "Requires the private nine-node Cluster fixture";
-    std::string seed(seeds);
+void RunRealClusterFailover(std::string_view seeds, bool persistent) {
+    const std::string connstring(seeds);
+    std::string seed(connstring);
     seed.erase(0, std::string("redis+cluster://").size());
     seed = seed.substr(0, seed.find(','));
     auto control = ha::common::redis::ConnectRedis(seed);
@@ -1453,10 +1483,16 @@ TEST_F(RedisHaKvProtocolTest, RealClusterReplicaPauseAndPrimaryFailover) {
     ASSERT_FALSE(replica_endpoint.empty());
     auto replica = ha::common::redis::ConnectRedis(replica_endpoint);
     ASSERT_TRUE(replica.has_value());
-    RedisHaKvBackend backend(
-        {.replicas_required = 2,
-         .replica_ack_timeout = std::chrono::milliseconds(100)});
-    ASSERT_EQ(ErrorCode::OK, backend.Connect(seeds));
+    KvWriteDurabilityPolicy policy{
+        .replicas_required = 2,
+        .replica_ack_timeout = std::chrono::milliseconds(100)};
+    if (persistent) {
+        policy.require_local_aof = true;
+        policy.replica_aof_required = 2;
+        policy.replica_aof_ack_timeout = std::chrono::milliseconds(100);
+    }
+    RedisHaKvBackend backend(policy);
+    ASSERT_EQ(ErrorCode::OK, backend.Connect(connstring));
     ha::common::redis::RedisReplyPtr paused(static_cast<redisReply*>(
         redisCommand(replica->get(), "CLIENT PAUSE 1500 ALL")));
     ASSERT_NE(nullptr, paused);
@@ -1481,10 +1517,16 @@ TEST_F(RedisHaKvProtocolTest, RealClusterReplicaPauseAndPrimaryFailover) {
             static_cast<redisReply*>(redisCommand(replica->get(), "ROLE")));
         promoted = role && role->type == REDIS_REPLY_ARRAY &&
                    std::string(role->element[0]->str) == "master";
-        if (promoted && backend.PutWithResult(key, "after-failover").status ==
-                            KvWriteStatus::kCommitted) {
-            recovered = true;
-            break;
+        if (promoted) {
+            const auto written = backend.PutWithResult(key, "after-failover");
+            if (written.status == KvWriteStatus::kCommitted) {
+                if (persistent) {
+                    EXPECT_TRUE(written.local_aof_acked);
+                    EXPECT_EQ(2u, written.replica_aof_acked);
+                }
+                recovered = true;
+                break;
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
@@ -1493,6 +1535,56 @@ TEST_F(RedisHaKvProtocolTest, RealClusterReplicaPauseAndPrimaryFailover) {
     EXPECT_EQ(ErrorCode::OK, backend.Get(key, value));
     EXPECT_EQ("after-failover", value);
     EXPECT_EQ(ErrorCode::OK, backend.DeleteRange(key, key + "0"));
+}
+
+TEST_F(RedisHaKvProtocolTest, RealClusterKvAndLeadershipAcrossAllShards) {
+    const auto* seeds = std::getenv("MC_TEST_REDIS_CLUSTER_SEEDS");
+    if (!seeds)
+        GTEST_SKIP()
+            << "Set MC_TEST_REDIS_CLUSTER_SEEDS for the nine-node test";
+    RunRealClusterKvAndLeadership(seeds, /*persistent=*/false);
+}
+
+TEST_F(RedisHaKvProtocolTest,
+       RealClusterPersistentKvAndLeadershipAcrossAllShards) {
+    const auto* seeds = std::getenv("MC_TEST_REDIS_CLUSTER_SEEDS");
+    if (!seeds)
+        GTEST_SKIP()
+            << "Set MC_TEST_REDIS_CLUSTER_SEEDS for the nine-node AOF test";
+    ASSERT_EQ(0, ::setenv("MC_REDIS_DURABILITY_PROFILE", "persistent", 1));
+    RunRealClusterKvAndLeadership(seeds, /*persistent=*/true);
+}
+
+TEST_F(RedisHaKvProtocolTest, RealClusterReshardingAndReplicaOnlySeed) {
+    const auto* seeds = std::getenv("MC_TEST_REDIS_CLUSTER_SEEDS");
+    if (!seeds)
+        GTEST_SKIP() << "Requires the private nine-node Cluster fixture";
+    RunRealClusterResharding(seeds, /*persistent=*/false);
+}
+
+TEST_F(RedisHaKvProtocolTest,
+       RealClusterPersistentReshardingAndReplicaOnlySeed) {
+    const auto* seeds = std::getenv("MC_TEST_REDIS_CLUSTER_SEEDS");
+    if (!seeds)
+        GTEST_SKIP() << "Requires the private nine-node AOF Cluster fixture";
+    ASSERT_EQ(0, ::setenv("MC_REDIS_DURABILITY_PROFILE", "persistent", 1));
+    RunRealClusterResharding(seeds, /*persistent=*/true);
+}
+
+TEST_F(RedisHaKvProtocolTest, RealClusterReplicaPauseAndPrimaryFailover) {
+    const auto* seeds = std::getenv("MC_TEST_REDIS_CLUSTER_SEEDS");
+    if (!seeds)
+        GTEST_SKIP() << "Requires the private nine-node Cluster fixture";
+    RunRealClusterFailover(seeds, /*persistent=*/false);
+}
+
+TEST_F(RedisHaKvProtocolTest,
+       RealClusterPersistentReplicaPauseAndPrimaryFailover) {
+    const auto* seeds = std::getenv("MC_TEST_REDIS_CLUSTER_SEEDS");
+    if (!seeds)
+        GTEST_SKIP() << "Requires the private nine-node AOF Cluster fixture";
+    ASSERT_EQ(0, ::setenv("MC_REDIS_DURABILITY_PROFILE", "persistent", 1));
+    RunRealClusterFailover(seeds, /*persistent=*/true);
 }
 
 TEST_F(RedisHaKvProtocolTest, EveryWriteWaitsOnTheExecutionConnection) {

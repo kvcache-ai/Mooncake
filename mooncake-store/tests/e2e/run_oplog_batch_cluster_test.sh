@@ -16,63 +16,94 @@ cleanup() {
     echo "Redis test logs retained in $test_dir"
 }
 trap cleanup EXIT
-nodes=()
-for i in {0..10}; do
-    port=$((base_port + i))
-    mkdir "$test_dir/$port"
-    extra=()
-    if ((i < 9)); then
-        extra=(--cluster-enabled yes --cluster-config-file nodes.conf)
-        nodes+=("127.0.0.1:$port")
-    elif ((i == 10)); then
-        extra=(--replicaof 127.0.0.1 "$((base_port + 9))")
-    fi
-    "$redis_server" --bind 127.0.0.1 --port "$port" --save "" --appendonly no \
-        --dir "$test_dir/$port" --logfile "$test_dir/$port/redis.log" \
-        "${extra[@]}" &
-    pids+=("$!")
-done
-for i in {0..10}; do
+start_cluster() {
+    local base_port=$1
+    local appendonly=$2
+    local appendfsync=$3
+    local nodes=()
+    local cluster_pids=()
+    for i in {0..10}; do
+        port=$((base_port + i))
+        mkdir "$test_dir/$port"
+        extra=()
+        if ((i < 9)); then
+            extra=(--cluster-enabled yes --cluster-config-file nodes.conf)
+            nodes+=("127.0.0.1:$port")
+        elif ((i == 10)); then
+            extra=(--replicaof 127.0.0.1 "$((base_port + 9))")
+        fi
+        "$redis_server" --bind 127.0.0.1 --port "$port" --save "" \
+            --appendonly "$appendonly" --appendfsync "$appendfsync" \
+            --dir "$test_dir/$port" --logfile "$test_dir/$port/redis.log" \
+            "${extra[@]}" &
+        cluster_pids+=("$!")
+        pids+=("$!")
+    done
+    for i in {0..10}; do
+        ready=0
+        for attempt in {1..100}; do
+            kill -0 "${cluster_pids[$i]}"
+            if "$redis_cli" -p "$((base_port + i))" ping 2>/dev/null |
+                grep -q PONG; then
+                ready=1
+                break
+            fi
+            sleep 0.1
+        done
+        [[ $ready == 1 ]]
+    done
+    "$redis_cli" --cluster create "${nodes[@]}" --cluster-replicas 2 \
+        --cluster-yes
     ready=0
     for attempt in {1..100}; do
-        kill -0 "${pids[$i]}"
-        if "$redis_cli" -p "$((base_port + i))" ping 2>/dev/null | grep -q PONG; then
+        synced=1
+        for i in 3 4 5 6 7 8 10; do
+            if ! "$redis_cli" -p "$((base_port + i))" info replication |
+                grep -q master_link_status:up; then
+                synced=0
+            fi
+        done
+        if [[ $synced == 1 ]] &&
+           "$redis_cli" -p "$base_port" cluster info | grep -q cluster_state:ok &&
+           "$redis_cli" -p "$base_port" --json cluster slots |
+               python3 -c 'import json,sys; slots=json.load(sys.stdin); sys.exit(not (len(slots)==3 and all(len(s)==5 for s in slots)))'; then
             ready=1
             break
         fi
-        sleep 0.1
+        sleep 0.2
     done
-    [[ $ready == 1 ]]
-done
-"$redis_cli" --cluster create "${nodes[@]}" --cluster-replicas 2 --cluster-yes
-ready=0
-for attempt in {1..100}; do
-    synced=1
-    for i in 3 4 5 6 7 8 10; do
-        if ! "$redis_cli" -p "$((base_port + i))" info replication |
-            grep -q master_link_status:up; then
-            synced=0
-        fi
-    done
-    if [[ $synced == 1 ]] &&
-       "$redis_cli" -p "$base_port" cluster info | grep -q cluster_state:ok &&
-       "$redis_cli" -p "$base_port" --json cluster slots |
-           python3 -c 'import json,sys; slots=json.load(sys.stdin); sys.exit(not (len(slots)==3 and all(len(s)==5 for s in slots)))'; then
-        ready=1
-        break
+    if [[ $ready != 1 ]]; then
+        "$redis_cli" -p "$base_port" --json cluster slots
+        "$redis_cli" -p "$base_port" cluster nodes
+        exit 1
     fi
-    sleep 0.2
-done
-if [[ $ready != 1 ]]; then
-    "$redis_cli" -p "$base_port" --json cluster slots
-    "$redis_cli" -p "$base_port" cluster nodes
-    exit 1
-fi
+    # Keep this function in the current shell: running it in command
+    # substitution would record the server PIDs in a throwaway subshell and
+    # leave orphaned Redis processes behind on exit.
+    cluster_seeds="redis+cluster://127.0.0.1:$base_port,127.0.0.1:$((base_port + 1))"
+}
+
+start_cluster "$base_port" no everysec
+memory_seeds=$cluster_seeds
+persistent_base=$((base_port + 100))
+# The persistent cases assert WAITAOF acknowledgments, so make every fsync
+# immediate instead of relying on the once-per-second AOF cycle.
+start_cluster "$persistent_base" yes always
+persistent_seeds=$cluster_seeds
 # Allow the initial replica synchronizations to complete before asserting ACKs.
 sleep 2
-export MC_TEST_REDIS_CLUSTER_SEEDS="redis+cluster://127.0.0.1:$base_port,127.0.0.1:$((base_port + 1))"
-"$build_dir/mooncake-store/tests/redis_ha_kv_backend_test" \
+# Memory-profile cases, including the RealCluster* tests without the persistent
+# prefix, run against the non-AOF fixture.
+GTEST_FILTER='-*RealClusterPersistent*' \
+    MC_TEST_REDIS_CLUSTER_SEEDS="$memory_seeds" \
+    "$build_dir/mooncake-store/tests/redis_ha_kv_backend_test" \
     --redis_endpoint="127.0.0.1:$((base_port + 9))"
+# Persistent-profile cases require AOF on every node, including replicas, and
+# run against the AOF fixture. Each test sets the profile itself.
+GTEST_FILTER='*RealClusterPersistent*' \
+    MC_TEST_REDIS_CLUSTER_SEEDS="$persistent_seeds" \
+    "$build_dir/mooncake-store/tests/redis_ha_kv_backend_test"
+export MC_TEST_REDIS_CLUSTER_SEEDS="$memory_seeds"
 GTEST_FILTER='*Redis*' "$build_dir/mooncake-store/tests/high_availability_test" \
     --redis_endpoint="127.0.0.1:$((base_port + 9))"
 python3 - "$build_dir" "$test_dir" "$redis_cli" "$base_port" <<'PY_REDIS_SERVICE_TEST'
