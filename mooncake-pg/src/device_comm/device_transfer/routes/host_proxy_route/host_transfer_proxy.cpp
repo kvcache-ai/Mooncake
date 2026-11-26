@@ -59,11 +59,11 @@ struct HostTransferProxy::LaneSet {
     explicit LaneSet(TransferEngine& engine) noexcept : engine(engine) {}
     ~LaneSet() noexcept;
 
-    static PGResult<std::unique_ptr<LaneSet>> create(TransferEngine& engine);
+    static PGResult<std::unique_ptr<LaneSet>> create(TransferEngine& engine,
+                                                     int device_index);
 
     TransferEngine& engine;
-    HostProxyCommandSlot* host_slots = nullptr;
-    HostProxyCommandSlot* device_slots = nullptr;
+    MappedHostBuffer<HostProxyCommandSlot> slots;
     std::array<uint64_t, kTransferLaneCount> signal_staging{};
     bool signal_staging_registered = false;
     std::array<Lane, kTransferLaneCount> lanes{};
@@ -77,19 +77,10 @@ HostTransferProxy::LaneSet::~LaneSet() noexcept {
                        << result;
         }
     }
-
-    if (host_slots) {
-        std::destroy_n(host_slots, kTransferLaneCount);
-        const auto result = cudaFreeHost(host_slots);
-        if (result != cudaSuccess) {
-            LOG(ERROR) << "Failed to free host-proxy slots: "
-                       << cudaGetErrorString(result);
-        }
-    }
 }
 
 PGResult<std::unique_ptr<HostTransferProxy::LaneSet>>
-HostTransferProxy::LaneSet::create(TransferEngine& engine) {
+HostTransferProxy::LaneSet::create(TransferEngine& engine, int device_index) {
     auto lane_set =
         std::unique_ptr<LaneSet>(new (std::nothrow) LaneSet(engine));
     if (!lane_set) {
@@ -97,16 +88,9 @@ HostTransferProxy::LaneSet::create(TransferEngine& engine) {
                            "failed to allocate fixed host-proxy lanes");
     }
 
-    constexpr size_t slot_count = kTransferLaneCount;
-    constexpr size_t slot_size = slot_count * sizeof(HostProxyCommandSlot);
-    PG_TRY_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&lane_set->host_slots),
-                              slot_size,
-                              cudaHostAllocMapped | cudaHostAllocPortable));
-    std::uninitialized_value_construct_n(lane_set->host_slots, slot_count);
-
-    PG_TRY_CUDA(cudaHostGetDevicePointer(
-        reinterpret_cast<void**>(&lane_set->device_slots), lane_set->host_slots,
-        0));
+    PG_TRY(lane_set->slots,
+           MappedHostBuffer<HostProxyCommandSlot>::create(
+               device_index, kTransferLaneCount, cudaHostAllocPortable));
 
     PG_TRY_TE(engine.registerLocalMemory(lane_set->signal_staging.data(),
                                          sizeof(lane_set->signal_staging),
@@ -116,7 +100,7 @@ HostTransferProxy::LaneSet::create(TransferEngine& engine) {
 
     for (uint32_t index = 0; index < kTransferLaneCount; ++index) {
         auto& lane = lane_set->lanes[index];
-        lane.host_slot = lane_set->host_slots + index;
+        lane.host_slot = lane_set->slots.host() + index;
         lane.signal_staging = lane_set->signal_staging.data() + index;
     }
     return lane_set;
@@ -444,9 +428,9 @@ PGResult<HostProxyCommandSlot*> HostTransferProxy::initializeDevice(
     PG_VALIDATE_STATE(!lane_set_,
                       "HostTransferProxy device is already initialized");
 
-    PG_TRY(auto lane_set, LaneSet::create(engine_));
+    PG_TRY(auto lane_set, LaneSet::create(engine_, device_index));
 
-    auto* const device_slots = lane_set->device_slots;
+    auto* const device_slots = lane_set->slots.device();
     lane_set_ = std::move(lane_set);
     state_changed_.notify_all();
     return device_slots;

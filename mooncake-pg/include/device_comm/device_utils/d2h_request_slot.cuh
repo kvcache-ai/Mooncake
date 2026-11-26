@@ -5,7 +5,7 @@
 
 #include "device_comm/device_utils/d2h_request_slot_types.h"
 #include "pg_assert.h"
-#include "device_comm/device_utils/device_timeout.cuh"
+#include "device_comm/device_utils/device_utils.cuh"
 
 namespace mooncake {
 

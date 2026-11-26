@@ -61,7 +61,11 @@ enum class DataType : uint8_t {
 
 // Returns zero for an invalid enum value. Public API validation is responsible
 // for rejecting such values before using the result in size arithmetic.
-inline constexpr std::size_t elementSize(DataType datatype) noexcept {
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+    inline constexpr std::size_t
+    elementSize(DataType datatype) noexcept {
     switch (datatype) {
         case DataType::Int8:
         case DataType::Uint8:
