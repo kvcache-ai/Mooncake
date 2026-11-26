@@ -276,8 +276,10 @@ struct ObjectMetadata {
         return num_visited;
     }
 
-    bool HasReplica(const std::function<bool(const Replica&)>& pred_fn) const {
-        return std::ranges::any_of(GetPart(0).replicas(), pred_fn);
+    template <typename Pred>
+    bool HasReplica(Pred&& pred_fn) const {
+        return std::ranges::any_of(GetPart(0).replicas(),
+                                   std::forward<Pred>(pred_fn));
     }
 
     bool AllReplicas(const std::function<bool(const Replica&)>& pred_fn) const {
@@ -324,6 +326,15 @@ struct ObjectMetadata {
     void GrantReadLease(std::chrono::milliseconds ttl) const {
         SpinLocker locker(&lock);
         lease_->GrantReadLease(ttl);
+    }
+
+    // Extend the read lease to a precomputed deadline while the caller holds
+    // the key's route lock (shared or exclusive). `lease_` is only reassigned
+    // under the key's exclusive write lock (PublishLocked / RebuildGroupState)
+    // and Lease::ExtendTo is lock-free atomic.
+    void ExtendReadLeaseTo(std::chrono::system_clock::time_point deadline) const
+        NO_THREAD_SAFETY_ANALYSIS {
+        lease_->ExtendTo(deadline);
     }
 
     // Whether the authoritative lease is expired.

@@ -1910,8 +1910,12 @@ class MasterService {
     };
 
     // What ExistKey answers for an object: whether it has a replica to read,
-    // granting it a read lease if it does and `grant_lease` is set.
-    bool ReadExistence(const ObjectMetadata& metadata, bool grant_lease) const;
+    // extending its read lease to `lease_deadline` when set.
+    bool ReadExistence(const ObjectMetadata& metadata,
+                       std::optional<std::chrono::system_clock::time_point>
+                           lease_deadline) const;
+    std::optional<std::chrono::system_clock::time_point> MakeReadLeaseDeadline(
+        bool grant_lease) const;
     // A client read of an object: its readable replicas, after the read's
     // effects on it (the read lease, the DFS LRU, hit metrics). What is left
     // for when no key is held goes to `follow_ups`.
