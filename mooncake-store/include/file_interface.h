@@ -222,6 +222,12 @@ class UringFile : public StorageFile {
                                                   size_t length,
                                                   off_t offset = 0);
 
+    // Writes the concatenation of iov from offset 0 through small per-thread
+    // aligned staging slots, overlapping the copy into each slot with the
+    // device writes of the slots before it. The end is zero-padded to 4 KiB.
+    // Returns the bytes written, padding included.
+    tl::expected<size_t, ErrorCode> write_staged(const iovec *iov, int iovcnt);
+
     // Batch read: submit up to 32 independent reads at once (each at its own
     // offset) before waiting for completions, giving NVMe queue depth > 1.
     // Use in BatchLoadBucket instead of per-key read_aligned() loops.

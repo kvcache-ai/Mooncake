@@ -286,6 +286,132 @@ class SharedUringRing {
         return submit_vector(/*write=*/true, fd, iovs, cnt, off);
     }
 
+    /// Write the concatenation of @p iovs from offset 0 through @p nslots
+    /// aligned staging slots of @p slot_size bytes each. Each slot is
+    /// submitted as soon as it is filled, and a slot is refilled once its
+    /// write completes, so copying overlaps the device writes. The last slot
+    /// is zero-padded to MIN_CHUNK. Returns the bytes written, padding
+    /// included.
+    tl::expected<size_t, ErrorCode> write_staged(int fd, const iovec* iovs,
+                                                 int cnt, char* const* slots,
+                                                 unsigned nslots,
+                                                 size_t slot_size) {
+        cqe_errno_ = 0;
+        if (!initialized_)
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        nslots = std::min(nslots, QUEUE_DEPTH);
+        const uint64_t op = next_operation_tag();
+        std::vector<unsigned> free_slots;
+        std::vector<size_t> slot_len(nslots, 0);
+        for (unsigned i = nslots; i > 0; --i) free_slots.push_back(i - 1);
+
+        int iov_idx = 0;
+        size_t iov_off = 0;
+        off_t file_off = 0;
+        size_t written = 0;
+        unsigned in_kernel = 0;
+        bool has_error = false;
+
+        while (true) {
+            while (!has_error && !free_slots.empty() && iov_idx < cnt) {
+                const unsigned slot = free_slots.back();
+                char* dst = slots[slot];
+                size_t fill = 0;
+                while (fill < slot_size && iov_idx < cnt) {
+                    const size_t n = std::min(slot_size - fill,
+                                              iovs[iov_idx].iov_len - iov_off);
+                    std::memcpy(
+                        dst + fill,
+                        static_cast<const char*>(iovs[iov_idx].iov_base) +
+                            iov_off,
+                        n);
+                    fill += n;
+                    iov_off += n;
+                    if (iov_off == iovs[iov_idx].iov_len) {
+                        ++iov_idx;
+                        iov_off = 0;
+                    }
+                }
+                if (fill == 0) break;
+                const size_t len =
+                    (fill + MIN_CHUNK - 1) / MIN_CHUNK * MIN_CHUNK;
+                if (len > fill) std::memset(dst + fill, 0, len - fill);
+                struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+                if (!sqe) {
+                    LOG(ERROR) << "[SharedUringRing] SQ full (write_staged)";
+                    has_error = true;
+                    break;
+                }
+                io_uring_prep_write(sqe, fd, dst, len, file_off);
+                sqe->user_data = op | static_cast<uint64_t>(slot + 1);
+                free_slots.pop_back();
+                slot_len[slot] = len;
+                file_off += static_cast<off_t>(len);
+                auto submit = detail::submit_all_pending(
+                    [this] { return io_uring_sq_ready(&ring_); },
+                    [this](unsigned) { return io_uring_submit(&ring_); },
+                    [] { std::this_thread::yield(); });
+                in_kernel += submit.submitted;
+                if (submit.error != 0 || submit.pending != 0) {
+                    LOG(ERROR)
+                        << "[SharedUringRing] write_staged submit "
+                           "failed: submitted="
+                        << submit.submitted << " pending=" << submit.pending
+                        << " error=" << submit.error;
+                    drain_submitted(in_kernel, op);
+                    reset_ring();
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                }
+            }
+            if (in_kernel == 0) break;
+
+            struct io_uring_cqe* cqe;
+            if (!wait_cqe(&cqe)) {
+                reset_ring();
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            do {
+                if ((cqe->user_data & ~BATCH_INDEX_MASK) == op) {
+                    const uint64_t index = cqe->user_data & BATCH_INDEX_MASK;
+                    --in_kernel;
+                    if (index == 0 || index > nslots) {
+                        LOG(ERROR) << "[SharedUringRing] invalid write_staged "
+                                      "CQE index: "
+                                   << index;
+                        has_error = true;
+                    } else {
+                        const unsigned slot = static_cast<unsigned>(index - 1);
+                        if (cqe->res < 0) {
+                            record_cqe_errno(cqe->res);
+                            LOG(ERROR) << "[SharedUringRing] write_staged CQE "
+                                          "error: "
+                                       << strerror(-cqe->res);
+                            has_error = true;
+                        } else if (static_cast<size_t>(cqe->res) !=
+                                   slot_len[slot]) {
+                            // O_DIRECT writes of whole blocks are not
+                            // expected to be short; treat one as a failure
+                            // rather than resubmitting the tail.
+                            LOG(ERROR) << "[SharedUringRing] short "
+                                          "write_staged: "
+                                       << cqe->res << " of " << slot_len[slot];
+                            has_error = true;
+                        } else {
+                            written += slot_len[slot];
+                        }
+                        free_slots.push_back(slot);
+                    }
+                }
+                // CQEs of other ops are leftovers of an earlier failed
+                // operation; drop them.
+                io_uring_cq_advance(&ring_, 1);
+            } while (in_kernel > 0 && io_uring_peek_cqe(&ring_, &cqe) == 0);
+        }
+
+        if (has_error) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return written;
+    }
+
     // Descriptor for one independently-addressed read in a batch.
     using ReadDesc = UringFile::ReadDesc;
 
@@ -1064,6 +1190,45 @@ tl::expected<size_t, ErrorCode> UringFile::write_aligned(const void* buffer,
     }
 
     auto res = SharedUringRing::instance().write(fd_, buffer, length, offset);
+    if (!res) record_ring_errno();
+    return res;
+}
+
+namespace {
+// Per-thread aligned slots for UringFile::write_staged. Allocated on first
+// use and kept for the thread's lifetime, so every bucket a thread writes
+// reuses the same, already faulted, pages.
+struct StagingSlots {
+    static constexpr unsigned kSlots = 8;
+    static constexpr size_t kSlotSize = 4 * 1024 * 1024;
+    char* slots[kSlots] = {};
+    bool ok = false;
+
+    StagingSlots() {
+        for (auto& slot : slots) {
+            void* p = nullptr;
+            if (posix_memalign(&p, 4096, kSlotSize) != 0) return;
+            slot = static_cast<char*>(p);
+        }
+        ok = true;
+    }
+    ~StagingSlots() {
+        for (auto* slot : slots) free(slot);
+    }
+};
+}  // namespace
+
+tl::expected<size_t, ErrorCode> UringFile::write_staged(const iovec* iov,
+                                                        int iovcnt) {
+    if (fd_ < 0) return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
+    thread_local StagingSlots staging;
+    if (!staging.ok) {
+        LOG(ERROR) << "[UringFile] cannot allocate write staging slots";
+        return make_error<size_t>(ErrorCode::INTERNAL_ERROR);
+    }
+    auto res = SharedUringRing::instance().write_staged(
+        fd_, iov, iovcnt, staging.slots, StagingSlots::kSlots,
+        StagingSlots::kSlotSize);
     if (!res) record_ring_errno();
     return res;
 }

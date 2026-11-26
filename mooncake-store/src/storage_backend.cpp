@@ -2955,6 +2955,17 @@ struct AlignedCopyBuffer {
     size_t capacity = 0;
 };
 
+// Threads that copy a packed direct bucket into its write buffer. Parallel
+// packing is opt-in; small buckets stay on the caller thread.
+unsigned PackedCopyThreads(size_t total_size) {
+    if (total_size < 16 * 1024 * 1024) return 1;
+    return static_cast<unsigned>(
+        std::clamp(Environ::ReadOr(BucketBackendEnvironmentVariables::
+                                       MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS,
+                                   1),
+                   1, 8));
+}
+
 }  // namespace
 
 // Each object takes whole 4 KiB blocks: zeros and then the key, so that the
@@ -3102,6 +3113,32 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         }
     }
 #ifdef USE_URING
+    // With one copy thread, stream a packed bucket through small staging
+    // slots: the copy overlaps the device writes, and the per-thread buffer
+    // stays fixed instead of growing to the largest bucket. The bytes on disk
+    // are the same as with the whole-bucket buffer below.
+    else if (UringFile* staged_file = dynamic_cast<UringFile*>(file.get());
+             staged_file && PackedCopyThreads(static_cast<size_t>(
+                                bucket_metadata->data_size)) == 1) {
+        const size_t aligned_size =
+            align_up(static_cast<size_t>(bucket_metadata->data_size),
+                     kDirectIOAlignment);
+        auto write_result = staged_file->write_staged(
+            iovs.data(), static_cast<int>(iovs.size()));
+        if (!write_result) {
+            NotifyDiskError(staged_file->sys_errno(), "write");
+            LOG(ERROR) << "write_staged failed for: " << bucket_id
+                       << ", error: " << write_result.error()
+                       << ErrnoSuffix(staged_file->sys_errno());
+            return tl::make_unexpected(write_result.error());
+        }
+        if (write_result.value() != aligned_size) {
+            LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
+                       << ", expected: " << aligned_size
+                       << ", got: " << write_result.value();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+    }
     // Try to use write_aligned for O_DIRECT I/O if file is UringFile
     else if (UringFile* uring_file = dynamic_cast<UringFile*>(file.get())) {
         size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
@@ -3129,15 +3166,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         void* write_buffer = scratch.data.get();
 
         // Copy disjoint byte ranges without changing the persisted layout.
-        // Parallel packing is opt-in; small buckets stay on the caller thread.
-        const unsigned copy_threads =
-            total_size < 16 * 1024 * 1024
-                ? 1
-                : static_cast<unsigned>(std::clamp(
-                      Environ::ReadOr(BucketBackendEnvironmentVariables::
-                                          MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS,
-                                      1),
-                      1, 8));
+        const unsigned copy_threads = PackedCopyThreads(total_size);
         const size_t range_size = align_up(
             (total_size + copy_threads - 1) / copy_threads, kDirectIOAlignment);
         const auto copy_range = [&](unsigned worker) {
