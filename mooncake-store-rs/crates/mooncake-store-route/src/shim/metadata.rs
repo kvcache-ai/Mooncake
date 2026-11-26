@@ -32,6 +32,18 @@ impl RouteDirectory for MetadataRouteDirectory {
         self.metadata.get_object_route(key)
     }
 
+    fn get_object_routes(
+        &self,
+        _observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<Option<ObjectRoute>>> {
+        match keys {
+            [] => Ok(Vec::new()),
+            [key] => Ok(vec![self.metadata.get_object_route(key)?]),
+            _ => self.metadata.get_object_routes(keys),
+        }
+    }
+
     fn confirm_replica_reference(
         &self,
         _observer: &ClientLease,

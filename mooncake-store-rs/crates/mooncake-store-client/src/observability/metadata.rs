@@ -230,6 +230,10 @@ impl MetadataBackend for ObservedMetadataBackend {
         self.observe("get_object_route", || self.inner.get_object_route(key))
     }
 
+    fn get_object_routes(&self, keys: &[ObjectKey]) -> Result<Vec<Option<ObjectRoute>>> {
+        self.observe("get_object_routes", || self.inner.get_object_routes(keys))
+    }
+
     fn list_object_routes(&self) -> Result<Vec<ObjectRoute>> {
         self.observe("list_object_routes", || self.inner.list_object_routes())
     }
