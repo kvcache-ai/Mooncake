@@ -84,9 +84,19 @@ bounded post preserves a signaled tail. Endpoint generations fence stale error
 feedback. Window updates use the existing worker monitor; rail/device health
 and recovery remain owned by the existing TENT mechanisms.
 
+The TENT monitor updates windows approximately once per second. Pressure and
+completion feedback is accumulated between ticks, so a window response can take
+up to one monitor period, plus scheduling delay. The compatibility epoch-count
+settings do not shorten this interval.
+
 Worker route caches and an endpoint binding fast path avoid shared route-map
 lookups after binding. Permits for slices left unposted by QP capacity are
 returned in the same posting pass.
+
+Route entries are retained for the lifetime of the worker instance to keep its
+raw-pointer caches valid. The monitor visits all retained routes each tick;
+memory use and scan cost therefore grow with the number of distinct paths seen,
+including retired peers. This implementation does not reclaim idle routes.
 
 This adapter does not add task-status APIs or change recovery probes.
 The generated build configuration is also
