@@ -127,6 +127,9 @@ struct DeviceTransferEndpoint {
     // request an installation or invalidate installed resources.
     uint64_t version = 0;
 
+    // Process identity for topology decisions. Empty when unavailable.
+    std::string host_id;
+
     bool operator==(const DeviceTransferEndpoint&) const = default;
 };
 
@@ -151,6 +154,10 @@ struct DeviceTransferRouteInfo {
     // the destination rank's directly mapped GPU memory.
     bool native_atomics = false;
 
+    [[nodiscard]] bool supportsDirectLl() const noexcept {
+        return directly_addressable && native_atomics;
+    }
+
     bool operator==(const DeviceTransferRouteInfo&) const = default;
 };
 
@@ -165,6 +172,7 @@ enum class DeviceCollectiveAlgorithm : uint8_t {
     OneShot = 2,
     Pairwise = 3,
     Star = 4,
+    HierarchicalOneShotRing = 5,
 };
 
 // Runtime, protocol and algorithm endpoints owned by one communicator.
@@ -308,6 +316,9 @@ struct GroupView {
     int32_t max_group_size = 0;          // fixed in-group slot capacity
     std::vector<GlobalRank> rank_order;  // InGroupRank -> GlobalRank
     std::vector<GroupMember> members;    // indexed by GlobalRank
+
+    // Leader GlobalRank for each rank in active-view order.
+    struct_pack::compatible<std::vector<GlobalRank>, 1> hierarchical_leaders;
 
     bool operator==(const GroupView&) const = default;
 };

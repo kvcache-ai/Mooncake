@@ -40,6 +40,8 @@ struct ResolvedGroupView {
     uint64_t buffer_size = 0;
     std::vector<ResolvedParticipant> participants;
     std::vector<DeviceCollectiveAlgorithmChoice> collective_algorithm_choices;
+    // For each active index, the active index of its hierarchical leader.
+    std::vector<uint32_t> hierarchical_leader_indices;
 
     [[nodiscard]] DeviceGroupView asDeviceView() const noexcept {
         DeviceGroupView view{

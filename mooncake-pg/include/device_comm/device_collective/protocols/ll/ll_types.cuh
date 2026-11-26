@@ -58,6 +58,9 @@ struct LLState {
     // Remote tag-recycle signal offsets, indexed by DeviceGroupView active
     // index.
     uint64_t tag_recycle_signal_offsets[kMaxNumRanks] = {};
+    // Bound remote peers in full-view active-index order.
+    uint32_t peer_count = 0;
+    uint32_t peer_active_indices[kMaxNumRanks] = {};
     // Local progress, indexed by channel.
     LLChannelProgress* progress = nullptr;
 };

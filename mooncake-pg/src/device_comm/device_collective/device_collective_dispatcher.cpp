@@ -5,6 +5,7 @@
 
 #include <glog/logging.h>
 
+#include "device_comm/device_collective/algorithms/hierarchical/hierarchical_algorithm.h"
 #include "device_comm/device_collective/algorithms/one_shot/one_shot_algorithm.h"
 #include "device_comm/device_collective/algorithms/pairwise/pairwise_algorithm.h"
 #include "device_comm/device_collective/algorithms/ring/ring_algorithm.h"
@@ -85,6 +86,16 @@ DeviceCollectiveDispatcher::create(DeviceTransferService& transfer_service,
         dispatcher->tryLoadAlgorithm<OneShotAlgorithm>(
             transfer_service, max_group_size, collective, *ll);
     }
+    if (simple && ll) {
+        auto* local_ll = dispatcher->tryLoadProtocol<LLProtocol>(
+            transfer_service, self_rank, max_group_size,
+            LLProtocol::Scope::DirectPeers);
+        if (local_ll) {
+            dispatcher->tryLoadAlgorithm<HierarchicalAlgorithm>(
+                transfer_service, max_group_size, collective, workspace,
+                *local_ll, *simple);
+        }
+    }
     return dispatcher;
 }
 
@@ -112,7 +123,8 @@ PGResult<void> DeviceCollectiveDispatcher::installGroupView(
                 algorithm->supports(choice.operation),
                 "configured algorithm is unavailable for this op");
             selected_algorithms.insert(algorithm);
-            required_protocols.insert(&algorithm->protocol());
+            const auto protocols = algorithm->protocols();
+            required_protocols.insert(protocols.begin(), protocols.end());
         }
     }
 
@@ -168,6 +180,13 @@ PGResult<const AlgorithmProvider*> DeviceCollectiveDispatcher::selectAlgorithm(
         request);
     for (const auto& choice : algorithm_choices_) {
         if (choice.operation != operation || bytes > choice.max_bytes) continue;
+        if (choice.algorithm == DeviceCollectiveAlgorithm::HierarchicalOneShotRing) {
+            const auto* allreduce = std::get_if<AllReduceRequest>(&request);
+            if (!allreduce || allreduce->datatype != DataType::Float32 ||
+                (allreduce->op != ReduceOp::Sum && allreduce->op != ReduceOp::Avg)) {
+                continue;
+            }
+        }
         return findAlgorithm(choice.algorithm);
     }
     return makePGError(

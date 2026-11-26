@@ -65,9 +65,8 @@ class LLControl {
     barrier(LLBarrierType type, uint64_t value,
             cooperative_groups::thread_block block) const {
         const auto lane = state_.transfer_handle->lane(channel_);
-        for (uint32_t index = 0; index < view_.participant_count; ++index) {
-            if (index == static_cast<uint32_t>(view_.self_active_index))
-                continue;
+        for (uint32_t slot = 0; slot < state_.peer_count; ++slot) {
+            const auto index = state_.peer_active_indices[slot];
             const auto& peer = view_.participants[index];
             const auto rank = peer.in_group_rank;
             PG_ASSERT(rank >= 0 &&
@@ -84,9 +83,8 @@ class LLControl {
                 TransferResult::Succeeded)
                 return {rank};
         }
-        for (uint32_t index = 0; index < view_.participant_count; ++index) {
-            if (index == static_cast<uint32_t>(view_.self_active_index))
-                continue;
+        for (uint32_t slot = 0; slot < state_.peer_count; ++slot) {
+            const auto index = state_.peer_active_indices[slot];
             const auto& peer = view_.participants[index];
             const auto rank = peer.in_group_rank;
             const auto* signal =

@@ -15,6 +15,7 @@ if(USE_CUDA)
   set(_pg_device_input
       "${_pg_device_source}"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/ring/ring_all_reduce.cu"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/hierarchical/hierarchical_sum.cu"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/ring/ring_all_gather.cu"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/ring/ring_reduce_scatter.cu"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/ring/ring_broadcast.cu"
@@ -187,6 +188,7 @@ if(USE_CUDA)
       device_comm/device_collective/protocols/simple/simple_protocol.cpp
       device_comm/device_collective/protocols/ll/ll_protocol.cpp
       device_comm/device_collective/algorithms/ring/ring_algorithm.cpp
+      device_comm/device_collective/algorithms/hierarchical/hierarchical_algorithm.cpp
       device_comm/device_collective/algorithms/one_shot/one_shot_algorithm.cpp
       device_comm/device_collective/algorithms/pairwise/pairwise_algorithm.cpp
       device_comm/device_collective/algorithms/star/star_algorithm.cpp
