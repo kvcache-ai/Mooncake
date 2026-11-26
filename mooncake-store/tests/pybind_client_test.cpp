@@ -3,12 +3,15 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <barrier>
 #include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <functional>
+#include <future>
 #include <fcntl.h>
 #include <algorithm>
 #include <limits>
@@ -3914,6 +3917,7 @@ class RecordingNofInitiator : public NVMeoFInitiator {
     int64_t PollCompletion(NofSegmentHandle*, uint32_t) override { return 0; }
 
     ErrorCode RegisterMemory(void* ptr, size_t size) override {
+        if (before_register_) before_register_();
         std::lock_guard<std::mutex> lock(mu_);
         ++register_calls_;
         if (register_result_ != ErrorCode::OK) {
@@ -3942,6 +3946,7 @@ class RecordingNofInitiator : public NVMeoFInitiator {
     }
 
     mutable std::mutex mu_;
+    std::function<void()> before_register_;
     int register_calls_ = 0;
     int unregister_calls_ = 0;
     ErrorCode register_result_ = ErrorCode::OK;
@@ -3963,6 +3968,62 @@ struct TeUnregisterHookGuard {
 };
 
 }  // namespace
+
+TEST_F(RealClientTest, ConcurrentDuplicateRegistrationTakesOneStoreLease) {
+    ScopedEnvVar use_tent("MC_USE_TENT");
+    ScopedEnvVar use_tev1("MC_USE_TEV1");
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    NofFactoryGuard guard;
+    auto initiator = std::make_shared<RecordingNofInitiator>();
+    RealClient::SetNofRuntimeFactoryForTesting([initiator]() {
+        return NofRuntime{initiator, std::make_shared<SystemDmaAllocator>()};
+    });
+    auto engine = std::make_shared<TransferEngine>(false);
+    ASSERT_EQ(engine->init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    ASSERT_NE(engine->installTransport("tcp", nullptr), nullptr);
+    ASSERT_EQ(engine->enableMemoryRegistrationReuse(), 0);
+    ASSERT_EQ(
+        py_client_->setup_real(engine->getLocalIpAndPort(), P2PHANDSHAKE, 0, 0,
+                               "tcp", "", master_.master_address(), engine),
+        0);
+
+    std::vector<char> buffer(4096);
+    auto* addr = buffer.data();
+    ASSERT_EQ(engine->registerLocalMemory(addr, buffer.size()), 0);  // PD lease
+    EXPECT_EQ(py_client_->register_buffer(addr, 0),
+              toInt(ErrorCode::INVALID_PARAMS));
+
+    // Pause the first call after TE registration and before Store publishes
+    // its record, so the duplicate reliably reaches the original race window.
+    std::atomic<bool> first{true};
+    std::promise<void> entered, resume;
+    initiator->before_register_ = [&] {
+        if (first.exchange(false)) {
+            entered.set_value();
+            resume.get_future().wait_for(std::chrono::seconds(10));
+        }
+    };
+    auto registering = std::async(std::launch::async, [&] {
+        return py_client_->register_buffer(addr, buffer.size());
+    });
+    ASSERT_EQ(entered.get_future().wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    EXPECT_EQ(py_client_->register_buffer(addr, buffer.size()),
+              toInt(ErrorCode::INVALID_PARAMS));
+    EXPECT_EQ(py_client_->unregister_buffer(addr),
+              toInt(ErrorCode::NOT_REGISTERED));
+    resume.set_value();
+    ASSERT_EQ(registering.get(), 0);
+    initiator->before_register_ = {};
+    EXPECT_EQ(initiator->register_calls_, 1);
+    EXPECT_EQ(py_client_->unregister_buffer(addr), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 1);
+    EXPECT_EQ(py_client_->unregister_buffer(addr),
+              toInt(ErrorCode::NOT_REGISTERED));
+    EXPECT_TRUE(engine->checkOverlap(addr, buffer.size()));
+    ASSERT_EQ(engine->unregisterLocalMemory(addr), 0);
+    EXPECT_FALSE(engine->checkOverlap(addr, buffer.size()));
+}
 
 // Regression test: closing a client without manually unregistering every
 // buffer must still release its SPDK registrations (they live in the

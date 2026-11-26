@@ -135,6 +135,8 @@ class TransferEngineImpl {
 
     int enableMemoryRegistrationReuse();
 
+    void releaseFailedRegistrationBuffer(TransferEngine::OwnedBuffer buffer);
+
     int registerLocalMemory(void* addr, size_t length,
                             const std::string& location = kWildcardLocation,
                             bool remote_accessible = true,
@@ -505,6 +507,9 @@ class TransferEngineImpl {
     std::mutex registration_reuse_mutex_;
     std::map<uintptr_t, size_t> registration_users_;
     std::vector<void*> failed_rollbacks_;
+    // Declared before multi_transports_ so any outstanding allocations
+    // outlive the transports during engine destruction.
+    std::vector<TransferEngine::OwnedBuffer> failed_rollback_buffers_;
 
     bool hasOverlapLocked(uintptr_t addr, uint64_t length) const;
 

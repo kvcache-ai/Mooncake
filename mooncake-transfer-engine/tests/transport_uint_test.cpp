@@ -1551,6 +1551,17 @@ TEST_F(MemoryRegistrationReuseTest, ParentReleaseKeepsChildAlive) {
     EXPECT_EQ(publishedBuffers(), 0u);
 }
 
+TEST_F(MemoryRegistrationReuseTest, OverlapDoesNotRetainFailedAllocation) {
+    auto* base = allocation.data();
+    ASSERT_EQ(engine->registerLocalMemory(base + 32, 64), 0);
+    EXPECT_EQ(engine->registerLocalMemory(base, 64), ERR_ADDRESS_OVERLAPPED);
+    engine->releaseFailedRegistrationBuffer(
+        {base, [](void* ptr) { ++*static_cast<char*>(ptr); }});
+    EXPECT_EQ(*base, 1);
+    EXPECT_EQ(publishedBuffers(), 1u);
+    EXPECT_EQ(engine->unregisterLocalMemory(base + 32), 0);
+}
+
 TEST_F(MemoryRegistrationReuseTest, InvalidBatchDoesNotAcquireReferences) {
     auto* base = allocation.data();
     ASSERT_EQ(engine->registerLocalMemory(base, 128), 0);
@@ -1703,14 +1714,20 @@ TEST_F(TransportTest, MemoryRegistrationReuseRetriesFailedRollback) {
     EXPECT_NE(errors.find("Failed to roll back batch registration"),
               std::string::npos);
     EXPECT_TRUE(engine.checkOverlap(base + 64, 64));
+    auto* pending = base + 64;
+    engine.releaseFailedRegistrationBuffer(
+        {pending, [](void* ptr) { ++*static_cast<char*>(ptr); }});
+    EXPECT_EQ(*pending, 0);
     EXPECT_EQ(engine.unregisterLocalMemoryBatch({base, base + 64}),
               ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_EQ(*pending, 1);
     EXPECT_TRUE(engine.checkOverlap(base, 64));
     EXPECT_FALSE(engine.checkOverlap(base + 64, 64));
     transport->setRegisterResult(0);
     ASSERT_EQ(engine.registerLocalMemory(base + 64, 64), 0);
     ASSERT_EQ(engine.unregisterLocalMemoryBatch({base, base + 64}), 0);
     EXPECT_FALSE(engine.checkOverlap(base, allocation.size()));
+    EXPECT_EQ(*pending, 1);
 }
 
 TEST_F(TransportTest, RegisterLocalMemoryBatchRejectsOverlappingBuffers) {

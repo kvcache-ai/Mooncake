@@ -4807,14 +4807,6 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    {
-        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        if (registered_buffer_sizes_.count(buffer)) {
-            LOG(ERROR) << "Buffer " << buffer << " is already registered";
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-    }
-
     // Only a HugeTLB segment's base address is widened to the physical
     // segment. ShmHelper::allocate rounds the mapping up to hugepage
     // granularity, so the MR bounds must coincide with the mapping bounds;
@@ -4838,18 +4830,25 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         }
     }
 
+    {
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        if (registered_buffer_sizes_.count(buffer) ||
+            !registering_buffers_.insert(buffer).second) {
+            LOG(ERROR) << "Buffer " << buffer << " is already registered or "
+                       << "being registered";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
     // Gather reads are owner-initiated WRITEs. Publish Store output buffers
     // on supported classic transports; TE's registration defaults stay intact.
     auto result = client_->RegisterLocalMemory(
         buffer, registration_size, kWildcardLocation,
         client_->SupportsGatherRead(), true);
-    if (!result) {
-        return result;
-    }
     // #3131: SPDK's RDMA transport keeps its own translation table, which TE
     // registration does not cover. Register the same (possibly widened) range
     // as TE; failure is non-fatal (same policy as the shm paths).
-    if (nof_runtime_.initiator) {
+    if (result && nof_runtime_.initiator) {
         auto rc =
             nof_runtime_.initiator->RegisterMemory(buffer, registration_size);
         if (rc == ErrorCode::NOF_REGISTRATION_STUCK) {
@@ -4872,9 +4871,10 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     }
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        registering_buffers_.erase(buffer);
         // The record keeps the logical size: writable-region resolution must
         // not expose the physical segment beyond what the caller registered.
-        registered_buffer_sizes_[buffer] = {size};
+        if (result) registered_buffer_sizes_[buffer] = {size};
     }
     return result;
 }
@@ -4889,44 +4889,26 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto unregister_result = [&]() -> tl::expected<void, ErrorCode> {
-        {
-            std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-            auto rec_it = registered_buffer_sizes_.find(buffer);
-            if (rec_it != registered_buffer_sizes_.end() &&
-                rec_it->second.te_released)
-                return {};
-        }
-        auto &hook = TeUnregisterHookForTestingSlot();
-        if (hook) {
-            return hook(buffer);
-        }
-        return client_->unregisterLocalMemory(buffer, true);
-    }();
-
-    // Record check, NoF cleanup and record erase stay in one critical
-    // section (teardown's unregister walk takes the same lock).
     std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     auto rec_it = registered_buffer_sizes_.find(buffer);
-    if (!unregister_result) {
-        // Fall through to the NoF cleanup only when TE reports the buffer as
-        // not registered and the record is still present. NOT_REGISTERED is
-        // truthful: RdmaTransport retries any stuck MR deregistration before
-        // reporting it. Any other TE failure may leave the TE registration
-        // alive: keep the record and propagate.
-        if (unregister_result.error() != ErrorCode::NOT_REGISTERED ||
-            rec_it == registered_buffer_sizes_.end()) {
-            LOG(ERROR) << "Unregister buffer failed with error: "
-                       << toString(unregister_result.error());
-            return tl::unexpected(unregister_result.error());
-        }
-        LOG(WARNING) << "TE reports buffer " << buffer
-                     << " as already unregistered; retrying the NoF cleanup";
-    }
-    // TENT may successfully unregister an unknown address. Without a Store
-    // record there is no pending NoF cleanup to retry.
     if (rec_it == registered_buffer_sizes_.end()) {
         return tl::unexpected(ErrorCode::NOT_REGISTERED);
+    }
+    if (!rec_it->second.te_released) {
+        auto &hook = TeUnregisterHookForTestingSlot();
+        auto result =
+            hook ? hook(buffer) : client_->unregisterLocalMemory(buffer, true);
+        if (!result && result.error() != ErrorCode::NOT_REGISTERED) {
+            LOG(ERROR) << "Unregister buffer failed with error: "
+                       << toString(result.error());
+            return result;
+        }
+        if (!result) {
+            LOG(WARNING)
+                << "TE reports buffer " << buffer
+                << " as already unregistered; retrying the NoF cleanup";
+        }
+        rec_it->second.te_released = true;
     }
     if (nof_runtime_.initiator) {
         auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
@@ -4937,13 +4919,10 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
                        << buffer << ": " << toString(rc)
                        << "; buffer stays recorded and the NoF pages stay "
                           "quarantined. Do not free or remap this buffer.";
-            rec_it->second.te_released = true;
             return tl::unexpected(rc);
         }
     }
-    if (rec_it != registered_buffer_sizes_.end()) {
-        registered_buffer_sizes_.erase(rec_it);
-    }
+    registered_buffer_sizes_.erase(rec_it);
     return {};
 }
 

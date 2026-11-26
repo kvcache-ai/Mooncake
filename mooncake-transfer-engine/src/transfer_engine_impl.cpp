@@ -931,10 +931,21 @@ int TransferEngineImpl::releaseReusableRegions(
     return 0;
 }
 
+void TransferEngineImpl::releaseFailedRegistrationBuffer(
+    TransferEngine::OwnedBuffer buffer) {
+    std::lock_guard<std::mutex> transaction(registration_reuse_mutex_);
+    if (std::find(failed_rollbacks_.begin(), failed_rollbacks_.end(),
+                  buffer.get()) != failed_rollbacks_.end()) {
+        failed_rollback_buffers_.push_back(std::move(buffer));
+    }
+}
+
 void TransferEngineImpl::retryFailedRollbacks() {
     if (failed_rollbacks_.empty()) return;
-    if (releaseReusableRegions(failed_rollbacks_) == 0)
+    if (releaseReusableRegions(failed_rollbacks_) == 0) {
         failed_rollbacks_.clear();
+        failed_rollback_buffers_.clear();
+    }
 }
 
 int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
