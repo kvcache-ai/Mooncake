@@ -10,6 +10,7 @@
 #include <deque>
 #include <functional>
 #include <list>
+#include <map>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1304,7 +1305,7 @@ class MasterService {
 
         void MaybeCompactLocked() REQUIRES(mutex_);
 
-        mutable std::mutex mutex_;
+        mutable Mutex mutex_;
         std::priority_queue<Entry, std::vector<Entry>, EarlierDeadline> heap_
             GUARDED_BY(mutex_);
         std::unordered_map<std::string, Registration> registrations_
@@ -2145,7 +2146,7 @@ class MasterService {
         std::chrono::system_clock::time_point ttl_;
         uint64_t mem_size_;
     };
-    std::mutex discarded_replicas_mutex_;
+    mutable Mutex discarded_replicas_mutex_;
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
     size_t offloading_queue_limit_ = 50000;
@@ -2222,7 +2223,7 @@ class MasterService {
     std::atomic<bool> job_dispatch_running_{false};
     DeadlineScheduler<std::weak_ptr<DrainJob>> drain_job_deadline_scheduler_;
     static constexpr uint64_t kJobDispatchThreadSleepMs = 500;
-    std::mutex job_mutex_;
+    Mutex job_mutex_;
     std::map<UUID, std::shared_ptr<DrainJob>> drain_jobs_
         GUARDED_BY(job_mutex_);
 

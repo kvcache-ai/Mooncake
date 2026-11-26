@@ -1255,17 +1255,20 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param required_size Bytes the disk must be able to hold.
      * @return disk index, or NO_AVAILABLE_DISK if no disk qualifies.
      */
-    tl::expected<int, ErrorCode> SelectDiskForWrite(int64_t required_size);
+    tl::expected<int, ErrorCode> SelectDiskForWrite(int64_t required_size)
+        REQUIRES(mutex_);
 
     void RestorePreparedEviction(PendingEviction&& pending);
 
-    void RestorePreparedEvictionLocked(PendingEviction&& pending);
+    void RestorePreparedEvictionLocked(PendingEviction&& pending)
+        REQUIRES(mutex_);
 
     void CommitPreparedEviction(const PendingEviction& pending);
 
     void ReleasePreparedWrite(const PendingEviction& pending);
 
-    void ReleasePreparedWriteLocked(const PendingEviction& pending);
+    void ReleasePreparedWriteLocked(const PendingEviction& pending)
+        REQUIRES(mutex_);
 
     /**
      * @brief Select the next bucket to evict on the given disk, according to
@@ -1276,7 +1279,7 @@ class BucketStorageBackend : public StorageBackendInterface {
      *         buckets_.end() if that disk has no candidate.
      */
     std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
-    SelectEvictionCandidate(int disk_index);
+    SelectEvictionCandidate(int disk_index) REQUIRES(mutex_);
 
     /**
      * @brief Actual on-disk bytes of one disk's offload directory, measured
@@ -1294,7 +1297,7 @@ class BucketStorageBackend : public StorageBackendInterface {
      *
      * @param disk_index The disk whose root is scanned.
      */
-    int64_t ActualDiskBytesUsedLocked(int disk_index) const;
+    int64_t ActualDiskBytesUsedLocked(int disk_index) const REQUIRES(mutex_);
 
     /**
      * @brief Phase 2 of eviction: delete persisted metadata for each evicted
@@ -1432,7 +1435,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_write_keys_;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
-    int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
+    int64_t GUARDED_BY(iterator_mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
 
     mutable Mutex offloading_mutex_;

@@ -232,12 +232,14 @@ class LocalHotCache {
 
    private:
     // Drain deferred LRU touches: splice accessed blocks to front
-    void drainDeferredTouches();
-    bool putHotKeyLocked(HotMemBlock* block);
-    bool removeHotKeyLocked(const std::string& key);
-    bool hasActiveBlockForKeyLocked(const std::string& key) const;
+    void drainDeferredTouches() REQUIRES(lru_mutex_);
+    bool putHotKeyLocked(HotMemBlock* block) REQUIRES(lru_mutex_);
+    bool removeHotKeyLocked(const std::string& key) REQUIRES(lru_mutex_);
+    bool hasActiveBlockForKeyLocked(const std::string& key) const
+        REQUIRES(lru_mutex_);
     bool isPutTokenValidLocked(const std::string& key,
-                               const HotCachePutToken& token) const;
+                               const HotCachePutToken& token) const
+        REQUIRES_SHARED(lru_mutex_);
 
     size_t block_size_;  // Actual block size used by this cache
 
@@ -252,7 +254,7 @@ class LocalHotCache {
     std::shared_ptr<ShmHelper::ShmSegment> shm_segment_;
     bool use_shm_ = false;
 
-    mutable std::shared_mutex lru_mutex_;
+    mutable SharedMutex lru_mutex_;
     std::list<HotMemBlock*> lru_queue_ GUARDED_BY(lru_mutex_);  // prefilled LRU
     // key -> iterator of lru_queue_
     std::unordered_map<std::string, std::list<HotMemBlock*>::iterator>

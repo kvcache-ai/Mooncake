@@ -532,6 +532,7 @@ class MasterServiceTest : public ::testing::Test {
         }
         for (const auto& member_key : ns->objects.GroupMembers(group_id)) {
             if (auto hold = ns->objects.Read(member_key)) {
+                SpinLocker locker(&hold->metadata().lock);
                 return hold->metadata().lease_;
             }
         }

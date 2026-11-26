@@ -286,11 +286,13 @@ bool LocalSsdManager::CancelOffloadsIfAllPending(
 
     const std::string index = tenant_id.MakeScopedKey(key);
     for (const auto& client : clients) {
+        client.record->mailbox.AssertMutexHeld();
         if (!client.record->mailbox.pending_offloads_.contains(index)) {
             return false;
         }
     }
     for (auto& client : clients) {
+        client.record->mailbox.AssertMutexHeld();
         client.record->mailbox.pending_offloads_.erase(index);
     }
     return true;
