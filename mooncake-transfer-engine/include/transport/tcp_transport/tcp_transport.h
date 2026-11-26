@@ -32,6 +32,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -400,9 +401,11 @@ class TcpTransport : public Transport {
         std::shared_ptr<FailureCounters> failure_counters;
     };
 
+    struct OneShotSession;
+
     struct ConnectionLaneState {
         std::mutex mutex;
-        bool shutting_down = false;
+        std::atomic<bool> shutting_down{false};
         size_t lanes_per_peer = 4;
         size_t max_queued_transfers_per_peer = 1024;
         size_t max_pending_admissions_per_peer = 1024;
@@ -413,6 +416,7 @@ class TcpTransport : public Transport {
             groups;
         std::unordered_map<std::string, ConnectionKey> current_key_by_peer;
         std::vector<std::shared_ptr<PeerConnectionGroup>> retiring_groups;
+        std::unordered_set<std::shared_ptr<OneShotSession>> one_shot_sessions;
         std::weak_ptr<ConnectionLaneRuntime> runtime;
         std::shared_ptr<FailureCounters> failure_counters =
             std::make_shared<FailureCounters>();

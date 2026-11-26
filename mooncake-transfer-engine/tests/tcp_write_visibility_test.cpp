@@ -2014,6 +2014,104 @@ TEST(TcpWriteVisibilityTest, GroupedScatterPreservesPartialFailureResults) {
     }
 }
 
+TEST(TcpWriteVisibilityTest, UnpooledShutdownFailsInFlightSubmitTransferSlice) {
+    ScopedEnvVar unpooled("MC_TCP_ENABLE_CONNECTION_POOL", "0");
+    ReusingWriteServer peer(/*hold_first_ack=*/true);
+    ASSERT_TRUE(peer.ok());
+    std::vector<char> pool(kSmallLength, 0x77);
+    auto engine = std::make_unique<TransferEngine>(false);
+    ASSERT_EQ(engine->init(P2PHANDSHAKE, "127.0.0.2:17999", "127.0.0.2", 17999),
+              0);
+    ASSERT_NE(engine->installTransport("tcp", nullptr), nullptr);
+    ASSERT_EQ(engine->registerLocalMemory(pool.data(), pool.size(), "cpu:0"),
+              0);
+    const auto seg_id = engine->openSegment(engine->getLocalIpAndPort());
+    ASSERT_NE(seg_id, static_cast<Transport::SegmentHandle>(-1));
+    // Unpooled mode preserves ordinary parallel batch submit eligibility.
+    EXPECT_TRUE(engine->supportsParallelBatchSubmit(seg_id));
+    auto desc = engine->getMetadata()->getSegmentDescByID(seg_id);
+    ASSERT_NE(desc, nullptr);
+    desc->tcp_data_port = peer.port();
+    desc->tcp_proto_version = 2;
+
+    TransferRequest req;
+    req.opcode = TransferRequest::WRITE;
+    req.source = pool.data();
+    req.target_id = seg_id;
+    req.target_offset = desc->buffers[0].addr;
+    req.length = pool.size();
+    const auto batch = engine->allocateBatchID(1);
+    ASSERT_TRUE(engine->submitTransfer(batch, {req}).ok());
+    ASSERT_TRUE(peer.waitForFirstRequest(std::chrono::seconds(5)));
+    TransferStatus status;
+    ASSERT_TRUE(engine->getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::WAITING);
+
+    const auto start = std::chrono::steady_clock::now();
+    engine.reset();
+    EXPECT_LT(std::chrono::steady_clock::now() - start,
+              std::chrono::seconds(5));
+    expectEverySliceCompletedExactlyOnceAfterShutdown(batch);
+    const auto& batch_desc = Transport::toBatchDesc(batch);
+    ASSERT_EQ(batch_desc.task_list.size(), 1u);
+    ASSERT_EQ(batch_desc.task_list[0].slice_list.size(), 1u);
+    EXPECT_EQ(batch_desc.task_list[0].slice_list[0]->status,
+              Transport::Slice::FAILED);
+    peer.releaseFirstAck();
+    reclaimBatchDescAfterEngineShutdownForTest(batch);
+}
+
+TEST(TcpWriteVisibilityTest, UnpooledParallelBatchSubmitCompletesCleanly) {
+    ScopedEnvVar unpooled("MC_TCP_ENABLE_CONNECTION_POOL", "0");
+    ScopedEnvVar threads("MC_BATCH_SUBMIT_THREADS", "2");
+    ScopedEnvVar min_size("MC_BATCH_SUBMIT_MIN_SIZE", "2");
+    constexpr size_t kNumSlices = 8;
+    constexpr size_t kSliceBytes = 256;
+    std::vector<char> pool(2 * kNumSlices * kSliceBytes, 0);
+    for (size_t i = 0; i < kNumSlices; ++i) {
+        memset(pool.data() + i * kSliceBytes, static_cast<int>(0x10 + i),
+               kSliceBytes);
+    }
+    auto engine = std::make_unique<TransferEngine>(false);
+    ASSERT_EQ(engine->init(P2PHANDSHAKE, "127.0.0.2:17998", "127.0.0.2", 17998),
+              0);
+    ASSERT_NE(engine->installTransport("tcp", nullptr), nullptr);
+    ASSERT_EQ(engine->registerLocalMemory(pool.data(), pool.size(), "cpu:0"),
+              0);
+    const auto seg_id = engine->openSegment(engine->getLocalIpAndPort());
+    ASSERT_NE(seg_id, static_cast<Transport::SegmentHandle>(-1));
+    ASSERT_TRUE(engine->supportsParallelBatchSubmit(seg_id));
+    auto desc = engine->getMetadata()->getSegmentDescByID(seg_id);
+    ASSERT_NE(desc, nullptr);
+    const uint64_t dst_base = desc->buffers[0].addr + kNumSlices * kSliceBytes;
+
+    auto result = engine->tryParallelBatchTransfer(
+        seg_id, kNumSlices,
+        [&](size_t begin, size_t end) {
+            std::vector<TransferRequest> entries;
+            entries.reserve(end - begin);
+            for (size_t i = begin; i < end; ++i) {
+                TransferRequest req;
+                req.opcode = TransferRequest::WRITE;
+                req.source = pool.data() + i * kSliceBytes;
+                req.target_id = seg_id;
+                req.target_offset = dst_base + i * kSliceBytes;
+                req.length = kSliceBytes;
+                entries.push_back(req);
+            }
+            return entries;
+        },
+        std::chrono::seconds(10));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result->ok()) << result->ToString();
+    for (size_t i = 0; i < kNumSlices; ++i) {
+        EXPECT_EQ(
+            memcmp(pool.data() + i * kSliceBytes,
+                   pool.data() + (kNumSlices + i) * kSliceBytes, kSliceBytes),
+            0);
+    }
+}
+
 // Mixed-version quadrant: a pooled legacy (v1) initiator against the current
 // server still transfers data correctly over repeated exchanges on one fixed
 // lane (with the old weaker WRITE completion semantics).
