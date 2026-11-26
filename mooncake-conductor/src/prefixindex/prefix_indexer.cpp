@@ -214,6 +214,206 @@ int64_t MatchedTokens(size_t block_count, int64_t block_size,
     return std::min(TokensForBlocks(block_count, block_size), queried);
 }
 
+// Project stream-scoped ownership into query candidates once per block.
+// Persistent owner sets remain unchanged: clearing one stream must not remove
+// another stream's copy for the same instance and rank.
+std::map<std::string, CacheHitResult> MatchMultipleCandidates(
+    const ContextState& state,
+    const std::map<std::string, std::set<int64_t>>& selected_instances,
+    size_t candidate_count, HashChain& chain, size_t block_count,
+    int64_t block_size, size_t queried_tokens, std::string* chain_error) {
+    std::map<std::string, CacheHitResult> results;
+    // No tier can extend a prefix whose first block is absent. Preserve
+    // registered zero-hit ranks without allocating the owner projection.
+    const HashBlock* first =
+        block_count == 0 ? nullptr : chain.At(0, chain_error);
+    if (first == nullptr || !state.blocks.contains(first->projected)) {
+        if (!chain_error->empty()) {
+            return {};
+        }
+        for (const auto& [instance_id, ranks] : selected_instances) {
+            auto& result = results[instance_id];
+            for (int64_t rank : ranks) {
+                result.dp.emplace(rank, 0);
+                result.rank_matches.emplace(rank, RankCacheHitResult{});
+            }
+        }
+        return results;
+    }
+
+    struct Candidate {
+        const std::string* instance_id;
+        int64_t rank;
+        uint8_t active = 0xf;
+        std::array<size_t, 4> depths{};
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(candidate_count);
+    for (const auto& [instance_id, ranks] : selected_instances) {
+        for (int64_t rank : ranks) {
+            candidates.push_back({&instance_id, rank});
+        }
+    }
+
+    // Skip the hash-map projection index when a single instance or a small
+    // candidate set is selected, or when the first block holds too few engine
+    // owners to amortize building the map: direct checks avoid map allocation
+    // and hashing overhead while still scanning each block's owners at most
+    // once and stopping as soon as every active candidate hits device.
+    constexpr size_t kDirectCandidateThreshold = 4;
+    const bool single_instance = selected_instances.size() == 1;
+    const auto& first_owners = state.blocks.at(first->projected);
+    const size_t first_engine_owners = first_owners.device_owners.size() +
+                                       first_owners.cpu_local_owners.size() +
+                                       first_owners.disk_owners.size();
+    const bool use_hash_index = !single_instance &&
+                                candidate_count > kDirectCandidateThreshold &&
+                                first_engine_owners > kDirectCandidateThreshold;
+    std::unordered_map<std::string_view, std::unordered_map<int64_t, size_t>>
+        candidate_index;
+    if (use_hash_index) {
+        candidate_index.reserve(selected_instances.size());
+        size_t idx = 0;
+        for (const auto& [instance_id, ranks] : selected_instances) {
+            auto& rank_index = candidate_index[instance_id];
+            rank_index.reserve(ranks.size());
+            for (int64_t rank : ranks) {
+                rank_index.emplace(rank, idx++);
+            }
+        }
+    }
+
+    std::vector<uint8_t> presence(candidate_count);
+    std::vector<size_t> active_candidates;
+    active_candidates.reserve(candidate_count);
+    for (size_t i = 0; i < candidate_count; ++i) active_candidates.push_back(i);
+
+    for (size_t depth = 0; depth < block_count && !active_candidates.empty();
+         ++depth) {
+        const HashBlock* hashed = chain.At(depth, chain_error);
+        if (hashed == nullptr) break;
+        auto block = state.blocks.find(hashed->projected);
+        if (block == state.blocks.end()) break;
+        for (size_t i : active_candidates) presence[i] = 0;
+        const auto& owners = block->second;
+        size_t remaining_device = active_candidates.size();
+        auto mark_candidate = [&](size_t idx, uint8_t tiers) {
+            if ((candidates[idx].active & tiers) == 0) return;
+            const uint8_t prev = presence[idx];
+            presence[idx] = prev | tiers;
+            if (tiers == 0xf && (prev & 0x1) == 0) {
+                --remaining_device;
+            }
+        };
+        auto scan_owners = [&](auto&& lookup) {
+            for (const auto& owner : owners.device_owners) {
+                const size_t idx = lookup(owner);
+                if (idx != candidate_count) {
+                    mark_candidate(idx, 0xf);
+                    if (remaining_device == 0) return;
+                }
+            }
+            for (const auto& owner : owners.cpu_local_owners) {
+                const size_t idx = lookup(owner);
+                if (idx != candidate_count) {
+                    mark_candidate(idx, 0xe);
+                }
+            }
+            uint8_t shared_tiers = owners.cpu_share_owners.empty() ? 0 : 0xc;
+            for (const auto& owner : owners.disk_owners) {
+                if (const auto* engine = std::get_if<EngineOwner>(&owner)) {
+                    const size_t idx = lookup(*engine);
+                    if (idx != candidate_count) {
+                        mark_candidate(idx, 0x8);
+                    }
+                } else {
+                    shared_tiers |= 0x8;
+                }
+            }
+            if (shared_tiers != 0) {
+                for (size_t i : active_candidates) {
+                    presence[i] |= shared_tiers;
+                }
+            }
+        };
+        if (single_instance) {
+            const std::string& target_instance =
+                selected_instances.begin()->first;
+            scan_owners([&](const EngineOwner& owner) -> size_t {
+                if (owner.instance_id != target_instance) {
+                    return candidate_count;
+                }
+                for (size_t i : active_candidates) {
+                    if (candidates[i].rank == owner.dp_rank) return i;
+                }
+                return candidate_count;
+            });
+        } else if (!use_hash_index ||
+                   active_candidates.size() <= kDirectCandidateThreshold) {
+            scan_owners([&](const EngineOwner& owner) -> size_t {
+                for (size_t i : active_candidates) {
+                    if (candidates[i].rank == owner.dp_rank &&
+                        *candidates[i].instance_id == owner.instance_id) {
+                        return i;
+                    }
+                }
+                return candidate_count;
+            });
+        } else {
+            scan_owners([&](const EngineOwner& owner) -> size_t {
+                auto instance = candidate_index.find(owner.instance_id);
+                if (instance == candidate_index.end()) {
+                    return candidate_count;
+                }
+                auto rank = instance->second.find(owner.dp_rank);
+                return rank == instance->second.end() ? candidate_count
+                                                      : rank->second;
+            });
+        }
+        for (size_t offset = 0; offset < active_candidates.size();) {
+            const size_t i = active_candidates[offset];
+            auto& candidate = candidates[i];
+            // A tier cannot resume matching after a gap. Each bit denotes
+            // the cumulative prefix available at that tier or above.
+            candidate.active &= presence[i];
+            if (candidate.active == 0) {
+                active_candidates[offset] = active_candidates.back();
+                active_candidates.pop_back();
+                continue;
+            }
+            for (size_t tier = 0; tier < candidate.depths.size(); ++tier) {
+                if (candidate.active & (1 << tier)) {
+                    candidate.depths[tier] = depth + 1;
+                }
+            }
+            ++offset;
+        }
+    }
+    for (const auto& candidate : candidates) {
+        auto& result = results[*candidate.instance_id];
+        RankCacheHitResult match{
+            .device =
+                MatchedTokens(candidate.depths[0], block_size, queried_tokens),
+            .cpu_local =
+                MatchedTokens(candidate.depths[1], block_size, queried_tokens),
+            .cpu_share =
+                MatchedTokens(candidate.depths[2], block_size, queried_tokens),
+            .disk =
+                MatchedTokens(candidate.depths[3], block_size, queried_tokens)};
+        result.dp.emplace(candidate.rank, match.device);
+        result.rank_matches.emplace(candidate.rank, match);
+        result.device = std::max(result.device, match.device);
+        result.cpu_local = std::max(result.cpu_local, match.cpu_local);
+        result.cpu_share = std::max(result.cpu_share, match.cpu_share);
+        result.disk = std::max(result.disk, match.disk);
+        result.longest_match_tokens = result.disk;
+    }
+    if (!chain_error->empty()) {
+        return {};
+    }
+    return results;
+}
+
 }  // namespace
 
 RegistrationResult PrefixCacheTable::ValidateRegistration(
@@ -662,191 +862,9 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
         candidate_count += ranks.size();
     }
     if (candidate_count > 1) {
-        // No tier can extend a prefix whose first block is absent. Preserve
-        // registered zero-hit ranks without allocating the owner projection.
-        const HashBlock* first =
-            block_count == 0 ? nullptr : chain->At(0, &chain_error);
-        if (first == nullptr || !state->blocks.contains(first->projected)) {
-            if (!chain_error.empty()) {
-                LOG(ERROR) << "Query hash computation failed: " << chain_error;
-                return {};
-            }
-            for (const auto& [instance_id, ranks] : selected_instances) {
-                auto& result = results[instance_id];
-                for (int64_t rank : ranks) {
-                    result.dp.emplace(rank, 0);
-                    result.rank_matches.emplace(rank, RankCacheHitResult{});
-                }
-            }
-            return results;
-        }
-
-        // Project stream-scoped ownership into query candidates once per block.
-        // Persistent owner sets remain unchanged: clearing one stream must not
-        // remove another stream's copy for the same instance and rank.
-        struct Candidate {
-            const std::string* instance_id;
-            int64_t rank;
-            uint8_t active = 0xf;
-            std::array<size_t, 4> depths{};
-        };
-        std::vector<Candidate> candidates;
-        candidates.reserve(candidate_count);
-        for (const auto& [instance_id, ranks] : selected_instances) {
-            for (int64_t rank : ranks) {
-                candidates.push_back({&instance_id, rank});
-            }
-        }
-
-        // Skip the hash-map projection index when a single instance or a small
-        // candidate set is selected: direct checks avoid map allocation and
-        // hashing overhead while still scanning each block's owners at most
-        // once and stopping as soon as every active candidate hits device.
-        constexpr size_t kDirectCandidateThreshold = 4;
-        const bool single_instance = selected_instances.size() == 1;
-        const bool use_hash_index =
-            !single_instance && candidate_count > kDirectCandidateThreshold;
-        std::unordered_map<std::string_view,
-                           std::unordered_map<int64_t, size_t>>
-            candidate_index;
-        if (use_hash_index) {
-            candidate_index.reserve(selected_instances.size());
-            size_t idx = 0;
-            for (const auto& [instance_id, ranks] : selected_instances) {
-                auto& rank_index = candidate_index[instance_id];
-                rank_index.reserve(ranks.size());
-                for (int64_t rank : ranks) {
-                    rank_index.emplace(rank, idx++);
-                }
-            }
-        }
-
-        std::vector<uint8_t> presence(candidate_count);
-        std::vector<size_t> active_candidates;
-        active_candidates.reserve(candidate_count);
-        for (size_t i = 0; i < candidate_count; ++i)
-            active_candidates.push_back(i);
-        for (size_t depth = 0;
-             depth < block_count && !active_candidates.empty(); ++depth) {
-            const HashBlock* hashed = chain->At(depth, &chain_error);
-            if (hashed == nullptr) break;
-            auto block = state->blocks.find(hashed->projected);
-            if (block == state->blocks.end()) break;
-            for (size_t i : active_candidates) presence[i] = 0;
-            const auto& owners = block->second;
-            size_t remaining_device = active_candidates.size();
-            auto mark_candidate = [&](size_t idx, uint8_t tiers) {
-                if ((candidates[idx].active & tiers) == 0) return;
-                const uint8_t prev = presence[idx];
-                presence[idx] = prev | tiers;
-                if (tiers == 0xf && (prev & 0x1) == 0) {
-                    --remaining_device;
-                }
-            };
-            auto scan_owners = [&](auto&& lookup) {
-                for (const auto& owner : owners.device_owners) {
-                    const size_t idx = lookup(owner);
-                    if (idx != candidate_count) {
-                        mark_candidate(idx, 0xf);
-                        if (remaining_device == 0) return;
-                    }
-                }
-                for (const auto& owner : owners.cpu_local_owners) {
-                    const size_t idx = lookup(owner);
-                    if (idx != candidate_count) {
-                        mark_candidate(idx, 0xe);
-                    }
-                }
-                uint8_t shared_tiers =
-                    owners.cpu_share_owners.empty() ? 0 : 0xc;
-                for (const auto& owner : owners.disk_owners) {
-                    if (const auto* engine = std::get_if<EngineOwner>(&owner)) {
-                        const size_t idx = lookup(*engine);
-                        if (idx != candidate_count) {
-                            mark_candidate(idx, 0x8);
-                        }
-                    } else {
-                        shared_tiers |= 0x8;
-                    }
-                }
-                if (shared_tiers != 0) {
-                    for (size_t i : active_candidates) {
-                        presence[i] |= shared_tiers;
-                    }
-                }
-            };
-            if (single_instance) {
-                const std::string& target_instance =
-                    selected_instances.begin()->first;
-                scan_owners([&](const EngineOwner& owner) -> size_t {
-                    if (owner.instance_id != target_instance) {
-                        return candidate_count;
-                    }
-                    for (size_t i : active_candidates) {
-                        if (candidates[i].rank == owner.dp_rank) return i;
-                    }
-                    return candidate_count;
-                });
-            } else if (!use_hash_index ||
-                       active_candidates.size() <= kDirectCandidateThreshold) {
-                scan_owners([&](const EngineOwner& owner) -> size_t {
-                    for (size_t i : active_candidates) {
-                        if (candidates[i].rank == owner.dp_rank &&
-                            *candidates[i].instance_id == owner.instance_id) {
-                            return i;
-                        }
-                    }
-                    return candidate_count;
-                });
-            } else {
-                scan_owners([&](const EngineOwner& owner) -> size_t {
-                    auto instance = candidate_index.find(owner.instance_id);
-                    if (instance == candidate_index.end()) {
-                        return candidate_count;
-                    }
-                    auto rank = instance->second.find(owner.dp_rank);
-                    return rank == instance->second.end() ? candidate_count
-                                                          : rank->second;
-                });
-            }
-            for (size_t offset = 0; offset < active_candidates.size();) {
-                const size_t i = active_candidates[offset];
-                auto& candidate = candidates[i];
-                // A tier cannot resume matching after a gap. Each bit denotes
-                // the cumulative prefix available at that tier or above.
-                candidate.active &= presence[i];
-                if (candidate.active == 0) {
-                    active_candidates[offset] = active_candidates.back();
-                    active_candidates.pop_back();
-                    continue;
-                }
-                for (size_t tier = 0; tier < candidate.depths.size(); ++tier) {
-                    if (candidate.active & (1 << tier)) {
-                        candidate.depths[tier] = depth + 1;
-                    }
-                }
-                ++offset;
-            }
-        }
-        for (const auto& candidate : candidates) {
-            auto& result = results[*candidate.instance_id];
-            RankCacheHitResult match{
-                .device = MatchedTokens(candidate.depths[0], context.block_size,
-                                        queried_tokens),
-                .cpu_local = MatchedTokens(candidate.depths[1],
-                                           context.block_size, queried_tokens),
-                .cpu_share = MatchedTokens(candidate.depths[2],
-                                           context.block_size, queried_tokens),
-                .disk = MatchedTokens(candidate.depths[3], context.block_size,
-                                      queried_tokens)};
-            result.dp.emplace(candidate.rank, match.device);
-            result.rank_matches.emplace(candidate.rank, match);
-            result.device = std::max(result.device, match.device);
-            result.cpu_local = std::max(result.cpu_local, match.cpu_local);
-            result.cpu_share = std::max(result.cpu_share, match.cpu_share);
-            result.disk = std::max(result.disk, match.disk);
-            result.longest_match_tokens = result.disk;
-        }
+        results = MatchMultipleCandidates(
+            *state, selected_instances, candidate_count, *chain, block_count,
+            context.block_size, queried_tokens, &chain_error);
         if (!chain_error.empty()) {
             LOG(ERROR) << "Query hash computation failed: " << chain_error;
             return {};

@@ -484,6 +484,35 @@ TEST(Query, SmallSelectionAndSingleInstanceMultiRankMatchOracle) {
     }
 }
 
+TEST(Query, SparseEngineOwnersWithManySharedCandidatesMatchOracle) {
+    PrefixCacheTable table;
+    const auto context = TestContext();
+    const auto profile = SglangProfile();
+    const auto tokens = Tokens(context.block_size);
+    std::string error;
+    auto strategy =
+        mooncake::conductor::prefixindex::CreateHashStrategy(profile, &error);
+    ASSERT_TRUE(strategy) << error;
+    std::vector<HashBlock> blocks;
+    ASSERT_EQ(strategy->Compute(context, tokens, std::nullopt, &blocks), "");
+    ASSERT_EQ(blocks.size(), 1u);
+
+    for (int instance = 0; instance < 64; ++instance) {
+        auto registration =
+            Registration("replica-" + std::to_string(instance), 0);
+        registration.profile = profile;
+        RegisterOrFail(table, registration);
+    }
+    ASSERT_EQ(table.StoreEngine(Device({blocks[0].projected},
+                                       DeviceOwner("replica-0", 0, "s0"))),
+              "");
+    ASSERT_EQ(table.StoreShared(
+                  Shared({blocks[0].projected}, StorageTier::kCpuShare)),
+              "");
+    EXPECT_EQ(table.Query(context, tokens),
+              ReferenceQuery(table, context, tokens));
+}
+
 TEST(Registration, InvalidInputsDoNotCreateContextState) {
     std::vector<EngineRegistration> invalid;
 
