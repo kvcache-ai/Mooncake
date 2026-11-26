@@ -4,7 +4,6 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
-#include <optional>
 #include <string_view>
 
 #include <ylt/util/tl/expected.hpp>
@@ -13,39 +12,45 @@
 
 namespace mooncake {
 
-// Owns resident workers, each with a private task queue. A task runs on the
-// worker selected by its caller-supplied affinity key, so all tasks prepared
-// from one source (for example, one file) land on one worker and that worker
-// owns the source's state. Each SubmitAndWait call publishes a set of prepared
-// tasks, blocks until that set has terminated, and returns its first reported
-// error. Callers keep all data referenced by their callbacks valid until
-// SubmitAndWait returns.
+// Runs caller-defined tasks on a fixed set of resident worker threads.
+// Callers accumulate tasks in a batch with PrepareTasks, publish and wait
+// for the whole batch with SubmitAndWait, and keep all data referenced by
+// their callbacks valid until SubmitAndWait returns.
 class BatchIoScheduler {
    public:
-    // Executes one caller-defined task index. An accepted task is executed at
-    // most once; a cancelled task is not executed. Tasks may run concurrently
-    // and out of order, including tasks from the same PendingBatch. Exceptions
-    // are converted to INTERNAL_ERROR.
+    // Executes one caller-defined task index. A task belongs to the batch
+    // passed to the PrepareTasks call that declared it; task indices are
+    // local to that call. An accepted task is executed at most once; a
+    // cancelled task is not executed. Tasks may run concurrently and out of
+    // order, including tasks from the same PendingBatch. Exceptions are
+    // converted to INTERNAL_ERROR.
     using Execute =
         std::function<tl::expected<void, ErrorCode>(size_t task_index)>;
 
-    // Finalizes one nonempty PrepareTasks call after all its tasks terminate.
-    // The argument is its first task error, or success. This callback runs once
-    // for each accepted, published group, including a group cancelled after
-    // publication. It runs outside scheduler locks; its errors and exceptions
-    // join the batch result (exceptions become INTERNAL_ERROR).
+    // Finalizes one nonempty PrepareTasks call after all its tasks
+    // terminate; the argument is their first task error, or success. Runs
+    // once for each accepted, published group, including a group cancelled
+    // after publication. Its errors and exceptions join the batch result
+    // (exceptions become INTERNAL_ERROR).
     using Complete = std::function<tl::expected<void, ErrorCode>(
         tl::expected<void, ErrorCode>)>;
 
-    // Gates task claiming without holding scheduler locks. Returning false
-    // defers the task and rechecks after the configured backoff. Exceptions
-    // fail the task with INTERNAL_ERROR. Already running callbacks are not
-    // interrupted.
+    // Decides whether a task may start. Returning false defers the task for
+    // a retry after the configured backoff. Exceptions fail the task with
+    // INTERNAL_ERROR. A task whose check has started is not interrupted.
     using Ready = std::function<bool()>;
 
-    // Starts the worker threads. An empty ready callback accepts tasks
-    // immediately. Workers are named with worker_name_prefix followed by their
-    // zero-based index, truncated to platform limits.
+    // Starts the worker threads and returns the scheduler.
+    //
+    // - `workers` (in): number of resident worker threads; must be nonzero.
+    // - `ready` (in, optional): consulted before a task starts; returning
+    //   false defers the task for a retry after `backoff`. Empty means tasks
+    //   start immediately.
+    // - `backoff` (in): how long a deferred task waits before its next
+    //   readiness check; must be positive.
+    // - `worker_name_prefix` (in): worker threads are named with this prefix
+    //   followed by their zero-based index, truncated to platform limits.
+    //
     // Returns INVALID_PARAMS for zero workers or a non-positive backoff, and
     // INTERNAL_ERROR if allocation or thread startup fails.
     static tl::expected<std::unique_ptr<BatchIoScheduler>, ErrorCode> Create(
@@ -59,9 +64,9 @@ class BatchIoScheduler {
     BatchIoScheduler(const BatchIoScheduler&) = delete;
     BatchIoScheduler& operator=(const BatchIoScheduler&) = delete;
 
-    // Owns tasks that have not yet been published. A default-constructed or
-    // consumed batch is empty and may be reused. Do not access one PendingBatch
-    // concurrently.
+    // A batch is a batch of tasks. Owns tasks that have not yet been
+    // published. A default-constructed or consumed batch is empty and may be
+    // reused. Do not access one PendingBatch concurrently.
     class PendingBatch {
        public:
         PendingBatch();
@@ -73,49 +78,58 @@ class BatchIoScheduler {
        private:
         friend class BatchIoScheduler;
         struct State;
+        // Null until the first PrepareTasks call; moved out by SubmitAndWait.
         std::unique_ptr<State> state_;
-        std::optional<ErrorCode> error_;
     };
 
-    // Appends task_count unpublished tasks to the queue of the worker selected
-    // by affinity_key % worker count. Callers pass a stable identity of the
-    // work (for this design, the bucket file's inode), so one source's tasks
-    // all run on one worker and that worker owns the source's state. Task i
-    // receives index i; indices are local to this call. No callback runs
-    // during preparation. task_count == 0 appends nothing and never runs
-    // complete; execute must still be nonempty.
+    // Prepares `task_count` tasks and appends them to the batch; the tasks
+    // run when the batch is submitted with SubmitAndWait.
     //
-    // A nonempty complete creates an independent failure group for this call.
-    // Without complete, the tasks share the batch-wide cancellation domain.
-    // Returns INVALID_PARAMS for an empty execute, NO_AVAILABLE_HANDLE on
-    // allocation failure, or INTERNAL_ERROR for another preparation exception.
-    // Any error invalidates all tasks accumulated in this PendingBatch; later
-    // preparations return the same error until SubmitAndWait consumes it.
+    // - `batch` (in-out): receives the tasks. After a preparation error it
+    //   reports that error until SubmitAndWait consumes it.
+    // - `task_count` (in): number of tasks to prepare; task `i` receives
+    //   index `i`, local to this call. Zero appends nothing.
+    // - `affinity_key` (in): a stable identifier of the work source, such as
+    //   the bucket file's inode. Equal keys always map to the same worker;
+    //   nothing else about the mapping is guaranteed or required.
+    // - `execute` (in): runs one task, called with the task's index, at most
+    //   once per accepted task.
+    // - `complete` (in, optional): runs once after all of this call's tasks
+    //   terminate, with their first error. With `complete`, these tasks fail
+    //   independently of the rest of the batch; without it, a task error
+    //   cancels the batch's other queued tasks.
+    //
+    // Returns INVALID_PARAMS if `execute` is empty, NO_AVAILABLE_HANDLE on
+    // allocation failure, or INTERNAL_ERROR for another preparation failure.
     tl::expected<void, ErrorCode> PrepareTasks(PendingBatch& batch,
                                                size_t task_count,
                                                uint64_t affinity_key,
                                                const Execute& execute,
                                                const Complete& complete = {});
 
-    // Consumes the PendingBatch and publishes all its prepared tasks to their
-    // worker queues without further allocation. Preparation errors are
-    // returned without publication or completion callbacks. An empty batch
-    // succeeds; a nonempty batch submitted after Shutdown returns
-    // UNAVAILABLE_IN_CURRENT_STATUS without running callbacks. The consumed
-    // batch is empty and reusable in every case.
+    // Submits the batch: publishes all its prepared tasks and blocks until
+    // every task has terminated and all started Execute and Complete
+    // callbacks have finished. Returns the first task error, or success when
+    // every task and finalizer succeeds.
     //
-    // For an accepted publication, waits until every task has terminated and
-    // all started Execute and Complete callbacks have finished. Ungrouped task
-    // errors cancel queued ungrouped tasks in this batch. A group error cancels
-    // only that group's queued tasks; other groups continue. Returns the first
-    // reported task error, or success when every task and finalizer succeeds.
+    // - `batch` (in-out): the batch to submit; it is empty and reusable when
+    //   this returns, in every case.
+    //
+    // An empty batch succeeds without running callbacks. If preparation
+    // reported an error, that error is returned and nothing is published. A
+    // nonempty batch submitted after Shutdown returns
+    // UNAVAILABLE_IN_CURRENT_STATUS without running callbacks. On a task
+    // error, ungrouped tasks of this batch are cancelled; a group error
+    // cancels only that group's queued tasks.
     tl::expected<void, ErrorCode> SubmitAndWait(PendingBatch& batch);
 
-    // Stops accepting nonempty publications, cancels queued tasks without
-    // running Execute, lets running callbacks finish, runs Complete for groups
-    // already published, and joins the workers. Safe to call repeatedly and
-    // concurrently with SubmitAndWait. Does not interrupt an in-progress
-    // backoff sleep or a running callback.
+    // Stops the scheduler: cancels queued tasks without running Execute,
+    // lets running callbacks finish, runs Complete for groups already
+    // published, and joins the workers.
+    //
+    // Takes no parameters. Safe to call repeatedly and concurrently with
+    // SubmitAndWait; an in-progress backoff sleep or running callback is not
+    // interrupted.
     void Shutdown();
 
    private:

@@ -25,16 +25,23 @@ namespace mooncake {
 
 class BatchIoScheduler::Impl {
    public:
+    // Shared state of one submitted batch: its first task error, the number
+    // of unfinished tasks, and the wait for them.
     struct Batch {
         std::optional<ErrorCode> error;
         size_t remaining = 0;
         std::condition_variable done;
     };
+    // Shared state of one completion group (one PrepareTasks call with a
+    // nonempty complete): its first task error, remaining task count, and
+    // the callback. A group fails and cancels independently of other groups.
     struct Group {
         std::optional<ErrorCode> error;
         size_t remaining = 0;
         Complete complete;
     };
+    // One prepared task: the batch it belongs to, its call-local index, its
+    // assigned queue, its execute callback, and its completion group if any.
     struct Task {
         std::shared_ptr<Batch> batch;
         size_t index = 0;
@@ -94,6 +101,9 @@ class BatchIoScheduler::Impl {
 
     ~Impl() { Shutdown(); }
 
+    // Waits on `batch` (input) after publishing `tasks`: every task is moved
+    // into its worker queue, so the list elements are moved-from on return.
+    // Returns the first task error reported by `batch`.
     tl::expected<void, ErrorCode> SubmitAndWait(
         const std::shared_ptr<Batch>& batch, std::list<Task>& tasks) {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -134,6 +144,10 @@ class BatchIoScheduler::Impl {
     }
 
    private:
+    // Worker main loop for `worker_index` (input): claims tasks from its own
+    // queue, runs each accepted task's execute, latches errors into the
+    // task's batch and group, finalizes finished groups, and returns when
+    // shutdown has drained the queue.
     void Work(size_t worker_index) {
         auto& slot = *slots_[worker_index];
         std::unique_lock<std::mutex> lock(mutex_);
@@ -215,6 +229,11 @@ class BatchIoScheduler::Impl {
     }
 
    public:
+    // Appends `task_count` prepared tasks to `tasks` (output; existing
+    // entries are untouched). `batch` is input and in-out: every prepared
+    // task holds a reference to it, and a preparation error is latched into
+    // it, poisoning the batch until SubmitAndWait consumes it. `task_count`,
+    // `affinity_key`, `execute` and `complete` are inputs.
     tl::expected<void, ErrorCode> PrepareTasks(
         const std::shared_ptr<Batch>& batch, std::list<Task>& tasks,
         size_t task_count, uint64_t affinity_key, const Execute& execute,
@@ -249,13 +268,13 @@ class BatchIoScheduler::Impl {
         }
     }
 
-    std::mutex mutex_;
-    std::mutex shutdown_mutex_;
-    std::vector<std::unique_ptr<Slot>> slots_;
-    bool stopping_ = false;
-    Ready ready_;
-    std::chrono::milliseconds backoff_{300};
-    std::vector<std::thread> workers_;
+    std::mutex mutex_;  // Guards the queues, stopping_, and batch/group state.
+    std::mutex shutdown_mutex_;  // Serializes concurrent Shutdown calls.
+    std::vector<std::unique_ptr<Slot>> slots_;  // One slot per worker.
+    bool stopping_ = false;  // Set by Shutdown; workers cancel tasks and drain.
+    Ready ready_;  // Caller gate before a task starts; empty accepts all.
+    std::chrono::milliseconds backoff_{300};  // Retry wait of a deferred task.
+    std::vector<std::thread> workers_;        // The resident worker threads.
 };
 
 tl::expected<std::unique_ptr<BatchIoScheduler>, ErrorCode>
@@ -280,6 +299,7 @@ BatchIoScheduler::BatchIoScheduler(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
 BatchIoScheduler::~BatchIoScheduler() = default;
 
+// A PendingBatch's contents: the shared batch state and the prepared tasks.
 struct BatchIoScheduler::PendingBatch::State {
     std::shared_ptr<Impl::Batch> batch = std::make_shared<Impl::Batch>();
     std::list<Impl::Task> tasks;
@@ -299,8 +319,6 @@ tl::expected<void, ErrorCode> BatchIoScheduler::PrepareTasks(
 tl::expected<void, ErrorCode> BatchIoScheduler::SubmitAndWait(
     PendingBatch& batch) {
     auto state = std::move(batch.state_);
-    auto error = std::exchange(batch.error_, std::nullopt);
-    if (error) return tl::make_unexpected(*error);
     if (!state) return {};
     return impl_->SubmitAndWait(state->batch, state->tasks);
 }
