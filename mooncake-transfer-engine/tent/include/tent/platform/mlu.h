@@ -37,13 +37,14 @@ class MluPlatform : public CpuPlatform {
     Status synchronizeDevices(const Topology* topology) override;
     // Same-host physical device identity, independent of visible ordinals.
     Status devicePciBusId(int device, std::string& identity);
-    // Resolve through CNRT and cache successful lookups of physical devices.
+    // Resolve from a cached enumeration of visible devices' PCI bus IDs.
     Status deviceByPciBusId(const std::string& identity, int& device);
     const std::string type() const override { return "mlu"; }
 
    private:
     // CNRT's visible device ordinals stay fixed for this platform's lifetime.
     std::mutex pci_devices_mutex_;
+    bool pci_devices_initialized_ = false;
     std::unordered_map<std::string, int> pci_devices_;
 };
 }  // namespace mooncake::tent

@@ -113,19 +113,25 @@ Status MluPlatform::deviceByPciBusId(const std::string& identity, int& device) {
     std::transform(normalized.begin(), normalized.end(), normalized.begin(),
                    [](unsigned char c) { return std::tolower(c); });
     std::lock_guard<std::mutex> lock(pci_devices_mutex_);
-    const auto found = pci_devices_.find(normalized);
-    if (found != pci_devices_.end()) {
-        device = found->second;
-        return Status::OK();
+    if (!pci_devices_initialized_) {
+        unsigned int count = 0;
+        CHECK_STATUS(checked(cnrtGetDeviceCount(&count)));
+        std::unordered_map<std::string, int> devices;
+        for (unsigned int ordinal = 0; ordinal < count; ++ordinal) {
+            std::string pci;
+            CHECK_STATUS(devicePciBusId(ordinal, pci));
+            devices.emplace(std::move(pci), ordinal);
+        }
+        // Publish only a complete enumeration; runtime failures remain
+        // retryable.
+        pci_devices_ = std::move(devices);
+        pci_devices_initialized_ = true;
     }
-    int resolved = -1;
-    CHECK_STATUS(
-        checked(cnrtDeviceGetByPCIBusId(&resolved, normalized.c_str())));
-    if (resolved < 0)
-        return Status::InternalError("Invalid MLU device ordinal");
-    // Cache only successful lookups so runtime errors remain retryable.
-    pci_devices_.emplace(std::move(normalized), resolved);
-    device = resolved;
+    const auto found = pci_devices_.find(normalized);
+    if (found == pci_devices_.end())
+        return Status::InvalidArgument("MLU PCI device is not visible: " +
+                                       normalized);
+    device = found->second;
     return Status::OK();
 }
 

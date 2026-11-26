@@ -47,6 +47,7 @@
 namespace {
 // Simulate a second visible device for cached-mapping tests on one-card hosts.
 constexpr char kPeerPciBusId[] = "ffff:ff:1f.7";
+thread_local bool stub_peer_enumeration = false;
 std::atomic<bool> fail_notifier_record{false};
 std::atomic<CNresult> reject_copy{CN_SUCCESS};
 std::atomic<CNresult> reject_peer_copy{CN_SUCCESS};
@@ -71,15 +72,25 @@ std::function<void()> before_copy, before_record, before_inline,
     after_idle_query;
 }  // namespace
 
-extern "C" cnrtRet_t __real_cnrtDeviceGetByPCIBusId(int *, const char *);
-extern "C" cnrtRet_t __wrap_cnrtDeviceGetByPCIBusId(int *device,
-                                                    const char *pci) {
-    if (std::strcmp(pci, kPeerPciBusId) == 0) {
-        *device = 1;
+extern "C" cnrtRet_t __real_cnrtGetDeviceCount(unsigned int *);
+extern "C" cnrtRet_t __wrap_cnrtGetDeviceCount(unsigned int *count) {
+    if (stub_peer_enumeration) {
+        *count = 2;
         return cnrtSuccess;
     }
-    if (std::strcmp(pci, "ffff:ff:1f.6") == 0) return cnrtErrorDeviceInvalid;
-    return __real_cnrtDeviceGetByPCIBusId(device, pci);
+    return __real_cnrtGetDeviceCount(count);
+}
+
+extern "C" cnrtRet_t __real_cnrtDeviceGetPCIBusId(char *, int, int);
+extern "C" cnrtRet_t __wrap_cnrtDeviceGetPCIBusId(char *pci, int len,
+                                                  int device) {
+    if (stub_peer_enumeration && device == 1) {
+        if (len < static_cast<int>(sizeof(kPeerPciBusId)))
+            return cnrtErrorArgsInvalid;
+        std::strcpy(pci, kPeerPciBusId);
+        return cnrtSuccess;
+    }
+    return __real_cnrtDeviceGetPCIBusId(pci, len, device);
 }
 
 extern "C" cnrtRet_t __real_cnrtMapMemHandle(void **, cnrtIpcMemHandle, int);
@@ -225,6 +236,16 @@ class TransferEngineImplTestPeer {
 namespace tent {
 class MluTransportTestPeer {
    public:
+    static Status simulatePeerDevice(MluTransport &transport,
+                                     MluPlatform &platform) {
+        stub_peer_enumeration = true;
+        int device = -1;
+        auto status = platform.deviceByPciBusId(kPeerPciBusId, device);
+        stub_peer_enumeration = false;
+        if (status.ok()) transport.platform_ = &platform;
+        return status;
+    }
+
     static bool importsRemovedWithoutLockContention(MluTransport &transport,
                                                     SegmentID target_id) {
         std::unique_lock<std::mutex> lock(transport.mutex_, std::try_to_lock);
@@ -395,6 +416,7 @@ class MluTransportTest : public ::testing::Test {
     }
 
     Platform *loader_ = nullptr;
+    MluPlatform peer_platform_{std::make_shared<Config>()};
     MluTransport transport_;
 };
 
@@ -608,6 +630,9 @@ TEST_F(MluTransportTest, DroppedIpcAttributeIsNotReturnedByLaterPrepare) {
 }
 
 TEST_F(MluTransportTest, CachedIpcMappingMustBeAccessibleForThisCopy) {
+    ASSERT_TRUE(
+        MluTransportTestPeer::simulatePeerDevice(transport_, peer_platform_)
+            .ok());
     uint8_t *source = nullptr, *target = nullptr;
     ASSERT_NO_FATAL_FAILURE(allocDevice(&source, kChunk));
     ASSERT_NO_FATAL_FAILURE(allocDevice(&target, kChunk));
@@ -637,6 +662,9 @@ TEST_F(MluTransportTest, CachedIpcMappingMustBeAccessibleForThisCopy) {
 }
 
 TEST_F(MluTransportTest, CachedIpcMappingChecksActualCopyDirection) {
+    ASSERT_TRUE(
+        MluTransportTestPeer::simulatePeerDevice(transport_, peer_platform_)
+            .ok());
     uint8_t *source = nullptr, *target = nullptr;
     ASSERT_NO_FATAL_FAILURE(allocDevice(&source, kChunk));
     ASSERT_NO_FATAL_FAILURE(allocDevice(&target, kChunk));
