@@ -831,9 +831,8 @@ void EventManager::PropagateDeployment(
         std::shared_lock lock(mu_);
         if (stopped_) return;
         for (const auto& [key, service] : active_configs_) {
-            // 池发布者（Mooncake）不持有 HBM 副本，注册 reader 会因“非
-            // owner”失败， 它的池事件靠同 ContextKey 上已激活的 layout 进入
-            // grouped 分支即可。
+            // Mooncake publishers are not registered as readers. Their event
+            // handlers load the active layout through the Store refresh path.
             if (service.publisher_kind == common::PublisherKind::kMooncake)
                 continue;
             if (ContextFromService(service) == context) {
@@ -845,7 +844,7 @@ void EventManager::PropagateDeployment(
               << " block_size=" << context.block_size
               << " tenant=" << context.tenant_id
               << " instances=" << selected.size();
-    // 不能持锁进入订阅者回调
+    // Do not hold mu_ while calling subscriber handlers.
     for (const auto& handler : selected) handler->AttachDeployment(binding);
 }
 

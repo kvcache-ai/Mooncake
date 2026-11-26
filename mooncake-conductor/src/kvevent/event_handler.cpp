@@ -316,9 +316,8 @@ KVEventHandler::KVEventHandler(EventManager* manager, common::ServiceConfig svc,
 
 bool KVEventHandler::AttachDeployment(
     const prefixindex::SourceLayout& binding) {
-    // 注意：即使本实例已有 layout（可能与宣告者共享同一份），也必须走一遍
-    // ActivateDeployment 以登记 (instance, rank) 的
-    // reader；否则该实例看不到池副本。
+    // Even if this handler already has the layout, the index must record the
+    // readable storage domains for this instance and rank.
     if (!binding.layout) {
         LOG(WARNING) << "Skip attaching deployment without layout instance="
                      << service_.instance_id;
@@ -348,8 +347,7 @@ bool KVEventHandler::AttachDeployment(
 
 bool KVEventHandler::EnsureDeployment() {
     if (layout_.layout) return true;
-    // 同 ContextKey 的其他实例可能已经宣告过布局（例如同一个 P 组内只有一个
-    // rank 发声明）。
+    // Another engine in this context may already have declared the layout.
     prefixindex::SourceLayout binding;
     if (!manager_->GetIndexer()->GetDeployment(ContextFromService(service_),
                                                &binding)) {
@@ -518,10 +516,8 @@ std::string KVEventHandler::HandleVllmBatch(
                      << " seq=" << metadata.sequence;
         return "batch data_parallel_rank conflicts with trusted registration";
     }
-    // kv_cache_layout
-    // 可能先于/后于数据事件到达，且它正是“是否启用分组路径”的输入，
-    // 所以这里必须无条件扫描；不能用 grouped_context()
-    // 作为门控（会形成循环依赖）。
+    // A layout declaration can arrive before or after data events. Scan for
+    // it even when grouped_context() is false.
     {
         for (const auto& decoded : batch.events) {
             if (!decoded.ok()) continue;
@@ -547,9 +543,8 @@ std::string KVEventHandler::HandleVllmBatch(
                       << " instance=" << service_.instance_id
                       << " groups=" << layout_.layout->groups.size();
             manager_->RefreshMooncakeDeployments(ContextFromService(service_));
-            // 同一 ContextKey 的其他实例（还没收到过 layout 的
-            // P、D、mc）也挂上这份部署， 否则它们既没有 hybrid
-            // 索引，也看不到池里的共享副本（cpu_share）。
+            // Let other subscribed engines in this context report shared
+            // cache hits without sending their own layout declarations.
             manager_->PropagateDeployment(ContextFromService(service_),
                                           layout_);
         }
