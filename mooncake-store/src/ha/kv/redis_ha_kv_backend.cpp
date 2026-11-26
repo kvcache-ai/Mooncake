@@ -227,17 +227,6 @@ ErrorCode RedisHaKvBackend::Connect(std::string connstring) {
     std::lock_guard<std::mutex> lock(mu_);
     connstring_ = std::move(connstring);
     client_.reset();
-    const auto config = RedisConnectionConfig::FromEnvironment();
-    if (!config) return config.error();
-    // The policy is fixed at construction. A persistent profile may require a
-    // stronger policy, but Connect must not silently rewrite the configured
-    // policy; reject the conflict instead.
-    if (config->durability_profile == RedisDurabilityProfile::kPersistent &&
-        !write_policy_.require_local_aof) {
-        LOG(ERROR) << "Redis persistent profile requires a write policy with "
-                      "require_local_aof enabled";
-        return ErrorCode::INVALID_PARAMS;
-    }
     const auto validation = ValidateRedisWriteDurabilityPolicy(write_policy_);
     if (validation != ErrorCode::OK) {
         return validation;
@@ -345,6 +334,19 @@ ErrorCode RedisHaKvBackend::EnsureConnectedLocked() {
         return ErrorCode::INVALID_PARAMS;
     }
     if (client_) return ErrorCode::OK;
+    const auto config = RedisConnectionConfig::FromEnvironment();
+    if (!config) return config.error();
+    // The policy is fixed at construction. A persistent profile may require a
+    // stronger policy, but connecting must not silently rewrite it; reject the
+    // conflict instead. Enforce the invariant here too: a backend retained
+    // after Connect() failed must not reconnect through a lazy path and then
+    // confirm writes with WAIT alone.
+    if (config->durability_profile == RedisDurabilityProfile::kPersistent &&
+        !write_policy_.require_local_aof) {
+        LOG(ERROR) << "Redis persistent profile requires a write policy with "
+                      "require_local_aof enabled";
+        return ErrorCode::INVALID_PARAMS;
+    }
     auto client = std::make_unique<ha::common::redis::RedisClusterClient>();
     const auto result =
         client->ConnectDetailed(connstring_, write_policy_.replicas_required,
