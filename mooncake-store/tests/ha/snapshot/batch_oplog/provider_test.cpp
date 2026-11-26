@@ -2,6 +2,7 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 
 #include <gtest/gtest.h>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 
@@ -11,6 +12,7 @@
 #include <vector>
 
 #include "crc32c.h"
+#include "ha/common/advancing_suffix_lag_backend.h"
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_applier.h"
@@ -44,16 +46,26 @@ class EmptyBackend final : public HaKvBackend {
 
     ErrorCode Range(std::string_view begin, std::string_view end, size_t limit,
                     std::vector<KvPair>& output) override {
-        if (begin == fail_range_begin) return ErrorCode::ETCD_OPERATION_ERROR;
-        output.clear();
-        for (const auto& [key, value] : values_) {
-            if (key >= begin && key < end &&
-                (limit == 0 || output.size() < limit)) {
-                output.push_back({key, value});
-            }
-        }
-        return ErrorCode::OK;
+        ++range_calls_;
+        return RangeFrom(begin, end, limit, output);
     }
+
+    ErrorCode RangeSerializable(std::string_view begin, std::string_view end,
+                                size_t limit,
+                                std::vector<KvPair>& output) override {
+        ++serializable_range_calls_;
+        if (on_serializable_range) on_serializable_range();
+        if (stale_serializable_ranges_ > 0) {
+            --stale_serializable_ranges_;
+            output.clear();
+            return ErrorCode::OK;
+        }
+        return RangeFrom(begin, end, limit, output);
+    }
+
+    void StaleNextSerializableRange() { stale_serializable_ranges_ = 1; }
+    int range_calls() const { return range_calls_; }
+    int serializable_range_calls() const { return serializable_range_calls_; }
 
     bool SupportsTxn() const override { return true; }
 
@@ -65,9 +77,25 @@ class EmptyBackend final : public HaKvBackend {
     }
 
     std::string fail_range_begin;
+    std::function<void()> on_serializable_range;
 
    private:
+    ErrorCode RangeFrom(std::string_view begin, std::string_view end,
+                        size_t limit, std::vector<KvPair>& output) {
+        if (begin == fail_range_begin) return ErrorCode::ETCD_OPERATION_ERROR;
+        output.clear();
+        for (const auto& [key, value] : values_) {
+            if (key >= begin && key < end &&
+                (limit == 0 || output.size() < limit)) {
+                output.push_back({key, value});
+            }
+        }
+        return ErrorCode::OK;
+    }
     std::map<std::string, std::string> values_;
+    size_t stale_serializable_ranges_{0};
+    int range_calls_{0};
+    int serializable_range_calls_{0};
 };
 
 class BatchOpLogSnapshotProviderTest : public ::testing::Test {
@@ -117,10 +145,10 @@ TEST_F(BatchOpLogSnapshotProviderTest,
 }
 
 TEST_F(BatchOpLogSnapshotProviderTest,
-       FailedSecondPageRetainsCompleteBatchProgress) {
+       DefaultPageLimitBoundsProgressBeforeSecondPageFailure) {
     EmptyBackend backend;
     LocalFileSnapshotObjectStore objects(root_);
-    for (uint64_t id = 1; id <= 1025; ++id) {
+    for (uint64_t id = 1; id <= 257; ++id) {
         OpLogEntry entry;
         entry.sequence_id = id;
         entry.op_type = OpType::REMOVE;
@@ -132,9 +160,8 @@ TEST_F(BatchOpLogSnapshotProviderTest,
                     EncodeOpLogBatchRecord(batch));
     }
     backend.Put(BuildDurablePrefixKey("clusterA"),
-                EncodeDurablePrefix({.batch_id = 1025, .last_seq = 1025}));
-    backend.fail_range_begin =
-        BuildBatchRecordRange("clusterA", 1024).begin_key;
+                EncodeDurablePrefix({.batch_id = 257, .last_seq = 257}));
+    backend.fail_range_begin = BuildBatchRecordRange("clusterA", 256).begin_key;
     BatchOpLogSnapshotProvider provider("clusterA", backend, objects,
                                         "snapshots");
     StandbyMetadataStore metadata;
@@ -143,9 +170,9 @@ TEST_F(BatchOpLogSnapshotProviderTest,
     const auto result = provider.RestoreBaseline(metadata, registry, &applier);
     ASSERT_FALSE(result);
     EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, result.error());
-    EXPECT_EQ(1025u, applier.GetExpectedSequenceId());
+    EXPECT_EQ(257u, applier.GetExpectedSequenceId());
     EXPECT_EQ(
-        1024u,
+        256u,
         HAMetricManager::instance().get_snapshot_runtime().suffix_batches);
 }
 
@@ -284,6 +311,61 @@ TEST_F(BatchOpLogSnapshotProviderTest, RestoreHonorsCancellation) {
                                            [] { return true; });
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(ErrorCode::ETCD_CTX_CANCELLED, result.error());
+}
+
+TEST_F(BatchOpLogSnapshotProviderTest,
+       CancellationDuringFallbackReplayIsNotAnIncompleteHistory) {
+    EmptyBackend backend;
+    LocalFileSnapshotObjectStore objects(root_);
+    // Compacted history requires the fallback snapshot. Cancellation during
+    // its replay must not fall through to the "no usable snapshot" error.
+    backend.Put(ha::BuildBatchOpLogSnapshotCompactionFloorKey("clusterA"), "1");
+    backend.Put(BuildDurablePrefixKey("clusterA"),
+                EncodeDurablePrefix({.batch_id = 2, .last_seq = 2}));
+    const auto segments = EncodeBatchOpLogSnapshotSegments({});
+    const auto segments_key =
+        ha::BuildBatchOpLogSnapshotSegmentsKey("snapshots", "1-7");
+    ASSERT_TRUE(objects.UploadBuffer(segments_key, segments));
+    ha::BatchOpLogSnapshotManifest manifest;
+    manifest.snapshot_id = "1-7";
+    manifest.last_included_batch_id = manifest.last_included_seq = 1;
+    manifest.segments = {
+        .key = segments_key,
+        .stored_size = segments.size(),
+        .crc32c = Crc32cValue(segments.data(), segments.size())};
+    const auto manifest_bytes = ha::EncodeBatchOpLogSnapshotManifest(manifest);
+    ha::BatchOpLogSnapshotDescriptor descriptor;
+    descriptor.snapshot_id = "1-7";
+    descriptor.last_included_batch_id = descriptor.last_included_seq = 1;
+    descriptor.manifest_key =
+        ha::BuildBatchOpLogSnapshotManifestKey("snapshots", "1-7");
+    descriptor.manifest_size = manifest_bytes.size();
+    descriptor.manifest_crc32c =
+        Crc32cValue(manifest_bytes.data(), manifest_bytes.size());
+    ASSERT_TRUE(objects.UploadString(descriptor.manifest_key, manifest_bytes));
+    const auto descriptor_bytes =
+        ha::EncodeBatchOpLogSnapshotDescriptor(descriptor);
+    ASSERT_TRUE(objects.UploadString(
+        ha::BuildBatchOpLogSnapshotDescriptorKey("snapshots", "1-7"),
+        descriptor_bytes));
+    backend.Put(ha::BuildBatchOpLogSnapshotFallbackKey("clusterA"),
+                descriptor_bytes);
+    bool cancelled = false;
+    backend.on_serializable_range = [&] { cancelled = true; };
+    BatchOpLogSnapshotProvider provider("clusterA", backend, objects,
+                                        "snapshots", 2,
+                                        std::chrono::milliseconds(0));
+    StandbyMetadataStore metadata;
+    StandbySegmentRegistry registry;
+    OpLogApplier applier(&metadata, "clusterA");
+    const auto result = provider.RestoreBaseline(metadata, registry, &applier,
+                                                 0, [&] { return cancelled; });
+
+    ASSERT_FALSE(result);
+    EXPECT_EQ(ErrorCode::ETCD_CTX_CANCELLED, result.error());
+    EXPECT_EQ(0u, metadata.GetKeyCount());
+    EXPECT_TRUE(registry.GetAllSegments().empty());
+    EXPECT_EQ(1u, applier.GetExpectedSequenceId());
 }
 
 TEST_F(BatchOpLogSnapshotProviderTest, EmptyCompleteHistoryIsAValidBaseline) {
@@ -434,6 +516,82 @@ TEST_F(BatchOpLogSnapshotProviderTest, ReturnsFinalCursorAfterSuffixReplay) {
 }
 
 TEST_F(BatchOpLogSnapshotProviderTest,
+       RejectsReplayThatReachesTargetSequenceBeforeTargetBatch) {
+    EmptyBackend backend;
+    LocalFileSnapshotObjectStore objects(root_);
+    // Batch 2 consumes sequence 3, which the prefix assigns to batch 3.
+    // Neither a full page nor a short page can prove this suffix complete.
+    OpLogBatchRecord batch;
+    batch.batch_id = 2;
+    batch.first_seq = 2;
+    batch.last_seq = 3;
+    for (uint64_t seq = 2; seq <= 3; ++seq) {
+        OpLogEntry entry;
+        entry.sequence_id = seq;
+        entry.op_type = OpType::REMOVE;
+        entry.object_key = "missing";
+        batch.entries.push_back(std::move(entry));
+    }
+    ASSERT_EQ(ErrorCode::OK, backend.Put(BuildBatchRecordKey("clusterA", 2),
+                                         EncodeOpLogBatchRecord(batch)));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 3, .last_seq = 3})));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(ha::BuildBatchOpLogSnapshotCompactionFloorKey("clusterA"),
+                    "1"));
+    const auto segments = EncodeBatchOpLogSnapshotSegments({});
+    const auto segments_key =
+        ha::BuildBatchOpLogSnapshotSegmentsKey("snapshots", "1-7");
+    ASSERT_TRUE(objects.UploadBuffer(segments_key, segments));
+    ha::BatchOpLogSnapshotManifest manifest;
+    manifest.snapshot_id = "1-7";
+    manifest.last_included_batch_id = manifest.last_included_seq = 1;
+    manifest.segments = {
+        .key = segments_key,
+        .stored_size = segments.size(),
+        .crc32c = Crc32cValue(segments.data(), segments.size())};
+    const auto manifest_bytes = ha::EncodeBatchOpLogSnapshotManifest(manifest);
+    ha::BatchOpLogSnapshotDescriptor descriptor;
+    descriptor.snapshot_id = "1-7";
+    descriptor.last_included_batch_id = descriptor.last_included_seq = 1;
+    descriptor.manifest_key =
+        ha::BuildBatchOpLogSnapshotManifestKey("snapshots", "1-7");
+    descriptor.manifest_size = manifest_bytes.size();
+    descriptor.manifest_crc32c =
+        Crc32cValue(manifest_bytes.data(), manifest_bytes.size());
+    ASSERT_TRUE(objects.UploadString(descriptor.manifest_key, manifest_bytes));
+    const auto descriptor_bytes =
+        ha::EncodeBatchOpLogSnapshotDescriptor(descriptor);
+    ASSERT_TRUE(objects.UploadString(
+        ha::BuildBatchOpLogSnapshotDescriptorKey("snapshots", "1-7"),
+        descriptor_bytes));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(ha::BuildBatchOpLogSnapshotLatestKey("clusterA"),
+                          descriptor_bytes));
+
+    for (const size_t page_size : {1u, 2u}) {
+        SCOPED_TRACE(page_size);
+        BatchOpLogSnapshotProvider provider("clusterA", backend, objects,
+                                            "snapshots", page_size);
+        StandbyMetadataStore metadata;
+        StandbySegmentRegistry registry;
+        OpLogApplier applier(&metadata, "clusterA");
+
+        const auto result =
+            provider.RestoreBaseline(metadata, registry, &applier);
+
+        EXPECT_FALSE(result.has_value());
+        if (result) continue;
+        EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, result.error());
+        EXPECT_EQ(0u, metadata.GetKeyCount());
+        EXPECT_TRUE(registry.GetAllSegments().empty());
+        EXPECT_EQ(1u, applier.GetExpectedSequenceId());
+    }
+}
+
+TEST_F(BatchOpLogSnapshotProviderTest,
        ReplaysCompleteHistoryAfterBothPointersAreInvalid) {
     LocalFileSnapshotObjectStore object_store(root_);
     EmptyBackend backend;
@@ -462,9 +620,11 @@ TEST_F(BatchOpLogSnapshotProviderTest,
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildDurablePrefixKey("clusterA"),
                           EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
+    backend.StaleNextSerializableRange();
 
-    BatchOpLogSnapshotProvider provider("clusterA", backend, object_store,
-                                        "snapshots");
+    BatchOpLogSnapshotProvider provider(
+        "clusterA", backend, object_store, "snapshots", 1024,
+        std::chrono::milliseconds(0), std::chrono::milliseconds(0));
     StandbyMetadataStore metadata;
     StandbySegmentRegistry registry;
     auto result = provider.RestoreBaseline(metadata, registry);
@@ -472,6 +632,46 @@ TEST_F(BatchOpLogSnapshotProviderTest,
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(2u, result->last_applied_seq);
     EXPECT_EQ(2u, result->last_applied_batch_id);
+    EXPECT_EQ(1, backend.serializable_range_calls());
+    EXPECT_GT(backend.range_calls(), 0);
+}
+
+TEST_F(BatchOpLogSnapshotProviderTest,
+       RevalidatesSuffixLagDespiteContinuousBatchProgress) {
+    auto storage = std::make_shared<EmptyBackend>();
+    AdvancingSuffixLagBackend backend("clusterA", storage);
+    backend.StartLagging(1);
+    LocalFileSnapshotObjectStore objects(root_);
+    BatchOpLogSnapshotProvider provider(
+        "clusterA", backend, objects, "snapshots", 1024,
+        std::chrono::milliseconds(1), std::chrono::milliseconds(30));
+    StandbyMetadataStore metadata;
+    StandbySegmentRegistry registry;
+
+    auto result = provider.RestoreBaseline(metadata, registry);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_GE(result->last_applied_batch_id, 2u);
+    EXPECT_EQ(result->last_applied_batch_id, result->last_applied_seq);
+}
+
+TEST_F(BatchOpLogSnapshotProviderTest,
+       KeepsStrongRevalidationAcrossCatchUpPages) {
+    auto storage = std::make_shared<EmptyBackend>();
+    AdvancingSuffixLagBackend backend("clusterA", storage);
+    backend.StartLagging(1, std::chrono::seconds(5), 3);
+    LocalFileSnapshotObjectStore objects(root_);
+    BatchOpLogSnapshotProvider provider(
+        "clusterA", backend, objects, "snapshots", 2,
+        std::chrono::milliseconds(1), std::chrono::milliseconds(30));
+    StandbyMetadataStore metadata;
+    StandbySegmentRegistry registry;
+
+    auto result = provider.RestoreBaseline(metadata, registry);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_GE(result->last_applied_batch_id, 4u);
+    EXPECT_EQ(result->last_applied_batch_id, result->last_applied_seq);
 }
 
 }  // namespace mooncake::test

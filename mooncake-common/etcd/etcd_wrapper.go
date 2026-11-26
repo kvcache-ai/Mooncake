@@ -1249,7 +1249,7 @@ func EtcdStoreGetWithPrefixWrapper(prefix *C.char, prefixSize C.int, keys **C.ch
 }
 
 //export EtcdStoreGetRangeAsJsonWrapper
-func EtcdStoreGetRangeAsJsonWrapper(startKey *C.char, startKeySize C.int, endKey *C.char, endKeySize C.int, limit C.int, outJson **C.char, outJsonSize *C.int, revisionId *C.longlong, errMsg **C.char) int {
+func EtcdStoreGetRangeAsJsonWrapper(startKey *C.char, startKeySize C.int, endKey *C.char, endKeySize C.int, limit C.int, serializable C.int, outJson **C.char, outJsonSize *C.int, revisionId *C.longlong, errMsg **C.char) int {
 	cli := getStoreClient()
 	if cli == nil {
 		*errMsg = C.CString("etcd client not initialized")
@@ -1267,6 +1267,9 @@ func EtcdStoreGetRangeAsJsonWrapper(startKey *C.char, startKeySize C.int, endKey
 	}
 	if limit > 0 {
 		opts = append(opts, clientv3.WithLimit(int64(limit)))
+	}
+	if serializable != 0 {
+		opts = append(opts, clientv3.WithSerializable())
 	}
 	resp, err := cli.Get(ctx, start, opts...)
 	if err != nil {
