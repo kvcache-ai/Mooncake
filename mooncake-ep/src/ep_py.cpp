@@ -43,6 +43,8 @@ PYBIND11_MODULE(_ep, m) {
     m.def("create_nccl_unique_id", &create_elastic_nccl_unique_id);
 #endif
 #if defined(MOONCAKE_EP_USE_XPU)
+    m.def("get_ep_elastic_buffer_size_hint",
+          &xpu_ep::get_ep_elastic_buffer_size_hint);
     m.def("calculate_elastic_buffer_size",
           &xpu_ep::MooncakeEpXpuElasticBuffer::calculate_buffer_size);
 #endif
@@ -131,6 +133,29 @@ PYBIND11_MODULE(_ep, m) {
              py::arg("cumulative_local_expert_recv_stats_ptr") = 0)
         .def("combine", &MooncakeEpBuffer::combine);
 #else
+    // Elastic mode (Buffer.create_elastic) over Level Zero IPC; there is no
+    // _barrier or _get_comm_stream on XPU.
+    buffer.def("_configure_elastic", &EpBuffer::configure_elastic)
+        .def("_set_explicit_destroy", &EpBuffer::set_explicit_destroy)
+        .def("_validate_connect_ranks", &EpBuffer::validate_connect_ranks)
+        .def("_stage_peer",
+             [](EpBuffer& native_buffer, int peer_rank, int64_t raddr,
+                int32_t rkey, int64_t subnet_prefix, int64_t interface_id,
+                const std::vector<int32_t>& qpns,
+                const std::vector<int32_t>& lids,
+                const std::vector<int32_t>& ipc_handle) {
+                 py::gil_scoped_release release;
+                 native_buffer.stage_peer(peer_rank, raddr, rkey, subnet_prefix,
+                                          interface_id, qpns, lids, ipc_handle);
+             })
+        .def("_disconnect_ranks", &EpBuffer::disconnect_ranks)
+        .def("_update_mask_buffer", &EpBuffer::update_mask_buffer)
+        .def("_query_mask_buffer", &EpBuffer::query_mask_buffer)
+        .def("_clean_mask_buffer", &EpBuffer::clean_mask_buffer)
+        .def("_get_active_rank_bound", &EpBuffer::get_active_rank_bound)
+        .def("_get_local_buffer_descriptor",
+             &EpBuffer::get_local_buffer_descriptor)
+        .def("destroy", &EpBuffer::destroy);
     buffer.def("dispatch", &EpBuffer::dispatch)
         .def("combine", &EpBuffer::combine)
         // Ranks on other nodes: a host proxy's RDMA writes, not IBGDA.
