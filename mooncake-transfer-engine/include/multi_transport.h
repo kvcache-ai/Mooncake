@@ -70,6 +70,11 @@ class MultiTransport {
     // cleanup means in-flight transport work may still own transfer buffers.
     Status freeBatchID(BatchID batch_id);
 
+    // Fail-closed WRITE submission requiring receiver-visible completion; see
+    // TransferEngine::submitReceiverVisibleWrite for the full contract.
+    Status submitReceiverVisibleWrite(
+        BatchID batch_id, const std::vector<TransferRequest> &entries);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries);
 
@@ -137,6 +142,11 @@ class MultiTransport {
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries,
                           std::vector<size_t> *task_sizes);
+
+    Status submitTransferImpl(BatchID batch_id,
+                              const std::vector<TransferRequest> &entries,
+                              std::vector<size_t> *task_sizes,
+                              bool require_receiver_visible);
 
     Status selectTransports(const std::vector<TransferRequest> &entries,
                             std::vector<Transport *> &transports);
