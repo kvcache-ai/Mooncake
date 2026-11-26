@@ -405,7 +405,7 @@ class TcpTransport : public Transport {
 
     struct ConnectionLaneState {
         std::mutex mutex;
-        std::atomic<bool> shutting_down{false};
+        bool shutting_down = false;
         size_t lanes_per_peer = 4;
         size_t max_queued_transfers_per_peer = 1024;
         size_t max_pending_admissions_per_peer = 1024;

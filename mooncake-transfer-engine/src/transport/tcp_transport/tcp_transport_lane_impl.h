@@ -584,7 +584,7 @@ void TcpTransport::enqueuePooledTransfer(const std::string& logical_peer,
 
     try {
         std::lock_guard<std::mutex> state_lock(state->mutex);
-        if (state->shutting_down.load(std::memory_order_acquire)) {
+        if (state->shutting_down) {
             rejected.emplace(std::move(work));
             rejection_reason = WorkFailureReason::SHUTDOWN;
         } else {
@@ -1490,8 +1490,8 @@ void TcpTransport::shutdownConnectionLanes() {
     std::vector<std::shared_ptr<OneShotSession>> one_shots;
     {
         std::lock_guard<std::mutex> state_lock(state->mutex);
-        if (state->shutting_down.load(std::memory_order_acquire)) return;
-        state->shutting_down.store(true, std::memory_order_release);
+        if (state->shutting_down) return;
+        state->shutting_down = true;
         groups.reserve(state->groups.size() + state->retiring_groups.size());
         for (const auto& entry : state->groups) groups.push_back(entry.second);
         for (const auto& group : state->retiring_groups)

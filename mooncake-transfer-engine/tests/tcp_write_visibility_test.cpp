@@ -2063,6 +2063,7 @@ TEST(TcpWriteVisibilityTest, UnpooledShutdownFailsInFlightSubmitTransferSlice) {
 
 TEST(TcpWriteVisibilityTest, UnpooledParallelBatchSubmitCompletesCleanly) {
     ScopedEnvVar unpooled("MC_TCP_ENABLE_CONNECTION_POOL", "0");
+    ScopedEnvVar io_threads("MC_NUM_TCP_IO_THREADS", "2");
     ScopedEnvVar threads("MC_BATCH_SUBMIT_THREADS", "2");
     ScopedEnvVar min_size("MC_BATCH_SUBMIT_MIN_SIZE", "2");
     constexpr size_t kNumSlices = 8;
