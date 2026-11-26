@@ -107,9 +107,10 @@ class OrderedOpLogWriter {
     // the future and use via(executor) to select its execution context.
     async_simple::Future<ErrorCode> AwaitDurable(uint64_t sequence);
 
-    // Release existing and future uncovered waiters during shutdown without
-    // stopping in-flight writes or callbacks. Covered sequences still return
-    // OK.
+    // Permanently reject new reservations and commits, including commits from
+    // existing reservations, and release uncovered waiters during shutdown.
+    // Already-accepted writes and callbacks continue; covered sequences still
+    // return OK.
     void CancelDurabilityWaits();
 
     bool IsAccepting() const;

@@ -314,7 +314,7 @@ OrderedOpLogWriter::Commit(Reservation&& reservation, OpLogEntry entry,
     if (impl_->terminal_state.has_value()) {
         return reject_reservation(impl_->terminal_state->error);
     }
-    if (impl_->stop_requested) {
+    if (impl_->stop_requested || impl_->durability_waits_cancelled) {
         return reject_reservation(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     std::string reason;
@@ -369,7 +369,7 @@ OrderedOpLogWriter::CommitBatch(Reservation&& reservation,
     if (impl_->terminal_state.has_value()) {
         return reject_reservation(impl_->terminal_state->error);
     }
-    if (impl_->stop_requested) {
+    if (impl_->stop_requested || impl_->durability_waits_cancelled) {
         return reject_reservation(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     for (const auto& entry : entries) {
@@ -445,7 +445,9 @@ void OrderedOpLogWriter::CancelDurabilityWaits() {
     {
         std::lock_guard lock(impl_->mutex);
         impl_->durability_waits_cancelled = true;
+        impl_->accepting = false;
         waiters.swap(impl_->durable_waiters);
+        impl_->PublishRuntime();
     }
     Impl::CompleteWaiters(std::move(waiters),
                           ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
@@ -620,7 +622,8 @@ void OrderedOpLogWriter::Start() {
                                                  .last_seq = batch.last_seq};
                         waiters = impl_->TakeCoveredWaiters();
                         impl_->last_error = ErrorCode::OK;
-                        impl_->accepting = !impl_->stop_requested;
+                        impl_->accepting = !impl_->stop_requested &&
+                                           !impl_->durability_waits_cancelled;
                         impl_->retry_delay_ms = 0;
                         impl_->stuck_range.reset();
                         for (size_t i = 0; i < entries.size(); ++i) {
