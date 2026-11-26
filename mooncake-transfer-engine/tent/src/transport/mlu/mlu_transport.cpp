@@ -35,6 +35,8 @@
 namespace mooncake {
 namespace tent {
 namespace {
+constexpr char kIpcExporterAttr[] = "mlu_ipc_exporter";
+
 std::string pidNamespace() {
     char buf[64];
     const auto size = readlink("/proc/self/ns/pid", buf, sizeof(buf));
@@ -59,43 +61,31 @@ struct IpcAttr {
     uintptr_t handle = 0;
     std::string pci_bus_id;
     pid_t pid = 0;
-    std::string pid_namespace;
 };
 
 std::string formatIpcAttr(const IpcAttr &attr) {
     // Use '|' because PCI bus IDs contain ':'.
     return std::to_string(attr.base) + '|' + std::to_string(attr.size) + '|' +
-           std::to_string(attr.handle) + '|' + attr.pci_bus_id + '|' +
-           std::to_string(attr.pid) + '|' + attr.pid_namespace;
+           std::to_string(attr.handle) + '|' + attr.pci_bus_id;
 }
 
 bool parseIpcAttr(const std::string &text, IpcAttr &attr) {
     // Legacy ordinal-only attributes cannot safely identify a remapped
     // device. Reject them and let the planner select another route.
-    std::array<std::string_view, 6> fields;
+    std::array<std::string_view, 4> fields;
     size_t start = 0;
-    size_t count = 0;
     for (size_t i = 0; i < fields.size(); ++i) {
         const size_t end = text.find('|', start);
+        if (i + 1 < fields.size() && end == std::string::npos) return false;
         if (i + 1 == fields.size() && end != std::string::npos) return false;
         fields[i] = std::string_view(text).substr(start, end - start);
-        ++count;
-        if (end == std::string::npos) break;
         start = end + 1;
     }
-    // Older exporters have no process identity; retain their existing
-    // segment-based cleanup without trying to watch an unrelated PID.
-    if (count != 4 && count != 6) return false;
     auto number = [](std::string_view field, auto &value) {
         auto [end, ec] =
             std::from_chars(field.data(), field.data() + field.size(), value);
         return ec == std::errc() && end == field.data() + field.size();
     };
-    if (count == 6) {
-        if (!number(fields[4], attr.pid) || attr.pid <= 0 || fields[5].empty())
-            return false;
-        attr.pid_namespace = std::string(fields[5]);
-    }
     attr.pci_bus_id = std::string(fields[3]);
     return number(fields[0], attr.base) && number(fields[1], attr.size) &&
            number(fields[2], attr.handle) && attr.size && attr.handle &&
@@ -261,9 +251,15 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
             // Keep this marker after the last buffer is removed. updateLocal()
             // replaces it with the publication number on every update.
             CHECK_STATUS(metadata_->segmentManager().updateLocal(
-                [](SegmentDesc &segment) {
-                    std::get<MemorySegmentDesc>(segment.detail)
-                        .transport_attrs.try_emplace(MLU);
+                [this](SegmentDesc &segment) {
+                    auto &memory = std::get<MemorySegmentDesc>(segment.detail);
+                    memory.transport_attrs.try_emplace(MLU);
+                    // Keep the buffer's four-field IPC format readable by
+                    // older importers; exporter identity is optional metadata.
+                    memory.device_attrs.erase(kIpcExporterAttr);
+                    if (!pid_namespace_.empty())
+                        memory.device_attrs[kIpcExporterAttr] =
+                            std::to_string(getpid()) + '|' + pid_namespace_;
                     return Status::OK();
                 }));
         }
@@ -777,9 +773,8 @@ Status MluTransport::addMemoryBuffer(BufferDesc &desc,
         desc.transports.push_back(TransportType::MLU);
     }
     desc.transport_attrs.erase(MLU);
-    if (ipc_enabled_ && !pid_namespace_.empty() &&
-        options.perm == kGlobalReadWrite && location.type() == "mlu" &&
-        desc.length) {
+    if (ipc_enabled_ && options.perm == kGlobalReadWrite &&
+        location.type() == "mlu" && desc.length) {
         const auto address = static_cast<CNaddr>(desc.addr);
         CNcontext context = nullptr;
         int device = -1;
@@ -810,7 +805,7 @@ Status MluTransport::addMemoryBuffer(BufferDesc &desc,
             if (status.ok() && handle) {
                 desc.transport_attrs[MLU] = formatIpcAttr(
                     {base, size, reinterpret_cast<uintptr_t>(handle),
-                     pci_bus_id, getpid(), pid_namespace_});
+                     pci_bus_id});
             }
         }
         if (!status.ok()) {
@@ -866,9 +861,23 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
     const auto &attr_text = entry.transport_attrs.at(MLU);
     IpcAttr attr;
     if (!parseIpcAttr(attr_text, attr) ||
-        (attr.pid && attr.pid_namespace != pid_namespace_) ||
         !rangeWithin(entry.addr, entry.length, attr.base, attr.size))
         return false;
+    const auto &device_attrs = segment.getMemory().device_attrs;
+    const auto exporter = device_attrs.find(kIpcExporterAttr);
+    // Legacy exporters omit this metadata and retain segment-based cleanup.
+    if (exporter != device_attrs.end()) {
+        const auto &identity = exporter->second;
+        const auto separator = identity.find('|');
+        if (separator == std::string::npos) return false;
+        const auto [pid_end, pid_error] = std::from_chars(
+            identity.data(), identity.data() + separator, attr.pid);
+        if (pid_error != std::errc() ||
+            pid_end != identity.data() + separator || attr.pid <= 0 ||
+            pid_namespace_.empty() ||
+            identity.substr(separator + 1) != pid_namespace_)
+            return false;
+    }
 
     // Peer checks and runtime device selection both use this process's
     // ordinal, even when the exporter exposes its devices in another order.

@@ -709,12 +709,7 @@ TEST_F(MluTransportTest, RejectsLegacyAndMalformedIpcAttributesBeforeMapping) {
           "4096|65536|101|", "4096|65536|0|0000:11:00.0",
           "4096|0|101|0000:11:00.0", "invalid|65536|101|0000:11:00.0",
           "4096|65536|101|0000:11:00.0|extra",
-          "4096|65536|101|0000:11:00.0|0|pid:[1]",
-          "4096|65536|101|0000:11:00.0|-1|pid:[1]",
-          "4096|65536|101|0000:11:00.0|abc|pid:[1]",
-          "4096|65536|101|0000:11:00.0|999999999999999999999|pid:[1]",
-          "4096|65536|101|0000:11:00.0|1|",
-          "4096|65536|101|0000:11:00.0|1|pid:[1]|extra"}) {
+          "4096|65536|101|0000:11:00.0|1|pid:[1]"}) {
         SCOPED_TRACE(text);
         auto entry = ipcBuffer(0x1000, kChunk, 101);
         entry.transport_attrs[MLU] = text;
@@ -731,20 +726,27 @@ TEST_F(MluTransportTest, ProcessIdentityRequiresMatchingPidNamespace) {
     ASSERT_FALSE(ns.empty());
     std::vector<uint8_t> source(kChunk);
     auto entry = ipcBuffer(0x1000, kChunk, 101);
-    entry.transport_attrs[MLU] += '|' + std::to_string(getpid()) + '|' + ns;
     MluTransportTestPeer::seedImportCache(
         transport_, 42,
         {{entry.transport_attrs.at(MLU), entry.addr, entry.length,
           std::make_shared<int>(0), getpid()}},
         1);
     auto snapshot = ipcSnapshot(1, {entry});
+    auto &identity = std::get<MemorySegmentDesc>(snapshot.detail)
+                         .device_attrs["mlu_ipc_exporter"];
+    identity = std::to_string(getpid()) + '|' + ns;
     EXPECT_TRUE(transport_.prepareRemoteBuffer(42, snapshot, entry,
                                                source.data(), Request::WRITE));
-    entry.transport_attrs[MLU] += "-different";
-    snapshot = ipcSnapshot(2, {entry});
     const int maps_before = ipc_map_calls;
-    EXPECT_FALSE(transport_.prepareRemoteBuffer(42, snapshot, entry,
-                                                source.data(), Request::WRITE));
+    for (const auto &invalid :
+         {std::string(), std::string("1"), "0|" + ns, "-1|" + ns, "abc|" + ns,
+          "999999999999999999999|" + ns, std::to_string(getpid()) + '|',
+          std::to_string(getpid()) + '|' + ns + "-different",
+          std::to_string(getpid()) + '|' + ns + "|extra"}) {
+        identity = invalid;
+        EXPECT_FALSE(transport_.prepareRemoteBuffer(
+            42, snapshot, entry, source.data(), Request::WRITE));
+    }
     EXPECT_EQ(ipc_map_calls.load(), maps_before);
 }
 
@@ -764,7 +766,7 @@ TEST_F(MluTransportTest, UnresolvableIpcOwnerDoesNotAttemptMapping) {
     EXPECT_EQ(ipc_map_calls.load(), maps_before);
 }
 
-TEST_F(MluTransportTest, RestrictedBuffersDoNotExportIpcHandle) {
+TEST_F(MluTransportTest, BufferPermissionsAndLegacyIpcFormat) {
     uint8_t *device = nullptr;
     ASSERT_NO_FATAL_FAILURE(allocDevice(&device, kChunk));
 
@@ -780,6 +782,14 @@ TEST_F(MluTransportTest, RestrictedBuffersDoNotExportIpcHandle) {
         EXPECT_EQ(desc.transport_attrs.count(MLU), 0);
         ASSERT_TRUE(transport_.removeMemoryBuffer(desc).ok());
     }
+
+    options.perm = kGlobalReadWrite;
+    ASSERT_TRUE(transport_.addMemoryBuffer(desc, options).ok());
+    ASSERT_EQ(desc.transport_attrs.count(MLU), 1);
+    const auto &attr = desc.transport_attrs.at(MLU);
+    // Older importers require exactly four fields.
+    EXPECT_EQ(std::count(attr.begin(), attr.end(), '|'), 3);
+    ASSERT_TRUE(transport_.removeMemoryBuffer(desc).ok());
 
     EXPECT_TRUE(loader_->free(device, kChunk).ok());
 }
