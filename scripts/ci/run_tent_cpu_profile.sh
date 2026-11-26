@@ -67,6 +67,7 @@ common_flags=(
 extra_flags=()
 build_targets=()
 ctest_args=()
+ctest_timeout=300
 
 case "$profile" in
   cuda-off)
@@ -83,7 +84,8 @@ case "$profile" in
   memfabric-mock)
     extra_flags=(-DUSE_CUDA=OFF -DUSE_MEMFABRIC=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF -DCMAKE_BUILD_TYPE=Debug)
     build_targets=(tent_memfabric_transport_test transfer_engine)
-    ctest_args=(-R '^tent_memfabric_transport_test$' --no-tests=error --timeout 120)
+    ctest_args=(-R '^tent_memfabric_transport_test$' --no-tests=error)
+    ctest_timeout=120
     ;;
   *)
     usage
@@ -102,18 +104,18 @@ else
 fi
 
 if [[ "$profile" == "cuda-off" ]]; then
-  ctest --test-dir "$build_dir" --output-on-failure --no-tests=error \
+  ctest --test-dir "$build_dir" --output-on-failure --no-tests=error --timeout "$ctest_timeout" \
     -R '^(transfer_task_tent_completion_test|standalone_client_tent_test)$'
-  ctest --test-dir "$build_dir" --output-on-failure --no-tests=error \
+  ctest --test-dir "$build_dir" --output-on-failure --no-tests=error --timeout "$ctest_timeout" \
     -R '^tent_compat_notify_test$'
-  ctest --test-dir "$build_dir" --output-on-failure --no-tests=error \
+  ctest --test-dir "$build_dir" --output-on-failure --no-tests=error --timeout "$ctest_timeout" \
     -R '^transfer_task_tent_shared_segment_test$'
 fi
 
 if [[ "$profile" == "ub-mock" ]]; then
   # The hugepage case skips itself when the runner grants no hugepages.
   sudo sysctl -w vm.nr_hugepages=64 || true
-  ctest --test-dir "$build_dir" --output-on-failure --no-tests=error \
+  ctest --test-dir "$build_dir" --output-on-failure --no-tests=error --timeout "$ctest_timeout" \
     -R '^store_tent_ub_mock_test$'
 fi
 
@@ -122,6 +124,7 @@ mkdir -p "$build_dir/test-results"
   cd "$build_dir"
   ctest --test-dir mooncake-transfer-engine/tent/tests -j \
     --output-on-failure \
+    --timeout "$ctest_timeout" \
     --output-junit "$build_dir/test-results/ctest.xml" \
     ${ctest_args[@]+"${ctest_args[@]}"}
 )
@@ -134,9 +137,10 @@ ci_start_service "tent-metadata-${profile}" "$RUNNER_TEMP/tent-metadata-${profil
 ci_wait_service "tent-metadata-${profile}" 8080
 
 rust_smoke_script="${MOONCAKE_TE_RUST_SMOKE_SCRIPT:-$GITHUB_WORKSPACE/scripts/ci/run_transfer_engine_rust_smoke.sh}"
+rust_smoke_timeout="${MOONCAKE_TE_RUST_SMOKE_TIMEOUT:-600}"
 MOONCAKE_BUILD_DIR="$build_dir" \
   MOONCAKE_TE_RUST_LINK_ASAN="0" \
-  "$rust_smoke_script"
+  timeout --signal=TERM --kill-after=30 "$rust_smoke_timeout" "$rust_smoke_script"
 
 ci_stop_service "tent-metadata-${profile}"
 

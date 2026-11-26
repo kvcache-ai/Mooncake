@@ -13,6 +13,9 @@ inputs:
   exclude-regex:
     description: Optional CTest test-name regex to exclude
     default: ''
+  timeout:
+    description: Optional default per-test timeout in seconds (CTest --timeout)
+    default: ''
 runs:
   using: composite
   steps:
@@ -22,4 +25,5 @@ runs:
         JUNIT_REPORT: ${{ inputs.junit-report }}
         CTEST_LABEL_EXCLUDE: ${{ inputs.label-exclude }}
         CTEST_EXCLUDE_REGEX: ${{ inputs.exclude-regex }}
+        CTEST_TIMEOUT: ${{ inputs.timeout }}
       run: bash "$GITHUB_ACTION_PATH/run.sh"

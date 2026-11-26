@@ -30,6 +30,7 @@ class RunCTestTest(unittest.TestCase):
         # An inherited workflow setting must not affect the unset-value case.
         env.pop("CTEST_LABEL_EXCLUDE", None)
         env.pop("CTEST_EXCLUDE_REGEX", None)
+        env.pop("CTEST_TIMEOUT", None)
         env.update(overrides)
         return subprocess.run(
             [
@@ -131,18 +132,20 @@ source "$SCRIPT"
         self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
         self.assertIn("--label-exclude", self.recorded("ctest.args"))
 
-    def test_exclude_regex_coexists_with_label_exclude_and_junit(self):
+    def test_exclude_regex_and_timeout_coexist_with_label_exclude_and_junit(self):
         regex = "^efa_(transport|c_api|gpu_loopback)_test$"
         report = "build/test-results/ctest.xml"
         result = self.run_suite(
             JUNIT_REPORT=report,
             CTEST_LABEL_EXCLUDE="^nvlink_gpu$",
             CTEST_EXCLUDE_REGEX=regex,
+            CTEST_TIMEOUT="600",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         args = self.recorded("ctest.args")
         self.assertEqual(args[args.index("--label-exclude") + 1], "^nvlink_gpu$")
         self.assertEqual(args[args.index("--exclude-regex") + 1], regex)
+        self.assertEqual(args[args.index("--timeout") + 1], "600")
         self.assertEqual(
             args[args.index("--output-junit") + 1], str(self.root / report)
         )

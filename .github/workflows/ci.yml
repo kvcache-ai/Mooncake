@@ -35,6 +35,7 @@ jobs:
   fast-checks:
     name: Fast lint, format, contract, and path checks
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
     permissions:
       contents: read
       pull-requests: read
@@ -208,24 +209,29 @@ jobs:
       shell: bash
 
     - name: Check canonical reshard contract types
+      timeout-minutes: 5
       run: bash scripts/check_reshard_types.sh
       shell: bash
 
     - name: Run focused release gate tests
+      timeout-minutes: 5
       run: python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
       shell: bash
 
     - name: Test CI service and smoke scripts
+      timeout-minutes: 5
       run: python -m unittest discover -s scripts/ci/tests -v
       shell: bash
 
     - name: Run focused shell regression tests
+      timeout-minutes: 5
       run: |
         bash scripts/tone_tests/tests/test_common_cleanup.sh
         python3 -m unittest discover -s scripts/tone_tests/tests -p 'test_*.py'
       shell: bash
 
     - name: Run CPU table, facade and range-plan contracts without a native build
+      timeout-minutes: 5
       env:
         # mooncake-wheel holds the pure-Python modules the installed wheel
         # merges into the package, such as mooncake._partial_read.
@@ -262,6 +268,7 @@ jobs:
             artifact: mooncake-wheel-ci-py310
             torch-pip-extra-args: '--index-url https://download.pytorch.org/whl/cpu'
     runs-on: ${{ matrix.ubuntu-version }}
+    timeout-minutes: 45
     steps:
     - uses: actions/checkout@v4
       with:
@@ -329,6 +336,7 @@ jobs:
       shell: bash
 
     - name: Run installation test script
+      timeout-minutes: 15
       env:
         TORCH_PIP_EXTRA_ARGS: ${{ matrix.torch-pip-extra-args }}
       run: |
@@ -338,10 +346,12 @@ jobs:
     - name: Test installed Conductor wheel API
       # Recheck the repaired artifact on both consumer distributions, without
       # build-tree imports or loader overrides masking missing dependencies.
+      timeout-minutes: 5
       run: python scripts/smoke_conductor_wheel.py mooncake-wheel/dist/*.whl --test-api
       shell: bash
 
     - name: Run in-process master e2e tests (no mooncake_master)
+      timeout-minutes: 5
       run: |
         source test_env/bin/activate
         bash scripts/run_standalone_store_e2e.sh
@@ -349,6 +359,7 @@ jobs:
       shell: bash
 
     - name: Run tensor snapshot regressions
+      timeout-minutes: 5
       env:
         MASTER_SERVER: "127.0.0.1:50061"
         MC_METADATA_SERVER: "P2PHANDSHAKE"
@@ -378,6 +389,7 @@ jobs:
       shell: bash
 
     - name: Run session and HCA write metadata regressions
+      timeout-minutes: 10
       run: |
         source test_env/bin/activate
         export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
@@ -391,6 +403,7 @@ jobs:
 
     - name: Run all PG CPU tests with installed PyTorch
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
+      timeout-minutes: 20
       env:
         MC_FORCE_TCP: "true"
         # The runner has CUDA headers/nvcc but no usable GPU for arch detection.
@@ -403,6 +416,7 @@ jobs:
 
     - name: Run Store API and RPC smoke tests
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
+      timeout-minutes: 10
       env:
         MOONCAKE_MASTER: "127.0.0.1:50051"
         MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
@@ -423,6 +437,7 @@ jobs:
 
     - name: Run SSD offload and promotion end-to-end tests
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
+      timeout-minutes: 10
       run: |
         source test_env/bin/activate
         ./scripts/ci/run_ssd_offload_smoke.sh
@@ -433,6 +448,7 @@ jobs:
     needs: [fast-checks]
     if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04
+    timeout-minutes: 75
     env:
       CI: "true"
       SCCACHE_GHA_ENABLED: "true"
@@ -534,6 +550,7 @@ jobs:
       run: ${SCCACHE_PATH} --show-stats
 
     - name: Run Mooncake Store Rust unit tests
+      timeout-minutes: 15
       env:
         MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build
         MOONCAKE_STORE_LIB_DIR: ${{ github.workspace }}/build/mooncake-store/src
@@ -548,6 +565,7 @@ jobs:
 
     - name: Run all CTest unit tests
       id: ctest
+      timeout-minutes: 25
       uses: ./.github/actions/run-ctest
       with:
         junit-report: build/test-results/ctest.xml
@@ -555,6 +573,10 @@ jobs:
         # Exclude the three EFA tests that require real EFA hardware; the five
         # hardware-free EFA tests still execute here and all EFA targets compile.
         exclude-regex: '^efa_(transport|c_api|gpu_loopback)_test$'
+        # Default per-test timeout (10m) instead of CTest's 25m fallback so a
+        # hung test fails fast while tests with explicit TIMEOUT properties keep
+        # their own limits and pybind_client_test (~6.5m) still has headroom.
+        timeout: '600'
 
     - name: Preserve CTest diagnostics
       if: ${{ always() && steps.ctest.outcome == 'failure' }}
@@ -571,6 +593,7 @@ jobs:
     needs: [fast-checks]
     if: needs.fast-checks.outputs.docs == 'true'
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@v4
       with:
@@ -637,6 +660,7 @@ jobs:
     needs: [fast-checks]
     if: needs.fast-checks.outputs.tent == 'true'
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       # Balance runner fan-out and wall-clock time across three legs instead of
@@ -728,6 +752,7 @@ jobs:
     # libraries on cuda-on (the CPU legs run the full smoke script per profile).
     - name: Check Transfer Engine Rust bindings, examples, and tests
       if: matrix.need_cuda
+      timeout-minutes: 15
       run: |
         if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
            [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
@@ -749,12 +774,14 @@ jobs:
 
     - name: Build standalone Transfer Engine flags check (build-flags)
       if: matrix.name == 'cpu-core'
+      timeout-minutes: 15
       run: ./scripts/ci/run_tent_cpu_profile.sh build-flags
       shell: bash
 
     - name: Build & test TENT (cuda-off)
       id: ctest_cuda_off
       if: matrix.name == 'cpu-core'
+      timeout-minutes: 25
       run: ./scripts/ci/run_tent_cpu_profile.sh cuda-off
       shell: bash
 
@@ -771,6 +798,7 @@ jobs:
     - name: Build & test TENT (memfabric-mock)
       id: ctest_memfabric
       if: matrix.name == 'cpu-core'
+      timeout-minutes: 15
       run: ./scripts/ci/run_tent_cpu_profile.sh memfabric-mock
       shell: bash
 
@@ -787,6 +815,7 @@ jobs:
     - name: Build & test TENT (cuda-off-metrics-on)
       id: ctest_metrics
       if: matrix.name == 'cpu-variants'
+      timeout-minutes: 20
       run: ./scripts/ci/run_tent_cpu_profile.sh cuda-off-metrics-on
       shell: bash
 
@@ -803,6 +832,7 @@ jobs:
     - name: Build & test TENT (ub-mock)
       id: ctest_ub
       if: matrix.name == 'cpu-variants'
+      timeout-minutes: 35
       run: ./scripts/ci/run_tent_cpu_profile.sh ub-mock
       shell: bash
 
@@ -936,6 +966,7 @@ jobs:
       shell: bash
 
     - name: Run Store-RS Classic TE smoke
+      timeout-minutes: 20
       run: ./scripts/ci/run_store_rs_smoke.sh
       shell: bash
 
@@ -963,6 +994,7 @@ jobs:
       - tent-ci
       - store-rs-ci
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       # Each path-gated group must succeed when selected and be skipped otherwise.
       # A failed selector must never turn skipped builds into a successful gate.

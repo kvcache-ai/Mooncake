@@ -197,6 +197,8 @@ with log_file.open("a") as f:
 
         ctest_calls = self.read_jsonl("ctest.jsonl")
         self.assertEqual(len(ctest_calls), 4)
+        for call in ctest_calls:
+            self.assertEqual(call["args"][call["args"].index("--timeout") + 1], "300")
         self.assertIn("tent_compat_notify_test", " ".join(ctest_calls[1]["args"]))
         self.assertIn(
             "transfer_task_tent_shared_segment_test", " ".join(ctest_calls[2]["args"])
@@ -238,6 +240,23 @@ with log_file.open("a") as f:
         ctest_calls = self.read_jsonl("ctest.jsonl")
         self.assertEqual(len(ctest_calls), 1)
         self.assertIn("^tent_memfabric_transport_test$", ctest_calls[0]["args"])
+        self.assertEqual(
+            ctest_calls[0]["args"][ctest_calls[0]["args"].index("--timeout") + 1],
+            "120",
+        )
+
+    def test_hung_rust_smoke_times_out_and_preserves_failure(self):
+        hung_smoke = self.bin_dir / "hung-rust-smoke.sh"
+        hung_smoke.write_text("#!/bin/sh\nsleep 30\n")
+        hung_smoke.chmod(0o755)
+        result = self.run_profile(
+            "memfabric-mock",
+            extra_env={
+                "MOONCAKE_TE_RUST_SMOKE_SCRIPT": str(hung_smoke),
+                "MOONCAKE_TE_RUST_SMOKE_TIMEOUT": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
 
     def test_failed_ctest_preserves_build_dir_for_diagnostics(self):
         result = self.run_profile(
@@ -326,6 +345,40 @@ class CIWorkflowOptimizationTest(unittest.TestCase):
         self.assertEqual(
             ctest["with"]["exclude-regex"], "^efa_(transport|c_api|gpu_loopback)_test$"
         )
+        self.assertEqual(ctest["with"]["timeout"], "600")
+        self.assertLessEqual(ctest["timeout-minutes"], 30)
+
+    def test_all_pr_ci_jobs_and_test_steps_have_explicit_timeouts(self):
+        for workflow_name, workflow in (
+            ("ci.yml", self.ci),
+            ("_build-wheel.yaml", self.build_wheel),
+            ("ci_rocm.yml", self.rocm),
+            ("ci-macos.yml", self.macos),
+        ):
+            for job_name, job in workflow["jobs"].items():
+                if "uses" in job:
+                    continue
+                with self.subTest(workflow=workflow_name, job=job_name):
+                    self.assertIn("timeout-minutes", job)
+                    self.assertGreater(job["timeout-minutes"], 0)
+                    self.assertLessEqual(job["timeout-minutes"], 75)
+
+        wheel_test_steps = {
+            s.get("name"): s for s in self.ci["jobs"]["test-wheel-ubuntu"]["steps"]
+        }
+        for step_name in (
+            "Run installation test script",
+            "Test installed Conductor wheel API",
+            "Run in-process master e2e tests (no mooncake_master)",
+            "Run tensor snapshot regressions",
+            "Run session and HCA write metadata regressions",
+            "Run all PG CPU tests with installed PyTorch",
+            "Run Store API and RPC smoke tests",
+            "Run SSD offload and promotion end-to-end tests",
+        ):
+            with self.subTest(step=step_name):
+                self.assertIn("timeout-minutes", wheel_test_steps[step_name])
+                self.assertLessEqual(wheel_test_steps[step_name]["timeout-minutes"], 20)
 
     def test_tent_ci_splits_into_three_balanced_legs_with_diagnostics(self):
         tent = self.ci["jobs"]["tent-ci"]

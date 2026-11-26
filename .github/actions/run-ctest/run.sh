@@ -12,6 +12,9 @@ fi
 if [ -n "${CTEST_EXCLUDE_REGEX:-}" ]; then
   args+=(--exclude-regex "$CTEST_EXCLUDE_REGEX")
 fi
+if [ -n "${CTEST_TIMEOUT:-}" ]; then
+  args+=(--timeout "$CTEST_TIMEOUT")
+fi
 if [ -n "$JUNIT_REPORT" ]; then
   report="$GITHUB_WORKSPACE/$JUNIT_REPORT"
   mkdir -p "$(dirname "$report")"
