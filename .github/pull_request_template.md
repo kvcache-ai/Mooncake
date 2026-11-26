@@ -47,7 +47,9 @@
 
 **Test commands:**
 ```bash
-# Example: bash scripts/run_ci_test.sh
+git fetch origin main
+pre-commit run --files $(git diff --name-only --diff-filter=ACMR origin/main...HEAD)
+./scripts/code_format.sh --check --changed-lines --base origin/main
 ```
 
 **Test results:**
