@@ -23,6 +23,8 @@
 #include <cerrno>
 #include <cstring>
 #include <map>
+#include <mutex>
+#include <unordered_map>
 #include <unistd.h>
 #include <sys/syscall.h>
 
@@ -137,6 +139,54 @@ static int openIPCHandle(const std::vector<unsigned char>& buffer,
         return -1;
     }
     return 0;
+}
+
+// IPC handles exported by this process, keyed by allocation base. HIP cannot
+// open a handle in the process that exported it (hipErrorInvalidContext), so a
+// target registered by another TransferEngine in this process is copied to at
+// its own address instead.
+struct LocalIpcExport {
+    hipIpcMemHandle_t handle;
+    size_t refs;
+};
+
+static std::mutex& localIpcExportsMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::unordered_map<uint64_t, LocalIpcExport>& localIpcExports() {
+    static std::unordered_map<uint64_t, LocalIpcExport> exports;
+    return exports;
+}
+
+static void addLocalIpcExport(uint64_t base, const hipIpcMemHandle_t& handle) {
+    std::lock_guard<std::mutex> lock(localIpcExportsMutex());
+    auto [it, inserted] =
+        localIpcExports().try_emplace(base, LocalIpcExport{handle, 0});
+    if (!inserted) it->second.handle = handle;
+    it->second.refs++;
+}
+
+static void removeLocalIpcExport(uint64_t base) {
+    std::lock_guard<std::mutex> lock(localIpcExportsMutex());
+    auto it = localIpcExports().find(base);
+    if (it != localIpcExports().end() && --it->second.refs == 0) {
+        localIpcExports().erase(it);
+    }
+}
+
+// True when `shm_name` carries the handle this process exported for `base`.
+// Matching the handle bytes, not just the address, keeps a peer process's
+// buffer at the same virtual address from being mistaken for a local one.
+static bool isLocalIpcExport(uint64_t base, const std::string& shm_name) {
+    std::lock_guard<std::mutex> lock(localIpcExportsMutex());
+    auto it = localIpcExports().find(base);
+    if (it == localIpcExports().end()) return false;
+    std::vector<unsigned char> buffer;
+    deserializeBinaryData(shm_name, buffer);
+    return buffer.size() == sizeof(hipIpcMemHandle_t) &&
+           memcmp(&it->second.handle, buffer.data(), buffer.size()) == 0;
 }
 
 static int openShareableHandle(const std::vector<unsigned char>& buffer,
@@ -807,6 +857,7 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         int rc = metadata_->addLocalMemoryBuffer(desc, true);
         if (rc == 0) {
             registered_base_refs_[base] = 1;
+            addLocalIpcExport(base, handle);
         } else {
             // addLocalMemoryBuffer appends the desc before publishing it;
             // drop the leftover so a failed registration leaves nothing
@@ -929,6 +980,7 @@ int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     // physical page.
     if (--registered_base_refs_[base] > 0) return 0;
     registered_base_refs_.erase(base);
+    if (!use_fabric_mem_) removeLocalIpcExport(base);
     return metadata_->removeLocalMemoryBuffer((void*)base, isOwnDesc,
                                               update_metadata);
 }
@@ -942,6 +994,12 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
     for (auto& entry : desc->buffers) {
         if (!entry.shm_name.empty() && entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
+            // Exported by this process: copy to it directly. Not cached, so
+            // an unregister by its owner is seen on the next transfer.
+            if (!use_fabric_mem_ &&
+                isLocalIpcExport(entry.addr, entry.shm_name)) {
+                return 0;
+            }
             // Check if already remapped (shared lock)
             remap_lock_.lockShared();
             if (remap_entries_.count(std::make_pair(target_id, entry.addr))) {
