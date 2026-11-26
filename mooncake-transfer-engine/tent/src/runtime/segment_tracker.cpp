@@ -18,6 +18,7 @@
 #include <cassert>
 #include <cstddef>
 #include <filesystem>
+#include <ranges>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -30,21 +31,33 @@
 namespace mooncake {
 namespace tent {
 namespace {
+using BufferRange = std::pair<uint64_t, size_t>;
+
+BufferRange bufferRange(const BufferDesc& desc) {
+    return {desc.addr, desc.length};
+}
+
+bool rangeLess(const BufferRange& lhs, const BufferRange& rhs) {
+    if (lhs.first != rhs.first) return lhs.first < rhs.first;
+    return lhs.second > rhs.second;  // Prefer the longest range at an address.
+}
+
 void sortBuffers(std::vector<BufferDesc>& buffers) {
     std::sort(buffers.begin(), buffers.end(),
-              [](const BufferDesc& lhs, const BufferDesc& rhs) -> bool {
-                  if (lhs.addr < rhs.addr) return true;
-                  if (lhs.addr > rhs.addr) return false;
-                  return lhs.length > rhs.length;  // prefer large interval
+              [](const BufferDesc& lhs, const BufferDesc& rhs) {
+                  return rangeLess(bufferRange(lhs), bufferRange(rhs));
               });
 }
 
+auto findRange(const std::vector<BufferDesc>& buffers, uint64_t addr,
+               size_t length) {
+    // Use the same ordering as publication to find all aliases of a range.
+    return std::ranges::equal_range(buffers, BufferRange{addr, length},
+                                    rangeLess, bufferRange);
+}
+
 bool containsBuffer(const SegmentDesc& desc, uint64_t base, size_t length) {
-    auto& detail = std::get<MemorySegmentDesc>(desc.detail);
-    for (auto& buf : detail.buffers) {
-        if (buf.addr == base && buf.length == length) return true;
-    }
-    return false;
+    return !findRange(desc.getMemory().buffers, base, length).empty();
 }
 
 struct BufferRangeHash {
@@ -58,12 +71,11 @@ struct BufferRangeHash {
 // Keep their reference counts in sync and remove them together.
 std::vector<size_t> MatchRange(const std::vector<BufferDesc>& buffers,
                                uint64_t addr, size_t length) {
+    const auto range = findRange(buffers, addr, length);
     std::vector<size_t> matches;
-    for (size_t i = 0; i < buffers.size(); ++i) {
-        if (buffers[i].addr == addr && buffers[i].length == length) {
-            matches.push_back(i);
-        }
-    }
+    matches.reserve(range.size());
+    for (auto it = range.begin(); it != range.end(); ++it)
+        matches.push_back(static_cast<size_t>(it - buffers.begin()));
     return matches;
 }
 
@@ -229,6 +241,8 @@ Status SegmentTracker::addInBatch(
         }
         return status;
     }
+    // Duplicate references were published before the callback.
+    if (any_dup && new_desc_list.empty()) return Status::OK();
     return manager_.updateLocal([&](SegmentDesc& desc) -> Status {
         assert(desc.type == SegmentType::Memory);
         auto& detail = std::get<MemorySegmentDesc>(desc.detail);

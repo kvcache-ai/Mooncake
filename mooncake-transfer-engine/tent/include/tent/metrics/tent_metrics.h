@@ -168,7 +168,13 @@ class TentMetrics {
     // register/unregisterLocalMemory. Same pairing rule as above.
     void recordRegisteredBufferBytes(TransportType tp, int64_t delta);
 
-    enum class MnnvlEvent { FabricFallback, StrictFailure };
+    enum class MnnvlEvent {
+        FabricFallback,
+        StrictFailure,
+        PoolHit,
+        PoolMiss,
+        CompletionQuery
+    };
     void recordMnnvlEvent(MnnvlEvent event);
 
     enum class Stage {
@@ -336,8 +342,8 @@ class TentMetrics {
     }
 
     metrics::CachedDynamicCounter<1> mnnvl_events_total_{
-        "tent_mnnvl_events_total", "MNNVL fabric event activity",
-        std::array<std::string, 1>{"event"}, 2};
+        "tent_mnnvl_events_total", "MNNVL fabric and completion event activity",
+        std::array<std::string, 1>{"event"}, 5};
 
     // Per-transport counters (label: transport). Values are int64_t.
     metrics::CachedDynamicCounter<1> read_bytes_total_{

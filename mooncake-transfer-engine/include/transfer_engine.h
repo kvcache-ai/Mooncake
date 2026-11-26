@@ -169,6 +169,9 @@ class TransferEngine {
 
     int removeLocalSegment(const std::string& segment_name);
 
+    // Do not call concurrently with memory registration.
+    int enableMemoryRegistrationReuse();
+
     // Register [addr, addr + length) for local and (when remote_accessible)
     // remote RDMA access.
     //

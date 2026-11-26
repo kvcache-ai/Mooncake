@@ -283,6 +283,8 @@ class TransferEnginePy {
     }
 
     // FOR EXPERIMENT ONLY
+    int enableMemoryRegistrationReuse();
+
     int registerMemory(uintptr_t buffer_addr, size_t capacity,
                        const std::string &location = kWildcardLocation,
                        bool remote_accessible = true);

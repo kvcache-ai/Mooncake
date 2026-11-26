@@ -9,6 +9,8 @@
 
 #include "http_metadata_server.h"
 #include "common/network.h"
+#include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 namespace mooncake::testing {
 
@@ -92,6 +94,42 @@ TEST_F(HttpMetadataServerTest, RejectsChangedRpcMetaRepublish) {
     auto stored = Get(port, path);
     EXPECT_EQ(stored.status, 200);
     EXPECT_EQ(stored.body, original);
+
+    server.stop();
+}
+
+// Clients write keys percent-encoded. Cleanup on client timeout removes the
+// plain key names in-process, so it only works if the server stores them
+// decoded. Afterwards the same client can register again.
+TEST_F(HttpMetadataServerTest, TimeoutCleanupRemovesKeysWrittenByClients) {
+    int port = getFreeTcpPort();
+    HttpMetadataServer server(static_cast<uint16_t>(port), "127.0.0.1");
+    ASSERT_TRUE(server.start());
+    WaitUntilReady(port);
+
+    const std::string ram_path =
+        "/metadata?key=mooncake%2Fram%2F10.0.0.1%3A12384";
+    const std::string rpc_path =
+        "/metadata?key=mooncake%2Frpc_meta%2F10.0.0.1%3A12384";
+    const std::string rpc_meta =
+        R"({"ip_or_host_name":"10.0.0.1","rpc_port":15228})";
+    const std::string restarted_rpc_meta =
+        R"({"ip_or_host_name":"10.0.0.1","rpc_port":16000})";
+
+    EXPECT_EQ(Put(port, ram_path, R"({"buffers":[]})").status, 200);
+    EXPECT_EQ(Put(port, rpc_path, rpc_meta).status, 200);
+
+    {
+        MasterService service;
+        service.setHttpMetadataServer(&server);
+        mooncake::test::MasterServiceTestPeer(service)
+            .CleanupHttpMetadataForTesting("10.0.0.1:12384");
+        service.setHttpMetadataServer(nullptr);
+    }
+
+    EXPECT_EQ(Get(port, ram_path).status, 404);
+    EXPECT_EQ(Get(port, rpc_path).status, 404);
+    EXPECT_EQ(Put(port, rpc_path, restarted_rpc_meta).status, 200);
 
     server.stop();
 }

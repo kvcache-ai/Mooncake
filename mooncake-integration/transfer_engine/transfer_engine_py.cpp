@@ -540,7 +540,8 @@ char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
     if (!buffer) return nullptr;
     int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
     if (ret) {
-        freeMemory(buffer);
+        // A failed rollback leaves the engine tracking the buffer.
+        if (!engine_->checkOverlap(buffer, capacity)) freeMemory(buffer);
         return nullptr;
     }
     return (char*)buffer;
@@ -1568,6 +1569,11 @@ int TransferEnginePy::batchUnregisterMemory(
     return engine_->unregisterLocalMemoryBatch(buffers);
 }
 
+int TransferEnginePy::enableMemoryRegistrationReuse() {
+    if (!engine_) return ERR_INVALID_ARGUMENT;
+    return engine_->enableMemoryRegistrationReuse();
+}
+
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity,
                                      const std::string& location,
                                      bool remote_accessible) {
@@ -2254,6 +2260,8 @@ NB_MODULE(engine, m) {
                  })
             .def("read_bytes_from_buffer",
                  &TransferEnginePy::readBytesFromBuffer)
+            .def("enable_memory_registration_reuse",
+                 &TransferEnginePy::enableMemoryRegistrationReuse)
             .def("register_memory", &TransferEnginePy::registerMemory,
                  py::arg("buffer_addr"), py::arg("capacity"),
                  py::arg("location") = kWildcardLocation,

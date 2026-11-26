@@ -204,6 +204,10 @@ int TransferEngine::removeLocalSegment(const std::string& segment_name) {
     return impl_->removeLocalSegment(segment_name);
 }
 
+int TransferEngine::enableMemoryRegistrationReuse() {
+    return impl_->enableMemoryRegistrationReuse();
+}
+
 int TransferEngine::registerLocalMemory(void* addr, size_t length,
                                         const std::string& location,
                                         bool remote_accessible,
@@ -898,6 +902,11 @@ int TransferEngine::removeLocalSegment(const std::string& segment_name) {
         return impl_->removeLocalSegment(segment_name);
 }
 
+int TransferEngine::enableMemoryRegistrationReuse() {
+    if (use_tent_) return ERR_NOT_IMPLEMENTED;
+    return impl_->enableMemoryRegistrationReuse();
+}
+
 int TransferEngine::registerLocalMemory(void* addr, size_t length,
                                         const std::string& location,
                                         bool remote_accessible,
@@ -1523,15 +1532,13 @@ std::optional<Status> TransferEngine::tryParallelBatchTransfer(
             << " descriptors=" << count;
     int device = -1;
 #ifdef USE_CUDA
-    const auto cuda_status = cudaGetDevice(&device);
-    if (cuda_status == cudaErrorNoDevice ||
-        cuda_status == cudaErrorInsufficientDriver ||
-        cuda_status == cudaErrorInitializationError) {
-        // Host-only transfers also work without an initialized CUDA runtime.
+    // Host-only transfers also work without an initialized CUDA runtime.
+    // A missing GPU, an uninitialized driver, and the CI driver stub all
+    // fail this query with different codes. There is no caller device to
+    // propagate, so the workers skip cudaSetDevice.
+    if (cudaGetDevice(&device) != cudaSuccess) {
         device = -1;
         (void)cudaGetLastError();
-    } else if (cuda_status != cudaSuccess) {
-        return Status::Context("Could not capture batch submit CUDA device");
     }
 #endif
     // Workers mutate distinct vectors; retain every vector until parent join.

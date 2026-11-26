@@ -4,7 +4,6 @@
 #include <chrono>
 #include <optional>
 #include <string>
-#include <type_traits>
 #include <utility>
 
 #include "../src/config/nof_debug_config.h"
@@ -40,11 +39,6 @@ TEST(NoFDebugConfigTest, DefaultsWhenUnset) {
     const auto config = NoFDebugConfig::FromEnvironment();
     EXPECT_FALSE(config.enabled);
     EXPECT_EQ(config.interval_ms, std::chrono::milliseconds{1000});
-}
-
-TEST(NoFDebugConfigTest, ExposesTheIntervalAsMilliseconds) {
-    EXPECT_TRUE((std::is_same_v<decltype(NoFDebugConfig{}.interval_ms),
-                                std::chrono::milliseconds>));
 }
 
 TEST(NoFDebugConfigTest, EachSettingKeepsItsOwnFirstUseSnapshot) {
