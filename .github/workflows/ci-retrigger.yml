@@ -1,0 +1,245 @@
+name: Retrigger CI on approval or run-ci label
+
+# Reruns gated PR workflows (`ci.yml`, `ci-macos.yml`) when either:
+# 1. A maintainer approves the PR (via workflow_run from CI Approval Signal), or
+# 2. A maintainer manually applies the `run-ci` label (via pull_request_target).
+#
+# Both events run from the default branch with `actions: write` so fork PRs can
+# rerun Actions; neither ever checks out PR code.
+on:
+  pull_request_target:
+    branches:
+      - "main"
+      - "release/**"
+    types: [labeled]
+  workflow_run:
+    workflows: ["CI Approval Signal"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: >-
+    ci-retrigger-${{ github.event_name == 'pull_request_target' &&
+    format('ci-approval:{0}:{1}', github.event.pull_request.number, github.event.pull_request.head.sha) ||
+    github.event.workflow_run.display_title }}
+  cancel-in-progress: false
+
+jobs:
+  retrigger:
+    if: >-
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.state == 'open' &&
+       github.event.label.name == 'run-ci' &&
+       github.actor != 'github-actions[bot]') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.event == 'pull_request_review' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.display_title, 'ci-approval:'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify trigger and rerun gated CI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          LABEL_PR_NUMBER: ${{ github.event.pull_request.number }}
+          LABEL_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DISPLAY_TITLE: ${{ github.event.workflow_run.display_title }}
+          POLL_INTERVAL_SECONDS: "10"
+          MAX_DISCOVERY_POLLS: "6"
+          MAX_WAIT_POLLS: "60"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          verify_pr_head_current() {
+            local meta state cur_sha
+            local -a f=()
+            meta=$(
+              gh api "repos/${REPO}/pulls/${pr_number}" \
+                --jq '(.state // ""), (.head.sha // "")'
+            ) || return 2
+            mapfile -t f <<< "$meta"
+            state="${f[0]:-}"
+            cur_sha="${f[1]:-}"
+            if [ "$state" != "open" ] || [ "$cur_sha" != "$head_sha" ]; then
+              echo "PR #${pr_number} moved or closed (state=${state}, head=${cur_sha}); skipping rerun for ${head_sha}."
+              return 1
+            fi
+            return 0
+          }
+
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            if [[ ! "$DISPLAY_TITLE" =~ ^ci-approval:([0-9]+):([0-9a-f]{40})$ ]]; then
+              echo "::error::Unexpected approval signal title: ${DISPLAY_TITLE}"
+              exit 1
+            fi
+            pr_number="${BASH_REMATCH[1]}"
+            head_sha="${BASH_REMATCH[2]}"
+
+            # Independently re-verify PR state and maintainer approval against
+            # the API so a modified fork workflow cannot spoof an approval.
+            pr_meta=$(
+              gh api "repos/${REPO}/pulls/${pr_number}" \
+                --jq '(.state // ""), (.base.ref // ""), (.head.sha // ""), (.user.login // "")'
+            )
+            mapfile -t pr_fields <<< "$pr_meta"
+            pr_state="${pr_fields[0]:-}"
+            base_ref="${pr_fields[1]:-}"
+            current_head_sha="${pr_fields[2]:-}"
+            pr_author="${pr_fields[3]:-}"
+            if [ "$pr_state" != "open" ] || [ "$current_head_sha" != "$head_sha" ] ||
+               [[ "$base_ref" != "main" && "$base_ref" != release/* ]]; then
+              echo "Skipping PR #${pr_number} (state=${pr_state}, base=${base_ref}, head=${current_head_sha})."
+              exit 0
+            fi
+
+            approver=$(
+              gh api --paginate "repos/${REPO}/pulls/${pr_number}/reviews" | jq -s -r \
+                --arg pr_author "$pr_author" '
+                  add // []
+                  | map(select(
+                      ((.user.type // "") == "User")
+                      and (((.user.login // "") | endswith("[bot]")) | not)
+                      and ((.user.login // "") != $pr_author)
+                      and (.author_association as $a
+                           | ["OWNER", "MEMBER", "COLLABORATOR"] | index($a) != null)
+                      and (.state as $s
+                           | ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"] | index($s) != null)
+                    ))
+                  | group_by(.user.login)
+                  | map(sort_by(.id) | last)
+                  | map(select(.state == "APPROVED"))
+                  | .[0].user.login // ""
+                '
+            )
+            if [ -z "$approver" ]; then
+              echo "PR #${pr_number} has no active maintainer approval; refusing to rerun."
+              exit 0
+            fi
+            echo "Verified approval by @${approver} for PR #${pr_number} (${head_sha})."
+          else
+            pr_number="$LABEL_PR_NUMBER"
+            head_sha="$LABEL_HEAD_SHA"
+            rc=0
+            verify_pr_head_current || rc=$?
+            if [ "$rc" -eq 1 ]; then
+              exit 0
+            elif [ "$rc" -ne 0 ]; then
+              exit "$rc"
+            fi
+          fi
+
+          retrigger_workflow() {
+            local wf="$1" required="$2" skip_unauth_success="$3"
+            local max_discovery=1
+            [ "$wf" = "ci.yml" ] && max_discovery="$MAX_DISCOVERY_POLLS"
+
+            local run_meta run_id="" status="" conclusion="" attempt=1
+            local -a fields=()
+            while [ "$attempt" -le "$max_discovery" ]; do
+              run_meta=$(
+                gh api "repos/${REPO}/actions/workflows/${wf}/runs?head_sha=${head_sha}&event=pull_request&per_page=20" \
+                  --jq '(.workflow_runs[0] // {}) | (.id // "" | tostring), (.status // ""), (.conclusion // "")'
+              ) || return 1
+              mapfile -t fields <<< "$run_meta"
+              run_id="${fields[0]:-}"
+              status="${fields[1]:-}"
+              conclusion="${fields[2]:-}"
+              [ -n "$run_id" ] && break
+              [ "$attempt" -lt "$max_discovery" ] && sleep "$POLL_INTERVAL_SECONDS"
+              attempt=$((attempt + 1))
+            done
+
+            if [ -z "$run_id" ]; then
+              if [ "$required" = "true" ]; then
+                echo "No ${wf} run found for SHA ${head_sha}. Open or push to the PR first."
+                return 1
+              fi
+              echo "[${wf}] No pull_request run found for ${head_sha}; skipping."
+              return 0
+            fi
+
+            local poll=0
+            while true; do
+              if [ "$status" = "action_required" ]; then
+                echo "::notice::[${wf}] Run ${run_id} is awaiting first-time contributor approval in Actions."
+                return 0
+              fi
+
+              local jobs_meta job_count approval_status auth_conclusion
+              jobs_meta=$(
+                gh api --paginate "repos/${REPO}/actions/runs/${run_id}/jobs?filter=latest&per_page=100" | jq -s -r '
+                  [.[].jobs[]] as $jobs
+                  | ($jobs | map(select(.name == "Check CI approval" or (.name | endswith(" / Check CI approval")))) | first // {}) as $ap
+                  | ($jobs | length | tostring),
+                    ($ap.status // ""),
+                    (($ap.steps // []) | map(select(.name == "Full CI authorized")) | first | .conclusion // "")
+                '
+              ) || return 1
+              mapfile -t fields <<< "$jobs_meta"
+              job_count="${fields[0]:-0}"
+              approval_status="${fields[1]:-}"
+              auth_conclusion="${fields[2]:-}"
+
+              if [ "$status" = "completed" ]; then
+                if [ "$EVENT_NAME" = "workflow_run" ]; then
+                  if [ "$auth_conclusion" = "success" ] && [ "$conclusion" != "cancelled" ]; then
+                    echo "[${wf}] Run ${run_id} already ran with full CI authorized (${conclusion}); skipping."
+                    return 0
+                  fi
+                  if [ "$skip_unauth_success" = "true" ] && [ "$conclusion" = "success" ]; then
+                    echo "[${wf}] Run ${run_id} already passed without heavy CI; skipping."
+                    return 0
+                  fi
+                fi
+                # Re-verify that the PR is still open at this exact SHA so a
+                # rerun of a cancelled stale run cannot cancel CI on a newer push.
+                local pr_rc=0
+                verify_pr_head_current || pr_rc=$?
+                if [ "$pr_rc" -eq 1 ]; then
+                  return 0
+                elif [ "$pr_rc" -ne 0 ]; then
+                  return "$pr_rc"
+                fi
+                echo "[${wf}] Rerunning run ${run_id}..."
+                gh run rerun "$run_id" --repo "$REPO" || return 1
+                return 0
+              fi
+
+              if { [ "$approval_status" = "completed" ] && [ "$auth_conclusion" = "success" ]; } ||
+                 { [ -z "$approval_status" ] && [ "$job_count" -gt 0 ]; }; then
+                echo "[${wf}] Run ${run_id} already has full CI ${status}; not duplicating."
+                return 0
+              fi
+
+              poll=$((poll + 1))
+              if [ "$poll" -gt "$MAX_WAIT_POLLS" ]; then
+                echo "::warning::[${wf}] Timed out waiting for fast-only run ${run_id} to complete."
+                return 1
+              fi
+              echo "[${wf}] Waiting for fast-only run ${run_id} (poll ${poll}/${MAX_WAIT_POLLS}, status=${status})..."
+              sleep "$POLL_INTERVAL_SECONDS"
+              run_meta=$(
+                gh api "repos/${REPO}/actions/runs/${run_id}" \
+                  --jq '(.status // ""), (.conclusion // "")'
+              ) || return 1
+              mapfile -t fields <<< "$run_meta"
+              status="${fields[0]:-}"
+              conclusion="${fields[1]:-}"
+            done
+          }
+
+          failed=0
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            retrigger_workflow "ci.yml" "false" "true" || failed=1
+            retrigger_workflow "ci-macos.yml" "false" "false" || failed=1
+          else
+            retrigger_workflow "ci.yml" "true" "false" || failed=1
+            retrigger_workflow "ci-macos.yml" "false" "false" || failed=1
+          fi
+          exit "$failed"

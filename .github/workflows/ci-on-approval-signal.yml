@@ -1,0 +1,46 @@
+name: CI Approval Signal
+run-name: >-
+  ${{
+  (github.event.review.state == 'approved' &&
+  github.event.review.user.type == 'User' &&
+  !endsWith(github.event.review.user.login, '[bot]') &&
+  github.event.review.user.login != github.event.pull_request.user.login &&
+  (github.event.review.author_association == 'OWNER' ||
+  github.event.review.author_association == 'MEMBER' ||
+  github.event.review.author_association == 'COLLABORATOR') &&
+  (github.event.pull_request.base.ref == 'main' ||
+  startsWith(github.event.pull_request.base.ref, 'release/'))) &&
+  format('ci-approval:{0}:{1}', github.event.pull_request.number, github.event.pull_request.head.sha) ||
+  format('ci-review-ignored:#{0}', github.event.pull_request.number)
+  }}
+
+# Bridges PR approvals to ci-retrigger.yml via workflow_run so fork PRs (where
+# pull_request_review gets a read-only GITHUB_TOKEN) can still rerun Actions.
+# Encodes PR number and head SHA in run-name; never checks out PR code.
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+jobs:
+  signal:
+    if: >-
+      github.event.review.state == 'approved' &&
+      github.event.review.user.type == 'User' &&
+      !endsWith(github.event.review.user.login, '[bot]') &&
+      github.event.review.user.login != github.event.pull_request.user.login &&
+      (github.event.review.author_association == 'OWNER' ||
+       github.event.review.author_association == 'MEMBER' ||
+       github.event.review.author_association == 'COLLABORATOR') &&
+      (github.event.pull_request.base.ref == 'main' ||
+       startsWith(github.event.pull_request.base.ref, 'release/'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Signal approval
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          echo "Approved PR #${PR_NUMBER} (${HEAD_SHA})"

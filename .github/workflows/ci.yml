@@ -9,10 +9,10 @@ on:
     branches:
       - "main"
       - "release/**"
-    # `labeled` is intentionally omitted. Auto-labeler already applies
-    # `run-ci`, so any new label (including `run-e2e-ci`) would retrigger
-    # this whole workflow and cancel the in-progress run. Same-SHA
-    # retrigger via the `run-ci` label lives in ci-on-label.yml.
+    # `labeled` is intentionally omitted so unrelated labels (such as
+    # `run-e2e-ci` or `size/*`) cannot retrigger this workflow or cancel an
+    # in-progress run. Heavy jobs wait for maintainer PR approval or a manual
+    # `run-ci` label (both retriggered by ci-retrigger.yml).
     types: [opened, synchronize, reopened]
   workflow_dispatch: {}
 
@@ -32,6 +32,12 @@ env:
   SCCACHE_GHA_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
 
 jobs:
+  check-approval:
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/_check-approval.yml
+
   engram-cpu-contracts:
     name: Engram CPU contracts (Python ${{ matrix.python-version }})
     runs-on: ubuntu-22.04
@@ -59,8 +65,8 @@ jobs:
   # Build the artifact tested below through the exact release wheel path. The
   # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
   build-wheel:
-    needs: [spell-check, clang-format, check-paths]
-    if: &run-ci-for-source-changes needs.check-paths.outputs.src == 'true'
+    needs: [check-approval, spell-check, clang-format, check-paths]
+    if: &run-ci-for-source-changes needs.check-approval.outputs.run_ci == 'true' && needs.check-paths.outputs.src == 'true'
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       python-versions: '["3.10", "3.12"]'
@@ -214,7 +220,7 @@ jobs:
 
   unit-tests:
     name: CTest unit tests (Python 3.12)
-    needs: [check-paths]
+    needs: [check-approval, check-paths]
     if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04
     env:
@@ -317,7 +323,7 @@ jobs:
         last-test-log: build/Testing/Temporary/LastTest.log
 
   build-flags:
-    needs: [check-paths]
+    needs: [check-approval, check-paths]
     if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04
     env:
@@ -639,7 +645,7 @@ jobs:
               - '.github/workflows/ci.yml'
 
   build-wheel-cu13:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [check-approval, spell-check, clang-format, check-paths]
     if: *run-ci-for-source-changes
     uses: ./.github/workflows/_build-wheel.yaml
     with:
@@ -656,7 +662,7 @@ jobs:
   # arm64 default wheels use a different transport set (USE_MNNVL) than
   # x86_64 (USE_INTRA_NVLINK), so build one here instead of only at release.
   build-wheel-cu13-arm64:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [check-approval, spell-check, clang-format, check-paths]
     if: *run-ci-for-source-changes
     uses: ./.github/workflows/_build-wheel.yaml
     with:
@@ -672,7 +678,7 @@ jobs:
   # at the release tag (#5260), and run the ones that need no EFA hardware.
   efa-unit-tests:
     name: EFA unit tests (build, no-hardware run)
-    needs: [check-paths]
+    needs: [check-approval, check-paths]
     if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04
     env:
@@ -749,19 +755,19 @@ jobs:
       shell: bash
 
   build-wheel-rocm:
-    needs: [spell-check, clang-format, check-paths]
-    if: needs.check-paths.outputs.src == 'true'
+    needs: [check-approval, spell-check, clang-format, check-paths]
+    if: *run-ci-for-source-changes
     uses: ./.github/workflows/ci_rocm.yml
     secrets: inherit
 
   build-wheel-xpu:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [check-approval, spell-check, clang-format, check-paths]
     if: *run-ci-for-source-changes
     uses: ./.github/workflows/ci_xpu.yml
 
   tent-ci:
-    needs: [spell-check, clang-format, check-paths]
-    if: needs.check-paths.outputs.tent == 'true'
+    needs: [check-approval, spell-check, clang-format, check-paths]
+    if: needs.check-approval.outputs.run_ci == 'true' && needs.check-paths.outputs.tent == 'true'
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -981,8 +987,8 @@ jobs:
 
   store-rs-ci:
     name: Store-RS Classic TE smoke
-    needs: [spell-check, clang-format, check-paths]
-    if: needs.check-paths.outputs.store_rs == 'true'
+    needs: [check-approval, spell-check, clang-format, check-paths]
+    if: needs.check-approval.outputs.run_ci == 'true' && needs.check-paths.outputs.store_rs == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     env:
@@ -1110,6 +1116,7 @@ jobs:
     # required check for a PR head whose run was cancelled.
     if: ${{ (github.event_name != 'push' && always()) || !cancelled() }}
     needs:
+      - check-approval
       - check-paths
       - spell-check
       - clang-format
@@ -1137,7 +1144,8 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
           PASSED: >-
-            ${{ needs.check-paths.result == 'success' &&
+            ${{ needs.check-approval.result == 'success' &&
+                needs.check-paths.result == 'success' &&
                 needs.spell-check.result == 'success' &&
                 needs.clang-format.result == 'success' &&
                 needs.python-lint.result == 'success' &&
@@ -1148,9 +1156,33 @@ jobs:
           echo "$NEEDS_JSON"
           test "$PASSED" = true
 
+      - name: Check documentation job
+        env:
+          EXPECTED: ${{ needs.check-paths.outputs.docs == 'true' && 'success' || 'skipped' }}
+          RESULT: ${{ needs.docs-check.result }}
+        run: test "$RESULT" = "$EXPECTED"
+
+      - name: Require approval for heavy CI
+        env:
+          RUN_CI: ${{ needs.check-approval.outputs.run_ci }}
+          NEEDS_HEAVY_CI: >-
+            ${{ needs.check-paths.outputs.src == 'true' ||
+                needs.check-paths.outputs.tent == 'true' ||
+                needs.check-paths.outputs.store_rs == 'true' }}
+        run: |
+          if [ "$NEEDS_HEAVY_CI" = "true" ] && [ "$RUN_CI" != "true" ]; then
+            echo "::notice::Fast checks passed. Full CI will run automatically after a maintainer approves this PR (or adds the 'run-ci' label)."
+            {
+              echo "### Waiting for Maintainer Approval"
+              echo ""
+              echo "All fast checks passed. Heavy build and test jobs are deferred until a maintainer approves this PR or adds the \`run-ci\` label."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
       - name: Check source jobs
         env:
-          EXPECTED: ${{ needs.check-paths.outputs.src == 'true' && 'success' || 'skipped' }}
+          EXPECTED: ${{ (needs.check-approval.outputs.run_ci == 'true' && needs.check-paths.outputs.src == 'true') && 'success' || 'skipped' }}
           RESULTS: >-
             ${{ needs.build-wheel.result }}
             ${{ needs.unit-tests.result }}
@@ -1168,18 +1200,12 @@ jobs:
 
       - name: Check TENT jobs
         env:
-          EXPECTED: ${{ needs.check-paths.outputs.tent == 'true' && 'success' || 'skipped' }}
+          EXPECTED: ${{ (needs.check-approval.outputs.run_ci == 'true' && needs.check-paths.outputs.tent == 'true') && 'success' || 'skipped' }}
           RESULT: ${{ needs.tent-ci.result }}
         run: test "$RESULT" = "$EXPECTED"
 
       - name: Check Store-RS job
         env:
-          EXPECTED: ${{ needs.check-paths.outputs.store_rs == 'true' && 'success' || 'skipped' }}
+          EXPECTED: ${{ (needs.check-approval.outputs.run_ci == 'true' && needs.check-paths.outputs.store_rs == 'true') && 'success' || 'skipped' }}
           RESULT: ${{ needs.store-rs-ci.result }}
-        run: test "$RESULT" = "$EXPECTED"
-
-      - name: Check documentation job
-        env:
-          EXPECTED: ${{ needs.check-paths.outputs.docs == 'true' && 'success' || 'skipped' }}
-          RESULT: ${{ needs.docs-check.result }}
         run: test "$RESULT" = "$EXPECTED"
