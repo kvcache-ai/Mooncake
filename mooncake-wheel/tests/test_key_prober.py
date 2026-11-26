@@ -9,7 +9,7 @@ import os
 import unittest
 
 import numpy as np
-from mooncake.store import MooncakeDistributedStore
+from mooncake.store import KeyProber, MooncakeDistributedStore
 
 
 def _setup(store):
@@ -37,6 +37,7 @@ class TestKeyProber(unittest.TestCase):
         self.hashes = [hashlib.sha256(bytes([i])).digest() for i in range(6)]
         self.blob = b"".join(self.hashes)
         self.prober = self.store.create_key_prober(self.groups, 32)
+        self.assertIsInstance(self.prober, KeyProber)
         # Group 0 stores hashes 0-2 under both templates and hash 3 under the
         # first only; group 1 stores hashes 0 and 4.
         stored = [(0, 0, h) for h in range(4)] + [(0, 1, h) for h in range(3)]

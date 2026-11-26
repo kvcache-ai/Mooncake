@@ -15,7 +15,6 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
-#include <numeric>
 #include <optional>
 #include <string_view>
 #include <unordered_set>
@@ -453,7 +452,9 @@ struct KeyTemplates {
 // it is released.
 struct KeyLookup {
     std::string hashes;
-    // Hash indices probed by each group, and the number of keys it yields.
+    // Hash indices probed by each group (empty if `all_hashes`), and the
+    // number of keys each group yields.
+    bool all_hashes = false;
     std::vector<std::vector<int64_t>> indices;
     std::vector<size_t> group_keys;
     size_t num_keys = 0;
@@ -513,9 +514,7 @@ struct KeyLookup {
             static_cast<int64_t>(out.hashes.size() / templates.hash_len);
         const size_t num_groups = templates.groups.size();
         if (indices.is_none()) {
-            std::vector<int64_t> all(num_hashes);
-            std::iota(all.begin(), all.end(), int64_t{0});
-            out.indices.assign(num_groups, all);
+            out.all_hashes = true;
         } else {
             if (py::len(indices) != num_groups) {
                 throw py::value_error("indices need one entry per group");
@@ -528,8 +527,11 @@ struct KeyLookup {
         out.group_keys.reserve(num_groups);
         for (size_t g = 0; g < num_groups; ++g) {
             size_t n = 0;
-            if (__builtin_mul_overflow(out.indices[g].size(),
-                                       templates.groups[g].size(), &n) ||
+            const size_t probed = out.all_hashes
+                                      ? static_cast<size_t>(num_hashes)
+                                      : out.indices[g].size();
+            if (__builtin_mul_overflow(probed, templates.groups[g].size(),
+                                       &n) ||
                 __builtin_add_overflow(out.num_keys, n, &out.num_keys)) {
                 throw std::overflow_error("too many lookup keys");
             }
@@ -558,14 +560,20 @@ struct KeyLookup {
         const size_t hex_len = 2 * templates.hash_len;
         std::vector<std::string> keys;
         keys.reserve(num_keys);
-        for (size_t g = 0; g < indices.size(); ++g) {
-            for (const int64_t idx : indices[g]) {
-                const std::string_view h(hex.data() + idx * hex_len, hex_len);
-                for (const auto &[prefix, suffix] : templates.groups[g]) {
-                    std::string &key = keys.emplace_back();
-                    key.reserve(prefix.size() + hex_len + suffix.size());
-                    key.append(prefix).append(h).append(suffix);
-                }
+        const size_t num_hashes = hashes.size() / templates.hash_len;
+        auto add = [&](size_t g, size_t idx) {
+            const std::string_view h(hex.data() + idx * hex_len, hex_len);
+            for (const auto &[prefix, suffix] : templates.groups[g]) {
+                std::string &key = keys.emplace_back();
+                key.reserve(prefix.size() + hex_len + suffix.size());
+                key.append(prefix).append(h).append(suffix);
+            }
+        };
+        for (size_t g = 0; g < templates.groups.size(); ++g) {
+            if (all_hashes) {
+                for (size_t idx = 0; idx < num_hashes; ++idx) add(g, idx);
+            } else {
+                for (const int64_t idx : indices[g]) add(g, idx);
             }
         }
         return keys;
@@ -2395,17 +2403,21 @@ class KeyProberPy {
         // released.
         const std::shared_ptr<PyClient> store =
             owner_->is_client_initialized() ? owner_->store_ : nullptr;
-        std::string out(lookup.num_keys, static_cast<char>(-1));
-        if (store && lookup.num_keys > 0) {
+        std::string out;
+        {
             py::gil_scoped_release release;
-            // Declared after `release`: the keys are freed before the GIL is
-            // taken back.
-            const auto keys = lookup.BuildKeys(templates_);
-            const std::vector<int> results = query(*store, keys);
-            for (size_t i = 0; i < std::min(results.size(), out.size()); ++i) {
-                out[i] = static_cast<char>(results[i] < 0 ? -1
-                                           : results[i]   ? 1
-                                                          : 0);
+            out.assign(lookup.num_keys, static_cast<char>(-1));
+            if (store && lookup.num_keys > 0) {
+                // Scoped inside `release`: the keys are freed before the GIL
+                // is taken back.
+                const auto keys = lookup.BuildKeys(templates_);
+                const std::vector<int> results = query(*store, keys);
+                for (size_t i = 0; i < std::min(results.size(), out.size());
+                     ++i) {
+                    out[i] = static_cast<char>(results[i] < 0 ? -1
+                                               : results[i]   ? 1
+                                                              : 0);
+                }
             }
         }
         py::list per_group;
