@@ -154,6 +154,8 @@ loadCollectiveAlgorithmChoicesFromEnvironment() {
         kAlgorithmByName{
             {"ring", DeviceCollectiveAlgorithm::Ring},
             {"oneshot", DeviceCollectiveAlgorithm::OneShot},
+            {"hierarchical_oneshot_ring",
+             DeviceCollectiveAlgorithm::HierarchicalOneShotRing},
             {"pairwise", DeviceCollectiveAlgorithm::Pairwise},
             {"star", DeviceCollectiveAlgorithm::Star},
         };
@@ -218,6 +220,14 @@ loadCollectiveAlgorithmChoicesFromEnvironment() {
                         std::numeric_limits<uint64_t>::max() / scale,
                     error_prefix + "max_bytes overflows uint64_t");
                 choice.max_bytes *= scale;
+            }
+            if (choice.algorithm ==
+                DeviceCollectiveAlgorithm::HierarchicalOneShotRing) {
+                PG_VALIDATE_ARG(choice.operation == OpType::AllReduce &&
+                                    choice.max_bytes > 0 &&
+                                    choice.max_bytes <= 32 * 1024,
+                                "Hierarchical prototype requires AllReduce "
+                                "with a bound up to 32 KiB");
             }
             choices.push_back(choice);
             if (comma == std::string_view::npos) break;

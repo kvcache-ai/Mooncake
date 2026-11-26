@@ -286,6 +286,29 @@ PGResult<ResolvedGroupView> DeviceCollectiveRuntime::resolveGroupView(
     // update. Only active local ranks need the bindings below.
     if (resolved.self_active_index < 0) return resolved;
 
+    if (const auto& leaders = view.hierarchical_leaders) {
+        PG_VALIDATE_STATE(
+            leaders->size() == resolved.participants.size(),
+            "Hierarchical leader count does not match active view");
+        auto& indices = resolved.hierarchical_leader_indices;
+        indices.reserve(leaders->size());
+        for (const auto leader : *leaders) {
+            const auto participant = std::find_if(
+                resolved.participants.begin(), resolved.participants.end(),
+                [leader](const auto& peer) {
+                    return peer.global_rank == leader;
+                });
+            PG_VALIDATE_STATE(participant != resolved.participants.end(),
+                              "Hierarchical leader is not active");
+            indices.push_back(static_cast<uint32_t>(
+                participant - resolved.participants.begin()));
+        }
+        for (const auto index : indices) {
+            PG_VALIDATE_STATE(indices[index] == index,
+                              "Hierarchical leader does not lead itself");
+        }
+    }
+
     for (auto& peer : resolved.participants) {
         const auto& member = view.members[peer.global_rank];
         PG_VALIDATE_STATE(member.endpoint,

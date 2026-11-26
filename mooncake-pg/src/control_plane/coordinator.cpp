@@ -1,4 +1,5 @@
 #include "control_plane/coordinator.h"
+#include "control_plane/hierarchical_oneshot_ring_topology.h"
 
 #include <algorithm>
 #include <iterator>
@@ -1395,8 +1396,45 @@ void CentralizedCoordinatorStateMachine::updateCollectiveSelection(
             break;
         }
     }
-    if (auto selection = selectGpuCollective(
-            view, routes, collective_algorithm_choices_override_)) {
+    view.hierarchical_leaders.reset();
+    auto overrides = collective_algorithm_choices_override_;
+    std::vector<GlobalRank> active;
+    for (const auto rank : view.rank_order) {
+        if (view.members[rank].isActive()) active.push_back(rank);
+    }
+    if (overrides) {
+        constexpr auto hierarchical =
+            DeviceCollectiveAlgorithm::HierarchicalOneShotRing;
+        const bool requested = std::any_of(
+            overrides->begin(), overrides->end(), [=](const auto& choice) {
+                return choice.algorithm == hierarchical;
+            });
+        if (requested && installed_transfer_endpoints_ &&
+            std::all_of(active.begin(), active.end(), [&](const auto rank) {
+                const auto& endpoint = view.members[rank].endpoint;
+                return endpoint &&
+                       endpoint->device_collective.supportsAlgorithm(
+                           hierarchical);
+            })) {
+            const auto topology = planHierarchicalOneShotRing(
+                active, *installed_transfer_endpoints_, routes);
+            if (topology &&
+                (topology->nodes.size() == 2 || active.size() == 1)) {
+                auto& leaders =
+                    view.hierarchical_leaders.emplace(active.size());
+                for (const auto& node : topology->nodes) {
+                    for (const auto index : node)
+                        leaders[index] = active[node.front()];
+                }
+            }
+        }
+        if (!view.hierarchical_leaders) {
+            std::erase_if(*overrides, [=](const auto& choice) {
+                return choice.algorithm == hierarchical;
+            });
+        }
+    }
+    if (auto selection = selectGpuCollective(view, routes, overrides)) {
         view.gpu_collective_backend = selection->backend;
         view.collective_algorithm_choices =
             std::move(selection->algorithm_choices);
