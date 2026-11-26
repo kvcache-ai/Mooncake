@@ -194,6 +194,10 @@ struct MasterConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
+    // Hand each client its offload tasks in enqueue order, so that clients
+    // with MOONCAKE_OFFLOAD_ORDERED_BUCKETS pack them into buckets in that
+    // order. Only takes effect with enable_offload.
+    bool offload_ordered_buckets = false;
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY so the next Get is fast.
@@ -317,6 +321,7 @@ class MasterServiceSupervisorConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
+    bool offload_ordered_buckets = false;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
@@ -379,6 +384,7 @@ class MasterServiceSupervisorConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
+        offload_ordered_buckets = config.offload_ordered_buckets;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -585,6 +591,7 @@ class WrappedMasterServiceConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
+    bool offload_ordered_buckets = false;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
@@ -684,6 +691,7 @@ class WrappedMasterServiceConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
+        offload_ordered_buckets = config.offload_ordered_buckets;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -818,6 +826,7 @@ class WrappedMasterServiceConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
+        offload_ordered_buckets = config.offload_ordered_buckets;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -1315,6 +1324,7 @@ class MasterServiceConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
+    bool offload_ordered_buckets = false;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
@@ -1412,6 +1422,7 @@ class MasterServiceConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
+        offload_ordered_buckets = config.offload_ordered_buckets;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -1581,6 +1592,7 @@ struct InProcMasterConfig {
     std::optional<int> http_metadata_port;
     std::optional<uint64_t> default_kv_lease_ttl;
     std::optional<bool> enable_offload;
+    std::optional<bool> offload_ordered_buckets;
     std::optional<bool> enable_cxl;
     std::optional<std::string> cxl_path;
     std::optional<size_t> cxl_size;
@@ -1600,6 +1612,7 @@ class InProcMasterConfigBuilder {
     std::optional<int> http_metadata_port_ = std::nullopt;
     std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
     std::optional<bool> enable_offload_ = std::nullopt;
+    std::optional<bool> offload_ordered_buckets_ = std::nullopt;
     std::optional<bool> enable_cxl_ = std::nullopt;
     std::optional<std::string> cxl_path_ = std::nullopt;
     std::optional<size_t> cxl_size_ = std::nullopt;
@@ -1635,6 +1648,11 @@ class InProcMasterConfigBuilder {
 
     InProcMasterConfigBuilder& set_enable_offload(bool enable) {
         enable_offload_ = enable;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_offload_ordered_buckets(bool enable) {
+        offload_ordered_buckets_ = enable;
         return *this;
     }
 
@@ -1699,6 +1717,7 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.http_metadata_port = http_metadata_port_;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
     config.enable_offload = enable_offload_;
+    config.offload_ordered_buckets = offload_ordered_buckets_;
     config.enable_cxl = enable_cxl_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;

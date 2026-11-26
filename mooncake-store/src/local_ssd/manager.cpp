@@ -2,13 +2,19 @@
 
 #include <algorithm>
 #include <iterator>
+#include <limits>
 #include <mutex>
+#include <string>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace mooncake {
 
-LocalSsdTaskMailbox::LocalSsdTaskMailbox(bool enable_offloading)
-    : enable_offloading_(enable_offloading) {}
+LocalSsdTaskMailbox::LocalSsdTaskMailbox(bool enable_offloading,
+                                         bool ordered_offloads)
+    : enable_offloading_(enable_offloading),
+      ordered_offloads_(ordered_offloads) {}
 
 ErrorCode LocalSsdTaskMailbox::EnqueueOffload(OffloadTaskItem task,
                                               size_t limit) {
@@ -20,20 +26,73 @@ ErrorCode LocalSsdTaskMailbox::EnqueueOffload(OffloadTaskItem task,
         return ErrorCode::KEYS_ULTRA_LIMIT;
     }
     auto index = TenantId(task.tenant_id).MakeScopedKey(task.key);
-    if (!pending_offloads_.emplace(std::move(index), std::move(task)).second) {
+    auto [it, inserted] =
+        pending_offloads_.emplace(std::move(index), std::move(task));
+    if (!inserted) {
         return ErrorCode::OBJECT_ALREADY_EXISTS;
     }
+    if (ordered_offloads_) {
+        pending_offload_order_.push_back(it->first);
+        // A key removed before the take leaves a stale entry (and one
+        // enqueued again, a second entry). Once remove/enqueue churn between
+        // two takes outgrows the queue limit, compact the list to one entry
+        // per queued task, at most the limit, so that compaction stays
+        // amortized O(1). The threshold saturates for huge limits.
+        constexpr size_t kSlack = 64;
+        const size_t threshold =
+            limit > (std::numeric_limits<size_t>::max() - kSlack) / 2
+                ? std::numeric_limits<size_t>::max()
+                : 2 * limit + kSlack;
+        if (pending_offload_order_.size() > threshold) {
+            CompactPendingOffloadOrder();
+        }
+    }
     return ErrorCode::OK;
+}
+
+void LocalSsdTaskMailbox::CompactPendingOffloadOrder() {
+    // Walk backwards so that each queued key keeps its last entry; earlier
+    // entries of a key removed and enqueued again, and those of keys removed
+    // for good, are dropped. Every queued key has an entry, so the result
+    // lists each of them exactly once.
+    std::unordered_set<const std::string*> seen;
+    seen.reserve(pending_offloads_.size());
+    std::vector<std::string> kept;
+    kept.reserve(pending_offloads_.size());
+    for (auto entry = pending_offload_order_.rbegin();
+         entry != pending_offload_order_.rend(); ++entry) {
+        auto it = pending_offloads_.find(*entry);
+        if (it != pending_offloads_.end() && seen.insert(&it->first).second) {
+            kept.push_back(std::move(*entry));
+        }
+    }
+    std::reverse(kept.begin(), kept.end());
+    pending_offload_order_ = std::move(kept);
 }
 
 std::vector<OffloadTaskItem> LocalSsdTaskMailbox::SetOffloadingAndTakePending(
     bool enabled) {
     MutexLocker lock(&mutex_);
     enable_offloading_ = enabled;
+    // Delivery order: the map's iteration order or, with ordered_offloads_,
+    // enqueue order. The tasks are then moved out in one loop.
+    std::vector<std::pair<const std::string, OffloadTaskItem>*> order;
+    order.reserve(pending_offloads_.size());
+    if (ordered_offloads_) {
+        CompactPendingOffloadOrder();
+        for (const auto& index : pending_offload_order_) {
+            order.push_back(&*pending_offloads_.find(index));
+        }
+        pending_offload_order_.clear();
+    } else {
+        for (auto& entry : pending_offloads_) {
+            order.push_back(&entry);
+        }
+    }
     std::vector<OffloadTaskItem> tasks;
-    tasks.reserve(pending_offloads_.size());
-    for (auto& [_, task] : pending_offloads_) {
-        tasks.push_back(std::move(task));
+    tasks.reserve(order.size());
+    for (auto* entry : order) {
+        tasks.push_back(std::move(entry->second));
     }
     pending_offloads_.clear();
     return tasks;
@@ -120,8 +179,8 @@ ErrorCode LocalSsdManager::RegisterClient(const UUID& client_id,
     if (clients_.contains(client_id)) {
         return ErrorCode::SEGMENT_ALREADY_EXISTS;
     }
-    clients_.emplace(client_id,
-                     std::make_shared<ClientRecord>(enable_offloading));
+    clients_.emplace(client_id, std::make_shared<ClientRecord>(
+                                    enable_offloading, ordered_offloads_));
     return ErrorCode::OK;
 }
 

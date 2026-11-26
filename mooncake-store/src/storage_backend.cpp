@@ -2713,9 +2713,10 @@ BucketStorageBackend::GetStoreMetadata() {
 tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
     std::vector<std::vector<std::string>>& buckets_keys,
-    std::vector<std::string>* deferred_keys) {
+    std::vector<std::string>* deferred_keys,
+    const std::vector<std::string>* key_order) {
     return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys,
-                                       deferred_keys);
+                                       deferred_keys, key_order);
 }
 
 void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
@@ -2737,7 +2738,8 @@ size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
 tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
     std::vector<std::vector<std::string>>& buckets_keys,
-    std::vector<std::string>* deferred_keys) {
+    std::vector<std::string>* deferred_keys,
+    const std::vector<std::string>* key_order) {
     MutexLocker offloading_locker(&offloading_mutex_);
     if (offloading_objects.empty()) {
         return {};
@@ -2762,7 +2764,44 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         return {};
     }
     bool carryover_loaded = false;
+    // Packing order: the iteration order of offloading_objects or, with
+    // key_order (MOONCAKE_OFFLOAD_ORDERED_BUCKETS), that order, so that
+    // consecutive keys share a bucket. key_order entries that are not in
+    // offloading_objects are skipped, and keys it does not list follow in
+    // iteration order. Without key_order no list is built.
+    using Entry = std::pair<const std::string, int64_t>;
+    std::vector<const Entry*> ordered_entries;
+    if (key_order != nullptr) {
+        ordered_entries.reserve(offloading_objects.size());
+        std::unordered_set<const Entry*> listed;
+        listed.reserve(offloading_objects.size());
+        for (const auto& key : *key_order) {
+            auto found = offloading_objects.find(key);
+            if (found != offloading_objects.end() &&
+                listed.insert(&*found).second) {
+                ordered_entries.push_back(&*found);
+            }
+        }
+        for (const auto& entry : offloading_objects) {
+            if (!listed.contains(&entry)) ordered_entries.push_back(&entry);
+        }
+    }
     auto it = offloading_objects.cbegin();
+    auto ordered_it = ordered_entries.cbegin();
+    auto at_end = [&] {
+        return key_order != nullptr ? ordered_it == ordered_entries.cend()
+                                    : it == offloading_objects.cend();
+    };
+    auto current = [&]() -> const Entry& {
+        return key_order != nullptr ? **ordered_it : *it;
+    };
+    auto advance = [&] {
+        if (key_order != nullptr) {
+            ++ordered_it;
+        } else {
+            ++it;
+        }
+    };
     int64_t residue_count = static_cast<int64_t>(offloading_objects.size() +
                                                  carryover_objects.size());
     int64_t total_count = residue_count;
@@ -2772,7 +2811,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         return IsExist(key);
     };
 
-    while (it != offloading_objects.cend()) {
+    while (!at_end()) {
         std::vector<std::string> bucket_keys;
         std::unordered_map<std::string, int64_t> bucket_objects;
         int64_t bucket_data_size = 0;
@@ -2791,7 +2830,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
 
         while (static_cast<int64_t>(bucket_keys.size()) <
                bucket_backend_config_.bucket_keys_limit) {
-            if (it == offloading_objects.cend()) {
+            if (at_end()) {
                 if (bucket_backend_config_.flush_partial_buckets) {
                     // Keep these keys in the current cycle, while FileStorage
                     // still has their tasks and source replicas are pinned.
@@ -2818,42 +2857,43 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                 return {};
             }
 
-            if (carryover_objects.find(it->first) != carryover_objects.end()) {
-                ++it;
+            const auto& [key, size] = current();
+            if (carryover_objects.find(key) != carryover_objects.end()) {
+                advance();
                 continue;
             }
 
-            if (it->second > bucket_backend_config_.bucket_size_limit) {
+            if (size > bucket_backend_config_.bucket_size_limit) {
                 VLOG(1) << "Object size exceeds bucket size limit: "
-                        << "key=" << it->first << ", object_size=" << it->second
+                        << "key=" << key << ", object_size=" << size
                         << ", limit="
                         << bucket_backend_config_.bucket_size_limit;
-                ++it;
+                advance();
                 continue;
             }
 
-            auto is_exist_result = is_exist_func(it->first);
+            auto is_exist_result = is_exist_func(key);
             if (!is_exist_result) {
                 LOG(ERROR) << "Failed to check existence in storage backend: "
-                           << "key=" << it->first
+                           << "key=" << key
                            << ", error=" << is_exist_result.error();
             }
             if (is_exist_result && is_exist_result.value()) {
                 VLOG(1) << "Key already exists in storage backend, skipping: "
-                        << "key=" << it->first;
-                ++it;
+                        << "key=" << key;
+                advance();
                 continue;
             }
 
-            if (bucket_data_size + it->second >
+            if (bucket_data_size + size >
                 bucket_backend_config_.bucket_size_limit) {
                 break;
             }
 
-            bucket_data_size += it->second;
-            bucket_keys.push_back(it->first);
-            bucket_objects.emplace(it->first, it->second);
-            ++it;
+            bucket_data_size += size;
+            bucket_keys.push_back(key);
+            bucket_objects.emplace(key, size);
+            advance();
 
             if (bucket_data_size == bucket_backend_config_.bucket_size_limit) {
                 break;

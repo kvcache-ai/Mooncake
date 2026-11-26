@@ -516,6 +516,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       quota_bytes_(config.quota_bytes),
       enable_multi_tenants_(config.enable_multi_tenants),
       segment_manager_(config.memory_allocator, config.enable_cxl),
+      local_ssd_manager_(config.enable_offload &&
+                         config.offload_ordered_buckets),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_type_(config.enable_cxl
@@ -657,6 +659,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
             LOG(INFO) << "Force-evict enabled: objects exceeding offload "
                          "cap will be evicted without disk offload";
         }
+    }
+    if (local_ssd_manager_.ordered_offloads()) {
+        LOG(INFO) << "offload_ordered_buckets: offload tasks are handed to "
+                     "the clients in enqueue order (set "
+                     "MOONCAKE_OFFLOAD_ORDERED_BUCKETS=1 on the clients too, "
+                     "so that they pack buckets in that order)";
     }
     // With offload-on-evict and offload_force_evict, a round that has queued
     // offload_cap_ratio of the offloading queue limit lets the rest of the

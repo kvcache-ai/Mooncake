@@ -73,6 +73,7 @@ struct FileStorageEnvironment {
         "MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO"};
     ScopedEnvVar use_uring{"MOONCAKE_OFFLOAD_USE_URING"};
     ScopedEnvVar legacy_use_uring{"MOONCAKE_USE_URING"};
+    ScopedEnvVar ordered_buckets{"MOONCAKE_OFFLOAD_ORDERED_BUCKETS"};
 };
 
 void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
@@ -91,6 +92,7 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_TRUE(config.enable_disk_watermark_eviction);
     EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
     EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.80);
+    EXPECT_FALSE(config.ordered_buckets);
 }
 
 class FileStorageConfigTest : public ::testing::Test {
@@ -168,6 +170,7 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
     env.disk_eviction_high_watermark_ratio.Set("0.75");
     env.disk_eviction_low_watermark_ratio.Set("0.50");
     env.use_uring.Set("1");
+    env.ordered_buckets.Set("1");
 
     const auto config = FileStorageConfig::FromEnvironment();
     EXPECT_EQ(config.storage_backend_type, StorageBackendType::kDistributed);
@@ -185,6 +188,7 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
     EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.75);
     EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.50);
     EXPECT_TRUE(config.use_uring);
+    EXPECT_TRUE(config.ordered_buckets);
 }
 
 TEST_F(FileStorageConfigTest, PreservesAliasPrecedence) {
@@ -258,6 +262,7 @@ TEST_F(FileStorageConfigTest, InvalidValuesUseDefaultsAndPreserveDiagnostics) {
     env.disk_eviction_high_watermark_ratio.Set("0.75suffix");
     env.disk_eviction_low_watermark_ratio.Set("nan");
     env.use_uring.Set("invalid");
+    env.ordered_buckets.Set("invalid");
 
     ::testing::internal::CaptureStderr();
     const auto config = FileStorageConfig::FromEnvironment();
@@ -273,6 +278,7 @@ TEST_F(FileStorageConfigTest, InvalidValuesUseDefaultsAndPreserveDiagnostics) {
              "MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
              "MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
              "MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
+             "MOONCAKE_OFFLOAD_ORDERED_BUCKETS",
          }) {
         EXPECT_NE(logs.find(name), std::string::npos) << name;
     }

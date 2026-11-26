@@ -19,7 +19,11 @@ namespace mooncake {
 
 class LocalSsdTaskMailbox {
    public:
-    explicit LocalSsdTaskMailbox(bool enable_offloading);
+    // @p ordered_offloads: SetOffloadingAndTakePending returns offload tasks
+    // in enqueue order (master flag offload_ordered_buckets) instead of hash
+    // order.
+    explicit LocalSsdTaskMailbox(bool enable_offloading,
+                                 bool ordered_offloads = false);
 
     ErrorCode EnqueueOffload(OffloadTaskItem task, size_t limit);
     std::vector<OffloadTaskItem> SetOffloadingAndTakePending(bool enabled);
@@ -36,10 +40,22 @@ class LocalSsdTaskMailbox {
     bool ConsumeRemoveAll();
 
    private:
+    // Rewrites pending_offload_order_ to one entry per queued offload, at the
+    // key's last position.
+    void CompactPendingOffloadOrder() REQUIRES(mutex_);
+
     mutable Mutex mutex_;
     bool enable_offloading_ GUARDED_BY(mutex_);
     std::unordered_map<std::string, OffloadTaskItem> pending_offloads_
         GUARDED_BY(mutex_);
+    // offload_ordered_buckets: deliver offload tasks in enqueue order, so
+    // that keys put together stay adjacent and the store packs them into the
+    // same bucket. pending_offload_order_ holds the scoped key of every
+    // accepted enqueue since the last take (or compaction). A key removed
+    // before the take is skipped; a key removed and enqueued again goes at its
+    // last position.
+    const bool ordered_offloads_;
+    std::vector<std::string> pending_offload_order_ GUARDED_BY(mutex_);
     // Dedup map + recency order. seq is monotone; enqueue, a duplicate
     // enqueue, and TouchPromotion all re-mark the entry with a fresh seq, so
     // TakePromotions can deliver the most-recently-touched key first instead
@@ -58,6 +74,13 @@ class LocalSsdTaskMailbox {
 
 class LocalSsdManager {
    public:
+    // @p ordered_offloads: every client's mailbox delivers offload tasks in
+    // enqueue order (see LocalSsdTaskMailbox).
+    explicit LocalSsdManager(bool ordered_offloads = false)
+        : ordered_offloads_(ordered_offloads) {}
+
+    bool ordered_offloads() const { return ordered_offloads_; }
+
     struct CapacityChange {
         int64_t previous_bytes;
         int64_t current_bytes;
@@ -109,8 +132,8 @@ class LocalSsdManager {
 
    private:
     struct ClientRecord {
-        explicit ClientRecord(bool enable_offloading)
-            : mailbox(enable_offloading) {}
+        ClientRecord(bool enable_offloading, bool ordered_offloads)
+            : mailbox(enable_offloading, ordered_offloads) {}
 
         // Unregistration removes the record from clients_ first, then takes
         // this lock exclusively to wait for operations that already found it.
@@ -143,6 +166,7 @@ class LocalSsdManager {
     std::vector<ClientAccess> SnapshotClients() const;
     static void WaitForOperations(const ClientMap& clients);
 
+    const bool ordered_offloads_;
     mutable std::shared_mutex mutex_;
     ClientMap clients_;
 };
