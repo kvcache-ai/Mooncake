@@ -400,7 +400,7 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
     MAKE_GUARD(ctx_restore,
                [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
 
-    BufferDesc buffer_desc;
+    BufferDesc buffer_desc{};
     buffer_desc.name = location;
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = (uint64_t)length;
@@ -474,26 +474,35 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
         return ret;
     }
 
-    int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-    if (ret) {
-        LOG(ERROR) << "addLocalMemoryBuffer failed, ret: " << ret;
-        return ret;
-    }
-
     const int register_ret = transfer_executor_->registerMem(
         addr, length, mem_type, transfer_executor_->getUseBufferPool(),
         remote_accessible);
-    if (register_ret == 0) {
+    if (register_ret != 0) {
+        return register_ret;
+    }
+
+    const int ret =
+        metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
+    if (ret == 0) {
         return 0;
     }
 
-    const int rollback_ret =
-        metadata_->removeLocalMemoryBuffer(addr, update_metadata);
-    if (rollback_ret != 0) {
+    LOG(ERROR) << "addLocalMemoryBuffer failed, ret: " << ret;
+    const int metadata_rollback_ret = metadata_->removeLocalMemoryBuffer(
+        addr,
+        [&buffer_desc](const BufferDesc& candidate) {
+            return candidate == buffer_desc;
+        },
+        update_metadata);
+    if (metadata_rollback_ret != 0) {
         LOG(ERROR) << "removeLocalMemoryBuffer rollback failed, ret: "
-                   << rollback_ret;
+                   << metadata_rollback_ret;
     }
-    return register_ret;
+    const int deregister_ret = transfer_executor_->deregisterMem(addr);
+    if (deregister_ret != 0) {
+        LOG(ERROR) << "deregisterMem rollback failed, ret: " << deregister_ret;
+    }
+    return ret;
 }
 
 int AscendDirectTransport::disconnectAllPeers() {
