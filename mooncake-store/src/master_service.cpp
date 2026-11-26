@@ -66,8 +66,16 @@ namespace mooncake {
 
 namespace {
 
-StorageLevel MemoryStorageLevelForProtocol(const std::string& protocol) {
-    return protocol == "cxl" ? StorageLevel::CXL : StorageLevel::RAM;
+StorageLevel MemoryStorageLevelForDescriptor(
+    const Replica::Descriptor& descriptor) {
+    // New snapshots carry the tier explicitly.  protocol_ remains the
+    // compatibility signal for snapshots written before storage_level was
+    // serialized.
+    return descriptor.get_storage_level() == StorageLevel::CXL ||
+                   descriptor.get_memory_descriptor()
+                           .buffer_descriptor.protocol_ == "cxl"
+               ? StorageLevel::CXL
+               : StorageLevel::RAM;
 }
 
 StorageLevel AccountedStorageLevel(
@@ -3295,6 +3303,7 @@ struct MasterService::LegacyRestoreContext {
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>&
         allocators;
     std::unordered_map<std::string, uint64_t>& accounted_bytes;
+    std::unordered_map<std::string, StorageLevel>& accounted_levels;
     size_t& rejected_count;
     size_t& already_existing_count;
     std::vector<std::pair<TenantId, std::string>>& repair_remove_keys;
@@ -3492,6 +3501,7 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
         // object validates, so a mid-construction rejection never leaves
         // phantom accounting behind for later capacity checks or metrics.
         std::unordered_map<std::string, uint64_t> object_bytes;
+        std::unordered_map<std::string, StorageLevel> object_levels;
 
         for (size_t desc_idx = 0; desc_idx < standby_meta.replicas.size();
              ++desc_idx) {
@@ -3508,6 +3518,20 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     ctx.segments_by_alias.at(buffer.transport_endpoint_);
                 if (desc.status != ReplicaStatus::REMOVED &&
                     desc.status != ReplicaStatus::FAILED) {
+                    const auto storage_level =
+                        MemoryStorageLevelForDescriptor(desc);
+                    const auto existing_level =
+                        ctx.accounted_levels.find(segment->segment_name);
+                    auto [object_level, inserted] = object_levels.emplace(
+                        segment->segment_name, storage_level);
+                    if ((existing_level != ctx.accounted_levels.end() &&
+                         existing_level->second != storage_level) ||
+                        (!inserted && object_level->second != storage_level)) {
+                        NoteLegacyStandbyRejection(ctx, entry,
+                                                   "mixed_memory_tiers");
+                        construction_ok = false;
+                        break;
+                    }
                     const uint64_t used =
                         ctx.accounted_bytes[segment->segment_name] +
                         object_bytes[segment->segment_name];
@@ -3523,7 +3547,7 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
 
                 replicas.push_back(Replica(
                     desc.id, std::make_unique<AllocatedBuffer>(alloc, buffer),
-                    desc.status));
+                    desc.status, MemoryStorageLevelForDescriptor(desc)));
             } else if (desc.is_nof_replica()) {
                 const auto& buffer =
                     desc.get_nof_descriptor().buffer_descriptor;
@@ -3586,6 +3610,8 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
         }
         for (const auto& [segment_name, bytes] : object_bytes) {
             ctx.accounted_bytes[segment_name] += bytes;
+            ctx.accounted_levels.emplace(segment_name,
+                                         object_levels.at(segment_name));
         }
         ctx.prepared.push_back(
             {accepted_entry.entry, std::move(accepted_entry.tenant_id),
@@ -4062,7 +4088,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                     if (desc.status != ReplicaStatus::REMOVED &&
                         desc.status != ReplicaStatus::FAILED) {
                         const auto storage_level =
-                            MemoryStorageLevelForProtocol(buffer.protocol_);
+                            MemoryStorageLevelForDescriptor(desc);
                         auto [level_it, level_inserted] =
                             restored_accounted_memory_levels.emplace(
                                 segment->segment_name, storage_level);
@@ -4111,7 +4137,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                     auto restored_buffer =
                         std::make_unique<AllocatedBuffer>(alloc, buffer);
                     replicas.push_back(Replica(
-                        desc.id, std::move(restored_buffer), desc.status));
+                        desc.id, std::move(restored_buffer), desc.status,
+                        MemoryStorageLevelForDescriptor(desc)));
                 } else if (desc.is_nof_replica()) {
                     const auto& buffer =
                         desc.get_nof_descriptor().buffer_descriptor;
@@ -4207,9 +4234,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         LegacyRestoreContext legacy_ctx{
             *legacy_objects,     memory_segments_by_alias,
             restored_allocators, restored_accounted_memory_bytes,
-            rejected_count,      already_existing_count,
-            repair_remove_keys,  repair_canonical_keys,
-            installed,           restore};
+            restored_accounted_memory_levels,
+            rejected_count,     already_existing_count,
+            repair_remove_keys, repair_canonical_keys,
+            installed,          restore};
         if (auto r = ValidateLegacyStandbyEntries(legacy_ctx); !r) {
             return tl::make_unexpected(r.error());
         }

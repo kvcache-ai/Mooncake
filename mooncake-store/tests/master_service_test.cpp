@@ -681,7 +681,7 @@ TEST(MasterFabricPlacementTest, CxlAllocationBypassesRamPhysicalPlacement) {
     cxl_segment.base = 0x300000000ULL;
     cxl_segment.size = kCxlSize;
     cxl_segment.protocol = "cxl";
-    cxl_segment.te_endpoint = cxl_segment.name;
+    cxl_segment.te_endpoint = "cxl-transfer-endpoint";
     ASSERT_TRUE(service.MountSegment(cxl_segment, client_id));
 
     ReplicateConfig request;
@@ -701,6 +701,10 @@ TEST(MasterFabricPlacementTest, CxlAllocationBypassesRamPhysicalPlacement) {
                   .get_memory_descriptor()
                   .buffer_descriptor.protocol_,
               "cxl");
+    EXPECT_EQ(result->front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              cxl_segment.te_endpoint);
 }
 
 TEST(MasterFabricPlacementTest, EvictionHintStaysWithinRequestedFabric) {

@@ -166,11 +166,11 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor(
             getTransportEndpoint(locality)};
 }
 
-void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {
+void AllocatedBuffer::change_to_cxl(std::string transport_endpoint) {
     uint64_t offset_raw = reinterpret_cast<uintptr_t>(buffer_ptr_);
     buffer_ptr_ = reinterpret_cast<void*>(offset_raw - DEFAULT_CXL_BASE);
     protocol = "cxl";
-    segment_name_ = client_segment_name;
+    segment_name_ = std::move(transport_endpoint);
 }
 
 void* AllocatedBuffer::get_vaddr_from_cxl() {

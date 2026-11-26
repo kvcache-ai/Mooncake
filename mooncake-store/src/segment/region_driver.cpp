@@ -33,14 +33,14 @@ class NativeAllocationCandidate final : public AllocationCandidate {
 class CxlAllocationCandidate final : public AllocationCandidate {
    public:
     CxlAllocationCandidate(std::shared_ptr<BufferAllocatorBase> allocator,
-                           std::string binding_name)
+                           std::string transport_endpoint)
         : AllocationCandidate(std::move(allocator)),
-          cxl_binding_name_(std::move(binding_name)) {}
+          transport_endpoint_(std::move(transport_endpoint)) {}
 
     std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
         auto buffer = allocator().allocate(size);
         if (buffer) {
-            buffer->change_to_cxl(cxl_binding_name_);
+            buffer->change_to_cxl(transport_endpoint_);
         }
         return buffer;
     }
@@ -50,7 +50,7 @@ class CxlAllocationCandidate final : public AllocationCandidate {
     }
 
    private:
-    std::string cxl_binding_name_;
+    std::string transport_endpoint_;
 };
 
 std::unique_ptr<RegionResource> MakeNativeResource(
@@ -64,7 +64,7 @@ std::unique_ptr<RegionResource> MakeCxlResource(
     const RegionResourceSpec& spec,
     std::shared_ptr<BufferAllocatorBase> allocator) {
     auto candidate = std::make_unique<CxlAllocationCandidate>(
-        std::move(allocator), spec.name);
+        std::move(allocator), spec.transport_endpoint);
     return std::make_unique<RegionResource>(std::move(candidate));
 }
 

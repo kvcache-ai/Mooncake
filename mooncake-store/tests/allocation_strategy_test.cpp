@@ -481,6 +481,11 @@ TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
     ASSERT_EQ(cxl_result->size(), 1);
     EXPECT_EQ(suspected_cxl_allocator->size(), 0u);
     EXPECT_EQ(active_cxl_allocator->size(), 1024u);
+    EXPECT_EQ((*cxl_result)[0]
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "active-cxl");
 }
 
 // Test preferred segment allocation when available

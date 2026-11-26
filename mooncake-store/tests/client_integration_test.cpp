@@ -180,6 +180,7 @@ YLT_REFL(LegacyReplicaDescriptor, id, descriptor_variant, status);
 TEST(HcaAffinityTest, ReadLocalityIsCompatibleInsideReplicaVariant) {
     Replica::Descriptor replica;
     replica.status = ReplicaStatus::COMPLETE;
+    replica.storage_level = StorageLevel::CXL;
     MemoryDescriptor memory;
     memory.buffer_descriptor = {1024, 0x300000000, "rdma", "receiver"};
     memory.locality = SegmentLocality{7, {"mlx5_0"}};
@@ -194,10 +195,12 @@ TEST(HcaAffinityTest, ReadLocalityIsCompatibleInsideReplicaVariant) {
         struct_pack::serialize(replica));
     ASSERT_TRUE(current);
     EXPECT_EQ(current->get_memory_descriptor().locality, memory.locality);
+    EXPECT_EQ(current->get_storage_level(), StorageLevel::CXL);
     auto new_reader = struct_pack::deserialize<Replica::Descriptor>(
         struct_pack::serialize(*old_reader));
     ASSERT_TRUE(new_reader);
     EXPECT_FALSE(new_reader->get_memory_descriptor().locality);
+    EXPECT_EQ(new_reader->get_storage_level(), StorageLevel::RAM);
 }
 
 struct LegacySegment {

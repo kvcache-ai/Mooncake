@@ -153,7 +153,7 @@ class AllocatedBuffer {
                  transport_endpoint_);
     };
 
-    void change_to_cxl(std::string client_segment_name);
+    void change_to_cxl(std::string transport_endpoint);
     void* get_vaddr_from_cxl();
 
    private:

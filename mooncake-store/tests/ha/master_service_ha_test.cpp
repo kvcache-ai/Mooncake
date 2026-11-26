@@ -3676,6 +3676,10 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesCxlBufferDescriptor) {
     EXPECT_EQ(restored.buffer_address_, address);
     EXPECT_EQ(restored.protocol_, "cxl");
     EXPECT_EQ(restored.transport_endpoint_, segment_name);
+    // Legacy snapshots can identify CXL only through protocol_.  Restore must
+    // preserve the logical tier even though its keepalive allocator is a
+    // generic standby allocator.
+    EXPECT_EQ(replicas.front().get_storage_level(), StorageLevel::CXL);
 
     auto public_replicas =
         service.GetReplicaList("standby_restore_cxl_key", kDefaultTenant);
@@ -3723,6 +3727,7 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyRebuildsRamAndCxlMetrics) {
         cxl.metadata.replicas.front()
             .get_memory_descriptor()
             .buffer_descriptor.protocol_ = "cxl";
+        cxl.metadata.replicas.front().storage_level = StorageLevel::CXL;
 
         ASSERT_TRUE(service
                         .RestoreFromStandbySnapshot(

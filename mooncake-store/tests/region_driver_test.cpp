@@ -183,7 +183,7 @@ TEST(RegionDriverTest, CxlCandidateProducesCxlDescriptors) {
     ASSERT_NE(buffer, nullptr);
     const auto descriptor = buffer->get_descriptor();
     EXPECT_EQ(descriptor.protocol_, "cxl");
-    EXPECT_EQ(descriptor.transport_endpoint_, spec.name);
+    EXPECT_EQ(descriptor.transport_endpoint_, spec.transport_endpoint);
 }
 
 TEST(RegionDriverTest, CxlDriverOwnsCapacityMetricLifetime) {

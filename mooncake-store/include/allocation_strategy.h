@@ -871,6 +871,10 @@ class CxlAllocationStrategy : public AllocationStrategy {
         std::vector<Replica> replicas;
         replicas.reserve(replica_num);
 
+        const auto* cxl_segment =
+            allocator_manager.GetSegmentMetadata(cxl_segment_name);
+        std::string transfer_endpoint =
+            cxl_segment != nullptr ? cxl_segment->te_endpoint : std::string{};
         std::unique_ptr<AllocatedBuffer> buffer;
         for (const auto& registration : *cxl_allocators) {
             const auto allocator = registration->GetAllocator();
@@ -880,6 +884,11 @@ class CxlAllocationStrategy : public AllocationStrategy {
             }
             buffer = registration->Allocate(slice_length);
             if (buffer) {
+                // Hand-built allocator snapshots used by legacy callers and
+                // unit tests may not carry Segment metadata.
+                if (transfer_endpoint.empty()) {
+                    transfer_endpoint = allocator->getTransportEndpoint();
+                }
                 break;
             }
         }
@@ -887,7 +896,14 @@ class CxlAllocationStrategy : public AllocationStrategy {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
-        buffer->change_to_cxl(cxl_segment_name);
+        if (transfer_endpoint.empty()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        // The segment name is the master's allocator identity (and can carry
+        // a "/cxl" suffix), while readers must use the endpoint published by
+        // Transfer Engine.  Do not leak the internal identity into transfer
+        // descriptors.
+        buffer->change_to_cxl(transfer_endpoint);
         replicas.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING,
                               replica_type);
 

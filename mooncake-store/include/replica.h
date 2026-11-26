@@ -769,13 +769,15 @@ class Replica {
         std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
                      LocalDiskDescriptor, DistributedFSDescriptor>
             descriptor_variant;
-        StorageLevel storage_level{StorageLevel::RAM};
         ReplicaStatus status;
-        YLT_REFL(Descriptor, id, descriptor_variant, storage_level, status);
+        // Versioned wire extension: peers predating tiered storage keep the
+        // legacy RAM default instead of failing to decode the descriptor.
+        struct_pack::compatible<StorageLevel, 1> storage_level;
+        YLT_REFL(Descriptor, id, descriptor_variant, status, storage_level);
 
         // Helper functions
         StorageLevel get_storage_level() const noexcept {
-            return storage_level;
+            return storage_level.value_or(StorageLevel::RAM);
         }
 
         bool is_memory_replica() noexcept {
@@ -950,6 +952,17 @@ class Replica {
               std::get<MemoryReplicaData>(data_).buffer
                   ? std::get<MemoryReplicaData>(data_).buffer->getStorageLevel()
                   : StorageLevel::RAM),
+          status_(status),
+          refcnt_(0) {}
+
+    // Standby snapshots carry the logical tier independently of the
+    // temporary allocator used while the owning client is not mounted.  Keep
+    // that tier instead of deriving it from the restore-only dummy allocator.
+    Replica(ReplicaID id, std::unique_ptr<AllocatedBuffer> buffer,
+            ReplicaStatus status, StorageLevel storage_level)
+        : id_(id),
+          data_(MemoryReplicaData{std::move(buffer)}),
+          storage_level_(storage_level),
           status_(status),
           refcnt_(0) {}
 
