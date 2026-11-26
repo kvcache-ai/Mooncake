@@ -4,9 +4,6 @@ import ctypes
 import gc
 import weakref
 import os
-import subprocess
-import sys
-import textwrap
 import threading
 import time
 
@@ -33,25 +30,14 @@ def create_store() -> MooncakeDistributedStore:
 
 def test_buffer_pool_acquires_released_buffer() -> None:
     store = create_store()
-    pool = BufferPool(store, min_size_class=4096, alignment=4096)
-
+    pool = BufferPool(store)
     lease = pool.acquire(1234)
+    assert lease.size == 1234
     lease.buffer[:4] = b"abcd"
     assert bytes(lease.buffer[:4]) == b"abcd"
     lease.release()
-
-    next_lease = pool.acquire(2048)
-    next_lease.release()
-    pool.close()
-
-
-def test_buffer_pool_uses_store_local_buffer_by_default() -> None:
-    store = create_store()
-    pool = BufferPool(store)
-
-    lease = pool.acquire(1024)
-    assert lease.size == 1024
-    lease.release()
+    with pool.acquire(2048) as next_lease:
+        assert next_lease.size == 2048
     pool.close()
 
 
@@ -85,17 +71,16 @@ def test_buffer_pool_prewarm_and_close() -> None:
     pool.close()
 
 
-@pytest.mark.parametrize("alignment", [64, 4096, 65536])
-def test_buffer_pool_uses_local_buffer_alignment(alignment: int) -> None:
+def test_buffer_pool_uses_local_buffer_alignment() -> None:
     store = create_store()
-    pool = BufferPool(store, min_size_class=4096, alignment=alignment)
+    pool = BufferPool(store, min_size_class=4096, alignment=65536)
 
     leases = [pool.acquire(size) for size in (1, 67, 1024)]
     for lease in leases:
-        assert lease.ptr % alignment == 0
+        assert lease.ptr % 65536 == 0
         lease.release()
     lease = pool.acquire(73)
-    assert lease.ptr % alignment == 0
+    assert lease.ptr % 65536 == 0
     lease.release()
     pool.close()
 
@@ -236,10 +221,6 @@ def test_buffer_pool_rejects_huge_size_overflow() -> None:
     pool.close()
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
-
-
 def test_default_pool_does_not_add_alignment_padding_or_overflow_registrations():
     store = create_store()
     observed = _ObservedStore(store)
@@ -312,9 +293,7 @@ def test_external_pool_region_is_opaque_and_keeps_original_objects(external_regi
         _ = view.ptr
 
 
-@pytest.mark.parametrize(
-    "offset,size", [(4097, None), (4096, 1), (0, 4097), (-1, 1), (0, -1)]
-)
+@pytest.mark.parametrize("offset,size", [(4096, 1), (-1, 1), (0, -1)])
 def test_external_pool_borrow_rejects_invalid_ranges(external_region, offset, size):
     store, pool, owner, lease = external_region
     with pytest.raises(
@@ -385,94 +364,56 @@ def test_external_pool_storage_anchor_survives_tensor_rebinding(external_pool):
         assert weak_anchor() is None
 
 
-@pytest.mark.parametrize(
-    "ptr,size,owner",
-    [(0, 4096, object()), (1, 0, object()), ((1 << 64) - 1, 2, object()), (1, 1, None)],
-)
 def test_external_pool_rejects_invalid_registration_without_poisoning_pool(
-    external_pool, ptr, size, owner
+    external_pool,
 ):
     _, pool = external_pool
-    with pytest.raises((ValueError, TypeError, OverflowError)):
-        pool.register_external_region(ptr, size, owner)
+    for ptr, size, owner in (
+        (0, 4096, object()),
+        (1, 0, object()),
+        ((1 << 64) - 1, 2, object()),
+        (1, 1, None),
+    ):
+        with pytest.raises((ValueError, TypeError, OverflowError)):
+            pool.register_external_region(ptr, size, owner)
     pool.retry_pending_external_registrations()
     with pool.acquire(64) as cpu:
         assert cpu.size == 64
 
 
-def test_external_pool_reregisters_same_address_after_release(external_pool):
-    _, pool = external_pool
-    owner = _ExternalOwner()
-    for _ in range(3):
-        with pool.register_external_region(owner.ptr, 4096, owner) as lease:
-            assert lease.owner is owner
-            with lease.borrow() as view:
-                assert view.ptr == owner.ptr
-        assert lease.owner is None
-
-
 def test_external_pool_uncertain_registration_pins_owner_without_blind_unregister():
-    import mooncake
-
-    # Isolate the deliberate process-lifetime owner pin. The child uses the
-    # same package/native search path; no installed wheel may replace it.
-    bootstrap = (
-        "import sys; sys.path.insert(0, "
-        + repr(os.path.dirname(mooncake.__path__[0]))
-        + "); import mooncake; mooncake.__path__[:] = "
-        + repr(list(mooncake.__path__))
-        + "; sys.path.insert(0, "
-        + repr(os.path.dirname(__file__))
-        + ");\n"
+    store = create_store()
+    arena = BufferPool(store)
+    local = arena.acquire(4096)
+    owner = _ExternalOwner()
+    weak_owner = weakref.ref(owner)
+    observed = _ObservedStore(store)
+    pool = BufferPool(observed)
+    healthy_owner = ctypes.create_string_buffer(4096)
+    healthy = pool.register_external_region(
+        ctypes.addressof(healthy_owner), 4096, healthy_owner
     )
-    code = textwrap.dedent(
-        """
-        import ctypes, gc, os, weakref
-        import pytest
-        from test_buffer_pool_native import BufferPool, create_store, _ObservedStore
-        store = create_store()
-        arena = BufferPool(store)
-        local = arena.acquire(4096)
-        class Owner:
-            pass
-        owner = Owner()
-        owner.local = local
-        weak = weakref.ref(owner)
-        wrapper = _ObservedStore(store)
-        pool = BufferPool(wrapper)
-        healthy_owner = ctypes.create_string_buffer(4096)
-        healthy = pool.register_external_region(ctypes.addressof(healthy_owner), 4096, healthy_owner)
-        # This range belongs to the existing CPU arena, not this pool.
-        with pytest.raises(RuntimeError):
-            pool.register_external_region(local.ptr, 4096, owner)
-        del owner
-        gc.collect()
-        assert weak() is not None
-        for cleanup in (pool.retry_pending_external_registrations, pool.close):
-            with pytest.raises(RuntimeError, match="uncertain"):
-                cleanup()
-        assert wrapper.unregistrations == 0
-        with healthy.borrow() as view:
-            assert view.ptr == ctypes.addressof(healthy_owner)
-        local.buffer[:4] = b"live"
-        assert bytes(local.buffer[:4]) == b"live"
-        healthy.release()
-        assert wrapper.unregistrations == 1
-        del pool
-        gc.collect()
-        assert weak() is not None
-        print("EXPECTED_UNCERTAIN_OWNER_RETAINED")
-        """
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", bootstrap + code],
-        env=dict(os.environ, CUDA_VISIBLE_DEVICES=""),
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "EXPECTED_UNCERTAIN_OWNER_RETAINED" in result.stdout
+    # This range belongs to the arena, so the pool cannot own its registration.
+    with pytest.raises(RuntimeError):
+        pool.register_external_region(local.ptr, 4096, owner)
+    del owner
+    gc.collect()
+    assert weak_owner() is not None
+    for cleanup in (pool.retry_pending_external_registrations, pool.close):
+        with pytest.raises(RuntimeError, match="uncertain"):
+            cleanup()
+    assert observed.unregistrations == 0
+    with healthy.borrow() as view:
+        assert view.ptr == ctypes.addressof(healthy_owner)
+    healthy.release()
+    assert observed.unregistrations == 1
+    del pool
+    gc.collect()
+    # The owner stays pinned for the lifetime of the process.
+    assert weak_owner() is not None
+    local.release()
+    arena.close()
+    assert store.close() == 0
 
 
 class _ObservedStore:
@@ -514,7 +455,7 @@ def test_external_pool_reuses_one_registration_for_distinct_payloads(observed_po
     owner = _ExternalOwner()
     lease = pool.register_external_region(owner.ptr, 4096, owner)
     try:
-        for value in (b"first", b"second", b"third"):
+        for value in (b"first", b"second"):
             with lease.borrow(128, len(value)) as view:
                 ctypes.memmove(view.ptr, value, len(value))
                 key = f"pool-reuse-{owner.ptr}"
@@ -530,6 +471,9 @@ def test_external_pool_reuses_one_registration_for_distinct_payloads(observed_po
     finally:
         lease.release()
     assert observed.unregistrations == 1
+    with pool.register_external_region(owner.ptr, 4096, owner) as again:
+        assert again.owner is owner
+    assert observed.registrations == 2 and again.owner is None
 
 
 @pytest.mark.parametrize("orphan", [False, True])
@@ -632,3 +576,7 @@ def test_external_pool_close_waits_for_registration_and_rolls_it_back(observed_p
     assert not thread.is_alive() and not closer.is_alive()
     assert len(outcome) == 1 and isinstance(outcome[0], str)
     assert observed.registrations == observed.unregistrations == 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

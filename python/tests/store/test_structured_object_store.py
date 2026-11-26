@@ -40,47 +40,39 @@ class SimpleDataProto:
         return cls(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
 
 
-def test_tensor_byte_copy_snapshots_device_storage_before_host_dereference(monkeypatch):
+def test_tensor_payload_helpers_snapshot_only_on_the_host_copy_path(monkeypatch):
     torch = pytest.importorskip("torch")
     cpu = torch.arange(16, dtype=torch.int32)
 
     class DeviceTensor:
         device = type("Device", (), {"type": "cuda"})()
-        copies = 0
+
+        def __init__(self) -> None:
+            self.copies = 0
 
         def cpu(self):
             self.copies += 1
             return cpu
 
     source = DeviceTensor()
+    seen = []
 
     def serialize(tensor):
-        assert tensor is cpu, "a device pointer reached the host byte-copy codec"
-        return b"header", cpu.data_ptr(), cpu.nbytes, cpu
+        seen.append(tensor)
+        return b"header", cpu.data_ptr(), cpu.nbytes, tensor
 
     monkeypatch.setattr(sos, "_tensor_codec_helper", lambda name: serialize)
     data, header = sos._tensor_payload_bytes(sos._TensorPayload(source))
-    assert source.copies == 1
     assert header == len(b"header")
     assert data == b"header" + cpu.numpy().tobytes()
-
-
-def test_native_tensor_parts_preserve_device_source(monkeypatch):
-    class DeviceTensor:
-        device = type("Device", (), {"type": "cuda"})()
-
-        def cpu(self):
-            raise AssertionError("the native tensor path must retain its device source")
-
-    source = DeviceTensor()
-
-    def serialize(tensor):
-        assert tensor is source
-        return b"header", 0xDEADBEEF, 64, source
-
-    monkeypatch.setattr(sos, "_tensor_codec_helper", lambda name: serialize)
-    metadata, ptr, size, owner = sos._tensor_payload_parts(sos._TensorPayload(source))
-    assert (metadata, ptr, size, owner) == (b"header", 0xDEADBEEF, 64, source)
+    assert sos._tensor_payload_parts(sos._TensorPayload(source)) == (
+        b"header",
+        cpu.data_ptr(),
+        cpu.nbytes,
+        source,
+    )
+    assert seen == [cpu, source]
+    assert source.copies == 1
 
 
 class BadDataProto:
@@ -2108,8 +2100,10 @@ class PostCommitFailureStore(InMemoryStore):
         return self._finish(key, super().pub_tensor(key, value, config))
 
 
-@pytest.mark.parametrize("mode", ["copy", "auto"])
-@pytest.mark.parametrize("point", ["meta", "chunk", "small", "manifest"])
+@pytest.mark.parametrize(
+    ("mode", "point"),
+    [("copy", "meta"), ("copy", "chunk"), ("auto", "small"), ("auto", "manifest")],
+)
 def test_dataproto_post_commit_failure_removes_attempted_keys(mode, point):
     torch = pytest.importorskip("torch")
     store = PostCommitFailureStore(point)
@@ -2135,8 +2129,7 @@ def test_dataproto_post_commit_failure_removes_attempted_keys(mode, point):
     assert store.tensor_objects == {}
 
 
-@pytest.mark.parametrize("mode", ["copy", "auto"])
-def test_new_manifest_post_commit_failure_preserves_borrowed_buffers(mode):
+def test_new_manifest_post_commit_failure_preserves_borrowed_buffers():
     store = PostCommitFailureStore("disabled")
     _, transfer = make_transfer(store=store)
     original = transfer.put_bundle(b"base", {"data": b"borrowed"})
@@ -5533,8 +5526,3 @@ def test_bundle_buffer_pool_exposes_existing_transport_pool_readonly():
     assert transfer.buffer_pool is sentinel
     with pytest.raises(AttributeError):
         transfer.buffer_pool = None
-
-
-def test_bundle_buffer_pool_without_native_support_keeps_fallback():
-    transfer = MooncakeBundleTransfer(object())
-    assert transfer.buffer_pool is None

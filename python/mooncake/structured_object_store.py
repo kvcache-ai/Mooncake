@@ -1230,9 +1230,7 @@ class MooncakeBundleTransfer:
     ) -> Any:
         manifest = self._bundle_store.resolve_manifest(stage_ref)
         metadata = _decode_structured_metadata(
-            self._bundle_store.read_payload(
-                manifest["meta"], prefer_pool=isinstance(destination, TensorDestination)
-            )
+            self._bundle_store.read_payload(manifest["meta"])
         )
         field_spec = _structured_field_specs(metadata).get(
             member, {"encoding": "bytes"}
@@ -3761,13 +3759,7 @@ class _StructuredObjectLayer:
         destinations: Optional[Mapping[str, Any]],
     ) -> StructuredObjectResult:
         destination_map = destinations or {}
-        metadata, buffers, selected = self._resolve_structured_read(
-            spec,
-            prefer_pool=any(
-                isinstance(value, TensorDestination)
-                for value in destination_map.values()
-            ),
-        )
+        metadata, buffers, selected = self._resolve_structured_read(spec)
         field_specs = _structured_field_specs(metadata)
         validate_tensor_destinations(destination_map)
         member_slices = dict(spec.member_slices)
@@ -3864,14 +3856,12 @@ class _StructuredObjectLayer:
     def _resolve_structured_read(
         self,
         spec: StructuredObjectReadSpec,
-        *,
-        prefer_pool: bool = False,
     ) -> tuple[dict[str, Any], Mapping[str, Any], list[str]]:
         if spec.member_names is not None and not spec.member_names:
             raise ValueError("structured read spec selected no members")
         manifest = self._bundle_store.resolve_manifest(spec.ref)
         metadata = _decode_structured_metadata(
-            self._bundle_store.read_payload(manifest["meta"], prefer_pool=prefer_pool)
+            self._bundle_store.read_payload(manifest["meta"])
         )
         buffers = manifest["buffers"]
         selected = (
@@ -4427,10 +4417,8 @@ class _BundleManifestStore:
         self._validate_manifest(manifest)
         return manifest
 
-    def read_payload(
-        self, payload_spec: Mapping[str, Any], *, prefer_pool: bool = False
-    ) -> bytes:
-        return self._transport.read_payload(payload_spec, prefer_pool=prefer_pool)
+    def read_payload(self, payload_spec: Mapping[str, Any]) -> bytes:
+        return self._transport.read_payload(payload_spec)
 
     def read_payload_range(
         self, payload_spec: Mapping[str, Any], byte_offset: int, byte_length: int
@@ -5021,21 +5009,10 @@ class _MooncakePayloadTransport:
             config,
         )
 
-    def read_payload(
-        self, payload_spec: Mapping[str, Any], *, prefer_pool: bool = False
-    ) -> bytes:
+    def read_payload(self, payload_spec: Mapping[str, Any]) -> bytes:
         expected_bytes = int(payload_spec["bytes"])
         if expected_bytes == 0:
             return b""
-        if prefer_pool and callable(self._get_into_ranges):
-            # Direct destinations read metadata through this bytes path. Reuse pool memory
-            # instead of registering a fresh bytearray for every small GET.
-            pooled = self.read_payload_ranges_batch(
-                [(payload_spec, [(0, 0, expected_bytes)])],
-                max_fragments=len(payload_spec["chunks"]),
-            )
-            if pooled is not None:
-                return pooled[0]
         data = bytearray(expected_bytes)
         self.read_payload_into(payload_spec, data)
         return bytes(data)

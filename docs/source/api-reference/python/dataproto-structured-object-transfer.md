@@ -215,18 +215,14 @@ The destination owner or lease must remain alive for as long as the materialized
 
 ## Payload-only tensor destinations
 
-`FieldSchema.direct_alignment` opts a dense tensor member into direct reads. `tensor_destination` receives only the payload, without its serialization header, and GET returns the same tensor. Other members keep ordinary materialization. DataProto fields and `StructuredObjectPayload.field_schemas` support the same declaration.
-
-For a preallocated, contiguous CPU/CUDA `target` with the required shape, dtype and alignment:
+`FieldSchema.direct_alignment` opts a dense `torch_tensor` field into a strict read into a caller-owned contiguous CPU/CUDA tensor. Other fields keep ordinary materialization. The same declaration is available on `StructuredObjectPayload.field_schemas`.
 
 ```python
-from mooncake.structured_object_store import FieldSchema, tensor_destination
-
 ref = transfer.put_dataproto(data, field_schemas={
     "selection": FieldSchema(codec="torch_tensor", direct_alignment=64),
 })
 lease = transfer.buffer_pool.register_external_region(
-    target.data_ptr(), target.nbytes, owner=target.untyped_storage(),
+    target.data_ptr(), target.nbytes, owner=target.untyped_storage()
 )
 try:
     with lease.borrow():
@@ -234,16 +230,11 @@ try:
             "selection": tensor_destination(target, alignment=64, pre_registered=True),
         })
         assert result["batch"]["selection"] is target
-        # Finish asynchronous consumers before releasing the borrow or reusing target.
 finally:
     lease.release()
 ```
 
-Register once and reuse the lease for subsequent reads. Borrows prevent lease release; they do not synchronize concurrent consumers. Drain I/O and consumers, release borrows/leases, and close the pool before closing/reconfiguring the Store or sleeping its allocator. Do not resize/remap registered storage or raw-register/unregister managed ranges. Failed unregisters retain ownership for retry; `retry_pending_external_registrations()` handles dropped leases. Ambiguous registration errors pin the owner until process exit.
-
-Direct reads validate current layout, shape, dtype, alignment, allocation bounds and cross-field overlap; native reads verify registration. Unsupported paths fail without staging or returning a replacement tensor. Sources and destinations need resolved negative/conjugate flags. For scatter views, pass `allocation=output_tensor`: the root meets schema alignment, and each fragment meets natural dtype alignment. Whole reads and row selections are supported; `batch_slices` uses the existing destination interface.
-
-PUT copy policy is independent: `copy`, `auto`, and registered tensor-object `zero_copy` sources support direct GET. Strict I/O requires a supported classic Transfer Engine and memory replica; CUDA TCP and TENT are rejected. External registration requires a private classic engine without NoF registration. CUDA GET waits for preceding work on the calling stream; the caller schedules and completes later consumers. Pointers are process-local. Explicit pool `alignment=A` aligns allocation only; the schema still controls direct reads.
+The caller keeps the target registered and controls consumer completion. Drain I/O and consumers, release borrows and leases, then close or reconfigure the Store. Raw register/unregister of managed ranges is unsupported. Reads validate layout, shape, dtype, alignment, bounds and cross-field overlap; unsupported paths fail without staging. Whole reads and row selections are supported. Strict I/O requires a classic Transfer Engine memory replica; TCP and TENT are rejected. CUDA reads wait for prior work on the calling stream. Failed unregisters keep ownership for retry through `retry_pending_external_registrations()`, ambiguous registrations pin the owner until process exit, and scatter views pass `allocation=output_tensor` so the root meets schema alignment.
 
 ## Copy policy
 

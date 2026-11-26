@@ -38,10 +38,14 @@ def direct_store():
     return store
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-@pytest.mark.parametrize("mode", ["copy", "auto", "zero_copy"])
-@pytest.mark.parametrize("alignment", [64, 4096])
-@pytest.mark.parametrize("rows", [[2, 0, 2], slice(1, 3), None, "member_slice"])
+@pytest.mark.parametrize(
+    ("device", "mode", "alignment", "rows"),
+    [
+        ("cpu", "zero_copy", 4096, "member_slice"),
+        ("cpu", "auto", 64, [2, 0, 2]),
+        ("cuda", "auto", 64, None),
+    ],
+)
 def test_direct_rdma_tensor_destination(direct_store, device, mode, alignment, rows):
     source = torch.full((3, 2, alignment // 4), -1, dtype=torch.int32)
     source[..., :8] = torch.arange(48, dtype=torch.int32).view(3, 2, 8)

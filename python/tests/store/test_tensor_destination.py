@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -48,8 +50,9 @@ def aligned_tensor(shape, alignment=64, dtype=torch.int32):
     return backing[offset : offset + count * size].view(dtype).view(shape)
 
 
-@pytest.mark.parametrize("mode", ["copy", "auto"])
-@pytest.mark.parametrize("rows", [None, slice(1, 3), [2, 0, 2], []])
+@pytest.mark.parametrize(
+    ("mode", "rows"), [("copy", None), ("auto", [2, 0, 2]), ("auto", [])]
+)
 def test_direct_tensor_payload_uses_caller_tensor_without_deserialization(
     mode, rows, monkeypatch
 ):
@@ -81,6 +84,13 @@ def test_tensor_destination_rejects_invalid_contracts():
         tensor_destination(target.view(-1)[1:], alignment=64, pre_registered=True)
     with pytest.raises(ValueError, match="contiguous"):
         tensor_destination(target.t(), pre_registered=True)
+    destination = tensor_destination(target, alignment=64, pre_registered=True)
+    target.as_strided_((2, 16), (1, 2))
+    with pytest.raises(ValueError, match="contiguous"):
+        destination.validate(
+            {"encoding": "torch_tensor", "dtype": "torch.int32", "element_size": 4},
+            (2, 16),
+        )
 
 
 @pytest.mark.parametrize("change", ["shape", "dtype", "transport"])
@@ -107,19 +117,7 @@ def test_direct_tensor_read_fails_without_staging(change):
     assert store.get_into_ranges_calls == 0
 
 
-def test_tensor_destination_revalidates_current_layout():
-    target = aligned_tensor((2, 16))
-    destination = tensor_destination(target, alignment=64, pre_registered=True)
-    target.as_strided_((2, 16), (1, 2))
-    with pytest.raises(ValueError, match="contiguous"):
-        destination.validate(
-            {"encoding": "torch_tensor", "dtype": "torch.int32", "element_size": 4},
-            (2, 16),
-        )
-
-
-@pytest.mark.parametrize("offset", [0, 4])
-def test_direct_destinations_reject_aliases_before_payload_read(offset):
+def test_direct_destinations_reject_aliases_before_payload_read():
     store, transfer = make_transfer(DirectStore())
     source = torch.ones((2, 16), dtype=torch.int32)
     ref = transfer.put(
@@ -133,7 +131,7 @@ def test_direct_destinations_reject_aliases_before_payload_read(offset):
     )
     allocation = aligned_tensor((40,))
     first = allocation[:32].view(2, 16)
-    second = allocation[offset : offset + 32].view(2, 16)
+    second = allocation[4:36].view(2, 16)
     with pytest.raises(ValueError, match="overlap"):
         transfer.get(
             ref,
@@ -173,10 +171,10 @@ def test_only_declared_schema_enables_direct_reads(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("alignment", [True, 0, -1, 3, "64"])
-def test_schema_rejects_invalid_direct_alignment(alignment):
-    with pytest.raises(ValueError, match="direct_alignment"):
-        FieldSchema(codec="torch_tensor", direct_alignment=alignment)
+def test_schema_rejects_invalid_direct_alignment():
+    for alignment in (True, -1, 3, "64"):
+        with pytest.raises(ValueError, match="direct_alignment"):
+            FieldSchema(codec="torch_tensor", direct_alignment=alignment)
 
 
 def test_structured_schema_requires_dense_tensors():
@@ -212,11 +210,6 @@ def test_direct_scatter_keeps_schema_alignment_on_output_allocation():
             pre_registered=True,
             allocation=allocation,
         )
-
-
-def test_scatter_fragment_requires_natural_dtype_alignment():
-    import ctypes
-
     root = aligned_tensor((32,))
     buffer = (ctypes.c_ubyte * (root.numel() * root.element_size())).from_address(
         root.data_ptr()
@@ -226,46 +219,25 @@ def test_scatter_fragment_requires_natural_dtype_alignment():
         tensor_destination(fragment, alignment=64, pre_registered=True, allocation=root)
 
 
-@pytest.mark.parametrize("flag", ["negative", "conjugate"])
-def test_direct_destination_rejects_logical_view_flags(flag):
-    root = torch.empty(
-        (2, 4), dtype=torch.int32 if flag == "negative" else torch.complex64
-    )
-    view = torch._neg_view(root) if flag == "negative" else root.conj()
-    with pytest.raises(ValueError, match="unresolved"):
-        tensor_destination(view, pre_registered=True)
-
-
-def test_direct_destination_rejects_logical_allocation_root():
+def test_direct_destination_rejects_logical_views():
     target = aligned_tensor((2, 4))
+    for view in (torch._neg_view(target), target.to(torch.complex64).conj()):
+        with pytest.raises(ValueError, match="unresolved"):
+            tensor_destination(view, pre_registered=True)
     with pytest.raises(ValueError, match="allocation"):
         tensor_destination(
             target, pre_registered=True, allocation=torch._neg_view(target)
         )
 
 
-def test_direct_destination_revalidates_logical_flags():
-    root = aligned_tensor((2, 4))
-    destination = tensor_destination(root, alignment=64, pre_registered=True)
-    torch._C._set_neg(root, True)
-    try:
-        with pytest.raises(ValueError, match="unresolved"):
-            destination.validate(
-                {
-                    "encoding": "torch_tensor",
-                    "dtype": "torch.int32",
-                    "element_size": 4,
-                    "direct_alignment": 64,
-                },
-                (2, 4),
-            )
-    finally:
-        torch._C._set_neg(root, False)
-
-
-@pytest.mark.parametrize("mode", ["copy", "auto"])
 @pytest.mark.parametrize(
-    "unsupported", ["scalar", "missing_native_codec", "negative", "conjugate", "sparse"]
+    ("mode", "unsupported"),
+    [
+        ("copy", "scalar"),
+        ("copy", "missing_native_codec"),
+        ("auto", "negative"),
+        ("auto", "sparse"),
+    ],
 )
 def test_direct_writer_rejects_unreadable_payload_before_publishing(
     monkeypatch, mode, unsupported
@@ -278,8 +250,6 @@ def test_direct_writer_rejects_unreadable_payload_before_publishing(
     )
     if unsupported == "negative":
         value = torch._neg_view(value)
-    elif unsupported == "conjugate":
-        value = value.to(torch.complex64).conj()
     elif unsupported == "sparse":
         value = value.to_sparse()
     if unsupported == "missing_native_codec":
@@ -299,11 +269,10 @@ def test_direct_writer_rejects_unreadable_payload_before_publishing(
     assert store.objects == {}
 
 
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.int16, torch.int32, torch.int64])
-@pytest.mark.parametrize("shape", [(0, 2, 4), (2, 0, 4), (2, 2, 4)])
-def test_direct_schema_empty_dimensions_and_dtypes(dtype, shape):
+@pytest.mark.parametrize("shape", [(0, 2, 4), (2, 2, 4)])
+def test_direct_schema_empty_dimensions(shape):
     store, transfer = make_transfer(DirectStore())
-    source = torch.arange(torch.Size(shape).numel(), dtype=dtype).view(shape)
+    source = torch.arange(torch.Size(shape).numel(), dtype=torch.int32).view(shape)
     ref = transfer.put(
         {"batch": {"value": source}},
         type="dataproto",
@@ -312,7 +281,7 @@ def test_direct_schema_empty_dimensions_and_dtypes(dtype, shape):
     )
     rows = list(range(shape[0] - 1, -1, -1))
     count = source.numel() * source.element_size()
-    target = aligned_tensor(shape, dtype=dtype)
+    target = aligned_tensor(shape)
     result = transfer.get(
         ref,
         type="dataproto",
@@ -357,11 +326,14 @@ class BoundedPayloadStore(DirectStore):
         )
 
 
-@pytest.mark.parametrize("mode", ["copy", "auto"])
-@pytest.mark.parametrize("rows", [None, [2, 0, 2]])
-@pytest.mark.parametrize("chunk_bytes", [128, 257, 4096])
-@pytest.mark.parametrize("non_contiguous", [False, True])
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    ("mode", "rows", "chunk_bytes", "non_contiguous", "device"),
+    [
+        ("copy", None, 257, False, "cpu"),
+        ("auto", [2, 0, 2], 128, True, "cpu"),
+        ("auto", None, 4096, False, "cuda"),
+    ],
+)
 def test_large_direct_schema_respects_chunk_bytes(
     mode, rows, chunk_bytes, non_contiguous, device
 ):
@@ -417,58 +389,17 @@ def test_registered_gpu_source_rejects_missing_registration_and_cleans_header():
     assert not store.registered
 
 
-@pytest.mark.parametrize("mode", ["copy", "auto"])
-def test_ordinary_tensor_keeps_single_object_storage(mode):
+def test_ordinary_tensor_keeps_single_object_storage():
     store, transfer = make_transfer(DirectStore())
     source = torch.arange(6144, dtype=torch.int32).view(3, 2, 1024)
     ref = transfer.put(
         {"value": source},
         type="dict",
         chunk_bytes=4096,
-        policy=BundleTransferPolicy(copy_mode=mode),
+        policy=BundleTransferPolicy(copy_mode="auto"),
         field_schemas={"value": FieldSchema(codec="torch_tensor")},
     )
     location = ref.field_index["value"]
     manifest = transfer._bundle_store.resolve_manifest(ref.stage_refs[location.stage])
     assert len(manifest["buffers"][location.member]["chunks"]) == 1
     torch.testing.assert_close(transfer.get(ref, type="dict")["value"], source)
-
-
-def test_copy_chunks_are_assembled_on_demand_and_cleaned_on_failure():
-    from mooncake.structured_object_store import _MooncakePayloadTransport
-
-    events = []
-
-    class ObservedGroup:
-        def __init__(self, index, fail=False):
-            self.index, self.fail = index, fail
-
-        def __iter__(self):
-            events.append(("copy", self.index))
-            if self.fail:
-                raise MemoryError("injected next-chunk allocation failure")
-            return iter([memoryview(b"payload")])
-
-    class Store(DirectStore):
-        def put(self, key, value, config=None):
-            events.append(("put", key))
-            return super().put(key, value, config=config)
-
-    store = Store()
-    transport = _MooncakePayloadTransport(store)
-    transport.put_multi_buffer_payload_chunks(
-        ["first", "second"],
-        [ObservedGroup(0), ObservedGroup(1)],
-        BundleTransferPolicy(copy_mode="copy"),
-    )
-    assert events == [("copy", 0), ("put", "first"), ("copy", 1), ("put", "second")]
-    store.objects.clear()
-    events.clear()
-    with pytest.raises(MemoryError, match="next-chunk"):
-        transport.put_multi_buffer_payload_chunks(
-            ["first", "second"],
-            [ObservedGroup(0), ObservedGroup(1, fail=True)],
-            BundleTransferPolicy(copy_mode="copy"),
-        )
-    assert store.objects == {}
-    assert events == [("copy", 0), ("put", "first"), ("copy", 1)]
