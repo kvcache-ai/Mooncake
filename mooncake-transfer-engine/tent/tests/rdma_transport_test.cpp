@@ -4468,6 +4468,23 @@ TEST_F(RdmaWorkersSharedQpTest, CongestionAcquireUsesBoundRouteWithEmptySlice) {
     EXPECT_EQ(snapshot(*bound->device_owner).inflight_bytes, 0u);
 }
 
+TEST_F(RdmaWorkersSharedQpTest, CongestionAcquireUsesPostingPathDevice) {
+    using namespace adaptive_congestion_control;
+    auto* route =
+        RdmaTransportTestPeer::prepareCongestionRoute(*workers_, kDev, 11);
+    RdmaSlice slice;
+    slice.source_dev_id = -1;
+    slice.length = kLen;
+    ASSERT_EQ(RdmaTransportTestPeer::acquireCongestionPermit(
+                  *workers_, slice, {kDev, 11, kDev}, endpoint_),
+              Decision::kAllow);
+    EXPECT_TRUE(slice.congestion_control_permit.active());
+    EXPECT_EQ(snapshot(*route->device_owner).inflight_bytes, kLen);
+    EXPECT_TRUE(completeTentCongestionControlAttempt(
+        slice, OutcomeClass::kSuccess, FailureScope::kOperation));
+    EXPECT_EQ(snapshot(*route->device_owner).inflight_bytes, 0u);
+}
+
 TEST_F(RdmaWorkersSharedQpTest, CongestionAcquireBoundRouteOverridesConflict) {
     using namespace adaptive_congestion_control;
     auto* bound =
@@ -4679,6 +4696,28 @@ class RdmaWorkersAvoidTest : public RdmaWorkersSharedQpTest {
     TentRdmaCongestionControlRoute* route_ = nullptr;
     size_t completed_ = 0;
 };
+
+TEST_F(RdmaWorkersAvoidTest, FreshRoutesReachBatchAdmission) {
+    using namespace adaptive_congestion_control;
+    ASSERT_EQ(endpoint_->congestionRoute(), nullptr);
+    for (size_t i = 0; i < 3; ++i) {
+        auto* slice = makeSlice();
+        slice->source_addr = source_.data() + i * kLen;
+        slice->target_addr = kTarget + i * kLen;
+        slice->task->request.target_id = target_;
+        ASSERT_TRUE(
+            RdmaTransportTestPeer::generatePostPath(*active_, slice).ok());
+        ASSERT_EQ(slice->congestion_control_route, route_);
+        RdmaTransportTestPeer::queuePostPath(*active_, 0, kDev, target_, kDev,
+                                             slice);
+    }
+    RdmaTransportTestPeer::postSend(*active_, 0);
+    ASSERT_EQ(post_order.size(), 3u);
+    EXPECT_EQ(endpoint_->congestionRoute(), route_);
+    EXPECT_EQ(snapshot(route_->domain).inflight_bytes, 3 * kLen);
+    drainCompletions();
+    EXPECT_EQ(snapshot(route_->domain).inflight_bytes, 0u);
+}
 
 TEST_F(RdmaWorkersAvoidTest, DefaultSignalOnePollRefundsRealPostedBatch) {
     using namespace adaptive_congestion_control;

@@ -650,7 +650,7 @@ adaptive_congestion_control::Decision Workers::acquireCongestionPermit(
             adaptive_congestion_control::Mode::kOff ||
         !slice || !endpoint)
         return adaptive_congestion_control::Decision::kAllow;
-    const int dev_id = slice->source_dev_id;
+    const int dev_id = path.local_device_id;
     if (dev_id < 0 ||
         static_cast<size_t>(dev_id) >= congestion_control_devices_.size())
         return adaptive_congestion_control::Decision::kAllow;
@@ -1040,6 +1040,10 @@ void Workers::asyncPostSend() {
                     congestion_control_devices_.size())
                 return false;
             auto* route = endpoint->congestionRoute();
+            if (!route && slices.front() &&
+                slices.front()->congestion_control_route)
+                route = endpoint->bindCongestionRoute(
+                    slices.front()->congestion_control_route);
             if (!route) return false;
             BatchItem items[kBatchCapacity];
             for (size_t i = 0; i < slices.size(); ++i) {
@@ -2452,6 +2456,8 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
         PostPath path{slice->source_dev_id, slice->task->request.target_id,
                       slice->target_dev_id};
         slice->congestion_control_route = getCongestionRoute(path);
+        slice->congestion_control_route_owner =
+            slice->congestion_control_route->shared_from_this();
     }
 #endif
     // Copy identifiers for GPUDirect reachability learning in asyncPollCq.
