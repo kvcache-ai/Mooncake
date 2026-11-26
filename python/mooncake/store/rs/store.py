@@ -30,6 +30,7 @@ _logger = logging.getLogger("mooncake.store.rs.store")
 BufferPool = _native.BufferPool
 RegisteredBufferPool = BufferPool
 
+_CONFIG_UNSET = object()
 _CACHE_STATUS = "status"
 _CACHE_STATUS_LIST = "status_list"
 _CACHE_BYTES = "bytes"
@@ -516,7 +517,8 @@ class MooncakeDistributedStore:
     ):
         return self.batch_put(keys=keys, values=values, tenant=tenant, config=config)
 
-    def batch_put_from(self, *args, tenant: str | None = None, config=None):
+    def batch_put_from(self, *args, tenant: str | None = None, config=_CONFIG_UNSET):
+        args, config = _split_raw_put_config(args, config)
         if len(args) == 1:
             items = _normalize_pointer_items(args[0])
             result = self._invoke_cache(
@@ -549,8 +551,9 @@ class MooncakeDistributedStore:
         self,
         *args,
         tenant: str | None = None,
-        config=None,
+        config=_CONFIG_UNSET,
     ):
+        args, config = _split_raw_put_config(args, config)
         if len(args) == 1:
             items = list(args[0])
             if _items_use_bytes_payloads(items):
@@ -1354,6 +1357,14 @@ def _normalize_key_value_items(
     if len(keys) != len(values):
         raise ValueError("keys and values must have the same length")
     return list(zip(keys, values))
+
+
+def _split_raw_put_config(args, config):
+    if len(args) == 4:
+        if config is not _CONFIG_UNSET:
+            raise TypeError("multiple values for argument 'config'")
+        return args[:3], args[3]
+    return args, None if config is _CONFIG_UNSET else config
 
 
 def _normalize_raw_batch_args(

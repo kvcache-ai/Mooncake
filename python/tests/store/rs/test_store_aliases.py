@@ -84,3 +84,31 @@ def test_get_batch_delegates_to_batch_get(store_module) -> None:
     assert result == [b"one", b"two"]
     assert len(calls) == 1
     assert calls[0][0] == "batch_get"
+
+
+@pytest.mark.parametrize(
+    ("method", "pointers", "sizes"),
+    [
+        ("batch_put_from", [64], [12]),
+        ("batch_put_from_multi_buffers", [[64, 96]], [[4, 8]]),
+    ],
+)
+def test_raw_batch_put_accepts_positional_config(store_module, method, pointers, sizes):
+    store = object.__new__(store_module.MooncakeDistributedStore)
+    calls = []
+
+    def record(name, *args, **kwargs):
+        calls.append((name, args, kwargs))
+        return [0]
+
+    store._invoke = record
+    put = getattr(store, method)
+    config = store_module.ReplicateConfig(replica_num=2, preferred_segment="rack-a")
+    assert put(["key"], pointers, sizes, config, tenant="a") == [0]
+    assert put(["key"], pointers, sizes, config=config, tenant="a") == [0]
+    assert calls[0] == calls[1]
+    assert calls[0][2]["tenant"] == "a"
+    assert calls[0][2]["replica_count"] == 2
+    assert calls[0][2]["preferred_segments"] == ["rack-a"]
+    with pytest.raises(TypeError, match="multiple values"):
+        put(["key"], pointers, sizes, config, config=None)
