@@ -40,6 +40,18 @@ PGResult<void> launchRingAllReduceKernel(const AllReduceRequest& request,
 PGResult<void> launchRingAllGatherKernel(const AllGatherRequest& request,
                                          RingDeviceState* state,
                                          cudaStream_t stream);
+PGResult<void> launchRingReduceScatterKernel(
+    const ReduceScatterRequest& request, RingDeviceState* state,
+    cudaStream_t stream);
+PGResult<void> launchRingBroadcastKernel(const BroadcastRequest& request,
+                                         RingDeviceState* state,
+                                         cudaStream_t stream);
+PGResult<void> launchRingReduceKernel(const ReduceRequest& request,
+                                      RingDeviceState* state,
+                                      cudaStream_t stream);
+PGResult<void> launchRingBarrierKernel(const BarrierRequest& request,
+                                       RingDeviceState* state,
+                                       cudaStream_t stream);
 
 }  // namespace mooncake
 
