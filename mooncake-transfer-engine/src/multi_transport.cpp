@@ -127,7 +127,7 @@ MultiTransport::~MultiTransport() {
     }
     // pop leaves the newest node as the tail. It is not inside a batch.
     if (completion_tail_ != nullptr && completion_tail_ != completion_stub_) {
-        releaseCompletionRecord(completion_tail_);
+        CompletionRecord::release(completion_tail_);
     }
     delete completion_stub_;
     completion_stub_ = nullptr;
@@ -290,19 +290,10 @@ void MultiTransport::suppressCompletion(BatchDesc* batch) {
     // Open means drain has not copied the id. Suppressed makes that copy
     // lose the claim. Delivered means the id is already out; deleting the
     // descriptor does not change the record the queue still owns.
-    uint32_t expected_claim = CompletionRecord::kOpen;
-    record->claim.compare_exchange_strong(
-        expected_claim, CompletionRecord::kSuppressed,
-        std::memory_order_acq_rel, std::memory_order_acquire);
+    record->suppress();
     batch->completion_queue_state.store(BatchDesc::kCompletionSuppressed,
                                         std::memory_order_release);
-    releaseCompletionRecord(record);
-}
-
-void MultiTransport::releaseCompletionRecord(CompletionRecord* record) {
-    if (record->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        delete record;
-    }
+    CompletionRecord::release(record);
 }
 
 void MultiTransport::pushCompletion(CompletionRecord* node) {
@@ -332,7 +323,7 @@ bool MultiTransport::popCompletion(BatchCompletion& out) {
     }
     CompletionRecord* old = completion_tail_;
     completion_tail_ = next;
-    if (old != completion_stub_) releaseCompletionRecord(old);
+    if (old != completion_stub_) CompletionRecord::release(old);
     return true;
 }
 

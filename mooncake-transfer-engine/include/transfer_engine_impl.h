@@ -525,7 +525,6 @@ class TransferEngineImpl {
 
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
-    std::shared_ptr<MultiTransport> multi_transports_;
     std::shared_mutex mutex_;
     MemoryRegionMap local_memory_regions_;
     MemoryRegionMap registering_memory_regions_;
@@ -602,6 +601,9 @@ class TransferEngineImpl {
     void StartMetricsReportingThread();
     void StopMetricsReportingThread();
 #endif
+
+    // Join deferred cleanup before destroying state used by its callbacks.
+    std::unique_ptr<MultiTransport> multi_transports_;
 };
 }  // namespace mooncake
 
