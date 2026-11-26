@@ -1,3 +1,5 @@
+find_package(OpenSSL REQUIRED)
+
 # Add allocator benchmark executable
 add_executable(allocator_bench allocator_bench.cpp)
 target_link_libraries(allocator_bench PRIVATE cachelib_memory_allocator
@@ -74,3 +76,12 @@ add_executable(exists_evict_bench exists_evict_bench.cpp)
 target_link_libraries(
   exists_evict_bench PRIVATE master_service_test_peer cachelib_memory_allocator
                              gflags::gflags glog::glog pthread)
+
+add_executable(master_trace_bench master_trace_bench.cpp)
+target_compile_definitions(
+  master_trace_bench
+  PRIVATE
+    MOONCAKE_TRACE_BENCH_PROFILE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/profiles")
+target_link_libraries(
+  master_trace_bench PRIVATE mooncake_store gflags::gflags glog::glog pthread
+                             JsonCpp::JsonCpp)

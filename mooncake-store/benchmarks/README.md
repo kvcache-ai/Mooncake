@@ -144,3 +144,11 @@ Output lines:
 - `PUTS`: with `--put_rate`, attempted and failed puts, put latency, and when
   the first put failed.
 - `FINAL`: keys written, live keys, and eviction passes.
+
+## Master Trace Benchmark
+
+`master_trace_bench` replays a deterministic SGLang workload synthesized from
+an offline-extracted `ModelProfile` against the Master metadata path. No
+traffic recording or external trace artifacts are required at runtime. See
+[master_trace_bench.md](master_trace_bench.md) for the profile schema,
+amplification, and 100M-key usage.
