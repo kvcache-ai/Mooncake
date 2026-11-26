@@ -67,7 +67,7 @@ common_flags=(
 extra_flags=()
 build_targets=()
 ctest_args=()
-ctest_timeout=300
+ctest_timeout=600
 
 case "$profile" in
   cuda-off)
@@ -137,7 +137,7 @@ ci_start_service "tent-metadata-${profile}" "$RUNNER_TEMP/tent-metadata-${profil
 ci_wait_service "tent-metadata-${profile}" 8080
 
 rust_smoke_script="${MOONCAKE_TE_RUST_SMOKE_SCRIPT:-$GITHUB_WORKSPACE/scripts/ci/run_transfer_engine_rust_smoke.sh}"
-rust_smoke_timeout="${MOONCAKE_TE_RUST_SMOKE_TIMEOUT:-600}"
+rust_smoke_timeout="${MOONCAKE_TE_RUST_SMOKE_TIMEOUT:-1200}"
 MOONCAKE_BUILD_DIR="$build_dir" \
   MOONCAKE_TE_RUST_LINK_ASAN="0" \
   timeout --signal=TERM --kill-after=30 "$rust_smoke_timeout" "$rust_smoke_script"

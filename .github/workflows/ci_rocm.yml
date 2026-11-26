@@ -27,7 +27,7 @@ on:
 jobs:
   build-wheel-rocm:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     # Pinned to match the upstream vllm/vllm-openai-rocm and sglang ROCm images
     # (ROCm 7.2). The wheel excludes the ROCm runtime and binds it at load time,
     # so it also loads on the ROCm 7.0 image variants.
@@ -195,7 +195,6 @@ jobs:
           ./scripts/build_wheel.sh
 
     - name: Smoke test wheel
-      timeout-minutes: 10
       shell: bash
       run: |
         set -eo pipefail

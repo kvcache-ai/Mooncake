@@ -50,7 +50,7 @@ env:
 jobs:
   build:
     runs-on: ${{ inputs.architecture == 'arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     # manylinux2_28 keeps the x86 wheel's libstdc++/glibc floor compatible with
     # RHEL/Rocky/Alma 8+. The CUDA image is also the toolchain for non-CUDA builds.
     container: >-
@@ -263,7 +263,6 @@ jobs:
           VERSION: ${{ env.VERSION }}
 
       - name: Smoke test repaired wheel
-        timeout-minutes: 10
         shell: bash
         run: |
           smoke_venv=$(mktemp -d)

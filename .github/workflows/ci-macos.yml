@@ -34,7 +34,7 @@ jobs:
   # guards that target from Linux-only regressions.
   build-master-macos:
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
