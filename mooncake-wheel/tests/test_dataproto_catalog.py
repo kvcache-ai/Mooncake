@@ -751,3 +751,243 @@ def test_catalog_ack_retry_does_not_republish_a_superseded_fragment() -> None:
     plan = catalog.resolve("train", ["a"])
     assert set(plan["handles"]) == {"manifest/put-2"}
     assert transfer.cleaned == ["manifest/put-1"]
+
+
+def test_register_current_handle_keeps_appended_fragment() -> None:
+    values = np.arange(4, dtype=np.float32).reshape(4, 1)
+    transfer = ShardTransfer(
+        {
+            "manifest/base-v2": {
+                "batch": {"value": values},
+                "non_tensor_batch": {},
+            }
+        }
+    )
+    catalog, client = catalog_client(transfer)
+    keys = [f"k{i}" for i in range(4)]
+    base = handle("base", ["value"], batch_size=4, partition="train")
+    client.register("train", keys, base)
+    appended = copy.deepcopy(base)
+    appended["stage_refs"]["rollout"]["manifest_key"] = "manifest/base-v2"
+    catalog.publish_append(
+        "append-op",
+        "manifest/base",
+        "train",
+        keys,
+        previous_handle=base,
+        handle=appended,
+    )
+    catalog.ack_publication("append-op")
+    current = catalog.resolve("train", keys)["handles"]["manifest/base"]
+    for overwrite in (False, True):
+        client.register("train", keys, current, overwrite=overwrite)
+    assert transfer.cleaned == []
+    result = client.read("train", keys, ["value"])
+    np.testing.assert_array_equal(result["batch"]["value"], values)
+    assert set(catalog.resolve("train", keys)["handles"]) == {"manifest/base"}
+
+
+class _OneSlotTransfer(ShardTransfer):
+    def __init__(self, fragments: dict[str, dict]) -> None:
+        super().__init__(fragments)
+        self.inflight = 0
+        self.max_inflight = 0
+
+    def get_dataproto(self, ref, *, fields, rows):
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        if self.inflight > 1:
+            raise RuntimeError("buffer pool blocked")
+        return super().get_dataproto(ref, fields=fields, rows=rows)
+
+    def release_result(self, _part) -> None:
+        self.inflight -= 1
+
+
+def test_read_releases_each_run_before_the_next() -> None:
+    values = np.arange(4, dtype=np.float32).reshape(4, 1)
+    transfer = _OneSlotTransfer(sharded_fragments(values, 2))
+    _catalog, client = catalog_client(transfer)
+    keys = [f"k{i}" for i in range(4)]
+    client.register("train", keys[:2], handle("s0", ["score"]))
+    client.register("train", keys[2:], handle("s1", ["score"]))
+    result = client.read("train", keys, ["score"])
+    np.testing.assert_array_equal(result["batch"]["score"], values)
+    assert transfer.max_inflight == 1
+    assert transfer.inflight == 0
+
+
+class _AliasTransfer:
+    def __init__(self) -> None:
+        self.bases: list[np.ndarray] = []
+        self.cleaned: list[str] = []
+
+    def get_dataproto(self, ref, *, fields, rows):
+        shard = int(ref["stage_refs"]["rollout"]["manifest_key"].rsplit("s", 1)[-1])
+        base = np.arange(
+            shard * 2, shard * 2 + (rows.stop - rows.start), dtype=np.int32
+        )
+        self.bases.append(base)
+        payload = np.empty(len(base), dtype=object)
+        for index in range(len(base)):
+            payload[index] = base[index : index + 1]
+        return {"batch": {"rows": payload}, "non_tensor_batch": {}, "meta_info": {}}
+
+    def release_result(self, _part) -> None:
+        for base in self.bases:
+            base.fill(-1)
+
+    def cleanup_dataproto(self, ref) -> None:
+        self.cleaned.append(next(iter(ref["stage_refs"].values()))["manifest_key"])
+
+
+def test_read_copies_ragged_rows_before_releasing_their_buffer() -> None:
+    transfer = _AliasTransfer()
+    _catalog, client = catalog_client(transfer)
+    keys = [f"k{i}" for i in range(4)]
+    client.register("train", keys[:2], handle("s0", ["rows"]))
+    client.register("train", keys[2:], handle("s1", ["rows"]))
+    result = client.read("train", keys, ["rows"])
+    rows = [int(row[0]) for row in result["batch"]["rows"]]
+    assert rows == [0, 1, 2, 3]
+    assert transfer.bases
+    assert all(int(base[0]) == -1 for base in transfer.bases)
+
+
+def test_confirmed_overlap_does_not_stay_in_the_retry_queue() -> None:
+    catalog = DataProtoCatalog()
+    failures = {"publish": 2}
+
+    def call(method, *args, **kwargs):
+        if method == "publish" and failures["publish"]:
+            failures["publish"] -= 1
+            raise RuntimeError("connection reset")
+        return getattr(catalog, method)(*args, **kwargs)
+
+    transfer = ShardTransfer({})
+    client = DataProtoCatalogTransfer(transfer, call)
+    other = DataProtoCatalogTransfer(
+        transfer,
+        lambda method, *args, **kwargs: getattr(catalog, method)(*args, **kwargs),
+    )
+    queued = handle("queued", ["score"], batch_size=1)
+    with pytest.raises(RuntimeError, match="connection reset"):
+        client.register("train", ["a"], queued)
+    assert len(client._pending_publications) == 1
+    other.register("train", ["a"], handle("owner", ["score"], batch_size=1))
+    client.register("train", ["b"], handle("other", ["score"], batch_size=1))
+    assert client._pending_publications == []
+    plan = catalog.resolve("train", ["a", "b"], ["score"])
+    assert [location[0] for location in plan["field_groups"][0]["locations"]] == [
+        "manifest/owner",
+        "manifest/other",
+    ]
+
+
+def test_lost_publish_response_replays_the_same_operation() -> None:
+    catalog = DataProtoCatalog()
+    lost = {"publish": True}
+
+    def call(method, *args, **kwargs):
+        result = getattr(catalog, method)(*args, **kwargs)
+        if method == "publish" and lost["publish"]:
+            lost["publish"] = False
+            raise ValueError("response decode failed")
+        return result
+
+    transfer = ShardTransfer(sharded_fragments(np.zeros((1, 1), np.float32), 1))
+    client = DataProtoCatalogTransfer(transfer, call)
+    client.register("train", ["a"], handle("s0", ["score"], batch_size=1))
+    assert client._pending_publications == []
+    assert set(catalog.resolve("train", ["a"])["handles"]) == {"manifest/s0"}
+
+
+def test_failed_read_pin_release_is_retried_on_close() -> None:
+    catalog = DataProtoCatalog()
+    failures = {"release_read": 1}
+
+    def call(method, *args, **kwargs):
+        if method == "release_read" and failures["release_read"]:
+            failures["release_read"] -= 1
+            raise RuntimeError("release rpc failed")
+        return getattr(catalog, method)(*args, **kwargs)
+
+    values = np.zeros((2, 1), np.float32)
+
+    class _PinTransfer(ShardTransfer):
+        def release_result(self, _result) -> None:
+            return None
+
+    transfer = _PinTransfer(sharded_fragments(values, 1))
+    client = DataProtoCatalogTransfer(transfer, call)
+    keys = ["k0", "k1"]
+    client.register("train", keys, handle("s0", ["score"]))
+    client.read("train", keys, ["score"])
+    assert catalog._read_pins
+    assert client._pending_read_tokens
+    client.close()
+    assert catalog._read_pins == {}
+    assert client._pending_read_tokens == []
+
+
+def test_put_omits_legacy_allow_overlap_keyword() -> None:
+    catalog = DataProtoCatalog()
+    seen: list[tuple[str, dict]] = []
+
+    def call(method, *args, **kwargs):
+        seen.append((method, kwargs))
+        return getattr(catalog, method)(*args, **kwargs)
+
+    transfer = FakeTransfer()
+    client = DataProtoCatalogTransfer(transfer, call)
+    data = type("FakeData", (list,), {"fields": ("value",)})([None])
+    client.put(data, partition="train", keys=["a"])
+    publish_kwargs = [kwargs for method, kwargs in seen if method == "publish"]
+    assert publish_kwargs
+    assert "allow_overlap" not in publish_kwargs[0]
+    client.register(
+        "train",
+        ["b"],
+        handle("external", ["value"], batch_size=1),
+        overwrite=False,
+    )
+    overlap_kwargs = [kwargs for method, kwargs in seen if method == "publish"][-1]
+    assert overlap_kwargs["allow_overlap"] is False
+
+
+def test_unmanaged_overwrite_cleans_the_replaced_managed_fragment() -> None:
+    values = np.zeros((2, 1), np.float32)
+    fragments = sharded_fragments(values, 1)
+    fragments["manifest/external"] = {
+        "batch": {"score": values.copy()},
+        "non_tensor_batch": {},
+    }
+    transfer = ShardTransfer(fragments)
+    _catalog, client = catalog_client(transfer)
+    keys = ["k0", "k1"]
+    client.register("train", keys, handle("s0", ["score"]))
+    client.register(
+        "train",
+        keys,
+        handle("external", ["score"]),
+        managed=False,
+        overwrite=True,
+    )
+    assert transfer.cleaned == ["manifest/s0"]
+    result = client.read("train", keys, ["score"])
+    np.testing.assert_array_equal(result["batch"]["score"], values)
+
+
+def test_concat_field_preserves_jagged_nested_layout() -> None:
+    torch = pytest.importorskip("torch")
+    from mooncake.dataproto_catalog import _concat_field
+
+    rows = [torch.arange(length) for length in (1, 3, 2, 4)]
+    left = torch.nested.as_nested_tensor(rows[:2], layout=torch.jagged)
+    right = torch.nested.as_nested_tensor(rows[2:], layout=torch.jagged)
+    merged = _concat_field([left, right])
+    assert merged.is_nested
+    assert merged.layout == torch.jagged
+    assert getattr(merged, "_ragged_idx", None) == getattr(left, "_ragged_idx", None)
+    for actual, expected in zip(merged.unbind(), rows):
+        assert torch.equal(actual, expected)
