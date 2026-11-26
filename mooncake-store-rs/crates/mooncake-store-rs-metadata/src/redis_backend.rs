@@ -2100,6 +2100,13 @@ impl MetadataBackend for RedisMetadataBackend {
                 .query_readonly("redis hget route payloads", |connection| {
                     pipeline.query(connection)
                 })?;
+            if payloads.len() != chunk.len() {
+                return Err(StoreError::Metadata(format!(
+                    "Redis route pipeline returned {} replies for {} keys",
+                    payloads.len(),
+                    chunk.len()
+                )));
+            }
             for payload in payloads {
                 routes.push(
                     payload
