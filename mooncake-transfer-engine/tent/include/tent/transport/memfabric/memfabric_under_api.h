@@ -1,7 +1,10 @@
 #ifndef MEMFABRIC_UNDER_API_H_
 #define MEMFABRIC_UNDER_API_H_
 
+#include <cstddef>
 #include <cstdint>
+#include <string>
+#include <vector>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -138,6 +141,66 @@ class MemFabricUnderApi {
     static smemTransBatchCopyFunc pSmemTransBatchCopy;
     static smemTransBatchStatusQueryFunc pSmemTransBatchStatusQuery;
     static smemSetLogLevelFunc pSmemSetLogLevel;
+};
+
+// HYBM GVA API: libmf_hybm_core.so.
+constexpr uint32_t kGvaMemoryTypeDevice = 1;
+constexpr uint32_t kGvaMemoryTypeHost = 2;
+// hybm_data_copy_direction is a bitmask: the source type occupies bit 2
+// (host 0x4) or bit 3 (device 0x8), and the destination type occupies bit 0
+// (host 0x0, device 0x1). For example, device-to-device is 0x9.
+constexpr uint32_t kGvaCopySourceHost = 0x4;
+constexpr uint32_t kGvaCopySourceDevice = 0x8;
+constexpr uint32_t kGvaCopyDestinationHost = 0x0;
+constexpr uint32_t kGvaCopyDestinationDevice = 0x1;
+
+struct MemFabricGvaConfig {
+    bool enabled = false;
+    std::string protocol = "device_sdma";
+    uint32_t rank_count = 0, rank = 0;
+    uint16_t device = 0, entity = 64;
+    uint64_t hbm_window = 0, dram_window = 0, hbm_size = 0, dram_size = 0;
+};
+struct MemFabricGvaCopy {
+    uint64_t source, destination;
+    size_t size;
+};
+// This adapter uses official HYBM headers in its implementation. No native ABI
+// structures or implementation-dependent handles appear in wire metadata.
+class MemFabricGvaApi {
+   public:
+    // Symbols are shared for process lifetime, including failed teardown.
+    // No CleanupLibrary: unloading could invalidate live entities or workers.
+    static bool LoadLibrary();
+    static int batchCopy(void*, const std::vector<MemFabricGvaCopy>&, uint32_t);
+    static int copy(void* entity, uint64_t source, uint64_t destination,
+                    size_t size, uint32_t direction);
+    static int wait(void* entity);
+    static int bind(uint16_t device);
+    static int initialize(uint16_t device);
+    static void uninitialize();
+    static void* create(const MemFabricGvaConfig& config);
+    static void destroy(void* entity);
+    static int reserve(void* entity);
+    static int unreserve(void* entity);
+    static void* allocate(void* entity, uint32_t memory_type, uint64_t size);
+    static int free(void* entity, void* slice);
+    static uint64_t address(void* entity, void* slice);
+    static uint64_t size(void* entity, void* slice);
+    static uint64_t base(void* entity, uint32_t memory_type);
+    static int translate(uint64_t address, uint32_t memory_type, uint64_t& out);
+    static int exportBlob(void* entity, void* slice,
+                          std::vector<uint8_t>& blob);
+    static int importBlob(void* entity, bool entity_info,
+                          const std::vector<uint8_t>& blob);
+    static int map(void* entity);
+    static int connect(void* entity, uint32_t rank);
+    static int reach(void* entity, uint32_t rank, uint32_t& out);
+    static int remove(void* entity, uint32_t rank);
+    static int unmap(void* entity, uint32_t rank);
+
+   private:
+    MemFabricGvaApi() = delete;
 };
 
 }  // namespace tent
