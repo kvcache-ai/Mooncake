@@ -928,6 +928,99 @@ TEST(AdaptiveCongestionControlSuccessBatchTest,
     EXPECT_EQ(snapshot(route).window_bytes, 64u);
 }
 
+TEST(AdaptiveCongestionControlSuccessBatchTest,
+     RefundedPermitsCanBeAdmittedAgain) {
+    DomainState device(testConfig()), route(testConfig());
+    const auto path = pathFor(device, route);
+    Permit first, second;
+    BatchItem items[] = {{&first, 8}, {&second, 12}};
+    Permit* permits[] = {&first, &second};
+    std::atomic<uint32_t> adapter_generation{1};
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        ASSERT_TRUE(tryAcquireBatch(path, items, 2));
+        uint64_t mask = 0;
+        ASSERT_TRUE(
+            completeSuccessBatch(permits, 2, mask, adapter_generation, 1));
+        EXPECT_EQ(mask, 3u);
+        EXPECT_FALSE(first.active());
+        EXPECT_FALSE(second.active());
+        EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+        EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
+    }
+}
+
+TEST(AdaptiveCongestionControlTest,
+     ScalarPublicationBalancesConcurrentCompletion) {
+    constexpr size_t kCount = 16384;
+    auto config = testConfig();
+    config.min_window_bytes = kCount;
+    config.max_window_bytes = kCount;
+    DomainState device(config), route(config);
+    const auto path = pathFor(device, route);
+    std::vector<Permit> permits(kCount);
+    std::atomic<bool> finished{false};
+    std::thread completion([&] {
+        for (auto& permit : permits) {
+            while (!permit.active() &&
+                   !finished.load(std::memory_order_acquire)) {
+            }
+            complete(permit, OutcomeClass::kDerivedFlush,
+                     FailureScope::kOperation);
+        }
+    });
+    size_t admitted = 0;
+    for (auto& permit : permits) {
+        if (tryAcquire(path, 1, permit) == Decision::kAllow) ++admitted;
+    }
+    finished.store(true, std::memory_order_release);
+    completion.join();
+    EXPECT_EQ(admitted, kCount);
+    EXPECT_EQ(snapshot(device).inflight_bytes, 0);
+    EXPECT_EQ(snapshot(route).inflight_bytes, 0);
+    // Reuse follows completion, rather than racing a later attempt against it.
+    ASSERT_EQ(tryAcquire(path, 1, permits[0]), Decision::kAllow);
+    EXPECT_TRUE(complete(permits[0], OutcomeClass::kDerivedFlush,
+                         FailureScope::kOperation));
+    EXPECT_EQ(snapshot(device).inflight_bytes, 0);
+    EXPECT_EQ(snapshot(route).inflight_bytes, 0);
+}
+
+TEST(AdaptiveCongestionControlBatchTest,
+     ActivePermitPublishesReservationBeforeConcurrentCompletion) {
+    // Exercise the public core contract, independently of adapter lifetimes.
+    // A large group widens the claim-to-publication interval without a hook.
+    constexpr size_t kCount = 65536;
+    auto config = testConfig();
+    config.min_window_bytes = kCount;
+    config.max_window_bytes = kCount;
+    DomainState device(config), route(config);
+    std::vector<Permit> permits(kCount);
+    std::vector<BatchItem> items;
+    items.reserve(kCount);
+    for (auto& permit : permits) items.push_back({&permit, 1});
+    std::atomic<bool> finished{false};
+    std::atomic<bool> observing{false};
+    std::thread completion([&] {
+        observing.store(true, std::memory_order_release);
+        while (!permits[0].active() &&
+               !finished.load(std::memory_order_acquire)) {
+        }
+        complete(permits[0], OutcomeClass::kDerivedFlush,
+                 FailureScope::kOperation);
+    });
+    while (!observing.load(std::memory_order_acquire)) {
+    }
+    const bool admitted =
+        tryAcquireBatch(pathFor(device, route), items.data(), items.size());
+    finished.store(true, std::memory_order_release);
+    completion.join();
+    ASSERT_TRUE(admitted);
+    for (auto& permit : permits)
+        complete(permit, OutcomeClass::kDerivedFlush, FailureScope::kOperation);
+    EXPECT_EQ(snapshot(device).inflight_bytes, 0);
+    EXPECT_EQ(snapshot(route).inflight_bytes, 0);
+}
+
 TEST(AdaptiveCongestionControlBatchTest, FullFitKeepsPerPermitCompletion) {
     DomainState device(testConfig()), route(testConfig());
     Permit first, second;

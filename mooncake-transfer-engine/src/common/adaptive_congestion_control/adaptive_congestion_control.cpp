@@ -281,10 +281,10 @@ Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
         }
         return decision;
     };
-    bool expected = false;
-    if (!permit.active_.compare_exchange_strong(expected, true,
-                                                std::memory_order_acq_rel,
-                                                std::memory_order_relaxed)) {
+    auto expected = Permit::State::kFree;
+    if (!permit.state_.compare_exchange_strong(
+            expected, Permit::State::kClaiming, std::memory_order_acq_rel,
+            std::memory_order_relaxed)) {
         return reject(Decision::kDefer, AdmissionDomain::kNone,
                       AdmissionReason::kNone);
     }
@@ -292,7 +292,7 @@ Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
     const AcquireResult device =
         CoreAccess::acquireOne(path.device, path.device_generation, bytes);
     if (device.decision != Decision::kAllow) {
-        permit.active_.store(false, std::memory_order_release);
+        permit.state_.store(Permit::State::kFree, std::memory_order_release);
         return reject(device.decision, AdmissionDomain::kDevice, device.reason);
     }
 
@@ -302,7 +302,7 @@ Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
         if (device.reserved) {
             CoreAccess::releaseBytes(*path.device, bytes);
         }
-        permit.active_.store(false, std::memory_order_release);
+        permit.state_.store(Permit::State::kFree, std::memory_order_release);
         return reject(route.decision, AdmissionDomain::kRoute, route.reason);
     }
 
@@ -321,7 +321,7 @@ Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
         if (route.reserved) {
             CoreAccess::releaseBytes(*path.route, bytes);
         }
-        permit.active_.store(false, std::memory_order_release);
+        permit.state_.store(Permit::State::kFree, std::memory_order_release);
         return reject(Decision::kAvoid,
                       !device_current ? AdmissionDomain::kDevice
                                       : AdmissionDomain::kRoute,
@@ -335,6 +335,7 @@ Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
     permit.route_generation_ = path.route_generation;
     permit.device_reserved_ = device.reserved;
     permit.route_reserved_ = route.reserved;
+    permit.state_.store(Permit::State::kReserved, std::memory_order_release);
     return Decision::kAllow;
 }
 
@@ -356,13 +357,13 @@ bool tryAcquireBatch(const PathHandle& path, const BatchItem* items,
     size_t claimed = 0;
     const auto undo_claims = [&] {
         while (claimed != 0)
-            items[--claimed].permit->active_.store(false,
-                                                   std::memory_order_release);
+            items[--claimed].permit->state_.store(Permit::State::kFree,
+                                                  std::memory_order_release);
     };
     for (; claimed < count; ++claimed) {
-        bool expected = false;
-        if (!items[claimed].permit->active_.compare_exchange_strong(
-                expected, true, std::memory_order_acq_rel,
+        auto expected = Permit::State::kFree;
+        if (!items[claimed].permit->state_.compare_exchange_strong(
+                expected, Permit::State::kClaiming, std::memory_order_acq_rel,
                 std::memory_order_relaxed)) {
             undo_claims();
             return false;
@@ -404,12 +405,14 @@ bool tryAcquireBatch(const PathHandle& path, const BatchItem* items,
         permit.route_generation_ = path.route_generation;
         permit.device_reserved_ = true;
         permit.route_reserved_ = true;
+        permit.state_.store(Permit::State::kReserved,
+                            std::memory_order_release);
     }
     return true;
 }
 
 bool isCurrentGeneration(const Permit& permit) {
-    if (!permit.active_.load(std::memory_order_acquire)) return false;
+    if (!permit.active()) return false;
     if (permit.device_ == nullptr && permit.route_ == nullptr) return false;
     return (permit.device_ == nullptr ||
             permit.device_generation_ == generation(*permit.device_)) &&
@@ -418,10 +421,10 @@ bool isCurrentGeneration(const Permit& permit) {
 }
 
 bool complete(Permit& permit, OutcomeClass outcome, FailureScope scope) {
-    bool expected = true;
-    if (!permit.active_.compare_exchange_strong(expected, false,
-                                                std::memory_order_acq_rel,
-                                                std::memory_order_relaxed)) {
+    auto expected = Permit::State::kReserved;
+    if (!permit.state_.compare_exchange_strong(
+            expected, Permit::State::kClaiming, std::memory_order_acq_rel,
+            std::memory_order_relaxed)) {
         return false;
     }
 
@@ -433,6 +436,7 @@ bool complete(Permit& permit, OutcomeClass outcome, FailureScope scope) {
         CoreAccess::releaseBytes(*permit.device_, permit.bytes_);
     if (permit.route_reserved_)
         CoreAccess::releaseBytes(*permit.route_, permit.bytes_);
+    permit.state_.store(Permit::State::kFree, std::memory_order_release);
     return true;
 }
 
@@ -479,10 +483,10 @@ bool completeSuccessBatch(Permit* const* permits, size_t count,
                     expected_adapter_generation
                 ? OutcomeClass::kSuccess
                 : OutcomeClass::kDerivedFlush;
-        bool expected = true;
-        if (!permit.active_.compare_exchange_strong(expected, false,
-                                                    std::memory_order_acq_rel,
-                                                    std::memory_order_relaxed))
+        auto expected = Permit::State::kReserved;
+        if (!permit.state_.compare_exchange_strong(
+                expected, Permit::State::kClaiming, std::memory_order_acq_rel,
+                std::memory_order_relaxed))
             continue;
         CoreAccess::recordOutcome(device, permit.device_generation_, outcome,
                                   FailureScope::kOperation, false);
@@ -495,6 +499,10 @@ bool completeSuccessBatch(Permit* const* permits, size_t count,
         CoreAccess::releaseBytes(*device, total);
         CoreAccess::releaseBytes(*route, total);
     }
+    for (size_t i = 0; i < count; ++i)
+        if (completed_mask & (uint64_t{1} << i))
+            permits[i]->state_.store(Permit::State::kFree,
+                                     std::memory_order_release);
     return true;
 }
 
@@ -508,8 +516,8 @@ Permit& Permit::operator=(Permit&& other) noexcept {
 }
 
 void Permit::moveFrom(Permit& other) noexcept {
-    const bool active =
-        other.active_.exchange(false, std::memory_order_acq_rel);
+    const auto state =
+        other.state_.exchange(State::kFree, std::memory_order_acq_rel);
     device_ = other.device_;
     route_ = other.route_;
     bytes_ = other.bytes_;
@@ -517,7 +525,7 @@ void Permit::moveFrom(Permit& other) noexcept {
     route_generation_ = other.route_generation_;
     device_reserved_ = other.device_reserved_;
     route_reserved_ = other.route_reserved_;
-    active_.store(active, std::memory_order_release);
+    state_.store(state, std::memory_order_release);
 
     other.device_ = nullptr;
     other.route_ = nullptr;

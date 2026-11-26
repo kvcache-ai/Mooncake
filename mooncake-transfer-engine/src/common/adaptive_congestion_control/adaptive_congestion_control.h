@@ -147,6 +147,9 @@ struct PathHandle {
     uint32_t route_generation = 0;
 };
 
+// Admission may overlap completion: only a fully published reservation can be
+// completed. Moving or reusing a permit requires external lifecycle sequencing;
+// an old completion must not overlap admission for a later attempt.
 class Permit {
    public:
     Permit() = default;
@@ -156,7 +159,9 @@ class Permit {
     Permit(Permit&& other) noexcept;
     Permit& operator=(Permit&& other) noexcept;
 
-    bool active() const { return active_.load(std::memory_order_acquire); }
+    bool active() const {
+        return state_.load(std::memory_order_acquire) == State::kReserved;
+    }
 
    private:
     friend Decision tryAcquire(const PathHandle&, uint64_t, Permit&,
@@ -167,7 +172,9 @@ class Permit {
                                      const std::atomic<uint32_t>&, uint32_t);
     friend bool isCurrentGeneration(const Permit&);
 
-    std::atomic<bool> active_{false};
+    // Claiming excludes both admission initialization and completion refunds.
+    enum class State : uint8_t { kFree, kClaiming, kReserved };
+    std::atomic<State> state_{State::kFree};
     DomainState* device_ = nullptr;
     DomainState* route_ = nullptr;
     uint64_t bytes_ = 0;
