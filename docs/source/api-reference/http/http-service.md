@@ -1084,8 +1084,10 @@ The master stops naming this store as the owner of the keys it offloaded, so a
 reader gets a clean miss instead of a peer that is about to disappear. Without
 this, a `LOCAL_DISK` segment leaves the master only when the client expires —
 one `client_ttl` after the store stops pinging — and reads that pick up the
-stale owner in that window block on the connect retries (see
-`MC_RPC_CONNECT_TIMEOUT_MS`) before missing.
+stale owner in that window may wait for connection attempts before missing.
+Set both `MC_OFFLOAD_RPC_CONNECT_RETRY_COUNT` and
+`MC_OFFLOAD_RPC_RECONNECT_WAIT_MS` to `0` to make one attempt without
+backoff. The attempt still uses `MC_RPC_CONNECT_TIMEOUT_MS`.
 
 The call then holds for `grace_period_seconds` before returning. Unlike a memory
 replica, which the NIC serves without help from the store process, a disk

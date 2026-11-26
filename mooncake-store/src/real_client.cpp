@@ -10111,23 +10111,17 @@ ClientRequester::ClientRequester() {
             coro_io::ib_socket_t::config_t{};
     }
 #endif
-    // Configure reasonable retry limits for SSD offload RPC connections.
-    // - connect_retry_count: Maximum connection retry attempts (default: 3)
-    // - reconnect_wait_time: Wait time between retries (default: 1000ms)
-    // - host_alive_detect_duration: Duration for background alive detection.
-    //   Set to 0 to disable infinite background reconnection attempts when
-    //   a Store node goes down. This prevents continuous "Connection refused"
-    //   logs. When Master cleans up stale local_disk replicas (via
-    //   CleanupStaleHandles), new requests won't route to dead nodes anyway.
-    pool_conf.connect_retry_count = 3;
-    pool_conf.reconnect_wait_time = std::chrono::milliseconds{1000};
+    // Keep the existing SSD offload retry policy unless explicitly overridden.
+    using Variables = OffloadRpcEnvironmentVariables;
+    pool_conf.connect_retry_count = Environ::ReadOr(
+        Variables::MC_OFFLOAD_RPC_CONNECT_RETRY_COUNT, uint32_t{3});
+    pool_conf.reconnect_wait_time = std::chrono::milliseconds{Environ::ReadOr(
+        Variables::MC_OFFLOAD_RPC_RECONNECT_WAIT_MS, uint32_t{1000})};
+    // Disable periodic reconnects after exhausting the retry budget.
     pool_conf.host_alive_detect_duration = std::chrono::milliseconds{0};
 
-    // Honour the same timeout overrides as the master pool. Without this the
-    // connect timeout stays at coro_rpc's built-in 30s, so a read that picks a
-    // peer which is gone blocks for connect_retry_count * 30s plus the waits
-    // between retries -- 91s with the defaults above -- and no configuration
-    // can shorten it. Defaults are unchanged when the variables are unset.
+    // Honour the same per-attempt and per-request timeout overrides as the
+    // master pool.
     detail::ApplyRpcTimeoutOverrides(pool_conf.client_config,
                                      RpcTimeoutConfig::FromEnvironment());
 
