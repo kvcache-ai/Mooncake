@@ -119,7 +119,10 @@ jobs:
               exit 1
               ;;
           esac
-          cmake_args="$cmake_args -DENABLE_KV_EVENTS=ON -DWITH_CONDUCTOR=ON"
+          cmake_args="$cmake_args -DBUILD_BENCHMARK=OFF -DENABLE_KV_EVENTS=ON -DWITH_CONDUCTOR=ON"
+          if [ "$BUILD_VARIANT" != "non-cuda" ]; then
+            cmake_args="$cmake_args -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache"
+          fi
           # AWS EFA transport. It dlopens libfabric when protocol=efa is used,
           # so the wheel only needs the headers (fetched below) and still
           # imports on hosts without libfabric.

@@ -10,6 +10,9 @@ inputs:
   label-exclude:
     description: Optional CTest label regex to exclude
     default: ''
+  exclude-regex:
+    description: Optional CTest test-name regex to exclude
+    default: ''
 runs:
   using: composite
   steps:
@@ -18,4 +21,5 @@ runs:
         RESERVE_RPC_PORT: ${{ inputs.reserve-rpc-port }}
         JUNIT_REPORT: ${{ inputs.junit-report }}
         CTEST_LABEL_EXCLUDE: ${{ inputs.label-exclude }}
+        CTEST_EXCLUDE_REGEX: ${{ inputs.exclude-regex }}
       run: bash "$GITHUB_ACTION_PATH/run.sh"

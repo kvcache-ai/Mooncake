@@ -29,6 +29,7 @@ class RunCTestTest(unittest.TestCase):
         }
         # An inherited workflow setting must not affect the unset-value case.
         env.pop("CTEST_LABEL_EXCLUDE", None)
+        env.pop("CTEST_EXCLUDE_REGEX", None)
         env.update(overrides)
         return subprocess.run(
             [
@@ -129,6 +130,38 @@ source "$SCRIPT"
         result = self.run_suite(CTEST_STATUS="23", CTEST_LABEL_EXCLUDE="nvlink_gpu")
         self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
         self.assertIn("--label-exclude", self.recorded("ctest.args"))
+
+    def test_exclude_regex_coexists_with_label_exclude_and_junit(self):
+        regex = "^efa_(transport|c_api|gpu_loopback)_test$"
+        report = "build/test-results/ctest.xml"
+        result = self.run_suite(
+            JUNIT_REPORT=report,
+            CTEST_LABEL_EXCLUDE="^nvlink_gpu$",
+            CTEST_EXCLUDE_REGEX=regex,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.recorded("ctest.args")
+        self.assertEqual(args[args.index("--label-exclude") + 1], "^nvlink_gpu$")
+        self.assertEqual(args[args.index("--exclude-regex") + 1], regex)
+        self.assertEqual(
+            args[args.index("--output-junit") + 1], str(self.root / report)
+        )
+
+    def test_cost_data_seeded_only_when_absent(self):
+        cost_file = self.root / "build/Testing/Temporary/CTestCostData.txt"
+        result = self.run_suite()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(cost_file.is_file())
+        seeded = cost_file.read_text()
+        self.assertIn("pybind_client_test 1 390", seeded)
+        self.assertIn("master_service_ha_test 1 217", seeded)
+        self.assertTrue(seeded.rstrip().endswith("---"))
+
+        custom = "custom_test 1 42\n---\n"
+        cost_file.write_text(custom)
+        result = self.run_suite()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(cost_file.read_text(), custom)
 
 
 if __name__ == "__main__":

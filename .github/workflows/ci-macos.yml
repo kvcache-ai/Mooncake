@@ -6,7 +6,10 @@ on:
       - "main"
       - "release/**"
     paths: &macos-paths
-      - 'mooncake-*/**'
+      - 'mooncake-common/**'
+      - 'mooncake-transfer-engine/**'
+      - 'mooncake-store/**'
+      - 'mooncake-integration/**'
       - 'extern/**'
       - 'cmake/**'
       - 'CMakeLists.txt'
@@ -67,7 +70,8 @@ jobs:
         cmake -S . -B build -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_UNIT_TESTS=OFF \
-          -DBUILD_EXAMPLES=OFF
+          -DBUILD_EXAMPLES=OFF \
+          -DBUILD_BENCHMARK=OFF
       shell: bash
 
     - name: Build mooncake_master

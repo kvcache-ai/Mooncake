@@ -32,20 +32,198 @@ env:
   SCCACHE_GHA_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
 
 jobs:
-  engram-cpu-contracts:
-    name: Engram CPU contracts (Python ${{ matrix.python-version }})
+  fast-checks:
+    name: Fast lint, format, contract, and path checks
     runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.12']
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      src: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.src }}
+      tent: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.tent }}
+      store_rs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.store_rs }}
+      docs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.docs }}
     steps:
     - uses: actions/checkout@v4
       with:
+        fetch-depth: 0
         persist-credentials: false
 
-    - uses: actions/setup-python@v5
+    - uses: dorny/paths-filter@v3
+      if: github.event_name != 'workflow_dispatch'
+      id: filter
       with:
-        python-version: ${{ matrix.python-version }}
+        # PRs use their base branch; pushes compare against the previous push
+        # on this ref, including release branches.
+        base: ${{ github.event_name == 'push' && github.ref || '' }}
+        filters: |
+          src:
+            - 'mooncake-common/**'
+            - 'mooncake-conductor/**'
+            - 'mooncake-ep/**'
+            - 'mooncake-integration/**'
+            - 'mooncake-p2p-store/**'
+            - 'mooncake-pg/**'
+            - 'mooncake-reshard/**'
+            - 'mooncake-rl/**'
+            - 'mooncake-store/**'
+            - 'mooncake-transfer-engine/**'
+            - 'mooncake-wheel/**'
+            - 'extern/**'
+            - 'cmake/**'
+            - 'CMakeLists.txt'
+            - 'dependencies.sh'
+            - 'scripts/build_wheel.sh'
+            - 'scripts/test_installation.sh'
+            - 'scripts/run_standalone_store_e2e.sh'
+            - 'scripts/test_upsert_api.py'
+            - 'scripts/test_copy_move_api.py'
+            - 'scripts/test_drain_http_api.py'
+            - 'scripts/ci/check_wheel_typing.sh'
+            - 'scripts/ci/cmake_lld.cmake'
+            - 'scripts/ci/wheel_typing/**'
+            - 'scripts/ci/run_rpc_smoke.sh'
+            - 'scripts/ci/run_ssd_offload_smoke.sh'
+            - 'scripts/ci/run_store_api_smoke.sh'
+            - 'scripts/ci/services.sh'
+            - 'scripts/e2e/python/verify_rocm_wheel.py'
+            - 'scripts/e2e/python/verify_xpu_wheel.py'
+            - '.github/actions/**'
+            - '.github/workflows/ci.yml'
+            - '.github/workflows/_build-wheel.yaml'
+            - '.github/workflows/ci_rocm.yml'
+            - '.github/workflows/ci_xpu.yml'
+          tent:
+            - 'mooncake-transfer-engine/**'
+            - 'mooncake-store/src/transfer_task.cpp'
+            - 'mooncake-store/tests/transfer_task_test.cpp'
+            - 'mooncake-store/tests/CMakeLists.txt'
+            - 'mooncake-common/**'
+            - 'extern/**'
+            - 'cmake/**'
+            - 'CMakeLists.txt'
+            - 'dependencies.sh'
+            - 'scripts/ci/cmake_lld.cmake'
+            - 'scripts/ci/run_tent_cpu_profile.sh'
+            - 'scripts/ci/run_transfer_engine_rust_smoke.sh'
+            - 'scripts/ci/services.sh'
+            - '.github/actions/**'
+            - '.github/workflows/ci.yml'
+          store_rs:
+            - 'mooncake-store-rs/**'
+            - 'python/mooncake/store/__init__.py'
+            - 'python/mooncake/store/rs/**'
+            - 'python/tests/store/rs/**'
+            - 'mooncake-common/include/**'
+            - 'mooncake-common/FindYLT.cmake'
+            - 'mooncake-transfer-engine/include/**'
+            - 'mooncake-transfer-engine/tent/include/**'
+            - 'scripts/ci/cmake_lld.cmake'
+            - 'scripts/ci/run_store_rs_smoke.sh'
+            - 'CMakeLists.txt'
+            - 'dependencies.sh'
+            - '.github/workflows/ci.yml'
+          docs:
+            - 'docs/**'
+            - '.github/workflows/ci.yml'
+
+    - name: Spell Check Repo
+      uses: crate-ci/typos@v1.30.2
+
+    - name: Set up Python 3.10 and 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: |
+          3.10
+          3.12
+
+    - name: Install Python check and format tools
+      run: |
+        python -m pip install --disable-pip-version-check \
+          ruff==0.6.9 pyright==1.1.411 packaging pytest==8.3.5 pyyaml \
+          clang-format==20.1.8 numpy msgpack hypothesis==6.141.0
+        python3.10 -m pip install --disable-pip-version-check \
+          numpy pytest msgpack hypothesis==6.141.0
+      shell: bash
+
+    - name: Check code format
+      run: |
+        # Check script exists and is executable
+        if [[ ! -x ./scripts/code_format.sh ]]; then
+          echo "Error: code_format.sh not found or not executable"
+          exit 1
+        fi
+
+        # Determine base ref for comparison
+        if [ "${{ github.event_name }}" == "pull_request" ]; then
+          # For PRs: compare against the target branch
+          BASE_REF="origin/${{ github.base_ref }}"
+        elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          # Manual runs have no previous push SHA.
+          BASE_REF="origin/${{ github.event.repository.default_branch }}"
+        else
+          # For push events: use github.event.before to handle multi-commit pushes
+          BEFORE_SHA="${{ github.event.before }}"
+          if [ "${BEFORE_SHA}" == "0000000000000000000000000000000000000000" ]; then
+            # New branch push, compare against default branch
+            BASE_REF="origin/${{ github.event.repository.default_branch }}"
+          else
+            # Normal push (single or multiple commits)
+            BASE_REF="${BEFORE_SHA}"
+          fi
+        fi
+        echo "Comparing against: ${BASE_REF}"
+        ./scripts/code_format.sh --check --changed-lines --base "${BASE_REF}"
+      shell: bash
+
+    - name: Check changed Python files
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          base_ref="origin/${{ github.base_ref }}"
+        elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          base_ref="origin/${{ github.event.repository.default_branch }}"
+        elif [ "${{ github.event.before }}" = \
+               "0000000000000000000000000000000000000000" ]; then
+          base_ref="origin/${{ github.event.repository.default_branch }}"
+        elif [ -n "${{ github.event.before }}" ]; then
+          base_ref="${{ github.event.before }}"
+        else
+          base_ref="HEAD^"
+        fi
+
+        mapfile -d '' python_files < <(
+          git diff --name-only --diff-filter=ACMR -z "$base_ref"...HEAD -- \
+            '*.py' \
+            ':(exclude)extern/**' \
+            ':(exclude)FAST25-release/**'
+        )
+        if [ "${#python_files[@]}" -eq 0 ]; then
+          echo "No changed Python files to check."
+          exit 0
+        fi
+
+        ruff check "${python_files[@]}"
+        python scripts/ci/check_changed_python_format.py \
+          "$base_ref" "${python_files[@]}"
+      shell: bash
+
+    - name: Check canonical reshard contract types
+      run: bash scripts/check_reshard_types.sh
+      shell: bash
+
+    - name: Run focused release gate tests
+      run: python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
+      shell: bash
+
+    - name: Test CI service and smoke scripts
+      run: python -m unittest discover -s scripts/ci/tests -v
+      shell: bash
+
+    - name: Run focused shell regression tests
+      run: |
+        bash scripts/tone_tests/tests/test_common_cleanup.sh
+        python3 -m unittest discover -s scripts/tone_tests/tests -p 'test_*.py'
+      shell: bash
 
     - name: Run CPU table, facade and range-plan contracts without a native build
       env:
@@ -53,14 +231,17 @@ jobs:
         # merges into the package, such as mooncake._partial_read.
         PYTHONPATH: ${{ github.workspace }}/python:${{ github.workspace }}/mooncake-wheel
       run: |
-        python -m pip install --disable-pip-version-check numpy pytest msgpack hypothesis==6.141.0
-        python -m pytest -q scripts/test_engram_tables.py python/tests/store/test_facade.py python/tests/store/test_structured_ranges_properties.py
+        for py in python3.10 python3.12; do
+          echo "=== Running Engram CPU contracts with ${py} ==="
+          "${py}" -m pytest -q scripts/test_engram_tables.py python/tests/store/test_facade.py python/tests/store/test_structured_ranges_properties.py
+        done
+      shell: bash
 
   # Build the artifact tested below through the exact release wheel path. The
   # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
   build-wheel:
-    needs: [spell-check, clang-format, check-paths]
-    if: &run-ci-for-source-changes needs.check-paths.outputs.src == 'true'
+    needs: [fast-checks]
+    if: &run-ci-for-source-changes needs.fast-checks.outputs.src == 'true'
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       python-versions: '["3.10", "3.12"]'
@@ -75,9 +256,11 @@ jobs:
           - ubuntu-version: ubuntu-22.04
             python-version: '3.12'
             artifact: mooncake-wheel-ci-py312
+            torch-pip-extra-args: ''
           - ubuntu-version: ubuntu-24.04
             python-version: '3.10'
             artifact: mooncake-wheel-ci-py310
+            torch-pip-extra-args: '--index-url https://download.pytorch.org/whl/cpu'
     runs-on: ${{ matrix.ubuntu-version }}
     steps:
     - uses: actions/checkout@v4
@@ -104,17 +287,50 @@ jobs:
         fi
       shell: bash
 
-    - name: Free up disk space
-      uses: ./.github/actions/free-disk-space
-
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.24
       with:
         cuda: '12.8.1'
         linux-local-args: '["--toolkit"]'
         method: 'network'
+        sub-packages: '["nvcc"]'
+
+    - name: Configure CUDA stub and PG JIT headers
+      run: |
+        if [ "${{ matrix.ubuntu-version }}" = "ubuntu-22.04" ] && \
+           [ "${{ matrix.python-version }}" = "3.12" ]; then
+          # PyTorch's ATen/cuda/CUDAContext.h includes cuBLAS/cuSPARSE/cuSOLVER/cuRAND
+          # headers from /usr/local/cuda/include when JIT-compiling mooncake-pg.
+          sudo apt-get install -y --no-install-recommends \
+            libcublas-dev-12-8 \
+            libcusparse-dev-12-8 \
+            libcusolver-dev-12-8 \
+            libcurand-dev-12-8
+        fi
+
+        cuda_stub=""
+        for candidate in /usr/local/cuda/lib64/stubs/libcuda.so \
+                         /usr/local/cuda/targets/*/lib/stubs/libcuda.so; do
+          if [ -f "$candidate" ]; then
+            cuda_stub="$candidate"
+            break
+          fi
+        done
+        if [ -z "$cuda_stub" ]; then
+          echo "::error::CUDA driver stub libcuda.so not found"
+          exit 1
+        fi
+        stub_dir="$(dirname "$cuda_stub")"
+        if [ ! -e "$stub_dir/libcuda.so.1" ]; then
+          sudo ln -s "$(basename "$cuda_stub")" "$stub_dir/libcuda.so.1"
+        fi
+        echo "LD_LIBRARY_PATH=$stub_dir:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+        echo "LIBRARY_PATH=$stub_dir:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+      shell: bash
 
     - name: Run installation test script
+      env:
+        TORCH_PIP_EXTRA_ARGS: ${{ matrix.torch-pip-extra-args }}
       run: |
         bash scripts/test_installation.sh
       shell: bash
@@ -214,7 +430,7 @@ jobs:
 
   unit-tests:
     name: CTest unit tests (Python 3.12)
-    needs: [check-paths]
+    needs: [fast-checks]
     if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04
     env:
@@ -233,6 +449,11 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
+    - name: Cache Mooncake Store Rust Cargo artifacts
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: mooncake-store/rust
+
     - name: Install and start etcd
       uses: ./.github/actions/setup-etcd
 
@@ -250,13 +471,29 @@ jobs:
     - name: Install build utilities and dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y ninja-build
+        sudo apt-get install -y ninja-build lld
         sudo bash -x dependencies.sh -y
         echo "/usr/local/go/bin" >> "$GITHUB_PATH"
       shell: bash
 
     - name: Set up compiler cache
       uses: ./.github/actions/setup-sccache
+
+    # Every default wheel carries the EFA transport (USE_EFA=ON), but the EFA
+    # unit tests only build with USE_EFA=ON and BUILD_UNIT_TESTS=ON, which no
+    # wheel build sets. Fetch the oldest libfabric API the transport accepts
+    # (dlopen'ed at runtime) so EFA tests compile and non-hardware ones run here.
+    - name: Fetch libfabric headers
+      env:
+        LIBFABRIC_HEADERS_VERSION: "1.18.3"
+      run: |
+        dest="$RUNNER_TEMP/libfabric-headers"
+        mkdir -p "$dest"
+        curl --retry 3 --retry-delay 2 -fsSL \
+          "https://github.com/ofiwg/libfabric/archive/refs/tags/v${LIBFABRIC_HEADERS_VERSION}.tar.gz" |
+          tar xz -C "$dest" --strip-components=1 "libfabric-${LIBFABRIC_HEADERS_VERSION}/include/rdma"
+        test -f "$dest/include/rdma/fabric.h"
+      shell: bash
 
     - name: Configure project with unit tests
       run: |
@@ -268,12 +505,17 @@ jobs:
           -DUSE_REDIS=ON \
           -DUSE_CUDA=ON \
           -DUSE_MNNVL=ON \
+          -DUSE_EFA=ON \
+          -DLIBFABRIC_INCLUDE_DIR="$RUNNER_TEMP/libfabric-headers/include" \
           -DWITH_P2P_STORE=ON \
           -DWITH_CONDUCTOR=ON \
           -DSTORE_USE_ETCD=ON \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_UNIT_TESTS=ON \
+          -DBUILD_EXAMPLES=OFF \
           -DENABLE_DEBUG_SYMBOLS=OFF \
+          -DCMAKE_PROJECT_INCLUDE="$GITHUB_WORKSPACE/scripts/ci/cmake_lld.cmake" \
+          -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache \
           -DENABLE_SCCACHE=ON
       shell: bash
 
@@ -285,6 +527,11 @@ jobs:
         cmake --build build --parallel 2
         sudo -E cmake --install build
       shell: bash
+
+    - name: Run sccache stat for check
+      if: ${{ env.SCCACHE_PATH != '' }}
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
 
     - name: Run Mooncake Store Rust unit tests
       env:
@@ -305,6 +552,9 @@ jobs:
       with:
         junit-report: build/test-results/ctest.xml
         label-exclude: '^nvlink_gpu$'
+        # Exclude the three EFA tests that require real EFA hardware; the five
+        # hardware-free EFA tests still execute here and all EFA targets compile.
+        exclude-regex: '^efa_(transport|c_api|gpu_loopback)_test$'
 
     - name: Preserve CTest diagnostics
       if: ${{ always() && steps.ctest.outcome == 'failure' }}
@@ -316,245 +566,10 @@ jobs:
         failed-tests-log: build/Testing/Temporary/LastTestsFailed.log
         last-test-log: build/Testing/Temporary/LastTest.log
 
-  build-flags:
-    needs: [check-paths]
-    if: *run-ci-for-source-changes
-    runs-on: ubuntu-22.04
-    env:
-      CI: "true"
-      SCCACHE_GHA_ENABLED: "true"
-      PIP_NO_CACHE_DIR: "1"
-      CMAKE_RELWITHDEBINFO_FLAGS: "-O2 -DNDEBUG"
-
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-
-    - name: Free up disk space
-      uses: ./.github/actions/free-disk-space
-
-    - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.24
-      with:
-        cuda: '12.8.1'
-        linux-local-args: '["--toolkit"]'
-        method: 'network'
-        sub-packages: '["nvcc", "nvrtc-dev"]'
-        non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev", "libcusolver-dev"]'
-
-    - name: Set up compiler cache
-      uses: ./.github/actions/setup-sccache
-
-    - name: Install dependencies
-      run: |
-        sudo apt update -y
-        sudo apt install -y ninja-build
-        sudo bash -x dependencies.sh -y
-        df -h
-      shell: bash
-
-    - name: Build transfer engine only
-      run: |
-        cd mooncake-transfer-engine
-        mkdir build
-        cd build
-        export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        cmake -G Ninja .. \
-          -DUSE_ETCD=OFF \
-          -DUSE_CXL=ON \
-          -DUSE_REDIS=ON \
-          -DUSE_HTTP=ON \
-          -DWITH_METRICS=ON \
-          -DBUILD_UNIT_TESTS=ON \
-          -DBUILD_EXAMPLES=ON \
-          -DENABLE_SCCACHE=ON \
-          -DUSE_CUDA=OFF \
-          -DUSE_MNNVL=OFF \
-          -DUSE_UB=OFF \
-          -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
-          "-DCMAKE_C_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
-          "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
-          -DENABLE_DEBUG_SYMBOLS=OFF
-        cmake --build .
-        sudo cmake --install .
-        df -h
-        cd ..
-        rm -rf build
-        df -h
-      shell: bash
-
-  spell-check:
-    name: Spell Check with Typos
-    runs-on: ubuntu-22.04
-    steps:
-    - name: Checkout Actions Repository
-      uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-    - name: Spell Check Repo
-      uses: crate-ci/typos@v1.30.2
-
-  reshard-type-check:
-    name: Check reshard manifest types
-    runs-on: ubuntu-22.04
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-
-    - name: Check canonical reshard contract types
-      run: |
-        python -m pip install --disable-pip-version-check pyright==1.1.411
-        bash scripts/check_reshard_types.sh
-      shell: bash
-
-  ci-script-tests:
-    name: Test CI scripts
-    runs-on: ubuntu-22.04
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-
-    - name: Run focused release gate tests
-      run: |
-        python -m pip install --disable-pip-version-check \
-          packaging pytest==8.3.5 pyyaml
-        python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
-      shell: bash
-
-    - name: Test CI service and smoke scripts
-      run: python -m unittest discover -s scripts/ci/tests -v
-
-  tone-script-tests:
-    name: Test external CI lifecycle helpers
-    runs-on: ubuntu-22.04
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Run focused shell regression tests
-      run: |
-        bash scripts/tone_tests/tests/test_common_cleanup.sh
-        python3 -m unittest discover -s scripts/tone_tests/tests -p 'test_*.py'
-      shell: bash
-
-  clang-format:
-    name: Check code format
-    runs-on: ubuntu-22.04
-    steps:
-    - name: Checkout Actions Repository
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0  # Need full history for branch comparison
-        persist-credentials: false
-
-    - name: Install clang-format 20
-      run: |
-        wget https://apt.llvm.org/llvm.sh
-        chmod +x llvm.sh
-        sudo ./llvm.sh 20
-        sudo apt-get install -y clang-format-20
-
-    - name: Check code format
-      run: |
-        # Check script exists and is executable
-        if [[ ! -x ./scripts/code_format.sh ]]; then
-          echo "Error: code_format.sh not found or not executable"
-          exit 1
-        fi
-
-        # Determine base ref for comparison
-        if [ "${{ github.event_name }}" == "pull_request" ]; then
-          # For PRs: compare against the target branch
-          BASE_REF="origin/${{ github.base_ref }}"
-        elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-          # Manual runs have no previous push SHA.
-          BASE_REF="origin/${{ github.event.repository.default_branch }}"
-        else
-          # For push events: use github.event.before to handle multi-commit pushes
-          BEFORE_SHA="${{ github.event.before }}"
-          if [ "${BEFORE_SHA}" == "0000000000000000000000000000000000000000" ]; then
-            # New branch push, compare against default branch
-            BASE_REF="origin/${{ github.event.repository.default_branch }}"
-          else
-            # Normal push (single or multiple commits)
-            BASE_REF="${BEFORE_SHA}"
-          fi
-        fi
-        echo "Comparing against: ${BASE_REF}"
-        ./scripts/code_format.sh --check --changed-lines --base "${BASE_REF}"
-      shell: bash
-
-  python-lint:
-    name: Check Python with Ruff
-    runs-on: ubuntu-22.04
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        persist-credentials: false
-
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-
-    - name: Install Ruff
-      run: python -m pip install --disable-pip-version-check ruff==0.6.9
-
-    - name: Check changed Python files
-      run: |
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          base_ref="origin/${{ github.base_ref }}"
-        elif [ "${{ github.event.before }}" = \
-               "0000000000000000000000000000000000000000" ]; then
-          base_ref="origin/${{ github.event.repository.default_branch }}"
-        elif [ -n "${{ github.event.before }}" ]; then
-          base_ref="${{ github.event.before }}"
-        else
-          base_ref="HEAD^"
-        fi
-
-        mapfile -d '' python_files < <(
-          git diff --name-only --diff-filter=ACMR -z "$base_ref"...HEAD -- \
-            '*.py' \
-            ':(exclude)extern/**' \
-            ':(exclude)FAST25-release/**'
-        )
-        if [ "${#python_files[@]}" -eq 0 ]; then
-          echo "No changed Python files to check."
-          exit 0
-        fi
-
-        ruff check "${python_files[@]}"
-        python scripts/ci/check_changed_python_format.py \
-          "$base_ref" "${python_files[@]}"
-      shell: bash
-
-
   docs-check:
     name: Check Sphinx docs build
-    needs: check-paths
-    if: needs.check-paths.outputs.docs == 'true'
+    needs: [fast-checks]
+    if: needs.fast-checks.outputs.docs == 'true'
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -575,71 +590,8 @@ jobs:
       working-directory: docs
       run: make html SPHINXOPTS=-W
 
-  check-paths:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      src: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.src }}
-      tent: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.tent }}
-      store_rs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.store_rs }}
-      docs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.docs }}
-    steps:
-      - uses: actions/checkout@v4
-        if: github.event_name != 'workflow_dispatch'
-        with:
-          fetch-depth: 2
-          persist-credentials: false
-      - uses: dorny/paths-filter@v3
-        if: github.event_name != 'workflow_dispatch'
-        id: filter
-        with:
-          # PRs use their base branch; pushes compare against the previous push
-          # on this ref, including release branches.
-          base: ${{ github.event_name == 'push' && github.ref || '' }}
-          filters: |
-            src:
-              - 'mooncake-*/**'
-              - 'extern/**'
-              - 'cmake/**'
-              - 'CMakeLists.txt'
-              - 'dependencies.sh'
-              - 'scripts/**'
-              - '.github/actions/**'
-              - '.github/workflows/**'
-            tent:
-              - 'mooncake-transfer-engine/**'
-              - 'mooncake-store/src/transfer_task.cpp'
-              - 'mooncake-store/tests/transfer_task_test.cpp'
-              - 'mooncake-store/tests/CMakeLists.txt'
-              - 'mooncake-common/**'
-              - 'extern/**'
-              - 'cmake/**'
-              - 'CMakeLists.txt'
-              - 'dependencies.sh'
-              - 'scripts/ci/run_transfer_engine_rust_smoke.sh'
-              - '.github/actions/**'
-              - '.github/workflows/ci.yml'
-            store_rs:
-              - 'mooncake-store-rs/**'
-              - 'python/mooncake/store/__init__.py'
-              - 'python/mooncake/store/rs/**'
-              - 'python/tests/store/rs/**'
-              - 'mooncake-common/include/**'
-              - 'mooncake-common/FindYLT.cmake'
-              - 'mooncake-transfer-engine/include/**'
-              - 'mooncake-transfer-engine/tent/include/**'
-              - 'scripts/ci/run_store_rs_smoke.sh'
-              - 'CMakeLists.txt'
-              - 'dependencies.sh'
-              - '.github/workflows/ci.yml'
-            docs:
-              - 'docs/**'
-              - '.github/workflows/ci.yml'
-
   build-wheel-cu13:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [fast-checks]
     if: *run-ci-for-source-changes
     uses: ./.github/workflows/_build-wheel.yaml
     with:
@@ -656,7 +608,7 @@ jobs:
   # arm64 default wheels use a different transport set (USE_MNNVL) than
   # x86_64 (USE_INTRA_NVLINK), so build one here instead of only at release.
   build-wheel-cu13-arm64:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [fast-checks]
     if: *run-ci-for-source-changes
     uses: ./.github/workflows/_build-wheel.yaml
     with:
@@ -666,154 +618,39 @@ jobs:
       artifact-prefix: mooncake-wheel-cu130-arm64
       version-override: 0.0.0.dev0
 
-  # Every default wheel carries the EFA transport (USE_EFA=ON), but the EFA
-  # unit tests only build with USE_EFA=ON and BUILD_UNIT_TESTS=ON, which no
-  # wheel build sets. Build them here so a break shows up in PR CI instead of
-  # at the release tag (#5260), and run the ones that need no EFA hardware.
-  efa-unit-tests:
-    name: EFA unit tests (build, no-hardware run)
-    needs: [check-paths]
-    if: *run-ci-for-source-changes
-    runs-on: ubuntu-22.04
-    env:
-      CI: "true"
-      SCCACHE_GHA_ENABLED: "true"
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-
-    - name: Free up disk space
-      uses: ./.github/actions/free-disk-space
-
-    - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.24
-      with:
-        cuda: '12.8.1'
-        linux-local-args: '["--toolkit"]'
-        method: 'network'
-        sub-packages: '["nvcc"]'
-
-    - name: Install build utilities and dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y ninja-build
-        sudo bash -x dependencies.sh -y
-        echo "/usr/local/go/bin" >> "$GITHUB_PATH"
-      shell: bash
-
-    - name: Set up compiler cache
-      uses: ./.github/actions/setup-sccache
-
-    - name: Fetch libfabric headers
-      # Same pin as the wheel build: the oldest libfabric API the transport
-      # accepts. Only headers are needed; libfabric is dlopen'ed at runtime.
-      env:
-        LIBFABRIC_HEADERS_VERSION: "1.18.3"
-      run: |
-        dest="$RUNNER_TEMP/libfabric-headers"
-        mkdir -p "$dest"
-        curl --retry 3 --retry-delay 2 -fsSL \
-          "https://github.com/ofiwg/libfabric/archive/refs/tags/v${LIBFABRIC_HEADERS_VERSION}.tar.gz" |
-          tar xz -C "$dest" --strip-components=1 "libfabric-${LIBFABRIC_HEADERS_VERSION}/include/rdma"
-        test -f "$dest/include/rdma/fabric.h"
-      shell: bash
-
-    - name: Build the EFA unit tests
-      run: |
-        cmake -S . -B build -G Ninja \
-          -DUSE_EFA=ON -DLIBFABRIC_INCLUDE_DIR="$RUNNER_TEMP/libfabric-headers/include" \
-          -DUSE_CUDA=ON -DUSE_HTTP=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
-          -DBUILD_UNIT_TESTS=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_SCCACHE=ON
-        targets=$(cmake --build build --target help | sed -n 's/^\(efa_[a-z_]*test\):.*/\1/p' | sort -u)
-        test -n "$targets"
-        echo "EFA test targets: $targets"
-        cmake --build build --parallel 128 --target $targets
-      shell: bash
-
-    - name: Configure CUDA driver runtime
-      # The runner has no NVIDIA driver; expose the stub libcuda the tests load.
-      uses: ./.github/actions/setup-cuda-runtime
-
-    - name: Run the EFA unit tests that need no EFA hardware
-      # The rest need an EFA device; they are only compiled here.
-      run: |
-        cd build
-        ctest --output-on-failure --timeout 300 --no-tests=error \
-          -R '^efa_(endpoint_handshake|select_device|discovery|stale_segment_desc|remote_accessible)_test$'
-      shell: bash
-
   build-wheel-rocm:
-    needs: [spell-check, clang-format, check-paths]
-    if: needs.check-paths.outputs.src == 'true'
+    needs: [fast-checks]
+    if: *run-ci-for-source-changes
     uses: ./.github/workflows/ci_rocm.yml
+    with:
+      # PR CI validates ROCm C++/HIP compilation, wheel repair, and smoke
+      # import once on Python 3.12; e2e-ci.yml and nightly.yml build 3.10 & 3.12.
+      python_versions: '["3.12"]'
     secrets: inherit
 
   build-wheel-xpu:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [fast-checks]
     if: *run-ci-for-source-changes
     uses: ./.github/workflows/ci_xpu.yml
 
   tent-ci:
-    needs: [spell-check, clang-format, check-paths]
-    if: needs.check-paths.outputs.tent == 'true'
+    needs: [fast-checks]
+    if: needs.fast-checks.outputs.tent == 'true'
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
-      # The Store library and its tests are about 70% of a full build, and
-      # the unit-tests job already builds and runs them. Only cuda-off runs
-      # Store tests here, so it builds just the TE tree plus those two test
-      # executables; the other legs configure with WITH_STORE=OFF. An empty
-      # build_targets builds and installs everything that was configured.
+      # Balance runner fan-out and wall-clock time across three legs instead of
+      # six: cuda-on checks CUDA compilation, cpu-core runs build-flags +
+      # cuda-off + memfabric-mock, and cpu-variants runs cuda-off-metrics-on +
+      # ub-mock.
       matrix:
         include:
           - name: cuda-on
-            cmake_flags: >-
-              -DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs
-              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
             need_cuda: true
-            metrics_flags: ''
-            build_targets: ''
-          - name: cuda-off
-            cmake_flags: '-DUSE_CUDA=OFF -DUSE_EVENT_DRIVEN_COMPLETION=ON'
+          - name: cpu-core
             need_cuda: false
-            metrics_flags: ''
-            build_targets: >-
-              mooncake-transfer-engine/all
-              transfer_task_test standalone_client_test
-          - name: cuda-off-metrics-on
-            cmake_flags: '-DUSE_CUDA=OFF -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF'
+          - name: cpu-variants
             need_cuda: false
-            metrics_flags: '-DTENT_METRICS_ENABLED=ON'
-            build_targets: ''
-          # Exercise the native UB target with its injected mock adapter. A
-          # Debug build also catches ODR/link errors hidden by optimization.
-          # USE_UB_MOCK adds the test-only loopback URMA adapter for focused
-          # TENT and Store tests without UB hardware.
-          - name: ub-mock
-            cmake_flags: >-
-              -DUSE_CUDA=OFF -DUSE_UB=ON -DUSE_UB_MOCK=ON
-              -DCMAKE_BUILD_TYPE=Debug -DWITH_STORE_RUST=OFF
-            need_cuda: false
-            metrics_flags: ''
-            build_targets: >-
-              mooncake-transfer-engine/all
-              store_tent_ub_mock_test
-          # Compile against stub ACL headers and embed host-only ACL stubs in
-          # transfer_engine for Rust checks; no CANN, NPU, or libmf_smem is required.
-          - name: memfabric-mock
-            cmake_flags: >-
-              -DUSE_CUDA=OFF -DUSE_MEMFABRIC=ON
-              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
-              -DCMAKE_BUILD_TYPE=Debug
-            need_cuda: false
-            metrics_flags: ''
-            build_targets: tent_memfabric_transport_test transfer_engine
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -843,7 +680,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt update -y
-        sudo apt install -y ninja-build
+        sudo apt install -y ninja-build lld
         sudo bash -x dependencies.sh -y
         df -h
       shell: bash
@@ -851,128 +688,133 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
-    - name: Configure project with TENT
+    - name: Cache Transfer Engine Rust Cargo artifacts
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: mooncake-transfer-engine/rust
+        prefix-key: v0-rust-te-${{ matrix.name }}
+
+    - name: Configure project with TENT (cuda-on)
+      if: matrix.need_cuda
       run: |
         mkdir build-tent
         cd build-tent
-        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_DEBUG_SYMBOLS=OFF ${{ matrix.cmake_flags }} ${{ matrix.metrics_flags }}
+        cmake -G Ninja .. \
+          -DUSE_TENT=ON \
+          -DUSE_HTTP=ON \
+          -DENABLE_SCCACHE=ON \
+          -DBUILD_UNIT_TESTS=ON \
+          -DBUILD_EXAMPLES=ON \
+          -DBUILD_BENCHMARK=OFF \
+          -DCMAKE_PROJECT_INCLUDE="$GITHUB_WORKSPACE/scripts/ci/cmake_lld.cmake" \
+          -DENABLE_DEBUG_SYMBOLS=OFF \
+          -DUSE_CUDA=ON \
+          -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs \
+          -DWITH_STORE=OFF \
+          -DWITH_STORE_RUST=OFF
       shell: bash
 
-    - name: Build project with TENT
+    - name: Build project with TENT (cuda-on)
+      if: matrix.need_cuda
       run: |
-        if [ "${{ matrix.need_cuda }}" = "true" ]; then
-          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        fi
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-}
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}
         cd build-tent
-        if [ -n "${{ matrix.build_targets }}" ]; then
-          cmake --build . --target ${{ matrix.build_targets }}
-        else
-          cmake --build .
-          sudo cmake --install .
-        fi
+        cmake --build .
+        sudo cmake --install .
       shell: bash
 
     # Check the Transfer Engine Rust crate against the freshly built C++
-    # libraries. This is a compile/link check, so it is safe to run on every
-    # matrix leg (including the cuda-on leg, which only verifies that the
-    # USE_CUDA code paths compile).
+    # libraries on cuda-on (the CPU legs run the full smoke script per profile).
     - name: Check Transfer Engine Rust bindings, examples, and tests
+      if: matrix.need_cuda
       run: |
         if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
            [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
           sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
         fi
-        if [ "${{ matrix.need_cuda }}" = "true" ]; then
-          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        fi
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
         cd mooncake-transfer-engine/rust
         export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build-tent
         export MOONCAKE_TE_LIB_DIR=$GITHUB_WORKSPACE/build-tent/mooncake-transfer-engine/src
         export MOONCAKE_TE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-transfer-engine/include
         cargo test --lib
         cargo test --examples --tests --no-run
-        cargo clean
       shell: bash
 
-    - name: Test Store completion and engine reuse with TENT
-      if: matrix.name == 'cuda-off'
-      run: |
-        ctest --test-dir build-tent --output-on-failure --no-tests=error \
-          -R '^(transfer_task_tent_completion_test|standalone_client_tent_test)$'
-      shell: bash
-
-    - name: Test TENT notification handle ownership
-      if: matrix.name == 'cuda-off'
-      run: |
-        ctest --test-dir build-tent --output-on-failure --no-tests=error \
-          -R '^tent_compat_notify_test$'
-      shell: bash
-
-    - name: Test Store scatter shared-segment ownership with TENT
-      if: matrix.name == 'cuda-off'
-      run: |
-        ctest --test-dir build-tent --output-on-failure --no-tests=error \
-          -R '^transfer_task_tent_shared_segment_test$'
-      shell: bash
-
-    # The hugepage case skips itself when the runner grants no hugepages.
-    - name: Test Store over the TENT UB loopback adapter
-      if: matrix.name == 'ub-mock'
-      run: |
-        sudo sysctl -w vm.nr_hugepages=64 || true
-        ctest --test-dir build-tent --output-on-failure --no-tests=error \
-          -R '^store_tent_ub_mock_test$'
-      shell: bash
-
-    # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
-    # with USE_CUDA=ON tent's cuda_probe hits the CUDA stub library at
-    # runtime and drives some dispatch paths past the fake objects the
-    # unit tests rely on, causing false failures. cuda-on still validates
-    # that every #ifdef USE_CUDA branch compiles.
-    - name: Test (TENT)
-      id: ctest
+    - name: Install Python test dependencies
       if: '!matrix.need_cuda'
-      run: |
-        ctest_args=()
-        if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
-          # Only the MemFabric test executable is built in this test directory.
-          ctest_args=(-R '^tent_memfabric_transport_test$' --no-tests=error --timeout 120)
-        fi
-        cd build-tent
-        mkdir -p test-results
-        ctest --test-dir mooncake-transfer-engine/tent/tests -j \
-          --output-on-failure \
-          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml" \
-          "${ctest_args[@]}"
+      run: python3 -m pip install --disable-pip-version-check aiohttp
       shell: bash
 
-    - name: Preserve TENT CTest diagnostics
-      if: ${{ always() && steps.ctest.outcome == 'failure' }}
+    - name: Build standalone Transfer Engine flags check (build-flags)
+      if: matrix.name == 'cpu-core'
+      run: ./scripts/ci/run_tent_cpu_profile.sh build-flags
+      shell: bash
+
+    - name: Build & test TENT (cuda-off)
+      id: ctest_cuda_off
+      if: matrix.name == 'cpu-core'
+      run: ./scripts/ci/run_tent_cpu_profile.sh cuda-off
+      shell: bash
+
+    - name: Preserve TENT CTest diagnostics (cuda-off)
+      if: ${{ always() && matrix.name == 'cpu-core' && steps.ctest_cuda_off.outcome == 'failure' }}
       uses: ./.github/actions/ctest-diagnostics
       with:
-        summary-title: TENT CTest failure (${{ matrix.name }})
-        artifact-name: ctest-diagnostics-tent-${{ matrix.name }}
-        junit-report: build-tent/test-results/ctest.xml
-        failed-tests-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
-        last-test-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
+        summary-title: TENT CTest failure (cuda-off)
+        artifact-name: ctest-diagnostics-tent-cuda-off
+        junit-report: build-tent-cuda-off/test-results/ctest.xml
+        failed-tests-log: build-tent-cuda-off/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build-tent-cuda-off/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
 
-    - name: Start Metadata Server
-      if: '!matrix.need_cuda'
-      run: |
-        cd mooncake-transfer-engine/example/http-metadata-server-python
-        pip install aiohttp
-        python ./bootstrap_server.py &
-        sleep 2
+    - name: Build & test TENT (memfabric-mock)
+      id: ctest_memfabric
+      if: matrix.name == 'cpu-core'
+      run: ./scripts/ci/run_tent_cpu_profile.sh memfabric-mock
       shell: bash
 
-    - name: Run Transfer Engine Rust smoke test
-      if: '!matrix.need_cuda'
-      env:
-        MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build-tent
-        MOONCAKE_TE_RUST_LINK_ASAN: "0"
-      run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
+    - name: Preserve TENT CTest diagnostics (memfabric-mock)
+      if: ${{ always() && matrix.name == 'cpu-core' && steps.ctest_memfabric.outcome == 'failure' }}
+      uses: ./.github/actions/ctest-diagnostics
+      with:
+        summary-title: TENT CTest failure (memfabric-mock)
+        artifact-name: ctest-diagnostics-tent-memfabric-mock
+        junit-report: build-tent-memfabric-mock/test-results/ctest.xml
+        failed-tests-log: build-tent-memfabric-mock/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build-tent-memfabric-mock/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
+
+    - name: Build & test TENT (cuda-off-metrics-on)
+      id: ctest_metrics
+      if: matrix.name == 'cpu-variants'
+      run: ./scripts/ci/run_tent_cpu_profile.sh cuda-off-metrics-on
       shell: bash
+
+    - name: Preserve TENT CTest diagnostics (cuda-off-metrics-on)
+      if: ${{ always() && matrix.name == 'cpu-variants' && steps.ctest_metrics.outcome == 'failure' }}
+      uses: ./.github/actions/ctest-diagnostics
+      with:
+        summary-title: TENT CTest failure (cuda-off-metrics-on)
+        artifact-name: ctest-diagnostics-tent-cuda-off-metrics-on
+        junit-report: build-tent-cuda-off-metrics-on/test-results/ctest.xml
+        failed-tests-log: build-tent-cuda-off-metrics-on/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build-tent-cuda-off-metrics-on/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
+
+    - name: Build & test TENT (ub-mock)
+      id: ctest_ub
+      if: matrix.name == 'cpu-variants'
+      run: ./scripts/ci/run_tent_cpu_profile.sh ub-mock
+      shell: bash
+
+    - name: Preserve TENT CTest diagnostics (ub-mock)
+      if: ${{ always() && matrix.name == 'cpu-variants' && steps.ctest_ub.outcome == 'failure' }}
+      uses: ./.github/actions/ctest-diagnostics
+      with:
+        summary-title: TENT CTest failure (ub-mock)
+        artifact-name: ctest-diagnostics-tent-ub-mock
+        junit-report: build-tent-ub-mock/test-results/ctest.xml
+        failed-tests-log: build-tent-ub-mock/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build-tent-ub-mock/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
 
     - name: Run sccache stat for check
       if: ${{ env.SCCACHE_PATH != '' }}
@@ -981,8 +823,8 @@ jobs:
 
   store-rs-ci:
     name: Store-RS Classic TE smoke
-    needs: [spell-check, clang-format, check-paths]
-    if: needs.check-paths.outputs.store_rs == 'true'
+    needs: [fast-checks]
+    if: needs.fast-checks.outputs.store_rs == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     env:
@@ -1030,16 +872,13 @@ jobs:
           mooncake-store-rs -> ../build/store-rs-ci/mooncake-store-rs/cargo-python
           mooncake-store-rs -> ../build/store-rs-ci/mooncake-store-rs/cargo-tests
 
-    - name: Free up disk space
-      uses: ./.github/actions/free-disk-space
-
     - name: Set up compiler cache
       uses: ./.github/actions/setup-sccache
 
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y ninja-build redis-server redis-tools
+        sudo apt-get install -y ninja-build lld redis-server redis-tools
         sudo bash -x dependencies.sh -y
         python -m pip install --disable-pip-version-check numpy pybind11
       shell: bash
@@ -1060,8 +899,10 @@ jobs:
           -DUSE_REDIS=ON \
           -DUSE_CUDA=OFF \
           -DBUILD_EXAMPLES=OFF \
+          -DBUILD_BENCHMARK=OFF \
           -DBUILD_UNIT_TESTS=OFF \
           -DBUILD_SHARED_LIBS=ON \
+          -DCMAKE_PROJECT_INCLUDE="$GITHUB_WORKSPACE/scripts/ci/cmake_lld.cmake" \
           -DENABLE_SCCACHE=ON \
           -DCMAKE_BUILD_TYPE=Release
       shell: bash
@@ -1110,21 +951,13 @@ jobs:
     # required check for a PR head whose run was cancelled.
     if: ${{ (github.event_name != 'push' && always()) || !cancelled() }}
     needs:
-      - check-paths
-      - spell-check
-      - clang-format
-      - python-lint
+      - fast-checks
       - docs-check
-      - reshard-type-check
-      - ci-script-tests
-      - tone-script-tests
       - build-wheel
       - unit-tests
-      - build-flags
       - test-wheel-ubuntu
       - build-wheel-cu13
       - build-wheel-cu13-arm64
-      - efa-unit-tests
       - build-wheel-rocm
       - build-wheel-xpu
       - tent-ci
@@ -1136,29 +969,20 @@ jobs:
       - name: Check unconditional jobs
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-          PASSED: >-
-            ${{ needs.check-paths.result == 'success' &&
-                needs.spell-check.result == 'success' &&
-                needs.clang-format.result == 'success' &&
-                needs.python-lint.result == 'success' &&
-                needs.reshard-type-check.result == 'success' &&
-                needs.ci-script-tests.result == 'success' &&
-                needs.tone-script-tests.result == 'success' }}
+          PASSED: ${{ needs.fast-checks.result == 'success' }}
         run: |
           echo "$NEEDS_JSON"
           test "$PASSED" = true
 
       - name: Check source jobs
         env:
-          EXPECTED: ${{ needs.check-paths.outputs.src == 'true' && 'success' || 'skipped' }}
+          EXPECTED: ${{ needs.fast-checks.outputs.src == 'true' && 'success' || 'skipped' }}
           RESULTS: >-
             ${{ needs.build-wheel.result }}
             ${{ needs.unit-tests.result }}
-            ${{ needs.build-flags.result }}
             ${{ needs.test-wheel-ubuntu.result }}
             ${{ needs.build-wheel-cu13.result }}
             ${{ needs.build-wheel-cu13-arm64.result }}
-            ${{ needs.efa-unit-tests.result }}
             ${{ needs.build-wheel-rocm.result }}
             ${{ needs.build-wheel-xpu.result }}
         run: |
@@ -1168,18 +992,18 @@ jobs:
 
       - name: Check TENT jobs
         env:
-          EXPECTED: ${{ needs.check-paths.outputs.tent == 'true' && 'success' || 'skipped' }}
+          EXPECTED: ${{ needs.fast-checks.outputs.tent == 'true' && 'success' || 'skipped' }}
           RESULT: ${{ needs.tent-ci.result }}
         run: test "$RESULT" = "$EXPECTED"
 
       - name: Check Store-RS job
         env:
-          EXPECTED: ${{ needs.check-paths.outputs.store_rs == 'true' && 'success' || 'skipped' }}
+          EXPECTED: ${{ needs.fast-checks.outputs.store_rs == 'true' && 'success' || 'skipped' }}
           RESULT: ${{ needs.store-rs-ci.result }}
         run: test "$RESULT" = "$EXPECTED"
 
       - name: Check documentation job
         env:
-          EXPECTED: ${{ needs.check-paths.outputs.docs == 'true' && 'success' || 'skipped' }}
+          EXPECTED: ${{ needs.fast-checks.outputs.docs == 'true' && 'success' || 'skipped' }}
           RESULT: ${{ needs.docs-check.result }}
         run: test "$RESULT" = "$EXPECTED"

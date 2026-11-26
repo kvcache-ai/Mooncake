@@ -14,6 +14,8 @@ concurrency:
 
 jobs:
   label:
+    # Skip title/body-only edits; base-branch edits still recompute the diff size.
+    if: github.event.action != 'edited' || github.event.changes.base != null
     runs-on: ubuntu-latest
     steps:
       # Do not check out or execute code from the PR: this also runs for forks.

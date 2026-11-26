@@ -93,7 +93,7 @@ jobs:
         apt-get update -y
         apt-get install -y --no-install-recommends \
           curl build-essential sudo pkg-config \
-          ninja-build
+          ninja-build lld
         # hipify-perl is required by the CMake USE_HIP path.
         echo "/opt/rocm/bin" >> "$GITHUB_PATH"
 
@@ -138,7 +138,9 @@ jobs:
           -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DWITH_CONDUCTOR=ON \
           -DENABLE_MULTI_PROTOCOL=ON \
           -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON \
-          -DBUILD_UNIT_TESTS=OFF -DENABLE_SCCACHE=ON \
+          -DBUILD_UNIT_TESTS=OFF -DBUILD_BENCHMARK=OFF \
+          -DENABLE_DEBUG_SYMBOLS=OFF -DENABLE_SCCACHE=ON \
+          -DCMAKE_PROJECT_INCLUDE="$GITHUB_WORKSPACE/scripts/ci/cmake_lld.cmake" \
           -DCMAKE_BUILD_TYPE=Release \
           -DPython3_EXECUTABLE="${PYTHON_BIN}"
 
