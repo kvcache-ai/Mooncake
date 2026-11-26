@@ -47,6 +47,10 @@ class OpLogBatchStandbyReader {
     std::optional<DurablePrefix> GetLastAppliedDurablePrefix() const {
         return last_applied_durable_prefix_;
     }
+    // The last fully scanned batch, when the applier has applied exactly up
+    // to its last sequence. A restarted reader can resume from it with
+    // SetBaselineCursor instead of scanning from the first batch.
+    std::optional<DurablePrefix> GetResumeCursor() const;
 
    private:
     OpLogBatchStandbyPollResult PollBatches(size_t max_batches, uint64_t floor);

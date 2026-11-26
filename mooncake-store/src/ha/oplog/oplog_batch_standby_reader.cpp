@@ -49,6 +49,17 @@ ErrorCode OpLogBatchStandbyReader::SetBaselineCursor(
     return ErrorCode::OK;
 }
 
+std::optional<DurablePrefix> OpLogBatchStandbyReader::GetResumeCursor() const {
+    const uint64_t expected = applier_.GetExpectedSequenceId();
+    if (last_applied_batch_id_ == 0 || !last_scanned_batch_last_seq_ ||
+        *last_scanned_batch_last_seq_ == 0 || expected == 0 ||
+        expected - 1 != *last_scanned_batch_last_seq_) {
+        return std::nullopt;
+    }
+    return DurablePrefix{.batch_id = last_applied_batch_id_,
+                         .last_seq = *last_scanned_batch_last_seq_};
+}
+
 OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
     size_t max_batches) {
     OpLogBatchStandbyPollResult result;
