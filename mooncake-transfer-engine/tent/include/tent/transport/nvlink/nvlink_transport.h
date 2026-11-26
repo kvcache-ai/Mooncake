@@ -169,12 +169,14 @@ class NVLinkTransport : public Transport {
         std::unordered_map<uint64_t, std::shared_ptr<CudaSharedMemory>>>;
     VmmMap vmm_mappings_;
 
+    struct RegisteredSegment {
+        uint64_t alloc_size = 0;
+        std::string encoded_attr;
+        size_t ref_count = 0;
+    };
+
     mutable std::mutex register_mutex_;
-    // cudaMalloc base address -> serialized cudaIpcMemHandle_t for that
-    // segment. Multiple BufferDescs can sub-allocate within one cudaMalloc
-    // segment (torch caching allocator); every one of them must carry the
-    // segment's IPC handle or NVLink submission for that buffer fails.
-    std::unordered_map<uint64_t, std::string> registered_base_addrs_;
+    std::unordered_map<uint64_t, RegisteredSegment> registered_base_addrs_;
 };
 }  // namespace tent
 }  // namespace mooncake
