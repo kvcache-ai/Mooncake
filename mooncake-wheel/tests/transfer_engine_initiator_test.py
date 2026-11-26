@@ -505,6 +505,116 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
             0,
             f"transfer_submit_write to unknown peer returned {batch_id}",
         )
+        self.assertEqual(self.adaptor.transfer_check_status(0), -1)
+        self.assertEqual(self.adaptor.batch_transfer_check_status([0]), [-1])
+        self.assertEqual(self.adaptor.get_batch_transfer_status([0]), -1)
+
+    def test_async_batch_arrays_with_nonblocking_check_status(self):
+        """Test batch_transfer_async_{write,read}_arrays with transfer_check_status and batch_transfer_check_status."""
+        from array import array
+        import time
+
+        adaptor = self.adaptor
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        def wait_single(batch_id: int, label: str, timeout_s: float = 30.0) -> int:
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                rc = adaptor.transfer_check_status(batch_id)
+                if rc != 0:
+                    return rc
+                time.sleep(0.0005)
+            self.fail(f"Timed out waiting for {label} batch {batch_id}")
+
+        # Empty 0-descriptor batch should complete cleanly with status 1.
+        empty = array("Q")
+        empty_bid = adaptor.batch_transfer_async_write_arrays(
+            self.target_server_name, empty, empty, empty
+        )
+        self.assertNotEqual(empty_bid, 0)
+        self.assertEqual(wait_single(empty_bid, "empty write"), 1)
+
+        # Submit two multi-chunk array write batches and poll them together via
+        # vectorized batch_transfer_check_status.
+        chunks_per_batch = 16
+        chunk_size = 512
+        stride = 1024
+        expected = []
+        write_bids = []
+        for b in range(2):
+            src_addrs = array(
+                "Q",
+                [
+                    base_src_addr + (b * chunks_per_batch + i) * stride
+                    for i in range(chunks_per_batch)
+                ],
+            )
+            dst_addrs = array(
+                "Q",
+                [
+                    base_dst_addr + (b * chunks_per_batch + i) * stride
+                    for i in range(chunks_per_batch)
+                ],
+            )
+            lengths = array("Q", [chunk_size] * chunks_per_batch)
+            for i in range(chunks_per_batch):
+                payload = f"batch-{b}-item-{i:02d}-".encode("ascii") * 40
+                payload = payload[:chunk_size]
+                expected.append(payload)
+                self.assertEqual(
+                    adaptor.write_bytes_to_buffer(src_addrs[i], payload, chunk_size), 0
+                )
+            bid = adaptor.batch_transfer_async_write_arrays(
+                self.target_server_name, src_addrs, dst_addrs, lengths
+            )
+            self.assertNotEqual(bid, 0)
+            write_bids.append(bid)
+
+        pending = list(write_bids)
+        write_deadline = time.monotonic() + 30.0
+        while pending:
+            self.assertLess(
+                time.monotonic(),
+                write_deadline,
+                f"Timed out waiting for vectorized write batches {pending}",
+            )
+            statuses = adaptor.batch_transfer_check_status(pending)
+            self.assertEqual(len(statuses), len(pending))
+            still_pending = []
+            for bid, st in zip(pending, statuses):
+                if st == 0:
+                    still_pending.append(bid)
+                else:
+                    self.assertEqual(st, 1, f"write batch {bid} failed with {st}")
+            pending = still_pending
+            if pending:
+                time.sleep(0.0005)
+
+        # Read all chunks back in a single array batch and poll with transfer_check_status.
+        total_chunks = 2 * chunks_per_batch
+        read_base = base_src_addr + total_chunks * stride
+        read_addrs = array("Q", [read_base + i * stride for i in range(total_chunks)])
+        remote_addrs = array(
+            "Q", [base_dst_addr + i * stride for i in range(total_chunks)]
+        )
+        read_lengths = array("Q", [chunk_size] * total_chunks)
+        for addr in read_addrs:
+            self.assertEqual(
+                adaptor.write_bytes_to_buffer(addr, b"\x00" * chunk_size, chunk_size), 0
+            )
+
+        read_bid = adaptor.batch_transfer_async_read_arrays(
+            self.target_server_name, read_addrs, remote_addrs, read_lengths
+        )
+        self.assertNotEqual(read_bid, 0)
+        self.assertEqual(wait_single(read_bid, "array read"), 1)
+
+        for i, addr in enumerate(read_addrs):
+            self.assertEqual(
+                adaptor.read_bytes_from_buffer(addr, chunk_size), expected[i]
+            )
 
     def test_send_probe_reachable_peer(self):
         """send_probe against a registered, reachable peer returns 0."""

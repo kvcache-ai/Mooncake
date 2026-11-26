@@ -33,6 +33,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <thread>
 #include <utility>
 
@@ -94,6 +95,12 @@ class TransferEngineImplTestPeer {
         for (const auto& [name, transport] : transports) {
             engine.multi_transports_->transport_map_.emplace(name, transport);
         }
+    }
+
+    static void addTransport(TransferEngineImpl& engine,
+                             std::shared_ptr<Transport> transport) {
+        engine.multi_transports_->transport_map_.emplace("zz-failure-injection",
+                                                         std::move(transport));
     }
 
     static TransferEngineImpl& implementation(TransferEngine& engine) {
@@ -1471,6 +1478,241 @@ TEST_F(TransportTest, ReadEmptyFile) {
     close(fd);
 }
 
+template <typename Engine>
+Transport* installRegistrationReuseTcp(Engine& engine) {
+    testing::internal::CaptureStderr();
+    auto* transport = engine.installTransport("tcp", nullptr);
+    auto output = testing::internal::GetCapturedStderr();
+    std::istringstream lines(output);
+    for (std::string line; std::getline(lines, line);) {
+        if (!line.empty() && line.front() == 'E') {
+            EXPECT_NE(line.find("Local segment descriptor not found"),
+                      std::string::npos)
+                << line;
+        }
+    }
+    return transport;
+}
+
+class MemoryRegistrationReuseTest : public TransportTest {
+   protected:
+    void SetUp() override {
+        TransportTest::SetUp();
+        engine = std::make_unique<TransferEngine>(false);
+        ASSERT_EQ(engine->init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+        ASSERT_NE(installRegistrationReuseTcp(*engine), nullptr);
+        ASSERT_EQ(engine->enableMemoryRegistrationReuse(), 0);
+    }
+
+    void TearDown() override {
+        engine.reset();
+        TransportTest::TearDown();
+    }
+
+    size_t publishedBuffers() {
+        std::vector<SegmentBufferInfo> buffers;
+        EXPECT_EQ(engine->getSegmentBuffers(LOCAL_SEGMENT_ID, buffers), 0);
+        return buffers.size();
+    }
+
+    std::array<char, 512> allocation{};
+    std::unique_ptr<TransferEngine> engine;
+};
+
+TEST_F(MemoryRegistrationReuseTest,
+       StoreAndPdShareIdenticalAndContainedRegions) {
+    auto* base = allocation.data();
+    // Store requests local access; PD needs a published remote-accessible MR.
+    ASSERT_EQ(engine->registerLocalMemory(base, 256, "*", false, false), 0);
+    EXPECT_EQ(publishedBuffers(), 1u);
+    ASSERT_EQ(
+        engine->registerLocalMemoryBatch({{base, 256}, {base + 64, 64}}, "*"),
+        0);
+    EXPECT_EQ(publishedBuffers(), 1u);
+    ASSERT_EQ(engine->unregisterLocalMemoryBatch({base, base + 64}), 0);
+    EXPECT_TRUE(engine->checkOverlap(base, 256));
+    EXPECT_EQ(publishedBuffers(), 1u);
+    ASSERT_EQ(engine->unregisterLocalMemory(base), 0);
+    EXPECT_FALSE(engine->checkOverlap(base, 256));
+    EXPECT_EQ(publishedBuffers(), 0u);
+}
+
+TEST_F(MemoryRegistrationReuseTest, ParentReleaseKeepsChildAlive) {
+    auto* base = allocation.data();
+    ASSERT_EQ(engine->registerLocalMemory(base, 256), 0);
+    ASSERT_EQ(engine->registerLocalMemory(base + 64, 64), 0);
+    ASSERT_EQ(engine->unregisterLocalMemory(base), 0);
+    EXPECT_TRUE(engine->checkOverlap(base, 256));
+    EXPECT_EQ(engine->unregisterLocalMemory(base), ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_EQ(engine->unregisterLocalMemory(base + 65),
+              ERR_ADDRESS_NOT_REGISTERED);
+    ASSERT_EQ(engine->unregisterLocalMemory(base + 64), 0);
+    EXPECT_FALSE(engine->checkOverlap(base, 256));
+    EXPECT_EQ(publishedBuffers(), 0u);
+}
+
+TEST_F(MemoryRegistrationReuseTest, InvalidBatchDoesNotAcquireReferences) {
+    auto* base = allocation.data();
+    ASSERT_EQ(engine->registerLocalMemory(base, 128), 0);
+    testing::internal::CaptureStderr();
+    auto result = engine->registerLocalMemoryBatch(
+        {{base, 64}, {base + 256, 64}, {base + 96, 64}}, "*");
+    auto errors = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(result, ERR_ADDRESS_OVERLAPPED);
+    EXPECT_NE(errors.find("overlapped memory region"), std::string::npos);
+    EXPECT_FALSE(engine->checkOverlap(base + 256, 64));
+    EXPECT_EQ(publishedBuffers(), 1u);
+    ASSERT_EQ(engine->unregisterLocalMemory(base), 0);
+    EXPECT_FALSE(engine->checkOverlap(base, 128));
+}
+
+TEST_F(MemoryRegistrationReuseTest,
+       RejectsInvalidLeasesWithoutReleasingOthers) {
+    auto* base = allocation.data();
+    ASSERT_EQ(engine->registerLocalMemory(base, 128), 0);
+    EXPECT_EQ(engine->registerLocalMemoryBatch({{base, 64}, {base, 64}}, "*"),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(engine->registerLocalMemory(base, 64, "cpu:0"),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(engine->registerLocalMemory(base, 0), ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(engine->registerLocalMemory(
+                  reinterpret_cast<void*>(UINTPTR_MAX - 3), 8),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(engine->unregisterLocalMemoryBatch({base, base}),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(engine->unregisterLocalMemoryBatch({base, base + 1}),
+              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_TRUE(engine->checkOverlap(base, 128));
+    ASSERT_EQ(engine->unregisterLocalMemory(base), 0);
+    EXPECT_EQ(publishedBuffers(), 0u);
+}
+
+TEST_F(MemoryRegistrationReuseTest, ConcurrentUsersKeepStoreRegistrationAlive) {
+    auto* base = allocation.data();
+    ASSERT_EQ(engine->registerLocalMemory(base, 256), 0);
+    std::vector<std::future<int>> users;
+    for (int i = 0; i < 8; ++i) {
+        users.push_back(std::async(std::launch::async, [&, i] {
+            auto* view = base + i * 16;
+            int ret = engine->registerLocalMemory(view, 16);
+            if (ret) return ret;
+            return engine->unregisterLocalMemory(view);
+        }));
+    }
+    for (auto& user : users) EXPECT_EQ(user.get(), 0);
+    EXPECT_EQ(publishedBuffers(), 1u);
+    ASSERT_EQ(engine->unregisterLocalMemory(base), 0);
+    EXPECT_EQ(publishedBuffers(), 0u);
+}
+
+TEST_F(TransportTest, MemoryRegistrationReuseAdoptsExistingRegistrations) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    ASSERT_NE(installRegistrationReuseTcp(engine), nullptr);
+    std::array<char, 256> allocation{};
+    auto* base = allocation.data();
+    ASSERT_EQ(engine.registerLocalMemory(base, 128), 0);
+    ASSERT_EQ(engine.registerLocalMemory(base + 128, 128, "*", false), 0);
+    EXPECT_EQ(engine.enableMemoryRegistrationReuse(), 0);
+    EXPECT_EQ(engine.enableMemoryRegistrationReuse(), 0);
+    ASSERT_EQ(engine.registerLocalMemory(base + 64, 64), 0);
+    EXPECT_EQ(engine.registerLocalMemory(base + 128, 64),
+              ERR_ADDRESS_OVERLAPPED);
+    ASSERT_EQ(engine.unregisterLocalMemory(base), 0);
+    EXPECT_TRUE(engine.checkOverlap(base, 128));
+    ASSERT_EQ(engine.unregisterLocalMemory(base + 64), 0);
+    EXPECT_FALSE(engine.checkOverlap(base, 128));
+    ASSERT_EQ(engine.unregisterLocalMemory(base + 128), 0);
+    EXPECT_FALSE(engine.checkOverlap(base, allocation.size()));
+}
+
+TEST_F(TransportTest,
+       MemoryRegistrationReuseBackendFailureDoesNotLeakReferences) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    ASSERT_NE(installRegistrationReuseTcp(engine), nullptr);
+    ASSERT_EQ(engine.enableMemoryRegistrationReuse(), 0);
+    auto transport = std::make_shared<BatchResultTransport>();
+    TransferEngineImplTestPeer::addTransport(engine, transport);
+    std::array<char, 256> allocation{};
+    auto* base = allocation.data();
+    ASSERT_EQ(engine.registerLocalMemory(base, 64), 0);
+    transport->setRegisterResult(ERR_MEMORY);
+    testing::internal::CaptureStderr();
+    auto result =
+        engine.registerLocalMemoryBatch({{base, 64}, {base + 128, 64}}, "*");
+    auto errors = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(result, ERR_MEMORY);
+    EXPECT_NE(errors.find("Failed to register a batch"), std::string::npos);
+    EXPECT_TRUE(engine.checkOverlap(base, 64));
+    EXPECT_FALSE(engine.checkOverlap(base + 128, 64));
+    auto desc = engine.getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_EQ(desc->buffers.size(), 1u);
+    EXPECT_EQ(desc->buffers.front().addr, reinterpret_cast<uintptr_t>(base));
+    transport->setRegisterResult(0);
+    ASSERT_EQ(engine.unregisterLocalMemory(base), 0);
+    EXPECT_FALSE(engine.checkOverlap(base, 64));
+    ASSERT_EQ(engine.registerLocalMemory(base + 128, 64), 0);
+    ASSERT_EQ(engine.unregisterLocalMemory(base + 128), 0);
+}
+
+TEST_F(TransportTest, MemoryRegistrationReuseRetriesFailedCleanup) {
+    class CleanupTransport : public BatchResultTransport {
+       public:
+        int result = ERR_MEMORY;
+
+       private:
+        int unregisterLocalMemory(void*, bool) override { return result; }
+    };
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    ASSERT_NE(installRegistrationReuseTcp(engine), nullptr);
+    ASSERT_EQ(engine.enableMemoryRegistrationReuse(), 0);
+    auto transport = std::make_shared<CleanupTransport>();
+    TransferEngineImplTestPeer::addTransport(engine, transport);
+    std::array<char, 64> allocation{};
+    auto* base = allocation.data();
+    ASSERT_EQ(engine.registerLocalMemory(base, allocation.size()), 0);
+    EXPECT_EQ(engine.unregisterLocalMemory(base), ERR_MEMORY);
+    EXPECT_TRUE(engine.checkOverlap(base, allocation.size()));
+    EXPECT_EQ(engine.registerLocalMemory(base, allocation.size()), ERR_CONTEXT);
+    // A transport may already have completed cleanup before another failed.
+    transport->result = ERR_ADDRESS_NOT_REGISTERED;
+    EXPECT_EQ(engine.unregisterLocalMemory(base), 0);
+    EXPECT_FALSE(engine.checkOverlap(base, allocation.size()));
+    EXPECT_EQ(engine.unregisterLocalMemory(base), ERR_ADDRESS_NOT_REGISTERED);
+}
+
+TEST_F(TransportTest, MemoryRegistrationReuseRetriesFailedRollback) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    ASSERT_NE(installRegistrationReuseTcp(engine), nullptr);
+    ASSERT_EQ(engine.enableMemoryRegistrationReuse(), 0);
+    auto transport = std::make_shared<BatchResultTransport>(ERR_MEMORY);
+    TransferEngineImplTestPeer::addTransport(engine, transport);
+    std::array<char, 128> allocation{};
+    auto* base = allocation.data();
+    ASSERT_EQ(engine.registerLocalMemory(base, 64), 0);
+    transport->setRegisterResult(ERR_MEMORY);
+    testing::internal::CaptureStderr();
+    auto result =
+        engine.registerLocalMemoryBatch({{base, 64}, {base + 64, 64}}, "*");
+    auto errors = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(result, ERR_MEMORY);
+    EXPECT_NE(errors.find("Failed to register a batch"), std::string::npos);
+    EXPECT_NE(errors.find("Failed to roll back batch registration"),
+              std::string::npos);
+    EXPECT_TRUE(engine.checkOverlap(base + 64, 64));
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({base, base + 64}),
+              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_TRUE(engine.checkOverlap(base, 64));
+    EXPECT_FALSE(engine.checkOverlap(base + 64, 64));
+    transport->setRegisterResult(0);
+    ASSERT_EQ(engine.registerLocalMemory(base + 64, 64), 0);
+    ASSERT_EQ(engine.unregisterLocalMemoryBatch({base, base + 64}), 0);
+    EXPECT_FALSE(engine.checkOverlap(base, allocation.size()));
+}
+
 TEST_F(TransportTest, RegisterLocalMemoryBatchRejectsOverlappingBuffers) {
     TransferEngine engine(false);
     ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
@@ -2391,6 +2633,45 @@ TEST_F(TransportTest, GroupedTaskCompletionWaitsForSubmissionSeal) {
 #endif
 
 #ifdef USE_TENT
+TEST(TransferEngineTentCompatibilityTest, EfaProtocolPinsRequiredFabric) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar tent_conf(
+        "MC_TENT_CONF",
+        R"({"policy":[{"name":"tcp-only","segment_type":"memory","transports":["tcp"]}],"transports":{"tcp":{"enable":true},"rdma":{"enable":true},"hp_tcp":{"enable":true},"shm":{"enable":true},"fabric":{"provider":"tcp","devices":["lo"]}},"metrics":{"enabled":false}})");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+
+    const std::vector<std::string> devices{"efa0", "efa1"};
+    TransferEngine engine(false, devices);
+    const int result =
+        engine.init(P2PHANDSHAKE, "tent-efa-pinning", "", 0, "efa");
+#ifdef USE_FABRIC
+    EXPECT_TRUE(result == 0 || result == ERR_CONTEXT) << result;
+    const auto* config = TransferEngineImplTestPeer::tentConfig(engine);
+    ASSERT_NE(config, nullptr);
+    EXPECT_EQ(config->get("transports/fabric/provider", ""), "efa");
+    EXPECT_EQ(config->getArray<std::string>("transports/fabric/devices"),
+              devices);
+#else
+    EXPECT_EQ(result, ERR_NOT_IMPLEMENTED);
+#endif
+}
+
+TEST(TransferEngineTentCompatibilityTest, ForceTcpEnvOverridesEfaProtocol) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar tent_conf("MC_TENT_CONF", kTentConfPrefersRdma);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+
+    const std::vector<std::string> devices{"efa0"};
+    TransferEngine engine(false, devices);
+    EXPECT_EQ(engine.init(P2PHANDSHAKE, "tent-efa-force-tcp", "", 0, "efa"), 0);
+    const auto* config = TransferEngineImplTestPeer::tentConfig(engine);
+    ASSERT_NE(config, nullptr);
+    EXPECT_TRUE(config->get("transports/force_tcp", false));
+    EXPECT_FALSE(config->get("transports/force_fabric", true));
+}
+
 TEST(TransferEngineTentCompatibilityTest,
      InstallTransportReturnsCompatibilityHandle) {
     ScopedEnvVar use_tent("MC_USE_TENT", "1");

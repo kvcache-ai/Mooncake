@@ -31,10 +31,16 @@ struct PromotionContext {
     std::vector<StandbyObjectEntry> objects;
     std::vector<StandbySegmentInfo> segments;
     WeightMetadataSnapshot weight_metadata;
+    ObjectReplicaSnapshot object_storage;
     std::unique_ptr<StandbyMetadataStore> metadata_store;
     DurablePrefix applied_cursor;
     ViewVersionId producer_view_version{0};
     ReplicaID max_replica_id{0};
+
+    bool HasObjectReplicaState() const {
+        return metadata_store ? metadata_store->HasObjectReplicaState()
+                              : object_storage.target.has_value();
+    }
 };
 
 class StandbyController {
@@ -79,7 +85,8 @@ class StandbyController {
 
 std::unique_ptr<StandbyController> CreateStandbyController(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
-    StandbyController::StartErrorInjector start_error_injector = {});
+    StandbyController::StartErrorInjector start_error_injector = {},
+    std::function<bool()> startup_cancelled = {});
 
 }  // namespace ha
 }  // namespace mooncake

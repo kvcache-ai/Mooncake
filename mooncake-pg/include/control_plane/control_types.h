@@ -120,10 +120,9 @@ struct OneShotEndpoint {
     bool operator==(const OneShotEndpoint&) const = default;
 };
 
-// Reserve #4747's wire extension before appending TwoShot. struct_pack's
-// compatible versions describe successive schemas, not independent field IDs.
-// This runtime leaves the Tree capability absent until that algorithm exists.
 inline constexpr uint32_t kTreeEndpointVersion = 1;
+
+// Tree borrows Simple and the process workspace; it publishes capability only.
 struct TreeEndpoint {
     uint32_t version = kTreeEndpointVersion;
     bool operator==(const TreeEndpoint&) const = default;
@@ -151,8 +150,8 @@ struct DeviceGroupEndpoint {
     std::optional<SimpleEndpoint> simple;
     std::optional<LLEndpoint> ll;
     std::optional<OneShotEndpoint> one_shot;
-    // Preserve the #4372 and #4747 wire prefixes, including an absent Tree
-    // slot.
+    // A plain appended optional would change struct_pack's wire type hash.
+    // compatible preserves the #4372 schema; old messages decode as absent.
     struct_pack::compatible<TreeEndpoint, 20260930> tree;
     struct_pack::compatible<TwoShotEndpoint, 20261030> two_shot;
 
@@ -165,6 +164,11 @@ struct DeviceGroupEndpoint {
     // Ring is the baseline; LL and one-shot resources are optional.
     [[nodiscard]] bool hasAllRequiredEndpoints() const noexcept {
         return view_epoch_signal_count != 0 && simple.has_value();
+    }
+
+    [[nodiscard]] bool supportsTree() const noexcept {
+        return hasAllRequiredEndpoints() && tree &&
+               tree->version == kTreeEndpointVersion;
     }
 
     [[nodiscard]] bool supportsBackend(
@@ -273,7 +277,7 @@ enum class GroupStatus : uint8_t {
 enum class DeviceAllReduceAlgorithm : uint8_t {
     Ring = 1,
     OneShot = 2,
-    // 3 is reserved for Tree (#4747).
+    Tree = 3,
     TwoShot = 4,
 };
 

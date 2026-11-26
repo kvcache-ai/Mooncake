@@ -80,6 +80,12 @@ On the initiator machine:
 Use `--request_interval_us=<N>` to add a per-thread delay before each
 transfer batch. The value is in microseconds; `0` disables pacing.
 
+Pacing is closed loop: each thread waits the interval after its previous
+transfer completes, then issues the next one. The per-thread request rate is
+therefore at most `1 / (interval + transfer latency)`, not `1 / interval`, and
+it drops as latency grows. The wait spins with `yield`, so each paced thread
+keeps a CPU core busy, which can compete with transport polling threads.
+
 When pacing is enabled, `Avg Lat (us)` includes the pacing gap because it is
 computed from wall-clock runtime, while `Avg Tx (us)` and Tx percentiles only
 measure transfer execution time.
@@ -161,7 +167,17 @@ Each output row corresponds to one benchmark configuration.
 | `P99 Tx (us)`  | P99 transfer latency                                |
 | `P999 Tx (us)` | P999 transfer latency                               |
 
-A short (~1 second) warmup phase is executed before measurements begin.
+`BW` is the throughput of the requested workload: total bytes divided by the
+pooled average worker duration of the measurement phase. It therefore includes
+work done inside the loop on request, such as `--request_interval_us` pacing
+and the data fill and verify of `--check_consistency`. `Avg Tx`, `P99 Tx`,
+`P999 Tx`, and `Avg Inst GB/s` time only the transfer itself, from submit to
+completion.
+
+Each case warms up for `--warmup_ms` milliseconds (1000 by default) before
+measurements begin. Use `--warmup_ms=0` to measure without warmup, including
+the cost of the first transfer. All worker threads still synchronize before
+starting the measured workload.
 
 ### 4.1 QoS Metrics Baseline
 
@@ -282,17 +298,20 @@ empty: the transfer loop is unchanged, with no extra clocks or I/O.
 When set, each completed transfer appends one JSON line:
 
 ```json
-{"batch_size":207360,"submit_us":66874,"wait_us":556363,"polls":201}
+{"block_size":4096,"batch_size":1,"warmup":false,"submit_us":2.613,"wait_us":10.874,"polls":901}
 ```
 
 | Field | Meaning |
 | ----- | ------- |
-| `submit_us` | Time in `submitTransfer` |
-| `wait_us` | Time from submit return until the batch reports COMPLETED |
+| `block_size`, `batch_size` | Shape of the transfer, identifying the sweep point |
+| `warmup` | `true` for transfers in the configured warmup before measurement |
+| `submit_us` | Time in `submitTransfer`, in microseconds with ns precision |
+| `wait_us` | Time from submit return until the batch reports COMPLETED, in microseconds with ns precision |
 | `polls` | Number of status polls in that wait |
 
-The file is opened once as `std::ofstream` and written with stream buffering. Skip the first
-couple of lines when summarizing; they include warmup. This log is for
+The file is opened once as `std::ofstream` and written with stream buffering.
+Filter on `warmup` when summarizing; warmup includes one-time costs such as
+connection setup. This log is for
 control-path analysis. Do not treat `wait_us` or table `BW` as a substitute
 for an application poll interval.
 
@@ -380,12 +399,17 @@ Example:
 * `--start_batch_size`, `--max_batch_size` : batch size sweep (powers of two)
 * `--start_num_threads`, `--max_num_threads` : thread sweep (powers of two)
 * `--duration` : measurement time per case (seconds)
+* `--warmup_ms` : warmup time per case (milliseconds; default 1000, 0 disables)
 
-A test case is skipped when:
-
-```
-block_size × batch_size × num_threads > total_buffer_size
-```
+Each thread owns one fixed region in its local buffer and one in its target
+buffer, sized for the largest operation (`max_block_size × max_batch_size`, or
+`--target_window_size` on the target side; see Section 5.5 for which buffer a
+thread uses). A test case is skipped when some thread's region does not fit in its local
+buffer (`--total_buffer_size`) or its target buffer (the buffer length after
+`--target_offset`, and `--target_range_size` if set). Because the layout only
+depends on the thread count, all block and batch sizes of a thread count either
+run or are skipped together. If every case is skipped, tebench exits
+with an error so that a misconfigured run does not look like a pass.
 
 **Multi-target initiator**
 
@@ -535,14 +559,12 @@ An existing run directory is rejected; use a new `--run-id` when rerunning with
 
 ### 5.5 GPU Affinity
 
-* `--local_gpu_id`  : initiator base GPU ID
-* `--target_gpu_id` : target base GPU ID
+* `--local_gpu_id`  : initiator GPU; `-1` allocates a buffer on every GPU
+* `--target_gpu_id` : first target buffer used, as an index into the target's
+  buffer list
 
-Each worker thread uses:
-
-```
-gpu_id + thread_id
-```
+Worker thread `i` uses local buffer `i % local_buffers` and target buffer
+`(target_gpu_id + i / target_count) % target_buffers`.
 
 ---
 
@@ -633,8 +655,9 @@ through `MC_TENT_CONF`:
      --start_num_threads=8 --max_num_threads=8
    ```
 
-   Initiator threads round-robin across the listed seg_types by `thread_id`
-   (even→DRAM, odd→VRAM). The engine selects transport based on the target
+   Initiator threads round-robin across the listed seg_types by
+   `thread_id / target_count` (with one target: even→DRAM, odd→VRAM), and use
+   the same seg_type on the local and the target side. The engine selects transport based on the target
    buffer's location — SHM for `cpu:N` buffers, NVLink for `cuda:N` buffers —
    so `/metrics` will show both `transport="shm"` and `transport="nvlink"`
    labels with non-zero counts from a single metrics endpoint.

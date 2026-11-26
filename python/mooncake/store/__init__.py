@@ -13,6 +13,7 @@ _CPP_EXPORTS = frozenset(
         "SoftPinAction",
         "ReplicateConfig",
         "ExistOptions",
+        "PhysicalPlacement",
         "ReplicaStatus",
         "MemoryDescriptor",
         "DiskDescriptor",
@@ -21,6 +22,11 @@ _CPP_EXPORTS = frozenset(
         "TaskType",
         "TaskStatus",
         "QueryTaskResponse",
+        "JobType",
+        "JobStatus",
+        "QueryJobResponse",
+        "ListTasksResponse",
+        "ListDrainJobsResponse",
         "BufferHandle",
         "BufferLeaseView",
         "BufferLease",
@@ -55,6 +61,7 @@ _CPP_EXPORTS = frozenset(
         "REPLICA_MOVE",
         "PENDING",
         "SUCCESS",
+        "CANCELED",
     }
 )
 

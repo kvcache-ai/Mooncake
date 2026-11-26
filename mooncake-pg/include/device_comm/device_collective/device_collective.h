@@ -24,6 +24,7 @@ namespace mooncake {
 class DeviceCollectiveWorkspace;
 class RingAllReduceAlgorithm;
 class OneShotAllReduceAlgorithm;
+class TreeAllReduceAlgorithm;
 class TwoShotAllReduceAlgorithm;
 class SimpleResources;
 class LLResources;
@@ -79,6 +80,7 @@ class DeviceCollectiveRuntime {
     PGResult<ResolvedGroupView> resolveGroupView(const GroupView& view) const;
     PGResult<void> installGroupView(const ResolvedGroupView& view,
                                     bool require_one_shot_plan,
+                                    bool require_tree_plan,
                                     bool require_two_shot_plan);
     PGResult<void> publishControlState(const Configuration& configuration,
                                        bool pinned,
@@ -101,6 +103,7 @@ class DeviceCollectiveRuntime {
     std::unique_ptr<LLResources> ll_;
     std::unique_ptr<RingAllReduceAlgorithm> ring_all_reduce_;
     std::unique_ptr<OneShotAllReduceAlgorithm> one_shot_all_reduce_;
+    std::unique_ptr<TreeAllReduceAlgorithm> tree_all_reduce_;
     std::unique_ptr<TwoShotAllReduceAlgorithm> two_shot_all_reduce_;
     // One committed host image; candidate construction never mutates it.
     std::unique_ptr<Configuration> configuration_;

@@ -2,6 +2,7 @@
 // Compiled by g++ for both CUDA and MUSA builds. Uses kernel launch wrappers
 // from mooncake_worker_kernels.cuh instead of <<<>>> syntax.
 
+#include <atomic>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -237,6 +238,8 @@ std::unique_ptr<WorkCompletion> MooncakeWorker::putTaskCpu(
             copyFromRecvBuffer(
                 (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
                 state->currentPos, realSize);
+            std::atomic_ref<uint32_t>(meta->halfReads[bufferOffset])
+                .fetch_add(1, std::memory_order_release);
 
             state->currentPos += realSize;
 
@@ -320,6 +323,8 @@ void MooncakeWorker::putTaskCuda(
         copyFromRecvBuffer(
             (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
             pos, realSize, enq_stream.get());
+        launchReadDoneKernel(meta->halfReadsDevice + bufferOffset,
+                             enq_stream.get());
 
         ++meta->taskCount;
     }
@@ -329,7 +334,9 @@ void MooncakeWorker::putTaskCuda(
     // serialized by the stream. In eager mode, finish each chunk's host-worker
     // submission step before installing the completion wait on issue_stream
     // below. Captured enqueue kernels have not run yet, so capture skips this
-    // gate.
+    // gate. The submission step includes waiting for the targets to read the
+    // half (AWAITING_READERS), so when a chunk reuses a half whose last run a
+    // target has not read yet, the caller waits here for that read too.
     if (!is_capturing) {
         waitUntilTasksSubmitted(submitted_tasks);
     }

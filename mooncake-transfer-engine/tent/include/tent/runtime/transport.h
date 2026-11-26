@@ -130,6 +130,10 @@ class Transport {
     // task reaches a terminal state.
     virtual bool supportsCancellation() const { return false; }
 
+    // True when submitTransferTasks() orders each copy after
+    // Request::producer_event on the device.
+    virtual bool supportsProducerEvent() const { return false; }
+
     virtual Status cancelTransferTask(SubBatchRef batch, int task_id) {
         return Status::NotImplemented(
             "cancelTransferTask not implemented" LOC_MARK);
@@ -142,6 +146,18 @@ class Transport {
 
     virtual Status freeLocalMemory(void* addr, size_t size) {
         return Platform::getLoader().free(addr, size);
+    }
+
+    virtual bool supportsGlobalAddressing() const { return false; }
+
+    virtual Status mapRemoteMemory(SegmentID, void*, size_t) {
+        return Status::NotImplemented(
+            "Global address mapping is unavailable" LOC_MARK);
+    }
+
+    virtual Status unmapRemoteMemory(SegmentID, void*) {
+        return Status::NotImplemented(
+            "Global address mapping is unavailable" LOC_MARK);
     }
 
     // Pre-registration warm-up that pins pages before NUMA probing.
@@ -192,6 +208,10 @@ class Transport {
     virtual Status getNicLoadStats(std::vector<NicLoadStats>&) const {
         return Status::OK();
     }
+
+    // Worker submission must preserve caller-thread context and execution
+    // dependencies. Ordinary failure/timeout and cleanup semantics still apply.
+    virtual bool supportsParallelBatchSubmit() const { return false; }
 
    protected:
     Capabilities caps;

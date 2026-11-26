@@ -26,11 +26,19 @@ DEFINE_string(local_buffer_size, "0", "Size of local buffer (e.g., 16MB, 1GB)");
 DEFINE_int32(threads, 1, "Number of threads for client service");
 DEFINE_string(tenant_id, "default", "Tenant identifier");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
-DEFINE_bool(start_offload_rpc_server, true,
-            "Expose TCP RPC for disk-tier reads "
-            "(batch_get_offload_object / release_offload_buffer). "
-            "Effective only when --enable_offload is true. "
-            "Disable for a write-only owner.");
+DEFINE_bool(
+    start_offload_rpc_server, true,
+    "Expose TCP RPC for disk-tier reads "
+    "(batch_get_offload_object / release_offload_buffer). "
+    "Effective only when --enable_offload is true. "
+    "Disable to serve offload requests on the main client RPC listener.");
+DEFINE_bool(enable_ssd_prefetch, false,
+            "Enable best-effort SSD-to-DRAM prefetch on exist probes and "
+            "requests delegated by remote clients.");
+DEFINE_int64(ssd_prefetch_cooldown_sec, DEFAULT_SSD_PREFETCH_COOLDOWN_SEC,
+             "SSD prefetch memory-pressure backoff in seconds; 0 disables.");
+DEFINE_int64(ssd_prefetch_dedup_ttl_sec, DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC,
+             "SSD prefetch per-key dedup TTL in seconds; 0 disables.");
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
 
@@ -46,6 +54,10 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::batchRemove_internal>(&real_client);
     server.register_handler<&RealClient::isExist_internal>(&real_client);
     server.register_handler<&RealClient::batchIsExist_internal>(&real_client);
+    server.register_handler<&RealClient::isExistWithOptions_internal>(
+        &real_client);
+    server.register_handler<&RealClient::batchIsExistWithOptions_internal>(
+        &real_client);
     server.register_handler<&RealClient::probeKey_internal>(&real_client);
     server.register_handler<&RealClient::batchProbeKey_internal>(&real_client);
     server.register_handler<&RealClient::getSize_internal>(&real_client);
@@ -107,12 +119,20 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::allocate_buffer_dummy>(&real_client);
     server.register_handler<&RealClient::create_copy_task>(&real_client);
     server.register_handler<&RealClient::create_move_task>(&real_client);
+    server.register_handler<&RealClient::create_drain_job>(&real_client);
+    server.register_handler<&RealClient::create_timed_drain_job>(&real_client);
+    server.register_handler<&RealClient::query_drain_job>(&real_client);
+    server.register_handler<&RealClient::cancel_drain_job>(&real_client);
+    server.register_handler<&RealClient::list_drain_jobs>(&real_client);
+    server.register_handler<&RealClient::list_tasks>(&real_client);
+    server.register_handler<&RealClient::cancel_task>(&real_client);
     server.register_handler<&RealClient::query_task>(&real_client);
     server.register_handler<&RealClient::batch_get_offload_object>(
         &real_client);
     server.register_handler<&RealClient::batch_get_offload_object_ranges>(
         &real_client);
     server.register_handler<&RealClient::release_offload_buffer>(&real_client);
+    server.register_handler<&RealClient::prefetch_offload_object>(&real_client);
 }
 }  // namespace mooncake
 
@@ -150,7 +170,9 @@ int main(int argc, char *argv[]) {
         FLAGS_master_server_address, nullptr,
         "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock", FLAGS_port,
         FLAGS_enable_offload, FLAGS_start_offload_rpc_server, "",
-        FLAGS_tenant_id, FLAGS_enable_http_server, FLAGS_http_port);
+        FLAGS_tenant_id, FLAGS_enable_http_server, FLAGS_http_port,
+        /*enable_embedded_master=*/false, FLAGS_enable_ssd_prefetch,
+        FLAGS_ssd_prefetch_cooldown_sec, FLAGS_ssd_prefetch_dedup_ttl_sec);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;

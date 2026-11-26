@@ -23,7 +23,6 @@
   [![PyPI Non-CUDA](https://img.shields.io/static/v1?label=pypi&message=non-CUDA&color=00BFFF)](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
   [![PyPI NPU](https://img.shields.io/static/v1?label=pypi&message=NPU&color=F87171)](https://pypi.org/project/mooncake-transfer-engine-npu/)
   [![PyPI MUSA](https://img.shields.io/static/v1?label=pypi&message=MUSA&color=F97316)](https://pypi.org/project/mooncake-transfer-engine-musa/)
-  [![PyPI EFA](https://img.shields.io/static/v1?label=pypi&message=EFA&color=F59E0B)](https://pypi.org/project/mooncake-transfer-engine-efa/)
   [![PyPI ROCm](https://img.shields.io/static/v1?label=pypi&message=ROCm&color=black)](https://pypi.org/project/mooncake-transfer-engine-rocm/)
 </div>
 <br/>
@@ -35,15 +34,16 @@ Under real workloads, Mooncake’s innovative architecture enables Kimi to handl
 
 <!-- Keep the seven most recent updates visible; archive older entries below. New PR/release dates use Asia/Shanghai (UTC+8). -->
 
+- **Nov 8, 2026**: [AMD ATOM integrated Mooncake](https://kvcache.ai/blog/atom-meets-mooncake/) for shared KV cache pooling and efficient KV transfer. In collaboration with NeuroSpark AI, the integration achieved over 95% prefix reuse and up to 2× higher throughput.
 - **Oct 10, 2026**: TensorRT-LLM merged a native [Mooncake Store connector](https://github.com/NVIDIA/TensorRT-LLM/pull/19171) into KVCMv2, enabling content-addressed KV cache pooling and prefix reuse across serving instances.
 - **Oct 6, 2026**: [TokenSpeed v0.1.1](https://github.com/lightseekorg/tokenspeed/releases/tag/v0.1.1) includes Mooncake Store as an L3 KV cache backend beneath its host cache, alongside Mooncake Transfer Engine support for PD and EPD disaggregation.
 - **Sept 17, 2026**: vLLM added [cross-encoder embedding reuse](https://github.com/vllm-project/vllm/pull/56242) through Mooncake Store, complementing its [encoder-cache transfer connector](https://github.com/vllm-project/vllm/pull/41567) for multimodal disaggregated serving. Both capabilities are included in [vLLM v0.31.0](https://github.com/vllm-project/vllm/releases/tag/v0.31.0).
 - **Aug 28, 2026**: LMDeploy merged [Mooncake Store support](https://github.com/InternLM/lmdeploy/pull/4903), enabling shared KV cache pooling and prefix reuse across PyTorch inference instances. Included in [LMDeploy v0.18.0](https://github.com/InternLM/lmdeploy/releases/tag/v0.18.0).
-- **Aug 24, 2026**: [AgentX / InferenceX v3](https://newsletter.semianalysis.com/p/agentx-inferencexv3-does-cuda-moat) highlights Mooncake's contributions to agentic inference workloads, including ROCm wheels, CI, and packaging improvements. [Mooncake optimization details](https://inferencex.semianalysis.com/agentx/optimizations/mooncake).
 
 <details>
 <summary>More</summary>
 
+- **Aug 24, 2026**: [AgentX / InferenceX v3](https://newsletter.semianalysis.com/p/agentx-inferencexv3-does-cuda-moat) highlights Mooncake's contributions to agentic inference workloads, including ROCm wheels, CI, and packaging improvements. [Mooncake optimization details](https://inferencex.semianalysis.com/agentx/optimizations/mooncake).
 - **Aug 20, 2026**: Mooncake is integrated into [Miles](https://github.com/radixark/miles) as a rollout data-transfer backend for the fragmented, heterogeneous data moving between rollout and training in disaggregated RL. Blogs: [KVCache.AI](https://kvcache.ai/blog/mooncake-rl-rollout-data-transfer/), [lmsys](https://www.lmsys.org/blog/2026-08-20-miles-mooncake-rollout-data-transfer).
 - **Aug 17, 2026**: Mooncake is integrated into [Speculators](https://github.com/vllm-project/speculators) as a distributed backend for multi-node online training, efficiently moves hidden-state between vLLM inference workers and Speculators trainers through RDMA, eliminating the need for massive hidden-state storage in offline training. [Benchmark on GB300 NVL72](https://x.com/mgoin_/status/2072785822231728363).
 - **Aug 5, 2026**: llm-d added a [Mooncake PD deployment guide](https://github.com/llm-d/llm-d/pull/1511), complementing its [Mooncake Store tiered offloading integration](https://github.com/llm-d/llm-d/pull/1826) for vLLM serving on Kubernetes.
@@ -122,7 +122,7 @@ The core of Mooncake is the Transfer Engine (TE), a high-performance data transf
 <!-- ![transfer-engine-performance.png](image/transfer-engine-performance.png) -->
 <img src=image/transfer-engine-performance.png width=75% />
 
-- **Broad support for heterogeneous transports and accelerators.** Transfer Engine provides unified data transfer across diverse protocols, including TCP, RDMA, AWS EFA, NVMe-oF, NVLink, HIP, Barex, CXL, and Ascend-family transports. When built with the corresponding runtime, Transfer Engine can detect accelerator memory and select suitable transport paths for efficient data movement across CUDA, MUSA, HIP, MACA, Cambricon MLU, and Ascend-enabled environments, as well as Intel XPU through TENT. For a complete list of supported protocols and configuration guide, see the [Supported Protocols Documentation](https://kvcache-ai.github.io/Mooncake/getting_started/supported-protocols.html).
+- **Broad support for heterogeneous transports and accelerators.** Transfer Engine provides unified data transfer across diverse protocols, including TCP, RDMA, AWS EFA, HPE Slingshot (CXI), NVMe-oF, NVLink, HIP, Barex, CXL, and Ascend-family transports. When built with the corresponding runtime, Transfer Engine can detect accelerator memory and select suitable transport paths for efficient data movement across CUDA, MUSA, HIP, MACA, Cambricon MLU, and Ascend-enabled environments, as well as Intel XPU through TENT. For a complete list of supported protocols and configuration guide, see the [Supported Protocols Documentation](https://kvcache-ai.github.io/Mooncake/getting_started/supported-protocols.html).
 
 - **Widely adopted across the LLM ecosystem.** TE is used in production inference stacks such as [SGLang](https://github.com/sgl-project/sglang), [vLLM](https://github.com/vllm-project/vllm), [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM), [vLLM-Ascend](https://github.com/vllm-project/vllm-ascend), [checkpoint-engine](https://github.com/MoonshotAI/checkpoint-engine), and [NIXL](https://github.com/ai-dynamo/nixl), among others, to efficiently transfer KV cache, embeddings, model weights, and other data.
 
@@ -210,7 +210,56 @@ Mooncake integrates with [vLLM](https://github.com/vllm-project/vllm) to acceler
 
 <h2 id="ecosystem-integrations">🌐 Ecosystem Integrations</h2>
 
-Mooncake connects inference engines, cache middleware, RL systems, and deployment tools. The directory below links to upstream guides and implementations for each integration, checked on Oct 15, 2026.
+Mooncake connects inference engines, cache middleware, RL systems, and deployment tools. Click a logo or a name to open the upstream project. Projects without a published logo are listed by name.
+
+<p align="center">
+  <a href="https://github.com/sgl-project/sglang"><img src="image/ecosystem/sglang.png" width="122" alt="SGLang"></a>
+  <a href="https://github.com/vllm-project/vllm"><img src="image/ecosystem/vllm.png" width="122" alt="vLLM"></a>
+  <a href="https://github.com/lightseekorg/tokenspeed"><img src="image/ecosystem/tokenspeed.png" width="122" alt="TokenSpeed"></a>
+  <a href="https://github.com/InternLM/lmdeploy"><img src="image/ecosystem/lmdeploy.png" width="122" alt="LMDeploy"></a>
+  <a href="https://github.com/vllm-project/vllm-ascend"><img src="image/ecosystem/vllm-ascend.png" width="122" alt="vLLM-Ascend"></a>
+  <a href="https://github.com/PaddlePaddle/FastDeploy"><img src="image/ecosystem/fastdeploy.png" width="122" alt="FastDeploy"></a>
+  <br>
+  <a href="https://github.com/xLLM-AI/xllm"><img src="image/ecosystem/xllm.png" width="122" alt="xLLM"></a>
+  <a href="https://github.com/thu-pacman/chitu"><img src="image/ecosystem/chitu.png" width="122" alt="Chitu"></a>
+  <a href="https://github.com/ROCm/ATOM"><img src="image/ecosystem/atom.png" width="122" alt="ATOM"></a>
+  <a href="https://github.com/sgl-project/sglang-omni"><img src="image/ecosystem/sglang-omni.png" width="122" alt="SGLang-Omni"></a>
+  <a href="https://github.com/vllm-project/vllm-omni"><img src="image/ecosystem/vllm-omni.png" width="122" alt="vLLM-Omni"></a>
+  <a href="https://github.com/ModelTC/LightX2V"><img src="image/ecosystem/lightx2v.png" width="122" alt="LightX2V"></a>
+  <br>
+  <a href="https://github.com/LMCache/LMCache"><img src="image/ecosystem/lmcache.png" width="122" alt="LMCache"></a>
+  <a href="https://github.com/ModelEngine-Group/unified-cache-management"><img src="image/ecosystem/ucm.png" width="122" alt="UCM"></a>
+  <a href="https://github.com/gpustack/gpustack"><img src="image/ecosystem/gpustack.png" width="122" alt="GPUStack"></a>
+  <a href="https://github.com/mstar-project/mstar"><img src="image/ecosystem/mstar.png" width="122" alt="mstar"></a>
+  <a href="https://github.com/pytorch/pytorch"><img src="image/ecosystem/pytorch.png" width="122" alt="PyTorch"></a>
+  <a href="https://github.com/ai-dynamo/dynamo"><img src="image/ecosystem/dynamo.png" width="122" alt="Dynamo"></a>
+  <br>
+  <a href="https://github.com/llm-d/llm-d"><img src="image/ecosystem/llm-d.png" width="122" alt="llm-d"></a>
+  <a href="https://github.com/THUDM/slime"><img src="image/ecosystem/slime.png" width="122" alt="slime"></a>
+  <a href="https://github.com/radixark/miles"><img src="image/ecosystem/miles.png" width="122" alt="Miles"></a>
+  <a href="https://github.com/inclusionAI/Awex"><img src="image/ecosystem/awex.png" width="122" alt="Awex"></a>
+  <a href="https://github.com/sgl-project/SpecForge"><img src="image/ecosystem/specforge.png" width="122" alt="SpecForge"></a>
+  <br>
+  <a href="https://github.com/NVIDIA/TensorRT-LLM">TensorRT-LLM</a> ·
+  <a href="https://github.com/taco-project/FlexKV">FlexKV</a> ·
+  <a href="https://github.com/alibaba/tair-kvcache">Tair KVCache</a> ·
+  <a href="https://github.com/ai-dynamo/nixl">NIXL</a> ·
+  <a href="https://github.com/AMD-AGI/Infera">Infera</a> ·
+  <a href="https://github.com/Tele-AI/Fluxon">Fluxon</a> ·
+  <a href="https://github.com/sgl-project/rbg">RBG</a> ·
+  <a href="https://github.com/smg-project/smg">SMG</a> ·
+  <a href="https://github.com/NVIDIA/srt-slurm">srt-slurm</a> ·
+  <a href="https://github.com/verl-project/verl">verl</a> ·
+  <a href="https://github.com/skyrl-project/SkyRL">SkyRL</a> ·
+  <a href="https://github.com/PrimeIntellect-ai/prime-rl">prime-rl</a> ·
+  <a href="https://github.com/NVIDIA-NeMo/RL">NeMo RL</a> ·
+  <a href="https://github.com/Tencent-Hunyuan/UniRL">UniRL</a> ·
+  <a href="https://github.com/Ascend/TransferQueue">TransferQueue</a> ·
+  <a href="https://github.com/MoonshotAI/checkpoint-engine">checkpoint-engine</a> ·
+  <a href="https://github.com/pytorch/torchtitan">TorchTitan</a> ·
+  <a href="https://github.com/lightseekorg/TorchSpec">TorchSpec</a> ·
+  <a href="https://github.com/vllm-project/speculators">Speculators</a>
+</p>
 
 <details>
 <summary>Integration directory</summary>
@@ -219,34 +268,50 @@ Mooncake connects inference engines, cache middleware, RL systems, and deploymen
 
 | Project | Mooncake components | Integration use cases | Guide or implementation |
 | --- | --- | --- | --- |
-| SGLang | TE, Store, EP/PG | PD/EPD transfer, HiCache, multimodal embedding caching, weight synchronization, and Elastic EP | [Integration guide](https://kvcache-ai.github.io/Mooncake/deployment/integrations/sglang/index.html), [Elastic EP](https://github.com/sgl-project/sglang/pull/10423) |
-| vLLM | TE, Store | PD transfer, shared KV pooling, encoder-cache transfer, and cross-encoder embedding reuse | [PD connector](https://docs.vllm.ai/en/latest/features/mooncake_connector_usage/), [Store connector](https://docs.vllm.ai/en/latest/features/mooncake_store_connector_usage/), [encoder connector](https://docs.vllm.ai/en/latest/features/mooncake_ec_connector_usage/) |
-| TokenSpeed | TE, Store | PD/EPD transfer and Store-backed L3 beneath the host KV cache | [Server configuration](https://github.com/lightseekorg/tokenspeed/blob/main/docs/configuration/server.md) |
-| TensorRT-LLM | TE, Store | PD transfer and shared KV pooling through the KVCMv2 Store connector merged into main | [TE implementation](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/executor/cache_transmission/mooncake_utils), [Store connector](https://github.com/NVIDIA/TensorRT-LLM/pull/19171) |
-| LMDeploy | TE, Store | PD transfer and cross-instance KV prefix reuse | [TE guide](https://kvcache-ai.github.io/Mooncake/deployment/integrations/lmdeploy.html), [Store connector](https://github.com/InternLM/lmdeploy/pull/4903) |
-| vLLM-Ascend | TE, Store | NPU PD transfer and KV pooling through AscendStoreConnector | [PD deployment](https://github.com/vllm-project/vllm-ascend/blob/main/docs/source/tutorials/features/pd_disaggregation_mooncake_multi_node.md), [KV pool](https://github.com/vllm-project/vllm-ascend/blob/main/docs/source/user_guide/feature_guide/kv_cache_pool_ascend_store.md) |
-| FastDeploy | Store | Global KV pooling and cache reuse in PD serving | [Global cache pooling](https://github.com/PaddlePaddle/FastDeploy/blob/develop/docs/features/global_cache_pooling.md) |
-| xLLM | TE, Store | KV transfer and distributed cache management | [KV transfer backends](https://github.com/jd-opensource/xllm/tree/main/xllm/core/kv_cache/transfer) |
-| Chitu | TE | Multi-prefill/multi-decode KV transfer over RDMA | [PD disaggregation](https://github.com/thu-pacman/chitu/blob/public-main/chitu/distributed/pd_disaggregation/README.md) |
-| LMCache | TE, Store | Remote KV storage, a native MP L2 adapter, and P2P cache sharing | [Store guide](https://docs.lmcache.ai/kv_cache/storage_backends/mooncake.html), [MP adapter](https://docs.lmcache.ai/mp/l2_storage.html#mooncake-store-mooncake-store-native-connector), [P2P backend](https://github.com/LMCache/LMCache/pull/4182) |
-| FlexKV | TE, Store | Distributed cache reuse and a content-addressed REMOTE tier | [Distributed reuse](https://github.com/taco-project/FlexKV/blob/main/docs/dist_reuse/README_en.md), [Store backend](https://github.com/taco-project/FlexKV/pull/231) |
-| NIXL | TE | Mooncake transport plugin for NIXL data movement | [Plugin guide](https://github.com/ai-dynamo/nixl/blob/main/src/plugins/mooncake/README.md) |
-| Dynamo | Store via SGLang HiCache | Shared-pool awareness and event-driven KV cache routing | [HiCache integration](https://github.com/ai-dynamo/dynamo/blob/main/docs/fern/pages/developer-guide/knowledge-base/modular-components/backends/sglang/hicache.md) |
-| llm-d | TE, Store via vLLM | Kubernetes PD serving and tiered KV cache offloading | [PD integration](https://github.com/llm-d/llm-d/pull/1511), [Tiered prefix cache](https://github.com/llm-d/llm-d/tree/main/guides/tiered-prefix-cache) |
-| RBG | TE, Store via inference engines | Role-based orchestration of Store, PD transfer, and cache reuse | [Deployment examples](https://github.com/sgl-project/rbg/tree/main/examples/inference/ecosystem/mooncake) |
-| srt-slurm | TE, Store via inference engines | Slurm deployment and Mooncake service configuration | [Mooncake services](https://github.com/NVIDIA/srt-slurm/blob/main/docs/mooncake-kv-store.md) |
-| NeMo RL | Store via TransferQueue | Rollout-to-training data exchange with optional GDR client transfers | [Data plane](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data_plane/README.md), [GDR support](https://github.com/NVIDIA-NeMo/RL/pull/3501) |
-| TransferQueue | Store | RL tensor/object storage, GDR transfers, and SSD offloading | [Store client](https://github.com/Ascend/TransferQueue/blob/main/transfer_queue/storage/clients/mooncake_client.py), [GDR guide](https://github.com/Ascend/TransferQueue/blob/main/docs/storage_backends/mooncake_gdr.md) |
-| verl | TE | Checkpoint-engine backend for trainer-to-rollout weight synchronization | [Mooncake backend](https://github.com/verl-project/verl/blob/main/verl/checkpoint_engine/mooncake_checkpoint_engine.py) |
-| checkpoint-engine | TE | Peer-to-peer model-weight distribution and updates | [P2P backend](https://github.com/MoonshotAI/checkpoint-engine) |
-| Miles | Store | Rollout-to-training data transfer | [Rollout transfer guide](https://github.com/radixark/miles/blob/main/docs/advanced/mooncake-rollout-transfer.md) |
-| TorchSpec | Store | Hidden-state exchange between inference and draft-model training | [Training architecture](https://github.com/torchspec-project/TorchSpec) |
-| Speculators | Store | Hidden-state exchange for distributed online draft-model training | [Hidden-state connectors](https://github.com/vllm-project/speculators/tree/main/hs_connectors) |
-| vLLM-Omni | TE, Store | Data exchange between multimodal pipeline stages | [Omni connectors](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/distributed/omni_connectors/connectors) |
-| LightX2V | TE | Encoder/transformer disaggregation for video generation | [Transfer backend](https://github.com/ModelTC/LightX2V/blob/main/lightx2v/disagg/mooncake.py) |
-| slime | TE via SGLang | PD-disaggregated rollout serving | [RL serving architecture](https://github.com/THUDM/slime/blob/main/docs/en/advanced/rl-systems.md) |
+| [SGLang](https://github.com/sgl-project/sglang) | TE, Store, EP/PG | PD/EPD transfer, HiCache, multimodal embedding caching, weight synchronization, and Elastic EP | [Integration guide](https://kvcache-ai.github.io/Mooncake/deployment/integrations/sglang/index.html), [Elastic EP](https://github.com/sgl-project/sglang/pull/10423) |
+| [vLLM](https://github.com/vllm-project/vllm) | TE, Store | PD transfer, shared KV pooling, encoder-cache transfer, and cross-encoder embedding reuse | [PD connector](https://docs.vllm.ai/en/latest/features/mooncake_connector_usage/), [Store connector](https://docs.vllm.ai/en/latest/features/mooncake_store_connector_usage/), [encoder connector](https://docs.vllm.ai/en/latest/features/mooncake_ec_connector_usage/) |
+| [TokenSpeed](https://github.com/lightseekorg/tokenspeed) | TE, Store | PD/EPD transfer and Store-backed L3 beneath the host KV cache | [Server configuration](https://github.com/lightseekorg/tokenspeed/blob/main/docs/configuration/server.md) |
+| [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) | TE, Store | PD transfer and shared KV pooling through the KVCMv2 Store connector merged into main | [TE implementation](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/executor/cache_transmission/mooncake_utils), [Store connector](https://github.com/NVIDIA/TensorRT-LLM/pull/19171) |
+| [LMDeploy](https://github.com/InternLM/lmdeploy) | TE, Store | PD transfer and cross-instance KV prefix reuse | [TE guide](https://kvcache-ai.github.io/Mooncake/deployment/integrations/lmdeploy.html), [Store connector](https://github.com/InternLM/lmdeploy/pull/4903) |
+| [vLLM-Ascend](https://github.com/vllm-project/vllm-ascend) | TE, Store | NPU PD transfer and KV pooling through AscendStoreConnector | [PD deployment](https://github.com/vllm-project/vllm-ascend/blob/main/docs/source/tutorials/features/pd_disaggregation_mooncake_multi_node.md), [KV pool](https://github.com/vllm-project/vllm-ascend/blob/main/docs/source/user_guide/feature_guide/kv_cache_pool_ascend_store.md) |
+| [FastDeploy](https://github.com/PaddlePaddle/FastDeploy) | Store | Global KV pooling and cache reuse in PD serving | [Global cache pooling](https://github.com/PaddlePaddle/FastDeploy/blob/develop/docs/features/global_cache_pooling.md) |
+| [xLLM](https://github.com/jd-opensource/xllm) | TE, Store | KV transfer and distributed cache management | [KV transfer backends](https://github.com/jd-opensource/xllm/tree/main/xllm/core/kv_cache/transfer) |
+| [Chitu](https://github.com/thu-pacman/chitu) | TE | Multi-prefill/multi-decode KV transfer over RDMA | [PD disaggregation](https://github.com/thu-pacman/chitu/blob/public-main/chitu/distributed/pd_disaggregation/README.md) |
+| [ATOM](https://github.com/ROCm/ATOM) | TE, Store | Shared KV cache pooling and efficient KV transfer | [Integration blog](https://kvcache.ai/blog/atom-meets-mooncake/), [PD connector](https://github.com/ROCm/ATOM/tree/main/atom/kv_transfer/disaggregation/mooncake), [Store offload](https://github.com/ROCm/ATOM/tree/main/atom/kv_transfer/offload/mooncake_store) |
+| [SGLang-Omni](https://github.com/sgl-project/sglang-omni) | TE | Cross-stage tensor and blob transfer between thinker, talker, codec, and vocoder stages | [Relay backend](https://github.com/sgl-project/sglang-omni/blob/main/sglang_omni/relay/mooncake.py) |
+| [vLLM-Omni](https://github.com/vllm-project/vllm-omni) | TE, Store | Data exchange between multimodal pipeline stages | [Omni connectors](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/distributed/omni_connectors/connectors) |
+| [LightX2V](https://github.com/ModelTC/LightX2V) | TE | Encoder/transformer disaggregation for video generation | [Transfer backend](https://github.com/ModelTC/LightX2V/blob/main/lightx2v/disagg/mooncake.py) |
+| [mstar](https://github.com/mstar-project/mstar) | TE | RDMA tensor transport between serving stages | [Tensor transport](https://github.com/mstar-project/mstar/blob/main/mstar/communication/tensors.py) |
+| [Infera](https://github.com/AMD-AGI/Infera) | TE via SGLang | PD disaggregation over Mooncake on ROCm | [1P1D example](https://github.com/AMD-AGI/Infera/blob/main/manual/examples/k8s_pd_1p1d_mooncake.md) |
+| [LMCache](https://github.com/LMCache/LMCache) | TE, Store | Remote KV storage, a native MP L2 adapter, and P2P cache sharing | [Store guide](https://docs.lmcache.ai/kv_cache/storage_backends/mooncake.html), [MP adapter](https://docs.lmcache.ai/mp/l2_storage.html#mooncake-store-mooncake-store-native-connector), [P2P backend](https://github.com/LMCache/LMCache/pull/4182) |
+| [FlexKV](https://github.com/taco-project/FlexKV) | TE, Store | Distributed cache reuse and a content-addressed REMOTE tier | [Distributed reuse](https://github.com/taco-project/FlexKV/blob/main/docs/dist_reuse/README_en.md), [Store backend](https://github.com/taco-project/FlexKV/pull/231) |
+| [Tair KVCache](https://github.com/alibaba/tair-kvcache) | Store | Mooncake Store as a data-storage backend for the KV Cache Manager | [Store backend](https://github.com/alibaba/tair-kvcache/blob/main/kv_cache_manager/data_storage/mooncake_backend.cc) |
+| [UCM](https://github.com/ModelEngine-Group/unified-cache-management) | Store | Shared KV store and PD transport for Ascend inference | [Store pipeline](https://ucm.readthedocs.io/en/latest/developer-guide/cache-configuration/mooncake/), [PD transport](https://ucm.readthedocs.io/en/latest/user-guide/capabilities/pd-disaggregation/distributed/) |
+| [Fluxon](https://github.com/Tele-AI/Fluxon) | Store | KV cache client backed by Mooncake Store | [Mooncake client](https://github.com/Tele-AI/Fluxon/blob/main/fluxon_py/kvclient/mooncake.py) |
+| [NIXL](https://github.com/ai-dynamo/nixl) | TE | Mooncake transport plugin for NIXL data movement | [Plugin guide](https://github.com/ai-dynamo/nixl/blob/main/src/plugins/mooncake/README.md) |
+| [PyTorch](https://github.com/pytorch/pytorch) | TE | Mooncake transport for point-to-point tensor transfer in `torch.distributed._transport` | [Transport](https://github.com/pytorch/pytorch/tree/main/torch/distributed/_transport/mooncake) |
+| [Dynamo](https://github.com/ai-dynamo/dynamo) | Store via SGLang HiCache | Shared-pool awareness and event-driven KV cache routing | [HiCache integration](https://github.com/ai-dynamo/dynamo/blob/main/docs/fern/pages/developer-guide/knowledge-base/modular-components/backends/sglang/hicache.md) |
+| [SMG](https://github.com/smg-project/smg) | TE via vLLM | KV-aware routing for Mooncake PD transfer | [PD transfer](https://github.com/smg-project/smg/blob/main/e2e_test/router/test_pd_mooncake.py) |
+| [llm-d](https://github.com/llm-d/llm-d) | TE, Store via vLLM | Kubernetes PD serving and tiered KV cache offloading | [PD integration](https://github.com/llm-d/llm-d/pull/1511), [Tiered prefix cache](https://github.com/llm-d/llm-d/tree/main/guides/tiered-prefix-cache) |
+| [GPUStack](https://github.com/gpustack/gpustack) | TE, Store | Managed Mooncake KV pools and PD disaggregation | [Cache backend](https://docs.gpustack.ai/gpustack-operator/v0.10.0/docs/modules/kv-cache/backend/), [PD disaggregation](https://docs.gpustack.ai/2.3/user-guide/pd-disaggregation/) |
+| [RBG](https://github.com/sgl-project/rbg) | TE, Store via inference engines | Role-based orchestration of Store, PD transfer, and cache reuse | [Deployment examples](https://github.com/sgl-project/rbg/tree/main/examples/inference/ecosystem/mooncake) |
+| [srt-slurm](https://github.com/NVIDIA/srt-slurm) | TE, Store via inference engines | Slurm deployment and Mooncake service configuration | [Mooncake services](https://github.com/NVIDIA/srt-slurm/blob/main/docs/mooncake-kv-store.md) |
+| [verl](https://github.com/verl-project/verl) | TE | Checkpoint-engine backend for trainer-to-rollout weight synchronization | [Mooncake backend](https://github.com/verl-project/verl/blob/main/verl/checkpoint_engine/mooncake_checkpoint_engine.py) |
+| [slime](https://github.com/THUDM/slime) | TE via SGLang | PD-disaggregated rollout serving | [RL serving architecture](https://github.com/THUDM/slime/blob/main/docs/en/advanced/rl-systems.md) |
+| [Miles](https://github.com/radixark/miles) | Store | Rollout-to-training data transfer | [Rollout transfer guide](https://github.com/radixark/miles/blob/main/docs/advanced/mooncake-rollout-transfer.md) |
+| [SkyRL](https://github.com/skyrl-project/SkyRL) | TE, Store via vLLM | PD transfer and shared KV offload for RL inference | [Inference guide](https://github.com/skyrl-project/SkyRL/blob/main/.agents/docs/inference.md) |
+| [prime-rl](https://github.com/PrimeIntellect-ai/prime-rl) | Store | Shared KV offload across inference nodes | [Inference guide](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/docs/inference.md) |
+| [UniRL](https://github.com/Tencent-Hunyuan/UniRL) | Store via TransferQueue | Rollout data exchange over Mooncake RDMA | [Data plane](https://github.com/Tencent-Hunyuan/UniRL/blob/main/unirl/distributed/README.md) |
+| [TorchTitan](https://github.com/pytorch/torchtitan) | Store via SGLang HiCache | Mooncake Store master for RL generators | [Store master](https://github.com/pytorch/torchtitan/blob/main/torchtitan/rl/generator/mooncake_master.py) |
+| [NeMo RL](https://github.com/NVIDIA-NeMo/RL) | Store via TransferQueue | Rollout-to-training data exchange with optional GDR client transfers | [Data plane](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data_plane/README.md), [GDR support](https://github.com/NVIDIA-NeMo/RL/pull/3501) |
+| [TransferQueue](https://github.com/Ascend/TransferQueue) | Store | RL tensor/object storage, GDR transfers, and SSD offloading | [Store client](https://github.com/Ascend/TransferQueue/blob/main/transfer_queue/storage/clients/mooncake_client.py), [GDR guide](https://github.com/Ascend/TransferQueue/blob/main/docs/storage_backends/mooncake_gdr.md) |
+| [checkpoint-engine](https://github.com/MoonshotAI/checkpoint-engine) | TE | Peer-to-peer model-weight distribution and updates | [P2P backend](https://github.com/MoonshotAI/checkpoint-engine) |
+| [Awex](https://github.com/inclusionAI/Awex) | TE | Training-to-inference weight synchronization | [Mooncake backend](https://github.com/inclusionAI/Awex#mooncake-weight-transfer) |
+| [TorchSpec](https://github.com/lightseekorg/TorchSpec) | Store | Hidden-state exchange between inference and draft-model training | [Training architecture](https://github.com/lightseekorg/TorchSpec) |
+| [Speculators](https://github.com/vllm-project/speculators) | Store | Hidden-state exchange for distributed online draft-model training | [Hidden-state connectors](https://github.com/vllm-project/speculators/tree/main/hs_connectors) |
+| [SpecForge](https://github.com/sgl-project/SpecForge) | Store | Hidden-state exchange for online draft-model training | [Store data plane](https://github.com/sgl-project/SpecForge/blob/main/specforge/runtime/data_plane/mooncake_store.py) |
 
-The Dynamo entry describes SGLang HiCache shared-cache routing. Its separate [KVBM G4 Store adapter proposal](https://github.com/ai-dynamo/dynamo/pull/9786) is still unmerged. NeMo RL's GDR path changes client-side tensor transfers; queued objects remain in Mooncake-managed host memory.
+The Dynamo entry describes SGLang HiCache shared-cache routing. NeMo RL's GDR path changes client-side tensor transfers; queued objects remain in Mooncake-managed host memory.
 
 </details>
 
@@ -254,9 +319,12 @@ The Dynamo entry describes SGLang HiCache shared-cache routing. Its separate [KV
 
 Mooncake supports hardware backends across accelerator vendors, cloud fabrics, and standard datacenter interconnects, as listed below. See the [supported protocols](https://kvcache-ai.github.io/Mooncake/getting_started/supported-protocols.html) and [Transfer Engine design docs](https://kvcache-ai.github.io/Mooncake/design/transfer-engine/index.html) for details.
 
-| <img src="image/partners/nvidia_logo.png" width="120" alt="NVIDIA"/> | <img src="image/partners/huawei_logo.png" width="120" alt="Huawei"/> | <img src="image/partners/amd_logo.png" width="120" alt="AMD"/> | <img src="image/hardwares/cambricon_logo.png" width="120" alt="Cambricon"/> | <img src="image/partners/moore_thread_logo.jpg" width="120" alt="Moore Threads"/> | <img src="image/partners/aws-logo.png" width="120" alt="AWS"/> |
-| --- | --- | --- | --- | --- | --- |
-| <img src="image/hardwares/MetaX_logo.png" width="120" alt="MetaX"/> | <img src="image/hardwares/T-Head_logo.png" width="120" alt="T-Head"/> | <img src="image/partners/aliyun_logo.png" width="120" alt="Alibaba Cloud"/> | <img src="image/partners/sunrise_logo.png" width="120" alt="Sunrise"/> | <img src="image/partners/hygon_logo.png" width="120" alt="Hygon"/> | <img src="image/hardwares/biren_logo.png" width="120" alt="Biren Technology"/> |
+<!-- Regenerate with: uv run scripts/generate_hardware_overview.py -->
+<p align="center">
+  <img src="image/hardwares/supported_hardware.png" width="960" alt="Supported hardware ecosystem: NVIDIA, Huawei, AMD, Cambricon, Moore Threads, AWS, MetaX, T-Head, Alibaba Cloud, Sunrise, Hygon, Biren Technology, Intel, Google, HPE, Iluvatar CoreX, FlagOS, Enflame."/>
+</p>
+
+*Each logo has equal display space; placement does not indicate ranking.*
 
 <h2 id="quick-start">🚀 Getting Started</h2>
 
@@ -276,6 +344,17 @@ In addition to CUDA, Mooncake also supports other accelerator backends, along wi
 - [Quick Start](https://kvcache-ai.github.io/Mooncake/getting_started/quick-start.html)
 - [Build from Source](https://kvcache-ai.github.io/Mooncake/getting_started/build.html)
 - [Deployment Guide](https://kvcache-ai.github.io/Mooncake/deployment/mooncake-store-deployment-guide.html)
+
+To build one Transfer Engine and Store wheel per platform for GIL-enabled
+CPython 3.12 and newer, use CPython 3.12 and CMake 3.26 or newer.
+
+```bash
+uv build --wheel -Cwheel.py-api=cp312 -Ccmake.define.WITH_CONDUCTOR=OFF
+```
+
+The resulting wheel has the `cp312-abi3` tag. Builds that include the EP,
+Conductor or TENT Python extensions use the regular CPython-specific wheel.
+
 
 
 ### Skills for AI Assistants

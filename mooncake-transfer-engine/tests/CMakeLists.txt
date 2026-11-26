@@ -1,5 +1,13 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
+add_executable(batch_submit_test ${WORKSPACE}/batch_submit_test.cpp)
+target_link_libraries(batch_submit_test PRIVATE transfer_engine gtest
+                                                gtest_main pthread)
+if(USE_TENT)
+  target_compile_definitions(batch_submit_test PRIVATE USE_TENT)
+endif()
+add_test(NAME batch_submit_test COMMAND batch_submit_test)
+
 if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
   add_executable(task_congestion_observation_test
                  ${WORKSPACE}/task_congestion_observation_test.cpp)
@@ -217,6 +225,16 @@ target_link_libraries(rdma_large_mr_test PUBLIC transfer_engine gtest
 # add_test(NAME rdma_large_mr_test COMMAND rdma_large_mr_test)  # needs an RDMA
 # dev + metadata server
 
+# Registering a sub-view of a HugeTLB mapping through RdmaTransport: the
+# caller's range is tried first and widened to whole huge pages only when
+# ibv_reg_mr rejects it with EINVAL. Self-skips without an RDMA device or
+# reserved hugepages.
+add_executable(rdma_hugetlb_subview_test
+               ${WORKSPACE}/rdma_hugetlb_subview_test.cpp)
+target_link_libraries(rdma_hugetlb_subview_test PUBLIC transfer_engine gtest)
+add_test(NAME rdma_hugetlb_subview_test COMMAND rdma_hugetlb_subview_test)
+set_tests_properties(rdma_hugetlb_subview_test PROPERTIES LABELS "rdma")
+
 if(USE_HIP)
   # Needs an AMD GPU, an RDMA NIC and the amdgpu peer-memory client.
   add_executable(rdma_hip_kfd_pin_test ${WORKSPACE}/rdma_hip_kfd_pin_test.cpp)
@@ -240,6 +258,15 @@ target_link_libraries(rdma_native_notify_test PUBLIC transfer_engine gtest
                                                      gtest_main)
 add_test(NAME rdma_native_notify_test COMMAND rdma_native_notify_test)
 set_tests_properties(rdma_native_notify_test PROPERTIES LABELS "rdma" TIMEOUT
+                                                        120)
+
+# Real CQ completions through the eventfd. Self-skips without an RDMA device
+# or when MC_SLICE_TIMEOUT disables the notification path.
+add_executable(rdma_completion_fd_test ${WORKSPACE}/rdma_completion_fd_test.cpp)
+target_link_libraries(rdma_completion_fd_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME rdma_completion_fd_test COMMAND rdma_completion_fd_test)
+set_tests_properties(rdma_completion_fd_test PROPERTIES LABELS "rdma" TIMEOUT
                                                         120)
 
 # CtrlChannel RDMA notify correctness. Self-skips without RDMA.
@@ -421,6 +448,18 @@ if(USE_HIP)
   target_link_libraries(hip_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME hip_transport_test COMMAND hip_transport_test)
+
+  add_executable(hip_stream_pool_test ${WORKSPACE}/hip_stream_pool_test.cpp)
+  target_link_libraries(hip_stream_pool_test PUBLIC transfer_engine gtest
+                                                    gtest_main)
+  foreach(priority default high invalid)
+    add_test(NAME hip_stream_pool_${priority}_test
+             COMMAND ${CMAKE_COMMAND} -E env MC_HIP_STREAM_PRIORITY=${priority}
+                     $<TARGET_FILE:hip_stream_pool_test>)
+  endforeach()
+  add_test(NAME hip_stream_pool_unset_test
+           COMMAND ${CMAKE_COMMAND} -E env --unset=MC_HIP_STREAM_PRIORITY
+                   $<TARGET_FILE:hip_stream_pool_test>)
 endif()
 
 if(USE_UBSHMEM)
@@ -661,6 +700,26 @@ target_link_libraries(rdma_unregister_retry_test PUBLIC transfer_engine gtest
                                                         gtest_main)
 add_test(NAME rdma_unregister_retry_test COMMAND rdma_unregister_retry_test)
 
+# Pending-cleanup state machine after a failed unregister (pending_dereg_ vs
+# pending_republish_). Interposes libibverbs, so no RDMA device or metadata
+# server is needed.
+add_executable(rdma_unregister_republish_test
+               ${WORKSPACE}/rdma_unregister_republish_test.cpp)
+target_link_libraries(rdma_unregister_republish_test PUBLIC transfer_engine
+                                                            gtest gtest_main)
+add_test(NAME rdma_unregister_republish_test
+         COMMAND rdma_unregister_republish_test)
+
+# HugeTLB narrow-first registration with interposed libibverbs (misaligned
+# ranges fail with EINVAL). Needs no NIC, but self-skips without two reserved
+# 2 MiB hugepages.
+add_executable(rdma_hugetlb_subview_fake_mr_test
+               ${WORKSPACE}/rdma_hugetlb_subview_fake_mr_test.cpp)
+target_link_libraries(rdma_hugetlb_subview_fake_mr_test PUBLIC transfer_engine
+                                                               gtest gtest_main)
+add_test(NAME rdma_hugetlb_subview_fake_mr_test
+         COMMAND rdma_hugetlb_subview_fake_mr_test)
+
 add_executable(rdma_memory_location_test
                ${WORKSPACE}/rdma_memory_location_test.cpp)
 target_link_libraries(rdma_memory_location_test PUBLIC transfer_engine gtest
@@ -719,9 +778,10 @@ if(USE_ASCEND_DIRECT)
   # implementations are included in the test file via anonymous namespace
   add_executable(ascend_direct_transport_test
                  ${WORKSPACE}/ascend_direct_transport_test.cpp)
-  target_link_libraries(ascend_direct_transport_test
-                        PUBLIC transfer_engine gtest gtest_main metadef)
-  # Allow shared library undefined symbols (Ascend libraries have circular deps)
+  target_link_libraries(
+    ascend_direct_transport_test PUBLIC transfer_engine gtest gtest_main
+                                        metadef glog::glog)
+  # Allow shared library undefined symbols (Ascend libraries have circular deps).
   set_target_properties(ascend_direct_transport_test
                         PROPERTIES LINK_FLAGS "-Wl,--allow-shlib-undefined")
 
@@ -785,3 +845,25 @@ add_executable(batch_counter_wait_test ${WORKSPACE}/batch_counter_wait_test.cpp)
 target_link_libraries(batch_counter_wait_test PUBLIC transfer_engine gtest
                                                      gtest_main)
 add_test(NAME batch_counter_wait_test COMMAND batch_counter_wait_test)
+
+add_executable(rdma_destination_local_test
+               ${WORKSPACE}/rdma_destination_local_test.cpp)
+target_link_libraries(rdma_destination_local_test PUBLIC transfer_engine gtest
+                                                         gtest_main)
+add_test(NAME rdma_destination_local_test COMMAND rdma_destination_local_test)
+
+# MC_RDMA_NIC_SELECTION: hardware-free map, knob and sparse-MR routing tests.
+add_executable(rdma_nic_selection_test ${WORKSPACE}/rdma_nic_selection_test.cpp)
+target_link_libraries(rdma_nic_selection_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME rdma_nic_selection_test COMMAND rdma_nic_selection_test)
+
+# Needs GPUs and RDMA NICs; skips unless MC_RUN_RDMA_GPU_TESTS is set.
+if(USE_CUDA OR USE_HIP)
+  add_executable(rdma_local_nic_gpu_test
+                 ${WORKSPACE}/rdma_local_nic_gpu_test.cpp)
+  target_link_libraries(rdma_local_nic_gpu_test PUBLIC transfer_engine gtest
+                                                       gtest_main)
+  add_test(NAME rdma_local_nic_gpu_test COMMAND rdma_local_nic_gpu_test)
+  set_tests_properties(rdma_local_nic_gpu_test PROPERTIES LABELS "rdma;gpu")
+endif()

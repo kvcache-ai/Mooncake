@@ -19,12 +19,14 @@
 #include <cuda_runtime.h>
 #include "tent/common/cuda_fabric_compat.h"
 
+#include <atomic>
 #include <functional>
 #include <iostream>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "tent/runtime/control_plane.h"
@@ -34,28 +36,65 @@
 namespace mooncake {
 namespace tent {
 
+struct MnnvlCompletionEvent {
+    cudaEvent_t event{nullptr};
+    CUcontext context{nullptr};
+    // CUDA 12+ IDs distinguish contexts even if CUDA reuses their handles.
+    unsigned long long context_id{0};
+};
+
+class MnnvlCompletionEventPool {
+    friend class MnnvlTransportTestPeer;
+
+   public:
+    explicit MnnvlCompletionEventPool(size_t capacity) : capacity_(capacity) {}
+    ~MnnvlCompletionEventPool();
+    Status acquire(int device, MnnvlCompletionEvent &completion);
+    void release(int device, const MnnvlCompletionEvent &completion,
+                 bool completed);
+
+   private:
+    std::mutex mutex_;
+    size_t capacity_;
+    // Capacity is shared by all contexts on a device, not per context.
+    std::unordered_map<int, std::vector<MnnvlCompletionEvent>> idle_;
+};
+
+struct MnnvlCompletion : MnnvlCompletionEvent {
+    MnnvlCompletion() = default;
+    MnnvlCompletion(const MnnvlCompletion &) = delete;
+    MnnvlCompletion &operator=(const MnnvlCompletion &) = delete;
+    std::shared_ptr<MnnvlCompletionEventPool> pool;
+    int device{-1};
+    cudaError_t result{cudaErrorNotReady};
+    bool recorded{false};
+    int last_polled_task{-1};
+    ~MnnvlCompletion();
+};
+
 struct MnnvlTask {
     Request request;
-    volatile TransferStatusEnum status_word;
-    volatile size_t transferred_bytes;
+    TransferStatusEnum status_word{PENDING};
+    size_t transferred_bytes{0};
     uint64_t target_addr = 0;
-    cudaEvent_t completion_event = nullptr;
+    size_t completion_group{0};
 };
 
 struct MnnvlSubBatch : public Transport::SubBatch {
     std::vector<MnnvlTask> task_list;
-    size_t max_size;
+    size_t max_size{0};
     CUDAStreamHandle sync_stream;
     CUDAStreamHandle async_stream;
     int stream_device_id = -1;
-    // Completion events created in startTransfer (one per submit). Destroyed by
-    // the destructor (RAII); Slab<T>::deallocate() invokes ~MnnvlSubBatch()
-    // before reusing the storage, so this runs on every free.
-    std::vector<cudaEvent_t> completion_events;
-    ~MnnvlSubBatch() {
-        for (auto event : completion_events) cudaEventDestroy(event);
+    mutable std::mutex mutex;
+    bool shared_polling{false};
+    // One independently owned event per submission, even for appended work.
+    std::vector<std::unique_ptr<MnnvlCompletion>> completion_groups;
+    ~MnnvlSubBatch();
+    size_t size() const override {
+        std::lock_guard<std::mutex> lock(mutex);
+        return task_list.size();
     }
-    virtual size_t size() const { return task_list.size(); }
 };
 
 class MnnvlTransport : public Transport {
@@ -73,6 +112,8 @@ class MnnvlTransport : public Transport {
 
     virtual Status uninstall();
 
+    virtual Status quiesce();
+
     virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size);
 
     virtual Status freeSubBatch(SubBatchRef &batch);
@@ -87,8 +128,21 @@ class MnnvlTransport : public Transport {
                                    const MemoryOptions &options);
 
     virtual Status removeMemoryBuffer(BufferDesc &desc);
+    bool tracksLocalBuffer(const BufferDesc &desc) const override;
 
     virtual const char *getName() const { return "mnnvl"; }
+    bool supportsGlobalAddressing() const override { return true; }
+    Status mapRemoteMemory(SegmentID peer, void *address, size_t size) override;
+    Status unmapRemoteMemory(SegmentID peer, void *address) override;
+
+    virtual bool supportsProducerEvent() const { return true; }
+
+    bool strictFabricEgm() const {
+        return installed_ && egm_enabled_ && egm_strict_ &&
+               handle_type_ == CU_MEM_HANDLE_TYPE_FABRIC;
+    }
+    Status getEgmNumaNodes(std::vector<int> &nodes, bool nearest);
+    Status getEgmGranularity(int node, size_t &granularity);
 
     virtual Status allocateLocalMemory(void **addr, size_t size,
                                        MemoryOptions &options);
@@ -96,12 +150,23 @@ class MnnvlTransport : public Transport {
     virtual Status freeLocalMemory(void *addr, size_t size);
 
    private:
-    void startTransfer(std::vector<MnnvlTask *> &tasks, MnnvlSubBatch *batch);
+    void startTransfer(std::vector<MnnvlTask *> &tasks,
+                       std::vector<void *> &srcs, std::vector<void *> &dsts,
+                       std::vector<size_t> &sizes, MnnvlSubBatch *batch,
+                       MnnvlCompletion &completion);
 
     void *createSharedMemory(const std::string &path, size_t size);
 
     Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
                                        uint64_t target_id);
+
+    Status mapVmmMemory(uint64_t &address, size_t size, SegmentID peer,
+                        bool fixed_address);
+
+    static Status ensureCudaContext();
+
+    Status getLocalAllocationRange(uint64_t address, size_t length,
+                                   uint64_t &base, size_t &size);
 
     Status setPeerAccess();
 
@@ -110,13 +175,24 @@ class MnnvlTransport : public Transport {
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> metadata_;
-    CudaPlatform *platform_;
+    CudaPlatform *platform_{nullptr};
 
     struct OpenedMnnvlEntry {
-        void *mnnvl_addr;
-        uint64_t length;
-        int cuda_id;
+        void *mnnvl_addr = nullptr;
+        uint64_t length = 0;  // Logical range used by cache lookups.
+        uint64_t mapped_length = 0;
+        uint64_t mapping_offset = 0;
+        int cuda_id = -1;
+        // Handle the mapping was imported from; a peer that re-registers the
+        // same address publishes a different one.
+        std::string mnnvl_handle;
+        std::shared_ptr<CudaSharedMemory> memory;
     };
+
+    Status importRemoteBuffer(const BufferDesc &buffer, OpenedMnnvlEntry &entry,
+                              bool fixed_address = false);
+
+    static Status releaseImportedEntry(const OpenedMnnvlEntry &entry);
 
     using HashMap =
         std::unordered_map<SegmentID,
@@ -124,22 +200,58 @@ class MnnvlTransport : public Transport {
 
     RWSpinlock relocate_lock_;
     HashMap relocate_map_;
+    // Tags thread-local relocation caches; renewed whenever relocate_map_
+    // changes and on uninstall.
+    std::atomic<uint64_t> relocate_epoch_;
+    // Mappings replaced by a re-imported peer buffer. In-flight copies may
+    // still target them, so they are only unmapped by uninstall().
+    std::vector<OpenedMnnvlEntry> retired_entries_;
     std::shared_ptr<Config> conf_;
 
     std::string machine_id_;
 
+    std::mutex batch_mutex_;
+    std::unordered_set<MnnvlSubBatch *> active_batches_;
+    // Each POSIX export has its own published pid-fd handle. Different
+    // registrations can share a VMM allocation without sharing an FD.
+    // Guarded by registration_mutex_.
+    std::unordered_map<std::string, int> exported_fds_;
+
     std::mutex allocate_mutex_;
-    // VMM allocations owned by this transport: base address -> mapped extent
-    // (rounded to the allocation granularity), needed to unmap on free.
-    std::unordered_map<void *, size_t> allocate_set_;
+    struct LocalAllocation {
+        void *addr = nullptr;
+        size_t size = 0;
+        CUmemGenericAllocationHandle handle = 0;
+        bool mapped = false;
+    };
+    // Retain every unfinished VMM cleanup stage, including early failures.
+    std::unordered_map<void *, LocalAllocation> allocate_set_;
+    std::vector<LocalAllocation> failed_allocations_;
+    static Status releaseLocalAllocation(LocalAllocation &allocation);
+    // Explicit uninstall requires callers to release GVA allocations first.
+    std::unordered_map<void *, std::unique_ptr<CudaSharedMemory>>
+        gva_allocations_;
     uint64_t async_memcpy_threshold_;
     bool supported_;
     CUmemAllocationHandleType handle_type_;
 
-    bool host_register_;
+    bool host_register_{true};
+    mutable std::mutex registration_mutex_;
+    struct HostPin {
+        size_t length;
+        std::shared_ptr<const uint8_t> owner;
+    };
+    std::unordered_map<uint64_t, HostPin> pinned_host_buffers_;
     // transports/mnnvl/egm: export HOST_NUMA (EGM) allocations so peers can
     // read/write host memory over NVLink; adds dram_to_dram / gpu_to_dram.
     bool egm_enabled_ = false;
+    // transports/mnnvl/egm_strict: host memory must really be EGM. Host
+    // allocation fails instead of falling back to plain memory, and an
+    // explicit MNNVL registration (MemoryOptions::type == MNNVL) of a host
+    // buffer that cannot be exported fails instead of staying local-only.
+    bool egm_strict_ = false;
+    MnnvlConfig options_;
+    std::shared_ptr<MnnvlCompletionEventPool> completion_pool_;
 };
 }  // namespace tent
 }  // namespace mooncake

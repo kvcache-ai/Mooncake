@@ -289,8 +289,36 @@ completion callback that drives the throttle states above.
 | `ssd_prefetch_cooldown_sec` | 5 | DRAM-pressure backoff; 0 disables |
 | `ssd_prefetch_dedup_ttl_sec` | 30 | per-key trigger dedup TTL; 0 disables |
 
-Requires `enable_ssd_offload` + `ssd_offload_path` (prefetch promotes from the
-local SSD tier; without offload there are no LOCAL_DISK replicas).
+The SSD holder requires `enable_ssd_offload` and an SSD storage directory.
+A requesting RealClient can use `setup(dict)` with `enable_ssd_prefetch=true`
+without enabling local offload or contributing a DRAM segment. Both the
+requesting RealClient and the SSD holder must enable prefetch.
+
+For an independent `mooncake_client` holder, set the offload directory using
+`MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` and start it with:
+
+```bash
+mooncake_client \
+  --host=<holder-address> \
+  --master_server_address=<master-address> \
+  --metadata_server=P2PHANDSHAKE \
+  --enable_offload=true \
+  --enable_ssd_prefetch=true \
+  --ssd_prefetch_cooldown_sec=5 \
+  --ssd_prefetch_dedup_ttl_sec=30
+```
+
+The prefetch CLI switch defaults to false. Durations are non-negative seconds;
+0 disables the corresponding backoff or deduplication window. Keep
+`--start_offload_rpc_server=true` to use the dedicated offload RPC listener.
+When it is false, the main client RPC listener serves remote disk reads and
+prefetch requests.
+
+Clients connected through `setup_dummy()` can also pass
+`ExistOptions.prefetch_to_memory=true`. The dummy forwards the option to its
+`mooncake_client`, which must enable prefetch. These options use additive RPCs;
+a newer dummy connected to an older server falls back to the ordinary exist
+query. Existing exist RPC signatures remain unchanged.
 
 ## Code map
 

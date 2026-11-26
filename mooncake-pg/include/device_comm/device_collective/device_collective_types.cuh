@@ -85,7 +85,6 @@ struct CollectiveChunk {
     uint64_t count = 0;
 };
 
-inline constexpr uint32_t kMaxDeviceCollectiveChannels = 32;
 static_assert(kMaxDeviceCollectiveChannels <= kTransferLaneCount);
 // Simple (3), LL (1), Ring/OneShot/Tree/TwoShot plans (4), recovery mirror (1).
 inline constexpr uint32_t kMaxDeviceControlUpdateOperations = 9;

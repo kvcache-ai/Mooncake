@@ -263,6 +263,11 @@ class LocalHttpMetadataServer {
         return "http://127.0.0.1:" + std::to_string(port_) + "/metadata";
     }
 
+    std::string lastPutHeaders() {
+        std::lock_guard<std::mutex> lock(values_mutex_);
+        return last_put_headers_;
+    }
+
    private:
     static std::string decodeUrlComponent(const std::string& value) {
         auto hex_digit = [](char c) -> int {
@@ -301,7 +306,7 @@ class LocalHttpMetadataServer {
     }
 
     static bool readRequest(int fd, std::string& request) {
-        constexpr size_t kMaximumRequestSize = 1 << 20;
+        constexpr size_t kMaximumRequestSize = 4 << 20;
         char buffer[4096];
         size_t header_end = std::string::npos;
         while ((header_end = request.find("\r\n\r\n")) == std::string::npos) {
@@ -361,6 +366,7 @@ class LocalHttpMetadataServer {
             const std::string value = request.substr(header_end + 4);
             std::lock_guard<std::mutex> lock(values_mutex_);
             values_[key] = value;
+            last_put_headers_ = request.substr(0, header_end);
         } else if (method == "GET") {
             std::lock_guard<std::mutex> lock(values_mutex_);
             auto it = values_.find(key);
@@ -401,7 +407,31 @@ class LocalHttpMetadataServer {
     std::atomic<bool> stopped_{false};
     std::mutex values_mutex_;
     std::unordered_map<std::string, std::string> values_;
+    std::string last_put_headers_;
 };
+
+TEST(HttpMetadataPluginTest, BufferedPutDoesNotRequest100Continue) {
+    LocalHttpMetadataServer server;
+    ASSERT_TRUE(server.ok());
+    auto plugin = MetadataStoragePlugin::Create(server.uri());
+    ASSERT_NE(plugin, nullptr);
+    // Exceed modern libcurl's automatic Expect threshold as well as testing
+    // a small request. The server deliberately never sends 100 Continue.
+    for (size_t size : {size_t{32}, size_t{2 * 1024 * 1024}}) {
+        Json::Value value;
+        value["payload"] = std::string(size, 'x');
+        ASSERT_TRUE(plugin->set("buffered-put", value));
+        auto headers = server.lastPutHeaders();
+        std::transform(headers.begin(), headers.end(), headers.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        EXPECT_EQ(headers.find("\r\nexpect:"), std::string::npos);
+        EXPECT_NE(headers.find("content-type: application/json"),
+                  std::string::npos);
+        Json::Value actual;
+        ASSERT_TRUE(plugin->get("buffered-put", actual));
+        EXPECT_EQ(actual, value);
+    }
+}
 #endif
 
 struct ScopedMetadataRefreshConfig {
