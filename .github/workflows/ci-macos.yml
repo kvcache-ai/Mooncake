@@ -6,7 +6,10 @@ on:
       - "main"
       - "release/**"
     paths: &macos-paths
-      - 'mooncake-*/**'
+      - 'mooncake-common/**'
+      - 'mooncake-transfer-engine/**'
+      - 'mooncake-store/**'
+      - 'mooncake-integration/**'
       - 'extern/**'
       - 'cmake/**'
       - 'CMakeLists.txt'
@@ -31,6 +34,7 @@ jobs:
   # guards that target from Linux-only regressions.
   build-master-macos:
     runs-on: macos-15
+    timeout-minutes: 90
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
@@ -67,7 +71,8 @@ jobs:
         cmake -S . -B build -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_UNIT_TESTS=OFF \
-          -DBUILD_EXAMPLES=OFF
+          -DBUILD_EXAMPLES=OFF \
+          -DBUILD_BENCHMARK=OFF
       shell: bash
 
     - name: Build mooncake_master

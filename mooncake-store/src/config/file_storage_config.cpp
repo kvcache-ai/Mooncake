@@ -120,6 +120,12 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.heartbeat_interval_seconds =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS,
                         config.heartbeat_interval_seconds);
+    config.reclaim_interval_seconds =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_RECLAIM_INTERVAL_SECONDS,
+                        config.reclaim_interval_seconds);
+    config.reclaim_cycle_seconds =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_RECLAIM_CYCLE_SECONDS,
+                        config.reclaim_cycle_seconds);
     config.client_buffer_gc_interval_seconds = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS,
         config.client_buffer_gc_interval_seconds);
