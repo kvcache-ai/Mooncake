@@ -1,15 +1,14 @@
-name: 'Hygon HCU PR Build & Test'
+name: 'Hygon HCU Build & Test'
 
 on:
-  pull_request_target:
-    branches: [main]
-    types: [labeled]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: hcu-upstream-pr-${{ github.event.pull_request.number }}
+  group: hcu-upstream-main
+  # The hardware pool is shared by the cross-node tests.
   cancel-in-progress: false
 
 jobs:
@@ -17,7 +16,7 @@ jobs:
     name: Build wheel
     if: >-
       github.repository == 'kvcache-ai/Mooncake' &&
-      github.event.label.name == 'run-hygon-ci'
+      github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, X64, hcu1]
     timeout-minutes: 120
     container:
@@ -27,12 +26,10 @@ jobs:
       CI: "false"
       FREE_BUILD_DIR: "0"
     steps:
-      - name: Checkout PR source
+      - name: Checkout dispatched main revision
         uses: actions/checkout@v4
         with:
-          allow-unsafe-pr-checkout: true
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
           submodules: recursive
@@ -147,12 +144,10 @@ jobs:
     env:
       TEST_IMAGE: harbor.sourcefind.cn:5443/hcu/admin/base/dtk:26.04-ubuntu22.04-mpi5.0-gcc11.4-cmake3.29-py3.10
     steps:
-      - name: Checkout authorized PR test scripts
+      - name: Checkout dispatched main test scripts
         uses: actions/checkout@v4
         with:
-          allow-unsafe-pr-checkout: true
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
           path: ci-control
@@ -229,12 +224,10 @@ jobs:
     env:
       TEST_IMAGE: harbor.sourcefind.cn:5443/hcu/admin/base/dtk:26.04-ubuntu22.04-mpi5.0-gcc11.4-cmake3.29-py3.10
     steps:
-      - name: Checkout authorized PR test scripts
+      - name: Checkout dispatched main test scripts
         uses: actions/checkout@v4
         with:
-          allow-unsafe-pr-checkout: true
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
           path: ci-control
@@ -305,11 +298,11 @@ jobs:
           retention-days: 7
 
   hcu-pr-gate:
-    name: HCU PR gate
+    name: HCU gate
     if: >-
       always() &&
       github.repository == 'kvcache-ai/Mooncake' &&
-      github.event.label.name == 'run-hygon-ci'
+      github.ref == 'refs/heads/main'
     needs:
       - build-wheel
       - test-transfer-engine-cross-node
@@ -332,27 +325,8 @@ jobs:
           if [ "${BUILD_RESULT}" != "success" ] || \
              [ "${RDMA_TEST_RESULT}" != "success" ] || \
              [ "${STORE_TEST_RESULT}" != "success" ]; then
-            echo "::error::HCU PR validation failed or was skipped."
+            echo "::error::HCU validation failed or was skipped."
             exit 1
           fi
 
           echo "The wheel built successfully and all HCU tests passed."
-
-  cleanup-label:
-    name: Remove HCU CI request label
-    needs: hcu-pr-gate
-    if: >-
-      always() &&
-      github.repository == 'kvcache-ai/Mooncake' &&
-      github.event.label.name == 'run-hygon-ci'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      pull-requests: write
-    steps:
-      - name: Remove request label
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: gh pr edit "$PR_NUMBER" --remove-label run-hygon-ci
