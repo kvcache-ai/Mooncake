@@ -399,6 +399,16 @@ TEST_F(MasterServiceTest,
                          TenantId::Default(), 3 * kObjectSize, trigger_config);
     ASSERT_FALSE(trigger.has_value());
     EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger.error());
+    // Stop the background eviction worker and drive an explicit eviction pass
+    // synchronously so the managed-weight skip assertion is deterministic and
+    // the allocation-failure wakeup from `trigger` cannot race against the
+    // ordinary-object removal assertions below.
+    MasterServiceTestPeer peer(service);
+    peer.EvictionRunning(service).store(false, std::memory_order_relaxed);
+    if (peer.EvictionThread(service).joinable()) {
+        peer.EvictionThread(service).join();
+    }
+    peer.RunBatchEvictForTesting(1.0, 1.0);
     EXPECT_TRUE(
         service.ExistKey(payload_key, TenantId::Default()).value_or(false));
     EXPECT_TRUE(
