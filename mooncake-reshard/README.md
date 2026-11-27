@@ -178,6 +178,71 @@ The sweep sorts unique allocations once instead of repeatedly comparing every
 pair of views in the same arena. View-overlap and declared-alias checks are
 unchanged; no persistent validation cache or new lifetime owner is introduced.
 
+## Optional Logical Plan Cache
+
+`WeightTransferPlanCache` is an explicit, process-local LRU for address-free
+local-target plans. It is disabled by default; existing planner, Reader, Sink,
+and Store callers do not read its environment variables or use it
+automatically. See [configuration and costs](plan_cache.md).
+
+`MC_RESHARD_PLAN_CACHE_ENABLED=1` enables the cache when the new same-fleet
+entry point is constructed. `MC_RESHARD_PLAN_CACHE_MAX_ENTRIES` sets a positive
+entry limit (default `2`). Limits count entries, not bytes, and every execution
+still obtains and validates fresh runtime bindings and allocation guards.
+
+## Explicit Same-Fleet Weight Transfer
+
+`InplaceWeightResharder(reader)` adds an opt-in entry point for complete source
+and target placements with the same participant ID set. It calls the existing
+local-target planner, binds the logical plan to the current runtime bindings,
+and executes through the supplied `MooncakeTransferEngineReader`. A configured
+cache can reuse only the logical plan; bound plans, addresses, leases and native
+engine state are not retained in that cache.
+
+The framework owner must stop source writes, discard KV, provision distinct
+target storage within its memory budget, and retain all source allocations
+until global completion. Same participants do not prove physical GPU identity
+or permit destructive overlapping writes. This helper does not allocate GPU
+weights, switch a production scheduler, provide a distributed completion fence,
+or automatically fall back after unknown completion. The reader's existing
+quarantine and allocation-lifetime contracts remain in force.
+
+`MooncakeTransferEngineReader(engine, transfer_executor=executor)` accepts an
+explicit executor with the same engine, no pending transfers, and matching
+completion-drain settings. Omitting it creates the original executor. A
+collective executor requires its caller to coordinate participant order and
+completion; local completion is not a world fence.
+
+The native `reset_reshard_peers_quiescent(peers)` method explicitly clears cached
+IPC mappings, metadata and Python handles only for the listed peers. An empty
+list is a no-op; unknown or repeated peers are harmless. The caller must first
+drain transfers on all participants, prevent concurrent registration, submission
+and unregistration,
+and fence completion. The method is not a drain or cancellation API. A failure
+may leave only some peers reset and requires restarting the participating
+engines. Existing GPU and DRAM transfer paths never invoke it automatically.
+
+The opt-in public-binding regression needs three CUDA GPUs and the built
+Mooncake extension. From the repository root, with `CUDA_HOME` set:
+
+```bash
+mkdir -p build
+c++ -shared -fPIC -std=c++17 -I"$CUDA_HOME/include" \
+  mooncake-integration/tests/reshard_ipc_trace.cpp -ldl \
+  -o build/reshard_ipc_trace.so
+CUDA_VISIBLE_DEVICES=0,1,2 MC_INTRANODE_NVLINK=1 MC_RUN_RESHARD_IPC_TESTS=1 \
+  LD_PRELOAD="$PWD/build/reshard_ipc_trace.so" \
+  python mooncake-integration/tests/test_reshard_peer_reset.py
+```
+
+The trace library observes real CUDA IPC calls and can fail one close operation.
+The failure test destroys the engine without resuming transfers; it does not
+validate recovery after an unknown transfer completion.
+
+Model parameter semantics, framework tensor layouts, packing policy, and
+serving lifecycle belong in the framework integration. They are not part of
+this model-independent entry point.
+
 ## Transfer Engine Execution
 
 `mooncake.reshard.transfer_engine` executes resource-neutral physical batches

@@ -50,6 +50,7 @@ env:
 jobs:
   build:
     runs-on: ${{ inputs.architecture == 'arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
+    timeout-minutes: 120
     # manylinux2_28 keeps the x86 wheel's libstdc++/glibc floor compatible with
     # RHEL/Rocky/Alma 8+. The CUDA image is also the toolchain for non-CUDA builds.
     container: >-
@@ -119,7 +120,7 @@ jobs:
               exit 1
               ;;
           esac
-          cmake_args="$cmake_args -DENABLE_KV_EVENTS=ON -DWITH_CONDUCTOR=ON"
+          cmake_args="$cmake_args -DBUILD_BENCHMARK=OFF -DENABLE_KV_EVENTS=ON -DWITH_CONDUCTOR=ON"
           # AWS EFA transport. It dlopens libfabric when protocol=efa is used,
           # so the wheel only needs the headers (fetched below) and still
           # imports on hosts without libfabric.

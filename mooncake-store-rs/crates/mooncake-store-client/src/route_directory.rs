@@ -7,8 +7,8 @@ use mooncake_store_core::{
     RouteCasRequest, RouteControlMode, RouteDirectory, RouteVersion,
 };
 use mooncake_store_route::{
-    set_route_metrics_sink, LocalRouteAuthority, RouteAuthorityRecord, RouteAuthorityService,
-    RouteMembershipProvider, RouteMetricsSink, RouteOwnerPage,
+    set_route_metrics_sink, LocalRouteAuthority, RouteAuthorityPresence, RouteAuthorityRecord,
+    RouteAuthorityService, RouteMembershipProvider, RouteMetricsSink, RouteOwnerPage,
 };
 
 use crate::client::{
@@ -79,6 +79,14 @@ pub(crate) fn authority_get_records(
     keys: &[ObjectKey],
 ) -> Result<Vec<RouteAuthorityRecord>> {
     LocalRouteAuthority::new(namespace, authority.clone()).get_route_records(keys)
+}
+
+pub(crate) fn authority_get_presence_many(
+    namespace: &str,
+    authority: &ClientStableId,
+    keys: &[ObjectKey],
+) -> Result<Vec<RouteAuthorityPresence>> {
+    LocalRouteAuthority::new(namespace, authority.clone()).get_route_presence_many(keys)
 }
 
 pub(crate) fn authority_get_allocation_route_references(

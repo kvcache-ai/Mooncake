@@ -16,15 +16,21 @@
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/topology.h"
+#include "batch_submit.h"
+#ifdef USE_CUDA
+#include <cuda_runtime_api.h>
+#endif
 #include <glog/logging.h>
 
 namespace mooncake {
 namespace tent {
 
 TransferEngine::TransferEngine()
-    : impl_(std::make_unique<TransferEngineImpl>()) {}
+    : impl_(std::make_unique<TransferEngineImpl>()),
+      batch_submit_executor_(std::make_shared<BatchSubmitExecutor>()) {}
 
-TransferEngine::TransferEngine(const std::string config_path) {
+TransferEngine::TransferEngine(const std::string config_path)
+    : batch_submit_executor_(std::make_shared<BatchSubmitExecutor>()) {
     auto conf = std::make_shared<Config>();
     auto status = conf->loadFile(config_path);
     if (!status.ok()) {
@@ -35,9 +41,111 @@ TransferEngine::TransferEngine(const std::string config_path) {
 }
 
 TransferEngine::TransferEngine(std::shared_ptr<Config> conf)
-    : impl_(std::make_unique<TransferEngineImpl>(conf)) {}
+    : impl_(std::make_unique<TransferEngineImpl>(conf)),
+      batch_submit_executor_(std::make_shared<BatchSubmitExecutor>()) {}
 
-TransferEngine::~TransferEngine() {}
+TransferEngine::~TransferEngine() { batch_submit_executor_->shutdown(); }
+
+bool TransferEngine::supportsParallelBatchSubmit(SegmentID peer) const {
+    return impl_->supportsParallelBatchSubmit(peer);
+}
+
+bool TransferEngine::isBatchSubmitEligible(size_t count) const {
+    return impl_ && batch_submit_executor_ &&
+           batch_submit_executor_->eligible(count);
+}
+
+struct TransferEngine::TentSubBatchAdapter {
+    using Executor = BatchSubmitExecutor;
+    TransferEngine& engine;
+    const std::vector<Request>& requests;
+    BatchID sub_batch_id = 0;
+
+    Executor::Result allocate();
+    Executor::Result submit();
+    SubBatchProgress poll();
+    Executor::Result release();
+};
+
+BatchSubmitExecutor::Result TransferEngine::TentSubBatchAdapter::allocate() {
+    sub_batch_id = engine.allocateBatch(requests.size());
+    return sub_batch_id
+               ? Executor::Result::OK()
+               : Executor::Result::Error("Could not allocate sub-batch");
+}
+
+BatchSubmitExecutor::Result TransferEngine::TentSubBatchAdapter::submit() {
+    auto status = engine.submitTransfer(sub_batch_id, requests);
+    return status.ok() ? Executor::Result::OK()
+                       : Executor::Result::SubmitError(status.ToString());
+}
+
+SubBatchProgress TransferEngine::TentSubBatchAdapter::poll() {
+    TransferStatus status{};
+    auto polled = engine.getTransferStatus(sub_batch_id, status);
+    if (!polled.ok()) return {true, false, polled.ToString()};
+    const bool terminal = status.s != PENDING && status.s != INITIAL;
+    return {terminal,
+            status.s == COMPLETED,
+            {},
+            status.s == FAILED || status.s == TIMEOUT};
+}
+
+BatchSubmitExecutor::Result TransferEngine::TentSubBatchAdapter::release() {
+    auto status = engine.freeBatch(sub_batch_id);
+    sub_batch_id = 0;
+    return status.ok() ? Executor::Result::OK()
+                       : Executor::Result::Error(status.ToString());
+}
+
+std::optional<Status> TransferEngine::tryParallelBatchTransfer(
+    SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
+    std::chrono::nanoseconds timeout,
+    ParallelBatchTransferFailureInfo* failure_info) {
+    using Executor = ::mooncake::BatchSubmitExecutor;
+    if (failure_info) *failure_info = {};
+    if (!isBatchSubmitEligible(count)) return std::nullopt;
+    auto& executor = *batch_submit_executor_;
+    const auto deadline = Executor::Clock::now() + timeout;
+    if (!supportsParallelBatchSubmit(peer)) {
+        VLOG(1) << "TENT parallel batch admission declined: peer=" << peer
+                << " descriptors=" << count;
+        return std::nullopt;
+    }
+    VLOG(1) << "TENT parallel batch admitted: peer=" << peer
+            << " descriptors=" << count;
+    int device = -1;
+#ifdef USE_CUDA
+    // Host-only transfers also work without an initialized CUDA runtime.
+    // A missing GPU, an uninitialized driver, and the CI driver stub all
+    // fail this query with different codes. There is no caller device to
+    // propagate, so the workers skip cudaSetDevice.
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        device = -1;
+        (void)cudaGetLastError();
+    }
+#endif
+    std::vector<std::vector<Request>> request_storage(
+        std::min(executor.config().threads, count));
+    auto result = executor.execute(
+        count, deadline,
+        [&](Executor::Range range, const Executor::Cancellation& cancellation) {
+#ifdef USE_CUDA
+            if (device >= 0 && cudaSetDevice(device) != cudaSuccess)
+                return Executor::Result::Error(
+                    "Could not bind batch submit CUDA device");
+#endif
+            auto& requests = request_storage[range.index];
+            requests = builder(range.begin, range.end);
+            if (requests.size() != range.end - range.begin)
+                return Executor::Result::Error(
+                    "Invalid sub-batch request count");
+            TentSubBatchAdapter sub_batch{*this, requests};
+            return ::mooncake::runSubBatch(sub_batch, cancellation);
+        });
+    if (failure_info) *failure_info = {result.submit_failed, result.retryable};
+    return result.ok() ? Status::OK() : Status::InternalError(result.error);
+}
 
 bool TransferEngine::available() const { return impl_->available(); }
 
@@ -96,6 +204,16 @@ Status TransferEngine::allocateLocalMemory(void** addr, size_t size,
 
 Status TransferEngine::freeLocalMemory(void* addr) {
     return impl_->freeLocalMemory(addr);
+}
+
+Status TransferEngine::mapRemoteMemory(SegmentID peer, void* gva, size_t size,
+                                       TransportType type) {
+    return impl_->mapRemoteMemory(peer, gva, size, type);
+}
+
+Status TransferEngine::unmapRemoteMemory(SegmentID peer, void* gva,
+                                         TransportType type) {
+    return impl_->unmapRemoteMemory(peer, gva, type);
 }
 
 Status TransferEngine::registerLocalMemory(void* addr, size_t size,

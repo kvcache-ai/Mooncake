@@ -15,6 +15,7 @@
 #include "allocator.h"
 #include "master_metric_manager.h"
 #include "replica.h"
+#include "test_buffer_allocator.h"
 #include "types.h"
 
 namespace mooncake {
@@ -598,6 +599,111 @@ TEST_F(SimpleAllocatorTest, StressTest) {
         allocator.deallocate(ptr, size);
         allocations.pop_back();
     }
+}
+
+// A buffer allocated from a TCP segment describes itself as plain TCP.
+TEST(BufferProtocolTest, DefaultsToTcp) {
+    auto allocator =
+        std::make_shared<test::TestBufferAllocator>("seg", "endpoint", 4096);
+    auto buffer = allocator->allocate(1024);
+    ASSERT_NE(buffer, nullptr);
+
+    const auto descriptor = buffer->get_descriptor();
+    EXPECT_EQ(descriptor.protocol_, "tcp");
+    EXPECT_EQ(descriptor.transport_endpoint_, "endpoint");
+}
+
+// A CXL buffer transfers from its client segment name, not from the endpoint
+// of the allocator that owns the memory.
+TEST(BufferProtocolTest, CxlCarriesTheClientSegmentName) {
+    for (const auto* protocol : {"tcp", "cxl"}) {
+        SCOPED_TRACE(protocol);
+        auto allocator =
+            CreateBufferAllocator(BufferAllocatorType::OFFSET, "seg",
+                                  DEFAULT_CXL_BASE, 4096, "endpoint", protocol);
+        ASSERT_TRUE(allocator.has_value());
+        auto buffer = (*allocator)->allocate(1024);
+        ASSERT_NE(buffer, nullptr);
+        EXPECT_EQ(buffer->get_descriptor().protocol_, protocol);
+        void* host_address = buffer->data();
+
+        buffer->change_to_cxl("client-binding");
+
+        EXPECT_EQ(buffer->get_vaddr_from_cxl(), host_address);
+        const auto descriptor = buffer->get_descriptor();
+        EXPECT_EQ(descriptor.protocol_, "cxl");
+        EXPECT_EQ(descriptor.transport_endpoint_, "client-binding");
+        EXPECT_EQ(descriptor.buffer_address_,
+                  reinterpret_cast<uintptr_t>(host_address) - DEFAULT_CXL_BASE);
+    }
+}
+
+// Restoring a descriptor must preserve its protocol, including values this
+// build does not know, so a standby snapshot from another version round-trips.
+TEST(BufferProtocolTest, DescriptorProtocolsRoundTrip) {
+    auto allocator = std::make_shared<DummyBufferAllocator>("seg", "endpoint");
+    auto describe = [&allocator](std::string protocol, std::string endpoint) {
+        AllocatedBuffer::Descriptor descriptor{};
+        descriptor.size_ = 1024;
+        descriptor.buffer_address_ = 0x1000;
+        descriptor.protocol_ = std::move(protocol);
+        descriptor.transport_endpoint_ = std::move(endpoint);
+        AllocatedBuffer buffer(allocator, descriptor);
+        return buffer.get_descriptor();
+    };
+
+    const auto tcp = describe("tcp", "endpoint");
+    EXPECT_EQ(tcp.protocol_, "tcp");
+    EXPECT_EQ(tcp.transport_endpoint_, "endpoint");
+
+    const auto cxl = describe("cxl", "client-binding");
+    EXPECT_EQ(cxl.protocol_, "cxl");
+    EXPECT_EQ(cxl.transport_endpoint_, "client-binding");
+
+    const auto unknown = describe("nvmeof", "endpoint");
+    EXPECT_EQ(unknown.protocol_, "nvmeof");
+    EXPECT_EQ(unknown.transport_endpoint_, "endpoint");
+}
+
+// Replacing a buffer's storage uses the protocol of the newly mounted segment,
+// not the protocol stored in the old descriptor.
+TEST(BufferProtocolTest, ReplacementUsesNewBuffersProtocol) {
+    auto allocator =
+        std::make_shared<test::TestBufferAllocator>("seg", "endpoint", 1 << 20);
+    auto protocol_of = [](const Replica& replica) {
+        return replica.get_descriptor()
+            .get_memory_descriptor()
+            .buffer_descriptor.protocol_;
+    };
+
+    // An ordinary memory replica keeps plain TCP across a replacement.
+    Replica tcp_replica(allocator->allocate(1024), ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(tcp_replica.replace_memory_buffer(allocator->allocate(1024)));
+    EXPECT_EQ(protocol_of(tcp_replica), "tcp");
+
+    // A restored descriptor does not override the newly mounted protocol.
+    auto unknown_allocator =
+        std::make_shared<DummyBufferAllocator>("seg", "endpoint");
+    AllocatedBuffer::Descriptor unknown{};
+    unknown.size_ = 1024;
+    unknown.buffer_address_ = 0x1000;
+    unknown.protocol_ = "nvmeof";
+    unknown.transport_endpoint_ = "endpoint";
+    Replica unknown_replica(
+        std::make_unique<AllocatedBuffer>(unknown_allocator, unknown),
+        ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(
+        unknown_replica.replace_memory_buffer(allocator->allocate(1024)));
+    EXPECT_EQ(protocol_of(unknown_replica), "tcp");
+
+    // The replacement can also move from TCP to another mounted protocol.
+    auto mounted_allocator = CreateBufferAllocator(
+        BufferAllocatorType::OFFSET, "nvlink-segment", 0x1C0000000ULL, 1 << 20,
+        "nvlink-endpoint", "nvlink");
+    ASSERT_TRUE(mounted_allocator.has_value());
+    ASSERT_TRUE(tcp_replica.replace_memory_buffer(
+        (*mounted_allocator)->allocate(1024)));
+    EXPECT_EQ(protocol_of(tcp_replica), "nvlink");
 }
 
 TEST_F(BufferAllocatorTest, BuffersAdvertiseTheirSegmentsProtocol) {

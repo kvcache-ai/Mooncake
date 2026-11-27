@@ -300,6 +300,10 @@ class DeviceSelector {
         // numa_tier_weights.
         bool strict_local_numa = false;
 
+        // Score only the closest rank holding an eligible NIC, as baseline
+        // mode does, instead of spraying slices across every rank.
+        bool closest_tier_only = false;
+
         // EWMA bandwidth learning rate (0.0 = full adaptation, 1.0 = no
         // learning)
         double bandwidth_learning_rate = 0.01;
@@ -408,6 +412,11 @@ class DeviceSelector {
         if (!entry || !local_topology_) return true;
         return !local_topology_->isCrossNuma(*entry, dev_id);
     }
+
+    // One past the last rank buildCandidates scans: every rank, or with
+    // closest_tier_only the first rank holding an eligible NIC.
+    size_t candidateRankEnd(const Topology::MemEntry *entry,
+                            uint64_t device_mask) const;
 
     Status buildCandidates(const Topology::MemEntry *entry,
                            uint64_t slice_bytes, uint64_t device_mask,

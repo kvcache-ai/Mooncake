@@ -211,15 +211,22 @@ message BatchGetRoutesReply {
   repeated GetRouteReply replies = 1;
 }
 
+message RoutePresenceSummary {
+  optional uint64 live_version = 1;
+  optional uint64 delete_version = 2;
+}
+
 message ContainsRouteReply {
   bool exists = 1;
   ErrorDetail error = 2;
+  RoutePresenceSummary presence = 3;
 }
 
 message BatchContainsRoutesRequest {
   string namespace = 1;
   string authority = 2;
   repeated string keys = 3;
+  bool include_presence = 4;
 }
 
 message BatchContainsRoutesReply {

@@ -21,6 +21,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -34,6 +35,7 @@
 namespace mooncake {
 class ShutdownToken;
 class TransferEngineImpl;
+class BatchSubmitExecutor;
 namespace tent {
 class Config;
 class TransferEngine;
@@ -167,6 +169,9 @@ class TransferEngine {
 
     int removeLocalSegment(const std::string& segment_name);
 
+    // Do not call concurrently with memory registration.
+    int enableMemoryRegistrationReuse();
+
     // Register [addr, addr + length) for local and (when remote_accessible)
     // remote RDMA access.
     //
@@ -204,6 +209,27 @@ class TransferEngine {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries);
+
+    using SubBatchRequestBuilder =
+        std::function<std::vector<TransferRequest>(size_t begin, size_t end)>;
+
+    struct ParallelBatchTransferFailureInfo {
+        // At least one engine submit API returned an error.
+        bool submit_failed = false;
+        // Only native FAILED/TIMEOUT errors, without parent expiry/shutdown.
+        bool retryable = false;
+    };
+
+    // Opt-in synchronous path for independent ranges to one peer.
+    // nullopt means disabled, below threshold, or unsupported before publish.
+    // The builder runs once per sub-batch and must return the requested range
+    // as valid READ/WRITE requests to peer, preserving every request field.
+    // The caller must ensure that all requests can execute independently;
+    // these preconditions are not checked by scanning the built requests.
+    std::optional<Status> tryParallelBatchTransfer(
+        SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
+        std::chrono::nanoseconds timeout,
+        ParallelBatchTransferFailureInfo* failure_info = nullptr);
 
     struct ScatterTransferRange {
         TransferRequest::OpCode opcode;
@@ -392,7 +418,13 @@ class TransferEngine {
     void enableGracefulShutdown();
     std::string showLinks(bool json = false) const;
 
+    bool supportsParallelBatchSubmit(SegmentID peer) const;
+
+    bool isBatchSubmitEligible(size_t count) const;
+
    private:
+    struct TESubBatchAdapter;
+
     Status submitScatterTransfer(BatchID batch_id,
                                  const std::vector<TransferRequest>& entries);
 
@@ -401,6 +433,7 @@ class TransferEngine {
         const std::string& local_server_name) const;
 
     std::shared_ptr<TransferEngineImpl> impl_;
+    std::shared_ptr<BatchSubmitExecutor> batch_submit_executor_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
     std::unique_ptr<Transport> tent_compat_transport_;
     std::mutex tent_compat_transport_mutex_;

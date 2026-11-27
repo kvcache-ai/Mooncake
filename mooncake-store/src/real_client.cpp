@@ -1017,14 +1017,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
-    bool enable_embedded_master) {
-    return setup_internal(EgmStorePoolConfig{}, local_hostname, metadata_server,
-                          global_segment_size, local_buffer_size, protocol,
-                          rdma_devices, master_server_addr, transfer_engine,
-                          ipc_socket_path, local_rpc_port, enable_ssd_offload,
-                          start_offload_rpc_server, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port,
-                          enable_embedded_master);
+    bool enable_embedded_master, bool enable_ssd_prefetch,
+    int64_t ssd_prefetch_cooldown_sec, int64_t ssd_prefetch_dedup_ttl_sec) {
+    return setup_internal(
+        EgmStorePoolConfig{}, local_hostname, metadata_server,
+        global_segment_size, local_buffer_size, protocol, rdma_devices,
+        master_server_addr, transfer_engine, ipc_socket_path, local_rpc_port,
+        enable_ssd_offload, start_offload_rpc_server, ssd_offload_path,
+        tenant_id, enable_client_http_server, client_http_port,
+        enable_embedded_master, enable_ssd_prefetch, ssd_prefetch_cooldown_sec,
+        ssd_prefetch_dedup_ttl_sec);
 }
 
 tl::expected<void, ErrorCode> RealClient::setup_internal(
@@ -1037,13 +1039,26 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
-    bool enable_embedded_master) {
+    bool enable_embedded_master, bool enable_ssd_prefetch,
+    int64_t ssd_prefetch_cooldown_sec, int64_t ssd_prefetch_dedup_ttl_sec) {
     // Re-entry guard (mirrors initAll_internal): a second setup would
     // overwrite client_ and skip the first instance's ordered cleanup.
     if (client_) {
         LOG(ERROR) << "Client is already initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    constexpr int64_t max_prefetch_seconds =
+        std::numeric_limits<int64_t>::max() / 1000;
+    if (ssd_prefetch_cooldown_sec < 0 || ssd_prefetch_dedup_ttl_sec < 0 ||
+        ssd_prefetch_cooldown_sec > max_prefetch_seconds ||
+        ssd_prefetch_dedup_ttl_sec > max_prefetch_seconds) {
+        LOG(ERROR) << "SSD prefetch durations must be non-negative seconds "
+                      "representable in milliseconds";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    enable_ssd_prefetch_ = enable_ssd_prefetch;
+    ssd_prefetch_cooldown_sec_ = ssd_prefetch_cooldown_sec;
+    ssd_prefetch_dedup_ttl_sec_ = ssd_prefetch_dedup_ttl_sec;
     // A previous teardown that could not release NoF registrations leaves
     // caller-owned buffers whose DMA translation may still be live under the
     // OLD initiator's owner token. Re-init installs a fresh initiator whose
@@ -1517,7 +1532,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     << "sunrise_link protocol requires USE_SUNRISE build";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
 #endif
-            } else if (this->protocol == "ub") {
+            } else if (this->protocol == "ub" && !use_mmap_segment) {
+                // Only allocate_buffer_allocator_memory() memory goes back
+                // through the UB free path; hugepage mmaps fall through to
+                // munmap below.
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
             } else if (use_mmap_segment) {
@@ -1694,6 +1712,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
+    {
+        std::lock_guard<std::mutex> lock(dummy_heartbeat_mutex_);
+        dummy_ping_client_ = client_;
+    }
+
     return {};
 }
 
@@ -1868,7 +1891,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     // SSD prefetch knobs (all default off; see
     // docs/source/design/store/ssd-prefetch.md).
-    enable_ssd_prefetch_ =
+    const bool enable_ssd_prefetch =
         get_config_bool(config, CONFIG_KEY_ENABLE_SSD_PREFETCH, false);
     auto prefetch_cooldown_opt =
         get_config_size(config, CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC,
@@ -1880,10 +1903,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         !prefetch_dedup_ttl_opt.has_value()) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    ssd_prefetch_cooldown_sec_ =
-        static_cast<int64_t>(prefetch_cooldown_opt.value());
-    ssd_prefetch_dedup_ttl_sec_ =
-        static_cast<int64_t>(prefetch_dedup_ttl_opt.value());
 
     auto egm_config =
         ParseEgmStorePoolConfig(config, protocol, global_segment_size);
@@ -1894,7 +1913,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             local_buffer_size, protocol, rdma_devices, master_server_addr,
             nullptr, ipc_socket_path, 50052, enable_ssd_offload, true,
             ssd_offload_path, tenant_id, enable_client_http_server,
-            client_http_port, enable_embedded_master);
+            client_http_port, enable_embedded_master, enable_ssd_prefetch,
+            static_cast<int64_t>(*prefetch_cooldown_opt),
+            static_cast<int64_t>(*prefetch_dedup_ttl_opt));
         if (!result && egm_config->enabled) {
             (void)tearDownAll_internal();
         }
@@ -1953,6 +1974,11 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         offload_rpc_server_.reset();
     }
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    {
+        std::lock_guard<std::mutex> heartbeat_lock(dummy_heartbeat_mutex_);
+        dummy_ping_client_.reset();
+        dummy_heartbeats_.clear();
+    }
     if (file_storage_) {
         auto result = file_storage_->Shutdown();
         if (!result) storage_shutdown_error_ = result.error();
@@ -3085,20 +3111,37 @@ int RealClient::isExist(const std::string &key) {
     return isExist(key, ExistOptions{});
 }
 
-int RealClient::isExist(const std::string &key, const ExistOptions &options) {
+tl::expected<bool, ErrorCode> RealClient::isExistWithOptions_internal(
+    const std::string &key, const ExistOptions &options) {
     auto result = isExist_internal(key);
-
-    if (result.has_value()) {
-        // Best-effort SSD prefetch: synchronous part is a throttle dedup plus
-        // a pool enqueue; no RPC is added to the exist path.
-        if (options.prefetch_to_memory && *result && enable_ssd_prefetch_ &&
-            prefetcher_) {
-            prefetcher_->TriggerPrefetch({key});
-        }
-        return *result ? 1 : 0;  // 1 if exists, 0 if not
-    } else {
-        return toInt(result.error());
+    if (result && *result && options.prefetch_to_memory &&
+        enable_ssd_prefetch_ && prefetcher_) {
+        prefetcher_->TriggerPrefetch({key});
     }
+    return result;
+}
+
+int RealClient::isExist(const std::string &key, const ExistOptions &options) {
+    auto result = isExistWithOptions_internal(key, options);
+    return result ? (*result ? 1 : 0) : toInt(result.error());
+}
+
+std::vector<tl::expected<bool, ErrorCode>>
+RealClient::batchIsExistWithOptions_internal(
+    const std::vector<std::string> &keys, const ExistOptions &options) {
+    auto results = batchIsExist_internal(keys);
+    if (options.prefetch_to_memory && enable_ssd_prefetch_ && prefetcher_) {
+        std::vector<std::string> candidates;
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (results[i] && *results[i]) {
+                candidates.push_back(keys[i]);
+            }
+        }
+        if (!candidates.empty()) {
+            prefetcher_->TriggerPrefetch(candidates);
+        }
+    }
+    return results;
 }
 
 std::vector<int> RealClient::batchIsExist(
@@ -3108,29 +3151,12 @@ std::vector<int> RealClient::batchIsExist(
 
 std::vector<int> RealClient::batchIsExist(const std::vector<std::string> &keys,
                                           const ExistOptions &options) {
-    auto internal_results = batchIsExist_internal(keys);
+    auto internal_results = batchIsExistWithOptions_internal(keys, options);
     std::vector<int> results;
     results.reserve(internal_results.size());
-
-    const bool maybe_prefetch =
-        options.prefetch_to_memory && enable_ssd_prefetch_ && prefetcher_;
-    std::vector<std::string> prefetch_candidates;
-    for (size_t i = 0; i < internal_results.size(); ++i) {
-        const auto &result = internal_results[i];
-        if (result.has_value()) {
-            results.push_back(result.value() ? 1 : 0);  // 1 if exists, 0 if not
-            if (maybe_prefetch && result.value()) {
-                prefetch_candidates.push_back(keys[i]);
-            }
-        } else {
-            results.push_back(toInt(result.error()));
-        }
+    for (const auto &result : internal_results) {
+        results.push_back(result ? (*result ? 1 : 0) : toInt(result.error()));
     }
-
-    if (!prefetch_candidates.empty()) {
-        prefetcher_->TriggerPrefetch(prefetch_candidates);
-    }
-
     return results;
 }
 
@@ -3251,6 +3277,11 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
 tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     int fd, uint64_t dummy_base_addr, size_t shm_size, bool is_local_buffer,
     int32_t physical_device_id, const UUID &client_id) {
+    if (fd < 0) {
+        LOG(ERROR) << "Invalid file descriptor: " << fd;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    DummyRegistrationGuard registration(*this, client_id);
     std::stringstream addr_stream;
     addr_stream << "0x" << std::hex << dummy_base_addr;
 
@@ -3266,15 +3297,10 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
             if (shm.dummy_base_addr ==
                 static_cast<uintptr_t>(dummy_base_addr)) {
                 LOG(INFO) << "Segment already mapped: " << shm_name;
-                if (fd >= 0) close(fd);
+                close(fd);
                 return {};
             }
         }
-    }
-
-    if (fd < 0) {
-        LOG(ERROR) << "Invalid file descriptor: " << fd;
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Reject a second local buffer before mapping or registering its memory.
@@ -3413,6 +3439,7 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
 #endif
 
     context.mapped_shms.push_back(std::move(shm));
+    registration.mark_registered(is_local_buffer);
 
     LOG(INFO) << "Mapped new shared memory: " << shm_name
               << ", size: " << shm_size;
@@ -3422,6 +3449,11 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
 tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     const UUID &client_id) {
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    return unmap_shm_locked(client_id);
+}
+
+tl::expected<void, ErrorCode> RealClient::unmap_shm_locked(
+    const UUID &client_id) {
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
@@ -3529,6 +3561,7 @@ tl::expected<void, ErrorCode> RealClient::ascend_shm_internal(
                    << shareable_handle_bytes.size();
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    DummyRegistrationGuard registration(*this, client_id);
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto &context = shm_contexts_[client_id];
     for (const auto &region : context.mapped_shms) {
@@ -3592,6 +3625,7 @@ tl::expected<void, ErrorCode> RealClient::ascend_shm_internal(
             ClientBufferAllocator::create(mapped_va, vmm_size, this->protocol);
     }
     context.mapped_shms.push_back(std::move(region));
+    registration.mark_registered(is_local_buffer);
 #endif
     return {};
 }
@@ -3610,6 +3644,7 @@ tl::expected<void, ErrorCode> RealClient::ascend_ipc_shm_internal(
         LOG(ERROR) << "Invalid IPC key size: " << ipc_key_bytes.size();
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    DummyRegistrationGuard registration(*this, client_id);
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto &context = shm_contexts_[client_id];
     for (const auto &region : context.mapped_shms) {
@@ -3669,6 +3704,7 @@ tl::expected<void, ErrorCode> RealClient::ascend_ipc_shm_internal(
     }
 
     context.mapped_shms.push_back(std::move(region));
+    registration.mark_registered(is_local_buffer);
     LOG(INFO) << "IPC memory mapped: dummy_addr=0x" << std::hex
               << dummy_base_addr << ", real_addr=" << mapped_va << std::dec
               << ", size=" << mem_size << ", device_id=" << device_id;
@@ -3709,9 +3745,15 @@ void RealClient::teardown_ascend_shm_buffer(MappedShm &shm) {
 
 tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     const UUID &client_id) {
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    return ascend_unmap_shm_locked(client_id);
+}
+
+tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_locked(
+    const UUID &client_id) {
     LOG(INFO) << "[ascend_unmap_shm] client_id=" << client_id
               << ", action=unmapping";
-    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "[ascend_unmap_shm] client_id=" << client_id
@@ -4765,6 +4807,14 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    {
+        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        if (registered_buffer_sizes_.count(buffer)) {
+            LOG(ERROR) << "Buffer " << buffer << " is already registered";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
     // Only a HugeTLB segment's base address is widened to the physical
     // segment. ShmHelper::allocate rounds the mapping up to hugepage
     // granularity, so the MR bounds must coincide with the mapping bounds;
@@ -4840,6 +4890,13 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto unregister_result = [&]() -> tl::expected<void, ErrorCode> {
+        {
+            std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+            auto rec_it = registered_buffer_sizes_.find(buffer);
+            if (rec_it != registered_buffer_sizes_.end() &&
+                rec_it->second.te_released)
+                return {};
+        }
         auto &hook = TeUnregisterHookForTestingSlot();
         if (hook) {
             return hook(buffer);
@@ -4880,6 +4937,7 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
                        << buffer << ": " << toString(rc)
                        << "; buffer stays recorded and the NoF pages stay "
                           "quarantined. Do not free or remap this buffer.";
+            rec_it->second.te_released = true;
             return tl::unexpected(rc);
         }
     }
@@ -9198,70 +9256,115 @@ RealClient::batch_get_into_multi_buffers_internal(
     return results;
 }
 
+RealClient::DummyRegistrationGuard::DummyRegistrationGuard(
+    RealClient &owner, const UUID &client_id)
+    : owner_(owner), client_id_(client_id) {
+    std::lock_guard<std::mutex> lock(owner_.dummy_heartbeat_mutex_);
+    ++owner_.pending_dummy_registrations_[client_id_];
+}
+
+RealClient::DummyRegistrationGuard::~DummyRegistrationGuard() {
+    std::lock_guard<std::mutex> lock(owner_.dummy_heartbeat_mutex_);
+    auto it = owner_.pending_dummy_registrations_.find(client_id_);
+    if (--it->second == 0) owner_.pending_dummy_registrations_.erase(it);
+}
+
+void RealClient::DummyRegistrationGuard::mark_registered(bool is_local_buffer) {
+    std::lock_guard<std::mutex> lock(owner_.dummy_heartbeat_mutex_);
+    if (owner_.dummy_ping_client_.expired()) return;
+    // setup_dummy registers its local/control buffer synchronously before
+    // starting heartbeats. Recognize that first registration without forcing
+    // a reconnect during normal startup. A late data-buffer registration after
+    // expiry must still request the complete set. Reconnect registrations keep
+    // the notification already consumed by the preceding NEED_REMOUNT ping.
+    const auto now = std::chrono::steady_clock::now();
+    auto it = owner_.dummy_heartbeats_
+                  .try_emplace(client_id_,
+                               DummyClientHeartbeat{now, !is_local_buffer})
+                  .first;
+    it->second.last_seen = now;
+}
+
 tl::expected<PingResponse, ErrorCode> RealClient::ping(const UUID &client_id) {
-    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
-
-    if (!client_) {
-        LOG(ERROR) << "client_id=" << client_id << ", error=client_not_ready";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    bool healthy;
+    bool needs_remount;
+    {
+        std::lock_guard<std::mutex> lock(dummy_heartbeat_mutex_);
+        // Finish this atomic health read under the lifetime gate: teardown
+        // must not release segment memory while a ping keeps Client alive.
+        auto client = dummy_ping_client_.lock();
+        if (!client) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        healthy = client->is_ping_healthy();
+        auto [it, inserted] = dummy_heartbeats_.try_emplace(client_id);
+        it->second.last_seen = std::chrono::steady_clock::now();
+        needs_remount = inserted || it->second.needs_remount;
+        // Existing dummy clients synchronously re-register all buffers after
+        // a non-OK ping, then ping again to acknowledge recovery (also with
+        // zero buffers). A lost response causes the same reconnect path.
+        it->second.needs_remount = false;
     }
-
     ClientStatus client_status =
-        client_->is_ping_healthy() ? ClientStatus::OK : ClientStatus::UNDEFINED;
-
-    PodUUID pod_client_id = {client_id.first, client_id.second};
-    if (!dummy_client_ping_queue_.push(pod_client_id)) {
-        // Queue is full
-        LOG(ERROR) << "client_id=" << client_id
-                   << ", error=dummy_client_ping_queue_";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        healthy ? ClientStatus::OK : ClientStatus::UNDEFINED;
+    if (needs_remount) {
+        client_status = ClientStatus::NEED_REMOUNT;
+        LOG(INFO) << "client_id=" << client_id << ", action=need_remount";
     }
     return PingResponse(view_version_, client_status);
 }
 
 void RealClient::dummy_client_monitor_func() {
-    std::unordered_map<UUID, std::chrono::steady_clock::time_point,
-                       boost::hash<UUID>>
-        client_ttl;
+    const auto ttl = std::chrono::seconds(dummy_client_live_ttl_sec_);
     while (dummy_client_monitor_running_) {
-        auto now = std::chrono::steady_clock::now();
-
-        // Update the client ttl
-        PodUUID pod_client_id;
-        while (dummy_client_ping_queue_.pop(pod_client_id)) {
-            UUID client_id = {pod_client_id.first, pod_client_id.second};
-            client_ttl[client_id] =
-                now + std::chrono::seconds(dummy_client_live_ttl_sec_);
-        }
-
-        // Find out expired clients
         std::vector<UUID> expired_clients;
-        for (auto it = client_ttl.begin(); it != client_ttl.end();) {
-            if (it->second < now) {
-                LOG(INFO) << "client_id=" << it->first
-                          << ", action=client_expired";
-                expired_clients.push_back(it->first);
-                it = client_ttl.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
-        // Update the client status to NEED_REMOUNT
-        if (!expired_clients.empty()) {
-            for (auto &client_id : expired_clients) {
-                // Unmap mapped_shms associated with this client
-                if (globalConfig().ascend_agent_mode) {
-                    ascend_unmap_shm_internal(client_id);
-                } else {
-                    unmap_shm_internal(client_id);
+        {
+            std::lock_guard<std::mutex> lock(dummy_heartbeat_mutex_);
+            const auto now = std::chrono::steady_clock::now();
+            for (const auto &[id, heartbeat] : dummy_heartbeats_) {
+                if (now - heartbeat.last_seen > ttl &&
+                    !pending_dummy_registrations_.contains(id)) {
+                    expired_clients.push_back(id);
                 }
             }
+        }
+        for (const auto &client_id : expired_clients) {
+            try_expire_dummy_client(client_id);
         }
 
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kDummyClientMonitorSleepMs));
     }
+}
+
+bool RealClient::try_expire_dummy_client(const UUID &client_id) {
+    const auto ttl = std::chrono::seconds(dummy_client_live_ttl_sec_);
+    std::unique_lock<std::shared_mutex> shm_lock(dummy_client_mutex_);
+    {
+        std::lock_guard<std::mutex> lock(dummy_heartbeat_mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        auto it = dummy_heartbeats_.find(client_id);
+        // A ping or registration may have arrived while we waited for
+        // the SHM lock. Commit expiry only after checking again.
+        if (it == dummy_heartbeats_.end() ||
+            pending_dummy_registrations_.contains(client_id) ||
+            now - it->second.last_seen <= ttl) {
+            return false;
+        }
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=client_expired, last_activity_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         now - it->second.last_seen)
+                         .count();
+        // Unknown clients get NEED_REMOUNT on their next ping. No tombstones
+        // are needed for clients that never return.
+        dummy_heartbeats_.erase(it);
+    }
+    // Never hold the heartbeat lock during slow unregister/munmap.
+    if (globalConfig().ascend_agent_mode) {
+        ascend_unmap_shm_locked(client_id);
+    } else {
+        unmap_shm_locked(client_id);
+    }
+    return true;
 }
 
 int RealClient::start_dummy_client_monitor() {

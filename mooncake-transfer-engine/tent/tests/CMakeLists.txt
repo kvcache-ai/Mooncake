@@ -401,8 +401,14 @@ if(USE_CUDA)
     target_compile_definitions(tent_mnnvl_transport_test
                                PRIVATE MNNVL_TEST_CUDA_WRAPPERS)
     target_link_options(
-      tent_mnnvl_transport_test PRIVATE "-Wl,--wrap=cudaEventRecord"
-      "-Wl,--wrap=cudaEventQuery")
+      tent_mnnvl_transport_test
+      PRIVATE
+      "-Wl,--wrap=cudaEventRecord"
+      "-Wl,--wrap=cudaEventQuery"
+      "-Wl,--wrap=cuDeviceGetAttribute"
+      "-Wl,--wrap=dlsym"
+      "-Wl,--wrap=cudaMemcpyAsync"
+      "-Wl,--wrap=cudaStreamSynchronize")
   endif()
   foreach(
     case
@@ -634,6 +640,21 @@ if(USE_UB)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_native_data_path_test
            COMMAND tent_ub_native_data_path_test)
+
+  # Engine-level UB run on the test-only loopback adapter (no UB hardware).
+  if(USE_UB_MOCK)
+    add_executable(tent_ub_loopback_engine_test ub_loopback_engine_test.cpp)
+    target_link_libraries(tent_ub_loopback_engine_test PRIVATE gtest gtest_main
+                                                               tent_link_group)
+    target_include_directories(
+      tent_ub_loopback_engine_test
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+              ${CMAKE_CURRENT_SOURCE_DIR}/ub_mock)
+    add_test(NAME tent_ub_loopback_engine_test
+             COMMAND tent_ub_loopback_engine_test)
+    set_tests_properties(tent_ub_loopback_engine_test
+                         PROPERTIES ENVIRONMENT "MC_TENT_UB_MOCK=1" TIMEOUT 120)
+  endif()
 endif()
 
 # End-to-end failover test: drives real TransferEngineImpl with
@@ -1056,6 +1077,8 @@ if(USE_MLU)
     add_test(NAME tent_mlu_${suite}_test COMMAND tent_mlu_${suite}_test)
     set_tests_properties(tent_mlu_${suite}_test PROPERTIES TIMEOUT 300)
   endforeach()
+  target_link_options(tent_mlu_platform_test PRIVATE
+                      "-Wl,--wrap=cnrtDeviceGetByPCIBusId")
   foreach(suite transport engine)
     target_link_options(
       tent_mlu_${suite}_test PRIVATE "-Wl,--wrap=cnGetMemAttribute"
@@ -1064,6 +1087,7 @@ if(USE_MLU)
   target_link_options(
     tent_mlu_transport_test
     PRIVATE
+    "-Wl,--wrap=cnrtDeviceGetByPCIBusId"
     "-Wl,--wrap=cnrtHostMalloc"
     "-Wl,--wrap=cnrtFreeHost"
     "-Wl,--wrap=cnrtMapMemHandle"
