@@ -169,6 +169,75 @@ def test_snapshot_writer_rejects_commit_with_missing_fragment() -> None:
     assert store.objects[writer.plan.control_key]
 
 
+def _payload_keys(store, writer) -> list[str]:
+    prefix = f"{writer.plan.manifest.group_id}/payload/"
+    return [key for key in store.objects if key.startswith(prefix)]
+
+
+def _fail_payload_existence_checks(store) -> None:
+    # The payload put succeeds, then the post-put existence check reports an
+    # RPC error, so upload() raises without returning any receipts.
+    store.batch_is_exist = lambda keys: [-1] * len(keys)
+
+
+def test_snapshot_writer_abort_removes_payloads_of_failed_first_flush() -> None:
+    store, weight_store = make_weight_store()
+    source = source_manifests(dp=1, tp=1)
+    writer = weight_store.begin_weight_snapshot(
+        _snapshot_descriptor(source),
+        _SnapshotAdapter(source),
+    )
+    fragment = source.bindings[0].fragments[0]
+    _fail_payload_existence_checks(store)
+
+    with pytest.raises(WeightStoreError, match="payload existence check failed"):
+        writer.write_tensor(
+            source.placement.tensors[0].tensor_id,
+            fragment.placement_fragment_id,
+        )
+
+    assert _payload_keys(store, writer) == []
+    assert writer.plan.manifest.manifest_key not in store.objects
+    assert b'"decision":"abort"' in store.objects[writer.plan.control_key]
+
+
+def test_snapshot_writer_abort_is_retryable_after_cleanup_failure() -> None:
+    store, weight_store = make_weight_store()
+    source = source_manifests(dp=1, tp=1)
+    writer = weight_store.begin_weight_snapshot(
+        _snapshot_descriptor(source),
+        _SnapshotAdapter(source),
+    )
+    fragment = source.bindings[0].fragments[0]
+    _fail_payload_existence_checks(store)
+    remove = store.remove
+    store.remove = lambda key, force=False: -1
+
+    # write_tensor() aborts on failure; the cleanup error chains the original.
+    with pytest.raises(WeightStoreError, match="upload cleanup failed") as info:
+        writer.write_tensor(
+            source.placement.tensors[0].tensor_id,
+            fragment.placement_fragment_id,
+        )
+    assert "payload existence check failed" in str(info.value.__context__)
+    assert len(_payload_keys(store, writer)) == 1
+
+    with pytest.raises(WeightStoreError, match="upload cleanup failed"):
+        writer.abort()
+    assert len(_payload_keys(store, writer)) == 1
+
+    store.remove = remove
+    writer.abort()
+
+    assert _payload_keys(store, writer) == []
+    with pytest.raises(WeightStoreError, match="Weight snapshot is closed"):
+        writer.write_tensor(
+            source.placement.tensors[0].tensor_id,
+            fragment.placement_fragment_id,
+        )
+    writer.abort()
+
+
 def test_snapshot_writer_rejects_fragment_for_another_tensor() -> None:
     _, weight_store = make_weight_store()
     source = source_manifests(dp=1, tp=2)

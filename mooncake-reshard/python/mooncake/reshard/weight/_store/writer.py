@@ -63,6 +63,7 @@ class WeightStoreWriter:
         self._receipts: list[UploadReceipt] = []
         self._closed = False
         self._committed = False
+        self._aborted = False
         self._commit_decision_may_exist = False
 
     @property
@@ -159,15 +160,18 @@ class WeightStoreWriter:
     def abort(self) -> None:
         """Remove uploaded payloads unless this writer has already committed."""
 
-        if self._closed:
+        if self._committed or self._aborted:
             return
         if self._commit_decision_may_exist:
             raise WeightStoreError(
                 "Weight snapshot commit decision may exist; retry commit instead"
             )
+        # Reject further writes even if cleanup fails, but leave abort retryable.
         self._closed = True
-        if self._receipts:
-            self._weight_store.abort_upload(self._plan, self._receipts)
+        # A failed upload() may have stored payloads without returning receipts,
+        # so clean up the whole plan even when no receipts were collected.
+        self._weight_store.abort_upload(self._plan, self._receipts)
+        self._aborted = True
 
     def _mark_commit_decision_may_exist(self) -> None:
         self._commit_decision_may_exist = True
