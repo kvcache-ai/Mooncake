@@ -132,6 +132,14 @@ Workers::Workers(RdmaTransport* transport)
 
     params.strict_local_numa =
         conf->get("transports/rdma/strict_local_numa", false);
+    params.closest_tier_only =
+        conf->get("transports/rdma/closest_tier_only", false);
+    dest_device_affinity_ =
+        conf->get("transports/rdma/dest_device_affinity", false);
+    if (dest_device_affinity_) {
+        LOG(INFO) << "RDMA dest device affinity enabled: remote NIC follows "
+                     "the same-name direct rail";
+    }
 
     // ============================================================
     // Bandwidth Estimation (EWMA)
@@ -1769,11 +1777,35 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
         return Status::DeviceNotFound(
             "No device could access the slice memory region" LOC_MARK);
 
-    if (slice->target_dev_id < 0) {
+    // Use the same-name direct rail and skip the memory-tier check. Without
+    // a same-name peer, keep the existing selection path.
+    bool affinity_pinned = false;
+    if (dest_device_affinity_) {
+        int direct = rail.directRemoteDevice(slice->source_dev_id);
+        if (direct >= 0) {
+            slice->target_dev_id = direct;
+            affinity_pinned = true;
+        } else if (!affinity_miss_warned_.exchange(true)) {
+            // The switch only pins a rail when both ends have a NIC with the
+            // same name. Say so once instead of silently falling back, which
+            // otherwise looks like the switch did nothing.
+            const auto* local_nic =
+                source.topo->getNicEntry(slice->source_dev_id);
+            LOG(WARNING) << "MC_ENABLE_DEST_DEVICE_AFFINITY is set, but peer "
+                         << target.segment->machine_id << " has no NIC named "
+                         << (local_nic ? local_nic->name : "<unknown>")
+                         << " that matches local NIC; keeping the normal "
+                            "selection path";
+        }
+    }
+    if (!affinity_pinned && slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
+        // A receiver NIC outside the target's closest rank DMAs into GPU
+        // memory across the host bridge; at line rate that triggers PFC.
+        const bool closest_tier_only =
+            device_selector_->getSchedulingParams().closest_tier_only;
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
-            if (rank && always_tier1_) break;
             const auto& list = target.topo_entry->device_list[rank];
             if (list.empty()) continue;
             if (std::find(list.begin(), list.end(), mapped_dev_id) !=
@@ -1781,6 +1813,7 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
                 slice->target_dev_id = mapped_dev_id;
                 break;
             }
+            if (closest_tier_only) break;
         }
     }
 
@@ -1848,9 +1881,19 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
             << "Optimal device pair not available: source_dev_id "
             << slice->source_dev_id << ", target_dev_id "
             << slice->target_dev_id;
+        // Stay on the pinned NIC instead of falling back to another rail.
+        if (affinity_pinned) {
+            return Status::DeviceNotFound(
+                "Same-name remote NIC is not available" LOC_MARK);
+        }
         return selectFallbackDevice(source, target, slice);
     }
 
+    // A retry released its charge before coming back here. allocate() does
+    // not run again when the local NIC is already chosen, so recharge the
+    // device this attempt will actually use. The first attempt already set
+    // charged_dev, and rechargeSlice is a no-op in that case.
+    rechargeSlice(slice, slice->source_dev_id);
     slice->rail_monitor = std::move(rail_monitor);
     slice->rail_probe_token = probe_token;
     return Status::OK();
@@ -2001,7 +2044,24 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
     CHECK_STATUS(getRouteHint(target, target_id, (uint64_t)slice->target_addr,
                               slice->length));
 
-    if (slice->retry_count == 0)
+    // Stay on the optimal path for a retry only when this local NIC is
+    // actually pinned to a same-name peer. The affinity switch alone must
+    // not stop the original rotation.
+    bool same_name_pinned = false;
+    if (slice->retry_count != 0 && dest_device_affinity_ &&
+        slice->source_dev_id >= 0 && target.segment) {
+        auto& worker = worker_context_[tl_wid];
+        auto rail = getOrCreateRail(worker.rails, target.segment->machine_id);
+        if (!rail->ready() || source.topo != rail->local() ||
+            target.topo != rail->remote()) {
+            CHECK_STATUS(rail->load(
+                std::shared_ptr<const Topology>(source.pin, source.topo),
+                std::shared_ptr<const Topology>(target.pin, target.topo),
+                rail_topo_json_, transport_->conf_.get()));
+        }
+        same_name_pinned = rail->directRemoteDevice(slice->source_dev_id) >= 0;
+    }
+    if (slice->retry_count == 0 || same_name_pinned)
         CHECK_STATUS(selectOptimalDevice(source, target, slice));
     else
         CHECK_STATUS(selectFallbackDevice(source, target, slice));

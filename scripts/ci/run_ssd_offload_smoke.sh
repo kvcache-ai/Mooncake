@@ -77,6 +77,13 @@ MASTER_SERVER=127.0.0.1:50051 \
   python python/tests/ssd/test_prefetch_on_exist.py
 ci_stop_service prefetch
 
+# Exercise the actual standalone client binary, including its production
+# handler registration and the DummyClient -> RealClient options RPCs.
+MC_RUN_CLIENT_PREFETCH_E2E=1 \
+  MOONCAKE_STORE_BACKEND=cpp \
+  MC_USE_TENT=0 \
+  python python/tests/ssd/test_mooncake_client_prefetch.py
+
 # Snapshot-after-close: background offload only (no eviction pressure), so
 # the closed writer's memory replica is the one under test.
 mkdir -p /tmp/mooncake_ci_snapshot_close

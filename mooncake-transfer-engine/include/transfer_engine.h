@@ -21,6 +21,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -34,6 +35,7 @@
 namespace mooncake {
 class ShutdownToken;
 class TransferEngineImpl;
+class BatchSubmitExecutor;
 namespace tent {
 class Config;
 class TransferEngine;
@@ -167,6 +169,26 @@ class TransferEngine {
 
     int removeLocalSegment(const std::string& segment_name);
 
+    // Do not call concurrently with memory registration.
+    int enableMemoryRegistrationReuse();
+
+    // Register [addr, addr + length) for local and (when remote_accessible)
+    // remote RDMA access.
+    //
+    // HugeTLB sub-views: RDMA transports that madvise the registered range
+    // (RDMA transports call ibv_fork_init, whose MADV_DONTFORK the kernel
+    // refuses to apply to a hugetlb VMA split inside a huge page) first try
+    // the range as given. Only if that is rejected with EINVAL is the
+    // registration retried over the enclosing huge pages. The resulting MR —
+    // and the rkey/lkey handed to peers — therefore covers whole huge pages,
+    // including padding outside [addr, addr + length). Access rights are
+    // per-MR, not per-range: a peer that holds the key can address that
+    // padding, which may contain application data that was never registered.
+    // The published description advertises only the requested range, but that
+    // is a cooperative boundary, not an enforced one. A caller unwilling to
+    // expose neighbouring bytes must register the whole hugepage-aligned
+    // mapping itself (whose sub-ranges it then owns exclusively) rather than
+    // passing a sub-view.
     int registerLocalMemory(void* addr, size_t length,
                             const std::string& location = kWildcardLocation,
                             bool remote_accessible = true,
@@ -187,6 +209,27 @@ class TransferEngine {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries);
+
+    using SubBatchRequestBuilder =
+        std::function<std::vector<TransferRequest>(size_t begin, size_t end)>;
+
+    struct ParallelBatchTransferFailureInfo {
+        // At least one engine submit API returned an error.
+        bool submit_failed = false;
+        // Only native FAILED/TIMEOUT errors, without parent expiry/shutdown.
+        bool retryable = false;
+    };
+
+    // Opt-in synchronous path for independent ranges to one peer.
+    // nullopt means disabled, below threshold, or unsupported before publish.
+    // The builder runs once per sub-batch and must return the requested range
+    // as valid READ/WRITE requests to peer, preserving every request field.
+    // The caller must ensure that all requests can execute independently;
+    // these preconditions are not checked by scanning the built requests.
+    std::optional<Status> tryParallelBatchTransfer(
+        SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
+        std::chrono::nanoseconds timeout,
+        ParallelBatchTransferFailureInfo* failure_info = nullptr);
 
     struct ScatterTransferRange {
         TransferRequest::OpCode opcode;
@@ -375,7 +418,13 @@ class TransferEngine {
     void enableGracefulShutdown();
     std::string showLinks(bool json = false) const;
 
+    bool supportsParallelBatchSubmit(SegmentID peer) const;
+
+    bool isBatchSubmitEligible(size_t count) const;
+
    private:
+    struct TESubBatchAdapter;
+
     Status submitScatterTransfer(BatchID batch_id,
                                  const std::vector<TransferRequest>& entries);
 
@@ -384,6 +433,7 @@ class TransferEngine {
         const std::string& local_server_name) const;
 
     std::shared_ptr<TransferEngineImpl> impl_;
+    std::shared_ptr<BatchSubmitExecutor> batch_submit_executor_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
     std::unique_ptr<Transport> tent_compat_transport_;
     std::mutex tent_compat_transport_mutex_;

@@ -9,8 +9,8 @@ completion overhead. They do not establish that this branch has passed
 production acceptance, nor imply that previously deployed MNNVL systems were
 unusable.
 
-This page describes the workspace-root implementation, including the
-registration and completion repairs. The classic implementation,
+This page describes the workspace-root implementation, including the F5/F2/F1
+changes and the registration/routing repairs. The classic implementation,
 serving-framework connectors, public Transfer Engine requests, and Python
 bindings are unchanged by this work.
 
@@ -25,13 +25,17 @@ Implementation entry points:
 | Path | Implementation | Build/runtime selection | Memory sharing |
 | --- | --- | --- | --- |
 | Classic MNNVL | `NvlinkTransport`, protocol `nvlink` | `USE_MNNVL=ON`; `MC_FORCE_MNNVL=1` influences automatic discovery | CUDA VMM and FABRIC exports; classic IPC handling where applicable |
-| Native TENT MNNVL | `MnnvlTransport`, type `MNNVL` | `USE_TENT=ON`, `USE_CUDA=ON`; public wrapper selects TENT with `MC_USE_TENT=1` or `MC_USE_TEV1=1`; native loader selects MNNVL with `MC_ENABLE_MNNVL` | CUDA VMM, normally FABRIC handles |
+| Native TENT MNNVL | `MnnvlTransport`, type `MNNVL` | `USE_TENT=ON`, `USE_CUDA=ON`; public wrapper selects TENT with `MC_USE_TENT=1` or `MC_USE_TEV1=1`; native loader selects MNNVL with `MC_ENABLE_MNNVL` or strict mode | CUDA VMM, normally FABRIC handles |
 | Same-host NVLink | Classic `IntraNodeNvlinkTransport` or native TENT `NVLinkTransport` | Separate intra-node/NVLINK selection | Same-machine CUDA IPC/P2P; not proof of cross-node MNNVL |
 
-`MC_FORCE_MNNVL` and `MC_ENABLE_MNNVL` are not interchangeable. The
-`MC_MNNVL_*` controls below apply to native TENT, not classic
+`MC_FORCE_MNNVL` and `MC_ENABLE_MNNVL` are not interchangeable. The new
+`MC_MNNVL_*` hardening controls below apply to native TENT, not classic
 `NvlinkTransport`. Installing a transport is also distinct from selecting it
 for a particular request.
+
+The classic path already caches caller-sync events and CUDA streams per thread
+and device. F2 adds a different resource: reusable **completion events** for
+native TENT submission groups, together with shared polling.
 
 ## End-to-End Architecture
 
@@ -144,9 +148,6 @@ copy APIs with `cudaMemcpySrcAccessOrderStream`, or older per-copy
 `cudaMemcpyAsync`. A completion event is recorded after a submission's copies.
 Appending tasks creates another completion group instead of replacing the
 previous event. Task indices retain their own completion-group association.
-A mutex serializes submit/poll bookkeeping within one sub-batch. Independent
-sub-batches retain independent events and may submit concurrently. Sub-batch
-teardown attempts to drain pending copy work before returning stream resources.
 
 Successful submission means work was accepted, not that KV data is ready.
 Completion must still be polled before the application publishes receiver
@@ -155,12 +156,93 @@ accepted work and report terminal task failure. They do not return an error
 that invites blind resubmission of an already accepted copy prefix. A failed
 CUDA drain is logged and cannot be treated as confirmed safe reuse.
 
+## F5: Strict FABRIC, No Silent Downgrade
+
+`require_fabric=true` makes native TENT fail closed for MNNVL-relevant memory
+transfers: CUDA on either endpoint, an explicit MNNVL hint, or EGM-enabled
+memory transfers. It is not a blanket ban on all control-plane TCP traffic or
+unrelated host-only/non-memory operations.
+
+- Bootstrap requires a CUDA build/platform and usable MNNVL installation.
+  Disabled MNNVL, non-FABRIC handle selection, and forced TCP conflict with
+  strict configuration.
+- Relevant transport-owned allocations must succeed through CUDA VMM rather
+  than silently falling back to `cudaMalloc` or ordinary host allocation.
+- Remotely accessible registration requires an actual FABRIC export and an
+  MNNVL transport tag; a backend's success without an export is insufficient.
+- Routing requires policy authorization and MNNVL capability. A conflicting
+  transport hint or policy exclusion fails instead of overriding policy.
+- Relevant remote targets require an accessible export. Process-local targets
+  are exempt from **remote-export** checks, but still require registration,
+  policy authorization, and a valid opcode/permission. WRITE to a locally known
+  `kGlobalReadOnly` target remains rejected.
+- Submit-stage and poll-stage failover cannot downgrade a strict MNNVL task to
+  RDMA/TCP. Failures surface to the caller.
+
+These checks prevent unintended data-path downgrade; they do not prove that an
+external allocator, serving framework, or a historical peer is correctly
+configured. Verify the actual allocation, engine, and per-transfer route.
+
+## F2: Completion Pooling and Shared Polling
+
+- Idle completion events are shared across sub-batches only within their
+  creation CUDA context. The total idle capacity remains per device across
+  all contexts. Each submission owns a noncopyable completion lease retaining
+  pool lifetime; event cleanup restores the caller's exact context. CUDA 12+
+  context IDs also prevent reuse across destroyed/recreated context handles.
+  With older CUDA headers, application contexts must outlive their pooled
+  events.
+- Only successfully completed, error-free recorded events are recycled.
+  Pending, failed, or unrecorded events are discarded. Sub-batch teardown
+  attempts to drain pending copy work before returning stream resources.
+- `completion_event_pool_capacity` limits retained **idle events per device**;
+  it is not admission control and does not cap all in-flight events.
+- Pooling also enables shared completion queries. An increasing task sweep
+  reuses its group's pending result; equal/earlier task indices query again so
+  polling one task or restarting a sweep cannot freeze progress. Terminal
+  completion/failure is shared by that group's tasks.
+- A mutex serializes submit/poll bookkeeping within one sub-batch. Independent
+  sub-batches retain independent events and may submit concurrently.
+
+The enable flag controls both event reuse and shared pending-completion
+polling. To isolate the benefit of event reuse, keep the pool enabled and
+compare capacities `0` and `256`: both share polling, but only the latter
+retains idle events. Disabling the pool retains a capacity-zero pool for event
+acquisition and release, including its mutex and teardown query; it does not
+remove all pool-management overhead.
+
+The intended benefit is fewer event create/destroy calls and repeated queries.
+No throughput or latency improvement has been measured for this branch yet.
+
+## F1: GPU-Side Caller Dependency
+
+The transport records its existing caller-sync event on
+`cudaStreamPerThread`, on the original caller's device:
+
+```text
+cpu_block: record caller event -> CPU event synchronize -> enqueue copy
+ gpu_wait: record caller event -> copy stream waits on event -> enqueue copy
+```
+
+`gpu_wait` removes the host wait for this dependency; it does not remove CUDA
+stream ordering or make one sub-batch's copies run in parallel. Re-recording
+the cached caller event does not change previously enqueued waits.
+
+Existing PD producer-event fencing remains mandatory. An event on the
+transport caller's per-thread stream does **not** automatically capture work
+on an arbitrary PyTorch/application stream. No producer-event propagation was
+added to requests, connectors, or Python APIs.
+
+`gpu_wait` requires `enable_runtime_queue=false`: deferred worker dispatch
+would observe the worker's stream rather than the original caller's stream.
+
 ## Reviewed P1/P2 Repairs
 
 | Severity | Defect | Repair and regression coverage |
 | --- | --- | --- |
 | P1 | Exporting an owned allocation replaced the logical registered range with the full mapping, widening metadata and breaking exact duplicate/unregister identity | Keep logical address/length; encode mapping extent/offset separately; test prefix/interior registrations, duplicate refcounts, original-range unregister, import readback, and cache bounds |
 | P2 | Defensive cleanup after a failed host registration could unpin an earlier successful registration at the same address | Attach a local-only shared ownership token to successful pins; cleanup checks address, length, and owner identity; test partial batch rollback and stale snapshots against a later owner |
+| P2 | Strict routing treated a process-local target as though it needed a remote export | Exempt only `LOCAL_SEGMENT_ID` from remote-export requirements; test READ/WRITE, implicit/explicit MNNVL hints, both selectors, policy exclusion, invalid target range, and no TCP submission |
 
 The host-pin token is copied through local registry snapshots but is not
 serialized into peer metadata. A failed registration gets no ownership token
@@ -172,24 +254,37 @@ Native TENT bootstrap defaults remain conservative:
 
 | JSON path | Environment override | Default |
 | --- | --- | --- |
+| `transports/mnnvl/require_fabric` | `MC_MNNVL_REQUIRE_FABRIC` | `false` |
+| `transports/mnnvl/completion_event_pool` | `MC_MNNVL_COMPLETION_EVENT_POOL` | `false` |
+| `transports/mnnvl/completion_event_pool_capacity` | None added | `256` idle events/device |
+| `transports/mnnvl/sync_mode` | `MC_MNNVL_SYNC_MODE` | `cpu_block` |
 | `transports/mnnvl/egm` | `MC_MNNVL_EGM` | `false` |
 
-Use actual JSON booleans in configuration files. Recreate the engine to change
-these bootstrap settings.
+Capacity accepts integers in `[0, 1048576]`; zero retains no idle events.
+`sync_mode` accepts only `cpu_block` or `gpu_wait`. The new boolean environment
+controls accept `true/false`, `1/0`, `yes/no`, and `on/off`; malformed new
+controls fail configuration. Use actual JSON booleans in configuration files.
+Recreate the engine to change these bootstrap settings.
 
 MNNVL retains some legacy-named tuning keys under `transports/nvlink`, including
 `handle_type` (normally `fabric`) and `host_register` (default `true`).
 `MC_ENABLE_MNNVL` is presence-based in the native loader; setting it to `0`
-still enables loading.
+still enables loading. `MC_FORCE_TCP` is also presence-based and conflicts with
+strict mode, even when its text is `0`.
 
 An opt-in native configuration, supplied through `MC_TENT_CONF` as an inline
 JSON object or a file path:
 
 ```json
 {
+  "enable_runtime_queue": false,
   "transports": {
     "mnnvl": {
       "enable": true,
+      "require_fabric": true,
+      "completion_event_pool": true,
+      "completion_event_pool_capacity": 256,
+      "sync_mode": "gpu_wait",
       "egm": false
     },
     "nvlink": { "handle_type": "fabric" }
@@ -197,17 +292,19 @@ JSON object or a file path:
 }
 ```
 
-For native use, set `MC_ENABLE_MNNVL=1`; the `enable` key alone is not a
-substitute for the current loader's activation condition.
+Strict mode causes native MNNVL loading without needing `MC_ENABLE_MNNVL`.
+For non-strict native use, set `MC_ENABLE_MNNVL=1`; the `enable` key alone is
+not a substitute for the current loader's activation condition.
 
 ### Metrics
 
 With compile-time and runtime TENT metrics enabled, observe
-`tent_mnnvl_events_total{event="..."}` with event `fabric_fallback`. JSON
-output has corresponding `tent_mnnvl_<event>_total` aliases.
+`tent_mnnvl_events_total{event="..."}` with events `fabric_fallback`,
+`strict_failure`, `pool_hit`, `pool_miss`, and `completion_query`. JSON output
+has corresponding `tent_mnnvl_<event>_total` aliases.
 
-Compare host submission latency, CPU utilization, throughput, and PD p95/p99
-latency against defaults.
+Compare pool hit rate, completion-query count per request, host submission
+latency, CPU utilization, throughput, and PD p95/p99 latency against defaults.
 A zero fallback counter alone is not proof that KV payloads took MNNVL: inspect
 engine selection, exported metadata, route, and fabric/NIC traffic together.
 
@@ -237,12 +334,15 @@ For testing this branch's native TENT optimizations on compatible peers:
 export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
 export MC_USE_TENT=1
 export MC_ENABLE_MNNVL=1
+export MC_MNNVL_REQUIRE_FABRIC=1
+export MC_MNNVL_COMPLETION_EVENT_POOL=1
+export MC_MNNVL_SYNC_MODE=gpu_wait
 ```
 
-Do not use `MC_FORCE_MNNVL` as a substitute for native activation. These
-settings are a validation example, not a production-certified recipe: the
-external allocator limitation below must be checked against the actual
-SGLang/Mooncake versions first.
+Leave `enable_runtime_queue=false`, and do not use `MC_FORCE_MNNVL` as a
+substitute for native activation. These settings are a validation example,
+not a production-certified recipe: the external allocator limitation below
+must be checked against the actual SGLang/Mooncake versions first.
 
 Launch prefill and decode workers using their existing model, network, and TP
 settings, adding `--disaggregation-mode prefill` or
@@ -261,12 +361,14 @@ membership, and usable control-plane addresses remain required.
   importers. Exact whole-allocation raw handles retain their previous format,
   but that is not a blanket classic/TENT interoperability guarantee.
 - External caller-created VMM mappings are not in `allocate_set_`.
-  `cuMemGetAddressRange` need not discover their extent. This work does not
-  add an external allocator extent API. An SGLang custom pool can expose this
-  limitation.
-- External-VMM handling retains the prior best-effort extent fallback.
-  Correct arbitrary interior-subrange discovery is not guaranteed when the
-  underlying allocation extent is unknown.
+  `cuMemGetAddressRange` need not discover their extent. If authoritative
+  extent discovery fails, strict registration rejects with
+  `Strict MNNVL cannot determine export allocation extent`. This work does
+  not add an external allocator extent API. An SGLang custom pool can expose
+  this limitation; allocator fallback is not a remedy for strict FABRIC.
+- Non-strict external-VMM handling retains the prior best-effort extent
+  fallback. Correct arbitrary interior-subrange discovery is not guaranteed
+  when the underlying allocation extent is unknown.
 - Logical TE range validation is not hardware isolation from an untrusted
   peer: a CUDA FABRIC handle grants allocation-level access. Use trusted peers
   and appropriate fabric isolation.
@@ -308,10 +410,11 @@ Hardware acceptance still requires:
 1. Two-node FABRIC READ/WRITE with whole allocations and interior logical
    ranges, plus byte-level KV checks. Same-host POSIX-FD readback is not a
    substitute for this test.
-2. Negative cases: malformed or out-of-range exports and copy/poll errors
-   surfacing as terminal task failures.
-3. Delayed producers on the existing PD stream/event path, concurrent batches,
-   repeated appends, polling progress, and teardown.
+2. Strict negative cases: unavailable FABRIC/IMEX, unsupported/nonexportable
+   allocation, absent export, conflicting policy/hint, and copy/poll errors;
+   no unintended RDMA/TCP payload fallback.
+3. Delayed producers on the existing PD stream/event path in both sync modes,
+   concurrent batches, repeated appends, polling progress, and teardown.
 4. SGLang PD correctness and sustained p95/p99 latency/CPU/throughput comparison
    with defaults, then staged capacity testing under realistic concurrency.
 

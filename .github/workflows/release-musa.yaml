@@ -71,7 +71,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.26.9'
+          go-version: '1.26.10'
           cache: false
 
       - name: Set Python bin
@@ -116,6 +116,7 @@ jobs:
           mkdir build
           cd build
           cmake_args=(
+            -DWITH_CONDUCTOR=ON
             -DUSE_MUSA=ON
             -DWITH_EP=ON
             -DUSE_HTTP=ON

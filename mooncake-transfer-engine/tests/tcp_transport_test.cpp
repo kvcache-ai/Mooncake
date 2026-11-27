@@ -390,6 +390,7 @@ TEST_F(TCPTransportTest, CApiBatchTransferStatus) {
               kInvalidArgument);
     EXPECT_EQ(getBatchTransferStatus(c_engine, INVALID_BATCH, &status),
               kInvalidArgument);
+    EXPECT_EQ(getBatchTransferStatus(c_engine, 0, &status), kInvalidArgument);
     EXPECT_EQ(getBatchTransferStatus(c_engine, batch_id, nullptr),
               kInvalidArgument);
 

@@ -13,16 +13,10 @@
 
 #include <gtest/gtest.h>
 
+#include "client_session/client_session_registry_test_peer.h"
 #include "replica.h"
 
 namespace mooncake::test {
-class ClientSessionRegistryTestPeer {
-   public:
-    using Record = std::shared_ptr<ClientLivenessRecord>;
-    static Record Find(const ClientSessionRegistry& registry, const UUID& id) {
-        return registry.Find(id);
-    }
-};
 
 // Inheriting the peer lets these tests call its accessors unqualified; it
 // stays the only boundary to the registry's internals.
@@ -61,6 +55,55 @@ void Suspect(const ClientSessionRegistryTestPeer::Record& record) {
 void Retire(const ClientSessionRegistryTestPeer::Record& record) {
     EXPECT_EQ(record->Evaluate(Clock::now(), 0s, 0s),
               Transition::BECAME_OFFLINE);
+}
+
+TEST_F(ClientSessionRegistryTest, HostHintsBelongToTheSession) {
+    ClientSessionRegistry registry;
+    EXPECT_TRUE(registry.GetHostId(kClient).empty());
+    // A hint has nowhere to live before the client has a session.
+    registry.UpdateHostId(kClient, "host-a");
+    EXPECT_TRUE(registry.GetHostId(kClient).empty());
+    Register(registry);
+    registry.UpdateHostId(kClient, "host-a");
+    registry.UpdateHostId(kClient, "");
+    EXPECT_EQ(registry.GetHostId(kClient), "host-a");
+    // Host hints stage until Commit() so an abandoned scope preserves the old
+    // hint, and post-commit updates apply immediately while the scope is held.
+    {
+        auto registration = registry.BeginRegistration(kClient);
+        ASSERT_TRUE(registration);
+        registration->UpdateHostId("host-b");
+        registration->UpdateHostId("");
+        EXPECT_EQ(registry.GetHostId(kClient), "host-a");
+        registration->Commit();
+        EXPECT_EQ(registry.GetHostId(kClient), "host-b");
+        registration->UpdateHostId("host-c");
+        registration->UpdateHostId("");
+        EXPECT_EQ(registry.GetHostId(kClient), "host-c");
+    }
+    EXPECT_TRUE(registry.GetHostId(UUID{3, 4}).empty());
+    registry.Reset();
+    EXPECT_TRUE(registry.GetHostId(kClient).empty());
+}
+
+TEST_F(ClientSessionRegistryTest,
+       MovedRegistrationUpdatesOnlyItsClientHostHint) {
+    ClientSessionRegistry registry;
+    const UUID other{3, 4};
+    Register(registry, other);
+    registry.UpdateHostId(other, "other-host");
+    {
+        auto original = registry.BeginRemount(kClient);
+        auto remount = std::move(original);
+        ASSERT_TRUE(remount);
+        EXPECT_FALSE(original->Session());
+        remount->UpdateHostId("host-a");
+        EXPECT_TRUE(registry.GetHostId(kClient).empty());
+        EXPECT_EQ(registry.GetHostId(other), "other-host");
+        remount->Commit();
+        EXPECT_EQ(registry.GetHostId(kClient), "host-a");
+    }
+    EXPECT_EQ(registry.GetHostId(kClient), "host-a");
 }
 
 TEST_F(ClientSessionRegistryTest, RemovingOldIncarnationPreservesNewHostHint) {
@@ -108,6 +151,28 @@ TEST_F(ClientSessionRegistryTest, GuardsCombineLookupAndStateAdmission) {
     EXPECT_FALSE(registry.TryAcquireServingSession(kClient));
 }
 
+TEST_F(ClientSessionRegistryTest, OperationsOnOneClientRunConcurrently) {
+    ClientSessionRegistry registry;
+    auto record = Register(registry);
+    auto first = registry.TryAcquireServingSession(kClient);
+    ASSERT_TRUE(first);
+    const auto slot = FindSlot(registry, kClient);
+    // A second operation on the same client must not queue behind the first.
+    // Only a state transition excludes admission, so requests of one client
+    // (and requests that hold it as a replication source) stay parallel.
+    auto second = std::async(std::launch::async, [&] {
+        return registry.TryAcquireRetainingSession(kClient).has_value() &&
+               AcquireSharedOperation(slot);
+    });
+    EXPECT_EQ(second.wait_for(1s), std::future_status::ready);
+    EXPECT_TRUE(second.get());
+    // Transitions still wait for every operation admitted before them.
+    EXPECT_FALSE(AcquireExclusiveOperation(slot, /*try_lock=*/true));
+    first.reset();
+    EXPECT_TRUE(AcquireExclusiveOperation(slot, /*try_lock=*/true));
+    EXPECT_EQ(record->state(), State::ACTIVE);
+}
+
 TEST_F(ClientSessionRegistryTest, SessionScopesExposeOnlyReadOnlyIdentity) {
     using Guard = ClientSessionRegistry::SessionGuard;
     using Registration = ClientSessionRegistry::Registration;
@@ -129,8 +194,59 @@ TEST_F(ClientSessionRegistryTest, SessionScopesExposeOnlyReadOnlyIdentity) {
     EXPECT_TRUE(guard->Session()->IsServing());
 }
 
-// Replica staleness checks bind directly to the retained ClientSessionSharedPtr
-// rather than consulting ClientSessionRegistry under its lock.
+TEST_F(ClientSessionRegistryTest, RetainedSuspectedSessionAllowsRecovery) {
+    ClientSessionRegistry registry;
+    auto record = Register(registry);
+    Suspect(record);
+    ASSERT_EQ(record->state(), State::SUSPECTED);
+    auto guard = registry.TryAcquireRetainingSession(kClient);
+    ASSERT_TRUE(guard);
+    auto ping =
+        std::async(std::launch::async, [&] { return registry.Ping(kClient); });
+    EXPECT_EQ(ping.wait_for(1s), std::future_status::ready);
+    // Release before joining so a regression fails rather than hanging.
+    guard.reset();
+    EXPECT_EQ(ping.get(), ClientStatus::NEED_REMOUNT);
+    EXPECT_EQ(record->state(), State::ACTIVE);
+}
+
+TEST_F(ClientSessionRegistryTest,
+       RemovalWaitsForAdmissionWithoutHoldingRegistry) {
+    const auto check = [](auto acquire) {
+        auto registry = std::make_unique<ClientSessionRegistry>();
+        auto record = Register(*registry);
+        const UUID other{3, 4};
+        Register(*registry, other);
+        std::future<bool> removed;
+        std::future<ClientStatus> ping;
+        ClientSessionSharedPtr identity;
+        {
+            auto guard = acquire(*registry);
+            ASSERT_TRUE(guard);
+            identity = guard->Session();
+            removed = std::async(std::launch::async, [&] {
+                return registry->Remove(kClient, record);
+            });
+            EXPECT_EQ(removed.wait_for(20ms), std::future_status::timeout);
+            ping = std::async(std::launch::async,
+                              [&] { return registry->Ping(other); });
+            EXPECT_EQ(ping.wait_for(1s), std::future_status::ready);
+        }
+        EXPECT_TRUE(removed.get());
+        EXPECT_EQ(ping.get(), ClientStatus::NEED_REMOUNT);
+        EXPECT_FALSE(Find(*registry, kClient));
+        EXPECT_FALSE(registry->TryAcquireRetainingSession(kClient));
+        registry.reset();
+        EXPECT_EQ(identity, record);
+    };
+    check([](auto& registry) {
+        return registry.TryAcquireServingSession(kClient);
+    });
+    check([](auto& registry) {
+        return registry.TryAcquireRetainingSession(kClient);
+    });
+}
+
 TEST_F(ClientSessionRegistryTest, LocalDiskCleanupNeedsNoRegistryAccess) {
     ClientSessionRegistry registry;
     auto record = Register(registry);
@@ -256,18 +372,12 @@ TEST_F(ClientSessionRegistryTest, ExceptionsDiscardOnlyUncommittedNewRecords) {
         EXPECT_TRUE(registration);
         throw std::runtime_error("mount failed");
     };
-
-    // Uncommitted provisional record is rolled back when stack unwinding runs.
     EXPECT_THROW(fail(), std::runtime_error);
     EXPECT_FALSE(Find(registry, kClient));
-
-    // Previously committed record is preserved if a later registration throws.
     auto existing = Register(registry);
     EXPECT_THROW(fail(), std::runtime_error);
     EXPECT_EQ(Find(registry, kClient), existing);
     EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
-
-    // Exceptions thrown after Commit() keep the newly registered session.
     const UUID other{3, 4};
     const auto fail_after_commit = [&] {
         auto registration = registry.BeginRegistration(other);
@@ -350,9 +460,8 @@ TEST_F(ClientSessionRegistryTest, PingCombinesObservationWithRemountReadiness) {
     for (const bool remounted : {false, true}) {
         for (const auto state :
              {State::ACTIVE, State::SUSPECTED, State::OFFLINE}) {
-            SCOPED_TRACE(::testing::Message()
-                         << "remounted=" << remounted
-                         << ", state=" << static_cast<int>(state));
+            SCOPED_TRACE(::testing::Message() << "remounted=" << remounted
+                                              << ", state=" << toString(state));
             ClientSessionRegistry registry;
             EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
             EXPECT_FALSE(Find(registry, kClient));
@@ -437,8 +546,6 @@ TEST_F(ClientSessionRegistryTest, MovedRegistrationOwnsRollbackAndCommit) {
     ClientSessionRegistry registry;
     std::optional<ClientSessionRegistry::Registration> moved;
     std::weak_ptr<const ClientLivenessRecord> provisional;
-
-    // 1. Provisional rollback ownership transfers to the moved-to scope.
     {
         auto registration = registry.BeginRegistration(kClient);
         ASSERT_TRUE(registration);
@@ -451,8 +558,6 @@ TEST_F(ClientSessionRegistryTest, MovedRegistrationOwnsRollbackAndCommit) {
     moved.reset();
     EXPECT_TRUE(provisional.expired());
     EXPECT_FALSE(Find(registry, kClient));
-
-    // 2. Committing on the moved-to scope publishes remount readiness.
     {
         auto remount = registry.BeginRemount(kClient);
         moved.emplace(std::move(*remount));
@@ -460,8 +565,6 @@ TEST_F(ClientSessionRegistryTest, MovedRegistrationOwnsRollbackAndCommit) {
     }
     moved.reset();
     EXPECT_EQ(registry.Ping(kClient), ClientStatus::OK);
-
-    // 3. Moving an already-committed scope preserves the committed record.
     {
         auto registration = registry.BeginRegistration(kClient);
         registration->Commit();
@@ -511,8 +614,114 @@ TEST_F(ClientSessionRegistryTest, RegistrationCannotCommitTwice) {
     }
 }
 
-TEST_F(ClientSessionRegistryTest, RestorePublishesOnlyCommittedStagedRecords) {
+TEST_F(ClientSessionRegistryTest, RegistrationAllowsPingBeforeScopeExit) {
     ClientSessionRegistry registry;
+    std::promise<void> attempted;
+    auto started = attempted.get_future();
+    std::future<ClientStatus> ping;
+    {
+        auto remount = registry.BeginRemount(kClient);
+        ASSERT_TRUE(remount);
+        remount->Commit();
+        ping = std::async(std::launch::async, [&] {
+            attempted.set_value();
+            return registry.Ping(kClient);
+        });
+        started.wait();
+        EXPECT_EQ(ping.wait_for(1s), std::future_status::ready);
+    }
+    EXPECT_EQ(ping.wait_for(1s), std::future_status::ready);
+    EXPECT_EQ(ping.get(), ClientStatus::OK);
+}
+
+TEST_F(ClientSessionRegistryTest,
+       WaitingRemountRetriesAfterProvisionalRollback) {
+    ClientSessionRegistry registry;
+    ClientSessionSharedPtr old;
+    std::future<ClientSessionSharedPtr> next;
+    {
+        auto registration = registry.BeginRegistration(kClient);
+        old = registration->Session();
+        next = std::async(std::launch::async, [&] {
+            auto remount = registry.BeginRemount(kClient);
+            if (!remount) return ClientSessionSharedPtr{};
+            remount->Commit();
+            return remount->Session();
+        });
+        EXPECT_EQ(next.wait_for(20ms), std::future_status::timeout);
+    }
+    const auto replacement = next.get();
+    ASSERT_TRUE(replacement);
+    EXPECT_NE(old, replacement);
+    EXPECT_EQ(Find(registry, kClient), replacement);
+    EXPECT_EQ(registry.Ping(kClient), ClientStatus::OK);
+}
+
+TEST_F(ClientSessionRegistryTest, RegistrationCommitPreservesNewerHeartbeat) {
+    ClientSessionRegistry registry;
+    auto record = Register(registry);
+    {
+        auto registration = registry.BeginRegistration(kClient, kInitial);
+        EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
+        registration->Commit();
+    }
+    EXPECT_EQ(record->Evaluate(Clock::now(), 10s, 20s), Transition::NONE);
+    EXPECT_EQ(record->state(), State::ACTIVE);
+}
+
+TEST_F(ClientSessionRegistryTest, RemountExcludesResourceAdmissionButNotPing) {
+    ClientSessionRegistry registry;
+    Register(registry);
+    std::future<bool> admitted;
+    std::future<ClientStatus> ping;
+    {
+        auto remount = registry.BeginRemount(kClient);
+        admitted = std::async(std::launch::async, [&] {
+            return registry.TryAcquireRetainingSession(kClient).has_value();
+        });
+        ping = std::async(std::launch::async,
+                          [&] { return registry.Ping(kClient); });
+        EXPECT_EQ(admitted.wait_for(20ms), std::future_status::timeout);
+        EXPECT_EQ(ping.wait_for(1s), std::future_status::ready);
+        remount->Commit();
+    }
+    EXPECT_TRUE(admitted.get());
+    EXPECT_EQ(ping.get(), ClientStatus::NEED_REMOUNT);
+}
+
+TEST_F(ClientSessionRegistryTest, RestoreWaitsWithoutBlockingRemountCommit) {
+    ClientSessionRegistry registry;
+    Register(registry);
+    const UUID other{3, 4};
+    Register(registry, other);
+    std::shared_mutex snapshot_mutex;
+    std::future<void> restore;
+    std::future<ClientStatus> ping;
+    {
+        auto remount = registry.BeginRemount(kClient);
+        std::unique_lock snapshot_lock(snapshot_mutex);
+        restore = std::async(std::launch::async, [&] {
+            auto batch = registry.BeginRestore();
+            std::unique_lock lock(snapshot_mutex);
+            batch.Commit();
+        });
+        EXPECT_EQ(restore.wait_for(20ms), std::future_status::timeout);
+        ping = std::async(std::launch::async,
+                          [&] { return registry.Ping(other); });
+        EXPECT_EQ(ping.wait_for(1s), std::future_status::ready);
+        remount->Commit();
+        EXPECT_FALSE(remount->NeedsRemount());
+    }
+    EXPECT_EQ(restore.wait_for(1s), std::future_status::ready);
+    restore.get();
+    EXPECT_EQ(ping.get(), ClientStatus::NEED_REMOUNT);
+}
+
+TEST_F(ClientSessionRegistryTest, RestorePublishesOnlyCommittedStagedRecords) {
+    std::vector<ClientSessionEvent> events;
+    ClientSessionRegistry registry;
+    ASSERT_TRUE(registry.AddListener(
+        [&](const ClientSessionEvent& event) { events.push_back(event); }));
     auto existing = Register(registry);
     const UUID other{3, 4};
     {
@@ -532,6 +741,8 @@ TEST_F(ClientSessionRegistryTest, RestorePublishesOnlyCommittedStagedRecords) {
     const auto restored = Find(registry, other);
     ASSERT_TRUE(restored);
     EXPECT_EQ(restored->ClientId(), other);
+    Drain(registry);
+    EXPECT_TRUE(events.empty());
     EXPECT_EQ(registry.Ping(other), ClientStatus::NEED_REMOUNT);
 }
 
@@ -583,7 +794,10 @@ TEST_F(ClientSessionRegistryTest,
 }
 
 TEST_F(ClientSessionRegistryTest, RemovalDoesNotAddALivenessState) {
+    std::vector<ClientSessionEvent> events;
     ClientSessionRegistry registry;
+    ASSERT_TRUE(registry.AddListener(
+        [&](const ClientSessionEvent& event) { events.push_back(event); }));
     auto old = Register(registry);
     {
         auto remount = registry.BeginRemount(kClient);
@@ -602,8 +816,126 @@ TEST_F(ClientSessionRegistryTest, RemovalDoesNotAddALivenessState) {
     EXPECT_EQ(old->Observe(kInitial + 13s), Observation::RECOVERED_ACTIVE);
     auto current = Register(registry);
     EXPECT_NE(old, current);
+    Drain(registry);
+    EXPECT_TRUE(events.empty());
     EXPECT_EQ(registry.TryAcquireServingSession(kClient)->Session(), current);
     EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
+}
+
+TEST_F(ClientSessionRegistryTest, WaitingAdmissionRejectsRolledBackRecord) {
+    ClientSessionRegistry registry;
+    std::promise<void> attempted;
+    auto started = attempted.get_future();
+    std::future<bool> admitted;
+    ClientSessionSharedPtr old;
+    {
+        auto registration = registry.BeginRegistration(kClient);
+        old = registration->Session();
+        admitted = std::async(std::launch::async, [&] {
+            attempted.set_value();
+            return registry.TryAcquireRetainingSession(kClient).has_value();
+        });
+        started.wait();
+        EXPECT_EQ(admitted.wait_for(20ms), std::future_status::timeout);
+    }
+    EXPECT_FALSE(admitted.get());
+    EXPECT_EQ(old->state(), State::ACTIVE);
+    EXPECT_FALSE(Find(registry, kClient));
+    auto current = Register(registry);
+    EXPECT_NE(old, current);
+    EXPECT_EQ(registry.TryAcquireRetainingSession(kClient)->Session(), current);
+}
+
+TEST_F(ClientSessionRegistryTest,
+       CurrentOperationValidatesIdentityNotLiveness) {
+    ClientSessionRegistry registry;
+    EXPECT_FALSE(AcquireExclusiveOperation({}));
+    auto old = Register(registry);
+    auto old_slot = FindSlot(registry, kClient);
+    EXPECT_TRUE(AcquireExclusiveOperation(old_slot));
+    ASSERT_TRUE(registry.Remove(kClient, old));
+    EXPECT_FALSE(AcquireExclusiveOperation(old_slot));
+    auto current = Register(registry);
+    auto current_slot = FindSlot(registry, kClient);
+    EXPECT_NE(old_slot, current_slot);
+    EXPECT_FALSE(AcquireExclusiveOperation(old_slot));
+    EXPECT_FALSE(AcquireExclusiveOperation(old_slot, /*try_lock=*/true));
+    EXPECT_TRUE(AcquireExclusiveOperation(current_slot));
+    Suspect(current);
+    Retire(current);
+    // OFFLINE slots still belong to the registry until cleanup completes.
+    // Operation validation must not prevent their removal.
+    EXPECT_EQ(current->state(), State::OFFLINE);
+    EXPECT_TRUE(AcquireExclusiveOperation(current_slot));
+    EXPECT_FALSE(registry.TryAcquireRetainingSession(kClient));
+    EXPECT_TRUE(registry.Remove(kClient, current));
+}
+
+TEST_F(ClientSessionRegistryTest, CurrentOperationTryLockDoesNotWait) {
+    ClientSessionRegistry registry;
+    Register(registry);
+    auto slot = FindSlot(registry, kClient);
+    std::future<bool> acquired;
+    {
+        auto remount = registry.BeginRemount(kClient);
+        acquired = std::async(std::launch::async, [&] {
+            return AcquireExclusiveOperation(slot, /*try_lock=*/true);
+        });
+        EXPECT_EQ(acquired.wait_for(1s), std::future_status::ready);
+    }
+    EXPECT_FALSE(acquired.get());
+    EXPECT_TRUE(AcquireExclusiveOperation(slot, /*try_lock=*/true));
+}
+
+TEST_F(ClientSessionRegistryTest, RemovedSlotIsReleasedDespiteRetainedRecord) {
+    ClientSessionRegistry registry;
+    auto record = Register(registry);
+    std::weak_ptr weak_slot = FindSlot(registry, kClient);
+    EXPECT_FALSE(weak_slot.expired());
+    ASSERT_TRUE(registry.Remove(kClient, record));
+    EXPECT_TRUE(weak_slot.expired());
+    EXPECT_EQ(record->state(), State::ACTIVE);
+    EXPECT_TRUE(SnapshotRecords(registry).empty());
+}
+
+TEST_F(ClientSessionRegistryTest, ConcurrentRemovalSucceedsOnlyOnce) {
+    ClientSessionRegistry registry;
+    auto record = Register(registry);
+    std::promise<void> start;
+    auto gate = start.get_future().share();
+    const auto remove = [&] {
+        gate.wait();
+        return registry.Remove(kClient, record);
+    };
+    auto first = std::async(std::launch::async, remove);
+    auto second = std::async(std::launch::async, remove);
+    start.set_value();
+    EXPECT_NE(first.get(), second.get());
+    EXPECT_FALSE(Find(registry, kClient));
+}
+
+TEST_F(ClientSessionRegistryTest, RestoreDoesNotBlockLookupOrHeartbeat) {
+    ClientSessionRegistry registry;
+    auto record = Register(registry);
+    {
+        auto remount = registry.BeginRemount(kClient);
+        remount->Commit();
+    }
+    std::future<bool> lookup;
+    const UUID other{3, 4};
+    {
+        auto restore = registry.BeginRestore();
+        restore.FindOrCreate(other);
+        lookup = std::async(std::launch::async, [&] {
+            return Find(registry, kClient) == record &&
+                   !Find(registry, other) &&
+                   registry.Ping(kClient) == ClientStatus::OK;
+        });
+        EXPECT_EQ(lookup.wait_for(1s), std::future_status::ready);
+        restore.Commit();
+    }
+    EXPECT_TRUE(lookup.get());
+    EXPECT_TRUE(Find(registry, other));
 }
 
 TEST_F(ClientSessionRegistryTest,
@@ -663,9 +995,29 @@ TEST_F(ClientSessionRegistryTest,
 }
 
 TEST_F(ClientSessionRegistryTest,
-       ExpireSessionsClearsMetadataBeforeRetireCallback) {
-    ClientSessionRegistry registry;
-    auto record = Register(registry);
+       ExpireSessionsClearsMetadataBeforeOfflineListener) {
+    bool retired = false;
+    ClientSessionSharedPtr retired_session;
+    Record record;
+    Slot slot;
+    ClientSessionRegistry registry(10s, 20s);
+    ASSERT_TRUE(registry.AddListener([&](const ClientSessionEvent& event) {
+        if (event.current != State::OFFLINE) return;
+        const auto& id = event.client_id;
+        const auto& session = event.session;
+        EXPECT_EQ(id, kClient);
+        EXPECT_EQ(session, record);
+        EXPECT_EQ(session->state(), State::OFFLINE);
+        EXPECT_TRUE(registry.GetHostId(kClient).empty());
+        EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
+        // Retirement runs after releasing the slot operation lock.
+        EXPECT_TRUE(AcquireExclusiveOperation(slot, /*try_lock=*/true));
+        retired_session = std::move(session);
+        retired = true;
+    }));
+
+    record = Register(registry);
+    slot = FindSlot(registry, kClient);
     {
         auto remount = registry.BeginRemount(kClient);
         ASSERT_TRUE(remount);
@@ -675,36 +1027,21 @@ TEST_F(ClientSessionRegistryTest,
     ASSERT_EQ(registry.GetHostId(kClient), "host-a");
 
     // First expiry pass moves ACTIVE -> SUSPECTED without retiring resources.
-    bool reserved = false;
-    bool retired = false;
-    registry.ExpireSessions(
-        kInitial + 10s, 10s, 20s, [&] { reserved = true; },
-        [&](const UUID&, const ClientSessionSharedPtr&) { retired = true; });
+    ExpireSessions(registry, kInitial + 10s);
     EXPECT_EQ(record->state(), State::SUSPECTED);
-    EXPECT_FALSE(reserved);
     EXPECT_FALSE(retired);
     EXPECT_EQ(registry.GetHostId(kClient), "host-a");
 
-    // Second expiry pass reserves retirement before OFFLINE, clears readiness
-    // and host hints, and passes the terminal session to the retire callback.
-    registry.ExpireSessions(
-        kInitial + 30s, 10s, 20s,
-        [&] {
-            EXPECT_EQ(record->state(), State::SUSPECTED);
-            reserved = true;
-        },
-        [&](const UUID& id, const ClientSessionSharedPtr& session) {
-            EXPECT_TRUE(reserved);
-            EXPECT_EQ(id, kClient);
-            EXPECT_EQ(session, record);
-            EXPECT_EQ(session->state(), State::OFFLINE);
-            EXPECT_TRUE(registry.GetHostId(kClient).empty());
-            EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
-            retired = true;
-        });
+    // Delivery observes cleared readiness and host hints.
+    ExpireSessions(registry, kInitial + 30s);
+    EXPECT_FALSE(retired);
+    Drain(registry);
     EXPECT_TRUE(retired);
+    EXPECT_EQ(retired_session, record);
+    EXPECT_TRUE(registry.HasRetiredSession());
     EXPECT_EQ(Find(registry, kClient), record);
     EXPECT_TRUE(registry.Remove(kClient, record));
+    EXPECT_FALSE(registry.HasRetiredSession());
 }
 
 }  // namespace

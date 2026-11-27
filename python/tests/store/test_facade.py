@@ -38,6 +38,7 @@ _CPP_PUBLIC_NAMES = {
     "SoftPinAction",
     "ReplicateConfig",
     "ExistOptions",
+    "PhysicalPlacement",
     "ReplicaStatus",
     "MemoryDescriptor",
     "DiskDescriptor",
@@ -46,6 +47,11 @@ _CPP_PUBLIC_NAMES = {
     "TaskType",
     "TaskStatus",
     "QueryTaskResponse",
+    "JobType",
+    "JobStatus",
+    "QueryJobResponse",
+    "ListTasksResponse",
+    "ListDrainJobsResponse",
     "BufferHandle",
     "BufferLeaseView",
     "BufferLease",
@@ -80,6 +86,7 @@ _CPP_PUBLIC_NAMES = {
     "REPLICA_MOVE",
     "PENDING",
     "SUCCESS",
+    "CANCELED",
 }
 
 
@@ -238,6 +245,7 @@ for name in (
     "_serialize_tensor",
     "_tensor_metadata_size",
     "_deserialize_tensor",
+    "PhysicalPlacement",
 ):
     try:
         getattr(store, name)

@@ -46,6 +46,9 @@
 #ifdef USE_XPU
 #include "tent/transport/xpu/xpu_transport.h"
 #endif
+#ifdef USE_MLU
+#include "tent/transport/mlu/mlu_transport.h"
+#endif
 
 #ifdef USE_CUDA
 #include "tent/platform/cuda.h"
@@ -112,6 +115,7 @@ struct PreservedTentConfigOverrides {
     std::optional<bool> ascend_agent_mode;
     std::optional<bool> ascend_store_te_init;
     std::optional<bool> ascend_fabric_mem;
+    std::optional<bool> ascend_standalone_single_segment;
     std::optional<bool> memfabric_store_te_init;
 };
 
@@ -250,6 +254,8 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
         config, "transports/ascend_direct/store_te_init", false);
     preserved.ascend_fabric_mem = captureExplicitConfigValue(
         config, "transports/ascend_direct/fabric_mem", false);
+    preserved.ascend_standalone_single_segment = captureExplicitConfigValue(
+        config, "transports/ascend_direct/standalone_single_segment", false);
     preserved.memfabric_store_te_init = captureExplicitConfigValue(
         config, "transports/memfabric/store_te_init", false);
     return preserved;
@@ -296,6 +302,9 @@ void restoreExplicitTransferEngineConfig(
                                preserved.ascend_store_te_init);
     restoreExplicitConfigValue(config, "transports/ascend_direct/fabric_mem",
                                preserved.ascend_fabric_mem);
+    restoreExplicitConfigValue(
+        config, "transports/ascend_direct/standalone_single_segment",
+        preserved.ascend_standalone_single_segment);
     restoreExplicitConfigValue(config, "transports/memfabric/store_te_init",
                                preserved.memfabric_store_te_init);
 }
@@ -406,6 +415,11 @@ Status TransferEngineImpl::construct() {
     std::atomic_store_explicit(&runtime_config_snapshot_,
                                buildTentConfigBundle(*conf_).runtime,
                                std::memory_order_relaxed);
+    CHECK_STATUS(parseMnnvlConfig(*conf_, mnnvl_config_));
+#ifndef USE_CUDA
+    if (mnnvl_config_.require_fabric)
+        return Status::InvalidArgument("Strict MNNVL requires a CUDA build");
+#endif
     CHECK_STATUS(ParseHpTcpTransportConfig(*conf_, &hp_tcp_transport_config_));
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
@@ -492,7 +506,11 @@ Status TransferEngineImpl::construct() {
         LOG(INFO) << "Using legacy transport selection (original logic)";
     }
 
-    CHECK_STATUS(loadTransports());
+    auto load_status = loadTransports();
+    if (!load_status.ok()) {
+        (void)deconstruct();
+        return load_status;
+    }
     const bool fabric_required = conf_->get("transports/force_fabric", false);
     if (fabric_required && !transport_list_[FABRIC]) {
         const Status cleanup = deconstruct();
@@ -525,6 +543,8 @@ Status TransferEngineImpl::construct() {
                                              topology_, conf_);
             if (!status.ok()) {
                 const bool required =
+                    (mnnvl_config_.require_fabric &&
+                     transport_index == static_cast<size_t>(MNNVL)) ||
                     (hp_tcp_transport_config_.enabled &&
                      transport_index ==
                          static_cast<size_t>(TransportType::HP_TCP)) ||
@@ -532,6 +552,11 @@ Status TransferEngineImpl::construct() {
                      transport_index ==
                          static_cast<size_t>(TransportType::FABRIC));
                 if (required) {
+                    if (mnnvl_config_.require_fabric &&
+                        transport_index == static_cast<size_t>(MNNVL)) {
+                        TentMetrics::instance().recordMnnvlEvent(
+                            TentMetrics::MnnvlEvent::StrictFailure);
+                    }
                     // Unwind the already-started control service and any
                     // preceding transports immediately; the destructor's later
                     // deconstruct() call is intentionally idempotent.
@@ -799,6 +824,10 @@ Status TransferEngineImpl::closeSegment(SegmentID handle) {
     if (auto* xpu = dynamic_cast<XpuTransport*>(transport_list_[XPU].get()))
         xpu->closeRemoteSegment(handle);
 #endif
+#ifdef USE_MLU
+    if (auto* mlu = dynamic_cast<MluTransport*>(transport_list_[MLU].get()))
+        mlu->closeRemoteSegment(handle);
+#endif
     return metadata_->segmentManager().closeRemote(handle);
 }
 
@@ -882,12 +911,27 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
 
 Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
                                                MemoryOptions& options) {
+    if (options.global_address && options.type == UNSPEC) {
+        for (auto type : getSupportedTransports(UNSPEC)) {
+            if (transport_list_[type]->supportsGlobalAddressing()) {
+                options.type = type;
+                break;
+            }
+        }
+        if (options.type == UNSPEC)
+            return Status::NotImplemented(
+                "No global-address transport" LOC_MARK);
+    }
     if (options.type == UNSPEC) {
         auto location_type = LocationParser(options.location).type();
         bool host_location =
             options.location == kWildcardLocation || location_type == "cpu";
-        if (host_location && transport_list_[MNNVL] &&
-            transport_list_[MNNVL]->capabilities().dram_to_dram)
+        if (mnnvl_config_.require_fabric &&
+            (location_type == "cuda" ||
+             (host_location && mnnvl_config_.egm_enabled)))
+            options.type = MNNVL;
+        else if (host_location && transport_list_[MNNVL] &&
+                 transport_list_[MNNVL]->capabilities().dram_to_dram)
             options.type = MNNVL;  // EGM: host memory NVLink peers can address
         else if (transport_list_[RDMA])
             options.type = RDMA;
@@ -905,12 +949,24 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             return Status::InvalidArgument(
                 "Not supported type in memory options" LOC_MARK);
     }
-    if (options.type < 0 || options.type >= kSupportedTransportTypes)
-        return Status::InvalidArgument("Invalid memory transport" LOC_MARK);
+    if (mnnvl_config_.require_fabric &&
+        (LocationParser(options.location).type() == "cuda" ||
+         (mnnvl_config_.egm_enabled &&
+          (options.location == kWildcardLocation ||
+           LocationParser(options.location).type() == "cpu"))) &&
+        options.type != MNNVL)
+        return Status::InvalidArgument(
+            "Strict MNNVL allocation cannot use another transport");
+    if (options.type <= UNSPEC || options.type >= kNumTransportTypes)
+        return Status::InvalidArgument(
+            "Invalid memory transport type" LOC_MARK);
     auto& transport = transport_list_[options.type];
     if (!transport)
         return Status::InvalidArgument(
             "Not supported type in memory options" LOC_MARK);
+    if (options.global_address && !transport->supportsGlobalAddressing())
+        return Status::NotImplemented(
+            "Transport has no global-address allocator" LOC_MARK);
     const bool default_shm =
         options.type == SHM && options.location == kWildcardLocation;
     if (default_shm) options.location = "cpu:0";
@@ -932,6 +988,20 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
     for (auto it = allocated_memory_.begin(); it != allocated_memory_.end();
          ++it) {
         if (it->addr == addr) {
+            if (it->options.global_address) {
+                auto segment = metadata_->segmentManager().getLocal();
+                if (segment) {
+                    const auto base = reinterpret_cast<uint64_t>(addr);
+                    for (const auto& buffer :
+                         std::get<MemorySegmentDesc>(segment->detail).buffers) {
+                        if (buffer.addr < base + it->size &&
+                            base < buffer.addr + buffer.length)
+                            return Status::InvalidArgument(
+                                "Unregister GVA memory before freeing "
+                                "it" LOC_MARK);
+                    }
+                }
+            }
             auto status = it->transport->freeLocalMemory(addr, it->size);
             if (!status.ok()) {
                 LOG(WARNING)
@@ -944,6 +1014,54 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
         }
     }
     return Status::InvalidArgument("Address region not registered" LOC_MARK);
+}
+
+Status TransferEngineImpl::mapRemoteMemory(SegmentID peer, void* gva,
+                                           size_t size, TransportType type) {
+    const auto address = reinterpret_cast<uint64_t>(gva);
+    if (peer == LOCAL_SEGMENT_ID || !address || !size ||
+        size > UINT64_MAX - address || type < UNSPEC ||
+        type >= kNumTransportTypes)
+        return Status::InvalidArgument(
+            "Invalid global mapping range or transport" LOC_MARK);
+    std::vector<TransportType> exported;
+    if (type == UNSPEC) {
+        SegmentDescRef pin;
+        CHECK_STATUS(metadata_->segmentManager().withCachedSegment(
+            peer, pin, [&](SegmentDesc* segment) -> Status {
+                auto* buffer = segment->findBuffer(address, size);
+                if (!buffer)
+                    return Status::NeedsRefreshCache(
+                        "Memory range is not registered" LOC_MARK);
+                exported = buffer->transports;
+                return Status::OK();
+            }));
+    }
+    for (auto candidate : getSupportedTransports(type)) {
+        if (transport_list_[candidate]->supportsGlobalAddressing() &&
+            (type != UNSPEC || std::find(exported.begin(), exported.end(),
+                                         candidate) != exported.end()))
+            return transport_list_[candidate]->mapRemoteMemory(peer, gva, size);
+    }
+    return Status::NotImplemented("No global-address transport" LOC_MARK);
+}
+
+Status TransferEngineImpl::unmapRemoteMemory(SegmentID peer, void* gva,
+                                             TransportType type) {
+    if (peer == LOCAL_SEGMENT_ID || !gva || type < UNSPEC ||
+        type >= kNumTransportTypes)
+        return Status::InvalidArgument(
+            "Invalid global mapping or transport" LOC_MARK);
+    Status status =
+        Status::NotImplemented("No global-address transport" LOC_MARK);
+    for (auto candidate : getSupportedTransports(type)) {
+        if (!transport_list_[candidate]->supportsGlobalAddressing()) continue;
+        status = transport_list_[candidate]->unmapRemoteMemory(peer, gva);
+        if (status.ok() ||
+            (!status.IsInvalidArgument() && !status.IsNotImplemented()))
+            return status;
+    }
+    return status;
 }
 
 // Forward declaration: getTypeEnum() is defined below but is needed by the
@@ -1097,10 +1215,50 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         desc_list.push_back(std::move(desc));
     }
 
+    auto needs_export = [&](const BufferDesc& desc) {
+        return mnnvl_config_.require_fabric &&
+               options.perm != kLocalReadWrite &&
+               (LocationParser(desc.location).type() == "cuda" ||
+                mnnvl_config_.egm_enabled);
+    };
+    auto valid_export = [](const BufferDesc& desc) {
+        return desc.permission != kLocalReadWrite &&
+               !desc.mnnvl_handle.empty() &&
+               std::find(desc.transports.begin(), desc.transports.end(),
+                         MNNVL) != desc.transports.end();
+    };
+    const bool required_export =
+        std::any_of(desc_list.begin(), desc_list.end(), needs_export);
+    const auto requested_descs =
+        required_export ? desc_list : std::vector<BufferDesc>{};
+    if (required_export && ((options.type != UNSPEC && options.type != MNNVL) ||
+                            !transport_list_[MNNVL]))
+        return Status::InvalidArgument(
+            "Strict MNNVL registration requires MNNVL");
     bool need_sync = false;
     auto status = local_segment_tracker_->addInBatch(
         desc_list,
         [&](std::vector<BufferDesc>& descs) -> Status {
+            // Duplicate ranges are pinned by SegmentTracker before this
+            // callback. Never turn an existing local-only registration into a
+            // successful remotely accessible strict registration without an
+            // actual export.
+            if (required_export) {
+                auto existing_status = local_segment_tracker_->forEach(
+                    [&](const BufferDesc& existing) {
+                        for (const auto& requested : requested_descs) {
+                            if (existing.addr == requested.addr &&
+                                existing.length == requested.length &&
+                                needs_export(requested) &&
+                                !valid_export(existing))
+                                return Status::InvalidArgument(
+                                    "Existing registration has no MNNVL fabric "
+                                    "export");
+                        }
+                        return Status::OK();
+                    });
+                if (!existing_status.ok()) return existing_status;
+            }
             const bool hp_tcp_required =
                 options.type == HP_TCP ||
                 (options.type == UNSPEC && transports.size() == 1 &&
@@ -1122,7 +1280,17 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             };
             Status first_error = Status::OK();
             for (auto type : transports) {
+                const auto before = descs;
                 auto s = transport_list_[type]->addMemoryBuffer(descs, options);
+                if (s.ok() && type == MNNVL && required_export) {
+                    for (const auto& desc : descs) {
+                        if (needs_export(desc) && !valid_export(desc)) {
+                            s = Status::InvalidArgument(
+                                "MNNVL registration returned no fabric export");
+                            break;
+                        }
+                    }
+                }
                 if (!s.ok()) {
                     // addMemoryBuffer implementations are required to be
                     // transactional, but invoke remove on the failing
@@ -1133,7 +1301,18 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                             transport_list_[type]->removeMemoryBuffer(desc);
                         if (!cleanup.ok()) LOG(WARNING) << cleanup.ToString();
                     }
+                    descs = before;
                     if (first_error.ok()) first_error = s;
+                    if (type == MNNVL && required_export) {
+                        TentMetrics::instance().recordMnnvlEvent(
+                            TentMetrics::MnnvlEvent::StrictFailure);
+                        for (auto registered : registered_transports) {
+                            for (auto desc : descs)
+                                (void)transport_list_[registered]
+                                    ->removeMemoryBuffer(desc);
+                        }
+                        return s;
+                    }
                     if (type == HP_TCP && hp_tcp_required) return s;
                     if (type == FABRIC && fabric_required) {
                         rollbackRegisteredTransports();
@@ -1275,6 +1454,39 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
         shard.alive_batches.insert(batch_id);
     }
     return batch_id;
+}
+
+bool TransferEngineImpl::supportsParallelBatchSubmit(SegmentID peer) const {
+    if (!available_) return false;
+    auto local = metadata_->segmentManager().getLocal();
+    SegmentDescRef remote;
+    if (peer == LOCAL_SEGMENT_ID)
+        remote = local;
+    else if (!metadata_->segmentManager().getRemoteCached(remote, peer).ok())
+        return false;
+    if (!local || !remote) return false;
+    // Equal unknown ids must remain conservative, matching the native selector.
+    const bool same_machine =
+        peer == LOCAL_SEGMENT_ID || local->machine_id == remote->machine_id;
+    bool found = false;
+    for (size_t i = 0; i < transport_list_.size(); ++i) {
+        const auto& transport = transport_list_[i];
+        if (!transport || !TransportSelector::isPeerReachable(
+                              static_cast<TransportType>(i), same_machine))
+            continue;
+        const auto caps = transport->capabilities();
+        const bool candidate = remote->type == SegmentType::File
+                                   ? caps.dram_to_file || caps.gpu_to_file
+                                   : caps.dram_to_dram || caps.dram_to_gpu ||
+                                         caps.gpu_to_dram || caps.gpu_to_gpu;
+        if (!candidate) continue;
+        // Cover possible direct submissions without planning requests. Native
+        // failover can select another candidate. Internal staging submissions
+        // remain on ProxyManager's own threads, as on the ordinary path.
+        if (!transport->supportsParallelBatchSubmit()) return false;
+        found = true;
+    }
+    return found;
 }
 
 Status TransferEngineImpl::freeBatch(BatchID batch_id) {
@@ -1638,6 +1850,18 @@ Status TransferEngineImpl::validateTransportHint(const Request& req,
     return Status::OK();
 }
 
+bool TransferEngineImpl::producerEventHonored(const Request& req,
+                                              TransportType type,
+                                              bool staging) const {
+    if (!req.producer_event) return true;
+    // Staging re-issues fresh chunk requests that do not carry the event.
+    if (staging || type == UNSPEC || type < 0 ||
+        type >= static_cast<TransportType>(kSupportedTransportTypes))
+        return false;
+    return transport_list_[type] &&
+           transport_list_[type]->supportsProducerEvent();
+}
+
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                                      int transport_index) {
     bool device_direct = false;
@@ -1655,7 +1879,7 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
 SelectionResult TransferEngineImpl::planTransport(const Request& request,
                                                   int transport_index,
                                                   bool allow_device_direct,
-                                                  bool allow_xpu_ipc,
+                                                  bool allow_local_ipc,
                                                   bool* device_direct) {
     // Owning reference: keeps the snapshot alive while we read through it.
     SegmentDescRef desc;
@@ -1668,49 +1892,110 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
     }
     auto local_mtype = Platform::getLoader().getMemoryType(request.source);
 
-    const TransportType hint = request.transport_hint;
+    TransportType hint = request.transport_hint;
+    bool strict_route = false;
+    if (mnnvl_config_.require_fabric && desc->type == SegmentType::Memory) {
+        auto* peer = desc->findBuffer(request.target_offset, request.length);
+        strict_route =
+            hint == MNNVL || local_mtype == MTYPE_CUDA ||
+            (peer && LocationParser(peer->location).type() == "cuda") ||
+            mnnvl_config_.egm_enabled;
+        if (strict_route) {
+            if (transport_index != 0 || (hint != UNSPEC && hint != MNNVL) ||
+                !peer ||
+                (request.opcode == Request::WRITE &&
+                 peer->permission == kGlobalReadOnly) ||
+                (request.target_id != LOCAL_SEGMENT_ID &&
+                 (peer->permission == kLocalReadWrite ||
+                  peer->mnnvl_handle.empty() ||
+                  std::find(peer->transports.begin(), peer->transports.end(),
+                            MNNVL) == peer->transports.end()))) {
+                TentMetrics::instance().recordMnnvlEvent(
+                    TentMetrics::MnnvlEvent::StrictFailure);
+                return SelectionResult{};
+            }
+            hint = MNNVL;
+        }
+    }
 
     // Plan XPU/MLU staging before selecting a host-only network transport.
     // Both can bypass staging through verified dma-buf RDMA, in which case
-    // nothing is staged. A same-host peer's XPU buffer can also be reached
-    // through an IPC mapping, but that route exists on XpuTransport alone:
-    // XPU is then offered first, unstaged, ahead of the staged network
+    // nothing is staged. A same-host peer's XPU or MLU buffer can also be
+    // reached through an IPC mapping. The device transport is offered first,
+    // unstaged, ahead of the staged network
     // transports, which stay available for failover and for policies whose
-    // explicit transports list does not name "xpu". The peer buffer is
-    // mapped only once XPU is actually selected; if that fails, the request
-    // is planned again without IPC. Other transport hints or a policy
-    // rejecting direct access require staging. XPU
+    // explicit transports list does not name the device transport. The peer
+    // buffer is mapped only once that route is selected; if mapping fails,
+    // the request is planned again without IPC. Other transport hints or a
+    // policy rejecting direct access require staging. XPU
     // staging needs the local XpuTransport; without it, selection is left to
     // transport capabilities (e.g. TCP copies device memory itself). Keep the
     // original memory types for policy matching.
     std::vector<std::string> host_staging_params;
     std::vector<TransportType> staging_transports;
+    bool local_mlu_staging = false;
+#ifdef USE_MLU
+    if (desc->type == SegmentType::Memory &&
+        request.target_id == LOCAL_SEGMENT_ID && local_mtype == MTYPE_MLU &&
+        transport_list_[MLU]) {
+        auto* entry = desc->findBuffer(request.target_offset, request.length);
+        if (!entry) return SelectionResult{};
+        void* copy_src = request.source;
+        void* copy_dst = reinterpret_cast<void*>(request.target_offset);
+        if (request.opcode == Request::READ) std::swap(copy_src, copy_dst);
+        if (getTypeEnum(LocationParser(entry->location).type()) == MTYPE_MLU &&
+            !MluTransport::canCopyPeer(copy_src, copy_dst)) {
+            findStagingPolicy(request, host_staging_params);
+            // An inaccessible device pair must not fall back to unstaged MLU.
+            if (host_staging_params.empty()) return SelectionResult{};
+            local_mlu_staging = true;
+            if (std::find(entry->transports.begin(), entry->transports.end(),
+                          MLU) != entry->transports.end())
+                staging_transports.push_back(MLU);
+        }
+    }
+#endif
     bool xpu_ipc = false;
+    bool mlu_ipc = false;
     bool direct = false;
+    bool rdma_direct = true;
     const BufferDesc* ipc_entry = nullptr;
     if (desc->type == SegmentType::Memory &&
         request.target_id != LOCAL_SEGMENT_ID) {
         auto* entry = desc->findBuffer(request.target_offset, request.length);
         if (!entry) return SelectionResult{};
         auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
+        const bool cuda_side =
+            local_mtype == MTYPE_CUDA || remote_mtype == MTYPE_CUDA;
         const bool xpu_side =
             local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU;
         const bool mlu_side =
             local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU;
-        direct =
-            (xpu_side || mlu_side) && allow_device_direct &&
-            (hint == UNSPEC || hint == RDMA) &&
-            deviceDirectRdmaReady(request, entry, local_mtype, remote_mtype);
-        xpu_ipc = xpu_side && !mlu_side && allow_xpu_ipc &&
+        if (cuda_side || xpu_side || mlu_side) {
+            rdma_direct = allow_device_direct &&
+                          (hint == UNSPEC || hint == RDMA) &&
+                          deviceDirectRdmaReady(request, entry, local_mtype,
+                                                remote_mtype);
+        }
+        direct = ((xpu_side || mlu_side) && rdma_direct) ||
+                 (cuda_side && !xpu_side && !mlu_side && allow_device_direct);
+        xpu_ipc = xpu_side && !mlu_side && allow_local_ipc &&
                   (hint == UNSPEC || hint == XPU) &&
                   xpuIpcCandidate(request, desc.get(), entry);
-        if (xpu_ipc) ipc_entry = entry;
+        mlu_ipc = mlu_side && !xpu_side && allow_local_ipc &&
+                  (hint == UNSPEC || hint == MLU) &&
+                  mluIpcCandidate(request, desc.get(), entry);
+        if (xpu_ipc || mlu_ipc) ipc_entry = entry;
         if (device_direct) *device_direct = direct;
         if ((xpu_side && !direct && transport_list_[XPU]) ||
             (mlu_side && !direct)) {
-            findStagingPolicy(request, host_staging_params);
-            if (host_staging_params.empty() && !xpu_ipc)
+            findStagingPolicy(request, host_staging_params,
+                              allow_device_direct);
+            if (host_staging_params.empty() && !xpu_ipc && !mlu_ipc)
                 return SelectionResult{};
+        } else if (cuda_side && !direct) {
+            findStagingPolicy(request, host_staging_params,
+                              allow_device_direct);
         }
         if (!host_staging_params.empty()) {
             // A staged side is replaced by a freshly registered host stage
@@ -1739,31 +2024,39 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
             }
         }
     }
-    const bool host_staging = !host_staging_params.empty();
-    // XPU over IPC without dma-buf RDMA: XPU first, on the original memory,
-    // then the network transports, on host stage buffers. With no staging
-    // route, XPU is the only transport that may see the device memory.
-    const bool ipc_mixed = xpu_ipc && !direct;
+    const bool host_staging =
+        !host_staging_params.empty() && !local_mlu_staging;
+    // IPC copies the original device buffers; network fallbacks use host
+    // stage buffers. Without a staging route, only IPC may see the device.
+    const bool ipc_mixed = (xpu_ipc || mlu_ipc) && !direct;
     std::vector<TransportType> mixed_transports;
     if (ipc_mixed) {
-        mixed_transports.push_back(XPU);
+        mixed_transports.push_back(xpu_ipc ? XPU : MLU);
         mixed_transports.insert(mixed_transports.end(),
                                 staging_transports.begin(),
                                 staging_transports.end());
     }
-    // Map the peer buffer only now that XPU won the selection; if that is
+    // Map the peer buffer only now that IPC won the selection; if that is
     // not possible, plan again without the IPC route.
     auto finish = [&](SelectionResult result) {
-        if (result.transport != XPU || !xpu_ipc) return result;
-        if (!xpuIpcReady(request, desc.get(), ipc_entry))
+        if (result.transport != XPU && result.transport != MLU) return result;
+        if ((result.transport == XPU && !xpu_ipc) ||
+            (result.transport == MLU && !mlu_ipc))
+            return result;
+        const bool ready = result.transport == XPU
+                               ? xpuIpcReady(request, desc.get(), ipc_entry)
+                               : mluIpcReady(request, desc.get(), ipc_entry);
+        if (!ready)
             return planTransport(request, transport_index, allow_device_direct,
                                  false, device_direct);
         result.staging_params.clear();
         return result;
     };
 
-    // Legacy mode: use original logic (before TransportSelector)
-    if (transport_selector_ && transport_selector_->isLegacyMode() &&
+    // Legacy mode: use original logic (before TransportSelector). Strict
+    // routes must honor policy authorization even in legacy mode.
+    if (!strict_route && transport_selector_ &&
+        transport_selector_->isLegacyMode() &&
         !transport_selector_->isForceTcp() &&
         !transport_selector_->isForceFabric()) {
         SelectionResult result;
@@ -1786,23 +2079,31 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
                 }
                 auto remote_mtype =
                     getTypeEnum(LocationParser(entry->location).type());
-                const auto& candidates = ipc_mixed      ? mixed_transports
-                                         : host_staging ? staging_transports
-                                                        : entry->transports;
+                const auto& candidates = ipc_mixed ? mixed_transports
+                                         : (host_staging || local_mlu_staging)
+                                             ? staging_transports
+                                             : entry->transports;
                 for (auto type : candidates) {
-                    // MLU requires the local segment. XPU additionally allows
-                    // a same-host peer's IPC-mappable buffer. NVLINK/SHM/TPU
-                    // require machine locality.
-                    if (type == MLU && request.target_id != LOCAL_SEGMENT_ID)
+                    if (local_mlu_staging) {
+                        if (type == MLU) raw.push_back(type);
+                        continue;
+                    }
+                    // XPU/MLU may access same-host peer buffers over IPC.
+                    if (type == MLU && request.target_id != LOCAL_SEGMENT_ID &&
+                        !mlu_ipc)
                         continue;
                     if (type == XPU && request.target_id != LOCAL_SEGMENT_ID &&
                         !xpu_ipc)
                         continue;
-                    if ((type == NVLINK || type == SHM || type == TPU) &&
-                        !same_machine)
+                    if (!TransportSelector::isPeerReachable(type, same_machine))
                         continue;
-                    const bool staged =
-                        host_staging && !(xpu_ipc && type == XPU);
+                    const bool staged = host_staging &&
+                                        !(xpu_ipc && type == XPU) &&
+                                        !(mlu_ipc && type == MLU);
+                    if (type == RDMA && !staged && !rdma_direct &&
+                        (isGpuType(local_mtype) || isGpuType(remote_mtype))) {
+                        continue;
+                    }
                     if (checkAvailability(transport_list_[type],
                                           staged ? MTYPE_CPU : local_mtype,
                                           staged ? MTYPE_CPU : remote_mtype)) {
@@ -1826,6 +2127,7 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
 
     // Selector mode: build ctx, then defer everything to
     // TransportSelector::select().
+    std::vector<TransportType> local_copy_transports;
     SelectionContext ctx;
     ctx.transfer_size = request.length;
     ctx.priority_level =
@@ -1834,8 +2136,12 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
     ctx.intent_type = request.intent_type;  // Business intent policy filter
     ctx.local_segment = request.target_id == LOCAL_SEGMENT_ID;
     ctx.host_staging = host_staging;
+    ctx.local_mlu_staging = local_mlu_staging;
     ctx.xpu_ipc = xpu_ipc;
-    ctx.xpu_ipc_only = ipc_mixed && !host_staging;
+    ctx.mlu_ipc = mlu_ipc;
+    ctx.xpu_ipc_only = xpu_ipc && ipc_mixed && !host_staging;
+    ctx.mlu_ipc_only = mlu_ipc && ipc_mixed && !host_staging;
+    ctx.rdma_device_direct = rdma_direct;
 
     if (desc->type == SegmentType::File) {
         // File segment: use selector with empty buffer_transports
@@ -1857,13 +2163,30 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
         ctx.same_machine = same_machine;
         ctx.local_memory_type = local_mtype;
         ctx.remote_memory_type = remote_mtype;
-        ctx.buffer_transports = ipc_mixed      ? &mixed_transports
-                                : host_staging ? &staging_transports
-                                               : &entry->transports;
+        ctx.buffer_transports = ipc_mixed ? &mixed_transports
+                                : (host_staging || local_mlu_staging)
+                                    ? &staging_transports
+                                    : &entry->transports;
+        if (strict_route && ctx.local_segment &&
+            std::find(entry->transports.begin(), entry->transports.end(),
+                      MNNVL) == entry->transports.end()) {
+            // Local-only registrations have no remote export tag, but MNNVL
+            // can copy directly to their process-local addresses. Supply a
+            // private fallback candidate without changing published metadata;
+            // explicit policy lists still take precedence in the selector.
+            local_copy_transports = entry->transports;
+            local_copy_transports.push_back(MNNVL);
+            ctx.buffer_transports = &local_copy_transports;
+        }
     }
 
     auto result = transport_selector_->select(ctx, transport_list_,
                                               transport_index, hint);
+    if (strict_route && result.transport != MNNVL) {
+        TentMetrics::instance().recordMnnvlEvent(
+            TentMetrics::MnnvlEvent::StrictFailure);
+        return SelectionResult{};
+    }
     if (result.transport != UNSPEC)
         result.staging_params = std::move(host_staging_params);
     return finish(std::move(result));
@@ -1995,6 +2318,9 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
             last.req.intent_type != curr.req.intent_type) {
             return false;
         }
+        // A merged request carries one producer dependency; mixing events
+        // would drop the ordering of the other half.
+        if (last.req.producer_event != curr.req.producer_event) return false;
         if (!last.boundary.source_key || !curr.boundary.source_key ||
             !last.boundary.target_key || !curr.boundary.target_key) {
             return false;
@@ -2193,9 +2519,56 @@ bool TransferEngineImpl::xpuIpcReady(const Request& request,
 #endif
 }
 
+bool TransferEngineImpl::mluIpcCandidate(const Request& request,
+                                         const SegmentDesc* desc,
+                                         const BufferDesc* remote_entry) {
+#ifdef USE_MLU
+    if (!desc || !remote_entry) return false;
+    auto* mlu = dynamic_cast<MluTransport*>(transport_list_[MLU].get());
+    return mlu &&
+           mlu->mayMapRemoteBuffer(request.target_id, *desc, *remote_entry);
+#else
+    (void)request;
+    (void)desc;
+    (void)remote_entry;
+    return false;
+#endif
+}
+
+bool TransferEngineImpl::mluIpcReady(const Request& request,
+                                     const SegmentDesc* desc,
+                                     const BufferDesc* remote_entry) {
+#ifdef USE_MLU
+    if (!desc || !remote_entry) return false;
+    auto* mlu = dynamic_cast<MluTransport*>(transport_list_[MLU].get());
+    return mlu &&
+           mlu->prepareRemoteBuffer(request.target_id, *desc, *remote_entry,
+                                    request.source, request.opcode);
+#else
+    (void)request;
+    (void)desc;
+    (void)remote_entry;
+    return false;
+#endif
+}
+
 void TransferEngineImpl::findStagingPolicy(const Request& request,
-                                           std::vector<std::string>& policy) {
-    if (request.target_id == LOCAL_SEGMENT_ID) return;
+                                           std::vector<std::string>& policy,
+                                           bool allow_device_direct) {
+    policy.clear();
+    if (request.target_id == LOCAL_SEGMENT_ID) {
+#ifdef USE_MLU
+        // planTransport has established that this local MLU pair needs staging.
+        auto locations = Platform::getLoader().getLocation(request.source, 1);
+        if (locations.empty()) return;
+        auto stage = topology_->findNearMem(locations[0].location);
+        // PRE/CROSS (WRITE) or CROSS/POST (READ) performs two local
+        // MLU copies. No remote stage or RPC is needed, and both legs
+        // reuse one chunk pool even when the devices share a NUMA node.
+        if (!stage.empty()) policy = {"", stage, ""};
+#endif
+        return;
+    }
 
     SegmentDesc* desc = nullptr;
     BufferDesc* entry = nullptr;
@@ -2222,21 +2595,18 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     auto server_addr = desc->rpc_server_addr;
     policy.clear();
     // case 1: rdma without gpu direct
-    if (transport_list_[RDMA] && transport_list_[NVLINK]) {
-        auto& xport = transport_list_[RDMA];
-        auto& caps = xport->capabilities();
-        if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CUDA &&
-            !caps.gpu_to_gpu) {
+    if (transport_list_[RDMA] && transport_list_[NVLINK] &&
+        !(allow_device_direct &&
+          deviceDirectRdmaReady(request, entry, local_mtype, remote_mtype))) {
+        if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CUDA) {
             policy.push_back(server_addr);
             policy.push_back(topology_->findNearMem(local));
             policy.push_back(desc->getMemory().topology.findNearMem(remote));
-        } else if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CPU &&
-                   !caps.gpu_to_dram) {
+        } else if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CPU) {
             policy.push_back(server_addr);
             policy.push_back(topology_->findNearMem(local));
             policy.push_back("");  // no remote stage
-        } else if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_CUDA &&
-                   !caps.dram_to_gpu) {
+        } else if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_CUDA) {
             policy.push_back(server_addr);
             policy.push_back("");  // no local stage
             policy.push_back(desc->getMemory().topology.findNearMem(remote));
@@ -2430,7 +2800,8 @@ Status TransferEngineImpl::prepareSubmit(
             }
         }
         owner.staging_params = owner.route.staging_params;
-        if (owner.staging_params.empty() &&
+        if (owner.request.target_id != LOCAL_SEGMENT_ID &&
+            owner.staging_params.empty() &&
             (owner.route.transport == TCP || owner.route.transport == HP_TCP)) {
             findStagingPolicy(owner.request, owner.staging_params);
         }
@@ -2439,6 +2810,13 @@ Status TransferEngineImpl::prepareSubmit(
             return Status::NotImplemented(
                 "scatter transfer does not support staged TENT "
                 "routes" LOC_MARK);
+        }
+        if (owner.route.transport != UNSPEC &&
+            !producerEventHonored(owner.request, owner.route.transport,
+                                  owner.staging)) {
+            return Status::InvalidArgument(
+                "producer_event is not supported by the selected "
+                "transport route" LOC_MARK);
         }
         prepared.owners.push_back(std::move(owner));
     }
@@ -2709,6 +3087,9 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
                                                  const PreparedSubmit& prepared,
                                                  QueueOwnerKind owner_kind) {
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (mnnvl_config_.gpu_wait)
+        return Status::InvalidArgument(
+            "MNNVL gpu_wait prohibits deferred runtime dispatch");
     if (prepared.tasks.empty()) return Status::OK();
     if (prepared.tasks.size() > batch->max_size - batch->task_list.size()) {
         return Status::TooManyRequests(
@@ -2950,9 +3331,12 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     if (!route.staging_params.empty() || task.type == TCP ||
         task.type == HP_TCP) {
         auto staging_params = route.staging_params;
-        if (staging_params.empty())
+        if (task.request.target_id != LOCAL_SEGMENT_ID &&
+            staging_params.empty())
             findStagingPolicy(task.request, staging_params);
         if (!staging_params.empty() && staging_proxy_) {
+            if (!producerEventHonored(task.request, task.type, true))
+                return finishQueuedOwner(owner_id, FAILED);
             task.staging = true;
             // Orchestration only; the real transport submissions issued by
             // ProxyManager are counted where they recurse through the
@@ -2976,6 +3360,8 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
 
     auto& transport = transport_list_[task.type];
     if (!transport) return finishQueuedOwner(owner_id, FAILED);
+    if (!producerEventHonored(task.request, task.type, false))
+        return finishQueuedOwner(owner_id, FAILED);
     auto& sub_batch = batch->sub_batch[task.type];
     if (task.type == RDMA || task.type == UB) {
         sub_batch->device_mask = task.device_mask;
@@ -3299,6 +3685,13 @@ Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& task = batch->task_list[task_id];
     auto prev_type = task.type;
+    if (mnnvl_config_.require_fabric && prev_type == MNNVL) {
+        task.suppress_failover = true;
+        TentMetrics::instance().recordMnnvlEvent(
+            TentMetrics::MnnvlEvent::StrictFailure);
+        return Status::InvalidEntry(
+            "Strict MNNVL prohibits transport failover");
+    }
 
     if (++task.failover_count > task.runtime_policy.max_failover_attempts) {
         LOG(WARNING) << "Task failover limit reached ("
@@ -3321,6 +3714,12 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         LOG_EVERY_N(WARNING, 100) << "No more transports available after "
                                   << transportTypeName(prev_type) << " failed";
         return Status::InvalidEntry("All available transports are failed");
+    }
+    // Never fail over to a route that would drop the producer dependency.
+    if (!producerEventHonored(task.request, type,
+                              !result.staging_params.empty())) {
+        return Status::InvalidEntry(
+            "fallback transport cannot honor producer_event" LOC_MARK);
     }
 
     LOG_EVERY_N(INFO, 1000)
@@ -3377,7 +3776,8 @@ bool TransferEngineImpl::attemptSubmitStageFailover(Batch* batch,
     // failover in updateTaskStatusAfterPoll, which sets task.status = FAILED
     // before calling resubmitTransferTask).
     task.status = FAILED;
-    for (int attempt = 0; attempt < task.runtime_policy.max_failover_attempts;
+    for (int attempt = 0; !task.suppress_failover &&
+                          attempt < task.runtime_policy.max_failover_attempts;
          ++attempt) {
         if (resubmitTransferTask(batch, task_id).ok()) {
             task.status = PENDING;
@@ -3511,7 +3911,8 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
     // A synchronous rejection dispatches no work, so keep trying candidates
     // within the original budget. An accepted attempt is polled on the next
     // progress step, rather than spinning here until it completes.
-    while (task.failover_count < task.runtime_policy.max_failover_attempts) {
+    while (!task.suppress_failover &&
+           task.failover_count < task.runtime_policy.max_failover_attempts) {
         if (resubmitTransferTask(batch, task_id).ok()) {
             task_status.s = PENDING;
             task.status = PENDING;

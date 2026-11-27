@@ -4185,6 +4185,84 @@ mod tests {
     }
 
     #[test]
+    fn redis_cold_backing_continuation_survives_index_backfill_and_cursor_delete() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/redis-cold-continuation");
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
+        )
+        .unwrap();
+        for key in ["c-cold", "a-cold", "b-cold"] {
+            let mut route = sample_route(1);
+            route.key = ObjectKey::new(key);
+            route.cold_backing = Some(mooncake_store_core::ColdBackingRoute {
+                owner: sample_runtime(),
+                cold_tier_id: "cold-device".to_string(),
+                object_locator: key.to_string(),
+                length: 12,
+                checksum: None,
+                state: mooncake_store_core::ColdBackingState::Materialized,
+                replicas: vec![],
+            });
+            assert!(
+                backend
+                    .compare_and_swap_object_route(&route.key, None, Some(&route))
+                    .unwrap()
+                    .applied
+            );
+        }
+        let client = redis::Client::open(server.url()).unwrap();
+        let mut connection = client.get_connection().unwrap();
+        // Exercise normal indexing and missing-index repair separately.
+        for repair in [false, true] {
+            if repair {
+                connection
+                    .del::<_, ()>(keyspace.object_cold_tier_device_index("cold-device"))
+                    .unwrap();
+            }
+            let mut filter = mooncake_store_core::ColdBackingRouteFilter {
+                device_id: Some("cold-device".to_string()),
+                limit: Some(1),
+                ..Default::default()
+            };
+            for key in ["a-cold", "b-cold", "c-cold"] {
+                let page = backend.list_object_routes_by_cold_backing(&filter).unwrap();
+                assert_eq!(page.len(), 1);
+                assert_eq!(page[0].key, ObjectKey::new(key));
+                filter.after_key = Some(page[0].key.clone());
+            }
+            assert!(backend
+                .list_object_routes_by_cold_backing(&filter)
+                .unwrap()
+                .is_empty());
+        }
+        // The global path has no device/owner/state index and must also page.
+        let first = backend
+            .list_object_routes_by_cold_backing(&mooncake_store_core::ColdBackingRouteFilter {
+                limit: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(first[0].key, ObjectKey::new("a-cold"));
+        assert!(
+            backend
+                .compare_and_swap_object_route(&first[0].key, Some(first[0].version), None)
+                .unwrap()
+                .applied
+        );
+        let next = backend
+            .list_object_routes_by_cold_backing(&mooncake_store_core::ColdBackingRouteFilter {
+                after_key: Some(first[0].key.clone()),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(next[0].key, ObjectKey::new("b-cold"));
+    }
+
+    #[test]
     fn redis_backend_uses_and_prunes_object_index() {
         let Some(server) = RedisTestServer::start() else {
             return;

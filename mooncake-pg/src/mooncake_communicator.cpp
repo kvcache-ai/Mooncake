@@ -14,6 +14,7 @@
 
 #include "common.h"
 #include "error_types.h"
+#include "control_plane/collective_algorithm_policy.h"
 #include "gpu_runtime.h"
 #include "memory_location.h"
 #include "pg_host_ip_resolve.h"
@@ -79,19 +80,8 @@ PGResult<DeviceRouteConfig> loadDeviceRouteConfigFromEnvironment() {
 PGResult<std::optional<DeviceAllReduceAlgorithm>>
 loadCollectiveAlgorithmFromEnvironment() {
     const char* raw_value = std::getenv("MOONCAKE_PG_COLLECTIVE_ALGORITHM");
-    if (!raw_value || std::string_view(raw_value) == "auto") {
-        return std::optional<DeviceAllReduceAlgorithm>{};
-    }
-    const std::string_view value(raw_value);
-    if (value == "ring") {
-        return std::optional{DeviceAllReduceAlgorithm::Ring};
-    }
-    if (value == "oneshot") {
-        return std::optional{DeviceAllReduceAlgorithm::OneShot};
-    }
-    return makePGError(PGErrorCode::InvalidArgument,
-                       "MOONCAKE_PG_COLLECTIVE_ALGORITHM must be 'auto', "
-                       "'ring', or 'oneshot'");
+    return parseCollectiveAlgorithm(raw_value ? std::string_view(raw_value)
+                                              : std::string_view("auto"));
 }
 
 void copyDeviceToDevice(void* dst, const void* src, size_t bytes,
@@ -621,17 +611,28 @@ PGResult<void> MooncakeCommunicator::initialize(
         PG_TRY_TE(context_.engine->registerLocalMemory(recv_buffer_[index],
                                                        kBufferSize, location));
 
-        // Register CPU synchronization regions. A half receives into two sets
-        // of flags, used by its consecutive runs in turn: a rank clears a run's
-        // flags when it finishes that run, and a faster peer may already have
-        // written its flag for the next run.
-        cpu_sync_send_region_[index] = new int32_t[kMaxNumRanks]{};
-        cpu_sync_recv_region_[index] = new int32_t[2 * kMaxNumRanks]{};
+        // Register CPU synchronization regions (see HalfSendSync and
+        // HalfRecvSync). A half receives into two sets of flags, used by its
+        // consecutive runs in turn: a rank clears a run's flags when it
+        // finishes that run, and a faster peer may already have written its
+        // flag for the next run. A GPU communicator's send region is mapped
+        // into the device, which counts this rank's reads there.
+        if (is_cpu_) {
+            cpu_sync_send_region_[index] =
+                new int32_t[sizeof(HalfSendSync) / sizeof(int32_t)]{};
+        } else {
+            PG_TRY_CUDA(cudaHostAlloc(
+                reinterpret_cast<void**>(&cpu_sync_send_region_[index]),
+                sizeof(HalfSendSync), cudaHostAllocMapped));
+            std::memset(cpu_sync_send_region_[index], 0, sizeof(HalfSendSync));
+        }
+        cpu_sync_recv_region_[index] =
+            new int32_t[sizeof(HalfRecvSync) / sizeof(int32_t)]{};
         PG_TRY_TE(context_.engine->registerLocalMemory(
-            cpu_sync_send_region_[index], kMaxNumRanks * sizeof(int32_t),
+            cpu_sync_send_region_[index], sizeof(HalfSendSync),
             kWildcardLocation));
         PG_TRY_TE(context_.engine->registerLocalMemory(
-            cpu_sync_recv_region_[index], 2 * kMaxNumRanks * sizeof(int32_t),
+            cpu_sync_recv_region_[index], sizeof(HalfRecvSync),
             kWildcardLocation));
     }
 
@@ -694,6 +695,14 @@ PGResult<void> MooncakeCommunicator::initialize(
         PG_TRY_CUDA(cudaHostGetDevicePointer(&meta_->activeRanksDevice,
                                              meta_->activeRanks, 0));
         std::fill_n(meta_->activeRanks, max_group_size_, false);
+    }
+    meta_->halfReads =
+        reinterpret_cast<HalfSendSync*>(cpu_sync_send_region_[0])->halfReads;
+    if (is_cpu_) {
+        meta_->halfReadsDevice = meta_->halfReads;
+    } else {
+        PG_TRY_CUDA(cudaHostGetDevicePointer(&meta_->halfReadsDevice,
+                                             meta_->halfReads, 0));
     }
 
     // Initial local endpoint info.
@@ -1557,7 +1566,11 @@ PGResult<void> MooncakeCommunicator::shutdown() {
                 cpu_sync_recv_region_[index]);
             context_.engine->unregisterLocalMemory(send_buffer_[index]);
             context_.engine->unregisterLocalMemory(recv_buffer_[index]);
-            delete[] cpu_sync_send_region_[index];
+            if (is_cpu_) {
+                delete[] cpu_sync_send_region_[index];
+            } else {
+                cudaFreeHost(cpu_sync_send_region_[index]);
+            }
             delete[] cpu_sync_recv_region_[index];
             if (is_cpu_) {
                 std::free(send_buffer_[index]);
@@ -1930,7 +1943,7 @@ void MooncakeCommunicator::applyGroupState(
         switch (next_mode) {
             case CollectiveExtensionState::Isolated:
             case CollectiveExtensionState::Quiescing:
-                PG_ASSERT_OK(device_collective_->useLocalOnly(view.epoch));
+                PG_ASSERT_OK(device_collective_->useLocalOnly(view));
                 break;
             case CollectiveExtensionState::Normal:
                 PG_ASSERT_OK(device_collective_->applyGroupView(view));

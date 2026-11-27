@@ -146,26 +146,50 @@ TEST_F(MetricsBootstrapConfigTest, RejectsOutOfRangeCommandLinePort) {
                  std::invalid_argument);
 }
 
-TEST(MasterServiceConfigTest, OplogBatchMaxEntriesDefaultsTo1024) {
-    MasterConfig master_config;
-    EXPECT_EQ(1024u, master_config.oplog_batch_max_entries);
+TEST(MasterServiceConfigTest, StandbyPollPageSizeDefaultsAndPropagates) {
+    MasterConfig master_config{};
+    EXPECT_EQ(256u, master_config.oplog_standby_max_batches_per_poll);
 
-    MasterServiceConfig service_config;
-    EXPECT_EQ(1024u, service_config.oplog_batch_max_entries);
+    MasterServiceSupervisorConfig defaults(master_config);
+    EXPECT_EQ(256u, defaults.oplog_standby_max_batches_per_poll);
+
+    master_config.oplog_standby_max_batches_per_poll = 256;
+    MasterServiceSupervisorConfig configured(master_config);
+    EXPECT_EQ(256u, configured.oplog_standby_max_batches_per_poll);
+
+    WrappedMasterServiceConfig wrapped(configured, 1);
+    MasterServiceConfig service_config(wrapped);
+    EXPECT_EQ(256u, wrapped.oplog_standby_max_batches_per_poll);
+    EXPECT_EQ(256u, service_config.oplog_standby_max_batches_per_poll);
+
+    const auto built = MasterServiceConfig::builder()
+                           .set_oplog_standby_max_batches_per_poll(64)
+                           .build();
+    EXPECT_EQ(64u, built.oplog_standby_max_batches_per_poll);
 }
 
-TEST(MasterServiceConfigTest, OplogIsDisabledByDefault) {
-    MasterConfig master_config;
-    EXPECT_FALSE(master_config.enable_oplog);
+TEST(MasterServiceConfigTest, OpLogPruningDefaultsPropagateToSupervisor) {
+    MasterConfig master_config{};
+    EXPECT_EQ(10u, master_config.oplog_prune_chunk_batch_count);
+    EXPECT_EQ(50u, master_config.oplog_prune_max_batches_per_second);
 
-    MasterServiceConfig service_config;
-    EXPECT_FALSE(service_config.enable_oplog);
-}
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    EXPECT_EQ(10u, supervisor_config.oplog_prune_chunk_batch_count);
+    EXPECT_EQ(50u, supervisor_config.oplog_prune_max_batches_per_second);
 
-TEST(MasterServiceConfigTest, OplogBuilderOverrideIsRespected) {
-    auto config = MasterServiceConfig::builder().set_enable_oplog(true).build();
+    WrappedMasterServiceConfig wrapped(supervisor_config, 1);
+    MasterServiceConfig service_config(wrapped);
+    EXPECT_EQ(10u, wrapped.oplog_prune_chunk_batch_count);
+    EXPECT_EQ(50u, wrapped.oplog_prune_max_batches_per_second);
+    EXPECT_EQ(10u, service_config.oplog_prune_chunk_batch_count);
+    EXPECT_EQ(50u, service_config.oplog_prune_max_batches_per_second);
 
-    EXPECT_TRUE(config.enable_oplog);
+    const auto built = MasterServiceConfig::builder()
+                           .set_oplog_prune_chunk_batch_count(7)
+                           .set_oplog_prune_max_batches_per_second(19)
+                           .build();
+    EXPECT_EQ(7u, built.oplog_prune_chunk_batch_count);
+    EXPECT_EQ(19u, built.oplog_prune_max_batches_per_second);
 }
 
 TEST(MasterServiceConfigTest, OplogSnapshotDefaultsAndOverridesPropagate) {
@@ -220,6 +244,12 @@ TEST(MasterServiceConfigTest, ValidatesOplogSnapshotConfiguration) {
     config.snapshot_chunk_object_count = 0;
     EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
     config.snapshot_chunk_object_count = 1;
+    config.oplog_prune_chunk_batch_count = 0;
+    EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
+    config.oplog_prune_chunk_batch_count = 10;
+    config.oplog_prune_max_batches_per_second = 0;
+    EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
+    config.oplog_prune_max_batches_per_second = 50;
     config.snapshot_object_store_type.clear();
     EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
 }
@@ -256,23 +286,29 @@ TEST(MasterServiceConfigTest, WeightCapabilityConfirmationPropagates) {
     EXPECT_TRUE(built.weight_management_oplog_capability_confirmed);
 }
 
-TEST(MasterServiceConfigTest, OplogBatchMaxEntriesBuilderOverrideRespected) {
-    auto config =
-        MasterServiceConfig::builder().set_oplog_batch_max_entries(17).build();
+TEST(MasterServiceConfigTest, EvictionWorkerThreadsPropagates) {
+    EXPECT_EQ(DEFAULT_EVICTION_WORKER_THREADS,
+              MasterServiceConfig{}.eviction_worker_threads);
+    EXPECT_EQ(DEFAULT_EVICTION_WORKER_THREADS,
+              MasterServiceConfig::builder().build().eviction_worker_threads);
+    EXPECT_EQ(8u, MasterServiceConfig::builder()
+                      .set_eviction_worker_threads(8)
+                      .build()
+                      .eviction_worker_threads);
 
-    EXPECT_EQ(17u, config.oplog_batch_max_entries);
-}
+    MasterConfig master_config{};
+    EXPECT_EQ(DEFAULT_EVICTION_WORKER_THREADS,
+              master_config.eviction_worker_threads);
+    master_config.eviction_worker_threads = 8;
+    const WrappedMasterServiceConfig from_master(master_config, 1);
+    const MasterServiceSupervisorConfig supervisor_config(master_config);
+    const WrappedMasterServiceConfig from_supervisor(supervisor_config, 1);
 
-TEST(MasterServiceConfigTest,
-     RestoreRepairDurableTimeoutBuilderOverrideRespected) {
-    MasterServiceConfig defaults;
-    EXPECT_EQ(DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS,
-              defaults.restore_repair_durable_timeout_ms);
-
-    auto config = MasterServiceConfig::builder()
-                      .set_restore_repair_durable_timeout_ms(50)
-                      .build();
-    EXPECT_EQ(50u, config.restore_repair_durable_timeout_ms);
+    EXPECT_EQ(8u, supervisor_config.eviction_worker_threads);
+    EXPECT_EQ(8u, from_master.eviction_worker_threads);
+    EXPECT_EQ(8u, from_supervisor.eviction_worker_threads);
+    EXPECT_EQ(8u, MasterServiceConfig(from_master).eviction_worker_threads);
+    EXPECT_EQ(8u, MasterServiceConfig(from_supervisor).eviction_worker_threads);
 }
 
 TEST(MasterServiceConfigTest, MetricsBootstrapConfigPropagatesToSupervisor) {

@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <numeric>
 
 #include "context.h"
@@ -427,7 +428,11 @@ class Workers {
     std::shared_mutex allocation_rails_mutex_;
     std::unordered_map<std::string, std::unique_ptr<RailMonitor>>
         allocation_rails_;
-    bool always_tier1_ = false;
+    // MC_ENABLE_DEST_DEVICE_AFFINITY: pin the remote NIC to the same name.
+    bool dest_device_affinity_ = false;
+    // One-shot warning for a peer that has no same-name NIC at all. Read on the
+    // selection hot path, so it is a plain atomic exchange rather than a lock.
+    std::atomic<bool> affinity_miss_warned_{false};
     // Opt-in deadline-aware bandwidth arbitration within a priority tier
     // (RFC #2792). Default false = original FIFO order (equal bandwidth split).
     bool deadline_bw_arbitration_ = false;

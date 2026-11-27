@@ -37,6 +37,7 @@ RUN mkdir -p build && \
         -DUSE_ETCD=ON \
         -DUSE_MUSA=ON \
         -DWITH_EP=ON \
+        -DWITH_CONDUCTOR=ON \
         -DSTORE_USE_ETCD=ON \
         -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
