@@ -351,6 +351,15 @@ class MasterServiceTestPeer {
         return service.task_manager_;
     }
 
+    static void StopDrainDispatchForTesting(MasterService& service) {
+        service.job_dispatch_running_ = false;
+        service.job_dispatch_thread_.join();
+    }
+
+    static void RunDrainRoundForTesting(MasterService& service) {
+        service.ProcessDrainJobs();
+    }
+
     static std::unique_lock<std::mutex> LockDrainJobForTesting(
         MasterService& service, const UUID& job_id) {
         std::shared_ptr<MasterService::DrainJob> job;
@@ -533,16 +542,6 @@ class MasterServiceTestPeer {
 
     bool IsReplicaReadable(const Replica& replica) const {
         return service_.IsReplicaReadable(replica);
-    }
-
-    static std::vector<std::string> KvMediaForMetadata(
-        const ObjectMetadata& metadata) {
-        return MasterService::KvMediaForMetadata(metadata);
-    }
-
-    static std::vector<std::string> KvMediaForRemoval(
-        const ObjectMetadata& metadata) {
-        return MasterService::KvMediaForRemoval(metadata);
     }
 
     void LoadTenantQuotaPoliciesFromStoreOrThrow() {

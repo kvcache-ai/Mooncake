@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include <ylt/struct_pack/compatible.hpp>
+
 #include "common_types.h"
 
 namespace mooncake {
@@ -118,6 +120,26 @@ struct OneShotEndpoint {
     bool operator==(const OneShotEndpoint&) const = default;
 };
 
+inline constexpr uint32_t kTreeEndpointVersion = 1;
+
+// Tree borrows Simple and the process workspace; it publishes capability only.
+struct TreeEndpoint {
+    uint32_t version = kTreeEndpointVersion;
+    bool operator==(const TreeEndpoint&) const = default;
+};
+
+// Two-shot reuses Simple signals and the shared workspace. Its initial direct
+// path conservatively requires native atomic P2P access for signal updates.
+inline constexpr uint32_t kTwoShotEndpointVersion = 1;
+
+struct TwoShotEndpoint {
+    uint32_t version = kTwoShotEndpointVersion;
+    DeviceUUID device_uuid{};
+    std::vector<DeviceUUID> native_atomic_peer_uuids;
+
+    bool operator==(const TwoShotEndpoint&) const = default;
+};
+
 // Runtime, protocol and algorithm endpoints owned by one communicator.
 struct DeviceGroupEndpoint {
     // Runtime-owned signal slice for synchronizing one GroupView incarnation.
@@ -128,15 +150,25 @@ struct DeviceGroupEndpoint {
     std::optional<SimpleEndpoint> simple;
     std::optional<LLEndpoint> ll;
     std::optional<OneShotEndpoint> one_shot;
+    // A plain appended optional would change struct_pack's wire type hash.
+    // compatible preserves the #4372 schema; old messages decode as absent.
+    struct_pack::compatible<TreeEndpoint, 20260930> tree;
+    struct_pack::compatible<TwoShotEndpoint, 20261030> two_shot;
 
     [[nodiscard]] bool empty() const noexcept {
         return view_epoch_signal_count == 0 && !simple.has_value() &&
-               !ll.has_value() && !one_shot.has_value();
+               !ll.has_value() && !one_shot.has_value() && !tree.has_value() &&
+               !two_shot.has_value();
     }
 
     // Ring is the baseline; LL and one-shot resources are optional.
     [[nodiscard]] bool hasAllRequiredEndpoints() const noexcept {
         return view_epoch_signal_count != 0 && simple.has_value();
+    }
+
+    [[nodiscard]] bool supportsTree() const noexcept {
+        return hasAllRequiredEndpoints() && tree &&
+               tree->version == kTreeEndpointVersion;
     }
 
     [[nodiscard]] bool supportsBackend(
@@ -245,6 +277,8 @@ enum class GroupStatus : uint8_t {
 enum class DeviceAllReduceAlgorithm : uint8_t {
     Ring = 1,
     OneShot = 2,
+    Tree = 3,
+    TwoShot = 4,
 };
 
 // Coordinator-provided upper bounds, in increasing byte order.

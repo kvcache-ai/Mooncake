@@ -166,6 +166,11 @@ struct RpcNameTraits<&WrappedMasterService::RemoveAll> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchUpdateSoftPin> {
+    static constexpr const char* value = "BatchUpdateSoftPin";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchRemove> {
     static constexpr const char* value = "BatchRemove";
 };
@@ -1034,6 +1039,17 @@ tl::expected<long, ErrorCode> MasterClient::RemoveAll(bool force) {
     auto result = invoke_rpc<&WrappedMasterService::RemoveAll, long>(
         force, tenant_id_.value());
     timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpdateSoftPin(
+    const std::vector<std::string>& keys, uint64_t ttl_ms) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchUpdateSoftPin");
+    timer.LogRequest("keys_count=", keys.size(), ", ttl_ms=", ttl_ms);
+    auto result =
+        invoke_batch_rpc<&WrappedMasterService::BatchUpdateSoftPin, void>(
+            keys.size(), keys, ttl_ms, tenant_id_.value());
+    timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
 

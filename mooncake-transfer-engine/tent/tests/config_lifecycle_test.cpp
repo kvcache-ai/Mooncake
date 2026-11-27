@@ -365,22 +365,49 @@ TEST(MnnvlConfigTest, DefaultsAndBootstrapLifecycle) {
     MnnvlConfig options;
     ASSERT_TRUE(parseMnnvlConfig(config, options).ok());
     EXPECT_FALSE(options.require_fabric);
-    for (const auto* key : {"require_fabric"}) {
+    EXPECT_FALSE(options.completion_event_pool);
+    EXPECT_EQ(options.completion_event_pool_capacity, 256);
+    EXPECT_FALSE(options.gpu_wait);
+    for (const auto* key : {"require_fabric", "completion_event_pool",
+                            "completion_event_pool_capacity", "sync_mode"}) {
         EXPECT_EQ(classifyConfigPath(std::string("transports/mnnvl/") + key),
                   ConfigLifecycle::kBootstrapOnly);
     }
 }
 
+TEST(MnnvlConfigTest, AcceptsOptInAndZeroRetention) {
+    Config config;
+    ASSERT_TRUE(config
+                    .load(R"({"transports":{"mnnvl":{
+        "require_fabric":true,"completion_event_pool":true,
+        "completion_event_pool_capacity":0,"sync_mode":"gpu_wait"}}})")
+                    .ok());
+    MnnvlConfig options;
+    ASSERT_TRUE(parseMnnvlConfig(config, options).ok());
+    EXPECT_TRUE(options.require_fabric);
+    EXPECT_TRUE(options.completion_event_pool);
+    EXPECT_EQ(options.completion_event_pool_capacity, 0);
+    EXPECT_TRUE(options.gpu_wait);
+}
+
 TEST(MnnvlConfigTest, RejectsMalformedControlsWithoutUpdatingOptions) {
     for (const auto& entry : std::vector<std::pair<std::string, json>>{
-             {"require_fabric", "true"}, {"require_fabric", nullptr}}) {
+             {"require_fabric", "true"},
+             {"require_fabric", nullptr},
+             {"completion_event_pool", 1},
+             {"completion_event_pool_capacity", -1},
+             {"completion_event_pool_capacity", 1.5},
+             {"completion_event_pool_capacity", UINT64_MAX},
+             {"completion_event_pool_capacity", nullptr},
+             {"sync_mode", true},
+             {"sync_mode", "invalid"}}) {
         Config config;
         config.set("transports/mnnvl/" + entry.first, entry.second);
         MnnvlConfig options;
-        options.egm_enabled = true;
+        options.completion_event_pool_capacity = 7;
         EXPECT_TRUE(parseMnnvlConfig(config, options).IsInvalidArgument())
             << entry.first;
-        EXPECT_TRUE(options.egm_enabled);
+        EXPECT_EQ(options.completion_event_pool_capacity, 7);
     }
 }
 
@@ -401,12 +428,26 @@ TEST(MnnvlConfigTest, StrictRejectsDisabledAndNonFabricConfigurations) {
     }
 }
 
+TEST(MnnvlConfigTest, GpuWaitRejectsDeferredDispatch) {
+    Config config;
+    config.set("transports/mnnvl/sync_mode", "gpu_wait");
+    config.set("enable_runtime_queue", true);
+    MnnvlConfig options;
+    EXPECT_TRUE(parseMnnvlConfig(config, options).IsInvalidArgument());
+    config.set("transports/mnnvl/sync_mode", "cpu_block");
+    EXPECT_TRUE(parseMnnvlConfig(config, options).ok());
+}
+
 TEST(MnnvlConfigTest, EnvironmentOverridesAndMalformedBooleans) {
     EnvVarGuard conf_guard("MC_TENT_CONF", "{}");
     EnvVarGuard strict_guard("MC_MNNVL_REQUIRE_FABRIC", "1");
+    EnvVarGuard pool_guard("MC_MNNVL_COMPLETION_EVENT_POOL", "ON");
+    EnvVarGuard sync_guard("MC_MNNVL_SYNC_MODE", "gpu_wait");
     Config config;
     ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
     EXPECT_TRUE(config.get("transports/mnnvl/require_fabric", false));
+    EXPECT_TRUE(config.get("transports/mnnvl/completion_event_pool", false));
+    EXPECT_EQ(config.get("transports/mnnvl/sync_mode", ""), "gpu_wait");
     EnvVarGuard invalid_guard("MC_MNNVL_REQUIRE_FABRIC", "tru");
     EXPECT_TRUE(ConfigHelper().loadFromEnv(config).IsInvalidArgument());
 }

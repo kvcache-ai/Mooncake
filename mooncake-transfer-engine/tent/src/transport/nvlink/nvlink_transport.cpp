@@ -113,7 +113,12 @@ Status syncWithCallerStream() {
 
 NVLinkTransport::NVLinkTransport() : installed_(false) {}
 
-NVLinkTransport::~NVLinkTransport() { uninstall(); }
+NVLinkTransport::~NVLinkTransport() {
+    // Final destruction ends the new GVA allocations' owner lifetime.
+    // Explicit uninstall, in contrast, rejects outstanding allocations.
+    gva_allocations_.clear();
+    uninstall();
+}
 
 Status NVLinkTransport::install(std::string& local_segment_name,
                                 std::shared_ptr<ControlService> metadata,
@@ -145,6 +150,15 @@ Status NVLinkTransport::install(std::string& local_segment_name,
 
 Status NVLinkTransport::uninstall() {
     if (installed_) {
+        std::lock_guard<std::mutex> allocations(allocate_mutex_);
+        if (!gva_allocations_.empty())
+            return Status::InvalidArgument(
+                "Free GVA allocations before uninstall" LOC_MARK);
+        RWSpinlock::WriteGuard guard(relocate_lock_);
+        for (auto& peer : vmm_mappings_)
+            for (auto& entry : peer.second)
+                CHECK_STATUS(entry.second->release());
+        vmm_mappings_.clear();
         metadata_.reset();
         for (auto& relocate_map : relocate_map_) {
             for (auto& by_addr : relocate_map.second) {
@@ -178,6 +192,42 @@ Status NVLinkTransport::freeSubBatch(SubBatchRef& batch) {
     auto shm_batch = dynamic_cast<NVLinkSubBatch*>(batch);
     if (!shm_batch)
         return Status::InvalidArgument("Invalid NVLink sub-batch" LOC_MARK);
+    // A transfer can report failure after earlier asynchronous copies were
+    // accepted by CUDA. Keep the batch and completion events alive until the
+    // stream is known to be drained; otherwise callers may reuse its buffers
+    // while the GPU is still accessing them.
+    if (shm_batch->async_stream.get() != nullptr) {
+        int saved_device = -1;
+        auto select_err = cudaGetDevice(&saved_device);
+        if (select_err != cudaSuccess) {
+            return Status::InternalError(
+                "unable to read CUDA device before NVLink cleanup" LOC_MARK);
+        }
+        if (shm_batch->stream_device_id >= 0 &&
+            saved_device != shm_batch->stream_device_id) {
+            select_err = cudaSetDevice(shm_batch->stream_device_id);
+            if (select_err != cudaSuccess) {
+                return Status::InternalError(
+                    "unable to select NVLink stream device for "
+                    "cleanup" LOC_MARK);
+            }
+        }
+        const auto sync_err =
+            cudaStreamSynchronize(shm_batch->async_stream.get());
+        if (saved_device != shm_batch->stream_device_id &&
+            shm_batch->stream_device_id >= 0) {
+            const auto restore_err = cudaSetDevice(saved_device);
+            if (restore_err != cudaSuccess) {
+                return Status::InternalError(
+                    "unable to restore CUDA device after NVLink "
+                    "cleanup" LOC_MARK);
+            }
+        }
+        if (sync_err != cudaSuccess) {
+            return Status::InternalError(
+                "NVLink stream drain failed; retaining sub-batch" LOC_MARK);
+        }
+    }
     // Completion events are destroyed by ~NVLinkSubBatch(), which Slab's
     // deallocate() invokes before returning the storage. Streams are
     // pool-managed and not destroyed here.
@@ -500,6 +550,20 @@ Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
                                         const MemoryOptions& options) {
+    {
+        std::lock_guard<std::mutex> lock(allocate_mutex_);
+        auto owned = gva_allocations_.find((void*)desc.addr);
+        if (owned != gva_allocations_.end()) {
+            if (desc.length > owned->second->size())
+                return Status::InvalidArgument(
+                    "Registration exceeds GVA allocation" LOC_MARK);
+            CHECK_STATUS(owned->second->exportHandle(
+                CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+                &desc.transport_attrs[NVLINK]));
+            desc.transports.push_back(NVLINK);
+            return Status::OK();
+        }
+    }
     LocationParser location(desc.location);
     if (location.type() == "cuda") {
         // MNNVL allocations are exported by MnnvlTransport instead of CUDA IPC.
@@ -593,6 +657,7 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
 }
 
 Status NVLinkTransport::removeMemoryBuffer(BufferDesc& desc) {
+    if (desc.transport_attrs.erase(NVLINK)) return Status::OK();
     LocationParser location(desc.location);
     if (location.type() == "cuda") {
         // Resolve base the same way we did in addMemoryBuffer, so we
@@ -682,8 +747,6 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
         }
     }
 
-    RWSpinlock::WriteGuard guard(relocate_lock_);
-
     BufferDesc* buffer;
     // Owning reference: `buffer` is used after the lambda returns.
     SegmentDescRef pin;
@@ -699,6 +762,7 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                 return Status::NeedsRefreshCache(
                     "Requested address is not in registered buffer" LOC_MARK);
             }
+            if (buffer->transport_attrs.count(NVLINK)) return Status::OK();
             if (buffer->shm_path.empty()) {
                 // cudaMalloc-segment dedup used to drop the IPC handle for
                 // every desc after the first one in the same segment; this
@@ -714,6 +778,10 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
             return Status::OK();
         }));
 
+    if (buffer->transport_attrs.count(NVLINK))
+        return mapVmmMemory(dest_addr, length, target_id, false, src_device);
+
+    RWSpinlock::WriteGuard guard(relocate_lock_);
     // The opening device must be the local source buffer's device, not the
     // peer's buffer->location ordinal (that is relative to the peer's
     // CUDA_VISIBLE_DEVICES and may be invalid or denote a different physical
@@ -764,6 +832,141 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
 
     auto shm_addr = it_dev->second.shm_addr;
     dest_addr = dest_addr - buffer->addr + ((uint64_t)shm_addr);
+    return Status::OK();
+}
+
+Status NVLinkTransport::allocateLocalMemory(void** addr, size_t size,
+                                            MemoryOptions& options) {
+    if (!addr || !size)
+        return Status::InvalidArgument("Invalid memory allocation" LOC_MARK);
+    if (!options.global_address)
+        return Platform::getLoader().allocate(addr, size, options);
+    if (!installed_ || LocationParser(options.location).type() != "cuda")
+        return Status::InvalidArgument(
+            "GVA requires installed CUDA transport" LOC_MARK);
+    int device = LocationParser(options.location).index();
+    if (device < 0) CHECK_CUDA(cudaGetDevice(&device));
+    CHECK_CUDA(cudaFree(nullptr));
+    CUmemAllocationProp properties{};
+    properties.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    properties.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    properties.location.id = device;
+    properties.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    std::vector<CUmemAccessDesc> access{CudaSharedMemory::deviceAccess(device)};
+    std::unique_ptr<CudaSharedMemory> memory;
+    auto status = CudaSharedMemory::create(properties, size, &memory);
+    if (!status.ok()) return status;
+    CHECK_STATUS(memory->map(access, options.global_address));
+    void* result = (void*)memory->address();
+    std::lock_guard<std::mutex> lock(allocate_mutex_);
+    gva_allocations_[result] = std::move(memory);
+    *addr = result;
+    return Status::OK();
+}
+
+Status NVLinkTransport::freeLocalMemory(void* addr, size_t size) {
+    std::lock_guard<std::mutex> lock(allocate_mutex_);
+    auto owned = gva_allocations_.find(addr);
+    if (owned == gva_allocations_.end())
+        return Platform::getLoader().free(addr, size);
+    CHECK_STATUS(owned->second->release());
+    gva_allocations_.erase(owned);
+    return Status::OK();
+}
+
+Status NVLinkTransport::mapVmmMemory(uint64_t& address, size_t size,
+                                     SegmentID peer, bool fixed_address,
+                                     int device) {
+    if (!installed_ || !address || !size || size > UINT64_MAX - address)
+        return Status::InvalidArgument("Invalid VMM range" LOC_MARK);
+    if (device < 0) CHECK_CUDA(cudaGetDevice(&device));
+    struct Cache {
+        const NVLinkTransport* owner = nullptr;
+        int device = -1;
+        VmmMap mappings;
+    };
+    thread_local Cache cache;
+    if (cache.owner != this || cache.device != device) {
+        cache.mappings.clear();
+        cache.owner = this;
+        cache.device = device;
+    }
+    if (!fixed_address) {
+        for (auto& [base, memory] : cache.mappings[peer]) {
+            if (memory->mapped() && address >= base &&
+                address - base < memory->size() &&
+                size <= memory->size() - (address - base)) {
+                address = memory->address() + address - base;
+                return Status::OK();
+            }
+        }
+    }
+    SegmentDescRef pin;
+    BufferDesc* buffer = nullptr;
+    std::string exported;
+    CHECK_STATUS(metadata_->segmentManager().withCachedSegment(
+        peer, pin, [&](SegmentDesc* segment) -> Status {
+            buffer = segment->findBuffer(address, size);
+            if (!buffer)
+                return Status::NeedsRefreshCache(
+                    "VMM range is not registered" LOC_MARK);
+            if (fixed_address && address != buffer->addr)
+                return Status::InvalidArgument(
+                    "Map the published region base" LOC_MARK);
+            if (segment->machine_id != machine_id_ &&
+                !segment->machine_id.empty())
+                return Status::InvalidArgument(
+                    "NVLink requires a same-host peer" LOC_MARK);
+            exported = buffer->transport_attrs.count(NVLINK)
+                           ? buffer->transport_attrs.at(NVLINK)
+                           : std::string();
+            if (exported.empty())
+                return Status::NotImplemented(
+                    "Buffer has no VMM handle" LOC_MARK);
+            return Status::OK();
+        }));
+    std::vector<CUmemAccessDesc> access;
+    access.push_back(CudaSharedMemory::deviceAccess(device));
+    RWSpinlock::WriteGuard guard(relocate_lock_);
+    auto& regions = vmm_mappings_[peer];
+    auto existing = regions.find(buffer->addr);
+    if (existing == regions.end()) {
+        std::unique_ptr<CudaSharedMemory> memory;
+        CHECK_STATUS(CudaSharedMemory::importHandle(
+            exported, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, buffer->length,
+            &memory));
+        CHECK_STATUS(memory->map(access, fixed_address ? buffer->addr : 0));
+        existing = regions.emplace(buffer->addr, std::move(memory)).first;
+    } else {
+        if (fixed_address && existing->second->address() != buffer->addr)
+            return Status::InvalidArgument(
+                "Unmap the relocated region before mapping its global "
+                "address" LOC_MARK);
+        CHECK_STATUS(existing->second->setAccess(access));
+    }
+    address = existing->second->address() + address - buffer->addr;
+    cache.mappings[peer][buffer->addr] = existing->second;
+    return Status::OK();
+}
+
+Status NVLinkTransport::mapRemoteMemory(SegmentID peer, void* address,
+                                        size_t size) {
+    if (peer == LOCAL_SEGMENT_ID)
+        return Status::InvalidArgument("Expected a remote segment" LOC_MARK);
+    uint64_t value = (uint64_t)address;
+    return mapVmmMemory(value, size, peer, true, -1);
+}
+
+Status NVLinkTransport::unmapRemoteMemory(SegmentID peer, void* address) {
+    RWSpinlock::WriteGuard guard(relocate_lock_);
+    auto remote = vmm_mappings_.find(peer);
+    if (remote == vmm_mappings_.end() ||
+        !remote->second.count((uint64_t)address))
+        return Status::InvalidArgument("VMM mapping does not exist" LOC_MARK);
+    auto region = remote->second.find((uint64_t)address);
+    CHECK_STATUS(region->second->release());
+    remote->second.erase(region);
+    if (remote->second.empty()) vmm_mappings_.erase(remote);
     return Status::OK();
 }
 

@@ -27,6 +27,10 @@ class FileStorage {
                 SsdMetric* ssd_metric = nullptr);
     ~FileStorage();
 
+    // The owner must stop external I/O first. Keep registered arenas alive
+    // until Client/TransferEngine teardown has completed.
+    tl::expected<void, ErrorCode> Shutdown();
+
     tl::expected<void, ErrorCode> Init();
 
     void RemoveAll();
@@ -179,6 +183,10 @@ class FileStorage {
 
    private:
     friend class FileStorageTest;
+    friend class FileStorageShutdownTestPeer;
+    std::mutex shutdown_mutex_;
+    bool staging_registered_ = false;
+    ErrorCode shutdown_error_ = ErrorCode::OK;
     friend class FileStoragePromotionTest;
     // TEST_F bodies are generated subclasses and do not inherit the fixture's
     // friendship, so the dangling-replica tests are friended by their
@@ -351,6 +359,27 @@ class FileStorage {
      * This is the same logic as the ScanMeta step in Init().
      */
     tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
+
+    // Each pass records stored keys the master no longer has; the next tick
+    // deletes buckets whose keys are all dead. Heartbeat thread only.
+    void ReclaimRemovedObjects();
+
+    // True unless a metadata rescan is running or still owed to a master
+    // that lost our LOCAL_DISK segment.
+    bool MasterKnowsOurObjects() const;
+
+    // Adds the keys the master no longer has (or, for offload_targets, has
+    // without our LOCAL_DISK replica). False if any key went unanswered.
+    bool FindDeadKeys(
+        const std::vector<std::pair<int64_t, std::string>>& bucket_keys,
+        bool offload_targets,
+        std::unordered_map<int64_t, std::vector<std::string>>& dead_keys);
+
+    // Unmaps stale local copies of offload targets, so a removed key that
+    // was put again is offloaded afresh instead of skipped (#4487).
+    void DropStaleCopiesOfOffloadTargets(
+        BucketStorageBackend& backend,
+        const std::unordered_map<std::string, int64_t>& storage_object_sizes);
 
     // Backend disk-error observer. Runs inline on the failing I/O thread, so
     // it makes no RPC and takes no lock that I/O or the heartbeat holds.
@@ -528,6 +557,18 @@ class FileStorage {
     std::function<int(bool sync_first)> test_filesystem_check_;
     std::mutex heartbeat_wake_mutex_;
     std::condition_variable heartbeat_wake_cv_;
+
+    // Reclaim state, touched by the heartbeat thread only.
+    std::unordered_map<int64_t, std::vector<std::string>> reclaim_dead_keys_;
+    int64_t reclaim_cursor_ = -1;
+    // Bumped each time the master reports our segment lost; a rescan that
+    // started at epoch E and succeeded publishes E. Reclaim needs them equal.
+    std::atomic<uint64_t> segment_lost_epoch_{0};
+    std::atomic<uint64_t> rescanned_epoch_{0};
+    bool reclaim_disabled_ = false;
+    uint32_t reclaim_passes_left_ = 0;
+    size_t reclaim_keys_per_pass_ = 0;
+    std::chrono::steady_clock::time_point next_reclaim_at_{};
 };
 
 }  // namespace mooncake

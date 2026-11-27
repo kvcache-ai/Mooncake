@@ -777,23 +777,44 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
     (void)deadline_ns;
     (void)intent_type;
     if (!running()) return -1.0;
+    XferBenchTimer parent_timer;
+    auto build = [&](size_t begin, size_t end) {
+        std::vector<TransferRequest> requests;
+        requests.reserve(end - begin);
+        for (uint64_t i = begin; i < end; ++i) {
+            TransferRequest entry;
+            entry.opcode =
+                opcode == READ ? TransferRequest::READ : TransferRequest::WRITE;
+            entry.length = block_size;
+            entry.source = (void*)(local_addr + block_size * i);
+            entry.target_id = target_id;
+            entry.target_offset = target_addr + block_size * i;
+            requests.emplace_back(entry);
+        }
+        return requests;
+    };
+    auto parallel_result = engine_->tryParallelBatchTransfer(
+        target_id, batch_size, build, std::chrono::seconds(30));
+    if (parallel_result) {
+        if (!parallel_result->ok()) {
+            // Ordinary free may defer cleanup while transport work still
+            // owns the payload. Preserve the buffers until process exit.
+            abandoned_batches_.fetch_add(1);
+            LOG(ERROR) << "Parallel batch transfer failed: "
+                       << parallel_result->ToString();
+            noteTransferFailed();
+            return -1.0;
+        }
+        return static_cast<double>(parent_timer.lap_ns(false)) /
+               kNanosecondsPerMicrosecond;
+    }
     auto batch_id = engine_->allocateBatchID(batch_size);
     if (batch_id == mooncake::INVALID_BATCH_ID) {
         LOG(ERROR) << "Failed to allocate transfer batch";
         noteTransferFailed();
         return -1.0;
     }
-    std::vector<TransferRequest> requests;
-    for (uint64_t i = 0; i < batch_size; ++i) {
-        TransferRequest entry;
-        entry.opcode =
-            opcode == READ ? TransferRequest::READ : TransferRequest::WRITE;
-        entry.length = block_size;
-        entry.source = (void*)(local_addr + block_size * i);
-        entry.target_id = target_id;
-        entry.target_offset = target_addr + block_size * i;
-        requests.emplace_back(entry);
-    }
+    auto requests = build(0, batch_size);
     // A deferred free means transport work may still own the buffers (see
     // TransferEngine::freeBatchID), e.g. a TIMEOUT task whose slices are
     // still waiting. Keep freeBuffers() from releasing them at exit.
@@ -827,7 +848,8 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
         }
         auto released = releaseFinishedBatch(*engine_, batch_id);
         if (!released.ok()) return fail("Failed to free batch", released);
-        return static_cast<double>(total_ns) / kNanosecondsPerMicrosecond;
+        return static_cast<double>(parent_timer.lap_ns(false)) /
+               kNanosecondsPerMicrosecond;
     }
     if (overall_status.s == TransferStatusEnum::PENDING) {
         // Abandoned after a stop; waitForBatch() already counted it.

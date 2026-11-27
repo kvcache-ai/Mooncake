@@ -14,8 +14,11 @@
 
 #include "tent/runtime/segment_tracker.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <filesystem>
+#include <ranges>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -28,21 +31,33 @@
 namespace mooncake {
 namespace tent {
 namespace {
+using BufferRange = std::pair<uint64_t, size_t>;
+
+BufferRange bufferRange(const BufferDesc& desc) {
+    return {desc.addr, desc.length};
+}
+
+bool rangeLess(const BufferRange& lhs, const BufferRange& rhs) {
+    if (lhs.first != rhs.first) return lhs.first < rhs.first;
+    return lhs.second > rhs.second;  // Prefer the longest range at an address.
+}
+
 void sortBuffers(std::vector<BufferDesc>& buffers) {
     std::sort(buffers.begin(), buffers.end(),
-              [](const BufferDesc& lhs, const BufferDesc& rhs) -> bool {
-                  if (lhs.addr < rhs.addr) return true;
-                  if (lhs.addr > rhs.addr) return false;
-                  return lhs.length > rhs.length;  // prefer large interval
+              [](const BufferDesc& lhs, const BufferDesc& rhs) {
+                  return rangeLess(bufferRange(lhs), bufferRange(rhs));
               });
 }
 
+auto findRange(const std::vector<BufferDesc>& buffers, uint64_t addr,
+               size_t length) {
+    // Use the same ordering as publication to find all aliases of a range.
+    return std::ranges::equal_range(buffers, BufferRange{addr, length},
+                                    rangeLess, bufferRange);
+}
+
 bool containsBuffer(const SegmentDesc& desc, uint64_t base, size_t length) {
-    auto& detail = std::get<MemorySegmentDesc>(desc.detail);
-    for (auto& buf : detail.buffers) {
-        if (buf.addr == base && buf.length == length) return true;
-    }
-    return false;
+    return !findRange(desc.getMemory().buffers, base, length).empty();
 }
 
 struct BufferRangeHash {
@@ -51,6 +66,68 @@ struct BufferRangeHash {
                (std::hash<size_t>()(range.second) << 1);
     }
 };
+
+// Descriptors with the same range are aliases of one logical registration.
+// Keep their reference counts in sync and remove them together.
+std::vector<size_t> MatchRange(const std::vector<BufferDesc>& buffers,
+                               uint64_t addr, size_t length) {
+    const auto range = findRange(buffers, addr, length);
+    std::vector<size_t> matches;
+    matches.reserve(range.size());
+    for (auto it = range.begin(); it != range.end(); ++it)
+        matches.push_back(static_cast<size_t>(it - buffers.begin()));
+    return matches;
+}
+
+void BumpRange(std::vector<BufferDesc>& buffers,
+               const std::vector<size_t>& matches) {
+    int logical = 0;
+    for (size_t index : matches) {
+        logical = std::max(logical, buffers[index].ref_count);
+    }
+    for (size_t index : matches) {
+        buffers[index].ref_count = logical + 1;
+    }
+}
+
+void PruneRemovedTransportAttrs(
+    const std::vector<TransportType>& original_transports,
+    const BufferDesc& original_front, const BufferDesc& updated,
+    BufferDesc& target) {
+    auto has_transport = [](const std::vector<TransportType>& transports,
+                            TransportType type) {
+        return std::find(transports.begin(), transports.end(), type) !=
+               transports.end();
+    };
+    for (auto it = target.transport_attrs.begin();
+         it != target.transport_attrs.end();) {
+        const TransportType type = it->first;
+        const bool removed_from_transports =
+            has_transport(original_transports, type) &&
+            !has_transport(updated.transports, type);
+        const bool removed_from_attrs =
+            original_front.transport_attrs.find(type) !=
+                original_front.transport_attrs.end() &&
+            updated.transport_attrs.find(type) == updated.transport_attrs.end();
+        if (removed_from_transports || removed_from_attrs) {
+            it = target.transport_attrs.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void ApplyCleanupProgress(const BufferDesc& original_front,
+                          const BufferDesc& updated, BufferDesc& target) {
+    PruneRemovedTransportAttrs(target.transports, original_front, updated,
+                               target);
+    target.transports = updated.transports;
+    target.regions = updated.regions;
+    target.rkey = updated.rkey;
+    target.lkey = updated.lkey;
+    target.shm_path = updated.shm_path;
+    target.mnnvl_handle = updated.mnnvl_handle;
+}
 }  // namespace
 
 Status SegmentTracker::add(uint64_t base, size_t length,
@@ -63,12 +140,10 @@ Status SegmentTracker::add(uint64_t base, size_t length,
         CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) -> Status {
             assert(desc.type == SegmentType::Memory);
             auto& detail = std::get<MemorySegmentDesc>(desc.detail);
-            for (auto& buf : detail.buffers) {
-                if (buf.addr == base && buf.length == length) {
-                    buf.ref_count++;
-                    found = true;
-                    break;
-                }
+            auto matches = MatchRange(detail.buffers, base, length);
+            if (!matches.empty()) {
+                BumpRange(detail.buffers, matches);
+                found = true;
             }
             return Status::OK();
         }));
@@ -137,15 +212,12 @@ Status SegmentTracker::addInBatch(
             assert(desc.type == SegmentType::Memory);
             auto& detail = std::get<MemorySegmentDesc>(desc.detail);
             for (auto& entry : desc_list) {
-                bool found = false;
-                for (auto& buf : detail.buffers) {
-                    if (buf.addr == entry.addr && buf.length == entry.length) {
-                        buf.ref_count++;
-                        found = true;
-                        break;
-                    }
-                }
-                if (found) {
+                auto matches =
+                    MatchRange(detail.buffers, entry.addr, entry.length);
+                if (!matches.empty()) {
+                    // One input, including a repeated input in this batch, is
+                    // one logical reference on every alias of the range.
+                    BumpRange(detail.buffers, matches);
                     bumped.emplace_back(entry.addr, entry.length);
                 } else {
                     appendNewDescriptor(entry);
@@ -169,6 +241,8 @@ Status SegmentTracker::addInBatch(
         }
         return status;
     }
+    // Duplicate references were published before the callback.
+    if (any_dup && new_desc_list.empty()) return Status::OK();
     return manager_.updateLocal([&](SegmentDesc& desc) -> Status {
         assert(desc.type == SegmentType::Memory);
         auto& detail = std::get<MemorySegmentDesc>(desc.detail);
@@ -185,32 +259,60 @@ Status SegmentTracker::remove(uint64_t base, size_t length,
     std::lock_guard<std::recursive_mutex> guard(mutex_);
     bool removed = false;
     BufferDesc removed_desc;
+    std::vector<BufferDesc> removed_group;
     CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) -> Status {
         assert(desc.type == SegmentType::Memory);
         auto& detail = std::get<MemorySegmentDesc>(desc.detail);
-        for (auto it = detail.buffers.begin(); it != detail.buffers.end();
-             ++it) {
-            if (it->addr == base && (!length || it->length == length)) {
-                it->ref_count--;
-                if (it->ref_count == 0) {
-                    removed_desc = *it;
-                    detail.buffers.erase(it);
-                    removed = true;
-                }
-                break;
-            }
+        auto first =
+            std::find_if(detail.buffers.begin(), detail.buffers.end(),
+                         [&](const auto& buffer) {
+                             return buffer.addr == base &&
+                                    (!length || buffer.length == length);
+                         });
+        if (first == detail.buffers.end()) return Status::OK();
+        const auto matches = MatchRange(detail.buffers, base, first->length);
+        int logical = 0;
+        for (size_t index : matches) {
+            logical = std::max(logical, detail.buffers[index].ref_count);
         }
+        if (logical > 1) {
+            for (size_t index : matches) {
+                detail.buffers[index].ref_count = logical - 1;
+            }
+            return Status::OK();
+        }
+        removed_group.reserve(matches.size());
+        for (size_t index : matches) {
+            removed_group.push_back(detail.buffers[index]);
+        }
+        for (auto it = matches.rbegin(); it != matches.rend(); ++it) {
+            detail.buffers.erase(detail.buffers.begin() +
+                                 static_cast<std::ptrdiff_t>(*it));
+        }
+        removed_desc = removed_group.front();
+        removed_desc.ref_count = 0;
+        removed = true;
         return Status::OK();
     }));
     if (!removed) return Status::OK();
     auto status = callback(removed_desc);
     if (!status.ok()) {
-        // Successful transport removals may have scrubbed their keys. Keep
-        // the remaining registrations and one reference for a safe retry.
-        removed_desc.ref_count = 1;
+        // Successful transport removals may have scrubbed their keys. Preserve
+        // that progress across every alias in the range for a safe retry.
+        for (size_t i = 1; i < removed_group.size(); ++i) {
+            ApplyCleanupProgress(removed_group.front(), removed_desc,
+                                 removed_group[i]);
+        }
+        PruneRemovedTransportAttrs(removed_group.front().transports,
+                                   removed_group.front(), removed_desc,
+                                   removed_desc);
+        removed_group.front() = std::move(removed_desc);
         CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) {
             auto& buffers = std::get<MemorySegmentDesc>(desc.detail).buffers;
-            buffers.push_back(std::move(removed_desc));
+            for (auto& buffer : removed_group) {
+                buffer.ref_count = 1;
+                buffers.push_back(std::move(buffer));
+            }
             sortBuffers(buffers);
             return Status::OK();
         }));

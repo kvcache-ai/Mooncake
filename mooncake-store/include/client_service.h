@@ -1240,6 +1240,7 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string host_id_;
+    const std::optional<PhysicalPlacement> physical_placement_;
     const std::string metadata_connstring_;
     const std::string protocol_;
     const bool object_checksum_enabled_;

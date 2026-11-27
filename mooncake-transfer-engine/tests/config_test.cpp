@@ -27,6 +27,74 @@
 namespace mooncake {
 namespace {
 
+class IbTimeoutEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_IB_TIMEOUT"); }
+};
+
+TEST_F(IbTimeoutEnvTest, PreservesDefault) {
+    ::unsetenv("MC_IB_TIMEOUT");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.ib_timeout, 14);
+}
+
+TEST_F(IbTimeoutEnvTest, AcceptsFiniteExponents) {
+    for (int exponent = 1; exponent <= 31; ++exponent) {
+        ASSERT_EQ(
+            ::setenv("MC_IB_TIMEOUT", std::to_string(exponent).c_str(), 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.ib_timeout, exponent);
+    }
+    ::setenv("MC_IB_TIMEOUT", " +18 ", 1);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.ib_timeout, 18);
+}
+
+TEST_F(IbTimeoutEnvTest, RejectsInvalidValuesWithoutChangingConfig) {
+    for (const char* value : {"", "0", "32", "-1", "18ms", "18.5", "+-18",
+                              "18 19", "999999999999999999999999"}) {
+        SCOPED_TRACE(value);
+        ASSERT_EQ(::setenv("MC_IB_TIMEOUT", value, 1), 0);
+        GlobalConfig config;
+        config.ib_timeout = 20;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.ib_timeout, 20);
+    }
+}
+
+TEST(AscendSingleSegmentConfigTest, DefaultsOffAndParsesExplicitBoolean) {
+    unsetenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT");
+    unsetenv("ASCEND_STANDALONE_SINGLE_SEGMENT");
+    GlobalConfig defaults;
+    loadGlobalConfig(defaults);
+    EXPECT_FALSE(defaults.ascend_standalone_single_segment);
+    for (const char* value : {"1", "true", "0", "false", "invalid"}) {
+        setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", value, 1);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.ascend_standalone_single_segment,
+                  std::string(value) == "1" || std::string(value) == "true");
+    }
+    setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", "0", 1);
+    setenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT", "1", 1);
+    GlobalConfig mc_override;
+    loadGlobalConfig(mc_override);
+    EXPECT_TRUE(mc_override.ascend_standalone_single_segment);
+
+    setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", "1", 1);
+    setenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT", "0", 1);
+    GlobalConfig mc_disable;
+    mc_disable.ascend_standalone_single_segment = true;
+    loadGlobalConfig(mc_disable);
+    EXPECT_FALSE(mc_disable.ascend_standalone_single_segment);
+
+    unsetenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT");
+    unsetenv("ASCEND_STANDALONE_SINGLE_SEGMENT");
+}
+
 // --- MC_PKEY_INDEX (stoi with try-catch, range 0-65535) ---
 
 class PkeyIndexEnvTest : public ::testing::Test {

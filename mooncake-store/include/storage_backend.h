@@ -52,9 +52,19 @@ struct BucketMetadata {
     // Runtime-only fields (not serialized) for safe deletion support
     // Tracks number of in-flight reads to enable safe bucket deletion
     mutable std::atomic<int32_t> inflight_reads_{0};
+    // Number of scan batches (ScanMeta -> NotifyOffloadSuccess) that have
+    // copied this bucket's keys and are still registering them with the
+    // master. Eviction skips a pinned bucket: deleting it before the
+    // registration lands would notify the master about a key it does not know
+    // yet, and the late NotifyOffloadSuccess would then re-create the object
+    // pointing at bytes that were just deleted. Reset to 0 in copy/move, like
+    // inflight_reads_.
+    mutable std::atomic<int32_t> scan_pins_{0};
     // Last access timestamp in nanoseconds; used by LRU eviction policy.
     // Updated on every read with relaxed ordering (approximate is sufficient).
     mutable std::atomic<int64_t> last_access_ns_{0};
+    // Guarded by BucketStorageBackend::mutex_; not serialized.
+    bool offload_notification_pending_ = false;
     // Index into BucketStorageBackend::disks_ identifying which disk holds
     // this bucket's files. Not serialized: Init() re-derives it from the disk
     // the .meta file was found on.
@@ -70,6 +80,7 @@ struct BucketMetadata {
           keys(other.keys),
           metadatas(other.metadatas),
           inflight_reads_(0),
+          scan_pins_(0),
           last_access_ns_(0),
           disk_index(other.disk_index) {}
 
@@ -80,6 +91,7 @@ struct BucketMetadata {
           keys(std::move(other.keys)),
           metadatas(std::move(other.metadatas)),
           inflight_reads_(0),
+          scan_pins_(0),
           last_access_ns_(0),
           disk_index(other.disk_index) {}
 
@@ -156,6 +168,68 @@ class BucketReadGuard {
             if (bucket_) {
                 bucket_->inflight_reads_.fetch_sub(1,
                                                    std::memory_order_release);
+            }
+            bucket_ = std::move(other.bucket_);
+            other.bucket_ = nullptr;
+        }
+        return *this;
+    }
+
+    const std::shared_ptr<BucketMetadata>& get() const { return bucket_; }
+
+   private:
+    std::shared_ptr<BucketMetadata> bucket_;
+};
+
+/**
+ * @brief RAII guard that keeps a bucket from being evicted while a scan batch
+ * is registering its keys with the master.
+ *
+ * A rescan (ScanMeta -> NotifyOffloadSuccess) copies a bucket's keys under a
+ * shared lock and then sends the batch over RPC outside that lock. If the
+ * bucket were evicted in between, the eviction notification would reach a
+ * master that does not know the key yet (OBJECT_NOT_FOUND), and the late
+ * registration would re-create the object pointing at the deleted bucket.
+ *
+ * The pin must be taken inside the same shared-lock section that copies the
+ * bucket (see BucketScan) and held until the registration RPC returns.
+ * Eviction selection skips pinned buckets instead of waiting for them, so the
+ * only buckets that cannot be evicted are the ones in the in-flight batch.
+ *
+ * Scope: this orders eviction against registration. It does not cover
+ * RemoveAll or write rollback, where the local deletion is authoritative and
+ * the master may already have dropped the metadata; closing that window needs
+ * a master-side value epoch/tombstone.
+ */
+class BucketScanPin {
+   public:
+    explicit BucketScanPin(std::shared_ptr<BucketMetadata> bucket)
+        : bucket_(std::move(bucket)) {
+        if (bucket_) {
+            bucket_->scan_pins_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    ~BucketScanPin() {
+        if (bucket_) {
+            bucket_->scan_pins_.fetch_sub(1, std::memory_order_release);
+        }
+    }
+
+    // Non-copyable
+    BucketScanPin(const BucketScanPin&) = delete;
+    BucketScanPin& operator=(const BucketScanPin&) = delete;
+
+    // Movable (so pins can live in a std::vector)
+    BucketScanPin(BucketScanPin&& other) noexcept
+        : bucket_(std::move(other.bucket_)) {
+        other.bucket_ = nullptr;
+    }
+
+    BucketScanPin& operator=(BucketScanPin&& other) noexcept {
+        if (this != &other) {
+            if (bucket_) {
+                bucket_->scan_pins_.fetch_sub(1, std::memory_order_release);
             }
             bucket_ = std::move(other.bucket_);
             other.bucket_ = nullptr;
@@ -262,6 +336,11 @@ struct FileStorageConfig {
 
     // Interval between heartbeats sent to the control plane (in seconds)
     uint32_t heartbeat_interval_seconds = 10;
+
+    // Interval between reclaim passes (bucket backend only); 0 disables them.
+    uint32_t reclaim_interval_seconds = 10;
+    // Time in which the passes check every stored key against the master.
+    uint32_t reclaim_cycle_seconds = 120;
 
     // Interval between client_buffer_gc (in seconds)
     uint32_t client_buffer_gc_interval_seconds = 1;
@@ -1010,6 +1089,11 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param buckets       Output vector to receive corresponding destination
      * bucket IDs
      * @param limit         Maximum number of entries to return in this call
+     * @param pins          Optional output. When non-null, every returned
+     *                      bucket is pinned (see BucketScanPin) for the
+     *                      caller. The caller must keep the pins alive until
+     *                      the batch's metadata has been registered with the
+     *                      master; dropping them re-enables eviction.
      * @return tl::expected<int64_t, ErrorCode>
      * - On success: the bucket ID where the next iteration should start  (or 0
      * if all data has been scanned).
@@ -1018,7 +1102,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<int64_t, ErrorCode> BucketScan(
         int64_t bucket_id, std::vector<std::string>& keys,
         std::vector<StorageObjectMetadata>& metadatas,
-        std::vector<int64_t>& buckets, int64_t limit);
+        std::vector<int64_t>& buckets, int64_t limit,
+        std::vector<BucketScanPin>* pins = nullptr);
 
     /**
      * @brief Retrieves the global metadata of the store.
@@ -1044,6 +1129,26 @@ class BucketStorageBackend : public StorageBackendInterface {
      *         - BUCKET_NOT_FOUND if bucket doesn't exist
      */
     tl::expected<void, ErrorCode> DeleteBucket(int64_t bucket_id);
+
+    // Buckets after after_bucket_id (wrapping, at most one lap) with their
+    // mapped keys, up to max_keys keys.
+    std::vector<std::pair<int64_t, std::vector<std::string>>>
+    GetReclaimCandidates(int64_t after_bucket_id, size_t max_keys) const;
+
+    // The given keys that are mapped, each with its bucket, in one lookup.
+    std::vector<std::pair<int64_t, std::string>> GetMappedBuckets(
+        const std::unordered_map<std::string, int64_t>& keys) const;
+
+    // Deletes each given bucket whose keys are all listed for it or no
+    // longer mapped to it; returns the number deleted.
+    size_t RemoveDeadBuckets(
+        const std::unordered_map<int64_t, std::vector<std::string>>&
+            dead_keys_by_bucket);
+
+    // Unmaps the keys still mapped to the given bucket, so they can be
+    // offloaded again; their bytes stay until the bucket is deleted.
+    void UnmapKeys(const std::unordered_map<int64_t, std::vector<std::string>>&
+                       keys_by_bucket);
 
     tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
         double high_watermark_ratio, double low_watermark_ratio,
@@ -1437,10 +1542,16 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
      * @param batched_slices A map from object key to a pre-allocated writable
      * buffer (Slice).
      * @return tl::expected<void, ErrorCode> indicating operation status.
+     *
+     * With io_uring (O_DIRECT), a buffer that starts on a 4 KiB boundary
+     * must have room for the value rounded up to 4 KiB and one page more,
+     * as the buffers of FileStorage::AllocateBatch have: whole pages are
+     * read into it and Slice::ptr is moved to the first byte of the value.
      */
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
 
+    // Same buffer requirement as BatchLoad.
     tl::expected<void, ErrorCode> BatchLoadSpans(
         std::unordered_map<std::string, StorageValueSpan>& spans) override;
 
@@ -1609,7 +1720,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         // Validate key matches expected key
         tl::expected<void, ErrorCode> ValidateKey(
             const std::string& expected_key,
-            const std::string& stored_key) const {
+            std::string_view stored_key) const {
             if (stored_key.size() != key_len) {
                 LOG(ERROR) << "Key length mismatch: expected " << key_len
                            << ", got " << stored_key.size();
@@ -1628,6 +1739,31 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> ReadOffsetValues(
         std::unordered_map<std::string, StorageValueSpan>& spans,
         bool require_exact_size);
+
+    // One value to read: where its record is and where the bytes go.
+    struct ReadPlan;
+
+    // Reads one record with a single read when the value is wanted from its
+    // first byte, and with two otherwise, then checks its header and key.
+    // `head` is scratch space for the header and key.
+    static tl::expected<void, ErrorCode> ReadRecord(const ReadPlan& plan,
+                                                    std::string& head);
+
+    // Checks the header and key at `head`, the first bytes of the record
+    // read from disk, against what the index has for the record.
+    static tl::expected<void, ErrorCode> CheckRecordHead(const ReadPlan& plan,
+                                                         const char* head);
+
+#ifdef USE_URING
+    // Reads the records of `plans`, all in `file`, with page-aligned reads
+    // submitted together, and moves each plan's destination pointer to the
+    // first value byte.
+    static tl::expected<void, ErrorCode> ReadRecordsDirect(
+        UringFile& file, const std::vector<ReadPlan*>& plans);
+#endif
+
+    // Alignment O_DIRECT wants for buffer, length and file offset.
+    static constexpr uint64_t kDirectIoAlignment = 4096;
 
     // Maximum key length accepted by BatchOffload and trusted on recovery.
     // Write-side enforcement (BatchOffload) and recovery-side validation

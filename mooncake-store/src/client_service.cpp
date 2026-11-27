@@ -11,6 +11,7 @@
 #include <csignal>
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <charconv>
 #include <cerrno>
 #include <chrono>
@@ -469,6 +470,8 @@ Client::Client(const std::string& local_hostname,
       local_hostname_(local_hostname),
       host_id_(
           ClientHostIdentityConfig::FromEnvironment(local_hostname).host_id),
+      physical_placement_(
+          ClientHostIdentityConfig::PhysicalFromEnvironment(local_hostname)),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
       object_checksum_enabled_(
@@ -608,6 +611,14 @@ ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
     if (!host_id_.empty()) {
         client_cfg.host_id = host_id_;
     }
+    if (protocol_ == "mnnvl" && physical_placement_) {
+        // A request cannot advertise reachability outside this engine's domain.
+        client_cfg.fabric_domain = physical_placement_->fabric_domain;
+        if (!client_cfg.requester_placement &&
+            (!client_cfg.requester_self_id ||
+             client_cfg.requester_self_id->empty()))
+            client_cfg.requester_placement = *physical_placement_;
+    }
     return client_cfg;
 }
 
@@ -740,8 +751,10 @@ tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
         return std::optional<ha::HABackendSpec>{std::nullopt};
     }
 
-    auto backend_type =
-        ha::ParseHABackendType(master_server_entry.substr(0, delimiter_pos));
+    const bool redis_cluster =
+        master_server_entry.substr(0, delimiter_pos) == "redis+cluster";
+    auto backend_type = ha::ParseHABackendType(
+        redis_cluster ? "redis" : master_server_entry.substr(0, delimiter_pos));
     if (!backend_type.has_value()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -753,8 +766,11 @@ tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
 
     return std::optional<ha::HABackendSpec>{ha::HABackendSpec{
         .type = backend_type.value(),
-        .connstring = master_server_entry.substr(delimiter_pos + 3),
+        .connstring = redis_cluster
+                          ? master_server_entry
+                          : master_server_entry.substr(delimiter_pos + 3),
         .cluster_namespace = "",
+        .redis_read_only = backend_type.value() == ha::HABackendType::REDIS,
     }};
 }
 
@@ -999,10 +1015,15 @@ ErrorCode Client::InitTransferEngine(
     }
 
     if (protocol == "ascend" || protocol == "ubshmem") {
-        const char* ascend_use_fabric_mem =
-            std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
+        const char* ascend_use_fabric_mem = getEnvWithFallback(
+            "MC_ASCEND_ENABLE_USE_FABRIC_MEM", "ASCEND_ENABLE_USE_FABRIC_MEM");
         if (ascend_use_fabric_mem) {
-            globalConfig().ascend_use_fabric_mem = true;
+            std::string val(ascend_use_fabric_mem);
+            std::transform(val.begin(), val.end(), val.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (val != "0" && val != "false" && val != "off" && val != "no") {
+                globalConfig().ascend_use_fabric_mem = true;
+            }
         }
     }
     if (protocol == "sunrise_link") {
@@ -4069,6 +4090,16 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
+    // The master rejects MNNVL mounts without a valid physical identity.
+    // Fail here before registering memory so the operator sees which
+    // environment variables are missing.
+    if (protocol == "mnnvl" &&
+        (!physical_placement_ || !physical_placement_->Valid())) {
+        LOG(ERROR) << "MNNVL mount requires a valid operator physical identity "
+                      "(MOONCAKE_FABRIC_DOMAIN, MC_RACK, MC_TRAY, "
+                      "MC_PHYSICAL_GPU)";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
 
     UUID segment_id;
     {
@@ -4104,6 +4135,9 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         segment.size = size;
         segment.protocol = protocol;
         segment.host_id = host_id_;
+        if (protocol == "mnnvl") {
+            segment.physical_placement = *physical_placement_;
+        }
         if (protocol == "rdma" && StoreHcaAffinityEnabled()) {
             if (auto topology = transfer_engine_->getLocalTopology()) {
                 segment.locality = DiscoverSegmentLocality(*topology, location);

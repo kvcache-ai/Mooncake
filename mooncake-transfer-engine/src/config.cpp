@@ -129,6 +129,15 @@ static bool peerMemoryModuleLoaded() {
 }
 
 void loadGlobalConfig(GlobalConfig& config) {
+    if (const char* value = std::getenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT");
+        value != nullptr && value[0] != '\0') {
+        parseBoolConfigEnv(value, "MC_ASCEND_STANDALONE_SINGLE_SEGMENT",
+                           config.ascend_standalone_single_segment);
+    } else if (const char* legacy =
+                   std::getenv("ASCEND_STANDALONE_SINGLE_SEGMENT")) {
+        parseBoolConfigEnv(legacy, "ASCEND_STANDALONE_SINGLE_SEGMENT",
+                           config.ascend_standalone_single_segment);
+    }
     // Without a peer-memory module, ibv_reg_mr() fails with EFAULT at the
     // first GPU buffer, so the dma_buf export is the default there;
     // WITH_NVIDIA_PEERMEM below still decides when set.
@@ -631,6 +640,29 @@ void loadGlobalConfig(GlobalConfig& config) {
     parseNicPeerAffinity(std::getenv("MC_NIC_PEER_AFFINITY"),
                          config.nic_peer_affinity);
 
+    // Resolved before the clash below, so that next to
+    // MC_ENABLE_HCA_PEER_AFFINITY the option is ignored whatever
+    // MC_ENABLE_DEST_DEVICE_AFFINITY says, and that clash then applies as is.
+    if (const char* value = std::getenv("MC_RDMA_WRITE_PREFER_DEST_NIC")) {
+        parseBoolConfigEnv(value, "MC_RDMA_WRITE_PREFER_DEST_NIC",
+                           config.rdma_write_prefer_dest_nic);
+    }
+    if (config.rdma_write_prefer_dest_nic) {
+        if (config.enable_hca_peer_affinity) {
+            LOG(ERROR) << "MC_RDMA_WRITE_PREFER_DEST_NIC and "
+                          "MC_ENABLE_HCA_PEER_AFFINITY cannot be enabled at "
+                          "the same time; ignoring "
+                          "MC_RDMA_WRITE_PREFER_DEST_NIC.";
+            config.rdma_write_prefer_dest_nic = false;
+        } else {
+            // The sender's NIC then follows the destination, and the peer
+            // must answer on the NIC of the same name. A worker reuses its
+            // last peer pick across slices, so the pairing covers every
+            // operation rather than WRITEs alone.
+            config.enable_dest_device_affinity = true;
+        }
+    }
+
     if (config.enable_hca_peer_affinity && config.enable_dest_device_affinity) {
         LOG(ERROR) << "MC_ENABLE_HCA_PEER_AFFINITY and "
                       "MC_ENABLE_DEST_DEVICE_AFFINITY cannot be enabled at "
@@ -860,6 +892,18 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    if (const char* value = std::getenv("MC_IB_TIMEOUT")) {
+        const auto parsed = TryParseInteger<int>(
+            value, {.trim_ascii_whitespace = true, .allow_leading_plus = true});
+        if (parsed && *parsed >= 1 && *parsed <= 31) {
+            config.ib_timeout = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid MC_IB_TIMEOUT: " << value
+                         << "; expected an integer in [1, 31], keeping "
+                         << config.ib_timeout;
+        }
+    }
+
     const char* ib_relaxed_ordering_env =
         std::getenv("MC_IB_PCI_RELAXED_ORDERING");
     if (ib_relaxed_ordering_env) {
@@ -1001,6 +1045,7 @@ void dumpGlobalConfig() {
                                                                    : "all");
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;
+    LOG(INFO) << "ib_timeout = " << config.ib_timeout;
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "
               << config.te_metadata_refresh_interval_seconds;
     LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
@@ -1018,6 +1063,8 @@ void dumpGlobalConfig() {
     }
     LOG(INFO) << "mlx5_qp_lag_port_balance = "
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
+    LOG(INFO) << "rdma_write_prefer_dest_nic = "
+              << (config.rdma_write_prefer_dest_nic ? "true" : "false");
     LOG(INFO) << "log_rdma_slice_affinity = "
               << (config.log_rdma_slice_affinity ? "true" : "false");
     LOG(INFO) << "track_rdma_posted_slices = "

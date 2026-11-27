@@ -9,7 +9,7 @@ completion overhead. They do not establish that this branch has passed
 production acceptance, nor imply that previously deployed MNNVL systems were
 unusable.
 
-This page describes the workspace-root implementation, including the F5
+This page describes the workspace-root implementation, including the F5/F2/F1
 changes and the registration/routing repairs. The classic implementation,
 serving-framework connectors, public Transfer Engine requests, and Python
 bindings are unchanged by this work.
@@ -32,6 +32,10 @@ Implementation entry points:
 `MC_MNNVL_*` hardening controls below apply to native TENT, not classic
 `NvlinkTransport`. Installing a transport is also distinct from selecting it
 for a particular request.
+
+The classic path already caches caller-sync events and CUDA streams per thread
+and device. F2 adds a different resource: reusable **completion events** for
+native TENT submission groups, together with shared polling.
 
 ## End-to-End Architecture
 
@@ -144,9 +148,6 @@ copy APIs with `cudaMemcpySrcAccessOrderStream`, or older per-copy
 `cudaMemcpyAsync`. A completion event is recorded after a submission's copies.
 Appending tasks creates another completion group instead of replacing the
 previous event. Task indices retain their own completion-group association.
-A mutex serializes submit/poll bookkeeping within one sub-batch. Independent
-sub-batches retain independent events and may submit concurrently. Sub-batch
-teardown attempts to drain pending copy work before returning stream resources.
 
 Successful submission means work was accepted, not that KV data is ready.
 Completion must still be polled before the application publishes receiver
@@ -182,6 +183,59 @@ These checks prevent unintended data-path downgrade; they do not prove that an
 external allocator, serving framework, or a historical peer is correctly
 configured. Verify the actual allocation, engine, and per-transfer route.
 
+## F2: Completion Pooling and Shared Polling
+
+- Idle completion events are shared across sub-batches only within their
+  creation CUDA context. The total idle capacity remains per device across
+  all contexts. Each submission owns a noncopyable completion lease retaining
+  pool lifetime; event cleanup restores the caller's exact context. CUDA 12+
+  context IDs also prevent reuse across destroyed/recreated context handles.
+  With older CUDA headers, application contexts must outlive their pooled
+  events.
+- Only successfully completed, error-free recorded events are recycled.
+  Pending, failed, or unrecorded events are discarded. Sub-batch teardown
+  attempts to drain pending copy work before returning stream resources.
+- `completion_event_pool_capacity` limits retained **idle events per device**;
+  it is not admission control and does not cap all in-flight events.
+- Pooling also enables shared completion queries. An increasing task sweep
+  reuses its group's pending result; equal/earlier task indices query again so
+  polling one task or restarting a sweep cannot freeze progress. Terminal
+  completion/failure is shared by that group's tasks.
+- A mutex serializes submit/poll bookkeeping within one sub-batch. Independent
+  sub-batches retain independent events and may submit concurrently.
+
+The enable flag controls both event reuse and shared pending-completion
+polling. To isolate the benefit of event reuse, keep the pool enabled and
+compare capacities `0` and `256`: both share polling, but only the latter
+retains idle events. Disabling the pool retains a capacity-zero pool for event
+acquisition and release, including its mutex and teardown query; it does not
+remove all pool-management overhead.
+
+The intended benefit is fewer event create/destroy calls and repeated queries.
+No throughput or latency improvement has been measured for this branch yet.
+
+## F1: GPU-Side Caller Dependency
+
+The transport records its existing caller-sync event on
+`cudaStreamPerThread`, on the original caller's device:
+
+```text
+cpu_block: record caller event -> CPU event synchronize -> enqueue copy
+ gpu_wait: record caller event -> copy stream waits on event -> enqueue copy
+```
+
+`gpu_wait` removes the host wait for this dependency; it does not remove CUDA
+stream ordering or make one sub-batch's copies run in parallel. Re-recording
+the cached caller event does not change previously enqueued waits.
+
+Existing PD producer-event fencing remains mandatory. An event on the
+transport caller's per-thread stream does **not** automatically capture work
+on an arbitrary PyTorch/application stream. No producer-event propagation was
+added to requests, connectors, or Python APIs.
+
+`gpu_wait` requires `enable_runtime_queue=false`: deferred worker dispatch
+would observe the worker's stream rather than the original caller's stream.
+
 ## Reviewed P1/P2 Repairs
 
 | Severity | Defect | Repair and regression coverage |
@@ -201,12 +255,16 @@ Native TENT bootstrap defaults remain conservative:
 | JSON path | Environment override | Default |
 | --- | --- | --- |
 | `transports/mnnvl/require_fabric` | `MC_MNNVL_REQUIRE_FABRIC` | `false` |
+| `transports/mnnvl/completion_event_pool` | `MC_MNNVL_COMPLETION_EVENT_POOL` | `false` |
+| `transports/mnnvl/completion_event_pool_capacity` | None added | `256` idle events/device |
+| `transports/mnnvl/sync_mode` | `MC_MNNVL_SYNC_MODE` | `cpu_block` |
 | `transports/mnnvl/egm` | `MC_MNNVL_EGM` | `false` |
 
-The new boolean environment controls accept `true/false`, `1/0`, `yes/no`,
-and `on/off`; malformed new controls fail configuration. Use actual JSON
-booleans in configuration files. Recreate the engine to change these
-bootstrap settings.
+Capacity accepts integers in `[0, 1048576]`; zero retains no idle events.
+`sync_mode` accepts only `cpu_block` or `gpu_wait`. The new boolean environment
+controls accept `true/false`, `1/0`, `yes/no`, and `on/off`; malformed new
+controls fail configuration. Use actual JSON booleans in configuration files.
+Recreate the engine to change these bootstrap settings.
 
 MNNVL retains some legacy-named tuning keys under `transports/nvlink`, including
 `handle_type` (normally `fabric`) and `host_register` (default `true`).
@@ -219,10 +277,14 @@ JSON object or a file path:
 
 ```json
 {
+  "enable_runtime_queue": false,
   "transports": {
     "mnnvl": {
       "enable": true,
       "require_fabric": true,
+      "completion_event_pool": true,
+      "completion_event_pool_capacity": 256,
+      "sync_mode": "gpu_wait",
       "egm": false
     },
     "nvlink": { "handle_type": "fabric" }
@@ -237,12 +299,12 @@ not a substitute for the current loader's activation condition.
 ### Metrics
 
 With compile-time and runtime TENT metrics enabled, observe
-`tent_mnnvl_events_total{event="..."}` with events `fabric_fallback` and
-`strict_failure`. JSON output has corresponding `tent_mnnvl_<event>_total`
-aliases.
+`tent_mnnvl_events_total{event="..."}` with events `fabric_fallback`,
+`strict_failure`, `pool_hit`, `pool_miss`, and `completion_query`. JSON output
+has corresponding `tent_mnnvl_<event>_total` aliases.
 
-Compare host submission latency, CPU utilization, throughput, and PD p95/p99
-latency against defaults.
+Compare pool hit rate, completion-query count per request, host submission
+latency, CPU utilization, throughput, and PD p95/p99 latency against defaults.
 A zero fallback counter alone is not proof that KV payloads took MNNVL: inspect
 engine selection, exported metadata, route, and fabric/NIC traffic together.
 
@@ -273,12 +335,14 @@ export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
 export MC_USE_TENT=1
 export MC_ENABLE_MNNVL=1
 export MC_MNNVL_REQUIRE_FABRIC=1
+export MC_MNNVL_COMPLETION_EVENT_POOL=1
+export MC_MNNVL_SYNC_MODE=gpu_wait
 ```
 
-Do not use `MC_FORCE_MNNVL` as a substitute for native activation. These
-settings are a validation example, not a production-certified recipe: the
-external allocator limitation below must be checked against the actual
-SGLang/Mooncake versions first.
+Leave `enable_runtime_queue=false`, and do not use `MC_FORCE_MNNVL` as a
+substitute for native activation. These settings are a validation example,
+not a production-certified recipe: the external allocator limitation below
+must be checked against the actual SGLang/Mooncake versions first.
 
 Launch prefill and decode workers using their existing model, network, and TP
 settings, adding `--disaggregation-mode prefill` or
@@ -349,8 +413,8 @@ Hardware acceptance still requires:
 2. Strict negative cases: unavailable FABRIC/IMEX, unsupported/nonexportable
    allocation, absent export, conflicting policy/hint, and copy/poll errors;
    no unintended RDMA/TCP payload fallback.
-3. Delayed producers on the existing PD stream/event path, concurrent batches,
-   repeated appends, polling progress, and teardown.
+3. Delayed producers on the existing PD stream/event path in both sync modes,
+   concurrent batches, repeated appends, polling progress, and teardown.
 4. SGLang PD correctness and sustained p95/p99 latency/CPU/throughput comparison
    with defaults, then staged capacity testing under realistic concurrency.
 

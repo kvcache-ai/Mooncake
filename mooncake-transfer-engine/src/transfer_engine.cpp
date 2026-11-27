@@ -20,7 +20,11 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#ifdef USE_CUDA
+#include <cuda_runtime_api.h>
+#endif
 #include "error.h"
+#include "batch_submit.h"
 
 namespace mooncake {
 namespace {
@@ -97,14 +101,17 @@ void detachShutdownToken(std::shared_ptr<ShutdownToken>& token) {
 }  // namespace
 
 TransferEngine::TransferEngine(bool auto_discover)
-    : impl_(std::make_shared<TransferEngineImpl>(auto_discover)) {}
+    : impl_(std::make_shared<TransferEngineImpl>(auto_discover)),
+      batch_submit_executor_(std::make_shared<BatchSubmitExecutor>()) {}
 
 TransferEngine::TransferEngine(bool auto_discover,
                                const std::vector<std::string>& filter)
-    : impl_(std::make_shared<TransferEngineImpl>(auto_discover, filter)) {}
+    : impl_(std::make_shared<TransferEngineImpl>(auto_discover, filter)),
+      batch_submit_executor_(std::make_shared<BatchSubmitExecutor>()) {}
 
 TransferEngine::TransferEngine(TransferEngine&& other) noexcept
     : impl_(std::move(other.impl_)),
+      batch_submit_executor_(std::move(other.batch_submit_executor_)),
       impl_tent_(std::move(other.impl_tent_)),
       metadata_conn_string_(std::move(other.metadata_conn_string_)),
       use_tent_(other.use_tent_) {
@@ -120,6 +127,7 @@ TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
     if (this == &other) return *this;
     freeEngine();
     impl_ = std::move(other.impl_);
+    batch_submit_executor_ = std::move(other.batch_submit_executor_);
     impl_tent_ = std::move(other.impl_tent_);
     tent_device_filter_ = std::move(other.tent_device_filter_);
     metadata_conn_string_ = std::move(other.metadata_conn_string_);
@@ -155,6 +163,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
 }
 
 int TransferEngine::freeEngine() {
+    if (batch_submit_executor_) batch_submit_executor_->shutdown();
     metadata_conn_string_.clear();
     detachShutdownToken(shutdown_token_);
     if (impl_) {
@@ -193,6 +202,10 @@ int TransferEngine::closeSegment(SegmentHandle handle) {
 
 int TransferEngine::removeLocalSegment(const std::string& segment_name) {
     return impl_->removeLocalSegment(segment_name);
+}
+
+int TransferEngine::enableMemoryRegistrationReuse() {
+    return impl_->enableMemoryRegistrationReuse();
 }
 
 int TransferEngine::registerLocalMemory(void* addr, size_t length,
@@ -578,6 +591,7 @@ TransferEngine::TransferEngine(bool auto_discover) {
     }
     if (!use_tent_) {
         impl_ = std::make_shared<TransferEngineImpl>(auto_discover);
+        batch_submit_executor_ = std::make_shared<BatchSubmitExecutor>();
     }
 }
 
@@ -621,11 +635,13 @@ TransferEngine::TransferEngine(bool auto_discover,
         tent_device_filter_ = filter;
     } else {
         impl_ = std::make_shared<TransferEngineImpl>(auto_discover, filter);
+        batch_submit_executor_ = std::make_shared<BatchSubmitExecutor>();
     }
 }
 
 TransferEngine::TransferEngine(TransferEngine&& other) noexcept
     : impl_(std::move(other.impl_)),
+      batch_submit_executor_(std::move(other.batch_submit_executor_)),
       impl_tent_(std::move(other.impl_tent_)),
       tent_compat_transport_(std::move(other.tent_compat_transport_)),
       shutdown_token_(nullptr),
@@ -644,6 +660,7 @@ TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
     if (this == &other) return *this;
     freeEngine();
     impl_ = std::move(other.impl_);
+    batch_submit_executor_ = std::move(other.batch_submit_executor_);
     impl_tent_ = std::move(other.impl_tent_);
     tent_compat_transport_ = std::move(other.tent_compat_transport_);
     tent_device_filter_ = std::move(other.tent_device_filter_);
@@ -755,6 +772,10 @@ int TransferEngine::init(const std::string& metadata_conn_string,
         if (globalConfig().ascend_agent_mode) {
             config->set("transports/ascend_direct/agent_mode", true);
         }
+        if (globalConfig().ascend_standalone_single_segment) {
+            config->set("transports/ascend_direct/standalone_single_segment",
+                        true);
+        }
         if (globalConfig().ascend_store_te_init) {
             config->set("transports/ascend_direct/store_te_init", true);
             if (globalConfig().ascend_use_fabric_mem) {
@@ -774,6 +795,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
 }
 
 int TransferEngine::freeEngine() {
+    if (batch_submit_executor_) batch_submit_executor_->shutdown();
     metadata_conn_string_.clear();
     detachShutdownToken(shutdown_token_);
     {
@@ -878,6 +900,11 @@ int TransferEngine::removeLocalSegment(const std::string& segment_name) {
         return 0;
     else
         return impl_->removeLocalSegment(segment_name);
+}
+
+int TransferEngine::enableMemoryRegistrationReuse() {
+    if (use_tent_) return ERR_NOT_IMPLEMENTED;
+    return impl_->enableMemoryRegistrationReuse();
 }
 
 int TransferEngine::registerLocalMemory(void* addr, size_t length,
@@ -1376,6 +1403,167 @@ std::string TransferEngine::showLinks(bool json) const {
 #endif
 
 namespace mooncake {
+
+bool TransferEngine::isBatchSubmitEligible(size_t count) const {
+#ifdef USE_TENT
+    if (use_tent_)
+        return impl_tent_ && impl_tent_->isBatchSubmitEligible(count);
+#endif
+    return impl_ && batch_submit_executor_ &&
+           batch_submit_executor_->eligible(count);
+}
+
+struct TransferEngine::TESubBatchAdapter {
+    using Executor = BatchSubmitExecutor;
+    TransferEngine& engine;
+    const std::vector<TransferRequest>& requests;
+    BatchID sub_batch_id = INVALID_BATCH_ID;
+
+    Executor::Result allocate();
+    Executor::Result submit();
+    SubBatchProgress poll();
+    Executor::Result release();
+};
+
+BatchSubmitExecutor::Result TransferEngine::TESubBatchAdapter::allocate() {
+    sub_batch_id = engine.allocateBatchID(requests.size());
+    return sub_batch_id == INVALID_BATCH_ID || sub_batch_id == 0
+               ? Executor::Result::Error("Could not allocate sub-batch")
+               : Executor::Result::OK();
+}
+
+BatchSubmitExecutor::Result TransferEngine::TESubBatchAdapter::submit() {
+    auto status = engine.submitTransfer(sub_batch_id, requests);
+    return status.ok() ? Executor::Result::OK()
+                       : Executor::Result::SubmitError(status.ToString());
+}
+
+SubBatchProgress TransferEngine::TESubBatchAdapter::poll() {
+    TransferStatus status{};
+    auto polled = engine.getBatchTransferStatus(sub_batch_id, status);
+    if (!polled.ok()) return {true, false, polled.ToString()};
+    const bool terminal = status.s != TransferStatusEnum::WAITING &&
+                          status.s != TransferStatusEnum::PENDING;
+    return {terminal,
+            status.s == TransferStatusEnum::COMPLETED,
+            {},
+            status.s == TransferStatusEnum::FAILED ||
+                status.s == TransferStatusEnum::TIMEOUT};
+}
+
+BatchSubmitExecutor::Result TransferEngine::TESubBatchAdapter::release() {
+    auto status = engine.freeBatchID(sub_batch_id);
+    sub_batch_id = INVALID_BATCH_ID;
+    return status.ok() || status.IsBatchCleanupDeferred()
+               ? Executor::Result::OK()
+               : Executor::Result::Error(status.ToString());
+}
+
+bool TransferEngine::supportsParallelBatchSubmit(SegmentID peer) const {
+#ifdef USE_TENT
+    if (use_tent_) {
+        return impl_tent_ && impl_tent_->supportsParallelBatchSubmit(peer);
+    }
+#endif
+    return impl_ && impl_->supportsParallelBatchSubmit(peer);
+}
+
+std::optional<Status> TransferEngine::tryParallelBatchTransfer(
+    SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
+    std::chrono::nanoseconds timeout,
+    ParallelBatchTransferFailureInfo* failure_info) {
+    using Executor = BatchSubmitExecutor;
+    if (failure_info) *failure_info = {};
+    if (!isBatchSubmitEligible(count)) return std::nullopt;
+#ifdef USE_TENT
+    if (use_tent_) {
+        tent::TransferEngine::ParallelBatchTransferFailureInfo tent_failure;
+        auto status = impl_tent_->tryParallelBatchTransfer(
+            peer, count,
+            [&](size_t begin, size_t end) {
+                auto entries = builder(begin, end);
+                std::vector<tent::Request> converted;
+                converted.reserve(entries.size());
+                for (const auto& entry : entries) {
+                    if ((entry.opcode != TransferRequest::READ &&
+                         entry.opcode != TransferRequest::WRITE) ||
+                        entry.intent_type < 0 ||
+                        entry.intent_type >
+                            static_cast<int>(
+                                tent::IntentType::STAGING_INTERNAL) ||
+                        entry.transport_hint < 0 ||
+                        entry.transport_hint >= tent::kSupportedTransportTypes)
+                        throw std::invalid_argument(
+                            "Unsupported parallel batch request");
+                    tent::Request request;
+                    request.opcode =
+                        static_cast<tent::Request::OpCode>(entry.opcode);
+                    request.source = entry.source;
+                    request.target_id = entry.target_id;
+                    request.target_offset = entry.target_offset;
+                    request.length = entry.length;
+                    request.priority = entry.priority;
+                    request.intent_type =
+                        static_cast<tent::IntentType>(entry.intent_type);
+                    request.transport_hint =
+                        static_cast<tent::TransportType>(entry.transport_hint);
+                    request.producer_event = entry.producer_event;
+                    converted.push_back(std::move(request));
+                }
+                return converted;
+            },
+            timeout, failure_info ? &tent_failure : nullptr);
+        if (failure_info)
+            *failure_info = {tent_failure.submit_failed,
+                             tent_failure.retryable};
+        if (!status) return std::nullopt;
+        return status->ok() ? Status::OK()
+                            : Status::Context(status->ToString());
+    }
+#endif
+    auto& executor = *batch_submit_executor_;
+    const auto deadline = Executor::Clock::now() + timeout;
+    if (!supportsParallelBatchSubmit(peer)) {
+        VLOG(1) << "Parallel batch admission declined: peer=" << peer
+                << " descriptors=" << count;
+        return std::nullopt;
+    }
+    VLOG(1) << "Parallel batch admitted: peer=" << peer
+            << " descriptors=" << count;
+    int device = -1;
+#ifdef USE_CUDA
+    // Host-only transfers also work without an initialized CUDA runtime.
+    // A missing GPU, an uninitialized driver, and the CI driver stub all
+    // fail this query with different codes. There is no caller device to
+    // propagate, so the workers skip cudaSetDevice.
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        device = -1;
+        (void)cudaGetLastError();
+    }
+#endif
+    // Workers mutate distinct vectors; retain every vector until parent join.
+    std::vector<std::vector<TransferRequest>> request_storage(
+        std::min(executor.config().threads, count));
+    auto result = executor.execute(
+        count, deadline,
+        [&](Executor::Range range, const Executor::Cancellation& cancellation) {
+#ifdef USE_CUDA
+            if (device >= 0 && cudaSetDevice(device) != cudaSuccess)
+                return Executor::Result::Error(
+                    "Could not bind batch submit CUDA device");
+#endif
+            auto& requests = request_storage[range.index];
+            requests = builder(range.begin, range.end);
+            if (requests.size() != range.end - range.begin)
+                return Executor::Result::Error(
+                    "Invalid sub-batch request count");
+            TESubBatchAdapter sub_batch{*this, requests};
+            return runSubBatch(sub_batch, cancellation);
+        });
+    if (failure_info) *failure_info = {result.submit_failed, result.retryable};
+    return result.ok() ? Status::OK() : Status::Context(result.error);
+}
+
 namespace {
 
 #ifdef USE_TENT

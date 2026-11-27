@@ -58,6 +58,12 @@ __global__ void enqueueTaskKernel(int opType, size_t dataSize,
     }
 }
 
+__global__ void readDoneKernel(uint32_t* halfReads) {
+    // The word is in host memory, where the host worker and the peers read it.
+    *halfReads = *halfReads + 1;
+    __threadfence_system();
+}
+
 template <typename scalar_t>
 __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                              size_t numElements, size_t numRanks, int op,
@@ -164,6 +170,10 @@ void launchEnqueueTaskKernel(int opType, size_t dataSize, int64_t broadcastRoot,
         activeRanksMirror, activeRanksCount, tasks, taskId);
 }
 
+void launchReadDoneKernel(uint32_t* halfReads, cudaStream_t stream) {
+    readDoneKernel<<<1, 1, 0, stream>>>(halfReads);
+}
+
 #define DEF_LAUNCH_REDUCE(scalar_t, suffix)                                   \
     void launchReduceKernel_##suffix(                                         \
         scalar_t* dst, const scalar_t* src, size_t numElements,               \
@@ -227,6 +237,9 @@ void preloadReduceKernels() {
             reinterpret_cast<const void*>(reduceKernel<bool>));
     preload("reduceKernel<BFloat16>",
             reinterpret_cast<const void*>(reduceKernel<__nv_bfloat16>));
+    // Its first launch follows a spinning enqueue kernel. A lazy load there
+    // can wait for that kernel, and so for every peer to issue the collective.
+    preload("readDoneKernel", reinterpret_cast<const void*>(readDoneKernel));
 #endif
 }
 

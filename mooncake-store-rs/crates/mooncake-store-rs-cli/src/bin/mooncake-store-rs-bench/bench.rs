@@ -124,6 +124,29 @@ fn operation_objects<'a>(keys: &'a [String], tenant: &'a str) -> Vec<ObjectRef<'
         .collect()
 }
 
+fn operation_keys_for_read(
+    interface: ReadInterface,
+    target: OperationTarget<'_>,
+    expected_hit: bool,
+) -> Vec<String> {
+    let keys = operation_keys(target);
+    if expected_hit
+        || !matches!(
+            interface,
+            ReadInterface::IsExist | ReadInterface::BatchIsExist
+        )
+    {
+        return keys;
+    }
+    keys.into_iter()
+        .map(|key| format!("absent:{key}"))
+        .collect()
+}
+
+fn is_hit_operation(iteration: usize, hit_ratio: u8) -> bool {
+    (iteration % 100) < hit_ratio as usize
+}
+
 fn write_operation_width(interface: WriteInterface, batch_size: usize) -> usize {
     match interface {
         WriteInterface::Put => 1,
@@ -133,8 +156,10 @@ fn write_operation_width(interface: WriteInterface, batch_size: usize) -> usize 
 
 fn read_operation_width(interface: ReadInterface, batch_size: usize) -> usize {
     match interface {
-        ReadInterface::Get => 1,
-        ReadInterface::BatchGet | ReadInterface::BatchGetInto => batch_size,
+        ReadInterface::Get | ReadInterface::IsExist => 1,
+        ReadInterface::BatchGet | ReadInterface::BatchGetInto | ReadInterface::BatchIsExist => {
+            batch_size
+        }
     }
 }
 
@@ -292,8 +317,9 @@ fn execute_read(
     interface: ReadInterface,
     target: OperationTarget<'_>,
     batch_get_into_buffers: Option<&mut ReadBuffers>,
+    expected_hit: bool,
 ) -> StoreResult<u64> {
-    let keys = operation_keys(target);
+    let keys = operation_keys_for_read(interface, target, expected_hit);
     match interface {
         ReadInterface::Get => reader
             .get_in_tenant(target.tenant, &keys[0])
@@ -310,6 +336,34 @@ fn execute_read(
             let mut requests = buffers.requests(&keys, target.tenant);
             let sizes = reader.batch_get_into(&mut requests)?;
             Ok(sizes.iter().map(|size| *size as u64).sum())
+        }
+        ReadInterface::IsExist => {
+            let exists = reader.is_exist_in_tenant(target.tenant, &keys[0])?;
+            if exists != expected_hit {
+                return Err(StoreError::InvalidState(format!(
+                    "unexpected existence result for {}: expected_hit={expected_hit} actual={exists}",
+                    keys[0]
+                )));
+            }
+            Ok(0)
+        }
+        ReadInterface::BatchIsExist => {
+            let results = reader.batch_is_exist(&operation_objects(&keys, target.tenant))?;
+            if results.len() != keys.len() {
+                return Err(StoreError::InvalidState(format!(
+                    "batch existence result length mismatch: expected={} actual={}",
+                    keys.len(),
+                    results.len()
+                )));
+            }
+            for (key, exists) in keys.iter().zip(results) {
+                if exists != expected_hit {
+                    return Err(StoreError::InvalidState(format!(
+                        "unexpected existence result for {key}: expected_hit={expected_hit} actual={exists}"
+                    )));
+                }
+            }
+            Ok(0)
         }
     }
 }
@@ -347,6 +401,7 @@ fn execute_read_with_retry(
     interface: ReadInterface,
     target: OperationTarget<'_>,
     batch_get_into_buffers: Option<&mut ReadBuffers>,
+    expected_hit: bool,
 ) -> StoreResult<u64> {
     let retry_started = Instant::now();
     let mut attempts = 0usize;
@@ -354,7 +409,7 @@ fn execute_read_with_retry(
     loop {
         attempts += 1;
         let buffers = batch_get_into_buffers.as_deref_mut();
-        match execute_read(reader, interface, target, buffers) {
+        match execute_read(reader, interface, target, buffers, expected_hit) {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
                 let message = error.to_string();
@@ -382,6 +437,8 @@ struct LiveCounters {
     get_ops: AtomicU64,
     put_bytes: AtomicU64,
     get_bytes: AtomicU64,
+    exist_hits: AtomicU64,
+    exist_misses: AtomicU64,
     errors: AtomicU64,
     logged_errors: AtomicU64,
 }
@@ -393,6 +450,8 @@ impl LiveCounters {
             get_ops: AtomicU64::new(0),
             put_bytes: AtomicU64::new(0),
             get_bytes: AtomicU64::new(0),
+            exist_hits: AtomicU64::new(0),
+            exist_misses: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             logged_errors: AtomicU64::new(0),
         }
@@ -495,6 +554,7 @@ pub fn run_bench(
     let batch_size = args.batch_size;
     let concurrency = args.concurrency;
     let read_ratio = args.read_ratio;
+    let hit_ratio = args.hit_ratio;
     let key_space_size = args.key_space_size;
     let global_seed = global.seed;
     let tenant = global.tenant.clone();
@@ -753,6 +813,7 @@ pub fn run_bench(
                     }
                 }
 
+                info!("measurement started worker_id={worker_id}");
                 put_rec.reset_start();
                 get_rec.reset_start();
                 let deadline = duration.map(|value| Instant::now() + value);
@@ -783,6 +844,7 @@ pub fn run_bench(
                             shard
                         };
                         let read_width = read_operation_width(read_interface, batch_size);
+                        let expected_hit = is_hit_operation(iter, hit_ratio);
                         let t0 = Instant::now();
                         match execute_read_with_retry(
                             reader,
@@ -795,11 +857,22 @@ pub fn run_bench(
                                 tenant: &tenant,
                             },
                             batch_get_into_buffers.as_mut(),
+                            expected_hit,
                         ) {
                             Ok(len) => {
                                 get_rec.record(t0.elapsed(), len);
                                 ctrs.get_ops.fetch_add(1, Ordering::Relaxed);
                                 ctrs.get_bytes.fetch_add(len, Ordering::Relaxed);
+                                if matches!(
+                                    read_interface,
+                                    ReadInterface::IsExist | ReadInterface::BatchIsExist
+                                ) {
+                                    if expected_hit {
+                                        ctrs.exist_hits.fetch_add(read_width as u64, Ordering::Relaxed);
+                                    } else {
+                                        ctrs.exist_misses.fetch_add(read_width as u64, Ordering::Relaxed);
+                                    }
+                                }
                             }
                             Err(e) => {
                                 get_rec.record_error();
@@ -867,6 +940,7 @@ pub fn run_bench(
 
                 put_rec.finish();
                 get_rec.finish();
+                info!("measurement finished worker_id={worker_id}");
                 Ok((put_rec, get_rec))
             });
             handles.push(handle);
@@ -906,6 +980,16 @@ pub fn run_bench(
         get_stats: if has_gets { Some(get_agg) } else { None },
     };
     report.print(&args.output_format);
+    if matches!(
+        read_interface,
+        ReadInterface::IsExist | ReadInterface::BatchIsExist
+    ) {
+        info!(
+            "existence probes: hits={} misses={}",
+            counters.exist_hits.load(Ordering::Relaxed),
+            counters.exist_misses.load(Ordering::Relaxed)
+        );
+    }
 
     cluster.heartbeat_all().ok();
 
@@ -1049,6 +1133,53 @@ mod tests {
         assert_eq!(write_operation_width(WriteInterface::BatchPutFrom, 8), 8);
         assert_eq!(read_operation_width(ReadInterface::BatchGet, 8), 8);
         assert_eq!(read_operation_width(ReadInterface::BatchGetInto, 8), 8);
+        assert_eq!(read_operation_width(ReadInterface::IsExist, 8), 1);
+        assert_eq!(read_operation_width(ReadInterface::BatchIsExist, 8), 8);
+    }
+
+    #[test]
+    fn existence_hit_schedule_is_deterministic() {
+        assert_eq!(
+            (0..100)
+                .filter(|iteration| is_hit_operation(*iteration, 95))
+                .count(),
+            95
+        );
+        assert_eq!(
+            (0..100)
+                .filter(|iteration| is_hit_operation(*iteration, 0))
+                .count(),
+            0
+        );
+        assert_eq!(
+            (0..100)
+                .filter(|iteration| is_hit_operation(*iteration, 100))
+                .count(),
+            100
+        );
+    }
+
+    #[test]
+    fn existence_miss_keys_cannot_alias_prefilled_keys() {
+        let target = OperationTarget {
+            worker_id: 0,
+            shard: WorkerKeyShard { start: 0, count: 4 },
+            key_offset: 0,
+            width: 2,
+            tenant: "bench",
+        };
+        let prefilled = operation_keys(target);
+        let misses = operation_keys_for_read(ReadInterface::BatchIsExist, target, false);
+        assert_ne!(prefilled, misses);
+        assert_eq!(misses.len(), prefilled.len());
+        for key in &misses {
+            assert!(key.starts_with("absent:"));
+            assert!(!prefilled.contains(key));
+        }
+        assert_eq!(
+            operation_keys_for_read(ReadInterface::IsExist, target, true),
+            prefilled
+        );
     }
 
     #[test]

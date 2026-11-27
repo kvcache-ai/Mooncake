@@ -49,8 +49,10 @@ fn verify_write_width(interface: WriteInterface, batch_size: usize) -> usize {
 
 fn verify_read_width(interface: ReadInterface, batch_size: usize) -> usize {
     match interface {
-        ReadInterface::Get => 1,
-        ReadInterface::BatchGet | ReadInterface::BatchGetInto => batch_size,
+        ReadInterface::Get | ReadInterface::IsExist => 1,
+        ReadInterface::BatchGet | ReadInterface::BatchGetInto | ReadInterface::BatchIsExist => {
+            batch_size
+        }
     }
 }
 
@@ -203,6 +205,9 @@ fn execute_verify_read(
             }
             Ok(values)
         }
+        ReadInterface::IsExist | ReadInterface::BatchIsExist => {
+            Err("existence interfaces are supported only by bench".to_string())
+        }
     }
 }
 
@@ -235,6 +240,12 @@ fn read_verify_all(
 }
 
 pub fn run_verify(global: GlobalArgs, args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if matches!(
+        args.read_interface,
+        ReadInterface::IsExist | ReadInterface::BatchIsExist
+    ) {
+        return Err("is-exist and batch-is-exist are supported only by bench".into());
+    }
     let mut cluster = BenchCluster::new(&global, 1, 1)?;
 
     // Convert to raw pointer addresses so closures can borrow `cluster` mutably

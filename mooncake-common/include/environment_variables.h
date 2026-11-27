@@ -20,6 +20,8 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES);
     MC_DEFINE_ENV_VAR(uint32_t, MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS);
+    MC_DEFINE_ENV_VAR(uint32_t, MOONCAKE_OFFLOAD_RECLAIM_INTERVAL_SECONDS);
+    MC_DEFINE_ENV_VAR(uint32_t, MOONCAKE_OFFLOAD_RECLAIM_CYCLE_SECONDS);
     MC_DEFINE_ENV_VAR(uint32_t,
                       MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS);
     MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS);
@@ -306,6 +308,11 @@ struct NvmeKvConnectorEnvironmentVariables {
 };
 
 struct RedisConnectionEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_CLUSTER_ENABLED);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_CONNECT_TIMEOUT_MS);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_COMMAND_TIMEOUT_MS);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_TOPOLOGY_REFRESH_MS);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_MAX_REDIRECTS);
     // Keep the DB index as a string so an explicitly empty value remains
     // distinguishable from a nonempty malformed value.
     MC_DEFINE_ENV_VAR(std::string, MC_REDIS_DB_INDEX);

@@ -23,7 +23,10 @@ use std::time::Duration;
 pub struct ClientConfig {
     /// RPC server address, `"host:port"`.
     pub conductor_addr: String,
+    /// Rounded up to whole milliseconds. `setup` returns `InvalidParams` for
+    /// zero or for more than `i64::MAX / 1_000_000` ms.
     pub connect_timeout: Duration,
+    /// Same rules as `connect_timeout`.
     pub request_timeout: Duration,
 }
 

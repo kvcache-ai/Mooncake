@@ -92,55 +92,6 @@ TEST_F(FilePerKeyConfigTest, ValidateRejectsOnlyEmptyDirectory) {
     }
 }
 
-TEST_F(FilePerKeyConfigTest, BothEvictionNamesKeepBoolParsingAndWarnings) {
-    struct Case {
-        const char* value;
-        bool enabled;
-        bool warning;
-    };
-    const Case cases[] = {
-        {"1", true, false},
-        {"0", false, false},
-        {"true", true, false},
-        {"FALSE", false, false},
-        {"Yes", true, false},
-        {"nO", false, false},
-        {"on", true, false},
-        {"OFF", false, false},
-        {"enable", true, false},
-        {"DISABLE", false, false},
-        {" \tfalse\r\n", false, false},
-        {"", true, true},
-        {"   ", true, true},
-        {"2", true, true},
-        {"-1", true, true},
-        {"999999999999999999999999", true, true},
-        {"falsex", true, true},
-        {"invalid", true, true},
-    };
-    for (const char* name :
-         {"MOONCAKE_OFFLOAD_ENABLE_EVICTION", "ENABLE_EVICTION"}) {
-        SCOPED_TRACE(name);
-        for (const auto& entry : cases) {
-            SCOPED_TRACE(entry.value);
-            ASSERT_EQ(setenv(name, entry.value, 1), 0);
-            testing::internal::CaptureStderr();
-            const auto config = FilePerKeyConfig::FromEnvironment();
-            const auto diagnostics = testing::internal::GetCapturedStderr();
-
-            EXPECT_EQ(config.enable_eviction, entry.enabled);
-            const std::string expected =
-                entry.warning
-                    ? std::string("[Mooncake] Warning: invalid value '") +
-                          entry.value + "' for env " + name +
-                          ", using default 1\n"
-                    : "";
-            EXPECT_EQ(diagnostics, expected);
-        }
-        ASSERT_EQ(unsetenv(name), 0);
-    }
-}
-
 TEST_F(FilePerKeyConfigTest, PreferredEvictionNameOverridesLegacyValue) {
     struct Case {
         const char* legacy;

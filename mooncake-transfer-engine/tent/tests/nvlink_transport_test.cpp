@@ -13,17 +13,22 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include "cuda_memory_test.h"
 
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <cuda.h>
@@ -432,5 +437,195 @@ TEST_F(NVLinkIpcRelocateTest, RelocateKeysPeerMappingsBySourceDevice) {
     ASSERT_TRUE(transport.uninstall().ok());
 }
 
+TEST(NVLinkVmmMemoryTest, SameAddressKernelAccessAndReuse) {
+    cuda_memory_test::roundTrip(NVLINK);
+}
+
+TEST(NVLinkVmmMemoryTest, ExplicitUninstallPreservesLiveGvaAllocation) {
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    auto conf = cuda_memory_test::config(NVLINK);
+    NVLinkTransport transport;
+    std::string name = "allocation_lifecycle";
+    ASSERT_TRUE(transport.install(name, metadata, nullptr, conf).ok());
+    MemoryOptions options;
+    options.type = NVLINK;
+    options.location = "cuda:0";
+    options.global_address = cuda_memory_test::kAddress;
+    void* memory = nullptr;
+    auto status = transport.allocateLocalMemory(&memory, 4096, options);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    EXPECT_FALSE(transport.uninstall().ok());
+    ASSERT_EQ(cudaMemset(memory, 0x35, 4096), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    ASSERT_TRUE(transport.freeLocalMemory(memory, 4096).ok());
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+TEST(NVLinkVmmMemoryTest, OrdinaryAllocationSurvivesExplicitUninstall) {
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    NVLinkTransport transport;
+    std::string name = "ordinary_lifecycle";
+    ASSERT_TRUE(
+        transport
+            .install(name, metadata, nullptr, cuda_memory_test::config(NVLINK))
+            .ok());
+    MemoryOptions options;
+    options.location = "cuda:0";
+    options.type = NVLINK;
+    void* memory = nullptr;
+    ASSERT_TRUE(transport.allocateLocalMemory(&memory, 4096, options).ok());
+    ASSERT_TRUE(transport.uninstall().ok());
+    ASSERT_EQ(cudaMemset(memory, 0x35, 4096), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    ASSERT_TRUE(transport.freeLocalMemory(memory, 4096).ok());
+}
+
+TEST(NVLinkVmmMemoryTest, OrdinaryAllocationRemainsIpcExportable) {
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    NVLinkTransport transport;
+    MemoryOptions options;
+    options.location = "cuda:0";
+    void* memory = nullptr;
+    ASSERT_TRUE(transport.allocateLocalMemory(&memory, 4096, options).ok());
+    cudaIpcMemHandle_t handle;
+    EXPECT_EQ(cudaIpcGetMemHandle(&handle, memory), cudaSuccess);
+    ASSERT_TRUE(transport.freeLocalMemory(memory, 4096).ok());
+}
+
+TEST(NVLinkVmmMemoryTest, ExternalNonExportableVmmIsSkipped) {
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaFree(nullptr), cudaSuccess);
+    CUmemAllocationProp properties{};
+    properties.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    properties.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    properties.location.id = 0;
+    std::unique_ptr<CudaSharedMemory> memory;
+    ASSERT_TRUE(CudaSharedMemory::create(properties, 4096, &memory).ok());
+    ASSERT_TRUE(memory->map({CudaSharedMemory::deviceAccess(0)}).ok());
+    BufferDesc desc;
+    desc.addr = memory->address();
+    desc.length = 4096;
+    desc.location = "cuda:0";
+    NVLinkTransport transport;
+    MemoryOptions options;
+    auto status = transport.addMemoryBuffer(desc, options);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_TRUE(desc.transports.empty());
+    EXPECT_TRUE(desc.shm_path.empty());
+    EXPECT_TRUE(desc.transport_attrs.empty());
+}
+
+TEST(NVLinkVmmMemoryTest, FailedFixedMappingCanBeRetriedOnSameObject) {
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaFree(nullptr), cudaSuccess);
+    CUmemAllocationProp properties{};
+    properties.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    properties.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    properties.location.id = 0;
+    properties.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    std::unique_ptr<CudaSharedMemory> owner, retry;
+    ASSERT_TRUE(CudaSharedMemory::create(properties, 4096, &owner).ok());
+    ASSERT_TRUE(CudaSharedMemory::create(properties, 4096, &retry).ok());
+    auto access =
+        std::vector<CUmemAccessDesc>{CudaSharedMemory::deviceAccess(0)};
+    ASSERT_TRUE(owner->map(access, cuda_memory_test::kAddress).ok());
+    EXPECT_FALSE(retry->map(access, cuda_memory_test::kAddress).ok());
+    EXPECT_FALSE(retry->mapped());
+    ASSERT_TRUE(owner->release().ok());
+    ASSERT_TRUE(retry->map(access, cuda_memory_test::kAddress).ok());
+    EXPECT_EQ(retry->address(), cuda_memory_test::kAddress);
+}
+
+TEST(NVLinkTransportTest, FreeSubBatchWaitsForPendingCudaWork) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is required for asynchronous drain test";
+    }
+
+    CUDAStreamPool pool;
+    CUDAStreamHandle stream;
+    ASSERT_TRUE(pool.acquire(stream, 0).ok());
+
+    NVLinkTransport transport;
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    auto* nv_batch = dynamic_cast<NVLinkSubBatch*>(batch);
+    ASSERT_NE(nv_batch, nullptr);
+    nv_batch->stream_device_id = 0;
+    nv_batch->async_stream = std::move(stream);
+
+    struct CallbackBarrier {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool entered = false;
+        bool release = false;
+    } barrier;
+
+    const auto callback = [](void* user_data) {
+        auto& state = *static_cast<CallbackBarrier*>(user_data);
+        {
+            std::lock_guard<std::mutex> guard(state.mutex);
+            state.entered = true;
+        }
+        state.cv.notify_all();
+        std::unique_lock<std::mutex> guard(state.mutex);
+        state.cv.wait(guard, [&] { return state.release; });
+    };
+
+    if (cudaLaunchHostFunc(nv_batch->async_stream.get(), callback, &barrier) !=
+        cudaSuccess) {
+        ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+        GTEST_SKIP() << "CUDA host callback cannot be enqueued";
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(barrier.mutex);
+        if (!barrier.cv.wait_for(lock, std::chrono::seconds(5),
+                                 [&] { return barrier.entered; })) {
+            barrier.release = true;
+            lock.unlock();
+            barrier.cv.notify_all();
+            ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+            GTEST_SKIP() << "CUDA host callback did not start";
+        }
+    }
+
+    std::atomic<bool> started{false};
+    std::atomic<bool> finished{false};
+    std::atomic<bool> succeeded{false};
+    std::thread cleanup([&] {
+        started.store(true, std::memory_order_release);
+        const auto status = transport.freeSubBatch(batch);
+        succeeded.store(status.ok(), std::memory_order_release);
+        finished.store(true, std::memory_order_release);
+    });
+    while (!started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const bool prematurely_freed = finished.load(std::memory_order_acquire);
+
+    {
+        std::lock_guard<std::mutex> lock(barrier.mutex);
+        barrier.release = true;
+    }
+    barrier.cv.notify_all();
+    cleanup.join();
+
+    EXPECT_FALSE(prematurely_freed)
+        << "A CUDA stream still using batch resources was released";
+    EXPECT_TRUE(succeeded.load(std::memory_order_acquire));
+    EXPECT_EQ(batch, nullptr);
+}
+
 }  // namespace tent
 }  // namespace mooncake
+
+int main(int argc, char** argv) {
+    int child = mooncake::tent::cuda_memory_test::childMain(argc, argv);
+    if (child >= 0) return child;
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}

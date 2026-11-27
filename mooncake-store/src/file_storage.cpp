@@ -204,19 +204,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 }
 
 FileStorage::~FileStorage() {
-    LOG(INFO) << "Shutdown FileStorage...";
-    heartbeat_running_ = false;
-    WakeHeartbeat();
-    if (heartbeat_thread_.joinable()) {
-        heartbeat_thread_.join();
-    }
-    storage_backend_->StopOffloadWorkers();
-    client_buffer_gc_running_ = false;
-    if (client_buffer_gc_thread_.joinable()) {
-        client_buffer_gc_thread_.join();
-    }
-    // A metadata rescan can still be reading through the storage backend.
-    if (rescan_future_.valid()) rescan_future_.wait();
+    if (!Shutdown())
+        LOG(ERROR) << "FileStorage shutdown retained a registered arena";
 #ifdef USE_URING
     // client_buffer_allocator_ frees the staging buffer after this body, so
     // unpin it here: the source registration and every I/O thread's clone of
@@ -228,6 +217,43 @@ FileStorage::~FileStorage() {
     for (const auto& root : disk_roots_) {
         if (root.fd >= 0) ::close(root.fd);
     }
+}
+
+tl::expected<void, ErrorCode> FileStorage::Shutdown() {
+    std::lock_guard lock(shutdown_mutex_);
+    LOG(INFO) << "Shutdown FileStorage...";
+    heartbeat_running_ = false;
+    WakeHeartbeat();
+    if (heartbeat_thread_.joinable()) {
+        heartbeat_thread_.join();
+    }
+    if (storage_backend_) {
+        storage_backend_->StopOffloadWorkers();
+    }
+    client_buffer_gc_running_ = false;
+    if (client_buffer_gc_thread_.joinable()) {
+        client_buffer_gc_thread_.join();
+    }
+    // A metadata rescan can still be reading through the storage backend.
+    if (rescan_future_.valid()) rescan_future_.wait();
+    if (staging_registered_) {
+        auto result = client_->unregisterLocalMemory(
+            client_buffer_allocator_->getBase(), true);
+        if (!result && result.error() != ErrorCode::NOT_REGISTERED) {
+            shutdown_error_ = result.error();
+            LOG(ERROR) << "Retaining FileStorage staging arena after "
+                          "unregister failure";
+            (void)new std::shared_ptr<ClientBufferAllocator>(
+                std::move(client_buffer_allocator_));
+        }
+        staging_registered_ = false;
+    }
+    // All owned workers have stopped. Release this strong owner while the
+    // staging allocator is still alive, so Client's destructor can drain TE.
+    client_.reset();
+    if (shutdown_error_ != ErrorCode::OK)
+        return tl::unexpected(shutdown_error_);
+    return {};
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {
@@ -311,6 +337,18 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             LOG(ERROR) << "Failed to scan meta and send to master: "
                        << scan_meta_result.error();
             return scan_meta_result;
+        }
+    }
+    // Replicas of an earlier incarnation make the master's answers
+    // untrustworthy, so reclaim stays off on a non-empty directory.
+    if (auto bucket_backend =
+            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+        bucket_backend && config_.reclaim_interval_seconds != 0) {
+        auto store_metadata = bucket_backend->GetStoreMetadata();
+        if (!store_metadata || store_metadata->total_keys != 0) {
+            reclaim_disabled_ = true;
+            LOG(WARNING) << "Reclaim of removed objects is disabled: the "
+                            "offload directory was not empty at start";
         }
     }
 
@@ -706,6 +744,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     std::vector<std::vector<std::string>> buckets_keys;
     std::vector<std::string> deferred_keys;
     if (bucket_backend) {
+        DropStaleCopiesOfOffloadTargets(*bucket_backend, storage_object_sizes);
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
             storage_object_sizes, buckets_keys, &deferred_keys);
         if (!allocate_res) {
@@ -1099,6 +1138,156 @@ tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
     return {};
 }
 
+bool FileStorage::MasterKnowsOurObjects() const {
+    return !rescan_future_.valid() && !metadata_resync_pending_.load() &&
+           rescanned_epoch_.load() == segment_lost_epoch_.load();
+}
+
+namespace {
+// Per-RPC caps keep requests and replies well under the 4 MiB message limit.
+constexpr size_t kReclaimQueryKeys = 10'000;
+constexpr size_t kReclaimQueryKeyBytes = 512 * 1024;
+// A pass stops querying after this long and resumes from its cursor, so the
+// heartbeat stays well inside the master's client TTL.
+constexpr auto kReclaimPassBudget = std::chrono::seconds(2);
+}  // namespace
+
+bool FileStorage::FindDeadKeys(
+    const std::vector<std::pair<int64_t, std::string>>& bucket_keys,
+    bool offload_targets,
+    std::unordered_map<int64_t, std::vector<std::string>>& dead_keys) {
+    std::unordered_map<TenantId, std::vector<size_t>, TenantIdHash>
+        indices_by_tenant;
+    for (size_t i = 0; i < bucket_keys.size(); ++i) {
+        indices_by_tenant[TenantId::ParseScopedKey(bucket_keys[i].second).first]
+            .push_back(i);
+    }
+    const auto is_ours = [this](const Replica::Descriptor& replica) {
+        const auto* disk =
+            std::get_if<LocalDiskDescriptor>(&replica.descriptor_variant);
+        return disk != nullptr && disk->transport_endpoint == local_rpc_addr_;
+    };
+    for (const auto& [tenant_id, indices] : indices_by_tenant) {
+        for (size_t begin = 0, end = 0; begin < indices.size(); begin = end) {
+            std::vector<std::string> keys;
+            for (size_t bytes = 0;
+                 end < indices.size() && keys.size() < kReclaimQueryKeys &&
+                 bytes < kReclaimQueryKeyBytes;
+                 ++end) {
+                keys.push_back(
+                    TenantId::ParseScopedKey(bucket_keys[indices[end]].second)
+                        .second);
+                bytes += keys.back().size();
+            }
+            auto results = client_->BatchQueryReadOnly(keys, tenant_id.value());
+            for (size_t i = 0; i < results.size(); ++i) {
+                // Stored key: dead once the object is gone (replica lists omit
+                // unreadable replicas). Offload target: dead without ours.
+                bool dead = false;
+                if (results[i]) {
+                    dead = offload_targets &&
+                           std::none_of(results[i]->replicas.begin(),
+                                        results[i]->replicas.end(), is_ours);
+                } else if (results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
+                    dead = !offload_targets;
+                } else if (results[i].error() !=
+                           ErrorCode::REPLICA_IS_NOT_READY) {
+                    return false;
+                }
+                if (dead) {
+                    const auto& [bucket_id, storage_key] =
+                        bucket_keys[indices[begin + i]];
+                    dead_keys[bucket_id].push_back(storage_key);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+void FileStorage::DropStaleCopiesOfOffloadTargets(
+    BucketStorageBackend& backend,
+    const std::unordered_map<std::string, int64_t>& storage_object_sizes) {
+    if (config_.reclaim_interval_seconds == 0 || !MasterKnowsOurObjects()) {
+        return;
+    }
+    // A target we still map is a stale copy of a removed object unless the
+    // master lists our replica; left mapped, the new value would be skipped.
+    const auto mapped = backend.GetMappedBuckets(storage_object_sizes);
+    std::unordered_map<int64_t, std::vector<std::string>> stale;
+    if (!mapped.empty() &&
+        FindDeadKeys(mapped, /*offload_targets=*/true, stale)) {
+        ColdReadInvalidation invalidate(*this);
+        backend.UnmapKeys(stale);
+    }
+}
+
+void FileStorage::ReclaimRemovedObjects() {
+    auto bucket_backend =
+        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    if (!bucket_backend) {
+        return;
+    }
+    if (config_.reclaim_interval_seconds == 0 || reclaim_disabled_ ||
+        !MasterKnowsOurObjects()) {
+        reclaim_dead_keys_.clear();
+        return;
+    }
+    auto verdicts = std::move(reclaim_dead_keys_);
+    reclaim_dead_keys_.clear();
+
+    const auto now = std::chrono::steady_clock::now();
+    auto store_metadata = bucket_backend->GetStoreMetadata();
+    if (now >= next_reclaim_at_ && store_metadata) {
+        next_reclaim_at_ =
+            now + std::chrono::seconds(config_.reclaim_interval_seconds);
+        // The share is fixed per lap from the key count at its start, so a
+        // lap takes about reclaim_cycle_seconds as buckets go.
+        if (reclaim_passes_left_ == 0) {
+            reclaim_passes_left_ =
+                std::max<uint32_t>(1, config_.reclaim_cycle_seconds /
+                                          config_.reclaim_interval_seconds);
+            reclaim_keys_per_pass_ = std::max<size_t>(
+                1, (store_metadata->total_keys + reclaim_passes_left_ - 1) /
+                       reclaim_passes_left_);
+        }
+        --reclaim_passes_left_;
+
+        auto candidates = bucket_backend->GetReclaimCandidates(
+            reclaim_cursor_, reclaim_keys_per_pass_);
+        std::vector<std::pair<int64_t, std::string>> bucket_keys;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            auto& [bucket_id, storage_keys] = candidates[i];
+            reclaim_dead_keys_[bucket_id];
+            for (auto& storage_key : storage_keys) {
+                bucket_keys.emplace_back(bucket_id, std::move(storage_key));
+            }
+            if (bucket_keys.size() < kReclaimQueryKeys &&
+                i + 1 < candidates.size()) {
+                continue;
+            }
+            // A master that does not answer for every key voids this pass
+            // and the previous one's verdicts; a later pass takes them again.
+            if (!FindDeadKeys(bucket_keys, /*offload_targets=*/false,
+                              reclaim_dead_keys_)) {
+                LOG(WARNING) << "Reclaim pass skipped: the master did not "
+                                "answer for every key";
+                reclaim_dead_keys_.clear();
+                return;
+            }
+            bucket_keys.clear();
+            reclaim_cursor_ = bucket_id;
+            if (std::chrono::steady_clock::now() >= now + kReclaimPassBudget) {
+                break;
+            }
+        }
+    }
+    if (!verdicts.empty()) {
+        ColdReadInvalidation invalidate(*this);
+        bucket_backend->RemoveDeadBuckets(verdicts);
+    }
+}
+
 tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
     auto is_enable_offloading_result = storage_backend_->IsEnableOffloading();
     if (!is_enable_offloading_result) {
@@ -1137,20 +1326,6 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         rescan_future_ = std::future<void>();
     }
 
-    // Retry metadata resync if previous attempt failed.
-    if (metadata_resync_pending_.load() && !rescan_future_.valid()) {
-        LOG(INFO) << "Retrying background metadata rescan";
-        rescan_future_ = std::async(std::launch::async, [this]() {
-            auto result = ReRegisterOffloadedObjects();
-            if (!result) {
-                LOG(ERROR) << "Background metadata rescan retry "
-                           << "failed: " << result.error();
-            } else {
-                metadata_resync_pending_.store(false);
-            }
-        });
-    }
-
     std::vector<OffloadTaskItem>
         offloading_objects;  // Objects selected for offloading
 
@@ -1186,6 +1361,10 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                              << "SEGMENT_NOT_FOUND, attempting to "
                              << "re-register local disk segment and "
                              << "re-register object metadata";
+                // A rescan is owed from here on, even if the remount reply
+                // or the retried heartbeat below is lost.
+                segment_lost_epoch_.fetch_add(1);
+                reclaim_dead_keys_.clear();
                 auto remount_result =
                     client_->MountLocalDiskSegment(enable_offloading_);
                 if (remount_result) {
@@ -1215,13 +1394,15 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                         LOG(INFO) << "Triggering background metadata rescan "
                                   << "after LOCAL_DISK segment re-registration";
                         metadata_resync_pending_.store(true);
-                        rescan_future_ =
-                            std::async(std::launch::async, [this]() {
+                        rescan_future_ = std::async(
+                            std::launch::async,
+                            [this, epoch = segment_lost_epoch_.load()]() {
                                 auto result = ReRegisterOffloadedObjects();
                                 if (!result) {
                                     LOG(ERROR) << "Background metadata rescan "
                                                << "failed: " << result.error();
                                 } else {
+                                    rescanned_epoch_.store(epoch);
                                     metadata_resync_pending_.store(false);
                                 }
                             });
@@ -1238,6 +1419,25 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
+    // Retry a failed rescan, or one owed to a later segment loss; only after
+    // a successful heartbeat, as an unmounted segment registers nothing.
+    if ((metadata_resync_pending_.load() ||
+         rescanned_epoch_.load() != segment_lost_epoch_.load()) &&
+        !rescan_future_.valid()) {
+        LOG(INFO) << "Retrying background metadata rescan";
+        rescan_future_ = std::async(
+            std::launch::async, [this, epoch = segment_lost_epoch_.load()]() {
+                auto result = ReRegisterOffloadedObjects();
+                if (!result) {
+                    LOG(ERROR) << "Background metadata rescan retry "
+                               << "failed: " << result.error();
+                } else {
+                    rescanned_epoch_.store(epoch);
+                    metadata_resync_pending_.store(false);
+                }
+            });
+    }
+
     // Generic removal reclaims files through metadata-checked eviction, not a
     // backend-wide wipe that could remove managed objects or another tenant.
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
@@ -1246,12 +1446,16 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         if (!offload_result) {
             LOG(ERROR) << "Failed to persist objects with error: "
                        << offload_result.error();
+            // A full disk is a reason to reclaim, not to skip it.
+            ReclaimRemovedObjects();
             return offload_result;
         }
     }
 
     VLOG(1) << "Completed heartbeat with offloaded objects count: "
             << offloading_objects.size();
+
+    ReclaimRemovedObjects();
 
     // Drive any pending L2->L1 promotion work for this client. Failures
     // inside ProcessPromotionTasks are logged per-key and do not propagate;
@@ -1867,6 +2071,7 @@ tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
         LOG(ERROR) << "Failed to register local memory: " << error_code.error();
         return error_code;
     }
+    staging_registered_ = true;
     return {};
 }
 
