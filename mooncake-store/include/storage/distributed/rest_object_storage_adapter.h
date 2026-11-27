@@ -56,6 +56,10 @@ class RestObjectStorageAdapter : public ObjectStorageAdapter {
     tl::expected<bool, ErrorCode> Exists(
         const std::string& logical_key) override;
     tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() override;
+    tl::expected<ObjectListPage, ErrorCode> ListPage(const std::string&,
+                                                     const std::string&,
+                                                     size_t) override;
+    bool SupportsGcListing() const override { return true; }
     tl::expected<void, ErrorCode> CheckHealth() override;
 
     // Operations that are intentionally not part of the common

@@ -24,8 +24,8 @@ enum class ObjectUploadPhase : uint8_t {
 };
 
 // No logical head or commit flag: visibility is owned by Master metadata.
-// A retired, uncertain upload remains tracked even after a successful DELETE,
-// because its single authorized PUT can still materialize later.
+// Uncertain retired uploads are retained for a bounded period in GC-enabled
+// namespaces. Orphan scans reclaim PUTs that materialize after forget.
 struct ObjectUploadRecord {
     ObjectReplicaTarget target;
     std::string tenant_id;
@@ -50,8 +50,12 @@ struct ObjectReplicaMutation {
     std::vector<std::string> forget;
     std::string metadata_payload;
     bool remove_value{false};
+    // Timed-out retirements handed off to namespace orphan GC, not an upload
+    // completion assertion. Both lists are validated by the fenced log replay.
+    struct_pack::compatible<std::vector<std::string>, 1> expired_forget;
+    struct_pack::compatible<std::vector<std::string>, 1> orphan_deletes;
     YLT_REFL(ObjectReplicaMutation, target, records, forget, metadata_payload,
-             remove_value);
+             remove_value, expired_forget, orphan_deletes);
 };
 
 struct ObjectReplicaSnapshot {

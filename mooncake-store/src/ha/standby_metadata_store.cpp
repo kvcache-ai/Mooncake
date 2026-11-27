@@ -1,4 +1,5 @@
 #include "ha/standby_metadata_store.h"
+#include "metadata_wire_compat.h"
 
 #include <algorithm>
 #include <limits>
@@ -47,8 +48,18 @@ bool ValidateObjectUploadRecord(const ObjectUploadRecord& record) {
 bool StandbyMetadataStore::ApplyObjectReplicaMutation(
     const std::string& tenant_id, const std::string& key,
     const ObjectReplicaMutation& mutation) {
+    const auto expired =
+        mutation.expired_forget.value_or(std::vector<std::string>{});
+    const auto orphans =
+        mutation.orphan_deletes.value_or(std::vector<std::string>{});
+    auto forget = mutation.forget;
+    forget.insert(forget.end(), expired.begin(), expired.end());
+    if (!orphans.empty() &&
+        (!mutation.records.empty() || !forget.empty() ||
+         mutation.remove_value || !mutation.metadata_payload.empty()))
+        return false;
     if (key.empty() || !ValidTarget(mutation.target) ||
-        (mutation.records.empty() && mutation.forget.empty()) ||
+        (mutation.records.empty() && forget.empty() && orphans.empty()) ||
         (mutation.remove_value && !mutation.metadata_payload.empty())) {
         return false;
     }
@@ -56,7 +67,7 @@ bool StandbyMetadataStore::ApplyObjectReplicaMutation(
     MetadataPayload payload;
     ReplicaID max_replica_id = 0;
     if (!mutation.metadata_payload.empty() &&
-        (struct_pack::deserialize_to(payload, mutation.metadata_payload) !=
+        (DeserializeMetadataPayload(payload, mutation.metadata_payload) !=
              struct_pack::errc::ok ||
          !ValidateMetadataReplicaIds(payload.replicas, max_replica_id))) {
         return false;
@@ -72,7 +83,7 @@ bool StandbyMetadataStore::ApplyObjectReplicaMutation(
             return false;
         }
     }
-    for (const auto& name : mutation.forget) {
+    for (const auto& name : forget) {
         if (name.empty() || !changed.insert(name).second) return false;
     }
     std::lock_guard lock(mutex_);
@@ -132,14 +143,23 @@ bool StandbyMetadataStore::ApplyObjectReplicaMutation(
             replica.status != ReplicaStatus::COMPLETE)
             return false;
     }
-    for (const auto& name : mutation.forget) {
+    for (const auto& name : forget) {
         const auto old = object_uploads_.find(name);
         if (old == object_uploads_.end() || old->second.tenant_id != tenant ||
             old->second.key != key ||
             old->second.phase != ObjectUploadPhase::RETIRED ||
-            !old->second.upload_finished) {
+            (!old->second.upload_finished &&
+             std::find(expired.begin(), expired.end(), name) ==
+                 expired.end())) {
             return false;
         }
+    }
+    for (const auto& name : expired)
+        if (!name.starts_with("mc-gc-v1-")) return false;
+    for (const auto& name : orphans) {
+        if (!name.starts_with("mc-gc-v1-") || !changed.insert(name).second ||
+            object_uploads_.contains(name))
+            return false;
     }
     object_storage_target_ = mutation.target;
     for (const auto& record : mutation.records) {
@@ -160,7 +180,7 @@ bool StandbyMetadataStore::ApplyObjectReplicaMutation(
                 record.object.object_key);
         object_upload_names_[record.replica_id] = record.object.object_key;
     }
-    for (const auto& name : mutation.forget) {
+    for (const auto& name : forget) {
         const auto& record = object_uploads_.at(name);
         auto key_it = object_upload_keys_.find({record.tenant_id, record.key});
         key_it->second.erase(name);

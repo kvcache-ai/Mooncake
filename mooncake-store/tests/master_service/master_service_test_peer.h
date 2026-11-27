@@ -52,6 +52,26 @@ class MasterServiceTestPeer {
     StandbyMetadataStore& EnableObjectRecordsForTesting(
         const ObjectStorageConfig& config);
 
+    void StartObjectGcForTesting(
+        std::shared_ptr<ObjectStorageAdapter> adapter) {
+        service_.object_storage_adapter_ = std::move(adapter);
+        service_.object_storage_worker_.Start();
+        service_.object_storage_worker_.Schedule();
+    }
+    void StopObjectGcForTesting() { service_.object_storage_worker_.Stop(); }
+    void SweepObjectOrphansForTesting(
+        std::shared_ptr<ObjectStorageAdapter> adapter) {
+        service_.object_storage_adapter_ = std::move(adapter);
+        service_.object_gc_scan_at_ = {};
+        service_.SweepObjectStorageOrphans();
+    }
+    std::pair<size_t, size_t> ObjectAdmissionForTesting() {
+        std::lock_guard lock(service_.object_storage_mutex_);
+        return {service_.object_pending_deadlines_.size() -
+                    service_.object_gc_records_.size(),
+                service_.object_gc_records_.size()};
+    }
+
     void SetBatchOpLogWriterFactoryForTesting(
         MasterService::BatchOpLogWriterFactory factory);
 

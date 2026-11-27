@@ -1432,7 +1432,8 @@ class MasterService {
     // and the object with them.
     tl::expected<void, ErrorCode> MarkRemovedAndPersist(
         const TenantId& tenant_id, const std::string& key,
-        ObjectMetadata& metadata, uint64_t& object_sequence);
+        ObjectMetadata& metadata,
+        std::vector<std::shared_future<ErrorCode>>& completions);
     // Returns why a remove may not take the object, or nothing if it may: its
     // lease is still held (unless `force`), a replica is incomplete, or a
     // replication task reads it.
@@ -1440,7 +1441,7 @@ class MasterService {
         const ObjectMetadata& metadata, const route::ObjectState& state,
         bool force, std::chrono::system_clock::time_point now);
     struct RemoveResult {
-        uint64_t object_sequence{0};
+        std::vector<std::shared_future<ErrorCode>> completions;
         long removed_count{0};
         int64_t freed_bytes{0};
         // Whether the walk reached any object, and whether it left any
@@ -2344,23 +2345,33 @@ class MasterService {
     BatchOpLogWriterFactory batch_oplog_writer_factory_;
 
     auto RemoveObjectImpl(const std::string&, const TenantId&, bool, bool,
-                          uint64_t&) -> tl::expected<void, ErrorCode>;
+                          std::vector<std::shared_future<ErrorCode>>&)
+        -> tl::expected<void, ErrorCode>;
     ObjectStorageConfig object_storage_config_;
     std::shared_ptr<ObjectStorageAdapter> object_storage_adapter_;
     std::unique_ptr<StandbyMetadataStore> object_uploads_;
     std::mutex object_storage_mutex_;
     std::chrono::steady_clock::time_point object_restore_time_;
     std::unordered_map<std::string, uint64_t> object_upload_sequences_;
-    // Pending work only: committed, referenced objects consume no admission
-    // slots. Both indexes are rebuilt from recovered records and metadata.
+    // Pending writes and retired GC have independent admission budgets.
+    // All indexes are rebuilt from recovered records and metadata.
     struct ObjectPendingWork {
         BackgroundWorker::Clock::time_point run_at;
         uint64_t generation;
         BackgroundWorker::Clock::time_point lease_deadline{};
+        uint64_t retry_delay_ms{0};
+        uint64_t retired_not_before_ms{0};
+        bool retired{false};
     };
     std::unordered_map<std::string, ObjectPendingWork>
         object_pending_deadlines_;
     uint64_t object_work_generation_{0};
+    std::set<std::pair<uint64_t, std::string>> object_gc_records_;
+    BackgroundWorker::Clock::time_point object_gc_scan_at_{};
+    std::string object_gc_scan_token_;
+    void SweepObjectStorageOrphans();
+    bool CanForgetUncertainObject(const ObjectUploadRecord&) const;
+    void UpdateObjectGcMetricsLocked();
     std::set<std::pair<BackgroundWorker::Clock::time_point, std::string>>
         object_work_;
     void SetObjectWorkLocked(
@@ -2385,6 +2396,14 @@ class MasterService {
         std::future<ErrorCode>* deferred = nullptr);
     tl::expected<std::future<ErrorCode>, ErrorCode> BeginObjectWriteRevocation(
         MetadataAccessorRW&, std::chrono::system_clock::time_point release_at);
+    // Object-aware removals finish only after their local metadata callback.
+    tl::expected<OpLogEntry, ErrorCode> AppendReplicaRemovalWithCompletion(
+        OrderedOpLogWriter::Reservation&&, OpType, const std::string& tenant,
+        const std::string& key, const std::string& payload,
+        std::vector<ReplicaID> removed_ids,
+        std::vector<std::shared_future<ErrorCode>>& completions);
+    static tl::expected<void, ErrorCode> WaitReplicaRemovals(
+        const std::vector<std::shared_future<ErrorCode>>& completions);
     tl::expected<void, ErrorCode> WaitObjectDurable(uint64_t sequence,
                                                     uint64_t timeout_ms = 0);
     tl::expected<OrderedOpLogWriter::PendingHandle, ErrorCode>

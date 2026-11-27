@@ -130,6 +130,13 @@ MasterService::CommitObjectAware(OrderedOpLogWriter::Reservation&& reservation,
         for (const auto& record : mutation.records)
             include(record.object.object_key);
         for (const auto& name : mutation.forget) include(name);
+        if (mutation.expired_forget)
+            for (const auto& name : *mutation.expired_forget) include(name);
+        if (mutation.orphan_deletes)
+            for (const auto& name : *mutation.orphan_deletes)
+                if (!name.starts_with(ObjectStorageGcPrefix(cluster_id_)) ||
+                    object_uploads_->FindObjectUpload(name))
+                    return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     } else {
         if (previous.empty())
             return ordered_oplog_writer_->Commit(
@@ -184,15 +191,21 @@ MasterService::CommitObjectAware(OrderedOpLogWriter::Reservation&& reservation,
         }
         entry.payload = EncodeObjectMutation(mutation);
     }
+    auto forget = mutation.forget;
+    if (mutation.expired_forget)
+        forget.insert(forget.end(), mutation.expired_forget->begin(),
+                      mutation.expired_forget->end());
     size_t new_records = 0;
     for (const auto& record : mutation.records)
         if (!object_uploads_->FindObjectUpload(record.object.object_key))
             ++new_records;
+    const auto pending_writes =
+        object_pending_deadlines_.size() - object_gc_records_.size();
     if (new_records &&
-        (object_pending_deadlines_.size() >=
-             object_storage_config_.max_pending_records ||
-         new_records > object_storage_config_.max_pending_records -
-                           object_pending_deadlines_.size()))
+        (object_gc_records_.size() >= object_storage_config_.max_gc_records ||
+         pending_writes >= object_storage_config_.max_pending_records ||
+         new_records >
+             object_storage_config_.max_pending_records - pending_writes))
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     // Remember transition boundaries before applying the candidate. Repeated
     // notifications must not postpone an existing cleanup/recheck deadline.
@@ -274,13 +287,13 @@ MasterService::CommitObjectAware(OrderedOpLogWriter::Reservation&& reservation,
             SetObjectWorkLocked(name, lease_deadline, lease_deadline);
         }
     }
-    for (const auto& name : mutation.forget) {
+    for (const auto& name : forget) {
         object_upload_sequences_.erase(name);
         SetObjectWorkLocked(name, std::nullopt);
     }
     ScheduleObjectWorkLocked();
-    if (!mutation.forget.empty() && !object_uploads_->FirstObjectUploadForKey(
-                                        entry.tenant_id, entry.object_key))
+    if (!forget.empty() && !object_uploads_->FirstObjectUploadForKey(
+                               entry.tenant_id, entry.object_key))
         object_uploads_->Remove(entry.tenant_id, entry.object_key);
     return pending;
 }
@@ -295,8 +308,9 @@ tl::expected<void, ErrorCode> MasterService::AuthorizeObjectStorage(
         });
     if (replica == replicas.end()) {
         replicas.emplace_back(
-            ObjectStorageDescriptor{UuidToString(generate_uuid()), size,
-                                    ObjectStorageWriteMode::SYNC,
+            ObjectStorageDescriptor{ObjectStorageGcPrefix(cluster_id_) +
+                                        UuidToString(generate_uuid()),
+                                    size, ObjectStorageWriteMode::SYNC,
                                     object_storage_config_.NamespaceId()},
             ReplicaStatus::PROCESSING);
         replica = std::prev(replicas.end());
@@ -391,6 +405,8 @@ tl::expected<void, ErrorCode> MasterService::FinishObjectStorageUpload(
         MetadataAccessorRW accessor(this, {tenant, record->key});
         record = object_uploads_->FindObjectUpload(name);
         if (!record) return {};
+        const auto old_phase = record->phase;
+        const auto old_finished = record->upload_finished;
         if (outcome == ObjectUploadOutcome::COMPLETE) {
             if (record->phase != ObjectUploadPhase::RETIRED)
                 record->phase = ObjectUploadPhase::UPLOADED;
@@ -402,14 +418,24 @@ tl::expected<void, ErrorCode> MasterService::FinishObjectStorageUpload(
             record->upload_finished =
                 outcome == ObjectUploadOutcome::NOT_WRITTEN;
         }
-        ObjectReplicaMutation mutation;
-        mutation.target = record->target;
-        mutation.records.push_back(*record);
-        auto appended = AppendOpLogWithDurableFinalize(
-            OpType::OBJECT_STORAGE_MUTATION, tenant.value(), record->key,
-            EncodeObjectMutation(mutation), {});
-        if (!appended) return tl::make_unexpected(appended.error());
-        sequence = appended->sequence_id;
+        if (record->phase == old_phase &&
+            record->upload_finished == old_finished) {
+            // Records are applied at enqueue time, before durability. A racing
+            // duplicate still owes the caller the original durability barrier.
+            std::lock_guard lock(object_storage_mutex_);
+            auto it = object_upload_sequences_.find(name);
+            // Live records restored from a durable snapshot may have no entry.
+            sequence = it == object_upload_sequences_.end() ? 0 : it->second;
+        } else {
+            ObjectReplicaMutation mutation;
+            mutation.target = record->target;
+            mutation.records.push_back(*record);
+            auto appended = AppendOpLogWithDurableFinalize(
+                OpType::OBJECT_STORAGE_MUTATION, tenant.value(), record->key,
+                EncodeObjectMutation(mutation), {});
+            if (!appended) return tl::make_unexpected(appended.error());
+            sequence = appended->sequence_id;
+        }
     }
     return WaitObjectDurable(sequence);
 }
@@ -616,21 +642,130 @@ void MasterService::SetObjectWorkLocked(
     std::optional<BackgroundWorker::Clock::time_point> run_at,
     BackgroundWorker::Clock::time_point lease_deadline) {
     auto existing = object_pending_deadlines_.find(name);
+    uint64_t retry_delay = object_storage_config_.cleanup_interval_ms;
     if (existing != object_pending_deadlines_.end()) {
+        retry_delay = existing->second.retry_delay_ms;
+        if (existing->second.retired)
+            object_gc_records_.erase(
+                {existing->second.retired_not_before_ms, name});
         object_work_.erase({existing->second.run_at, name});
         object_pending_deadlines_.erase(existing);
     }
     if (run_at) {
+        const auto record = object_uploads_->FindObjectUpload(name);
+        const bool retired =
+            record && record->phase == ObjectUploadPhase::RETIRED;
+        const uint64_t not_before = retired ? record->not_before_ms : 0;
+        if (retired) object_gc_records_.emplace(not_before, name);
         object_pending_deadlines_.emplace(
             name, ObjectPendingWork{*run_at, ++object_work_generation_,
-                                    lease_deadline});
+                                    lease_deadline, retry_delay, not_before,
+                                    retired});
         object_work_.emplace(*run_at, name);
     }
+    UpdateObjectGcMetricsLocked();
+}
+
+void MasterService::UpdateObjectGcMetricsLocked() {
+    const auto now = ObjectNowMs();
+    const auto oldest =
+        object_gc_records_.empty() ? now : object_gc_records_.begin()->first;
+    MasterMetricManager::instance().set_object_gc_stats(
+        object_pending_deadlines_.size() - object_gc_records_.size(),
+        object_gc_records_.size(), now > oldest ? now - oldest : 0);
 }
 
 void MasterService::ScheduleObjectWorkLocked() {
-    if (object_work_.empty()) return;
-    object_storage_worker_.ScheduleAt(object_work_.begin()->first);
+    auto next = object_gc_scan_at_;
+    if (!object_work_.empty())
+        next = std::min(next, object_work_.begin()->first);
+    object_storage_worker_.ScheduleAt(next);
+}
+
+bool MasterService::CanForgetUncertainObject(
+    const ObjectUploadRecord& record) const {
+    const auto now = ObjectNowMs();
+    return object_storage_adapter_ &&
+           object_storage_adapter_->SupportsGcListing() &&
+           record.object.object_key.starts_with(
+               ObjectStorageGcPrefix(cluster_id_)) &&
+           now >= record.not_before_ms &&
+           now - record.not_before_ms >=
+               object_storage_config_.unknown_upload_retention_ms;
+}
+
+void MasterService::SweepObjectStorageOrphans() {
+    std::string token;
+    {
+        std::lock_guard lock(object_storage_mutex_);
+        if (BackgroundWorker::Clock::now() < object_gc_scan_at_) return;
+        token = object_gc_scan_token_;
+        object_gc_scan_at_ = BackgroundWorker::Clock::now() +
+                             std::chrono::milliseconds(
+                                 object_storage_config_.cleanup_max_backoff_ms);
+    }
+    if (!object_storage_adapter_ ||
+        !object_storage_adapter_->SupportsGcListing() ||
+        GetRestoreLifecycleState() != RestoreLifecycleState::kServing)
+        return;
+    const auto prefix = ObjectStorageGcPrefix(cluster_id_);
+    auto page = object_storage_adapter_->ListPage(
+        prefix, token,
+        std::min<uint64_t>(1000,
+                           object_storage_config_.maintenance_batch_size));
+    if (!page) {
+        MasterMetricManager::instance().inc_object_gc_failures();
+        LOG(WARNING) << "Object orphan listing failed: "
+                     << toString(page.error());
+        return;
+    }
+    ObjectReplicaMutation mutation;
+    mutation.target = object_storage_config_.target;
+    mutation.orphan_deletes = std::vector<std::string>{};
+    const auto now = ObjectNowMs();
+    for (const auto& object : page->objects) {
+        if (object.logical_key.starts_with(prefix) && object.last_modified_ms &&
+            now >= object.last_modified_ms &&
+            now - object.last_modified_ms >=
+                object_storage_config_.gc_min_object_age_ms &&
+            !object_uploads_->FindObjectUpload(object.logical_key))
+            mutation.orphan_deletes->push_back(object.logical_key);
+    }
+    if (!mutation.orphan_deletes->empty()) {
+        uint64_t sequence;
+        {
+            std::shared_lock lock(master_state_mutex_);
+            if (GetRestoreLifecycleState() != RestoreLifecycleState::kServing)
+                return;
+            // CommitObjectAware rechecks the live registry under its ordering
+            // mutex. Every valid object replica has a record, including hidden
+            // Upsert values. The fenced log prevents a stale leader from using
+            // an incomplete registry; immutable names are never reauthorized.
+            auto appended = AppendOpLogWithDurableFinalize(
+                OpType::OBJECT_STORAGE_MUTATION,
+                std::string(TenantId::kDefaultValue), "__object_orphan_gc__",
+                EncodeObjectMutation(mutation), {});
+            if (!appended) return;
+            sequence = appended->sequence_id;
+        }
+        if (!WaitObjectDurable(sequence)) return;
+        for (const auto& name : *mutation.orphan_deletes) {
+            if (!AdmitsBusinessWorkers()) return;
+            auto removed = object_storage_adapter_->Delete(name);
+            if (!removed && removed.error() != ErrorCode::FILE_NOT_FOUND &&
+                removed.error() != ErrorCode::OBJECT_NOT_FOUND) {
+                MasterMetricManager::instance().inc_object_gc_failures();
+                return;
+            }
+        }
+    }
+    std::lock_guard lock(object_storage_mutex_);
+    object_gc_scan_token_ = std::move(page->next_token);
+    object_gc_scan_at_ = BackgroundWorker::Clock::now() +
+                         std::chrono::milliseconds(
+                             object_gc_scan_token_.empty()
+                                 ? object_storage_config_.gc_scan_interval_ms
+                                 : 0);
 }
 
 void MasterService::MaintainObjectStorage() {
@@ -719,22 +854,28 @@ void MasterService::MaintainObjectStorage() {
             auto deleted = object_storage_adapter_->Delete(name);
             if (!deleted && deleted.error() != ErrorCode::FILE_NOT_FOUND &&
                 deleted.error() != ErrorCode::OBJECT_NOT_FOUND) {
+                MasterMetricManager::instance().inc_object_gc_failures();
                 LOG(WARNING)
                     << "Object cleanup failed: " << toString(deleted.error());
                 return;
             }
-            if (!record->upload_finished) return;
+            if (!record->upload_finished && !CanForgetUncertainObject(*record))
+                return;
             std::shared_lock lock(master_state_mutex_);
             if (!AdmitsBusinessWorkers()) return;
             MetadataAccessorRW accessor(this, {tenant, record->key});
             auto current = object_uploads_->FindObjectUpload(name);
             if (!current || current->phase != ObjectUploadPhase::RETIRED ||
-                !current->upload_finished ||
+                (!current->upload_finished &&
+                 !CanForgetUncertainObject(*current)) ||
                 current->not_before_ms > ObjectNowMs())
                 return;
             ObjectReplicaMutation mutation;
             mutation.target = current->target;
-            mutation.forget.push_back(name);
+            if (current->upload_finished)
+                mutation.forget.push_back(name);
+            else
+                mutation.expired_forget = std::vector<std::string>{name};
             auto appended = AppendOpLogWithDurableFinalize(
                 OpType::OBJECT_STORAGE_MUTATION, current->tenant_id,
                 current->key, EncodeObjectMutation(mutation),
@@ -754,18 +895,26 @@ void MasterService::MaintainObjectStorage() {
             // A duplicate notification can advance the log sequence without
             // changing the work. It must not bypass a failed DELETE's backoff.
             if (current != object_pending_deadlines_.end() &&
-                current->second.generation == generation)
+                current->second.generation == generation) {
+                const auto delay =
+                    current->second.retired
+                        ? current->second.retry_delay_ms
+                        : object_storage_config_.cleanup_interval_ms;
+                const auto lease_deadline = current->second.lease_deadline;
                 SetObjectWorkLocked(
                     name,
-                    std::max(
-                        current->second.run_at,
-                        BackgroundWorker::Clock::now() +
-                            std::chrono::milliseconds(
-                                object_storage_config_.cleanup_interval_ms)),
-                    current->second.lease_deadline);
+                    std::max(current->second.run_at,
+                             BackgroundWorker::Clock::now() +
+                                 std::chrono::milliseconds(delay)),
+                    lease_deadline);
+                object_pending_deadlines_.at(name).retry_delay_ms = std::min(
+                    object_storage_config_.cleanup_max_backoff_ms, delay * 2);
+            }
         }
     }
+    SweepObjectStorageOrphans();
     std::lock_guard lock(object_storage_mutex_);
+    UpdateObjectGcMetricsLocked();
     ScheduleObjectWorkLocked();
 }
 
@@ -825,6 +974,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreObjectStorageLocked(
         object_upload_sequences_.clear();
         object_pending_deadlines_.clear();
         object_work_.clear();
+        object_gc_records_.clear();
+        object_gc_scan_token_.clear();
+        object_gc_scan_at_ = BackgroundWorker::Clock::now();
+        UpdateObjectGcMetricsLocked();
     }
     const auto now = ObjectNowMs();
     uint64_t pending_sequence = 0;
@@ -900,12 +1053,55 @@ tl::expected<void, ErrorCode> MasterService::RestoreObjectStorageLocked(
                                  restore_repair_durable_timeout_ms_);
     return {};
 }
+tl::expected<OpLogEntry, ErrorCode>
+MasterService::AppendReplicaRemovalWithCompletion(
+    OrderedOpLogWriter::Reservation&& reservation, OpType type,
+    const std::string& tenant, const std::string& key,
+    const std::string& payload, std::vector<ReplicaID> removed_ids,
+    std::vector<std::shared_future<ErrorCode>>& completions) {
+    auto completion = std::make_shared<ObjectCompletion>();
+    auto future = completion->promise.get_future().share();
+    uint64_t object_sequence = 0;
+    auto appended = AppendReservedOpLogWithDurableFinalize(
+        std::move(reservation), type, tenant, key, payload,
+        [this, completion,
+         removed_ids = std::move(removed_ids)](const OpLogEntry& entry) {
+            FinalizeRemovedReplicasAfterDurable(entry, removed_ids);
+            completion->Finish(ErrorCode::OK);
+        },
+        &object_sequence);
+    if (!appended) return appended;
+    // Preserve ordinary HA removals' asynchronous behavior. Object-aware
+    // removals already promised a durable result; also wait for local erase.
+    if (object_sequence) {
+        [[maybe_unused]] auto failure =
+            ordered_oplog_writer_->AwaitDurable(object_sequence)
+                .thenValue([completion](ErrorCode error) {
+                    if (error != ErrorCode::OK) completion->Finish(error);
+                });
+        completions.push_back(std::move(future));
+    }
+    return appended;
+}
+
+tl::expected<void, ErrorCode> MasterService::WaitReplicaRemovals(
+    const std::vector<std::shared_future<ErrorCode>>& completions) {
+    auto error = ErrorCode::OK;
+    for (const auto& completion : completions) {
+        const auto result = completion.get();
+        if (error == ErrorCode::OK) error = result;
+    }
+    if (error != ErrorCode::OK) return tl::make_unexpected(error);
+    return {};
+}
+
 auto MasterService::RemoveObject(const std::string& key, const TenantId& tenant,
                                  bool force, bool allow_managed)
     -> tl::expected<void, ErrorCode> {
-    uint64_t sequence = 0;
-    auto result = RemoveObjectImpl(key, tenant, force, allow_managed, sequence);
-    if (result && sequence) return WaitObjectDurable(sequence);
-    return result;
+    std::vector<std::shared_future<ErrorCode>> completions;
+    auto result =
+        RemoveObjectImpl(key, tenant, force, allow_managed, completions);
+    if (!result) return result;
+    return WaitReplicaRemovals(completions);
 }
 }  // namespace mooncake

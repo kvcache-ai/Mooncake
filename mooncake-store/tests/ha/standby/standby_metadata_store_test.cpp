@@ -315,6 +315,37 @@ TEST(ObjectReplicaStateTest, RejectsInvalidMetadataWithoutPartialApply) {
               ObjectUploadPhase::RETIRED);
 }
 
+TEST(ObjectReplicaStateTest,
+     ExpiredForgetAndOrphanAuthorizationRejectLiveRecords) {
+    StandbyMetadataStore store;
+    auto record = Upload();
+    record.object.object_key = ObjectStorageGcPrefix("cluster") + "attempt";
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation(
+        "default", "key", {Target(), {record}, {}, {}, false}));
+    ObjectReplicaMutation expired;
+    expired.target = Target();
+    expired.expired_forget = std::vector<std::string>{record.object.object_key};
+    EXPECT_FALSE(store.ApplyObjectReplicaMutation("default", "key", expired));
+    ObjectReplicaMutation orphan;
+    orphan.target = Target();
+    orphan.orphan_deletes = std::vector<std::string>{record.object.object_key};
+    EXPECT_FALSE(store.ApplyObjectReplicaMutation("default", "key", orphan));
+    record.phase = ObjectUploadPhase::RETIRED;
+    record.not_before_ms = 100;
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation(
+        "default", "key", {Target(), {record}, {}, {}, true}));
+    EXPECT_FALSE(store.ApplyObjectReplicaMutation("default", "key", orphan));
+    auto bytes = struct_pack::serialize(expired);
+    ObjectReplicaMutation restored;
+    ASSERT_EQ(struct_pack::deserialize_to(restored, bytes),
+              struct_pack::errc::ok);
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation("default", "key", restored));
+    EXPECT_FALSE(store.FindObjectUpload(record.object.object_key));
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation("default", "key", orphan));
+    orphan.orphan_deletes = std::vector<std::string>{"legacy-unknown"};
+    EXPECT_FALSE(store.ApplyObjectReplicaMutation("default", "key", orphan));
+}
+
 TEST(ObjectReplicaStateTest, UncertainRetirementCannotBeForgotten) {
     StandbyMetadataStore store;
     auto record = Upload();

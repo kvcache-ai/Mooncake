@@ -1375,6 +1375,32 @@ TEST(S3ObjectStorageAdapterEngineTest, ClearsHeadersAtResponseBoundaries) {
 // Differs from OSS: keys are still URL-decoded (encoding-type=url), but S3
 // returns NextContinuationToken unencoded, so the token is sent back byte
 // for byte (URI-encoded once in the query) instead of being decoded first.
+TEST(S3ObjectStorageAdapterEngineTest, GcListsOneBoundedPageWithAgeAndScope) {
+    ScriptedHttpServer server(
+        {{200,
+          "<ListBucketResult><IsTruncated>true</IsTruncated>"
+          "<Contents><Key>test-prefix%2Fmc-gc-v1-61-object</Key><Size>3</Size>"
+          "<LastModified>1970-01-02T00:00:00.123Z</LastModified></Contents>"
+          "<NextContinuationToken>next</NextContinuationToken></"
+          "ListBucketResult>"}});
+    ScopedEnvironment environment;
+    ConfigureScriptedEndpoint(environment, server.port());
+    S3ObjectStorageAdapter adapter("/test-prefix/");
+    ASSERT_TRUE(adapter.Init());
+    auto page = adapter.ListPage("mc-gc-v1-61-", "", 1);
+    ASSERT_TRUE(page);
+    ASSERT_EQ(page->objects.size(), 1u);
+    EXPECT_EQ(page->objects.front().logical_key, "mc-gc-v1-61-object");
+    EXPECT_EQ(page->objects.front().last_modified_ms, 86400123u);
+    EXPECT_EQ(page->next_token, "next");
+    server.Wait();
+    ASSERT_TRUE(server.error().empty()) << server.error();
+    ASSERT_EQ(server.requests().size(), 1u);
+    EXPECT_NE(server.requests()[0].find("max-keys=1"), std::string::npos);
+    EXPECT_NE(server.requests()[0].find("prefix=test-prefix%2Fmc-gc-v1-61-"),
+              std::string::npos);
+}
+
 TEST(S3ObjectStorageAdapterEngineTest, DecodesPaginatedLogicalKeys) {
     ScriptedHttpServer server({
         {200,

@@ -6,6 +6,13 @@
 #include "storage/distributed/object_replica_io.h"
 
 namespace mooncake {
+namespace {
+bool ShouldRetryObjectCompletion(const tl::expected<void, ErrorCode>& result) {
+    return !result && result.error() != ErrorCode::ILLEGAL_CLIENT &&
+           result.error() != ErrorCode::INVALID_PARAMS;
+}
+}  // namespace
+
 tl::expected<std::shared_ptr<ObjectStorageBackend>, ErrorCode>
 Client::GetObjectStorageBackend(const std::string& namespace_id) {
     std::lock_guard lock(object_storage_init_mutex_);
@@ -69,11 +76,8 @@ ErrorCode Client::WriteObjectStorageReplica(const Replica::Descriptor& replica,
     if (error == ErrorCode::OK) {
         if (metrics_)
             metrics_->transfer_metric.total_write_bytes.inc(object.object_size);
-        // Completion is normally persisted with PutEnd, avoiding another RPC
-        // and log barrier. Retain only a notification in case PutEnd fails.
-        std::lock_guard lock(object_storage_completions_mutex_);
-        object_storage_completions_.insert_or_assign(
-            object.object_key, ObjectUploadOutcome::COMPLETE);
+        // PutEnd persists completion. Only a failed/abandoned finalization
+        // queues a separate completion notification.
     } else {
         ReportObjectStorageUpload(object.object_key,
                                   may_exist ? ObjectUploadOutcome::UNKNOWN
@@ -110,7 +114,8 @@ ErrorCode Client::ReadObjectStorageReplica(const Replica::Descriptor& replica,
 }
 void Client::ReportObjectStorageUpload(const std::string& name,
                                        ObjectUploadOutcome outcome) {
-    if (!master_client_.FinishObjectStorageUpload(name, outcome)) {
+    const auto result = master_client_.FinishObjectStorageUpload(name, outcome);
+    if (ShouldRetryObjectCompletion(result)) {
         {
             std::lock_guard lock(object_storage_completions_mutex_);
             object_storage_completions_.insert_or_assign(name, outcome);
@@ -118,14 +123,21 @@ void Client::ReportObjectStorageUpload(const std::string& name,
         EnsureStorageControlPlaneStarted();
     }
 }
-void Client::AcknowledgeObjectStorageWrite(
+void Client::QueueObjectStorageCompletions(
     const std::vector<Replica::Descriptor>& replicas) {
-    for (const auto& replica : replicas) {
-        if (!replica.is_object_storage_replica()) continue;
+    bool queued = false;
+    {
         std::lock_guard lock(object_storage_completions_mutex_);
-        object_storage_completions_.erase(
-            replica.get_object_storage_descriptor().object_key);
+        for (const auto& replica : replicas) {
+            if (!replica.is_object_storage_replica()) continue;
+            const auto& object = replica.get_object_storage_descriptor();
+            if (object.write_mode != ObjectStorageWriteMode::SYNC) continue;
+            object_storage_completions_.insert_or_assign(
+                object.object_key, ObjectUploadOutcome::COMPLETE);
+            queued = true;
+        }
     }
+    if (queued) EnsureStorageControlPlaneStarted();
 }
 void Client::PollObjectStorage() {
     std::vector<std::pair<std::string, ObjectUploadOutcome>> pending;
@@ -143,9 +155,15 @@ void Client::PollObjectStorage() {
     for (const auto& [name, outcome] : pending) {
         if (!task_poll_running_.load()) break;
         last_polled_object_ = name;
-        if (master_client_.FinishObjectStorageUpload(name, outcome)) {
+        const auto result =
+            master_client_.FinishObjectStorageUpload(name, outcome);
+        if (!ShouldRetryObjectCompletion(result)) {
             std::lock_guard lock(object_storage_completions_mutex_);
-            object_storage_completions_.erase(name);
+            const auto it = object_storage_completions_.find(name);
+            // Do not erase a newer outcome queued while this RPC was running.
+            if (it != object_storage_completions_.end() &&
+                it->second == outcome)
+                object_storage_completions_.erase(it);
         }
     }
 }

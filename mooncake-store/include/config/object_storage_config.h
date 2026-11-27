@@ -29,11 +29,20 @@ struct ObjectStorageConfig {
     uint64_t max_pending_records{10000};
     uint64_t maintenance_batch_size{32};
     uint64_t cleanup_interval_ms{10000};
+    uint64_t max_gc_records{100000};
+    uint64_t unknown_upload_retention_ms{24ULL * 60 * 60 * 1000};
+    uint64_t gc_scan_interval_ms{24ULL * 60 * 60 * 1000};
+    uint64_t gc_min_object_age_ms{24ULL * 60 * 60 * 1000};
+    uint64_t cleanup_max_backoff_ms{60ULL * 60 * 1000};
     bool Validate() const;
     std::string NamespaceId() const;
     YLT_REFL(ObjectStorageConfig, enabled, target, max_object_bytes,
              max_staging_bytes, max_pending_records, maintenance_batch_size,
-             cleanup_interval_ms);
+             cleanup_interval_ms, max_gc_records, unknown_upload_retention_ms,
+             gc_scan_interval_ms, gc_min_object_age_ms, cleanup_max_backoff_ms);
 };
+
+// Disjoint logical namespace for immutable uploads owned by this HA cluster.
+std::string ObjectStorageGcPrefix(const std::string& cluster_id);
 
 }  // namespace mooncake

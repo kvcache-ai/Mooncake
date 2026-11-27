@@ -926,42 +926,50 @@ tl::expected<size_t, ErrorCode> RestObjectStorageAdapter::GetSize(
     }
 }
 
+tl::expected<ObjectListPage, ErrorCode> RestObjectStorageAdapter::ListPage(
+    const std::string& logical_prefix, const std::string& token, size_t limit) {
+    if (!limit || limit > 1000)
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    std::map<std::string, std::string> query{
+        {"encoding-type", "url"},
+        {"list-type", "2"},
+        {"max-keys", std::to_string(limit)},
+        {"prefix", LogicalToPhysicalKey(logical_prefix)}};
+    if (!token.empty()) query["continuation-token"] = token;
+    auto response = Request("GET", "", query);
+    if (!response) return tl::make_unexpected(response.error());
+    if (!IsSuccess(response->status))
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    auto page = object_storage_xml::ParseListObjectsV2(response->body);
+    if (!page || page->objects.size() > limit)
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    ObjectListPage result;
+    for (auto& object : page->objects) {
+        auto key = PhysicalToLogicalKey(UriDecode(object.key));
+        if (!key || !key->starts_with(logical_prefix))
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        result.objects.push_back(
+            {std::move(*key), object.size, object.last_modified_ms});
+    }
+    if (page->is_truncated) {
+        result.next_token = std::move(page->next_continuation_token);
+        if (ContinuationTokenIsUrlEncoded())
+            result.next_token = UriDecode(result.next_token);
+        if (result.next_token.empty() || result.next_token == token)
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    return result;
+}
+
 tl::expected<std::vector<KeyInfo>, ErrorCode>
 RestObjectStorageAdapter::ListKeys() {
-    const std::string prefix = PhysicalPrefix();
     std::vector<KeyInfo> keys;
     std::string token;
     do {
-        std::map<std::string, std::string> query{{"encoding-type", "url"},
-                                                 {"list-type", "2"},
-                                                 {"max-keys", "1000"},
-                                                 {"prefix", prefix}};
-        if (!token.empty()) query["continuation-token"] = token;
-        auto response = Request("GET", "", query);
-        if (!response) return tl::make_unexpected(response.error());
-        if (!IsSuccess(response->status))
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-
-        // A LIST can come back with HTTP 200 and an incomplete document (S3
-        // documents this for ListObjectsV2). Such a response is rejected: a
-        // partial listing returned as success would let callers such as
-        // ScanMeta silently drop existing objects.
-        auto page = object_storage_xml::ParseListObjectsV2(response->body);
-        if (!page) {
-            LOG(ERROR) << LogName()
-                       << " LIST response rejected: " << page.error();
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-        for (auto& object : page->objects) {
-            auto logical_key = PhysicalToLogicalKey(UriDecode(object.key));
-            if (!logical_key) return tl::make_unexpected(logical_key.error());
-            keys.push_back({std::move(*logical_key), object.size});
-        }
-        token = std::move(page->next_continuation_token);
-        if (ContinuationTokenIsUrlEncoded()) token = UriDecode(token);
-        if (!page->is_truncated) token.clear();
-        if (page->is_truncated && token.empty())
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        auto page = ListPage("", token, 1000);
+        if (!page) return tl::make_unexpected(page.error());
+        for (auto& object : page->objects) keys.push_back(std::move(object));
+        token = std::move(page->next_token);
     } while (!token.empty());
     return keys;
 }

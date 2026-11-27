@@ -1036,6 +1036,7 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    friend class ClientObjectStorageTestPeer;
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -1074,7 +1075,7 @@ class Client {
     void SubmitObjectStorageWrites(std::vector<PutOperation>&);
     void PollObjectStorage();
     void ReportObjectStorageUpload(const std::string&, ObjectUploadOutcome);
-    void AcknowledgeObjectStorageWrite(const std::vector<Replica::Descriptor>&);
+    void QueueObjectStorageCompletions(const std::vector<Replica::Descriptor>&);
     // Publish the namespace and its backend together. I/O retains the backend.
     std::mutex object_storage_init_mutex_;
     bool object_storage_config_current_{false};

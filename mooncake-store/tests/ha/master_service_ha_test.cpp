@@ -35,6 +35,7 @@
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "types.h"
+#include "storage/distributed/object_storage_adapter.h"
 
 namespace mooncake::test {
 
@@ -1603,6 +1604,488 @@ INSTANTIATE_TEST_SUITE_P(HA, AbandonedObjectUpsertTest,
                                            AbandonedWrite::InvalidMemory,
                                            AbandonedWrite::Preemption,
                                            AbandonedWrite::StalePut));
+
+// Keep the callback blocked after the log is durable: Remove must not report
+// success while a subsequent Put would still find the old publication.
+TEST_F(MasterServiceHATest, ObjectRemovalsWaitForLocalFinalize) {
+    for (const std::string operation :
+         {"remove", "batch", "regex", "tenant", "all", "clear", "segment"}) {
+        SCOPED_TRACE(operation);
+        auto config = MakeStrictHAConfig();
+        config.oplog_batch_max_entries = 1;
+        MasterService service(config);
+        MasterServiceTestPeer peer(service);
+        auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+        auto* log = InstallGatedWriter(service, backend);
+        ObjectStorageConfig storage;
+        storage.enabled = true;
+        storage.target = {
+            "s3", "https://example.test", "bucket", "region", "prefix", true};
+        peer.EnableObjectRecordsForTesting(storage);
+        const auto segment = PrepareSimpleSegment(service, "remove-memory");
+        const std::vector<std::string> keys = {"remove-0", "remove-1"};
+        ReplicateConfig placement;
+        placement.replica_num = 1;
+        placement.os_replica_num = 1;
+        for (const auto& key : keys) {
+            auto targets = service.PutStart(segment.client_id, key,
+                                            kDefaultTenant, 64, placement);
+            ASSERT_TRUE(targets);
+            ASSERT_TRUE(service.PutEnd(
+                segment.client_id,
+                ObjectMeta{key, std::nullopt,
+                           targets->front().object_write_attempt},
+                kDefaultTenant, ReplicaType::ALL));
+        }
+        OpLogBatchStorage batches(config.cluster_id, *backend);
+        DurablePrefix prefix;
+        ASSERT_EQ(batches.ReadDurablePrefix(prefix), ErrorCode::OK);
+        ASSERT_TRUE(log->PauseCallbacksAfter(prefix.last_seq));
+        // BatchReplicaClear respects read leases even for the owning writer.
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        backend->BlockTxn();
+        auto removal = std::async(std::launch::async, [&]() -> bool {
+            if (operation == "remove")
+                return service.Remove(keys[0], kDefaultTenant, true)
+                    .has_value();
+            if (operation == "batch") {
+                auto results = service.BatchRemove(keys, kDefaultTenant, true);
+                return results.size() == 2 && results[0] && results[1];
+            }
+            if (operation == "regex") {
+                auto result =
+                    service.RemoveByRegex("^remove-", kDefaultTenant, true);
+                return result && *result == 2;
+            }
+            if (operation == "tenant")
+                return service.RemoveAll(kDefaultTenant, true) == 2;
+            if (operation == "all") return service.RemoveAll(true) == 2;
+            auto result = service.BatchReplicaClear(
+                keys, segment.client_id,
+                operation == "segment" ? "remove-memory" : "");
+            return result && result->size() == 2;
+        });
+        // Always unblock before the async future's destructor, even on ASSERT.
+        struct Release {
+            BlockingBatchHaKvBackend& backend;
+            GatedOrderedOpLogWriter& log;
+            ~Release() {
+                backend.AllowTxn();
+                log.ResumeCallbacks();
+            }
+        } release{*backend, *log};
+        ASSERT_TRUE(backend->WaitForBlockedTxn());
+        const auto last = prefix.last_seq + (operation == "remove" ? 1 : 2);
+        backend->AllowTxn();
+        auto durable = std::make_shared<std::promise<ErrorCode>>();
+        auto durable_result = durable->get_future();
+        [[maybe_unused]] auto waiter = log->AwaitDurable(last).thenValue(
+            [durable](ErrorCode error) { durable->set_value(error); });
+        ASSERT_EQ(durable_result.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        ASSERT_EQ(durable_result.get(), ErrorCode::OK);
+        EXPECT_EQ(removal.wait_for(std::chrono::milliseconds(50)),
+                  std::future_status::timeout);
+        if (operation != "segment") {
+            for (const size_t object_replicas : {0u, 1u}) {
+                ReplicateConfig retry;
+                retry.replica_num = 1;
+                retry.os_replica_num = object_replicas;
+                auto pending = service.PutStart(segment.client_id, keys[0],
+                                                kDefaultTenant, 64, retry);
+                ASSERT_FALSE(pending);
+                EXPECT_EQ(pending.error(), ErrorCode::OBJECT_REPLICA_BUSY);
+            }
+        }
+        log->ResumeCallbacks();
+        ASSERT_EQ(removal.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        ASSERT_TRUE(removal.get());
+        auto old = MasterServiceTestPeer::ReadObject(
+            service,
+            MasterServiceTestPeer::ObjectIdentity{kDefaultTenant, keys[0]});
+        if (operation == "segment") {
+            ASSERT_TRUE(old);
+            ASSERT_EQ(old->metadata().CountReplicas(), 1u);
+            EXPECT_TRUE(old->metadata()
+                            .GetAllReplicas()
+                            .front()
+                            .is_object_storage_replica());
+        } else {
+            ASSERT_FALSE(old);
+            ReplicateConfig retry;
+            retry.replica_num = 1;
+            auto recreated = service.PutStart(segment.client_id, keys[0],
+                                              kDefaultTenant, 64, retry);
+            ASSERT_TRUE(recreated);
+            ASSERT_TRUE(service.PutEnd(
+                segment.client_id,
+                ObjectMeta{keys[0], std::nullopt,
+                           recreated->front().object_write_attempt},
+                kDefaultTenant, ReplicaType::ALL));
+            EXPECT_TRUE(service.GetReplicaList(keys[0], kDefaultTenant));
+        }
+    }
+}
+
+TEST_F(MasterServiceHATest, ObjectRemovalReturnsDurabilityFailure) {
+    for (const bool cancel : {false, true}) {
+        SCOPED_TRACE(cancel);
+        auto config = MakeStrictHAConfig();
+        MasterService service(config);
+        MasterServiceTestPeer peer(service);
+        auto backend = std::make_shared<FailingBatchHaKvBackend>();
+        auto* log = InstallGatedWriter(service, backend);
+        ObjectStorageConfig storage;
+        storage.enabled = true;
+        storage.target = {
+            "s3", "https://example.test", "bucket", "region", "prefix", true};
+        peer.EnableObjectRecordsForTesting(storage);
+        const auto writer = generate_uuid();
+        ReplicateConfig placement;
+        placement.replica_num = 0;
+        placement.os_replica_num = 1;
+        auto targets =
+            service.PutStart(writer, "remove", kDefaultTenant, 64, placement);
+        ASSERT_TRUE(targets);
+        ASSERT_TRUE(
+            service.PutEnd(writer,
+                           ObjectMeta{"remove", std::nullopt,
+                                      targets->front().object_write_attempt},
+                           kDefaultTenant, ReplicaType::ALL));
+        backend->SetTxnError(cancel ? ErrorCode::ETCD_OPERATION_ERROR
+                                    : ErrorCode::ETCD_TRANSACTION_FAIL);
+        auto removal = std::async(std::launch::async, [&] {
+            return service.Remove("remove", kDefaultTenant, true);
+        });
+        EXPECT_TRUE(backend->WaitForTxnCalls(1));
+        if (cancel) log->CancelDurabilityWaits();
+        const auto status = removal.wait_for(std::chrono::seconds(2));
+        if (status != std::future_status::ready) log->CancelDurabilityWaits();
+        ASSERT_EQ(status, std::future_status::ready);
+        auto result = removal.get();
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), cancel
+                                      ? ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS
+                                      : ErrorCode::ETCD_TRANSACTION_FAIL);
+    }
+}
+
+TEST_F(MasterServiceHATest, DuplicateObjectCompletionWaitsWithoutAppending) {
+    for (const auto outcome :
+         {ObjectUploadOutcome::COMPLETE, ObjectUploadOutcome::UNKNOWN,
+          ObjectUploadOutcome::NOT_WRITTEN}) {
+        SCOPED_TRACE(static_cast<int>(outcome));
+        auto config = MakeStrictHAConfig();
+        MasterService service(config);
+        MasterServiceTestPeer peer(service);
+        auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+        auto* log = InstallGatedWriter(service, backend);
+        ObjectStorageConfig storage;
+        storage.enabled = true;
+        storage.target = {
+            "s3", "https://example.test", "bucket", "region", "prefix", true};
+        peer.EnableObjectRecordsForTesting(storage);
+        const auto writer = generate_uuid();
+        ReplicateConfig placement;
+        placement.replica_num = 0;
+        placement.os_replica_num = 1;
+        auto targets = service.PutStart(writer, "duplicate", kDefaultTenant, 64,
+                                        placement);
+        ASSERT_TRUE(targets);
+        const auto name =
+            targets->front().get_object_storage_descriptor().object_key;
+        OpLogBatchStorage batches(config.cluster_id, *backend);
+        DurablePrefix before;
+        ASSERT_EQ(batches.ReadDurablePrefix(before), ErrorCode::OK);
+        backend->BlockTxn();
+        auto first = std::async(std::launch::async, [&] {
+            return service.FinishObjectStorageUpload(writer, name, outcome,
+                                                     kDefaultTenant);
+        });
+        struct Release {
+            BlockingBatchHaKvBackend& backend;
+            ~Release() { backend.AllowTxn(); }
+        } release{*backend};
+        ASSERT_TRUE(backend->WaitForBlockedTxn());
+        auto duplicate = std::async(std::launch::async, [&] {
+            return service.FinishObjectStorageUpload(writer, name, outcome,
+                                                     kDefaultTenant);
+        });
+        EXPECT_EQ(duplicate.wait_for(std::chrono::milliseconds(50)),
+                  std::future_status::timeout);
+        // One authorization and one state transition; the duplicate must not
+        // consume another log slot even while the first transition is pending.
+        EXPECT_FALSE(
+            log->WaitForSubmittedCount(3, std::chrono::milliseconds(50)));
+        backend->AllowTxn();
+        ASSERT_TRUE(first.get());
+        ASSERT_TRUE(duplicate.get());
+        ASSERT_TRUE(service.FinishObjectStorageUpload(writer, name, outcome,
+                                                      kDefaultTenant));
+        // Once the upload is known finished, an older UNKNOWN is also a no-op.
+        if (outcome != ObjectUploadOutcome::UNKNOWN)
+            ASSERT_TRUE(service.FinishObjectStorageUpload(
+                writer, name, ObjectUploadOutcome::UNKNOWN, kDefaultTenant));
+        DurablePrefix after;
+        ASSERT_EQ(batches.ReadDurablePrefix(after), ErrorCode::OK);
+        EXPECT_EQ(after.last_seq, before.last_seq + 1);
+    }
+}
+
+class GcObjectAdapter : public ObjectStorageAdapter {
+   public:
+    std::mutex mutex;
+    std::map<std::string, uint64_t> objects;
+    std::vector<std::string> deletes;
+    std::atomic<bool> fail_delete{false};
+    std::atomic<size_t> list_calls{0};
+    void Add(const std::string& name, uint64_t modified = 1) {
+        std::lock_guard lock(mutex);
+        objects[name] = modified;
+    }
+    bool Has(const std::string& name) {
+        std::lock_guard lock(mutex);
+        return objects.contains(name);
+    }
+    size_t DeleteCount() {
+        std::lock_guard lock(mutex);
+        return deletes.size();
+    }
+    tl::expected<void, ErrorCode> Put(const std::string& name,
+                                      std::span<const char>) override {
+        Add(name);
+        return {};
+    }
+    tl::expected<void, ErrorCode> PutV(const std::string& name, const iovec*,
+                                       int) override {
+        Add(name);
+        return {};
+    }
+    tl::expected<size_t, ErrorCode> Get(const std::string&, void*,
+                                        size_t) override {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    tl::expected<bool, ErrorCode> Exists(const std::string& name) override {
+        return Has(name);
+    }
+    tl::expected<void, ErrorCode> Delete(const std::string& name) override {
+        std::lock_guard lock(mutex);
+        deletes.push_back(name);
+        if (fail_delete) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        objects.erase(name);
+        return {};
+    }
+    tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() override {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    bool SupportsGcListing() const override { return true; }
+    tl::expected<ObjectListPage, ErrorCode> ListPage(const std::string& prefix,
+                                                     const std::string& token,
+                                                     size_t limit) override {
+        ++list_calls;
+        std::lock_guard lock(mutex);
+        ObjectListPage page;
+        for (auto it = objects.upper_bound(token); it != objects.end(); ++it) {
+            if (!it->first.starts_with(prefix)) continue;
+            if (page.objects.size() == limit) {
+                page.next_token = page.objects.back().logical_key;
+                break;
+            }
+            page.objects.push_back({it->first, 64, it->second});
+        }
+        return page;
+    }
+    tl::expected<void, ErrorCode> Init() override { return {}; }
+    const char* GetName() const override { return "gc-test"; }
+};
+
+static bool WaitForObjectGc(const std::function<bool()>& done) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!done()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return true;
+}
+
+TEST_F(MasterServiceHATest,
+       ObjectGcReclaimsUnknownAndLatePutWithoutTouchingLiveObjects) {
+    auto config = MakeStrictHAConfig();
+    config.default_kv_lease_ttl = 0;
+    MasterService service(config);
+    MasterServiceTestPeer peer(service);
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    ASSERT_EQ(peer.SetBatchOpLogBackendForTesting(backend), ErrorCode::OK);
+    ObjectStorageConfig storage;
+    storage.enabled = true;
+    storage.target = {
+        "s3", "https://example.test", "bucket", "region", "prefix", true};
+    storage.max_pending_records = 1;
+    storage.unknown_upload_retention_ms = 20;
+    storage.cleanup_interval_ms = 2;
+    storage.cleanup_max_backoff_ms = 10;
+    storage.gc_scan_interval_ms = 5;
+    storage.gc_min_object_age_ms = 60000;
+    storage.maintenance_batch_size = 2;
+    auto& records = peer.EnableObjectRecordsForTesting(storage);
+    auto adapter = std::make_shared<GcObjectAdapter>();
+    ReplicateConfig placement;
+    placement.replica_num = 0;
+    placement.os_replica_num = 1;
+    const auto writer = generate_uuid();
+    auto pending =
+        service.PutStart(writer, "unknown", kDefaultTenant, 64, placement);
+    ASSERT_TRUE(pending);
+    const auto name =
+        pending->front().get_object_storage_descriptor().object_key;
+    adapter->Add(name);
+    ASSERT_TRUE(service.FinishObjectStorageUpload(
+        writer, name, ObjectUploadOutcome::UNKNOWN, kDefaultTenant));
+    EXPECT_EQ(peer.ObjectAdmissionForTesting(),
+              (std::pair<size_t, size_t>{0, 1}));
+    auto live = service.PutStart(writer, "live", kDefaultTenant, 64, placement);
+    ASSERT_TRUE(live);
+    const auto live_name =
+        live->front().get_object_storage_descriptor().object_key;
+    ASSERT_TRUE(service.PutEnd(
+        writer,
+        ObjectMeta{"live", std::nullopt, live->front().object_write_attempt},
+        kDefaultTenant, ReplicaType::ALL));
+    adapter->Add(live_name);
+    auto in_flight =
+        service.PutStart(writer, "in-flight", kDefaultTenant, 64, placement);
+    ASSERT_TRUE(in_flight);
+    const auto in_flight_name =
+        in_flight->front().get_object_storage_descriptor().object_key;
+    adapter->Add(in_flight_name);
+    const auto prefix = ObjectStorageGcPrefix(config.cluster_id);
+    const auto young = prefix + "young";
+    const auto no_date = prefix + "no-date";
+    const auto foreign = ObjectStorageGcPrefix("another-cluster") + "orphan";
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    adapter->Add(young, now);
+    adapter->Add(no_date, 0);
+    adapter->Add(foreign);
+    adapter->Add("legacy-orphan");
+    service.MarkReadyForServing();
+    service.ActivateServing();
+    peer.StartObjectGcForTesting(adapter);
+    ASSERT_TRUE(
+        WaitForObjectGc([&] { return !records.FindObjectUpload(name); }));
+    EXPECT_FALSE(adapter->Has(name));
+    // A PUT that arrived after the record was forgotten is found by a later
+    // scan. Its old backend timestamp makes it eligible without a long sleep.
+    adapter->Add(name);
+    ASSERT_TRUE(WaitForObjectGc([&] { return !adapter->Has(name); }));
+    peer.StopObjectGcForTesting();
+    EXPECT_TRUE(adapter->Has(live_name));
+    EXPECT_TRUE(adapter->Has(in_flight_name));
+    EXPECT_TRUE(adapter->Has(young));
+    EXPECT_TRUE(adapter->Has(no_date));
+    EXPECT_TRUE(adapter->Has(foreign));
+    EXPECT_TRUE(adapter->Has("legacy-orphan"));
+    EXPECT_GT(adapter->list_calls.load(), 1u);
+    StandbyMetadataStore replay;
+    OpLogApplier applier(&replay, config.cluster_id);
+    OpLogBatchStandbyReader reader(config.cluster_id, *backend, applier);
+    ASSERT_EQ(reader.PollOnce().error, ErrorCode::OK);
+    EXPECT_FALSE(replay.FindObjectUpload(name));
+    EXPECT_TRUE(replay.FindObjectUpload(live_name));
+}
+
+TEST_F(MasterServiceHATest,
+       ObjectGcBacklogSurvivesRestoreAndRecoversAfterDeleteFailure) {
+    auto config = MakeStrictHAConfig();
+    config.default_kv_lease_ttl = 0;
+    ObjectStorageConfig storage;
+    storage.enabled = true;
+    storage.target = {
+        "s3", "https://example.test", "bucket", "region", "prefix", true};
+    storage.max_pending_records = 1;
+    storage.max_gc_records = 2;
+    storage.cleanup_interval_ms = 5;
+    storage.cleanup_max_backoff_ms = 40;
+    storage.unknown_upload_retention_ms = 1;
+    ObjectReplicaSnapshot snapshot;
+    const auto writer = generate_uuid();
+    ReplicateConfig placement;
+    placement.replica_num = 0;
+    placement.os_replica_num = 1;
+    {
+        MasterService service(config);
+        MasterServiceTestPeer peer(service);
+        ASSERT_EQ(peer.SetBatchOpLogBackendForTesting(
+                      std::make_shared<FakeBatchHaKvBackend>()),
+                  ErrorCode::OK);
+        auto& records = peer.EnableObjectRecordsForTesting(storage);
+        for (const auto& key : {"one", "two"}) {
+            auto pending =
+                service.PutStart(writer, key, kDefaultTenant, 64, placement);
+            ASSERT_TRUE(pending);
+            ASSERT_TRUE(service.FinishObjectStorageUpload(
+                writer,
+                pending->front().get_object_storage_descriptor().object_key,
+                ObjectUploadOutcome::UNKNOWN, kDefaultTenant));
+        }
+        auto blocked =
+            service.PutStart(writer, "blocked", kDefaultTenant, 64, placement);
+        ASSERT_FALSE(blocked);
+        EXPECT_EQ(blocked.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+        snapshot = records.SnapshotObjectReplicas();
+    }
+    MasterService service(config);
+    MasterServiceTestPeer peer(service);
+    ASSERT_EQ(peer.SetBatchOpLogBackendForTesting(
+                  std::make_shared<FakeBatchHaKvBackend>()),
+              ErrorCode::OK);
+    auto& records = peer.EnableObjectRecordsForTesting(storage);
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({}, 0, {}, {}, snapshot));
+    EXPECT_EQ(peer.ObjectAdmissionForTesting(),
+              (std::pair<size_t, size_t>{0, 2}));
+    auto adapter = std::make_shared<GcObjectAdapter>();
+    adapter->fail_delete = true;
+    service.ActivateServing();
+    peer.StartObjectGcForTesting(adapter);
+    ASSERT_TRUE(WaitForObjectGc([&] { return adapter->DeleteCount() >= 2; }));
+    EXPECT_EQ(records.ObjectUploadCount(), 2u);
+    const auto deadline =
+        peer.ObjectCleanupDeadline(snapshot.records.front().object.object_key);
+    EXPECT_GT(deadline, std::chrono::steady_clock::now());
+    adapter->fail_delete = false;
+    ASSERT_TRUE(
+        WaitForObjectGc([&] { return records.ObjectUploadCount() == 0; }));
+    EXPECT_TRUE(
+        service.PutStart(writer, "unblocked", kDefaultTenant, 64, placement));
+    peer.StopObjectGcForTesting();
+}
+
+TEST_F(MasterServiceHATest, ObjectOrphanGcRequiresServingAndFencedDurability) {
+    auto config = MakeStrictHAConfig();
+    MasterService service(config);
+    MasterServiceTestPeer peer(service);
+    auto backend = std::make_shared<FailingBatchHaKvBackend>();
+    ASSERT_EQ(peer.SetBatchOpLogBackendForTesting(backend), ErrorCode::OK);
+    ObjectStorageConfig storage;
+    storage.enabled = true;
+    storage.target = {
+        "s3", "https://example.test", "bucket", "region", "prefix", true};
+    peer.EnableObjectRecordsForTesting(storage);
+    auto adapter = std::make_shared<GcObjectAdapter>();
+    const auto name = ObjectStorageGcPrefix(config.cluster_id) + "orphan";
+    adapter->Add(name);
+    peer.SweepObjectOrphansForTesting(adapter);
+    EXPECT_EQ(adapter->list_calls.load(), 0u);
+    service.MarkReadyForServing();
+    service.ActivateServing();
+    backend->SetTxnError(ErrorCode::ETCD_TRANSACTION_FAIL);
+    peer.SweepObjectOrphansForTesting(adapter);
+    EXPECT_TRUE(adapter->Has(name));
+    EXPECT_EQ(adapter->DeleteCount(), 0u);
+}
 
 TEST_F(MasterServiceHATest, ObjectRetirementHonorsLeasesFromEarlierLeaders) {
     ObjectStorageConfig storage;

@@ -23,6 +23,13 @@ struct WeightMetadataSnapshot;
 
 class MasterMetricManager {
    public:
+    void set_object_gc_stats(uint64_t pending, uint64_t retired,
+                             uint64_t age_ms) {
+        object_pending_writes_.update(pending);
+        object_gc_records_.update(retired);
+        object_gc_oldest_age_ms_.update(age_ms);
+    }
+    void inc_object_gc_failures() { object_gc_failures_.inc(); }
     // --- Singleton Access ---
     static MasterMetricManager& instance();
 
@@ -154,6 +161,18 @@ class MasterMetricManager {
     uint8_t classify_key_group(std::string_view key) const;
     void inc_key_group(uint8_t group, int64_t value_bytes);
     void dec_key_group(uint8_t group, int64_t value_bytes);
+
+    ylt::metric::gauge_t object_pending_writes_{
+        "master_object_pending_writes",
+        "Uncommitted object writes awaiting completion"};
+    ylt::metric::gauge_t object_gc_records_{
+        "master_object_gc_records", "Retired object records awaiting GC"};
+    ylt::metric::gauge_t object_gc_oldest_age_ms_{
+        "master_object_gc_oldest_age_ms",
+        "Age since oldest retired read-protection deadline"};
+    ylt::metric::counter_t object_gc_failures_{
+        "master_object_gc_failures_total",
+        "Failed object GC deletes or listings"};
 
     // Cluster Metrics
     void inc_active_clients(int64_t val = 1);

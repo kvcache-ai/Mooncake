@@ -768,7 +768,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
     client_sessions_.Start();
     VLOG(1) << "action=start_client_session_plane";
     if (dfs_kvcs_capacity_provider_) kvcs_capacity_refresh_worker_.Start();
-    if (object_uploads_) object_storage_worker_.Start();
+    if (object_uploads_) {
+        object_storage_worker_.Start();
+        object_storage_worker_.Schedule();
+    }
 
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
@@ -4488,7 +4491,7 @@ auto MasterService::BatchReplicaClear(
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     std::vector<std::string> cleared_keys;
-    uint64_t object_sequence = 0;
+    std::vector<std::shared_future<ErrorCode>> completions;
     cleared_keys.reserve(object_keys.size());
     const bool clear_all_segments = segment_name.empty();
     const TenantId requested_tenant(tenant_id);
@@ -4554,16 +4557,10 @@ auto MasterService::BatchReplicaClear(
                             removed_ids.push_back(replica.id());
                             replica.mark_removed();
                         });
-                    auto persist_result =
-                        AppendReservedOpLogWithDurableFinalize(
-                            std::move(reservation.value()), OpType::REMOVE,
-                            normalized_tenant.value(), key, {},
-                            [this, removed_ids = std::move(removed_ids)](
-                                const OpLogEntry& durable_entry) {
-                                FinalizeRemovedReplicasAfterDurable(
-                                    durable_entry, removed_ids);
-                            },
-                            &object_sequence);
+                    auto persist_result = AppendReplicaRemovalWithCompletion(
+                        std::move(reservation.value()), OpType::REMOVE,
+                        normalized_tenant.value(), key, {},
+                        std::move(removed_ids), completions);
                     if (!persist_result) {
                         continue;
                     }
@@ -4629,27 +4626,17 @@ auto MasterService::BatchReplicaClear(
 
                     tl::expected<OpLogEntry, ErrorCode> persist_result;
                     if (remaining.empty()) {
-                        persist_result = AppendReservedOpLogWithDurableFinalize(
+                        persist_result = AppendReplicaRemovalWithCompletion(
                             std::move(reservation.value()), OpType::REMOVE,
                             normalized_tenant.value(), key, {},
-                            [this, removed_ids = std::move(removed_ids)](
-                                const OpLogEntry& durable_entry) {
-                                FinalizeRemovedReplicasAfterDurable(
-                                    durable_entry, removed_ids);
-                            },
-                            &object_sequence);
+                            std::move(removed_ids), completions);
                     } else {
-                        persist_result = AppendReservedOpLogWithDurableFinalize(
+                        persist_result = AppendReplicaRemovalWithCompletion(
                             std::move(reservation.value()), OpType::PUT_END,
                             normalized_tenant.value(), key,
                             SerializeMetadataForOpLogFromReplicaDescriptors(
                                 metadata, remaining),
-                            [this, removed_ids = std::move(removed_ids)](
-                                const OpLogEntry& durable_entry) {
-                                FinalizeRemovedReplicasAfterDurable(
-                                    durable_entry, removed_ids);
-                            },
-                            &object_sequence);
+                            std::move(removed_ids), completions);
                     }
                     if (!persist_result) {
                         continue;
@@ -4680,10 +4667,8 @@ auto MasterService::BatchReplicaClear(
     }
 
     shared_lock.unlock();
-    if (object_sequence) {
-        auto durable = WaitObjectDurable(object_sequence);
-        if (!durable) return tl::make_unexpected(durable.error());
-    }
+    auto completed = WaitReplicaRemovals(completions);
+    if (!completed) return tl::make_unexpected(completed.error());
     return cleared_keys;
 }
 
@@ -5445,6 +5430,13 @@ auto MasterService::CleanupStaleBeforeWrite(const char* why,
     if (!accessor.IsPublished()) {
         return {};
     }
+    // A pending erase is not an existing value: clients treat ALREADY_EXISTS
+    // as a successful Put without transferring any data.
+    if (accessor.Get().CountReplicas() != 0 &&
+        accessor.Get().AllReplicas([](const Replica& replica) {
+            return replica.status() == ReplicaStatus::REMOVED;
+        }))
+        return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
     const std::string& key = accessor.GetKey();
     const TenantId& tenant_id = accessor.GetTenantId();
     auto& metadata = accessor.Get();
@@ -7700,10 +7692,10 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
     return RemoveObject(key, tenant_id, force, false);
 }
 
-auto MasterService::RemoveObjectImpl(const std::string& key,
-                                     const TenantId& tenant_id, bool force,
-                                     bool allow_managed_weight,
-                                     uint64_t& object_sequence)
+auto MasterService::RemoveObjectImpl(
+    const std::string& key, const TenantId& tenant_id, bool force,
+    bool allow_managed_weight,
+    std::vector<std::shared_future<ErrorCode>>& completions)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -7727,7 +7719,7 @@ auto MasterService::RemoveObjectImpl(const std::string& key,
 
     if (enable_ha_ && enable_oplog_) {
         return MarkRemovedAndPersist(object_id.tenant_id, key, metadata,
-                                     object_sequence);
+                                     completions);
     }
     accessor.Erase();
     return {};
@@ -7735,7 +7727,7 @@ auto MasterService::RemoveObjectImpl(const std::string& key,
 
 tl::expected<void, ErrorCode> MasterService::MarkRemovedAndPersist(
     const TenantId& tenant_id, const std::string& key, ObjectMetadata& metadata,
-    uint64_t& object_sequence) {
+    std::vector<std::shared_future<ErrorCode>>& completions) {
     auto reservation = ReserveBatchOpLogSlot();
     if (!reservation) {
         return tl::make_unexpected(reservation.error());
@@ -7745,14 +7737,9 @@ tl::expected<void, ErrorCode> MasterService::MarkRemovedAndPersist(
                            [&removed_ids](const Replica& replica) {
                                removed_ids.push_back(replica.id());
                            });
-    auto persist_result = AppendReservedOpLogWithDurableFinalize(
+    auto persist_result = AppendReplicaRemovalWithCompletion(
         std::move(reservation.value()), OpType::REMOVE, tenant_id.value(), key,
-        {},
-        [this, removed_ids =
-                   std::move(removed_ids)](const OpLogEntry& durable_entry) {
-            FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids);
-        },
-        &object_sequence);
+        {}, std::move(removed_ids), completions);
     if (!persist_result) {
         return tl::make_unexpected(persist_result.error());
     }
@@ -7837,7 +7824,7 @@ MasterService::RemoveResult MasterService::RemoveTenantObjects(
             metadata.CountReplicas(&Replica::fn_is_memory_replica);
         if (enable_ha_ && enable_oplog_) {
             if (!MarkRemovedAndPersist(tenant_id, candidate.key, metadata,
-                                       result.object_sequence)) {
+                                       result.completions)) {
                 result.skipped_object = true;
                 continue;
             }
@@ -7874,15 +7861,13 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
     VLOG(1) << "action=remove_by_regex, pattern=" << regex_pattern
             << ", removed_count=" << result.removed_count;
     shared_lock.unlock();
-    if (result.object_sequence) {
-        auto durable = WaitObjectDurable(result.object_sequence);
-        if (!durable) return tl::make_unexpected(durable.error());
-    }
+    auto completed = WaitReplicaRemovals(result.completions);
+    if (!completed) return tl::make_unexpected(completed.error());
     return result.removed_count;
 }
 
 long MasterService::RemoveAll(bool force) {
-    uint64_t object_sequence = 0;
+    std::vector<std::shared_future<ErrorCode>> completions;
     long removed_count = 0;
     int64_t total_freed_size = 0;
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
@@ -7904,7 +7889,8 @@ long MasterService::RemoveAll(bool force) {
         [&](const TenantId& tenant_id, metadata::Namespace& /*ns*/) {
             const RemoveResult result =
                 RemoveTenantObjects(tenant_id, force, now, nullptr);
-            object_sequence = std::max(object_sequence, result.object_sequence);
+            completions.insert(completions.end(), result.completions.begin(),
+                               result.completions.end());
             removed_count += result.removed_count;
             total_freed_size += result.freed_bytes;
             // Record the tenant only once the walk actually reached an object.
@@ -7941,7 +7927,7 @@ long MasterService::RemoveAll(bool force) {
             << ", removed_count=" << removed_count
             << ", total_freed_size=" << total_freed_size;
     shared_lock.unlock();
-    if (object_sequence && !WaitObjectDurable(object_sequence)) return -1;
+    if (!WaitReplicaRemovals(completions)) return -1;
     return removed_count;
 }
 
@@ -7973,8 +7959,7 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
             << ", removed_count=" << result.removed_count
             << ", total_freed_size=" << result.freed_bytes;
     shared_lock.unlock();
-    if (result.object_sequence && !WaitObjectDurable(result.object_sequence))
-        return -1;
+    if (!WaitReplicaRemovals(result.completions)) return -1;
     return result.removed_count;
 }
 
@@ -7986,7 +7971,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
 
-    std::vector<std::pair<size_t, uint64_t>> object_removals;
+    std::vector<std::pair<size_t, std::shared_future<ErrorCode>>>
+        object_removals;
     const auto now = std::chrono::system_clock::now();
     for (size_t original_idx = 0; original_idx < keys.size(); ++original_idx) {
         const std::string& key = keys[original_idx];
@@ -8049,11 +8035,12 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
         }
 
         if (enable_ha_ && enable_oplog_) {
-            uint64_t object_sequence = 0;
+            std::vector<std::shared_future<ErrorCode>> completions;
             results[original_idx] = MarkRemovedAndPersist(
-                normalized_tenant, key, metadata, object_sequence);
-            if (object_sequence)
-                object_removals.emplace_back(original_idx, object_sequence);
+                normalized_tenant, key, metadata, completions);
+            for (auto& completion : completions)
+                object_removals.emplace_back(original_idx,
+                                             std::move(completion));
             continue;
         }
         accessor.Erase();
@@ -8061,13 +8048,9 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
     }
 
     snapshot_lock.unlock();
-    // A durable prefix covers all earlier removals. If the writer stopped
-    // partway through the batch, report failure only for its undurable tail.
-    for (auto it = object_removals.rbegin(); it != object_removals.rend();
-         ++it) {
-        auto durable = WaitObjectDurable(it->second);
-        if (durable) break;
-        results[it->first] = tl::make_unexpected(durable.error());
+    for (const auto& [index, completion] : object_removals) {
+        const auto error = completion.get();
+        if (error != ErrorCode::OK) results[index] = tl::make_unexpected(error);
     }
     return results;
 }

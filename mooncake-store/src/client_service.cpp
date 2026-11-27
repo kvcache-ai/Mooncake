@@ -2411,10 +2411,15 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
+            if (transfer_summary.successful_object_transfers)
+                QueueObjectStorageCompletions(start_result.value());
             return tl::unexpected(err);
         }
     }
 
+    if (!finalize_decision.end_type &&
+        transfer_summary.successful_object_transfers)
+        QueueObjectStorageCompletions(start_result.value());
     if (finalize_decision.revoke_type.has_value()) {
         auto revoke_result =
             ObjectWriteAttemptFor(start_result.value())
@@ -2430,7 +2435,6 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     if (!finalize_decision.success) {
         return tl::unexpected(finalize_decision.error);
     }
-    AcknowledgeObjectStorageWrite(start_result.value());
 
     return {};
 }
@@ -2636,9 +2640,14 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end upsert operation: " << err;
+            if (transfer_summary.successful_object_transfers)
+                QueueObjectStorageCompletions(start_result.value());
             return tl::unexpected(err);
         }
     }
+    if (!finalize_decision.end_type &&
+        transfer_summary.successful_object_transfers)
+        QueueObjectStorageCompletions(start_result.value());
     if (finalize_decision.revoke_type.has_value()) {
         auto revoke_result =
             ObjectWriteAttemptFor(start_result.value())
@@ -2654,7 +2663,6 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     if (!finalize_decision.success) {
         return tl::unexpected(finalize_decision.error);
     }
-    AcknowledgeObjectStorageWrite(start_result.value());
 
     // Success-side invalidation: a concurrent read between the pre-upsert
     // RemoveHotKey() and UpsertEnd could have read the old value and submitted
@@ -3897,7 +3905,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     int no_available_handle_count = 0;
     for (const auto& op : ops) {
         // With the new structure, result is always set (never nullopt)
-        if (op.IsSuccessful()) AcknowledgeObjectStorageWrite(op.replicas);
+        if (!op.IsSuccessful() &&
+            op.transfer_summary.successful_object_transfers)
+            QueueObjectStorageCompletions(op.replicas);
         results.emplace_back(op.result);
 
         // Additional validation and logging for debugging

@@ -417,8 +417,8 @@ DEFINE_string(object_storage_prefix, "", "Immutable object namespace prefix");
 DEFINE_bool(object_storage_path_style, false, "Use path-style object requests");
 DEFINE_uint64(
     object_storage_max_pending_records, 10000,
-    "Admission threshold for uncommitted uploads and retired objects; "
-    "committed referenced objects do not count");
+    "Admission threshold for uncommitted uploads; retired cleanup records "
+    "have a separate GC budget");
 DEFINE_uint64(object_storage_max_object_bytes, 268435456,
               "Maximum object size");
 DEFINE_uint64(object_storage_max_staging_bytes, 1073741824,
@@ -428,8 +428,23 @@ DEFINE_uint64(object_storage_maintenance_batch_size, 32,
               "continues in the next callback without an interval wait");
 DEFINE_uint64(
     object_storage_cleanup_interval_ms, 10000,
-    "Retry/recheck interval for failed deletions, unknown uploads and "
+    "Initial retry/recheck interval for failed deletions, unknown uploads and "
     "unfinished writes; not a delay between healthy cleanup batches");
+
+DEFINE_uint64(object_storage_max_gc_records, 100000,
+              "Retired GC backlog high watermark; new object authorizations "
+              "are throttled above it");
+DEFINE_uint64(object_storage_unknown_upload_retention_ms, 86400000,
+              "Retention after retirement read protection before handing "
+              "uncertain uploads to orphan GC");
+DEFINE_uint64(
+    object_storage_gc_scan_interval_ms, 86400000,
+    "Interval between complete orphan scans of this cluster namespace");
+DEFINE_uint64(object_storage_gc_min_object_age_ms, 86400000,
+              "Minimum backend LastModified age for orphan deletion");
+DEFINE_uint64(
+    object_storage_cleanup_max_backoff_ms, 3600000,
+    "Maximum retry delay for retired objects and failed orphan scans");
 
 // OpLog store configuration
 DEFINE_bool(enable_oplog, false,
@@ -792,6 +807,23 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("object_storage_cleanup_interval_ms",
                              &master_config.object_storage.cleanup_interval_ms,
                              FLAGS_object_storage_cleanup_interval_ms);
+    default_config.GetUInt64("object_storage_max_gc_records",
+                             &master_config.object_storage.max_gc_records,
+                             FLAGS_object_storage_max_gc_records);
+    default_config.GetUInt64(
+        "object_storage_unknown_upload_retention_ms",
+        &master_config.object_storage.unknown_upload_retention_ms,
+        FLAGS_object_storage_unknown_upload_retention_ms);
+    default_config.GetUInt64("object_storage_gc_scan_interval_ms",
+                             &master_config.object_storage.gc_scan_interval_ms,
+                             FLAGS_object_storage_gc_scan_interval_ms);
+    default_config.GetUInt64("object_storage_gc_min_object_age_ms",
+                             &master_config.object_storage.gc_min_object_age_ms,
+                             FLAGS_object_storage_gc_min_object_age_ms);
+    default_config.GetUInt64(
+        "object_storage_cleanup_max_backoff_ms",
+        &master_config.object_storage.cleanup_max_backoff_ms,
+        FLAGS_object_storage_cleanup_max_backoff_ms);
     default_config.GetBool("enable_oplog", &master_config.enable_oplog,
                            FLAGS_enable_oplog);
     default_config.GetBool(
@@ -1360,6 +1392,36 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set)
         master_config.object_storage.cleanup_interval_ms =
             FLAGS_object_storage_cleanup_interval_ms;
+    if ((google::GetCommandLineFlagInfo("object_storage_max_gc_records",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.max_gc_records =
+            FLAGS_object_storage_max_gc_records;
+    if ((google::GetCommandLineFlagInfo(
+             "object_storage_unknown_upload_retention_ms", &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.unknown_upload_retention_ms =
+            FLAGS_object_storage_unknown_upload_retention_ms;
+    if ((google::GetCommandLineFlagInfo("object_storage_gc_scan_interval_ms",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.gc_scan_interval_ms =
+            FLAGS_object_storage_gc_scan_interval_ms;
+    if ((google::GetCommandLineFlagInfo("object_storage_gc_min_object_age_ms",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.gc_min_object_age_ms =
+            FLAGS_object_storage_gc_min_object_age_ms;
+    if ((google::GetCommandLineFlagInfo("object_storage_cleanup_max_backoff_ms",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set)
+        master_config.object_storage.cleanup_max_backoff_ms =
+            FLAGS_object_storage_cleanup_max_backoff_ms;
     if ((google::GetCommandLineFlagInfo("enable_oplog", &info) &&
          !info.is_default) ||
         !conf_set) {
