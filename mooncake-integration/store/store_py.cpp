@@ -10,6 +10,7 @@
 #include <numa.h>
 
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <unordered_set>
@@ -31,6 +32,7 @@
 #include "buffer_pool.h"
 #include "python_buffer.h"
 #include "store_py_internal.h"
+#include "store/store_key_py.h"
 
 namespace py = nanobind;
 
@@ -3608,10 +3610,22 @@ NB_MODULE(_store, m) {
             "batch_get_replica_desc",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
-                py::gil_scoped_release release;
-                return self.store_->batch_get_replica_desc(keys);
+                std::map<std::string, std::vector<Replica::Descriptor>>
+                    replica_map;
+                {
+                    py::gil_scoped_release release;
+                    replica_map = self.store_->batch_get_replica_desc(keys);
+                }
+                py::dict decoded;
+                for (const auto &entry : replica_map) {
+                    decoded[StoreKeyToPy(entry.first)] = entry.second;
+                }
+                return decoded;
             },
-            py::arg("keys"))
+            py::arg("keys"),
+            "Replica descriptors for each key. A valid UTF-8 key is str; "
+            "any other key is bytes, so one binary key does not fail "
+            "the batch.")
         .def(
             "batch_replica_clear",
             [](MooncakeStorePyWrapper &self,
