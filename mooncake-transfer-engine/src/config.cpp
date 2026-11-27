@@ -844,6 +844,24 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+#ifdef USE_CUDA
+    if (const char* value = std::getenv("MOONCAKE_RDMA_HOST_ONLY")) {
+        const auto parsed = TryParseBool(value);
+        if (parsed.has_value()) {
+            config.rdma_host_only = *parsed;
+        } else {
+            LOG(WARNING)
+                << "Invalid MOONCAKE_RDMA_HOST_ONLY environment value: "
+                << value << ", keeping default " << config.rdma_host_only;
+        }
+    }
+#else
+    if (std::getenv("MOONCAKE_RDMA_HOST_ONLY") != nullptr) {
+        LOG(WARNING) << "MOONCAKE_RDMA_HOST_ONLY is only supported in CUDA "
+                        "builds; ignoring the environment value";
+    }
+#endif
+
     const char* endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
     if (endpoint_store_type_env) {
         if (strcmp(endpoint_store_type_env, "FIFO") == 0) {
