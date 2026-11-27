@@ -248,6 +248,9 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <chrono>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -259,6 +262,7 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
 namespace mooncake {
 class TransferEngine;
 class TransferEngineImplTestPeer;
+class BatchSubmitExecutor;
 namespace tent {
 class TransferEngineImpl;
 class Config;
@@ -310,6 +314,21 @@ class TransferEngine {
 
     Status freeLocalMemory(void* addr);
 
+    // Map the published GVA region starting at gva on the
+    // caller's current device, at the same numeric address as its owner.
+    // Both map and unmap take the published region base.
+    // Success is idempotent and makes the region ready for direct kernel
+    // access. NVLINK and MNNVL support CUDA VMM regions; POSIX FD import
+    // uses pidfd_getfd and requires permission to access the exporting process.
+    Status mapRemoteMemory(SegmentID peer, void* gva, size_t size,
+                           TransportType type = UNSPEC);
+
+    // gva must be the published region base. The application synchronizes
+    // kernels and transfers using the region before unmapping it. The owner
+    // unregisters/frees only after all peers have finished using it.
+    Status unmapRemoteMemory(SegmentID peer, void* gva,
+                             TransportType type = UNSPEC);
+
     Status registerLocalMemory(void* addr, size_t size,
                                Permission permission = kGlobalReadWrite);
 
@@ -322,6 +341,9 @@ class TransferEngine {
     Status unregisterLocalMemory(std::vector<void*> addr_list,
                                  std::vector<size_t> size_list = {});
 
+    // GVA allocations require synchronization and local unregistration before
+    // freeLocalMemory. Explicit transport uninstall requires them to be freed;
+    // final engine destruction ends their lifetime.
     // advanced buffer allocate function
     Status allocateLocalMemory(void** addr, size_t size,
                                MemoryOptions& options);
@@ -340,6 +362,25 @@ class TransferEngine {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list);
+
+    using SubBatchRequestBuilder =
+        std::function<std::vector<Request>(size_t begin, size_t end)>;
+    struct ParallelBatchTransferFailureInfo {
+        // At least one engine submit API returned an error.
+        bool submit_failed = false;
+        // Only native FAILED/TIMEOUT errors, without parent expiry/shutdown.
+        bool retryable = false;
+    };
+    // Opt-in synchronous path for independent ranges to one peer.
+    // nullopt means disabled, below threshold, or unsupported before publish.
+    // The builder runs once per sub-batch and must return the requested range
+    // as valid READ/WRITE requests to peer, preserving every request field.
+    // The caller must ensure that all requests can execute independently;
+    // these preconditions are not checked by scanning the built requests.
+    std::optional<Status> tryParallelBatchTransfer(
+        SegmentID peer, size_t count, const SubBatchRequestBuilder& builder,
+        std::chrono::nanoseconds timeout,
+        ParallelBatchTransferFailureInfo* failure_info = nullptr);
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list,
@@ -385,11 +426,18 @@ class TransferEngine {
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
+    bool supportsParallelBatchSubmit(SegmentID peer) const;
+
+    bool isBatchSubmitEligible(size_t count) const;
+
    private:
+    struct TentSubBatchAdapter;
+
     Status submitTransferRequiringPostSubmitCancellation(
         BatchID batch_id, const std::vector<Request>& request_list);
 
     std::unique_ptr<TransferEngineImpl> impl_;
+    std::shared_ptr<BatchSubmitExecutor> batch_submit_executor_;
     friend class ::mooncake::TransferEngine;
     friend class ::mooncake::TransferEngineImplTestPeer;
 };

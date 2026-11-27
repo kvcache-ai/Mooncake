@@ -8,10 +8,10 @@
 
 .github @stmatengss @ykwd @Ann-1024 @luketong777 @Aionw
 /docs @ShangmingCai @stmatengss @ykwd @UNIDY2002 @alogfans @staryxchen
-/mooncake-ep @UNIDY2002 @ympcMark @yuechen-sys
+/mooncake-ep @UNIDY2002 @ympcMark @yuechen-sys @caozhanhao
 /mooncake-integration/transfer_engine @ShangmingCai @alogfans
 /mooncake-integration/store @ykwd @stmatengss @zxpdemonio
-/mooncake-pg @UNIDY2002 @ympcMark @yuechen-sys
+/mooncake-pg @UNIDY2002 @ympcMark @yuechen-sys @caozhanhao
 /mooncake-reshard @ShangmingCai @stmatengss @Bo-Vincent @zxpdemonio
 /mooncake-store @ykwd @stmatengss @XucSh @YiXR @Aionw
 /mooncake-store-rs/ @llfl @Bo-Vincent @zxpdemonio
@@ -23,11 +23,11 @@
 /python/tests/store/async_store_integration.py @ykwd @stmatengss @zxpdemonio
 /python/tests/store/test_async_store.py @ykwd @stmatengss @zxpdemonio
 /python/mooncake/buffer_pool.py @ykwd @stmatengss
-/python/mooncake/ep.py @UNIDY2002 @ympcMark @yuechen-sys
+/python/mooncake/ep.py @UNIDY2002 @ympcMark @yuechen-sys @caozhanhao
 /python/mooncake/mooncake_config.py @ykwd @stmatengss
-/python/mooncake/mooncake_elastic_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
-/python/mooncake/mooncake_ep_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
-/python/tests/ep/ @UNIDY2002 @ympcMark @yuechen-sys
+/python/mooncake/mooncake_elastic_buffer.py @UNIDY2002 @ympcMark @yuechen-sys @caozhanhao
+/python/mooncake/mooncake_ep_buffer.py @UNIDY2002 @ympcMark @yuechen-sys @caozhanhao
+/python/tests/ep/ @UNIDY2002 @ympcMark @yuechen-sys @caozhanhao
 /python/tests/services/test_http_metadata_server.py @ykwd @stmatengss @zxpdemonio
 /python/mooncake/cli.py @ykwd @stmatengss @zxpdemonio
 /python/mooncake/cli_client.py @ykwd @stmatengss @zxpdemonio

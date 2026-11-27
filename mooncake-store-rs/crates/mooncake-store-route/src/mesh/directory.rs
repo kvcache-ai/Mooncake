@@ -181,6 +181,7 @@ struct EmbeddedWrhRouteDirectory {
 struct RouteReadOptions<'a> {
     repairs: Option<&'a mut [RouteReadRepairState]>,
     read_all: bool,
+    source_ranks: Option<&'a [usize]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1101,14 +1102,19 @@ impl EmbeddedWrhRouteDirectory {
             match self.read_authority_batch(&authority, &batch_keys) {
                 Ok(results) => {
                     for ((index, key), result) in indices.into_iter().zip(batch_keys).zip(results) {
+                        let source_rank = options
+                            .source_ranks
+                            .and_then(|ranks| ranks.get(index))
+                            .copied()
+                            .unwrap_or(rank);
                         match result.map(value_from_authority_record) {
                             Ok(Some(route)) => {
                                 trace!(
                                     namespace = %self.namespace,
                                     key = %key.0,
                                     authority = %authority.runtime,
-                                    rank,
-                                    source = route_read_source(rank, self.route_topk),
+                                    rank = source_rank,
+                                    source = route_read_source(source_rank, self.route_topk),
                                     route_version = route.version().0,
                                     replica_count = match &route { RouteAuthorityValue::Route(route) => route.replicas.len(), RouteAuthorityValue::DeleteMarker(_) => 0 },
                                     "route authority returned object route"
@@ -1122,7 +1128,7 @@ impl EmbeddedWrhRouteDirectory {
                                     debug!(
                                         key = %key.0,
                                         authority = %authority.runtime,
-                                        source = route_read_source(rank, self.route_topk),
+                                        source = route_read_source(source_rank, self.route_topk),
                                         route_version = route.version().0,
                                         replica_count = match &route { RouteAuthorityValue::Route(route) => route.replicas.len(), RouteAuthorityValue::DeleteMarker(_) => 0 },
                                         "sampled route authority object route"
@@ -1703,11 +1709,15 @@ impl EmbeddedWrhRouteDirectory {
                     if observations[index][rank] == PresenceObservation::Unsupported {
                         fallback_keys.push(keys[index].clone());
                         fallback_authorities.push(vec![authority.clone()]);
-                        fallback_targets.push(index);
+                        fallback_targets.push((index, rank));
                     }
                 }
             }
 
+            let fallback_source_ranks = fallback_targets
+                .iter()
+                .map(|(_, rank)| *rank)
+                .collect::<Vec<_>>();
             let mut fallback_resolved = vec![None; fallback_keys.len()];
             let mut fallback_observations =
                 vec![vec![RouteAuthorityObservation::Unobserved]; fallback_keys.len()];
@@ -1719,10 +1729,11 @@ impl EmbeddedWrhRouteDirectory {
                 RouteReadOptions {
                     repairs: Some(fallback_observations.as_mut_slice()),
                     read_all: true,
+                    source_ranks: Some(&fallback_source_ranks),
                 },
                 "contains selective legacy fallback read failed",
             )?;
-            for (work_index, key_index) in fallback_targets.into_iter().enumerate() {
+            for (work_index, (key_index, _)) in fallback_targets.into_iter().enumerate() {
                 if matches!(
                     fallback_observations[work_index][0],
                     RouteAuthorityObservation::Unobserved
@@ -1766,6 +1777,7 @@ impl EmbeddedWrhRouteDirectory {
                 RouteReadOptions {
                     repairs: Some(observations.as_mut_slice()),
                     read_all: true,
+                    source_ranks: None,
                 },
                 "contains validation route batch read failed",
             )?;
@@ -2084,6 +2096,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                 RouteReadOptions {
                     repairs: Some(repairs.as_mut_slice()),
                     read_all: false,
+                    source_ranks: None,
                 },
                 if rank == 0 {
                     "authority route batch read failed; trying mirrored authorities"
@@ -2102,6 +2115,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             RouteReadOptions {
                 repairs: None,
                 read_all: false,
+                source_ranks: None,
             },
             "fallback authority route batch read failed; trying other authorities",
         )? {
@@ -2138,6 +2152,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                 RouteReadOptions {
                     repairs: None,
                     read_all: false,
+                    source_ranks: None,
                 },
                 if rank == 0 {
                     "authority bounded route batch read failed; trying mirrored authorities"
@@ -4596,6 +4611,99 @@ mod owner_page_contract_tests {
         assert_eq!(
             full_queries.lock().as_slice(),
             &[(legacy_id, vec![unsupported_key])]
+        );
+    }
+
+    #[test]
+    fn contains_presence_legacy_fallback_groups_keys_per_authority() {
+        let observer = test_lease("contains-presence-legacy-grouping-observer");
+        let candidates = (0..4)
+            .map(|index| test_lease(&format!("contains-presence-legacy-grouping-{index}")))
+            .collect::<Vec<_>>();
+        let keys = (0..64)
+            .map(|index| ObjectKey::new(format!("contains-presence-legacy-grouping-key-{index}")))
+            .collect::<Vec<_>>();
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let namespace = metadata.route_namespace();
+        let ranked = keys
+            .iter()
+            .map(|key| ranked_top_authorities(&namespace, &candidates, key, 2))
+            .collect::<Vec<_>>();
+        let live_legacy = ranked[0][0].clone();
+        let delete_legacy = ranked[0][1].clone();
+        let expected_fallback_keys = |authority: &ClientLease| {
+            keys.iter()
+                .zip(&ranked)
+                .filter(|(_, authorities)| {
+                    authorities
+                        .iter()
+                        .any(|selected| selected.runtime.stable_id == authority.runtime.stable_id)
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>()
+        };
+        let live_fallback_keys = expected_fallback_keys(&live_legacy);
+        let delete_fallback_keys = expected_fallback_keys(&delete_legacy);
+        assert!(live_fallback_keys.len() > 1);
+        assert!(delete_fallback_keys.len() > 1);
+        let expected = ranked
+            .iter()
+            .map(|authorities| {
+                authorities
+                    .iter()
+                    .any(|authority| authority.runtime.stable_id == live_legacy.runtime.stable_id)
+            })
+            .collect::<Vec<_>>();
+        assert!(expected.iter().any(|present| *present));
+        assert!(expected.iter().any(|present| !*present));
+        let mut live = test_route("contains-presence-legacy-grouping-route", &observer.runtime);
+        live.version = RouteVersion(6);
+        let full_queries = Arc::new(Mutex::new(Vec::new()));
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata,
+            &observer,
+            Arc::new(PresenceConfirmationClient {
+                inner: RecordingConfirmationClient {
+                    routes: BTreeMap::from([(live_legacy.runtime.stable_id.0.clone(), Some(live))]),
+                    delete_versions: BTreeMap::from([(
+                        delete_legacy.runtime.stable_id.0.clone(),
+                        Some(RouteVersion(5)),
+                    )]),
+                    read_failures: BTreeSet::new(),
+                    queried_authorities: Arc::new(Mutex::new(Vec::new())),
+                },
+                presence_queries: Arc::new(Mutex::new(Vec::new())),
+                full_queries: Some(full_queries.clone()),
+                item_unsupported: BTreeSet::new(),
+                item_failures: BTreeSet::new(),
+                malformed: false,
+                contains_present: true,
+                unsupported: BTreeSet::from([
+                    live_legacy.runtime.stable_id.0.clone(),
+                    delete_legacy.runtime.stable_id.0.clone(),
+                ]),
+            }),
+            Arc::new(TestMembership { leases: candidates }),
+        );
+
+        assert_eq!(
+            directory
+                .contains_object_routes_bounded(&observer, &keys)
+                .unwrap(),
+            expected
+        );
+        let queries = full_queries.lock();
+        assert_eq!(queries.len(), 2);
+        let queries = queries.iter().cloned().collect::<BTreeMap<_, _>>();
+        assert_eq!(queries.len(), 2);
+        assert_eq!(
+            queries.get(&live_legacy.runtime.stable_id.0),
+            Some(&live_fallback_keys)
+        );
+        assert_eq!(
+            queries.get(&delete_legacy.runtime.stable_id.0),
+            Some(&delete_fallback_keys)
         );
     }
 

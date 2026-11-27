@@ -42,6 +42,8 @@
 #include "peer_access_test.h"
 
 namespace {
+// Simulate a second visible device for cached-mapping tests on one-card hosts.
+constexpr char kPeerPciBusId[] = "ffff:ff:1f.7";
 std::atomic<bool> fail_notifier_record{false};
 std::atomic<CNresult> reject_copy{CN_SUCCESS};
 std::atomic<CNresult> reject_peer_copy{CN_SUCCESS};
@@ -65,6 +67,17 @@ int forced_pinned_frees = 0;
 std::function<void()> before_copy, before_record, before_inline,
     after_idle_query;
 }  // namespace
+
+extern "C" cnrtRet_t __real_cnrtDeviceGetByPCIBusId(int *, const char *);
+extern "C" cnrtRet_t __wrap_cnrtDeviceGetByPCIBusId(int *device,
+                                                    const char *pci) {
+    if (std::strcmp(pci, kPeerPciBusId) == 0) {
+        *device = 1;
+        return cnrtSuccess;
+    }
+    if (std::strcmp(pci, "ffff:ff:1f.6") == 0) return cnrtErrorDeviceInvalid;
+    return __real_cnrtDeviceGetByPCIBusId(device, pci);
+}
 
 extern "C" cnrtRet_t __real_cnrtMapMemHandle(void **, cnrtIpcMemHandle, int);
 extern "C" cnrtRet_t __wrap_cnrtMapMemHandle(void **ptr,
@@ -231,13 +244,20 @@ namespace {
 constexpr size_t kChunk = 64ul << 10;  // 64 KiB
 constexpr size_t kBufSize = 3 * kChunk;
 
-BufferDesc ipcBuffer(uint64_t base, uint64_t size, uint64_t handle) {
+std::string pciBusId(int device) {
+    char pci[32] = {};
+    EXPECT_EQ(cnrtDeviceGetPCIBusId(pci, sizeof(pci), device), cnrtSuccess);
+    return pci;
+}
+
+BufferDesc ipcBuffer(uint64_t base, uint64_t size, uint64_t handle,
+                     const std::string &pci = pciBusId(0)) {
     BufferDesc buffer{};
     buffer.addr = base;
     buffer.length = size;
-    buffer.transport_attrs[MLU] = std::to_string(base) + ':' +
-                                  std::to_string(size) + ':' +
-                                  std::to_string(handle) + ":0";
+    buffer.transport_attrs[MLU] = std::to_string(base) + '|' +
+                                  std::to_string(size) + '|' +
+                                  std::to_string(handle) + '|' + pci;
     return buffer;
 }
 
@@ -426,9 +446,8 @@ TEST_F(MluTransportTest, CachedIpcMappingMustBeAccessibleForThisCopy) {
     ASSERT_NO_FATAL_FAILURE(allocDevice(&target, kChunk));
     std::vector<uint8_t> host_source(kChunk);
     constexpr SegmentID target_id = 42;
-    auto entry = ipcBuffer(0x1000, kChunk, 101);
     // Model a cached export from another device, even on single-device hosts.
-    entry.transport_attrs[MLU] = "4096:" + std::to_string(kChunk) + ":101:1";
+    auto entry = ipcBuffer(0x1000, kChunk, 101, kPeerPciBusId);
     auto segment = ipcSnapshot(10, {entry});
     MluTransportTestPeer::seedImportCache(
         transport_, target_id,
@@ -455,10 +474,9 @@ TEST_F(MluTransportTest, CachedIpcMappingChecksActualCopyDirection) {
     ASSERT_NO_FATAL_FAILURE(allocDevice(&source, kChunk));
     ASSERT_NO_FATAL_FAILURE(allocDevice(&target, kChunk));
     constexpr SegmentID target_id = 42;
-    auto entry = ipcBuffer(0x1000, kChunk, 101);
     // The cached mapping is real device-0 memory; only its exported device
     // and accessibility are simulated, so one physical device is sufficient.
-    entry.transport_attrs[MLU] = "4096:" + std::to_string(kChunk) + ":101:1";
+    auto entry = ipcBuffer(0x1000, kChunk, 101, kPeerPciBusId);
     auto segment = ipcSnapshot(1, {entry});
     MluTransportTestPeer::seedImportCache(
         transport_, target_id,
@@ -483,6 +501,44 @@ TEST_F(MluTransportTest, CachedIpcMappingChecksActualCopyDirection) {
     transport_.closeRemoteSegment(target_id);
     EXPECT_TRUE(loader_->free(source, kChunk).ok());
     EXPECT_TRUE(loader_->free(target, kChunk).ok());
+}
+
+TEST_F(MluTransportTest, RejectsLegacyAndMalformedIpcAttributesBeforeMapping) {
+    constexpr SegmentID target_id = 42;
+    MluTransportTestPeer::seedImportCache(transport_, target_id, {}, 0);
+    std::vector<uint8_t> source(kChunk);
+    stub_ipc_mapping = source.data();
+    const int maps_before = ipc_map_calls;
+    for (const auto *text :
+         {"4096:65536:101:0", "2|4096|65536|101|0000:11:00.0", "4096|65536|101",
+          "4096|65536|101|", "4096|65536|0|0000:11:00.0",
+          "4096|0|101|0000:11:00.0", "invalid|65536|101|0000:11:00.0",
+          "4096|65536|101|0000:11:00.0|extra"}) {
+        SCOPED_TRACE(text);
+        auto entry = ipcBuffer(0x1000, kChunk, 101);
+        entry.transport_attrs[MLU] = text;
+        auto segment = ipcSnapshot(1, {entry});
+        EXPECT_TRUE(transport_.mayMapRemoteBuffer(target_id, segment, entry));
+        EXPECT_FALSE(transport_.prepareRemoteBuffer(
+            target_id, segment, entry, source.data(), Request::WRITE));
+    }
+    EXPECT_EQ(ipc_map_calls.load(), maps_before);
+}
+
+TEST_F(MluTransportTest, UnresolvableIpcOwnerDoesNotAttemptMapping) {
+    constexpr SegmentID target_id = 42;
+    MluTransportTestPeer::seedImportCache(transport_, target_id, {}, 0);
+    auto entry = ipcBuffer(0x1000, kChunk, 101, "ffff:ff:1f.6");
+    auto segment = ipcSnapshot(1, {entry});
+    std::vector<uint8_t> source(kChunk);
+    stub_ipc_mapping = source.data();
+    const int maps_before = ipc_map_calls;
+    ASSERT_TRUE(transport_.mayMapRemoteBuffer(target_id, segment, entry));
+    for (auto opcode : {Request::WRITE, Request::READ}) {
+        EXPECT_FALSE(transport_.prepareRemoteBuffer(target_id, segment, entry,
+                                                    source.data(), opcode));
+    }
+    EXPECT_EQ(ipc_map_calls.load(), maps_before);
 }
 
 TEST_F(MluTransportTest, RestrictedBuffersDoNotExportIpcHandle) {
@@ -892,8 +948,7 @@ class MluIpcDeviceStateTest : public MluCrossContextTest,
 
 TEST_P(MluIpcDeviceStateTest, RestoresRuntimeDeviceAndDriverContext) {
     constexpr SegmentID target_id = 42;
-    auto entry = ipcBuffer(0x1000, kChunk, 101);
-    entry.transport_attrs[MLU] = "4096:" + std::to_string(kChunk) + ":101:1";
+    auto entry = ipcBuffer(0x1000, kChunk, 101, pciBusId(1));
     auto snapshot = ipcSnapshot(1, {entry});
     MluTransportTestPeer::seedImportCache(transport_, target_id, {}, 0);
     std::vector<uint8_t> source(kChunk);
