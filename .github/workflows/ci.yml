@@ -70,11 +70,13 @@ jobs:
             - 'mooncake-store/**'
             - 'mooncake-transfer-engine/**'
             - 'mooncake-wheel/**'
+            - 'python/**'
             - 'extern/**'
             - 'cmake/**'
             - 'CMakeLists.txt'
             - 'dependencies.sh'
             - 'scripts/build_wheel.sh'
+            - 'scripts/smoke_conductor_wheel.py'
             - 'scripts/test_installation.sh'
             - 'scripts/run_standalone_store_e2e.sh'
             - 'scripts/test_upsert_api.py'
@@ -128,9 +130,6 @@ jobs:
             - 'docs/**'
             - '.github/workflows/ci.yml'
 
-    - name: Spell Check Repo
-      uses: crate-ci/typos@v1.30.2
-
     - name: Set up Python 3.10 and 3.12
       uses: actions/setup-python@v5
       with:
@@ -147,7 +146,40 @@ jobs:
           numpy pytest msgpack hypothesis==6.141.0
       shell: bash
 
+    - name: Resolve base ref
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BASE_REF: ${{ github.base_ref }}
+        EVENT_BEFORE: ${{ github.event.before }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: |
+        if [ "${EVENT_NAME}" = "pull_request" ]; then
+          # For PRs: compare against the target branch.
+          base_ref="origin/${PR_BASE_REF}"
+        elif [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+          # Manual runs have no previous push SHA.
+          base_ref="origin/${DEFAULT_BRANCH}"
+        elif [ "${EVENT_BEFORE}" = "0000000000000000000000000000000000000000" ]; then
+          # New branch push, compare against default branch.
+          base_ref="origin/${DEFAULT_BRANCH}"
+        elif [ -n "${EVENT_BEFORE}" ]; then
+          # Normal push (single or multiple commits).
+          base_ref="${EVENT_BEFORE}"
+        else
+          base_ref="HEAD^"
+        fi
+        echo "Comparing against: ${base_ref}"
+        echo "BASE_REF=${base_ref}" >> "$GITHUB_ENV"
+      shell: bash
+
+    - name: Spell Check Repo
+      id: typos
+      continue-on-error: true
+      uses: crate-ci/typos@v1.30.2
+
     - name: Check code format
+      id: code_format
+      continue-on-error: true
       run: |
         # Check script exists and is executable
         if [[ ! -x ./scripts/code_format.sh ]]; then
@@ -155,45 +187,15 @@ jobs:
           exit 1
         fi
 
-        # Determine base ref for comparison
-        if [ "${{ github.event_name }}" == "pull_request" ]; then
-          # For PRs: compare against the target branch
-          BASE_REF="origin/${{ github.base_ref }}"
-        elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-          # Manual runs have no previous push SHA.
-          BASE_REF="origin/${{ github.event.repository.default_branch }}"
-        else
-          # For push events: use github.event.before to handle multi-commit pushes
-          BEFORE_SHA="${{ github.event.before }}"
-          if [ "${BEFORE_SHA}" == "0000000000000000000000000000000000000000" ]; then
-            # New branch push, compare against default branch
-            BASE_REF="origin/${{ github.event.repository.default_branch }}"
-          else
-            # Normal push (single or multiple commits)
-            BASE_REF="${BEFORE_SHA}"
-          fi
-        fi
-        echo "Comparing against: ${BASE_REF}"
         ./scripts/code_format.sh --check --changed-lines --base "${BASE_REF}"
       shell: bash
 
     - name: Check changed Python files
+      id: python_checks
+      continue-on-error: true
       run: |
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          base_ref="origin/${{ github.base_ref }}"
-        elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-          base_ref="origin/${{ github.event.repository.default_branch }}"
-        elif [ "${{ github.event.before }}" = \
-               "0000000000000000000000000000000000000000" ]; then
-          base_ref="origin/${{ github.event.repository.default_branch }}"
-        elif [ -n "${{ github.event.before }}" ]; then
-          base_ref="${{ github.event.before }}"
-        else
-          base_ref="HEAD^"
-        fi
-
         mapfile -d '' python_files < <(
-          git diff --name-only --diff-filter=ACMR -z "$base_ref"...HEAD -- \
+          git diff --name-only --diff-filter=ACMR -z "${BASE_REF}"...HEAD -- \
             '*.py' \
             ':(exclude)extern/**' \
             ':(exclude)FAST25-release/**'
@@ -203,39 +205,91 @@ jobs:
           exit 0
         fi
 
-        ruff check "${python_files[@]}"
+        status=0
+        ruff check "${python_files[@]}" || status=1
         python scripts/ci/check_changed_python_format.py \
-          "$base_ref" "${python_files[@]}"
+          "${BASE_REF}" "${python_files[@]}" || status=1
+        exit "$status"
       shell: bash
 
     - name: Check canonical reshard contract types
+      id: reshard_types
+      continue-on-error: true
       run: bash scripts/check_reshard_types.sh
       shell: bash
 
     - name: Run focused release gate tests
+      id: release_gate_tests
+      continue-on-error: true
       run: python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
       shell: bash
 
     - name: Test CI service and smoke scripts
+      id: ci_script_tests
+      continue-on-error: true
       run: python -m unittest discover -s scripts/ci/tests -v
       shell: bash
 
     - name: Run focused shell regression tests
+      id: shell_regression_tests
+      continue-on-error: true
       run: |
-        bash scripts/tone_tests/tests/test_common_cleanup.sh
-        python3 -m unittest discover -s scripts/tone_tests/tests -p 'test_*.py'
+        status=0
+        bash scripts/tone_tests/tests/test_common_cleanup.sh || status=1
+        python3 -m unittest discover -s scripts/tone_tests/tests -p 'test_*.py' || status=1
+        exit "$status"
       shell: bash
 
     - name: Run CPU table, facade and range-plan contracts without a native build
+      id: engram_contracts
+      continue-on-error: true
       env:
         # mooncake-wheel holds the pure-Python modules the installed wheel
         # merges into the package, such as mooncake._partial_read.
         PYTHONPATH: ${{ github.workspace }}/python:${{ github.workspace }}/mooncake-wheel
       run: |
+        status=0
         for py in python3.10 python3.12; do
           echo "=== Running Engram CPU contracts with ${py} ==="
-          "${py}" -m pytest -q scripts/test_engram_tables.py python/tests/store/test_facade.py python/tests/store/test_structured_ranges_properties.py
+          "${py}" -m pytest -q scripts/test_engram_tables.py python/tests/store/test_facade.py python/tests/store/test_structured_ranges_properties.py || status=1
         done
+        exit "$status"
+      shell: bash
+
+    - name: Verify fast-checks results
+      env:
+        TYPOS_OUTCOME: ${{ steps.typos.outcome }}
+        CODE_FORMAT_OUTCOME: ${{ steps.code_format.outcome }}
+        PYTHON_CHECKS_OUTCOME: ${{ steps.python_checks.outcome }}
+        RESHARD_TYPES_OUTCOME: ${{ steps.reshard_types.outcome }}
+        RELEASE_GATE_TESTS_OUTCOME: ${{ steps.release_gate_tests.outcome }}
+        CI_SCRIPT_TESTS_OUTCOME: ${{ steps.ci_script_tests.outcome }}
+        SHELL_REGRESSION_TESTS_OUTCOME: ${{ steps.shell_regression_tests.outcome }}
+        ENGRAM_CONTRACTS_OUTCOME: ${{ steps.engram_contracts.outcome }}
+      run: |
+        failed=()
+        check_outcome() {
+          local label="$1" outcome="$2"
+          echo "${label}: ${outcome}"
+          if [ "${outcome}" != "success" ]; then
+            echo "::error::${label} did not succeed (outcome: ${outcome})"
+            failed+=("${label}")
+          fi
+        }
+
+        check_outcome "Spell Check Repo" "${TYPOS_OUTCOME}"
+        check_outcome "Check code format" "${CODE_FORMAT_OUTCOME}"
+        check_outcome "Check changed Python files" "${PYTHON_CHECKS_OUTCOME}"
+        check_outcome "Check canonical reshard contract types" "${RESHARD_TYPES_OUTCOME}"
+        check_outcome "Run focused release gate tests" "${RELEASE_GATE_TESTS_OUTCOME}"
+        check_outcome "Test CI service and smoke scripts" "${CI_SCRIPT_TESTS_OUTCOME}"
+        check_outcome "Run focused shell regression tests" "${SHELL_REGRESSION_TESTS_OUTCOME}"
+        check_outcome "Run CPU table, facade and range-plan contracts" "${ENGRAM_CONTRACTS_OUTCOME}"
+
+        if [ "${#failed[@]}" -gt 0 ]; then
+          echo "Failed fast-checks (${#failed[@]}): ${failed[*]}"
+          exit 1
+        fi
       shell: bash
 
   # Build the artifact tested below through the exact release wheel path. The
@@ -526,7 +580,6 @@ jobs:
           -DBUILD_EXAMPLES=OFF \
           -DENABLE_DEBUG_SYMBOLS=OFF \
           -DCMAKE_PROJECT_INCLUDE="$GITHUB_WORKSPACE/scripts/ci/cmake_lld.cmake" \
-          -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache \
           -DENABLE_SCCACHE=ON
       shell: bash
 
