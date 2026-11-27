@@ -210,7 +210,10 @@ class EngramCoordinator {
                         "Previous Engram node incarnation is still leased",
                         true);
                 }
-                if (!group.rebuilding) {
+                // A second crash in this generation starts a new rebuild;
+                // members adopting an earlier rebuild share its generation.
+                if (!group.rebuilding ||
+                    member.generation == group.generation) {
                     ++group.generation;
                     group.records.clear();
                     group.rebuilding = true;

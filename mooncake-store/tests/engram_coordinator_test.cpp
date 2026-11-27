@@ -96,6 +96,84 @@ TEST(EngramCoordinator, RestartPreservesShardAndFencesWholeGroup) {
     EXPECT_FALSE(coordinator.Handle(read, now).found);
 }
 
+TEST(EngramCoordinator, SecondCrashDuringRebuildFencesWholeGroup) {
+    for (const std::string mode : {"auto", "manual"}) {
+        SCOPED_TRACE(mode);
+        EngramCoordinator coordinator;
+        auto now = std::chrono::steady_clock::now();
+        auto a = Join("a", 3);
+        auto b = Join("b", 3);
+        auto c = Join("c", 3);
+        a.mode = b.mode = c.mode = mode;
+        a.group = b.group = c.group = "rebuilding-group";
+        a.shard = 0;
+        b.shard = 1;
+        c.shard = 2;
+        auto initial = coordinator.Handle(a, now);
+        ASSERT_TRUE(initial.error.empty());
+        ASSERT_TRUE(coordinator.Handle(b, now).error.empty());
+        ASSERT_TRUE(coordinator.Handle(c, now).full);
+
+        now += std::chrono::seconds(11);
+        a.incarnation = "launch-2";
+        auto first = coordinator.Handle(a, now);
+        ASSERT_TRUE(first.error.empty());
+        ASSERT_EQ(first.generation, initial.generation + 1);
+        EXPECT_FALSE(first.full);
+        b.incarnation = "launch-2";
+        auto peer = coordinator.Handle(b, now);
+        ASSERT_TRUE(peer.error.empty());
+        ASSERT_EQ(peer.generation, first.generation);
+        EXPECT_FALSE(peer.full);
+
+        // Exercise the control API directly while c has not rejoined yet.
+        auto record = a;
+        record.action = "put";
+        record.boot = first.boot;
+        record.generation = first.generation;
+        record.key = "layer/caller/member";
+        record.value = "old address";
+        ASSERT_TRUE(coordinator.Handle(record, now).error.empty());
+        a.incarnation = "launch-3";
+        EXPECT_TRUE(coordinator.Handle(a, now).retry);
+        now += std::chrono::seconds(11);
+        auto second = coordinator.Handle(a, now);
+        ASSERT_TRUE(second.error.empty());
+        EXPECT_EQ(second.generation, first.generation + 1);
+        EXPECT_EQ(second.group, initial.group);
+        EXPECT_EQ(second.shard, initial.shard);
+        EXPECT_FALSE(second.full);
+
+        auto heartbeat = b;
+        heartbeat.action = "heartbeat";
+        heartbeat.boot = peer.boot;
+        heartbeat.generation = peer.generation;
+        EXPECT_FALSE(coordinator.Handle(heartbeat, now).error.empty());
+        record.incarnation = a.incarnation;
+        record.generation = second.generation;
+        record.action = "get";
+        auto cleared = coordinator.Handle(record, now);
+        ASSERT_TRUE(cleared.error.empty());
+        EXPECT_FALSE(cleared.found);
+        record.action = "put";
+        record.value = "new address";
+        EXPECT_TRUE(coordinator.Handle(record, now).error.empty());
+
+        // Other members adopt this recovery wave without another bump.
+        b.incarnation = "launch-3";
+        auto rebuilt_b = coordinator.Handle(b, now);
+        ASSERT_TRUE(rebuilt_b.error.empty());
+        EXPECT_EQ(rebuilt_b.generation, second.generation);
+        EXPECT_EQ(rebuilt_b.shard, peer.shard);
+        EXPECT_FALSE(rebuilt_b.full);
+        c.incarnation = "launch-2";
+        auto rebuilt_c = coordinator.Handle(c, now);
+        ASSERT_TRUE(rebuilt_c.error.empty());
+        EXPECT_EQ(rebuilt_c.generation, second.generation);
+        EXPECT_TRUE(rebuilt_c.full);
+    }
+}
+
 TEST(EngramCoordinator, ExpiredOwnerCannotCompleteAGroupForANewNode) {
     for (const std::string mode : {"auto", "manual"}) {
         EngramCoordinator coordinator;
