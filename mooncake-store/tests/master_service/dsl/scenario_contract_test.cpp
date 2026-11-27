@@ -123,7 +123,7 @@ static_assert(SupportsThen<ReadableObjects>);
 
 MasterServiceConfig ContractOffloadConfig() {
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     config.default_kv_lease_ttl = 0;
     return config;
 }

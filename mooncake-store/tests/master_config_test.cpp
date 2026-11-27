@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 namespace mooncake::test {
 namespace {
 
@@ -90,6 +92,66 @@ TEST(HALeaseTtlConfigTest, SupervisorConfigCarriesMasterConfigTtl) {
     const MasterServiceSupervisorConfig supervisor_config(master_config);
 
     EXPECT_EQ(17, supervisor_config.ha_leader_lease_ttl_sec);
+}
+
+TEST(OffloadConfigTest, ConfigSurvivesAdaptersAndValidates) {
+    MasterConfig master{};
+    master.enable_offload = true;
+    master.offload_on_evict = true;
+    master.offload_force_evict = true;
+    master.offloading_queue_limit = 4096;
+    master.offload_cap_ratio = 0.25;
+
+    WrappedMasterServiceConfig wrapped(master, 0);
+    MasterServiceConfig service(wrapped);
+    EXPECT_TRUE(service.offload_config.enable_offload);
+    EXPECT_TRUE(service.offload_config.offload_on_evict);
+    EXPECT_TRUE(service.offload_config.offload_force_evict);
+    EXPECT_EQ(service.offload_config.offloading_queue_limit, 4096u);
+    EXPECT_DOUBLE_EQ(service.offload_config.offload_cap_ratio, 0.25);
+    EXPECT_NO_THROW(service.Validate());
+    EXPECT_EQ(service.offload_config.OffloadCap(), 1024);
+    EXPECT_TRUE(service.offload_config.ShouldOffloadOnEvict());
+    EXPECT_FALSE(service.offload_config.ShouldOffloadOnPutEnd());
+
+    {
+        OffloadConfig put_end_cfg = service.offload_config;
+        put_end_cfg.offload_on_evict = false;
+        EXPECT_FALSE(put_end_cfg.ShouldOffloadOnEvict());
+        EXPECT_TRUE(put_end_cfg.ShouldOffloadOnPutEnd());
+    }
+    {
+        OffloadConfig disabled_cfg = service.offload_config;
+        disabled_cfg.enable_offload = false;
+        EXPECT_FALSE(disabled_cfg.ShouldOffloadOnEvict());
+        EXPECT_FALSE(disabled_cfg.ShouldOffloadOnPutEnd());
+    }
+
+    // Invalid offload values fail config validation directly.
+    {
+        MasterServiceConfig bad = service;
+        bad.offload_config.offload_cap_ratio = 1.5;
+        EXPECT_THROW(bad.Validate(), std::invalid_argument);
+    }
+    {
+        MasterServiceConfig bad = service;
+        bad.offload_config.offload_cap_ratio =
+            std::numeric_limits<double>::quiet_NaN();
+        EXPECT_THROW(bad.Validate(), std::invalid_argument);
+    }
+    {
+        MasterServiceConfig bad = service;
+        bad.offload_config.offloading_queue_limit = 0;
+        EXPECT_THROW(bad.Validate(), std::invalid_argument);
+    }
+
+    // Supervisor config validation rejects invalid offload knobs.
+    {
+        MasterConfig bad_master{};
+        bad_master.offload_cap_ratio = -0.1;
+        EXPECT_THROW((void)MasterServiceSupervisorConfig(bad_master),
+                     std::invalid_argument);
+    }
 }
 
 }  // namespace

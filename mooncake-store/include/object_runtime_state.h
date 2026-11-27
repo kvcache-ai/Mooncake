@@ -39,16 +39,7 @@ struct ReplicationTask {
     uint64_t dynamic_replication_version_epoch{0};
     bool durable_cleanup_pending{false};
     std::optional<ReplicaID> existing_move_target{};
-};
-
-struct OffloadingTask {
-    ReplicaID source_id;
-    std::chrono::system_clock::time_point start_time;
-    // Clients whose LocalDiskSegment::offloading_objects hold a mirror
-    // for this key. One marker can cover several mirrors, since the
-    // offload is pushed once per completed MEMORY replica and those
-    // replicas may live on different clients.
-    std::vector<UUID> mirror_clients;
+    ReplicaPin source_pin{};
 };
 
 // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
@@ -125,6 +116,8 @@ struct PromotionTask {
     // SSD prefetch admission. NotifyPromotionSuccess grants a read lease
     // so the promoted replica survives until the follow-up get.
     bool from_prefetch{false};
+    // RAII pin on the source LOCAL_DISK replica; auto-unpins when erased.
+    ReplicaPin source_pin{};
 };
 
 }  // namespace mooncake

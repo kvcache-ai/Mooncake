@@ -8,6 +8,7 @@
 // It reads like std::optional<T> (has_value, *, ->, emplace, reset, assigning
 // a T) and copies its value like one. Engaging it allocates.
 
+#include <concepts>
 #include <memory>
 #include <type_traits>
 #include <utility>
@@ -19,9 +20,12 @@ class HeapOptional {
    public:
     HeapOptional() = default;
     HeapOptional(const HeapOptional& other)
+        requires std::copy_constructible<T>
         : value_(other.value_ ? std::make_unique<T>(*other.value_) : nullptr) {}
     HeapOptional(HeapOptional&&) noexcept = default;
-    HeapOptional& operator=(const HeapOptional& other) {
+    HeapOptional& operator=(const HeapOptional& other)
+        requires std::copy_constructible<T>
+    {
         if (this != &other) {
             value_ =
                 other.value_ ? std::make_unique<T>(*other.value_) : nullptr;

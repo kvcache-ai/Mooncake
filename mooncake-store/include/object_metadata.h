@@ -538,6 +538,69 @@ struct ObjectMetadata {
 
     bool IsGrouped() const { return !group_id.empty(); }
 
+    // Reconcile the process-global memory/file cache-object counts with the
+    // object's currently completed replicas.
+    void SyncCacheTotalAccounting() {
+        const bool has_memory_cache_replica =
+            HasReplica([](const Replica& replica) {
+                return replica.is_memory_replica() && replica.is_completed();
+            });
+        const bool has_disk_cache_replica =
+            HasReplica([](const Replica& replica) {
+                return (replica.is_disk_replica() ||
+                        replica.is_local_disk_replica()) &&
+                       replica.is_completed();
+            });
+
+        if (!memory_cache_total_accounted && has_memory_cache_replica) {
+            MasterMetricManager::instance().inc_mem_cache_nums();
+            memory_cache_total_accounted = true;
+        } else if (memory_cache_total_accounted && !has_memory_cache_replica) {
+            MasterMetricManager::instance().dec_mem_cache_nums();
+            memory_cache_total_accounted = false;
+        }
+
+        if (!disk_cache_total_accounted && has_disk_cache_replica) {
+            MasterMetricManager::instance().inc_file_cache_nums();
+            disk_cache_total_accounted = true;
+        } else if (disk_cache_total_accounted && !has_disk_cache_replica) {
+            MasterMetricManager::instance().dec_file_cache_nums();
+            disk_cache_total_accounted = false;
+        }
+    }
+
+    // Inserts `replica` if no LOCAL_DISK replica exists yet, or updates the
+    // matching client's LOCAL_DISK replica fields in place. Returns true if a
+    // new LOCAL_DISK replica was inserted.
+    bool ApplyLocalDiskReplica(const UUID& client_id, Replica& replica) {
+        if (!HasReplica(&Replica::fn_is_local_disk_replica)) {
+            std::vector<Replica> replicas;
+            replicas.emplace_back(std::move(replica));
+            AddReplicas(std::move(replicas));
+            SyncCacheTotalAccounting();
+            return true;
+        }
+        VisitReplicas(
+            [client_id](const Replica& rep) {
+                return rep.type() == ReplicaType::LOCAL_DISK &&
+                       rep.get_descriptor()
+                               .get_local_disk_descriptor()
+                               .client_id == client_id;
+            },
+            [&replica](Replica& rep) {
+                rep.get_descriptor()
+                    .get_local_disk_descriptor()
+                    .transport_endpoint = replica.get_descriptor()
+                                              .get_local_disk_descriptor()
+                                              .transport_endpoint;
+                rep.get_descriptor().get_local_disk_descriptor().object_size =
+                    replica.get_descriptor()
+                        .get_local_disk_descriptor()
+                        .object_size;
+            });
+        return false;
+    }
+
     // Check if the metadata is valid
     // Valid means it has at least one valid replica and size is greater
     // than 0

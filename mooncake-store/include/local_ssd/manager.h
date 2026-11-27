@@ -56,6 +56,10 @@ class LocalSsdTaskMailbox {
     friend class LocalSsdManager;
 };
 
+// Client-scoped LocalSSD state plane (peer to SegmentManager): tracks mounted
+// LocalSSD clients, per-client SSD capacity/usage accounting, and per-client
+// offload, promotion, and remove-all mailboxes. Shared by MasterService,
+// OffloadManager, promotion paths, and SSD-aware allocation strategies.
 class LocalSsdManager {
    public:
     struct CapacityChange {
@@ -70,6 +74,7 @@ class LocalSsdManager {
 
     ErrorCode RegisterClient(const UUID& client_id, bool enable_offloading);
     std::optional<int64_t> UnregisterClient(const UUID& client_id);
+    bool HasClient(const UUID& client_id) const;
 
     // UUIDs of all registered LocalSSD clients. Used to rebuild client
     // liveness records after an HA snapshot restore.

@@ -66,5 +66,25 @@ TEST(HeapOptionalTest, MovesTheAllocation) {
     EXPECT_EQ(&*moved, value);
 }
 
+TEST(HeapOptionalTest, SupportsMoveOnlyTypes) {
+    struct MoveOnlyTask {
+        std::unique_ptr<int> payload;
+    };
+    static_assert(!std::is_copy_constructible_v<HeapOptional<MoveOnlyTask>>);
+    static_assert(!std::is_copy_assignable_v<HeapOptional<MoveOnlyTask>>);
+    static_assert(std::is_move_constructible_v<HeapOptional<MoveOnlyTask>>);
+    static_assert(std::is_move_assignable_v<HeapOptional<MoveOnlyTask>>);
+
+    HeapOptional<MoveOnlyTask> task;
+    task.emplace(MoveOnlyTask{std::make_unique<int>(42)});
+    ASSERT_TRUE(task.has_value());
+    EXPECT_EQ(*task->payload, 42);
+
+    HeapOptional<MoveOnlyTask> moved(std::move(task));
+    EXPECT_FALSE(task.has_value());
+    ASSERT_TRUE(moved.has_value());
+    EXPECT_EQ(*moved->payload, 42);
+}
+
 }  // namespace
 }  // namespace mooncake

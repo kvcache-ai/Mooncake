@@ -180,6 +180,11 @@ std::optional<int64_t> LocalSsdManager::UnregisterClient(
     return record->total_capacity_bytes;
 }
 
+bool LocalSsdManager::HasClient(const UUID& client_id) const {
+    std::shared_lock lock(mutex_);
+    return clients_.contains(client_id);
+}
+
 tl::expected<LocalSsdManager::CapacityChange, ErrorCode>
 LocalSsdManager::ReportCapacity(const UUID& client_id, int64_t bytes) {
     if (bytes < 0) {

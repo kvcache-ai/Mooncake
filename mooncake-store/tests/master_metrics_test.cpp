@@ -837,7 +837,7 @@ static std::string PutKeyAndOffload(MasterService& svc, const UUID& client_id,
 TEST_F(MasterMetricsTest, LocalDiskReplicaAllocatedSize) {
     auto& metrics = MasterMetricManager::instance();
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     MasterService svc(config);
 
     constexpr size_t kBuf = 0x400000000;
@@ -873,7 +873,7 @@ TEST_F(MasterMetricsTest, LocalDiskReplicaAllocatedSize) {
 TEST_F(MasterMetricsTest, LocalDiskSegmentCapacityHeartbeat) {
     auto& metrics = MasterMetricManager::instance();
     MasterServiceConfig config;
-    config.enable_offload = true;
+    config.offload_config.enable_offload = true;
     MasterService svc(config);
 
     constexpr size_t kBuf = 0x500000000;
@@ -906,6 +906,18 @@ TEST_F(MasterMetricsTest, LocalDiskSegmentCapacityHeartbeat) {
     // Idempotent: same capacity reported again — gauge must not change.
     ASSERT_TRUE(svc.ReportSsdCapacity(client_id, kCap2).has_value());
     EXPECT_EQ(metrics.get_total_file_capacity(), baseline + kCap2);
+
+    // Zeroing capacity drops the gauge back to baseline; re-reporting restores
+    // it; explicit unmount subtracts the client's reported capacity.
+    ASSERT_TRUE(svc.ReportSsdCapacity(client_id, 0).has_value());
+    EXPECT_EQ(metrics.get_total_file_capacity(), baseline);
+    ASSERT_TRUE(svc.ReportSsdCapacity(client_id, kCap2).has_value());
+    EXPECT_EQ(metrics.get_total_file_capacity(), baseline + kCap2);
+    ASSERT_TRUE(svc.UnmountLocalDiskSegment(client_id).has_value());
+    EXPECT_EQ(metrics.get_total_file_capacity(), baseline);
+    // Second unmount is idempotent and does not underflow the gauge.
+    ASSERT_TRUE(svc.UnmountLocalDiskSegment(client_id).has_value());
+    EXPECT_EQ(metrics.get_total_file_capacity(), baseline);
 }
 
 TEST_F(MasterMetricsTest, PutStartReplicaAllocationFailureMetric) {
