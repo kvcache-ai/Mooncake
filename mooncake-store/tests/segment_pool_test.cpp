@@ -1012,12 +1012,14 @@ TEST(SegmentPoolTest, AdoptRejectsCatalogConflictWithoutReplacingResource) {
     EXPECT_EQ(access.Catalog().Regions().size(), 1U);
 }
 
-TEST(SegmentPoolTest, DestroyedPoolAndRetainedAllocatorRemoveMetricLabels) {
+TEST(SegmentPoolTest, DestroyedPoolAndRetainedAllocatorLabelsFollowProjection) {
     auto& metrics = MasterMetricManager::instance();
+    const std::string name = "retained-allocator-labels";
+    const std::string label = "segment=\"" + name + "\"";
     for (bool retain_allocator : {false, true}) {
         SCOPED_TRACE(retain_allocator);
-        const std::string name = "retained-allocator-labels";
-        const std::string label = "segment=\"" + name + "\"";
+        metrics.project_storage_usage({});
+        EXPECT_EQ(metrics.get_segment_allocated_mem_size(name), 0);
         std::shared_ptr<BufferAllocatorBase> retained;
         std::unique_ptr<AllocatedBuffer> live;
         {
@@ -1030,22 +1032,45 @@ TEST(SegmentPoolTest, DestroyedPoolAndRetainedAllocatorRemoveMetricLabels) {
             ASSERT_NE(allocator, nullptr);
             live = allocator->allocate(4096);
             ASSERT_NE(live, nullptr);
+            // Allocation updates the allocator and its usage tracker, not the
+            // process-lifetime gauge.
+            EXPECT_EQ(metrics.get_segment_allocated_mem_size(name), 0);
             if (retain_allocator) {
                 retained = std::move(allocator);
             }
-            EXPECT_NE(metrics.serialize_metrics().find(label),
-                      std::string::npos);
-        }
-        // The pool released its capacity, but a live allocator still owns
-        // usage under the label, so the label must outlive the pool.
-        EXPECT_EQ(metrics.get_segment_total_mem_capacity(name), 0);
-        if (retain_allocator) {
+
+            const auto usage = pool.GetMemoryUsageSnapshot();
+            EXPECT_EQ(usage.used_bytes, 4096u);
+            EXPECT_EQ(usage.capacity_bytes, kRegionSize);
+            ASSERT_EQ(usage.segments.count(name), 1u);
+            EXPECT_EQ(usage.segments.at(name).used_bytes, 4096u);
+            EXPECT_EQ(usage.segments.at(name).capacity_bytes, kRegionSize);
+
+            TieredStorageUsageSnapshot projected;
+            projected.memory = usage;
+            metrics.project_storage_usage(projected);
             EXPECT_EQ(metrics.get_segment_allocated_mem_size(name), 4096);
+            EXPECT_EQ(metrics.get_segment_total_mem_capacity(name),
+                      static_cast<int64_t>(kRegionSize));
             EXPECT_NE(metrics.serialize_metrics().find(label),
                       std::string::npos);
         }
+
+        // The pool released its capacity synchronously, but the projected
+        // usage keeps the label alive until the next projection because the
+        // retained allocator still owns the bytes.
+        EXPECT_EQ(metrics.get_segment_total_mem_capacity(name), 0);
+        EXPECT_EQ(metrics.get_segment_allocated_mem_size(name), 4096);
+        EXPECT_NE(metrics.serialize_metrics().find(label), std::string::npos);
+        if (retain_allocator) {
+            EXPECT_EQ(retained->size(), 4096u);
+        }
+
         retained.reset();
         live.reset();
+        // Nothing owns the segment any more. Projecting the empty service
+        // snapshot removes the per-segment labels.
+        metrics.project_storage_usage({});
         EXPECT_EQ(metrics.get_segment_allocated_mem_size(name), 0);
         EXPECT_EQ(metrics.get_segment_total_mem_capacity(name), 0);
         EXPECT_EQ(metrics.serialize_metrics().find(label), std::string::npos);

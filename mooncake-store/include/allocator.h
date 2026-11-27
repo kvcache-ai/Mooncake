@@ -383,7 +383,6 @@ class CachelibBufferAllocator
     const size_t total_size_;
     const std::string transport_endpoint_;
     const std::string transport_protocol_;
-    const ReplicaType replica_type_;
 
     // metrics - removed allocated_bytes_ member
     // ylt::metric::gauge_t* allocated_bytes_{nullptr};
@@ -462,7 +461,6 @@ class OffsetBufferAllocator
     const size_t total_size_;
     const std::string transport_endpoint_;
     const std::string transport_protocol_;
-    const ReplicaType replica_type_;
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;

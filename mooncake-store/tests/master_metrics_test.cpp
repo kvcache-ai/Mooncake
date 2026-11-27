@@ -185,9 +185,16 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ReplicateConfig config;
     config.replica_num = 1;
 
+    // Allocation gauges are an observability projection, so refresh them from
+    // the authoritative service snapshot before every storage assertion.
+    auto refresh_storage = [&] {
+        metrics.project_storage_usage(service_.GetStorageUsageSnapshot());
+    };
+
     // Test MountSegment request
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
+    refresh_storage();
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), kSegmentSize);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
@@ -201,6 +208,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
         service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result1.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
+    refresh_storage();
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
               value_length);
@@ -210,6 +218,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
         service_.PutRevoke(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_revoke_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 0);
+    refresh_storage();
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
     ASSERT_EQ(metrics.get_put_revoke_requests(), 1);
@@ -220,6 +229,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
         service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result2.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
+    refresh_storage();
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
               value_length);
@@ -229,6 +239,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
         client_id, ObjectMeta{key, std::nullopt}, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
+    refresh_storage();
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
               value_length);
@@ -255,6 +266,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_remove_requests(), 1);
     ASSERT_EQ(metrics.get_remove_failures(), 0);
     ASSERT_EQ(metrics.get_key_count(), 0);
+    refresh_storage();
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
 
@@ -270,6 +282,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_remove_all_requests(), 1);
     ASSERT_EQ(metrics.get_remove_all_failures(), 0);
     ASSERT_EQ(metrics.get_key_count(), 0);
+    refresh_storage();
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
 
@@ -287,18 +300,17 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
 
-    // Unmount removes the segment capacity synchronously, but invalid replica
-    // metadata and its allocation metrics are reclaimed by the background
-    // cleanup worker.
+    // Unmount removes the segment from the projection immediately; the
+    // background cleanup worker still has to drop the invalid replica
+    // metadata.
     const auto cleanup_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while ((metrics.get_key_count() != 0 ||
-            metrics.get_allocated_mem_size() != 0 ||
-            metrics.get_segment_allocated_mem_size(segment.name) != 0) &&
+    while (metrics.get_key_count() != 0 &&
            std::chrono::steady_clock::now() < cleanup_deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     ASSERT_EQ(metrics.get_key_count(), 0);
+    refresh_storage();
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
 }

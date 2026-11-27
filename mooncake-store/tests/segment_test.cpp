@@ -973,9 +973,9 @@ TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {
     EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
     EXPECT_DOUBLE_EQ(usage.used_ratio(), 0.25);
 
-    // Restore global gauges before teardown because allocator and segment
-    // cleanup still emit their matching decrements.
-    metrics.inc_allocated_nof_size("", kAllocationSize);
+    // NOF capacity is still written on mount/unmount, so restore that gauge
+    // before teardown. Allocated bytes need no compensation because allocation
+    // no longer writes that gauge.
     metrics.inc_total_nof_capacity("", kSegmentSize);
     buffer.reset();
     {

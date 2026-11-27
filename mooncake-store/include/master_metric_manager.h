@@ -68,7 +68,10 @@ class MasterMetricManager {
      * @brief Refresh storage gauges from authoritative allocator snapshots.
      *
      * This is an observability projection. Business code must use the domain
-     * snapshots directly and must not read the resulting gauges.
+     * snapshots directly and must not read the resulting gauges. Allocation
+     * and deallocation no longer write the allocated gauges, so allocated
+     * bytes (including standby-restored segments) become visible only after
+     * this projection runs.
      */
     void project_storage_usage(const TieredStorageUsageSnapshot& snapshot);
 
@@ -104,10 +107,11 @@ class MasterMetricManager {
     int64_t get_segment_total_mem_capacity(const std::string& segment);
 
     // Remove per-segment memory labels only when both usage and capacity are
-    // zero. Allocator destruction and capacity release retry cleanup when
-    // retained resources are released. Cleanup is best-effort: the zero check
-    // and removal are not atomic with concurrent updates, avoiding a global
-    // lock on the allocation hot path.
+    // zero. Capacity release retries cleanup after the last mounted reference
+    // goes away. Allocated bytes are owned by project_storage_usage(), which
+    // removes labels for segments absent from the projected snapshot; the
+    // allocation path never writes them. The zero check and removal are
+    // best-effort and not atomic with concurrent projection.
     void remove_segment_metrics(const std::string& segment);
 
     // NoF segment Metrics

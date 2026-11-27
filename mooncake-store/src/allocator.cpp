@@ -9,8 +9,6 @@
 #include <numeric>
 #include <stdexcept>
 
-#include "master_metric_manager.h"
-
 namespace mooncake {
 namespace {
 
@@ -274,13 +272,12 @@ CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
                                                  size_t base, size_t size,
                                                  std::string transport_endpoint,
                                                  std::string transport_protocol,
-                                                 ReplicaType replica_type)
+                                                 ReplicaType)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       transport_endpoint_(std::move(transport_endpoint)),
-      transport_protocol_(std::move(transport_protocol)),
-      replica_type_(replica_type) {
+      transport_protocol_(std::move(transport_protocol)) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
             << " size=" << size;
@@ -311,16 +308,7 @@ CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
             << static_cast<int>(pool_id_);
 }
 
-CachelibBufferAllocator::~CachelibBufferAllocator() {
-    if (replica_type_ == ReplicaType::MEMORY) {
-        MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
-                                                               size());
-        MasterMetricManager::instance().remove_segment_metrics(segment_name_);
-    } else if (replica_type_ == ReplicaType::NOF_SSD) {
-        MasterMetricManager::instance().dec_allocated_nof_size(segment_name_,
-                                                               size());
-    }
-};
+CachelibBufferAllocator::~CachelibBufferAllocator() = default;
 
 std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
     size_t size) {
@@ -345,13 +333,6 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
     VLOG(1) << "allocation_succeeded size=" << size
             << " segment=" << segment_name_ << " address=" << buffer;
     RecordAllocation(size);
-    if (replica_type_ == ReplicaType::MEMORY) {
-        MasterMetricManager::instance().inc_allocated_mem_size(segment_name_,
-                                                               size);
-    } else if (replica_type_ == ReplicaType::NOF_SSD) {
-        MasterMetricManager::instance().inc_allocated_nof_size(segment_name_,
-                                                               size);
-    }
     return std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size);
 }
 
@@ -365,13 +346,6 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
         size_t freed_size =
             handle->size_;  // Store size before handle might become invalid
         RecordDeallocation(freed_size);
-        if (replica_type_ == ReplicaType::MEMORY) {
-            MasterMetricManager::instance().dec_allocated_mem_size(
-                segment_name_, freed_size);
-        } else if (replica_type_ == ReplicaType::NOF_SSD) {
-            MasterMetricManager::instance().dec_allocated_nof_size(
-                segment_name_, freed_size);
-        }
         VLOG(1) << "deallocation_succeeded address=" << handle->buffer_ptr_
                 << " size=" << freed_size << " segment=" << segment_name_;
     } catch (const std::exception& e) {
@@ -384,13 +358,6 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
 std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::adoptImportedBuffer(
     const LiveAllocation& allocation) {
     RecordAllocation(allocation.requested_size);
-    if (replica_type_ == ReplicaType::MEMORY) {
-        MasterMetricManager::instance().inc_allocated_mem_size(
-            segment_name_, allocation.requested_size);
-    } else if (replica_type_ == ReplicaType::NOF_SSD) {
-        MasterMetricManager::instance().inc_allocated_nof_size(
-            segment_name_, allocation.requested_size);
-    }
     return std::make_unique<AllocatedBuffer>(
         shared_from_this(),
         reinterpret_cast<void*>(base_ + allocation.offset_from_base),
@@ -444,13 +411,12 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
                                              size_t base, size_t size,
                                              std::string transport_endpoint,
                                              std::string transport_protocol,
-                                             ReplicaType replica_type)
+                                             ReplicaType)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       transport_endpoint_(std::move(transport_endpoint)),
-      transport_protocol_(std::move(transport_protocol)),
-      replica_type_(replica_type) {
+      transport_protocol_(std::move(transport_protocol)) {
     VLOG(1) << "initializing_offset_buffer_allocator segment_name="
             << segment_name << " base_address=" << reinterpret_cast<void*>(base)
             << " size=" << size;
@@ -484,16 +450,7 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
     }
 }
 
-OffsetBufferAllocator::~OffsetBufferAllocator() {
-    if (replica_type_ == ReplicaType::MEMORY) {
-        MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
-                                                               size());
-        MasterMetricManager::instance().remove_segment_metrics(segment_name_);
-    } else if (replica_type_ == ReplicaType::NOF_SSD) {
-        MasterMetricManager::instance().dec_allocated_nof_size(segment_name_,
-                                                               size());
-    }
-};
+OffsetBufferAllocator::~OffsetBufferAllocator() = default;
 
 std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
     if (!offset_allocator_) {
@@ -530,13 +487,6 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
     }
 
     RecordAllocation(size);
-    if (replica_type_ == ReplicaType::MEMORY) {
-        MasterMetricManager::instance().inc_allocated_mem_size(segment_name_,
-                                                               size);
-    } else if (replica_type_ == ReplicaType::NOF_SSD) {
-        MasterMetricManager::instance().inc_allocated_nof_size(segment_name_,
-                                                               size);
-    }
     return allocated_buffer;
 }
 
@@ -547,13 +497,6 @@ void OffsetBufferAllocator::deallocate(AllocatedBuffer* handle) {
         size_t freed_size = handle->size();
         handle->offset_handle_.reset();
         RecordDeallocation(freed_size);
-        if (replica_type_ == ReplicaType::MEMORY) {
-            MasterMetricManager::instance().dec_allocated_mem_size(
-                segment_name_, freed_size);
-        } else if (replica_type_ == ReplicaType::NOF_SSD) {
-            MasterMetricManager::instance().dec_allocated_nof_size(
-                segment_name_, freed_size);
-        }
         VLOG(1) << "deallocation_succeeded address=" << handle->data()
                 << " size=" << freed_size << " segment=" << segment_name_;
     } catch (const std::exception& e) {

@@ -729,6 +729,92 @@ TEST_F(BufferAllocatorTest, BuffersAdvertiseTheirSegmentsProtocol) {
     EXPECT_EQ(restored->buffers[0]->get_descriptor().protocol_, "rdma");
 }
 
+TEST_F(BufferAllocatorTest, StorageUsageTrackerCrossThreadAccounting) {
+    auto tracker = std::make_shared<StorageUsageTracker>();
+    constexpr uintptr_t kBase = 0x200000000ULL;
+    constexpr size_t kCapacity = 16 * 1024 * 1024;
+    constexpr size_t kAllocSize = 4096;
+
+    // Allocate on one thread and release on another so per-thread stripes
+    // receive asymmetric increments and decrements that must sum to zero.
+    {
+        auto allocator = std::make_shared<OffsetBufferAllocator>(
+            "cross-thread-seg", kBase, kCapacity, "127.0.0.1:50051", "tcp");
+        allocator->AttachUsageTracker(tracker);
+        EXPECT_EQ(tracker->GetUsage().capacity_bytes, kCapacity);
+
+        std::vector<std::unique_ptr<AllocatedBuffer>> buffers(64);
+        std::thread producer([&]() {
+            for (auto& buf : buffers) {
+                buf = allocator->allocate(kAllocSize);
+                ASSERT_NE(buf, nullptr);
+            }
+        });
+        producer.join();
+        EXPECT_EQ(tracker->GetUsage().used_bytes, buffers.size() * kAllocSize);
+
+        std::thread consumer([&]() { buffers.clear(); });
+        consumer.join();
+        EXPECT_EQ(tracker->GetUsage().used_bytes, 0u);
+    }
+    EXPECT_EQ(tracker->GetUsage().used_bytes, 0u);
+    EXPECT_EQ(tracker->GetUsage().capacity_bytes, 0u);
+
+    // Concurrent multi-segment allocations across many threads must sum
+    // accurately across stripes while live and settle to zero when released
+    // from different threads.
+    constexpr size_t kThreads = 16;
+    constexpr size_t kBlocksPerThread = 128;
+    {
+        std::vector<std::shared_ptr<OffsetBufferAllocator>> allocators;
+        allocators.reserve(kThreads);
+        for (size_t i = 0; i < kThreads; ++i) {
+            auto a = std::make_shared<OffsetBufferAllocator>(
+                "sharded-seg-" + std::to_string(i),
+                kBase + (i + 1) * (64ULL * 1024 * 1024), kCapacity,
+                "127.0.0.1:50051", "tcp");
+            a->AttachUsageTracker(tracker);
+            allocators.push_back(std::move(a));
+        }
+        EXPECT_EQ(tracker->GetUsage().capacity_bytes, kThreads * kCapacity);
+
+        std::vector<std::vector<std::unique_ptr<AllocatedBuffer>>> held(
+            kThreads);
+        std::vector<std::thread> producers;
+        producers.reserve(kThreads);
+        for (size_t i = 0; i < kThreads; ++i) {
+            producers.emplace_back([&, i]() {
+                held[i].reserve(kBlocksPerThread);
+                for (size_t k = 0; k < kBlocksPerThread; ++k) {
+                    auto buf = allocators[i]->allocate(kAllocSize);
+                    ASSERT_NE(buf, nullptr);
+                    held[i].push_back(std::move(buf));
+                }
+            });
+        }
+        for (auto& w : producers) {
+            w.join();
+        }
+        EXPECT_EQ(tracker->GetUsage().used_bytes,
+                  kThreads * kBlocksPerThread * kAllocSize);
+
+        // Release each batch from a fresh set of threads so decrements land on
+        // different per-thread stripes than the producers.
+        std::vector<std::thread> consumers;
+        consumers.reserve(kThreads);
+        for (size_t i = 0; i < kThreads; ++i) {
+            consumers.emplace_back(
+                [&, idx = (i + 1) % kThreads]() { held[idx].clear(); });
+        }
+        for (auto& w : consumers) {
+            w.join();
+        }
+        EXPECT_EQ(tracker->GetUsage().used_bytes, 0u);
+    }
+    EXPECT_EQ(tracker->GetUsage().used_bytes, 0u);
+    EXPECT_EQ(tracker->GetUsage().capacity_bytes, 0u);
+}
+
 }  // namespace mooncake
 
 int main(int argc, char** argv) {
