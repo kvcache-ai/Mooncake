@@ -237,97 +237,100 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
         }
     }
 
-    if (chunks.size() > 1) {
+    {
         std::lock_guard<std::mutex> lock(chunk_map_mutex_);
-        std::vector<uint64_t> chunk_addrs;
-        chunk_addrs.reserve(chunks.size());
-        for (const auto& c : chunks) {
-            chunk_addrs.push_back(reinterpret_cast<uint64_t>(c.first));
+        if (chunks.size() > 1) {
+            std::vector<uint64_t> chunk_addrs;
+            chunk_addrs.reserve(chunks.size());
+            for (const auto& c : chunks) {
+                chunk_addrs.push_back(reinterpret_cast<uint64_t>(c.first));
+            }
+            chunk_map_[reinterpret_cast<uint64_t>(addr)] =
+                std::move(chunk_addrs);
+        } else {
+            // A successful registration supersedes any unfinished
+            // unregistration recorded at this addr (mirrors
+            // RdmaTransport::clearPending); a stale entry would otherwise
+            // make the next unregister skip this registration's segments.
+            chunk_map_.erase(reinterpret_cast<uint64_t>(addr));
         }
-        chunk_map_[reinterpret_cast<uint64_t>(addr)] = std::move(chunk_addrs);
     }
 
     return 0;
 }
 
 int UbTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
-    bool found_in_chunk_map = false;
+    return unregisterLocalMemoryInternal(addr, update_metadata,
+                                         /*defer_publish=*/false);
+}
+
+// Single-segment and chunked buffers share one path: remove every chunk's
+// local BufferDesc without publishing, release the URMA segments, publish
+// once, and keep whatever a retry still has to finish in chunk_map_. Removing
+// metadata first and publishing last also means peers never see a BufferDesc
+// whose segment is already gone without the publish being retried.
+int UbTransport::unregisterLocalMemoryInternal(void* addr, bool update_metadata,
+                                               bool defer_publish) {
+    const uint64_t base = reinterpret_cast<uint64_t>(addr);
+    bool tracked = false;
     std::vector<uint64_t> chunk_addrs;
     {
         std::lock_guard<std::mutex> lock(chunk_map_mutex_);
-        auto it = chunk_map_.find(reinterpret_cast<uint64_t>(addr));
+        auto it = chunk_map_.find(base);
         if (it != chunk_map_.end()) {
-            found_in_chunk_map = true;
+            tracked = true;
             chunk_addrs = it->second;
         }
     }
-    if (found_in_chunk_map) {
-        int first_err = 0;
-        std::vector<uint64_t> remaining_chunks;
-        for (uint64_t ca : chunk_addrs) {
-            int rc = metadata_->removeLocalMemoryBuffer(
-                reinterpret_cast<void*>(ca), /*update_metadata=*/false);
-            // On retry after a partial MR/publish failure, already-removed
-            // chunks return ERR_ADDRESS_NOT_REGISTERED; keep going so any
-            // surviving URMA segments can still be unregistered.
-            if (rc && rc != ERR_ADDRESS_NOT_REGISTERED && !first_err) {
-                first_err = rc;
-            }
+    if (!tracked) chunk_addrs.push_back(base);
+
+    int first_err = 0;
+    for (uint64_t ca : chunk_addrs) {
+        int rc = metadata_->removeLocalMemoryBuffer(reinterpret_cast<void*>(ca),
+                                                    /*update_metadata=*/false);
+        if (rc == ERR_ADDRESS_NOT_REGISTERED) {
+            // A tracked chunk lost its BufferDesc on an earlier attempt that
+            // then failed to release its segment; keep going so the retry
+            // reaches it. An untracked address without a BufferDesc is not a
+            // registration base.
+            if (!tracked) return ERR_ADDRESS_NOT_REGISTERED;
+            continue;
         }
-        for (uint64_t ca : chunk_addrs) {
-            bool chunk_failed = false;
-            for (auto& context : context_list_) {
-                int ret = context->unregisterMemoryRegion(ca);
-                if (ret) {
-                    LOG(ERROR) << "UbTransport: failed to unregister chunk "
-                                  "segment at "
-                               << reinterpret_cast<void*>(ca);
-                    chunk_failed = true;
-                    if (!first_err) first_err = ret;
-                }
-            }
-            if (chunk_failed) {
-                remaining_chunks.push_back(ca);
-            }
-        }
-        int pub_err = 0;
-        if (update_metadata) {
-            pub_err = metadata_->updateLocalSegmentDesc();
-            if (pub_err && !first_err) first_err = pub_err;
-        }
-        {
-            std::lock_guard<std::mutex> lock(chunk_map_mutex_);
-            auto it = chunk_map_.find(reinterpret_cast<uint64_t>(addr));
-            if (it != chunk_map_.end()) {
-                if (!remaining_chunks.empty()) {
-                    it->second = std::move(remaining_chunks);
-                } else if (pub_err) {
-                    // All MRs are gone; keep an empty list so a retry only
-                    // republishes metadata without re-touching MRs.
-                    it->second.clear();
-                } else {
-                    chunk_map_.erase(it);
-                }
-            }
-        }
-        return first_err;
+        if (rc && !first_err) first_err = rc;
     }
 
-    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
-    if (rc) return rc;
-    int first_err = 0;
-    for (auto& context : context_list_) {
-        int ret = context->unregisterMemoryRegion((uint64_t)addr);
-        if (ret && !first_err) first_err = ret;
+    std::vector<uint64_t> live_chunks;
+    for (uint64_t ca : chunk_addrs) {
+        bool chunk_failed = false;
+        for (auto& context : context_list_) {
+            int ret = context->unregisterMemoryRegion(ca);
+            if (ret) {
+                LOG(ERROR) << "UbTransport: failed to unregister segment at "
+                           << reinterpret_cast<void*>(ca);
+                chunk_failed = true;
+                if (!first_err) first_err = ret;
+            }
+        }
+        if (chunk_failed) live_chunks.push_back(ca);
     }
-    if (first_err) {
-        // The BufferDesc is already gone, so a plain retry would stop at
-        // removeLocalMemoryBuffer() and leak the surviving URMA segment.
-        // Track it as a single-chunk entry so the retry goes through the
-        // chunked path above, which tolerates the missing metadata.
+
+    int pub_err = 0;
+    if (update_metadata) {
+        pub_err = metadata_->updateLocalSegmentDesc();
+        if (pub_err && !first_err) first_err = pub_err;
+    }
+
+    {
         std::lock_guard<std::mutex> lock(chunk_map_mutex_);
-        chunk_map_[reinterpret_cast<uint64_t>(addr)] = {
-            reinterpret_cast<uint64_t>(addr)};
+        if (!live_chunks.empty()) {
+            chunk_map_[base] = std::move(live_chunks);
+        } else if (pub_err || defer_publish) {
+            // Every segment is gone; only the publish is owed. An empty entry
+            // lets a retry republish without touching segments.
+            chunk_map_[base].clear();
+        } else {
+            chunk_map_.erase(base);
+        }
     }
     return first_err;
 }
@@ -366,20 +369,37 @@ int UbTransport::unregisterLocalMemoryBatch(
     for (auto& addr : addr_list) {
         results.emplace_back(
             std::async(std::launch::async, [this, addr]() -> int {
-                return unregisterLocalMemory(addr, false);
+                return unregisterLocalMemoryInternal(addr, false,
+                                                     /*defer_publish=*/true);
             }));
     }
 
     int first_error = 0;
     for (size_t i = 0; i < addr_list.size(); ++i) {
         int ret = results[i].get();
+        // A batch retry after a partial failure finds the members that were
+        // already finished gone; treat that as done (mirrors
+        // RdmaTransport::unregisterLocalMemoryBatch).
+        if (ret == ERR_ADDRESS_NOT_REGISTERED) continue;
         if (ret) {
             LOG(WARNING) << "UbTransport: Failed to unregister memory: addr "
                          << addr_list[i];
             if (!first_error) first_error = ret;
         }
     }
+    // Publish even on failure so the members that were cleaned up stop being
+    // advertised. Their metadata-only entries are dropped only once the
+    // publish lands, so a retry after a publish failure republishes.
     int metadata_ret = metadata_->updateLocalSegmentDesc();
+    if (!metadata_ret) {
+        std::lock_guard<std::mutex> lock(chunk_map_mutex_);
+        for (void* addr : addr_list) {
+            auto it = chunk_map_.find(reinterpret_cast<uint64_t>(addr));
+            if (it != chunk_map_.end() && it->second.empty()) {
+                chunk_map_.erase(it);
+            }
+        }
+    }
     return first_error ? first_error : metadata_ret;
 }
 
@@ -515,12 +535,32 @@ Status UbTransport::submitTransferTask(
     const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark =
         globalConfig().max_wr * globalConfig().num_jetty_per_ep;
-    uint64_t nr_slices = 0;
+    size_t pending_slice_count = 0;
 
     auto fail_unposted_slices = [&]() {
         for (auto& entry : slices_to_post)
             for (auto* slice : entry.second) slice->markFailed();
         slices_to_post.clear();
+    };
+    // A task that cannot be fully submitted, and every task after it, gets a
+    // zero-length failed slice so the success + failed == slice_count check in
+    // getTransferStatus() reports FAILED rather than COMPLETED for an empty or
+    // partially flushed task (mirrors RdmaTransport::submitTransferTask).
+    // ~TransferTask() reclaims the slice through slice_list.
+    auto fail_tasks_from = [&](size_t first_task_index) {
+        fail_unposted_slices();
+        for (size_t i = first_task_index; i < task_list.size(); ++i) {
+            auto& task = *task_list[i];
+            Slice* slice = getSliceCache().allocate();
+            assert(slice);
+            slice->source_addr = nullptr;
+            slice->length = 0;
+            slice->task = &task;
+            slice->status = Slice::PENDING;
+            task.slice_list.push_back(slice);
+            __sync_fetch_and_add(&task.slice_count, 1);
+            slice->markFailed();
+        }
     };
 
     int last_local_buffer_id = -1;
@@ -585,6 +625,7 @@ Status UbTransport::submitTransferTask(
                 return false;
             }
             refreshed_targets.insert(request.target_id);
+            if (!tryBeginTargetRefresh(request.target_id)) return false;
             auto fresh = metadata_->getSegmentDescByID(request.target_id,
                                                        /*force_update=*/true);
             if (!fresh) return false;
@@ -633,7 +674,7 @@ Status UbTransport::submitTransferTask(
                 // ~TransferTask() returns everything in slice_list to the
                 // cache exactly once. Mark unposted slices failed so waits and
                 // batch teardown do not observe stuck PENDING slices.
-                fail_unposted_slices();
+                fail_tasks_from(index);
                 LOG(ERROR)
                     << "UbTransport: Address not registered by any device(s) "
                     << static_cast<void*>(source_addr);
@@ -648,7 +689,7 @@ Status UbTransport::submitTransferTask(
                 local_segment_desc->buffers[buffer_id].l_seg_index[device_id];
             void* l_seg = context->localSegWithIndex(local_tseg_index);
             if (!l_seg) {
-                fail_unposted_slices();
+                fail_tasks_from(index);
                 LOG(ERROR) << "UbTransport: Local segment no longer registered "
                               "for address "
                            << static_cast<void*>(source_addr);
@@ -659,9 +700,6 @@ Status UbTransport::submitTransferTask(
 
             Slice* slice = getSliceCache().allocate();
             assert(slice);
-            if (!slice->from_cache) {
-                nr_slices++;
-            }
             slice->source_addr = source_addr;
             slice->length = slice_length;
             slice->opcode = request.opcode;
@@ -678,11 +716,13 @@ Status UbTransport::submitTransferTask(
             slices_to_post[context].push_back(slice);
             task.total_bytes += slice->length;
             __sync_fetch_and_add(&task.slice_count, 1);
-            if (nr_slices >= kSubmitWatermark) {
+            // Count every queued slice: counting only fresh allocations never
+            // reached the watermark once the slice cache was warm.
+            if (++pending_slice_count >= kSubmitWatermark) {
                 for (auto& entry : slices_to_post)
                     entry.first->submitPostSend(entry.second);
                 slices_to_post.clear();
-                nr_slices = 0;
+                pending_slice_count = 0;
             }
 
             offset += slice_length;
@@ -691,6 +731,23 @@ Status UbTransport::submitTransferTask(
     for (auto& entry : slices_to_post)
         entry.first->submitPostSend(entry.second);
     return Status::OK();
+}
+
+// A forced refresh blocks the submitting thread on a metadata RPC (up to the
+// handshake timeout in P2P mode). Repeated submits to an unmounted buffer or a
+// dead peer would otherwise pay that on every call, so allow at most one per
+// target per cooldown. The value matches the failed-target cooldown in
+// UbWorkerPool::submitPostSend, which still refreshes on its own miss.
+static constexpr auto kTargetRefreshCooldown = std::chrono::milliseconds(100);
+
+bool UbTransport::tryBeginTargetRefresh(SegmentID target_id) {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(target_refresh_mutex_);
+    auto [it, inserted] = last_target_refresh_.try_emplace(target_id, now);
+    if (inserted) return true;
+    if (now - it->second < kTargetRefreshCooldown) return false;
+    it->second = now;
+    return true;
 }
 
 Status UbTransport::getTransferStatus(BatchID batch_id, size_t task_id,
