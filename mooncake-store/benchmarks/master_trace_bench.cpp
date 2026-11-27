@@ -89,6 +89,7 @@ struct ModelProfile {
 struct PlannedOp {
     int64_t t_us = 0;
     OpKind kind = OpKind::kPut;
+    bool check_deadline = true;
     uint64_t start_idx = 0;
     uint64_t miss_start = 0;
     uint32_t hit_count = 0;
@@ -506,8 +507,8 @@ WorkloadPlan GeneratePlan(const ModelProfile& profile, uint64_t seed) {
                                            profile.prefix_probe_hit_ratio))));
             const uint32_t misses = total - hits;
             const uint64_t start = pick_hot_start(next_key, hits);
-            plan.ops.push_back(PlannedOp{t_us, OpKind::kExist, start, miss_base,
-                                         hits, misses});
+            plan.ops.push_back(PlannedOp{t_us, OpKind::kExist, true, start,
+                                         miss_base, hits, misses});
             ++plan.exist_ops;
             plan.exist_keys += total;
             continue;
@@ -520,13 +521,15 @@ WorkloadPlan GeneratePlan(const ModelProfile& profile, uint64_t seed) {
                 std::min<uint64_t>(get_sampler.Sample(rng), next_key));
             const uint64_t start = pick_hot_start(next_key, batch);
             // Causal hit path: BatchExistKey (hit) -> BatchGetReplicaList.
+            // Only the leading op is paced against t_us; the follow-up runs
+            // immediately after BatchExistKey completes.
             plan.ops.push_back(
-                PlannedOp{t_us, OpKind::kExist, start, 0, batch, 0});
+                PlannedOp{t_us, OpKind::kExist, true, start, 0, batch, 0});
             ++plan.exist_ops;
             plan.exist_keys += batch;
 
             plan.ops.push_back(
-                PlannedOp{t_us, OpKind::kGet, start, 0, batch, 0});
+                PlannedOp{t_us, OpKind::kGet, false, start, 0, batch, 0});
             ++plan.get_ops;
             plan.get_keys += batch;
             continue;
@@ -537,12 +540,12 @@ WorkloadPlan GeneratePlan(const ModelProfile& profile, uint64_t seed) {
             put_sampler.Sample(rng), profile.keys_per_clone - next_key));
         // Causal miss path: BatchExistKey (miss) -> BatchPutStart/End.
         plan.ops.push_back(
-            PlannedOp{t_us, OpKind::kExist, 0, next_key, 0, batch});
+            PlannedOp{t_us, OpKind::kExist, true, 0, next_key, 0, batch});
         ++plan.exist_ops;
         plan.exist_keys += batch;
 
         plan.ops.push_back(
-            PlannedOp{t_us, OpKind::kPut, next_key, 0, batch, 0});
+            PlannedOp{t_us, OpKind::kPut, false, next_key, 0, batch, 0});
         ++plan.put_ops;
         plan.put_keys += batch;
         next_key += batch;
@@ -967,54 +970,71 @@ int main(int argc, char** argv) {
     std::atomic<uint64_t> exist_not_found{0}, evicted_misses{0}, skipped_ops{0};
     std::atomic<uint64_t> errors{0}, missing{0}, missed{0};
 
-    std::thread heartbeat([&]() {
-        auto last_progress = std::chrono::steady_clock::now();
-        try {
-            while (!stop.load(std::memory_order_relaxed)) {
-                for (auto& client : clients) {
-                    if (stop.load(std::memory_order_relaxed)) {
-                        return;
-                    }
-                    client->Ping();
-                }
-                if (FLAGS_progress_interval_sec > 0) {
-                    const auto now = std::chrono::steady_clock::now();
-                    if (now - last_progress >=
-                        std::chrono::seconds(FLAGS_progress_interval_sec)) {
-                        last_progress = now;
-                        const uint64_t pk =
-                            put_keys.load(std::memory_order_relaxed);
-                        const uint64_t done =
-                            put_ops.load(std::memory_order_relaxed) +
-                            get_ops.load(std::memory_order_relaxed) +
-                            exist_ops.load(std::memory_order_relaxed) +
-                            skipped_ops.load(std::memory_order_relaxed);
-                        const double pct =
-                            keys_total == 0
-                                ? 100.0
-                                : 100.0 * static_cast<double>(pk) /
-                                      static_cast<double>(keys_total);
-                        LOG(INFO) << "progress: put_keys=" << pk << "/"
-                                  << keys_total << " (" << static_cast<int>(pct)
-                                  << "%), ops=" << done << "/" << planned_ops
-                                  << ", errors="
-                                  << errors.load(std::memory_order_relaxed);
-                    }
-                }
-                std::unique_lock<std::mutex> lock(hb_mutex);
-                hb_cv.wait_for(lock, std::chrono::seconds(1),
-                               [&]() { return stop.load(); });
-            }
-        } catch (const std::exception& error) {
-            LOG(ERROR) << "heartbeat failed: " << error.what();
-            heartbeat_failed.store(true);
-            {
-                std::lock_guard<std::mutex> lock(hb_mutex);
-                stop.store(true);
-            }
-            hb_cv.notify_all();
+    const auto request_stop = [&]() {
+        {
+            std::lock_guard<std::mutex> lock(hb_mutex);
+            stop.store(true);
         }
-    });
+        hb_cv.notify_all();
+    };
+
+    constexpr size_t kMaxHeartbeatThreads = 8;
+    const size_t hb_threads =
+        std::min<size_t>(clients.size(), kMaxHeartbeatThreads);
+    std::vector<std::thread> heartbeats;
+    heartbeats.reserve(hb_threads);
+    for (size_t shard = 0; shard < hb_threads; ++shard) {
+        heartbeats.emplace_back([&, shard]() {
+            auto last_progress = std::chrono::steady_clock::now();
+            try {
+                while (!stop.load(std::memory_order_relaxed)) {
+                    for (size_t i = shard; i < clients.size();
+                         i += hb_threads) {
+                        if (stop.load(std::memory_order_relaxed)) {
+                            return;
+                        }
+                        clients[i]->Ping();
+                    }
+                    if (shard == 0 && FLAGS_progress_interval_sec > 0) {
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now - last_progress >=
+                            std::chrono::seconds(FLAGS_progress_interval_sec)) {
+                            last_progress = now;
+                            const uint64_t pk =
+                                put_keys.load(std::memory_order_relaxed);
+                            const uint64_t done =
+                                put_ops.load(std::memory_order_relaxed) +
+                                get_ops.load(std::memory_order_relaxed) +
+                                exist_ops.load(std::memory_order_relaxed) +
+                                skipped_ops.load(std::memory_order_relaxed);
+                            const double pct =
+                                keys_total == 0
+                                    ? 100.0
+                                    : 100.0 * static_cast<double>(pk) /
+                                          static_cast<double>(keys_total);
+                            LOG(INFO)
+                                << "progress: put_keys=" << pk << "/"
+                                << keys_total << " (" << static_cast<int>(pct)
+                                << "%), ops=" << done << "/" << planned_ops
+                                << ", errors="
+                                << errors.load(std::memory_order_relaxed);
+                        }
+                    }
+                    std::unique_lock<std::mutex> lock(hb_mutex);
+                    hb_cv.wait_for(lock, std::chrono::seconds(1),
+                                   [&]() { return stop.load(); });
+                }
+            } catch (const std::exception& error) {
+                LOG(ERROR) << "heartbeat failed: " << error.what();
+                heartbeat_failed.store(true);
+                request_stop();
+            } catch (...) {
+                LOG(ERROR) << "heartbeat failed with unknown exception";
+                heartbeat_failed.store(true);
+                request_stop();
+            }
+        });
+    }
 
     std::vector<std::vector<double>> put_latencies(FLAGS_amplify);
     std::vector<std::vector<double>> get_latencies(FLAGS_amplify);
@@ -1062,7 +1082,7 @@ int main(int argc, char** argv) {
                     if (stop.load()) {
                         break;
                     }
-                    if (FLAGS_speed > 0) {
+                    if (FLAGS_speed > 0 && op.check_deadline) {
                         const auto due =
                             clone_start +
                             std::chrono::microseconds(op.t_us / FLAGS_speed);
@@ -1088,6 +1108,10 @@ int main(int argc, char** argv) {
                         }
                         if (!clients[clone]->Put(keys, object_bytes, &us)) {
                             errors.fetch_add(1, std::memory_order_relaxed);
+                            LOG(ERROR) << "clone " << clone
+                                       << " put failed; stopping benchmark";
+                            request_stop();
+                            break;
                         } else {
                             put_ops.fetch_add(1, std::memory_order_relaxed);
                             put_keys.fetch_add(count,
@@ -1120,6 +1144,10 @@ int main(int argc, char** argv) {
                                 &ev_miss, &got_keys, &transport_error)) {
                             if (transport_error) {
                                 errors.fetch_add(1, std::memory_order_relaxed);
+                                LOG(ERROR) << "clone " << clone
+                                           << " get failed; stopping benchmark";
+                                request_stop();
+                                break;
                             } else {
                                 missing.fetch_add(1, std::memory_order_relaxed);
                             }
@@ -1152,6 +1180,10 @@ int main(int argc, char** argv) {
                                                        : nullptr)) {
                             errors.fetch_add(1, std::memory_order_relaxed);
                             has_causal_found = false;
+                            LOG(ERROR) << "clone " << clone
+                                       << " exist failed; stopping benchmark";
+                            request_stop();
+                            break;
                         } else {
                             exist_ops.fetch_add(1, std::memory_order_relaxed);
                             exist_keys.fetch_add(count,
@@ -1166,19 +1198,11 @@ int main(int argc, char** argv) {
             } catch (const std::exception& error) {
                 LOG(ERROR) << "clone " << clone << " threw: " << error.what();
                 errors.fetch_add(1, std::memory_order_relaxed);
-                {
-                    std::lock_guard<std::mutex> lock(hb_mutex);
-                    stop.store(true);
-                }
-                hb_cv.notify_all();
+                request_stop();
             } catch (...) {
                 LOG(ERROR) << "clone " << clone << " threw unknown exception";
                 errors.fetch_add(1, std::memory_order_relaxed);
-                {
-                    std::lock_guard<std::mutex> lock(hb_mutex);
-                    stop.store(true);
-                }
-                hb_cv.notify_all();
+                request_stop();
             }
         });
     }
@@ -1188,12 +1212,10 @@ int main(int argc, char** argv) {
     // Capture elapsed time immediately after replay completes so heartbeat
     // teardown never adds jitter to seconds or ops_per_second.
     const auto finished = std::chrono::steady_clock::now();
-    {
-        std::lock_guard<std::mutex> lock(hb_mutex);
-        stop.store(true);
+    request_stop();
+    for (auto& hb : heartbeats) {
+        hb.join();
     }
-    hb_cv.notify_all();
-    heartbeat.join();
     if (heartbeat_failed.load()) {
         LOG(ERROR) << "heartbeat failed; benchmark result is incomplete";
         return 1;
