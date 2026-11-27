@@ -25,7 +25,6 @@ SUPPORT_XPU: bool
 class CompletionNotificationFallback(Exception):
     """Notification was requested, but this submit must fall back to polling."""
 
-
 class TransferStatus:
     """Values carried by ``drain_completions`` rows as ``status``."""
 
@@ -44,7 +43,6 @@ class TransferStatus:
     def name(self) -> str: ...
     @property
     def value(self) -> int: ...
-
 
 class TransferOpcode:
     Read: ClassVar[TransferOpcode]
@@ -409,6 +407,7 @@ class TransferEngine:
         Returns 0 on success, non-zero on failure.
         """
     def get_engine(self) -> InnerTransferEngine: ...
+    def reset_reshard_peers_quiescent(self, peers: Sequence[str]) -> int: ...
     def get_engine_ptr(self) -> int: ...
 
 class SharedSegment:

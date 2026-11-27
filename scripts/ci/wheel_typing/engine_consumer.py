@@ -82,6 +82,9 @@ def exercise_transfer_engine(engine: TransferEngine) -> None:
     assert_type(engine.get_local_topology(), str)
     assert_type(engine.send_probe("peer:1"), int)
     assert_type(engine.get_engine_ptr(), int)
+    assert_type(engine.reset_reshard_peers_quiescent(["peer:1"]), int)
+    assert_type(engine.reset_reshard_peers_quiescent(peers=("peer:1",)), int)
+    engine.reset_reshard_peers_quiescent([1])  # type: ignore[list-item]
     assert_type(engine.unregister_memory(buffer), int)
     assert_type(engine.free_managed_buffer(buffer, 4096), int)
 
