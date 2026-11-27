@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from types import MappingProxyType
+from typing import Literal
 
 import numpy as np
 import pytest
@@ -1807,9 +1808,25 @@ def test_structured_object_ndarray_read_can_use_buffer_pool() -> None:
     assert store.get_into_ranges_calls == before_range_reads + 1
     assert pool.acquire_sizes == [array.nbytes]
 
-    MooncakeBundleTransfer.release_result(result.objects)
+    MooncakeBundleTransfer.release(result.objects, type="dataproto")
     assert pool.release_count == before_release_count + 1
     MooncakeBundleTransfer.release_result(result.objects)
+    assert pool.release_count == before_release_count + 1
+
+
+def test_unified_dict_release_returns_pool_buffer() -> None:
+    pool = FakeBufferPool()
+    _store, transfer = make_transfer(buffer_pool=pool)
+    weights = np.arange(12, dtype=np.float32).reshape(3, 4)
+    ref = transfer.put({"weights": weights}, type="dict")
+    result = transfer.get(ref, type="dict")
+    assert np.array_equal(result["weights"], weights)
+    assert hasattr(result["weights"], "_mooncake_pool_owner")
+    before_release_count = pool.release_count
+
+    transfer.release(result, type="dict")
+    assert pool.release_count == before_release_count + 1
+    transfer.release_dict(result)
     assert pool.release_count == before_release_count + 1
 
 
@@ -3428,11 +3445,35 @@ def test_unified_dict_get_returns_flat_lists_without_changing_dataproto_shape() 
     ]
 
 
+def test_unified_cleanup_removes_flat_dict_objects() -> None:
+    store, transfer = make_transfer()
+    ref = transfer.put(
+        {
+            "input_ids": np.arange(6, dtype=np.int64).reshape(3, 2),
+            "tokens": [np.asarray([1, 2]), None, np.asarray([3])],
+            "step": 7,
+        },
+        type="dict",
+    )
+
+    assert store.objects
+    transfer.cleanup(ref, type="dict")
+
+    assert store.objects == {}
+
+
 def test_unified_put_rejects_unknown_type() -> None:
     _store, transfer = make_transfer()
 
     with pytest.raises(ValueError, match="unsupported Mooncake payload type"):
         transfer.put({}, type="unknown")  # type: ignore[arg-type]
+
+    ref = transfer.put({"input_ids": np.arange(2)}, type="dict")
+    with pytest.raises(ValueError, match="unsupported Mooncake payload type"):
+        transfer.cleanup(ref, type="unknown")  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="unsupported Mooncake payload type"):
+        MooncakeBundleTransfer.release({}, type="unknown")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -3553,9 +3594,31 @@ def test_ref_aliases_match_dataproto_ref_helpers() -> None:
     assert import_ref is import_dataproto_ref
 
 
-def test_release_result_is_available_for_split_api_compatibility() -> None:
+@pytest.mark.parametrize("payload_type", ["dataproto", "dict"])
+def test_unified_lifecycle_dispatches_to_type_specific_helpers(
+    monkeypatch: pytest.MonkeyPatch, payload_type: Literal["dataproto", "dict"]
+) -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put({"weights": np.arange(2)}, type="dict")
+    result = {"weights": np.arange(2)}
+    released = []
+    cleaned = []
+    monkeypatch.setattr(
+        MooncakeBundleTransfer, f"release_{payload_type}", staticmethod(released.append)
+    )
+    monkeypatch.setattr(transfer, f"cleanup_{payload_type}", cleaned.append)
+
+    transfer.release(result, type=payload_type)
+    transfer.cleanup(ref, type=payload_type)
+
+    assert len(released) == 1 and released[0] is result
+    assert len(cleaned) == 1 and cleaned[0] is ref
+
+
+def test_unified_release_is_available_for_split_api_compatibility() -> None:
     result = {"tokens": [np.asarray([1, 2]), None]}
 
+    assert MooncakeBundleTransfer.release(result, type="dict") is None
     assert MooncakeBundleTransfer.release_result(result) is None
     assert result["tokens"][0].tolist() == [1, 2]
 
@@ -4539,7 +4602,8 @@ def test_dataproto_helper_overwrite_replaces_encoded_metadata() -> None:
     assert np.array_equal(result["non_tensor_batch"]["text"], np.asarray([1, 2]))
 
 
-def test_dataproto_helper_cleanup_removes_all_stage_objects() -> None:
+@pytest.mark.parametrize("unified", [False, True])
+def test_dataproto_helper_cleanup_removes_all_stage_objects(unified: bool) -> None:
     store, transfer = make_transfer()
     ref = transfer.put_dataproto(
         SimpleDataProto(batch={"input_ids": np.arange(4, dtype=np.int64)}),
@@ -4552,7 +4616,10 @@ def test_dataproto_helper_cleanup_removes_all_stage_objects() -> None:
     )
 
     assert store.objects
-    transfer.cleanup_dataproto(ref)
+    if unified:
+        transfer.cleanup(ref, type="dataproto")
+    else:
+        transfer.cleanup_dataproto(ref)
 
     assert store.objects == {}
 
