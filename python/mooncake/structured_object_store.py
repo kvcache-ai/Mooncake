@@ -7,6 +7,7 @@ import io
 import json
 import sys
 import uuid
+from bisect import bisect_right
 from collections.abc import MutableMapping
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -5006,13 +5007,16 @@ class _MooncakePayloadTransport:
             offsets.append(total_bytes)
             output_bytes = ranges[-1][1] + ranges[-1][2] if ranges else 0
             lengths.append(output_bytes)
+            chunks = payload_spec["chunks"]
+            chunk_starts = _chunk_offsets(chunks) if len(ranges) > 1 else None
             for source, destination, size in ranges:
                 physical = _payload_range_fragments(
-                    payload_spec["chunks"],
+                    chunks,
                     source,
                     size,
                     total_bytes + destination,
                     max_fragments - len(fragments) + 1,
+                    chunk_starts,
                 )
                 if sum(part[4] for part in physical) != size:
                     return None
@@ -5930,11 +5934,16 @@ def _payload_range_fragments(
     byte_length: int,
     destination_offset: int = 0,
     max_fragments: int | None = None,
+    chunk_starts: Sequence[int] | None = None,
 ) -> list[tuple[str, int, int, int, int]]:
     fragments: list[tuple[str, int, int, int, int]] = []
     read_end = byte_offset + byte_length
-    chunk_offset = 0
-    for chunk in chunks:
+    first = max(0, bisect_right(chunk_starts, byte_offset) - 1) if chunk_starts else 0
+    chunk_offset = chunk_starts[first] if chunk_starts else 0
+    for index in range(first, len(chunks)):
+        if chunk_offset >= read_end:
+            break
+        chunk = chunks[index]
         chunk_size = int(chunk["bytes"])
         chunk_end = chunk_offset + chunk_size
         overlap_start = max(byte_offset, chunk_offset)

@@ -78,6 +78,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     int deconstruct();
     int deconstructLocked();
     void beginDestroyLocked();
+    Transport::Slice::RdmaCompletionToken autoGidCompletionTokenLocked() const;
 
    public:
     void setPeerNicPath(const std::string &peer_nic_path);

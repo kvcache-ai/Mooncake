@@ -177,6 +177,17 @@ enum class ObjectDataType : uint8_t {
     // 10-255 reserved for future types
 };
 
+static_assert(static_cast<uint8_t>(ObjectDataType::UNKNOWN) == 0);
+static_assert(static_cast<uint8_t>(ObjectDataType::KVCACHE) == 1);
+static_assert(static_cast<uint8_t>(ObjectDataType::TENSOR) == 2);
+static_assert(static_cast<uint8_t>(ObjectDataType::WEIGHT) == 3);
+static_assert(static_cast<uint8_t>(ObjectDataType::SAMPLE) == 4);
+static_assert(static_cast<uint8_t>(ObjectDataType::ACTIVATION) == 5);
+static_assert(static_cast<uint8_t>(ObjectDataType::GRADIENT) == 6);
+static_assert(static_cast<uint8_t>(ObjectDataType::OPTIMIZER_STATE) == 7);
+static_assert(static_cast<uint8_t>(ObjectDataType::METADATA) == 8);
+static_assert(static_cast<uint8_t>(ObjectDataType::GENERAL) == 9);
+
 inline std::ostream& operator<<(std::ostream& os,
                                 const ObjectDataType& type) noexcept {
     static const std::unordered_map<ObjectDataType, std::string_view>

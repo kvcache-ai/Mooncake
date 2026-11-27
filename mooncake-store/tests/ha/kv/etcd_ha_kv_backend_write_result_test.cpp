@@ -38,7 +38,8 @@ ErrorCode EtcdHelper::Get(const char*, size_t, std::string&, EtcdRevisionId&) {
 }
 
 ErrorCode EtcdHelper::GetRangeAsJson(const char*, size_t, const char*, size_t,
-                                     size_t, std::string&, EtcdRevisionId&) {
+                                     size_t, std::string&, EtcdRevisionId&,
+                                     bool) {
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
 

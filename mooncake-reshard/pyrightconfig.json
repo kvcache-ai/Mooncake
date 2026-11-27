@@ -10,6 +10,8 @@
     "python/mooncake/reshard/weight/validation.py",
     "python/mooncake/reshard/weight/binding.py",
     "python/mooncake/reshard/weight/serde.py",
+    "python/mooncake/reshard/weight/plan_cache.py",
+    "python/mooncake/reshard/weight/inplace.py",
     "python/mooncake/reshard/kv_cache/resolved.py",
     "python/mooncake/reshard/kv_cache/transfer.py",
     "python/mooncake/reshard/kv_cache/completion.py",
