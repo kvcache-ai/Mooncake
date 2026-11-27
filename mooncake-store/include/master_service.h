@@ -1167,7 +1167,8 @@ class MasterService {
     // `evict_ratio_lowerbound`. It consumes the allocation-pressure signal and
     // raises it again when the round could free nothing that was there to
     // free.
-    void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound,
+                    StorageLevel target_level = StorageLevel::RAM);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
     using NamespaceEvictionResult = StoreControl::EvictionResult;
@@ -1646,8 +1647,8 @@ class MasterService {
     const bool allow_evict_soft_pinned_objects_;
 
     // Eviction related members
-    std::atomic<bool> need_mem_eviction_{
-        false};  // Set to trigger memory eviction when allocation fails
+    std::atomic<bool> need_ram_eviction_{false};  // RAM allocation pressure
+    std::atomic<bool> need_cxl_eviction_{false};  // CXL allocation pressure
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
     const double eviction_ratio_;                     // in range [0.0, 1.0]
@@ -1661,6 +1662,8 @@ class MasterService {
     // starts.
     struct MemoryEviction;
     std::unique_ptr<MemoryEviction> memory_eviction_;
+    std::unique_ptr<MemoryEviction> ram_memory_eviction_;
+    std::unique_ptr<MemoryEviction> cxl_memory_eviction_;
     struct KvcsDfsEviction;
     std::unique_ptr<KvcsDfsEviction> kvcs_dfs_eviction_;
 
@@ -2089,6 +2092,7 @@ class MasterService {
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    std::shared_ptr<AllocationStrategy> cxl_allocation_strategy_;
 
     mutable std::shared_mutex master_state_mutex_;
 
@@ -2348,6 +2352,10 @@ class MasterService {
         standby_allocator_keepalive_;
     std::vector<StandbySegmentInfo> standby_memory_segments_;
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
+    // Tier for each entry above. The standby segment registry predates tiered
+    // storage, so restore derives this from each live buffer descriptor.
+    std::unordered_map<std::string, StorageLevel>
+        standby_accounted_memory_levels_;
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
@@ -2361,6 +2369,8 @@ class MasterService {
     bool IsReplicaReadable(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
+    bool IsEvictableMemoryReplicaAtLevel(
+        const Replica& replica, StorageLevel target_level) const;
 
     /**
      * Commits a segment event using capacity reserved before the local change.

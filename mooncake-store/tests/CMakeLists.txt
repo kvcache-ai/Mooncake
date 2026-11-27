@@ -239,6 +239,9 @@ add_store_test(rpc_timeout_test rpc_timeout_test.cpp
                rpc_timeout_config_test.cpp)
 if(USE_CXL)
   add_store_test(cxl_client_integration_test cxl_client_integration_test.cpp)
+  if(ENABLE_MULTI_PROTOCOL)
+    add_store_test(level_storage_test level_storage_test.cpp)
+  endif()
 endif()
 add_store_test(master_metrics_test master_metrics_test.cpp)
 add_store_test(master_admin_server_test master_admin_server_test.cpp)
@@ -636,6 +639,7 @@ add_ha_test(oplog_batch_standby_reader_test
 add_ha_test(batch_oplog_pruning_worker_test
             ha/oplog/batch_oplog_pruning_worker_test.cpp)
 add_ha_test(ordered_oplog_writer_test ha/oplog/ordered_oplog_writer_test.cpp)
+target_link_libraries(ordered_oplog_writer_test PRIVATE aio)
 if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
   target_compile_definitions(ha_metric_manager_test
                              PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)

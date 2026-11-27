@@ -66,6 +66,47 @@ namespace mooncake {
 
 namespace {
 
+StorageLevel MemoryStorageLevelForDescriptor(
+    const Replica::Descriptor& descriptor) {
+    // New snapshots carry the tier explicitly.  protocol_ remains the
+    // compatibility signal for snapshots written before storage_level was
+    // serialized.
+    return descriptor.get_storage_level() == StorageLevel::CXL ||
+                   descriptor.get_memory_descriptor()
+                           .buffer_descriptor.protocol_ == "cxl"
+               ? StorageLevel::CXL
+               : StorageLevel::RAM;
+}
+
+StorageLevel AccountedStorageLevel(
+    const std::unordered_map<std::string, StorageLevel>& levels,
+    const std::string& segment) {
+    const auto it = levels.find(segment);
+    return it == levels.end() ? StorageLevel::RAM : it->second;
+}
+
+void IncStandbyMemoryMetrics(const std::string& segment, uint64_t bytes,
+                             StorageLevel level) {
+    auto& metrics = MasterMetricManager::instance();
+    metrics.inc_allocated_mem_size(segment, static_cast<int64_t>(bytes));
+    if (level == StorageLevel::CXL) {
+        metrics.inc_allocated_cxl_size(segment, static_cast<int64_t>(bytes));
+    } else {
+        metrics.inc_allocated_dram_size(segment, static_cast<int64_t>(bytes));
+    }
+}
+
+void DecStandbyMemoryMetrics(const std::string& segment, uint64_t bytes,
+                             StorageLevel level) {
+    auto& metrics = MasterMetricManager::instance();
+    metrics.dec_allocated_mem_size(segment, static_cast<int64_t>(bytes));
+    if (level == StorageLevel::CXL) {
+        metrics.dec_allocated_cxl_size(segment, static_cast<int64_t>(bytes));
+    } else {
+        metrics.dec_allocated_dram_size(segment, static_cast<int64_t>(bytes));
+    }
+}
+
 tl::expected<OpLogEntry, ErrorCode> BuildSegmentMountOpLogEntry(
     const Segment& segment, const std::string& key) {
     SegmentMountOp op;
@@ -184,10 +225,12 @@ struct MasterService::MemoryEviction {
     class Policy final : public eviction::EvictionPolicy {
        public:
         Policy(const MasterService& service, bool allow_soft_pinned,
-               ReplicaKind kind = ReplicaKind::kMemory)
+               ReplicaKind kind = ReplicaKind::kMemory,
+               std::optional<StorageLevel> target_level = std::nullopt)
             : service_(service),
               allow_soft_pinned_(allow_soft_pinned),
-              kind_(kind) {}
+              kind_(kind),
+              target_level_(target_level) {}
 
         bool SupportsParallel() const override { return true; }
 
@@ -211,10 +254,17 @@ struct MasterService::MemoryEviction {
             }
             eviction::Plan plan;
             for (const Replica& replica : candidate.metadata.GetAllReplicas()) {
-                const bool evictable =
-                    kind_ == ReplicaKind::kMemory
-                        ? service_.IsEvictableMemoryReplica(replica)
-                        : replica.is_dfs_replica() && replica.is_completed();
+                const bool evictable = kind_ == ReplicaKind::kMemory
+                                           ? target_level_.has_value()
+                                                 ? service_
+                                                       .IsEvictableMemoryReplicaAtLevel(
+                                                           replica,
+                                                           *target_level_)
+                                                 : service_
+                                                       .IsEvictableMemoryReplica(
+                                                           replica)
+                                           : replica.is_dfs_replica() &&
+                                                 replica.is_completed();
                 if (evictable) {
                     plan.release.push_back(replica.id());
                 }
@@ -230,6 +280,7 @@ struct MasterService::MemoryEviction {
         const MasterService& service_;
         const bool allow_soft_pinned_;
         const ReplicaKind kind_;
+        const std::optional<StorageLevel> target_level_;
     };
 
     // Takes the replicas off the object on the spot, with the cache and
@@ -369,11 +420,13 @@ struct MasterService::MemoryEviction {
         bool through_oplog = false;
         bool allow_evict_soft_pinned = false;
         bool offload_on_evict = false;
+        std::optional<StorageLevel> target_level;
         eviction::OffloadingReclaimer::Options offload;
     };
 
     MemoryEviction(MasterService& service, const Settings& settings)
-        : policy(service, settings.allow_evict_soft_pinned),
+        : policy(service, settings.allow_evict_soft_pinned,
+                 ReplicaKind::kMemory, settings.target_level),
           immediate(service),
           oplog(service),
           offload_queue(service),
@@ -671,6 +724,26 @@ MasterService::MasterService(const MasterServiceConfig& config)
             .offload = {.cap = static_cast<long>(offloading_queue_limit_ *
                                                  config.offload_cap_ratio),
                         .force_evict = config.offload_force_evict}});
+    ram_memory_eviction_ = std::make_unique<MemoryEviction>(
+        *this,
+        MemoryEviction::Settings{
+            .worker_threads = config.eviction_worker_threads,
+            .through_oplog = enable_oplog_,
+            .allow_evict_soft_pinned = allow_evict_soft_pinned_objects_,
+            .offload_on_evict = offload_on_evict_,
+            .target_level = StorageLevel::RAM,
+            .offload = {.cap = static_cast<long>(offloading_queue_limit_ *
+                                                 config.offload_cap_ratio),
+                        .force_evict = config.offload_force_evict}});
+    cxl_memory_eviction_ = std::make_unique<MemoryEviction>(
+        *this,
+        MemoryEviction::Settings{
+            .worker_threads = config.eviction_worker_threads,
+            .through_oplog = enable_oplog_,
+            .allow_evict_soft_pinned = allow_evict_soft_pinned_objects_,
+            .offload_on_evict = false,
+            .target_level = StorageLevel::CXL,
+            .offload = {}});
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY. Only meaningful when offload is enabled
     // (otherwise no LOCAL_DISK replicas exist in the first place).
@@ -820,7 +893,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     if (config.enable_cxl) {
-        allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
+        // CXL is selected per request. Keep the configured strategy for RAM.
+        cxl_allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
         const auto result = segment_manager_.initializeCxlAllocator(
             config.cxl_path, config.cxl_size);
         LOG_IF(FATAL, result != ErrorCode::OK)
@@ -1011,8 +1085,9 @@ MasterService::~MasterService() {
 
     client_offboarding_worker_.Stop();
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
-        MasterMetricManager::instance().dec_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
+        DecStandbyMemoryMetrics(
+            segment, bytes,
+            AccountedStorageLevel(standby_accounted_memory_levels_, segment));
         MasterMetricManager::instance().remove_segment_metrics(segment);
     }
 
@@ -1078,6 +1153,8 @@ TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
     TieredStorageUsageSnapshot snapshot{
         .memory = segment_manager_.GetMemoryUsageSnapshot(),
         .nof = nof_segment_manager_.GetUsageSnapshot(),
+        .ram = segment_manager_.GetMemoryUsageSnapshot(StorageLevel::RAM),
+        .cxl = segment_manager_.GetMemoryUsageSnapshot(StorageLevel::CXL),
         .dfs = {},
     };
     if (enable_dfs_ && dfs_allocator_ && dfs_allocator_->IsInitialized()) {
@@ -1491,14 +1568,17 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         }
         for (auto& restore : restores) {
             if (restore.imported_size != 0) {
-                MasterMetricManager::instance().dec_allocated_mem_size(
-                    restore.segment.name,
-                    static_cast<int64_t>(restore.imported_size));
+                DecStandbyMemoryMetrics(
+                    restore.segment.name, restore.imported_size,
+                    AccountedStorageLevel(standby_accounted_memory_levels_,
+                                           restore.segment.name));
                 auto accounted =
                     standby_accounted_memory_bytes_.find(restore.segment.name);
                 accounted->second -= restore.imported_size;
                 if (accounted->second == 0) {
                     standby_accounted_memory_bytes_.erase(accounted);
+                    standby_accounted_memory_levels_.erase(
+                        restore.segment.name);
                 }
             }
             for (size_t i = 0; i < restore.replicas.size(); ++i) {
@@ -3223,6 +3303,7 @@ struct MasterService::LegacyRestoreContext {
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>&
         allocators;
     std::unordered_map<std::string, uint64_t>& accounted_bytes;
+    std::unordered_map<std::string, StorageLevel>& accounted_levels;
     size_t& rejected_count;
     size_t& already_existing_count;
     std::vector<std::pair<TenantId, std::string>>& repair_remove_keys;
@@ -3420,6 +3501,7 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
         // object validates, so a mid-construction rejection never leaves
         // phantom accounting behind for later capacity checks or metrics.
         std::unordered_map<std::string, uint64_t> object_bytes;
+        std::unordered_map<std::string, StorageLevel> object_levels;
 
         for (size_t desc_idx = 0; desc_idx < standby_meta.replicas.size();
              ++desc_idx) {
@@ -3436,6 +3518,20 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     ctx.segments_by_alias.at(buffer.transport_endpoint_);
                 if (desc.status != ReplicaStatus::REMOVED &&
                     desc.status != ReplicaStatus::FAILED) {
+                    const auto storage_level =
+                        MemoryStorageLevelForDescriptor(desc);
+                    const auto existing_level =
+                        ctx.accounted_levels.find(segment->segment_name);
+                    auto [object_level, inserted] = object_levels.emplace(
+                        segment->segment_name, storage_level);
+                    if ((existing_level != ctx.accounted_levels.end() &&
+                         existing_level->second != storage_level) ||
+                        (!inserted && object_level->second != storage_level)) {
+                        NoteLegacyStandbyRejection(ctx, entry,
+                                                   "mixed_memory_tiers");
+                        construction_ok = false;
+                        break;
+                    }
                     const uint64_t used =
                         ctx.accounted_bytes[segment->segment_name] +
                         object_bytes[segment->segment_name];
@@ -3451,7 +3547,7 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
 
                 replicas.push_back(Replica(
                     desc.id, std::make_unique<AllocatedBuffer>(alloc, buffer),
-                    desc.status));
+                    desc.status, MemoryStorageLevelForDescriptor(desc)));
             } else if (desc.is_nof_replica()) {
                 const auto& buffer =
                     desc.get_nof_descriptor().buffer_descriptor;
@@ -3514,6 +3610,8 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
         }
         for (const auto& [segment_name, bytes] : object_bytes) {
             ctx.accounted_bytes[segment_name] += bytes;
+            ctx.accounted_levels.emplace(segment_name,
+                                         object_levels.at(segment_name));
         }
         ctx.prepared.push_back(
             {accepted_entry.entry, std::move(accepted_entry.tenant_id),
@@ -3902,6 +4000,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     std::unordered_map<const StandbySegmentInfo*, std::map<uintptr_t, uint64_t>>
         bounded_memory_ranges;
     std::unordered_map<std::string, uint64_t> restored_accounted_memory_bytes;
+    std::unordered_map<std::string, StorageLevel>
+        restored_accounted_memory_levels;
     size_t restored_object_count = 0;
     size_t dropped_stale_replica_count = 0;
     size_t skipped_stale_object_count = 0;
@@ -3987,6 +4087,20 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                     const auto* segment = segment_it->second;
                     if (desc.status != ReplicaStatus::REMOVED &&
                         desc.status != ReplicaStatus::FAILED) {
+                        const auto storage_level =
+                            MemoryStorageLevelForDescriptor(desc);
+                        auto [level_it, level_inserted] =
+                            restored_accounted_memory_levels.emplace(
+                                segment->segment_name, storage_level);
+                        if (!level_inserted &&
+                            level_it->second != storage_level) {
+                            LOG(ERROR)
+                                << "RestoreFromStandbySnapshot: mixed memory "
+                                   "tiers for segment="
+                                << segment->segment_name;
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_PARAMS);
+                        }
                         auto& bytes =
                             restored_accounted_memory_bytes[segment
                                                                 ->segment_name];
@@ -4023,7 +4137,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                     auto restored_buffer =
                         std::make_unique<AllocatedBuffer>(alloc, buffer);
                     replicas.push_back(Replica(
-                        desc.id, std::move(restored_buffer), desc.status));
+                        desc.id, std::move(restored_buffer), desc.status,
+                        MemoryStorageLevelForDescriptor(desc)));
                 } else if (desc.is_nof_replica()) {
                     const auto& buffer =
                         desc.get_nof_descriptor().buffer_descriptor;
@@ -4119,9 +4234,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         LegacyRestoreContext legacy_ctx{
             *legacy_objects,     memory_segments_by_alias,
             restored_allocators, restored_accounted_memory_bytes,
-            rejected_count,      already_existing_count,
-            repair_remove_keys,  repair_canonical_keys,
-            installed,           restore};
+            restored_accounted_memory_levels,
+            rejected_count,     already_existing_count,
+            repair_remove_keys, repair_canonical_keys,
+            installed,          restore};
         if (auto r = ValidateLegacyStandbyEntries(legacy_ctx); !r) {
             return tl::make_unexpected(r.error());
         }
@@ -4156,6 +4272,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
 
     const auto prev_standby_accounted_memory_bytes =
         standby_accounted_memory_bytes_;
+    const auto prev_standby_accounted_memory_levels =
+        standby_accounted_memory_levels_;
     const auto prev_standby_memory_segments = standby_memory_segments_;
     const auto prev_standby_allocator_keepalive = standby_allocator_keepalive_;
     const auto prev_invalid_replica_endpoints = invalid_replica_endpoints_;
@@ -4175,6 +4293,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
             }
         }
         standby_accounted_memory_bytes_ = prev_standby_accounted_memory_bytes;
+        standby_accounted_memory_levels_ =
+            prev_standby_accounted_memory_levels;
         standby_memory_segments_ = prev_standby_memory_segments;
         standby_allocator_keepalive_ = prev_standby_allocator_keepalive;
         invalid_replica_endpoints_ = prev_invalid_replica_endpoints;
@@ -4183,6 +4303,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
 
     standby_accounted_memory_bytes_ =
         std::move(restored_accounted_memory_bytes);
+    standby_accounted_memory_levels_ =
+        std::move(restored_accounted_memory_levels);
     standby_memory_segments_ = std::move(restored_memory_segments);
     standby_allocator_keepalive_ = std::move(restored_allocators);
     invalid_replica_endpoints_ = std::move(restored_invalid_endpoints);
@@ -4311,12 +4433,15 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     // the client/snapshot mutexes held here mean no concurrent reader can see
     // the gauge drift between the map swap and this commit.
     for (const auto& [segment, bytes] : prev_standby_accounted_memory_bytes) {
-        MasterMetricManager::instance().dec_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
+        DecStandbyMemoryMetrics(
+            segment, bytes,
+            AccountedStorageLevel(prev_standby_accounted_memory_levels,
+                                   segment));
     }
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
-        MasterMetricManager::instance().inc_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
+        IncStandbyMemoryMetrics(
+            segment, bytes,
+            AccountedStorageLevel(standby_accounted_memory_levels_, segment));
     }
 
     LOG(INFO) << "Restored from standby: " << restored_object_count
@@ -4627,6 +4752,12 @@ bool MasterService::IsEvictableMemoryReplica(const Replica& replica) const {
            replica.get_refcnt() == 0;
 }
 
+bool MasterService::IsEvictableMemoryReplicaAtLevel(
+    const Replica& replica, StorageLevel target_level) const {
+    return IsEvictableMemoryReplica(replica) &&
+           replica.get_descriptor().get_storage_level() == target_level;
+}
+
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
                                           const TenantId& tenant_id)
     -> tl::expected<
@@ -4880,6 +5011,16 @@ auto MasterService::AllocateReplicas(const std::string& key,
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
     bool has_enough_memory_segments = false;
+    const StorageLevel memory_storage_level =
+        config.PreferredStorageLevel() == StorageLevel::CXL
+            ? StorageLevel::CXL
+            : StorageLevel::RAM;
+    auto request_memory_eviction = [this, memory_storage_level]() {
+        auto& signal = memory_storage_level == StorageLevel::CXL
+                           ? need_cxl_eviction_
+                           : need_ram_eviction_;
+        signal.store(true, std::memory_order_relaxed);
+    };
 
     if (config.replica_num > 0) {
         std::vector<std::string> preferred_segments;
@@ -4940,8 +5081,22 @@ auto MasterService::AllocateReplicas(const std::string& key,
                 config.preferred_hca_names.value_or(
                     std::vector<std::string>{}));
         }
-        auto allocation_result = allocation_strategy_->AllocateForRequest(
-            allocator_snapshot, value_length, config, preferred_segments);
+        auto allocation_result = [&]()
+            -> tl::expected<std::vector<Replica>, ErrorCode> {
+            if (memory_storage_level == StorageLevel::CXL) {
+                if (!cxl_allocation_strategy_) {
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                // CXL is one shared pool. RAM-only rack/tray/GPU placement
+                // must not route it through AllocateFrom(), which deliberately
+                // has no meaning for the shared CXL allocator.
+                return cxl_allocation_strategy_->Allocate(
+                    allocator_snapshot, value_length, config.replica_num,
+                    preferred_segments, {}, ReplicaType::MEMORY);
+            }
+            return allocation_strategy_->AllocateForRequest(
+                allocator_snapshot, value_length, config, preferred_segments);
+        }();
 
         // Only failed or short allocations need this eviction hint. Count on
         // the retained snapshot after releasing the segment read lock, within
@@ -4951,12 +5106,22 @@ auto MasterService::AllocateReplicas(const std::string& key,
              allocation_result.error() != ErrorCode::INVALID_PARAMS) ||
             (allocation_result &&
              allocation_result->size() != config.replica_num)) {
-            const auto resolved = AllocationStrategy::ResolvePlacement(config);
-            has_enough_memory_segments =
-                allocator_snapshot
-                    .FilterForFabric(resolved ? resolved->fabric_domain
-                                              : std::string{})
-                    .hasEnoughServingNames(config.replica_num);
+            if (memory_storage_level == StorageLevel::CXL) {
+                // CXL capacity pressure belongs to the shared pool and is not
+                // scoped by the RAM requester's fabric placement.
+                has_enough_memory_segments =
+                    allocator_snapshot.getServingNames(StorageLevel::CXL)
+                        .size() >= config.replica_num;
+            } else {
+                const auto resolved =
+                    AllocationStrategy::ResolvePlacement(config);
+                has_enough_memory_segments =
+                    allocator_snapshot
+                        .FilterForFabric(resolved ? resolved->fabric_domain
+                                                  : std::string{})
+                        .getServingNames(StorageLevel::RAM)
+                        .size() >= config.replica_num;
+            }
         }
 
         if (!allocation_result.has_value()) {
@@ -4968,7 +5133,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
             if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
                 MasterMetricManager::instance().inc_put_start_alloc_failures();
                 if (has_enough_memory_segments) {
-                    need_mem_eviction_ = true;
+                    request_memory_eviction();
                 }
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
             }
@@ -5022,7 +5187,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
             if (config.replica_num > 0 &&
                 allocated_memory_replicas != config.replica_num &&
                 has_enough_memory_segments) {
-                need_mem_eviction_ = true;
+                request_memory_eviction();
             }
             if (config.nof_replica_num > 0 &&
                 allocated_nof_replicas != config.nof_replica_num) {
@@ -9571,21 +9736,42 @@ void MasterService::EvictionThreadFunc() {
         }
 
         const auto now = std::chrono::system_clock::now();
-        double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
-        if (used_ratio > eviction_high_watermark_ratio_ ||
-            (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
-            LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
-                      << " high_watermark=" << eviction_high_watermark_ratio_
-                      << " need_mem_eviction=" << need_mem_eviction_
-                      << " eviction_ratio=" << eviction_ratio_;
-            double evict_ratio_target = std::max(
-                eviction_ratio_,
-                used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_);
-            double evict_ratio_lowerbound =
-                std::max(evict_ratio_target * 0.5,
-                         used_ratio - eviction_high_watermark_ratio_);
-            BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
-            LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
+        auto run_tier_eviction =
+            [&, this](StorageLevel storage_level, const char* tier,
+                      std::atomic<bool>& allocation_pressure) {
+                const double used_ratio =
+                    segment_manager_.GetMemoryUsage(storage_level).used_ratio();
+                if (used_ratio <= eviction_high_watermark_ratio_ &&
+                    (!allocation_pressure.load(std::memory_order_relaxed) ||
+                     eviction_ratio_ <= 0.0)) {
+                    return false;
+                }
+                LOG(INFO) << "[EVICT-TRIGGER] tier=" << tier
+                          << " memory_ratio=" << used_ratio
+                          << " high_watermark="
+                          << eviction_high_watermark_ratio_
+                          << " allocation_pressure="
+                          << allocation_pressure.load(
+                                 std::memory_order_relaxed)
+                          << " eviction_ratio=" << eviction_ratio_;
+                const double evict_ratio_target = std::max(
+                    eviction_ratio_, used_ratio - eviction_high_watermark_ratio_ +
+                                         eviction_ratio_);
+                const double evict_ratio_lowerbound =
+                    std::max(evict_ratio_target * 0.5,
+                             used_ratio - eviction_high_watermark_ratio_);
+                BatchEvict(evict_ratio_target, evict_ratio_lowerbound,
+                           storage_level);
+                LOG(INFO) << "[EVICT-DONE] tier=" << tier
+                          << " BatchEvict execution completed.";
+                return true;
+            };
+
+        const bool ram_evicted = run_tier_eviction(
+            StorageLevel::RAM, "RAM", need_ram_eviction_);
+        const bool cxl_evicted = run_tier_eviction(
+            StorageLevel::CXL, "CXL", need_cxl_eviction_);
+        if (ram_evicted || cxl_evicted) {
             last_discard_time = now;
         } else if (now - last_discard_time > put_start_release_timeout_sec_) {
             // Try discarding expired processing keys and ongoing replication
@@ -9922,11 +10108,15 @@ MasterService::NamespaceEvictionResult MasterService::EvictNamespaceMemory(
 }
 
 void MasterService::BatchEvict(double evict_ratio_target,
-                               double evict_ratio_lowerbound) {
+                               double evict_ratio_lowerbound,
+                               StorageLevel target_level) {
     // Consume the allocation-pressure signal before this round. A new failure
     // during the round remains visible to the next iteration.
-    const bool allocation_pressure =
-        need_mem_eviction_.exchange(false, std::memory_order_relaxed);
+    auto& allocation_pressure_signal =
+        target_level == StorageLevel::CXL ? need_cxl_eviction_
+                                          : need_ram_eviction_;
+    const bool allocation_pressure = allocation_pressure_signal.exchange(
+        false, std::memory_order_relaxed);
 
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     // Writes that expired before they finished, and replicas whose release
@@ -9937,14 +10127,17 @@ void MasterService::BatchEvict(double evict_ratio_target,
             DiscardExpiredProcessingReplicas(ns, now);
         });
     const uint64_t released_discarded = ReleaseExpiredDiscardedReplicas(now);
-    const eviction::Report report = memory_eviction_->evictor.Run(
+    MemoryEviction* tier_eviction = target_level == StorageLevel::CXL
+                                        ? cxl_memory_eviction_.get()
+                                        : ram_memory_eviction_.get();
+    const eviction::Report report = tier_eviction->evictor.Run(
         eviction::Scope::All(),
         eviction::ObjectGoal{.target_ratio = evict_ratio_target,
                              .min_ratio = evict_ratio_lowerbound});
     const bool made_progress = report.MadeProgress() || released_discarded > 0;
     if (allocation_pressure && !report.stopped && !made_progress &&
         report.filed > 0) {
-        need_mem_eviction_.store(true, std::memory_order_relaxed);
+        allocation_pressure_signal.store(true, std::memory_order_relaxed);
     }
 
     // Counted here, not by the evictor's observers: releasing discarded

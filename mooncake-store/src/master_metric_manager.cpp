@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <glog/logging.h>
+#include <cstdint>
 #include <iomanip>  // For std::fixed, std::setprecision
 #include <limits>   // For std::numeric_limits
 #include <sstream>  // For string building during serialization
@@ -55,6 +56,28 @@ MasterMetricManager::MasterMetricManager()
           "Total bytes currently allocated for file storage in 3fs/nfs"),
       file_total_capacity_("master_total_file_capacity_bytes",
                            "Total capacity for file storage in 3fs/nfs"),
+      dram_allocated_size_(
+          "master_allocated_dram_bytes",
+          "Total bytes currently allocated across all dram segments"),
+      dram_total_capacity_("master_total_dram_capacity_bytes",
+                           "Total dram capacity across all mounted segments"),
+      dram_allocated_size_per_segment_(
+          "segment_allocated_dram_bytes",
+          "Total dram bytes currently allocated of the segment", {"segment"}),
+      dram_total_capacity_per_segment_(
+          "segment_total_dram_capacity_bytes",
+          "Total dram capacity of the mounted segment", {"segment"}),
+      cxl_allocated_size_(
+          "master_allocated_cxl_bytes",
+          "Total bytes currently allocated across all cxl segments"),
+      cxl_total_capacity_("master_total_cxl_capacity_bytes",
+                          "Total cxl capacity across all mounted segments"),
+      cxl_allocated_size_per_segment_(
+          "segment_allocated_cxl_bytes",
+          "Total cxl bytes currently allocated of the segment", {"segment"}),
+      cxl_total_capacity_per_segment_(
+          "segment_total_cxl_capacity_bytes",
+          "Total cxl capacity of the mounted segment", {"segment"}),
       dfs_allocated_size_("master_dfs_allocated_bytes",
                           "Total bytes currently allocated by the DFS "
                           "allocator (shard/bucket mode)"),
@@ -590,6 +613,10 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     mem_total_capacity_.update(0);
     file_allocated_size_.update(0);
     file_total_capacity_.update(0);
+    dram_allocated_size_.update(0);
+    dram_total_capacity_.update(0);
+    cxl_allocated_size_.update(0);
+    cxl_total_capacity_.update(0);
     dfs_allocated_size_.update(0);
     dfs_total_capacity_.update(0);
     dfs_file_count_.update(0);
@@ -797,6 +824,22 @@ int64_t MasterMetricManager::get_total_mem_capacity() {
     return mem_total_capacity_.value();
 }
 
+MasterMetricManager::StorageRatios MasterMetricManager::get_global_used_ratio(
+    void) {
+    double allocated = mem_allocated_size_.value();
+    double capacity = mem_total_capacity_.value();
+    double ram_allocated = dram_allocated_size_.value();
+    double ram_capacity = dram_total_capacity_.value();
+    double cxl_allocated = cxl_allocated_size_.value();
+    double cxl_capacity = cxl_total_capacity_.value();
+
+    if (capacity == 0) {
+        return {0.0, 0.0, 0.0};
+    }
+    double ram_ratio = ram_capacity == 0.0 ? 0.0 : ram_allocated / ram_capacity;
+    double cxl_ratio = cxl_capacity == 0.0 ? 0.0 : cxl_allocated / cxl_capacity;
+    return {allocated / capacity, ram_ratio, cxl_ratio};
+}
 int64_t MasterMetricManager::get_segment_allocated_mem_size(
     const std::string& segment) {
     return mem_allocated_size_per_segment_.value({segment});
@@ -817,6 +860,140 @@ int64_t MasterMetricManager::get_segment_total_mem_capacity(
     return mem_total_capacity_per_segment_.value({segment});
 }
 
+// DRAM Storage Metrics
+void MasterMetricManager::inc_allocated_dram_size(const std::string& segment,
+                                                  int64_t val) {
+    dram_allocated_size_.inc(val);
+    if (!segment.empty()) dram_allocated_size_per_segment_.inc({segment}, val);
+}
+
+void MasterMetricManager::dec_allocated_dram_size(const std::string& segment,
+                                                  int64_t val) {
+    dram_allocated_size_.dec(val);
+    if (!segment.empty()) dram_allocated_size_per_segment_.dec({segment}, val);
+}
+
+void MasterMetricManager::reset_allocated_dram_size() {
+    dram_allocated_size_.reset();
+}
+
+void MasterMetricManager::inc_total_dram_capacity(const std::string& segment,
+                                                  int64_t val) {
+    dram_total_capacity_.inc(val);
+    if (!segment.empty()) dram_total_capacity_per_segment_.inc({segment}, val);
+}
+
+void MasterMetricManager::dec_total_dram_capacity(const std::string& segment,
+                                                  int64_t val) {
+    dram_total_capacity_.dec(val);
+    if (!segment.empty()) dram_total_capacity_per_segment_.dec({segment}, val);
+}
+
+void MasterMetricManager::reset_total_dram_capacity() {
+    dram_total_capacity_.reset();
+}
+
+int64_t MasterMetricManager::get_allocated_dram_size() {
+    return dram_allocated_size_.value();
+}
+
+int64_t MasterMetricManager::get_total_dram_capacity() {
+    return dram_total_capacity_.value();
+}
+
+void MasterMetricManager::reset_segment_allocated_dram_size(
+    const std::string& segment) {
+    dram_allocated_size_per_segment_.update({segment}, 0);
+}
+
+void MasterMetricManager::reset_segment_total_dram_capacity(
+    const std::string& segment) {
+    dram_total_capacity_per_segment_.update({segment}, 0);
+}
+
+// CXL Storage Metrics
+void MasterMetricManager::inc_allocated_cxl_size(const std::string& segment,
+                                                 int64_t val) {
+    cxl_allocated_size_.inc(val);
+    if (!segment.empty()) cxl_allocated_size_per_segment_.inc({segment}, val);
+}
+
+void MasterMetricManager::dec_allocated_cxl_size(const std::string& segment,
+                                                 int64_t val) {
+    cxl_allocated_size_.dec(val);
+    if (!segment.empty()) cxl_allocated_size_per_segment_.dec({segment}, val);
+}
+
+void MasterMetricManager::reset_allocated_cxl_size() {
+    cxl_allocated_size_.reset();
+}
+
+void MasterMetricManager::inc_total_cxl_capacity(const std::string& segment,
+                                                 int64_t val) {
+    cxl_total_capacity_.inc(val);
+    if (!segment.empty()) cxl_total_capacity_per_segment_.inc({segment}, val);
+}
+
+void MasterMetricManager::dec_total_cxl_capacity(const std::string& segment,
+                                                 int64_t val) {
+    cxl_total_capacity_.dec(val);
+    if (!segment.empty()) cxl_total_capacity_per_segment_.dec({segment}, val);
+}
+
+void MasterMetricManager::reset_total_cxl_capacity() {
+    cxl_total_capacity_.reset();
+}
+
+int64_t MasterMetricManager::get_allocated_cxl_size() {
+    return cxl_allocated_size_.value();
+}
+int64_t MasterMetricManager::get_total_cxl_capacity() {
+    return cxl_total_capacity_.value();
+}
+
+void MasterMetricManager::reset_segment_allocated_cxl_size(
+    const std::string& segment) {
+    cxl_allocated_size_per_segment_.update({segment}, 0);
+}
+
+void MasterMetricManager::reset_segment_total_cxl_capacity(
+    const std::string& segment) {
+    cxl_total_capacity_per_segment_.update({segment}, 0);
+}
+
+int64_t MasterMetricManager::get_segment_allocated_dram_size(
+    const std::string& segment) {
+    return dram_allocated_size_per_segment_.value({segment});
+}
+int64_t MasterMetricManager::get_segment_total_dram_capacity(
+    const std::string& segment) {
+    return dram_total_capacity_per_segment_.value({segment});
+}
+int64_t MasterMetricManager::get_segment_allocated_cxl_size(
+    const std::string& segment) {
+    return cxl_allocated_size_per_segment_.value({segment});
+}
+int64_t MasterMetricManager::get_segment_total_cxl_capacity(
+    const std::string& segment) {
+    return cxl_total_capacity_per_segment_.value({segment});
+}
+
+MasterMetricManager::StorageRatios MasterMetricManager::get_segment_used_ratio(
+    const std::string& segment) {
+    double allocated = get_segment_allocated_mem_size(segment);
+    double capacity = get_segment_total_mem_capacity(segment);
+    double ram_allocated = get_segment_allocated_dram_size(segment);
+    double ram_capacity = get_segment_total_dram_capacity(segment);
+    double cxl_allocated = get_segment_allocated_cxl_size(segment);
+    double cxl_capacity = get_segment_total_cxl_capacity(segment);
+    if (capacity == 0) {
+        return {0.0, 0.0, 0.0};
+    }
+    double ram_ratio = ram_capacity == 0.0 ? 0.0 : ram_allocated / ram_capacity;
+    double cxl_ratio = cxl_capacity == 0.0 ? 0.0 : cxl_allocated / cxl_capacity;
+    return {allocated / capacity, ram_ratio, cxl_ratio};
+}
+
 void MasterMetricManager::remove_segment_metrics(const std::string& segment) {
     if (segment.empty() ||
         mem_allocated_size_per_segment_.value({segment}) != 0 ||
@@ -825,6 +1002,10 @@ void MasterMetricManager::remove_segment_metrics(const std::string& segment) {
     }
     mem_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
     mem_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
+    dram_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
+    dram_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
+    cxl_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
+    cxl_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
 }
 
 // NoF segment Metrics
@@ -906,6 +1087,12 @@ void MasterMetricManager::project_storage_usage(
     project_tier(snapshot.nof, nof_allocated_size_, nof_total_capacity_,
                  nof_allocated_size_per_segment_,
                  nof_total_capacity_per_segment_, projected_nof_segments_);
+    project_tier(snapshot.ram, dram_allocated_size_, dram_total_capacity_,
+                 dram_allocated_size_per_segment_,
+                 dram_total_capacity_per_segment_, projected_ram_segments_);
+    project_tier(snapshot.cxl, cxl_allocated_size_, cxl_total_capacity_,
+                 cxl_allocated_size_per_segment_,
+                 cxl_total_capacity_per_segment_, projected_cxl_segments_);
 
     dfs_allocated_size_.update(static_cast<int64_t>(snapshot.dfs.used_bytes));
     dfs_total_capacity_.update(
@@ -2245,6 +2432,14 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_total_capacity_per_segment_);
     serialize_metric(file_allocated_size_);
     serialize_metric(file_total_capacity_);
+    serialize_metric(dram_allocated_size_);
+    serialize_metric(dram_total_capacity_);
+    serialize_metric(dram_allocated_size_per_segment_);
+    serialize_metric(dram_total_capacity_per_segment_);
+    serialize_metric(cxl_allocated_size_);
+    serialize_metric(cxl_total_capacity_);
+    serialize_metric(cxl_allocated_size_per_segment_);
+    serialize_metric(cxl_total_capacity_per_segment_);
     serialize_metric(dfs_allocated_size_);
     serialize_metric(dfs_total_capacity_);
     serialize_metric(dfs_file_count_);
@@ -2532,6 +2727,10 @@ std::string MasterMetricManager::get_summary_string(
     // --- Get current values ---
     int64_t mem_allocated = mem_allocated_size_.value();
     int64_t mem_capacity = mem_total_capacity_.value();
+    int64_t ram_allocated = dram_allocated_size_.value();
+    int64_t ram_capacity = dram_total_capacity_.value();
+    int64_t cxl_allocated = cxl_allocated_size_.value();
+    int64_t cxl_capacity = cxl_total_capacity_.value();
     int64_t nof_allocated = nof_allocated_size_.value();
     int64_t nof_capacity = nof_total_capacity_.value();
     int64_t file_allocated = file_allocated_size_.value();
@@ -2829,6 +3028,18 @@ std::string MasterMetricManager::get_summary_string(
         ss << " (" << std::fixed << std::setprecision(1)
            << ((double)mem_allocated / (double)mem_capacity * 100.0) << "%)";
     }
+    ss << " | DRAM Storage: " << byte_size_to_string(ram_allocated) << " / "
+       << byte_size_to_string(ram_capacity);
+    if (ram_capacity > 0) {
+        ss << " (" << std::fixed << std::setprecision(1)
+           << ((double)ram_allocated / (double)ram_capacity * 100.0) << "%)";
+    }
+    ss << " | CXL Storage: " << byte_size_to_string(cxl_allocated) << " / "
+       << byte_size_to_string(cxl_capacity);
+    if (cxl_capacity > 0) {
+        ss << " (" << std::fixed << std::setprecision(1)
+           << ((double)cxl_allocated / (double)cxl_capacity * 100.0) << "%)";
+    }
     int64_t file_display_capacity = get_total_file_capacity();
     ss << " | NVMe-oF SSD: " << byte_size_to_string(nof_allocated) << " / "
        << byte_size_to_string(nof_capacity);
@@ -3078,8 +3289,7 @@ std::string MasterMetricManager::get_summary_string(
        << "size=" << byte_size_to_string(nof_evicted_size);
 
     // Discard summary
-    ss << " | Discard: "
-       << "Released/Total=" << put_start_release_cnt << "/"
+    ss << " | Discard: " << "Released/Total=" << put_start_release_cnt << "/"
        << put_start_discard_cnt << ", StagingSize="
        << byte_size_to_string(put_start_discarded_staging_size);
 

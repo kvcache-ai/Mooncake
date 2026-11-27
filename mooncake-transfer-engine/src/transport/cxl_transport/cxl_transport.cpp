@@ -222,8 +222,11 @@ int CxlTransport::allocateLocalSegmentID() {
     if (!desc) desc = std::make_shared<SegmentDesc>();
     desc->name = local_server_name_;
 #ifdef ENABLE_MULTI_PROTOCOL
-    if (!desc->protocol.empty()) desc->protocol += ",";
-    desc->protocol += "cxl";
+    // Guard: don't append "cxl" if it's already registered in this desc.
+    if (desc->protocol.find("cxl") == std::string::npos) {
+        if (!desc->protocol.empty()) desc->protocol += ",";
+        desc->protocol += "cxl";
+    }
 #else
     desc->protocol = "cxl";
 #endif

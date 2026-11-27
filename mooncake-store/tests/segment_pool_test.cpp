@@ -432,7 +432,7 @@ TEST(SegmentPoolTest, SameNameKindsRemainIndependentAcrossUnmountRollback) {
         ASSERT_TRUE(native_replica.has_value());
         ASSERT_TRUE(cxl_replica.has_value());
         EXPECT_EQ(ReplicaEndpoint(*native_replica), native.te_endpoint);
-        EXPECT_EQ(ReplicaEndpoint(*cxl_replica), cxl.name);
+        EXPECT_EQ(ReplicaEndpoint(*cxl_replica), cxl.te_endpoint);
     }
     auto transaction = [&] {
         auto access = pool.AcquireWriteAccess();

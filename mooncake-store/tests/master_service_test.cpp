@@ -663,6 +663,50 @@ TEST(MasterFabricPlacementTest, PutUpsertCopyMoveRespectFabricBoundary) {
     EXPECT_EQ(escaped.error(), ErrorCode::INVALID_PARAMS);
 }
 
+TEST(MasterFabricPlacementTest, CxlAllocationBypassesRamPhysicalPlacement) {
+    constexpr size_t kCxlSize = 16 * 1024 * 1024;
+    const auto service_config =
+        MasterServiceConfig::builder()
+            .set_memory_allocator(BufferAllocatorType::CACHELIB)
+            .set_enable_cxl(true)
+            .set_cxl_path("shared-cxl-pool")
+            .set_cxl_size(kCxlSize)
+            .build();
+    MasterService service(service_config);
+    const auto client_id = generate_uuid();
+
+    Segment cxl_segment;
+    cxl_segment.id = generate_uuid();
+    cxl_segment.name = "cxl-placement-client";
+    cxl_segment.base = 0x300000000ULL;
+    cxl_segment.size = kCxlSize;
+    cxl_segment.protocol = "cxl";
+    cxl_segment.te_endpoint = "cxl-transfer-endpoint";
+    ASSERT_TRUE(service.MountSegment(cxl_segment, client_id));
+
+    ReplicateConfig request;
+    request.preferred_storage_level = StorageLevel::CXL;
+    request.preferred_segment = cxl_segment.name;
+    // This is meaningful for RAM/MNNVL placement, but a shared CXL pool must
+    // not be forced through the per-segment AllocateFrom() path.
+    request.requester_placement =
+        PhysicalPlacement{"fabric-a", "rack1", "tray1", 3, 0};
+
+    auto result = service.PutStart(client_id, "cxl-with-placement",
+                                   TenantId::Default(), 1024, request);
+    ASSERT_TRUE(result) << toString(result.error());
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ(result->front().get_storage_level(), StorageLevel::CXL);
+    EXPECT_EQ(result->front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.protocol_,
+              "cxl");
+    EXPECT_EQ(result->front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              cxl_segment.te_endpoint);
+}
+
 TEST(MasterFabricPlacementTest, EvictionHintStaysWithinRequestedFabric) {
     MasterServiceConfig service_config;
     service_config.memory_allocator = BufferAllocatorType::OFFSET;
@@ -3365,6 +3409,61 @@ TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
     // Without the route shrinking a stripe as its slots go, the bucket array
     // would still sit at its high-water mark and this assertion would fail.
     EXPECT_LT(buckets_after, buckets_before / 2);
+}
+
+TEST_F(MasterServiceTest, BatchEvictOnlyRemovesTargetMemoryTier) {
+    auto verify_target_tier = [](StorageLevel target_level,
+                                 StorageLevel retained_level) {
+        SCOPED_TRACE(::testing::Message()
+                     << "target_level=" << target_level
+                     << ", retained_level=" << retained_level);
+        constexpr size_t kCapacity = 16 * 1024 * 1024;
+        constexpr size_t kObjectSize = 1024;
+        auto ram_allocator = std::make_shared<OffsetBufferAllocator>(
+            "evict_ram", 0x500000000, kCapacity, "evict_ram", "tcp",
+            StorageLevel::RAM);
+        auto cxl_allocator = std::make_shared<OffsetBufferAllocator>(
+            "evict_cxl", 0x510000000, kCapacity, "evict_cxl", "cxl",
+            StorageLevel::CXL);
+
+        auto ram_buffer = ram_allocator->allocate(kObjectSize);
+        auto cxl_buffer = cxl_allocator->allocate(kObjectSize);
+        ASSERT_NE(ram_buffer, nullptr);
+        ASSERT_NE(cxl_buffer, nullptr);
+
+        auto service_config =
+            MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+        auto service = std::make_unique<MasterService>(service_config);
+        const TenantId tenant_id = TenantId::Default();
+        const UUID client_id = generate_uuid();
+        const std::string key = target_level == StorageLevel::RAM
+                                    ? "evict_only_ram"
+                                    : "evict_only_cxl";
+
+        std::vector<Replica> replicas;
+        replicas.emplace_back(std::move(ram_buffer), ReplicaStatus::COMPLETE);
+        replicas.emplace_back(std::move(cxl_buffer), ReplicaStatus::COMPLETE);
+        {
+            MasterServiceTestPeer peer(*service);
+            auto guard =
+                peer.GetOrCreateNamespace(tenant_id).objects.WriteKey(key);
+            (void)guard.Publish(
+                client_id, std::chrono::system_clock::time_point{},
+                kObjectSize, std::move(replicas), std::nullopt, false,
+                ObjectDataType::UNKNOWN, "", tenant_id, key);
+        }
+
+        MasterServiceTestPeer(*service).RunBatchEvictForTesting(
+            1.0, 1.0, target_level);
+
+        auto result = service->GetReplicaList(key, tenant_id);
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result->replicas.size(), 1u);
+        EXPECT_EQ(result->replicas.front().get_storage_level(), retained_level);
+    };
+
+    verify_target_tier(StorageLevel::RAM, StorageLevel::CXL);
+    verify_target_tier(StorageLevel::CXL, StorageLevel::RAM);
 }
 
 TEST_F(MasterServiceTest, BatchEvictCountsARoundOnlyWhenItHadSomethingToDo) {

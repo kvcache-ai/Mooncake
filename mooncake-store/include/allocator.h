@@ -134,6 +134,7 @@ class AllocatedBuffer {
 
     [[nodiscard]] std::string getSegmentName() const noexcept;
 
+    [[nodiscard]] StorageLevel getStorageLevel() const noexcept;
     // The endpoint a reader transfers from, as get_descriptor() reports it.
     [[nodiscard]] std::string getTransportEndpoint(
         std::optional<SegmentLocality>* locality = nullptr) const;
@@ -152,7 +153,7 @@ class AllocatedBuffer {
                  transport_endpoint_);
     };
 
-    void change_to_cxl(std::string client_segment_name);
+    void change_to_cxl(std::string transport_endpoint);
     void* get_vaddr_from_cxl();
 
    private:
@@ -181,6 +182,8 @@ class AllocatedBuffer {
 class BufferAllocatorBase {
    public:
     virtual ~BufferAllocatorBase() = default;
+
+    virtual StorageLevel getStorageLevel() const = 0;
 
     virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
     virtual void deallocate(AllocatedBuffer* handle) = 0;
@@ -258,10 +261,16 @@ class BufferAllocatorBase {
 class DummyBufferAllocator final : public BufferAllocatorBase {
    public:
     explicit DummyBufferAllocator(std::string segment_name,
-                                  std::string transport_endpoint)
+                                  std::string transport_endpoint,
+                                  StorageLevel storage_level =
+                                      StorageLevel::RAM)
         : segment_name_(std::move(segment_name)),
-          transport_endpoint_(std::move(transport_endpoint)) {}
+          transport_endpoint_(std::move(transport_endpoint)),
+          storage_level_(storage_level) {}
 
+    StorageLevel getStorageLevel() const override {
+        return storage_level_;
+    }
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
         return nullptr;
     }
@@ -283,6 +292,7 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
    private:
     std::string segment_name_;
     std::string transport_endpoint_;
+    StorageLevel storage_level_;
 };
 
 /**
@@ -309,11 +319,14 @@ class CachelibBufferAllocator
     static tl::expected<std::shared_ptr<CachelibBufferAllocator>, ErrorCode>
     Create(std::string segment_name, size_t base, size_t size,
            std::string transport_endpoint, std::string transport_protocol,
+           StorageLevel level = StorageLevel::RAM,
            ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~CachelibBufferAllocator() override;
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
+
+    StorageLevel getStorageLevel() const override { return storage_level_; }
 
     void deallocate(AllocatedBuffer* handle) override;
 
@@ -341,6 +354,7 @@ class CachelibBufferAllocator
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
                             std::string transport_endpoint,
                             std::string transport_protocol,
+                            StorageLevel level,
                             ReplicaType replica_type);
 
     std::unique_ptr<AllocatedBuffer> adoptImportedBuffer(
@@ -351,6 +365,7 @@ class CachelibBufferAllocator
     const size_t total_size_;
     const std::string transport_endpoint_;
     const std::string transport_protocol_;
+    StorageLevel storage_level_;
     const ReplicaType replica_type_;
 
     // metrics - removed allocated_bytes_ member
@@ -367,6 +382,7 @@ class CachelibBufferAllocator
         std::string segment_name, size_t base, size_t size,
         std::string transport_endpoint, std::string transport_protocol,
         const std::vector<LiveAllocation>& allocations,
+        StorageLevel storage_level,
         ReplicaType replica_type);
 };
 
@@ -379,8 +395,8 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint, std::string transport_protocol,
     const std::vector<LiveAllocation>& allocations,
+    StorageLevel storage_level = StorageLevel::RAM,
     ReplicaType replica_type = ReplicaType::MEMORY);
-
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
  * strategy, which provides efficient memory allocation with bin-based
@@ -393,11 +409,14 @@ class OffsetBufferAllocator
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
                           std::string transport_endpoint,
                           std::string transport_protocol,
+                          StorageLevel level = StorageLevel::RAM,
                           ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~OffsetBufferAllocator() override;
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
+
+    StorageLevel getStorageLevel() const override { return storage_level_; }
 
     void deallocate(AllocatedBuffer* handle) override;
 
@@ -430,6 +449,7 @@ class OffsetBufferAllocator
     const size_t total_size_;
     const std::string transport_endpoint_;
     const std::string transport_protocol_;
+    StorageLevel storage_level_;
     const ReplicaType replica_type_;
 
     // offset allocator implementation
@@ -448,6 +468,7 @@ std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint, std::string transport_protocol,
     const std::vector<LiveAllocation>& allocations,
+    StorageLevel storage_level = StorageLevel::RAM,
     ReplicaType replica_type = ReplicaType::MEMORY);
 
 tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
@@ -455,6 +476,7 @@ CreateBufferAllocator(BufferAllocatorType allocator_type,
                       std::string segment_name, size_t base, size_t size,
                       std::string transport_endpoint,
                       std::string transport_protocol,
+                      StorageLevel level = StorageLevel::RAM,
                       ReplicaType replica_type = ReplicaType::MEMORY);
 
 // The main difference is that it allocates real memory and returns it, while

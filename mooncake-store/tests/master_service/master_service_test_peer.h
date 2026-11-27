@@ -61,7 +61,8 @@ class MasterServiceTestPeer {
 
     // Drive one eviction cycle synchronously, without the periodic worker.
     void RunBatchEvictForTesting(double evict_ratio_target,
-                                 double evict_ratio_lowerbound);
+                                 double evict_ratio_lowerbound,
+                                 StorageLevel target_level = StorageLevel::RAM);
 
     void RunNoFBatchEvictForTesting(double evict_ratio_target,
                                     double evict_ratio_lowerbound);
@@ -250,10 +251,16 @@ class MasterServiceTestPeer {
     }
 
     static auto& NeedMemEviction(MasterService& service) {
-        return service.need_mem_eviction_;
+        return service.need_ram_eviction_;
     }
     static const auto& NeedMemEviction(const MasterService& service) {
-        return service.need_mem_eviction_;
+        return service.need_ram_eviction_;
+    }
+    static auto& NeedCxlEviction(MasterService& service) {
+        return service.need_cxl_eviction_;
+    }
+    static const auto& NeedCxlEviction(const MasterService& service) {
+        return service.need_cxl_eviction_;
     }
 
     static auto& NofSegmentManager(MasterService& service) {

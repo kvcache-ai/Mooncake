@@ -253,6 +253,25 @@ class AllocatorManager {
         return serving_names;
     }
 
+    [[nodiscard]] std::vector<std::string> getServingNames(
+        StorageLevel storage_level) const {
+        std::vector<std::string> serving_names;
+        serving_names.reserve(names_.size());
+        for (const auto& name : names_) {
+            const auto& registrations = allocators_.at(name);
+            if (std::any_of(
+                    registrations.begin(), registrations.end(),
+                    [storage_level](const auto& registration) {
+                        const auto allocator = registration->GetAllocator();
+                        return registration->IsAllocatable() && allocator &&
+                               allocator->getStorageLevel() == storage_level;
+                    })) {
+                serving_names.push_back(name);
+            }
+        }
+        return serving_names;
+    }
+
     // Like getServingNames().size() >= min_count, without materializing names.
     // Registration serving state is still observed on the retained snapshot.
     [[nodiscard]] bool hasEnoughServingNames(size_t min_count) const {
@@ -440,7 +459,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
             }
 
             auto buffer =
-                allocateSingle(allocator_manager, names[0], slice_length);
+                allocateSingle(allocator_manager, names[0], slice_length,
+                               targetStorageLevel(replica_type));
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -460,7 +480,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
             }
 
             auto buffer = allocateSingle(allocator_manager, preferred_segment,
-                                         slice_length);
+                                         slice_length,
+                                         targetStorageLevel(replica_type));
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -495,7 +516,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
                 continue;
             }
 
-            auto buffer = allocateSingle(allocator_manager, name, slice_length);
+            auto buffer = allocateSingle(allocator_manager, name, slice_length,
+                                         targetStorageLevel(replica_type));
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -526,7 +548,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
         }
 
         auto buffer =
-            allocateSingle(allocator_manager, segment_name, slice_length);
+            allocateSingle(allocator_manager, segment_name, slice_length,
+                           StorageLevel::RAM);
         if (buffer == nullptr) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
@@ -536,7 +559,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
 
     std::unique_ptr<AllocatedBuffer> allocateSingle(
         const AllocatorManager& allocator_manager, const std::string& name,
-        const size_t slice_length) {
+        const size_t slice_length, StorageLevel target_level) {
         const auto allocators = allocator_manager.getAllocators(name);
         if (allocators == nullptr || allocators->size() == 0) {
             return nullptr;
@@ -544,8 +567,13 @@ class RandomAllocationStrategy : public AllocationStrategy {
 
         const auto num_segs = allocators->size();
         if (num_segs == 1) {
-            // Fast path for single segment
-            return (*allocators)[0]->Allocate(slice_length);
+            const auto& registration = (*allocators)[0];
+            const auto allocator = registration->GetAllocator();
+            if (!registration->IsAllocatable() || !allocator ||
+                allocator->getStorageLevel() != target_level) {
+                return nullptr;
+            }
+            return registration->Allocate(slice_length);
         }
 
         // Randomly select a start point to distribute
@@ -558,11 +586,14 @@ class RandomAllocationStrategy : public AllocationStrategy {
             for (size_t i = 0; i < num_segs; ++i) {
                 const auto& registration =
                     (*allocators)[(i + seg_offset) % num_segs];
+                const auto allocator = registration->GetAllocator();
+                if (!registration->IsAllocatable() || !allocator ||
+                    allocator->getStorageLevel() != target_level) {
+                    continue;
+                }
                 if (!preferred_hca_names.empty()) {
-                    const auto& allocator = registration->GetAllocator();
                     if (HcaAffinityTier(
-                            allocator ? allocator->GetLocalityHandle().get()
-                                      : nullptr,
+                            allocator->GetLocalityHandle().get(),
                             preferred_hca_names) != tier) {
                         continue;
                     }
@@ -577,6 +608,11 @@ class RandomAllocationStrategy : public AllocationStrategy {
     }
 
    protected:
+    static StorageLevel targetStorageLevel(ReplicaType replica_type) {
+        return replica_type == ReplicaType::NOF_SSD ? StorageLevel::SSD
+                                                    : StorageLevel::RAM;
+    }
+
     // Draws again on a non-serving segment, so the serving segment right after
     // a run of them is not more likely to come first.
     static size_t randomStartIndex(const AllocatorManager& allocator_manager,
@@ -628,7 +664,8 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
                 continue;
             }
             auto buffer = allocateSingle(allocator_manager, preferred_segment,
-                                         slice_length);
+                                         slice_length,
+                                         targetStorageLevel(replica_type));
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -674,7 +711,9 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
                 break;
             }
             const auto& name = names[candidate.name_idx];
-            auto buffer = allocateSingle(allocator_manager, name, slice_length);
+            auto buffer =
+                allocateSingle(allocator_manager, name, slice_length,
+                               targetStorageLevel(replica_type));
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -700,7 +739,9 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
                 used_segments.contains(name)) {
                 continue;
             }
-            auto buffer = allocateSingle(allocator_manager, name, slice_length);
+            auto buffer =
+                allocateSingle(allocator_manager, name, slice_length,
+                               targetStorageLevel(replica_type));
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -830,20 +871,39 @@ class CxlAllocationStrategy : public AllocationStrategy {
         std::vector<Replica> replicas;
         replicas.reserve(replica_num);
 
+        const auto* cxl_segment =
+            allocator_manager.GetSegmentMetadata(cxl_segment_name);
+        std::string transfer_endpoint =
+            cxl_segment != nullptr ? cxl_segment->te_endpoint : std::string{};
         std::unique_ptr<AllocatedBuffer> buffer;
         for (const auto& registration : *cxl_allocators) {
-            if (registration->IsAllocatable()) {
-                buffer = registration->Allocate(slice_length);
-                if (buffer) {
-                    break;
+            const auto allocator = registration->GetAllocator();
+            if (!registration->IsAllocatable() || !allocator ||
+                allocator->getStorageLevel() != StorageLevel::CXL) {
+                continue;
+            }
+            buffer = registration->Allocate(slice_length);
+            if (buffer) {
+                // Hand-built allocator snapshots used by legacy callers and
+                // unit tests may not carry Segment metadata.
+                if (transfer_endpoint.empty()) {
+                    transfer_endpoint = allocator->getTransportEndpoint();
                 }
+                break;
             }
         }
         if (!buffer) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
-        buffer->change_to_cxl(cxl_segment_name);
+        if (transfer_endpoint.empty()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        // The segment name is the master's allocator identity (and can carry
+        // a "/cxl" suffix), while readers must use the endpoint published by
+        // Transfer Engine.  Do not leak the internal identity into transfer
+        // descriptors.
+        buffer->change_to_cxl(transfer_endpoint);
         replicas.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING,
                               replica_type);
 

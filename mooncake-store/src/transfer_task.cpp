@@ -13,6 +13,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "replica.h"
 #include "config/transfer_submitter_config.h"
 #include "config/nof_debug_config.h"
 #include "config/fileread_worker_pool_config.h"
@@ -1132,22 +1133,11 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         }
 
         if (op_code == TransferRequest::READ) {
-            future = submitMemoryReadOperation(handle, slices, 0, intent);
+            future = submitMemoryReadOperation(
+                handle, slices, 0, replica.get_storage_level(), intent);
         } else {
-            TransferStrategy strategy = selectStrategy(handle, slices);
-
-            switch (strategy) {
-                case TransferStrategy::LOCAL_MEMCPY:
-                    future = submitMemcpyOperation(handle, slices, op_code);
-                    break;
-                case TransferStrategy::TRANSFER_ENGINE:
-                    future = submitTransferEngineOperation(handle, slices,
-                                                           op_code, 0, intent);
-                    break;
-                default:
-                    LOG(ERROR) << "Unknown transfer strategy: " << strategy;
-                    return std::nullopt;
-            }
+            future = submitMemoryWriteOperation(
+                handle, slices, 0, replica.get_storage_level(), intent);
         }
     } else if (replica.is_nof_replica()) {
         auto& ssd_desc = replica.get_nof_descriptor();
@@ -1245,9 +1235,33 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             offset += slice.size;
         }
     }
-    auto future = use_local_memcpy
-                      ? submitMemcpyOperations(std::move(memcpy_operations))
-                      : submitTransfer(requests, intent);
+    std::optional<TransferFuture> future;
+    if (use_local_memcpy) {
+        future = submitMemcpyOperations(std::move(memcpy_operations));
+    } else {
+#ifdef ENABLE_MULTI_PROTOCOL
+        if (level_protocols_.size() > 1 && !replicas.empty()) {
+            // All requests in one transfer batch must use the same transport.
+            auto first_level = replicas[0].get_storage_level();
+            for (size_t i = 1; i < replicas.size(); ++i) {
+                if (replicas[i].get_storage_level() != first_level) {
+                    LOG(ERROR)
+                        << "submit_batch: mixed storage levels in batch "
+                        << "(first=" << static_cast<int>(first_level)
+                        << ", replica[" << i << "]="
+                        << static_cast<int>(replicas[i].get_storage_level())
+                        << ")";
+                    return std::nullopt;
+                }
+            }
+            std::string proto = level_protocols_[first_level];
+            future = mp_submitTransfer(requests, proto);
+        } else
+#endif
+        {
+            future = submitTransfer(requests, intent);
+        }
+    }
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -1706,8 +1720,16 @@ TransferSubmitter::submit_batch_get_offload_object(
             offset += slice.size;
         }
     }
-    return use_local_memcpy ? submitMemcpyOperations(std::move(operations))
-                            : submitTransfer(requests, intent);
+    if (use_local_memcpy) {
+        return submitMemcpyOperations(std::move(operations));
+    }
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (level_protocols_.size() > 1) {
+        std::string proto = level_protocols_[StorageLevel::RAM];
+        return mp_submitTransfer(requests, proto);
+    }
+#endif
+    return submitTransfer(requests, intent);
 }
 
 void TransferSubmitter::appendMemcpyOperations(
@@ -1828,6 +1850,84 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     return TransferFuture(state);
 }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+std::optional<TransferFuture> TransferSubmitter::mp_submitTransfer(
+    std::vector<TransferRequest>& requests, std::string& proto) {
+    // Allocate batch ID
+    const size_t batch_size = requests.size();
+    BatchID batch_id = engine_.allocateBatchID(batch_size);
+    if (batch_id == INVALID_BATCH_ID) {
+        LOG(ERROR) << "Failed to allocate batch ID";
+        return std::nullopt;
+    }
+
+    // Submit transfer
+    Status s = engine_.mp_submitTransfer(batch_id, requests, proto);
+    if (!s.ok()) {
+        LOG(ERROR) << "Failed to submit all transfers, error code is "
+                   << s.code();
+        // Note: batch_id will be freed by TransferEngineOperationState
+        // destructor if we create the state object, otherwise we need to
+        // free it here
+        engine_.freeBatchID(batch_id);
+        return std::nullopt;
+    }
+
+    if (batch_id == INVALID_BATCH_ID) {  // INVALID_BATCH_ID
+        LOG(ERROR) << "Invalid batch ID for transfer engine operation";
+        return std::nullopt;
+    }
+
+    // Create state with transfer engine context - no polling thread
+    // needed
+    auto state = std::make_shared<TransferEngineOperationState>(
+        engine_, batch_id, batch_size);
+
+    return TransferFuture(state);
+}
+
+std::optional<TransferFuture>
+TransferSubmitter::mp_submitTransferEngineOperation(
+    const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
+    const TransferRequest::OpCode op_code, std::string& proto,
+    uint64_t buffer_offset) {
+    if (handle.transport_endpoint_.empty()) {
+        LOG(ERROR) << "Transport endpoint is empty for handle with address "
+                   << handle.buffer_address_;
+        return std::nullopt;
+    }
+    SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
+
+    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+        LOG(ERROR) << "Failed to open segment for endpoint='"
+                   << handle.transport_endpoint_ << "'";
+        return std::nullopt;
+    }
+
+    // Create transfer requests
+    std::vector<TransferRequest> requests;
+    requests.reserve(slices.size());
+    uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
+    uint64_t offset = buffer_offset;
+
+    for (size_t i = 0; i < slices.size(); ++i) {
+        const auto& slice = slices[i];
+        if (slice.ptr == nullptr) continue;
+
+        TransferRequest request;
+        request.opcode = op_code;
+        request.source = static_cast<char*>(slice.ptr);
+        request.target_id = seg;
+        request.target_offset = base_address + offset;
+        request.length = slice.size;
+
+        offset += slice.size;
+        requests.emplace_back(request);
+    }
+    return mp_submitTransfer(requests, proto);
+}
+#endif
+
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code, uint64_t src_offset,
@@ -1885,7 +1985,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    uint64_t src_offset, TransferIntent intent) {
+    uint64_t src_offset, StorageLevel storage_level, TransferIntent intent) {
     TransferStrategy strategy = selectStrategy(handle, slices);
 
     if (strategy == TransferStrategy::LOCAL_MEMCPY) {
@@ -1893,6 +1993,20 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
                                      src_offset);
     }
     if (strategy == TransferStrategy::TRANSFER_ENGINE) {
+#ifdef ENABLE_MULTI_PROTOCOL
+        if (level_protocols_.size() > 1) {
+            auto it = level_protocols_.find(storage_level);
+            if (it == level_protocols_.end()) {
+                LOG(ERROR) << "No transport protocol configured for storage "
+                              "level "
+                           << static_cast<int>(storage_level);
+                return std::nullopt;
+            }
+            std::string proto = it->second;
+            return mp_submitTransferEngineOperation(
+                handle, slices, TransferRequest::READ, proto, src_offset);
+        }
+#endif
         return submitTransferEngineOperation(
             handle, slices, TransferRequest::READ, src_offset, intent);
     }
@@ -1904,7 +2018,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryWriteOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    uint64_t dst_offset, TransferIntent intent) {
+    uint64_t dst_offset, StorageLevel storage_level, TransferIntent intent) {
     TransferStrategy strategy = selectStrategy(handle, slices);
 
     if (strategy == TransferStrategy::LOCAL_MEMCPY) {
@@ -1912,6 +2026,20 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryWriteOperation(
                                      dst_offset);
     }
     if (strategy == TransferStrategy::TRANSFER_ENGINE) {
+#ifdef ENABLE_MULTI_PROTOCOL
+        if (level_protocols_.size() > 1) {
+            auto it = level_protocols_.find(storage_level);
+            if (it == level_protocols_.end()) {
+                LOG(ERROR) << "No transport protocol configured for storage "
+                              "level "
+                           << static_cast<int>(storage_level);
+                return std::nullopt;
+            }
+            std::string proto = it->second;
+            return mp_submitTransferEngineOperation(
+                handle, slices, TransferRequest::WRITE, proto, dst_offset);
+        }
+#endif
         return submitTransferEngineOperation(
             handle, slices, TransferRequest::WRITE, dst_offset, intent);
     }
@@ -1940,7 +2068,8 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
             return std::nullopt;
         }
 
-        future = submitMemoryReadOperation(handle, slices, src_offset, intent);
+        future = submitMemoryReadOperation(handle, slices, src_offset,
+                                           replica.get_storage_level(), intent);
     } else if (replica.is_nof_replica()) {
         LOG(ERROR) << "Range read not supported for NoF replicas";
         return std::nullopt;
@@ -1976,7 +2105,8 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeWrite(
             return std::nullopt;
         }
 
-        future = submitMemoryWriteOperation(handle, slices, dst_offset, intent);
+        future = submitMemoryWriteOperation(handle, slices, dst_offset,
+                                            replica.get_storage_level(), intent);
     } else if (replica.is_nof_replica()) {
         LOG(ERROR) << "Range write not supported for NoF replicas";
         return std::nullopt;

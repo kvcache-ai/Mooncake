@@ -38,8 +38,10 @@ std::string MasterServiceTestPeer::
 }
 
 void MasterServiceTestPeer::RunBatchEvictForTesting(
-    double evict_ratio_target, double evict_ratio_lowerbound) {
-    service_.BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+    double evict_ratio_target, double evict_ratio_lowerbound,
+    StorageLevel target_level) {
+    service_.BatchEvict(evict_ratio_target, evict_ratio_lowerbound,
+                        target_level);
 }
 
 void MasterServiceTestPeer::RunNoFBatchEvictForTesting(

@@ -392,15 +392,19 @@ class SegmentManager {
     }
 
     /**
-     * @brief Return current DRAM usage derived from mounted allocators.
+     * @brief Return aggregate RAM+CXL usage derived from mounted allocators.
      *
      * Shared allocators (for example the global CXL allocator) are counted
      * once even when they are referenced by multiple mounted segments.
      */
     [[nodiscard]] StorageUsageSnapshot GetMemoryUsageSnapshot() const;
 
+    /** Return the per-segment usage snapshot for one memory storage level. */
+    [[nodiscard]] StorageUsageSnapshot GetMemoryUsageSnapshot(
+        StorageLevel storage_level) const;
+
     /**
-     * @brief Return aggregate DRAM usage in O(1) without segment_mutex_.
+     * @brief Return aggregate RAM+CXL usage in O(1) without segment_mutex_.
      *
      * Best-effort: used/capacity may tear briefly across mount/unmount,
      * matching the previous metric-gauge watermark reads. An unmounted
@@ -408,7 +412,41 @@ class SegmentManager {
      * deallocate calls drain and the last shared_ptr is dropped.
      */
     [[nodiscard]] StorageUsage GetMemoryUsage() const noexcept {
-        return usage_tracker_->GetUsage();
+        const auto ram = ram_usage_tracker_->GetUsage();
+        const auto cxl = cxl_usage_tracker_->GetUsage();
+        return StorageUsage{.used_bytes = ram.used_bytes + cxl.used_bytes,
+                            .capacity_bytes =
+                                ram.capacity_bytes + cxl.capacity_bytes};
+    }
+
+    /**
+     * @brief Return usage for one memory storage level in O(1).
+     *
+     * SSD is not managed by SegmentManager's memory allocators and therefore
+     * returns an empty usage value.
+     */
+    [[nodiscard]] StorageUsage GetMemoryUsage(
+        StorageLevel storage_level) const noexcept {
+        if (storage_level == StorageLevel::RAM) {
+            return ram_usage_tracker_->GetUsage();
+        }
+        if (storage_level == StorageLevel::CXL) {
+            return cxl_usage_tracker_->GetUsage();
+        }
+        return {};
+    }
+
+    /** Return the global CXL allocator's metric label and live usage. */
+    [[nodiscard]] std::optional<std::pair<std::string, StorageUsage>>
+    GetCxlGlobalAllocatorUsage() const {
+        std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+        if (!cxl_global_allocator_) {
+            return std::nullopt;
+        }
+        return std::make_pair(
+            cxl_global_allocator_->getSegmentName(),
+            StorageUsage{.used_bytes = cxl_global_allocator_->size(),
+                         .capacity_bytes = cxl_global_allocator_->capacity()});
     }
 
     ErrorCode initializeCxlAllocator(const std::string& cxl_path,
@@ -421,8 +459,15 @@ class SegmentManager {
 
    private:
     void AttachMountedUsageTrackers();
+    std::shared_ptr<StorageUsageTracker> GetUsageTracker(
+        StorageLevel storage_level) const noexcept {
+        return storage_level == StorageLevel::CXL ? cxl_usage_tracker_
+                                                  : ram_usage_tracker_;
+    }
 
-    std::shared_ptr<StorageUsageTracker> usage_tracker_ =
+    std::shared_ptr<StorageUsageTracker> ram_usage_tracker_ =
+        std::make_shared<StorageUsageTracker>();
+    std::shared_ptr<StorageUsageTracker> cxl_usage_tracker_ =
         std::make_shared<StorageUsageTracker>();
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;

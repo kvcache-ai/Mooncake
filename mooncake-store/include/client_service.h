@@ -78,6 +78,9 @@ class QueryResult {
  */
 class Client {
    public:
+#ifdef ENABLE_MULTI_PROTOCOL
+    using RegisteredBuffer = TransferEngine::RegisteredBuffer;
+#endif
     virtual ~Client();
 
     // One topology/registration snapshot serves every key or fragment in a
@@ -654,6 +657,11 @@ class Client {
      */
     void* GetBaseAddr();
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<StorageLevel, std::string> GetLevelProtocols() {
+        return level_protocols_;
+    }
+#endif
     /**
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
@@ -1052,6 +1060,15 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
+
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Multi-protocol version
+    ErrorCode InitMultiProtocolTransferEngine(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring,
+        const std::vector<std::string>& protocols,
+        const std::optional<std::string>& device_names);
+#endif
     void InitTransferSubmitter();
     // Submits one transfer without waiting for it. The caller must get() the
     // returned future before it releases the slices or the replica.
@@ -1176,6 +1193,17 @@ class Client {
         const std::vector<const std::vector<Slice>*>& slice_lists,
         const std::vector<DistributedFSDescriptor>& descriptors);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
+        std::vector<PutOperation>& ops, bool is_upsert);
+    std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
+        const std::vector<std::string>& object_keys,
+        const std::vector<QueryResult>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
+#ifdef ENABLE_MULTI_PROTOCOL
+    void DispatchProtocols(const std::vector<std::string>& protocols);
+    // Store Level
+    std::unordered_map<StorageLevel, std::string> level_protocols_;
+#endif
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
     HcaAffinity MakeHcaAffinity() const;
     void AttachHcaAffinity(ReplicateConfig& config,

@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "master_metric_manager.h"
 #include "master_service/master_service_test_peer.h"
 #include "object_test_helpers.h"
 
@@ -3675,6 +3676,10 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesCxlBufferDescriptor) {
     EXPECT_EQ(restored.buffer_address_, address);
     EXPECT_EQ(restored.protocol_, "cxl");
     EXPECT_EQ(restored.transport_endpoint_, segment_name);
+    // Legacy snapshots can identify CXL only through protocol_.  Restore must
+    // preserve the logical tier even though its keepalive allocator is a
+    // generic standby allocator.
+    EXPECT_EQ(replicas.front().get_storage_level(), StorageLevel::CXL);
 
     auto public_replicas =
         service.GetReplicaList("standby_restore_cxl_key", kDefaultTenant);
@@ -3695,6 +3700,55 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesCxlBufferDescriptor) {
     ASSERT_EQ(batch_after.size(), 1);
     ASSERT_FALSE(batch_after[0].has_value());
     EXPECT_EQ(batch_after[0].error(), ErrorCode::REPLICA_IS_NOT_READY);
+}
+
+TEST_F(MasterServiceHATest, RestoreFromStandbyRebuildsRamAndCxlMetrics) {
+    constexpr size_t kRamBytes = 4096;
+    constexpr size_t kCxlBytes = 8192;
+    const std::string ram_segment = "standby_metrics_ram";
+    const std::string cxl_segment = "standby_metrics_cxl";
+    auto& metrics = MasterMetricManager::instance();
+    const auto mem_before = metrics.get_allocated_mem_size();
+    const auto dram_before = metrics.get_allocated_dram_size();
+    const auto cxl_before = metrics.get_allocated_cxl_size();
+
+    {
+        MasterService service(
+            MasterServiceConfig::builder().set_enable_ha(false).build());
+        auto ram = MakeStandbyObject("standby_metrics_ram_key", ram_segment,
+                                     kRamBytes);
+        ram.metadata.replicas.front().id = 101;
+        ram.metadata.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.protocol_ = "tcp";
+        auto cxl = MakeStandbyObject("standby_metrics_cxl_key", cxl_segment,
+                                     kCxlBytes);
+        cxl.metadata.replicas.front().id = 102;
+        cxl.metadata.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.protocol_ = "cxl";
+        cxl.metadata.replicas.front().storage_level = StorageLevel::CXL;
+
+        ASSERT_TRUE(service
+                        .RestoreFromStandbySnapshot(
+                            {ram, cxl}, 7,
+                            {MakeStandbyMemorySegment(ram_segment),
+                             MakeStandbyMemorySegment(cxl_segment)})
+                        .has_value());
+
+        EXPECT_EQ(metrics.get_allocated_mem_size(),
+                  mem_before + kRamBytes + kCxlBytes);
+        EXPECT_EQ(metrics.get_allocated_dram_size(), dram_before + kRamBytes);
+        EXPECT_EQ(metrics.get_allocated_cxl_size(), cxl_before + kCxlBytes);
+        EXPECT_EQ(metrics.get_segment_allocated_dram_size(ram_segment),
+                  kRamBytes);
+        EXPECT_EQ(metrics.get_segment_allocated_cxl_size(cxl_segment),
+                  kCxlBytes);
+    }
+
+    EXPECT_EQ(metrics.get_allocated_mem_size(), mem_before);
+    EXPECT_EQ(metrics.get_allocated_dram_size(), dram_before);
+    EXPECT_EQ(metrics.get_allocated_cxl_size(), cxl_before);
 }
 
 TEST_F(MasterServiceHATest, RemountRejectsExistingSegmentFromDifferentClient) {

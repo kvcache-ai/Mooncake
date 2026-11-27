@@ -51,6 +51,7 @@ using mooncake::AllocatorManager;
 using mooncake::OffsetBufferAllocator;
 using mooncake::RandomAllocationStrategy;
 using mooncake::ReplicaType;
+using mooncake::StorageLevel;
 using mooncake::offset_allocator::OffsetAllocationHandle;
 using mooncake::offset_allocator::OffsetAllocator;
 using mooncake::offset_allocator::OffsetAllocStorageReport;
@@ -299,7 +300,8 @@ class PutAllocationFixture {
         : capacity_(capacity),
           allocator_(std::make_shared<OffsetBufferAllocator>(
               kSegmentName, kBenchmarkBaseAddress, capacity,
-              "benchmark-endpoint", "tcp", ReplicaType::MEMORY)) {
+              "benchmark-endpoint", "tcp", StorageLevel::RAM,
+              ReplicaType::MEMORY)) {
         allocator_manager_.addAllocator(kSegmentName, allocator_);
     }
 

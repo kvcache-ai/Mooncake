@@ -527,6 +527,8 @@ TEST_F(MasterMetricsTest, ProjectStorageUsageRemovesAbsentSegmentLabels) {
     auto& metrics = MasterMetricManager::instance();
     const std::string mem_segment = "projected_removed_mem_segment";
     const std::string nof_segment = "projected_removed_nof_segment";
+    const std::string ram_segment = "projected_removed_ram_segment";
+    const std::string cxl_segment = "projected_removed_cxl_segment";
 
     TieredStorageUsageSnapshot snapshot;
     snapshot.memory.used_bytes = 4096;
@@ -535,6 +537,12 @@ TEST_F(MasterMetricsTest, ProjectStorageUsageRemovesAbsentSegmentLabels) {
     snapshot.nof.used_bytes = 1024;
     snapshot.nof.capacity_bytes = 4096;
     snapshot.nof.segments[nof_segment] = {1024, 4096};
+    snapshot.ram.used_bytes = 3072;
+    snapshot.ram.capacity_bytes = 6144;
+    snapshot.ram.segments[ram_segment] = {3072, 6144};
+    snapshot.cxl.used_bytes = 2048;
+    snapshot.cxl.capacity_bytes = 8192;
+    snapshot.cxl.segments[cxl_segment] = {2048, 8192};
     metrics.project_storage_usage(snapshot);
 
     const std::string with_labels = metrics.serialize_metrics();
@@ -542,15 +550,28 @@ TEST_F(MasterMetricsTest, ProjectStorageUsageRemovesAbsentSegmentLabels) {
               std::string::npos);
     EXPECT_NE(with_labels.find("segment=\"" + nof_segment + "\""),
               std::string::npos);
+    EXPECT_NE(with_labels.find("segment=\"" + ram_segment + "\""),
+              std::string::npos);
+    EXPECT_NE(with_labels.find("segment=\"" + cxl_segment + "\""),
+              std::string::npos);
 
     metrics.project_storage_usage({});
     const std::string after = metrics.serialize_metrics();
     EXPECT_EQ(after.find("segment=\"" + mem_segment + "\""), std::string::npos);
-    EXPECT_EQ(after.find("segment=\"" + nof_segment + "\""), std::string::npos);
+    EXPECT_EQ(after.find("segment=\"" + nof_segment + "\""),
+              std::string::npos);
+    EXPECT_EQ(after.find("segment=\"" + ram_segment + "\""),
+              std::string::npos);
+    EXPECT_EQ(after.find("segment=\"" + cxl_segment + "\""),
+              std::string::npos);
     EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
     EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
     EXPECT_EQ(metrics.get_allocated_nof_size(), 0);
     EXPECT_EQ(metrics.get_total_nof_capacity(), 0);
+    EXPECT_EQ(metrics.get_allocated_dram_size(), 0);
+    EXPECT_EQ(metrics.get_total_dram_capacity(), 0);
+    EXPECT_EQ(metrics.get_allocated_cxl_size(), 0);
+    EXPECT_EQ(metrics.get_total_cxl_capacity(), 0);
 }
 
 TEST_F(MasterMetricsTest, ProjectStorageUsageExposesDfsAllocatorGauges) {
@@ -625,6 +646,8 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
               std::string::npos);
     EXPECT_EQ(metrics.get_allocated_mem_size(), kAllocationSize);
     EXPECT_EQ(metrics.get_total_mem_capacity(), segment.size);
+    EXPECT_EQ(metrics.get_allocated_dram_size(), kAllocationSize);
+    EXPECT_EQ(metrics.get_total_dram_capacity(), segment.size);
     EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
               kAllocationSize);
     EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
@@ -636,6 +659,8 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     admin_server.SetServiceAvailable(false);
     EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
     EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+    EXPECT_EQ(metrics.get_allocated_dram_size(), 0);
+    EXPECT_EQ(metrics.get_total_dram_capacity(), 0);
     {
         const std::string serialized = metrics.serialize_metrics();
         EXPECT_EQ(serialized.find("segment=\"" + segment.name + "\""),
@@ -657,6 +682,8 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     EXPECT_EQ(metrics_resp.http_status, 200);
     EXPECT_EQ(metrics.get_allocated_mem_size(), kAllocationSize);
     EXPECT_EQ(metrics.get_total_mem_capacity(), segment.size);
+    EXPECT_EQ(metrics.get_allocated_dram_size(), kAllocationSize);
+    EXPECT_EQ(metrics.get_total_dram_capacity(), segment.size);
 
     auto segments_resp = FetchUrl(http_port, "/get_all_segments");
     EXPECT_EQ(segments_resp.http_status, 200);

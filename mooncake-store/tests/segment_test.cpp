@@ -114,15 +114,18 @@ TEST(PlacementRpcTest, LegacyLayoutsRemainCompatibleInBothDirections) {
     ASSERT_TRUE(decoded);
     EXPECT_EQ(decoded->host_id, "host1");
     EXPECT_EQ(decoded->SessionId(), "session1");
+    EXPECT_EQ(decoded->PreferredStorageLevel(), StorageLevel::RAM);
     EXPECT_FALSE(decoded->requester_placement);
     EXPECT_FALSE(decoded->fabric_domain);
     decoded->requester_self_id = "rack1.host1#g3";
     decoded->fabric_domain = "fabric1";
     decoded->requester_placement =
         PhysicalPlacement{"fabric1", "rack1", "host1", 3, 2};
+    decoded->preferred_storage_level = StorageLevel::CXL;
     const auto bytes = struct_pack::serialize(*decoded);
     auto restored = struct_pack::deserialize<ReplicateConfig>(bytes);
     ASSERT_TRUE(restored);
+    EXPECT_EQ(restored->PreferredStorageLevel(), StorageLevel::CXL);
     ASSERT_TRUE(restored->requester_placement);
     EXPECT_EQ(*restored->requester_placement, *decoded->requester_placement);
     EXPECT_EQ(*restored->requester_self_id, "rack1.host1#g3");
@@ -397,7 +400,8 @@ class SegmentTest : public ::testing::Test {
         const std::shared_ptr<BufferAllocatorBase>& allocator,
         const std::vector<Segment>& segments) {
         if (segment_manager.cxl_global_allocator_ != allocator) {
-            allocator->AttachUsageTracker(segment_manager.usage_tracker_);
+            allocator->AttachUsageTracker(segment_manager.GetUsageTracker(
+                allocator->getStorageLevel()));
             segment_manager.cxl_global_allocator_ = allocator;
         }
         for (const auto& segment : segments) {
@@ -635,6 +639,12 @@ TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {
     EXPECT_EQ(usage.used_bytes, kAllocationSize);
     EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
     EXPECT_DOUBLE_EQ(usage.used_ratio(), 0.25);
+    EXPECT_EQ(segment_manager.GetMemoryUsage(StorageLevel::RAM).used_bytes,
+              kAllocationSize);
+    EXPECT_EQ(segment_manager.GetMemoryUsage(StorageLevel::RAM).capacity_bytes,
+              kSegmentSize);
+    EXPECT_EQ(segment_manager.GetMemoryUsage(StorageLevel::CXL).capacity_bytes,
+              0u);
     ASSERT_EQ(snapshot.segments.size(), 1u);
     EXPECT_EQ(snapshot.segments.at(segment.name).used_bytes, kAllocationSize);
     EXPECT_EQ(snapshot.segments.at(segment.name).capacity_bytes, kSegmentSize);
@@ -891,7 +901,8 @@ TEST_F(SegmentTest, MemoryUsageSnapshotCountsSharedCxlAllocatorOnce) {
     constexpr size_t kSegmentSize = 16 * 1024 * 1024;
     constexpr size_t kAllocationSize = 4 * 1024 * 1024;
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        "cxl_pool", 0x200000000, kSegmentSize, "cxl_pool", "cxl");
+        "cxl_pool", 0x200000000, kSegmentSize, "cxl_pool", "cxl",
+        StorageLevel::CXL);
     InstallSharedCxlAllocatorForTesting(segment_manager, allocator, {});
 
     auto buffer = allocator->allocate(kAllocationSize);
@@ -899,10 +910,22 @@ TEST_F(SegmentTest, MemoryUsageSnapshotCountsSharedCxlAllocatorOnce) {
 
     auto snapshot = segment_manager.GetMemoryUsageSnapshot();
     auto usage = segment_manager.GetMemoryUsage();
+    const auto cxl_allocator_usage =
+        segment_manager.GetCxlGlobalAllocatorUsage();
+    ASSERT_TRUE(cxl_allocator_usage.has_value());
+    EXPECT_EQ(cxl_allocator_usage->first, "cxl_pool");
+    EXPECT_EQ(cxl_allocator_usage->second.used_bytes, kAllocationSize);
+    EXPECT_EQ(cxl_allocator_usage->second.capacity_bytes, kSegmentSize);
     EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
     EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
     EXPECT_EQ(usage.used_bytes, kAllocationSize);
     EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
+    EXPECT_EQ(segment_manager.GetMemoryUsage(StorageLevel::CXL).used_bytes,
+              kAllocationSize);
+    EXPECT_EQ(segment_manager.GetMemoryUsage(StorageLevel::CXL).capacity_bytes,
+              kSegmentSize);
+    EXPECT_EQ(segment_manager.GetMemoryUsage(StorageLevel::RAM).capacity_bytes,
+              0u);
 
     Segment first;
     first.id = generate_uuid();
@@ -924,6 +947,70 @@ TEST_F(SegmentTest, MemoryUsageSnapshotCountsSharedCxlAllocatorOnce) {
     ASSERT_EQ(snapshot.segments.size(), 1u);
     EXPECT_EQ(snapshot.segments.at("cxl_pool").used_bytes, kAllocationSize);
     EXPECT_EQ(snapshot.segments.at("cxl_pool").capacity_bytes, kSegmentSize);
+}
+
+TEST_F(SegmentTest, MemoryUsageSeparatesRamAndCxlTiers) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET,
+                                   /*enable_cxl=*/true);
+    constexpr size_t kRamCapacity = 16 * 1024 * 1024;
+    constexpr size_t kCxlCapacity = 32 * 1024 * 1024;
+    constexpr size_t kRamAllocation = 4 * 1024 * 1024;
+    constexpr size_t kCxlAllocation = 8 * 1024 * 1024;
+
+    Segment ram_segment;
+    ram_segment.id = generate_uuid();
+    ram_segment.name = "tier_usage_ram";
+    ram_segment.size = kRamCapacity;
+    ram_segment.base = 0x240000000;
+    ram_segment.te_endpoint = ram_segment.name;
+    ram_segment.protocol = "tcp";
+    const UUID ram_client_id = generate_uuid();
+
+    std::shared_ptr<BufferAllocatorBase> ram_allocator;
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(ram_segment,
+                                              SessionFor(ram_client_id)),
+                  ErrorCode::OK);
+        ram_allocator = segment_access.GetAllocator(ram_segment.id);
+    }
+    ASSERT_NE(ram_allocator, nullptr);
+
+    auto cxl_allocator = std::make_shared<OffsetBufferAllocator>(
+        "tier_usage_cxl", 0x280000000, kCxlCapacity, "tier_usage_cxl", "cxl",
+        StorageLevel::CXL);
+    InstallSharedCxlAllocatorForTesting(segment_manager, cxl_allocator, {});
+
+    auto ram_buffer = ram_allocator->allocate(kRamAllocation);
+    auto cxl_buffer = cxl_allocator->allocate(kCxlAllocation);
+    ASSERT_NE(ram_buffer, nullptr);
+    ASSERT_NE(cxl_buffer, nullptr);
+
+    const auto ram_usage =
+        segment_manager.GetMemoryUsage(StorageLevel::RAM);
+    const auto cxl_usage =
+        segment_manager.GetMemoryUsage(StorageLevel::CXL);
+    const auto total_usage = segment_manager.GetMemoryUsage();
+
+    EXPECT_EQ(ram_usage.used_bytes, kRamAllocation);
+    EXPECT_EQ(ram_usage.capacity_bytes, kRamCapacity);
+    EXPECT_EQ(cxl_usage.used_bytes, kCxlAllocation);
+    EXPECT_EQ(cxl_usage.capacity_bytes, kCxlCapacity);
+    EXPECT_EQ(total_usage.used_bytes, kRamAllocation + kCxlAllocation);
+    EXPECT_EQ(total_usage.capacity_bytes, kRamCapacity + kCxlCapacity);
+
+    ram_buffer.reset();
+    cxl_buffer.reset();
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(
+                      ram_segment.id, metrics_dec_capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.CommitUnmountSegment(
+                      ram_segment.id, ram_client_id, metrics_dec_capacity),
+                  ErrorCode::OK);
+    }
 }
 
 TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {

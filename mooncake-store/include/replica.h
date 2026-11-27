@@ -183,6 +183,13 @@ struct ReplicateConfig {
     struct_pack::compatible<std::string, 5> requester_self_id;
     struct_pack::compatible<std::string, 5> fabric_domain;
     struct_pack::compatible<PhysicalPlacement, 5> requester_placement;
+    // Versioned so peers predating tiered storage keep the legacy RAM default
+    // instead of failing to decode the request's base wire layout.
+    struct_pack::compatible<StorageLevel, 6> preferred_storage_level;
+
+    StorageLevel PreferredStorageLevel() const {
+        return preferred_storage_level.value_or(StorageLevel::RAM);
+    }
 
     bool ValidSessionIds(size_t key_count) const {
         return !session_ids ||
@@ -265,7 +272,8 @@ struct ReplicateConfig {
         }
         os << "]";
         os << ", prefer_alloc_in_same_node: "
-           << config.prefer_alloc_in_same_node
+           << config.prefer_alloc_in_same_node;
+        os << ", preferred_storage_level: " << config.PreferredStorageLevel()
            << ", data_type: " << config.data_type;
         if (!config.host_id.empty()) {
             os << ", host_id: " << config.host_id;
@@ -448,6 +456,7 @@ class Replica {
     Replica(Replica&& src) noexcept
         : id_(src.id_),
           data_(std::move(src.data_)),
+          storage_level_(src.storage_level_),
           status_(src.status_),
           refcnt_(src.refcnt_.exchange(0)) {
         // Mark the source as moved-from so its destructor doesn't
@@ -474,6 +483,7 @@ class Replica {
 
         id_ = src.id_;
         data_ = std::move(src.data_);
+        storage_level_ = src.storage_level_;
         status_ = src.status_;
         refcnt_.store(src.refcnt_.exchange(0));
         // Mark src as moved-from.
@@ -760,9 +770,16 @@ class Replica {
                      LocalDiskDescriptor, DistributedFSDescriptor>
             descriptor_variant;
         ReplicaStatus status;
-        YLT_REFL(Descriptor, id, descriptor_variant, status);
+        // Versioned wire extension: peers predating tiered storage keep the
+        // legacy RAM default instead of failing to decode the descriptor.
+        struct_pack::compatible<StorageLevel, 1> storage_level;
+        YLT_REFL(Descriptor, id, descriptor_variant, status, storage_level);
 
         // Helper functions
+        StorageLevel get_storage_level() const noexcept {
+            return storage_level.value_or(StorageLevel::RAM);
+        }
+
         bool is_memory_replica() noexcept {
             return std::holds_alternative<MemoryDescriptor>(descriptor_variant);
         }
@@ -931,6 +948,21 @@ class Replica {
             ReplicaStatus status)
         : id_(id),
           data_(MemoryReplicaData{std::move(buffer)}),
+          storage_level_(
+              std::get<MemoryReplicaData>(data_).buffer
+                  ? std::get<MemoryReplicaData>(data_).buffer->getStorageLevel()
+                  : StorageLevel::RAM),
+          status_(status),
+          refcnt_(0) {}
+
+    // Standby snapshots carry the logical tier independently of the
+    // temporary allocator used while the owning client is not mounted.  Keep
+    // that tier instead of deriving it from the restore-only dummy allocator.
+    Replica(ReplicaID id, std::unique_ptr<AllocatedBuffer> buffer,
+            ReplicaStatus status, StorageLevel storage_level)
+        : id_(id),
+          data_(MemoryReplicaData{std::move(buffer)}),
+          storage_level_(storage_level),
           status_(status),
           refcnt_(0) {}
 
@@ -938,6 +970,12 @@ class Replica {
             ReplicaStatus status, ReplicaType replica_type)
         : id_(id),
           data_(MakeBufferedData(std::move(buffer), replica_type)),
+          storage_level_(replica_type == ReplicaType::NOF_SSD
+                             ? StorageLevel::SSD
+                             : (std::get<MemoryReplicaData>(data_).buffer
+                                    ? std::get<MemoryReplicaData>(data_)
+                                          .buffer->getStorageLevel()
+                                    : StorageLevel::RAM)),
           status_(status),
           refcnt_(0) {}
 
@@ -946,6 +984,7 @@ class Replica {
         : id_(id),
           data_(std::make_unique<DiskReplicaData>(
               DiskReplicaData{std::move(file_path), object_size})),
+          storage_level_(StorageLevel::SSD),
           status_(status),
           refcnt_(0) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
@@ -958,6 +997,7 @@ class Replica {
           data_(std::make_unique<LocalDiskReplicaData>(LocalDiskReplicaData{
               client_id, object_size, std::move(transport_endpoint),
               std::move(owner_session)})),
+          storage_level_(StorageLevel::SSD),
           status_(status),
           refcnt_(0) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
@@ -968,6 +1008,7 @@ class Replica {
         : id_(id),
           data_(std::make_unique<DfsReplicaData>(
               DfsReplicaData{std::move(descriptor)})),
+          storage_level_(StorageLevel::SSD),
           status_(status),
           refcnt_(0) {}
 
@@ -978,6 +1019,7 @@ class Replica {
 
     ReplicaID id_;
     Data data_;
+    StorageLevel storage_level_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 
     friend class MasterService;  // Standby restore advances next_id_
@@ -988,6 +1030,7 @@ inline Replica::Descriptor Replica::get_descriptor() const {
     Replica::Descriptor desc;
     desc.id = id_;
     desc.status = status_;
+    desc.storage_level = storage_level_;
 
     if (is_memory_replica()) {
         const auto& mem_data = std::get<MemoryReplicaData>(data_);

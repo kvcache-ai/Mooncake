@@ -1,6 +1,7 @@
 #include "segment.h"
 
 #include "master_metric_manager.h"
+#include "types.h"
 
 #include <functional>
 namespace mooncake {
@@ -154,17 +155,40 @@ StorageUsageSnapshot SegmentManager::GetMemoryUsageSnapshot() const {
     return snapshot;
 }
 
+StorageUsageSnapshot SegmentManager::GetMemoryUsageSnapshot(
+    StorageLevel storage_level) const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    StorageUsageSnapshot snapshot;
+    std::unordered_set<const BufferAllocatorBase*> counted_allocators;
+
+    auto add_if_matching =
+        [&](const std::shared_ptr<BufferAllocatorBase>& allocator) {
+        if (allocator && allocator->getStorageLevel() == storage_level) {
+            AddAllocatorUsage(snapshot, allocator, counted_allocators);
+        }
+    };
+
+    add_if_matching(cxl_global_allocator_);
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        (void)segment_id;
+        add_if_matching(mounted_segment.buf_allocator);
+    }
+    return snapshot;
+}
+
 void SegmentManager::AttachMountedUsageTrackers() {
     std::unordered_set<const BufferAllocatorBase*> attached_allocators;
     if (cxl_global_allocator_) {
-        cxl_global_allocator_->AttachUsageTracker(usage_tracker_);
+        cxl_global_allocator_->AttachUsageTracker(
+            GetUsageTracker(cxl_global_allocator_->getStorageLevel()));
         attached_allocators.insert(cxl_global_allocator_.get());
     }
     for (auto& [segment_id, mounted_segment] : mounted_segments_) {
         (void)segment_id;
         auto& allocator = mounted_segment.buf_allocator;
         if (allocator && attached_allocators.insert(allocator.get()).second) {
-            allocator->AttachUsageTracker(usage_tracker_);
+            allocator->AttachUsageTracker(
+                GetUsageTracker(allocator->getStorageLevel()));
         }
     }
 }
@@ -258,31 +282,31 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     // Check if cxl storage is enable
     if (segment_manager_->enable_cxl_ && segment.protocol == "cxl") {
         LOG(INFO) << "Start Mounting CXL Segment.";
-        if (segment_manager_->memory_allocator_ ==
+        if (segment_manager_->memory_allocator_ !=
             BufferAllocatorType::CACHELIB) {
-            auto allocator = segment_manager_->cxl_global_allocator_;
-            if (segment_manager_->cxl_global_allocator_ == nullptr) {
-                LOG(ERROR) << "Cxl global allocator has not been initialized.";
-                return ErrorCode::INTERNAL_ERROR;
-            }
-            auto registration =
-                segment_manager_->allocator_manager_.addAllocator(
-                    segment.name, allocator, std::move(owner_session));
-            segment_manager_->allocator_manager_.SetSegmentMetadata(segment);
-            segment_manager_->client_segments_[client_id].push_back(segment.id);
-            segment_manager_->mounted_segments_[segment.id] = {
-                segment, SegmentStatus::OK, allocator, registration};
-            segment_manager_->client_by_name_[segment.name] = client_id;
-            segment_manager_->segment_id_by_name_[segment.name] = segment.id;
-            AddHostSegment(segment_manager_->segments_by_host_, segment);
-
-            LOG(INFO) << "[CXL Segment Mounted Successfully] Segment name: "
-                      << segment.name
-                      << ", Mount size: " << (size / 1024 / 1024 / 1024)
-                      << " GB";
-            return ErrorCode::OK;
+            return ErrorCode::INTERNAL_ERROR;
         }
-        return ErrorCode::INTERNAL_ERROR;
+
+        auto allocator = segment_manager_->cxl_global_allocator_;
+        if (allocator == nullptr) {
+            LOG(ERROR) << "Cxl global allocator has not been initialized.";
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        auto registration = segment_manager_->allocator_manager_.addAllocator(
+            segment.name, allocator, std::move(owner_session));
+        segment_manager_->allocator_manager_.SetSegmentMetadata(segment);
+        segment_manager_->client_segments_[client_id].push_back(segment.id);
+        segment_manager_->mounted_segments_[segment.id] = {
+            segment, SegmentStatus::OK, allocator, registration};
+        segment_manager_->client_by_name_[segment.name] = client_id;
+        segment_manager_->segment_id_by_name_[segment.name] = segment.id;
+        AddHostSegment(segment_manager_->segments_by_host_, segment);
+
+        LOG(INFO) << "[CXL Segment Mounted Successfully] Segment name: "
+                  << segment.name
+                  << ", Mount size: " << (size / 1024 / 1024 / 1024)
+                  << " GB";
+        return ErrorCode::OK;
     }
     // Check if parameters are valid before allocating memory.
     if (buffer == 0 || size == 0) {
@@ -302,14 +326,16 @@ ErrorCode ScopedSegmentAccess::MountSegment(
 
     auto created = CreateBufferAllocator(segment_manager_->memory_allocator_,
                                          segment.name, buffer, size,
-                                         segment.te_endpoint, segment.protocol);
+                                         segment.te_endpoint, segment.protocol,
+                                         StorageLevel::RAM);
     if (!created) {
         return created.error();
     }
     auto allocator = std::move(*created);
     allocator->SetLocality(segment.locality);
 
-    allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
+    allocator->AttachUsageTracker(segment_manager_->GetUsageTracker(
+        allocator->getStorageLevel()));
     auto registration = segment_manager_->allocator_manager_.addAllocator(
         segment.name, allocator, std::move(owner_session));
     segment_manager_->allocator_manager_.SetSegmentMetadata(segment);
@@ -320,6 +346,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     segment_manager_->segment_id_by_name_[segment.name] = segment.id;
     AddHostSegment(segment_manager_->segments_by_host_, segment);
     MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
+    MasterMetricManager::instance().inc_total_dram_capacity(segment.name, size);
 
     return ErrorCode::OK;
 }
@@ -487,7 +514,8 @@ bool ScopedSegmentAccess::ReplaceAllocators(
         if (replacement.expected != replacement.replacement) {
             replacement.replacement->SetLocality(mounted.segment.locality);
             replacement.replacement->AttachUsageTracker(
-                segment_manager_->usage_tracker_);
+                segment_manager_->GetUsageTracker(
+                    replacement.replacement->getStorageLevel()));
             mounted.allocator_registration->SetAllocatable(false);
             mounted.allocator_registration =
                 std::move(manager_replacements[i].replacement);
@@ -674,6 +702,8 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     // Decrease the total capacity
     if (!is_cxl) {
         MasterMetricManager::instance().dec_total_mem_capacity(
+            segment_name, metrics_dec_capacity);
+        MasterMetricManager::instance().dec_total_dram_capacity(
             segment_name, metrics_dec_capacity);
         // Remove per-segment metric labels entirely to avoid stale 0-value
         // entries persisting in Prometheus output (e.g. after snapshot
@@ -974,7 +1004,8 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
 
     auto created = CreateBufferAllocator(
         nof_segment_manager_->memory_allocator_, segment.name, buffer, size,
-        segment.te_endpoint, "nvmeof", ReplicaType::NOF_SSD);
+        segment.te_endpoint, "nvmeof", StorageLevel::SSD,
+        ReplicaType::NOF_SSD);
     if (!created) {
         return created.error();
     }
@@ -1197,32 +1228,45 @@ void SegmentManager::releaseCapacityMetrics() {
         }
         MasterMetricManager::instance().dec_total_mem_capacity(segment.name,
                                                                segment.size);
+        MasterMetricManager::instance().dec_total_dram_capacity(segment.name,
+                                                                segment.size);
         MasterMetricManager::instance().remove_segment_metrics(segment.name);
+    }
+    if (cxl_global_allocator_) {
+        const auto& segment_name = cxl_global_allocator_->getSegmentName();
+        const auto capacity = cxl_global_allocator_->capacity();
+        MasterMetricManager::instance().dec_total_mem_capacity(segment_name,
+                                                               capacity);
+        MasterMetricManager::instance().dec_total_cxl_capacity(segment_name,
+                                                               capacity);
+        MasterMetricManager::instance().remove_segment_metrics(segment_name);
     }
 }
 
 ErrorCode SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
                                                  size_t cxl_size) {
     LOG(INFO) << "Init CXL global allocator.";
-    LOG(INFO) << "[CXL] create allocator with "
-              << "path=" << cxl_path << " base=0x" << std::hex
-              << DEFAULT_CXL_BASE << std::dec << " size=" << cxl_size << " ("
-              << std::fixed << std::setprecision(2)
-              << cxl_size / (1024.0 * 1024 * 1024) << " GB)";
+    LOG(INFO) << "[CXL] create allocator with " << "path=" << cxl_path
+              << " base=0x" << std::hex << DEFAULT_CXL_BASE << std::dec
+              << " size=" << cxl_size << " (" << std::fixed
+              << std::setprecision(2) << cxl_size / (1024.0 * 1024 * 1024)
+              << " GB)";
 
-    auto created =
-        CreateBufferAllocator(BufferAllocatorType::CACHELIB, cxl_path,
-                              DEFAULT_CXL_BASE, cxl_size, cxl_path, "cxl");
+    auto created = CreateBufferAllocator(
+        BufferAllocatorType::CACHELIB, cxl_path, DEFAULT_CXL_BASE, cxl_size,
+        cxl_path, "cxl", StorageLevel::CXL, ReplicaType::MEMORY);
     if (!created) {
         return created.error();
     }
     auto allocator = std::move(*created);
-    allocator->AttachUsageTracker(usage_tracker_);
+    allocator->AttachUsageTracker(
+        GetUsageTracker(allocator->getStorageLevel()));
     {
         std::unique_lock<std::shared_mutex> lock(segment_mutex_);
         cxl_global_allocator_ = std::move(allocator);
     }
     MasterMetricManager::instance().inc_total_mem_capacity(cxl_path, cxl_size);
+    MasterMetricManager::instance().inc_total_cxl_capacity(cxl_path, cxl_size);
     return ErrorCode::OK;
 }
 
