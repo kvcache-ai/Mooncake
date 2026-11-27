@@ -517,8 +517,18 @@ TEST_F(NVLinkIpcAttrTest, RemoveRefCountsAfterFreeAndUninstallInvalidates) {
     first.shm_path = "/other_transport";
     ASSERT_TRUE(transport_.removeMemoryBuffer(first).ok());
     EXPECT_EQ(first.transport_attrs.count(TransportType::NVLINK), 0u);
+    EXPECT_EQ(std::count(first.transports.begin(), first.transports.end(),
+                         TransportType::NVLINK),
+              0);
     EXPECT_EQ(first.shm_path, "/other_transport");
     ASSERT_TRUE(transport_.removeMemoryBuffer(first).ok());
+
+    auto cpu = makeBuffer(0x80000000ULL, 4096, "cpu:0");
+    ASSERT_TRUE(transport_.addMemoryBuffer(cpu, opts).ok());
+    ASSERT_TRUE(transport_.removeMemoryBuffer(cpu).ok());
+    EXPECT_EQ(std::count(cpu.transports.begin(), cpu.transports.end(),
+                         TransportType::NVLINK),
+              0);
 
     auto third = makeBuffer(kSeg1Base + 512 * 1024, 32 * 1024);
     ASSERT_TRUE(transport_.addMemoryBuffer(third, opts).ok());

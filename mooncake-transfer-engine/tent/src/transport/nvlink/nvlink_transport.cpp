@@ -70,6 +70,13 @@ void addNvlinkTransportTag(BufferDesc& desc) {
     }
 }
 
+void removeNvlinkTransportTag(BufferDesc& desc) {
+    desc.transports.erase(
+        std::remove(desc.transports.begin(), desc.transports.end(),
+                    TransportType::NVLINK),
+        desc.transports.end());
+}
+
 Status decodeCudaIpcHandle(const std::string& hex, cudaIpcMemHandle_t& out) {
     if (hex.size() != 2 * sizeof(cudaIpcMemHandle_t)) {
         return Status::InvalidArgument(
@@ -869,6 +876,7 @@ Status NVLinkTransport::removeMemoryBuffer(BufferDesc& desc) {
             }
         }
         desc.transport_attrs.erase(attr_it);
+        removeNvlinkTransportTag(desc);
         return Status::OK();
     }
     LocationParser location(desc.location);
@@ -877,6 +885,7 @@ Status NVLinkTransport::removeMemoryBuffer(BufferDesc& desc) {
             CHECK_CUDA(cudaHostUnregister((void*)desc.addr));
         }
     }
+    removeNvlinkTransportTag(desc);
     return Status::OK();
 }
 
