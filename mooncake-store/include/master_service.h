@@ -1318,12 +1318,12 @@ class MasterService {
     static void SyncCacheTotalAccounting(ObjectMetadata& metadata);
     static void AccountCacheTotalRemoval(ObjectMetadata& metadata);
     std::vector<Replica> PopReplicasWithCacheTotalAccounting(
-        ObjectMetadata& metadata,
+        ObjectMetadata& metadata, const std::string& key,
         const std::function<bool(const Replica&)>& pred_fn);
     std::vector<Replica> PopReplicasWithCacheTotalAccounting(
-        ObjectMetadata& metadata);
+        ObjectMetadata& metadata, const std::string& key);
     size_t EraseReplicasWithCacheTotalAccounting(
-        ObjectMetadata& metadata,
+        ObjectMetadata& metadata, const std::string& key,
         const std::function<bool(const Replica&)>& pred_fn,
         std::vector<ReplicaID>* erased_replica_ids = nullptr);
 
@@ -1433,10 +1433,12 @@ class MasterService {
         const std::function<bool(const std::string& key)>& matches_key);
     static void ApplySoftPinMetricDelta(int metric_delta);
     void ApplySoftPinEvaluation(
-        const ObjectMetadata& metadata,
+        const ObjectMetadata& metadata, const std::string& key,
+        const TenantId& tenant_id,
         const ObjectMetadata::SoftPinEvaluation& result) const;
     bool IsSoftPinActive(
-        const ObjectMetadata& metadata,
+        const ObjectMetadata& metadata, const std::string& key,
+        const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) const;
     void CleanupExpiredSoftPins(
         const std::chrono::system_clock::time_point& now);
@@ -1635,7 +1637,8 @@ class MasterService {
         }
     }
     void CancelPromotionTaskForRemovedReplicas(
-        ObjectMetadata& metadata, route::ObjectState& state,
+        ObjectMetadata& metadata, const std::string& key,
+        const TenantId& tenant_id, route::ObjectState& state,
         const std::vector<ReplicaID>& removed_replica_ids)
         NO_THREAD_SAFETY_ANALYSIS;
 
