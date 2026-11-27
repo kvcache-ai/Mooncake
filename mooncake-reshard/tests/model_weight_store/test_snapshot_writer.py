@@ -213,13 +213,15 @@ def test_snapshot_writer_abort_is_retryable_after_cleanup_failure() -> None:
     remove = store.remove
     store.remove = lambda key, force=False: -1
 
-    # write_tensor() aborts on failure; the cleanup error chains the original.
+    # write_tensor() aborts on failure; the cleanup error keeps the original.
     with pytest.raises(WeightStoreError, match="upload cleanup failed") as info:
         writer.write_tensor(
             source.placement.tensors[0].tensor_id,
             fragment.placement_fragment_id,
         )
-    assert "payload existence check failed" in str(info.value.__context__)
+    original = "original error: WeightStoreError: payload existence check failed"
+    assert original in str(info.value)
+    assert "payload existence check failed" in str(info.value.__cause__)
     assert len(_payload_keys(store, writer)) == 1
 
     with pytest.raises(WeightStoreError, match="upload cleanup failed"):
@@ -236,6 +238,44 @@ def test_snapshot_writer_abort_is_retryable_after_cleanup_failure() -> None:
             fragment.placement_fragment_id,
         )
     writer.abort()
+
+
+def test_snapshot_writer_abort_before_any_upload_makes_no_store_calls() -> None:
+    store, weight_store = make_weight_store()
+    source = source_manifests(dp=1, tp=2)
+    writer = weight_store.begin_weight_snapshot(
+        _snapshot_descriptor(source),
+        _MismatchedTensorAdapter(source),
+    )
+    calls_before = list(store.calls)
+
+    with pytest.raises(WeightStoreError, match="another tensor"):
+        writer.write_tensor("wrong-tensor", object())
+
+    assert store.calls == calls_before
+    assert writer.plan.control_key not in store.objects
+    writer.abort()
+    assert store.calls == calls_before
+    with pytest.raises(WeightStoreError, match="Weight snapshot is closed"):
+        writer.write_tensor("wrong-tensor", object())
+
+
+def test_snapshot_writer_context_abort_before_upload_skips_store() -> None:
+    store, weight_store = make_weight_store()
+    source = source_manifests(dp=1, tp=2)
+    writer = weight_store.begin_weight_snapshot(
+        _snapshot_descriptor(source),
+        _SnapshotAdapter(source),
+    )
+    calls_before = list(store.calls)
+
+    with pytest.raises(RuntimeError, match="caller failed"):
+        with writer:
+            raise RuntimeError("caller failed")
+
+    assert store.calls == calls_before
+    with pytest.raises(WeightStoreError, match="Weight snapshot is closed"):
+        writer.commit()
 
 
 def test_snapshot_writer_rejects_fragment_for_another_tensor() -> None:
