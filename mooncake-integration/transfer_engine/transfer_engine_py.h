@@ -27,6 +27,9 @@
 
 #include "common/base/status.h"
 #include "transfer_engine.h"
+#ifdef USE_INTRA_NVLINK
+#include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
+#endif
 #include "transfer_engine_c.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/transport.h"
@@ -307,6 +310,31 @@ class TransferEnginePy {
     int sendProbe(const std::string &peer_server_name);
 
     std::shared_ptr<TransferEngine> getEngine() const { return engine_; }
+
+    // Experimental: the caller must globally fence transfers and exclude all
+    // concurrent submissions and memory registration changes. This mutex does
+    // not establish engine-wide quiescence. Failure can leave a partial reset.
+    int resetReshardPeersQuiescent(const std::vector<std::string> &peers) {
+#ifdef USE_INTRA_NVLINK
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto *transport = dynamic_cast<mooncake::IntraNodeNvlinkTransport *>(
+            engine_->getTransport("nvlink_intra"));
+        if (!transport) return -1;
+        auto metadata = engine_->getMetadata();
+        for (const auto &peer : peers) {
+            auto peer_id = metadata->getCachedSegmentID(peer);
+            if (peer_id == LOCAL_SEGMENT_ID) return -1;
+            if (peer_id != static_cast<uint64_t>(-1) &&
+                transport->resetPeerMappingsQuiescent(peer_id) != 0)
+                return -1;
+            if (metadata->invalidateRemoteSegmentCache(peer) != 0) return -1;
+            handle_map_.erase(peer);
+        }
+        return 0;
+#else
+        return -1;
+#endif
+    }
 
     uintptr_t getEnginePtr() const { return (uintptr_t)engine_.get(); }
 

@@ -18,6 +18,7 @@
 #include <atomic>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -90,14 +91,22 @@ class NVLinkTransport : public Transport {
     virtual Status removeMemoryBuffer(BufferDesc &desc);
 
     virtual const char *getName() const { return "nvlink"; }
+    bool supportsGlobalAddressing() const override { return true; }
+    Status mapRemoteMemory(SegmentID peer, void *address, size_t size) override;
+    Status unmapRemoteMemory(SegmentID peer, void *address) override;
+
+    Status allocateLocalMemory(void **addr, size_t size,
+                               MemoryOptions &options) override;
+    Status freeLocalMemory(void *addr, size_t size) override;
 
    private:
     void startTransfer(std::vector<NVLinkTask *> &tasks, NVLinkSubBatch *batch);
 
-    void *createSharedMemory(const std::string &path, size_t size);
-
     Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
                                        uint64_t target_id, int src_device);
+
+    Status mapVmmMemory(uint64_t &address, size_t size, SegmentID peer,
+                        bool fixed_address, int device);
 
     Status setPeerAccess();
 
@@ -149,6 +158,16 @@ class NVLinkTransport : public Transport {
     std::string machine_id_;
     uint64_t async_memcpy_threshold_;
     bool host_register_;
+
+    std::mutex allocate_mutex_;
+    // Only allocations explicitly requested through global_address live here.
+    // Explicit uninstall requires callers to release these allocations first.
+    std::unordered_map<void *, std::unique_ptr<CudaSharedMemory>>
+        gva_allocations_;
+    using VmmMap = std::unordered_map<
+        SegmentID,
+        std::unordered_map<uint64_t, std::shared_ptr<CudaSharedMemory>>>;
+    VmmMap vmm_mappings_;
 
     mutable std::mutex register_mutex_;
     // cudaMalloc base address -> serialized cudaIpcMemHandle_t for that

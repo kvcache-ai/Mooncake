@@ -164,6 +164,8 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`, applied **per disk** when several are configured. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
 | `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
+| `MOONCAKE_OFFLOAD_RECLAIM_INTERVAL_SECONDS` | `10` | Interval between passes that reclaim buckets of objects the master removed; `0` disables reclaim. See {ref}`Reclaim of removed objects <ssd-offload-reclaim>` |
+| `MOONCAKE_OFFLOAD_RECLAIM_CYCLE_SECONDS` | `120` | Target time for the passes to check every stored key against the master once. A lap takes longer when passes hit their time limit. |
 
 For `packed` direct bucket writes, each writing thread retains a 4096-byte-aligned buffer
 that grows to fit its largest bucket and is released when the thread exits.
@@ -354,6 +356,18 @@ When `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true`, the FileStorage hea
 The watermark ratios apply to each backend's quota. For `bucket_storage_backend`, the quota is `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` (or the matching entry of `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST`); when that value is `0`, the backend defaults it to 90% of the physical disk capacity. With several disks configured, each disk is checked against its own quota and evicted toward the low watermark on its own. For `file_per_key_storage_backend`, the underlying file backend uses its storage quota, which defaults to 90% of the physical disk capacity in SSD offload mode.
 
 For watermark eviction, the real client notifies the master before deleting local files. If the notification fails, the selected files remain tracked locally and are retried by a later heartbeat.
+
+(ssd-offload-reclaim)=
+### Reclaim of removed objects
+
+Removing an object on the master (remove, remove by regex, remove all, lease or TTL expiry) drops only its metadata. With `bucket_storage_backend`, the real client reclaims the disk space itself:
+
+- Every `MOONCAKE_OFFLOAD_RECLAIM_INTERVAL_SECONDS`, the heartbeat asks the master about the next share of stored keys, sized so that all keys are checked about once per `MOONCAKE_OFFLOAD_RECLAIM_CYCLE_SECONDS`. A pass stops after about 2 seconds and the next one continues where it stopped, so the heartbeat is never held up for long.
+- On the next tick, a bucket whose keys the master no longer has is deleted. A bucket that still holds one live key keeps all its bytes until it is fully dead or evicted.
+- When a removed key is put again and offloaded to the same real client, its stale copy is dropped and the new value is written.
+- Nothing is reclaimed while the real client re-registers its objects with the master, for example after the master lost its segment.
+
+If the offload directory already holds objects when the real client starts, reclaim stays off for the lifetime of that process, and the client logs `Reclaim of removed objects is disabled: the offload directory was not empty at start`. Space from objects removed in that time is freed only by eviction, or by reclaim after the client restarts on an empty directory.
 
 ---
 

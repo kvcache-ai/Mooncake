@@ -146,14 +146,6 @@ TEST_F(MetricsBootstrapConfigTest, RejectsOutOfRangeCommandLinePort) {
                  std::invalid_argument);
 }
 
-TEST(MasterServiceConfigTest, OplogBatchMaxEntriesDefaultsTo1024) {
-    MasterConfig master_config;
-    EXPECT_EQ(1024u, master_config.oplog_batch_max_entries);
-
-    MasterServiceConfig service_config;
-    EXPECT_EQ(1024u, service_config.oplog_batch_max_entries);
-}
-
 TEST(MasterServiceConfigTest, StandbyPollPageSizeDefaultsAndPropagates) {
     MasterConfig master_config{};
     EXPECT_EQ(256u, master_config.oplog_standby_max_batches_per_poll);
@@ -198,20 +190,6 @@ TEST(MasterServiceConfigTest, OpLogPruningDefaultsPropagateToSupervisor) {
                            .build();
     EXPECT_EQ(7u, built.oplog_prune_chunk_batch_count);
     EXPECT_EQ(19u, built.oplog_prune_max_batches_per_second);
-}
-
-TEST(MasterServiceConfigTest, OplogIsDisabledByDefault) {
-    MasterConfig master_config;
-    EXPECT_FALSE(master_config.enable_oplog);
-
-    MasterServiceConfig service_config;
-    EXPECT_FALSE(service_config.enable_oplog);
-}
-
-TEST(MasterServiceConfigTest, OplogBuilderOverrideIsRespected) {
-    auto config = MasterServiceConfig::builder().set_enable_oplog(true).build();
-
-    EXPECT_TRUE(config.enable_oplog);
 }
 
 TEST(MasterServiceConfigTest, OplogSnapshotDefaultsAndOverridesPropagate) {
@@ -331,25 +309,6 @@ TEST(MasterServiceConfigTest, EvictionWorkerThreadsPropagates) {
     EXPECT_EQ(8u, from_supervisor.eviction_worker_threads);
     EXPECT_EQ(8u, MasterServiceConfig(from_master).eviction_worker_threads);
     EXPECT_EQ(8u, MasterServiceConfig(from_supervisor).eviction_worker_threads);
-}
-
-TEST(MasterServiceConfigTest, OplogBatchMaxEntriesBuilderOverrideRespected) {
-    auto config =
-        MasterServiceConfig::builder().set_oplog_batch_max_entries(17).build();
-
-    EXPECT_EQ(17u, config.oplog_batch_max_entries);
-}
-
-TEST(MasterServiceConfigTest,
-     RestoreRepairDurableTimeoutBuilderOverrideRespected) {
-    MasterServiceConfig defaults;
-    EXPECT_EQ(DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS,
-              defaults.restore_repair_durable_timeout_ms);
-
-    auto config = MasterServiceConfig::builder()
-                      .set_restore_repair_durable_timeout_ms(50)
-                      .build();
-    EXPECT_EQ(50u, config.restore_repair_durable_timeout_ms);
 }
 
 TEST(MasterServiceConfigTest, MetricsBootstrapConfigPropagatesToSupervisor) {

@@ -1888,6 +1888,8 @@ class MasterService {
         // Holds an object, whether or not a replica is still valid.
         bool IsPublished() const { return guard_.has_value(); }
 
+        route::Generation Generation() const { return guard_->generation(); }
+
         bool InProcessing() const {
             return IsPublished() && guard_->state().is_processing;
         }
@@ -2200,14 +2202,41 @@ class MasterService {
     // Task manager
     ClientTaskManager task_manager_;
 
-    struct ActiveDrainTask {
-        UUID task_id;
+    struct DrainCandidate {
         TenantId tenant_id;
-        std::string key;
-        std::string source_segment;
-        std::string target_segment;
+        route::ObjectRef object;
+        size_t source_index;
+        uint32_t failed_attempts{0};
+        std::chrono::steady_clock::time_point retry_at{};
+        bool blocked{false};
+    };
+
+    struct ActiveDrainTask {
+        DrainCandidate candidate;
         size_t bytes;
-        std::string unit_key;
+    };
+
+    enum class DrainSourceState {
+        kPendingScan,
+        kAwaitingReclamation,
+        kExhausted,
+        kDrained,
+    };
+
+    struct DrainSourceProgress {
+        // Queued and active candidates keep the source in kPendingScan.
+        size_t outstanding{0};
+        DrainSourceState state{DrainSourceState::kPendingScan};
+        std::chrono::steady_clock::time_point verify_after{};
+        std::unordered_map<std::string, route::Generation> exhausted_attempts;
+    };
+
+    struct DrainPlan {
+        // Indexed by the source's position in CreateDrainJobRequest::segments.
+        std::vector<DrainSourceProgress> sources;
+        std::deque<DrainCandidate> ready;
+        std::deque<DrainCandidate> delayed;
+        uint64_t blocked_units{0};
     };
 
     enum class DrainStopReason { NONE, USER, TIMEOUT };
@@ -2230,16 +2259,20 @@ class MasterService {
         std::string message;
         uint64_t succeeded_units{0};
         uint64_t failed_units{0};
-        uint64_t blocked_units{0};
         uint64_t migrated_bytes{0};
         std::unordered_map<UUID, ActiveDrainTask, boost::hash<UUID>>
             active_tasks;
-        std::unordered_set<std::string> completed_unit_keys;
-        std::unordered_map<std::string, uint32_t> retry_counts;
-        std::unordered_set<std::string> terminal_failed_unit_keys;
+        std::optional<DrainPlan> plan;
+    };
+
+    struct DrainMove {
+        std::string target;
+        size_t bytes;
     };
 
     static constexpr uint32_t kMaxDrainUnitRetries = 3;
+    static constexpr auto kDrainSourceVerificationInterval =
+        std::chrono::seconds(5);
 
     static bool IsDrainJobTerminal(JobStatus status);
     static bool DrainJobStopRequested(const DrainJob& job);
@@ -2254,16 +2287,21 @@ class MasterService {
     void ProcessDrainJobStop(DrainJob& job);
     void HandleDrainJobTimeout(const std::weak_ptr<DrainJob>& job);
     void RefreshDrainJobTasks(DrainJob& job);
+    bool RecordDrainFailure(DrainJob& job, DrainCandidate& candidate);
+    void DelayDrainCandidate(DrainPlan& plan, DrainCandidate candidate,
+                             bool blocked);
     void RequestDrainTaskCancellation(DrainJob& job);
-    bool FinishDrainJobCancellation(DrainJob& job);
+    void FinishDrainJobCancellation(DrainJob& job);
     void ScheduleDrainJobTasks(DrainJob& job);
+    std::vector<bool> ScanDrainSources(
+        DrainJob& job, const std::vector<size_t>& source_indices);
     bool MaybeCompleteDrainJob(DrainJob& job);
+    tl::expected<DrainMove, ErrorCode> PlanDrainMove(
+        DrainCandidate& candidate, const CreateDrainJobRequest& request);
     std::optional<std::string> SelectDrainTargetForKey(
-        const ObjectMetadata& metadata, const std::string& source_segment,
-        const std::vector<std::string>& requested_targets);
-    std::string MakeDrainUnitKey(const TenantId& tenant_id,
-                                 const std::string& key,
-                                 const std::string& source_segment) const;
+        const std::vector<std::string>& existing_segments,
+        const std::string& source_segment,
+        const CreateDrainJobRequest& request);
 
     std::thread job_dispatch_thread_;
     std::atomic<bool> job_dispatch_running_{false};

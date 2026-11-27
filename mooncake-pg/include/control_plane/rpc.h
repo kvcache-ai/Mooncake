@@ -112,6 +112,9 @@ struct RegisterGroupResponse {
     bool success = false;
     std::string reject_reason;
     GroupView view;
+    // Older rejections preserve local-only execution. Explicit Tree backend
+    // rejection is fatal to this communicator; the Agent remains alive.
+    struct_pack::compatible<bool, 20260930> allow_local_fallback;
 };
 
 struct ConfirmReadyForActivationRequest {
