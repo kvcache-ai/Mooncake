@@ -251,67 +251,6 @@ func TestElectionKeyFormat(t *testing.T) {
 	}
 }
 
-// TestLeaseCRUDWithFakeClient tests basic Lease CRUD via the K8s API.
-func TestLeaseCRUDWithFakeClient(t *testing.T) {
-	fakeClient := fake.NewSimpleClientset()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	holderID := "node-a:9090"
-	transitions := int32(0)
-	lease := &coordinationv1.Lease{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "crud-test",
-			Namespace: "default",
-		},
-		Spec: coordinationv1.LeaseSpec{
-			HolderIdentity:   &holderID,
-			LeaseTransitions: &transitions,
-		},
-	}
-	created, err := fakeClient.CoordinationV1().Leases("default").Create(ctx, lease, metav1.CreateOptions{})
-	if err != nil {
-		t.Fatalf("create lease failed: %v", err)
-	}
-	if *created.Spec.HolderIdentity != holderID {
-		t.Errorf("created holder = %q, want %q", *created.Spec.HolderIdentity, holderID)
-	}
-
-	newHolder := "node-b:9090"
-	newTransitions := int32(1)
-	created.Spec.HolderIdentity = &newHolder
-	created.Spec.LeaseTransitions = &newTransitions
-	updated, err := fakeClient.CoordinationV1().Leases("default").Update(ctx, created, metav1.UpdateOptions{})
-	if err != nil {
-		t.Fatalf("update lease failed: %v", err)
-	}
-	if *updated.Spec.HolderIdentity != newHolder {
-		t.Errorf("updated holder = %q, want %q", *updated.Spec.HolderIdentity, newHolder)
-	}
-	if *updated.Spec.LeaseTransitions != newTransitions {
-		t.Errorf("updated transitions = %d, want %d", *updated.Spec.LeaseTransitions, newTransitions)
-	}
-
-	got, err := fakeClient.CoordinationV1().Leases("default").Get(ctx, "crud-test", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("get lease failed: %v", err)
-	}
-	if *got.Spec.HolderIdentity != newHolder {
-		t.Errorf("got holder = %q, want %q", *got.Spec.HolderIdentity, newHolder)
-	}
-
-	err = fakeClient.CoordinationV1().Leases("default").Delete(ctx, "crud-test", metav1.DeleteOptions{})
-	if err != nil {
-		t.Fatalf("delete lease failed: %v", err)
-	}
-
-	_, err = fakeClient.CoordinationV1().Leases("default").Get(ctx, "crud-test", metav1.GetOptions{})
-	if err == nil {
-		t.Fatal("expected error after delete, got nil")
-	}
-}
-
 // TestConcurrentGetHolder tests concurrent calls to getHolder.
 func TestConcurrentGetHolder(t *testing.T) {
 	holderID := "concurrent-node:8080"

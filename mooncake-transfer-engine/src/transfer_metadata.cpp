@@ -821,6 +821,16 @@ int TransferMetadata::publishSegmentDesc(const std::string &segment_name,
     return 0;
 }
 
+int TransferMetadata::invalidateRemoteSegmentCache(const std::string &name) {
+    RWSpinlock::WriteGuard guard(segment_lock_);
+    auto it = segment_name_to_id_map_.find(name);
+    if (it == segment_name_to_id_map_.end()) return 0;
+    if (it->second == LOCAL_SEGMENT_ID) return -1;
+    segment_id_to_desc_map_.erase(it->second);
+    segment_name_to_id_map_.erase(it);
+    return 0;
+}
+
 int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     if (p2p_handshake_mode_) {
         RWSpinlock::WriteGuard guard(segment_lock_);

@@ -11,7 +11,9 @@
 #include "device_comm/device_utils/d2h_request_slot.h"
 #include "device_comm/device_utils/h2d_request_slot.h"
 #include "device_comm/device_collective/algorithms/ring/ring_all_reduce.h"
+#include "device_comm/device_collective/algorithms/tree/tree_all_reduce.h"
 #include "device_comm/device_collective/algorithms/oneshot/one_shot_all_reduce.h"
+#include "device_comm/device_collective/algorithms/twoshot/two_shot_all_reduce.h"
 #include "device_comm/device_collective/device_control_update.h"
 #include "device_comm/device_collective/device_collective_workspace.h"
 #include "device_comm/device_collective/protocols/simple/simple_resources.h"
@@ -30,13 +32,15 @@ struct DeviceCollectiveRuntime::Configuration {
     LLBindings ll;
     RingAllReducePlan ring;
     OneShotAllReducePlan one_shot;
+    TreeAllReducePlan tree;
+    TwoShotAllReducePlan two_shot;
     std::array<int32_t, kMaxNumRanks> active_ranks{};
 };
 
 namespace {
 
-// Simple (3), LL bindings (1), two Plans, and the recovery mirror.
-static_assert(kMaxDeviceControlUpdateOperations >= 7);
+// Simple (3), LL bindings (1), four Plans, and the recovery mirror.
+static_assert(kMaxDeviceControlUpdateOperations >= 3 + 1 + 4 + 1);
 
 bool rangesOverlap(const void* left, const void* right, size_t size) {
     if (size == 0 || left == right) return false;
@@ -148,7 +152,13 @@ DeviceCollectiveRuntime::create(DeviceTransferService& transfer_service,
     PG_TRY(runtime->ring_all_reduce_,
            RingAllReduceAlgorithm::create(device_index, collective, workspace,
                                           *runtime->simple_));
+    PG_TRY(runtime->tree_all_reduce_,
+           TreeAllReduceAlgorithm::create(device_index, collective, workspace,
+                                          *runtime->simple_));
     const auto* p2p = transfer_service.findRoute<P2pRoute>();
+    PG_TRY(runtime->two_shot_all_reduce_,
+           TwoShotAllReduceAlgorithm::create(transfer_service, collective,
+                                             workspace, *runtime->simple_));
     if (max_group_size > 1 && p2p && !p2p->nativeAtomicPeerUuids().empty()) {
         PG_TRY(runtime->ll_, LLResources::create(transfer_service, self_rank,
                                                  max_group_size));
@@ -173,6 +183,7 @@ DeviceCollectiveRuntime::~DeviceCollectiveRuntime() noexcept {
 }
 
 DeviceGroupEndpoint DeviceCollectiveRuntime::localEndpoint() const {
+    const auto* p2p = transfer_service_.findRoute<P2pRoute>();
     return DeviceGroupEndpoint{
         .view_epoch_signal = view_epoch_signals_.offset(),
         .view_epoch_signal_count = static_cast<uint32_t>(active_ranks_count_),
@@ -181,10 +192,18 @@ DeviceGroupEndpoint DeviceCollectiveRuntime::localEndpoint() const {
         .one_shot = one_shot_all_reduce_
                         ? std::optional{one_shot_all_reduce_->localEndpoint()}
                         : std::nullopt,
+        .tree = TreeEndpoint{},
+        .two_shot =
+            p2p ? std::optional{TwoShotEndpoint{
+                      .device_uuid = p2p->deviceUuid(),
+                      .native_atomic_peer_uuids = p2p->nativeAtomicPeerUuids()}}
+                : std::nullopt,
     };
 }
 
-PGResult<void> DeviceCollectiveRuntime::useLocalOnly(uint64_t view_epoch) {
+PGResult<void> DeviceCollectiveRuntime::useLocalOnly(
+    const GroupView& group_view) {
+    const auto view_epoch = group_view.epoch;
     std::lock_guard<std::mutex> lock(mutex_);
     if (shutdown_complete_) return {};
     PG_VALIDATE_STATE(!shutdown_requested_,
@@ -200,7 +219,14 @@ PGResult<void> DeviceCollectiveRuntime::useLocalOnly(uint64_t view_epoch) {
     };
     view.participants.push_back(
         ResolvedParticipant{.in_group_rank = self_rank_});
-    return installGroupView(view, one_shot_all_reduce_ != nullptr);
+    // An isolated joiner captures the same algorithm as the committed group.
+    // Membership is local-only, but algorithm choices remain authoritative.
+    auto choices = group_view.all_reduce_algorithm_choices;
+    PG_TRY(installGroupView(view, one_shot_all_reduce_ != nullptr,
+                            /*require_tree_plan=*/false,
+                            /*require_two_shot_plan=*/true));
+    all_reduce_algorithm_choices_ = std::move(choices);
+    return {};
 }
 
 PGResult<void> DeviceCollectiveRuntime::applyGroupView(const GroupView& view) {
@@ -221,7 +247,16 @@ PGResult<void> DeviceCollectiveRuntime::applyGroupView(const GroupView& view) {
         view.all_reduce_algorithm_choices.end(), [](const auto& choice) {
             return choice.algorithm == DeviceAllReduceAlgorithm::OneShot;
         });
-    PG_TRY(installGroupView(collective_view, one_shot_selected));
+    const bool tree_selected =
+        std::any_of(choices.begin(), choices.end(), [](const auto& choice) {
+            return choice.algorithm == DeviceAllReduceAlgorithm::Tree;
+        });
+    const bool two_shot_selected =
+        std::any_of(choices.begin(), choices.end(), [](const auto& choice) {
+            return choice.algorithm == DeviceAllReduceAlgorithm::TwoShot;
+        });
+    PG_TRY(installGroupView(collective_view, one_shot_selected, tree_selected,
+                            two_shot_selected));
     all_reduce_algorithm_choices_ = std::move(choices);
     return {};
 }
@@ -253,12 +288,24 @@ PGResult<void> DeviceCollectiveRuntime::enqueueAllReduce(
         "device AllReduce buffers must be identical or non-overlapping");
     PG_VALIDATE_STATE(!shutdown_requested_,
                       "device collective runtime is shutting down");
-    const bool use_one_shot = allReduceAlgorithm(buffer_size, datatype, op) ==
-                              DeviceAllReduceAlgorithm::OneShot;
-    PG_VALIDATE_STATE(
-        (use_one_shot ? configuration_->one_shot.status
-                      : configuration_->ring.status) == DevicePlanStatus::Ready,
-        "selected device AllReduce Plan is not ready");
+    const auto algorithm = allReduceAlgorithm(buffer_size, datatype, op);
+    DevicePlanStatus status = DevicePlanStatus::Unavailable;
+    switch (algorithm) {
+        case DeviceAllReduceAlgorithm::Ring:
+            status = configuration_->ring.status;
+            break;
+        case DeviceAllReduceAlgorithm::OneShot:
+            status = configuration_->one_shot.status;
+            break;
+        case DeviceAllReduceAlgorithm::Tree:
+            status = configuration_->tree.status;
+            break;
+        case DeviceAllReduceAlgorithm::TwoShot:
+            status = configuration_->two_shot.status;
+            break;
+    }
+    PG_VALIDATE_STATE(status == DevicePlanStatus::Ready,
+                      "selected device AllReduce Plan is not ready");
     const AllReduceRequest request{
         .send_buffer = send_buffer,
         .recv_buffer = recv_buffer,
@@ -279,11 +326,23 @@ PGResult<void> DeviceCollectiveRuntime::enqueueAllReduce(
         PG_TRY(user_stream.waitEvent(handoff_event_));
 
         PGResult<void> launched;
-        if (use_one_shot) {
-            launched =
-                one_shot_all_reduce_->enqueue(request, user_stream.get());
-        } else {
-            launched = ring_all_reduce_->enqueue(request, user_stream.get());
+        switch (algorithm) {
+            case DeviceAllReduceAlgorithm::Ring:
+                launched =
+                    ring_all_reduce_->enqueue(request, user_stream.get());
+                break;
+            case DeviceAllReduceAlgorithm::OneShot:
+                launched =
+                    one_shot_all_reduce_->enqueue(request, user_stream.get());
+                break;
+            case DeviceAllReduceAlgorithm::Tree:
+                launched =
+                    tree_all_reduce_->enqueue(request, user_stream.get());
+                break;
+            case DeviceAllReduceAlgorithm::TwoShot:
+                launched =
+                    two_shot_all_reduce_->enqueue(request, user_stream.get());
+                break;
         }
 
         PG_TRY(handoff_event_.record(user_stream));
@@ -334,6 +393,8 @@ PGResult<void> DeviceCollectiveRuntime::shutdown() {
         failure_recovery_callback_ = {};
         ring_all_reduce_.reset();
         one_shot_all_reduce_.reset();
+        tree_all_reduce_.reset();
+        two_shot_all_reduce_.reset();
         simple_.reset();
         ll_.reset();
         releaseState();
@@ -406,11 +467,20 @@ PGResult<ResolvedGroupView> DeviceCollectiveRuntime::resolveGroupView(
 }
 
 PGResult<void> DeviceCollectiveRuntime::installGroupView(
-    const ResolvedGroupView& view, bool require_one_shot_plan) {
+    const ResolvedGroupView& view, bool require_one_shot_plan,
+    bool require_tree_plan, bool require_two_shot_plan) {
     Configuration next;
     next.epoch = view.epoch;
     PG_TRY(next.simple, simple_->bindGroupView(view));
     PG_TRY(next.ring, ring_all_reduce_->buildPlan(view));
+    PG_TRY(next.tree, tree_all_reduce_->buildPlan(view));
+    PG_VALIDATE_STATE(
+        !require_tree_plan || view.self_active_index < 0 ||
+            next.tree.status == DevicePlanStatus::Ready,
+        "Selected Tree resources or peer capabilities are unavailable");
+    if (require_two_shot_plan && view.self_active_index >= 0) {
+        PG_TRY(next.two_shot, two_shot_all_reduce_->buildPlan(view));
+    }
     if (require_one_shot_plan && view.self_active_index >= 0) {
         PG_VALIDATE_STATE(ll_ && one_shot_all_reduce_,
                           "Selected one-shot resources are unavailable");
@@ -444,10 +514,13 @@ PGResult<void> DeviceCollectiveRuntime::publishControlState(
     PG_TRY(simple_->appendUpdate(builder, configuration.simple));
     if (ll_) PG_TRY(ll_->appendUpdate(builder, configuration.ll));
     PG_TRY(ring_all_reduce_->appendPlanUpdate(builder, configuration.ring));
+    PG_TRY(two_shot_all_reduce_->appendPlanUpdate(builder,
+                                                  configuration.two_shot));
     if (one_shot_all_reduce_) {
         PG_TRY(one_shot_all_reduce_->appendPlanUpdate(builder,
                                                       configuration.one_shot));
     }
+    PG_TRY(tree_all_reduce_->appendPlanUpdate(builder, configuration.tree));
     *configuration_ = configuration;
     control_mailbox_->control_update_slot.publish(builder.controlUpdate(),
                                                   pinned);
@@ -486,6 +559,8 @@ PGResult<void> DeviceCollectiveRuntime::prepareFailureResume(
         invalid.epoch = kInvalidViewEpoch;
         invalid.ring = RingAllReducePlan{};
         invalid.one_shot = OneShotAllReducePlan{};
+        invalid.tree = TreeAllReducePlan{};
+        invalid.two_shot = TwoShotAllReducePlan{};
         PG_TRY(publishControlState(invalid, /* pinned = */ true,
                                    /* include_active_ranks_mirror = */ true));
     }

@@ -1183,6 +1183,48 @@ TEST_F(SegmentTest, SegmentLifecycleStatusControlsAllocation) {
     EXPECT_TRUE(HasAllocatorForSegment(segment_manager, segment.id));
 }
 
+TEST_F(SegmentTest, MountRejectsClosedEarlierRegistrationOfSameName) {
+    SegmentManager segment_manager;
+    Segment first;
+    first.id = generate_uuid();
+    first.name = "shared_segment";
+    first.base = 0x100000000;
+    first.size = 16 * 1024 * 1024;
+
+    Segment second = first;
+    second.id = generate_uuid();
+    second.base = 0x200000000;
+    Segment replacement = first;
+    replacement.id = generate_uuid();
+    replacement.base = 0x300000000;
+
+    const auto client_id = generate_uuid();
+    auto session = SessionFor(client_id);
+    auto segments = segment_manager.getSegmentAccess();
+    ASSERT_EQ(segments.MountSegment(first, session), ErrorCode::OK);
+    ASSERT_EQ(segments.MountSegment(second, session), ErrorCode::OK);
+    for (auto status : {SegmentStatus::DRAINING, SegmentStatus::DRAINED}) {
+        segments.SetDrainSourceStatus(first.name, status);
+        // The indexed registration is open, while the earlier one is closed.
+        ASSERT_EQ(
+            segments.SetSegmentStatusByName(first.name, SegmentStatus::OK),
+            ErrorCode::OK);
+        EXPECT_EQ(segments.MountSegment(replacement, session),
+                  ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    size_t capacity = 0;
+    ASSERT_EQ(segments.PrepareUnmountSegment(first.id, capacity),
+              ErrorCode::OK);
+    EXPECT_EQ(segments.MountSegment(replacement, session),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    ASSERT_EQ(segments.CommitUnmountSegment(first.id, client_id, capacity),
+              ErrorCode::OK);
+    ASSERT_EQ(segments.PrepareGracefulUnmountSegment(second.id), ErrorCode::OK);
+    EXPECT_EQ(segments.MountSegment(replacement, session), ErrorCode::OK);
+    EXPECT_TRUE(segments.IsSegmentAllocatable(replacement.name));
+}
+
 TEST_F(SegmentTest,
        GracefulUnmountStopsDetachedAllocationButKeepsExistingBuffers) {
     SegmentManager segment_manager;
