@@ -281,17 +281,21 @@ struct P2pMappingImpl : P2pMapping {
             LOG(ERROR) << "[P2P] failed to select device for mapping cleanup";
             return;
         }
+        cudaError_t close_err = cudaSuccess;
 #if defined(USE_CUDA)
         if (kind == P2pHandleKind::Fabric) {
             cuMemUnmap(reinterpret_cast<CUdeviceptr>(ptr), size);
             cuMemAddressFree(reinterpret_cast<CUdeviceptr>(ptr), size);
             cuMemRelease(handle);
         } else {
-            takeError(cudaIpcCloseMemHandle(ptr));
+            close_err = takeError(cudaIpcCloseMemHandle(ptr));
         }
 #else
-        takeError(cudaIpcCloseMemHandle(ptr));
+        close_err = takeError(cudaIpcCloseMemHandle(ptr));
 #endif
+        if (close_err != cudaSuccess)
+            LOG(ERROR) << "[P2P] IPC handle close failed: "
+                       << cudaGetErrorString(close_err);
         if (previous_device != import_device &&
             takeError(cudaSetDevice(previous_device)) != cudaSuccess)
             LOG(ERROR)
