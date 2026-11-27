@@ -29,7 +29,7 @@ int main(int argc, char** argv) {
     google::InitGoogleLogging(argc > 0 ? argv[0] : "mooncake_conductor");
     FLAGS_logtostderr = true;
 
-    // TODO: support conductor metrics
+    // Prometheus metrics are served on the HTTP server at /metrics.
     // ParseLogLevel already reports glog's own values, so they apply directly.
     const auto log_level = mooncake::conductor::common::ParseLogLevel();
     FLAGS_minloglevel = log_level.min_severity;

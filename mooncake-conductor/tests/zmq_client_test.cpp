@@ -916,6 +916,12 @@ TEST(ZMQClient, EventGapReplaysMissingMessagesBeforeLiveMessage) {
                   (std::vector<int64_t>{11, 12, 13, 14, 15}));
         EXPECT_EQ(client.GetDroppedEvents(), 4);
         EXPECT_EQ(client.GetGapCount(), 1);
+        EXPECT_GE(client.GetReplaySuccesses(), 1u);
+        EXPECT_EQ(client.GetReplayFailures(), 0u);
+        ASSERT_TRUE(handler->FindBatch(11, endpoint).has_value());
+        ASSERT_TRUE(handler->FindBatch(15, endpoint).has_value());
+        EXPECT_TRUE(handler->FindBatch(11, endpoint)->metadata.from_replay);
+        EXPECT_FALSE(handler->FindBatch(15, endpoint)->metadata.from_replay);
         client.Stop();
     }
 }
@@ -966,6 +972,8 @@ TEST(ZMQClient, ReplayWithTopicStillRejectsMalformedFrames) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         EXPECT_TRUE(client.IsStale());
+        EXPECT_GT(client.GetReplayFailures(), 0u);
+        EXPECT_EQ(client.GetReplaySuccesses(), 0u);
         EXPECT_EQ(client.GetLastSequence(), 10);
         EXPECT_FALSE(handler->FindBatch(15, config.endpoint).has_value());
         client.Stop();
@@ -1211,6 +1219,7 @@ TEST(ZMQClient, HandlerFailureMarksLiveOnlySourceStaleWithoutAdvancing) {
 
     ASSERT_TRUE(WaitForStale(client, std::chrono::seconds(1)));
     EXPECT_EQ(client.GetLastSequence(), -1);
+    EXPECT_EQ(client.GetBatchFailures(), 1u);
     EXPECT_EQ(handler->StaleNotificationCount(), 1u);
     EXPECT_TRUE(handler->WasSourceMarkedStale("test-pod", endpoint, -1));
     EXPECT_NE(client.GetStaleReason().find(
@@ -1236,6 +1245,7 @@ TEST(ZMQClient, HandlerFailureMarksReplaySourceStaleWithoutAdvancing) {
 
     ASSERT_TRUE(WaitForStale(client, std::chrono::seconds(1)));
     EXPECT_EQ(client.GetLastSequence(), -1);
+    EXPECT_EQ(client.GetBatchFailures(), 1u);
     EXPECT_EQ(handler->StaleNotificationCount(), 1u);
     EXPECT_TRUE(handler->WasSourceMarkedStale("test-pod", endpoint, -1));
     EXPECT_NE(client.GetStaleReason().find(

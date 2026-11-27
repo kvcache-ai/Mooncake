@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "conductor/common/types.h"
+#include "conductor/kvevent/event_metrics.h"
 #include "conductor/prefixindex/prefix_indexer.h"
 #include "conductor/zmq/event_type.h"
 #include "conductor/zmq/zmq_client.h"
@@ -57,6 +58,14 @@ class KVEventHandler : public zmq::EventHandler {
                        const std::string& reason) override;
 
     void MarkUnavailable();
+    // Export only this subscription; the handler owns the counter lifetime.
+    std::string RenderMetrics(const std::string& labels) const {
+        return metrics_.Render(labels);
+    }
+    std::map<std::string, std::string> RenderMetricFamilies(
+        const std::string& labels) const {
+        return metrics_.RenderFamilies(labels);
+    }
 
     // Waits for callbacks admitted before MarkUnavailable() to finish. Must be
     // called without EventManager::mu_ held.
@@ -136,6 +145,7 @@ class KVEventHandler : public zmq::EventHandler {
         KVEventHandler* handler_;
     };
 
+    EventMetrics metrics_;
     EventManager* manager_;
     common::ServiceConfig service_;
     std::mutex lifecycle_mu_;
@@ -205,6 +215,7 @@ class EventManager {
         const std::string& instance_id, const std::string& tenant_id,
         int dp_rank);
 
+    std::string RenderMetrics();
     void RegisterHttpHandlers();
 
     prefixindex::PrefixCacheTable indexer_;
