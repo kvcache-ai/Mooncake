@@ -156,7 +156,13 @@ class DeepEPBackend:
         rendezvous.publish(f"member/{self.shard}", descriptor)
         for peer in range(layout.num_shards):
             other = rendezvous.wait(f"member/{peer}")
-            if any(other[k] != descriptor[k] for k in descriptor if k != "nonce"):
+            # Lookup capacity sizes the caller's receive buffer and queues;
+            # peers only need matching table and communicator geometry.
+            if any(
+                other[k] != descriptor[k]
+                for k in descriptor
+                if k not in ("nonce", "capacity")
+            ):
                 raise ValueError(f"Engram configuration mismatch at shard {peer}")
         if self.shard == 0:
             rendezvous.publish(
