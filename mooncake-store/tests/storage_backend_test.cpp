@@ -21,6 +21,7 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
@@ -539,6 +540,58 @@ TEST_F(StorageBackendTest, BucketScan) {
         ASSERT_FALSE(res.has_value());
         EXPECT_EQ(res.error(), ErrorCode::INVALID_PARAMS);
         EXPECT_TRUE(scan_keys.empty());
+    }
+}
+
+TEST_F(StorageBackendTest, BucketScanContinuesPastUnmappedKeys) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> buckets;
+    std::unordered_map<std::string, std::string> data;
+    ASSERT_TRUE(BatchOffloadUtil(backend, keys, sizes, data, buckets));
+
+    std::vector<std::string> first_bucket_keys;
+    std::vector<StorageObjectMetadata> first_bucket_metadata;
+    std::vector<int64_t> first_bucket_ids;
+    ASSERT_TRUE(backend.BucketScan({0, 0}, first_bucket_keys,
+                                   first_bucket_metadata, first_bucket_ids,
+                                   10));
+    ASSERT_EQ(first_bucket_keys.size(), 10u);
+    ASSERT_EQ(first_bucket_ids.size(), 1u);
+
+    std::vector<std::string> scanned;
+    std::vector<StorageObjectMetadata> metadata;
+    std::vector<int64_t> scanned_buckets;
+    auto cursor =
+        backend.BucketScan({0, 0}, scanned, metadata, scanned_buckets, 2);
+    ASSERT_TRUE(cursor);
+    EXPECT_EQ(cursor->key_index, 2u);
+    // Removing a key before the cursor must not shift its physical position.
+    // Holes at and after the cursor must not consume the emitted-key budget.
+    backend.UnmapKeys(
+        {{first_bucket_ids.front(),
+          {first_bucket_keys[0], first_bucket_keys[2], first_bucket_keys[5]}}});
+    scanned.clear();
+    metadata.clear();
+    scanned_buckets.clear();
+    cursor = backend.BucketScan(*cursor, scanned, metadata, scanned_buckets, 3);
+    ASSERT_TRUE(cursor);
+    EXPECT_EQ(scanned, (std::vector<std::string>{first_bucket_keys[3],
+                                                 first_bucket_keys[4],
+                                                 first_bucket_keys[6]}));
+    EXPECT_EQ(cursor->bucket_id, first_bucket_ids.front());
+    EXPECT_EQ(cursor->key_index, 7u);
+    ASSERT_EQ(metadata.size(), 3u);
+    for (size_t i = 0; i < metadata.size(); ++i) {
+        const size_t position = std::array<size_t, 3>{3, 4, 6}[i];
+        EXPECT_EQ(metadata[i].offset, first_bucket_metadata[position].offset);
+        EXPECT_EQ(metadata[i].data_size,
+                  first_bucket_metadata[position].data_size);
     }
 }
 
