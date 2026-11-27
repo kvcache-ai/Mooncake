@@ -78,6 +78,15 @@ const SharedHostMapper::ImportedRegion* SharedHostMapper::ResolveHandle(
     region.length = length;
 
     if (parsed.owner_pid == static_cast<int>(getpid())) {
+        if (!host_memfd::IsOwnHandle(parsed)) {
+            // Same pid from another PID namespace on this host. Our fd of
+            // that number names different memory, so keep using HIXL.
+            LOG(INFO) << "Shared host segment " << handle
+                      << " carries our pid but not our memfd; falling back "
+                         "to HIXL";
+            regions_.emplace(handle, ImportedRegion{});
+            return nullptr;
+        }
         // Our own allocation. The address is already valid here, so mapping it
         // a second time would only burn address space.
         region.local_base = reinterpret_cast<void*>(remote_base);

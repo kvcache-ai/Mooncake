@@ -382,6 +382,23 @@ inline bool ParseLocalHandle(const std::string& handle, ParsedHandle& parsed) {
     return true;
 }
 
+// True only when `parsed` names a memfd this very process exported, so the
+// owner's address can be used in place. A matching pid alone is not proof:
+// pids are per PID namespace while boot_id is per machine, so a peer in another
+// container on this host can export a handle carrying our pid. Using its
+// address here would read or write unrelated local memory and report success.
+// The inode check ties the handle to the memfd our own fd actually refers to.
+inline bool IsOwnHandle(const ParsedHandle& parsed) {
+    if (parsed.owner_pid != static_cast<int>(getpid())) {
+        return false;
+    }
+    struct stat st = {};
+    if (stat(parsed.path.c_str(), &st) != 0) {
+        return false;
+    }
+    return static_cast<unsigned long long>(st.st_ino) == parsed.inode;
+}
+
 // Importer side: open `handle` and map it over `window`, a reservation of
 // exactly `size` bytes obtained from ReserveAlignedWindow(). Fails, without
 // touching `window`, whenever the handle cannot be proven to name the memfd
