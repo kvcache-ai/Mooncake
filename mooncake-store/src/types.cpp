@@ -42,6 +42,7 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::CHECKSUM_MISMATCH, "CHECKSUM_MISMATCH"},
         {ErrorCode::RPC_FAIL, "RPC_FAIL"},
         {ErrorCode::RPC_TIMEOUT, "RPC_TIMEOUT"},
+        {ErrorCode::OFFLOAD_NOT_DISPATCHED, "OFFLOAD_NOT_DISPATCHED"},
         {ErrorCode::ETCD_OPERATION_ERROR, "ETCD_OPERATION_ERROR"},
         {ErrorCode::ETCD_KEY_NOT_EXIST, "ETCD_KEY_NOT_EXIST"},
         {ErrorCode::ETCD_TRANSACTION_FAIL, "ETCD_TRANSACTION_FAIL"},

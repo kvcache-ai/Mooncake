@@ -405,6 +405,7 @@ enum class ErrorCode : int32_t {
     // RPC errors (Range: -900 to -999)
     RPC_FAIL = -900,     ///< RPC operation failed.
     RPC_TIMEOUT = -901,  ///< RPC call timed out (client-side deadline hit).
+    OFFLOAD_NOT_DISPATCHED = -902,  ///< The completion handler could not run.
 
     // High availability errors (Range: -1000 to -1099)
     ETCD_OPERATION_ERROR = -1000,   ///< etcd operation failed.

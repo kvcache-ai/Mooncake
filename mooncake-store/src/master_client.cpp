@@ -446,9 +446,15 @@ template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
     const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
     Args&&... args) {
+    constexpr bool offload_completion = std::is_same_v<
+        RpcNameTraits<ServiceMethod>,
+        RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess>>;
+    constexpr auto not_dispatched = offload_completion
+                                        ? ErrorCode::OFFLOAD_NOT_DISPATCHED
+                                        : ErrorCode::RPC_FAIL;
     RpcDrainGuard::ScopedCall inflight(rpc_drain_);
     if (!inflight.ok()) {
-        return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        return tl::make_unexpected(not_dispatched);
     }
     // Increment RPC counter
     if (metrics_) {
@@ -466,13 +472,21 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
                 });
             if (!ret.has_value()) {
                 LOG(ERROR) << "Client not available";
-                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+                co_return tl::make_unexpected(not_dispatched);
             }
             auto result = co_await std::move(ret.value());
             if (!result) {
                 if (result.error().code == coro_rpc::errc::timed_out) {
                     LOG(ERROR) << "RPC call timed out: " << result.error().msg;
                     co_return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+                }
+                if constexpr (offload_completion) {
+                    if (result.error().code ==
+                        coro_rpc::errc::function_not_registered) {
+                        LOG(ERROR) << "Offload completion RPC unavailable: "
+                                   << result.error().msg;
+                        co_return tl::make_unexpected(not_dispatched);
+                    }
                 }
                 LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
