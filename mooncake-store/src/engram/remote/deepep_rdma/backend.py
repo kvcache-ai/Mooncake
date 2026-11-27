@@ -33,7 +33,6 @@ class DeepEPBackend:
         caller_id,
         max_lookup_rows,
         local_dir=None,
-        rdma_device=None,
         timeout=300,
         num_callers=1,
         assignment=None,
@@ -78,7 +77,6 @@ class DeepEPBackend:
                 session_id,
                 caller_id,
                 local_dir,
-                rdma_device,
                 timeout,
             )
         except BaseException:
@@ -94,7 +92,6 @@ class DeepEPBackend:
         session_id,
         caller_id,
         local_dir,
-        rdma_device,
         timeout,
     ):
         import torch
@@ -174,8 +171,6 @@ class DeepEPBackend:
         if depth > 32768 or layout.num_shards * qps > 2048:
             raise ValueError("Lookup capacity/shard count exceeds DeepEP queue limits")
         env = {"NCCL_GIN_TYPE": "3"}
-        if rdma_device is not None:
-            env["NCCL_IB_HCA"] = "=" + rdma_device
         previous = {key: os.environ.get(key) for key in env}
         try:
             os.environ.update(env)

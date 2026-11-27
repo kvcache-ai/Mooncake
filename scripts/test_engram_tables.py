@@ -2,8 +2,11 @@
 
 import errno
 import gc
+import os
+import sys
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -91,6 +94,61 @@ def test_auto_and_manual_config_have_distinct_placement_contracts():
         replace(manual, shard_id=2)
     with pytest.raises(ValueError):
         replace(manual, group_id=None)
+
+
+@pytest.mark.parametrize("nic_filter", [None, "=mlx5_0", "=mlx5_0,mlx5_1"])
+def test_remote_connection_preserves_nccl_nic_configuration(monkeypatch, nic_filter):
+    from mooncake._engram.remote.deepep_rdma import backend, jit, local_share
+
+    if nic_filter is None:
+        monkeypatch.delenv("NCCL_IB_HCA", raising=False)
+    else:
+        monkeypatch.setenv("NCCL_IB_HCA", nic_filter)
+    monkeypatch.setenv("NCCL_GIN_TYPE", "previous")
+    torch = ModuleType("torch")
+    torch.Tensor = type("Tensor", (), {})
+    torch.cuda = SimpleNamespace(
+        current_device=lambda: 0, is_current_stream_capturing=lambda: False
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    records = {}
+    rendezvous = SimpleNamespace(
+        publish=records.__setitem__, wait=records.__getitem__, close=lambda: None
+    )
+    assignment = SimpleNamespace(rendezvous=lambda *args: rendezvous)
+
+    def connect(unique_id, world, rank):
+        assert (world, rank) == (1, 0)
+        assert os.environ.get("NCCL_IB_HCA") == nic_filter
+        assert os.environ["NCCL_GIN_TYPE"] == "3"
+        raise RuntimeError("native connection failed")
+
+    monkeypatch.setattr(
+        jit,
+        "load_bridge",
+        lambda: SimpleNamespace(unique_id=lambda: b"test", connect=connect),
+    )
+    monkeypatch.setattr(
+        local_share,
+        "LocalShare",
+        lambda *args: SimpleNamespace(storage=None, close=lambda: None),
+    )
+    with pytest.raises(RuntimeError, match="native connection failed"):
+        backend.DeepEPBackend(
+            tables={"h": {"num_rows": 1, "row_bytes": 8}},
+            namespace="nic-test",
+            local_tables={"h": np.zeros((1, 8), dtype=np.uint8)},
+            owners={"h": 0},
+            shard_id=0,
+            num_shards=1,
+            master_addr=None,
+            session_id="test",
+            caller_id=0,
+            max_lookup_rows=16,
+            assignment=assignment,
+        )
+    assert os.environ.get("NCCL_IB_HCA") == nic_filter
+    assert os.environ["NCCL_GIN_TYPE"] == "previous"
 
 
 def make_store(path, width=17, persistent=True):

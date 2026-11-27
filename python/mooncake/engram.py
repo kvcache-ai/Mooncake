@@ -44,7 +44,6 @@ class EngramStoreConfig:
     caller_id: int | None = None
     num_callers: int | None = None
     max_lookup_rows: int | None = None
-    rdma_device: str | None = None
     timeout: float = 300
 
     def __post_init__(self):
@@ -77,7 +76,6 @@ class EngramStoreConfig:
                 "caller_id",
                 "num_callers",
                 "max_lookup_rows",
-                "rdma_device",
             ):
                 if getattr(self, name) is not None:
                     raise ValueError(f"{name} requires backend='deepep_rdma'")
@@ -100,10 +98,6 @@ class EngramStoreConfig:
         for name in ("node_id", "model_key"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"Remote {name} must be a nonempty string")
-        if self.rdma_device is not None and (
-            not isinstance(self.rdma_device, str) or not self.rdma_device
-        ):
-            raise ValueError("rdma_device must be a nonempty string")
         if self.assignment == "auto":
             if self.group_id is not None or self.shard_id is not None:
                 raise ValueError("Auto assignment does not accept group_id/shard_id")
@@ -232,7 +226,6 @@ class EngramStore:
                 caller_id=config.caller_id,
                 num_callers=config.num_callers,
                 max_lookup_rows=config.max_lookup_rows,
-                rdma_device=config.rdma_device,
                 timeout=config.timeout,
                 assignment=self._assignment,
             )
@@ -256,7 +249,6 @@ class EngramStore:
         session_id,
         caller_id,
         max_lookup_rows,
-        rdma_device=None,
         timeout=300,
         num_callers=1,
     ):
@@ -290,7 +282,6 @@ class EngramStore:
                 caller_id=caller_id,
                 max_lookup_rows=max_lookup_rows,
                 local_dir=self._root,
-                rdma_device=rdma_device,
                 timeout=timeout,
                 num_callers=num_callers,
             )

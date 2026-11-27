@@ -148,12 +148,31 @@ callers; each caller has its own communication rail and lookup workspace.
 selects the Master RPC endpoint. Engram registration, bootstrap records and
 readiness all use Master RPC; no HTTP metadata endpoint or user session ID is
 needed. This requires a Master and Python extension built with this change.
-Lookup itself does not query Master. NIC selection defaults to NCCL; optional
-`rdma_device` and `timeout` overrides belong to the Config.
+Lookup itself does not query Master. NIC selection reuses NCCL configuration,
+including `NCCL_IB_HCA` when set; Engram does not override it. Set any NIC filter
+before launching the runtime. The Config accepts an optional `timeout` override
+(default: 300 seconds).
 
 The runtime supplies stable node/model identities, dense local caller numbers,
 matching caller counts, and lookup capacity. Capacity counts every submitted ID
-in `[T,K]`, including masked IDs. Tables must have equal byte-row widths.
+in `[T,K]`, including masked IDs. These five fields are required for the remote
+backend; local tables do not use them:
+
+| Runtime field | Purpose | Why the runtime supplies it |
+| --- | --- | --- |
+| `node_id` | Stable identity of one storage node. | All GPU callers on that node share placement; restarted nodes can retain their shard. It is not a routable address. |
+| `model_key` | Isolates placement pools by checkpoint identity. | Nodes serving different checkpoints must not join the same storage group. It need not be a weight-content hash. |
+| `caller_id` | Dense caller index in `[0,num_callers)`. | The same index on each node forms one communication rail, with its own lookup workspace. It is independent of physical GPU and storage shard IDs. |
+| `num_callers` | Number of GPU callers on each storage node. | Peers validate matching counts, and local callers wait until all have imported the shared CPU allocation. |
+| `max_lookup_rows` | Maximum submitted IDs per lookup, `T * K`. | Communication buffers and queues are sized before lookup/CUDA Graph capture. Count masked IDs and graph padding as well as useful IDs. |
+
+For four storage nodes with four GPU callers each, `group_size=4`,
+`num_callers=4`, and each node has callers `0,1,2,3`. No field needs to be
+entered in an inference runtime's user JSON if the runtime derives it, as
+SGLang does. A single-caller deployment uses `caller_id=0, num_callers=1`;
+these values must not be reused as defaults for a multi-caller deployment.
+
+Tables must have equal byte-row widths.
 Placement is independent of computational TP/DP/CP ownership. Initialize before
 CUDA Graph capture, and order overlapping uses of one Store workspace.
 
