@@ -27,6 +27,7 @@ on:
 jobs:
   build-wheel-rocm:
     runs-on: ubuntu-22.04
+    timeout-minutes: 120
     # Pinned to match the upstream vllm/vllm-openai-rocm and sglang ROCm images
     # (ROCm 7.2). The wheel excludes the ROCm runtime and binds it at load time,
     # so it also loads on the ROCm 7.0 image variants.
@@ -93,7 +94,7 @@ jobs:
         apt-get update -y
         apt-get install -y --no-install-recommends \
           curl build-essential sudo pkg-config \
-          ninja-build
+          ninja-build lld
         # hipify-perl is required by the CMake USE_HIP path.
         echo "/opt/rocm/bin" >> "$GITHUB_PATH"
 
@@ -138,7 +139,9 @@ jobs:
           -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DWITH_CONDUCTOR=ON \
           -DENABLE_MULTI_PROTOCOL=ON \
           -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON \
-          -DBUILD_UNIT_TESTS=OFF -DENABLE_SCCACHE=ON \
+          -DBUILD_UNIT_TESTS=OFF -DBUILD_BENCHMARK=OFF \
+          -DENABLE_DEBUG_SYMBOLS=OFF -DENABLE_SCCACHE=ON \
+          -DCMAKE_PROJECT_INCLUDE="$GITHUB_WORKSPACE/scripts/ci/cmake_lld.cmake" \
           -DCMAKE_BUILD_TYPE=Release \
           -DPython3_EXECUTABLE="${PYTHON_BIN}"
 

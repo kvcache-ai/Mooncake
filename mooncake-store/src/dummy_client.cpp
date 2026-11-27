@@ -578,6 +578,22 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
             LOG(INFO)
                 << "Hot cache shm not available (real client may not have it)";
         }
+    } else {
+        // Zero-buffer startup has no control SHM registration. A fresh UUID
+        // can be asked to remount, and there are no buffers to replay yet.
+        auto initial_ping =
+            invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+        if (initial_ping &&
+            initial_ping->client_status == ClientStatus::NEED_REMOUNT) {
+            initial_ping =
+                invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+        }
+        if (!initial_ping || initial_ping->client_status != ClientStatus::OK) {
+            connected_.store(false);
+            LOG(ERROR) << "Initial dummy client heartbeat failed";
+            return -1;
+        }
+        last_ping_healthy_.store(true);
     }
 
     ping_running_ = true;
@@ -1310,11 +1326,17 @@ int DummyClient::isExist(const std::string& key) {
 }
 
 int DummyClient::isExist(const std::string& key, const ExistOptions& options) {
-    if (options.prefetch_to_memory) {
-        VLOG(1) << "SSD prefetch is not supported via DummyClient; "
-                << "prefetch_to_memory ignored for key=" << key;
+    if (!options.prefetch_to_memory) {
+        return isExist(key);
     }
-    return isExist(key);
+    auto result = invoke_rpc<&RealClient::isExistWithOptions_internal, bool>(
+        key, options);
+    // Prefetch is best-effort, including during a rolling upgrade to a
+    // server that does not yet expose the additive options RPC.
+    if (!result && result.error() == ErrorCode::RPC_FAIL) {
+        return isExist(key);
+    }
+    return result ? (*result ? 1 : 0) : toInt(result.error());
 }
 
 std::vector<int> DummyClient::batchIsExist(
@@ -1369,11 +1391,24 @@ std::vector<int> DummyClient::batchProbeKey(
 
 std::vector<int> DummyClient::batchIsExist(const std::vector<std::string>& keys,
                                            const ExistOptions& options) {
-    if (options.prefetch_to_memory) {
-        VLOG(1) << "SSD prefetch is not supported via DummyClient; "
-                << "prefetch_to_memory ignored";
+    if (!options.prefetch_to_memory || keys.empty()) {
+        return batchIsExist(keys);
     }
-    return batchIsExist(keys);
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batchIsExistWithOptions_internal, bool>(
+            keys.size(), keys, options);
+    if (std::all_of(internal_results.begin(), internal_results.end(),
+                    [](const auto& result) {
+                        return !result && result.error() == ErrorCode::RPC_FAIL;
+                    })) {
+        return batchIsExist(keys);
+    }
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto& result : internal_results) {
+        results.push_back(result ? (*result ? 1 : 0) : -1);
+    }
+    return results;
 }
 
 int64_t DummyClient::getSize(const std::string& key) {

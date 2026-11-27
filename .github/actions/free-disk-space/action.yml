@@ -1,15 +1,33 @@
 name: Free runner disk space
 description: Remove preinstalled toolchains that Mooncake CI does not use
 
+inputs:
+  min-free-gb:
+    description: Skip cleanup when root filesystem already has at least this many GB free
+    default: '40'
+
 runs:
   using: composite
   steps:
     - name: Remove unused runner tools
       shell: bash
+      env:
+        MIN_FREE_GB: ${{ inputs.min-free-gb }}
       run: |
-        sudo rm -rf -- \
+        set -euo pipefail
+        avail_gb=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
+        if [ "${avail_gb:-0}" -ge "${MIN_FREE_GB}" ]; then
+          echo "Root filesystem already has ${avail_gb}G available (>= ${MIN_FREE_GB}G); skipping cleanup."
+          df -h
+          exit 0
+        fi
+        # Delete independent preinstalled toolchain trees in parallel when disk is tight.
+        for path in \
           /usr/share/dotnet \
           /opt/ghc \
           /opt/hostedtoolcache/CodeQL \
-          /usr/local/lib/android
+          /usr/local/lib/android; do
+          sudo rm -rf -- "$path" &
+        done
+        wait
         df -h

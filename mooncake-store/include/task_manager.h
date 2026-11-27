@@ -172,6 +172,7 @@ class ScopedTaskReadAccess {
     ~ScopedTaskReadAccess() = default;
 
     std::optional<Task> find_task_by_id(const UUID& task_id) const;
+    std::optional<TaskStatus> find_task_status_by_id(const UUID& task_id) const;
 
     tl::expected<bool, ErrorCode> is_cancellation_requested(
         const UUID& client_id, const UUID& task_id) const;

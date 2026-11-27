@@ -54,6 +54,15 @@ std::optional<Task> ScopedTaskReadAccess::find_task_by_id(
     return std::nullopt;
 }
 
+std::optional<TaskStatus> ScopedTaskReadAccess::find_task_status_by_id(
+    const UUID& task_id) const {
+    const auto it = manager_->all_tasks_.find(task_id);
+    if (it == manager_->all_tasks_.end()) {
+        return std::nullopt;
+    }
+    return it->second.status;
+}
+
 tl::expected<bool, ErrorCode> ScopedTaskReadAccess::is_cancellation_requested(
     const UUID& client_id, const UUID& task_id) const {
     auto it = manager_->all_tasks_.find(task_id);

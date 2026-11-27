@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "allocation_strategy.h"
@@ -98,6 +99,9 @@ class ScopedSegmentAccess {
 
     bool GetSegment(const UUID& segment_id, Segment& segment) const;
 
+    bool CanCopyWithinFabric(const std::string& source,
+                             const std::string& target) const;
+
     struct AllocatorReplacement {
         UUID segment_id;
         std::shared_ptr<BufferAllocatorBase> expected;
@@ -168,8 +172,8 @@ class ScopedSegmentAccess {
                             size_t& capacity);
 
     /**
-     * @brief Check whether the named segment still has allocated memory,
-     * including when it no longer accepts new allocations.
+     * @brief Check whether any registration under this name still has
+     * allocated memory, including those closed to new allocations.
      * @param segment_name Name of the mounted segment to check.
      * @return True if the segment has allocated memory. False if the segment
      * is missing or has no allocated memory.
@@ -218,7 +222,19 @@ class ScopedSegmentAccess {
     ErrorCode SetSegmentStatusByName(const std::string& segment_name,
                                      SegmentStatus status);
 
+    // An explicit job owns the name until it finishes, even if the last
+    // registration is removed before the job reaches a terminal state.
+    bool IsDrainSourceFenced(const std::string& segment_name) const;
+    void FenceDrainSource(const std::string& segment_name);
+    void ReleaseDrainSourceFence(const std::string& segment_name);
+
+    // Drain jobs own a source name, which may contain several mounted IDs.
+    // Preserve already-drained registrations when closing them to allocation.
+    void SetDrainSourceStatus(const std::string& segment_name,
+                              SegmentStatus status);
+
    private:
+    ErrorCode SetSegmentStatus(MountedSegment& mounted, SegmentStatus status);
     void ReindexSegmentNameAfterRemoval(const UUID& removed_segment_id,
                                         const std::string& segment_name);
 
@@ -311,19 +327,26 @@ class ScopedAllocatorAccess {
         const AllocatorManager& allocator_manager,
         const HostSegmentIndex& segments_by_host,
         const std::unordered_map<std::string, UUID>& client_by_name,
-        std::shared_mutex& mutex)
+        std::shared_mutex& mutex,
+        const std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>*
+            mounted_segments = nullptr,
+        const std::unordered_map<std::string, UUID>* segment_id_by_name =
+            nullptr)
         : allocator_manager_(allocator_manager),
           segments_by_host_(&segments_by_host),
           client_by_name_(&client_by_name),
+          mounted_segments_(mounted_segments),
+          segment_id_by_name_(segment_id_by_name),
           lock_(mutex) {}
 
     const AllocatorManager& getAllocatorManager() const {
         return allocator_manager_;
     }
 
-    AllocatorManager SnapshotAllocatorManager() const {
-        return allocator_manager_.Snapshot(client_by_name_);
-    }
+    // A readable source may no longer have an allocation registration while
+    // draining. Resolve its identity from mounted records under the same lock.
+    AllocatorManager SnapshotAllocatorManager(
+        const std::string& source_segment = {}) const;
 
     std::vector<std::string> GetHostOrderedSegments(
         const std::string& writer_host_id, const std::string& key) const;
@@ -334,6 +357,9 @@ class ScopedAllocatorAccess {
     const AllocatorManager& allocator_manager_;
     const HostSegmentIndex* segments_by_host_{nullptr};
     const std::unordered_map<std::string, UUID>* client_by_name_{nullptr};
+    const std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>*
+        mounted_segments_{nullptr};
+    const std::unordered_map<std::string, UUID>* segment_id_by_name_{nullptr};
     std::shared_lock<std::shared_mutex> lock_;
 };
 
@@ -374,7 +400,8 @@ class SegmentManager {
      */
     ScopedAllocatorAccess getAllocatorAccess() {
         return ScopedAllocatorAccess(allocator_manager_, segments_by_host_,
-                                     client_by_name_, segment_mutex_);
+                                     client_by_name_, segment_mutex_,
+                                     &mounted_segments_, &segment_id_by_name_);
     }
 
     /**
@@ -428,6 +455,8 @@ class SegmentManager {
         client_by_name_;  // segment name -> client_id
     std::unordered_map<std::string, UUID>
         segment_id_by_name_;             // segment name -> segment_id
+    std::unordered_map<std::string, std::set<UUID>> registrations_by_name_;
+    std::unordered_set<std::string> fenced_drain_sources_;
     HostSegmentIndex segments_by_host_;  // host_id -> segment name -> segment
                                          // ids for allocatable segments
     friend class ScopedSegmentAccess;

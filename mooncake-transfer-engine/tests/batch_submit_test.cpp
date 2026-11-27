@@ -69,6 +69,28 @@ namespace {
 using Executor = BatchSubmitExecutor;
 using namespace std::chrono_literals;
 
+// Signals a gate on the first call and again from the destructor. Declared
+// after the std::async future so a failing assertion opens the gate before
+// that future's destructor joins the callback.
+class SignalOnce {
+   public:
+    explicit SignalOnce(std::promise<void>& promise) : promise_(promise) {}
+    SignalOnce(const SignalOnce&) = delete;
+    SignalOnce& operator=(const SignalOnce&) = delete;
+
+    void signal() {
+        if (!sent_) {
+            sent_ = true;
+            promise_.set_value();
+        }
+    }
+    ~SignalOnce() { signal(); }
+
+   private:
+    std::promise<void>& promise_;
+    bool sent_ = false;
+};
+
 TEST(BatchSubmit, ConfigParsingAndEligibility) {
     struct SavedEnvironment {
         const char* name;
@@ -154,7 +176,11 @@ TEST(BatchSubmit, ShutdownStopsAdmissionAndWaitsForActiveCallbacks) {
                                           : Executor::Result::Canceled();
                 });
         });
-        started.get_future().wait();
+        auto started_future = started.get_future();
+        if (started_future.wait_for(2s) != std::future_status::ready) {
+            executor.shutdown();
+            FAIL() << "batch submit callback did not start";
+        }
         executor.shutdown();
         EXPECT_EQ(returned.load(), 1);
         auto result = parent.get();
@@ -284,9 +310,12 @@ TEST(BatchSubmit, FailureJoinsAcceptedSiblingWithoutExpiringIt) {
                 return Executor::Result::OK();
             });
     });
-    cancel_seen.get_future().wait();
+    SignalOnce release_sibling_gate(release_sibling);
+    auto cancel_future = cancel_seen.get_future();
+    ASSERT_EQ(cancel_future.wait_for(2s), std::future_status::ready)
+        << "sibling did not observe cancellation";
     EXPECT_EQ(parent.wait_for(0s), std::future_status::timeout);
-    release_sibling.set_value();
+    release_sibling_gate.signal();
     EXPECT_EQ(parent.get().error, "first sub-batch failed");
     EXPECT_TRUE(
         executor
@@ -373,7 +402,9 @@ TEST(BatchSubmit, ExpiredParentDoesNotPublishOrRunQueuedWork) {
                                         return Executor::Result::OK();
                                     });
         });
-        started.get_future().wait();
+        SignalOnce release_workers(release);
+        ASSERT_EQ(started.get_future().wait_for(2s), std::future_status::ready)
+            << "occupied callbacks did not start";
         std::atomic<int> submitted{0};
         auto expired = std::async(std::launch::async, [&] {
             return executor.execute(4, Executor::Clock::now(),
@@ -386,7 +417,7 @@ TEST(BatchSubmit, ExpiredParentDoesNotPublishOrRunQueuedWork) {
         // occupied.
         EXPECT_EQ(expired.wait_for(2s), std::future_status::ready);
         EXPECT_EQ(submitted.load(), 0);
-        release.set_value();
+        release_workers.signal();
         EXPECT_TRUE(first.get().ok());
         EXPECT_FALSE(expired.get().ok());
         EXPECT_EQ(submitted.load(), 0);
@@ -673,7 +704,11 @@ TEST_F(ClassicBatchSubmit,
             },
             10s);
     });
-    const auto id = published.get_future().get();
+    SignalOnce release_resume(resume_sibling);
+    auto published_future = published.get_future();
+    ASSERT_EQ(published_future.wait_for(5s), std::future_status::ready)
+        << "submit hook did not publish the batch";
+    const auto id = published_future.get();
     const auto until = BatchSubmitExecutor::Clock::now() + 5s;
     while (!MultiTransportBatchTestPeer::deferred(*multi, id) &&
            BatchSubmitExecutor::Clock::now() < until)
@@ -686,7 +721,7 @@ TEST_F(ClassicBatchSubmit,
     // Native cleanup owns the descriptor until this callback pin drops.
     // Do not access the id again after releasing it.
     Transport::toBatchDesc(id).active_completion_callbacks.store(0);
-    resume_sibling.set_value();
+    release_resume.signal();
     auto result = parent.get();
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(result->ok()) << result->ToString();
