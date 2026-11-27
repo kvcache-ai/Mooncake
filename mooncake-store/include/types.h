@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <charconv>
 #include <map>
 #include <memory>
 #include <optional>
@@ -106,6 +107,11 @@ static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 // the pre-existing behaviour, where only the pool-wide watermark can trigger
 // background eviction. Inert unless enable_multi_tenants is set.
 static constexpr double DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
+// Threads that walk the eviction index in one memory eviction pass. 0 picks
+// one per 16M filed keys each pass, clamped to [1, 64]; an explicit count in
+// that range overrides the automatic choice.
+static constexpr uint32_t DEFAULT_EVICTION_WORKER_THREADS = 0;
+static constexpr uint32_t MAX_EVICTION_WORKER_THREADS = 64;
 static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
@@ -170,6 +176,17 @@ enum class ObjectDataType : uint8_t {
     GENERAL = 9,
     // 10-255 reserved for future types
 };
+
+static_assert(static_cast<uint8_t>(ObjectDataType::UNKNOWN) == 0);
+static_assert(static_cast<uint8_t>(ObjectDataType::KVCACHE) == 1);
+static_assert(static_cast<uint8_t>(ObjectDataType::TENSOR) == 2);
+static_assert(static_cast<uint8_t>(ObjectDataType::WEIGHT) == 3);
+static_assert(static_cast<uint8_t>(ObjectDataType::SAMPLE) == 4);
+static_assert(static_cast<uint8_t>(ObjectDataType::ACTIVATION) == 5);
+static_assert(static_cast<uint8_t>(ObjectDataType::GRADIENT) == 6);
+static_assert(static_cast<uint8_t>(ObjectDataType::OPTIMIZER_STATE) == 7);
+static_assert(static_cast<uint8_t>(ObjectDataType::METADATA) == 8);
+static_assert(static_cast<uint8_t>(ObjectDataType::GENERAL) == 9);
 
 inline std::ostream& operator<<(std::ostream& os,
                                 const ObjectDataType& type) noexcept {
@@ -434,6 +451,7 @@ enum class ErrorCode : int32_t {
     TASK_PENDING_LIMIT_EXCEEDED =
         -1401,              ///< Total pending tasks exceed the limit.
     JOB_NOT_FOUND = -1402,  ///< Job not found.
+    TASK_CANCELED = -1403,  ///< Task canceled before committing.
 
     // DFS errors (Range: -1600 to -1699)
     DFS_NETWORK_TIMEOUT = -1600,      ///< DFS network timeout.
@@ -499,6 +517,44 @@ inline int HcaAffinityTier(const std::optional<SegmentLocality>& locality,
                            const std::vector<std::string>& hcas) {
     return HcaAffinityTier(locality ? &*locality : nullptr, hcas);
 }
+// Placement identity is never a routable TE address. The fabric domain is
+// explicitly provisioned by the operator, not inferred from rack membership.
+struct PhysicalPlacement {
+    std::string fabric_domain;
+    std::string rack;
+    std::string tray;
+    int physical_gpu{-1};
+    int numa_node{-1};
+
+    bool Valid() const {
+        return !fabric_domain.empty() && !rack.empty() && !tray.empty() &&
+               physical_gpu >= 0 && numa_node >= -1;
+    }
+    bool operator==(const PhysicalPlacement&) const = default;
+
+    // Compatibility with the fork's <rack>.<host>[:port]#g<physical_gpu>.
+    // A domain must still be supplied separately by the caller.
+    static std::optional<PhysicalPlacement> FromSelfId(std::string_view id) {
+        const auto dot = id.find('.');
+        const auto gpu = id.rfind("#g");
+        if (dot == std::string_view::npos || dot == 0 ||
+            gpu == std::string_view::npos || gpu <= dot + 1)
+            return std::nullopt;
+        PhysicalPlacement result;
+        result.rack = id.substr(0, dot);
+        result.tray = id.substr(dot + 1, gpu - dot - 1);
+        const auto colon = result.tray.find(':');
+        if (colon != std::string::npos) result.tray.resize(colon);
+        const auto number = id.substr(gpu + 2);
+        auto [end, ec] = std::from_chars(
+            number.data(), number.data() + number.size(), result.physical_gpu);
+        if (ec != std::errc{} || end != number.data() + number.size() ||
+            result.physical_gpu < 0 || result.tray.empty())
+            return std::nullopt;
+        return result;
+    }
+};
+YLT_REFL(PhysicalPlacement, fabric_domain, rack, tray, physical_gpu, numa_node);
 
 /**
  * @brief Represents a contiguous memory region
@@ -513,11 +569,21 @@ struct Segment {
     std::string protocol;
     std::string host_id{};
     struct_pack::compatible<SegmentLocality, 1> locality;
+    struct_pack::compatible<PhysicalPlacement, 2> physical_placement;
     Segment() = default;
-    bool operator==(const Segment&) const = default;
+    bool operator==(const Segment& other) const {
+        return id == other.id && name == other.name && base == other.base &&
+               size == other.size && te_endpoint == other.te_endpoint &&
+               protocol == other.protocol && host_id == other.host_id &&
+               bool(locality) == bool(other.locality) &&
+               (!locality || *locality == *other.locality) &&
+               bool(physical_placement) == bool(other.physical_placement) &&
+               (!physical_placement ||
+                *physical_placement == *other.physical_placement);
+    }
 };
 YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id,
-         locality);
+         locality, physical_placement);
 
 /**
  * @brief Allocation strategy type for segment allocation

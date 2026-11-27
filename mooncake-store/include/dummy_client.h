@@ -181,9 +181,8 @@ class DummyClient : public PyClient {
 
     int isExist(const std::string &key);
 
-    // ExistOptions variants: prefetch runs on the real client holding the
-    // SSD tier; the dummy shim only forwards existence checks, so the
-    // options are accepted but ignored (with a log) here.
+    // Forward prefetch options to the real client using additive RPCs;
+    // older servers fall back to the legacy existence checks.
     int isExist(const std::string &key, const ExistOptions &options) override;
     std::vector<int> batchIsExist(const std::vector<std::string> &keys,
                                   const ExistOptions &options) override;
@@ -217,6 +216,25 @@ class DummyClient : public PyClient {
     tl::expected<UUID, ErrorCode> create_move_task(const std::string &key,
                                                    const std::string &source,
                                                    const std::string &target);
+
+    tl::expected<UUID, ErrorCode> create_drain_job(
+        const CreateDrainJobRequest &request) override;
+
+    tl::expected<UUID, ErrorCode> create_timed_drain_job(
+        const CreateDrainJobRequest &request, uint64_t timeout_ms) override;
+
+    tl::expected<QueryJobResponse, ErrorCode> query_drain_job(
+        const UUID &job_id) override;
+
+    tl::expected<void, ErrorCode> cancel_drain_job(const UUID &job_id) override;
+
+    tl::expected<ListDrainJobsResponse, ErrorCode> list_drain_jobs(
+        const DrainJobListRequest &request) override;
+
+    tl::expected<ListTasksResponse, ErrorCode> list_tasks(
+        const TaskListRequest &request) override;
+
+    tl::expected<void, ErrorCode> cancel_task(const UUID &task_id) override;
 
     tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
 

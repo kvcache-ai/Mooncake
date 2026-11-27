@@ -16,6 +16,9 @@
 #ifndef TRANSFER_EXECUTOR_BASE_H
 #define TRANSFER_EXECUTOR_BASE_H
 
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -102,8 +105,12 @@ class TransferExecutorBase {
     void pollLocalCopies();
 
     int registerMem(void* addr, size_t length, adxl::MemType mem_type,
-                    bool use_buffer_pool, bool remote_accessible);
+                    bool use_buffer_pool, bool remote_accessible,
+                    bool all_engines = false);
     int deregisterMem(void* addr);
+    // Drop every recorded Adxl peer. 0 means the table is empty afterward.
+    // Non-zero means at least one Disconnect failed and that peer was kept.
+    int disconnectAllPeers();
 
     const size_t getNumEngines() const { return adxl_engines_.size(); }
     const std::vector<aclrtContext>& getLocalEngineContexts() const {
@@ -128,7 +135,7 @@ class TransferExecutorBase {
                    int32_t timeout_in_millis);
     std::string resolveTargetAdxlEngineName(
         const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
-        uint64_t dest_addr) const;
+        uint64_t dest_addr, size_t length, size_t local_engine_idx) const;
     // Fills `dest_addrs` with every slice's destination rebased onto this
     // process's address space, and returns true when all of them resolved.
     // On false the caller must use adxl: a partially translated group cannot
@@ -137,6 +144,11 @@ class TransferExecutorBase {
         const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
         const std::vector<Transport::Slice*>& slice_list,
         std::vector<void*>& dest_addrs);
+
+    // Async executor waits until every submitted task has finished and the
+    // query thread has returned from its follow-up Disconnect. The sync
+    // executor has no such work left once the active-sync count reaches 0.
+    virtual void drainInFlightTransfers() {}
 
     InitParams params_;
     // One instance per local engine: it owns that engine's ACL context, copy
@@ -151,18 +163,47 @@ class TransferExecutorBase {
     bool use_shmem_{false};
     std::vector<std::shared_ptr<adxl::AdxlEngine>> adxl_engines_;
     std::vector<aclrtContext> local_engine_contexts_;
+    // Captured during initialization; dispatch threads need no ACL context.
+    std::vector<int32_t> local_engine_physical_ids_;
     std::mutex mem_handle_mutex_;
 
     std::unordered_map<size_t, std::set<std::string>> connected_segments_;
     std::mutex connection_mutex_;
+
+    // One disconnectAllPeers() at a time. finalize() takes it as well, so
+    // teardown cannot stop the query thread or destroy engines until the
+    // call returns.
+    std::mutex disconnect_all_mutex_;
+
+    // Bit 63 is set by quiesceSyncTransfers() and cleared by
+    // resumeSyncTransfers() after the peer walk. The low 63 bits count
+    // execute() and local Copy() calls still inside the caller. The hot path
+    // claims a slot, or sees that new work must fail, with one load and a CAS.
+    std::atomic<uint64_t> transfer_lifecycle_state_{0};
+    // Held by disconnectAllPeers() while it waits for the count to reach 0.
+    // The transfer that drops the count to 0 while the bit is set holds it
+    // only long enough to notify.
+    std::mutex transfer_lifecycle_cv_mutex_;
+    std::condition_variable transfer_lifecycle_cv_;
 
     std::shared_ptr<TransferMetadata> metadata_;
 
    private:
     using EngineMemHandle = std::pair<size_t, adxl::MemHandle>;
 
+    // False means peers are quiesced and the caller must fail the slices.
+    // True owns one active-sync slot and must be paired with endSyncTransfer().
+    bool beginSyncTransfer();
+    void endSyncTransfer();
+    // Sets the quiesce bit and waits until every slot taken above is released.
+    void quiesceSyncTransfers();
+    void resumeSyncTransfers();
+
     void rollbackRegisteredMem(
-        const std::vector<EngineMemHandle>& registered_mem_handles);
+        void* addr, const std::vector<EngineMemHandle>& registered_mem_handles);
+    // Polls device-copy groups until none remain. Call only after every
+    // Copy() counted in transfer_lifecycle_state_ has returned.
+    void drainLocalCopies();
     std::map<void*, std::vector<EngineMemHandle>> addr_to_mem_handles_;
 };
 

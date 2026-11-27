@@ -339,8 +339,8 @@ int EfaTransport::registerLocalMemoryInternal(
     bool use_full_coverage = (total_pages_per_nic <= getMaxPteEntries()) &&
                              thp_plan != ThpPlan::kThpPartitioned;
 
-    // Narrow a single-chunk DEVICE buffer to the NICs the topology reports as
-    // closest to its GPU (MC_EFA_NIC_SELECTION=local, the default). See
+    // Narrow a DEVICE buffer to the NICs the topology reports as closest to
+    // its GPU (MC_EFA_NIC_SELECTION=local, the default). See
     // buildLocalNicMap() for where the set comes from. Steady-state bandwidth
     // is unchanged: Topology::selectDevice() picks only from preferred_hca on
     // a first attempt, which is exactly this set, so keys on the other NICs
@@ -366,50 +366,10 @@ int EfaTransport::registerLocalMemoryInternal(
         if (it != local_nic_map_.end()) local_nics = &it->second;
     }
 
-    std::vector<std::vector<size_t>> nic_assignments(num_chunks);
-    if (chunks.size() <= 1 && local_nics) {
-        // Single chunk, topology-local NIC selection requested for this device.
-        nic_assignments[0] = *local_nics;
-        if (globalConfig().trace) {
-            LOG(INFO) << "EFA local NIC selection: " << addr << " ("
-                      << resolved_name << ") on " << local_nics->size() << "/"
-                      << num_nics << " NICs";
-        }
-    } else if (chunks.size() <= 1) {
-        // Single chunk: all NICs
-        for (size_t n = 0; n < num_nics; ++n) {
-            nic_assignments[0].push_back(n);
-        }
-    } else if (use_full_coverage) {
-        // Multi-chunk, PTE budget OK: every chunk on every NIC
-        LOG(WARNING) << "Full NIC coverage: " << num_chunks << " chunks × "
-                     << num_nics
-                     << " NICs (total PTE/NIC=" << total_pages_per_nic
-                     << ", budget=" << getMaxPteEntries() << ")";
-        for (size_t ci = 0; ci < num_chunks; ++ci) {
-            for (size_t n = 0; n < num_nics; ++n) {
-                nic_assignments[ci].push_back(n);
-            }
-        }
-    } else if (num_chunks <= num_nics) {
-        // Multi-chunk, PTE exceeded, more NICs than chunks: disjoint partition
-        for (size_t ci = 0; ci < num_chunks; ++ci) {
-            size_t nics_per = num_nics / num_chunks;
-            size_t extra = num_nics % num_chunks;
-            size_t start = ci * nics_per + std::min(ci, extra);
-            size_t count = nics_per + (ci < extra ? 1 : 0);
-            for (size_t n = start; n < start + count; ++n) {
-                nic_assignments[ci].push_back(n);
-            }
-        }
-        if (thp_plan == ThpPlan::kThpPartitioned) {
-            LOG(WARNING) << "Disjoint NIC partition: full-coverage "
-                            "registration failed";
-        } else {
-            LOG(WARNING) << "Disjoint NIC partition: PTE/NIC="
-                         << total_pages_per_nic
-                         << " exceeds budget=" << getMaxPteEntries();
-        }
+    const NicPlan plan =
+        planChunkNics(num_chunks, num_nics, local_nics, use_full_coverage);
+    const std::vector<std::vector<size_t>>& nic_assignments = plan.assignments;
+    auto log_chunk_nics = [&]() {
         for (size_t ci = 0; ci < num_chunks; ++ci) {
             std::string nic_list;
             for (size_t j = 0; j < nic_assignments[ci].size(); ++j) {
@@ -418,38 +378,78 @@ int EfaTransport::registerLocalMemoryInternal(
             }
             LOG(WARNING) << "  chunk " << ci << " -> NICs [" << nic_list << "]";
         }
-    } else {
-        // Multi-chunk, PTE exceeded, more chunks than NICs: round-robin
-        // Each NIC gets multiple chunks; verify per-NIC PTE stays in budget.
-        size_t pte_budget = getMaxPteEntries();
-        std::vector<size_t> pages_per_nic(num_nics, 0);
-        for (size_t ci = 0; ci < num_chunks; ++ci) {
-            size_t nic = ci % num_nics;
-            size_t chunk_pages = chunks[ci].second / page_size;
-            pages_per_nic[nic] += chunk_pages;
-            nic_assignments[ci].push_back(nic);
-        }
-        bool pte_ok = true;
-        for (size_t n = 0; n < num_nics; ++n) {
-            if (pages_per_nic[n] > pte_budget) {
-                pte_ok = false;
-                break;
+    };
+    auto warn_local_not_applied = [&]() {
+        if (!local_nics) return;
+        LOG(WARNING) << "MC_EFA_NIC_SELECTION=local is not applied to "
+                     << resolved_name << " buffer " << addr << ": "
+                     << num_chunks << " chunks do not fit on its "
+                     << local_nics->size() << " local NICs";
+    };
+    switch (plan.kind) {
+        case NicPlanKind::kSingleLocal:
+            if (globalConfig().trace) {
+                LOG(INFO) << "EFA local NIC selection: " << addr << " ("
+                          << resolved_name << ") on " << local_nics->size()
+                          << "/" << num_nics << " NICs";
             }
-        }
-        if (!pte_ok) {
-            LOG(ERROR) << "Buffer requires " << num_chunks << " chunks ("
-                       << length << " bytes) but per-NIC PTE budget ("
-                       << pte_budget << " entries, page_size=" << page_size
-                       << ") is exceeded even with round-robin across "
-                       << num_nics << " NICs";
-            return ERR_INVALID_ARGUMENT;
-        }
-        LOG(WARNING) << "Round-robin NIC assignment: " << num_chunks
-                     << " chunks across " << num_nics << " NICs";
-        for (size_t ci = 0; ci < num_chunks; ++ci) {
-            LOG(WARNING) << "  chunk " << ci << " ("
-                         << chunks[ci].second / (1024 * 1024) << " MB) -> NIC "
-                         << nic_assignments[ci][0];
+            break;
+        case NicPlanKind::kSingleAll:
+            break;
+        case NicPlanKind::kLocalCoverage:
+            LOG(INFO) << "EFA local NIC selection: " << addr << " ("
+                      << resolved_name << "), " << num_chunks << " chunks on "
+                      << local_nics->size() << "/" << num_nics << " NICs";
+            break;
+        case NicPlanKind::kLocalPartition:
+            LOG(WARNING) << "Local disjoint NIC partition for " << resolved_name
+                         << ": PTE/NIC=" << total_pages_per_nic
+                         << " exceeds budget=" << getMaxPteEntries();
+            log_chunk_nics();
+            break;
+        case NicPlanKind::kFullCoverage:
+            LOG(WARNING) << "Full NIC coverage: " << num_chunks << " chunks × "
+                         << num_nics
+                         << " NICs (total PTE/NIC=" << total_pages_per_nic
+                         << ", budget=" << getMaxPteEntries() << ")";
+            break;
+        case NicPlanKind::kPartition:
+            if (thp_plan == ThpPlan::kThpPartitioned) {
+                LOG(WARNING) << "Disjoint NIC partition: full-coverage "
+                                "registration failed";
+            } else {
+                LOG(WARNING)
+                    << "Disjoint NIC partition: PTE/NIC=" << total_pages_per_nic
+                    << " exceeds budget=" << getMaxPteEntries();
+            }
+            warn_local_not_applied();
+            log_chunk_nics();
+            break;
+        case NicPlanKind::kRoundRobin: {
+            size_t pte_budget = getMaxPteEntries();
+            std::vector<size_t> pages_per_nic(num_nics, 0);
+            for (size_t ci = 0; ci < num_chunks; ++ci) {
+                pages_per_nic[nic_assignments[ci][0]] +=
+                    chunks[ci].second / page_size;
+            }
+            for (size_t n = 0; n < num_nics; ++n) {
+                if (pages_per_nic[n] <= pte_budget) continue;
+                LOG(ERROR) << "Buffer requires " << num_chunks << " chunks ("
+                           << length << " bytes) but per-NIC PTE budget ("
+                           << pte_budget << " entries, page_size=" << page_size
+                           << ") is exceeded even with round-robin across "
+                           << num_nics << " NICs";
+                return ERR_INVALID_ARGUMENT;
+            }
+            LOG(WARNING) << "Round-robin NIC assignment: " << num_chunks
+                         << " chunks across " << num_nics << " NICs";
+            warn_local_not_applied();
+            for (size_t ci = 0; ci < num_chunks; ++ci) {
+                LOG(WARNING) << "  chunk " << ci << " ("
+                             << chunks[ci].second / (1024 * 1024)
+                             << " MB) -> NIC " << nic_assignments[ci][0];
+            }
+            break;
         }
     }
 
@@ -786,6 +786,53 @@ int EfaTransport::indexTopologyOverDevices(
     // parse() keeps only the listed HCAs, each entry in its own order, and
     // resolves fresh indices for them.
     return indexed.parse(topology.toString(), device_names);
+}
+
+EfaTransport::NicPlan EfaTransport::planChunkNics(
+    size_t num_chunks, size_t num_nics, const std::vector<size_t>* local_nics,
+    bool full_coverage) {
+    NicPlan plan{NicPlanKind::kSingleAll, {}};
+    if (num_chunks == 0) return plan;
+    plan.assignments.resize(num_chunks);
+
+    std::vector<size_t> all_nics(num_nics);
+    for (size_t n = 0; n < num_nics; ++n) all_nics[n] = n;
+
+    // The first chunks take one NIC more when the count does not divide evenly.
+    auto partition = [&](const std::vector<size_t>& nics) {
+        size_t per = nics.size() / num_chunks;
+        size_t extra = nics.size() % num_chunks;
+        for (size_t ci = 0; ci < num_chunks; ++ci) {
+            size_t start = ci * per + std::min(ci, extra);
+            size_t count = per + (ci < extra ? 1 : 0);
+            plan.assignments[ci].assign(nics.begin() + start,
+                                        nics.begin() + start + count);
+        }
+    };
+
+    if (num_chunks == 1) {
+        plan.kind =
+            local_nics ? NicPlanKind::kSingleLocal : NicPlanKind::kSingleAll;
+        plan.assignments[0] = local_nics ? *local_nics : all_nics;
+    } else if (local_nics && full_coverage) {
+        plan.kind = NicPlanKind::kLocalCoverage;
+        for (auto& nics : plan.assignments) nics = *local_nics;
+    } else if (local_nics && num_chunks <= local_nics->size()) {
+        plan.kind = NicPlanKind::kLocalPartition;
+        partition(*local_nics);
+    } else if (full_coverage) {
+        plan.kind = NicPlanKind::kFullCoverage;
+        for (auto& nics : plan.assignments) nics = all_nics;
+    } else if (num_chunks <= num_nics) {
+        plan.kind = NicPlanKind::kPartition;
+        partition(all_nics);
+    } else {
+        plan.kind = NicPlanKind::kRoundRobin;
+        for (size_t ci = 0; ci < num_chunks; ++ci) {
+            plan.assignments[ci] = {ci % num_nics};
+        }
+    }
+    return plan;
 }
 
 int EfaTransport::registerLocalMemoryBatch(

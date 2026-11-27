@@ -718,7 +718,10 @@ TEST_F(ClientSessionRegistryTest, RestoreWaitsWithoutBlockingRemountCommit) {
 }
 
 TEST_F(ClientSessionRegistryTest, RestorePublishesOnlyCommittedStagedRecords) {
+    std::vector<ClientSessionEvent> events;
     ClientSessionRegistry registry;
+    ASSERT_TRUE(registry.AddListener(
+        [&](const ClientSessionEvent& event) { events.push_back(event); }));
     auto existing = Register(registry);
     const UUID other{3, 4};
     {
@@ -738,6 +741,8 @@ TEST_F(ClientSessionRegistryTest, RestorePublishesOnlyCommittedStagedRecords) {
     const auto restored = Find(registry, other);
     ASSERT_TRUE(restored);
     EXPECT_EQ(restored->ClientId(), other);
+    Drain(registry);
+    EXPECT_TRUE(events.empty());
     EXPECT_EQ(registry.Ping(other), ClientStatus::NEED_REMOUNT);
 }
 
@@ -789,7 +794,10 @@ TEST_F(ClientSessionRegistryTest,
 }
 
 TEST_F(ClientSessionRegistryTest, RemovalDoesNotAddALivenessState) {
+    std::vector<ClientSessionEvent> events;
     ClientSessionRegistry registry;
+    ASSERT_TRUE(registry.AddListener(
+        [&](const ClientSessionEvent& event) { events.push_back(event); }));
     auto old = Register(registry);
     {
         auto remount = registry.BeginRemount(kClient);
@@ -808,6 +816,8 @@ TEST_F(ClientSessionRegistryTest, RemovalDoesNotAddALivenessState) {
     EXPECT_EQ(old->Observe(kInitial + 13s), Observation::RECOVERED_ACTIVE);
     auto current = Register(registry);
     EXPECT_NE(old, current);
+    Drain(registry);
+    EXPECT_TRUE(events.empty());
     EXPECT_EQ(registry.TryAcquireServingSession(kClient)->Session(), current);
     EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
 }
@@ -985,30 +995,26 @@ TEST_F(ClientSessionRegistryTest,
 }
 
 TEST_F(ClientSessionRegistryTest,
-       ExpireSessionsClearsMetadataBeforeRetireCallback) {
-    bool reserved = false;
+       ExpireSessionsClearsMetadataBeforeOfflineListener) {
     bool retired = false;
     ClientSessionSharedPtr retired_session;
     Record record;
     Slot slot;
-    ClientSessionRegistry registry(
-        10s, 20s, {},
-        [&] {
-            EXPECT_EQ(record->state(), State::SUSPECTED);
-            reserved = true;
-        },
-        [&](const UUID& id, ClientSessionSharedPtr session) {
-            EXPECT_TRUE(reserved);
-            EXPECT_EQ(id, kClient);
-            EXPECT_EQ(session, record);
-            EXPECT_EQ(session->state(), State::OFFLINE);
-            EXPECT_TRUE(registry.GetHostId(kClient).empty());
-            EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
-            // Retirement runs after releasing the slot operation lock.
-            EXPECT_TRUE(AcquireExclusiveOperation(slot, /*try_lock=*/true));
-            retired_session = std::move(session);
-            retired = true;
-        });
+    ClientSessionRegistry registry(10s, 20s);
+    ASSERT_TRUE(registry.AddListener([&](const ClientSessionEvent& event) {
+        if (event.current != State::OFFLINE) return;
+        const auto& id = event.client_id;
+        const auto& session = event.session;
+        EXPECT_EQ(id, kClient);
+        EXPECT_EQ(session, record);
+        EXPECT_EQ(session->state(), State::OFFLINE);
+        EXPECT_TRUE(registry.GetHostId(kClient).empty());
+        EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
+        // Retirement runs after releasing the slot operation lock.
+        EXPECT_TRUE(AcquireExclusiveOperation(slot, /*try_lock=*/true));
+        retired_session = std::move(session);
+        retired = true;
+    }));
 
     record = Register(registry);
     slot = FindSlot(registry, kClient);
@@ -1023,13 +1029,13 @@ TEST_F(ClientSessionRegistryTest,
     // First expiry pass moves ACTIVE -> SUSPECTED without retiring resources.
     ExpireSessions(registry, kInitial + 10s);
     EXPECT_EQ(record->state(), State::SUSPECTED);
-    EXPECT_FALSE(reserved);
     EXPECT_FALSE(retired);
     EXPECT_EQ(registry.GetHostId(kClient), "host-a");
 
-    // Second expiry pass reserves retirement before OFFLINE, clears readiness
-    // and host hints, and passes the terminal session to the retire callback.
+    // Delivery observes cleared readiness and host hints.
     ExpireSessions(registry, kInitial + 30s);
+    EXPECT_FALSE(retired);
+    Drain(registry);
     EXPECT_TRUE(retired);
     EXPECT_EQ(retired_session, record);
     EXPECT_TRUE(registry.HasRetiredSession());

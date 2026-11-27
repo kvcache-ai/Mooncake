@@ -198,6 +198,9 @@ bool validateSweep(std::string* error) {
     if (XferBenchConfig::duration <= 0) {
         return fail(error, "--duration must be positive");
     }
+    if (XferBenchConfig::warmup_ms < 0) {
+        return fail(error, "--warmup_ms must be non-negative");
+    }
     return true;
 }
 
@@ -257,6 +260,13 @@ bool parseOpMode(OpMode* mode, std::string* error) {
 
 bool validateConfig(BenchConfig* config, std::string* error) {
     *config = BenchConfig{};
+    // Both backends allocate only these two types; anything else left the
+    // classic runner with no buffers and crashed on a modulo by zero.
+    if (XferBenchConfig::seg_type != "DRAM" &&
+        XferBenchConfig::seg_type != "VRAM") {
+        return fail(error, "--seg_type must be DRAM or VRAM, got '" +
+                               XferBenchConfig::seg_type + "'");
+    }
     if (XferBenchConfig::use_hugepage && !validateHugepage(error)) return false;
     if (!parseClasses(config, error)) return false;
     if (!validateDeadlineAndIntent(*config, error)) return false;

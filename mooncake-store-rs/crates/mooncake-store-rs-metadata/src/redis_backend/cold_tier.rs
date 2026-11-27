@@ -43,6 +43,13 @@ return {2, next_payload}
 "#;
 
 fn route_matches_cold_backing_filter(route: &ObjectRoute, filter: &ColdBackingRouteFilter) -> bool {
+    if filter
+        .after_key
+        .as_ref()
+        .is_some_and(|key| route.key <= *key)
+    {
+        return false;
+    }
     let Some(backing) = route.cold_backing.as_ref() else {
         return false;
     };
@@ -149,7 +156,13 @@ impl RedisMetadataBackend {
         filter: &ColdBackingRouteFilter,
     ) -> Result<Vec<ObjectRoute>> {
         let Some(index) = self.cold_backing_filter_index(filter) else {
-            return MetadataBackend::list_object_routes_by_cold_backing(self, filter);
+            let mut routes = self.list_object_routes()?;
+            routes.sort_by(|left, right| left.key.cmp(&right.key));
+            return Ok(routes
+                .into_iter()
+                .filter(|route| route_matches_cold_backing_filter(route, filter))
+                .take(filter.limit.unwrap_or(usize::MAX))
+                .collect());
         };
         let keys =
             self.query_readonly("redis list object routes by cold backing", |connection| {
@@ -190,11 +203,15 @@ impl RedisMetadataBackend {
                 .map_err(|error| metadata_error("redis srem cold backing route index", error))?;
         }
         if keys.is_empty() || routes.is_empty() {
-            let all_routes = self.list_object_routes()?;
+            let mut all_routes = self.list_object_routes()?;
+            all_routes.sort_by(|left, right| left.key.cmp(&right.key));
+            // Repair the complete index before paging; backfilling only the
+            // requested page would hide every subsequent page behind it.
+            let mut index_filter = filter.clone();
+            index_filter.after_key = None;
             routes = all_routes
                 .into_iter()
-                .filter(|route| route_matches_cold_backing_filter(route, filter))
-                .take(filter.limit.unwrap_or(usize::MAX))
+                .filter(|route| route_matches_cold_backing_filter(route, &index_filter))
                 .collect();
             if !routes.is_empty() {
                 let index_keys = routes
@@ -208,7 +225,11 @@ impl RedisMetadataBackend {
                         metadata_error("redis sadd cold backing route index", error)
                     })?;
             }
-            return Ok(routes);
+            return Ok(routes
+                .into_iter()
+                .filter(|route| route_matches_cold_backing_filter(route, filter))
+                .take(filter.limit.unwrap_or(usize::MAX))
+                .collect());
         }
         if !live_keys.is_empty() {
             let mut connection = self.connection("redis refresh cold backing route index")?;
@@ -216,6 +237,7 @@ impl RedisMetadataBackend {
                 .sadd::<_, _, ()>(&index, live_keys)
                 .map_err(|error| metadata_error("redis sadd cold backing route index", error))?;
         }
+        routes.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(routes
             .into_iter()
             .filter(|route| route_matches_cold_backing_filter(route, filter))

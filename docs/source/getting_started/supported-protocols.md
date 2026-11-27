@@ -9,6 +9,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **tcp** | Standard network | General purpose, works everywhere | ✅ Primary |
 | **rdma** | RDMA-capable NIC | High-performance, low-latency | ✅ Primary |
 | **efa** | AWS EFA-capable instance | High-performance on AWS (libfabric SRD) | ✅ Primary |
+| **cxi** | HPE Slingshot Cassini NIC | Slingshot transfers via libfabric's CXI provider | ✅ Primary (classic TE) |
 | **nvmeof** | NVMe-oF capable storage | Direct NVMe storage access | ⚠️ Advanced |
 | **nvlink** | NVIDIA MNNVL | Inter-node GPU communication | ⚠️ Advanced |
 | **musa** | Moore Threads GPU + MTLink | Intra-node GPU IPC/P2P | ⚠️ Advanced |
@@ -178,6 +179,51 @@ cmake .. -DUSE_EFA=ON -DUSE_CUDA=ON
 
 **Documentation:** See [EFA Transport](../design/transfer-engine/transport/efa_transport.md) for build instructions, benchmarks, and tuning.
 
+(hpe-slingshot-cxi)=
+### HPE Slingshot (CXI)
+
+**Description:** The `cxi` transport supports HPE Slingshot Cassini NICs through
+libfabric's CXI provider. It is available in the classic Transfer Engine and
+Mooncake Store. Transfer Engine support was added in
+[PR #2535](https://github.com/kvcache-ai/Mooncake/pull/2535); Store deployments
+also need the topology discovery and lifecycle fixes from
+[PR #5454](https://github.com/kvcache-ai/Mooncake/pull/5454).
+
+**Requirements:**
+
+- Build from source with `-DUSE_CXI=ON`; see {ref}`Build with HPE Slingshot <build-with-hpe-slingshot-cxi>`.
+- Install the site's CXI drivers, libcxi, and a libfabric build with the `cxi`
+  provider. Verify availability with `fi_info -p cxi`, which should list
+  `provider: cxi` and domains such as `cxi0`.
+- For GPU memory, also enable `-DUSE_CUDA=ON` or `-DUSE_HIP=ON` and use a
+  libfabric build with the corresponding heterogeneous-memory support.
+- Launch peers with compatible Slingshot service/VNI access using the site's
+  job launcher and network configuration.
+
+**Configuration:**
+```python
+from mooncake.engine import TransferEngine
+
+engine = TransferEngine()
+# Arguments: reachable local hostname, metadata server, protocol, device filter.
+if engine.initialize("node1", "P2PHANDSHAKE", "cxi", "") != 0:
+    raise RuntimeError("CXI initialization failed")
+```
+
+An empty device filter discovers all CXI NICs. To restrict discovery, pass a
+comma-separated list such as `"cxi0,cxi1"`, using domain names from `fi_info`
+rather than Ethernet interface names such as `hsn0`.
+
+**Current Scope:**
+
+- Use the classic Transfer Engine and leave `MC_USE_TENT` / `MC_USE_TEV1` unset.
+  TENT's libfabric backend does not yet include a CXI provider profile.
+- Direct Transfer Engine requests that cross memory-registration chunk
+  boundaries are not automatically split; see
+  [issue #3502](https://github.com/kvcache-ai/Mooncake/issues/3502).
+- For Store, select `protocol="cxi"` or `MOONCAKE_PROTOCOL=cxi`; see the
+  {ref}`Store configuration reference <reference-client-configuration-tuning>`.
+
 ## Advanced Protocols (C++ Transfer Engine)
 
 The following protocols are available at the C++ Transfer Engine level for specialized use cases. They are not commonly used through the Python API.
@@ -201,7 +247,7 @@ The following protocols are available at the C++ Transfer Engine level for speci
 **Description:** NVIDIA MNNVL (Multi-Node NVLink) protocol for high-bandwidth, low-latency GPU-to-GPU communication across nodes.
 
 See [MNNVL Architecture and PD Hardening](../design/transfer-engine/transport/mnnvl_transport.md)
-for classic versus native TENT selection, memory export/import, F5
+for classic versus native TENT selection, memory export/import, F5/F2/F1
 optimizations, configuration, and compatibility boundaries.
 
 **Use When:**
@@ -719,6 +765,7 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 | Development/Testing | tcp | Simple setup, no special hardware |
 | Production Inference | rdma | Best performance and latency |
 | AWS Cloud (EFA instances) | efa | High performance on p5e, p6-b200, p4d, etc. |
+| HPE Slingshot (Cassini NICs) | cxi | Build with `-DUSE_CXI=ON`; use the classic Transfer Engine |
 | Cloud Environments | tcp or rdma (if available) | Check cloud provider support |
 | Multi-tier Storage | rdma + nvmeof | Combine protocols for different layers |
 | AMD GPU Clusters | rdma + hip | Use HIP for local GPU communication |

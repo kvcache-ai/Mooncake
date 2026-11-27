@@ -83,3 +83,66 @@ function(mooncake_provide_hiredis)
                  "${MOONCAKE_HIREDIS_INCLUDE_DIR}")
   endif()
 endfunction()
+
+function(mooncake_provide_boost)
+  if(TARGET Mooncake::boost)
+    return()
+  endif()
+
+  include(FetchContent)
+  cmake_policy(PUSH)
+  if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
+  endif()
+
+  set(_boost_version "1.92.0")
+  set(_boost_sha256
+      "ea7b982002cc9dfbe59b0b217b206f470dc75f3de0bb2973d844118934d82411")
+  set(_boost_url
+      "https://github.com/boostorg/boost/releases/download/boost-${_boost_version}/boost-${_boost_version}-b2-nodocs.tar.xz"
+  )
+  set(_boost_urls "${_boost_url}")
+  if(GH_MIRROR)
+    string(REPLACE "," ";" _gh_mirrors "${GH_MIRROR}")
+    list(GET _gh_mirrors 0 _first_mirror)
+    string(STRIP "${_first_mirror}" _first_mirror)
+    if(_first_mirror)
+      if(NOT _first_mirror MATCHES "/$")
+        set(_first_mirror "${_first_mirror}/")
+      endif()
+      set(_boost_urls "${_first_mirror}${_boost_url}" "${_boost_url}")
+    endif()
+  endif()
+
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.18")
+    FetchContent_Declare(
+      boost_headers
+      URL ${_boost_urls}
+      URL_HASH SHA256=${_boost_sha256}
+      SOURCE_SUBDIR boost)
+    FetchContent_MakeAvailable(boost_headers)
+  else()
+    FetchContent_Declare(
+      boost_headers
+      URL ${_boost_urls}
+      URL_HASH SHA256=${_boost_sha256})
+    FetchContent_GetProperties(boost_headers)
+    if(NOT boost_headers_POPULATED)
+      FetchContent_Populate(boost_headers)
+    endif()
+  endif()
+  cmake_policy(POP)
+
+  FetchContent_GetProperties(boost_headers)
+  message(
+    STATUS
+      "Boost headers: using pinned Boost ${_boost_version} (${boost_headers_SOURCE_DIR})"
+  )
+
+  add_library(Mooncake::boost INTERFACE IMPORTED)
+  set_target_properties(
+    Mooncake::boost
+    PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${boost_headers_SOURCE_DIR}"
+               INTERFACE_SYSTEM_INCLUDE_DIRECTORIES
+               "${boost_headers_SOURCE_DIR}")
+endfunction()

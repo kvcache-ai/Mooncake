@@ -89,13 +89,20 @@ struct SelectionContext {
     // Match policy against the original memory types, but select a network
     // transport for the host-to-host leg of a staged request.
     bool host_staging{false};
+    // A local MLU pair without direct access uses one host stage. Both legs
+    // are MLU copies; there is no host-to-host network leg.
+    bool local_mlu_staging{false};
     // The peer's XPU buffer may be mapped into this process (Level Zero IPC),
     // so XpuTransport can address it, unstaged, although the segment is not
     // local. Other transports still follow host_staging.
     bool xpu_ipc{false};
+    // A same-host MLU buffer has been mapped through CNRT IPC.
+    bool mlu_ipc{false};
     // Only XpuTransport may carry the request: the device memory has neither
     // a dma-buf RDMA registration nor a host staging route.
     bool xpu_ipc_only{false};
+    bool mlu_ipc_only{false};
+    bool rdma_device_direct{true};
 };
 
 /**
@@ -219,6 +226,12 @@ class TransportSelector {
 
     static std::optional<std::vector<TransportType>> reorderWithHint(
         const std::vector<TransportType>& raw, TransportType hint);
+
+    // Coarse reachability for direct peer submissions. Internal staging uses
+    // ProxyManager's own threads and can still use local-only transports.
+    static bool isPeerReachable(TransportType type, bool same_machine) {
+        return same_machine || (type != NVLINK && type != SHM && type != TPU);
+    }
 
    private:
     // Width of SelectionResult::device_mask; a NIC past this index cannot be

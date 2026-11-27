@@ -34,11 +34,13 @@
 #include "transport/ascend_transport/ascend_direct_transport/adxl_compat.h"
 #include "transfer_metadata.h"
 #include "config.h"
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <set>
@@ -60,6 +62,7 @@ constexpr int kTransferStatusMaxRetries = 1000;
 // threads do not clobber the test thread's current device.
 static thread_local int g_device_id = 0;
 static int g_device_count = 1;
+static std::map<int32_t, int32_t> g_physical_device_ids;
 static thread_local aclrtContext g_context =
     reinterpret_cast<aclrtContext>(0x10000);
 static thread_local aclError g_get_device_result = ACL_ERROR_NONE;
@@ -75,6 +78,11 @@ static std::map<const void*, aclrtMemLocation> g_memory_locations;
 // False stands for a thread that never bound a context, which is what the
 // signal handling thread looks like when it tears the client down.
 static bool g_thread_context_bound = true;
+static int g_get_context_block_remaining = 0;
+static bool g_get_context_entered = false;
+static bool g_release_get_context = true;
+static std::mutex g_get_context_mutex;
+static std::condition_variable g_get_context_cv;
 static std::mutex g_acl_mutex;
 static std::atomic<bool> g_null_recent_error{false};
 // 0 = no size limit; otherwise aclrtMallocPhysical fails when size > threshold.
@@ -139,6 +147,7 @@ void reset() {
     g_device_id = 0;
     g_get_device_result = ACL_ERROR_NONE;
     g_device_count = 1;
+    g_physical_device_ids.clear();
     g_context = ContextForDevice(0);
     g_memcpy_result = ACL_ERROR_NONE;
     g_memcpy_async_result = ACL_ERROR_NONE;
@@ -150,6 +159,13 @@ void reset() {
     g_set_device_ids.clear();
     g_memory_locations.clear();
     g_thread_context_bound = true;
+    {
+        std::lock_guard<std::mutex> context_lock(g_get_context_mutex);
+        g_get_context_block_remaining = 0;
+        g_get_context_entered = false;
+        g_release_get_context = true;
+        g_get_context_cv.notify_all();
+    }
     g_malloc_physical_max_success = 0;
     g_malloc_physical_call_count = 0;
     g_acl_event_seq = 0;
@@ -187,6 +203,26 @@ void set_device_count(int count) {
 void set_thread_context_bound(bool bound) {
     std::lock_guard<std::mutex> lock(g_acl_mutex);
     g_thread_context_bound = bound;
+}
+
+void arm_get_current_context_block() {
+    std::lock_guard<std::mutex> lock(g_get_context_mutex);
+    g_get_context_block_remaining = 1;
+    g_get_context_entered = false;
+    g_release_get_context = false;
+}
+
+void release_get_current_context_block() {
+    std::lock_guard<std::mutex> lock(g_get_context_mutex);
+    g_get_context_block_remaining = 0;
+    g_release_get_context = true;
+    g_get_context_cv.notify_all();
+}
+
+bool wait_get_current_context_entered() {
+    std::unique_lock<std::mutex> lock(g_get_context_mutex);
+    return g_get_context_cv.wait_for(lock, std::chrono::seconds(5),
+                                     [] { return g_get_context_entered; });
 }
 
 void set_pointer_location(void* ptr, aclrtMemLocationType type, uint32_t id) {
@@ -326,6 +362,15 @@ aclError aclrtSetDevice(int deviceId) {
 }
 
 aclError aclrtGetCurrentContext(aclrtContext* context) {
+    {
+        std::unique_lock<std::mutex> lock(g_get_context_mutex);
+        if (g_get_context_block_remaining > 0) {
+            --g_get_context_block_remaining;
+            g_get_context_entered = true;
+            g_get_context_cv.notify_all();
+            g_get_context_cv.wait(lock, [] { return g_release_get_context; });
+        }
+    }
     if (!g_thread_context_bound) {
         return 1;
     }
@@ -461,7 +506,9 @@ const char* aclGetRecentErrMsg() {
 
 aclError aclrtGetPhyDevIdByLogicDevId(int32_t logic_dev_id,
                                       int32_t* physical_dev_id) {
-    *physical_dev_id = logic_dev_id;
+    const auto it = g_physical_device_ids.find(logic_dev_id);
+    *physical_dev_id =
+        it == g_physical_device_ids.end() ? logic_dev_id : it->second;
     return ACL_ERROR_NONE;
 }
 
@@ -563,16 +610,27 @@ aclError aclrtFreeHost(void* host_ptr) {
 }
 
 static adxl::Status g_connect_result = adxl::SUCCESS;
+static adxl::Status g_disconnect_result = adxl::SUCCESS;
 static adxl::Status g_transfer_result = adxl::SUCCESS;
 static adxl::Status g_initialize_result = adxl::SUCCESS;
 static adxl::Status g_transfer_async_result = adxl::SUCCESS;
 static adxl::Status g_get_transfer_status_result = adxl::SUCCESS;
 static adxl::Status g_register_mem_result = adxl::SUCCESS;
+static bool g_block_get_status = false;
+static bool g_get_status_entered = false;
+static bool g_release_get_status = false;
+static int g_transfer_sync_block_remaining = 0;
+static bool g_transfer_sync_entered = false;
+static bool g_release_transfer_sync = false;
+static std::condition_variable g_adxl_cv;
 static adxl::TransferStatus g_transfer_status_enum =
     adxl::TransferStatus::COMPLETED;
 static std::deque<adxl::Status> g_transfer_results;
 static std::deque<adxl::Status> g_transfer_async_results;
 static std::deque<adxl::Status> g_initialize_results;
+static std::deque<adxl::Status> g_register_mem_results;
+static std::deque<adxl::Status> g_deregister_mem_results;
+static std::vector<int> g_registered_devices;
 static std::vector<std::string> g_initialize_names;
 static std::vector<uintptr_t> g_registered_mem_handles;
 static std::vector<uintptr_t> g_deregistered_mem_handles;
@@ -598,6 +656,14 @@ namespace adxl_mock {
 void reset() {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_connect_result = adxl::SUCCESS;
+    g_disconnect_result = adxl::SUCCESS;
+    g_block_get_status = false;
+    g_get_status_entered = false;
+    g_release_get_status = true;
+    g_transfer_sync_block_remaining = 0;
+    g_transfer_sync_entered = false;
+    g_release_transfer_sync = true;
+    g_adxl_cv.notify_all();
     g_transfer_result = adxl::SUCCESS;
     g_initialize_result = adxl::SUCCESS;
     g_transfer_async_result = adxl::SUCCESS;
@@ -607,6 +673,9 @@ void reset() {
     g_transfer_results.clear();
     g_transfer_async_results.clear();
     g_initialize_results.clear();
+    g_register_mem_results.clear();
+    g_deregister_mem_results.clear();
+    g_registered_devices.clear();
     g_initialize_names.clear();
     g_registered_mem_handles.clear();
     g_deregistered_mem_handles.clear();
@@ -637,6 +706,52 @@ void set_capability_result(adxl::Status status, int32_t value) {
 void set_connect_result(adxl::Status status) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_connect_result = status;
+}
+
+void set_disconnect_result(adxl::Status status) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_disconnect_result = status;
+}
+
+void arm_transfer_sync_block() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_transfer_sync_block_remaining = 1;
+    g_transfer_sync_entered = false;
+    g_release_transfer_sync = false;
+}
+
+void release_transfer_sync_block() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_transfer_sync_block_remaining = 0;
+    g_release_transfer_sync = true;
+    g_adxl_cv.notify_all();
+}
+
+bool wait_transfer_sync_entered() {
+    std::unique_lock<std::mutex> lock(g_mutex);
+    return g_adxl_cv.wait_for(lock, std::chrono::seconds(5),
+                              [] { return g_transfer_sync_entered; });
+}
+
+void arm_get_status_block() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_block_get_status = true;
+    g_get_status_entered = false;
+    g_release_get_status = false;
+}
+
+void release_get_status_block() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_block_get_status = false;
+    g_release_get_status = true;
+    g_transfer_status_enum = adxl::TransferStatus::COMPLETED;
+    g_adxl_cv.notify_all();
+}
+
+bool wait_get_status_entered() {
+    std::unique_lock<std::mutex> lock(g_mutex);
+    return g_adxl_cv.wait_for(lock, std::chrono::seconds(5),
+                              [] { return g_get_status_entered; });
 }
 
 void set_transfer_result(adxl::Status status) {
@@ -811,7 +926,7 @@ Status AdxlEngine::Disconnect(const AscendString& remote_engine,
     std::lock_guard<std::mutex> lock(g_mutex);
     g_connected.erase(std::string(remote_engine.GetString()));
     g_disconnect_count++;
-    return SUCCESS;
+    return g_disconnect_result;
 }
 
 Status AdxlEngine::TransferSync(const AscendString& remote_engine,
@@ -821,21 +936,24 @@ Status AdxlEngine::TransferSync(const AscendString& remote_engine,
     (void)remote_engine;
     (void)timeout_in_millis;
 
-    adxl::Status result;
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_transfer_count++;
-        if (!g_transfer_results.empty()) {
-            result = g_transfer_results.front();
-            g_transfer_results.pop_front();
-        } else {
-            result = g_transfer_result;
-        }
-    }
-
     (void)operation;
     (void)op_descs;
 
+    std::unique_lock<std::mutex> lock(g_mutex);
+    g_transfer_count++;
+    adxl::Status result;
+    if (!g_transfer_results.empty()) {
+        result = g_transfer_results.front();
+        g_transfer_results.pop_front();
+    } else {
+        result = g_transfer_result;
+    }
+    if (g_transfer_sync_block_remaining > 0) {
+        --g_transfer_sync_block_remaining;
+        g_transfer_sync_entered = true;
+        g_adxl_cv.notify_all();
+        g_adxl_cv.wait(lock, [] { return g_release_transfer_sync; });
+    }
     return result;
 }
 
@@ -869,13 +987,15 @@ Status AdxlEngine::GetTransferStatus(const TransferReq& req,
                                      TransferStatus& status) {
     (void)req;
 
-    adxl::Status result;
-    adxl::TransferStatus status_val;
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        result = g_get_transfer_status_result;
-        status_val = g_transfer_status_enum;
+    std::unique_lock<std::mutex> lock(g_mutex);
+    if (g_block_get_status) {
+        g_get_status_entered = true;
+        g_adxl_cv.notify_all();
+        g_adxl_cv.wait(lock, [] { return g_release_get_status; });
     }
+    const adxl::Status result = g_get_transfer_status_result;
+    const adxl::TransferStatus status_val = g_transfer_status_enum;
+    lock.unlock();
     if (result == adxl::SUCCESS) {
         status = status_val;
     }
@@ -888,12 +1008,18 @@ Status AdxlEngine::RegisterMem(const MemDesc& mem, MemType type,
     std::lock_guard<std::mutex> lock(g_mutex);
     g_register_mem_count++;
     g_last_local_only = mem.local_only;
+    if (!g_register_mem_results.empty()) {
+        const auto status = g_register_mem_results.front();
+        g_register_mem_results.pop_front();
+        if (status != adxl::SUCCESS) return status;
+    }
     if (g_register_mem_result != adxl::SUCCESS) {
         return g_register_mem_result;
     }
     mem_handle =
         reinterpret_cast<MemHandle>(static_cast<uintptr_t>(g_next_handle++));
     g_registered_mem_handles.push_back(reinterpret_cast<uintptr_t>(mem_handle));
+    g_registered_devices.push_back(g_device_id);
     return SUCCESS;
 }
 
@@ -902,6 +1028,11 @@ Status AdxlEngine::DeregisterMem(MemHandle mem_handle) {
     g_deregister_mem_count++;
     g_deregistered_mem_handles.push_back(
         reinterpret_cast<uintptr_t>(mem_handle));
+    if (!g_deregister_mem_results.empty()) {
+        const auto status = g_deregister_mem_results.front();
+        g_deregister_mem_results.pop_front();
+        return status;
+    }
     return SUCCESS;
 }
 
@@ -949,10 +1080,12 @@ class AscendDirectTransportTest : public ::testing::Test {
    protected:
     void SetUp() override {
         // Unit tests mock explicit Connect(); disable auto-connect by default.
+        unsetenv("MC_ASCEND_AUTO_CONNECT");
         setenv("ASCEND_AUTO_CONNECT", "0", 1);
         unsetenv("MC_CUSTOM_TOPO_JSON");
         mock_acl::reset();
         adxl_mock::reset();
+        globalConfig().ascend_standalone_single_segment = false;
 
         mock_acl::set_pointer_location(test_buffer_src_,
                                        ACL_MEM_LOCATION_TYPE_HOST, 0);
@@ -972,9 +1105,27 @@ class AscendDirectTransportTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        globalConfig().ascend_standalone_single_segment = false;
+        globalConfig().ascend_agent_mode = false;
+        unsetenv("MC_ASCEND_AUTO_CONNECT");
         unsetenv("ASCEND_AUTO_CONNECT");
         unsetenv("MC_CUSTOM_TOPO_JSON");
+        unsetenv("MC_ASCEND_GLOBAL_RESOURCE_CONFIG");
         unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+        unsetenv("MC_ASCEND_LOCAL_COMM_RES");
+        unsetenv("ASCEND_LOCAL_COMM_RES");
+        unsetenv("MC_ASCEND_RDMA_TC");
+        unsetenv("ASCEND_RDMA_TC");
+        unsetenv("MC_ASCEND_RDMA_SL");
+        unsetenv("ASCEND_RDMA_SL");
+        unsetenv("MC_ASCEND_BUFFER_POOL");
+        unsetenv("ASCEND_BUFFER_POOL");
+        unsetenv("MC_ASCEND_USE_ASYNC_TRANSFER");
+        unsetenv("ASCEND_USE_ASYNC_TRANSFER");
+        unsetenv("MC_ASCEND_THREAD_POOL_SIZE");
+        unsetenv("ASCEND_THREAD_POOL_SIZE");
+        unsetenv("MC_ASCEND_BASE_PORT");
+        unsetenv("ASCEND_BASE_PORT");
         unsetenv("HCCL_INTRA_ROCE_ENABLE");
         ContextManager::getInstance().finalize();
         google::ShutdownGoogleLogging();
@@ -1088,16 +1239,18 @@ class AscendDirectTransportTest : public ::testing::Test {
         return result;
     }
 
-    TransferWaitResult runRemoteTransfer(AscendDirectTransport* transport,
-                                         void* src, int target_id,
-                                         uint64_t target_offset, size_t len) {
+    TransferWaitResult runRemoteTransfer(
+        AscendDirectTransport* transport, void* src, int target_id,
+        uint64_t target_offset, size_t len,
+        Transport::TransferRequest::OpCode opcode =
+            Transport::TransferRequest::WRITE) {
         auto batch_id = transport->allocateBatchID(1);
         if (batch_id == 0) {
             return {false, false, {}};
         }
         std::vector<Transport::TransferRequest> requests;
         Transport::TransferRequest req;
-        req.opcode = Transport::TransferRequest::WRITE;
+        req.opcode = opcode;
         req.source = src;
         req.target_id = target_id;
         req.target_offset = target_offset;
@@ -1169,6 +1322,19 @@ class AscendDirectTransportTest : public ::testing::Test {
         constexpr size_t kAlignment = 2 * 1024 * 1024;
         return std::unique_ptr<void, FreeDeleter>(
             aligned_alloc(kAlignment, 2 * kAlignment));
+    }
+
+    bool connectOneRemotePeer(AscendDirectTransport* transport) {
+        if (transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                           "cpu:0", true, true) != 0) {
+            return false;
+        }
+        addRemoteSegment(transport->meta(),
+                         {1, "remote_server", "192.168.1.200", 40000});
+        initTestData(kTransferBufSize);
+        auto result = runRemoteTransfer(transport, test_buffer_src_, 1, 0x10000,
+                                        kTransferBufSize);
+        return result.finished && !result.failed;
     }
 
     size_t getLocalBufferCount(AscendDirectTransport* transport) {
@@ -1876,6 +2042,400 @@ TEST_F(AscendDirectTransportTest,
 // -----------------------------------------------------------------------------
 // Batch tests
 // -----------------------------------------------------------------------------
+
+TEST_F(AscendDirectTransportTest, SingleSegment_RegistersVisibleEnginesOnly) {
+    globalConfig().ascend_agent_mode = true;
+    globalConfig().ascend_standalone_single_segment = true;
+    for (const auto& physical_ids : std::vector<std::vector<int>>{
+             {0, 1, 2, 3}, {4, 5, 6, 7}, {4, 6}, {7}}) {
+        ContextManager::getInstance().finalize();
+        mock_acl::set_device_count(physical_ids.size());
+        ASSERT_EQ(aclrtSetDevice(0), ACL_ERROR_NONE);
+        g_physical_device_ids.clear();
+        for (size_t i = 0; i < physical_ids.size(); ++i) {
+            g_physical_device_ids[i] = physical_ids[i];
+        }
+        ASSERT_TRUE(ContextManager::getInstance().initialize());
+        auto transport = createTransport();
+        ASSERT_NE(transport, nullptr);
+        g_registered_devices.clear();
+        ASSERT_EQ(
+            transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                           kWildcardLocation, true, true),
+            0);
+        auto desc = transport->meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        ASSERT_EQ(desc->buffers.size(), physical_ids.size());
+        ASSERT_EQ(g_registered_devices.size(), physical_ids.size());
+        for (size_t i = 0; i < physical_ids.size(); ++i) {
+            EXPECT_EQ(desc->buffers[i].addr,
+                      reinterpret_cast<uint64_t>(test_buffer_src_));
+            EXPECT_EQ(desc->buffers[i].name, kWildcardLocation);
+            EXPECT_EQ(desc->buffers[i].device_id, i);
+            EXPECT_EQ(g_registered_devices[i], i);
+        }
+        const int before = adxl_mock::get_deregister_mem_count();
+        mock_acl::set_thread_context_bound(false);
+        ASSERT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+        EXPECT_EQ(adxl_mock::get_deregister_mem_count() - before,
+                  physical_ids.size());
+        EXPECT_EQ(getLocalBufferCount(transport.get()), 0u);
+        mock_acl::set_thread_context_bound(true);
+    }
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegment_OffKeepsOneRegistration) {
+    globalConfig().ascend_agent_mode = true;
+    ContextManager::getInstance().finalize();
+    mock_acl::set_device_count(4);
+    g_physical_device_ids = {{0, 4}, {1, 5}, {2, 6}, {3, 7}};
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(aclrtSetDevice(2), ACL_ERROR_NONE);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 1);
+    auto desc = transport->meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_EQ(desc->buffers.size(), 1u);
+    EXPECT_EQ(desc->buffers.front().device_id, 2);
+    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegment_LocalBuffersStayOnOneEngine) {
+    globalConfig().ascend_agent_mode = true;
+    globalConfig().ascend_standalone_single_segment = true;
+    ContextManager::getInstance().finalize();
+    mock_acl::set_device_count(4);
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             kWildcardLocation, false, true),
+              0);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), 1u);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 1);
+    ASSERT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegment_EmbeddedClientKeepsOneEngine) {
+    globalConfig().ascend_standalone_single_segment = true;
+    g_physical_device_ids = {{0, 7}};
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             kWildcardLocation, true, true),
+              0);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 1);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), 1u);
+    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegment_RejectsBufferPool) {
+    globalConfig().ascend_agent_mode = true;
+    globalConfig().ascend_standalone_single_segment = true;
+    setenv("ASCEND_BUFFER_POOL", "4:8", 1);
+    auto transport = createTransport();
+    unsetenv("ASCEND_BUFFER_POOL");
+    ASSERT_NE(transport, nullptr);
+    EXPECT_NE(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             kWildcardLocation, true, true),
+              0);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 0);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), 0u);
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegment_PartialRegisterRollsBack) {
+    globalConfig().ascend_agent_mode = true;
+    globalConfig().ascend_standalone_single_segment = true;
+    ContextManager::getInstance().finalize();
+    mock_acl::set_device_count(4);
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    g_register_mem_results = {adxl::SUCCESS, adxl::SUCCESS, adxl::FAILED};
+    EXPECT_NE(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             kWildcardLocation, true, true),
+              0);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 3);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 2);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), 0u);
+    EXPECT_EQ(adxl_mock::get_registered_mem_handles(),
+              adxl_mock::get_deregistered_mem_handles());
+}
+
+TEST_F(AscendDirectTransportTest,
+       SingleSegment_RollbackFailureRetainsHandlesForDeregister) {
+    globalConfig().ascend_agent_mode = true;
+    globalConfig().ascend_standalone_single_segment = true;
+    ContextManager::getInstance().finalize();
+    mock_acl::set_device_count(4);
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    g_register_mem_results = {adxl::SUCCESS, adxl::SUCCESS, adxl::FAILED};
+    g_deregister_mem_results = {adxl::FAILED, adxl::SUCCESS};
+    EXPECT_NE(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             kWildcardLocation, true, true),
+              0);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 3);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 2);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), 0u);
+
+    // Later cleanup must still find and retry the handle that failed rollback.
+    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 3);
+    const auto registered = adxl_mock::get_registered_mem_handles();
+    const auto deregistered = adxl_mock::get_deregistered_mem_handles();
+    ASSERT_EQ(registered.size(), 2u);
+    ASSERT_EQ(deregistered.size(), 3u);
+    EXPECT_EQ(deregistered.back(), registered.front());
+
+    // Once cleaned up, another unregister is a no-op.
+    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 3);
+}
+
+TEST_F(AscendDirectTransportTest,
+       SingleSegment_DeregisterRetriesFailedHandleOnly) {
+    globalConfig().ascend_agent_mode = true;
+    globalConfig().ascend_standalone_single_segment = true;
+    ContextManager::getInstance().finalize();
+    mock_acl::set_device_count(4);
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             kWildcardLocation, true, true),
+              0);
+    g_deregister_mem_results = {adxl::SUCCESS, adxl::FAILED, adxl::SUCCESS,
+                                adxl::SUCCESS};
+    EXPECT_NE(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), 4u);
+    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), 0u);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 5);
+    const auto deregistered = adxl_mock::get_deregistered_mem_handles();
+    EXPECT_EQ(deregistered.back(), deregistered[1]);
+}
+
+TEST(AscendDeviceMappingTest, ReversesAndBalancesByPhysicalModulo) {
+    const std::vector<std::vector<uint32_t>> expected = {
+        {7, 6, 5, 4, 3, 2, 1, 0},
+        {3, 2, 1, 0, 3, 2, 1, 0},
+        {1, 0, 1, 0, 1, 0, 1, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0},
+    };
+    for (size_t row = 0; row < expected.size(); ++row) {
+        const uint32_t servers = 8 >> row;
+        for (uint32_t physical_id = 0; physical_id < 8; ++physical_id) {
+            EXPECT_EQ(ReverseDeviceIndex(physical_id, servers),
+                      expected[row][physical_id]);
+        }
+    }
+    EXPECT_EQ(ReverseDeviceIndex(6, 2), 1u);
+    EXPECT_EQ(ReverseDeviceIndex(9, 2), 0u);
+    EXPECT_FALSE(ReverseDeviceIndex(0, 0));
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegment_ClientRoutesByPhysicalDevice) {
+    const uint64_t dest = reinterpret_cast<uint64_t>(test_buffer_dst_);
+    for (uint32_t host_devices : {8, 16}) {
+        mock_acl::set_device_count(static_cast<int>(host_devices));
+        g_physical_device_ids.clear();
+        for (uint32_t id = 0; id < host_devices; ++id) {
+            g_physical_device_ids[static_cast<int32_t>(id)] =
+                static_cast<int32_t>(id);
+        }
+        for (bool use_async : {false, true}) {
+            for (const auto& server_ids :
+                 std::vector<std::vector<int>>{{0, 1, 2, 3, 4, 5, 6, 7},
+                                               {0, 1, 2, 3},
+                                               {4, 5, 6, 7},
+                                               {4, 6},
+                                               {7},
+                                               {1, 3, 5, 7}}) {
+                std::vector<int> counts(server_ids.size());
+                for (uint32_t physical_id = 0; physical_id < host_devices;
+                     ++physical_id) {
+                    SCOPED_TRACE(::testing::Message()
+                                 << "client=" << physical_id
+                                 << " servers=" << server_ids.size()
+                                 << " async=" << use_async);
+                    ASSERT_EQ(aclrtSetDevice(static_cast<int>(physical_id)),
+                              ACL_ERROR_NONE);
+                    auto transport = createTransport(use_async);
+                    ASSERT_NE(transport, nullptr);
+                    auto desc =
+                        std::make_shared<TransferMetadata::SegmentDesc>();
+                    desc->name = "remote";
+                    desc->protocol = "ascend";
+                    desc->rank_info.hostIp = "192.168.1.100";
+                    for (size_t i = 0; i < server_ids.size(); ++i) {
+                        desc->rank_info.endpoints.push_back(
+                            "192.168.1.100:" +
+                            std::to_string(30000 + server_ids[i]));
+                        TransferMetadata::BufferDesc buffer;
+                        buffer.addr = dest;
+                        buffer.length = kRegisterMemSize;
+                        buffer.device_id = i;
+                        desc->buffers.push_back(buffer);
+                    }
+                    // Candidate ordering and duplicate records must not change
+                    // routing.
+                    std::reverse(desc->buffers.begin(), desc->buffers.end());
+                    desc->buffers.push_back(desc->buffers.front());
+                    auto published = desc;
+                    transport->meta()->addLocalSegment(1, desc->name,
+                                                       std::move(published));
+                    const size_t selected = server_ids.size() - 1 -
+                                            (physical_id % server_ids.size());
+                    ++counts[selected];
+                    const int connects_before = adxl_mock::get_connect_count();
+                    for (auto opcode : {Transport::TransferRequest::READ,
+                                        Transport::TransferRequest::WRITE}) {
+                        for (size_t offset : {size_t{0}, size_t{8192}}) {
+                            const auto result = runRemoteTransfer(
+                                transport.get(), test_buffer_src_, 1,
+                                dest + offset, kTransferBufSize, opcode);
+                            ASSERT_TRUE(result.finished);
+                            ASSERT_FALSE(result.failed);
+                            EXPECT_EQ(adxl_mock::get_last_connect_target(),
+                                      desc->rank_info.endpoints[selected]);
+                        }
+                    }
+                    EXPECT_EQ(adxl_mock::get_connect_count() - connects_before,
+                              1);
+                }
+                for (int count : counts)
+                    EXPECT_EQ(count, host_devices / server_ids.size());
+            }
+        }
+    }
+}
+
+TEST_F(AscendDirectTransportTest,
+       SingleSegment_IsolatedVisibilityDistributesAcrossServers) {
+    const uint64_t dest = reinterpret_cast<uint64_t>(test_buffer_dst_);
+    for (uint32_t servers : {8u, 4u, 2u, 1u}) {
+        std::vector<int> counts(servers, 0);
+        for (uint32_t physical_id = 0; physical_id < 8; ++physical_id) {
+            SCOPED_TRACE(::testing::Message()
+                         << "servers=" << servers
+                         << " physical_id=" << physical_id);
+            mock_acl::set_device_count(1);
+            ASSERT_EQ(aclrtSetDevice(0), ACL_ERROR_NONE);
+            g_physical_device_ids = {{0, static_cast<int32_t>(physical_id)}};
+            auto transport = createTransport();
+            ASSERT_NE(transport, nullptr);
+            auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+            desc->name = "remote";
+            desc->protocol = "ascend";
+            desc->rank_info.hostIp = "192.168.1.100";
+            for (size_t i = 0; i < servers; ++i) {
+                desc->rank_info.endpoints.push_back("192.168.1.100:" +
+                                                    std::to_string(30000 + i));
+                TransferMetadata::BufferDesc buffer;
+                buffer.addr = dest;
+                buffer.length = kRegisterMemSize;
+                buffer.device_id = i;
+                desc->buffers.push_back(buffer);
+            }
+            transport->meta()->addLocalSegment(1, desc->name, std::move(desc));
+            const size_t selected = servers - 1 - (physical_id % servers);
+            ++counts[selected];
+            const auto result = runRemoteTransfer(
+                transport.get(), test_buffer_src_, 1, dest, kTransferBufSize);
+            ASSERT_TRUE(result.finished);
+            ASSERT_FALSE(result.failed);
+            EXPECT_EQ(adxl_mock::get_last_connect_target(),
+                      "192.168.1.100:" + std::to_string(30000 + selected));
+        }
+        for (int count : counts) {
+            EXPECT_EQ(count, static_cast<int>(8 / servers));
+        }
+    }
+}
+
+TEST_F(AscendDirectTransportTest,
+       SingleSegment_UnknownPhysicalIdFailsSharedRouteOnly) {
+    g_physical_device_ids = {{0, -1}};
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const uint64_t dest = reinterpret_cast<uint64_t>(test_buffer_dst_);
+    addMultiEndpointRemoteSegment(
+        transport->meta(), 1, "legacy", "192.168.1.100",
+        {"192.168.1.100:30000", "192.168.1.100:30001"}, 1, dest,
+        kRegisterMemSize);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1, dest,
+                                    kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    auto desc = transport->meta()->getSegmentDescByID(1);
+    auto shared = std::make_shared<TransferMetadata::SegmentDesc>(*desc);
+    shared->name = "shared";
+    shared->buffers.push_back(shared->buffers.front());
+    shared->buffers.back().device_id = 0;
+    transport->meta()->addLocalSegment(2, "shared", std::move(shared));
+    result = runRemoteTransfer(transport.get(), test_buffer_src_, 2, dest,
+                               kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_TRUE(result.failed);
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegment_UsesSparsePhysicalModulo) {
+    mock_acl::set_device_count(4);
+    g_physical_device_ids = {{0, 4}, {1, 6}, {2, 9}, {3, 11}};
+    ASSERT_EQ(aclrtSetDevice(1), ACL_ERROR_NONE);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const uint64_t dest = reinterpret_cast<uint64_t>(test_buffer_dst_);
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "shared";
+    desc->rank_info.endpoints = {"192.168.1.100:30004", "192.168.1.100:30007"};
+    for (int device_id : {0, 1}) {
+        TransferMetadata::BufferDesc buffer;
+        buffer.addr = dest;
+        buffer.length = kRegisterMemSize;
+        buffer.device_id = device_id;
+        desc->buffers.push_back(buffer);
+    }
+    transport->meta()->addLocalSegment(1, "shared", std::move(desc));
+    const auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                          dest, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    // Physical 6 with 2 candidates selects 2 - 1 - (6 % 2) = 1.
+    EXPECT_EQ(adxl_mock::get_last_connect_target(), "192.168.1.100:30007");
+}
+
+TEST_F(AscendDirectTransportTest,
+       SingleSegment_ClientUsesOnlyCoveringCandidates) {
+    g_physical_device_ids = {{0, 0}};
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const uint64_t dest = reinterpret_cast<uint64_t>(test_buffer_dst_);
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "remote";
+    desc->protocol = "ascend";
+    desc->rank_info.endpoints = {"192.168.1.100:30004", "192.168.1.100:30005",
+                                 "192.168.1.100:30006", "192.168.1.100:30007"};
+    for (int device_id : {3, 0, 1, 2}) {
+        TransferMetadata::BufferDesc buffer;
+        buffer.addr = device_id == 0 ? dest + kRegisterMemSize : dest;
+        buffer.length = device_id == 2 ? 1 : kRegisterMemSize;
+        buffer.device_id = device_id;
+        desc->buffers.push_back(buffer);
+    }
+    auto published = desc;
+    transport->meta()->addLocalSegment(1, desc->name, std::move(published));
+    const auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                          dest, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    ASSERT_FALSE(result.failed);
+    EXPECT_EQ(adxl_mock::get_last_connect_target(),
+              desc->rank_info.endpoints[3]);
+}
 
 TEST_F(AscendDirectTransportTest, Batch_ExceedsCapacity) {
     auto transport = createTransport();
@@ -2854,6 +3414,387 @@ TEST_F(AscendDirectTransportTest,
     ASSERT_TRUE(result.finished);
     EXPECT_TRUE(result.failed);
     EXPECT_EQ(adxl_mock::get_disconnect_count(), 1);
+}
+
+// -----------------------------------------------------------------------------
+// disconnectAllPeers
+// -----------------------------------------------------------------------------
+
+namespace {
+constexpr int kDisconnectPending = 2;
+
+struct JoinThread {
+    std::thread& thread;
+    ~JoinThread() {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+};
+
+struct ReleaseAdxlBlocks {
+    ~ReleaseAdxlBlocks() {
+        adxl_mock::release_transfer_sync_block();
+        adxl_mock::release_get_status_block();
+    }
+};
+
+struct UnsetEnv {
+    const char* name;
+    ~UnsetEnv() { unsetenv(name); }
+};
+}  // namespace
+
+TEST_F(AscendDirectTransportTest,
+       DisconnectAllPeers_SecondCallWaitsUntilFirstReturns) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_TRUE(connectOneRemotePeer(transport.get()));
+    const int disconnects_before = adxl_mock::get_disconnect_count();
+
+    // GetCurrentContext is the first step after disconnect_all_mutex_, and it
+    // is outside connection_mutex_. A second call that is not serialized
+    // finishes Disconnect while this one is still blocked here.
+    mock_acl::arm_get_current_context_block();
+
+    std::thread first;
+    JoinThread join_first{first};
+    std::thread second;
+    JoinThread join_second{second};
+    // Released before the joins on the failure path, so a blocked caller
+    // cannot outlive the test.
+    struct ReleaseContextBlock {
+        ~ReleaseContextBlock() {
+            mock_acl::release_get_current_context_block();
+        }
+    } release_context_block;
+    std::atomic<int> first_rc{kDisconnectPending};
+    std::atomic<int> second_rc{kDisconnectPending};
+
+    first = std::thread([&transport, &first_rc] {
+        first_rc = transport->disconnectAllPeers();
+    });
+    ASSERT_TRUE(mock_acl::wait_get_current_context_entered());
+
+    second = std::thread([&transport, &second_rc] {
+        second_rc = transport->disconnectAllPeers();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_EQ(first_rc.load(), kDisconnectPending);
+    ASSERT_EQ(second_rc.load(), kDisconnectPending);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), disconnects_before);
+
+    mock_acl::release_get_current_context_block();
+    first.join();
+    second.join();
+    EXPECT_EQ(first_rc.load(), 0);
+    EXPECT_EQ(second_rc.load(), 0);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), disconnects_before + 1);
+}
+
+TEST_F(AscendDirectTransportTest,
+       DisconnectAllPeers_FinalizeWaitsUntilCallReturns) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_TRUE(connectOneRemotePeer(transport.get()));
+
+    mock_acl::arm_get_current_context_block();
+
+    std::atomic<int> disconnect_rc{kDisconnectPending};
+    std::atomic<bool> destroyed{false};
+    std::thread disconnecter;
+    JoinThread join_disconnecter{disconnecter};
+    std::thread destroyer;
+    JoinThread join_destroyer{destroyer};
+    struct ReleaseContextBlock {
+        ~ReleaseContextBlock() {
+            mock_acl::release_get_current_context_block();
+        }
+    } release_context_block;
+
+    disconnecter = std::thread([&transport, &disconnect_rc] {
+        disconnect_rc = transport->disconnectAllPeers();
+    });
+    ASSERT_TRUE(mock_acl::wait_get_current_context_entered());
+
+    destroyer = std::thread([&transport, &destroyed] {
+        transport.reset();
+        destroyed.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(disconnect_rc.load(), kDisconnectPending);
+    EXPECT_FALSE(destroyed.load());
+
+    mock_acl::release_get_current_context_block();
+    disconnecter.join();
+    destroyer.join();
+    EXPECT_EQ(disconnect_rc.load(), 0);
+    EXPECT_TRUE(destroyed.load());
+}
+
+TEST_F(AscendDirectTransportTest, DisconnectAllPeers_NoPeers_ReturnsZero) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    EXPECT_EQ(transport->disconnectAllPeers(), 0);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), 0);
+}
+
+TEST_F(AscendDirectTransportTest,
+       DisconnectAllPeers_Sync_DropsRecordedPeerAndAllowsReconnect) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_TRUE(connectOneRemotePeer(transport.get()));
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), 0);
+
+    EXPECT_EQ(transport->disconnectAllPeers(), 0);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), 1);
+
+    const int connects_before = adxl_mock::get_connect_count();
+    auto again = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                   0x10000, kTransferBufSize);
+    ASSERT_TRUE(again.finished);
+    EXPECT_FALSE(again.failed);
+    EXPECT_GT(adxl_mock::get_connect_count(), connects_before);
+}
+
+TEST_F(AscendDirectTransportTest,
+       DisconnectAllPeers_Sync_AutoConnect_DropsRecordedPeer) {
+    setenv("ASCEND_AUTO_CONNECT", "1", 1);
+    UnsetEnv restore_auto_connect{"ASCEND_AUTO_CONNECT"};
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_TRUE(connectOneRemotePeer(transport.get()));
+    EXPECT_EQ(adxl_mock::get_connect_count(), 0);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), 0);
+
+    EXPECT_EQ(transport->disconnectAllPeers(), 0);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), 1);
+}
+
+TEST_F(AscendDirectTransportTest,
+       DisconnectAllPeers_Sync_FailedDisconnectKeepsPeer) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_TRUE(connectOneRemotePeer(transport.get()));
+
+    adxl_mock::set_disconnect_result(adxl::FAILED);
+    EXPECT_EQ(transport->disconnectAllPeers(), -1);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), 1);
+
+    adxl_mock::set_disconnect_result(adxl::SUCCESS);
+    EXPECT_EQ(transport->disconnectAllPeers(), 0);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), 2);
+}
+
+TEST_F(AscendDirectTransportTest,
+       DisconnectAllPeers_Sync_NotConnectedErasesPeer) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_TRUE(connectOneRemotePeer(transport.get()));
+
+    adxl_mock::set_disconnect_result(adxl::NOT_CONNECTED);
+    EXPECT_EQ(transport->disconnectAllPeers(), 0);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), 1);
+
+    adxl_mock::set_disconnect_result(adxl::SUCCESS);
+    EXPECT_EQ(transport->disconnectAllPeers(), 0);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), 1);
+}
+
+TEST_F(AscendDirectTransportTest,
+       DisconnectAllPeers_Sync_WaitsForInFlightAndRejectsNewTransfer) {
+    adxl_mock::arm_transfer_sync_block();
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(),
+                     {1, "remote_server", "192.168.1.200", 40000});
+
+    std::thread inflight;
+    JoinThread join_inflight{inflight};
+    std::thread disconnecter;
+    JoinThread join_disconnecter{disconnecter};
+    ReleaseAdxlBlocks release_blocks;
+
+    std::atomic<bool> inflight_failed{false};
+    std::atomic<bool> inflight_finished{false};
+    inflight =
+        std::thread([this, &transport, &inflight_failed, &inflight_finished] {
+            auto result = runRemoteTransfer(transport.get(), test_buffer_src_,
+                                            1, 0x10000, kTransferBufSize);
+            inflight_finished = result.finished;
+            inflight_failed = result.failed;
+        });
+    ASSERT_TRUE(adxl_mock::wait_transfer_sync_entered());
+
+    std::atomic<int> disconnect_rc{kDisconnectPending};
+    disconnecter = std::thread([&transport, &disconnect_rc] {
+        disconnect_rc = transport->disconnectAllPeers();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_EQ(disconnect_rc.load(), kDisconnectPending);
+    ASSERT_EQ(adxl_mock::get_disconnect_count(), 0);
+
+    auto rejected = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                      0x10000, kTransferBufSize);
+    EXPECT_TRUE(rejected.finished);
+    EXPECT_TRUE(rejected.failed);
+    EXPECT_EQ(adxl_mock::get_transfer_count(), 1);
+
+    adxl_mock::release_transfer_sync_block();
+    inflight.join();
+    disconnecter.join();
+    EXPECT_TRUE(inflight_finished.load());
+    EXPECT_FALSE(inflight_failed.load());
+    EXPECT_EQ(disconnect_rc.load(), 0);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), 1);
+}
+
+TEST_F(AscendDirectTransportTest,
+       DisconnectAllPeers_Async_DrainsInFlightBeforeDisconnect) {
+    adxl_mock::arm_get_status_block();
+    adxl_mock::set_transfer_async_result(adxl::SUCCESS);
+    adxl_mock::set_get_transfer_status_result(adxl::SUCCESS);
+    adxl_mock::set_transfer_status_enum(adxl::TransferStatus::WAITING);
+
+    auto transport = createTransport(true);
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(),
+                     {1, "remote_server", "192.168.1.200", 40000});
+
+    std::thread inflight;
+    JoinThread join_inflight{inflight};
+    std::thread disconnecter;
+    JoinThread join_disconnecter{disconnecter};
+    ReleaseAdxlBlocks release_blocks;
+
+    std::atomic<bool> inflight_failed{true};
+    std::atomic<bool> inflight_finished{false};
+    inflight =
+        std::thread([this, &transport, &inflight_failed, &inflight_finished] {
+            auto result = runRemoteTransfer(transport.get(), test_buffer_src_,
+                                            1, 0x10000, kTransferBufSize);
+            inflight_finished = result.finished;
+            inflight_failed = result.failed;
+        });
+    ASSERT_TRUE(adxl_mock::wait_get_status_entered());
+
+    std::atomic<int> disconnect_rc{kDisconnectPending};
+    disconnecter = std::thread([&transport, &disconnect_rc] {
+        disconnect_rc = transport->disconnectAllPeers();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_EQ(disconnect_rc.load(), kDisconnectPending);
+    ASSERT_EQ(adxl_mock::get_disconnect_count(), 0);
+    EXPECT_EQ(adxl_mock::get_transfer_async_count(), 1);
+
+    auto rejected = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                      0x10000, kTransferBufSize);
+    EXPECT_TRUE(rejected.finished);
+    EXPECT_TRUE(rejected.failed);
+    EXPECT_EQ(adxl_mock::get_transfer_async_count(), 1);
+
+    adxl_mock::release_get_status_block();
+    inflight.join();
+    disconnecter.join();
+    EXPECT_TRUE(inflight_finished.load());
+    EXPECT_FALSE(inflight_failed.load());
+    EXPECT_EQ(disconnect_rc.load(), 0);
+    EXPECT_EQ(adxl_mock::get_disconnect_count(), 1);
+}
+
+TEST_F(AscendDirectTransportTest, DisconnectAllPeers_RestoresCallerContext) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_TRUE(connectOneRemotePeer(transport.get()));
+
+    const aclrtContext caller = ContextForDevice(3);
+    ASSERT_EQ(aclrtSetCurrentContext(caller), ACL_ERROR_NONE);
+    EXPECT_EQ(transport->disconnectAllPeers(), 0);
+
+    aclrtContext after = nullptr;
+    ASSERT_EQ(aclrtGetCurrentContext(&after), ACL_ERROR_NONE);
+    EXPECT_EQ(after, caller);
+}
+
+TEST_F(AscendDirectTransportTest,
+       DisconnectAllPeers_LocalDeviceCopy_WaitsUntilCopyCompletes) {
+    setenv("ASCEND_TRANSFER_TIMEOUT", "30000", 1);
+    UnsetEnv restore_timeout{"ASCEND_TRANSFER_TIMEOUT"};
+    mock_acl::set_skip_flag_copy(true);
+    mock_acl::set_pointer_location(test_buffer_src_,
+                                   ACL_MEM_LOCATION_TYPE_DEVICE, 0);
+    mock_acl::set_pointer_location(test_buffer_dst_,
+                                   ACL_MEM_LOCATION_TYPE_DEVICE, 0);
+
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_dst_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    const size_t host_allocs_before = mock_acl::host_allocs().size();
+
+    auto batch_id = transport->allocateBatchID(1);
+    ASSERT_NE(batch_id, 0);
+    std::vector<Transport::TransferRequest> requests;
+    Transport::TransferRequest req;
+    req.opcode = Transport::TransferRequest::WRITE;
+    req.source = test_buffer_src_;
+    req.target_id = 0;
+    req.target_offset = reinterpret_cast<uint64_t>(test_buffer_dst_);
+    req.length = kTransferBufSize;
+    requests.push_back(req);
+    ASSERT_TRUE(transport->submitTransfer(batch_id, requests).ok());
+
+    bool submitted = false;
+    for (int i = 0; i < 2000; ++i) {
+        if (mock_acl::host_allocs().size() > host_allocs_before &&
+            mock_acl::memcpy_async_call_count() > 0) {
+            submitted = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(submitted);
+
+    std::thread disconnecter;
+    JoinThread join_disconnecter{disconnecter};
+    std::atomic<int> disconnect_rc{kDisconnectPending};
+    disconnecter = std::thread([&transport, &disconnect_rc] {
+        disconnect_rc = transport->disconnectAllPeers();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_EQ(disconnect_rc.load(), kDisconnectPending);
+
+    auto rejected = transport->allocateBatchID(1);
+    ASSERT_NE(rejected, 0);
+    ASSERT_TRUE(transport->submitTransfer(rejected, requests).ok());
+    auto rejected_result = waitForTransfer(transport.get(), rejected);
+    EXPECT_TRUE(rejected_result.finished);
+    EXPECT_TRUE(rejected_result.failed);
+    transport->freeBatchID(rejected);
+    ASSERT_EQ(disconnect_rc.load(), kDisconnectPending);
+
+    auto allocs = mock_acl::host_allocs();
+    ASSERT_GT(allocs.size(), host_allocs_before);
+    for (size_t i = host_allocs_before; i < allocs.size(); ++i) {
+        *static_cast<uint32_t*>(allocs[i]) = 1;
+    }
+    disconnecter.join();
+    EXPECT_EQ(disconnect_rc.load(), 0);
+
+    Transport::TransferStatus status{};
+    ASSERT_TRUE(transport->getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, Transport::COMPLETED);
+    transport->freeBatchID(batch_id);
 }
 
 // -----------------------------------------------------------------------------
@@ -3869,6 +4810,25 @@ TEST_F(ClientServerModeTest, AcceptZeroBufferPoolInClientServerMode) {
     auto transport = createTransport();
     EXPECT_NE(transport, nullptr);
     unsetenv("ASCEND_BUFFER_POOL");
+}
+
+TEST_F(ClientServerModeTest, McAscendEnvTakesPrecedenceOverLegacy) {
+    adxl_mock::set_capability_result(adxl::SUCCESS, 1);
+    setenv("ASCEND_LOCAL_COMM_RES", R"({"version":"1.2"})", 1);
+    setenv("MC_ASCEND_LOCAL_COMM_RES", R"({"version":"1.5"})", 1);
+    setenv("ASCEND_RDMA_TC", "10", 1);
+    setenv("MC_ASCEND_RDMA_TC", "20", 1);
+    setenv("ASCEND_RDMA_SL", "1", 1);
+    setenv("MC_ASCEND_RDMA_SL", "2", 1);
+    setenv("ASCEND_BUFFER_POOL", "4:8", 1);
+    setenv("MC_ASCEND_BUFFER_POOL", "0:0", 1);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const auto opts = adxl_mock::get_last_init_options();
+    EXPECT_EQ(opts.at("adxl.LocalCommRes"), R"({"version":"1.5"})");
+    EXPECT_EQ(opts.at("adxl.RdmaTrafficClass"), "20");
+    EXPECT_EQ(opts.at("adxl.RdmaServiceLevel"), "2");
+    EXPECT_EQ(opts.at("adxl.BufferPool"), "0:0");
 }
 
 // Bind the real transport without a remote server; only device resolution

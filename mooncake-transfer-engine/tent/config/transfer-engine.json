@@ -110,9 +110,14 @@
         "ascend_direct": {
             "enable": true,
             "transfer_timeout_ms": 10000,
+            "base_port": 20000,
+            "thread_pool_size": 16,
             "rdma_tc": "",
             "rdma_sl": "",
+            "local_comm_res": "{\"version\":\"1.3\"}",
             "fabric_mem": false,
+            "use_shmem": false,
+            "standalone_single_segment": false,
             "global_resource_config": "",
             "agent_mode": false
         },

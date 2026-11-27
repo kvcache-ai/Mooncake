@@ -33,6 +33,7 @@
 
 #include "mooncake_te_build_config.h"
 #include "common/base/status.h"
+#include "error.h"
 #include "transfer_metadata.h"
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
 #include "adaptive_congestion_control.h"
@@ -76,6 +77,11 @@ class Transport {
         int advise_retry_cnt = 0;
         // Per-request transport pin, TENT only.
         int transport_hint = 0;
+        // Runtime event (e.g. cudaEvent_t) the source must wait on before the
+        // copy, TENT only. Must stay valid, and must not be re-recorded, until
+        // the request reaches a terminal state: runtime-queue dispatch and
+        // transport failover may still read it after submitTransfer returns.
+        void *producer_event = nullptr;
         // Business intent for TENT scheduling (0 = unspecified).
         int intent_type = 0;
         // Adjacent requests in a group may be scheduled as one unit.
@@ -164,6 +170,11 @@ class Transport {
     // minimize overhead on hot paths. The caller must ensure that
     // the underlying BatchDesc object remains alive and valid for
     // as long as the handle is in use.
+    static inline bool isValidBatchID(BatchID id) {
+        return id != 0 && id != UINT64_MAX &&
+               id != static_cast<BatchID>(ERR_MEMORY);
+    }
+
     static inline BatchDesc &toBatchDesc(BatchID id) {
         return *reinterpret_cast<BatchDesc *>(id);
     }
@@ -788,6 +799,11 @@ class Transport {
         return Status::OK();
     }
     virtual Status CheckStatus(SegmentID sid) { return Status::OK(); }
+
+    // Can an independent ordinary batch be submitted from a batch submit worker
+    // without losing caller-thread context or execution dependencies?
+    // This does not strengthen ordinary failure, timeout or cleanup semantics.
+    virtual bool supportsParallelBatchSubmit() const { return false; }
 
    protected:
     virtual int install(std::string &local_server_name,
