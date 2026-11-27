@@ -4,6 +4,8 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -516,6 +518,50 @@ TEST_F(LocalDiskUnmountInterleavingTest,
     ASSERT_TRUE(late_replicas.has_value());
     ASSERT_EQ(1u, late_replicas.value().replicas.size());
     EXPECT_TRUE(late_replicas.value().replicas[0].is_local_disk_replica());
+}
+
+// The replica-sweep half runs after UnmountLocalDiskSegment releases its
+// exclusive deregistration lock. It must still take master_state_mutex_
+// shared so it cannot erase or shift replicas while an exclusive state holder
+// (ReMountSegment, snapshot export, or standby restore) walks and mutates
+// object metadata.
+TEST_F(LocalDiskUnmountInterleavingTest,
+       SweepHalfWaitsForExclusiveMasterStateLock) {
+    auto service = CreateSsdAwareOffloadService();
+    UUID client_id = generate_uuid();
+    const std::string segment = "ssd_interleave_state_lock_segment";
+    const std::string key = "ssd_interleave_state_lock_key";
+    MountMemoryAndLocalDisk(*service, client_id, segment, 0x1500000000);
+    PutAndOffload(*service, client_id, key, 1024, segment);
+
+    DeregisterHalf(*service, client_id);
+
+    std::unique_lock<std::shared_mutex> state_lock(
+        MasterServiceTestPeer::MasterStateMutex(*service));
+    auto sweeping =
+        std::async(std::launch::async, [&] { SweepHalf(*service, client_id); });
+    EXPECT_EQ(std::future_status::timeout,
+              sweeping.wait_for(std::chrono::milliseconds(250)));
+
+    // Inspect the key directly under its shard read lock while
+    // master_state_mutex_ is held exclusively: the sweep must not have
+    // mutated or removed the LOCAL_DISK replica yet.
+    {
+        auto object = MasterServiceTestPeer::ReadObject(
+            *service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        ASSERT_TRUE(object.has_value());
+        EXPECT_TRUE(
+            object->metadata().HasReplica(&Replica::fn_is_local_disk_replica));
+    }
+
+    state_lock.unlock();
+    sweeping.get();
+
+    auto replicas = service->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(1u, replicas.value().replicas.size());
+    EXPECT_TRUE(replicas.value().replicas[0].is_memory_replica());
 }
 
 // Regression test for issue #2997.
