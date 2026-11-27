@@ -105,6 +105,12 @@ jobs:
     - name: Free up disk space
       uses: ./.github/actions/free-disk-space
 
+    - name: Retry transient apt download failures
+      run: |
+        sudo tee /etc/apt/apt.conf.d/80-retries >/dev/null <<'EOF'
+        APT::Acquire::Retries "5";
+        EOF
+
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.24
       with:
@@ -237,6 +243,12 @@ jobs:
     - name: Free up disk space
       uses: ./.github/actions/free-disk-space
 
+    - name: Retry transient apt download failures
+      run: |
+        sudo tee /etc/apt/apt.conf.d/80-retries >/dev/null <<'EOF'
+        APT::Acquire::Retries "5";
+        EOF
+
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.24
       with:
@@ -336,6 +348,12 @@ jobs:
 
     - name: Free up disk space
       uses: ./.github/actions/free-disk-space
+
+    - name: Retry transient apt download failures
+      run: |
+        sudo tee /etc/apt/apt.conf.d/80-retries >/dev/null <<'EOF'
+        APT::Acquire::Retries "5";
+        EOF
 
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.24
@@ -689,6 +707,12 @@ jobs:
     - name: Free up disk space
       uses: ./.github/actions/free-disk-space
 
+    - name: Retry transient apt download failures
+      run: |
+        sudo tee /etc/apt/apt.conf.d/80-retries >/dev/null <<'EOF'
+        APT::Acquire::Retries "5";
+        EOF
+
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.24
       with:
@@ -825,6 +849,12 @@ jobs:
     - name: Free up disk space
       if: matrix.need_cuda
       uses: ./.github/actions/free-disk-space
+
+    - name: Retry transient apt download failures
+      run: |
+        sudo tee /etc/apt/apt.conf.d/80-retries >/dev/null <<'EOF'
+        APT::Acquire::Retries "5";
+        EOF
 
     - name: Install CUDA Toolkit
       if: matrix.need_cuda
@@ -1033,6 +1063,12 @@ jobs:
 
     - name: Set up compiler cache
       uses: ./.github/actions/setup-sccache
+
+    - name: Retry transient apt download failures
+      run: |
+        sudo tee /etc/apt/apt.conf.d/80-retries >/dev/null <<'EOF'
+        APT::Acquire::Retries "5";
+        EOF
 
     - name: Install dependencies
       run: |

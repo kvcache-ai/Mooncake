@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -195,6 +197,14 @@ class FileStorage {
         FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplica_Test;
     friend class
         FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket_Test;
+    friend class
+        FileStorageTest_BatchGetSingleflight_SameMultiKeyBatchShared_Test;
+    friend class
+        FileStorageTest_BatchGetSingleflight_StagingSharingVerification_Test;
+    friend class
+        FileStorageTest_BatchGetSingleflight_LastReleaseFreesSharedStaging_Test;
+    friend class
+        FileStorageTest_BatchGetSingleflight_AbandonedReaderDoesNotLeakStaging_Test;
 
     struct AllocatedBatch;
     struct ColdReadInvalidation;
@@ -492,6 +502,14 @@ class FileStorage {
     // unwinds, the destroyed promise reports a broken promise instead of
     // parking the waiters forever.
     ReadSingleFlight<std::string, ColdReadOutcome> inflight_cold_reads_;
+    // Test-only. When set, the leader of a cold read waits until `need`
+    // callers have entered Acquire, so overlapping readers share one staging
+    // buffer instead of racing a fast local load.
+    struct ColdReadOverlapGate {
+        std::atomic<int> entered{0};
+        int need = 0;
+    };
+    ColdReadOverlapGate* cold_read_overlap_gate_ = nullptr;
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;

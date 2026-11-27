@@ -509,8 +509,8 @@ inline tl::expected<void, ErrorCode> gather_maybe_device_to_host(
 // replica_selection.h (included above) so they can be unit-tested directly.
 using mooncake::SelectBestReplica;
 
-// Preserve the selected medium and lease. Affinity-enabled memory reads retain
-// their candidates until the actual destination of each read is known.
+// Preserve the selected medium and lease. Complete MEMORY siblings stay in the
+// query so Client::Get can fall back after a peer TRANSFER_FAIL (Type-1).
 inline QueryResult FilterQueryResult(const QueryResult &qr,
                                      const Replica::Descriptor &replica,
                                      bool include_object_checksum = true) {
