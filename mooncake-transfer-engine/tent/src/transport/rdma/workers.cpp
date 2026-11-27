@@ -366,31 +366,87 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
             }
         }
     }
+    if (slice_list.num_slices == 0) return Status::OK();
     auto& worker = worker_context_[worker_id];
+    const int priority = slice_list.first && slice_list.first->task
+                             ? slice_list.first->priority
+                             : PRIO_HIGH;
+    auto& queue = worker.queues[priority];
+    BoundedSliceQueue::Reservation reservation;
+    if (!queue.try_reserve(reservation)) {
+        return Status::TooManyRequests(
+            "Worker submit queue unavailable" LOC_MARK);
+    }
+    const bool wake = accountSubmission(worker, slice_list, worker_id);
+    queue.commit(reservation, slice_list);
+    if (wake) wakeSubmitConsumer(worker);
+    return Status::OK();
+}
 
-    // This lane's set and counter now account for the slices, wherever they
-    // are later swept from. First entry only: a slice arriving here has
-    // never been counted, so there is nothing to move.
-    auto* owned = slice_list.first;
-    for (int i = 0; i < slice_list.num_slices && owned; ++i) {
+bool Workers::accountSubmission(WorkerContext& worker,
+                                const RdmaSliceList& list, int worker_id) {
+    auto* owned = list.first;
+    for (int i = 0; i < list.num_slices && owned; ++i) {
         owned->owner_worker.store(worker_id, std::memory_order_relaxed);
         owned->counted_lane.store(worker_id, std::memory_order_relaxed);
         owned = owned->next;
     }
+    // A worker may resolve a slice as soon as its list is published.
+    return worker.inflight_slices.fetch_add(list.num_slices) == 0;
+}
 
-    // Get priority from first slice (all slices in list have same priority)
-    int priority = PRIO_HIGH;
-    if (slice_list.first && slice_list.first->task) {
-        priority = slice_list.first->priority;
+void Workers::wakeSubmitConsumer(WorkerContext& worker) {
+    std::lock_guard<std::mutex> lock(worker.mutex);
+    if (worker.in_suspend) worker.cv.notify_all();
+}
+
+Status Workers::admitBatch(std::vector<RdmaSliceList>& slice_lists) {
+    if (!accepting_submits_.load(std::memory_order_acquire)) {
+        return Status::InternalError("RDMA transport is quiescing" LOC_MARK);
+    }
+    if (!running_.load(std::memory_order_acquire) || !worker_context_ ||
+        num_workers_ == 0) {
+        return Status::InternalError("RDMA workers are not running" LOC_MARK);
+    }
+    if (slice_lists.size() > num_workers_) {
+        return Status::InvalidArgument("Too many worker slice lists" LOC_MARK);
     }
 
-    // A worker may finish immediately after queue publication.
-    const auto previous =
-        worker.inflight_slices.fetch_add(slice_list.num_slices);
-    worker.queues[priority].push(slice_list);
-    if (!previous) {
-        std::lock_guard<std::mutex> lock(worker.mutex);
-        if (worker.in_suspend) worker.cv.notify_all();
+    struct Admission {
+        size_t lane;
+        BoundedSliceQueue* queue;
+        BoundedSliceQueue::Reservation reservation;
+        bool wake = false;
+    };
+    std::vector<Admission> pending;
+    pending.reserve(slice_lists.size());
+    for (size_t lane = 0; lane < slice_lists.size(); ++lane) {
+        const auto& list = slice_lists[lane];
+        if (list.num_slices == 0) continue;
+        const int priority =
+            list.first && list.first->task ? list.first->priority : PRIO_HIGH;
+        auto& queue = worker_context_[lane].queues[priority];
+        BoundedSliceQueue::Reservation reservation;
+        if (!queue.try_reserve(reservation)) {
+            for (auto& item : pending) {
+                item.queue->cancel_reservation(item.reservation);
+                wakeSubmitConsumer(worker_context_[item.lane]);
+            }
+            return Status::TooManyRequests(
+                "Worker submit queue unavailable; flush not "
+                "published" LOC_MARK);
+        }
+        pending.push_back({lane, &queue, reservation});
+    }
+
+    // Account all lists before any worker can post a slice from this flush.
+    for (auto& item : pending) {
+        item.wake = accountSubmission(worker_context_[item.lane],
+                                      slice_lists[item.lane], item.lane);
+    }
+    for (auto& item : pending) {
+        item.queue->commit(item.reservation, slice_lists[item.lane]);
+        if (item.wake) wakeSubmitConsumer(worker_context_[item.lane]);
     }
     return Status::OK();
 }
@@ -721,6 +777,9 @@ void Workers::asyncPostSend() {
     auto shared_quota =
         device_selector_ ? device_selector_->getSharedSlotManager() : nullptr;
 
+    // Cancellations have no inflight count and must drain even if the
+    // selected priority cannot send or a different priority has work.
+    for (auto& queue : worker.queues) queue.discard_empty_entries();
     // Promote timed-out low priority requests
     promoteTimedOutRequests(worker);
 
@@ -748,8 +807,8 @@ void Workers::asyncPostSend() {
             // Prepare one QP window, then post and return to CQ polling. Do
             // not wait for a full window when the producer has less ready.
             while (new_slices < slice_budget) {
-                auto list = worker.queues[prio].pop();
-                if (!list.num_slices) break;
+                RdmaSliceList list;
+                if (!worker.queues[prio].try_pop(list)) break;
                 new_slices += list.num_slices;
                 result.push_back(list);
             }
@@ -1366,11 +1425,17 @@ void Workers::workerThread(int thread_id) {
 
     uint64_t grace_ts = 0;
     uint64_t last_perf_logging_ts = 0;
+    const auto has_ready_submission = [&worker] {
+        for (const auto& queue : worker.queues) {
+            if (queue.has_ready()) return true;
+        }
+        return false;
+    };
     while (running_) {
         auto current_ts = getCurrentTimeInNano();
         auto inflight_slices =
             worker.inflight_slices.load(std::memory_order_relaxed);
-        if (inflight_slices ||
+        if (inflight_slices || has_ready_submission() ||
             current_ts - grace_ts <
                 transport_->params_->workers.grace_period_ns) {
             asyncPostSend();
@@ -1386,8 +1451,10 @@ void Workers::workerThread(int thread_id) {
             std::unique_lock<std::mutex> lock(worker.mutex);
             worker.in_suspend = true;
             worker.cv.wait(lock, [&]() -> bool {
-                return !running_ || worker.inflight_slices.load(
-                                        std::memory_order_acquire) > 0;
+                return !running_ ||
+                       worker.inflight_slices.load(std::memory_order_acquire) >
+                           0 ||
+                       has_ready_submission();
             });
             worker.in_suspend = false;
         }

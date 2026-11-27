@@ -110,6 +110,54 @@ TEST(BoundedMPSCQueueTest, PushStillAcceptsAndEmptyPushIsANoop) {
     EXPECT_EQ(queue.pop().num_slices, 0);
 }
 
+TEST(BoundedMPSCQueueTest, RejectingSecondQueueLeavesOnlyCanceledSlots) {
+    Queue first;
+    Queue full;
+    auto item = entry(1);
+    for (int i = 0; i < 8; ++i) ASSERT_TRUE(full.try_push(item));
+    for (int i = 0; i < 24; ++i) {
+        Queue::Reservation admitted, rejected;
+        ASSERT_TRUE(first.try_reserve(admitted));
+        EXPECT_FALSE(first.has_ready());
+        ASSERT_FALSE(full.try_reserve(rejected));
+        first.cancel_reservation(admitted);
+        EXPECT_TRUE(first.has_ready());
+        first.discard_empty_entries();
+        EXPECT_FALSE(first.has_ready());
+    }
+
+    Queue::Reservation reserved;
+    ASSERT_TRUE(first.try_reserve(reserved));
+    first.commit(reserved, item);
+    first.discard_empty_entries();
+    ASSERT_EQ(first.pop().num_slices, 1);
+}
+
+TEST(BoundedMPSCQueueTest, TryPopSkipsCanceledReservationsBeforeReadyEntry) {
+    Queue queue;
+    Queue::Reservation first_reserved;
+    Queue::Reservation second_reserved;
+    ASSERT_TRUE(queue.try_reserve(first_reserved));
+    ASSERT_TRUE(queue.try_reserve(second_reserved));
+    auto item = entry(4);
+    ASSERT_TRUE(queue.try_push(item));
+
+    SliceList out;
+    // An unpublished reservation at head blocks dequeuing later entries.
+    EXPECT_FALSE(queue.try_pop(out));
+
+    queue.cancel_reservation(first_reserved);
+    queue.cancel_reservation(second_reserved);
+    ASSERT_TRUE(queue.try_pop(out));
+    EXPECT_EQ(out.num_slices, 4);
+
+    // Trailing canceled reservations alone still report empty.
+    Queue::Reservation trailing_reserved;
+    ASSERT_TRUE(queue.try_reserve(trailing_reserved));
+    queue.cancel_reservation(trailing_reserved);
+    EXPECT_FALSE(queue.try_pop(out));
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake
