@@ -71,6 +71,12 @@ In the default route mode, the client chooses route authorities with embedded we
 
 This keeps object route lookups on the authority mesh and off the metadata hot path in normal `EmbeddedWrh` deployments.
 
+Batch route reads group keys by authority and issue remote groups concurrently,
+with at most eight requests in flight per batch. Local groups are read directly,
+and replies are merged in authority order. Ranking rounds, version validation,
+readable-replica filtering, and unary fallback retain their existing semantics.
+Single-authority reads use the direct request path.
+
 `mooncake-store-route` owns the route-control request semantics. It defines the
 route control request/response envelope, dispatches inbound route-authority
 requests to the local authority service, and turns outbound transport replies
