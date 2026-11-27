@@ -30,11 +30,27 @@
 
 #include "tent/runtime/transport.h"
 #include "tent/runtime/slab.h"
+#include "mooncake_te_build_config.h"
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#include "adaptive_congestion_control.h"
+#endif
 
 namespace mooncake {
 namespace tent {
 struct RdmaSlice;
 class RailMonitor;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+struct TentRdmaCongestionControlRoute
+    : std::enable_shared_from_this<TentRdmaCongestionControlRoute> {
+    explicit TentRdmaCongestionControlRoute(
+        const adaptive_congestion_control::Config& config)
+        : domain(config, 1) {}
+
+    adaptive_congestion_control::DomainState domain;
+    std::shared_ptr<adaptive_congestion_control::DomainState> device_owner;
+    std::atomic<uint32_t> endpoint_generation{0};
+};
+#endif
 
 struct RdmaSliceList {
     RdmaSlice* first = nullptr;
@@ -209,6 +225,14 @@ struct RdmaSlice {
     // string-keyed map lookup on the RDMA hot path. Shared ownership keeps it
     // alive through endpoint teardown and stable across map rehashes.
     std::shared_ptr<RailMonitor> rail_monitor;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    TentRdmaCongestionControlRoute* congestion_control_route = nullptr;
+    // Posted slices can outlive Workers while endpoint teardown drains CQEs.
+    std::shared_ptr<TentRdmaCongestionControlRoute>
+        congestion_control_route_owner;
+    adaptive_congestion_control::Permit congestion_control_permit;
+    uint32_t congestion_control_endpoint_generation = 0;
+#endif
     // Nonzero only when this slice owns an admitted probe/trial on
     // rail_monitor. A stale completion/flush must not cancel another slice's
     // in-flight probe on the same per-worker RailMonitor.

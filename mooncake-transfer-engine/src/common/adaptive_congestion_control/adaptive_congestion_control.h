@@ -16,6 +16,7 @@
 #define MOONCAKE_ADAPTIVE_CONGESTION_CONTROL_H
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 #include "task_congestion_status_c.h"
@@ -24,6 +25,7 @@ namespace mooncake::adaptive_congestion_control {
 
 struct CoreAccess;
 struct PathHandle;
+struct BatchItem;
 class Permit;
 
 enum class Mode : uint8_t { kOff, kObserve, kEnforce };
@@ -110,7 +112,10 @@ class DomainState {
     friend class Permit;
     friend Decision tryAcquire(const PathHandle&, uint64_t, Permit&,
                                AdmissionEvidence*);
+    friend bool tryAcquireBatch(const PathHandle&, const BatchItem*, size_t);
     friend bool complete(Permit&, OutcomeClass, FailureScope);
+    friend bool completeSuccessBatch(Permit* const*, size_t, uint64_t&,
+                                     const std::atomic<uint32_t>&, uint32_t);
     friend void recordSignals(DomainState&, uint32_t, const Signals&);
     friend void controlTick(DomainState&, uint64_t);
     friend void resetGeneration(DomainState&, uint32_t);
@@ -120,12 +125,13 @@ class DomainState {
     Config config_;
     std::atomic<PathState> state_{PathState::kHealthy};
     std::atomic<uint64_t> window_bytes_{0};
-    std::atomic<uint64_t> inflight_bytes_{0};
-    std::atomic<uint64_t> deferred_bytes_{0};
     std::atomic<uint32_t> generation_{1};
+    alignas(64) std::atomic<uint64_t> inflight_bytes_{0};
+    std::atomic<uint64_t> deferred_bytes_{0};
 
     std::atomic<uint32_t> feedback_generation_{1};
     std::atomic<uint32_t> feedback_writers_{0};
+    alignas(64) std::atomic<uint64_t> success_feedback_{uint64_t{1} << 32};
     std::atomic<uint64_t> successful_completions_{0};
     std::atomic<uint64_t> receiver_pressure_{0};
     std::atomic<bool> epoch_error_{false};
@@ -141,6 +147,9 @@ struct PathHandle {
     uint32_t route_generation = 0;
 };
 
+// Admission may overlap completion: only a fully published reservation can be
+// completed. Moving or reusing a permit requires external lifecycle sequencing;
+// an old completion must not overlap admission for a later attempt.
 class Permit {
    public:
     Permit() = default;
@@ -150,15 +159,22 @@ class Permit {
     Permit(Permit&& other) noexcept;
     Permit& operator=(Permit&& other) noexcept;
 
-    bool active() const { return active_.load(std::memory_order_acquire); }
+    bool active() const {
+        return state_.load(std::memory_order_acquire) == State::kReserved;
+    }
 
    private:
     friend Decision tryAcquire(const PathHandle&, uint64_t, Permit&,
                                AdmissionEvidence*);
+    friend bool tryAcquireBatch(const PathHandle&, const BatchItem*, size_t);
     friend bool complete(Permit&, OutcomeClass, FailureScope);
+    friend bool completeSuccessBatch(Permit* const*, size_t, uint64_t&,
+                                     const std::atomic<uint32_t>&, uint32_t);
     friend bool isCurrentGeneration(const Permit&);
 
-    std::atomic<bool> active_{false};
+    // Claiming excludes both admission initialization and completion refunds.
+    enum class State : uint8_t { kFree, kClaiming, kReserved };
+    std::atomic<State> state_{State::kFree};
     DomainState* device_ = nullptr;
     DomainState* route_ = nullptr;
     uint64_t bytes_ = 0;
@@ -170,6 +186,17 @@ class Permit {
     void moveFrom(Permit& other) noexcept;
 };
 
+// Temporary input for one full-fit admission attempt. No pointers are retained.
+struct BatchItem {
+    Permit* permit;
+    uint64_t bytes;
+};
+
+// Speculatively reserve the entire group, or leave no claims/reservations.
+// False is silent: the caller retains the scalar admission/evidence path.
+bool tryAcquireBatch(const PathHandle& path, const BatchItem* items,
+                     size_t count);
+
 // A domain with no inflight bytes admits one indivisible slice even when it
 // exceeds the window. The full byte count is reserved;
 // transport-level static limits must still be enforced by the caller.
@@ -179,6 +206,12 @@ Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
                     AdmissionEvidence* evidence = nullptr);
 bool isCurrentGeneration(const Permit& permit);
 bool complete(Permit& permit, OutcomeClass outcome, FailureScope scope);
+// False leaves every permit untouched. True refunds all winners before return.
+// Adapter changes suppress feedback per winner; the guard is not retained.
+bool completeSuccessBatch(Permit* const* permits, size_t count,
+                          uint64_t& completed_mask,
+                          const std::atomic<uint32_t>& adapter_generation,
+                          uint32_t expected_adapter_generation);
 void recordSignals(DomainState& state, uint32_t generation,
                    const Signals& signals);
 void controlTick(DomainState& state, uint64_t now_ns);

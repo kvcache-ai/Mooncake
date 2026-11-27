@@ -30,6 +30,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -146,6 +147,86 @@ class RdmaTransportTestPeer {
     static std::unique_ptr<Workers> makeWorkers(RdmaTransport& transport) {
         return std::make_unique<Workers>(&transport);
     }
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    // Keep the public submit path, but let the test advance one worker tick
+    // at a time without starting a monitor or polling fake completion queues.
+    static void attachManualWorkers(RdmaTransport& transport,
+                                    std::unique_ptr<Workers>& workers,
+                                    uint64_t block_size) {
+        transport.params_->workers.num_workers = 1;
+        transport.params_->workers.block_size = block_size;
+        transport.params_->workers.max_retry_count = 8;
+        transport.conf_->set(RailMonitor::kCfgErrorThreshold, 3);
+        transport.conf_->set(RailMonitor::kCfgCooldownSecs, 30);
+        workers->running_.store(true);
+        transport.workers_ = std::move(workers);
+    }
+
+    static std::unique_ptr<Workers> detachManualWorkers(
+        RdmaTransport& transport) {
+        transport.workers_->running_.store(false);
+        return std::move(transport.workers_);
+    }
+
+    static void postTick(Workers& workers) {
+        const int previous = tl_wid;
+        tl_wid = 0;
+        workers.asyncPostSend();
+        tl_wid = previous;
+    }
+
+    static TentRdmaCongestionControlRoute* prepareCongestionRoute(
+        Workers& workers, int dev, SegmentID target) {
+        workers.congestion_control_config_ =
+            adaptive_congestion_control::Config{};
+        enableCongestionControl(workers, dev);
+        const int previous = tl_wid;
+        tl_wid = 0;
+        auto* route = workers.getCongestionRoute({dev, target, dev});
+        tl_wid = previous;
+        return route;
+    }
+
+    static adaptive_congestion_control::Decision acquireCongestionPermit(
+        Workers& workers, RdmaSlice& slice, const Workers::PostPath& path,
+        const std::shared_ptr<RdmaEndPoint>& endpoint, int lane = 0) {
+        const int previous = tl_wid;
+        tl_wid = lane;
+        auto decision = workers.acquireCongestionPermit(&slice, path, endpoint);
+        tl_wid = previous;
+        return decision;
+    }
+
+    static const Topology& topology(const RdmaTransport& transport) {
+        return *transport.local_topology_;
+    }
+
+    static adaptive_congestion_control::DomainState& enableCongestionControl(
+        Workers& workers, int dev) {
+        workers.congestion_control_config_.mode =
+            adaptive_congestion_control::Mode::kEnforce;
+        workers.congestion_control_devices_.resize(dev + 1);
+        workers.congestion_control_devices_[dev] =
+            std::make_shared<adaptive_congestion_control::DomainState>(
+                workers.congestion_control_config_);
+        return *workers.congestion_control_devices_[dev];
+    }
+    static void acquireCongestionPermit(
+        Workers& workers, RdmaSlice* slice,
+        const std::shared_ptr<RdmaEndPoint>& endpoint, int dev) {
+        const int previous = tl_wid;
+        tl_wid = 0;
+        EXPECT_EQ(
+            workers.acquireCongestionPermit(slice, {dev, 0, dev}, endpoint),
+            adaptive_congestion_control::Decision::kAllow);
+        tl_wid = previous;
+    }
+    static void setBlockSize(RdmaTransport& transport, uint64_t bytes) {
+        transport.params_->workers.block_size = bytes;
+    }
+
+#endif
 
     // Drives the decision half of handleContextEvents with a synthesized
     // event, bypassing ibv_get_async_event/ibv_ack_async_event.
@@ -4350,6 +4431,584 @@ std::vector<RdmaSlice*> RdmaWorkersSharedQpTest::post_order;
 std::vector<int> RdmaWorkersSharedQpTest::post_flags;
 std::vector<ibv_wc> RdmaWorkersSharedQpTest::cq_completions;
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+TEST_F(RdmaWorkersSharedQpTest, CongestionAcquireUsesBoundRouteWithEmptySlice) {
+    using namespace adaptive_congestion_control;
+    auto* bound =
+        RdmaTransportTestPeer::prepareCongestionRoute(*workers_, kDev, 11);
+    ASSERT_EQ(endpoint_->bindCongestionRoute(bound), bound);
+    RdmaSlice slice{};
+    slice.source_dev_id = kDev;
+    slice.length = 32;
+    EXPECT_EQ(RdmaTransportTestPeer::acquireCongestionPermit(
+                  *workers_, slice, {kDev, 22, kDev}, endpoint_),
+              Decision::kAllow);
+    EXPECT_EQ(slice.congestion_control_route, bound);
+    EXPECT_EQ(slice.congestion_control_route_owner.get(), bound);
+    EXPECT_EQ(slice.congestion_control_endpoint_generation,
+              endpoint_->generation());
+    EXPECT_EQ(bound->endpoint_generation.load(), endpoint_->generation());
+    EXPECT_EQ(snapshot(bound->domain).inflight_bytes, 32u);
+    ASSERT_NE(bound->device_owner, nullptr);
+    EXPECT_EQ(snapshot(*bound->device_owner).inflight_bytes, 32u);
+    EXPECT_TRUE(completeTentCongestionControlAttempt(
+        slice, OutcomeClass::kSuccess, FailureScope::kOperation));
+    EXPECT_FALSE(completeTentCongestionControlAttempt(
+        slice, OutcomeClass::kSuccess, FailureScope::kOperation));
+    EXPECT_EQ(snapshot(bound->domain).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(*bound->device_owner).inflight_bytes, 0u);
+    ASSERT_EQ(slice.congestion_control_route, nullptr);
+    EXPECT_EQ(RdmaTransportTestPeer::acquireCongestionPermit(
+                  *workers_, slice, {kDev, 33, kDev}, endpoint_),
+              Decision::kAllow);
+    EXPECT_EQ(slice.congestion_control_route_owner.get(), bound);
+    EXPECT_TRUE(completeTentCongestionControlAttempt(
+        slice, OutcomeClass::kSuccess, FailureScope::kOperation));
+    EXPECT_EQ(snapshot(bound->domain).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(*bound->device_owner).inflight_bytes, 0u);
+}
+
+TEST_F(RdmaWorkersSharedQpTest, CongestionAcquireUsesPostingPathDevice) {
+    using namespace adaptive_congestion_control;
+    auto* route =
+        RdmaTransportTestPeer::prepareCongestionRoute(*workers_, kDev, 11);
+    RdmaSlice slice;
+    slice.source_dev_id = -1;
+    slice.length = kLen;
+    ASSERT_EQ(RdmaTransportTestPeer::acquireCongestionPermit(
+                  *workers_, slice, {kDev, 11, kDev}, endpoint_),
+              Decision::kAllow);
+    EXPECT_TRUE(slice.congestion_control_permit.active());
+    EXPECT_EQ(snapshot(*route->device_owner).inflight_bytes, kLen);
+    EXPECT_TRUE(completeTentCongestionControlAttempt(
+        slice, OutcomeClass::kSuccess, FailureScope::kOperation));
+    EXPECT_EQ(snapshot(*route->device_owner).inflight_bytes, 0u);
+}
+
+TEST_F(RdmaWorkersSharedQpTest, CongestionAcquireBoundRouteOverridesConflict) {
+    using namespace adaptive_congestion_control;
+    auto* bound =
+        RdmaTransportTestPeer::prepareCongestionRoute(*workers_, kDev, 11);
+    ASSERT_EQ(endpoint_->bindCongestionRoute(bound), bound);
+    auto conflict = std::make_shared<TentRdmaCongestionControlRoute>(
+        adaptive_congestion_control::Config{});
+    RdmaSlice slice{};
+    slice.source_dev_id = kDev;
+    slice.length = 32;
+    slice.congestion_control_route = conflict.get();
+    slice.congestion_control_route_owner = conflict;
+    resetGeneration(bound->domain, 0x80000001u);
+    EXPECT_EQ(RdmaTransportTestPeer::acquireCongestionPermit(
+                  *workers_, slice, {kDev, 99, kDev}, endpoint_),
+              Decision::kAllow);
+    EXPECT_EQ(slice.congestion_control_route_owner.get(), bound);
+    EXPECT_TRUE(isCurrentGeneration(slice.congestion_control_permit));
+    EXPECT_EQ(snapshot(conflict->domain).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(bound->domain).inflight_bytes, 32u);
+    EXPECT_TRUE(completeTentCongestionControlAttempt(
+        slice, OutcomeClass::kDerivedFlush, FailureScope::kOperation));
+    EXPECT_EQ(snapshot(bound->domain).inflight_bytes, 0u);
+    auto replacement = std::make_shared<RdmaEndPoint>();
+    slice.congestion_control_route = bound;
+    EXPECT_EQ(RdmaTransportTestPeer::acquireCongestionPermit(
+                  *workers_, slice, {kDev, 101, kDev}, replacement),
+              Decision::kAllow);
+    EXPECT_EQ(replacement->congestionRoute(), bound);
+    EXPECT_EQ(slice.congestion_control_route_owner.get(), bound);
+    EXPECT_EQ(slice.congestion_control_endpoint_generation,
+              replacement->generation());
+    EXPECT_NE(replacement->generation(), endpoint_->generation());
+    EXPECT_TRUE(completeTentCongestionControlAttempt(
+        slice, OutcomeClass::kSuccess, FailureScope::kOperation));
+    EXPECT_EQ(snapshot(bound->domain).inflight_bytes, 0u);
+}
+
+TEST_F(RdmaWorkersSharedQpTest, CongestionAcquireFirstBindPinsRouteOwnership) {
+    using namespace adaptive_congestion_control;
+    RdmaTransportTestPeer::enableCongestionControl(*workers_, kDev);
+    ASSERT_EQ(endpoint_->congestionRoute(), nullptr);
+    RdmaSlice slice{};
+    slice.source_dev_id = kDev;
+    slice.length = 32;
+    ASSERT_EQ(RdmaTransportTestPeer::acquireCongestionPermit(
+                  *workers_, slice, {kDev, 11, kDev}, endpoint_),
+              Decision::kAllow);
+    auto* bound = endpoint_->congestionRoute();
+    ASSERT_NE(bound, nullptr);
+    EXPECT_EQ(slice.congestion_control_route, bound);
+    std::weak_ptr<TentRdmaCongestionControlRoute> retained =
+        slice.congestion_control_route_owner;
+    auto device = bound->device_owner;
+    ASSERT_NE(device, nullptr);
+    RdmaTransportTestPeer::destroyWorkerContexts(*workers_);
+    workers_.reset();
+    endpoint_.reset();
+    EXPECT_FALSE(retained.expired());
+    EXPECT_TRUE(completeTentCongestionControlAttempt(
+        slice, OutcomeClass::kSuccess, FailureScope::kOperation));
+    EXPECT_EQ(snapshot(bound->domain).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(*device).inflight_bytes, 0u);
+    slice.congestion_control_route_owner.reset();
+    EXPECT_TRUE(retained.expired());
+}
+
+TEST_F(RdmaWorkersSharedQpTest, CongestionAcquireConcurrentFirstBindAgrees) {
+    using namespace adaptive_congestion_control;
+    auto& device =
+        RdmaTransportTestPeer::enableCongestionControl(*workers_, kDev);
+    adaptive_congestion_control::Config config;
+    config.mode = Mode::kEnforce;
+    auto first = std::make_shared<TentRdmaCongestionControlRoute>(config);
+    auto second = std::make_shared<TentRdmaCongestionControlRoute>(config);
+    RdmaSlice slices[2]{};
+    slices[0].congestion_control_route = first.get();
+    slices[1].congestion_control_route = second.get();
+    std::atomic<bool> start{false};
+    Decision decisions[2]{};
+    std::thread threads[2];
+    for (int i = 0; i < 2; ++i) {
+        slices[i].source_dev_id = kDev;
+        slices[i].length = 32;
+        threads[i] = std::thread([&, i] {
+            while (!start.load(std::memory_order_acquire)) {
+            }
+            decisions[i] = RdmaTransportTestPeer::acquireCongestionPermit(
+                *workers_, slices[i],
+                {kDev, static_cast<SegmentID>(11 + i), kDev}, endpoint_, i);
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) thread.join();
+    auto* bound = endpoint_->congestionRoute();
+    ASSERT_NE(bound, nullptr);
+    EXPECT_EQ(snapshot(bound->domain).inflight_bytes, 64u);
+    EXPECT_EQ(snapshot(device).inflight_bytes, 64u);
+    for (int i = 0; i < 2; ++i) {
+        EXPECT_EQ(decisions[i], Decision::kAllow);
+        EXPECT_EQ(slices[i].congestion_control_route_owner.get(), bound);
+        EXPECT_EQ(slices[i].congestion_control_endpoint_generation,
+                  endpoint_->generation());
+        EXPECT_TRUE(completeTentCongestionControlAttempt(
+            slices[i], OutcomeClass::kSuccess, FailureScope::kOperation));
+    }
+    EXPECT_EQ(snapshot(bound->domain).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+}
+
+class RdmaWorkersAvoidTest : public RdmaWorkersSharedQpTest {
+   protected:
+    void SetUp() override {
+        ASSERT_NO_FATAL_FAILURE(RdmaWorkersSharedQpTest::SetUp());
+        RdmaTransportTestPeer::destroyWorkerContexts(*workers_);
+        RdmaTransportTestPeer::makeWorkerContexts(*workers_, 1);
+        source_.resize(3 * kLen);
+        metadata_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        RdmaTransportTestPeer::bindMetadata(transport_, metadata_);
+        ASSERT_TRUE(metadata_->segmentManager()
+                        .updateLocal([&](SegmentDesc& local) {
+                            local.name = "avoid-local";
+                            local.machine_id = "avoid-local-machine";
+                            local.type = SegmentType::Memory;
+                            auto& memory =
+                                std::get<MemorySegmentDesc>(local.detail);
+                            memory.topology =
+                                RdmaTransportTestPeer::topology(transport_);
+                            BufferDesc buffer{};
+                            buffer.addr =
+                                reinterpret_cast<uint64_t>(source_.data());
+                            buffer.length = source_.size();
+                            buffer.location = "cpu:0";
+                            buffer.lkey = {0, 1};
+                            buffer.rkey = {0, 2};
+                            memory.buffers = {buffer};
+                            return Status::OK();
+                        })
+                        .ok());
+
+        // Metadata uses a real RPC round trip; only verbs are stand-ins.
+        remote_ = *metadata_->segmentManager().getLocal();
+        remote_.machine_id = "avoid-remote-machine";
+        std::get<MemorySegmentDesc>(remote_.detail).buffers[0].addr = kTarget;
+        ASSERT_TRUE(server_
+                        .registerFunction(
+                            GetSegmentDesc,
+                            [this](const std::string_view&, std::string& r) {
+                                r = json(remote_).dump();
+                            })
+                        .ok());
+        uint16_t port = 0;
+        ASSERT_TRUE(server_.start(port).ok());
+        remote_.name = "127.0.0.1:" + std::to_string(port);
+        remote_.rpc_server_addr = remote_.name;
+        ASSERT_TRUE(
+            metadata_->segmentManager().openRemote(target_, remote_.name).ok());
+        endpoint_ = context_->endpointStore()->getOrInsert(
+            MakeNicPath(remote_.name, context_->name()));
+        ASSERT_NE(endpoint_, nullptr);
+        RdmaEndPointTestPeer::markReady(endpoint_);
+
+        route_ = RdmaTransportTestPeer::prepareCongestionRoute(*workers_, kDev,
+                                                               target_);
+        active_ = workers_.get();
+        RdmaTransportTestPeer::attachManualWorkers(transport_, workers_, kLen);
+        ASSERT_TRUE(transport_.allocateSubBatch(batch_, 1).ok());
+    }
+
+    void drainCompletions() {
+        // Exercise completion accounting, not real DMA or a hardware CQ.
+        while (completed_ < post_order.size()) {
+            auto* slice = post_order[completed_++];
+            ibv_wc wc{};
+            wc.wr_id = reinterpret_cast<uint64_t>(slice);
+            wc.status = IBV_WC_SUCCESS;
+            RdmaTransportTestPeer::handleCompletion(
+                *active_, RdmaTransportTestPeer::workerContext(*active_, 0),
+                *context_, wc, getCurrentTimeInNano());
+        }
+    }
+
+    void TearDown() override {
+        if (active_) {
+            if (batch_ && batch_->size() != 0) {
+                (void)transport_.cancelTransferTask(batch_, 0);
+                drainCompletions();
+                RdmaTransportTestPeer::postTick(*active_);
+            }
+        }
+        if (context_ && context_->endpointStore()) {
+            (void)context_->endpointStore()->clear();
+        }
+        if (active_) {
+            if (batch_) (void)transport_.freeSubBatch(batch_);
+            workers_ = RdmaTransportTestPeer::detachManualWorkers(transport_);
+        }
+        RdmaWorkersSharedQpTest::TearDown();
+    }
+
+    static constexpr uint64_t kTarget = 0x10000000;
+    std::vector<char> source_;
+    std::shared_ptr<ControlService> metadata_;
+    CoroRpcAgent server_;
+    SegmentDesc remote_;
+    SegmentID target_ = 0;
+    Transport::SubBatchRef batch_ = nullptr;
+    Workers* active_ = nullptr;
+    TentRdmaCongestionControlRoute* route_ = nullptr;
+    size_t completed_ = 0;
+};
+
+TEST_F(RdmaWorkersAvoidTest, FreshRoutesReachBatchAdmission) {
+    using namespace adaptive_congestion_control;
+    ASSERT_EQ(endpoint_->congestionRoute(), nullptr);
+    for (size_t i = 0; i < 3; ++i) {
+        auto* slice = makeSlice();
+        slice->source_addr = source_.data() + i * kLen;
+        slice->target_addr = kTarget + i * kLen;
+        slice->task->request.target_id = target_;
+        ASSERT_TRUE(
+            RdmaTransportTestPeer::generatePostPath(*active_, slice).ok());
+        ASSERT_EQ(slice->congestion_control_route, route_);
+        RdmaTransportTestPeer::queuePostPath(*active_, 0, kDev, target_, kDev,
+                                             slice);
+    }
+    RdmaTransportTestPeer::postSend(*active_, 0);
+    ASSERT_EQ(post_order.size(), 3u);
+    EXPECT_EQ(endpoint_->congestionRoute(), route_);
+    EXPECT_EQ(snapshot(route_->domain).inflight_bytes, 3 * kLen);
+    drainCompletions();
+    EXPECT_EQ(snapshot(route_->domain).inflight_bytes, 0u);
+}
+
+TEST_F(RdmaWorkersAvoidTest, DefaultSignalOnePollRefundsRealPostedBatch) {
+    using namespace adaptive_congestion_control;
+    ASSERT_EQ(params_->endpoint.signal_interval, 1);
+    ASSERT_EQ(
+        RdmaTransportTestPeer::params(transport_)->endpoint.signal_interval, 1);
+    endpoint_->bindCongestionRoute(route_);
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    ASSERT_TRUE(transport_.allocateSubBatch(batch_, 3).ok());
+    std::vector<Request> requests(3);
+    for (size_t i = 0; i < requests.size(); ++i) {
+        requests[i].opcode = Request::WRITE;
+        requests[i].source = source_.data() + i * kLen;
+        requests[i].target_id = target_;
+        requests[i].target_offset = kTarget + i * kLen;
+        requests[i].length = kLen;
+    }
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, requests).ok());
+    RdmaTransportTestPeer::postTick(*active_);
+    ASSERT_EQ(post_order.size(), 3u);
+    ASSERT_NE(route_->device_owner, nullptr);
+    ASSERT_EQ(snapshot(route_->domain).inflight_bytes, source_.size());
+    ASSERT_EQ(snapshot(*route_->device_owner).inflight_bytes, source_.size());
+    ASSERT_NE(post_order[0]->task, post_order[1]->task);
+    ASSERT_NE(post_order[0]->task, post_order[2]->task);
+    ASSERT_NE(post_order[1]->task, post_order[2]->task);
+    const auto route_window = snapshot(route_->domain).window_bytes;
+    const auto device_window = snapshot(*route_->device_owner).window_bytes;
+    for (size_t i = 0; i < post_order.size(); ++i) {
+        auto* slice = post_order[i];
+        ASSERT_EQ(slice->task->num_slices, 1u);
+        ASSERT_TRUE(post_flags[i] & IBV_SEND_SIGNALED);
+        ASSERT_TRUE(slice->congestion_control_permit.active());
+        ASSERT_EQ(slice->congestion_control_route, route_);
+        ASSERT_EQ(slice->completions_owed.load(), 1);
+        ibv_wc wc{};
+        wc.wr_id = reinterpret_cast<uint64_t>(slice);
+        wc.status = IBV_WC_SUCCESS;
+        cq_completions.push_back(wc);
+    }
+    RdmaTransportTestPeer::setSliceTimeout(*active_, UINT64_MAX);
+    RdmaTransportTestPeer::pollCompletions(*active_, 0);
+    completed_ = post_order.size();
+    EXPECT_TRUE(cq_completions.empty());
+    EXPECT_EQ(snapshot(route_->domain).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(*route_->device_owner).inflight_bytes, 0u);
+    for (auto* slice : post_order) {
+        EXPECT_EQ(slice->word, COMPLETED);
+        EXPECT_EQ(slice->completions_owed.load(), 0);
+        EXPECT_FALSE(slice->congestion_control_permit.active());
+        EXPECT_EQ(slice->congestion_control_route, nullptr);
+        EXPECT_FALSE(completeTentCongestionControlAttempt(
+            *slice, OutcomeClass::kSuccess, FailureScope::kOperation));
+    }
+    EXPECT_TRUE(RdmaEndPointTestPeer::queueEmpty(endpoint_, 0));
+    EXPECT_EQ(cq_.getQuota(), 0);
+    EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+    EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
+    controlTick(route_->domain, getCurrentTimeInNano());
+    controlTick(*route_->device_owner, getCurrentTimeInNano());
+    EXPECT_GT(snapshot(route_->domain).window_bytes, route_window);
+    EXPECT_GT(snapshot(*route_->device_owner).window_bytes, device_window);
+    for (size_t i = 0; i < requests.size(); ++i) {
+        TransferStatus status;
+        ASSERT_TRUE(transport_.getTransferStatus(batch_, i, status).ok());
+        EXPECT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kLen);
+    }
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    batch_ = nullptr;
+    // No posted slice is dereferenced after the public batch free.
+    post_order.clear();
+}
+
+TEST_F(RdmaWorkersAvoidTest, DefaultSignalOneLatePollReapsFreedBatch) {
+    using namespace adaptive_congestion_control;
+    ASSERT_EQ(params_->endpoint.signal_interval, 1);
+    ASSERT_EQ(
+        RdmaTransportTestPeer::params(transport_)->endpoint.signal_interval, 1);
+    endpoint_->bindCongestionRoute(route_);
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source_.data();
+    request.target_id = target_;
+    request.target_offset = kTarget;
+    request.length = source_.size();
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request}).ok());
+    RdmaTransportTestPeer::postTick(*active_);
+    ASSERT_EQ(post_order.size(), 3u);
+    for (auto* slice : post_order) {
+        ASSERT_EQ(slice->completions_owed.load(), 1);
+        ibv_wc wc{};
+        wc.wr_id = reinterpret_cast<uint64_t>(slice);
+        wc.status = IBV_WC_SUCCESS;
+        cq_completions.push_back(wc);
+    }
+    ASSERT_TRUE(transport_.cancelTransferTask(batch_, 0).ok());
+    RdmaTransportTestPeer::setSliceTimeout(*active_, 1);
+    auto& lane = RdmaTransportTestPeer::workerContext(*active_, 0);
+    RdmaTransportTestPeer::expireTimedOutSlices(
+        *active_, lane, getCurrentTimeInNano() + 1'000'000);
+    for (auto* slice : post_order) {
+        ASSERT_NE(slice->word, PENDING);
+        ASSERT_EQ(slice->completions_owed.load(), 1);
+    }
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    batch_ = nullptr;
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 3u);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 3u);
+    RdmaTransportTestPeer::setSliceTimeout(*active_, UINT64_MAX);
+    RdmaTransportTestPeer::pollCompletions(*active_, 0);
+    completed_ = post_order.size();
+    EXPECT_TRUE(cq_completions.empty());
+    EXPECT_EQ(snapshot(route_->domain).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(*route_->device_owner).inflight_bytes, 0u);
+    EXPECT_EQ(cq_.getQuota(), 0);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+    post_order.clear();
+}
+
+TEST_F(RdmaWorkersAvoidTest, DefaultSignalOneSuccessRunBeforeError) {
+    using namespace adaptive_congestion_control;
+    ASSERT_EQ(params_->endpoint.signal_interval, 1);
+    ASSERT_EQ(
+        RdmaTransportTestPeer::params(transport_)->endpoint.signal_interval, 1);
+    RdmaTransportTestPeer::params(transport_)->workers.max_retry_count = 1;
+    endpoint_->bindCongestionRoute(route_);
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source_.data();
+    request.target_id = target_;
+    request.target_offset = kTarget;
+    request.length = source_.size();
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request}).ok());
+    RdmaTransportTestPeer::postTick(*active_);
+    ASSERT_EQ(post_order.size(), 3u);
+    for (size_t i = 0; i < post_order.size(); ++i) {
+        ASSERT_TRUE(post_order[i]->congestion_control_permit.active());
+        ibv_wc wc{};
+        wc.wr_id = reinterpret_cast<uint64_t>(post_order[i]);
+        wc.status = i == 2 ? IBV_WC_LOC_LEN_ERR : IBV_WC_SUCCESS;
+        cq_completions.push_back(wc);
+    }
+    RdmaTransportTestPeer::setSliceTimeout(*active_, UINT64_MAX);
+    RdmaTransportTestPeer::pollCompletions(*active_, 0);
+    completed_ = post_order.size();
+    EXPECT_TRUE(cq_completions.empty());
+    EXPECT_EQ(post_order[0]->word, COMPLETED);
+    EXPECT_EQ(post_order[1]->word, COMPLETED);
+    EXPECT_EQ(post_order[2]->word, FAILED);
+    for (auto* slice : post_order) {
+        EXPECT_EQ(slice->completions_owed.load(), 0);
+        EXPECT_FALSE(slice->congestion_control_permit.active());
+    }
+    EXPECT_EQ(snapshot(route_->domain).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(*route_->device_owner).inflight_bytes, 0u);
+    EXPECT_EQ(cq_.getQuota(), 0);
+    EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+    EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
+    TransferStatus status;
+    ASSERT_TRUE(transport_.getTransferStatus(batch_, 0, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    EXPECT_EQ(status.transferred_bytes, 2 * kLen);
+}
+
+TEST_F(RdmaWorkersAvoidTest, FullBatchKeepsUnpostedSuffixUnreserved) {
+    using namespace adaptive_congestion_control;
+    constexpr uint64_t block = 128u << 10;
+    RdmaTransportTestPeer::setBlockSize(transport_, block);
+    endpoint_->bindCongestionRoute(route_);
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source_.data();
+    request.target_id = target_;
+    request.target_offset = kTarget;
+    request.length = 6 * block;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request}).ok());
+    params_->endpoint.max_qp_wr = 2;
+    RdmaTransportTestPeer::postTick(*active_);
+    ASSERT_EQ(post_order.size(), 2u);
+    EXPECT_EQ(snapshot(route_->domain).inflight_bytes, 2 * block);
+    auto* batch = static_cast<RdmaSubBatch*>(batch_);
+    int index = 0;
+    for (auto* slice = batch->slice_chain[0]; slice; slice = slice->next)
+        EXPECT_EQ(slice->congestion_control_permit.active(), index++ < 2);
+    drainCompletions();
+    for (int tick = 0; tick < 2; ++tick) {
+        RdmaTransportTestPeer::postTick(*active_);
+        drainCompletions();
+    }
+    EXPECT_EQ(post_order.size(), 6u);
+    EXPECT_EQ(snapshot(route_->domain).inflight_bytes, 0u);
+    TransferStatus status;
+    ASSERT_TRUE(transport_.getTransferStatus(batch_, 0, status).ok());
+    EXPECT_EQ(status.s, COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, request.length);
+    EXPECT_FALSE(completeTentCongestionControlAttempt(
+        *batch->slice_chain[0], OutcomeClass::kSuccess,
+        FailureScope::kOperation));
+}
+
+#endif
+
+// This fixture only uses interfaces present before congestion admission, so
+// its enforce case can be overlaid onto the baseline as a behavioral RED.
+class RdmaWorkersCongestionPostingTest
+    : public RdmaWorkersSharedQpTest,
+      public ::testing::WithParamInterface<const char*> {
+   protected:
+    void SetUp() override {
+        const char* keys[] = {
+            "MC_ADAPTIVE_CONGESTION_CONTROL_MODE",
+            "MC_ADAPTIVE_CONGESTION_CONTROL_MIN_WINDOW_BYTES",
+            "MC_ADAPTIVE_CONGESTION_CONTROL_MAX_WINDOW_BYTES"};
+        const char* values[] = {GetParam(), "1048576", "1048576"};
+        for (int i = 0; i < 3; ++i) {
+            const auto* previous = std::getenv(keys[i]);
+            saved_.push_back(
+                {keys[i], previous ? previous : "", previous != nullptr});
+            setenv(keys[i], values[i], 1);
+        }
+        RdmaWorkersSharedQpTest::SetUp();
+    }
+    void TearDown() override {
+        RdmaWorkersSharedQpTest::TearDown();
+        for (const auto& saved : saved_) {
+            if (saved.present)
+                setenv(saved.key.c_str(), saved.value.c_str(), 1);
+            else
+                unsetenv(saved.key.c_str());
+        }
+    }
+    struct SavedEnvironment {
+        std::string key;
+        std::string value;
+        bool present;
+    };
+    std::vector<SavedEnvironment> saved_;
+};
+
+TEST_P(RdmaWorkersCongestionPostingTest, WindowControlsActualWorkerPosts) {
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    RdmaTransportTestPeer::bindMetadata(transport_, metadata);
+    ASSERT_TRUE(
+        metadata->segmentManager()
+            .updateLocal([&](SegmentDesc& segment) {
+                segment.type = SegmentType::Memory;
+                segment.name = "congestion-posting";
+                segment.machine_id = "congestion-posting";
+                auto& memory = std::get<MemorySegmentDesc>(segment.detail);
+                return memory.topology.parse(
+                    R"({"nics":[{"name":"mc-tcp-0","type":1,"numa_node":0},{"name":"mc-absent-rnic-1","type":0,"numa_node":0}]})");
+            })
+            .ok());
+    auto endpoint = context_->endpointStore()->getOrInsert(
+        "congestion-posting@mc-absent-rnic-1");
+    ASSERT_TRUE(endpoint);
+    RdmaEndPointTestPeer::markReady(endpoint);
+    auto now = getCurrentTimeInNano();
+    for (int index = 0; index < 3; ++index) {
+        auto* slice = makeSlice();
+        slice->source_dev_id = kDev;
+        slice->target_dev_id = kDev;
+        slice->enqueue_ts = now;
+        slice->task->request.target_id = LOCAL_SEGMENT_ID;
+        RdmaTransportTestPeer::queuePostPath(*workers_, 0, kDev,
+                                             LOCAL_SEGMENT_ID, kDev, slice);
+    }
+    RdmaTransportTestPeer::postSend(*workers_, 0);
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    const bool enforce = std::string(GetParam()) == "enforce";
+#else
+    const bool enforce = false;
+#endif
+    EXPECT_EQ(post_order.size(), enforce ? 1u : 3u);
+    if (enforce) {
+        completeWith(post_order.front(), IBV_WC_SUCCESS, now + 1);
+        RdmaTransportTestPeer::postSend(*workers_, 0);
+        EXPECT_EQ(post_order.size(), 2u);
+    }
+    ASSERT_EQ(context_->endpointStore()->remove(endpoint.get()), 0);
+    endpoint.reset();
+    for (auto* slice : slices_)
+        if (slice->word == PENDING) updateSliceStatus(slice, CANCELED);
+}
+
+INSTANTIATE_TEST_SUITE_P(AdmissionModes, RdmaWorkersCongestionPostingTest,
+                         ::testing::Values("off", "observe", "enforce"));
+
 TEST_F(RdmaWorkersSharedQpTest, EndpointPinsConstructionAddressGeneration) {
     const auto endpoint_address =
         RdmaEndPointTestPeer::localAddress(*endpoint_);
@@ -4550,6 +5209,164 @@ TEST_F(RdmaWorkersSharedQpTest,
     EXPECT_EQ(slices[4]->completions_owed.load(), 1);
     EXPECT_EQ(cq_.getQuota(), 5);
 }
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+TEST_F(RdmaWorkersSharedQpTest, CongestionLimitPreservesSignaledChainTail) {
+    params_->endpoint.signal_interval = 3;
+    RdmaEndPointTestPeer::markReady(endpoint_);
+    std::vector<RdmaSlice*> slices;
+    for (int index = 0; index < 5; ++index) slices.push_back(makeSlice());
+    EXPECT_EQ(endpoint_->submitSlicesLimited(slices, 0, nullptr, 0), 0);
+    ASSERT_EQ(endpoint_->submitSlicesLimited(slices, 0, nullptr, 2), 2);
+    ASSERT_EQ(post_flags.size(), 2u);
+    EXPECT_EQ(post_flags[0] & IBV_SEND_SIGNALED, 0);
+    EXPECT_NE(post_flags[1] & IBV_SEND_SIGNALED, 0);
+    EXPECT_EQ(slices[2]->completions_owed.load(), 0);
+    EXPECT_EQ(cq_.getQuota(), 2);
+}
+
+TEST_F(RdmaWorkersSharedQpTest,
+       EndpointTeardownRetainsPermitDomainsAfterWorkers) {
+    auto* slice = postSlice(0, 1000);
+    RdmaTransportTestPeer::enableCongestionControl(*workers_, kDev);
+    RdmaTransportTestPeer::acquireCongestionPermit(*workers_, slice, endpoint_,
+                                                   kDev);
+    std::weak_ptr<TentRdmaCongestionControlRoute> route =
+        slice->congestion_control_route_owner;
+    ASSERT_FALSE(route.expired());
+    RdmaTransportTestPeer::destroyWorkerContexts(*workers_);
+    workers_.reset();
+    EXPECT_FALSE(route.expired());
+    endpoint_.reset();
+    EXPECT_FALSE(slice->congestion_control_permit.active());
+    auto retained = route.lock();
+    ASSERT_TRUE(retained);
+    EXPECT_EQ(
+        adaptive_congestion_control::snapshot(retained->domain).inflight_bytes,
+        0u);
+    EXPECT_EQ(adaptive_congestion_control::snapshot(*retained->device_owner)
+                  .inflight_bytes,
+              0u);
+}
+
+class RdmaWorkersCongestionCapacityTest : public RdmaWorkersSharedQpTest {
+   protected:
+    void prepare(size_t count) {
+        RdmaTransportTestPeer::enableCongestionControl(*workers_, kDev);
+        auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+        RdmaTransportTestPeer::bindMetadata(transport_, metadata);
+        ASSERT_TRUE(
+            metadata->segmentManager()
+                .updateLocal([&](SegmentDesc& segment) {
+                    segment.type = SegmentType::Memory;
+                    segment.name = "congestion-capacity";
+                    segment.machine_id = "congestion-capacity";
+                    auto& memory = std::get<MemorySegmentDesc>(segment.detail);
+                    return memory.topology.parse(
+                        R"({"nics":[{"name":"mc-tcp-0","type":1,"numa_node":0},{"name":"mc-absent-rnic-1","type":0,"numa_node":0}]})");
+                })
+                .ok());
+        posting_endpoint_ = context_->endpointStore()->getOrInsert(
+            "congestion-capacity@mc-absent-rnic-1");
+        ASSERT_TRUE(posting_endpoint_);
+        RdmaEndPointTestPeer::markReady(posting_endpoint_);
+        now_ = getCurrentTimeInNano();
+        for (size_t index = 0; index < count; ++index) {
+            auto* slice = makeSlice();
+            slice->source_dev_id = kDev;
+            slice->target_dev_id = kDev;
+            slice->enqueue_ts = now_;
+            slice->task->request.target_id = LOCAL_SEGMENT_ID;
+            RdmaTransportTestPeer::queuePostPath(*workers_, 0, kDev,
+                                                 LOCAL_SEGMENT_ID, kDev, slice);
+        }
+    }
+    void TearDown() override {
+        if (posting_endpoint_) {
+            context_->endpointStore()->remove(posting_endpoint_.get());
+            EXPECT_EQ(posting_endpoint_->deconstruct(), 0);
+            posting_endpoint_.reset();
+        }
+        for (auto* slice : slices_)
+            if (slice->word == PENDING) updateSliceStatus(slice, CANCELED);
+        RdmaWorkersSharedQpTest::TearDown();
+    }
+    void expectInflight(uint64_t bytes) {
+        auto route = slices_.front()->congestion_control_route_owner;
+        ASSERT_TRUE(route);
+        EXPECT_EQ(
+            adaptive_congestion_control::snapshot(route->domain).inflight_bytes,
+            bytes);
+        EXPECT_EQ(adaptive_congestion_control::snapshot(*route->device_owner)
+                      .inflight_bytes,
+                  bytes);
+    }
+    std::shared_ptr<RdmaEndPoint> posting_endpoint_;
+    uint64_t now_ = 0;
+};
+
+TEST_F(RdmaWorkersCongestionCapacityTest,
+       SqLimitedPrefixReturnsUnpostedPermitsForRetry) {
+    params_->endpoint.max_qp_wr = 1;
+    prepare(3);
+    RdmaTransportTestPeer::postSend(*workers_, 0);
+    ASSERT_EQ(post_order.size(), 1u);
+    expectInflight(kLen);
+    EXPECT_FALSE(slices_[1]->congestion_control_permit.active());
+    EXPECT_FALSE(slices_[2]->congestion_control_permit.active());
+    completeWith(slices_[0], IBV_WC_SUCCESS, now_ + 1);
+    expectInflight(0);
+    RdmaTransportTestPeer::postSend(*workers_, 0);
+    ASSERT_EQ(post_order.size(), 2u);
+    EXPECT_EQ(post_order.back(), slices_[1]);
+    expectInflight(kLen);
+    EXPECT_FALSE(slices_[2]->congestion_control_permit.active());
+    completeWith(slices_[1], IBV_WC_SUCCESS, now_ + 2);
+    RdmaTransportTestPeer::postSend(*workers_, 0);
+    ASSERT_EQ(post_order.size(), 3u);
+    completeWith(slices_[2], IBV_WC_SUCCESS, now_ + 3);
+    expectInflight(0);
+}
+
+TEST_F(RdmaWorkersCongestionCapacityTest,
+       PartialPostTimeoutAndFlushReturnEveryPermit) {
+    params_->endpoint.signal_interval = 4;
+    RdmaTransportTestPeer::params(transport_)->workers.max_retry_count = 1;
+    fake.post_send_rc = EIO;
+    fake.post_send_bad_wr_index = 2;
+    prepare(4);
+    RdmaTransportTestPeer::postSend(*workers_, 0);
+    ASSERT_EQ(post_order.size(), 2u);
+    ASSERT_EQ(post_flags.size(), 2u);
+    EXPECT_EQ(post_flags[0] & IBV_SEND_SIGNALED, 0);
+    EXPECT_EQ(post_flags[1] & IBV_SEND_SIGNALED, 0);
+    EXPECT_EQ(posting_endpoint_->status(), RdmaEndPoint::EP_DESTROYING);
+    expectInflight(2 * kLen);
+    EXPECT_FALSE(slices_[2]->congestion_control_permit.active());
+    EXPECT_FALSE(slices_[3]->congestion_control_permit.active());
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 1);
+    auto& lane = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    RdmaTransportTestPeer::expireTimedOutSlices(*workers_, lane, now_ + 10);
+    expectInflight(0);
+    for (size_t index = 0; index < 2; ++index) {
+        EXPECT_EQ(slices_[index]->word, TIMEOUT);
+        ibv_wc wc{};
+        wc.wr_id = reinterpret_cast<uint64_t>(slices_[index]);
+        wc.status = IBV_WC_WR_FLUSH_ERR;
+        cq_completions.push_back(wc);
+    }
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, UINT64_MAX);
+    RdmaTransportTestPeer::pollCompletions(*workers_, 0);
+    expectInflight(0);
+    for (auto* slice : slices_) {
+        EXPECT_FALSE(slice->congestion_control_permit.active());
+        EXPECT_EQ(slice->completions_owed.load(), 0);
+        EXPECT_NE(slice->word, PENDING);
+    }
+    EXPECT_EQ(cq_.getQuota(), 0);
+    EXPECT_TRUE(RdmaEndPointTestPeer::queueEmpty(posting_endpoint_, 0));
+}
+#endif
 
 TEST_F(RdmaWorkersSharedQpTest,
        SelectiveSignalingCapsIntervalAtHalfTheSqDepth) {

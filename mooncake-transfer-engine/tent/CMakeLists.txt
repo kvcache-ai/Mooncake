@@ -6,6 +6,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   mooncake_provide_liburing()
   mooncake_provide_hiredis()
   mooncake_provide_cli11()
+  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/mooncake_te_build_config.h
+          DESTINATION include)
 endif()
 
 if(BUILD_UNIT_TESTS AND NOT TARGET gtest)
@@ -28,6 +30,10 @@ endif()
 # path). Declared at the top level so it is discoverable; the actual compile
 # definition is applied in tent/src/metrics/CMakeLists.txt.
 option(TENT_METRICS_ENABLED "Enable TENT metrics collection" OFF)
+
+configure_file(../include/mooncake_te_build_config.h.in
+               mooncake_te_build_config.h @ONLY)
+include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 set(TENT_REPOSITORY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 execute_process(
@@ -57,6 +63,11 @@ set(TENT_FEATURE_SUNRISE ${USE_SUNRISE})
 set(TENT_FEATURE_TPU ${USE_TPU})
 
 add_subdirectory(src)
+target_include_directories(
+  tent_interface INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>)
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL AND TARGET tent_xport_rdma)
+  target_link_libraries(tent_xport_rdma PUBLIC adaptive_congestion_control_core)
+endif()
 add_subdirectory(plugins)
 add_subdirectory(cli)
 if(BUILD_UNIT_TESTS)
