@@ -544,6 +544,32 @@ struct NofQos {
     }
 };
 
+/**
+ * @brief Merge consecutive slices that describe one contiguous local range.
+ *
+ * Callers may describe a single block-aligned buffer as several adjacent
+ * slices -- batch_put_from_multi_buffers() and batch_get_into_multi_buffers()
+ * keep the caller's slice boundaries verbatim, and a sub-block slice of a
+ * block-aligned buffer is not itself a multiple of the NoF block size.
+ * Validating such slices one at a time would reject a layout the former
+ * GetContiguousSliceRange() path accepted, so coalesce first and validate the
+ * resulting runs.
+ *
+ * Two slices are coalesced when the previous one ends exactly where the next
+ * one starts (prev.ptr + prev.size == next.ptr). Object order is preserved, so
+ * the concatenated bytes -- and therefore the remote offsets derived from them
+ * -- are identical to what submitting each slice separately produced.
+ * Zero-length slices are dropped: a zero-byte NofTask neither advances nor
+ * completes.
+ *
+ * @param slices Caller slices, in object order.
+ * @return The coalesced runs; std::nullopt if a slice has a null pointer or
+ *         the pointer/size arithmetic overflows. An empty vector means every
+ *         slice was zero-length.
+ */
+std::optional<std::vector<Slice>> CoalesceAdjacentSlices(
+    const std::vector<Slice>& slices);
+
 constexpr int kDefaultNofWorkers = 4;
 class NofWorkerPool {
    public:

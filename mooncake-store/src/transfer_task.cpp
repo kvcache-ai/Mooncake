@@ -2036,6 +2036,46 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeWrite(
     return future;
 }
 
+std::optional<std::vector<Slice>> CoalesceAdjacentSlices(
+    const std::vector<Slice>& slices) {
+    std::vector<Slice> coalesced;
+    coalesced.reserve(slices.size());
+    for (const auto& slice : slices) {
+        if (slice.ptr == nullptr) {
+            LOG(ERROR) << "NoF slice has a null pointer, slices="
+                       << slices.size();
+            return std::nullopt;
+        }
+        if (slice.size == 0) {
+            // A zero-byte task never makes progress; drop it instead of
+            // handing it to the worker.
+            continue;
+        }
+        const auto ptr = reinterpret_cast<uintptr_t>(slice.ptr);
+        if (slice.size > std::numeric_limits<uintptr_t>::max() - ptr) {
+            LOG(ERROR) << "NoF slice ptr=" << slice.ptr
+                       << " size=" << slice.size
+                       << " overflows, slices=" << slices.size();
+            return std::nullopt;
+        }
+        if (!coalesced.empty()) {
+            auto& prev = coalesced.back();
+            if (reinterpret_cast<uintptr_t>(prev.ptr) + prev.size == ptr) {
+                if (slice.size >
+                    std::numeric_limits<size_t>::max() - prev.size) {
+                    LOG(ERROR) << "NoF coalesced slice size overflows, slices="
+                               << slices.size();
+                    return std::nullopt;
+                }
+                prev.size += slice.size;
+                continue;
+            }
+        }
+        coalesced.push_back(slice);
+    }
+    return coalesced;
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code) {
@@ -2053,6 +2093,23 @@ std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
         return std::nullopt;
     }
 
+    // Callers keep their slice boundaries verbatim, and a sub-block slice of a
+    // block-aligned buffer is not itself block-aligned. Merge adjacent slices
+    // into maximal runs first so those layouts still validate -- and as a side
+    // effect submit fewer, larger DMAs.
+    const auto coalesced = CoalesceAdjacentSlices(slices);
+    if (!coalesced.has_value()) {
+        LOG(ERROR) << "NoF request endpoint=" << handle.transport_endpoint_
+                   << " has unusable slices, slices=" << slices.size();
+        return std::nullopt;
+    }
+    const std::vector<Slice>& runs = *coalesced;
+    if (runs.empty()) {
+        LOG(ERROR) << "NoF request endpoint=" << handle.transport_endpoint_
+                   << " has no non-empty slices";
+        return std::nullopt;
+    }
+
     NofSegmentHandle* seg_handle =
         nof_initiator_->OpenSegment(handle.transport_endpoint_);
     if (!seg_handle) {
@@ -2063,8 +2120,8 @@ std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
 
     uint32_t block_size = nof_initiator_->GetBlockSize(seg_handle);
     // Without SGL, ptr must be block-aligned; with SGL (supports_sgl) the
-    // requirement relaxes to dma_alignment. Each slice is its own DMA, so the
-    // requirement applies to every slice, not just to the first one.
+    // requirement relaxes to dma_alignment. Each run is its own DMA, so the
+    // requirement applies to every run, not just to the first one.
     const auto caps = nof_initiator_->GetCapabilities();
     const uint64_t ptr_alignment =
         caps.supports_sgl ? caps.dma_alignment : block_size;
@@ -2079,25 +2136,25 @@ std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
         return std::nullopt;
     }
 
-    // Validate every slice before submitting any of them: rejecting halfway
+    // Validate every run before submitting any of them: rejecting halfway
     // through would leave the earlier DMAs running against a state that
     // nothing is waiting for.
     uint64_t total_size = 0;
-    for (size_t i = 0; i < slices.size(); ++i) {
-        const auto& slice = slices[i];
-        if (slice.ptr == nullptr || slice.size % block_size != 0 ||
-            reinterpret_cast<std::uintptr_t>(slice.ptr) % ptr_alignment != 0) {
-            LOG(ERROR) << "NoF slice " << i << "/" << slices.size()
-                       << " ptr=" << slice.ptr << ", size=" << slice.size
+    for (size_t i = 0; i < runs.size(); ++i) {
+        const auto& run = runs[i];
+        if (run.ptr == nullptr || run.size % block_size != 0 ||
+            reinterpret_cast<std::uintptr_t>(run.ptr) % ptr_alignment != 0) {
+            LOG(ERROR) << "NoF run " << i << "/" << runs.size()
+                       << " ptr=" << run.ptr << ", size=" << run.size
                        << " is not aligned to block size " << block_size
                        << " (ptr_alignment=" << ptr_alignment << ")";
             return std::nullopt;
         }
-        if (slice.size > std::numeric_limits<uint64_t>::max() - total_size) {
-            LOG(ERROR) << "NoF slice sizes overflow, slices=" << slices.size();
+        if (run.size > std::numeric_limits<uint64_t>::max() - total_size) {
+            LOG(ERROR) << "NoF run sizes overflow, slices=" << slices.size();
             return std::nullopt;
         }
-        total_size += slice.size;
+        total_size += run.size;
     }
     if (total_size == 0 || handle.size_ < total_size) {
         LOG(ERROR) << "Invalid NoF request endpoint="
@@ -2110,22 +2167,23 @@ std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
     const NofIOOp op =
         (op_code == TransferRequest::READ) ? NofIOOp::kRead : NofIOOp::kWrite;
     auto state = std::make_shared<NofOperationState>();
-    state->set_pending_tasks(static_cast<int>(slices.size()));
+    state->set_pending_tasks(static_cast<int>(runs.size()));
 
-    // Slices land back to back from buffer_address_, so slice i goes to
+    // Runs land back to back from buffer_address_, so run i goes to
     // buffer_address_ + sum(sizes[0..i-1]) -- the same remote layout a single
-    // concatenated DMA would have produced. Every slice size is a multiple of
+    // concatenated DMA would have produced. Every run size is a multiple of
     // block_size, so each derived remote offset stays block-aligned.
     uint64_t byte_offset = handle.buffer_address_;
-    for (const auto& slice : slices) {
-        NofTask task(seg_handle, slice.ptr, byte_offset, slice.size, op, state);
+    for (const auto& run : runs) {
+        NofTask task(seg_handle, run.ptr, byte_offset, run.size, op, state);
         task.metric = nof_metric_;
         nof_pool_->submitTask(std::move(task));
-        byte_offset += slice.size;
+        byte_offset += run.size;
     }
 
     VLOG(1) << "NoF transfer submitted to " << handle.transport_endpoint_
-            << " slices=" << slices.size() << " bytes=" << total_size;
+            << " slices=" << slices.size() << " runs=" << runs.size()
+            << " bytes=" << total_size;
     return TransferFuture(state);
 }
 
