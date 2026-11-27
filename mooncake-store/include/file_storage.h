@@ -416,6 +416,15 @@ class FileStorage {
         return client_buffer_shards_[batch_id % kClientBufferShards];
     }
 
+    // Signals that staging-arena capacity was actually returned to
+    // client_buffer_allocator_, so readers waiting for space in AllocateBatch
+    // retry promptly instead of polling. Held by the allocator and its handles
+    // too, so a release wakes waiters even when it comes from a handle going
+    // out of scope (a failed BatchLoad, a rolled-back partial batch, or a
+    // dropped local owner) rather than ReleaseBuffer. The generation counter
+    // closes the failed-check-to-sleep lost-wakeup window.
+    std::shared_ptr<ClientBufferReleaseSignal> client_buffer_release_signal_;
+
     std::atomic<uint64_t> next_batch_id_{1};
 
     /**
