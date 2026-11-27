@@ -229,7 +229,9 @@ class FileStorageTest : public ::testing::Test {
         Drain,
         Shutdown,
         Eviction,
-        EvictionDuringRpc
+        EvictionDuringRpc,
+        Reset,
+        ResetDuringRpc
     };
 
     void RunRecoveryRegistrationRetry(ErrorCode error, RecoveryPath path,
@@ -251,6 +253,7 @@ class FileStorageTest : public ::testing::Test {
                                 &WrappedMasterService::ReMountSegment,
                                 &WrappedMasterService::MountLocalDiskSegment,
                                 &WrappedMasterService::UnmountLocalDiskSegment,
+                                &WrappedMasterService::RemoveAll,
                                 &WrappedMasterService::ReportSsdCapacity,
                                 &WrappedMasterService::OffloadObjectHeartbeat,
                                 &WrappedMasterService::PromotionObjectHeartbeat,
@@ -284,7 +287,9 @@ class FileStorageTest : public ::testing::Test {
             path == RecoveryPath::Drain || path == RecoveryPath::Shutdown;
         const bool evict = path == RecoveryPath::Eviction ||
                            path == RecoveryPath::EvictionDuringRpc;
-        if (cancel || evict) {
+        const bool reset =
+            path == RecoveryPath::Reset || path == RecoveryPath::ResetDuringRpc;
+        if (cancel || evict || reset) {
             config.metadata_recovery_retry_initial_ms = 5000;
             config.metadata_recovery_retry_max_ms = 5000;
         }
@@ -324,20 +329,33 @@ class FileStorageTest : public ::testing::Test {
             ASSERT_TRUE(storage->storage_backend_->Init());
             ASSERT_TRUE(client->MountLocalDiskSegment(true));
         }
-        if (evict) {
+        if (evict || reset) {
             const auto backend = std::static_pointer_cast<BucketStorageBackend>(
                 storage->storage_backend_);
-            auto metadata = backend->GetStoreMetadata();
-            ASSERT_TRUE(metadata);
-            // Evict the older two-key bucket, preserving the later bucket for
-            // the fresh scan after invalidation.
-            storage->config_.disk_eviction_high_watermark_ratio =
-                static_cast<double>(metadata->total_size - 1) /
-                buckets.max_total_size;
-            storage->config_.disk_eviction_low_watermark_ratio =
-                static_cast<double>(metadata->total_size / 2 + 1) /
-                buckets.max_total_size;
-            const bool during_rpc = path == RecoveryPath::EvictionDuringRpc;
+            if (evict) {
+                auto metadata = backend->GetStoreMetadata();
+                ASSERT_TRUE(metadata);
+                // The scanned bucket stays pinned; eviction reclaims the later
+                // bucket while recovery backs off.
+                storage->config_.disk_eviction_high_watermark_ratio =
+                    static_cast<double>(metadata->total_size - 1) /
+                    buckets.max_total_size;
+                storage->config_.disk_eviction_low_watermark_ratio =
+                    static_cast<double>(metadata->total_size / 2 + 1) /
+                    buckets.max_total_size;
+            }
+            const bool during_rpc = path == RecoveryPath::EvictionDuringRpc ||
+                                    path == RecoveryPath::ResetDuringRpc;
+            auto mutate_backend = [&]() -> tl::expected<void, ErrorCode> {
+                if (!reset) return storage->RunDiskWatermarkEviction();
+                // Explicit reset bypasses scan pins. Clear the master after
+                // the local reset so an outstanding registration is removed
+                // too.
+                storage->RemoveAll();
+                auto removed = client->RemoveAll(true);
+                if (!removed) return tl::make_unexpected(removed.error());
+                return {};
+            };
             if (during_rpc) recovery.PauseFirstAttempt();
             auto outcome = completed.get_future();
             auto* owner = storage.get();
@@ -346,31 +364,32 @@ class FileStorageTest : public ::testing::Test {
                     completed.set_value(owner->ReRegisterOffloadedObjects());
                 });
             ASSERT_TRUE(recovery.WaitForAttempt());
-            // The first registration partially succeeds, then backs off. Real
-            // watermark eviction removes the SSD buckets and their replicas.
+            // The first registration partially succeeds, then backs off.
+            // A real eviction or reset invalidates that recovery generation.
             if (during_rpc) {
-                std::promise<void> eviction_started;
-                auto started = eviction_started.get_future();
-                auto eviction = std::async(std::launch::async, [&] {
-                    eviction_started.set_value();
-                    return storage->RunDiskWatermarkEviction();
+                std::promise<void> mutation_started;
+                auto started = mutation_started.get_future();
+                auto mutation = std::async(std::launch::async, [&] {
+                    mutation_started.set_value();
+                    return mutate_backend();
                 });
                 started.wait();
-                // Eviction cannot notify/delete before the outstanding
-                // registration RPC finishes, even with a valid snapshot.
-                EXPECT_EQ(eviction.wait_for(std::chrono::milliseconds(100)),
+                // Mutation cannot complete before the outstanding registration
+                // RPC finishes, even with a valid snapshot.
+                EXPECT_EQ(mutation.wait_for(std::chrono::milliseconds(100)),
                           std::future_status::timeout);
                 recovery.ResumeFirstAttempt();
-                ASSERT_TRUE(eviction.get());
+                ASSERT_TRUE(mutation.get());
             } else {
-                ASSERT_TRUE(storage->RunDiskWatermarkEviction());
+                ASSERT_TRUE(mutate_backend());
             }
             for (size_t i = 0; i < keys.size(); ++i) {
                 auto exists =
                     storage->Exists(TenantId::Default().MakeScopedKey(keys[i]));
                 ASSERT_TRUE(exists);
-                EXPECT_EQ(*exists, i >= 2);
-                EXPECT_FALSE(client->Query(keys[i]));
+                const bool survives = !reset && i < 2;
+                EXPECT_EQ(*exists, survives);
+                if (!survives) EXPECT_FALSE(client->Query(keys[i]));
             }
             EXPECT_EQ(outcome.wait_for(std::chrono::seconds(1)),
                       std::future_status::ready);
@@ -380,16 +399,16 @@ class FileStorageTest : public ::testing::Test {
             EXPECT_FALSE(result.has_value());
             if (!result) EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
             EXPECT_EQ(recovery.Snapshot().first.size(), 1u);
-            for (const auto& key : keys) {
-                auto advertised = client->Query(key);
-                EXPECT_FALSE(advertised)
-                    << "Evicted key was re-registered: " << key;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (!reset && i < 2) continue;
+                EXPECT_FALSE(client->Query(keys[i]))
+                    << "Deleted key was re-registered: " << keys[i];
             }
-            // The next heartbeat's fresh scan registers the surviving bucket.
+            // The next heartbeat's fresh scan only registers surviving data.
             ASSERT_TRUE(storage->ReRegisterOffloadedObjects());
             for (size_t i = 0; i < keys.size(); ++i) {
                 auto advertised = client->Query(keys[i]);
-                EXPECT_EQ(advertised.has_value(), i >= 2) << keys[i];
+                EXPECT_EQ(advertised.has_value(), !reset && i < 2) << keys[i];
             }
             return;
         }
@@ -3358,7 +3377,6 @@ TEST_F(FileStorageTest, DrainUnmountFailureKeepsLatchAndRetries) {
     EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, heartbeat_rpc.error());
 }
 
-
 TEST_F(FileStorageTest, BatchGetRanges_RegistersReleasableStaging) {
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
@@ -3936,6 +3954,16 @@ TEST_F(FileStorageTest, RecoveryBackoffDoesNotReregisterEvictedBuckets) {
 TEST_F(FileStorageTest, RecoveryRegistrationFinishesBeforeBucketEviction) {
     RunRecoveryRegistrationRetry(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED,
                                  RecoveryPath::EvictionDuringRpc, true);
+}
+
+TEST_F(FileStorageTest, RecoveryBackoffDoesNotReregisterResetBuckets) {
+    RunRecoveryRegistrationRetry(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED,
+                                 RecoveryPath::Reset, true);
+}
+
+TEST_F(FileStorageTest, RecoveryRegistrationFinishesBeforeBucketReset) {
+    RunRecoveryRegistrationRetry(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED,
+                                 RecoveryPath::ResetDuringRpc, true);
 }
 
 TEST_F(FileStorageTest, RecoveryBackoffStopsOnDrain) {
