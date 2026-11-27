@@ -169,6 +169,11 @@ struct GlobalConfig {
     bool log_rdma_slice_affinity = false;
     bool track_rdma_posted_slices = false;
     int parallel_reg_mr = -1;
+    // Opt-in workers for disjoint chunks of large CPU buffers. Unlike NIC
+    // parallelism, each worker registers its chunk on every NIC without a
+    // temporary pre-touch MR. Zero preserves the existing registration path.
+    size_t host_reg_threads = 0;
+    bool host_mem_numa_affinity = false;
     // Cap on concurrent buffer registrations in registerLocalMemoryBatch().
     // 0 (default) = unbounded, one thread per buffer. Set via
     // MC_MAX_CONCURRENT_REG_MR; the best value is platform-specific, see the

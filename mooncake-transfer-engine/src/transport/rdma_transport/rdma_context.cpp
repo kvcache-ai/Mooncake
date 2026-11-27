@@ -577,8 +577,8 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     CUmemorytype memType;
     CUresult result = cuPointerGetAttribute(
         &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
-
     if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
+        out.host_memory = true;
         out.method = DmabufExport::Method::kHostReg;
 #if defined(USE_CUDA) || defined(USE_SUPA) || defined(USE_MACA)
     } else if (memType == CU_MEMORYTYPE_DEVICE &&
@@ -714,10 +714,9 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
 #elif defined(USE_HIP_DMABUF)
     hipPointerAttribute_t hipAttr{};
     hipError_t hipRes = hipPointerGetAttributes(&hipAttr, addr);
-
     if (hipRes != hipSuccess || hipAttr.type == hipMemoryTypeHost ||
         hipAttr.type == hipMemoryTypeUnregistered) {
-        // Host memory — standard ibv_reg_mr() path.
+        out.host_memory = true;
         out.method = DmabufExport::Method::kHostReg;
     } else if (hipAttr.type == hipMemoryTypeManaged) {
         // Managed (unified) memory pages can migrate between host and device;
@@ -796,6 +795,10 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     }
 #else
     out.method = DmabufExport::Method::kHostReg;
+#if !defined(USE_HIP) && !defined(USE_MUSA) && !defined(USE_HYGON) && \
+    !defined(USE_COREX) && !defined(USE_SUNRISE)
+    out.host_memory = true;
+#endif
 #endif
     return 0;
 }
@@ -970,24 +973,29 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
 }
 
 int RdmaContext::unregisterMemoryRegion(void *addr) {
-    RWSpinlock::WriteGuard guard(memory_regions_lock_);
-    auto iter = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
-    if (iter == memory_region_map_.end()) {
-        return 0;
+    MemoryRegionMap::node_type region;
+    {
+        RWSpinlock::WriteGuard guard(memory_regions_lock_);
+        auto iter =
+            findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
+        if (iter == memory_region_map_.end()) return 0;
+        region = memory_region_map_.extract(iter);
     }
-    if (!iter->second.mr) {  // skipped on a non-paired Data Direct NIC
-        memory_region_map_.erase(iter);
-        return 0;
-    }
-    if (ibv_dereg_mr(iter->second.mr)) {
+    // A non-paired Data Direct NIC stores a placeholder without an MR.
+    if (!region.mapped().mr) return 0;
+    // Deregistration can spend seconds unpinning a large host range. Remove
+    // its keys before releasing the map lock, then let disjoint ranges unpin
+    // concurrently without blocking lookups for still-registered buffers.
+    // As with registration, the caller must serialize the lifetime of the
+    // same buffer and quiesce transfers before unregistering it.
+    if (ibv_dereg_mr(region.mapped().mr)) {
+        RWSpinlock::WriteGuard guard(memory_regions_lock_);
+        memory_region_map_.insert(std::move(region));
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
     }
-    // No MADV_DOFORK here (reverted #3660): libibverbs already restores the
-    // fork state of a plain host MR inside ibv_dereg_mr(), while dma-buf and
-    // device ranges never carried MADV_DONTFORK and madvise() on them only
-    // fails with EINVAL/ENOMEM (see issue #3639).
-    memory_region_map_.erase(iter);
+    // libibverbs restores the fork state of plain host MRs. Device and dma-buf
+    // ranges never carried MADV_DONTFORK and must not receive MADV_DOFORK here.
     return 0;
 }
 

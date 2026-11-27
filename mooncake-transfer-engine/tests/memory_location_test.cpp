@@ -5,9 +5,48 @@
 #include <numa.h>
 #include <numaif.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+
+TEST(MemoryLocationTest, PageSizeAnonymousAndFileMappings) {
+    const size_t page = sysconf(_SC_PAGESIZE);
+    for (int flags : {MAP_PRIVATE, MAP_SHARED}) {
+        void *addr = mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE,
+                          flags | MAP_ANONYMOUS, -1, 0);
+        ASSERT_NE(addr, MAP_FAILED);
+        EXPECT_EQ(mooncake::detectBufferPageSize(addr), page);
+        EXPECT_EQ(mooncake::detectBufferPageSize(static_cast<char *>(addr) +
+                                                 page + 1),
+                  page);
+        munmap(addr, 2 * page);
+    }
+    FILE *file = tmpfile();
+    ASSERT_NE(file, nullptr);
+    ASSERT_EQ(ftruncate(fileno(file), page), 0);
+    void *addr = mmap(nullptr, page, PROT_READ, MAP_PRIVATE, fileno(file), 0);
+    ASSERT_NE(addr, MAP_FAILED);
+    EXPECT_EQ(mooncake::detectBufferPageSize(addr), page);
+    munmap(addr, page);
+    fclose(file);
+}
+
+TEST(MemoryLocationTest, PageSizeAnonymousHugeTlbIsNotBasePage) {
+    const size_t huge = 2 * 1024 * 1024;
+    // No reservation or access: also exercise HugeTLB classification on hosts
+    // without a preallocated pool, without consuming physical huge pages.
+    void *addr = mmap(nullptr, huge, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB |
+                          MAP_NORESERVE | (21 << MAP_HUGE_SHIFT),
+                      -1, 0);
+    if (addr == MAP_FAILED) GTEST_SKIP() << "2 MiB HugeTLB mapping unavailable";
+    EXPECT_EQ(mooncake::detectBufferPageSize(addr), huge);
+    EXPECT_EQ(mooncake::detectBufferPageSize(static_cast<char *>(addr) + 1),
+              huge);
+    munmap(addr, huge);
+}
 
 TEST(MemoryLocationTest, MallocSimpleNode0) {
     int size = 4096 * 10;
@@ -176,6 +215,8 @@ TEST(MemoryLocationTest, ThpDetectionNotFaultedIn) {
     }
 
     EXPECT_TRUE(mooncake::hasHugepageAdvice(addr));
+    EXPECT_EQ(mooncake::detectBufferPageSize(addr),
+              static_cast<size_t>(sysconf(_SC_PAGESIZE)));
     // Nothing resident yet, so it is not THP-backed.
     EXPECT_FALSE(mooncake::isThpBacked(addr, size));
 

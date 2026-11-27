@@ -264,7 +264,11 @@ class RdmaTransport : public Transport {
     // receives the base addr, so remember each base buffer's chunk
     // start-addresses for cleanup.
     std::mutex chunk_map_mutex_;
-    std::unordered_map<uint64_t, std::vector<uint64_t>> chunk_map_;
+    struct RegisteredChunks {
+        std::vector<uint64_t> addresses;
+        size_t host_workers = 0;
+    };
+    std::unordered_map<uint64_t, RegisteredChunks> chunk_map_;
 
     // A registration of HugeTLB host memory is attempted over the caller's own
     // range first; only when ibv_reg_mr() rejects it with EINVAL — the kernel

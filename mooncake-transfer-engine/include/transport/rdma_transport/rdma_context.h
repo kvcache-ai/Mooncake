@@ -124,6 +124,7 @@ struct MemoryRegionMeta {
 struct DmabufExport {
     enum class Method { kHostReg, kDmabufReg };
     Method method = Method::kHostReg;
+    bool host_memory = false;
     int fd = -1;          // live dma_buf fd; -1 when not applicable
     uint64_t offset = 0;  // offset of addr within the exported allocation
     // sysfs PCI root of the GPU owning the memory ("pci0009:00"); empty when

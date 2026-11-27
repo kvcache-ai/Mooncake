@@ -27,10 +27,29 @@ namespace mooncake {
 
 size_t detectBufferPageSize(void *addr) {
     const size_t fallback = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const uintptr_t target = reinterpret_cast<uintptr_t>(addr);
+    // Avoid walking unrelated resident pages in smaps. Anonymous HugeTLB has
+    // a hugetlbfs inode; anonymous THP still reports the base KernelPageSize.
+    {
+        std::ifstream maps("/proc/self/maps");
+        std::string line;
+        while (std::getline(maps, line)) {
+            unsigned long start = 0, end = 0;
+            unsigned int major = 0, minor = 0;
+            unsigned long long inode = 0;
+            if (std::sscanf(line.c_str(), "%lx-%lx %*s %*s %x:%x %llu", &start,
+                            &end, &major, &minor, &inode) != 5)
+                break;
+            if (target >= start && target < end) {
+                if (major == 0 && minor == 0 && inode == 0) return fallback;
+                break;
+            }
+            if (target < start) break;
+        }
+    }
     std::ifstream smaps("/proc/self/smaps");
     if (!smaps.is_open()) return fallback;
 
-    const uintptr_t target = reinterpret_cast<uintptr_t>(addr);
     std::string line;
     bool in_range = false;
 
