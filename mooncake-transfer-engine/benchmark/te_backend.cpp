@@ -27,7 +27,6 @@
 #include <sys/mman.h>
 
 #if defined(USE_CUDA)
-#include <bits/stdint-uintn.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include "cuda_alike.h"
@@ -517,7 +516,16 @@ int TEBenchRunner::allocateBuffers() {
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
     } else if (XferBenchConfig::seg_type == "VRAM") {
         int gpu_count = 0;
-        cudaGetDeviceCount(&gpu_count);
+        auto err = cudaGetDeviceCount(&gpu_count);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "cudaGetDeviceCount failed: "
+                       << cudaGetErrorString(err);
+            return -1;
+        }
+        if (gpu_count == 0) {
+            LOG(ERROR) << "No GPU available for --seg_type=VRAM";
+            return -1;
+        }
         int start_gpu = 0, num_buffers = gpu_count;
         if (XferBenchConfig::local_gpu_id != -1) {
             start_gpu = XferBenchConfig::local_gpu_id;
@@ -533,12 +541,18 @@ int TEBenchRunner::allocateBuffers() {
             pinned_buffer_list_[i] =
                 allocateMemoryPool(total_buffer_size, gpu_id, true);
             if (!pinned_buffer_list_[i]) return -1;
-            engine_->registerLocalMemory(pinned_buffer_list_[i],
-                                         total_buffer_size, location);
+            if (engine_->registerLocalMemory(pinned_buffer_list_[i],
+                                             total_buffer_size, location)) {
+                LOG(ERROR) << "Failed to register VRAM buffer on GPU "
+                           << gpu_id;
+                return -1;
+            }
         }
 #endif
     } else {
-        LOG(ERROR) << "Unknown seg_type: " << XferBenchConfig::seg_type;
+        LOG(ERROR) << "--seg_type=" << XferBenchConfig::seg_type
+                   << " is not supported by this build";
+        return -1;
     }
     return 0;
 }
@@ -608,7 +622,12 @@ TEBenchRunner::TEBenchRunner() {
                      XferBenchConfig::seg_name.empty())
                         ? mooncake::getHostname()
                         : XferBenchConfig::seg_name;
-    engine_->init(conn_str, seg_name);
+    if (engine_->init(conn_str, seg_name) != 0) {
+        LOG(ERROR) << "Failed to initialize the transfer engine with "
+                   << conn_str;
+        init_ok_ = false;
+        return;
+    }
 #ifdef USE_SUNRISE
     // Sunrise IPC handles must be produced by the installed transport before
     // the benchmark starts issuing transfers, so classic tebench installs the
@@ -758,18 +777,44 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
     (void)deadline_ns;
     (void)intent_type;
     if (!running()) return -1.0;
-    auto batch_id = engine_->allocateBatchID(batch_size);
-    std::vector<TransferRequest> requests;
-    for (uint64_t i = 0; i < batch_size; ++i) {
-        TransferRequest entry;
-        entry.opcode =
-            opcode == READ ? TransferRequest::READ : TransferRequest::WRITE;
-        entry.length = block_size;
-        entry.source = (void*)(local_addr + block_size * i);
-        entry.target_id = target_id;
-        entry.target_offset = target_addr + block_size * i;
-        requests.emplace_back(entry);
+    XferBenchTimer parent_timer;
+    auto build = [&](size_t begin, size_t end) {
+        std::vector<TransferRequest> requests;
+        requests.reserve(end - begin);
+        for (uint64_t i = begin; i < end; ++i) {
+            TransferRequest entry;
+            entry.opcode =
+                opcode == READ ? TransferRequest::READ : TransferRequest::WRITE;
+            entry.length = block_size;
+            entry.source = (void*)(local_addr + block_size * i);
+            entry.target_id = target_id;
+            entry.target_offset = target_addr + block_size * i;
+            requests.emplace_back(entry);
+        }
+        return requests;
+    };
+    auto parallel_result = engine_->tryParallelBatchTransfer(
+        target_id, batch_size, build, std::chrono::seconds(30));
+    if (parallel_result) {
+        if (!parallel_result->ok()) {
+            // Ordinary free may defer cleanup while transport work still
+            // owns the payload. Preserve the buffers until process exit.
+            abandoned_batches_.fetch_add(1);
+            LOG(ERROR) << "Parallel batch transfer failed: "
+                       << parallel_result->ToString();
+            noteTransferFailed();
+            return -1.0;
+        }
+        return static_cast<double>(parent_timer.lap_ns(false)) /
+               kNanosecondsPerMicrosecond;
     }
+    auto batch_id = engine_->allocateBatchID(batch_size);
+    if (batch_id == mooncake::INVALID_BATCH_ID) {
+        LOG(ERROR) << "Failed to allocate transfer batch";
+        noteTransferFailed();
+        return -1.0;
+    }
+    auto requests = build(0, batch_size);
     // A deferred free means transport work may still own the buffers (see
     // TransferEngine::freeBatchID), e.g. a TIMEOUT task whose slices are
     // still waiting. Keep freeBuffers() from releasing them at exit.
@@ -790,19 +835,21 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
         releaseUnfinishedBatch();
         return fail("Failed to submit transfer", submitted);
     }
-    const uint64_t submit_us = timer.lap_us(false);
+    const uint64_t submit_ns = splitOutputEnabled() ? timer.lap_ns(false) : 0;
     uint64_t polls = 0;
     mooncake::TransferStatus overall_status;
     auto polled = waitForBatch(batch_id, overall_status, polls);
     if (!polled.ok()) return fail("Failed to poll transfer", polled);
     if (overall_status.s == TransferStatusEnum::COMPLETED) {
-        const uint64_t total_us = timer.lap_us(false);
+        const uint64_t total_ns = timer.lap_ns(false);
         if (splitOutputEnabled()) {
-            logSplitXfer({batch_size, submit_us, total_us - submit_us, polls});
+            logSplitXfer({block_size, batch_size, splitWarmup(), submit_ns,
+                          total_ns - submit_ns, polls});
         }
         auto released = releaseFinishedBatch(*engine_, batch_id);
         if (!released.ok()) return fail("Failed to free batch", released);
-        return static_cast<double>(total_us);
+        return static_cast<double>(parent_timer.lap_ns(false)) /
+               kNanosecondsPerMicrosecond;
     }
     if (overall_status.s == TransferStatusEnum::PENDING) {
         // Abandoned after a stop; waitForBatch() already counted it.

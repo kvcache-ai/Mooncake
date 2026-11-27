@@ -72,6 +72,17 @@ constexpr int kGdrFailureThreshold = 2;
 // Friend accessor for driving initializeContexts() without a full install().
 class RdmaTransportTestPeer {
    public:
+    static void setDestDeviceAffinity(Workers& workers, bool enabled) {
+        workers.dest_device_affinity_ = enabled;
+    }
+
+    // The transport config is private; rail settings reach a RailMonitor only
+    // through load(conf), so tests must edit it before the first path.
+    static void setTransportConf(RdmaTransport& transport, const char* key,
+                                 int value) {
+        transport.conf_->set(key, value);
+    }
+
     static Status generatePostPath(Workers& workers, RdmaSlice* slice) {
         const int previous = tl_wid;
         tl_wid = 0;
@@ -297,6 +308,19 @@ class RdmaTransportTestPeer {
     }
     static WorkerContext& workerContext(Workers& workers, size_t i) {
         return workers.worker_context_[i];
+    }
+
+    // Rail monitor a worker lane created for a peer. Null until the first
+    // path is generated, because getOrCreateRail() runs on demand.
+    static std::shared_ptr<RailMonitor> findRail(
+        Workers& workers, size_t worker_id, const std::string& machine_id) {
+        auto& rails = workers.worker_context_[worker_id].rails;
+        auto it = rails.find(machine_id);
+        return it == rails.end() ? nullptr : it->second;
+    }
+
+    static bool affinityMissWarned(Workers& workers) {
+        return workers.affinity_miss_warned_.load();
     }
 
     static void stopAcceptingSubmits(Workers& workers) {
@@ -735,6 +759,168 @@ TEST_F(RdmaMluSliceMetadataLifetimeTest,
     RdmaTransportTestPeer::releaseSliceQuota(*workers_, &next, 0, 0);
 }
 
+TEST_F(RdmaSliceMetadataLifetimeTest, AffinityRetryRechargesPinnedNic) {
+    RdmaTransportTestPeer::setDestDeviceAffinity(*workers_, true);
+    workers_->getDeviceSelector()->setSmartSelection(true);
+
+    RdmaTask task;
+    task.request = request_;
+    RdmaSlice slice;
+    slice.task = &task;
+    slice.source_addr = request_.source;
+    slice.target_addr = request_.target_offset;
+    slice.length = request_.length;
+    ASSERT_TRUE(
+        RdmaTransportTestPeer::generatePostPath(*workers_, &slice).ok());
+    const int pinned = slice.source_dev_id;
+    ASSERT_GE(pinned, 0);
+    EXPECT_EQ(slice.target_dev_id, pinned);
+    EXPECT_EQ(slice.charged_dev.load(), pinned);
+    EXPECT_EQ(workers_->getDeviceSelector()->getInflightBytes(pinned),
+              slice.length);
+
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, &slice, 0, 0);
+    EXPECT_EQ(slice.charged_dev.load(), -1);
+    EXPECT_EQ(workers_->getDeviceSelector()->getInflightBytes(pinned), 0u);
+
+    slice.retry_count = 1;
+    ASSERT_TRUE(
+        RdmaTransportTestPeer::generatePostPath(*workers_, &slice).ok());
+    EXPECT_EQ(slice.source_dev_id, pinned);
+    EXPECT_EQ(slice.target_dev_id, pinned);
+    EXPECT_EQ(slice.charged_dev.load(), pinned);
+    EXPECT_EQ(workers_->getDeviceSelector()->getInflightBytes(pinned),
+              slice.length);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, &slice, 0, 0);
+}
+
+// The switch cannot pin a rail when the peer has no NIC of the same name. That
+// must stay a warning plus the normal selection path, not a failure, and the
+// warning must not repeat for every slice.
+TEST_F(RdmaSliceMetadataLifetimeTest, AffinityWithoutSameNameWarnsOnce) {
+    RdmaTransportTestPeer::setDestDeviceAffinity(*workers_, true);
+    ASSERT_TRUE(
+        peer_->segmentManager()
+            .updateLocal([&](SegmentDesc& segment) {
+                segment = *metadata_->segmentManager().getLocal();
+                segment.name = peer_name_;
+                segment.rpc_server_addr = peer_name_;
+                segment.machine_id = "different-machine";
+                auto& topo =
+                    std::get<MemorySegmentDesc>(segment.detail).topology;
+                topo.nic_list_[0].name = "rn_0";
+                topo.nic_list_[1].name = "rn_1";
+                return Status::OK();
+            })
+            .ok());
+    metadata_->segmentManager().invalidateRemote(request_.target_id);
+    EXPECT_FALSE(RdmaTransportTestPeer::affinityMissWarned(*workers_));
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        RdmaTask task;
+        task.request = request_;
+        RdmaSlice slice;
+        slice.task = &task;
+        slice.source_addr = request_.source;
+        slice.target_addr = request_.target_offset;
+        slice.length = request_.length;
+        ASSERT_TRUE(
+            RdmaTransportTestPeer::generatePostPath(*workers_, &slice).ok());
+        // No same-name peer, so the memory-tier path still picks a device.
+        EXPECT_GE(slice.source_dev_id, 0);
+        EXPECT_GE(slice.target_dev_id, 0);
+        RdmaTransportTestPeer::releaseSliceQuota(*workers_, &slice, 0, 0);
+    }
+    // The flag latches on the first miss, so later slices stay quiet.
+    EXPECT_TRUE(RdmaTransportTestPeer::affinityMissWarned(*workers_));
+}
+
+TEST_F(RdmaSliceMetadataLifetimeTest, AffinityWithoutSameNameStillRotates) {
+    RdmaTransportTestPeer::setDestDeviceAffinity(*workers_, true);
+    ASSERT_TRUE(
+        peer_->segmentManager()
+            .updateLocal([&](SegmentDesc& segment) {
+                segment = *metadata_->segmentManager().getLocal();
+                segment.name = peer_name_;
+                segment.rpc_server_addr = peer_name_;
+                segment.machine_id = "different-machine";
+                auto& topo =
+                    std::get<MemorySegmentDesc>(segment.detail).topology;
+                topo.nic_list_[0].name = "rn_0";
+                topo.nic_list_[1].name = "rn_1";
+                return Status::OK();
+            })
+            .ok());
+    metadata_->segmentManager().invalidateRemote(request_.target_id);
+
+    RdmaTask task;
+    task.request = request_;
+    RdmaSlice slice;
+    slice.task = &task;
+    slice.source_addr = request_.source;
+    slice.target_addr = request_.target_offset;
+    slice.length = request_.length;
+    slice.source_dev_id = 0;
+    slice.target_dev_id = 0;
+    slice.retry_count = 1;
+    slice.charged_dev = -1;
+    ASSERT_TRUE(
+        RdmaTransportTestPeer::generatePostPath(*workers_, &slice).ok());
+    // Fallback records the pair it picked. The optimal path does not.
+    EXPECT_GE(slice.last_fallback_idx, 0);
+    EXPECT_EQ(slice.charged_dev.load(), slice.source_dev_id);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, &slice, 0, 0);
+}
+
+// Pinned rail rejected by admit(): the slice must fail on that rail instead of
+// rotating to another remote NIC, and the chosen pair must not change.
+TEST_F(RdmaSliceMetadataLifetimeTest, AffinityPinnedRailRejectedFailsSlice) {
+    // Keep the paused rail from arming an exploratory probe mid-test: with the
+    // default one-second interval a slow machine could admit the retry instead
+    // of rejecting it.
+    RdmaTransportTestPeer::setTransportConf(
+        transport_, RailMonitor::kCfgProbeIntervalSecs, 3600);
+    RdmaTransportTestPeer::setDestDeviceAffinity(*workers_, true);
+
+    RdmaTask task;
+    task.request = request_;
+    RdmaSlice slice;
+    slice.task = &task;
+    slice.source_addr = request_.source;
+    slice.target_addr = request_.target_offset;
+    slice.length = request_.length;
+    ASSERT_TRUE(
+        RdmaTransportTestPeer::generatePostPath(*workers_, &slice).ok());
+    const int pinned = slice.source_dev_id;
+    ASSERT_GE(pinned, 0);
+    ASSERT_EQ(slice.target_dev_id, pinned);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, &slice, 0, 0);
+
+    // Pause the same-name rail so admit() rejects the retry. The default
+    // threshold is 3 and the test topology is unchanged, so three failures
+    // within the error window arm the cooldown.
+    auto rail =
+        RdmaTransportTestPeer::findRail(*workers_, 0, "different-machine");
+    ASSERT_NE(rail, nullptr);
+    for (int i = 0; i < 3; ++i) rail->markFailed(pinned, pinned, 0);
+    ASSERT_FALSE(rail->isAvailable(pinned, pinned));
+
+    slice.retry_count = 1;
+    auto status = RdmaTransportTestPeer::generatePostPath(*workers_, &slice);
+    EXPECT_FALSE(status.ok());
+    const std::string message(status.message());
+    EXPECT_NE(message.find("Same-name remote NIC is not available"),
+              std::string::npos)
+        << message;
+    // Fail closed: neither side moves to another NIC.
+    EXPECT_EQ(slice.source_dev_id, pinned);
+    EXPECT_EQ(slice.target_dev_id, pinned);
+    // A rejected attempt charges nothing, so the retry cannot leak quota.
+    EXPECT_EQ(slice.charged_dev.load(), -1);
+    EXPECT_EQ(workers_->getDeviceSelector()->getInflightBytes(pinned), 0u);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, &slice, 0, 0);
+}
+
 TEST_F(RdmaSliceMetadataLifetimeTest,
        CallerPublishesPerLaneStartupSteadyAndTailChunks) {
     ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
@@ -1143,6 +1329,21 @@ TEST(RdmaParamsTest, DefaultsKeepLaneCountsAligned) {
     EXPECT_EQ(params.endpoint.qp_mul_factor, params.num_lanes);
     EXPECT_EQ(params.workers.num_workers, params.num_lanes);
     EXPECT_EQ(params.endpoint.path_mtu, IBV_MTU_4096);
+}
+
+// Slice timeouts subtract two of these timestamps. A wall-clock step between
+// them must not change the result, so they come from the monotonic clock.
+TEST(RdmaSliceClockTest, TimestampsComeFromTheMonotonicClock) {
+    auto monotonic_ns = [] {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return int64_t{ts.tv_sec} * 1000000000 + ts.tv_nsec;
+    };
+    const int64_t before = monotonic_ns();
+    const int64_t now = getCurrentTimeInNano();
+    const int64_t after = monotonic_ns();
+    EXPECT_GE(now, before);
+    EXPECT_LE(now, after);
 }
 
 TEST(RdmaSubBatchTest, ReportsTaskCount) {

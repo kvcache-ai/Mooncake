@@ -56,8 +56,8 @@ MLU A -> host stage A -> TCP -> host stage B -> MLU B
 ```
 
 A host-memory endpoint omits its device stage. Both READ and WRITE are supported.
-A peer transfer uses a network transport hint such as `RDMA` or `TCP`; `MLU` is
-only a local-copy hint. For separate allocation and registration calls, use fresh
+A peer transfer can use `MLU` for same-host IPC, or a network transport hint
+such as `RDMA` or `TCP`. For separate allocation and registration calls, use fresh
 `MemoryOptions` or reset `type = UNSPEC` before automatic registration: allocation
 may fill in the transport type. Explicit MLU-only device registration is also
 supported, since the network stage registers its own host buffers.
@@ -93,7 +93,16 @@ its completion cannot be tracked, it remains pending until the queue drains.
 Drain failures are reported and resources are retained for retry. External pinned
 allocations remain owned by the caller.
 
-There is no MLU peer-to-peer or MLU IPC. Direct device RDMA is offered only when
+Local device pairs use P2P when the copy direction is accessible, with host
+staging otherwise. Same-host IPC attributes identify the owner by PCI bus ID,
+which the importer resolves to its own visible device ordinal before checking
+P2P access and mapping the allocation. Successful device lookups are cached.
+Missing or unresolvable identities and
+legacy ordinal-only attributes use other routes when the hint and policy permit;
+an explicit MLU-only request can fail instead. Logical partitions sharing a PCI
+bus ID still require a partition-specific identity to distinguish them reliably.
+
+Direct device RDMA is offered only when
 both endpoints advertise successful RDMA registration; otherwise the host
 staging route is used. An invalid allocation range, missing local copy
 transport, or missing staging location fails instead of submitting unregistered

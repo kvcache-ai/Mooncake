@@ -113,6 +113,13 @@ option(USE_MNNVL "option for using Multi-Node NVLink transport" OFF)
 option(USE_CXL "option for using CXL protocol" OFF)
 option(USE_EFA "option for using AWS EFA transport" OFF)
 option(USE_UB "option for using UB protocol transport" OFF)
+option(
+  USE_UB_MOCK
+  "test-only: build TENT UB with an in-process loopback URMA adapter, enabled at runtime by MC_TENT_UB_MOCK=1; never use in production builds"
+  OFF)
+if(USE_UB_MOCK AND NOT USE_UB)
+  message(FATAL_ERROR "USE_UB_MOCK requires USE_UB=ON")
+endif()
 option(USE_SUNRISE
        "option for enabling gpu features for Sunrise GPU with Tang runtime" OFF)
 option(USE_ENFLAME

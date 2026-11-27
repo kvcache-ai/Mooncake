@@ -15,6 +15,7 @@
 #include "tent/platform/sunrise.h"
 
 #include <algorithm>
+#include <cctype>
 #include <dirent.h>
 #include <fstream>
 #include <infiniband/verbs.h>
@@ -190,17 +191,40 @@ static void insertFallbackMemEntry(int nic_list_count,
     mem_list.push_back(new_entry);
 }
 
-Status SunrisePlatform::probe(std::vector<Topology::NicEntry>& nic_list,
-                              std::vector<Topology::MemEntry>& mem_list) {
-    auto detected_nic = listInfiniBandDevices();
-    filterInfiniBandDevices(detected_nic, conf);
-    for (auto& entry : detected_nic) nic_list.push_back(entry);
-    insertFallbackMemEntry((int)nic_list.size(), mem_list);
-    discoverCpuTopology(nic_list, mem_list);
+static int getNumaNodeFromPciDevice(const std::string& pci_bdf) {
+    std::ifstream file("/sys/bus/pci/devices/" + pci_bdf + "/numa_node");
+    int numa_node = -1;
+    if (!(file >> numa_node)) return -1;
+    return numa_node;
+}
 
+static int getPciDistance(const char* bus1, const char* bus2) {
+    char buf[PATH_MAX];
+    char path1[PATH_MAX];
+    char path2[PATH_MAX];
+    snprintf(buf, sizeof(buf), "/sys/bus/pci/devices/%s", bus1);
+    if (!realpath(buf, path1)) return -1;
+    snprintf(buf, sizeof(buf), "/sys/bus/pci/devices/%s", bus2);
+    if (!realpath(buf, path2)) return -1;
+
+    const char* ptr1 = path1;
+    const char* ptr2 = path2;
+    while (*ptr1 && *ptr1 == *ptr2) {
+        ++ptr1;
+        ++ptr2;
+    }
+    int distance = 0;
+    for (; *ptr1; ++ptr1) distance += (*ptr1 == '/');
+    for (; *ptr2; ++ptr2) distance += (*ptr2 == '/');
+    return distance;
+}
+
+static void discoverSunriseTopology(
+    const std::vector<Topology::NicEntry>& nic_list,
+    std::vector<Topology::MemEntry>& mem_list) {
     int device_count = 0;
     if (tangGetDeviceCount(&device_count) != tangSuccess || device_count <= 0) {
-        return Status::OK();
+        return;
     }
 
     for (int i = 0; i < device_count; ++i) {
@@ -208,11 +232,50 @@ Status SunrisePlatform::probe(std::vector<Topology::NicEntry>& nic_list,
         entry.name = "cuda:" + std::to_string(i);
         entry.numa_node = -1;
         entry.type = Topology::MEM_CUDA;
+        char pci_bus_id[32] = {};
+        auto err = tangDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), i);
+        std::vector<int> distances(nic_list.size(), -1);
+        int min_distance = INT_MAX;
+        if (err == tangSuccess) {
+            for (char* ch = pci_bus_id; *ch; ++ch)
+                *ch = static_cast<char>(
+                    std::tolower(static_cast<unsigned char>(*ch)));
+            entry.pci_bus_id = pci_bus_id;
+            entry.numa_node = getNumaNodeFromPciDevice(entry.pci_bus_id);
+            for (size_t nic = 0; nic < nic_list.size(); ++nic) {
+                distances[nic] = getPciDistance(
+                    nic_list[nic].pci_bus_id.c_str(), pci_bus_id);
+                // An unresolved sysfs path is unknown, never the closest NIC.
+                if (distances[nic] >= 0)
+                    min_distance = std::min(min_distance, distances[nic]);
+            }
+        } else {
+            LOG(WARNING) << "tangDeviceGetPCIBusId for device " << i << ": "
+                         << tangGetErrorString(err);
+        }
         for (int nic = 0; nic < (int)nic_list.size(); ++nic) {
-            entry.device_list[2].push_back(nic);
+            size_t rank = 2;
+            if (distances[nic] >= 0) {
+                if (distances[nic] == min_distance)
+                    rank = 0;
+                else if (entry.numa_node >= 0 &&
+                         nic_list[nic].numa_node == entry.numa_node)
+                    rank = 1;
+            }
+            entry.device_list[rank].push_back(nic);
         }
         mem_list.push_back(std::move(entry));
     }
+}
+
+Status SunrisePlatform::probe(std::vector<Topology::NicEntry>& nic_list,
+                              std::vector<Topology::MemEntry>& mem_list) {
+    auto detected_nic = listInfiniBandDevices();
+    filterInfiniBandDevices(detected_nic, conf);
+    for (auto& entry : detected_nic) nic_list.push_back(entry);
+    insertFallbackMemEntry((int)nic_list.size(), mem_list);
+    discoverCpuTopology(nic_list, mem_list);
+    discoverSunriseTopology(nic_list, mem_list);
     return Status::OK();
 }
 

@@ -358,6 +358,20 @@ void RailMonitor::markRecovered(int local_nic, int remote_nic,
     }
 }
 
+int RailMonitor::directRemoteDevice(int local_nic) const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto it = direct_rails_.find(local_nic);
+    if (it == direct_rails_.end() || it->second < 0) return -1;
+    // loadDefault() may record a different NIC when names do not match.
+    const auto* local_entry = local_ ? local_->getNicEntry(local_nic) : nullptr;
+    const auto* remote_entry =
+        remote_ ? remote_->getNicEntry(it->second) : nullptr;
+    if (!local_entry || !remote_entry ||
+        local_entry->name != remote_entry->name)
+        return -1;
+    return it->second;
+}
+
 int RailMonitor::findBestRemoteDevice(int local_nic, int remote_numa) {
     std::lock_guard<std::mutex> guard(mutex_);
     if (remote_numa >= 0 && remote_numa < (int)kMaxNuma) {

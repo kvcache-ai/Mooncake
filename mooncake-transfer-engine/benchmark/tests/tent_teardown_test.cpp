@@ -16,6 +16,7 @@
 #include "split_output.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
+#include "batch_submit.h"
 
 #include <gtest/gtest.h>
 #include <cstdio>
@@ -36,6 +37,10 @@ class TransferEngineImplTestPeer {
     static std::weak_ptr<tent::ControlService> metadata(
         const tent::TransferEngine& engine) {
         return engine.impl_->metadata_;
+    }
+    static void enableParallelBatchSubmit(tent::TransferEngine& engine) {
+        engine.batch_submit_executor_ = std::make_shared<BatchSubmitExecutor>(
+            BatchSubmitExecutor::Config{1, 1, 4});
     }
 };
 
@@ -137,6 +142,7 @@ class NoQuiesceTransport : public Transport {
         ++removed_buffers;
         return Status::OK();
     }
+    bool supportsParallelBatchSubmit() const override { return true; }
 };
 
 class TENTTeardownTest : public testing::TestWithParam<bool> {
@@ -151,8 +157,13 @@ class TENTTeardownTest : public testing::TestWithParam<bool> {
         config->set("rpc_server_hostname", "127.0.0.1");
         config->set("rpc_server_port", 0);
         config->set("log_level", "warning");
-        for (const auto* name : {"rdma", "tcp", "hp_tcp", "shm", "io_uring"})
-            config->set(std::string("transports/") + name + "/enable", false);
+        // Only the injected transport participates in admission and teardown.
+        for (int type = 1; type < kSupportedTransportTypes; ++type)
+            config->set("transports/" +
+                            std::string(transportTypeName(
+                                static_cast<TransportType>(type))) +
+                            "/enable",
+                        false);
         auto engine = std::make_unique<TransferEngine>(config);
         ASSERT_TRUE(engine->available());
         engine_ = engine.get();
@@ -228,6 +239,15 @@ class TENTTeardownTest : public testing::TestWithParam<bool> {
 };
 
 TEST_P(TENTTeardownTest, PollErrorRetainsEngineAndBuffer) {
+    transport_->mode = NoQuiesceTransport::Mode::PollError;
+    EXPECT_LT(transfer(), 0);
+    expectRetained();
+}
+
+TEST_P(TENTTeardownTest, ParallelBatchPollErrorRetainsEngineAndBuffer) {
+    TransferEngineImplTestPeer::enableParallelBatchSubmit(*engine_);
+    ASSERT_TRUE(engine_->isBatchSubmitEligible(1));
+    ASSERT_TRUE(engine_->supportsParallelBatchSubmit(LOCAL_SEGMENT_ID));
     transport_->mode = NoQuiesceTransport::Mode::PollError;
     EXPECT_LT(transfer(), 0);
     expectRetained();
