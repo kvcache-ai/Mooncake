@@ -8,6 +8,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <ylt/easylog.hpp>
@@ -156,6 +157,14 @@ class DefaultConfig {
 
 // usage: export MC_YLT_LOG_LEVEL=info or export MC_YLT_LOG_LEVEL=debug etc.
 inline void init_ylt_log_level() {
+    // This process-startup helper owns the default YLT console logger. Its
+    // default async appender queues records but has no consumer until init_log.
+    // Initialize once so later level changes do not replace a live appender.
+    static std::once_flag logger_initialized;
+    std::call_once(logger_initialized, [] {
+        easylog::init_log(easylog::Severity::WARN, "", true, true);
+    });
+
     const char* env_level = std::getenv("MC_YLT_LOG_LEVEL");
     if (!env_level || !*env_level) {
         // default is WARN

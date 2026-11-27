@@ -432,10 +432,37 @@ class _BundleManifestStore:
         return RemoteBundleRef(manifest_key=manifest_key, manifest=manifest)
 
     def remove_bundle(self, ref: RemoteBundleRef | Mapping[str, Any]) -> None:
-        manifest = self.resolve_manifest(ref)
-        keys = self._payload_keys(manifest)
-        keys.append(self._manifest_key(ref, manifest))
-        _cleanup_keys(self._store, keys, strict=True)
+        try:
+            manifest = self.resolve_manifest(ref)
+        except (KeyError, json.JSONDecodeError) as error:
+            if isinstance(ref, RemoteBundleRef) or ref.get("manifest") is not None:
+                raise
+            if isinstance(error, json.JSONDecodeError) and error.doc:
+                raise
+            # A retry can arrive after the final removal took effect. Store-RS
+            # also returns empty bytes on read errors, so confirm absence.
+            key = ref["manifest_key"]
+            batch_is_exist = getattr(self._store, "batch_is_exist", None)
+            if callable(batch_is_exist):
+                statuses = batch_is_exist([key])
+                if len(statuses) != 1 or statuses[0] not in (0, 1):
+                    raise RuntimeError(
+                        f"batch_is_exist failed for {key}: {statuses}"
+                    ) from error
+                if statuses[0] == 0:
+                    return
+            else:
+                is_exist = getattr(self._store, "is_exist", None)
+                if callable(is_exist):
+                    if is_exist(key) == 0:
+                        return
+                elif isinstance(error, KeyError):
+                    return
+            raise
+        manifest_key = self._manifest_key(ref, manifest)
+        # A manifest-only handle needs the payload list if cleanup is retried.
+        _cleanup_keys(self._store, self._payload_keys(manifest), strict=True)
+        _cleanup_keys(self._store, [manifest_key], strict=True)
 
     def resolve_manifest(
         self, ref: RemoteBundleRef | Mapping[str, Any]
@@ -1270,7 +1297,6 @@ def _is_duplicate_buffer_registration(status: Any) -> bool:
 
 
 def _cleanup_keys(store: BundleStore, keys: Sequence[str], strict: bool) -> None:
-    errors = []
     pending_keys = list(dict.fromkeys(keys))
     batch_remove = getattr(store, "batch_remove", None)
     if callable(batch_remove) and pending_keys:
@@ -1283,20 +1309,16 @@ def _cleanup_keys(store: BundleStore, keys: Sequence[str], strict: bool) -> None
                 raise RuntimeError(
                     f"batch_remove returned {len(results)} results for {len(pending_keys)} keys"
                 )
-            failed_results = [
-                (key, status)
+            pending_keys = [
+                key
                 for key, status in zip(pending_keys, results)
                 if status not in (None, 0, MISSING_OBJECT_ERROR)
             ]
-            if not failed_results:
-                return
-            errors.extend(failed_results)
-            pending_keys = [key for key, _status in failed_results]
         except Exception:
             if strict:
                 raise
 
-    retry_errors = []
+    errors = []
     for key in pending_keys:
         try:
             status = store.remove(key, force=True)
@@ -1307,9 +1329,7 @@ def _cleanup_keys(store: BundleStore, keys: Sequence[str], strict: bool) -> None
                 raise
             continue
         if status not in (None, 0, MISSING_OBJECT_ERROR):
-            retry_errors.append((key, status))
-    if retry_errors:
-        errors = retry_errors
+            errors.append((key, status))
     if errors and strict:
         raise RuntimeError(
             f"failed to remove {len(errors)} Mooncake keys: {errors[:3]}"

@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "allocation_strategy.h"
@@ -171,8 +172,8 @@ class ScopedSegmentAccess {
                             size_t& capacity);
 
     /**
-     * @brief Check whether the named segment still has allocated memory,
-     * including when it no longer accepts new allocations.
+     * @brief Check whether any registration under this name still has
+     * allocated memory, including those closed to new allocations.
      * @param segment_name Name of the mounted segment to check.
      * @return True if the segment has allocated memory. False if the segment
      * is missing or has no allocated memory.
@@ -221,7 +222,19 @@ class ScopedSegmentAccess {
     ErrorCode SetSegmentStatusByName(const std::string& segment_name,
                                      SegmentStatus status);
 
+    // An explicit job owns the name until it finishes, even if the last
+    // registration is removed before the job reaches a terminal state.
+    bool IsDrainSourceFenced(const std::string& segment_name) const;
+    void FenceDrainSource(const std::string& segment_name);
+    void ReleaseDrainSourceFence(const std::string& segment_name);
+
+    // Drain jobs own a source name, which may contain several mounted IDs.
+    // Preserve already-drained registrations when closing them to allocation.
+    void SetDrainSourceStatus(const std::string& segment_name,
+                              SegmentStatus status);
+
    private:
+    ErrorCode SetSegmentStatus(MountedSegment& mounted, SegmentStatus status);
     void ReindexSegmentNameAfterRemoval(const UUID& removed_segment_id,
                                         const std::string& segment_name);
 
@@ -442,6 +455,8 @@ class SegmentManager {
         client_by_name_;  // segment name -> client_id
     std::unordered_map<std::string, UUID>
         segment_id_by_name_;             // segment name -> segment_id
+    std::unordered_map<std::string, std::set<UUID>> registrations_by_name_;
+    std::unordered_set<std::string> fenced_drain_sources_;
     HostSegmentIndex segments_by_host_;  // host_id -> segment name -> segment
                                          // ids for allocatable segments
     friend class ScopedSegmentAccess;

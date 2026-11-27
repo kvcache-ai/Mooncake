@@ -450,7 +450,7 @@ skills, Mooncake provides built-in playbooks for common development tasks:
 | Skill | Use it for |
 |-------|------------|
 | `/mooncake-troubleshoot` | Diagnose services, RDMA, environment variables, and runtime logs. |
-| `/mooncake-ci-local` | Run pre-PR local validation with Mooncake's CI script. |
+| `/mooncake-ci-local` | Run the local checks from Linux PR CI before opening a PR. |
 | `/mooncake-api` | Work with Mooncake Store, Transfer Engine, and EP/Backend Python APIs. |
 
 Install them from the Claude Code plugin marketplace without cloning the full
