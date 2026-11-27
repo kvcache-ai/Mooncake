@@ -671,6 +671,7 @@ task-congestion-status-api
 :maxdepth: 1
 
 transfer-engine-bench-tuning
+rdma-pxn-samerail-send
 :::
 
 ## Completion notification
