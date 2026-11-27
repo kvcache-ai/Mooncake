@@ -1,4 +1,4 @@
-# Mooncake Store High Availability Design
+# High Availability Design
 
 ## Overview
 

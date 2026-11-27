@@ -332,7 +332,7 @@ tests instead of starting Redis or Master processes.
 
 ### Snapshot & Restore
 
-The legacy Master-generated snapshot and restore path has been removed. HA recovery uses the standby-generated batch OpLog snapshot path. For its capture, verification, fallback, suffix replay, and pruning design, see [Mooncake Store High Availability Design](../design/store/high-availability.md#snapshot-and-restore).
+The legacy Master-generated snapshot and restore path has been removed. HA recovery uses the standby-generated batch OpLog snapshot path. For its capture, verification, fallback, suffix replay, and pruning design, see [High Availability Design](../design/store/high-availability.md#snapshot-and-restore).
 
 ---
 
@@ -558,7 +558,7 @@ snapshot_interval_seconds: 600
 snapshot_object_store_type: "local"
 ```
 
-The snapshot configuration above enables a Standby-produced baseline and OpLog suffix replay. The bootstrap and promotion sequences are covered in [Mooncake Store High Availability Design](../design/store/high-availability.md#role-and-serving-lifecycle).
+The snapshot configuration above enables a Standby-produced baseline and OpLog suffix replay. The bootstrap and promotion sequences are covered in [High Availability Design](../design/store/high-availability.md#role-and-serving-lifecycle).
 
 For multi-host deployments using `local`, every recovery candidate must access the **same persistent snapshot data** through `MOONCAKE_SNAPSHOT_LOCAL_PATH`. Identically named directories on separate local disks do not satisfy this requirement; use shared durable storage or a shared snapshot object store.
 
