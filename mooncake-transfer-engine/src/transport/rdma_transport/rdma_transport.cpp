@@ -2235,6 +2235,10 @@ RdmaTransport::SegmentID RdmaTransport::getSegmentID(
     return metadata_->getSegmentID(segment_name);
 }
 
+bool RdmaTransport::notifyEnabled() const {
+    return notify_enabled_.value_or(globalConfig().rdma_notify_enabled);
+}
+
 int RdmaTransport::sendNativeNotify(
     const std::string &peer_server_name,
     const TransferMetadata::NotifyDesc &notify) {

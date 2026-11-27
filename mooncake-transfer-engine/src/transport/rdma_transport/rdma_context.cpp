@@ -380,8 +380,8 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
         cq_list_[i].native = cq;
     }
 
-    native_notify_enabled_ = globalConfig().rdma_notify_enabled &&
-                             std::string(engine_.getName()) == "rdma";
+    native_notify_enabled_ =
+        engine_.notifyEnabled() && std::string(engine_.getName()) == "rdma";
     if (native_notify_enabled_) {
         notify_cq_ = ibv_create_cq(context_, globalConfig().max_cqe, nullptr,
                                    nullptr, 0);

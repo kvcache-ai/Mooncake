@@ -20,6 +20,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -108,6 +109,12 @@ class MultiTransport {
     // See TransferEngine::drainCompletions().
     Status drainCompletions(std::vector<BatchCompletion> &out);
 
+    // Passed to the rdma or rdma_twosided transport installed afterwards; see
+    // TransferEngine::setRdmaNotifyEnabled().
+    void setRdmaNotifyEnabled(std::optional<bool> enabled) {
+        rdma_notify_enabled_ = enabled;
+    }
+
     Transport *installTransport(const std::string &proto,
                                 std::shared_ptr<Topology> topo);
 
@@ -188,6 +195,7 @@ class MultiTransport {
    private:
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
+    std::optional<bool> rdma_notify_enabled_;
     std::map<std::string, std::shared_ptr<Transport>> transport_map_;
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;

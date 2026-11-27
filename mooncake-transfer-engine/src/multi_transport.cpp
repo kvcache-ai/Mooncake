@@ -1129,6 +1129,8 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         } else {
             transport = new RdmaTwoSidedTransport();
         }
+        static_cast<RdmaTransport*>(transport)->setNotifyEnabled(
+            rdma_notify_enabled_);
     }
 #ifdef USE_UB
     else if (std::string(proto) == "ub") {

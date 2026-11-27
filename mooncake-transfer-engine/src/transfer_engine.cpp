@@ -405,6 +405,10 @@ void TransferEngine::setAutoDiscover(const AutoDiscoverConfig& config) {
     impl_->setAutoDiscover(config);
 }
 
+void TransferEngine::setRdmaNotifyEnabled(bool enabled) {
+    impl_->setRdmaNotifyEnabled(enabled);
+}
+
 void* TransferEngine::getBaseAddr() { return impl_->getBaseAddr(); }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
@@ -1298,6 +1302,10 @@ void TransferEngine::setAutoDiscover(bool auto_discover) {
 
 void TransferEngine::setAutoDiscover(const AutoDiscoverConfig& config) {
     if (!use_tent_) impl_->setAutoDiscover(config);
+}
+
+void TransferEngine::setRdmaNotifyEnabled(bool enabled) {
+    if (!use_tent_) impl_->setRdmaNotifyEnabled(enabled);
 }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
