@@ -6,6 +6,73 @@ use mooncake_store_route::{
 };
 
 impl RouteControlTransport for ControlPlaneClient {
+    fn send_route_control_batch(
+        &self,
+        requests: Vec<(ClientLease, RouteControlRequest)>,
+    ) -> Vec<Result<RouteControlResponse>> {
+        use futures_util::StreamExt;
+
+        if requests.len() <= 1 {
+            return requests
+                .into_iter()
+                .map(|(lease, request)| self.send_route_control(&lease, request))
+                .collect();
+        }
+        if requests.iter().any(|(_, request)| {
+            !matches!(
+                request,
+                RouteControlRequest::BatchGet { .. } | RouteControlRequest::BatchContains { .. }
+            )
+        }) {
+            return requests
+                .into_iter()
+                .map(|(lease, request)| self.send_route_control(&lease, request))
+                .collect();
+        }
+        let profiling_parent = crate::observability::ProfilingSpan::current_parent();
+        self.block_on_control(async {
+            let requests = requests.into_iter().map(|(lease, request)| {
+                let profiling_parent = profiling_parent.as_ref();
+                async move {
+                    let tracker =
+                        OperationTracker::new_detached(request.operation(), profiling_parent);
+                    let result = match request.empty_response() {
+                        Some(response) => Ok(response),
+                        None => match request {
+                            RouteControlRequest::BatchGet {
+                                namespace,
+                                authority,
+                                keys,
+                            } => {
+                                self.send_route_batch_get_async(&lease, namespace, authority, keys)
+                                    .await
+                            }
+                            RouteControlRequest::BatchContains {
+                                namespace,
+                                authority,
+                                keys,
+                                include_presence,
+                            } => {
+                                self.send_route_batch_contains_async(
+                                    &lease,
+                                    namespace,
+                                    authority,
+                                    keys,
+                                    include_presence,
+                                )
+                                .await
+                            }
+                            _ => unreachable!("only read requests are batched asynchronously"),
+                        },
+                    };
+                    tracker.finish(&result, 0);
+                    result
+                }
+            });
+            futures_util::StreamExt::collect(futures_util::stream::iter(requests).buffered(8)).await
+        })
+    }
+
     fn send_route_control(
         &self,
         lease: &ClientLease,
@@ -194,19 +261,21 @@ impl ControlPlaneClient {
 
     fn block_on_control<Fut, T>(&self, future: Fut) -> T
     where
-        Fut: std::future::Future<Output = T> + Send + 'static,
-        T: Send + 'static,
+        Fut: std::future::Future<Output = T> + Send,
+        T: Send,
     {
         let handle = self.runtime_handle();
         if tokio::runtime::Handle::try_current().is_ok() {
-            let thread = std::thread::Builder::new()
-                .name("mooncake-control-client-block-on".to_string())
-                .spawn(move || handle.block_on(future))
-                .expect("control plane blocking bridge thread should spawn");
-            return match thread.join() {
-                Ok(output) => output,
-                Err(payload) => std::panic::resume_unwind(payload),
-            };
+            return std::thread::scope(|scope| {
+                let thread = std::thread::Builder::new()
+                    .name("mooncake-control-client-block-on".to_string())
+                    .spawn_scoped(scope, move || handle.block_on(future))
+                    .expect("control plane blocking bridge thread should spawn");
+                match thread.join() {
+                    Ok(output) => output,
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            });
         }
         handle.block_on(future)
     }
@@ -281,18 +350,38 @@ impl ControlPlaneClient {
         keys: Vec<ObjectKey>,
         include_presence: bool,
     ) -> Result<RouteControlResponse> {
+        self.block_on_control(self.send_route_batch_contains_async(
+            lease,
+            namespace,
+            authority,
+            keys,
+            include_presence,
+        ))
+    }
+
+    async fn send_route_batch_contains_async(
+        &self,
+        lease: &ClientLease,
+        namespace: String,
+        authority: ClientStableId,
+        keys: Vec<ObjectKey>,
+        include_presence: bool,
+    ) -> Result<RouteControlResponse> {
         let request = pb::BatchContainsRoutesRequest {
             namespace,
             authority: authority.0.clone(),
             keys: keys.iter().map(|key| key.0.clone()).collect(),
             include_presence,
         };
-        match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
-            request_id,
-            body: Some(pb::control_stream_request::Body::RouteContains(
-                request.clone(),
-            )),
-        }) {
+        match self
+            .stream_request_async(lease, |request_id| pb::ControlStreamRequest {
+                request_id,
+                body: Some(pb::control_stream_request::Body::RouteContains(
+                    request.clone(),
+                )),
+            })
+            .await
+        {
             Ok(reply) => {
                 decode_error(reply.error)?;
                 let pb::control_stream_reply::Body::RouteContains(reply) =
@@ -318,13 +407,25 @@ impl ControlPlaneClient {
                 );
             }
         }
-        let reply = self.rpc_for_lease(lease, move |mut client| async move {
-            client.batch_contains_routes(Request::new(request)).await
-        })?;
+        let reply = self
+            .rpc_for_lease_async(lease, move |mut client| async move {
+                client.batch_contains_routes(Request::new(request)).await
+            })
+            .await?;
         decode_route_batch_contains_reply(reply, include_presence)
     }
 
     fn send_route_batch_get(
+        &self,
+        lease: &ClientLease,
+        namespace: String,
+        authority: ClientStableId,
+        keys: Vec<ObjectKey>,
+    ) -> Result<RouteControlResponse> {
+        self.block_on_control(self.send_route_batch_get_async(lease, namespace, authority, keys))
+    }
+
+    async fn send_route_batch_get_async(
         &self,
         lease: &ClientLease,
         namespace: String,
@@ -336,10 +437,13 @@ impl ControlPlaneClient {
             authority: authority.0.clone(),
             keys: keys.iter().map(|key| key.0.clone()).collect(),
         };
-        match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
-            request_id,
-            body: Some(pb::control_stream_request::Body::RouteGet(request.clone())),
-        }) {
+        match self
+            .stream_request_async(lease, |request_id| pb::ControlStreamRequest {
+                request_id,
+                body: Some(pb::control_stream_request::Body::RouteGet(request.clone())),
+            })
+            .await
+        {
             Ok(reply) => {
                 decode_error(reply.error)?;
                 let pb::control_stream_reply::Body::RouteGet(reply) =
@@ -364,9 +468,11 @@ impl ControlPlaneClient {
                 );
             }
         }
-        let reply = self.rpc_for_lease(lease, move |mut client| async move {
-            client.batch_get_routes(Request::new(request)).await
-        })?;
+        let reply = self
+            .rpc_for_lease_async(lease, move |mut client| async move {
+                client.batch_get_routes(Request::new(request)).await
+            })
+            .await?;
         decode_route_batch_get_reply(reply)
     }
 
@@ -1305,7 +1411,7 @@ impl ControlPlaneClient {
         result
     }
 
-    fn stream_session_for(
+    async fn stream_session_for_async(
         &self,
         lease: &ClientLease,
         address: &str,
@@ -1321,9 +1427,9 @@ impl ControlPlaneClient {
             self.streams.lock().remove(address);
         }
 
-        let channel = self.channel_for(lease)?;
+        let channel = self.channel_for_async(lease).await?;
         let request_timeout = self.request_timeout;
-        let session = self.block_on_control(async move {
+        let session = async move {
             tokio::time::timeout(request_timeout, async move {
                 let (sender, receiver) = mpsc::channel(128);
                 let outbound = ReceiverStream::new(receiver);
@@ -1345,7 +1451,8 @@ impl ControlPlaneClient {
             })
             .await
             .map_err(|_| control_timeout_error("control stream open", request_timeout))?
-        })?;
+        }
+        .await?;
         self.streams
             .lock()
             .insert(address.to_string(), session.clone());
@@ -1374,22 +1481,28 @@ impl ControlPlaneClient {
     fn stream_request(
         &self,
         lease: &ClientLease,
-        build: impl Fn(u64) -> pb::ControlStreamRequest,
+        build: impl Fn(u64) -> pb::ControlStreamRequest + Send + Sync,
+    ) -> Result<pb::ControlStreamReply> {
+        self.block_on_control(self.stream_request_async(lease, build))
+    }
+
+    async fn stream_request_async(
+        &self,
+        lease: &ClientLease,
+        build: impl Fn(u64) -> pb::ControlStreamRequest + Send + Sync,
     ) -> Result<pb::ControlStreamReply> {
         let address = control_address(lease)?;
         let mut last_error = None;
         for attempt in 0..2 {
-            let session = self.stream_session_for(lease, &address)?;
+            let session = self.stream_session_for_async(lease, &address).await?;
             let request_id = session.next_request_id.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = oneshot::channel();
             session.pending.lock().insert(request_id, tx);
             let request = build(request_id);
             let sender = session.sender.clone();
-            let send_result = self
-                .block_on_control(async move { sender.send(request).await })
-                .map_err(|error| {
-                    StoreError::Transport(format!("control stream send failed: {error}"))
-                });
+            let send_result = sender.send(request).await.map_err(|error| {
+                StoreError::Transport(format!("control stream send failed: {error}"))
+            });
             if let Err(error) = send_result {
                 session.pending.lock().remove(&request_id);
                 session.closed.store(true, Ordering::Relaxed);
@@ -1405,8 +1518,7 @@ impl ControlPlaneClient {
                 continue;
             }
             let request_timeout = self.request_timeout;
-            let reply = self
-                .block_on_control(async move { tokio::time::timeout(request_timeout, rx).await });
+            let reply = tokio::time::timeout(request_timeout, rx).await;
             let reply = match reply {
                 Ok(reply) => reply.map_err(|_| {
                     StoreError::Transport("control stream response channel closed".to_string())
@@ -1448,6 +1560,10 @@ impl ControlPlaneClient {
     }
 
     pub(super) fn channel_for(&self, lease: &ClientLease) -> Result<Channel> {
+        self.block_on_control(self.channel_for_async(lease))
+    }
+
+    async fn channel_for_async(&self, lease: &ClientLease) -> Result<Channel> {
         let address = control_address(lease)?;
         if let Some(channel) = self.channels.lock().get(&address).cloned() {
             return Ok(channel);
@@ -1462,13 +1578,11 @@ impl ControlPlaneClient {
             .tcp_nodelay(true)
             .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
             .keep_alive_timeout(KEEPALIVE_TIMEOUT);
-        let channel = self
-            .block_on_control(async move { endpoint.connect().await })
-            .map_err(|error| {
-                StoreError::Transport(format!(
-                    "control plane connect to {address} failed: {error}"
-                ))
-            })?;
+        let channel = endpoint.connect().await.map_err(|error| {
+            StoreError::Transport(format!(
+                "control plane connect to {address} failed: {error}"
+            ))
+        })?;
         trace!(address, "opened new control plane channel");
         self.channels.lock().insert(address, channel.clone());
         Ok(channel)
@@ -1483,8 +1597,18 @@ impl ControlPlaneClient {
             std::future::Future<Output = std::result::Result<Response<T>, Status>> + Send + 'static,
         T: Send + 'static,
     {
-        let channel = self.channel_for(lease)?;
-        let result = self.rpc(f, channel);
+        self.block_on_control(self.rpc_for_lease_async(lease, f))
+    }
+
+    async fn rpc_for_lease_async<F, Fut, T>(&self, lease: &ClientLease, f: F) -> Result<T>
+    where
+        F: FnOnce(pb::control_plane_service_client::ControlPlaneServiceClient<Channel>) -> Fut
+            + Send,
+        Fut: std::future::Future<Output = std::result::Result<Response<T>, Status>> + Send,
+        T: Send,
+    {
+        let channel = self.channel_for_async(lease).await?;
+        let result = self.rpc_async(f, channel).await;
         self.invalidate_on_transport_error(lease, &result);
         result
     }
@@ -1498,15 +1622,23 @@ impl ControlPlaneClient {
             std::future::Future<Output = std::result::Result<Response<T>, Status>> + Send + 'static,
         T: Send + 'static,
     {
+        self.block_on_control(self.rpc_async(f, channel))
+    }
+
+    async fn rpc_async<F, Fut, T>(&self, f: F, channel: Channel) -> Result<T>
+    where
+        F: FnOnce(pb::control_plane_service_client::ControlPlaneServiceClient<Channel>) -> Fut
+            + Send,
+        Fut: std::future::Future<Output = std::result::Result<Response<T>, Status>> + Send,
+        T: Send,
+    {
         let client = pb::control_plane_service_client::ControlPlaneServiceClient::new(channel);
         let request_timeout = self.request_timeout;
-        self.block_on_control(async move {
-            tokio::time::timeout(request_timeout, f(client))
-                .await
-                .map_err(|_| control_timeout_error("control unary rpc", request_timeout))?
-                .map(Response::into_inner)
-                .map_err(status_to_store_error)
-        })
+        tokio::time::timeout(request_timeout, f(client))
+            .await
+            .map_err(|_| control_timeout_error("control unary rpc", request_timeout))?
+            .map(Response::into_inner)
+            .map_err(status_to_store_error)
     }
 
     pub(crate) fn clear_channels(&self) {

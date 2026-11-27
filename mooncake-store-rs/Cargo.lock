@@ -1269,6 +1269,7 @@ name = "mooncake-store-client"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "futures-util",
  "io-uring",
  "is-terminal",
  "libc",

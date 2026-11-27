@@ -12,6 +12,7 @@ kvcs-capi = []
 nof-spdk = []
 
 [dependencies]
+futures-util = "0.3"
 libc = "0.2"
 io-uring = "0.7"
 mooncake-store-core           = { path = "../mooncake-store-core" }

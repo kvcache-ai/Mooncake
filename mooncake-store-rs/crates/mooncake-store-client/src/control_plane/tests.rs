@@ -42,6 +42,61 @@ struct TestAuthority {
     routes: Mutex<BTreeMap<String, ObjectRoute>>,
     delete_versions: Mutex<BTreeMap<String, RouteVersion>>,
     route_epoch: AtomicU64,
+    presence_gate: Option<Arc<PresenceGate>>,
+    batch_gate: Option<Arc<BatchGate>>,
+}
+
+#[derive(Default)]
+struct BatchGate {
+    state: Mutex<(usize, usize, bool)>,
+    changed: parking_lot::Condvar,
+}
+
+impl BatchGate {
+    fn enter(&self) {
+        let mut state = self.state.lock();
+        state.0 += 1;
+        state.1 = state.1.max(state.0);
+        while !state.2 {
+            if self
+                .changed
+                .wait_for(&mut state, Duration::from_secs(2))
+                .timed_out()
+            {
+                state.2 = true;
+                self.changed.notify_all();
+            }
+        }
+        state.0 -= 1;
+    }
+}
+
+#[derive(Default)]
+struct PresenceGate {
+    state: Mutex<(usize, bool, bool)>,
+    changed: parking_lot::Condvar,
+}
+
+impl PresenceGate {
+    fn enter(&self) {
+        let mut state = self.state.lock();
+        state.0 += 1;
+        if state.0 == 2 && !state.1 {
+            state.2 = true;
+            state.1 = true;
+            self.changed.notify_all();
+        }
+        while !state.1 {
+            if self
+                .changed
+                .wait_for(&mut state, Duration::from_secs(2))
+                .timed_out()
+            {
+                state.1 = true;
+                self.changed.notify_all();
+            }
+        }
+    }
 }
 
 impl TestAuthority {
@@ -90,6 +145,12 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
         _authority: &ClientStableId,
         keys: &[ObjectKey],
     ) -> Vec<mooncake_store_core::Result<mooncake_store_route::RouteAuthorityPresence>> {
+        if let Some(gate) = &self.presence_gate {
+            gate.enter();
+        }
+        if let Some(gate) = &self.batch_gate {
+            gate.enter();
+        }
         keys.iter()
             .map(|key| {
                 Ok(mooncake_store_route::RouteAuthorityPresence {
@@ -2417,6 +2478,218 @@ fn route_get_preserves_delete_marker_over_control_plane_transport() {
     );
     assert_eq!(live.delete_version, None);
     handle.shutdown();
+}
+
+#[test]
+fn route_contains_overlaps_remote_presence_authorities() {
+    use mooncake_store_core::RouteControlMode;
+    use mooncake_store_route::RouteMembershipProvider;
+    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
+
+    struct Membership(Vec<ClientLease>);
+    impl RouteMembershipProvider for Membership {
+        fn live_clients(
+            &self,
+            _: bool,
+            _: &'static str,
+        ) -> mooncake_store_core::Result<Vec<ClientLease>> {
+            Ok(self.0.clone())
+        }
+        fn reconcile_suspects(&self, _: &[ClientLease]) {}
+        fn is_suspect(&self, _: &ClientRuntimeId) -> bool {
+            false
+        }
+        fn mark_suspect(&self, _: ClientRuntimeId, _: Instant, _: Option<&ClientLease>) {}
+        fn clear_suspect(&self, _: &ClientRuntimeId) {}
+    }
+
+    let gate = Arc::new(PresenceGate::default());
+    let mut handles = Vec::new();
+    let mut leases = Vec::new();
+    for index in 0..2 {
+        let authority = Arc::new(TestAuthority {
+            presence_gate: Some(gate.clone()),
+            ..TestAuthority::default()
+        });
+        authority.insert(sample_route("overlap-live", 7, &sample_owner()));
+        let handle = ControlPlaneHandle::spawn(
+            "127.0.0.1",
+            authority,
+            Arc::new(TestAllocator::default()),
+            Arc::new(TestEviction::default()),
+        )
+        .expect("authority should start");
+        let mut lease = sample_lease(handle.address());
+        lease
+            .endpoints
+            .labels
+            .insert("route".to_string(), "true".to_string());
+        lease.runtime = ClientRuntimeId::new(format!("overlap-authority-{index}"), ClientEpoch(1));
+        leases.push(lease);
+        handles.push(handle);
+    }
+    let mut observer = sample_lease("127.0.0.1:1");
+    observer.runtime = ClientRuntimeId::new("overlap-observer", ClientEpoch(1));
+    let directory = mooncake_store_route::build_route_directory(
+        RouteControlMode::EmbeddedWrh,
+        2,
+        1024 * 1024,
+        Arc::new(InMemoryMetadataBackend::new()),
+        &observer,
+        Arc::new(ControlPlaneClient::new().expect("client should build")),
+        Arc::new(Membership(leases)),
+    );
+    let result = directory
+        .contains_object_routes_bounded(
+            &observer,
+            &[
+                ObjectKey::new("overlap-live"),
+                ObjectKey::new("overlap-missing"),
+                ObjectKey::new("overlap-live"),
+            ],
+        )
+        .expect("contains should complete");
+    assert_eq!(result, vec![true, false, true]);
+    assert!(
+        gate.state.lock().2,
+        "both remote presence requests must enter before either is released"
+    );
+    for handle in &mut handles {
+        handle.shutdown();
+    }
+}
+
+#[test]
+fn route_control_batch_preserves_order_and_individual_errors() {
+    use mooncake_store_route::{RouteControlRequest, RouteControlResponse, RouteControlTransport};
+
+    let authority = Arc::new(TestAuthority::default());
+    authority.insert(sample_route("batch-live", 9, &sample_owner()));
+    authority
+        .delete_versions
+        .lock()
+        .insert("batch-deleted".to_string(), RouteVersion(10));
+    let mut handle = ControlPlaneHandle::spawn(
+        "127.0.0.1",
+        authority,
+        Arc::new(TestAllocator::default()),
+        Arc::new(TestEviction::default()),
+    )
+    .expect("authority should start");
+    let client = ControlPlaneClient::new().expect("client should build");
+    let lease = sample_lease(handle.address());
+    let contains = |keys: &[&str]| RouteControlRequest::BatchContains {
+        namespace: "ns".to_string(),
+        authority: lease.runtime.stable_id.clone(),
+        keys: keys.iter().map(|key| ObjectKey::new(*key)).collect(),
+        include_presence: false,
+    };
+    assert!(client.send_route_control_batch(Vec::new()).is_empty());
+    let single = client.send_route_control_batch(vec![(lease.clone(), contains(&[]))]);
+    assert!(
+        matches!(single.as_slice(), [Ok(RouteControlResponse::BatchContains(items))] if items.is_empty())
+    );
+    let requests = vec![
+        (
+            lease.clone(),
+            contains(&["batch-live", "missing", "batch-live"]),
+        ),
+        (
+            sample_lease("invalid control uri"),
+            contains(&["batch-live"]),
+        ),
+        (
+            lease.clone(),
+            RouteControlRequest::BatchGet {
+                namespace: "ns".to_string(),
+                authority: lease.runtime.stable_id.clone(),
+                keys: vec![ObjectKey::new("batch-deleted")],
+            },
+        ),
+    ];
+    let runtime = RuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime should build");
+    let mut responses = runtime
+        .block_on(async { client.send_route_control_batch(requests) })
+        .into_iter();
+    let RouteControlResponse::BatchContains(items) = responses.next().unwrap().unwrap() else {
+        panic!("first response should contain existence results");
+    };
+    assert_eq!(
+        items
+            .into_iter()
+            .collect::<mooncake_store_core::Result<Vec<_>>>()
+            .unwrap(),
+        vec![true, false, true]
+    );
+    assert!(matches!(
+        responses.next().unwrap(),
+        Err(StoreError::Transport(_))
+    ));
+    let RouteControlResponse::BatchGet(records) = responses.next().unwrap().unwrap() else {
+        panic!("last response should contain route records");
+    };
+    assert_eq!(
+        records[0].as_ref().unwrap().delete_version,
+        Some(RouteVersion(10))
+    );
+    assert!(responses.next().is_none());
+    handle.shutdown();
+}
+
+#[test]
+fn route_control_batch_limits_inflight_authorities_to_eight() {
+    use mooncake_store_route::{RouteControlRequest, RouteControlResponse, RouteControlTransport};
+
+    let gate = Arc::new(BatchGate::default());
+    let mut handles = Vec::new();
+    let mut requests = Vec::new();
+    for index in 0..10 {
+        let authority = Arc::new(TestAuthority {
+            batch_gate: Some(gate.clone()),
+            ..TestAuthority::default()
+        });
+        authority.insert(sample_route("bounded-live", index + 1, &sample_owner()));
+        let handle = ControlPlaneHandle::spawn(
+            "127.0.0.1",
+            authority,
+            Arc::new(TestAllocator::default()),
+            Arc::new(TestEviction::default()),
+        )
+        .expect("authority should start");
+        requests.push((
+            sample_lease(handle.address()),
+            RouteControlRequest::BatchContains {
+                namespace: "bounded".to_string(),
+                authority: ClientStableId::new(format!("bounded-{index}")),
+                keys: vec![ObjectKey::new("bounded-live")],
+                include_presence: true,
+            },
+        ));
+        handles.push(handle);
+    }
+    let client = ControlPlaneClient::new().expect("client should build");
+    let responses = client.send_route_control_batch(requests);
+    assert_eq!(responses.len(), 10);
+    for (index, response) in responses.into_iter().enumerate() {
+        let RouteControlResponse::BatchGetPresence(records) = response.unwrap() else {
+            panic!("expected presence response");
+        };
+        assert_eq!(
+            records[0].as_ref().unwrap().live_version,
+            Some(RouteVersion(index as u64 + 1))
+        );
+    }
+    assert_eq!(
+        gate.state.lock().1,
+        8,
+        "exactly eight authority requests should overlap"
+    );
+    for handle in &mut handles {
+        handle.shutdown();
+    }
 }
 
 #[test]
