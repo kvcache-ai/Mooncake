@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "common/client_buffer_allocation.h"
+#include "../src/common/client_buffer_allocation_internal.h"
 #include "nof/dma_buffer_allocator.h"
 
 #include <algorithm>
@@ -58,7 +59,8 @@ class SizedHostFreeTest : public ::testing::Test {
         unsetenv("MC_STORE_FREE_THREADS");
     }
     // Keep partial edge pages while satisfying aligned_alloc(64, size).
-    static constexpr size_t size = (16ull << 30) + 64;
+    static constexpr size_t threshold = 32ull << 20;
+    static constexpr size_t size = threshold + 64;
 };
 
 TEST_F(SizedHostFreeTest, DiscardsOnlyFullOwnedPagesAndJoinsBeforeFree) {
@@ -70,7 +72,7 @@ TEST_F(SizedHostFreeTest, DiscardsOnlyFullOwnedPagesAndJoinsBeforeFree) {
     uintptr_t end = begin + size;
     begin += (page - begin % page) % page;
     end -= end % page;
-    free_memory("tcp", ptr, nullptr, size);
+    detail::free_memory("tcp", ptr, nullptr, size, threshold);
     ASSERT_EQ(ranges.size(), 4u);
     std::sort(ranges.begin(), ranges.end());
     uintptr_t next = begin;
@@ -93,7 +95,7 @@ TEST_F(SizedHostFreeTest, DisabledInvalidAndUnsizedFreeKeepOriginalPath) {
         ASSERT_EQ(setenv("MC_STORE_FREE_THREADS", setting, 1), 0);
         void *ptr = allocate_buffer_allocator_memory(size, "tcp", 64);
         ASSERT_NE(ptr, nullptr);
-        free_memory("tcp", ptr, nullptr, size);
+        detail::free_memory("tcp", ptr, nullptr, size, threshold);
         EXPECT_TRUE(ranges.empty());
     }
     ASSERT_EQ(setenv("MC_STORE_FREE_THREADS", "4", 1), 0);
@@ -116,7 +118,7 @@ TEST_F(SizedHostFreeTest, AdviceFailureStillReleasesAllocation) {
     void *ptr = allocate_buffer_allocator_memory(allocation_size, "tcp", page);
     ASSERT_NE(ptr, nullptr);
     const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
-    free_memory("tcp", ptr, nullptr, allocation_size);
+    detail::free_memory("tcp", ptr, nullptr, allocation_size, threshold);
     ASSERT_EQ(ranges.size(), 4u);
     unsigned char residency = 0;
     EXPECT_EQ(mincore(reinterpret_cast<void *>(address), page, &residency), -1);
@@ -135,7 +137,7 @@ TEST_F(SizedHostFreeTest, SizedReleasePreservesDmaAllocatorOwnership) {
     ASSERT_EQ(setenv("MC_STORE_FREE_THREADS", "4", 1), 0);
     void *ptr = allocate_buffer_allocator_memory(size, "tcp", 64, &allocator);
     ASSERT_NE(ptr, nullptr);
-    free_memory("tcp", ptr, &allocator, size);
+    detail::free_memory("tcp", ptr, &allocator, size, threshold);
     EXPECT_EQ(allocator.freed, ptr);
     EXPECT_TRUE(ranges.empty());
 }

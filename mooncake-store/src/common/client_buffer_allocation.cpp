@@ -1,5 +1,6 @@
 #include "common/client_buffer_allocation.h"
 
+#include "client_buffer_allocation_internal.h"
 #include "config.h"
 #include "config/hugepage_config.h"
 #include "host_memory_affinity.h"
@@ -36,7 +37,6 @@ namespace {
 // pinned registrations have already been released. Keep partial edge pages
 // intact: they may also contain allocator bookkeeping or another allocation.
 void discard_owned_pages(void *ptr, size_t total_size) {
-    if (!ptr || total_size < (16ull << 30)) return;
     const char *setting = std::getenv("MC_STORE_FREE_THREADS");
     if (!setting) return;
     const auto threads = TryParseInteger<size_t>(setting);
@@ -51,6 +51,7 @@ void discard_owned_pages(void *ptr, size_t total_size) {
     const size_t page = static_cast<size_t>(page_size);
     const uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
     const size_t skip = (page - base % page) % page;
+    if (total_size <= skip) return;
     const size_t pages = (total_size - skip) / page;
     const size_t count = std::min(*threads, pages);
     if (count < 2) return;
@@ -202,6 +203,12 @@ void free_memory(const std::string &protocol, void *ptr,
 
 void free_memory(const std::string &protocol, void *ptr,
                  DmaBufferAllocator *dma_allocator, size_t total_size) {
+    detail::free_memory(protocol, ptr, dma_allocator, total_size, 16ull << 30);
+}
+
+void detail::free_memory(const std::string &protocol, void *ptr,
+                         DmaBufferAllocator *dma_allocator, size_t total_size,
+                         size_t min_discard_size) {
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_free_memory(protocol, ptr);
@@ -238,7 +245,8 @@ void free_memory(const std::string &protocol, void *ptr,
 #endif
     return;
 #endif
-    discard_owned_pages(ptr, total_size);
+    if (ptr && total_size >= min_discard_size)
+        discard_owned_pages(ptr, total_size);
     free(ptr);
 }
 

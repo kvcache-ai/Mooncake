@@ -772,12 +772,14 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             // Bound each driver call even for very large pools. A worker
             // completes all NICs for one tile before moving to its next tile.
             constexpr size_t host_chunk_limit = size_t{2} * 1024 * 1024 * 1024;
+            constexpr size_t min_host_chunk = 256 * 1024 * 1024;
             const size_t workers = globalConfig().host_reg_threads;
             const size_t per_worker = len / workers + (len % workers != 0);
             const size_t block = (per_worker / host_alignment +
                                   (per_worker % host_alignment != 0)) *
                                  host_alignment;
-            plan_chunk_limit = std::min(block, host_chunk_limit);
+            plan_chunk_limit =
+                std::clamp(block, min_host_chunk, host_chunk_limit);
             if (chunk_limit)
                 plan_chunk_limit = std::min(plan_chunk_limit, chunk_limit);
         }
@@ -973,6 +975,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // pre-touch thread only adds a DMA-BUF import (and a BAR1 mapping) of its
     // block, so skip it there.
     const bool do_pre_touch =
+        !force_sequential &&
         dmabuf_exp.method != DmabufExport::Method::kDmabufReg &&
         context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
         length >= (size_t)4 * 1024 * 1024 * 1024;

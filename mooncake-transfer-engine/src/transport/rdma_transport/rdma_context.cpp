@@ -947,14 +947,23 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access,
                                       const DmabufExport &exp) {
     // Placeholder context for a failed RNIC: no PD to register against.
     if (!pd_) return 0;
+    MemoryRegionMap::iterator region;
+    {
+        RWSpinlock::WriteGuard guard(memory_regions_lock_);
+        auto [iter, inserted] = memory_region_map_.try_emplace(
+            reinterpret_cast<uintptr_t>(addr),
+            MemoryRegionMeta{addr, length, nullptr, true});
+        if (!inserted) return ERR_ADDRESS_OVERLAPPED;
+        region = iter;
+    }
     MemoryRegionMeta mrMeta;
     int ret = registerMemoryRegionInternal(addr, length, access, exp, mrMeta);
-    if (ret != 0) {
-        return ret;
-    }
     RWSpinlock::WriteGuard guard(memory_regions_lock_);
-    memory_region_map_[reinterpret_cast<uintptr_t>(mrMeta.addr)] = mrMeta;
-    return 0;
+    if (ret == 0)
+        region->second = mrMeta;
+    else
+        memory_region_map_.erase(region);
+    return ret;
 }
 
 int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
@@ -973,27 +982,30 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
 }
 
 int RdmaContext::unregisterMemoryRegion(void *addr) {
-    MemoryRegionMap::node_type region;
+    MemoryRegionMap::iterator region;
+    ibv_mr *mr;
     {
         RWSpinlock::WriteGuard guard(memory_regions_lock_);
-        auto iter =
-            findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
-        if (iter == memory_region_map_.end()) return 0;
-        region = memory_region_map_.extract(iter);
+        region = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
+        if (region == memory_region_map_.end()) return 0;
+        if (region->second.busy) return ERR_CONTEXT;
+        mr = region->second.mr;
+        if (!mr) {
+            memory_region_map_.erase(region);
+            return 0;
+        }
+        region->second.busy = true;
+        region->second.mr = nullptr;
     }
-    // A non-paired Data Direct NIC stores a placeholder without an MR.
-    if (!region.mapped().mr) return 0;
-    // Deregistration can spend seconds unpinning a large host range. Remove
-    // its keys before releasing the map lock, then let disjoint ranges unpin
-    // concurrently without blocking lookups for still-registered buffers.
-    // As with registration, the caller must serialize the lifetime of the
-    // same buffer and quiesce transfers before unregistering it.
-    if (ibv_dereg_mr(region.mapped().mr)) {
-        RWSpinlock::WriteGuard guard(memory_regions_lock_);
-        memory_region_map_.insert(std::move(region));
+    const int ret = ibv_dereg_mr(mr);
+    RWSpinlock::WriteGuard guard(memory_regions_lock_);
+    if (ret) {
+        region->second.mr = mr;
+        region->second.busy = false;
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
     }
+    memory_region_map_.erase(region);
     // libibverbs restores the fork state of plain host MRs. Device and dma-buf
     // ranges never carried MADV_DONTFORK and must not receive MADV_DOFORK here.
     return 0;

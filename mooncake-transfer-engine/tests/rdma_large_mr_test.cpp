@@ -323,7 +323,7 @@ class RDMAParallelHostMrTest : public ::testing::Test {
         EXPECT_EQ(memcmp(source, target, bytes), 0);
     }
 
-    void checkTransfers(size_t expected_chunks) {
+    void checkTransfers(size_t expected_chunks, size_t length = size) {
         auto desc = engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
         ASSERT_NE(desc, nullptr);
         ASSERT_EQ(desc->buffers.size(), expected_chunks);
@@ -334,13 +334,18 @@ class RDMAParallelHostMrTest : public ::testing::Test {
             transfer(0, seam - 32767, true);
             transfer(seam - 32767, 1ull << 20, false);
         }
-        transfer(0, size - 65539, false);
+        transfer(0, length - 65539, false);
     }
 };
 
-TEST_F(RDMAParallelHostMrTest, SplitsHostBufferBelowDeviceLimit) {
-    ASSERT_EQ(engine->registerLocalMemory(addr, size, "cpu:0"), 0);
-    checkTransfers(4u);
+TEST_F(RDMAParallelHostMrTest, SixtyFourWorkersUseFourChunksForOneGiB) {
+    constexpr size_t length = 1ull << 30;
+    globalConfig().host_reg_threads = 64;
+    ASSERT_EQ(engine->registerLocalMemory(addr, length, "cpu:0"), 0);
+    ASSERT_NO_FATAL_FAILURE(checkTransfers(4u, length));
+    auto desc = engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    for (const auto &buffer : desc->buffers)
+        EXPECT_EQ(buffer.length, length / 4);
     ASSERT_EQ(engine->unregisterLocalMemory(addr), 0);
     expectNoRegions();
 }
@@ -389,6 +394,7 @@ TEST_F(RDMAParallelHostMrTest,
     ASSERT_EQ(context.registerMemoryRegion(other, 4096, IBV_ACCESS_LOCAL_WRITE),
               0);
     const uint32_t key = context.lkey(addr);
+    const uint32_t remote_key = context.rkey(addr);
     const uint32_t other_key = context.lkey(other);
     {
         std::lock_guard<std::mutex> lock(held_dereg_mutex);
@@ -405,6 +411,12 @@ TEST_F(RDMAParallelHostMrTest,
                                            [] { return held_dereg_entered; }));
     }
     auto independent = std::async(std::launch::async, [&] {
+        EXPECT_EQ(context.lkey(addr), 0u);
+        EXPECT_EQ(context.rkey(addr), 0u);
+        EXPECT_EQ(
+            context.registerMemoryRegion(addr, 4096, IBV_ACCESS_LOCAL_WRITE),
+            ERR_ADDRESS_OVERLAPPED);
+        EXPECT_NE(context.unregisterMemoryRegion(addr), 0);
         const uint32_t observed = context.lkey(other);
         const int rc = context.unregisterMemoryRegion(other);
         return std::pair{observed, rc};
@@ -422,9 +434,13 @@ TEST_F(RDMAParallelHostMrTest,
     EXPECT_EQ(observed, other_key);
     EXPECT_EQ(rc, 0);
     EXPECT_EQ(context.lkey(addr), key);
+    EXPECT_EQ(context.rkey(addr), remote_key);
     EXPECT_EQ(RdmaContextTestPeer::memoryRegionCount(context), 1u);
     EXPECT_EQ(context.unregisterMemoryRegion(addr), 0);
     EXPECT_EQ(RdmaContextTestPeer::memoryRegionCount(context), 0u);
+    ASSERT_EQ(context.registerMemoryRegion(addr, 4096, IBV_ACCESS_LOCAL_WRITE),
+              0);
+    EXPECT_EQ(context.unregisterMemoryRegion(addr), 0);
 }
 
 TEST_F(RDMAParallelHostMrTest, ReleasesDataDirectPlaceholderWithoutVerbs) {
