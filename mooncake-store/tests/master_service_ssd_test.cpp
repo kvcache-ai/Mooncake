@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -516,6 +517,55 @@ TEST_F(LocalDiskUnmountInterleavingTest,
     ASSERT_TRUE(late_replicas.has_value());
     ASSERT_EQ(1u, late_replicas.value().replicas.size());
     EXPECT_TRUE(late_replicas.value().replicas[0].is_local_disk_replica());
+}
+
+TEST_F(MasterServiceSSDTest, RemountSurvivesRetiredLocalDiskCleanup) {
+    auto service = CreateSsdAwareOffloadService();
+    MasterServiceTestPeer::ReplicaCleanupWorker(*service).Stop();
+    const UUID owner = generate_uuid();
+    const UUID healthy = generate_uuid();
+    const auto& tenant = TenantId::Default();
+    const auto add = [&](const UUID& client, const char* key,
+                         const char* endpoint) {
+        return service->NotifyOffloadSuccess(
+            client, {{.tenant_id = tenant.value(), .key = key, .size = 1024}},
+            {{.data_size = 1024, .transport_endpoint = endpoint}});
+    };
+    ASSERT_TRUE(service->MountLocalDiskSegment(owner, true).has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(healthy, true).has_value());
+    ASSERT_TRUE(add(owner, "old", "old-disk").has_value());
+    ASSERT_TRUE(add(owner, "replace", "old-disk").has_value());
+    ASSERT_TRUE(add(healthy, "healthy", "healthy-disk").has_value());
+    ASSERT_TRUE(service->GetReplicaList("old", tenant).has_value());
+    auto& metrics = MasterMetricManager::instance();
+    const auto before_unmount = metrics.get_file_cache_nums();
+
+    ASSERT_TRUE(service->UnmountLocalDiskSegment(owner).has_value());
+    EXPECT_FALSE(service->GetReplicaList("old", tenant).has_value());
+    EXPECT_EQ(before_unmount, metrics.get_file_cache_nums());
+
+    ASSERT_TRUE(service->MountLocalDiskSegment(owner, true).has_value());
+    ASSERT_TRUE(add(owner, "replace", "new-disk").has_value());
+    ASSERT_TRUE(add(owner, "new", "new-disk").has_value());
+    MasterServiceTestPeer(*service).ClearInvalidHandles();
+
+    EXPECT_FALSE(service->GetReplicaList("old", tenant).has_value());
+    for (const auto* key : {"replace", "new", "healthy"}) {
+        const auto replicas = service->GetReplicaList(key, tenant);
+        ASSERT_TRUE(replicas.has_value()) << key;
+        ASSERT_EQ(1u, replicas->replicas.size()) << key;
+        ASSERT_TRUE(replicas->replicas.front().is_local_disk_replica()) << key;
+        EXPECT_EQ(
+            key == std::string_view("healthy") ? "healthy-disk" : "new-disk",
+            replicas->replicas.front()
+                .get_local_disk_descriptor()
+                .transport_endpoint);
+    }
+    const auto usage =
+        MasterServiceTestPeer::LocalSsdManager(*service).GetUsage(owner);
+    ASSERT_TRUE(usage.has_value());
+    EXPECT_EQ(2048, usage->used_bytes);
+    EXPECT_EQ(before_unmount, metrics.get_file_cache_nums());
 }
 
 // Regression test for issue #2997.

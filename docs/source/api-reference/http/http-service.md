@@ -1093,6 +1093,11 @@ replica is read and pushed by that process, so it has to stay alive for the
 reads the master handed out before the deregistration. Offloading is stopped for
 good when this is called; the store is expected to exit afterwards.
 
+With OpLog disabled, new lookups skip the retired SSD mount before the master
+acknowledges the unmount. The master can continue reclaiming that mount's
+metadata in the background. With OpLog enabled, the master scans the metadata
+and submits the replica removals to OpLog before acknowledging the unmount.
+
 Returns success and does nothing when SSD offload is not enabled on this store.
 Safe to call more than once.
 

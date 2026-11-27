@@ -1178,10 +1178,11 @@ class MasterService {
                                                  uint64_t target_bytes);
 
     // Caller holds the Replica owner's retaining guard.
-    auto AddReplicaForRetainedClient(const UUID& client_id,
-                                     const std::string& key,
-                                     const TenantId& tenant_id,
-                                     Replica& replica)
+    auto AddReplicaForRetainedClient(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id, Replica& replica,
+        const ClientSessionSharedPtr& session,
+        const LocalDiskRegistrationPtr* offload_mount = nullptr)
         -> tl::expected<bool, ErrorCode>;
 
     void ClearInvalidHandles();
@@ -1540,6 +1541,7 @@ class MasterService {
     // object's memory replicas whose segment is gone, and the object with them
     // when none is left valid.
     void CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor);
+    void RemoveRetiredLocalDiskReplicas(MetadataAccessorRW& accessor);
 
     // Discards the namespace's expired processing replicas and expired tasks.
     void DiscardExpiredProcessingReplicas(

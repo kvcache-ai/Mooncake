@@ -115,13 +115,14 @@ bool LocalSsdTaskMailbox::ConsumeRemoveAll() {
 }
 
 ErrorCode LocalSsdManager::RegisterClient(const UUID& client_id,
-                                          bool enable_offloading) {
+                                          bool enable_offloading,
+                                          ClientSessionSharedPtr session) {
     std::unique_lock lock(mutex_);
     if (clients_.contains(client_id)) {
         return ErrorCode::SEGMENT_ALREADY_EXISTS;
     }
-    clients_.emplace(client_id,
-                     std::make_shared<ClientRecord>(enable_offloading));
+    clients_.emplace(client_id, std::make_shared<ClientRecord>(
+                                    enable_offloading, std::move(session)));
     return ErrorCode::OK;
 }
 
@@ -172,12 +173,19 @@ std::optional<int64_t> LocalSsdManager::UnregisterClient(
             return std::nullopt;
         }
         record = std::move(it->second);
+        record->registration->mounted.store(false, std::memory_order_release);
         clients_.erase(it);
     }
 
     std::unique_lock lifecycle_lock(record->lifecycle_mutex);
     MutexLocker stats_lock(&record->stats_mutex);
     return record->total_capacity_bytes;
+}
+
+LocalDiskRegistrationPtr LocalSsdManager::GetRegistration(
+    const UUID& client_id) const {
+    auto client = FindClient(client_id);
+    return client ? client->record->registration : nullptr;
 }
 
 tl::expected<LocalSsdManager::CapacityChange, ErrorCode>
@@ -204,8 +212,9 @@ std::optional<LocalSsdManager::Usage> LocalSsdManager::GetUsage(
     }
     auto& record = *client->record;
     MutexLocker stats_lock(&record.stats_mutex);
-    return Usage{record.total_capacity_bytes,
-                 record.used_bytes.load(std::memory_order_relaxed)};
+    return Usage{
+        record.total_capacity_bytes,
+        record.registration->used_bytes.load(std::memory_order_relaxed)};
 }
 
 bool LocalSsdManager::AdjustUsedBytes(const UUID& client_id, int64_t delta) {
@@ -213,7 +222,8 @@ bool LocalSsdManager::AdjustUsedBytes(const UUID& client_id, int64_t delta) {
     if (!client) {
         return false;
     }
-    client->record->used_bytes.fetch_add(delta, std::memory_order_relaxed);
+    client->record->registration->used_bytes.fetch_add(
+        delta, std::memory_order_relaxed);
     return true;
 }
 
@@ -357,6 +367,10 @@ void LocalSsdManager::Clear() {
     ClientMap clients;
     {
         std::unique_lock lock(mutex_);
+        for (const auto& [_, record] : clients_) {
+            record->registration->mounted.store(false,
+                                                std::memory_order_release);
+        }
         clients.swap(clients_);
     }
     WaitForOperations(clients);

@@ -11,6 +11,7 @@
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 
+#include "client_liveness.h"
 #include "mutex.h"
 #include "tenant_id.h"
 #include "types.h"
@@ -68,8 +69,10 @@ class LocalSsdManager {
         int64_t used_bytes;
     };
 
-    ErrorCode RegisterClient(const UUID& client_id, bool enable_offloading);
+    ErrorCode RegisterClient(const UUID& client_id, bool enable_offloading,
+                             ClientSessionSharedPtr session = nullptr);
     std::optional<int64_t> UnregisterClient(const UUID& client_id);
+    LocalDiskRegistrationPtr GetRegistration(const UUID& client_id) const;
 
     // UUIDs of all registered LocalSSD clients. Used to rebuild client
     // liveness records after an HA snapshot restore.
@@ -109,15 +112,17 @@ class LocalSsdManager {
 
    private:
     struct ClientRecord {
-        explicit ClientRecord(bool enable_offloading)
-            : mailbox(enable_offloading) {}
+        ClientRecord(bool enable_offloading, ClientSessionSharedPtr session)
+            : registration(
+                  std::make_shared<LocalDiskRegistration>(std::move(session))),
+              mailbox(enable_offloading) {}
 
         // Unregistration removes the record from clients_ first, then takes
         // this lock exclusively to wait for operations that already found it.
         mutable std::shared_mutex lifecycle_mutex;
         mutable Mutex stats_mutex;
         int64_t total_capacity_bytes GUARDED_BY(stats_mutex){0};
-        std::atomic<int64_t> used_bytes{0};
+        const std::shared_ptr<LocalDiskRegistration> registration;
         LocalSsdTaskMailbox mailbox;
     };
 
