@@ -128,6 +128,18 @@ struct TreeEndpoint {
     bool operator==(const TreeEndpoint&) const = default;
 };
 
+// Two-shot reuses Simple signals and the shared workspace. Its initial direct
+// path conservatively requires native atomic P2P access for signal updates.
+inline constexpr uint32_t kTwoShotEndpointVersion = 1;
+
+struct TwoShotEndpoint {
+    uint32_t version = kTwoShotEndpointVersion;
+    DeviceUUID device_uuid{};
+    std::vector<DeviceUUID> native_atomic_peer_uuids;
+
+    bool operator==(const TwoShotEndpoint&) const = default;
+};
+
 // Runtime, protocol and algorithm endpoints owned by one communicator.
 struct DeviceGroupEndpoint {
     // Runtime-owned signal slice for synchronizing one GroupView incarnation.
@@ -141,10 +153,12 @@ struct DeviceGroupEndpoint {
     // A plain appended optional would change struct_pack's wire type hash.
     // compatible preserves the #4372 schema; old messages decode as absent.
     struct_pack::compatible<TreeEndpoint, 20260930> tree;
+    struct_pack::compatible<TwoShotEndpoint, 20261030> two_shot;
 
     [[nodiscard]] bool empty() const noexcept {
         return view_epoch_signal_count == 0 && !simple.has_value() &&
-               !ll.has_value() && !one_shot.has_value() && !tree.has_value();
+               !ll.has_value() && !one_shot.has_value() && !tree.has_value() &&
+               !two_shot.has_value();
     }
 
     // Ring is the baseline; LL and one-shot resources are optional.
@@ -264,6 +278,7 @@ enum class DeviceAllReduceAlgorithm : uint8_t {
     Ring = 1,
     OneShot = 2,
     Tree = 3,
+    TwoShot = 4,
 };
 
 // Coordinator-provided upper bounds, in increasing byte order.

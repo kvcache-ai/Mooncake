@@ -16,9 +16,11 @@ parseCollectiveAlgorithm(std::string_view value) {
     if (value == "oneshot")
         return std::optional{DeviceAllReduceAlgorithm::OneShot};
     if (value == "tree") return std::optional{DeviceAllReduceAlgorithm::Tree};
+    if (value == "twoshot")
+        return std::optional{DeviceAllReduceAlgorithm::TwoShot};
     return makePGError(PGErrorCode::InvalidArgument,
                        "MOONCAKE_PG_COLLECTIVE_ALGORITHM must be 'auto', "
-                       "'ring', 'oneshot', or 'tree'");
+                       "'ring', 'oneshot', 'tree', or 'twoshot'");
 }
 
 }  // namespace mooncake
