@@ -140,6 +140,21 @@ class DelayedReadBackend : public BucketStorageBackend {
     std::atomic<size_t> loads{0};
 };
 
+class FailingScanBackend : public BucketStorageBackend {
+   public:
+    using BucketStorageBackend::BucketStorageBackend;
+
+    tl::expected<void, ErrorCode> ScanMeta(
+        const std::function<ErrorCode(
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas)>& handler) override {
+        ++scan_calls;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    std::atomic<int> scan_calls{0};
+};
+
 class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
@@ -448,16 +463,21 @@ class FileStorageTest : public ::testing::Test {
         ASSERT_TRUE(backend->Init());
         ASSERT_TRUE(storage.RegisterLocalMemory());
         storage.enable_offloading_ = true;
-        ASSERT_TRUE(storage.Heartbeat());
+        bool productive = false;
+        ASSERT_TRUE(storage.Heartbeat(true, &productive));
+        EXPECT_TRUE(productive);
         ASSERT_EQ(1u, storage.deferred_task_by_storage_key_.size());
         EXPECT_EQ(1u, backend->UngroupedOffloadingObjectsSize());
         std::vector<OffloadTaskItem> fresh;
         ASSERT_TRUE(client->OffloadObjectHeartbeat(true, fresh));
         ASSERT_TRUE(fresh.empty());
 
-        ASSERT_TRUE(storage.Heartbeat());
+        ASSERT_TRUE(storage.Heartbeat(true, &productive));
+        EXPECT_TRUE(productive);
         EXPECT_TRUE(storage.deferred_task_by_storage_key_.empty());
         EXPECT_EQ(0u, backend->UngroupedOffloadingObjectsSize());
+        ASSERT_TRUE(storage.Heartbeat(true, &productive));
+        EXPECT_FALSE(productive);
         auto query = client->Query("heartbeat-tail");
         ASSERT_TRUE(query);
         EXPECT_EQ(1u,
@@ -653,12 +673,14 @@ class FileStorageTest : public ::testing::Test {
         }
         auto backend = file_storage.storage_backend_;
         ASSERT_TRUE(backend->Init());
-        auto result = file_storage.OffloadObjects(tasks);
+        bool productive = false;
+        auto result = file_storage.OffloadObjects(tasks, &productive);
         if (fail_write) {
             ASSERT_FALSE(result.has_value());
             EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
         } else {
             ASSERT_TRUE(result.has_value());
+            EXPECT_EQ(productive, duplicate_count < keys.size());
         }
 
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -713,6 +735,7 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
+        UnsetEnv("MOONCAKE_OFFLOAD_BUSY_POLL_INTERVAL_MS");
         UnsetEnv("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS");
         UnsetEnv("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS");
         UnsetEnv("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION");
@@ -1257,8 +1280,20 @@ class FileStorageTest : public ::testing::Test {
             EXPECT_TRUE(has_local_disk_replica);
         }
 
-        auto heartbeat_result = fileStorage.Heartbeat();
+        bool productive = true;
+        auto fast_result = fileStorage.Heartbeat(false, &productive);
+        ASSERT_TRUE(fast_result.has_value());
+        EXPECT_FALSE(productive);
+        for (const auto& key : expected_keys) {
+            auto exists = fileStorage.storage_backend_->IsExist(key);
+            ASSERT_TRUE(exists.has_value());
+            EXPECT_TRUE(exists.value())
+                << "fast ticks must leave regular watermark maintenance undone";
+        }
+
+        auto heartbeat_result = fileStorage.Heartbeat(true, &productive);
         ASSERT_TRUE(heartbeat_result.has_value());
+        EXPECT_FALSE(productive);
 
         for (const auto& key : expected_keys) {
             auto exists = fileStorage.storage_backend_->IsExist(key);
@@ -1543,6 +1578,57 @@ class FileStorageTest : public ::testing::Test {
         auto unmount = client.value()->UnmountSegment(seg_ptr, kSegSize);
         EXPECT_TRUE(unmount.has_value());
         std::free(seg_ptr);
+    }
+
+    void RunFailedMetadataRescanRetryGate() {
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                      std::nullopt, master.master_address());
+        ASSERT_TRUE(created);
+        auto client = *created;
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_filepath = data_path + "/failed_rescan_gate";
+        config.local_buffer_size = 1024 * 1024;
+        config.enable_disk_watermark_eviction = false;
+        fs::create_directories(config.storage_filepath);
+        FileStorage storage(config, client, endpoint);
+        BucketBackendConfig bucket_config;
+        auto backend = std::make_shared<FailingScanBackend>(config, bucket_config);
+        storage.storage_backend_ = backend;
+        ASSERT_TRUE(backend->Init());
+        {
+            MutexLocker locker(&storage.offloading_mutex_);
+            storage.enable_offloading_ = true;
+        }
+        storage.metadata_resync_pending_.store(true);
+
+        auto join_rescan = [&storage] {
+            if (storage.rescan_future_.valid()) storage.rescan_future_.wait();
+        };
+        for (int i = 0; i < 3; ++i) {
+            ASSERT_TRUE(storage.Heartbeat(false));
+            join_rescan();
+        }
+        EXPECT_EQ(backend->scan_calls.load(), 0)
+            << "offload-only ticks must not restart failed metadata scans";
+
+        ASSERT_TRUE(storage.Heartbeat(true));
+        join_rescan();
+        EXPECT_EQ(backend->scan_calls.load(), 1)
+            << "the regular maintenance tick owns the retry";
+        EXPECT_TRUE(storage.metadata_resync_pending_.load())
+            << "a failed scan remains eligible for the next maintenance tick";
+
+        ASSERT_TRUE(storage.Heartbeat(false));
+        join_rescan();
+        EXPECT_EQ(backend->scan_calls.load(), 1);
     }
 };
 
@@ -3450,6 +3536,64 @@ TEST_F(FileStorageTest,
     EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u)
         << "Abandoned shared staging buffers must be reclaimed once their "
            "lease expires, otherwise the memory leaks for good";
+}
+
+TEST_F(FileStorageTest, FailedMetadataRescanRetriesOnlyOnMaintenanceTicks) {
+    RunFailedMetadataRescanRetryGate();
+}
+
+TEST(FileStorageHeartbeatScheduleTest, BusyPollingPreservesRegularMaintenance) {
+    using Clock = std::chrono::steady_clock;
+    const auto start = Clock::time_point{};
+    const auto regular = std::chrono::seconds(10);
+    const auto busy = std::chrono::milliseconds(100);
+    FileStorageHeartbeatSchedule schedule;
+
+    EXPECT_TRUE(schedule.ShouldRunMaintenance(start));
+    schedule.RecordMaintenance(start, regular);
+    EXPECT_EQ(schedule.NextPoll(start, false, regular, busy), start + regular);
+    EXPECT_FALSE(
+        schedule.ShouldRunMaintenance(start + std::chrono::milliseconds(1)));
+
+    const auto productive = start + std::chrono::milliseconds(1);
+    EXPECT_EQ(schedule.NextPoll(productive, true, regular, busy), productive);
+    EXPECT_EQ(schedule.NextPoll(productive, false, regular, busy),
+              start + std::chrono::milliseconds(101));
+    EXPECT_EQ(schedule.NextPoll(start + std::chrono::milliseconds(101), false,
+                                regular, busy),
+              start + std::chrono::milliseconds(201));
+    EXPECT_EQ(schedule.NextPoll(start + regular - std::chrono::milliseconds(50),
+                                false, regular, busy),
+              start + regular);
+
+    EXPECT_TRUE(schedule.ShouldRunMaintenance(start + regular));
+    schedule.RecordMaintenance(start + regular, regular);
+    EXPECT_EQ(schedule.NextPoll(start + regular, false, regular, busy),
+              start + regular + busy);
+    EXPECT_EQ(schedule.NextPoll(start + regular + std::chrono::seconds(2),
+                                false, regular, busy),
+              start + 2 * regular);
+}
+
+TEST(FileStorageHeartbeatScheduleTest, LongTickDoesNotSkipMaintenance) {
+    using Clock = std::chrono::steady_clock;
+    const auto start = Clock::time_point{};
+    const auto regular = std::chrono::seconds(10);
+    const auto busy = std::chrono::milliseconds(100);
+    FileStorageHeartbeatSchedule schedule;
+
+    EXPECT_TRUE(schedule.ShouldRunMaintenance(start));
+    schedule.RecordMaintenance(start, regular);
+    EXPECT_FALSE(schedule.ShouldRunMaintenance(start + regular -
+                                               std::chrono::milliseconds(1)));
+
+    const auto finished = start + regular + std::chrono::milliseconds(50);
+    EXPECT_EQ(schedule.NextPoll(finished, false, regular, busy),
+              start + regular);
+    EXPECT_TRUE(schedule.ShouldRunMaintenance(finished));
+    schedule.RecordMaintenance(finished, regular);
+    EXPECT_EQ(schedule.NextPoll(finished, false, regular, busy),
+              finished + regular);
 }
 
 }  // namespace mooncake

@@ -57,6 +57,7 @@ struct FileStorageEnvironment {
     ScopedEnvVar total_size_limit{"MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES"};
     ScopedEnvVar heartbeat_interval{
         "MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS"};
+    ScopedEnvVar busy_poll_interval{"MOONCAKE_OFFLOAD_BUSY_POLL_INTERVAL_MS"};
     ScopedEnvVar client_buffer_gc_interval{
         "MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS"};
     ScopedEnvVar client_buffer_gc_ttl{
@@ -84,6 +85,7 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_EQ(config.total_keys_limit, 10'000'000);
     EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
+    EXPECT_EQ(config.heartbeat_busy_poll_interval_ms, 100u);
     EXPECT_EQ(config.client_buffer_gc_interval_seconds, 1u);
     EXPECT_EQ(config.client_buffer_gc_ttl_ms, 5000u);
     EXPECT_FALSE(config.use_uring);
@@ -162,6 +164,7 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
     env.total_keys_limit.Set("5000000");
     env.total_size_limit.Set("1099511627776");
     env.heartbeat_interval.Set("5");
+    env.busy_poll_interval.Set("250");
     env.client_buffer_gc_interval.Set("7");
     env.client_buffer_gc_ttl.Set("9000");
     env.enable_disk_watermark_eviction.Set("0");
@@ -179,6 +182,7 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
     EXPECT_EQ(config.total_keys_limit, 5000000);
     EXPECT_EQ(config.total_size_limit, 1099511627776);
     EXPECT_EQ(config.heartbeat_interval_seconds, 5u);
+    EXPECT_EQ(config.heartbeat_busy_poll_interval_ms, 250u);
     EXPECT_EQ(config.client_buffer_gc_interval_seconds, 7u);
     EXPECT_EQ(config.client_buffer_gc_ttl_ms, 9000u);
     EXPECT_FALSE(config.enable_disk_watermark_eviction);
@@ -252,6 +256,7 @@ TEST_F(FileStorageConfigTest, InvalidValuesUseDefaultsAndPreserveDiagnostics) {
     env.total_keys_limit.Set("invalid");
     env.total_size_limit.Set("invalid");
     env.heartbeat_interval.Set("invalid");
+    env.busy_poll_interval.Set("invalid");
     env.client_buffer_gc_interval.Set("invalid");
     env.client_buffer_gc_ttl.Set("invalid");
     env.enable_disk_watermark_eviction.Set("invalid");
@@ -271,6 +276,7 @@ TEST_F(FileStorageConfigTest, InvalidValuesUseDefaultsAndPreserveDiagnostics) {
              "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT",
              "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES",
              "MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
+             "MOONCAKE_OFFLOAD_BUSY_POLL_INTERVAL_MS",
              "MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
              "MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
          }) {
@@ -299,12 +305,27 @@ TEST_F(FileStorageConfigTest, InvalidIntValueUsesDefault) {
 
 TEST_F(FileStorageConfigTest, OutOfRangeValueUsesDefault) {
     SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "4294967296");
+    SetEnv("MOONCAKE_OFFLOAD_BUSY_POLL_INTERVAL_MS", "4294967296");
     const auto too_large = FileStorageConfig::FromEnvironment();
     EXPECT_EQ(too_large.heartbeat_interval_seconds, 10u);
+    EXPECT_EQ(too_large.heartbeat_busy_poll_interval_ms, 100u);
 
     SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "-10");
+    SetEnv("MOONCAKE_OFFLOAD_BUSY_POLL_INTERVAL_MS", "-10");
     const auto negative = FileStorageConfig::FromEnvironment();
     EXPECT_EQ(negative.heartbeat_interval_seconds, 10u);
+    EXPECT_EQ(negative.heartbeat_busy_poll_interval_ms, 100u);
+
+    SetEnv("MOONCAKE_OFFLOAD_BUSY_POLL_INTERVAL_MS", "0");
+    const auto zero = FileStorageConfig::FromEnvironment();
+    EXPECT_EQ(zero.heartbeat_busy_poll_interval_ms, 100u);
+}
+
+TEST_F(FileStorageConfigTest, ValidateRejectsZeroBusyPollInterval) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path.string();
+    config.heartbeat_busy_poll_interval_ms = 0;
+    EXPECT_FALSE(config.Validate());
 }
 
 TEST_F(FileStorageConfigTest, ValidateSuccessWithValidConfig) {

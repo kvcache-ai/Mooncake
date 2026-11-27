@@ -85,7 +85,7 @@ Heartbeat Thread          Master                  Local Memory Segment
 
 Step by step:
 
-1. **Heartbeat**: The heartbeat thread wakes up every `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` seconds and calls `client_->OffloadObjectHeartbeat(enable_offloading_, offloading_objects)`. The master replies with a map of `{key → size}` for objects it has selected to evict from memory.
+1. **Heartbeat**: The heartbeat thread calls `client_->OffloadObjectHeartbeat(enable_offloading_, offloading_objects)` after each regular or adaptive wait. The master replies with a map of `{key → size}` for objects it has selected to evict from memory. After a tick that stored or deferred work, the client re-polls immediately and then every `MOONCAKE_OFFLOAD_BUSY_POLL_INTERVAL_MS` for one `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` period. Idle clients return to the regular interval. Fast ticks handle offload only; promotion and disk-watermark maintenance retain the regular cadence.
 2. **Read slices from memory**: `FileStorage::OffloadObjects` groups the keys into buckets (for `BucketStorageBackend`) and calls `BatchQuerySegmentSlices` to obtain `{key → Slice}` from the local memory segment via `client_->BatchQuery`.
 3. **Eviction** (if capacity limit is set): Before writing, `PrepareEviction` removes old buckets from metadata under the exclusive lock and collects their keys. The `eviction_handler` callback calls `client_->BatchEvictDiskReplica` to notify the master in one batched RPC. `FinalizeEviction` then deletes the corresponding files.
 4. **Write to SSD**: `StorageBackend::BatchOffload` serializes and writes the key-value data to disk.
@@ -192,7 +192,7 @@ The two caps are independent and may be combined; when both are set a write must
 
 ### Proactive watermark eviction
 
-`FileStorage::Heartbeat()` also calls the backend-level proactive disk watermark path when `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true`. The high watermark decides when eviction starts and the low watermark decides the target usage after eviction. This path is independent of write admission, so disk usage can move back toward the low watermark even when no new write arrives.
+On regular heartbeat ticks, `FileStorage::Heartbeat()` calls the backend-level proactive disk watermark path when `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true`. The high watermark decides when eviction starts and the low watermark decides the target usage after eviction. This path is independent of write admission, so disk usage can move back toward the low watermark even when no new write arrives.
 
 | Backend | Candidate source |
 |---------|------------------|

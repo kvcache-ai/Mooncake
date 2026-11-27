@@ -90,6 +90,30 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
 
 }  // namespace
 
+bool FileStorageHeartbeatSchedule::ShouldRunMaintenance(
+    Clock::time_point now) const {
+    return now >= next_maintenance_;
+}
+
+void FileStorageHeartbeatSchedule::RecordMaintenance(
+    Clock::time_point now, Clock::duration regular_interval) {
+    next_maintenance_ = now + regular_interval;
+}
+
+FileStorageHeartbeatSchedule::Clock::time_point
+FileStorageHeartbeatSchedule::NextPoll(Clock::time_point now, bool productive,
+                                       Clock::duration regular_interval,
+                                       Clock::duration busy_interval) {
+    if (productive) {
+        busy_until_ = now + regular_interval;
+        return now;
+    }
+    if (now < busy_until_) {
+        return std::min(now + busy_interval, next_maintenance_);
+    }
+    return next_maintenance_;
+}
+
 FileStorage::DiskErrorAction FileStorage::ClassifyDiskErrno(int err) {
     switch (err) {
         case ENODEV:
@@ -336,18 +360,35 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
 
     heartbeat_running_.store(true);
     heartbeat_thread_ = std::thread([this]() {
-        LOG(INFO) << "Starting periodic task with interval: "
+        using Clock = FileStorageHeartbeatSchedule::Clock;
+        const auto regular_interval =
+            std::chrono::seconds(config_.heartbeat_interval_seconds);
+        const auto busy_interval =
+            std::chrono::milliseconds(config_.heartbeat_busy_poll_interval_ms);
+        FileStorageHeartbeatSchedule schedule;
+        LOG(INFO) << "Starting periodic task with regular interval: "
                   << config_.heartbeat_interval_seconds
-                  << "s, running is: " << heartbeat_running_.load();
+                  << "s, busy poll interval: "
+                  << config_.heartbeat_busy_poll_interval_ms
+                  << "ms, running is: " << heartbeat_running_.load();
         while (heartbeat_running_.load()) {
-            Heartbeat();
+            const bool run_maintenance =
+                schedule.ShouldRunMaintenance(Clock::now());
+            bool productive = false;
+            Heartbeat(run_maintenance, &productive);
+            const auto finished = Clock::now();
+            if (run_maintenance) {
+                schedule.RecordMaintenance(finished, regular_interval);
+            }
+            const auto wait_duration =
+                schedule.NextPoll(finished, productive, regular_interval,
+                                  busy_interval) -
+                finished;
             // Wake early for a fence the heartbeat has not applied yet.
             std::unique_lock<std::mutex> lock(heartbeat_wake_mutex_);
-            heartbeat_wake_cv_.wait_for(
-                lock, std::chrono::seconds(config_.heartbeat_interval_seconds),
-                [this] {
-                    return !heartbeat_running_ || (disk_fenced_ && !draining_);
-                });
+            heartbeat_wake_cv_.wait_for(lock, wait_duration, [this] {
+                return !heartbeat_running_ || (disk_fenced_ && !draining_);
+            });
         }
     });
     client_buffer_gc_running_.store(true);
@@ -669,7 +710,8 @@ bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
 }
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
-    const std::vector<OffloadTaskItem>& offloading_objects) {
+    const std::vector<OffloadTaskItem>& offloading_objects, bool* productive) {
+    if (productive) *productive = false;
     if (offloading_objects.empty() && deferred_task_by_storage_key_.empty()) {
         return {};
     }
@@ -770,6 +812,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     // through to the NACK flush below before returning it, so no drained key is
     // left waiting on the TTL reaper.
     std::optional<ErrorCode> abort_error;
+    bool stored_any = false;
 
     for (const auto& keys : buckets_keys) {
         if (disk_fenced_.load()) {
@@ -874,12 +917,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         std::unordered_set<std::string> reported_keys;
         reported_keys.reserve(host_batch_object.size());
         auto bucket_complete_handler =
-            [this, offload_start, complete_handler, &reported_keys](
+            [this, offload_start, complete_handler, &reported_keys,
+             &stored_any](
                 const std::vector<std::string>& keys,
                 std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
             auto res = complete_handler(keys, metadatas);
             if (res == ErrorCode::OK) {
                 reported_keys.insert(keys.begin(), keys.end());
+                stored_any = stored_any || !keys.empty();
             }
             if (res == ErrorCode::OK && ssd_metric_) {
                 auto elapsed_us =
@@ -982,6 +1027,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 << " deferred offload task(s) to the next cycle";
     }
     deferred_task_by_storage_key_ = std::move(carried_tasks);
+    if (productive) {
+        *productive = stored_any || !deferred_task_by_storage_key_.empty();
+    }
 
     if (!failed_tasks.empty()) {
         std::vector<StorageObjectMetadata> failed_metadatas;
@@ -1090,7 +1138,9 @@ tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
     return enable_offloading;
 }
 
-tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
+tl::expected<void, ErrorCode> FileStorage::Heartbeat(bool run_maintenance,
+                                                     bool* productive) {
+    if (productive) *productive = false;
     if (client_ == nullptr) {
         LOG(ERROR) << "client is nullptr";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -1115,8 +1165,10 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         rescan_future_ = std::future<void>();
     }
 
-    // Retry metadata resync if previous attempt failed.
-    if (metadata_resync_pending_.load() && !rescan_future_.valid()) {
+    // Retry metadata resync on regular ticks. The initial scan after a
+    // successful remount below still starts immediately.
+    if (run_maintenance && metadata_resync_pending_.load() &&
+        !rescan_future_.valid()) {
         LOG(INFO) << "Retrying background metadata rescan";
         rescan_future_ = std::async(std::launch::async, [this]() {
             auto result = ReRegisterOffloadedObjects();
@@ -1213,30 +1265,30 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     // Generic removal reclaims files through metadata-checked eviction, not a
     // backend-wide wipe that could remove managed objects or another tenant.
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
+    bool offload_productive = false;
     if (!offloading_objects.empty() || !deferred_task_by_storage_key_.empty()) {
-        auto offload_result = OffloadObjects(offloading_objects);
+        auto offload_result =
+            OffloadObjects(offloading_objects, &offload_productive);
         if (!offload_result) {
             LOG(ERROR) << "Failed to persist objects with error: "
                        << offload_result.error();
             return offload_result;
         }
     }
+    if (productive) *productive = offload_productive;
 
     VLOG(1) << "Completed heartbeat with offloaded objects count: "
             << offloading_objects.size();
 
-    // Drive any pending L2->L1 promotion work for this client. Failures
-    // inside ProcessPromotionTasks are logged per-key and do not propagate;
-    // promotion is best-effort and must never break offload.
-    (void)ProcessPromotionTasks();
-
-    // Proactive disk watermarks keep LOCAL_DISK usage below the configured
-    // low watermark even when no new write arrives to trigger reactive
-    // eviction.
-    auto disk_eviction_result = RunDiskWatermarkEviction();
-    if (!disk_eviction_result) {
-        LOG(WARNING) << "Disk watermark eviction failed: "
-                     << disk_eviction_result.error();
+    if (run_maintenance) {
+        // Promotion and watermark maintenance retain the regular cadence even
+        // while offload-only ticks are polling for more work.
+        (void)ProcessPromotionTasks();
+        auto disk_eviction_result = RunDiskWatermarkEviction();
+        if (!disk_eviction_result) {
+            LOG(WARNING) << "Disk watermark eviction failed: "
+                         << disk_eviction_result.error();
+        }
     }
     return {};
 }

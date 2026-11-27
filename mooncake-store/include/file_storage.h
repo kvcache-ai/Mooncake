@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -18,6 +19,24 @@
 namespace mooncake {
 
 struct SsdMetric;
+
+// Keeps fast offload polling separate from the regular maintenance deadline.
+// The heartbeat thread records a regular tick only after that tick has run.
+class FileStorageHeartbeatSchedule {
+   public:
+    using Clock = std::chrono::steady_clock;
+
+    bool ShouldRunMaintenance(Clock::time_point now) const;
+    void RecordMaintenance(Clock::time_point now,
+                           Clock::duration regular_interval);
+    Clock::time_point NextPoll(Clock::time_point now, bool productive,
+                               Clock::duration regular_interval,
+                               Clock::duration busy_interval);
+
+   private:
+    Clock::time_point next_maintenance_{};
+    Clock::time_point busy_until_{};
+};
 
 class FileStorage {
    public:
@@ -251,10 +270,13 @@ class FileStorage {
 
     /**
      * @brief Offload object data and metadata.
+     * @param productive On successful return, set to true when this cycle
+     *        stored at least one object or retained deferred work.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> OffloadObjects(
-        const std::vector<OffloadTaskItem>& offloading_objects);
+        const std::vector<OffloadTaskItem>& offloading_objects,
+        bool* productive = nullptr);
 
     /**
      * @brief Classifies a BatchOffload error as affecting only the current
@@ -282,13 +304,16 @@ class FileStorage {
      * client.
      * 2. Receives feedback on which objects should be offloaded.
      * 3. Triggers asynchronous offloading of pending objects.
-     * 4. If offload work was returned, pulls and processes any pending L2->L1
-     *    promotion tasks queued by the master (mirror of step 1+2 in the
-     *    reverse direction).
-     * 5. Runs proactive local-disk watermark eviction.
+     * 4. On regular ticks, pulls and processes pending L2->L1 promotion tasks.
+     * 5. On regular ticks, runs proactive local-disk watermark eviction.
+     * @param run_maintenance Whether promotion and watermark maintenance are
+     *        due on this tick. Defaults to the legacy full heartbeat behavior.
+     * @param productive Set to true only when offload work was stored or
+     *        deferred, allowing the caller to schedule a fast re-poll.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
-    tl::expected<void, ErrorCode> Heartbeat();
+    tl::expected<void, ErrorCode> Heartbeat(bool run_maintenance = true,
+                                            bool* productive = nullptr);
 
     /**
      * @brief Drives the L2->L1 promotion pipeline for one heartbeat tick.
