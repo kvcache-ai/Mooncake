@@ -26,6 +26,7 @@ jobs:
   check-approval:
     name: Check CI approval
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       run_ci: ${{ steps.approval.outputs.run_ci }}
       reason: ${{ steps.approval.outputs.reason }}
@@ -89,15 +90,15 @@ jobs:
 
           echo "run_ci=false" >> "$GITHUB_OUTPUT"
           echo "reason=awaiting-approval" >> "$GITHUB_OUTPUT"
-          echo "PR #${PR_NUMBER} is awaiting maintainer approval (or 'run-ci' label): fast checks only."
+          echo "PR #${PR_NUMBER} is awaiting maintainer approval (or 'run-ci' label + manual rerun): fast checks only."
           {
             echo "### Fast Checks Only"
             echo ""
-            echo "Heavy build and test jobs are deferred until a maintainer approves this PR or adds the \`run-ci\` label."
+            echo "Heavy build and test jobs will run automatically after a maintainer approves this PR. To run them before approval, add the \`run-ci\` label and select **Re-run jobs** on this workflow run (or push a new commit)."
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "${FAIL_IF_UNAPPROVED:-false}" = "true" ]; then
-            echo "::notice::Build is deferred until a maintainer approves this PR (or adds the 'run-ci' label)."
+            echo "::notice::Build is deferred until a maintainer approves this PR (or adds the 'run-ci' label and re-runs jobs)."
             exit 1
           fi
 

@@ -36,6 +36,7 @@ jobs:
       (github.event.pull_request.base.ref == 'main' ||
        startsWith(github.event.pull_request.base.ref, 'release/'))
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Signal approval
         env:

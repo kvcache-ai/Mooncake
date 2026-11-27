@@ -17,6 +17,7 @@ if(USE_CUDA)
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/ring/ring_all_reduce.cu"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/oneshot/one_shot_all_reduce.cu"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/tree/tree_all_reduce.cu"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/twoshot/two_shot_all_reduce.cu"
   )
 elseif(USE_MUSA OR USE_MACA)
   set(_pg_device_object "${CMAKE_CURRENT_BINARY_DIR}/mooncake_worker_device.o")
@@ -175,6 +176,7 @@ if(USE_CUDA)
       device_comm/device_collective/algorithms/oneshot/one_shot_all_reduce.cpp
       device_comm/device_collective/algorithms/tree/tree_topology.cpp
       device_comm/device_collective/algorithms/tree/tree_all_reduce.cpp
+      device_comm/device_collective/algorithms/twoshot/two_shot_all_reduce.cpp
       device_comm/device_collective/strong_stream.cpp)
 endif()
 

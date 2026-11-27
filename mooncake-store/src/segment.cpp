@@ -211,10 +211,24 @@ ErrorCode ScopedSegmentAccess::MountSegment(
             bool(indexed.physical_placement) !=
                 bool(segment.physical_placement) ||
             (indexed.physical_placement &&
-             *indexed.physical_placement != *segment.physical_placement))
+             *indexed.physical_placement != *segment.physical_placement)) {
             return ErrorCode::INVALID_PARAMS;
-        if (indexed_segment->second.status == SegmentStatus::UNMOUNTING) {
-            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        }
+    }
+    if (IsDrainSourceFenced(segment.name)) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    const auto registrations =
+        segment_manager_->registrations_by_name_.find(segment.name);
+    if (registrations != segment_manager_->registrations_by_name_.end()) {
+        for (const auto& id : registrations->second) {
+            const auto status =
+                segment_manager_->mounted_segments_.at(id).status;
+            if (status == SegmentStatus::UNMOUNTING ||
+                status == SegmentStatus::DRAINING ||
+                status == SegmentStatus::DRAINED) {
+                return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+            }
         }
     }
     // SEGMENT_ALREADY_EXISTS is a liveness signal only for a confirmed replay
@@ -274,6 +288,8 @@ ErrorCode ScopedSegmentAccess::MountSegment(
                 segment, SegmentStatus::OK, allocator, registration};
             segment_manager_->client_by_name_[segment.name] = client_id;
             segment_manager_->segment_id_by_name_[segment.name] = segment.id;
+            segment_manager_->registrations_by_name_[segment.name].insert(
+                segment.id);
             AddHostSegment(segment_manager_->segments_by_host_, segment);
 
             LOG(INFO) << "[CXL Segment Mounted Successfully] Segment name: "
@@ -318,6 +334,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
         segment, SegmentStatus::OK, std::move(allocator), registration};
     segment_manager_->client_by_name_[segment.name] = client_id;
     segment_manager_->segment_id_by_name_[segment.name] = segment.id;
+    segment_manager_->registrations_by_name_[segment.name].insert(segment.id);
     AddHostSegment(segment_manager_->segments_by_host_, segment);
     MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
 
@@ -668,6 +685,14 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     if (!retain_name_registration) {
         ReindexSegmentNameAfterRemoval(segment_id, segment_name);
     }
+    auto registrations =
+        segment_manager_->registrations_by_name_.find(segment_name);
+    if (registrations != segment_manager_->registrations_by_name_.end()) {
+        registrations->second.erase(segment_id);
+        if (registrations->second.empty()) {
+            segment_manager_->registrations_by_name_.erase(registrations);
+        }
+    }
     // Remove from mounted_segments_
     segment_manager_->mounted_segments_.erase(mounted);
 
@@ -784,14 +809,17 @@ ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
 
 bool ScopedSegmentAccess::HasAllocatedMemory(
     const std::string& segment_name) const {
-    const auto id = segment_manager_->segment_id_by_name_.find(segment_name);
-    if (id == segment_manager_->segment_id_by_name_.end()) {
+    const auto registrations =
+        segment_manager_->registrations_by_name_.find(segment_name);
+    if (registrations == segment_manager_->registrations_by_name_.end()) {
         return false;
     }
-    const auto mounted = segment_manager_->mounted_segments_.find(id->second);
-    return mounted != segment_manager_->mounted_segments_.end() &&
-           mounted->second.buf_allocator &&
-           mounted->second.buf_allocator->size() != 0;
+    const auto& ids = registrations->second;
+    return std::any_of(ids.begin(), ids.end(), [this](const UUID& id) {
+        const auto& allocator =
+            segment_manager_->mounted_segments_.at(id).buf_allocator;
+        return allocator && allocator->size() != 0;
+    });
 }
 
 ErrorCode ScopedSegmentAccess::GetUnreadySegments(
@@ -889,7 +917,44 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
 
-    auto& mounted_segment = mounted_segment_it->second;
+    return SetSegmentStatus(mounted_segment_it->second, status);
+}
+
+bool ScopedSegmentAccess::IsDrainSourceFenced(
+    const std::string& segment_name) const {
+    return segment_manager_->fenced_drain_sources_.contains(segment_name);
+}
+
+void ScopedSegmentAccess::FenceDrainSource(const std::string& segment_name) {
+    segment_manager_->fenced_drain_sources_.insert(segment_name);
+    SetDrainSourceStatus(segment_name, SegmentStatus::DRAINING);
+}
+
+void ScopedSegmentAccess::ReleaseDrainSourceFence(
+    const std::string& segment_name) {
+    segment_manager_->fenced_drain_sources_.erase(segment_name);
+}
+
+void ScopedSegmentAccess::SetDrainSourceStatus(const std::string& segment_name,
+                                               SegmentStatus status) {
+    const auto registrations =
+        segment_manager_->registrations_by_name_.find(segment_name);
+    if (registrations == segment_manager_->registrations_by_name_.end()) {
+        return;
+    }
+    for (const auto& id : registrations->second) {
+        auto& mounted = segment_manager_->mounted_segments_.at(id);
+        if (mounted.status == SegmentStatus::GRACEFULLY_UNMOUNTING ||
+            (status == SegmentStatus::DRAINING &&
+             mounted.status == SegmentStatus::DRAINED)) {
+            continue;
+        }
+        (void)SetSegmentStatus(mounted, status);
+    }
+}
+
+ErrorCode ScopedSegmentAccess::SetSegmentStatus(MountedSegment& mounted_segment,
+                                                SegmentStatus status) {
     if (mounted_segment.status == SegmentStatus::UNMOUNTING) {
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
