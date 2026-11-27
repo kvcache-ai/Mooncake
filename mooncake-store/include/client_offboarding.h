@@ -39,6 +39,7 @@ struct ClientOffboardingJob {
     ClientSessionSharedPtr retired_session;
     std::vector<PreparedSegmentOffboarding> prepared_segments;
     bool metadata_cleanup_accepted{false};
+    bool drain_tasks_settled{false};
     bool local_ssd_unregistered{false};
     uint64_t retry_count{0};
     std::chrono::steady_clock::time_point next_attempt_at{

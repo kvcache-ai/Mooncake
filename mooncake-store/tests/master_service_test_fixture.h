@@ -87,6 +87,25 @@ class MasterServiceTest : public ::testing::Test {
         return MasterServiceTestPeer(service).ProcessClientOffboardingJob(job);
     }
 
+    void RetireSegmentForTest(MasterService& service, const Segment& segment,
+                              const UUID& client_id) {
+        const auto liveness = FindClientLivenessForTest(service, client_id);
+        ASSERT_TRUE(liveness);
+        const auto now = ClientLivenessRecord::Clock::now();
+        constexpr auto ttl = std::chrono::seconds::zero();
+        ASSERT_EQ(liveness->Evaluate(now, ttl, ttl),
+                  ClientLivenessTransition::BECAME_SUSPECTED);
+        MasterMetricManager::instance().client_liveness_became_suspected();
+        ASSERT_EQ(liveness->Evaluate(now, ttl, ttl),
+                  ClientLivenessTransition::BECAME_OFFLINE);
+        MasterMetricManager::instance().client_liveness_became_offline();
+        ClientOffboardingJob job;
+        job.client_id = client_id;
+        job.retired_session = liveness;
+        ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
+        EXPECT_FALSE(service.QuerySegmentStatusById(segment.id).has_value());
+    }
+
     ErrorCode PrepareUnmountSegmentForTest(MasterService& service,
                                            const UUID& segment_id,
                                            size_t& metrics_dec_capacity) {
@@ -418,30 +437,16 @@ class MasterServiceTest : public ::testing::Test {
 
         bool processed = false;
         for (const auto& assignment : *fetched) {
-            if (assignment.type != TaskType::REPLICA_MOVE) {
+            if (assignment.type != TaskType::DRAIN_MOVE) {
                 continue;
             }
 
-            ReplicaMovePayload payload;
-            struct_json::from_json(payload, assignment.payload);
-
-            const TenantId tenant_id(payload.tenant_id);
-            EXPECT_TRUE(tenant_id.IsValid());
-            if (!tenant_id.IsValid()) {
-                return false;
-            }
-            auto move_start =
-                service.MoveStart(client_id, payload.key, tenant_id,
-                                  payload.source, payload.target);
+            auto move_start = service.StartDrainMove(client_id, assignment.id);
             EXPECT_TRUE(move_start.has_value());
-            EXPECT_TRUE(
-                service.MoveEnd(client_id, payload.key, tenant_id).has_value());
-
-            TaskCompleteRequest complete_request;
-            complete_request.id = assignment.id;
-            complete_request.status = TaskStatus::SUCCESS;
-            complete_request.message = "move_done";
-            EXPECT_TRUE(service.MarkTaskToComplete(client_id, complete_request)
+            EXPECT_TRUE(service
+                            .FinishDrainMove(client_id, assignment.id,
+                                             /*commit=*/true,
+                                             /*writes_drained=*/true)
                             .has_value());
             processed = true;
         }
@@ -458,7 +463,7 @@ class MasterServiceTest : public ::testing::Test {
 
         bool processed = false;
         for (const auto& assignment : *fetched) {
-            if (assignment.type != TaskType::REPLICA_MOVE) {
+            if (assignment.type != TaskType::DRAIN_MOVE) {
                 continue;
             }
 

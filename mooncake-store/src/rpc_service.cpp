@@ -1420,6 +1420,48 @@ tl::expected<void, ErrorCode> WrappedMasterService::MoveRevoke(
         [] { MasterMetricManager::instance().inc_move_revoke_failures(); });
 }
 
+tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::StartDrainMove(
+    const UUID& client_id, const UUID& task_id) {
+    return execute_rpc(
+        "StartDrainMove",
+        [&] { return master_service_.StartDrainMove(client_id, task_id); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", task_id=", task_id);
+        },
+        [] { MasterMetricManager::instance().inc_move_start_requests(); },
+        [] { MasterMetricManager::instance().inc_move_start_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::FinishDrainMove(
+    const UUID& client_id, const UUID& task_id, bool commit,
+    bool writes_drained) {
+    return execute_rpc(
+        "FinishDrainMove",
+        [&] {
+            return master_service_.FinishDrainMove(client_id, task_id, commit,
+                                                   writes_drained);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", task_id=", task_id,
+                             ", commit=", commit,
+                             ", writes_drained=", writes_drained);
+        },
+        [commit] {
+            auto& metrics = MasterMetricManager::instance();
+            if (commit)
+                metrics.inc_move_end_requests();
+            else
+                metrics.inc_move_revoke_requests();
+        },
+        [commit] {
+            auto& metrics = MasterMetricManager::instance();
+            if (commit)
+                metrics.inc_move_end_failures();
+            else
+                metrics.inc_move_revoke_failures();
+        });
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     ReplicaType replica_type) {
@@ -2174,6 +2216,8 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::DynamicReplicaCopyRevoke,
         &WrappedMasterService::MoveStart, &WrappedMasterService::MoveEnd,
         &WrappedMasterService::MoveRevoke,
+        &WrappedMasterService::StartDrainMove,
+        &WrappedMasterService::FinishDrainMove,
         &WrappedMasterService::EvictDiskReplica,
         &WrappedMasterService::EvictDiskReplicaIfCurrent,
         &WrappedMasterService::BatchEvictDiskReplica,

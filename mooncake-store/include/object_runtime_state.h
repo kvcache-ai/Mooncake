@@ -39,6 +39,7 @@ struct ReplicationTask {
     uint64_t dynamic_replication_version_epoch{0};
     bool durable_cleanup_pending{false};
     std::optional<ReplicaID> existing_move_target{};
+    UUID drain_task_id{};
 };
 
 struct OffloadingTask {

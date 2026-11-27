@@ -635,15 +635,24 @@ class MasterService {
     tl::expected<MoveStartResponse, ErrorCode> MoveStart(
         const UUID& client_id, const std::string& key,
         const TenantId& tenant_id, const std::string& src_segment,
-        const std::string& tgt_segment);
+        const std::string& tgt_segment, const Task* drain_task = nullptr);
 
     tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
                                           const std::string& key,
-                                          const TenantId& tenant_id);
+                                          const TenantId& tenant_id,
+                                          const Task* drain_task = nullptr);
 
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
                                              const std::string& key,
-                                             const TenantId& tenant_id);
+                                             const TenantId& tenant_id,
+                                             const Task* drain_task = nullptr);
+
+    tl::expected<MoveStartResponse, ErrorCode> StartDrainMove(
+        const UUID& client_id, const UUID& task_id);
+    tl::expected<void, ErrorCode> FinishDrainMove(const UUID& client_id,
+                                                  const UUID& task_id,
+                                                  bool commit,
+                                                  bool writes_drained);
 
     /**
      * @brief Remove an object and its replicas
@@ -1199,6 +1208,7 @@ class MasterService {
         const std::function<bool(const Replica&)>& is_stale);
     void OnClientSessionChanged(const ClientSessionEvent& event);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
+    void SettleRetiredDrainTasks(const ClientOffboardingJob& job);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();
@@ -2190,6 +2200,8 @@ class MasterService {
         std::unordered_set<std::string> completed_unit_keys;
         std::unordered_map<std::string, uint32_t> retry_counts;
         std::unordered_set<std::string> terminal_failed_unit_keys;
+        std::unordered_map<std::string, DrainSource> sources;
+        std::unordered_set<std::string> drained_sources;
     };
 
     static constexpr uint32_t kMaxDrainUnitRetries = 3;
@@ -2202,7 +2214,10 @@ class MasterService {
     tl::expected<UUID, ErrorCode> CreateMoveTaskInternal(
         const std::string& key, const TenantId& tenant_id,
         const std::string& source, const std::string& target,
-        bool retained_by_drain);
+        const DrainSource* drain_source);
+    void QuarantineDrainTarget(ObjectMetadata& metadata,
+                               const ReplicationTask& task);
+    void AbortDrainMove(MetadataAccessorRW& accessor, const UUID& task_id);
     void ProcessDrainJobs();
     void ProcessDrainJobStop(DrainJob& job);
     void HandleDrainJobTimeout(const std::weak_ptr<DrainJob>& job);

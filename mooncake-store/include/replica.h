@@ -687,6 +687,14 @@ class Replica {
         }
     }
 
+    [[nodiscard]] std::shared_ptr<BufferAllocatorBase> GetMemoryAllocator()
+        const {
+        const auto* memory = std::get_if<MemoryReplicaData>(&data_);
+        return memory != nullptr && memory->buffer
+                   ? memory->buffer->getAllocator()
+                   : nullptr;
+    }
+
     [[nodiscard]] std::vector<std::optional<std::string>> get_segment_names()
         const;
 

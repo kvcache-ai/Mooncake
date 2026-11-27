@@ -97,6 +97,17 @@ class ScopedSegmentAccess {
                                      const UUID& client_id) const;
 
     bool GetSegment(const UUID& segment_id, Segment& segment) const;
+    std::optional<DrainSource> GetDrainSource(const std::string& name) const;
+
+    // Keep the write destination out of a replacement allocator as well as
+    // the current allocator until the writer's transfers have drained.
+    ErrorCode ProtectDrainTarget(const UUID& task_id, const UUID& writer,
+                                 const std::string& name,
+                                 const Replica& replica);
+    void QuarantineDrainTarget(const UUID& task_id,
+                               std::vector<Replica> replicas);
+    void ReleaseDrainTarget(const UUID& task_id, const UUID& writer);
+    bool HasProtectedDrainTarget(const UUID& segment_id) const;
 
     bool CanCopyWithinFabric(const std::string& source,
                              const std::string& target) const;
@@ -444,6 +455,20 @@ class SegmentManager {
         segment_id_by_name_;             // segment name -> segment_id
     HostSegmentIndex segments_by_host_;  // host_id -> segment name -> segment
                                          // ids for allocatable segments
+    struct DrainTarget {
+        Segment segment;
+        UUID owner;
+        UUID writer;
+        UUID budget_id;
+        uintptr_t address;
+        size_t bytes;
+        bool quarantined = false;
+        std::optional<Replica> replica;
+    };
+    // The reservation exists before the descriptor leaves MoveStart. It
+    // survives target unmount for this Master's lifetime.
+    std::unordered_map<UUID, DrainTarget, boost::hash<UUID>> drain_targets_;
+    std::unordered_map<UUID, size_t, boost::hash<UUID>> drain_target_bytes_;
     friend class ScopedSegmentAccess;
     friend class SegmentTest;  // for unit tests
 };

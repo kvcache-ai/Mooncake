@@ -76,6 +76,10 @@ namespace {
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
 
+bool IsRpcTransportError(ErrorCode error) {
+    return error == ErrorCode::RPC_FAIL || error == ErrorCode::RPC_TIMEOUT;
+}
+
 class ScopedObjectChecksumBuffer {
    public:
     ScopedObjectChecksumBuffer(PinnedBufferPool& pool, size_t size)
@@ -4664,11 +4668,11 @@ bool Client::IsTaskCancellationRequested(const UUID* task_id) {
 tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
     const std::string& key, const std::string& action_name,
     std::function<tl::expected<void, ErrorCode>()> end_fn,
-    std::function<tl::expected<void, ErrorCode>()> revoke_fn,
+    std::function<tl::expected<void, ErrorCode>(bool)> revoke_fn,
     const Replica::Descriptor& source,
     const std::vector<Replica::Descriptor>& targets, const UUID* task_id) {
-    auto revoke_lambda = [&]() {
-        auto revoke_result = revoke_fn();
+    auto revoke_lambda = [&](bool writes_drained) {
+        auto revoke_result = revoke_fn(writes_drained);
         if (!revoke_result.has_value()) {
             LOG(WARNING) << "action=replica_" << action_name << "_revoke_failed"
                          << ", key=" << key
@@ -4676,7 +4680,7 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
         }
     };
     auto cancel_and_revoke = [&]() -> tl::expected<void, ErrorCode> {
-        auto result = revoke_fn();
+        auto result = revoke_fn(true);
         if (!result &&
             result.error() != ErrorCode::OBJECT_NO_REPLICATION_TASK &&
             result.error() != ErrorCode::OBJECT_NOT_FOUND) {
@@ -4696,7 +4700,7 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
         if (!source.is_memory_replica()) {
             LOG(ERROR) << "action=replica_" << action_name << "_failed"
                        << ", key=" << key << ", error=invalid_replica_type";
-            revoke_lambda();
+            revoke_lambda(true);
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
@@ -4705,7 +4709,7 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
             LOG(ERROR) << "action=replica_" << action_name << "_failed"
                        << ", key=" << key
                        << ", error=source_replica_not_in_local_memory";
-            revoke_lambda();
+            revoke_lambda(true);
             return tl::unexpected(ErrorCode::REPLICA_NOT_IN_LOCAL_MEMORY);
         }
 
@@ -4733,14 +4737,14 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
                 if (TransferWriteRange(target, chunk, offset,
                                        TransferIntent::kMigration) !=
                     ErrorCode::OK) {
-                    revoke_lambda();
+                    revoke_lambda(false);
                     return tl::unexpected(ErrorCode::TRANSFER_FAIL);
                 }
                 offset += slice.size;
             }
         } else if (TransferWrite(target, slices, TransferIntent::kMigration) !=
                    ErrorCode::OK) {
-            revoke_lambda();
+            revoke_lambda(false);
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
     }
@@ -4753,7 +4757,7 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
     if (!end_result.has_value()) {
         // Start creates a replication task even when the target already
         // exists, so a failed end must release the source reservation.
-        revoke_lambda();
+        revoke_lambda(true);
         return tl::unexpected(end_result.error());
     }
 
@@ -4813,7 +4817,7 @@ tl::expected<void, ErrorCode> Client::Copy(
                          key, tenant_id, dynamic_replication_lease_id,
                          dynamic_replication_version_epoch);
     };
-    auto copy_revoke = [&]() {
+    auto copy_revoke = [&](bool) {
         return dynamic_replication_lease_id == UUID{}
                    ? master_client_.CopyRevoke(key, tenant_id)
                    : master_client_.DynamicReplicaCopyRevoke(
@@ -4842,7 +4846,8 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& tenant_id,
                                            const std::string& source,
                                            const std::string& target,
-                                           const UUID* task_id) {
+                                           const UUID* task_id, bool drain_move,
+                                           bool* drain_start_rpc_failed) {
     if (IsTaskCancellationRequested(task_id)) {
         return tl::unexpected(ErrorCode::TASK_CANCELED);
     }
@@ -4852,12 +4857,16 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     // Call MoveStart first - it validates existence and allocates replica if
     // needed
     auto move_start_result =
-        master_client_.MoveStart(key, tenant_id, source, target);
+        drain_move ? master_client_.StartDrainMove(*task_id)
+                   : master_client_.MoveStart(key, tenant_id, source, target);
     if (!move_start_result.has_value()) {
-        ErrorCode error = move_start_result.error();
+        const auto error = move_start_result.error();
+        if (drain_move && drain_start_rpc_failed &&
+            IsRpcTransportError(error)) {
+            *drain_start_rpc_failed = true;
+        }
         LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
                    << ", error=move_start_failed" << ", error_code=" << error;
-        // MoveStart already validated existence, so we just return the error
         return tl::unexpected(error);
     }
 
@@ -4871,8 +4880,17 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     }
 
     auto result = ExecuteReplicaTransfer(
-        key, "move", [&]() { return master_client_.MoveEnd(key, tenant_id); },
-        [&]() { return master_client_.MoveRevoke(key, tenant_id); },
+        key, "move",
+        [&]() {
+            return drain_move
+                       ? master_client_.FinishDrainMove(*task_id, true, true)
+                       : master_client_.MoveEnd(key, tenant_id);
+        },
+        [&](bool writes_drained) {
+            return drain_move ? master_client_.FinishDrainMove(*task_id, false,
+                                                               writes_drained)
+                              : master_client_.MoveRevoke(key, tenant_id);
+        },
         response.source, targets, task_id);
 
     if (result.has_value()) {
@@ -5706,6 +5724,7 @@ void Client::SubmitTask(const TaskAssignment& assignment) {
 void Client::ExecuteTask(const ClientTask& client_task) {
     const auto& assignment = client_task.assignment;
     ErrorCode result = ErrorCode::OK;
+    bool drain_start_rpc_failed = false;
 
     try {
         switch (assignment.type) {
@@ -5726,12 +5745,15 @@ void Client::ExecuteTask(const ClientTask& client_task) {
                 }
                 break;
             }
-            case TaskType::REPLICA_MOVE: {
+            case TaskType::REPLICA_MOVE:
+            case TaskType::DRAIN_MOVE: {
                 ReplicaMovePayload payload;
                 struct_json::from_json(payload, assignment.payload);
                 auto move_result =
                     Move(payload.key, payload.tenant_id, payload.source,
-                         payload.target, &assignment.id);
+                         payload.target, &assignment.id,
+                         assignment.type == TaskType::DRAIN_MOVE,
+                         &drain_start_rpc_failed);
                 if (move_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
@@ -5754,23 +5776,48 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         result = ErrorCode::INTERNAL_ERROR;
     }
 
+    constexpr auto kTaskRpcRetryDelay = std::chrono::milliseconds(250);
+    auto should_retry_rpc = [&](ErrorCode error) {
+        return task_running_.load() &&
+               (IsRpcTransportError(error) ||
+                error == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    };
     auto report_completion = [&](const TaskCompleteRequest& request) {
         for (;;) {
             auto completion = master_client_.MarkTaskToComplete(request);
-            if (completion) {
-                return;
+            if (completion ||
+                (drain_start_rpc_failed &&
+                 completion.error() == ErrorCode::TASK_NOT_FOUND)) {
+                break;
             }
             LOG(WARNING) << "action=task_complete_failed"
                          << ", task_id=" << assignment.id
                          << ", error_code=" << completion.error();
-            if (!task_running_.load() ||
-                (completion.error() != ErrorCode::RPC_FAIL &&
-                 completion.error() != ErrorCode::RPC_TIMEOUT &&
-                 completion.error() !=
-                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS)) {
+            if (!should_retry_rpc(completion.error())) {
                 return;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            std::this_thread::sleep_for(kTaskRpcRetryDelay);
+        }
+
+        if (!drain_start_rpc_failed) {
+            return;
+        }
+        // Start may have protected a target before its response was lost.
+        // The worker never submitted a write. Settling the task first fences
+        // a delayed Start so it cannot leave a new reservation after release.
+        for (;;) {
+            auto release = master_client_.FinishDrainMove(
+                assignment.id, /*commit=*/false, /*writes_drained=*/true);
+            if (release || release.error() == ErrorCode::TASK_NOT_FOUND) {
+                return;
+            }
+            LOG(WARNING) << "action=drain_target_release_failed"
+                         << ", task_id=" << assignment.id
+                         << ", error_code=" << release.error();
+            if (!should_retry_rpc(release.error())) {
+                return;
+            }
+            std::this_thread::sleep_for(kTaskRpcRetryDelay);
         }
     };
 
