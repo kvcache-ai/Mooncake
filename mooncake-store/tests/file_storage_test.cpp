@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -15,6 +16,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <unordered_set>
 #include <string>
 #include <thread>
@@ -139,6 +141,101 @@ class DelayedReadBackend : public BucketStorageBackend {
 
     std::atomic<size_t> loads{0};
 };
+
+// Sets (or unsets, for nullptr) one environment variable for a scope.
+class ScopedEnv {
+   public:
+    ScopedEnv(const char* name, const char* value) : name_(name) {
+        if (const char* old = std::getenv(name)) old_ = old;
+        if (value) {
+            setenv(name, value, 1);
+        } else {
+            unsetenv(name);
+        }
+    }
+    ~ScopedEnv() {
+        if (old_) {
+            setenv(name_.c_str(), old_->c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+    ScopedEnv(const ScopedEnv&) = delete;
+    ScopedEnv& operator=(const ScopedEnv&) = delete;
+
+   private:
+    std::string name_;
+    std::optional<std::string> old_;
+};
+
+// Captures stderr until Take(). gtest allows one capture at a time, so the
+// destructor ends the capture if the test leaves the scope before Take(),
+// e.g. because a constructor threw.
+class ScopedStderrCapture {
+   public:
+    ScopedStderrCapture() { ::testing::internal::CaptureStderr(); }
+    ~ScopedStderrCapture() {
+        if (!taken_) (void)::testing::internal::GetCapturedStderr();
+    }
+    std::string Take() {
+        taken_ = true;
+        return ::testing::internal::GetCapturedStderr();
+    }
+    ScopedStderrCapture(const ScopedStderrCapture&) = delete;
+    ScopedStderrCapture& operator=(const ScopedStderrCapture&) = delete;
+
+   private:
+    bool taken_ = false;
+};
+
+// The VMA containing an address, from /proc/self/smaps.
+struct VmaInfo {
+    bool mapped = false;
+    bool hugetlb = false;  // VmFlags "ht"
+    unsigned long kernel_page_kib = 0;
+};
+
+static VmaInfo FindVma(const void* addr) {
+    std::ifstream smaps("/proc/self/smaps");
+    const auto target = reinterpret_cast<uintptr_t>(addr);
+    VmaInfo vma;
+    for (std::string line; std::getline(smaps, line);) {
+        unsigned long start = 0, end = 0;
+        if (std::sscanf(line.c_str(), "%lx-%lx ", &start, &end) == 2) {
+            if (vma.mapped) break;
+            vma.mapped = start <= target && target < end;
+        } else if (vma.mapped && line.rfind("KernelPageSize:", 0) == 0) {
+            vma.kernel_page_kib = std::stoul(line.substr(15));
+        } else if (vma.mapped && line.rfind("VmFlags:", 0) == 0) {
+            vma.hugetlb = (line + " ").find(" ht ") != std::string::npos;
+        }
+    }
+    return vma;
+}
+
+// A HugeTLB pool counter for one page size; -1 if the kernel has no pool of
+// that size.
+static long HugepagePoolCount(size_t page_size, const char* counter) {
+    std::ifstream file("/sys/kernel/mm/hugepages/hugepages-" +
+                       std::to_string(page_size / 1024) + "kB/" + counter);
+    long count = -1;
+    if (file) file >> count;
+    return count;
+}
+
+// Pages of a HugeTLB pool that a new mapping can take: free pages not
+// already reserved by other mappings. -1 if there is no pool of that size.
+static long AvailableHugepages(size_t page_size) {
+    const long free_pages = HugepagePoolCount(page_size, "free_hugepages");
+    if (free_pages < 0) return -1;
+    return free_pages -
+           std::max(0L, HugepagePoolCount(page_size, "resv_hugepages"));
+}
+
+static bool GlibcMayUseHugetlb() {
+    const char* tunables = std::getenv("GLIBC_TUNABLES");
+    return tunables && std::strstr(tunables, "hugetlb");
+}
 
 class FileStorageTest : public ::testing::Test {
    protected:
@@ -704,6 +801,7 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR");
         UnsetEnv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH");
         UnsetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
+        UnsetEnv("MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE");
         UnsetEnv("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT");
@@ -935,6 +1033,10 @@ class FileStorageTest : public ::testing::Test {
         return fileStorage.draining_.load();
     }
 
+    static void* StagingBufferBase(FileStorage& fileStorage) {
+        return fileStorage.client_buffer_allocator_->getBase();
+    }
+
     static void InjectDiskError(FileStorage& fileStorage, int err,
                                 const char* op) {
         fileStorage.OnDiskError(err, op);
@@ -963,16 +1065,37 @@ class FileStorageTest : public ::testing::Test {
 
     // Reads values of several sizes back from the offset allocator backend
     // through FileStorage, whole and in windows, into the staging buffers
-    // FileStorage allocates for them.
-    void RunOffsetBackendLocalReadScenario(bool use_uring) {
+    // FileStorage allocates for them. With a client, FileStorage::Init()
+    // first registers the staging buffer with it and mounts the local disk
+    // segment, as client setup does. staging_vma, if given, receives the
+    // staging buffer's VMA.
+    void RunOffsetBackendLocalReadScenario(
+        bool use_uring, const std::shared_ptr<Client>& client = nullptr,
+        const std::string& local_rpc_addr = "localhost:9003",
+        int64_t local_buffer_size = 128 * 1024 * 1024,
+        VmaInfo* staging_vma = nullptr) {
         auto config = FileStorageConfig::FromEnvironment();
         config.storage_backend_type = StorageBackendType::kOffsetAllocator;
         config.storage_filepath = data_path;
         config.total_size_limit = 64 * 1024 * 1024;
-        config.local_buffer_size = 128 * 1024 * 1024;
+        config.local_buffer_size = local_buffer_size;
         config.use_uring = use_uring;
-        FileStorage fileStorage(config, nullptr, "localhost:9003");
-        ASSERT_TRUE(InitStorageBackend(fileStorage));
+        FileStorage fileStorage(config, client, local_rpc_addr);
+        if (client) {
+            auto init = fileStorage.Init();
+            ASSERT_TRUE(init) << init.error();
+        } else {
+            ASSERT_TRUE(InitStorageBackend(fileStorage));
+        }
+        const auto staging_begin =
+            reinterpret_cast<uintptr_t>(StagingBufferBase(fileStorage));
+        const auto staging_end = staging_begin + local_buffer_size;
+        auto in_staging = [&](uintptr_t pointer, size_t size) {
+            return staging_begin <= pointer && pointer + size <= staging_end;
+        };
+        if (staging_vma) {
+            *staging_vma = FindVma(StagingBufferBase(fileStorage));
+        }
 
         // 200 bytes is about what BatchOffloadUtil writes per key, 56960 is
         // the KV page size reported in issue #5272 and 131072 the default of
@@ -1016,6 +1139,8 @@ class FileStorageTest : public ::testing::Test {
             ASSERT_TRUE(result) << result.error();
             ASSERT_EQ(result->pointers.size(), keys.size());
             for (size_t i = 0; i < keys.size(); ++i) {
+                EXPECT_TRUE(in_staging(result->pointers[i], values[i].size()))
+                    << "pass " << pass << " key " << keys[i];
                 EXPECT_EQ(std::memcmp(reinterpret_cast<const char*>(
                                           result->pointers[i]),
                                       values[i].data(), values[i].size()),
@@ -1036,6 +1161,9 @@ class FileStorageTest : public ::testing::Test {
         ASSERT_TRUE(ranges) << ranges.error();
         ASSERT_EQ(ranges->pointers.size(), keys.size());
         for (size_t i = 0; i < keys.size(); ++i) {
+            EXPECT_TRUE(in_staging(ranges->pointers[i],
+                                   static_cast<size_t>(lengths[i])))
+                << "range of key " << keys[i];
             EXPECT_EQ(
                 std::memcmp(reinterpret_cast<const char*>(ranges->pointers[i]),
                             values[i].data() + offsets[i],
@@ -1606,6 +1734,244 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
         FileStorageIsEnableOffloading(fileStorage3);
     ASSERT_TRUE(enable_offloading_result3 &&
                 !enable_offloading_result3.value());
+}
+
+// Without MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE (unset, off, or invalid), the
+// staging buffer keeps its base-page allocation, even when
+// MC_STORE_USE_HUGEPAGE puts the rest of the store on HugeTLB pages.
+TEST_F(FileStorageTest, StagingBufferKeepsBasePagesByDefault) {
+    if (GlibcMayUseHugetlb()) {
+        GTEST_SKIP() << "glibc may back malloc'd memory with hugepages";
+    }
+    ScopedEnv page_size("MC_STORE_HUGEPAGE_SIZE", "2MB");
+    for (const char* store : {static_cast<const char*>(nullptr), "1"}) {
+        ScopedEnv store_hugepage("MC_STORE_USE_HUGEPAGE", store);
+        for (const char* staging :
+             {static_cast<const char*>(nullptr), "0", "off", "not-a-bool"}) {
+            ScopedEnv staging_hugepage("MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE",
+                                       staging);
+            auto config = FileStorageConfig::FromEnvironment();
+            config.storage_filepath = data_path;
+            config.local_buffer_size = 4 * 1024 * 1024;
+            FileStorage storage(config, nullptr, "localhost:9003");
+            const VmaInfo vma = FindVma(StagingBufferBase(storage));
+            EXPECT_TRUE(vma.mapped);
+            EXPECT_FALSE(vma.hugetlb)
+                << "MC_STORE_USE_HUGEPAGE=" << (store ? store : "<unset>")
+                << " MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE="
+                << (staging ? staging : "<unset>");
+        }
+    }
+}
+
+// With the opt-in, the whole staging buffer, rounded up to whole hugepages,
+// is one HugeTLB mapping of MC_STORE_HUGEPAGE_SIZE pages, and a size that is
+// not a multiple of the page size is logged with the bytes it wastes. The
+// pages go back to the pool when FileStorage is destroyed.
+TEST_F(FileStorageTest, StagingBufferUsesHugetlbWhenRequested) {
+    constexpr size_t kPageSize = SZ_2MB;
+    constexpr long kPages = 4;
+    const long available = AvailableHugepages(kPageSize);
+    if (available < kPages) {
+        GTEST_SKIP() << "Needs " << kPages << " free 2MB hugepages, have "
+                     << available
+                     << " (/sys/kernel/mm/hugepages/hugepages-2048kB)";
+    }
+    ScopedEnv arena("MC_MMAP_ARENA_POOL_SIZE", nullptr);
+    ScopedEnv store_hugepage("MC_STORE_USE_HUGEPAGE", "1");
+    ScopedEnv page_size("MC_STORE_HUGEPAGE_SIZE", "2MB");
+    ScopedEnv staging_hugepage("MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE", "true");
+    auto config = FileStorageConfig::FromEnvironment();
+    ASSERT_TRUE(config.staging_use_hugepage);
+    config.storage_filepath = data_path;
+    config.local_buffer_size = (kPages - 1) * kPageSize + 4096;
+    const size_t usable = config.local_buffer_size;
+    const size_t mapped = kPages * kPageSize;
+    const long free_before = HugepagePoolCount(kPageSize, "free_hugepages");
+
+    unsigned char* base = nullptr;
+    {
+        ScopedStderrCapture capture;
+        FileStorage storage(config, nullptr, "localhost:9003");
+        const std::string logs = capture.Take();
+        base = static_cast<unsigned char*>(StagingBufferBase(storage));
+        ASSERT_NE(base, nullptr);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(base) % kPageSize, 0u);
+        for (const unsigned char* addr : {base, base + mapped - 1}) {
+            const VmaInfo vma = FindVma(addr);
+            EXPECT_TRUE(vma.hugetlb) << static_cast<const void*>(addr);
+            EXPECT_EQ(vma.kernel_page_kib, kPageSize / 1024);
+        }
+        EXPECT_EQ(HugepagePoolCount(kPageSize, "free_hugepages"),
+                  free_before - kPages);
+        std::memset(base, 0x5a, usable);
+        EXPECT_NE(logs.find(std::to_string(mapped) +
+                            " bytes mapped in 4 HugeTLB pages of 2048 kB"),
+                  std::string::npos)
+            << logs;
+        EXPECT_NE(logs.find("maps " + std::to_string(mapped) + " bytes, " +
+                            std::to_string(usable) + " of them usable and " +
+                            std::to_string(mapped - usable) + " wasted"),
+                  std::string::npos)
+            << logs;
+    }
+    EXPECT_FALSE(FindVma(base).hugetlb);
+    EXPECT_EQ(HugepagePoolCount(kPageSize, "free_hugepages"), free_before);
+}
+
+// With a client, FileStorage::Init() registers the HugeTLB staging buffer
+// (remote-accessible, as in client setup), and values read back from disk
+// land in it.
+TEST_F(FileStorageTest, StagingHugepageRegistersAndServesDiskReads) {
+    constexpr size_t kPageSize = SZ_2MB;
+    constexpr long kPages = 4;
+    const long available = AvailableHugepages(kPageSize);
+    if (available < kPages) {
+        GTEST_SKIP() << "Needs " << kPages << " free 2MB hugepages, have "
+                     << available
+                     << " (/sys/kernel/mm/hugepages/hugepages-2048kB)";
+    }
+    ScopedEnv arena("MC_MMAP_ARENA_POOL_SIZE", nullptr);
+    ScopedEnv store_hugepage("MC_STORE_USE_HUGEPAGE", "1");
+    ScopedEnv page_size("MC_STORE_HUGEPAGE_SIZE", "2MB");
+    ScopedEnv staging_hugepage("MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE", "1");
+    testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                 .set_enable_offload(true)
+                                 .set_default_kv_lease_ttl(0)
+                                 .set_root_fs_dir("")
+                                 .build()));
+    const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client);
+
+    VmaInfo staging;
+    RunOffsetBackendLocalReadScenario(/*use_uring=*/false, *client, endpoint,
+                                      kPages * kPageSize, &staging);
+    EXPECT_TRUE(staging.hugetlb);
+    EXPECT_EQ(staging.kernel_page_kib, kPageSize / 1024);
+}
+
+// With the mmap arena enabled, the HugeTLB staging buffer is taken from the
+// arena pool, which MC_STORE_USE_HUGEPAGE maps from HugeTLB pages too. The
+// arena is set up once per process, so this runs in a new process.
+TEST_F(FileStorageTest, StagingHugepageComesFromMmapArena) {
+    constexpr size_t kPageSize = SZ_2MB;
+    constexpr long kPages = 4;
+    const long available = AvailableHugepages(kPageSize);
+    if (available < kPages) {
+        GTEST_SKIP() << "Needs " << kPages << " free 2MB hugepages, have "
+                     << available
+                     << " (/sys/kernel/mm/hugepages/hugepages-2048kB)";
+    }
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ScopedEnv disable_arena("MC_DISABLE_MMAP_ARENA", nullptr);
+    ScopedEnv arena("MC_MMAP_ARENA_POOL_SIZE", "8MB");
+    ScopedEnv store_hugepage("MC_STORE_USE_HUGEPAGE", "1");
+    ScopedEnv page_size("MC_STORE_HUGEPAGE_SIZE", "2MB");
+    ScopedEnv staging_hugepage("MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE", "1");
+    EXPECT_EXIT(
+        {
+            auto config = FileStorageConfig::FromEnvironment();
+            config.storage_filepath = data_path;
+            config.local_buffer_size = 2 * kPageSize;
+            FileStorage storage(config, nullptr, "localhost:9003");
+            const void* base = StagingBufferBase(storage);
+            const VmaInfo vma = FindVma(base);
+            std::fprintf(stderr, "staging arena=%d hugetlb=%d page_kib=%lu\n",
+                         is_mmap_arena_allocation(base) ? 1 : 0,
+                         vma.hugetlb ? 1 : 0, vma.kernel_page_kib);
+            std::fflush(stderr);
+            std::_Exit(0);
+        },
+        ::testing::ExitedWithCode(0),
+        "staging arena=1 hugetlb=1 page_kib=2048");
+}
+
+// A HugeTLB request the pool cannot satisfy fails construction with an error
+// naming the page size and count; it does not fall back to base pages.
+TEST_F(FileStorageTest, StagingHugepageShortageFailsConstruction) {
+    constexpr size_t kPageSize = SZ_2MB;
+    const long available = AvailableHugepages(kPageSize);
+    if (available < 0 ||
+        HugepagePoolCount(kPageSize, "nr_overcommit_hugepages") != 0) {
+        GTEST_SKIP() << "No fixed-size 2MB HugeTLB pool on this host";
+    }
+    ScopedEnv arena("MC_MMAP_ARENA_POOL_SIZE", nullptr);
+    ScopedEnv store_hugepage("MC_STORE_USE_HUGEPAGE", "1");
+    ScopedEnv page_size("MC_STORE_HUGEPAGE_SIZE", "2MB");
+    ScopedEnv staging_hugepage("MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE", "1");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = (available + 1) * kPageSize;
+
+    try {
+        FileStorage storage(config, nullptr, "localhost:9003");
+        FAIL() << "FileStorage started without its HugeTLB staging buffer";
+    } catch (const std::runtime_error& e) {
+        const std::string message = e.what();
+        EXPECT_NE(message.find("MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE"),
+                  std::string::npos)
+            << message;
+        EXPECT_NE(message.find("needs " + std::to_string(available + 1) +
+                               " free pages in "
+                               "/sys/kernel/mm/hugepages/hugepages-2048kB"),
+                  std::string::npos)
+            << message;
+    }
+}
+
+// A non-positive staging size is reported as such, not as a hugepage
+// shortage.
+TEST_F(FileStorageTest, StagingHugepageRejectsNonPositiveSize) {
+    ScopedEnv store_hugepage("MC_STORE_USE_HUGEPAGE", "1");
+    ScopedEnv page_size("MC_STORE_HUGEPAGE_SIZE", "2MB");
+    ScopedEnv staging_hugepage("MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE", "1");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    for (const int64_t size : {int64_t{0}, int64_t{-1}}) {
+        config.local_buffer_size = size;
+        try {
+            FileStorage storage(config, nullptr, "localhost:9003");
+            ADD_FAILURE() << "FileStorage started with local_buffer_size="
+                          << size;
+        } catch (const std::invalid_argument& e) {
+            const std::string message = e.what();
+            EXPECT_NE(message.find("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=" +
+                                   std::to_string(size)),
+                      std::string::npos)
+                << message;
+            EXPECT_EQ(message.find("free pages"), std::string::npos) << message;
+        }
+    }
+}
+
+// The opt-in reuses the MC_STORE_USE_HUGEPAGE configuration; without it the
+// staging buffer keeps base pages and a warning says why.
+TEST_F(FileStorageTest, StagingHugepageNeedsStoreHugepage) {
+    if (GlibcMayUseHugetlb()) {
+        GTEST_SKIP() << "glibc may back malloc'd memory with hugepages";
+    }
+    ScopedEnv store_hugepage("MC_STORE_USE_HUGEPAGE", nullptr);
+    ScopedEnv staging_hugepage("MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE", "1");
+    auto config = FileStorageConfig::FromEnvironment();
+    ASSERT_TRUE(config.staging_use_hugepage);
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 4 * 1024 * 1024;
+
+    VmaInfo vma;
+    std::string logs;
+    {
+        ScopedStderrCapture capture;
+        FileStorage storage(config, nullptr, "localhost:9003");
+        logs = capture.Take();
+        vma = FindVma(StagingBufferBase(storage));
+    }
+    EXPECT_TRUE(vma.mapped);
+    EXPECT_FALSE(vma.hugetlb);
+    EXPECT_NE(logs.find("MC_STORE_USE_HUGEPAGE is not set"), std::string::npos)
+        << logs;
 }
 
 #ifdef USE_URING

@@ -47,6 +47,7 @@ struct FileStorageEnvironment {
         "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR"};
     ScopedEnvVar storage_path{"MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"};
     ScopedEnvVar local_buffer_size{"MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES"};
+    ScopedEnvVar staging_use_hugepage{"MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE"};
     ScopedEnvVar pinned_restore_arena_size{
         "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES"};
     ScopedEnvVar scanmeta_iterator_keys_limit{
@@ -79,6 +80,7 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_EQ(config.storage_backend_type, StorageBackendType::kBucket);
     EXPECT_EQ(config.storage_filepath, "/data/file_storage");
     EXPECT_EQ(config.local_buffer_size, 1280 * 1024 * 1024);
+    EXPECT_FALSE(config.staging_use_hugepage);
     EXPECT_EQ(config.pinned_restore_arena_size, 0);
     EXPECT_EQ(config.scanmeta_iterator_keys_limit, 20000);
     EXPECT_EQ(config.total_keys_limit, 10'000'000);
@@ -151,6 +153,33 @@ TEST_F(FileStorageConfigTest, FabricMemRoundsUnalignedLocalBufferUp) {
     fabric = previous;
 
     EXPECT_EQ(config.local_buffer_size, int64_t{2} * 1024 * 1024 * 1024);
+}
+
+TEST_F(FileStorageConfigTest, ReadsStagingUseHugepage) {
+    for (const char* value : {"1", "true", "TRUE", "yes", "on"}) {
+        env.staging_use_hugepage.Set(value);
+        EXPECT_TRUE(FileStorageConfig::FromEnvironment().staging_use_hugepage)
+            << value;
+    }
+    for (const char* value : {"0", "false", "no", "off"}) {
+        env.staging_use_hugepage.Set(value);
+        EXPECT_FALSE(FileStorageConfig::FromEnvironment().staging_use_hugepage)
+            << value;
+    }
+}
+
+TEST_F(FileStorageConfigTest, InvalidStagingUseHugepageIsIgnoredWithWarning) {
+    env.staging_use_hugepage.Set("not-a-bool");
+
+    ::testing::internal::CaptureStderr();
+    const auto config = FileStorageConfig::FromEnvironment();
+    const std::string logs = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_FALSE(config.staging_use_hugepage);
+    EXPECT_NE(logs.find("Ignoring invalid "
+                        "MOONCAKE_OFFLOAD_STAGING_USE_HUGEPAGE='not-a-bool'"),
+              std::string::npos)
+        << logs;
 }
 
 TEST_F(FileStorageConfigTest, ReadsValidValues) {

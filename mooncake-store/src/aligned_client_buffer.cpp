@@ -95,6 +95,11 @@ void* AllocateAlignedBuffer(size_t aligned_size, const std::string& protocol,
 }
 }  // namespace
 
+bool AlignedClientBufferAllocator::uses_protocol_allocator(
+    const std::string& protocol) {
+    return UseProtocolAllocator(protocol);
+}
+
 std::shared_ptr<AlignedClientBufferAllocator>
 AlignedClientBufferAllocator::create(size_t size, const std::string& protocol,
                                      bool use_hugepage) {
