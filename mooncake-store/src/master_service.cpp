@@ -5674,8 +5674,15 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // A restarted client has a new UUID and may report its SSD objects before
+    // the old owner's replicas are swept. Deduplicate by owner, not merely by
+    // storage medium, or that successful rescan would silently lose the new
+    // registration. Keep other owners until their normal lifecycle cleanup;
+    // neither a key nor an RPC endpoint proves two owners share a disk.
     const bool replacing_existing =
-        metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+        metadata.HasReplica([&client_id](const Replica& existing) {
+            return existing.get_local_disk_client_id() == client_id;
+        });
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::vector<Replica::Descriptor> post;
@@ -5702,8 +5709,13 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
             }
         }
         if (!replacing_existing) {
-            // The new LOCAL_DISK replica is COMPLETE upon AddReplica.
-            post.push_back(replica.get_descriptor());
+            // The new LOCAL_DISK replica is COMPLETE upon AddReplica. Same
+            // position as in memory: ahead of the existing LOCAL_DISK ones.
+            auto pos = std::find_if(post.begin(), post.end(),
+                                    [](const Replica::Descriptor& d) {
+                                        return d.is_local_disk_replica();
+                                    });
+            post.insert(pos, replica.get_descriptor());
         }
 
         auto persist_result = AppendOpLogVisibleBeforeDurable(
@@ -5715,9 +5727,7 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     }
 
     if (!replacing_existing) {
-        std::vector<Replica> replicas;
-        replicas.emplace_back(std::move(replica));
-        metadata.AddReplicas(std::move(replicas));
+        metadata.AddLocalDiskReplicaFirst(std::move(replica));
         SyncCacheTotalAccounting(metadata);
         return true;
     }
@@ -8438,10 +8448,12 @@ auto MasterService::NotifyOffloadSuccess(
                         // registration is refused.
                         refused_unmounted = true;
                     } else if (!obj_metadata.HasReplica(
-                                   &Replica::fn_is_local_disk_replica)) {
-                        std::vector<Replica> replicas;
-                        replicas.emplace_back(std::move(replica));
-                        obj_metadata.AddReplicas(std::move(replicas));
+                                   [&client_id](const Replica& rep) {
+                                       return rep.get_local_disk_client_id() ==
+                                              client_id;
+                                   })) {
+                        obj_metadata.AddLocalDiskReplicaFirst(
+                            std::move(replica));
                         SyncCacheTotalAccounting(obj_metadata);
                         MasterMetricManager::instance().inc_offload_completed(
                             UuidToString(client_id));

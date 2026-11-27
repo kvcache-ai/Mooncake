@@ -405,6 +405,21 @@ TEST_F(ReplicaSelectionTest, LocalDiskPrecedesDfs) {
     EXPECT_TRUE(sel->is_local_disk_replica());
 }
 
+// With several LOCAL_DISK replicas the first one wins, the same rule as the
+// session read path; the master lists the newest owner first.
+TEST_F(ReplicaSelectionTest, FirstLocalDiskReplicaWins) {
+    std::unordered_set<std::string> local;
+    std::vector<Replica::Descriptor> reps = {
+        MakeLocalDisk("new_owner"),
+        MakeDfs("/dfs/object"),
+        MakeLocalDisk("old_owner"),
+    };
+    const auto* sel = SelectBestReplica(reps, local);
+    ASSERT_NE(sel, nullptr);
+    ASSERT_TRUE(sel->is_local_disk_replica());
+    EXPECT_EQ(sel->get_local_disk_descriptor().transport_endpoint, "new_owner");
+}
+
 TEST_F(ReplicaSelectionTest, NoCompleteReplicaReturnsNull) {
     std::unordered_set<std::string> local;
     std::vector<Replica::Descriptor> reps = {

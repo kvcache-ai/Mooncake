@@ -281,6 +281,10 @@ struct ObjectMetadata {
         MutablePart(0).AddReplicas(std::move(replicas));
     }
 
+    void AddLocalDiskReplicaFirst(Replica&& replica) {
+        MutablePart(0).AddLocalDiskReplicaFirst(std::move(replica));
+    }
+
     std::vector<Replica> PopReplicas(
         const std::function<bool(const Replica&)>& pred_fn) {
         return MutablePart(0).PopReplicas(pred_fn);
