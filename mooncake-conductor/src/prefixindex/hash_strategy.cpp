@@ -922,7 +922,6 @@ class SglangHashChain final : public HashChain {
           cache_salt_(std::move(cache_salt)),
           event_seed_(std::move(event_seed)) {
         computed_.reserve(block_count_);
-        encoded_.reserve(block_size_ * sizeof(uint32_t) * (bigram ? 2 : 1));
         if (initial_parent) {
             parent_ = *initial_parent;
             has_parent_ = true;
@@ -983,8 +982,13 @@ class SglangHashChain final : public HashChain {
                 std::min(block_begin + block_size_, logical_length);
             // Size once, then write little-endian bytes directly instead of
             // updating the vectors for each byte of every token.
-            encoded_.resize((block_end - block_begin) * (bigram_ ? 8 : 4));
-            uint8_t* output = encoded_.data();
+            const size_t parent_size = has_parent_ ? parent_.size() : 0;
+            encoded_.resize(parent_size +
+                            (block_end - block_begin) * (bigram_ ? 8 : 4));
+            if (has_parent_) {
+                std::copy(parent_.begin(), parent_.end(), encoded_.begin());
+            }
+            uint8_t* output = encoded_.data() + parent_size;
             for (size_t token_index = block_begin; token_index < block_end;
                  ++token_index) {
                 const int32_t token = token_ids_[token_index];
@@ -1002,15 +1006,8 @@ class SglangHashChain final : public HashChain {
                     *output++ = static_cast<uint8_t>(next_value >> 24);
                 }
             }
-            std::vector<uint8_t> input;
-            input.reserve((has_parent_ ? parent_.size() : 0) + encoded_.size());
-            if (has_parent_) {
-                input.insert(input.end(), parent_.begin(), parent_.end());
-            }
-            input.insert(input.end(), encoded_.begin(), encoded_.end());
-
             HashBlock hashed;
-            if (std::string hash_error = Sha256(input, &hashed.digest);
+            if (std::string hash_error = Sha256(encoded_, &hashed.digest);
                 !hash_error.empty()) {
                 sticky_error_ = std::move(hash_error);
                 if (error != nullptr) *error = sticky_error_;
