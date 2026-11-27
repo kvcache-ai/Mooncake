@@ -19,6 +19,87 @@
 #include "store_rpc_client_io_context.h"
 #include "types.h"
 namespace mooncake::store {
+namespace {
+
+// A gather request carries at most this many ranges, matching the owner-side
+// GatherReadOptions::max_ranges limit. Groups above it are planned as several
+// requests instead of being handed to the scatter path as a whole.
+constexpr size_t kMaxPlanRanges = 131072;
+constexpr size_t kMinPlanRanges = 256;
+constexpr uint64_t kMaxPlanBytes = 512ULL << 20;
+constexpr uint64_t kMinPlanBytes = 64ULL << 10;
+
+// Builds one plan from whole transfers of a single (endpoint, buffer) group.
+// A plan must own whole transfers: the caller reports fragment completion per
+// transfer and plan, so a transfer split across plans would be reported as
+// failed by every plan that does not cover all of its fragments.
+bool BuildGatherPlan(
+    const std::string& endpoint,
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+    const std::vector<size_t>& indices, uintptr_t buffer,
+    GatherReadPlan& plan) {
+    struct Fragment {
+        uint64_t target, source, bytes;
+    };
+    size_t expected = 0;
+    for (size_t i : indices) expected += transfers[i].lengths.size();
+    std::vector<Fragment> fragments;
+    fragments.reserve(std::min(expected, kMaxPlanRanges));
+    for (size_t i : indices) {
+        const auto& t = transfers[i];
+        if (t.opcode != TransferRequest::READ ||
+            t.lengths.size() != t.local_offsets.size() ||
+            t.lengths.size() != t.remote_offsets.size() || !t.local_buffer ||
+            t.lengths.size() > kMaxPlanRanges - fragments.size())
+            return false;
+        for (size_t k = 0; k < t.lengths.size(); ++k) {
+            auto n = t.lengths[k];
+            if (!n || n > 1024 || t.local_offsets[k] > t.local_capacity ||
+                n > t.local_capacity - t.local_offsets[k] ||
+                t.remote_offsets[k] > t.remote_size ||
+                n > t.remote_size - t.remote_offsets[k] ||
+                t.remote_base_offset > UINT64_MAX - t.remote_offsets[k] ||
+                t.remote_base_offset + t.remote_offsets[k] > UINT64_MAX - n ||
+                buffer > UINT64_MAX - t.local_offsets[k] ||
+                buffer + t.local_offsets[k] > UINT64_MAX - n)
+                return false;
+            fragments.push_back({buffer + t.local_offsets[k],
+                                 t.remote_base_offset + t.remote_offsets[k],
+                                 n});
+        }
+    }
+    if (fragments.size() < kMinPlanRanges) return false;
+    std::sort(fragments.begin(), fragments.end(),
+              [](const auto& a, const auto& b) { return a.target < b.target; });
+    GatherReadPlan candidate{endpoint,
+                             indices,
+                             {},
+                             reinterpret_cast<void*>(fragments.front().target),
+                             0};
+    uint64_t next = fragments.front().target;
+    size_t source_runs = 0;
+    uint64_t previous_source_end = 0;
+    for (const auto& fragment : fragments) {
+        if (fragment.target != next ||
+            fragment.bytes > kMaxPlanBytes - candidate.bytes)
+            return false;
+        if (!source_runs || previous_source_end != fragment.source)
+            ++source_runs;
+        previous_source_end = fragment.source + fragment.bytes;
+        candidate.ranges.push_back({fragment.source, fragment.bytes});
+        candidate.bytes += fragment.bytes;
+        next += fragment.bytes;
+    }
+    // Count source runs, not merely submitted rows: contiguous source rows are
+    // already inexpensive on the existing coalescing path.
+    if (source_runs < kMinPlanRanges || candidate.bytes < kMinPlanBytes)
+        return false;
+    plan = std::move(candidate);
+    return true;
+}
+
+}  // namespace
+
 std::vector<GatherReadPlan> PlanGatherReads(
     const std::vector<TransferEngine::ScatterTransferRange>& transfers,
     const std::vector<std::string>& endpoints) {
@@ -36,78 +117,43 @@ std::vector<GatherReadPlan> PlanGatherReads(
                 .push_back(i);
     for (const auto& [key, indices] : groups) {
         size_t count = 0;
+        bool oversized = false;
         for (size_t i : indices) {
-            if (transfers[i].lengths.size() > 131072 - count) {
-                count = 131073;
+            if (transfers[i].lengths.size() > kMaxPlanRanges - count) {
+                oversized = true;
                 break;
             }
             count += transfers[i].lengths.size();
         }
-        if (count < 256 || count > 131072) continue;
-        struct Fragment {
-            uint64_t target, source, bytes;
-        };
-        std::vector<Fragment> fragments;
-        fragments.reserve(count);
-        bool valid = true;
-        for (size_t i : indices) {
-            const auto& t = transfers[i];
-            if (t.opcode != TransferRequest::READ ||
-                t.lengths.size() != t.local_offsets.size() ||
-                t.lengths.size() != t.remote_offsets.size() ||
-                !t.local_buffer ||
-                t.lengths.size() > 131072 - fragments.size()) {
-                valid = false;
-                break;
+        if (oversized) {
+            // Keep gather for a group that does not fit in one request by
+            // planning each run of whole transfers within the limit. A run
+            // that cannot form a valid plan on its own stays on scatter; the
+            // group is never dropped because of its total size alone.
+            std::vector<size_t> run;
+            size_t run_ranges = 0;
+            auto flush = [&] {
+                if (run.empty()) return;
+                GatherReadPlan plan;
+                if (BuildGatherPlan(key.first, transfers, run, key.second,
+                                    plan))
+                    plans.push_back(std::move(plan));
+                run.clear();
+                run_ranges = 0;
+            };
+            for (size_t i : indices) {
+                const size_t ranges = transfers[i].lengths.size();
+                if (ranges > kMaxPlanRanges) continue;  // no split can fit it
+                if (!run.empty() && ranges > kMaxPlanRanges - run_ranges)
+                    flush();
+                run.push_back(i);
+                run_ranges += ranges;
             }
-            for (size_t k = 0; k < t.lengths.size(); ++k) {
-                auto n = t.lengths[k];
-                if (!n || n > 1024 || t.local_offsets[k] > t.local_capacity ||
-                    n > t.local_capacity - t.local_offsets[k] ||
-                    t.remote_offsets[k] > t.remote_size ||
-                    n > t.remote_size - t.remote_offsets[k] ||
-                    t.remote_base_offset > UINT64_MAX - t.remote_offsets[k] ||
-                    t.remote_base_offset + t.remote_offsets[k] >
-                        UINT64_MAX - n ||
-                    key.second > UINT64_MAX - t.local_offsets[k] ||
-                    key.second + t.local_offsets[k] > UINT64_MAX - n) {
-                    valid = false;
-                    break;
-                }
-                fragments.push_back({key.second + t.local_offsets[k],
-                                     t.remote_base_offset + t.remote_offsets[k],
-                                     n});
-            }
-            if (!valid) break;
+            flush();
+            continue;
         }
-        if (!valid || fragments.size() < 256) continue;
-        std::sort(
-            fragments.begin(), fragments.end(),
-            [](const auto& a, const auto& b) { return a.target < b.target; });
-        GatherReadPlan plan{key.first,
-                            indices,
-                            {},
-                            reinterpret_cast<void*>(fragments.front().target),
-                            0};
-        uint64_t next = fragments.front().target;
-        size_t source_runs = 0;
-        uint64_t previous_source_end = 0;
-        for (const auto& fragment : fragments) {
-            if (fragment.target != next ||
-                fragment.bytes > (512ULL << 20) - plan.bytes) {
-                valid = false;
-                break;
-            }
-            if (!source_runs || previous_source_end != fragment.source)
-                ++source_runs;
-            previous_source_end = fragment.source + fragment.bytes;
-            plan.ranges.push_back({fragment.source, fragment.bytes});
-            plan.bytes += fragment.bytes;
-            next += fragment.bytes;
-        }
-        // Count source runs, not merely submitted rows: contiguous source
-        // rows are already inexpensive on the existing coalescing path.
-        if (valid && source_runs >= 256 && plan.bytes >= (64 << 10))
+        GatherReadPlan plan;
+        if (BuildGatherPlan(key.first, transfers, indices, key.second, plan))
             plans.push_back(std::move(plan));
     }
     return plans;
