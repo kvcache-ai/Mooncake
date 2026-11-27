@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <ylt/util/tl/expected.hpp>
+#include <ylt/struct_pb.hpp>
 
 #include "allocator.h"
 #include "common/timestamp.h"
@@ -1256,6 +1257,125 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
         std::string loaded(static_cast<char*>(it->second.ptr), it->second.size);
         EXPECT_EQ(loaded, value);
     }
+}
+
+TEST_F(StorageBackendTest, AdaptorBatchLoadRejectsUndersizedDestination) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_short_read";
+    file_per_key_config.enable_eviction = false;
+    StorageBackendAdaptor adaptor(cfg, file_per_key_config);
+    ASSERT_TRUE(adaptor.Init());
+    ASSERT_TRUE(adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    const std::string key = "short-read-key";
+    const std::string value = "hello world";
+    std::vector<char> value_buffer(value.begin(), value.end());
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    batch_object.emplace(
+        key, std::vector<Slice>{{value_buffer.data(), value_buffer.size()}});
+    ASSERT_TRUE(adaptor.BatchOffload(
+        batch_object,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    std::vector<char> destination(16, 0x5a);
+    const auto original = destination;
+    std::unordered_map<std::string, Slice> load_slices;
+    load_slices.emplace(key, Slice{destination.data(), 1});
+    auto result = adaptor.BatchLoad(load_slices);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(destination, original);
+}
+
+TEST_F(StorageBackendTest, AdaptorBatchLoadRejectsMismatchedValueLength) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_mismatched_value_length";
+    file_per_key_config.enable_eviction = false;
+    StorageBackendAdaptor adaptor(cfg, file_per_key_config);
+    ASSERT_TRUE(adaptor.Init());
+
+    struct Record {
+        std::string key;
+        std::string value;
+    };
+    const std::string requested_key = "length-check-key";
+    Record record{requested_key, "B"};
+    std::string encoded;
+    struct_pb::to_pb(record, encoded);
+    ASSERT_GE(encoded.size(), 3);
+    // Non-minimal varint keeps decoding valid while the value is shorter.
+    encoded.resize(encoded.size() - 3);
+    encoded.push_back(0x12);
+    encoded.push_back(0x81);
+    encoded.push_back(0x80);
+    encoded.push_back(0x00);
+    encoded.push_back('B');
+    const auto path = FileUtil::ResolvePathFromKey(
+        requested_key, cfg.storage_filepath, file_per_key_config.fsdir);
+    auto saved = FileUtil::SaveStringToFile(encoded, path);
+    ASSERT_TRUE(saved.has_value()) << saved.error();
+
+    std::vector<char> destination(record.value.size() + 2, 0x5a);
+    const auto original = destination;
+    std::unordered_map<std::string, Slice> load_slices;
+    load_slices.emplace(requested_key,
+                        Slice{destination.data(), destination.size()});
+    auto result = adaptor.BatchLoad(load_slices);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(destination, original);
+}
+
+TEST_F(StorageBackendTest, AdaptorBatchLoadRejectsMismatchedEmbeddedKey) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_mismatched_record";
+    file_per_key_config.enable_eviction = false;
+    StorageBackendAdaptor adaptor(cfg, file_per_key_config);
+    ASSERT_TRUE(adaptor.Init());
+    ASSERT_TRUE(adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    const std::string requested_key = "requested-key";
+    const std::string stored_key = "different-key";
+    const std::string value = "BBBB";
+    std::vector<char> value_buffer(value.begin(), value.end());
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    batch_object.emplace(stored_key, std::vector<Slice>{{value_buffer.data(),
+                                                         value_buffer.size()}});
+    ASSERT_TRUE(adaptor.BatchOffload(
+        batch_object,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    const auto stored_path = FileUtil::ResolvePathFromKey(
+        stored_key, cfg.storage_filepath, file_per_key_config.fsdir);
+    const auto requested_path = FileUtil::ResolvePathFromKey(
+        requested_key, cfg.storage_filepath, file_per_key_config.fsdir);
+    fs::create_directories(fs::path(requested_path).parent_path());
+    ASSERT_TRUE(fs::copy_file(stored_path, requested_path,
+                              fs::copy_options::overwrite_existing));
+
+    std::vector<char> destination(value.size(), 0x5a);
+    const auto original = destination;
+    std::unordered_map<std::string, Slice> load_slices;
+    load_slices.emplace(requested_key,
+                        Slice{destination.data(), destination.size()});
+    auto result = adaptor.BatchLoad(load_slices);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_KEY);
+    EXPECT_EQ(destination, original);
 }
 
 TEST_F(StorageBackendTest, AdaptorBatchOffload_PartialSuccess) {
