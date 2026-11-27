@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -43,6 +44,21 @@ using NofIOCallback = void (*)(void* ctx, const NofIOCompletion& completion);
 struct NofIOAdaptor {
     NofIOCallback cb;
     void* ctx;
+};
+
+// Neutral KV completion types. Keep them in the transport-independent
+// interface so the executor and its tests do not depend on SPDK headers.
+struct NofKvCompletion {
+    uint32_t status_code_type = 0;
+    uint32_t status_code = 0;
+    uint32_t result = 0;
+};
+
+using NofKvCallback = void (*)(void* ctx, const NofKvCompletion& completion);
+
+struct NofKvAdaptor {
+    NofKvCallback cb = nullptr;
+    void* ctx = nullptr;
 };
 
 struct NofCapabilities {
@@ -94,6 +110,37 @@ class NVMeoFInitiator {
     // "all pending" (SPDK dialect, now an explicit contract).
     virtual int64_t PollCompletion(NofSegmentHandle* handle,
                                    uint32_t max_completions) = 0;
+
+    // Optional KV command-set extension. Backends that only implement the
+    // block command set inherit the unsupported defaults.
+    virtual NofSegmentHandle* OpenKvSegment(
+        const std::string& /*transport_str*/) {
+        return nullptr;
+    }
+    virtual void CloseKvSegment(NofSegmentHandle* /*handle*/) {}
+    // Cancels outstanding KV commands and invalidates their queue pair. After
+    // this call returns, no callback for the aborted commands may run.
+    virtual void AbortKvSegment(NofSegmentHandle* /*handle*/) {}
+    virtual bool IsKvNamespace(const NofSegmentHandle* /*handle*/) const {
+        return false;
+    }
+    virtual int SubmitKvStore(NofSegmentHandle* /*handle*/, const void* /*key*/,
+                              uint8_t /*key_len*/, const void* /*value*/,
+                              uint32_t /*value_len*/, bool /*create_only*/,
+                              NofKvAdaptor* /*adaptor*/) {
+        return -EOPNOTSUPP;
+    }
+    virtual int SubmitKvRetrieve(NofSegmentHandle* /*handle*/,
+                                 const void* /*key*/, uint8_t /*key_len*/,
+                                 void* /*value*/, uint32_t /*value_len*/,
+                                 NofKvAdaptor* /*adaptor*/) {
+        return -EOPNOTSUPP;
+    }
+    virtual int SubmitKvDelete(NofSegmentHandle* /*handle*/,
+                               const void* /*key*/, uint8_t /*key_len*/,
+                               NofKvAdaptor* /*adaptor*/) {
+        return -EOPNOTSUPP;
+    }
 
     // Closes #3131: register a user buffer with the initiator's DMA
     // translation table. No-op (OK) for initiators without one.

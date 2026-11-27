@@ -32,6 +32,19 @@ class SpdkInitiator : public NVMeoFInitiator {
     ErrorCode UnregisterMemory(void* ptr) override;
     NofCapabilities GetCapabilities() const override;
 
+    NofSegmentHandle* OpenKvSegment(const std::string& transport_str) override;
+    void CloseKvSegment(NofSegmentHandle* handle) override;
+    void AbortKvSegment(NofSegmentHandle* handle) override;
+    bool IsKvNamespace(const NofSegmentHandle* handle) const override;
+    int SubmitKvStore(NofSegmentHandle* handle, const void* key,
+                      uint8_t key_len, const void* value, uint32_t value_len,
+                      bool create_only, NofKvAdaptor* adaptor) override;
+    int SubmitKvRetrieve(NofSegmentHandle* handle, const void* key,
+                         uint8_t key_len, void* value, uint32_t value_len,
+                         NofKvAdaptor* adaptor) override;
+    int SubmitKvDelete(NofSegmentHandle* handle, const void* key,
+                       uint8_t key_len, NofKvAdaptor* adaptor) override;
+
    private:
     class Impl;
     std::unique_ptr<Impl> impl_;
