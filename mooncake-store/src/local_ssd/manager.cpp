@@ -226,6 +226,61 @@ ErrorCode LocalSsdManager::EnqueueOffload(const UUID& client_id,
     return client->record->mailbox.EnqueueOffload(std::move(task), limit);
 }
 
+ErrorCode LocalSsdManager::EnqueueOffloadMirrors(
+    const std::vector<OffloadMirror>& mirrors, const TenantId& tenant,
+    const std::string& key, size_t limit, UUID* full_client) {
+    if (mirrors.empty()) return ErrorCode::UNABLE_OFFLOADING;
+    if (mirrors.size() == 1) {
+        auto result =
+            EnqueueOffload(mirrors.front().client,
+                           {tenant.value(), key, mirrors.front().size}, limit);
+        if (result == ErrorCode::KEYS_ULTRA_LIMIT && full_client)
+            *full_client = mirrors.front().client;
+        return result;
+    }
+    // Same lock order as CancelOffloadsIfAllPending. Heartbeats cannot drain
+    // an inserted prefix while a later insertion can still fail.
+    auto sorted = mirrors;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.client < b.client; });
+    std::vector<ClientAccess> clients;
+    clients.reserve(mirrors.size());
+    for (const auto& mirror : sorted) {
+        if (!clients.empty() && clients.back().client_id == mirror.client)
+            return ErrorCode::INVALID_PARAMS;
+        auto client = FindClient(mirror.client);
+        if (!client) return ErrorCode::SEGMENT_NOT_FOUND;
+        clients.push_back(std::move(*client));
+    }
+    const auto index = tenant.MakeScopedKey(key);
+    std::vector<std::unique_lock<Mutex>> locks;
+    locks.reserve(clients.size());
+    for (auto& client : clients) {
+        auto& box = client.record->mailbox;
+        locks.emplace_back(box.mutex_);
+        if (!box.enable_offloading_) return ErrorCode::UNABLE_OFFLOADING;
+        if (box.pending_offloads_.size() >= limit) {
+            if (full_client) *full_client = client.client_id;
+            return ErrorCode::KEYS_ULTRA_LIMIT;
+        }
+        if (box.pending_offloads_.contains(index))
+            return ErrorCode::OBJECT_ALREADY_EXISTS;
+    }
+    size_t inserted = 0;
+    try {
+        for (; inserted < clients.size(); ++inserted) {
+            clients[inserted].record->mailbox.pending_offloads_.emplace(
+                index,
+                OffloadTaskItem{tenant.value(), key, sorted[inserted].size});
+        }
+    } catch (...) {
+        while (inserted != 0)
+            clients[--inserted].record->mailbox.pending_offloads_.erase(index);
+        throw;
+    }
+    return ErrorCode::OK;
+}
+
 tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
 LocalSsdManager::SetOffloadingAndTakePending(const UUID& client_id,
                                              bool enabled) {

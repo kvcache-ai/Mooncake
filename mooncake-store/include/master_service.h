@@ -1579,6 +1579,10 @@ class MasterService {
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr);
 
+    tl::expected<Replica*, ErrorCode> PushOffloadingQueue(
+        const ObjectIdentity& object_id, std::span<Replica* const> sources,
+        std::vector<UUID>& mirror_clients);
+
     // Cancels the offload task on `object_id`, releasing the source refcnt
     // and dropping the task marker along with its mirrors. Returns false
     // without touching the task if any mirror has already been drained by a
@@ -1627,8 +1631,8 @@ class MasterService {
     // cluster-wide in-flight counter. Safe no-op if no task exists.
     void ErasePromotionTaskIfPresent(route::ObjectState& state)
         NO_THREAD_SAFETY_ANALYSIS {
-        if (state.promotion_task) {
-            state.promotion_task.reset();
+        if (state.Tasks().promotion_task) {
+            state.MutableTasks().promotion_task.reset();
             promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
             MasterMetricManager::instance().dec_promotion_in_flight();
             MasterMetricManager::instance().inc_promotion_cancelled();
@@ -1759,7 +1763,7 @@ class MasterService {
         }
 
         bool HasReplicationTask() const {
-            return IsPublished() && guard_->state().replication_task;
+            return IsPublished() && guard_->state().Tasks().replication_task;
         }
 
         // The held key and its tenant; only while a key is held.
@@ -1789,7 +1793,7 @@ class MasterService {
         route::ObjectState& GetState() { return guard_->state(); }
 
         ReplicationTask& GetReplicationTask() {
-            return *guard_->state().replication_task;
+            return *guard_->state().MutableTasks().replication_task;
         }
 
         // Publishes an object under the held key, which must hold none:
@@ -1816,8 +1820,8 @@ class MasterService {
         }
 
         void EraseReplicationTask() {
-            if (IsPublished()) {
-                guard_->state().replication_task.reset();
+            if (HasReplicationTask()) {
+                guard_->state().MutableTasks().replication_task.reset();
             }
         }
 

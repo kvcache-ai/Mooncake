@@ -71,8 +71,7 @@ void BufferAllocatorBase::AttachUsageTracker(
     if (!usage_tracker || usage_registration_) {
         return;
     }
-    usage_registration_ = std::make_unique<StorageUsageRegistration>(
-        usage_tracker, cur_size_, capacity());
+    AttachUsageTracker(usage_tracker, capacity());
 }
 
 void BufferAllocatorBase::RecordAllocation(size_t bytes) noexcept {
@@ -90,78 +89,141 @@ void BufferAllocatorBase::RecordDeallocation(size_t bytes) noexcept {
 }
 
 std::string AllocatedBuffer::getSegmentName() const noexcept {
-    auto alloc = allocator_.lock();
+    auto alloc = getAllocator();
     if (alloc) {
         return alloc->getSegmentName();
     }
     return std::string();
 }
 
-AllocatedBuffer::~AllocatedBuffer() {
-    // Note: This is an edge case. If the 'weak_ptr' is released, the segment
-    // has already been deallocated at this point, and its memory usage details
-    // (capacity/allocated) no longer need to be maintained.
-    auto alloc = allocator_.lock();
-    if (alloc) {
-        alloc->deallocate(this);
-        VLOG(1) << "buf_handle_deallocated size=" << size_;
+std::shared_ptr<const BufferOrigin> BufferAllocatorBase::GetBufferOrigin(
+    const std::shared_ptr<BufferAllocatorBase>& allocator) {
+    if (!allocator) {
+        static const auto empty = std::make_shared<const BufferOrigin>();
+        return empty;
     }
+    std::call_once(allocator->origin_once_, [&] {
+        auto root = std::make_shared<BufferOrigin>();
+        root->allocator = allocator;
+        root->offset_allocator = allocator->OffsetOwner();
+        root->protocol = allocator->getTransportProtocol();
+        allocator->origin_ = std::move(root);
+    });
+    return allocator->origin_;
+}
+
+std::shared_ptr<const BufferOrigin> BufferOrigin::ForTransport(
+    const std::shared_ptr<const BufferOrigin>& source,
+    std::string_view protocol, std::string_view cxl_endpoint,
+    uintptr_t transfer_address_base) {
+    const auto matches = [&](const BufferOrigin& origin) {
+        return origin.protocol == protocol &&
+               origin.cxl_endpoint == cxl_endpoint &&
+               origin.transfer_address_base == transfer_address_base;
+    };
+    if (matches(*source)) return source;
+
+    const auto make_variant = [&] {
+        auto result = std::make_shared<BufferOrigin>(*source);
+        result->protocol = protocol;
+        result->cxl_endpoint = cxl_endpoint;
+        result->transfer_address_base = transfer_address_base;
+        return result;
+    };
+    // An already converted CXL buffer or an external release token can carry
+    // private state. Do not build chains of cached overrides on these buffers.
+    if (source->transfer_address_base || source->release_size)
+        return make_variant();
+
+    // Mounted CXL bindings and most standby endpoints use a single variant.
+    // Once published it can be read concurrently without taking the mutex.
+    auto& cache = source->transports;
+    std::call_once(cache.first_once, [&] { cache.first = make_variant(); });
+    if (matches(*cache.first)) return cache.first;
+
+    std::lock_guard lock(cache.mutex);
+    for (const auto& entry : cache.others) {
+        auto result = entry.lock();
+        if (result && matches(*result)) return result;
+    }
+    std::erase_if(cache.others,
+                  [](const auto& entry) { return entry.expired(); });
+    auto result = make_variant();
+    cache.others.push_back(result);
+    return result;
+}
+
+void AllocatedBuffer::ReleaseOffset() noexcept {
+    using offset_allocator::OffsetAllocation;
+    if (allocation_.isNoSpace()) return;
+    const auto allocation = std::exchange(
+        allocation_, OffsetAllocation{OffsetAllocation::NO_SPACE,
+                                      OffsetAllocation::NO_SPACE});
+    if (auto owner = origin_->offset_allocator.lock()) {
+        owner->freeAllocation(allocation,
+                              origin_->release_size.value_or(size_));
+    }
+}
+
+AllocatedBuffer::~AllocatedBuffer() {
+    if (auto owner = getAllocator()) {
+        owner->deallocate(this);
+    }
+    // The inner allocator can outlive the mounting allocator.
+    ReleaseOffset();
 }
 
 AllocatedBuffer::AllocatedBuffer(
     std::shared_ptr<BufferAllocatorBase> allocator, void* buffer_ptr,
     std::size_t size,
     std::optional<offset_allocator::OffsetAllocationHandle>&& offset_handle)
-    : allocator_(allocator),
-      buffer_ptr_(buffer_ptr),
-      size_(size),
-      offset_handle_(std::move(offset_handle)) {
-    auto protocol =
-        allocator ? allocator->getTransportProtocol() : std::string();
-    if (protocol != "tcp") {
-        protocol_ = std::make_unique<ProtocolState>();
-        protocol_->kind =
-            protocol == "cxl" ? BufferProtocol::kCxl : BufferProtocol::kOther;
-        if (protocol_->kind == BufferProtocol::kOther) {
-            protocol_->value = std::move(protocol);
+    : origin_(BufferAllocatorBase::GetBufferOrigin(allocator)),
+      allocation_address_(buffer_ptr),
+      size_(size) {
+    if (offset_handle) {
+        const auto& owner = offset_handle->m_allocator;
+        if (owner.owner_before(origin_->offset_allocator) ||
+            origin_->offset_allocator.owner_before(owner) ||
+            offset_handle->size() != size) {
+            auto origin = std::make_shared<BufferOrigin>(*origin_);
+            origin->offset_allocator = owner;
+            origin->release_size = offset_handle->size();
+            origin_ = std::move(origin);
         }
+        allocation_ = offset_handle->m_allocation;
+        offset_handle->m_allocator.reset();
+        offset_handle.reset();
     }
 }
 
 AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                                  const AllocatedBuffer::Descriptor& descriptor)
-    : allocator_(std::move(allocator)),
-      buffer_ptr_(reinterpret_cast<void*>(descriptor.buffer_address_)),
-      size_(descriptor.size_) {
-    if (descriptor.protocol_ == "cxl") {
-        protocol_ = std::make_unique<ProtocolState>();
-        protocol_->kind = BufferProtocol::kCxl;
-        protocol_->value = descriptor.transport_endpoint_;
-    } else if (descriptor.protocol_ != "tcp") {
-        // Keep every other protocol so the descriptor still round-trips
-        // through restore unchanged.
-        protocol_ = std::make_unique<ProtocolState>();
-        protocol_->kind = BufferProtocol::kOther;
-        protocol_->value = descriptor.protocol_;
+    : AllocatedBuffer(
+          std::move(allocator),
+          reinterpret_cast<void*>(
+              descriptor.buffer_address_ +
+              (descriptor.protocol_ == "cxl" ? DEFAULT_CXL_BASE : 0)),
+          descriptor.size_) {
+    if (descriptor.protocol_ != origin_->protocol ||
+        descriptor.protocol_ == "cxl") {
+        const bool cxl = descriptor.protocol_ == "cxl";
+        origin_ = BufferOrigin::ForTransport(
+            origin_, descriptor.protocol_,
+            cxl ? std::string_view(descriptor.transport_endpoint_)
+                : std::string_view{},
+            cxl ? DEFAULT_CXL_BASE : 0);
     }
 }
 
-std::string_view AllocatedBuffer::protocolName() const noexcept {
-    if (!protocol_) return "tcp";
-    switch (protocol_->kind) {
-        case BufferProtocol::kCxl:
-            return "cxl";
-        case BufferProtocol::kOther:
-            return protocol_->value;
-        case BufferProtocol::kTcp:
-            break;
-    }
-    return "tcp";
+void AllocatedBuffer::bindSegmentLifetime(SegmentLifetime lifetime) {
+    auto bound = std::make_shared<BufferOrigin>(*origin_);
+    bound->lifetime = std::move(lifetime);
+    origin_ = std::move(bound);
 }
 
 std::string AllocatedBuffer::getTransportEndpoint(
     std::optional<SegmentLocality>* locality) const {
-    auto alloc = allocator_.lock();
+    auto alloc = getAllocator();
     std::string endpoint;
     if (alloc) {
         endpoint = alloc->getTransportEndpoint();
@@ -177,8 +239,8 @@ std::string AllocatedBuffer::getTransportEndpoint(
             << "allocator=expired_or_null in getTransportEndpoint";
     }
 
-    if (protocolKind() == BufferProtocol::kCxl) {
-        endpoint = protocol_->value;
+    if (origin_->protocol == "cxl") {
+        endpoint = origin_->cxl_endpoint;
     }
     return endpoint;
 }
@@ -186,38 +248,24 @@ std::string AllocatedBuffer::getTransportEndpoint(
 // Implementation of get_descriptor
 AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor(
     std::optional<SegmentLocality>* locality) const {
-    return {static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_),
-            std::string(protocolName()), getTransportEndpoint(locality)};
+    return {static_cast<uint64_t>(size()), reinterpret_cast<uintptr_t>(data()),
+            origin_->protocol, getTransportEndpoint(locality)};
 }
 
-void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {
-    // Reuse the state already created for a non-TCP segment. Only TCP needs
-    // an allocation here; do it before converting the address so unwinding
-    // cannot free an offset as a host address (see
-    // CachelibBufferAllocator::deallocate). The remaining steps are noexcept.
-    auto state =
-        protocol_ ? std::move(protocol_) : std::make_unique<ProtocolState>();
-    state->kind = BufferProtocol::kCxl;
-    state->value = std::move(client_segment_name);
-
-    uint64_t offset_raw = reinterpret_cast<uintptr_t>(buffer_ptr_);
-    buffer_ptr_ = reinterpret_cast<void*>(offset_raw - DEFAULT_CXL_BASE);
-    protocol_ = std::move(state);
+void AllocatedBuffer::change_to_cxl(std::string_view client_segment_name) {
+    origin_ = BufferOrigin::ForTransport(origin_, "cxl", client_segment_name,
+                                         DEFAULT_CXL_BASE);
 }
 
-void* AllocatedBuffer::get_vaddr_from_cxl() {
-    uint64_t offset_raw = reinterpret_cast<uintptr_t>(buffer_ptr_);
-    return reinterpret_cast<void*>(offset_raw + DEFAULT_CXL_BASE);
-}
+void* AllocatedBuffer::get_vaddr_from_cxl() { return allocation_address_; }
 
 // Define operator<< using public accessors or get_descriptor if appropriate
 std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
+    const auto allocator = buffer.getAllocator();
     return os << "AllocatedBuffer: { "
               << "segment_name: "
-              << (buffer.allocator_.lock()
-                      ? buffer.allocator_.lock()->getSegmentName()
-                      : std::string("<expired>"))
+              << (allocator ? allocator->getSegmentName()
+                            : std::string("<expired>"))
               << ", "
               << "size: " << buffer.size() << ", "
               << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
@@ -324,6 +372,10 @@ CachelibBufferAllocator::~CachelibBufferAllocator() {
 
 std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
     size_t size) {
+    // CacheLib's free list can itself allocate. Prepare the complete owner
+    // before taking a block so an origin/handle OOM needs no rollback.
+    auto handle =
+        std::make_unique<AllocatedBuffer>(shared_from_this(), nullptr, size);
     void* buffer = nullptr;
     try {
         // Allocate memory using CacheLib.
@@ -342,8 +394,14 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
         LOG(ERROR) << "allocation_unknown_exception";
         return nullptr;
     }
-    VLOG(1) << "allocation_succeeded size=" << size
-            << " segment=" << segment_name_ << " address=" << buffer;
+    adoptBuffer(*handle, buffer);
+    return handle;
+}
+
+void CachelibBufferAllocator::adoptBuffer(AllocatedBuffer& handle,
+                                          void* buffer) {
+    handle.allocation_address_ = buffer;
+    const auto size = handle.size();
     RecordAllocation(size);
     if (replica_type_ == ReplicaType::MEMORY) {
         MasterMetricManager::instance().inc_allocated_mem_size(segment_name_,
@@ -352,16 +410,15 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
         MasterMetricManager::instance().inc_allocated_nof_size(segment_name_,
                                                                size);
     }
-    return std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size);
+    VLOG(1) << "allocation_succeeded size=" << size
+            << " segment=" << segment_name_ << " address=" << buffer;
 }
 
 void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
+    if (!handle->allocation_address_) return;
     try {
-        void* buffer = handle->get_descriptor().protocol_ == "cxl"
-                           ? handle->get_vaddr_from_cxl()
-                           : handle->buffer_ptr_;
         // Deallocate memory using CacheLib.
-        memory_allocator_->free(buffer);
+        memory_allocator_->free(handle->allocation_address_);
         size_t freed_size =
             handle->size_;  // Store size before handle might become invalid
         RecordDeallocation(freed_size);
@@ -372,29 +429,14 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
             MasterMetricManager::instance().dec_allocated_nof_size(
                 segment_name_, freed_size);
         }
-        VLOG(1) << "deallocation_succeeded address=" << handle->buffer_ptr_
-                << " size=" << freed_size << " segment=" << segment_name_;
+        VLOG(1) << "deallocation_succeeded address="
+                << handle->allocation_address_ << " size=" << freed_size
+                << " segment=" << segment_name_;
     } catch (const std::exception& e) {
         LOG(ERROR) << "deallocation_exception error=" << e.what();
     } catch (...) {
         LOG(ERROR) << "deallocation_unknown_exception";
     }
-}
-
-std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::adoptImportedBuffer(
-    const LiveAllocation& allocation) {
-    RecordAllocation(allocation.requested_size);
-    if (replica_type_ == ReplicaType::MEMORY) {
-        MasterMetricManager::instance().inc_allocated_mem_size(
-            segment_name_, allocation.requested_size);
-    } else if (replica_type_ == ReplicaType::NOF_SSD) {
-        MasterMetricManager::instance().inc_allocated_nof_size(
-            segment_name_, allocation.requested_size);
-    }
-    return std::make_unique<AllocatedBuffer>(
-        shared_from_this(),
-        reinterpret_cast<void*>(base_ + allocation.offset_from_base),
-        allocation.requested_size);
 }
 
 std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
@@ -433,7 +475,12 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
     buffers.reserve(allocations.size());
     for (const auto& allocation : allocations) {
-        buffers.push_back(allocator->adoptImportedBuffer(allocation));
+        auto handle = std::make_unique<AllocatedBuffer>(
+            allocator, nullptr, allocation.requested_size);
+        allocator->adoptBuffer(
+            *handle,
+            reinterpret_cast<void*>(base + allocation.offset_from_base));
+        buffers.push_back(std::move(handle));
     }
     return RestoredCachelibBufferAllocator{std::move(allocator),
                                            std::move(buffers)};
@@ -542,10 +589,9 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
 
 void OffsetBufferAllocator::deallocate(AllocatedBuffer* handle) {
     try {
-        // The OffsetAllocator handles deallocation automatically through RAII
-        // when the OffsetAllocationHandle goes out of scope
+        // Consume the allocation token once, before publishing the new usage.
         size_t freed_size = handle->size();
-        handle->offset_handle_.reset();
+        handle->ReleaseOffset();
         RecordDeallocation(freed_size);
         if (replica_type_ == ReplicaType::MEMORY) {
             MasterMetricManager::instance().dec_allocated_mem_size(

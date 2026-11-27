@@ -81,6 +81,15 @@ class LocalSsdManager {
     std::optional<Usage> GetUsage(const UUID& client_id) const;
     bool AdjustUsedBytes(const UUID& client_id, int64_t delta);
 
+    struct OffloadMirror {
+        UUID client;
+        int64_t size;
+    };
+    // Publish one key to all selected mailboxes, or leave them unchanged.
+    ErrorCode EnqueueOffloadMirrors(const std::vector<OffloadMirror>& mirrors,
+                                    const TenantId& tenant,
+                                    const std::string& key, size_t limit,
+                                    UUID* full_client = nullptr);
     ErrorCode EnqueueOffload(const UUID& client_id, OffloadTaskItem task,
                              size_t limit);
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>

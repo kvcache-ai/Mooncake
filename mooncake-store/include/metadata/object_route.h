@@ -63,6 +63,7 @@
 #include "common/transparent_string_hash.h"
 #include "metadata/group_index.h"
 #include "metadata/object_state.h"
+#include "metadata/slot_mutex.h"
 #include "mutex.h"
 #include "object_metadata.h"
 
@@ -140,9 +141,9 @@ struct SlotOwnerState {
 
 // A slot's lock as a guard or cursor holds it in `kMode`.
 template <LockMode kMode>
-using SlotLock = std::conditional_t<kMode == LockMode::kWrite,
-                                    std::unique_lock<std::shared_mutex>,
-                                    std::shared_lock<std::shared_mutex>>;
+using SlotLock =
+    std::conditional_t<kMode == LockMode::kWrite, std::unique_lock<SlotMutex>,
+                       std::shared_lock<SlotMutex>>;
 
 class ObjectRoute;
 template <LockMode kMode>
@@ -183,9 +184,10 @@ class KeySlot {
     // neither copied nor moved.
     struct Record {
         template <typename... Args>
-        explicit Record(Generation generation, Args&&... metadata_args)
+        explicit Record(Generation generation, const std::string& key,
+                        const TenantId& tenant, Args&&... metadata_args)
             : generation(generation),
-              metadata(std::forward<Args>(metadata_args)...) {}
+              metadata(&key, &tenant, std::forward<Args>(metadata_args)...) {}
 
         Generation generation;
         ObjectMetadata metadata;
@@ -198,7 +200,7 @@ class KeySlot {
     // holds an object; the map's own entry is not a holder. Exactly 1 means a
     // sole holder and no object, so that holder's release drops the slot.
     std::atomic<uint32_t> state_{0};
-    mutable std::shared_mutex mutex_;
+    mutable SlotMutex mutex_;
     std::optional<Record> record_;
     SlotOwnerState owner_;
     // Hook into the owner's in-flight list.
@@ -430,8 +432,9 @@ class ObjectRoute {
     // `observer`, when set, outlives the route; it hears of read releases
     // only when `report_reads` is set.
     explicit ObjectRoute(RouteObserver* observer = nullptr,
-                         bool report_reads = false)
-        : observer_(observer),
+                         bool report_reads = false, TenantId tenant = {})
+        : tenant_(std::move(tenant)),
+          observer_(observer),
           report_reads_(observer != nullptr && report_reads) {}
     ObjectRoute(const ObjectRoute&) = delete;
     ObjectRoute& operator=(const ObjectRoute&) = delete;
@@ -562,6 +565,7 @@ class ObjectRoute {
                "route access from inside an object cursor");
     }
 
+    const TenantId tenant_;
     RouteObserver* const observer_;
     const bool report_reads_;
     std::atomic<Generation> next_generation_{1};
@@ -572,7 +576,9 @@ class ObjectRoute {
     mutable std::atomic<uint32_t> live_cursors_{0};
     mutable std::array<Stripe, kStripeCount> stripes_;
     // Group membership and the one shared Lease per group.
-    GroupIndex groups_;
+    // Membership is removed before its slot can be erased. The table is
+    // destroyed before the stripes holding the key bytes.
+    StripedGroupIndex<64, std::string_view> groups_;
 };
 
 // --- Guard ------------------------------------------------------------------
@@ -586,6 +592,7 @@ Guard<kMode>::~Guard() {
         if (handed_out_ && route_->observer_ != nullptr) {
             route_->observer_->OnWriteRelease(*this);
         }
+        if (handed_out_ && has_object()) state().ReleaseIdleTasks();
     } else {
         if (handed_out_ && route_->report_reads_) {
             route_->observer_->OnReadRelease(*this);
@@ -765,6 +772,7 @@ class ObjectRoute::Cursor {
 
     void UnlockSlot() {
         if (slot_lock_.owns_lock()) {
+            if constexpr (kWrite) current_->record_->state.ReleaseIdleTasks();
             slot_lock_.unlock();
         }
     }
@@ -863,26 +871,26 @@ Generation ObjectRoute::PublishLocked(KeySlot& slot, Args&&... metadata_args) {
     const Generation generation =
         next_generation_.fetch_add(1, std::memory_order_relaxed);
     ObjectMetadata& metadata =
-        slot.record_.emplace(generation, std::forward<Args>(metadata_args)...)
+        slot.record_
+            .emplace(generation, slot.key(), tenant_,
+                     std::forward<Args>(metadata_args)...)
             .metadata;
+    if (metadata.IsGrouped()) {
+        try {
+            metadata.BindGroupLease(
+                groups_.AddMember(metadata.GroupId(), slot.key()));
+        } catch (...) {
+            slot.record_.reset();
+            throw;
+        }
+    }
     slot.state_.fetch_or(KeySlot::kOccupied, std::memory_order_relaxed);
-    if (metadata.user_key != slot.key()) {
-        LOG(FATAL) << "Publish under key " << slot.key()
-                   << " of an object keyed " << metadata.user_key;
-    }
-    if (!metadata.group_id.empty()) {
-        // AddMember returns null only for an empty group_id.
-        auto lease = groups_.AddMember(metadata.group_id, slot.key());
-        assert(lease != nullptr);
-        SpinLocker locker(&metadata.lock);
-        metadata.lease_ = std::move(lease);
-    }
     object_count_.fetch_add(1, std::memory_order_relaxed);
     return generation;
 }
 
 inline void ObjectRoute::TearDownLocked(KeySlot& slot) {
-    const std::string& group_id = slot.record_->metadata.group_id;
+    const std::string& group_id = slot.record_->metadata.GroupId();
     if (!group_id.empty()) {
         (void)groups_.RemoveMember(group_id, slot.key());
     }
@@ -909,7 +917,7 @@ inline void ObjectRoute::RebuildGroupState() {
         }
         const auto deadline = metadata.EvictionDeadline();
         auto [it, inserted] =
-            max_deadline_by_group.try_emplace(metadata.group_id, deadline);
+            max_deadline_by_group.try_emplace(metadata.GroupId(), deadline);
         if (!inserted) {
             it->second = std::max(it->second, deadline);
         }
@@ -917,7 +925,7 @@ inline void ObjectRoute::RebuildGroupState() {
     // The group index is a leaf under a slot lock, so the loop body registers
     // membership itself.
     for (auto object : WriteCursor()) {
-        const std::string& group_id = object.metadata().group_id;
+        const std::string& group_id = object.metadata().GroupId();
         if (group_id.empty()) {
             continue;
         }
@@ -927,8 +935,7 @@ inline void ObjectRoute::RebuildGroupState() {
         if (it != max_deadline_by_group.end()) {
             lease->ExtendTo(it->second);
         }
-        SpinLocker locker(&object.metadata().lock);
-        object.metadata().lease_ = std::move(lease);
+        object.metadata().BindGroupLease(std::move(lease));
     }
 }
 

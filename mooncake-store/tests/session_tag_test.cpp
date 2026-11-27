@@ -77,7 +77,7 @@ std::string SessionTag(MasterService& service, const std::string& key) {
         &service, MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
                       key, TenantId::Default()));
     EXPECT_TRUE(access.Exists());
-    return access.Exists() ? access.Get().session_id : "<missing>";
+    return access.Exists() ? access.Get().SessionId() : "<missing>";
 }
 
 ReplicateConfig Tagged(std::string id) {

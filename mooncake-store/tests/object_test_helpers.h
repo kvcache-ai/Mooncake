@@ -89,8 +89,7 @@ struct ObjectRouteTestPeer {
         if (!slot) {
             return true;
         }
-        std::unique_lock<std::shared_mutex> lock(slot->mutex_,
-                                                 std::try_to_lock);
+        std::unique_lock lock(slot->mutex_, std::try_to_lock);
         return lock.owns_lock();
     }
 
@@ -125,11 +124,11 @@ struct ObjectRouteTestPeer {
             }
         }
         for (const auto& slot : slots) {
-            std::unique_lock<std::shared_mutex> lock(slot->mutex_);
+            std::unique_lock lock(slot->mutex_);
             if (!slot->record_.has_value()) {
                 continue;
             }
-            const std::string& group_id = slot->record_->metadata.group_id;
+            const std::string& group_id = slot->record_->metadata.GroupId();
             if (!group_id.empty()) {
                 (void)route.groups_.RemoveMember(group_id, slot->key());
             }

@@ -118,9 +118,11 @@ TEST(DynamicReplicationControllerTest, CommitFilesTheLeaseAndStartsCooldown) {
     route::ObjectState state;
     const auto lease = Admit(controller, state, "key");
 
-    ASSERT_TRUE(state.dynamic_replication_pending.has_value());
-    EXPECT_EQ(state.dynamic_replication_pending->lease_id, lease.lease_id);
-    EXPECT_EQ(state.dynamic_replication_pending->task_id, lease.task_id);
+    ASSERT_TRUE(state.Tasks().dynamic_replication_pending.has_value());
+    EXPECT_EQ(state.Tasks().dynamic_replication_pending->lease_id,
+              lease.lease_id);
+    EXPECT_EQ(state.Tasks().dynamic_replication_pending->task_id,
+              lease.task_id);
     EXPECT_FALSE(state.HasWorkInFlight());
     EXPECT_TRUE(Indexed(controller, "key"));
     EXPECT_TRUE(controller.HasPendingLocked(kTenant, "key", state));
@@ -165,7 +167,7 @@ TEST(DynamicReplicationControllerTest, ClearDropsPendingCooldownLeaseAndIndex) {
 
     controller.ClearPendingLocked(kTenant, "key", state);
 
-    EXPECT_FALSE(state.dynamic_replication_pending.has_value());
+    EXPECT_FALSE(state.Tasks().dynamic_replication_pending.has_value());
     EXPECT_TRUE(controller.CheckCooldownLocked(state));
     EXPECT_FALSE(controller.FindLease(kTenant, lease.proposal_id).has_value());
     EXPECT_FALSE(Indexed(controller, "key"));
@@ -213,12 +215,12 @@ TEST(DynamicReplicationControllerTest, ExpiredPendingIsClearedOnLookup) {
     auto controller = MakeController("enforce");
     route::ObjectState state;
     Admit(controller, state, "key");
-    state.dynamic_replication_pending->expire_at_ms_epoch = 1;
+    state.MutableTasks().dynamic_replication_pending->expire_at_ms_epoch = 1;
 
     EXPECT_TRUE(controller.PendingExpiredLocked(
         state, DynamicReplicationController::NowMs()));
     EXPECT_FALSE(controller.HasPendingLocked(kTenant, "key", state));
-    EXPECT_FALSE(state.dynamic_replication_pending.has_value());
+    EXPECT_FALSE(state.Tasks().dynamic_replication_pending.has_value());
     EXPECT_FALSE(Indexed(controller, "key"));
 }
 
@@ -265,7 +267,7 @@ TEST(DynamicReplicationControllerTest, DynamicCopyMustMatchItsPendingTask) {
             .error(),
         ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     // None of those gave the task up.
-    EXPECT_TRUE(state.dynamic_replication_pending.has_value());
+    EXPECT_TRUE(state.Tasks().dynamic_replication_pending.has_value());
 
     // The object changed version since the lease: the task is dropped, with
     // its lease.
@@ -275,7 +277,7 @@ TEST(DynamicReplicationControllerTest, DynamicCopyMustMatchItsPendingTask) {
                                      "source", 8, 7, targets)
             .error(),
         ErrorCode::INVALID_VERSION);
-    EXPECT_FALSE(state.dynamic_replication_pending.has_value());
+    EXPECT_FALSE(state.Tasks().dynamic_replication_pending.has_value());
     EXPECT_FALSE(controller.FindLease(kTenant, lease.proposal_id).has_value());
 }
 
@@ -289,12 +291,12 @@ TEST(DynamicReplicationControllerTest, GuardGivesUpThePendingTaskUnlessKept) {
             controller, kTenant, key, state, /*active=*/true);
         guard.Release();
     }
-    EXPECT_TRUE(state.dynamic_replication_pending.has_value());
+    EXPECT_TRUE(state.Tasks().dynamic_replication_pending.has_value());
     {
         DynamicReplicationController::PendingCopyGuard guard(
             controller, kTenant, key, state, /*active=*/true);
     }
-    EXPECT_FALSE(state.dynamic_replication_pending.has_value());
+    EXPECT_FALSE(state.Tasks().dynamic_replication_pending.has_value());
 }
 
 TEST(DynamicReplicationControllerTest, UnindexForgetsOnlyThatKey) {

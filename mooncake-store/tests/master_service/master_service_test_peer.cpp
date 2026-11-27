@@ -170,8 +170,11 @@ void MasterServiceTestPeer::ResetCandidateBackoffsForTesting() {
         MasterService::MetadataAccessorRW accessor(
             &service_, MasterService::ObjectIdentity{.tenant_id = tenant_id,
                                                      .user_key = key});
-        if (accessor.Exists() && accessor.GetState().promotion_candidate) {
-            accessor.GetState().promotion_candidate->retry_after = epoch;
+        if (accessor.Exists() &&
+            accessor.GetState().Tasks().promotion_candidate) {
+            accessor.GetState()
+                .MutableTasks()
+                .promotion_candidate->retry_after = epoch;
             tracker.File(tenant_id, key, epoch);
         }
     }

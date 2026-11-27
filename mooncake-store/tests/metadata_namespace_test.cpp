@@ -70,7 +70,7 @@ TEST(NamespaceTest, AKeyStaysListedWhileAnyWorkRemains) {
         auto guard = ns.objects.Write("k1");
         ASSERT_TRUE(guard.has_value());
         guard->state().is_processing = true;
-        guard->state().offloading_task =
+        guard->state().MutableTasks().offloading_task =
             OffloadingTask{1, std::chrono::system_clock::now(), {}};
     }
 
@@ -81,7 +81,7 @@ TEST(NamespaceTest, AKeyStaysListedWhileAnyWorkRemains) {
     {
         auto guard = ns.objects.Write("k1");
         ASSERT_TRUE(guard.has_value());
-        guard->state().offloading_task.reset();
+        guard->state().MutableTasks().offloading_task.reset();
     }
     EXPECT_TRUE(ns.InFlightKeys().empty());
 }

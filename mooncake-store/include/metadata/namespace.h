@@ -55,8 +55,9 @@ class Namespace final : private route::RouteObserver {
                        std::unique_ptr<EvictionIndex> eviction_index = nullptr,
                        NamespaceObserver* observer = nullptr)
         // The route is built first, so it reads the index before it moves.
-        : objects(this, eviction_index != nullptr &&
-                            eviction_index->observes_reads()),
+        : objects(this,
+                  eviction_index != nullptr && eviction_index->observes_reads(),
+                  id),
           id_(std::move(id)),
           policy_(policy),
           observer_(observer),

@@ -13,9 +13,8 @@
 #include <optional>
 #include <span>
 #include <utility>
+#include <variant>
 #include <vector>
-
-#include <boost/container/small_vector.hpp>
 
 #include "replica.h"
 
@@ -31,9 +30,9 @@ class ObjectPart {
     ObjectPart& operator=(ObjectPart&&) = delete;
 
     ObjectPart(size_t length, std::vector<Replica>&& replicas)
-        : length_(length),
-          replicas_(std::move_iterator(replicas.begin()),
-                    std::move_iterator(replicas.end())) {}
+        : length_(length), replicas_(std::move(replicas)) {
+        InlineSingleReplica();
+    }
 
     size_t length() const { return length_; }
 
@@ -47,50 +46,73 @@ class ObjectPart {
     // below. The first replica sits in the part itself, so the common one
     // replica case allocates nothing.
     std::span<Replica> replicas() {
-        return {replicas_.data(), replicas_.size()};
+        if (auto* one = std::get_if<Replica>(&replicas_)) return {one, 1};
+        return std::get<std::vector<Replica>>(replicas_);
     }
     std::span<const Replica> replicas() const {
-        return {replicas_.data(), replicas_.size()};
+        if (auto* one = std::get_if<Replica>(&replicas_)) return {one, 1};
+        return std::get<std::vector<Replica>>(replicas_);
     }
 
-    void AddReplicas(std::vector<Replica>&& replicas) {
-        replicas_.insert(replicas_.end(), std::move_iterator(replicas.begin()),
-                         std::move_iterator(replicas.end()));
+    void AddReplicas(std::vector<Replica>&& added) {
+        if (added.empty()) return;
+        if (auto* one = std::get_if<Replica>(&replicas_)) {
+            std::vector<Replica> many;
+            many.reserve(1 + added.size());
+            many.push_back(std::move(*one));
+            replicas_.emplace<std::vector<Replica>>(std::move(many));
+        }
+        auto& many = std::get<std::vector<Replica>>(replicas_);
+        if (many.empty()) {
+            many = std::move(added);
+            InlineSingleReplica();
+        } else {
+            many.insert(many.end(), std::make_move_iterator(added.begin()),
+                        std::make_move_iterator(added.end()));
+        }
     }
 
     // What comes back is out of the part: the caller owns those replicas and
     // decides how to isolate, defer or release them.
     template <typename Pred>
     [[nodiscard]] std::vector<Replica> PopReplicas(Pred&& pred) {
-        auto partition_point = std::partition(
-            replicas_.begin(), replicas_.end(),
-            [&pred](const Replica& replica) { return !pred(replica); });
-
-        std::vector<Replica> popped_replicas;
-        if (partition_point != replicas_.end()) {
-            popped_replicas.reserve(
-                std::distance(partition_point, replicas_.end()));
-            std::move(partition_point, replicas_.end(),
-                      std::back_inserter(popped_replicas));
-            replicas_.erase(partition_point, replicas_.end());
+        if (auto* one = std::get_if<Replica>(&replicas_)) {
+            return pred(*one) ? PopReplicas() : std::vector<Replica>{};
         }
-
-        return popped_replicas;
+        auto& many = std::get<std::vector<Replica>>(replicas_);
+        const auto keep_end = std::partition(
+            many.begin(), many.end(),
+            [&](const Replica& replica) { return !pred(replica); });
+        if (keep_end == many.begin()) return PopReplicas();
+        std::vector<Replica> popped(std::make_move_iterator(keep_end),
+                                    std::make_move_iterator(many.end()));
+        many.erase(keep_end, many.end());
+        InlineSingleReplica();
+        return popped;
     }
 
     [[nodiscard]] std::vector<Replica> PopReplicas() {
-        std::vector<Replica> popped_replicas;
-        popped_replicas.reserve(replicas_.size());
-        std::move(replicas_.begin(), replicas_.end(),
-                  std::back_inserter(popped_replicas));
-        replicas_.clear();
-        return popped_replicas;
+        if (auto* many = std::get_if<std::vector<Replica>>(&replicas_)) {
+            return std::exchange(*many, {});
+        }
+        std::vector<Replica> popped;
+        popped.push_back(std::move(std::get<Replica>(replicas_)));
+        replicas_.emplace<std::vector<Replica>>();
+        return popped;
     }
 
    private:
+    void InlineSingleReplica() {
+        auto& many = std::get<std::vector<Replica>>(replicas_);
+        if (many.size() == 1) {
+            // Move out before emplace destroys the vector holding the element.
+            Replica only = std::move(many.front());
+            replicas_.emplace<Replica>(std::move(only));
+        }
+    }
     const size_t length_;
     std::optional<uint64_t> checksum_;
-    boost::container::small_vector<Replica, 1> replicas_;
+    std::variant<Replica, std::vector<Replica>> replicas_;
 };
 
 }  // namespace mooncake

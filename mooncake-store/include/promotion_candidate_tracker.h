@@ -22,6 +22,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -95,10 +96,21 @@ class PromotionCandidateTracker {
    private:
     friend class test::MasterServiceTestPeer;
 
+    struct KeyView {
+        std::string_view tenant;
+        std::string_view key;
+
+        KeyView(const TenantId& tenant_id, std::string_view key)
+            : tenant(tenant_id.value()), key(key) {}
+        KeyView(const Key& owned) : KeyView(owned.tenant_id, owned.key) {}
+
+        friend bool operator==(KeyView, KeyView) = default;
+    };
     struct KeyHash {
-        size_t operator()(const Key& k) const noexcept {
-            return TenantIdHash{}(k.tenant_id) ^
-                   (std::hash<std::string>{}(k.key) * 1099511628211ULL);
+        using is_transparent = void;
+        size_t operator()(KeyView k) const noexcept {
+            return std::hash<std::string_view>{}(k.tenant) ^
+                   (std::hash<std::string_view>{}(k.key) * 1099511628211ULL);
         }
     };
     using TimePoint = std::chrono::steady_clock::time_point;
@@ -131,7 +143,7 @@ class PromotionCandidateTracker {
     mutable std::mutex mutex_;
     // When each filed key is due, and the same keys in due order. The order
     // points at the keys of `due_`, whose nodes never move.
-    std::unordered_map<Key, TimePoint, KeyHash> due_;
+    std::unordered_map<Key, TimePoint, KeyHash, std::equal_to<>> due_;
     std::set<std::pair<TimePoint, const Key*>> order_;
 };
 

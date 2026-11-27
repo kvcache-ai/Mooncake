@@ -100,7 +100,7 @@ class PrefetchTaskMasterTest : public ::testing::Test {
             service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
                                                    .user_key = key});
         return accessor.Exists() &&
-               accessor.GetState().promotion_task.has_value();
+               accessor.GetState().Tasks().promotion_task.has_value();
     }
 
     static bool IsLeaseAliveForTesting(MasterService* service,
@@ -123,10 +123,12 @@ class PrefetchTaskMasterTest : public ::testing::Test {
             service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
                                                    .user_key = key});
         if (!accessor.Exists() ||
-            !accessor.GetState().promotion_candidate.has_value()) {
+            !accessor.GetState().Tasks().promotion_candidate.has_value()) {
             return std::nullopt;
         }
-        return accessor.GetState().promotion_candidate->execution_failures;
+        return accessor.GetState()
+            .Tasks()
+            .promotion_candidate->execution_failures;
     }
 
     // The in-flight task's execution-failure count if a task exists.
@@ -137,10 +139,10 @@ class PrefetchTaskMasterTest : public ::testing::Test {
             service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
                                                    .user_key = key});
         if (!accessor.Exists() ||
-            !accessor.GetState().promotion_task.has_value()) {
+            !accessor.GetState().Tasks().promotion_task.has_value()) {
             return std::nullopt;
         }
-        return accessor.GetState().promotion_task->execution_failures;
+        return accessor.GetState().Tasks().promotion_task->execution_failures;
     }
 
     // Seed an on-hit candidate carrying a prior execution-failure history,

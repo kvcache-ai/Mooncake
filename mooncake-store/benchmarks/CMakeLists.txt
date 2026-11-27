@@ -14,10 +14,24 @@ add_executable(master_bench master_bench.cpp)
 target_link_libraries(master_bench PRIVATE cachelib_memory_allocator
                                            mooncake_store)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(master_metadata_footprint_bench
+                 master_metadata_footprint_bench.cpp)
+  target_link_libraries(
+    master_metadata_footprint_bench
+    PRIVATE mooncake_store_master
+            cachelib_memory_allocator
+            mooncake_common
+            yalantinglibs::yalantinglibs
+            glog::glog
+            gflags::gflags
+            pthread)
+endif()
+
 # Add BatchGetReplicaList latency benchmark executable
 add_executable(batch_get_replica_bench batch_get_replica_bench.cpp)
 target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator
-                                                       mooncake_store)
+                                                      mooncake_store)
 
 # Add file interface benchmark executable
 add_executable(file_interface_bench file_interface_bench.cpp)
@@ -43,7 +57,7 @@ target_link_libraries(
 if(USE_NOF)
   add_executable(nof_worker_pool_bench nof_worker_pool_bench.cpp)
   target_link_libraries(nof_worker_pool_bench PRIVATE mooncake_store glog::glog
-                                                       gflags::gflags)
+                                                      gflags::gflags)
 endif()
 
 # Add BatchEvict benchmark executable

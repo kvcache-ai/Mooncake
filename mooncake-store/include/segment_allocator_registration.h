@@ -36,9 +36,9 @@ class SegmentAllocatorRegistration {
     [[nodiscard]] std::shared_ptr<SegmentAllocatorRegistration> WithAllocator(
         std::shared_ptr<BufferAllocatorBase> replacement) const;
     [[nodiscard]] std::shared_ptr<SegmentAllocatorRegistration>
-    ReplaceClientSession(ClientSessionSharedPtr session,
-                         std::shared_ptr<BufferAllocatorBase> allocator,
-                         bool allocatable);
+    WithClientSession(ClientSessionSharedPtr session,
+                      std::shared_ptr<BufferAllocatorBase> allocator,
+                      bool allocatable) const;
     void BindBuffer(AllocatedBuffer& buffer) const;
     void SetAllocatable(bool allocatable) noexcept;
     void Invalidate() noexcept;
@@ -48,6 +48,8 @@ class SegmentAllocatorRegistration {
     // carry: draining toggles this flag without invalidating existing buffers.
     std::atomic<bool> allocatable_{true};
     SegmentLifetime lifetime_;
+    std::shared_ptr<const BufferOrigin> standalone_origin_;
+    std::shared_ptr<const BufferOrigin> bound_origin_;
 
     friend class AllocatorManager;
     friend class ScopedNoFSegmentAccess;

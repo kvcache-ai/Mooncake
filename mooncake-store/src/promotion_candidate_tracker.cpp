@@ -39,13 +39,17 @@ void PromotionCandidateTracker::RecordLocked(const TenantId& tenant_id,
                                              ErrorCode last_error,
                                              uint32_t execution_failures) {
     const auto now = std::chrono::steady_clock::now();
-    if (state.promotion_candidate) {
+    if (state.Tasks().promotion_candidate) {
         // Update existing entry: refresh last_seen, reset
         // retry_after/retry_count. execution_failures is intentionally NOT
         // updated here: a read refresh is new demand signal and may extend
         // the budget, but it must not erase the failure history of this
         // admission chain.
-        PromotionCandidate& candidate = *state.promotion_candidate;
+        PromotionCandidate& candidate =
+            *state.MutableTasks().promotion_candidate;
+        if (File(tenant_id, key, now)) {
+            count_.fetch_add(1, std::memory_order_relaxed);
+        }
         candidate.last_seen = now;
         candidate.last_reason = reason;
         candidate.last_error = last_error;
@@ -54,9 +58,6 @@ void PromotionCandidateTracker::RecordLocked(const TenantId& tenant_id,
         }
         candidate.retry_after = now;
         candidate.retry_count = 0;
-        if (File(tenant_id, key, now)) {
-            count_.fetch_add(1, std::memory_order_relaxed);
-        }
         return;
     }
 
@@ -75,18 +76,27 @@ void PromotionCandidateTracker::RecordLocked(const TenantId& tenant_id,
         return;
     }
 
-    state.promotion_candidate.emplace(
-        PromotionCandidate{.sketch_score = sketch_score,
-                           .first_seen = now,
-                           .last_seen = now,
-                           .retry_after = now,
-                           .last_reason = reason,
-                           .last_error = last_error,
-                           .retry_count = 0,
-                           .execution_failures = execution_failures});
-    if (!File(tenant_id, key, now)) {
-        // A stale entry the object left behind holds a slot of its own.
+    try {
+        auto& slot = state.MutableTasks().promotion_candidate;
+        HeapOptional<PromotionCandidate> prepared;
+        prepared.emplace(
+            PromotionCandidate{.sketch_score = sketch_score,
+                               .first_seen = now,
+                               .last_seen = now,
+                               .retry_after = now,
+                               .last_reason = reason,
+                               .last_error = last_error,
+                               .retry_count = 0,
+                               .execution_failures = execution_failures});
+        if (!File(tenant_id, key, now)) {
+            // A stale entry the object left behind holds a slot of its own.
+            DecrementCount();
+        }
+        slot = std::move(prepared);
+    } catch (...) {
         DecrementCount();
+        state.ReleaseIdleTasks();
+        throw;
     }
     MasterMetricManager::instance().inc_promotion_candidate_recorded();
     VLOG(1) << "promotion_candidate_recorded key=" << key;
@@ -95,23 +105,23 @@ void PromotionCandidateTracker::RecordLocked(const TenantId& tenant_id,
 void PromotionCandidateTracker::EraseLocked(const TenantId& tenant_id,
                                             const std::string& key,
                                             route::ObjectState& state) {
-    if (!state.promotion_candidate) {
+    if (!state.Tasks().promotion_candidate) {
         return;
     }
-    state.promotion_candidate.reset();
     if (Unfile(tenant_id, key)) {
         DecrementCount();
     }
+    state.MutableTasks().promotion_candidate.reset();
 }
 
 uint32_t PromotionCandidateTracker::ConsumeLocked(const TenantId& tenant_id,
                                                   const std::string& key,
                                                   route::ObjectState& state) {
-    if (!state.promotion_candidate) {
+    if (!state.Tasks().promotion_candidate) {
         return 0;
     }
     const uint32_t execution_failures =
-        state.promotion_candidate->execution_failures;
+        state.Tasks().promotion_candidate->execution_failures;
     EraseLocked(tenant_id, key, state);
     return execution_failures;
 }
@@ -120,10 +130,10 @@ bool PromotionCandidateTracker::DueLocked(const TenantId& tenant_id,
                                           const std::string& key,
                                           route::ObjectState& state,
                                           TimePoint now) {
-    if (!state.promotion_candidate) {
+    if (!state.Tasks().promotion_candidate) {
         return false;
     }
-    const PromotionCandidate& candidate = *state.promotion_candidate;
+    const PromotionCandidate& candidate = *state.Tasks().promotion_candidate;
     if (Stale(candidate, now)) {
         VLOG(1) << "promotion_candidate_expired key=" << key
                 << " retry_count=" << candidate.retry_count;
@@ -147,11 +157,12 @@ void PromotionCandidateTracker::BackoffLocked(const TenantId& tenant_id,
                                               const std::string& key,
                                               route::ObjectState& state,
                                               PromotionQueueResult result) {
-    if (!state.promotion_candidate) {
+    if (!state.Tasks().promotion_candidate) {
         return;
     }
     const auto now = std::chrono::steady_clock::now();
-    PromotionCandidate& candidate = *state.promotion_candidate;
+    auto& slot = *state.MutableTasks().promotion_candidate;
+    auto candidate = slot;
     candidate.retry_count++;
     if (result == PromotionQueueResult::kWatermarkRejected) {
         candidate.last_reason = PromotionCandidateReason::kWatermark;
@@ -172,6 +183,7 @@ void PromotionCandidateTracker::BackoffLocked(const TenantId& tenant_id,
     } else {
         candidate.retry_after = now + Backoff(candidate.retry_count);
         File(tenant_id, key, candidate.retry_after);
+        slot = candidate;
     }
 }
 
@@ -205,17 +217,27 @@ bool PromotionCandidateTracker::File(const TenantId& tenant_id,
     std::lock_guard<std::mutex> lock(mutex_);
     auto [it, inserted] = due_.try_emplace(Key{tenant_id, key}, due);
     if (!inserted) {
-        order_.erase({it->second, &it->first});
-        it->second = due;
+        if (it->second != due) {
+            auto node = order_.extract({it->second, &it->first});
+            node.value().first = due;
+            order_.insert(std::move(node));
+            it->second = due;
+        }
+        return false;
     }
-    order_.emplace(due, &it->first);
-    return inserted;
+    try {
+        order_.emplace(due, &it->first);
+    } catch (...) {
+        due_.erase(it);
+        throw;
+    }
+    return true;
 }
 
 bool PromotionCandidateTracker::Unfile(const TenantId& tenant_id,
                                        const std::string& key) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = due_.find(Key{tenant_id, key});
+    const auto it = due_.find(KeyView{tenant_id, key});
     if (it == due_.end()) {
         return false;
     }

@@ -19,7 +19,7 @@ tl::expected<Effect, ErrorCode> OffloadingReclaimer::Apply(
         return inner_.Apply(ns, hold, plan, so_far);
     }
     // The replica an offload in flight pinned keeps the data until it lands.
-    if (hold.state().offloading_task.has_value()) {
+    if (hold.state().Tasks().offloading_task.has_value()) {
         return inner_.Apply(ns, hold, plan, so_far);
     }
     if (options_.force_evict && static_cast<long>(so_far.Count(
@@ -29,20 +29,24 @@ tl::expected<Effect, ErrorCode> OffloadingReclaimer::Apply(
 
     for (const ReplicaID id : plan.release) {
         Replica* source = metadata.GetReplicaByID(id);
-        std::vector<UUID> mirror_clients;
-        if (source == nullptr ||
-            !queue_.Push(ns.id(), hold.key(), *source, &mirror_clients)) {
-            continue;
-        }
-        source->inc_refcnt();
-        hold.state().offloading_task =
-            OffloadingTask{id, Clock::now(), std::move(mirror_clients)};
-
+        if (!source) continue;
         Plan rest;
-        for (const ReplicaID other : plan.release) {
-            if (other != id) {
-                rest.release.push_back(other);
+        try {
+            for (const ReplicaID other : plan.release) {
+                if (other != id) rest.release.push_back(other);
             }
+            auto& slot = hold.state().MutableTasks().offloading_task;
+            HeapOptional<OffloadingTask> pending;
+            auto& task = pending.emplace();
+            task.source_id = id;
+            task.start_time = Clock::now();
+            if (!queue_.Push(ns.id(), hold.key(), *source,
+                             &task.mirror_clients))
+                continue;
+            slot = std::move(pending);
+            source->inc_refcnt();
+        } catch (const std::bad_alloc&) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
         auto effect = rest.release.empty()
                           ? tl::expected<Effect, ErrorCode>(Effect{})

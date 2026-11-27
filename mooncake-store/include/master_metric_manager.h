@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <string>
@@ -36,6 +37,10 @@ class MasterMetricManager {
     void dec_allocated_mem_size(const std::string& segment, int64_t val = 1);
     void reset_allocated_mem_size();
     void inc_total_mem_capacity(const std::string& segment, int64_t val = 1);
+    // Prepare the label and this thread's global gauge slot before publishing
+    // a batch of mounts. Invoke on the same thread at commit.
+    std::function<void()> PrepareMountCapacity(const std::string& segment,
+                                               int64_t bytes);
     void dec_total_mem_capacity(const std::string& segment, int64_t val = 1);
     void reset_total_mem_capacity();
 
@@ -604,9 +609,16 @@ class MasterMetricManager {
     ylt::metric::dynamic_gauge_1t
         mem_allocated_size_per_segment_;  // Segment memory usage update for
                                           // gauge
-    ylt::metric::dynamic_gauge_1t
-        mem_total_capacity_per_segment_;  // Segment memory capacity update for
-                                          // gauge
+    class CapacityGauge : public ylt::metric::dynamic_gauge_1t {
+       public:
+        using ylt::metric::dynamic_gauge_1t::dynamic_gauge_1t;
+        std::shared_ptr<std::atomic<int64_t>> Pin(const std::string& label) {
+            auto entry = try_emplace(std::array<std::string, 1>{label}).first;
+            return {entry, &entry->value};
+        }
+    };
+    CapacityGauge mem_total_capacity_per_segment_;  // Segment memory capacity
+                                                    // update for gauge
 
     // NoF Segment Metrics
     ylt::metric::gauge_t

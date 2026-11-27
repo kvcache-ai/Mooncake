@@ -14,6 +14,10 @@
 
 #include "mutex.h"
 
+namespace mooncake {
+class AllocatedBuffer;
+}
+
 namespace mooncake::offset_allocator {
 typedef unsigned char uint8;
 typedef unsigned short uint16;
@@ -102,6 +106,7 @@ class OffsetAllocationHandle {
     uint64_t size() const { return requested_size; }
 
    private:
+    friend class mooncake::AllocatedBuffer;
     std::weak_ptr<OffsetAllocator> m_allocator;
     // The offset in m_allocation may not be equal to the real offset.
     OffsetAllocation m_allocation;
@@ -199,6 +204,7 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     static std::shared_ptr<OffsetAllocator> deserialize_from(T& serializer);
 
    private:
+    friend class mooncake::AllocatedBuffer;
     friend class OffsetAllocationHandle;
 
     // Internal method for Handle to free allocation (thread-safe)

@@ -183,6 +183,12 @@ std::optional<UUID> ScopedAllocatorAccess::GetOwnerClientId(
 
 ErrorCode ScopedSegmentAccess::MountSegment(
     const Segment& segment, ClientSessionSharedPtr owner_session) {
+    return MountSegment(segment, std::move(owner_session), nullptr);
+}
+
+ErrorCode ScopedSegmentAccess::MountSegment(
+    const Segment& segment, ClientSessionSharedPtr owner_session,
+    std::vector<std::function<void()>>* publish) {
     if (!owner_session) {
         return ErrorCode::INVALID_PARAMS;
     }
@@ -260,7 +266,16 @@ ErrorCode ScopedSegmentAccess::MountSegment(
         if (!mounted.locality && segment.locality) {
             mounted.locality = segment.locality;
             if (existing->second.buf_allocator) {
-                existing->second.buf_allocator->SetLocality(segment.locality);
+                auto allocator = existing->second.buf_allocator;
+                if (publish) {
+                    auto locality = std::make_shared<const SegmentLocality>(
+                        *segment.locality);
+                    publish->emplace_back([allocator, locality] {
+                        allocator->PublishLocality(locality);
+                    });
+                } else {
+                    allocator->SetLocality(segment.locality);
+                }
             }
             segment_manager_->allocator_manager_.SetSegmentMetadata(mounted);
         }
@@ -325,7 +340,8 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     auto allocator = std::move(*created);
     allocator->SetLocality(segment.locality);
 
-    allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
+    if (!publish)
+        allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
     auto registration = segment_manager_->allocator_manager_.addAllocator(
         segment.name, allocator, std::move(owner_session));
     segment_manager_->allocator_manager_.SetSegmentMetadata(segment);
@@ -336,7 +352,20 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     segment_manager_->segment_id_by_name_[segment.name] = segment.id;
     segment_manager_->registrations_by_name_[segment.name].insert(segment.id);
     AddHostSegment(segment_manager_->segments_by_host_, segment);
-    MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
+    if (publish) {
+        auto& mounted = segment_manager_->mounted_segments_.at(segment.id);
+        auto capacity = MasterMetricManager::instance().PrepareMountCapacity(
+            segment.name, size);
+        publish->emplace_back([&mounted,
+                               tracker = segment_manager_->usage_tracker_, size,
+                               capacity = std::move(capacity)] {
+            mounted.buf_allocator->AttachUsageTracker(tracker, size);
+            capacity();
+        });
+    } else {
+        MasterMetricManager::instance().inc_total_mem_capacity(segment.name,
+                                                               size);
+    }
 
     return ErrorCode::OK;
 }
@@ -344,33 +373,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
 void ScopedSegmentAccess::BindClientSession(
     const ClientSessionSharedPtr& owner_session) {
     CHECK(owner_session);
-    const auto client_segments_it =
-        segment_manager_->client_segments_.find(owner_session->ClientId());
-    if (client_segments_it == segment_manager_->client_segments_.end()) {
-        return;
-    }
-    for (const auto& segment_id : client_segments_it->second) {
-        auto mounted_it = segment_manager_->mounted_segments_.find(segment_id);
-        if (mounted_it == segment_manager_->mounted_segments_.end() ||
-            !mounted_it->second.allocator_registration) {
-            continue;
-        }
-        auto& mounted = mounted_it->second;
-        auto old_registration = mounted.allocator_registration;
-        if (old_registration->GetClientSession() == owner_session) {
-            continue;
-        }
-        const bool in_allocator_manager =
-            HasAllocatorRegistration(segment_manager_->allocator_manager_,
-                                     mounted.segment.name, old_registration);
-        auto next_registration = old_registration->ReplaceClientSession(
-            owner_session, mounted.buf_allocator, in_allocator_manager);
-        if (in_allocator_manager) {
-            CHECK(segment_manager_->allocator_manager_.replaceRegistrations(
-                {{mounted.segment.name, old_registration, next_registration}}));
-        }
-        mounted.allocator_registration = std::move(next_registration);
-    }
+    CHECK(ReplaceAllocators({}, owner_session));
 }
 
 void ScopedSegmentAccess::BindBufferToSegment(const UUID& segment_id,
@@ -382,16 +385,42 @@ void ScopedSegmentAccess::BindBufferToSegment(const UUID& segment_id,
 ErrorCode ScopedSegmentAccess::ReMountSegment(
     const std::vector<Segment>& segments,
     ClientSessionSharedPtr owner_session) {
+    return PublishRemount(segments, std::move(owner_session), nullptr);
+}
+
+ErrorCode ScopedSegmentAccess::ReMountSegment(
+    const std::vector<Segment>& segments, ClientSessionSharedPtr owner_session,
+    const std::vector<AllocatorReplacement>& replacements) {
+    return PublishRemount(segments, std::move(owner_session), &replacements);
+}
+
+ErrorCode ScopedSegmentAccess::PublishRemount(
+    const std::vector<Segment>& segments, ClientSessionSharedPtr owner_session,
+    const std::vector<AllocatorReplacement>* replacements) try {
     if (!owner_session) {
         return ErrorCode::INVALID_PARAMS;
     }
+    // MountSegment writes several indexes. Build them privately so that a
+    // failure between two insertions cannot publish even a detached slot.
+    auto& live = *segment_manager_;
+    SegmentManager staged(live.memory_allocator_, live.enable_cxl_);
+    staged.usage_tracker_ = live.usage_tracker_;
+    staged.cxl_global_allocator_ = live.cxl_global_allocator_;
+    staged.allocator_manager_ = live.allocator_manager_.Snapshot();
+    staged.mounted_segments_ = live.mounted_segments_;
+    staged.client_segments_ = live.client_segments_;
+    staged.client_by_name_ = live.client_by_name_;
+    staged.segment_id_by_name_ = live.segment_id_by_name_;
+    staged.segments_by_host_ = live.segments_by_host_;
+    auto access = staged.getSegmentAccess();
+    std::vector<std::function<void()>> publish;
     for (const auto& segment : segments) {
         auto validation =
-            ValidateRemountSegment(segment, owner_session->ClientId());
+            access.ValidateRemountSegment(segment, owner_session->ClientId());
         if (validation != ErrorCode::OK) {
             return validation;
         }
-        ErrorCode err = MountSegment(segment, owner_session);
+        ErrorCode err = access.MountSegment(segment, owner_session, &publish);
         if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
             err == ErrorCode::INTERNAL_ERROR) {
             LOG(ERROR) << "segment_name=" << segment.name
@@ -414,7 +443,38 @@ ErrorCode ScopedSegmentAccess::ReMountSegment(
         }
     }
 
+    // Keep superseded allocators alive through capacity publication. Their
+    // destructors can retire zero-valued per-segment metric labels.
+    std::vector<AllocatorReplacement> swaps;
+    if (replacements) {
+        for (const auto& segment : segments) {
+            if (!access.GetAllocator(segment.id))
+                return ErrorCode::INTERNAL_ERROR;
+        }
+        swaps = *replacements;
+        for (auto& swap : swaps) {
+            // A standby segment that first mounts in this batch has no live
+            // allocator to compare against.
+            if (!swap.expected) {
+                if (GetAllocator(swap.segment_id))
+                    return ErrorCode::INTERNAL_ERROR;
+                swap.expected = access.GetAllocator(swap.segment_id);
+            }
+        }
+        if (!access.ReplaceAllocators(swaps, owner_session))
+            return ErrorCode::INTERNAL_ERROR;
+    }
+    // No allocations after ReplaceAllocators switches registration generations.
+    for (auto& commit : publish) commit();
+    live.allocator_manager_ = std::move(staged.allocator_manager_);
+    live.mounted_segments_.swap(staged.mounted_segments_);
+    live.client_segments_.swap(staged.client_segments_);
+    live.client_by_name_.swap(staged.client_by_name_);
+    live.segment_id_by_name_.swap(staged.segment_id_by_name_);
+    live.segments_by_host_.swap(staged.segments_by_host_);
     return ErrorCode::OK;
+} catch (const std::bad_alloc&) {
+    return ErrorCode::INTERNAL_ERROR;
 }
 
 ErrorCode ScopedSegmentAccess::ValidateRemountSegment(
@@ -471,45 +531,100 @@ bool ScopedSegmentAccess::GetSegment(const UUID& segment_id,
 }
 
 bool ScopedSegmentAccess::ReplaceAllocators(
-    const std::vector<AllocatorReplacement>& replacements) {
+    const std::vector<AllocatorReplacement>& replacements,
+    const ClientSessionSharedPtr& owner_session) {
+    struct Pending {
+        MountedSegment* mounted;
+        std::shared_ptr<SegmentAllocatorRegistration> registration;
+        bool session_changed;
+        std::shared_ptr<const SegmentLocality> locality;
+        size_t capacity;
+    };
+    std::vector<Pending> pending;
     std::vector<AllocatorManager::RegistrationReplacement> manager_replacements;
-    manager_replacements.reserve(replacements.size());
+    auto& manager = segment_manager_->allocator_manager_;
+    auto stage = [&](MountedSegment& mounted,
+                     const std::shared_ptr<BufferAllocatorBase>& allocator,
+                     bool registered, bool rebind) {
+        const auto& old = mounted.allocator_registration;
+        auto next = old;
+        if (rebind) {
+            next = old->WithClientSession(owner_session, allocator, registered);
+        } else if (allocator != mounted.buf_allocator) {
+            next = old->WithAllocator(allocator);
+        }
+        if (registered) {
+            manager_replacements.push_back({mounted.segment.name, old, next});
+        }
+        if (next != old) {
+            const bool new_allocator = allocator != mounted.buf_allocator;
+            auto locality = new_allocator && mounted.segment.locality
+                                ? std::make_shared<const SegmentLocality>(
+                                      *mounted.segment.locality)
+                                : nullptr;
+            pending.push_back({&mounted, std::move(next), rebind,
+                               std::move(locality),
+                               new_allocator ? allocator->capacity() : 0});
+        }
+    };
+
+    std::unordered_set<MountedSegment*> replaced;
     for (const auto& replacement : replacements) {
-        auto mounted =
+        auto it =
             segment_manager_->mounted_segments_.find(replacement.segment_id);
-        if (mounted == segment_manager_->mounted_segments_.end() ||
-            !mounted->second.allocator_registration ||
-            mounted->second.allocator_registration->GetAllocator() !=
+        if (it == segment_manager_->mounted_segments_.end() ||
+            !it->second.allocator_registration || !replacement.replacement ||
+            it->second.allocator_registration->GetAllocator() !=
                 replacement.expected ||
-            !replacement.replacement) {
+            !replaced.insert(&it->second).second) {
             return false;
         }
-        auto next_registration =
-            replacement.expected == replacement.replacement
-                ? mounted->second.allocator_registration
-                : mounted->second.allocator_registration->WithAllocator(
-                      replacement.replacement);
-        manager_replacements.push_back({mounted->second.segment.name,
-                                        mounted->second.allocator_registration,
-                                        std::move(next_registration)});
+        auto& mounted = it->second;
+        const bool rebind =
+            owner_session &&
+            mounted.allocator_registration->GetClientSession() != owner_session;
+        stage(mounted, replacement.replacement, true, rebind);
     }
-    if (!segment_manager_->allocator_manager_.replaceRegistrations(
-            manager_replacements)) {
-        return false;
-    }
-    for (size_t i = 0; i < replacements.size(); ++i) {
-        const auto& replacement = replacements[i];
-        auto& mounted =
-            segment_manager_->mounted_segments_.at(replacement.segment_id);
-        if (replacement.expected != replacement.replacement) {
-            replacement.replacement->SetLocality(mounted.segment.locality);
-            replacement.replacement->AttachUsageTracker(
-                segment_manager_->usage_tracker_);
-            mounted.allocator_registration->SetAllocatable(false);
-            mounted.allocator_registration =
-                std::move(manager_replacements[i].replacement);
-            mounted.buf_allocator = replacement.replacement;
+    if (owner_session) {
+        const auto it =
+            segment_manager_->client_segments_.find(owner_session->ClientId());
+        if (it != segment_manager_->client_segments_.end()) {
+            for (const auto& id : it->second) {
+                auto found = segment_manager_->mounted_segments_.find(id);
+                if (found == segment_manager_->mounted_segments_.end())
+                    continue;
+                auto& mounted = found->second;
+                const auto& old = mounted.allocator_registration;
+                if (replaced.erase(&mounted) || !old ||
+                    old->GetClientSession() == owner_session)
+                    continue;
+                stage(mounted, mounted.buf_allocator,
+                      HasAllocatorRegistration(manager, mounted.segment.name,
+                                               old),
+                      true);
+            }
         }
+        // Every explicit swap must belong to the client being rebound.
+        if (!replaced.empty()) return false;
+    }
+    // replaceRegistrations validates and reserves its target slots before the
+    // first pointer swap. Everything following that swap is non-throwing.
+    if (!manager.replaceRegistrations(manager_replacements)) return false;
+    for (auto& change : pending) {
+        auto& mounted = *change.mounted;
+        const auto& allocator = change.registration->GetAllocator();
+        if (allocator != mounted.buf_allocator) {
+            allocator->PublishLocality(std::move(change.locality));
+            allocator->AttachUsageTracker(segment_manager_->usage_tracker_,
+                                          change.capacity);
+        }
+        if (change.session_changed) {
+            mounted.allocator_registration->Invalidate();
+        } else {
+            mounted.allocator_registration->SetAllocatable(false);
+        }
+        mounted.buf_allocator = allocator;
+        mounted.allocator_registration = std::move(change.registration);
     }
     return true;
 }

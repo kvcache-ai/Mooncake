@@ -15,7 +15,7 @@ namespace route {
 // metadata.
 //
 // Every object carries one, and almost every object carries neither a task nor
-// a candidate, so each lives on the heap and costs a pointer while absent.
+// a candidate. They share one optional allocation while in use.
 struct ObjectState {
     // A primary write or a background task is in flight for this key.
     bool is_processing{false};
@@ -27,22 +27,48 @@ struct ObjectState {
     // An in-place overwrite invalidates the old contents even if a pending
     // REMOVED replica still retains their tier. Consumed on write release.
     bool kv_content_invalidated{false};
-    HeapOptional<ReplicationTask> replication_task;
-    HeapOptional<OffloadingTask> offloading_task;
-    HeapOptional<PromotionTask> promotion_task;
-    // The dynamic replica proposal admitted for this key and not yet started
-    // by its CopyStart, and how long the key waits before the next one. Owned
-    // by DynamicReplicationController; neither is work in flight.
-    HeapOptional<DynamicReplicaPending> dynamic_replication_pending;
-    std::chrono::steady_clock::time_point dynamic_replication_cooldown{};
-    // A promotion a transient gate turned away, waiting for a retry. It is
-    // not work in flight: no task holds anything for it.
-    HeapOptional<PromotionCandidate> promotion_candidate;
+    struct TaskFields {
+        HeapOptional<ReplicationTask> replication_task;
+        HeapOptional<OffloadingTask> offloading_task;
+        HeapOptional<PromotionTask> promotion_task;
+        // The dynamic replica proposal admitted for this key and not yet
+        // started by its CopyStart, and how long the key waits before the next
+        // one. Owned by DynamicReplicationController; neither is work in
+        // flight.
+        HeapOptional<DynamicReplicaPending> dynamic_replication_pending;
+        std::chrono::steady_clock::time_point dynamic_replication_cooldown{};
+        // A promotion a transient gate turned away, waiting for a retry. It is
+        // not work in flight: no task holds anything for it.
+        HeapOptional<PromotionCandidate> promotion_candidate;
+    };
+
+    const TaskFields& Tasks() const noexcept {
+        static const TaskFields empty;
+        return tasks_ ? *tasks_ : empty;
+    }
+
+    TaskFields* ExistingTasks() noexcept { return tasks_ ? &*tasks_ : nullptr; }
+
+    TaskFields& MutableTasks() { return tasks_ ? *tasks_ : tasks_.emplace(); }
+
+    void ReleaseIdleTasks() noexcept {
+        if (tasks_ && !tasks_->replication_task && !tasks_->offloading_task &&
+            !tasks_->promotion_task && !tasks_->promotion_candidate &&
+            !tasks_->dynamic_replication_pending &&
+            tasks_->dynamic_replication_cooldown ==
+                std::chrono::steady_clock::time_point{}) {
+            tasks_.reset();
+        }
+    }
 
     bool HasWorkInFlight() const {
-        return is_processing || replication_task || offloading_task ||
-               promotion_task;
+        return is_processing ||
+               (tasks_ && (tasks_->replication_task ||
+                           tasks_->offloading_task || tasks_->promotion_task));
     }
+
+   private:
+    HeapOptional<TaskFields> tasks_;
 };
 
 }  // namespace route

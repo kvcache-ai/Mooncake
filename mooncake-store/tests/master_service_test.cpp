@@ -930,7 +930,7 @@ TEST_F(MasterServiceTest,
             MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
                 "shared-key", TenantId("pin-a")));
         EXPECT_TRUE(accessor.Get().IsHardPinned());
-        EXPECT_EQ(accessor.Get().session_id,
+        EXPECT_EQ(accessor.Get().SessionId(),
                   std::optional<std::string>("writing-session"));
         return accessor.Get().EvictionDeadline();
     };
