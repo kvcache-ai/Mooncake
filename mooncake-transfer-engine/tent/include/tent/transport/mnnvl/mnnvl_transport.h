@@ -36,13 +36,39 @@
 namespace mooncake {
 namespace tent {
 
-struct MnnvlCompletion {
+struct MnnvlCompletionEvent {
+    cudaEvent_t event{nullptr};
+    CUcontext context{nullptr};
+    // CUDA 12+ IDs distinguish contexts even if CUDA reuses their handles.
+    unsigned long long context_id{0};
+};
+
+class MnnvlCompletionEventPool {
+    friend class MnnvlTransportTestPeer;
+
+   public:
+    explicit MnnvlCompletionEventPool(size_t capacity) : capacity_(capacity) {}
+    ~MnnvlCompletionEventPool();
+    Status acquire(int device, MnnvlCompletionEvent &completion);
+    void release(int device, const MnnvlCompletionEvent &completion,
+                 bool completed);
+
+   private:
+    std::mutex mutex_;
+    size_t capacity_;
+    // Capacity is shared by all contexts on a device, not per context.
+    std::unordered_map<int, std::vector<MnnvlCompletionEvent>> idle_;
+};
+
+struct MnnvlCompletion : MnnvlCompletionEvent {
     MnnvlCompletion() = default;
     MnnvlCompletion(const MnnvlCompletion &) = delete;
     MnnvlCompletion &operator=(const MnnvlCompletion &) = delete;
-    cudaEvent_t event{nullptr};
+    std::shared_ptr<MnnvlCompletionEventPool> pool;
     int device{-1};
     cudaError_t result{cudaErrorNotReady};
+    bool recorded{false};
+    int last_polled_task{-1};
     ~MnnvlCompletion();
 };
 
@@ -61,6 +87,7 @@ struct MnnvlSubBatch : public Transport::SubBatch {
     CUDAStreamHandle async_stream;
     int stream_device_id = -1;
     mutable std::mutex mutex;
+    bool shared_polling{false};
     // One independently owned event per submission, even for appended work.
     std::vector<std::unique_ptr<MnnvlCompletion>> completion_groups;
     ~MnnvlSubBatch();
@@ -104,6 +131,9 @@ class MnnvlTransport : public Transport {
     bool tracksLocalBuffer(const BufferDesc &desc) const override;
 
     virtual const char *getName() const { return "mnnvl"; }
+    bool supportsGlobalAddressing() const override { return true; }
+    Status mapRemoteMemory(SegmentID peer, void *address, size_t size) override;
+    Status unmapRemoteMemory(SegmentID peer, void *address) override;
 
     virtual bool supportsProducerEvent() const { return true; }
 
@@ -130,6 +160,9 @@ class MnnvlTransport : public Transport {
     Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
                                        uint64_t target_id);
 
+    Status mapVmmMemory(uint64_t &address, size_t size, SegmentID peer,
+                        bool fixed_address);
+
     static Status ensureCudaContext();
 
     Status getLocalAllocationRange(uint64_t address, size_t length,
@@ -153,12 +186,13 @@ class MnnvlTransport : public Transport {
         // Handle the mapping was imported from; a peer that re-registers the
         // same address publishes a different one.
         std::string mnnvl_handle;
+        std::shared_ptr<CudaSharedMemory> memory;
     };
 
-    Status importRemoteBuffer(const BufferDesc &buffer,
-                              OpenedMnnvlEntry &entry);
+    Status importRemoteBuffer(const BufferDesc &buffer, OpenedMnnvlEntry &entry,
+                              bool fixed_address = false);
 
-    static void releaseImportedEntry(const OpenedMnnvlEntry &entry);
+    static Status releaseImportedEntry(const OpenedMnnvlEntry &entry);
 
     using HashMap =
         std::unordered_map<SegmentID,
@@ -194,6 +228,9 @@ class MnnvlTransport : public Transport {
     std::unordered_map<void *, LocalAllocation> allocate_set_;
     std::vector<LocalAllocation> failed_allocations_;
     static Status releaseLocalAllocation(LocalAllocation &allocation);
+    // Explicit uninstall requires callers to release GVA allocations first.
+    std::unordered_map<void *, std::unique_ptr<CudaSharedMemory>>
+        gva_allocations_;
     uint64_t async_memcpy_threshold_;
     bool supported_;
     CUmemAllocationHandleType handle_type_;
@@ -214,6 +251,7 @@ class MnnvlTransport : public Transport {
     // buffer that cannot be exported fails instead of staying local-only.
     bool egm_strict_ = false;
     MnnvlConfig options_;
+    std::shared_ptr<MnnvlCompletionEventPool> completion_pool_;
 };
 }  // namespace tent
 }  // namespace mooncake

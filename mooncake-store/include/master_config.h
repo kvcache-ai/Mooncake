@@ -8,6 +8,7 @@
 
 #include "config/metrics_bootstrap_config.h"
 #include "config_helper.h"
+#include "ha/oplog/oplog_batch_config.h"
 #include "types.h"
 #include "config/object_storage_config.h"
 
@@ -139,6 +140,8 @@ struct MasterConfig {
     uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    uint32_t oplog_standby_max_batches_per_poll =
+        kDefaultOpLogStandbyMaxBatchesPerPoll;
     uint32_t batch_oplog_retry_timeout_sec = 180;
 
     std::string cluster_id;
@@ -281,6 +284,8 @@ class MasterServiceSupervisorConfig {
     uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    uint32_t oplog_standby_max_batches_per_poll =
+        kDefaultOpLogStandbyMaxBatchesPerPoll;
     uint32_t batch_oplog_retry_timeout_sec = 180;
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -428,6 +433,8 @@ class MasterServiceSupervisorConfig {
             config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
+        oplog_standby_max_batches_per_poll =
+            config.oplog_standby_max_batches_per_poll;
         batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
@@ -616,6 +623,8 @@ class WrappedMasterServiceConfig {
     uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    uint32_t oplog_standby_max_batches_per_poll =
+        kDefaultOpLogStandbyMaxBatchesPerPoll;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -721,6 +730,8 @@ class WrappedMasterServiceConfig {
             config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
+        oplog_standby_max_batches_per_poll =
+            config.oplog_standby_max_batches_per_poll;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -854,6 +865,8 @@ class WrappedMasterServiceConfig {
             config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
+        oplog_standby_max_batches_per_poll =
+            config.oplog_standby_max_batches_per_poll;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -926,6 +939,8 @@ class MasterServiceConfigBuilder {
     uint64_t oplog_prune_max_batches_per_second_ = 50;
     int oplog_poll_interval_ms_ = 1000;
     uint32_t oplog_batch_max_entries_ = 1024;
+    uint32_t oplog_standby_max_batches_per_poll_ =
+        kDefaultOpLogStandbyMaxBatchesPerPoll;
     uint64_t restore_repair_durable_timeout_ms_ =
         DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
@@ -1125,6 +1140,12 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_oplog_batch_max_entries(uint32_t entries) {
         oplog_batch_max_entries_ = entries;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_standby_max_batches_per_poll(
+        uint32_t batches) {
+        oplog_standby_max_batches_per_poll_ = batches;
         return *this;
     }
 
@@ -1335,6 +1356,8 @@ class MasterServiceConfig {
     uint64_t oplog_prune_max_batches_per_second = 50;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    uint32_t oplog_standby_max_batches_per_poll =
+        kDefaultOpLogStandbyMaxBatchesPerPoll;
     uint64_t restore_repair_durable_timeout_ms =
         DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -1436,6 +1459,8 @@ class MasterServiceConfig {
             config.oplog_prune_max_batches_per_second;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
+        oplog_standby_max_batches_per_poll =
+            config.oplog_standby_max_batches_per_poll;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -1518,6 +1543,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
         oplog_prune_max_batches_per_second_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
     config.oplog_batch_max_entries = oplog_batch_max_entries_;
+    config.oplog_standby_max_batches_per_poll =
+        oplog_standby_max_batches_per_poll_;
     config.restore_repair_durable_timeout_ms =
         restore_repair_durable_timeout_ms_;
     config.cluster_id = cluster_id_;

@@ -1137,7 +1137,9 @@ int MasterServiceSupervisor::Start() {
             MasterService::PrepareObjectStorageAdapter(
                 WrappedMasterServiceConfig(config_, 0));
         }
-        standby_controller = CreateStandbyController(*spec, config_);
+        standby_controller = CreateStandbyController(
+            *spec, config_, {},
+            [this] { return ShutdownObserved(shutdown_requested_); });
     } catch (const std::exception& error) {
         LOG(ERROR) << "Standby dependency initialization failed: "
                    << error.what();

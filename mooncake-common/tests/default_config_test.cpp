@@ -2,10 +2,48 @@
 #include "duration_utils.h"
 
 #include <gtest/gtest.h>
+#include <poll.h>
+#include <unistd.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <string_view>
 
 namespace mooncake {
+
+TEST(YltLoggingDeathTest, AcceptedLogRecordIsConsumed) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    // Isolate the process-global logger and wait for actual consumer output.
+    ASSERT_EXIT(
+        {
+            std::fflush(stdout);
+            int output[2];
+            if (::pipe(output) != 0 || ::dup2(output[1], STDOUT_FILENO) < 0) {
+                std::_Exit(3);
+            }
+            ::close(output[1]);
+            ::setenv("MC_YLT_LOG_LEVEL", "info", 1);
+            init_ylt_log_level();
+            ELOG_INFO << "ylt-consumer-regression";
+
+            struct pollfd reader{};
+            reader.fd = output[0];
+            reader.events = POLLIN;
+            char buffer[1024];
+            const auto bytes = ::poll(&reader, 1, 5000) > 0
+                                   ? ::read(output[0], buffer, sizeof(buffer))
+                                   : 0;
+            const bool consumed =
+                bytes > 0 &&
+                std::string_view(buffer, static_cast<size_t>(bytes))
+                        .find("ylt-consumer-regression") !=
+                    std::string_view::npos;
+            easylog::stop_async_log();
+            std::_Exit(consumed ? 0 : 2);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
 
 class DefaultConfigTest : public ::testing::Test {
    public:

@@ -555,8 +555,9 @@ TEST_F(MetricsRecordingTest,
 TEST_F(MetricsRecordingTest, MnnvlEventsHaveExactJsonAndPrometheusDeltas) {
     auto& metrics = TentMetrics::instance();
     const MetricsSnapshot before(metrics);
-    const char* names[] = {"fabric_fallback", "strict_failure"};
-    for (size_t i = 0; i < 2; ++i)
+    const char* names[] = {"fabric_fallback", "strict_failure", "pool_hit",
+                           "pool_miss", "completion_query"};
+    for (size_t i = 0; i < 5; ++i)
         metrics.recordMnnvlEvent(static_cast<TentMetrics::MnnvlEvent>(i));
     const MetricsSnapshot after(metrics);
     for (const auto* name : names) {
@@ -567,11 +568,10 @@ TEST_F(MetricsRecordingTest, MnnvlEventsHaveExactJsonAndPrometheusDeltas) {
         EXPECT_EQ(after.series(series) - before.series(series), 1);
     }
     TentMetrics::setEnabled(false);
-    metrics.recordMnnvlEvent(TentMetrics::MnnvlEvent::StrictFailure);
+    metrics.recordMnnvlEvent(TentMetrics::MnnvlEvent::PoolHit);
     TentMetrics::setEnabled(true);
-    EXPECT_EQ(
-        MetricsSnapshot(metrics).counter("tent_mnnvl_strict_failure_total"),
-        after.counter("tent_mnnvl_strict_failure_total"));
+    EXPECT_EQ(MetricsSnapshot(metrics).counter("tent_mnnvl_pool_hit_total"),
+              after.counter("tent_mnnvl_pool_hit_total"));
 }
 
 TEST_F(MetricsRecordingTest, CompletedTransferRecordsBytesAndLatency) {

@@ -156,6 +156,12 @@ option(STORE_USE_JEMALLOC
        "Use jemalloc in the mooncake store master and client binaries" OFF)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Dependencies.cmake)
+if(WITH_STORE OR WITH_CONDUCTOR)
+  mooncake_provide_boost()
+  get_target_property(_mooncake_boost_include_dir Mooncake::boost
+                      INTERFACE_INCLUDE_DIRECTORIES)
+  include_directories(BEFORE SYSTEM "${_mooncake_boost_include_dir}")
+endif()
 if(WITH_STORE)
   mooncake_provide_zstd()
   mooncake_provide_xxhash()
