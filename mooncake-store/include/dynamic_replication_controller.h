@@ -37,6 +37,7 @@
 #include "client_liveness.h"
 #include "dynamic_replication_lease_table.h"
 #include "metadata/object_state.h"
+#include "metadata/object_view.h"
 #include "object_metadata.h"
 #include "rpc_types.h"
 #include "segment.h"
@@ -114,7 +115,8 @@ class DynamicReplicationController {
     // Picks a source among the readable MEMORY replicas and a target segment
     // with room to spare, preferring another host.
     std::optional<Plan> SelectPlan(
-        ScopedSegmentAccess& segment_access, const ObjectMetadata& metadata,
+        ScopedSegmentAccess& segment_access,
+        const metadata::ConstObjectView& object,
         const std::function<bool(const Replica&)>& is_readable,
         const std::optional<std::string>& preferred_target_segment,
         std::string target_domain) const;

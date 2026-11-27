@@ -1323,7 +1323,7 @@ class MasterService {
     std::vector<Replica> PopReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata);
     size_t EraseReplicasWithCacheTotalAccounting(
-        ObjectMetadata& metadata,
+        const metadata::ObjectView& object,
         const std::function<bool(const Replica&)>& pred_fn,
         std::vector<ReplicaID>* erased_replica_ids = nullptr);
 
@@ -1433,10 +1433,10 @@ class MasterService {
         const std::function<bool(const std::string& key)>& matches_key);
     static void ApplySoftPinMetricDelta(int metric_delta);
     void ApplySoftPinEvaluation(
-        const ObjectMetadata& metadata,
+        const metadata::ConstObjectView& object,
         const ObjectMetadata::SoftPinEvaluation& result) const;
     bool IsSoftPinActive(
-        const ObjectMetadata& metadata,
+        const metadata::ConstObjectView& object,
         const std::chrono::system_clock::time_point& now) const;
     void CleanupExpiredSoftPins(
         const std::chrono::system_clock::time_point& now);
@@ -1445,15 +1445,12 @@ class MasterService {
 
     // Helper to clean up stale handles pointing to unmounted segments
     // or local_disk replicas whose owner client no longer retains resources.
-    bool CleanupStaleHandles(const std::string& key, const TenantId& tenant_id,
-                             ObjectMetadata& metadata,
-                             route::ObjectState& state);
+    bool CleanupStaleHandles(const metadata::ObjectView& object);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
     // accounting (promotion-task cancellation) instead of
     // duplicating it.
     bool CleanupStaleHandles(
-        const std::string& key, const TenantId& tenant_id,
-        ObjectMetadata& metadata, route::ObjectState& state,
+        const metadata::ObjectView& object,
         const std::function<bool(const Replica&)>& is_stale);
 
     // True when client_id currently has a LOCAL_DISK registration.
@@ -1635,7 +1632,7 @@ class MasterService {
         }
     }
     void CancelPromotionTaskForRemovedReplicas(
-        ObjectMetadata& metadata, route::ObjectState& state,
+        const metadata::ObjectView& object,
         const std::vector<ReplicaID>& removed_replica_ids)
         NO_THREAD_SAFETY_ANALYSIS;
 
@@ -1767,6 +1764,11 @@ class MasterService {
         const TenantId& GetTenantId() const { return ns_->id(); }
         // The held publication; like `Get()`, only while one is held.
         route::ObjectRef GetRef() const { return guard_->ref(); }
+        // Bound view of the held publication (only call when IsPublished()).
+        [[nodiscard]] metadata::ObjectView View() const {
+            assert(IsPublished());
+            return ns_->View(*guard_);
+        }
 
         // The namespace policy's say on the held key taking `bytes` more
         // memory, asked before it is allocated; zero bytes asks only whether
@@ -1836,7 +1838,8 @@ class MasterService {
         MetadataAccessorRO(const MasterService* service,
                            const TenantId& tenant_id,
                            const std::string& user_key)
-            : guard_(Hold(service->namespaces_.Lookup(tenant_id), user_key)) {}
+            : ns_(service->namespaces_.Lookup(tenant_id)),
+              guard_(Hold(ns_, user_key)) {}
         MetadataAccessorRO(const MasterService* service,
                            const ObjectIdentity& object_id)
             : MetadataAccessorRO(service, object_id.tenant_id,
@@ -1852,6 +1855,15 @@ class MasterService {
 
         bool InProcessing() const {
             return IsPublished() && guard_->state().is_processing;
+        }
+
+        // The held key and its tenant (only call when IsPublished() is true).
+        const std::string& GetKey() const { return guard_->key(); }
+        const TenantId& GetTenantId() const { return ns_->id(); }
+        // Bound view of the held publication (only call when IsPublished()).
+        [[nodiscard]] metadata::ConstObjectView View() const {
+            assert(IsPublished());
+            return ns_->View(*guard_);
         }
 
         // Get metadata (only call when Exists() is true)
@@ -1870,6 +1882,7 @@ class MasterService {
             return ns->objects.Read(user_key);
         }
 
+        const metadata::Namespace* ns_;
         std::optional<route::ReadGuard> guard_;
     };
 

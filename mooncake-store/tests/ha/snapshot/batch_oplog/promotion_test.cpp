@@ -252,8 +252,8 @@ TEST(BatchOpLogPromotionTest,
     EXPECT_EQ(object.group_id, restored.group_id);
     EXPECT_EQ(object.data_type, restored.data_type);
     EXPECT_TRUE(restored.IsHardPinned());
-    EXPECT_EQ(TenantId("tenant"), restored.tenant_id);
-    EXPECT_EQ("managed-weight", restored.user_key);
+    EXPECT_EQ(TenantId("tenant"), accessor.GetTenantId());
+    EXPECT_EQ("managed-weight", accessor.GetKey());
 }
 
 }  // namespace mooncake::test

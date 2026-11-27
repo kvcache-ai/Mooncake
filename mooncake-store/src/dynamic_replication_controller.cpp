@@ -285,11 +285,13 @@ DynamicReplicationController::FindReusableLease(
 
 std::optional<DynamicReplicationController::Plan>
 DynamicReplicationController::SelectPlan(
-    ScopedSegmentAccess& segment_access, const ObjectMetadata& metadata,
+    ScopedSegmentAccess& segment_access,
+    const metadata::ConstObjectView& object,
     const std::function<bool(const Replica&)>& is_readable,
     const std::optional<std::string>& preferred_target_segment,
     std::string target_domain) const {
-    const std::string& object_key = metadata.user_key;
+    const std::string& object_key = object.key();
+    const ObjectMetadata& metadata = object.metadata();
     std::unordered_set<std::string> existing_segments;
     std::unordered_set<std::string> existing_hosts;
     std::vector<std::string> source_segments;

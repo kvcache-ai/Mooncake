@@ -130,10 +130,13 @@ TEST_F(TenantIterationTest, ReadCursorVisitsEachObjectOfItsTenantOnce) {
     EXPECT_TRUE(KeysOf(service, kTenantC).empty());
 
     // A ref taken by the walk names the publication it saw.
-    for (auto object : NamespaceOf(service, kTenantA)->objects.ReadCursor()) {
+    const metadata::Namespace* ns_a = NamespaceOf(service, kTenantA);
+    for (auto object : ns_a->objects.ReadCursor()) {
+        const auto view = ns_a->View(object);
         EXPECT_EQ(object.ref().key, object.key());
         EXPECT_EQ(object.ref().generation, object.generation());
-        EXPECT_EQ(object.metadata().user_key, object.key());
+        EXPECT_EQ(view.tenant_id(), kTenantA);
+        EXPECT_EQ(view.key(), object.key());
     }
 }
 

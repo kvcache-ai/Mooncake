@@ -1,3 +1,4 @@
+#include "metadata/namespace.h"
 #include "metadata/object_route.h"
 #include "object_test_helpers.h"
 
@@ -71,7 +72,6 @@ TEST(ObjectRouteTest, PublishMakesTheObjectReachableUnderItsKey) {
         // The guard that published now holds the object it published.
         ASSERT_TRUE(guard.has_object());
         EXPECT_EQ(guard.generation(), generation);
-        EXPECT_EQ(guard.metadata().user_key, "k1");
         EXPECT_FALSE(guard.state().HasWorkInFlight());
     }
     EXPECT_NE(generation, 0u);
@@ -584,7 +584,6 @@ TEST(ObjectRouteTest, ReadCursorVisitsEveryObjectOnce) {
         // The cursor names the publication it stands on.
         EXPECT_EQ(object.ref().key, object.key());
         EXPECT_EQ(object.ref().generation, object.generation());
-        EXPECT_EQ(object.metadata().user_key, object.key());
         keys.push_back(object.key());
     }
     for (const auto& ref : published) {
@@ -762,21 +761,6 @@ TEST(ObjectRouteDeathTest, PublishOverAnObjectAborts) {
             (void)test::PublishEnvelope(guard);
         },
         "already holds an object");
-}
-
-TEST(ObjectRouteDeathTest, PublishOfAnotherKeysMetadataAborts) {
-    ObjectRoute route;
-    const auto write_time =
-        std::chrono::system_clock::time_point(std::chrono::seconds(1));
-    EXPECT_DEATH(
-        {
-            auto guard = route.WriteKey("k1");
-            (void)guard.Publish(UUID{1, 2}, write_time, 128,
-                                std::vector<Replica>{}, std::nullopt, false,
-                                ObjectDataType::UNKNOWN, std::string(),
-                                TenantId(), std::string("k2"));
-        },
-        "of an object keyed k2");
 }
 
 TEST(ObjectRouteDeathTest, TearDownOfAnEmptyKeyAborts) {
@@ -1079,8 +1063,7 @@ TEST(ObjectRouteTest, ChurnKeepsTheRouteAndTheGroupConsistent) {
             std::this_thread::yield();
             std::vector<std::string> visited;
             for (auto object : route.ReadCursor()) {
-                if (object.generation() == 0 ||
-                    object.metadata().user_key != object.key()) {
+                if (object.generation() == 0) {
                     violation();
                 }
                 visited.push_back(object.key());
@@ -1132,6 +1115,98 @@ TEST(ObjectRouteTest, ChurnKeepsTheRouteAndTheGroupConsistent) {
     }
     EXPECT_TRUE(route.Empty());
     EXPECT_EQ(ObjectRouteTestPeer::SlotCount(route), 0u);
+}
+
+TEST(ObjectRouteTest, PublishClassifiesKeyGroupFromSlotKey) {
+    auto& metrics = MasterMetricManager::instance();
+    metrics.configure_key_groups("kv:suffix:_k,state:prefix:st_");
+    struct ResetKeyGroups {
+        MasterMetricManager& m;
+        ~ResetKeyGroups() { m.configure_key_groups(""); }
+    } reset{metrics};
+
+    ObjectRoute route;
+    ASSERT_NE(PublishObject(route, "blk_k"), 0u);
+    ASSERT_NE(PublishObject(route, "st_one"), 0u);
+    ASSERT_NE(PublishObject(route, "plain"), 0u);
+
+    {
+        auto kv_guard = route.Read("blk_k");
+        ASSERT_TRUE(kv_guard.has_value());
+        EXPECT_EQ(kv_guard->metadata().key_group,
+                  metrics.classify_key_group("blk_k"));
+
+        auto st_guard = route.Read("st_one");
+        ASSERT_TRUE(st_guard.has_value());
+        EXPECT_EQ(st_guard->metadata().key_group,
+                  metrics.classify_key_group("st_one"));
+        EXPECT_NE(kv_guard->metadata().key_group,
+                  st_guard->metadata().key_group);
+    }
+
+    const std::string before = metrics.serialize_metrics();
+    EXPECT_NE(before.find("master_key_count_by_group{group=\"kv\"} 1"),
+              std::string::npos);
+    EXPECT_NE(before.find("master_value_bytes_by_group{group=\"kv\"} 128"),
+              std::string::npos);
+    EXPECT_NE(before.find("master_key_count_by_group{group=\"state\"} 1"),
+              std::string::npos);
+    EXPECT_NE(before.find("master_key_count_by_group{group=\"other\"} 1"),
+              std::string::npos);
+
+    EXPECT_TRUE(TearDownKey(route, "blk_k"));
+    EXPECT_TRUE(TearDownKey(route, "st_one"));
+    EXPECT_TRUE(TearDownKey(route, "plain"));
+
+    const std::string after = metrics.serialize_metrics();
+    EXPECT_NE(after.find("master_key_count_by_group{group=\"kv\"} 0"),
+              std::string::npos);
+    EXPECT_NE(after.find("master_value_bytes_by_group{group=\"kv\"} 0"),
+              std::string::npos);
+    EXPECT_NE(after.find("master_key_count_by_group{group=\"state\"} 0"),
+              std::string::npos);
+    EXPECT_NE(after.find("master_key_count_by_group{group=\"other\"} 0"),
+              std::string::npos);
+}
+
+TEST(ObjectRouteTest, NamespaceViewBindsAuthoritativeIdentity) {
+    const TenantId tenant("tenant-view");
+    metadata::Namespace ns(tenant);
+    {
+        auto guard = ns.objects.WriteKey("k1");
+        ASSERT_NE(test::PublishEnvelope(guard), 0u);
+        const metadata::ObjectView view = ns.View(guard);
+        EXPECT_EQ(view.tenant_id(), tenant);
+        EXPECT_EQ(view.key(), "k1");
+        EXPECT_EQ(&view.metadata(), &guard.metadata());
+        EXPECT_EQ(&view.state(), &guard.state());
+
+        const metadata::ConstObjectView const_view = view;
+        EXPECT_EQ(const_view.tenant_id(), tenant);
+        EXPECT_EQ(const_view.key(), "k1");
+        EXPECT_EQ(&const_view.metadata(), &guard.metadata());
+    }
+    {
+        auto guard = ns.objects.Read("k1");
+        ASSERT_TRUE(guard.has_value());
+        const metadata::ConstObjectView view = ns.View(*guard);
+        EXPECT_EQ(view.tenant_id(), tenant);
+        EXPECT_EQ(view.key(), "k1");
+        EXPECT_EQ(&view.metadata(), &guard->metadata());
+    }
+    for (auto object : ns.objects.WriteCursor()) {
+        const metadata::ObjectView view = ns.View(object);
+        EXPECT_EQ(view.tenant_id(), tenant);
+        EXPECT_EQ(view.key(), "k1");
+        EXPECT_EQ(&view.metadata(), &object.metadata());
+        EXPECT_EQ(&view.state(), &object.state());
+    }
+    for (auto object : ns.objects.ReadCursor()) {
+        const metadata::ConstObjectView view = ns.View(object);
+        EXPECT_EQ(view.tenant_id(), tenant);
+        EXPECT_EQ(view.key(), "k1");
+        EXPECT_EQ(&view.metadata(), &object.metadata());
+    }
 }
 
 }  // namespace

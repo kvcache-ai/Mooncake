@@ -270,7 +270,7 @@ class Evictor::Pass {
             reason = SkipReason::kLeaseActive;
         } else {
             auto plan = evictor_.policy_.Decide(
-                Candidate{ns_.id(), hold.key(), metadata, now_, fallback});
+                Candidate{ns_.View(hold), now_, fallback});
             if (plan) {
                 return plan;
             }
