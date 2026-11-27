@@ -1056,18 +1056,23 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     /**
      * @brief Iterate over the metadata of stored objects starting from a
-     * specified bucket.
+     * specified bucket. A bucket reports only the keys it owns (whose index
+     * entry points at it), never a duplicate it lists but does not serve.
      * @param bucket_id The ID of the bucket to start scanning from.
      * @param keys          Output vector to receive object keys
      * @param metadatas     Output vector to receive object metadata
      * @param buckets       Output vector to receive corresponding destination
      * bucket IDs
-     * @param limit         Maximum number of entries to return in this call
+     * @param limit         Maximum number of entries (owned keys) to return
+     *                      in this call
      * @param pins          Optional output. When non-null, every returned
      *                      bucket is pinned (see BucketScanPin) for the
      *                      caller. The caller must keep the pins alive until
      *                      the batch's metadata has been registered with the
      *                      master; dropping them re-enables eviction.
+     * @param skipped_not_owned Optional output. When non-null, the number of
+     *                      listed keys left out because the scanned bucket
+     *                      does not own them is added to it.
      * @return tl::expected<int64_t, ErrorCode>
      * - On success: the bucket ID where the next iteration should start  (or 0
      * if all data has been scanned).
@@ -1077,7 +1082,8 @@ class BucketStorageBackend : public StorageBackendInterface {
         int64_t bucket_id, std::vector<std::string>& keys,
         std::vector<StorageObjectMetadata>& metadatas,
         std::vector<int64_t>& buckets, int64_t limit,
-        std::vector<BucketScanPin>* pins = nullptr);
+        std::vector<BucketScanPin>* pins = nullptr,
+        int64_t* skipped_not_owned = nullptr);
 
     /**
      * @brief Retrieves the global metadata of the store.
@@ -1161,10 +1167,12 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<std::vector<std::string>>& buckets_keys,
         std::vector<std::string>* deferred_keys = nullptr);
 
+    // @p skipped_not_owned: see BucketScan.
     tl::expected<void, ErrorCode> HandleNext(
         const std::function<
             ErrorCode(const std::vector<std::string>& keys,
-                      std::vector<StorageObjectMetadata>& metadatas)>& handler);
+                      std::vector<StorageObjectMetadata>& metadatas)>& handler,
+        int64_t* skipped_not_owned = nullptr);
 
     tl::expected<bool, ErrorCode> HasNext();
 
