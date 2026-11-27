@@ -5,11 +5,9 @@
 // and a run without any observer is complete. The per-object calls run under
 // the object's write lock, so they must not block or take another key's lock.
 
-#include <string>
-
 #include "eviction/policy.h"
 #include "eviction/report.h"
-#include "object_metadata.h"
+#include "metadata/object_view.h"
 #include "tenant_id.h"
 
 namespace mooncake {
@@ -31,11 +29,7 @@ class Scope {
 };
 
 // An object as an observer sees it.
-struct ObjectView {
-    const TenantId& tenant_id;
-    const std::string& key;
-    const ObjectMetadata& metadata;
-};
+using ObjectView = metadata::ObjectView;
 
 class EvictionObserver {
    public:

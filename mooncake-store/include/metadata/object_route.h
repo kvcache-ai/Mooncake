@@ -647,6 +647,9 @@ class ObjectRoute::Cursor {
         using State = typename Guard<kMode>::State;
 
         const std::string& key() const { return slot_.key(); }
+        [[nodiscard]] bool BelongsTo(const ObjectRoute& route) const noexcept {
+            return route_ == &route;
+        }
         Generation generation() const { return slot_.record_->generation; }
         ObjectRef ref() const { return {key(), generation()}; }
         Metadata& metadata() const { return slot_.record_->metadata; }
@@ -660,7 +663,9 @@ class ObjectRoute::Cursor {
 
        private:
         friend class Cursor;
-        explicit Object(KeySlot& slot) : slot_(slot) {}
+        Object(const ObjectRoute* route, KeySlot& slot)
+            : route_(route), slot_(slot) {}
+        const ObjectRoute* route_;
         KeySlot& slot_;
     };
 
@@ -668,7 +673,9 @@ class ObjectRoute::Cursor {
 
     class Iterator {
        public:
-        Object operator*() const { return Object(*cursor_->current_); }
+        Object operator*() const {
+            return Object(&cursor_->route_, *cursor_->current_);
+        }
         Iterator& operator++() {
             cursor_->Advance();
             return *this;

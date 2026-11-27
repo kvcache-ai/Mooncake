@@ -115,8 +115,7 @@ class DynamicReplicationController {
     // Picks a source among the readable MEMORY replicas and a target segment
     // with room to spare, preferring another host.
     std::optional<Plan> SelectPlan(
-        ScopedSegmentAccess& segment_access,
-        const metadata::ConstObjectView& object,
+        ScopedSegmentAccess& segment_access, const metadata::ObjectView& object,
         const std::function<bool(const Replica&)>& is_readable,
         const std::optional<std::string>& preferred_target_segment,
         std::string target_domain) const;

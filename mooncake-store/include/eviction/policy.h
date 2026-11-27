@@ -29,7 +29,7 @@ using Clock = std::chrono::system_clock;
 // An object the evictor may take memory from, as the policy sees it under the
 // object's write lock.
 struct Candidate {
-    metadata::ConstObjectView object;
+    metadata::ObjectView object;
     Clock::time_point now;
     // Set when the evictor comes back to an object the policy deferred.
     bool fallback;

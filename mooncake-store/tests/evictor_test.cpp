@@ -102,15 +102,20 @@ class FakeReclaimer final : public eviction::Reclaimer {
     std::vector<std::string> torn_down;
 };
 
+static_assert(!std::is_copy_constructible_v<eviction::Candidate>);
+static_assert(!std::is_copy_assignable_v<eviction::Candidate>);
+static_assert(!std::is_move_constructible_v<eviction::Candidate>);
+static_assert(!std::is_move_assignable_v<eviction::Candidate>);
+
 class RecordingObserver final : public eviction::EvictionObserver {
    public:
     void OnApplied(const eviction::ObjectView& view,
                    const eviction::Effect&) override {
-        applied.push_back(view.key);
+        applied.push_back(view.key());
     }
     void OnSkipped(const eviction::ObjectView& view,
                    SkipReason reason) override {
-        skipped.emplace_back(view.key, reason);
+        skipped.emplace_back(view.key(), reason);
     }
     void OnRunEnd(const Scope&, const eviction::Report& report) override {
         ++runs;

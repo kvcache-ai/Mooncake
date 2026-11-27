@@ -1169,40 +1169,92 @@ TEST(ObjectRouteTest, PublishClassifiesKeyGroupFromSlotKey) {
               std::string::npos);
 }
 
+template <typename T>
+concept SupportsOperatorNew = requires(std::size_t n) { T::operator new(n); };
+
+template <typename T>
+concept SupportsArrayOperatorNew =
+    requires(std::size_t n) { T::operator new[](n); };
+
+template <typename Ns, typename Arg>
+concept SupportsNamespaceView = requires(Ns&& n, Arg&& a) {
+    std::forward<Ns>(n).View(std::forward<Arg>(a));
+};
+
 TEST(ObjectRouteTest, NamespaceViewBindsAuthoritativeIdentity) {
+    static_assert(!std::is_copy_constructible_v<metadata::ObjectView>);
+    static_assert(!std::is_copy_assignable_v<metadata::ObjectView>);
+    static_assert(!std::is_move_constructible_v<metadata::ObjectView>);
+    static_assert(!std::is_move_assignable_v<metadata::ObjectView>);
+    static_assert(!SupportsOperatorNew<metadata::ObjectView>);
+    static_assert(!SupportsArrayOperatorNew<metadata::ObjectView>);
+    static_assert(SupportsNamespaceView<const metadata::Namespace&,
+                                        const route::WriteGuard&>);
+    static_assert(!SupportsNamespaceView<const metadata::Namespace&,
+                                         route::WriteGuard&&>);
+    static_assert(!SupportsNamespaceView<metadata::Namespace&&,
+                                         const route::WriteGuard&>);
+    static_assert(
+        !SupportsNamespaceView<metadata::Namespace&&, route::WriteGuard&&>);
+    static_assert(SupportsNamespaceView<const metadata::Namespace&,
+                                        const route::ReadGuard&>);
+    static_assert(
+        !SupportsNamespaceView<const metadata::Namespace&, route::ReadGuard&&>);
+    static_assert(
+        !SupportsNamespaceView<metadata::Namespace&&, const route::ReadGuard&>);
+    static_assert(
+        !SupportsNamespaceView<metadata::Namespace&&, route::ReadGuard&&>);
+    static_assert(SupportsNamespaceView<
+                  const metadata::Namespace&,
+                  const route::ObjectRoute::Cursor<LockMode::kRead>::Object&>);
+    static_assert(SupportsNamespaceView<
+                  const metadata::Namespace&,
+                  route::ObjectRoute::Cursor<LockMode::kRead>::Object&&>);
+    static_assert(!SupportsNamespaceView<
+                  metadata::Namespace&&,
+                  const route::ObjectRoute::Cursor<LockMode::kRead>::Object&>);
+    static_assert(SupportsNamespaceView<
+                  const metadata::Namespace&,
+                  const route::ObjectRoute::Cursor<LockMode::kWrite>::Object&>);
+    static_assert(!SupportsNamespaceView<
+                  metadata::Namespace&&,
+                  const route::ObjectRoute::Cursor<LockMode::kWrite>::Object&>);
+
     const TenantId tenant("tenant-view");
     metadata::Namespace ns(tenant);
+    metadata::Namespace other_ns(TenantId("other-tenant"));
     {
         auto guard = ns.objects.WriteKey("k1");
         ASSERT_NE(test::PublishEnvelope(guard), 0u);
+        EXPECT_TRUE(guard.BelongsTo(ns.objects));
+        EXPECT_FALSE(guard.BelongsTo(other_ns.objects));
         const metadata::ObjectView view = ns.View(guard);
         EXPECT_EQ(view.tenant_id(), tenant);
         EXPECT_EQ(view.key(), "k1");
         EXPECT_EQ(&view.metadata(), &guard.metadata());
-        EXPECT_EQ(&view.state(), &guard.state());
-
-        const metadata::ConstObjectView const_view = view;
-        EXPECT_EQ(const_view.tenant_id(), tenant);
-        EXPECT_EQ(const_view.key(), "k1");
-        EXPECT_EQ(&const_view.metadata(), &guard.metadata());
     }
     {
         auto guard = ns.objects.Read("k1");
         ASSERT_TRUE(guard.has_value());
-        const metadata::ConstObjectView view = ns.View(*guard);
+        EXPECT_TRUE(guard->BelongsTo(ns.objects));
+        EXPECT_FALSE(guard->BelongsTo(other_ns.objects));
+        const metadata::ObjectView view = ns.View(*guard);
         EXPECT_EQ(view.tenant_id(), tenant);
         EXPECT_EQ(view.key(), "k1");
         EXPECT_EQ(&view.metadata(), &guard->metadata());
     }
     for (auto object : ns.objects.WriteCursor()) {
+        EXPECT_TRUE(object.BelongsTo(ns.objects));
+        EXPECT_FALSE(object.BelongsTo(other_ns.objects));
         const metadata::ObjectView view = ns.View(object);
         EXPECT_EQ(view.tenant_id(), tenant);
         EXPECT_EQ(view.key(), "k1");
         EXPECT_EQ(&view.metadata(), &object.metadata());
-        EXPECT_EQ(&view.state(), &object.state());
     }
     for (auto object : ns.objects.ReadCursor()) {
-        const metadata::ConstObjectView view = ns.View(object);
+        EXPECT_TRUE(object.BelongsTo(ns.objects));
+        EXPECT_FALSE(object.BelongsTo(other_ns.objects));
+        const metadata::ObjectView view = ns.View(object);
         EXPECT_EQ(view.tenant_id(), tenant);
         EXPECT_EQ(view.key(), "k1");
         EXPECT_EQ(&view.metadata(), &object.metadata());

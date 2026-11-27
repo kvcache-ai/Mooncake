@@ -61,7 +61,7 @@ Each key maps to one `ObjectMetadata` record:
 |---|---|
 | `client_id`, `put_start_time` | Writer identity and write-start time (used to reap stale `PutStart`s) |
 | `data_type` | Data-type classification |
-| `group_id` | Optional group for shared-TTL lifecycle (tenant and key live on `Namespace` and `KeySlot`, bound on demand via `metadata::ObjectView` / `ConstObjectView`) |
+| `group_id` | Optional group for shared-TTL lifecycle (tenant and key live on `Namespace` and `KeySlot`, bound on demand via read-only `metadata::ObjectView`) |
 | `lease_`, `soft_pin_timeout`, `hard_pinned` | Read lease and pin state that control eviction eligibility |
 | `parts_` | `boost::container::small_vector<ObjectPart, 1>`. Each object currently has one part, which holds the length, optional checksum, and replicas in a `small_vector<Replica, 1>`. |
 
@@ -180,9 +180,9 @@ Engine connection metadata.
 
 - **Master memory**: the key and its metadata are stored together — the key
   is owned once by the slot-map node in the tenant's route (`KeySlot`), and
-  the tenant ID is owned once by `metadata::Namespace`. Internal helpers
-  receive stack-only `metadata::ObjectView` / `ConstObjectView` views produced
-  by the namespace rather than duplicating either string in `ObjectMetadata`.
+  the tenant ID is owned once by `metadata::Namespace`. Read-only helpers
+  receive stack-only, immovable `metadata::ObjectView` views produced by the
+  namespace rather than duplicating either string in `ObjectMetadata`.
 - **Storage backends**: Bucket, Offset Allocator, and FilePerKey store the
   storage key alongside the value. FilePerKey can also derive a lookup path
   directly from that key. NVMe KV and object storage use backend-specific
