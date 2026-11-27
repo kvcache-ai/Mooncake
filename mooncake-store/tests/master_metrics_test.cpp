@@ -207,11 +207,11 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
               value_length);
     ASSERT_EQ(metrics.get_put_start_requests(), 1);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
-    auto put_revoke_result =
-        service_.PutRevoke(client_id,
-                           CapturedPrimaryGrantsForTesting::Meta(
-                               &service_, client_id, key, TenantId::Default()),
-                           ReplicaType::MEMORY);
+    auto put_revoke_result = service_.PutRevokeV2(
+        client_id,
+        CapturedPrimaryGrantsForTesting::Meta(&service_, client_id, key,
+                                              TenantId::Default()),
+        ReplicaType::MEMORY);
     ASSERT_TRUE(put_revoke_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
@@ -686,14 +686,15 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     EXPECT_NE(detail_resp.body.find("\"allocator_capacity_bytes\""),
               std::string::npos);
 
-    ASSERT_TRUE(service
-                    ->PutRevoke(client_id,
-                                CapturedPrimaryGrantsForTesting::Meta(
-                                    service.get(), client_id,
-                                    std::string("admin_metrics_projection_key"),
-                                    TenantId::Default()),
-                                ReplicaType::MEMORY)
-                    .has_value());
+    ASSERT_TRUE(
+        service
+            ->PutRevokeV2(client_id,
+                          CapturedPrimaryGrantsForTesting::Meta(
+                              service.get(), client_id,
+                              std::string("admin_metrics_projection_key"),
+                              TenantId::Default()),
+                          ReplicaType::MEMORY)
+            .has_value());
     ASSERT_TRUE(service->UnmountSegment(segment.id, client_id).has_value());
 
     admin_server.Stop();
@@ -758,7 +759,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     std::vector<ObjectMeta> object_metas;
     object_metas.reserve(keys.size());
     for (const auto& key : keys) {
-        object_metas.emplace_back(ObjectMeta{key, std::nullopt});
+        object_metas.emplace_back(ObjectMeta{key, std::nullopt, std::nullopt});
     }
     auto batch_put_end_result =
         BatchPutEndWithGrantForTesting(service_, client_id, object_metas);
@@ -789,7 +790,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
 
     // Test BatchPutRevoke request (should all fail)
     auto batch_put_revoke_result =
-        service_.BatchPutRevoke(client_id, object_metas);
+        service_.BatchPutRevokeV2(client_id, object_metas);
     ASSERT_EQ(batch_put_revoke_result.size(), 3);
     ASSERT_EQ(metrics.get_batch_put_revoke_requests(), 1);
     ASSERT_EQ(metrics.get_batch_put_revoke_partial_successes(), 0);

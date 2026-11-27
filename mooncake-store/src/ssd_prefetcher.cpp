@@ -29,6 +29,7 @@ constexpr size_t kPrefetchMetadataChunkSize = 128;
 struct SsdPrefetchRoute {
     int64_t local_disk_size{0};
     std::string holder_endpoint;
+    std::string storage_key;
 };
 
 // Delegated keys may carry a foreign tenant; scope them in the dedup table
@@ -43,10 +44,12 @@ std::string ScopeTenantKey(const std::string& own_tenant,
 // readable) and no MEMORY replica at all (a PROCESSING memory replica means
 // someone is already promoting/writing it).
 std::optional<SsdPrefetchRoute> ClassifySsdPrefetchRoute(
-    const std::vector<Replica::Descriptor>& replicas) {
+    const std::vector<Replica::Descriptor>& replicas,
+    const std::string& local_rpc_addr = "") {
     bool has_memory = false;
     SsdPrefetchRoute route;
     bool has_local_disk = false;
+    bool matched_local_holder = false;
     for (const auto& replica : replicas) {
         if (replica.is_memory_replica()) {
             has_memory = true;
@@ -54,11 +57,19 @@ std::optional<SsdPrefetchRoute> ClassifySsdPrefetchRoute(
         }
         if (replica.is_local_disk_replica() &&
             replica.status == ReplicaStatus::COMPLETE) {
-            has_local_disk = true;
-            route.local_disk_size =
-                static_cast<int64_t>(calculate_total_size(replica));
-            route.holder_endpoint =
-                replica.get_local_disk_descriptor().transport_endpoint;
+            const auto& disk = replica.get_local_disk_descriptor();
+            const bool is_local_holder =
+                !local_rpc_addr.empty() &&
+                (disk.transport_endpoint.empty() ||
+                 disk.transport_endpoint == local_rpc_addr);
+            if (!has_local_disk || (!matched_local_holder && is_local_holder)) {
+                has_local_disk = true;
+                matched_local_holder = is_local_holder;
+                route.local_disk_size =
+                    static_cast<int64_t>(calculate_total_size(replica));
+                route.holder_endpoint = disk.transport_endpoint;
+                route.storage_key = disk.storage_key.value_or("");
+            }
         }
     }
     if (has_memory || !has_local_disk || route.local_disk_size <= 0) {
@@ -253,8 +264,8 @@ void SsdPrefetcher::TriggerPrefetch(const std::vector<std::string>& keys,
                     throttle->markFailed(chunk[i]);
                     continue;
                 }
-                auto route =
-                    ClassifySsdPrefetchRoute(batch_results[i].value().replicas);
+                auto route = ClassifySsdPrefetchRoute(
+                    batch_results[i].value().replicas, local_rpc_addr);
                 if (!route) {
                     throttle->markAlreadyResident(chunk[i]);
                     continue;
@@ -266,10 +277,13 @@ void SsdPrefetcher::TriggerPrefetch(const std::vector<std::string>& keys,
                     // RegisterPrefetchTask. EngineCore (segment=0) otherwise
                     // leaves a PROCESSING MEMORY replica that get() waits on
                     // for the full per-key budget.
+                    const std::string& lookup_key = !route->storage_key.empty()
+                                                        ? route->storage_key
+                                                        : chunk[i];
                     std::optional<int64_t> local_size;
                     if (file_storage) {
                         local_size =
-                            file_storage->LookupLocalObjectSize(chunk[i]);
+                            file_storage->LookupLocalObjectSize(lookup_key);
                     }
                     if (local_size && *local_size > 0) {
                         local_keys.push_back(chunk[i]);
@@ -360,25 +374,80 @@ void SsdPrefetcher::RunLocalPrefetch(const std::vector<std::string>& keys,
     SubmitJob([client = std::move(client),
                file_storage = std::move(file_storage), throttle, own_tenant,
                tenant_id, keys = std::move(raw_keys)]() {
-        std::vector<std::string> local_keys;
-        std::vector<int64_t> local_sizes;
-        local_keys.reserve(keys.size());
-        local_sizes.reserve(keys.size());
-        for (const auto& key : keys) {
-            auto local_size =
-                file_storage->LookupLocalObjectSize(key, tenant_id);
-            if (!local_size || *local_size <= 0) {
-                VLOG(1) << "SSD prefetch: skip remote key=" << key
-                        << " (not in local object map)";
-                throttle->markFailed(
-                    ScopeTenantKey(own_tenant, tenant_id, key));
+        for (size_t offset = 0; offset < keys.size();
+             offset += kPrefetchMetadataChunkSize) {
+            const size_t end =
+                std::min(offset + kPrefetchMetadataChunkSize, keys.size());
+            std::vector<std::string> chunk(keys.begin() + offset,
+                                           keys.begin() + end);
+            auto batch_results = client->BatchQueryReadOnly(chunk, tenant_id);
+            if (batch_results.size() != chunk.size()) {
+                LOG(WARNING)
+                    << "SSD prefetch: delegated BatchQueryReadOnly size "
+                       "mismatch, expected "
+                    << chunk.size() << ", got " << batch_results.size();
+                for (const auto& key : chunk) {
+                    throttle->markFailed(
+                        ScopeTenantKey(own_tenant, tenant_id, key));
+                }
                 continue;
             }
-            local_keys.push_back(key);
-            local_sizes.push_back(*local_size);
+
+            std::vector<std::string> local_keys;
+            std::vector<int64_t> local_sizes;
+            local_keys.reserve(chunk.size());
+            local_sizes.reserve(chunk.size());
+            for (size_t i = 0; i < chunk.size(); ++i) {
+                const auto& key = chunk[i];
+                const std::string scoped =
+                    ScopeTenantKey(own_tenant, tenant_id, key);
+                if (!batch_results[i]) {
+                    throttle->markFailed(scoped);
+                    continue;
+                }
+                bool has_memory = false;
+                bool found_local_disk = false;
+                std::string raw_storage_key;
+                for (const auto& replica : batch_results[i].value().replicas) {
+                    if (replica.is_memory_replica()) {
+                        has_memory = true;
+                        break;
+                    }
+                    if (!found_local_disk && replica.is_local_disk_replica() &&
+                        replica.status == ReplicaStatus::COMPLETE &&
+                        replica.get_local_disk_descriptor().client_id ==
+                            client->getClientId()) {
+                        found_local_disk = true;
+                        raw_storage_key = replica.get_local_disk_descriptor()
+                                              .storage_key.value_or("");
+                    }
+                }
+                if (has_memory) {
+                    throttle->markAlreadyResident(scoped);
+                    continue;
+                }
+                if (!found_local_disk) {
+                    throttle->markFailed(scoped);
+                    continue;
+                }
+                const std::string& lookup_key =
+                    !raw_storage_key.empty() ? raw_storage_key : key;
+                auto local_size =
+                    file_storage->LookupLocalObjectSize(lookup_key, tenant_id);
+                if (!local_size || *local_size <= 0) {
+                    VLOG(1) << "SSD prefetch: skip remote key=" << key
+                            << " (not in local object map)";
+                    throttle->markFailed(scoped);
+                    continue;
+                }
+                local_keys.push_back(key);
+                local_sizes.push_back(*local_size);
+            }
+            if (!local_keys.empty()) {
+                RegisterAndPromote(*client, *file_storage, throttle, local_keys,
+                                   local_sizes, tenant_id);
+            }
         }
-        RegisterAndPromote(*client, *file_storage, throttle, local_keys,
-                           local_sizes, tenant_id);
     });
 }
 }  // namespace mooncake
