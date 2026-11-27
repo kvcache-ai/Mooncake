@@ -1,6 +1,7 @@
-#include "buffer_pool.h"
+#include <nanobind/stl/shared_ptr.h>
 
-#include <pybind11/gil.h>
+#include "buffer_pool.h"
+#include "python_buffer.h"
 
 #include <atomic>
 #include <chrono>
@@ -21,7 +22,7 @@
 #include "real_client.h"
 #include "types.h"
 
-namespace py = pybind11;
+namespace py = nanobind;
 
 namespace mooncake {
 namespace {
@@ -37,15 +38,15 @@ std::shared_ptr<PyClient> unwrap_pyclient_capsule(py::object capsule) {
         throw std::runtime_error(
             "store wrapper returned a non-capsule PyClient handle");
     }
-    py::capsule py_client_capsule(capsule);
+    auto py_client_capsule = py::borrow<py::capsule>(capsule);
     const char *capsule_name = py_client_capsule.name();
     if (capsule_name == nullptr ||
         std::strcmp(capsule_name, kPyClientCapsuleName) != 0) {
         throw std::runtime_error(
             "store wrapper returned an unexpected PyClient capsule type");
     }
-    auto *ptr = static_cast<std::shared_ptr<PyClient> *>(
-        py_client_capsule.get_pointer());
+    auto *ptr =
+        static_cast<std::shared_ptr<PyClient> *>(py_client_capsule.data());
     if (ptr == nullptr) {
         throw std::runtime_error(
             "store wrapper returned an empty PyClient capsule");
@@ -58,7 +59,7 @@ std::shared_ptr<PyClient> unwrap_store(py::object store_obj) {
         return nullptr;
     }
     try {
-        return store_obj.cast<std::shared_ptr<PyClient>>();
+        return py::cast<std::shared_ptr<PyClient>>(store_obj);
     } catch (const py::cast_error &) {
     }
     if (!py::hasattr(store_obj, kPyClientCapsuleMethod)) {
@@ -84,7 +85,7 @@ class BufferLeaseViewNative {
     BufferLeaseViewNative(const BufferLeaseViewNative &) = delete;
     BufferLeaseViewNative &operator=(const BufferLeaseViewNative &) = delete;
 
-    py::buffer_info buffer_info();
+    int export_buffer(PyObject *self, Py_buffer *view, int flags);
 
    private:
     std::shared_ptr<BufferLeaseNative> lease_;
@@ -105,7 +106,6 @@ class BufferLeaseNative
     uintptr_t ptr() const;
     size_t size() const { return requested_size_; }
     py::object buffer();
-    py::buffer_info buffer_info(size_t size);
     void add_export();
     void release_export();
     BufferLeaseNative &enter() { return *this; }
@@ -203,8 +203,15 @@ BufferLeaseViewNative::BufferLeaseViewNative(
 
 BufferLeaseViewNative::~BufferLeaseViewNative() { lease_->release_export(); }
 
-py::buffer_info BufferLeaseViewNative::buffer_info() {
-    return lease_->buffer_info(size_);
+int BufferLeaseViewNative::export_buffer(PyObject *self, Py_buffer *view,
+                                         int flags) {
+    try {
+        return fill_byte_buffer(
+            self, view, reinterpret_cast<void *>(lease_->ptr()), size_, flags);
+    } catch (const std::exception &error) {
+        PyErr_SetString(PyExc_BufferError, error.what());
+        return -1;
+    }
 }
 
 BufferLeaseNative::BufferLeaseNative(std::shared_ptr<BufferPoolNative> pool,
@@ -230,13 +237,6 @@ py::object BufferLeaseNative::buffer() {
     auto view = std::make_shared<BufferLeaseViewNative>(shared_from_this(),
                                                         requested_size_);
     return py::memoryview(py::cast(view));
-}
-
-py::buffer_info BufferLeaseNative::buffer_info(size_t size) {
-    if (!handle_) throw std::runtime_error("buffer lease is closed");
-    return py::buffer_info(handle_->ptr(), sizeof(uint8_t),
-                           py::format_descriptor<uint8_t>::format(), 1, {size},
-                           {sizeof(uint8_t)});
 }
 
 void BufferLeaseNative::add_export() {
@@ -302,22 +302,23 @@ BufferPoolNative::BufferPoolNative(const py::object &store, size_t max_bytes,
     } else {
         max_bytes_ = std::max(max_bytes, local_buffer_capacity_);
     }
-    max_size_class_ =
-        max_size_class.is_none() ? max_bytes_ : max_size_class.cast<size_t>();
+    max_size_class_ = max_size_class.is_none()
+                          ? max_bytes_
+                          : py::cast<size_t>(max_size_class);
     if (!default_timeout.is_none()) {
-        default_timeout_ = default_timeout.cast<double>();
+        default_timeout_ = py::cast<double>(default_timeout);
     }
     if (!max_regions.is_none()) {
-        max_regions_ = max_regions.cast<size_t>();
+        max_regions_ = py::cast<size_t>(max_regions);
     }
 }
 
 std::shared_ptr<BufferLeaseNative> BufferPoolNative::acquire(
     size_t size, py::object block, py::object timeout) {
     bool should_block =
-        block.is_none() ? block_on_exhaustion_ : block.cast<bool>();
+        block.is_none() ? block_on_exhaustion_ : py::cast<bool>(block);
     std::optional<double> timeout_s = default_timeout_;
-    if (!timeout.is_none()) timeout_s = timeout.cast<double>();
+    if (!timeout.is_none()) timeout_s = py::cast<double>(timeout);
     if (timeout_s.has_value() && *timeout_s < 0) {
         throw std::runtime_error("timeout must be non-negative");
     }
@@ -533,27 +534,34 @@ void BufferPoolNative::raise_if_open_locked() const {
     }
 }
 
-void bind_buffer_pool(py::module &m) {
-    py::class_<BufferLeaseViewNative, std::shared_ptr<BufferLeaseViewNative>>(
-        m, "BufferLeaseView", py::buffer_protocol())
-        .def_property_readonly(
-            "buffer",
-            [](const py::object &self) { return py::memoryview(self); })
-        .def_buffer(&BufferLeaseViewNative::buffer_info);
+void bind_buffer_pool(py::module_ &m) {
+    static PyType_Slot lease_view_slots[] = {
+        {Py_bf_getbuffer,
+         reinterpret_cast<void *>(+[](PyObject *self, Py_buffer *view,
+                                      int flags) {
+             return py::inst_ptr<BufferLeaseViewNative>(self)->export_buffer(
+                 self, view, flags);
+         })},
+        {0, nullptr},
+    };
+    py::class_<BufferLeaseViewNative>(m, "BufferLeaseView",
+                                      py::type_slots(lease_view_slots))
+        .def_prop_ro("buffer", [](const py::object &self) {
+            return py::memoryview(self);
+        });
 
-    py::class_<BufferLeaseNative, std::shared_ptr<BufferLeaseNative>>(
-        m, "BufferLease")
-        .def_property_readonly("ptr", &BufferLeaseNative::ptr)
-        .def_property_readonly("size", &BufferLeaseNative::size)
-        .def_property_readonly("buffer", &BufferLeaseNative::buffer)
+    py::class_<BufferLeaseNative>(m, "BufferLease")
+        .def_prop_ro("ptr", &BufferLeaseNative::ptr)
+        .def_prop_ro("size", &BufferLeaseNative::size)
+        .def_prop_ro("buffer", &BufferLeaseNative::buffer)
         .def("release", &BufferLeaseNative::release)
         .def("__enter__", &BufferLeaseNative::enter,
-             py::return_value_policy::reference_internal)
-        .def("__exit__", &BufferLeaseNative::exit);
+             py::rv_policy::reference_internal)
+        .def("__exit__", &BufferLeaseNative::exit, py::arg("exc_type").none(),
+             py::arg("exc_value").none(), py::arg("traceback").none());
 
-    py::class_<BufferPoolNative, std::shared_ptr<BufferPoolNative>>(
-        m, "BufferPool")
-        .def(py::init([](const py::object &store, size_t max_bytes,
+    py::class_<BufferPoolNative>(m, "BufferPool")
+        .def(py::new_([](const py::object &store, size_t max_bytes,
                          size_t min_size_class, py::object max_size_class,
                          size_t alignment, bool block_on_exhaustion,
                          py::object default_timeout, py::object max_regions,
@@ -563,29 +571,33 @@ void bind_buffer_pool(py::module &m) {
                      alignment, block_on_exhaustion, default_timeout,
                      max_regions);
                  if (!prewarm_size.is_none() && prewarm_count > 0) {
-                     pool->prewarm(prewarm_size.cast<size_t>(), prewarm_count);
+                     pool->prewarm(py::cast<size_t>(prewarm_size),
+                                   prewarm_count);
                  }
                  return pool;
              }),
              py::arg("store"), py::arg("max_bytes") = 0,
              py::arg("min_size_class") = 64 * 1024,
-             py::arg("max_size_class") = py::none(),
+             py::arg("max_size_class").none() = py::none(),
              py::arg("alignment") = 8 * 1024 * 1024,
              py::arg("block_on_exhaustion") = true,
-             py::arg("default_timeout") = py::none(),
-             py::arg("max_regions") = py::none(),
-             py::arg("prewarm_size") = py::none(), py::arg("prewarm_count") = 0)
+             py::arg("default_timeout").none() = py::none(),
+             py::arg("max_regions").none() = py::none(),
+             py::arg("prewarm_size").none() = py::none(),
+             py::arg("prewarm_count") = 0)
         .def("acquire", &BufferPoolNative::acquire, py::arg("size"),
-             py::arg("block") = py::none(), py::arg("timeout") = py::none())
+             py::arg("block").none() = py::none(),
+             py::arg("timeout").none() = py::none())
         .def("buffer", &BufferPoolNative::buffer, py::arg("size"),
-             py::arg("block") = py::none(), py::arg("timeout") = py::none())
+             py::arg("block").none() = py::none(),
+             py::arg("timeout").none() = py::none())
         .def("prewarm", &BufferPoolNative::prewarm, py::arg("size"),
              py::arg("count"))
         .def("close", &BufferPoolNative::close);
 
-    m.attr("RegisteredBufferPool") = m.attr("BufferPool");
-    m.attr("RegisteredBufferLease") = m.attr("BufferLease");
-    m.attr("RegisteredBufferLeaseView") = m.attr("BufferLeaseView");
+    m.attr("RegisteredBufferPool") = py::object(m.attr("BufferPool"));
+    m.attr("RegisteredBufferLease") = py::object(m.attr("BufferLease"));
+    m.attr("RegisteredBufferLeaseView") = py::object(m.attr("BufferLeaseView"));
 }
 
 }  // namespace mooncake

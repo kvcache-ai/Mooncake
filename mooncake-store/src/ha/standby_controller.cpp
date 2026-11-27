@@ -1,5 +1,7 @@
 #include "ha/standby_controller.h"
 
+#include <algorithm>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -37,7 +39,11 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
         .enable_snapshot_bootstrap = config.enable_oplog_snapshot,
         .enable_oplog_following = capabilities.has_oplog_following,
         .oplog_poll_interval_ms = config.oplog_poll_interval_ms,
+        .oplog_standby_max_batches_per_poll =
+            config.oplog_standby_max_batches_per_poll,
         .batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec,
+        .ha_redis_expected_replicas_per_shard =
+            config.ha_redis_expected_replicas_per_shard,
     });
 }
 
@@ -113,12 +119,14 @@ class CapabilityDrivenStandbyController final : public StandbyController {
    public:
     CapabilityDrivenStandbyController(
         const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
-        StartErrorInjector start_error_injector)
+        StartErrorInjector start_error_injector,
+        std::function<bool()> startup_cancelled)
         : spec_(spec),
           config_(config),
           capabilities_(BuildStandbyRuntimeCapabilities(spec, config)),
           standby_service_(CreateStandbyService(config, capabilities_)),
-          start_error_injector_(std::move(start_error_injector)) {
+          start_error_injector_(std::move(start_error_injector)),
+          startup_cancelled_(std::move(startup_cancelled)) {
         if (config_.enable_oplog_snapshot) {
             try {
                 if (spec_.type != HABackendType::ETCD ||
@@ -141,7 +149,12 @@ class CapabilityDrivenStandbyController final : public StandbyController {
                 standby_service_->SetBatchOpLogSnapshotProvider(
                     std::make_unique<BatchOpLogSnapshotProvider>(
                         config_.cluster_id, *batch_backend_,
-                        *snapshot_object_store_, snapshot_root));
+                        *snapshot_object_store_, snapshot_root,
+                        config_.oplog_standby_max_batches_per_poll,
+                        std::chrono::milliseconds(
+                            std::max(config_.oplog_poll_interval_ms, 1)),
+                        std::chrono::seconds(
+                            config_.batch_oplog_retry_timeout_sec)));
                 batch_oplog_snapshot_coordinator_ =
                     std::make_unique<BatchOpLogSnapshotCoordinator>(
                         *standby_service_, *batch_backend_,
@@ -217,7 +230,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
 
         ErrorCode err = standby_service_->Start(
             observed_leader.has_value() ? observed_leader->leader_address : "",
-            oplog_connstring_, config_.cluster_id);
+            oplog_connstring_, config_.cluster_id, startup_cancelled_);
 
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -453,6 +466,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         batch_oplog_snapshot_coordinator_;
     ErrorCode dependency_init_error_{ErrorCode::OK};
     StartErrorInjector start_error_injector_;
+    std::function<bool()> startup_cancelled_;
     std::string oplog_connstring_;
 
     mutable std::mutex state_mutex_;
@@ -469,12 +483,14 @@ class CapabilityDrivenStandbyController final : public StandbyController {
 
 std::unique_ptr<StandbyController> CreateStandbyController(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
-    StandbyController::StartErrorInjector start_error_injector) {
+    StandbyController::StartErrorInjector start_error_injector,
+    std::function<bool()> startup_cancelled) {
     const auto capabilities = BuildStandbyRuntimeCapabilities(spec, config);
     if (capabilities.has_snapshot_bootstrap ||
         capabilities.has_oplog_following) {
         return std::make_unique<CapabilityDrivenStandbyController>(
-            spec, config, std::move(start_error_injector));
+            spec, config, std::move(start_error_injector),
+            std::move(startup_cancelled));
     }
 
     LOG(INFO) << "HA standby controller falls back to noop, backend_type="

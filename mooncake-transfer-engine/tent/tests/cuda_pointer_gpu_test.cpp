@@ -111,3 +111,70 @@ TEST(CudaPointerGpuTest, RealAllocationsCopiesAndContextRestoration) {
     EXPECT_TRUE(platform.free(device, src.size()).ok());
     EXPECT_TRUE(platform.free(managed, src.size()).ok());
 }
+
+TEST(CudaPointerGpuTest, ExportDmabufAlignmentSubRangeAndContextRestoration) {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) GTEST_SKIP();
+    ASSERT_EQ(cudaSuccess, cudaSetDevice(0));
+    CudaPlatform platform(nullptr);
+
+    constexpr size_t kAlloc = 64ULL << 20;
+    constexpr size_t kOffset = 16ULL << 20;
+    constexpr size_t kLength = 16ULL << 20;
+    constexpr size_t kUnalignedSize = (4ULL << 20) + 128;
+    void* base = nullptr;
+    void* unaligned = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&base, kAlloc));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&unaligned, kUnalignedSize));
+
+    const char* prev_peermem = std::getenv("WITH_NVIDIA_PEERMEM");
+    const std::string saved_peermem = prev_peermem ? prev_peermem : "";
+    ASSERT_EQ(0, ::setenv("WITH_NVIDIA_PEERMEM", "0", 1));
+    std::array<char, 64> host_buf{};
+    DmabufExport host_exp;
+    EXPECT_TRUE(
+        platform.exportDmabuf(host_buf.data(), host_buf.size(), host_exp)
+            .IsInvalidArgument());
+
+    DmabufExport whole_exp;
+    Status whole_st =
+        platform.exportDmabuf(unaligned, kUnalignedSize, whole_exp);
+    if (whole_st.ok()) {
+        EXPECT_GE(whole_exp.fd, 0);
+        EXPECT_TRUE(whole_exp.close_fd);
+        EXPECT_EQ(0u, whole_exp.offset);
+        whole_exp.close();
+    } else {
+        EXPECT_TRUE(whole_st.IsNotImplemented()) << whole_st.ToString();
+    }
+
+    std::thread worker([&] {
+        CUcontext before = nullptr, after = nullptr;
+        ASSERT_EQ(CUDA_SUCCESS, cuCtxGetCurrent(&before));
+        ASSERT_EQ(nullptr, before);
+
+        DmabufExport exp;
+        Status s = platform.exportDmabuf(static_cast<char*>(base) + kOffset,
+                                         kLength, exp);
+        ASSERT_EQ(CUDA_SUCCESS, cuCtxGetCurrent(&after));
+        EXPECT_EQ(nullptr, after);
+        if (s.ok()) {
+            EXPECT_GE(exp.fd, 0);
+            EXPECT_TRUE(exp.close_fd);
+            EXPECT_EQ(0u, exp.offset);
+            exp.close();
+            EXPECT_EQ(-1, exp.fd);
+        } else {
+            EXPECT_TRUE(s.IsNotImplemented()) << s.ToString();
+        }
+    });
+    worker.join();
+
+    if (prev_peermem != nullptr) {
+        ::setenv("WITH_NVIDIA_PEERMEM", saved_peermem.c_str(), 1);
+    } else {
+        ::unsetenv("WITH_NVIDIA_PEERMEM");
+    }
+    EXPECT_EQ(cudaSuccess, cudaFree(unaligned));
+    EXPECT_EQ(cudaSuccess, cudaFree(base));
+}

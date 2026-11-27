@@ -136,6 +136,21 @@ impl mooncake_store_route::RouteAuthorityService for LocalAuthorityAdapter {
         }
     }
 
+    fn batch_get_route_presence(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Vec<Result<mooncake_store_route::RouteAuthorityPresence>> {
+        match crate::route_directory::authority_get_presence_many(namespace, authority, keys) {
+            Ok(presence) => presence.into_iter().map(Ok).collect(),
+            Err(error) => keys
+                .iter()
+                .map(|_| Err(StoreError::NotFound(error.to_string())))
+                .collect(),
+        }
+    }
+
     fn batch_contains_routes(
         &self,
         namespace: &str,
@@ -242,6 +257,13 @@ impl LocalAllocatorAdapter {
                 }
                 Err(error) => return Err(error),
             }
+            if !self
+                .allocator
+                .lock()
+                .can_fit_after_eviction(None, length_bytes)
+            {
+                break;
+            }
             if self.storage_owner.has_local_cold_tier_work() {
                 cold_tier::ColdTierHandle::kick_offload_for_allocator_eviction(
                     self.storage_owner.as_ref(),
@@ -291,6 +313,13 @@ impl LocalAllocatorAdapter {
                     last_error = Some(message);
                 }
                 Err(error) => return Err(error),
+            }
+            if !self
+                .allocator
+                .lock()
+                .can_fit_after_eviction(Some(segment_name), length_bytes)
+            {
+                break;
             }
             if self.storage_owner.has_local_cold_tier_work() {
                 cold_tier::ColdTierHandle::kick_offload_for_allocator_eviction(

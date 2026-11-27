@@ -42,6 +42,13 @@ class ClientSessionRegistryTestPeer {
         registry.ExpireSessions(now);
     }
 
+    static bool WaitForExpiryStop(ClientSessionRegistry& registry,
+                                  Clock::duration timeout) {
+        std::unique_lock lock(registry.expiry_mutex_);
+        return registry.expiry_cv_.wait_for(
+            lock, timeout, [&] { return registry.expiry_stopping_; });
+    }
+
     // Ping at an explicit time, so a recovery goes through the registry (and
     // is published) like a production heartbeat, not past it.
     static ClientStatus Ping(ClientSessionRegistry& registry,
@@ -49,8 +56,17 @@ class ClientSessionRegistryTestPeer {
         return registry.Observe(client_id, now);
     }
 
+    // Deliver queued transitions on the caller's thread instead of the
+    // registry's delivery thread.
+    static void Drain(ClientSessionRegistry& registry) {
+        registry.events_.Drain();
+    }
+
+    // One deterministic tick: evaluate every session, then deliver what it
+    // published.
     static void Poll(ClientSessionRegistry& registry, Clock::time_point now) {
-        ExpireSessions(registry, now);
+        registry.ExpireSessions(now);
+        registry.events_.Drain();
     }
 
     static Slot FindSlot(const ClientSessionRegistry& registry,

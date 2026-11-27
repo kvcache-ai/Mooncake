@@ -124,7 +124,8 @@ TEST(KvEventPublisherBatchingTest, PacedRemovalsFlushWhenFull) {
     ASSERT_TRUE(subscriber.Connect(config.bind_endpoint));
     std::jthread producer([&] {
         for (size_t i = 0; i < 64; ++i) {
-            publisher.PublishRemoved(std::to_string(i), "cpu", "tenant-a", "g");
+            publisher.PublishTransition(std::to_string(i), "tenant-a", "g", "",
+                                        KvEventPublisher::kMediumCpu, 0);
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
     });
@@ -148,7 +149,8 @@ TEST(KvEventPublisherBatchingTest, PartialRemovalBatchFlushesAtDeadline) {
     KvEventPublisher publisher(config);
     Subscriber subscriber;
     ASSERT_TRUE(subscriber.Connect(config.bind_endpoint));
-    publisher.PublishRemoved("a", "disk");
+    publisher.PublishTransition("a", "", "", "", KvEventPublisher::kMediumDisk,
+                                0);
     const auto batch = subscriber.Receive();
     ASSERT_TRUE(batch);
     ASSERT_EQ(batch->events.size(), 1u);
@@ -163,7 +165,8 @@ TEST(KvEventPublisherBatchingTest, ContinuousArrivalsDoNotResetDeadline) {
     ASSERT_TRUE(subscriber.Connect(config.bind_endpoint));
     std::jthread producer([&] {
         for (unsigned i = 0; i < 100; ++i) {
-            publisher.PublishRemoved(std::to_string(i), "cpu");
+            publisher.PublishTransition(std::to_string(i), "", "", "",
+                                        KvEventPublisher::kMediumCpu, 0);
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     });
@@ -178,11 +181,15 @@ TEST(KvEventPublisherBatchingTest, StoresAndClearsFlushAndKeepMutationOrder) {
     KvEventPublisher publisher(config);
     Subscriber subscriber;
     ASSERT_TRUE(subscriber.Connect(config.bind_endpoint));
-    publisher.PublishRemoved("a", "cpu", "tenant-a");
-    publisher.PublishStored("a", "cpu", "tenant-a", "", "new-a");
+    publisher.PublishTransition("a", "tenant-a", "", "",
+                                KvEventPublisher::kMediumCpu, 0);
+    publisher.PublishTransition("a", "tenant-a", "", "new-a", 0,
+                                KvEventPublisher::kMediumCpu);
     publisher.PublishCleared("tenant-a");
-    publisher.PublishRemoved("b", "disk", "tenant-b");
-    publisher.PublishStored("b", "disk", "tenant-b", "", "new-b");
+    publisher.PublishTransition("b", "tenant-b", "", "",
+                                KvEventPublisher::kMediumDisk, 0);
+    publisher.PublishTransition("b", "tenant-b", "", "new-b", 0,
+                                KvEventPublisher::kMediumDisk);
     const std::vector<std::string> types{"removed", "stored", "cleared",
                                          "removed", "stored"};
     const std::vector<std::string> keys{"a", "a", "", "b", "b"};
@@ -214,7 +221,8 @@ TEST(KvEventPublisherBatchingTest, StoreAloneDoesNotWaitForRemovalDeadline) {
     KvEventPublisher publisher(config);
     Subscriber subscriber;
     ASSERT_TRUE(subscriber.Connect(config.bind_endpoint));
-    publisher.PublishStored("a", "cpu");
+    publisher.PublishTransition("a", "", "", "", 0,
+                                KvEventPublisher::kMediumCpu);
     const auto batch = subscriber.Receive();
     ASSERT_TRUE(batch);
     ASSERT_EQ(batch->events.size(), 1u);
@@ -226,14 +234,16 @@ TEST(KvEventPublisherBatchingTest, ZeroTimeoutKeepsImmediatePartialFlush) {
     KvEventPublisher publisher(config);
     Subscriber subscriber;
     ASSERT_TRUE(subscriber.Connect(config.bind_endpoint));
-    publisher.PublishRemoved("a", "cpu");
+    publisher.PublishTransition("a", "", "", "", KvEventPublisher::kMediumCpu,
+                                0);
     ASSERT_TRUE(subscriber.Receive());
 }
 
 TEST(KvEventPublisherBatchingTest, ShutdownInterruptsRemovalDeadline) {
     const auto config = Config(5000000);
     auto publisher = std::make_unique<KvEventPublisher>(config);
-    publisher->PublishRemoved("a", "cpu");
+    publisher->PublishTransition("a", "", "", "", KvEventPublisher::kMediumCpu,
+                                 0);
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     const auto before = Clock::now();
     publisher.reset();

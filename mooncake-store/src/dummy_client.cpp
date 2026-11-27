@@ -8,6 +8,7 @@
 #include <fcntl.h>     // For O_CREAT, O_RDWR
 #include <unistd.h>    // For ftruncate, close, shm_unlink
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <algorithm>
 #include <limits>
@@ -496,10 +497,15 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
 int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                              const std::string& server_address,
                              const std::string& ipc_socket_path) {
-    const char* use_fabric_mem_env =
-        std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
-    if (use_fabric_mem_env && std::string(use_fabric_mem_env) == "1") {
-        globalConfig().ascend_use_fabric_mem = true;
+    const char* use_fabric_mem_env = getEnvWithFallback(
+        "MC_ASCEND_ENABLE_USE_FABRIC_MEM", "ASCEND_ENABLE_USE_FABRIC_MEM");
+    if (use_fabric_mem_env) {
+        std::string val(use_fabric_mem_env);
+        std::transform(val.begin(), val.end(), val.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (val == "1" || val == "true") {
+            globalConfig().ascend_use_fabric_mem = true;
+        }
     }
 
     void* base_addr = nullptr;
@@ -572,6 +578,22 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
             LOG(INFO)
                 << "Hot cache shm not available (real client may not have it)";
         }
+    } else {
+        // Zero-buffer startup has no control SHM registration. A fresh UUID
+        // can be asked to remount, and there are no buffers to replay yet.
+        auto initial_ping =
+            invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+        if (initial_ping &&
+            initial_ping->client_status == ClientStatus::NEED_REMOUNT) {
+            initial_ping =
+                invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+        }
+        if (!initial_ping || initial_ping->client_status != ClientStatus::OK) {
+            connected_.store(false);
+            LOG(ERROR) << "Initial dummy client heartbeat failed";
+            return -1;
+        }
+        last_ping_healthy_.store(true);
     }
 
     ping_running_ = true;
@@ -1304,11 +1326,17 @@ int DummyClient::isExist(const std::string& key) {
 }
 
 int DummyClient::isExist(const std::string& key, const ExistOptions& options) {
-    if (options.prefetch_to_memory) {
-        VLOG(1) << "SSD prefetch is not supported via DummyClient; "
-                << "prefetch_to_memory ignored for key=" << key;
+    if (!options.prefetch_to_memory) {
+        return isExist(key);
     }
-    return isExist(key);
+    auto result = invoke_rpc<&RealClient::isExistWithOptions_internal, bool>(
+        key, options);
+    // Prefetch is best-effort, including during a rolling upgrade to a
+    // server that does not yet expose the additive options RPC.
+    if (!result && result.error() == ErrorCode::RPC_FAIL) {
+        return isExist(key);
+    }
+    return result ? (*result ? 1 : 0) : toInt(result.error());
 }
 
 std::vector<int> DummyClient::batchIsExist(
@@ -1363,11 +1391,24 @@ std::vector<int> DummyClient::batchProbeKey(
 
 std::vector<int> DummyClient::batchIsExist(const std::vector<std::string>& keys,
                                            const ExistOptions& options) {
-    if (options.prefetch_to_memory) {
-        VLOG(1) << "SSD prefetch is not supported via DummyClient; "
-                << "prefetch_to_memory ignored";
+    if (!options.prefetch_to_memory || keys.empty()) {
+        return batchIsExist(keys);
     }
-    return batchIsExist(keys);
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batchIsExistWithOptions_internal, bool>(
+            keys.size(), keys, options);
+    if (std::all_of(internal_results.begin(), internal_results.end(),
+                    [](const auto& result) {
+                        return !result && result.error() == ErrorCode::RPC_FAIL;
+                    })) {
+        return batchIsExist(keys);
+    }
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto& result : internal_results) {
+        results.push_back(result ? (*result ? 1 : 0) : -1);
+    }
+    return results;
 }
 
 int64_t DummyClient::getSize(const std::string& key) {
@@ -2085,6 +2126,42 @@ tl::expected<UUID, ErrorCode> DummyClient::create_move_task(
     const std::string& key, const std::string& source,
     const std::string& target) {
     return invoke_rpc<&RealClient::create_move_task, UUID>(key, source, target);
+}
+
+tl::expected<UUID, ErrorCode> DummyClient::create_drain_job(
+    const CreateDrainJobRequest& request) {
+    return invoke_rpc<&RealClient::create_drain_job, UUID>(request);
+}
+
+tl::expected<UUID, ErrorCode> DummyClient::create_timed_drain_job(
+    const CreateDrainJobRequest& request, uint64_t timeout_ms) {
+    return invoke_rpc<&RealClient::create_timed_drain_job, UUID>(request,
+                                                                 timeout_ms);
+}
+
+tl::expected<QueryJobResponse, ErrorCode> DummyClient::query_drain_job(
+    const UUID& job_id) {
+    return invoke_rpc<&RealClient::query_drain_job, QueryJobResponse>(job_id);
+}
+
+tl::expected<void, ErrorCode> DummyClient::cancel_drain_job(
+    const UUID& job_id) {
+    return invoke_rpc<&RealClient::cancel_drain_job, void>(job_id);
+}
+
+tl::expected<ListDrainJobsResponse, ErrorCode> DummyClient::list_drain_jobs(
+    const DrainJobListRequest& request) {
+    return invoke_rpc<&RealClient::list_drain_jobs, ListDrainJobsResponse>(
+        request);
+}
+
+tl::expected<ListTasksResponse, ErrorCode> DummyClient::list_tasks(
+    const TaskListRequest& request) {
+    return invoke_rpc<&RealClient::list_tasks, ListTasksResponse>(request);
+}
+
+tl::expected<void, ErrorCode> DummyClient::cancel_task(const UUID& task_id) {
+    return invoke_rpc<&RealClient::cancel_task, void>(task_id);
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> DummyClient::query_task(

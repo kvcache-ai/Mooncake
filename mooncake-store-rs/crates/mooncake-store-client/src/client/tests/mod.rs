@@ -284,7 +284,10 @@ struct BlockingCasMetadataBackend {
 struct RecoverableMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     state: StdMutex<RecoverableMetadataState>,
+    cold_usage_settlement_gate: StdMutex<Option<ColdUsageSettlementGate>>,
 }
+
+type ColdUsageSettlementGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
 #[derive(Default)]
 struct BlockingCasGateState {
@@ -627,6 +630,7 @@ impl RecoverableMetadataBackend {
         Self {
             inner,
             state: StdMutex::new(RecoverableMetadataState::default()),
+            cold_usage_settlement_gate: StdMutex::new(None),
         }
     }
 
@@ -840,6 +844,15 @@ impl MetadataBackend for RecoverableMetadataBackend {
         delta: mooncake_store_core::ColdTierUsageDelta,
         updated_at_ms: u64,
     ) -> mooncake_store_core::Result<mooncake_store_core::ColdTierDeviceRecord> {
+        if delta.used_bytes > 0 {
+            let gate = self.cold_usage_settlement_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                entered.send(()).expect("test should wait for settlement");
+                release
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("test should release settlement");
+            }
+        }
         self.inner
             .apply_cold_tier_usage_delta(device_id, delta, updated_at_ms)
     }
@@ -11377,6 +11390,163 @@ fn storage_owner_clock_evicts_cold_local_replicas_before_hot_ones() {
 }
 
 #[test]
+fn invalid_local_put_preserves_existing_object() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("invalid-local-segment"));
+    let client = StoreClientBuilder::new(metadata, "invalid-local")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let keep = b"0123456789abcdef";
+    let keep_route = client.put("invalid-local-keep", keep).expect("seed put");
+    let segment_name = keep_route.replicas[0].segment_name.clone();
+    let oversized = [b'x'; 64];
+    for (key, value) in [("empty", &b""[..]), ("oversized", &oversized[..])] {
+        assert!(client.put(key, value).is_err(), "{key} put should fail");
+        assert_eq!(
+            client
+                .get("invalid-local-keep")
+                .expect("invalid put must preserve the existing object"),
+            keep,
+            "{key} put evicted the existing object"
+        );
+    }
+    assert!(client
+        .reserve_segment_allocation(client.runtime_id(), Some(&segment_name), 64, true)
+        .is_err());
+    assert_eq!(
+        client
+            .get("invalid-local-keep")
+            .expect("preferred-segment failure must preserve the existing object"),
+        keep
+    );
+}
+
+#[test]
+fn terminal_allocation_failures_preserve_existing_object() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("terminal-allocation-segment"));
+    let client = StoreClientBuilder::new(metadata, "terminal-allocation")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let keep = b"0123456789abcdef";
+    let keep_route = client.put("terminal-keep", keep).expect("seed put");
+    let segment_name = keep_route.replicas[0].segment_name.clone();
+    {
+        let mut allocator = client.allocator.lock();
+        let segment = allocator.segments.get_mut(&segment_name).expect("segment");
+        segment.next_allocation_id = u64::MAX;
+    }
+    let generation_error = client
+        .reserve_segment_allocation(client.runtime_id(), Some(&segment_name), 16, true)
+        .expect_err("generation exhaustion should be terminal");
+    assert!(matches!(generation_error, StoreError::InvalidState(_)));
+    assert_eq!(
+        client
+            .get("terminal-keep")
+            .expect("generation exhaustion must preserve the existing object"),
+        keep
+    );
+
+    {
+        let mut allocator = client.allocator.lock();
+        let segment = allocator.segments.get_mut(&segment_name).expect("segment");
+        segment.next_allocation_id = 1;
+        segment.announcement.used_bytes = u64::MAX;
+        segment.cursor_bytes = 0;
+        segment.free_spans.clear();
+    }
+    let overflow_error = client
+        .reserve_segment_allocation(client.runtime_id(), Some(&segment_name), 16, true)
+        .expect_err("reservation overflow should be terminal");
+    assert!(matches!(overflow_error, StoreError::InvalidState(_)));
+    assert_eq!(
+        client
+            .get("terminal-keep")
+            .expect("reservation overflow must preserve the existing object"),
+        keep
+    );
+}
+
+#[test]
+fn invalid_remote_put_preserves_existing_object() {
+    let _guard = metrics_test_lock().lock();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let storage_transport = Arc::new(TestTransport::new("invalid-remote-storage-segment"));
+    let router_transport = Arc::new(storage_transport.peer("invalid-remote-router-segment"));
+    let storage = StoreClientBuilder::new(metadata.clone(), "invalid-remote-storage")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(storage_transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+    let router = StoreClientBuilder::new(metadata.clone(), "invalid-remote-router")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(router_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+            1,
+        )
+        .build(test_future_expiry_ms())
+        .expect("router build should succeed");
+    router
+        .register_local_memory()
+        .expect("router memory should register");
+    wait_for_membership_convergence(&[&storage, &router]);
+
+    let keep = b"0123456789abcdef";
+    router.put("invalid-remote-keep", keep).expect("seed put");
+    let oversized = [b'x'; 64];
+    for (key, value) in [("empty", &b""[..]), ("oversized", &oversized[..])] {
+        assert!(router.put(key, value).is_err(), "{key} put should fail");
+        assert_eq!(
+            router
+                .get("invalid-remote-keep")
+                .expect("invalid put must preserve the existing object"),
+            keep,
+            "{key} put evicted the existing object"
+        );
+    }
+    assert!(router
+        .batch_put(&[
+            PutRequest::new("batch-empty", b""),
+            PutRequest::new("batch-oversized", &oversized),
+        ])
+        .is_err());
+    assert_eq!(
+        router
+            .get("invalid-remote-keep")
+            .expect("batch failure must preserve the existing object"),
+        keep
+    );
+}
+
+#[test]
 fn query_route_marks_local_replica_hot_for_eviction() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("query-hot-local-segment"));
@@ -14973,6 +15143,65 @@ fn put_returns_error_when_route_publish_succeeds_but_quota_finalize_fails() {
     assert_eq!(quota.used_objects, 0);
     assert_eq!(quota.pending_reserved_bytes, 4);
     assert_eq!(quota.pending_reserved_objects, 1);
+}
+
+#[test]
+fn remove_reclaims_legacy_allocation_when_quota_finalize_fails() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    inner
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                spec: TenantPolicySpec {
+                    quota: Some(TenantQuotaPolicy {
+                        max_bytes: Some(16),
+                        max_objects: Some(2),
+                    }),
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: Some(2),
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 10,
+                updated_by: "admin".to_string(),
+            },
+            None,
+        )
+        .expect("tenant quota policy should store");
+    let metadata = Arc::new(FinalizeFailureMetadataBackend::new(
+        inner.clone(),
+        "quota-client:1:tenant-a:2",
+    ));
+    let transport = Arc::new(TestTransport::new("delete-finalize-reclaim-segment"));
+    let mut compatibility = CompatibilityDescriptor::default();
+    compatibility
+        .capabilities
+        .remove(mooncake_store_core::ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY);
+    let client = StoreClientBuilder::new(metadata, "quota-client")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .compatibility(compatibility)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("quota client should build");
+
+    let first = client.put("key", b"1234").expect("put should succeed");
+    let first_offset = first.replicas[0].segment_offset;
+    let error = client
+        .remove("key", true)
+        .expect_err("delete should fail when quota finalization fails");
+    assert!(error.to_string().contains("injected finalize failure"));
+    assert!(!client.is_exist("key").expect("is_exist should succeed"));
+    client
+        .remove("key", true)
+        .expect("forced retry should be idempotent after route deletion");
+
+    let second = client
+        .put("other", b"1234")
+        .expect("legacy allocation should have been reclaimed");
+    assert_eq!(second.replicas[0].segment_offset, first_offset);
 }
 
 #[test]
@@ -19171,6 +19400,14 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
     allocator.upsert(&primary);
     allocator.upsert(&secondary);
     allocator.upsert(&draining);
+    assert!(allocator.can_fit_after_eviction(None, 128));
+    assert!(!allocator.can_fit_after_eviction(None, 129));
+    assert!(allocator.can_fit_after_eviction(Some(&primary.segment_name), 128));
+    assert!(!allocator.can_fit_after_eviction(Some(&primary.segment_name), 129));
+    assert!(!allocator.can_fit_after_eviction(Some(&primary.segment_name), 0));
+    assert!(allocator.can_fit_after_eviction(Some(&secondary.segment_name), 63));
+    assert!(!allocator.can_fit_after_eviction(Some(&secondary.segment_name), 65));
+    assert!(!allocator.can_fit_after_eviction(Some(&draining.segment_name), 1));
     assert_eq!(allocator.announcements().len(), 3);
     assert!(allocator.announcement(&primary.segment_name).is_some());
     assert!(matches!(
@@ -20303,6 +20540,7 @@ mod namespace_adversarial;
 mod namespace_isolation_tests;
 mod perf_invariant_tests;
 mod quota_prop;
+mod review_gc_starvation;
 mod route_migration_tests;
 mod routing_prop;
 mod routing_tests;

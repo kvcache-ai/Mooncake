@@ -39,8 +39,10 @@ std::atomic<uint32_t> g_agent_alloc_next{0};
 // without the TE either sets runtime flags or relies on the env default.
 constexpr int kRuntimeAgentMode = 1 << 0;
 constexpr int kRuntimeFabricMem = 1 << 1;
+constexpr int kRuntimeSingleSegment = 1 << 2;
 std::atomic<AscendConfigBoolFn> g_agent_mode_provider{nullptr};
 std::atomic<AscendConfigBoolFn> g_use_fabric_mem_provider{nullptr};
+std::atomic<AscendConfigBoolFn> g_single_segment_provider{nullptr};
 std::atomic<int> g_runtime_flags{-1};
 
 bool AgentModeEnabled() {
@@ -56,6 +58,16 @@ bool AgentModeEnabled() {
     return false;
 }
 
+std::optional<bool> ParseBoolValue(const char* value);
+
+const char* GetEnvWithFallback(const char* primary, const char* fallback) {
+    const char* value = std::getenv(primary);
+    if (value != nullptr && value[0] != '\0') {
+        return value;
+    }
+    return fallback != nullptr ? std::getenv(fallback) : nullptr;
+}
+
 bool FabricMemEnabled() {
     AscendConfigBoolFn provider =
         g_use_fabric_mem_provider.load(std::memory_order_acquire);
@@ -66,9 +78,27 @@ bool FabricMemEnabled() {
     if (flags >= 0) {
         return (flags & kRuntimeFabricMem) != 0;
     }
-    // Classic store semantics: the variable being set enables fabric memory,
-    // whatever its value is.
-    return std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM") != nullptr;
+    const char* value = GetEnvWithFallback("MC_ASCEND_ENABLE_USE_FABRIC_MEM",
+                                           "ASCEND_ENABLE_USE_FABRIC_MEM");
+    if (value == nullptr) {
+        return false;
+    }
+    const auto parsed = ParseBoolValue(value);
+    // Classic store semantics: any non-falsy value enables fabric memory.
+    return parsed.value_or(true);
+}
+
+bool SingleSegmentEnabled() {
+    AscendConfigBoolFn provider =
+        g_single_segment_provider.load(std::memory_order_acquire);
+    if (provider != nullptr) {
+        return provider();
+    }
+    const int flags = g_runtime_flags.load(std::memory_order_acquire);
+    if (flags >= 0) {
+        return (flags & kRuntimeSingleSegment) != 0;
+    }
+    return false;
 }
 
 // Small self-contained bool parser (the classic bool_parser.h dependency is a
@@ -198,17 +228,20 @@ void add_store_memory_range(void* ptr, size_t size) {
     g_store_mem_ranges.push_back({ptr, size});
 }
 
-// ASCEND_USE_SHMEM. Opt-in: allocate a memfd a peer on this machine can map.
-// Parsed here so the store and GlobalConfig do not have to carry the switch.
+// MC_ASCEND_USE_SHMEM / ASCEND_USE_SHMEM. Opt-in: allocate a memfd a peer on
+// this machine can map. Parsed here so the store and GlobalConfig do not have
+// to carry the switch.
 bool SharedHostMemRequested() {
-    const char* value = std::getenv("ASCEND_USE_SHMEM");
+    const char* value =
+        GetEnvWithFallback("MC_ASCEND_USE_SHMEM", "ASCEND_USE_SHMEM");
     if (value == nullptr) {
         return false;
     }
     const auto parsed = ParseBoolValue(value);
     if (!parsed.has_value()) {
         LOG(WARNING) << "Invalid value '" << value
-                     << "' for ASCEND_USE_SHMEM, treating it as disabled";
+                     << "' for MC_ASCEND_USE_SHMEM/ASCEND_USE_SHMEM, treating "
+                        "it as disabled";
         return false;
     }
     return *parsed;
@@ -248,7 +281,8 @@ bool HostMmapRequested() {
     if (CustomTopologyConfigured()) {
         return true;
     }
-    const char* config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+    const char* config = GetEnvWithFallback("MC_ASCEND_GLOBAL_RESOURCE_CONFIG",
+                                            "ASCEND_GLOBAL_RESOURCE_CONFIG");
     return HasRoceHostProtocolDesc(config);
 }
 
@@ -533,7 +567,8 @@ void* AllocateStoreMemoryImpl(size_t total_size, const std::string& protocol) {
     }
     if (protocol == "ubshmem") {
         LOG(ERROR) << "ubshmem protocol only support fabric mem, please "
-                      "configure ASCEND_ENABLE_USE_FABRIC_MEM environment.";
+                      "configure MC_ASCEND_ENABLE_USE_FABRIC_MEM/"
+                      "ASCEND_ENABLE_USE_FABRIC_MEM environment.";
         return nullptr;
     }
 
@@ -813,7 +848,12 @@ void ascend_allocator_set_config_provider(AscendConfigBoolFn agent_mode,
     g_use_fabric_mem_provider.store(use_fabric_mem, std::memory_order_release);
 }
 
-void ascend_allocator_set_runtime_flags(bool agent_mode, bool use_fabric_mem) {
+void ascend_allocator_set_single_segment_provider(AscendConfigBoolFn fn) {
+    g_single_segment_provider.store(fn, std::memory_order_release);
+}
+
+void ascend_allocator_set_runtime_flags(bool agent_mode, bool use_fabric_mem,
+                                        bool single_segment) {
     int flags = 0;
     if (agent_mode) {
         flags |= kRuntimeAgentMode;
@@ -821,7 +861,23 @@ void ascend_allocator_set_runtime_flags(bool agent_mode, bool use_fabric_mem) {
     if (use_fabric_mem) {
         flags |= kRuntimeFabricMem;
     }
+    if (single_segment) {
+        flags |= kRuntimeSingleSegment;
+    }
     g_runtime_flags.store(flags, std::memory_order_release);
+}
+
+size_t ascend_agent_mode_store_chunk_cap(size_t total_size) {
+    if (SingleSegmentEnabled()) {
+        LOG(INFO) << "Standalone single-segment mode: " << total_size
+                  << " bytes shared by all local NPU engines";
+        return 0;
+    }
+    const uint32_t n = ContextManager::getInstance().getDeviceCount();
+    if (n <= 1 || total_size == 0) {
+        return 0;
+    }
+    return total_size / n;
 }
 
 }  // namespace mooncake

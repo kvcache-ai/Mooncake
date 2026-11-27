@@ -2651,6 +2651,22 @@ def test_dataproto_matrix_row_only_uses_one_ranged_call() -> None:
     assert store.get_into_ranges_calls == before_calls + 1
 
 
+def test_batched_ranges_handle_empty_chunks_and_preserve_fragment_cap() -> None:
+    store, transfer = make_transfer(buffer_pool=FakeBufferPool())
+    parts = [b"", b"ab", b"", b"cde", b""]
+    chunks = []
+    for index, data in enumerate(parts):
+        key = f"part-{index}"
+        store.objects[key] = data
+        chunks.append({"key": key, "bytes": len(data)})
+    requests = [({"chunks": chunks}, [(2, 0, 3), (1, 3, 2), (2, 5, 1)])]
+
+    assert transfer._transport.read_payload_ranges_batch(requests, 3) is None
+    assert store.get_into_ranges_calls == 0
+    assert transfer._transport.read_payload_ranges_batch(requests, 4) == [b"cdebcc"]
+    assert store.get_into_ranges_calls == 1
+
+
 def test_dataproto_matrix_range_cap_falls_back(monkeypatch) -> None:
     store, transfer = make_transfer(buffer_pool=FakeBufferPool())
     matrix = np.arange(48, dtype=np.int16).reshape(6, 8)

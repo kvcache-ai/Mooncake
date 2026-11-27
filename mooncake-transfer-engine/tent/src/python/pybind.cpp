@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -136,6 +138,22 @@ static inline std::vector<void*> U64VectorToPtrVector(
     for (auto a : addr_list) ptrs.push_back(U64ToPtr(a));
     return ptrs;
 }
+
+static inline bool IsUint64Vector(const py::array& array) {
+    if (array.ndim() != 1 || !array.dtype().is(py::dtype::of<uint64_t>())) {
+        return false;
+    }
+    // numpy reports a zero stride for empty arrays, so the stride check only
+    // applies when there is an element to address.
+    return array.size() == 0 ||
+           array.strides(0) == static_cast<py::ssize_t>(sizeof(uint64_t));
+}
+
+// Bound for the wait after a failed batch. A task sitting behind the QP retry
+// timer (send_timeout 14 ~= 67 ms, send_retry_count 7) needs up to ~540 ms to
+// finish. At the deadline the engine cancels what is still running and reports
+// the statuses it sees, so the caller learns whether the buffers are idle.
+constexpr uint64_t kSettleTimeoutMs = 600;
 
 // =============================================================================
 // RAII Wrappers
@@ -760,6 +778,139 @@ PYBIND11_MODULE(tent, m) {
                 return status_list;
             },
             py::arg("batch_id"), py::arg("timeout_ms") = 0)
+
+        // ---------------------------------------------------------------------
+        // array submit and blocking wait
+        // ---------------------------------------------------------------------
+        .def(
+            "transfer_sync_arrays",
+            [](TransferEngine& self, py::array src, py::array dst,
+               py::array lengths, uint64_t target_id,
+               Request::OpCode opcode) -> py::array_t<uint8_t> {
+                const auto count = static_cast<size_t>(src.size());
+                const bool well_formed =
+                    IsUint64Vector(src) && IsUint64Vector(dst) &&
+                    IsUint64Vector(lengths) && src.size() == dst.size() &&
+                    src.size() == lengths.size();
+                if (!well_formed && count == 0) {
+                    ThrowStatus(
+                        Status::InvalidArgument(
+                            "src, dst and lengths must be one-dimensional "
+                            "uint64 arrays of equal length" LOC_MARK),
+                        "transfer_sync_arrays");
+                }
+                py::array_t<uint8_t> result(static_cast<py::ssize_t>(count));
+                if (count == 0) {
+                    return result;
+                }
+                auto* states = result.mutable_data();
+                std::fill(states, states + count,
+                          static_cast<uint8_t>(TransferStatusEnum::INVALID));
+                if (!well_formed) {
+                    return result;
+                }
+                const auto* src_ptr = static_cast<const uint64_t*>(src.data());
+                const auto* dst_ptr = static_cast<const uint64_t*>(dst.data());
+                const auto* len_ptr =
+                    static_cast<const uint64_t*>(lengths.data());
+                std::string wait_error;
+                Status transfer_error;
+                {
+                    py::gil_scoped_release release;
+                    std::vector<Request> request_list(count);
+                    for (size_t i = 0; i < count; ++i) {
+                        auto& request = request_list[i];
+                        request.opcode = opcode;
+                        request.source = U64ToPtr(src_ptr[i]);
+                        request.target_id = static_cast<SegmentID>(target_id);
+                        request.target_offset = dst_ptr[i];
+                        request.length = static_cast<size_t>(len_ptr[i]);
+                    }
+                    const auto batch_id = self.allocateBatch(count);
+                    if (!batch_id) {
+                        transfer_error = Status::TooManyRequests(
+                            "No free batch slot for a transfer_sync_arrays "
+                            "call" LOC_MARK);
+                    } else {
+                        BatchGuard guard(&self,
+                                         static_cast<uint64_t>(batch_id));
+                        // A failed submit or wait leaves ownership with the
+                        // transport; ask it to stop before the guard frees the
+                        // batch, or the caller may reuse live buffers.
+                        const auto settled = [&] {
+                            std::vector<TransferStatus> settle_status;
+                            auto status = self.waitTransfer(
+                                batch_id, &settle_status, kSettleTimeoutMs);
+                            if (!status.ok()) return false;
+                            return settle_status.size() == count &&
+                                   std::none_of(
+                                       settle_status.begin(),
+                                       settle_status.end(),
+                                       [](const TransferStatus& item) {
+                                           return item.s ==
+                                                  TransferStatusEnum::PENDING;
+                                       });
+                        };
+                        auto submit_status =
+                            self.submitTransfer(batch_id, request_list);
+                        if (!submit_status.ok()) {
+                            if (!settled()) {
+                                wait_error =
+                                    "submitTransfer failed: " +
+                                    submit_status.ToString() +
+                                    "; the batch may still access src and dst, "
+                                    "so do not reuse them";
+                            }
+                        } else {
+                            std::vector<TransferStatus> status_list;
+                            auto wait_status =
+                                self.waitTransfer(batch_id, &status_list, 0);
+                            if (!wait_status.ok()) {
+                                wait_error = "waitTransfer failed: " +
+                                             wait_status.ToString();
+                                if (!settled()) {
+                                    wait_error +=
+                                        "; the batch may still access src and "
+                                        "dst, so do not reuse them";
+                                }
+                            } else if (status_list.size() != count) {
+                                wait_error =
+                                    "waitTransfer returned " +
+                                    std::to_string(status_list.size()) +
+                                    " statuses for " + std::to_string(count) +
+                                    " descriptors" LOC_MARK;
+                            } else {
+                                for (size_t i = 0; i < count; ++i) {
+                                    states[i] =
+                                        static_cast<uint8_t>(status_list[i].s);
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!wait_error.empty()) {
+                    ThrowStatus(Status::InternalError(wait_error),
+                                "transfer_sync_arrays");
+                }
+                if (!transfer_error.ok()) {
+                    ThrowStatus(transfer_error, "transfer_sync_arrays");
+                }
+                return result;
+            },
+            "Submit src to dst descriptors in one batch and wait until every "
+            "descriptor reaches a terminal state. src, dst and lengths are "
+            "one-dimensional uint64 arrays of equal length and must not be "
+            "modified until the call returns. Malformed non-empty input is "
+            "reported as INVALID for every entry; an empty input that is not "
+            "three empty uint64 vectors raises InvalidArgumentError; running "
+            "out of batch slots raises TooManyRequests. A failed submit or "
+            "wait waits one RDMA retry budget (600 ms) for every descriptor to "
+            "stop, cancelling whatever still runs at the deadline; if "
+            "descriptors are still pending then, the call raises "
+            "InternalError, which says src and dst must not be reused. This "
+            "call has no timeout.",
+            py::arg("src"), py::arg("dst"), py::arg("lengths"),
+            py::arg("target_id"), py::arg("opcode"))
 
         // ---------------------------------------------------------------------
         // notification send/receive

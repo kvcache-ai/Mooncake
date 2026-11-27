@@ -35,32 +35,14 @@ ErrorCode LegacyWriteError(const KvWriteResult& result, const char* operation) {
     return result.ToLegacyError();
 }
 
-}  // namespace
-
-ErrorCode EtcdHaKvBackend::Get(std::string_view key, std::string& value) {
-    EtcdRevisionId revision_id = 0;
-    return EtcdHelper::Get(key.data(), key.size(), value, revision_id);
-}
-
-ErrorCode EtcdHaKvBackend::Put(std::string_view key, std::string_view value) {
-    return LegacyWriteError(PutWithResult(key, value), "PUT");
-}
-
-KvWriteResult EtcdHaKvBackend::PutWithResult(std::string_view key,
-                                             std::string_view value) {
-    return KvWriteResult::FromError(
-        EtcdHelper::Put(key.data(), key.size(), value.data(), value.size()));
-}
-
-ErrorCode EtcdHaKvBackend::Range(std::string_view begin_key,
-                                 std::string_view end_key, size_t limit,
-                                 std::vector<KvPair>& kvs) {
+ErrorCode ReadRange(std::string_view begin_key, std::string_view end_key,
+                    size_t limit, std::vector<KvPair>& kvs, bool serializable) {
     kvs.clear();
     std::string json;
     EtcdRevisionId revision_id = 0;
     ErrorCode err = EtcdHelper::GetRangeAsJson(
         begin_key.data(), begin_key.size(), end_key.data(), end_key.size(),
-        limit, json, revision_id);
+        limit, json, revision_id, serializable);
     if (err != ErrorCode::OK) {
         return err;
     }
@@ -85,6 +67,36 @@ ErrorCode EtcdHaKvBackend::Range(std::string_view begin_key,
             {.key = item["key"].asString(), .value = item["value"].asString()});
     }
     return ErrorCode::OK;
+}
+
+}  // namespace
+
+ErrorCode EtcdHaKvBackend::Get(std::string_view key, std::string& value) {
+    EtcdRevisionId revision_id = 0;
+    return EtcdHelper::Get(key.data(), key.size(), value, revision_id);
+}
+
+ErrorCode EtcdHaKvBackend::Put(std::string_view key, std::string_view value) {
+    return LegacyWriteError(PutWithResult(key, value), "PUT");
+}
+
+KvWriteResult EtcdHaKvBackend::PutWithResult(std::string_view key,
+                                             std::string_view value) {
+    return KvWriteResult::FromError(
+        EtcdHelper::Put(key.data(), key.size(), value.data(), value.size()));
+}
+
+ErrorCode EtcdHaKvBackend::Range(std::string_view begin_key,
+                                 std::string_view end_key, size_t limit,
+                                 std::vector<KvPair>& kvs) {
+    return ReadRange(begin_key, end_key, limit, kvs, false);
+}
+
+ErrorCode EtcdHaKvBackend::RangeSerializable(std::string_view begin_key,
+                                             std::string_view end_key,
+                                             size_t limit,
+                                             std::vector<KvPair>& kvs) {
+    return ReadRange(begin_key, end_key, limit, kvs, true);
 }
 
 bool EtcdHaKvBackend::SupportsTxn() const { return true; }

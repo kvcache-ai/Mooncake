@@ -2,7 +2,8 @@
 requires = [
     "scikit-build-core>=1.0",
     "pybind11>=2.13",
-    "numpy>=1.24",
+    "numpy>=2.0",
+    "nanobind>=2.13",
     # Retained for the legacy wheel helper and packaging test environment.
     "setuptools>=61",
     # Retained for the legacy wheel helper; PG Torch compilation is runtime JIT.
@@ -116,6 +117,7 @@ sdist.exclude = ["extern/yalantinglibs/.git"]
 BUILD_BENCHMARK = false
 BUILD_UNIT_TESTS = false
 USE_CUDA = false
+WITH_CONDUCTOR = true
 WITH_EP = false
 WITH_P2P_STORE = false
 WITH_STORE_GO = false

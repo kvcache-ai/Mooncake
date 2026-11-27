@@ -14,6 +14,7 @@
 
 #include "ha/ha_types.h"
 #include "ha/oplog/oplog_applier.h"
+#include "ha/oplog/oplog_batch_config.h"
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_types.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
@@ -51,7 +52,10 @@ struct HotStandbyConfig {
     bool enable_oplog_following{true};
 
     int oplog_poll_interval_ms{1000};
+    uint32_t oplog_standby_max_batches_per_poll{
+        kDefaultOpLogStandbyMaxBatchesPerPoll};
     uint32_t batch_oplog_retry_timeout_sec{180};
+    uint32_t ha_redis_expected_replicas_per_shard{0};
 };
 
 /**
@@ -96,11 +100,14 @@ class HotStandbyService {
      * OpLog backend-based sync)
      * @param oplog_endpoints Comma-separated OpLog backend endpoints
      * @param cluster_id Cluster identifier for OpLog path
-     * @return ErrorCode::OK on success
+     * @param cancelled Optional shutdown predicate checked during bootstrap
+     * @return ErrorCode::OK on success, ETCD_CTX_CANCELLED if startup is
+     * stopped
      */
     ErrorCode Start(const std::string& primary_address,
                     const std::string& oplog_endpoints,
-                    const std::string& cluster_id);
+                    const std::string& cluster_id,
+                    std::function<bool()> cancelled = {});
 
     /**
      * @brief Stop replication and disconnect from Primary
@@ -243,9 +250,13 @@ class HotStandbyService {
         kBoundedNoProgress,
     };
 
-    ErrorCode PrepareBootstrapBaselineLocked(uint64_t& baseline_seq_id);
+    ErrorCode PrepareBootstrapBaselineLocked(
+        uint64_t& baseline_seq_id, const std::function<bool()>& cancelled);
     ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id);
-    ErrorCode LoadBatchOpLogSnapshotBaselineLocked(uint64_t& baseline_seq_id);
+    ErrorCode LoadBatchOpLogSnapshotBaselineLocked(
+        uint64_t& baseline_seq_id, const std::function<bool()>& cancelled);
+    bool WaitForRestoreCancellation(std::chrono::milliseconds delay,
+                                    const std::function<bool()>& cancelled);
     ErrorCode StartOplogFollowingLocked(uint64_t baseline_seq_id);
     void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
@@ -326,6 +337,12 @@ class HotStandbyService {
     std::optional<BatchOpLogSnapshotCapture> ready_snapshot_capture_;
 
     // Synchronization
+    // Stop publishes cancellation without waiting for mutex_, which Start holds
+    // throughout bootstrap. A generation avoids resetting a concurrent Stop.
+    std::atomic<uint64_t> stop_generation_{0};
+    std::atomic<uint32_t> stops_in_progress_{0};
+    std::mutex restore_cancel_mutex_;
+    std::condition_variable restore_cancel_cv_;
     mutable std::mutex mutex_;
     mutable std::mutex sync_status_callback_mutex_;
     mutable std::mutex snapshot_lifecycle_callback_mutex_;
