@@ -576,6 +576,13 @@ TEST_F(UbLargeSegUnitTest, RegisterAndUnregisterBatchHandlesOversizedBuffers) {
     EXPECT_EQ(UbTransportTestPeer::chunkMapSize(*transport_), 0u);
     EXPECT_EQ(localBufferCount(), 0u);
     EXPECT_EQ(liveSegmentCount(), 0u);
+
+    // A batch of addresses that are all unknown reports NOT_REGISTERED; a
+    // batch that cleans at least one member succeeds.
+    EXPECT_EQ(transport_->unregisterLocalMemoryBatch({buf0, buf1}),
+              ERR_ADDRESS_NOT_REGISTERED);
+    ASSERT_EQ(registerBuffer(buf0, kMaxSegSize), 0);
+    EXPECT_EQ(transport_->unregisterLocalMemoryBatch({buf0, buf1}), 0);
 }
 
 TEST_F(UbLargeSegUnitTest, UnregisterRetriesAfterPartialSegmentFailure) {

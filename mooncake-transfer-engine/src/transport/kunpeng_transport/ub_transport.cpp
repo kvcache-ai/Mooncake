@@ -375,12 +375,18 @@ int UbTransport::unregisterLocalMemoryBatch(
     }
 
     int first_error = 0;
+    bool any_cleaned = false;
+    bool any_not_registered = false;
     for (size_t i = 0; i < addr_list.size(); ++i) {
         int ret = results[i].get();
         // A batch retry after a partial failure finds the members that were
         // already finished gone; treat that as done (mirrors
         // RdmaTransport::unregisterLocalMemoryBatch).
-        if (ret == ERR_ADDRESS_NOT_REGISTERED) continue;
+        if (ret == ERR_ADDRESS_NOT_REGISTERED) {
+            any_not_registered = true;
+            continue;
+        }
+        if (!ret) any_cleaned = true;
         if (ret) {
             LOG(WARNING) << "UbTransport: Failed to unregister memory: addr "
                          << addr_list[i];
@@ -400,7 +406,13 @@ int UbTransport::unregisterLocalMemoryBatch(
             }
         }
     }
-    return first_error ? first_error : metadata_ret;
+    if (first_error) return first_error;
+    if (metadata_ret) return metadata_ret;
+    // Keep the never-registered contract for the engine's multi-transport
+    // aggregation: report NOT_REGISTERED only when every member was unknown
+    // and nothing was cleaned.
+    if (any_not_registered && !any_cleaned) return ERR_ADDRESS_NOT_REGISTERED;
+    return 0;
 }
 
 Status UbTransport::submitTransfer(
