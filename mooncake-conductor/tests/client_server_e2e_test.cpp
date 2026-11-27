@@ -304,7 +304,7 @@ common::ServiceConfig E2EService(const std::string& instance_id,
 std::string RegisterMsgpackBody(const common::ServiceConfig& svc) {
     msgpack::sbuffer buffer;
     msgpack::packer<msgpack::sbuffer> packer(&buffer);
-    packer.pack_map(8);
+    packer.pack_map(svc.shared_backend_ids ? 9 : 8);
     packer.pack("endpoint");
     packer.pack(svc.endpoint);
     packer.pack("type");
@@ -329,6 +329,10 @@ std::string RegisterMsgpackBody(const common::ServiceConfig& svc) {
     packer.pack(svc.hash_profile.python_hash_seed);
     packer.pack("index_projection");
     packer.pack(svc.hash_profile.index_projection);
+    if (svc.shared_backend_ids) {
+        packer.pack("shared_backend_ids");
+        packer.pack(*svc.shared_backend_ids);
+    }
     return std::string(buffer.data(), buffer.size());
 }
 
@@ -376,6 +380,11 @@ Json::Value ServiceConfigToJson(const common::ServiceConfig& svc) {
         value["CacheGroup"] = Json::Value(Json::nullValue);
     }
     value["HashProfile"] = HashProfileToJson(svc.hash_profile);
+    if (svc.shared_backend_ids) {
+        Json::Value backends(Json::arrayValue);
+        for (const auto& id : *svc.shared_backend_ids) backends.append(id);
+        value["SharedBackendIDs"] = std::move(backends);
+    }
     return value;
 }
 
@@ -905,6 +914,8 @@ class RouterEventPublisher {
         ASSERT_TRUE(zmq::detail::SendMultipart(socket_, frames));
     }
 
+    void SkipSequence() { ++sequence_; }
+
     // Preserve upstream event fields while setting the registered DP rank.
     void PublishFixture(const std::string& hex, int64_t rank) {
         std::string payload;
@@ -1021,6 +1032,177 @@ void PublishMooncakeCpu(RouterEventPublisher& publisher, uint64_t hash,
     }
     packer.pack(0);
     publisher.Publish(std::string(buffer.data(), buffer.size()));
+}
+
+void PublishSglangPool(RouterEventPublisher& pool, const QueryRequest& request,
+                       const Json::Value& data, const std::string& backend_id,
+                       int cpu_blocks = 3, int disk_blocks = 4,
+                       bool clear = false) {
+    constexpr int64_t timestamp = 1700000000123;
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> packer(&buffer);
+    const auto field = [&](const char* key, const auto& value) {
+        packer.pack(key);
+        packer.pack(value);
+    };
+    packer.pack_array(3);
+    packer.pack(timestamp);
+    packer.pack_array(clear ? 1 : cpu_blocks + disk_blocks);
+    uint64_t id = 0;
+    for (const auto& [medium, count] :
+         std::array<std::pair<const char*, int>, 2>{
+             {{"CPU", cpu_blocks}, {"DISK", disk_blocks}}}) {
+        for (int i = 0; i < (clear ? 1 : count); ++i) {
+            packer.pack_map(clear ? 11 : 17);
+            field("event_type", clear ? "cleared" : "stored");
+            field("event_id", ++id);
+            field("timestamp", timestamp);
+            field("model_name", request.context.model_name);
+            field("block_size", request.context.block_size);
+            field("additional_salt", msgpack::type::nil_t{});
+            field("lora_name", msgpack::type::nil_t{});
+            field("tenant_id", request.context.tenant_id);
+            field("backend_id", backend_id);
+            if (clear) {
+                field("medium", msgpack::type::nil_t{});
+            } else {
+                field("medium", medium);
+            }
+            field("dp_rank", 0);
+            if (clear) break;
+            field("group_id", msgpack::type::nil_t{});
+            field("seq_hashes", std::vector<uint64_t>{});
+            field("base_block_idx", msgpack::type::nil_t{});
+            field(
+                "object_key",
+                "router_" + data["upstream_hex_digests"][i].asString() + "_k");
+            field("parent_hash", msgpack::type::nil_t{});
+            field("token_ids", msgpack::type::nil_t{});
+        }
+        if (clear) break;
+    }
+    packer.pack(0);
+    pool.Publish(std::string(buffer.data(), buffer.size()));
+}
+
+TEST(ClientServerE2ETest, IndependentSharedStoresWithSevenSglangEngines) {
+    std::array<RouterEventPublisher, 7> publishers;
+    RouterEventPublisher pool_a;
+    RouterEventPublisher pool_b;
+    EventManager manager({}, 0, kRpcPort);
+    ASSERT_TRUE(manager.StartHTTPServer());
+    ASSERT_TRUE(manager.StartRPCServer());
+    manager.Start();
+    const uint16_t http_port = EventManagerTestPeer::HttpPort(manager);
+    ConductorClient client;
+    ASSERT_NO_FATAL_FAILURE(
+        SetupWithRetry(client, "127.0.0.1:" + std::to_string(kRpcPort)));
+    coro_http::coro_http_client http;
+    const auto data =
+        test::LoadJsonFixture("sglang_map_event_vectors.json")["integration"];
+    QueryRequest request;
+    request.context = {
+        .tenant_id = "default", .model_name = "router-model", .block_size = 4};
+    for (const auto& token : data["token_ids"]) {
+        request.token_ids.push_back(token.asInt());
+    }
+    const auto make_service = [&](const std::string& id,
+                                  RouterEventPublisher& publisher,
+                                  common::PublisherKind kind) {
+        auto svc = E2EService(id, publisher.Endpoint());
+        svc.publisher_kind = kind;
+        svc.model_name = request.context.model_name;
+        svc.block_size = request.context.block_size;
+        svc.hash_profile.strategy = "sglang";
+        svc.hash_profile.algorithm = "sha256_raw";
+        svc.hash_profile.index_projection = "first64_be";
+        return svc;
+    };
+    for (size_t i = 0; i < publishers.size(); ++i) {
+        auto svc = make_service("engine-" + std::to_string(i), publishers[i],
+                                common::PublisherKind::kSglang);
+        svc.shared_backend_ids.emplace(
+            common::SharedBackendIds{i < 3 ? "pool-a" : "pool-b"});
+        if (i % 2 == 0) {
+            ASSERT_TRUE(client.Register(svc).has_value());
+        } else {
+            ASSERT_EQ(
+                HttpPost(http, http_port, "/register", RegisterMsgpackBody(svc))
+                    .status,
+                200);
+        }
+        ASSERT_TRUE(publishers[i].WaitForSubscriber());
+    }
+    for (const auto& [id, pool] :
+         std::array<std::pair<const char*, RouterEventPublisher*>, 2>{
+             {{"pool-a", &pool_a}, {"pool-b", &pool_b}}}) {
+        ASSERT_TRUE(client
+                        .Register(make_service(
+                            id, *pool, common::PublisherKind::kMooncake))
+                        .has_value());
+        ASSERT_TRUE(pool->WaitForSubscriber());
+    }
+    const auto services = client.ListServices();
+    ASSERT_TRUE(services.has_value());
+    ASSERT_EQ(services->size(), 9u);
+    for (const auto& svc : *services) {
+        if (svc.publisher_kind == common::PublisherKind::kSglang) {
+            ASSERT_TRUE(svc.shared_backend_ids.has_value());
+            EXPECT_EQ(svc.shared_backend_ids->size(), 1u);
+        } else {
+            EXPECT_FALSE(svc.shared_backend_ids.has_value());
+        }
+    }
+    const auto http_services = HttpGet(http, http_port, "/services");
+    ASSERT_EQ(http_services.status, 200);
+    EXPECT_EQ(DecodeMsgpackBody(http_services.body), ServicesToJson(*services));
+
+    const auto wait_for = [&](int cpu_a, int disk_a, int cpu_b,
+                              int disk_b) -> ::testing::AssertionResult {
+        QueryResult expected;
+        for (size_t i = 0; i < publishers.size(); ++i) {
+            prefixindex::CacheHitResult hit;
+            hit.cpu_share = i < 3 ? cpu_a : cpu_b;
+            hit.disk = i < 3 ? disk_a : disk_b;
+            hit.longest_match_tokens = hit.disk;
+            hit.dp = {{0, 0}};
+            hit.rank_matches = {{0, {0, 0, hit.cpu_share, hit.disk}}};
+            expected.instances.emplace("engine-" + std::to_string(i), hit);
+        }
+        const auto expected_json = QueryResultToJson(expected);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        Json::Value actual;
+        do {
+            const auto rpc = client.Query(request);
+            const auto resp =
+                HttpPost(http, http_port, "/query", QueryMsgpackBody(request));
+            if (resp.status == 200) actual = DecodeMsgpackBody(resp.body);
+            if (rpc && *rpc == expected && actual == expected_json) {
+                return ::testing::AssertionSuccess();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } while (std::chrono::steady_clock::now() < deadline);
+        return ::testing::AssertionFailure()
+               << "expected " << expected_json << ", received " << actual;
+    };
+
+    ASSERT_TRUE(wait_for(0, 0, 0, 0));
+    PublishSglangPool(pool_a, request, data, "pool-a");
+    ASSERT_TRUE(wait_for(12, 16, 0, 0));
+    PublishSglangPool(pool_b, request, data, "pool-b", 1, 2);
+    ASSERT_TRUE(wait_for(12, 16, 4, 8));
+
+    // A lost sequence, with no replay, retracts only A's stream owners even
+    // for overlapping hashes. B's independently published owners survive.
+    pool_a.SkipSequence();
+    PublishSglangPool(pool_a, request, data, "pool-a");
+    ASSERT_TRUE(wait_for(0, 0, 4, 8));
+    PublishSglangPool(pool_b, request, data, "pool-b", 1, 2, true);
+    ASSERT_TRUE(wait_for(0, 0, 0, 0));
+
+    client.Close();
+    manager.Stop();
 }
 
 enum class QueryProtocol { kHttp, kRpc };
@@ -1153,51 +1335,7 @@ class RouterQueryTest : public ::testing::TestWithParam<QueryProtocol> {
     }
 
     void PublishPool(bool clear = false) {
-        constexpr int64_t timestamp = 1700000000123;
-        msgpack::sbuffer buffer;
-        msgpack::packer<msgpack::sbuffer> packer(&buffer);
-        const auto field = [&](const char* key, const auto& value) {
-            packer.pack(key);
-            packer.pack(value);
-        };
-        packer.pack_array(3);
-        packer.pack(timestamp);
-        packer.pack_array(clear ? 1 : 7);
-        uint64_t id = 0;
-        for (const auto& [medium, count] :
-             std::array<std::pair<const char*, int>, 2>{
-                 {{"CPU", 3}, {"DISK", 4}}}) {
-            for (int i = 0; i < (clear ? 1 : count); ++i) {
-                packer.pack_map(clear ? 11 : 17);
-                field("event_type", clear ? "cleared" : "stored");
-                field("event_id", ++id);
-                field("timestamp", timestamp);
-                field("model_name", request_.context.model_name);
-                field("block_size", 4);
-                field("additional_salt", msgpack::type::nil_t{});
-                field("lora_name", msgpack::type::nil_t{});
-                field("tenant_id", "default");
-                field("backend_id", "router-pool");
-                if (clear) {
-                    field("medium", msgpack::type::nil_t{});
-                } else {
-                    field("medium", medium);
-                }
-                field("dp_rank", 0);
-                if (clear) break;
-                field("group_id", msgpack::type::nil_t{});
-                field("seq_hashes", std::vector<uint64_t>{});
-                field("base_block_idx", msgpack::type::nil_t{});
-                field("object_key",
-                      "router_" + data_["upstream_hex_digests"][i].asString() +
-                          "_k");
-                field("parent_hash", msgpack::type::nil_t{});
-                field("token_ids", msgpack::type::nil_t{});
-            }
-            if (clear) break;
-        }
-        packer.pack(0);
-        pool_.Publish(std::string(buffer.data(), buffer.size()));
+        PublishSglangPool(pool_, request_, data_, "router-pool", 3, 4, clear);
     }
 
     void Seed() {

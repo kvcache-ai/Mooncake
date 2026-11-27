@@ -28,7 +28,8 @@ prefixindex::EngineRegistration RegistrationFromService(
             .dp_rank = service.dp_rank,
             .effective_block_size = service.block_size,
             .cache_group = service.cache_group,
-            .publisher_kind = service.publisher_kind};
+            .publisher_kind = service.publisher_kind,
+            .shared_backend_ids = service.shared_backend_ids};
 }
 
 std::string ValidateServiceConfig(const common::ServiceConfig& service) {
@@ -60,6 +61,9 @@ std::string ValidateServiceConfig(const common::ServiceConfig& service) {
             .error;
     }
     if (service.publisher_kind == common::PublisherKind::kMooncake) {
+        if (service.shared_backend_ids) {
+            return "shared_backend_ids may only be set for an engine";
+        }
         return prefixindex::ValidateHashProfile(ProfileFromService(service));
     }
     return "unsupported publisher kind";
@@ -147,6 +151,15 @@ tl::expected<RegisterResult, ErrorCode> ConductorService::Register(
         manager_.services_.push_back(resolved);
     }
     return RegisterResult{resolved.instance_id, is_new};
+}
+
+tl::expected<RegisterResult, ErrorCode>
+ConductorService::RegisterWithSharedBackends(
+    const common::ServiceConfig& config) {
+    if (!config.shared_backend_ids) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return Register(config);
 }
 
 tl::expected<UnregisterResult, ErrorCode> ConductorService::Unregister(

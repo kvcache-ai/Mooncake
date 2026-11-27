@@ -65,6 +65,11 @@ py::dict ServiceToDict(const mooncake::conductor::common::ServiceConfig& svc) {
     d["DPRank"] = svc.dp_rank;
     d["CacheGroup"] = svc.cache_group ? py::cast(*svc.cache_group) : py::none();
     d["HashProfile"] = HashProfileToDict(svc.hash_profile);
+    if (svc.shared_backend_ids) {
+        py::list ids;
+        for (const auto& id : *svc.shared_backend_ids) ids.append(id);
+        d["SharedBackendIDs"] = std::move(ids);
+    }
     return d;
 }
 
@@ -164,9 +169,10 @@ class PyConductorClient {
         namespace mc = mooncake::conductor;
         mc::common::ServiceConfig svc;
         static const std::set<std::string> kKnownKeys = {
-            "instance_id", "endpoint",    "replay_endpoint", "publisher_type",
-            "model_name",  "lora_name",   "tenant_id",       "block_size",
-            "dp_rank",     "cache_group", "hash_profile"};
+            "instance_id",    "endpoint",     "replay_endpoint",
+            "publisher_type", "model_name",   "lora_name",
+            "tenant_id",      "block_size",   "dp_rank",
+            "cache_group",    "hash_profile", "shared_backend_ids"};
         ValidateKeys(config, kKnownKeys, "register config");
         auto get_str = [&](const char* key, std::string* out) {
             if (!config.contains(key)) return;
@@ -186,6 +192,21 @@ class PyConductorClient {
         if (config.contains("cache_group") && !config["cache_group"].is_none())
             svc.cache_group =
                 RegisterValue<int64_t>(config["cache_group"], "cache_group");
+        if (config.contains("shared_backend_ids")) {
+            if (!py::isinstance<py::list>(config["shared_backend_ids"]))
+                throw py::value_error("shared_backend_ids must be a list");
+            svc.shared_backend_ids.emplace();
+            const auto ids =
+                py::reinterpret_borrow<py::list>(config["shared_backend_ids"]);
+            for (auto value : ids) {
+                auto id =
+                    RegisterValue<std::string>(value, "shared_backend_ids");
+                if (id.empty())
+                    throw py::value_error(
+                        "shared_backend_ids must contain non-empty strings");
+                svc.shared_backend_ids->insert(std::move(id));
+            }
+        }
         if (config.contains("publisher_type")) {
             auto kind =
                 mc::common::ParsePublisherKind(RegisterValue<std::string>(

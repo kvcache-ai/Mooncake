@@ -242,6 +242,29 @@ std::vector<common::ServiceConfig> ParseConfig(int* http_server_port,
                 LOG(ERROR) << "Invalid cache_group instance_id=" << name;
                 continue;
             }
+            if (raw.isMember("shared_backend_ids")) {
+                const auto& values = raw["shared_backend_ids"];
+                if (!values.isArray() ||
+                    svc.publisher_kind == common::PublisherKind::kMooncake) {
+                    LOG(ERROR)
+                        << "Invalid shared_backend_ids stream_key=" << name;
+                    continue;
+                }
+                svc.shared_backend_ids.emplace();
+                bool valid = true;
+                for (const auto& value : values) {
+                    if (!value.isString() || value.asString().empty()) {
+                        valid = false;
+                        break;
+                    }
+                    svc.shared_backend_ids->insert(value.asString());
+                }
+                if (!valid) {
+                    LOG(ERROR)
+                        << "Invalid shared_backend_ids stream_key=" << name;
+                    continue;
+                }
+            }
             std::string profile_error;
             if (!ParseHashProfile(raw, &svc.hash_profile, &profile_error)) {
                 LOG(ERROR) << "Invalid hash_profile stream_key=" << name

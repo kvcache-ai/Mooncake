@@ -223,6 +223,12 @@ and `type` are not accepted.
 | `tenant_id` | str | `"default"` | Empty or omitted values normalize to `"default"`. |
 | `dp_rank` | int | `0` | Nonnegative data-parallel rank. |
 | `cache_group` | int or None | `None` | Optional cache group; only `0` is currently supported. |
+| `shared_backend_ids` | list[str] | omitted | Engine-only set of reachable shared Store backend IDs. Omitted retains all shared backends in the context; an empty list allows none. Each ID must be non-empty. |
+
+For a scoped registration, use a Conductor server supporting shared backend
+eligibility and the masters' distinct event `backend_id` values. Re-register
+the rank after unregistering it to change the list. Older servers reject the
+new RPC rather than accepting an unrestricted registration.
 
 `hash_profile` accepts exactly four keys: `strategy`, `algorithm`,
 `python_hash_seed`, and `index_projection`. Values must be strings. Supported
@@ -345,6 +351,7 @@ Lists active publisher configurations.
 | `DPRank` | int | `dp_rank` |
 | `CacheGroup` | int or None | `cache_group` |
 | `HashProfile` | dict[str, str] | Resolved `hash_profile`, including server-derived `root_digest`. |
+| `SharedBackendIDs` | list[str] | `shared_backend_ids`; absent unless explicitly configured. |
 
 On failure, `ret` is negative, `count` is `0`, and `services` is `[]`.
 Service entries cannot be passed directly to `register()` because the field

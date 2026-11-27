@@ -82,6 +82,15 @@ A prefix entry records owners per storage tier:
 
 Mooncake events with a medium other than `cpu`, `cpu_pinned`, or `disk` are ignored.
 
+Shared objects retain their stream, backend and object identities for removal
+and stale-source invalidation. Each registered engine rank may declare an
+optional `shared_backend_ids` set, independent of the hash context and model
+`cache_group`. Missing means all shared backends in the context, while an empty
+set means none. Both CPU-share and shared-disk matching use the same eligibility
+rule. A vLLM CPU-local announcement is suppressed only if the shared CPU owner
+is reachable by that rank. Clearing or unregistering a Store stream still
+retracts its exact owners, not other pools or engine registrations.
+
 ## Hash profiles
 
 Conductor never trusts a block hash it cannot reproduce. Every service registers
@@ -158,7 +167,8 @@ the last applied sequence.
    `instance_id`.
 3. Conductor recomputes the prefix hash chain with the context's hash profile.
 4. For each instance and DP rank, a cursor walks the chain through cumulative
-   tier predicates. The first miss ends each predicate, so prefix continuity is
+   tier predicates, considering only eligible shared backend owners for that
+   rank. The first miss ends each predicate, so prefix continuity is
    preserved: `device <= cpu_local <= cpu_share <= disk`.
 5. Instance-level tier counts are the maximum over that instance's ranks, and
    `longest_matched` equals `disk`. Counts are in tokens, clamped to the number
@@ -169,7 +179,9 @@ the last applied sequence.
 
 Static configuration lists services under `kvevent_instance`, using the same
 field names as `POST /register`. When `instance_id` is omitted, the entry key is
-used. Invalid entries are logged and skipped.
+used. Invalid entries are logged and skipped. For independent Store pools,
+set the optional `shared_backend_ids` array on each engine rank, using the
+master's event `backend_id` (see the [Indexer API](../../api-reference/http/conductor-indexer.md)).
 
 ```json
 {

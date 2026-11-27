@@ -59,6 +59,7 @@ struct EngineRegistration {
     int64_t effective_block_size = 0;
     std::optional<int64_t> cache_group;
     common::PublisherKind publisher_kind = common::PublisherKind::kVllm;
+    std::optional<common::SharedBackendIds> shared_backend_ids;
 };
 
 struct EngineMutation {
