@@ -46,7 +46,11 @@ cp -r python/tests/ssd test_env/ssd_tests
 mkdir -p test_env/store_tests
 cp python/tests/store/test_structured_ranges_properties.py test_env/store_tests/
 cd test_env
-pip install torch numpy
+# Allow GPU-less consumer legs (e.g. ubuntu-24.04, which skips PG CUDA JIT) to
+# pass --index-url https://download.pytorch.org/whl/cpu without affecting numpy.
+# shellcheck disable=SC2086
+pip install torch ${TORCH_PIP_EXTRA_ARGS:-}
+pip install numpy
 python -c "import mooncake._fast_copy"
 python -c "import mooncake.structured_object_store"
 python tests/test_fast_copy.py

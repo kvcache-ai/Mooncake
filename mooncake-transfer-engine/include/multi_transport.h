@@ -126,6 +126,10 @@ class MultiTransport {
 
     void *getBaseAddr();
 
+    // Conservative peer routes, without constructing/routing a descriptor
+    // batch.
+    bool supportsParallelBatchSubmit(Transport::SegmentID peer);
+
    private:
     Status freeBatchID(BatchID batch_id,
                        const std::function<void()> &before_delete);

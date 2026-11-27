@@ -303,6 +303,11 @@ class TransferEngineImpl {
 
     Status freeLocalMemory(void* addr);
 
+    Status mapRemoteMemory(SegmentID peer, void* gva, size_t size,
+                           TransportType type);
+
+    Status unmapRemoteMemory(SegmentID peer, void* gva, TransportType type);
+
     Status registerLocalMemory(void* addr, size_t size,
                                Permission permission = kGlobalReadWrite);
 
@@ -431,6 +436,8 @@ class TransferEngineImpl {
     // an idempotent "maybe ready" signal.
     void notifyBatchMaybeReady(BatchID batch_id,
                                bool poll_until_terminal = false);
+
+    bool supportsParallelBatchSubmit(SegmentID peer) const;
 
    private:
     friend class ProgressWorker;

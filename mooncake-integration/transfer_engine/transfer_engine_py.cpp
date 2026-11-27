@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transfer_engine_py.h"
+#include "batch_submit.h"
 
 #include <algorithm>
 #include <cassert>
@@ -539,7 +540,8 @@ char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
     if (!buffer) return nullptr;
     int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
     if (ret) {
-        freeMemory(buffer);
+        // A failed rollback leaves the engine tracking the buffer.
+        if (!engine_->checkOverlap(buffer, capacity)) freeMemory(buffer);
         return nullptr;
     }
     return (char*)buffer;
@@ -977,6 +979,25 @@ batch_id_t TransferEnginePy::batchTransferAsyncReadArrays(
                               TransferOpcode::READ, transport_hint, nic_hint);
 }
 
+void TransferEnginePy::evictStaleSegment(
+    const std::string& target_hostname,
+    Transport::SegmentHandle failed_handle) {
+    if (engine_->CheckSegmentStatus(failed_handle).ok()) return;
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto it = handle_map_.find(target_hostname);
+    if (it == handle_map_.end() || it->second != failed_handle) return;
+    LOG(WARNING) << "Evicting stale segment for target " << target_hostname;
+    engine_->closeSegment(failed_handle);
+    // Under MC_USE_TENT there is no classic metadata object
+    // (getMetadata() returns nullptr); TENT invalidates its own
+    // segment cache inside closeSegment(). Guard the classic-only
+    // cleanup so evicting a dead peer's handle cannot dereference
+    // a null metadata pointer. Refs #3995 (P0-stale-handle).
+    if (auto metadata = engine_->getMetadata())
+        metadata->removeSegmentDesc(target_hostname);
+    handle_map_.erase(it);
+}
+
 int TransferEnginePy::transferSync(const char* target_hostname,
                                    uintptr_t buffer,
                                    uintptr_t peer_buffer_address, size_t length,
@@ -1033,22 +1054,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                 : engine_->submitTransfer(batch_id, {entry});
         if (!s.ok()) {
             engine_->freeBatchID(batch_id);
-            Status segment_status = engine_->CheckSegmentStatus(handle);
-            if (!segment_status.ok()) {
-                LOG(WARNING)
-                    << "submitTransfer failed with target " << target_hostname
-                    << ", CheckSegmentStatus not ok, ready to closeSegment";
-                std::lock_guard<std::mutex> guard(mutex_);
-                engine_->closeSegment(handle);
-                // Under MC_USE_TENT there is no classic metadata object
-                // (getMetadata() returns nullptr); TENT invalidates its own
-                // segment cache inside closeSegment(). Guard the classic-only
-                // cleanup so evicting a dead peer's handle cannot dereference
-                // a null metadata pointer. Refs #3995 (P0-stale-handle).
-                if (auto metadata = engine_->getMetadata())
-                    metadata->removeSegmentDesc(target_hostname);
-                handle_map_.erase(target_hostname);
-            }
+            evictStaleSegment(target_hostname, handle);
             return -1;
         }
 
@@ -1120,35 +1126,81 @@ int TransferEnginePy::batchTransferSync(
     }
 
     const int max_retry = engine_->numContexts() + 1;
-    auto start_ts = getCurrentTimeInNano();
-    auto total_length = std::accumulate(lengths.begin(), lengths.end(), 0ull);
+    using Clock = std::chrono::steady_clock;
+    const auto start = Clock::now();
+    const auto total_length =
+        std::accumulate(lengths.begin(), lengths.end(), 0ull);
+    // 1GiB per second (legacy approximation: one nanosecond per byte).
+    // Add this size allowance to the base timeout once for all attempts.
+    const auto deadline =
+        start + std::chrono::nanoseconds(transfer_timeout_nsec_ + total_length);
     auto batch_size = buffers.size();
     const int nic_hint_id = resolveNicHint(nic_hint);
+    const int hint = parseTransportHint(transport_hint);
+    const bool try_parallel_batch =
+        !notify && engine_->isBatchSubmitEligible(batch_size) &&
+        independentTransferDestinations(
+            opcode == TransferOpcode::WRITE ? peer_buffer_addresses : buffers,
+            lengths);
     std::vector<TransferRequest> entries;
-    for (size_t i = 0; i < batch_size; ++i) {
-        TransferRequest entry;
-        if (opcode == TransferOpcode::WRITE) {
-            entry.opcode = TransferRequest::WRITE;
-        } else {
-            entry.opcode = TransferRequest::READ;
-        }
-        entry.length = lengths[i];
-        entry.source = (void*)buffers[i];
-        entry.target_id = handle;
-        entry.target_offset = peer_buffer_addresses[i];
-        entry.advise_retry_cnt = 0;
-        entry.transport_hint = parseTransportHint(transport_hint);
-        entry.nic_hint = nic_hint_id;
-        entries.push_back(entry);
-    }
-
     for (int retry = 0; retry < max_retry; ++retry) {
-        // Preserve the historical empty-hint retry policy. Only stop pinning a
-        // named RNIC after the first submit-level attempt fails.
-        if (retry > 0) {
-            for (auto& entry : entries) entry.nic_hint = -1;
+        const auto now = Clock::now();
+        if (now >= deadline) {
+            LOG(INFO) << "Sync batch data transfer timeout before attempt "
+                      << retry;
+            return -1;
         }
+        // Retry the whole batch using ordinary topology selection after the
+        // first native FAILED/TIMEOUT. A submit API error is not retried.
+        const int attempt_nic_hint = retry == 0 ? nic_hint_id : -1;
+        const auto build_requests = [&, attempt_nic_hint](size_t begin,
+                                                          size_t end) {
+            std::vector<TransferRequest> requests;
+            requests.reserve(end - begin);
+            for (size_t i = begin; i < end; ++i) {
+                TransferRequest entry;
+                entry.opcode = opcode == TransferOpcode::WRITE
+                                   ? TransferRequest::WRITE
+                                   : TransferRequest::READ;
+                entry.length = lengths[i];
+                entry.source = reinterpret_cast<void*>(buffers[i]);
+                entry.target_id = handle;
+                entry.target_offset = peer_buffer_addresses[i];
+                entry.advise_retry_cnt = 0;
+                entry.transport_hint = hint;
+                entry.nic_hint = attempt_nic_hint;
+                requests.push_back(std::move(entry));
+            }
+            return requests;
+        };
+        if (try_parallel_batch) {
+            TransferEngine::ParallelBatchTransferFailureInfo failure;
+            auto result = engine_->tryParallelBatchTransfer(
+                handle, batch_size, build_requests,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(deadline -
+                                                                     now),
+                &failure);
+            if (result) {
+                if (result->ok()) return 0;
+                LOG(ERROR) << "Parallel batch transfer failed: "
+                           << result->ToString();
+                if (failure.submit_failed) {
+                    evictStaleSegment(target_hostname, handle);
+                    return -1;
+                }
+                if (!failure.retryable) return -1;
+                continue;
+            }
+        }
+        // Build the full request vector only after parallel submission declines
+        // this attempt, before any work has been published.
+        if (entries.empty())
+            entries = build_requests(0, batch_size);
+        else
+            for (auto& entry : entries) entry.nic_hint = attempt_nic_hint;
+        if (Clock::now() >= deadline) return -1;
         auto batch_id = engine_->allocateBatchID(batch_size);
+        if (batch_id == INVALID_BATCH_ID) return -1;
         Status s =
             notify
                 ? engine_->submitTransferWithNotify(
@@ -1161,22 +1213,7 @@ int TransferEnginePy::batchTransferSync(
                        << " requests, " << total_length
                        << " bytes): " << s.ToString();
             engine_->freeBatchID(batch_id);
-            Status segment_status = engine_->CheckSegmentStatus(handle);
-            if (!segment_status.ok()) {
-                LOG(WARNING)
-                    << "submitTransfer failed with target " << target_hostname
-                    << ", CheckSegmentStatus not ok, ready to closeSegment";
-                std::lock_guard<std::mutex> guard(mutex_);
-                engine_->closeSegment(handle);
-                // Under MC_USE_TENT there is no classic metadata object
-                // (getMetadata() returns nullptr); TENT invalidates its own
-                // segment cache inside closeSegment(). Guard the classic-only
-                // cleanup so evicting a dead peer's handle cannot dereference
-                // a null metadata pointer. Refs #3995 (P0-stale-handle).
-                if (auto metadata = engine_->getMetadata())
-                    metadata->removeSegmentDesc(target_hostname);
-                handle_map_.erase(target_hostname);
-            }
+            evictStaleSegment(target_hostname, handle);
             return -1;
         }
 
@@ -1203,12 +1240,13 @@ int TransferEnginePy::batchTransferSync(
                 completed = true;
             }
             if (completed) break;
-            auto current_ts = getCurrentTimeInNano();
-            const int64_t timeout =
-                transfer_timeout_nsec_ + total_length;  // 1GiB per second
-            if (current_ts - start_ts > timeout) {
-                LOG(INFO) << "Sync batch data transfer timeout after "
-                          << current_ts - start_ts << "ns";
+            if (Clock::now() >= deadline) {
+                LOG(INFO)
+                    << "Sync batch data transfer timeout after "
+                    << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           Clock::now() - start)
+                           .count()
+                    << "ns";
                 if (!release_scheduled) {
                     engine_->freeBatchID(batch_id);
                 }
@@ -1529,6 +1567,11 @@ int TransferEnginePy::batchUnregisterMemory(
         buffers.push_back(reinterpret_cast<char*>(buffer_addresses[i]));
     }
     return engine_->unregisterLocalMemoryBatch(buffers);
+}
+
+int TransferEnginePy::enableMemoryRegistrationReuse() {
+    if (!engine_) return ERR_INVALID_ARGUMENT;
+    return engine_->enableMemoryRegistrationReuse();
 }
 
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity,
@@ -2209,6 +2252,8 @@ NB_MODULE(engine, m) {
                  })
             .def("read_bytes_from_buffer",
                  &TransferEnginePy::readBytesFromBuffer)
+            .def("enable_memory_registration_reuse",
+                 &TransferEnginePy::enableMemoryRegistrationReuse)
             .def("register_memory", &TransferEnginePy::registerMemory,
                  py::arg("buffer_addr"), py::arg("capacity"),
                  py::arg("location") = kWildcardLocation,
@@ -2240,6 +2285,15 @@ NB_MODULE(engine, m) {
                  "Returns 0 on success, non-zero on failure. Used by "
                  "SGLang's failed-session blacklist recovery.")
             .def("get_engine", &TransferEnginePy::getEngine)
+            .def("reset_reshard_peers_quiescent",
+                 &TransferEnginePy::resetReshardPeersQuiescent,
+                 py::arg("peers"),
+                 "Experimental: close intra-node NVLink IPC mappings and "
+                 "invalidate metadata and Python handles for the listed peers. "
+                 "Caller must globally fence completed transfers and prevent "
+                 "concurrent submissions, registration, and unregistration. "
+                 "Returns 0 on success; failure may leave a partial reset and "
+                 "requires restarting the participating engines.")
             .def("get_engine_ptr", &TransferEnginePy::getEnginePtr);
 
     adaptor_cls

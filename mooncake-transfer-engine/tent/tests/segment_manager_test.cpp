@@ -528,6 +528,84 @@ TEST(SegmentTrackerTest, RefCountedAddRemove) {
     EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
 }
 
+TEST(SegmentTrackerTest, DuplicateOnlyBatchPublishesOnce) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    const auto desc = makeBuffer(0x20000, 0x1000);
+    auto noop = [](auto&) { return Status::OK(); };
+    std::vector<BufferDesc> initial{desc};
+    ASSERT_TRUE(tracker.addInBatch(initial, noop).ok());
+
+    const auto before = manager->getLocal();
+    auto during_callback = before;
+    std::vector<BufferDesc> dup{desc, desc};
+    auto status = tracker.addInBatch(dup, [&](auto& added) {
+        EXPECT_TRUE(added.empty());
+        during_callback = manager->getLocal();
+        EXPECT_EQ(buffersOf(during_callback)[0].ref_count, 3);
+        return Status::OK();
+    });
+    ASSERT_TRUE(status.ok());
+    EXPECT_NE(during_callback, before);
+    EXPECT_EQ(manager->getLocal(), during_callback);
+}
+
+TEST(SegmentTrackerTest, MixedBatchMatchesTheExactAddressAndLength) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto noop = [](auto&) { return Status::OK(); };
+
+    const auto left = makeBuffer(0x10000, 0x1000);
+    const auto short_range = makeBuffer(0x20000, 0x1000);
+    const auto long_range = makeBuffer(0x20000, 0x2000);
+    const auto right = makeBuffer(0x30000, 0x1000);
+    const auto middle = makeBuffer(0x20000, 0x1800);
+    std::vector<BufferDesc> initial{right, short_range, left, long_range};
+    ASSERT_TRUE(tracker.addInBatch(initial, noop).ok());
+
+    std::vector<BufferDesc> mixed{middle, short_range, short_range, long_range};
+    ASSERT_TRUE(tracker
+                    .addInBatch(mixed,
+                                [&](std::vector<BufferDesc>& added) {
+                                    EXPECT_EQ(added.size(), 1u);
+                                    if (!added.empty()) {
+                                        EXPECT_EQ(added[0].length,
+                                                  middle.length);
+                                    }
+                                    return Status::OK();
+                                })
+                    .ok());
+
+    auto snapshot = manager->getLocal();
+    const auto& buffers = buffersOf(snapshot);
+    ASSERT_EQ(buffers.size(), 5u);
+    EXPECT_EQ(buffers[0].addr, left.addr);
+    EXPECT_EQ(buffers[1].length, long_range.length);
+    EXPECT_EQ(buffers[1].ref_count, 2);
+    EXPECT_EQ(buffers[2].length, middle.length);
+    EXPECT_EQ(buffers[2].ref_count, 1);
+    EXPECT_EQ(buffers[3].length, short_range.length);
+    EXPECT_EQ(buffers[3].ref_count, 3);
+    EXPECT_EQ(buffers[4].addr, right.addr);
+
+    // Without a length, remove still releases the longest range first.
+    std::vector<size_t> removed;
+    auto on_remove = [&](BufferDesc& desc) {
+        removed.push_back(desc.length);
+        return Status::OK();
+    };
+    ASSERT_TRUE(tracker.remove(short_range.addr, 0, on_remove).ok());
+    EXPECT_TRUE(removed.empty());
+    ASSERT_TRUE(tracker.remove(short_range.addr, 0, on_remove).ok());
+    ASSERT_TRUE(
+        tracker.remove(short_range.addr, middle.length, on_remove).ok());
+    EXPECT_EQ(removed, (std::vector<size_t>{long_range.length, middle.length}));
+    auto remaining = manager->getLocal();
+    ASSERT_EQ(buffersOf(remaining).size(), 3u);
+    EXPECT_EQ(buffersOf(remaining)[1].length, short_range.length);
+    EXPECT_EQ(buffersOf(remaining)[1].ref_count, 3);
+}
+
 TEST(SegmentTrackerTest, AddInBatchCoalescesDuplicateNewRanges) {
     auto manager = makeManager();
     SegmentTracker tracker(*manager);
