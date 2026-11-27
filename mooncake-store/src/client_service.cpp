@@ -4842,7 +4842,8 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& tenant_id,
                                            const std::string& source,
                                            const std::string& target,
-                                           const UUID* task_id) {
+                                           const UUID* task_id,
+                                           bool* target_allocation_failed) {
     if (IsTaskCancellationRequested(task_id)) {
         return tl::unexpected(ErrorCode::TASK_CANCELED);
     }
@@ -4855,6 +4856,10 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         master_client_.MoveStart(key, tenant_id, source, target);
     if (!move_start_result.has_value()) {
         ErrorCode error = move_start_result.error();
+        if (target_allocation_failed &&
+            error == ErrorCode::NO_AVAILABLE_HANDLE) {
+            *target_allocation_failed = true;
+        }
         LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
                    << ", error=move_start_failed" << ", error_code=" << error;
         // MoveStart already validated existence, so we just return the error
@@ -5706,6 +5711,7 @@ void Client::SubmitTask(const TaskAssignment& assignment) {
 void Client::ExecuteTask(const ClientTask& client_task) {
     const auto& assignment = client_task.assignment;
     ErrorCode result = ErrorCode::OK;
+    bool target_allocation_failed = false;
 
     try {
         switch (assignment.type) {
@@ -5731,7 +5737,10 @@ void Client::ExecuteTask(const ClientTask& client_task) {
                 struct_json::from_json(payload, assignment.payload);
                 auto move_result =
                     Move(payload.key, payload.tenant_id, payload.source,
-                         payload.target, &assignment.id);
+                         payload.target, &assignment.id,
+                         assignment.retry_capacity_on_master.value_or(false)
+                             ? &target_allocation_failed
+                             : nullptr);
                 if (move_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
@@ -5790,6 +5799,7 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         // Other errors (e.g., OBJECT_NOT_FOUND, REPLICA_NOT_FOUND) should
         // not be retried
         bool should_retry =
+            !target_allocation_failed &&
             (result == ErrorCode::NO_AVAILABLE_HANDLE) &&
             (current_retry_count < assignment.max_retry_attempts);
 
@@ -5820,9 +5830,14 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             TaskCompleteRequest complete_request;
             complete_request.id = assignment.id;
             complete_request.status = TaskStatus::FAILED;
-            complete_request.message =
-                toString(result) + " (max retries reached: " +
-                std::to_string(assignment.max_retry_attempts) + ")";
+            complete_request.message = toString(result);
+            if (target_allocation_failed) {
+                complete_request.target_allocation_failed = true;
+            } else {
+                complete_request.message +=
+                    " (max retries reached: " +
+                    std::to_string(assignment.max_retry_attempts) + ")";
+            }
             report_completion(complete_request);
         }
     }

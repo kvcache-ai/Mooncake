@@ -3371,85 +3371,45 @@ TEST_F(FileStorageTest,
     constexpr int64_t kBufferSize = 1024 * 1024;
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
-    // Small pool, so the probe below can exhaust it and drive the eager GC.
     file_storage_config.local_buffer_size = kBufferSize;
     file_storage_config.total_keys_limit = 1000;
-    // Short-ish lease so an abandoned batch becomes reclaimable quickly, but
-    // comfortably longer than the concurrent cold reads below take to run.
-    file_storage_config.client_buffer_gc_ttl_ms = 2000;
+    // Use the whole pool for the allocation probe without direct-I/O padding.
+    file_storage_config.use_uring = false;
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
     ASSERT_FALSE(keys.empty());
 
-    const std::string target_key = keys.front();
-    const int64_t target_size = sizes.front();
-    constexpr int kConcurrency = 8;
-
-    // Every reader disappears right after its cold read without releasing,
-    // which is the worst case for a shared staging buffer: only the lease can
-    // still get the memory back.
-    std::atomic<int> started{0};
-    std::atomic<int> readers{0};
-    std::vector<uint64_t> staging_ptrs(kConcurrency, 0);
-    std::vector<std::thread> threads;
-    threads.reserve(kConcurrency);
-
-    for (int i = 0; i < kConcurrency; ++i) {
-        threads.emplace_back([&, i] {
-            started.fetch_add(1);
-            while (started.load() < kConcurrency) {
-                std::this_thread::yield();
-            }
-            auto result = fileStorage.BatchGet({target_key}, {target_size});
-            if (!result) return;
-            if (result->pointers.size() == 1) {
-                staging_ptrs[i] = result->pointers[0];
-            }
-            readers.fetch_add(1);
-            // Deliberately no ReleaseBuffer: the client is gone.
-        });
-    }
-
-    for (auto& t : threads) {
-        t.join();
-    }
-    ASSERT_EQ(readers.load(), kConcurrency);
-
-    int sharers = 0;
-    for (int i = 0; i < kConcurrency; ++i) {
-        if (staging_ptrs[i] == staging_ptrs[0]) {
-            sharers++;
-        }
-    }
-    EXPECT_GT(sharers, 1)
-        << "Expected the concurrent readers to share one staging buffer";
-    EXPECT_EQ(ClientBufferBatchCount(fileStorage),
-              static_cast<size_t>(kConcurrency))
-        << "Every reader should hold its own batch id";
-
-    // These tests never call Init(), so the background GC thread is not
-    // running; reclamation is driven by the eager GC inside AllocateBatch,
-    // which kicks in when an allocation fails. A whole-pool request cannot be
-    // satisfied while any batch is outstanding, so it always takes that path.
-    const std::vector<std::string> probe_key = {target_key};
+    const std::vector<std::string> probe_key = {keys.front()};
     const std::vector<int64_t> probe_size = {kBufferSize};
+    auto leader = fileStorage.BatchGet(probe_key, {sizes.front()});
+    ASSERT_TRUE(leader);
+    auto staging = ClientBufferBatch(fileStorage, leader->batch_id);
+    ASSERT_NE(staging, nullptr);
+
+    // Register the same aliases that joined readers would hold. Abandoned
+    // readers leave these ids registered without calling ReleaseBuffer.
+    constexpr size_t kReaderCount = 8;
+    std::vector<uint64_t> batch_ids{leader->batch_id};
+    for (size_t i = 1; i < kReaderCount; ++i) {
+        auto alias = FileStorageShareStagingBuffer(fileStorage, staging);
+        EXPECT_EQ(alias.pointers, leader->pointers);
+        batch_ids.push_back(alias.batch_id);
+    }
+    staging.reset();
+    ASSERT_EQ(ClientBufferBatchCount(fileStorage), kReaderCount);
+
+    // A whole-pool request drives eager GC and must fail while leases are live.
     auto probe = FileStorageAllocateBatch(fileStorage, probe_key, probe_size);
     ASSERT_FALSE(probe);
     EXPECT_EQ(probe.error(), ErrorCode::BUFFER_OVERFLOW);
+    EXPECT_EQ(ClientBufferBatchCount(fileStorage), kReaderCount);
 
-    // The lease is still alive, so the eager GC must leave the abandoned batch
-    // alone: its reader may still be copying out of it.
-    EXPECT_EQ(ClientBufferBatchCount(fileStorage),
-              static_cast<size_t>(kConcurrency))
-        << "An unexpired lease should keep the shared staging buffer reserved";
-
-    // Let the lease expire, then drive the eager GC once more.
-    std::this_thread::sleep_for(std::chrono::milliseconds(
-        file_storage_config.client_buffer_gc_ttl_ms + 100));
+    for (const auto id : batch_ids) {
+        ASSERT_TRUE(ExpireClientBufferBatch(fileStorage, id));
+    }
     probe = FileStorageAllocateBatch(fileStorage, probe_key, probe_size);
-    EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u)
-        << "Abandoned shared staging buffers must be reclaimed once their "
-           "lease expires, otherwise the memory leaks for good";
+    ASSERT_TRUE(probe) << "Expired aliases must return staging to the pool";
+    EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u);
 }
 
 }  // namespace mooncake

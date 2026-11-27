@@ -10697,8 +10697,9 @@ tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
     }
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     auto write_access = task_manager_.get_write_access();
-    ErrorCode err = write_access.complete_task(client_id, request.id,
-                                               request.status, request.message);
+    ErrorCode err = write_access.complete_task(
+        client_id, request.id, request.status, request.message,
+        request.target_allocation_failed.value_or(false));
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "task_id=" << request.id
                    << ", error=complete_task_failed";
@@ -11055,6 +11056,7 @@ bool MasterService::FinishDrainJobCancellation(DrainJob& job) {
         return false;
     }
 
+    job.capacity_retries.clear();
     if (job.stop_reason.load(std::memory_order_relaxed) ==
         DrainStopReason::TIMEOUT) {
         // Keep unfinished sources DRAINING so a new job can safely resume.
@@ -11090,8 +11092,10 @@ std::string MasterService::MakeDrainUnitKey(
 }
 
 std::optional<std::string> MasterService::SelectDrainTargetForKey(
-    const ObjectMetadata& metadata, const std::string& source_segment,
-    const std::vector<std::string>& requested_targets) {
+    const ObjectMetadata& metadata, size_t object_size,
+    const std::string& source_segment,
+    const std::vector<std::string>& requested_targets,
+    const std::unordered_set<std::string>* failed_targets) {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     std::vector<std::string> candidate_segments = requested_targets;
     if (candidate_segments.empty()) {
@@ -11105,7 +11109,8 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
     double best_util = std::numeric_limits<double>::max();
     std::optional<std::string> best_target;
     for (const auto& candidate : candidate_segments) {
-        if (candidate == source_segment) {
+        if (candidate == source_segment ||
+            (failed_targets && failed_targets->contains(candidate))) {
             continue;
         }
         if (std::find(existing_segments.begin(), existing_segments.end(),
@@ -11119,7 +11124,7 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
         size_t used = 0, capacity = 0;
         if (segment_access.QuerySegments(candidate, used, capacity) !=
                 ErrorCode::OK ||
-            capacity == 0) {
+            capacity == 0 || used > capacity || object_size > capacity - used) {
             continue;
         }
         const double util =
@@ -11173,6 +11178,13 @@ void MasterService::RefreshDrainJobTasks(DrainJob& job) {
             job.succeeded_units++;
             job.migrated_bytes += active_task.bytes;
             job.completed_unit_keys.insert(active_task.unit_key);
+            job.capacity_retries.erase(active_task.unit_key);
+        } else if (task_opt->target_allocation_failed) {
+            if (!DrainJobStopRequested(job)) {
+                auto& retry = job.capacity_retries[active_task.unit_key];
+                retry.generation = active_task.generation;
+                retry.failed_targets.insert(active_task.target_segment);
+            }
         } else if (task_opt->status == TaskStatus::FAILED ||
                    (task_opt->status == TaskStatus::CANCELED &&
                     !DrainJobStopRequested(job))) {
@@ -11181,6 +11193,7 @@ void MasterService::RefreshDrainJobTasks(DrainJob& job) {
             retry_count++;
             if (retry_count >= kMaxDrainUnitRetries) {
                 job.terminal_failed_unit_keys.insert(active_task.unit_key);
+                job.capacity_retries.erase(active_task.unit_key);
             }
         }
     }
@@ -11216,6 +11229,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
         std::string target_segment;
         size_t bytes;
         std::string unit_key;
+        route::Generation generation;
     };
 
     const size_t slots = max_concurrency - job.active_tasks.size();
@@ -11227,6 +11241,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
     }
 
     std::unordered_set<std::string> blocked_unit_keys;
+    const auto now = std::chrono::steady_clock::now();
     {
         std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
         VisitNamespaces([&](const TenantId& tenant_id,
@@ -11264,6 +11279,8 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                     continue;
                 }
                 const auto& metadata = accessor.Get();
+                const auto generation = accessor.Generation();
+                const size_t object_size = metadata.TotalLength();
                 for (const auto& source_segment : job.request.segments) {
                     if (DrainJobStopRequested(job)) {
                         return;
@@ -11319,17 +11336,43 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                         continue;
                     }
 
+                    // delete old record and skip waiting object
+                    auto retry = job.capacity_retries.find(unit_key);
+                    if (retry != job.capacity_retries.end() &&
+                        retry->second.generation != generation) {
+                        job.capacity_retries.erase(retry);
+                        retry = job.capacity_retries.end();
+                    }
+                    auto* capacity_retry = retry == job.capacity_retries.end()
+                                               ? nullptr
+                                               : &retry->second;
+                    if (capacity_retry && capacity_retry->retry_at > now) {
+                        blocked_unit_keys.insert(unit_key);
+                        continue;
+                    }
+
                     auto target = SelectDrainTargetForKey(
-                        metadata, source_segment, job.request.target_segments);
+                        metadata, object_size, source_segment,
+                        job.request.target_segments,
+                        capacity_retry ? &capacity_retry->failed_targets
+                                       : nullptr);
                     if (!target.has_value()) {
+                        if (capacity_retry &&
+                            !capacity_retry->failed_targets.empty()) {
+                            capacity_retry->failed_targets.clear();
+                            capacity_retry->retry_at =
+                                std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(
+                                    kJobDispatchThreadSleepMs);
+                        }
                         blocked_unit_keys.insert(unit_key);
                         continue;
                     }
 
                     if (plans.size() < slots) {
                         plans.push_back({tenant_id, key, source_segment,
-                                         *target, metadata.TotalLength(),
-                                         unit_key});
+                                         std::move(*target), object_size,
+                                         unit_key, generation});
                     }
                 }
             }
@@ -11357,6 +11400,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
             active_task.target_segment = plan.target_segment;
             active_task.bytes = plan.bytes;
             active_task.unit_key = plan.unit_key;
+            active_task.generation = plan.generation;
             job.active_tasks.emplace(task_id.value(), std::move(active_task));
         } else if (task_id.error() == ErrorCode::NO_AVAILABLE_HANDLE ||
                    task_id.error() ==
@@ -11369,6 +11413,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
             retry_count++;
             if (retry_count >= kMaxDrainUnitRetries) {
                 job.terminal_failed_unit_keys.insert(plan.unit_key);
+                job.capacity_retries.erase(plan.unit_key);
             }
         }
     }
@@ -11434,6 +11479,7 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
     }
 
     if (remaining_segments.empty()) {
+        job.capacity_retries.clear();
         job.status = JobStatus::SUCCEEDED;
         job.last_updated_at = std::chrono::system_clock::now();
         job.message = "Drain job finished successfully";
@@ -11465,6 +11511,7 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         }
     }
 
+    job.capacity_retries.clear();
     job.status = JobStatus::FAILED;
     job.last_updated_at = std::chrono::system_clock::now();
     job.message = "Drain job failed: unrecoverable units remain";

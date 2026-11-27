@@ -318,6 +318,7 @@ struct TaskAssignment {
     std::string payload;
     int64_t created_at_ms_epoch;
     uint32_t max_retry_attempts;
+    struct_pack::compatible<bool, 1> retry_capacity_on_master;
 
     TaskAssignment() = default;
     TaskAssignment(const Task& task)
@@ -328,10 +329,14 @@ struct TaskAssignment {
               std::chrono::duration_cast<std::chrono::milliseconds>(
                   task.created_at.time_since_epoch())
                   .count())),
-          max_retry_attempts(task.max_retry_attempts) {}
+          max_retry_attempts(task.max_retry_attempts) {
+        if (task.retained_by_drain) {
+            retry_capacity_on_master = true;
+        }
+    }
 };
 YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch,
-         max_retry_attempts);
+         max_retry_attempts, retry_capacity_on_master);
 
 /**
  * @brief Task update structure
@@ -340,10 +345,11 @@ struct TaskCompleteRequest {
     UUID id;
     TaskStatus status;
     std::string message;
+    struct_pack::compatible<bool, 1> target_allocation_failed;
 
     TaskCompleteRequest() = default;
 };
-YLT_REFL(TaskCompleteRequest, id, status, message);
+YLT_REFL(TaskCompleteRequest, id, status, message, target_allocation_failed);
 
 struct BatchGetOffloadObjectResponse {
     uint64_t batch_id;

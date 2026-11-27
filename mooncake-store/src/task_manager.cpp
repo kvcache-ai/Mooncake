@@ -232,7 +232,8 @@ std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
 ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
                                                const UUID& task_id,
                                                TaskStatus status,
-                                               const std::string& message) {
+                                               const std::string& message,
+                                               bool target_allocation_failed) {
     if (!is_finished_status(status)) {
         LOG(ERROR) << "complete_task: invalid completion status=" << status
                    << ", task_id=" << task_id;
@@ -263,6 +264,9 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
         manager_->total_pending_tasks_ > 0) {
         manager_->total_pending_tasks_--;
     }
+    task.target_allocation_failed =
+        task.retained_by_drain && task.status == TaskStatus::PROCESSING &&
+        status == TaskStatus::FAILED && target_allocation_failed;
     task.mark_complete(status, message);
 
     auto ps_it = manager_->processing_tasks_.find(client_id);
