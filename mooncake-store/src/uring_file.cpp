@@ -1351,6 +1351,21 @@ bool UringFile::register_global_buffer(void* buffer, size_t length) {
     return ok;
 }
 
+bool UringFile::is_supported() {
+    static const bool supported = [] {
+        struct io_uring ring {};
+        const int ret = io_uring_queue_init(1, &ring, 0);
+        if (ret < 0) {
+            LOG(ERROR) << "[UringFile] io_uring unavailable: "
+                       << strerror(-ret);
+            return false;
+        }
+        io_uring_queue_exit(&ring);
+        return true;
+    }();
+    return supported;
+}
+
 void UringFile::unregister_global_buffer() {
     g_buf.base.store(nullptr, std::memory_order_release);
     g_buf.size.store(0, std::memory_order_release);

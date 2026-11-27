@@ -249,6 +249,10 @@ class UringFile : public StorageFile {
     // before the buffer is freed.
     static void unregister_global_buffer();
 
+    // Whether this process may create an io_uring; container seccomp
+    // profiles commonly reject io_uring_setup even when the kernel allows it.
+    static bool is_supported();
+
     bool register_buffer(void *buffer, size_t length);
     void unregister_buffer();
     bool is_buffer_registered() const;

@@ -126,8 +126,16 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
 
+#ifdef USE_URING
+    if (config_.use_uring && !UringFile::is_supported()) {
+        LOG(ERROR) << "MOONCAKE_OFFLOAD_USE_URING is set but io_uring is "
+                      "unavailable; using POSIX file I/O";
+        config_.use_uring = false;
+    }
+#endif
+
     if (config.pinned_restore_arena_size > 0) {
-        if (config.use_uring) {
+        if (config_.use_uring) {
             LOG(WARNING) << "Pinned SSD restore is disabled with io_uring";
         } else if (!client ||
                    !client->CanUseLocalMemcpy(client->GetSegmentEndpoint())) {
@@ -181,7 +189,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     // mechanism. This must happen before any I/O threads start so that they
     // can lazily pick up the registration on their first I/O call.
 #ifdef USE_URING
-    if (config.use_uring) {
+    if (config_.use_uring) {
         auto aligned_allocator =
             std::static_pointer_cast<AlignedClientBufferAllocator>(
                 client_buffer_allocator_);

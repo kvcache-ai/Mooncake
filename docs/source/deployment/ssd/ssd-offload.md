@@ -140,7 +140,7 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` | `10` | Interval for offload heartbeat to master (seconds) |
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS` | `1` | Interval for reclaiming expired offload buffers; defaults to the heartbeat interval in the current implementation |
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS` | `5000` | Lease time for buffers returned by `batch_get_offload_object` before GC reclaims them |
-| `MOONCAKE_OFFLOAD_USE_URING` | `false` | Enable io_uring for async file I/O |
+| `MOONCAKE_OFFLOAD_USE_URING` | `false` | Enable io_uring for async file I/O. If the process cannot create an io_uring (for example, a container seccomp profile blocks `io_uring_setup`), FileStorage logs an error and uses POSIX file I/O |
 | `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION` | `true` | Enable proactive local-disk eviction from the FileStorage heartbeat |
 | `MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO` | `0.90` | Trigger proactive disk eviction when backend usage exceeds this ratio of its quota |
 | `MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO` | `0.80` | Target backend usage ratio for proactive disk eviction |
