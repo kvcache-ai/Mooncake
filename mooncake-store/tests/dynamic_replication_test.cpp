@@ -145,7 +145,7 @@ class DynamicReplicationTest : public ::testing::Test {
             return false;
         }
         for (const auto& [replica_id, record] :
-             accessor.Get().dynamic_replicas) {
+             accessor.Get().DynamicReplicas()) {
             (void)replica_id;
             if (record.target_segment == target_segment && record.complete) {
                 return true;
@@ -164,8 +164,8 @@ class DynamicReplicationTest : public ::testing::Test {
         if (!accessor.Exists()) {
             return false;
         }
-        return std::any_of(accessor.Get().dynamic_replicas.begin(),
-                           accessor.Get().dynamic_replicas.end(),
+        return std::any_of(accessor.Get().DynamicReplicas().begin(),
+                           accessor.Get().DynamicReplicas().end(),
                            [&target_segment](const auto& entry) {
                                return entry.second.target_segment ==
                                           target_segment &&
@@ -1045,6 +1045,13 @@ TEST_F(DynamicReplicationTest, EvictedDynamicReplicaBlocksImmediateRecreate) {
     auto next_target = PrepareSegment(service, "segment_2", 0x1300000000);
     PutObject(service, source.client_id, "evicted-dynamic-key",
               source.segment_name);
+    {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{
+                          TenantId::Default(), "evicted-dynamic-key"});
+        ASSERT_TRUE(accessor.Exists());
+        EXPECT_FALSE(accessor.Get().HasDynamicReplicaState());
+    }
 
     auto proposal =
         BuildProposal(service, "evicted-dynamic-key", target.segment_name);
@@ -1073,6 +1080,22 @@ TEST_F(DynamicReplicationTest, EvictedDynamicReplicaBlocksImmediateRecreate) {
         immediate_recreate);
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(rejected.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
+    MasterServiceTestPeer::MetadataAccessorRW accessor(
+        &service, MasterServiceTestPeer::ObjectIdentity{TenantId::Default(),
+                                                        "evicted-dynamic-key"});
+    ASSERT_TRUE(accessor.Exists());
+    auto& metadata = accessor.Get();
+    const auto now = std::chrono::steady_clock::now();
+    EXPECT_TRUE(metadata.HasDynamicReplicaState());
+    EXPECT_TRUE(metadata.DynamicReplicationRecreateBlocked(now));
+    metadata.ReclaimExpiredDynamicReplicaState(now);
+    EXPECT_TRUE(metadata.HasDynamicReplicaState());
+
+    const auto after_cooldown = now + std::chrono::minutes(2);
+    metadata.ReclaimExpiredDynamicReplicaState(after_cooldown);
+    EXPECT_FALSE(metadata.HasDynamicReplicaState());
+    EXPECT_FALSE(metadata.DynamicReplicationRecreateBlocked(after_cooldown));
 }
 
 TEST_F(DynamicReplicationTest, SourceSelectionUsesStableTieBreak) {

@@ -148,6 +148,18 @@ class Transport {
         return Platform::getLoader().free(addr, size);
     }
 
+    virtual bool supportsGlobalAddressing() const { return false; }
+
+    virtual Status mapRemoteMemory(SegmentID, void*, size_t) {
+        return Status::NotImplemented(
+            "Global address mapping is unavailable" LOC_MARK);
+    }
+
+    virtual Status unmapRemoteMemory(SegmentID, void*) {
+        return Status::NotImplemented(
+            "Global address mapping is unavailable" LOC_MARK);
+    }
+
     // Pre-registration warm-up that pins pages before NUMA probing.
     // Returns true if pages were successfully pinned (caller may skip
     // prefault). Default: no-op, returns false.
@@ -196,6 +208,10 @@ class Transport {
     virtual Status getNicLoadStats(std::vector<NicLoadStats>&) const {
         return Status::OK();
     }
+
+    // Worker submission must preserve caller-thread context and execution
+    // dependencies. Ordinary failure/timeout and cleanup semantics still apply.
+    virtual bool supportsParallelBatchSubmit() const { return false; }
 
    protected:
     Capabilities caps;

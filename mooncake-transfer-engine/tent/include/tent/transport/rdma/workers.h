@@ -428,7 +428,6 @@ class Workers {
     std::shared_mutex allocation_rails_mutex_;
     std::unordered_map<std::string, std::unique_ptr<RailMonitor>>
         allocation_rails_;
-    bool always_tier1_ = false;
     // MC_ENABLE_DEST_DEVICE_AFFINITY: pin the remote NIC to the same name.
     bool dest_device_affinity_ = false;
     // One-shot warning for a peer that has no same-name NIC at all. Read on the
