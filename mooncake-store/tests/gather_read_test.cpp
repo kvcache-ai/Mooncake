@@ -527,6 +527,71 @@ TEST(GatherReadPlannerTest, RespectsDestinationOrdering) {
               t.remote_base_offset + t.remote_offsets.back());
 }
 
+// `heads` transfers of `rows` rows each, packed back to back in the destination
+// buffer, with strided sources so every row is an independent source run.
+static std::vector<OwnedRanges> packedRanges(size_t heads, size_t rows,
+                                             size_t length = 264) {
+    std::vector<OwnedRanges> out;
+    for (size_t h = 0; h < heads; ++h) {
+        OwnedRanges t;
+        t.remote_segment = "owner";
+        t.remote_base_offset = 0x10000000;
+        t.remote_size = 1ULL << 34;
+        t.local_buffer = reinterpret_cast<void*>(0x20000000);
+        t.local_capacity = 1ULL << 34;
+        for (size_t i = 0; i < rows; ++i) {
+            const size_t global = h * rows + i;
+            t.local_offsets.push_back(global * length);
+            t.remote_offsets.push_back(global * 8192);
+            t.lengths.push_back(length);
+        }
+        out.push_back(std::move(t));
+    }
+    return out;
+}
+static std::vector<TransferEngine::ScatterTransferRange> asRanges(
+    const std::vector<OwnedRanges>& owned) {
+    std::vector<TransferEngine::ScatterTransferRange> out;
+    for (const auto& t : owned) out.push_back(t);
+    return out;
+}
+TEST(GatherReadPlannerTest, OversizedGroupIsSplitInsteadOfDropped) {
+    // 12 x 12288 = 147456 ranges, above the 131072 request limit.
+    auto owned = packedRanges(12, 12288);
+    std::vector<std::string> endpoints(owned.size(), "owner:1");
+    auto plans = PlanGatherReads(asRanges(owned), endpoints);
+    ASSERT_EQ(plans.size(), 2);
+    size_t total = 0;
+    uintptr_t next = 0x20000000;
+    std::vector<size_t> seen(owned.size(), 0);
+    for (const auto& plan : plans) {
+        EXPECT_LE(plan.ranges.size(), 131072);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(plan.destination), next);
+        next += plan.bytes;
+        total += plan.bytes;
+        for (size_t i : plan.transfers) ++seen[i];
+    }
+    // Every byte is covered once, contiguously, and no transfer is shared
+    // between plans: the caller reports completion per transfer and plan.
+    EXPECT_EQ(total, 12 * 12288 * 264);
+    EXPECT_EQ(next, 0x20000000 + total);
+    for (size_t count : seen) EXPECT_EQ(count, 1);
+}
+TEST(GatherReadPlannerTest, SingleTransferOverLimitUsesScatter) {
+    // One transfer above the limit cannot be split without reporting another
+    // plan's fragments as failed, so it keeps the scatter path.
+    auto owned = packedRanges(1, 147456);
+    EXPECT_TRUE(PlanGatherReads(asRanges(owned), {"owner:1"}).empty());
+}
+TEST(GatherReadPlannerTest, InvalidRunDoesNotDropItsSiblings) {
+    auto owned = packedRanges(12, 12288);
+    owned[11].local_offsets[5] += 1;  // gap that only invalidates its own run
+    std::vector<std::string> endpoints(owned.size(), "owner:1");
+    auto plans = PlanGatherReads(asRanges(owned), endpoints);
+    ASSERT_EQ(plans.size(), 1);
+    EXPECT_EQ(plans[0].bytes, 10 * 12288 * 264);
+}
+
 class StoreGatherReadTest : public ::testing::TestWithParam<std::string> {};
 TEST_P(StoreGatherReadTest, InterleavedKeysSnapshotAndScatterFallback) {
     const auto& protocol = GetParam();
