@@ -16,6 +16,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
+#include "deadline_scheduler.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -510,6 +511,15 @@ class Client {
      */
     tl::expected<void, ErrorCode> UnmountSegmentById(
         const UUID& segment_id, uint64_t grace_period_ms = 0,
+        std::function<void(const UUID&)> cleanup_callback = {});
+
+    // Gracefully unmounts every mounted segment with cleanup_callback, and
+    // waits, with heartbeats and tasks still running, until the client has
+    // released all gracefully unmounting segments. Returns false if some
+    // remain after grace + kGracefulUnmountLeaseHold +
+    // kGracefulUnmountWaitSlack.
+    bool GracefulUnmountAllAndWait(
+        uint64_t grace_period_ms,
         std::function<void(const UUID&)> cleanup_callback = {});
 
     /**
@@ -1221,6 +1231,8 @@ class Client {
     std::unordered_map<UUID, std::function<void(const UUID&)>,
                        boost::hash<UUID>>
         graceful_unmount_cleanup_callbacks_;
+    // Notified, with mounted_segments_mutex_, after a release finishes.
+    std::condition_variable graceful_unmount_released_cv_;
 
     /**
      * @brief Internal helper to unmount a segment by iterator.
@@ -1229,13 +1241,36 @@ class Client {
     tl::expected<void, ErrorCode> UnmountSegmentImpl(
         std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
 
+    struct GracefulUnmountCheck {
+        UUID segment_id;
+        std::chrono::steady_clock::time_point give_up_at;
+        bool removed_by_master = false;
+    };
+    // How often the client asks the master whether a gracefully unmounting
+    // segment is gone, which may be before its grace period ends.
+    static constexpr std::chrono::seconds kGracefulUnmountPollInterval{1};
+    // The master drops a segment without waiting for read leases, and
+    // readers keep reading objects they looked up before. Keep the memory
+    // registered until their leases, at the default TTL, have expired.
+    static constexpr std::chrono::milliseconds kGracefulUnmountLeaseHold{
+        DEFAULT_DEFAULT_KV_LEASE_TTL};
+    // Past the grace period, how long polling continues before giving up.
+    static constexpr std::chrono::seconds kGracefulUnmountGiveUpDelay{40};
+    // Past grace + lease hold, how long GracefulUnmountAllAndWait waits.
+    static constexpr std::chrono::seconds kGracefulUnmountWaitSlack{3};
     void StartGracefulUnmountTimer(const UUID& segment_id,
                                    uint64_t grace_period_ms);
-    void OnGracefulUnmountTimer(const UUID& segment_id, int retry_left);
-    bool WaitForGracefulUnmountDelay(std::chrono::milliseconds delay);
-    std::mutex graceful_unmount_timer_mutex_;
-    std::condition_variable graceful_unmount_timer_cv_;
-    bool graceful_unmount_timer_stopping_{false};
+    void OnGracefulUnmountTimer(const GracefulUnmountCheck& check);
+    bool MasterRemovedSegment(const UUID& segment_id);
+    // Unregisters the segment's MR, runs its cleanup callback, then drops it
+    // from gracefully_unmounting_segments_.
+    void ReleaseGracefulUnmount(const UUID& segment_id);
+    // Has its own thread, so waiting out a grace period does not hold a
+    // task_thread_pool_ worker that drain and move tasks need.
+    DeadlineScheduler<GracefulUnmountCheck> graceful_unmount_scheduler_{
+        [this](const GracefulUnmountCheck& check) {
+            OnGracefulUnmountTimer(check);
+        }};
 
     // Configuration
     const std::string local_hostname_;

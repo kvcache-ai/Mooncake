@@ -2892,15 +2892,31 @@ NB_MODULE(_store, m) {
             "candidates may retain partial leases after a concurrent eviction.")
         .def(
             "close",
-            [](MooncakeStorePyWrapper &self) {
-                int rc = self.store_ ? self.store_->tearDownAll() : 0;
+            [](MooncakeStorePyWrapper &self, uint64_t grace_period_seconds) {
+                int rc = 0;
+                if (self.store_) {
+                    if (self.real_client_) {
+                        self.real_client_->set_shutdown_grace_period(
+                            grace_period_seconds);
+                    } else if (grace_period_seconds > 0) {
+                        LOG(WARNING) << "close() ignores grace_period_seconds "
+                                        "on a dummy client";
+                    }
+                    std::optional<py::gil_scoped_release> release;
+                    if (grace_period_seconds > 0) release.emplace();
+                    rc = self.store_->tearDownAll();
+                }
                 self.store_.reset();
                 self.real_client_.reset();
                 self.use_dummy_client_ = false;
                 return rc;
             },
+            py::arg("grace_period_seconds") = 0,
             "Close the store and clear the native client, including on "
-            "cleanup failure. A nonzero result is terminal, not retryable.")
+            "cleanup failure. A nonzero result is terminal, not retryable. "
+            "With grace_period_seconds > 0, a real client first gracefully "
+            "unmounts its segments and waits until the master removes them "
+            "and the default read lease has passed.")
         .def("health_check", &MooncakeStorePyWrapper::health_check,
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "

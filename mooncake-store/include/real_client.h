@@ -369,6 +369,12 @@ class RealClient : public PyClient {
 
     int tearDownAll();
 
+    // Makes the next teardown first gracefully unmount every segment for
+    // `seconds`, and keep serving reads and tasks until the master removes
+    // them and the default read lease has passed. 0 (the default) tears down
+    // right away.
+    void set_shutdown_grace_period(uint64_t seconds);
+
     // Test-only seam: when set, setup_internal() builds the NoF runtime from
     // this factory instead of CreateNofRuntime(). Not thread-safe; set before
     // setup and reset (pass nullptr) after the test.
@@ -1336,6 +1342,7 @@ class RealClient : public PyClient {
     // Reject new work once teardown begins; cleanup calls serialize to
     // completion
     std::atomic<bool> closed_{false};
+    std::atomic<uint64_t> shutdown_grace_period_ms_{0};
 
     // Latched when teardown's NoF buffer cleanup failed: repeat teardown
     // calls retry the cleanup and keep reporting the failure until it heals.
@@ -1414,6 +1421,9 @@ class RealClient : public PyClient {
     std::mutex teardown_mutex_;
     ErrorCode storage_shutdown_error_ = ErrorCode::OK;
     RpcDrainGuard offload_rpc_drain_;
+    // Admits mounts until teardown starts, so none lands after the graceful
+    // unmount takes its snapshot.
+    RpcDrainGuard mount_drain_;
     friend class RealClientShutdownTestPeer;
     std::unique_ptr<class EmbeddedMaster> embedded_master_;
 
@@ -1541,6 +1551,8 @@ class RealClient : public PyClient {
 
     // Owners awaiting teardown, including mounts without a Client record.
     std::vector<std::unique_ptr<NvlinkHostNumaAllocation>> egm_segment_ptrs_;
+    // Client segment id of each EGM owner that mounted, by base.
+    std::unordered_map<void *, UUID> egm_segment_ids_;
 
     void ReleaseMountedSegmentRecord(const std::string &segment_id);
     void ReleaseAllMountedSegmentRecords();

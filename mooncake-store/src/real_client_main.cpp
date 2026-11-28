@@ -39,6 +39,11 @@ DEFINE_int64(ssd_prefetch_cooldown_sec, DEFAULT_SSD_PREFETCH_COOLDOWN_SEC,
              "SSD prefetch memory-pressure backoff in seconds; 0 disables.");
 DEFINE_int64(ssd_prefetch_dedup_ttl_sec, DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC,
              "SSD prefetch per-key dedup TTL in seconds; 0 disables.");
+DEFINE_uint64(shutdown_grace_seconds, 0,
+              "On SIGTERM, SIGINT or SIGHUP, gracefully unmount all segments "
+              "for this many seconds and keep serving until the master "
+              "removes them and the default read lease has passed. 0 exits "
+              "right away.");
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
 
@@ -177,6 +182,8 @@ int main(int argc, char *argv[]) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;
     }
+
+    client_inst->set_shutdown_grace_period(FLAGS_shutdown_grace_seconds);
 
     if (client_inst->start_dummy_client_monitor()) {
         LOG(FATAL) << "Failed to start dummy client monitor thread";
