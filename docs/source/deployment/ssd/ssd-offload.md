@@ -167,8 +167,13 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_RECLAIM_INTERVAL_SECONDS` | `10` | Interval between passes that reclaim buckets of objects the master removed; `0` disables reclaim. See {ref}`Reclaim of removed objects <ssd-offload-reclaim>` |
 | `MOONCAKE_OFFLOAD_RECLAIM_CYCLE_SECONDS` | `120` | Target time for the passes to check every stored key against the master once. A lap takes longer when passes hit their time limit. |
 
-For `packed` direct bucket writes, each writing thread retains a 4096-byte-aligned buffer
-that grows to fit its largest bucket and is released when the thread exits.
+For `packed` direct bucket writes with one copy thread (the default), each writing
+thread retains eight 4 MiB 4096-byte-aligned staging slots. The bucket is copied
+into them slot by slot, and each slot is written as soon as it is filled, so the
+copy overlaps the device writes. With `MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS`
+above 1, each writing thread instead retains a 4096-byte-aligned buffer that
+grows to fit its largest bucket; it is filled by the copy threads and then
+written. Either buffer is released when the thread exits.
 Only the end of the data file is zero-padded to a 4096-byte boundary; key order,
 metadata offsets, and logical lengths keep the existing format. Data writes and
 `datasync` finish before metadata is written and the local index is committed.

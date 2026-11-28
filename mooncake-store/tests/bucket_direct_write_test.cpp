@@ -367,6 +367,24 @@ TEST_P(BucketDirectWriteTest, ConcurrentWritersKeepSeparateBuffers) {
     Verify(backend, second);
 }
 
+TEST_P(BucketDirectWriteTest, BucketLargerThanStagingSlots) {
+    // About 50 MiB, more than the 8 x 4 MiB staging slots of a single-copy
+    // packed write, so slots are refilled while earlier writes are in flight.
+    BucketStorageBackend backend(file_config_, bucket_config_);
+    ASSERT_TRUE(backend.Init());
+    auto values = MakeValues(20, 64);
+    auto batch = MakeBatch(values);
+    std::vector<std::string> keys;
+    std::vector<StorageObjectMetadata> metadata;
+    ASSERT_TRUE(backend.BatchOffload(batch, [&](const auto& k, auto& m) {
+        keys = k;
+        metadata = m;
+        return ErrorCode::OK;
+    }));
+    VerifyLayout(keys, metadata, values);
+    Verify(backend, values);
+}
+
 INSTANTIATE_TEST_SUITE_P(WriteModes, BucketDirectWriteTest,
                          ::testing::ValuesIn(WriteModes()));
 
