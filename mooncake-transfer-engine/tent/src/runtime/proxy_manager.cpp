@@ -490,7 +490,14 @@ void ProxyManager::runner(size_t id) {
             }
         }
         if (buffers_safe_to_release) {
-            task.native->staging_status.store(status.ok() ? COMPLETED : FAILED,
+            TransferStatusEnum result = COMPLETED;
+            if (!status.ok()) {
+                result = task.native->staging_cancel_requested.load(
+                             std::memory_order_acquire)
+                             ? CANCELED
+                             : FAILED;
+            }
+            task.native->staging_status.store(result,
                                               std::memory_order_release);
             impl_->notifyBatchMaybeReady(task.batch);
         }
@@ -647,6 +654,11 @@ Status ProxyManager::transferEventLoop(
         if (!running_.load(std::memory_order_acquire)) {
             buffers_safe_to_release = cleanup_inflight();
             return Status::InternalError("Proxy manager is shutting down");
+        }
+        if (task.native->staging_cancel_requested.load(
+                std::memory_order_acquire)) {
+            buffers_safe_to_release = cleanup_inflight();
+            return Status::InternalError("Staging transfer canceled");
         }
         auto id = event_queue.front();
         auto& chunk = chunks[id];
