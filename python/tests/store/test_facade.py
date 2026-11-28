@@ -34,6 +34,7 @@ def _run_python(
 
 _CPP_PUBLIC_NAMES = {
     "RangedReadSnapshot",
+    "KeyProber",
     "ObjectDataType",
     "SoftPinAction",
     "ReplicateConfig",

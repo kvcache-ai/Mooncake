@@ -9,9 +9,14 @@
 #include <nanobind/stl/vector.h>
 #include <numa.h>
 
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <unordered_set>
 
 #include "pyclient.h"
@@ -405,6 +410,189 @@ void apply_tensor_batch_results(std::vector<int> &results,
     }
     for (size_t i = 0; i < op_results.size(); ++i)
         results[original_indices[i]] = op_results[i];
+}
+
+// Store keys "<prefix>{hash}<suffix>" for prefix-cache lookups, where {hash}
+// is the lowercase hex of a block hash. Compiled once per caller, so a lookup
+// passes only raw hashes and indices, and the keys are built in C++ with the
+// GIL released instead of as one Python string per key.
+struct KeyTemplates {
+    // groups[g] holds the (prefix, suffix) of each template of group g.
+    std::vector<std::vector<std::pair<std::string, std::string>>> groups;
+    size_t hash_len = 0;
+
+    static KeyTemplates Compile(
+        const std::vector<std::vector<std::string>> &groups, size_t hash_len) {
+        static constexpr std::string_view kPlaceholder = "{hash}";
+        if (hash_len == 0) throw py::value_error("hash_len must be positive");
+        KeyTemplates out;
+        out.hash_len = hash_len;
+        out.groups.reserve(groups.size());
+        for (const auto &group : groups) {
+            auto &compiled = out.groups.emplace_back();
+            compiled.reserve(group.size());
+            for (const auto &tmpl : group) {
+                const size_t pos = tmpl.find(kPlaceholder);
+                if (pos == std::string::npos ||
+                    tmpl.find(kPlaceholder, pos + 1) != std::string::npos) {
+                    throw py::value_error(
+                        ("key template must contain {hash} exactly once: " +
+                         tmpl)
+                            .c_str());
+                }
+                compiled.emplace_back(tmpl.substr(0, pos),
+                                      tmpl.substr(pos + kPlaceholder.size()));
+            }
+        }
+        return out;
+    }
+};
+
+// One lookup's arguments, copied under the GIL so the keys can be built after
+// it is released.
+struct KeyLookup {
+    std::string hashes;
+    // Hash indices probed by each group (empty if `all_hashes`), and the
+    // number of keys each group yields.
+    bool all_hashes = false;
+    std::vector<std::vector<int64_t>> indices;
+    std::vector<size_t> group_keys;
+    size_t num_keys = 0;
+
+    static bool IsInt64Format(const char *format) {
+        if (format == nullptr) return false;
+        if (*format == '@' || *format == '=' ||
+            (*format == '<' && std::endian::native == std::endian::little)) {
+            ++format;
+        }
+        return std::strcmp(format, "q") == 0 || std::strcmp(format, "l") == 0;
+    }
+
+    // A 1-D int64 buffer (e.g. a numpy array) or any sequence of ints.
+    static std::vector<int64_t> ParseIndices(py::handle obj,
+                                             int64_t num_hashes) {
+        std::vector<int64_t> out;
+        if (PyObject_CheckBuffer(obj.ptr())) {
+            const PythonBuffer buf(obj);
+            const Py_buffer &info = buf.view();
+            if (info.ndim != 1 || info.itemsize != sizeof(int64_t) ||
+                !IsInt64Format(info.format)) {
+                throw py::value_error("indices must be 1-D int64 buffers");
+            }
+            const auto span = contiguous_buffer_span(info);
+            out.resize(span.size() / sizeof(int64_t));
+            if (!out.empty()) {
+                std::memcpy(out.data(), span.data(), span.size());
+            }
+        } else {
+            for (py::handle item : obj) out.push_back(py::cast<int64_t>(item));
+        }
+        for (const int64_t idx : out) {
+            if (idx < 0 || idx >= num_hashes) {
+                throw py::index_error("hash index out of range");
+            }
+        }
+        return out;
+    }
+
+    // Call with the GIL held; it may raise. `indices` is None (every group
+    // probes every hash) or holds one entry per group.
+    static KeyLookup FromPython(const KeyTemplates &templates,
+                                py::handle hashes, py::handle indices) {
+        KeyLookup out;
+        {
+            // The buffer view must outlive the span read from it.
+            const PythonBuffer hash_buf(hashes);
+            const auto span = contiguous_buffer_span(hash_buf.view());
+            if (span.size() % templates.hash_len != 0) {
+                throw py::value_error(
+                    "hashes length is not a multiple of hash_len");
+            }
+            out.hashes.assign(span.data(), span.size());
+        }
+        const auto num_hashes =
+            static_cast<int64_t>(out.hashes.size() / templates.hash_len);
+        const size_t num_groups = templates.groups.size();
+        if (indices.is_none()) {
+            out.all_hashes = true;
+        } else {
+            if (py::len(indices) != num_groups) {
+                throw py::value_error("indices need one entry per group");
+            }
+            out.indices.reserve(num_groups);
+            for (py::handle group : indices) {
+                out.indices.push_back(ParseIndices(group, num_hashes));
+            }
+        }
+        out.group_keys.reserve(num_groups);
+        for (size_t g = 0; g < num_groups; ++g) {
+            size_t n = 0;
+            const size_t probed = out.all_hashes
+                                      ? static_cast<size_t>(num_hashes)
+                                      : out.indices[g].size();
+            if (__builtin_mul_overflow(probed, templates.groups[g].size(),
+                                       &n) ||
+                __builtin_add_overflow(out.num_keys, n, &out.num_keys)) {
+                throw std::overflow_error("too many lookup keys");
+            }
+            out.group_keys.push_back(n);
+        }
+        return out;
+    }
+
+    // Keys ordered by group, then hash index, then template. Needs no GIL.
+    std::vector<std::string> BuildKeys(const KeyTemplates &templates) const {
+        static constexpr auto kHexPairs = [] {
+            constexpr char kHex[] = "0123456789abcdef";
+            std::array<std::array<char, 2>, 256> table{};
+            for (size_t b = 0; b < table.size(); ++b) {
+                table[b] = {kHex[b >> 4], kHex[b & 0xf]};
+            }
+            return table;
+        }();
+        // Hex every hash once; groups often share hashes.
+        std::string hex(2 * hashes.size(), '\0');
+        for (size_t i = 0; i < hashes.size(); ++i) {
+            const auto &pair = kHexPairs[static_cast<unsigned char>(hashes[i])];
+            hex[2 * i] = pair[0];
+            hex[2 * i + 1] = pair[1];
+        }
+        const size_t hex_len = 2 * templates.hash_len;
+        std::vector<std::string> keys;
+        keys.reserve(num_keys);
+        const size_t num_hashes = hashes.size() / templates.hash_len;
+        auto add = [&](size_t g, size_t idx) {
+            const std::string_view h(hex.data() + idx * hex_len, hex_len);
+            for (const auto &[prefix, suffix] : templates.groups[g]) {
+                std::string &key = keys.emplace_back();
+                key.reserve(prefix.size() + hex_len + suffix.size());
+                key.append(prefix).append(h).append(suffix);
+            }
+        };
+        for (size_t g = 0; g < templates.groups.size(); ++g) {
+            if (all_hashes) {
+                for (size_t idx = 0; idx < num_hashes; ++idx) add(g, idx);
+            } else {
+                for (const int64_t idx : indices[g]) add(g, idx);
+            }
+        }
+        return keys;
+    }
+};
+
+GrantLeasePolicy parse_lease_policy(const std::string &policy,
+                                    uint64_t candidate_size) {
+    GrantLeasePolicy lease_policy;
+    if (policy == "none") {
+        lease_policy.lease_mode = ProbeLeaseMode::None;
+    } else if (policy == "LastHitOnly") {
+        lease_policy.lease_mode = ProbeLeaseMode::LastHitOnly;
+    } else {
+        throw py::value_error(
+            ("Unknown batch_probe_key policy: " + policy).c_str());
+    }
+    lease_policy.candidate_size = candidate_size;
+    return lease_policy;
 }
 
 }  // namespace
@@ -2199,6 +2387,54 @@ class MooncakeStorePyWrapper {
     }
 };
 
+// Probes the keys of fixed templates for many block hashes in one call. Reads
+// the Store's client on every call, so it follows close() and setup().
+class KeyProberPy {
+   public:
+    KeyProberPy(MooncakeStorePyWrapper *owner, KeyTemplates templates)
+        : owner_(owner), templates_(std::move(templates)) {}
+
+    // Runs `query(client, keys)` with the GIL released and returns one bytes
+    // object per group, one signed byte per key: 1 exists, 0 missing, -1 error.
+    template <typename Query>
+    py::list Run(py::handle hashes, py::handle indices, Query &&query) const {
+        const auto lookup = KeyLookup::FromPython(templates_, hashes, indices);
+        // Hold our own reference: close() may reset store_ while the GIL is
+        // released.
+        const std::shared_ptr<PyClient> store =
+            owner_->is_client_initialized() ? owner_->store_ : nullptr;
+        std::string out;
+        {
+            py::gil_scoped_release release;
+            out.assign(lookup.num_keys, static_cast<char>(-1));
+            if (store && lookup.num_keys > 0) {
+                // Scoped inside `release`: the keys are freed before the GIL
+                // is taken back.
+                const auto keys = lookup.BuildKeys(templates_);
+                const std::vector<int> results = query(*store, keys);
+                for (size_t i = 0; i < std::min(results.size(), out.size());
+                     ++i) {
+                    out[i] = static_cast<char>(results[i] < 0 ? -1
+                                               : results[i]   ? 1
+                                                              : 0);
+                }
+            }
+        }
+        py::list per_group;
+        size_t pos = 0;
+        for (const size_t n : lookup.group_keys) {
+            per_group.append(py::bytes(out.data() + pos, n));
+            pos += n;
+        }
+        return per_group;
+    }
+
+   private:
+    // Kept alive by the Python prober object (keep_alive in the binding).
+    MooncakeStorePyWrapper *owner_;
+    KeyTemplates templates_;
+};
+
 class MooncakeHostMemAllocatorPyWrapper {
    public:
     // Only support ShmHelper for now
@@ -2589,6 +2825,47 @@ NB_MODULE(_store, m) {
                  return self.register_->set_unregister_by_endpoint(
                      nqn, nsid, traddr, trsvcid, master_server_addr);
              });
+    py::class_<KeyProberPy>(
+        m, "KeyProber",
+        "Existence checks for keys built from fixed templates and block "
+        "hashes, without the GIL. Create with "
+        "MooncakeDistributedStore.create_key_prober().")
+        .def(
+            "is_exist",
+            [](const KeyProberPy &self, py::handle hashes, py::handle indices,
+               const ExistOptions &options) {
+                return self.Run(
+                    hashes, indices,
+                    [&](PyClient &store, const std::vector<std::string> &keys) {
+                        return store.batchIsExist(keys, options);
+                    });
+            },
+            py::arg("hashes"), py::arg("indices") = py::none(),
+            py::arg("options") = ExistOptions{},
+            "batch_is_exist over the keys of every template of group g and "
+            "every hash at indices[g]. `hashes` is a buffer of hash_len-byte "
+            "hashes; `indices` holds one int64 array (or int sequence) per "
+            "group, or is None to probe every hash in every group. Returns "
+            "one bytes object per group, one byte per key in (hash index, "
+            "template) order: 1 exists, 0 missing, -1 error.")
+        .def(
+            "probe",
+            [](const KeyProberPy &self, py::handle hashes, py::handle indices,
+               const std::string &policy, uint64_t candidate_size) {
+                const auto lease_policy =
+                    parse_lease_policy(policy, candidate_size);
+                return self.Run(
+                    hashes, indices,
+                    [&](PyClient &store, const std::vector<std::string> &keys) {
+                        return store.batchProbeKey(keys, lease_policy);
+                    });
+            },
+            py::arg("hashes"), py::arg("indices") = py::none(),
+            py::arg("policy") = "none", py::arg("candidate_size") = 1,
+            "batch_probe_key over the same keys and results as is_exist(). "
+            "LastHitOnly candidates are runs of candidate_size keys across "
+            "all groups, in result order.");
+
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
@@ -2867,16 +3144,8 @@ NB_MODULE(_store, m) {
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys, const std::string &policy,
                uint64_t candidate_size) {
-                GrantLeasePolicy lease_policy;
-                if (policy == "none") {
-                    lease_policy.lease_mode = ProbeLeaseMode::None;
-                } else if (policy == "LastHitOnly") {
-                    lease_policy.lease_mode = ProbeLeaseMode::LastHitOnly;
-                } else {
-                    throw py::value_error(
-                        ("Unknown batch_probe_key policy: " + policy).c_str());
-                }
-                lease_policy.candidate_size = candidate_size;
+                const auto lease_policy =
+                    parse_lease_policy(policy, candidate_size);
                 if (!self.is_client_initialized()) {
                     return std::vector<int>(
                         keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
@@ -2890,6 +3159,18 @@ NB_MODULE(_store, m) {
             "negative values on error. none grants no leases. LastHitOnly "
             "leases the last all-1 group of candidate_size results; failed "
             "candidates may retain partial leases after a concurrent eviction.")
+        .def(
+            "create_key_prober",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::vector<std::string>> &groups,
+               size_t hash_len) {
+                return KeyProberPy(&self,
+                                   KeyTemplates::Compile(groups, hash_len));
+            },
+            py::arg("groups"), py::arg("hash_len"), py::keep_alive<0, 1>(),
+            "Prepare a KeyProber for keys built from block hashes. "
+            "groups[g] lists key templates, each with one \"{hash}\" "
+            "placeholder for the lowercase hex of a hash_len-byte hash.")
         .def(
             "close",
             [](MooncakeStorePyWrapper &self) {

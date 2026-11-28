@@ -1806,6 +1806,57 @@ compatibility. `is_exist()`, `batch_is_exist()`, and `probe_key()` are unchanged
 
 ---
 
+#### create_key_prober()
+Prepare existence checks for keys built from block hashes, such as the
+per-block keys of a prefix-cache lookup. The keys are built in C++ with the
+GIL released, so a lookup of tens of thousands of keys does not create one
+Python string per key or hold the caller's GIL while doing so.
+
+```python
+def create_key_prober(self, groups: List[List[str]], hash_len: int) -> KeyProber
+```
+
+**Parameters:**
+- `groups` (List[List[str]]): Key templates per group. Each template contains
+  `{hash}` exactly once; it is replaced by the lowercase hex of a hash.
+- `hash_len` (int): Length in bytes of each hash.
+
+The prober reads the Store's client on each call: after `close()` its calls
+return -1 for every key.
+
+#### KeyProber.is_exist() / KeyProber.probe()
+
+```python
+def is_exist(self, hashes, indices=None, options=ExistOptions()) -> List[bytes]
+def probe(self, hashes, indices=None, policy="none", candidate_size=1) -> List[bytes]
+```
+
+**Parameters:**
+- `hashes` (buffer): `hash_len`-byte hashes back to back (e.g. `bytes`).
+- `indices` (optional): one 1-D int64 array or sequence of ints per group,
+  the hashes the group probes. `None` probes every hash in every group.
+- `options`: as for `batch_is_exist()`.
+- `policy`, `candidate_size`: as for `batch_probe_key()`, applied to all keys
+  in result order.
+
+**Returns:** one `bytes` object per group, one signed byte per key ordered by
+hash index, then template: 1=exists, 0=missing, -1=error. `is_exist()` has
+the semantics of `batch_is_exist()` and `probe()` those of `batch_probe_key()`.
+
+**Example:**
+```python
+prober = store.create_key_prober(
+    groups=[["model@g0@tp0@{hash}", "model@g0@tp1@{hash}"],
+            ["{hash}_0_k", "{hash}_0_v"]],
+    hash_len=32,
+)
+hashes = b"".join(block_hashes)
+g0, g1 = prober.is_exist(hashes, indices=[np.arange(8), np.array([6, 7])])
+g0 = np.frombuffer(g0, dtype=np.int8).reshape(-1, 2)  # one row per hash
+```
+
+---
+
 #### get_size()
 Get the size of a stored object in bytes.
 
