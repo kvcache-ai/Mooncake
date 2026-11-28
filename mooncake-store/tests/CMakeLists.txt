@@ -67,6 +67,14 @@ if(USE_MLU)
     add_test(NAME ${mlu_test} COMMAND ${mlu_test})
   endforeach()
 endif()
+if(USE_TPU)
+  # Runs against TENT's mock PJRT adapter, so it needs no TPU hardware.
+  add_store_test(tpu_store_test tpu_store_test.cpp)
+  add_dependencies(tpu_store_test mock_tpu_pjrt)
+  target_link_libraries(tpu_store_test PRIVATE ${CMAKE_DL_LIBS})
+  target_compile_definitions(
+    tpu_store_test PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
+endif()
 add_store_test(real_client_shutdown_test real_client_shutdown_test.cpp)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT BUILD_SHARED_LIBS)
   target_compile_definitions(real_client_shutdown_test

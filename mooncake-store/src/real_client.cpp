@@ -5001,6 +5001,17 @@ bool RealClient::can_use_direct_memory_read(const Replica::Descriptor &replica,
     if (replica_protocol == "nvlink") {
         return true;
     }
+#ifdef USE_TPU
+    // TENT stages TPU memory through its own host buffers, in chunks, whatever
+    // the replica's protocol, so it takes a TPU destination as it is. The
+    // classic engine cannot address TPU memory and keeps the staging copy.
+    const auto *device = device::GetAcceleratorRegistry()
+                             .RuntimeAccelerators()
+                             .FindDeviceForPointer(buffer);
+    if (device && device->Vendor() == device::AcceleratorVendor::kTpu) {
+        return client_ && client_->IsUsingTent();
+    }
+#endif
     if (replica_protocol != "rdma") {
         return false;
     }
