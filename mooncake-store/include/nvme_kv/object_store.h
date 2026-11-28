@@ -23,6 +23,7 @@ struct NvmeKvObjectKey {
 struct NvmeKvReadRoot {
     NvmeKvObjectHeader header{};
     NvmeKvStoredIdentityView identity;
+    uint32_t chunk_slot = 0;
     std::string blob;
     std::vector<NvmeKvManifestChunkRecord> chunks;
 
@@ -53,13 +54,17 @@ tl::expected<void, ErrorCode> ValidateNvmeKvReadRoot(
 struct NvmeKvPutResult {
     bool stored = false;
     bool inserted = false;
+    // Newly retained chunk bytes and the size of the published inline payload.
+    int64_t new_chunk_bytes = 0;
+    uint32_t inline_bytes = 0;
 };
 
 struct NvmeKvWriteAttempt {
     std::string payload_storage;
     std::string_view payload;
     std::optional<NvmeKvWritePlan> write_plan;
-    std::vector<NvmeKvPhysicalKey> written_chunk_keys;
+    std::vector<size_t> written_chunks;
+    int64_t retained_chunk_bytes = 0;
     bool root_written = false;
     ErrorCode error = ErrorCode::OK;
 };
@@ -140,6 +145,8 @@ class NvmeKvObjectStore final {
 
         tl::expected<PutResult, ErrorCode> result =
             tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        // A failed write can leave newly staged chunks live or ambiguous.
+        int64_t retained_on_failure = 0;
     };
 
     struct GetRequest {

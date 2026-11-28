@@ -72,6 +72,12 @@ class NvmeKvStorageBackendTest : public ::testing::Test {
         fs::remove_all(data_path_, ec);
     }
 
+    static tl::expected<int64_t, ErrorCode> Offload(
+        NvmeKvStorageBackend &backend, const std::string &key, size_t size) {
+        std::string value(size, 'v');
+        return backend.BatchOffload({{key, {{value.data(), size}}}}, nullptr);
+    }
+
     std::string data_path_;
 };
 
@@ -309,6 +315,91 @@ TEST_F(NvmeKvStorageBackendTest, PipelinedStubRoundTripChunkedObjects) {
     EXPECT_EQ(loaded_values, values);
 }
 
+TEST_F(NvmeKvStorageBackendTest, RepeatedInlineRewritesReturnQuotaOnShrink) {
+    EnvVarGuard driver("MOONCAKE_NVME_KV_DRIVER", "stub");
+    EnvVarGuard limit("MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT", "65536");
+    FileStorageConfig config;
+    config.storage_filepath = data_path_;
+    config.total_size_limit = 8 * 1024;
+    config.total_keys_limit = 2;
+    NvmeKvStorageBackend backend(config);
+    ASSERT_TRUE(backend.Init());
+    ASSERT_EQ(Offload(backend, "rewrite", 4096).value_or(0), 1);
+    for (int i = 0; i < 8; ++i) {
+        ASSERT_EQ(Offload(backend, "rewrite", 1024).value_or(0), 1) << i;
+        ASSERT_EQ(Offload(backend, "rewrite", 4096).value_or(0), 1) << i;
+    }
+    const auto over_limit = Offload(backend, "new", 4097);
+    ASSERT_FALSE(over_limit);
+    EXPECT_EQ(over_limit.error(), ErrorCode::KEYS_ULTRA_LIMIT);
+    EXPECT_EQ(Offload(backend, "new", 4096).value_or(0), 1);
+    EXPECT_EQ(Offload(backend, "rewrite", 1024).value_or(0), 1);
+}
+
+TEST_F(NvmeKvStorageBackendTest, BatchDoesNotSpendAnUnpublishedShrink) {
+    EnvVarGuard driver("MOONCAKE_NVME_KV_DRIVER", "stub");
+    EnvVarGuard limit("MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT", "65536");
+    FileStorageConfig config;
+    config.storage_filepath = data_path_;
+    config.total_size_limit = 8192;
+    NvmeKvStorageBackend backend(config);
+    ASSERT_TRUE(backend.Init());
+    ASSERT_EQ(Offload(backend, "large", 6144).value_or(0), 1);
+    ASSERT_EQ(Offload(backend, "small", 1024).value_or(0), 1);
+
+    std::string small(1024, 's'), large(4096, 'l');
+    const auto batch =
+        backend.BatchOffload({{"large", {{small.data(), small.size()}}},
+                              {"small", {{large.data(), large.size()}}}},
+                             nullptr);
+    ASSERT_FALSE(batch);
+    EXPECT_EQ(batch.error(), ErrorCode::KEYS_ULTRA_LIMIT);
+    ASSERT_EQ(Offload(backend, "large", small.size()).value_or(0), 1);
+    EXPECT_EQ(Offload(backend, "small", large.size()).value_or(0), 1);
+}
+
+TEST_F(NvmeKvStorageBackendTest, ShrinkingReopenedRootPreservesOtherKeysQuota) {
+    EnvVarGuard driver("MOONCAKE_NVME_KV_DRIVER", "stub");
+    EnvVarGuard limit("MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT", "65536");
+    FileStorageConfig config;
+    config.storage_filepath = data_path_;
+    config.total_size_limit = 8 * 1024;
+    {
+        NvmeKvStorageBackend writer(config);
+        ASSERT_TRUE(writer.Init());
+        ASSERT_EQ(Offload(writer, "existing", 4096).value_or(0), 1);
+    }
+    NvmeKvStorageBackend reopened(config);
+    ASSERT_TRUE(reopened.Init());
+    ASSERT_EQ(Offload(reopened, "other", 4096).value_or(0), 1);
+    ASSERT_EQ(Offload(reopened, "existing", 1024).value_or(0), 1);
+    const auto over_limit = Offload(reopened, "new", 3073);
+    ASSERT_FALSE(over_limit);
+    EXPECT_EQ(over_limit.error(), ErrorCode::KEYS_ULTRA_LIMIT);
+    EXPECT_EQ(Offload(reopened, "new", 3072).value_or(0), 1);
+}
+
+TEST_F(NvmeKvStorageBackendTest, ReusingRetainedChunksOnlyChargesNewPayload) {
+    EnvVarGuard driver("MOONCAKE_NVME_KV_DRIVER", "stub");
+    EnvVarGuard limit("MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT", "4096");
+    FileStorageConfig config;
+    config.storage_filepath = data_path_;
+    config.total_size_limit = 20 * 1024;
+    NvmeKvStorageBackend backend(config);
+    ASSERT_TRUE(backend.Init());
+
+    ASSERT_EQ(Offload(backend, "rewrite", 1024).value_or(0), 1);
+    ASSERT_EQ(Offload(backend, "rewrite", 9000).value_or(0), 1);
+    ASSERT_EQ(Offload(backend, "rewrite", 2048).value_or(0), 1);
+    ASSERT_EQ(Offload(backend, "rewrite", 9000).value_or(0), 1);
+    const auto too_large =
+        Offload(backend, "new", config.total_size_limit - 9000 + 1);
+    ASSERT_FALSE(too_large);
+    EXPECT_EQ(too_large.error(), ErrorCode::KEYS_ULTRA_LIMIT);
+    EXPECT_EQ(
+        Offload(backend, "new", config.total_size_limit - 9000).value_or(0), 1);
+}
+
 TEST_F(NvmeKvStorageBackendTest, ManifestCacheUpdatesAfterSameKeyRewrite) {
     EnvVarGuard driver_guard("MOONCAKE_NVME_KV_DRIVER", "stub");
     EnvVarGuard runtime_limit_guard("MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT",
@@ -321,6 +412,8 @@ TEST_F(NvmeKvStorageBackendTest, ManifestCacheUpdatesAfterSameKeyRewrite) {
     NvmeKvStorageBackend backend(config);
     ASSERT_TRUE(backend.Init().has_value());
 
+    NvmeKvStorageBackend reader(config);
+    ASSERT_TRUE(reader.Init().has_value());
     const std::string key = "nvme_kv_manifest_cache_rewrite";
     std::string first_value(192 * 1024, 'x');
     std::string second_value(first_value.size(), 'y');
@@ -343,10 +436,15 @@ TEST_F(NvmeKvStorageBackendTest, ManifestCacheUpdatesAfterSameKeyRewrite) {
         {key, Slice{loaded.data(), loaded.size()}}};
     ASSERT_TRUE(backend.BatchLoad(load_batch).has_value());
     EXPECT_EQ(loaded, first_value);
+    ASSERT_TRUE(reader.BatchLoad(load_batch).has_value());
+    EXPECT_EQ(loaded, first_value);
 
     store_value(second_value);
     std::fill(loaded.begin(), loaded.end(), '\0');
     ASSERT_TRUE(backend.BatchLoad(load_batch).has_value());
+    EXPECT_EQ(loaded, second_value);
+    std::fill(loaded.begin(), loaded.end(), '\0');
+    ASSERT_TRUE(reader.BatchLoad(load_batch).has_value());
     EXPECT_EQ(loaded, second_value);
 }
 

@@ -28,8 +28,10 @@ class NvmeKvConnector {
 
     tl::expected<void, ErrorCode> Init();
     tl::expected<void, ErrorCode> Init(const NvmeKvConnectorConfig &config);
-    tl::expected<void, ErrorCode> Store(const PhysicalKey &key,
-                                        std::string value);
+    tl::expected<void, ErrorCode> Store(
+        const PhysicalKey &key, std::string value,
+        NvmeKvCommandExecutor::StoreMode mode =
+            NvmeKvCommandExecutor::StoreMode::kInsert);
     void StoreBatch(std::vector<NvmeKvCommandExecutor::StoreRequest> &requests);
     tl::expected<std::string, ErrorCode> Retrieve(const PhysicalKey &key,
                                                   uint32_t size_hint = 0) const;

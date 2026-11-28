@@ -1,12 +1,15 @@
 #include "nvme_kv/executor.h"
 #include "nvme_kv/executor_util.h"
 
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <system_error>
 #include <utility>
 
-#include "mutex.h"
+#include <unistd.h>
 
 namespace mooncake {
 namespace {
@@ -21,39 +24,45 @@ class NvmeKvStubExecutor : public NvmeKvCommandExecutor {
                                   128 * 1024))) {}
 
     tl::expected<void, ErrorCode> Store(const PhysicalKey &key,
-                                        std::string value) override {
+                                        std::string value,
+                                        StoreMode mode) override {
         const auto blob_path = BlobPath(key);
-        {
-            SharedMutexLocker lock(&mutex_, shared_lock);
-            if (objects_.find(key) != objects_.end()) {
-                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-            }
+        if (mode == StoreMode::kUpdate && !std::filesystem::exists(blob_path)) {
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
-        if (std::filesystem::exists(blob_path)) {
-            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-        }
-        std::ofstream out(blob_path, std::ios::binary | std::ios::trunc);
-        if (!out) {
+        std::string pending = blob_path.string() + ".XXXXXX";
+        const int fd = ::mkstemp(pending.data());
+        if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        auto *file = ::fdopen(fd, "wb");
+        if (!file) {
+            ::close(fd);
+            ::unlink(pending.c_str());
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-        out.write(value.data(), static_cast<std::streamsize>(value.size()));
-        if (!out.good()) {
+        const bool written =
+            std::fwrite(value.data(), 1, value.size(), file) == value.size();
+        const bool closed = std::fclose(file) == 0;
+        if (!written || !closed) {
+            ::unlink(pending.c_str());
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-        SharedMutexLocker lock(&mutex_);
-        objects_[key] = std::move(value);
+        // Publish complete files: link is insert-only, rename replaces a root.
+        const int status = mode == StoreMode::kInsert
+                               ? ::link(pending.c_str(), blob_path.c_str())
+                               : ::rename(pending.c_str(), blob_path.c_str());
+        const int error = errno;
+        if (mode == StoreMode::kInsert || status != 0)
+            ::unlink(pending.c_str());
+        if (status != 0) {
+            return tl::make_unexpected(error == EEXIST
+                                           ? ErrorCode::OBJECT_ALREADY_EXISTS
+                                           : ErrorCode::FILE_WRITE_FAIL);
+        }
         return {};
     }
 
     tl::expected<std::string, ErrorCode> Retrieve(
         const PhysicalKey &key, uint32_t /*size_hint*/ = 0) const override {
-        {
-            SharedMutexLocker lock(&mutex_, shared_lock);
-            auto it = objects_.find(key);
-            if (it != objects_.end()) {
-                return it->second;
-            }
-        }
         const auto blob_path = BlobPath(key);
         std::ifstream in(blob_path, std::ios::binary);
         if (!in) {
@@ -64,19 +73,11 @@ class NvmeKvStubExecutor : public NvmeKvCommandExecutor {
         if (!in.good() && !in.eof()) {
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
-        {
-            SharedMutexLocker lock(&mutex_);
-            objects_[key] = value;
-        }
         return value;
     }
 
     tl::expected<void, ErrorCode> Delete(const PhysicalKey &key) override {
         const auto blob_path = BlobPath(key);
-        {
-            SharedMutexLocker lock(&mutex_);
-            objects_.erase(key);
-        }
         std::error_code ec;
         const bool removed = std::filesystem::remove(blob_path, ec);
         if (ec) {
@@ -93,24 +94,11 @@ class NvmeKvStubExecutor : public NvmeKvCommandExecutor {
     }
 
    private:
-    struct PhysicalKeyHash {
-        size_t operator()(const PhysicalKey &key) const {
-            size_t seed = 0;
-            for (uint8_t b : key) {
-                seed = (seed * 131) ^ b;
-            }
-            return seed;
-        }
-    };
-
     std::filesystem::path BlobPath(const PhysicalKey &key) const {
         return storage_path_ / (NvmeKvPhysicalKeyToHex(key) + ".blob");
     }
 
     std::filesystem::path storage_path_;
-    mutable SharedMutex mutex_;
-    mutable std::unordered_map<PhysicalKey, std::string, PhysicalKeyHash>
-        objects_ GUARDED_BY(mutex_);
     Capabilities capabilities_;
 };
 

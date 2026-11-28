@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 
 #include "nvme_kv/object_store.h"
 #include "storage_backend.h"
@@ -40,8 +42,11 @@ class NvmeKvStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> InitDevice();
     std::atomic<bool> initialized_{false};
     std::unique_ptr<NvmeKvObjectStore> object_store_;
-    std::atomic<int64_t> total_size_{0};
-    std::atomic<int64_t> total_keys_{0};
+    std::mutex quota_mutex_;
+    // Quotas start empty on open. Only credit inline bytes charged by this
+    // instance, even when an older root is already present on the device.
+    std::unordered_map<std::string, uint32_t> charged_inline_bytes_;
+    int64_t total_size_ = 0;
 };
 
 }  // namespace mooncake
