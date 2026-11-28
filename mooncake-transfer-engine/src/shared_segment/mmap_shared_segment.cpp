@@ -92,15 +92,13 @@ class MmapSharedSegmentBackend : public SharedSegmentBackend {
         return host_memfd::Granularity();
     }
 
-    Status CreateOwner(uint64_t size, const SharedSegmentOptions& options,
-                       uintptr_t& base_addr,
-                       std::vector<uint8_t>& handle) override;
+    Status Prepare(uint64_t total_size, const OwnerChunk* local_chunk,
+                   const SharedSegmentOptions& options, uintptr_t& base_addr,
+                   std::vector<uint8_t>& handle) override;
 
-    Status ReserveLocal(uint64_t size, const SharedSegmentOptions& options,
-                        uintptr_t& base_addr) override;
-
-    Status ImportAndMap(uint64_t size, const SharedSegmentOptions& options,
-                        const std::vector<uint8_t>& handle) override;
+    Status CompleteMapping(const std::vector<OwnerChunk>& chunks,
+                           const std::vector<std::vector<uint8_t>>& handles,
+                           const SharedSegmentOptions& options) override;
 
     uint16_t BackendId() const override { return kMmapBackendId; }
 
@@ -133,77 +131,85 @@ Status MmapSharedSegmentBackend::RegisterMapped(
     return Status::OK();
 }
 
-Status MmapSharedSegmentBackend::CreateOwner(
-    uint64_t size, const SharedSegmentOptions& options, uintptr_t& base_addr,
+Status MmapSharedSegmentBackend::Prepare(
+    uint64_t total_size, const OwnerChunk* local_chunk,
+    const SharedSegmentOptions& /*options*/, uintptr_t& base_addr,
     std::vector<uint8_t>& handle) {
-    int fd = -1;
-    void* mapped = nullptr;
-    std::string error;
-    if (!host_memfd::Create(size, fd, mapped, error)) {
-        return Status::Memory(error);
-    }
-    LOG(INFO) << "Shared segment mmap: unnamed memfd + THP hint (no HugeTLB), "
-              << "size " << size << ", shmem_thp="
-              << (host_memfd::ShmemThpEnabled() ? "on" : "off");
-
-    addr_ = mapped;
-    size_ = size;
-    memfd_ = fd;
-    auto status = RegisterMapped(options);
-    if (!status.ok()) {
-        return status;
-    }
-    base_addr = reinterpret_cast<uintptr_t>(addr_);
-    const std::string name = host_memfd::ExportHandle(memfd_);
-    handle.assign(name.begin(), name.end());
-    return Status::OK();
-}
-
-Status MmapSharedSegmentBackend::ReserveLocal(
-    uint64_t size, const SharedSegmentOptions& /*options*/,
-    uintptr_t& base_addr) {
     void* reserved =
-        host_memfd::ReserveAlignedWindow(size, host_memfd::Granularity());
+        host_memfd::ReserveAlignedWindow(total_size, host_memfd::Granularity());
     if (reserved == MAP_FAILED) {
-        return Status::Memory(std::string("mmap reserve failed: ") +
-                              std::strerror(errno));
+        return Status::Memory("Shared segment mmap reserve failed: " +
+                              std::string(std::strerror(errno)));
     }
     addr_ = reserved;
-    size_ = size;
+    size_ = total_size;
     base_addr = reinterpret_cast<uintptr_t>(addr_);
+
+    if (local_chunk != nullptr) {
+        if (local_chunk->offset > size_ ||
+            local_chunk->size > size_ - local_chunk->offset) {
+            return Status::InvalidArgument(
+                "Shared segment local owner chunk exceeds reserved window");
+        }
+        int fd = -1;
+        std::string error;
+        void* chunk_addr = static_cast<uint8_t*>(addr_) + local_chunk->offset;
+        if (!host_memfd::CreateAt(local_chunk->size, chunk_addr, fd, error)) {
+            return Status::Memory(error);
+        }
+        memfd_ = fd;
+        LOG(INFO) << "Shared segment mmap: unnamed memfd + THP hint "
+                     "(no HugeTLB), base 0x"
+                  << std::hex << base_addr << " offset 0x"
+                  << local_chunk->offset << std::dec << ", chunk "
+                  << local_chunk->size << " / total " << total_size
+                  << ", shmem_thp="
+                  << (host_memfd::ShmemThpEnabled() ? "on" : "off");
+        const std::string name = host_memfd::ExportHandle(memfd_);
+        handle.assign(name.begin(), name.end());
+    }
     return Status::OK();
 }
 
-Status MmapSharedSegmentBackend::ImportAndMap(
-    uint64_t size, const SharedSegmentOptions& options,
-    const std::vector<uint8_t>& handle) {
+Status MmapSharedSegmentBackend::CompleteMapping(
+    const std::vector<OwnerChunk>& chunks,
+    const std::vector<std::vector<uint8_t>>& handles,
+    const SharedSegmentOptions& options) {
     if (addr_ == nullptr || size_ == 0) {
         return Status::InvalidArgument(
             "Shared segment import needs a reserved address window");
     }
-    if (size != size_) {
+    if (chunks.size() != handles.size()) {
         return Status::InvalidArgument(
-            "Shared segment import size does not match the reservation");
+            "Shared segment owner chunk and handle count mismatch");
     }
-    if (handle.empty() || handle.size() > kMaxHandleBytes) {
-        return Status::InvalidArgument(
-            "Shared segment owner handle has an unexpected length");
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        const auto& chunk = chunks[i];
+        if (chunk.offset > size_ || chunk.size > size_ - chunk.offset) {
+            return Status::InvalidArgument(
+                "Shared segment owner chunk exceeds reserved window");
+        }
+        if (chunk.owner_rank == options.rank_id) {
+            continue;
+        }
+        const auto& handle = handles[i];
+        if (handle.empty() || handle.size() > kMaxHandleBytes) {
+            return Status::InvalidArgument(
+                "Shared segment owner handle has an unexpected length");
+        }
+        const std::string name(handle.begin(), handle.end());
+        if (!host_memfd::IsHandle(name)) {
+            return Status::InvalidArgument(
+                "Shared segment owner handle is not a memfd /proc/<pid>/fd "
+                "path");
+        }
+        void* chunk_addr = static_cast<uint8_t*>(addr_) + chunk.offset;
+        std::string error;
+        if (!host_memfd::Import(name, chunk.size, chunk_addr, error)) {
+            return Status::Memory("Shared segment import failed: " + error);
+        }
     }
-    const std::string name(handle.begin(), handle.end());
-    if (!host_memfd::IsHandle(name)) {
-        return Status::InvalidArgument(
-            "Shared segment owner handle is not a memfd /proc/<pid>/fd path");
-    }
-
-    std::string error;
-    if (!host_memfd::Import(name, size, addr_, error)) {
-        return Status::Memory("Shared segment import failed: " + error);
-    }
-    auto status = RegisterMapped(options);
-    if (!status.ok()) {
-        return status;
-    }
-    return Status::OK();
+    return RegisterMapped(options);
 }
 
 void MmapSharedSegmentBackend::Release() {

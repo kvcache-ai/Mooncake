@@ -14,14 +14,17 @@
 
 #include "shared_segment_py.h"
 
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
+#include <optional>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace py = nanobind;
 
@@ -40,11 +43,14 @@ void ThrowIfError(const Status& status) {
 std::pair<std::shared_ptr<SharedSegment>, py::bytes> SegmentCreate(
     const std::string& name, uint64_t size, uint32_t world_size,
     uint32_t rank_id, uint32_t owner_rank, int32_t device_id, bool mmap,
-    bool host_register) {
+    bool host_register, std::optional<std::vector<uint32_t>> owner_ranks) {
     SharedSegmentOptions options;
     options.world_size = world_size;
     options.rank_id = rank_id;
     options.owner_rank = owner_rank;
+    if (owner_ranks.has_value()) {
+        options.owner_ranks = std::move(*owner_ranks);
+    }
     options.device_id = device_id;
     options.mmap = mmap;
     options.host_register = host_register;
@@ -88,6 +94,7 @@ void bind_shared_segment(py::module_& m) {
                     py::arg("world_size"), py::arg("rank_id"),
                     py::arg("owner_rank") = 0, py::arg("device_id") = 0,
                     py::arg("mmap") = true, py::arg("host_register") = false,
+                    py::arg("owner_ranks").none() = py::none(),
                     "Phase one; returns (segment, blob).")
         .def_static("supported", &SharedSegment::Supported,
                     py::arg("mmap") = true, py::arg("host_register") = false,
@@ -97,7 +104,8 @@ void bind_shared_segment(py::module_& m) {
         .def("ready", &SharedSegment::ready)
         .def("base_addr", &SharedSegment::base_addr)
         .def("device_addr", &SharedSegment::device_addr)
-        .def("size", &SharedSegment::size);
+        .def("size", &SharedSegment::size)
+        .def("owner_ranks", &SharedSegment::owner_ranks);
 }
 
 }  // namespace mooncake

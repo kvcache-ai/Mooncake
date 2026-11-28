@@ -16,6 +16,8 @@
 
 #include <cstring>
 #include <glog/logging.h>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "shared_segment_internal.h"
 
@@ -62,15 +64,33 @@ uint64_t HashValue(uint64_t seed, uint64_t value) {
     return HashBytes(seed, &value, sizeof(value));
 }
 
-Status ValidateOptions(const SharedSegmentOptions& options) {
+Status ValidateOptions(const SharedSegmentOptions& options,
+                       const std::vector<uint32_t>& owner_ranks) {
     if (options.world_size == 0) {
         return Status::InvalidArgument(
             "Shared segment world_size must not be zero");
     }
-    if (options.rank_id >= options.world_size ||
-        options.owner_rank >= options.world_size) {
+    if (options.rank_id >= options.world_size) {
         return Status::InvalidArgument(
-            "Shared segment rank_id and owner_rank must be below world_size");
+            "Shared segment rank_id must be below world_size");
+    }
+    if (owner_ranks.empty()) {
+        return Status::InvalidArgument(
+            "Shared segment owner_ranks must not be empty");
+    }
+    std::unordered_set<uint32_t> seen;
+    seen.reserve(owner_ranks.size());
+    for (uint32_t owner : owner_ranks) {
+        if (owner >= options.world_size) {
+            return Status::InvalidArgument("Shared segment owner rank " +
+                                           std::to_string(owner) +
+                                           " must be below world_size");
+        }
+        if (!seen.insert(owner).second) {
+            return Status::InvalidArgument(
+                "Shared segment owner_ranks contains duplicate rank " +
+                std::to_string(owner));
+        }
     }
     if (options.host_register && !options.mmap) {
         return Status::InvalidArgument(
@@ -108,16 +128,24 @@ Status CheckPeerBlob(uint32_t rank, uint16_t backend_id, uint64_t fingerprint,
     return Status::OK();
 }
 
-Status ExtractOwnerHandle(const SharedSegmentOptions& options,
-                          uint16_t backend_id, uint64_t fingerprint,
-                          uint64_t alloc_size,
-                          const std::vector<std::string>& blobs,
-                          std::vector<uint8_t>& owner_handle) {
+Status ExtractOwnerHandles(const SharedSegmentOptions& options,
+                           const std::vector<uint32_t>& owner_ranks,
+                           uint16_t backend_id, uint64_t fingerprint,
+                           uint64_t alloc_size,
+                           const std::vector<std::string>& blobs,
+                           std::vector<std::vector<uint8_t>>& owner_handles) {
     if (blobs.size() != options.world_size) {
         return Status::InvalidArgument(
             "Shared segment expects one blob per rank, got " +
             std::to_string(blobs.size()));
     }
+    std::unordered_map<uint32_t, size_t> rank_to_owner_index;
+    rank_to_owner_index.reserve(owner_ranks.size());
+    for (size_t i = 0; i < owner_ranks.size(); ++i) {
+        rank_to_owner_index[owner_ranks[i]] = i;
+    }
+
+    owner_handles.assign(owner_ranks.size(), {});
     for (uint32_t rank = 0; rank < blobs.size(); ++rank) {
         SegmentBlobHeader header{};
         std::vector<uint8_t> handle;
@@ -126,13 +154,19 @@ Status ExtractOwnerHandle(const SharedSegmentOptions& options,
         if (!status.ok()) {
             return status;
         }
-        if (rank == options.owner_rank) {
-            owner_handle = std::move(handle);
+        const auto it = rank_to_owner_index.find(rank);
+        if (it != rank_to_owner_index.end()) {
+            if (handle.empty()) {
+                return Status::InvalidArgument("Shared segment owner rank " +
+                                               std::to_string(rank) +
+                                               " did not export a handle");
+            }
+            owner_handles[it->second] = std::move(handle);
+        } else if (!handle.empty()) {
+            return Status::InvalidArgument("Shared segment non-owner rank " +
+                                           std::to_string(rank) +
+                                           " unexpectedly exported a handle");
         }
-    }
-    if (owner_handle.empty()) {
-        return Status::InvalidArgument(
-            "Shared segment owner rank did not export a handle");
     }
     return Status::OK();
 }
@@ -142,12 +176,45 @@ uint64_t AlignUp(uint64_t value, uint64_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
 
+std::vector<uint32_t> ResolveOwnerRanks(const SharedSegmentOptions& options) {
+    if (!options.owner_ranks.empty()) {
+        return options.owner_ranks;
+    }
+    return {options.owner_rank};
+}
+
+std::vector<OwnerChunk> ComputeOwnerChunks(
+    uint64_t size, uint64_t granularity,
+    const std::vector<uint32_t>& owner_ranks, uint64_t& total_alloc_size) {
+    std::vector<OwnerChunk> chunks;
+    chunks.reserve(owner_ranks.size());
+    uint64_t total_granules = AlignUp(size, granularity) / granularity;
+    if (total_granules < owner_ranks.size()) {
+        total_granules = owner_ranks.size();
+    }
+    const uint64_t base_granules = total_granules / owner_ranks.size();
+    const uint64_t extra_granules = total_granules % owner_ranks.size();
+    uint64_t offset = 0;
+    for (size_t i = 0; i < owner_ranks.size(); ++i) {
+        const uint64_t granules = base_granules + (i < extra_granules ? 1 : 0);
+        const uint64_t chunk_size = granules * granularity;
+        chunks.push_back(OwnerChunk{owner_ranks[i], offset, chunk_size});
+        offset += chunk_size;
+    }
+    total_alloc_size = offset;
+    return chunks;
+}
+
 uint64_t ComputeSegmentFingerprint(const std::string& name, uint64_t size,
                                    const SharedSegmentOptions& options) {
+    const auto owners = ResolveOwnerRanks(options);
     uint64_t hash = HashBytes(kFnvOffsetBasis, name.data(), name.size());
     hash = HashValue(hash, size);
     hash = HashValue(hash, options.world_size);
-    hash = HashValue(hash, options.owner_rank);
+    hash = HashValue(hash, owners.size());
+    for (uint32_t owner : owners) {
+        hash = HashValue(hash, owner);
+    }
     hash = HashValue(hash, options.mmap ? 1ULL : 0ULL);
     hash = HashValue(hash, options.host_register ? 1ULL : 0ULL);
     return hash;
@@ -212,7 +279,7 @@ std::unique_ptr<SharedSegmentBackend> CreateSharedSegmentBackend(
 
 SharedSegment::SharedSegment(std::string name, uint64_t size,
                              SharedSegmentOptions options)
-    : name_(std::move(name)), size_(size), options_(options) {}
+    : name_(std::move(name)), size_(size), options_(std::move(options)) {}
 
 SharedSegment::~SharedSegment() = default;
 
@@ -243,7 +310,8 @@ Status SharedSegment::Create(const std::string& name, uint64_t size,
                              const SharedSegmentOptions& options,
                              std::shared_ptr<SharedSegment>& segment,
                              std::string& out_blob) {
-    auto status = ValidateOptions(options);
+    auto owner_ranks = ResolveOwnerRanks(options);
+    auto status = ValidateOptions(options, owner_ranks);
     if (!status.ok()) {
         return status;
     }
@@ -254,6 +322,7 @@ Status SharedSegment::Create(const std::string& name, uint64_t size,
 
     auto candidate =
         std::shared_ptr<SharedSegment>(new SharedSegment(name, size, options));
+    candidate->owner_ranks_ = std::move(owner_ranks);
     candidate->backend_ =
         CreateSharedSegmentBackend(SelectSharedSegmentBackend(options.mmap));
     if (candidate->backend_ == nullptr) {
@@ -263,26 +332,41 @@ Status SharedSegment::Create(const std::string& name, uint64_t size,
     }
 
     candidate->fingerprint_ = ComputeSegmentFingerprint(name, size, options);
-    const uint64_t granularity = candidate->backend_->Granularity(options);
-    candidate->alloc_size_ = AlignUp(size, granularity);
+    candidate->granularity_ = candidate->backend_->Granularity(options);
+    if (candidate->granularity_ == 0) {
+        return Status::InvalidArgument(
+            "Shared segment backend reported zero granularity");
+    }
+
+    const auto chunks =
+        ComputeOwnerChunks(size, candidate->granularity_,
+                           candidate->owner_ranks_, candidate->alloc_size_);
+    if (candidate->alloc_size_ > kMaxSegmentBytes) {
+        return Status::InvalidArgument(
+            "Shared segment aligned allocation size exceeds limit");
+    }
+
+    const OwnerChunk* local_chunk = nullptr;
+    for (const auto& chunk : chunks) {
+        if (chunk.owner_rank == options.rank_id) {
+            local_chunk = &chunk;
+            break;
+        }
+    }
+
+    std::vector<uint8_t> handle;
+    status =
+        candidate->backend_->Prepare(candidate->alloc_size_, local_chunk,
+                                     options, candidate->base_addr_, handle);
+    if (!status.ok()) {
+        return status;
+    }
 
     SegmentBlobHeader header{};
     header.backend_id = candidate->backend_->BackendId();
     header.rank_id = options.rank_id;
     header.fingerprint = candidate->fingerprint_;
     header.alloc_size = candidate->alloc_size_;
-
-    std::vector<uint8_t> handle;
-    if (options.rank_id == options.owner_rank) {
-        status = candidate->backend_->CreateOwner(
-            candidate->alloc_size_, options, candidate->base_addr_, handle);
-    } else {
-        status = candidate->backend_->ReserveLocal(
-            candidate->alloc_size_, options, candidate->base_addr_);
-    }
-    if (!status.ok()) {
-        return status;
-    }
 
     status = EncodeSegmentBlob(header, handle, out_blob);
     if (!status.ok()) {
@@ -291,8 +375,9 @@ Status SharedSegment::Create(const std::string& name, uint64_t size,
     // Python may fold a layout tag after '|'; log the bare name only.
     const auto bare_name = name.substr(0, name.find('|'));
     LOG(INFO) << "Shared segment " << bare_name << " create: rank "
-              << options.rank_id << " of " << options.world_size << ", base 0x"
-              << std::hex << candidate->base_addr_ << std::dec << ", "
+              << options.rank_id << " of " << options.world_size << ", owners "
+              << candidate->owner_ranks_.size() << ", base 0x" << std::hex
+              << candidate->base_addr_ << std::dec << ", "
               << candidate->alloc_size_ << " bytes";
     segment = std::move(candidate);
     return Status::OK();
@@ -307,19 +392,20 @@ Status SharedSegment::Complete(const std::vector<std::string>& blobs) {
         return Status::InvalidArgument(
             "SharedSegment::Complete needs a segment returned by Create");
     }
-    std::vector<uint8_t> owner_handle;
+    uint64_t total_alloc_size = 0;
+    const auto chunks =
+        ComputeOwnerChunks(size_, granularity_, owner_ranks_, total_alloc_size);
+    std::vector<std::vector<uint8_t>> owner_handles;
     auto status =
-        ExtractOwnerHandle(options_, backend_->BackendId(), fingerprint_,
-                           alloc_size_, blobs, owner_handle);
+        ExtractOwnerHandles(options_, owner_ranks_, backend_->BackendId(),
+                            fingerprint_, alloc_size_, blobs, owner_handles);
     if (!status.ok()) {
         return status;
     }
 
-    if (options_.rank_id != options_.owner_rank) {
-        status = backend_->ImportAndMap(alloc_size_, options_, owner_handle);
-        if (!status.ok()) {
-            return status;
-        }
+    status = backend_->CompleteMapping(chunks, owner_handles, options_);
+    if (!status.ok()) {
+        return status;
     }
     ready_ = true;
     return Status::OK();

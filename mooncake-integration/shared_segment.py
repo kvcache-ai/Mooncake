@@ -1,13 +1,13 @@
 """Process-shared host memory for one-writer/many-reader KV offload.
 
-MLA keeps the same KV in every rank of a TP group, so offloading it per rank
-multiplies host memory by the TP size for no benefit. A shared segment allocates
-the pages once, in ``owner_rank``, and maps them into every rank of the group.
+MLA keeps the same KV in every rank of a group, so offloading it per rank
+multiplies host memory by the group size for no benefit. A shared segment
+allocates physical pages once across ``owner_ranks`` (one or more ranks that
+contribute physical memory shards) and maps them into every rank of the group
+as one contiguous virtual span.
 
-Virtual addresses are deliberately not forced to match across ranks: peers agree
-on the byte layout, so the reserved address space equals the segment size rather
-than size x world_size. Layout (which offset holds which tensor) is computed
-here; C++ only shares the raw span.
+Virtual addresses are local to each process. Layout (which offset holds which
+tensor) is computed here; C++ only shares the raw contiguous span.
 
     from mooncake.shared_segment import create_shared_segment
 
@@ -17,9 +17,10 @@ here; C++ only shares the raw span.
             "k": dict(count=num_layers, shape=k_shape, dtype=torch.bfloat16),
             "v": dict(count=num_layers, shape=v_shape, dtype=torch.bfloat16),
         },
-        world_size=tp_size,
-        rank_id=tp_rank,
-        comm_group=tp_group,
+        world_size=group_size,
+        rank_id=group_rank,
+        owner_ranks=[0, 1],
+        comm_group=comm_group,
         mmap=False,  # Ascend VMM; tensors() are NPU views of the SVM VA
     )
     k_caches = seg.tensors("k")
@@ -56,35 +57,72 @@ def create_shared_segment(
     blocks: Mapping[str, Mapping[str, Any]],
     world_size: int,
     rank_id: int,
-    owner_rank: int = 0,
+    owner_ranks: int | Sequence[int] | None = None,
     device_id: int | None = None,
     comm_group: Any = None,
     mmap: bool = True,
     host_register: bool = False,
-    *,
-    tp_group: Any = None,
+    *args: Any,
+    **kwargs: Any,
 ) -> SharedSegment:
     """Creates a shared host segment and returns it ready to use.
 
     Every rank of the group must call this with an identical declaration; a
     disagreement is reported here rather than silently producing wrong reads.
+
+    ``owner_ranks`` specifies which rank(s) allocate and export physical memory
+    shards (an ``int`` or non-empty sequence of unique rank ids; defaults to
+    ``(0,)``). Deprecated keyword alias ``owner_rank`` is accepted via
+    ``**kwargs``.
+
     ``comm_group`` is the torch process group (or vLLM GroupCoordinator) used
     to all-gather export blobs; it may be omitted only when ``world_size`` is
-    1. ``tp_group`` is a deprecated alias of ``comm_group``. ``device_id``
-    defaults to the rank's current accelerator.
+    1. Deprecated keyword alias ``tp_group`` is accepted via ``**kwargs``.
+    ``device_id`` defaults to the rank's current accelerator.
 
-    ``mmap`` (default True) uses an unnamed memfd and asks the kernel for THP
-    (``MADV_HUGEPAGE``) so the span can be 2MiB pages without a HugeTLB pool;
-    4KiB pages if THP cannot allocate. Ranks share those pages through the
-    memfd. Set ``mmap=False`` for the platform VMM fabric path.
+    ``mmap`` (default True) uses unnamed memfd(s) mapped into a contiguous
+    process-local window and asks the kernel for THP (``MADV_HUGEPAGE``) so
+    the span can be 2MiB pages without a HugeTLB pool; 4KiB pages if THP cannot
+    allocate. Set ``mmap=False`` for the platform VMM path (AscendCL VMM).
+
     ``host_register`` (default False) HostRegister's mmap pages for
     ``device_id`` so ``tensors().data_ptr()`` is a device VA suitable for TE
     ``location=\"npu\"`` ROCE D2rH; requires ``mmap=True``. Ascend VMM
     (``mmap=False``) also exposes NPU tensors: the host SVM VA is already
-    device-accessible after ``MemSetAccess`` (owner ``MallocMem``, peer
-    ``ImportAndMap``), so ``tensors().data_ptr()`` is that same VA.
+    device-accessible after ``MemSetAccess``, so ``tensors().data_ptr()`` is
+    that VA.
     """
+    if args:
+        raise TypeError(
+            f"create_shared_segment() takes at most 9 positional arguments "
+            f"({9 + len(args)} given)"
+        )
+    tp_group = kwargs.pop("tp_group", None)
+    legacy_owner_rank = kwargs.pop("owner_rank", None)
+    if kwargs:
+        unexpected = next(iter(kwargs))
+        raise TypeError(
+            f"create_shared_segment() got an unexpected keyword argument "
+            f"{unexpected!r}"
+        )
+
     comm_group = _select_comm_group(comm_group, tp_group)
+    if (
+        isinstance(world_size, bool)
+        or not isinstance(world_size, int)
+        or world_size <= 0
+    ):
+        raise SharedSegmentError("world_size must be a positive integer")
+    if (
+        isinstance(rank_id, bool)
+        or not isinstance(rank_id, int)
+        or not (0 <= rank_id < world_size)
+    ):
+        raise SharedSegmentError(
+            f"rank_id must be in [0, {world_size}), got {rank_id!r}"
+        )
+    resolved_owners = _resolve_owner_ranks(owner_ranks, legacy_owner_rank, world_size)
+
     if host_register and not mmap:
         raise SharedSegmentError("host_register requires mmap=True")
     if not shared_segment_supported(mmap=mmap, host_register=host_register):
@@ -122,10 +160,11 @@ def create_shared_segment(
             total,
             world_size,
             rank_id,
-            owner_rank,
+            resolved_owners[0],
             device,
             mmap,
             host_register,
+            list(resolved_owners),
         )
     except RuntimeError as exc:
         create_error = str(exc)
@@ -175,9 +214,8 @@ class SharedSegment:
 
         On Ascend, ``host_register=True`` (mmap) and ``mmap=False`` (VMM) both
         yield NPU tensors whose ``data_ptr()`` can be registered with Transfer
-        Engine as ``location=\"npu\"`` for ROCE D2rH. mmap without HostRegister
-        yields host CPU tensors. Views share physical pages across the TP
-        group. Each view holds a reference back to this segment.
+        Engine as ``location=\"npu\"``. mmap without HostRegister yields host
+        CPU tensors. Each view holds a reference back to this segment.
         """
         spec = self._specs.get(block)
         if spec is None:
@@ -210,8 +248,14 @@ class SharedSegment:
     def base_addr(self) -> int:
         return self._segment.base_addr()
 
+    def device_addr(self) -> int:
+        return self._segment.device_addr()
+
     def total_size(self) -> int:
         return self._segment.size()
+
+    def owner_ranks(self) -> tuple[int, ...]:
+        return tuple(self._segment.owner_ranks())
 
 
 def shared_segment_supported(mmap: bool = True, host_register: bool = False) -> bool:
@@ -295,6 +339,55 @@ def _select_comm_group(comm_group: Any, tp_group: Any) -> Any:
     raise SharedSegmentError(
         "pass only comm_group; tp_group is a deprecated alias of comm_group"
     )
+
+
+def _normalize_owner_ranks(value: Any) -> tuple[int, ...]:
+    if isinstance(value, bool):
+        raise SharedSegmentError("owner_ranks must be an int or a sequence of ints")
+    if isinstance(value, int):
+        return (value,)
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        raise SharedSegmentError("owner_ranks must be an int or a sequence of ints")
+    ranks: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise SharedSegmentError(f"owner_ranks entries must be ints, got {item!r}")
+        ranks.append(item)
+    return tuple(ranks)
+
+
+def _resolve_owner_ranks(
+    owner_ranks: int | Sequence[int] | None,
+    legacy_owner_rank: Any,
+    world_size: int,
+) -> tuple[int, ...]:
+    """Resolves ``owner_ranks`` and deprecated alias ``owner_rank``."""
+    if owner_ranks is None and legacy_owner_rank is None:
+        resolved = (0,)
+    elif owner_ranks is None:
+        resolved = _normalize_owner_ranks(legacy_owner_rank)
+    elif legacy_owner_rank is None:
+        resolved = _normalize_owner_ranks(owner_ranks)
+    else:
+        primary = _normalize_owner_ranks(owner_ranks)
+        legacy = _normalize_owner_ranks(legacy_owner_rank)
+        if primary != legacy:
+            raise SharedSegmentError(
+                "pass only owner_ranks; owner_rank is a deprecated alias of "
+                "owner_ranks"
+            )
+        resolved = primary
+
+    if not resolved:
+        raise SharedSegmentError("owner_ranks must not be empty")
+    seen: set[int] = set()
+    for owner in resolved:
+        if owner < 0 or owner >= world_size:
+            raise SharedSegmentError(f"owner rank {owner} must be in [0, {world_size})")
+        if owner in seen:
+            raise SharedSegmentError(f"owner_ranks contains duplicate rank {owner}")
+        seen.add(owner)
+    return resolved
 
 
 def _resolve_cpu_group(comm_group: Any) -> Any:

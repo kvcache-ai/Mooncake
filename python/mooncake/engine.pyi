@@ -410,6 +410,7 @@ class SharedSegment:
         device_id: int = 0,
         mmap: bool = True,
         host_register: bool = False,
+        owner_ranks: Sequence[int] | None = None,
     ) -> tuple[SharedSegment, bytes]:
         """Phase one; returns (segment, blob)."""
     @staticmethod
@@ -421,6 +422,7 @@ class SharedSegment:
     def base_addr(self) -> int: ...
     def device_addr(self) -> int: ...
     def size(self) -> int: ...
+    def owner_ranks(self) -> list[int]: ...
 
 class ReceivedData:
     @property
