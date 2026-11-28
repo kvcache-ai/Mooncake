@@ -542,6 +542,50 @@ TEST_F(BatchCounterWait, FreeBeforeDrainDropsTheQueuedId) {
 #endif
 }
 
+TEST_F(BatchCounterWait, CompletionRecordsReleaseEachOwner) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    const auto delivered = batch(1);
+    const auto freed = batch(1);
+    const auto destroyed = batch(1);
+    for (auto b : {delivered, freed, destroyed}) {
+        ASSERT_TRUE(enable(b).ok());
+        ASSERT_TRUE(submit(b, {1}).ok());
+        rdma->finish(rdma->tasks.size() - 1);
+    }
+    auto* delivered_record =
+        Transport::toBatchDesc(delivered).completion_record.load();
+    auto* freed_record = Transport::toBatchDesc(freed).completion_record.load();
+    auto* destroyed_record =
+        Transport::toBatchDesc(destroyed).completion_record.load();
+    for (auto* record : {delivered_record, freed_record, destroyed_record}) {
+        ASSERT_NE(record, nullptr);
+        EXPECT_EQ(record->refs.load(), 2u);
+        EXPECT_EQ(record->claim.load(), Transport::CompletionRecord::kOpen);
+    }
+
+    ASSERT_TRUE(multi.freeBatchID(freed).ok());
+    forget(batches, freed);
+    forget(batches, destroyed);
+    delete &Transport::toBatchDesc(destroyed);
+    // The queue still owns both records after the batch owners release them.
+    for (auto* record : {freed_record, destroyed_record}) {
+        EXPECT_EQ(record->refs.load(), 1u);
+        EXPECT_EQ(record->claim.load(),
+                  Transport::CompletionRecord::kSuppressed);
+    }
+
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    ASSERT_EQ(done.size(), 1u);
+    EXPECT_EQ(done[0].batch_id, delivered);
+    EXPECT_EQ(delivered_record->claim.load(),
+              Transport::CompletionRecord::kDelivered);
+    EXPECT_EQ(delivered_record->refs.load(), 1u);
+#endif
+}
+
 TEST_F(BatchCounterWait, ShortSubmitWakesWhenSubmittedTasksFinish) {
 #ifndef __linux__
     GTEST_SKIP();

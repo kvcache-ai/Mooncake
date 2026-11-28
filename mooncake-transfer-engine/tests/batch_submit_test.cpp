@@ -7,8 +7,10 @@
 #include <atomic>
 #include <barrier>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <tuple>
 
 #ifdef USE_TENT
@@ -21,13 +23,18 @@ namespace mooncake {
 class TransferEngineImplTestPeer {
    public:
     static void classic(TransferEngine& engine,
-                        std::shared_ptr<MultiTransport> multi,
+                        std::unique_ptr<MultiTransport> multi,
                         size_t threads = 2) {
         engine.use_tent_ = false;
         engine.impl_ = std::make_shared<TransferEngineImpl>(false);
         engine.impl_->multi_transports_ = std::move(multi);
         engine.batch_submit_executor_ = std::make_shared<BatchSubmitExecutor>(
             BatchSubmitExecutor::Config{threads, 1, 4});
+    }
+    static bool hasPendingNotify(const TransferEngine& engine, BatchID id) {
+        auto& impl = *engine.impl_;
+        RWSpinlock::ReadGuard guard(impl.send_notifies_lock_);
+        return impl.notifies_to_send_.count(id) != 0;
     }
 #ifdef USE_TENT
     static tent::TransferEngineImpl& impl(tent::TransferEngine& engine) {
@@ -62,6 +69,10 @@ class MultiTransportBatchTestPeer {
     static bool deferred(MultiTransport& multi, BatchID id) {
         std::lock_guard<std::mutex> lock(multi.deferred_cleanup_mutex_);
         return multi.deferred_cleanup_batches_.count(id) != 0;
+    }
+    // The free path and cleanup worker both poll under this mutex.
+    static bool stoppingWhilePolling(const MultiTransport& multi) {
+        return multi.stop_deferred_cleanup_;
     }
 };
 
@@ -542,6 +553,7 @@ class BatchSubmitProbe : public Transport {
     std::atomic<int> submits{0};
     std::function<void()> on_submit;
     std::function<void(BatchID, const TransferRequest*)> on_batch_submit;
+    std::function<TransferStatusEnum()> poll_status;
     std::mutex mutex;
     std::vector<TransferRequest> observed;
 
@@ -560,7 +572,8 @@ class BatchSubmitProbe : public Transport {
             std::lock_guard<std::mutex> lock(mutex);
             for (auto* task : tasks) {
                 observed.push_back(*task->request);
-                task->is_finished = true;
+                task->is_finished = !poll_status;
+                if (poll_status) task->slice_count = 1;
             }
         }
         if (on_submit) on_submit();
@@ -570,7 +583,7 @@ class BatchSubmitProbe : public Transport {
     }
     Status getTransferStatus(BatchID id, size_t index,
                              TransferStatus& status) override {
-        status.s = terminal.load();
+        status.s = poll_status ? poll_status() : terminal.load();
         status.transferred_bytes =
             toBatchDesc(id).task_list[index].request->length;
         return Status::OK();
@@ -599,16 +612,17 @@ class ClassicBatchSubmit : public ::testing::Test {
     std::string local = "local:1";
     std::shared_ptr<TransferMetadata> metadata =
         std::make_shared<TransferMetadata>(P2PHANDSHAKE);
-    std::shared_ptr<MultiTransport> multi =
-        std::make_shared<MultiTransport>(metadata, local);
+    MultiTransport* multi = nullptr;
     std::shared_ptr<BatchSubmitProbe> transport =
         std::make_shared<BatchSubmitProbe>();
     TransferEngine engine{false};
 
     void SetUp() override {
+        auto owned_multi = std::make_unique<MultiTransport>(metadata, local);
+        multi = owned_multi.get();
         MultiTransportBatchTestPeer::install(*multi, "probe", transport);
         add(1, "probe");
-        TransferEngineImplTestPeer::classic(engine, multi);
+        TransferEngineImplTestPeer::classic(engine, std::move(owned_multi));
     }
     void add(uint64_t peer, const std::string& protocol) {
         auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
@@ -726,6 +740,30 @@ TEST_F(ClassicBatchSubmit,
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(result->ok()) << result->ToString();
     EXPECT_EQ(transport->submits.load(), 2);
+}
+
+TEST_F(ClassicBatchSubmit, DestructionFinishesDeferredNotifyCleanup) {
+    std::thread::id completed_on;
+    const auto entries = requests(0, 1);
+    {
+        TransferEngine owner(std::move(engine));
+        // Finish on the cleanup worker's final pass during destruction.
+        transport->poll_status = [&completed_on, multi = multi] {
+            if (!MultiTransportBatchTestPeer::stoppingWhilePolling(*multi)) {
+                return Transport::TransferStatusEnum::WAITING;
+            }
+            completed_on = std::this_thread::get_id();
+            return Transport::TransferStatusEnum::COMPLETED;
+        };
+        const auto id = owner.allocateBatchID(entries.size());
+        const auto submitted =
+            owner.submitTransferWithNotify(id, entries, {"test", "pending"});
+        ASSERT_TRUE(submitted.ok()) << submitted.ToString();
+        ASSERT_TRUE(owner.freeBatchID(id).IsBatchCleanupDeferred());
+        EXPECT_TRUE(TransferEngineImplTestPeer::hasPendingNotify(owner, id));
+    }
+    EXPECT_NE(completed_on, std::thread::id{});
+    EXPECT_NE(completed_on, std::this_thread::get_id());
 }
 
 TEST_F(ClassicBatchSubmit,

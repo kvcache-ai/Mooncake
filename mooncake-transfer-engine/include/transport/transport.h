@@ -611,21 +611,33 @@ class Transport {
         }
     };
 
-    // One heap node per published event batch. The queue owns it, so
-    // freeing the BatchDesc does not unlink the queue.
+    // One heap node per published event batch. Freeing the BatchDesc does
+    // not unlink the queue.
     struct CompletionRecord {
         std::atomic<CompletionRecord *> next{nullptr};
         BatchID batch_id = 0;
         TransferStatus status{};
-        // Drain and freeBatchID claim this once. Delivered copies the id
+        // Drain and batch teardown claim this once. Delivered copies the id
         // out. Suppressed drops it. The loser does not touch the id.
         static constexpr uint32_t kOpen = 0;
         static constexpr uint32_t kDelivered = 1;
         static constexpr uint32_t kSuppressed = 2;
         std::atomic<uint32_t> claim{kOpen};
-        // One ref for the queue, one for the batch. free releases the
-        // batch ref; pop releases the queue ref.
+        // The queue and the batch each own a reference.
         std::atomic<uint32_t> refs{2};
+
+        void suppress() {
+            uint32_t expected = kOpen;
+            claim.compare_exchange_strong(expected, kSuppressed,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire);
+        }
+
+        static void release(CompletionRecord *record) {
+            if (record->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                delete record;
+            }
+        }
     };
 
     struct BatchDesc {
@@ -695,6 +707,16 @@ class Transport {
         // - A failed submit never releases the extra token, so the latch
         //   never reaches 0 and nothing is erased from the ready queue.
         std::atomic<uint64_t> pending{0};
+
+        ~BatchDesc() {
+            // Publishers must be quiescent before destruction. A consumer
+            // may still hold the queue reference.
+            if (auto *record = completion_record.exchange(
+                    nullptr, std::memory_order_acq_rel)) {
+                record->suppress();
+                CompletionRecord::release(record);
+            }
+        }
 
         // Same accounting as a settled getBatchTransferStatus walk: a
         // FAILED task contributes no bytes.

@@ -214,7 +214,6 @@ class MultiTransport {
     // Single consumer. false when the consumer has observed an empty queue.
     // Drops the queue's ref on the previous tail.
     bool popCompletion(BatchCompletion &out);
-    void releaseCompletionRecord(CompletionRecord *record);
 };
 }  // namespace mooncake
 
