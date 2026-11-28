@@ -601,6 +601,16 @@ void setAutoDiscover(bool auto_discover);
 Enables or disables topology discovery.
 - Typical use: controlled environments or debugging where auto discovery is not desired.
 
+#### TransferEngine::setNicSelection
+
+```cpp
+void setNicSelection(NicSelection selection);
+```
+
+Overrides `MC_RDMA_NIC_SELECTION` and `MC_EFA_NIC_SELECTION` for this engine's RDMA, RDMA two-sided and EFA transports: `NicSelection::ALL` registers buffers on every NIC, `NicSelection::LOCAL` registers GPU memory only on its topology-preferred NICs. Without a call, the engine follows the environment variables. Other transports do no NIC selection and are not affected. Each affected transport logs the policy it uses, for example `rdma_nic_selection = local (engine override)`.
+- Must be called before `init()`; a later call logs an error and changes nothing. In TENT mode it logs a warning and is ignored.
+- Typical use: two engines in one process that need different policies, such as a KV cache engine on `ALL` next to a weight-transfer engine on `LOCAL`.
+
 #### TransferEngine::setWhitelistFilters
 
 ```cpp

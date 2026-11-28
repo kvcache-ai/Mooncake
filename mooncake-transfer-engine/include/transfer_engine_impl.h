@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -443,6 +444,16 @@ class TransferEngineImpl {
         auto_discover_config_ = config;
     }
 
+    // See TransferEngine::setNicSelection().
+    void setNicSelection(NicSelection selection) {
+        if (multi_transports_) {
+            LOG(ERROR) << "setNicSelection() must be called before init(); "
+                          "ignoring it";
+            return;
+        }
+        nic_selection_ = selection;
+    }
+
     // Optional transport hint carried by the protocol argument of init(). An
     // empty value keeps the config written by setAutoDiscover(), which Store
     // uses to pass the protocol of the client before calling init(). A hint
@@ -562,6 +573,8 @@ class TransferEngineImpl {
 
     // Discover topology and install transports automatically when enabled.
     AutoDiscoverConfig auto_discover_config_;
+    // Set by setNicSelection(); unset follows the environment.
+    std::optional<NicSelection> nic_selection_;
     std::vector<std::string> filter_;
     bool use_barex_ = false;
 

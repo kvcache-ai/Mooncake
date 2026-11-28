@@ -252,6 +252,75 @@ INSTANTIATE_TEST_SUITE_P(Modes, RdmaLocalNicGpuTest,
                          ::testing::Combine(::testing::Bool(),
                                             ::testing::Values(0, 1),
                                             ::testing::Bool()));
+
+// Two engines in one process with opposite setNicSelection() overrides, both
+// against MC_RDMA_NIC_SELECTION, register the same kind of GPU buffer on their
+// own NIC sets.
+TEST(RdmaLocalNicGpuOverrideTest, EnginesChooseIndependently) {
+    if (!std::getenv("MC_RUN_RDMA_GPU_TESTS"))
+        GTEST_SKIP()
+            << "Set MC_RUN_RDMA_GPU_TESTS=1 on an allocated GPU/RDMA node";
+    int gpu_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&gpu_count), cudaSuccess);
+    ASSERT_GE(gpu_count, 1);
+    auto &config = globalConfig();
+    const NicSelection saved = config.rdma_nic_selection;
+    struct Restore {
+        GlobalConfig &config;
+        NicSelection selection;
+        ~Restore() { config.rdma_nic_selection = selection; }
+    } restore{config, saved};
+    constexpr size_t size = 1 << 20;
+    for (NicSelection env : {NicSelection::ALL, NicSelection::LOCAL}) {
+        config.rdma_nic_selection = env;
+        GpuBuffer buffer(0, size);
+        ASSERT_NE(buffer.ptr, nullptr);
+        std::vector<std::unique_ptr<TransferEngine>> engines;
+        for (NicSelection selection :
+             {NicSelection::LOCAL, NicSelection::ALL}) {
+            auto engine = std::make_unique<TransferEngine>(true);
+            engine->setNicSelection(selection);
+            ASSERT_EQ(engine->init(P2PHANDSHAKE, "127.0.0.1"), 0);
+            ASSERT_NE(engine->getTransport("rdma"), nullptr);
+            // Ignored after init(): registration below still uses `selection`.
+            engine->setNicSelection(selection == NicSelection::LOCAL
+                                        ? NicSelection::ALL
+                                        : NicSelection::LOCAL);
+            ASSERT_EQ(engine->registerLocalMemory(buffer.ptr, size, "*"), 0);
+            auto desc =
+                engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+            ASSERT_NE(desc, nullptr);
+            std::vector<std::string> device_names;
+            for (const auto &device : desc->devices)
+                device_names.push_back(device.name);
+            const auto preferred = buildPreferredNicIndexMap(
+                desc->topology.getMatrix(), device_names);
+            ASSERT_TRUE(preferred.count(GPU_PREFIX + "0"));
+            const size_t expected = selection == NicSelection::LOCAL
+                                        ? preferred.at(GPU_PREFIX + "0").size()
+                                        : desc->devices.size();
+            size_t keyed = 0;
+            for (const auto &mr : desc->buffers) {
+#ifdef ENABLE_MULTI_PROTOCOL
+                if (!mr.protocol.empty() && mr.protocol != "rdma") continue;
+#endif
+                if (mr.addr != reinterpret_cast<uint64_t>(buffer.ptr)) continue;
+                keyed = std::count_if(mr.lkey.begin(), mr.lkey.end(),
+                                      [](auto key) { return key != 0; });
+            }
+            EXPECT_EQ(keyed, expected);
+            std::cout << "GPU_MR_OVERRIDE env="
+                      << (env == NicSelection::LOCAL ? "local" : "all")
+                      << " override="
+                      << (selection == NicSelection::LOCAL ? "local" : "all")
+                      << " keyed=" << keyed << "/" << desc->devices.size()
+                      << std::endl;
+            engines.push_back(std::move(engine));
+        }
+        for (auto &engine : engines)
+            ASSERT_EQ(engine->unregisterLocalMemory(buffer.ptr), 0);
+    }
+}
 #endif
 }  // namespace
 }  // namespace mooncake

@@ -547,7 +547,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     std::string resolved_name = name;
 
     // The HCAs this buffer is registered on, as indices into context_list_.
-    // By default every HCA. With MC_RDMA_NIC_SELECTION=local, GPU memory is
+    // By default every HCA. With LOCAL NIC selection, GPU memory is
     // registered only on the HCAs the topology prefers for its GPU. Skipped
     // HCAs keep their slots in the published lkey/rkey arrays with zero keys,
     // which device selection already skips, so a device index still names the
@@ -556,7 +556,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // a NUMA node's preferred set is not a GPU rail group.
     std::vector<size_t> registration_nics;
     bool narrowed = false;
-    if (globalConfig().rdma_nic_selection == NicSelection::LOCAL) {
+    if (nicSelection() == NicSelection::LOCAL) {
         std::string location = name;
         if (name == kWildcardLocation) {
             // For device memory this is a pointer-attribute query; it does not
@@ -568,11 +568,12 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             auto it = local_nic_map_.find(location);
             if (it == local_nic_map_.end()) {
                 // Fail closed rather than silently registering on every HCA.
-                LOG(ERROR) << "MC_RDMA_NIC_SELECTION=local: no opened "
+                LOG(ERROR) << "rdma_nic_selection = local: no opened "
                               "topology-preferred HCA for "
                            << location << " (buffer " << addr
                            << "); check the topology and device filters, or "
-                              "set MC_RDMA_NIC_SELECTION=all";
+                              "select all through MC_RDMA_NIC_SELECTION "
+                              "or the engine's NIC selection";
                 return ERR_DEVICE_NOT_FOUND;
             }
             registration_nics = it->second;
@@ -1053,11 +1054,12 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                 std::all_of(
                     buffer_desc.lkey.begin(), buffer_desc.lkey.end(),
                     [](BufferDesc::mr_key_t key) { return key == 0; })) {
-                LOG(ERROR) << "MC_RDMA_NIC_SELECTION=local: no "
+                LOG(ERROR) << "rdma_nic_selection = local: no "
                               "topology-preferred HCA of "
                            << resolved_name << " holds an MR for " << chunk_addr
-                           << "; fix the topology or set "
-                              "MC_RDMA_NIC_SELECTION=all";
+                           << "; fix the topology or select all through "
+                              "MC_RDMA_NIC_SELECTION or the engine's NIC "
+                              "selection";
                 unregisterChunkMRs(chunk_addr);
                 rollbackPlan(plan, ci);
                 err = ERR_DEVICE_NOT_FOUND;
@@ -2334,6 +2336,10 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
     return ret;
 }
 
+NicSelection RdmaTransport::nicSelection() const {
+    return nic_selection_.value_or(globalConfig().rdma_nic_selection);
+}
+
 int RdmaTransport::initializeRdmaResources() {
     auto hca_list = local_topology_->getHcaList();
     for (auto &device_name : hca_list) {
@@ -2370,7 +2376,18 @@ int RdmaTransport::initializeRdmaResources() {
         LOG(ERROR) << "RdmaTransport: No available RNIC";
         return ERR_DEVICE_NOT_FOUND;
     }
-    if (globalConfig().rdma_nic_selection == NicSelection::LOCAL) {
+    const NicSelection nic_selection = nicSelection();
+    LOG(INFO) << "RdmaTransport: rdma_nic_selection = "
+              << (nic_selection == NicSelection::LOCAL ? "local" : "all")
+              << (nic_selection_ ? " (engine override)"
+                                 : " (MC_RDMA_NIC_SELECTION)");
+    if (nic_selection == NicSelection::LOCAL) {
+        LOG(WARNING) << "RdmaTransport: rdma_nic_selection = local publishes "
+                        "zero keys for GPU buffers on non-preferred HCAs. "
+                        "Every process that reads or writes them must skip "
+                        "HCAs without keys (Mooncake#5185); an older peer can "
+                        "post a zero key and move a shared QP to the error "
+                        "state";
         // Index by context_list_ slot. A failed RNIC keeps its placeholder
         // slot but disableDevice() already removed it from every preferred
         // list, so it never enters the map.
@@ -2387,7 +2404,7 @@ int RdmaTransport::initializeRdmaResources() {
                 if (!nic_list.empty()) nic_list += ",";
                 nic_list += context_names[i];
             }
-            LOG(INFO) << "RdmaTransport: MC_RDMA_NIC_SELECTION=local, "
+            LOG(INFO) << "RdmaTransport: rdma_nic_selection = local, "
                       << entry.first << " registers on [" << nic_list << "]";
         }
     }

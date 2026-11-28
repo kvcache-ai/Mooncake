@@ -1236,6 +1236,7 @@ Transport* MultiTransport::installTransport(const std::string& proto,
                    << ", please rebuild Mooncake";
         return nullptr;
     }
+    transport->setNicSelection(nic_selection_);
 
 #ifdef USE_BAREX
     bool use_eic = false;

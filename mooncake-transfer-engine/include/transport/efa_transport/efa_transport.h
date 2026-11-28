@@ -34,11 +34,13 @@ namespace mooncake {
 
 class EfaContext;
 class EfaEndPoint;
+class EfaTransportTestPeer;
 class TransferMetadata;
 
 class EfaTransport : public Transport {
     friend class EfaContext;
     friend class EfaEndPoint;
+    friend class EfaTransportTestPeer;
 
    public:
     using BufferDesc = TransferMetadata::BufferDesc;
@@ -213,9 +215,12 @@ class EfaTransport : public Transport {
     std::vector<std::shared_ptr<EfaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
 
+    // The engine override if set, otherwise MC_EFA_NIC_SELECTION.
+    NicSelection nicSelection() const;
+
     // Memory location -> context_list_ indices of the topology-local NICs,
-    // built once in initializeEfaResources(). Only read when
-    // MC_EFA_NIC_SELECTION=local; empty otherwise. Const after install(), so no
+    // built once in initializeEfaResources(). Only read when the NIC
+    // selection is LOCAL; empty otherwise. Const after install(), so no
     // lock is needed on the registration path.
     std::unordered_map<std::string, std::vector<size_t>> local_nic_map_;
 

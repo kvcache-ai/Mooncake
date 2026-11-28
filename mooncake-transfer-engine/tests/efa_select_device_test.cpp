@@ -20,13 +20,31 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "config.h"
 #include "transport/efa_transport/efa_transport.h"
 
 namespace mooncake {
+
+// Outside the anonymous namespace: EfaTransport befriends
+// mooncake::EfaTransportTestPeer.
+class EfaTransportTestPeer {
+   public:
+    static NicSelection nicSelection(const EfaTransport& transport) {
+        return transport.nicSelection();
+    }
+
+    // ~EfaTransport() needs metadata, which install() normally binds.
+    static void bindMetadata(EfaTransport& transport) {
+        transport.metadata_ = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+        transport.local_server_name_ = "efa-nic-selection-override-test";
+    }
+};
+
 namespace {
 
 constexpr uint64_t kBufferAddr = 0x7f0000000000ULL;
@@ -258,6 +276,33 @@ TEST(EfaLocalNicMapTest, DeduplicatesPreferredHca) {
     ASSERT_EQ(map.size(), 1u);
     EXPECT_EQ(map.at("cuda:0"), (std::vector<size_t>{1, 0}));
     EXPECT_EQ(map.count("cuda:1"), 0u);
+}
+
+// An engine override wins over MC_EFA_NIC_SELECTION in both directions;
+// without one, the transport reads the variable when it applies the policy,
+// not when it is constructed.
+TEST(EfaNicSelectionOverrideTest, OverrideWinsAndUnsetFollowsConfig) {
+    auto& config = globalConfig();
+    struct Restore {
+        GlobalConfig& config;
+        NicSelection selection;
+        ~Restore() { config.efa_nic_selection = selection; }
+    } restore{config, config.efa_nic_selection};
+    config.efa_nic_selection = NicSelection::LOCAL;
+    EfaTransport all;
+    all.setNicSelection(NicSelection::ALL);
+    EfaTransport unset;
+    config.efa_nic_selection = NicSelection::ALL;
+    EfaTransport local;
+    local.setNicSelection(NicSelection::LOCAL);
+    for (EfaTransport* transport : {&all, &unset, &local})
+        EfaTransportTestPeer::bindMetadata(*transport);
+    EXPECT_EQ(EfaTransportTestPeer::nicSelection(all), NicSelection::ALL);
+    EXPECT_EQ(EfaTransportTestPeer::nicSelection(local), NicSelection::LOCAL);
+    EXPECT_EQ(EfaTransportTestPeer::nicSelection(unset), NicSelection::ALL);
+    config.efa_nic_selection = NicSelection::LOCAL;
+    EXPECT_EQ(EfaTransportTestPeer::nicSelection(unset), NicSelection::LOCAL);
+    EXPECT_EQ(EfaTransportTestPeer::nicSelection(all), NicSelection::ALL);
 }
 
 // Which NICs each chunk of a buffer is registered on. 16 NICs, two per GPU,

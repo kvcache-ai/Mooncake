@@ -391,6 +391,20 @@ std::string buildConnString(const std::string& metadata_type,
     return conn_string;
 }
 
+void TransferEnginePy::setNicSelection(const std::string& selection) {
+    NicSelection value = NicSelection::ALL;
+    if (!parseNicSelection(selection.c_str(), value)) {
+        throw std::invalid_argument(
+            "nic_selection must be 'all' or 'local', got '" + selection + "'");
+    }
+    if (engine_) {
+        // After initialize(): the engine logs an error and changes nothing.
+        engine_->setNicSelection(value);
+        return;
+    }
+    nic_selection_ = value;
+}
+
 int TransferEnginePy::initialize(const char* local_hostname,
                                  const char* metadata_server,
                                  const char* protocol,
@@ -446,6 +460,8 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 #else
     engine_ = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
 #endif
+
+    if (nic_selection_) engine_->setNicSelection(*nic_selection_);
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
@@ -2085,6 +2101,7 @@ NB_MODULE(engine, m) {
     auto adaptor_cls =
         py::class_<TransferEnginePy>(m, "TransferEngine")
             .def(py::init<>())
+            .def("set_nic_selection", &TransferEnginePy::setNicSelection)
             .def("initialize", &TransferEnginePy::initialize)
             .def("initialize_ext", &TransferEnginePy::initializeExt)
             .def("get_rpc_port", &TransferEnginePy::getRpcPort)

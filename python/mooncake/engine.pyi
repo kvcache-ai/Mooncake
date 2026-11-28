@@ -87,6 +87,7 @@ class TransferEngine:
     TransferOpcode = _TransferOpcode
 
     def __init__(self) -> None: ...
+    def set_nic_selection(self, selection: str, /) -> None: ...
     def initialize(
         self,
         local_hostname: str,

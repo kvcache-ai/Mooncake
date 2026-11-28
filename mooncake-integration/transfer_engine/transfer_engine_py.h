@@ -21,6 +21,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <optional>
 #include <stack>
 #include <string>
 #include <vector>
@@ -63,6 +64,11 @@ class TransferEnginePy {
     TransferEnginePy();
 
     ~TransferEnginePy();
+
+    // "all" or "local", ignoring case; see TransferEngine::setNicSelection().
+    // Call before initialize(); a later call logs an error and changes
+    // nothing. Any other value raises ValueError.
+    void setNicSelection(const std::string &selection);
 
     int initialize(const char *local_hostname, const char *metadata_server,
                    const char *protocol, const char *device_name);
@@ -366,6 +372,8 @@ class TransferEnginePy {
 
    private:
     std::shared_ptr<TransferEngine> engine_;
+    // Set by setNicSelection() before initialize() creates engine_.
+    std::optional<NicSelection> nic_selection_;
     Transport *xport_;
 
     std::mutex mutex_;

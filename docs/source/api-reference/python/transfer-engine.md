@@ -103,6 +103,17 @@ Initializes the transfer engine with extended configuration including metadata t
 **Returns:**
 - `int`: 0 on success, negative value on failure
 
+#### set_nic_selection()
+
+```python
+set_nic_selection(selection)
+```
+
+Overrides `MC_RDMA_NIC_SELECTION` and `MC_EFA_NIC_SELECTION` for this engine's RDMA, RDMA two-sided and EFA transports, so engines in one process can choose independently. Call it before `initialize()` or `initialize_ext()`; a later call logs an error and changes nothing. Without a call, the engine follows the environment variables. See `TransferEngine::setNicSelection()` in the C++ API.
+
+**Parameters:**
+- `selection` (str): `"all"` or `"local"`, ignoring case. Any other value raises `ValueError`.
+
 ### Engine Information
 
 #### get_engine()

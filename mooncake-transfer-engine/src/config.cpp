@@ -68,11 +68,7 @@ bool parseBoolConfigEnv(const char* value, const char* env_name, bool& output) {
 void parseNicSelectionEnv(const char* env_name, NicSelection& output) {
     const char* value = std::getenv(env_name);
     if (!value) return;
-    if (strcasecmp(value, "all") == 0) {
-        output = NicSelection::ALL;
-    } else if (strcasecmp(value, "local") == 0) {
-        output = NicSelection::LOCAL;
-    } else {
+    if (!parseNicSelection(value, output)) {
         LOG(WARNING) << "Invalid " << env_name
                      << " environment value: " << value
                      << ", expected all|local, keeping default";
@@ -120,6 +116,18 @@ void parseNicPeerAffinity(
 }
 
 }  // namespace
+
+bool parseNicSelection(const char* value, NicSelection& output) {
+    if (!value) return false;
+    if (strcasecmp(value, "all") == 0) {
+        output = NicSelection::ALL;
+    } else if (strcasecmp(value, "local") == 0) {
+        output = NicSelection::LOCAL;
+    } else {
+        return false;
+    }
+    return true;
+}
 
 // Whether a GPU peer-memory kernel module is loaded: nvidia-peermem, or
 // nv_peer_mem from MLNX_OFED. ibv_reg_mr() on device memory needs one.
