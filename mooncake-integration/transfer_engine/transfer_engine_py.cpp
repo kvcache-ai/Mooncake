@@ -1852,10 +1852,8 @@ std::string TransferEnginePy::getLocalTopology(const char* device_name) {
     py::gil_scoped_release release;
     auto device_name_safe = device_name ? std::string(device_name) : "";
 
-    const bool use_tent =
-        getenv("MC_USE_TENT") != nullptr || getenv("MC_USE_TEV1") != nullptr;
 #ifdef USE_TENT
-    if (use_tent) {
+    if (TransferEngine::isTentSelectedFromEnv()) {
         // This helper only needs topology, so use the native TENT Config path
         // directly instead of constructing the classic compatibility shim.
         // Keep the filter per-instance and avoid the process-global
@@ -1872,8 +1870,6 @@ std::string TransferEnginePy::getLocalTopology(const char* device_name) {
         return tent_engine.available() ? tent_engine.getLocalTopologyString()
                                        : "{}";
     }
-#else
-    (void)use_tent;
 #endif
 
     // Classic path: device_filter is honored by classic TransferEngineImpl.
@@ -1951,6 +1947,8 @@ void bind_enum_integer_conversion(py::enum_<Enum>& type) {
 }  // namespace
 
 NB_MODULE(engine, m) {
+    m.def("_is_tent_selected",
+          &mooncake::TransferEngine::isTentSelectedFromEnv);
 #ifdef USE_XPU
     m.attr("SUPPORT_XPU") = true;
 #else

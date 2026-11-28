@@ -49,6 +49,14 @@ for value in (
 
 assert engine.TransferOpcode.Read < engine.TransferOpcode.Write
 
+assert isinstance(engine._is_tent_selected(), bool)
+try:
+    engine._is_tent_selected(True)
+except TypeError:
+    pass
+else:
+    raise AssertionError("_is_tent_selected must take no arguments")
+
 assert callable(engine.create_rpc_client)
 assert callable(engine.create_rpc_server)
 assert callable(engine.SharedSegment.create)

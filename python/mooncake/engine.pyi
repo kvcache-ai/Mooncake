@@ -23,6 +23,8 @@ SUPPORT_MUSA: bool
 SUPPORT_TENT: bool
 SUPPORT_XPU: bool
 
+def _is_tent_selected() -> bool: ...
+
 class CompletionNotificationFallback(Exception):
     """Notification was requested, but this submit must fall back to polling."""
 

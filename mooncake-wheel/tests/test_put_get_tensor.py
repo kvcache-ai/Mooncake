@@ -35,9 +35,9 @@ def xpu_available():
 
 
 def tent_engine_selected():
-    # Intel XPU is only supported by the TENT engine. The store is created in
-    # setUpClass, so the selection must already be in the environment.
-    return bool(os.getenv("MC_USE_TENT") or os.getenv("MC_USE_TEV1"))
+    from mooncake.engine import _is_tent_selected
+
+    return _is_tent_selected()
 
 
 # Define a test class for serialization

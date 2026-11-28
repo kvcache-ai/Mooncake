@@ -15,4 +15,4 @@ mooncake\.engine\.(ScatterTransferCompletionStatus|TransferOpcode|TransferStatus
 
 # stubtest does not recognize nanobind.nb_func objects as builtin functions,
 # including the callables registered with nanobind def_static.
-mooncake\.engine\.(create_rpc_client|create_rpc_server|SharedSegment\.(create|supported))
+mooncake\.engine\.(_is_tent_selected|create_rpc_client|create_rpc_server|SharedSegment\.(create|supported))

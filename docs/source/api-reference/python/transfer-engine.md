@@ -691,7 +691,10 @@ returns -1. An empty peer table returns 0.
 get_local_topology(device_name=None)
 ```
 
-Gets the local network topology information as a JSON string.
+Gets the local network topology as JSON using the same backend selection as a
+new Transfer Engine. The `transfer_engine_topology_dump --backend auto`
+command follows that selection. Use `--backend te` or `--backend tent` to
+inspect a specific backend.
 
 **Parameters:**
 - `device_name` (str, optional): Comma-separated list of device names to filter, or None for all devices

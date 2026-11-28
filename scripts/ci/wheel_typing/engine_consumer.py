@@ -20,6 +20,7 @@ from mooncake.engine import (
     TransferEngine,
     TransferNotify,
     TransferOpcode,
+    _is_tent_selected,
     create_rpc_client,
 )
 
@@ -29,6 +30,7 @@ optional_engine: TransferEngine | None = None
 def exercise_transfer_engine(engine: TransferEngine) -> None:
     assert_type(engine.initialize("127.0.0.1", "P2PHANDSHAKE", "tcp", ""), int)
     assert_type(engine.get_rpc_port(), int)
+    assert_type(_is_tent_selected(), bool)
 
     buffer = engine.allocate_managed_buffer(4096)
     assert_type(buffer, int)
@@ -90,6 +92,7 @@ def exercise_transfer_engine(engine: TransferEngine) -> None:
     assert_type(engine.unregister_memory(buffer), int)
     assert_type(engine.free_managed_buffer(buffer, 4096), int)
 
+    _is_tent_selected(True)  # type: ignore[call-arg]
     engine.transfer_sync_write("peer:1", "0x0", 0, 4096)  # type: ignore[arg-type]
     engine.transfer_sync("peer:1", buffer, 0, 4096, 1)  # type: ignore[arg-type]
     engine.not_a_binding()  # type: ignore[attr-defined]

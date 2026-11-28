@@ -78,6 +78,36 @@ class ScopedEnvVar {
     std::optional<std::string> old_value_;
 };
 
+TEST(TransferEngineBackendTest, DiagnosticSelectionMatchesBothConstructors) {
+    struct Case {
+        const char* flag;
+        const char* alias;
+        bool requests_tent;
+    };
+    const Case cases[] = {
+        {nullptr, nullptr, false}, {"0", nullptr, false},
+        {"false", "off", false},   {"no", "0", false},
+        {"", nullptr, true},       {nullptr, "", true},
+        {"FALSE", nullptr, true},  {"off", "1", true},
+        {"1", "no", true},
+    };
+    for (const auto& item : cases) {
+        SCOPED_TRACE(::testing::Message()
+                     << "flag=" << (item.flag ? item.flag : "<unset>")
+                     << " alias=" << (item.alias ? item.alias : "<unset>"));
+        ScopedEnvVar flag("MC_USE_TENT", item.flag);
+        ScopedEnvVar alias("MC_USE_TEV1", item.alias);
+#ifdef USE_TENT
+        const bool expected = item.requests_tent;
+#else
+        const bool expected = false;
+#endif
+        EXPECT_EQ(TransferEngine::isTentSelectedFromEnv(), expected);
+        EXPECT_EQ(TransferEngine(false).isUsingTent(), expected);
+        EXPECT_EQ(TransferEngine(false, {}).isUsingTent(), expected);
+    }
+}
+
 class TransferEngineImplTestPeer {
    public:
     static void replaceTransports(TransferEngineImpl& engine,
