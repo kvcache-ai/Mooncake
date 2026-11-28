@@ -28,6 +28,33 @@ namespace mooncake {
 
 namespace {
 
+class CpuStreamingTarget final : public ssd_offload::WriteTarget {
+   public:
+    explicit CpuStreamingTarget(std::vector<Slice> destinations)
+        : destinations_(std::move(destinations)) {}
+    ssd_offload::Error Write(const ssd_offload::ReadChunk& chunk,
+                             ssd_offload::SlotBuffer buffer) noexcept override {
+        for (const auto& fragment : chunk.fragments) {
+            const auto& destination = fragment.destination;
+            if (destination.destination_index >= destinations_.size())
+                return ssd_offload::Error::kInvalidArgument;
+            const auto& slice = destinations_[destination.destination_index];
+            if (destination.offset > slice.size ||
+                destination.length > slice.size - destination.offset ||
+                fragment.buffer_offset > buffer.capacity ||
+                destination.length > buffer.capacity - fragment.buffer_offset)
+                return ssd_offload::Error::kInvalidArgument;
+            std::memcpy(static_cast<std::byte*>(slice.ptr) + destination.offset,
+                        buffer.data + fragment.buffer_offset,
+                        destination.length);
+        }
+        return ssd_offload::Error::kOk;
+    }
+
+   private:
+    const std::vector<Slice> destinations_;
+};
+
 // syncfs for every failure except a data or metadata read: reads leave the
 // log nothing to write (measured: they alone never shut XFS down), and one
 // bad file would otherwise flush the whole filesystem on every failed read.
@@ -119,12 +146,12 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       client_(client),
       ssd_metric_(ssd_metric),
       local_rpc_addr_(local_rpc_addr),
-      pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
-      client_buffer_allocator_(AlignedClientBufferAllocator::create(
-          config.local_buffer_size, client ? client->GetProtocol() : "")) {
+      pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()) {
     if (!config_.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
+    client_buffer_allocator_ = AlignedClientBufferAllocator::create(
+        config.local_buffer_size, client ? client->GetProtocol() : "");
 
     if (config.pinned_restore_arena_size > 0) {
         if (config.use_uring) {
@@ -156,6 +183,15 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     }
 
     storage_backend_ = create_storage_backend_result.value();
+    streaming_bucket_ready_ = config_.streaming_read.enabled &&
+                              std::dynamic_pointer_cast<BucketStorageBackend>(
+                                  storage_backend_) != nullptr;
+#if !(defined(__linux__) && defined(USE_URING))
+    if (streaming_bucket_ready_ && config_.streaming_read.use_uring) {
+        LOG(WARNING) << "MOONCAKE_OFFLOAD_STREAM_USE_URING is set, but "
+                        "io_uring support is not built in; using pread";
+    }
+#endif
     if (auto distributed_backend =
             std::dynamic_pointer_cast<DistributedStorageBackend>(
                 storage_backend_)) {
@@ -219,6 +255,15 @@ FileStorage::~FileStorage() {
 tl::expected<void, ErrorCode> FileStorage::Shutdown() {
     std::lock_guard lock(shutdown_mutex_);
     LOG(INFO) << "Shutdown FileStorage...";
+    {
+        std::unique_lock lock(streaming_mutex_);
+        streaming_stopped_ = true;
+#if defined(__linux__) && defined(USE_URING)
+        streaming_uring_reads_.reset();
+        streaming_uring_init_attempted_ = true;
+#endif
+        streaming_reads_.reset();
+    }
     heartbeat_running_ = false;
     WakeHeartbeat();
     if (heartbeat_thread_.joinable()) {
@@ -673,6 +718,285 @@ FileStorage::BatchGetLocalRanges(const std::vector<std::string>& keys,
     result.pointers = std::move(batch->pointers);
     result.owner = std::move(batch);
     return result;
+}
+
+bool FileStorage::SupportsLocalStreamingRead() const {
+    if (!streaming_bucket_ready_) return false;
+    std::shared_lock lock(streaming_mutex_);
+    return !streaming_stopped_;
+}
+
+ssd_offload::BoundedExecutor* FileStorage::GetOrCreateStreamingReadsLocked() {
+    std::lock_guard init_lock(streaming_init_mutex_);
+    if (!streaming_reads_) {
+        const auto& stream = config_.streaming_read;
+        try {
+            streaming_reads_ = std::make_unique<ssd_offload::BoundedExecutor>(
+                stream.read_workers, stream.max_outstanding);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to initialize local streaming read pool: "
+                       << e.what();
+            return nullptr;
+        }
+    }
+    return streaming_reads_.get();
+}
+
+#if defined(__linux__) && defined(USE_URING)
+std::shared_ptr<ssd_offload::UringReadExecutor>
+FileStorage::GetOrCreateStreamingUringReadsLocked() {
+    std::lock_guard init_lock(streaming_init_mutex_);
+    if (!streaming_uring_init_attempted_) {
+        streaming_uring_init_attempted_ = true;
+        const auto& stream = config_.streaming_read;
+        streaming_uring_reads_ = ssd_offload::UringReadExecutor::Create(
+            stream.read_workers, stream.max_outstanding);
+    }
+    return streaming_uring_reads_;
+}
+#endif
+
+void FileStorage::ReapExpiredClientBuffers() {
+    auto gc_now = std::chrono::steady_clock::now();
+    for (auto& shard : client_buffer_shards_) {
+        MutexLocker locker(&shard.mutex);
+        for (auto it = shard.batches.begin(); it != shard.batches.end();) {
+            if (gc_now >= it->second.lease_timeout) {
+                it = shard.batches.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+}
+
+tl::expected<void, ErrorCode> FileStorage::ReadLocalStreaming(
+    const std::vector<LocalReadRequest>& requests) {
+    using namespace ssd_offload;
+    if (!streaming_bucket_ready_)
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    std::shared_lock lock(streaming_mutex_);
+    if (streaming_stopped_)
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    if (disk_fenced_.load())
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    const auto start = std::chrono::steady_clock::now();
+    const auto& config = config_.streaming_read;
+    auto* buckets = dynamic_cast<BucketStorageBackend*>(storage_backend_.get());
+    if (!buckets) return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    if (!config.Validate(client_buffer_allocator_->size()))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (requests.size() > config.max_fragments)
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+
+    std::vector<std::vector<DestinationSlice>> request_destinations;
+    request_destinations.reserve(requests.size());
+    std::vector<Slice> all_destinations;
+    std::vector<std::pair<uintptr_t, uintptr_t>> intervals;
+    size_t destination_count = 0;
+    const auto arena_begin =
+        reinterpret_cast<uintptr_t>(client_buffer_allocator_->getBase());
+    const auto arena_end = arena_begin + client_buffer_allocator_->size();
+    // Validate destinations before opening any bucket files. Overlapping
+    // destinations return NOT_SUPPORTED so RealClient can fall back to the
+    // sequential restore path.
+    for (const auto& request : requests) {
+        if (request.destinations.size() >
+            config.max_fragments - destination_count)
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        destination_count += request.destinations.size();
+        std::vector<DestinationSlice> dst_slices;
+        dst_slices.reserve(request.destinations.size());
+        for (const auto& slice : request.destinations) {
+            if (slice.size && !slice.ptr)
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            const auto begin = reinterpret_cast<uintptr_t>(slice.ptr);
+            if (slice.size > std::numeric_limits<uintptr_t>::max() - begin)
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            const auto end = begin + slice.size;
+            if (slice.size && begin < arena_end && end > arena_begin)
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            if (slice.size) intervals.emplace_back(begin, end);
+            const size_t dst_index = all_destinations.size();
+            all_destinations.push_back(slice);
+            dst_slices.push_back({dst_index, 0, slice.size});
+        }
+        request_destinations.push_back(std::move(dst_slices));
+    }
+    std::sort(intervals.begin(), intervals.end());
+    for (size_t i = 1; i < intervals.size(); ++i) {
+        if (intervals[i].first < intervals[i - 1].second)
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    // Reserve open-file credits against deduplicated bucket sources before
+    // opening any descriptors.
+    struct SourceCredits {
+        std::atomic<size_t>& active;
+        size_t count{0};
+        ~SourceCredits() {
+            if (count) active.fetch_sub(count, std::memory_order_relaxed);
+        }
+    } source_credits{active_streaming_sources_};
+
+    std::vector<BucketStorageBackend::ReadSourceRequest> source_requests;
+    source_requests.reserve(requests.size());
+    for (const auto& request : requests) {
+        source_requests.push_back({request.storage_key, request.expected_size});
+    }
+    auto acquired = buckets->AcquireReadSources(
+        source_requests, [&](size_t unique_sources) {
+            size_t active =
+                active_streaming_sources_.load(std::memory_order_relaxed);
+            do {
+                if (active > config.max_outstanding ||
+                    unique_sources > config.max_outstanding - active)
+                    return false;
+            } while (!active_streaming_sources_.compare_exchange_weak(
+                active, active + unique_sources, std::memory_order_relaxed));
+            source_credits.count = unique_sources;
+            return true;
+        });
+    if (!acquired) return tl::make_unexpected(acquired.error());
+
+    std::vector<size_t> chunk_sources;
+    ReadPlan batch_plan;
+    batch_plan.slot_bytes = config.slot_bytes;
+    batch_plan.alignment = 1;
+    size_t fragments = 0;
+    // Preflight the complete batch before writing any destination, merging all
+    // objects into one multi-source plan so small-object batches read in
+    // parallel while sharing deduplicated bucket file descriptors.
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& loc = acquired->locations[i];
+        auto result = BuildReadPlan(
+            {loc.object_bytes, loc.value_file_offset, requests[i].source_offset,
+             std::move(request_destinations[i])},
+            {config.slot_bytes, 1, config.max_chunks, config.max_fragments});
+        if (result.error == Error::kPlanLimit ||
+            result.plan.chunks.size() >
+                config.max_chunks - batch_plan.chunks.size())
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        if (result.error != Error::kOk ||
+            result.plan.payload_bytes >
+                uint64_t(std::numeric_limits<int64_t>::max()) -
+                    batch_plan.payload_bytes ||
+            result.plan.io_bytes >
+                std::numeric_limits<uint64_t>::max() - batch_plan.io_bytes)
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        for (const auto& chunk : result.plan.chunks) {
+            if (chunk.fragments.size() > config.max_fragments - fragments)
+                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            fragments += chunk.fragments.size();
+        }
+        batch_plan.payload_bytes += result.plan.payload_bytes;
+        batch_plan.io_bytes += result.plan.io_bytes;
+        for (auto& chunk : result.plan.chunks) {
+            batch_plan.chunks.push_back(std::move(chunk));
+            chunk_sources.push_back(loc.source_index);
+        }
+    }
+    if (batch_plan.chunks.empty()) return {};
+    if (disk_fenced_.load())
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+
+    const uint64_t payload_bytes = batch_plan.payload_bytes;
+    std::vector<BufferHandle> handles;
+    std::vector<SlotBuffer> buffers;
+    bool gc_triggered = false;
+    const size_t desired_slots =
+        std::min(config.slots, batch_plan.chunks.size());
+    for (size_t i = 0; i < desired_slots; ++i) {
+        auto handle = client_buffer_allocator_->allocate(config.slot_bytes);
+        if (!handle && !gc_triggered) {
+            gc_triggered = true;
+            ReapExpiredClientBuffers();
+            handle = client_buffer_allocator_->allocate(config.slot_bytes);
+        }
+        if (!handle) {
+            if (handles.empty())
+                return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
+            // Degrade gracefully to the slots already reserved when concurrent
+            // remote leases occupy part of the shared staging arena.
+            break;
+        }
+        buffers.push_back(
+            {static_cast<std::byte*>(handle->ptr()), config.slot_bytes});
+        handles.push_back(std::move(*handle));
+    }
+
+    auto target =
+        std::make_shared<CpuStreamingTarget>(std::move(all_destinations));
+    // Declare ownership before the driver so exceptional unwinding drains the
+    // driver while its ReadChunk pointers still refer to a live plan.
+    // Local CPU memcpy runs inline on this scheduler thread (writes == nullptr)
+    // to avoid spawning a separate write thread pool for local restores.
+    std::unique_ptr<ReadPipeline> pipeline;
+    std::unique_ptr<PipelineDriver> driver;
+#if defined(__linux__) && defined(USE_URING)
+    if (config.use_uring) {
+        auto uring_reads = GetOrCreateStreamingUringReadsLocked();
+        if (uring_reads) {
+            auto native = UringPipelineDriver::Create(
+                acquired->sources, chunk_sources, target,
+                std::move(uring_reads), nullptr, buffers);
+            driver = std::move(native.driver);
+        }
+    }
+#endif
+    if (!driver) {
+        if (config.use_uring) {
+            LOG_FIRST_N(WARNING, 5)
+                << "Local streaming io_uring driver unavailable; falling back "
+                   "to pread executor";
+        }
+        auto* reads = GetOrCreateStreamingReadsLocked();
+        if (!reads) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        driver = std::make_unique<ThreadedPipelineDriver>(
+            std::move(acquired->sources), std::move(chunk_sources), target,
+            *reads, nullptr, buffers.size());
+    }
+    pipeline =
+        std::make_unique<ReadPipeline>(std::move(batch_plan), buffers, *driver);
+    const auto start_err = pipeline->Start();
+    if (start_err != Error::kOk && !pipeline->inflight())
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    while (pipeline->inflight()) {
+        IoCompletion completion;
+        if (!driver->WaitForEvent(completion, std::chrono::seconds(1)))
+            continue;  // A wait timeout never releases an accepted slot.
+        Error drain_err = Error::kOk;
+        if (completion.stage == SlotStage::kReading) {
+            if (completion.result == Error::kIoError &&
+                completion.sys_errno != 0) {
+                OnDiskError(completion.sys_errno, "read");
+            }
+            drain_err = pipeline->ReadDrained(
+                completion.token, completion.bytes, completion.result);
+        } else {
+            drain_err =
+                pipeline->WriteDrained(completion.token, completion.result);
+        }
+        if (drain_err != Error::kOk)
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    if (pipeline->state() != PipelineState::kSucceeded)
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    if (ssd_metric_) {
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count();
+        ssd_metric_->ssd_read_ops.inc(requests.size());
+        ssd_metric_->ssd_read_bytes.inc(payload_bytes);
+        ssd_metric_->ssd_read_latency_us.observe(elapsed);
+        ssd_metric_->ssd_read_latency_summary.observe(elapsed);
+        ssd_metric_->ssd_total_ops.inc(requests.size());
+        ssd_metric_->ssd_total_bytes.inc(payload_bytes);
+        ssd_metric_->ssd_total_latency_us.observe(elapsed);
+        ssd_metric_->ssd_total_latency_summary.observe(elapsed);
+    }
+    return {};
 }
 
 bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
@@ -2021,20 +2345,7 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
         if (!alloc_result && !gc_triggered &&
             &allocator == client_buffer_allocator_.get()) {
             gc_triggered = true;
-            {
-                auto gc_now = std::chrono::steady_clock::now();
-                for (auto& shard : client_buffer_shards_) {
-                    MutexLocker locker(&shard.mutex);
-                    for (auto it = shard.batches.begin();
-                         it != shard.batches.end();) {
-                        if (gc_now >= it->second.lease_timeout) {
-                            it = shard.batches.erase(it);
-                        } else {
-                            ++it;
-                        }
-                    }
-                }
-            }
+            ReapExpiredClientBuffers();
             alloc_result = allocator.allocate(alloc_size);
         }
         if (!alloc_result) {

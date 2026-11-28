@@ -171,6 +171,12 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // the request cannot be represented by this allocator.
     [[nodiscard]] uint64_t normalizedAllocationSize(size_t size) const;
 
+    // Computes {normalized_slot_bytes, effective_arena_bytes} for an arena of
+    // size arena_bytes without instantiating an allocator. Returns {0, 0} on
+    // invalid or overflowing inputs.
+    [[nodiscard]] static std::pair<uint64_t, uint64_t> slotBudget(
+        size_t slot_bytes, uint64_t arena_bytes) noexcept;
+
     // Returns a mutex-free atomic upper-bound hint for the largest allocatable
     // free region. The hint may be larger than the current value after a
     // successful allocation, is tightened on a locked allocation failure, and

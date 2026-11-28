@@ -7726,4 +7726,81 @@ TEST_F(StorageBackendTest, BucketIndexGrowthPreservesRollbackAndRecovery) {
     EXPECT_EQ(recovered.GetStoreMetadata()->total_keys, keys_per_bucket);
 }
 
+TEST_F(StorageBackendTest, AcquireReadSourcesPinsBucketAgainstEviction) {
+    for (auto policy :
+         {BucketEvictionPolicy::FIFO, BucketEvictionPolicy::LRU}) {
+        const std::string sub =
+            data_path +
+            (policy == BucketEvictionPolicy::FIFO ? "/fifo_pin" : "/lru_pin");
+        ASSERT_TRUE(fs::create_directories(sub));
+        FileStorageConfig config;
+        config.storage_filepath = sub;
+        BucketBackendConfig bucket_config;
+        bucket_config.eviction_policy = policy;
+        bucket_config.bucket_size_limit = 4096;
+        // Two 4096-byte buckets (~8.3 KiB with metadata) fit under 10000 bytes,
+        // while a third bucket (~12.4 KiB) deterministically forces eviction.
+        bucket_config.max_total_size = 10000;
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+
+        std::string val_a(4096, 'a'), val_b(4096, 'b'), val_c(4096, 'c'),
+            val_d(4096, 'd');
+        ASSERT_TRUE(backend.BatchOffload(
+            {{"pin_a", {{val_a.data(), val_a.size()}}}}, nullptr));
+        ASSERT_TRUE(backend.BatchOffload(
+            {{"pin_b", {{val_b.data(), val_b.size()}}}}, nullptr));
+
+        // Pin the first bucket with AcquireReadSources. For LRU, read pin_b
+        // after pinning pin_a so pin_a remains the oldest bucket under both
+        // FIFO and LRU; eviction triggered by the third bucket must skip the
+        // read-pinned pin_a bucket and evict pin_b instead.
+        auto pinned_a = backend.AcquireReadSources({{"pin_a", val_a.size()}},
+                                                   [](size_t) { return true; });
+        ASSERT_TRUE(pinned_a.has_value());
+        if (policy == BucketEvictionPolicy::LRU) {
+            std::string tmp_b(val_b.size(), '\0');
+            std::unordered_map<std::string, Slice> load_b{
+                {"pin_b", {tmp_b.data(), tmp_b.size()}}};
+            ASSERT_TRUE(backend.BatchLoad(load_b));
+            EXPECT_EQ(tmp_b, val_b);
+        }
+
+        std::vector<std::string> evicted_keys;
+        auto third = backend.BatchOffload(
+            {{"pin_c", {{val_c.data(), val_c.size()}}}}, nullptr,
+            [&](const std::vector<std::string>& keys)
+                -> tl::expected<void, ErrorCode> {
+                evicted_keys.insert(evicted_keys.end(), keys.begin(),
+                                    keys.end());
+                return {};
+            });
+        ASSERT_TRUE(third.has_value());
+        EXPECT_EQ(evicted_keys, std::vector<std::string>{"pin_b"});
+        EXPECT_TRUE(*backend.IsExist("pin_a"));
+        EXPECT_FALSE(*backend.IsExist("pin_b"));
+        EXPECT_TRUE(*backend.IsExist("pin_c"));
+
+        // When every bucket is read-pinned, eviction cannot free space and must
+        // fail fast with FILE_WRITE_FAIL rather than stalling in
+        // FinalizeEviction.
+        auto pinned_c = backend.AcquireReadSources({{"pin_c", val_c.size()}},
+                                                   [](size_t) { return true; });
+        ASSERT_TRUE(pinned_c.has_value());
+        const auto start = std::chrono::steady_clock::now();
+        auto fourth = backend.BatchOffload(
+            {{"pin_d", {{val_d.data(), val_d.size()}}}}, nullptr);
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        ASSERT_FALSE(fourth.has_value());
+        EXPECT_EQ(fourth.error(), ErrorCode::FILE_WRITE_FAIL);
+        EXPECT_LT(elapsed, std::chrono::seconds(2));
+        EXPECT_TRUE(*backend.IsExist("pin_a"));
+        EXPECT_TRUE(*backend.IsExist("pin_c"));
+        EXPECT_FALSE(*backend.IsExist("pin_d"));
+
+        pinned_c->sources.clear();
+        pinned_a->sources.clear();
+    }
+}
+
 }  // namespace mooncake::test

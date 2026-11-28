@@ -131,6 +131,58 @@ Step by step:
 
 ---
 
+## Bounded local streaming restore
+
+`MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ=true` enables a CPU restore path for
+objects owned by the same Store client. The bucket backend pins each source
+file while a bounded set of staging slots reads and copies chunks into the
+caller's destinations. Whole objects and ranges can exceed the staging arena.
+The default is disabled.
+
+`MOONCAKE_OFFLOAD_READ_IO_THREADS` configures the per-client restore RPC read
+thread pool size (default 8, valid range 1–128), initialized lazily on first
+offload read call and joined on teardown to keep blocking legacy SSD reads off
+the `coro_rpc` I/O event loop.
+
+`MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES` defaults to 1 MiB and
+`MOONCAKE_OFFLOAD_STREAM_SLOTS` defaults to four. Read executors are created
+lazily on first streaming read and default to four workers
+(`MOONCAKE_OFFLOAD_STREAM_READ_THREADS`). Local CPU restores copy chunks inline
+on the calling thread without spawning a separate write thread pool
+(`MOONCAKE_OFFLOAD_STREAM_WRITE_THREADS` defaults to two and is validated for
+asynchronous write targets).
+`MOONCAKE_OFFLOAD_STREAM_MAX_OUTSTANDING` (default 64) bounds accepted tasks
+and unique open bucket leases (keys in the same bucket share one open file
+descriptor and `BucketReadGuard`, and eviction skips read-pinned buckets). Full
+executors apply backpressure. Shutdown waits for accepted local reads before
+releasing their staging memory.
+
+Destinations, limits, and destination overlaps are checked before opening files
+and planning ranges. Overlapping destinations and preflight capacity limits fall
+back to the existing sequential restore path; invalid ranges, arena-aliasing
+destinations, exhausted staging arenas (`BUFFER_OVERFLOW`), shut-down storage
+(`UNAVAILABLE_IN_CURRENT_STATUS`), and post-preflight I/O errors fail directly.
+An I/O failure after copying starts reports failure after accepted work has
+drained. Publish the destination data only after the read succeeds.
+
+### Optional streaming io_uring
+
+Set `MOONCAKE_OFFLOAD_STREAM_USE_URING=true` together with local streaming
+to use persistent ordinary-READ `io_uring` workers (lazily created on first
+streaming read; idle workers block in `poll()` without periodic wakeups). Each
+worker owns one ring and retains every source and staging slot until its CQE is
+consumed. Partial reads continue from the completed offset, and transient
+`-EINTR`/`-EAGAIN` completions have a finite retry budget. Submission
+backpressure keeps accepted work within the configured limit.
+
+If `io_uring` is unavailable at build or runtime, or if a previous batch left
+the persistent `io_uring` read executor in a failed state, a warning is logged
+and subsequent local streaming batches fall back to the portable `pread` driver
+(queued or unsubmitted operations on a failed worker complete with
+`FILE_READ_FAIL`, and a broken ring tears down cleanly so shutdown never hangs).
+Both drivers drain accepted work before releasing source leases or staging
+slots.
+
 ## Storage Backends
 
 ### BucketStorageBackend (default)
