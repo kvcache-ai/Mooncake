@@ -36,9 +36,11 @@
 #include <mutex>
 #include <optional>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 #include "common.h"
+#include "config.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
 #include "transfer_metadata_plugin.h"
@@ -586,12 +588,61 @@ Status TcpTransport::submitTransfer(
 
 Status TcpTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
+    return submitTasks(task_list, false);
+}
+
+Status TcpTransport::validateReceiverVisibleWrites(
+    const std::vector<TransferRequest>& entries) const {
+    if (!metadata_) {
+        return Status::InvalidArgument(
+            "receiver-visible TCP write metadata is unavailable");
+    }
+    if (forceLegacyTcpProto()) {
+        return Status::ProtocolUnsupported(
+            "receiver-visible TCP write requires v2 framing (MC_TCP_PROTO=1)");
+    }
+    const bool metacache = globalConfig().metacache;
+    // When metacache is enabled, deduplicate per-target lookups in this
+    // preflight pass; startTransfer still rechecks the descriptor at dispatch
+    // time. When metacache is disabled, routing (selectTransports), preflight
+    // validation, and dispatch (startTransfer) deliberately each fetch a fresh
+    // descriptor so metadata downgrades are observed promptly rather than
+    // cached across stages.
+    std::unordered_set<SegmentID> validated_targets;
+    for (const auto& entry : entries) {
+        if (metacache && entries.size() > 1 &&
+            !validated_targets.insert(entry.target_id).second) {
+            continue;
+        }
+        auto desc = metadata_->getSegmentDescByID(entry.target_id);
+        if (!desc) {
+            return Status::InvalidArgument(
+                "receiver-visible TCP write target segment not found");
+        }
+        if (desc->tcp_proto_version < 2) {
+            return Status::ProtocolUnsupported(
+                "receiver-visible TCP write requires peer v2 framing for "
+                "segment " +
+                desc->name);
+        }
+    }
+    return Status::OK();
+}
+
+Status TcpTransport::submitReceiverVisibleWriteTasks(
+    const std::vector<TransferTask*>& task_list) {
+    return submitTasks(task_list, true);
+}
+
+Status TcpTransport::submitTasks(const std::vector<TransferTask*>& task_list,
+                                 bool require_ack) {
     for (size_t i = 0; i < task_list.size();) {
         auto* task = task_list[i];
         assert(task && task->request);
         const auto group_id = task->request->task_group_id;
         if (group_id == TransferRequest::kNoTaskGroup) {
-            startTransfer(prepareTransfer(task, *task->request));
+            startTransfer(prepareTransfer(task, *task->request), nullptr, false,
+                          require_ack);
             ++i;
             continue;
         }
@@ -607,7 +658,7 @@ Status TcpTransport::submitTransferTask(
                  task_list[i]->request->task_group_id == group_id &&
                  task_list[i - 1]->request + task_list[i - 1]->request_count ==
                      task_list[i]->request);
-        startTransferSequence(std::move(slices));
+        startTransferSequence(std::move(slices), require_ack);
     }
     return Status::OK();
 }
@@ -621,7 +672,7 @@ Status TcpTransport::submitTransferTaskGroup(
         for (size_t j = 0; j < task->request_count; ++j)
             slices.push_back(prepareTransfer(task, task->request[j]));
     }
-    startTransferSequence(std::move(slices));
+    startTransferSequence(std::move(slices), false);
     return Status::OK();
 }
 
@@ -642,7 +693,8 @@ Transport::Slice* TcpTransport::prepareTransfer(
     return slice;
 }
 
-void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
+void TcpTransport::startTransferSequence(std::vector<Slice*> slices,
+                                         bool require_ack) {
     struct Sequence {
         std::mutex mutex;
         std::vector<Slice*> slices;
@@ -657,7 +709,7 @@ void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
     auto advance = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak_advance = advance;
 
-    *advance = [this, sequence, weak_advance]() {
+    *advance = [this, sequence, weak_advance, require_ack]() {
         auto advance = weak_advance.lock();
         if (!advance) return;
 
@@ -695,7 +747,7 @@ void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
             // another loop iteration rather than recursive calls. For an
             // asynchronous completion, this invocation returns and the
             // continuation becomes the next runner.
-            startTransfer(slice, std::move(continuation), true);
+            startTransfer(slice, std::move(continuation), true, require_ack);
 
             {
                 std::lock_guard<std::mutex> lock(sequence->mutex);
@@ -734,7 +786,7 @@ std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
 
 void TcpTransport::startTransfer(Slice* slice,
                                  std::function<void()> continuation,
-                                 bool reuse_connection) {
+                                 bool reuse_connection, bool require_ack) {
     auto finish = [slice, &continuation](TransferStatusEnum status) mutable {
         if (status == TransferStatusEnum::COMPLETED)
             slice->markSuccess();
@@ -767,6 +819,22 @@ void TcpTransport::startTransfer(Slice* slice,
         return;
     }
 
+    bool use_v2 = false;
+    if (require_ack) {
+        const bool force_legacy = forceLegacyTcpProto();
+        use_v2 = desc->tcp_proto_version >= 2 && !force_legacy;
+        if (slice->opcode != TransferRequest::WRITE || !use_v2) {
+            LOG_EVERY_N(ERROR, 100)
+                << "TcpTransport::startTransfer rejected receiver-visible "
+                   "write for segment "
+                << desc->name << " (opcode=" << static_cast<int>(slice->opcode)
+                << ", tcp_proto_version=" << desc->tcp_proto_version
+                << ", force_legacy=" << force_legacy << ")";
+            finish(TransferStatusEnum::FAILED);
+            return;
+        }
+    }
+
     // Zero-length requests are complete by definition. v1 reported them
     // COMPLETED while the server silently rejected size==0 in address
     // validation; preserve that outcome without a round trip.
@@ -775,9 +843,12 @@ void TcpTransport::startTransfer(Slice* slice,
         return;
     }
 
+    if (!require_ack) {
+        use_v2 = desc->tcp_proto_version >= 2 && !forceLegacyTcpProto();
+    }
+
     const ConnectionKey key{desc->tcp_data_host,
                             static_cast<uint16_t>(desc->tcp_data_port)};
-    const bool use_v2 = desc->tcp_proto_version >= 2 && !forceLegacyTcpProto();
     TcpWorkItem work(slice, use_v2, std::move(continuation));
 
     // Scatter task groups request reuse even when the general pool setting is

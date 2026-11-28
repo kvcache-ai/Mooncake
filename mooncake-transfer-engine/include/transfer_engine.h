@@ -207,6 +207,43 @@ class TransferEngine {
 
     int unregisterLocalMemory(void* addr, bool update_metadata = true);
 
+    // Strict WRITE submission that guarantees receiver-visible completion
+    // (destination bytes are ready for the receiver to consume when the task
+    // reports COMPLETED) and fails closed instead of silently downgrading.
+    // Each routed transport validates whether it can provide this guarantee.
+    // Currently classic TCP v2 opts in (its server applies payload bytes to
+    // destination memory before sending the v2 completion ACK); other
+    // transports (e.g. RDMA, SHM, NVLink) fail closed with
+    // NotSupportedTransport until their visibility contracts are implemented
+    // (see RFC #5768).
+    //
+    // Error taxonomy (all preflight errors return before mutating the batch):
+    //   - NotImplemented: TENT backend or producer_event on classic TE.
+    //   - NotSupportedTransport: any entry routes to a transport that does not
+    //     support receiver-visible writes (or whose advertised transport is not
+    //     installed locally).
+    //   - ProtocolUnsupported: the routed transport supports receiver-visible
+    //     writes, but the active protocol override (MC_TCP_PROTO=1) or a
+    //     target peer's protocol version (tcp_proto_version < 2) does not. A
+    //     legacy peer becomes eligible once upgraded and refreshed via
+    //     syncSegmentCache().
+    //   - InvalidArgument: invalid batch_id, non-WRITE opcode, missing/invalid
+    //     target_id, or event-enabled batch constraint violation.
+    //   - CompletionNotificationUnsupported: event-enabled batch when a routed
+    //     transport does not publish batch completion counters.
+    //   - TooManyRequests: batch capacity exceeded.
+    //
+    // Empty entries validate TENT, batch_id, and event-enabled constraints
+    // before returning OK on a valid non-event classic batch without mutating
+    // it (regardless of installed transports or MC_TCP_PROTO). Zero-length
+    // entries still validate the route, WRITE opcode, and peer protocol
+    // version, then complete locally (COMPLETED) without wire I/O. At dispatch
+    // time, TcpTransport::startTransfer() re-checks peer protocol eligibility
+    // and fails individual tasks (FAILED) if metadata downgraded after
+    // preflight.
+    Status submitReceiverVisibleWrite(
+        BatchID batch_id, const std::vector<TransferRequest>& entries);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries);
 

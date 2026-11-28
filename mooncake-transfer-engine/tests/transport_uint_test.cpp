@@ -2704,6 +2704,27 @@ TEST(TransferEngineTentCompatibilityTest,
 }
 
 TEST(TransferEngineTentCompatibilityTest,
+     SubmitReceiverVisibleWriteReturnsNotImplementedUnderTent) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+
+    TransferEngine engine;
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "tent-receiver-visible-write"), 0);
+
+    const auto batch = engine.allocateBatchID(1);
+    ASSERT_NE(batch, INVALID_BATCH_ID);
+    EXPECT_TRUE(
+        engine.submitReceiverVisibleWrite(batch, {}).IsNotImplemented());
+    TransferRequest req{};
+    req.opcode = TransferRequest::WRITE;
+    EXPECT_TRUE(
+        engine.submitReceiverVisibleWrite(batch, {req}).IsNotImplemented());
+    EXPECT_TRUE(engine.freeBatchID(batch).ok());
+}
+
+TEST(TransferEngineTentCompatibilityTest,
      CApiInstallTransportReturnsCompatibilityHandle) {
     ScopedEnvVar use_tent("MC_USE_TENT", "1");
     ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");

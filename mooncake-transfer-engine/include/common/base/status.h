@@ -41,6 +41,7 @@ class Status final {
         kAddressOverlapped = 7,
         kNotSupportedTransport = 8,
         kCompletionNotificationUnsupported = 9,
+        kProtocolUnsupported = 10,
         kDns = 101,
         kSocket = 102,
         kMalformedJson = 103,
@@ -168,6 +169,12 @@ class Status final {
         return Code::kCompletionNotificationUnsupported == code_;
     }
 
+    // Returns true iff the selected transport supports the requested semantic
+    // in principle, but the active or peer wire protocol version does not.
+    [[nodiscard]] bool IsProtocolUnsupported() const {
+        return Code::kProtocolUnsupported == code_;
+    }
+
     // Return a combination of the error code name and message.
     std::string ToString() const;
 
@@ -233,6 +240,9 @@ class Status final {
     }
     static Status CompletionNotificationUnsupported(std::string_view msg) {
         return Status(Code::kCompletionNotificationUnsupported, msg);
+    }
+    static Status ProtocolUnsupported(std::string_view msg) {
+        return Status(Code::kProtocolUnsupported, msg);
     }
 
     // Return a human-readable name of the 'code'.
