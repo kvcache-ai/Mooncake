@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,8 @@ namespace mooncake {
 struct ObjectStorageBackendConfig {
     uint64_t max_object_bytes{256ULL * 1024 * 1024};
     uint64_t max_staging_bytes{1024ULL * 1024 * 1024};
+    // Standalone readers default to the same object limit as writers.
+    std::optional<uint64_t> max_read_object_bytes{std::nullopt};
 };
 
 // Synchronous I/O for a caller-selected immutable object name. The caller owns
@@ -36,6 +39,10 @@ class ObjectStorageBackend {
     ObjectStorageBackend(ObjectStorageBackendConfig config,
                          std::shared_ptr<ObjectStorageAdapter> adapter);
 
+    // In-flight reservations remain charged when a new leader changes the
+    // limit.
+    void SetMaxStagingBytes(uint64_t limit);
+
     // Gather a full object before issuing one PUT. upload_started is reset on
     // entry and set just before invoking PutOnce: true means PUT may have
     // begun, including when the adapter returns an error.
@@ -52,6 +59,12 @@ class ObjectStorageBackend {
                      const std::vector<Slice>& slices,
                      const IsHostMemory& is_host, const Copy& to_host,
                      bool* upload_started = nullptr);
+
+    // Also report whether the object may exist after a single PUT attempt.
+    ErrorCode WriteV(const std::string& object_key, uint64_t object_size,
+                     const std::vector<Slice>& slices,
+                     const IsHostMemory& is_host, const Copy& to_host,
+                     bool* upload_started, bool* may_exist);
 
     // Coalesce continuous object ranges across destination slice boundaries,
     // then scatter using at most min(4 MiB, max_staging_bytes) of
@@ -73,6 +86,7 @@ class ObjectStorageBackend {
    private:
     const ObjectStorageBackendConfig config_;
     const std::shared_ptr<ObjectStorageAdapter> adapter_;
+    std::atomic<uint64_t> max_staging_bytes_;
     std::atomic<uint64_t> staging_bytes_{0};
 };
 

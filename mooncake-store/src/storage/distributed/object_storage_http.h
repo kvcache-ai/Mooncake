@@ -1,5 +1,9 @@
 #pragma once
 
+#include <curl/curl.h>
+
+#include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -8,7 +12,69 @@
 #include <string>
 #include <string_view>
 
+#include "object_storage_xml.h"
+
 namespace mooncake::object_storage_http {
+
+// Single request, redirects disabled. A lost reply or a server error can
+// follow a successful write. Pre-request transport failures and explicit HTTP
+// request rejections cannot.
+inline bool PutMayExist(CURLcode result, long status, std::string_view body) {
+    // A final rejection still applies if reading its response body failed.
+    switch (status) {
+        case 301:  // Wrong endpoint; no redirect was followed
+        case 307:
+        case 308:
+        case 401:  // Unauthorized
+        case 403:  // Forbidden
+        case 404:  // Destination bucket/path does not exist
+        case 405:  // Method not allowed
+        case 411:  // Length required
+        case 412:  // Precondition failed
+        case 413:  // Payload too large
+        case 414:  // URI too long
+        case 415:  // Unsupported media type
+        case 417:  // Expectation failed
+            return false;
+        case 400:
+        case 409: {
+            // A Bad Request can also report RequestTimeout. Only a complete
+            // provider error identifying a rejected request rules out a write.
+            if (result != CURLE_OK) return true;
+            const auto code = object_storage_xml::ParseErrorCode(body);
+            if (status == 409) {
+                return code != "FileAlreadyExists" && code != "FileImmutable" &&
+                       code != "ConditionalRequestConflict";
+            }
+            static constexpr auto rejected = std::to_array<std::string_view>({
+                "AuthorizationHeaderMalformed",
+                "BadDigest",
+                "EntityTooLarge",
+                "ExpiredToken",
+                "IncorrectEndpoint",
+                "InvalidAccessKeyId",
+                "InvalidArgument",
+                "InvalidBucketName",
+                "InvalidDigest",
+                "InvalidEncryptionAlgorithmError",
+                "InvalidObjectName",
+                "InvalidRequest",
+                "InvalidSecurityToken",
+                "InvalidToken",
+                "KeyTooLongError",
+                "SecurityTokenExpired",
+                "SignatureDoesNotMatch",
+                "TokenRefreshRequired",
+                "XAmzContentSHA256Mismatch",
+            });
+            return std::ranges::find(rejected, code) == rejected.end();
+        }
+    }
+    return result != CURLE_COULDNT_RESOLVE_PROXY &&
+           result != CURLE_COULDNT_RESOLVE_HOST &&
+           result != CURLE_COULDNT_CONNECT &&
+           result != CURLE_PEER_FAILED_VERIFICATION;
+}
 
 struct ContentRange {
     uint64_t first;

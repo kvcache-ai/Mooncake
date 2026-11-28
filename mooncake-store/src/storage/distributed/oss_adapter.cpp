@@ -1,3 +1,4 @@
+#include "storage/distributed/object_storage_xml.h"
 #include "storage/distributed/oss_adapter.h"
 
 #include <curl/curl.h>
@@ -308,7 +309,8 @@ OssObjectStorageAdapter::OssObjectStorageAdapter(std::string key_prefix)
 }
 
 tl::expected<void, ErrorCode> OssObjectStorageAdapter::Init() {
-    auto config = OssAdapterConfig::FromEnvironment();
+    auto config =
+        OssAdapterConfig::FromEnvironment(target_ ? &*target_ : nullptr);
     if (!config.has_value()) {
         return tl::make_unexpected(config.error());
     }
@@ -528,7 +530,9 @@ OssObjectStorageAdapter::Request(
     const std::string& method, const std::string& physical_key,
     const std::map<std::string, std::string>& query, const char* body,
     size_t body_size, const std::string& range, const iovec* upload_iov,
-    int upload_iovcnt, void* download_buffer, size_t download_capacity) const {
+    int upload_iovcnt, void* download_buffer, size_t download_capacity,
+    bool* may_exist) const {
+    if (may_exist) *may_exist = false;
     if (!initialized_) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -544,6 +548,9 @@ OssObjectStorageAdapter::Request(
 
     const CURLcode result = curl_easy_perform(context.curl);
     curl_easy_getinfo(context.curl, CURLINFO_RESPONSE_CODE, &response.status);
+    if (may_exist)
+        *may_exist = object_storage_http::PutMayExist(result, response.status,
+                                                      context.error_body);
     response.transferred = context.download_context.transferred;
     response.body = std::move(context.error_body);
     // Preserve 404/416 when receiving their oversized bodies was aborted
@@ -575,11 +582,19 @@ tl::expected<void, ErrorCode> OssObjectStorageAdapter::Put(
 
 tl::expected<void, ErrorCode> OssObjectStorageAdapter::PutV(
     const std::string& logical_key, const iovec* iov, int iovcnt) {
+    bool may_exist;
+    return PutVOnceWithOutcome(logical_key, iov, iovcnt, may_exist);
+}
+
+tl::expected<void, ErrorCode> OssObjectStorageAdapter::PutVOnceWithOutcome(
+    const std::string& logical_key, const iovec* iov, int iovcnt,
+    bool& may_exist) {
+    may_exist = false;
     auto total = GetIovecSize(iov, iovcnt);
     if (!total) return tl::make_unexpected(total.error());
-    if (*total == 0) return Put(logical_key, {});
-    auto response = Request("PUT", LogicalToPhysicalKey(logical_key), {},
-                            nullptr, *total, "", iov, iovcnt);
+    auto response =
+        Request("PUT", LogicalToPhysicalKey(logical_key), {}, nullptr, *total,
+                "", *total ? iov : nullptr, iovcnt, nullptr, 0, &may_exist);
     if (!response) return tl::make_unexpected(response.error());
     if (!IsSuccess(response->status))
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
@@ -882,50 +897,49 @@ tl::expected<size_t, ErrorCode> OssObjectStorageAdapter::GetSize(
     }
 }
 
+tl::expected<ObjectListPage, ErrorCode> OssObjectStorageAdapter::ListPage(
+    const std::string& logical_prefix, const std::string& token, size_t limit) {
+    if (!limit || limit > 1000)
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    std::map<std::string, std::string> query{
+        {"encoding-type", "url"},
+        {"list-type", "2"},
+        {"max-keys", std::to_string(limit)},
+        {"prefix", LogicalToPhysicalKey(logical_prefix)}};
+    if (!token.empty()) query["continuation-token"] = token;
+    auto response = Request("GET", "", query);
+    if (!response) return tl::make_unexpected(response.error());
+    if (!IsSuccess(response->status))
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    auto page = object_storage_xml::ParseListObjectsV2(response->body);
+    if (!page || page->objects.size() > limit)
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    ObjectListPage result;
+    for (auto& object : page->objects) {
+        auto key = PhysicalToLogicalKey(UriDecode(object.key));
+        if (!key || !key->starts_with(logical_prefix))
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        result.objects.push_back(
+            {std::move(*key), object.size, object.last_modified_ms});
+    }
+    if (page->is_truncated) {
+        result.next_token = std::move(page->next_continuation_token);
+        result.next_token = UriDecode(result.next_token);
+        if (result.next_token.empty() || result.next_token == token)
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    return result;
+}
+
 tl::expected<std::vector<KeyInfo>, ErrorCode>
 OssObjectStorageAdapter::ListKeys() {
-    const std::string prefix = PhysicalPrefix();
     std::vector<KeyInfo> keys;
     std::string token;
     do {
-        std::map<std::string, std::string> query{{"encoding-type", "url"},
-                                                 {"list-type", "2"},
-                                                 {"max-keys", "1000"},
-                                                 {"prefix", prefix}};
-        if (!token.empty()) query["continuation-token"] = token;
-        auto response = Request("GET", "", query);
-        if (!response) return tl::make_unexpected(response.error());
-        if (!IsSuccess(response->status))
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-
-        size_t pos = 0;
-        while ((pos = response->body.find("<Contents>", pos)) !=
-               std::string::npos) {
-            const size_t end = response->body.find("</Contents>", pos);
-            if (end == std::string::npos) break;
-            const std::string_view item(response->body.data() + pos,
-                                        end + 11 - pos);
-            std::string physical_key = UriDecode(XmlValue(item, "Key"));
-            const std::string size_value = XmlValue(item, "Size");
-            auto logical_key = PhysicalToLogicalKey(physical_key);
-            if (!logical_key) return tl::make_unexpected(logical_key.error());
-            try {
-                const auto value = std::stoull(size_value);
-                if (value > std::numeric_limits<size_t>::max())
-                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-                keys.push_back(
-                    {std::move(*logical_key), static_cast<size_t>(value)});
-            } catch (...) {
-                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-            }
-            pos = end + 11;
-        }
-        token = UriDecode(XmlValue(response->body, "NextContinuationToken"));
-        const std::string truncated = boost::algorithm::to_lower_copy(
-            XmlValue(response->body, "IsTruncated"));
-        if (truncated != "true") token.clear();
-        if (truncated == "true" && token.empty())
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        auto page = ListPage("", token, 1000);
+        if (!page) return tl::make_unexpected(page.error());
+        for (auto& object : page->objects) keys.push_back(std::move(object));
+        token = std::move(page->next_token);
     } while (!token.empty());
     return keys;
 }

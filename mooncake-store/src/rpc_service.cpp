@@ -139,6 +139,10 @@ void WrappedMasterService::StopBatchOpLogPruningWorker() {
     master_service_.StopBatchOpLogPruningWorker();
 }
 
+void WrappedMasterService::CancelBatchOpLogDurabilityWaits() {
+    master_service_.CancelBatchOpLogDurabilityWaits();
+}
+
 void WrappedMasterService::StopBatchOpLogWriter() {
     master_service_.StopBatchOpLogWriter();
 }
@@ -480,6 +484,48 @@ WrappedMasterService::GetReplicaListForAdmin(const std::string& key,
         [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
 }
 
+tl::expected<ObjectStorageConfig, ErrorCode>
+WrappedMasterService::GetObjectStorageConfig() {
+    return execute_rpc(
+        "GetObjectStorageConfig",
+        [&] { return master_service_.GetObjectStorageConfig(); }, [](auto&) {},
+        [] {}, [] {});
+}
+tl::expected<void, ErrorCode> WrappedMasterService::FinishObjectStorageUpload(
+    const UUID& writer, const std::string& name, ObjectUploadOutcome outcome,
+    const std::string& tenant) {
+    return execute_rpc(
+        "FinishObjectStorageUpload",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& id) {
+                    return master_service_.FinishObjectStorageUpload(
+                        writer, name, outcome, id);
+                });
+        },
+        [](auto&) {}, [] {}, [] {});
+}
+tl::expected<void, ErrorCode> WrappedMasterService::RevokeObjectStorageWrite(
+    const UUID& writer, const std::string& key,
+    const ObjectWriteAttempt& attempt, const std::string& tenant) {
+    return execute_rpc(
+        "RevokeObjectStorageWrite",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& id) {
+                    return master_service_.RevokeObjectStorageWrite(
+                        writer, key, attempt, id);
+                });
+        },
+        [](auto&) {}, [] {}, [] {});
+}
+
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
@@ -586,38 +632,9 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     } else if (!resolved_tenant_id) {
         results.assign(keys.size(),
                        tl::make_unexpected(resolved_tenant_id.error()));
-    } else if (config.prefer_alloc_in_same_node) {
-        ReplicateConfig new_config = config;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            new_config.SetKeyIds(config, i);
-            auto result = master_service_.PutStart(
-                client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], new_config);
-            results.emplace_back(result);
-            if ((i == 0) && result.has_value()) {
-                std::string preferred_segment;
-                for (const auto& replica : result.value()) {
-                    if (replica.is_memory_replica()) {
-                        auto handles =
-                            replica.get_memory_descriptor().buffer_descriptor;
-                        if (!handles.transport_endpoint_.empty()) {
-                            preferred_segment = handles.transport_endpoint_;
-                        }
-                    }
-                }
-                if (!preferred_segment.empty()) {
-                    new_config.preferred_segment = preferred_segment;
-                }
-            }
-        }
     } else {
-        ReplicateConfig key_config = config;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            key_config.SetKeyIds(config, i);
-            results.emplace_back(master_service_.PutStart(
-                client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config));
-        }
+        results = master_service_.BatchPutStart(
+            client_id, keys, *resolved_tenant_id, slice_lengths, config);
     }
 
     size_t failure_count = 0;
@@ -2078,9 +2095,11 @@ tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments,
-    const WeightMetadataSnapshot& weight_metadata) {
+    const WeightMetadataSnapshot& weight_metadata,
+    const ObjectReplicaSnapshot& object_storage) {
     return master_service_.RestoreFromStandbySnapshot(
-        objects, initial_oplog_sequence_id, segments, weight_metadata);
+        objects, initial_oplog_sequence_id, segments, weight_metadata,
+        object_storage);
 }
 
 tl::expected<void, ErrorCode>
@@ -2131,6 +2150,9 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::GetReplicaListByRegex,
         &WrappedMasterService::GetReplicaList,
         &WrappedMasterService::BatchGetReplicaList,
+        &WrappedMasterService::GetObjectStorageConfig,
+        &WrappedMasterService::FinishObjectStorageUpload,
+        &WrappedMasterService::RevokeObjectStorageWrite,
         &WrappedMasterService::PutStart, &WrappedMasterService::PutEnd,
         &WrappedMasterService::PutRevoke, &WrappedMasterService::BatchPutStart,
         &WrappedMasterService::BatchPutEnd,

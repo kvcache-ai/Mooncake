@@ -1375,6 +1375,32 @@ TEST(S3ObjectStorageAdapterEngineTest, ClearsHeadersAtResponseBoundaries) {
 // Differs from OSS: keys are still URL-decoded (encoding-type=url), but S3
 // returns NextContinuationToken unencoded, so the token is sent back byte
 // for byte (URI-encoded once in the query) instead of being decoded first.
+TEST(S3ObjectStorageAdapterEngineTest, GcListsOneBoundedPageWithAgeAndScope) {
+    ScriptedHttpServer server(
+        {{200,
+          "<ListBucketResult><IsTruncated>true</IsTruncated>"
+          "<Contents><Key>test-prefix%2Fmc-gc-v1-61-object</Key><Size>3</Size>"
+          "<LastModified>1970-01-02T00:00:00.123Z</LastModified></Contents>"
+          "<NextContinuationToken>next</NextContinuationToken></"
+          "ListBucketResult>"}});
+    ScopedEnvironment environment;
+    ConfigureScriptedEndpoint(environment, server.port());
+    S3ObjectStorageAdapter adapter("/test-prefix/");
+    ASSERT_TRUE(adapter.Init());
+    auto page = adapter.ListPage("mc-gc-v1-61-", "", 1);
+    ASSERT_TRUE(page);
+    ASSERT_EQ(page->objects.size(), 1u);
+    EXPECT_EQ(page->objects.front().logical_key, "mc-gc-v1-61-object");
+    EXPECT_EQ(page->objects.front().last_modified_ms, 86400123u);
+    EXPECT_EQ(page->next_token, "next");
+    server.Wait();
+    ASSERT_TRUE(server.error().empty()) << server.error();
+    ASSERT_EQ(server.requests().size(), 1u);
+    EXPECT_NE(server.requests()[0].find("max-keys=1"), std::string::npos);
+    EXPECT_NE(server.requests()[0].find("prefix=test-prefix%2Fmc-gc-v1-61-"),
+              std::string::npos);
+}
+
 TEST(S3ObjectStorageAdapterEngineTest, DecodesPaginatedLogicalKeys) {
     ScriptedHttpServer server({
         {200,
@@ -1820,6 +1846,47 @@ TEST(S3ObjectStorageAdapterEngineTest,
     EXPECT_EQ(once, 1U);
     EXPECT_EQ(put, kAttempts);
     EXPECT_EQ(putv, kAttempts);
+}
+
+TEST(S3ObjectStorageAdapterEngineTest,
+     SinglePutDistinguishesRejectionFromLostReply) {
+    using Server = test::OssFaultHttpServer;
+    Server server({{"denied", Server::Reply(403, "denied")},
+                   {"empty", Server::Reply(403, "denied")},
+                   {"large", Server::Reply(413, "too large")},
+                   {"no-bucket", Server::Reply(404, "NoSuchBucket")},
+                   {"lost", Server::Reset()},
+                   {"busy", Server::Reply(503, "busy")}});
+    ScopedEnvironment environment;
+    ConfigureFaultEndpoint(environment, server.port());
+    auto adapter = std::make_shared<S3ObjectStorageAdapter>("/backend-io/");
+    ASSERT_TRUE(adapter->Init());
+    ObjectStorageBackend backend({16, 16}, adapter);
+    char byte = 'a';
+    auto write = [&](const std::string& key, size_t size, bool& may_exist) {
+        return backend.WriteV(
+            key, size, {{&byte, size}}, [](const Slice&) { return true; }, {},
+            nullptr, &may_exist);
+    };
+    bool may_exist = true;
+    EXPECT_EQ(write("denied", 1, may_exist), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_FALSE(may_exist);
+    EXPECT_EQ(write("empty", 0, may_exist), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_FALSE(may_exist);
+    EXPECT_EQ(write("large", 1, may_exist), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_FALSE(may_exist);
+    EXPECT_EQ(write("no-bucket", 1, may_exist), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_FALSE(may_exist);
+    EXPECT_EQ(write("lost", 1, may_exist), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_TRUE(may_exist);
+    EXPECT_EQ(write("busy", 1, may_exist), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_TRUE(may_exist);
+    server.Stop();
+    ASSERT_TRUE(server.error().empty()) << server.error();
+    ASSERT_EQ(server.requests().size(), 6u);
+    EXPECT_EQ(write("refused", 1, may_exist),
+              ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_FALSE(may_exist);
 }
 
 TEST(S3ObjectStorageAdapterEngineTest,

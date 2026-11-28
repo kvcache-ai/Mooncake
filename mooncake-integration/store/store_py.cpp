@@ -2271,6 +2271,7 @@ NB_MODULE(_store, m) {
         .def_rw("replica_num", &ReplicateConfig::replica_num)
         .def_rw("nof_replica_num", &ReplicateConfig::nof_replica_num)
         .def_rw("dfs_replica_num", &ReplicateConfig::dfs_replica_num)
+        .def_rw("os_replica_num", &ReplicateConfig::os_replica_num)
         .def_rw("soft_pin_action", &ReplicateConfig::soft_pin_action)
         .def_rw("soft_pin_ttl_ms", &ReplicateConfig::soft_pin_ttl_ms)
         .def_rw("with_hard_pin", &ReplicateConfig::with_hard_pin)
@@ -2403,8 +2404,19 @@ NB_MODULE(_store, m) {
         .def_rw("file_path", &DiskDescriptor::file_path)
         .def_rw("object_size", &DiskDescriptor::object_size);
 
+    py::class_<ObjectStorageDescriptor>(m, "ObjectStorageDescriptor")
+        .def_ro("object_key", &ObjectStorageDescriptor::object_key)
+        .def_ro("object_size", &ObjectStorageDescriptor::object_size);
+
     py::class_<Replica::Descriptor>(m, "ReplicaDescriptor")
         .def_ro("status", &Replica::Descriptor::status)
+        .def("is_object_storage_replica",
+             &Replica::Descriptor::is_object_storage_replica)
+        .def("get_object_storage_descriptor",
+             static_cast<const ObjectStorageDescriptor &(
+                 Replica::Descriptor::*)() const>(
+                 &Replica::Descriptor::get_object_storage_descriptor),
+             py::rv_policy::reference_internal)
         .def("is_memory_replica",
              static_cast<bool (Replica::Descriptor::*)() const noexcept>(
                  &Replica::Descriptor::is_memory_replica))

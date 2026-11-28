@@ -740,19 +740,35 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 #endif
         }
 
-        mooncake::WrappedMasterServiceConfig wrapped_config(
-            config, leadership_session->view.view_version);
         // The serving primary handles heartbeats/unmounts, so forward the
         // metadata cleanup config here like the non-HA path does.
         // Keep the gate alive until after the service is destroyed because the
         // OpLog writer owned by the service invokes a callback that uses it.
         detail::ServingStateGate serving_state;
-        auto wrapped_master_service = std::make_shared<WrappedMasterService>(
-            wrapped_config, config.http_metadata_server,
-            config.http_metadata_remote_url);
+        std::shared_ptr<WrappedMasterService> wrapped_master_service;
+        try {
+            wrapped_master_service = std::make_shared<WrappedMasterService>(
+                WrappedMasterServiceConfig(
+                    config, leadership_session->view.view_version),
+                config.http_metadata_server, config.http_metadata_remote_url);
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "Master service construction failed: "
+                       << error.what();
+            renewal.Stop();
+            LogLeadershipReleaseWarning("service construction failure",
+                                        release_term("service_construction"));
+            return -1;
+        }
         // Runs the term's handlers once they are registered. It drains before
         // the service goes, so release the service through release_service.
         std::unique_ptr<RpcWorkerPool> worker_pool;
+        auto drain_rpc_workers = [&]() {
+            // Release durability waits before joining their RPC handlers.
+            // Keep writes and callbacks alive until the writer stops below.
+            if (worker_pool)
+                wrapped_master_service->CancelBatchOpLogDurabilityWaits();
+            worker_pool.reset();
+        };
         // Stops the term's resources that exist, in the serving-exit order,
         // and keeps the service, the index and the gate alive through the
         // exit. Each step is a no-op on a resource not yet created or
@@ -764,7 +780,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 // captures wrapped_master_service by reference.
                 serving_state.RequestShutdown([] {});
                 wrapped_master_service->RequestStopBatchOpLogPruningWorker();
-                worker_pool.reset();
+                drain_rpc_workers();
                 StopLeadershipMonitor(monitor);
                 wrapped_master_service->StopBatchOpLogPruningWorker();
                 wrapped_master_service->StopBatchOpLogWriter();
@@ -785,7 +801,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             }
             serving_state.RequestShutdown([] {});
             wrapped_master_service->RequestStopBatchOpLogPruningWorker();
-            worker_pool.reset();
+            drain_rpc_workers();
             wrapped_master_service->StopBatchOpLogPruningWorker();
             wrapped_master_service->StopBatchOpLogWriter();
             wrapped_master_service.reset();
@@ -808,13 +824,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         // Keep the handoff until serving is established so restore failure
         // or a later lease loss can still resume from the applied cursor.
         SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
-        // This review unit can replay and snapshot obligations but cannot yet
-        // resume their Master lifecycle. Never serve after dropping that state.
         auto restore_result =
-            promotion_ctx->HasObjectReplicaState()
-                ? tl::expected<void, ErrorCode>(
-                      tl::unexpected(ErrorCode::NOT_SUPPORTED))
-            : promotion_ctx->metadata_store
+            promotion_ctx->metadata_store
                 ? wrapped_master_service->RestoreFromBatchOpLogPromotion(
                       *promotion_ctx->metadata_store,
                       promotion_ctx->applied_cursor, promotion_ctx->segments,
@@ -822,7 +833,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                       static_cast<size_t>(config.snapshot_chunk_object_count))
                 : wrapped_master_service->RestoreFromStandby(
                       promotion_ctx->objects, promotion_ctx->applied_seq_id,
-                      promotion_ctx->segments, promotion_ctx->weight_metadata);
+                      promotion_ctx->segments, promotion_ctx->weight_metadata,
+                      promotion_ctx->object_storage);
         if (ShutdownObserved(shutdown_requested)) {
             std::unique_ptr<LeadershipMonitorHandle> no_monitor;
             stop_term_resources(no_monitor);
@@ -1070,9 +1082,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto server_err = std::move(ec.value()).get();
         shutdown_trigger.Stop();
         wrapped_master_service->RequestStopBatchOpLogPruningWorker();
-        // Finish the calls the workers still hold before the term's OpLog
-        // writer and leadership go, as inline handlers would have.
-        worker_pool.reset();
+        drain_rpc_workers();
         LOG(ERROR) << "Master service stopped: " << server_err;
 
         StopLeadershipMonitor(leadership_monitor_handle);
@@ -1123,6 +1133,10 @@ int MasterServiceSupervisor::Start() {
 
     std::unique_ptr<StandbyController> standby_controller;
     try {
+        if (config_.object_storage.enabled) {
+            MasterService::PrepareObjectStorageAdapter(
+                WrappedMasterServiceConfig(config_, 0));
+        }
         standby_controller = CreateStandbyController(
             *spec, config_, {},
             [this] { return ShutdownObserved(shutdown_requested_); });

@@ -19,6 +19,7 @@ namespace route {
 struct ObjectState {
     // A primary write or a background task is in flight for this key.
     bool is_processing{false};
+    bool object_storage_commit_pending{false};
     // KV event state fits in the padding after `is_processing`, so it adds
     // zero bytes to KeySlot. Announcements may outlive availability while a
     // removed replica waits for durable finalization.

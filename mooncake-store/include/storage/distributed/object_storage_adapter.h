@@ -16,6 +16,13 @@ struct KeyInfo {
     // Decoded Mooncake logical key, not a provider-specific physical key.
     std::string logical_key;
     size_t size = 0;
+    // Unix milliseconds; zero means absent/invalid and is never GC eligible.
+    uint64_t last_modified_ms = 0;
+};
+
+struct ObjectListPage {
+    std::vector<KeyInfo> objects;
+    std::string next_token;
 };
 
 struct ObjectPutRequest {
@@ -110,6 +117,14 @@ class ObjectStorageAdapter {
     // from the adapter's configured physical namespace.
     virtual tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() = 0;
 
+    // A bounded page within a logical prefix. Tokens are opaque to callers.
+    virtual tl::expected<ObjectListPage, ErrorCode> ListPage(
+        const std::string& logical_prefix, const std::string& token,
+        size_t limit) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    virtual bool SupportsGcListing() const { return false; }
+
     virtual tl::expected<void, ErrorCode> Init() = 0;
 
     // Performs an end-to-end service check after Init(). Implementations may
@@ -145,6 +160,13 @@ class ObjectStorageAdapter {
             return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
         }
         return PutV(logical_key, iov, iovcnt);
+    }
+    // True when a single PUT may have created the object, including when its
+    // reply was lost. Adapters that cannot prove rejection stay conservative.
+    virtual tl::expected<void, ErrorCode> PutVOnceWithOutcome(
+        const std::string& key, const iovec* iov, int count, bool& may_exist) {
+        may_exist = true;
+        return PutVOnce(key, iov, count);
     }
 };
 

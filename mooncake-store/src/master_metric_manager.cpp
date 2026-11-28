@@ -2257,6 +2257,10 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(client_liveness_suspected_clients_);
     serialize_metric(client_liveness_offline_clients_);
     serialize_metric(pending_client_offboarding_jobs_metric_);
+    serialize_metric(object_pending_writes_);
+    serialize_metric(object_gc_records_);
+    serialize_metric(object_gc_oldest_age_ms_);
+    serialize_metric(object_gc_failures_);
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);

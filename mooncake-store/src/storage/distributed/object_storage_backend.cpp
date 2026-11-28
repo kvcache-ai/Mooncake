@@ -18,7 +18,7 @@ class StagingReservation {
         std::atomic<uint64_t>& bytes, uint64_t limit, uint64_t size) {
         auto current = bytes.load();
         do {
-            if (size > limit - current) {
+            if (size && (current >= limit || size > limit - current)) {
                 return std::nullopt;
             }
         } while (!bytes.compare_exchange_weak(current, current + size));
@@ -97,12 +97,19 @@ tl::expected<uint64_t, ErrorCode> ValidateReadSlices(
 ObjectStorageBackend::ObjectStorageBackend(
     ObjectStorageBackendConfig config,
     std::shared_ptr<ObjectStorageAdapter> adapter)
-    : config_(config), adapter_(std::move(adapter)) {
+    : config_(config),
+      adapter_(std::move(adapter)),
+      max_staging_bytes_(config.max_staging_bytes) {
     if (!adapter_ || config_.max_object_bytes == 0 ||
         config_.max_staging_bytes == 0) {
         throw std::invalid_argument(
             "Invalid object storage backend configuration");
     }
+}
+
+void ObjectStorageBackend::SetMaxStagingBytes(uint64_t limit) {
+    if (limit == 0) throw std::invalid_argument("Invalid object staging limit");
+    max_staging_bytes_.store(limit);
 }
 
 ErrorCode ObjectStorageBackend::Write(const std::string& object_key,
@@ -126,7 +133,7 @@ ErrorCode ObjectStorageBackend::Write(const std::string& object_key,
     }
 
     auto reservation = StagingReservation::TryAcquire(
-        staging_bytes_, config_.max_staging_bytes, object_size);
+        staging_bytes_, max_staging_bytes_.load(), object_size);
     if (!reservation) {
         return ErrorCode::NO_AVAILABLE_HANDLE;
     }
@@ -158,6 +165,17 @@ ErrorCode ObjectStorageBackend::WriteV(const std::string& object_key,
                                        const IsHostMemory& is_host,
                                        const Copy& to_host,
                                        bool* upload_started) {
+    return WriteV(object_key, object_size, slices, is_host, to_host,
+                  upload_started, nullptr);
+}
+
+ErrorCode ObjectStorageBackend::WriteV(const std::string& object_key,
+                                       uint64_t object_size,
+                                       const std::vector<Slice>& slices,
+                                       const IsHostMemory& is_host,
+                                       const Copy& to_host,
+                                       bool* upload_started, bool* may_exist) {
+    if (may_exist) *may_exist = false;
     if (upload_started != nullptr) {
         *upload_started = false;
     }
@@ -192,7 +210,7 @@ ErrorCode ObjectStorageBackend::WriteV(const std::string& object_key,
     auto reservation =
         staging_bytes != 0
             ? StagingReservation::TryAcquire(
-                  staging_bytes_, config_.max_staging_bytes, staging_bytes)
+                  staging_bytes_, max_staging_bytes_.load(), staging_bytes)
             : std::nullopt;
     if (staging_bytes != 0 && !reservation) {
         return ErrorCode::NO_AVAILABLE_HANDLE;
@@ -218,8 +236,11 @@ ErrorCode ObjectStorageBackend::WriteV(const std::string& object_key,
     if (upload_started != nullptr) {
         *upload_started = true;
     }
-    const auto result = adapter_->PutVOnce(object_key, iov.data(),
-                                           static_cast<int>(iov.size()));
+    const int count = static_cast<int>(iov.size());
+    const auto result = may_exist
+                            ? adapter_->PutVOnceWithOutcome(
+                                  object_key, iov.data(), count, *may_exist)
+                            : adapter_->PutVOnce(object_key, iov.data(), count);
     return result ? ErrorCode::OK : result.error();
 }
 
@@ -228,7 +249,9 @@ ErrorCode ObjectStorageBackend::Read(const std::string& object_key,
                                      const std::vector<Slice>& slices,
                                      uint64_t offset, const Copy& from_host) {
     const auto total_bytes = ValidateReadSlices(
-        object_size, config_.max_object_bytes, slices, offset);
+        object_size,
+        config_.max_read_object_bytes.value_or(config_.max_object_bytes),
+        slices, offset);
     if (!total_bytes) {
         return total_bytes.error();
     }
@@ -240,9 +263,9 @@ ErrorCode ObjectStorageBackend::Read(const std::string& object_key,
     }
 
     const auto chunk =
-        std::min({*total_bytes, kMaxReadChunkBytes, config_.max_staging_bytes});
+        std::min({*total_bytes, kMaxReadChunkBytes, max_staging_bytes_.load()});
     auto reservation = StagingReservation::TryAcquire(
-        staging_bytes_, config_.max_staging_bytes, chunk);
+        staging_bytes_, max_staging_bytes_.load(), chunk);
     if (!reservation) {
         return ErrorCode::NO_AVAILABLE_HANDLE;
     }
@@ -307,7 +330,9 @@ ErrorCode ObjectStorageBackend::Read(const std::string& object_key,
         return Read(object_key, object_size, slices, offset, from_host);
     }
     const auto total_bytes = ValidateReadSlices(
-        object_size, config_.max_object_bytes, slices, offset);
+        object_size,
+        config_.max_read_object_bytes.value_or(config_.max_object_bytes),
+        slices, offset);
     if (!total_bytes) {
         return total_bytes.error();
     }
@@ -315,7 +340,7 @@ ErrorCode ObjectStorageBackend::Read(const std::string& object_key,
         return Read(object_key, object_size, slices, offset, from_host);
     }
     const auto chunk =
-        std::min({*total_bytes, kMaxReadChunkBytes, config_.max_staging_bytes});
+        std::min({*total_bytes, kMaxReadChunkBytes, max_staging_bytes_.load()});
     for (uint64_t done = 0; done < *total_bytes;) {
         const auto length = std::min(chunk, *total_bytes - done);
         const auto result = adapter_->GetRange(

@@ -6,6 +6,7 @@
 // adapter.
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -17,6 +18,7 @@ namespace mooncake::object_storage_xml {
 struct ListedObject {
     std::string key;  // XML-decoded, otherwise as sent by the service
     size_t size = 0;
+    uint64_t last_modified_ms = 0;
 };
 
 struct ListObjectsPage {
@@ -33,6 +35,9 @@ struct ListObjectsPage {
 // listing must not be mistaken for a complete one.
 tl::expected<ListObjectsPage, std::string> ParseListObjectsV2(
     std::string_view body);
+
+// Returns the unique text-only Code of an Error document, or an empty string.
+std::string ParseErrorCode(std::string_view body);
 
 // Returns "Code: Message" from an Error document, or an empty string when
 // the body carries neither.

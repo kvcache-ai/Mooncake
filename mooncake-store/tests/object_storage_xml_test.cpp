@@ -17,6 +17,24 @@ std::string Listing(const std::string& contents,
 
 const char kObject[] = "<Contents><Key>p/a</Key><Size>3</Size></Contents>";
 
+TEST(ObjectStorageXmlTest, GcRequiresAValidLastModified) {
+    for (const std::string timestamp :
+         {"", "garbage", "2025-02-30T00:00:00Z", "2025-01-01T24:00:00Z",
+          "2025-01-01T00:00:00+00:00"}) {
+        auto page = ParseListObjectsV2(
+            Listing("<Contents><Key>a</Key><Size>1</Size>"
+                    "<LastModified>" +
+                    timestamp + "</LastModified></Contents>"));
+        ASSERT_TRUE(page);
+        EXPECT_EQ(page->objects.front().last_modified_ms, 0u);
+    }
+    auto page = ParseListObjectsV2(Listing(
+        "<Contents><Key>a</Key><Size>1</Size>"
+        "<LastModified>1970-01-02T01:02:03.456Z</LastModified></Contents>"));
+    ASSERT_TRUE(page);
+    EXPECT_EQ(page->objects.front().last_modified_ms, 90123456u);
+}
+
 TEST(ObjectStorageXmlTest, ParsesListObjectsV2Page) {
     const std::string body =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"

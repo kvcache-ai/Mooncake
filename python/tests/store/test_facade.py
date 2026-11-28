@@ -42,6 +42,7 @@ _CPP_PUBLIC_NAMES = {
     "ReplicaStatus",
     "MemoryDescriptor",
     "DiskDescriptor",
+    "ObjectStorageDescriptor",
     "ReplicaDescriptor",
     "Descriptor",
     "TaskType",

@@ -1,4 +1,5 @@
 #pragma once
+#include <set>
 
 #include <cstddef>
 #include <map>
@@ -93,8 +94,22 @@ class StandbyMetadataStore final : public MetadataStore {
         const std::string& tenant_id, const std::string& key,
         const ObjectReplicaMutation& mutation) override;
     bool RestoreObjectReplicas(const ObjectReplicaSnapshot& snapshot);
+    // Copy the frozen promotion handoff directly into the serving indexes.
+    bool RestoreObjectReplicas(const StandbyMetadataStore& source,
+                               const ObjectReplicaTarget& expected_target);
     ObjectReplicaSnapshot SnapshotObjectReplicas() const;
     bool HasObjectReplicaState() const;
+    std::optional<ObjectUploadRecord> FindObjectUpload(
+        const std::string& name) const;
+    std::vector<ObjectUploadRecord> ObjectUploadChunk(const std::string& after,
+                                                      size_t count) const;
+    size_t ObjectUploadCount() const;
+    std::optional<ObjectUploadRecord> FirstObjectUploadForKey(
+        const std::string& tenant, const std::string& key) const;
+    std::vector<ObjectUploadRecord> ActiveObjectUploadsForKey(
+        const std::string& tenant, const std::string& key) const;
+    std::vector<ObjectUploadRecord> RetiredObjectUploadChunk(
+        const std::string& after, size_t count) const;
 
     void Snapshot(std::vector<StandbyObjectEntry>& out) const;
     bool ValidateReplicaIds(ReplicaID& max_replica_id) const;
@@ -110,6 +125,11 @@ class StandbyMetadataStore final : public MetadataStore {
     std::optional<ObjectReplicaTarget> object_storage_target_;
     std::map<std::string, ObjectUploadRecord> object_uploads_;
     std::unordered_map<ReplicaID, std::string> object_upload_names_;
+    std::map<std::pair<std::string, std::string>, std::set<std::string>>
+        object_upload_keys_;
+    std::map<std::pair<std::string, std::string>, std::set<std::string>>
+        active_object_upload_keys_;
+    std::set<std::string> retired_object_upload_names_;
     std::map<WeightRevisionIdentity, WeightRevisionMetadata> weight_metadata_;
     std::map<WeightRevisionIdentity, uint64_t> weight_metadata_tombstones_;
     std::unordered_map<uint64_t, WeightRevisionLease> weight_leases_;

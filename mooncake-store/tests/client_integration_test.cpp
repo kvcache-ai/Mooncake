@@ -69,10 +69,12 @@ class ObjectChecksumClient : public Client {
         : Client("localhost", "", protocol) {}
 };
 
-struct LegacyReplicateConfig {
+// Current object-aware RPC base, without session or affinity extensions.
+struct BaseReplicateConfig {
     size_t replica_num{1};
     size_t nof_replica_num{0};
     size_t dfs_replica_num{0};
+    size_t os_replica_num{0};
     SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
     std::optional<uint64_t> soft_pin_ttl_ms;
     bool with_hard_pin{false};
@@ -85,11 +87,13 @@ struct LegacyReplicateConfig {
     std::optional<std::vector<std::string>> group_ids;
 };
 
-// Main's session-aware RPC shape, without this PR's affinity extensions.
+// Current object-aware RPC shape, including sessions but no affinity
+// extensions.
 struct SessionReplicateConfig {
     size_t replica_num{1};
     size_t nof_replica_num{0};
     size_t dfs_replica_num{0};
+    size_t os_replica_num{0};
     SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
     std::optional<uint64_t> soft_pin_ttl_ms;
     bool with_hard_pin{false};
@@ -104,11 +108,13 @@ struct SessionReplicateConfig {
 };
 
 TEST(HcaAffinityTest, RequestHintIsWireCompatibleAndSurvivesBatchSplitting) {
-    LegacyReplicateConfig legacy;
+    BaseReplicateConfig legacy;
+    legacy.os_replica_num = 1;
     legacy.preferred_segments = {"receiver"};
     auto decoded = struct_pack::deserialize<ReplicateConfig>(
         struct_pack::serialize(legacy));
     ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->os_replica_num, 1);
     EXPECT_FALSE(decoded->residency_affinity_ids);
     EXPECT_FALSE(decoded->preferred_hca_names);
     EXPECT_EQ(decoded->preferred_segments, legacy.preferred_segments);
@@ -122,14 +128,16 @@ TEST(HcaAffinityTest, RequestHintIsWireCompatibleAndSurvivesBatchSplitting) {
     EXPECT_EQ(current->residency_affinity_ids, decoded->residency_affinity_ids);
     EXPECT_EQ(current->ForSingleKey(1).preferred_hca_names,
               decoded->preferred_hca_names);
-    auto old_reader = struct_pack::deserialize<LegacyReplicateConfig>(
+    auto old_reader = struct_pack::deserialize<BaseReplicateConfig>(
         struct_pack::serialize(*decoded));
     ASSERT_TRUE(old_reader);
+    EXPECT_EQ(old_reader->os_replica_num, 1);
     EXPECT_EQ(old_reader->preferred_segments, legacy.preferred_segments);
 }
 
 TEST(HcaAffinityTest, SessionAndAffinityExtensionsRemainWireCompatible) {
     SessionReplicateConfig session_config;
+    session_config.os_replica_num = 1;
     session_config.group_ids = std::vector<std::string>{"g0", "g1"};
     session_config.session_ids = std::vector<std::string>{"s0", "s1"};
     EXPECT_EQ(struct_pack::get_type_code<ReplicateConfig>(),
@@ -137,6 +145,7 @@ TEST(HcaAffinityTest, SessionAndAffinityExtensionsRemainWireCompatible) {
     auto current = struct_pack::deserialize<ReplicateConfig>(
         struct_pack::serialize(session_config));
     ASSERT_TRUE(current);
+    EXPECT_EQ(current->os_replica_num, 1);
     EXPECT_EQ(current->session_ids, session_config.session_ids);
     EXPECT_FALSE(current->residency_affinity_ids);
     EXPECT_FALSE(current->preferred_hca_names);
@@ -149,6 +158,7 @@ TEST(HcaAffinityTest, SessionAndAffinityExtensionsRemainWireCompatible) {
     auto session_reader = struct_pack::deserialize<SessionReplicateConfig>(
         struct_pack::serialize(*current));
     ASSERT_TRUE(session_reader);
+    EXPECT_EQ(session_reader->os_replica_num, 1);
     EXPECT_EQ(session_reader->session_ids, session_config.session_ids);
     EXPECT_EQ(session_reader->group_ids, session_config.group_ids);
     auto affinity_reader = struct_pack::deserialize<ReplicateConfig>(
@@ -177,6 +187,39 @@ struct LegacyReplicaDescriptor {
 };
 YLT_REFL(LegacyReplicaDescriptor, id, descriptor_variant, status);
 
+// Object-aware variant without the compatible memory-locality extension.
+struct PreLocalityReplicaDescriptor {
+    ReplicaID id{0};
+    std::variant<LegacyMemoryDescriptor, NoFDescriptor, DiskDescriptor,
+                 LocalDiskDescriptor, DistributedFSDescriptor,
+                 ObjectStorageDescriptor>
+        descriptor_variant;
+    ReplicaStatus status;
+};
+YLT_REFL(PreLocalityReplicaDescriptor, id, descriptor_variant, status);
+
+TEST(HcaAffinityTest, ObjectReplicaRequiresCoordinatedRpcUpgrade) {
+    EXPECT_NE(struct_pack::get_type_code<Replica::Descriptor>(),
+              struct_pack::get_type_code<LegacyReplicaDescriptor>());
+    LegacyReplicaDescriptor legacy;
+    legacy.id = 7;
+    legacy.status = ReplicaStatus::COMPLETE;
+    legacy.descriptor_variant =
+        LegacyMemoryDescriptor{{1024, 0x300000000, "rdma", "receiver"}};
+    EXPECT_FALSE(struct_pack::deserialize<Replica::Descriptor>(
+        struct_pack::serialize(legacy)));
+    Replica::Descriptor current;
+    current.id = legacy.id;
+    current.status = legacy.status;
+    MemoryDescriptor memory;
+    memory.buffer_descriptor =
+        std::get<LegacyMemoryDescriptor>(legacy.descriptor_variant)
+            .buffer_descriptor;
+    current.descriptor_variant = memory;
+    EXPECT_FALSE(struct_pack::deserialize<LegacyReplicaDescriptor>(
+        struct_pack::serialize(current)));
+}
+
 TEST(HcaAffinityTest, ReadLocalityIsCompatibleInsideReplicaVariant) {
     Replica::Descriptor replica;
     replica.status = ReplicaStatus::COMPLETE;
@@ -184,7 +227,7 @@ TEST(HcaAffinityTest, ReadLocalityIsCompatibleInsideReplicaVariant) {
     memory.buffer_descriptor = {1024, 0x300000000, "rdma", "receiver"};
     memory.locality = SegmentLocality{7, {"mlx5_0"}};
     replica.descriptor_variant = memory;
-    auto old_reader = struct_pack::deserialize<LegacyReplicaDescriptor>(
+    auto old_reader = struct_pack::deserialize<PreLocalityReplicaDescriptor>(
         struct_pack::serialize(replica));
     ASSERT_TRUE(old_reader);
     EXPECT_EQ(std::get<LegacyMemoryDescriptor>(old_reader->descriptor_variant)
@@ -340,7 +383,7 @@ TEST(HcaAffinityTest, BatchHintsFollowKeysAndRetrySubsets) {
     EXPECT_EQ(restored->per_key_preferred_hca_names,
               config.per_key_preferred_hca_names);
     EXPECT_EQ(restored->residency_affinity_ids, config.residency_affinity_ids);
-    auto legacy = struct_pack::deserialize<LegacyReplicateConfig>(
+    auto legacy = struct_pack::deserialize<BaseReplicateConfig>(
         struct_pack::serialize(config));
     ASSERT_TRUE(legacy);
     EXPECT_EQ(legacy->group_ids, config.group_ids);

@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -69,11 +70,52 @@ class RangedDiskLeaseTest : public ::testing::Test {
         return std::nullopt;
     }
 
+    void ReadTwoMemorySessions(const std::string& key, const QueryResult& query,
+                               const Replica::Descriptor& replica,
+                               char* destination, std::vector<int>& results) {
+        const auto now = std::chrono::steady_clock::now();
+        std::vector<RealClient::SessionRangeReadRequest> requests;
+        for (size_t i = 0; i < 2; ++i) {
+            requests.push_back({key,
+                                i,
+                                replica,
+                                query,
+                                {destination + i},
+                                {1},
+                                {0},
+                                1,
+                                i ? now + std::chrono::minutes(1) : now});
+        }
+        client_->execute_session_memory_range_reads(requests, results);
+    }
+
     testing::InProcMaster master_;
     std::string master_address_;
     std::filesystem::path tmp_dir_;
     std::shared_ptr<RealClient> client_;
 };
+
+TEST_F(RangedDiskLeaseTest,
+       ExpiredMemoryRangeSkipsTransferAndPreservesBatchIndexes) {
+    const std::string key = "session-memory-lease";
+    ASSERT_EQ(client_->put(key, std::span<const char>("a", 1)), 0);
+    auto queries = client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1u);
+    ASSERT_TRUE(queries[0]);
+    auto memory =
+        std::find_if(queries[0]->replicas.begin(), queries[0]->replicas.end(),
+                     [](const auto& r) { return r.is_memory_replica(); });
+    ASSERT_NE(memory, queries[0]->replicas.end());
+    auto destination = client_->allocate_client_buffer(2);
+    ASSERT_TRUE(destination);
+    auto* bytes = static_cast<char*>(destination->ptr());
+    std::memset(bytes, '!', 2);
+    std::vector<int> results(2);
+    ReadTwoMemorySessions(key, *queries[0], *memory, bytes, results);
+    EXPECT_EQ(results[0], toInt(ErrorCode::LEASE_EXPIRED));
+    EXPECT_EQ(results[1], 1);
+    EXPECT_EQ(std::string(bytes, 2), "!a");
+}
 
 TEST_F(RangedDiskLeaseTest,
        DiskRangeReadRejectsAfterTransferWhenLeaseAlreadyExpired) {

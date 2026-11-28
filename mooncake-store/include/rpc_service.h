@@ -23,12 +23,22 @@ class HttpMetadataServer;
 class WrappedMasterService {
    public:
     store::GatherReadDirectory gather_directory;
+    tl::expected<ObjectStorageConfig, ErrorCode> GetObjectStorageConfig();
+
+    tl::expected<void, ErrorCode> FinishObjectStorageUpload(
+        const UUID&, const std::string&, ObjectUploadOutcome,
+        const std::string& tenant_id = "default");
+    tl::expected<void, ErrorCode> RevokeObjectStorageWrite(
+        const UUID&, const std::string&, const ObjectWriteAttempt&,
+        const std::string& tenant_id = "default");
+
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
     ErrorCode StartBatchOpLogPruningWorker(uint64_t chunk_batch_count,
                                            uint64_t max_batches_per_second);
     void RequestStopBatchOpLogPruningWorker();
     void StopBatchOpLogPruningWorker();
+    void CancelBatchOpLogDurabilityWaits();
     void StopBatchOpLogWriter();
     void StopHttpMetadataCleanup();
     // Restore lifecycle hooks (RFC #4700, slice 1). Serving means "committed
@@ -353,7 +363,8 @@ class WrappedMasterService {
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
-        const WeightMetadataSnapshot& weight_metadata = {});
+        const WeightMetadataSnapshot& weight_metadata = {},
+        const ObjectReplicaSnapshot& object_storage = {});
     // Copies objects out of the handoff; the caller keeps ownership.
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
         const BatchOpLogPromotionHandoff& handoff,

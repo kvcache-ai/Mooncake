@@ -5,6 +5,7 @@
 #include <boost/property_tree/xml_parser.hpp>
 
 #include <charconv>
+#include <chrono>
 #include <optional>
 #include <sstream>
 #include <system_error>
@@ -137,6 +138,45 @@ std::optional<size_t> ParseSize(std::string text) {
     return value;
 }
 
+// S3/OSS use UTC ISO 8601, optionally with fractional seconds. Missing or
+// malformed timestamps remain uncollectable rather than appearing ancient.
+uint64_t ParseLastModified(const std::string& text) {
+    if (text.size() < 20 || text[4] != '-' || text[7] != '-' ||
+        text[10] != 'T' || text[13] != ':' || text[16] != ':' ||
+        text.back() != 'Z')
+        return 0;
+    auto number = [&](size_t start, size_t count) -> int {
+        int result = 0;
+        for (size_t i = start; i < start + count; ++i) {
+            if (text[i] < '0' || text[i] > '9') return -1;
+            result = result * 10 + text[i] - '0';
+        }
+        return result;
+    };
+    const int y = number(0, 4), m = number(5, 2), d = number(8, 2);
+    const int h = number(11, 2), minute = number(14, 2), sec = number(17, 2);
+    using namespace std::chrono;
+    const year_month_day date{year(y), month(m), day(d)};
+    if (y < 1970 || !date.ok() || h < 0 || h > 23 || minute < 0 ||
+        minute > 59 || sec < 0 || sec > 59)
+        return 0;
+    int fraction = 0;
+    if (text.size() != 20) {
+        if (text[19] != '.' || text.size() < 22) return 0;
+        int scale = 100;
+        for (size_t i = 20; i + 1 < text.size(); ++i) {
+            if (text[i] < '0' || text[i] > '9') return 0;
+            fraction += (text[i] - '0') * scale;
+            scale /= 10;
+        }
+    }
+    return duration_cast<milliseconds>(sys_days(date).time_since_epoch() +
+                                       hours(h) + minutes(minute) +
+                                       seconds(sec))
+               .count() +
+           fraction;
+}
+
 }  // namespace
 
 tl::expected<ListObjectsPage, std::string> ParseListObjectsV2(
@@ -164,7 +204,10 @@ tl::expected<ListObjectsPage, std::string> ParseListObjectsV2(
         const auto size = ParseSize(std::move(*size_text));
         if (!size)
             return tl::make_unexpected("Contents element has an invalid Size");
-        page.objects.push_back({std::move(*key), *size});
+        page.objects.push_back(
+            {std::move(*key), *size,
+             ParseLastModified(
+                 OnlyChildText(contents, "LastModified").value_or(""))});
     }
 
     // IsTruncated is mandatory: without it the end of the listing cannot be
@@ -183,6 +226,14 @@ tl::expected<ListObjectsPage, std::string> ParseListObjectsV2(
     page.next_continuation_token =
         root->get<std::string>("NextContinuationToken", "");
     return page;
+}
+
+std::string ParseErrorCode(std::string_view body) {
+    if (body.find('\0') != std::string_view::npos) return {};
+    const auto document = ReadDocument(body, nullptr);
+    if (!document) return {};
+    const ptree::ptree* root = Root(*document, "Error");
+    return root ? OnlyChildText(*root, "Code").value_or("") : "";
 }
 
 std::string ErrorCodeAndMessage(std::string_view body) {

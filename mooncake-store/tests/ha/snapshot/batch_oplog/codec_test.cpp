@@ -1,4 +1,5 @@
 #include "ha/snapshot/batch_oplog/codec.h"
+#include "metadata_wire_compat.h"
 
 #include <gtest/gtest.h>
 
@@ -120,3 +121,56 @@ TEST(BatchOpLogSnapshotCodecTest, RejectsTruncatedArtifacts) {
 }
 
 }  // namespace mooncake::test
+
+// The previous tests vary compatible fields but use the current descriptor
+// variant. This fixture freezes the actual pre-object five-alternative shape.
+
+TEST(BatchOpLogSnapshotCodecTest, ReadsPreObjectDescriptorVariant) {
+    mooncake::metadata_wire_v2::Chunk old;
+    old.chunk_index = 7;
+    mooncake::metadata_wire_v2::Entry entry;
+    entry.key = "legacy-key";
+    entry.metadata.size = 4096;
+    entry.metadata.object_checksum = 123;
+    mooncake::metadata_wire_v2::ReplicaDescriptor replica;
+    replica.id = 19;
+    replica.status = mooncake::ReplicaStatus::COMPLETE;
+    mooncake::MemoryDescriptor memory;
+    memory.buffer_descriptor.size_ = 4096;
+    memory.buffer_descriptor.transport_endpoint_ = "127.0.0.1:9000";
+    replica.descriptor_variant = memory;
+    entry.metadata.replicas.push_back(replica);
+    old.objects.push_back(entry);
+    auto encoded = struct_pack::serialize<std::vector<uint8_t>>(old);
+    auto decoded = mooncake::DecodeBatchOpLogSnapshotObjectChunk(encoded, 7, 1);
+    ASSERT_TRUE(decoded) << decoded.error();
+    ASSERT_EQ(decoded->objects.size(), 1);
+    const auto& metadata = decoded->objects.front().metadata;
+    EXPECT_EQ(metadata.object_checksum.value(), 123);
+    ASSERT_EQ(metadata.replicas.size(), 1);
+    EXPECT_EQ(metadata.replicas.front().id, 19);
+    EXPECT_TRUE(metadata.replicas.front().is_memory_replica());
+}
+
+TEST(BatchOpLogSnapshotCodecTest, ReadsPreObjectMetadataLog) {
+    mooncake::metadata_wire_v2::Payload old;
+    old.size = 16;
+    old.session_id = "legacy-session";
+    old.object_checksum = 456;
+    mooncake::metadata_wire_v2::ReplicaDescriptor replica;
+    replica.id = 17;
+    replica.status = mooncake::ReplicaStatus::COMPLETE;
+    replica.descriptor_variant = mooncake::DiskDescriptor{"legacy.data", 16};
+    old.replicas.push_back(replica);
+    auto bytes = struct_pack::serialize(old);
+    mooncake::MetadataPayload decoded;
+    ASSERT_EQ(mooncake::DeserializeMetadataPayload(
+                  decoded, {bytes.data(), bytes.size()}),
+              struct_pack::errc::ok);
+    EXPECT_EQ(decoded.session_id.value(), "legacy-session");
+    EXPECT_EQ(decoded.object_checksum.value(), 456);
+    ASSERT_EQ(decoded.replicas.size(), 1);
+    EXPECT_EQ(decoded.replicas.front().id, 17);
+    EXPECT_EQ(decoded.replicas.front().get_disk_descriptor().file_path,
+              "legacy.data");
+}

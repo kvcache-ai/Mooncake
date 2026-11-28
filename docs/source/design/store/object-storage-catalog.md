@@ -4,10 +4,9 @@ orphan: true
 
 # Object upload and cleanup recovery records
 
-This is review unit 2 of [RFC #4296](https://github.com/kvcache-ai/Mooncake/issues/4296).
-It adds recovery records for object upload attempts and physical reclamation.
-It does not enable object replicas in Store APIs. Client uploads, reads and
-Master cleanup scheduling belong to the subsequent synchronous integration.
+This describes recovery records and physical reclamation for synchronous
+object replicas, developed under
+[RFC #4296](https://github.com/kvcache-ai/Mooncake/issues/4296).
 
 ## Ownership
 
@@ -30,12 +29,54 @@ The state is monotonic:
 - `RETIRED`: the object is no longer needed by that attempt/value. The caller
   supplies a conservative `not_before_ms` covering read protection.
 
-`upload_finished` means that the PUT can no longer materialize late. A retired
-record with an uncertain outcome cannot be forgotten after one successful
-DELETE: a delayed PUT can recreate the object. The subsequent integration must
-repeat cleanup and retain/backpressure these obligations. Only terminal retired
-records can be forgotten, after the caller has confirmed physical deletion and
-satisfied protection. There is no bucket scan or DELETE implementation here.
+`upload_finished` means that the PUT can no longer materialize late. A successful
+DELETE alone does not establish this: a delayed PUT can recreate the object.
+The Master separates pending-write admission from retired cleanup obligations.
+
+## Bounded cleanup and orphan collection
+
+New uploads use immutable names under `mc-gc-v1-<hex-cluster-id>-` within the
+configured storage prefix. Cluster IDs must be unique for independent clusters
+sharing a target. Do not reuse a cluster ID after discarding its HA state while
+retaining that namespace's objects. Legacy names remain readable and normally
+collectable; uncertain legacy uploads remain tracked because their ownership
+cannot safely be inferred from a bucket listing.
+
+The Master waits for retirement durability and read protection before DELETE.
+For uncertain uploads in the new namespace, it retains the record for another
+`object_storage_unknown_upload_retention_ms` (default 24 hours). After that
+period, a successful final DELETE allows a durable `expired_forget`. This hands
+the obligation to orphan GC; it does not set `upload_finished` or assert that a
+remote PUT has stopped. Failed deletes retry with exponential backoff, bounded
+by `object_storage_cleanup_max_backoff_ms` (default one hour).
+
+A recovered, serving leader periodically lists its cluster namespace in bounded
+pages. Objects with a backend LastModified timestamp older than
+`object_storage_gc_min_object_age_ms` (default 24 hours) are candidates only
+when the current upload registry has no record. Every valid object replica,
+including a hidden Upsert value, must have a registry record. Missing or invalid
+timestamps are skipped. Before DELETE the Master rechecks absence under the log
+ordering mutex, appends an `orphan_deletes` authorization and waits for its
+fenced durability. Replay rejects authorizations for tracked objects. This also
+prevents a stale leader from deleting an object created by its successor.
+Immutable names are never reused. Failed scans retry; successful scans repeat
+after `object_storage_gc_scan_interval_ms` (default 24 hours), including when
+there are no pending records. Thus PUTs arriving after forget are eventually
+collected. List permissions are required in addition to read/write/delete.
+
+`object_storage_max_pending_records` limits unfinished writes (default 10,000).
+Retired records instead use `object_storage_max_gc_records` (default 100,000),
+a high watermark that throttles new authorizations until cleanup progresses.
+Existing writes can still finish or retire while throttled. Both indexes are
+rebuilt after failover. Metrics expose `master_object_pending_writes`,
+`master_object_gc_records`, `master_object_gc_oldest_age_ms`, and
+`master_object_gc_failures_total`. The oldest-age metric measures time after
+read protection, not time since the upload began. Legacy uncertain records can
+still fill the separate GC watermark and require operator cleanup/migration;
+they are never silently forgotten.
+
+Deploy the GC-capable binary on all potential leaders and standbys before
+using the new log extensions; older binaries cannot safely replay them.
 
 ## Ordered recovery boundary
 
@@ -46,15 +87,16 @@ namespace changes or cross-writer updates leave both stores unchanged.
 Metadata replica IDs use the recovery checks: zero, the reserved maximum ID
 and duplicate IDs within one object are rejected before either store changes.
 
-The next integration must validate exact replica descriptors and attempt tokens
-before producing a mutation. It must use the existing fenced
-`OrderedOpLogWriter` and wait for `AwaitDurable(sequence)` before authorizing an
+The Master validates exact replica descriptors and attempt tokens
+before producing a mutation. It uses the existing fenced
+`OrderedOpLogWriter` and waits for durability before authorizing an
 upload, publishing a committed value or acknowledging a logical removal.
 Enqueue success is insufficient. Business locks must not be held while waiting.
 Retries of metadata notifications must not authorize another physical PUT.
-New attempts use fresh immutable names scoped by cluster/view, so late work
-cannot affect replacements. These producer responsibilities are not implemented
-by the passive recovery store.
+Logical commit/removal acknowledgments additionally wait for their local
+metadata finalizers. New attempts use fresh immutable names scoped by cluster,
+so late work cannot affect replacements. These are Master responsibilities;
+the passive recovery store only validates and applies the resulting mutations.
 
 `OpLogApplier` applies these entries in its existing global sequence, including
 duplicate-delivery handling and checksum checks. Ordinary logical removal does

@@ -21,6 +21,7 @@
 #include <ostream>
 
 #include "types.h"
+#include "config/object_storage_config.h"
 #include "allocator.h"
 #include "master_metric_manager.h"
 
@@ -30,6 +31,15 @@ namespace mooncake {
  * @brief Globally unique replica identification.
  */
 using ReplicaID = uint64_t;
+
+// Replica IDs can be allocated again by a fresh process after all older state
+// is reclaimed. The immutable token also fences delayed completion/revoke RPCs.
+struct ObjectWriteAttempt {
+    ReplicaID replica_id{0};
+    std::string token;
+    YLT_REFL(ObjectWriteAttempt, replica_id, token);
+    bool operator==(const ObjectWriteAttempt&) const = default;
+};
 
 /**
  * @brief Stream operator for ReplicaType
@@ -42,7 +52,8 @@ inline std::ostream& operator<<(std::ostream& os,
                              {ReplicaType::LOCAL_DISK, "LOCAL_DISK"},
                              {ReplicaType::NOF_SSD, "NOF_SSD"},
                              {ReplicaType::ALL, "ALL"},
-                             {ReplicaType::DFS, "DFS"}};
+                             {ReplicaType::DFS, "DFS"},
+                             {ReplicaType::OBJECT_STORAGE, "OBJECT_STORAGE"}};
 
     os << (replica_type_strings.count(replicaType)
                ? replica_type_strings.at(replicaType)
@@ -139,6 +150,8 @@ struct ReplicateConfig {
         per_key_preferred_hca_names;
     // Per-key opaque residency affinity metadata.
     struct_pack::compatible<std::vector<std::string>, 4> residency_affinity_ids;
+
+    size_t os_replica_num{0};
 
     bool HasValidKeyHints(size_t key_count) const {
         return (!group_ids || group_ids->size() == key_count) &&
@@ -240,6 +253,7 @@ struct ReplicateConfig {
         os << "ReplicateConfig: { replica_num: " << config.replica_num
            << ", nof_replica_num: " << config.nof_replica_num
            << ", dfs_replica_num: " << config.dfs_replica_num
+           << ", os_replica_num: " << config.os_replica_num
            << ", soft_pin_action: " << config.soft_pin_action
            << ", soft_pin_ttl_ms: ";
         if (config.soft_pin_ttl_ms.has_value()) {
@@ -297,6 +311,14 @@ struct ReplicateConfig {
     }
 };
 
+// Preserve the RPC field order independently of aggregate initialization.
+YLT_REFL(ReplicateConfig, replica_num, nof_replica_num, dfs_replica_num,
+         os_replica_num, soft_pin_action, soft_pin_ttl_ms, with_hard_pin,
+         preferred_segments, preferred_segment, preferred_nof_segments,
+         prefer_alloc_in_same_node, data_type, host_id, group_ids, session_ids,
+         preferred_hca_names, per_key_preferred_hca_names,
+         residency_affinity_ids);
+
 enum class ReplicaWriteMode {
     SINGLE_REPLICA,
     FLEXIBLE_DUAL_REPLICA,
@@ -325,12 +347,12 @@ struct ExistOptions {
 
 inline ReplicaWriteMode DetermineReplicaWriteMode(
     const ReplicateConfig& config) {
-    if (config.dfs_replica_num == 0 && config.replica_num == 1 &&
-        config.nof_replica_num == 1) {
+    if (config.os_replica_num == 0 && config.dfs_replica_num == 0 &&
+        config.replica_num == 1 && config.nof_replica_num == 1) {
         return ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA;
     }
     if (config.replica_num > 1 || config.nof_replica_num > 1 ||
-        config.dfs_replica_num > 0) {
+        config.dfs_replica_num > 0 || config.os_replica_num > 0) {
         return ReplicaWriteMode::RELIABLE_MULTI_REPLICA;
     }
     return ReplicaWriteMode::SINGLE_REPLICA;
@@ -368,6 +390,20 @@ struct DistributedFSDescriptor {
     int shard_idx = 0;
     YLT_REFL(DistributedFSDescriptor, file_path, offset, object_size,
              aligned_size, shard_idx);
+};
+
+// An object name is never reused by a replacement write or reassigned task.
+struct ObjectStorageDescriptor {
+    std::string object_key;
+    uint64_t object_size{0};
+    ObjectStorageWriteMode write_mode{ObjectStorageWriteMode::SYNC};
+    std::string namespace_id;
+    YLT_REFL(ObjectStorageDescriptor, object_key, object_size, write_mode,
+             namespace_id);
+};
+
+struct ObjectStorageReplicaData {
+    ObjectStorageDescriptor descriptor;
 };
 
 struct DfsReplicaData {
@@ -427,6 +463,9 @@ class Replica {
 
     // dfs replica constructor
     Replica(DistributedFSDescriptor descriptor, ReplicaStatus status)
+        : Replica(next_id_.fetch_add(1), std::move(descriptor), status) {}
+
+    Replica(ObjectStorageDescriptor descriptor, ReplicaStatus status)
         : Replica(next_id_.fetch_add(1), std::move(descriptor), status) {}
 
     ~Replica() {
@@ -534,6 +573,18 @@ class Replica {
 
     [[nodiscard]] static bool fn_is_processing(const Replica& replica) {
         return replica.is_processing();
+    }
+
+    [[nodiscard]] bool is_object_storage_replica() const {
+        return std::holds_alternative<
+            std::unique_ptr<ObjectStorageReplicaData>>(data_);
+    }
+    static bool fn_is_object_storage_replica(const Replica& replica) {
+        return replica.is_object_storage_replica();
+    }
+    const ObjectStorageDescriptor& get_object_storage_descriptor() const {
+        return std::get<std::unique_ptr<ObjectStorageReplicaData>>(data_)
+            ->descriptor;
     }
 
     [[nodiscard]] bool is_busy() const { return refcnt_.load() > 0; }
@@ -749,6 +800,10 @@ class Replica {
             const std::unique_ptr<LocalDiskReplicaData>&) const {
             return ReplicaType::LOCAL_DISK;
         }
+        ReplicaType operator()(
+            const std::unique_ptr<ObjectStorageReplicaData>&) const {
+            return ReplicaType::OBJECT_STORAGE;
+        }
         ReplicaType operator()(const std::unique_ptr<DfsReplicaData>&) const {
             return ReplicaType::DFS;
         }
@@ -757,10 +812,26 @@ class Replica {
     struct Descriptor {
         ReplicaID id{0};
         std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
-                     LocalDiskDescriptor, DistributedFSDescriptor>
+                     LocalDiskDescriptor, DistributedFSDescriptor,
+                     ObjectStorageDescriptor>
             descriptor_variant;
         ReplicaStatus status;
-        YLT_REFL(Descriptor, id, descriptor_variant, status);
+        // Exact completion identity when a memory-only write replaces an object
+        // value.
+        struct_pack::compatible<ObjectWriteAttempt, 1> object_write_attempt;
+        YLT_REFL(Descriptor, id, descriptor_variant, status,
+                 object_write_attempt);
+
+        bool is_object_storage_replica() const noexcept {
+            return std::holds_alternative<ObjectStorageDescriptor>(
+                descriptor_variant);
+        }
+        const ObjectStorageDescriptor& get_object_storage_descriptor() const {
+            return std::get<ObjectStorageDescriptor>(descriptor_variant);
+        }
+        ObjectStorageDescriptor& get_object_storage_descriptor() {
+            return std::get<ObjectStorageDescriptor>(descriptor_variant);
+        }
 
         // Helper functions
         bool is_memory_replica() noexcept {
@@ -891,7 +962,8 @@ class Replica {
     // DFS 64 B) for the replicas that never use them.
     using Data = std::variant<
         MemoryReplicaData, NoFReplicaData, std::unique_ptr<DiskReplicaData>,
-        std::unique_ptr<LocalDiskReplicaData>, std::unique_ptr<DfsReplicaData>>;
+        std::unique_ptr<LocalDiskReplicaData>, std::unique_ptr<DfsReplicaData>,
+        std::unique_ptr<ObjectStorageReplicaData>>;
 
     static Data MakeBufferedData(std::unique_ptr<AllocatedBuffer> buffer,
                                  ReplicaType replica_type) {
@@ -971,6 +1043,14 @@ class Replica {
           status_(status),
           refcnt_(0) {}
 
+    Replica(ReplicaID id, ObjectStorageDescriptor descriptor,
+            ReplicaStatus status)
+        : id_(id),
+          data_(std::make_unique<ObjectStorageReplicaData>(
+              ObjectStorageReplicaData{std::move(descriptor)})),
+          status_(status),
+          refcnt_(0) {}
+
     // Process-wide and monotonic. Standby restores bump it past the max
     // restored id and never roll back: a failed restore keeps the counter
     // advanced so ids are never reused.
@@ -1026,6 +1106,8 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
         desc.descriptor_variant = std::move(local_disk_desc);
+    } else if (is_object_storage_replica()) {
+        desc.descriptor_variant = get_object_storage_descriptor();
     } else if (is_dfs_replica()) {
         desc.descriptor_variant = DfsData(data_).descriptor;
     }

@@ -40,6 +40,10 @@ class RestObjectStorageAdapter : public ObjectStorageAdapter {
                                            int iovcnt) override;
     bool SupportsSinglePutAttempt() const override { return true; }
     bool SupportsSinglePutVAttempt() const override { return true; }
+    tl::expected<void, ErrorCode> PutVOnceWithOutcome(const std::string& key,
+                                                      const iovec* iov,
+                                                      int count,
+                                                      bool& may_exist) override;
     tl::expected<size_t, ErrorCode> Get(const std::string& logical_key,
                                         void* buf, size_t len) override;
     tl::expected<size_t, ErrorCode> GetRange(const std::string& logical_key,
@@ -52,6 +56,10 @@ class RestObjectStorageAdapter : public ObjectStorageAdapter {
     tl::expected<bool, ErrorCode> Exists(
         const std::string& logical_key) override;
     tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() override;
+    tl::expected<ObjectListPage, ErrorCode> ListPage(const std::string&,
+                                                     const std::string&,
+                                                     size_t) override;
+    bool SupportsGcListing() const override { return true; }
     tl::expected<void, ErrorCode> CheckHealth() override;
 
     // Operations that are intentionally not part of the common
@@ -125,14 +133,16 @@ class RestObjectStorageAdapter : public ObjectStorageAdapter {
         const char* body = nullptr, size_t body_size = 0,
         const std::string& range = "", const iovec* upload_iov = nullptr,
         int upload_iovcnt = 0, void* download_buffer = nullptr,
-        size_t download_capacity = 0, bool retry = true) const;
+        size_t download_capacity = 0, bool retry = true,
+        bool* may_exist = nullptr) const;
 
     tl::expected<void, ErrorCode> PutImpl(const std::string& logical_key,
                                           std::span<const char> data,
                                           bool retry);
     tl::expected<void, ErrorCode> PutVImpl(const std::string& logical_key,
                                            const iovec* iov, int iovcnt,
-                                           bool retry);
+                                           bool retry,
+                                           bool* may_exist = nullptr);
 
     // Runs the batch, then retries requests that failed transiently.
     std::vector<tl::expected<size_t, ErrorCode>> RequestBatch(

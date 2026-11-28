@@ -6,21 +6,9 @@
 #include <vector>
 
 #include "replica.h"
+#include "config/object_storage_config.h"
 
 namespace mooncake {
-
-// Non-secret identity of the storage namespace. Credentials stay process-local.
-struct ObjectReplicaTarget {
-    std::string provider;
-    std::string endpoint;
-    std::string bucket;
-    std::string region;
-    std::string prefix;
-    bool path_style{false};
-    YLT_REFL(ObjectReplicaTarget, provider, endpoint, bucket, region, prefix,
-             path_style);
-    bool operator==(const ObjectReplicaTarget&) const = default;
-};
 
 // Object addressing only; this review unit does not add a Store replica type.
 struct ObjectStorageLocation {
@@ -36,8 +24,8 @@ enum class ObjectUploadPhase : uint8_t {
 };
 
 // No logical head or commit flag: visibility is owned by Master metadata.
-// A retired, uncertain upload remains tracked even after a successful DELETE,
-// because its single authorized PUT can still materialize later.
+// Uncertain retired uploads are retained for a bounded period in GC-enabled
+// namespaces. Orphan scans reclaim PUTs that materialize after forget.
 struct ObjectUploadRecord {
     ObjectReplicaTarget target;
     std::string tenant_id;
@@ -48,8 +36,10 @@ struct ObjectUploadRecord {
     ObjectUploadPhase phase{ObjectUploadPhase::AUTHORIZED};
     uint64_t not_before_ms{0};
     bool upload_finished{false};
+    // Largest lease TTL any leader serving this immutable object can grant.
+    struct_pack::compatible<uint64_t, 1> read_lease_ttl_ms;
     YLT_REFL(ObjectUploadRecord, target, tenant_id, key, writer, replica_id,
-             object, phase, not_before_ms, upload_finished);
+             object, phase, not_before_ms, upload_finished, read_lease_ttl_ms);
 };
 
 // One ordered-log entry changes visibility and its upload/retirement
@@ -60,8 +50,12 @@ struct ObjectReplicaMutation {
     std::vector<std::string> forget;
     std::string metadata_payload;
     bool remove_value{false};
+    // Timed-out retirements handed off to namespace orphan GC, not an upload
+    // completion assertion. Both lists are validated by the fenced log replay.
+    struct_pack::compatible<std::vector<std::string>, 1> expired_forget;
+    struct_pack::compatible<std::vector<std::string>, 1> orphan_deletes;
     YLT_REFL(ObjectReplicaMutation, target, records, forget, metadata_payload,
-             remove_value);
+             remove_value, expired_forget, orphan_deletes);
 };
 
 struct ObjectReplicaSnapshot {

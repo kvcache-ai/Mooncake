@@ -105,6 +105,12 @@ struct TransferMetric {
                          "Get transfer latency (us)", kLatencyBucket, labels),
           put_latency_us("mooncake_transfer_put_latency",
                          "Put transfer latency (us)", kLatencyBucket, labels),
+          object_put_latency_us("mooncake_object_put_latency",
+                                "Object PUT including staging (us)",
+                                kLatencyBucket, labels),
+          object_get_latency_us("mooncake_object_get_latency",
+                                "Object GET including scatter (us)",
+                                kLatencyBucket, labels),
           start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t total_read_bytes;
@@ -113,6 +119,8 @@ struct TransferMetric {
     ylt::metric::histogram_t batch_get_latency_us;
     ylt::metric::histogram_t get_latency_us;
     ylt::metric::histogram_t put_latency_us;
+    ylt::metric::histogram_t object_put_latency_us;
+    ylt::metric::histogram_t object_get_latency_us;
 
     void serialize(std::string& str) {
         total_read_bytes.serialize(str);
@@ -121,6 +129,8 @@ struct TransferMetric {
         batch_get_latency_us.serialize(str);
         get_latency_us.serialize(str);
         put_latency_us.serialize(str);
+        object_put_latency_us.serialize(str);
+        object_get_latency_us.serialize(str);
     }
 
     std::string summary_metrics(bool include_bandwidth = true) {

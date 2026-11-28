@@ -47,6 +47,31 @@ class MasterServiceTestPeer {
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
 
+    // Exercise object commit and recovery with the in-memory HA log. Remote
+    // I/O and the cleanup worker are deliberately not started by this fixture.
+    StandbyMetadataStore& EnableObjectRecordsForTesting(
+        const ObjectStorageConfig& config);
+
+    void StartObjectGcForTesting(
+        std::shared_ptr<ObjectStorageAdapter> adapter) {
+        service_.object_storage_adapter_ = std::move(adapter);
+        service_.object_storage_worker_.Start();
+        service_.object_storage_worker_.Schedule();
+    }
+    void StopObjectGcForTesting() { service_.object_storage_worker_.Stop(); }
+    void SweepObjectOrphansForTesting(
+        std::shared_ptr<ObjectStorageAdapter> adapter) {
+        service_.object_storage_adapter_ = std::move(adapter);
+        service_.object_gc_scan_at_ = {};
+        service_.SweepObjectStorageOrphans();
+    }
+    std::pair<size_t, size_t> ObjectAdmissionForTesting() {
+        std::lock_guard lock(service_.object_storage_mutex_);
+        return {service_.object_pending_deadlines_.size() -
+                    service_.object_gc_records_.size(),
+                service_.object_gc_records_.size()};
+    }
+
     void SetBatchOpLogWriterFactoryForTesting(
         MasterService::BatchOpLogWriterFactory factory);
 
@@ -62,6 +87,11 @@ class MasterServiceTestPeer {
     // Drive one eviction cycle synchronously, without the periodic worker.
     void RunBatchEvictForTesting(double evict_ratio_target,
                                  double evict_ratio_lowerbound);
+
+    auto ObjectCleanupDeadline(const std::string& name) {
+        std::lock_guard lock(service_.object_storage_mutex_);
+        return service_.object_pending_deadlines_.at(name).run_at;
+    }
 
     void RunNoFBatchEvictForTesting(double evict_ratio_target,
                                     double evict_ratio_lowerbound);
@@ -89,6 +119,10 @@ class MasterServiceTestPeer {
         const std::function<void(const TenantId&, metadata::Namespace&)>& visit)
         const {
         service_.VisitNamespaces(visit);
+    }
+
+    static auto KvMediaMasksForMetadata(const ObjectMetadata& metadata) {
+        return MasterService::KvMediaMasksForMetadata(metadata);
     }
 
     // Enable epoch bookkeeping without starting a live KV event publisher.

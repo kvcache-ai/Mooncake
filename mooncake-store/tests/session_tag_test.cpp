@@ -46,11 +46,30 @@ void operator delete[](void* ptr, const std::nothrow_t&) noexcept {
 
 namespace mooncake::test {
 namespace {
-// Pre-session RPC shape. Keep this fixture independent of ReplicateConfig.
+// Frozen pre-object RPC shape; this upgrade intentionally changes its type
+// code.
 struct LegacyReplicateConfig {
     size_t replica_num{1};
     size_t nof_replica_num{0};
     size_t dfs_replica_num{0};
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms;
+    bool with_hard_pin{false};
+    std::vector<std::string> preferred_segments;
+    std::string preferred_segment;
+    std::vector<std::string> preferred_nof_segments;
+    bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::string host_id;
+    std::optional<std::vector<std::string>> group_ids;
+};
+
+// Current object-aware RPC base, without session or affinity extensions.
+struct BaseReplicateConfig {
+    size_t replica_num{1};
+    size_t nof_replica_num{0};
+    size_t dfs_replica_num{0};
+    size_t os_replica_num{0};
     SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
     std::optional<uint64_t> soft_pin_ttl_ms;
     bool with_hard_pin{false};
@@ -87,22 +106,38 @@ ReplicateConfig Tagged(std::string id) {
 }
 }  // namespace
 
-TEST(SessionTagTest, RpcCompatibilityAndBatchValidation) {
-    EXPECT_EQ(struct_pack::get_type_code<ReplicateConfig>(),
+TEST(SessionTagTest, ObjectConfigRequiresCoordinatedRpcUpgrade) {
+    EXPECT_NE(struct_pack::get_type_code<ReplicateConfig>(),
               struct_pack::get_type_code<LegacyReplicateConfig>());
     LegacyReplicateConfig legacy;
+    EXPECT_FALSE(struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(legacy)));
+    ReplicateConfig current;
+    EXPECT_EQ(current.os_replica_num, 0);
+    EXPECT_FALSE(struct_pack::deserialize<LegacyReplicateConfig>(
+        struct_pack::serialize(current)));
+}
+
+TEST(SessionTagTest, RpcCompatibilityAndBatchValidation) {
+    EXPECT_EQ(struct_pack::get_type_code<ReplicateConfig>(),
+              struct_pack::get_type_code<BaseReplicateConfig>());
+    BaseReplicateConfig legacy;
+    legacy.os_replica_num = 1;
     legacy.group_ids = std::vector<std::string>{"group"};
     auto decoded = struct_pack::deserialize<ReplicateConfig>(
         struct_pack::serialize(legacy));
     ASSERT_TRUE(decoded);
     EXPECT_FALSE(decoded->session_ids);
+    EXPECT_EQ(decoded->os_replica_num, 1);
     EXPECT_EQ(decoded->group_ids, legacy.group_ids);
 
     auto config = Tagged("session");
     config.group_ids = legacy.group_ids;
-    auto old_reader = struct_pack::deserialize<LegacyReplicateConfig>(
+    config.os_replica_num = 1;
+    auto old_reader = struct_pack::deserialize<BaseReplicateConfig>(
         struct_pack::serialize(config));
     ASSERT_TRUE(old_reader);
+    EXPECT_EQ(old_reader->os_replica_num, 1);
     EXPECT_EQ(old_reader->group_ids, legacy.group_ids);
     auto new_reader = struct_pack::deserialize<ReplicateConfig>(
         struct_pack::serialize(config));

@@ -479,6 +479,7 @@ add_store_test(bucket_backend_config_test bucket_backend_config_test.cpp)
 add_store_test(offset_allocator_backend_config_test
                offset_allocator_backend_config_test.cpp)
 add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
+add_store_test(client_object_storage_test client_object_storage_test.cpp)
 add_store_test(object_storage_adapter_test object_storage_adapter_test.cpp)
 add_store_test(object_storage_backend_test object_storage_backend_test.cpp)
 add_store_test(kvcs_object_storage_adapter_test
@@ -684,3 +685,9 @@ target_include_directories(hf3fs_resource_manager_test BEFORE
 target_link_libraries(hf3fs_resource_manager_test PRIVATE gtest gtest_main
                                                           pthread)
 add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)
+
+# Manual end-to-end protocol driver; orchestrated by object_storage_e2e.py.
+add_executable(object_storage_protocol_client
+               object_storage_protocol_client.cpp)
+target_link_libraries(object_storage_protocol_client PRIVATE mooncake_store
+                                                             glog::glog)

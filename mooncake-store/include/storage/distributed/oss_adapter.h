@@ -1,4 +1,6 @@
 #pragma once
+#include <optional>
+#include "config/object_storage_config.h"
 
 #include <map>
 #include <span>
@@ -18,6 +20,10 @@ namespace mooncake {
 class OssObjectStorageAdapter : public ObjectStorageAdapter {
    public:
     explicit OssObjectStorageAdapter(std::string key_prefix);
+    explicit OssObjectStorageAdapter(ObjectReplicaTarget target)
+        : OssObjectStorageAdapter(target.prefix) {
+        target_ = std::move(target);
+    }
     ~OssObjectStorageAdapter() override = default;
 
     tl::expected<void, ErrorCode> Put(const std::string& logical_key,
@@ -36,12 +42,20 @@ class OssObjectStorageAdapter : public ObjectStorageAdapter {
     tl::expected<bool, ErrorCode> Exists(
         const std::string& logical_key) override;
     tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() override;
+    tl::expected<ObjectListPage, ErrorCode> ListPage(const std::string&,
+                                                     const std::string&,
+                                                     size_t) override;
+    bool SupportsGcListing() const override { return true; }
 
     tl::expected<void, ErrorCode> Init() override;
     tl::expected<void, ErrorCode> CheckHealth() override;
     const char* GetName() const override { return "oss"; }
     bool SupportsSinglePutAttempt() const override { return true; }
     bool SupportsSinglePutVAttempt() const override { return true; }
+    tl::expected<void, ErrorCode> PutVOnceWithOutcome(const std::string& key,
+                                                      const iovec* iov,
+                                                      int count,
+                                                      bool& may_exist) override;
 
     // OSS-specific operations that are intentionally not part of the common
     // ObjectStorageAdapter contract.
@@ -52,6 +66,7 @@ class OssObjectStorageAdapter : public ObjectStorageAdapter {
     tl::expected<size_t, ErrorCode> GetSize(const std::string& logical_key);
 
    private:
+    std::optional<ObjectReplicaTarget> target_;
     struct Response {
         long status = 0;
         size_t transferred = 0;
@@ -75,7 +90,7 @@ class OssObjectStorageAdapter : public ObjectStorageAdapter {
         const char* body = nullptr, size_t body_size = 0,
         const std::string& range = "", const iovec* upload_iov = nullptr,
         int upload_iovcnt = 0, void* download_buffer = nullptr,
-        size_t download_capacity = 0) const;
+        size_t download_capacity = 0, bool* may_exist = nullptr) const;
 
     std::vector<tl::expected<size_t, ErrorCode>> RequestBatch(
         const std::vector<BatchRequest>& requests);
