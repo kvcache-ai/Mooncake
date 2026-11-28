@@ -645,6 +645,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
     ) -> std::result::Result<Response<pb::BatchContainsRoutesReply>, Status> {
         let request = request.into_inner();
         let include_presence = request.include_presence && !self.legacy_contains;
+        let require_filtered_presence = include_presence && request.require_filtered_presence;
         let keys = request
             .keys
             .into_iter()
@@ -656,6 +657,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             authority: ClientStableId::new(request.authority),
             keys,
             include_presence,
+            require_filtered_presence,
         };
         let replies = match serve_route_control_request(self.authority.as_ref(), route_request) {
             Ok(RouteControlResponse::BatchContains(results)) => results
@@ -665,11 +667,13 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                         exists,
                         error: None,
                         presence: None,
+                        filtered_presence: false,
                     },
                     Err(error) => pb::ContainsRouteReply {
                         exists: false,
                         error: Some(pb_error(error)),
                         presence: None,
+                        filtered_presence: false,
                     },
                 })
                 .collect(),
@@ -687,12 +691,14 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                                 live_version: presence.live_version.map(|version| version.0),
                                 delete_version: presence.delete_version.map(|version| version.0),
                             }),
+                            filtered_presence: require_filtered_presence,
                         }
                     }
                     Err(error) => pb::ContainsRouteReply {
                         exists: false,
                         error: Some(pb_error(error)),
                         presence: None,
+                        filtered_presence: false,
                     },
                 })
                 .collect(),
@@ -706,6 +712,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                         exists: false,
                         error: Some(detail.clone()),
                         presence: None,
+                        filtered_presence: false,
                     })
                     .collect()
             }
@@ -716,6 +723,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                         exists: false,
                         error: Some(detail.clone()),
                         presence: None,
+                        filtered_presence: false,
                     })
                     .collect()
             }
