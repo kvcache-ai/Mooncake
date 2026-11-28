@@ -194,4 +194,43 @@ TEST_F(BatchReadTest, ListsAndCountsThroughTheRouteCursors) {
     EXPECT_EQ(service.GetKeyCount(), 2u * kKeysPerTenant);
 }
 
+TEST_F(BatchReadTest, LargeBatchExistMatchesPointReadsAndGrantsLeases) {
+    MasterService service(MultiTenantConfig());
+    const auto context = PrepareSimpleSegment(service);
+    Populate(service, context.client_id);
+
+    std::vector<std::string> keys;
+    constexpr int kLargeCount = 3000;
+    keys.reserve(kLargeCount + 5);
+    for (int i = 0; i < kLargeCount; ++i) {
+        keys.push_back("a" + std::to_string(i % kKeysPerTenant));
+    }
+    keys.push_back("a7");
+    keys.push_back("a-pending");
+    keys.push_back("absent");
+    keys.push_back("b3");
+    keys.push_back("a7");
+
+    // BatchProbeKey grants no leases.
+    const auto probed =
+        service.BatchProbeKey(GrantLeasePolicy{}, keys, kTenantA);
+    ASSERT_EQ(probed.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(probed[i].has_value());
+        EXPECT_EQ(*probed[i], ReadableInTenantA(keys[i])) << keys[i];
+    }
+    EXPECT_TRUE(service.Remove("a0", kTenantA).has_value());
+
+    // BatchExistKey matches point reads and grants leases on readable hits.
+    const auto exists = service.BatchExistKey(keys, kTenantA);
+    ASSERT_EQ(exists.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(exists[i].has_value());
+        const bool expected = keys[i] != "a0" && ReadableInTenantA(keys[i]);
+        EXPECT_EQ(*exists[i], expected) << keys[i];
+    }
+    EXPECT_EQ(service.Remove("a1", kTenantA).error(),
+              ErrorCode::OBJECT_HAS_LEASE);
+}
+
 }  // namespace mooncake::test

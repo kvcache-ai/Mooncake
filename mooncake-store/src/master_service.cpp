@@ -2965,20 +2965,29 @@ auto MasterService::ExistKeyImpl(const std::string& key,
         return false;
     }
 
-    return ReadExistence(accessor.Get(), grant_lease);
+    return ReadExistence(accessor.Get(), MakeReadLeaseDeadline(grant_lease));
 }
 
-bool MasterService::ReadExistence(const ObjectMetadata& metadata,
-                                  bool grant_lease) const {
-    if (!HasReadableReplica(metadata)) {
+std::optional<std::chrono::system_clock::time_point>
+MasterService::MakeReadLeaseDeadline(bool grant_lease) const {
+    if (!grant_lease) {
+        return std::nullopt;
+    }
+    return std::chrono::system_clock::now() +
+           std::chrono::milliseconds(default_kv_lease_ttl_);
+}
+
+bool MasterService::ReadExistence(
+    const ObjectMetadata& metadata,
+    std::optional<std::chrono::system_clock::time_point> lease_deadline) const {
+    if (metadata.GetPart(0).length() == 0 || !HasReadableReplica(metadata)) {
         return false;
     }
 
-    if (grant_lease) {
+    if (lease_deadline.has_value()) {
         // Protect the live object for a follow-up read. The boolean response
         // carries no descriptor or client-side deadline.
-        metadata.GrantReadLease(
-            std::chrono::milliseconds(default_kv_lease_ttl_));
+        metadata.ExtendReadLeaseTo(*lease_deadline);
     }
     return true;
 }
@@ -3044,22 +3053,24 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
     const std::vector<std::string>& keys, const TenantId& tenant_id,
     bool grant_lease) {
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
-    std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
+    std::vector<tl::expected<bool, ErrorCode>> results(
+        keys.size(), tl::expected<bool, ErrorCode>(false));
     if (keys.empty()) {
         return results;
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        MetadataAccessorRO accessor(this, normalized_tenant, keys[i]);
-        if (!accessor.Exists()) {
-            VLOG(1) << "key=" << keys[i] << ", tenant_id=" << normalized_tenant
-                    << ", info=object_not_found";
-            results[i] = false;
-            continue;
-        }
-        results[i] = ReadExistence(accessor.Get(), grant_lease);
+    const metadata::Namespace* ns = namespaces_.Lookup(normalized_tenant);
+    if (ns == nullptr) {
+        return results;
     }
+
+    const auto lease_deadline = MakeReadLeaseDeadline(grant_lease);
+    ns->objects.BatchRead(keys, [&](size_t i, const ObjectMetadata& metadata) {
+        if (ReadExistence(metadata, lease_deadline)) {
+            results[i] = true;
+        }
+    });
     return results;
 }
 

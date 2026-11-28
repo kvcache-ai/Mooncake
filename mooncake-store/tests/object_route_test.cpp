@@ -1134,5 +1134,109 @@ TEST(ObjectRouteTest, ChurnKeepsTheRouteAndTheGroupConsistent) {
     EXPECT_EQ(ObjectRouteTestPeer::SlotCount(route), 0u);
 }
 
+TEST(ObjectRouteTest, BatchReadMatchesPointReadsAcrossSmallAndLargeBatches) {
+    ObjectRoute route;
+    constexpr int kObjectCount = 600;
+    for (int i = 0; i < kObjectCount; ++i) {
+        ASSERT_NE(PublishObject(route, "k" + std::to_string(i)), 0u);
+    }
+
+    auto verify = [&](const std::vector<std::string>& keys) {
+        std::vector<int> hits(keys.size(), 0);
+        route.BatchRead(keys, [&](size_t i, const ObjectMetadata& metadata) {
+            EXPECT_EQ(metadata.user_key, keys[i]);
+            hits[i] = 1;
+        });
+        for (size_t i = 0; i < keys.size(); ++i) {
+            EXPECT_EQ(hits[i], route.Contains(keys[i]) ? 1 : 0)
+                << "mismatch at i=" << i << " key=" << keys[i];
+        }
+    };
+
+    // Empty and small (< stripe grouping threshold) batches.
+    verify({});
+    verify({"k0", "missing", "k7", "k0", "k599"});
+
+    // Large (>= stripe grouping threshold) batch with duplicates and misses.
+    std::vector<std::string> large;
+    large.reserve(3000);
+    for (int i = 0; i < 3000; ++i) {
+        if (i % 3 == 0) {
+            large.push_back("k" + std::to_string(i % kObjectCount));
+        } else {
+            large.push_back("missing_" + std::to_string(i));
+        }
+    }
+    verify(large);
+}
+
+TEST(ObjectRouteTest, BatchReadDefersContendedSlotsAndPreservesLockOrder) {
+    ObjectRoute route;
+    constexpr int kObjectCount = 400;
+    for (int i = 0; i < kObjectCount; ++i) {
+        ASSERT_NE(PublishObject(route, "k" + std::to_string(i)), 0u);
+    }
+
+    std::vector<std::string> keys;
+    keys.reserve(512);
+    for (int i = 0; i < 512; ++i) {
+        keys.push_back("k" + std::to_string(i % kObjectCount));
+    }
+
+    auto run_while_write_locked = [&](std::string_view locked_key,
+                                      bool tear_down) {
+        auto write_guard = route.Write(locked_key);
+        ASSERT_TRUE(write_guard.has_value());
+
+        std::atomic<bool> reader_started{false};
+        std::vector<int> results(keys.size(), 0);
+        std::thread reader([&] {
+            reader_started.store(true, std::memory_order_release);
+            route.BatchRead(
+                keys, [&](size_t i, const ObjectMetadata&) { results[i] = 1; });
+        });
+
+        while (!reader_started.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (tear_down) {
+            write_guard->TearDown();
+        }
+        write_guard.reset();
+        reader.join();
+
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const int expected = (tear_down && keys[i] == locked_key) ? 0 : 1;
+            EXPECT_EQ(results[i], expected) << "key=" << keys[i];
+        }
+    };
+
+    run_while_write_locked("k5", /*tear_down=*/false);
+    run_while_write_locked("k7", /*tear_down=*/true);
+    EXPECT_EQ(ObjectRouteTestPeer::SlotCount(route),
+              static_cast<size_t>(kObjectCount - 1));
+}
+
+TEST(ObjectRouteTest, BatchReadNotifiesObserverWhenReportReadsEnabled) {
+    struct CountingObserver final : route::RouteObserver {
+        void OnWriteRelease(const route::WriteGuard&) override {}
+        void OnReadRelease(const route::ReadGuard&) override {
+            ++read_releases;
+        }
+        std::atomic<int> read_releases{0};
+    } observer;
+
+    ObjectRoute route(&observer, /*report_reads=*/true);
+    ASSERT_NE(PublishObject(route, "a"), 0u);
+    ASSERT_NE(PublishObject(route, "b"), 0u);
+
+    std::vector<std::string> keys{"a", "missing", "b", "a"};
+    int hits = 0;
+    route.BatchRead(keys, [&](size_t, const ObjectMetadata&) { ++hits; });
+    EXPECT_EQ(hits, 3);
+    EXPECT_EQ(observer.read_releases.load(), 3);
+}
+
 }  // namespace
 }  // namespace mooncake

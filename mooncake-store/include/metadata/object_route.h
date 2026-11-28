@@ -45,10 +45,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -224,7 +226,8 @@ using SlotMap = std::unordered_map<std::string, KeySlot, TransparentStringHash,
                                    std::equal_to<>>;
 
 // One of a route's stripes: a share of its slots under one lock.
-struct Stripe {
+// Cacheline-aligned so adjacent stripes do not false-share their shared_mutex.
+struct alignas(64) Stripe {
     mutable std::shared_mutex lock;
     SlotMap slots;
 };
@@ -451,6 +454,15 @@ class ObjectRoute {
         return Acquire<LockMode::kRead>(*this, ref.key, ref.generation);
     }
 
+    // Visits each present key in `keys` under its shared key lock, grouping
+    // larger batches by stripe so each stripe lock is taken once instead of
+    // once per key. `on_hit(size_t index, const ObjectMetadata&)` runs under
+    // the key's shared lock (and possibly its stripe's shared lock), so it
+    // must not reach any route or block on locks ordered before a stripe/slot
+    // lock. Missing keys are skipped.
+    template <typename OnHit>
+    void BatchRead(std::span<const std::string> keys, OnHit&& on_hit) const;
+
     // The object under `key`, held exclusively; nullopt when it holds none.
     [[nodiscard]] std::optional<WriteGuard> Write(std::string_view key) {
         return Acquire<LockMode::kWrite>(*this, key, std::nullopt);
@@ -530,12 +542,49 @@ class ObjectRoute {
     friend class Guard;
     friend struct test::ObjectRouteTestPeer;
 
+    static_assert((kStripeCount & (kStripeCount - 1)) == 0,
+                  "kStripeCount must be a power of two");
+
+    [[nodiscard]] static constexpr size_t StripeIndexFromHash(
+        size_t hash) noexcept {
+        return hash & (kStripeCount - 1);
+    }
     [[nodiscard]] static size_t StripeIndex(std::string_view key) {
-        return TransparentStringHash{}(key) % kStripeCount;
+        return StripeIndexFromHash(TransparentStringHash{}(key));
     }
     [[nodiscard]] Stripe& StripeOf(std::string_view key) const {
         return stripes_[StripeIndex(key)];
     }
+
+    struct DeferredRead {
+        size_t index;
+        SlotHandle slot;
+    };
+    struct HashedKeyIndex {
+        uint32_t index;
+        size_t hash;
+    };
+
+    // Probes one key while `stripe.lock` is held shared. Uncontended hits skip
+    // SlotHandle refcount atomics; contended slots are appended to `deferred`
+    // and resolved after releasing the stripe lock to preserve lock order.
+    template <typename OnHit>
+    static void ReadKeyInLockedStripe(Stripe& stripe, size_t index,
+                                      PrehashedStringView key,
+                                      std::vector<DeferredRead>& deferred,
+                                      OnHit& on_hit);
+
+    template <typename OnHit>
+    static void ResolveDeferredReads(std::vector<DeferredRead>& deferred,
+                                     OnHit& on_hit);
+
+    template <typename OnHit>
+    void BatchReadDirect(std::span<const std::string> keys,
+                         OnHit& on_hit) const;
+
+    template <typename OnHit>
+    void BatchReadGrouped(std::span<const std::string> keys,
+                          OnHit& on_hit) const;
 
     // The key locked in `kMode` on `route`, handed out only while it holds an
     // object and, given a `generation`, only while that is the current
@@ -818,9 +867,10 @@ inline ObjectRoute::~ObjectRoute() {
 
 inline SlotHandle ObjectRoute::FindSlot(std::string_view key) const {
     AssertNotInCursor();
-    Stripe& stripe = StripeOf(key);
+    const size_t hash = TransparentStringHash{}(key);
+    Stripe& stripe = stripes_[StripeIndexFromHash(hash)];
     std::shared_lock<std::shared_mutex> lock(stripe.lock);
-    const auto it = stripe.slots.find(key);
+    const auto it = stripe.slots.find(PrehashedStringView{key, hash});
     return it == stripe.slots.end() ? SlotHandle()
                                     : SlotHandle(stripe, it->second);
 }
@@ -856,6 +906,165 @@ std::optional<Guard<kMode>> ObjectRoute::Acquire(
 
 inline WriteGuard ObjectRoute::WriteKey(std::string_view key) {
     return WriteGuard(this, FindOrCreateSlot(key)).HandOut();
+}
+
+template <typename OnHit>
+void ObjectRoute::ReadKeyInLockedStripe(Stripe& stripe, size_t index,
+                                        PrehashedStringView key,
+                                        std::vector<DeferredRead>& deferred,
+                                        OnHit& on_hit) {
+    const auto it = stripe.slots.find(key);
+    if (it == stripe.slots.end()) {
+        return;
+    }
+    KeySlot& slot = it->second;
+    std::shared_lock<std::shared_mutex> slot_lock(slot.mutex_,
+                                                  std::try_to_lock);
+    if (!slot_lock.owns_lock()) [[unlikely]] {
+        deferred.push_back({index, SlotHandle(stripe, slot)});
+        return;
+    }
+    if (slot.record_.has_value()) {
+        on_hit(index, slot.record_->metadata);
+    }
+}
+
+template <typename OnHit>
+void ObjectRoute::ResolveDeferredReads(std::vector<DeferredRead>& deferred,
+                                       OnHit& on_hit) {
+    for (DeferredRead& item : deferred) {
+        KeySlot& slot = *item.slot;
+        std::shared_lock<std::shared_mutex> slot_lock(slot.mutex_);
+        if (slot.record_.has_value()) {
+            on_hit(item.index, slot.record_->metadata);
+        }
+    }
+    deferred.clear();
+}
+
+template <typename OnHit>
+void ObjectRoute::BatchReadDirect(std::span<const std::string> keys,
+                                  OnHit& on_hit) const {
+    std::vector<DeferredRead> deferred;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const size_t hash = TransparentStringHash{}(keys[i]);
+        Stripe& stripe = stripes_[StripeIndexFromHash(hash)];
+        std::shared_lock<std::shared_mutex> stripe_lock(stripe.lock);
+        ReadKeyInLockedStripe(stripe, i, PrehashedStringView{keys[i], hash},
+                              deferred, on_hit);
+    }
+    if (!deferred.empty()) [[unlikely]] {
+        ResolveDeferredReads(deferred, on_hit);
+    }
+}
+
+template <typename OnHit>
+void ObjectRoute::BatchReadGrouped(std::span<const std::string> keys,
+                                   OnHit& on_hit) const {
+    struct Scratch {
+        std::vector<size_t> hashes;
+        std::vector<HashedKeyIndex> grouped;
+    };
+    thread_local Scratch scratch;
+
+    const size_t n = keys.size();
+    scratch.hashes.resize(n);
+    scratch.grouped.resize(n);
+
+    // 1. Hash each key once and count how many fall into each stripe.
+    std::array<uint32_t, kStripeCount> counts{};
+    for (size_t i = 0; i < n; ++i) {
+        const size_t hash = TransparentStringHash{}(keys[i]);
+        scratch.hashes[i] = hash;
+        ++counts[StripeIndexFromHash(hash)];
+    }
+
+    // 2. Prefix-sum stripe ranges and scatter (index, hash) into stripe order.
+    std::array<uint32_t, kStripeCount> offsets;
+    std::array<uint32_t, kStripeCount> write_pos;
+    uint32_t running = 0;
+    for (size_t s = 0; s < kStripeCount; ++s) {
+        offsets[s] = running;
+        write_pos[s] = running;
+        running += counts[s];
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const size_t hash = scratch.hashes[i];
+        scratch.grouped[write_pos[StripeIndexFromHash(hash)]++] = {
+            static_cast<uint32_t>(i), hash};
+    }
+
+    // 3. Sweep stripes from a rotating start so concurrent readers do not
+    //    lockstep onto the same stripe mutex cache lines.
+    static std::atomic<size_t> next_start_stripe{0};
+    const size_t start_stripe = StripeIndexFromHash(
+        next_start_stripe.fetch_add(137, std::memory_order_relaxed));
+
+    std::vector<DeferredRead> deferred;
+    for (size_t step = 0; step < kStripeCount; ++step) {
+        const size_t s = StripeIndexFromHash(start_stripe + step);
+        if (counts[s] == 0) {
+            continue;
+        }
+        Stripe& stripe = stripes_[s];
+        std::shared_lock<std::shared_mutex> stripe_lock(stripe.lock);
+        if (stripe.slots.empty()) {
+            continue;
+        }
+
+        const uint32_t begin = offsets[s];
+        const uint32_t end = begin + counts[s];
+        for (uint32_t pos = begin; pos < end; ++pos) {
+            if (pos + 2 < end) {
+                __builtin_prefetch(&keys[scratch.grouped[pos + 2].index], 0, 1);
+            }
+            const HashedKeyIndex& entry = scratch.grouped[pos];
+            ReadKeyInLockedStripe(
+                stripe, entry.index,
+                PrehashedStringView{keys[entry.index], entry.hash}, deferred,
+                on_hit);
+        }
+    }
+
+    if (!deferred.empty()) [[unlikely]] {
+        ResolveDeferredReads(deferred, on_hit);
+    }
+
+    // Release scratch after unusually large batches so worker threads do not
+    // retain excessive memory indefinitely.
+    constexpr size_t kMaxRetainedScratch = 262144;
+    if (scratch.grouped.capacity() > kMaxRetainedScratch) {
+        std::vector<size_t>().swap(scratch.hashes);
+        std::vector<HashedKeyIndex>().swap(scratch.grouped);
+    }
+}
+
+template <typename OnHit>
+void ObjectRoute::BatchRead(std::span<const std::string> keys,
+                            OnHit&& on_hit) const {
+    AssertNotInCursor();
+    if (keys.empty()) {
+        return;
+    }
+    if (report_reads_) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (auto guard = Read(keys[i])) {
+                on_hit(i, guard->metadata());
+            }
+        }
+        return;
+    }
+    if (object_count_.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+
+    constexpr size_t kStripeGroupThreshold = 256;
+    if (keys.size() < kStripeGroupThreshold ||
+        keys.size() > std::numeric_limits<uint32_t>::max()) {
+        BatchReadDirect(keys, on_hit);
+    } else {
+        BatchReadGrouped(keys, on_hit);
+    }
 }
 
 template <typename... Args>
