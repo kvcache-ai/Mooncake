@@ -1,5 +1,7 @@
 #include "ha/leadership/backends/redis/redis_leader_coordinator.h"
 
+#include <algorithm>
+#include <limits>
 #include <chrono>
 #include <exception>
 #include <memory>
@@ -12,6 +14,7 @@
 
 #include "types.h"
 #include "config/ha_cluster_namespace_config.h"
+#include "config/redis_connection_config.h"
 #ifdef STORE_USE_REDIS
 #include <hiredis/hiredis.h>
 #endif
@@ -34,8 +37,6 @@ using common::redis::SanitizeHashTagComponent;
 
 constexpr auto kViewChangePollInterval = std::chrono::milliseconds(200);
 constexpr auto kMinimumRenewInterval = std::chrono::milliseconds(200);
-constexpr auto kRedisLeaseTtl =
-    std::chrono::seconds(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC);
 
 constexpr char kLeaderAddressField[] = "leader_address";
 constexpr char kViewVersionField[] = "view_version";
@@ -341,10 +342,7 @@ RedisLeaderCoordinator::TryAcquireLeadership(
             return tl::make_unexpected(err);
         }
 
-        const auto ttl_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                kRedisLeaseTtl)
-                .count();
+        const auto ttl_ms = lease_ttl_.count();
         auto reply =
             ExecuteLocked({"EVAL", kAcquireLeadershipScript, "2",
                            master_view_key_, view_version_key_, leader_address,
@@ -398,7 +396,7 @@ RedisLeaderCoordinator::TryAcquireLeadership(
         .view = MasterView{.leader_address = leader_address,
                            .view_version = view_version},
         .owner_token = std::move(owner_token),
-        .lease_ttl = kRedisLeaseTtl,
+        .lease_ttl = lease_ttl_,
     };
 
     return AcquireLeadershipResult{
@@ -410,8 +408,10 @@ RedisLeaderCoordinator::TryAcquireLeadership(
 
 tl::expected<bool, ErrorCode> RedisLeaderCoordinator::RenewLeadership(
     const LeadershipSession& session) {
-    if (session.owner_token.empty() ||
-        session.lease_ttl <= std::chrono::milliseconds::zero()) {
+    if (session.owner_token.empty() || spec_.leader_lease_ttl_sec <= 0 ||
+        spec_.leader_lease_ttl_sec >
+            std::numeric_limits<int64_t>::max() / 1000 ||
+        session.lease_ttl.count() != spec_.leader_lease_ttl_sec * 1000) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -440,6 +440,7 @@ tl::expected<bool, ErrorCode> RedisLeaderCoordinator::RenewLeadership(
                 return tl::make_unexpected(err);
             }
             bool renewed = false;
+            const auto renewal_started = std::chrono::steady_clock::now();
             err = RenewLeadershipOnceLocked(session, renewed);
             if (err != ErrorCode::OK) {
                 return tl::make_unexpected(err);
@@ -454,22 +455,23 @@ tl::expected<bool, ErrorCode> RedisLeaderCoordinator::RenewLeadership(
             renew_stop_requested_ = false;
             renew_result_ = ErrorCode::OK;
             ClearLeadershipMonitorStateLocked();
-            renew_thread_ = std::thread([this, session]() {
+            renew_thread_ = std::thread([this, session, renewal_started]() {
                 const auto renew_interval =
                     ResolveRenewInterval(session.lease_ttl);
+                auto next_renewal = renewal_started + renew_interval;
                 ErrorCode renew_result = ErrorCode::OK;
                 LeadershipLossReason loss_reason =
                     LeadershipLossReason::kLostLeadership;
 
                 while (true) {
                     std::unique_lock<std::mutex> lock(state_mutex_);
-                    if (renew_cv_.wait_for(lock, renew_interval,
-                                           [this, &session] {
-                                               return shutdown_requested_ ||
-                                                      renew_stop_requested_ ||
-                                                      renew_owner_token_ !=
-                                                          session.owner_token;
-                                           })) {
+                    if (renew_cv_.wait_until(lock, next_renewal,
+                                             [this, &session] {
+                                                 return shutdown_requested_ ||
+                                                        renew_stop_requested_ ||
+                                                        renew_owner_token_ !=
+                                                            session.owner_token;
+                                             })) {
                         break;
                     }
 
@@ -480,6 +482,9 @@ tl::expected<bool, ErrorCode> RedisLeaderCoordinator::RenewLeadership(
                         break;
                     }
 
+                    // ACK latency must not extend the lease renewal cadence.
+                    next_renewal =
+                        std::chrono::steady_clock::now() + renew_interval;
                     bool renewed = false;
                     err = RenewLeadershipOnceLocked(session, renewed);
                     if (err != ErrorCode::OK) {
@@ -671,10 +676,32 @@ LeadershipLossReason RedisLeaderCoordinator::ClassifyLeadershipLossReason(
 
 ErrorCode RedisLeaderCoordinator::ConnectLocked() {
     if (connected_ && client_) return ErrorCode::OK;
+    auto config = RedisConnectionConfig::FromEnvironment();
+    if (!config) return config.error();
+    if (spec_.leader_lease_ttl_sec <= 0 ||
+        spec_.leader_lease_ttl_sec >
+            std::numeric_limits<int64_t>::max() / 1000) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    lease_ttl_ = std::chrono::milliseconds(spec_.leader_lease_ttl_sec * 1000);
+    const bool persistent =
+        config->durability_profile == RedisDurabilityProfile::kPersistent;
+    const auto ack_budget = std::chrono::milliseconds(
+        config->replication_ack_timeout_ms +
+        (persistent ? config->aof_ack_timeout_ms : 0));
+    if (ack_budget >= lease_ttl_ / 2) {
+        LOG(ERROR) << "Redis leadership acknowledgement budget must be less "
+                      "than half leader_lease_ttl_sec";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    require_aof_ = persistent;
+    replication_ack_timeout_ =
+        std::chrono::milliseconds(config->replication_ack_timeout_ms);
+    aof_ack_timeout_ = std::chrono::milliseconds(config->aof_ack_timeout_ms);
     auto client = std::make_unique<common::redis::RedisClusterClient>();
     const auto result = client->ConnectDetailed(
         spec_.connstring, spec_.ha_redis_expected_replicas_per_shard,
-        spec_.redis_read_only);
+        spec_.redis_read_only, persistent);
     if (result.error != ErrorCode::OK) {
         LOG(ERROR) << "Redis leadership startup failed: error="
                    << toString(result.error) << " routing_error="
@@ -695,28 +722,37 @@ void RedisLeaderCoordinator::DisconnectLocked() {
 RedisReplyPtr RedisLeaderCoordinator::ExecuteLocked(
     const std::vector<std::string>& command, bool write) {
     const auto started = std::chrono::steady_clock::now();
+    const auto deadline =
+        started + std::min(std::chrono::milliseconds(2000), lease_ttl_ / 2);
     if (write) reconciliation_ = OwnershipReconciliation::NotNeeded;
     {
-        auto lease = client_->Execute(command, master_view_key_, write,
-                                      started + std::chrono::seconds(2));
+        auto lease =
+            client_->Execute(command, master_view_key_, write, deadline);
         if (lease.reply && lease.error == ErrorCode::OK) {
             if (!write || lease.reply->type == REDIS_REPLY_ERROR)
                 return std::move(lease.reply);
+            const auto replicas = spec_.ha_redis_expected_replicas_per_shard;
             const auto ack =
-                client_->Wait(lease, spec_.ha_redis_expected_replicas_per_shard,
-                              std::chrono::milliseconds(1000));
-            // Leave enough of the five-second lease for the next renewal.
-            if (ack && *ack == spec_.ha_redis_expected_replicas_per_shard &&
-                std::chrono::steady_clock::now() - started < kRedisLeaseTtl / 2)
+                client_->Wait(lease, replicas, replication_ack_timeout_);
+            bool confirmed = ack && *ack == replicas;
+            if (confirmed && require_aof_) {
+                const auto aof =
+                    client_->WaitAof(lease, replicas, aof_ack_timeout_);
+                confirmed = aof && aof->first == 1 && aof->second == replicas;
+            }
+            // Both waits share the execution connection and original deadline.
+            // Reserve half the TTL for renewal scheduling and stop on
+            // uncertainty.
+            if (confirmed && std::chrono::steady_clock::now() < deadline)
                 return std::move(lease.reply);
         }
     }
     if (write) {
         // Reconcile ownership on the current owner, but never turn a read-back
         // into replication confirmation or replay an uncertain lease mutation.
-        auto observed = client_->Execute(
-            {"HGET", master_view_key_, kOwnerTokenField}, master_view_key_,
-            false, started + std::chrono::seconds(2));
+        auto observed =
+            client_->Execute({"HGET", master_view_key_, kOwnerTokenField},
+                             master_view_key_, false, deadline);
         const auto& expected_owner = command[1] == kAcquireLeadershipScript
                                          ? command.back()
                                          : command[4];

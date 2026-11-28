@@ -101,7 +101,92 @@ TEST(RedisWriteAckTest, FailedOrUnknownExecutionNeverWaitsOrReplays) {
     }
 }
 
-TEST(RedisWriteAckTest, UnsupportedAofPolicyIsRejectedBeforeWriting) {
+TEST(RedisWriteAckTest, PersistentWriteRequiresWaitThenLocalAndReplicaAof) {
+    size_t calls = 0;
+    const auto result = ExecuteRedisWriteWithAck(
+        {.replicas_required = 2,
+         .require_local_aof = true,
+         .replica_aof_required = 2},
+        [&] {
+            EXPECT_EQ(0u, calls++);
+            return KvWriteResult::Committed();
+        },
+        [&](size_t replicas, std::chrono::milliseconds) {
+            EXPECT_EQ(2u, replicas);
+            EXPECT_EQ(1u, calls++);
+            return tl::expected<size_t, ErrorCode>(2);
+        },
+        [&](size_t replicas, std::chrono::milliseconds) {
+            EXPECT_EQ(2u, replicas);
+            EXPECT_EQ(2u, calls++);
+            return tl::expected<std::pair<size_t, size_t>, ErrorCode>(
+                std::pair<size_t, size_t>{1, 2});
+        });
+    EXPECT_EQ(KvWriteStatus::kCommitted, result.status);
+    EXPECT_TRUE(result.local_aof_acked);
+    EXPECT_EQ(2u, result.replica_aof_acked);
+    EXPECT_EQ(3u, calls);
+}
+
+TEST(RedisWriteAckTest, InsufficientAofCountsAreUnknown) {
+    const auto result = ExecuteRedisWriteWithAck(
+        {.replicas_required = 1,
+         .require_local_aof = true,
+         .replica_aof_required = 1},
+        [] { return KvWriteResult::Committed(); },
+        [](size_t, std::chrono::milliseconds)
+            -> tl::expected<size_t, ErrorCode> { return 1; },
+        [](size_t, std::chrono::milliseconds)
+            -> tl::expected<std::pair<size_t, size_t>, ErrorCode> {
+            return std::pair<size_t, size_t>{0, 1};
+        });
+    EXPECT_EQ(KvWriteStatus::kOutcomeUnknown, result.status);
+    EXPECT_FALSE(result.local_aof_acked);
+    EXPECT_EQ(1u, result.replica_aof_acked);
+}
+
+TEST(RedisWriteAckTest, AofWaitIsSkippedWhenReplicaWaitIsInsufficient) {
+    size_t aof_calls = 0;
+    const auto result = ExecuteRedisWriteWithAck(
+        {.replicas_required = 2,
+         .require_local_aof = true,
+         .replica_aof_required = 2},
+        [] { return KvWriteResult::Committed(); },
+        [](size_t, std::chrono::milliseconds)
+            -> tl::expected<size_t, ErrorCode> { return 1; },
+        [&](size_t, std::chrono::milliseconds)
+            -> tl::expected<std::pair<size_t, size_t>, ErrorCode> {
+            ++aof_calls;
+            return std::pair<size_t, size_t>{1, 2};
+        });
+    EXPECT_EQ(KvWriteStatus::kOutcomeUnknown, result.status);
+    EXPECT_EQ(0u, aof_calls);
+}
+
+TEST(RedisWriteAckTest, AofFailureNeverReplaysOrFallsBackToMemory) {
+    size_t scripts = 0;
+    const auto result = ExecuteRedisWriteWithAck(
+        {.replicas_required = 1,
+         .require_local_aof = true,
+         .replica_aof_required = 1},
+        [&] {
+            ++scripts;
+            return KvWriteResult::Committed();
+        },
+        [](size_t, std::chrono::milliseconds)
+            -> tl::expected<size_t, ErrorCode> { return 1; },
+        [](size_t, std::chrono::milliseconds)
+            -> tl::expected<std::pair<size_t, size_t>, ErrorCode> {
+            return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+        });
+    EXPECT_EQ(KvWriteStatus::kOutcomeUnknown, result.status);
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, result.error);
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, result.ToLegacyError());
+    EXPECT_EQ(1u, result.replicas_acked);
+    EXPECT_EQ(1u, scripts);
+}
+
+TEST(RedisWriteAckTest, InconsistentAofPolicyIsRejectedBeforeWriting) {
     size_t script_calls = 0;
     const auto result = ExecuteRedisWriteWithAck(
         {.replicas_required = 1, .require_local_aof = true},
@@ -112,7 +197,7 @@ TEST(RedisWriteAckTest, UnsupportedAofPolicyIsRejectedBeforeWriting) {
         [](size_t, std::chrono::milliseconds)
             -> tl::expected<size_t, ErrorCode> { return 1; });
     EXPECT_EQ(KvWriteStatus::kRejected, result.status);
-    EXPECT_EQ(ErrorCode::NOT_SUPPORTED, result.error);
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error);
     EXPECT_EQ(0u, script_calls);
 }
 

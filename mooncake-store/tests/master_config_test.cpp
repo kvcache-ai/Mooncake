@@ -1,9 +1,22 @@
 #include "master_config.h"
+#include "ha/ha_types.h"
+
+#include <limits>
 
 #include <gtest/gtest.h>
 
 namespace mooncake::test {
 namespace {
+
+TEST(RedisHaConfigTest, ReplicaCountMustFitPositiveRedisInteger) {
+    EXPECT_FALSE(ha::IsValidRedisReplicaCount(0));
+    EXPECT_FALSE(ha::IsValidRedisReplicaCount(static_cast<size_t>(-1)));
+    EXPECT_TRUE(ha::IsValidRedisReplicaCount(1));
+    EXPECT_TRUE(ha::IsValidRedisReplicaCount(2));
+    const auto maximum = static_cast<size_t>(std::numeric_limits<int>::max());
+    EXPECT_TRUE(ha::IsValidRedisReplicaCount(maximum));
+    EXPECT_FALSE(ha::IsValidRedisReplicaCount(maximum + 1));
+}
 
 TEST(RedisHaConfigTest, ReplicaCountSurvivesAllConfigAdapters) {
     MasterConfig master{};

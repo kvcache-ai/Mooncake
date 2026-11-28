@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -95,12 +96,20 @@ inline ErrorCode ValidateHABackendAvailability(HABackendType type) {
     return ErrorCode::INVALID_PARAMS;
 }
 
+inline bool IsValidRedisReplicaCount(size_t count) {
+    return count > 0 &&
+           count <= static_cast<size_t>(std::numeric_limits<int>::max());
+}
+
 struct HABackendSpec {
     HABackendType type = HABackendType::UNKNOWN;
     std::string connstring;
     ClusterNamespace cluster_namespace;
-    // Leadership lease TTL in seconds. Currently honored by the etcd backend.
+    // Leadership lease TTL in seconds, honored by etcd and Redis. Redis
+    // requires the configured acknowledgement budget to be strictly below half
+    // this TTL.
     int64_t leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
+    // All shards must have this positive replica count; zero is invalid for HA.
     size_t ha_redis_expected_replicas_per_shard = 0;
     // Client discovery reads topology without imposing a write policy.
     bool redis_read_only = false;

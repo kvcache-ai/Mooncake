@@ -18,7 +18,11 @@ class RedisHaKvBackend : public HaKvBackend {
     // exactly this count; WAIT 1 returning 2 is an unknown outcome. Callers
     // supplying a policy must ensure it matches the deployment's membership.
     // Cluster mode validates the configured count against discovered
-    // membership.
+    // membership. A configured persistent profile requires the supplied
+    // policy to require local AOF at Connect; explicit policies may strengthen
+    // a memory profile but cannot weaken a persistent one. Configure HA
+    // timeouts via the backend factory; direct callers can supply a timeout
+    // policy.
     explicit RedisHaKvBackend(
         KvWriteDurabilityPolicy policy = {.replicas_required = 1})
         : write_policy_(policy) {}

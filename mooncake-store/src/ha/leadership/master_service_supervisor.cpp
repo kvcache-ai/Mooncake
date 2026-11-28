@@ -81,6 +81,11 @@ tl::expected<HABackendSpec, ErrorCode> BuildHABackendSpec(
     if (connstring.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (backend_type.value() == HABackendType::REDIS &&
+        !IsValidRedisReplicaCount(
+            config.ha_redis_expected_replicas_per_shard)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
 
     return HABackendSpec{
         .type = backend_type.value(),

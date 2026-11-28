@@ -185,6 +185,9 @@ TEST_F(RedisOpLogBackendTest, AllWritesReportReplicationAcknowledgement) {
     ASSERT_EQ(KvWriteStatus::kCommitted, put.status);
     EXPECT_EQ(1u, put.replicas_required);
     EXPECT_EQ(1u, put.replicas_acked);
+    const auto policy = backend_->GetWriteDurabilityPolicy();
+    EXPECT_EQ(policy.require_local_aof, put.local_aof_acked);
+    EXPECT_EQ(policy.replica_aof_required, put.replica_aof_acked);
 
     KvTxn txn;
     txn.compares.push_back({.key = key,
@@ -194,6 +197,8 @@ TEST_F(RedisOpLogBackendTest, AllWritesReportReplicationAcknowledgement) {
     const auto changed = backend_->TxnWithResult(txn);
     ASSERT_EQ(KvWriteStatus::kCommitted, changed.status);
     EXPECT_EQ(1u, changed.replicas_acked);
+    EXPECT_EQ(policy.require_local_aof, changed.local_aof_acked);
+    EXPECT_EQ(policy.replica_aof_required, changed.replica_aof_acked);
     const auto failed = backend_->TxnWithResult(txn);
     EXPECT_EQ(KvWriteStatus::kCompareFailed, failed.status);
     EXPECT_EQ(0u, failed.replicas_acked);
@@ -201,6 +206,8 @@ TEST_F(RedisOpLogBackendTest, AllWritesReportReplicationAcknowledgement) {
     const auto deleted = backend_->DeleteRangeWithResult(key, key + "0");
     ASSERT_EQ(KvWriteStatus::kCommitted, deleted.status);
     EXPECT_EQ(1u, deleted.replicas_acked);
+    EXPECT_EQ(policy.require_local_aof, deleted.local_aof_acked);
+    EXPECT_EQ(policy.replica_aof_required, deleted.replica_aof_acked);
 }
 
 TEST_F(RedisOpLogBackendTest,

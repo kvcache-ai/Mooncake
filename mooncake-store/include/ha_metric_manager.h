@@ -307,6 +307,9 @@ class HAMetricManager {
     void observe_batch_record_commit_to_durable_us(int64_t latency_us);
     void observe_batch_record_callback_latency_us(int64_t latency_us);
 
+    void observe_redis_replica_acks(int64_t replicas);
+    void observe_redis_aof_acks(int64_t local, int64_t replicas);
+
     // ========== State Machine Metrics ==========
 
     /**
@@ -383,6 +386,9 @@ class HAMetricManager {
     ylt::metric::histogram_t batch_record_txn_latency_us_;
     ylt::metric::histogram_t batch_record_commit_to_durable_us_;
     ylt::metric::histogram_t batch_record_callback_latency_us_;
+    ylt::metric::histogram_t redis_replica_acks_;
+    ylt::metric::histogram_t redis_local_aof_acks_;
+    ylt::metric::histogram_t redis_replica_aof_acks_;
 
     // State Machine
     ylt::metric::gauge_t standby_state_;

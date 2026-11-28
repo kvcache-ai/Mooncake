@@ -218,11 +218,16 @@ bash mooncake-store/tests/e2e/run_oplog_batch_cluster_test.sh --redis-cluster bu
 ```
 
 The same entry point retains its offline script tests when called without
-arguments. Redis mode starts a private three-primary, six-replica cluster and a
-standalone primary/replica pair. It tests routing, migration, replica confirmation,
-controlled failover, and two Masters with OpLog enabled. All processes started by
-the fixture are stopped on exit; logs are retained in its temporary directory.
-It requires Python 3 and Redis binaries with `redis-cli --json` support. Override
+arguments. Redis mode starts two private three-primary, six-replica clusters and
+a standalone primary/replica pair. The second cluster, on
+`REDIS_TEST_BASE_PORT + 100`, enables AOF on every node with `appendfsync
+always` so WAITAOF acknowledgments are deterministic; it serves the
+`MC_REDIS_DURABILITY_PROFILE=persistent` cases, which exercise real replica
+fsync acknowledgments, controlled failover, and resharding. It tests routing,
+migration, replica confirmation, controlled failover, and two Masters with OpLog
+enabled. All processes started by the fixture are stopped on exit; logs are
+retained in its temporary directory. It requires Redis 7.2 or newer for the
+persistent cases, Python 3, and `redis-cli --json` support. Override
 `REDIS_SERVER`, `REDIS_CLI`, or `REDIS_TEST_BASE_PORT` as needed.
 
 ## Batch OpLog capacity tests

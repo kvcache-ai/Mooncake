@@ -229,6 +229,16 @@ HAMetricManager::HAMetricManager()
           "ha_batch_record_callback_latency_us",
           "Batch-record durable-to-callback queue latency in microseconds",
           {10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000}),
+      redis_replica_acks_("ha_redis_replica_acks",
+                          "Replica acknowledgements reported by WAIT",
+                          {0, 1, 2, 3, 5, 10}),
+      redis_local_aof_acks_("ha_redis_local_aof_acks",
+                            "Local fsync acknowledgements reported by WAITAOF",
+                            {0, 1}),
+      redis_replica_aof_acks_(
+          "ha_redis_replica_aof_acks",
+          "Replica fsync acknowledgements reported by WAITAOF",
+          {0, 1, 2, 3, 5, 10}),
 
       // State Machine
       standby_state_(
@@ -489,6 +499,15 @@ void HAMetricManager::observe_batch_record_callback_latency_us(
     batch_record_callback_latency_us_.observe(latency_us);
 }
 
+void HAMetricManager::observe_redis_replica_acks(int64_t replicas) {
+    redis_replica_acks_.observe(replicas);
+}
+
+void HAMetricManager::observe_redis_aof_acks(int64_t local, int64_t replicas) {
+    redis_local_aof_acks_.observe(local);
+    redis_replica_aof_acks_.observe(replicas);
+}
+
 // ========== State Machine Metrics ==========
 
 void HAMetricManager::set_standby_state(int64_t state_value) {
@@ -551,6 +570,9 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(batch_record_retry_total_);
 #endif
     serialize_metric(state_transitions_total_);
+    serialize_metric(redis_replica_acks_);
+    serialize_metric(redis_local_aof_acks_);
+    serialize_metric(redis_replica_aof_acks_);
 
     BatchOpLogPrunerRuntime pruner;
     {

@@ -6,6 +6,7 @@
 #include <csignal>
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
+#include <limits>
 #include <memory>   // For std::unique_ptr
 #include <optional>
 #include <string>
@@ -351,9 +352,9 @@ DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_int64(ha_leader_lease_ttl_sec,
              mooncake::DEFAULT_MASTER_VIEW_LEASE_TTL_SEC,
-             "Leadership lease TTL in seconds for the etcd HA backend. A "
-             "longer TTL tolerates longer etcd apply stalls but delays "
-             "failover after a leader crash (range 2..60)");
+             "Leadership lease TTL in seconds for etcd and Redis HA backends. "
+             "Longer TTL tolerates longer stalls but delays failover after a "
+             "leader crash (range 2..60)");
 DEFINE_validator(ha_leader_lease_ttl_sec, [](const char* flagname,
                                              int64_t value) {
     if (value < kMinHaLeaderLeaseTtlSec || value > kMaxHaLeaderLeaseTtlSec) {
@@ -364,7 +365,8 @@ DEFINE_validator(ha_leader_lease_ttl_sec, [](const char* flagname,
     return true;
 });
 DEFINE_uint32(ha_redis_expected_replicas_per_shard, 0,
-              "Expected replica membership per Redis shard; must be positive");
+              "Expected replica membership per Redis shard (range 1..INT_MAX; "
+              "0 means unconfigured)");
 DEFINE_string(ha_backend_connstring, "",
               "HA backend connection string. If unset, only backend_type=etcd "
               "falls back to etcd_endpoints for backward compatibility");
@@ -1185,8 +1187,10 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
             FLAGS_ha_redis_expected_replicas_per_shard;
     }
     if (master_config.enable_ha && master_config.ha_backend_type == "redis" &&
-        master_config.ha_redis_expected_replicas_per_shard == 0) {
-        LOG(FATAL) << "ha_redis_expected_replicas_per_shard must be positive";
+        !mooncake::ha::IsValidRedisReplicaCount(
+            master_config.ha_redis_expected_replicas_per_shard)) {
+        LOG(FATAL) << "ha_redis_expected_replicas_per_shard must be in [1, "
+                   << std::numeric_limits<int>::max() << "]";
     }
     if (master_config.ha_leader_lease_ttl_sec < kMinHaLeaderLeaseTtlSec ||
         master_config.ha_leader_lease_ttl_sec > kMaxHaLeaderLeaseTtlSec) {
