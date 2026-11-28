@@ -831,6 +831,12 @@ class MasterClient {
                           const std::string& tenant_id,
                           ReplicaType replica_type);
 
+    // Capacity-eviction variant. Any active read lease rejects the whole
+    // batch so a bucket is never partially evicted because of a hot key.
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
+    BatchEvictDiskReplicaIfAllUnleased(
+        const std::vector<std::string>& scoped_keys, ReplicaType replica_type);
+
    private:
     /**
      * @brief Generic RPC invocation helper for single-result operations

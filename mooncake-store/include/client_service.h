@@ -476,6 +476,10 @@ class Client {
         const std::vector<std::string>& keys, const std::string& tenant_id,
         ReplicaType replica_type);
 
+    std::vector<tl::expected<void, ErrorCode>>
+    BatchEvictDiskReplicaIfAllUnleased(
+        const std::vector<std::string>& scoped_keys, ReplicaType replica_type);
+
     /**
      * @brief Registers a memory segment to master for allocation
      * @param buffer Memory buffer to register

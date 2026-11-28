@@ -587,6 +587,14 @@ class MasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const TenantId& tenant_id, ReplicaType replica_type);
 
+    // Capacity-eviction variant with bucket-atomic lease admission: if any
+    // object has a read lease, no replica in the batch is evicted. Missing
+    // objects do not block eviction of the remaining keys.
+    std::vector<tl::expected<void, ErrorCode>>
+    BatchEvictDiskReplicaIfAllUnleased(
+        const UUID& client_id, const std::vector<std::string>& scoped_keys,
+        ReplicaType replica_type);
+
     /**
      * @brief Start a copy operation
      *

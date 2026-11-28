@@ -1021,43 +1021,34 @@ tl::expected<void, ErrorCode> FileStorage::NotifyEvictedDiskReplicas(
     const std::vector<std::string>& evicted_keys) {
     if (evicted_keys.empty()) return {};
 
-    std::optional<ErrorCode> first_error;
-    std::unordered_map<TenantId, std::vector<std::string>, TenantIdHash>
-        keys_by_tenant;
-    for (const auto& storage_key : evicted_keys) {
-        auto [tenant_id, key] = TenantId::ParseScopedKey(storage_key);
-        keys_by_tenant[tenant_id].push_back(key);
+    auto results = client_->BatchEvictDiskReplicaIfAllUnleased(
+        evicted_keys, ReplicaType::LOCAL_DISK);
+    if (results.size() != evicted_keys.size()) {
+        LOG(ERROR) << "BatchEvictDiskReplicaIfAllUnleased returned "
+                   << results.size() << " result(s) for " << evicted_keys.size()
+                   << " key(s)";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    for (const auto& [tenant_id, keys] : keys_by_tenant) {
-        auto results = client_->BatchEvictDiskReplica(keys, tenant_id.value(),
-                                                      ReplicaType::LOCAL_DISK);
-        if (results.size() != keys.size()) {
-            LOG(ERROR) << "BatchEvictDiskReplica returned " << results.size()
-                       << " result(s) for " << keys.size()
-                       << " key(s), tenant_id=" << tenant_id;
+    std::optional<ErrorCode> first_error;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i]) {
+            if (results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
+                VLOG(1) << "Master no longer tracks evicted local disk key: "
+                        << evicted_keys[i];
+                continue;
+            }
             if (!first_error.has_value()) {
-                first_error = ErrorCode::INTERNAL_ERROR;
+                first_error = results[i].error();
             }
-            continue;
-        }
-
-        for (size_t i = 0; i < results.size(); ++i) {
-            if (!results[i]) {
-                if (results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
-                    VLOG(1)
-                        << "Master no longer tracks evicted local disk key: "
-                        << keys[i] << ", tenant_id=" << tenant_id;
-                    continue;
-                }
-                if (!first_error.has_value()) {
-                    first_error = results[i].error();
-                }
-                LOG(WARNING)
-                    << "Failed to notify master about evicted local disk key: "
-                    << keys[i] << ", tenant_id=" << tenant_id
-                    << ", error: " << results[i].error();
+            if (results[i].error() == ErrorCode::OBJECT_HAS_LEASE) {
+                VLOG(1) << "Deferring local disk eviction for leased key: "
+                        << evicted_keys[i];
+                continue;
             }
+            LOG(WARNING) << "Failed to notify master about evicted local disk "
+                         << "key: " << evicted_keys[i]
+                         << ", error: " << results[i].error();
         }
     }
     if (first_error.has_value()) {

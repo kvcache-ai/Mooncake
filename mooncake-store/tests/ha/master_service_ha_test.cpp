@@ -7392,7 +7392,8 @@ TEST_F(MasterServiceHATest, BatchReplicaClearSegmentReleasesAfterDurable) {
     EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
 }
 
-TEST_F(MasterServiceHATest, EvictDiskReplicaWritesBatchRecordOpLog) {
+TEST_F(MasterServiceHATest,
+       EvictDiskReplicaIfAllUnleasedWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_disk_evict_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
@@ -7425,10 +7426,11 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaWritesBatchRecordOpLog) {
                     .has_value());
     ReadBatchEventually(storage, 3, batch);
 
-    ASSERT_TRUE(service
-                    .EvictDiskReplica(mounted.client_id, key, kDefaultTenant,
-                                      ReplicaType::LOCAL_DISK)
-                    .has_value());
+    auto results = service.BatchEvictDiskReplicaIfAllUnleased(
+        mounted.client_id, {kDefaultTenant.MakeScopedKey(key)},
+        ReplicaType::LOCAL_DISK);
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_TRUE(results[0].has_value());
     ReadBatchEventually(storage, 4, batch);
 
     ASSERT_EQ(1u, batch.entries.size());

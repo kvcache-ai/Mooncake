@@ -4007,6 +4007,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchEvictDiskReplica(
     return master_client_.BatchEvictDiskReplica(keys, tenant_id, replica_type);
 }
 
+std::vector<tl::expected<void, ErrorCode>>
+Client::BatchEvictDiskReplicaIfAllUnleased(
+    const std::vector<std::string>& scoped_keys, ReplicaType replica_type) {
+    return master_client_.BatchEvictDiskReplicaIfAllUnleased(scoped_keys,
+                                                             replica_type);
+}
+
 std::vector<int> Client::GetNicNumaNodes() const {
     std::set<int> nodes;
     if (!transfer_engine_) return {};

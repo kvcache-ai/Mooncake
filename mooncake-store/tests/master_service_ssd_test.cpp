@@ -330,6 +330,91 @@ TEST_F(MasterServiceSSDTest, EvictDiskReplicaDecrementsFileCacheNums) {
     EXPECT_EQ(metrics.get_mem_cache_nums(), baseline_mem + 1);
 }
 
+TEST_F(MasterServiceSSDTest,
+       BatchEvictDiskReplicaIfAllUnleasedRejectsWholeBatch) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 60000;
+    auto service = std::make_unique<MasterService>(config);
+    const UUID client_id = generate_uuid();
+    const std::string segment = "ssd_lease_eviction_segment";
+    MountMemoryAndLocalDisk(*service, client_id, segment, 0xd00000000);
+
+    const std::vector<std::string> keys{"leased_by_exist", "leased_by_query",
+                                        "not_leased"};
+    std::vector<std::string> scoped_keys;
+    for (const auto& key : keys) {
+        PutAndOffload(*service, client_id, key, 128, segment);
+        scoped_keys.push_back(TenantId::Default().MakeScopedKey(key));
+    }
+    ASSERT_TRUE(service->ExistKey(keys[0], TenantId::Default()).value());
+    ASSERT_TRUE(
+        service->GetReplicaList(keys[1], TenantId::Default()).has_value());
+
+    auto local_disk_count = [&](const std::string& key) {
+        auto replicas =
+            service->GetReplicaListForAdmin(key, TenantId::Default());
+        EXPECT_TRUE(replicas.has_value());
+        return std::count_if(replicas->replicas.begin(),
+                             replicas->replicas.end(), [](const auto& replica) {
+                                 return replica.is_local_disk_replica();
+                             });
+    };
+
+    auto results = service->BatchEvictDiskReplicaIfAllUnleased(
+        client_id, scoped_keys, ReplicaType::LOCAL_DISK);
+    ASSERT_EQ(results.size(), keys.size());
+    EXPECT_EQ(results[0].error(), ErrorCode::OBJECT_HAS_LEASE);
+    EXPECT_EQ(results[1].error(), ErrorCode::OBJECT_HAS_LEASE);
+    EXPECT_TRUE(results[2].has_value());
+    for (const auto& key : keys) {
+        EXPECT_EQ(local_disk_count(key), 1);
+    }
+
+    for (size_t i = 0; i < 2; ++i) {
+        auto hold = MasterServiceTestPeer::WriteObject(
+            *service, {TenantId::Default(), keys[i]});
+        ASSERT_TRUE(hold.has_value());
+        auto& metadata = hold->metadata();
+        SpinLocker locker(&metadata.lock);
+        metadata.lease_->SetDeadline(std::chrono::system_clock::now() -
+                                     std::chrono::seconds(1));
+    }
+
+    results = service->BatchEvictDiskReplicaIfAllUnleased(
+        client_id, scoped_keys, ReplicaType::LOCAL_DISK);
+    ASSERT_EQ(results.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_TRUE(results[i].has_value());
+        EXPECT_EQ(local_disk_count(keys[i]), 0);
+    }
+}
+
+TEST_F(MasterServiceSSDTest,
+       BatchEvictDiskReplicaIgnoresLeaseForCompatibility) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 60000;
+    auto service = std::make_unique<MasterService>(config);
+    const UUID client_id = generate_uuid();
+    const std::string segment = "ssd_legacy_eviction_segment";
+    MountMemoryAndLocalDisk(*service, client_id, segment, 0xe00000000);
+
+    const std::string key = "legacy_eviction_with_lease";
+    PutAndOffload(*service, client_id, key, 128, segment);
+    ASSERT_TRUE(service->ExistKey(key, TenantId::Default()).value());
+
+    auto results = service->BatchEvictDiskReplica(
+        client_id, {key}, TenantId::Default(), ReplicaType::LOCAL_DISK);
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_TRUE(results[0].has_value());
+    auto replicas = service->GetReplicaListForAdmin(key, TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    EXPECT_TRUE(std::none_of(
+        replicas->replicas.begin(), replicas->replicas.end(),
+        [](const auto& replica) { return replica.is_local_disk_replica(); }));
+}
+
 // Real-path performance comparison: MasterService PutStart throughput for
 // three configurations:
 //   (A) RANDOM, no offload        — baseline, original behavior
