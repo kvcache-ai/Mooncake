@@ -998,6 +998,236 @@ TEST(DeviceSelectorTransmitTest, PostedBytesTrackTheHardwareBacklog) {
     EXPECT_EQ(sel->getPostedBytes(7), 0u);  // unknown device
 }
 
+class DeviceSelectorSchedulingTest : public ::testing::Test {
+   protected:
+    DeviceSelector::SelectionEstimator estimator_ =
+        DeviceSelector::SelectionEstimator::Latency;
+    DeviceSelector::AllocationPolicy allocation_ =
+        DeviceSelector::AllocationPolicy::InverseScore;
+
+    std::unique_ptr<DeviceSelector> selector() {
+        DeviceSelector::SchedulingParams params;
+        params.selection_estimator = estimator_;
+        params.allocation_policy = allocation_;
+        params.bandwidth_learning_rate = 0.0;
+        params.transmit_bandwidth_learning_rate = 0.0;
+        params.transmit_meter_interval_ns = 0;
+        params.ewma_min_multiplier = 0.000001;
+        params.score_jitter_range = 0.0;
+        params.enable_priority_filtering = false;
+        return makeTwoNicSelector(params);
+    }
+
+    void observeRates(DeviceSelector& sel, int dev, double latency_rate,
+                      double transmit_rate) {
+        ASSERT_TRUE(sel.chargeDevice(dev, kMiB).ok());
+        ASSERT_TRUE(sel.release(dev, kMiB, kMiB / latency_rate).ok());
+        sel.notePosted(dev, kMiB, kT0);
+        sel.maybeSampleTransmit(dev, kT0);
+        const uint64_t end =
+            kT0 + static_cast<uint64_t>(kMiB / transmit_rate * 1e9);
+        sel.notePostEnded(dev, kMiB, end);
+        sel.noteCompleted(dev, kMiB);
+        sel.maybeSampleTransmit(dev, end);
+    }
+
+    // Each test starts before the thread-local periodic probe counter advances.
+    Status allocate(DeviceSelector& sel, uint64_t total, uint32_t count,
+                    uint64_t block, std::vector<int>& ids,
+                    uint64_t mask = ~0ULL) {
+        Status status;
+        std::thread submitter([&] {
+            status = sel.allocate(total, count, block, "cpu:0", ids, PRIO_HIGH,
+                                  mask);
+        });
+        submitter.join();
+        return status;
+    }
+};
+
+TEST_F(DeviceSelectorSchedulingTest, DefaultLatencyUsesCompletionRate) {
+    auto sel = selector();
+    observeRates(*sel, 0, 10e9, 1e9);
+    observeRates(*sel, 1, 1e9, 10e9);
+    std::vector<int> ids;
+    ASSERT_TRUE(allocate(*sel, kMiB, 1, kMiB, ids).ok());
+    ASSERT_EQ(ids.size(), 1u);
+    EXPECT_EQ(ids[0], 0);
+}
+
+TEST_F(DeviceSelectorSchedulingTest, TransmitSelectionUsesBusyRateSnapshot) {
+    estimator_ = DeviceSelector::SelectionEstimator::Transmit;
+    auto sel = selector();
+    // A separately configured selector does not change the existing one.
+    estimator_ = DeviceSelector::SelectionEstimator::Latency;
+    auto other = selector();
+    observeRates(*sel, 0, 10e9, 1e9);
+    observeRates(*sel, 1, 1e9, 10e9);
+    std::vector<int> ids;
+    ASSERT_TRUE(allocate(*sel, kMiB, 1, kMiB, ids).ok());
+    ASSERT_EQ(ids.size(), 1u);
+    EXPECT_EQ(ids[0], 1);
+    observeRates(*other, 0, 10e9, 1e9);
+    observeRates(*other, 1, 1e9, 10e9);
+    ASSERT_TRUE(allocate(*other, kMiB, 1, kMiB, ids).ok());
+    EXPECT_EQ(ids[0], 0);
+}
+
+TEST_F(DeviceSelectorSchedulingTest, FinishTimeAddsCurrentRequestToBacklog) {
+    for (auto mode : {DeviceSelector::AllocationPolicy::InverseScore,
+                      DeviceSelector::AllocationPolicy::FinishTime}) {
+        allocation_ = mode;
+        auto sel = selector();
+        ASSERT_TRUE(sel->setDeviceBandwidth(0, 200.0).ok());
+        // Existing backlog has equal drain time on the 2:1 capacity paths.
+        ASSERT_TRUE(sel->chargeDevice(0, 2 * kMiB).ok());
+        ASSERT_TRUE(sel->chargeDevice(1, kMiB).ok());
+        std::vector<int> ids;
+        ASSERT_TRUE(allocate(*sel, 30 * kMiB, 30, kMiB, ids).ok());
+        const size_t fast = std::count(ids.begin(), ids.end(), 0);
+        // Inverse-score allocates 18:12; updating pending reaches capacity
+        // 20:10.
+        EXPECT_EQ(fast, mode == DeviceSelector::AllocationPolicy::FinishTime
+                            ? 20u
+                            : 18u);
+        EXPECT_EQ(sel->getInflightBytes(0), (fast + 2) * kMiB);
+        EXPECT_EQ(sel->getInflightBytes(1), (31 - fast) * kMiB);
+    }
+}
+
+TEST_F(DeviceSelectorSchedulingTest, FinishTimeChargesShortAndFoldedTailsOnce) {
+    allocation_ = DeviceSelector::AllocationPolicy::FinishTime;
+    for (uint64_t total : {31 * kMiB + 17, 33 * kMiB + 17}) {
+        auto sel = selector();
+        std::vector<int> ids;
+        ASSERT_TRUE(allocate(*sel, total, 32, kMiB, ids).ok());
+        ASSERT_EQ(ids.size(), 32u);
+        uint64_t expected[2] = {0, 0};
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const uint64_t bytes =
+                i + 1 == ids.size() ? total - i * kMiB : kMiB;
+            expected[ids[i]] += bytes;
+        }
+        EXPECT_EQ(expected[0] + expected[1], total);
+        for (int dev = 0; dev < 2; ++dev) {
+            EXPECT_EQ(sel->getInflightBytes(dev), expected[dev]);
+            ASSERT_TRUE(sel->release(dev, expected[dev], 0.0).ok());
+            EXPECT_EQ(sel->getInflightBytes(dev), 0u);
+        }
+    }
+}
+
+TEST_F(DeviceSelectorSchedulingTest, FinishTimeRespectsTopologyPenalty) {
+    allocation_ = DeviceSelector::AllocationPolicy::FinishTime;
+    auto topo = twoRdmaNics();
+    topo->mem_list_[0].device_list[0] = {0};
+    topo->mem_list_[0].device_list[1] = {1};
+    DeviceSelector sel;
+    ASSERT_TRUE(sel.loadTopology(topo).ok());
+    DeviceSelector::SchedulingParams params;
+    params.allocation_policy = allocation_;
+    params.score_jitter_range = 0.0;
+    params.enable_priority_filtering = false;
+    sel.setSchedulingParams(params);
+    ASSERT_TRUE(sel.setDeviceBandwidth(0, 100.0).ok());
+    ASSERT_TRUE(sel.setDeviceBandwidth(1, 200.0).ok());
+    std::vector<int> ids;
+    ASSERT_TRUE(allocate(sel, 30 * kMiB, 30, kMiB, ids).ok());
+    // The 2x-faster remote tier has a 5x topology penalty.
+    EXPECT_GT(std::count(ids.begin(), ids.end(), 0),
+              std::count(ids.begin(), ids.end(), 1));
+}
+
+TEST_F(DeviceSelectorSchedulingTest, FinishTimePreservesTwoRailLaneCoverage) {
+    allocation_ = DeviceSelector::AllocationPolicy::FinishTime;
+    auto sel = selector();
+    ASSERT_TRUE(sel->setDeviceBandwidth(0, 200.0).ok());
+    ASSERT_TRUE(sel->setDeviceBandwidth(1, 200.0).ok());
+    std::vector<int> ids;
+    ASSERT_TRUE(allocate(*sel, 4 * kMiB, 32, kMiB / 8, ids).ok());
+    ASSERT_EQ(ids.size(), 32u);
+    // The transport assigns slice i to worker (start + i) % num_workers.
+    // A periodic 0,1,0,1 allocation would use only 3/6 lanes per NIC even
+    // though each NIC has 16 slices, enough to use all six.
+    for (size_t start = 0; start < 6; ++start) {
+        bool seen[2][6] = {};
+        for (size_t i = 0; i < ids.size(); ++i)
+            seen[ids[i]][(start + i) % 6] = true;
+        for (const auto& lanes : seen)
+            EXPECT_TRUE(std::all_of(std::begin(lanes), std::end(lanes),
+                                    [](bool used) { return used; }));
+    }
+    EXPECT_EQ(sel->getInflightBytes(0), 2 * kMiB);
+    EXPECT_EQ(sel->getInflightBytes(1), 2 * kMiB);
+}
+
+TEST_F(DeviceSelectorSchedulingTest,
+       FinishTimePreservesPlannedFoldedTailDevice) {
+    allocation_ = DeviceSelector::AllocationPolicy::FinishTime;
+    auto sel = selector();
+    ASSERT_TRUE(sel->setDeviceBandwidth(0, 200.0).ok());
+    ASSERT_TRUE(sel->setDeviceBandwidth(1, 200.0).ok());
+    std::vector<int> ids;
+    constexpr uint64_t total = 7 * kMiB + 17;
+    ASSERT_TRUE(allocate(*sel, total, 5, kMiB, ids).ok());
+    ASSERT_EQ(ids.size(), 5u);
+    // Four equal slices balance the two paths. Their predicted finish times
+    // tie for the 3 MiB + 17 tail, so the lower device ID gets that tail.
+    // Grouping the entire vector would move it to NIC1 and change the plan.
+    EXPECT_EQ(ids.back(), 0);
+    EXPECT_EQ(sel->getInflightBytes(0), 5 * kMiB + 17);
+    EXPECT_EQ(sel->getInflightBytes(1), 2 * kMiB);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        const uint64_t bytes = i + 1 == ids.size() ? total - i * kMiB : kMiB;
+        ASSERT_TRUE(sel->release(ids[i], bytes, 0.0).ok());
+    }
+    EXPECT_EQ(sel->getInflightBytes(0), 0u);
+    EXPECT_EQ(sel->getInflightBytes(1), 0u);
+}
+
+TEST_F(DeviceSelectorSchedulingTest, FinishTimeKeepsMasksAndAvailability) {
+    estimator_ = DeviceSelector::SelectionEstimator::Transmit;
+    allocation_ = DeviceSelector::AllocationPolicy::FinishTime;
+    auto sel = selector();
+    std::vector<int> ids;
+    ASSERT_TRUE(allocate(*sel, 8 * kMiB, 8, kMiB, ids, 1ULL << 1).ok());
+    EXPECT_EQ(std::count(ids.begin(), ids.end(), 1), 8);
+    EXPECT_EQ(sel->getInflightBytes(0), 0u);
+    ASSERT_TRUE(sel->setDeviceAvailable(1, false).ok());
+    EXPECT_FALSE(allocate(*sel, kMiB, 1, kMiB, ids, 1ULL << 1).ok());
+    EXPECT_TRUE(ids.empty());
+}
+
+TEST_F(DeviceSelectorSchedulingTest, FinishTimeRetainsPeriodicExploration) {
+    allocation_ = DeviceSelector::AllocationPolicy::FinishTime;
+    auto sel = selector();
+    ASSERT_TRUE(sel->setDeviceBandwidth(0, 200.0).ok());
+    std::thread submitter([&] {
+        for (int round = 1; round <= 100; ++round) {
+            std::vector<int> ids;
+            ASSERT_TRUE(sel->allocate(30 * kMiB, 30, kMiB, "cpu:0", ids).ok());
+            ASSERT_EQ(ids.size(), 30u);
+            EXPECT_EQ(std::count(ids.begin(), ids.end(), 0),
+                      round == 100 ? 15 : 20);
+            for (int dev : ids) ASSERT_TRUE(sel->release(dev, kMiB, 0.0).ok());
+        }
+    });
+    submitter.join();
+}
+
+TEST_F(DeviceSelectorSchedulingTest, DisabledSmartSchedulingKeepsRoundRobin) {
+    estimator_ = DeviceSelector::SelectionEstimator::Transmit;
+    allocation_ = DeviceSelector::AllocationPolicy::FinishTime;
+    auto sel = selector();
+    sel->setSmartSelection(false);
+    ASSERT_TRUE(sel->setDeviceBandwidth(0, 200.0).ok());
+    std::vector<int> ids;
+    ASSERT_TRUE(allocate(*sel, 30 * kMiB, 30, kMiB, ids).ok());
+    EXPECT_EQ(std::count(ids.begin(), ids.end(), 0), 15);
+    EXPECT_EQ(sel->getInflightBytes(0), 0u);
+    EXPECT_EQ(sel->getInflightBytes(1), 0u);
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

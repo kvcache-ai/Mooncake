@@ -121,6 +121,29 @@ Workers::Workers(RdmaTransport* transport)
     // Format: [local_numa, remote_numa1, remote_numa2, ...]
     // ============================================================
     DeviceSelector::SchedulingParams params;
+    const auto estimator =
+        conf->get("transports/rdma/selection_estimator", "latency");
+    if (estimator == "transmit") {
+        params.selection_estimator =
+            DeviceSelector::SelectionEstimator::Transmit;
+    } else if (estimator == "latency") {
+        params.selection_estimator =
+            DeviceSelector::SelectionEstimator::Latency;
+    } else if (!estimator.empty()) {
+        LOG(WARNING) << "Unknown RDMA selection_estimator=" << estimator
+                     << "; using latency";
+    }
+    const auto allocation =
+        conf->get("transports/rdma/allocation_policy", "inverse_score");
+    if (allocation == "finish_time") {
+        params.allocation_policy = DeviceSelector::AllocationPolicy::FinishTime;
+    } else if (allocation == "inverse_score") {
+        params.allocation_policy =
+            DeviceSelector::AllocationPolicy::InverseScore;
+    } else if (!allocation.empty()) {
+        LOG(WARNING) << "Unknown RDMA allocation_policy=" << allocation
+                     << "; using inverse_score";
+    }
 
     auto numa_penalties =
         conf->get("transports/rdma/numa_penalties", std::vector<double>{});
