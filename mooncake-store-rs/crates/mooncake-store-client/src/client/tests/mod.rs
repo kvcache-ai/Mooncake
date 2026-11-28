@@ -144,9 +144,15 @@ impl HotPathBlockedMetadataBackend {
     }
 }
 
+type BeforeRouteReadHook = (ObjectKey, Box<dyn FnOnce() + Send>);
+
 struct CountingMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     list_live_clients_calls: AtomicUsize,
+    fail_live_client_list: AtomicBool,
+    before_route_read: Mutex<Option<BeforeRouteReadHook>>,
+    fail_next_quota_abort: AtomicBool,
+    quota_abort_calls: AtomicUsize,
     get_object_route_calls: AtomicUsize,
     upsert_client_lease_calls: AtomicUsize,
     update_client_state_calls: AtomicUsize,
@@ -510,6 +516,10 @@ impl CountingMetadataBackend {
         Self {
             inner,
             list_live_clients_calls: AtomicUsize::new(0),
+            fail_live_client_list: AtomicBool::new(false),
+            before_route_read: Mutex::new(None),
+            fail_next_quota_abort: AtomicBool::new(false),
+            quota_abort_calls: AtomicUsize::new(0),
             get_object_route_calls: AtomicUsize::new(0),
             upsert_client_lease_calls: AtomicUsize::new(0),
             update_client_state_calls: AtomicUsize::new(0),
@@ -1797,6 +1807,11 @@ impl MetadataBackend for CountingMetadataBackend {
 
     fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
         self.list_live_clients_calls.fetch_add(1, Ordering::Relaxed);
+        if self.fail_live_client_list.load(Ordering::Relaxed) {
+            return Err(StoreError::Metadata(
+                "injected membership failure".to_string(),
+            ));
+        }
         self.visible_live_clients()
     }
 
@@ -1861,6 +1876,17 @@ impl MetadataBackend for CountingMetadataBackend {
         key: &ObjectKey,
     ) -> mooncake_store_core::Result<Option<mooncake_store_core::ObjectRoute>> {
         self.get_object_route_calls.fetch_add(1, Ordering::Relaxed);
+        let hook = {
+            let mut pending = self.before_route_read.lock();
+            if pending.as_ref().is_some_and(|(target, _)| target == key) {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, hook)) = hook {
+            hook();
+        }
         self.inner.get_object_route(key)
     }
 
@@ -1997,6 +2023,10 @@ impl MetadataBackend for CountingMetadataBackend {
         &self,
         reservation_id: &str,
     ) -> mooncake_store_core::Result<TenantQuotaAbortOutcome> {
+        self.quota_abort_calls.fetch_add(1, Ordering::Relaxed);
+        if self.fail_next_quota_abort.swap(false, Ordering::Relaxed) {
+            return Err(StoreError::Metadata("injected quota abort failure".into()));
+        }
         self.inner.abort_tenant_quota(reservation_id)
     }
 
@@ -7548,6 +7578,156 @@ fn routed_put_skips_owner_with_full_publication_ledger() {
             .contains(store_a.runtime_id()),
         "allocator backpressure must not quarantine the saturated owner"
     );
+}
+
+#[test]
+fn single_object_put_paths_retry_after_reservation_membership_refresh() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("single-put-refresh-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("single-put-refresh-b-segment"));
+    let successor_transport =
+        Arc::new(store_a_transport.peer("single-put-refresh-successor-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("single-put-refresh-writer-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut store_a = StoreClientBuilder::new(metadata.clone(), "single-put-refresh-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "single-put-refresh-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let mut successor = StoreClientBuilder::new(metadata.clone(), "single-put-refresh-successor")
+        .state(ClientLifecycleState::Standby)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(successor_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("successor build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "single-put-refresh-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    successor
+        .register_local_memory()
+        .expect("successor memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &successor, &writer]);
+
+    store_a.enter_draining().expect("old owner should drain");
+    let stale_membership = writer
+        .live_clients_snapshot(true)
+        .expect("pre-activation membership should refresh");
+    assert!(stale_membership.iter().any(|lease| {
+        lease.runtime == *store_a.runtime_id() && lease.state == ClientLifecycleState::Draining
+    }));
+    assert!(stale_membership.iter().any(|lease| {
+        lease.runtime == *successor.runtime_id() && lease.state == ClientLifecycleState::Standby
+    }));
+    successor.activate().expect("successor should activate");
+    writer
+        .live_client_cache
+        .lock()
+        .store(stale_membership.clone());
+
+    let policy = ReplicationPolicy::new()
+        .replica_count(2)
+        .prefer_local(false);
+    let value = b"single-put-refresh-payload";
+    let route = writer
+        .put_with_policy("single-put-refresh-key", value, &policy)
+        .expect("single put should refresh stale membership and retry");
+    assert_eq!(route.replicas.len(), 2);
+    assert!(route
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == *successor.runtime_id()));
+    assert_eq!(writer.get("single-put-refresh-key").unwrap(), value);
+
+    // Exercise the same reserve retry through the registered-buffer entry point.
+    writer
+        .live_client_cache
+        .lock()
+        .store(stale_membership.clone());
+    let registered_value = b"registered-put-refresh-payload".to_vec();
+    writer
+        .register_buffer(
+            registered_value.as_ptr() as *mut c_void,
+            registered_value.len(),
+        )
+        .expect("registered source should register");
+    let registered_route = writer
+        .put_from_with_policy(
+            "registered-put-refresh-key",
+            registered_value.as_ptr().cast(),
+            registered_value.len(),
+            &policy,
+        )
+        .expect("registered-buffer put should refresh stale membership and retry");
+    assert_eq!(registered_route.replicas.len(), 2);
+    assert!(registered_route
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == *successor.runtime_id()));
+    assert_eq!(
+        writer.get("registered-put-refresh-key").unwrap(),
+        registered_value
+    );
+
+    // Different per-item policies intentionally select batch_put's single-object fallback.
+    writer.live_client_cache.lock().store(stale_membership);
+    let batch_value = b"fallback-batch-replica-two";
+    let single_value = b"fallback-batch-replica-one";
+    let routes = writer
+        .batch_put(&[
+            PutRequest::new("fallback-batch-two", batch_value).replication(policy),
+            PutRequest::new("fallback-batch-one", single_value).replication(
+                ReplicationPolicy::new()
+                    .replica_count(1)
+                    .prefer_local(false),
+            ),
+        ])
+        .expect("single-object batch fallback should handle stale membership");
+    assert_eq!(routes[0].replicas.len(), 2);
+    assert!(routes[0]
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == *successor.runtime_id()));
+    assert_eq!(routes[1].replicas.len(), 1);
+    assert_eq!(writer.get("fallback-batch-two").unwrap(), batch_value);
+    assert_eq!(writer.get("fallback-batch-one").unwrap(), single_value);
 }
 
 #[test]
@@ -18465,6 +18645,639 @@ fn drain_migration_updates_object_route_without_refreshing_draining_authority() 
         "object route facade must stop advertising the evacuated replica"
     );
     assert_eq!(writer.get(key).expect("migrated value should read"), value);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MembershipReadPath {
+    Single,
+    Batch,
+    Readable,
+    Ranges,
+}
+
+struct MembershipReadFixture {
+    metadata: Arc<CountingMetadataBackend>,
+    stores: [StoreClient; 2],
+    reader: StoreClient,
+    stale_membership: Vec<ClientLease>,
+    keys: Vec<String>,
+}
+
+impl MembershipReadFixture {
+    const PAYLOAD: &'static [u8] = b"membership-read-payload";
+
+    fn new() -> Self {
+        let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
+            InMemoryMetadataBackend::new(),
+        )));
+        let transport = TestTransport::new("membership-read-segment");
+        let build = |name: &str, storage: bool, state| {
+            StoreClientBuilder::new(metadata.clone(), name)
+                .state(state)
+                .label("pool", "pool-a")
+                .label("storage", if storage { "true" } else { "false" })
+                .route_control(RouteControlMode::MetadataOnly)
+                .live_client_sync_interval(Duration::ZERO)
+                .transport(Arc::new(transport.peer(&format!("{name}-segment"))))
+                .local_memory(if storage {
+                    storage_config_with_bytes(65536)
+                } else {
+                    rw_only_config()
+                })
+                .build(test_future_expiry_ms())
+                .unwrap()
+        };
+        let mut store_a = build("membership-read-a", true, ClientLifecycleState::Standby);
+        let store_b = build("membership-read-b", true, ClientLifecycleState::Active);
+        let mut reader = build(
+            "membership-read-reader",
+            false,
+            ClientLifecycleState::Active,
+        );
+        for client in [&store_a, &store_b, &reader] {
+            client.register_local_memory().unwrap();
+            client.live_clients_snapshot(true).unwrap();
+        }
+        let stale_membership = reader.live_clients_snapshot(true).unwrap();
+        store_a.activate().unwrap();
+        reader.live_clients_snapshot(true).unwrap();
+        let policy = ReplicationPolicy::new()
+            .replica_count(2)
+            .prefer_local(false)
+            .preferred_storage_owners([
+                store_a.runtime_id().storage_key(),
+                store_b.runtime_id().storage_key(),
+            ]);
+        // Guarantee that healthy reads exercise non-primary load balancing.
+        let keys = (0..256)
+            .map(|i| format!("membership-read-key-{i}"))
+            .filter(|key| {
+                super::replica_balance_hash(
+                    &reader.runtime_id().stable_id.0,
+                    &format!("default::{key}"),
+                ) % 2
+                    == 1
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 8);
+        for key in &keys {
+            let route = reader.put_with_policy(key, Self::PAYLOAD, &policy).unwrap();
+            assert_eq!(route.replicas[0].owner, *store_a.runtime_id());
+            assert_eq!(route.replicas[1].owner, *store_b.runtime_id());
+        }
+        // Isolate foreground read counts from queued writes and hit-report callbacks.
+        reader.async_replica_tracking.shutdown();
+        reader.async_route_hit_reporting.shutdown();
+        Self {
+            metadata,
+            stores: [store_a, store_b],
+            reader,
+            stale_membership,
+            keys,
+        }
+    }
+
+    fn read(&self, path: MembershipReadPath) {
+        let objects = self
+            .keys
+            .iter()
+            .map(|key| ObjectRef::new(key))
+            .collect::<Vec<_>>();
+        match path {
+            MembershipReadPath::Single => {
+                for key in &self.keys {
+                    assert_eq!(self.reader.get(key).unwrap(), Self::PAYLOAD);
+                }
+            }
+            MembershipReadPath::Batch => {
+                assert_eq!(
+                    self.reader.batch_get(&objects).unwrap(),
+                    vec![Self::PAYLOAD.to_vec(); self.keys.len()]
+                );
+            }
+            MembershipReadPath::Readable => {
+                assert_eq!(
+                    self.reader.batch_is_readable(&objects).unwrap(),
+                    vec![true; self.keys.len()]
+                );
+            }
+            MembershipReadPath::Ranges => {
+                let len = Self::PAYLOAD.len();
+                let mut buffer = vec![0u8; len * self.keys.len()];
+                let pointer = buffer.as_mut_ptr();
+                self.reader
+                    .register_buffer(pointer.cast(), buffer.len())
+                    .unwrap();
+                let keys = self.keys.iter().map(String::as_str).collect::<Vec<_>>();
+                let offsets = (0..keys.len()).map(|i| [i * len]).collect::<Vec<_>>();
+                let offsets = offsets
+                    .iter()
+                    .map(|offset| offset.as_slice())
+                    .collect::<Vec<_>>();
+                let zeros = [0];
+                let sizes = [len];
+                let sources = vec![zeros.as_slice(); keys.len()];
+                let lengths = vec![sizes.as_slice(); keys.len()];
+                let result = unsafe {
+                    self.reader.get_into_ranges(
+                        "default",
+                        &[pointer],
+                        &[buffer.len()],
+                        &[keys.as_slice()],
+                        &[offsets.as_slice()],
+                        &[sources.as_slice()],
+                        &[lengths.as_slice()],
+                    )
+                };
+                self.reader
+                    .unregister_buffer(pointer.cast(), buffer.len())
+                    .unwrap();
+                assert_eq!(result, vec![vec![vec![len as i64]; keys.len()]]);
+                assert_eq!(buffer, Self::PAYLOAD.repeat(keys.len()));
+            }
+        }
+    }
+
+    fn assert_replicas(&self, count: usize) {
+        for key in &self.keys {
+            let route = self.reader.query_route(key).unwrap().unwrap();
+            assert_eq!(route.replicas.len(), count, "route for {key}");
+            if count == 1 {
+                assert_eq!(route.replicas[0].owner, *self.stores[1].runtime_id());
+            }
+        }
+    }
+}
+
+#[test]
+fn ranged_read_preserves_routes_published_after_membership_refresh() {
+    let mut fixture = MembershipReadFixture::new();
+    fixture.keys.truncate(2);
+    let mut published = fixture
+        .reader
+        .query_route(&fixture.keys[1])
+        .unwrap()
+        .unwrap();
+    assert!(
+        fixture
+            .metadata
+            .compare_and_swap_object_route(&published.key, Some(published.version), None)
+            .unwrap()
+            .applied
+    );
+    published.version = published.version.next();
+    fixture
+        .metadata
+        .update_client_state(
+            fixture.stores[0].runtime_id(),
+            ClientLifecycleState::Standby,
+        )
+        .unwrap();
+    fixture.reader.live_clients_snapshot(true).unwrap();
+    let before = fixture.metadata.list_live_clients_calls();
+    let metadata = fixture.metadata.clone();
+    let new_route = published.clone();
+    *fixture.metadata.before_route_read.lock() = Some((
+        published.key.clone(),
+        Box::new(move || {
+            // A has already refreshed membership; B becomes visible afterward.
+            assert_eq!(metadata.list_live_clients_calls() - before, 1);
+            metadata
+                .update_client_state(&new_route.replicas[0].owner, ClientLifecycleState::Active)
+                .unwrap();
+            assert!(
+                metadata
+                    .compare_and_swap_object_route(&new_route.key, None, Some(&new_route))
+                    .unwrap()
+                    .applied
+            );
+        }),
+    ));
+
+    fixture.read(MembershipReadPath::Ranges);
+
+    assert!(fixture.metadata.before_route_read.lock().is_none());
+    assert_eq!(fixture.metadata.list_live_clients_calls() - before, 1);
+    assert_eq!(
+        fixture
+            .reader
+            .query_route(&fixture.keys[1])
+            .unwrap()
+            .unwrap(),
+        published,
+        "the shared snapshot predates B and must not remove its healthy primary"
+    );
+    assert_eq!(
+        fixture
+            .reader
+            .query_route(&fixture.keys[0])
+            .unwrap()
+            .unwrap()
+            .replicas
+            .len(),
+        1,
+        "A can still be pruned using its later membership refresh"
+    );
+}
+
+#[test]
+fn read_failure_refresh_preserves_replicas_published_during_route_lookup() {
+    let fixture = MembershipReadFixture::new();
+    let key = &fixture.keys[0];
+    let (mut resolved, _) = fixture
+        .reader
+        .resolve_objects(&[ObjectRef::new(key)])
+        .unwrap();
+    let entry = &mut resolved[0];
+    let mut published = entry.route.clone();
+    published.version = published.version.next();
+    fixture
+        .metadata
+        .update_client_state(
+            fixture.stores[0].runtime_id(),
+            ClientLifecycleState::Standby,
+        )
+        .unwrap();
+    let metadata = fixture.metadata.clone();
+    let new_route = published.clone();
+    let expected = entry.route.version;
+    *fixture.metadata.before_route_read.lock() = Some((
+        published.key.clone(),
+        Box::new(move || {
+            metadata
+                .update_client_state(&new_route.replicas[0].owner, ClientLifecycleState::Active)
+                .unwrap();
+            assert!(
+                metadata
+                    .compare_and_swap_object_route(&new_route.key, Some(expected), Some(&new_route))
+                    .unwrap()
+                    .applied
+            );
+        }),
+    ));
+    let before = fixture.metadata.list_live_clients_calls();
+
+    assert!(fixture
+        .reader
+        .refresh_resolved_route_after_read_failure(entry)
+        .unwrap());
+
+    assert!(fixture.metadata.before_route_read.lock().is_none());
+    assert_eq!(fixture.metadata.list_live_clients_calls() - before, 1);
+    assert_eq!(entry.route, published);
+    assert_eq!(fixture.reader.query_route(key).unwrap().unwrap(), published);
+}
+
+#[test]
+fn put_reservation_retry_stops_when_quota_abort_fails_before_applying() {
+    let fixture = MembershipReadFixture::new();
+    let scope = TenantPolicyScope::new("default", None::<String>, None::<String>);
+    let quota = TenantQuotaPolicy {
+        max_bytes: Some(1024),
+        max_objects: Some(16),
+    };
+    let policy = fixture
+        .metadata
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: scope.clone(),
+                spec: TenantPolicySpec {
+                    quota: Some(quota.clone()),
+                    ..Default::default()
+                },
+                version: 1,
+                updated_at_ms: now_ms(),
+                updated_by: "test".into(),
+            },
+            None,
+        )
+        .unwrap();
+    fixture
+        .reader
+        .live_client_cache
+        .lock()
+        .store_tenant_quota_policy(
+            "default".into(),
+            Some(policy.version),
+            Some(quota),
+            now_ms(),
+        );
+    fixture
+        .metadata
+        .update_client_state(
+            fixture.stores[0].runtime_id(),
+            ClientLifecycleState::Standby,
+        )
+        .unwrap();
+    fixture.reader.live_clients_snapshot(true).unwrap();
+    // A refresh would discover enough owners to retry successfully.
+    fixture
+        .metadata
+        .update_client_state(fixture.stores[0].runtime_id(), ClientLifecycleState::Active)
+        .unwrap();
+    fixture
+        .metadata
+        .fail_next_quota_abort
+        .store(true, Ordering::Relaxed);
+    let before = fixture.metadata.list_live_clients_calls();
+    let policy = ReplicationPolicy::new()
+        .replica_count(2)
+        .prefer_local(false);
+    let value = b"single-put-refresh-payload";
+    let key = "quota-abort-before-retry";
+
+    let error = fixture
+        .reader
+        .put_with_policy(key, value, &policy)
+        .unwrap_err();
+
+    assert!(
+        matches!(error, StoreError::InvalidState(ref message)
+        if message.contains("injected quota abort failure")),
+        "{error}"
+    );
+    assert_eq!(
+        fixture.metadata.quota_abort_calls.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(fixture.metadata.list_live_clients_calls() - before, 0);
+    assert!(fixture.reader.query_route(key).unwrap().is_none());
+    let object_key = fixture.reader.scoped_object_key_for_tenant("default", key);
+    assert!(fixture
+        .metadata
+        .get_tenant_object_accounting(&object_key)
+        .unwrap()
+        .is_none());
+    let reservations = fixture
+        .metadata
+        .list_tenant_quota_reservations(&scope)
+        .unwrap();
+    assert_eq!(
+        reservations.len(),
+        1,
+        "the failed abort must not create a second reservation"
+    );
+    let state = fixture
+        .metadata
+        .get_tenant_quota_state(&scope)
+        .unwrap()
+        .unwrap();
+    assert_eq!((state.used_bytes, state.used_objects), (0, 0));
+    assert_eq!(state.pending_reserved_bytes, value.len() as u64);
+    assert_eq!(state.pending_reserved_objects, 1);
+
+    // Clean up the original reservation, then prove refresh/retry would otherwise succeed.
+    fixture
+        .metadata
+        .abort_tenant_quota(&reservations[0].reservation_id)
+        .unwrap();
+    fixture.reader.put_with_policy(key, value, &policy).unwrap();
+    assert_eq!(fixture.reader.get(key).unwrap(), value);
+    let state = fixture
+        .metadata
+        .get_tenant_quota_state(&scope)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (state.used_bytes, state.used_objects),
+        (value.len() as u64, 1)
+    );
+    assert_eq!(
+        (state.pending_reserved_bytes, state.pending_reserved_objects),
+        (0, 0)
+    );
+}
+
+#[test]
+fn healthy_replicated_reads_do_not_refresh_membership() {
+    let fixture = MembershipReadFixture::new();
+    for path in [
+        MembershipReadPath::Single,
+        MembershipReadPath::Batch,
+        MembershipReadPath::Readable,
+        MembershipReadPath::Ranges,
+    ] {
+        let before = fixture.metadata.list_live_clients_calls();
+        fixture.read(path);
+        assert_eq!(
+            fixture.metadata.list_live_clients_calls() - before,
+            0,
+            "{path:?}"
+        );
+        fixture.assert_replicas(2);
+    }
+}
+
+#[test]
+fn batch_read_pruning_refreshes_membership_once() {
+    for path in [
+        MembershipReadPath::Batch,
+        MembershipReadPath::Readable,
+        MembershipReadPath::Ranges,
+    ] {
+        let fixture = MembershipReadFixture::new();
+        fixture
+            .metadata
+            .update_client_state(
+                fixture.stores[0].runtime_id(),
+                ClientLifecycleState::Offline,
+            )
+            .unwrap();
+        fixture.reader.live_clients_snapshot(true).unwrap();
+        let before = fixture.metadata.list_live_clients_calls();
+        fixture.read(path);
+        assert_eq!(
+            fixture.metadata.list_live_clients_calls() - before,
+            1,
+            "{path:?}"
+        );
+        if matches!(path, MembershipReadPath::Ranges) {
+            // Later routes were loaded after the shared snapshot and retain their replicas.
+            for (index, key) in fixture.keys.iter().enumerate() {
+                let route = fixture.reader.query_route(key).unwrap().unwrap();
+                assert_eq!(route.replicas.len(), if index == 0 { 1 } else { 2 });
+            }
+        } else {
+            fixture.assert_replicas(1);
+        }
+    }
+}
+
+#[test]
+fn batch_read_pruning_preserves_routes_when_membership_refresh_fails() {
+    for path in [
+        MembershipReadPath::Batch,
+        MembershipReadPath::Readable,
+        MembershipReadPath::Ranges,
+    ] {
+        let fixture = MembershipReadFixture::new();
+        fixture
+            .reader
+            .live_client_cache
+            .lock()
+            .store(fixture.stale_membership.clone());
+        fixture
+            .metadata
+            .fail_live_client_list
+            .store(true, Ordering::Relaxed);
+        let before = fixture.metadata.list_live_clients_calls();
+        fixture.read(path);
+        assert_eq!(
+            fixture.metadata.list_live_clients_calls() - before,
+            1,
+            "{path:?}"
+        );
+        fixture.assert_replicas(2);
+        fixture
+            .metadata
+            .fail_live_client_list
+            .store(false, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn batch_reads_refresh_missing_membership_once() {
+    for path in [
+        MembershipReadPath::Batch,
+        MembershipReadPath::Readable,
+        MembershipReadPath::Ranges,
+    ] {
+        let fixture = MembershipReadFixture::new();
+        fixture
+            .reader
+            .live_client_cache
+            .lock()
+            .store(vec![fixture.reader.lease().clone()]);
+        let before = fixture.metadata.list_live_clients_calls();
+        fixture.read(path);
+        assert_eq!(
+            fixture.metadata.list_live_clients_calls() - before,
+            1,
+            "{path:?}"
+        );
+        fixture.assert_replicas(2);
+    }
+}
+
+#[test]
+fn stale_membership_does_not_prune_active_replicas_on_single_or_batch_read() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("stale-read-prune-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("stale-read-prune-b-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("stale-read-prune-reader-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("stale-read-prune-writer-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut store_a = StoreClientBuilder::new(metadata.clone(), "stale-read-prune-a")
+        .state(ClientLifecycleState::Standby)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "stale-read-prune-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "stale-read-prune-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &reader]);
+    let stale_membership = reader
+        .live_clients_snapshot(true)
+        .expect("standby membership should refresh");
+    assert!(stale_membership.iter().any(|lease| {
+        lease.runtime == *store_a.runtime_id() && lease.state == ClientLifecycleState::Standby
+    }));
+    store_a.activate().expect("store-a should activate");
+
+    let writer = StoreClientBuilder::new(metadata.clone(), "stale-read-prune-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .live_client_cache
+        .lock()
+        .store(stale_membership.clone());
+
+    let policy = ReplicationPolicy::new()
+        .replica_count(2)
+        .prefer_local(false)
+        .preferred_storage_owners([
+            store_a.runtime_id().storage_key(),
+            store_b.runtime_id().storage_key(),
+        ]);
+    let single_value = b"stale-read-single-payload";
+    let single_route = writer
+        .put_with_policy("stale-read-single-key", single_value, &policy)
+        .expect("two-replica seed put should succeed");
+    assert_eq!(single_route.replicas[0].owner, *store_a.runtime_id());
+    assert_eq!(single_route.replicas.len(), 2);
+
+    assert_eq!(reader.get("stale-read-single-key").unwrap(), single_value);
+    let after_single = writer
+        .query_route("stale-read-single-key")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after_single.replicas.len(),
+        2,
+        "single get must retain both active replicas"
+    );
+
+    // Restore the pre-activation snapshot so batch read exercises the same stale window.
+    reader.live_client_cache.lock().store(stale_membership);
+    let batch_value = b"stale-read-batch-payload";
+    writer
+        .put_with_policy("stale-read-batch-key", batch_value, &policy)
+        .expect("second two-replica seed put should succeed");
+    let batch_result = reader
+        .batch_get(&[ObjectRef::new("stale-read-batch-key")])
+        .expect("batch get should read through the active backup");
+    assert_eq!(batch_result, vec![batch_value.to_vec()]);
+    let after_batch = writer.query_route("stale-read-batch-key").unwrap().unwrap();
+    assert_eq!(
+        after_batch.replicas.len(),
+        2,
+        "batch get must retain both active replicas"
+    );
 }
 
 #[test]
