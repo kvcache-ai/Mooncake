@@ -906,6 +906,8 @@ struct DiskState {
     int64_t total_size = 0;
     int64_t pending_write_size = 0;
     int64_t pending_eviction_size = 0;
+    // Physical footprint of reserved writes (upper bound).
+    int64_t pending_physical_write = 0;
     // FIFO eviction index: bucket ids on this disk, ascending = oldest first.
     // buckets_ alone is not enough once buckets live on several disks, since
     // its begin() may point at a bucket on a different disk.
@@ -913,10 +915,45 @@ struct DiskState {
     // LRU eviction index: {last_access_ns, bucket_id} for buckets on this
     // disk. Maintained lazily; SelectEvictionCandidate() repairs stale entries.
     std::set<std::pair<int64_t, int64_t>> lru_index;
-    // Cached result of ActualDiskBytesUsedLocked() for this disk and when it
-    // was taken. Per-disk because each root is scanned on its own.
-    int64_t cached_disk_bytes = -1;
-    std::chrono::steady_clock::time_point cached_disk_bytes_at;
+};
+
+// One directory scan, with the written counter read before the walk and the
+// cache generation it belongs to.
+struct DiskUsageSample {
+    int64_t bytes = 0;
+    int64_t written_base = 0;
+    uint64_t generation = 0;
+};
+
+// Cached physical usage of one disk's offload directory, filled by
+// BucketStorageBackend::ActualDiskBytesUsed(). Kept out of DiskState so the
+// directory walk runs without BucketStorageBackend::mutex_; the own mutex is
+// held across the walk, guarding the sample and serialising scans of the disk.
+struct DiskUsageCache {
+    Mutex mutex;
+    DiskUsageSample sample;
+    bool valid = false;  // false = rescan on next query
+    std::chrono::steady_clock::time_point taken_at{};
+    // Committed bucket bytes; covers writes since the sample was taken.
+    std::atomic<int64_t> written{0};
+    // Bumped by Invalidate(), so a sample taken before it is detectably stale.
+    std::atomic<uint64_t> generation{0};
+
+    void Invalidate() {
+        MutexLocker lock(&mutex);
+        valid = false;
+        generation.fetch_add(1, std::memory_order_acq_rel);
+    }
+};
+
+// Free space and physical usage for one disk, gathered before PrepareEviction
+// takes BucketStorageBackend::mutex_.
+struct DiskSpaceSnapshot {
+    // fs::space() succeeded; available is meaningful only then.
+    bool space_known = false;
+    uint64_t available = 0;
+    // Result of ActualDiskBytesUsed(); empty when max_physical_bytes is off.
+    DiskUsageSample usage;
 };
 
 class BucketStorageBackend : public StorageBackendInterface {
@@ -1235,6 +1272,8 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<std::string> skipped_keys;
         int64_t evicted_size = 0;
         int64_t write_size = 0;
+        // Share of DiskState::pending_physical_write.
+        int64_t physical_write_size = 0;
         // Disk this reservation belongs to. PrepareEviction picks it before
         // reserving anything, and every Restore/Commit/Release step credits
         // that same disk's counters. -1 only ever survives on a default-
@@ -1315,11 +1354,22 @@ class BucketStorageBackend : public StorageBackendInterface {
      * (or its own emptyDir quota), so scanning and capping them together would
      * make one busy disk reject writes on an idle one.
      * Result is cached for bucket_backend_config_.disk_scan_cache_ms to bound
-     * the scan cost regardless of offload rate. Caller must hold mutex_.
+     * the scan cost regardless of offload rate. Call without mutex_ held.
      *
      * @param disk_index The disk whose root is scanned.
      */
-    int64_t ActualDiskBytesUsedLocked(int disk_index) const;
+    DiskUsageSample ActualDiskBytesUsed(int disk_index) const;
+
+    // Sample plus writes committed since it and writes still reserved.
+    // Caller must hold mutex_.
+    int64_t ProjectedPhysicalBytesLocked(int disk_index,
+                                         const DiskUsageSample& sample) const;
+
+    /**
+     * @brief Collect the free space and physical usage PrepareEviction needs
+     * for one disk. Runs the system calls, so call it without mutex_ held.
+     */
+    DiskSpaceSnapshot SnapshotDiskSpace(int disk_index) const;
 
     /**
      * @brief Phase 2 of eviction: delete persisted metadata for each evicted
@@ -1377,6 +1427,15 @@ class BucketStorageBackend : public StorageBackendInterface {
     size_t GetLastAlignedCopyBytesForTest() const {
         return last_aligned_copy_bytes_.load(std::memory_order_relaxed);
     }
+
+    // Test-only: the cached physical-usage measurement PrepareEviction uses
+    // for one disk, so cache reuse and invalidation are observable.
+    int64_t ActualDiskBytesUsedForTest(int disk_index) const {
+        return ActualDiskBytesUsed(disk_index).bytes;
+    }
+
+    // Test-only: the physical usage PrepareEviction would project right now.
+    int64_t ProjectedPhysicalBytesForTest(int disk_index);
 
     // Test-only: open aligned direct bucket files as on a file system that
     // refuses O_DIRECT.
@@ -1446,6 +1505,9 @@ class BucketStorageBackend : public StorageBackendInterface {
     // Per-disk quotas, accounting and eviction indexes, indexed in lockstep
     // with disk_paths_. Never resized after construction.
     mutable std::vector<DiskState> GUARDED_BY(mutex_) disks_;
+    // Per-disk physical-usage cache, indexed like disks_ and sized once in
+    // the constructor. Not guarded by mutex_; see DiskUsageCache.
+    std::unique_ptr<DiskUsageCache[]> disk_usage_cache_;
     // Round-robin cursor for SelectDiskForWrite: the disk to try first on the
     // next write.
     int rr_cursor_ GUARDED_BY(mutex_) = 0;
