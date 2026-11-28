@@ -522,6 +522,10 @@ TEST_F(BatchCounterWait, OneDrainReturnsEveryReadyBatch) {
     pfd.fd = multi.completionFd();
     pfd.events = POLLIN;
     EXPECT_EQ(::poll(&pfd, 1, 0), 0);
+    for (auto b : {first, second}) {
+        ASSERT_TRUE(multi.freeBatchID(b).ok());
+        forget(batches, b);
+    }
 #endif
 }
 
@@ -558,6 +562,8 @@ TEST_F(BatchCounterWait, ShortSubmitWakesWhenSubmittedTasksFinish) {
     EXPECT_EQ(done[0].batch_id, b);
     EXPECT_EQ(done[0].status.s, Transport::COMPLETED);
     EXPECT_EQ(done[0].status.transferred_bytes, 17u);
+    ASSERT_TRUE(multi.freeBatchID(b).ok());
+    forget(batches, b);
 #endif
 }
 
@@ -579,6 +585,8 @@ TEST_F(BatchCounterWait, SecondSubmitRejectedWhenEventEnabled) {
     ASSERT_TRUE(submit(legacy, {1}).ok());
     rdma->finish(1);
     ASSERT_TRUE(submit(legacy, {1}).ok());
+    ASSERT_TRUE(multi.freeBatchID(b).ok());
+    forget(batches, b);
 #endif
 }
 
@@ -657,6 +665,8 @@ TEST_F(BatchCounterWait, OptInCompletionInsideSubmitPublishesOnTailSlice) {
     EXPECT_EQ(done[0].batch_id, b);
     EXPECT_EQ(done[0].status.s, Transport::COMPLETED);
     EXPECT_EQ(done[0].status.transferred_bytes, 40u);
+    ASSERT_TRUE(multi.freeBatchID(b).ok());
+    forget(batches, b);
 #endif
 }
 
@@ -674,6 +684,8 @@ TEST_F(BatchCounterWait, SynchronousCompletionPublishesAfterSuccessfulSubmit) {
     ASSERT_EQ(done.size(), 1u);
     EXPECT_EQ(done[0].batch_id, b);
     EXPECT_EQ(done[0].status.s, Transport::COMPLETED);
+    ASSERT_TRUE(multi.freeBatchID(b).ok());
+    forget(batches, b);
 #endif
 }
 
@@ -744,6 +756,8 @@ TEST_F(BatchCounterWait, PartialSliceFailureDoesNotWakeUntilTaskDone) {
     auto queried = query(b);
     EXPECT_EQ(queried.s, Transport::FAILED);
     EXPECT_EQ(queried.transferred_bytes, 0u);
+    ASSERT_TRUE(multi.freeBatchID(b).ok());
+    forget(batches, b);
 #endif
 }
 
@@ -805,6 +819,8 @@ TEST_F(BatchCounterWait, EmptyEventSubmitRejected) {
     ASSERT_TRUE(multi.drainCompletions(done).ok());
     ASSERT_EQ(done.size(), 1u);
     EXPECT_EQ(done[0].batch_id, b);
+    ASSERT_TRUE(multi.freeBatchID(b).ok());
+    forget(batches, b);
 #endif
 }
 
