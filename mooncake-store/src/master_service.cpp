@@ -10219,6 +10219,10 @@ const eviction::OffloadLedger& MasterService::offload_ledger() const {
     return memory_eviction_->ledger;
 }
 
+eviction::Evictor& MasterService::memory_evictor() {
+    return memory_eviction_->evictor;
+}
+
 bool MasterService::OffloadOwnerHasRoom(const UUID& owner) const {
     const eviction::OffloadLedger& ledger = memory_eviction_->ledger;
     // A stalled owner (a hung store, a lost heartbeat reply) is not handed

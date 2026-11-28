@@ -7,6 +7,8 @@
 #include <vector>
 
 #include "client_session/client_session_registry_test_peer.h"
+#include "eviction/evictor.h"
+#include "eviction/offload_ledger.h"
 #include "master_service.h"
 
 namespace mooncake::test {
@@ -70,6 +72,20 @@ class MasterServiceTestPeer {
     void RunNoFBatchEvictForTesting(double evict_ratio_target,
                                     double evict_ratio_lowerbound);
 
+    // Async offload-on-evict (--offload_on_evict_async).
+    using AsyncEvictionTick = MasterService::AsyncEvictionTick;
+    bool OffloadAsync() const { return service_.offload_async_; }
+    uint64_t OffloadOwnerRoom() const { return service_.offload_owner_room_; }
+    const eviction::OffloadLedger& OffloadLedger() const {
+        return service_.offload_ledger();
+    }
+    void PublishOffloadLedgerGaugesForTesting() {
+        service_.PublishOffloadLedgerGauges();
+    }
+    // One tick of the eviction thread's async pool round.
+    AsyncEvictionTick RunAsyncOffloadEvictionTickForTesting() {
+        return service_.RunAsyncOffloadEvictionTick();
+    }
     // The expiry sweep of every namespace and of the replicas whose release
     // was deferred, as of `now`, as an eviction round runs it.
     void DiscardExpiredForTesting(std::chrono::system_clock::time_point now) {
@@ -94,6 +110,21 @@ class MasterServiceTestPeer {
             keys.insert(keys.end(), entry->keys.begin(), entry->keys.end());
         }
         return keys;
+    }
+    // The workers memory eviction's run in `tenant_id` takes; the run's goal
+    // is nothing, so it takes nothing.
+    uint32_t MemoryEvictionWorkersForTesting(const TenantId& tenant_id) {
+        std::shared_lock<std::shared_mutex> lock(service_.master_state_mutex_);
+        return service_.memory_evictor()
+            .Run(tenant_id, eviction::ByteGoal{})
+            .workers;
+    }
+    // Stops and joins the eviction thread, so a test drives every round.
+    void StopEvictionThreadForTesting() {
+        service_.eviction_running_.store(false, std::memory_order_relaxed);
+        if (service_.eviction_thread_.joinable()) {
+            service_.eviction_thread_.join();
+        }
     }
 
     void RunDfsEvictionForTesting();

@@ -70,6 +70,7 @@ class DfsAllocatorInterface;
 class ImmutableBucketAllocator;
 class KvcsCapacityProvider;
 namespace eviction {
+class Evictor;
 class OffloadLedger;
 }  // namespace eviction
 
@@ -1599,6 +1600,8 @@ class MasterService {
     bool OffloadOwnerHasRoom(const UUID& owner) const;
     // Async: what eviction has queued for offload and not yet seen end.
     const eviction::OffloadLedger& offload_ledger() const;
+    // The evictor memory eviction runs (BatchEvict, EvictNamespaceMemory).
+    eviction::Evictor& memory_evictor();
     // Async: frees the memory of the object `accessor` holds, whose offload
     // eviction queued (at `evict_queued_at`, when it was eviction's copy) has
     // just landed, unless it was read, pinned or taken meanwhile. Returns the
