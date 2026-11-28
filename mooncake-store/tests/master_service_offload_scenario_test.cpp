@@ -251,6 +251,83 @@ TEST(MasterServiceOffloadScenarioTest,
             {"upsert_over_partially_drained_offload"}, 1024));
 }
 
+class MirroredDiskUpsertTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        scenario.Given(MemoryNode("owner"))
+            .Given(MemoryNode("mirror"))
+            .When(MountLocalDisk("owner"))
+            .When(PutStart(key, 1_KB).By("owner").Replicas(2).ExpectReplicas(2))
+            .When(PutEnd(key).By("owner"))
+            .When(OffloadHeartbeat("owner").ExpectTasks({key}, 1024))
+            .When(CompleteOffload({key}).By("owner").OnNode("owner"))
+            .Then(Object(key).HasCompleteLocalDiskReplicas(1))
+            .When(MountLocalDisk("mirror"))
+            .When(UpsertStart(key, 1_KB).By("owner").Replicas(2))
+            .When(UpsertEnd(key).By("owner"))
+            .Then(Object(key)
+                      .HasCompleteMemoryReplicas(2)
+                      .HasCompleteLocalDiskReplicas(0))
+            .When(OffloadHeartbeat("owner").ExpectTasks({key}, 1024));
+    }
+
+    void ExpectDiskOnlyRead() {
+        scenario
+            .When(ClearReplicas({key})
+                      .By("owner")
+                      .FromNode("owner")
+                      .ExpectCleared({key}))
+            .When(ClearReplicas({key})
+                      .By("owner")
+                      .FromNode("mirror")
+                      .ExpectCleared({key}))
+            .Then(Object(key).HasReplicas(1).HasCompleteLocalDiskReplicas(1));
+    }
+
+    const std::string key = "mirrored-upsert";
+    MasterScenario scenario{"same-size upsert with two offload mirrors",
+                            OffloadConfig(0)};
+};
+
+TEST_F(MirroredDiskUpsertTest, OwnerAcknowledgesFirst) {
+    scenario.When(OffloadHeartbeat("mirror").ExpectTasks({key}, 1024))
+        .When(CompleteOffload({key}).By("owner").OnNode("owner"))
+        .Then(Object(key).HasCompleteLocalDiskReplicas(1))
+        .When(CompleteOffload({key}).By("mirror").OnNode("mirror"));
+    ExpectDiskOnlyRead();
+}
+
+TEST_F(MirroredDiskUpsertTest, MirrorAcknowledgesFirst) {
+    scenario.When(OffloadHeartbeat("mirror").ExpectTasks({key}, 1024))
+        .When(CompleteOffload({key}).By("mirror").OnNode("mirror"))
+        .Then(Object(key).HasCompleteLocalDiskReplicas(0))
+        .When(CompleteOffload({key}).By("owner").OnNode("owner"));
+    ExpectDiskOnlyRead();
+}
+
+TEST_F(MirroredDiskUpsertTest, MirrorReportsFailureBeforeOwnerAcknowledges) {
+    scenario.When(OffloadHeartbeat("mirror").ExpectTasks({key}, 1024))
+        .When(CompleteOffload({key}).By("mirror").OnNode("mirror").OfSize(-1))
+        .Then(Object(key).HasCompleteLocalDiskReplicas(0))
+        .When(CompleteOffload({key}).By("owner").OnNode("owner"));
+    ExpectDiskOnlyRead();
+}
+
+TEST_F(MirroredDiskUpsertTest, MirrorDisablesOffloadBeforeOwnerAcknowledges) {
+    scenario.When(OffloadHeartbeat("mirror").Disabled().ExpectNoTasks())
+        .Then(Object(key).HasCompleteLocalDiskReplicas(0))
+        .When(CompleteOffload({key}).By("owner").OnNode("owner"));
+    ExpectDiskOnlyRead();
+}
+
+TEST_F(MirroredDiskUpsertTest, OwnerFailureKeepsDiskPendingOnReregistration) {
+    scenario.When(OffloadHeartbeat("mirror").ExpectTasks({key}, 1024))
+        .When(CompleteOffload({key}).By("owner").OnNode("owner").OfSize(-1))
+        .When(CompleteOffload({key}).By("mirror").OnNode("mirror"))
+        .When(CompleteOffload({key}).By("owner").OnNode("owner"))
+        .Then(Object(key).HasCompleteLocalDiskReplicas(0));
+}
+
 TEST(MasterServiceOffloadScenarioTest, RemoveReleasesLocalDiskUsage) {
     // Both stores report 1000 bytes of SSD. Offloading 800 bytes to disk-1
     // leaves it 20% free against disk-2's 90%, so disk-2 would win the next
