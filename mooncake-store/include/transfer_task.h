@@ -388,6 +388,16 @@ struct MemcpyTask {
 };
 
 /**
+ * @brief True when some op writes bytes that another op of the task reads or
+ * writes, so the ops must run one after another instead of being batched.
+ *
+ * Zero-length ops touch nothing. An op whose own source and destination
+ * overlap counts too, and so does a range whose end would wrap past the top of
+ * the address space; both are conservative.
+ */
+bool MemcpyOperationsOverlap(const std::vector<MemcpyOperation>& operations);
+
+/**
  * @brief Thread pool for asynchronous memcpy operations
  *
  * This class manages a single worker thread that executes memcpy operations
