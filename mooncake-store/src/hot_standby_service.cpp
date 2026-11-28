@@ -1385,6 +1385,10 @@ void HotStandbyService::ReplicationLoop() {
             auto result = batch_standby_reader_->PollOnce(
                 config_.oplog_standby_max_batches_per_poll, read_mode);
             standby_has_more_pages = result.has_more_pages;
+            if (result.skipped_entries > 0) {
+                HAMetricManager::instance().inc_oplog_skipped_entries(
+                    static_cast<int64_t>(result.skipped_entries));
+            }
             if (result.durable_prefix_present ||
                 result.disposition ==
                     OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED) {
@@ -1494,6 +1498,10 @@ void HotStandbyService::ReplicationLoop() {
 
         const uint64_t applied_seq_id = applied_seq_id_.load();
         const uint64_t primary_seq_id = primary_seq_id_.load();
+        HAMetricManager::instance().set_oplog_standby_lag(
+            primary_seq_id > applied_seq_id
+                ? static_cast<int64_t>(primary_seq_id - applied_seq_id)
+                : 0);
         if (applied_seq_id != last_reported_applied_seq_id ||
             primary_seq_id != last_reported_primary_seq_id) {
             last_reported_applied_seq_id = applied_seq_id;
