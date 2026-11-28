@@ -1639,9 +1639,12 @@ TransferSubmitter::submit_batch_get_offload_object(
         return std::nullopt;
     }
 
-    const bool use_local_memcpy =
-        buffer_access == OffloadBufferAccess::kLocalAddress;
-    if (use_local_memcpy && !canUseLocalMemcpy(transfer_engine_addr)) {
+    // Copy with memcpy whenever the source is locally addressable, regardless
+    // of buffer_access. kLocalAddress requires a locally addressable source
+    // and is rejected otherwise.
+    const bool use_local_memcpy = canUseLocalMemcpy(transfer_engine_addr);
+    if (buffer_access == OffloadBufferAccess::kLocalAddress &&
+        !use_local_memcpy) {
         LOG(ERROR) << "Offload source is not locally addressable: "
                    << transfer_engine_addr;
         return std::nullopt;
