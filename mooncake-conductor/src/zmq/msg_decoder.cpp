@@ -103,10 +103,19 @@ ValueResult<std::vector<uint64_t>> ParseUint64Array(const object& value) {
 }
 
 const std::set<std::string_view> kVllmFields = {
-    "type",      "block_hashes",       "parent_block_hash",
-    "token_ids", "block_size",         "lora_id",
-    "medium",    "lora_name",          "extra_keys",
-    "group_idx", "kv_cache_spec_kind", "kv_cache_spec_sliding_window",
+    "type",
+    "block_hashes",
+    "parent_block_hash",
+    "token_ids",
+    "block_size",
+    "lora_id",
+    "medium",
+    "lora_name",
+    "extra_keys",
+    "group_idx",
+    "kv_cache_spec_kind",
+    "kv_cache_spec_sliding_window",
+    "kv_cache_layout",
 };
 
 const std::set<std::string_view> kVllmRemovedFields = {"type", "block_hashes",
@@ -172,7 +181,9 @@ ValueResult<VllmEvent> ParseVllmEvent(const object& raw) {
                            &event.kv_cache_spec_kind, &error) ||
             !ParseOptional(reader, "kv_cache_spec_sliding_window",
                            ParseNullableInt64,
-                           &event.kv_cache_spec_sliding_window, &error)) {
+                           &event.kv_cache_spec_sliding_window, &error) ||
+            !ParseOptional(reader, "kv_cache_layout", ParseNullableString,
+                           &event.kv_cache_layout, &error)) {
             return ValueResult<VllmEvent>::Err(error);
         }
         if (const object* extra_keys = reader.Get("extra_keys");
@@ -479,7 +490,7 @@ ValueResult<std::optional<std::vector<int32_t>>> ParseSglangTokenIds(
 // omitted, so an absent optional key is normal and carries the default meaning.
 const std::set<std::string_view> kSglangFields = {
     "type",    "block_hashes", "parent_block_hash", "token_ids",  "block_size",
-    "lora_id", "medium",       "cache_salt",        "session_id",
+    "lora_id", "medium",       "cache_salt",        "session_id", "lora_name",
 };
 
 const std::set<std::string_view> kSglangRemovedFields = {"type", "block_hashes",
@@ -548,7 +559,9 @@ ValueResult<SglangEvent> ParseSglangEvent(const object& raw) {
             !ParseOptional(reader, "medium", ParseNullableString, &event.medium,
                            &error) ||
             !ParseOptional(reader, "cache_salt", ParseNullableString,
-                           &event.cache_salt, &error)) {
+                           &event.cache_salt, &error) ||
+            !ParseOptional(reader, "lora_name", ParseNullableString,
+                           &event.lora_name, &error)) {
             return ValueResult<SglangEvent>::Err(error);
         }
         if (event.block_size <= 0) {
