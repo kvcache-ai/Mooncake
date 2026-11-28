@@ -384,12 +384,19 @@ class TransferEngine:
     def get_first_buffer_address(self, segment_name: str, /) -> int: ...
     def warmup_efa_segment(self, segment_name: str) -> int: ...
     def get_notifies(self) -> list[TransferNotify]: ...
+    def refresh_session(self, peer_server_name: str) -> int:
+        """Refresh one cached peer descriptor on the classic backend.
+
+        Returns 0 if metadata is accepted, including unchanged data;
+        non-zero on failure. Does not prove data-plane health.
+        """
     def send_probe(self, peer_server_name: str) -> int:
         """Send a JSON-RPC probe to peer to verify reachability.
 
         Returns 0 on success, non-zero on failure.
         """
     def get_engine(self) -> InnerTransferEngine: ...
+    def reset_reshard_peers_quiescent(self, peers: Sequence[str]) -> int: ...
     def get_engine_ptr(self) -> int: ...
 
 class SharedSegment:

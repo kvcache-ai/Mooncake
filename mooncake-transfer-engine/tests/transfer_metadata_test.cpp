@@ -482,6 +482,104 @@ std::shared_ptr<TransferMetadata::SegmentDesc> makeRdmaSegmentDesc(
 
 }  // namespace
 
+TEST(TransferMetadataInvalidationTest, UnknownRemoteIsIdempotent) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    EXPECT_EQ(metadata.getCachedSegmentID("not-an-endpoint"),
+              static_cast<TransferMetadata::SegmentID>(-1));
+    EXPECT_EQ(metadata.invalidateRemoteSegmentCache("127.0.0.1:0"), 0);
+    EXPECT_EQ(metadata.invalidateRemoteSegmentCache("127.0.0.1:0"), 0);
+}
+
+TEST(TransferMetadataInvalidationTest, CachedLookupUsesTheRequestedName) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    constexpr TransferMetadata::SegmentID kRemoteID = 17;
+    auto remote = makeRdmaSegmentDesc("127.0.0.1:1234", 0x1000);
+    ASSERT_EQ(metadata.addLocalSegment(
+                  kRemoteID, "localhost:1234",
+                  std::shared_ptr<TransferMetadata::SegmentDesc>(remote)),
+              0);
+    EXPECT_EQ(metadata.getCachedSegmentID("localhost:1234"), kRemoteID);
+    EXPECT_EQ(metadata.getCachedSegmentID(remote->name),
+              static_cast<TransferMetadata::SegmentID>(-1));
+    ASSERT_EQ(metadata.invalidateRemoteSegmentCache("localhost:1234"), 0);
+    EXPECT_EQ(metadata.getCachedSegmentID("localhost:1234"),
+              static_cast<TransferMetadata::SegmentID>(-1));
+}
+
+TEST(TransferMetadataInvalidationTest, RejectsLocalAndPreservesDescriptor) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    const std::string local_name = "127.0.0.1:0";
+    auto local_desc = makeRdmaSegmentDesc(local_name, 0x3000);
+    ASSERT_EQ(metadata.addLocalSegment(
+                  LOCAL_SEGMENT_ID, local_name,
+                  std::shared_ptr<TransferMetadata::SegmentDesc>(local_desc)),
+              0);
+
+    EXPECT_NE(metadata.invalidateRemoteSegmentCache(local_name), 0);
+    EXPECT_EQ(metadata.getCachedSegmentID(local_name), LOCAL_SEGMENT_ID);
+    EXPECT_EQ(metadata.getSegmentID(local_name), LOCAL_SEGMENT_ID);
+    EXPECT_EQ(metadata.getSegmentDescByID(LOCAL_SEGMENT_ID), local_desc);
+    EXPECT_EQ(metadata.getSegmentDescByName(local_name), local_desc);
+}
+
+TEST(TransferMetadataInvalidationTest,
+     RefetchesUpdatedPeerAndPreservesAuthoritativeDescriptor) {
+    constexpr uint64_t kInitialAddr = 0x1000;
+    constexpr uint64_t kUpdatedAddr = 0x2000;
+    ScopedMetadataRefreshConfig restore(0, true);
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_name = "127.0.0.1:" + std::to_string(port);
+    ASSERT_EQ(
+        server.addLocalSegment(LOCAL_SEGMENT_ID, remote_name,
+                               makeRdmaSegmentDesc(remote_name, kInitialAddr)),
+        0);
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_name, rpc_desc), 0);
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    const auto old_id = client.getSegmentID(remote_name);
+    ASSERT_NE(old_id, static_cast<TransferMetadata::SegmentID>(-1));
+    auto cached_desc = client.getSegmentDescByID(old_id);
+    ASSERT_NE(cached_desc, nullptr);
+    ASSERT_EQ(cached_desc->buffers.size(), 1U);
+    ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+    ASSERT_EQ(server.removeLocalMemoryBuffer(
+                  reinterpret_cast<void *>(kInitialAddr), false),
+              0);
+    ASSERT_EQ(
+        server.addLocalMemoryBuffer(makeRdmaBufferDesc(kUpdatedAddr), false),
+        0);
+    EXPECT_EQ(client.getSegmentDescByName(remote_name), cached_desc);
+
+    ASSERT_EQ(client.invalidateRemoteSegmentCache(remote_name), 0);
+    ASSERT_EQ(client.invalidateRemoteSegmentCache(remote_name), 0);
+    EXPECT_EQ(client.getSegmentDescByID(old_id), nullptr);
+    auto refreshed_desc = client.getSegmentDescByName(remote_name);
+    ASSERT_NE(refreshed_desc, nullptr);
+    ASSERT_EQ(refreshed_desc->buffers.size(), 1U);
+    EXPECT_EQ(refreshed_desc->buffers[0].addr, kUpdatedAddr);
+    EXPECT_NE(client.getSegmentID(remote_name), old_id);
+    auto authoritative_desc = server.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(authoritative_desc, nullptr);
+    ASSERT_EQ(authoritative_desc->buffers.size(), 1U);
+    EXPECT_EQ(authoritative_desc->buffers[0].addr, kUpdatedAddr);
+    auto fetched_desc = client.getSegmentDesc(remote_name);
+    ASSERT_NE(fetched_desc, nullptr);
+    ASSERT_EQ(fetched_desc->buffers.size(), 1U);
+    EXPECT_EQ(fetched_desc->buffers[0].addr, kUpdatedAddr);
+}
+
 TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
     constexpr uint64_t kInitialAddr = 0x1000;
     constexpr uint64_t kUpdatedAddr = 0x2000;
@@ -1299,6 +1397,86 @@ class TransferMetadataStaleSegmentInvalidationTest : public ::testing::Test {
         return client.getSegmentDescByName(name);
     }
 };
+
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       StrictRefreshRequiresCachedRemoteButLegacySyncDoesNot) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+    ASSERT_EQ(
+        client.updateSegmentDesc("peer", *makeRdmaSegmentDesc("peer", 0x1000)),
+        0);
+    EXPECT_NE(client.refreshCachedSegment(""), 0);
+    EXPECT_NE(client.refreshCachedSegment("peer"), 0);
+    // openSegmentNoCache calls sync before its first lookup. Keep that
+    // contract.
+    EXPECT_EQ(client.syncSegmentCache("peer"), 0);
+    ASSERT_TRUE(client.getSegmentDescByName("peer"));
+    EXPECT_EQ(client.refreshCachedSegment("peer"), 0);
+    EXPECT_EQ(client.syncSegmentCache(""), 0);
+}
+
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       StrictRefreshAcceptsUnchangedAndRetainsOldReferences) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+    auto old = seedRemoteSegment(client, "peer");
+    ASSERT_TRUE(old);
+    ASSERT_EQ(client.refreshCachedSegment("peer"), 0);
+    ASSERT_EQ(
+        client.updateSegmentDesc("peer", *makeRdmaSegmentDesc("peer", 0x2000)),
+        0);
+    ASSERT_EQ(client.refreshCachedSegment("peer"), 0);
+    EXPECT_EQ(client.getSegmentDescByName("peer")->buffers.front().addr,
+              0x2000);
+    EXPECT_EQ(old->buffers.front().addr, 0x1000);
+}
+
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       StrictRefreshRejectsUnavailableAndMissingMetadata) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+    auto old = seedRemoteSegment(client, "peer");
+    ASSERT_TRUE(old);
+    plugin->failNext("mooncake/ram/peer", 1);
+    EXPECT_NE(client.refreshCachedSegment("peer"), 0);
+    EXPECT_EQ(client.getSegmentDescByName("peer"), old);
+    EXPECT_EQ(client.refreshCachedSegment("peer"), 0);
+    plugin->drop("mooncake/ram/peer");
+    EXPECT_NE(client.refreshCachedSegment("peer"), 0);
+    // All-cache refresh remains best effort even with missing metadata.
+    EXPECT_EQ(client.syncSegmentCache(""), 0);
+    EXPECT_EQ(old->buffers.front().addr, 0x1000);
+}
+
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       StrictRefreshRejectsRollbackAndSameVersionConflict) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+    auto old = seedRemoteSegment(client, "peer");
+    ASSERT_TRUE(old);
+    Json::Value original;
+    ASSERT_TRUE(plugin->get("mooncake/ram/peer", original));
+    auto stale = original;
+    stale["metadata_version"] = Json::UInt64(old->metadata_version - 1);
+    plugin->set("mooncake/ram/peer", stale);
+    EXPECT_NE(client.refreshCachedSegment("peer"), 0);
+    EXPECT_EQ(client.syncSegmentCache("peer"), 0);
+    auto conflict = original;
+    conflict["buffers"][0]["addr"] = Json::UInt64(0x2000);
+    plugin->set("mooncake/ram/peer", conflict);
+    EXPECT_NE(client.refreshCachedSegment("peer"), 0);
+    EXPECT_EQ(client.syncSegmentCache("peer"), 0);
+    EXPECT_EQ(client.getSegmentDescByName("peer"), old);
+    original["metadata_version"] = Json::UInt64(old->metadata_version + 1);
+    plugin->set("mooncake/ram/peer", original);
+    EXPECT_EQ(client.refreshCachedSegment("peer"), 0);
+    EXPECT_EQ(client.getSegmentDescByName("peer")->metadata_version,
+              old->metadata_version + 1);
+}
 
 // Red on master / green on branch: a cached remote segment whose backend key
 // is removed (peer unmount) is invalidated only after the consecutive-failure

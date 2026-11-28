@@ -383,6 +383,17 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    if (const char* max_seg_size_env = std::getenv("MC_MAX_SEG_SIZE")) {
+        const auto parsed = TryParseInteger<uint64_t>(
+            max_seg_size_env, {.trim_ascii_whitespace = true});
+        if (parsed.has_value() && *parsed > 0) {
+            config.max_seg_size = *parsed;
+        } else {
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_MAX_SEG_SIZE";
+        }
+    }
+
     const char* retry_cnt_env = std::getenv("MC_RETRY_CNT");
     if (retry_cnt_env) {
         size_t val = atoi(retry_cnt_env);
@@ -892,6 +903,18 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    if (const char* value = std::getenv("MC_IB_TIMEOUT")) {
+        const auto parsed = TryParseInteger<int>(
+            value, {.trim_ascii_whitespace = true, .allow_leading_plus = true});
+        if (parsed && *parsed >= 1 && *parsed <= 31) {
+            config.ib_timeout = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid MC_IB_TIMEOUT: " << value
+                         << "; expected an integer in [1, 31], keeping "
+                         << config.ib_timeout;
+        }
+    }
+
     const char* ib_relaxed_ordering_env =
         std::getenv("MC_IB_PCI_RELAXED_ORDERING");
     if (ib_relaxed_ordering_env) {
@@ -1002,6 +1025,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "gid_index = " << config.gid_index;
     LOG(INFO) << "pkey_index = " << config.pkey_index;
     LOG(INFO) << "max_mr_size = " << config.max_mr_size;
+    LOG(INFO) << "max_seg_size = " << config.max_seg_size;
     LOG(INFO) << "max_cqe = " << config.max_cqe;
     LOG(INFO) << "max_ep_per_ctx = " << config.max_ep_per_ctx;
     LOG(INFO) << "num_qp_per_ep = " << config.num_qp_per_ep;
@@ -1033,6 +1057,7 @@ void dumpGlobalConfig() {
                                                                    : "all");
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;
+    LOG(INFO) << "ib_timeout = " << config.ib_timeout;
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "
               << config.te_metadata_refresh_interval_seconds;
     LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;

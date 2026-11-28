@@ -1404,6 +1404,18 @@ python -m mooncake.mooncake_store_service --config=<config_path> -Dtenant_id=ten
 
 Run the `mooncake_client` binary as a standalone RPC process that owns storage resources; application processes (vLLM / SGLang) use lightweight **dummy clients** to forward requests to it. It connects to the master and listens on port `50052` by default.
 
+The heartbeat handler does not wait for the shared-memory lock. A registration
+protects its own client while it is in progress, and a newly installed mapping
+renews that client's expiration deadline. After expiration, the next heartbeat
+requests a full remount using the existing `NEED_REMOUNT` status, and the dummy
+client resends its registered shared-memory descriptors automatically.
+
+Use `--threads=2` or more when running concurrent dummy requests during
+registration. With the default single RPC worker, an RPC waiting for the
+shared-memory lock can occupy the only worker and delay heartbeats. Ascend
+registration also runs on an RPC worker. Configure enough workers for the
+concurrent blocking RPCs because heartbeats share the worker pool.
+
 ```bash
 mooncake_client \
   --global_segment_size="4GB" \
