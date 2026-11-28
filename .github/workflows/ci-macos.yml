@@ -14,6 +14,7 @@ on:
       - 'cmake/**'
       - 'CMakeLists.txt'
       - '.github/workflows/ci-macos.yml'
+      - '.github/workflows/_check-approval.yml'
   pull_request:
     branches:
       - "main"
@@ -30,9 +31,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-approval:
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/_check-approval.yml
+    with:
+      fail-if-unapproved: true
+
   # Only mooncake_master builds on macOS today (no RDMA/NUMA), so this job
   # guards that target from Linux-only regressions.
   build-master-macos:
+    needs: [check-approval]
+    if: needs.check-approval.outputs.run_ci == 'true'
     runs-on: macos-15
     timeout-minutes: 90
     env:

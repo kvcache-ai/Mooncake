@@ -1,0 +1,112 @@
+name: _check-approval
+
+# Shared approval gate for PR workflows (`ci.yml`, `ci-macos.yml`).
+# Authorizes heavy CI on non-PR events, when a PR carries the manual `run-ci`
+# label, or when a non-bot repo maintainer has an active APPROVED review.
+on:
+  workflow_call:
+    inputs:
+      fail-if-unapproved:
+        description: Fail this job when heavy CI is not yet authorized (for workflows without fast checks)
+        type: boolean
+        default: false
+    outputs:
+      run_ci:
+        description: Whether heavy CI jobs are authorized to run
+        value: ${{ jobs.check-approval.outputs.run_ci }}
+      reason:
+        description: Reason for the authorization decision
+        value: ${{ jobs.check-approval.outputs.reason }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  check-approval:
+    name: Check CI approval
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      run_ci: ${{ steps.approval.outputs.run_ci }}
+      reason: ${{ steps.approval.outputs.reason }}
+    steps:
+      - name: Evaluate PR approval status
+        id: approval
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          FAIL_IF_UNAPPROVED: ${{ inputs.fail-if-unapproved }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "run_ci=true" >> "$GITHUB_OUTPUT"
+            echo "reason=event:${EVENT_NAME}" >> "$GITHUB_OUTPUT"
+            echo "Non-PR event (${EVENT_NAME}): full CI enabled."
+            exit 0
+          fi
+
+          # Query live PR state rather than github.event so gh run rerun sees
+          # labels and approvals added after the original pull_request event.
+          pr_json=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          pr_author=$(echo "$pr_json" | jq -r '.user.login // ""')
+          if echo "$pr_json" | jq -e 'any(.labels[]?; .name == "run-ci")' >/dev/null; then
+            echo "run_ci=true" >> "$GITHUB_OUTPUT"
+            echo "reason=label:run-ci" >> "$GITHUB_OUTPUT"
+            echo "PR #${PR_NUMBER} has the 'run-ci' label: full CI enabled."
+            exit 0
+          fi
+
+          approver=$(
+            gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/reviews" | jq -s -r \
+              --arg pr_author "$pr_author" '
+                add // []
+                | map(select(
+                    ((.user.type // "") == "User")
+                    and (((.user.login // "") | endswith("[bot]")) | not)
+                    and ((.user.login // "") != $pr_author)
+                    and (.author_association as $a
+                         | ["OWNER", "MEMBER", "COLLABORATOR"] | index($a) != null)
+                    and (.state as $s
+                         | ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"] | index($s) != null)
+                  ))
+                | group_by(.user.login)
+                | map(sort_by(.id) | last)
+                | map(select(.state == "APPROVED"))
+                | .[0].user.login // ""
+              '
+          )
+
+          if [ -n "$approver" ]; then
+            echo "run_ci=true" >> "$GITHUB_OUTPUT"
+            echo "reason=approved:${approver}" >> "$GITHUB_OUTPUT"
+            echo "PR #${PR_NUMBER} is approved by @${approver}: full CI enabled."
+            exit 0
+          fi
+
+          echo "run_ci=false" >> "$GITHUB_OUTPUT"
+          echo "reason=awaiting-approval" >> "$GITHUB_OUTPUT"
+          echo "PR #${PR_NUMBER} is awaiting maintainer approval (or 'run-ci' label + manual rerun): fast checks only."
+          {
+            echo "### Fast Checks Only"
+            echo ""
+            echo "Heavy build and test jobs will run automatically after a maintainer approves this PR. To run them before approval, add the \`run-ci\` label and select **Re-run jobs** on this workflow run (or push a new commit)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${FAIL_IF_UNAPPROVED:-false}" = "true" ]; then
+            echo "::notice::Build is deferred until a maintainer approves this PR (or adds the 'run-ci' label and re-runs jobs)."
+            exit 1
+          fi
+
+      # Marker step inspected by ci-retrigger.yml via the Jobs API to
+      # distinguish fast-only runs from runs that authorized full CI.
+      - name: Full CI authorized
+        if: steps.approval.outputs.run_ci == 'true'
+        env:
+          REASON: ${{ steps.approval.outputs.reason }}
+        shell: bash
+        run: echo "Full CI authorized (${REASON})."

@@ -9,8 +9,9 @@ on:
     branches:
       - "main"
       - "release/**"
-    # Labels must not restart or cancel in-progress runs. For a same-SHA
-    # retrigger, rerun the existing GitHub Actions run.
+    # Labels must not restart or cancel in-progress runs. Heavy jobs wait for
+    # maintainer PR approval (auto-retriggered by ci-retrigger.yml) or a manual
+    # `run-ci` label followed by re-running the existing Actions run.
     types: [opened, synchronize, reopened]
   workflow_dispatch: {}
 
@@ -30,6 +31,12 @@ env:
   SCCACHE_GHA_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
 
 jobs:
+  check-approval:
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/_check-approval.yml
+
   fast-checks:
     name: Fast lint, format, contract, and path checks
     runs-on: ubuntu-22.04
@@ -293,8 +300,8 @@ jobs:
   # Build the artifact tested below through the exact release wheel path. The
   # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
   build-wheel:
-    needs: [fast-checks]
-    if: &run-ci-for-source-changes needs.fast-checks.outputs.src == 'true'
+    needs: [check-approval, fast-checks]
+    if: &run-ci-for-source-changes needs.check-approval.outputs.run_ci == 'true' && needs.fast-checks.outputs.src == 'true'
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       python-versions: '["3.10", "3.12"]'
@@ -492,7 +499,7 @@ jobs:
 
   unit-tests:
     name: CTest unit tests (Python 3.12)
-    needs: [fast-checks]
+    needs: [check-approval, fast-checks]
     if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04
     timeout-minutes: 120
@@ -659,7 +666,7 @@ jobs:
       run: make html SPHINXOPTS=-W
 
   build-wheel-cu13:
-    needs: [fast-checks]
+    needs: [check-approval, fast-checks]
     if: *run-ci-for-source-changes
     uses: ./.github/workflows/_build-wheel.yaml
     with:
@@ -676,7 +683,7 @@ jobs:
   # arm64 default wheels use a different transport set (USE_MNNVL) than
   # x86_64 (USE_INTRA_NVLINK), so build one here instead of only at release.
   build-wheel-cu13-arm64:
-    needs: [fast-checks]
+    needs: [check-approval, fast-checks]
     if: *run-ci-for-source-changes
     uses: ./.github/workflows/_build-wheel.yaml
     with:
@@ -687,7 +694,7 @@ jobs:
       version-override: 0.0.0.dev0
 
   build-wheel-rocm:
-    needs: [fast-checks]
+    needs: [check-approval, fast-checks]
     if: *run-ci-for-source-changes
     uses: ./.github/workflows/ci_rocm.yml
     with:
@@ -697,13 +704,13 @@ jobs:
     secrets: inherit
 
   build-wheel-xpu:
-    needs: [fast-checks]
+    needs: [check-approval, fast-checks]
     if: *run-ci-for-source-changes
     uses: ./.github/workflows/ci_xpu.yml
 
   tent-ci:
-    needs: [fast-checks]
-    if: needs.fast-checks.outputs.tent == 'true'
+    needs: [check-approval, fast-checks]
+    if: needs.check-approval.outputs.run_ci == 'true' && needs.fast-checks.outputs.tent == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     strategy:
@@ -893,8 +900,8 @@ jobs:
 
   store-rs-ci:
     name: Store-RS Classic TE smoke
-    needs: [fast-checks]
-    if: needs.fast-checks.outputs.store_rs == 'true'
+    needs: [check-approval, fast-checks]
+    if: needs.check-approval.outputs.run_ci == 'true' && needs.fast-checks.outputs.store_rs == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
@@ -1022,6 +1029,7 @@ jobs:
     # required check for a PR head whose run was cancelled.
     if: ${{ (github.event_name != 'push' && always()) || !cancelled() }}
     needs:
+      - check-approval
       - fast-checks
       - docs-check
       - build-wheel
@@ -1041,14 +1049,40 @@ jobs:
       - name: Check unconditional jobs
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-          PASSED: ${{ needs.fast-checks.result == 'success' }}
+          PASSED: >-
+            ${{ needs.check-approval.result == 'success' &&
+                needs.fast-checks.result == 'success' }}
         run: |
           echo "$NEEDS_JSON"
           test "$PASSED" = true
 
+      - name: Check documentation job
+        env:
+          EXPECTED: ${{ needs.fast-checks.outputs.docs == 'true' && 'success' || 'skipped' }}
+          RESULT: ${{ needs.docs-check.result }}
+        run: test "$RESULT" = "$EXPECTED"
+
+      - name: Require approval for heavy CI
+        env:
+          RUN_CI: ${{ needs.check-approval.outputs.run_ci }}
+          NEEDS_HEAVY_CI: >-
+            ${{ needs.fast-checks.outputs.src == 'true' ||
+                needs.fast-checks.outputs.tent == 'true' ||
+                needs.fast-checks.outputs.store_rs == 'true' }}
+        run: |
+          if [ "$NEEDS_HEAVY_CI" = "true" ] && [ "$RUN_CI" != "true" ]; then
+            echo "::notice::Fast checks passed. Full CI will run automatically after a maintainer approves this PR (or after adding the 'run-ci' label and re-running jobs)."
+            {
+              echo "### Waiting for Maintainer Approval"
+              echo ""
+              echo "All fast checks passed. Heavy build and test jobs will run automatically after a maintainer approves this PR. To run them before approval, add the \`run-ci\` label and select **Re-run jobs** on this workflow run (or push a new commit)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
       - name: Check source jobs
         env:
-          EXPECTED: ${{ needs.fast-checks.outputs.src == 'true' && 'success' || 'skipped' }}
+          EXPECTED: ${{ (needs.check-approval.outputs.run_ci == 'true' && needs.fast-checks.outputs.src == 'true') && 'success' || 'skipped' }}
           RESULTS: >-
             ${{ needs.build-wheel.result }}
             ${{ needs.unit-tests.result }}
@@ -1064,18 +1098,12 @@ jobs:
 
       - name: Check TENT jobs
         env:
-          EXPECTED: ${{ needs.fast-checks.outputs.tent == 'true' && 'success' || 'skipped' }}
+          EXPECTED: ${{ (needs.check-approval.outputs.run_ci == 'true' && needs.fast-checks.outputs.tent == 'true') && 'success' || 'skipped' }}
           RESULT: ${{ needs.tent-ci.result }}
         run: test "$RESULT" = "$EXPECTED"
 
       - name: Check Store-RS job
         env:
-          EXPECTED: ${{ needs.fast-checks.outputs.store_rs == 'true' && 'success' || 'skipped' }}
+          EXPECTED: ${{ (needs.check-approval.outputs.run_ci == 'true' && needs.fast-checks.outputs.store_rs == 'true') && 'success' || 'skipped' }}
           RESULT: ${{ needs.store-rs-ci.result }}
-        run: test "$RESULT" = "$EXPECTED"
-
-      - name: Check documentation job
-        env:
-          EXPECTED: ${{ needs.fast-checks.outputs.docs == 'true' && 'success' || 'skipped' }}
-          RESULT: ${{ needs.docs-check.result }}
         run: test "$RESULT" = "$EXPECTED"
