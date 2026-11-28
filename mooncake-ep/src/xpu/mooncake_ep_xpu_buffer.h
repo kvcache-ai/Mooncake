@@ -109,6 +109,30 @@ class MooncakeEpXpuBuffer {
                    uint64_t combined_x_ptr, bool async, bool return_recv_hook,
                    uint64_t compute_stream_ptr);
 
+    // Elastic mode (Buffer.create_elastic), with the CUDA buffer's methods
+    // and messages. num_ranks is a capacity of rank slots, connected one
+    // peer at a time over Level Zero IPC, masked and unmasked, and
+    // disconnected so a replacement can take the slot. A dispatch or combine
+    // serves the first num_experts / num_experts_per_rank slots, at least
+    // up to the highest active one. There is no RDMA here, so every rank
+    // must be on this node.
+    void configure_elastic(int num_experts_per_rank, uint64_t active_ranks_ptr);
+    void set_explicit_destroy(bool explicitly_destroy);
+    void validate_connect_ranks(const std::vector<int>& peer_ranks);
+    // raddr through lids are the CUDA path's RDMA metadata, unused here.
+    void stage_peer(int peer_rank, int64_t raddr, int32_t rkey,
+                    int64_t subnet_prefix, int64_t interface_id,
+                    const std::vector<int32_t>& qpns,
+                    const std::vector<int32_t>& lids,
+                    const std::vector<int32_t>& ipc_handle);
+    void disconnect_ranks(const std::vector<int>& peer_ranks);
+    void update_mask_buffer(int peer_rank, bool masked, uint64_t stream_ptr);
+    void query_mask_buffer(uint64_t output_ptr, uint64_t stream_ptr);
+    void clean_mask_buffer(uint64_t stream_ptr);
+    int get_active_rank_bound();
+    std::tuple<uint64_t, size_t> get_local_buffer_descriptor() const;
+    void destroy();
+
    private:
     sycl::queue& queueFor(uint64_t stream_ptr);
     // Both need mu_ held.
@@ -117,12 +141,21 @@ class MooncakeEpXpuBuffer {
     int64_t timeoutTicks(int timeout_us) const;
     int64_t* topkShadow(int slot) const;
     int32_t* slotShadow(int slot) const;
+    // The buffer is laid out for num_ranks_ and layout_experts; the kernels
+    // run for rank_bound ranks and num_experts.
     void checkShape(int hidden, int num_topk,
-                    int num_max_dispatch_tokens_per_rank,
-                    int num_experts) const;
+                    int num_max_dispatch_tokens_per_rank, int num_experts,
+                    int rank_bound, int layout_experts) const;
     PeerView peerView() const;
     // Waits for the proxy's writes (with mu_ not held).
     void drainProxy();
+    // Waits for every launched call (with mu_ not held).
+    void quiesce();
+    // The rank slots a dispatch or combine of num_experts serves.
+    int rankBound(int num_experts, uint64_t active_ranks_ptr);
+    // These need elastic_mu_ held.
+    void commitStagedPeers();
+    void refreshActiveRankBound();
 
     int rank_, num_ranks_;
     int64_t num_ep_buffer_bytes_;
@@ -158,6 +191,22 @@ class MooncakeEpXpuBuffer {
 #if MOONCAKE_EP_XPU_RDMA
     std::unique_ptr<XpuEpProxy> proxy_;
 #endif
+
+    // Elastic mode. Lock order: elastic_mu_, then mu_.
+    std::mutex elastic_mu_;
+    bool elastic_ = false;
+    bool explicitly_destroy_ = false;
+    bool destroyed_ = false;
+    int num_experts_per_rank_ = 0;
+    int active_rank_bound_ = 0;  // one past the highest active slot
+    int32_t* elastic_active_ranks_ = nullptr;  // the caller's device mask
+    std::vector<uint8_t> elastic_connected_;   // staged or committed
+    std::vector<uint8_t> elastic_committed_;   // in the IPC peer table
+    std::vector<uint8_t> elastic_staged_;      // mapped, not yet in the table
+    std::vector<int32_t> elastic_active_host_;
+    // half_bytes of the last call's layout (under mu_), to find the ready
+    // flags of the second half; 0 before the first call.
+    size_t last_half_bytes_ = 0;
 };
 
 }  // namespace xpu_ep

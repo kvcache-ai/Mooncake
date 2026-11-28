@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace mooncake {
@@ -46,12 +47,27 @@ class XpuIpcBuffer {
     void importPeers(const std::vector<std::vector<int32_t>>& handles,
                      const std::vector<int>& active);
 
+    // One peer at a time, for the elastic buffer. stagePeer maps and probes
+    // `peer`'s buffer, throwing if it cannot, but leaves the device table
+    // alone; publishPeer then enters the mapping there. disconnectPeer
+    // removes a published peer and closes its mapping. The caller makes sure
+    // no kernel is reading the table while it changes.
+    void stagePeer(int peer, const std::vector<int32_t>& handle);
+    void publishPeer(int peer);
+    void discardStagedPeer(int peer);
+    void disconnectPeer(int peer);
+
     // Device tables, one entry per rank (this rank maps to base()).
     void* const* peerBases() const { return d_peer_bases_; }
     bool allPeersAccessible() const { return all_accessible_; }
 
    private:
     void closeImports();
+    // Opens `handle` of rank `peer`, whose size and pid namespace the caller
+    // has checked. Returns nullptr, with the reason in `why`, if it cannot.
+    void* openPeer(int peer, const std::vector<int32_t>& handle,
+                   std::string* why);
+    void setPeerBase(int peer, void* base);
 
     sycl::queue queue_;
     ze_context_handle_t ze_ctx_ = nullptr;
@@ -62,6 +78,7 @@ class XpuIpcBuffer {
     void* base_ = nullptr;
     std::optional<ze_ipc_mem_handle_t> exported_;
     std::vector<void*> imports_;  // nullptr for self and unmapped peers
+    std::vector<void*> staged_;   // mapped by stagePeer, not yet published
     void** d_peer_bases_ = nullptr;
     bool all_accessible_ = false;
 };

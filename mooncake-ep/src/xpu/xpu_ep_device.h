@@ -132,11 +132,15 @@ XPU_EP_INLINE bool arrive_last(sycl::nd_item<1> it, int* done_counter,
 // The last work-group of a send kernel tells every rank this one's staging is
 // ready, by setting ready[this rank] in that rank's copy of the current half.
 // The flag is 1, or with `values`, values[r] + 1 for rank r, which saves the
-// receiver a remote read.
+// receiver a remote read. With `active`, inactive ranks get no flag: one that
+// is masked but alive (or connected inactive) would otherwise find it still
+// set, from a call it took no part in, once it is unmasked.
 XPU_EP_INLINE void post_ready(int tid, const PeerView& pv, int* ready, int rank,
-                              int num_ranks, const int* values = nullptr) {
+                              int num_ranks, const int* values = nullptr,
+                              int32_t* active = nullptr) {
     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
     for (int r = tid; r < num_ranks; r += kWGSize) {
+        if (active && !device_atomic<int32_t>(active[r]).load()) continue;
         int* flag =
             reinterpret_cast<int*>(rebase(pv, ready + rank * kReadyStride, r));
         if (flag) uc_store(flag, values ? values[r] + 1 : 1);

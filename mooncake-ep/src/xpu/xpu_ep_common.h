@@ -192,6 +192,14 @@ inline size_t get_ep_buffer_size_hint(int num_max_dispatch_tokens_per_rank,
         .total_bytes;
 }
 
+// An elastic buffer is laid out for its full capacity of rank slots.
+inline size_t get_ep_elastic_buffer_size_hint(
+    int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks,
+    int num_experts_per_rank) {
+    return get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank, hidden,
+                                   num_ranks, num_ranks * num_experts_per_rank);
+}
+
 // Dispatch message: [hidden BF16 or FP8 values][FP8 only: hidden / 128
 // float scales], padded to whole cache lines. Message t is source token t, so
 // it needs no header.

@@ -262,7 +262,7 @@ class Buffer:
             raise ValueError("rank must be within the positive rank capacity.")
         if num_experts_per_rank <= 0 or num_rdma_bytes <= 0:
             raise ValueError("expert and RDMA capacities must be positive.")
-        if (
+        if self.device_type != "xpu" and (
             _USE_MACA
             or getattr(torch.version, "maca", None)
             or getattr(torch.version, "musa", None)
@@ -270,7 +270,9 @@ class Buffer:
             or torch.version.cuda is None
             or not torch.cuda.is_available()
         ):
-            raise RuntimeError("The elastic EP buffer requires a CUDA native build.")
+            raise RuntimeError(
+                "The elastic EP buffer requires a CUDA or XPU native build."
+            )
 
         from mooncake import ep
 
@@ -278,17 +280,23 @@ class Buffer:
         self.num_ep_buffer_bytes = num_rdma_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self._num_experts_per_rank = num_experts_per_rank
+        device_module = getattr(torch, self.device_type)
         self._active_ranks = torch.zeros(
             (num_ranks,),
             dtype=torch.int32,
-            device=torch.device("cuda", torch.cuda.current_device()),
+            device=torch.device(self.device_type, device_module.current_device()),
         )
         self._active_ranks[self.rank] = 1
+        runtime_kwargs = {}
+        if self.device_type == "xpu":
+            # The XPU runtime allocates on, and launches into, torch's queue.
+            runtime_kwargs["stream_ptr"] = _native_current_stream_ptr()
         self.runtime = ep.Buffer(
             self.rank,
             num_ranks,
             num_rdma_bytes,
             self.disable_ll_nvlink,
+            **runtime_kwargs,
         )
         self.runtime._set_explicit_destroy(self.explicitly_destroy)
         self._use_fallback = False
@@ -303,6 +311,17 @@ class Buffer:
 
     def _get_local_peer_metadata(self) -> Tuple[Any, ...]:
         self._require_elastic_runtime()
+        if self.device_type == "xpu":
+            # XPU reaches elastic peers over Level Zero IPC only.
+            return (
+                0,
+                0,
+                0,
+                0,
+                (),
+                (),
+                tuple(int(value) for value in self.runtime.get_ipc_handle()),
+            )
         raddr, rkey = self.runtime.get_mr_info()
         subnet_prefix, interface_id = self.runtime.get_gid()
         return (
@@ -410,7 +429,10 @@ class Buffer:
             or mask_status.numel() != self.group_size
             or mask_status.device != self._active_ranks.device
         ):
-            raise ValueError("mask_status must be a capacity-sized CUDA int32 tensor.")
+            raise ValueError(
+                "mask_status must be a capacity-sized int32 tensor on the "
+                "buffer's device."
+            )
         self.runtime._query_mask_buffer(
             mask_status.data_ptr(), _native_current_stream_ptr()
         )
@@ -421,6 +443,8 @@ class Buffer:
 
     def barrier(self) -> None:
         self._require_elastic_runtime()
+        if self.device_type == "xpu":
+            raise NotImplementedError("The XPU elastic buffer has no barrier().")
         self.runtime._barrier(self.timeout_ms * 1000, _native_current_stream_ptr())
 
     def destroy(self) -> None:
@@ -438,6 +462,10 @@ class Buffer:
 
     def get_comm_stream(self) -> torch.Stream:
         self._require_elastic_runtime()
+        if self.device_type == "xpu":
+            raise NotImplementedError(
+                "The XPU elastic buffer launches on the caller's stream."
+            )
         stream_ptr = self.runtime._get_comm_stream()
         return torch.cuda.ExternalStream(stream_ptr, device=self._active_ranks.device)
 
@@ -460,6 +488,10 @@ class Buffer:
             raise RuntimeError(
                 "This PyTorch build cannot wrap a native buffer without a copy."
             )
+        if data_ptr >= 1 << 63:
+            # Level Zero USM addresses can exceed int64, which torch binds
+            # the pointer as; the two's-complement value keeps its bits.
+            data_ptr -= 1 << 64
         storage = construct_storage(data_ptr, device, logical_bytes)
         tensor = torch.empty(0, dtype=dtype, device=device).set_(
             storage, 0, size, stride
@@ -858,7 +890,7 @@ class Buffer:
         if self._is_elastic:
             if device != self._active_ranks.device or dtype != torch.int32:
                 raise ValueError(
-                    "Elastic active mask must use its fixed CUDA int32 tensor."
+                    "Elastic active mask must use its fixed int32 tensor."
                 )
             return self._active_ranks
         if not self._is_mooncake_backend():
@@ -945,6 +977,11 @@ class Buffer:
         if self._active_ranks.device != x.device:
             raise ValueError("Dispatch input must use the configured rank-mask device.")
         if cumulative_local_expert_recv_stats is not None:
+            if self.device_type == "xpu":
+                raise NotImplementedError(
+                    "The XPU elastic buffer does not collect "
+                    "cumulative_local_expert_recv_stats."
+                )
             stats = cumulative_local_expert_recv_stats
             if (
                 stats.dtype != torch.int32

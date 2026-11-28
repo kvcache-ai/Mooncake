@@ -237,7 +237,7 @@ sycl::event dispatch_send_impl(sycl::queue& q, const DispatchArgs a) {
                 sycl::group_barrier(it.get_group());
                 // Each rank's flag carries how many tokens this rank sends it.
                 post_ready(tid, a.peers, a.ready, a.rank, a.num_ranks,
-                           rank_counts);
+                           rank_counts, a.active_ranks);
             });
     });
 }
@@ -507,7 +507,8 @@ sycl::event combine_send_reduced(sycl::queue& q, const CombineArgs a) {
                 }
 
                 if (!arrive_last(it, a.done_counter, &s_last[0])) return;
-                post_ready(tid, a.peers, a.ready, a.rank, a.num_ranks);
+                post_ready(tid, a.peers, a.ready, a.rank, a.num_ranks, nullptr,
+                           a.active_ranks);
             });
     });
 }
@@ -625,7 +626,8 @@ sycl::event combine_send(sycl::queue& q, const CombineArgs& args) {
                               row_bytes, lane, kWarpSize);
 
                 if (!arrive_last(it, a.done_counter, &s_last[0])) return;
-                post_ready(tid, a.peers, a.ready, a.rank, a.num_ranks);
+                post_ready(tid, a.peers, a.ready, a.rank, a.num_ranks, nullptr,
+                           a.active_ranks);
             });
     });
 }
