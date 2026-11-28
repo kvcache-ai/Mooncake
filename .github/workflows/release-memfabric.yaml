@@ -82,7 +82,7 @@ jobs:
           sudo bash -x dependencies.sh -y
           sudo bash scripts/ascend/dependencies_ascend_installation.sh
           sudo apt-get install -y file
-          echo "PATH=/usr/local/go/bin:${PATH}" >> "$GITHUB_ENV"
+          echo "PATH=/opt/mooncake-toolchain/bin:${PATH}" >> "$GITHUB_ENV"
 
       - name: Configure project
         shell: bash
@@ -114,7 +114,7 @@ jobs:
           export PYTHONPATH="${PYTHONPATH:-}"
           export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
           source /usr/local/Ascend/cann/set_env.sh
-          export PATH="/usr/local/go/bin:${PATH}"
+          export PATH="/opt/mooncake-toolchain/bin:${PATH}"
           # Limit parallelism for memory-heavy Store builds.
           cmake --build build --parallel 2
           sudo cmake --install build

@@ -32,7 +32,7 @@ FROM ${BASE_IMAGE}
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PATH="/usr/local/go/bin:${PATH}"
+    PATH="/opt/mooncake-toolchain/bin:${PATH}"
 
 ARG CMAKE_BUILD_TYPE=RelWithDebInfo
 # Pin the DPC++ compiler version to keep image builds reproducible.
@@ -54,7 +54,6 @@ RUN apt-get update && \
         build-essential \
         cmake \
         git \
-        ninja-build \
         pkg-config \
         libibverbs-dev \
         librdmacm-dev \

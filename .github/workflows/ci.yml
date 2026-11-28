@@ -534,9 +534,9 @@ jobs:
     - name: Install build utilities and dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y ninja-build lld
+        sudo apt-get install -y lld
         sudo bash -x dependencies.sh -y
-        echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+        echo "/opt/mooncake-toolchain/bin" >> "$GITHUB_PATH"
       shell: bash
 
     - name: Set up compiler cache
@@ -749,8 +749,9 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt update -y
-        sudo apt install -y ninja-build lld
+        sudo apt install -y lld
         sudo bash -x dependencies.sh -y
+        echo "/opt/mooncake-toolchain/bin" >> "$GITHUB_PATH"
         df -h
       shell: bash
 
@@ -766,9 +767,7 @@ jobs:
     - name: Configure project with TENT (cuda-on)
       if: matrix.need_cuda
       run: |
-        mkdir build-tent
-        cd build-tent
-        cmake -G Ninja .. \
+        cmake -B build-tent -G Ninja \
           -DUSE_TENT=ON \
           -DUSE_HTTP=ON \
           -DENABLE_SCCACHE=ON \
@@ -948,7 +947,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y ninja-build lld redis-server redis-tools
+        sudo apt-get install -y lld redis-server redis-tools
         sudo bash -x dependencies.sh -y
         python -m pip install --disable-pip-version-check numpy pybind11
       shell: bash
