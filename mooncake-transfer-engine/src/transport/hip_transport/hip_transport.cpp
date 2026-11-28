@@ -788,9 +788,23 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
 
         // Get IPC handle
         hipIpcMemHandle_t handle;
-        if (!checkHip(hipIpcGetMemHandle(&handle, base_ptr),
-                      "HipTransport: hipIpcGetMemHandle failed")) {
+        hipError_t ipc_err = hipIpcGetMemHandle(&handle, base_ptr);
+        if (ipc_err != hipSuccess) {
             registered_addr_to_base_.erase((uint64_t)addr);
+            (void)hipGetLastError();
+            // VMM (hipMemCreate) memory has no IPC handle. Leave it to the
+            // other transports instead of failing their registration too.
+            hipMemGenericAllocationHandle_t vmm_handle;
+            if (hipMemRetainAllocationHandle(&vmm_handle, addr) == hipSuccess) {
+                (void)hipMemRelease(vmm_handle);
+                LOG(WARNING) << "HipTransport: VMM buffer " << addr
+                             << " cannot be shared over HIP IPC, leaving it "
+                                "to other transports";
+                skipped_addrs_.insert((uint64_t)addr);
+                return 0;
+            }
+            (void)hipGetLastError();
+            (void)checkHip(ipc_err, "HipTransport: hipIpcGetMemHandle failed");
             return -1;
         }
 
