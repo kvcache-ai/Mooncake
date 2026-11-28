@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -431,6 +432,73 @@ TEST(HttpMetadataPluginTest, BufferedPutDoesNotRequest100Continue) {
         ASSERT_TRUE(plugin->get("buffered-put", actual));
         EXPECT_EQ(actual, value);
     }
+}
+
+TEST(TransferMetadataNamespaceTest, IsolatesSegmentsAndRpcEntries) {
+    LocalHttpMetadataServer server;
+    ASSERT_TRUE(server.ok());
+    const char *previous = std::getenv("MC_METADATA_CLUSTER_ID");
+    struct RestoreNamespace {
+        std::optional<std::string> previous;
+        ~RestoreNamespace() {
+            if (previous) {
+                setenv("MC_METADATA_CLUSTER_ID", previous->c_str(), 1);
+            } else {
+                unsetenv("MC_METADATA_CLUSTER_ID");
+            }
+        }
+    } restore{previous ? std::make_optional<std::string>(previous)
+                       : std::nullopt};
+    ASSERT_EQ(setenv("MC_METADATA_CLUSTER_ID", "default-cluster", 1), 0);
+
+    TransferMetadata first(server.uri(), "cluster-a");
+    TransferMetadata second(server.uri(), "cluster-b/");
+    EXPECT_STREQ(std::getenv("MC_METADATA_CLUSTER_ID"), "default-cluster");
+    TransferMetadata fallback(server.uri(), "");
+    TransferMetadata legacy(server.uri());
+    const std::string name = "same-segment";
+    TransferMetadata::SegmentDesc segment{};
+    segment.name = name;
+    segment.protocol = "tcp";
+    segment.tcp_data_host = "127.0.0.1";
+    segment.tcp_data_port = 1234;
+    ASSERT_EQ(first.updateSegmentDesc(name, segment), 0);
+    segment.tcp_data_port = 2345;
+    ASSERT_EQ(second.updateSegmentDesc(name, segment), 0);
+
+    TransferMetadata::RpcMetaDesc rpc{};
+    rpc.ip_or_host_name = "127.0.0.1";
+    rpc.rpc_port = 1234;
+    ASSERT_EQ(first.addRpcMetaEntry(name, rpc), 0);
+    rpc.rpc_port = 2345;
+    ASSERT_EQ(second.addRpcMetaEntry(name, rpc), 0);
+    rpc.rpc_port = 3456;
+    ASSERT_EQ(fallback.addRpcMetaEntry(name, rpc), 0);
+    ASSERT_EQ(unsetenv("MC_METADATA_CLUSTER_ID"), 0);
+
+    TransferMetadata::RpcMetaDesc resolved{};
+    auto first_segment = first.getSegmentDescByName(name);
+    auto second_segment = second.getSegmentDescByName(name);
+    ASSERT_NE(first_segment, nullptr);
+    ASSERT_NE(second_segment, nullptr);
+    EXPECT_EQ(first_segment->tcp_data_port, 1234);
+    EXPECT_EQ(second_segment->tcp_data_port, 2345);
+    ASSERT_EQ(legacy.getRpcMetaEntry(name, resolved), 0);
+    EXPECT_EQ(resolved.rpc_port, 3456);
+    ASSERT_EQ(first.getRpcMetaEntry(name, resolved), 0);
+    EXPECT_EQ(resolved.rpc_port, 1234);
+    ASSERT_EQ(first.removeRpcMetaEntry(name), 0);
+    ASSERT_EQ(first.removeSegmentDesc(name), 0);
+    TransferMetadata removed(server.uri(), "cluster-a");
+    EXPECT_EQ(removed.getSegmentDescByName(name), nullptr);
+    EXPECT_NE(removed.getRpcMetaEntry(name, resolved), 0);
+
+    TransferMetadata survivor(server.uri(), "cluster-b");
+    auto surviving_segment = survivor.getSegmentDescByName(name);
+    ASSERT_NE(surviving_segment, nullptr);
+    EXPECT_EQ(surviving_segment->tcp_data_port, 2345);
+    ASSERT_EQ(survivor.getRpcMetaEntry(name, resolved), 0);
+    EXPECT_EQ(resolved.rpc_port, 2345);
 }
 #endif
 

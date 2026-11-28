@@ -127,6 +127,7 @@ class Client {
      * @param master_server_entry The entry of master server (IP:Port of master
      *        address for non-HA mode, or <backend>://connstring for HA mode,
      *        e.g. etcd://IP:Port;IP:Port;...;IP:Port)
+     * @param metadata_cluster_id Metadata key prefix for a new classic engine.
      * @return std::optional containing a shared_ptr to Client if successful,
      * std::nullopt otherwise
      */
@@ -138,7 +139,8 @@ class Client {
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
         std::map<std::string, std::string> labels = {},
         const std::string& tenant_id = "default",
-        std::shared_ptr<NVMeoFInitiator> nof_initiator = nullptr);
+        std::shared_ptr<NVMeoFInitiator> nof_initiator = nullptr,
+        const std::string& metadata_cluster_id = "");
 
     // Test-only seam: when set, Client::Create builds the default NoF
     // initiator from this factory instead of CreateNofRuntime() whenever the
@@ -1048,10 +1050,11 @@ class Client {
         const ReplicateConfig& config);
 
     void EnterHaRuntimeMode();
-    ErrorCode InitTransferEngine(
-        const std::string& local_hostname,
-        const std::string& metadata_connstring, const std::string& protocol,
-        const std::optional<std::string>& device_names);
+    ErrorCode InitTransferEngine(const std::string& local_hostname,
+                                 const std::string& metadata_connstring,
+                                 const std::string& protocol,
+                                 const std::optional<std::string>& device_names,
+                                 const std::string& metadata_cluster_id);
     void InitTransferSubmitter();
     // Submits one transfer without waiting for it. The caller must get() the
     // returned future before it releases the slices or the replica.

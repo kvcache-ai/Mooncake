@@ -310,13 +310,16 @@ struct TransferHandshakeUtil {
     }
 };
 
-TransferMetadata::TransferMetadata(const std::string &conn_string) {
+TransferMetadata::TransferMetadata(const std::string &conn_string,
+                                   const std::string &metadata_cluster_id) {
     next_segment_id_.store(1);
 
     std::string protocol = extractProtocolFromConnString(conn_string);
     std::string custom_key;
 
-    const char *custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
+    const char *custom_prefix = !metadata_cluster_id.empty()
+                                    ? metadata_cluster_id.c_str()
+                                    : std::getenv("MC_METADATA_CLUSTER_ID");
     if (custom_prefix != nullptr && strlen(custom_prefix) > 0) {
         custom_key = custom_prefix;
 

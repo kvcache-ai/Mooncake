@@ -1327,10 +1327,24 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `tenant_id` | str | `default` | *(advanced)* Tenant identifier |
 | `enable_client_http_server` | bool | `false` | Enable the client-side HTTP `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `client_http_port` | int | `9300` | Client-side HTTP endpoint port, used only when `enable_client_http_server=true` |
+| `metadata_cluster_id` | str | empty | Transfer Engine metadata namespace for this Store instance |
 
 ```{note}
 The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). The later arguments (`engine`, SSD offload fields, `tenant_id`, and client HTTP endpoint fields) are optional. In Method A, launcher-level `MOONCAKE_*` variables used only by `MooncakeConfig` are ignored. Variables consumed directly by the C++ client, including the FileStorage/DFS backend variables and low-level `MC_*` engine variables below, are still read.
 ```
+
+With the C++ Store backend, pass `metadata_cluster_id="cluster-a"` to
+`setup(...)` or `setup({...})` when independent clusters share a centralized
+metadata service. Peers sharing those keys must use the same ID. The Store uses
+the ID when it creates a classic Transfer Engine. An omitted or empty ID uses
+`MC_METADATA_CLUSTER_ID`, or the standard `mooncake/` prefix if unset or empty.
+Classic P2P handshakes and externally supplied `engine` instances ignore the ID;
+configure a reused engine's namespace when initializing that engine. TENT
+currently rejects a nonempty ID when creating an engine.
+
+With Mooncake's HTTP metadata servers, avoid IDs containing `rpc_meta`, which
+the servers use to identify RPC records. Set the Master's `MC_METADATA_CLUSTER_ID`
+to its clients' ID so it can clean up their HTTP metadata on timeout.
 
 ### Method B — Service / Integration (`MOONCAKE_*` + CLI)
 

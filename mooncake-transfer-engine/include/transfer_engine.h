@@ -126,10 +126,13 @@ class TransferEngine {
              const std::string& ip_or_host_name = "",
              uint64_t rpc_port = 12345);
 
+    // An empty metadata_cluster_id uses MC_METADATA_CLUSTER_ID.
+    // Classic P2P handshakes ignore it. TENT rejects nonempty IDs.
     int init(const std::string& metadata_conn_string,
              const std::string& local_server_name,
              const std::string& ip_or_host_name, uint64_t rpc_port,
-             const std::string& protocol);
+             const std::string& protocol,
+             const std::string& metadata_cluster_id = "");
 
     int freeEngine();
 

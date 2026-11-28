@@ -1125,6 +1125,8 @@ def setup(
     tenant_id: str = "default",
     enable_client_http_server: bool = False,
     client_http_port: int = 9300,
+    enable_embedded_master: bool = False,
+    metadata_cluster_id: str = "",
 ) -> int
 ```
 
@@ -1165,6 +1167,7 @@ the positional overload.
 - `tenant_id` (str): Tenant namespace for object keys. Defaults to `"default"`.
 - `enable_client_http_server` (bool): Enable the client-local `/health`, `/metrics`, `/metrics/summary`, and `/version` HTTP endpoints. Defaults to `False`.
 - `client_http_port` (int): Port for the client-local HTTP endpoints. Defaults to `9300`.
+- `metadata_cluster_id` (str): Key prefix for centralized metadata when the Store creates a classic Transfer Engine. Omitting it or passing `""` uses `MC_METADATA_CLUSTER_ID`. Classic P2P handshakes and externally supplied `engine` instances ignore the ID. TENT currently rejects a nonempty ID when creating an engine. The dictionary overload converts values with `str()`.
 
 **Store segment pinned memory:** CUDA-enabled builds can register Store-managed
 host segments as pinned memory when `MC_STORE_PIN_MEMORY_MAX_BYTES` is set to a

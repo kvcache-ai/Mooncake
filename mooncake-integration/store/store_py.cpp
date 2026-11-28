@@ -2626,7 +2626,8 @@ NB_MODULE(_store, m) {
                const std::string &tenant_id = "default",
                bool enable_client_http_server = false,
                int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
-               bool enable_embedded_master = false) {
+               bool enable_embedded_master = false,
+               const std::string &metadata_cluster_id = "") {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2643,7 +2644,10 @@ NB_MODULE(_store, m) {
                         master_server_addr, transfer_engine, "", 50052,
                         enable_ssd_offload, true, ssd_offload_path, tenant_id,
                         enable_client_http_server, client_http_port,
-                        enable_embedded_master);
+                        enable_embedded_master, false,
+                        DEFAULT_SSD_PREFETCH_COOLDOWN_SEC,
+                        DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC,
+                        metadata_cluster_id);
                     ret = result.has_value() ? 0
                                              : static_cast<int>(result.error());
                 }
@@ -2658,7 +2662,8 @@ NB_MODULE(_store, m) {
             py::arg("ssd_offload_path") = "", py::arg("tenant_id") = "default",
             py::arg("enable_client_http_server") = false,
             py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT,
-            py::arg("enable_embedded_master") = false)
+            py::arg("enable_embedded_master") = false,
+            py::arg("metadata_cluster_id") = "")
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
@@ -2688,6 +2693,8 @@ NB_MODULE(_store, m) {
             "Supported keys:\n"
             "  local_hostname (required): Local hostname.\n"
             "  metadata_server (required): Metadata server address.\n"
+            "  metadata_cluster_id: Optional classic TE metadata namespace "
+            "(empty uses MC_METADATA_CLUSTER_ID).\n"
             "  global_segment_size: Global segment size (default 16MB).\n"
             "  local_buffer_size: Local buffer size (default 16MB).\n"
             "  protocol: Transfer protocol (default 'tcp').\n"

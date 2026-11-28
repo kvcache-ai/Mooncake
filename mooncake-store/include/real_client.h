@@ -711,8 +711,8 @@ class RealClient : public PyClient {
         int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
         bool enable_embedded_master = false, bool enable_ssd_prefetch = false,
         int64_t ssd_prefetch_cooldown_sec = DEFAULT_SSD_PREFETCH_COOLDOWN_SEC,
-        int64_t ssd_prefetch_dedup_ttl_sec =
-            DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC);
+        int64_t ssd_prefetch_dedup_ttl_sec = DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC,
+        const std::string &metadata_cluster_id = "");
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -1516,7 +1516,8 @@ class RealClient : public PyClient {
         const std::string &ssd_offload_path, const std::string &tenant_id,
         bool enable_client_http_server, int client_http_port,
         bool enable_embedded_master, bool enable_ssd_prefetch,
-        int64_t ssd_prefetch_cooldown_sec, int64_t ssd_prefetch_dedup_ttl_sec);
+        int64_t ssd_prefetch_cooldown_sec, int64_t ssd_prefetch_dedup_ttl_sec,
+        const std::string &metadata_cluster_id);
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;
