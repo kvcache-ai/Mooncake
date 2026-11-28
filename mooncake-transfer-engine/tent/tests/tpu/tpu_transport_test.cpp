@@ -31,8 +31,11 @@
 #include <dlfcn.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <thread>
 #include <vector>
 
 #ifndef MOCK_TPU_PJRT_LIB
@@ -84,14 +87,28 @@ class TpuTransportTest : public ::testing::Test {
         if (mock_) dlclose(mock_);
     }
 
+    TransferStatus waitFor(Transport::SubBatchRef batch, int id) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        TransferStatus status{};
+        do {
+            EXPECT_TRUE(transport_.getTransferStatus(batch, id, status).ok());
+            if (status.s != TransferStatusEnum::PENDING) break;
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        return status;
+    }
+
     // Runs one request through the transport and returns its final status.
     TransferStatus run(const Request &request) {
         Transport::SubBatchRef batch = nullptr;
         EXPECT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
         EXPECT_TRUE(transport_.submitTransferTasks(batch, {request}).ok());
-        TransferStatus status{};
-        EXPECT_TRUE(transport_.getTransferStatus(batch, 0, status).ok());
-        EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+        auto status = waitFor(batch, 0);
+        // A copy still running would write into a freed batch: keep it.
+        if (status.s != TransferStatusEnum::PENDING) {
+            EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+        }
         return status;
     }
 
@@ -197,6 +214,39 @@ TEST_F(TpuTransportTest, FailsOnNonLocalTarget) {
     request.target_id = LOCAL_SEGMENT_ID + 1;
     auto status = run(request);
     EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+}
+
+// Engine teardown calls quiesce() before it frees batches.
+TEST_F(TpuTransportTest, QuiesceFinishesQueuedCopiesThenRejectsNew) {
+    constexpr size_t kCopies = 16;
+    auto *token =
+        static_cast<uint8_t *>(register_(kCopies * kChunk, /*index=*/0));
+    ASSERT_NE(token, nullptr);
+    auto *data = static_cast<uint8_t *>(device_data_(token));
+    for (size_t i = 0; i < kCopies * kChunk; ++i) data[i] = (uint8_t)(i % 233);
+    std::vector<uint8_t> staging(kCopies * kChunk, 0);
+
+    std::vector<Request> requests;
+    for (size_t i = 0; i < kCopies; ++i) {
+        requests.push_back(makeRequest(Request::WRITE, token + i * kChunk,
+                                       (uint64_t)(staging.data() + i * kChunk),
+                                       kChunk));
+    }
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, kCopies + 1).ok());
+    ASSERT_TRUE(transport_.submitTransferTasks(batch, requests).ok());
+    ASSERT_TRUE(transport_.quiesce().ok());
+
+    for (size_t i = 0; i < kCopies; ++i) {
+        TransferStatus status{};
+        ASSERT_TRUE(
+            transport_.getTransferStatus(batch, static_cast<int>(i), status)
+                .ok());
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED) << "copy " << i;
+    }
+    EXPECT_EQ(0, std::memcmp(staging.data(), data, kCopies * kChunk));
+    EXPECT_FALSE(transport_.submitTransferTasks(batch, {requests[0]}).ok());
+    EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
 }
 
 }  // namespace

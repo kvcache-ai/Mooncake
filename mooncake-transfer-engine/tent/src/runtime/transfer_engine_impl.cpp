@@ -580,7 +580,15 @@ Status TransferEngineImpl::construct() {
         }
     }
 
-    staging_proxy_ = std::make_unique<ProxyManager>(this);
+    // A staging worker overlaps the chunks of one request only, and a TPU
+    // KV-cache batch holds a small request per layer and shard. TPU engines
+    // get more workers, and stage buffers for them; others keep the defaults.
+    if (transport_list_[TPU])
+        staging_proxy_ = std::make_unique<ProxyManager>(this, 4 * 1024 * 1024,
+                                                        /*chunk_count=*/256,
+                                                        /*worker_count=*/32);
+    else
+        staging_proxy_ = std::make_unique<ProxyManager>(this);
 
     if (runtime_queue_config_.limits.deadline_aware &&
         runtime_queue_config_.limits.mlu_local_threshold > 0.0) {
@@ -1095,8 +1103,9 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     }
     if (transport_list_[MNNVL]) result.push_back(MNNVL);
     if (transport_list_[NVLINK]) result.push_back(NVLINK);
-    // Prefer XPU/MLU local copies over TCP's device-copy fallback. Neither
+    // Prefer TPU/XPU/MLU local copies over TCP's device-copy fallback. None
     // advertises host-to-host capability, so host network order is intact.
+    if (transport_list_[TPU]) result.push_back(TPU);
     if (transport_list_[XPU]) result.push_back(XPU);
     if (transport_list_[MLU]) result.push_back(MLU);
     if (transport_list_[RDMA]) result.push_back(RDMA);
@@ -1109,7 +1118,6 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     if (transport_list_[HP_TCP]) result.push_back(HP_TCP);
     if (transport_list_[GDS]) result.push_back(GDS);
     if (transport_list_[MPCOMM]) result.push_back(MPCOMM);
-    if (transport_list_[TPU]) result.push_back(TPU);
     if (transport_list_[HYLINK]) result.push_back(HYLINK);
     if (transport_list_[MEMFABRIC]) result.push_back(MEMFABRIC);
     return result;
@@ -1918,16 +1926,16 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
         }
     }
 
-    // Plan XPU/MLU staging before selecting a host-only network transport.
-    // Both can bypass staging through verified dma-buf RDMA, in which case
+    // Plan TPU/XPU/MLU staging before selecting a host-only network transport.
+    // XPU/MLU can bypass staging through verified dma-buf RDMA, in which case
     // nothing is staged. A same-host peer's XPU or MLU buffer can also be
     // reached through an IPC mapping. The device transport is offered first,
-    // unstaged, ahead of the staged network
-    // transports, which stay available for failover and for policies whose
-    // explicit transports list does not name the device transport. The peer
-    // buffer is mapped only once that route is selected; if mapping fails,
-    // the request is planned again without IPC. Other transport hints or a
-    // policy rejecting direct access require staging. XPU
+    // unstaged, ahead of the staged network transports, which stay available
+    // for failover and for policies whose explicit transports list does not
+    // name the device transport. The peer buffer is mapped only once that
+    // route is selected; if mapping fails, the request is planned again
+    // without IPC. Other transport hints or a policy rejecting direct access
+    // require staging; TPU always requires it. XPU
     // staging needs the local XpuTransport; without it, selection is left to
     // transport capabilities (e.g. TCP copies device memory itself). Keep the
     // original memory types for policy matching.
@@ -1967,27 +1975,30 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
         auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
         const bool cuda_side =
             local_mtype == MTYPE_CUDA || remote_mtype == MTYPE_CUDA;
+        const bool tpu_side =
+            local_mtype == MTYPE_TPU || remote_mtype == MTYPE_TPU;
         const bool xpu_side =
             local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU;
         const bool mlu_side =
             local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU;
-        if (cuda_side || xpu_side || mlu_side) {
+        if (!tpu_side && (cuda_side || xpu_side || mlu_side)) {
             rdma_direct = allow_device_direct &&
                           (hint == UNSPEC || hint == RDMA) &&
                           deviceDirectRdmaReady(request, entry, local_mtype,
                                                 remote_mtype);
         }
-        direct = ((xpu_side || mlu_side) && rdma_direct) ||
-                 (cuda_side && !xpu_side && !mlu_side && allow_device_direct);
-        xpu_ipc = xpu_side && !mlu_side && allow_local_ipc &&
+        direct = !tpu_side &&
+                 (((xpu_side || mlu_side) && rdma_direct) ||
+                  (cuda_side && !xpu_side && !mlu_side && allow_device_direct));
+        xpu_ipc = xpu_side && !mlu_side && !tpu_side && allow_local_ipc &&
                   (hint == UNSPEC || hint == XPU) &&
                   xpuIpcCandidate(request, desc.get(), entry);
-        mlu_ipc = mlu_side && !xpu_side && allow_local_ipc &&
+        mlu_ipc = mlu_side && !xpu_side && !tpu_side && allow_local_ipc &&
                   (hint == UNSPEC || hint == MLU) &&
                   mluIpcCandidate(request, desc.get(), entry);
         if (xpu_ipc || mlu_ipc) ipc_entry = entry;
         if (device_direct) *device_direct = direct;
-        if ((xpu_side && !direct && transport_list_[XPU]) ||
+        if (tpu_side || (xpu_side && !direct && transport_list_[XPU]) ||
             (mlu_side && !direct)) {
             findStagingPolicy(request, host_staging_params,
                               allow_device_direct);
@@ -2001,7 +2012,8 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
             // A staged side is replaced by a freshly registered host stage
             // buffer, so its own tags are irrelevant. An unstaged host buffer
             // on either side is used as-is and must already carry the
-            // network transport.
+            // network transport. When the peer side is staged, check that the
+            // peer actually runs the candidate network transport.
             const BufferDesc* local_entry = nullptr;
             if (host_staging_params[1].empty()) {
                 auto local_desc = metadata_->segmentManager().getLocal();
@@ -2009,16 +2021,33 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
                     local_entry = local_desc->findBuffer(
                         (uint64_t)request.source, request.length);
             }
-            const BufferDesc* remote_entry =
-                host_staging_params[2].empty() ? entry : nullptr;
-            auto carries = [](const BufferDesc* buffer, TransportType type) {
-                return !buffer || std::find(buffer->transports.begin(),
-                                            buffer->transports.end(),
-                                            type) != buffer->transports.end();
+            const bool remote_staged = !host_staging_params[2].empty();
+            const auto& remote_mem = desc->getMemory();
+            auto has_transport = [](const BufferDesc* buffer,
+                                    TransportType type) {
+                return buffer && std::find(buffer->transports.begin(),
+                                           buffer->transports.end(),
+                                           type) != buffer->transports.end();
+            };
+            auto local_supports = [&](TransportType type) {
+                return !local_entry || has_transport(local_entry, type);
+            };
+            auto peer_supports = [&](TransportType type) {
+                if (!remote_staged) return has_transport(entry, type);
+                if (has_transport(entry, type)) return true;
+                if (type == RDMA) {
+                    return std::any_of(
+                        remote_mem.devices.begin(), remote_mem.devices.end(),
+                        [](const DeviceDesc& dev) {
+                            return dev.transport_attrs.find(UB) ==
+                                   dev.transport_attrs.end();
+                        });
+                }
+                return remote_mem.getTransportAttrs(type) != nullptr;
             };
             for (auto type : {RDMA, FABRIC, TCP, HP_TCP}) {
-                if (transport_list_[type] && carries(local_entry, type) &&
-                    carries(remote_entry, type)) {
+                if (transport_list_[type] && local_supports(type) &&
+                    peer_supports(type)) {
                     staging_transports.push_back(type);
                 }
             }
@@ -2236,6 +2265,7 @@ struct TransferEngineImpl::PreparedSubmit {
         SelectionResult route{};
         bool staging{false};
         std::vector<std::string> staging_params;
+        std::shared_ptr<const StagedRoute> staged_route;
     };
 
     std::chrono::steady_clock::time_point submit_time{};
@@ -2635,45 +2665,18 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
                 remote, Topology::MEM_CUDA));
         }
     }
-    // case 3: TPU. HBM is not NIC-addressable, so any hop touching TPU memory
-    // is staged through host DRAM: TpuTransport performs the local HBM<->host
-    // copy (via the PJRT adapter) and the host<->host hop is carried by
-    // whatever host-DRAM network transport is present. TPU deployments (e.g.
-    // cloud TPU VMs) are typically TCP/multi-NIC rather than RDMA, so we gate
-    // on either; the cross stage itself is routed by capability (dram_to_dram),
-    // so TCP is selected when RDMA is absent. We also require TpuTransport (the
-    // local HBM<->host executor), mirroring how the CUDA cases gate on NVLINK.
-    // An empty stage location means "no staging needed on that side".
-    if (transport_list_[TPU] &&
-        (transport_list_[RDMA] || transport_list_[UB] ||
-         transport_list_[FABRIC] || transport_list_[TCP] ||
-         transport_list_[HP_TCP])) {
-        if (local_mtype == MTYPE_TPU && remote_mtype == MTYPE_TPU) {
-            policy.clear();
-            policy.push_back(server_addr);
-            policy.push_back(topology_->findNearMem(local));
-            policy.push_back(desc->getMemory().topology.findNearMem(remote));
-        } else if (local_mtype == MTYPE_TPU && remote_mtype == MTYPE_CPU) {
-            policy.clear();
-            policy.push_back(server_addr);
-            policy.push_back(topology_->findNearMem(local));
-            policy.push_back("");  // remote already host DRAM
-        } else if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_TPU) {
-            policy.clear();
-            policy.push_back(server_addr);
-            policy.push_back("");  // local already host DRAM
-            policy.push_back(desc->getMemory().topology.findNearMem(remote));
-        }
-    }
-    // XPU and MLU stage device memory through host DRAM. The local device
-    // needs its copy transport; a host-only caller can delegate a peer's MLU
-    // copy to that peer. Each device side needs a resolvable host stage. Fail
-    // closed when topology or the local copy transport is unavailable.
+    // TPU, XPU and MLU stage device memory through host DRAM. The local device
+    // needs its copy transport; a host-only caller can delegate a peer's TPU
+    // or MLU copy to that peer. Each device side needs a resolvable host
+    // stage. Fail closed when topology or the local copy transport is
+    // unavailable.
     // planTransport bypasses this policy for a verified dma-buf RDMA
     // route; otherwise, when XpuTransport is present, every device side,
     // including a mixed-vendor peer, must stage rather than exposing device
     // memory to a host-only transport.
-    if (((transport_list_[XPU] &&
+    if ((((local_mtype == MTYPE_TPU || remote_mtype == MTYPE_TPU) &&
+          (local_mtype != MTYPE_TPU || transport_list_[TPU])) ||
+         (transport_list_[XPU] &&
           (local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU)) ||
          ((local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU) &&
           (local_mtype != MTYPE_MLU || transport_list_[MLU]))) &&
@@ -2716,9 +2719,59 @@ SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
     return result;
 }
 
+SelectionResult TransferEngineImpl::resolveRoute(const Request& req,
+                                                 const StagedRoute* staged,
+                                                 int transport_index) {
+    if (!staged) return resolveTransport(req, transport_index);
+    // Reuse the planned route: re-planning on a ProxyManager thread, with its
+    // own segment cache, could pick another one.
+    if (transport_index == 0) return staged->route;
+    if (transport_index < 0) return SelectionResult{};
+    // Walk only the staged-only candidates anchored at staged->route.transport
+    // so a transient XPU/MLU IPC fallback cannot shift indices and retry the
+    // failed transport.
+    auto plan_staged = [&](int idx) {
+        return planTransport(staged->request, idx,
+                             /*allow_device_direct=*/false,
+                             /*allow_local_ipc=*/false, nullptr);
+    };
+    auto find_base = [&]() -> int {
+        for (int idx = 0; idx < static_cast<int>(kSupportedTransportTypes);
+             ++idx) {
+            auto candidate = plan_staged(idx);
+            if (candidate.transport == UNSPEC) break;
+            if (candidate.transport == staged->route.transport) return idx;
+        }
+        return -1;
+    };
+    int base_idx = find_base();
+    if (base_idx < 0 && staged->request.target_id != LOCAL_SEGMENT_ID) {
+        metadata_->segmentManager().invalidateRemote(staged->request.target_id);
+        base_idx = find_base();
+    }
+    if (base_idx < 0) return SelectionResult{};
+    auto route = plan_staged(base_idx + transport_index);
+    // A candidate without staging cannot carry a host-to-host hop.
+    if (route.staging_params.empty()) return SelectionResult{};
+    route.staging_params.clear();
+    return route;
+}
+
+std::shared_ptr<const StagedRoute> TransferEngineImpl::hopRoute(
+    const SelectionResult& route, const Request& request) {
+    // Staging that findStagingPolicy adds after selection, rather than
+    // staging planned with the route, leaves each hop to route by itself.
+    if (route.staging_params.empty()) return nullptr;
+    auto hop = route;
+    hop.staging_params.clear();
+    return std::make_shared<const StagedRoute>(
+        StagedRoute{request, std::move(hop)});
+}
+
 Status TransferEngineImpl::prepareSubmit(
     Batch* batch, const std::vector<Request>& request_list,
-    PreparedSubmit& prepared, bool require_post_submit_cancellation) {
+    PreparedSubmit& prepared, bool require_post_submit_cancellation,
+    std::shared_ptr<const StagedRoute> staged_route) {
     if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
     for (size_t i = 0; i < request_list.size(); ++i) {
         auto st = validateTransportHint(request_list[i], i);
@@ -2787,7 +2840,8 @@ Status TransferEngineImpl::prepareSubmit(
     for (const auto& request : merged.request_list) {
         PreparedSubmit::Owner owner;
         owner.request = request;
-        owner.route = resolveTransport(owner.request, 0);
+        owner.staged_route = staged_route;
+        owner.route = resolveRoute(owner.request, staged_route.get(), 0);
         if (require_post_submit_cancellation) {
             const auto type = owner.route.transport;
             if (type == UNSPEC || type < 0 ||
@@ -2800,7 +2854,7 @@ Status TransferEngineImpl::prepareSubmit(
             }
         }
         owner.staging_params = owner.route.staging_params;
-        if (owner.request.target_id != LOCAL_SEGMENT_ID &&
+        if (!staged_route && owner.request.target_id != LOCAL_SEGMENT_ID &&
             owner.staging_params.empty() &&
             (owner.route.transport == TCP || owner.route.transport == HP_TCP)) {
             findStagingPolicy(owner.request, owner.staging_params);
@@ -2896,8 +2950,10 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
         task.runtime_policy = prepared.runtime_policy;
         task.status = PENDING;
         task.request = merged_request;
+        task.staged_route = owner.staged_route;
         task.public_length = task_plan.public_length;
         task.staging = false;
+        task.staged_retried = false;
         task.start_time =
             prepared.submit_time;  // Record start time for latency tracking
         task.dispatch_time = prepared.submit_time;  // No queue wait on direct
@@ -2920,8 +2976,9 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
             // Transport::submitTransferTasks() calls, which are counted where
             // they recurse through the non-staging path below. Only stamp the
             // logical request's first post time for stage decomposition here.
-            auto status = staging_proxy_->submit(&task, (BatchID)batch,
-                                                 owner.staging_params);
+            auto status = staging_proxy_->submit(
+                &task, (BatchID)batch, owner.staging_params,
+                hopRoute(owner.route, task.request));
             if (!status.ok()) {
                 task.staging = false;
                 task.type = UNSPEC;
@@ -3118,9 +3175,10 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         // prediction is a pre-dispatch heuristic, and re-scoring an admitted
         // owner would let the drop decision change underneath it.
         input.transport = owner.route.transport;
+        // Never drop a staged request's hop: that fails the request part-way.
         input.degradation_eligible =
             (owner.route.transport == RDMA || owner.route.transport == UB) &&
-            !owner.staging;
+            !owner.staging && !owner.staged_route;
         submit.owners.push_back(std::move(input));
     }
 
@@ -3138,8 +3196,10 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         task.runtime_policy = prepared.runtime_policy;
         task.status = PENDING;
         task.request = owner.request;
+        task.staged_route = owner.staged_route;
         task.public_length = task_plan.public_length;
         task.staging = false;
+        task.staged_retried = false;
         task.start_time = prepared.submit_time;
         task.type = UNSPEC;
         task.sub_task_id = -1;
@@ -3320,7 +3380,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     auto* batch = queued.batch;
     auto& task = batch->task_list[queued.owner_task_id];
     task.dispatch_time = std::chrono::steady_clock::now();
-    auto route = resolveTransport(task.request, 0);
+    auto route = resolveRoute(task.request, task.staged_route.get(), 0);
     task.type = route.transport;
     task.device_mask = route.device_mask;
     task.qp_pool = route.qp_pool.value_or("");
@@ -3328,8 +3388,8 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         return finishQueuedOwner(owner_id, FAILED);
     }
 
-    if (!route.staging_params.empty() || task.type == TCP ||
-        task.type == HP_TCP) {
+    if (!task.staged_route && (!route.staging_params.empty() ||
+                               task.type == TCP || task.type == HP_TCP)) {
         auto staging_params = route.staging_params;
         if (task.request.target_id != LOCAL_SEGMENT_ID &&
             staging_params.empty())
@@ -3342,7 +3402,8 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
             // ProxyManager are counted where they recurse through the
             // non-staging path below.
             auto status =
-                staging_proxy_->submit(&task, (BatchID)batch, staging_params);
+                staging_proxy_->submit(&task, (BatchID)batch, staging_params,
+                                       hopRoute(route, task.request));
             if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
             task.post_time = std::chrono::steady_clock::now();
             return markQueuedOwnerSubmitted(owner_id);
@@ -3479,7 +3540,8 @@ bool TransferEngineImpl::shouldQueueSubmit(const PreparedSubmit& prepared,
 Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list,
     const Notification* notifi, QueueOwnerKind owner_kind,
-    bool require_post_submit_cancellation) {
+    bool require_post_submit_cancellation,
+    std::shared_ptr<const StagedRoute> staged_route) {
     Batch* batch = nullptr;
     CHECK_STATUS(retainBatch(batch_id, batch));
     BatchRef batch_ref(*this, batch);
@@ -3491,7 +3553,8 @@ Status TransferEngineImpl::submitTransfer(
         const size_t start_task_id = batch_ref.get()->task_list.size();
         PreparedSubmit prepared;
         CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared,
-                                   require_post_submit_cancellation));
+                                   require_post_submit_cancellation,
+                                   std::move(staged_route)));
 
         if (shouldQueueSubmit(prepared, owner_kind)) {
             CHECK_STATUS(
@@ -3531,9 +3594,11 @@ Status TransferEngineImpl::submitTransferRequiringPostSubmitCancellation(
 }
 
 Status TransferEngineImpl::submitStagingTransfer(
-    BatchID batch_id, const std::vector<Request>& request_list) {
+    BatchID batch_id, const std::vector<Request>& request_list,
+    std::shared_ptr<const StagedRoute> staged_route) {
     return submitTransfer(batch_id, request_list, nullptr,
-                          QueueOwnerKind::StagingInternal);
+                          QueueOwnerKind::StagingInternal, false,
+                          std::move(staged_route));
 }
 
 void TransferEngineImpl::addSubmitHook(Batch* batch, size_t start_task_id,
@@ -3682,6 +3747,17 @@ Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
     return Status::OK();
 }
 
+bool TransferEngineImpl::batchSuppressesFailover(BatchID batch_id) {
+    if (!batch_id) return false;
+    std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+    if (!isBatchAlive(batch_id)) return false;
+    const auto* batch = reinterpret_cast<const Batch*>(batch_id);
+    for (const auto& task : batch->task_list) {
+        if (task.suppress_failover) return true;
+    }
+    return false;
+}
+
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& task = batch->task_list[task_id];
     auto prev_type = task.type;
@@ -3693,6 +3769,13 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
             "Strict MNNVL prohibits transport failover");
     }
 
+    const bool was_staging = task.staging;
+    if (was_staging && task.staged_retried) {
+        task.suppress_failover = true;
+        return Status::InvalidEntry(
+            "Staged transfer retry already exhausted" LOC_MARK);
+    }
+
     if (++task.failover_count > task.runtime_policy.max_failover_attempts) {
         LOG(WARNING) << "Task failover limit reached ("
                      << task.runtime_policy.max_failover_attempts
@@ -3701,12 +3784,13 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
             "Failover limit exceeded, all transports exhausted");
     }
 
-    if (task.staging)
+    if (was_staging)
         task.staging = false;
     else
         task.xport_priority = task.failover_count;
 
-    auto result = resolveTransport(task.request, task.xport_priority);
+    auto result = resolveRoute(task.request, task.staged_route.get(),
+                               task.xport_priority);
     auto type = result.transport;
     if (type == UNSPEC) {
         VLOG(1) << "No more transports available after "
@@ -3722,16 +3806,24 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
             "fallback transport cannot honor producer_event" LOC_MARK);
     }
 
-    LOG_EVERY_N(INFO, 1000)
-        << "Transport failover: " << transportTypeName(prev_type) << " -> "
-        << transportTypeName(type) << " (attempt " << task.failover_count << "/"
-        << task.runtime_policy.max_failover_attempts << ", generation "
-        << task.runtime_policy.config_generation << ")";
-    VLOG(1) << "Transport failover: " << transportTypeName(prev_type) << " -> "
+    if (type != prev_type) {
+        LOG_EVERY_N(INFO, 1000)
+            << "Transport failover: " << transportTypeName(prev_type) << " -> "
             << transportTypeName(type) << " (attempt " << task.failover_count
             << "/" << task.runtime_policy.max_failover_attempts
             << ", generation " << task.runtime_policy.config_generation << ")";
-    TENT_RECORD_TRANSPORT_FAILOVER(prev_type, type);
+        VLOG(1) << "Transport failover: " << transportTypeName(prev_type)
+                << " -> " << transportTypeName(type) << " (attempt "
+                << task.failover_count << "/"
+                << task.runtime_policy.max_failover_attempts << ", generation "
+                << task.runtime_policy.config_generation << ")";
+        TENT_RECORD_TRANSPORT_FAILOVER(prev_type, type);
+    } else {
+        VLOG(1) << "Retrying staged transfer on " << transportTypeName(type)
+                << " (attempt " << task.failover_count << "/"
+                << task.runtime_policy.max_failover_attempts << ", generation "
+                << task.runtime_policy.config_generation << ")";
+    }
 
     // A failed device staging operation must never fall through to submitting
     // the original VRAM addresses to a host-only network transport.
@@ -3740,8 +3832,10 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         task.device_mask = result.device_mask;
         task.qp_pool = result.qp_pool.value_or("");
         task.staging = true;
+        task.staged_retried = was_staging;
         return staging_proxy_->submit(&task, (BatchID)batch,
-                                      result.staging_params);
+                                      result.staging_params,
+                                      hopRoute(result, task.request));
     }
 
     auto& transport = transport_list_[type];
@@ -3930,6 +4024,8 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
         alias.device_mask = task.device_mask;
         alias.qp_pool = task.qp_pool;
         alias.staging = task.staging;
+        alias.staged_retried = task.staged_retried;
+        alias.suppress_failover = task.suppress_failover;
     }
 }
 
@@ -4432,7 +4528,9 @@ Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
 uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location) {
     uint64_t addr = 0;
     auto status = staging_proxy_->pinStageBuffer(location, addr);
-    if (!status.ok()) LOG(ERROR) << status.ToString();
+    // A full pool is transient: a peer pinning remotely backs off and retries.
+    if (!status.ok() && !status.IsTooManyRequests())
+        LOG(ERROR) << status.ToString();
     return addr;
 }
 
@@ -4551,7 +4649,8 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
             // transfer ultimately completed or failed, so it is recorded for
             // both outcomes. The feasible MLU ratio requires the actual
             // transfer latency, so it is only recorded on COMPLETED.
-            if (task.request.deadline_ns != 0) {
+            // Staged hops carry their request's deadline; skip them.
+            if (task.request.deadline_ns != 0 && !task.staged_route) {
                 uint64_t start_ns = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         start_time.time_since_epoch())

@@ -23,14 +23,16 @@
 namespace mooncake {
 namespace tent {
 ProxyManager::ProxyManager(TransferEngineImpl* impl, size_t chunk_size,
-                           size_t chunk_count)
+                           size_t chunk_count, size_t worker_count)
     : chunk_size_(chunk_size),
       chunk_count_(chunk_count),
       impl_(impl),
       shutdown_drain_timeout_(std::chrono::milliseconds(
-          impl->conf_->get("staging/shutdown_drain_timeout_ms", 30000L))) {
+          impl->conf_->get("staging/shutdown_drain_timeout_ms", 30000L))),
+      worker_count_(worker_count),
+      shards_(std::make_unique<WorkerShard[]>(worker_count)) {
     running_ = true;
-    for (size_t i = 0; i < kShards; ++i) {
+    for (size_t i = 0; i < worker_count_; ++i) {
         shards_[i].thread = std::thread(&ProxyManager::runner, this, i);
     }
 }
@@ -106,7 +108,7 @@ Status ProxyManager::deconstruct() {
     if (!running_.exchange(false, std::memory_order_acq_rel)) {
         return Status::OK();
     }
-    for (size_t i = 0; i < kShards; ++i) {
+    for (size_t i = 0; i < worker_count_; ++i) {
         {
             // Pair with the waiter's predicate check so shutdown cannot
             // notify between that check and entering the condition wait.
@@ -228,18 +230,23 @@ Status ProxyManager::deconstruct() {
     return Status::OK();
 }
 
-BatchID ProxyManager::submitCrossStage(const Request& request,
-                                       uint64_t local_stage_buffer,
-                                       uint64_t remote_stage_buffer,
-                                       uint64_t chunk_length) {
+BatchID ProxyManager::submitCrossStage(
+    const Request& request, const std::shared_ptr<const StagedRoute>& route,
+    uint64_t local_stage_buffer, uint64_t remote_stage_buffer,
+    uint64_t chunk_length) {
     Request inter_stage;
     inter_stage.opcode = request.opcode;
     inter_stage.source = (void*)local_stage_buffer;
     inter_stage.length = chunk_length;
     inter_stage.target_id = request.target_id;
     inter_stage.target_offset = remote_stage_buffer;
+    if (route) {
+        // Scheduling fields only: `route` picks the transport.
+        inter_stage.priority = request.priority;
+        inter_stage.deadline_ns = request.deadline_ns;
+    }
     auto batch = impl_->allocateBatch(1);
-    auto status = impl_->submitStagingTransfer(batch, {inter_stage});
+    auto status = impl_->submitStagingTransfer(batch, {inter_stage}, route);
     if (!status.ok()) {
         LOG(WARNING) << "failed to submit cross-stage transfer: "
                      << status.ToString();
@@ -324,21 +331,34 @@ Status ProxyManager::waitCrossStage(const Request& request,
                                     uint64_t local_stage_buffer,
                                     uint64_t remote_stage_buffer,
                                     uint64_t chunk_length) {
-    auto batch = submitCrossStage(request, local_stage_buffer,
+    auto batch = submitCrossStage(request, nullptr, local_stage_buffer,
                                   remote_stage_buffer, chunk_length);
     if (!batch) return Status::TooManyRequests("submit cross stage failed");
     return impl_->waitTransferCompletion(batch);
 }
 
 Status ProxyManager::submit(TaskInfo* task, BatchID batch,
-                            const std::vector<std::string>& params) {
+                            const std::vector<std::string>& params,
+                            std::shared_ptr<const StagedRoute> route) {
     StagingTask staging_task;
     staging_task.native = task;
     staging_task.batch = batch;
     staging_task.params = params;
+    staging_task.route = std::move(route);
     task->staging_status.store(PENDING, std::memory_order_relaxed);
     static std::atomic<size_t> next_queue_index(0);
-    thread_local size_t id = next_queue_index.fetch_add(1) % kShards;
+    // Stay on this thread's worker while it is idle (warm caches); otherwise
+    // take the least loaded one, so one batch's requests run concurrently.
+    thread_local const size_t ticket = next_queue_index.fetch_add(1);
+    const size_t home = ticket % worker_count_;
+    size_t id = home;
+    for (size_t i = 1; i < worker_count_; ++i) {
+        const size_t other = (home + i) % worker_count_;
+        if (shards_[other].pending.load(std::memory_order_relaxed) <
+            shards_[id].pending.load(std::memory_order_relaxed))
+            id = other;
+    }
+    shards_[id].pending.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(shards_[id].mu);
         shards_[id].queue.push(staging_task);
@@ -358,37 +378,58 @@ Status ProxyManager::getStatus(TaskInfo* task, TransferStatus& task_status) {
 struct StageBufferCache {
     StageBufferCache(ProxyManager& mgr) : mgr(mgr) {}
 
-    uint64_t allocateLocal(const std::string& location, int idx = 0) {
+    // A full pool returns TooManyRequests.
+    Status pinLocal(const std::string& location, int idx, uint64_t& addr) {
         auto key = location + "-" + std::to_string(idx);
-        if (local_stage_buffers.count(key)) {
-            return local_stage_buffers[key];
+        auto it = local_stage_buffers.find(key);
+        if (it != local_stage_buffers.end()) {
+            addr = it->second;
+            return Status::OK();
         }
+        CHECK_STATUS(mgr.pinStageBuffer(location, addr));
+        local_stage_buffers[key] = addr;
+        return Status::OK();
+    }
+
+    // The peer reports a full pool as address 0.
+    Status pinRemote(const std::string& server_addr,
+                     const std::string& location, int idx, uint64_t& addr) {
+        auto key = location + "-" + std::to_string(idx);
+        auto& pinned = remote_stage_buffers[server_addr];
+        auto it = pinned.find(key);
+        if (it != pinned.end()) {
+            addr = it->second;
+            return Status::OK();
+        }
+        CHECK_STATUS(
+            ControlClient::pinStageBuffer(server_addr, location, addr));
+        if (!addr)
+            return Status::TooManyRequests("No available stage buffer in " +
+                                           location + " at " + server_addr);
+        pinned[key] = addr;
+        return Status::OK();
+    }
+
+    uint64_t allocateLocal(const std::string& location, int idx = 0) {
         uint64_t addr = 0;
-        auto status = mgr.pinStageBuffer(location, addr);
+        auto status = pinLocal(location, idx, addr);
         if (!status.ok()) {
             LOG(ERROR) << "Failed to pin local stage buffer: " << status
                        << ", location " << location;
             return 0;
         }
-        local_stage_buffers[key] = addr;
         return addr;
     }
 
     uint64_t allocateRemote(const std::string& server_addr,
                             const std::string& location, int idx = 0) {
-        auto key = location + "-" + std::to_string(idx);
-        if (remote_stage_buffers[server_addr].count(key)) {
-            return remote_stage_buffers[server_addr][key];
-        }
         uint64_t addr = 0;
-        auto status =
-            ControlClient::pinStageBuffer(server_addr, location, addr);
+        auto status = pinRemote(server_addr, location, idx, addr);
         if (!status.ok()) {
             LOG(ERROR) << "Failed to pin remote stage buffer: " << status
                        << ", location " << location;
             return 0;
         }
-        remote_stage_buffers[server_addr][key] = addr;
         return addr;
     }
 
@@ -430,16 +471,20 @@ void ProxyManager::runner(size_t id) {
             shard.queue.pop();
         }
 
-        if (!task.native) continue;
+        if (!task.native) {
+            shard.pending.fetch_sub(1, std::memory_order_relaxed);
+            continue;
+        }
         flushPendingCleanups();
         StageBufferCache cache(*this);
         bool buffers_safe_to_release = true;
+        bool suppress_failover = false;
         std::vector<BatchID> undrained_batches;
         std::vector<std::shared_ptr<internal::RemoteStageOperation>>
             undrained_remote_operations;
-        auto status =
-            transferEventLoop(task, &cache, buffers_safe_to_release,
-                              undrained_batches, undrained_remote_operations);
+        auto status = transferEventLoop(task, &cache, buffers_safe_to_release,
+                                        suppress_failover, undrained_batches,
+                                        undrained_remote_operations);
         // A failed sibling does not stop copies already using the caller's
         // buffer. Keep the parent PENDING until those copies are terminal.
         // Shutdown still uses the existing bounded deferred-teardown path.
@@ -451,6 +496,8 @@ void ProxyManager::runner(size_t id) {
                 TransferStatus child_status;
                 auto polled = impl_->progressBatch(*it, child_status);
                 if (polled.ok() && child_status.s != PENDING) {
+                    if (impl_->batchSuppressesFailover(*it))
+                        suppress_failover = true;
                     impl_->releaseBatch(reinterpret_cast<Batch*>(*it));
                     it = undrained_batches.erase(it);
                 } else {
@@ -489,7 +536,10 @@ void ProxyManager::runner(size_t id) {
                 has_pending_cleanups_.store(true, std::memory_order_relaxed);
             }
         }
+        // Before publishing, so a caller's next submit sees this worker idle.
+        shard.pending.fetch_sub(1, std::memory_order_relaxed);
         if (buffers_safe_to_release) {
+            if (suppress_failover) task.native->suppress_failover = true;
             task.native->staging_status.store(status.ok() ? COMPLETED : FAILED,
                                               std::memory_order_release);
             impl_->notifyBatchMaybeReady(task.batch);
@@ -497,38 +547,59 @@ void ProxyManager::runner(size_t id) {
     }
 }
 
+Status ProxyManager::reserveStageBuffers(const StagingTask& task,
+                                         StageBufferCache* cache, size_t count,
+                                         uint64_t* local, uint64_t* remote) {
+    // Back off at most 10 ms: each attempt on a staged peer pins over RPC.
+    constexpr auto kWait = std::chrono::seconds(30);
+    constexpr auto kMaxBackoff = std::chrono::microseconds(10000);
+    const auto& server_addr = task.params[0];
+    const bool local_staging = !task.params[1].empty();
+    const bool remote_staging = !task.params[2].empty();
+    const auto deadline = std::chrono::steady_clock::now() + kWait;
+    auto backoff = std::chrono::microseconds(50);
+    while (true) {
+        Status status;
+        for (size_t i = 0; status.ok() && local_staging && i < count; ++i)
+            status =
+                cache->pinLocal(task.params[1], static_cast<int>(i), local[i]);
+        for (size_t i = 0; status.ok() && remote_staging && i < count; ++i)
+            status = cache->pinRemote(server_addr, task.params[2],
+                                      static_cast<int>(i), remote[i]);
+        if (status.ok()) return status;
+        cache->reset();
+        if (!status.IsTooManyRequests()) return status;
+        if (!running_.load(std::memory_order_acquire))
+            return Status::InternalError(
+                "Proxy manager is shutting down" LOC_MARK);
+        if (std::chrono::steady_clock::now() + backoff > deadline)
+            return status;
+        std::this_thread::sleep_for(backoff);
+        backoff = std::min(backoff * 2, kMaxBackoff);
+    }
+}
+
 Status ProxyManager::transferEventLoop(
     StagingTask& task, StageBufferCache* cache, bool& buffers_safe_to_release,
-    std::vector<BatchID>& undrained_batches,
+    bool& suppress_failover, std::vector<BatchID>& undrained_batches,
     std::vector<std::shared_ptr<internal::RemoteStageOperation>>&
         undrained_remote_operations) {
     buffers_safe_to_release = true;
+    suppress_failover = false;
     auto& request = task.native->request;
+    const auto& route = task.route;
     auto server_addr = task.params[0];
     bool local_staging = !task.params[1].empty();
     bool remote_staging = !task.params[2].empty();
+    // Pin no more buffers than chunks: other workers share the pool.
+    const size_t request_chunks =
+        std::max<size_t>(1, (request.length + chunk_size_ - 1) / chunk_size_);
     const size_t kStageBuffers =
-        std::min(chunk_count_, static_cast<size_t>(16));
+        std::min({request_chunks, chunk_count_, static_cast<size_t>(16)});
     uint64_t local_stage_buffer[kStageBuffers],
         remote_stage_buffer[kStageBuffers];
-    if (local_staging) {
-        for (size_t i = 0; i < kStageBuffers; ++i) {
-            local_stage_buffer[i] =
-                cache->allocateLocal(task.params[1], static_cast<int>(i));
-            if (local_stage_buffer[i] == 0)
-                return Status::InternalError(
-                    "Failed to pin local stage buffer");
-        }
-    }
-    if (remote_staging) {
-        for (size_t i = 0; i < kStageBuffers; ++i) {
-            remote_stage_buffer[i] = cache->allocateRemote(
-                server_addr, task.params[2], static_cast<int>(i));
-            if (remote_stage_buffer[i] == 0)
-                return Status::InternalError(
-                    "Failed to pin remote stage buffer");
-        }
-    }
+    CHECK_STATUS(reserveStageBuffers(task, cache, kStageBuffers,
+                                     local_stage_buffer, remote_stage_buffer));
 
     enum class StageState {
         PRE,
@@ -579,6 +650,9 @@ Status ProxyManager::transferEventLoop(
             LOG(ERROR) << "Failed to poll in-flight staging batch: " << status;
             impl_->freeBatch(batch);
             return false;
+        }
+        if (xfer_status.s != PENDING && impl_->batchSuppressesFailover(batch)) {
+            suppress_failover = true;
         }
         auto free_status = impl_->freeBatch(batch);
         if (!free_status.ok()) {
@@ -704,7 +778,7 @@ Status ProxyManager::transferEventLoop(
                     }
                     remote_locked.insert(chunk.remote_buf);
                 }
-                chunk.batch = submitCrossStage(request, chunk.local_buf,
+                chunk.batch = submitCrossStage(request, route, chunk.local_buf,
                                                chunk.remote_buf, chunk.length);
                 if (!chunk.batch) {
                     chunk.state = StageState::FAILED;
@@ -774,6 +848,9 @@ Status ProxyManager::transferEventLoop(
                     chunk.batch = 0;
                 } else if (xfer_status.s != PENDING) {
                     chunk.state = StageState::FAILED;
+                    if (impl_->batchSuppressesFailover(chunk.batch)) {
+                        suppress_failover = true;
+                    }
                     impl_->freeBatch(chunk.batch);
                     chunk.batch = 0;
                 }
@@ -801,6 +878,9 @@ Status ProxyManager::transferEventLoop(
                 auto result = operation->tryTakeResult();
                 if (result) {
                     if (!result->confirmed) {
+                        if (request.opcode == Request::WRITE) {
+                            suppress_failover = true;
+                        }
                         chunk.state = StageState::FAILED;
                         event_queue.push(id);
                         break;

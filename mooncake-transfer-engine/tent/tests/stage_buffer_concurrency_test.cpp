@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// ProxyManager::stage_buffers_ is reached from the kShards staging workers via
+// ProxyManager::stage_buffers_ is reached from the staging workers via
 // StageBufferCache::allocateLocal and from the RPC thread via Pin/Unpin. The
 // chunk bitmaps are atomic_flags, but the map holding them was unsynchronised,
 // so a first-time pin could rehash under another thread's find.
