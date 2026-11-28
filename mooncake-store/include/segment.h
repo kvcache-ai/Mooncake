@@ -179,6 +179,9 @@ class ScopedSegmentAccess {
      * is missing or has no allocated memory.
      */
     bool HasAllocatedMemory(const std::string& segment_name) const;
+    // IDs of the mounted segments registered under this name.
+    std::vector<UUID> GetSegmentIdsByName(
+        const std::string& segment_name) const;
 
     /**
      * @brief Get all segments that are not ready (not in OK status)

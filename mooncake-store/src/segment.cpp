@@ -822,6 +822,16 @@ bool ScopedSegmentAccess::HasAllocatedMemory(
     });
 }
 
+std::vector<UUID> ScopedSegmentAccess::GetSegmentIdsByName(
+    const std::string& segment_name) const {
+    const auto registrations =
+        segment_manager_->registrations_by_name_.find(segment_name);
+    if (registrations == segment_manager_->registrations_by_name_.end()) {
+        return {};
+    }
+    return {registrations->second.begin(), registrations->second.end()};
+}
+
 ErrorCode ScopedSegmentAccess::GetUnreadySegments(
     std::vector<std::pair<Segment, UUID>>& unready_segments) const {
     unready_segments.clear();
