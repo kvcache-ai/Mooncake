@@ -611,9 +611,15 @@ TEST_P(MasterServiceEvictScenarioTest,
     const std::string cluster_id = "evict_scenario_durability";
     const std::string tenant = TenantId::Default().value();
     auto backend = std::make_shared<EvictBlockingBatchHaKvBackend>();
+    // The tenant watermark would otherwise evict the quota-filling object from
+    // a background maintenance round, outside the BlockTxn window this case is
+    // built around: that eviction makes its removal durable before
+    // PutStart(before-durable), so the quota is already released and the write
+    // is admitted. Only the explicit EvictMemory below should evict "cold".
+    auto config = HaConfig(cluster_id, {{tenant, kObjectSize}});
+    config.tenant_eviction_high_watermark_ratio = 0.0;
     MasterScenario scenario("durability gates eviction quota reclamation",
-                            HaConfig(cluster_id, {{tenant, kObjectSize}}),
-                            backend);
+                            config, backend);
     scenario.Given(MemoryNode("memory").Capacity(kObjectSize))
         .Given(Objects({"cold"})
                    .Size(kObjectSize)
