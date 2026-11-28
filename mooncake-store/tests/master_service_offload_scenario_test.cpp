@@ -263,12 +263,14 @@ TEST(MasterServiceOffloadScenarioTest, RemoveReleasesLocalDiskUsage) {
         .When(ReportSsdCapacity("disk-1", 1000))
         .When(MountLocalDisk("disk-2"))
         .When(ReportSsdCapacity("disk-2", 1000))
-        .When(PutStart("ssd_remove_released", 800).By("disk-1"))
+        .When(
+            PutStart("ssd_remove_released", 800).By("disk-1").OnNode("disk-1"))
         .When(PutEnd("ssd_remove_released").By("disk-1"))
         .When(CompleteOffload({"ssd_remove_released"})
                   .By("disk-1")
                   .OnNode("disk-1"))
-        .When(PutStart("ssd_remove_baseline", 100).By("disk-2"))
+        .When(
+            PutStart("ssd_remove_baseline", 100).By("disk-2").OnNode("disk-2"))
         .When(PutEnd("ssd_remove_baseline").By("disk-2"))
         .When(CompleteOffload({"ssd_remove_baseline"})
                   .By("disk-2")
@@ -289,12 +291,12 @@ TEST(MasterServiceOffloadScenarioTest, ReplicaClearReleasesLocalDiskUsage) {
         .When(ReportSsdCapacity("disk-1", 1000))
         .When(MountLocalDisk("disk-2"))
         .When(ReportSsdCapacity("disk-2", 1000))
-        .When(PutStart("ssd_clear_released", 800).By("disk-1"))
+        .When(PutStart("ssd_clear_released", 800).By("disk-1").OnNode("disk-1"))
         .When(PutEnd("ssd_clear_released").By("disk-1"))
         .When(CompleteOffload({"ssd_clear_released"})
                   .By("disk-1")
                   .OnNode("disk-1"))
-        .When(PutStart("ssd_clear_baseline", 100).By("disk-2"))
+        .When(PutStart("ssd_clear_baseline", 100).By("disk-2").OnNode("disk-2"))
         .When(PutEnd("ssd_clear_baseline").By("disk-2"))
         .When(CompleteOffload({"ssd_clear_baseline"})
                   .By("disk-2")
@@ -317,12 +319,12 @@ TEST(MasterServiceOffloadScenarioTest, AllocationPrefersTheFresherSsd) {
         .When(ReportSsdCapacity("disk-1", 1000))
         .When(MountLocalDisk("disk-2"))
         .When(ReportSsdCapacity("disk-2", 1000))
-        .When(PutStart("ssd_fresher_heavy", 800).By("disk-1"))
+        .When(PutStart("ssd_fresher_heavy", 800).By("disk-1").OnNode("disk-1"))
         .When(PutEnd("ssd_fresher_heavy").By("disk-1"))
         .When(CompleteOffload({"ssd_fresher_heavy"})
                   .By("disk-1")
                   .OnNode("disk-1"))
-        .When(PutStart("ssd_fresher_light", 100).By("disk-2"))
+        .When(PutStart("ssd_fresher_light", 100).By("disk-2").OnNode("disk-2"))
         .When(PutEnd("ssd_fresher_light").By("disk-2"))
         .When(CompleteOffload({"ssd_fresher_light"})
                   .By("disk-2")
@@ -342,12 +344,14 @@ TEST(MasterServiceOffloadScenarioTest, EvictDiskReplicaReleasesLocalDiskUsage) {
         .When(ReportSsdCapacity("disk-1", 1000))
         .When(MountLocalDisk("disk-2"))
         .When(ReportSsdCapacity("disk-2", 1000))
-        .When(PutStart("ssd_evict_dec_heavy", 800).By("disk-1"))
+        .When(
+            PutStart("ssd_evict_dec_heavy", 800).By("disk-1").OnNode("disk-1"))
         .When(PutEnd("ssd_evict_dec_heavy").By("disk-1"))
         .When(CompleteOffload({"ssd_evict_dec_heavy"})
                   .By("disk-1")
                   .OnNode("disk-1"))
-        .When(PutStart("ssd_evict_dec_light", 100).By("disk-2"))
+        .When(
+            PutStart("ssd_evict_dec_light", 100).By("disk-2").OnNode("disk-2"))
         .When(PutEnd("ssd_evict_dec_light").By("disk-2"))
         .When(CompleteOffload({"ssd_evict_dec_light"})
                   .By("disk-2")
@@ -416,12 +420,16 @@ TEST(MasterServiceOffloadScenarioTest, UnmountLocalDiskDropsOnlyItsReplicas) {
         .When(ReportSsdCapacity("leaving", 1000))
         .When(MountLocalDisk("staying"))
         .When(ReportSsdCapacity("staying", 1000))
-        .When(PutStart("ssd_unmount_leaving_key", 1_KB).By("leaving"))
+        .When(PutStart("ssd_unmount_leaving_key", 1_KB)
+                  .By("leaving")
+                  .OnNode("leaving"))
         .When(PutEnd("ssd_unmount_leaving_key").By("leaving"))
         .When(CompleteOffload({"ssd_unmount_leaving_key"})
                   .By("leaving")
                   .OnNode("leaving"))
-        .When(PutStart("ssd_unmount_staying_key", 1_KB).By("staying"))
+        .When(PutStart("ssd_unmount_staying_key", 1_KB)
+                  .By("staying")
+                  .OnNode("staying"))
         .When(PutEnd("ssd_unmount_staying_key").By("staying"))
         .When(CompleteOffload({"ssd_unmount_staying_key"})
                   .By("staying")
@@ -488,6 +496,68 @@ TEST(MasterServiceOffloadScenarioTest, CompleteOffloadAfterUnmountIsRefused) {
                   .OfSize(1024)
                   .ExpectError(ErrorCode::SEGMENT_NOT_FOUND))
         .Then(Object("ssd_gate_orphan_key").DoesNotExist());
+}
+
+TEST(MasterServiceOffloadScenarioTest, CompleteOffloadByNonMirrorIsIgnored) {
+    // The offload is enqueued to "owner" only. A completion from another
+    // client must neither attach its disk replica nor consume the task, so
+    // the owner's own completion still lands afterwards.
+    MasterScenario("only the scheduled mirror can complete an offload",
+                   SsdAwareOffloadConfig())
+        .Given(MemoryNode("owner"))
+        .Given(MemoryNode("intruder"))
+        .When(MountLocalDisk("owner"))
+        .When(ReportSsdCapacity("owner", 1000))
+        .When(MountLocalDisk("intruder"))
+        .When(ReportSsdCapacity("intruder", 1000))
+        .When(PutStart("ssd_mirror_key", 1_KB)
+                  .By("owner")
+                  .OnNode("owner")
+                  .ExpectMemoryNodes({"owner"}))
+        .When(PutEnd("ssd_mirror_key").By("owner"))
+        .When(CompleteOffload({"ssd_mirror_key"})
+                  .By("intruder")
+                  .OnNode("intruder"))
+        .Then(Object("ssd_mirror_key").HasReplicas(1).HasMemoryReplicas(1))
+        .When(OffloadHeartbeat("owner").ExpectTasks({"ssd_mirror_key"}, 1024))
+        .When(CompleteOffload({"ssd_mirror_key"}).By("owner").OnNode("owner"))
+        .Then(Object("ssd_mirror_key").HasReplicas(2).HasLocalDiskReplicas(1));
+}
+
+TEST(MasterServiceOffloadScenarioTest, NackOffloadByNonMirrorIsIgnored) {
+    // A NACK from a client the offload was not enqueued to must not cancel
+    // the task. If it did, the task marker would be gone and the intruder's
+    // completion below would fall through to the no-task registration path
+    // and attach its own disk replica.
+    MasterScenario("only the scheduled mirror can cancel an offload",
+                   SsdAwareOffloadConfig())
+        .Given(MemoryNode("owner"))
+        .Given(MemoryNode("intruder"))
+        .When(MountLocalDisk("owner"))
+        .When(ReportSsdCapacity("owner", 1000))
+        .When(MountLocalDisk("intruder"))
+        .When(ReportSsdCapacity("intruder", 1000))
+        .When(PutStart("ssd_mirror_nack_key", 1_KB)
+                  .By("owner")
+                  .OnNode("owner")
+                  .ExpectMemoryNodes({"owner"}))
+        .When(PutEnd("ssd_mirror_nack_key").By("owner"))
+        .When(CompleteOffload({"ssd_mirror_nack_key"})
+                  .By("intruder")
+                  .OnNode("intruder")
+                  .OfSize(-1))
+        .When(CompleteOffload({"ssd_mirror_nack_key"})
+                  .By("intruder")
+                  .OnNode("intruder"))
+        .Then(Object("ssd_mirror_nack_key").HasReplicas(1).HasMemoryReplicas(1))
+        .When(OffloadHeartbeat("owner").ExpectTasks({"ssd_mirror_nack_key"},
+                                                    1024))
+        .When(CompleteOffload({"ssd_mirror_nack_key"})
+                  .By("owner")
+                  .OnNode("owner"))
+        .Then(Object("ssd_mirror_nack_key")
+                  .HasReplicas(2)
+                  .HasLocalDiskReplicas(1));
 }
 
 // The four offload/eviction config combos, driven through the client-visible
