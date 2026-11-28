@@ -215,6 +215,37 @@ inline bool Map(int fd, uint64_t size, void* hint, void*& addr,
     return true;
 }
 
+// Owner side (into a pre-reserved window): create the memfd, map it at
+// `window` with MAP_FIXED, and prefault it. `window` must be a sub-range of a
+// reservation from ReserveAlignedWindow().
+inline bool CreateAt(uint64_t size, void* window, int& fd, std::string& error) {
+    if (window == nullptr) {
+        error = "CreateAt requires a non-null reserved window";
+        return false;
+    }
+    fd = CreateAnonymousMemFd();
+    if (fd < 0) {
+        error = std::string("memfd_create failed: ") + std::strerror(errno);
+        return false;
+    }
+    if (ftruncate(fd, static_cast<off_t>(size)) != 0) {
+        error = std::string("ftruncate failed: ") + std::strerror(errno);
+        close(fd);
+        fd = -1;
+        return false;
+    }
+    void* mapped = nullptr;
+    if (!Map(fd, size, window, mapped, error)) {
+        close(fd);
+        fd = -1;
+        return false;
+    }
+    AdviseTransparentHugePages(mapped, size);
+    PrefaultRange(mapped, size, kPrefaultStride);
+    AdviseDontFork(mapped, size);
+    return true;
+}
+
 // Owner side: create the memfd, map it at an aligned base, and prefault it.
 // `size` should already be a multiple of Granularity().
 inline bool Create(uint64_t size, int& fd, void*& addr, std::string& error) {

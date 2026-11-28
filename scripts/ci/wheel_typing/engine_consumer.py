@@ -102,7 +102,17 @@ def exercise_shared_segment() -> None:
     segment.complete([blob, blob])
     assert_type(segment.ready(), bool)
     assert_type(segment.base_addr(), int)
+    assert_type(segment.owner_ranks(), list[int])
     assert_type(SharedSegment.supported(), bool)
+    multi_seg, multi_blob = SharedSegment.create(
+        "multi",
+        1 << 22,
+        world_size=4,
+        rank_id=0,
+        owner_ranks=[0, 2],
+    )
+    assert_type(multi_seg, SharedSegment)
+    assert_type(multi_blob, bytes)
 
 
 def exercise_rpc_interface() -> None:
