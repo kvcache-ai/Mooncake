@@ -69,7 +69,7 @@ TEST_F(BucketBackendConfigTest, UsesExistingDefaultsWhenEnvironmentIsUnset) {
     EXPECT_EQ(config.max_total_size, 0);
     EXPECT_EQ(config.max_physical_bytes, 0);
     EXPECT_EQ(config.disk_scan_cache_ms, 500);
-    EXPECT_EQ(config.eviction_policy, BucketEvictionPolicy::FIFO);
+    EXPECT_EQ(config.eviction_policy, BucketEvictionPolicy::LRU);
     EXPECT_FALSE(config.flush_partial_buckets);
     EXPECT_FALSE(config.aligned_direct_write);
 }

@@ -105,7 +105,7 @@ BucketBackendConfig::FromEnvironment() {
     const std::string policy = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY,
         Environ::ReadOr(Variables::MOONCAKE_BUCKET_EVICTION_POLICY,
-                        std::string{"fifo"}));
+                        std::string{"lru"}));
     if (policy == "fifo") {
         config.eviction_policy = BucketEvictionPolicy::FIFO;
     } else if (policy == "lru") {
