@@ -40,6 +40,7 @@
 #include "transfer_task.h"
 #include "transport/transport.h"
 #include "config.h"
+#include "client_master_address.h"
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "types.h"
 #include "client_buffer.h"
@@ -55,6 +56,7 @@
 #include "gpu_vendor/intra_nvlink.h"
 #endif
 #include "crc_checksum.h"
+#include "error.h"
 #include "config/client_numa_config.h"
 #include "storage/distributed/distributed_storage_backend.h"
 
@@ -741,36 +743,6 @@ static std::vector<std::string> ParseDeviceNames(std::string_view value) {
     return devices;
 }
 
-tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
-    const std::string& master_server_entry) {
-    const auto delimiter_pos = master_server_entry.find("://");
-    if (delimiter_pos == std::string::npos) {
-        return std::optional<ha::HABackendSpec>{std::nullopt};
-    }
-
-    const bool redis_cluster =
-        master_server_entry.substr(0, delimiter_pos) == "redis+cluster";
-    auto backend_type = ha::ParseHABackendType(
-        redis_cluster ? "redis" : master_server_entry.substr(0, delimiter_pos));
-    if (!backend_type.has_value()) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto availability = ha::ValidateHABackendAvailability(backend_type.value());
-    if (availability != ErrorCode::OK) {
-        return tl::make_unexpected(availability);
-    }
-
-    return std::optional<ha::HABackendSpec>{ha::HABackendSpec{
-        .type = backend_type.value(),
-        .connstring = redis_cluster
-                          ? master_server_entry
-                          : master_server_entry.substr(delimiter_pos + 3),
-        .cluster_namespace = "",
-        .redis_read_only = backend_type.value() == ha::HABackendType::REDIS,
-    }};
-}
-
 tl::expected<void, ErrorCode> CheckRegisterMemoryParams(
     const void* addr, size_t length, const std::string& protocol) {
     if (addr == nullptr) {
@@ -793,7 +765,9 @@ tl::expected<void, ErrorCode> CheckRegisterMemoryParams(
 ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
     auto ha_backend_spec = ParseHABackendSpec(master_server_entry);
     if (!ha_backend_spec) {
-        LOG(ERROR) << "Invalid HA backend entry: " << master_server_entry;
+        // Invalid HA entries may contain credentials; omit the raw input.
+        LOG(ERROR) << "Invalid HA backend entry: error="
+                   << toString(ha_backend_spec.error());
         return ha_backend_spec.error();
     }
 
@@ -802,22 +776,38 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
             ha::CreateLeaderCoordinator(ha_backend_spec.value().value());
         if (!coordinator) {
             LOG(ERROR) << "Failed to create HA backend coordinator: "
-                       << toString(coordinator.error());
+                       << "backend="
+                       << ha::HABackendTypeToString(
+                              ha_backend_spec.value()->type)
+                       << " error=" << toString(coordinator.error());
             return coordinator.error();
         }
 
+        const auto diagnostics = coordinator.value()->GetDiscoveryDiagnostics();
         auto master_view = ha::ReadCurrentViewOrWaitForReady(
             *coordinator.value(), kInitialLeaderReadyTimeout);
         if (!master_view) {
             LOG(ERROR) << "Failed to discover a ready master view: "
-                       << toString(master_view.error());
+                       << "error=" << toString(master_view.error());
+            if (!diagnostics.empty()) {
+                LOG(ERROR) << "HA discovery details: " << diagnostics;
+            }
             return master_view.error();
         }
         if (!master_view->has_value()) {
             // An absent ready view can mean either no elected leader or an
             // elected leader whose endpoint is still hidden during recovery.
-            LOG(ERROR) << "No master became ready within "
-                       << kInitialLeaderReadyTimeout.count() << " seconds";
+            if (diagnostics.empty()) {
+                LOG(ERROR) << "No master became ready within "
+                           << kInitialLeaderReadyTimeout.count() << " seconds";
+            } else {
+                LOG(ERROR) << "No master became ready within "
+                           << kInitialLeaderReadyTimeout.count() << " seconds; "
+                           << diagnostics
+                           << ". Verify the HA endpoints and ensure Master "
+                              "--cluster_id matches client "
+                              "MC_STORE_CLUSTER_ID.";
+            }
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
         }
 
@@ -829,10 +819,6 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
 
         leader_coordinator_ = std::move(coordinator.value());
         direct_master_address_.clear();
-        if (!leader_monitor_running_.exchange(true)) {
-            leader_monitor_thread_ =
-                std::thread([this]() { this->LeaderMonitorThreadMain(); });
-        }
         return ErrorCode::OK;
     } else {
         auto err = ConnectMasterEndpoint(master_server_entry);
@@ -858,13 +844,26 @@ void Client::EnterHaRuntimeMode() {
     // and leader-readiness probes use the separately configured fast-fail
     // control pool once initialization has completed.
     master_client_.EnableHaConnectionPolicy();
+
+    // Failed initialization attempts must not join a blocking backend watch
+    // before RealClient can retry with a different Store endpoint.
+    if (!leader_monitor_running_.exchange(true)) {
+        leader_monitor_thread_ =
+            std::thread([this]() { this->LeaderMonitorThreadMain(); });
+    }
 }
 
 ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
-    if (!metrics_) return master_client_.Connect(address);
-
-    return metrics_->master_heartbeat_metric.ObserveConnect(
-        [this, &address] { return master_client_.Connect(address); });
+    const auto err =
+        metrics_
+            ? metrics_->master_heartbeat_metric.ObserveConnect(
+                  [this, &address] { return master_client_.Connect(address); })
+            : master_client_.Connect(address);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Master ServiceReady RPC failed: endpoint='" << address
+                   << "' error=" << toString(err);
+    }
+    return err;
 }
 
 ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
@@ -970,8 +969,9 @@ void Client::EnsureStorageControlPlaneStarted() {
 
 ErrorCode Client::InitTransferEngine(
     const std::string& local_hostname, const std::string& metadata_connstring,
-    const std::string& protocol,
-    const std::optional<std::string>& device_names) {
+    const std::string& protocol, const std::optional<std::string>& device_names,
+    bool& retryable_on_new_endpoint) {
+    retryable_on_new_endpoint = false;
     // TEs created through the Store entry (Client::Create ->
     // InitTransferEngine) are tagged so ascend_direct can resolve a per-role
     // link config (e.g. Store=RoCE/D2H, P2P=HCCS/D2D). The flag only needs to
@@ -1037,6 +1037,7 @@ ErrorCode Client::InitTransferEngine(
                                     hostname, port);
     if (rc != 0) {
         LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
+        retryable_on_new_endpoint = rc == ERR_RPC_META_CONFLICT;
         return ErrorCode::INTERNAL_ERROR;
     }
 
@@ -1245,6 +1246,26 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::shared_ptr<TransferEngine>& transfer_engine,
     std::map<std::string, std::string> labels, const std::string& tenant_id,
     std::shared_ptr<NVMeoFInitiator> nof_initiator) {
+    auto result =
+        CreateWithError(local_hostname, metadata_connstring, protocol,
+                        device_names, master_server_entry, transfer_engine,
+                        std::move(labels), tenant_id, std::move(nof_initiator));
+    if (!result) {
+        return std::nullopt;
+    }
+    return std::move(result.value());
+}
+
+tl::expected<std::shared_ptr<Client>, Client::CreateFailure>
+Client::CreateWithError(const std::string& local_hostname,
+                        const std::string& metadata_connstring,
+                        const std::string& protocol,
+                        const std::optional<std::string>& device_names,
+                        const std::string& master_server_entry,
+                        const std::shared_ptr<TransferEngine>& transfer_engine,
+                        std::map<std::string, std::string> labels,
+                        const std::string& tenant_id,
+                        std::shared_ptr<NVMeoFInitiator> nof_initiator) {
     // Reused engines retain their metadata mode. In particular, P2PHANDSHAKE
     // must publish the engine's actual endpoint rather than the Store hostname.
     const auto& resolved_metadata =
@@ -1264,7 +1285,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
-        return std::nullopt;
+        return tl::make_unexpected(CreateFailure{err});
     }
 
     // Initialize storage backend if storage_root_dir is valid
@@ -1295,11 +1316,12 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                         << "Failed to initialize storage backend: " << prep_err
                         << ". Persistence was requested via fsdir but is "
                            "unavailable.";
-                    return std::nullopt;
+                    return tl::make_unexpected(CreateFailure{prep_err});
                 }
             } else {
                 LOG(ERROR) << "Invalid fsdir format: " << dir_string;
-                return std::nullopt;
+                return tl::make_unexpected(
+                    CreateFailure{ErrorCode::INVALID_PARAMS});
             }
         }
     } else {
@@ -1327,31 +1349,34 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                         << "Failed to initialize storage backend: " << prep_err
                         << ". Persistence was requested via storage config "
                            "but is unavailable.";
-                    return std::nullopt;
+                    return tl::make_unexpected(CreateFailure{prep_err});
                 }
             } else {
                 LOG(ERROR) << "Invalid fsdir format: " << config.fsdir;
-                return std::nullopt;
+                return tl::make_unexpected(
+                    CreateFailure{ErrorCode::INVALID_PARAMS});
             }
         }
     }
 
-    client->EnterHaRuntimeMode();
-
     // this only performs RPC calls
     if (protocol == "rpc_only") {
         LOG(INFO) << "Use rpc only. Skip initializing transfer engine.";
+        client->EnterHaRuntimeMode();
         return client;
     }
 
     // Initialize transfer engine
     if (transfer_engine == nullptr) {
         client->transfer_engine_ = std::make_shared<TransferEngine>();
+        bool retryable_on_new_endpoint = false;
         err = client->InitTransferEngine(local_hostname, metadata_connstring,
-                                         protocol, device_names);
+                                         protocol, device_names,
+                                         retryable_on_new_endpoint);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to initialize transfer engine";
-            return std::nullopt;
+            return tl::make_unexpected(
+                CreateFailure{err, retryable_on_new_endpoint});
         }
     } else {
         client->transfer_engine_ = transfer_engine;
@@ -1366,6 +1391,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         LOG(ERROR) << "Failed to initialize local hot cache";
     }
 
+    client->EnterHaRuntimeMode();
     return client;
 }
 

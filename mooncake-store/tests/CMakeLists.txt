@@ -356,6 +356,10 @@ add_store_test(real_client_regular_page_register_test
                real_client_regular_page_register_test.cpp)
 add_store_test(real_client_uninitialized_test
                real_client_uninitialized_test.cpp)
+if(USE_HTTP)
+  add_store_test(real_client_auto_port_retry_test
+                 real_client_auto_port_retry_test.cpp)
+endif()
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(standalone_client_test standalone_client_test.cpp)
@@ -563,8 +567,9 @@ if(STORE_USE_ETCD
    OR STORE_USE_K8S_LEASE)
   add_test(NAME high_availability_test COMMAND high_availability_test)
 endif()
-add_ha_test(ha_backend_availability_test
-            ha/leadership/ha_backend_availability_test.cpp)
+add_ha_test(
+  ha_backend_availability_test ha/leadership/ha_backend_availability_test.cpp
+  ha/leadership/client_ha_logging_test.cpp)
 add_ha_test(leader_label_reconciler_test
             ha/leadership/leader_label_reconciler_test.cpp)
 add_ha_test(oplog_batch_storage_test ha/oplog/oplog_batch_storage_test.cpp)

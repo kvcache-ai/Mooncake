@@ -38,6 +38,7 @@
 // range. Must never cross a public API boundary; translate it back to
 // ERR_CONTEXT first.
 #define ERR_CONTEXT_EINVAL (-203)
+#define ERR_RPC_META_CONFLICT (-204)
 
 #define ERR_NUMA (-300)
 #define ERR_CLOCK (-301)

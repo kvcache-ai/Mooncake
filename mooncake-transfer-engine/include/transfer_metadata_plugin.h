@@ -18,6 +18,12 @@
 #include "transfer_metadata.h"
 
 namespace mooncake {
+enum class MetadataSetResult {
+    kSuccess,
+    kFailure,
+    kRpcMetaConflict,
+};
+
 struct MetadataStoragePlugin {
     static std::shared_ptr<MetadataStoragePlugin> Create(
         const std::string &conn_string);
@@ -40,6 +46,11 @@ struct MetadataStoragePlugin {
         return get(key, value) ? GetResult::kFound : GetResult::kUnavailable;
     }
     virtual bool set(const std::string &key, const Json::Value &value) = 0;
+    virtual MetadataSetResult setWithStatus(const std::string &key,
+                                            const Json::Value &value) {
+        return set(key, value) ? MetadataSetResult::kSuccess
+                               : MetadataSetResult::kFailure;
+    }
     virtual bool remove(const std::string &key) = 0;
 };
 

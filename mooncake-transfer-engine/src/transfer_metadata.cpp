@@ -1956,7 +1956,15 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
     rpcMetaJSON["rpc_port"] = static_cast<Json::UInt>(desc.rpc_port);
     rpcMetaJSON["metadata_version"] =
         static_cast<Json::UInt64>(desc.metadata_version);
-    if (!storage_plugin_->set(rpc_meta_prefix_ + server_name, rpcMetaJSON)) {
+    const auto set_result = storage_plugin_->setWithStatus(
+        rpc_meta_prefix_ + server_name, rpcMetaJSON);
+    if (set_result == MetadataSetResult::kRpcMetaConflict) {
+        LOG(WARNING) << "RPC metadata key already exists with a different "
+                        "value for "
+                     << server_name;
+        return ERR_RPC_META_CONFLICT;
+    }
+    if (set_result != MetadataSetResult::kSuccess) {
         LOG(ERROR) << "Failed to set location of " << server_name;
         return ERR_METADATA;
     }

@@ -114,6 +114,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/mmap_arena_config.cpp
     common/mmap_buffer.cpp
     client_service.cpp
+    client_master_address.cpp
     gather_read.cpp
     client_metric.cpp
     master_client.cpp

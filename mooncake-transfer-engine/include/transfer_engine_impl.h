@@ -524,6 +524,7 @@ class TransferEngineImpl {
     void clearSkipRegistrationLocked(void* addr);
 
     std::shared_ptr<TransferMetadata> metadata_;
+    bool rpc_meta_entry_conflict_ = false;
     std::string local_server_name_;
     std::shared_ptr<MultiTransport> multi_transports_;
     std::shared_mutex mutex_;
