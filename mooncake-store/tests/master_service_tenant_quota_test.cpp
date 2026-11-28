@@ -585,6 +585,65 @@ TEST_F(MasterServiceTenantQuotaTest,
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
+       RemoveWhileMirrorCompletionAwaitsAdmissionStaysRemoved) {
+    const TenantId tenant("tenant-a");
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_multi_tenants(true)
+                      .set_enable_offload(true)
+                      .set_default_kv_lease_ttl(0)
+                      .set_tenant_quota_connector_type("file")
+                      .set_tenant_quota_connector_uri(
+                          WritePolicyFile({{tenant, 1024 * 1024}}))
+                      .build();
+    MasterService service(config);
+    const UUID client_a = MountSegment(service, 64 * 1024, "mirror_a");
+    const UUID client_b = MountSegment(service, 64 * 1024, "mirror_b");
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_a, true).has_value());
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_b, true).has_value());
+
+    const std::string key = "mirrored";
+    ReplicateConfig replicate;
+    replicate.replica_num = 2;
+    ASSERT_TRUE(
+        service.PutStart(client_a, key, tenant, 128, replicate).has_value());
+    ASSERT_TRUE(
+        service.PutEnd(client_a, key, tenant, ReplicaType::MEMORY).has_value());
+    auto tasks_a = service.OffloadObjectHeartbeat(client_a, true);
+    auto tasks_b = service.OffloadObjectHeartbeat(client_b, true);
+    ASSERT_TRUE(tasks_a.has_value());
+    ASSERT_TRUE(tasks_b.has_value());
+    ASSERT_EQ(tasks_a->size(), 1u);
+    ASSERT_EQ(tasks_b->size(), 1u);
+
+    StorageObjectMetadata metadata;
+    metadata.data_size = 128;
+    metadata.transport_endpoint = "disk-endpoint";
+    ASSERT_TRUE(service.NotifyOffloadSuccess(client_a, *tasks_a, {metadata})
+                    .has_value());
+
+    auto policy_lock = LockTenantQuotaPolicyForTest(service);
+    std::atomic<bool> notified{false};
+    tl::expected<void, ErrorCode> notify_result;
+    std::thread notify_thread([&] {
+        notify_result =
+            service.NotifyOffloadSuccess(client_b, *tasks_b, {metadata});
+        notified = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const bool awaited_admission = !notified;
+    auto removed = service.Remove(key, tenant, true);
+    policy_lock.unlock();
+    notify_thread.join();
+
+    ASSERT_TRUE(awaited_admission);
+    ASSERT_TRUE(removed.has_value()) << toString(removed.error());
+    ASSERT_TRUE(notify_result.has_value()) << toString(notify_result.error());
+    auto exists = service.ExistKey(key, tenant);
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
        NotifyOffloadSuccessRejectsOrphanObjectWithoutOffloadTask) {
     const std::string initial_policy = WritePolicyFile(
         {{TenantId("tenant-a"), 1000}, {TenantId("tenant-b"), 1000}});

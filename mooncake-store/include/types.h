@@ -285,13 +285,14 @@ struct OffloadTaskItem {
     std::string tenant_id;
     std::string key;
     int64_t size;
+    struct_pack::compatible<uint64_t, 1> task_id;
 
     bool operator==(const OffloadTaskItem& other) const {
         return tenant_id == other.tenant_id && key == other.key &&
                size == other.size;
     }
 };
-YLT_REFL(OffloadTaskItem, tenant_id, key, size);
+YLT_REFL(OffloadTaskItem, tenant_id, key, size, task_id);
 
 struct PromotionTaskItem {
     std::string tenant_id;

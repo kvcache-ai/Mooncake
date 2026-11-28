@@ -5454,6 +5454,52 @@ TEST_F(MasterServiceBatchRecordE2ETest,
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,
+       RemoveCancelsInFlightOffloadBeforeDurableFinalize) {
+    const std::string cluster_id = "test_batch_record_remove_inflight_offload";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_enable_offload(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallGatedWriter(service, backend);
+
+    auto mounted =
+        PrepareSimpleSegment(service, "remove_inflight_offload_segment");
+    ASSERT_TRUE(
+        service.MountLocalDiskSegment(mounted.client_id, true).has_value());
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key =
+        PutObject(service, mounted.client_id, "remove_inflight_offload_key");
+    ReadBatchEventually(storage, 2, batch);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
+    auto tasks = service.OffloadObjectHeartbeat(mounted.client_id, true);
+    ASSERT_TRUE(tasks.has_value());
+    ASSERT_EQ(tasks->size(), 1u);
+
+    ASSERT_TRUE(service.Remove(key, kDefaultTenant, true).has_value());
+    StorageObjectMetadata metadata;
+    metadata.data_size = 1024;
+    metadata.transport_endpoint = "disk-endpoint";
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(mounted.client_id, *tasks, {metadata})
+            .has_value());
+
+    ReadBatchEventually(storage, 3, batch);
+    ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+    auto exists = service.ExistKey(key, kDefaultTenant);
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
        ClearInvalidHandlesReleasesResourcesAfterDurable) {
     const std::string cluster_id = "test_batch_record_stale_finalize";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
