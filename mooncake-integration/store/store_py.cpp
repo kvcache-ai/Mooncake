@@ -3600,6 +3600,10 @@ NB_MODULE(_store, m) {
         .def(
             "get_replica_desc",
             [](MooncakeStorePyWrapper &self, const std::string &key) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<Replica::Descriptor>{};
+                }
                 py::gil_scoped_release release;
                 return self.store_->get_replica_desc(key);
             },
@@ -3608,6 +3612,11 @@ NB_MODULE(_store, m) {
             "batch_get_replica_desc",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::map<std::string,
+                                    std::vector<Replica::Descriptor>>{};
+                }
                 py::gil_scoped_release release;
                 return self.store_->batch_get_replica_desc(keys);
             },
