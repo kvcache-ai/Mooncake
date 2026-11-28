@@ -37,6 +37,9 @@
 #include <cuda_runtime.h>
 #include "tent/platform/cuda_utils.h"
 #endif
+#ifdef USE_HIP
+#include "tent/platform/rocm_gem.h"
+#endif
 
 #include "ib_link_speed.h"
 #include "tent/common/status.h"
@@ -656,6 +659,15 @@ RdmaContext::MemReg RdmaContext::registerMemReg(
     // separate host stage buffer.
     const auto memory_type = Platform::getLoader().getMemoryType(addr);
     if (memory_type == MTYPE_MLU || memory_type == MTYPE_CUDA) return nullptr;
+#ifdef USE_HIP
+    // The amdgpu peer-memory client behind ibv_reg_mr dereferences the NULL
+    // kfd_bo of a GEM BO, so a GEM buffer is only ever registered above.
+    if (lookupHipGemBuffer(addr, nullptr, nullptr, nullptr, nullptr)) {
+        LOG(ERROR) << "amdgpu GEM buffer " << addr << " in RDMA device "
+                   << device_name_ << " can only be registered through dma-buf";
+        return nullptr;
+    }
+#endif
 
     // Standard CPU memory registration
     ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
