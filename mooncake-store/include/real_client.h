@@ -125,6 +125,11 @@ class RealClient : public PyClient {
 
     int register_buffer(void *buffer, size_t size);
 
+    bool supports_external_buffer_registration() const {
+        return client_ && client_->SupportsExternalBufferRegistration() &&
+               !nof_runtime_.initiator;
+    }
+
     int unregister_buffer(void *buffer);
 
     struct WritableBufferRegion {
@@ -154,6 +159,14 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const QueryResultCache *query_result_cache = nullptr) override;
+
+    // Memory replicas only; submit directly to the caller's registered buffer.
+    std::vector<std::vector<std::vector<int64_t>>> get_into_ranges_direct(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes);
 
     // Read only from the supplied snapshot. Never re-query a key or renew a
     // lease: an expired snapshot fails with LEASE_EXPIRED.
@@ -214,6 +227,10 @@ class RealClient : public PyClient {
      */
     int put_from(const std::string &key, void *buffer, size_t size,
                  const ReplicateConfig &config = ReplicateConfig{});
+
+    // Caller owns registration and keeps the source alive until return.
+    int put_from_direct(const std::string &key, void *buffer, size_t size,
+                        const ReplicateConfig &config = ReplicateConfig{});
 
     /**
      * @brief Put one object directly from a registered data buffer plus a
@@ -767,7 +784,7 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const std::vector<size_t> *buffer_capacities = nullptr,
         const QueryResultCache *query_result_cache = nullptr,
-        bool allow_query_refresh = true);
+        bool allow_query_refresh = true, bool direct_only = false);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,

@@ -213,6 +213,29 @@ result = transfer.get_dataproto(
 
 The destination owner or lease must remain alive for as long as the materialized data may be used.
 
+## Payload-only tensor destinations
+
+`FieldSchema.direct_alignment` opts a dense `torch_tensor` field into a strict read into a caller-owned contiguous CPU/CUDA tensor. Other fields keep ordinary materialization. The same declaration is available on `StructuredObjectPayload.field_schemas`.
+
+```python
+ref = transfer.put_dataproto(data, field_schemas={
+    "selection": FieldSchema(codec="torch_tensor", direct_alignment=64),
+})
+lease = transfer.buffer_pool.register_external_region(
+    target.data_ptr(), target.nbytes, owner=target.untyped_storage()
+)
+try:
+    with lease.borrow():
+        result = transfer.get_dataproto(ref, destinations={
+            "selection": tensor_destination(target, alignment=64, pre_registered=True),
+        })
+        assert result["batch"]["selection"] is target
+finally:
+    lease.release()
+```
+
+The caller keeps the target registered and controls consumer completion. Drain I/O and consumers, release borrows and leases, then close or reconfigure the Store. Raw register/unregister of managed ranges is unsupported. Reads validate layout, shape, dtype, alignment, bounds and cross-field overlap; unsupported paths fail without staging. Whole reads and row selections are supported. Strict I/O requires a classic Transfer Engine memory replica; TCP and TENT are rejected. CUDA reads wait for prior work on the calling stream. Failed unregisters keep ownership for retry through `retry_pending_external_registrations()`, ambiguous registrations pin the owner until process exit, and scatter views pass `allocation=output_tensor` so the root meets schema alignment.
+
 ## Copy policy
 
 Control-plane metadata and manifests are small and always use the copy path. Tensor and ndarray payloads use the configured payload policy:

@@ -5390,7 +5390,8 @@ RealClient::get_into_ranges_internal(
     const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
     const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
     const std::vector<size_t> *buffer_capacities,
-    const QueryResultCache *query_result_cache, bool allow_query_refresh) {
+    const QueryResultCache *query_result_cache, bool allow_query_refresh,
+    bool direct_only) {
     auto results = build_ranged_read_internal_error_results(
         buffers.size(), all_keys, all_dst_offsets, ErrorCode::INVALID_PARAMS);
     if (!client_) {
@@ -5488,8 +5489,19 @@ RealClient::get_into_ranges_internal(
             }
 
             const auto &metadata = metadata_result.value();
+            if (direct_only &&
+                (!metadata.replica.is_memory_replica() ||
+                 (runtime_accelerator.FindDeviceForPointer(buffers[i]) &&
+                  !client_->CanReadDirectToDevice(metadata.replica, true)))) {
+                LOG(ERROR) << "Strict direct read has no supported memory path "
+                           << "for key " << keys[j];
+                std::fill(range_results.begin(), range_results.end(),
+                          tl::unexpected(ErrorCode::INVALID_REPLICA));
+                continue;
+            }
             if (metadata.replica.is_memory_replica()) {
-                if (client_->CanUseLocalMemcpy(metadata.replica) &&
+                if (!direct_only &&
+                    client_->CanUseLocalMemcpy(metadata.replica) &&
                     runtime_accelerator.FindDeviceForPointer(buffers[i])) {
                     if (!allow_query_refresh) {
                         for (size_t k = 0; k < range_results.size(); ++k) {
@@ -5626,7 +5638,11 @@ RealClient::get_into_ranges_internal(
                     if (select_replica(candidates.replicas,
                                        std::span<const Slice>(&destination, 1),
                                        selected) != ErrorCode::OK ||
-                        !selected.is_memory_replica()) {
+                        !selected.is_memory_replica() ||
+                        (direct_only &&
+                         runtime_accelerator.FindDeviceForPointer(
+                             destination.ptr) &&
+                         !client_->CanReadDirectToDevice(selected, true))) {
                         range_results[k] =
                             tl::unexpected(ErrorCode::INVALID_REPLICA);
                         continue;
@@ -5741,7 +5757,7 @@ RealClient::get_into_ranges_internal(
     // Choose only compatible contiguous-output groups. Both ordinary and
     // snapshot reads share this planner and preserve their lease semantics.
     auto plans =
-        client_->SupportsGatherRead()
+        !direct_only && client_->SupportsGatherRead()
             ? store::PlanGatherReads(memory_transfers, gather_endpoints)
             : std::vector<store::GatherReadPlan>{};
     std::vector<std::pair<size_t, store::GatherReadOperation>> gathered;
@@ -5860,6 +5876,27 @@ RealClient::get_into_ranges_internal(
         refresh_leases();
     }
     return results;
+}
+
+std::vector<std::vector<std::vector<int64_t>>>
+RealClient::get_into_ranges_direct(
+    const std::vector<void *> &buffers,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
+    // Strict reads must retain the caller's destination until physical drain.
+    // The Store TENT scatter timeout currently releases its logical batch
+    // first. Check the active engine, not whether TENT was compiled in.
+    if (client_ && !client_->SupportsStrictDirectRead()) {
+        return convert_ranged_read_results(
+            build_ranged_read_internal_error_results(buffers.size(), all_keys,
+                                                     all_dst_offsets,
+                                                     ErrorCode::NOT_SUPPORTED));
+    }
+    return convert_ranged_read_results(get_into_ranges_internal(
+        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes, nullptr,
+        nullptr, true, true));
 }
 
 std::vector<std::vector<std::vector<int64_t>>>
@@ -6082,6 +6119,23 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
     }
 
     return {};
+}
+
+int RealClient::put_from_direct(const std::string &key, void *buffer,
+                                size_t size, const ReplicateConfig &config) {
+    if (!client_ || config.prefer_alloc_in_same_node) {
+        return static_cast<int>(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_->SupportsStrictDirectRead()) {
+        return static_cast<int>(ErrorCode::NOT_SUPPORTED);
+    }
+    if (size == 0) return 0;
+    const auto region = resolve_writable_buffer_region(buffer);
+    if (!region || size > region->size - region->offset) {
+        return static_cast<int>(ErrorCode::INVALID_PARAMS);
+    }
+    auto slices = split_into_slices(buffer, size);
+    return to_py_ret(client_->Put(key, slices, config, true));
 }
 
 int RealClient::put_from(const std::string &key, void *buffer, size_t size,

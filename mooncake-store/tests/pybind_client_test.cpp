@@ -5225,6 +5225,33 @@ TEST_F(RealClientTest,
     std::remove(quota_path);
 }
 
+TEST_F(RealClientTest, ExternalPoolCapabilityRejectsSharedEngine) {
+    ScopedEnvVar nof_backend("MC_NOF_BACKEND", "none");
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    auto engine = std::make_shared<TransferEngine>(false);
+    ASSERT_EQ(engine->init("P2PHANDSHAKE", "localhost:17957"), 0);
+    ASSERT_NE(engine->installTransport("tcp", nullptr), nullptr);
+    ASSERT_EQ(py_client_->setup_real("localhost:17957", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_, engine),
+              0);
+    EXPECT_FALSE(py_client_->supports_external_buffer_registration());
+}
+
+TEST_F(RealClientTest, ExternalPoolCapabilityRejectsNof) {
+    NofFactoryGuard factory_guard;
+    auto initiator = std::make_shared<RecordingNofInitiator>();
+    RealClient::SetNofRuntimeFactoryForTesting([initiator]() {
+        return NofRuntime{initiator, std::make_shared<SystemDmaAllocator>()};
+    });
+    StartMasterAndSetupClient();
+    EXPECT_FALSE(py_client_->supports_external_buffer_registration());
+    std::vector<char> backing(4096);
+    EXPECT_EQ(py_client_->register_buffer(backing.data(), backing.size()), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(backing.data()), 0);
+}
+
 }  // namespace testing
 
 }  // namespace mooncake
