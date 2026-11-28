@@ -860,6 +860,15 @@ TEST_F(MemFabricTransportTest, InstallFormatsIpv6RpcEndpoint) {
     EXPECT_EQ(PublishedEndpoint(), "[2001:db8::10]:12345");
 }
 
+TEST_F(MemFabricTransportTest, InstallPublishesNicForHostRdma) {
+    ASSERT_TRUE(SetRpcAddress("192.0.2.10:9000").ok());
+
+    ASSERT_TRUE(Install("host_rdma").ok());
+
+    EXPECT_EQ(state_->create_url, "192.0.2.10:0");
+    EXPECT_EQ(state_->create_nic, "tcp://192.0.2.10:9000");
+}
+
 TEST_F(MemFabricTransportTest, InstallRejectsInvalidRpcAddress) {
     for (const auto& address :
          {"", ":9000", "127.0.0.1:bad", "127.0.0.1:0", "0.0.0.0:9000",

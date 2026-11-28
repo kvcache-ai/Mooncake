@@ -143,20 +143,21 @@ Status MemFabricTransport::install(std::string& local_segment_name,
     // let MemFabric allocate its own listening port.
     const auto bind_url = buildIpAddrWithPort(host, 0, ipv6);
     const auto nic_url = "tcp://" + buildIpAddrWithPort(host, rpc_port, ipv6);
-    const bool device_rdma =
-        config_.data_op_type.value() & SMEMB_DATA_OP_DEVICE_RDMA;
+    const auto op_type = config_.data_op_type.value();
+    const bool rdma = (op_type & SMEMB_DATA_OP_DEVICE_RDMA) ||
+                      (op_type & SMEMB_DATA_OP_HOST_RDMA);
     smem_trans_config_t cfg;
     // Reserve room for any assigned port instead of silently truncating an
     // endpoint in the vendor's fixed-size fields.
     if (buildIpAddrWithPort(host, std::numeric_limits<uint16_t>::max(), ipv6)
                 .size() >= sizeof(cfg.url) ||
-        (device_rdma && nic_url.size() >= sizeof(cfg.nic))) {
+        (rdma && nic_url.size() >= sizeof(cfg.nic))) {
         return Status::InvalidArgument(
             "Local RPC address exceeds MemFabric endpoint capacity" LOC_MARK);
     }
 
     config_.bind_url = bind_url;
-    config_.nic_url = device_rdma ? nic_url : "";
+    config_.nic_url = rdma ? nic_url : "";
     config_.store_url.clear();
     config_.device_id = -1;
     const auto log_level = conf ? conf->get("log_level", "info") : "info";
