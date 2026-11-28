@@ -316,6 +316,35 @@ bool validateTcpAddress(const std::shared_ptr<TransferMetadata>& metadata,
     }
     return false;
 }
+
+// Upper bound on one coalesced request. A request occupies one lane until it
+// finishes, so an unbounded merge would serialize a large batch on one socket.
+constexpr uint64_t kMaxCoalescedBytes = 16ull << 20;
+
+// Exclusive upper bound for extending a request that starts at `addr` on
+// `target_id`: the end of the registered remote buffer holding `addr` (the
+// responder validates one request against one buffer), capped at
+// kMaxCoalescedBytes. Returns 0 when no registered buffer holds `addr`.
+uint64_t coalesceLimit(const std::shared_ptr<TransferMetadata>& metadata,
+                       uint64_t target_id, uint64_t addr) {
+    auto desc = metadata->getSegmentDescByID(target_id);
+    if (!desc) return 0;
+    for (const auto& buffer : desc->buffers) {
+        if (buffer.addr + buffer.length < buffer.addr) continue;
+        if (buffer.addr <= addr && addr < buffer.addr + buffer.length)
+            return std::min(buffer.addr + buffer.length,
+                            addr + kMaxCoalescedBytes);
+    }
+    return 0;
+}
+
+// True if a request for `length` bytes at remote `addr` continues a coalesced
+// request that currently ends at `end`, without passing `limit`.
+bool continuesRange(uint64_t addr, uint64_t length, uint64_t end,
+                    uint64_t limit) {
+    return addr == end && length > 0 && length <= limit &&
+           end <= limit - length;
+}
 }  // namespace
 
 TcpTransport::TcpTransport()
@@ -332,6 +361,9 @@ TcpTransport::TcpTransport()
             enable_connection_pool_ = true;
         }
     }
+
+    if (const char* env = getenv("MC_TCP_COALESCE"))
+        coalesce_enabled_ = std::string(env) == "1";
 
     constexpr size_t kDefaultLanesPerPeer = 4;
     constexpr size_t kDefaultQueuedTransfersPerPeer = 65535;
@@ -591,8 +623,36 @@ Status TcpTransport::submitTransferTask(
         assert(task && task->request);
         const auto group_id = task->request->task_group_id;
         if (group_id == TransferRequest::kNoTaskGroup) {
-            startTransfer(prepareTransfer(task, *task->request));
+            Slice* head = prepareTransfer(task, *task->request);
             ++i;
+            // Fold the following requests into this one while they continue
+            // its remote range. Each fold saves a request round trip.
+            std::vector<Slice*> followers;
+            uint64_t end = head->tcp.dest_addr + head->length;
+            const uint64_t limit =
+                coalesce_enabled_ && task->request_count == 1 &&
+                        head->length > 0
+                    ? coalesceLimit(metadata_, head->target_id,
+                                    head->tcp.dest_addr)
+                    : 0;
+            while (i < task_list.size()) {
+                auto* next = task_list[i];
+                const auto* request = next->request;
+                if (!request || next->request_count != 1 ||
+                    request->task_group_id != TransferRequest::kNoTaskGroup ||
+                    request->opcode != head->opcode ||
+                    request->target_id != head->target_id ||
+                    !continuesRange(request->target_offset, request->length,
+                                    end, limit))
+                    break;
+                followers.push_back(prepareTransfer(next, *request));
+                end += request->length;
+                ++i;
+            }
+            // A coalesced item must not take the one-shot path, which would
+            // open a socket per item; lanes serve it like a task group.
+            const bool reuse = !followers.empty();
+            startTransfer(head, nullptr, reuse, std::move(followers));
             continue;
         }
 
@@ -673,6 +733,7 @@ void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
 
         while (true) {
             Slice* slice = nullptr;
+            std::vector<Slice*> followers;
             bool has_more = false;
             {
                 std::lock_guard<std::mutex> lock(sequence->mutex);
@@ -681,6 +742,23 @@ void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
                     return;
                 }
                 slice = sequence->slices[sequence->next++];
+                uint64_t end = slice->tcp.dest_addr + slice->length;
+                const uint64_t limit =
+                    coalesce_enabled_ && slice->length > 0
+                        ? coalesceLimit(metadata_, slice->target_id,
+                                        slice->tcp.dest_addr)
+                        : 0;
+                while (sequence->next < sequence->slices.size()) {
+                    Slice* next = sequence->slices[sequence->next];
+                    if (next->opcode != slice->opcode ||
+                        next->target_id != slice->target_id ||
+                        !continuesRange(next->tcp.dest_addr, next->length, end,
+                                        limit))
+                        break;
+                    followers.push_back(next);
+                    end += next->length;
+                    ++sequence->next;
+                }
                 has_more = sequence->next < sequence->slices.size();
                 sequence->resume_requested = false;
             }
@@ -695,7 +773,8 @@ void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
             // another loop iteration rather than recursive calls. For an
             // asynchronous completion, this invocation returns and the
             // continuation becomes the next runner.
-            startTransfer(slice, std::move(continuation), true);
+            startTransfer(slice, std::move(continuation), true,
+                          std::move(followers));
 
             {
                 std::lock_guard<std::mutex> lock(sequence->mutex);
@@ -734,8 +813,16 @@ std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
 
 void TcpTransport::startTransfer(Slice* slice,
                                  std::function<void()> continuation,
-                                 bool reuse_connection) {
-    auto finish = [slice, &continuation](TransferStatusEnum status) mutable {
+                                 bool reuse_connection,
+                                 std::vector<Slice*> followers) {
+    auto finish = [slice, &continuation,
+                   &followers](TransferStatusEnum status) mutable {
+        for (auto* follower : followers) {
+            if (status == TransferStatusEnum::COMPLETED)
+                follower->markSuccess();
+            else
+                follower->markFailed();
+        }
         if (status == TransferStatusEnum::COMPLETED)
             slice->markSuccess();
         else
@@ -779,6 +866,7 @@ void TcpTransport::startTransfer(Slice* slice,
                             static_cast<uint16_t>(desc->tcp_data_port)};
     const bool use_v2 = desc->tcp_proto_version >= 2 && !forceLegacyTcpProto();
     TcpWorkItem work(slice, use_v2, std::move(continuation));
+    work.followers = std::move(followers);
 
     // Scatter task groups request reuse even when the general pool setting is
     // disabled. Fixed lanes provide the same serial socket reuse without
@@ -817,10 +905,7 @@ void TcpTransport::startTransferWithSocket(
                 completeTerminalAction(
                     TerminalAction(std::move(completed), status, false));
             });
-        session->initiate(terminal_work->value().slice->source_addr,
-                          terminal_work->value().slice->tcp.dest_addr,
-                          terminal_work->value().slice->length,
-                          terminal_work->value().slice->opcode);
+        initiateWork(*session, terminal_work->value());
     } catch (const std::exception& e) {
         LOG(ERROR) << "TcpTransport::startTransfer encountered an exception. "
                       "Slice details - source_addr: "
