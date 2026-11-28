@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <set>
@@ -19,8 +20,258 @@
 #include "local_ssd/manager.h"
 #include "segment.h"
 #include "types.h"
+#include "test_buffer_allocator.h"
 
 namespace mooncake {
+
+namespace {
+class FallbackSearchTestPeer : public RandomAllocationStrategy {
+   public:
+    using RandomAllocationStrategy::FallbackCandidateSearch;
+};
+}  // namespace
+
+TEST(FallbackSearchTest, PreservesPrefixAndVisitsOnlyUnseenNamesInRecovery) {
+    for (const size_t size :
+         {1u, 2u, 99u, 100u, 101u, 127u, 257u, 1000u, 1001u}) {
+        SCOPED_TRACE(size);
+        threadLocalRandomEngine().seed(42);
+        FallbackSearchTestPeer::FallbackCandidateSearch search(size, size - 1);
+        const auto initial_engine = threadLocalRandomEngine();
+        std::set<size_t> visited;
+        const size_t prefix = size <= 100 ? size : 95;
+        for (size_t i = 0; i < size; ++i) {
+            const auto index = search.Next(true);
+            ASSERT_TRUE(index);
+            EXPECT_LT(*index, size);
+            EXPECT_TRUE(visited.insert(*index).second);
+            if (i < prefix) {
+                EXPECT_EQ(*index, i == 0 ? size - 1 : i - 1);
+                EXPECT_EQ(threadLocalRandomEngine(), initial_engine);
+                search.Charge();
+            }
+            // Later names are treated as non-serving, so they do not charge
+            // the recovery budget. The physical walk must still end at N.
+        }
+        EXPECT_EQ(visited.size(), size);
+        EXPECT_FALSE(search.Next(true));
+    }
+}
+
+TEST(FallbackSearchTest, PartialResultDoesNotActivateRecovery) {
+    FallbackSearchTestPeer::FallbackCandidateSearch search(1000, 900);
+    const auto before = threadLocalRandomEngine();
+    for (size_t i = 0; i < 100; ++i) {
+        ASSERT_TRUE(search.Next(false));
+        search.Charge();
+    }
+    EXPECT_FALSE(search.Next(false));
+    EXPECT_EQ(threadLocalRandomEngine(), before);
+}
+
+TEST(FallbackSearchTest, ModularStepDoesNotOverflow) {
+    const auto size = std::numeric_limits<size_t>::max();
+    threadLocalRandomEngine().seed(44);
+    FallbackSearchTestPeer::FallbackCandidateSearch search(size, size - 1);
+    for (size_t i = 0; i < 95; ++i) {
+        const auto index = search.Next(true);
+        ASSERT_TRUE(index);
+        EXPECT_EQ(*index, i == 0 ? size - 1 : i - 1);
+        search.Charge();
+    }
+    const size_t remaining = size - 95;
+    auto expected_engine = threadLocalRandomEngine();
+    size_t previous = randomIndex(remaining, expected_engine);
+    const auto first = search.Next(true);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(*first, previous + 94);
+    const auto step =
+        tryRandomCoprimeStep(remaining, expected_engine).value_or(1);
+    for (size_t i = 0; i < 200; ++i) {
+        const auto index = search.Next(true);
+        ASSERT_TRUE(index);
+        ASSERT_GE(*index, 94u);
+        const size_t offset = *index - 94;
+        EXPECT_LT(offset, remaining);
+        const size_t distance = offset >= previous
+                                    ? offset - previous
+                                    : remaining - previous + offset;
+        EXPECT_EQ(distance, step);
+        previous = offset;
+    }
+}
+
+TEST(FallbackSearchTest, FullPoolKeepsTheOriginalAllocationAttemptBudget) {
+    LocalSsdManager ssd;
+    for (const auto policy : {AllocationStrategyType::RANDOM,
+                              AllocationStrategyType::FREE_RATIO_FIRST,
+                              AllocationStrategyType::SSD_FREE_RATIO_FIRST}) {
+        SCOPED_TRACE(static_cast<int>(policy));
+        AllocatorManager manager;
+        std::vector<std::shared_ptr<test::TestBufferAllocator>> allocators;
+        for (size_t i = 0; i < 257; ++i) {
+            const auto name = "full-" + std::to_string(i);
+            auto allocator = std::make_shared<test::TestBufferAllocator>(
+                name, name, 64 * 1024);
+            allocator->SetUsed(allocator->capacity());
+            manager.addAllocator(name, allocator);
+            allocators.push_back(std::move(allocator));
+        }
+        threadLocalRandomEngine().seed(42);
+        auto strategy = CreateAllocationStrategy(policy, ssd);
+        auto result = strategy->Allocate(manager, 4096);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+        size_t attempts = 0;
+        for (const auto& allocator : allocators) {
+            attempts += allocator->allocation_calls();
+            EXPECT_LE(allocator->allocation_calls(),
+                      policy == AllocationStrategyType::RANDOM ? 1u : 2u);
+        }
+        EXPECT_EQ(attempts,
+                  policy == AllocationStrategyType::RANDOM ? 100u : 106u);
+    }
+}
+
+TEST(FallbackSearchTest, FirstSuccessDoesNotDrawRecoveryRandomness) {
+    AllocatorManager manager;
+    for (size_t i = 0; i < 257; ++i) {
+        const auto name = "free-" + std::to_string(i);
+        manager.addAllocator(name, std::make_shared<test::TestBufferAllocator>(
+                                       name, name, 64 * 1024));
+    }
+    threadLocalRandomEngine().seed(43);
+    auto expected_engine = threadLocalRandomEngine();
+    randomIndex(manager.getNames().size(), expected_engine);
+    RandomAllocationStrategy strategy;
+    ASSERT_TRUE(strategy.Allocate(manager, 4096));
+    EXPECT_EQ(threadLocalRandomEngine(), expected_engine);
+}
+
+TEST(FallbackSearchTest, ExcludedNamesStillConsumeTheRecoveryBudget) {
+    constexpr size_t size = 1000;
+    AllocatorManager manager;
+    std::vector<std::shared_ptr<test::TestBufferAllocator>> allocators;
+    for (size_t i = 0; i < size; ++i) {
+        const auto name = "excluded-budget-" + std::to_string(i);
+        auto allocator =
+            std::make_shared<test::TestBufferAllocator>(name, name, 64 * 1024);
+        manager.addAllocator(name, allocator);
+        allocators.push_back(std::move(allocator));
+    }
+    threadLocalRandomEngine().seed(42);
+    FallbackSearchTestPeer::FallbackCandidateSearch planned(size,
+                                                            randomIndex(size));
+    std::set<std::string> excluded;
+    for (size_t i = 0; i < 100; ++i) {
+        const auto index = planned.Next(true);
+        ASSERT_TRUE(index);
+        excluded.insert(manager.getNames()[*index]);
+        planned.Charge();
+    }
+    threadLocalRandomEngine().seed(42);
+    RandomAllocationStrategy strategy;
+    EXPECT_FALSE(strategy.Allocate(manager, 4096, 1, {}, excluded));
+    for (const auto& allocator : allocators) {
+        EXPECT_EQ(allocator->allocation_calls(), 0u);
+    }
+}
+
+TEST(FallbackSearchTest,
+     PartialReplicasRemainUniqueAcrossSameNameRegistrations) {
+    AllocatorManager manager;
+    for (size_t i = 0; i < 257; ++i) {
+        const auto name = "unique-" + std::to_string(i);
+        manager.addAllocator(name, std::make_shared<test::TestBufferAllocator>(
+                                       name, name + "/first", 64 * 1024));
+    }
+    auto failed = std::make_shared<test::TestBufferAllocator>(
+        "unique-0", "unique-0/failed", 64 * 1024);
+    failed->SetAlwaysFail();
+    manager.addAllocator("unique-0", failed);
+    threadLocalRandomEngine().seed(43);
+    auto expected_engine = threadLocalRandomEngine();
+    randomIndex(2, expected_engine);    // Same-name registration selection.
+    randomIndex(257, expected_engine);  // Original fallback start.
+    RandomAllocationStrategy strategy;
+    auto result =
+        strategy.Allocate(manager, 4096, 201, {"unique-0"}, {"unique-1"});
+    ASSERT_TRUE(result);
+    EXPECT_GE(result->size(), 99u);
+    EXPECT_LE(result->size(), 101u);
+    std::set<std::string> names;
+    for (const auto& replica : *result) {
+        const auto segments = replica.get_segment_names();
+        ASSERT_EQ(segments.size(), 1u);
+        ASSERT_TRUE(segments.front());
+        EXPECT_TRUE(names.insert(*segments.front()).second);
+    }
+    EXPECT_EQ(names.count("unique-0"), 1u);
+    EXPECT_EQ(names.count("unique-1"), 0u);
+    EXPECT_EQ(threadLocalRandomEngine(), expected_engine);
+}
+
+TEST(FallbackSearchTest, ExplorationCanFillMultipleDistinctLogicalSegments) {
+    LocalSsdManager ssd;
+    for (const auto policy : {AllocationStrategyType::RANDOM,
+                              AllocationStrategyType::FREE_RATIO_FIRST,
+                              AllocationStrategyType::SSD_FREE_RATIO_FIRST}) {
+        SCOPED_TRACE(static_cast<int>(policy));
+        auto planned = RandomEngine(42);
+        const size_t sample_start = randomIndex(1000, planned);
+        const size_t fallback_start = policy == AllocationStrategyType::RANDOM
+                                          ? sample_start
+                                          : randomIndex(1000, planned);
+        std::set<size_t> full;
+        for (size_t i = 0; i < 95; ++i) {
+            full.insert((fallback_start + i) % 1000);
+        }
+        if (policy != AllocationStrategyType::RANDOM) {
+            for (size_t i = 0; i < 24; ++i) {
+                full.insert((sample_start + i) % 1000);
+            }
+        }
+        AllocatorManager manager;
+        std::vector<std::shared_ptr<test::TestBufferAllocator>> allocators;
+        for (size_t i = 0; i < 1000; ++i) {
+            const auto name = "exploration-replicas-" + std::to_string(i);
+            auto allocator = std::make_shared<test::TestBufferAllocator>(
+                name, name + "/first", 64 * 1024);
+            allocator->SetUsed(full.contains(i) ? allocator->capacity() : 0);
+            manager.addAllocator(name, allocator);
+            allocators.push_back(std::move(allocator));
+            if (!full.contains(i)) {
+                auto failed = std::make_shared<test::TestBufferAllocator>(
+                    name, name + "/failed", 64 * 1024);
+                failed->SetAlwaysFail();
+                manager.addAllocator(name, failed);
+                allocators.push_back(std::move(failed));
+            }
+        }
+        threadLocalRandomEngine().seed(42);
+        auto strategy = CreateAllocationStrategy(policy, ssd);
+        auto result = strategy->Allocate(manager, 4096, 4);
+        ASSERT_TRUE(result);
+        ASSERT_EQ(result->size(), 4u);
+        std::set<std::string> names;
+        for (const auto& replica : *result) {
+            const auto segments = replica.get_segment_names();
+            ASSERT_EQ(segments.size(), 1u);
+            ASSERT_TRUE(segments.front());
+            EXPECT_TRUE(names.insert(*segments.front()).second);
+        }
+        size_t attempts = 0;
+        for (const auto& allocator : allocators) {
+            attempts += allocator->allocation_calls();
+        }
+        // The prefix and initial Ranked sample cannot allocate. Four distinct
+        // replicas must fit within the five remaining charged positions.
+        const size_t prefix_attempts =
+            policy == AllocationStrategyType::RANDOM ? 95 : 119;
+        EXPECT_GE(attempts, prefix_attempts + 4);
+        EXPECT_LE(attempts, prefix_attempts + 9);
+    }
+}
 
 // Size units for better readability
 static constexpr size_t MiB = 1024 * 1024;

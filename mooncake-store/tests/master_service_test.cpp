@@ -46,6 +46,70 @@
 
 namespace mooncake::test {
 
+TEST_F(MasterServiceTest, ExpansionCandidateCoverageReachesNewTail) {
+    constexpr size_t kSegments = 1000;
+    constexpr size_t kFullSegments = 900;
+    constexpr size_t kCapacity = 64 * 1024;
+    constexpr size_t kTrials = 256;
+    for (const auto policy : {AllocationStrategyType::RANDOM,
+                              AllocationStrategyType::FREE_RATIO_FIRST,
+                              AllocationStrategyType::SSD_FREE_RATIO_FIRST}) {
+        SCOPED_TRACE(static_cast<int>(policy));
+        MasterServiceConfig config;
+        config.memory_allocator = BufferAllocatorType::OFFSET;
+        config.allocation_strategy_type = policy;
+        config.eviction_ratio = 0;
+        config.eviction_high_watermark_ratio = 1;
+        config.client_active_ttl_sec = 3600;
+        MasterService service(config);
+        const auto owner = generate_uuid();
+        std::set<std::string> added_segments;
+        for (size_t i = 0; i < kSegments; ++i) {
+            const auto name = "expansion-" + std::to_string(i);
+            const auto segment = MakeSegment(
+                name, kDefaultSegmentBase + i * kCapacity, kCapacity);
+            ASSERT_TRUE(service.MountSegment(segment, owner));
+            if (i < kFullSegments) {
+                ReplicateConfig fill;
+                fill.replica_num = 1;
+                fill.preferred_segment = name;
+                ASSERT_TRUE(service.PutStart(owner, name, TenantId::Default(),
+                                             kCapacity, fill));
+                ASSERT_TRUE(service.PutEnd(owner, name, TenantId::Default(),
+                                           ReplicaType::MEMORY));
+            } else {
+                added_segments.insert(name);
+            }
+        }
+        ReplicateConfig incoming;
+        incoming.replica_num = 1;
+        threadLocalRandomEngine().seed(42);
+        size_t successes = 0;
+        for (size_t i = 0; i < kTrials; ++i) {
+            auto result = service.PutStart(owner, "incoming",
+                                           TenantId::Default(), 4096, incoming);
+            if (!result) {
+                EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+                continue;
+            }
+            ++successes;
+            ASSERT_EQ(result->size(), 1u);
+            EXPECT_TRUE(added_segments.contains(
+                result->front()
+                    .get_memory_descriptor()
+                    .buffer_descriptor.transport_endpoint_));
+            ASSERT_TRUE(service.PutRevoke(
+                owner, "incoming", TenantId::Default(), ReplicaType::MEMORY));
+        }
+        // Keep the original 100-position fallback budget. Require a clear
+        // improvement over main (<30%), not success for every request.
+        EXPECT_GE(successes, kTrials * 4 / 10);
+        auto keys = service.GetAllKeys(TenantId::Default());
+        ASSERT_TRUE(keys);
+        EXPECT_EQ(keys->size(), kFullSegments);
+    }
+}
+
 class ScopedEnvVar {
    public:
     explicit ScopedEnvVar(const char* name) : name_(name) {
