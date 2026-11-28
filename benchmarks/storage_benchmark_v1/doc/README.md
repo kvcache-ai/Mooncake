@@ -8,6 +8,9 @@ The KVCache Storage Benchmark is a tool for evaluating storage performance of KV
 
 ### Basic Usage
 
+From the repository root, run `python -m benchmarks.storage_benchmark_v1 --help`
+to see the available options. You can also run the script directly:
+
 ```bash
 cd benchmarks/storage_benchmark_v1
 python benchmark.py --scenario conversation \
@@ -19,7 +22,7 @@ python benchmark.py --scenario conversation \
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--trace-dir` | `../../FAST25-release/traces` | Directory containing trace files |
+| `--trace-dir` | `FAST25-release/traces` in the repository | Directory containing trace files |
 | `--scenario` | `toolagent` | Test scenario: `conversation`, `synthetic`, `toolagent`, or `all` |
 | `--storage-dir` | `/tmp/mooncake_bench` | Directory for storage files |
 | `--model` | `glm5` | Model preset: `glm5` or `kimi-k2.6` |

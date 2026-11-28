@@ -16,8 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any
 
-from storage import DiskHashTable
-from layout import get_model_config, create_layout
+if __package__:
+    from .layout import create_layout, get_model_config
+    from .storage import DiskHashTable
+else:  # Direct invocation via python benchmark.py
+    from layout import create_layout, get_model_config
+    from storage import DiskHashTable
 
 
 # ============================================================================
@@ -739,7 +743,7 @@ def main():
     parser.add_argument(
         "--trace-dir",
         type=str,
-        default="../../FAST25-release/traces",
+        default=str(Path(__file__).resolve().parents[2] / "FAST25-release" / "traces"),
         help="Trace files directory",
     )
     parser.add_argument(
