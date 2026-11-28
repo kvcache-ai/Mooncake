@@ -72,7 +72,7 @@ ctest_timeout=600
 case "$profile" in
   cuda-off)
     extra_flags=(-DUSE_CUDA=OFF -DUSE_EVENT_DRIVEN_COMPLETION=ON)
-    build_targets=(mooncake-transfer-engine/all transfer_task_test standalone_client_test)
+    build_targets=(mooncake-transfer-engine/all transfer_task_test standalone_client_test engine)
     ;;
   cuda-off-metrics-on)
     extra_flags=(-DUSE_CUDA=OFF -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF -DTENT_METRICS_ENABLED=ON)
@@ -110,6 +110,8 @@ if [[ "$profile" == "cuda-off" ]]; then
     -R '^tent_compat_notify_test$'
   ctest --test-dir "$build_dir" --output-on-failure --no-tests=error --timeout "$ctest_timeout" \
     -R '^transfer_task_tent_shared_segment_test$'
+  ctest --test-dir "$build_dir" --output-on-failure --no-tests=error --timeout "$ctest_timeout" \
+    -R '^python_async_batch_(classic|tent)_test$'
 fi
 
 if [[ "$profile" == "ub-mock" ]]; then
