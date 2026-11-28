@@ -13,6 +13,7 @@
 
 #include "ascii_string.h"
 #include "conductor/kvevent/object_key_parser.h"
+#include "conductor/prefixindex/hash_strategy.h"
 #include "conductor/prefixindex/layout_parser.h"
 #include "integer_parser.h"
 
@@ -1058,7 +1059,7 @@ std::string KVEventHandler::HandleMooncakeStored(
         service_.hash_profile.strategy == "sglang_bigram") {
         return HandleSglangMooncakeStored(event, metadata);
     }
-    if (service_.hash_profile.strategy != "vllm_v1") {
+    if (!prefixindex::IsVllmV1Strategy(service_.hash_profile.strategy)) {
         return "unsupported Mooncake object-key strategy";
     }
     const auto tier = SharedTier(event.fields.medium);
@@ -1181,7 +1182,7 @@ std::string KVEventHandler::HandleMooncakeRemoved(
         service_.hash_profile.strategy == "sglang_bigram") {
         return HandleSglangMooncakeRemoved(event, metadata);
     }
-    if (service_.hash_profile.strategy != "vllm_v1") {
+    if (!prefixindex::IsVllmV1Strategy(service_.hash_profile.strategy)) {
         return "unsupported Mooncake object-key strategy";
     }
     const auto tier = SharedTier(event.fields.medium);

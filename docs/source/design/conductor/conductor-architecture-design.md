@@ -90,12 +90,13 @@ a `hash_profile` that tells Conductor how the publisher hashes token blocks, and
 
 | `strategy` | `algorithm` | `index_projection` | Block coverage |
 |---|---|---|---|
-| `vllm_v1` | `sha256` (pickle) or `sha256_cbor` | `low64_be` | Complete blocks only |
+| `vllm_v1` | `sha256` (pickle) or `sha256_cbor` | `low64_be` | Complete blocks only; untagged extra keys (vLLM < v0.31) |
+| `vllm_v1_tagged` | `sha256` (pickle) or `sha256_cbor` | `low64_be` | Complete blocks only; tagged extra keys (vLLM >= v0.31), no LoRA |
 | `sglang` | `sha256_raw` | `first64_be` | Includes the final partial block |
 | `sglang_bigram` | `sha256_raw` | `first64_be` | Includes the final partial block; hashes adjacent token pairs |
 
-`vllm_v1` also requires `python_hash_seed` (decimal `0..4294967295`, or
-`"random"`), from which Conductor derives the chain root `root_digest`.
+Both vLLM strategies require `python_hash_seed` (decimal `0..4294967295`,
+`"random"`, or vLLM's default `"vllm-none-hash"`), from which Conductor derives the chain root `root_digest`.
 SGLang strategies have no seed; their root depends only on the optional
 `cache_salt`.
 

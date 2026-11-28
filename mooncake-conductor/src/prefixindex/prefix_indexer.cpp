@@ -247,6 +247,11 @@ RegistrationResult PrefixCacheTable::ValidateRegistration(
         !error.empty()) {
         return {.error = std::move(error)};
     }
+    if (auto error = ValidateHashProfileForContext(registration.profile,
+                                                   registration.context);
+        !error.empty()) {
+        return {.error = std::move(error)};
+    }
     if (registration.layout) {
         if (auto error = ValidateCacheLayout(*registration.layout);
             !error.empty()) {

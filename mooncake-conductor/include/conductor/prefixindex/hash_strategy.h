@@ -6,6 +6,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "conductor/prefixindex/types.h"
@@ -82,5 +83,20 @@ std::unique_ptr<HashStrategy> CreateHashStrategy(
     std::optional<std::string> extra_key = std::nullopt);
 
 std::string DigestToHex(const std::array<uint8_t, 32>& digest);
+
+// "vllm_v1" hashes vLLM's untagged extra keys (bare LoRA name and cache salt,
+// vLLM < v0.31). "vllm_v1_tagged" hashes the tagged tuples vLLM >= v0.31
+// uses. Both share the vLLM v1 chain, root, and low64_be projection.
+inline constexpr std::string_view kVllmV1Strategy = "vllm_v1";
+inline constexpr std::string_view kVllmV1TaggedStrategy = "vllm_v1_tagged";
+
+// Returns true for every strategy that uses the vLLM v1 block-hash chain.
+bool IsVllmV1Strategy(std::string_view strategy);
+
+// Returns an empty string when the profile can reproduce the publisher's
+// block hashes for this context. vllm_v1_tagged cannot hash LoRA blocks:
+// vLLM keys them by ("lora", name, path) and registration carries no path.
+std::string ValidateHashProfileForContext(const HashProfile& profile,
+                                          const ContextKey& context);
 
 }  // namespace mooncake::conductor::prefixindex

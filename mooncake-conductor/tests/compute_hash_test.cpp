@@ -23,6 +23,7 @@ using mooncake::conductor::prefixindex::HashDomain;
 using mooncake::conductor::prefixindex::HashProfile;
 using mooncake::conductor::prefixindex::ResolveHashProfile;
 using mooncake::conductor::prefixindex::ValidateHashProfile;
+using mooncake::conductor::prefixindex::ValidateHashProfileForContext;
 using mooncake::conductor::test::LoadJsonFixture;
 using mooncake::conductor::test::ParseU64;
 
@@ -476,6 +477,203 @@ TEST(HashStrategyGolden, MatchesVllmPickleVectors) {
             }
         }
     }
+}
+
+std::optional<std::string> CaseSalt(const Json::Value& test_case) {
+    if (test_case.isMember("cache_salt_repeat")) {
+        const Json::Value& repeat = test_case["cache_salt_repeat"];
+        return std::string(static_cast<size_t>(repeat["count"].asUInt64()),
+                           repeat["value"].asString().front());
+    }
+    return SaltFrom(test_case["cache_salt"]);
+}
+
+HashProfileConfig TaggedSource(const Json::Value& profile) {
+    return {.strategy = profile["strategy"].asString(),
+            .algorithm = profile["algorithm"].asString(),
+            .python_hash_seed = profile["python_hash_seed"].asString(),
+            .index_projection = profile["index_projection"].asString()};
+}
+
+// vLLM >= v0.31 hashes tagged extra keys: (("cache_salt", salt),) on the
+// first block.  The fixture is generated with the real CPython pickler and
+// cbor2 and cross-checked against vLLM's own hash_block_tokens.
+TEST(HashStrategyGolden, MatchesVllmTaggedVectors) {
+    const Json::Value fixture =
+        LoadJsonFixture("hash_golden_vectors_vllm_tagged.json");
+    const Json::Value& suites = fixture["suites"];
+    ASSERT_EQ(suites.size(), 4u);
+    for (const auto& suite : suites) {
+        const Json::Value& pinned = suite["profile"];
+        SCOPED_TRACE(pinned["algorithm"].asString() + "/" +
+                     pinned["python_hash_seed"].asString());
+
+        HashProfile profile;
+        const std::string resolve_error =
+            ResolveHashProfile(TaggedSource(pinned), &profile);
+        ASSERT_TRUE(resolve_error.empty()) << resolve_error;
+        EXPECT_EQ(profile, ProfileFrom(pinned));
+        EXPECT_EQ(
+            Sha256Hex(HexToBytes(suite["seed_serialized_hex"].asString())),
+            profile.root_digest);
+        ASSERT_TRUE(ValidateHashProfile(profile).empty());
+
+        std::string factory_error;
+        auto strategy = CreateHashStrategy(profile, &factory_error);
+        ASSERT_NE(strategy, nullptr) << factory_error;
+
+        for (const auto& test_case : suite["cases"]) {
+            SCOPED_TRACE(test_case["name"].asString());
+            const ContextKey context{
+                .tenant_id = "default",
+                .model_name = "golden-model",
+                .lora_name = "",
+                .block_size = test_case["block_size"].asInt64(),
+            };
+            const std::vector<int32_t> tokens = CaseTokens(test_case);
+
+            std::vector<HashBlock> blocks;
+            const std::string error = strategy->Compute(
+                context, tokens, CaseSalt(test_case), &blocks);
+            ASSERT_TRUE(error.empty()) << error;
+
+            const Json::Value& expected = test_case["expected"];
+            ASSERT_EQ(blocks.size(), expected.size());
+            for (Json::ArrayIndex index = 0; index < expected.size(); ++index) {
+                const std::string digest = DigestToHex(blocks[index].digest);
+                EXPECT_EQ(digest, expected[index]["digest"].asString())
+                    << "block=" << index;
+                EXPECT_EQ(blocks[index].projected.value,
+                          ParseU64(expected[index]["projected_decimal"]))
+                    << "block=" << index;
+                if (expected[index].isMember("serialized_hex")) {
+                    EXPECT_EQ(
+                        Sha256Hex(HexToBytes(
+                            expected[index]["serialized_hex"].asString())),
+                        expected[index]["digest"].asString())
+                        << "block=" << index;
+                }
+            }
+        }
+    }
+}
+
+TEST(HashStrategyGolden, LegacyVllmV1KeepsUntaggedSaltShape) {
+    const Json::Value fixture =
+        LoadJsonFixture("hash_golden_vectors_vllm_tagged.json");
+    const std::vector<int32_t> tokens{1, 2, 3, 4, 5, 6, 7, 8};
+    const ContextKey context{.tenant_id = "default",
+                             .model_name = "golden-model",
+                             .lora_name = "",
+                             .block_size = 4};
+    for (const auto& suite : fixture["suites"]) {
+        HashProfileConfig source = TaggedSource(suite["profile"]);
+        SCOPED_TRACE(source.algorithm + "/" + source.python_hash_seed);
+        source.strategy = "vllm_v1";
+        HashProfile legacy_profile;
+        ASSERT_TRUE(ResolveHashProfile(source, &legacy_profile).empty());
+        // The root digest depends only on the seed and the codec.
+        EXPECT_EQ(legacy_profile.root_digest,
+                  suite["profile"]["root_digest"].asString());
+
+        std::string factory_error;
+        auto legacy = CreateHashStrategy(legacy_profile, &factory_error);
+        ASSERT_NE(legacy, nullptr) << factory_error;
+        for (const auto& test_case : suite["cases"]) {
+            const std::string name = test_case["name"].asString();
+            if (name != "unsalted_matches_untagged_shape" &&
+                name != "salt_first_block_only") {
+                continue;
+            }
+            SCOPED_TRACE(name);
+            std::vector<HashBlock> blocks;
+            ASSERT_TRUE(
+                legacy->Compute(context, tokens, CaseSalt(test_case), &blocks)
+                    .empty());
+            ASSERT_EQ(blocks.size(), 2u);
+            const Json::Value& expected = test_case["expected"];
+            if (name == "unsalted_matches_untagged_shape") {
+                // No extra keys: both recipes hash None.
+                EXPECT_EQ(DigestToHex(blocks[1].digest),
+                          expected[1]["digest"].asString());
+            } else {
+                EXPECT_NE(DigestToHex(blocks[0].digest),
+                          expected[0]["digest"].asString());
+            }
+        }
+    }
+}
+
+TEST(HashProfileResolver, AcceptsVllmDefaultNoneHashSeed) {
+    const Json::Value fixture =
+        LoadJsonFixture("hash_golden_vectors_vllm_tagged.json");
+    for (const auto& suite : fixture["suites"]) {
+        const Json::Value& pinned = suite["profile"];
+        if (pinned["python_hash_seed"].asString() != "vllm-none-hash") {
+            continue;
+        }
+        for (const std::string strategy : {"vllm_v1", "vllm_v1_tagged"}) {
+            HashProfileConfig source = TaggedSource(pinned);
+            source.strategy = strategy;
+            SCOPED_TRACE(strategy + "/" + source.algorithm);
+            HashProfile resolved;
+            std::string error_field = "stale";
+            const std::string error =
+                ResolveHashProfile(source, &resolved, &error_field);
+            ASSERT_TRUE(error.empty()) << error;
+            EXPECT_TRUE(error_field.empty());
+            EXPECT_EQ(resolved.python_hash_seed, "vllm-none-hash");
+            EXPECT_EQ(resolved.root_digest, pinned["root_digest"].asString());
+            EXPECT_TRUE(ValidateHashProfile(resolved).empty());
+        }
+    }
+
+    // Like "random", the default seed is matched exactly.
+    for (const std::string seed :
+         {"vllm-none-hash ", " vllm-none-hash", "VLLM-NONE-HASH"}) {
+        SCOPED_TRACE(seed);
+        HashProfile resolved;
+        EXPECT_FALSE(
+            ResolveHashProfile(SourceProfile(seed, "sha256"), &resolved)
+                .empty());
+    }
+}
+
+TEST(HashStrategy, TaggedRecipeRejectsLoraUntilLoraPathIsKnown) {
+    HashProfile profile;
+    ASSERT_TRUE(ResolveHashProfile({.strategy = "vllm_v1_tagged",
+                                    .algorithm = "sha256",
+                                    .python_hash_seed = "0",
+                                    .index_projection = "low64_be"},
+                                   &profile)
+                    .empty());
+    std::string factory_error;
+    auto strategy = CreateHashStrategy(profile, &factory_error);
+    ASSERT_NE(strategy, nullptr) << factory_error;
+
+    const ContextKey lora_context{.tenant_id = "default",
+                                  .model_name = "model",
+                                  .lora_name = "adapter-a",
+                                  .block_size = 4};
+    const std::vector<int32_t> tokens{1, 2, 3, 4};
+    std::string chain_error;
+    EXPECT_EQ(
+        strategy->CreateChain(lora_context, tokens, std::nullopt, &chain_error),
+        nullptr);
+    EXPECT_NE(chain_error.find("lora_path"), std::string::npos) << chain_error;
+
+    std::vector<HashBlock> blocks{HashBlock{}};
+    EXPECT_NE(strategy->Compute(lora_context, tokens, std::nullopt, &blocks)
+                  .find("lora_path"),
+              std::string::npos);
+    EXPECT_TRUE(blocks.empty());
+
+    EXPECT_NE(
+        ValidateHashProfileForContext(profile, lora_context).find("lora_path"),
+        std::string::npos);
+    EXPECT_TRUE(
+        ValidateHashProfileForContext(ValidPickleProfile(), lora_context)
+            .empty());
 }
 
 TEST(HashStrategyGolden, PickleMultiBlockChainDoesNotReuseLow64AsParent) {

@@ -14,6 +14,7 @@
 #include "conductor/prefixindex/hash_strategy.h"
 #include "conductor/prefixindex/prefix_indexer.h"
 #include "prefix_indexer_test_peer.h"
+#include "test_fixtures.h"
 
 namespace {
 
@@ -332,6 +333,94 @@ TEST(Registration, ForgedSeedRootPairIsRejectedWithoutMutation) {
     EXPECT_NE(conflicting.error.find("does not match"), std::string::npos);
     EXPECT_FALSE(conflicting.inserted);
     EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), registered);
+}
+
+HashProfile TaggedPickleProfile(std::string seed = "0") {
+    HashProfile profile;
+    const std::string error =
+        mooncake::conductor::prefixindex::ResolveHashProfile(
+            {.strategy = "vllm_v1_tagged",
+             .algorithm = "sha256",
+             .python_hash_seed = std::move(seed),
+             .index_projection = "low64_be"},
+            &profile);
+    EXPECT_TRUE(error.empty()) << error;
+    return profile;
+}
+
+// Issue #5903: a vLLM >= v0.31 publisher indexes block hashes computed over
+// tagged extra keys.  A vllm_v1_tagged context must recompute the same chain
+// at query time, so salted queries match the full prefix.
+TEST(Registration, TaggedProfileMatchesVllmSaltedBlockHashes) {
+    PrefixCacheTable table;
+    EngineRegistration registration = Registration();
+    registration.context = TestContext(4);
+    registration.effective_block_size = 4;
+    registration.profile = TaggedPickleProfile();
+    RegisterOrFail(table, registration);
+
+    // The block hashes vLLM's own hash_block_tokens publishes for this
+    // request, pinned in the tagged golden fixture (sha256, seed "0").
+    const Json::Value fixture = mooncake::conductor::test::LoadJsonFixture(
+        "hash_golden_vectors_vllm_tagged.json");
+    const Json::Value* salted = nullptr;
+    for (const auto& suite : fixture["suites"]) {
+        if (suite["profile"]["algorithm"].asString() != "sha256" ||
+            suite["profile"]["python_hash_seed"].asString() != "0") {
+            continue;
+        }
+        for (const auto& test_case : suite["cases"]) {
+            if (test_case["name"].asString() == "salt_first_block_only") {
+                salted = &test_case;
+            }
+        }
+    }
+    ASSERT_NE(salted, nullptr);
+    ASSERT_EQ((*salted)["cache_salt"].asString(), "tenant-salt");
+    std::vector<ProjectedPrefix> published;
+    for (const auto& block : (*salted)["expected"]) {
+        published.push_back(ProjectedPrefix{
+            mooncake::conductor::test::ParseU64(block["projected_decimal"])});
+    }
+    ASSERT_EQ(published.size(), 2u);
+
+    EngineMutation mutation = Device(published);
+    mutation.context = registration.context;
+    mutation.effective_block_size = 4;
+    ASSERT_EQ(table.StoreEngine(mutation), "");
+
+    const std::vector<int32_t> tokens{1, 2, 3, 4, 5, 6, 7, 8};
+    const auto salted_hits =
+        table.Query(registration.context, tokens, std::string("tenant-salt"));
+    ASSERT_TRUE(salted_hits.contains("instance-a"));
+    EXPECT_EQ(salted_hits.at("instance-a").longest_match_tokens, 8);
+
+    // A different salt must not reuse the tenant's cache.
+    const auto other_salt =
+        table.Query(registration.context, tokens, std::string("other-salt"));
+    if (other_salt.contains("instance-a")) {
+        EXPECT_EQ(other_salt.at("instance-a").longest_match_tokens, 0);
+    }
+}
+
+TEST(Registration, TaggedProfileWithLoraIsRejectedWithoutMutation) {
+    PrefixCacheTable table;
+    EngineRegistration registration = Registration();
+    registration.context.lora_name = "adapter-a";
+    registration.profile = TaggedPickleProfile();
+
+    const auto validation =
+        PrefixCacheTable::ValidateRegistration(registration);
+    EXPECT_NE(validation.error.find("lora_path"), std::string::npos)
+        << validation.error;
+    const auto rejected = table.Register(registration);
+    EXPECT_NE(rejected.error.find("lora_path"), std::string::npos);
+    EXPECT_FALSE(rejected.inserted);
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table).contexts.empty());
+
+    // Without LoRA the same tagged profile registers.
+    registration.context.lora_name.clear();
+    RegisterOrFail(table, registration);
 }
 
 TEST(Registration, SglangSeedVariantsShareContextAndBinding) {

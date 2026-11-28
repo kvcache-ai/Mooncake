@@ -249,8 +249,9 @@ counts are cumulative, so `device <= cpu_local <= cpu_share <= disk`; do not add
 them together. Instance-level counts are the maximum across ranks. Unlike the
 Python and HTTP representations, Rust map keys remain integer DP ranks.
 
-Block coverage follows the registered hash strategy: `vllm_v1` considers complete
-blocks, while `sglang` and `sglang_bigram` also consider a final partial block.
+Block coverage follows the registered hash strategy: `vllm_v1` and
+`vllm_v1_tagged` consider complete blocks, while `sglang` and `sglang_bigram`
+also consider a final partial block.
 For `sglang_bigram`, a query with `n` tokens can match at most
 `max(n - 1, 0)` logical KV positions.
 
@@ -287,7 +288,8 @@ public fields before registration when needed:
 
 | Strategy | Algorithm | Index projection | Python hash seed |
 |---|---|---|---|
-| `vllm_v1` | `sha256` or `sha256_cbor` | `low64_be` | The publisher's decimal seed in `0..=4294967295`, or `"random"`. |
+| `vllm_v1` | `sha256` or `sha256_cbor` | `low64_be` | The publisher's decimal seed in `0..=4294967295`, `"random"`, or `"vllm-none-hash"`. |
+| `vllm_v1_tagged` | `sha256` or `sha256_cbor` | `low64_be` | Same as `vllm_v1`. Use for vLLM v0.31 and later; no LoRA. |
 | `sglang`, `sglang_bigram` | `sha256_raw` | `first64_be` | Unused; an empty string is accepted. |
 
 The profile must reproduce the publisher's block hashes. All services in one

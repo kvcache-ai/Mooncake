@@ -60,7 +60,13 @@ std::string ValidateServiceConfig(const common::ServiceConfig& service) {
             .error;
     }
     if (service.publisher_kind == common::PublisherKind::kMooncake) {
-        return prefixindex::ValidateHashProfile(ProfileFromService(service));
+        if (auto error =
+                prefixindex::ValidateHashProfile(ProfileFromService(service));
+            !error.empty()) {
+            return error;
+        }
+        return prefixindex::ValidateHashProfileForContext(
+            ProfileFromService(service), ContextFromService(service));
     }
     return "unsupported publisher kind";
 }

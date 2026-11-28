@@ -150,7 +150,7 @@ query(
 
 Queries continuous prefix-cache matches for a prompt. All arguments after
 `model_name` are keyword-only. Block handling follows the registered hash
-strategy: `vllm_v1` considers complete blocks, while `sglang` and
+strategy: `vllm_v1` and `vllm_v1_tagged` consider complete blocks, while `sglang` and
 `sglang_bigram` also consider a final partial block. For `sglang_bigram`,
 counts measure logical KV positions from adjacent token pairs, so a query with
 `n` tokens can match at most `max(n - 1, 0)` positions.
@@ -230,7 +230,8 @@ combinations are:
 
 | `strategy` | `algorithm` | `index_projection` | `python_hash_seed` |
 |------------|-------------|--------------------|--------------------|
-| `vllm_v1` | `sha256` or `sha256_cbor` | `low64_be` | Publisher's seed as decimal text in `0..4294967295`, or `"random"`. |
+| `vllm_v1` | `sha256` or `sha256_cbor` | `low64_be` | Publisher's seed as decimal text in `0..4294967295`, `"random"`, or `"vllm-none-hash"`. |
+| `vllm_v1_tagged` | `sha256` or `sha256_cbor` | `low64_be` | Same as `vllm_v1`. Use for vLLM v0.31 and later; no LoRA. |
 | `sglang` or `sglang_bigram` | `sha256_raw` | `first64_be` | Optional; normalized to `"0"`. |
 
 The recipe must match the publisher. Conductor derives `root_digest` on the

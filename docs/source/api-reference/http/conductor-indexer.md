@@ -60,10 +60,21 @@ publisher's hashing:
 
 | `strategy` | `algorithm` | `index_projection` | `python_hash_seed` |
 |---|---|---|---|
-| `vllm_v1` | `sha256` or `sha256_cbor` | `low64_be` | Required. The publisher's `PYTHONHASHSEED` as decimal text in `0..4294967295`, or `"random"`. |
+| `vllm_v1` | `sha256` or `sha256_cbor` | `low64_be` | Required. The publisher's `PYTHONHASHSEED` as decimal text in `0..4294967295`, `"random"`, or `"vllm-none-hash"` when `PYTHONHASHSEED` is unset. |
+| `vllm_v1_tagged` | `sha256` or `sha256_cbor` | `low64_be` | Same as `vllm_v1`. |
 | `sglang` or `sglang_bigram` | `sha256_raw` | `first64_be` | Optional and ignored. |
 
-`vllm_v1` hashes complete blocks only. `sglang` also hashes the final partial
+`vllm_v1` and `vllm_v1_tagged` hash complete blocks only. They differ in how
+the cache salt and LoRA name enter the block hash. `vllm_v1` matches vLLM
+before v0.31, which hashes the bare strings. `vllm_v1_tagged` matches vLLM
+v0.31 and later, which hashes tagged tuples such as `("cache_salt", salt)`.
+vLLM v0.31 and later also folds the LoRA adapter path into every block hash,
+which Conductor cannot reproduce, so `vllm_v1_tagged` rejects registrations
+with a non-empty `lora_name`. vLLM v0.29 and later uses the seed
+`"vllm-none-hash"` for `sha256` and `sha256_cbor` when `PYTHONHASHSEED` is
+unset.
+
+`sglang` also hashes the final partial
 block. `sglang_bigram` hashes adjacent token pairs, so a query with `n` tokens
 can match at most `n - 1` positions. The server derives `root_digest` from the
 profile; it appears in read responses but is not accepted as input.
@@ -336,7 +347,7 @@ The master never parses object keys. It forwards the raw Store key as
 `token_ids`, and `base_block_idx`. Conductor derives the block identity from
 the key itself, using the convention selected by the registered hash profile:
 
-- `vllm_v1`: the hex block hash in a vLLM or vLLM-Ascend Mooncake connector key
+- `vllm_v1` / `vllm_v1_tagged`: the hex block hash in a vLLM or vLLM-Ascend Mooncake connector key
   (fields separated by `@`), or `connector_block_hash` when present, projected to
   its low 64 bits;
 - `sglang` / `sglang_bigram`: the 64-hex-character hash in an SGLang HiCache key,
