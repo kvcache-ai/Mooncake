@@ -2135,6 +2135,95 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
     return {};
 }
 
+tl::expected<BucketStorageBackend::AcquiredReadSources, ErrorCode>
+BucketStorageBackend::AcquireReadSources(
+    const std::vector<ReadSourceRequest>& requests,
+    const std::function<bool(size_t)>& reserve_credits) {
+    AcquiredReadSources result;
+    if (requests.empty()) return result;
+
+    struct PendingBucket {
+        int64_t bucket_id;
+        int disk_index;
+        uint64_t min_file_bytes;
+        std::shared_ptr<BucketReadGuard> guard;
+    };
+    std::vector<PendingBucket> pending_buckets;
+    std::unordered_map<int64_t, size_t> bucket_to_source;
+    result.locations.reserve(requests.size());
+    {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        const bool update_lru =
+            bucket_backend_config_.eviction_policy == BucketEvictionPolicy::LRU;
+        const int64_t now_ns =
+            update_lru
+                ? std::chrono::steady_clock::now().time_since_epoch().count()
+                : 0;
+        for (const auto& req : requests) {
+            auto object = object_bucket_map_.find(std::string(req.key));
+            if (!object) return tl::make_unexpected(ErrorCode::INVALID_KEY);
+            const auto& metadata = *object;
+            if (metadata.data_size < 0 || metadata.offset < 0 ||
+                metadata.key_size < 0 ||
+                uint64_t(metadata.data_size) != req.expected_size ||
+                metadata.offset >
+                    std::numeric_limits<int64_t>::max() - metadata.key_size) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            const uint64_t value_file_offset =
+                uint64_t(metadata.offset) + uint64_t(metadata.key_size);
+            if (req.expected_size >
+                uint64_t(std::numeric_limits<int64_t>::max()) -
+                    value_file_offset) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            const uint64_t end_offset = value_file_offset + req.expected_size;
+            auto [it, inserted] = bucket_to_source.emplace(
+                metadata.bucket_id, pending_buckets.size());
+            if (inserted) {
+                auto bucket = buckets_.find(metadata.bucket_id);
+                if (bucket == buckets_.end()) {
+                    return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+                }
+                if (update_lru) {
+                    bucket->second->last_access_ns_.store(
+                        now_ns, std::memory_order_relaxed);
+                }
+                pending_buckets.push_back(
+                    {metadata.bucket_id, bucket->second->disk_index, end_offset,
+                     std::make_shared<BucketReadGuard>(bucket->second)});
+            } else {
+                auto& pending = pending_buckets[it->second];
+                pending.min_file_bytes =
+                    std::max(pending.min_file_bytes, end_offset);
+            }
+            result.locations.push_back(
+                {it->second, req.expected_size, value_file_offset});
+        }
+    }
+
+    if (reserve_credits && !reserve_credits(pending_buckets.size())) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    result.sources.reserve(pending_buckets.size());
+    for (auto& pending : pending_buckets) {
+        auto path = GetBucketDataPath(pending.bucket_id, pending.disk_index);
+        if (!path) return tl::make_unexpected(path.error());
+        auto opened = ssd_offload::OpenPosixReadSource(
+            *path, pending.min_file_bytes, std::move(pending.guard));
+        if (opened.error != ssd_offload::Error::kOk) {
+            if (opened.error == ssd_offload::Error::kIoError &&
+                opened.sys_errno != 0) {
+                NotifyDiskError(opened.sys_errno, "open");
+            }
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        result.sources.push_back(std::move(opened.source));
+    }
+    return result;
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::GetBucketKeys(
     int64_t bucket_id, std::vector<std::string>& bucket_keys) {
     SharedMutexLocker locker(&mutex_, shared_lock);
@@ -3454,6 +3543,13 @@ BucketStorageBackend::SelectEvictionCandidate(int disk_index) {
                     ++pos;
                     continue;
                 }
+                if (bucket_it->second->inflight_reads_.load(
+                        std::memory_order_acquire) > 0) {
+                    VLOG(1) << "SelectEvictionCandidate: skipping read-pinned "
+                            << "bucket_id=" << bucket_it->first;
+                    ++pos;
+                    continue;
+                }
                 return bucket_it;
             }
             return buckets_.end();
@@ -3489,6 +3585,13 @@ BucketStorageBackend::SelectEvictionCandidate(int disk_index) {
                 if (bucket_it->second->scan_pins_.load(
                         std::memory_order_relaxed) > 0) {
                     VLOG(1) << "SelectEvictionCandidate: skipping scan-pinned "
+                            << "bucket_id=" << id;
+                    ++it;
+                    continue;
+                }
+                if (bucket_it->second->inflight_reads_.load(
+                        std::memory_order_acquire) > 0) {
+                    VLOG(1) << "SelectEvictionCandidate: skipping read-pinned "
                             << "bucket_id=" << id;
                     ++it;
                     continue;

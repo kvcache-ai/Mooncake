@@ -73,6 +73,15 @@ struct FileStorageEnvironment {
         "MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO"};
     ScopedEnvVar use_uring{"MOONCAKE_OFFLOAD_USE_URING"};
     ScopedEnvVar legacy_use_uring{"MOONCAKE_USE_URING"};
+    ScopedEnvVar local_streaming_read{"MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ"};
+    ScopedEnvVar ssd_push{"MOONCAKE_OFFLOAD_SSD_PUSH"};
+    ScopedEnvVar stream_use_uring{"MOONCAKE_OFFLOAD_STREAM_USE_URING"};
+    ScopedEnvVar stream_slot_bytes{"MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES"};
+    ScopedEnvVar stream_slots{"MOONCAKE_OFFLOAD_STREAM_SLOTS"};
+    ScopedEnvVar stream_read_threads{"MOONCAKE_OFFLOAD_STREAM_READ_THREADS"};
+    ScopedEnvVar stream_write_threads{"MOONCAKE_OFFLOAD_STREAM_WRITE_THREADS"};
+    ScopedEnvVar stream_max_outstanding{
+        "MOONCAKE_OFFLOAD_STREAM_MAX_OUTSTANDING"};
 };
 
 void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
@@ -91,6 +100,14 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_TRUE(config.enable_disk_watermark_eviction);
     EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
     EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.80);
+    EXPECT_FALSE(config.streaming_read.enabled);
+    EXPECT_FALSE(config.streaming_read.push_enabled);
+    EXPECT_FALSE(config.streaming_read.use_uring);
+    EXPECT_EQ(config.streaming_read.slot_bytes, 1024u * 1024u);
+    EXPECT_EQ(config.streaming_read.slots, 4u);
+    EXPECT_EQ(config.streaming_read.read_workers, 4u);
+    EXPECT_EQ(config.streaming_read.write_workers, 2u);
+    EXPECT_EQ(config.streaming_read.max_outstanding, 64u);
 }
 
 class FileStorageConfigTest : public ::testing::Test {
@@ -370,6 +387,109 @@ TEST_F(FileStorageConfigTest, ValidateFailsOnInvalidLimits) {
     config.disk_eviction_low_watermark_ratio = 0.8;
     config.disk_eviction_high_watermark_ratio = 1.1;
     EXPECT_FALSE(config.Validate());
+}
+
+TEST_F(FileStorageConfigTest, StreamingReadEnvAndValidation) {
+    env.storage_path.Set(data_path.c_str());
+    env.local_buffer_size.Set("16777216");
+    env.local_streaming_read.Set("true");
+    env.stream_use_uring.Set("true");
+    env.stream_slot_bytes.Set("1048576");
+    env.stream_slots.Set("4");
+    env.stream_read_threads.Set("2");
+    env.stream_write_threads.Set("3");
+    env.stream_max_outstanding.Set("16");
+
+    auto config = FileStorageConfig::FromEnvironment();
+    EXPECT_TRUE(config.streaming_read.enabled);
+    EXPECT_TRUE(config.streaming_read.use_uring);
+    EXPECT_EQ(config.streaming_read.slot_bytes, 1048576u);
+    EXPECT_EQ(config.streaming_read.slots, 4u);
+    EXPECT_EQ(config.streaming_read.read_workers, 2u);
+    EXPECT_EQ(config.streaming_read.write_workers, 3u);
+    EXPECT_EQ(config.streaming_read.max_outstanding, 16u);
+    EXPECT_TRUE(config.Validate());
+
+    config.streaming_read.slots = 32;  // 32 * 1 MiB > 16 MiB arena
+    EXPECT_FALSE(config.Validate());
+
+    config.streaming_read.slots = 4;
+    config.streaming_read.max_outstanding = 4;
+    config.streaming_read.read_workers = 8;  // read_workers > max_outstanding
+    EXPECT_FALSE(config.Validate());
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    EXPECT_TRUE(config.Validate());  // non-bucket ignores streaming limits
+    config.storage_backend_type = StorageBackendType::kBucket;
+    config.streaming_read.read_workers = 2;
+    config.streaming_read.max_outstanding = 16;
+
+    // Minimal single-slot / single-reader configuration must validate without
+    // overriding the unused default write_workers value.
+    {
+        FileStorageConfig minimal;
+        minimal.storage_filepath = data_path;
+        minimal.local_buffer_size = 16 * 1024 * 1024;
+        minimal.streaming_read.enabled = true;
+        minimal.streaming_read.slots = 1;
+        minimal.streaming_read.read_workers = 1;
+        minimal.streaming_read.max_outstanding = 1;
+        EXPECT_EQ(minimal.streaming_read.write_workers, 2u);
+        EXPECT_TRUE(minimal.Validate());
+
+        // Standalone owner-push (enabled=false, push_enabled=true) must still
+        // run StreamingReadConfig::Validate() from FileStorageConfig::Validate.
+        minimal.streaming_read.enabled = false;
+        minimal.streaming_read.push_enabled = true;
+        minimal.streaming_read.slots = 1;
+        minimal.streaming_read.max_outstanding = 2;
+        minimal.streaming_read.write_workers = 3;
+        EXPECT_FALSE(minimal.Validate());
+        minimal.streaming_read.write_workers = 2;
+        minimal.streaming_read.max_outstanding = 1;  // < 2 * slots
+        EXPECT_FALSE(minimal.Validate());
+        minimal.streaming_read.max_outstanding = 2;
+        EXPECT_TRUE(minimal.Validate());
+        EXPECT_EQ(minimal.streaming_read.ProtocolLimits().max_objects, 2u);
+        minimal.streaming_read.max_outstanding = 1024;
+        EXPECT_EQ(minimal.streaming_read.ProtocolLimits().max_objects,
+                  ssd_offload::StreamingReadConfig::kPushMaxBatchObjects);
+    }
+
+    // MOONCAKE_OFFLOAD_SSD_PUSH=true alone raises DefaultMaxOutstanding to 512.
+    {
+        FileStorageEnvironment push_env;
+        push_env.storage_path.Set(data_path.c_str());
+        push_env.ssd_push.Set("true");
+        const auto push_cfg = FileStorageConfig::FromEnvironment();
+        EXPECT_FALSE(push_cfg.streaming_read.enabled);
+        EXPECT_TRUE(push_cfg.streaming_read.push_enabled);
+        EXPECT_EQ(push_cfg.streaming_read.max_outstanding,
+                  ssd_offload::StreamingReadConfig::kPushMaxBatchObjects);
+        EXPECT_EQ(push_cfg.streaming_read.ProtocolLimits().max_objects,
+                  ssd_offload::StreamingReadConfig::kPushMaxBatchObjects);
+        EXPECT_TRUE(push_cfg.Validate());
+    }
+
+    // OffsetAllocator rounds non-exact bin sizes up (1150976 -> 1179648) and
+    // our config helper stays in lockstep with OffsetAllocator itself.
+    config.streaming_read.slots = 4;
+    config.streaming_read.slot_bytes = 1150976;  // 1 MiB + 100 KiB
+    config.local_buffer_size = 4 * 1150976;
+    EXPECT_FALSE(config.Validate());
+    config.local_buffer_size = 4 * 1179648;
+    EXPECT_TRUE(config.Validate());
+
+    for (uint64_t arena : {4ULL * 1024 * 1024, 8ULL * 1024 * 1024 * 1024}) {
+        auto allocator =
+            mooncake::offset_allocator::OffsetAllocator::create(0, arena);
+        for (size_t slot : {size_t{4096}, size_t{1048576}, size_t{1150976},
+                            size_t{2097151}, size_t{64ULL * 1024 * 1024}}) {
+            const auto [normalized, _] =
+                ssd_offload::OffsetAllocatorSlotBudget(slot, arena);
+            EXPECT_EQ(normalized, allocator->normalizedAllocationSize(slot))
+                << "arena=" << arena << " slot=" << slot;
+        }
+    }
 }
 
 }  // namespace

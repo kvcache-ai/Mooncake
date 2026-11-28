@@ -609,12 +609,26 @@ bool MultiTransport::supportsParallelBatchSubmit(Transport::SegmentID peer) {
 
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
-    return submitTransfer(batch_id, entries, nullptr);
+    return submitTransferImpl(batch_id, entries, nullptr,
+                              /*require_receiver_visible=*/false);
+}
+
+Status MultiTransport::submitReceiverVisibleWrite(
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    return submitTransferImpl(batch_id, entries, nullptr,
+                              /*require_receiver_visible=*/true);
 }
 
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     std::vector<size_t>* task_sizes) {
+    return submitTransferImpl(batch_id, entries, task_sizes,
+                              /*require_receiver_visible=*/false);
+}
+
+Status MultiTransport::submitTransferImpl(
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    std::vector<size_t>* task_sizes, bool require_receiver_visible) {
     if (!Transport::isValidBatchID(batch_id)) {
         return Status::InvalidArgument("Invalid batch ID");
     }
@@ -643,6 +657,51 @@ Status MultiTransport::submitTransfer(
     if (!select_status.ok()) return select_status;
 
     if (entries.empty()) return Status::OK();
+
+    if (require_receiver_visible) {
+        for (const auto& entry : entries) {
+            if (entry.opcode != TransferRequest::WRITE) {
+                return Status::InvalidArgument(
+                    "receiver-visible submission requires WRITE entries");
+            }
+        }
+        bool single_transport = true;
+        Transport* first_transport = transports[0];
+        for (size_t i = 1; i < transports.size(); ++i) {
+            if (transports[i] != first_transport) {
+                single_transport = false;
+                break;
+            }
+        }
+        if (single_transport) {
+            auto status =
+                first_transport->validateReceiverVisibleWrites(entries);
+            if (!status.ok()) return status;
+        } else {
+            // Validate each routed transport in first-seen order before
+            // mutating batch_desc so mixed batches fail closed atomically.
+            std::vector<std::pair<Transport*, std::vector<TransferRequest>>>
+                grouped;
+            for (size_t i = 0; i < entries.size(); ++i) {
+                auto it = std::find_if(grouped.begin(), grouped.end(),
+                                       [&](const auto& item) {
+                                           return item.first == transports[i];
+                                       });
+                if (it == grouped.end()) {
+                    grouped.emplace_back(
+                        transports[i],
+                        std::vector<TransferRequest>{entries[i]});
+                } else {
+                    it->second.push_back(entries[i]);
+                }
+            }
+            for (const auto& [transport, group_entries] : grouped) {
+                auto status =
+                    transport->validateReceiverVisibleWrites(group_entries);
+                if (!status.ok()) return status;
+            }
+        }
+    }
     auto& task_list = batch_desc.task_list;
     const bool all_counter = std::all_of(
         transports.begin(), transports.end(),
@@ -702,7 +761,10 @@ Status MultiTransport::submitTransfer(
     }
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
-        auto status = entry.first->submitTransferTask(entry.second);
+        auto status =
+            require_receiver_visible
+                ? entry.first->submitReceiverVisibleWriteTasks(entry.second)
+                : entry.first->submitTransferTask(entry.second);
         for (auto* task : entry.second) {
             if ((__atomic_load_n(&task->completion_state, __ATOMIC_RELAXED) &
                  Transport::Slice::kCompletionSealBit) == 0)

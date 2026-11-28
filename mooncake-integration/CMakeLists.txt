@@ -325,6 +325,28 @@ endif()
 if(WITH_STORE)
   install(TARGETS store LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
                                 COMPONENT python)
+  if(BUILD_UNIT_TESTS)
+    set(ssd_test_library_path
+        "$<TARGET_FILE_DIR:asio_shared>:$<TARGET_FILE_DIR:transfer_engine>")
+    if(TARGET build_etcd_wrapper)
+      string(APPEND ssd_test_library_path
+             ":${PROJECT_BINARY_DIR}/mooncake-common/etcd")
+    endif()
+    set(ssd_test_use_uring "false")
+    if(TARGET Mooncake::liburing)
+      set(ssd_test_use_uring "true")
+    endif()
+    add_test(
+      NAME ssd_fixed_l2_python_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env PYTHONPATH=$<TARGET_FILE_DIR:store>
+        LD_LIBRARY_PATH=${ssd_test_library_path}:$ENV{LD_LIBRARY_PATH}
+        MOONCAKE_TEST_MASTER=$<TARGET_FILE:mooncake_master>
+        MOONCAKE_TEST_SSD_USE_URING=${ssd_test_use_uring}
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ssd_fixed_l2_direct.py)
+    set_tests_properties(ssd_fixed_l2_python_test PROPERTIES TIMEOUT 90)
+  endif()
 endif()
 
 if(WITH_TE OR WITH_CONDUCTOR)

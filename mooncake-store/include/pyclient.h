@@ -366,6 +366,12 @@ class PyClient {
     virtual int register_buffer(void *buffer, size_t size) = 0;
 
     virtual int unregister_buffer(void *buffer) = 0;
+    virtual std::string get_ssd_push_peer_info() const { return "{}"; }
+    virtual std::string get_ssd_push_stats() const { return "{}"; }
+    virtual int configure_ssd_push_peers(const std::vector<std::string> &) {
+        return -1;
+    }
+    virtual int recover_ssd_push() { return -1; }
 
     virtual int64_t get_into(const std::string &key, void *buffer,
                              size_t size) = 0;
@@ -423,14 +429,14 @@ class PyClient {
 
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,
-        const std::vector<void *> &buffers,
-        const std::vector<size_t> &sizes) = 0;
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        int64_t timeout_ms = 0) = 0;
 
     virtual std::vector<int> batch_get_into_multi_buffers(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_alloc_in_same_node) = 0;
+        bool prefer_alloc_in_same_node, int64_t timeout_ms = 0) = 0;
 
     virtual int put_from(const std::string &key, void *buffer, size_t size,
                          const ReplicateConfig &config = ReplicateConfig{}) = 0;

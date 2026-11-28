@@ -13,6 +13,13 @@
 #include "common/read_singleflight.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
+#include "ssd_owner_callbacks.h"
+#include "ssd_pipeline_io.h"
+#include "ssd_read_protocol.h"
+#if defined(__linux__) && defined(USE_URING)
+#include "ssd_uring_pipeline.h"
+#endif
+#include <shared_mutex>
 #include "pinned_buffer_pool.h"
 
 namespace mooncake {
@@ -67,6 +74,34 @@ class FileStorage {
         uint64_t batch_id;
         std::vector<uint64_t> pointers;
     };
+
+    struct LocalReadRequest {
+        std::string storage_key;
+        // Size of the complete persisted object, before range selection.
+        uint64_t expected_size{0};
+        uint64_t source_offset{0};
+        std::vector<Slice> destinations;
+    };
+    bool SupportsLocalStreamingRead() const;
+    // Destinations are writable CPU memory, held exclusively through return.
+    // Their sizes select a continuous source range in destination order.
+    // Destinations across the whole batch must not overlap. An I/O error can
+    // partially modify them; publish only after whole-batch success. Every
+    // return drains accepted I/O before releasing staging or source leases.
+    tl::expected<void, ErrorCode> ReadLocalStreaming(
+        const std::vector<LocalReadRequest>& requests);
+
+    bool SupportsOwnerStreamingRead() const;
+    // Trusted owner worker only, after requester grant resolution. The target
+    // maps zero-based flat destination ordinals (object/range/destination
+    // order) to authoritative resolved views; planner offsets are relative to a
+    // view. Keep FileStorage alive through return. Preflight errors accept no
+    // writes. A result with dma_drained=false must leave the owner ledger
+    // quarantined.
+    tl::expected<ssd_offload::SsdReadResultV1, ErrorCode> ReadOwnerStreaming(
+        const ssd_offload::SsdReadRequestV1& request,
+        std::shared_ptr<ssd_offload::SourceDrainedWriteTarget> target,
+        std::chrono::steady_clock::time_point deadline);
 
     struct LocalBatchResult {
         std::vector<uint64_t> pointers;
@@ -204,7 +239,9 @@ class FileStorage {
         const std::vector<int64_t>& sizes);
     tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadBatchShared(
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
-        bool prefer_pinned, std::string flight_key);
+        bool prefer_pinned, std::string flight_key,
+        std::optional<std::chrono::steady_clock::time_point> deadline =
+            std::nullopt);
     static tl::expected<std::vector<uint64_t>, ErrorCode>
     StagingPointersInOrder(const AllocatedBatch& batch,
                            const std::vector<std::string>& keys,
@@ -414,6 +451,27 @@ class FileStorage {
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
+    // Lazily initializes streaming executors while caller holds
+    // streaming_mutex_ (shared); serialized internally by
+    // streaming_init_mutex_.
+    ssd_offload::BoundedExecutor* GetOrCreateStreamingReadsLocked();
+    ssd_offload::BoundedExecutor* GetOrCreateStreamingWritesLocked();
+#if defined(__linux__) && defined(USE_URING)
+    std::shared_ptr<ssd_offload::UringReadExecutor>
+    GetOrCreateStreamingUringReadsLocked();
+#endif
+
+    mutable std::shared_mutex streaming_mutex_;
+    mutable std::mutex streaming_init_mutex_;
+    bool streaming_bucket_ready_{false};
+    bool streaming_stopped_{false};
+#if defined(__linux__) && defined(USE_URING)
+    bool streaming_uring_init_attempted_{false};
+    std::shared_ptr<ssd_offload::UringReadExecutor> streaming_uring_reads_;
+#endif
+    std::unique_ptr<ssd_offload::BoundedExecutor> streaming_reads_;
+    std::unique_ptr<ssd_offload::BoundedExecutor> streaming_writes_;
+    std::atomic<size_t> active_streaming_sources_{0};
     // Whether client_buffer_allocator_'s buffer is the io_uring fixed buffer,
     // which the destructor must unregister before the buffer is freed.
     bool uring_buffer_registered_ = false;
@@ -436,6 +494,8 @@ class FileStorage {
     ClientBufferShard& ShardFor(uint64_t batch_id) {
         return client_buffer_shards_[batch_id % kClientBufferShards];
     }
+
+    void ReapExpiredClientBuffers();
 
     std::atomic<uint64_t> next_batch_id_{1};
 

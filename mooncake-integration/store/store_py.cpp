@@ -2893,14 +2893,35 @@ NB_MODULE(_store, m) {
         .def(
             "close",
             [](MooncakeStorePyWrapper &self) {
-                int rc = self.store_ ? self.store_->tearDownAll() : 0;
-                self.store_.reset();
-                self.real_client_.reset();
-                self.use_dummy_client_ = false;
+                auto store = self.store_;
+                int rc = 0;
+                if (store) {
+                    py::gil_scoped_release release;
+                    rc = store->tearDownAll();
+                }
+                // Keep the native client only on retryable OBJECT_HAS_LEASE
+                // (e.g. un-drained SSD push writes requiring recover_ssd_push
+                // before retrying close). All other outcomes release handles
+                // only if this close still owns the active store instance, and
+                // drop the shared_ptrs with the GIL released.
+                if (rc != to_py_ret(ErrorCode::OBJECT_HAS_LEASE) &&
+                    self.store_ == store) {
+                    auto drop_store = std::move(self.store_);
+                    auto drop_real = std::move(self.real_client_);
+                    self.use_dummy_client_ = false;
+                    py::gil_scoped_release release;
+                    store.reset();
+                    drop_store.reset();
+                    drop_real.reset();
+                } else if (store) {
+                    py::gil_scoped_release release;
+                    store.reset();
+                }
                 return rc;
             },
-            "Close the store and clear the native client, including on "
-            "cleanup failure. A nonzero result is terminal, not retryable.")
+            "Close the store and clear the native client. Retains the client "
+            "only when OBJECT_HAS_LEASE is returned so the caller can run "
+            "recover_ssd_push() / unregister_buffer() and retry close().")
         .def("health_check", &MooncakeStorePyWrapper::health_check,
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "
@@ -3222,6 +3243,46 @@ NB_MODULE(_store, m) {
             "wait for in-flight RDMA/NoF operations, and freeing or remapping "
             "the buffer while a transfer is active is unsafe")
         .def(
+            "get_ssd_push_peer_info",
+            [](MooncakeStorePyWrapper &self) {
+                auto store = self.store_;
+                if (!store) return std::string("{}");
+                py::gil_scoped_release release;
+                return store->get_ssd_push_peer_info();
+            },
+            "Get trusted bootstrap document (contains shared HMAC secret) for "
+            "fixed-L2 TCP SSD owner-push")
+        .def(
+            "get_ssd_push_stats",
+            [](MooncakeStorePyWrapper &self) {
+                auto store = self.store_;
+                if (!store) return std::string("{}");
+                py::gil_scoped_release release;
+                return store->get_ssd_push_stats();
+            },
+            "Get non-secret operational stats JSON for fixed-L2 TCP SSD "
+            "owner-push")
+        .def(
+            "configure_ssd_push_peers",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &peers) {
+                auto store = self.store_;
+                if (!store) return -1;
+                py::gil_scoped_release release;
+                return store->configure_ssd_push_peers(peers);
+            },
+            py::arg("peers"),
+            "Configure trusted fixed-L2 SSD peers during setup or dynamically")
+        .def(
+            "recover_ssd_push",
+            [](MooncakeStorePyWrapper &self) {
+                auto store = self.store_;
+                if (!store) return -1;
+                py::gil_scoped_release release;
+                return store->recover_ssd_push();
+            },
+            "Recover uncertain SSD push reads without resubmitting them")
+        .def(
             "get_into",
             [](MooncakeStorePyWrapper &self, const std::string &key,
                uintptr_t buffer_ptr, size_t size) {
@@ -3316,16 +3377,23 @@ NB_MODULE(_store, m) {
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
                const std::vector<uintptr_t> &buffer_ptrs,
-               const std::vector<size_t> &sizes) {
+               const std::vector<size_t> &sizes, int64_t timeout_ms) {
+                auto store = self.store_;
+                if (!store) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int64_t>(
+                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                }
                 std::vector<void *> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
                     buffers.push_back(reinterpret_cast<void *>(ptr));
                 }
                 py::gil_scoped_release release;
-                return self.store_->batch_get_into(keys, buffers, sizes);
+                return store->batch_get_into(keys, buffers, sizes, timeout_ms);
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+            py::arg("timeout_ms") = 0,
             "Get object data directly into pre-allocated buffers for "
             "multiple "
             "keys")
@@ -3481,14 +3549,21 @@ NB_MODULE(_store, m) {
                const std::vector<std::string> &keys,
                const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
                const std::vector<std::vector<size_t>> &all_sizes,
-               bool prefer_alloc_in_same_node = false) {
+               bool prefer_alloc_in_same_node = false, int64_t timeout_ms = 0) {
+                auto store = self.store_;
+                if (!store) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>(
+                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                }
                 py::gil_scoped_release release;
-                return self.store_->batch_get_into_multi_buffers(
+                return store->batch_get_into_multi_buffers(
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
-                    prefer_alloc_in_same_node);
+                    prefer_alloc_in_same_node, timeout_ms);
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
             py::arg("prefer_alloc_in_same_node") = false,
+            py::arg("timeout_ms") = 0,
             "Get object data directly into multiple pre-allocated buffers for "
             "multiple "
             "keys")
