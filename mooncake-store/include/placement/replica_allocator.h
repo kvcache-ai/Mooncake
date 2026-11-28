@@ -41,6 +41,7 @@ struct PlacementConstraints final {
     std::string_view preferred_segment_name;
     std::span<const std::string> preferred_segment_names;
     std::span<const std::string> excluded_segment_names;
+    std::span<const std::string> preferred_hca_names;
 };
 
 struct HostAffinity final {

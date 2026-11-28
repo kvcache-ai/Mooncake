@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <limits>
@@ -499,7 +500,7 @@ YLT_REFL(SegmentLocality, numa_node, hca_names);
 
 // Match HCA names on the receiver; unknown locality precedes a known mismatch.
 inline int HcaAffinityTier(const SegmentLocality* locality,
-                           const std::vector<std::string>& hcas) {
+                           std::span<const std::string> hcas) {
     if (hcas.empty()) return 0;
     if (!locality || locality->numa_node < 0 || locality->hca_names.empty())
         return 1;
@@ -514,7 +515,7 @@ inline int HcaAffinityTier(const SegmentLocality* locality,
 }
 
 inline int HcaAffinityTier(const std::optional<SegmentLocality>& locality,
-                           const std::vector<std::string>& hcas) {
+                           std::span<const std::string> hcas) {
     return HcaAffinityTier(locality ? &*locality : nullptr, hcas);
 }
 // Placement identity is never a routable TE address. The fabric domain is

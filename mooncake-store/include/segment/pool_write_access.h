@@ -26,17 +26,21 @@ class SegmentPool::WriteAccess final {
 
     WriteAccess(AccessKey, SegmentPool& segment_pool);
 
-    ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
-    tl::expected<RegionMountTxn, ErrorCode> PrepareMount(const Segment& segment,
-                                                         const UUID& client_id);
+    ErrorCode MountSegment(const Segment& segment,
+                           ClientSessionSharedPtr owner_session);
+    tl::expected<RegionMountTxn, ErrorCode> PrepareMount(
+        const Segment& segment, ClientSessionSharedPtr owner_session);
     // Descriptors must use the canonical transport endpoint. The recovery
     // caller resolves segment-name aliases before entering the Pool.
     tl::expected<RegionMountTxn, ErrorCode> PrepareRestore(
-        const Segment& segment, const UUID& client_id,
+        const Segment& segment, ClientSessionSharedPtr owner_session,
         std::span<const AllocatedBuffer::Descriptor> descriptors);
     tl::expected<RegionMountTxn, ErrorCode> PrepareAdopt(
         MountedRegion mounted, std::shared_ptr<BufferAllocatorBase> allocator,
         bool account_capacity_metrics);
+    ErrorCode ValidateRemountSegment(const Segment& segment,
+                                     const UUID& client_id) const;
+    void BindClientSession(const ClientSessionSharedPtr& owner_session);
     void Clear() noexcept;
 
     tl::expected<RegionUnmountTxn, ErrorCode> PrepareUnmount(
@@ -58,7 +62,7 @@ class SegmentPool::WriteAccess final {
                                      SegmentStatus previous_status,
                                      uint64_t generation);
     tl::expected<RegionMountTxn, ErrorCode> PrepareWithLiveAllocations(
-        const Segment& segment, const UUID& client_id,
+        const Segment& segment, ClientSessionSharedPtr owner_session,
         const std::vector<LiveAllocation>& live_allocations,
         uint64_t imported_requested_bytes);
     ErrorCode EraseUnmountedRegion(const UUID& segment_id,

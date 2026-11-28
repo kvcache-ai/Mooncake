@@ -40,6 +40,9 @@ RegionUnmountTxn::RegionUnmountTxn(TransactionKey,
     const auto result =
         access.TransitionRegion(mounted, resource, SegmentStatus::UNMOUNTING);
     DCHECK(result == ErrorCode::OK);
+    // Invalidate existing buffers immediately so metadata cleanup sees stale
+    // handles even while the driver retains the resource for rollback.
+    resource.candidate->InvalidateLifetime();
     generation_ = mounted.generation;
 }
 
@@ -96,6 +99,7 @@ ErrorCode SegmentPool::WriteAccess::RestoreUnmountedRegion(
                    << ", driver_present=" << (driver != nullptr);
         return ErrorCode::INTERNAL_ERROR;
     }
+    resource->candidate->ResetLifetime(mounted->owner_session);
     return TransitionRegion(*mounted, *resource, previous_status);
 }
 
@@ -187,6 +191,28 @@ ErrorCode SegmentPool::WriteAccess::EraseUnmountedRegion(
         }
     }
     return ErrorCode::OK;
+}
+
+void SegmentPool::WriteAccess::BindClientSession(
+    const ClientSessionSharedPtr& owner_session) {
+    CHECK(owner_session);
+    const UUID client_id = owner_session->ClientId();
+    std::vector<UUID> region_ids;
+    for (const auto& mounted : catalog_.ClientRegions(client_id)) {
+        region_ids.push_back(mounted.segment.id);
+    }
+    for (const auto& id : region_ids) {
+        const auto* mounted = catalog_.Find(id);
+        if (!mounted || mounted->status == SegmentStatus::UNMOUNTING ||
+            mounted->owner_session == owner_session) {
+            continue;
+        }
+        if (auto* resource = segment_pool_.GetResource(*mounted)) {
+            resource->candidate->ResetLifetime(owner_session);
+        }
+        const bool updated = catalog_.SetOwnerSession(id, owner_session);
+        DCHECK(updated);
+    }
 }
 
 const RegionCatalog& SegmentPool::WriteAccess::Catalog() const {

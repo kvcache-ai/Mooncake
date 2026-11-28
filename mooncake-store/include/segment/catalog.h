@@ -25,12 +25,20 @@ class RegionCatalog final {
             return r.segment.name;
         }
     };
+    struct ClientId {
+        using result_type = const UUID&;
+        result_type operator()(const MountedRegion& r) const {
+            return r.client_id;
+        }
+    };
     using Records = boost::multi_index_container<
         MountedRegion,
         boost::multi_index::indexed_by<
             boost::multi_index::hashed_unique<SegmentId, boost::hash<UUID>>,
             boost::multi_index::hashed_non_unique<
-                SegmentName, TransparentStringHash, std::equal_to<>>>>;
+                SegmentName, TransparentStringHash, std::equal_to<>>,
+            boost::multi_index::hashed_non_unique<ClientId,
+                                                  boost::hash<UUID>>>>;
 
    public:
     // Borrowed records and ranges must not outlive the owner's Pool lock.
@@ -43,9 +51,17 @@ class RegionCatalog final {
                    return r.segment.id;
                });
     }
+    auto ClientRegions(const UUID& client_id) const {
+        auto [first, last] = records_.get<2>().equal_range(client_id);
+        return std::ranges::subrange(first, last, std::distance(first, last));
+    }
     ErrorCode Register(const MountedRegion& mounted);
     bool Erase(const UUID& segment_id);
     bool SetStatus(const UUID& segment_id, SegmentStatus status);
+    bool SetLocality(const UUID& segment_id,
+                     const std::optional<SegmentLocality>& locality);
+    bool SetOwnerSession(const UUID& segment_id,
+                         ClientSessionSharedPtr owner_session);
     void Clear();
     std::optional<UUID> FindOwnerClientId(std::string_view name) const;
 

@@ -10,6 +10,18 @@
 
 namespace mooncake {
 
+SegmentPool::SegmentPool(RegionDriverRegistry region_drivers)
+    : region_drivers_(std::move(region_drivers)) {
+    for (const auto& [kind, driver] : region_drivers_) {
+        (void)kind;
+        if (driver) {
+            if (auto shared = driver->GetSharedAllocator()) {
+                shared->AttachUsageTracker(usage_tracker_);
+            }
+        }
+    }
+}
+
 SegmentPool::~SegmentPool() { ReleaseCapacityMetrics(); }
 
 SegmentPool::WriteAccess SegmentPool::AcquireWriteAccess() {
@@ -36,20 +48,33 @@ StorageUsageSnapshot SegmentPool::GetMemoryUsageSnapshot() const {
     std::shared_lock lock(pool_mutex_);
     StorageUsageSnapshot snapshot;
     std::unordered_set<const BufferAllocatorBase*> counted;
+    auto add_allocator =
+        [&](const std::shared_ptr<BufferAllocatorBase>& allocator) {
+            if (!allocator || !counted.insert(allocator.get()).second) {
+                return;
+            }
+            const size_t used = allocator->size();
+            const size_t capacity = allocator->capacity();
+            snapshot.used_bytes += used;
+            snapshot.capacity_bytes += capacity;
+            const std::string segment_name = allocator->getSegmentName();
+            if (!segment_name.empty()) {
+                auto& region = snapshot.segments[segment_name];
+                region.used_bytes += used;
+                region.capacity_bytes += capacity;
+            }
+        };
+    for (const auto& [kind, driver] : region_drivers_) {
+        (void)kind;
+        if (driver) {
+            add_allocator(driver->GetSharedAllocator());
+        }
+    }
     for (const auto& mounted : catalog_.Regions()) {
         const auto* resource = GetResource(mounted);
-        if (!resource || !resource->allocator() ||
-            !counted.insert(resource->allocator().get()).second) {
-            continue;
+        if (resource) {
+            add_allocator(resource->allocator());
         }
-        const size_t used = resource->allocator()->size();
-        const size_t capacity = resource->allocator()->capacity();
-        snapshot.used_bytes += used;
-        snapshot.capacity_bytes += capacity;
-        auto& region =
-            snapshot.segments[resource->allocator()->getSegmentName()];
-        region.used_bytes += used;
-        region.capacity_bytes += capacity;
     }
     return snapshot;
 }
