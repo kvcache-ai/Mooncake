@@ -95,9 +95,11 @@ class RdmaTransportTestPeer {
 
 class WorkerPoolTestPeer {
    public:
-    static void processContextEvent(WorkerPool& worker_pool,
-                                    ibv_event_type event_type) {
-        worker_pool.processContextEventForTest(event_type);
+    static bool injectContextEvent(WorkerPool& worker_pool,
+                                   ibv_event_type event_type) {
+        int empty = -1;
+        return worker_pool.injected_context_event_.compare_exchange_strong(
+            empty, static_cast<int>(event_type), std::memory_order_relaxed);
     }
 };
 
@@ -106,9 +108,8 @@ class RdmaContextTestPeer {
     static bool injectContextEvent(RdmaContext* context,
                                    ibv_event_type event_type) {
         if (context && context->worker_pool_) {
-            WorkerPoolTestPeer::processContextEvent(*context->worker_pool_,
-                                                    event_type);
-            return true;
+            return WorkerPoolTestPeer::injectContextEvent(
+                *context->worker_pool_, event_type);
         }
         return false;
     }
@@ -659,6 +660,8 @@ TEST_F(RDMAEndpointReestablishTest,
         injected_down.store(true, std::memory_order_release);
 
         std::this_thread::sleep_for(std::chrono::seconds(7));
+        EXPECT_FALSE(RdmaTransportTestPeer::contextActive(
+            init_ctx.rdma_transport_, "mlx5_2"));
         inject_up_ok.store(
             RdmaTransportTestPeer::injectContextEvent(
                 init_ctx.rdma_transport_, "mlx5_2", IBV_EVENT_PORT_ACTIVE),
@@ -754,6 +757,8 @@ TEST_F(RDMAEndpointReestablishTest,
         injected_down.store(true, std::memory_order_release);
 
         std::this_thread::sleep_for(std::chrono::seconds(7));
+        EXPECT_FALSE(RdmaTransportTestPeer::contextActive(
+            target_ctx.rdma_transport_, "mlx5_3"));
         inject_up_ok.store(
             RdmaTransportTestPeer::injectContextEvent(
                 target_ctx.rdma_transport_, "mlx5_3", IBV_EVENT_PORT_ACTIVE),
