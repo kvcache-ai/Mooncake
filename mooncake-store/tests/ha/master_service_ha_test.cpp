@@ -6665,6 +6665,143 @@ TEST_F(MasterServiceHATest, InvalidMountLogEntryLeavesNoSegmentOrClient) {
     EXPECT_EQ(segment.te_endpoint, batch.entries.front().object_key);
 }
 
+TEST_F(MasterServiceHATest, MountCommitFailureLeavesNoSegmentOrClient) {
+    const std::string cluster_id = "mount_commit_failure_rollback";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .build());
+    auto* writer = InstallRejectingWriter(service, backend);
+    const Segment segment = MakeSegment("commit-failed-mount");
+    const UUID client = generate_uuid();
+    writer->RejectCommitsWith(ErrorCode::PERSISTENT_FAIL);
+
+    const auto result = service.MountSegment(segment, client);
+
+    ASSERT_FALSE(result);
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, result.error());
+    EXPECT_EQ(1u, writer->rejected_commits());
+    std::string name, endpoint;
+    EXPECT_FALSE(
+        MasterServiceTestPeer::SegmentManager(service).GetSegmentBasicInfo(
+            segment.id, name, endpoint));
+    EXPECT_FALSE(MasterServiceTestPeer(service).FindClientRecord(client));
+
+    writer->RejectCommitsWith(ErrorCode::OK);
+    ASSERT_TRUE(service.MountSegment(segment, client));
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::SEGMENT_MOUNT, batch.entries.front().op_type);
+    EXPECT_EQ(segment.te_endpoint, batch.entries.front().object_key);
+}
+
+TEST_F(MasterServiceHATest, MountCommitFailureExcludesConcurrentAllocation) {
+    class BlockingRejectingWriter : public OrderedOpLogWriter {
+       public:
+        using OrderedOpLogWriter::OrderedOpLogWriter;
+
+        tl::expected<PendingHandle, ErrorCode> Commit(
+            Reservation&& reservation, OpLogEntry entry,
+            DurableCallback callback) override {
+            std::unique_lock lock(mutex_);
+            if (!block_first_) {
+                lock.unlock();
+                return OrderedOpLogWriter::Commit(std::move(reservation),
+                                                  std::move(entry),
+                                                  std::move(callback));
+            }
+            block_first_ = false;
+            entered_ = true;
+            cv_.notify_all();
+            cv_.wait(lock, [this] { return released_; });
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+
+        bool WaitForFirstCommit() {
+            std::unique_lock lock(mutex_);
+            return cv_.wait_for(lock, std::chrono::seconds(2),
+                                [this] { return entered_; });
+        }
+
+        void ReleaseFirstCommit() {
+            std::lock_guard lock(mutex_);
+            released_ = true;
+            cv_.notify_all();
+        }
+
+       private:
+        std::mutex mutex_;
+        std::condition_variable cv_;
+        bool block_first_{true};
+        bool entered_{false};
+        bool released_{false};
+    };
+
+    const std::string cluster_id = "mount_commit_failure_concurrent_allocation";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .build());
+    MasterServiceTestPeer(service).SetBatchOpLogWriterFactoryForTesting(
+        [](OrderedOpLogWriterConfig config,
+           OrderedOpLogWriter::WriteBatchFn write_batch) {
+            return std::make_unique<BlockingRejectingWriter>(
+                std::move(config), std::move(write_batch));
+        });
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    auto* writer = static_cast<BlockingRejectingWriter*>(
+        MasterServiceTestPeer::OrderedOplogWriter(service).get());
+    struct ReleaseOnExit {
+        BlockingRejectingWriter* writer;
+        ~ReleaseOnExit() { writer->ReleaseFirstCommit(); }
+    } release{writer};
+
+    const Segment segment = MakeSegment("pending-mount-allocation");
+    const UUID client = generate_uuid();
+    auto mount = std::async(std::launch::async, [&] {
+        return service.MountSegment(segment, client);
+    });
+    ASSERT_TRUE(writer->WaitForFirstCommit());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {segment.name};
+    std::atomic<bool> put_started{false};
+    auto put = std::async(std::launch::async, [&] {
+        put_started.store(true);
+        return service.PutStart(client, "pending-mount-allocation",
+                                kDefaultTenant, 1024, config);
+    });
+    while (!put_started.load()) {
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(std::future_status::timeout,
+              put.wait_for(std::chrono::milliseconds(100)));
+
+    writer->ReleaseFirstCommit();
+    const auto mount_result = mount.get();
+    ASSERT_FALSE(mount_result);
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, mount_result.error());
+    const auto put_result = put.get();
+    EXPECT_FALSE(put_result);
+    if (!put_result) {
+        EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, put_result.error());
+    }
+    std::string name, endpoint;
+    EXPECT_FALSE(
+        MasterServiceTestPeer::SegmentManager(service).GetSegmentBasicInfo(
+            segment.id, name, endpoint));
+    EXPECT_FALSE(MasterServiceTestPeer(service).FindClientRecord(client));
+}
+
 TEST_F(MasterServiceHATest, InvalidRemountLogEntryRejectsTheWholeGroup) {
     const std::string cluster_id = "invalid_remount_log_entry";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();

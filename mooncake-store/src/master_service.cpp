@@ -1118,9 +1118,11 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
+        // Exclude object operations until persistence accepts the mount. A
+        // rollback must not remove allocations made through the pending
+        // segment.
+        std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         {
-            std::shared_lock<std::shared_mutex> snapshot_lock(
-                master_state_mutex_);
             ScopedSegmentAccess segment_access =
                 segment_manager_.getSegmentAccess();
             LOG(INFO) << "client_id=" << client_id
@@ -1133,17 +1135,39 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
             mount_result != ErrorCode::SEGMENT_ALREADY_EXISTS) {
             return tl::make_unexpected(mount_result);
         }
+        if (mount_result == ErrorCode::OK && reservation) {
+            auto persisted = PersistSegmentOpForHA(
+                "MountSegment", std::move(*reservation), *entry);
+            if (!persisted) {
+                ScopedSegmentAccess segment_access =
+                    segment_manager_.getSegmentAccess();
+                size_t metrics_dec_capacity = 0;
+                const auto prepared = segment_access.PrepareUnmountSegment(
+                    segment.id, metrics_dec_capacity);
+                if (prepared != ErrorCode::OK) {
+                    LOG(ERROR) << "segment_name=" << segment.name
+                               << ", error=mount_rollback_prepare_failed, err="
+                               << static_cast<int>(prepared);
+                } else {
+                    const auto rolled_back =
+                        segment_access.CommitUnmountSegment(
+                            segment.id, client_id, metrics_dec_capacity);
+                    if (rolled_back != ErrorCode::OK) {
+                        LOG(ERROR)
+                            << "segment_name=" << segment.name
+                            << ", error=mount_rollback_commit_failed, err="
+                            << static_cast<int>(rolled_back);
+                    }
+                }
+                return persisted;
+            }
+        }
         if (mount_result == ErrorCode::OK) {
             registration->UpdateHostId(segment.host_id);
         }
         registration->Commit();
     }
 
-    if (mount_result == ErrorCode::OK && reservation) {
-        auto persisted = PersistSegmentOpForHA("MountSegment",
-                                               std::move(*reservation), *entry);
-        if (!persisted) return persisted;
-    }
     if (mount_result == ErrorCode::OK) {
         NotifyPolicyCapacityChanged();
     }
