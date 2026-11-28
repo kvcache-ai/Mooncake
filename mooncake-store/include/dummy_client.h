@@ -83,6 +83,9 @@ class DummyClient : public PyClient {
     std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
         const std::vector<std::string> &keys) override;
 
+    std::vector<tl::expected<QueryResult, ErrorCode>> batch_query_read_only(
+        const std::vector<std::string> &keys) override;
+
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);

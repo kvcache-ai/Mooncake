@@ -141,6 +141,48 @@ MASTER_PID=$!
 sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store.py
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_replicated_distributed_object_store.py
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_batch_query_read_only.py
+
+# DFS-backed replica predicate test. Needs a master started with the POSIX
+# DFS allocator (see test_is_dfs_replica.py docstring for the env vars).
+if [ -n "$TEST_DFS_REPLICA" ]; then
+    TEST_DFS_ROOT_DIR="/tmp/mooncake_test_dfs_replica"
+    mkdir -p $TEST_DFS_ROOT_DIR
+    kill $MASTER_PID 2>/dev/null || true
+    wait $MASTER_PID 2>/dev/null || true
+    MOONCAKE_ENABLE_DFS=1 \
+    MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend \
+    MOONCAKE_DFS_FS_ADAPTER=posix \
+    MOONCAKE_DFS_ROOT_DIR=$TEST_DFS_ROOT_DIR \
+    MOONCAKE_DFS_SHARD_COUNT=1 \
+    MOONCAKE_DFS_SHARD_CAPACITY=16777216 \
+    MOONCAKE_DFS_ALIGNMENT=4096 \
+    MOONCAKE_DFS_EVICTION_ENABLED=0 \
+    MOONCAKE_DFS_DEFERRED_FREE_SECONDS=0 \
+    MOONCAKE_DFS_SINGLE_TENANT=true \
+        mooncake_master --default_kv_lease_ttl=500 &
+    MASTER_PID=$!
+    sleep 1
+    MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+    DEFAULT_KV_LEASE_TTL=500 \
+    MOONCAKE_ENABLE_DFS=1 \
+    MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend \
+    MOONCAKE_DFS_FS_ADAPTER=posix \
+    MOONCAKE_DFS_ROOT_DIR=$TEST_DFS_ROOT_DIR \
+    MOONCAKE_DFS_SHARD_COUNT=1 \
+    MOONCAKE_DFS_SHARD_CAPACITY=16777216 \
+    MOONCAKE_DFS_ALIGNMENT=4096 \
+    MOONCAKE_DFS_EVICTION_ENABLED=0 \
+    MOONCAKE_DFS_DEFERRED_FREE_SECONDS=0 \
+    MOONCAKE_DFS_SINGLE_TENANT=true \
+    MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=16777216 \
+        python test_is_dfs_replica.py
+    kill $MASTER_PID || true
+    wait $MASTER_PID 2>/dev/null || true
+    rm -rf $TEST_DFS_ROOT_DIR
+else
+    echo "Skipping test: TEST_DFS_REPLICA environment variable is not set"
+fi
 
 pip install torch numpy safetensors packaging
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_put_get_tensor.py

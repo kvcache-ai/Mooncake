@@ -1744,6 +1744,32 @@ std::vector<tl::expected<QueryResult, ErrorCode>> DummyClient::batch_query(
     return results;
 }
 
+std::vector<tl::expected<QueryResult, ErrorCode>>
+DummyClient::batch_query_read_only(const std::vector<std::string>& keys) {
+    auto cached_results =
+        invoke_rpc<&RealClient::batch_get_query_results_read_only,
+                   std::vector<CachedQueryResultResponse>>(keys);
+    if (!cached_results) {
+        return std::vector<tl::expected<QueryResult, ErrorCode>>(
+            keys.size(), tl::unexpected(cached_results.error()));
+    }
+    if (cached_results->size() != keys.size()) {
+        LOG(ERROR) << "BatchQueryReadOnly response size mismatch: expected "
+                   << keys.size() << ", got " << cached_results->size();
+        return std::vector<tl::expected<QueryResult, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::RPC_FAIL));
+    }
+
+    std::vector<tl::expected<QueryResult, ErrorCode>> results;
+    results.reserve(keys.size());
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& cached_result : *cached_results) {
+        results.emplace_back(
+            from_cached_query_result_response(cached_result, now));
+    }
+    return results;
+}
+
 std::string DummyClient::get_hostname() const {
     // Dummy client does not have a hostname
     return "";

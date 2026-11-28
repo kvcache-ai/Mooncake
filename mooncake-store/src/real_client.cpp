@@ -5908,6 +5908,16 @@ std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::batch_query(
     return client_->BatchQuery(keys);
 }
 
+std::vector<tl::expected<QueryResult, ErrorCode>>
+RealClient::batch_query_read_only(const std::vector<std::string> &keys) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<QueryResult, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    return client_->BatchQueryReadOnly(keys);
+}
+
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::build_ranged_read_metadata_from_query_result(
     const std::string &key, tl::expected<QueryResult, ErrorCode> query_result) {
@@ -9563,6 +9573,34 @@ std::vector<CachedQueryResultResponse> RealClient::batch_get_query_results(
     if (query_results.size() != keys.size()) {
         LOG(ERROR) << "Batch query response size mismatch in "
                       "batch_get_query_results: expected "
+                   << keys.size() << ", got " << query_results.size() << ".";
+        return std::vector<CachedQueryResultResponse>(
+            keys.size(), CachedQueryResultResponse(ErrorCode::RPC_FAIL));
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto &query_result : query_results) {
+        cached_results.push_back(
+            to_cached_query_result_response(query_result, now));
+    }
+    return cached_results;
+}
+
+std::vector<CachedQueryResultResponse>
+RealClient::batch_get_query_results_read_only(
+    const std::vector<std::string> &keys) {
+    if (!client_) {
+        LOG(ERROR)
+            << "batch_get_query_results_read_only: client not initialized";
+        return std::vector<CachedQueryResultResponse>(
+            keys.size(), CachedQueryResultResponse(ErrorCode::INVALID_PARAMS));
+    }
+    auto query_results = client_->BatchQueryReadOnly(keys);
+    std::vector<CachedQueryResultResponse> cached_results;
+    cached_results.reserve(keys.size());
+    if (query_results.size() != keys.size()) {
+        LOG(ERROR) << "Batch query response size mismatch in "
+                      "batch_get_query_results_read_only: expected "
                    << keys.size() << ", got " << query_results.size() << ".";
         return std::vector<CachedQueryResultResponse>(
             keys.size(), CachedQueryResultResponse(ErrorCode::RPC_FAIL));

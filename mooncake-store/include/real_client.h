@@ -174,6 +174,14 @@ class RealClient : public PyClient {
     std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
         const std::vector<std::string> &keys) override;
 
+    /**
+     * @brief Read-only variant of batch_query(); no lease is granted
+     * @param keys Vector of keys to query
+     * @return Vector of query results in the same order as keys
+     */
+    std::vector<tl::expected<QueryResult, ErrorCode>> batch_query_read_only(
+        const std::vector<std::string> &keys) override;
+
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);
@@ -942,6 +950,8 @@ class RealClient : public PyClient {
     std::map<std::string, std::vector<Replica::Descriptor>>
     batch_get_replica_desc(const std::vector<std::string> &keys);
     std::vector<CachedQueryResultResponse> batch_get_query_results(
+        const std::vector<std::string> &keys);
+    std::vector<CachedQueryResultResponse> batch_get_query_results_read_only(
         const std::vector<std::string> &keys);
     std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
 

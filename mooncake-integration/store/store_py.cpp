@@ -2414,6 +2414,9 @@ NB_MODULE(_store, m) {
         .def("is_local_disk_replica",
              static_cast<bool (Replica::Descriptor::*)() const noexcept>(
                  &Replica::Descriptor::is_local_disk_replica))
+        .def("is_dfs_replica",
+             static_cast<bool (Replica::Descriptor::*)() const noexcept>(
+                 &Replica::Descriptor::is_dfs_replica))
         .def(
             "get_memory_descriptor",
             static_cast<const MemoryDescriptor &(Replica::Descriptor::*)()
@@ -3612,6 +3615,40 @@ NB_MODULE(_store, m) {
                 return self.store_->batch_get_replica_desc(keys);
             },
             py::arg("keys"))
+        .def(
+            "batch_query_read_only",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                py::gil_scoped_release release;
+                auto query_results = self.store_->batch_query_read_only(keys);
+                std::map<std::string, std::vector<Replica::Descriptor>>
+                    replica_map;
+                if (query_results.size() != keys.size()) {
+                    LOG(ERROR) << "batch_query_read_only response size "
+                                  "mismatch: expected "
+                               << keys.size() << ", got "
+                               << query_results.size() << ".";
+                    return replica_map;
+                }
+                for (size_t i = 0; i < query_results.size(); ++i) {
+                    if (query_results[i]) {
+                        replica_map[keys[i]] =
+                            std::move(query_results[i].value().replicas);
+                    } else {
+                        LOG(ERROR) << "batch_query_read_only failed for key: "
+                                   << keys[i] << " with error: "
+                                   << toString(query_results[i].error());
+                    }
+                }
+                return replica_map;
+            },
+            py::arg("keys"),
+            "Read-only batch query of replica metadata: grants no lease and "
+            "does not trigger promotion-on-hit. Intended for metadata "
+            "classification (e.g. tier-aware admission control) that must "
+            "not perturb hot-path state. Returns a dict mapping each key "
+            "to its list of ReplicaDescriptor; keys that failed the query "
+            "are omitted.")
         .def(
             "batch_replica_clear",
             [](MooncakeStorePyWrapper &self,
