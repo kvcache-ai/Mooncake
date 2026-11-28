@@ -149,10 +149,15 @@ static inline bool IsUint64Vector(const py::array& array) {
            array.strides(0) == static_cast<py::ssize_t>(sizeof(uint64_t));
 }
 
-// Bound for the wait after a failed batch. A task sitting behind the QP retry
-// timer (send_timeout 14 ~= 67 ms, send_retry_count 7) needs up to ~540 ms to
-// finish. At the deadline the engine cancels what is still running and reports
-// the statuses it sees, so the caller learns whether the buffers are idle.
+static bool AllTerminal(const std::vector<TransferStatus>& statuses,
+                        size_t count) {
+    return statuses.size() == count &&
+           std::none_of(statuses.begin(), statuses.end(),
+                        [](const TransferStatus& item) {
+                            return item.s == TransferStatusEnum::PENDING;
+                        });
+}
+
 constexpr uint64_t kSettleTimeoutMs = 600;
 
 // =============================================================================
@@ -785,8 +790,8 @@ PYBIND11_MODULE(tent, m) {
         .def(
             "transfer_sync_arrays",
             [](TransferEngine& self, py::array src, py::array dst,
-               py::array lengths, uint64_t target_id,
-               Request::OpCode opcode) -> py::array_t<uint8_t> {
+               py::array lengths, uint64_t target_id, Request::OpCode opcode,
+               uint64_t timeout_ms) -> py::array_t<uint8_t> {
                 const auto count = static_cast<size_t>(src.size());
                 const bool well_formed =
                     IsUint64Vector(src) && IsUint64Vector(dst) &&
@@ -834,55 +839,73 @@ PYBIND11_MODULE(tent, m) {
                     } else {
                         BatchGuard guard(&self,
                                          static_cast<uint64_t>(batch_id));
-                        // A failed submit or wait leaves ownership with the
-                        // transport; ask it to stop before the guard frees the
-                        // batch, or the caller may reuse live buffers.
-                        const auto settled = [&] {
-                            std::vector<TransferStatus> settle_status;
-                            auto status = self.waitTransfer(
-                                batch_id, &settle_status, kSettleTimeoutMs);
-                            if (!status.ok()) return false;
-                            return settle_status.size() == count &&
-                                   std::none_of(
-                                       settle_status.begin(),
-                                       settle_status.end(),
-                                       [](const TransferStatus& item) {
-                                           return item.s ==
-                                                  TransferStatusEnum::PENDING;
-                                       });
-                        };
+                        constexpr const char* kUnsafeReuseWarning =
+                            "; the batch may still access src and dst, so do "
+                            "not reuse them";
+                        const auto settle =
+                            [&](std::vector<TransferStatus>* out = nullptr,
+                                Status* settle_err = nullptr) {
+                                std::vector<TransferStatus> scratch;
+                                auto* target = out ? out : &scratch;
+                                auto status = self.waitTransfer(
+                                    batch_id, target, kSettleTimeoutMs);
+                                if (settle_err) *settle_err = status;
+                                return status.ok() &&
+                                       AllTerminal(*target, count);
+                            };
                         auto submit_status =
                             self.submitTransfer(batch_id, request_list);
                         if (!submit_status.ok()) {
-                            if (!settled()) {
-                                wait_error =
-                                    "submitTransfer failed: " +
-                                    submit_status.ToString() +
-                                    "; the batch may still access src and dst, "
-                                    "so do not reuse them";
+                            if (!settle()) {
+                                wait_error = "submitTransfer failed: " +
+                                             submit_status.ToString() +
+                                             kUnsafeReuseWarning;
                             }
                         } else {
                             std::vector<TransferStatus> status_list;
-                            auto wait_status =
-                                self.waitTransfer(batch_id, &status_list, 0);
+                            auto wait_status = self.waitTransfer(
+                                batch_id, &status_list, timeout_ms);
                             if (!wait_status.ok()) {
                                 wait_error = "waitTransfer failed: " +
                                              wait_status.ToString();
-                                if (!settled()) {
-                                    wait_error +=
-                                        "; the batch may still access src and "
-                                        "dst, so do not reuse them";
+                                if (!settle()) {
+                                    wait_error += kUnsafeReuseWarning;
                                 }
                             } else if (status_list.size() != count) {
                                 wait_error =
                                     "waitTransfer returned " +
                                     std::to_string(status_list.size()) +
                                     " statuses for " + std::to_string(count) +
-                                    " descriptors" LOC_MARK;
+                                    " descriptors";
+                                if (!settle()) {
+                                    wait_error += kUnsafeReuseWarning;
+                                }
+                                wait_error += LOC_MARK;
                             } else {
-                                for (size_t i = 0; i < count; ++i) {
-                                    states[i] =
-                                        static_cast<uint8_t>(status_list[i].s);
+                                Status settle_err;
+                                if (!AllTerminal(status_list, count) &&
+                                    !settle(&status_list, &settle_err)) {
+                                    wait_error =
+                                        timeout_ms != 0
+                                            ? "waitTransfer timed out after " +
+                                                  std::to_string(timeout_ms) +
+                                                  " ms"
+                                            : "waitTransfer returned pending "
+                                              "descriptors";
+                                    if (!settle_err.ok()) {
+                                        wait_error += " (settle failed: " +
+                                                      settle_err.ToString() +
+                                                      ")";
+                                    }
+                                    wait_error += kUnsafeReuseWarning;
+                                    if (settle_err.ok()) {
+                                        wait_error += LOC_MARK;
+                                    }
+                                } else {
+                                    for (size_t i = 0; i < count; ++i) {
+                                        states[i] = static_cast<uint8_t>(
+                                            status_list[i].s);
+                                    }
                                 }
                             }
                         }
@@ -903,14 +926,17 @@ PYBIND11_MODULE(tent, m) {
             "modified until the call returns. Malformed non-empty input is "
             "reported as INVALID for every entry; an empty input that is not "
             "three empty uint64 vectors raises InvalidArgumentError; running "
-            "out of batch slots raises TooManyRequests. A failed submit or "
-            "wait waits one RDMA retry budget (600 ms) for every descriptor to "
-            "stop, cancelling whatever still runs at the deadline; if "
-            "descriptors are still pending then, the call raises "
-            "InternalError, which says src and dst must not be reused. This "
-            "call has no timeout.",
+            "out of batch slots raises TooManyRequests. timeout_ms bounds the "
+            "wait in milliseconds; 0 waits without a timeout. At timeout_ms, "
+            "queued descriptors are canceled and in-flight descriptors are "
+            "asked to stop; pending descriptors drain for up to one RDMA retry "
+            "budget (600 ms), and settled descriptors return their terminal "
+            "states. A failed submit or wait also drains for up to one RDMA "
+            "retry budget (600 ms), canceling whatever still runs at the "
+            "deadline; if descriptors are still pending after the drain, the "
+            "call raises InternalError warning not to reuse src and dst.",
             py::arg("src"), py::arg("dst"), py::arg("lengths"),
-            py::arg("target_id"), py::arg("opcode"))
+            py::arg("target_id"), py::arg("opcode"), py::arg("timeout_ms") = 0)
 
         // ---------------------------------------------------------------------
         // notification send/receive
