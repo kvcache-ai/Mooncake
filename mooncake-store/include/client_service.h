@@ -476,6 +476,16 @@ class Client {
         const std::vector<std::string>& keys, const std::string& tenant_id,
         ReplicaType replica_type);
 
+    // Per-segment bookkeeping for the staged strict-MNNVL mount.
+    struct MnnvlMountState {
+        std::atomic<bool> cleanup_confirmed{true};
+        UUID id{};
+        // These stages are protected by mounted_segments_mutex_.
+        bool publication_pending = false;
+        bool registration_pending = false;
+        bool remountable = false;
+    };
+
     /**
      * @brief Registers a memory segment to master for allocation
      * @param buffer Memory buffer to register
@@ -484,7 +494,8 @@ class Client {
      */
     tl::expected<void, ErrorCode> MountSegment(
         const void* buffer, size_t size, const std::string& protocol = "tcp",
-        const std::string& location = kWildcardLocation);
+        const std::string& location = kWildcardLocation,
+        std::shared_ptr<MnnvlMountState> cleanup_state = {});
 
     /**
      * @brief Unregisters a memory segment from master
@@ -501,7 +512,18 @@ class Client {
      */
     tl::expected<UUID, ErrorCode> MountSegmentAndGetId(
         const void* buffer, size_t size, const std::string& protocol = "tcp",
-        const std::string& location = kWildcardLocation);
+        const std::string& location = kWildcardLocation,
+        std::shared_ptr<MnnvlMountState> cleanup_state = {});
+
+    // Stop Store-owned submissions before removing EGM visibility/backing.
+    void StopStoreWorkers();
+    // Tears down every strict (MNNVL) mount before the owner releases the EGM
+    // backing: confirmed state is dropped, unconfirmed cleanup is retried, and
+    // caller-managed mounts are included. Call after StopStoreWorkers().
+    tl::expected<void, ErrorCode> CleanupMnnvlSegments();
+    std::shared_ptr<TransferEngine> GetTransferEngine() const {
+        return transfer_engine_;
+    }
 
     /**
      * @brief Unmounts a segment by its UUID.
@@ -1213,6 +1235,23 @@ class Client {
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
+    std::unordered_map<UUID, std::shared_ptr<MnnvlMountState>,
+                       boost::hash<UUID>>
+        mnnvl_mount_states_;
+    std::mutex stop_workers_mutex_;
+    bool store_workers_stopped_ = false;
+    friend class EgmStoreLifecycleTestPeer;
+    // Fault injection is confined to the test peer; production uses TE/Master.
+    struct MnnvlLifecycleOps {
+        std::function<int(void*, size_t, const std::string&)> register_memory;
+        std::function<bool(void*, size_t)> exported;
+        std::function<tl::expected<void, ErrorCode>(const Segment&)> mount;
+        std::function<tl::expected<void, ErrorCode>(const UUID&)> unmount;
+        std::function<int(void*)> unregister_memory;
+        std::function<int()> drain;
+    };
+    std::unique_ptr<MnnvlLifecycleOps> mnnvl_ops_for_test_;
+    tl::expected<void, ErrorCode> CleanupMnnvlMount(const Segment& segment);
 
     // Segments in graceful unmount: readable by remote peers, not allocatable
     // locally. TE MR remains registered until master confirms removal.

@@ -308,6 +308,13 @@ class TransferEngineImpl {
 
     Status unmapRemoteMemory(SegmentID peer, void* gva, TransportType type);
 
+    bool isStrictMnnvlEgm() const;
+    Status getEgmNumaNodes(std::vector<int>& nodes, bool nearest);
+    Status getEgmGranularity(int node, size_t& granularity);
+    bool isMnnvlExported(void* addr, size_t size) const;
+    // Caller must prevent new submissions while draining/freeing memory.
+    Status quiesce();
+
     Status registerLocalMemory(void* addr, size_t size,
                                Permission permission = kGlobalReadWrite);
 
@@ -646,6 +653,12 @@ class TransferEngineImpl {
                                 std::chrono::steady_clock::time_point end_time);
 
    private:
+    std::recursive_mutex strict_memory_mutex_;
+    // Unpublished registration failures retain their transport identity here.
+    // Failed tracked removals are restored and retried by SegmentTracker.
+    std::unordered_map<uint64_t, BufferDesc> pending_mnnvl_unregister_;
+    std::unordered_set<uint64_t> pending_mnnvl_metadata_;
+
     struct AllocatedMemory {
         void* addr;
         size_t size;

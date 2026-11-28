@@ -53,6 +53,7 @@
 #ifdef USE_CUDA
 #include "tent/platform/cuda.h"
 #include "tent/platform/cuda_utils.h"
+#include "tent/transport/mnnvl/mnnvl_transport.h"
 #endif
 
 namespace mooncake {
@@ -109,6 +110,7 @@ struct PreservedTentConfigOverrides {
     bool force_fabric{false};
     std::optional<std::string> fabric_provider;
     std::optional<std::vector<std::string>> fabric_devices;
+    bool store_egm{false};
     std::optional<std::vector<std::string>> rdma_whitelist;
     // Classic TE shim writes these nested leaves before construct(). Keep
     // them on the existing identity whitelist instead of growing Config.
@@ -244,6 +246,7 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
         config, "transports/fabric/provider", std::string());
     preserved.fabric_devices = captureExplicitConfigValue(
         config, "transports/fabric/devices", std::vector<std::string>());
+    preserved.store_egm = config.get("transports/mnnvl/store_egm", false);
     preserved.rpc_server_port =
         captureExplicitConfigValue(config, "rpc_server_port", json());
     preserved.rdma_whitelist = captureExplicitConfigValue(
@@ -341,7 +344,16 @@ TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf,
     // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
     // explicit metadata identity intact.
     auto status = ConfigHelper().loadFromEnv(*conf_);
+    const bool store_egm =
+        preserved.store_egm || conf_->get("transports/mnnvl/store_egm", false);
+    const bool conflicting_tcp =
+        store_egm &&
+        (preserved.force_tcp || conf_->get("transports/force_tcp", false));
     restoreExplicitTransferEngineConfig(*conf_, preserved);
+    if (conflicting_tcp)
+        status = Status::InvalidArgument(
+            "Store EGM conflicts with forced TCP" LOC_MARK);
+    if (store_egm) ConfigHelper::forceMnnvlEgm(*conf_);
     if (status.ok()) status = construct();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
@@ -411,6 +423,12 @@ Status TransferEngineImpl::setupLocalSegment() {
 }
 
 Status TransferEngineImpl::construct() {
+    if (conf_->get("transports/mnnvl/store_egm", false)) {
+        if (conf_->get("transports/force_tcp", false))
+            return Status::InvalidArgument(
+                "Store EGM conflicts with forced TCP" LOC_MARK);
+        ConfigHelper::forceMnnvlEgm(*conf_);
+    }
     // Publish the snapshot before any setup step can return an error.
     std::atomic_store_explicit(&runtime_config_snapshot_,
                                buildTentConfigBundle(*conf_).runtime,
@@ -542,9 +560,15 @@ Status TransferEngineImpl::construct() {
             auto status = transport->install(local_segment_name_, metadata_,
                                              topology_, conf_);
             if (!status.ok()) {
+                // Explicitly required transports must fail construction
+                // on install failure rather than an optional-transport
+                // skip.
+                const bool mnnvl_required =
+                    (mnnvl_config_.require_fabric ||
+                     conf_->get("transports/mnnvl/store_egm", false)) &&
+                    transport_index == static_cast<size_t>(MNNVL);
                 const bool required =
-                    (mnnvl_config_.require_fabric &&
-                     transport_index == static_cast<size_t>(MNNVL)) ||
+                    mnnvl_required ||
                     (hp_tcp_transport_config_.enabled &&
                      transport_index ==
                          static_cast<size_t>(TransportType::HP_TCP)) ||
@@ -552,8 +576,7 @@ Status TransferEngineImpl::construct() {
                      transport_index ==
                          static_cast<size_t>(TransportType::FABRIC));
                 if (required) {
-                    if (mnnvl_config_.require_fabric &&
-                        transport_index == static_cast<size_t>(MNNVL)) {
+                    if (mnnvl_required) {
                         TentMetrics::instance().recordMnnvlEvent(
                             TentMetrics::MnnvlEvent::StrictFailure);
                     }
@@ -579,6 +602,13 @@ Status TransferEngineImpl::construct() {
             transport_string += " ";
         }
     }
+
+    if (conf_->get("transports/mnnvl/store_egm", false) &&
+        (!transport_list_[MNNVL] ||
+         !transport_list_[MNNVL]->capabilities().dram_to_dram ||
+         !transport_list_[MNNVL]->capabilities().gpu_to_dram))
+        return Status::InvalidArgument(
+            "Required MNNVL EGM capability missing" LOC_MARK);
 
     staging_proxy_ = std::make_unique<ProxyManager>(this);
 
@@ -983,7 +1013,90 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
     return Status::OK();
 }
 
+bool TransferEngineImpl::isStrictMnnvlEgm() const {
+#ifdef USE_CUDA
+    auto transport =
+        dynamic_cast<MnnvlTransport*>(transport_list_[MNNVL].get());
+    if (!available_ || !conf_->get("transports/mnnvl/store_egm", false) ||
+        conf_->get("transports/force_tcp", false) || !transport ||
+        !transport->strictFabricEgm() || enable_progress_worker_ ||
+        runtime_queue_config_.enabled)
+        return false;
+    auto snapshot = std::atomic_load_explicit(&runtime_config_snapshot_,
+                                              std::memory_order_acquire);
+    if (!snapshot || snapshot->max_failover_attempts != 0 ||
+        snapshot->enable_auto_failover_on_poll)
+        return false;
+    for (size_t i = 0; i < kSupportedTransportTypes; ++i) {
+        if (i == MNNVL || i == IOURING || i == GDS) continue;
+        if (transport_list_[i]) return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+Status TransferEngineImpl::getEgmNumaNodes(std::vector<int>& nodes,
+                                           bool nearest) {
+    nodes.clear();
+#ifdef USE_CUDA
+    if (isStrictMnnvlEgm())
+        return static_cast<MnnvlTransport*>(transport_list_[MNNVL].get())
+            ->getEgmNumaNodes(nodes, nearest);
+#endif
+    return Status::InvalidArgument("Strict MNNVL EGM unavailable" LOC_MARK);
+}
+
+Status TransferEngineImpl::getEgmGranularity(int node, size_t& granularity) {
+    granularity = 0;
+#ifdef USE_CUDA
+    if (isStrictMnnvlEgm())
+        return static_cast<MnnvlTransport*>(transport_list_[MNNVL].get())
+            ->getEgmGranularity(node, granularity);
+#endif
+    return Status::InvalidArgument("Strict MNNVL EGM unavailable" LOC_MARK);
+}
+
+bool TransferEngineImpl::isMnnvlExported(void* addr, size_t size) const {
+    const uint64_t base = reinterpret_cast<uint64_t>(addr);
+    if (!isStrictMnnvlEgm() || !base || !size || size > UINT64_MAX - base)
+        return false;
+    auto segment = metadata_->segmentManager().getLocal();
+    const auto& buffers = std::get<MemorySegmentDesc>(segment->detail).buffers;
+    for (const auto& buffer : buffers) {
+        if (buffer.addr <= base && base - buffer.addr <= buffer.length &&
+            size <= buffer.length - (base - buffer.addr) &&
+            buffer.permission != kLocalReadWrite &&
+            LocationParser(buffer.location).type() == "cpu" &&
+            !buffer.mnnvl_handle.empty() &&
+            std::find(buffer.transports.begin(), buffer.transports.end(),
+                      MNNVL) != buffer.transports.end())
+            return true;
+    }
+    return false;
+}
+
+Status TransferEngineImpl::quiesce() {
+    // Serialize against polling/deferred free; caller stops new submissions.
+    std::lock_guard<std::recursive_mutex> lock(progress_mutex_);
+    Status first = Status::OK();
+    for (const auto& transport : transport_list_) {
+        if (!transport) continue;
+        auto status = transport->quiesce();
+        if (!status.ok() && first.ok()) first = status;
+    }
+    return first;
+}
+
 Status TransferEngineImpl::freeLocalMemory(void* addr) {
+    std::unique_lock<std::recursive_mutex> strict_lock(strict_memory_mutex_,
+                                                       std::defer_lock);
+    const bool strict = conf_->get("transports/mnnvl/store_egm", false);
+    if (strict) {
+        strict_lock.lock();
+        CHECK_STATUS(quiesce());
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = allocated_memory_.begin(); it != allocated_memory_.end();
          ++it) {
@@ -1001,6 +1114,27 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
                                 "it" LOC_MARK);
                     }
                 }
+            }
+            if (strict) {
+                const uint64_t base = reinterpret_cast<uint64_t>(addr);
+                auto overlaps = [&](const BufferDesc& buffer) {
+                    return buffer.addr < base + it->size &&
+                           base < buffer.addr + buffer.length;
+                };
+                auto snapshot = metadata_->segmentManager().getLocal();
+                for (const auto& buffer :
+                     std::get<MemorySegmentDesc>(snapshot->detail).buffers)
+                    if (overlaps(buffer))
+                        return Status::InvalidArgument(
+                            "EGM allocation remains registered" LOC_MARK);
+                for (const auto& pending : pending_mnnvl_unregister_)
+                    if (overlaps(pending.second))
+                        return Status::InvalidArgument(
+                            "EGM deregistration remains pending" LOC_MARK);
+                for (uint64_t pending : pending_mnnvl_metadata_)
+                    if (pending >= base && pending - base < it->size)
+                        return Status::InvalidArgument(
+                            "EGM metadata removal remains pending" LOC_MARK);
             }
             auto status = it->transport->freeLocalMemory(addr, it->size);
             if (!status.ok()) {
@@ -1118,6 +1252,9 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
 Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                                                std::vector<size_t> size_list,
                                                MemoryOptions& options) {
+    std::unique_lock<std::recursive_mutex> strict_lock(strict_memory_mutex_,
+                                                       std::defer_lock);
+    if (conf_->get("transports/mnnvl/store_egm", false)) strict_lock.lock();
     if (addr_list.size() != size_list.size()) {
         return Status::InvalidArgument(
             "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
@@ -1299,7 +1436,11 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                     for (auto& desc : descs) {
                         auto cleanup =
                             transport_list_[type]->removeMemoryBuffer(desc);
-                        if (!cleanup.ok()) LOG(WARNING) << cleanup.ToString();
+                        if (!cleanup.ok()) {
+                            LOG(WARNING) << cleanup.ToString();
+                            if (conf_->get("transports/mnnvl/store_egm", false))
+                                pending_mnnvl_unregister_[desc.addr] = desc;
+                        }
                     }
                     descs = before;
                     if (first_error.ok()) first_error = s;
@@ -1349,11 +1490,19 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                     TentMetrics::instance().recordRegisteredBufferBytes(
                         type, static_cast<int64_t>(desc.length));
                 }
+                // A successful registration supersedes the bookkeeping left
+                // behind by an earlier failure on the same range: unregister
+                // prefers pending entries over the tracker, and a metadata
+                // retry marker must not shadow this registration.
+                pending_mnnvl_unregister_.erase(desc.addr);
+                pending_mnnvl_metadata_.erase(desc.addr);
             }
             return Status::OK();
         },
         [&](BufferDesc& desc) {
             need_sync = true;
+            // The tracker restores failed removals with their remaining
+            // transport state; only unpublished buffers need a pending copy.
             return deregisterRemovedBuffer(desc);
         });
     // Synchronize local segment to metadata server so remote peers can see the
@@ -1369,6 +1518,64 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
 // WARNING: before exiting TE, make sure that all local memory are
 // unregistered, otherwise the CUDA may halt!
 Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
+    if (conf_->get("transports/mnnvl/store_egm", false)) {
+        std::lock_guard<std::recursive_mutex> lock(strict_memory_mutex_);
+        CHECK_STATUS(quiesce());
+        const uint64_t requested_base = reinterpret_cast<uint64_t>(addr);
+        if (pending_mnnvl_metadata_.count(requested_base)) {
+            // The local removal already happened; only its publication is
+            // retried here. Removing again would drop a second reference to a
+            // shared registration. A distinct registration of the same base
+            // clears this marker before it can be observed here.
+            CHECK_STATUS(metadata_->segmentManager().synchronizeLocal());
+            pending_mnnvl_metadata_.erase(requested_base);
+            return Status::OK();
+        }
+        uint64_t base = requested_base;
+        auto covers = [&](const BufferDesc& desc) {
+            return desc.addr <= base && base - desc.addr < desc.length &&
+                   (!size || size <= desc.length - (base - desc.addr));
+        };
+        auto pending = pending_mnnvl_unregister_.find(base);
+        if (pending == pending_mnnvl_unregister_.end()) {
+            pending = std::find_if(
+                pending_mnnvl_unregister_.begin(),
+                pending_mnnvl_unregister_.end(),
+                [&](const auto& entry) { return covers(entry.second); });
+        }
+        if (pending != pending_mnnvl_unregister_.end()) {
+            // Failed registrations were never published to the tracker.
+            CHECK_STATUS(deregisterRemovedBuffer(pending->second));
+            pending_mnnvl_unregister_.erase(pending);
+        } else {
+            // MNNVL may expand a supplied subrange to the exported VMM base.
+            auto snapshot = metadata_->segmentManager().getLocal();
+            const auto& buffers =
+                std::get<MemorySegmentDesc>(snapshot->detail).buffers;
+            auto buffer = std::find_if(
+                buffers.begin(), buffers.end(), [&](const auto& desc) {
+                    return desc.addr == base && (!size || desc.length == size);
+                });
+            if (buffer == buffers.end())
+                buffer = std::find_if(buffers.begin(), buffers.end(), covers);
+            if (buffer != buffers.end()) {
+                base = buffer->addr;
+                size = buffer->length;
+            }
+            CHECK_STATUS(local_segment_tracker_->remove(
+                base, size, [&](BufferDesc& desc) {
+                    // On failure the tracker restores this descriptor. Retry
+                    // through it so success removes the restored entry too.
+                    return deregisterRemovedBuffer(desc);
+                }));
+        }
+        // Record the completed unregister before publishing. A metadata-only
+        // retry must not drop a second reference to a shared registration.
+        pending_mnnvl_metadata_.insert(requested_base);
+        CHECK_STATUS(metadata_->segmentManager().synchronizeLocal());
+        pending_mnnvl_metadata_.erase(requested_base);
+        return Status::OK();
+    }
     bool removed = false;
     auto status = local_segment_tracker_->remove(
         (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
@@ -1385,6 +1592,12 @@ Status TransferEngineImpl::unregisterLocalMemory(
     if (!size_list.empty() && addr_list.size() != size_list.size()) {
         return Status::InvalidArgument(
             "Mismatched addresses and sizes in unregisterLocalMemory" LOC_MARK);
+    }
+    if (conf_->get("transports/mnnvl/store_egm", false)) {
+        for (size_t i = 0; i < addr_list.size(); ++i)
+            CHECK_STATUS(unregisterLocalMemory(
+                addr_list[i], size_list.empty() ? 0 : size_list[i]));
+        return Status::OK();
     }
     bool removed_any = false;
     Status first_error;
@@ -1408,8 +1621,8 @@ Status TransferEngineImpl::unregisterLocalMemory(
 }
 
 Status TransferEngineImpl::deregisterRemovedBuffer(BufferDesc& desc) {
-    Status first_error;
     const BufferDesc original_desc = desc;
+    Status first_error = Status::OK();
     const auto& registered_transports = original_desc.transports;
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
         auto& transport = transport_list_[type];

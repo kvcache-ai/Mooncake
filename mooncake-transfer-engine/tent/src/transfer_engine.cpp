@@ -216,6 +216,24 @@ Status TransferEngine::unmapRemoteMemory(SegmentID peer, void* gva,
     return impl_->unmapRemoteMemory(peer, gva, type);
 }
 
+bool TransferEngine::isStrictMnnvlEgm() const {
+    return impl_->isStrictMnnvlEgm();
+}
+
+Status TransferEngine::getEgmNumaNodes(std::vector<int>& nodes, bool nearest) {
+    return impl_->getEgmNumaNodes(nodes, nearest);
+}
+
+Status TransferEngine::getEgmGranularity(int node, size_t& granularity) {
+    return impl_->getEgmGranularity(node, granularity);
+}
+
+bool TransferEngine::isMnnvlExported(void* addr, size_t size) const {
+    return impl_->isMnnvlExported(addr, size);
+}
+
+Status TransferEngine::quiesce() { return impl_->quiesce(); }
+
 Status TransferEngine::registerLocalMemory(void* addr, size_t size,
                                            Permission permission) {
     return impl_->registerLocalMemory({addr}, {size}, permission);
