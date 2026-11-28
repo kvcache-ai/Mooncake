@@ -78,6 +78,10 @@ class Workers {
 
     Status submit(RdmaSliceList& slice_list, int worker_id = -1);
 
+    // Each non-empty list is indexed by its destination lane. A rejected
+    // flush publishes no slices so the caller can settle all of its lists.
+    Status admitBatch(std::vector<RdmaSliceList>& slice_lists);
+
     Status cancel(RdmaTask* task);
 
     DeviceSelector* getDeviceSelector() const { return device_selector_.get(); }
@@ -410,6 +414,9 @@ class Workers {
     // and the asyncPostSend drain consumes them first. Moves the slice's
     // inflight count to `worker` from whichever lane still holds it.
     void submitFromTick(WorkerContext& worker, RdmaSlice* slice);
+    bool accountSubmission(WorkerContext& worker, const RdmaSliceList& list,
+                           int worker_id);
+    void wakeSubmitConsumer(WorkerContext& worker);
 
     WorkerContext* worker_context_;
     uint64_t slice_timeout_ns_;
