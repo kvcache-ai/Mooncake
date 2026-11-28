@@ -8,10 +8,21 @@
 #include <utility>
 
 #include "conductor/prefixindex/hash_strategy.h"
+#include "conductor/prefixindex/hybrid_index.h"
 
 namespace mooncake::conductor::prefixindex {
 
 namespace {
+
+bool MatchesLayout(const std::shared_ptr<HybridIndex>& index,
+                   const std::shared_ptr<const CacheLayout>& requested) {
+    if (!index || !requested) return !index && !requested;
+    const auto& current = index->Layout();
+    return current == *requested ||
+           (!requested->unavailable_reason.empty() &&
+            requested->id == current.id &&
+            requested->hash_unit_tokens == current.hash_unit_tokens);
+}
 
 std::string ValidateContext(const ContextKey& context) {
     if (context.tenant_id.empty()) {
@@ -236,6 +247,16 @@ RegistrationResult PrefixCacheTable::ValidateRegistration(
         !error.empty()) {
         return {.error = std::move(error)};
     }
+    if (registration.layout) {
+        if (auto error = ValidateCacheLayout(*registration.layout);
+            !error.empty()) {
+            return {.error = std::move(error)};
+        }
+        if (auto error = ValidateLayoutProfile(*registration.layout,
+                                               registration.profile);
+            !error.empty())
+            return {.error = std::move(error)};
+    }
     return {};
 }
 
@@ -248,6 +269,12 @@ RegistrationResult PrefixCacheTable::Register(
 
     auto candidate =
         std::make_shared<ContextState>(registration.profile, block_limit_);
+    if (registration.layout) {
+        candidate->hybrid = std::make_shared<HybridIndex>(registration.layout);
+        candidate->hybrid->Register(registration.instance_id,
+                                    registration.dp_rank,
+                                    registration.readable_domains);
+    }
     candidate->instance_ranks[registration.instance_id].insert(
         registration.dp_rank);
     candidate->instance_publishers[registration.instance_id].emplace(
@@ -269,6 +296,10 @@ RegistrationResult PrefixCacheTable::Register(
         return {.error =
                     "registration conflicts with the ContextKey hash profile"};
     }
+    if (!MatchesLayout(state->hybrid, registration.layout)) {
+        return {.error =
+                    "registration conflicts with the ContextKey cache layout"};
+    }
     auto publisher = state->instance_publishers.find(registration.instance_id);
     if (publisher != state->instance_publishers.end()) {
         auto rank = publisher->second.find(registration.dp_rank);
@@ -279,12 +310,82 @@ RegistrationResult PrefixCacheTable::Register(
                     "registration conflicts with the engine publisher kind"};
         }
     }
+    if (state->hybrid) {
+        if (auto error = state->hybrid->Register(registration.instance_id,
+                                                 registration.dp_rank,
+                                                 registration.readable_domains);
+            !error.empty()) {
+            return {.error = std::move(error)};
+        }
+    }
     const bool inserted = state->instance_ranks[registration.instance_id]
                               .insert(registration.dp_rank)
                               .second;
     state->instance_publishers[registration.instance_id].emplace(
         registration.dp_rank, registration.publisher_kind);
     return {.inserted = inserted, .error = ""};
+}
+
+std::string PrefixCacheTable::BindLayout(
+    const ContextKey& context, const HashProfile& profile,
+    std::shared_ptr<const CacheLayout> layout) {
+    if (auto error = ValidateContext(context); !error.empty()) return error;
+    if (auto error = ValidateHashProfile(profile); !error.empty()) return error;
+    if (layout) {
+        if (auto error = ValidateCacheLayout(*layout); !error.empty())
+            return error;
+        if (auto error = ValidateLayoutProfile(*layout, profile);
+            !error.empty())
+            return error;
+    }
+    auto candidate = std::make_shared<ContextState>(profile, block_limit_);
+    if (layout) candidate->hybrid = std::make_shared<HybridIndex>(layout);
+    std::shared_ptr<ContextState> state;
+    {
+        std::unique_lock lock(context_map_mutex_);
+        auto [it, inserted] =
+            contexts_.try_emplace(context, std::move(candidate));
+        if (inserted) return "";
+        state = it->second;
+    }
+    std::shared_lock lock(state->mutex);
+    if (state->profile != profile)
+        return "hash profile conflicts with registered context";
+    if (!MatchesLayout(state->hybrid, layout))
+        return "cache layout conflicts with registered context";
+    return "";
+}
+
+std::string PrefixCacheTable::ActivateDeployment(const ContextKey& context,
+                                                 const HashProfile& profile,
+                                                 const SourceLayout& binding,
+                                                 const std::string& instance,
+                                                 int64_t rank) {
+    if (!binding.layout || !binding.layout->unavailable_reason.empty())
+        return "a complete deployment layout is required";
+    if (auto error = ValidateCacheLayout(*binding.layout); !error.empty())
+        return error;
+    if (auto error = ValidateLayoutProfile(*binding.layout, profile);
+        !error.empty())
+        return error;
+    const auto state = LoadContextState(context);
+    if (!state) return "deployment context is not registered";
+    std::unique_lock lock(state->mutex);
+    if (state->profile != profile || !state->hybrid)
+        return "deployment conflicts with context profile/layout";
+    return state->hybrid->ActivateDeployment(binding, instance, rank);
+}
+
+bool PrefixCacheTable::GetDeployment(const ContextKey& context,
+                                     SourceLayout* binding) const {
+    const auto state = LoadContextState(context);
+    if (!state) return false;
+    std::shared_lock lock(state->mutex);
+    if (!state->hybrid) return false;
+    const auto deployment = state->hybrid->Deployment();
+    if (!deployment) return false;
+    *binding = *deployment;
+    return true;
 }
 
 std::shared_ptr<ContextState> PrefixCacheTable::LoadContextState(
@@ -295,7 +396,8 @@ std::shared_ptr<ContextState> PrefixCacheTable::LoadContextState(
 }
 
 std::string PrefixCacheTable::ValidateProfileBinding(
-    const ContextKey& context, const HashProfile& profile) const {
+    const ContextKey& context, const HashProfile& profile,
+    std::shared_ptr<const CacheLayout> layout) const {
     if (auto error = ValidateContext(context); !error.empty()) {
         return error;
     }
@@ -311,6 +413,8 @@ std::string PrefixCacheTable::ValidateProfileBinding(
     if (state->profile != profile) {
         return "hash profile conflicts with the registered ContextKey profile";
     }
+    if (!MatchesLayout(state->hybrid, layout))
+        return "cache layout conflicts with registered context";
     return "";
 }
 
@@ -348,6 +452,11 @@ std::string PrefixCacheTable::Unregister(const ContextKey& context,
         }
     }
 
+    if (state->hybrid) {
+        state->hybrid->Unregister(instance_id, dp_rank);
+        return "";
+    }
+
     for (auto& [unused_prefix, presence] : state->blocks) {
         (void)unused_prefix;
         std::erase_if(presence.device_owners, [&](const EngineOwner& owner) {
@@ -381,6 +490,7 @@ std::string PrefixCacheTable::StoreEngine(const EngineMutation& mutation) {
     }
 
     std::unique_lock state_lock(state->mutex);
+    if (state->hybrid) return "special-KV context requires a grouped mutation";
     auto instance = state->instance_ranks.find(mutation.owner.instance_id);
     if (instance == state->instance_ranks.end() ||
         !instance->second.contains(mutation.owner.dp_rank)) {
@@ -425,6 +535,7 @@ std::string PrefixCacheTable::RemoveEngine(const EngineMutation& mutation) {
     }
 
     std::unique_lock state_lock(state->mutex);
+    if (state->hybrid) return "special-KV context requires a grouped mutation";
     // Only prefixes in the mutation can become empty, so avoid a full scan.
     for (ProjectedPrefix prefix : mutation.prefixes) {
         auto block = state->blocks.find(prefix);
@@ -462,6 +573,11 @@ std::string PrefixCacheTable::ClearEngine(const EngineClear& clear) {
     }
 
     std::unique_lock state_lock(state->mutex);
+    if (state->hybrid) {
+        state->hybrid->Clear(clear.owner.source_stream, std::nullopt,
+                             clear.tier);
+        return "";
+    }
     for (auto& [unused_prefix, presence] : state->blocks) {
         (void)unused_prefix;
         if (!clear.tier || *clear.tier == StorageTier::kDevice) {
@@ -489,6 +605,7 @@ std::string PrefixCacheTable::StoreShared(const SharedMutation& mutation) {
     }
 
     std::unique_lock state_lock(state->mutex);
+    if (state->hybrid) return "special-KV context requires a grouped mutation";
     for (ProjectedPrefix prefix : mutation.prefixes) {
         auto& presence = state->blocks[prefix];
         if (mutation.tier == StorageTier::kCpuShare) {
@@ -526,6 +643,7 @@ std::string PrefixCacheTable::RemoveShared(const SharedMutation& mutation) {
     }
 
     std::unique_lock state_lock(state->mutex);
+    if (state->hybrid) return "special-KV context requires a grouped mutation";
     // Only prefixes in the mutation can become empty, so avoid a full scan.
     for (ProjectedPrefix prefix : mutation.prefixes) {
         auto block = state->blocks.find(prefix);
@@ -554,6 +672,11 @@ std::string PrefixCacheTable::ClearShared(const SharedClear& clear) {
     }
 
     std::unique_lock state_lock(state->mutex);
+    if (state->hybrid) {
+        state->hybrid->Clear(clear.owner.source_stream, clear.owner.backend_id,
+                             clear.tier);
+        return "";
+    }
     for (auto& [unused_prefix, presence] : state->blocks) {
         (void)unused_prefix;
         if (!clear.tier.has_value() || *clear.tier == StorageTier::kCpuShare) {
@@ -567,6 +690,44 @@ std::string PrefixCacheTable::ClearShared(const SharedClear& clear) {
     return "";
 }
 
+std::string PrefixCacheTable::StoreGrouped(const GroupMutation& mutation) {
+    if (auto error = ValidateContext(mutation.context); !error.empty())
+        return error;
+    auto state = LoadContextState(mutation.context);
+    if (!state || !state->hybrid) return "special-KV context is not registered";
+    std::unique_lock lock(state->mutex);
+    if (auto error = state->hybrid->Validate(mutation); !error.empty())
+        return error;
+    state->hybrid->Store(mutation);
+    return "";
+}
+
+std::string PrefixCacheTable::RemoveGrouped(const GroupMutation& mutation) {
+    if (auto error = ValidateContext(mutation.context); !error.empty())
+        return error;
+    auto state = LoadContextState(mutation.context);
+    if (!state) return "";
+    if (!state->hybrid) return "special-KV context is not registered";
+    std::unique_lock lock(state->mutex);
+    if (auto error = state->hybrid->Validate(mutation); !error.empty())
+        return error;
+    state->hybrid->Remove(mutation);
+    return "";
+}
+
+std::string PrefixCacheTable::ClearGroupedSource(
+    const ContextKey& context, const std::string& source,
+    const std::optional<std::string>& backend) {
+    if (auto error = ValidateContext(context); !error.empty()) return error;
+    if (source.empty()) return "source must not be empty";
+    auto state = LoadContextState(context);
+    if (!state) return "";
+    if (!state->hybrid) return "special-KV context is not registered";
+    std::unique_lock lock(state->mutex);
+    state->hybrid->Clear(source, backend);
+    return "";
+}
+
 std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
     const ContextKey& context, std::span<const int32_t> token_ids,
     std::optional<std::string> cache_salt,
@@ -575,6 +736,11 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
     auto state = LoadContextState(context);
     if (!state) {
         return results;
+    }
+
+    if (state->hybrid) {
+        return state->hybrid->Query(*state, context, token_ids, cache_salt,
+                                    instance_filter);
     }
 
     // The profile is immutable, and the shared_ptr keeps state alive while the
@@ -762,7 +928,8 @@ GlobalView PrefixCacheTable::GetGlobalView() const {
         context_view.context = context;
         context_view.profile = state->profile;
         context_view.instance_ranks = state->instance_ranks;
-        context_view.prefix_count = state->blocks.size();
+        context_view.prefix_count =
+            state->hybrid ? state->hybrid->PrefixCount() : state->blocks.size();
         view.contexts.push_back(std::move(context_view));
     }
     return view;

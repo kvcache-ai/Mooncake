@@ -165,6 +165,23 @@ std::string ParseVllmObjectKey(const std::string& object_key,
     *result = {};
     const auto parts = SplitAt(object_key, '@');
 
+    // Mooncake's hybrid layerwise object contains the whole stage-local
+    // group. The final rank is a physical shard, not part of its hash.
+    if (parts.size() == 6 && !parts[0].empty() &&
+        parts[1].starts_with("mooncake_hybrid_v1:") &&
+        parts[1].size() ==
+            std::string_view("mooncake_hybrid_v1:").size() + 64 &&
+        IsHashText(
+            parts[1].substr(std::string_view("mooncake_hybrid_v1:").size())) &&
+        HasDecimalLabel(parts[2], "group:") &&
+        HasDecimalLabel(parts[3], "block:") &&
+        TryParseInteger<uint64_t>(parts[3].substr(6)).value_or(0) > 0 &&
+        IsVllmHashText(parts[4]) && IsNonNegativeDecimal(parts[5])) {
+        result->logical_key = object_key;
+        result->namespace_prefix = JoinParts(parts, 0, 4);
+        return FillProjectedHash(parts[4], result);
+    }
+
     // Current vLLM-Ascend layerwise GVA keys use a compact layout without
     // field labels: model@hash@head_or_tp_rank, or
     // model@group_id@hash@head_or_tp_rank for multi-group models.

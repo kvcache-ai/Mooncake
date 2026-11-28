@@ -97,9 +97,9 @@ TEST(TransportRegistrationLimitTest, ClassifiesProtocols) {
 
     EXPECT_EQ(GetTransportRegistrationLimit("rdma"), std::nullopt);
     EXPECT_EQ(GetTransportRegistrationLimit("tcp"), std::nullopt);
+    EXPECT_EQ(GetTransportRegistrationLimit("ub"), std::nullopt);
     EXPECT_EQ(GetTransportRegistrationLimit("efa"), kMaxMrSize);
     EXPECT_EQ(GetTransportRegistrationLimit("cxi"), kMaxMrSize);
-    EXPECT_TRUE(GetTransportRegistrationLimit("ub").has_value());
 }
 
 class RealClientTest : public ::testing::Test {
