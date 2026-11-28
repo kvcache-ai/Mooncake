@@ -28,6 +28,7 @@
 #include "metadata/lease_eviction_index.h"
 #include "metadata/namespace_policy.h"
 #include "metadata/object_route.h"
+#include "metadata/object_view.h"
 #include "tenant_id.h"
 #include "types.h"
 
@@ -70,6 +71,47 @@ class Namespace final : private route::RouteObserver {
     route::ObjectRoute objects;
 
     const TenantId& id() const { return id_; }
+
+    // Binds a published object held through this namespace's route to the
+    // authoritative TenantId and key owned by this namespace and its slot.
+    // Rvalue guards and rvalue namespaces are deleted so a view cannot be
+    // produced from a temporary lock that releases at the end of the
+    // expression.
+    [[nodiscard]] ObjectView View(
+        const route::WriteGuard& guard) const& noexcept {
+        assert(guard.BelongsTo(objects) && guard.has_object());
+        return ObjectView(id_, guard.key(), guard.metadata());
+    }
+    ObjectView View(const route::WriteGuard&&) const& = delete;
+    ObjectView View(const route::WriteGuard&) const&& = delete;
+    ObjectView View(const route::WriteGuard&&) const&& = delete;
+
+    [[nodiscard]] ObjectView View(
+        const route::ReadGuard& guard) const& noexcept {
+        assert(guard.BelongsTo(objects) && guard.has_object());
+        return ObjectView(id_, guard.key(), guard.metadata());
+    }
+    ObjectView View(const route::ReadGuard&&) const& = delete;
+    ObjectView View(const route::ReadGuard&) const&& = delete;
+    ObjectView View(const route::ReadGuard&&) const&& = delete;
+
+    [[nodiscard]] ObjectView View(
+        const route::ObjectRoute::Cursor<LockMode::kRead>::Object& object)
+        const& noexcept {
+        assert(object.BelongsTo(objects));
+        return ObjectView(id_, object.key(), object.metadata());
+    }
+    ObjectView View(const route::ObjectRoute::Cursor<LockMode::kRead>::Object&)
+        const&& = delete;
+
+    [[nodiscard]] ObjectView View(
+        const route::ObjectRoute::Cursor<LockMode::kWrite>::Object& object)
+        const& noexcept {
+        assert(object.BelongsTo(objects));
+        return ObjectView(id_, object.key(), object.metadata());
+    }
+    ObjectView View(const route::ObjectRoute::Cursor<LockMode::kWrite>::Object&)
+        const&& = delete;
 
     // The policy's say on the object `guard` holds taking `bytes` more memory,
     // asked before the memory is allocated; zero bytes asks only whether the

@@ -489,11 +489,11 @@ class MasterServiceTestPeer {
     }
 
     size_t EraseReplicasWithCacheTotalAccounting(
-        ObjectMetadata& metadata,
+        MetadataAccessorRW& accessor,
         const std::function<bool(const Replica&)>& pred_fn,
         std::vector<ReplicaID>* erased_replica_ids = nullptr) {
         return service_.EraseReplicasWithCacheTotalAccounting(
-            metadata, pred_fn, erased_replica_ids);
+            accessor, pred_fn, erased_replica_ids);
     }
 
     NamespaceEvictionResult EvictNamespaceMemory(const TenantId& tenant_id,

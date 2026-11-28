@@ -7,13 +7,31 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace mooncake::test {
 namespace {
 
 using Accessor = MasterServiceTestPeer::MetadataAccessorRW;
+using AccessorRO = MasterServiceTestPeer::MetadataAccessorRO;
 using Identity = MasterServiceTestPeer::ObjectIdentity;
+
+template <typename T>
+concept SupportsAccessorView = requires(T&& a) { std::forward<T>(a).View(); };
+
+static_assert(!std::is_copy_constructible_v<Accessor>);
+static_assert(!std::is_copy_assignable_v<Accessor>);
+static_assert(!std::is_move_constructible_v<Accessor>);
+static_assert(!std::is_move_assignable_v<Accessor>);
+static_assert(!std::is_copy_constructible_v<AccessorRO>);
+static_assert(!std::is_copy_assignable_v<AccessorRO>);
+static_assert(!std::is_move_constructible_v<AccessorRO>);
+static_assert(!std::is_move_assignable_v<AccessorRO>);
+static_assert(SupportsAccessorView<const Accessor&>);
+static_assert(!SupportsAccessorView<Accessor&&>);
+static_assert(SupportsAccessorView<const AccessorRO&>);
+static_assert(!SupportsAccessorView<AccessorRO&&>);
 
 std::optional<route::ObjectRef> CurrentRef(MasterService& service,
                                            const std::string& key) {

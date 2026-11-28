@@ -41,13 +41,13 @@ class FakePolicy final : public eviction::EvictionPolicy {
    public:
     tl::expected<eviction::Plan, SkipReason> Decide(
         const eviction::Candidate& candidate) const override {
-        if (!candidate.fallback && soft_pinned.count(candidate.key) > 0) {
+        if (!candidate.fallback && soft_pinned.count(candidate.key()) > 0) {
             return tl::make_unexpected(defer_soft_pinned
                                            ? SkipReason::kDeferred
                                            : SkipReason::kSoftPinned);
         }
         eviction::Plan plan;
-        for (const Replica& replica : candidate.metadata.GetAllReplicas()) {
+        for (const Replica& replica : candidate.metadata().GetAllReplicas()) {
             if (replica.is_memory_replica() && replica.is_completed() &&
                 replica.get_refcnt() == 0) {
                 plan.release.push_back(replica.id());
@@ -102,15 +102,20 @@ class FakeReclaimer final : public eviction::Reclaimer {
     std::vector<std::string> torn_down;
 };
 
+static_assert(!std::is_copy_constructible_v<eviction::Candidate>);
+static_assert(!std::is_copy_assignable_v<eviction::Candidate>);
+static_assert(!std::is_move_constructible_v<eviction::Candidate>);
+static_assert(!std::is_move_assignable_v<eviction::Candidate>);
+
 class RecordingObserver final : public eviction::EvictionObserver {
    public:
     void OnApplied(const eviction::ObjectView& view,
                    const eviction::Effect&) override {
-        applied.push_back(view.key);
+        applied.push_back(view.key());
     }
     void OnSkipped(const eviction::ObjectView& view,
                    SkipReason reason) override {
-        skipped.emplace_back(view.key, reason);
+        skipped.emplace_back(view.key(), reason);
     }
     void OnRunEnd(const Scope&, const eviction::Report& report) override {
         ++runs;
@@ -137,9 +142,9 @@ class EvictorTest : public ::testing::Test {
             list.emplace_back(allocator_->allocate(128),
                               ReplicaStatus::COMPLETE);
         }
-        (void)guard.Publish(
-            UUID{1, 2}, Clock::time_point{}, 128, std::move(list), std::nullopt,
-            false, ObjectDataType::UNKNOWN, group_id, TenantId(tenant), key);
+        (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
+                            std::move(list), std::nullopt, false,
+                            ObjectDataType::UNKNOWN, group_id);
         SetDeadline(guard.metadata(), Clock::now() - age);
     }
 
@@ -389,8 +394,7 @@ TEST_F(EvictorTest, AReplacedDeferredObjectIsLeftAlone) {
         list.emplace_back(allocator_->allocate(128), ReplicaStatus::COMPLETE);
         (void)hold->Publish(UUID{1, 2}, Clock::time_point{}, 128,
                             std::move(list), std::nullopt, false,
-                            ObjectDataType::UNKNOWN, std::string(),
-                            TenantId("a"), "pinned");
+                            ObjectDataType::UNKNOWN, std::string());
     };
 
     Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
@@ -450,8 +454,7 @@ TEST_F(EvictorTest, AMemberReplacedBeforeItsTurnIsLeftAlone) {
         list.emplace_back(allocator_->allocate(128), ReplicaStatus::COMPLETE);
         (void)hold->Publish(UUID{1, 2}, Clock::time_point{}, 128,
                             std::move(list), std::nullopt, false,
-                            ObjectDataType::UNKNOWN, std::string(),
-                            TenantId("a"), replaced);
+                            ObjectDataType::UNKNOWN, std::string());
         SetDeadline(hold->metadata(), Clock::now() + std::chrono::hours(1));
     };
 
@@ -588,8 +591,7 @@ class OffloadingReclaimerTest : public EvictorTest {
         metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
         auto hold = ns.objects.Write(key);
         EXPECT_TRUE(hold.has_value());
-        eviction::Candidate candidate{ns.id(), key, hold->metadata(),
-                                      Clock::now(), false};
+        eviction::Candidate candidate{ns.View(*hold), Clock::now(), false};
         auto plan = policy_.Decide(candidate);
         EXPECT_TRUE(plan.has_value());
         auto effect = reclaimer.Apply(ns, *hold, *plan, so_far);

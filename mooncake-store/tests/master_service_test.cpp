@@ -3906,6 +3906,72 @@ TEST_F(MasterServiceTest, SoftPinExpiresAndGetDoesNotReactivate) {
     service_->RemoveAll();
 }
 
+TEST_F(MasterServiceTest,
+       SoftPinUsesNormalizedTenantWhenMultiTenancyIsDisabled) {
+    const uint64_t kv_lease_ttl = 200;
+    const uint64_t kv_soft_pin_ttl = 20;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+    const TenantId requested_tenant("tenant-a");
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 16;
+    constexpr size_t value_size = 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service, "test_segment", buffer, segment_size);
+
+    const int64_t baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+    ReplicateConfig config;
+    config.soft_pin_action = SoftPinAction::ENABLE;
+
+    ASSERT_TRUE(service
+                    ->PutStart(client_id, "pin_expire", requested_tenant,
+                               value_size, config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "pin_expire", requested_tenant,
+                             ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline + 1);
+    EXPECT_EQ(SoftPinRegistrationCount(*service), 1u);
+
+    // With multi-tenancy disabled, the object lives in the default namespace;
+    // soft-pin indexing must use the normalized tenant so expiry sweeps find
+    // it and clear both the metadata deadline and the index entry.
+    const auto deadline = GetSoftPinDeadline(*service, "pin_expire");
+    ASSERT_TRUE(deadline.has_value());
+    CleanupExpiredSoftPinsAt(*service, *deadline);
+    EXPECT_FALSE(GetSoftPinDeadline(*service, "pin_expire").has_value());
+    EXPECT_EQ(SoftPinRegistrationCount(*service), 0u);
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+
+    // Erasing a soft-pinned object must also remove its deadline registration
+    // under the normalized tenant.
+    ASSERT_TRUE(service
+                    ->PutStart(client_id, "pin_remove", requested_tenant,
+                               value_size, config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "pin_remove", requested_tenant,
+                             ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(SoftPinRegistrationCount(*service), 1u);
+    ASSERT_TRUE(
+        service->Remove("pin_remove", requested_tenant, /*force=*/true));
+    EXPECT_EQ(SoftPinRegistrationCount(*service), 0u);
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+
+    service->RemoveAll();
+}
+
 TEST_F(MasterServiceTest, ExistKeyLeasesPinSegmentButProbeKeyDoesNot) {
     // Set a long lease TTL so leases granted by ExistKey will not expire
     // during the test.

@@ -245,9 +245,11 @@ class Evictor::Pass {
             return {};
         }
         report_.Add(*effect);
-        const ObjectView view{ns_.id(), hold.key(), hold.metadata()};
-        for (EvictionObserver* observer : evictor_.observers_) {
-            observer->OnApplied(view, *effect);
+        {
+            const ObjectView view = ns_.View(hold);
+            for (EvictionObserver* observer : evictor_.observers_) {
+                observer->OnApplied(view, *effect);
+            }
         }
         if (effect->needs_teardown) {
             evictor_.reclaimer_.TearDown(ns_, hold);
@@ -270,7 +272,7 @@ class Evictor::Pass {
             reason = SkipReason::kLeaseActive;
         } else {
             auto plan = evictor_.policy_.Decide(
-                Candidate{ns_.id(), hold.key(), metadata, now_, fallback});
+                Candidate{ns_.View(hold), now_, fallback});
             if (plan) {
                 return plan;
             }
@@ -289,7 +291,7 @@ class Evictor::Pass {
         } else if (reason == SkipReason::kLeaseActive) {
             ++report_.lease_active;
         }
-        const ObjectView view{ns_.id(), hold.key(), hold.metadata()};
+        const ObjectView view = ns_.View(hold);
         for (EvictionObserver* observer : evictor_.observers_) {
             observer->OnSkipped(view, reason);
         }

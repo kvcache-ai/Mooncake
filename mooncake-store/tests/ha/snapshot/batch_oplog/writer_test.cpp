@@ -816,8 +816,8 @@ TEST_F(BatchOpLogSnapshotWriterTest,
     ASSERT_TRUE(accessor.Exists());
     EXPECT_EQ("opaque-unit", accessor.Get().residency_affinity_id);
     EXPECT_EQ("write-session", accessor.Get().session_id);
-    EXPECT_EQ(tenant, accessor.Get().tenant_id);
-    EXPECT_EQ(key, accessor.Get().user_key);
+    EXPECT_EQ(tenant, accessor.GetTenantId());
+    EXPECT_EQ(key, accessor.GetKey());
 }
 
 TEST_F(BatchOpLogSnapshotWriterTest, WritesAndVerifiesMultipleChunks) {

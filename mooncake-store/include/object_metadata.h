@@ -3,8 +3,9 @@
 // ObjectMetadata: the per-object metadata envelope.
 //
 // Moved out of MasterService so the service and the per-object metadata
-// module share one definition. The envelope owns the object identity, the
-// authoritative read lease and the soft-pin state.
+// module share one definition. The envelope owns the object's content, the
+// authoritative read lease and the soft-pin state; its tenant and key are
+// owned by the Namespace and route::KeySlot that hold it.
 // The object's content and the replicas holding it live in the envelope's
 // single ObjectPart.
 //
@@ -22,6 +23,7 @@
 #include <ranges>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -35,7 +37,6 @@
 #include "mutex.h"
 #include "object_part.h"
 #include "replica.h"
-#include "tenant_id.h"
 #include "types.h"
 
 namespace mooncake {
@@ -68,29 +69,33 @@ struct ObjectMetadata {
         }
     }
 
+    // Non-owning key view passed by ObjectRoute::PublishLocked so key-group
+    // classification and RAII metric accounting stay in ObjectMetadata without
+    // duplicating the key string.
+    struct KeyView {
+        std::string_view value;
+    };
+
     ObjectMetadata() = delete;
 
-    ObjectMetadata(const UUID& client_id_,
+    ObjectMetadata(KeyView key_, const UUID& client_id_,
                    const std::chrono::system_clock::time_point put_start_time_,
                    size_t value_length, std::vector<Replica>&& reps,
                    std::optional<std::chrono::system_clock::time_point>
                        committed_soft_pin_timeout = std::nullopt,
                    bool enable_hard_pin = false,
                    ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
-                   std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
-                   std::string user_key_ = {},
+                   std::string group_id_ = "",
                    std::string residency_affinity_id_ = "")
         : client_id(client_id_),
           put_start_time(put_start_time_),
-          data_type(data_type_),
           group_id(std::move(group_id_)),
           residency_affinity_id(std::move(residency_affinity_id_)),
-          tenant_id(std::move(tenant_id_)),
-          user_key(std::move(user_key_)),
+          data_type(data_type_),
           key_group(
-              MasterMetricManager::instance().classify_key_group(user_key)),
-          soft_pin_timeout(std::move(committed_soft_pin_timeout)),
-          hard_pinned(enable_hard_pin) {
+              MasterMetricManager::instance().classify_key_group(key_.value)),
+          hard_pinned(enable_hard_pin),
+          soft_pin_timeout(std::move(committed_soft_pin_timeout)) {
         parts_.emplace_back(value_length, std::move(reps));
         MasterMetricManager::instance().inc_key_count(1);
         MasterMetricManager::instance().inc_key_group(key_group, value_length);
@@ -99,6 +104,21 @@ struct ObjectMetadata {
         }
         MasterMetricManager::instance().observe_value_size(value_length);
     }
+
+    // Standalone construction (e.g. unit tests outside a route).
+    ObjectMetadata(const UUID& client_id_,
+                   const std::chrono::system_clock::time_point put_start_time_,
+                   size_t value_length, std::vector<Replica>&& reps,
+                   std::optional<std::chrono::system_clock::time_point>
+                       committed_soft_pin_timeout = std::nullopt,
+                   bool enable_hard_pin = false,
+                   ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
+                   std::string group_id_ = "",
+                   std::string residency_affinity_id_ = "")
+        : ObjectMetadata(KeyView{}, client_id_, put_start_time_, value_length,
+                         std::move(reps), std::move(committed_soft_pin_timeout),
+                         enable_hard_pin, data_type_, std::move(group_id_),
+                         std::move(residency_affinity_id_)) {}
 
     ObjectMetadata(const ObjectMetadata&) = delete;
     ObjectMetadata& operator=(const ObjectMetadata&) = delete;
@@ -109,12 +129,8 @@ struct ObjectMetadata {
     UUID client_id;
     // Updated by UpsertStart (Case B) to reset the discard timeout.
     std::chrono::system_clock::time_point put_start_time;
-    const ObjectDataType data_type{ObjectDataType::UNKNOWN};
     const std::string group_id;
     const std::string residency_affinity_id;
-    const TenantId tenant_id;
-    const std::string user_key;
-    const uint8_t key_group;
 
     // Committed attribution only; protected by the key's lock.
     std::string session_id;
@@ -153,6 +169,11 @@ struct ObjectMetadata {
     }
 
     mutable SpinLock lock;
+    const ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    const uint8_t key_group;
+    const bool hard_pinned{false};  // immutable, set at creation
+    bool memory_cache_total_accounted{false};
+    bool disk_cache_total_accounted{false};
     // Authoritative lease: ungrouped objects own one; grouped objects share
     // the group's. Never null after construction.
     mutable std::shared_ptr<Lease> lease_ GUARDED_BY(lock) =
@@ -164,9 +185,6 @@ struct ObjectMetadata {
     // carry a generation token, so a stale End from the same client cannot
     // otherwise be distinguished from the current write.
     HeapOptional<PendingSoftPinAction> pending_soft_pin_action;
-    const bool hard_pinned{false};  // immutable, set at creation
-    bool memory_cache_total_accounted{false};
-    bool disk_cache_total_accounted{false};
 
     struct DynamicReplicaRecord {
         std::chrono::system_clock::time_point created_at;

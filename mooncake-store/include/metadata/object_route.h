@@ -183,9 +183,11 @@ class KeySlot {
     // neither copied nor moved.
     struct Record {
         template <typename... Args>
-        explicit Record(Generation generation, Args&&... metadata_args)
+        explicit Record(Generation generation, std::string_view key,
+                        Args&&... metadata_args)
             : generation(generation),
-              metadata(std::forward<Args>(metadata_args)...) {}
+              metadata(ObjectMetadata::KeyView{key},
+                       std::forward<Args>(metadata_args)...) {}
 
         Generation generation;
         ObjectMetadata metadata;
@@ -344,6 +346,9 @@ class Guard {
     ~Guard();
 
     const std::string& key() const { return slot_->key(); }
+    [[nodiscard]] bool BelongsTo(const ObjectRoute& route) const noexcept {
+        return route_ == &route;
+    }
 
     // Whether the key holds an object.
     bool has_object() const { return slot_->record_.has_value(); }
@@ -359,9 +364,9 @@ class Guard {
     // arguments, and wires its group membership and the group's shared lease;
     // the state starts empty. Returns the new publication's generation.
     //
-    // Two caller bugs abort in every build rather than corrupt the route: a
-    // key that already holds an object, whose group membership and count the
-    // new one would strand, and metadata whose user_key is not this key.
+    // A caller bug aborts in every build rather than corrupt the route: a key
+    // that already holds an object, whose group membership and count the new
+    // one would strand.
     //
     // Nobody else can reach the object until the guard is released, so the
     // caller finishes setting it up through metadata() and state().
@@ -642,6 +647,9 @@ class ObjectRoute::Cursor {
         using State = typename Guard<kMode>::State;
 
         const std::string& key() const { return slot_.key(); }
+        [[nodiscard]] bool BelongsTo(const ObjectRoute& route) const noexcept {
+            return route_ == &route;
+        }
         Generation generation() const { return slot_.record_->generation; }
         ObjectRef ref() const { return {key(), generation()}; }
         Metadata& metadata() const { return slot_.record_->metadata; }
@@ -655,7 +663,9 @@ class ObjectRoute::Cursor {
 
        private:
         friend class Cursor;
-        explicit Object(KeySlot& slot) : slot_(slot) {}
+        Object(const ObjectRoute* route, KeySlot& slot)
+            : route_(route), slot_(slot) {}
+        const ObjectRoute* route_;
         KeySlot& slot_;
     };
 
@@ -663,7 +673,9 @@ class ObjectRoute::Cursor {
 
     class Iterator {
        public:
-        Object operator*() const { return Object(*cursor_->current_); }
+        Object operator*() const {
+            return Object(&cursor_->route_, *cursor_->current_);
+        }
         Iterator& operator++() {
             cursor_->Advance();
             return *this;
@@ -863,13 +875,11 @@ Generation ObjectRoute::PublishLocked(KeySlot& slot, Args&&... metadata_args) {
     const Generation generation =
         next_generation_.fetch_add(1, std::memory_order_relaxed);
     ObjectMetadata& metadata =
-        slot.record_.emplace(generation, std::forward<Args>(metadata_args)...)
+        slot.record_
+            .emplace(generation, slot.key(),
+                     std::forward<Args>(metadata_args)...)
             .metadata;
     slot.state_.fetch_or(KeySlot::kOccupied, std::memory_order_relaxed);
-    if (metadata.user_key != slot.key()) {
-        LOG(FATAL) << "Publish under key " << slot.key()
-                   << " of an object keyed " << metadata.user_key;
-    }
     if (!metadata.group_id.empty()) {
         // AddMember returns null only for an empty group_id.
         auto lease = groups_.AddMember(metadata.group_id, slot.key());

@@ -16,6 +16,7 @@
 
 #include <ylt/util/tl/expected.hpp>
 
+#include "metadata/object_view.h"
 #include "object_metadata.h"
 #include "replica.h"
 #include "tenant_id.h"
@@ -28,12 +29,20 @@ using Clock = std::chrono::system_clock;
 // An object the evictor may take memory from, as the policy sees it under the
 // object's write lock.
 struct Candidate {
-    const TenantId& tenant_id;
-    const std::string& key;
-    const ObjectMetadata& metadata;
+    metadata::ObjectView object;
     Clock::time_point now;
     // Set when the evictor comes back to an object the policy deferred.
     bool fallback;
+
+    [[nodiscard]] const TenantId& tenant_id() const noexcept {
+        return object.tenant_id();
+    }
+    [[nodiscard]] const std::string& key() const noexcept {
+        return object.key();
+    }
+    [[nodiscard]] const ObjectMetadata& metadata() const noexcept {
+        return object.metadata();
+    }
 };
 
 // The replicas to take off the candidate.
