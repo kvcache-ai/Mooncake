@@ -3461,6 +3461,10 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_locked(
     }
 
     auto &context = it->second;
+    // Capture pins before tearing down so a dead dummy client's GetHotKey
+    // ref_count is not stranded (BufferHandle destructor never runs).
+    std::vector<std::string> hot_pins_to_release =
+        TakeHotCachePinsLocked(context);
     context.client_buffer_allocator.reset();
 
     // Retry previously quarantined segments (unregister failed earlier) before
@@ -3541,10 +3545,15 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_locked(
     }
     context.mapped_shms.clear();
     shm_contexts_.erase(it);
+    tl::expected<void, ErrorCode> result = {};
     if (failed) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    return {};
+    // ReleaseHotKey takes LocalHotCache::lru_mutex_; drop dummy_client_mutex_
+    // first to avoid lock-order inversion with acquire_hot_cache.
+    lock.unlock();
+    ReleaseHotCachePins(hot_pins_to_release);
+    return result;
 }
 
 tl::expected<void, ErrorCode> RealClient::ascend_shm_internal(
@@ -3762,6 +3771,8 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_locked(
     }
 
     auto &context = it->second;
+    std::vector<std::string> hot_pins_to_release =
+        TakeHotCachePinsLocked(context);
     context.client_buffer_allocator.reset();
 
     // Retry previously quarantined segments (unregister failed earlier) before
@@ -3860,10 +3871,15 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_locked(
         }
     }
     shm_contexts_.erase(it);
+    tl::expected<void, ErrorCode> result = {};
     if (failed) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    return {};
+    // ReleaseHotKey takes LocalHotCache::lru_mutex_; drop dummy_client_mutex_
+    // first to avoid lock-order inversion with acquire_hot_cache.
+    lock.unlock();
+    ReleaseHotCachePins(hot_pins_to_release);
+    return result;
 }
 
 tl::expected<bool, ErrorCode> RealClient::is_shm_mapped_internal(
@@ -4203,8 +4219,35 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
         });
 }
 
+std::vector<std::string> RealClient::TakeHotCachePinsLocked(
+    ShmContext &context) {
+    std::vector<std::string> keys;
+    size_t total = 0;
+    for (const auto &entry : context.hot_cache_pins) {
+        total += entry.second;
+    }
+    keys.reserve(total);
+    for (auto &entry : context.hot_cache_pins) {
+        for (size_t i = 0; i < entry.second; ++i) {
+            keys.push_back(entry.first);
+        }
+    }
+    context.hot_cache_pins.clear();
+    return keys;
+}
+
+void RealClient::ReleaseHotCachePins(const std::vector<std::string> &keys) {
+    if (keys.empty() || !client_ || !client_->IsHotCacheEnabled()) {
+        return;
+    }
+    auto hot_cache = client_->GetHotCache();
+    for (const auto &key : keys) {
+        hot_cache->ReleaseHotKey(key);
+    }
+}
+
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
-RealClient::acquire_hot_cache(const std::string &key) {
+RealClient::acquire_hot_cache(const std::string &key, const UUID &client_id) {
     if (!client_ || !client_->IsHotCacheEnabled()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -4221,16 +4264,54 @@ RealClient::acquire_hot_cache(const std::string &key) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
+    // Record the pin under the client's ledger so expiry/unmap can release it.
+    // GetHotKey already ran (lru_mutex_); take dummy_client_mutex_ second.
+    bool client_missing = false;
+    {
+        std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        auto it = shm_contexts_.find(client_id);
+        if (it == shm_contexts_.end()) {
+            client_missing = true;
+        } else {
+            it->second.hot_cache_pins[key]++;
+        }
+    }
+    if (client_missing) {
+        hot_cache->ReleaseHotKey(key);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     return std::make_tuple(static_cast<uint64_t>(offset), blk->size);
 }
 
 tl::expected<void, ErrorCode> RealClient::release_hot_cache(
-    const std::string &key) {
+    const std::string &key, const UUID &client_id) {
     if (!client_ || !client_->IsHotCacheEnabled()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    client_->GetHotCache()->ReleaseHotKey(key);
+    bool should_release = false;
+    {
+        std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        auto it = shm_contexts_.find(client_id);
+        if (it == shm_contexts_.end()) {
+            // Client already unmapped; pin was released during unmap/expiry.
+            return {};
+        }
+        auto &pins = it->second.hot_cache_pins;
+        auto pit = pins.find(key);
+        if (pit == pins.end() || pit->second == 0) {
+            // Already released (e.g. duplicate release); do not ReleaseHotKey.
+            return {};
+        }
+        if (--(pit->second) == 0) {
+            pins.erase(pit);
+        }
+        should_release = true;
+    }
+    if (should_release) {
+        client_->GetHotCache()->ReleaseHotKey(key);
+    }
     return {};
 }
 
@@ -4322,7 +4403,8 @@ RealClient::allocate_buffer_dummy(size_t size, const UUID &client_id) {
 }
 
 std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
-RealClient::batch_acquire_hot_cache(const std::vector<std::string> &keys) {
+RealClient::batch_acquire_hot_cache(const std::vector<std::string> &keys,
+                                    const UUID &client_id) {
     std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>> results;
     results.reserve(keys.size());
 
@@ -4334,6 +4416,8 @@ RealClient::batch_acquire_hot_cache(const std::vector<std::string> &keys) {
     }
 
     auto hot_cache = client_->GetHotCache();
+    std::vector<std::string> acquired_keys;
+    acquired_keys.reserve(keys.size());
     for (const auto &key : keys) {
         HotMemBlock *blk = hot_cache->GetHotKey(key);
         if (!blk) {
@@ -4346,21 +4430,62 @@ RealClient::batch_acquire_hot_cache(const std::vector<std::string> &keys) {
             results.push_back(tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
             continue;
         }
+        acquired_keys.push_back(key);
         results.push_back(
             std::make_tuple(static_cast<uint64_t>(offset), blk->size));
+    }
+
+    if (!acquired_keys.empty()) {
+        std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        auto it = shm_contexts_.find(client_id);
+        if (it == shm_contexts_.end()) {
+            lock.unlock();
+            for (const auto &key : acquired_keys) {
+                hot_cache->ReleaseHotKey(key);
+            }
+            for (auto &r : results) {
+                if (r.has_value()) {
+                    r = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+            }
+            return results;
+        }
+        auto &pins = it->second.hot_cache_pins;
+        for (const auto &key : acquired_keys) {
+            pins[key]++;
+        }
     }
     return results;
 }
 
 tl::expected<void, ErrorCode> RealClient::batch_release_hot_cache(
-    const std::vector<std::string> &keys) {
+    const std::vector<std::string> &keys, const UUID &client_id) {
     if (!client_ || !client_->IsHotCacheEnabled()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto hot_cache = client_->GetHotCache();
-    for (const auto &key : keys) {
-        hot_cache->ReleaseHotKey(key);
+
+    std::vector<std::string> to_release;
+    to_release.reserve(keys.size());
+    {
+        std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        auto it = shm_contexts_.find(client_id);
+        if (it == shm_contexts_.end()) {
+            // Client already unmapped; pins were released during unmap/expiry.
+            return {};
+        }
+        auto &pins = it->second.hot_cache_pins;
+        for (const auto &key : keys) {
+            auto pit = pins.find(key);
+            if (pit == pins.end() || pit->second == 0) {
+                continue;
+            }
+            if (--(pit->second) == 0) {
+                pins.erase(pit);
+            }
+            to_release.push_back(key);
+        }
     }
+    ReleaseHotCachePins(to_release);
     return {};
 }
 

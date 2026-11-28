@@ -242,6 +242,7 @@ class DummyClient : public PyClient {
 
    private:
     friend class DummyClientTeardownTestPeer;
+    friend class DummyClientHotCachePinTestPeer;
 
     struct PreparedBuffer {
         void *original = nullptr;
