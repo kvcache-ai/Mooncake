@@ -851,12 +851,13 @@ class MasterServiceHATest : public ::testing::Test {
         auto hold = MasterServiceTestPeer::WriteObject(
             *service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
         ASSERT_TRUE(hold.has_value());
-        hold->state().promotion_task = MasterServiceTestPeer::PromotionTask{
-            .source_id = 0,
-            .alloc_id = alloc_id,
-            .object_size = object_size,
-            .start_time = std::chrono::system_clock::now(),
-            .holder_id = holder_id};
+        hold->state().MutableTasks().promotion_task =
+            MasterServiceTestPeer::PromotionTask{
+                .source_id = 0,
+                .alloc_id = alloc_id,
+                .object_size = object_size,
+                .start_time = std::chrono::system_clock::now(),
+                .holder_id = holder_id};
     }
 
     static bool NeedMemoryEvictionForTesting(const MasterService& service) {
@@ -936,7 +937,7 @@ class MasterServiceHATest : public ::testing::Test {
                                          const std::string& key) {
         MasterServiceTestPeer::MetadataAccessorRO accessor(
             &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
-        return accessor.Exists() ? accessor.Get().group_id
+        return accessor.Exists() ? accessor.Get().GroupId()
                                  : std::string("<absent>");
     }
 
@@ -1044,7 +1045,7 @@ class MasterServiceHATest : public ::testing::Test {
             &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         ASSERT_TRUE(accessor.Exists());
         SpinLocker locker(&accessor.Get().lock);
-        accessor.Get().lease_->SetDeadline(deadline);
+        accessor.Get().ActiveLease().SetDeadline(deadline);
     }
 
     static std::chrono::system_clock::time_point LeaseDeadlineForTesting(
@@ -1057,7 +1058,7 @@ class MasterServiceHATest : public ::testing::Test {
             return {};
         }
         SpinLocker locker(&accessor.Get().lock);
-        return accessor.Get().lease_->ExpiresAt();
+        return accessor.Get().ActiveLease().ExpiresAt();
     }
 
     static uint64_t EvictNamespaceMemoryForTesting(MasterService& service,
@@ -1376,8 +1377,8 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
     ASSERT_TRUE(legacy_accessor.Exists());
     EXPECT_EQ(legacy_accessor.Get().GetPart(0).checksum(),
               std::optional<uint64_t>(0x1234));
-    EXPECT_EQ("legacy-session", legacy_accessor.Get().session_id);
-    EXPECT_EQ("legacy-affinity", legacy_accessor.Get().residency_affinity_id);
+    EXPECT_EQ("legacy-session", legacy_accessor.Get().SessionId());
+    EXPECT_EQ("legacy-affinity", legacy_accessor.Get().ResidencyAffinityId());
 
     auto source = std::make_unique<StandbyMetadataStore>();
     ASSERT_TRUE(source->PutMetadata(batch_object.tenant_id, batch_object.key,
@@ -1398,8 +1399,8 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
     ASSERT_TRUE(batch_accessor.Exists());
     EXPECT_EQ(batch_accessor.Get().GetPart(0).checksum(),
               std::optional<uint64_t>(0));
-    EXPECT_EQ("batch-session", batch_accessor.Get().session_id);
-    EXPECT_EQ("batch-affinity", batch_accessor.Get().residency_affinity_id);
+    EXPECT_EQ("batch-session", batch_accessor.Get().SessionId());
+    EXPECT_EQ("batch-affinity", batch_accessor.Get().ResidencyAffinityId());
 }
 
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesReplicaIds) {

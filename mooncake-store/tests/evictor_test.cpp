@@ -146,7 +146,7 @@ class EvictorTest : public ::testing::Test {
     static void SetDeadline(const ObjectMetadata& metadata,
                             Clock::time_point deadline) {
         SpinLocker locker(&metadata.lock);
-        metadata.lease_->SetDeadline(deadline);
+        metadata.ActiveLease().SetDeadline(deadline);
     }
 
     // Publishes `key` in `tenant`'s namespace with its lease ending at
@@ -593,8 +593,9 @@ class OffloadingReclaimerTest : public EvictorTest {
         auto plan = policy_.Decide(candidate);
         EXPECT_TRUE(plan.has_value());
         auto effect = reclaimer.Apply(ns, *hold, *plan, so_far);
-        if (effect && hold->state().offloading_task.has_value()) {
-            offloading_source_ = hold->state().offloading_task->source_id;
+        if (effect && hold->state().Tasks().offloading_task.has_value()) {
+            offloading_source_ =
+                hold->state().Tasks().offloading_task->source_id;
         }
         return effect;
     }

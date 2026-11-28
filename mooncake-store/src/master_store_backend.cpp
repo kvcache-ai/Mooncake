@@ -87,12 +87,12 @@ MasterStoreBackend::SnapshotWeightGroup(
             return tl::make_unexpected(WeightManagementError::NOT_FOUND);
         }
         const auto& metadata = accessor.Get();
-        if (metadata.group_id != payload_group_id) {
+        if (metadata.GroupId() != payload_group_id) {
             return tl::make_unexpected(WeightManagementError::CONFLICT);
         }
         members.push_back(WeightGroupMemberSnapshot{
             .key = key,
-            .residency_affinity_id = metadata.residency_affinity_id,
+            .residency_affinity_id = metadata.ResidencyAffinityId(),
             .size = metadata.TotalLength(),
             .data_type = metadata.data_type,
             .readable = master_.HasReadableReplica(metadata),

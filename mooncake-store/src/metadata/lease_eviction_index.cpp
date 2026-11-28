@@ -367,8 +367,7 @@ const Lease* GroupLeaseOf(const ObjectMetadata& metadata) {
     if (!metadata.IsGrouped()) {
         return nullptr;
     }
-    SpinLocker locker(&metadata.lock);
-    return metadata.lease_.get();
+    return metadata.GroupLease().get();
 }
 
 // Per-WorkUnit snapshot sequence recorded when a worker copies the bucket, used
@@ -453,11 +452,7 @@ struct alignas(128) LeaseEvictionIndex::Shard {
         ++size;
         auto it = groups.find(group_lease);
         if (it == groups.end()) {
-            std::shared_ptr<const Lease> held_lease;
-            {
-                SpinLocker locker(&metadata.lock);
-                held_lease = metadata.lease_;
-            }
+            std::shared_ptr<const Lease> held_lease = metadata.GroupLease();
             const uint64_t identity =
                 EntryIdentity::ForGroup(shard_id, ++groups_created);
             const uint64_t born = ++seq;

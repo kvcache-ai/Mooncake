@@ -199,8 +199,8 @@ class DynamicReplicationTest : public ::testing::Test {
             return has_lease;
         }
         const auto& state = accessor.GetState();
-        return state.dynamic_replication_pending.has_value() ||
-               state.dynamic_replication_cooldown !=
+        return state.Tasks().dynamic_replication_pending.has_value() ||
+               state.Tasks().dynamic_replication_cooldown !=
                    std::chrono::steady_clock::time_point{} ||
                has_lease;
     }
@@ -277,7 +277,8 @@ class DynamicReplicationTest : public ::testing::Test {
             &service,
             MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         ASSERT_TRUE(accessor.Exists());
-        auto& pending = accessor.GetState().dynamic_replication_pending;
+        auto& pending =
+            accessor.GetState().MutableTasks().dynamic_replication_pending;
         ASSERT_TRUE(pending.has_value())
             << "the object carries no pending proposal";
         pending->expire_at_ms_epoch = 1;

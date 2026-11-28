@@ -778,6 +778,18 @@ void MasterMetricManager::inc_total_mem_capacity(const std::string& segment,
     if (!segment.empty()) mem_total_capacity_per_segment_.inc({segment}, val);
 }
 
+std::function<void()> MasterMetricManager::PrepareMountCapacity(
+    const std::string& segment, int64_t bytes) {
+    mem_total_capacity_.inc(0);
+    auto counter = segment.empty()
+                       ? nullptr
+                       : mem_total_capacity_per_segment_.Pin(segment);
+    return [this, counter = std::move(counter), bytes]() noexcept {
+        mem_total_capacity_.inc(bytes);
+        if (counter) counter->fetch_add(bytes, std::memory_order_relaxed);
+    };
+}
+
 void MasterMetricManager::dec_total_mem_capacity(const std::string& segment,
                                                  int64_t val) {
     mem_total_capacity_.dec(val);

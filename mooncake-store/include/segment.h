@@ -2,6 +2,7 @@
 
 #include <boost/functional/hash.hpp>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <ostream>
 #include <optional>
@@ -85,6 +86,11 @@ class ScopedSegmentAccess {
     ErrorCode MountSegment(const Segment& segment,
                            ClientSessionSharedPtr owner_session);
 
+    struct AllocatorReplacement {
+        UUID segment_id;
+        std::shared_ptr<BufferAllocatorBase> expected;
+        std::shared_ptr<BufferAllocatorBase> replacement;
+    };
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
      * errors that may be solved by subsequent remount tryings are considered as
@@ -94,6 +100,13 @@ class ScopedSegmentAccess {
     ErrorCode ReMountSegment(const std::vector<Segment>& segments,
                              ClientSessionSharedPtr owner_session);
 
+    // The Master also binds the client's generation and installs imported
+    // allocators in the same publication as the mounts.
+    ErrorCode ReMountSegment(
+        const std::vector<Segment>& segments,
+        ClientSessionSharedPtr owner_session,
+        const std::vector<AllocatorReplacement>& replacements);
+
     ErrorCode ValidateRemountSegment(const Segment& segment,
                                      const UUID& client_id) const;
 
@@ -102,13 +115,9 @@ class ScopedSegmentAccess {
     bool CanCopyWithinFabric(const std::string& source,
                              const std::string& target) const;
 
-    struct AllocatorReplacement {
-        UUID segment_id;
-        std::shared_ptr<BufferAllocatorBase> expected;
-        std::shared_ptr<BufferAllocatorBase> replacement;
-    };
     bool ReplaceAllocators(
-        const std::vector<AllocatorReplacement>& replacements);
+        const std::vector<AllocatorReplacement>& replacements,
+        const ClientSessionSharedPtr& owner_session = nullptr);
 
     std::shared_ptr<BufferAllocatorBase> GetAllocator(
         const UUID& segment_id) const;
@@ -235,6 +244,13 @@ class ScopedSegmentAccess {
 
    private:
     ErrorCode SetSegmentStatus(MountedSegment& mounted, SegmentStatus status);
+    ErrorCode MountSegment(const Segment& segment,
+                           ClientSessionSharedPtr owner_session,
+                           std::vector<std::function<void()>>* publish);
+    ErrorCode PublishRemount(
+        const std::vector<Segment>& segments,
+        ClientSessionSharedPtr owner_session,
+        const std::vector<AllocatorReplacement>* replacements);
     void ReindexSegmentNameAfterRemoval(const UUID& removed_segment_id,
                                         const std::string& segment_name);
 

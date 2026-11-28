@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <future>
@@ -24,15 +25,13 @@ using route::ObjectRoute;
 using test::ObjectRouteTestPeer;
 using test::PublishObject;
 
-// The lease the object under `key` holds, read under the key's read lock and
-// the envelope's own lease lock; null when the key holds no object.
+// The shared lease bound to this key, if any.
 std::shared_ptr<Lease> LeaseOf(const ObjectRoute& route, std::string_view key) {
     auto guard = route.Read(key);
     if (!guard) {
         return nullptr;
     }
-    SpinLocker locker(&guard->metadata().lock);
-    return guard->metadata().lease_;
+    return guard->metadata().GroupLease();
 }
 
 // Tears down whatever `key` holds; false when it holds nothing.
@@ -93,6 +92,62 @@ TEST(ObjectRouteTest, PublishMakesTheObjectReachableUnderItsKey) {
 
     EXPECT_FALSE(route.Read("missing").has_value());
     EXPECT_FALSE(route.Write("missing").has_value());
+}
+
+TEST(ObjectRouteTest, PublicationBorrowsTheMapKeyAndNamespaceTenant) {
+    const TenantId tenant("tenant-with-a-long-name");
+    ObjectRoute route(nullptr, false, tenant);
+    const std::string key(128, 'k');
+    {
+        auto guard = route.WriteKey(key);
+        auto temporary_key = key;
+        guard.Publish(UUID{1, 2}, std::chrono::system_clock::now(), 128,
+                      std::vector<Replica>{}, std::nullopt, false,
+                      ObjectDataType::UNKNOWN, "", TenantId(tenant),
+                      temporary_key);
+        temporary_key.clear();
+    }
+    auto read = route.Read(key);
+    ASSERT_TRUE(read);
+    EXPECT_EQ(&read->metadata().user_key, &read->key());
+    EXPECT_EQ(read->metadata().tenant_id, tenant);
+}
+
+// Hot-key readers must see both halves of a write together while other
+// readers and writers are queued on the same slot.
+TEST(ObjectRouteTest, SharedReadersSeeCompleteUpdatesOnAContendedKey) {
+    ObjectRoute route;
+    ASSERT_NE(PublishObject(route, "hot"), 0u);
+    {
+        auto guard = route.Write("hot");
+        guard->metadata().client_id = UUID{0, 0};
+    }
+    constexpr size_t threads = 8;
+    constexpr size_t rounds = 2000;
+    std::barrier start(threads);
+    std::vector<std::thread> workers;
+    std::atomic<bool> consistent{true};
+    for (size_t t = 0; t < threads; ++t) {
+        workers.emplace_back([&, t] {
+            start.arrive_and_wait();
+            for (size_t i = 0; i < rounds; ++i) {
+                if (t % 2 == 0) {
+                    auto guard = route.Write("hot");
+                    auto& [first, second] = guard->metadata().client_id;
+                    ++first;
+                    ++second;
+                } else {
+                    auto guard = route.Read("hot");
+                    const auto& [first, second] = guard->metadata().client_id;
+                    if (first != second) consistent.store(false);
+                }
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    EXPECT_TRUE(consistent.load());
+    EXPECT_EQ(route.Read("hot")->metadata().client_id,
+              (UUID{threads / 2 * rounds, threads / 2 * rounds}));
 }
 
 TEST(ObjectRouteTest, WriteKeyLocksAnAbsentKeyWithoutPublishing) {
@@ -209,7 +264,7 @@ TEST(ObjectRouteTest, PublishAfterTearDownOnTheSameGuardReplacesTheObject) {
         second = test::PublishEnvelope(guard, "g2");
         ASSERT_TRUE(guard.has_object());
         EXPECT_EQ(guard.generation(), second);
-        EXPECT_EQ(guard.metadata().group_id, "g2");
+        EXPECT_EQ(guard.metadata().GroupId(), "g2");
     }
     EXPECT_NE(second, first);
     EXPECT_EQ(route.ObjectCount(), 1u);
@@ -237,6 +292,31 @@ TEST(ObjectRouteTest, PublishJoinsTheGroupOnItsSharedLease) {
     EXPECT_EQ(first_lease.get(), LeaseOf(route, "k2").get());
 }
 
+TEST(ObjectRouteTest, GroupMembersShareTheNameAndKeepPrivateLabels) {
+    ObjectRoute route;
+    const std::string group(128, 'g');
+    ASSERT_NE(PublishObject(route, "first", group), 0u);
+    {
+        auto guard = route.WriteKey("second");
+        guard.Publish(UUID{1, 2}, std::chrono::system_clock::now(), 128,
+                      std::vector<Replica>{}, std::nullopt, false,
+                      ObjectDataType::UNKNOWN, group, TenantId::Default(),
+                      "second", "affinity");
+        guard.metadata().SetSessionId("session");
+        const auto& lease = guard.metadata().GroupLease();
+        ASSERT_TRUE(lease);
+        EXPECT_EQ(&guard.metadata().GroupId(), &lease->group_id);
+        EXPECT_EQ(guard.metadata().ResidencyAffinityId(), "affinity");
+        EXPECT_EQ(guard.metadata().SessionId(), "session");
+    }
+    ASSERT_TRUE(TearDownKey(route, "second"));
+    auto guard = route.Read("first");
+    ASSERT_TRUE(guard);
+    EXPECT_EQ(guard->metadata().GroupId(), group);
+    EXPECT_TRUE(guard->metadata().SessionId().empty());
+    EXPECT_TRUE(guard->metadata().ResidencyAffinityId().empty());
+}
+
 TEST(ObjectRouteTest, PublishLeavesAnUngroupedObjectOnItsOwnLease) {
     ObjectRoute route;
     ASSERT_NE(PublishObject(route, "k1"), 0u);
@@ -245,10 +325,15 @@ TEST(ObjectRouteTest, PublishLeavesAnUngroupedObjectOnItsOwnLease) {
     // An ungrouped object joins no group and keeps the never-granted lease
     // its envelope was constructed with: present, its own, and expired.
     EXPECT_TRUE(route.GroupMembers("").empty());
-    const auto lease = LeaseOf(route, "k1");
-    ASSERT_NE(lease, nullptr);
-    EXPECT_NE(lease.get(), LeaseOf(route, "k2").get());
-    EXPECT_TRUE(route.Read("k1")->metadata().IsLeaseExpired());
+    auto first = route.Read("k1");
+    ASSERT_TRUE(first);
+    EXPECT_FALSE(first->metadata().GroupLease());
+    EXPECT_TRUE(first->metadata().IsLeaseExpired());
+    first->metadata().GrantReadLease(std::chrono::hours(1));
+    first.reset();
+    auto second = route.Read("k2");
+    ASSERT_TRUE(second);
+    EXPECT_TRUE(second->metadata().IsLeaseExpired());
 }
 
 TEST(ObjectRouteTest, TearDownDropsOnlyItsOwnMembership) {
@@ -316,16 +401,18 @@ TEST(ObjectRouteTest, RebuildGroupStateRegroupsMembersOnTheLatestDeadline) {
     const auto restore_lease = [&](std::string_view key, int seconds) {
         auto guard = route.Write(key);
         ASSERT_TRUE(guard.has_value());
-        auto lease = std::make_shared<Lease>();
-        lease->ExtendTo(at(seconds));
-        SpinLocker locker(&guard->metadata().lock);
-        guard->metadata().lease_ = std::move(lease);
+        auto& metadata = guard->metadata();
+        if (metadata.IsGrouped()) {
+            metadata.BindGroupLease(
+                std::make_shared<NamedGroupLease>(metadata.GroupId()));
+        }
+        metadata.ActiveLease().SetDeadline(at(seconds));
     };
     restore_lease("k1", 100);
     restore_lease("k2", 300);
     restore_lease("k3", 200);
     restore_lease("solo", 50);
-    const auto solo_lease = LeaseOf(route, "solo");
+    EXPECT_FALSE(LeaseOf(route, "solo"));
 
     route.RebuildGroupState();
 
@@ -343,8 +430,10 @@ TEST(ObjectRouteTest, RebuildGroupStateRegroupsMembersOnTheLatestDeadline) {
     EXPECT_NE(g2_lease.get(), g1_lease.get());
     EXPECT_EQ(g2_lease->ExpiresAt(), at(200));
     // An ungrouped object keeps its own lease.
-    EXPECT_EQ(LeaseOf(route, "solo").get(), solo_lease.get());
-    EXPECT_EQ(solo_lease->ExpiresAt(), at(50));
+    auto solo = route.Read("solo");
+    ASSERT_TRUE(solo);
+    EXPECT_FALSE(solo->metadata().GroupLease());
+    EXPECT_EQ(solo->metadata().EvictionDeadline(), at(50));
     EXPECT_EQ(route.ObjectCount(), 4u);
 }
 
@@ -607,22 +696,24 @@ TEST(ObjectRouteTest, WriteCursorChangesMetadataAndState) {
     for (const char* key : {"k1", "k2"}) {
         auto guard = route.WriteKey(key);
         test::PublishEnvelope(guard);
-        guard.state().offloading_task.emplace();
+        guard.state().MutableTasks().offloading_task.emplace();
     }
 
     // A write cursor may change a task, but not whether the object has work
     // in flight: it does not run the observer.
     for (auto object : route.WriteCursor()) {
         object.metadata().MutablePart(0).SetChecksum(42);
-        object.state().offloading_task->mirror_clients.push_back(UUID{3, 4});
+        object.state().MutableTasks().offloading_task->mirror_clients.push_back(
+            UUID{3, 4});
     }
     for (const char* key : {"k1", "k2"}) {
         auto guard = route.Read(key);
         ASSERT_TRUE(guard.has_value());
         ASSERT_TRUE(guard->metadata().GetPart(0).checksum().has_value());
         EXPECT_EQ(*guard->metadata().GetPart(0).checksum(), 42u);
-        ASSERT_TRUE(guard->state().offloading_task.has_value());
-        EXPECT_EQ(guard->state().offloading_task->mirror_clients.size(), 1u);
+        ASSERT_TRUE(guard->state().Tasks().offloading_task.has_value());
+        EXPECT_EQ(guard->state().Tasks().offloading_task->mirror_clients.size(),
+                  1u);
     }
 }
 
@@ -1066,7 +1157,8 @@ TEST(ObjectRouteTest, ChurnKeepsTheRouteAndTheGroupConsistent) {
                 continue;
             }
             pairs_observed.fetch_add(1, std::memory_order_relaxed);
-            if (first->metadata().lease_ != second->metadata().lease_ ||
+            if (first->metadata().GroupLease() !=
+                    second->metadata().GroupLease() ||
                 !is_member("k1") || !is_member("k2")) {
                 violation();
             }

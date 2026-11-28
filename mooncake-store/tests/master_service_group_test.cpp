@@ -29,8 +29,8 @@ TEST_F(MasterServiceTest, ResidencyAffinitySurvivesPutAndUpsert) {
             &service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
         ASSERT_TRUE(accessor.Exists());
         const auto& metadata = accessor.Get();
-        EXPECT_EQ("opaque-unit", metadata.residency_affinity_id);
-        EXPECT_EQ("write-session", metadata.session_id);
+        EXPECT_EQ("opaque-unit", metadata.ResidencyAffinityId());
+        EXPECT_EQ("write-session", metadata.SessionId());
         for (const auto& encoded :
              {MasterServiceTestPeer::SerializeMetadataForOpLogForTesting(
                   service, metadata),
@@ -86,7 +86,7 @@ TEST_F(MasterServiceTest, ResidencyAffinitySurvivesPreemptedUpsertRetry) {
     MasterServiceTestPeer::MetadataAccessorRO accessor(
         &service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
     ASSERT_TRUE(accessor.Exists());
-    EXPECT_EQ("opaque-unit", accessor.Get().residency_affinity_id);
+    EXPECT_EQ("opaque-unit", accessor.Get().ResidencyAffinityId());
 }
 
 TEST_F(MasterServiceTest, ResidencyAffinityBatchOrderAndInvalidCounts) {
@@ -107,7 +107,7 @@ TEST_F(MasterServiceTest, ResidencyAffinityBatchOrderAndInvalidCounts) {
             &service, MasterServiceTestPeer::ObjectIdentity{tenant, keys[i]});
         ASSERT_TRUE(accessor.Exists());
         EXPECT_EQ(config.residency_affinity_ids->at(i),
-                  accessor.Get().residency_affinity_id);
+                  accessor.Get().ResidencyAffinityId());
     }
     auto upserts = service.BatchUpsertStart(context.client_id, keys, tenant,
                                             {2048, 2048}, config);
@@ -120,7 +120,7 @@ TEST_F(MasterServiceTest, ResidencyAffinityBatchOrderAndInvalidCounts) {
             &service, MasterServiceTestPeer::ObjectIdentity{tenant, keys[i]});
         ASSERT_TRUE(accessor.Exists());
         EXPECT_EQ(config.residency_affinity_ids->at(i),
-                  accessor.Get().residency_affinity_id);
+                  accessor.Get().ResidencyAffinityId());
     }
     config.residency_affinity_ids = std::vector<std::string>{"one"};
     for (const auto& result : service.BatchUpsertStart(

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -88,6 +89,37 @@ class SegmentLifetime {
     std::shared_ptr<State> state_;
 };
 
+// Immutable descriptor fields shared by buffers from one allocator. A CXL
+// conversion or an imported descriptor can carry a buffer-specific endpoint.
+struct BufferOrigin {
+    std::weak_ptr<BufferAllocatorBase> allocator;
+    std::weak_ptr<offset_allocator::OffsetAllocator> offset_allocator;
+    SegmentLifetime lifetime;
+    std::string protocol;
+    std::string cxl_endpoint;
+    // Only set for a caller supplying a handle with a different request size.
+    std::optional<size_t> release_size;
+    // Zero until the buffer is published as a CXL offset.
+    uintptr_t transfer_address_base{0};
+
+    static std::shared_ptr<const BufferOrigin> ForTransport(
+        const std::shared_ptr<const BufferOrigin>& source,
+        std::string_view protocol, std::string_view cxl_endpoint,
+        uintptr_t transfer_address_base);
+
+    // Each registration generation owns its transport variants. Copying the
+    // descriptor fields starts a new cache, including when rebinding a session.
+    struct TransportVariants {
+        TransportVariants() = default;
+        TransportVariants(const TransportVariants&) noexcept {}
+        std::once_flag first_once;
+        std::shared_ptr<const BufferOrigin> first;
+        std::mutex mutex;
+        std::vector<std::weak_ptr<const BufferOrigin>> others;
+    };
+    mutable TransportVariants transports;
+};
+
 class AllocatedBuffer {
    public:
     friend class CachelibBufferAllocator;
@@ -112,34 +144,36 @@ class AllocatedBuffer {
     AllocatedBuffer(AllocatedBuffer&&) noexcept;
     AllocatedBuffer& operator=(AllocatedBuffer&&) noexcept;
 
-    [[nodiscard]] void* data() const noexcept { return buffer_ptr_; }
+    [[nodiscard]] void* data() const noexcept {
+        return reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(allocation_address_) -
+            origin_->transfer_address_base);
+    }
 
     [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
 
     [[nodiscard]] bool isAllocatorValid() const {
-        return !allocator_.expired() && segment_lifetime_.isValid();
+        return !origin_->allocator.expired() && origin_->lifetime.isValid();
     }
 
     [[nodiscard]] std::shared_ptr<BufferAllocatorBase> getAllocator() const {
-        return allocator_.lock();
+        return origin_->allocator.lock();
     }
 
     [[nodiscard]] bool isAvailable() const {
-        return !allocator_.expired() && segment_lifetime_.isServing();
+        return !origin_->allocator.expired() && origin_->lifetime.isServing();
     }
 
     // Bind before publication, or while excluding readers of this buffer.
     // Later session changes update the registration, not this fixed snapshot.
-    void bindSegmentLifetime(SegmentLifetime lifetime) {
-        segment_lifetime_ = std::move(lifetime);
-    }
+    void bindSegmentLifetime(SegmentLifetime lifetime);
 
     // Preserve the owning session's identity for replica affiliation checks
     // and source admission; a client UUID alone cannot distinguish
     // re-registers.
     [[nodiscard]] const ClientSessionSharedPtr& getClientSession()
         const noexcept {
-        return segment_lifetime_.getClientSession();
+        return origin_->lifetime.getClientSession();
     }
 
     // Serialize the buffer into a descriptor for transfer
@@ -166,41 +200,19 @@ class AllocatedBuffer {
                  transport_endpoint_);
     };
 
-    void change_to_cxl(std::string client_segment_name);
+    void change_to_cxl(std::string_view client_segment_name);
     void* get_vaddr_from_cxl();
 
    private:
-    // The protocol of a buffer that is not plain TCP. Plain TCP is the null
-    // pointer: it is the common case, and everything it needs is already in
-    // the allocator.
-    struct ProtocolState {
-        // Never kTcp: plain TCP is the null pointer.
-        BufferProtocol kind;
-        // kCxl: the client segment name the buffer transfers from.
-        // kOther: a mounted or restored protocol other than TCP/CXL.
-        std::string value;
-    };
-
-    [[nodiscard]] BufferProtocol protocolKind() const noexcept {
-        return protocol_ ? protocol_->kind : BufferProtocol::kTcp;
-    }
-
-    [[nodiscard]] std::string_view protocolName() const noexcept;
-
-    std::weak_ptr<BufferAllocatorBase> allocator_;
-    // Set before publication; its validity is atomic and its owner session is
-    // immutable.
-    SegmentLifetime segment_lifetime_;
-    std::shared_ptr<ClientLivenessRecord> client_liveness_;
-    std::string segment_name_;
-    void* buffer_ptr_{nullptr};
+    std::shared_ptr<const BufferOrigin> origin_;
+    // The address owned by the allocator, including during CXL conversion.
+    void* allocation_address_{nullptr};
     std::size_t size_{0};
-    // Null for TCP; otherwise stores the mounted/restored protocol or the
-    // client segment name once change_to_cxl() ran.
-    std::unique_ptr<ProtocolState> protocol_;
-    // RAII handle for buffer allocated by offset allocator
-    std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
-        std::nullopt};
+    offset_allocator::OffsetAllocation allocation_{
+        offset_allocator::OffsetAllocation::NO_SPACE,
+        offset_allocator::OffsetAllocation::NO_SPACE};
+
+    void ReleaseOffset() noexcept;
 
     friend class Replica;
     friend class SegmentAllocatorRegistration;
@@ -225,16 +237,25 @@ class BufferAllocatorBase {
     // this allocator advertises it to readers.
     virtual std::string getTransportProtocol() const = 0;
 
+    // One immutable origin for standalone allocations. Registration binds a
+    // copy with its own session generation before publication.
+    static std::shared_ptr<const BufferOrigin> GetBufferOrigin(
+        const std::shared_ptr<BufferAllocatorBase>& allocator);
+
+   private:
+    virtual std::weak_ptr<offset_allocator::OffsetAllocator> OffsetOwner()
+        const {
+        return {};
+    }
+    mutable std::once_flag origin_once_;
+    std::shared_ptr<const BufferOrigin> origin_;
+
+   public:
     // Publish an immutable value; legacy remounts may enrich unknown locality.
     void SetLocality(std::optional<SegmentLocality> locality) {
-        std::atomic_store_explicit(
-            &locality_,
-            locality
-                ? std::make_shared<const SegmentLocality>(std::move(*locality))
-                : nullptr,
-            std::memory_order_release);
-        // Monotonic: a concurrent clear must not hide a later publication.
-        if (locality) has_locality_.store(true, std::memory_order_release);
+        PublishLocality(locality ? std::make_shared<const SegmentLocality>(
+                                       std::move(*locality))
+                                 : nullptr);
     }
     std::shared_ptr<const SegmentLocality> GetLocalityHandle() const {
         if (!has_locality_.load(std::memory_order_acquire)) return nullptr;
@@ -277,7 +298,20 @@ class BufferAllocatorBase {
 
    private:
     std::atomic_size_t cur_size_{0};
-    std::unique_ptr<StorageUsageRegistration> usage_registration_;
+    friend class ScopedSegmentAccess;
+    void PublishLocality(
+        std::shared_ptr<const SegmentLocality> locality) noexcept {
+        const bool has_locality = static_cast<bool>(locality);
+        std::atomic_store_explicit(&locality_, std::move(locality),
+                                   std::memory_order_release);
+        if (has_locality) has_locality_.store(true, std::memory_order_release);
+    }
+    void AttachUsageTracker(const std::shared_ptr<StorageUsageTracker>& tracker,
+                            size_t capacity) noexcept {
+        if (tracker && !usage_registration_)
+            usage_registration_.emplace(tracker, cur_size_, capacity);
+    }
+    std::optional<StorageUsageRegistration> usage_registration_;
     std::shared_ptr<const SegmentLocality> locality_;
     std::atomic<bool> has_locality_{false};
 };
@@ -375,8 +409,7 @@ class CachelibBufferAllocator
                             std::string transport_protocol,
                             ReplicaType replica_type);
 
-    std::unique_ptr<AllocatedBuffer> adoptImportedBuffer(
-        const LiveAllocation& allocation);
+    void adoptBuffer(AllocatedBuffer& handle, void* buffer);
     // metadata
     const std::string segment_name_;
     const size_t base_;
@@ -463,6 +496,11 @@ class OffsetBufferAllocator
     const std::string transport_endpoint_;
     const std::string transport_protocol_;
     const ReplicaType replica_type_;
+
+    std::weak_ptr<offset_allocator::OffsetAllocator> OffsetOwner()
+        const override {
+        return offset_allocator_;
+    }
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;

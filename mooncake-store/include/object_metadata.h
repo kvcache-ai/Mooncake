@@ -3,17 +3,17 @@
 // ObjectMetadata: the per-object metadata envelope.
 //
 // Moved out of MasterService so the service and the per-object metadata
-// module share one definition. The envelope owns the object identity, the
+// module share one definition. The envelope carries the object identity, the
 // authoritative read lease and the soft-pin state.
 // The object's content and the replicas holding it live in the envelope's
 // single ObjectPart.
 //
-// It has no ownership lock: whoever owns the envelope decides how the
-// envelope as a whole is guarded. The `lock` member below is internal and
-// narrower — it protects only `lease_` and `soft_pin_timeout`, so a holder of
-// the envelope can read either without them tearing.
+// The enclosing slot's reader/writer lock guards record ownership and group
+// binding. Read leases are atomic. The spin lock protects soft-pin changes
+// that may take place while the enclosing slot is shared.
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -21,16 +21,15 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include <boost/container/small_vector.hpp>
-
 #include "common/heap_optional.h"
-#include "lease.h"
+#include "metadata/group_lease.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "object_part.h"
@@ -70,28 +69,44 @@ struct ObjectMetadata {
 
     ObjectMetadata() = delete;
 
-    ObjectMetadata(const UUID& client_id_,
+    template <class... Args>
+    ObjectMetadata(const UUID& writer, Args&&... args)
+        : ObjectMetadata(nullptr, nullptr, writer,
+                         std::forward<Args>(args)...) {}
+
+    // A routed publication borrows its map node's immutable key and its
+    // namespace's tenant. Both outlive destruction of the record.
+    ObjectMetadata(const std::string* slot_key, const TenantId* route_tenant,
+                   const UUID& client_id_,
                    const std::chrono::system_clock::time_point put_start_time_,
                    size_t value_length, std::vector<Replica>&& reps,
                    std::optional<std::chrono::system_clock::time_point>
                        committed_soft_pin_timeout = std::nullopt,
                    bool enable_hard_pin = false,
                    ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
-                   std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
-                   std::string user_key_ = {},
+                   std::string group_id_ = "",
+                   const TenantId& tenant_id_ = TenantId::Default(),
+                   const std::string& user_key_ = {},
                    std::string residency_affinity_id_ = "")
         : client_id(client_id_),
           put_start_time(put_start_time_),
-          data_type(data_type_),
-          group_id(std::move(group_id_)),
-          residency_affinity_id(std::move(residency_affinity_id_)),
-          tenant_id(std::move(tenant_id_)),
-          user_key(std::move(user_key_)),
+          user_key(BindKey(slot_key, user_key_)),
+          tenant_id(BindTenant(route_tenant, tenant_id_)),
           key_group(
               MasterMetricManager::instance().classify_key_group(user_key)),
+          data_type(data_type_),
+          hard_pinned(enable_hard_pin),
           soft_pin_timeout(std::move(committed_soft_pin_timeout)),
-          hard_pinned(enable_hard_pin) {
-        parts_.emplace_back(value_length, std::move(reps));
+          part_(value_length, std::move(reps)) {
+        if (slot_key && *slot_key != user_key_) {
+            LOG(FATAL) << "Publish under key " << *slot_key
+                       << " of an object keyed " << user_key_;
+        }
+        if (!group_id_.empty() || !residency_affinity_id_.empty()) {
+            auto& labels = EnsureLabels();
+            labels.unbound_group = std::move(group_id_);
+            labels.affinity = std::move(residency_affinity_id_);
+        }
         MasterMetricManager::instance().inc_key_count(1);
         MasterMetricManager::instance().inc_key_group(key_group, value_length);
         if (soft_pin_timeout) {
@@ -109,15 +124,82 @@ struct ObjectMetadata {
     UUID client_id;
     // Updated by UpsertStart (Case B) to reset the discard timeout.
     std::chrono::system_clock::time_point put_start_time;
-    const ObjectDataType data_type{ObjectDataType::UNKNOWN};
-    const std::string group_id;
-    const std::string residency_affinity_id;
-    const TenantId tenant_id;
-    const std::string user_key;
-    const uint8_t key_group;
 
-    // Committed attribution only; protected by the key's lock.
-    std::string session_id;
+   private:
+    struct OwnedIdentity {
+        std::string key;
+        TenantId tenant;
+    };
+    struct Labels {
+        std::string unbound_group;
+        std::string affinity;
+        std::string session;
+        // Standalone envelopes and routes with no associated tenant.
+        HeapOptional<OwnedIdentity> owned;
+    };
+    struct Attributes {
+        std::shared_ptr<NamedGroupLease> group_lease;
+        HeapOptional<Labels> labels;
+    };
+    HeapOptional<Attributes> attributes_;
+    Attributes& EnsureAttributes() {
+        return attributes_ ? *attributes_ : attributes_.emplace();
+    }
+    Labels& EnsureLabels() {
+        auto& labels = EnsureAttributes().labels;
+        return labels ? *labels : labels.emplace();
+    }
+    OwnedIdentity& Owned() {
+        auto& owned = EnsureLabels().owned;
+        return owned ? *owned : owned.emplace();
+    }
+    const std::string& BindKey(const std::string* slot_key,
+                               const std::string& supplied) {
+        if (slot_key) return *slot_key;
+        return Owned().key = supplied;
+    }
+    const TenantId& BindTenant(const TenantId* route_tenant,
+                               const TenantId& supplied) {
+        if (route_tenant && *route_tenant == supplied) return *route_tenant;
+        if (supplied.IsDefault()) return TenantId::Default();
+        return Owned().tenant = supplied;
+    }
+    static const std::string& EmptyString() {
+        static const std::string empty;
+        return empty;
+    }
+
+   public:
+    const std::string& user_key;
+    const TenantId& tenant_id;
+    const uint8_t key_group;
+    const ObjectDataType data_type;
+    const bool hard_pinned;
+    bool memory_cache_total_accounted{false};
+    bool disk_cache_total_accounted{false};
+    mutable SpinLock lock;
+
+    const std::string& GroupId() const {
+        if (attributes_ && attributes_->group_lease)
+            return attributes_->group_lease->group_id;
+        return attributes_ && attributes_->labels
+                   ? attributes_->labels->unbound_group
+                   : EmptyString();
+    }
+    const std::string& ResidencyAffinityId() const {
+        return attributes_ && attributes_->labels
+                   ? attributes_->labels->affinity
+                   : EmptyString();
+    }
+    const std::string& SessionId() const {
+        return attributes_ && attributes_->labels ? attributes_->labels->session
+                                                  : EmptyString();
+    }
+    void SetSessionId(std::string id) {
+        if (!id.empty() || (attributes_ && attributes_->labels)) {
+            EnsureLabels().session = std::move(id);
+        }
+    }
     struct PendingSessionTag {
         std::string session_id;
         std::unordered_set<ReplicaID> eligible_replica_ids;
@@ -132,10 +214,16 @@ struct ObjectMetadata {
         }
     }
 
+    // An offload admitted by PutEnd must be followed by a non-allocating
+    // commit of its source replicas. Keep the pending tag until that commit.
+    void PrepareSessionTagCommit() {
+        if (pending_session_tag) EnsureLabels();
+    }
+
     void CommitSessionTag(ReplicaID replica_id) {
         if (pending_session_tag &&
             pending_session_tag->eligible_replica_ids.contains(replica_id)) {
-            session_id = std::move(pending_session_tag->session_id);
+            EnsureLabels().session = std::move(pending_session_tag->session_id);
             pending_session_tag.reset();
         }
     }
@@ -152,11 +240,31 @@ struct ObjectMetadata {
         }
     }
 
-    mutable SpinLock lock;
-    // Authoritative lease: ungrouped objects own one; grouped objects share
-    // the group's. Never null after construction.
-    mutable std::shared_ptr<Lease> lease_ GUARDED_BY(lock) =
-        std::make_shared<Lease>();
+    // Group membership changes only under the enclosing object's write lock.
+    // Ungrouped reads update the local atomic deadline in-place.
+    mutable Lease local_lease_;
+    const std::shared_ptr<NamedGroupLease>& GroupLease() const {
+        static const std::shared_ptr<NamedGroupLease> none;
+        return attributes_ ? attributes_->group_lease : none;
+    }
+    void BindGroupLease(std::shared_ptr<NamedGroupLease> lease) noexcept {
+        assert(attributes_ && lease && lease->group_id == GroupId());
+        auto& attrs = *attributes_;
+        attrs.group_lease = std::move(lease);
+        if (attrs.labels) {
+            if (!attrs.labels->owned && attrs.labels->session.empty() &&
+                attrs.labels->affinity.empty()) {
+                attrs.labels.reset();
+            } else {
+                std::string{}.swap(attrs.labels->unbound_group);
+            }
+        }
+    }
+    Lease& ActiveLease() const {
+        return attributes_ && attributes_->group_lease
+                   ? *attributes_->group_lease
+                   : local_lease_;
+    }
     mutable std::optional<std::chrono::system_clock::time_point>
         soft_pin_timeout GUARDED_BY(lock);  // committed object soft-pin
                                             // deadline
@@ -164,9 +272,6 @@ struct ObjectMetadata {
     // carry a generation token, so a stale End from the same client cannot
     // otherwise be distinguished from the current write.
     HeapOptional<PendingSoftPinAction> pending_soft_pin_action;
-    const bool hard_pinned{false};  // immutable, set at creation
-    bool memory_cache_total_accounted{false};
-    bool disk_cache_total_accounted{false};
 
     struct DynamicReplicaRecord {
         std::chrono::system_clock::time_point created_at;
@@ -262,17 +367,17 @@ struct ObjectMetadata {
 
     // Read under the owner's shared lock, change under its exclusive lock. A
     // replica pointer taken from a part is invalidated by any add or pop on it.
-    const ObjectPart& GetPart(size_t index) const { return parts_.at(index); }
-
-    ObjectPart& MutablePart(size_t index) { return parts_.at(index); }
-
-    size_t TotalLength() const {
-        size_t total = 0;
-        for (const auto& part : parts_) {
-            total += part.length();
-        }
-        return total;
+    const ObjectPart& GetPart(size_t index) const {
+        if (index != 0) throw std::out_of_range("object part index");
+        return part_;
     }
+
+    ObjectPart& MutablePart(size_t index) {
+        if (index != 0) throw std::out_of_range("object part index");
+        return part_;
+    }
+
+    size_t TotalLength() const { return part_.length(); }
 
     // Temporary: these operate on part 0. The multi-part work replaces them
     // with `parts()` and a flattened `replicas()` view, so each call site says
@@ -368,24 +473,21 @@ struct ObjectMetadata {
     // group TTL; a zero ttl is a no-op on a live lease (PutEnd cannot
     // expire a live group).
     void GrantReadLease(std::chrono::milliseconds ttl) const {
-        SpinLocker locker(&lock);
-        lease_->GrantReadLease(ttl);
+        ActiveLease().GrantReadLease(ttl);
     }
 
     // Whether the authoritative lease is expired.
     bool IsLeaseExpired() const {
-        SpinLocker locker(&lock);
-        return lease_->IsExpired(std::chrono::system_clock::now());
+        return ActiveLease().IsExpired(std::chrono::system_clock::now());
     }
 
     bool IsLeaseExpired(std::chrono::system_clock::time_point& now) const {
-        SpinLocker locker(&lock);
-        return lease_->IsExpired(now);
+        return ActiveLease().IsExpired(now);
     }
 
     // Lease deadline eviction ranks the object by.
     std::chrono::system_clock::time_point EvictionDeadline() const {
-        return lease_->ExpiresAt();
+        return ActiveLease().ExpiresAt();
     }
 
     SoftPinEvaluation EvaluateSoftPin(
@@ -536,7 +638,7 @@ struct ObjectMetadata {
 
     bool IsHardPinned() const { return hard_pinned; }
 
-    bool IsGrouped() const { return !group_id.empty(); }
+    bool IsGrouped() const { return !GroupId().empty(); }
 
     // Check if the metadata is valid
     // Valid means it has at least one valid replica and size is greater
@@ -601,7 +703,7 @@ struct ObjectMetadata {
     }
 
     // The first part sits in the object itself: every object has one today.
-    boost::container::small_vector<ObjectPart, 1> parts_;
+    ObjectPart part_;
 };
 
 }  // namespace mooncake

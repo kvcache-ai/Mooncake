@@ -108,7 +108,7 @@ class WeightReconciliationTest : public MasterServiceTest {
             service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
         ASSERT_TRUE(member.has_value());
         const auto& metadata = member->metadata();
-        ASSERT_EQ(group_id, metadata.group_id);
+        ASSERT_EQ(group_id, metadata.GroupId());
         ASSERT_TRUE(metadata.HasReplica([](const Replica& replica) {
             return replica.is_memory_replica();
         }));

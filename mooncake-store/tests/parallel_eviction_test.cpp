@@ -52,7 +52,7 @@ class ShardedLeaseIndexTest : public ::testing::Test {
                             std::move(replicas), std::nullopt, hard_pin,
                             ObjectDataType::UNKNOWN, group, TenantId{}, key);
         SpinLocker locker(&guard.metadata().lock);
-        guard.metadata().lease_->SetDeadline(deadline);
+        guard.metadata().ActiveLease().SetDeadline(deadline);
     }
 };
 
@@ -91,7 +91,8 @@ TEST_F(ShardedLeaseIndexTest,
                              std::move(replicas), std::nullopt, false,
                              ObjectDataType::UNKNOWN, "", TenantId{}, "a");
         SpinLocker locker(&guard->metadata().lock);
-        guard->metadata().lease_->SetDeadline(now_ - std::chrono::seconds(10));
+        guard->metadata().ActiveLease().SetDeadline(now_ -
+                                                    std::chrono::seconds(10));
     }
     auto guard = ns_.objects.Write("a");
     ASSERT_TRUE(guard);
@@ -130,7 +131,8 @@ TEST_F(ShardedLeaseIndexTest, LiveLeaseIsRevalidatedAndRefiled) {
     ASSERT_TRUE(entry);
     {
         auto guard = ns_.objects.Read("a");
-        guard->metadata().lease_->ExtendTo(now_ + std::chrono::seconds(20));
+        guard->metadata().ActiveLease().ExtendTo(now_ +
+                                                 std::chrono::seconds(20));
     }
     {
         auto guard = ns_.objects.Write("a");
@@ -148,7 +150,8 @@ TEST_F(ShardedLeaseIndexTest,
         Publish(key);
         {
             auto guard = ns_.objects.Read(key);
-            guard->metadata().lease_->ExtendTo(now_ - std::chrono::seconds(1));
+            guard->metadata().ActiveLease().ExtendTo(now_ -
+                                                     std::chrono::seconds(1));
         }
         auto cursor = ns_.eviction_index().ScanRanges(now_, 1);
         size_t visits = 0;
@@ -521,7 +524,7 @@ class ParallelEvictorNativeTest : public ::testing::Test {
                             std::move(replicas), std::nullopt, false,
                             ObjectDataType::UNKNOWN, group, TenantId{}, key);
         SpinLocker locker(&guard.metadata().lock);
-        guard.metadata().lease_->SetDeadline(
+        guard.metadata().ActiveLease().SetDeadline(
             live ? Clock::now() + std::chrono::hours(1) : Clock::time_point{});
     }
 };
@@ -632,7 +635,7 @@ TEST_F(ParallelEvictorNativeTest, GroupIsNotSplitByGoal) {
                             ObjectDataType::UNKNOWN, "", TenantId{},
                             "k" + std::to_string(i));
         SpinLocker locker(&guard.metadata().lock);
-        guard.metadata().lease_->SetDeadline(
+        guard.metadata().ActiveLease().SetDeadline(
             Clock::time_point{metadata::LeaseEvictionIndex::kBucketWidth});
     }
     eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {}, 4);
@@ -658,13 +661,14 @@ TEST_F(ParallelEvictorNativeTest,
                             std::move(replicas), std::nullopt, false,
                             ObjectDataType::UNKNOWN, "", TenantId{}, key);
         SpinLocker locker(&guard.metadata().lock);
-        guard.metadata().lease_->SetDeadline(deadline);
+        guard.metadata().ActiveLease().SetDeadline(deadline);
     };
     const auto w = metadata::LeaseEvictionIndex::kBucketWidth;
     for (int i = 0; i < 5; ++i) {
         publish_at("r0_" + std::to_string(i), Clock::time_point{});
         auto read = ns.objects.Read("r0_" + std::to_string(i));
-        read->metadata().lease_->ExtendTo(Clock::now() + std::chrono::hours(1));
+        read->metadata().ActiveLease().ExtendTo(Clock::now() +
+                                                std::chrono::hours(1));
     }
     for (int i = 0; i < 5; ++i) {
         publish_at("r1_" + std::to_string(i), Clock::time_point{w});
@@ -719,13 +723,13 @@ TEST_F(ParallelEvictorNativeTest, ByteGoalReclaimsExpiredReadRenewalsInOneRun) {
             auto& ns = namespaces_.GetOrCreate(TenantId{});
             {
                 auto guard = ns.objects.Read(expired);
-                guard->metadata().lease_->ExtendTo(Clock::now() -
-                                                   std::chrono::seconds(1));
+                guard->metadata().ActiveLease().ExtendTo(
+                    Clock::now() - std::chrono::seconds(1));
             }
             {
                 auto guard = ns.objects.Read(live);
-                guard->metadata().lease_->ExtendTo(Clock::now() +
-                                                   std::chrono::hours(1));
+                guard->metadata().ActiveLease().ExtendTo(Clock::now() +
+                                                         std::chrono::hours(1));
             }
             reclaimer_.parallel_safe = parallel_safe;
             eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {},
@@ -754,8 +758,8 @@ TEST_F(ParallelEvictorNativeTest,
     auto& ns = namespaces_.GetOrCreate(TenantId{});
     for (int i = 0; i < 50; ++i) {
         auto guard = ns.objects.Read(std::to_string(i));
-        guard->metadata().lease_->ExtendTo(Clock::now() +
-                                           std::chrono::hours(1));
+        guard->metadata().ActiveLease().ExtendTo(Clock::now() +
+                                                 std::chrono::hours(1));
     }
     eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {}, 4);
     auto report = evictor.Run(eviction::Scope::All(), {.target_ratio = .5});

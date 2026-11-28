@@ -490,14 +490,15 @@ void DynamicReplicationController::UnindexPendingLocked(
 
 tl::expected<void, ErrorCode> DynamicReplicationController::CheckCooldownLocked(
     route::ObjectState& state) const {
-    if (state.dynamic_replication_cooldown ==
+    if (state.Tasks().dynamic_replication_cooldown ==
         std::chrono::steady_clock::time_point{}) {
         return {};
     }
-    if (state.dynamic_replication_cooldown > std::chrono::steady_clock::now()) {
+    if (state.Tasks().dynamic_replication_cooldown >
+        std::chrono::steady_clock::now()) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
-    state.dynamic_replication_cooldown =
+    state.MutableTasks().dynamic_replication_cooldown =
         std::chrono::steady_clock::time_point{};
     return {};
 }
@@ -523,7 +524,7 @@ ReplicaActionLease DynamicReplicationController::IssueLeaseLocked(
             ? std::min(proposal.expire_at_ms_epoch, server_deadline_ms)
             : server_deadline_ms;
 
-    state.dynamic_replication_pending =
+    state.MutableTasks().dynamic_replication_pending =
         DynamicReplicaPending{.proposal_id = lease.proposal_id,
                               .lease_id = lease.lease_id,
                               .source_segment = lease.source_segment,
@@ -540,11 +541,11 @@ ReplicaActionLease DynamicReplicationController::IssueLeaseLocked(
 void DynamicReplicationController::CommitLeaseLocked(
     route::ObjectState& state, const TenantId& tenant_id,
     const std::string& key, const ReplicaActionLease& lease) {
-    assert(state.dynamic_replication_pending.has_value());
+    assert(state.Tasks().dynamic_replication_pending.has_value());
     // A lease is filed under the key of the object it was issued for.
     assert(lease.key == key);
-    state.dynamic_replication_pending->task_id = lease.task_id;
-    state.dynamic_replication_cooldown =
+    state.MutableTasks().dynamic_replication_pending->task_id = lease.task_id;
+    state.MutableTasks().dynamic_replication_cooldown =
         std::chrono::steady_clock::now() + kActionCooldown;
     std::lock_guard<std::mutex> lock(lease_mutex_);
     leases_[tenant_id].Put(lease.proposal_id, lease);
@@ -552,14 +553,15 @@ void DynamicReplicationController::CommitLeaseLocked(
 
 bool DynamicReplicationController::PendingExpiredLocked(
     const route::ObjectState& state, int64_t now_ms) const {
-    return state.dynamic_replication_pending.has_value() &&
-           state.dynamic_replication_pending->expire_at_ms_epoch < now_ms;
+    return state.Tasks().dynamic_replication_pending.has_value() &&
+           state.Tasks().dynamic_replication_pending->expire_at_ms_epoch <
+               now_ms;
 }
 
 bool DynamicReplicationController::HasPendingLocked(const TenantId& tenant_id,
                                                     const std::string& key,
                                                     route::ObjectState& state) {
-    if (!state.dynamic_replication_pending.has_value()) {
+    if (!state.Tasks().dynamic_replication_pending.has_value()) {
         return false;
     }
     if (!PendingExpiredLocked(state, NowMs())) {
@@ -572,9 +574,10 @@ bool DynamicReplicationController::HasPendingLocked(const TenantId& tenant_id,
 void DynamicReplicationController::ClearPendingLocked(
     const TenantId& tenant_id, const std::string& key,
     route::ObjectState& state) {
-    state.dynamic_replication_pending.reset();
-    state.dynamic_replication_cooldown =
-        std::chrono::steady_clock::time_point{};
+    if (auto* tasks = state.ExistingTasks()) {
+        tasks->dynamic_replication_pending.reset();
+        tasks->dynamic_replication_cooldown = {};
+    }
     EraseLeasesForObject(tenant_id, key);
     UnindexPendingLocked(tenant_id, key);
 }
@@ -590,7 +593,7 @@ DynamicReplicationController::ValidateCopyStartLocked(
     // Dropping a pending task clears its cooldown and its leases with it, so
     // the next proposal is not held back by the abandoned one.
     auto drop_pending = [&] { ClearPendingLocked(tenant_id, key, state); };
-    if (!state.dynamic_replication_pending.has_value()) {
+    if (!state.Tasks().dynamic_replication_pending.has_value()) {
         if (dynamic_copy) {
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
@@ -599,7 +602,7 @@ DynamicReplicationController::ValidateCopyStartLocked(
     }
     // Taken by value: the branches below reset the pending state this reference
     // would otherwise point into.
-    const auto pending = *state.dynamic_replication_pending;
+    const auto pending = *state.Tasks().dynamic_replication_pending;
     if (pending.expire_at_ms_epoch < NowMs()) {
         drop_pending();
         if (dynamic_copy) {
@@ -632,11 +635,11 @@ void DynamicReplicationController::RegisterCopyStartLocked(
     const std::string& source_segment, uint64_t version_epoch,
     const std::vector<std::string>& target_segments,
     const std::vector<ReplicaID>& replica_ids) const {
-    if (!state.dynamic_replication_pending.has_value()) {
+    if (!state.Tasks().dynamic_replication_pending.has_value()) {
         return;
     }
-    const auto pending = *state.dynamic_replication_pending;
-    state.dynamic_replication_pending.reset();
+    const auto pending = *state.Tasks().dynamic_replication_pending;
+    state.MutableTasks().dynamic_replication_pending.reset();
     if (pending.source_segment != source_segment ||
         pending.expire_at_ms_epoch < NowMs() ||
         pending.version_epoch != version_epoch) {

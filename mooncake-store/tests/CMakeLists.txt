@@ -38,6 +38,9 @@ function(add_ha_test name)
 endfunction()
 
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
+add_store_test(allocator_origin_test allocator_origin_test.cpp
+               allocation_probe.cpp)
+add_store_test(task_fields_test task_fields_test.cpp allocation_probe.cpp)
 add_store_test(weight_management_contract_test
                weight_management_contract_test.cpp)
 add_store_test(weight_metadata_store_test weight_metadata_store_test.cpp)

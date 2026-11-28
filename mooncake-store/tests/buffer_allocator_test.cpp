@@ -729,6 +729,66 @@ TEST_F(BufferAllocatorTest, BuffersAdvertiseTheirSegmentsProtocol) {
     EXPECT_EQ(restored->buffers[0]->get_descriptor().protocol_, "rdma");
 }
 
+TEST_F(BufferAllocatorTest,
+       CxlCachelibReleasesBuffersBeforeAndAfterAddressConversion) {
+    auto result = CachelibBufferAllocator::Create(
+        "pool", DEFAULT_CXL_BASE, 64 * 1024 * 1024, "/dev/dax0.0", "cxl");
+    ASSERT_TRUE(result);
+    auto allocator = *result;
+    auto unconverted = allocator->allocate(257);
+    auto converted = allocator->allocate(513);
+    ASSERT_TRUE(unconverted);
+    ASSERT_TRUE(converted);
+    const auto address = reinterpret_cast<uintptr_t>(converted->data());
+    converted->change_to_cxl("segment");
+    const auto descriptor = converted->get_descriptor();
+    EXPECT_EQ(descriptor.protocol_, "cxl");
+    EXPECT_EQ(descriptor.transport_endpoint_, "segment");
+    EXPECT_EQ(descriptor.buffer_address_, address - DEFAULT_CXL_BASE);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(converted->data()),
+              descriptor.buffer_address_);
+
+    // A failed conversion leaves this handle with its original address.
+    unconverted.reset();
+    EXPECT_EQ(allocator->size(), 513u);
+    converted.reset();
+    EXPECT_EQ(allocator->size(), 0u);
+}
+
+TEST_F(BufferAllocatorTest, RestoredCxlDescriptorPreservesZeroOffset) {
+    auto allocator = std::make_shared<DummyBufferAllocator>("pool", "endpoint");
+    AllocatedBuffer restored(
+        allocator, AllocatedBuffer::Descriptor{257, 0, "cxl", "segment"});
+    const auto descriptor = restored.get_descriptor();
+    EXPECT_EQ(descriptor.buffer_address_, 0u);
+    EXPECT_EQ(descriptor.size_, 257u);
+    EXPECT_EQ(descriptor.protocol_, "cxl");
+    EXPECT_EQ(descriptor.transport_endpoint_, "segment");
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(restored.get_vaddr_from_cxl()),
+              DEFAULT_CXL_BASE);
+}
+
+TEST_F(BufferAllocatorTest,
+       BufferRetainsItsProtocolAndReleasesItsOffsetAfterUnmount) {
+    auto mounted = std::make_shared<OffsetBufferAllocator>(
+        "segment", 0x100000000ULL, 16 * 1024 * 1024, "endpoint", "rdma");
+    auto inner = mounted->getOffsetAllocator();
+    auto buffer = mounted->allocate(257);
+    ASSERT_TRUE(buffer);
+    ASSERT_EQ(inner->get_metrics().allocated_size_, 257u);
+    const auto before = buffer->get_descriptor();
+    mounted.reset();
+    EXPECT_FALSE(buffer->isAllocatorValid());
+    const auto after = buffer->get_descriptor();
+    EXPECT_EQ(after.protocol_, before.protocol_);
+    EXPECT_EQ(after.buffer_address_, before.buffer_address_);
+    EXPECT_EQ(after.size_, 257u);
+    EXPECT_TRUE(after.transport_endpoint_.empty());
+    buffer.reset();
+    EXPECT_EQ(inner->get_metrics().allocated_num_, 0u);
+    EXPECT_EQ(inner->get_metrics().allocated_size_, 0u);
+}
+
 }  // namespace mooncake
 
 int main(int argc, char** argv) {

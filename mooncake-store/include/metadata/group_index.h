@@ -15,7 +15,7 @@
 #include <vector>
 
 #include "common/transparent_string_hash.h"
-#include "lease.h"
+#include "metadata/group_lease.h"
 
 namespace mooncake {
 
@@ -36,7 +36,9 @@ namespace mooncake {
 // settled by the caller, which holds the key's lock while it adds or drops a
 // membership (see route::ObjectRoute), so this table keeps no identity of its
 // own.
-template <size_t StripeCount>
+// Routes can borrow member keys from their stable map nodes. Standalone
+// tables own their keys, including keys supplied as temporary strings.
+template <size_t StripeCount, typename MemberKey = std::string>
 class StripedGroupIndex {
    public:
     // Materialize the group on demand, register the member and return the
@@ -49,19 +51,25 @@ class StripedGroupIndex {
     // set and a repeat is not an error. An empty group_id is the ungrouped
     // case: it joins no group and gets no lease, so no ungrouped object is ever
     // registered here.
-    [[nodiscard]] std::shared_ptr<Lease> AddMember(
+    [[nodiscard]] std::shared_ptr<NamedGroupLease> AddMember(
         std::string_view group_id, std::string_view member_key) {
         if (group_id.empty()) {
             return nullptr;
         }
         auto& stripe = StripeFor(group_id);
         std::unique_lock<std::shared_mutex> lock(stripe.mutex);
-        auto [it, inserted] = stripe.groups.try_emplace(std::string(group_id));
-        if (inserted) {
-            it->second.lease = std::make_shared<Lease>();
-            group_count_.fetch_add(1, std::memory_order_relaxed);
+        if (const auto it = stripe.groups.find(group_id);
+            it != stripe.groups.end()) {
+            it->second.member_keys.emplace(member_key);
+            return it->second.lease;
         }
-        it->second.member_keys.insert(std::string(member_key));
+        GroupState group;
+        group.lease = std::make_shared<NamedGroupLease>(group_id);
+        group.member_keys.emplace(member_key);
+        const auto it =
+            stripe.groups.emplace(std::string(group_id), std::move(group))
+                .first;
+        group_count_.fetch_add(1, std::memory_order_relaxed);
         return it->second.lease;
     }
 
@@ -101,7 +109,7 @@ class StripedGroupIndex {
         std::vector<std::string> members;
         members.reserve(it->second.member_keys.size());
         for (const auto& member : it->second.member_keys) {
-            members.push_back(member);
+            members.emplace_back(member);
         }
         return members;
     }
@@ -114,9 +122,9 @@ class StripedGroupIndex {
 
    private:
     struct GroupState {
-        std::unordered_set<std::string, TransparentStringHash, std::equal_to<>>
+        std::unordered_set<MemberKey, TransparentStringHash, std::equal_to<>>
             member_keys;
-        std::shared_ptr<Lease> lease;
+        std::shared_ptr<NamedGroupLease> lease;
 
         bool Empty() const { return member_keys.empty(); }
     };

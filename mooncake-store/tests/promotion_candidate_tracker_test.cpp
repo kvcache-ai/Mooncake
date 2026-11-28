@@ -28,8 +28,8 @@ TEST(PromotionCandidateTrackerTest, RecordFilesTheKeyAsDueNow) {
     tracker.RecordLocked(kTenant, "k", state, /*sketch_score=*/3,
                          PromotionCandidateReason::kWatermark, ErrorCode::OK);
 
-    ASSERT_TRUE(state.promotion_candidate);
-    EXPECT_EQ(state.promotion_candidate->sketch_score, 3);
+    ASSERT_TRUE(state.Tasks().promotion_candidate);
+    EXPECT_EQ(state.Tasks().promotion_candidate->sketch_score, 3);
     EXPECT_FALSE(tracker.Empty());
     const auto due = tracker.Due(Clock::now(), 16);
     ASSERT_EQ(due.size(), 1u);
@@ -46,12 +46,12 @@ TEST(PromotionCandidateTrackerTest, RefreshKeepsFailureHistoryAndOneEntry) {
                          ErrorCode::OK, /*execution_failures=*/2);
     tracker.BackoffLocked(kTenant, "k", state,
                           PromotionQueueResult::kQueueCapRejected);
-    ASSERT_EQ(state.promotion_candidate->retry_count, 1u);
+    ASSERT_EQ(state.Tasks().promotion_candidate->retry_count, 1u);
 
     tracker.RecordLocked(kTenant, "k", state, 1,
                          PromotionCandidateReason::kWatermark, ErrorCode::OK);
 
-    const PromotionCandidate& candidate = *state.promotion_candidate;
+    const PromotionCandidate& candidate = *state.Tasks().promotion_candidate;
     EXPECT_EQ(candidate.retry_count, 0u);
     EXPECT_EQ(candidate.execution_failures, 2u);
     EXPECT_EQ(candidate.sketch_score, 5) << "the score only ever rises";
@@ -72,9 +72,9 @@ TEST(PromotionCandidateTrackerTest, EraseAndConsumeUnfile) {
                          ErrorCode::OK, /*execution_failures=*/4);
 
     tracker.EraseLocked(kTenant, "a", a);
-    EXPECT_FALSE(a.promotion_candidate);
+    EXPECT_FALSE(a.Tasks().promotion_candidate);
     EXPECT_EQ(tracker.ConsumeLocked(kTenant, "b", b), 4u);
-    EXPECT_FALSE(b.promotion_candidate);
+    EXPECT_FALSE(b.Tasks().promotion_candidate);
     EXPECT_EQ(tracker.ConsumeLocked(kTenant, "b", b), 0u)
         << "no candidate is a fresh chain";
     EXPECT_TRUE(tracker.Empty());
@@ -90,7 +90,7 @@ TEST(PromotionCandidateTrackerTest, BackoffRefilesInTheFuture) {
     tracker.BackoffLocked(kTenant, "k", state,
                           PromotionQueueResult::kPushFailed);
 
-    const PromotionCandidate& candidate = *state.promotion_candidate;
+    const PromotionCandidate& candidate = *state.Tasks().promotion_candidate;
     EXPECT_EQ(candidate.retry_count, 1u);
     EXPECT_EQ(candidate.last_reason, PromotionCandidateReason::kPushFailed);
     const auto filed_at = candidate.retry_after;
@@ -132,7 +132,7 @@ TEST(PromotionCandidateTrackerTest, StaleCandidateIsDroppedWhenDue) {
     // Past the TTL, the candidate is dropped instead of retried.
     EXPECT_FALSE(tracker.DueLocked(kTenant, "k", state,
                                    Clock::now() + std::chrono::hours(1)));
-    EXPECT_FALSE(state.promotion_candidate);
+    EXPECT_FALSE(state.Tasks().promotion_candidate);
     EXPECT_TRUE(tracker.Empty());
     EXPECT_TRUE(AllFiled(tracker).empty());
 }
@@ -143,12 +143,12 @@ TEST(PromotionCandidateTrackerTest, RetryBudgetRunsOut) {
     tracker.RecordLocked(kTenant, "k", state, 1,
                          PromotionCandidateReason::kQueueCap, ErrorCode::OK);
     size_t retries = 0;
-    while (state.promotion_candidate && retries < 1000) {
+    while (state.Tasks().promotion_candidate && retries < 1000) {
         tracker.BackoffLocked(kTenant, "k", state,
                               PromotionQueueResult::kQueueCapRejected);
         ++retries;
     }
-    EXPECT_FALSE(state.promotion_candidate);
+    EXPECT_FALSE(state.Tasks().promotion_candidate);
     EXPECT_LT(retries, 1000u);
     EXPECT_TRUE(tracker.Empty());
 }
