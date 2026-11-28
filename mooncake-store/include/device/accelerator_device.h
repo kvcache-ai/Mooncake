@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 #include "pinned_host_buffer.h"
 
@@ -53,6 +54,19 @@ class AcceleratorDevice {
     virtual void SetContext(int32_t device_id) const = 0;
     virtual bool Copy(void* dst, const void* src, size_t size,
                       CopyDirection direction) const = 0;
+    // Register existing host memory with the device runtime so device copies
+    // DMA it directly instead of staging it (the role cudaHostRegister plays
+    // on CUDA). Unsupported by default.
+    virtual bool RegisterHostMemory(void* /*addr*/, size_t /*size*/,
+                                    std::string& error_message) const {
+        error_message = "not supported by this device";
+        return false;
+    }
+    virtual bool UnregisterHostMemory(void* /*addr*/,
+                                      std::string& error_message) const {
+        error_message = "not supported by this device";
+        return false;
+    }
     virtual PinnedHostBuffer AllocatePinnedHost(size_t size) const = 0;
 };
 
