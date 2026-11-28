@@ -1194,7 +1194,8 @@ class MasterService {
     // matching is_stale, erasing a key when no valid replica remains. Each
     // tenant is first read to pick the objects that match, and only those are
     // cleaned, each under its own write lock, since a mass client expiry marks
-    // handles stale table-wide.
+    // handles stale table-wide. Caller owns master_state_mutex_ (shared) while
+    // metadata is swept.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
     void OnClientSessionChanged(const ClientSessionEvent& event);

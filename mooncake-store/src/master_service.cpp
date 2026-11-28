@@ -2474,6 +2474,7 @@ void MasterService::ClearInvalidHandlesLocked() {
 }
 
 void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     (void)ClearStaleHandles([&owner](const Replica& replica) {
         return replica.is_local_disk_replica() && replica.is_completed() &&
                replica.get_local_disk_client_id() == owner;
