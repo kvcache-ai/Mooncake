@@ -5096,7 +5096,8 @@ auto MasterService::InsertMetadata(
     const ResolvedSoftPinRequest& soft_pin_request,
     std::vector<Replica>&& replicas,
     std::optional<std::chrono::system_clock::time_point>
-        committed_soft_pin_timeout)
+        committed_soft_pin_timeout,
+    std::string* preferred_memory_segment)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     assert(!accessor.IsPublished());
     const std::string& key = accessor.GetKey();
@@ -5117,6 +5118,21 @@ auto MasterService::InsertMetadata(
 
         if (replica.is_memory_replica()) {
             const auto& mem_desc = desc.get_memory_descriptor();
+            if (preferred_memory_segment != nullptr &&
+                !mem_desc.buffer_descriptor.transport_endpoint_.empty()) {
+                // CXL's shared allocator has a different name from the
+                // mounted segment. Its descriptor carries that mount name.
+                if (mem_desc.buffer_descriptor.protocol_ == "cxl") {
+                    *preferred_memory_segment =
+                        mem_desc.buffer_descriptor.transport_endpoint_;
+                } else {
+                    for (const auto& name : replica.get_segment_names()) {
+                        if (name && !name->empty()) {
+                            *preferred_memory_segment = *name;
+                        }
+                    }
+                }
+            }
             VLOG(1) << "Replica #" << ++i << ": buffer_address="
                     << mem_desc.buffer_descriptor.buffer_address_
                     << ", transport_endpoint="
@@ -5160,7 +5176,7 @@ auto MasterService::AllocateAndInsertMetadata(
     const ResolvedSoftPinRequest& soft_pin_request,
     std::optional<std::chrono::system_clock::time_point>
         committed_soft_pin_timeout,
-    bool* dfs_allocation_failed)
+    bool* dfs_allocation_failed, std::string* preferred_memory_segment)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     assert(!accessor.IsPublished());
     const std::string& key = accessor.GetKey();
@@ -5180,7 +5196,8 @@ auto MasterService::AllocateAndInsertMetadata(
     return InsertMetadata(accessor, client_id, value_length, config, group_id,
                           residency_affinity_id, now, soft_pin_request,
                           std::move(allocation_result.value()),
-                          std::move(committed_soft_pin_timeout));
+                          std::move(committed_soft_pin_timeout),
+                          preferred_memory_segment);
 }
 
 auto MasterService::PrepareWriteStart(
@@ -5341,8 +5358,12 @@ auto MasterService::AdmitWithDfsRecovery(const ReplicateConfig& config,
 auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const TenantId& tenant_id,
                              const uint64_t slice_length,
-                             const ReplicateConfig& config)
+                             const ReplicateConfig& config,
+                             std::string* preferred_memory_segment)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    if (preferred_memory_segment != nullptr) {
+        preferred_memory_segment->clear();
+    }
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     auto plan = PrepareWriteStart(client_id, key, object_id.tenant_id,
                                   slice_length, config, "put_start");
@@ -5411,7 +5432,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         return AllocateAndInsertMetadata(
             accessor, client_id, slice_length, config, plan->writer_host_id,
             plan->group_id, plan->residency_affinity_id, now,
-            plan->soft_pin_request, std::nullopt, dfs_allocation_failed);
+            plan->soft_pin_request, std::nullopt, dfs_allocation_failed,
+            preferred_memory_segment);
     };
 
     // Tenant over-quota remains a background-eviction concern. Bucket-count

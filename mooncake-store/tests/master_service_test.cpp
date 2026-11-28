@@ -4078,6 +4078,103 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
     EXPECT_EQ(base_failed_items, metrics.get_batch_exist_key_failed_items());
 }
 
+TEST_F(MasterServiceTest, BatchPutStartCarriesLogicalSegmentNameAndFallsBack) {
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
+    service_config.enable_metric_reporting = false;
+    service_config.memory_allocator = BufferAllocatorType::OFFSET;
+    WrappedMasterService service(service_config);
+
+    const UUID writer_id = generate_uuid();
+    auto home = MakeSegment("logical-home");
+    home.te_endpoint = "127.0.0.1:19001";
+    // A different segment may have a logical name equal to home's transfer
+    // endpoint. Confusing the two makes the second key prefer that segment.
+    auto remote =
+        MakeSegment(home.te_endpoint, kDefaultSegmentBase + kDefaultSegmentSize,
+                    2 * kDefaultSegmentSize);
+    remote.te_endpoint = "127.0.0.1:19002";
+    ASSERT_TRUE(service.MountSegment(home, writer_id));
+    ASSERT_TRUE(service.MountSegment(remote, generate_uuid()));
+
+    ReplicateConfig config;
+    config.prefer_alloc_in_same_node = true;
+    config.preferred_segments = {home.name};
+    const std::vector<std::string> keys = {"first", "second", "spill",
+                                           "too-large", "last"};
+    const auto results = service.BatchPutStart(
+        writer_id, keys,
+        {4096, 4096, kDefaultSegmentSize, 3 * kDefaultSegmentSize, 4096},
+        config);
+    ASSERT_EQ(results.size(), keys.size());
+    const std::vector<std::pair<size_t, std::string>> expected = {
+        {0, home.te_endpoint},
+        {1, home.te_endpoint},
+        {2, remote.te_endpoint},
+        {4, home.te_endpoint}};
+    std::vector<std::string> successful_keys;
+    for (const auto& [index, endpoint] : expected) {
+        SCOPED_TRACE(keys[index]);
+        ASSERT_TRUE(results[index]) << toString(results[index].error());
+        ASSERT_EQ(results[index]->size(), 1u);
+        ASSERT_TRUE(results[index]->front().is_memory_replica());
+        EXPECT_EQ(results[index]
+                      ->front()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  endpoint);
+        successful_keys.push_back(keys[index]);
+    }
+    ASSERT_FALSE(results[3]);
+    EXPECT_EQ(results[3].error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    // Allocation is still best effort per key, not an atomic batch. A spill
+    // and a rejected key do not undo other allocations or change the hint.
+    auto committed = service.BatchPutEnd(
+        writer_id, MakeObjectMetas(successful_keys), ReplicaType::MEMORY);
+    ASSERT_EQ(committed.size(), successful_keys.size());
+    for (const auto& result : committed) {
+        ASSERT_TRUE(result);
+    }
+    EXPECT_FALSE(service.ExistKey(keys[3]).value_or(true));
+    // The failed allocation must not reserve the key.
+    ASSERT_TRUE(service.PutStart(writer_id, keys[3], 4096, config));
+    ASSERT_TRUE(service.PutRevoke(writer_id, keys[3], ReplicaType::MEMORY));
+}
+
+TEST_F(MasterServiceTest, BatchPutStartPreservesCxlMountName) {
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
+    service_config.enable_metric_reporting = false;
+    service_config.enable_cxl = true;
+    service_config.memory_allocator = BufferAllocatorType::CACHELIB;
+    service_config.cxl_path = "shared-cxl-allocator";
+    service_config.cxl_size = kDefaultSegmentSize;
+    WrappedMasterService service(service_config);
+
+    const UUID writer_id = generate_uuid();
+    auto segment =
+        MakeSegment("cxl-mount", DEFAULT_CXL_BASE, kDefaultSegmentSize);
+    segment.protocol = "cxl";
+    ASSERT_NE(segment.name, service_config.cxl_path);
+    ASSERT_TRUE(service.MountSegment(segment, writer_id));
+
+    ReplicateConfig config;
+    config.prefer_alloc_in_same_node = true;
+    config.preferred_segments = {segment.name};
+    const auto results = service.BatchPutStart(
+        writer_id, {"cxl-first", "cxl-second"}, {1024, 1024}, config);
+    ASSERT_EQ(results.size(), 2u);
+    for (const auto& result : results) {
+        ASSERT_TRUE(result) << toString(result.error());
+        ASSERT_EQ(result->size(), 1u);
+        const auto& buffer =
+            result->front().get_memory_descriptor().buffer_descriptor;
+        EXPECT_EQ(buffer.protocol_, "cxl");
+        EXPECT_EQ(buffer.transport_endpoint_, segment.name);
+    }
+}
+
 TEST_F(MasterServiceTest, WrappedWriteBoundaryRejectsInvalidTenantIds) {
     WrappedMasterService service(
         MakeStrictWrappedConfig({"registered-tenant"}));
