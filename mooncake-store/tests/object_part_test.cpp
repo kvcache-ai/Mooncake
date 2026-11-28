@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <ranges>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -158,6 +159,36 @@ TEST(ObjectPartTest, OneReplicaStaysInsideThePart) {
     EXPECT_LT(replica, part_begin + sizeof(ObjectPart));
 }
 
+TEST(ObjectPartTest, KeepsTheSurvivingReplicaInlineAfterGrowingAndShrinking) {
+    ObjectPart part(kObjectLength, {});
+    part.AddReplicas(MakeDiskReplicas({ReplicaStatus::PROCESSING}));
+    const ReplicaID first = part.replicas().front().id();
+
+    auto added = MakeDiskReplicas({ReplicaStatus::COMPLETE});
+    const ReplicaID second = added.front().id();
+    part.AddReplicas(std::move(added));
+    ASSERT_EQ(part.replicas().size(), 2u);
+    EXPECT_EQ(part.replicas()[0].id(), first);
+    EXPECT_EQ(part.replicas()[1].id(), second);
+
+    auto removed = part.PopReplicas(&Replica::fn_is_processing);
+    ASSERT_EQ(removed.size(), 1u);
+    EXPECT_EQ(removed.front().id(), first);
+    ASSERT_EQ(part.replicas().size(), 1u);
+    EXPECT_EQ(part.replicas().front().id(), second);
+    const auto address =
+        reinterpret_cast<std::uintptr_t>(part.replicas().data());
+    const auto begin = reinterpret_cast<std::uintptr_t>(&part);
+    EXPECT_GE(address, begin);
+    EXPECT_LT(address, begin + sizeof(part));
+
+    EXPECT_TRUE(part.PopReplicas(&Replica::fn_is_processing).empty());
+    removed = part.PopReplicas(&Replica::fn_is_completed);
+    ASSERT_EQ(removed.size(), 1u);
+    EXPECT_EQ(removed.front().id(), second);
+    EXPECT_TRUE(part.replicas().empty());
+}
+
 TEST(EnvelopePartTest, TheEnvelopeReadsAndWritesItsSinglePart) {
     auto metadata = MakeEnvelope(kObjectLength,
                                  MakeDiskReplicas({ReplicaStatus::COMPLETE}));
@@ -167,6 +198,8 @@ TEST(EnvelopePartTest, TheEnvelopeReadsAndWritesItsSinglePart) {
     // envelope's own operations answer with what that part holds.
     const ObjectPart& part = metadata->GetPart(0);
     EXPECT_EQ(&metadata->MutablePart(0), &part);
+    EXPECT_THROW(metadata->GetPart(1), std::out_of_range);
+    EXPECT_THROW(metadata->MutablePart(1), std::out_of_range);
     EXPECT_EQ(part.length(), kObjectLength);
     EXPECT_EQ(*part.checksum(), kChecksum);
     EXPECT_EQ(metadata->TotalLength(), part.length());

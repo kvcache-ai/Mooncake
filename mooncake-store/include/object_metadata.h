@@ -21,13 +21,12 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
-#include <boost/container/small_vector.hpp>
 
 #include "common/heap_optional.h"
 #include "lease.h"
@@ -90,8 +89,8 @@ struct ObjectMetadata {
           key_group(
               MasterMetricManager::instance().classify_key_group(user_key)),
           soft_pin_timeout(std::move(committed_soft_pin_timeout)),
-          hard_pinned(enable_hard_pin) {
-        parts_.emplace_back(value_length, std::move(reps));
+          hard_pinned(enable_hard_pin),
+          part_(value_length, std::move(reps)) {
         MasterMetricManager::instance().inc_key_count(1);
         MasterMetricManager::instance().inc_key_group(key_group, value_length);
         if (soft_pin_timeout) {
@@ -262,17 +261,17 @@ struct ObjectMetadata {
 
     // Read under the owner's shared lock, change under its exclusive lock. A
     // replica pointer taken from a part is invalidated by any add or pop on it.
-    const ObjectPart& GetPart(size_t index) const { return parts_.at(index); }
-
-    ObjectPart& MutablePart(size_t index) { return parts_.at(index); }
-
-    size_t TotalLength() const {
-        size_t total = 0;
-        for (const auto& part : parts_) {
-            total += part.length();
-        }
-        return total;
+    const ObjectPart& GetPart(size_t index) const {
+        if (index != 0) throw std::out_of_range("object part index");
+        return part_;
     }
+
+    ObjectPart& MutablePart(size_t index) {
+        if (index != 0) throw std::out_of_range("object part index");
+        return part_;
+    }
+
+    size_t TotalLength() const { return part_.length(); }
 
     // Temporary: these operate on part 0. The multi-part work replaces them
     // with `parts()` and a flattened `replicas()` view, so each call site says
@@ -601,7 +600,7 @@ struct ObjectMetadata {
     }
 
     // The first part sits in the object itself: every object has one today.
-    boost::container::small_vector<ObjectPart, 1> parts_;
+    ObjectPart part_;
 };
 
 }  // namespace mooncake
