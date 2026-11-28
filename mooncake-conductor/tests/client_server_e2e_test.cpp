@@ -1357,6 +1357,7 @@ TEST(ClientServerE2ETest, VllmCpuLocalYieldsToMooncakeAcrossPublicQueries) {
 
 TEST(ClientServerE2E, SpecialKVRegistrationEventsAndBothQueryTransports) {
     RouterEventPublisher publisher;
+    RouterEventPublisher ordinary_publisher;
     EventManager manager({}, 0, kRpcPort);
     ASSERT_TRUE(manager.StartHTTPServer());
     ASSERT_TRUE(manager.StartRPCServer());
@@ -1376,7 +1377,7 @@ TEST(ClientServerE2E, SpecialKVRegistrationEventsAndBothQueryTransports) {
     request.context.model_name = service.model_name;
     const auto hashes =
         ProjectedFor(request.context, service.hash_profile, request.token_ids);
-    auto publish = [&](bool removed, int group,
+    auto publish = [&](RouterEventPublisher& target, bool removed, int group,
                        const std::vector<ProjectedPrefix>& values) {
         msgpack::sbuffer buffer;
         msgpack::packer<msgpack::sbuffer> packer(&buffer);
@@ -1407,7 +1408,7 @@ TEST(ClientServerE2E, SpecialKVRegistrationEventsAndBothQueryTransports) {
             packer.pack_nil();
         }
         packer.pack(0);
-        publisher.Publish(std::string(buffer.data(), buffer.size()));
+        target.Publish(std::string(buffer.data(), buffer.size()));
     };
     coro_http::coro_http_client http;
     const auto http_port = EventManagerTestPeer::HttpPort(manager);
@@ -1427,11 +1428,11 @@ TEST(ClientServerE2E, SpecialKVRegistrationEventsAndBothQueryTransports) {
         } while (std::chrono::steady_clock::now() < deadline);
         return false;
     };
-    publish(false, 0, hashes);
+    publish(publisher, false, 0, hashes);
     ASSERT_TRUE(wait_for(0));  // Full presence cannot manufacture a checkpoint.
-    publish(false, 1, {hashes.back()});
+    publish(publisher, false, 1, {hashes.back()});
     ASSERT_TRUE(wait_for(0));  // No complete deployed group inventory on wire.
-    publish(true, 1, {hashes.back()});
+    publish(publisher, true, 1, {hashes.back()});
     ASSERT_TRUE(wait_for(0));
     const auto view = client.GetGlobalView();
     ASSERT_TRUE(view);
@@ -1442,15 +1443,17 @@ TEST(ClientServerE2E, SpecialKVRegistrationEventsAndBothQueryTransports) {
     EXPECT_TRUE(empty->instances.empty());
 
     // A different, unlisted model still uses the ordinary event/query path.
+    // A fresh XPUB endpoint makes the new subscription observable.
+    service.endpoint = ordinary_publisher.Endpoint();
     service.model_name = "unlisted-model";
     request.context.model_name = service.model_name;
     ASSERT_TRUE(client.Register(service));
-    ASSERT_TRUE(publisher.WaitForSubscriber());
+    ASSERT_TRUE(ordinary_publisher.WaitForSubscriber());
     const auto ordinary_hashes =
         ProjectedFor(request.context, service.hash_profile, request.token_ids);
-    publish(false, 0, ordinary_hashes);
+    publish(ordinary_publisher, false, 0, ordinary_hashes);
     ASSERT_TRUE(wait_for(48));
-    publish(true, 0, ordinary_hashes);
+    publish(ordinary_publisher, true, 0, ordinary_hashes);
     ASSERT_TRUE(wait_for(0));
     ASSERT_TRUE(client.Unregister(service.instance_id, "default", 0));
     client.Close();
