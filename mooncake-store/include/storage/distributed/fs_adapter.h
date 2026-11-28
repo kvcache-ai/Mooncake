@@ -132,9 +132,19 @@ class FileSystemAdapter {
     virtual bool SupportsFdReopen() const { return false; }
 
     // Opt in to backend batching and concurrent positional I/O on cached
-    // shard fds. Other adapters retain per-request bucket handles and
-    // serialized shard I/O.
+    // shard fds. Other adapters retain serialized shard I/O and, unless
+    // RequiresWriteSync(), per-request bucket handles.
     virtual bool SupportsBatchIo() const { return false; }
+
+    // Whether written data must go through SyncFile before a write is
+    // reported as successful. When true, the backend calls SyncFile once per
+    // file per BatchWrite, after all of that batch's writes to the file, and
+    // fails the file's requests if it fails. Bucket writes are then grouped
+    // per bucket so each bucket is opened and synced once per batch.
+    virtual bool RequiresWriteSync() const { return false; }
+
+    // Makes the completed writes on `fd` durable.
+    virtual tl::expected<void, ErrorCode> SyncFile(int /*fd*/) { return {}; }
 
     // Whether ReadAt/BatchReadAt accept iovecs pointing at arbitrary writable
     // host memory, with any length and file offset, without caller-side
