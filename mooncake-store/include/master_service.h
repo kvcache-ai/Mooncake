@@ -1579,12 +1579,11 @@ class MasterService {
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr);
 
-    // Cancels the offload task on `object_id`, releasing the source refcnt
-    // and dropping the task marker along with its mirrors. Returns false
+    // Cancels the offload task on `object_id`, dropping the task marker
+    // (releasing its source ReplicaPin) along with its mirrors. Returns false
     // without touching the task if any mirror has already been drained by a
     // store worker.
-    bool CancelQueuedOffloadTask(ObjectMetadata& metadata,
-                                 route::ObjectState& state,
+    bool CancelQueuedOffloadTask(route::ObjectState& state,
                                  const ObjectIdentity& object_id);
 
     struct GracefulUnmountDeadlineRecord {

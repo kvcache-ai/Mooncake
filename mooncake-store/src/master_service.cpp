@@ -1985,9 +1985,6 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
     }
 
     auto& metadata = accessor.Get();
-    if (auto source = metadata.GetReplicaByID(source_id); source != nullptr) {
-        source->dec_refcnt();
-    }
 
     std::unordered_set<ReplicaID> ids(target_ids.begin(), target_ids.end());
     auto replicas = PopReplicasWithCacheTotalAccounting(
@@ -2168,15 +2165,11 @@ void MasterService::EraseMetadata(metadata::Namespace& ns,
         ns.BeforeTearDown(hold);
     }
 
-    // Clean up offloading_task + dec_refcnt before erasing metadata.
-    // When BatchEvict deletes metadata, Store Worker may still have an
-    // in-flight offload for this key. Without this cleanup the task
-    // becomes an orphan that only expires after 600s.
+    // Clean up offloading_task before erasing metadata (releasing its
+    // ReplicaPin automatically). When BatchEvict deletes metadata, Store
+    // Worker may still have an in-flight offload for this key. Without this
+    // cleanup the task becomes an orphan that only expires after 600s.
     if (state.offloading_task) {
-        auto source = metadata.GetReplicaByID(state.offloading_task->source_id);
-        if (source != nullptr) {
-            source->dec_refcnt();
-        }
         state.offloading_task.reset();
 
         // The mailbox entry must be dropped too, otherwise the next
@@ -2184,13 +2177,7 @@ void MasterService::EraseMetadata(metadata::Namespace& ns,
         // produces an orphan bucket.
         local_ssd_manager_.RemoveOffloadFromAll(tenant_id, key);
     }
-    if (state.replication_task) {
-        auto source =
-            metadata.GetReplicaByID(state.replication_task->source_id);
-        if (source != nullptr) {
-            source->dec_refcnt();
-        }
-    }
+    state.replication_task.reset();
     ErasePromotionTaskIfPresent(state);
     dynamic_replication_.ClearPendingLocked(tenant_id, key, state);
     // The candidate leaves the retry index with the object, or the index would
@@ -5558,24 +5545,24 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         auto& state = accessor.GetState();
         // One marker covers every mirror pushed below, so the mirrors are
         // collected before the marker is recorded.
-        std::optional<ReplicaID> source_id;
+        ReplicaPin source_pin;
         std::vector<UUID> mirror_clients;
         metadata.VisitReplicas(
             [](const Replica& replica) {
                 return replica.is_completed() && replica.is_memory_replica();
             },
-            [this, &object_id, &source_id, &mirror_clients](Replica& replica) {
+            [this, &object_id, &source_pin, &mirror_clients](Replica& replica) {
                 auto result =
                     PushOffloadingQueue(object_id, replica, &mirror_clients);
-                if (result && !source_id.has_value()) {
-                    replica.inc_refcnt();
-                    source_id = replica.id();
+                if (result && !source_pin.Active()) {
+                    source_pin = replica.Pin();
                 }
             });
-        if (source_id.has_value() && !state.offloading_task) {
-            state.offloading_task =
-                OffloadingTask{*source_id, std::chrono::system_clock::now(),
-                               std::move(mirror_clients)};
+        if (source_pin.Active() && !state.offloading_task) {
+            const ReplicaID source_id = source_pin.replica_id();
+            state.offloading_task = OffloadingTask{
+                source_id, std::chrono::system_clock::now(),
+                std::move(mirror_clients), std::move(source_pin)};
         }
     }
 
@@ -6043,8 +6030,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // over. Once a store worker owns the task it is reading the
                 // source buffer for its SSD write, so the upsert waits for
                 // NotifyOffloadSuccess to clear the marker instead.
-                if (!CancelQueuedOffloadTask(accessor.Get(),
-                                             accessor.GetState(), object_id)) {
+                if (!CancelQueuedOffloadTask(accessor.GetState(), object_id)) {
                     LOG(INFO) << "key=" << key
                               << ", error=object_has_offloading_task";
                     return tl::make_unexpected(
@@ -6699,24 +6685,28 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         response.targets.push_back(std::move(descriptor));
     }
 
-    // Create replication task for tracking.
+    // Create replication task for tracking, pinning source to protect it from
+    // eviction until the task ends or is discarded.
     auto& replication_task = state.replication_task;
     if (replication_task) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
-    replication_task.emplace(
-        client_id, std::chrono::system_clock::now(),
-        ReplicationTask::Type::COPY, source->id(), std::move(replica_ids),
-        dynamic_replication_lease_id, dynamic_replication_version_epoch);
+    replication_task.emplace(ReplicationTask{
+        .client_id = client_id,
+        .start_time = std::chrono::system_clock::now(),
+        .type = ReplicationTask::Type::COPY,
+        .source_id = source->id(),
+        .replica_ids = std::move(replica_ids),
+        .dynamic_replication_lease_id = dynamic_replication_lease_id,
+        .dynamic_replication_version_epoch = dynamic_replication_version_epoch,
+        .source_pin = source->Pin(),
+    });
 
     dynamic_replication_.RegisterCopyStartLocked(
         metadata, state, src_segment,
         DynamicReplicationController::VersionEpoch(metadata),
         new_target_segments, replication_task->replica_ids);
     pending_guard.Release();
-
-    // Increase source refcnt to protect it from eviction.
-    source->inc_refcnt();
 
     // Add replicas to the object.
     // DO NOT ACCESS source AFTER THIS !!!
@@ -6778,13 +6768,8 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         LOG(ERROR) << "key=" << key << ", source_id=" << source_id
                    << ", status=" << (source == nullptr ? "nullptr" : "invalid")
                    << ", copy source becomes invalid during data transfer";
-        // Release the refcnt taken in CopyStart. The success path below does
-        // this once the copy completes; this error path must do it too, or the
-        // source replica stays pinned and can never be evicted.
-        if (source != nullptr) {
-            source->dec_refcnt();
-        }
-        // Discard target replicas and clear the replication task.
+        // Discard target replicas and clear the replication task (releasing
+        // source_pin automatically).
         EraseReplicasWithCacheTotalAccounting(
             metadata, [&task](const Replica& replica) {
                 return std::find(task.replica_ids.begin(),
@@ -6830,7 +6815,6 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         batch_reservation = std::move(reservation.value());
     }
 
-    source->dec_refcnt();
     for (const auto& replica_id : commit_target_ids) {
         auto replica = metadata.GetReplicaByID(replica_id);
         if (replica != nullptr) {
@@ -6934,16 +6918,7 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     }
 
     auto& metadata = accessor.Get();
-    const auto source_id = task.source_id;
     const auto replica_ids = task.replica_ids;
-    auto source = metadata.GetReplicaByID(source_id);
-    if (source == nullptr) {
-        LOG(WARNING) << "key=" << key << ", source_id=" << source_id
-                     << ", copy source not found during revoke";
-    } else {
-        // Decrement source reference count
-        source->dec_refcnt();
-    }
 
     // Erase all replica_ids
     for (const auto& replica_id : replica_ids) {
@@ -7074,20 +7049,23 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         response.target = std::nullopt;
     }
 
-    // Create replication task for tracking.
+    // Create replication task for tracking, pinning source to protect it from
+    // eviction until the move ends or is discarded.
     auto& replication_task = accessor.GetState().replication_task;
     if (replication_task) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
-    replication_task.emplace(client_id, std::chrono::system_clock::now(),
-                             ReplicationTask::Type::MOVE, source->id(),
-                             std::move(replica_ids), UUID{}, 0);
+    replication_task.emplace(ReplicationTask{
+        .client_id = client_id,
+        .start_time = std::chrono::system_clock::now(),
+        .type = ReplicationTask::Type::MOVE,
+        .source_id = source->id(),
+        .replica_ids = std::move(replica_ids),
+        .source_pin = source->Pin(),
+    });
     if (target != nullptr) {
         replication_task->existing_move_target = target->id();
     }
-
-    // Increase source refcnt to protect it from eviction.
-    source->inc_refcnt();
 
     // Add replicas to the object.
     // DO NOT ACCESS source AFTER THIS !!!
@@ -7137,13 +7115,8 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         LOG(ERROR) << "key=" << key << ", source_id=" << source_id
                    << ", status=" << (source == nullptr ? "nullptr" : "invalid")
                    << ", move source becomes invalid during data transfer";
-        // Release the refcnt taken in MoveStart. The success path below does
-        // this once the move completes; this error path must do it too, or the
-        // source replica stays pinned and can never be evicted.
-        if (source != nullptr) {
-            source->dec_refcnt();
-        }
-        // Discard target replica and clear the replication task.
+        // Discard target replica and clear the replication task (releasing
+        // source_pin automatically).
         EraseReplicasWithCacheTotalAccounting(
             metadata, [&task](const Replica& replica) {
                 return std::find(task.replica_ids.begin(),
@@ -7174,8 +7147,9 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
 
-    // Validate the target replica before any mutation. Source dec_refcnt
-    // and target mark_complete are deferred until after persist.
+    // Validate the target replica before any mutation. Target mark_complete
+    // and releasing the source ReplicaPin (via EraseReplicationTask) are
+    // deferred until after persist.
     if (task.existing_move_target) {
         const auto* target =
             metadata.GetReplicaByID(*task.existing_move_target);
@@ -7191,11 +7165,8 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             LOG(WARNING)
                 << "key=" << key << ", replica_id=" << target_id
                 << ", move target becomes invalid during data transfer";
-            // Release the refcnt taken in MoveStart. The success path below
-            // does this once the move completes; this error path must do it
-            // too, or the source replica stays pinned.
-            source->dec_refcnt();
-            // Discard target replica and clear the replication task.
+            // Discard target replica and clear the replication task (releasing
+            // source_pin automatically).
             EraseReplicasWithCacheTotalAccounting(
                 metadata, [&task](const Replica& replica) {
                     return std::find(task.replica_ids.begin(),
@@ -7246,7 +7217,6 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
     }
 
     // Persist OK — apply local commit.
-    source->dec_refcnt();
     if (has_target) {
         auto replica = metadata.GetReplicaByID(target_id);
         if (replica != nullptr) {
@@ -7309,15 +7279,6 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     }
 
     auto& metadata = accessor.Get();
-    auto source_id = task.source_id;
-    auto source = metadata.GetReplicaByID(source_id);
-    if (source == nullptr) {
-        LOG(WARNING) << "key=" << key << ", source_id=" << source_id
-                     << ", move source not found during revoke";
-    } else {
-        // Decrement source reference count
-        source->dec_refcnt();
-    }
 
     // Erase all replica_ids (in MOVE operation, there should be at most one)
     for (const auto& replica_id : task.replica_ids) {
@@ -7711,10 +7672,6 @@ void MasterService::CancelPromotionTaskForRemovedReplicas(
         return;
     }
 
-    if (auto* source = metadata.GetReplicaByID(task->source_id);
-        source != nullptr) {
-        source->dec_refcnt();
-    }
     const UUID holder_id = task->holder_id;
     ErasePromotionTaskIfPresent(state);
 
@@ -8263,23 +8220,15 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
     }
     // Offloading is disabled: clear the pending queue to prevent unbounded
     // growth that would trigger KEYS_ULTRA_LIMIT in PushOffloadingQueue. We
-    // must also clean up the corresponding offloading tasks and decrement
-    // source replica refcounts to avoid resource leaks and blocked writes
+    // must also clean up the corresponding offloading tasks (releasing their
+    // source ReplicaPins) to avoid resource leaks and blocked writes
     // (OBJECT_HAS_REPLICATION_TASK).
     for (auto& task : *pending) {
         const auto object_id =
             MakeObjectIdentity(task.key, TenantId(task.tenant_id));
         MetadataAccessorRW accessor(this, object_id);
         if (accessor.Exists()) {
-            auto& offloading_task = accessor.GetState().offloading_task;
-            if (offloading_task) {
-                auto source =
-                    accessor.Get().GetReplicaByID(offloading_task->source_id);
-                if (source) {
-                    source->dec_refcnt();
-                }
-                offloading_task.reset();
-            }
+            accessor.GetState().offloading_task.reset();
         }
     }
     return std::vector<OffloadTaskItem>{};
@@ -8355,7 +8304,8 @@ auto MasterService::NotifyOffloadSuccess(
             MakeObjectIdentityForRequest(task.key, task_tenant);
 
         // NACK sentinel: offload failed on worker. Clean up the
-        // offloading_task + dec_refcnt but skip AddReplica.
+        // offloading_task (auto-unpinning source via ReplicaPin) and skip
+        // AddReplica.
         if (metadata.data_size < 0) {
             std::shared_lock<std::shared_mutex> shared_lock(
                 master_state_mutex_);
@@ -8363,11 +8313,6 @@ auto MasterService::NotifyOffloadSuccess(
             if (accessor.Exists()) {
                 auto& offloading_task = accessor.GetState().offloading_task;
                 if (offloading_task) {
-                    auto source = accessor.Get().GetReplicaByID(
-                        offloading_task->source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
-                    }
                     offloading_task.reset();
                     MasterMetricManager::instance().inc_offload_failed(
                         UuidToString(client_id));
@@ -8416,11 +8361,6 @@ auto MasterService::NotifyOffloadSuccess(
                 // for a master-admitted offload completion. Without this task
                 // marker, fall through to the regular registration check.
                 if (offloading_task) {
-                    auto source =
-                        obj_metadata.GetReplicaByID(offloading_task->source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
-                    }
                     offloading_task.reset();
 
                     if (!segment_mounted) {
@@ -8514,9 +8454,9 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     std::vector<UUID>* mirror_clients) {
     const auto& segment_names = replica.get_segment_names();
     // No source segment names means there is no usable source segment to
-    // offload from. Returning a silent {} here caused the caller to record an
-    // OffloadingTask + inc_refcnt for work that was never enqueued, leaking the
-    // refcount until TTL expiry (issue #2997). Return an explicit
+    // offload from. Returning a silent {} here caused the caller to pin the
+    // source and record an OffloadingTask for work that was never enqueued,
+    // leaking the pin until TTL expiry (issue #2997). Return an explicit
     // UNABLE_OFFLOADING so callers treat this as a no-op rather than a success.
     if (segment_names.empty() ||
         std::none_of(segment_names.begin(), segment_names.end(),
@@ -8596,8 +8536,7 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     return {};
 }
 
-bool MasterService::CancelQueuedOffloadTask(ObjectMetadata& metadata,
-                                            route::ObjectState& state,
+bool MasterService::CancelQueuedOffloadTask(route::ObjectState& state,
                                             const ObjectIdentity& object_id) {
     auto& offloading_task = state.offloading_task;
     if (!offloading_task) {
@@ -8613,10 +8552,6 @@ bool MasterService::CancelQueuedOffloadTask(ObjectMetadata& metadata,
         return false;
     }
 
-    auto source = metadata.GetReplicaByID(offloading_task->source_id);
-    if (source != nullptr) {
-        source->dec_refcnt();
-    }
     MasterMetricManager::instance().inc_offload_cancelled(
         UuidToString(mirror_clients[0]));
     offloading_task.reset();
@@ -9044,15 +8979,15 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         return PromotionQueueResult::kQueueCapRejected;
     }
 
-    // Pin the source replica.
-    source->inc_refcnt();
+    // Pin the source replica; auto-unpins on early return if enqueue fails.
+    ReplicaPin source_pin = source->Pin();
     const uint64_t object_size =
         source->get_descriptor().get_local_disk_descriptor().object_size;
 
-    // Try to enqueue on the holder client. On failure, drop the refcnt back.
+    // Try to enqueue on the holder client. On failure, source_pin releases on
+    // scope exit.
     auto push_result = PushPromotionQueue(object_id, *source);
     if (!push_result) {
-        source->dec_refcnt();
         VLOG(1) << "promotion_push_failed key=" << key
                 << " error=" << push_result.error();
         if (push_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -9084,13 +9019,15 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
     // execution-failure cycles; an absent candidate means a fresh chain (0).
     const uint32_t execution_failures =
         promotion_candidates_.ConsumeLocked(object_id.tenant_id, key, state);
-    promotion_task =
-        PromotionTask{.source_id = source->id(),
-                      .alloc_id = 0,
-                      .object_size = object_size,
-                      .start_time = std::chrono::system_clock::now(),
-                      .holder_id = holder_id,
-                      .execution_failures = execution_failures};
+    promotion_task = PromotionTask{
+        .source_id = source->id(),
+        .alloc_id = 0,
+        .object_size = object_size,
+        .start_time = std::chrono::system_clock::now(),
+        .holder_id = holder_id,
+        .execution_failures = execution_failures,
+        .source_pin = std::move(source_pin),
+    };
     promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
     MasterMetricManager::instance().inc_promotion_in_flight();
     MasterMetricManager::instance().inc_promotion_admitted();
@@ -9167,19 +9104,20 @@ auto MasterService::RegisterPrefetchTask(const UUID& client_id,
     // persistently failing hot key would cycle prefetch -> fail -> on-hit
     // retry -> re-record -> prefetch with the breaker reset to zero every
     // time a probe re-triggers.
-    source->inc_refcnt();
     const uint64_t object_size =
         source->get_descriptor().get_local_disk_descriptor().object_size;
     const uint32_t execution_failures = promotion_candidates_.ConsumeLocked(
         object_id.tenant_id, object_id.user_key, accessor.GetState());
-    promotion_task =
-        PromotionTask{.source_id = source->id(),
-                      .alloc_id = 0,
-                      .object_size = object_size,
-                      .start_time = std::chrono::system_clock::now(),
-                      .holder_id = holder_id.value(),
-                      .execution_failures = execution_failures,
-                      .from_prefetch = true};
+    promotion_task = PromotionTask{
+        .source_id = source->id(),
+        .alloc_id = 0,
+        .object_size = object_size,
+        .start_time = std::chrono::system_clock::now(),
+        .holder_id = holder_id.value(),
+        .execution_failures = execution_failures,
+        .from_prefetch = true,
+        .source_pin = source->Pin(),
+    };
     promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
     MasterMetricManager::instance().inc_promotion_in_flight();
     VLOG(1) << "prefetch_task_registered key=" << object_id.user_key
@@ -9405,11 +9343,7 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         }
     }
 
-    // Drop the source LOCAL_DISK replica's refcnt and erase the task.
-    auto* source = metadata.GetReplicaByID(promotion_task->source_id);
-    if (source != nullptr) {
-        source->dec_refcnt();
-    }
+    // Erase the task (automatically releasing source_pin).
     const uint64_t completed_bytes = promotion_task->object_size;
     promotion_task.reset();
     promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
@@ -9473,10 +9407,6 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
 
     // Mirror the reaper's expiry path; see DiscardExpiredProcessingReplicas
     // Part 4 for the full rationale on each step.
-    auto* source = metadata.GetReplicaByID(promotion_task->source_id);
-    if (source != nullptr) {
-        source->dec_refcnt();
-    }
     if (promotion_task->alloc_id != 0) {
         const ReplicaID alloc_id = promotion_task->alloc_id;
         EraseReplicasWithCacheTotalAccounting(
@@ -9790,11 +9720,6 @@ void MasterService::DiscardExpiredProcessingReplicas(
             continue;
         }
 
-        auto source = metadata.GetReplicaByID(task->source_id);
-        if (source != nullptr) {
-            source->dec_refcnt();
-        }
-
         auto replicas =
             PopReplicasWithCacheTotalAccounting(metadata, target_pred);
         std::vector<ReplicaID> erased_replica_ids;
@@ -9835,10 +9760,6 @@ void MasterService::DiscardExpiredProcessingReplicas(
         if (ttl > now) {
             continue;
         }
-        auto source = accessor.Get().GetReplicaByID(task->source_id);
-        if (source != nullptr) {
-            source->dec_refcnt();
-        }
         LOG(WARNING) << "Offloading task expired for key: " << key
                      << " tenant=" << tenant_id;
         task.reset();
@@ -9858,10 +9779,6 @@ void MasterService::DiscardExpiredProcessingReplicas(
         const auto ttl = task->start_time + put_start_release_timeout_sec_;
         if (ttl > now) {
             continue;
-        }
-        auto source = metadata.GetReplicaByID(task->source_id);
-        if (source != nullptr) {
-            source->dec_refcnt();
         }
         if (task->alloc_id != 0) {
             const ReplicaID alloc_id = task->alloc_id;

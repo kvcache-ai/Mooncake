@@ -398,6 +398,102 @@ struct LocalDiskDescriptor {
     YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
 };
 
+namespace detail {
+
+// Refcounted pin control block shared between a Replica and all active
+// ReplicaPin handles. Allocated lazily on first Replica::Pin() so unpinned
+// replicas incur zero heap allocations.
+//
+// Packed atomic uint64_t layout:
+//   - Upper 32 bits: handle_count (1 for the owning Replica + 1 per active
+//     ReplicaPin). Deletes itself when handle_count reaches 0.
+//   - Lower 32 bits: pin_count (number of active ReplicaPin handles; equals
+//     Replica::get_refcnt()).
+struct ReplicaPinState {
+    static constexpr uint64_t kHandleOne = uint64_t{1} << 32;
+    static constexpr uint64_t kPinOne = uint64_t{1};
+    static constexpr uint64_t kPinMask = 0xFFFFFFFFULL;
+
+    // Initialized with handle_count = 1 (the owning Replica), pin_count = 0.
+    std::atomic<uint64_t> state{kHandleOne};
+
+    void AcquirePin() noexcept {
+        state.fetch_add(kHandleOne + kPinOne, std::memory_order_relaxed);
+    }
+
+    void ReleasePin() noexcept {
+        const uint64_t prev =
+            state.fetch_sub(kHandleOne + kPinOne, std::memory_order_acq_rel);
+        if (static_cast<uint32_t>(prev >> 32) == 1) {
+            delete this;
+        }
+    }
+
+    void ReleaseReplicaOwner() noexcept {
+        const uint64_t prev =
+            state.fetch_sub(kHandleOne, std::memory_order_acq_rel);
+        if (static_cast<uint32_t>(prev >> 32) == 1) {
+            delete this;
+        }
+    }
+
+    [[nodiscard]] uint32_t PinCount() const noexcept {
+        return static_cast<uint32_t>(state.load(std::memory_order_acquire) &
+                                     kPinMask);
+    }
+};
+
+}  // namespace detail
+
+// Move-only RAII handle keeping a Replica busy (protected from eviction,
+// in-place overwrite, and move removal) for the lifetime of an async task
+// (Copy/Move, Offload, Promotion, etc.).
+//
+// Destroying or resetting a ReplicaPin atomically unpins the replica from any
+// thread without acquiring the key lock or accessing ObjectMetadata, and
+// remains safe even if the Replica has already been moved or destroyed.
+class ReplicaPin {
+   public:
+    ReplicaPin() noexcept = default;
+    ~ReplicaPin() { Reset(); }
+
+    ReplicaPin(const ReplicaPin&) = delete;
+    ReplicaPin& operator=(const ReplicaPin&) = delete;
+
+    ReplicaPin(ReplicaPin&& other) noexcept
+        : state_(std::exchange(other.state_, nullptr)),
+          replica_id_(std::exchange(other.replica_id_, 0)) {}
+
+    ReplicaPin& operator=(ReplicaPin&& other) noexcept {
+        if (this != &other) {
+            Reset();
+            state_ = std::exchange(other.state_, nullptr);
+            replica_id_ = std::exchange(other.replica_id_, 0);
+        }
+        return *this;
+    }
+
+    void Reset() noexcept {
+        if (state_ != nullptr) {
+            state_->ReleasePin();
+            state_ = nullptr;
+            replica_id_ = 0;
+        }
+    }
+
+    [[nodiscard]] bool Active() const noexcept { return state_ != nullptr; }
+    explicit operator bool() const noexcept { return Active(); }
+    [[nodiscard]] ReplicaID replica_id() const noexcept { return replica_id_; }
+
+   private:
+    friend class Replica;
+    ReplicaPin(detail::ReplicaPinState* state, ReplicaID replica_id) noexcept
+        : state_(state), replica_id_(replica_id) {}
+
+    detail::ReplicaPinState* state_{nullptr};
+    ReplicaID replica_id_{0};
+};
+
 class Replica {
    public:
     struct Descriptor;
@@ -430,6 +526,11 @@ class Replica {
         : Replica(next_id_.fetch_add(1), std::move(descriptor), status) {}
 
     ~Replica() {
+        if (auto* state =
+                pin_state_.exchange(nullptr, std::memory_order_acq_rel);
+            state != nullptr) {
+            state->ReleaseReplicaOwner();
+        }
         if (status_ == ReplicaStatus::UNDEFINED) return;
         if (is_disk_replica()) {
             MasterMetricManager::instance().dec_allocated_file_size(
@@ -449,7 +550,8 @@ class Replica {
         : id_(src.id_),
           data_(std::move(src.data_)),
           status_(src.status_),
-          refcnt_(src.refcnt_.exchange(0)) {
+          pin_state_(
+              src.pin_state_.exchange(nullptr, std::memory_order_acq_rel)) {
         // Mark the source as moved-from so its destructor doesn't
         // double-decrement metrics.
         src.status_ = ReplicaStatus::UNDEFINED;
@@ -475,7 +577,12 @@ class Replica {
         id_ = src.id_;
         data_ = std::move(src.data_);
         status_ = src.status_;
-        refcnt_.store(src.refcnt_.exchange(0));
+        if (auto* old = pin_state_.exchange(
+                src.pin_state_.exchange(nullptr, std::memory_order_acq_rel),
+                std::memory_order_acq_rel);
+            old != nullptr) {
+            old->ReleaseReplicaOwner();
+        }
         // Mark src as moved-from.
         src.status_ = ReplicaStatus::UNDEFINED;
 
@@ -536,7 +643,7 @@ class Replica {
         return replica.is_processing();
     }
 
-    [[nodiscard]] bool is_busy() const { return refcnt_.load() > 0; }
+    [[nodiscard]] bool is_busy() const noexcept { return get_refcnt() > 0; }
 
     [[nodiscard]] static bool fn_is_busy(const Replica& replica) {
         return replica.is_busy();
@@ -727,11 +834,16 @@ class Replica {
         }
     }
 
-    void inc_refcnt() { refcnt_.fetch_add(1); }
+    [[nodiscard]] ReplicaPin Pin() {
+        auto* state = GetOrCreatePinState();
+        state->AcquirePin();
+        return ReplicaPin(state, id_);
+    }
 
-    void dec_refcnt() { refcnt_.fetch_sub(1); }
-
-    uint32_t get_refcnt() const { return refcnt_.load(); }
+    [[nodiscard]] uint32_t get_refcnt() const noexcept {
+        const auto* state = pin_state_.load(std::memory_order_acquire);
+        return state != nullptr ? state->PinCount() : 0;
+    }
 
     friend std::ostream& operator<<(std::ostream& os, const Replica& replica);
 
@@ -931,23 +1043,20 @@ class Replica {
             ReplicaStatus status)
         : id_(id),
           data_(MemoryReplicaData{std::move(buffer)}),
-          status_(status),
-          refcnt_(0) {}
+          status_(status) {}
 
     Replica(ReplicaID id, std::unique_ptr<AllocatedBuffer> buffer,
             ReplicaStatus status, ReplicaType replica_type)
         : id_(id),
           data_(MakeBufferedData(std::move(buffer), replica_type)),
-          status_(status),
-          refcnt_(0) {}
+          status_(status) {}
 
     Replica(ReplicaID id, std::string file_path, uint64_t object_size,
             ReplicaStatus status)
         : id_(id),
           data_(std::make_unique<DiskReplicaData>(
               DiskReplicaData{std::move(file_path), object_size})),
-          status_(status),
-          refcnt_(0) {
+          status_(status) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
     }
 
@@ -958,8 +1067,7 @@ class Replica {
           data_(std::make_unique<LocalDiskReplicaData>(LocalDiskReplicaData{
               client_id, object_size, std::move(transport_endpoint),
               std::move(owner_session)})),
-          status_(status),
-          refcnt_(0) {
+          status_(status) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
     }
 
@@ -968,8 +1076,23 @@ class Replica {
         : id_(id),
           data_(std::make_unique<DfsReplicaData>(
               DfsReplicaData{std::move(descriptor)})),
-          status_(status),
-          refcnt_(0) {}
+          status_(status) {}
+
+    detail::ReplicaPinState* GetOrCreatePinState() const {
+        if (auto* state = pin_state_.load(std::memory_order_acquire);
+            state != nullptr) {
+            return state;
+        }
+        auto* fresh = new detail::ReplicaPinState();
+        detail::ReplicaPinState* expected = nullptr;
+        if (pin_state_.compare_exchange_strong(expected, fresh,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {
+            return fresh;
+        }
+        delete fresh;
+        return expected;
+    }
 
     // Process-wide and monotonic. Standby restores bump it past the max
     // restored id and never roll back: a failed restore keeps the counter
@@ -981,7 +1104,7 @@ class Replica {
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 
     friend class MasterService;  // Standby restore advances next_id_
-    std::atomic<uint32_t> refcnt_{0};
+    mutable std::atomic<detail::ReplicaPinState*> pin_state_{nullptr};
 };
 
 inline Replica::Descriptor Replica::get_descriptor() const {
@@ -1109,7 +1232,7 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
            << ", shard_idx: " << dfs_data.descriptor.shard_idx;
     }
 
-    os << ", refcnt: " << replica.refcnt_.load() << " }";
+    os << ", refcnt: " << replica.get_refcnt() << " }";
     return os;
 }
 
