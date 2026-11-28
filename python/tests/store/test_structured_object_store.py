@@ -546,6 +546,7 @@ def test_structured_object_expands_store_replicate_config() -> None:
     config = mooncake_store.ReplicateConfig()
     config.replica_num = 2
     config.group_ids = ["rollout-group"]
+    config.allowed_memory_segments = ["home-a", "home-b"]
     payload = structured_payload(
         {"kind": "replicated"}, values=_multi_buffer_payload(range(8))
     )
@@ -575,6 +576,7 @@ def test_structured_object_expands_store_replicate_config() -> None:
     assert expanded is not config
     assert list(expanded.group_ids) == ["rollout-group", "rollout-group"]
     assert expanded.replica_num == 2
+    assert expanded.allowed_memory_segments == ["home-a", "home-b"]
     assert config.group_ids == ["rollout-group"]
 
 

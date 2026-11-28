@@ -348,6 +348,12 @@ class ScopedAllocatorAccess {
     AllocatorManager SnapshotAllocatorManager(
         const std::string& source_segment = {}) const;
 
+    AllocatorManager SnapshotAllocatorManager(
+        const std::vector<std::string>& allowed_names) const {
+        return allocator_manager_.SnapshotForSegments(allowed_names,
+                                                      client_by_name_);
+    }
+
     std::vector<std::string> GetHostOrderedSegments(
         const std::string& writer_host_id, const std::string& key) const;
 

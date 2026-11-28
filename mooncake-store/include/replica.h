@@ -183,6 +183,9 @@ struct ReplicateConfig {
     struct_pack::compatible<std::string, 5> requester_self_id;
     struct_pack::compatible<std::string, 5> fabric_domain;
     struct_pack::compatible<PhysicalPlacement, 5> requester_placement;
+    // Preserve the released fabric extension's layout and version.
+    struct_pack::compatible<std::vector<std::string>, 6>
+        allowed_memory_segments;
 
     bool ValidSessionIds(size_t key_count) const {
         return !session_ids ||

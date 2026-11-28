@@ -182,8 +182,19 @@ constexpr bool can_invoke_when_disconnected() {
                               decltype(&RealClient::ascend_ipc_shm_internal)>>;
 }
 
+template <typename Arg>
+static bool RequiresStrictPlacement(const Arg& arg) {
+    if constexpr (std::is_same_v<Arg, ReplicateConfig>) {
+        return arg.allowed_memory_segments.has_value();
+    }
+    return false;
+}
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
+    if ((RequiresStrictPlacement(args) || ...)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     RpcDrainGuard::ScopedCall inflight(rpc_drain_);
     if (!inflight.ok()) {
         return tl::make_unexpected(ErrorCode::RPC_FAIL);
@@ -221,6 +232,9 @@ tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
+    if ((RequiresStrictPlacement(args) || ...)) {
+        return {input_size, tl::make_unexpected(ErrorCode::INVALID_PARAMS)};
+    }
     RpcDrainGuard::ScopedCall inflight(rpc_drain_);
     if (!inflight.ok()) {
         return std::vector<tl::expected<ResultType, ErrorCode>>(

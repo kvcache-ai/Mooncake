@@ -4881,7 +4881,9 @@ auto MasterService::AllocateReplicas(const std::string& key,
                 preferred_segments.push_back(segment_name);
             }
         };
-        if (!config.preferred_segment.empty()) {
+        if (config.allowed_memory_segments) {
+            preferred_segments = *config.allowed_memory_segments;
+        } else if (!config.preferred_segment.empty()) {
             append_preferred_segment(config.preferred_segment);
         } else {
             for (const auto& preferred_segment : config.preferred_segments) {
@@ -4892,8 +4894,9 @@ auto MasterService::AllocateReplicas(const std::string& key,
         {
             ScopedAllocatorAccess allocator_access =
                 segment_manager_.getAllocatorAccess();
-            if (!writer_host_id.empty() && !config.fabric_domain &&
-                !config.requester_placement && !config.requester_self_id) {
+            if (!config.allowed_memory_segments && !writer_host_id.empty() &&
+                !config.fabric_domain && !config.requester_placement &&
+                !config.requester_self_id) {
                 auto host_ordered_segments =
                     allocator_access.GetHostOrderedSegments(writer_host_id,
                                                             key);
@@ -4922,13 +4925,30 @@ auto MasterService::AllocateReplicas(const std::string& key,
                             << host_ordered_segments.size();
                 }
             }
-            allocator_snapshot = allocator_access.SnapshotAllocatorManager();
+            allocator_snapshot =
+                config.allowed_memory_segments
+                    ? allocator_access.SnapshotAllocatorManager(
+                          preferred_segments)
+                    : allocator_access.SnapshotAllocatorManager();
         }
 
         if (StoreHcaAffinityEnabled()) {
             allocator_snapshot.SetHcaAffinity(
                 config.preferred_hca_names.value_or(
                     std::vector<std::string>{}));
+        }
+        if (config.allowed_memory_segments) {
+            auto placement = AllocationStrategy::ResolvePlacement(config);
+            if (!placement) {
+                return tl::make_unexpected(placement.error());
+            }
+            // Allowed names bound the snapshot; they are not explicit fabric
+            // preferences. Keep only eligible names in the preference order so
+            // AllocateForRequest can apply its normal filter to the strict set.
+            std::erase_if(preferred_segments, [&](const auto& name) {
+                return !allocator_snapshot.IsFabricEligible(
+                    name, placement->fabric_domain);
+            });
         }
         auto allocation_result = allocation_strategy_->AllocateForRequest(
             allocator_snapshot, value_length, config, preferred_segments);
@@ -5343,6 +5363,14 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const uint64_t slice_length,
                              const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    if (config.allowed_memory_segments &&
+        (config.allowed_memory_segments->empty() || config.replica_num == 0 ||
+         config.nof_replica_num != 0 || config.dfs_replica_num != 0 ||
+         std::any_of(config.allowed_memory_segments->begin(),
+                     config.allowed_memory_segments->end(),
+                     [](const auto& name) { return name.empty(); }))) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     auto plan = PrepareWriteStart(client_id, key, object_id.tenant_id,
                                   slice_length, config, "put_start");
@@ -5895,6 +5923,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 const uint64_t slice_length,
                                 const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    if (config.allowed_memory_segments) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     auto placement = AllocationStrategy::ResolvePlacement(config);
     if (!placement) return tl::make_unexpected(placement.error());

@@ -224,6 +224,41 @@ TEST_F(FabricPlacementTest, FabricSnapshotsPreserveHcaAffinity) {
     EXPECT_EQ(filtered.getNames(), (std::vector<std::string>{"local"}));
 }
 
+TEST_F(FabricPlacementTest, AllowedSnapshotPreservesPlacementAndHcaState) {
+    Add("local", {"fabric-a", "rack1", "tray1", 3, 0});
+    Add("foreign", {"fabric-b", "rack2", "tray2", 3, 1});
+    Add("disallowed", {"fabric-a", "rack1", "tray1", 3, 0});
+    Add("tcp", {}, "tcp");
+    const std::vector<std::string> hcas{"mlx5_0", "mlx5_1"};
+    manager_.SetHcaAffinity(hcas);
+    const std::unordered_map<std::string, UUID> owners{
+        {"local", generate_uuid()}, {"foreign", generate_uuid()}};
+    auto snapshot = manager_.SnapshotForSegments(
+        {"foreign", "local", "tcp", "missing", "local"}, &owners);
+    EXPECT_EQ(snapshot.getNames(),
+              (std::vector<std::string>{"foreign", "local", "tcp"}));
+    EXPECT_EQ(snapshot.GetHcaAffinity(), hcas);
+    for (const auto* name : {"local", "foreign", "tcp"}) {
+        const auto* metadata = snapshot.GetSegmentMetadata(name);
+        ASSERT_NE(metadata, nullptr);
+        EXPECT_EQ(metadata->protocol,
+                  manager_.GetSegmentMetadata(name)->protocol);
+        EXPECT_EQ(metadata->physical_placement,
+                  manager_.GetSegmentMetadata(name)->physical_placement);
+    }
+    EXPECT_EQ(snapshot.GetSegmentMetadata("disallowed"), nullptr);
+    auto eligible = snapshot.FilterForFabric("fabric-a");
+    EXPECT_EQ(eligible.getNames(), (std::vector<std::string>{"local"}));
+    EXPECT_EQ(eligible.GetHcaAffinity(), hcas);
+    EXPECT_EQ(eligible.GetOwnerClientId("local"), owners.at("local"));
+    EXPECT_FALSE(eligible.GetOwnerClientId("foreign"));
+    auto result = strategy_->AllocateForRequest(snapshot, 1024, Request(), {});
+    ASSERT_TRUE(result);
+    EXPECT_EQ(Name(result->front()), "local");
+    auto legacy = snapshot.FilterForFabric("");
+    EXPECT_EQ(legacy.getNames(), (std::vector<std::string>{"tcp"}));
+}
+
 TEST_F(FabricPlacementTest, PhysicalLocalityTiersAndRoutableEndpoint) {
     Add("local", {"fabric-a", "rack1", "tray1", 3, 0});
     Add("same-rack", {"fabric-a", "rack1", "tray2", 3, 0});
@@ -569,6 +604,57 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentInsufficientSpace) {
     EXPECT_EQ(mem_desc.buffer_descriptor.transport_endpoint_,
               "segment1");  // Falls back to other segment
     EXPECT_EQ(mem_desc.buffer_descriptor.size_, small_slice);
+}
+
+TEST_P(AllocationStrategyParameterizedTest, StrictLogicalSegmentSnapshot) {
+    auto home = CreateTestAllocator("endpoint-A", 0);
+    auto other = CreateTestAllocator("endpoint-B", 0x10000000ULL);
+    AllocatorManager segments;
+    segments.addAllocator("home", home);
+    segments.addAllocator("other", other);
+    const std::vector<std::string> allowed{"home"};
+    auto restricted = segments.SnapshotForSegments(allowed);
+    std::vector<std::vector<Replica>> held;
+    for (size_t index = 0; index < 4; ++index) {
+        auto first = strategy_->Allocate(restricted, 15 * MiB, 1, allowed);
+        ASSERT_TRUE(first.has_value());
+        held.push_back(std::move(first.value()));
+    }
+    const auto home_usage = home->size();
+    const auto other_usage = other->size();
+    auto strict = strategy_->Allocate(restricted, 5 * MiB, 1, allowed);
+    ASSERT_FALSE(strict.has_value());
+    EXPECT_EQ(strict.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(home->size(), home_usage);
+    EXPECT_EQ(other->size(), other_usage);
+
+    auto soft = strategy_->Allocate(segments, 5 * MiB, 1, allowed);
+    ASSERT_TRUE(soft.has_value());
+    ASSERT_EQ(soft->size(), 1u);
+    EXPECT_EQ(soft->front()
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "endpoint-B");
+}
+
+TEST_F(AllocationStrategyTest, StrictSnapshotMatchesOnlyRegisteredNames) {
+    AllocatorManager segments;
+    auto home =
+        CreateBufferAllocator(BufferAllocatorType::OFFSET, "home",
+                              0x100000000ULL, 64 * MiB, "endpoint-A", "tcp");
+    ASSERT_TRUE(home.has_value());
+    segments.addAllocator("home", *home);
+    const std::unordered_map<std::string, UUID> owners{
+        {"home", generate_uuid()}, {"absent", generate_uuid()}};
+    auto selected =
+        segments.SnapshotForSegments({"absent", "home", "home"}, &owners);
+    EXPECT_EQ(selected.getNames(), std::vector<std::string>{"home"});
+    EXPECT_EQ(selected.GetOwnerClientId("home"), owners.at("home"));
+    EXPECT_FALSE(selected.GetOwnerClientId("absent").has_value());
+    EXPECT_TRUE(
+        segments.SnapshotForSegments({"endpoint-A"}).getNames().empty());
+    EXPECT_TRUE(segments.SnapshotForSegments({}).getNames().empty());
 }
 
 // Test allocation when all allocators are full

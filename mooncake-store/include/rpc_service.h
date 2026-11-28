@@ -111,6 +111,10 @@ class WrappedMasterService {
         const uint64_t slice_length, const ReplicateConfig& config,
         const std::string& tenant_id = "default");
 
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStartStrict(
+        const UUID& client_id, const std::string& key, uint64_t slice_length,
+        const ReplicateConfig& config, const std::string& tenant_id);
+
     tl::expected<void, ErrorCode> PutEnd(
         const UUID& client_id, const ObjectMeta& object_meta,
         ReplicaType replica_type = ReplicaType::ALL,
@@ -126,6 +130,13 @@ class WrappedMasterService {
                   const std::vector<uint64_t>& slice_lengths,
                   const ReplicateConfig& config,
                   const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStartStrict(const UUID& client_id,
+                        const std::vector<std::string>& keys,
+                        const std::vector<uint64_t>& slice_lengths,
+                        const ReplicateConfig& config,
+                        const std::string& tenant_id);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,

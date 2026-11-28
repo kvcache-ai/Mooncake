@@ -2353,6 +2353,16 @@ NB_MODULE(_store, m) {
                 if (ids) config.residency_affinity_ids = std::move(*ids);
             })
         .def_prop_rw(
+            "allowed_memory_segments",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::string>> {
+                return config.allowed_memory_segments;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::string>> value) {
+                config.allowed_memory_segments = std::move(value);
+            })
+        .def_prop_rw(
             "preferred_hca_names",
             [](const ReplicateConfig &config)
                 -> std::optional<std::vector<std::string>> {
