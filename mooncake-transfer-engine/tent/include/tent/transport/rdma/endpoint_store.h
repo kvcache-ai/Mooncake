@@ -49,6 +49,14 @@ class EndpointStore {
 
     virtual void evictOne() = 0;
 
+    // Retire every endpoint unused for longer than idle_timeout_ns, moving it
+    // to the waiting list so reclaim() can release its QPs and its pinned
+    // notification buffers. Independent of max_size_: capacity eviction only
+    // runs when a new endpoint is inserted, which a process whose peers
+    // simply leave never does again for those peers. A zero timeout disables
+    // idle eviction. Returns the number of endpoints retired.
+    virtual size_t evictIdle(uint64_t idle_timeout_ns) = 0;
+
     // Evict all endpoints: move every entry to the waiting list and begin
     // destroying it.  Called on port recovery so that QPs that entered
     // IBV_QPS_ERR while the link was down are torn down and rebuilt on the
@@ -76,6 +84,7 @@ class FIFOEndpointStore : public EndpointStore {
 
     void evictAll() override;
     void evictOne() override;
+    size_t evictIdle(uint64_t idle_timeout_ns) override;
     void reclaim() override;
 
    private:
@@ -110,6 +119,7 @@ class SIEVEEndpointStore : public EndpointStore {
     int remove(RdmaEndPoint *ep) override;
     void evictAll() override;
     void evictOne() override;
+    size_t evictIdle(uint64_t idle_timeout_ns) override;
     void reclaim() override;
 
    private:
