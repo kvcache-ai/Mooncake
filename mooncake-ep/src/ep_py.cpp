@@ -226,6 +226,21 @@ PYBIND11_MODULE(_ep, m) {
              py::arg("num_gpu_timeout_secs"), py::arg("transport") = "ipc",
              py::arg("nccl_unique_id") = std::vector<int32_t>{},
              py::arg("stream_ptr") = 0)
+        .def(py::init<int, int, int, int, int64_t, int64_t, int64_t, int64_t,
+                      bool, bool, bool, bool, bool, int, int, int, int,
+                      std::string, std::vector<int32_t>, std::vector<int32_t>,
+                      uint64_t>(),
+             py::arg("transport_rank"), py::arg("capacity_ranks"),
+             py::arg("logical_rank"), py::arg("logical_num_ranks"),
+             py::arg("num_buffer_bytes"), py::arg("num_max_tokens_per_rank"),
+             py::arg("hidden"), py::arg("num_topk"),
+             py::arg("use_fp8_dispatch"), py::arg("deterministic"),
+             py::arg("allow_hybrid_mode"), py::arg("allow_multiple_reduction"),
+             py::arg("prefer_overlap_with_compute"), py::arg("sl_idx"),
+             py::arg("num_allocated_qps"), py::arg("num_cpu_timeout_secs"),
+             py::arg("num_gpu_timeout_secs"), py::arg("transport"),
+             py::arg("nccl_unique_id"), py::arg("logical_to_transport_slots"),
+             py::arg("stream_ptr") = 0)
         .def("destroy", &MooncakeEpXpuElasticBuffer::destroy)
         .def("using_nccl", &MooncakeEpXpuElasticBuffer::using_nccl)
         .def_static("calculate_buffer_size",
@@ -245,6 +260,13 @@ PYBIND11_MODULE(_ep, m) {
              py::arg("remote"))
         .def("connect_rdma", &MooncakeEpXpuElasticBuffer::connect_rdma,
              py::arg("infos"), py::arg("active_ranks_mask"))
+        .def("connect_peer", &MooncakeEpXpuElasticBuffer::connect_peer,
+             py::call_guard<py::gil_scoped_release>())
+        .def("disconnect_peer", &MooncakeEpXpuElasticBuffer::disconnect_peer)
+        .def("drain_queue_pairs",
+             &MooncakeEpXpuElasticBuffer::drain_queue_pairs)
+        .def("set_ibgda_membership",
+             &MooncakeEpXpuElasticBuffer::set_ibgda_membership)
         .def("dispatch", &MooncakeEpXpuElasticBuffer::dispatch)
         .def("combine", &MooncakeEpXpuElasticBuffer::combine);
 #endif

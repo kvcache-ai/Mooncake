@@ -515,10 +515,46 @@ def test_xpu_rejects_other_transports(monkeypatch, requested: str) -> None:
         _requested_xpu_transport(requested)
 
 
-def test_xpu_create_elastic_is_rejected(monkeypatch) -> None:
+def _xpu_store_buffer(monkeypatch, gathered: list) -> ElasticBuffer:
     monkeypatch.setattr(elastic_buffer_module, "_ep_device_type", lambda: "xpu")
-    with pytest.raises(NotImplementedError, match="not supported on XPU"):
-        ElasticBuffer.create_elastic(0, 2, object(), store_namespace="test")
+    buffer = object.__new__(ElasticBuffer)
+    buffer._planned_scaling = False
+
+    class Collectives:
+        def all_gather(self, operation, value):
+            gathered.append(operation)
+            return [value]
+
+    buffer._store_collectives = Collectives()
+    return buffer
+
+
+@pytest.mark.parametrize("required", [None, "ipc"])
+def test_xpu_store_transport_is_ipc(monkeypatch, required) -> None:
+    gathered = []
+    buffer = _xpu_store_buffer(monkeypatch, gathered)
+    # XPU has no NCCL device support to query, and nothing to agree on.
+    assert buffer._select_store_transport(object(), required) == "ipc"
+    assert gathered == []
+
+
+@pytest.mark.parametrize("required", ["nccl", "ibgda"])
+def test_xpu_store_cannot_join_other_transports(monkeypatch, required) -> None:
+    buffer = _xpu_store_buffer(monkeypatch, [])
+    with pytest.raises(RuntimeError, match="cannot join"):
+        buffer._select_store_transport(object(), required)
+
+
+def test_xpu_store_rdma_agrees_through_the_store(monkeypatch) -> None:
+    gathered = []
+    buffer = _xpu_store_buffer(monkeypatch, gathered)
+    buffer.rank_idx = 0
+    buffer.num_ranks = 2
+    buffer.runtime = types.SimpleNamespace(rdma_available=lambda: False)
+    monkeypatch.setenv("MC_EP_RANKS_PER_NODE", "1")
+    with pytest.raises(elastic_buffer_module._XpuRdmaError, match="verbs"):
+        buffer._connect_xpu_rdma([[0] * 8, [0] * 8], [1, 1], None)
+    assert gathered == ["xpu-rdma-status"]
 
 
 @pytest.mark.parametrize("backend_name", ["gloo", "mooncake-cpu"])
