@@ -118,7 +118,6 @@ class UrmaContext : public UbContext {
     urma_token_t urma_token = {.token = 0xACFE};
     urma_context_t* urma_context_ = nullptr;
     // ibv_pd *pd_ = nullptr;
-    uint64_t max_seg_size{};
     urma_mtu active_mtu_;
     urma_eid_t eid_{};
     urma_device_attr_t dev_attr_{};
@@ -126,8 +125,14 @@ class UrmaContext : public UbContext {
     int eid_index_ = -1;
     int active_speed_ = -1;
 
+    struct SegRegion {
+        urma_target_seg_t* seg;
+        uint64_t length;
+        uint32_t index;
+    };
+
     RWSpinlock seg_region_lock_;
-    std::vector<std::pair<urma_target_seg_t*, uint64_t>> seg_region_list_;
+    std::vector<SegRegion> seg_region_list_;
     std::vector<urma_target_seg_t*> local_tseg_list_;
     std::vector<urma_seg_t*> remote_seg_list_;
     std::vector<urma_target_seg_t*> imported_seg_list_;

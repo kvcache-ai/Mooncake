@@ -18,6 +18,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <optional>
+#include <string>
 #include <thread>
 
 #include "config.h"
@@ -1288,6 +1290,49 @@ TEST(RdAtomicResolveTest, RequestIsClampedToDeviceLimit) {
 TEST(RdAtomicResolveTest, RequestMayExceedHistoricalCapUpToDeviceLimit) {
     EXPECT_EQ(resolveRdAtomicDepth(64, 128), 64);
     EXPECT_EQ(resolveRdAtomicDepth(255, 255), 255);
+}
+
+class MaxSegSizeEnvTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        if (const char* prev = std::getenv("MC_MAX_SEG_SIZE")) {
+            saved_env_ = prev;
+        }
+    }
+
+    void TearDown() override {
+        if (saved_env_.has_value()) {
+            ::setenv("MC_MAX_SEG_SIZE", saved_env_->c_str(), 1);
+        } else {
+            ::unsetenv("MC_MAX_SEG_SIZE");
+        }
+    }
+
+   private:
+    std::optional<std::string> saved_env_;
+};
+
+TEST_F(MaxSegSizeEnvTest, UnsetKeepsDefault) {
+    ::unsetenv("MC_MAX_SEG_SIZE");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_seg_size, 0x10000000000ULL);
+}
+
+TEST_F(MaxSegSizeEnvTest, ValidOverrideUpdatesMaxSegSize) {
+    ASSERT_EQ(::setenv("MC_MAX_SEG_SIZE", " 67108864 ", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_seg_size, 67108864ULL);
+}
+
+TEST_F(MaxSegSizeEnvTest, InvalidOrNonPositiveValuesAreIgnored) {
+    for (const char* bad : {"", "0", "-1", "abc", "64abc"}) {
+        ASSERT_EQ(::setenv("MC_MAX_SEG_SIZE", bad, 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.max_seg_size, 0x10000000000ULL) << "value=" << bad;
+    }
 }
 
 }  // namespace
