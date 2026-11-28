@@ -56,6 +56,15 @@ class ResourceTracker {
     // Register a DistributedObjectStore instance for cleanup
     void registerInstance(const std::shared_ptr<PyClient> &instance);
 
+    // Re-assert the standalone signal contract on the calling (main) thread.
+    // Third-party device runtimes (e.g. accelerator SDKs) may reconfigure
+    // signal masks and handlers during device initialization, which would
+    // silently break the contract established in the constructor and leave
+    // mounted segments behind when the process is killed.  Call this after
+    // setup has completed so the sigwait thread owns the signals again and a
+    // fallback handler covers any thread left with an unblocked mask.
+    void rearmStandaloneSignals();
+
    private:
     ResourceTracker();
     ~ResourceTracker();
@@ -70,6 +79,13 @@ class ResourceTracker {
     // Signal handler function
     static void signalHandler(int signal);
 
+    // Async-signal-safe fallback handler: records the signal for the
+    // watchdog thread, which performs the actual cleanup in normal thread
+    // context (heavy work such as RPC calls and logging is not
+    // async-signal-safe and must not run in signal context).
+    static void fallbackSignalHandler(int signal);
+    static std::atomic<int> pending_cleanup_signal_;
+
     // Exit handler function
     static void exitHandler();
 
@@ -83,6 +99,12 @@ class ResourceTracker {
     void startSignalThread();
     std::once_flag signal_once_{};
     std::jthread signal_thread_{};  // joins on destruction
+
+    // Watchdog thread: performs the cleanup requested by the fallback
+    // signal handler in normal thread context.
+    void startSignalWatchdog();
+    std::thread signal_watchdog_thread_{};
+    std::atomic<bool> signal_watchdog_running_{false};
 };
 
 class RealClient : public PyClient {
