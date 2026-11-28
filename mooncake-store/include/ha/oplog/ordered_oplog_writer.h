@@ -103,9 +103,26 @@ class OrderedOpLogWriter {
     // immediately ready with OK, even after terminal failure or Stop().
     // Otherwise, terminal failure completes it with the terminal error, and
     // Stop() completes it with UNAVAILABLE_IN_CURRENT_STATUS. Promises are
-    // fulfilled outside the writer mutex. Callers can co_await the future and
-    // use via(executor) to select the continuation's execution context.
-    async_simple::Future<ErrorCode> AwaitDurable(uint64_t sequence);
+    // fulfilled outside the writer mutex without an implicit executor. For
+    // blocking continuations on timed or untimed waits, attach via(executor) or
+    // co_await from a coroutine bound to an executor.
+    // A finite timeout ends only this wait, returning the last write error or
+    // PERSISTENT_FAIL (use GetTerminalState() to distinguish a per-wait timeout
+    // from terminal writer failure). The mutation may still commit: timeout is
+    // not proof of rejection, and must not trigger an unconditional replay of
+    // the mutation. Finite timeouts fire on a lazily created 4-thread timer
+    // pool that Stop() cancels and joins; Stop() waits for any in-flight inline
+    // timeout continuations on that pool, and blocking all 4 pool workers with
+    // inline continuations stalls further timeout notifications until one
+    // returns. Do not destroy the writer from writer-owned threads (including
+    // inline continuations or thenValue captures that async_simple may destroy
+    // on the completing thread). Resource initialization failures propagate to
+    // the caller without registering a wait. Negative timeouts return
+    // INVALID_PARAMS; zero polls the current prefix; max() retains the
+    // unbounded wait with no timer allocation.
+    async_simple::Future<ErrorCode> AwaitDurable(
+        uint64_t sequence,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds::max());
 
     bool IsAccepting() const;
     ErrorCode LastError() const;
@@ -115,6 +132,8 @@ class OrderedOpLogWriter {
     // can no longer publish runtime metrics after this handoff.
     void ActivateRuntimeMetrics();
     void Start();
+    // Concurrent callers share one join. Calls on writer-owned threads only
+    // request shutdown; the owner must call Stop() from another thread.
     virtual void Stop();
 
    private:

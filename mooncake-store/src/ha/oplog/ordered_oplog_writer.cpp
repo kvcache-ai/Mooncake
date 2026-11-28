@@ -5,22 +5,126 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include <asio/steady_timer.hpp>
+#include <asio/thread_pool.hpp>
 #include <async_simple/Promise.h>
+#include <glog/logging.h>
 
 #include "ha/oplog/oplog_test_failpoint.h"
 #include "ha_metric_manager.h"
 
 namespace mooncake {
 
+namespace {
+
+thread_local const void* current_writer_worker = nullptr;
+
+struct WriterWorkerScope {
+    const void* previous;
+    explicit WriterWorkerScope(const void* current)
+        : previous(current_writer_worker) {
+        current_writer_worker = current;
+    }
+    ~WriterWorkerScope() { current_writer_worker = previous; }
+};
+
+// Wraps asio::thread_pool(0) with explicit worker threads so a partial thread
+// creation failure stops the scheduler before joining already-started threads
+// (standalone asio::thread_pool(n) unwinds thread_group::join() without
+// stopping the scheduler).
+class DurableWaitTimerPool {
+   public:
+    using Executor = asio::thread_pool::executor_type;
+    using Timer =
+        asio::basic_waitable_timer<std::chrono::steady_clock,
+                                   asio::wait_traits<std::chrono::steady_clock>,
+                                   Executor>;
+
+    explicit DurableWaitTimerPool(size_t thread_count) : pool_(0) {
+        threads_.reserve(thread_count);
+        try {
+            for (size_t i = 0; i < thread_count; ++i) {
+                threads_.emplace_back([this] { pool_.attach(); });
+            }
+        } catch (...) {
+            Stop();
+            throw;
+        }
+    }
+
+    ~DurableWaitTimerPool() { Stop(); }
+
+    DurableWaitTimerPool(const DurableWaitTimerPool&) = delete;
+    DurableWaitTimerPool& operator=(const DurableWaitTimerPool&) = delete;
+
+    Executor get_executor() noexcept { return pool_.get_executor(); }
+
+    void Stop() {
+        pool_.stop();
+        for (auto& thread : threads_) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+        threads_.clear();
+    }
+
+   private:
+    asio::thread_pool pool_;
+    std::vector<std::thread> threads_;
+};
+
+std::optional<std::chrono::steady_clock::time_point> ComputeWaitDeadline(
+    std::chrono::milliseconds timeout) {
+    if (timeout == std::chrono::milliseconds::max()) {
+        return std::nullopt;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto max_time = std::chrono::steady_clock::time_point::max();
+    if (now >= std::chrono::steady_clock::time_point{}) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(max_time -
+                                                                  now);
+        if (timeout >= remaining) {
+            return std::nullopt;
+        }
+    }
+    const auto max_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::duration::max());
+    if (timeout >= max_ms) {
+        return std::nullopt;
+    }
+    return now + timeout;
+}
+
+}  // namespace
+
 struct OrderedOpLogWriter::Impl {
-    using DurableWaiters =
+    static constexpr size_t kTimerPoolThreads = 4;
+
+    struct TimedWaiter;
+    using UntimedWaiters =
         std::multimap<uint64_t, async_simple::Promise<ErrorCode>>;
+    using TimedWaiters = std::multimap<uint64_t, std::shared_ptr<TimedWaiter>>;
+    struct TimedWaiter {
+        async_simple::Promise<ErrorCode> promise;
+        // Constructed, armed, cancelled, and destroyed exclusively under mutex.
+        std::optional<DurableWaitTimerPool::Timer> timer;
+        // Protected by mutex; position is valid only while pending is true.
+        TimedWaiters::iterator position;
+        bool pending{false};
+    };
+    struct TakenWaiters {
+        UntimedWaiters untimed;
+        TimedWaiters timed;
+    };
 
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
     using Clock = std::chrono::steady_clock;
@@ -53,6 +157,24 @@ struct OrderedOpLogWriter::Impl {
             return;
         }
         next_sequence_id = this->config.initial_durable_prefix.last_seq + 1;
+    }
+
+    void OnWaitTimeout(const std::weak_ptr<TimedWaiter>& weak_waiter) {
+        WriterWorkerScope worker_scope(this);
+        TestFailPoint::Wait("durable_wait_before_timeout");
+        std::shared_ptr<TimedWaiter> timed_out;
+        ErrorCode error = ErrorCode::PERSISTENT_FAIL;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            timed_out = weak_waiter.lock();
+            if (!timed_out || !timed_out->pending) return;
+            timed_out->pending = false;
+            timed_out->timer.reset();
+            timed_waiters.erase(timed_out->position);
+            error = last_error == ErrorCode::OK ? ErrorCode::PERSISTENT_FAIL
+                                                : last_error;
+        }
+        timed_out->promise.setValue(ErrorCode{error});
     }
 
     void PublishRuntime(bool activate = false) {
@@ -109,21 +231,55 @@ struct OrderedOpLogWriter::Impl {
 
     // Called with mutex held. Extracting nodes avoids allocating while
     // advancing the prefix and leaves later waiters untouched.
-    DurableWaiters TakeCoveredWaiters() {
-        DurableWaiters covered;
-        auto end = durable_waiters.upper_bound(durable_prefix.last_seq);
-        for (auto it = durable_waiters.begin(); it != end;) {
+    TakenWaiters TakeCoveredWaiters() {
+        TakenWaiters covered;
+        auto untimed_end = untimed_waiters.upper_bound(durable_prefix.last_seq);
+        for (auto it = untimed_waiters.begin(); it != untimed_end;) {
+            covered.untimed.insert(untimed_waiters.extract(it++));
+        }
+        auto timed_end = timed_waiters.upper_bound(durable_prefix.last_seq);
+        for (auto it = timed_waiters.begin(); it != timed_end;) {
             auto current = it++;
-            covered.insert(durable_waiters.extract(current));
+            current->second->pending = false;
+            current->second->timer.reset();
+            covered.timed.insert(timed_waiters.extract(current));
         }
         return covered;
     }
 
+    TakenWaiters TakeAllWaiters() {
+        TakenWaiters waiters;
+        waiters.untimed.swap(untimed_waiters);
+        for (auto& waiter : timed_waiters) {
+            waiter.second->pending = false;
+            waiter.second->timer.reset();
+        }
+        waiters.timed.swap(timed_waiters);
+        return waiters;
+    }
+
     // A continuation may run inline and reenter the writer, so never call
-    // this while holding mutex.
-    static void CompleteWaiters(DurableWaiters waiters, ErrorCode error) {
-        for (auto& waiter : waiters) {
-            waiter.second.setValue(ErrorCode{error});
+    // this while holding mutex. Merge both maps to preserve sequence order;
+    // for identical sequences, untimed waiters complete before timed waiters
+    // while registration order within each map is preserved.
+    static void CompleteWaiters(TakenWaiters waiters, ErrorCode error) {
+        auto untimed_it = waiters.untimed.begin();
+        auto timed_it = waiters.timed.begin();
+        while (untimed_it != waiters.untimed.end() &&
+               timed_it != waiters.timed.end()) {
+            if (untimed_it->first <= timed_it->first) {
+                untimed_it->second.setValue(ErrorCode{error});
+                ++untimed_it;
+            } else {
+                timed_it->second->promise.setValue(ErrorCode{error});
+                ++timed_it;
+            }
+        }
+        for (; untimed_it != waiters.untimed.end(); ++untimed_it) {
+            untimed_it->second.setValue(ErrorCode{error});
+        }
+        for (; timed_it != waiters.timed.end(); ++timed_it) {
+            timed_it->second->promise.setValue(ErrorCode{error});
         }
     }
 
@@ -131,7 +287,7 @@ struct OrderedOpLogWriter::Impl {
                             OrderedOpLogWriterTerminalReason reason) {
         TerminalCallback callback;
         std::optional<OrderedOpLogWriterTerminalState> state;
-        DurableWaiters waiters;
+        TakenWaiters waiters;
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (stop_requested || terminal_state.has_value()) {
@@ -157,7 +313,7 @@ struct OrderedOpLogWriter::Impl {
             PublishRuntime();
             callback = terminal_callback;
             state = terminal_state;
-            waiters.swap(durable_waiters);
+            waiters = TakeAllWaiters();
         }
         cv.notify_all();
         CompleteWaiters(std::move(waiters), error);
@@ -176,6 +332,9 @@ struct OrderedOpLogWriter::Impl {
     bool running{false};
     bool stop_requested{false};
     bool callback_stop_requested{false};
+    bool joining{false};
+    bool joined{false};
+    std::thread::id join_owner;
     ErrorCode last_error{ErrorCode::OK};
     uint64_t retry_count{0};
     uint64_t runtime_owner{0};
@@ -186,7 +345,8 @@ struct OrderedOpLogWriter::Impl {
     uint64_t next_sequence_id{1};
     uint64_t next_group_id{1};
     DurablePrefix durable_prefix{config.initial_durable_prefix};
-    DurableWaiters durable_waiters;
+    UntimedWaiters untimed_waiters;
+    TimedWaiters timed_waiters;
     size_t open_waiting_slots{0};
     std::unordered_set<uint64_t> active_reservations;
     std::deque<PendingEntry> committed_entries;
@@ -195,6 +355,10 @@ struct OrderedOpLogWriter::Impl {
     std::deque<PendingEntry> callback_entries;
     std::thread writer_thread;
     std::thread callback_thread;
+    // Lock order: timer_pool_init_mutex -> mutex. Serializes first-time lazy
+    // creation of timer_pool without holding mutex across thread startup.
+    std::mutex timer_pool_init_mutex;
+    std::unique_ptr<DurableWaitTimerPool> timer_pool;
 };
 
 namespace {
@@ -262,7 +426,11 @@ void OrderedOpLogWriter::ActivateRuntimeMetrics() {
     if (impl_->runtime_owner == 0) impl_->PublishRuntime(true);
 }
 
-OrderedOpLogWriter::~OrderedOpLogWriter() { Stop(); }
+OrderedOpLogWriter::~OrderedOpLogWriter() {
+    CHECK(current_writer_worker != impl_.get())
+        << "OrderedOpLogWriter cannot be destroyed on a writer-owned thread";
+    Stop();
+}
 
 tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
 OrderedOpLogWriter::Reserve() {
@@ -420,22 +588,81 @@ void OrderedOpLogWriter::Abort(Reservation&& reservation) {
 }
 
 async_simple::Future<ErrorCode> OrderedOpLogWriter::AwaitDurable(
-    uint64_t sequence) {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (impl_->durable_prefix.last_seq >= sequence) {
-        return async_simple::makeReadyFuture<ErrorCode>(ErrorCode::OK);
-    }
-    if (impl_->terminal_state.has_value()) {
+    uint64_t sequence, std::chrono::milliseconds timeout) {
+    if (timeout < std::chrono::milliseconds::zero()) {
         return async_simple::makeReadyFuture<ErrorCode>(
-            ErrorCode{impl_->terminal_state->error});
+            ErrorCode::INVALID_PARAMS);
     }
-    if (impl_->stop_requested) {
-        return async_simple::makeReadyFuture<ErrorCode>(
-            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    // Declared before lock so any unused spare pool is stopped and joined
+    // outside impl_->mutex.
+    std::unique_ptr<DurableWaitTimerPool> spare_pool;
+    std::unique_lock<std::mutex> lock(impl_->mutex);
+    auto check_ready = [&]() -> std::optional<async_simple::Future<ErrorCode>> {
+        if (impl_->durable_prefix.last_seq >= sequence) {
+            return async_simple::makeReadyFuture<ErrorCode>(ErrorCode::OK);
+        }
+        if (impl_->terminal_state.has_value()) {
+            return async_simple::makeReadyFuture<ErrorCode>(
+                ErrorCode{impl_->terminal_state->error});
+        }
+        if (impl_->stop_requested) {
+            return async_simple::makeReadyFuture<ErrorCode>(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        if (timeout == std::chrono::milliseconds::zero()) {
+            return async_simple::makeReadyFuture<ErrorCode>(
+                impl_->last_error == ErrorCode::OK ? ErrorCode::PERSISTENT_FAIL
+                                                   : impl_->last_error);
+        }
+        return std::nullopt;
+    };
+    if (auto ready = check_ready()) {
+        return std::move(*ready);
     }
-    async_simple::Promise<ErrorCode> promise;
-    auto future = promise.getFuture();
-    impl_->durable_waiters.emplace(sequence, std::move(promise));
+    const auto deadline = ComputeWaitDeadline(timeout);
+    if (!deadline.has_value()) {
+        async_simple::Promise<ErrorCode> promise;
+        auto future = promise.getFuture();
+        impl_->untimed_waiters.emplace(sequence, std::move(promise));
+        return future;
+    }
+    if (!impl_->timer_pool) {
+        lock.unlock();
+        std::lock_guard<std::mutex> init_lock(impl_->timer_pool_init_mutex);
+        lock.lock();
+        if (auto ready = check_ready()) {
+            return std::move(*ready);
+        }
+        if (!impl_->timer_pool) {
+            lock.unlock();
+            spare_pool =
+                std::make_unique<DurableWaitTimerPool>(Impl::kTimerPoolThreads);
+            lock.lock();
+            if (auto ready = check_ready()) {
+                return std::move(*ready);
+            }
+            impl_->timer_pool = std::move(spare_pool);
+        }
+    }
+    auto waiter = std::make_shared<Impl::TimedWaiter>();
+    auto future = waiter->promise.getFuture();
+    waiter->position = impl_->timed_waiters.emplace(sequence, waiter);
+    waiter->pending = true;
+    const auto unregister = [this](Impl::TimedWaiter* pending) {
+        pending->pending = false;
+        pending->timer.reset();
+        impl_->timed_waiters.erase(pending->position);
+    };
+    std::unique_ptr<Impl::TimedWaiter, decltype(unregister)> registration(
+        waiter.get(), unregister);
+    waiter->timer.emplace(impl_->timer_pool->get_executor(), *deadline);
+    waiter->timer->async_wait(
+        [impl = impl_.get(), weak_waiter = std::weak_ptr<Impl::TimedWaiter>(
+                                 waiter)](const asio::error_code& ec) {
+            if (ec == asio::error::operation_aborted) return;
+            impl->OnWaitTimeout(weak_waiter);
+        });
+    registration.release();
     return future;
 }
 
@@ -477,6 +704,7 @@ void OrderedOpLogWriter::Start() {
     impl_->callback_stop_requested = false;
     impl_->running = true;
     impl_->callback_thread = std::thread([this] {
+        current_writer_worker = impl_.get();
         while (true) {
             Impl::PendingEntry callback_entry;
             {
@@ -513,6 +741,7 @@ void OrderedOpLogWriter::Start() {
         }
     });
     impl_->writer_thread = std::thread([this] {
+        current_writer_worker = impl_.get();
         while (true) {
             std::vector<Impl::PendingEntry> entries;
             DurablePrefix expected_prefix;
@@ -589,7 +818,7 @@ void OrderedOpLogWriter::Start() {
                     txn_latency_us);
 #endif
                 if (err == ErrorCode::OK) {
-                    Impl::DurableWaiters waiters;
+                    Impl::TakenWaiters waiters;
                     TestFailPoint::Wait("batch_txn_succeeded_before_callback");
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
                     const auto durable_at = Impl::Clock::now();
@@ -684,26 +913,45 @@ void OrderedOpLogWriter::Start() {
 
 void OrderedOpLogWriter::Stop() {
     bool running;
-    Impl::DurableWaiters waiters;
+    std::unique_ptr<DurableWaitTimerPool> pool_to_stop;
+    const bool worker = current_writer_worker == impl_.get();
+    Impl::TakenWaiters waiters;
     ErrorCode waiter_error;
     {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
+        std::unique_lock<std::mutex> lock(impl_->mutex);
         impl_->accepting = false;
         impl_->stop_requested = true;
         impl_->retry_delay_ms = 0;
         impl_->PublishRuntime();
+        const auto caller = std::this_thread::get_id();
+        // Worker callbacks can request shutdown, but cannot wait for a joiner
+        // that may itself be joining this worker. The owner completes Stop.
+        if (impl_->joining) {
+            if (!worker && impl_->join_owner != caller) {
+                impl_->cv.wait(lock, [this] { return impl_->joined; });
+            }
+            return;
+        }
+        if (impl_->joined) return;
         running = impl_->running;
-        waiters.swap(impl_->durable_waiters);
+        waiters = impl_->TakeAllWaiters();
+        if (!worker) {
+            impl_->joining = true;
+            impl_->join_owner = caller;
+            pool_to_stop = std::move(impl_->timer_pool);
+        }
         waiter_error = impl_->terminal_state.has_value()
                            ? impl_->terminal_state->error
                            : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
     impl_->cv.notify_all();
     Impl::CompleteWaiters(std::move(waiters), waiter_error);
-    if (!running) {
-        return;
+    if (worker) return;
+    if (pool_to_stop) {
+        pool_to_stop->Stop();
+        pool_to_stop.reset();
     }
-    if (impl_->writer_thread.joinable()) {
+    if (running && impl_->writer_thread.joinable()) {
         impl_->writer_thread.join();
     }
     {
@@ -711,11 +959,13 @@ void OrderedOpLogWriter::Stop() {
         impl_->callback_stop_requested = true;
     }
     impl_->cv.notify_all();
-    if (impl_->callback_thread.joinable()) {
+    if (running && impl_->callback_thread.joinable()) {
         impl_->callback_thread.join();
     }
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->running = false;
+    impl_->joined = true;
+    impl_->cv.notify_all();
 }
 
 }  // namespace mooncake
