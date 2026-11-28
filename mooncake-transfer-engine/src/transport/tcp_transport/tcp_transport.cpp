@@ -788,13 +788,29 @@ void TcpTransport::startTransfer(Slice* slice,
         return;
     }
 
+    if (!context_ || !lane_state_) {
+        failWorkItem(std::move(work), WorkFailureReason::RUNTIME_UNAVAILABLE,
+                     lane_state_ ? lane_state_->failure_counters : nullptr);
+        return;
+    }
+    bool shutting_down = false;
+    {
+        std::lock_guard<std::mutex> state_lock(lane_state_->mutex);
+        shutting_down = lane_state_->shutting_down;
+    }
+    if (shutting_down) {
+        failWorkItem(std::move(work), WorkFailureReason::SHUTDOWN,
+                     lane_state_->failure_counters);
+        return;
+    }
+
     // Preserve the connection-pool-disabled synchronous one-shot path.
     auto socket = getConnection(key.host, key.port);
     if (!socket) {
         LOG(ERROR) << "TcpTransport::startTransfer failed to get connection to "
                    << key.host << ":" << key.port;
-        completeTerminalAction(
-            TerminalAction(std::move(work), TransferStatusEnum::FAILED, false));
+        failWorkItem(std::move(work), WorkFailureReason::CONNECT_FAILED,
+                     lane_state_->failure_counters);
         return;
     }
     startTransferWithSocket(std::move(work), std::move(socket));
@@ -802,58 +818,177 @@ void TcpTransport::startTransfer(Slice* slice,
 
 void TcpTransport::startTransferWithSocket(
     TcpWorkItem work, std::shared_ptr<asio::ip::tcp::socket> socket) noexcept {
-    const Slice* slice = work.slice;
-    std::shared_ptr<std::optional<TcpWorkItem>> terminal_work;
-    try {
-        terminal_work =
-            std::make_shared<std::optional<TcpWorkItem>>(std::move(work));
-        auto session = std::make_shared<ClientSession>(
-            socket, terminal_work->value().use_v2,
-            [terminal_work, socket](TransferStatusEnum status, bool) noexcept {
-                closeSocketNoThrow(socket);
-                if (!terminal_work->has_value()) return;
-                auto completed = std::move(terminal_work->value());
-                terminal_work->reset();
+    const auto state = lane_state_;
+    void* const source_addr = work.slice->source_addr;
+    const uint64_t dest_addr = work.slice->tcp.dest_addr;
+    const size_t length = work.slice->length;
+    const TransferRequest::OpCode opcode = work.slice->opcode;
+    const SegmentID target_id = work.slice->target_id;
+    const bool use_v2 = work.use_v2;
+
+    // Executor-only terminal handler: runs on entry->executor (shard 0),
+    // serialized with initiation and shutdown cancellation posts.
+    auto finish_on_executor = [](const std::shared_ptr<ConnectionLaneState>& st,
+                                 const std::shared_ptr<OneShotSession>& ent,
+                                 TransferStatusEnum status) noexcept {
+        {
+            std::lock_guard<std::mutex> state_lock(st->mutex);
+            st->one_shot_sessions.erase(ent);
+        }
+        std::optional<TcpWorkItem> completed;
+        std::shared_ptr<ClientSession> active_session;
+        std::shared_ptr<asio::ip::tcp::socket> active_socket;
+        bool was_cancelled = false;
+        {
+            std::lock_guard<std::mutex> lock(ent->mutex);
+            was_cancelled = ent->cancelled;
+            if (ent->work.has_value()) {
+                completed.emplace(std::move(*ent->work));
+                ent->work.reset();
+            }
+            active_session = std::move(ent->session);
+            active_socket = std::move(ent->socket);
+        }
+        if (active_session && status != TransferStatusEnum::COMPLETED) {
+            active_session->cancel();
+        }
+        closeSocketNoThrow(active_socket);
+        if (completed.has_value()) {
+            if (status == TransferStatusEnum::COMPLETED) {
                 completeTerminalAction(
-                    TerminalAction(std::move(completed), status, false));
-            });
-        session->initiate(terminal_work->value().slice->source_addr,
-                          terminal_work->value().slice->tcp.dest_addr,
-                          terminal_work->value().slice->length,
-                          terminal_work->value().slice->opcode);
+                    TerminalAction(std::move(*completed), status, false));
+            } else {
+                failWorkItem(std::move(*completed),
+                             was_cancelled ? WorkFailureReason::SHUTDOWN
+                                           : WorkFailureReason::SESSION_FAILED,
+                             st->failure_counters);
+            }
+        }
+    };
+
+    std::shared_ptr<OneShotSession> entry;
+    bool registered = false;
+    auto fail_on_caller = [&]() noexcept {
+        if (!entry) {
+            closeSocketNoThrow(socket);
+            if (work.slice) {
+                failWorkItem(std::move(work), WorkFailureReason::SESSION_FAILED,
+                             state->failure_counters);
+            }
+            return;
+        }
+        bool owns_socket = !registered;
+        if (registered) {
+            std::lock_guard<std::mutex> state_lock(state->mutex);
+            owns_socket = !state->shutting_down;
+            state->one_shot_sessions.erase(entry);
+        }
+        std::optional<TcpWorkItem> failed;
+        std::shared_ptr<asio::ip::tcp::socket> failed_socket;
+        {
+            std::lock_guard<std::mutex> lock(entry->mutex);
+            if (entry->work.has_value()) {
+                failed.emplace(std::move(*entry->work));
+                entry->work.reset();
+            }
+            if (owns_socket) failed_socket = std::move(entry->socket);
+        }
+        if (owns_socket) closeSocketNoThrow(failed_socket);
+        if (failed.has_value()) {
+            failWorkItem(std::move(*failed),
+                         owns_socket ? WorkFailureReason::SESSION_FAILED
+                                     : WorkFailureReason::SHUTDOWN,
+                         state->failure_counters);
+        }
+    };
+
+    try {
+        auto executor = socket->get_executor();
+        // Note: this non-default unpooled path acquires the shared
+        // ConnectionLaneState::mutex to register and remove each one-shot
+        // session so shutdownConnectionLanes() cancels in-flight unpooled
+        // transfers cleanly while keeping supportsParallelBatchSubmit() safe
+        // under concurrent submissions.
+        {
+            std::lock_guard<std::mutex> state_lock(state->mutex);
+            if (!state->shutting_down) {
+                entry = std::make_shared<OneShotSession>(executor, socket,
+                                                         std::move(work));
+                state->one_shot_sessions.insert(entry);
+                registered = true;
+            }
+        }
+        if (!registered) {
+            closeSocketNoThrow(socket);
+            failWorkItem(std::move(work), WorkFailureReason::SHUTDOWN,
+                         state->failure_counters);
+            return;
+        }
+
+        // Dispatch initiation onto the socket's io_context thread so
+        // ClientSession::writeHeader() and its progress deadline timer stay
+        // serialized with async completion handlers, matching startLaneSession.
+        // Constructing ClientSession on the executor with a weak_ptr to
+        // OneShotSession avoids any strong reference cycle.
+        asio::dispatch(executor, [state, entry, finish_on_executor, source_addr,
+                                  dest_addr, length, opcode, target_id,
+                                  use_v2]() noexcept {
+            bool failed = false;
+            {
+                std::lock_guard<std::mutex> lock(entry->mutex);
+                if (entry->cancelled || !entry->work.has_value() ||
+                    !entry->socket) {
+                    return;
+                }
+                try {
+                    std::weak_ptr<OneShotSession> weak_entry(entry);
+                    auto session = std::make_shared<ClientSession>(
+                        entry->socket, use_v2,
+                        [state, weak_entry, finish_on_executor](
+                            TransferStatusEnum status, bool) noexcept {
+                            if (auto ent = weak_entry.lock()) {
+                                finish_on_executor(state, ent, status);
+                            }
+                        });
+                    entry->session = session;
+                    session->initiate(source_addr, dest_addr, length, opcode);
+                } catch (const std::exception& e) {
+                    LOG(ERROR) << "TcpTransport::startTransfer encountered an "
+                                  "exception. Slice details - source_addr: "
+                               << source_addr << ", length: " << length
+                               << ", opcode: " << (int)opcode
+                               << ", target_id: " << target_id
+                               << ". Exception: " << e.what();
+                    failed = true;
+                } catch (...) {
+                    LOG(ERROR) << "TcpTransport::startTransfer encountered an "
+                                  "unknown exception. Slice details - "
+                                  "source_addr: "
+                               << source_addr << ", length: " << length
+                               << ", opcode: " << (int)opcode
+                               << ", target_id: " << target_id;
+                    failed = true;
+                }
+            }
+            if (failed) {
+                finish_on_executor(state, entry, TransferStatusEnum::FAILED);
+            }
+        });
     } catch (const std::exception& e) {
         LOG(ERROR) << "TcpTransport::startTransfer encountered an exception. "
                       "Slice details - source_addr: "
-                   << slice->source_addr << ", length: " << slice->length
-                   << ", opcode: " << (int)slice->opcode
-                   << ", target_id: " << slice->target_id
+                   << source_addr << ", length: " << length
+                   << ", opcode: " << (int)opcode
+                   << ", target_id: " << target_id
                    << ". Exception: " << e.what();
-        closeSocketNoThrow(socket);
-        if (terminal_work && terminal_work->has_value()) {
-            auto failed = std::move(terminal_work->value());
-            terminal_work->reset();
-            failWorkItem(std::move(failed), WorkFailureReason::SESSION_FAILED,
-                         lane_state_->failure_counters);
-        } else if (work.slice) {
-            failWorkItem(std::move(work), WorkFailureReason::SESSION_FAILED,
-                         lane_state_->failure_counters);
-        }
+        fail_on_caller();
     } catch (...) {
         LOG(ERROR) << "TcpTransport::startTransfer encountered an unknown "
                       "exception. Slice details - source_addr: "
-                   << slice->source_addr << ", length: " << slice->length
-                   << ", opcode: " << (int)slice->opcode
-                   << ", target_id: " << slice->target_id;
-        closeSocketNoThrow(socket);
-        if (terminal_work && terminal_work->has_value()) {
-            auto failed = std::move(terminal_work->value());
-            terminal_work->reset();
-            failWorkItem(std::move(failed), WorkFailureReason::SESSION_FAILED,
-                         lane_state_->failure_counters);
-        } else if (work.slice) {
-            failWorkItem(std::move(work), WorkFailureReason::SESSION_FAILED,
-                         lane_state_->failure_counters);
-        }
+                   << source_addr << ", length: " << length
+                   << ", opcode: " << (int)opcode
+                   << ", target_id: " << target_id;
+        fail_on_caller();
     }
 }
 
