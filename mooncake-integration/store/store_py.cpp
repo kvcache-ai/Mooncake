@@ -15,6 +15,7 @@
 #include <unordered_set>
 
 #include "pyclient.h"
+#include "master_client.h"
 #include "dummy_client.h"
 #include "real_client.h"
 #include "common.h"
@@ -2225,6 +2226,67 @@ class MooncakeDistributedNoFRegisterPyWrapper {
     MooncakeDistributedNoFRegisterPyWrapper() = default;
 };
 
+namespace {
+
+class EngramMasterClient {
+    MasterClient client_{generate_uuid()};
+
+   public:
+    explicit EngramMasterClient(const std::string &address) {
+        if (client_.Connect(address) != ErrorCode::OK) {
+            throw std::runtime_error("Cannot connect to Mooncake Master: " +
+                                     address);
+        }
+    }
+
+    py::dict Request(const py::dict &args) {
+        EngramControlRequest request;
+        const auto read = [&](const char *key, auto &target) {
+            using T = std::decay_t<decltype(target)>;
+            if (args.contains(key)) target = py::cast<T>(args[key]);
+        };
+        read("action", request.action);
+        read("pool", request.pool);
+        read("node", request.node);
+        read("incarnation", request.incarnation);
+        read("mode", request.mode);
+        read("group", request.group);
+        read("shard", request.shard);
+        read("group_size", request.group_size);
+        read("num_callers", request.num_callers);
+        read("boot", request.boot);
+        read("generation", request.generation);
+        read("key", request.key);
+        read("value", request.value);
+        auto result = [&] {
+            py::gil_scoped_release release;
+            return client_.EngramControl(request);
+        }();
+        if (!result) throw std::runtime_error("Engram Master RPC failed");
+        py::dict response;
+        response["error"] = result->error;
+        response["retry"] = result->retry;
+        response["full"] = result->full;
+        response["found"] = result->found;
+        response["group"] = result->group;
+        response["shard"] = result->shard;
+        response["group_size"] = result->group_size;
+        response["boot"] = result->boot;
+        response["generation"] = result->generation;
+        response["value"] = result->value;
+        return response;
+    }
+};
+
+void BindEngramControl(py::module_ &module) {
+    py::class_<EngramMasterClient>(module, "_EngramMasterClient")
+        .def(py::init<const std::string &>(),
+             py::call_guard<py::gil_scoped_release>())
+        .def("request", &EngramMasterClient::Request);
+}
+
+}  // namespace
+
 NB_MODULE(_store, m) {
     m.def("_serialize_tensor", &serialize_tensor_metadata,
           "Inspect a torch tensor as Mooncake tensor metadata, data pointer, "
@@ -3879,6 +3941,8 @@ NB_MODULE(_store, m) {
 
     m.def("get_alloc_func_addr", &get_alloc_func_addr);
     m.def("get_free_func_addr", &get_free_func_addr);
+
+    BindEngramControl(m);
 }
 
 }  // namespace mooncake

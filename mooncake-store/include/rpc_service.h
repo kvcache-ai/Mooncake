@@ -9,6 +9,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_service.h"
+#include "engram_coordinator.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "master_config.h"
@@ -22,6 +23,7 @@ namespace mooncake {
 class HttpMetadataServer;
 class WrappedMasterService {
    public:
+    EngramControlResponse EngramControl(const EngramControlRequest& request);
     store::GatherReadDirectory gather_directory;
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
@@ -452,6 +454,7 @@ class WrappedMasterService {
 
    private:
     MasterService master_service_;
+    EngramCoordinator engram_coordinator_;
 };
 
 class RpcWorkerPool;

@@ -184,10 +184,8 @@ if(USE_UBSHMEM)
 endif()
 
 if(WITH_STORE)
-  if(USE_CUDA)
-    add_subdirectory(../mooncake-store/src/engram
-                     ${CMAKE_BINARY_DIR}/mooncake-store/src/engram)
-  endif()
+  add_subdirectory(../mooncake-store/src/engram
+                   ${CMAKE_BINARY_DIR}/mooncake-store/src/engram)
   nanobind_add_module(
     store
     ${MOONCAKE_NANOBIND_ABI}
@@ -271,6 +269,12 @@ if(WITH_TE)
     DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
     COMPONENT python)
 endif()
+
+# Keep Engram available in both direct CMake installs and PEP 517 wheels.
+install(
+  FILES "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/engram.py"
+  DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+  COMPONENT python)
 
 # scikit-build-core consumes these legacy modules through python/CMakeLists.txt.
 # Retain the direct CMake install surface only outside PEP 517 builds.

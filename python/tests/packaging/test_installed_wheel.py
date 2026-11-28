@@ -45,6 +45,15 @@ def test_wheel_imports_outside_the_repository(
         wheel_files = set(archive.namelist())
     assert "mooncake/store/__init__.py" in wheel_files
     assert "mooncake/_structured_ranges.py" in wheel_files
+    assert {
+        "mooncake/engram.py",
+        "mooncake/_engram/__init__.py",
+        "mooncake/_engram/remote/control.py",
+        "mooncake/_engram/remote/rendezvous.py",
+        "mooncake/_engram/remote/deepep_rdma/backend.py",
+        "mooncake/_engram/remote/deepep_rdma/bridge.cpp",
+        "mooncake/_engram/remote/deepep_rdma/DEEP_EP_LICENSE",
+    } <= wheel_files
     assert {"mooncake/py.typed", "mooncake/engine.pyi"} <= wheel_files
     assert not any(name.endswith("mooncake_store_rs.pth") for name in wheel_files)
     assert not any(name.startswith("mooncake_store_rs/") for name in wheel_files)
@@ -81,7 +90,15 @@ def test_wheel_imports_outside_the_repository(
     subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
     python = environment / "bin" / "python"
     subprocess.run(
-        [str(python), "-m", "pip", "install", "aiohttp", "msgpack", "requests"],
+        [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "aiohttp",
+            "msgpack",
+            "requests",
+        ],
         check=True,
     )
     subprocess.run(
@@ -127,6 +144,7 @@ repository_path = Path({str(REPOSITORY_ROOT)!r}).resolve()
 assert not package_path.is_relative_to(repository_path), (package_path, repository_path)
 assert metadata.version("mooncake-transfer-engine") == {_project_version(project_file)!r}
 assert "administration" in metadata.metadata("mooncake-transfer-engine").get_all("Provides-Extra", [])
+assert "engram" in metadata.metadata("mooncake-transfer-engine").get_all("Provides-Extra", [])
 assert mooncake.store._BACKEND == "cpp"
 assert mooncake.store.MooncakeDistributedStore is private_store.MooncakeDistributedStore
 assert mooncake.BufferPool is mooncake.store.BufferPool
@@ -370,6 +388,41 @@ for name, module in tuple(sys.modules.items()):
         check=True,
     )
     check_help()
+
+    subprocess.run(
+        [str(python), "-m", "pip", "install", f"{wheel}[engram]"],
+        check=True,
+    )
+    engram_smoke_script = """
+from importlib import import_module, util
+from pathlib import Path
+import mooncake
+package_path = Path(mooncake.__file__).resolve()
+from mooncake.engram import EngramStore, EngramStoreConfig
+from mooncake._engram.remote.deepep_rdma import backend as engram_backend
+import numpy as np
+from tempfile import TemporaryDirectory
+assert Path(engram_backend.__file__).resolve().is_relative_to(package_path.parent)
+assert (Path(engram_backend.__file__).parent / "bridge.cpp").is_file()
+assert (Path(engram_backend.__file__).parent / "DEEP_EP_LICENSE").is_file()
+with TemporaryDirectory() as directory:
+    config = EngramStoreConfig(local_dir=directory, persistent=False)
+    specs = {"rows": {"num_rows": 3, "row_bytes": 4}}
+    expected = np.arange(12, dtype=np.uint8).reshape(3, 4)
+    with EngramStore(tables=specs, namespace="wheel-smoke", config=config) as store:
+        store.populate("rows", expected)
+        output = np.empty((2, 1, 4), dtype=np.uint8)
+        store.lookup(["rows"], np.array([[2], [0]], dtype=np.int64), output)
+        np.testing.assert_array_equal(output[:, 0], expected[[2, 0]])
+if util.find_spec("mooncake._engram_cuda") is not None:
+    import_module("mooncake._engram_cuda")
+"""
+    subprocess.run(
+        [str(python), "-I", "-c", engram_smoke_script],
+        cwd=tmp_path,
+        env=clean_environment,
+        check=True,
+    )
 
     if project_file == "pyproject.toml":
         structured_requirements = [

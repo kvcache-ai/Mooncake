@@ -225,6 +225,29 @@ class ConductorServerPreservationTest(unittest.TestCase):
                         library = build / "mooncake-common/libasio.so"
                         library.parent.mkdir()
                         library.write_bytes(b"server runtime dependency")
+                        # The cleanup block stages the public Python package
+                        # and Engram runtime before removing the native build.
+                        source = script_path.parents[1]
+                        for relative in (
+                            "python/mooncake",
+                            "mooncake-store/src/engram",
+                            "mooncake-reshard/python/mooncake/reshard",
+                        ):
+                            shutil.copytree(
+                                source / relative,
+                                root / relative,
+                                ignore=shutil.ignore_patterns("__pycache__"),
+                            )
+                        package = root / "mooncake-wheel/mooncake"
+                        package.mkdir(parents=True)
+                        (package / "__init__.py").write_text("# legacy initializer\n")
+                        (build / "CMakeCache.txt").write_text(
+                            "WITH_STORE:BOOL=ON\nUSE_CUDA:BOOL=ON\n"
+                        )
+                        cuda = build / "mooncake-store/src/engram/local"
+                        cuda.mkdir(parents=True)
+                        cuda_name = "_engram_cuda.cpython-test.so"
+                        (cuda / cuda_name).write_bytes(b"CUDA")
                         staging = build / "ep_pg_staging"
                         staging.mkdir()
                         (staging / "libmooncake_ep_device.so").write_bytes(b"EP")
@@ -236,6 +259,7 @@ class ConductorServerPreservationTest(unittest.TestCase):
                             f"source {shlex.quote(str(script_path))}\n"
                             f"BUILD_DIR={shlex.quote(build_arg)}\n"
                             f"BUILD_DIR_ABS={shlex.quote(str(build))}\n"
+                            f"BUILD_ROOT={shlex.quote(str(root))}\n"
                             'DEVICE_STAGING_DIR="$BUILD_DIR_ABS/ep_pg_staging"\n'
                             "DEVICE_LIBRARY_BASENAMES=(libmooncake_ep_device.so)\n"
                             "WITH_EP_BUILD=1\nUSE_XPU_BUILD=0\n"
@@ -245,6 +269,9 @@ class ConductorServerPreservationTest(unittest.TestCase):
                             + 'test -f "$DEVICE_STAGING_TEMP/libmooncake_ep_device.so"\n'
                             + 'test ! -e "$DEVICE_STAGING_TEMP/libmooncake_pg_device.so"\n'
                             + 'test -d "$CUDA_EP_JIT_DIR"\n'
+                            + f'test -f "{package}/{cuda_name}"\n'
+                            + f'test -f "{package}/_engram/remote/control.py"\n'
+                            + f'test -f "{package}/_engram/remote/deepep_rdma/bridge.cpp"\n'
                             + 'rm -rf "$DEVICE_STAGING_TEMP"\n'
                             + 'printf "%s" "$CONDUCTOR_SMOKE_DIR" > preserved-path\n'
                             + f"exit {exit_code}\n"
@@ -262,6 +289,13 @@ class ConductorServerPreservationTest(unittest.TestCase):
                         self.assertEqual(result.returncode, exit_code, result.stderr)
                         preserved = Path((root / "preserved-path").read_text())
                         self.assertFalse(preserved.exists())
+                        self.assertEqual(
+                            (package / "__init__.py").read_text(),
+                            "# legacy initializer\n",
+                        )
+                        self.assertEqual(
+                            {path.name for path in package.iterdir()}, {"__init__.py"}
+                        )
 
 
 class WheelBuildCallerTest(unittest.TestCase):

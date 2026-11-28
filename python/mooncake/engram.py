@@ -9,16 +9,105 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import mmap
 import operator
 import os
 import tempfile
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-__all__ = ["EngramStore"]
+__all__ = ["EngramStore", "EngramStoreConfig"]
+
+
+@dataclass(frozen=True)
+class EngramStoreConfig:
+    """One flat configuration; model-specific table metadata stays in Store.
+
+    Remote node/model identity, caller numbering and lookup capacity are
+    supplied by the inference runtime, not by its user-facing JSON config.
+    Master connectivity reuses MOONCAKE_MASTER or the existing Mooncake file.
+    """
+
+    backend: str = "local"
+    local_dir: str | None = None
+    persistent: bool = True
+    assignment: str | None = None
+    group_size: int | None = None
+    group_id: str | None = None
+    shard_id: int | None = None
+    node_id: str | None = None
+    model_key: str | None = None
+    caller_id: int | None = None
+    num_callers: int | None = None
+    max_lookup_rows: int | None = None
+    timeout: float = 300
+
+    def __post_init__(self):
+        if self.backend not in ("local", "deepep_rdma"):
+            raise ValueError(f"Unsupported Engram backend: {self.backend!r}")
+        if type(self.persistent) is not bool:
+            raise ValueError("persistent must be a bool")
+        if self.local_dir is not None and (
+            not isinstance(self.local_dir, (str, os.PathLike))
+            or not os.fspath(self.local_dir)
+        ):
+            raise ValueError("local_dir must be a nonempty string")
+        if (
+            isinstance(self.timeout, bool)
+            or not isinstance(self.timeout, (int, float))
+            or not math.isfinite(self.timeout)
+            or self.timeout <= 0
+        ):
+            raise ValueError("timeout must be finite and positive")
+        if self.backend == "local":
+            if self.local_dir is None:
+                raise ValueError("Local Engram tables require local_dir")
+            for name in (
+                "assignment",
+                "group_size",
+                "group_id",
+                "shard_id",
+                "node_id",
+                "model_key",
+                "caller_id",
+                "num_callers",
+                "max_lookup_rows",
+            ):
+                if getattr(self, name) is not None:
+                    raise ValueError(f"{name} requires backend='deepep_rdma'")
+            return
+        if self.local_dir is not None:
+            raise ValueError("deepep_rdma does not use local_dir")
+        if self.assignment not in ("auto", "manual"):
+            raise ValueError("Remote assignment must be 'auto' or 'manual'")
+        for name, upper in (("group_size", 64), ("num_callers", 256)):
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= upper:
+                raise ValueError(f"{name} must be an integer in [1,{upper}]")
+        if (
+            type(self.caller_id) is not int
+            or not 0 <= self.caller_id < self.num_callers
+        ):
+            raise ValueError("caller_id must be in [0,num_callers)")
+        if type(self.max_lookup_rows) is not int or self.max_lookup_rows < 1:
+            raise ValueError("max_lookup_rows must be a positive integer")
+        for name in ("node_id", "model_key"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"Remote {name} must be a nonempty string")
+        if self.assignment == "auto":
+            if self.group_id is not None or self.shard_id is not None:
+                raise ValueError("Auto assignment does not accept group_id/shard_id")
+        elif (
+            not isinstance(self.group_id, str)
+            or not self.group_id
+            or type(self.shard_id) is not int
+            or not 0 <= self.shard_id < self.group_size
+        ):
+            raise ValueError("Manual assignment requires group_id and a valid shard_id")
 
 
 class EngramStore:
@@ -29,8 +118,9 @@ class EngramStore:
     Persistent local files survive close; anonymous tables (persistent=False)
     are released on close or process exit. CPU lookup is synchronous. CUDA
     lookup enqueues the complete operation on the supplied stream, including
-    completion, and returns None. ``store_client`` is reserved for a future
-    remote backend; remote tables are not supported yet.
+    completion, and returns None. ``EngramStoreConfig`` selects the
+    node-sharded DeepEP backend; ``store_client`` remains an unsupported
+    reserved argument.
     """
 
     def __init__(
@@ -41,21 +131,34 @@ class EngramStore:
         local_dir=None,
         store_client=None,
         persistent=True,
+        config=None,
     ):
         self._closed = False
         self._lock = threading.RLock()
         self._mappings = {}
         self._cuda_tables = {}
         self._cuda_lookups = {}
+        self._remote = None
+        self._assignment = None
         if not isinstance(namespace, str) or not namespace:
             raise ValueError("A nonempty namespace is required")
-        if (local_dir is None) == (store_client is None):
-            raise ValueError("Choose exactly one of local_dir and store_client")
         if store_client is not None:
-            raise NotImplementedError("Remote EngramStore is not supported yet")
-        if not isinstance(persistent, bool):
-            raise ValueError("persistent must be a bool")
-        self._persistent = persistent
+            raise NotImplementedError(
+                "Remote EngramStore is not supported through store_client; use EngramStoreConfig"
+            )
+        if config is not None:
+            if not isinstance(config, EngramStoreConfig):
+                raise TypeError("config must be EngramStoreConfig")
+            if local_dir is not None or persistent is not True:
+                raise ValueError("Do not mix config with local_dir/persistent")
+        else:
+            config = EngramStoreConfig(
+                local_dir=local_dir,
+                persistent=persistent,
+            )
+        self._config = config
+        self._persistent = config.persistent
+        self._namespace = namespace
         if not tables:
             raise ValueError("At least one table is required")
         self._specs = {}
@@ -68,10 +171,64 @@ class EngramStore:
             if n < 0 or r <= 0 or n * r > np.iinfo(np.intp).max:
                 raise ValueError("Invalid table size")
             self._specs[name] = {"num_rows": n, "row_bytes": r}
-        self._root = Path(local_dir).resolve()
-        if persistent:
-            self._root /= hashlib.sha256(namespace.encode()).hexdigest()
-        self._root.mkdir(parents=True, exist_ok=True)
+        self._root = None
+        if config.backend == "local":
+            self._root = Path(config.local_dir).resolve()
+            if self._persistent:
+                self._root /= hashlib.sha256(namespace.encode()).hexdigest()
+            self._root.mkdir(parents=True, exist_ok=True)
+        else:
+            if len(self._specs) < config.group_size:
+                raise ValueError("More storage nodes than Engram tables")
+            if len({spec["row_bytes"] for spec in self._specs.values()}) != 1:
+                raise ValueError("deepep_rdma requires equal byte-row widths")
+            from ._engram.remote.control import Assignment
+
+            self._assignment = Assignment(config)
+
+    @property
+    def group_id(self):
+        return None if self._assignment is None else self._assignment.group_id
+
+    @property
+    def shard_id(self):
+        return None if self._assignment is None else self._assignment.shard_id
+
+    @property
+    def group_size(self):
+        return None if self._assignment is None else self._assignment.group_size
+
+    def populate_and_sync(self, local_tables, *, table_owners):
+        """Publish this node's byte tables, connect, and wait for group readiness.
+
+        Construction already fixed node placement. Call before CUDA capture.
+        All local callers share one CPU allocation; input rows may be released
+        after return. Weights and placement remain immutable until close.
+        """
+        from ._engram.remote.deepep_rdma.backend import DeepEPBackend
+
+        with self._lock:
+            if self._assignment is None:
+                raise RuntimeError("populate_and_sync requires backend='deepep_rdma'")
+            if self._closed or self._remote is not None or self._mappings:
+                raise RuntimeError("populate_and_sync requires a fresh EngramStore")
+            self._assignment.check()
+            config = self._config
+            self._remote = DeepEPBackend(
+                tables=self._specs,
+                namespace=self._namespace,
+                local_tables=local_tables,
+                owners=table_owners,
+                shard_id=self.shard_id,
+                num_shards=self.group_size,
+                master_addr=None,
+                session_id=self._assignment.identity,
+                caller_id=config.caller_id,
+                num_callers=config.num_callers,
+                max_lookup_rows=config.max_lookup_rows,
+                timeout=config.timeout,
+                assignment=self._assignment,
+            )
 
     def _spec(self, name):
         if self._closed:
@@ -80,6 +237,54 @@ class EngramStore:
 
     def get_table_spec(self, table_id):
         return dict(self._spec(table_id))
+
+    def populate_shard_and_sync(
+        self,
+        local_tables,
+        *,
+        shard_id,
+        num_shards,
+        table_owners,
+        master_addr,
+        session_id,
+        caller_id,
+        max_lookup_rows,
+        timeout=300,
+        num_callers=1,
+    ):
+        """Publish this node's tables and connect all node shards through Master.
+
+        Storage shard IDs are independent of model ranks. Each node supplies
+        only its owned tables; local callers share their backing CPU snapshot.
+        caller_id pairs one GPU caller on each node into a private rail group.
+        master_addr is the Master's HTTP metadata endpoint. session_id must be
+        unique per deployment. Returns after all shards have registered and
+        connected. Remote lookup keeps the existing stream-ordered byte API.
+        """
+        if self._assignment is not None:
+            raise RuntimeError("Configured remote stores use populate_and_sync")
+        from ._engram.remote.deepep_rdma.backend import DeepEPBackend
+
+        with self._lock:
+            if self._closed or self._remote is not None or self._mappings:
+                raise RuntimeError(
+                    "populate_shard_and_sync requires a fresh EngramStore"
+                )
+            self._remote = DeepEPBackend(
+                tables=self._specs,
+                namespace=self._namespace,
+                local_tables=local_tables,
+                owners=table_owners,
+                shard_id=shard_id,
+                num_shards=num_shards,
+                master_addr=master_addr,
+                session_id=session_id,
+                caller_id=caller_id,
+                max_lookup_rows=max_lookup_rows,
+                local_dir=self._root,
+                timeout=timeout,
+                num_callers=num_callers,
+            )
 
     def _path(self, name):
         return self._root / hashlib.sha256(name.encode()).hexdigest()
@@ -94,6 +299,8 @@ class EngramStore:
 
     def populate(self, table_id, rows):
         with self._lock:
+            if self._assignment is not None or self._remote is not None:
+                raise RuntimeError("Use populate_and_sync for remote tables")
             spec = self._spec(table_id)
             rows = self._array(rows)
             shape = (spec["num_rows"], spec["row_bytes"])
@@ -198,6 +405,11 @@ class EngramStore:
                 x < 0 or x > np.iinfo(np.int64).max for x in offsets
             ):
                 raise ValueError("Expected one nonnegative int64 offset per table")
+            if self._remote is not None:
+                self._remote.lookup(table_ids, row_ids, output, stream, offsets)
+                return
+            if self._assignment is not None:
+                raise RuntimeError("Call populate_and_sync before remote lookup")
             if stream is not None:
                 self._lookup_cuda(table_ids, row_ids, output, int(stream), offsets)
                 return
@@ -279,6 +491,8 @@ class EngramStore:
     def remove(self, table_id):
         with self._lock:
             self._spec(table_id)
+            if self._assignment is not None or self._remote is not None:
+                raise RuntimeError("Remote tables cannot be removed individually")
             if not self._persistent:
                 raise RuntimeError("Anonymous tables are released by close()")
             if table_id in self._mappings:
@@ -295,6 +509,15 @@ class EngramStore:
         with self._lock:
             if self._closed:
                 return
+            if self._remote is not None:
+                try:
+                    self._remote.close()
+                finally:
+                    self._remote = None
+                    if self._assignment is not None:
+                        self._assignment.close()
+            elif self._assignment is not None:
+                self._assignment.close()
             for lookup in self._cuda_lookups.values():
                 lookup.synchronize()
             lookup = None

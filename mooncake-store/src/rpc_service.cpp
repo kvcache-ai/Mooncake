@@ -2115,6 +2115,11 @@ void RegisterPooledHandlers(coro_rpc::coro_rpc_server& server,
 
 }  // namespace
 
+EngramControlResponse WrappedMasterService::EngramControl(
+    const EngramControlRequest& request) {
+    return engram_coordinator_.Handle(request);
+}
+
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
                         WrappedMasterService& wrapped_master_service,
                         RpcWorkerPool* worker_pool) {
@@ -2125,8 +2130,8 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
                             &WrappedMasterService::ServiceReady>(
         &wrapped_master_service);
     RegisterPooledHandlers<
-        &WrappedMasterService::ExistKey, &WrappedMasterService::ProbeKey,
-        &WrappedMasterService::BatchQueryIp,
+        &WrappedMasterService::EngramControl, &WrappedMasterService::ExistKey,
+        &WrappedMasterService::ProbeKey, &WrappedMasterService::BatchQueryIp,
         &WrappedMasterService::BatchReplicaClear,
         &WrappedMasterService::GetReplicaListByRegex,
         &WrappedMasterService::GetReplicaList,

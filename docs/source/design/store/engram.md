@@ -3,13 +3,13 @@
 EngramStore reads immutable tables of opaque byte rows. Models own hashing,
 quantization, scales, projections and distributed communication.
 
-This implementation supports local CPU and CUDA lookup only. The table/row
-contract is designed to accommodate future remote backends, but remote
-Mooncake Store execution is not supported yet.
+Local CPU/CUDA tables and node-sharded `deepep_rdma` tables share the same
+byte-row lookup contract. The remote backend requires CUDA/NCCL GIN-capable
+owners; CPU-only remote owners are not supported.
 
 ## Table API
 
-The table API adds no public configuration or lookup-handle class. Import
+The original local table interface remains available. Import
 `EngramStore` from `mooncake.engram`, or from `mooncake.store` with the C++ Store
 backend.
 
@@ -58,6 +58,15 @@ Row bytes must be contiguous. Nonoverlapping positive outer strides support
 both token-major and head-major output; strided ID matrices are also accepted.
 IDs and output must not overlap. Empty token batches are supported.
 
+## Wheel installation
+
+Both the PEP 517 build and `scripts/build_wheel.sh` include `mooncake.engram`,
+the private remote packages, JIT C++ source and its license. Install the NumPy
+extra with `pip install 'mooncake-transfer-engine[engram]'`. CUDA-enabled Store
+builds also include `_engram_cuda`; CPU builds support the local CPU interface.
+The `deepep_rdma` backend additionally needs PyTorch and the compatible
+DeepEP/NCCL runtime described below; these are not bundled into the wheel.
+
 ## Local CUDA execution
 
 Build with `USE_CUDA=ON` (for wheel builds, pass
@@ -102,17 +111,82 @@ leave behind after a worker is killed. These tables are isolated per Store
 instance, cannot be reopened by namespace, and are released by `close()` or
 process exit. `remove()` is not needed or supported in this mode.
 
-## Future remote backends
+## Configured backends and remote initialization
 
-`lookup(table_ids, row_ids, output, *, stream=None, offsets=None)` describes
-requested rows and caller-owned output without exposing table addresses or a
-transport. A future remote implementation can use the same contract, including
-the requirement that consumers on the supplied CUDA stream observe complete
-output. This does not promise CUDA graph support for every future backend.
+`EngramStoreConfig` lives in `mooncake.engram`. It is one flat, immutable
+configuration, validated for its selected `backend`. Existing local constructor
+calls remain supported; do not mix `config` with explicit legacy local options.
 
-Remote CPU and CUDA execution, transport selection and remote benchmarks are
-not implemented here. Passing `store_client` fails explicitly rather than
-falling back to local storage.
+Under `mooncake-store/src/engram`, `local/` contains the native local CUDA
+implementation. `remote/` contains shared placement and metadata rendezvous;
+`remote/deepep_rdma/` owns DeepEP slot layout, CPU allocation, communication,
+JIT compilation and lookup kernels. Future communication backends can add
+sibling directories without changing the shared coordination code.
+
+```python
+from mooncake.engram import EngramStore, EngramStoreConfig
+
+config = EngramStoreConfig(
+    backend="deepep_rdma", assignment="auto", group_size=2,
+    node_id=runtime_node_id, model_key=checkpoint_identity,
+    caller_id=local_caller_id, num_callers=local_caller_count,
+    max_lookup_rows=maximum_submitted_ids,
+)
+store = EngramStore(tables=all_head_specs, namespace=layer_namespace, config=config)
+# Construction registers the node and waits for a complete group. Load only
+# this node's heads, using store.shard_id and store.group_size.
+store.populate_and_sync(local_tables, table_owners=head_owners)
+store.lookup(head_names, ids, output, offsets=head_offsets, stream=stream)
+```
+
+Use `assignment="manual"`, `group_id` and `shard_id` for explicit placement.
+Auto admission needs no total cluster size: compatible nodes form successive
+fixed-size groups. Nodes on the same host share a final CPU allocation across
+callers; each caller has its own communication rail and lookup workspace.
+
+`MOONCAKE_MASTER`, or `master_server_address` in the existing Mooncake config,
+selects the Master RPC endpoint. Engram registration, bootstrap records and
+readiness all use Master RPC; no HTTP metadata endpoint or user session ID is
+needed. This requires a Master and Python extension built with this change.
+Lookup itself does not query Master. NIC selection reuses NCCL configuration,
+including `NCCL_IB_HCA` when set; Engram does not override it. Set any NIC filter
+before launching the runtime. The Config accepts an optional `timeout` override
+(default: 300 seconds).
+
+The runtime supplies stable node/model identities, dense local caller numbers,
+matching caller counts, and lookup capacity. Capacity counts every submitted ID
+in `[T,K]`, including masked IDs. These five fields are required for the remote
+backend; local tables do not use them:
+
+| Runtime field | Purpose | Why the runtime supplies it |
+| --- | --- | --- |
+| `node_id` | Stable identity of one storage node. | All GPU callers on that node share placement; restarted nodes can retain their shard. It is not a routable address. |
+| `model_key` | Isolates placement pools by checkpoint identity. | Nodes serving different checkpoints must not join the same storage group. It need not be a weight-content hash. |
+| `caller_id` | Dense caller index in `[0,num_callers)`. | The same index on each node forms one communication rail, with its own lookup workspace. It is independent of physical GPU and storage shard IDs. |
+| `num_callers` | Number of GPU callers on each storage node. | Peers validate matching counts, and local callers wait until all have imported the shared CPU allocation. |
+| `max_lookup_rows` | Maximum submitted IDs per lookup, `T * K`. | Communication buffers and queues are sized before lookup/CUDA Graph capture. Count masked IDs and graph padding as well as useful IDs. |
+
+For four storage nodes with four GPU callers each, `group_size=4`,
+`num_callers=4`, and each node has callers `0,1,2,3`. No field needs to be
+entered in an inference runtime's user JSON if the runtime derives it, as
+SGLang does. A single-caller deployment uses `caller_id=0, num_callers=1`;
+these values must not be reused as defaults for a multi-caller deployment.
+
+Tables must have equal byte-row widths.
+Placement is independent of computational TP/DP/CP ownership. Initialize before
+CUDA Graph capture, and order overlapping uses of one Store workspace.
+
+Node leases distinguish active owners from replacement processes. A restart
+retains placement, increments the group's bootstrap generation, and discards
+old initialization records. All owners must rebuild their Stores/communicators
+before lookup resumes. This is not transparent single-node recovery. Placement
+is in-memory Master state; surviving a Master restart is outside this backend.
+The compatibility `populate_shard_and_sync` entry point retains the previous
+explicit HTTP-rendezvous path; configured stores use `populate_and_sync`.
+
+`backend="local"` uses `local_dir` and `persistent`; remote allocations are
+process-lifetime CPU memory and do not use these file settings. Other backend
+names, including the planned MNNVL and UB paths, fail until implemented.
 
 ## Model coverage
 
@@ -128,13 +202,15 @@ projections, request history and distributed communication in their own code.
 | Gemma3n / Gemma4 | Per-layer input embedding rows | Direct token indexing, scaling, projection and gating |
 
 The table/row contract keeps model-side interpretation separate from storage.
-The current local implementation supports CPU and CUDA lookup; remote lookup
-is future work.
+The local implementation supports CPU and CUDA lookup. The SGLang remote
+adapter currently targets Qwen4-Exp and its Qwen3.8 checkpoint family.
 
 ## Verification
 
 Run `pytest -q scripts/test_engram_tables.py` for local table contracts and CUDA
-graph replay, and verifies that remote backend selection is rejected.
+graph replay. Local regression checks cover Config validation, coordinator
+admission, manual conflicts, restart placement, expired owners and generation
+fencing.
 `scripts/bench_engram_store_27b.py` benchmarks the same API against local storage.
 
 The SGLang integration was tested end to end with real weights for all five
@@ -146,3 +222,12 @@ fixed KV capacity and serialized requests. These are functional correctness
 checks for local storage, not a performance benchmark or remote validation.
 See [the companion SGLang PR](https://github.com/sgl-project/sglang/pull/44521)
 for the complete test configuration.
+
+The configured `deepep_rdma` path was also tested with Qwen3.8-Flash-Next-FP8
+on two nodes, each running TP4/EP4 with PP1 and one model replica. Auto and manual
+assignment matched local storage exactly for 40 remote requests / 1,280 generated
+tokens, including output logprobs, with prefill and decode CUDA graphs enabled.
+Eight-caller storage tests checked byte correctness, shared CPU allocations,
+graph replay, whole-group restart and SIGKILL recovery with retained placement.
+Real Master RPC tests additionally checked expired owners in partial groups.
+These checks validate functionality under the tested configurations.

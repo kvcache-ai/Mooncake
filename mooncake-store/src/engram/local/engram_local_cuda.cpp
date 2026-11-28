@@ -20,6 +20,13 @@ void check(cudaError_t rc) {
     if (rc != cudaSuccess) throw std::runtime_error(cudaGetErrorString(rc));
 }
 
+std::string dtype_name(const py::object& tensor) {
+    // Materialize the attribute: converting an accessor directly to py::str
+    // can bypass Python's __str__ conversion in nanobind.
+    const py::object dtype = tensor.attr("dtype");
+    return py::cast<std::string>(py::str(dtype));
+}
+
 struct DeviceGuard {
     int previous;
     explicit DeviceGuard(int device) {
@@ -72,7 +79,7 @@ struct View {
     std::vector<size_t> shape, strides;
     View(py::object tensor, const std::string& dtype, size_t element_size) {
         if (!py::cast<bool>(tensor.attr("is_cuda")) ||
-            py::cast<std::string>(py::str(tensor.attr("dtype"))) != dtype)
+            dtype_name(tensor) != dtype)
             throw std::invalid_argument("Unexpected tensor device or dtype");
         shape = py::cast<std::vector<size_t>>(tensor.attr("shape"));
         strides = py::cast<std::vector<size_t>>(tensor.attr("stride")());
@@ -152,7 +159,7 @@ class Lookup {
             !ids.attr("device").equal(output.attr("device")))
             throw std::invalid_argument(
                 "IDs, output and current CUDA device must match");
-        const auto dtype = py::cast<std::string>(py::str(ids.attr("dtype")));
+        const auto dtype = dtype_name(ids);
         if (dtype != "torch.int32" && dtype != "torch.int64")
             throw std::invalid_argument("IDs must be int32 or int64");
         View input(ids, dtype, dtype == "torch.int64" ? 8 : 4);
