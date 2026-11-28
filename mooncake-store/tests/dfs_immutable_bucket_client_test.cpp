@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -24,6 +25,20 @@ namespace {
 
 class FailingBucketPosixAdapter : public PosixFsAdapter {
    public:
+    tl::expected<int, ErrorCode> OpenExistingFile(
+        const std::string& path) override {
+        ++opens;
+        return PosixFsAdapter::OpenExistingFile(path);
+    }
+    tl::expected<void, ErrorCode> CloseFile(int fd) override {
+        ++closes;
+        return PosixFsAdapter::CloseFile(fd);
+    }
+    tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int count,
+                                           int64_t offset) override {
+        ++reads;
+        return PosixFsAdapter::ReadAt(fd, iov, count, offset);
+    }
     void FailNextWrite() { fail_next_.store(true); }
     tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
                                             int iovcnt,
@@ -34,6 +49,8 @@ class FailingBucketPosixAdapter : public PosixFsAdapter {
         return PosixFsAdapter::WriteAt(fd, iov, iovcnt, offset);
     }
 
+    std::atomic<int> opens{0}, closes{0}, reads{0};
+
    private:
     std::atomic<bool> fail_next_{false};
 };
@@ -42,6 +59,7 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
    protected:
     virtual int MaxBucketCount() const { return 2; }
     virtual uint64_t DefaultKvLeaseTtl() const { return 0; }
+    virtual uint64_t BucketCapacity() const { return 4096; }
 
     void SetUp() override {
         root_ = (std::filesystem::temp_directory_path() /
@@ -53,7 +71,8 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
         SetEnv("MOONCAKE_DFS_FS_ADAPTER", "posix");
         SetEnv("MOONCAKE_DFS_ROOT_DIR", root_);
         SetEnv("MOONCAKE_DFS_ALLOCATOR", "bucket");
-        SetEnv("MOONCAKE_DFS_BUCKET_CAPACITY", "4096");
+        SetEnv("MOONCAKE_DFS_BUCKET_CAPACITY",
+               std::to_string(BucketCapacity()));
         SetEnv("MOONCAKE_DFS_MAX_BUCKET_COUNT",
                std::to_string(MaxBucketCount()));
         SetEnv("MOONCAKE_DFS_ALIGNMENT", "4096");
@@ -83,7 +102,7 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
         distributed_config.fs_adapter_type = "posix";
         distributed_config.allocator_type = "bucket";
         distributed_config.alignment = 4096;
-        distributed_config.bucket_capacity = 4096;
+        distributed_config.bucket_capacity = BucketCapacity();
         distributed_config.max_bucket_count = MaxBucketCount();
         auto adapter = std::make_unique<FailingBucketPosixAdapter>();
         adapter_ = adapter.get();
@@ -154,6 +173,71 @@ class DfsImmutableBucketLruClientTest : public DfsImmutableBucketClientTest {
     int MaxBucketCount() const override { return 3; }
     uint64_t DefaultKvLeaseTtl() const override { return 50; }
 };
+
+class DfsBucketReadBatchClientTest : public DfsImmutableBucketClientTest {
+   protected:
+    uint64_t DefaultKvLeaseTtl() const override { return 5000; }
+    uint64_t BucketCapacity() const override { return 16384; }
+};
+
+TEST_F(DfsBucketReadBatchClientTest, AnotherClientReadsOneBucketPerBatch) {
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root_;
+    DistributedStorageConfig config;
+    config.fsdir = root_;
+    config.fs_adapter_type = "posix";
+    config.allocator_type = "bucket";
+    config.alignment = 4096;
+    config.bucket_capacity = BucketCapacity();
+    config.max_bucket_count = MaxBucketCount();
+    auto adapter = std::make_unique<FailingBucketPosixAdapter>();
+    auto* recorded = adapter.get();
+    auto reader_backend = std::make_shared<DistributedStorageBackend>(
+        file_config, config, std::move(adapter));
+    ASSERT_TRUE(reader_backend->Init());
+    provider_->SetDfsStorageBackend(reader_backend);
+
+    const std::vector<std::string> keys{"batch_first", "batch_second",
+                                        "batch_third"};
+    std::vector<std::string> values{
+        std::string(4096, 'A'), std::string(4096, 'B'), std::string(4096, 'C')};
+    std::vector<std::vector<Slice>> write_slices;
+    for (size_t i = 0; i < keys.size(); ++i)
+        write_slices.push_back(Slices(values[i]));
+    ReplicateConfig dfs_only;
+    dfs_only.replica_num = 0;
+    dfs_only.dfs_replica_num = 1;
+    const auto writes = writer_->BatchPut(keys, write_slices, dfs_only);
+    ASSERT_EQ(writes.size(), keys.size());
+    for (const auto& result : writes) ASSERT_TRUE(result);
+    std::optional<DistributedFSDescriptor> first_descriptor;
+    for (const auto& key : keys) {
+        const auto query = provider_->Query(key);
+        ASSERT_TRUE(query);
+        ASSERT_EQ(query->replicas.size(), 1u);
+        ASSERT_TRUE(query->replicas[0].is_dfs_replica());
+        const auto& descriptor = query->replicas[0].get_dfs_descriptor();
+        if (first_descriptor) {
+            ASSERT_EQ(descriptor.file_path, first_descriptor->file_path);
+        } else {
+            first_descriptor = descriptor;
+        }
+    }
+    std::vector<std::string> outputs(keys.size(), std::string(4096, '\0'));
+    std::unordered_map<std::string, std::vector<Slice>> read_slices;
+    for (size_t i = 0; i < keys.size(); ++i)
+        read_slices[keys[i]] = Slices(outputs[i]);
+    for (int call = 1; call <= 2; ++call) {
+        const auto reads = provider_->BatchGet(keys, read_slices);
+        ASSERT_EQ(reads.size(), keys.size());
+        for (const auto& result : reads) EXPECT_TRUE(result);
+        EXPECT_EQ(outputs, values);
+        EXPECT_EQ(recorded->opens.load(), call);
+        EXPECT_EQ(recorded->closes.load(), call);
+        EXPECT_EQ(recorded->reads.load(), call * static_cast<int>(keys.size()));
+    }
+}
 
 TEST_F(DfsImmutableBucketClientTest, PutReturnsAfterWriteAndFailureRevokes) {
     std::string value(4096, 'A');
