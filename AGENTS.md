@@ -18,6 +18,9 @@
   checklist, and AI assistance disclosure.
 - For AI-assisted changes, make sure the human submitter has reviewed every
   changed line and can defend the change end-to-end.
+- Do not add a `Signed-off-by` trailer for an AI agent. The human author
+  signs the DCO.
+- Add attribution using commit trailers such as `Co-authored-by:`.
 - Before handoff, run pre-commit on the files touched by the change when the
   toolchain is available (see `CONTRIBUTING.md` for the PR-scoped
   `pre-commit run --files ...` command). Do not use

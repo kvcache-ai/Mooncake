@@ -97,6 +97,8 @@ class ShmTransport : public Transport {
 
     bool getShmName(void* addr, std::string* name) const;
 
+    bool supportsParallelBatchSubmit() const override { return true; }
+
    private:
     struct OpenedShmEntry {
         void* shm_addr = nullptr;

@@ -401,8 +401,14 @@ if(USE_CUDA)
     target_compile_definitions(tent_mnnvl_transport_test
                                PRIVATE MNNVL_TEST_CUDA_WRAPPERS)
     target_link_options(
-      tent_mnnvl_transport_test PRIVATE "-Wl,--wrap=cudaEventRecord"
-      "-Wl,--wrap=cudaEventQuery")
+      tent_mnnvl_transport_test
+      PRIVATE
+      "-Wl,--wrap=cudaEventRecord"
+      "-Wl,--wrap=cudaEventQuery"
+      "-Wl,--wrap=cuDeviceGetAttribute"
+      "-Wl,--wrap=dlsym"
+      "-Wl,--wrap=cudaMemcpyAsync"
+      "-Wl,--wrap=cudaStreamSynchronize")
   endif()
   foreach(
     case
@@ -1071,6 +1077,8 @@ if(USE_MLU)
     add_test(NAME tent_mlu_${suite}_test COMMAND tent_mlu_${suite}_test)
     set_tests_properties(tent_mlu_${suite}_test PROPERTIES TIMEOUT 300)
   endforeach()
+  target_link_options(tent_mlu_platform_test PRIVATE
+                      "-Wl,--wrap=cnrtDeviceGetByPCIBusId")
   foreach(suite transport engine)
     target_link_options(
       tent_mlu_${suite}_test PRIVATE "-Wl,--wrap=cnGetMemAttribute"
@@ -1079,6 +1087,7 @@ if(USE_MLU)
   target_link_options(
     tent_mlu_transport_test
     PRIVATE
+    "-Wl,--wrap=cnrtDeviceGetByPCIBusId"
     "-Wl,--wrap=cnrtHostMalloc"
     "-Wl,--wrap=cnrtFreeHost"
     "-Wl,--wrap=cnrtMapMemHandle"
