@@ -12,6 +12,8 @@ namespace hf3fs_test {
 inline std::atomic<int> live_iovs{0};
 inline std::atomic<int> live_rings{0};
 inline std::atomic<int> calls{0};
+// hf3fs_iovunlink calls, which drop a buffer's /dev/shm name in the SDK.
+inline std::atomic<int> iov_unlinks{0};
 inline std::atomic<int> fail_call{0};
 inline std::atomic<bool> block_create{false};
 inline std::atomic<bool> create_entered{false};
@@ -34,4 +36,5 @@ inline int hf3fs_iorcreate4(hf3fs_ior*, const char*, size_t, bool, size_t, int,
     return 0;
 }
 inline void hf3fs_iovdestroy(hf3fs_iov*) { --hf3fs_test::live_iovs; }
+inline void hf3fs_iovunlink(hf3fs_iov*) { ++hf3fs_test::iov_unlinks; }
 inline void hf3fs_iordestroy(hf3fs_ior*) { --hf3fs_test::live_rings; }

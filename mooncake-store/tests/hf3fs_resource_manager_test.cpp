@@ -16,6 +16,7 @@ class Hf3fsResourceManagerTest : public ::testing::Test {
     void SetUp() override {
         hf3fs_test::calls = 0;
         hf3fs_test::fail_call = 0;
+        hf3fs_test::iov_unlinks = 0;
     }
     void TearDown() override {
         EXPECT_EQ(hf3fs_test::live_iovs, 0);
@@ -135,6 +136,21 @@ TEST_F(Hf3fsResourceManagerTest, ConcurrentThreadsHaveSeparateResources) {
         ASSERT_NE(resources[i], nullptr);
         for (size_t j = 0; j < i; ++j) EXPECT_NE(resources[i], resources[j]);
     }
+}
+
+// A killed client never reaches hf3fs_iovdestroy, so each buffer's /dev/shm
+// name must already be unlinked once the buffer is created.
+TEST_F(Hf3fsResourceManagerTest, ThreadResourcesUnlinkBuffers) {
+    USRBIOResourceManager manager;
+    Hf3fsConfig config;
+    config.mount_root = "/mnt/3fs";
+    manager.setDefaultParams(config);
+    auto* resource = manager.getThreadResource();
+    ASSERT_NE(resource, nullptr);
+    EXPECT_EQ(hf3fs_test::iov_unlinks, 1);
+    resource->Cleanup();
+    ASSERT_EQ(manager.getThreadResource(), resource);
+    EXPECT_EQ(hf3fs_test::iov_unlinks, 2);
 }
 
 }  // namespace mooncake::test
