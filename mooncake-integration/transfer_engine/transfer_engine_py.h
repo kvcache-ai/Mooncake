@@ -354,6 +354,7 @@ class TransferEnginePy {
 
     int resolveNicHint(const std::string &name) const;
 
+    bool initMemoryAllocator(const char *protocol);
     int checkSingleBatchStatus(batch_id_t batch_id);
 
     char *allocateRawBuffer(size_t capacity);
@@ -364,6 +365,8 @@ class TransferEnginePy {
 
    private:
     std::shared_ptr<TransferEngine> engine_;
+    void *(*allocate_memory_)(size_t) = nullptr;
+    void (*free_memory_)(void *) = nullptr;
     Transport *xport_;
 
     std::mutex mutex_;
