@@ -29,6 +29,14 @@ namespace {
 
 constexpr size_t kSha256DigestSize = 32;
 constexpr uint64_t kMaxPythonHashSeed = std::numeric_limits<uint32_t>::max();
+constexpr std::string_view kVllmDefaultNoneHashSeed = "vllm-none-hash";
+constexpr std::string_view kInvalidSeedMessage =
+    "python_hash_seed must be \"random\", \"vllm-none-hash\", or ASCII "
+    "decimal text in 0..4294967295";
+constexpr std::string_view kTaggedLoraUnsupportedMessage =
+    "vllm_v1_tagged cannot reproduce LoRA block hashes: vLLM >= v0.31 keys "
+    "them by (\"lora\", lora_name, lora_path) and Conductor has no lora_path "
+    "for this context";
 
 // ---------------------------------------------------------------------------
 // Recipe boundary
@@ -42,6 +50,13 @@ constexpr uint64_t kMaxPythonHashSeed = std::numeric_limits<uint32_t>::max();
 // non-empty cache salt after LoRA only on the first block) and never sees
 // value shapes outside the Conductor query contract.
 //
+// The extras slot has two shapes.  Untagged (vllm_v1, vLLM < v0.31) holds the
+// bare strings: (lora_name, cache_salt).  Tagged (vllm_v1_tagged, vLLM >=
+// v0.31, kv_cache_utils.generate_block_hash_extra_keys) holds one tuple per
+// key: (("cache_salt", salt),).  vLLM's tagged LoRA key also carries the
+// adapter path, which Conductor does not know, so tagged values never carry
+// a LoRA name (VllmV1HashChain::ValidateInputs rejects that context).
+//
 // Multimodal and prompt-embedding vLLM extra keys are deliberately NOT
 // representable here: the Conductor query API cannot express them, so the
 // codecs reject that shape by construction instead of approximating it.
@@ -52,7 +67,10 @@ struct VllmBlockValues {
     std::span<const int32_t> token_ids;      // exactly one complete block
     const std::string* lora_name;            // nullptr when no LoRA extra key
     const std::string* cache_salt;           // nullptr when no salt extra key
+    bool tagged_extra_keys = false;          // vLLM >= v0.31 tagged-tuple shape
 };
+
+constexpr std::string_view kCacheSaltTag = "cache_salt";
 
 class VllmValueCodec {
    public:
@@ -147,6 +165,12 @@ class CborVllmCodec final : public VllmValueCodec {
         const bool has_salt = values.cache_salt != nullptr;
         if (!has_lora && !has_salt) {
             out->push_back(0xf6U);
+        } else if (values.tagged_extra_keys) {
+            // [["cache_salt", salt]]: cbor2 encodes tuples as arrays.
+            AppendArrayHeader(1, out);
+            AppendArrayHeader(2, out);
+            AppendText(kCacheSaltTag, out);
+            AppendText(*values.cache_salt, out);
         } else {
             AppendArrayHeader(
                 static_cast<size_t>(has_lora) + static_cast<size_t>(has_salt),
@@ -379,13 +403,28 @@ void PickleEncodeTokenTuple(std::span<const int32_t> tokens,
 }
 
 // Encodes the extras slot: Python None when there are no extra keys,
-// otherwise the (LoRA, salt) string tuple in vLLM's ordering.  The caller
-// must have executed the save-entry checkpoint for this value already.
+// otherwise the (LoRA, salt) string tuple in vLLM's ordering, or for tagged
+// values the ((tag, salt),) tuple of tuples.  The caller must have executed
+// the save-entry checkpoint for this value already.
 void PickleEncodeExtras(const VllmBlockValues& values, PickleStream* stream) {
     const bool has_lora = values.lora_name != nullptr;
     const bool has_salt = values.cache_salt != nullptr;
     if (!has_lora && !has_salt) {
         stream->Write(kPickleNone);
+        return;
+    }
+    if (values.tagged_extra_keys) {
+        // Outer 1-tuple holding the inner ("cache_salt", salt) 2-tuple; each
+        // nested save() starts with a frame checkpoint.
+        stream->Checkpoint();  // save(("cache_salt", salt))
+        stream->Checkpoint();  // save("cache_salt")
+        PickleEncodeString(kCacheSaltTag, stream);
+        stream->Checkpoint();  // save(salt)
+        PickleEncodeString(*values.cache_salt, stream);
+        stream->Write(kPickleTuple2);
+        stream->Write(kPickleMemoize);
+        stream->Write(kPickleTuple1);
+        stream->Write(kPickleMemoize);
         return;
     }
     if (has_lora) {
@@ -576,7 +615,7 @@ std::string ValidateProfileSelectors(std::string_view strategy,
         if (error_field != nullptr) *error_field = field;
         return message;
     };
-    if (strategy != "vllm_v1" && strategy != "sglang" &&
+    if (!IsVllmV1Strategy(strategy) && strategy != "sglang" &&
         strategy != "sglang_bigram") {
         return reject("strategy",
                       "unsupported hash strategy: " + std::string(strategy));
@@ -608,12 +647,14 @@ std::string ValidatePythonHashSeed(std::string_view seed) {
     if (!IsValidUtf8(seed)) {
         return "python_hash_seed must contain valid UTF-8";
     }
-    if (seed == "random") {
+    // "vllm-none-hash" is the seed vLLM (v0.29+) uses for cryptographic block
+    // hashes when PYTHONHASHSEED is unset (kv_cache_utils.
+    // DEFAULT_NONE_HASH_SEED); it is matched exactly, like "random".
+    if (seed == "random" || seed == kVllmDefaultNoneHashSeed) {
         return "";
     }
     if (seed.empty()) {
-        return "python_hash_seed must be \"random\" or ASCII decimal text in "
-               "0..4294967295";
+        return std::string(kInvalidSeedMessage);
     }
 
     // Accepts only bare ASCII decimal digits: the default options reject a
@@ -623,8 +664,7 @@ std::string ValidatePythonHashSeed(std::string_view seed) {
     // error.
     const auto value = TryParseInteger<uint64_t>(seed);
     if (!value.has_value()) {
-        return "python_hash_seed must be \"random\" or ASCII decimal text in "
-               "0..4294967295";
+        return std::string(kInvalidSeedMessage);
     }
     if (*value > kMaxPythonHashSeed) {
         return "python_hash_seed must be in range 0..4294967295";
@@ -651,7 +691,7 @@ std::string ValidateResolvedHashProfileShape(const HashProfile& profile) {
         !error.empty()) {
         return error;
     }
-    if (profile.strategy == "vllm_v1") {
+    if (IsVllmV1Strategy(profile.strategy)) {
         if (auto error = ValidatePythonHashSeed(profile.python_hash_seed);
             !error.empty()) {
             return error;
@@ -686,12 +726,13 @@ ProjectedPrefix ProjectDigest(
 // cached, so prefix-index walks that stall early never hash the tail.
 class VllmV1HashChain final : public HashChain {
    public:
-    VllmV1HashChain(const VllmValueCodec* codec,
+    VllmV1HashChain(const VllmValueCodec* codec, bool tagged_extra_keys,
                     std::array<uint8_t, kSha256DigestSize> root_digest,
                     const ContextKey& context,
                     std::span<const int32_t> token_ids,
                     std::optional<std::string> cache_salt)
         : codec_(codec),
+          tagged_extra_keys_(tagged_extra_keys),
           parent_(std::move(root_digest)),
           lora_name_(context.lora_name),
           cache_salt_(std::move(cache_salt)),
@@ -708,6 +749,7 @@ class VllmV1HashChain final : public HashChain {
     // Validates inputs eagerly (same contract as Compute). Returns an empty
     // string on success.
     static std::string ValidateInputs(const ContextKey& context,
+                                      bool tagged_extra_keys,
                                       std::optional<std::string> cache_salt) {
         if (context.block_size <= 0 ||
             static_cast<uint64_t>(context.block_size) >
@@ -716,6 +758,9 @@ class VllmV1HashChain final : public HashChain {
         }
         if (!IsValidUtf8(context.lora_name)) {
             return "lora_name must contain valid UTF-8";
+        }
+        if (tagged_extra_keys && !context.lora_name.empty()) {
+            return std::string(kTaggedLoraUnsupportedMessage);
         }
         if (cache_salt.has_value() && !IsValidUtf8(*cache_salt)) {
             return "cache_salt must contain valid UTF-8";
@@ -759,6 +804,7 @@ class VllmV1HashChain final : public HashChain {
                     token_ids_.subspan(block_index * block_size_, block_size_),
                 .lora_name = has_lora ? &lora_name_ : nullptr,
                 .cache_salt = has_salt ? &*cache_salt_ : nullptr,
+                .tagged_extra_keys = tagged_extra_keys_,
             };
 
             codec_->EncodeBlock(values, &encoded_);
@@ -802,6 +848,7 @@ class VllmV1HashChain final : public HashChain {
 #endif
 
     const VllmValueCodec* codec_;
+    bool tagged_extra_keys_;
     std::array<uint8_t, kSha256DigestSize> parent_;
     std::string lora_name_;
     std::optional<std::string> cache_salt_;
@@ -818,9 +865,11 @@ class VllmV1HashChain final : public HashChain {
 
 class VllmV1HashStrategy final : public HashStrategy {
    public:
-    VllmV1HashStrategy(const VllmValueCodec* codec,
+    VllmV1HashStrategy(const VllmValueCodec* codec, bool tagged_extra_keys,
                        std::array<uint8_t, kSha256DigestSize> root_digest)
-        : codec_(codec), root_digest_(std::move(root_digest)) {}
+        : codec_(codec),
+          tagged_extra_keys_(tagged_extra_keys),
+          root_digest_(std::move(root_digest)) {}
 
     std::string Compute(const ContextKey& context,
                         std::span<const int32_t> token_ids,
@@ -855,8 +904,8 @@ class VllmV1HashStrategy final : public HashStrategy {
         const ContextKey& context, std::span<const int32_t> token_ids,
         std::optional<std::string> cache_salt,
         std::string* error) const override {
-        if (std::string validation_error =
-                VllmV1HashChain::ValidateInputs(context, cache_salt);
+        if (std::string validation_error = VllmV1HashChain::ValidateInputs(
+                context, tagged_extra_keys_, cache_salt);
             !validation_error.empty()) {
             if (error != nullptr) {
                 *error = std::move(validation_error);
@@ -864,11 +913,13 @@ class VllmV1HashStrategy final : public HashStrategy {
             return nullptr;
         }
         return std::make_unique<VllmV1HashChain>(
-            codec_, root_digest_, context, token_ids, std::move(cache_salt));
+            codec_, tagged_extra_keys_, root_digest_, context, token_ids,
+            std::move(cache_salt));
     }
 
    private:
     const VllmValueCodec* codec_;
+    bool tagged_extra_keys_;
     std::array<uint8_t, kSha256DigestSize> root_digest_;
 };
 
@@ -1243,7 +1294,21 @@ std::unique_ptr<HashStrategy> CreateHashStrategy(
         return nullptr;
     }
     return std::make_unique<VllmV1HashStrategy>(
-        codec, DecodeRootDigest(profile.root_digest));
+        codec, profile.strategy == kVllmV1TaggedStrategy,
+        DecodeRootDigest(profile.root_digest));
+}
+
+bool IsVllmV1Strategy(std::string_view strategy) {
+    return strategy == kVllmV1Strategy || strategy == kVllmV1TaggedStrategy;
+}
+
+std::string ValidateHashProfileForContext(const HashProfile& profile,
+                                          const ContextKey& context) {
+    if (profile.strategy == kVllmV1TaggedStrategy &&
+        !context.lora_name.empty()) {
+        return std::string(kTaggedLoraUnsupportedMessage);
+    }
+    return "";
 }
 
 std::string DigestToHex(const std::array<uint8_t, 32>& digest) {

@@ -7,6 +7,8 @@
 #include <set>
 #include <string>
 
+#include "conductor/prefixindex/hash_strategy.h"
+
 namespace mooncake::conductor::prefixindex {
 namespace {
 
@@ -33,7 +35,7 @@ std::string ResolveVllmDeployment(const common::ServiceConfig& service,
     const auto* model = FindModelCacheSpec(service.model_name);
     if (!result || !model || !model->checkpoints || model->sliding_window ||
         service.publisher_kind != common::PublisherKind::kVllm ||
-        service.hash_profile.strategy != "vllm_v1")
+        !IsVllmV1Strategy(service.hash_profile.strategy))
         return "unsupported vLLM deployment/model";
     if (declaration.empty() || declaration.size() > 65536)
         return "cache layout declaration must contain at most 65536 bytes";

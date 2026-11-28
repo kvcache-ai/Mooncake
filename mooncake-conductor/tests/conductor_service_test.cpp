@@ -2,7 +2,10 @@
 
 #include <gtest/gtest.h>
 
+#include <string>
+
 #include "conductor/kvevent/event_manager.h"
+#include "conductor/prefixindex/hash_strategy.h"
 #include "event_manager_test_peer.h"
 
 namespace mooncake::conductor::kvevent {
@@ -44,6 +47,36 @@ TEST(ConductorServiceTest, RegisterRejectsInvalidConfig) {
     auto result = manager.GetService().Register(svc);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+// vllm_v1_tagged cannot hash LoRA blocks without the adapter path, so every
+// publisher kind, including Mooncake object-key publishers that skip engine
+// registration, must reject that combination.
+TEST(ConductorServiceTest, ValidateServiceConfigRejectsTaggedLoraForAllKinds) {
+    common::ServiceConfig svc;
+    svc.endpoint = "tcp://127.0.0.1:29988";
+    svc.model_name = "m";
+    svc.tenant_id = "default";
+    svc.instance_id = "inst-tagged";
+    svc.block_size = 16;
+    ASSERT_TRUE(
+        prefixindex::ResolveHashProfile({.strategy = "vllm_v1_tagged",
+                                         .algorithm = "sha256",
+                                         .python_hash_seed = "0",
+                                         .index_projection = "low64_be"},
+                                        &svc.hash_profile)
+            .empty());
+
+    for (const auto kind :
+         {common::PublisherKind::kVllm, common::PublisherKind::kMooncake}) {
+        SCOPED_TRACE(std::string(common::PublisherKindName(kind)));
+        svc.publisher_kind = kind;
+        svc.lora_name.clear();
+        EXPECT_EQ(ValidateServiceConfig(svc), "");
+        svc.lora_name = "adapter-a";
+        EXPECT_NE(ValidateServiceConfig(svc).find("lora_path"),
+                  std::string::npos);
+    }
 }
 
 TEST(ConductorServiceTest, RegisterNormalizesEmptyTenantId) {

@@ -4,6 +4,7 @@
 
 #include "ascii_string.h"
 #include "conductor/kvevent/object_key_parser.h"
+#include "conductor/prefixindex/hash_strategy.h"
 #include "conductor/prefixindex/hybrid_index.h"
 #include "conductor/prefixindex/layout_parser.h"
 
@@ -89,7 +90,9 @@ std::string ObjectMutation(const common::ServiceConfig& service,
         return "object hash must be a 64- or 16-character hex digest";
     uint64_t projected = 0;
     const size_t start =
-        service.hash_profile.strategy == "vllm_v1" ? hash.size() - 16 : 0;
+        prefixindex::IsVllmV1Strategy(service.hash_profile.strategy)
+            ? hash.size() - 16
+            : 0;
     for (size_t i = 0; i < hash.size(); ++i) {
         const char ch = hash[i];
         const int digit = ch >= '0' && ch <= '9'   ? ch - '0'
