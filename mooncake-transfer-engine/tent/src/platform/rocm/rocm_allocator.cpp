@@ -13,15 +13,36 @@
 // limitations under the License.
 
 #include "tent/platform/rocm.h"
+#include "tent/platform/rocm_gem.h"
 #include "tent/common/status.h"
 
 #include <hip/hip_runtime.h>
 #include <numa.h>
 #include <glog/logging.h>
+#include <unistd.h>
 #include <vector>
 
 namespace mooncake {
 namespace tent {
+
+Status RocmPlatform::exportDmabuf(void* addr, size_t length,
+                                  DmabufExport& out) {
+    out = DmabufExport{};
+    void* base = nullptr;
+    size_t size = 0;
+    int fd = -1;
+    if (!lookupHipGemBuffer(addr, &base, &size, &fd, nullptr))
+        return Platform::exportDmabuf(addr, length, out);
+    if ((uintptr_t)addr + length > (uintptr_t)base + size) {
+        ::close(fd);
+        return Status::InvalidArgument(
+            "buffer runs past its amdgpu GEM allocation" LOC_MARK);
+    }
+    out.fd = fd;
+    out.offset = (uintptr_t)addr - (uintptr_t)base;
+    out.close_fd = true;
+    return Status::OK();
+}
 
 Status RocmPlatform::allocate(void** pptr, size_t size,
                               MemoryOptions& options) {

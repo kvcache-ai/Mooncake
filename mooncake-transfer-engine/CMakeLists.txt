@@ -103,6 +103,11 @@ if (USE_MNNVL OR USE_CUDA OR USE_HIP OR USE_MUSA OR USE_MACA OR USE_SUPA)
   add_subdirectory(nvlink-allocator)
 endif()
 
+# amdgpu GEM-backed device buffers for RDMA (mooncake.allocator.HipGemAllocator)
+if (USE_HIP)
+  add_subdirectory(hip-gem-allocator)
+endif()
+
 # Build ubshmem allocator for Huawei NPU fabric memory
 if (USE_UBSHMEM)
   add_subdirectory(ubshmem-allocator)

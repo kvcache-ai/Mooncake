@@ -34,6 +34,9 @@
 
 #include "tent/common/status.h"
 #include "tent/common/utils/ip.h"
+#ifdef USE_HIP
+#include "tent/platform/rocm_gem.h"
+#endif
 #include "tent/transport/rdma/buffers.h"
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/workers.h"
@@ -766,6 +769,12 @@ bool RdmaTransport::warmupMemory(void* addr, size_t length) {
     if (memory_type == MTYPE_XPU || memory_type == MTYPE_MLU ||
         memory_type == MTYPE_CUDA)
         return false;
+#ifdef USE_HIP
+    // ibv_reg_mr of an amdgpu GEM BO reaches the peer-memory client's NULL
+    // kfd_bo dereference (rocm_gem.h).
+    if (lookupHipGemBuffer(addr, nullptr, nullptr, nullptr, nullptr))
+        return false;
+#endif
     unsigned hwc = std::thread::hardware_concurrency();
     if (hwc < 4) return false;
     RdmaContext* warmup_ctx = nullptr;

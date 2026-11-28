@@ -1564,6 +1564,9 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
 bool RdmaTransport::acquireKfdPinAnchor(void *addr, const DmabufExport &exp) {
 #ifdef USE_HIP_DMABUF
     auto &state = kfdPinAnchorState();
+    // A GEM BO is charged once already, and the anchor is an ibv_reg_mr,
+    // which the amdgpu peer-memory client cannot take for a GEM BO.
+    if (exp.amdgpu_gem) return false;
     if (!exp.alloc_base || state.load() == kKfdPinNoAnchor) return false;
     if (state.load() == kKfdPinUnprobed) {
         ibv_pd *pd = nullptr;
