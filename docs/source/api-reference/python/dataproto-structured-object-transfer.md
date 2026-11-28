@@ -65,6 +65,8 @@ For process boundaries, use `export_dataproto_ref(ref)`. The exported handle is 
 
 Duplicate field names are rejected by default. Use `overwrite=True` only when replacing all fields from an existing stage; after the new stage object is written successfully, the old stage object is removed.
 
+`append_dataproto_fields()` appends whole fields; it cannot write a subset of rows of an existing field. Use the catalog path below for row-sharded writeback.
+
 Field names are global within a ref. A `batch` field and a `non_tensor_batch` field cannot use the same name.
 
 ## Reading fields
@@ -124,6 +126,47 @@ The result is a plain dictionary when `data_cls` is omitted:
 ```
 
 If `data_cls` is provided, Mooncake first tries `data_cls.from_dict(batch, non_tensor_batch, meta_info=meta_info)`, then falls back to `data_cls(batch=..., non_tensor_batch=..., meta_info=...)`.
+
+## Multi-rank sharded writeback
+
+When workers own disjoint row ranges of one logical batch, each worker can put its own fragment and the driver can merge references instead of gathering tensors:
+
+```python
+from mooncake.dataproto_catalog import DataProtoCatalog, DataProtoCatalogTransfer
+
+# Worker i: write its own rows and return the exported handle.
+shard = transfer.put_dataproto({"old_log_probs": worker_rows}, partition="step-1", stage="rollout")
+handle = export_dataproto_ref(shard)
+
+# Driver: register every shard under its logical row keys, then read one batch.
+catalog = DataProtoCatalog()
+client = DataProtoCatalogTransfer(
+    transfer,
+    lambda method, *args, **kwargs: getattr(catalog, method)(*args, **kwargs),
+)
+for keys, handle in shards:
+    client.register("step-1", keys, handle)
+
+batch = client.read("step-1", all_keys, fields=["old_log_probs"])
+```
+
+`read()` resolves the keys, issues one ranged read per contiguous fragment run, copies each run into memory owned by the result, releases that run's buffer, and returns rows in `keys` order. Fragments stay ordinary immutable DataProto objects; the catalog only indexes `(key, field)` to `(fragment, row)`, so nothing is rewritten in place. `register()` accepts fragments written by other processes, while `put()` covers writers that publish through the same client.
+
+Pass `data_cls` to `read()` to build a DataProto-like object instead of a plain dict; the same constructor rules as `get_dataproto()` apply. Each field's row count is checked against the number of keys, so a truncated fragment fails instead of returning a short batch.
+
+All writers and the driver must use the same `key_prefix`, because bundle manifests are scoped to that namespace.
+
+`register()` takes ownership of the fragment by default, so appended fields and cleanup follow the catalog lifecycle; pass `managed=False` to keep a fragment metadata-only.
+
+Registering a fragment that would take over a field already owned by another fragment fails, which catches a rank writing the wrong key range. Registering the handle already stored for a fragment reuses that fragment, including after an append replaces its manifest key, and does not retire its objects. The same keys leave the mapping unchanged; a different key order updates it. Pass `overwrite=True` to replace a field with a different fragment.
+
+The keys passed to `register()` must follow the row order of that fragment; Mooncake does not store row ids inside the payload, so a mismatched order reads back mismatched rows.
+
+Fragment objects live in the segment registered by the writer's store client. Keep that client open until the driver's `read()` finishes: once the writer closes its store or exits, its segment is unmounted and the fragment can no longer be read.
+
+One driver may call the transfer from several threads; catalog calls are serialized. A second process that only reads should register with `managed=False`, so that exactly one owner deletes fragments.
+
+Appends only take effect through the catalog that indexes the fragment: a writer that appends on its own handle gets a new handle the driver never sees. Likewise, after handing a handle to a managed registration, the writer should not clean it up itself.
 
 ## Tensor and ndarray behavior
 

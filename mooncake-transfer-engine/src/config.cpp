@@ -383,6 +383,17 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    if (const char* max_seg_size_env = std::getenv("MC_MAX_SEG_SIZE")) {
+        const auto parsed = TryParseInteger<uint64_t>(
+            max_seg_size_env, {.trim_ascii_whitespace = true});
+        if (parsed.has_value() && *parsed > 0) {
+            config.max_seg_size = *parsed;
+        } else {
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_MAX_SEG_SIZE";
+        }
+    }
+
     const char* retry_cnt_env = std::getenv("MC_RETRY_CNT");
     if (retry_cnt_env) {
         size_t val = atoi(retry_cnt_env);
@@ -1014,6 +1025,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "gid_index = " << config.gid_index;
     LOG(INFO) << "pkey_index = " << config.pkey_index;
     LOG(INFO) << "max_mr_size = " << config.max_mr_size;
+    LOG(INFO) << "max_seg_size = " << config.max_seg_size;
     LOG(INFO) << "max_cqe = " << config.max_cqe;
     LOG(INFO) << "max_ep_per_ctx = " << config.max_ep_per_ctx;
     LOG(INFO) << "num_qp_per_ep = " << config.num_qp_per_ep;

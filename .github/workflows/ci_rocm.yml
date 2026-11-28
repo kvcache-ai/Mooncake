@@ -94,7 +94,7 @@ jobs:
         apt-get update -y
         apt-get install -y --no-install-recommends \
           curl build-essential sudo pkg-config \
-          ninja-build lld
+          ninja-build
         # hipify-perl is required by the CMake USE_HIP path.
         echo "/opt/rocm/bin" >> "$GITHUB_PATH"
 
@@ -134,6 +134,7 @@ jobs:
       run: |
         set -eo pipefail
         export PATH="/opt/rocm/bin:$PATH"   # hipify-perl for USE_HIP
+        # Keep the default linker so pybind11's GCC LTO objects link correctly.
         rm -rf build && mkdir build && cd build
         cmake -G Ninja .. \
           -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DWITH_CONDUCTOR=ON \
@@ -141,7 +142,6 @@ jobs:
           -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON \
           -DBUILD_UNIT_TESTS=OFF -DBUILD_BENCHMARK=OFF \
           -DENABLE_DEBUG_SYMBOLS=OFF -DENABLE_SCCACHE=ON \
-          -DCMAKE_PROJECT_INCLUDE="$GITHUB_WORKSPACE/scripts/ci/cmake_lld.cmake" \
           -DCMAKE_BUILD_TYPE=Release \
           -DPython3_EXECUTABLE="${PYTHON_BIN}"
 

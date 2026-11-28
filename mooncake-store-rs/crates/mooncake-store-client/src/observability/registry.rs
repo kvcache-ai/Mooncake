@@ -1,16 +1,14 @@
 #![allow(dead_code)]
 
-use std::borrow::Borrow;
 #[cfg(test)]
 use std::cell::RefCell;
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use mooncake_store_core::{
-    ClientLease, ClientLifecycleState, ColdTierDeviceState, ObjectKey, ObjectRoute, ReplicaTier,
-    SegmentAnnouncement, SegmentLifecycleState,
+    ClientLease, ClientLifecycleState, ColdTierDeviceState, SegmentAnnouncement,
+    SegmentLifecycleState,
 };
 
 use super::process::ProcessSnapshot;
@@ -547,105 +545,6 @@ struct OperationMetricState {
 
 type OperationKey = (&'static str, &'static str);
 
-#[derive(Default)]
-struct RouteGauges {
-    // Keep one contribution per key, matching the route event sink's overwrite semantics.
-    by_key: BTreeMap<String, Vec<ReplicaDistributionKey>>,
-    objects_by_tenant: BTreeMap<String, u64>,
-    replicas_by_runtime: BTreeMap<ReplicaDistributionKey, u64>,
-}
-
-impl RouteGauges {
-    fn record(&mut self, key: &ObjectKey, replicas: Vec<ReplicaDistributionKey>) {
-        let replicas = match self.by_key.entry(key.0.clone()) {
-            Entry::Vacant(entry) => {
-                increment_route_count(&mut self.objects_by_tenant, object_key_tenant(entry.key()));
-                entry.insert(replicas)
-            }
-            Entry::Occupied(mut entry) => {
-                if entry.get() == &replicas {
-                    return;
-                }
-                for replica in entry.insert(replicas) {
-                    decrement_route_count(&mut self.replicas_by_runtime, &replica);
-                }
-                entry.into_mut()
-            }
-        };
-        for replica in replicas.iter() {
-            increment_route_count(&mut self.replicas_by_runtime, replica);
-        }
-    }
-
-    fn remove(&mut self, key: &ObjectKey) {
-        if let Some(replicas) = self.by_key.remove(&key.0) {
-            decrement_route_count(&mut self.objects_by_tenant, object_key_tenant(&key.0));
-            for replica in replicas {
-                decrement_route_count(&mut self.replicas_by_runtime, &replica);
-            }
-        }
-    }
-
-    fn object_snapshot(&self) -> Vec<GaugeSample<TenantKey>> {
-        self.objects_by_tenant
-            .iter()
-            .map(|(tenant, count)| GaugeSample {
-                key: TenantKey {
-                    tenant: tenant.clone(),
-                },
-                value: *count as f64,
-            })
-            .collect()
-    }
-
-    fn replica_snapshot(&self) -> Vec<GaugeSample<ReplicaDistributionKey>> {
-        self.replicas_by_runtime
-            .iter()
-            .map(|(key, count)| GaugeSample {
-                key: key.clone(),
-                value: *count as f64,
-            })
-            .collect()
-    }
-}
-
-fn increment_route_count<K, Q>(counts: &mut BTreeMap<K, u64>, key: &Q)
-where
-    K: Borrow<Q> + Ord,
-    Q: ToOwned<Owned = K> + Ord + ?Sized,
-{
-    if let Some(count) = counts.get_mut(key) {
-        *count += 1;
-    } else {
-        counts.insert(key.to_owned(), 1);
-    }
-}
-
-fn decrement_route_count<K, Q>(counts: &mut BTreeMap<K, u64>, key: &Q)
-where
-    K: Borrow<Q> + Ord,
-    Q: Ord + ?Sized,
-{
-    let count = counts
-        .get_mut(key)
-        .expect("missing route gauge contribution");
-    *count -= 1;
-    if *count == 0 {
-        counts.remove(key);
-    }
-}
-
-fn route_replica_labels(route: &ObjectRoute) -> Vec<ReplicaDistributionKey> {
-    route
-        .replicas
-        .iter()
-        .map(|replica| ReplicaDistributionKey {
-            runtime: replica.owner.to_string(),
-            tier: replica_tier_label(replica.tier),
-        })
-        .collect()
-}
-
 struct MetricsRegistry {
     tenant: String,
     operations: BTreeMap<OperationKey, OperationMetricState>,
@@ -654,7 +553,6 @@ struct MetricsRegistry {
     request_inflight: GaugeFamily<RequestInflightKey>,
     request_duration: HistogramFamily<RequestKey>,
     segments: BTreeMap<(String, String), SegmentSample>,
-    routes: RouteGauges,
     runtime_leases: BTreeMap<String, RuntimeLeaseMetric>,
     heartbeat_consecutive_failures: GaugeFamily<RuntimeKey>,
     heartbeat_last_success_ms: GaugeFamily<RuntimeKey>,
@@ -741,7 +639,6 @@ impl Default for MetricsRegistry {
             request_inflight: GaugeFamily::default(),
             request_duration: HistogramFamily::default(),
             segments: BTreeMap::new(),
-            routes: RouteGauges::default(),
             runtime_leases: BTreeMap::new(),
             heartbeat_consecutive_failures: GaugeFamily::default(),
             heartbeat_last_success_ms: GaugeFamily::default(),
@@ -841,7 +738,6 @@ impl SharedMetricsRegistry {
         self.inner.lock().expect("metrics lock poisoned")
     }
 
-    #[cfg(test)]
     fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -937,8 +833,8 @@ impl MetricsRegistry {
             request_inflight: self.request_inflight.snapshot(),
             request_duration: self.request_duration.snapshot(),
             segments: self.segments.values().cloned().collect(),
-            object_routes: self.routes.object_snapshot(),
-            replica_distribution: self.routes.replica_snapshot(),
+            object_routes: Vec::new(),
+            replica_distribution: Vec::new(),
             runtime_status: self.runtime_status_snapshot(),
             runtime_lease_expires_at_ms: self.runtime_lease_snapshot(),
             heartbeat_consecutive_failures: self.heartbeat_consecutive_failures.snapshot(),
@@ -1555,18 +1451,6 @@ pub(crate) fn record_segment_removed(announcement: &SegmentAnnouncement) {
         .insert((sample.runtime.clone(), sample.segment.clone()), sample);
 }
 
-pub(crate) fn record_route(route: &ObjectRoute) {
-    let replicas = route_replica_labels(route);
-    global_metrics_registry()
-        .lock()
-        .routes
-        .record(&route.key, replicas);
-}
-
-pub(crate) fn remove_route(key: &ObjectKey) {
-    global_metrics_registry().lock().routes.remove(key);
-}
-
 pub(crate) fn record_segment_lifecycle(action: &'static str, result: &'static str) {
     global_metrics_registry()
         .lock()
@@ -1962,14 +1846,21 @@ pub(crate) fn snapshot_metrics_with_registry(
     registry: &SharedMetricsRegistry,
     process: ProcessSnapshot,
 ) -> MetricsSnapshot {
+    let is_global = registry.ptr_eq(global_metrics_registry());
+    // Route mutations can call the event sink under an authority write lock.
+    // Collect authority gauges before taking the global metrics mutex.
+    let gauges = is_global.then(mooncake_store_route::snapshot_route_gauges);
     #[cfg(test)]
-    if registry.ptr_eq(global_metrics_registry()) {
-        return registry
-            .lock()
-            .snapshot_with_tenant(process, test_process_tenant_label());
+    let tenant_override = is_global.then(test_process_tenant_label).flatten();
+    #[cfg(not(test))]
+    let tenant_override = None;
+    let mut snapshot = registry
+        .lock()
+        .snapshot_with_tenant(process, tenant_override);
+    if let Some(gauges) = gauges {
+        apply_route_gauges(&mut snapshot, gauges);
     }
-
-    registry.lock().snapshot(process)
+    snapshot
 }
 
 #[cfg(test)]
@@ -2024,13 +1915,6 @@ fn segment_identity(announcement: &SegmentAnnouncement) -> (String, String) {
     )
 }
 
-fn object_key_tenant(key: &str) -> &str {
-    key.split_once("::")
-        .or_else(|| key.split_once('/'))
-        .map(|(tenant, _)| tenant)
-        .unwrap_or("default")
-}
-
 fn segment_sample(announcement: &SegmentAnnouncement) -> SegmentSample {
     SegmentSample {
         runtime: announcement.owner.to_string(),
@@ -2060,15 +1944,6 @@ fn client_state_label(state: ClientLifecycleState) -> &'static str {
     }
 }
 
-fn replica_tier_label(tier: ReplicaTier) -> &'static str {
-    match tier {
-        ReplicaTier::Dram => "dram",
-        ReplicaTier::Nvme => "nvme",
-        ReplicaTier::File => "file",
-        ReplicaTier::Unknown => "unknown",
-    }
-}
-
 fn cold_tier_device_state_label(state: ColdTierDeviceState) -> &'static str {
     match state {
         ColdTierDeviceState::Unregistered => "unregistered",
@@ -2080,139 +1955,94 @@ fn cold_tier_device_state_label(state: ColdTierDeviceState) -> &'static str {
     }
 }
 
+fn apply_route_gauges(
+    snapshot: &mut MetricsSnapshot,
+    gauges: mooncake_store_route::RouteGaugeSnapshot,
+) {
+    snapshot.object_routes = gauges
+        .objects_by_tenant
+        .into_iter()
+        .map(|(tenant, count)| GaugeSample {
+            key: TenantKey { tenant },
+            value: count as f64,
+        })
+        .collect();
+    snapshot.replica_distribution = gauges
+        .replicas_by_runtime
+        .into_iter()
+        .flat_map(|(runtime, tiers)| {
+            let runtime = runtime.to_string();
+            tiers.into_iter().map(move |(tier, count)| GaugeSample {
+                key: ReplicaDistributionKey {
+                    runtime: runtime.clone(),
+                    tier,
+                },
+                value: count as f64,
+            })
+        })
+        .collect();
+    // Preserve the existing ordering by exported label, including numeric epochs.
+    snapshot
+        .replica_distribution
+        .sort_by(|left, right| left.key.cmp(&right.key));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mooncake_store_core::{
-        ClientEpoch, ClientRuntimeId, CompatibilityDescriptor, ReplicaRoute, RouteState,
-        RouteVersion, SegmentName,
-    };
+    use mooncake_store_core::{ClientEpoch, ClientRuntimeId};
+    use mooncake_store_route::RouteGaugeSnapshot;
 
-    fn route(key: &str, replicas: &[(&str, ReplicaTier)]) -> ObjectRoute {
-        ObjectRoute {
-            key: ObjectKey::new(key),
-            namespace: None,
-            logical_key: None,
-            canonical_key: None,
-            sharing_scope: None,
-            qos_tier: None,
-            version: RouteVersion(1),
-            state: RouteState::Active,
-            compatibility: CompatibilityDescriptor::default(),
-            replicas: replicas
+    #[test]
+    fn route_gauge_export_preserves_labels_counts_and_order() {
+        let gauges = RouteGaugeSnapshot {
+            objects_by_tenant: BTreeMap::from([
+                ("tenant-a".to_string(), 3),
+                ("default".to_string(), 1),
+            ]),
+            replicas_by_runtime: BTreeMap::from([
+                (
+                    ClientRuntimeId::new("owner", ClientEpoch(2)),
+                    BTreeMap::from([("dram", 2)]),
+                ),
+                (
+                    ClientRuntimeId::new("owner", ClientEpoch(10)),
+                    BTreeMap::from([("dram", 1), ("nvme", 3)]),
+                ),
+            ]),
+        };
+        let mut snapshot = MetricsSnapshot::default();
+        apply_route_gauges(&mut snapshot, gauges);
+        assert_eq!(
+            snapshot
+                .object_routes
                 .iter()
-                .enumerate()
-                .map(|(index, (owner, tier))| ReplicaRoute {
-                    owner: ClientRuntimeId::new(*owner, ClientEpoch(1)),
-                    segment_name: SegmentName::new(format!("segment-{index}")),
-                    allocation_id: Some(index as u64),
-                    offset: Some(0),
-                    segment_offset: 0,
-                    length: 1,
-                    checksum: None,
-                    tier: *tier,
-                    priority: index as u16,
-                })
-                .collect(),
-            cold_backing: None,
-            nof_backing: None,
-        }
-    }
-
-    #[test]
-    fn route_metrics_handle_empty_identical_and_duplicate_replicas() {
-        let mut gauges = RouteGauges::default();
-        let empty = route("tenant-a::key", &[]);
-        gauges.record(&empty.key, route_replica_labels(&empty));
-        gauges.record(&empty.key, route_replica_labels(&empty));
-        assert_eq!(gauges.object_snapshot()[0].value, 1.0);
-        assert!(gauges.replica_snapshot().is_empty());
-
-        let duplicates = route(
-            "tenant-a::key",
-            &[
-                ("runtime-a", ReplicaTier::Dram),
-                ("runtime-a", ReplicaTier::Dram),
-            ],
+                .map(|sample| (sample.key.tenant.as_str(), sample.value))
+                .collect::<Vec<_>>(),
+            vec![("default", 1.0), ("tenant-a", 3.0)]
         );
-        gauges.record(&duplicates.key, route_replica_labels(&duplicates));
-        gauges.record(&duplicates.key, route_replica_labels(&duplicates));
-        assert_eq!(gauges.object_snapshot()[0].value, 1.0);
-        let replicas = gauges.replica_snapshot();
-        assert_eq!(replicas.len(), 1);
-        assert_eq!(replicas[0].value, 2.0);
-        gauges.remove(&duplicates.key);
-        gauges.remove(&duplicates.key);
-        assert!(gauges.object_snapshot().is_empty());
-        assert!(gauges.replica_snapshot().is_empty());
+        assert_eq!(
+            snapshot
+                .replica_distribution
+                .iter()
+                .map(|sample| (sample.key.runtime.as_str(), sample.key.tier, sample.value))
+                .collect::<Vec<_>>(),
+            vec![
+                ("owner:10", "dram", 1.0),
+                ("owner:10", "nvme", 3.0),
+                ("owner:2", "dram", 2.0),
+            ]
+        );
+        apply_route_gauges(&mut snapshot, RouteGaugeSnapshot::default());
+        assert!(snapshot.object_routes.is_empty());
+        assert!(snapshot.replica_distribution.is_empty());
     }
 
     #[test]
-    fn incremental_route_gauges_match_full_snapshot() {
-        use ReplicaTier::{Dram, File, Nvme, Unknown};
-
-        let mut registry = MetricsRegistry::default();
-        let mut routes = BTreeMap::<String, ObjectRoute>::new();
-        let keys = [
-            "tenant-a::first",
-            "tenant-a::second",
-            "tenant-b/key",
-            "unscoped",
-        ];
-        let changes: &[Option<&[(&str, ReplicaTier)]>] = &[
-            Some(&[("owner-a", Dram), ("owner-a", Dram), ("owner-b", Nvme)]),
-            Some(&[("owner-b", Nvme), ("owner-a", Dram), ("owner-a", Dram)]),
-            Some(&[("owner-a", File), ("owner-c", Unknown)]),
-            Some(&[]),
-            None,
-            None,
-        ];
-        for round in 0..changes.len() {
-            // Offset each key's changes so removals can leave shared labels in use.
-            for (index, key) in keys.iter().enumerate() {
-                if let Some(replicas) = changes[(round + index) % changes.len()] {
-                    let next = route(key, replicas);
-                    registry
-                        .routes
-                        .record(&next.key, route_replica_labels(&next));
-                    routes.insert(key.to_string(), next);
-                } else {
-                    registry.routes.remove(&ObjectKey::new(*key));
-                    routes.remove(*key);
-                }
-
-                let mut counts_by_tenant = BTreeMap::<TenantKey, f64>::new();
-                let mut counts_by_replica = BTreeMap::<ReplicaDistributionKey, f64>::new();
-                for route in routes.values() {
-                    let tenant = object_key_tenant(&route.key.0).to_owned();
-                    *counts_by_tenant.entry(TenantKey { tenant }).or_default() += 1.0;
-                    for replica in &route.replicas {
-                        *counts_by_replica
-                            .entry(ReplicaDistributionKey {
-                                runtime: replica.owner.to_string(),
-                                tier: replica_tier_label(replica.tier),
-                            })
-                            .or_default() += 1.0;
-                    }
-                }
-                let snapshot = registry.snapshot(ProcessSnapshot::default());
-                assert_eq!(
-                    snapshot
-                        .object_routes
-                        .into_iter()
-                        .map(|sample| (sample.key, sample.value))
-                        .collect::<Vec<_>>(),
-                    counts_by_tenant.into_iter().collect::<Vec<_>>(),
-                );
-                assert_eq!(
-                    snapshot
-                        .replica_distribution
-                        .into_iter()
-                        .map(|sample| (sample.key, sample.value))
-                        .collect::<Vec<_>>(),
-                    counts_by_replica.into_iter().collect::<Vec<_>>(),
-                );
-            }
-        }
+    fn private_metrics_registry_does_not_collect_process_route_gauges() {
+        let registry = new_metrics_registry();
+        let snapshot = snapshot_metrics_with_registry(&registry, ProcessSnapshot::default());
+        assert!(snapshot.object_routes.is_empty());
+        assert!(snapshot.replica_distribution.is_empty());
     }
 }

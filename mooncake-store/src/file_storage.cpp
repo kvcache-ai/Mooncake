@@ -6,11 +6,13 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -563,6 +565,22 @@ FileStorage::LoadBatchShared(const std::vector<std::string>& keys,
         } catch (const std::future_error&) {
             // Preserve the existing abandoned-producer fallback.
             return LoadBatch(keys, sizes, prefer_pinned);
+        }
+    }
+    const int required_waiters =
+        cold_read_waiters_required_for_test_.load(std::memory_order_acquire);
+    if (required_waiters > 0) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (flight.WaiterCount() < required_waiters) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                LOG(ERROR) << "Cold-read leader timed out waiting for "
+                           << required_waiters << " coalesced waiters";
+                auto failure = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                flight.Publish(failure);
+                return failure;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
     }
     auto result = LoadBatch(keys, sizes, prefer_pinned);

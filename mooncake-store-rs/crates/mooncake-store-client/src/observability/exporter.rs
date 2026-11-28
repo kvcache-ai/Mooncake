@@ -121,7 +121,11 @@ fn render_cluster_state_metrics(output: &mut String, snapshot: &MetricsSnapshot)
         ));
     }
 
-    gauge_family(output, OBJECT_ROUTES, "Known object routes by tenant.");
+    gauge_family(
+        output,
+        OBJECT_ROUTES,
+        "Locally retained authority route entries by tenant, including mirrors.",
+    );
     for GaugeSample { key, value } in &snapshot.object_routes {
         let TenantKey { tenant } = key;
         output.push_str(&format!(
@@ -135,7 +139,7 @@ fn render_cluster_state_metrics(output: &mut String, snapshot: &MetricsSnapshot)
     gauge_family(
         output,
         REPLICA_DISTRIBUTION,
-        "Known replicas by runtime and tier.",
+        "Replicas referenced by local authority entries, by runtime and tier.",
     );
     for GaugeSample { key, value } in &snapshot.replica_distribution {
         let ReplicaDistributionKey { runtime, tier } = key;

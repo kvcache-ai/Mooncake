@@ -1,16 +1,16 @@
 use std::sync::{Arc, OnceLock};
 
-use mooncake_store_core::{CasResult, ObjectKey, ObjectRoute};
+use mooncake_store_core::CasResult;
 use parking_lot::RwLock;
 
+/// Event counters for routing operations.
+///
+/// Authority gauges are owned by route tables and collected through
+/// [`crate::snapshot_route_gauges`], independently of the event sink.
 pub trait RouteMetricsSink: Send + Sync {
     fn record_route_repair(&self, operation: &'static str);
 
     fn record_route_cas(&self, outcome: &'static str);
-
-    fn record_route(&self, route: &ObjectRoute);
-
-    fn remove_route(&self, key: &ObjectKey);
 
     fn record_delete_marker_state(&self, entries: u64, bytes: u64, budget_bytes: u64);
 
@@ -23,10 +23,6 @@ impl RouteMetricsSink for NoopRouteMetricsSink {
     fn record_route_repair(&self, _operation: &'static str) {}
 
     fn record_route_cas(&self, _outcome: &'static str) {}
-
-    fn record_route(&self, _route: &ObjectRoute) {}
-
-    fn remove_route(&self, _key: &ObjectKey) {}
 
     fn record_delete_marker_state(&self, _entries: u64, _bytes: u64, _budget_bytes: u64) {}
 
@@ -52,13 +48,6 @@ pub(crate) fn record_cas_outcome(cas: &CasResult) {
         return;
     }
     route_metrics_sink().read().record_route_cas("conflict");
-}
-
-pub(crate) fn record_authoritative_route_update(next: Option<&ObjectRoute>, key: &ObjectKey) {
-    match next {
-        Some(route) => route_metrics_sink().read().record_route(route),
-        None => route_metrics_sink().read().remove_route(key),
-    }
 }
 
 pub(crate) fn record_delete_marker_state(entries: u64, bytes: u64, budget_bytes: u64) {
