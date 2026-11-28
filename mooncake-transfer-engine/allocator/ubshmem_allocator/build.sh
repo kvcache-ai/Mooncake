@@ -2,7 +2,7 @@
 
 set -e
 
-source "$(dirname "$(readlink -f "$0")")/../scripts/allocator_build_common.sh"
+source "$(dirname "$(readlink -f "$0")")/../../scripts/allocator_build_common.sh"
 
 # Get output directory from command line argument, default to current directory
 OUTPUT_DIR=${1:-.}
