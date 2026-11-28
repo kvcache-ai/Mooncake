@@ -1734,10 +1734,8 @@ struct BucketStorageBackend::WritePlan {
     struct HybridWriteRange {
         size_t offset;
         size_t length;
-        bool direct;
     };
     bool hybrid_write = false;
-    FdGuard hybrid_buffered_fd{-1};
     std::vector<HybridWriteRange> hybrid_ranges;
 
     ~WritePlan() {
@@ -1830,20 +1828,36 @@ tl::expected<void, ErrorCode> BucketStorageBackend::PrepareOffload(
                 std::min(static_cast<size_t>(
                              bucket_backend_config_.write_sub_batch_bytes),
                          kChunk));
-            const size_t interior_begin = std::min(kBlock, total);
+            const size_t interior_begin = 0;
             const size_t interior_end = total & ~(kBlock - 1);
-            plan->hybrid_ranges.push_back({0, interior_begin, false});
             for (size_t cursor = interior_begin; cursor < interior_end;) {
                 const size_t until_boundary = kChunk - cursor % kChunk;
                 size_t length =
                     std::min({interior_end - cursor, target, until_boundary});
+                if (cursor == 0 && !plan->iov_ends.empty() &&
+                    plan->iov_ends.front() < length) {
+                    // Split the first chunk at the first key boundary: the
+                    // key lives in a separate buffer, and the data that
+                    // follows stays zero-copy.
+                    length = plan->iov_ends.front();
+                }
                 length -= length % kBlock;
-                plan->hybrid_ranges.push_back({cursor, length, true});
+                if (length == 0) {
+                    // The key boundary left less than one block: copy the
+                    // whole first block through scratch (key bytes plus the
+                    // data that fits behind them).
+                    length = std::min(kBlock, interior_end - cursor);
+                }
+                plan->hybrid_ranges.push_back({cursor, length});
                 cursor += length;
             }
-            if (total > kBlock && interior_end < total) {
+            if (interior_end < total) {
+                // The unaligned tail block is written padded: the executor
+                // copies the real bytes into scratch and submits the full
+                // block. Nothing beyond data_size is ever read back.
+                const size_t padded_end = (total + kBlock - 1) & ~(kBlock - 1);
                 plan->hybrid_ranges.push_back(
-                    {interior_end, total - interior_end, false});
+                    {interior_end, padded_end - interior_end});
             }
             result = write_io_scheduler_->PrepareWriteTasks(
                 state.batch, plan->hybrid_ranges.size(),
@@ -1943,8 +1957,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::InitializeWritePlan(
                 return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
         }
         auto reserved = PrepareEviction(
-            plan.bucket->data_size + plan.bucket->meta_size,
-            plan.bucket->keys);
+            plan.bucket->data_size + plan.bucket->meta_size, plan.bucket->keys);
         if (!reserved) return tl::make_unexpected(reserved.error());
         plan.pending = std::move(*reserved);
         plan.disk_index = plan.pending->disk_index;
@@ -1968,22 +1981,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::InitializeWritePlan(
     plan.file_created = true;
 #ifdef USE_URING
     if (plan.hybrid_write) {
-        if (dynamic_cast<UringFile*>(plan.file.get()) == nullptr) {
+        auto* uring_file = dynamic_cast<UringFile*>(plan.file.get());
+        if (uring_file == nullptr) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-        plan.hybrid_buffered_fd.fd =
-            ::open(path->c_str(), O_WRONLY | O_CLOEXEC);
-        if (plan.hybrid_buffered_fd.fd < 0) {
-            const int err = errno;
-            NotifyDiskError(err, "open");
-            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
         }
 #ifdef __linux__
         // Reserve the file and establish its final size before writing sub-
         // batches, so aligned writes stay within the current EOF.
         int allocated;
         do {
-            allocated = ::fallocate(plan.hybrid_buffered_fd.get(), 0, 0,
+            allocated = ::fallocate(uring_file->fd_for_async_write(), 0, 0,
                                     plan.bucket->data_size);
         } while (allocated != 0 && errno == EINTR);
         if (allocated != 0) {
@@ -2105,56 +2112,6 @@ BucketStorageBackend::PrepareHybridWriteRange(WritePlan& plan,
 #ifdef USE_URING
     const auto& range = plan.hybrid_ranges[range_index];
     const size_t range_end = range.offset + range.length;
-    if (!range.direct) {
-        std::vector<iovec> parts;
-        for (size_t index = 0; index < plan.iovs.size(); ++index) {
-            const size_t source_begin =
-                index == 0 ? 0 : plan.iov_ends[index - 1];
-            const size_t source_end = plan.iov_ends[index];
-            const size_t begin = std::max(range.offset, source_begin);
-            const size_t end = std::min(range_end, source_end);
-            if (begin < end) {
-                parts.push_back({static_cast<char*>(plan.iovs[index].iov_base) +
-                                     begin - source_begin,
-                                 end - begin});
-            }
-        }
-        size_t done = 0;
-        size_t index = 0;
-        while (done < range.length && index < parts.size()) {
-            const int count = static_cast<int>(
-                std::min<size_t>(parts.size() - index, IOV_MAX));
-            const ssize_t written =
-                ::pwritev(plan.hybrid_buffered_fd.fd, parts.data() + index,
-                          count, static_cast<off_t>(range.offset + done));
-            if (written < 0) {
-                if (errno == EINTR) continue;
-                const int err = errno;
-                NotifyDiskError(err, "pwritev");
-                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-            }
-            if (written == 0) {
-                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-            }
-            done += static_cast<size_t>(written);
-            ssize_t advance = written;
-            while (index < parts.size() &&
-                   advance >= static_cast<ssize_t>(parts[index].iov_len)) {
-                advance -= static_cast<ssize_t>(parts[index].iov_len);
-                ++index;
-            }
-            if (index < parts.size() && advance > 0) {
-                parts[index].iov_base =
-                    static_cast<char*>(parts[index].iov_base) + advance;
-                parts[index].iov_len -= static_cast<size_t>(advance);
-            }
-        }
-        if (done != range.length) {
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
-        return std::optional<BatchIoScheduler::WriteRequest>{};
-    }
-
     constexpr size_t kBlock = kDirectIOAlignment;
     if (range.offset % kBlock != 0 || range.length % kBlock != 0 ||
         range.length == 0 || range.length > scratch.size()) {
@@ -2171,7 +2128,8 @@ BucketStorageBackend::PrepareHybridWriteRange(WritePlan& plan,
                          (range.offset - source_begin);
     if (range_end > plan.iov_ends[first] ||
         reinterpret_cast<uintptr_t>(buffer) % kBlock != 0) {
-        for (size_t pos = range.offset, i = first; pos < range_end; ++i) {
+        for (size_t pos = range.offset, i = first;
+             pos < range_end && i < plan.iovs.size(); ++i) {
             const size_t piece_end = std::min(range_end, plan.iov_ends[i]);
             if (pos == piece_end) continue;
             const size_t begin = i == 0 ? 0 : plan.iov_ends[i - 1];
@@ -2196,6 +2154,22 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinishWritePlan(
     WritePlan& plan, tl::expected<void, ErrorCode> result) {
     // Called once, after every data callback has returned, outside queue locks.
     try {
+        if (result) {
+            if (plan.hybrid_write) {
+                // The padded tail write may extend the file to the block
+                // boundary; restore the exact size before publishing
+                // metadata.
+                auto* uring_file = dynamic_cast<UringFile*>(plan.file.get());
+                if (uring_file == nullptr ||
+                    ::ftruncate(uring_file->fd_for_async_write(),
+                                plan.bucket->data_size) != 0) {
+                    LOG(ERROR) << "Failed to restore bucket file size, "
+                                  "bucket_id="
+                               << plan.id;
+                    result = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                }
+            }
+        }
         if (result) {
             result = plan.file->datasync();
             if (!result) NotifyDiskError(plan.file->sys_errno(), "fdatasync");
@@ -2697,9 +2671,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                     actual_offset + static_cast<int64_t>(plan.dest_slice.size);
                 char* const dest = static_cast<char*>(plan.dest_slice.ptr);
                 const bool dest_aligned =
-                    reinterpret_cast<uintptr_t>(dest) %
-                        kDirectIOAlignment ==
-                    0;
+                    reinterpret_cast<uintptr_t>(dest) % kDirectIOAlignment == 0;
 
                 if (!dest_aligned) {
                     // Degraded: one buffered read of the exact range; the
@@ -2748,8 +2720,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                         if (read_descs[i].error == ErrorCode::OK) continue;
                         LOG(ERROR)
                             << "batch_read failed for key: "
-                            << batch_read_plans[i].plan->key
-                            << ", bucket_id="
+                            << batch_read_plans[i].plan->key << ", bucket_id="
                             << batch_read_plans[i].plan->bucket_id
                             << ", error=" << read_descs[i].error
                             << ErrnoSuffix(uring_file->sys_errno());
@@ -2764,8 +2735,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                     if (!desc.completed) {
                         LOG(ERROR)
                             << "batch_read did not complete for key: "
-                            << plan.key
-                            << ", bucket_id=" << plan.bucket_id;
+                            << plan.key << ", bucket_id=" << plan.bucket_id;
                         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                     }
                     if (desc.bytes_read < batch_plan.min_required) {
@@ -2793,8 +2763,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
             }
 
             if (!buffered_reads.empty()) {
-                const int buffered_fd = ::open(
-                    filepath_res.value().c_str(), O_RDONLY | O_CLOEXEC);
+                const int buffered_fd =
+                    ::open(filepath_res.value().c_str(), O_RDONLY | O_CLOEXEC);
                 if (buffered_fd < 0) {
                     const int err = errno;
                     NotifyDiskError(err, "open");
@@ -2809,8 +2779,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                     size_t done = 0;
                     while (done < read.length) {
                         const ssize_t n = ::pread(
-                            buffered_fd,
-                            static_cast<char*>(read.dest) + done,
+                            buffered_fd, static_cast<char*>(read.dest) + done,
                             read.length - done,
                             read.file_offset + static_cast<off_t>(done));
                         if (n < 0) {
@@ -2824,9 +2793,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                                 ErrorCode::FILE_READ_FAIL);
                         }
                         if (n == 0) {
-                            LOG(ERROR) << "hybrid buffered read hit EOF at "
-                                       << read.file_offset +
-                                              static_cast<off_t>(done);
+                            LOG(ERROR)
+                                << "hybrid buffered read hit EOF at "
+                                << read.file_offset + static_cast<off_t>(done);
                             return tl::make_unexpected(
                                 ErrorCode::FILE_READ_FAIL);
                         }
@@ -3886,9 +3855,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
 
     // The UringFile branch below packs data_size bytes; it must not see the
     // padded iovecs of an aligned direct bucket.
-    const bool hybrid_write =
-        bucket_backend_config_.aligned_uring_write &&
-        dynamic_cast<UringFile*>(file.get()) != nullptr;
+    const bool hybrid_write = bucket_backend_config_.aligned_uring_write &&
+                              dynamic_cast<UringFile*>(file.get()) != nullptr;
     if (hybrid_write) {
         // Hybrid bucket write per the write-plan design. The plain bucket
         // layout is one contiguous byte stream, and the plan is assembled
@@ -3936,8 +3904,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             cap > 0 ? cap : std::max<int64_t>(total, kBlock));
         if (want > write_back.capacity) {
             void* wbuf = nullptr;
-            const int ret =
-                posix_memalign(&wbuf, kDirectIOAlignment, want);
+            const int ret = posix_memalign(&wbuf, kDirectIOAlignment, want);
             if (ret != 0) {
                 LOG(ERROR) << "Failed to allocate " << want
                            << " bytes for hybrid bucket writes: "
@@ -3955,14 +3922,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             int64_t done = 0;
             int64_t pos = 0;
             for (const auto& iov : iovs) {
-                const int64_t iov_end =
-                    pos + static_cast<int64_t>(iov.iov_len);
+                const int64_t iov_end = pos + static_cast<int64_t>(iov.iov_len);
                 if (iov_end > from && pos < from + len) {
                     const int64_t s = std::max(pos, from);
                     const int64_t e = std::min(iov_end, from + len);
                     memcpy(dst + (s - from),
-                           static_cast<const char*>(iov.iov_base) +
-                               (s - pos),
+                           static_cast<const char*>(iov.iov_base) + (s - pos),
                            e - s);
                     done += e - s;
                     if (done >= len) break;
@@ -4000,8 +3965,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                 const int64_t ce = std::min(e, interior_end);
                 if (ce <= cs) continue;
                 const bool on_grid =
-                    ((reinterpret_cast<intptr_t>(iov.iov_base) - s) %
-                     kBlock) == 0;
+                    ((reinterpret_cast<intptr_t>(iov.iov_base) - s) % kBlock) ==
+                    0;
                 if (on_grid) {
                     const int64_t b0 = (cs + kBlock - 1) & ~(kBlock - 1);
                     const int64_t b1 = ce & ~(kBlock - 1);
@@ -4009,10 +3974,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                         if (b0 > gap_off) {
                             pieces.push_back({nullptr, gap_off, b0 - gap_off});
                         }
-                        pieces.push_back(
-                            {static_cast<char*>(iov.iov_base) +
-                                 static_cast<int64_t>(b0 - s),
-                             b0, b1 - b0});
+                        pieces.push_back({static_cast<char*>(iov.iov_base) +
+                                              static_cast<int64_t>(b0 - s),
+                                          b0, b1 - b0});
                         gap_off = b1;
                     }
                 }
@@ -4027,11 +3991,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         descs.reserve(33);
         int64_t batch_bytes = 0;
         char* wcur = write_back.data.get();
-        const int64_t batch_cap =
-            static_cast<int64_t>(write_back.capacity);
+        const int64_t batch_cap = static_cast<int64_t>(write_back.capacity);
         int64_t direct_written = 0;
-        const auto submit_sub_batch =
-            [&]() -> tl::expected<void, ErrorCode> {
+        const auto submit_sub_batch = [&]() -> tl::expected<void, ErrorCode> {
             if (descs.empty()) return {};
             auto r = uring_file->batch_write(descs.data(),
                                              static_cast<int>(descs.size()));
@@ -4117,9 +4079,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                 }
                 const int64_t bs = std::max(s, run.offset);
                 const int64_t be = std::min(e, run.offset + run.length);
-                part.push_back(iovec{
-                    static_cast<char*>(iov.iov_base) + (bs - s),
-                    static_cast<size_t>(be - bs)});
+                part.push_back(
+                    iovec{static_cast<char*>(iov.iov_base) + (bs - s),
+                          static_cast<size_t>(be - bs)});
             }
             int64_t done = 0;
             size_t idx = 0;
@@ -4127,15 +4089,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             while (done < run.length && idx < part.size()) {
                 const int cnt = static_cast<int>(
                     std::min<size_t>(part.size() - idx, IOV_MAX));
-                ssize_t n = ::pwritev(buffered_fd, part.data() + idx, cnt,
-                                      off);
+                ssize_t n = ::pwritev(buffered_fd, part.data() + idx, cnt, off);
                 if (n < 0) {
                     if (errno == EINTR) continue;
                     const int err = errno;
                     NotifyDiskError(err, "pwritev");
-                    LOG(ERROR) << "hybrid buffered write failed for: "
-                               << bucket_id << ", errno=" << err << " ("
-                               << strerror(err) << ")";
+                    LOG(ERROR)
+                        << "hybrid buffered write failed for: " << bucket_id
+                        << ", errno=" << err << " (" << strerror(err) << ")";
                     CleanupOrphanedBucket(bucket_id, disk_index);
                     return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
                 }
@@ -4599,9 +4560,8 @@ int64_t BucketStorageBackend::ActualDiskBytesUsedLocked(int disk_index) const {
     if (disk.cached_disk_bytes < 0) {
         return bucket_backend_config_.max_physical_bytes;
     }
-    return AddPhysicalUsageBudget(disk.cached_disk_bytes,
-                                  static_cast<uint64_t>(
-                                      disk.pending_write_size));
+    return AddPhysicalUsageBudget(
+        disk.cached_disk_bytes, static_cast<uint64_t>(disk.pending_write_size));
 }
 
 int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
@@ -4673,8 +4633,8 @@ void BucketStorageBackend::DiskUsageScanLoop() {
                 for (const auto& disk : disks_) {
                     per_disk_pending.push_back(
                         static_cast<uint64_t>(disk.pending_write_size));
-                    pending_start += static_cast<uint64_t>(
-                        disk.pending_write_size);
+                    pending_start +=
+                        static_cast<uint64_t>(disk.pending_write_size);
                 }
             }
             if (hook) hook();
@@ -4701,19 +4661,17 @@ void BucketStorageBackend::DiskUsageScanLoop() {
                     disks_[index].cached_disk_bytes_at =
                         std::chrono::steady_clock::now();
                     if (published >= 0) {
-                        total = AddPhysicalUsageBudget(total,
-                                                       static_cast<uint64_t>(
-                                                           published));
+                        total = AddPhysicalUsageBudget(
+                            total, static_cast<uint64_t>(published));
                     } else {
                         // One unreadable disk fails the whole view closed.
                         total = -1;
                         break;
                     }
                 }
-                cached_disk_bytes_ = total < 0
-                                         ? -1
-                                         : AddPhysicalUsageBudget(
-                                               total, pending_start);
+                cached_disk_bytes_ =
+                    total < 0 ? -1
+                              : AddPhysicalUsageBudget(total, pending_start);
                 scanned_write_bytes_ = write_start;
             } else {
                 // A failed pass cannot be trusted for any view: fail the
@@ -4764,8 +4722,7 @@ BucketStorageBackend::ScanPhysicalDiskBytes() const {
             struct stat st;
             if (::stat(it->path().c_str(), &st) == 0) {
                 per_disk[index] = AddPhysicalUsageBudget(
-                    per_disk[index],
-                    static_cast<uint64_t>(st.st_blocks) * 512);
+                    per_disk[index], static_cast<uint64_t>(st.st_blocks) * 512);
             } else if (errno != ENOENT) {
                 LOG(WARNING) << "[Bucket] background physical-usage stat "
                                 "failed: "
@@ -5562,8 +5519,8 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode,
     // Hybrid bucket writes open their data files with O_DIRECT. The write
     // planner supplies block-aligned descriptors for queued write SQEs.
     const bool aligned_uring_write =
-        bucket_backend_config_.aligned_uring_write &&
-        mode == FileMode::Write && path.ends_with(BUCKET_DATA_FILE_SUFFIX);
+        bucket_backend_config_.aligned_uring_write && mode == FileMode::Write &&
+        path.ends_with(BUCKET_DATA_FILE_SUFFIX);
     const bool use_direct =
         file_storage_config_.use_uring &&
         (mode == FileMode::Read || packed_write || aligned_uring_write);
