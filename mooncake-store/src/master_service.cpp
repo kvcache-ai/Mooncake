@@ -2207,23 +2207,33 @@ void MasterService::EraseMetadata(metadata::Namespace& ns,
 }
 
 void MasterService::ReleaseLocalDiskUsage(std::span<const Replica> replicas) {
-    std::unordered_map<UUID, int64_t, boost::hash<UUID>> bytes_by_client;
     for (const auto& replica : replicas) {
-        if (!replica.is_local_disk_replica()) {
-            continue;
-        }
-        const auto descriptor =
-            replica.get_descriptor().get_local_disk_descriptor();
-        if (descriptor.object_size > 0) {
-            bytes_by_client[descriptor.client_id] += descriptor.object_size;
+        // A replica restored from OpLog without a live mount was never
+        // charged to that mount's usage.
+        if (const auto* registration = replica.getLocalDiskRegistration()) {
+            registration->used_bytes.fetch_sub(replica.get_descriptor()
+                                                   .get_local_disk_descriptor()
+                                                   .object_size,
+                                               std::memory_order_relaxed);
         }
     }
-    if (bytes_by_client.empty()) {
+}
+
+void MasterService::RemoveRetiredLocalDiskReplicas(
+    MetadataAccessorRW& accessor) {
+    if (enable_oplog_ || !accessor.IsPublished()) {
         return;
     }
-
-    for (const auto& [client_id, bytes] : bytes_by_client) {
-        local_ssd_manager_.AdjustUsedBytes(client_id, -bytes);
+    const auto retired = [](const Replica& replica) {
+        const auto* registration = replica.getLocalDiskRegistration();
+        return registration && replica.is_completed() &&
+               !registration->mounted.load(std::memory_order_acquire);
+    };
+    auto& metadata = accessor.Get();
+    if (metadata.HasReplica(retired) &&
+        CleanupStaleHandles(metadata.user_key, metadata.tenant_id, metadata,
+                            accessor.GetState(), retired)) {
+        accessor.Erase();
     }
 }
 
@@ -4702,7 +4712,12 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
 
     if (replica_list.empty()) {
         if (metadata.AllReplicas([](const Replica& replica) {
-                return replica.status() == ReplicaStatus::REMOVED;
+                if (replica.status() == ReplicaStatus::REMOVED) {
+                    return true;
+                }
+                const auto* registration = replica.getLocalDiskRegistration();
+                return registration &&
+                       !registration->mounted.load(std::memory_order_acquire);
             })) {
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
@@ -5612,15 +5627,14 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
-    const auto owner_session = retaining_guard->Session();
-    replica.bindLocalDiskSession(owner_session);
-    return AddReplicaForRetainedClient(client_id, key, tenant_id, replica);
+    return AddReplicaForRetainedClient(client_id, key, tenant_id, replica,
+                                       retaining_guard->Session());
 }
 
-auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
-                                                const std::string& key,
-                                                const TenantId& tenant_id,
-                                                Replica& replica)
+auto MasterService::AddReplicaForRetainedClient(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    Replica& replica, const ClientSessionSharedPtr& session,
+    const LocalDiskRegistrationPtr* offload_mount)
     -> tl::expected<bool, ErrorCode> {
     assert(tenant_id.IsValid());
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
@@ -5644,12 +5658,25 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     // deregistration can race; with the subsystem off both the mount and
     // unmount RPCs refuse, so there is nothing to check against and no race
     // to close.
-    if (enable_offload_ && !HasMountedLocalDiskSegment(client_id)) {
+    const auto registration =
+        offload_mount ? *offload_mount
+                      : local_ssd_manager_.GetRegistration(client_id);
+    if (enable_offload_ && (!registration || !registration->mounted.load(
+                                                 std::memory_order_acquire))) {
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    if (!replica.is_local_disk_replica()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (registration) {
+        replica.bindLocalDiskRegistration(registration);
+    } else {
+        replica.bindLocalDiskSession(session);
     }
     const ObjectIdentity object_id{normalized_tenant, key};
     MetadataAccessorRW accessor(this, object_id,
                                 MetadataAccessorRW::CreateKey{});
+    RemoveRetiredLocalDiskReplicas(accessor);
     if (!accessor.IsPublished()) {
         accessor.Publish(
             client_id, std::chrono::system_clock::now(),
@@ -5658,12 +5685,6 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
             ObjectDataType::UNKNOWN, std::string{}, object_id.tenant_id, key);
     }
     auto& metadata = accessor.Get();
-    if (replica.type() != ReplicaType::LOCAL_DISK) {
-        LOG(ERROR) << "Invalid replica type: " << replica.type()
-                   << ". Expected ReplicaType::LOCAL_DISK.";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
     const bool replacing_existing =
         metadata.HasReplica(&Replica::fn_is_local_disk_replica);
 
@@ -5705,6 +5726,12 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     }
 
     if (!replacing_existing) {
+        if (offload_mount && registration) {
+            registration->used_bytes.fetch_add(replica.get_descriptor()
+                                                   .get_local_disk_descriptor()
+                                                   .object_size,
+                                               std::memory_order_relaxed);
+        }
         std::vector<Replica> replicas;
         replicas.emplace_back(std::move(replica));
         metadata.AddReplicas(std::move(replicas));
@@ -8181,7 +8208,8 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
     ErrorCode err;
     {
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
-        err = local_ssd_manager_.RegisterClient(client_id, enable_offloading);
+        err = local_ssd_manager_.RegisterClient(client_id, enable_offloading,
+                                                registration->Session());
     }
     if (err != ErrorCode::OK && err != ErrorCode::SEGMENT_ALREADY_EXISTS) {
         return tl::make_unexpected(err);
@@ -8198,22 +8226,9 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
 
-    // Drop the client's LOCAL_DISK registration first: from here on
-    // OffloadObjectHeartbeat answers SEGMENT_NOT_FOUND, so the master hands
-    // this client no further offload work. Then sweep the replicas it still
-    // owns, so no reader can be given a replica whose owner is about to stop
-    // serving. The sweep walks every namespace, so it must run without
-    // the registry lock held -- the same order and the same reason as the
-    // client offboarding worker.
-    //
-    // The deregistration takes master_state_mutex_ exclusively.
-    // NotifyOffloadSuccess admits a disk-replica registration by checking
-    // this client's registration inside one shared-lock section together with
-    // the metadata write, so that section lands entirely before this
-    // deregistration (the sweep below erases the replica) or entirely after
-    // (the check refuses it). Without the exclusive lock a registration
-    // admitted against the old one could land on a key the sweep had
-    // already passed and survive as a stale owner.
+    // Retire the mount before returning. The shared side of this lock
+    // protects replica admission, so every published replica sees the
+    // retirement on the exact registration it was admitted against.
     std::optional<int64_t> reported_capacity;
     {
         std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
@@ -8229,10 +8244,11 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
             *reported_capacity);
     }
 
-    // Explicit unmount removes this owner's disk replicas even while its
-    // session still retains resources; generic stale-session cleanup would
-    // deliberately preserve them.
-    ClearLocalDiskHandlesOwnedBy(client_id);
+    if (enable_oplog_) {
+        ClearLocalDiskHandlesOwnedBy(client_id);
+    } else {
+        replica_cleanup_worker_.Schedule();
+    }
 
     LOG(INFO) << "client_id=" << client_id
               << ", action=unmount_local_disk_segment_by_request";
@@ -8339,6 +8355,7 @@ auto MasterService::NotifyOffloadSuccess(
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     const auto owner_session = retaining_guard->Session();
+    const auto offload_mount = local_ssd_manager_.GetRegistration(client_id);
     // Set when an entry's replica registration is refused because the client
     // no longer has a LOCAL_DISK segment entry (see the per-entry checks
     // below). NACK cleanups still run for the rest of the batch; the caller
@@ -8377,10 +8394,8 @@ auto MasterService::NotifyOffloadSuccess(
         }
 
         Replica replica(client_id, metadata.data_size,
-                        metadata.transport_endpoint, ReplicaStatus::COMPLETE,
-                        owner_session);
+                        metadata.transport_endpoint, ReplicaStatus::COMPLETE);
         bool handled_existing_object = false;
-        bool added_new_local_disk_replica = false;
         {
             std::shared_lock<std::shared_mutex> shared_lock(
                 master_state_mutex_);
@@ -8399,8 +8414,11 @@ auto MasterService::NotifyOffloadSuccess(
             // deregistration can race; with the subsystem off both the mount
             // and unmount RPCs refuse, so there is nothing to check against
             // and no race to close.
+            const auto& registration = offload_mount;
             const bool segment_mounted =
-                !enable_offload_ || HasMountedLocalDiskSegment(client_id);
+                !enable_offload_ ||
+                (registration &&
+                 registration->mounted.load(std::memory_order_acquire));
             MetadataAccessorRW accessor(this, request_object_id);
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
@@ -8423,20 +8441,32 @@ auto MasterService::NotifyOffloadSuccess(
                     }
                     offloading_task.reset();
 
+                    if (segment_mounted) {
+                        RemoveRetiredLocalDiskReplicas(accessor);
+                    }
+                    // A key containing only a retired replica is recreated
+                    // through the regular admission path.
+                    handled_existing_object =
+                        !segment_mounted || accessor.IsPublished();
                     if (!segment_mounted) {
-                        // The offload bookkeeping above still ran; only the
-                        // registration is refused.
                         refused_unmounted = true;
-                    } else if (!obj_metadata.HasReplica(
+                    } else if (handled_existing_object &&
+                               !obj_metadata.HasReplica(
                                    &Replica::fn_is_local_disk_replica)) {
+                        if (registration) {
+                            replica.bindLocalDiskRegistration(registration);
+                            registration->used_bytes.fetch_add(
+                                metadata.data_size, std::memory_order_relaxed);
+                        } else {
+                            replica.bindLocalDiskSession(owner_session);
+                        }
                         std::vector<Replica> replicas;
                         replicas.emplace_back(std::move(replica));
                         obj_metadata.AddReplicas(std::move(replicas));
                         SyncCacheTotalAccounting(obj_metadata);
                         MasterMetricManager::instance().inc_offload_completed(
                             UuidToString(client_id));
-                        added_new_local_disk_replica = true;
-                    } else {
+                    } else if (handled_existing_object) {
                         obj_metadata.VisitReplicas(
                             [client_id](const Replica& rep) {
                                 return rep.type() == ReplicaType::LOCAL_DISK &&
@@ -8459,7 +8489,6 @@ auto MasterService::NotifyOffloadSuccess(
                                         .object_size;
                             });
                     }
-                    handled_existing_object = true;
                 }
             }
         }
@@ -8475,7 +8504,8 @@ auto MasterService::NotifyOffloadSuccess(
                 request_object_id.user_key};
 
             auto res = AddReplicaForRetainedClient(
-                client_id, object_id.user_key, object_id.tenant_id, replica);
+                client_id, object_id.user_key, object_id.tenant_id, replica,
+                owner_session, &offload_mount);
             if (!res) {
                 if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
                     continue;
@@ -8493,10 +8523,6 @@ auto MasterService::NotifyOffloadSuccess(
                            << ", key=" << object_id.user_key;
                 return tl::make_unexpected(res.error());
             }
-            added_new_local_disk_replica = res.value();
-        }
-        if (metadata.data_size > 0 && added_new_local_disk_replica) {
-            local_ssd_manager_.AdjustUsedBytes(client_id, metadata.data_size);
         }
     }
 

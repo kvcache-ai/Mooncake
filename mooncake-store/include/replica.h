@@ -353,11 +353,15 @@ struct LocalDiskReplicaData {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
-    // Process-local affiliation with the exact Client incarnation. This is
-    // rebuilt after restore and deliberately excluded from descriptors. It is
-    // set before the replica is published and not changed while readers can
-    // see it, so it needs no atomic access.
-    ClientSessionSharedPtr owner_session;
+    // Restored replicas initially have only an owner session. Replicas added
+    // through a live mount retain that mount's identity instead.
+    std::variant<ClientSessionSharedPtr, LocalDiskRegistrationPtr> owner;
+
+    const LocalDiskRegistration* GetRegistration() const noexcept {
+        const auto* registration =
+            std::get_if<LocalDiskRegistrationPtr>(&owner);
+        return registration ? registration->get() : nullptr;
+    }
 };
 
 struct DistributedFSDescriptor {
@@ -500,8 +504,12 @@ class Replica {
         }
         if (const auto* local =
                 std::get_if<std::unique_ptr<LocalDiskReplicaData>>(&data_)) {
-            const auto* record = (*local)->owner_session.get();
-            return record != nullptr && record->IsServing();
+            const auto* registration = (*local)->GetRegistration();
+            const auto& session = getClientSession();
+            return session &&
+                   (!registration ||
+                    registration->mounted.load(std::memory_order_acquire)) &&
+                   session->IsServing();
         }
         return true;
     }
@@ -634,8 +642,11 @@ class Replica {
     [[nodiscard]] bool has_stale_local_disk_client() const noexcept {
         if (const auto* local =
                 std::get_if<std::unique_ptr<LocalDiskReplicaData>>(&data_)) {
-            const auto& record = (*local)->owner_session;
-            return !record || !record->ShouldRetainResources();
+            const auto* registration = (*local)->GetRegistration();
+            const auto& session = getClientSession();
+            return !session || !session->ShouldRetainResources() ||
+                   (registration &&
+                    !registration->mounted.load(std::memory_order_acquire));
         }
         return false;
     }
@@ -655,8 +666,18 @@ class Replica {
     // Memory replicas get their session only through the segment lifetime.
     void bindLocalDiskSession(ClientSessionSharedPtr session) {
         if (is_local_disk_replica()) {
-            LocalDiskData(data_).owner_session = std::move(session);
+            LocalDiskData(data_).owner = std::move(session);
         }
+    }
+
+    void bindLocalDiskRegistration(LocalDiskRegistrationPtr registration) {
+        LocalDiskData(data_).owner = std::move(registration);
+    }
+
+    [[nodiscard]] const LocalDiskRegistration* getLocalDiskRegistration()
+        const {
+        return is_local_disk_replica() ? LocalDiskData(data_).GetRegistration()
+                                       : nullptr;
     }
 
     [[nodiscard]] const ClientSessionSharedPtr& getClientSession()
@@ -667,7 +688,12 @@ class Replica {
         }
         if (const auto* local =
                 std::get_if<std::unique_ptr<LocalDiskReplicaData>>(&data_)) {
-            return (*local)->owner_session;
+            if (const auto* registration = (*local)->GetRegistration()) {
+                return registration->session;
+            }
+            const auto* session =
+                std::get_if<ClientSessionSharedPtr>(&(*local)->owner);
+            return session ? *session : kNoSession;
         }
         return kNoSession;
     }

@@ -157,4 +157,17 @@ class ClientLivenessRecord {
 // Resources retain this handle; mutation and admission belong to the registry.
 using ClientSessionSharedPtr = std::shared_ptr<const ClientLivenessRecord>;
 
+// One incarnation of a mounted local disk, independently of the memory
+// segments of its client. Replicas keep this identity across a remount.
+struct LocalDiskRegistration {
+    explicit LocalDiskRegistration(ClientSessionSharedPtr owner)
+        : session(std::move(owner)) {}
+
+    const ClientSessionSharedPtr session;
+    std::atomic<bool> mounted{true};
+    mutable std::atomic<int64_t> used_bytes{0};
+};
+
+using LocalDiskRegistrationPtr = std::shared_ptr<const LocalDiskRegistration>;
+
 }  // namespace mooncake

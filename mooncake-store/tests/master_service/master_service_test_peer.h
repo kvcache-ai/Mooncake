@@ -417,8 +417,8 @@ class MasterServiceTestPeer {
                                      const TenantId& tenant_id,
                                      Replica& replica)
         -> tl::expected<bool, ErrorCode> {
-        return service_.AddReplicaForRetainedClient(client_id, key, tenant_id,
-                                                    replica);
+        return service_.AddReplicaForRetainedClient(
+            client_id, key, tenant_id, replica, replica.getClientSession());
     }
 
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
