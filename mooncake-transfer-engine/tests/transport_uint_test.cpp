@@ -456,6 +456,64 @@ TEST(TransferEngineAscendTransportTest, ProtocolHintMergeKeepsStoredProtocol) {
 #endif
 }
 
+#if (defined(USE_MNNVL) || defined(USE_INTRA_NVLINK) || defined(USE_MUSA)) && \
+    !defined(USE_MACA) && !defined(USE_UB) && !defined(USE_UBSHMEM) &&        \
+    !defined(USE_ASCEND_HETEROGENEOUS) && !defined(USE_SUNRISE)
+TEST(TransferEngineAutoDiscoverTest,
+     GpuP2pProtocolHintsSelectCompiledTransportWithHcasPresent) {
+    char path[] = "/tmp/mc_custom_topo_XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_NE(fd, -1);
+    struct UnlinkGuard {
+        const char* p;
+        ~UnlinkGuard() { unlink(p); }
+    } unlink_guard{path};
+    const std::string json = R"({"cpu:0": [["mc_fake_0"], ["mc_fake_1"]]})";
+    const ssize_t written = write(fd, json.data(), json.size());
+    close(fd);
+    ASSERT_EQ(written, static_cast<ssize_t>(json.size()));
+
+    {
+#ifdef USE_TENT
+        ScopedEnvVar use_tent("MC_USE_TENT", nullptr);
+#endif
+        ScopedEnvVar custom_topology("MC_CUSTOM_TOPO_JSON", path);
+        ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+        ScopedEnvVar force_shm("MC_FORCE_SHM", nullptr);
+        ScopedEnvVar force_hca("MC_FORCE_HCA", nullptr);
+        ScopedEnvVar force_mnnvl("MC_FORCE_MNNVL", nullptr);
+#ifdef USE_MUSA
+        ScopedEnvVar force_musa("MC_FORCE_MUSA", nullptr);
+#endif
+        ScopedEnvVar intra_nvlink("MC_INTRANODE_NVLINK", nullptr);
+        ScopedEnvVar nvlink_ipc("MC_USE_NVLINK_IPC", "1");
+
+#ifdef USE_MUSA
+        TransferEngine musa_engine(/*auto_discover=*/true);
+        EXPECT_EQ(musa_engine.init(P2PHANDSHAKE, "127.0.0.1:0", "", 0, "musa"),
+                  0);
+        EXPECT_NE(musa_engine.getTransport("musa"), nullptr);
+        EXPECT_EQ(musa_engine.getTransport("rdma"), nullptr);
+#elif defined(USE_MNNVL)
+        TransferEngine nvlink_engine(/*auto_discover=*/true);
+        EXPECT_EQ(
+            nvlink_engine.init(P2PHANDSHAKE, "127.0.0.1:0", "", 0, "nvlink"),
+            0);
+        EXPECT_NE(nvlink_engine.getTransport("nvlink"), nullptr);
+        EXPECT_EQ(nvlink_engine.getTransport("rdma"), nullptr);
+#endif
+#ifdef USE_INTRA_NVLINK
+        TransferEngine intra_engine(/*auto_discover=*/true);
+        EXPECT_EQ(intra_engine.init(P2PHANDSHAKE, "127.0.0.1:0", "", 0,
+                                    "nvlink_intra"),
+                  0);
+        EXPECT_NE(intra_engine.getTransport("nvlink_intra"), nullptr);
+        EXPECT_EQ(intra_engine.getTransport("rdma"), nullptr);
+#endif
+    }
+}
+#endif
+
 TEST(TransferEngineAscendTransportTest, InitProtocolHintReachesEngine) {
     TransferEngine engine(/*auto_discover=*/false);
 
