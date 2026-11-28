@@ -2396,6 +2396,153 @@ TEST_F(MasterServiceHATest, InvalidHandleCleanupWaitsForSnapshotBarrier) {
     cleanup.get();
 }
 
+TEST_F(MasterServiceHATest, RemountDoesNotVisitUnrelatedObjects) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "indexed_remount";
+    auto restored = MakeStandbyObject("indexed_restored_key", endpoint);
+    restored.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        {restored}, 1, {MakeStandbyMemorySegment(endpoint)}));
+    const auto live =
+        PrepareSimpleSegment(service, "indexed_live", 0x400000000);
+    const std::string unrelated = "indexed_unrelated_key";
+    PutObjectOnSegment(service, live.client_id, unrelated, "indexed_live");
+
+    using Access = MasterServiceTestPeer::MetadataAccessorRW;
+    auto held = std::make_unique<Access>(
+        &service,
+        MasterServiceTestPeer::ObjectIdentity{kDefaultTenant, unrelated},
+        Access::AsIs{});
+    ASSERT_TRUE(held->IsPublished());
+    auto remount = std::async(std::launch::async, [&] {
+        return service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid());
+    });
+    const auto status = remount.wait_for(std::chrono::seconds(1));
+    held.reset();
+    EXPECT_EQ(status, std::future_status::ready);
+    ASSERT_TRUE(remount.get());
+}
+
+TEST_F(MasterServiceHATest,
+       RemountReleasesTheChargeOfReplicasThatDiedOrphaned) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_died_orphaned_segment";
+    const std::string kept_key = "standby_died_orphaned_kept_key";
+    const std::string erased_key = "standby_died_orphaned_erased_key";
+    auto kept_object = MakeStandbyObject(kept_key, endpoint);
+    kept_object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto erased_object = MakeStandbyObject(erased_key, endpoint);
+    erased_object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot({kept_object, erased_object}, 7,
+                                        {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
+    auto& metrics = MasterMetricManager::instance();
+    ASSERT_EQ(metrics.get_segment_allocated_mem_size(endpoint), 2048);
+
+    // Nothing un-charges a replica that dies while its segment is orphaned;
+    // the remount that ends the orphan has to.
+    EraseObjectForTesting(service, kDefaultTenant, erased_key);
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+
+    EXPECT_TRUE(service.GetReplicaList(kept_key, kDefaultTenant).has_value());
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 1024);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size(endpoint), 1024);
+}
+
+TEST_F(MasterServiceHATest, RemountReadoptsAnEarlierRestoreOnTheSameEndpoint) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_restored_twice_segment";
+    const std::string first_key = "standby_restored_twice_first_key";
+    const std::string second_key = "standby_restored_twice_second_key";
+    auto first_object = MakeStandbyObject(first_key, endpoint);
+    first_object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {first_object}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+    auto second_object = MakeStandbyObject(second_key, endpoint);
+    second_object.metadata.replicas.front().id = 2;
+    second_object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot({second_object}, 8,
+                                        {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
+
+    // The second restore took over the orphan, so the replica the first one
+    // put there is re-adopted too, not left on the placeholder allocator.
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 2048);
+    EXPECT_FALSE(
+        HasInvalidMemoryHandleForTesting(service, kDefaultTenant, first_key));
+    EXPECT_FALSE(
+        HasInvalidMemoryHandleForTesting(service, kDefaultTenant, second_key));
+}
+
+TEST_F(MasterServiceHATest, RemountRepointsOnlyTheReplicaOnItsOwnSegment) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string remounted = "standby_same_region_remounted";
+    const std::string other = "standby_same_region_other";
+    const std::string key = "standby_same_region_key";
+    // Address spaces are per segment, so the key's replica on `other` can sit
+    // at the same address and size as the one on `remounted`, and here it
+    // comes first. The remount has to re-point the replica it restored.
+    auto object = MakeStandbyObject(key, other);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto on_remounted = MakeStandbyMemoryReplica(remounted);
+    on_remounted.id = 2;
+    on_remounted.get_memory_descriptor().buffer_descriptor.buffer_address_ =
+        kDefaultSegmentBase;
+    object.metadata.replicas.push_back(std::move(on_remounted));
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot({object}, 7,
+                                        {MakeStandbyMemorySegment(other),
+                                         MakeStandbyMemorySegment(remounted)})
+            .has_value());
+
+    ASSERT_TRUE(
+        service.ReMountSegment({MakeSegment(remounted)}, generate_uuid())
+            .has_value());
+
+    auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant, key);
+    ASSERT_EQ(replicas.size(), 2);
+    EXPECT_EQ(replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              other);
+    EXPECT_EQ(replicas[1]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              remounted);
+    EXPECT_FALSE(
+        HasInvalidMemoryHandleForTesting(service, kDefaultTenant, key));
+}
+
 TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());

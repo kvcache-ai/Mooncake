@@ -629,6 +629,7 @@ add_ha_test(hot_standby_service_test ha/standby/hot_standby_service_test.cpp)
 add_ha_test(standby_metadata_store_test
             ha/standby/standby_metadata_store_test.cpp)
 add_ha_test(standby_controller_test ha/standby/standby_controller_test.cpp)
+add_ha_test(orphaned_segments_test ha/standby/orphaned_segments_test.cpp)
 add_ha_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)
 add_ha_test(oplog_types_test ha/oplog/oplog_types_test.cpp)
 add_ha_test(oplog_batch_codec_test ha/oplog/oplog_batch_codec_test.cpp)
