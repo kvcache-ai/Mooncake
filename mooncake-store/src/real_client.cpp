@@ -1746,13 +1746,16 @@ inline std::string get_config(const ConfigDict &config, const std::string &key,
 
 inline std::optional<size_t> get_config_size(const ConfigDict &config,
                                              const std::string &key,
-                                             size_t default_value) {
+                                             size_t default_value,
+                                             bool allow_iec_units = true) {
     auto it = config.find(key);
     if (it == config.end()) {
         return default_value;
     }
 
-    auto parsed_size_opt = try_string_to_byte_size(it->second);
+    auto parsed_size_opt =
+        allow_iec_units ? try_string_to_byte_size(it->second)
+                        : try_string_to_byte_size_legacy_units(it->second);
     if (!parsed_size_opt.has_value()) {
         LOG(ERROR) << "Invalid size value for config key '" << key
                    << "': " << it->second;
@@ -1893,12 +1896,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // docs/source/design/store/ssd-prefetch.md).
     const bool enable_ssd_prefetch =
         get_config_bool(config, CONFIG_KEY_ENABLE_SSD_PREFETCH, false);
+    // Cooldown and dedup TTL are seconds, so retain their legacy unit parsing.
     auto prefetch_cooldown_opt =
         get_config_size(config, CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC,
-                        DEFAULT_SSD_PREFETCH_COOLDOWN_SEC);
+                        DEFAULT_SSD_PREFETCH_COOLDOWN_SEC,
+                        /*allow_iec_units=*/false);
     auto prefetch_dedup_ttl_opt =
         get_config_size(config, CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC,
-                        DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC);
+                        DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC,
+                        /*allow_iec_units=*/false);
     if (!prefetch_cooldown_opt.has_value() ||
         !prefetch_dedup_ttl_opt.has_value()) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);

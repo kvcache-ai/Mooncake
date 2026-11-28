@@ -4,6 +4,19 @@ The Python package exposes the native Store and framework-neutral structured
 objects. Existing `put_structured_object`, DataProto, whole-object
 `materialize` and matrix reads keep their current behavior.
 
+## Configuration size units
+
+`MooncakeConfig.from_file()` and `MooncakeConfig.load_from_env()` accept byte
+counts and case-insensitive binary units for segment and buffer sizes.
+`K`, `KB` and `KiB` each mean 1,024 bytes. The same rule applies to
+`M/MB/MiB`, `G/GB/GiB` and `T/TB/TiB`. For example, `1.5 GiB` is
+1,610,612,736 bytes. Sizes must be nonnegative and below 2⁶⁴ bytes before
+fractional bytes are discarded.
+
+A JSON configuration can set `"global_segment_size": "8GiB"` and
+`"local_buffer_size": "512MiB"`. The corresponding environment settings are
+`MOONCAKE_GLOBAL_SEGMENT_SIZE=8GiB` and `MOONCAKE_LOCAL_BUFFER_SIZE=512MiB`.
+
 ## Reading member byte ranges
 
 `MooncakeBundleTransfer.materialize_ranges_into` reads selected byte intervals

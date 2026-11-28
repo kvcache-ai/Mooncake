@@ -37,7 +37,12 @@ class PrefetchTeardownTest : public ::testing::Test {
                                       .set_http_metrics_port(0)
                                       .set_http_metadata_port(0)
                                       .build()));
-        ConfigDict config = {
+        client_ = RealClient::create();
+        ASSERT_TRUE(client_->setup_internal(PrefetchConfig()).has_value());
+    }
+
+    ConfigDict PrefetchConfig() const {
+        return {
             {CONFIG_KEY_LOCAL_HOSTNAME, "127.0.0.1"},
             {CONFIG_KEY_METADATA_SERVER, "P2PHANDSHAKE"},
             // The review scenario: DRAM segments, but no local SSD offload.
@@ -48,9 +53,8 @@ class PrefetchTeardownTest : public ::testing::Test {
             {CONFIG_KEY_ENABLE_SSD_PREFETCH, "true"},
             {"ipc_socket_path", IpcPath()},
         };
-        client_ = RealClient::create();
-        ASSERT_TRUE(client_->setup_internal(config).has_value());
     }
+
     void TearDown() override {
         if (dummy_) dummy_->tearDownAll();
         if (server_) server_->stop();
@@ -220,17 +224,9 @@ TEST_F(PrefetchTeardownTest, PositionalSetupAcceptsExplicitZeroDurations) {
 
 TEST_F(PrefetchTeardownTest, ConfigDictPreservesPrefetchConfiguration) {
     ResetClient();
-    ConfigDict config = {
-        {CONFIG_KEY_LOCAL_HOSTNAME, "127.0.0.1"},
-        {CONFIG_KEY_METADATA_SERVER, "P2PHANDSHAKE"},
-        {CONFIG_KEY_GLOBAL_SEGMENT_SIZE, "16777216"},
-        {CONFIG_KEY_LOCAL_BUFFER_SIZE, "16777216"},
-        {CONFIG_KEY_PROTOCOL, "tcp"},
-        {CONFIG_KEY_MASTER_SERVER_ADDR, master_.master_address()},
-        {CONFIG_KEY_ENABLE_SSD_PREFETCH, "true"},
-        {CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC, "7"},
-        {CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC, "11"},
-    };
+    auto config = PrefetchConfig();
+    config[CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC] = "7";
+    config[CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC] = "11";
     ASSERT_TRUE(client_->setup_internal(config).has_value());
     EXPECT_TRUE(PrefetcherInitialized());
     EXPECT_EQ(CooldownSeconds(), 7);
@@ -251,18 +247,14 @@ TEST_F(PrefetchTeardownTest, RejectsInvalidPrefetchDurationsBeforeSetup) {
     }
 }
 
-TEST_F(PrefetchTeardownTest, ConfigDictRejectsInvalidDurationRanges) {
+TEST_F(PrefetchTeardownTest, ConfigDictRejectsInvalidPrefetchDurations) {
     ResetClient();
     for (const auto* knob : {CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC,
                              CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC}) {
-        for (const auto* value : {"-1", "9223372036854775807"}) {
+        for (const auto* value : {"-1", "9223372036854775807", "1MiB"}) {
             SCOPED_TRACE(std::string(knob) + "=" + value);
-            ConfigDict config = {
-                {CONFIG_KEY_LOCAL_HOSTNAME, "127.0.0.1"},
-                {CONFIG_KEY_METADATA_SERVER, "P2PHANDSHAKE"},
-                {CONFIG_KEY_MASTER_SERVER_ADDR, master_.master_address()},
-                {knob, value},
-            };
+            auto config = PrefetchConfig();
+            config[knob] = value;
             auto result = client_->setup_internal(config);
             ASSERT_FALSE(result.has_value());
             EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);

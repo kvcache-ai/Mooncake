@@ -43,7 +43,8 @@ HugepageConfig HugepageConfig::FromEnvironment() {
         config.page_size = parsed_size;
     } else {
         LOG(WARNING) << "Invalid MC_STORE_HUGEPAGE_SIZE='" << *raw_size
-                     << "'. Supported: 2MB, 512MB, 1GB. Fallback to 2MB.";
+                     << "'. Supported: 2MB/2MiB, 512MB/512MiB, 1GB/1GiB. "
+                        "Fallback to 2MB.";
     }
     return config;
 }
