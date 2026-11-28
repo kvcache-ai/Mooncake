@@ -45,6 +45,10 @@ namespace device {
 // Manages intra-node GPU P2P IPC handles and the device-visible peer pointer
 // table used by the EP kernel.
 // ---------------------------------------------------------------------------
+// exportP2pMemory() and importP2pMemory() report a failure by their result.
+// A failed runtime call in them or in ~P2pMapping() leaves no error pending
+// for the calling thread's next cudaGetLastError().
+
 // One imported peer allocation. Stop GPU accesses before destroying it.
 // Destruction selects the import device and restores the caller's device.
 class P2pMapping {
