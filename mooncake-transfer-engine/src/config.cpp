@@ -460,6 +460,25 @@ void loadGlobalConfig(GlobalConfig& config) {
                             "MC_HANDSHAKE_CONNECT_TIMEOUT";
     }
 
+    const char* handshake_read_timeout =
+        std::getenv("MC_HANDSHAKE_READ_TIMEOUT");
+    if (handshake_read_timeout) {
+        // Strict parse: a typo such as "15s" keeps the current value rather
+        // than being truncated.
+        int val = 0;
+        const char* end =
+            handshake_read_timeout + strlen(handshake_read_timeout);
+        auto [ptr, ec] = std::from_chars(handshake_read_timeout, end, val);
+        if (ec == std::errc() && ptr == end && val > 0 && val < 3600) {
+            config.handshake_read_timeout = val;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_HANDSHAKE_READ_TIMEOUT: "
+                         << handshake_read_timeout
+                         << ". Expected an integer in range 1-3599";
+        }
+    }
+
     const char* rdma_rail_pause_seconds =
         std::getenv("MC_RDMA_RAIL_PAUSE_SECONDS");
     if (rdma_rail_pause_seconds) {
