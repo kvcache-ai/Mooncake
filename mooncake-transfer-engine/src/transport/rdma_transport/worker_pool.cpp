@@ -496,6 +496,14 @@ static bool isHandshakeRpcFailure(int ret) {
 // Shared by all local RNICs; pruned alongside the existing connection pauses.
 static ConnectPauseTracker active_endpoint_connect_pause(getCurrentTimeInNano);
 
+// Host part of a handshake server name ("host:port" -> "host"), stripped the
+// same way as normalizeNicPath(). Engines on one machine share the host and
+// differ only in their handshake port.
+static std::string setupHostOf(const std::string &server) {
+    const size_t colon = server.rfind(':');
+    return colon == std::string::npos ? server : server.substr(0, colon);
+}
+
 class ActiveEndpointSetupExecutor {
    public:
     explicit ActiveEndpointSetupExecutor(size_t thread_count) : running_(true) {
@@ -534,7 +542,8 @@ class ActiveEndpointSetupExecutor {
         }
         // One RPC per server; an invalid future defers admission without
         // queuing.
-        if (in_flight_.size() >= workers_.size() || in_flight_.count(server))
+        if (in_flight_.size() >= workers_.size() || in_flight_.count(server) ||
+            !hostAdmits(server))
             return {};
         std::packaged_task<int()> task([this, operation = std::move(operation),
                                         server, exception_error]() mutable {
@@ -551,7 +560,7 @@ class ActiveEndpointSetupExecutor {
             return ret;
         });
         auto future = task.get_future();
-        in_flight_.insert(server);
+        in_flight_.emplace(server, std::chrono::steady_clock::now());
         try {
             tasks_.emplace(std::move(task));
         } catch (...) {
@@ -563,6 +572,28 @@ class ActiveEndpointSetupExecutor {
     }
 
    private:
+    // Engines on one machine are separate servers, so without a host limit
+    // one hung machine (process stopped, kernel still accepting TCP) can hold
+    // every slot for the full handshake read timeout and starve new
+    // connections to healthy hosts. A host may hold at most half of the
+    // slots. Once every RPC it holds has been running longer than
+    // kStalledRpcThreshold, it may also use one extra slot, so that healthy
+    // engines on a partially hung machine are still reached one at a time.
+    // Caller holds mutex_.
+    bool hostAdmits(const std::string &server) const {
+        constexpr auto kStalledRpcThreshold = std::chrono::seconds(1);
+        const size_t limit = std::max<size_t>(1, workers_.size() / 2);
+        const auto host = setupHostOf(server);
+        const auto now = std::chrono::steady_clock::now();
+        size_t held = 0, recent = 0;
+        for (const auto &[in_flight_server, started] : in_flight_) {
+            if (setupHostOf(in_flight_server) != host) continue;
+            ++held;
+            if (now - started < kStalledRpcThreshold) ++recent;
+        }
+        return held < limit || (held == limit && recent == 0);
+    }
+
     void complete(const std::string &server, int ret) {
         std::lock_guard<std::mutex> lock(mutex_);
         in_flight_.erase(server);
@@ -593,7 +624,9 @@ class ActiveEndpointSetupExecutor {
     std::mutex mutex_;
     std::condition_variable cv_;
     bool running_;
-    std::unordered_set<std::string> in_flight_;
+    // Server -> submit time of its in-flight RPC.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        in_flight_;
 };
 
 static ActiveEndpointSetupExecutor &activeEndpointSetupExecutor() {
