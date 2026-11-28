@@ -202,6 +202,231 @@ class MetadataWorkloadModelTest(unittest.TestCase):
         self.assertFalse(model.is_present(4))
 
 
+class ReadMixTest(unittest.TestCase):
+    def _args(self, *extra):
+        return bench.build_parser().parse_args(
+            [
+                "--scenario=read_mix",
+                "--io-api=zcopy",
+                "--read-hit-pct=60",
+                "--value-size=512",
+                "--verify",
+                "--pattern=x",
+                *extra,
+            ]
+        )
+
+    def test_plan_is_seeded_and_reserves_disjoint_missing_keys(self):
+        for hit_pct, expected_hits in ((0, 0), (60, 6), (100, 10)):
+            with self.subTest(hit_pct=hit_pct):
+                plan = bench.build_read_mix_plan(20, 4, 10, hit_pct, 17)
+                self.assertEqual(
+                    plan, bench.build_read_mix_plan(20, 4, 10, hit_pct, 17)
+                )
+                present = [key for key, hit in plan if hit]
+                missing = [key for key, hit in plan if not hit]
+                self.assertEqual(len(present), expected_hits)
+                self.assertTrue(set(present) <= set(range(20, 24)))
+                self.assertEqual(set(missing), set(range(24, 34 - expected_hits)))
+                self.assertEqual(len(plan), 10)
+        self.assertEqual(
+            sum(hit for _, hit in bench.build_read_mix_plan(20, 4, 7, 60, 17)), 4
+        )
+
+    def test_strict_per_key_status_distinguishes_miss_and_transfer_error(self):
+        args = self._args("--batch-size=7")
+        store, zcopy = Mock(), Mock()
+        payload = bench.PayloadFactory(512, b"x")
+        zcopy.read_bytes.side_effect = [payload.build(0), b"y" * 512]
+        session = bench.StoreSession(
+            args, 0, payload, store, SimpleNamespace(replica_num=1), zcopy
+        )
+        plan = [
+            (0, True),
+            (1, False),
+            (2, False),
+            (3, True),
+            (4, True),
+            (5, False),
+            (6, True),
+        ]
+        with patch.object(
+            session,
+            "_get_lengths_zcopy",
+            return_value=[512, -704, -800, -704, 511, 512, 512],
+        ):
+            result = session.get_expected_ids(plan, verify=True)
+        self.assertEqual((result.expected_hits, result.expected_misses), (4, 3))
+        self.assertEqual((result.matched_hits, result.matched_misses), (1, 1))
+        self.assertEqual((result.kv_successes, result.kv_failures), (2, 5))
+        self.assertEqual(result.misses, 2)
+        self.assertEqual(result.bytes_processed, 512)
+        self.assertEqual(result.verify_failures, 2)
+        self.assertEqual(
+            result.error_counts,
+            {
+                -800: 1,
+                "UNEXPECTED_MISS": 1,
+                "VERIFY_SIZE_MISMATCH": 1,
+                "UNEXPECTED_HIT": 1,
+                "VERIFY_FAIL": 1,
+            },
+        )
+        store.is_exist.assert_not_called()
+        self.assertEqual(
+            [call.args for call in zcopy.read_bytes.call_args_list],
+            [(0, 512), (6, 512)],
+        )
+
+    def test_short_status_vector_does_not_consume_destination_bytes(self):
+        args = self._args("--batch-size=2")
+        store, zcopy = Mock(), Mock()
+        session = bench.StoreSession(
+            args,
+            0,
+            bench.PayloadFactory(512, b"x"),
+            store,
+            SimpleNamespace(replica_num=1),
+            zcopy,
+        )
+        with patch.object(session, "_get_lengths_zcopy", return_value=[512]):
+            result = session.get_expected_ids([(0, True), (1, False)], verify=True)
+        self.assertFalse(result.request_ok)
+        self.assertEqual(result.kv_failures, 2)
+        self.assertEqual(result.error_counts, {"READ_RESULT_COUNT_MISMATCH": 2})
+        zcopy.read_bytes.assert_not_called()
+
+    def _fake_store(self, contents):
+        store = Mock()
+        store.setup.return_value = 0
+        lock = threading.Lock()
+
+        def put(keys, ptrs, sizes, config):
+            with lock:
+                for key, ptr, size in zip(keys, ptrs, sizes):
+                    contents[key] = ctypes.string_at(ptr, size)
+            return [0] * len(keys)
+
+        def get(keys, ptrs, sizes):
+            with lock:
+                results = []
+                for key, ptr, size in zip(keys, ptrs, sizes):
+                    if key not in contents:
+                        results.append(-704)
+                        continue
+                    value = contents[key]
+                    self.assertLessEqual(len(value), size)
+                    ctypes.memmove(ptr, value, len(value))
+                    results.append(len(value))
+                return results
+
+        store.put_from.side_effect = lambda key, ptr, size, config: put(
+            [key], [ptr], [size], config
+        )[0]
+        store.batch_put_from.side_effect = put
+        store.get_into.side_effect = lambda key, ptr, size: get([key], [ptr], [size])[0]
+        store.batch_get_into.side_effect = get
+        return store
+
+    def _run_cli(self, store, extra):
+        with TemporaryDirectory() as directory:
+            argv = [
+                "store_kv_bench.py",
+                "--scenario=read_mix",
+                "--io-api=zcopy",
+                "--nr-objects=10",
+                "--prepare-objects=4",
+                "--object-id-start=20",
+                "--value-size=512",
+                "--verify",
+                "--pattern=x",
+                "--numjobs=2",
+                "--output-dir",
+                directory,
+                *extra,
+            ]
+            fake_module = types.SimpleNamespace(
+                MooncakeDistributedStore=Mock(return_value=store),
+                ReplicateConfig=store_module.ReplicateConfig,
+                BufferPool=FakeBufferPool,
+            )
+            with (
+                patch.object(bench, "load_store_module", return_value=fake_module),
+                patch.object(sys, "argv", argv),
+            ):
+                code = bench.main()
+            return code, json.loads((Path(directory) / "summary.json").read_text())
+
+    def test_cli_runs_all_hit_all_miss_and_mixed_single_or_batched(self):
+        for hit_pct, batch_size, external in (
+            (100, 1, False),
+            (0, 3, False),
+            (60, 3, False),
+            (60, 3, True),
+        ):
+            with self.subTest(
+                hit_pct=hit_pct, batch_size=batch_size, external=external
+            ):
+                contents = {}
+                if external:
+                    contents = {
+                        bench.make_key("kvbench", 20, object_id): b"x" * 512
+                        for object_id in range(20, 24)
+                    }
+                store = self._fake_store(contents)
+                extra = [f"--read-hit-pct={hit_pct}", f"--batch-size={batch_size}"]
+                if external:
+                    extra.append("--prepare-mode=none")
+                code, summary = self._run_cli(store, extra)
+                stats = summary["phases"]["read_mix"]
+                self.assertEqual(code, 0)
+                self.assertTrue(summary["ok"])
+                expected_hits = hit_pct // 10
+                self.assertEqual(stats["expected_hits"], expected_hits)
+                self.assertEqual(stats["expected_misses"], 10 - expected_hits)
+                self.assertEqual(stats["matched_hits"], expected_hits)
+                self.assertEqual(stats["matched_misses"], 10 - expected_hits)
+                self.assertEqual(stats["kvs"], 10)
+                self.assertEqual(stats["successful_kvs"], 10)
+                self.assertEqual(stats["failed_kvs"], 0)
+                self.assertEqual(stats["misses"], 10 - expected_hits)
+                self.assertEqual(stats["bytes"], expected_hits * 512)
+                self.assertEqual(stats["error_counts"], {})
+                store.is_exist.assert_not_called()
+                if external:
+                    self.assertNotIn("prepare_write", summary["phases"])
+                    store.put_from.assert_not_called()
+                    store.batch_put_from.assert_not_called()
+                else:
+                    self.assertEqual(
+                        summary["phases"]["prepare_write"]["successful_kvs"], 4
+                    )
+
+    def test_cli_fails_a_transport_error_on_an_expected_missing_key(self):
+        store = self._fake_store({})
+        store.batch_get_into.side_effect = lambda keys, ptrs, sizes: [-800] * len(keys)
+        code, summary = self._run_cli(
+            store, ["--read-hit-pct=0", "--batch-size=3", "--prepare-mode=none"]
+        )
+        self.assertEqual(code, 22)
+        self.assertFalse(summary["ok"])
+        stats = summary["phases"]["read_mix"]
+        self.assertEqual(stats["matched_misses"], 0)
+        self.assertEqual(stats["misses"], 0)
+        self.assertEqual(stats["failed_kvs"], 10)
+        self.assertEqual(stats["error_counts"], {"-800": 10})
+
+    def test_rejects_backends_without_unambiguous_status_and_timed_mix(self):
+        for extra in (
+            "--store-backend=rs",
+            "--io-api=plain",
+            "--runtime=1",
+            "--read-hit-pct=101",
+        ):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                bench.BenchmarkRunner(self._args(extra))
+
+
 class OutputTest(unittest.TestCase):
     def test_journal_replay_summary_and_sampling(self):
         root = Path(f"/tmp/mooncake-kv-bench-test-{os.getpid()}")

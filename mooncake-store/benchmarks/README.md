@@ -2,6 +2,51 @@
 
 This directory contains benchmark tools for Mooncake Store internals.
 
+## Expected-hit/miss Store read workload
+
+`store_kv_bench.py --scenario read_mix` measures a fixed number of Store object
+reads at a reproducible expected hit percentage. Unlike `mixed_rw`, which
+mixes writes with reads from the prepared dataset, this scenario mixes reads
+of present and deliberately absent keys. For example, run against an isolated
+C++ Store cluster:
+
+```bash
+python mooncake-store/benchmarks/store_kv_bench.py \
+    --scenario read_mix --store-backend cpp --io-api zcopy \
+    --read-hit-pct 60 --nr-objects 1000 --prepare-objects 100 \
+    --key-prefix readmix-60-example --key-size 48 --rand-seed 17 \
+    --batch-size 16 --numjobs 4 --value-size 4096 \
+    --verify --pattern kv --summary-json readmix-60.json
+```
+
+Keep the object size, read count, batch size, lanes and seed fixed across
+`--read-hit-pct 100`, `0` and mixed arms. Use fresh, non-overlapping key prefixes
+for each independently prepared run. The read plan contains exactly
+`floor(nr_objects * read_hit_pct / 100)` expected hits, cycling over the
+`prepare_objects` keys (default `nr_objects`), with the remaining reads targeting
+a disjoint, unwritten key range. The seed fixes the shuffled plan and batch
+composition; actual completion order across lanes may differ. To read a dataset
+already prepared by another process on persistent Store owners, use
+`--prepare-mode none` and the same key prefix, key size, object ID start,
+prepared count, value size and payload pattern. The benchmark checks the
+expected outcomes; it does not assume an external write succeeded.
+
+The `read_mix` phase reports `expected_hits`, `expected_misses`, `matched_hits`
+and `matched_misses` in the summary. `successful_kvs` counts matching outcomes,
+including genuine expected misses; `bytes` counts matching hit bytes only.
+`misses` counts actual `OBJECT_NOT_FOUND` statuses (including unexpected ones).
+Other negative read statuses, unexpected presence/absence, incorrect hit lengths,
+and payload mismatches under `--verify` fail the workload. A batch latency is the
+latency of the whole batch, not of an individual hit or miss. An object hit does
+not identify a particular physical storage tier or an inference-engine cache hit.
+
+The scenario is currently limited to `--runtime 0`, `--store-backend cpp`, and
+`--io-api zcopy` (`get_into` / `batch_get_into`). The C++ registered-buffer APIs
+return per-key status or bytes. Plain reads can collapse absence and failure to
+an empty payload; the current Store-RS compatibility facade also maps exceptions
+to the same negative status as absence. Neither is eligible for this strict
+expected-outcome measurement until their result contracts distinguish the cases.
+
 ## Allocation Strategy Benchmark
 
 `allocation_strategy_bench` evaluates Store allocation behavior across segment
