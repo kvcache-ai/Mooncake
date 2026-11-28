@@ -1452,7 +1452,8 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     return tl::expected<QueryResult, ErrorCode>(
         tl::in_place, std::move(result.value().replicas),
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
-        result.value().object_checksum, result.value().resolved_tenant_id);
+        result.value().object_checksum, result.value().resolved_tenant_id,
+        result.value().object_generation.value_or(""));
 }
 
 tl::expected<QueryResult, ErrorCode> Client::QueryReadOnly(
@@ -1466,7 +1467,9 @@ tl::expected<QueryResult, ErrorCode> Client::QueryReadOnly(
     // The admin read-only path grants no lease: pin the expiry to now so the
     // caller cannot mistake this metadata for a lease-protected one.
     return QueryResult(std::move(result.value().replicas), start_time,
-                       result.value().object_checksum);
+                       result.value().object_checksum,
+                       result.value().resolved_tenant_id,
+                       result.value().object_generation.value_or(""));
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
@@ -1501,7 +1504,8 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
                 start_time +
                     std::chrono::milliseconds(response[i].value().lease_ttl_ms),
                 response[i].value().object_checksum,
-                response[i].value().resolved_tenant_id);
+                response[i].value().resolved_tenant_id,
+                response[i].value().object_generation.value_or(""));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -1538,9 +1542,11 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQueryReadOnly(
     for (size_t i = 0; i < response.size(); ++i) {
         if (response[i]) {
             // No lease granted on the read-only path: expiry pinned to now.
-            results.emplace_back(
-                QueryResult(std::move(response[i].value().replicas), start_time,
-                            response[i].value().object_checksum));
+            results.emplace_back(QueryResult(
+                std::move(response[i].value().replicas), start_time,
+                response[i].value().object_checksum,
+                response[i].value().resolved_tenant_id,
+                response[i].value().object_generation.value_or("")));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -2191,6 +2197,20 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         return tl::unexpected(err);
     }
 
+    auto write_generation_opt =
+        GetOptionalPrimaryWriteGeneration(start_result.value());
+    if (!write_generation_opt) {
+        (void)master_client_.PutRevoke(key, ReplicaType::ALL);
+        return tl::unexpected(write_generation_opt.error());
+    }
+    const std::string write_generation = write_generation_opt->value_or("");
+    auto make_write_meta = [&](std::optional<uint64_t> checksum) {
+        ObjectMeta meta{key, checksum, {}};
+        if (!write_generation.empty()) {
+            meta.write_generation = write_generation;
+        }
+        return meta;
+    };
     ReplicaTransferSummary transfer_summary;
     for (const auto& replica : start_result.value()) {
         transfer_summary.RecordAllocatedReplica(replica);
@@ -2208,7 +2228,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             if (replica.is_disk_replica()) {
                 // Store to local file if storage backend is available
                 auto disk_descriptor = replica.get_disk_descriptor();
-                PutToLocalFile(key, slices, disk_descriptor);
+                PutToLocalFile(key, slices, disk_descriptor, write_generation);
                 break;  // Only one disk replica is needed
             }
         }
@@ -2268,7 +2288,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.PutEnd(
-            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+            make_write_meta(object_checksum), *finalize_decision.end_type);
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
@@ -2277,8 +2297,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     if (finalize_decision.revoke_type.has_value()) {
-        auto revoke_result =
-            master_client_.PutRevoke(key, *finalize_decision.revoke_type);
+        auto revoke_result = master_client_.PutRevoke(
+            make_write_meta(std::nullopt), *finalize_decision.revoke_type);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke put operation";
             return tl::unexpected(revoke_result.error());
@@ -2332,15 +2352,42 @@ Client::DiskReplicaHealResult Client::healDanglingLocalDiskReplica(
     // the file is still there. Only a proven-gone answer evicts; present or
     // unknown (transport/config trouble) keeps the old idempotent path, so a
     // healthy replica can never be evicted by mistake.
-    const std::optional<bool> file_gone = local_disk_probe_fn_(key);
+    // Probe and conditionally evict the same physical incarnation observed in
+    // this query. A concurrent delete/rewrite must not turn an old missing-file
+    // observation into removal of the replacement's SSD replica.
+    std::string storage_key;
+    bool has_physical_key = false;
+    bool has_legacy_key = false;
+    for (const auto& replica : replicas->replicas) {
+        if (replica.status == ReplicaStatus::COMPLETE &&
+            replica.is_local_disk_replica()) {
+            const auto physical =
+                replica.get_local_disk_descriptor().storage_key.value_or("");
+            if (physical.empty()) {
+                has_legacy_key = true;
+            } else {
+                has_physical_key = true;
+                if (!storage_key.empty() && storage_key != physical) {
+                    return DiskReplicaHealResult::kUnknown;
+                }
+                storage_key = physical;
+            }
+        }
+    }
+    if (has_physical_key && has_legacy_key) {
+        return DiskReplicaHealResult::kUnknown;
+    }
+    const std::string& probe_key = has_physical_key ? storage_key : key;
+    if (probe_key.empty()) return DiskReplicaHealResult::kUnknown;
+    const std::optional<bool> file_gone = local_disk_probe_fn_(probe_key);
     if (file_gone == false) {
         return DiskReplicaHealResult::kPresent;
     }
     if (file_gone != true) {
         return DiskReplicaHealResult::kUnknown;
     }
-    auto evicted =
-        master_client_.EvictDiskReplica(key, ReplicaType::LOCAL_DISK);
+    auto evicted = master_client_.EvictDiskReplica(
+        probe_key, ReplicaType::LOCAL_DISK, has_physical_key);
     if (!evicted) {
         LOG(WARNING) << "Failed to evict dangling LOCAL_DISK replica for key="
                      << key << ": " << toString(evicted.error());
@@ -2395,6 +2442,20 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         return tl::unexpected(err);
     }
 
+    auto write_generation_opt =
+        GetOptionalPrimaryWriteGeneration(start_result.value());
+    if (!write_generation_opt) {
+        (void)master_client_.UpsertRevoke(key, ReplicaType::ALL);
+        return tl::unexpected(write_generation_opt.error());
+    }
+    const std::string write_generation = write_generation_opt->value_or("");
+    auto make_write_meta = [&](std::optional<uint64_t> checksum) {
+        ObjectMeta meta{key, checksum, {}};
+        if (!write_generation.empty()) {
+            meta.write_generation = write_generation;
+        }
+        return meta;
+    };
     ReplicaTransferSummary transfer_summary;
     for (const auto& replica : start_result.value()) {
         transfer_summary.RecordAllocatedReplica(replica);
@@ -2410,7 +2471,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             const auto& replica = *it;
             if (replica.is_disk_replica()) {
                 auto disk_descriptor = replica.get_disk_descriptor();
-                PutToLocalFile(key, slices, disk_descriptor);
+                PutToLocalFile(key, slices, disk_descriptor, write_generation);
                 break;
             }
         }
@@ -2469,7 +2530,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         DetermineFinalizeDecision(client_cfg, transfer_summary);
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.UpsertEnd(
-            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+            make_write_meta(object_checksum), *finalize_decision.end_type);
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end upsert operation: " << err;
@@ -2477,8 +2538,8 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         }
     }
     if (finalize_decision.revoke_type.has_value()) {
-        auto revoke_result =
-            master_client_.UpsertRevoke(key, *finalize_decision.revoke_type);
+        auto revoke_result = master_client_.UpsertRevoke(
+            make_write_meta(std::nullopt), *finalize_decision.revoke_type);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke upsert operation";
             return tl::unexpected(revoke_result.error());
@@ -2528,6 +2589,7 @@ class PutOperation {
     std::string key;
     std::vector<Slice> slices;
     std::optional<uint64_t> object_checksum;
+    std::string write_generation;
     std::vector<std::vector<Slice>> batched_slices;
 
     // Enhanced state tracking
@@ -2603,6 +2665,14 @@ class PutOperation {
     }
 
     void RecordAllocatedReplicas() {
+        auto generation = GetOptionalPrimaryWriteGeneration(replicas);
+        if (!generation) {
+            SetTerminalError(generation.error(),
+                             PutOperationState::MASTER_FAILED,
+                             "Primary Start returned mixed write generations");
+            return;
+        }
+        write_generation = generation->value_or("");
         transfer_summary = ReplicaTransferSummary{};
         for (const auto& replica : replicas) {
             transfer_summary.RecordAllocatedReplica(replica);
@@ -2684,48 +2754,90 @@ void Client::healDanglingLocalDiskBatchStarts(
     if (replica_lists.size() != candidate_keys.size()) {
         return;
     }
-    std::vector<std::string> evict_keys;
-    std::vector<size_t> evict_positions;
+    std::vector<std::string> physical_evict_keys;
+    std::vector<size_t> physical_evict_positions;
+    std::vector<std::string> legacy_evict_keys;
+    std::vector<size_t> legacy_evict_positions;
     for (size_t j = 0; j < candidate_keys.size(); ++j) {
         if (!replica_lists[j] || !HasOnlyClientLocalDiskReplicas(
                                      replica_lists[j]->replicas, client_id_)) {
             continue;
         }
-        const std::optional<bool> file_gone =
-            local_disk_probe_fn_(candidate_keys[j]);
+        std::string storage_key;
+        bool has_physical_key = false;
+        bool has_legacy_key = false;
+        bool ambiguous = false;
+        for (const auto& replica : replica_lists[j]->replicas) {
+            if (replica.status != ReplicaStatus::COMPLETE ||
+                !replica.is_local_disk_replica())
+                continue;
+            const auto physical =
+                replica.get_local_disk_descriptor().storage_key.value_or("");
+            if (physical.empty()) {
+                has_legacy_key = true;
+            } else {
+                has_physical_key = true;
+                if (!storage_key.empty() && storage_key != physical) {
+                    ambiguous = true;
+                    break;
+                }
+                storage_key = physical;
+            }
+        }
+        if (ambiguous || (has_physical_key && has_legacy_key)) continue;
+        const std::string& probe_key =
+            has_physical_key ? storage_key : candidate_keys[j];
+        if (probe_key.empty()) continue;
+        const std::optional<bool> file_gone = local_disk_probe_fn_(probe_key);
         if (file_gone != true) {
             continue;
         }
-        evict_keys.emplace_back(candidate_keys[j]);
-        evict_positions.emplace_back(j);
+        if (has_physical_key) {
+            physical_evict_keys.emplace_back(probe_key);
+            physical_evict_positions.emplace_back(j);
+        } else {
+            legacy_evict_keys.emplace_back(probe_key);
+            legacy_evict_positions.emplace_back(j);
+        }
     }
-    if (evict_keys.empty()) {
-        return;
-    }
-    auto evicted = master_client_.BatchEvictDiskReplica(
-        evict_keys, ReplicaType::LOCAL_DISK);
-    if (evicted.size() != evict_keys.size()) {
+    if (physical_evict_keys.empty() && legacy_evict_keys.empty()) {
         return;
     }
     std::vector<std::string> retry_keys;
     std::vector<std::vector<uint64_t>> retry_slices;
     std::vector<size_t> retry_positions;
     std::vector<size_t> retry_config_indices;
-    for (size_t j = 0; j < evict_keys.size(); ++j) {
-        if (!evicted[j]) {
-            LOG(WARNING) << "Failed to evict dangling LOCAL_DISK replica for "
-                         << "key=" << evict_keys[j] << ": "
-                         << toString(evicted[j].error());
-            continue;
+    auto evict_batch = [&](const std::vector<std::string>& batch_evict_keys,
+                           const std::vector<size_t>& batch_evict_positions,
+                           bool is_physical) {
+        if (batch_evict_keys.empty()) return;
+        auto evicted = master_client_.BatchEvictDiskReplica(
+            batch_evict_keys, ReplicaType::LOCAL_DISK, is_physical);
+        if (evicted.size() != batch_evict_keys.size()) {
+            return;
         }
-        LOG(WARNING) << "Evicted dangling LOCAL_DISK replica for key="
-                     << evict_keys[j] << " (backing file already gone)";
-        retry_positions.emplace_back(evict_positions[j]);
-        retry_config_indices.push_back(already_exists[evict_positions[j]]);
-        retry_keys.emplace_back(keys[already_exists[evict_positions[j]]]);
-        retry_slices.emplace_back(
-            slice_lengths[already_exists[evict_positions[j]]]);
-    }
+        for (size_t j = 0; j < batch_evict_keys.size(); ++j) {
+            if (!evicted[j]) {
+                LOG(WARNING)
+                    << "Failed to evict dangling LOCAL_DISK replica for "
+                    << "key=" << batch_evict_keys[j] << ": "
+                    << toString(evicted[j].error());
+                continue;
+            }
+            LOG(WARNING) << "Evicted dangling LOCAL_DISK replica for key="
+                         << batch_evict_keys[j]
+                         << " (backing file already gone)";
+            retry_positions.emplace_back(batch_evict_positions[j]);
+            retry_config_indices.push_back(
+                already_exists[batch_evict_positions[j]]);
+            retry_keys.emplace_back(
+                keys[already_exists[batch_evict_positions[j]]]);
+            retry_slices.emplace_back(
+                slice_lengths[already_exists[batch_evict_positions[j]]]);
+        }
+    };
+    evict_batch(physical_evict_keys, physical_evict_positions, true);
+    evict_batch(legacy_evict_keys, legacy_evict_positions, false);
     if (retry_keys.empty()) {
         return;
     }
@@ -3010,7 +3122,8 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops,
                 const auto& replica = *it;
                 if (replica.is_disk_replica()) {
                     auto disk_descriptor = replica.get_disk_descriptor();
-                    PutToLocalFile(op.key, op.slices, disk_descriptor);
+                    PutToLocalFile(op.key, op.slices, disk_descriptor,
+                                   op.write_generation);
                     break;  // Only one disk replica is needed
                 }
             }
@@ -3434,8 +3547,12 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         std::vector<ObjectMeta> object_metas;
         object_metas.reserve(group.indices.size());
         for (size_t i = 0; i < group.indices.size(); ++i) {
-            object_metas.emplace_back(ObjectMeta{
-                group.keys[i], ops[group.indices[i]].object_checksum});
+            ObjectMeta meta{
+                group.keys[i], ops[group.indices[i]].object_checksum, {}};
+            if (!ops[group.indices[i]].write_generation.empty()) {
+                meta.write_generation = ops[group.indices[i]].write_generation;
+            }
+            object_metas.emplace_back(std::move(meta));
         }
         auto responses = master_client_.BatchPutEnd(object_metas, replica_type);
         if (responses.size() != group.keys.size()) {
@@ -3463,8 +3580,17 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         if (group.keys.empty()) {
             return;
         }
+        std::vector<ObjectMeta> object_metas;
+        object_metas.reserve(group.indices.size());
+        for (size_t i = 0; i < group.indices.size(); ++i) {
+            ObjectMeta meta{group.keys[i], std::nullopt, {}};
+            if (!ops[group.indices[i]].write_generation.empty()) {
+                meta.write_generation = ops[group.indices[i]].write_generation;
+            }
+            object_metas.emplace_back(std::move(meta));
+        }
         auto responses =
-            master_client_.BatchPutRevoke(group.keys, replica_type);
+            master_client_.BatchPutRevoke(object_metas, replica_type);
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
@@ -3545,12 +3671,12 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
 void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     std::vector<ObjectMeta> successful_object_metas;
     std::vector<size_t> successful_indices;
-    std::vector<std::string> failed_keys;
+    std::vector<ObjectMeta> failed_object_metas;
     std::vector<size_t> failed_indices;
 
     successful_object_metas.reserve(ops.size());
     successful_indices.reserve(ops.size());
-    failed_keys.reserve(ops.size());
+    failed_object_metas.reserve(ops.size());
     failed_indices.reserve(ops.size());
 
     for (size_t i = 0; i < ops.size(); ++i) {
@@ -3559,8 +3685,11 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
             HasExpectedReplicaAllocation(op.ToReplicateConfig(),
                                          op.transfer_summary) &&
             AllAllocatedTransfersSucceeded(op.transfer_summary)) {
-            successful_object_metas.emplace_back(
-                ObjectMeta{op.key, op.object_checksum});
+            ObjectMeta meta{op.key, op.object_checksum, {}};
+            if (!op.write_generation.empty()) {
+                meta.write_generation = op.write_generation;
+            }
+            successful_object_metas.emplace_back(std::move(meta));
             successful_indices.emplace_back(i);
             continue;
         }
@@ -3575,7 +3704,11 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
                     "Replica transfer failed before upsert finalize"));
         }
         if (!op.IsSuccessful() && !op.replicas.empty()) {
-            failed_keys.emplace_back(op.key);
+            ObjectMeta meta{op.key, std::nullopt, {}};
+            if (!op.write_generation.empty()) {
+                meta.write_generation = op.write_generation;
+            }
+            failed_object_metas.emplace_back(std::move(meta));
             failed_indices.emplace_back(i);
         }
     }
@@ -3623,11 +3756,12 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     }
 
     // Process failed operations that need cleanup
-    if (!failed_keys.empty()) {
-        auto revoke_responses = master_client_.BatchUpsertRevoke(failed_keys);
-        if (revoke_responses.size() != failed_keys.size()) {
+    if (!failed_object_metas.empty()) {
+        auto revoke_responses =
+            master_client_.BatchUpsertRevoke(failed_object_metas);
+        if (revoke_responses.size() != failed_object_metas.size()) {
             LOG(ERROR) << "BatchUpsertRevoke response size mismatch: expected "
-                       << failed_keys.size() << ", got "
+                       << failed_object_metas.size() << ", got "
                        << revoke_responses.size();
             for (size_t idx : failed_indices) {
                 ops[idx].SetError(ErrorCode::RPC_FAIL,
@@ -3637,16 +3771,16 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
             for (size_t i = 0; i < revoke_responses.size(); ++i) {
                 const size_t op_idx = failed_indices[i];
                 if (!revoke_responses[i]) {
-                    LOG(ERROR)
-                        << "Failed to revoke upsert for key " << failed_keys[i]
-                        << ": " << toString(revoke_responses[i].error());
+                    LOG(ERROR) << "Failed to revoke upsert for key "
+                               << failed_object_metas[i].key << ": "
+                               << toString(revoke_responses[i].error());
                     std::string original_context =
                         ops[op_idx].failure_context.value_or("unknown error");
                     ops[op_idx].failure_context =
                         original_context + "; revoke also failed";
                 } else {
                     LOG(INFO) << "Successfully revoked failed upsert for key "
-                              << failed_keys[i];
+                              << failed_object_metas[i].key;
                 }
             }
         }
@@ -3869,6 +4003,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutEnd(
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
+    const std::vector<ObjectMeta>& object_metas, ReplicaType replica_type) {
+    return master_client_.BatchPutRevoke(object_metas, replica_type);
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
     const std::vector<std::string>& keys, ReplicaType replica_type) {
     return master_client_.BatchPutRevoke(keys, replica_type);
 }
@@ -3979,14 +4118,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
 }
 
 tl::expected<void, ErrorCode> Client::EvictDiskReplica(
-    const std::string& key, ReplicaType replica_type) {
-    return master_client_.EvictDiskReplica(key, replica_type);
+    const std::string& key, ReplicaType replica_type,
+    bool physical_storage_key) {
+    return master_client_.EvictDiskReplica(key, replica_type,
+                                           physical_storage_key);
 }
 
 tl::expected<void, ErrorCode> Client::EvictDiskReplica(
     const std::string& key, const std::string& tenant_id,
-    ReplicaType replica_type) {
-    return master_client_.EvictDiskReplica(key, tenant_id, replica_type);
+    ReplicaType replica_type, bool physical_storage_key) {
+    return master_client_.EvictDiskReplica(key, tenant_id, replica_type,
+                                           physical_storage_key);
 }
 
 tl::expected<bool, ErrorCode> Client::EvictDiskReplicaIfCurrent(
@@ -3997,14 +4139,17 @@ tl::expected<bool, ErrorCode> Client::EvictDiskReplicaIfCurrent(
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchEvictDiskReplica(
-    const std::vector<std::string>& keys, ReplicaType replica_type) {
-    return master_client_.BatchEvictDiskReplica(keys, replica_type);
+    const std::vector<std::string>& keys, ReplicaType replica_type,
+    bool physical_storage_key) {
+    return master_client_.BatchEvictDiskReplica(keys, replica_type,
+                                                physical_storage_key);
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchEvictDiskReplica(
     const std::vector<std::string>& keys, const std::string& tenant_id,
-    ReplicaType replica_type) {
-    return master_client_.BatchEvictDiskReplica(keys, tenant_id, replica_type);
+    ReplicaType replica_type, bool physical_storage_key) {
+    return master_client_.BatchEvictDiskReplica(keys, tenant_id, replica_type,
+                                                physical_storage_key);
 }
 
 std::vector<int> Client::GetNicNumaNodes() const {
@@ -4587,19 +4732,24 @@ tl::expected<void, ErrorCode> Client::RegisterPrefetchTask(
 }
 
 tl::expected<PromotionAllocStartResponse, ErrorCode>
-Client::PromotionAllocStart(
-    const std::string& key, uint64_t size,
-    const std::vector<std::string>& preferred_segments) {
-    return master_client_.PromotionAllocStart(client_id_, key, size,
-                                              preferred_segments);
+Client::PromotionAllocStart(const std::string& key, uint64_t size,
+                            const std::vector<std::string>& preferred_segments,
+                            bool physical_storage_key,
+                            const std::string& expected_task_id) {
+    return master_client_.PromotionAllocStart(
+        client_id_, key, size, preferred_segments, physical_storage_key,
+        expected_task_id);
 }
 
 tl::expected<PromotionAllocStartResponse, ErrorCode>
-Client::PromotionAllocStart(
-    const std::string& key, const std::string& tenant_id, uint64_t size,
-    const std::vector<std::string>& preferred_segments) {
-    return master_client_.PromotionAllocStart(client_id_, key, tenant_id, size,
-                                              preferred_segments);
+Client::PromotionAllocStart(const std::string& key,
+                            const std::string& tenant_id, uint64_t size,
+                            const std::vector<std::string>& preferred_segments,
+                            bool physical_storage_key,
+                            const std::string& expected_task_id) {
+    return master_client_.PromotionAllocStart(
+        client_id_, key, tenant_id, size, preferred_segments,
+        physical_storage_key, expected_task_id);
 }
 
 tl::expected<void, ErrorCode> Client::NotifyPromotionSuccess(
@@ -4612,6 +4762,21 @@ tl::expected<void, ErrorCode> Client::NotifyPromotionSuccess(
     return master_client_.NotifyPromotionSuccess(client_id_, key, tenant_id);
 }
 
+tl::expected<void, ErrorCode> Client::NotifyPromotionSuccess(
+    const std::string& key, const std::string& expected_generation,
+    const std::string& expected_task_id) {
+    return master_client_.NotifyPromotionSuccess(
+        client_id_, key, expected_generation, expected_task_id);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionSuccess(
+    const std::string& key, const std::string& tenant_id,
+    const std::string& expected_generation,
+    const std::string& expected_task_id) {
+    return master_client_.NotifyPromotionSuccess(
+        client_id_, key, tenant_id, expected_generation, expected_task_id);
+}
+
 tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
     const std::string& key) {
     return master_client_.NotifyPromotionFailure(client_id_, key);
@@ -4620,6 +4785,21 @@ tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
 tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
     const std::string& key, const std::string& tenant_id) {
     return master_client_.NotifyPromotionFailure(client_id_, key, tenant_id);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
+    const std::string& key, const std::string& expected_generation,
+    const std::string& expected_task_id) {
+    return master_client_.NotifyPromotionFailure(
+        client_id_, key, expected_generation, expected_task_id);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
+    const std::string& key, const std::string& tenant_id,
+    const std::string& expected_generation,
+    const std::string& expected_task_id) {
+    return master_client_.NotifyPromotionFailure(
+        client_id_, key, tenant_id, expected_generation, expected_task_id);
 }
 
 ErrorCode Client::PromotionWrite(const Replica::Descriptor& memory_descriptor,
@@ -4959,7 +5139,8 @@ ErrorCode Client::PrepareStorageBackend(const std::string& storage_root_dir,
 
 void Client::PutToLocalFile(const std::string& key,
                             const std::vector<Slice>& slices,
-                            const DiskDescriptor& disk_descriptor) {
+                            const DiskDescriptor& disk_descriptor,
+                            const std::string& write_generation) {
     if (!storage_backend_) return;
 
     size_t total_size = 0;
@@ -4977,6 +5158,14 @@ void Client::PutToLocalFile(const std::string& key,
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
 
+    auto make_write_meta = [&key, &write_generation]() {
+        ObjectMeta meta{key, std::nullopt, {}};
+        if (!write_generation.empty()) {
+            meta.write_generation = write_generation;
+        }
+        return meta;
+    };
+
     for (const auto& slice : slices) {
         device::PointerInfo info{};
         auto* device =
@@ -4990,8 +5179,8 @@ void Client::PutToLocalFile(const std::string& key,
                            << ", triggering PutRevoke for disk replica";
                 pinned_buffer_pool_->Release(std::move(buf));
                 // Must revoke to avoid phantom replica in master
-                auto revoke_result =
-                    master_client_.PutRevoke(key, ReplicaType::DISK);
+                auto revoke_result = master_client_.PutRevoke(
+                    make_write_meta(), ReplicaType::DISK);
                 if (!revoke_result) {
                     LOG(ERROR)
                         << "Failed to revoke put operation for key: " << key;
@@ -5007,8 +5196,13 @@ void Client::PutToLocalFile(const std::string& key,
 
     // Async StoreObject + PutEnd (unchanged from original)
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
-                                value = std::move(value), path] {
+                                value = std::move(value), path,
+                                write_generation] {
         ReplicaType replica_type = ReplicaType::DISK;
+        ObjectMeta disk_meta{key, std::nullopt, {}};
+        if (!write_generation.empty()) {
+            disk_meta.write_generation = write_generation;
+        }
         // Store the object
         auto store_result = backend->StoreObject(
             path, value, key,
@@ -5040,7 +5234,8 @@ void Client::PutToLocalFile(const std::string& key,
         if (!store_result) {
             // If storage failed, revoke the put operation
             LOG(ERROR) << "Failed to store object for key: " << key;
-            auto revoke_result = master_client_.PutRevoke(key, replica_type);
+            auto revoke_result =
+                master_client_.PutRevoke(disk_meta, replica_type);
             if (!revoke_result) {
                 LOG(ERROR) << "Failed to revoke put operation for key: " << key;
             }
@@ -5048,8 +5243,7 @@ void Client::PutToLocalFile(const std::string& key,
         }
 
         // If storage succeeded, end the put operation
-        auto end_result =
-            master_client_.PutEnd(ObjectMeta{key, std::nullopt}, replica_type);
+        auto end_result = master_client_.PutEnd(disk_meta, replica_type);
         if (!end_result) {
             LOG(ERROR) << "Failed to end put operation for key: " << key;
         }

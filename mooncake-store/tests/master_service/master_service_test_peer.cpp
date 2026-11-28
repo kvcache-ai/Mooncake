@@ -1,4 +1,5 @@
 #include "master_service/master_service_test_peer.h"
+#include "rpc_service.h"
 
 #include <algorithm>
 #include <cassert>
@@ -8,6 +9,29 @@
 #include "storage/distributed/kvcs/kvcs_capacity_provider.h"
 
 namespace mooncake::test {
+
+MasterServiceTestPeer::MasterServiceTestPeer(WrappedMasterService& service)
+    : service_(service.master_service_) {}
+
+MasterServiceTestPeer::OffloadInspection
+MasterServiceTestPeer::InspectOffloadForTesting(const TenantId& tenant_id,
+                                                const std::string& key) {
+    OffloadInspection result;
+    MetadataAccessorRO accessor(&service_, ObjectIdentity{tenant_id, key});
+    if (!accessor.Exists()) return result;
+    result.task_count = accessor.GetState().offloading_task.has_value();
+    for (const auto& replica : accessor.Get().GetAllReplicas()) {
+        if (replica.is_memory_replica())
+            result.memory_refs += replica.get_refcnt();
+    }
+    return result;
+}
+
+int64_t MasterServiceTestPeer::GetLocalDiskUsedBytesForTesting(
+    const UUID& client_id) {
+    auto usage = service_.local_ssd_manager_.GetUsage(client_id);
+    return usage ? usage->used_bytes : 0;
+}
 
 ErrorCode MasterServiceTestPeer::SetBatchOpLogBackendForTesting(
     std::shared_ptr<HaKvBackend> backend) {

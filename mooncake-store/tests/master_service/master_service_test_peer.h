@@ -5,6 +5,10 @@
 #include "client_session/client_session_registry_test_peer.h"
 #include "master_service.h"
 
+namespace mooncake {
+class WrappedMasterService;
+}
+
 namespace mooncake::test {
 
 // The single test access boundary for MasterService. Keep test-only inspection,
@@ -15,6 +19,15 @@ class MasterServiceTestPeer {
    public:
     explicit MasterServiceTestPeer(MasterService& service)
         : service_(service) {}
+    explicit MasterServiceTestPeer(WrappedMasterService& service);
+
+    struct OffloadInspection {
+        size_t task_count{0};
+        uint32_t memory_refs{0};
+    };
+    OffloadInspection InspectOffloadForTesting(const TenantId& tenant_id,
+                                               const std::string& key);
+    int64_t GetLocalDiskUsedBytesForTesting(const UUID& client_id);
 
     size_t RunWeightReconciliationForTesting(uint64_t now_ms,
                                              size_t limit = 32) {
@@ -269,6 +282,11 @@ class MasterServiceTestPeer {
     static const auto& OrderedOplogWriter(const MasterService& service) {
         return service.ordered_oplog_writer_;
     }
+    static void SetOpLogDurableWaitTimeoutForTesting(
+        MasterService& service, std::chrono::milliseconds timeout) {
+        service.oplog_durable_wait_timeout_ms_.store(timeout.count(),
+                                                     std::memory_order_release);
+    }
 
     static auto& PromotionAdmissionThreshold(MasterService& service) {
         return service.promotion_admission_threshold_;
@@ -452,6 +470,27 @@ class MasterServiceTestPeer {
         service_.dynamic_replication_.ClearPendingLocked(tenant_id, key, state);
     }
 
+    bool AgeOffloadTaskForTesting(const TenantId& tenant,
+                                  const std::string& key) {
+        MetadataAccessorRW accessor(&service_, ObjectIdentity{tenant, key});
+        if (!accessor.Exists()) return false;
+        auto& task = accessor.GetState().offloading_task;
+        if (!task) return false;
+        task->start_time =
+            std::chrono::system_clock::now() - std::chrono::hours(24);
+        return true;
+    }
+
+    bool ReissueOffloadTaskForTesting(const OffloadTaskItem& task) {
+        MetadataAccessorRW accessor(
+            &service_, ObjectIdentity{TenantId(task.tenant_id), task.key});
+        if (!accessor.Exists()) return false;
+        auto& current = accessor.GetState().offloading_task;
+        if (!current) return false;
+        current->task_id = task.task_id.value_or("");
+        return true;
+    }
+
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
         service_.ClearLocalDiskHandlesOwnedBy(owner);
     }
@@ -565,7 +604,8 @@ class MasterServiceTestPeer {
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr) {
-        return service_.PushOffloadingQueue(object_id, replica, mirror_clients);
+        return service_.PushOffloadingQueue(
+            object_id, replica, "test-generation", "test-task", mirror_clients);
     }
 
     const TenantId& ResolveRequestTenantId(const TenantId& tenant_id) const {

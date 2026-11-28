@@ -23,6 +23,7 @@
 #include "common/network.h"
 #include "ha/ha_types.h"
 #include "master_admin_service.h"
+#include "offload_storage_key.h"
 #include "master_config.h"
 #include "master_metric_manager.h"
 #include "rpc_service.h"
@@ -818,11 +819,14 @@ TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
     auto put =
         service->PutStart(client_id, "quota_admin_key", 100, cfg, "tenant-a");
     ASSERT_TRUE(put.has_value()) << toString(put.error());
-    ASSERT_TRUE(service
-                    ->PutEnd(client_id,
-                             ObjectMeta{"quota_admin_key", std::nullopt},
-                             ReplicaType::MEMORY, "tenant-a")
-                    .has_value());
+    auto put_gen = GetPrimaryWriteGeneration(*put);
+    ASSERT_TRUE(put_gen.has_value());
+    ASSERT_TRUE(
+        service
+            ->PutEnd(client_id,
+                     ObjectMeta{"quota_admin_key", std::nullopt, *put_gen},
+                     ReplicaType::MEMORY, "tenant-a")
+            .has_value());
 
     auto metrics = HttpGet(port, "/metrics");
     EXPECT_EQ(metrics.http_status, 200);
@@ -957,9 +961,12 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
         cfg.replica_num = 1;
         auto ps = service_->PutStart(client_id, kDefaultKey, 1024, cfg);
         if (ps.has_value()) {
-            (void)service_->PutEnd(client_id,
-                                   ObjectMeta{kDefaultKey, std::nullopt},
-                                   ReplicaType::MEMORY);
+            auto gen = GetPrimaryWriteGeneration(*ps);
+            if (gen.has_value()) {
+                (void)service_->PutEnd(
+                    client_id, ObjectMeta{kDefaultKey, std::nullopt, *gen},
+                    ReplicaType::MEMORY);
+            }
         }
 
         port_ = getFreeTcpPort();
@@ -1092,8 +1099,12 @@ TEST_F(MasterAdminServerWithServiceTest, GetAllKeysExcludesRemovedKey) {
     cfg.replica_num = 1;
     auto ps = service_->PutStart(client_id, key, 1024, cfg);
     if (ps.has_value()) {
-        (void)service_->PutEnd(client_id, ObjectMeta{key, std::nullopt},
-                               ReplicaType::MEMORY);
+        auto gen = GetPrimaryWriteGeneration(*ps);
+        if (gen.has_value()) {
+            (void)service_->PutEnd(client_id,
+                                   ObjectMeta{key, std::nullopt, *gen},
+                                   ReplicaType::MEMORY);
+        }
     }
     (void)service_->Remove(key, "default");
 
@@ -1313,11 +1324,15 @@ TEST_F(MasterAdminServerTest, CancelDrainJobReportsInFlightStatus) {
     ReplicateConfig replica_config;
     replica_config.replica_num = 1;
     replica_config.preferred_segments = {source.name};
-    ASSERT_TRUE(service->PutStart(source_client, "admin_cancel_key", 1024,
-                                  replica_config));
-    ASSERT_TRUE(service->PutEnd(source_client,
-                                ObjectMeta{"admin_cancel_key", std::nullopt},
-                                ReplicaType::MEMORY));
+    auto cancel_ps = service->PutStart(source_client, "admin_cancel_key", 1024,
+                                       replica_config);
+    ASSERT_TRUE(cancel_ps);
+    auto cancel_gen = GetPrimaryWriteGeneration(*cancel_ps);
+    ASSERT_TRUE(cancel_gen);
+    ASSERT_TRUE(service->PutEnd(
+        source_client,
+        ObjectMeta{"admin_cancel_key", std::nullopt, *cancel_gen},
+        ReplicaType::MEMORY));
 
     CreateDrainJobRequest request;
     request.segments = {source.name};
@@ -1511,9 +1526,12 @@ TEST_F(MasterAdminServerWithServiceTest, BatchQueryKeysMultipleKeys) {
     cfg.replica_num = 1;
     auto ps = service_->PutStart(client_id, "second_key", 512, cfg);
     if (ps.has_value()) {
-        (void)service_->PutEnd(client_id,
-                               ObjectMeta{"second_key", std::nullopt},
-                               ReplicaType::MEMORY);
+        auto gen = GetPrimaryWriteGeneration(*ps);
+        if (gen.has_value()) {
+            (void)service_->PutEnd(client_id,
+                                   ObjectMeta{"second_key", std::nullopt, *gen},
+                                   ReplicaType::MEMORY);
+        }
     }
 
     auto resp = HttpGet("/batch_query_keys?keys=" + std::string(kDefaultKey) +
@@ -1657,13 +1675,21 @@ TEST_F(MasterAdminServerTest, MultipleSegmentsAndKeys) {
     cfg.replica_num = 1;
     auto ps1 = service->PutStart(client_id, "key_one", 1024, cfg);
     if (ps1.has_value()) {
-        (void)service->PutEnd(client_id, ObjectMeta{"key_one", std::nullopt},
-                              ReplicaType::MEMORY);
+        auto gen1 = GetPrimaryWriteGeneration(*ps1);
+        if (gen1.has_value()) {
+            (void)service->PutEnd(client_id,
+                                  ObjectMeta{"key_one", std::nullopt, *gen1},
+                                  ReplicaType::MEMORY);
+        }
     }
     auto ps2 = service->PutStart(client_id, "key_two", 2048, cfg);
     if (ps2.has_value()) {
-        (void)service->PutEnd(client_id, ObjectMeta{"key_two", std::nullopt},
-                              ReplicaType::MEMORY);
+        auto gen2 = GetPrimaryWriteGeneration(*ps2);
+        if (gen2.has_value()) {
+            (void)service->PutEnd(client_id,
+                                  ObjectMeta{"key_two", std::nullopt, *gen2},
+                                  ReplicaType::MEMORY);
+        }
     }
 
     int port = getFreeTcpPort();
@@ -1740,15 +1766,42 @@ TEST_F(MasterAdminServerTest, BatchQueryKeysReturnsLocalDiskReplicaInfo) {
 
     const std::string key = "ld_only_key";
     const std::string endpoint = "127.0.0.1:9999";
+    ReplicateConfig replicate_cfg;
+    replicate_cfg.replica_num = 1;
+    auto ld_ps = service->PutStart(client_id, key, 2048, replicate_cfg);
+    ASSERT_TRUE(ld_ps.has_value());
+    auto ld_gen = GetPrimaryWriteGeneration(*ld_ps);
+    ASSERT_TRUE(ld_gen.has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, ObjectMeta{key, std::nullopt, *ld_gen},
+                             ReplicaType::MEMORY)
+                    .has_value());
+    auto offloads = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(offloads.has_value());
+    if (!offloads->empty()) {
+        std::vector<StorageObjectMetadata> rejected(offloads->size());
+        for (auto& item : rejected) item.data_size = -1;
+        ASSERT_TRUE(
+            service->NotifyOffloadSuccess(client_id, *offloads, rejected)
+                .has_value());
+    }
     StorageObjectMetadata sm;
     sm.bucket_id = 0;
     sm.offset = 0;
-    sm.key_size = static_cast<int64_t>(key.size());
+    sm.key_size =
+        static_cast<int64_t>(MakeOffloadStorageKey(key, *ld_gen).size());
     sm.data_size = 2048;
     sm.transport_endpoint = endpoint;
-    OffloadTaskItem task{.tenant_id = "default", .key = key, .size = 2048};
+    OffloadTaskItem task{.tenant_id = "default",
+                         .key = key,
+                         .size = 2048,
+                         .object_generation = *ld_gen,
+                         .restoring = true};
     ASSERT_TRUE(
         service->NotifyOffloadSuccess(client_id, {task}, {sm}).has_value());
+    auto cleared = service->BatchReplicaClear({key}, client_id, segment.name);
+    ASSERT_TRUE(cleared.has_value());
+    ASSERT_EQ(cleared->size(), 1u);
 
     int port = getFreeTcpPort();
     MasterAdminServer admin(static_cast<uint16_t>(port), false);

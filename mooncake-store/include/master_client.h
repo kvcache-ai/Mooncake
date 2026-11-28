@@ -312,6 +312,8 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
         const std::string& key, ReplicaType replica_type);
+    [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
+        const ObjectMeta& object_meta, ReplicaType replica_type);
 
     /**
      * @brief Revokes a put operation for a batch of objects
@@ -320,6 +322,9 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
+        const std::vector<ObjectMeta>& object_metas,
         ReplicaType replica_type = ReplicaType::ALL);
 
     /**
@@ -348,9 +353,13 @@ class MasterClient {
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertRevoke(
         const std::string& key, ReplicaType replica_type);
+    [[nodiscard]] tl::expected<void, ErrorCode> UpsertRevoke(
+        const ObjectMeta& object_meta, ReplicaType replica_type);
 
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const std::vector<std::string>& keys);
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
+        const std::vector<ObjectMeta>& object_metas);
 
     /**
      * @brief Removes an object and all its replicas
@@ -597,11 +606,15 @@ class MasterClient {
     [[nodiscard]] tl::expected<PromotionAllocStartResponse, ErrorCode>
     PromotionAllocStart(const UUID& client_id, const std::string& key,
                         uint64_t size,
-                        const std::vector<std::string>& preferred_segments);
+                        const std::vector<std::string>& preferred_segments,
+                        bool physical_storage_key = false,
+                        const std::string& expected_task_id = {});
     [[nodiscard]] tl::expected<PromotionAllocStartResponse, ErrorCode>
     PromotionAllocStart(const UUID& client_id, const std::string& key,
                         const std::string& tenant_id, uint64_t size,
-                        const std::vector<std::string>& preferred_segments);
+                        const std::vector<std::string>& preferred_segments,
+                        bool physical_storage_key = false,
+                        const std::string& expected_task_id = {});
 
     /**
      * @brief Release master-side promotion task state after a client-side
@@ -613,6 +626,14 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionFailure(
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const UUID& client_id, const std::string& key,
+        const std::string& expected_generation,
+        const std::string& expected_task_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const std::string& expected_generation,
+        const std::string& expected_task_id);
 
     /**
      * @brief Commit a staged MEMORY replica to COMPLETE; called after the
@@ -623,6 +644,14 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionSuccess(
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const UUID& client_id, const std::string& key,
+        const std::string& expected_generation,
+        const std::string& expected_task_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const std::string& expected_generation,
+        const std::string& expected_task_id);
 
     /**
      * @brief Start a copy operation
@@ -794,10 +823,11 @@ class MasterClient {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> EvictDiskReplica(
-        const std::string& key, ReplicaType replica_type);
+        const std::string& key, ReplicaType replica_type,
+        bool physical_storage_key = false);
     [[nodiscard]] tl::expected<void, ErrorCode> EvictDiskReplica(
         const std::string& key, const std::string& tenant_id,
-        ReplicaType replica_type);
+        ReplicaType replica_type, bool physical_storage_key = false);
 
     /**
      * @brief Evict a disk replica only if the master still records the
@@ -825,11 +855,13 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
     BatchEvictDiskReplica(const std::vector<std::string>& keys,
-                          ReplicaType replica_type);
+                          ReplicaType replica_type,
+                          bool physical_storage_key = false);
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
     BatchEvictDiskReplica(const std::vector<std::string>& keys,
                           const std::string& tenant_id,
-                          ReplicaType replica_type);
+                          ReplicaType replica_type,
+                          bool physical_storage_key = false);
 
    private:
     /**

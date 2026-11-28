@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "offload_storage_key.h"
 #include "weight_management.h"
 
 namespace mooncake::test {
@@ -114,10 +115,27 @@ class WeightGroupLifecycleTest : public MasterServiceTest {
                                     const UUID& client_id,
                                     const std::string& key, int64_t size,
                                     const std::string& endpoint) {
+        auto pending_offloads = service.OffloadObjectHeartbeat(client_id, true);
+        if (pending_offloads && !pending_offloads->empty()) {
+            std::vector<StorageObjectMetadata> nacks(pending_offloads->size());
+            for (auto& meta : nacks) meta.data_size = -1;
+            ASSERT_TRUE(service.NotifyOffloadSuccess(client_id,
+                                                     *pending_offloads, nacks));
+        }
+        const auto generation =
+            CapturedPrimaryGrantsForTesting::Meta(&service, client_id, key,
+                                                  TenantId::Default())
+                .write_generation.value_or("");
+        ASSERT_FALSE(generation.empty());
         std::vector<OffloadTaskItem> tasks{
-            OffloadTaskItem{.tenant_id = "default", .key = key, .size = size}};
+            OffloadTaskItem{.tenant_id = "default",
+                            .key = key,
+                            .size = size,
+                            .object_generation = generation,
+                            .restoring = true}};
         StorageObjectMetadata metadata;
-        metadata.key_size = key.size();
+        metadata.key_size =
+            static_cast<int64_t>(MakeOffloadStorageKey(key, generation).size());
         metadata.data_size = size;
         metadata.transport_endpoint = endpoint;
         ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, tasks, {metadata}));
@@ -159,8 +177,9 @@ TEST_F(WeightGroupLifecycleTest,
     const auto ready = PublishReadyWithPayloads(
         service, context.client_id,
         {{"payload-a", 1024, "affinity-a"}, {"payload-b", 3072, "affinity-b"}});
-    ASSERT_TRUE(service.PutEnd(context.client_id, "payload-a",
-                               TenantId::Default(), ReplicaType::DISK));
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id,
+                                          "payload-a", TenantId::Default(),
+                                          ReplicaType::DISK));
     {
         MasterServiceTestPeer::MetadataAccessorRW member(
             &service, MasterServiceTestPeer::ObjectIdentity{TenantId::Default(),
@@ -250,8 +269,9 @@ TEST_F(WeightGroupLifecycleTest, HotManifestDoesNotChangeColdPayloadResidency) {
                               .build());
     const auto context = PrepareSimpleSegment(service);
     const auto ready = PublishReady(service, context.client_id);
-    ASSERT_TRUE(service.PutEnd(context.client_id, "payload-a",
-                               TenantId::Default(), ReplicaType::DISK));
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id,
+                                          "payload-a", TenantId::Default(),
+                                          ReplicaType::DISK));
     {
         MasterServiceTestPeer::MetadataAccessorRW member(
             &service, MasterServiceTestPeer::ObjectIdentity{TenantId::Default(),
@@ -277,8 +297,9 @@ TEST_F(WeightGroupLifecycleTest, RevisionLeasePreventsPhysicalDemotion) {
     const auto context = PrepareSimpleSegment(service);
     const auto ready = PublishReady(service, context.client_id);
     for (const auto& key : {std::string("payload-a"), ManifestKey()}) {
-        ASSERT_TRUE(service.PutEnd(context.client_id, key, TenantId::Default(),
-                                   ReplicaType::DISK));
+        ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id, key,
+                                              TenantId::Default(),
+                                              ReplicaType::DISK));
     }
     const auto lease = service.AcquireWeightRevisionLease({
         .identity = ready.identity,
@@ -529,8 +550,8 @@ TEST_F(WeightGroupLifecycleTest, OperationRemainsPendingUntilTargetObserved) {
     auto ready = PublishReady(service, client_id);
 
     for (const auto& key : {std::string("payload-a"), ManifestKey()}) {
-        ASSERT_TRUE(service.PutEnd(client_id, key, TenantId::Default(),
-                                   ReplicaType::DISK));
+        ASSERT_TRUE(PutEndWithGrantForTesting(
+            service, client_id, key, TenantId::Default(), ReplicaType::DISK));
         ASSERT_TRUE(service.GetReplicaList(key, TenantId::Default()));
     }
     auto started = service.StartWeightResidencyOperation(
@@ -572,8 +593,9 @@ TEST_F(WeightGroupLifecycleTest,
         {{"payload-a", 1024, "affinity-a"}, {"payload-b", 1024, "affinity-b"}});
     for (const auto& key :
          {std::string("payload-a"), std::string("payload-b"), ManifestKey()}) {
-        ASSERT_TRUE(service.PutEnd(context.client_id, key, TenantId::Default(),
-                                   ReplicaType::DISK));
+        ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id, key,
+                                              TenantId::Default(),
+                                              ReplicaType::DISK));
     }
     ASSERT_TRUE(service.StartWeightResidencyOperation({
         .identity = ready.identity,
@@ -615,13 +637,13 @@ TEST_F(WeightGroupLifecycleTest, ColdOperationEvictsWholeManagedGroup) {
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
     auto ready = PublishReady(service, client_id);
-    ASSERT_TRUE(service
-                    .PutEnd(client_id, "payload-a", TenantId::Default(),
-                            ReplicaType::DISK)
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, client_id, "payload-a",
+                                          TenantId::Default(),
+                                          ReplicaType::DISK)
                     .has_value());
-    ASSERT_TRUE(service
-                    .PutEnd(client_id, ManifestKey(), TenantId::Default(),
-                            ReplicaType::DISK)
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, client_id, ManifestKey(),
+                                          TenantId::Default(),
+                                          ReplicaType::DISK)
                     .has_value());
     auto started = service.StartWeightResidencyOperation(
         StartWeightResidencyOperationRequest{
@@ -655,13 +677,13 @@ TEST_F(WeightGroupLifecycleTest, RehydrateQueuesAndCompletesWholeManagedGroup) {
     const UUID client_id = generate_uuid();
     ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true));
     auto ready = PublishReady(service, client_id);
-    ASSERT_TRUE(service
-                    .PutEnd(client_id, "payload-a", TenantId::Default(),
-                            ReplicaType::DISK)
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, client_id, "payload-a",
+                                          TenantId::Default(),
+                                          ReplicaType::DISK)
                     .has_value());
-    ASSERT_TRUE(service
-                    .PutEnd(client_id, ManifestKey(), TenantId::Default(),
-                            ReplicaType::DISK)
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, client_id, ManifestKey(),
+                                          TenantId::Default(),
+                                          ReplicaType::DISK)
                     .has_value());
     AddLocalDiskReplica(service, client_id, "payload-a", 1024, "test_segment");
     AddLocalDiskReplica(service, client_id, ManifestKey(), 128, "test_segment");
@@ -694,9 +716,12 @@ TEST_F(WeightGroupLifecycleTest, RehydrateQueuesAndCompletesWholeManagedGroup) {
         ASSERT_FALSE(pending->empty());
         for (const auto& task : *pending) {
             ASSERT_TRUE(service.PromotionAllocStart(
-                client_id, task.key, TenantId(task.tenant_id), task.size, {}));
+                client_id, task.key, TenantId(task.tenant_id), task.size, {},
+                false, task.task_id.value_or("")));
             ASSERT_TRUE(service.NotifyPromotionSuccess(
-                client_id, task.key, TenantId(task.tenant_id)));
+                client_id, task.key, TenantId(task.tenant_id),
+                task.object_generation.value_or(""),
+                task.task_id.value_or("")));
             ++promoted;
         }
     }
@@ -724,8 +749,9 @@ TEST_F(WeightGroupLifecycleTest, RecreatedMetadataStartsFreshMemberSelection) {
     ASSERT_TRUE(service.MountLocalDiskSegment(context.client_id, true));
     const auto ready = PublishReady(service, context.client_id);
     const auto attach_cold = [&](const std::string& key, uint64_t size) {
-        ASSERT_TRUE(service.PutEnd(context.client_id, key, TenantId::Default(),
-                                   ReplicaType::DISK));
+        ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id, key,
+                                              TenantId::Default(),
+                                              ReplicaType::DISK));
         AddLocalDiskReplica(service, context.client_id, key, size,
                             "test_segment");
     };
@@ -795,8 +821,8 @@ TEST_F(WeightGroupLifecycleTest, MemberBudgetBoundsEvictionAndPromotion) {
         {{"payload-a", 1024, "affinity-a"}, {"payload-b", 1024, "affinity-b"}});
     for (const auto& key :
          {std::string("payload-a"), std::string("payload-b"), ManifestKey()}) {
-        ASSERT_TRUE(service.PutEnd(client_id, key, TenantId::Default(),
-                                   ReplicaType::DISK));
+        ASSERT_TRUE(PutEndWithGrantForTesting(
+            service, client_id, key, TenantId::Default(), ReplicaType::DISK));
         AddLocalDiskReplica(service, client_id, key,
                             key == ManifestKey() ? 128 : 1024, "test_segment");
     }
@@ -835,9 +861,11 @@ TEST_F(WeightGroupLifecycleTest, MemberBudgetBoundsEvictionAndPromotion) {
         ASSERT_EQ(1, pending->size());
         const auto& task = pending->front();
         ASSERT_TRUE(service.PromotionAllocStart(
-            client_id, task.key, TenantId(task.tenant_id), task.size, {}));
-        ASSERT_TRUE(service.NotifyPromotionSuccess(client_id, task.key,
-                                                   TenantId(task.tenant_id)));
+            client_id, task.key, TenantId(task.tenant_id), task.size, {}, false,
+            task.task_id.value_or("")));
+        ASSERT_TRUE(service.NotifyPromotionSuccess(
+            client_id, task.key, TenantId(task.tenant_id),
+            task.object_generation.value_or(""), task.task_id.value_or("")));
     }
     MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
         ready.updated_at_ms + 5, 1);

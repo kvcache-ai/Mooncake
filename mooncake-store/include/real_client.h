@@ -1011,7 +1011,11 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
         const std::string &target_rpc_service_addr,
         std::unordered_map<std::string, std::vector<Slice>> &objects,
-        const OffloadReadRange *read_range = nullptr);
+        const OffloadReadRange *read_range = nullptr, int64_t timeout_ms = 0,
+        UUID owner_client_id = {},
+        const std::unordered_map<std::string, std::string> &disk_storage_keys =
+            {},
+        std::string_view resolved_tenant = {});
 
     // Owner restore for LOCAL_DISK: RPC batch_get_offload_object or
     // BatchGetLocal. Callers copy out of the restored arena (sequential
@@ -1029,7 +1033,8 @@ class RealClient : public PyClient {
         const std::unordered_map<std::string, std::vector<Slice>> &objects,
         bool allow_pinned = true,
         const std::vector<int64_t> *value_offsets = nullptr,
-        const std::vector<int64_t> *object_sizes = nullptr);
+        const std::vector<int64_t> *object_sizes = nullptr,
+        std::string_view resolved_tenant = {});
 
     bool can_use_pinned_restore_arena(
         const std::string &target_rpc_service_addr,
@@ -1280,6 +1285,7 @@ class RealClient : public PyClient {
     // session and wait for outstanding range writes before finalize/free.
     struct PutSessionEntry {
         std::vector<Replica::Descriptor> replicas;
+        std::string write_generation;
         uint64_t object_size{0};
         ReplicaWriteMode write_mode{ReplicaWriteMode::SINGLE_REPLICA};
         bool writable{true};

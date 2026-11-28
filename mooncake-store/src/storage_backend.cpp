@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <limits>
 #include <future>
+#include <atomic>
 
 #include <array>
 #include <cctype>
@@ -60,6 +61,7 @@ std::string ErrnoSuffix(int err) {
     if (err == 0) return "";
     return ", errno=" + std::to_string(err) + " (" + strerror(err) + ")";
 }
+std::atomic<uint64_t> g_bucket_metadata_temp_sequence{0};
 }  // namespace
 
 #include "storage/distributed/distributed_storage_backend.h"
@@ -1441,6 +1443,107 @@ tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
     return fs::exists(path);
 }
 
+tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchQuery(
+    const std::vector<std::string>& keys,
+    std::unordered_map<std::string, StorageObjectMetadata>& metadatas) {
+    auto decode_varint = [](const uint8_t* data, size_t len, size_t& pos,
+                            uint64_t& out) -> bool {
+        out = 0;
+        unsigned shift = 0;
+        while (pos < len && shift < 64) {
+            const uint8_t b = data[pos++];
+            out |= static_cast<uint64_t>(b & 0x7Fu) << shift;
+            if ((b & 0x80u) == 0) return true;
+            shift += 7;
+        }
+        return false;
+    };
+
+    for (const auto& key : keys) {
+        const auto path = FileUtil::ResolvePathFromKey(
+            key, file_storage_config_.storage_filepath,
+            file_per_key_config_.fsdir);
+        std::error_code error;
+        const auto size = std::filesystem::file_size(path, error);
+        if (error || size > uint64_t(INT64_MAX))
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+
+        // Fast path: KVEntry encodes field 1 (key) then field 2 (value). Read
+        // only the protobuf prefix so querying large values avoids reading the
+        // entire payload into memory.
+        bool parsed_fast = false;
+        const size_t prefix_cap =
+            static_cast<size_t>(std::min<uint64_t>(size, key.size() + 32));
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            FdGuard fd_guard(fd);
+            std::string prefix(prefix_cap, '\0');
+            size_t got = 0;
+            while (got < prefix_cap) {
+                const ssize_t n =
+                    ::pread(fd, prefix.data() + got, prefix_cap - got,
+                            static_cast<off_t>(got));
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) break;
+                got += static_cast<size_t>(n);
+            }
+            if (got == prefix_cap) {
+                const auto* buf =
+                    reinterpret_cast<const uint8_t*>(prefix.data());
+                size_t pos = 0;
+                uint64_t key_len = 0;
+                if (pos < got && buf[pos] == 0x0Au) {
+                    ++pos;
+                    if (decode_varint(buf, got, pos, key_len) &&
+                        key_len == key.size() && pos + key_len <= got &&
+                        std::memcmp(buf + pos, key.data(), key.size()) == 0) {
+                        pos += static_cast<size_t>(key_len);
+                        if (pos == size) {
+                            metadatas.emplace(
+                                key,
+                                StorageObjectMetadata{
+                                    -1, 0, static_cast<int64_t>(key.size()), 0,
+                                    ""});
+                            parsed_fast = true;
+                        } else if (pos < got && buf[pos] == 0x12u) {
+                            ++pos;
+                            uint64_t val_len = 0;
+                            if (decode_varint(buf, got, pos, val_len) &&
+                                val_len == size - pos) {
+                                metadatas.emplace(
+                                    key,
+                                    StorageObjectMetadata{
+                                        -1, 0, static_cast<int64_t>(key.size()),
+                                        static_cast<int64_t>(val_len), ""});
+                                parsed_fast = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (parsed_fast) continue;
+
+        std::string bytes;
+        auto read = storage_backend_->LoadObject(path, bytes,
+                                                 static_cast<int64_t>(size));
+        if (!read) return tl::make_unexpected(read.error());
+        KVEntry entry;
+        try {
+            struct_pb::from_pb(entry, bytes);
+        } catch (...) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        if (entry.key != key)
+            return tl::make_unexpected(ErrorCode::INVALID_KEY);
+        metadatas.emplace(
+            key, StorageObjectMetadata{-1, 0, static_cast<int64_t>(key.size()),
+                                       static_cast<int64_t>(entry.value.size()),
+                                       ""});
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
     for (const auto& [key, slice] : batched_slices) {
@@ -1769,8 +1872,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // Commit to metadata maps under exclusive lock FIRST.
     // This ensures any concurrent BatchLoad arriving after Master redirects
     // reads to this node can find the key in object_bucket_map_.
-    // Even if complete_handler fails later, the read path is correct —
-    // RollbackCommittedBucket will undo the commit safely.
+    // FileStorage keeps the commit on uncertain notification results, since
+    // some Master entries may already point at these files.
     {
         SharedMutexLocker lock(&mutex_);
 
@@ -1853,11 +1956,10 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             LOG(ERROR) << "Complete handler failed: " << error_code
                        << ", Key count: " << committed_keys.size()
                        << ", Bucket id: " << bucket_id;
-            // Master was NOT notified. The local index has entries that
-            // Master doesn't know about — a "client can read but Master
-            // doesn't know" ghost replica. Rollback the local commit
-            // (removes index entries + waits for inflight reads + deletes
-            // on-disk files).
+            // A callback requesting rollback must guarantee that no remote
+            // replica was published. FileStorage acknowledges the local
+            // commit and retains its notification for retry when publication
+            // is uncertain; an aggregate RPC error is not such a guarantee.
             RollbackCommittedBucket(bucket_id, committed_keys, disk_index);
             return tl::make_unexpected(error_code);
         }
@@ -2726,9 +2828,9 @@ BucketStorageBackend::GetStoreMetadata() {
 tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
     std::vector<std::vector<std::string>>& buckets_keys,
-    std::vector<std::string>* deferred_keys) {
+    bool flush_previous_carryover, std::vector<std::string>* deferred_keys) {
     return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys,
-                                       deferred_keys);
+                                       flush_previous_carryover, deferred_keys);
 }
 
 void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
@@ -2747,12 +2849,18 @@ size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
     return ungrouped_offloading_objects_.size();
 }
 
+std::unordered_map<std::string, int64_t>
+BucketStorageBackend::UngroupedOffloadingObjects() const {
+    MutexLocker locker(&offloading_mutex_);
+    return ungrouped_offloading_objects_;
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
     std::vector<std::vector<std::string>>& buckets_keys,
-    std::vector<std::string>* deferred_keys) {
+    bool flush_previous_carryover, std::vector<std::string>* deferred_keys) {
     MutexLocker offloading_locker(&offloading_mutex_);
-    if (offloading_objects.empty()) {
+    if (offloading_objects.empty() && !flush_previous_carryover) {
         return {};
     }
     auto& ungrouped_offloading_objects = ungrouped_offloading_objects_;
@@ -2774,6 +2882,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         buckets_keys.push_back(std::move(replayed_keys));
         return {};
     }
+    ungrouped_offloading_objects.clear();
     bool carryover_loaded = false;
     auto it = offloading_objects.cbegin();
     int64_t residue_count = static_cast<int64_t>(offloading_objects.size() +
@@ -2785,10 +2894,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         return IsExist(key);
     };
 
-    while (it != offloading_objects.cend()) {
+    while (it != offloading_objects.cend() ||
+           (!carryover_loaded && !carryover_objects.empty())) {
         std::vector<std::string> bucket_keys;
         std::unordered_map<std::string, int64_t> bucket_objects;
         int64_t bucket_data_size = 0;
+        const bool contains_previous_carryover =
+            !carryover_loaded && !carryover_objects.empty();
 
         if (!carryover_loaded) {
             for (const auto& ungrouped_it : carryover_objects) {
@@ -2805,7 +2917,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         while (static_cast<int64_t>(bucket_keys.size()) <
                bucket_backend_config_.bucket_keys_limit) {
             if (it == offloading_objects.cend()) {
-                if (bucket_backend_config_.flush_partial_buckets) {
+                if (bucket_backend_config_.flush_partial_buckets ||
+                    (flush_previous_carryover && contains_previous_carryover)) {
                     // Keep these keys in the current cycle, while FileStorage
                     // still has their tasks and source replicas are pinned.
                     if (!bucket_keys.empty()) {
@@ -3267,17 +3380,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         LOG(ERROR) << "Failed to store bucket metadata, error: "
                    << store_bucket_metadata_result.error();
 
-        // Clean up the bucket file to prevent orphans
-        std::error_code ec;
-        if (fs::remove(bucket_data_path, ec)) {
-            LOG(WARNING) << "Cleaned up orphaned bucket file after metadata "
-                            "write failure: "
-                         << bucket_data_path;
-        } else if (ec) {
-            LOG(ERROR) << "Failed to clean up bucket file after metadata write "
-                          "failure: "
-                       << bucket_data_path << ", error: " << ec.message();
-        }
+        // A rename may have succeeded before a directory sync failure.
+        // Remove both files so a later Init() cannot recover a failed write.
+        // Cleanup remains best effort if the filesystem itself is failing.
+        CleanupOrphanedBucket(bucket_id, disk_index);
 
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -3363,6 +3469,12 @@ void BucketStorageBackend::RollbackCommittedBucket(
         buckets_.erase(bucket_it);
     }
 
+    // Invalidate recovery before waiting for existing source leases.
+    if (auto path = GetBucketMetadataPath(bucket_id, disk_index); path) {
+        if (unlink(path->c_str()) != 0 && errno != ENOENT)
+            LOG(ERROR) << "Cannot invalidate rolled-back bucket metadata: "
+                       << *path;
+    }
     // Phase 2: Wait for inflight reads to drain.
     // Readers that found the key before we removed it from the map
     // hold a BucketReadGuard that keeps inflight_reads_ > 0.
@@ -4124,6 +4236,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
     }
     // Lock released - new readers can't find this bucket anymore
 
+    // A bounded source-drain timeout must not leave a recoverable marker.
+    if (auto path =
+            GetBucketMetadataPath(bucket_id, bucket_metadata->disk_index);
+        path) {
+        if (unlink(path->c_str()) != 0 && errno != ENOENT)
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
     // Step 2: Wait for in-flight reads to complete
     // Readers that started before we removed from buckets_ still hold guards
     constexpr int kMaxSpinIterations = 1000;
@@ -4316,25 +4435,152 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto meta_path = meta_path_res.value();
-    auto open_file_result = OpenFile(meta_path, FileMode::Write);
-    if (!open_file_result) {
-        LOG(ERROR) << "Failed to open file for bucket writing: " << meta_path;
+    std::string str;
+    try {
+        struct_pb::to_pb(*metadata, str);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to serialize bucket metadata for " << meta_path
+                   << ", error=" << e.what();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    // Publish metadata through a same-directory temporary file. A direct
+    // O_TRUNC write can leave a torn .meta file that Init() treats as a bad
+    // bucket and deletes, even though the bucket data was already synced.
+    // Bucket IDs are unique; the pid/sequence suffix plus O_EXCL also avoids
+    // colliding with a stale temporary file after a process restart.
+    std::string temp_path;
+    int fd = -1;
+    for (int attempt = 0; attempt < 128; ++attempt) {
+        const auto sequence = g_bucket_metadata_temp_sequence.fetch_add(
+            1, std::memory_order_relaxed);
+        temp_path = meta_path + ".tmp." + std::to_string(getpid()) + "." +
+                    std::to_string(sequence);
+        fd = open(temp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                  0644);
+        if (fd >= 0 || errno != EEXIST) break;
+    }
+    if (fd < 0) {
+        const int err = errno;
+        NotifyDiskError(err, "open");
+        LOG(ERROR) << "Failed to create temporary bucket metadata file for: "
+                   << meta_path << ", errno=" << err << " (" << strerror(err)
+                   << ")";
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
-    auto file = std::move(open_file_result.value());
-    std::string str;
-    struct_pb::to_pb(*metadata, str);
-    auto write_result = file->write(str, str.size());
-    if (!write_result) {
-        NotifyDiskError(file->sys_errno(), "write");
-        LOG(ERROR) << "Write failed for: " << meta_path
-                   << ", error: " << write_result.error();
-        return tl::make_unexpected(write_result.error());
+    FdGuard file_guard(fd);
+    auto remove_temp = [&]() {
+        if (unlink(temp_path.c_str()) != 0 && errno != ENOENT) {
+            const int err = errno;
+            LOG(ERROR) << "Failed to remove temporary metadata file "
+                       << temp_path << ", errno=" << err << " ("
+                       << strerror(err) << ")";
+        }
+    };
+    auto injected_failure = [&](MetadataFailurePointForTest point) {
+        return test_metadata_failure_point_.load(std::memory_order_relaxed) ==
+               point;
+    };
+
+    size_t written = 0;
+    while (written < str.size()) {
+        const ssize_t result =
+            write(fd, str.data() + written, str.size() - written);
+        if (result < 0 && errno == EINTR) continue;
+        if (result <= 0) {
+            const int err = result < 0 ? errno : EIO;
+            NotifyDiskError(err, "write");
+            LOG(ERROR) << "Failed to write temporary bucket metadata: "
+                       << temp_path << ", errno=" << err << " ("
+                       << strerror(err) << ")";
+            remove_temp();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        written += static_cast<size_t>(result);
     }
-    if (write_result.value() != str.size()) {
-        LOG(ERROR) << "Write size mismatch for: " << meta_path
-                   << ", expected: " << str.size()
-                   << ", got: " << write_result.value();
+    if (injected_failure(MetadataFailurePointForTest::kAfterWrite)) {
+        remove_temp();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (injected_failure(MetadataFailurePointForTest::kFileSync)) {
+        LOG(ERROR) << "Injected file sync failure for temporary bucket "
+                      "metadata: "
+                   << temp_path;
+        remove_temp();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (fsync(fd) != 0) {
+        const int err = errno;
+        NotifyDiskError(err, "fsync");
+        LOG(ERROR) << "Failed to sync temporary bucket metadata: " << temp_path
+                   << ", errno=" << err << " (" << strerror(err) << ")";
+        remove_temp();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (close(file_guard.release()) != 0) {
+        const int err = errno;
+        NotifyDiskError(err, "close");
+        LOG(ERROR) << "Failed to close temporary bucket metadata: " << temp_path
+                   << ", errno=" << err << " (" << strerror(err) << ")";
+        remove_temp();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    if (injected_failure(MetadataFailurePointForTest::kRename)) {
+        LOG(ERROR) << "Injected rename failure for bucket metadata: "
+                   << meta_path;
+        remove_temp();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (rename(temp_path.c_str(), meta_path.c_str()) != 0) {
+        const int err = errno;
+        NotifyDiskError(err, "rename");
+        LOG(ERROR) << "Failed to publish bucket metadata " << meta_path
+                   << ", errno=" << err << " (" << strerror(err) << ")";
+        remove_temp();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    const auto parent_path =
+        std::filesystem::path(meta_path).parent_path().empty()
+            ? std::filesystem::path(".")
+            : std::filesystem::path(meta_path).parent_path();
+    const int dir_fd =
+        open(parent_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0) {
+        const int err = errno;
+        NotifyDiskError(err, "open_dir");
+        LOG(ERROR) << "Failed to open bucket metadata directory " << parent_path
+                   << ", errno=" << err << " (" << strerror(err) << ")";
+        unlink(meta_path.c_str());
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    FdGuard dir_guard(dir_fd);
+    const bool injected_dir_sync =
+        injected_failure(MetadataFailurePointForTest::kDirectorySync);
+    if (injected_dir_sync || fsync(dir_fd) != 0) {
+        if (injected_dir_sync) {
+            LOG(ERROR) << "Injected directory sync failure for bucket metadata "
+                          "directory "
+                       << parent_path;
+        } else {
+            const int err = errno;
+            NotifyDiskError(err, "fsync_dir");
+            LOG(ERROR) << "Failed to sync bucket metadata directory "
+                       << parent_path << ", errno=" << err << " ("
+                       << strerror(err) << ")";
+        }
+        if (unlink(meta_path.c_str()) != 0 && errno != ENOENT) {
+            const int err = errno;
+            LOG(ERROR) << "Failed to roll back bucket metadata " << meta_path
+                       << " after directory sync failure, errno=" << err << " ("
+                       << strerror(err) << ")";
+        } else if (fsync(dir_fd) != 0) {
+            const int err = errno;
+            LOG(ERROR) << "Failed to sync bucket metadata rollback in "
+                       << parent_path << ", errno=" << err << " ("
+                       << strerror(err) << ")";
+        }
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     metadata->meta_size = str.size();
@@ -6262,6 +6508,24 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     }
 
     return static_cast<int64_t>(keys.size());
+}
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchQuery(
+    const std::vector<std::string>& keys,
+    std::unordered_map<std::string, StorageObjectMetadata>& metadatas) {
+    for (const auto& key : keys) {
+        auto& shard = shards_[ShardForKey(key)];
+        SharedMutexLocker lock(&shard.mutex, shared_lock);
+        auto entry = shard.map.find(key);
+        if (entry == shard.map.end())
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        metadatas.emplace(
+            key, StorageObjectMetadata{
+                     0, static_cast<int64_t>(entry->second.offset),
+                     static_cast<int64_t>(key.size()),
+                     static_cast<int64_t>(entry->second.value_size), ""});
+    }
+    return {};
 }
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(

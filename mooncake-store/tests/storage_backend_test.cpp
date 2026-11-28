@@ -1,4 +1,6 @@
+#include "offload_storage_key.h"
 #include "storage_backend.h"
+#include <ylt/struct_pb.hpp>
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -20,6 +22,7 @@
 #include <string_view>
 #include <thread>
 #include <atomic>
+#include <array>
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
@@ -379,6 +382,90 @@ TEST_F(StorageBackendTest, AdaptorInitCreatesMissingRootDir) {
     StorageBackendAdaptor adaptor(cfg, file_per_key_config);
     ASSERT_TRUE(adaptor.Init().has_value());
     EXPECT_TRUE(fs::is_directory(cfg.storage_filepath));
+}
+
+TEST_F(StorageBackendTest, BucketOffloadFlushesIdleTail) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 500;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    std::vector<std::vector<std::string>> buckets;
+    ASSERT_TRUE(
+        backend.AllocateOffloadingBuckets({{"owned-tail", 1024}}, buckets));
+    EXPECT_TRUE(buckets.empty());
+    EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 1);
+
+    // The next FileStorage heartbeat requests a bounded flush, even when no
+    // new tasks arrive. Default grouping alone may retain the initial tail.
+    ASSERT_TRUE(backend.AllocateOffloadingBuckets({}, buckets, true));
+    ASSERT_EQ(buckets.size(), 1);
+    EXPECT_EQ(buckets.front(), (std::vector<std::string>{"owned-tail"}));
+    EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 0);
+}
+
+TEST_F(StorageBackendTest, BucketOffloadKeepsEachHeartbeatTaskSet) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 500;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        std::unordered_map<std::string, int64_t> tasks;
+        for (int i = 0; i < 128; ++i) {
+            tasks.emplace(
+                "cycle-" + std::to_string(cycle) + "-" + std::to_string(i),
+                1024);
+        }
+        std::vector<std::vector<std::string>> buckets;
+        ASSERT_TRUE(backend.AllocateOffloadingBuckets(tasks, buckets));
+        EXPECT_TRUE(buckets.empty());
+        EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), tasks.size());
+        ASSERT_TRUE(backend.AllocateOffloadingBuckets({}, buckets, true));
+        ASSERT_EQ(buckets.size(), 1);
+        EXPECT_EQ(buckets.front().size(), tasks.size());
+        auto remaining = tasks;
+        for (const auto& key : buckets.front()) {
+            EXPECT_EQ(remaining.erase(key), 1u)
+                << "A bucket must not contain a prior heartbeat's task";
+        }
+        EXPECT_TRUE(remaining.empty());
+        EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 0);
+    }
+}
+
+TEST_F(StorageBackendTest, BucketOffloadFlushesTailAfterFullBucket) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 500;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    std::unordered_map<std::string, int64_t> tasks;
+    for (int i = 0; i < 501; ++i) {
+        tasks.emplace("owned-" + std::to_string(i), 1024);
+    }
+    std::vector<std::vector<std::string>> buckets;
+    ASSERT_TRUE(backend.AllocateOffloadingBuckets(tasks, buckets));
+    ASSERT_EQ(buckets.size(), 1);
+    EXPECT_EQ(buckets[0].size(), 500);
+    EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 1);
+
+    ASSERT_TRUE(backend.AllocateOffloadingBuckets({}, buckets, true));
+    ASSERT_EQ(buckets.size(), 2);
+    EXPECT_EQ(buckets[1].size(), 1);
+    auto remaining = tasks;
+    for (const auto& bucket : buckets) {
+        for (const auto& key : bucket) {
+            EXPECT_EQ(remaining.erase(key), 1u);
+        }
+    }
+    EXPECT_TRUE(remaining.empty());
+    EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 0);
 }
 
 TEST_F(StorageBackendTest, StorageBackendAll) {
@@ -2835,6 +2922,7 @@ TEST_F(StorageBackendTest, BucketEvictionDoesNotReportSkippedDuplicateKeys) {
 
 //-----------------------------------------------------------------------------
 // BucketReadGuard RAII Behavior Tests (Phase 1 - D2)
+
 //-----------------------------------------------------------------------------
 
 TEST_F(StorageBackendTest,
@@ -7724,6 +7812,69 @@ TEST_F(StorageBackendTest, BucketIndexGrowthPreservesRollbackAndRecovery) {
     EXPECT_EQ(recovered.GetStoreMetadata()->total_keys, 0);
     ASSERT_TRUE(recovered.BatchOffload(make_batch(0), nullptr));
     EXPECT_EQ(recovered.GetStoreMetadata()->total_keys, keys_per_bucket);
+}
+
+TEST_F(StorageBackendTest, BucketMetadataPublicationFailureDoesNotAcknowledge) {
+    using Failure = BucketStorageBackend::MetadataFailurePointForTest;
+    const std::array<Failure, 4> failure_points{
+        Failure::kAfterWrite, Failure::kFileSync, Failure::kRename,
+        Failure::kDirectorySync};
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    auto storage_backend =
+        std::make_unique<BucketStorageBackend>(config, bucket_config);
+    ASSERT_TRUE(storage_backend->Init());
+
+    const std::string key = "metadata_failure_key";
+    std::string value(65536, 'm');
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(key, std::vector<Slice>{Slice{value.data(), value.size()}});
+    int completion_count = 0;
+    for (const auto failure : failure_points) {
+        SCOPED_TRACE(static_cast<int>(failure));
+        storage_backend->SetMetadataFailurePointForTest(failure);
+        auto result =
+            storage_backend->BatchOffload(batch, [&](const auto&, auto&) {
+                ++completion_count;
+                return ErrorCode::OK;
+            });
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
+        EXPECT_EQ(completion_count, 0);
+        auto exists = storage_backend->IsExist(key);
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_FALSE(exists.value());
+        for (const auto& entry : fs::directory_iterator(data_path))
+            EXPECT_EQ(entry.path().filename(), ".mooncake_local_disk.lock");
+        storage_backend.reset();
+        {
+            BucketStorageBackend restarted(config, bucket_config);
+            ASSERT_TRUE(restarted.Init());
+            auto recovered = restarted.IsExist(key);
+            ASSERT_TRUE(recovered.has_value());
+            EXPECT_FALSE(recovered.value());
+        }
+        storage_backend =
+            std::make_unique<BucketStorageBackend>(config, bucket_config);
+        ASSERT_TRUE(storage_backend->Init());
+    }
+
+    // Failure must also release the pending write reservation so a retry can
+    // commit normally, using a new bucket ID rather than a partial metadata.
+    storage_backend->SetMetadataFailurePointForTest(Failure::kNone);
+    auto retry = storage_backend->BatchOffload(batch, [&](const auto&, auto&) {
+        ++completion_count;
+        return ErrorCode::OK;
+    });
+    ASSERT_TRUE(retry.has_value());
+    EXPECT_EQ(completion_count, 1);
+    storage_backend.reset();
+    BucketStorageBackend restarted(config, bucket_config);
+    ASSERT_TRUE(restarted.Init());
+    auto recovered = restarted.IsExist(key);
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_TRUE(recovered.value());
 }
 
 }  // namespace mooncake::test

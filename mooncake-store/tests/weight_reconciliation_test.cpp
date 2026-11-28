@@ -222,15 +222,17 @@ TEST_F(WeightReconciliationTest, AcceptedPutEndRefreshesImportInactivity) {
         std::vector<std::string>{"affinity-" + importing->identity.revision};
     config.group_ids =
         std::vector<std::string>{importing->manifest.payload_group_id};
-    ASSERT_TRUE(service.PutStart(context.client_id, "active-end-payload",
-                                 TenantId::Default(), 1024, config));
+    ASSERT_TRUE(PutStartWithGrantForTesting(service, context.client_id,
+                                            "active-end-payload",
+                                            TenantId::Default(), 1024, config));
     const auto before_end_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    ASSERT_TRUE(service.PutEnd(context.client_id, "active-end-payload",
-                               TenantId::Default(), ReplicaType::ALL));
+    ASSERT_TRUE(PutEndWithGrantForTesting(
+        service, context.client_id, "active-end-payload", TenantId::Default(),
+        ReplicaType::ALL));
     MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
         before_end_ms + 300'001, 32);
     const auto observed =
@@ -387,11 +389,12 @@ TEST_F(WeightReconciliationTest,
     EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, result.error());
     config.group_ids =
         std::vector<std::string>{importing->manifest.payload_group_id};
-    ASSERT_TRUE(service.UpsertStart(context.client_id,
-                                    "upsert-importing-payload",
-                                    TenantId::Default(), 1024, config));
-    EXPECT_TRUE(service.UpsertEnd(context.client_id, "upsert-importing-payload",
-                                  TenantId::Default(), ReplicaType::ALL));
+    ASSERT_TRUE(UpsertStartWithGrantForTesting(
+        service, context.client_id, "upsert-importing-payload",
+        TenantId::Default(), 1024, config));
+    EXPECT_TRUE(UpsertEndWithGrantForTesting(
+        service, context.client_id, "upsert-importing-payload",
+        TenantId::Default(), ReplicaType::ALL));
 }
 
 TEST_F(WeightReconciliationTest,
@@ -454,10 +457,12 @@ TEST_F(WeightReconciliationTest,
         PutCompletedObject(service, context.client_id, "ordinary-payload",
                            config, 1024);
         config.group_ids.reset();
-        ASSERT_TRUE(service.UpsertStart(context.client_id, "ordinary-payload",
-                                        TenantId::Default(), length, config));
-        ASSERT_TRUE(service.UpsertEnd(context.client_id, "ordinary-payload",
-                                      TenantId::Default(), ReplicaType::ALL));
+        ASSERT_TRUE(UpsertStartWithGrantForTesting(
+            service, context.client_id, "ordinary-payload", TenantId::Default(),
+            length, config));
+        ASSERT_TRUE(UpsertEndWithGrantForTesting(
+            service, context.client_id, "ordinary-payload", TenantId::Default(),
+            ReplicaType::ALL));
         EXPECT_TRUE(
             service.GetReplicaList("ordinary-payload", TenantId::Default()));
         EXPECT_EQ(std::vector<std::string>{"ordinary-payload"},
@@ -487,8 +492,9 @@ TEST_F(WeightReconciliationTest,
             .count());
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     ASSERT_TRUE(service.BeginWeightImport(request));
-    ASSERT_TRUE(service.PutEnd(context.client_id, "idle-retries-payload",
-                               TenantId::Default(), ReplicaType::ALL));
+    ASSERT_TRUE(PutEndWithGrantForTesting(
+        service, context.client_id, "idle-retries-payload", TenantId::Default(),
+        ReplicaType::ALL));
     const auto rejected =
         service.PutEnd(generate_uuid(), "idle-retries-payload",
                        TenantId::Default(), ReplicaType::ALL);

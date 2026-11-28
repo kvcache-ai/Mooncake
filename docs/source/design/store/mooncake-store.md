@@ -834,6 +834,7 @@ complete. A nonempty name clears completed replicas on that segment.
 
 metadata-management
 ssd-offload
+ssd-generations
 immutable-dfs-bucket-allocator
 ssd-free-ratio-first-allocation
 nvme-kv-backend

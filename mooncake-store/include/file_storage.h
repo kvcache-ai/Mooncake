@@ -106,7 +106,6 @@ class FileStorage {
         const std::vector<int64_t>& offsets,
         const std::vector<int64_t>& lengths,
         const std::vector<int64_t>& object_sizes);
-
     [[nodiscard]] bool HasPinnedRestoreArena() const {
         return pinned_restore_arena_allocator_ != nullptr;
     }
@@ -257,6 +256,15 @@ class FileStorage {
     tl::expected<void, ErrorCode> OffloadObjects(
         const std::vector<OffloadTaskItem>& offloading_objects);
 
+    // Caller holds offload_tasks_mutex_. Terminally discard locally retained
+    // tasks and the backend's grouping hints; never retry a payload operation.
+    void CancelPendingOffloadsLocked(
+        const std::vector<OffloadTaskItem>& additional = {});
+
+    // Caller holds offload_tasks_mutex_. Keep a committed bucket readable
+    // until the aggregate notification has an unambiguous successful reply.
+    tl::expected<void, ErrorCode> RetryPendingOffloadNotificationLocked();
+
     /**
      * @brief Classifies a BatchOffload error as affecting only the current
      * bucket rather than the whole offload cycle.
@@ -339,7 +347,9 @@ class FileStorage {
 
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
         const std::vector<std::string>& keys, const std::string& tenant_id,
-        std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
+        std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
+        std::unordered_map<std::string, std::string>* queried_generations =
+            nullptr);
 
     tl::expected<void, ErrorCode> RegisterLocalMemory();
 
@@ -399,7 +409,7 @@ class FileStorage {
     // Heartbeat: latch the drain and hand pending offload work back.
     void ApplyDiskFence();
     // Heartbeat thread: NACK the tasks carried for the backend's ungrouped
-    // pool and drop the pool (see deferred_task_by_storage_key_).
+    // pool and drop the pool (see pending_offload_tasks_).
     void NackCarriedOffloadTasks();
     // Heartbeat, while draining_: unmount until the master acknowledges it
     // (the master treats an already-unmounted segment as success).
@@ -440,72 +450,6 @@ class FileStorage {
 
     std::atomic<uint64_t> next_batch_id_{1};
 
-    /**
-     * @brief Partition drained-but-unbucketed offload tasks into NACKs vs
-     * carries (pure function; extracted for direct unit testing).
-     *
-     * A key absent from all_bucket_keys was either deliberately skipped by
-     * the backend (size over bucket limit / already on disk) — those must be
-     * NACKed so the master releases the task and source-replica refcount — or
-     * DEFERRED to the backend's ungrouped pool. FileStorage replays carried
-     * keys next cycle and may flush a partial bucket. Deferred keys must NOT
-     * be NACKed: the backend carries only key+size across the deferral, so
-     * their tasks must be
-     * carried here or the re-emitted keys arrive task-less and are silently
-     * dropped (upstream #3006 — measured as ~12% of pool entries never
-     * reaching the SSD tier).
-     *
-     * Previously carried keys must also be RETAINED while un-emitted: the
-     * backend's pool only moves on a call with non-empty input, so a cycle
-     * can pass without the pooled keys being either emitted or re-reported
-     * (empty effective input after the carry merge). Rebuilding the carry
-     * from deferred_keys alone would NACK such keys while the pool still
-     * holds them — re-introducing the task-less drop.
-     *
-     * Retention is void for a key re-drained this cycle (redrained_carried_
-     * keys): the collision handling in OffloadObjects dropped its pooled copy,
-     * so it is no longer waiting and the stale carried task must not be
-     * retained. Without the exclusion, a re-drained key the backend then
-     * skipped (e.g. re-PUT at a size over the bucket limit) is neither
-     * bucketed nor deferred, so the stale task would be retained forever as a
-     * zombie AND its presence in carried_tasks would suppress the NACK for the
-     * fresh task — losing the fresh task and leaking its source refcount.
-     * Note the exclusion cannot be expressed as "absent from
-     * task_by_storage_key": the carry merge inserts every non-collision
-     * carried task into that map, so such a test would void retention
-     * entirely.
-     *
-     * @param task_by_storage_key All tasks known this cycle (drained +
-     * carried).
-     * @param all_bucket_keys Storage keys emitted in a bucket this cycle.
-     * @param deferred_keys Storage keys the backend deferred this cycle.
-     * @param previously_carried Carry map from the previous cycle; entries
-     * not emitted this cycle are retained in carried_tasks.
-     * @param redrained_carried_keys Carried keys re-drained this cycle, whose
-     * pooled copies the caller already removed; excluded from retention.
-     * @param failed_tasks Output: tasks to NACK (appended).
-     * @param carried_tasks Output: tasks to carry to the next cycle.
-     */
-    static void PartitionUnbucketedTasks(
-        const std::unordered_map<std::string, OffloadTaskItem>&
-            task_by_storage_key,
-        const std::unordered_set<std::string>& all_bucket_keys,
-        const std::vector<std::string>& deferred_keys,
-        const std::unordered_map<std::string, OffloadTaskItem>&
-            previously_carried,
-        const std::unordered_set<std::string>& redrained_carried_keys,
-        std::vector<OffloadTaskItem>& failed_tasks,
-        std::unordered_map<std::string, OffloadTaskItem>& carried_tasks);
-
-    // Tasks for keys the bucket backend deferred to its ungrouped pool, keyed
-    // by tenant-scoped storage key. Consumed (merged into task_by_storage_key)
-    // on the next OffloadObjects call, when the backend re-emits those keys in
-    // a bucket. Only touched from the offload worker path (single-threaded);
-    // lost on restart together with the backend's in-memory ungrouped pool,
-    // in which case the master's TTL reaper reclaims the orphaned tasks.
-    std::unordered_map<std::string, OffloadTaskItem>
-        deferred_task_by_storage_key_;
-
     // Singleflight for cold reads. The first reader of an exact batch becomes
     // the leader and does the SSD I/O; readers that request the same key/size
     // pairs, in any order, share the staging owner. Remote readers take an
@@ -520,6 +464,18 @@ class FileStorage {
     std::atomic<int> cold_read_waiters_required_for_test_{0};
 
     mutable Mutex offloading_mutex_;
+    // Serializes pending-task ownership with offload, RemoveAll and drain.
+    // Never acquire it while holding offloading_mutex_ (the offload failure
+    // path may acquire that mutex to disable further admission).
+    mutable Mutex offload_tasks_mutex_;
+    std::unordered_map<std::string, OffloadTaskItem> GUARDED_BY(
+        offload_tasks_mutex_) pending_offload_tasks_;
+    // At most one committed bucket: a failed notification stops this write
+    // cycle; subsequent heartbeats retry before admitting more work.
+    std::vector<OffloadTaskItem> GUARDED_BY(offload_tasks_mutex_)
+        pending_notification_tasks_;
+    std::vector<StorageObjectMetadata> GUARDED_BY(offload_tasks_mutex_)
+        pending_notification_metadatas_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
     std::atomic<bool> heartbeat_running_;
     std::thread heartbeat_thread_;

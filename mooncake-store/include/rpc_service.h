@@ -121,6 +121,11 @@ class WrappedMasterService {
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
 
+    tl::expected<void, ErrorCode> PutRevokeV2(
+        const UUID& client_id, const ObjectMeta& object_meta,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
+
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
                   const std::vector<uint64_t>& slice_lengths,
@@ -134,6 +139,11 @@ class WrappedMasterService {
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevokeV2(
+        const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
 
@@ -152,6 +162,11 @@ class WrappedMasterService {
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
 
+    tl::expected<void, ErrorCode> UpsertRevokeV2(
+        const UUID& client_id, const ObjectMeta& object_meta,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
+
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchUpsertStart(const UUID& client_id,
                      const std::vector<std::string>& keys,
@@ -165,6 +180,10 @@ class WrappedMasterService {
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevokeV2(
+        const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
         const std::string& tenant_id = "default");
 
     tl::expected<void, ErrorCode> Remove(
@@ -280,13 +299,29 @@ class WrappedMasterService {
         const std::string& tenant_id, uint64_t size,
         const std::vector<std::string>& preferred_segments);
 
+    tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStartV2(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, uint64_t size,
+        const std::vector<std::string>& preferred_segments,
+        bool physical_storage_key, const std::string& expected_task_id);
+
     tl::expected<void, ErrorCode> NotifyPromotionSuccess(
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
 
+    tl::expected<void, ErrorCode> NotifyPromotionSuccessV2(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const std::string& expected_generation,
+        const std::string& expected_task_id);
+
     tl::expected<void, ErrorCode> NotifyPromotionFailure(
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
+
+    tl::expected<void, ErrorCode> NotifyPromotionFailureV2(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const std::string& expected_generation,
+        const std::string& expected_task_id);
 
     // Admin-only, grow-only DFS capacity management. Existing placements remain
     // valid.
@@ -435,6 +470,11 @@ class WrappedMasterService {
                                                    const std::string& tenant_id,
                                                    ReplicaType replica_type);
 
+    tl::expected<void, ErrorCode> EvictDiskReplicaV2(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, ReplicaType replica_type,
+        bool physical_storage_key);
+
     // Conditional variant: evicts only when the current record still carries
     // the replica id the caller failed on. Returns false when the replica was
     // replaced in the meantime; the replacement is left untouched.
@@ -447,10 +487,16 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplicaV2(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id, ReplicaType replica_type,
+        bool physical_storage_key);
+
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
+    friend class test::MasterServiceTestPeer;
     MasterService master_service_;
 };
 

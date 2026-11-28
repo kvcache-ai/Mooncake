@@ -8,6 +8,7 @@
 // chain itself.
 
 #include "master_service.h"
+#include "offload_storage_key.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -64,19 +65,46 @@ class PrefetchTaskMasterTest : public ::testing::Test {
     bool InjectLocalDiskOnlyKey(MasterService& service, const UUID& client_id,
                                 const std::string& key, int64_t size,
                                 const std::string& transport_endpoint) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segments = {transport_endpoint};
+        auto put_start =
+            service.PutStart(client_id, key, TenantId::Default(), size, config);
+        if (!put_start) return false;
+        auto write_generation = GetPrimaryWriteGeneration(*put_start);
+        if (!write_generation) return false;
+        if (!service.PutEnd(client_id,
+                            ObjectMeta{key, std::nullopt, *write_generation},
+                            TenantId::Default(), ReplicaType::MEMORY)) {
+            return false;
+        }
+        auto offloads = service.OffloadObjectHeartbeat(client_id, true);
+        if (offloads && !offloads->empty()) {
+            std::vector<StorageObjectMetadata> rejected(offloads->size());
+            for (auto& item : rejected) item.data_size = -1;
+            if (!service.NotifyOffloadSuccess(client_id, *offloads, rejected)) {
+                return false;
+            }
+        }
         std::vector<OffloadTaskItem> tasks{
             OffloadTaskItem{.tenant_id = std::string(TenantId::kDefaultValue),
                             .key = key,
-                            .size = size}};
+                            .size = size,
+                            .object_generation = *write_generation,
+                            .restoring = true}};
         StorageObjectMetadata sm;
         sm.bucket_id = 0;
         sm.offset = 0;
-        sm.key_size = static_cast<int64_t>(key.size());
+        sm.key_size = static_cast<int64_t>(
+            MakeOffloadStorageKey(key, *write_generation).size());
         sm.data_size = size;
         sm.transport_endpoint = transport_endpoint;
         std::vector<StorageObjectMetadata> metas{sm};
         auto res = service.NotifyOffloadSuccess(client_id, tasks, metas);
-        return res.has_value();
+        if (!res.has_value()) return false;
+        auto cleared =
+            service.BatchReplicaClear({key}, client_id, transport_endpoint);
+        return cleared.has_value() && cleared->size() == 1;
     }
 
     void PutObject(MasterService& service, const UUID& client_id,
@@ -86,8 +114,11 @@ class PrefetchTaskMasterTest : public ::testing::Test {
         auto put_start =
             service.PutStart(client_id, key, TenantId::Default(), size, config);
         ASSERT_TRUE(put_start.has_value()) << "PutStart failed for key=" << key;
-        auto put_end = service.PutEnd(client_id, key, TenantId::Default(),
-                                      ReplicaType::MEMORY);
+        auto write_generation = GetPrimaryWriteGeneration(*put_start);
+        ASSERT_TRUE(write_generation.has_value());
+        auto put_end = service.PutEnd(
+            client_id, ObjectMeta{key, std::nullopt, *write_generation},
+            TenantId::Default(), ReplicaType::MEMORY);
         ASSERT_TRUE(put_end.has_value()) << "PutEnd failed for key=" << key;
     }
 
@@ -260,11 +291,21 @@ TEST_F(PrefetchTaskMasterTest, NotifyPromotionSuccessGrantsLeaseForPrefetch) {
         service->RegisterPrefetchTask(holder, "pk5", TenantId::Default())
             .has_value());
     const std::vector<std::string> preferred_segments;
-    auto alloc = service->PromotionAllocStart(
-        holder, "pk5", TenantId::Default(), 1024, preferred_segments);
+    auto disk_list =
+        service->GetReplicaListForAdmin("pk5", TenantId::Default());
+    ASSERT_TRUE(disk_list.has_value());
+    ASSERT_EQ(disk_list->replicas.size(), 1u);
+    const std::string physical_key = disk_list->replicas.front()
+                                         .get_local_disk_descriptor()
+                                         .storage_key.value_or("");
+    ASSERT_FALSE(physical_key.empty());
+    auto alloc =
+        service->PromotionAllocStart(holder, physical_key, TenantId::Default(),
+                                     1024, preferred_segments, true, {});
     ASSERT_TRUE(alloc.has_value());
-    auto commit =
-        service->NotifyPromotionSuccess(holder, "pk5", TenantId::Default());
+    auto commit = service->NotifyPromotionSuccess(
+        holder, "pk5", TenantId::Default(),
+        alloc->object_generation.value_or(""), alloc->task_id.value_or(""));
     ASSERT_TRUE(commit.has_value());
 
     // A prefetch-committed replica carries a fresh read lease so the DRAM

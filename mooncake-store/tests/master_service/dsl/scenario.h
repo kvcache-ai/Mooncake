@@ -6,6 +6,8 @@
 #include <functional>
 #include <initializer_list>
 #include <memory>
+#include <map>
+#include <tuple>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -386,7 +388,15 @@ struct PutEndAction {
     std::string tenant{TenantId::Default().value()};
     std::optional<uint64_t> checksum{};
     std::optional<ErrorCode> expected_error{};
+    std::optional<size_t> start_ordinal{};
     ReplicaType replica_type{ReplicaType::MEMORY};
+
+    // Select a particular successful Start by this actor/tenant/key. This
+    // preserves a delayed operation's authority across later replacement.
+    PutEndAction& FromStart(size_t ordinal) {
+        start_ordinal = ordinal;
+        return *this;
+    }
 
     PutEndAction& By(std::string value) {
         actor = std::move(value);
@@ -422,7 +432,15 @@ struct UpsertEndAction {
     std::string tenant{TenantId::Default().value()};
     std::optional<uint64_t> checksum{};
     std::optional<ErrorCode> expected_error{};
+    std::optional<size_t> start_ordinal{};
     ReplicaType replica_type{ReplicaType::MEMORY};
+
+    // Select a particular successful Start by this actor/tenant/key. This
+    // preserves a delayed operation's authority across later replacement.
+    UpsertEndAction& FromStart(size_t ordinal) {
+        start_ordinal = ordinal;
+        return *this;
+    }
 
     UpsertEndAction& By(std::string value) {
         actor = std::move(value);
@@ -457,7 +475,15 @@ struct PutRevokeAction {
     std::string actor{"default"};
     std::string tenant{TenantId::Default().value()};
     std::optional<ErrorCode> expected_error{};
+    std::optional<size_t> start_ordinal{};
     ReplicaType replica_type{ReplicaType::MEMORY};
+
+    // Select a particular successful Start by this actor/tenant/key. This
+    // preserves a delayed operation's authority across later replacement.
+    PutRevokeAction& FromStart(size_t ordinal) {
+        start_ordinal = ordinal;
+        return *this;
+    }
 
     PutRevokeAction& By(std::string value) {
         actor = std::move(value);
@@ -487,7 +513,15 @@ struct UpsertRevokeAction {
     std::string actor{"default"};
     std::string tenant{TenantId::Default().value()};
     std::optional<ErrorCode> expected_error{};
+    std::optional<size_t> start_ordinal{};
     ReplicaType replica_type{ReplicaType::MEMORY};
+
+    // Select a particular successful Start by this actor/tenant/key. This
+    // preserves a delayed operation's authority across later replacement.
+    UpsertRevokeAction& FromStart(size_t ordinal) {
+        start_ordinal = ordinal;
+        return *this;
+    }
 
     UpsertRevokeAction& By(std::string value) {
         actor = std::move(value);
@@ -1334,6 +1368,14 @@ struct CompleteOffloadAction {
     std::string node;
     std::optional<int64_t> size{};
     std::optional<ErrorCode> expected_error{};
+    bool without_admission{false};
+
+    // Explicit negative protocol test: send empty credentials and require no
+    // publication. This never grants authority to a normal completion.
+    CompleteOffloadAction& WithoutAdmission() {
+        without_admission = true;
+        return *this;
+    }
 
     CompleteOffloadAction& By(std::string value) {
         actor = std::move(value);
@@ -2267,6 +2309,13 @@ class MasterScenario {
         const StartResult& result,
         const std::optional<std::vector<std::string>>& expected_memory_nodes =
             std::nullopt);
+    void RememberPrimaryGrant(const std::string& actor,
+                              const std::string& tenant, const std::string& key,
+                              const std::vector<Replica::Descriptor>& replicas);
+    ObjectMeta PrimaryMeta(const std::string& actor, const std::string& tenant,
+                           const std::string& key,
+                           std::optional<uint64_t> checksum = {},
+                           std::optional<size_t> ordinal = {}) const;
     void Fail(std::string message) const;
 
     std::string name_;
@@ -2286,6 +2335,11 @@ class MasterScenario {
     std::unordered_map<std::string, UUID> task_ids_;
     std::unordered_map<std::string, std::vector<Replica::Descriptor>>
         last_start_results_;
+    std::map<std::tuple<std::string, std::string, std::string>,
+             std::vector<std::string>>
+        primary_grants_;
+    std::map<std::tuple<std::string, std::string, std::string>, OffloadTaskItem>
+        delivered_offloads_;
 };
 
 }  // namespace mooncake::test

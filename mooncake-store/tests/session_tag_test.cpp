@@ -3,6 +3,7 @@
 
 #include "master_service_test_fixture.h"
 #include "metadata_store.h"
+#include "offload_storage_key.h"
 #include "rpc_service.h"
 
 namespace {
@@ -218,7 +219,14 @@ TEST_F(MasterServiceTest, SessionTagSurvivesAddingDiskReplica) {
     MasterService service;
     const auto client = PrepareSimpleSegment(service).client_id;
     PutCompletedObject(service, client, "key", Tagged("writer"));
+    const auto generation = CapturedPrimaryGrantsForTesting::Meta(
+                                &service, client, "key", TenantId::Default())
+                                .write_generation.value_or("");
+    ASSERT_FALSE(generation.empty());
     Replica disk(client, 1024, "local://session", ReplicaStatus::COMPLETE);
+    disk.update_local_disk_descriptor(1024, "local://session",
+                                      MakeOffloadStorageKey("key", generation),
+                                      generation);
     ASSERT_TRUE(service.AddReplica(client, "key", TenantId::Default(), disk));
     EXPECT_EQ(SessionTag(service, "key"), "writer");
 }
@@ -229,44 +237,45 @@ TEST_F(MasterServiceTest, SessionTagCommitsAndSurvivesUpsertReplacement) {
     PrepareSimpleSegment(service);
     const auto client = generate_uuid();
     auto a = Tagged("a");
-    ASSERT_TRUE(service.PutStart(client, "key", TenantId::Default(), 1024, a));
+    ASSERT_TRUE(PutStartWithGrantForTesting(service, client, "key",
+                                            TenantId::Default(), 1024, a));
     EXPECT_EQ(SessionTag(service, "key"), "");
-    ASSERT_TRUE(service.PutEnd(client, "key", TenantId::Default(),
-                               ReplicaType::MEMORY));
+    ASSERT_TRUE(PutEndWithGrantForTesting(
+        service, client, "key", TenantId::Default(), ReplicaType::MEMORY));
     EXPECT_EQ(SessionTag(service, "key"), "a");
     EXPECT_FALSE(service.PutStart(client, "key", TenantId::Default(), 1024,
                                   Tagged("b")));
     EXPECT_EQ(SessionTag(service, "key"), "a");
 
     // Same-size, absent tag; then size-changing, explicit tag.
-    ASSERT_TRUE(
-        service.UpsertStart(client, "key", TenantId::Default(), 1024, {}));
-    ASSERT_TRUE(service.UpsertEnd(client, "key", TenantId::Default(),
-                                  ReplicaType::MEMORY));
+    ASSERT_TRUE(UpsertStartWithGrantForTesting(service, client, "key",
+                                               TenantId::Default(), 1024, {}));
+    ASSERT_TRUE(UpsertEndWithGrantForTesting(
+        service, client, "key", TenantId::Default(), ReplicaType::MEMORY));
     EXPECT_EQ(SessionTag(service, "key"), "a");
-    ASSERT_TRUE(service.UpsertStart(client, "key", TenantId::Default(), 2048,
-                                    Tagged("b")));
+    ASSERT_TRUE(UpsertStartWithGrantForTesting(
+        service, client, "key", TenantId::Default(), 2048, Tagged("b")));
     EXPECT_EQ(SessionTag(service, "key"), "a");
     EXPECT_FALSE(service.UpsertEnd(generate_uuid(), "key", TenantId::Default(),
                                    ReplicaType::MEMORY));
     EXPECT_EQ(SessionTag(service, "key"), "a");
-    ASSERT_TRUE(service.UpsertEnd(client, "key", TenantId::Default(),
-                                  ReplicaType::MEMORY));
+    ASSERT_TRUE(UpsertEndWithGrantForTesting(
+        service, client, "key", TenantId::Default(), ReplicaType::MEMORY));
     EXPECT_EQ(SessionTag(service, "key"), "b");
 
-    ASSERT_TRUE(service.UpsertStart(client, "key", TenantId::Default(), 4096,
-                                    Tagged("")));
-    ASSERT_TRUE(service.UpsertEnd(client, "key", TenantId::Default(),
-                                  ReplicaType::MEMORY));
+    ASSERT_TRUE(UpsertStartWithGrantForTesting(
+        service, client, "key", TenantId::Default(), 4096, Tagged("")));
+    ASSERT_TRUE(UpsertEndWithGrantForTesting(
+        service, client, "key", TenantId::Default(), ReplicaType::MEMORY));
     EXPECT_EQ(SessionTag(service, "key"), "b");
     // Preempt an unfinished tagged write; its pending tag must not survive.
-    ASSERT_TRUE(service.UpsertStart(client, "key", TenantId::Default(), 4096,
-                                    Tagged("failed")));
+    ASSERT_TRUE(UpsertStartWithGrantForTesting(
+        service, client, "key", TenantId::Default(), 4096, Tagged("failed")));
     EXPECT_EQ(SessionTag(service, "key"), "b");
-    ASSERT_TRUE(
-        service.UpsertStart(client, "key", TenantId::Default(), 4096, {}));
-    ASSERT_TRUE(service.UpsertEnd(client, "key", TenantId::Default(),
-                                  ReplicaType::MEMORY));
+    ASSERT_TRUE(UpsertStartWithGrantForTesting(service, client, "key",
+                                               TenantId::Default(), 4096, {}));
+    ASSERT_TRUE(UpsertEndWithGrantForTesting(
+        service, client, "key", TenantId::Default(), ReplicaType::MEMORY));
     EXPECT_EQ(SessionTag(service, "key"), "b");
     ASSERT_TRUE(service.Remove("key", TenantId::Default(), true));
     PutCompletedObject(service, client, "key", {});
@@ -281,19 +290,19 @@ TEST_F(MasterServiceTest, SessionTagValidationAndBatchUpsert) {
                                   Tagged(std::string(257, 'x'))));
     EXPECT_FALSE(service.ExistKey("bad", TenantId::Default()).value_or(false));
     auto config = Tagged("a");
-    auto results = service.BatchUpsertStart(
-        client, {"a", "b"}, TenantId::Default(), {1024, 1024}, config);
+    auto results = BatchUpsertStartWithGrantForTesting(
+        service, client, {"a", "b"}, TenantId::Default(), {1024, 1024}, config);
     ASSERT_EQ(results.size(), 2);
     EXPECT_FALSE(results[0]);
     EXPECT_FALSE(results[1]);
     config.session_ids = std::vector<std::string>{"a", "b"};
-    results = service.BatchUpsertStart(client, {"a", "b"}, TenantId::Default(),
-                                       {1024, 1024}, config);
+    results = BatchUpsertStartWithGrantForTesting(
+        service, client, {"a", "b"}, TenantId::Default(), {1024, 1024}, config);
     ASSERT_TRUE(results[0]);
     ASSERT_TRUE(results[1]);
     for (const auto& key : {"a", "b"}) {
-        ASSERT_TRUE(service.UpsertEnd(client, key, TenantId::Default(),
-                                      ReplicaType::MEMORY));
+        ASSERT_TRUE(UpsertEndWithGrantForTesting(
+            service, client, key, TenantId::Default(), ReplicaType::MEMORY));
         EXPECT_EQ(SessionTag(service, key), key);
     }
 }
@@ -302,10 +311,10 @@ TEST_F(MasterServiceTest, SessionTagRevokedWriteDoesNotTagRetry) {
     MasterService service;
     PrepareSimpleSegment(service);
     const auto client = generate_uuid();
-    ASSERT_TRUE(service.PutStart(client, "key", TenantId::Default(), 1024,
-                                 Tagged("revoked")));
-    ASSERT_TRUE(service.PutRevoke(client, "key", TenantId::Default(),
-                                  ReplicaType::MEMORY));
+    ASSERT_TRUE(PutStartWithGrantForTesting(
+        service, client, "key", TenantId::Default(), 1024, Tagged("revoked")));
+    ASSERT_TRUE(PutRevokeWithGrantForTesting(
+        service, client, "key", TenantId::Default(), ReplicaType::MEMORY));
     PutCompletedObject(service, client, "key", {});
     EXPECT_EQ(SessionTag(service, "key"), "");
 }

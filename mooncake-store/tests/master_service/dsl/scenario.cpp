@@ -480,6 +480,7 @@ MasterScenario& MasterScenario::WhenPutStart(PutStartActionData action) {
                         action.expected_memory_nodes);
     if (result) {
         last_start_results_[action.tenant + "\n" + action.key] = *result;
+        RememberPrimaryGrant(action.actor, action.tenant, action.key, *result);
     }
     return *this;
 }
@@ -535,8 +536,34 @@ MasterScenario& MasterScenario::WhenUpsertStart(UpsertStartActionData action) {
     }
     if (result) {
         last_start_results_[action.tenant + "\n" + action.key] = *result;
+        RememberPrimaryGrant(action.actor, action.tenant, action.key, *result);
     }
     return *this;
+}
+
+void MasterScenario::RememberPrimaryGrant(
+    const std::string& actor, const std::string& tenant, const std::string& key,
+    const std::vector<Replica::Descriptor>& replicas) {
+    auto generation = GetPrimaryWriteGeneration(replicas);
+    if (!generation) {
+        Fail("Start(" + key + ") returned no consistent primary write grant");
+        return;
+    }
+    primary_grants_[{actor, tenant, key}].push_back(*generation);
+}
+
+ObjectMeta MasterScenario::PrimaryMeta(const std::string& actor,
+                                       const std::string& tenant,
+                                       const std::string& key,
+                                       std::optional<uint64_t> checksum,
+                                       std::optional<size_t> ordinal) const {
+    const auto found = primary_grants_.find({actor, tenant, key});
+    if (found == primary_grants_.end() || found->second.empty())
+        return {key, checksum, {}};
+    const auto index = ordinal.value_or(found->second.size() - 1);
+    return {
+        key, checksum,
+        index < found->second.size() ? found->second[index] : std::string{}};
 }
 
 MasterScenario& MasterScenario::When(PutEndAction action) {
@@ -544,9 +571,11 @@ MasterScenario& MasterScenario::When(PutEndAction action) {
         return *this;
     }
 
-    const auto result = service_->PutEnd(
-        ActorId(action.actor), ObjectMeta{action.key, action.checksum},
-        TenantId(action.tenant), action.replica_type);
+    const auto result =
+        service_->PutEnd(ActorId(action.actor),
+                         PrimaryMeta(action.actor, action.tenant, action.key,
+                                     action.checksum, action.start_ordinal),
+                         TenantId(action.tenant), action.replica_type);
     ValidateActionResult("PutEnd(" + action.key + ")", action.expected_error,
                          result.has_value(),
                          result ? ErrorCode::OK : result.error());
@@ -558,9 +587,11 @@ MasterScenario& MasterScenario::When(UpsertEndAction action) {
         return *this;
     }
 
-    const auto result = service_->UpsertEnd(
-        ActorId(action.actor), ObjectMeta{action.key, action.checksum},
-        TenantId(action.tenant), action.replica_type);
+    const auto result =
+        service_->UpsertEnd(ActorId(action.actor),
+                            PrimaryMeta(action.actor, action.tenant, action.key,
+                                        action.checksum, action.start_ordinal),
+                            TenantId(action.tenant), action.replica_type);
     ValidateActionResult("UpsertEnd(" + action.key + ")", action.expected_error,
                          result.has_value(),
                          result ? ErrorCode::OK : result.error());
@@ -573,7 +604,9 @@ MasterScenario& MasterScenario::When(PutRevokeAction action) {
     }
 
     const auto result =
-        service_->PutRevoke(ActorId(action.actor), action.key,
+        service_->PutRevoke(ActorId(action.actor),
+                            PrimaryMeta(action.actor, action.tenant, action.key,
+                                        {}, action.start_ordinal),
                             TenantId(action.tenant), action.replica_type);
     ValidateActionResult("PutRevoke(" + action.key + ")", action.expected_error,
                          result.has_value(),
@@ -586,9 +619,11 @@ MasterScenario& MasterScenario::When(UpsertRevokeAction action) {
         return *this;
     }
 
-    const auto result =
-        service_->UpsertRevoke(ActorId(action.actor), action.key,
-                               TenantId(action.tenant), action.replica_type);
+    const auto result = service_->UpsertRevoke(
+        ActorId(action.actor),
+        PrimaryMeta(action.actor, action.tenant, action.key, {},
+                    action.start_ordinal),
+        TenantId(action.tenant), action.replica_type);
     ValidateActionResult("UpsertRevoke(" + action.key + ")",
                          action.expected_error, result.has_value(),
                          result ? ErrorCode::OK : result.error());
@@ -617,6 +652,12 @@ MasterScenario& MasterScenario::When(BatchUpsertStartAction action) {
                             action.expected_error,
                             action.expected_replica_count,
                             action.expected_replica_status, results[index]);
+        if (results[index]) {
+            RememberPrimaryGrant(action.actor, action.tenant,
+                                 action.keys[index], *results[index]);
+            last_start_results_[action.tenant + "\n" + action.keys[index]] =
+                *results[index];
+        }
     }
     return *this;
 }
@@ -650,7 +691,7 @@ MasterScenario& MasterScenario::When(BatchUpsertEndAction action) {
     std::vector<ObjectMeta> objects;
     objects.reserve(action.keys.size());
     for (const auto& key : action.keys) {
-        objects.push_back({.key = key, .object_checksum = std::nullopt});
+        objects.push_back(PrimaryMeta(action.actor, action.tenant, key));
     }
     const auto results = service_->BatchUpsertEnd(
         ActorId(action.actor), objects, TenantId(action.tenant));
@@ -1197,6 +1238,10 @@ MasterScenario& MasterScenario::When(OffloadHeartbeatAction action) {
     }
     const auto result = service_->OffloadObjectHeartbeat(
         ActorId(action.actor), action.enable_offloading);
+    if (result && action.enable_offloading)
+        for (const auto& task : *result)
+            delivered_offloads_[{action.actor, task.tenant_id, task.key}] =
+                task;
     ValidateActionResult("OffloadHeartbeat(" + action.actor + ")",
                          action.expected_error, result.has_value(),
                          result ? ErrorCode::OK : result.error());
@@ -1270,8 +1315,38 @@ MasterScenario& MasterScenario::When(CompleteOffloadAction action) {
             size = static_cast<int64_t>(
                 descriptor->get_memory_descriptor().buffer_descriptor.size_);
         }
-        tasks.push_back(OffloadTaskItem{
-            .tenant_id = action.tenant, .key = key, .size = size});
+        if (action.without_admission) {
+            tasks.push_back(OffloadTaskItem{
+                .tenant_id = action.tenant, .key = key, .size = size});
+            StorageObjectMetadata metadata{};
+            metadata.data_size = size;
+            metadata.transport_endpoint = endpoint;
+            metadatas.push_back(std::move(metadata));
+            continue;
+        }
+        auto delivered =
+            delivered_offloads_.find({action.actor, action.tenant, key});
+        if (delivered == delivered_offloads_.end()) {
+            auto heartbeat =
+                service_->OffloadObjectHeartbeat(ActorId(action.actor), true);
+            if (heartbeat)
+                for (const auto& task : *heartbeat)
+                    delivered_offloads_[{action.actor, task.tenant_id,
+                                         task.key}] = task;
+            delivered =
+                delivered_offloads_.find({action.actor, action.tenant, key});
+        }
+        if (delivered == delivered_offloads_.end()) {
+            Fail("CompleteOffload(" + key +
+                 ") has no delivered offload admission");
+            return *this;
+        }
+        if (delivered->second.size != size) {
+            Fail("CompleteOffload(" + key +
+                 ") size differs from delivered task");
+            return *this;
+        }
+        tasks.push_back(delivered->second);
         StorageObjectMetadata metadata{};
         metadata.data_size = size;
         metadata.transport_endpoint = endpoint;
@@ -1337,7 +1412,10 @@ MasterScenario& MasterScenario::When(RacePutStartAction action) {
             if (result) {
                 admitted.fetch_add(1);
                 const auto end = service_->PutEnd(
-                    actor_id, action.key, tenant_id, ReplicaType::MEMORY);
+                    actor_id,
+                    ObjectMeta{action.key, std::nullopt,
+                               result->front().write_generation},
+                    tenant_id, ReplicaType::MEMORY);
                 if (end) {
                     completed.fetch_add(1);
                 } else {
@@ -1509,8 +1587,11 @@ MasterScenario& MasterScenario::When(RaceWritesWithRemoveAllAction action) {
                                        ") failed: " + toString(start.error()));
                     continue;
                 }
-                const auto end = service_->PutEnd(actor_id, key, tenant_id,
-                                                  ReplicaType::MEMORY);
+                const auto end = service_->PutEnd(
+                    actor_id,
+                    ObjectMeta{key, std::nullopt,
+                               start->front().write_generation},
+                    tenant_id, ReplicaType::MEMORY);
                 if (!end) {
                     std::lock_guard lock(failures_mutex);
                     failures.push_back("PutEnd(" + key +

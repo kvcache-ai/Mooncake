@@ -664,7 +664,7 @@ TEST_P(MasterServiceEvictScenarioTest,
         .When(PutStart("writer-failure", kObjectSize)
                   .OnNode("memory")
                   .WithHardPin())
-        .When(PutEnd("writer-failure"));
+        .When(PutEnd("writer-failure").ExpectError(ErrorCode::INTERNAL_ERROR));
     ASSERT_TRUE(backend->WaitForTransactionCalls(1));
 
     scenario.When(WaitForOpLogFailure())

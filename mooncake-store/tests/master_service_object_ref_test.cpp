@@ -1,3 +1,4 @@
+#include "master_service/primary_write_grants_for_testing.h"
 // The accessor contract: a key held across a write's whole read-modify-write,
 // and a publication named by an ObjectRef that a later step comes back to.
 
@@ -86,20 +87,20 @@ TEST_F(MasterServiceTest, SizeChangingUpsertStartsANewPublication) {
     ASSERT_TRUE(before.has_value());
 
     // The same size is overwritten in place: still the same publication.
-    ASSERT_TRUE(service
-                    .UpsertStart(context.client_id, key, TenantId::Default(),
-                                 1024, OneMemoryReplica())
+    ASSERT_TRUE(UpsertStartWithGrantForTesting(service, context.client_id, key,
+                                               TenantId::Default(), 1024,
+                                               OneMemoryReplica())
                     .has_value());
     EXPECT_TRUE(IsPublished(service, *before));
-    ASSERT_TRUE(service
-                    .PutEnd(context.client_id, key, TenantId::Default(),
-                            ReplicaType::MEMORY)
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id, key,
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
                     .has_value());
 
     // A new size replaces the object under the same lock.
-    ASSERT_TRUE(service
-                    .UpsertStart(context.client_id, key, TenantId::Default(),
-                                 2048, OneMemoryReplica())
+    ASSERT_TRUE(UpsertStartWithGrantForTesting(service, context.client_id, key,
+                                               TenantId::Default(), 2048,
+                                               OneMemoryReplica())
                     .has_value());
     const auto after = CurrentRef(service, key);
     ASSERT_TRUE(after.has_value());
@@ -119,9 +120,9 @@ TEST_F(MasterServiceTest, ConcurrentPutStartsAdmitOneWriter) {
     for (int i = 0; i < kWriters; ++i) {
         writers.emplace_back([&, i] {
             start_line.arrive_and_wait();
-            auto result =
-                service.PutStart(context.client_id, key, TenantId::Default(),
-                                 1024, OneMemoryReplica());
+            auto result = PutStartWithGrantForTesting(
+                service, context.client_id, key, TenantId::Default(), 1024,
+                OneMemoryReplica());
             results[i] = result ? ErrorCode::OK : result.error();
         });
     }
@@ -164,9 +165,9 @@ TEST_F(MasterServiceTest, ConcurrentUpsertStartsLeaveOneObject) {
             // Half keep the size and half change it, so in-place overwrites,
             // preemptions and replacements interleave.
             const uint64_t size = i % 2 == 0 ? 1024 : 2048;
-            auto result =
-                service.UpsertStart(context.client_id, key, TenantId::Default(),
-                                    size, OneMemoryReplica());
+            auto result = UpsertStartWithGrantForTesting(
+                service, context.client_id, key, TenantId::Default(), size,
+                OneMemoryReplica());
             results[i] = result ? ErrorCode::OK : result.error();
         });
     }
@@ -192,9 +193,9 @@ TEST_F(MasterServiceTest, ConcurrentUpsertStartsLeaveOneObject) {
         EXPECT_EQ(accessor.Get().CountReplicas(&Replica::fn_is_memory_replica),
                   1);
     }
-    ASSERT_TRUE(service
-                    .PutEnd(context.client_id, key, TenantId::Default(),
-                            ReplicaType::MEMORY)
+    ASSERT_TRUE(PutEndWithGrantForTesting(service, context.client_id, key,
+                                          TenantId::Default(),
+                                          ReplicaType::MEMORY)
                     .has_value());
     EXPECT_TRUE(service.GetReplicaList(key, TenantId::Default()).has_value());
 }

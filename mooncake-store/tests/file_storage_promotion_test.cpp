@@ -29,6 +29,22 @@ class FakeClient : public Client {
                  /*protocol=*/"tcp",
                  /*labels=*/{}) {}
 
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQueryReadOnly(
+        const std::vector<std::string>& keys,
+        const std::string& tenant) override {
+        std::vector<tl::expected<QueryResult, ErrorCode>> result;
+        for (const auto& key : keys) {
+            Replica disk(getClientId(), 1024, "localhost:9003",
+                         ReplicaStatus::COMPLETE);
+            disk.update_local_disk_descriptor(1024, "localhost:9003", key,
+                                              "fixture-generation");
+            result.emplace_back(QueryResult({disk.get_descriptor()},
+                                            std::chrono::steady_clock::now(),
+                                            {}, tenant, "fixture-generation"));
+        }
+        return result;
+    }
+
     // Drives the queue returned to the heartbeat caller.
     std::vector<PromotionTaskItem> heartbeat_queue;
     tl::expected<void, ErrorCode> heartbeat_result =
@@ -52,6 +68,14 @@ class FakeClient : public Client {
                !heartbeat_queue.empty()) {
             promotion_objects.push_back(std::move(heartbeat_queue.back()));
             heartbeat_queue.pop_back();
+            auto& task = promotion_objects.back();
+            if (task.storage_key.value_or("").empty())
+                task.storage_key = task.key;
+            if (task.object_generation.value_or("").empty())
+                task.object_generation = "fixture-generation";
+            if (task.task_id.value_or("").empty())
+                task.task_id =
+                    "fixture-task-" + task.tenant_id + ":" + task.key;
         }
         return {};
     }
@@ -64,18 +88,25 @@ class FakeClient : public Client {
 
     tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
         const std::string& key, uint64_t size,
-        const std::vector<std::string>& preferred_segments) override {
-        return PromotionAllocStart(key, "default", size, preferred_segments);
+        const std::vector<std::string>& preferred_segments,
+        bool physical_storage_key = false,
+        const std::string& expected_task_id = {}) override {
+        return PromotionAllocStart(key, "default", size, preferred_segments,
+                                   physical_storage_key, expected_task_id);
     }
 
     tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
         const std::string& key, const std::string& tenant_id, uint64_t size,
-        const std::vector<std::string>& preferred_segments) override {
+        const std::vector<std::string>& preferred_segments,
+        bool physical_storage_key = false,
+        const std::string& expected_task_id = {}) override {
         last_alloc_tenant = tenant_id;
         (void)size;
         (void)preferred_segments;
         alloc_calls.fetch_add(1);
         last_alloc_key = key;
+        last_alloc_succeeded = false;
+        last_alloc_had_task_id = !expected_task_id.empty();
         auto it = alloc_overrides.find(key);
         if (it != alloc_overrides.end()) {
             return tl::make_unexpected(it->second);
@@ -83,7 +114,12 @@ class FakeClient : public Client {
         if (!default_alloc_succeeds) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
-        return default_alloc_response;
+        auto response = default_alloc_response;
+        response.object_generation = "fixture-generation";
+        response.task_id = "fixture-task-" + tenant_id + ":" + key;
+        response.storage_key = key;
+        last_alloc_succeeded = true;
+        return response;
     }
 
     // PromotionWrite: per-key dispatch.
@@ -103,6 +139,14 @@ class FakeClient : public Client {
     std::unordered_map<std::string, ErrorCode> notify_overrides;
     tl::expected<void, ErrorCode> default_notify_result =
         tl::expected<void, ErrorCode>{};
+
+    tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& generation, const std::string& task_id) override {
+        EXPECT_FALSE(generation.empty());
+        EXPECT_FALSE(task_id.empty());
+        return NotifyPromotionSuccess(key, tenant_id);
+    }
 
     tl::expected<void, ErrorCode> NotifyPromotionSuccess(
         const std::string& key) override {
@@ -128,6 +172,16 @@ class FakeClient : public Client {
     // post-AllocStart failure paths in ProcessPromotionTasks actually
     // notify the master.
     tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& generation, const std::string& task_id) override {
+        EXPECT_FALSE(generation.empty());
+        if (last_alloc_succeeded || last_alloc_had_task_id) {
+            EXPECT_FALSE(task_id.empty());
+        }
+        return NotifyPromotionFailure(key, tenant_id);
+    }
+
+    tl::expected<void, ErrorCode> NotifyPromotionFailure(
         const std::string& key) override {
         return NotifyPromotionFailure(key, "default");
     }
@@ -149,6 +203,8 @@ class FakeClient : public Client {
     std::vector<std::string> notify_keys;
     std::vector<std::string> notify_failure_keys;
     std::string last_alloc_key;
+    bool last_alloc_succeeded = false;
+    bool last_alloc_had_task_id = false;
 };
 
 }  // namespace fs_test

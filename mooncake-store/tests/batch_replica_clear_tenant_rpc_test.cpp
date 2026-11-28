@@ -90,9 +90,11 @@ TEST(BatchReplicaClearTenantRpcTest, UsesClientTenantAndKeepsTenantsIsolated) {
         auto put_start = service->PutStart(client_id, kSharedKey, kObjectSize,
                                            replicate_config, tenant);
         ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
-        auto put_end =
-            service->PutEnd(client_id, ObjectMeta{kSharedKey, std::nullopt},
-                            ReplicaType::MEMORY, tenant);
+        auto write_generation = GetPrimaryWriteGeneration(*put_start);
+        ASSERT_TRUE(write_generation.has_value());
+        auto put_end = service->PutEnd(
+            client_id, ObjectMeta{kSharedKey, std::nullopt, *write_generation},
+            ReplicaType::MEMORY, tenant);
         ASSERT_TRUE(put_end.has_value()) << toString(put_end.error());
     }
 

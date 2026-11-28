@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <functional>
 #include <string>
 
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -45,6 +46,11 @@ class EmbeddedMaster {
                std::to_string(http_metrics_port_);
     }
     std::shared_ptr<WrappedMasterService> service() const { return wrapped_; }
+
+   protected:
+    bool StartImpl(
+        InProcMasterConfig config,
+        const std::function<void(WrappedMasterServiceConfig&)>& customize);
 
    private:
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;

@@ -9,6 +9,7 @@
 
 #include "master_service.h"
 #include "master_service/master_service_test_peer.h"
+#include "master_service/primary_write_grants_for_testing.h"
 #include "object_test_helpers.h"
 #include "types.h"
 
@@ -372,10 +373,16 @@ class MasterServiceTest : public ::testing::Test {
         auto put_start = service.PutStart(client_id, key, TenantId::Default(),
                                           slice_length, config);
         EXPECT_TRUE(put_start.has_value());
-        EXPECT_TRUE(service
-                        .PutEnd(client_id, key, TenantId::Default(),
-                                ReplicaType::MEMORY)
-                        .has_value());
+        if (!put_start) return key;
+        auto write_generation = GetPrimaryWriteGeneration(*put_start);
+        EXPECT_TRUE(write_generation);
+        if (!write_generation) return key;
+        EXPECT_TRUE(
+            service
+                .PutEnd(client_id,
+                        ObjectMeta{key, std::nullopt, *write_generation},
+                        TenantId::Default(), ReplicaType::MEMORY)
+                .has_value());
         return key;
     }
 
@@ -388,10 +395,16 @@ class MasterServiceTest : public ::testing::Test {
         ASSERT_TRUE(put_start.has_value())
             << "PutStart failed for key=" << key
             << ", error=" << toString(put_start.error());
-        ASSERT_TRUE(service
-                        .PutEnd(client_id, key, TenantId::Default(),
-                                ReplicaType::MEMORY)
-                        .has_value());
+        CapturedPrimaryGrantsForTesting::Remember(
+            &service, client_id, key, TenantId::Default(), put_start);
+        auto write_generation = GetPrimaryWriteGeneration(*put_start);
+        ASSERT_TRUE(write_generation);
+        ASSERT_TRUE(
+            service
+                .PutEnd(client_id,
+                        ObjectMeta{key, std::nullopt, *write_generation},
+                        TenantId::Default(), ReplicaType::MEMORY)
+                .has_value());
     }
 
     void PutCompletedObject(MasterService& service, const UUID& client_id,
@@ -403,8 +416,15 @@ class MasterServiceTest : public ::testing::Test {
         ASSERT_TRUE(put_start.has_value())
             << "PutStart failed for key=" << key << ", tenant_id=" << tenant_id
             << ", error=" << toString(put_start.error());
+        CapturedPrimaryGrantsForTesting::Remember(&service, client_id, key,
+                                                  tenant_id, put_start);
+        auto write_generation = GetPrimaryWriteGeneration(*put_start);
+        ASSERT_TRUE(write_generation);
         ASSERT_TRUE(
-            service.PutEnd(client_id, key, tenant_id, ReplicaType::MEMORY)
+            service
+                .PutEnd(client_id,
+                        ObjectMeta{key, std::nullopt, *write_generation},
+                        tenant_id, ReplicaType::MEMORY)
                 .has_value());
     }
 

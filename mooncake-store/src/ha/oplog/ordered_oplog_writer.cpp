@@ -132,6 +132,7 @@ struct OrderedOpLogWriter::Impl {
         TerminalCallback callback;
         std::optional<OrderedOpLogWriterTerminalState> state;
         DurableWaiters waiters;
+        bool notify_waiters = false;
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (stop_requested || terminal_state.has_value()) {
@@ -158,8 +159,10 @@ struct OrderedOpLogWriter::Impl {
             callback = terminal_callback;
             state = terminal_state;
             waiters.swap(durable_waiters);
+            notify_waiters = blocking_waiters > 0;
         }
         cv.notify_all();
+        if (notify_waiters) waiter_cv.notify_all();
         CompleteWaiters(std::move(waiters), error);
         if (callback) {
             callback(*state);
@@ -172,6 +175,10 @@ struct OrderedOpLogWriter::Impl {
     std::optional<OrderedOpLogWriterTerminalState> terminal_state;
     mutable std::mutex mutex;
     std::condition_variable cv;
+    std::condition_variable waiter_cv;
+    size_t blocking_waiters{0};
+    std::thread::id writer_thread_id{};
+    std::thread::id callback_thread_id{};
     bool accepting{true};
     bool running{false};
     bool stop_requested{false};
@@ -185,6 +192,7 @@ struct OrderedOpLogWriter::Impl {
     uint64_t next_reservation_id{1};
     uint64_t next_sequence_id{1};
     uint64_t next_group_id{1};
+    uint64_t finalized_sequence{config.initial_durable_prefix.last_seq};
     DurablePrefix durable_prefix{config.initial_durable_prefix};
     DurableWaiters durable_waiters;
     size_t open_waiting_slots{0};
@@ -439,6 +447,81 @@ async_simple::Future<ErrorCode> OrderedOpLogWriter::AwaitDurable(
     return future;
 }
 
+tl::expected<void, ErrorCode> OrderedOpLogWriter::WaitUntilDurable(
+    uint64_t sequence, std::chrono::milliseconds timeout) {
+    if (timeout.count() < 0 ||
+        timeout > std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::duration::max() / 2))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    std::unique_lock lock(impl_->mutex);
+    const auto self = std::this_thread::get_id();
+    if (self == impl_->writer_thread_id || self == impl_->callback_thread_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto ready = [&] {
+        return impl_->durable_prefix.last_seq >= sequence ||
+               impl_->terminal_state || impl_->stop_requested;
+    };
+    if (!ready()) {
+        struct WaiterGuard {
+            size_t& count;
+            explicit WaiterGuard(size_t& c) : count(c) { ++count; }
+            ~WaiterGuard() { --count; }
+        } guard(impl_->blocking_waiters);
+        if (timeout.count() == 0)
+            impl_->waiter_cv.wait(lock, ready);
+        else if (!impl_->waiter_cv.wait_for(lock, timeout, ready))
+            return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+    }
+    if (impl_->durable_prefix.last_seq >= sequence) return {};
+    return tl::make_unexpected(impl_->terminal_state
+                                   ? impl_->terminal_state->error
+                                   : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+tl::expected<void, ErrorCode> OrderedOpLogWriter::WaitUntilFinalized(
+    uint64_t sequence, std::chrono::milliseconds timeout) {
+    if (timeout.count() < 0 ||
+        timeout > std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::duration::max() / 2))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    std::unique_lock lock(impl_->mutex);
+    const auto self = std::this_thread::get_id();
+    if (self == impl_->writer_thread_id || self == impl_->callback_thread_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto ready = [&] {
+        return impl_->finalized_sequence >= sequence ||
+               ((impl_->terminal_state || impl_->stop_requested) &&
+                impl_->durable_prefix.last_seq < sequence);
+    };
+    if (!ready()) {
+        struct WaiterGuard {
+            size_t& count;
+            explicit WaiterGuard(size_t& c) : count(c) { ++count; }
+            ~WaiterGuard() { --count; }
+        } guard(impl_->blocking_waiters);
+        if (timeout.count() == 0)
+            impl_->waiter_cv.wait(lock, ready);
+        else if (!impl_->waiter_cv.wait_for(lock, timeout, ready))
+            return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+    }
+    if (impl_->finalized_sequence >= sequence) return {};
+    return tl::make_unexpected(impl_->terminal_state
+                                   ? impl_->terminal_state->error
+                                   : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+uint64_t OrderedOpLogWriter::DurableSequence() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->durable_prefix.last_seq;
+}
+
+uint64_t OrderedOpLogWriter::FinalizedSequence() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->finalized_sequence;
+}
+
 bool OrderedOpLogWriter::IsAccepting() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->accepting;
@@ -477,10 +560,33 @@ void OrderedOpLogWriter::Start() {
     impl_->callback_stop_requested = false;
     impl_->running = true;
     impl_->callback_thread = std::thread([this] {
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            impl_->callback_thread_id = std::this_thread::get_id();
+        }
+        struct ThreadIdReset {
+            Impl* impl;
+            ~ThreadIdReset() {
+                std::lock_guard<std::mutex> lock(impl->mutex);
+                impl->callback_thread_id = std::thread::id{};
+            }
+        } id_reset{impl_.get()};
+        std::optional<uint64_t> completed_sequence;
         while (true) {
             Impl::PendingEntry callback_entry;
+            bool notify_waiters = false;
             {
                 std::unique_lock<std::mutex> lock(impl_->mutex);
+                if (completed_sequence) {
+                    impl_->finalized_sequence = *completed_sequence;
+                    completed_sequence.reset();
+                    notify_waiters = impl_->blocking_waiters > 0;
+                }
+                if (notify_waiters) {
+                    lock.unlock();
+                    impl_->waiter_cv.notify_all();
+                    lock.lock();
+                }
                 impl_->cv.wait(lock, [&] {
                     return impl_->callback_stop_requested ||
                            !impl_->callback_entries.empty();
@@ -510,9 +616,21 @@ void OrderedOpLogWriter::Start() {
 #endif
                 callback_entry.callback(callback_entry.entry);
             }
+            completed_sequence = callback_entry.entry.sequence_id;
         }
     });
     impl_->writer_thread = std::thread([this] {
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            impl_->writer_thread_id = std::this_thread::get_id();
+        }
+        struct ThreadIdReset {
+            Impl* impl;
+            ~ThreadIdReset() {
+                std::lock_guard<std::mutex> lock(impl->mutex);
+                impl->writer_thread_id = std::thread::id{};
+            }
+        } id_reset{impl_.get()};
         while (true) {
             std::vector<Impl::PendingEntry> entries;
             DurablePrefix expected_prefix;
@@ -602,6 +720,7 @@ void OrderedOpLogWriter::Start() {
                                     .count());
                     }
 #endif
+                    bool notify_waiters = false;
                     {
                         std::lock_guard<std::mutex> lock(impl_->mutex);
                         impl_->durable_prefix = {.batch_id = batch.batch_id,
@@ -635,8 +754,10 @@ void OrderedOpLogWriter::Start() {
                         impl_->batch_busy = false;
                         impl_->SealCommittedEntriesIfIdle();
                         impl_->PublishRuntime();
+                        notify_waiters = impl_->blocking_waiters > 0;
                     }
                     impl_->cv.notify_all();
+                    if (notify_waiters) impl_->waiter_cv.notify_all();
                     Impl::CompleteWaiters(std::move(waiters), ErrorCode::OK);
                     break;
                 }
@@ -684,6 +805,7 @@ void OrderedOpLogWriter::Start() {
 
 void OrderedOpLogWriter::Stop() {
     bool running;
+    bool notify_waiters = false;
     Impl::DurableWaiters waiters;
     ErrorCode waiter_error;
     {
@@ -693,12 +815,14 @@ void OrderedOpLogWriter::Stop() {
         impl_->retry_delay_ms = 0;
         impl_->PublishRuntime();
         running = impl_->running;
+        notify_waiters = impl_->blocking_waiters > 0;
         waiters.swap(impl_->durable_waiters);
         waiter_error = impl_->terminal_state.has_value()
                            ? impl_->terminal_state->error
                            : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
     impl_->cv.notify_all();
+    if (notify_waiters) impl_->waiter_cv.notify_all();
     Impl::CompleteWaiters(std::move(waiters), waiter_error);
     if (!running) {
         return;

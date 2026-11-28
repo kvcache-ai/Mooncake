@@ -1853,4 +1853,127 @@ TEST(OrderedOpLogWriterAdmissionTest, CommitBatchRejectsSlotMismatch) {
     writer.Abort(std::move(*next));
 }
 
+TEST_F(OrderedOpLogWriterAwaitTest, BlockingFinalizationIncludesCallbackDrain) {
+    CreateWriter();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation);
+    std::promise<void> entered, release;
+    auto entered_future = entered.get_future();
+    auto gate = release.get_future().share();
+    auto pending = writer_->Commit(std::move(*reservation), MakeEntry(),
+                                   [&](const OpLogEntry&) {
+                                       entered.set_value();
+                                       gate.wait();
+                                   });
+    ASSERT_TRUE(pending);
+    writer_->Start();
+    const auto entered_status =
+        entered_future.wait_for(std::chrono::seconds(2));
+    if (entered_status != std::future_status::ready) {
+        release.set_value();
+        FAIL() << "callback did not start";
+    }
+    EXPECT_TRUE(writer_->WaitUntilDurable(pending->sequence_id(),
+                                          std::chrono::milliseconds(50)));
+    auto blocked = writer_->WaitUntilFinalized(pending->sequence_id(),
+                                               std::chrono::milliseconds(50));
+    EXPECT_FALSE(blocked);
+    if (!blocked) EXPECT_EQ(blocked.error(), ErrorCode::RPC_TIMEOUT);
+    release.set_value();
+    EXPECT_TRUE(writer_->WaitUntilFinalized(pending->sequence_id(),
+                                            std::chrono::seconds(2)));
+    writer_->Stop();
+    EXPECT_TRUE(writer_->WaitUntilFinalized(pending->sequence_id(),
+                                            std::chrono::milliseconds(0)));
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest,
+       BlockingFinalizationRejectsSelfDeadlockFromCallbackThread) {
+    CreateWriter();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation);
+    std::promise<std::pair<ErrorCode, ErrorCode>> callback_wait_errs;
+    auto err_future = callback_wait_errs.get_future();
+    auto pending = writer_->Commit(
+        std::move(*reservation), MakeEntry("self-wait"),
+        [&](const OpLogEntry& entry) {
+            auto fin = writer_->WaitUntilFinalized(
+                entry.sequence_id, std::chrono::milliseconds(0));
+            auto dur = writer_->WaitUntilDurable(entry.sequence_id + 1,
+                                                 std::chrono::milliseconds(0));
+            callback_wait_errs.set_value({fin ? ErrorCode::OK : fin.error(),
+                                          dur ? ErrorCode::OK : dur.error()});
+        });
+    ASSERT_TRUE(pending);
+    writer_->Start();
+    ASSERT_EQ(err_future.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    const auto [fin_err, dur_err] = err_future.get();
+    EXPECT_EQ(fin_err, ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(dur_err, ErrorCode::INVALID_PARAMS);
+    EXPECT_TRUE(writer_->WaitUntilFinalized(pending->sequence_id(),
+                                            std::chrono::seconds(2)));
+    writer_->Stop();
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, BlockingBarriersWakeOnStopBeforeStart) {
+    CreateWriter();
+    auto durable = std::async(std::launch::async, [&] {
+        return writer_->WaitUntilDurable(1, std::chrono::milliseconds(0));
+    });
+    auto finalized = std::async(std::launch::async, [&] {
+        return writer_->WaitUntilFinalized(1, std::chrono::milliseconds(0));
+    });
+    writer_->Stop();
+    EXPECT_EQ(durable.get().error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(finalized.get().error(),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_TRUE(writer_->WaitUntilDurable(0, std::chrono::milliseconds(0)));
+    EXPECT_TRUE(writer_->WaitUntilFinalized(0, std::chrono::milliseconds(0)));
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest,
+       BlockingBarriersRejectUnrepresentableTimeouts) {
+    CreateWriter();
+    for (auto timeout :
+         {std::chrono::milliseconds(-1), std::chrono::milliseconds::max()}) {
+        EXPECT_EQ(writer_->WaitUntilDurable(1, timeout).error(),
+                  ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(writer_->WaitUntilFinalized(1, timeout).error(),
+                  ErrorCode::INVALID_PARAMS);
+    }
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest,
+       LaterFencingDoesNotSkipEarlierDurableCallback) {
+    CreateWriter();
+    auto first = writer_->Reserve();
+    ASSERT_TRUE(first);
+    auto durable =
+        writer_->Commit(std::move(*first), MakeEntry("first"),
+                        [this](const OpLogEntry&) { BlockCallback(); });
+    ASSERT_TRUE(durable);
+    writer_->Start();
+    ASSERT_TRUE(WaitForCallback());
+    storage_.FailNextWrite(ErrorCode::ETCD_TRANSACTION_FAIL);
+    auto second = writer_->Reserve();
+    ASSERT_TRUE(second);
+    auto rejected =
+        writer_->Commit(std::move(*second), MakeEntry("second"), {});
+    ASSERT_TRUE(rejected);
+    auto& waiter = Await(rejected->sequence_id());
+    ExpectResult(waiter, ErrorCode::ETCD_TRANSACTION_FAIL);
+    auto pending = writer_->WaitUntilFinalized(durable->sequence_id(),
+                                               std::chrono::milliseconds(50));
+    ASSERT_FALSE(pending);
+    EXPECT_EQ(pending.error(), ErrorCode::RPC_TIMEOUT);
+    ReleaseCallback();
+    EXPECT_TRUE(writer_->WaitUntilFinalized(durable->sequence_id(),
+                                            std::chrono::seconds(2)));
+    auto failed = writer_->WaitUntilFinalized(rejected->sequence_id(),
+                                              std::chrono::milliseconds(20));
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(failed.error(), ErrorCode::ETCD_TRANSACTION_FAIL);
+}
+
 }  // namespace mooncake::test

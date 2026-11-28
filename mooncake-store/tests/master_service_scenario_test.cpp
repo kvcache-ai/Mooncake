@@ -99,6 +99,45 @@ TEST(MasterServiceTest, UpsertNewKey) {
                   .HasReplicas(1)
                   .HasCompleteReplicas(1));
 }
+TEST(MasterServiceTest,
+     SameClientDelayedEndAndRevokeKeepReplacementProcessing) {
+    MasterScenario("same-client delayed terminal keeps replacement processing")
+        .Given(MemoryNode("memory"))
+        .When(PutStart("same-client", 1_KB).By("writer"))
+        .When(UpsertStart("same-client", 1_KB).By("writer"))
+        .When(PutEnd("same-client")
+                  .By("writer")
+                  .FromStart(0)
+                  .ExpectError(ErrorCode::INVALID_VERSION))
+        .Then(Object("same-client").IsNotReady())
+        .When(PutRevoke("same-client")
+                  .By("writer")
+                  .FromStart(0)
+                  .ExpectError(ErrorCode::INVALID_VERSION))
+        .Then(Object("same-client").IsNotReady())
+        .When(UpsertEnd("same-client").By("writer").FromStart(1))
+        .Then(Object("same-client").IsReadable().HasCompleteReplicas(1));
+}
+TEST(MasterServiceTest, InPlaceWriteRetainsItsOwnAdmissionGrant) {
+    MasterScenario("same-client in-place generation keeps original grant")
+        .Given(MemoryNode("memory"))
+        .When(PutStart("in-place-fence", 1_KB).By("writer"))
+        .When(PutEnd("in-place-fence").By("writer"))
+        .When(UpsertStart("in-place-fence", 1_KB)
+                  .By("writer")
+                  .ExpectBufferReuse())
+        .When(UpsertEnd("in-place-fence")
+                  .By("writer")
+                  .FromStart(0)
+                  .ExpectError(ErrorCode::INVALID_VERSION))
+        .When(UpsertRevoke("in-place-fence")
+                  .By("writer")
+                  .FromStart(0)
+                  .ExpectError(ErrorCode::INVALID_VERSION))
+        .Then(Object("in-place-fence").IsNotReady())
+        .When(UpsertEnd("in-place-fence").By("writer").FromStart(1))
+        .Then(Object("in-place-fence").IsReadable().HasCompleteReplicas(1));
+}
 
 TEST(MasterServiceTest, UpsertPreemptsInProgressPut) {
     MasterScenario("upsert preempts an in-progress put")

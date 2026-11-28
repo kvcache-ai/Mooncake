@@ -255,7 +255,7 @@ size_t LocalSsdManager::RemoveOffloadFromAll(const TenantId& tenant_id,
 
 bool LocalSsdManager::CancelOffloadsIfAllPending(
     const std::vector<UUID>& client_ids, const TenantId& tenant_id,
-    std::string_view key) {
+    std::string_view key, std::string_view expected_task_id) {
     if (client_ids.empty()) {
         return false;
     }
@@ -286,9 +286,11 @@ bool LocalSsdManager::CancelOffloadsIfAllPending(
 
     const std::string index = tenant_id.MakeScopedKey(key);
     for (const auto& client : clients) {
-        if (!client.record->mailbox.pending_offloads_.contains(index)) {
+        const auto task = client.record->mailbox.pending_offloads_.find(index);
+        if (task == client.record->mailbox.pending_offloads_.end() ||
+            (!expected_task_id.empty() &&
+             task->second.task_id.value_or("") != expected_task_id))
             return false;
-        }
     }
     for (auto& client : clients) {
         client.record->mailbox.pending_offloads_.erase(index);

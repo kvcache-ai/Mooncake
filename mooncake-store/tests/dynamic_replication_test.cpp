@@ -57,8 +57,11 @@ class DynamicReplicationTest : public ::testing::Test {
         auto put_start =
             service.PutStart(client_id, key, TenantId::Default(), 1024, config);
         ASSERT_TRUE(put_start.has_value());
-        auto put_end = service.PutEnd(client_id, key, TenantId::Default(),
-                                      ReplicaType::MEMORY);
+        auto write_generation = GetPrimaryWriteGeneration(*put_start);
+        ASSERT_TRUE(write_generation.has_value());
+        auto put_end = service.PutEnd(
+            client_id, ObjectMeta{key, std::nullopt, *write_generation},
+            TenantId::Default(), ReplicaType::MEMORY);
         ASSERT_TRUE(put_end.has_value());
     }
 

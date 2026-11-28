@@ -58,8 +58,11 @@ class OffloadOnEvictTest : public ::testing::Test {
         auto put_start =
             service.PutStart(client_id, key, TenantId::Default(), size, config);
         ASSERT_TRUE(put_start.has_value()) << "PutStart failed for key=" << key;
-        auto put_end = service.PutEnd(client_id, key, TenantId::Default(),
-                                      ReplicaType::MEMORY);
+        auto write_generation = GetPrimaryWriteGeneration(*put_start);
+        ASSERT_TRUE(write_generation.has_value());
+        auto put_end = service.PutEnd(
+            client_id, ObjectMeta{key, std::nullopt, *write_generation},
+            TenantId::Default(), ReplicaType::MEMORY);
         ASSERT_TRUE(put_end.has_value()) << "PutEnd failed for key=" << key;
     }
 
@@ -132,10 +135,14 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsQueuedOffloadWithOffloadOnEvict) {
             offloading_key = k;
             EXPECT_EQ(upsert->size(), 1u);
             EXPECT_EQ(upsert->at(0).status, ReplicaStatus::PROCESSING);
-            ASSERT_TRUE(service
-                            ->PutEnd(ctx.client_id, k, TenantId::Default(),
-                                     ReplicaType::MEMORY)
-                            .has_value());
+            auto write_generation = GetPrimaryWriteGeneration(*upsert);
+            ASSERT_TRUE(write_generation.has_value());
+            ASSERT_TRUE(
+                service
+                    ->PutEnd(ctx.client_id,
+                             ObjectMeta{k, std::nullopt, *write_generation},
+                             TenantId::Default(), ReplicaType::MEMORY)
+                    .has_value());
             break;
         }
     }
