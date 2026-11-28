@@ -31,8 +31,14 @@ double-buffering, staging-buffer lifecycle, and async status tracking.
 | `tpu_pjrt_shim.cpp` (`TpuPjrtShim`) | Isolates all PJRT dependency. Resolves the device-copy adapter at runtime via `dlopen`. |
 | `../../transport/tpu/tpu_transport.cpp` (`TpuTransport`) | The local HBM↔host staging executor. Advertises only `gpu_to_dram` / `dram_to_gpu`; runs the copy via `Platform::copy` for `LOCAL_SEGMENT_ID` requests. |
 
-The staging policy that ties these together lives in
-`TransferEngineImpl::findStagingPolicy` (case "TPU").
+The staging policy that ties these together is planned in
+`TransferEngineImpl::getTransportType` (before transport selection) using the
+shared TPU/XPU/MLU case in `TransferEngineImpl::findStagingPolicy`.
+
+Each process copies only its own HBM. The initiator stages its local TPU side
+through its `TpuTransport` and delegates the peer's TPU side to the peer, so a
+host-only initiator, even one built without `USE_TPU`, can read and write a
+peer's TPU memory. A local TPU side without a local `TpuTransport` is refused.
 
 ## The device-copy adapter (runtime dependency)
 
