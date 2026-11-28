@@ -21,6 +21,7 @@ jobs:
     with:
       architecture: ${{ matrix.architecture }}
       artifact-prefix: ${{ matrix.artifact-prefix }}
+      use-tent: true
 
   publish-release:
     needs: build
