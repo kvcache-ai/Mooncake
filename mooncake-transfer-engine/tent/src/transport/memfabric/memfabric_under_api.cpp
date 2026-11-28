@@ -258,8 +258,7 @@ int MemFabricGvaApi::copy(void* entity, uint64_t source, uint64_t destination,
         nullptr, 0);
 }
 int MemFabricGvaApi::batchCopy(void* entity,
-                               const std::vector<MemFabricGvaCopy>& copies,
-                               uint32_t direction) {
+                               const std::vector<MemFabricGvaCopy>& copies) {
     auto* api = nativeApi();
     if (!api || copies.empty() || copies.size() > UINT32_MAX) return -1;
     auto buffers = std::make_shared<NativeHybm::BatchBuffers>();
@@ -285,8 +284,7 @@ int MemFabricGvaApi::batchCopy(void* entity,
         buffers->sources.data(), buffers->destinations.data(),
         buffers->sizes.data(), static_cast<uint32_t>(copies.size())};
     const auto ret = api->hybm_data_batch_copy_(
-        entity, &params, static_cast<hybm_data_copy_direction>(direction),
-        nullptr, 0);
+        entity, &params, HYBM_DATA_COPY_DIRECTION_AUTO, nullptr, 0);
     {
         std::lock_guard<std::mutex> lock(api->batch_mutex_);
         if (!ret) {
@@ -468,8 +466,7 @@ int MemFabricGvaApi::unmap(void* entity, uint32_t rank) {
 // reports the native API as unavailable.
 
 bool MemFabricGvaApi::LoadLibrary() { return false; }
-int MemFabricGvaApi::batchCopy(void*, const std::vector<MemFabricGvaCopy>&,
-                               uint32_t) {
+int MemFabricGvaApi::batchCopy(void*, const std::vector<MemFabricGvaCopy>&) {
     return -1;
 }
 int MemFabricGvaApi::copy(void*, uint64_t, uint64_t, size_t, uint32_t) {

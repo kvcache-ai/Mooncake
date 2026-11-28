@@ -71,11 +71,6 @@ bool blobValid(const nlohmann::json& descriptor) {
     }
     return true;
 }
-bool containsRange(uint64_t base, uint64_t length, uint64_t address,
-                   size_t size) {
-    return address >= base && address - base < length &&
-           size <= length - (address - base);
-}
 }  // namespace
 MemFabricSharedMemory::MemFabricSharedMemory(MemFabricGvaConfig config,
                                              std::string segment_name)
@@ -251,7 +246,6 @@ Status MemFabricSharedMemory::allocate(void** out, size_t size,
     }
     Slice record;
     record.handle = slice;
-    record.memory_type = memory_type;
     record.length = size;
     record.descriptor = makeIdentity();
     record.descriptor["type"] = memory_type;
@@ -628,7 +622,6 @@ Status MemFabricSharedMemory::importBundle(uint32_t rank,
         ret = MemFabricGvaApi::connect(entity_, rank);
         if (ret) return pending("connect peer (retry when ready)", ret);
     }
-    slice.publication = requested.dump();
     slice.active = true;
     return Status::OK();
 }
@@ -672,67 +665,16 @@ Status MemFabricSharedMemory::unmap(const std::string& peer_segment_name,
     }
     return Status::InvalidArgument("Unknown GVA mapping");
 }
-uint32_t MemFabricSharedMemory::memoryTypeForRange(uint64_t address,
-                                                   size_t size) const {
-    for (const auto& [base, slice] : slices_) {
-        if (slice.published &&
-            containsRange(base, slice.length, address, size)) {
-            return slice.memory_type;
-        }
-    }
-    for (const auto& [rank, peer] : imported_ranks_) {
-        if (peer.cleaned) continue;
-        for (const auto& [base, slice] : peer.slices) {
-            if (slice.active &&
-                containsRange(base, slice.descriptor.at("size").get<uint64_t>(),
-                              address, size)) {
-                return slice.descriptor.at("type").get<uint32_t>();
-            }
-        }
-    }
-    return 0;
-}
-Status MemFabricSharedMemory::validateCopyTarget(
-    const std::string& peer_segment_name, uint64_t address,
-    const std::string& descriptor) const {
+Status MemFabricSharedMemory::beginCopy(size_t count) {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto& [rank, peer] : imported_ranks_) {
-        if (peer.cleaned || peer.segment_name != peer_segment_name) continue;
-        const auto it = peer.slices.find(address);
-        if (it == peer.slices.end()) continue;
-        const auto& slice = it->second;
-        if (slice.active && slice.publication == descriptor) {
-            return Status::OK();
-        }
-    }
-    return Status::InvalidArgument(
-        "Remote GVA publication differs from prepared allocation");
-}
-Status MemFabricSharedMemory::beginCopy(uint64_t source, uint64_t destination,
-                                        size_t size, uint32_t& direction) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!size || size > UINT64_MAX - source ||
-        size > UINT64_MAX - destination) {
-        return Status::InvalidArgument("Invalid GVA copy range");
-    }
     if (copy_failed_) return pending("native copy completion remains unknown");
-    const auto src_type = memoryTypeForRange(source, size);
-    const auto dst_type = memoryTypeForRange(destination, size);
-    if (!src_type || !dst_type) {
-        return Status::InvalidArgument(
-            "GVA copy requires published local or active mapped peer slices");
-    }
-    // HYBM_GLOBAL_{HOST,DEVICE}_TO_GLOBAL_{HOST,DEVICE}.
-    direction = (src_type == kGvaMemoryTypeDevice ? kGvaCopySourceDevice
-                                                  : kGvaCopySourceHost) +
-                (dst_type == kGvaMemoryTypeDevice ? kGvaCopyDestinationDevice
-                                                  : kGvaCopyDestinationHost);
-    ++pending_copies_;
+    pending_copies_ += count;
     return Status::OK();
 }
-template <typename Copy>
-Status MemFabricSharedMemory::runPinnedCopy(size_t count, Copy copy,
-                                            const char* operation) {
+Status MemFabricSharedMemory::runBatchCopy(
+    const std::vector<MemFabricGvaCopy>& copies) {
+    if (copies.empty()) return Status::OK();
+    const auto count = copies.size();
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (copy_failed_) {
@@ -744,21 +686,15 @@ Status MemFabricSharedMemory::runPinnedCopy(size_t count, Copy copy,
     }
     // beginCopy pins the resources. Blocking native calls leave mutex_ free.
     const auto bound = MemFabricGvaApi::bind(config_.device);
-    const auto result = bound ? bound : copy();
+    const auto result =
+        bound ? bound : MemFabricGvaApi::batchCopy(entity_, copies);
     const bool drained = bound || !result ||
                          (config_.protocol == "device_sdma" &&
                           MemFabricGvaApi::wait(entity_) == 0);
-    auto status = result ? nativeError(operation, result) : Status::OK();
+    auto status =
+        result ? nativeError("synchronous batch copy", result) : Status::OK();
     releaseCopy(count, !drained);
     return status;
-}
-Status MemFabricSharedMemory::runBatchCopy(
-    const std::vector<MemFabricGvaCopy>& copies, uint32_t direction) {
-    if (copies.empty()) return Status::OK();
-    return runPinnedCopy(
-        copies.size(),
-        [&] { return MemFabricGvaApi::batchCopy(entity_, copies, direction); },
-        "synchronous batch copy");
 }
 void MemFabricSharedMemory::releaseCopy(size_t count, bool completion_unknown) {
     std::lock_guard<std::mutex> lock(mutex_);

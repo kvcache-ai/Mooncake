@@ -35,14 +35,9 @@ class MemFabricSharedMemory {
                    const std::string& descriptor, uint64_t address,
                    size_t size);
     Status unmap(const std::string& peer_segment_name, uint64_t address);
-    Status validateCopyTarget(const std::string& peer_segment_name,
-                              uint64_t address,
-                              const std::string& descriptor) const;
-    Status beginCopy(uint64_t source, uint64_t destination, size_t size,
-                     uint32_t& direction);
-    // Each member has already been pinned by beginCopy; settles all those pins.
-    Status runBatchCopy(const std::vector<MemFabricGvaCopy>&,
-                        uint32_t direction);
+    Status beginCopy(size_t count);
+    // Settles the pins acquired by beginCopy for each member.
+    Status runBatchCopy(const std::vector<MemFabricGvaCopy>& copies);
     void releaseCopy(size_t count, bool completion_unknown = false);
     Status close();
 
@@ -52,13 +47,11 @@ class MemFabricSharedMemory {
     struct Slice {
         void* handle = nullptr;
         uint64_t length = 0;
-        uint32_t memory_type = 0;
         bool published = false;
         Json descriptor;
     };
     struct RemoteSlice {
         Json descriptor;
-        std::string publication;
         bool active = false, imported = false;
     };
     // Native imports grouped by rank, not a peer discovery/connection list.
@@ -73,8 +66,6 @@ class MemFabricSharedMemory {
     Status mapOrPrepare(const std::string&, const std::string&, uint64_t,
                         size_t, bool);
     Status validateConfig() const;
-    template <typename Copy>
-    Status runPinnedCopy(size_t count, Copy copy, const char* operation);
     // Resource helpers below require mutex_ to be held by the caller.
     // Device binding belongs to each native caller.
     void destroyEntity();
@@ -88,7 +79,6 @@ class MemFabricSharedMemory {
     Status importPeer(ImportedRank&, const Json&);
     Status verifyPeerMapping(uint32_t, const RemoteSlice&);
     Status cleanupPeer(uint32_t, ImportedRank&);
-    uint32_t memoryTypeForRange(uint64_t, size_t) const;
     Json makeIdentity() const;
     mutable std::mutex mutex_;
     MemFabricGvaConfig config_;

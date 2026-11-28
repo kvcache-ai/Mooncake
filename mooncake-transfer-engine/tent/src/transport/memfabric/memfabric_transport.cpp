@@ -7,7 +7,6 @@
 #include <cstring>
 #include <chrono>
 #include <limits>
-#include <iterator>
 #include <map>
 #include <optional>
 #include <utility>
@@ -734,130 +733,42 @@ Status MemFabricTransport::submitGvaCopies(
         batch->capacity - std::min(batch->capacity, batch->task_list.size())) {
         return Status::TooManyRequests("GVA sub-batch capacity exceeded");
     }
-    std::vector<GvaCopy> copies;
-    CHECK_STATUS(resolveGvaCopies(requests, copies));
-    std::vector<std::shared_ptr<GvaCopyGroup>> groups;
-    CHECK_STATUS(buildGvaCopyGroups(batch, requests, copies, groups));
-    dispatchGvaCopyGroups(groups);
-    return Status::OK();
-}
-
-Status MemFabricTransport::resolveGvaCopies(
-    const std::vector<Request>& requests, std::vector<GvaCopy>& copies) {
-    try {
-        copies.reserve(requests.size());
-    } catch (...) {
-        return Status::InternalError("Cannot allocate GVA copy tasks");
-    }
-    auto rollback = [&] { gva_->releaseCopy(copies.size()); };
     for (const auto& request : requests) {
         if (request.opcode != Request::READ &&
             request.opcode != Request::WRITE) {
-            rollback();
             return Status::InvalidArgument("Invalid GVA copy opcode");
         }
-        // Source is the local endpoint for both READ and WRITE. It must be
-        // inside an owned GVA slice; beginCopy checks full range/publication.
-        auto local = reinterpret_cast<uint64_t>(request.source);
-        const auto local_segment = metadata_->segmentManager().getLocal();
-        const auto* local_buffer =
-            local_segment->findBuffer(local, request.length);
-        if (!local_buffer || !findGvaDescriptor(*local_buffer)) {
-            rollback();
-            return Status::InvalidArgument(
-                "Local copy endpoint must be a registered logical GVA slice");
-        }
-        auto status = metadata_->segmentManager().withCachedSegment(
-            request.target_id, [&](SegmentDesc* segment) -> Status {
-                auto* buffer =
-                    segment->findBuffer(request.target_offset, request.length);
-                if (!buffer) {
-                    return Status::InvalidArgument(
-                        "Remote GVA copy range is not registered");
-                }
-                const auto* descriptor = findGvaDescriptor(*buffer);
-                if (!descriptor) {
-                    return Status::InvalidArgument(
-                        "Remote copy endpoint must be a GVA slice");
-                }
-                auto mapping =
-                    gva_remote_.find({request.target_id, buffer->addr});
-                if (mapping == gva_remote_.end() ||
-                    mapping->second != segment->name) {
-                    return Status::InvalidArgument(
-                        "Map remote GVA slice before copy");
-                }
-                return gva_->validateCopyTarget(segment->name, buffer->addr,
-                                                *descriptor);
-            });
-        if (!status.ok()) {
-            rollback();
-            return status;
-        }
-        GvaCopy copy{local, request.target_offset, request.length, 0};
-        if (request.opcode == Request::READ) {
-            std::swap(copy.source, copy.destination);
-        }
-        status = gva_->beginCopy(copy.source, copy.destination, copy.size,
-                                 copy.direction);
-        if (!status.ok()) {
-            rollback();
-            return status;
-        }
-        copies.push_back(copy);
     }
+    std::vector<std::shared_ptr<GvaCopyGroup>> groups;
+    CHECK_STATUS(gva_->beginCopy(requests.size()));
+    CHECK_STATUS(buildGvaCopyGroups(batch, requests, groups));
+    dispatchGvaCopyGroups(groups);
     return Status::OK();
 }
 
 Status MemFabricTransport::buildGvaCopyGroups(
     MemFabricSubBatch* batch, const std::vector<Request>& requests,
-    const std::vector<GvaCopy>& copies,
     std::vector<std::shared_ptr<GvaCopyGroup>>& groups) {
     const auto original_task_count = batch->task_list.size();
     try {
-        // Group adjacent independent copies with the same opcode, peer and
-        // direction into one native batch. Workers may execute groups in any
-        // order. Callers must wait for a copy before submitting dependent work.
-        std::map<uint64_t, uint64_t> reads, writes;
-        auto overlaps = [](const auto& ranges, uint64_t base, size_t size) {
-            auto it = ranges.lower_bound(base);
-            if (it != ranges.end() && it->first < base + size) return true;
-            return it != ranges.begin() && std::prev(it)->second > base;
-        };
-        auto insert = [](auto& ranges, uint64_t base, size_t size) {
-            uint64_t end = base + size;
-            auto it = ranges.lower_bound(base);
-            if (it != ranges.begin() && std::prev(it)->second >= base) --it;
-            while (it != ranges.end() && it->first <= end) {
-                base = std::min(base, it->first);
-                end = std::max(end, it->second);
-                it = ranges.erase(it);
-            }
-            ranges.emplace(base, end);
-        };
-        groups.reserve(copies.size());
-        batch->task_list.reserve(original_task_count + copies.size());
-        for (size_t index = 0; index < copies.size(); ++index) {
-            const auto& copy = copies[index];
+        // HYBM infers direction from the addresses. Callers must wait for a
+        // copy to complete before submitting dependent work.
+        groups.reserve(requests.size());
+        batch->task_list.reserve(original_task_count + requests.size());
+        for (size_t index = 0; index < requests.size(); ++index) {
             const auto& request = requests[index];
-            if (groups.empty() || groups.back()->direction != copy.direction ||
-                groups.back()->target != request.target_id ||
-                groups.back()->opcode != request.opcode ||
-                overlaps(writes, copy.source, copy.size) ||
-                overlaps(writes, copy.destination, copy.size) ||
-                overlaps(reads, copy.destination, copy.size)) {
-                auto group = std::make_shared<GvaCopyGroup>();
-                group->direction = copy.direction;
-                group->target = request.target_id;
-                group->opcode = request.opcode;
-                groups.push_back(std::move(group));
-                reads.clear();
-                writes.clear();
+            if (index == 0 ||
+                request.target_id != requests[index - 1].target_id ||
+                request.opcode != requests[index - 1].opcode) {
+                groups.push_back(std::make_shared<GvaCopyGroup>());
+            }
+            MemFabricGvaCopy copy{reinterpret_cast<uint64_t>(request.source),
+                                  request.target_offset, request.length};
+            if (request.opcode == Request::READ) {
+                std::swap(copy.source, copy.destination);
             }
             auto& group = *groups.back();
-            group.copies.push_back({copy.source, copy.destination, copy.size});
-            insert(reads, copy.source, copy.size);
-            insert(writes, copy.destination, copy.size);
+            group.copies.push_back(copy);
             MemFabricTask task;
             task.request = request;
             task.length = request.length;
@@ -876,10 +787,10 @@ Status MemFabricTransport::buildGvaCopyGroups(
             }
             copy_workers_.swap(workers);
         }
-        batch->pending_batch_count += copies.size();
+        batch->pending_batch_count += requests.size();
     } catch (...) {
         batch->task_list.resize(original_task_count);
-        gva_->releaseCopy(copies.size());
+        gva_->releaseCopy(requests.size());
         return Status::InternalError("Cannot allocate GVA copy queue");
     }
     return Status::OK();
@@ -897,8 +808,7 @@ void MemFabricTransport::dispatchGvaCopyGroups(
             worker.enqueue([context, pending, group] {
                 auto outcome = TransferStatusEnum::FAILED;
                 try {
-                    const auto status =
-                        context->runBatchCopy(group->copies, group->direction);
+                    const auto status = context->runBatchCopy(group->copies);
                     if (status.ok()) outcome = TransferStatusEnum::COMPLETED;
                 } catch (...) {
                     context->releaseCopy(group->copies.size(), true);
