@@ -2092,6 +2092,141 @@ def test_bundle_remove_keeps_manifest_until_payload_cleanup_succeeds(
     assert store.objects == {}
 
 
+@pytest.fixture(params=["cpp", "rs"])
+def cleanup_store(request):
+    """Exercise the same cleanup cases through both public store contracts."""
+    native = InMemoryStore()
+    native.batch_is_exist = lambda keys, **kwargs: [
+        native.is_exist(key) for key in keys
+    ]
+    forces = []
+    native_remove = native.remove
+
+    def remove(key, *, force=False, **kwargs):
+        forces.append(force)
+        return native_remove(key, force)
+
+    native.remove = remove
+    native.batch_remove = lambda keys, **kwargs: [
+        native.remove(key, **kwargs) for key in keys
+    ]
+    if request.param == "cpp":
+        store = native
+    else:
+        pytest.importorskip("mooncake._store_rs")
+        from mooncake.store.rs.store import MooncakeDistributedStore
+
+        store = MooncakeDistributedStore()
+
+        class NativeContract:
+            def __getattr__(self, name):
+                operation = getattr(
+                    native, "batch_put_from" if name == "batch_put_from_raw" else name
+                )
+
+                def invoke(*args, **kwargs):
+                    kwargs.pop("tenant", None)
+                    if name == "unregister_buffer":
+                        args = args[:1]
+                    return operation(*args, **kwargs)
+
+                return invoke
+
+        store._native = NativeContract()
+    return store, native, forces
+
+
+def test_shared_bundle_cleanup_preserves_manifest_on_partial_failure(
+    cleanup_store, monkeypatch
+) -> None:
+    store, native, forces = cleanup_store
+    transfer = MooncakeBundleTransfer(store, key_prefix="cleanup-contract")
+    ref = transfer.put_bundle(b"meta", {"payload": b"abcdef"}, chunk_bytes=2)
+    handle = {"manifest_key": ref.manifest_key}
+    failed_key = ref.manifest["buffers"]["payload"]["chunks"][0]["key"]
+    remove = native.remove
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            native,
+            "remove",
+            lambda key, **kwargs: -1 if key == failed_key else remove(key, **kwargs),
+        )
+        with pytest.raises(RuntimeError, match="failed to remove"):
+            transfer.remove_bundle(handle)
+        assert failed_key in native.objects
+        assert ref.manifest_key in native.objects
+    # Retry through a fresh helper: no in-process cached manifest is required.
+    MooncakeBundleTransfer(store, key_prefix="cleanup-contract").remove_bundle(handle)
+    assert native.objects == {}
+    assert forces and all(forces)
+
+
+def test_shared_bundle_cleanup_clears_superseded_batch_error(
+    cleanup_store, monkeypatch
+) -> None:
+    store, native, forces = cleanup_store
+    transfer = MooncakeBundleTransfer(store)
+    ref = transfer.put_bundle(b"meta", {"payload": b"data"})
+    batch_remove = native.batch_remove
+    calls = 0
+
+    def transient_batch(keys, **kwargs):
+        nonlocal calls
+        calls += 1
+        return [-1] * len(keys) if calls == 1 else batch_remove(keys, **kwargs)
+
+    monkeypatch.setattr(native, "batch_remove", transient_batch)
+    transfer.remove_bundle({"manifest_key": ref.manifest_key})
+    assert native.objects == {}
+    assert forces and all(forces)
+
+
+def test_shared_bundle_cleanup_retries_lost_manifest_delete_response(
+    cleanup_store, monkeypatch
+) -> None:
+    store, native, _forces = cleanup_store
+    transfer = MooncakeBundleTransfer(store)
+    ref = transfer.put_bundle(b"meta", {"payload": b"data"})
+    batch_remove = native.batch_remove
+    remove = native.remove
+    lost_response = False
+
+    def lose_response(keys, **kwargs):
+        nonlocal lost_response
+        result = batch_remove(keys, **kwargs)
+        if ref.manifest_key in keys:
+            lost_response = True
+            raise RuntimeError("lost delete response")
+        return result
+
+    def fail_manifest_retry(key, **kwargs):
+        if lost_response and key == ref.manifest_key:
+            return -1
+        return remove(key, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(native, "batch_remove", lose_response)
+        patch.setattr(native, "remove", fail_manifest_retry)
+        with pytest.raises(RuntimeError, match="lost delete response|failed to remove"):
+            transfer.remove_bundle({"manifest_key": ref.manifest_key})
+    assert native.objects == {}
+    MooncakeBundleTransfer(store).remove_bundle({"manifest_key": ref.manifest_key})
+
+
+@pytest.mark.parametrize("statuses", [[-1], [], [0, 0]])
+def test_rs_bundle_cleanup_propagates_existence_errors(monkeypatch, statuses) -> None:
+    pytest.importorskip("mooncake._store_rs")
+    from mooncake.store.rs.store import MooncakeDistributedStore
+
+    store = MooncakeDistributedStore()
+    monkeypatch.setattr(store, "batch_is_exist", lambda keys: statuses)
+    monkeypatch.setattr(store, "is_exist", lambda key: False)
+    with pytest.raises(RuntimeError, match="batch_is_exist failed"):
+        MooncakeBundleTransfer(store).remove_bundle(
+            {"manifest_key": "bundle/x/manifest"}
+        )
+
+
 def test_bundle_batch_get_failure_unregisters_buffer() -> None:
     store, transfer = make_transfer(FailingBatchGetStore())
     ref = transfer.put_structured_object(
@@ -5304,3 +5439,88 @@ def test_session_config_expands_with_physical_keys_without_mutating_input():
         _config_for_grouped_keys(
             SimpleNamespace(per_key_preferred_hca_names=[["mlx5_0"], []]), 2
         )
+
+
+@pytest.mark.parametrize("positional", [False, True])
+def test_bundle_borrows_pre_registered_source(positional) -> None:
+    store, transfer = make_transfer()
+    source = np.arange(32, dtype=np.uint8)
+    ptr = int(source.ctypes.data)
+    assert store.register_buffer(ptr, source.nbytes) == 0
+    registration_count = store.register_buffer_calls
+    if positional:
+        ref = transfer.put_bundle(
+            b"m", {"source": source}, "default", None, None, None, {"source": True}
+        )
+    else:
+        ref = transfer.put_bundle(
+            b"m", {"source": source}, pre_registered_buffers={"source": True}
+        )
+    assert store.batch_put_from_calls > 0
+    assert store.register_buffer_calls == registration_count
+    assert ptr in store.registered
+    transfer.remove_bundle(ref)
+    assert ptr in store.registered
+    assert store.unregister_buffer(ptr) == 0
+
+
+def test_bundle_explicit_parallel_policy_without_pool() -> None:
+    store, transfer = make_transfer()
+    ref = transfer.put_bundle(
+        b"m",
+        {"source": bytes(range(128))},
+        chunk_bytes=8,
+        policy=BundleTransferPolicy(put_mode="parallel", max_inflight_put=4),
+    )
+    assert store.max_active_puts > 1
+    transfer.remove_bundle(ref)
+
+
+def test_structured_pool_exhaustion_falls_back_without_waiting() -> None:
+    pool = NonBlockingOnlyBufferPool()
+    store, transfer = make_transfer(buffer_pool=pool)
+    values = np.arange(24, dtype=np.int32).reshape(6, 4)
+    ref = transfer.put_structured_object(
+        StructuredObjectPayload(buffers={"a": values, "b": values})
+    )
+    result = transfer.materialize(transfer.read_spec(ref))
+    assert np.array_equal(result.objects["a"], values)
+    assert np.array_equal(result.objects["b"], values)
+    assert pool.acquire_blocks and all(value is False for value in pool.acquire_blocks)
+    transfer.remove_bundle(ref)
+
+
+def test_direct_copy_payload_pool_exhaustion_uses_shared_fallback(monkeypatch) -> None:
+    pool = NonBlockingOnlyBufferPool()
+    _store, transfer = make_transfer(buffer_pool=pool)
+    arrays = [np.arange(5, dtype=np.int32), np.arange(5, 12, dtype=np.int32)]
+    value = sos._DirectCopyPayload.from_flat_arrays(arrays, np.dtype("int32"), 12)
+    monkeypatch.setattr(
+        sos,
+        "_concat_arrays_into",
+        lambda *args: pytest.fail("unavailable pool reached native concat"),
+    )
+    ref = transfer.put_structured_object(
+        StructuredObjectPayload(buffers={"value": value})
+    )
+    try:
+        assert np.array_equal(
+            transfer.materialize(transfer.read_spec(ref)).objects["value"],
+            np.arange(12),
+        )
+        assert pool.acquire_blocks and all(
+            value is False for value in pool.acquire_blocks
+        )
+    finally:
+        transfer.remove_bundle(ref)
+
+
+def test_shared_cleanup_does_not_suppress_corrupt_present_manifest(
+    cleanup_store,
+) -> None:
+    store, native, _forces = cleanup_store
+    key = "bundle/default/present/manifest"
+    native.objects[key] = b"not-json"
+    with pytest.raises(json.JSONDecodeError):
+        MooncakeBundleTransfer(store).remove_bundle({"manifest_key": key})
+    assert native.objects[key] == b"not-json"
