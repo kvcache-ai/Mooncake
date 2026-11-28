@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -513,6 +514,10 @@ class FileStorage {
     // unwinds, the destroyed promise reports a broken promise instead of
     // parking the waiters forever.
     ReadSingleFlight<std::string, ColdReadOutcome> inflight_cold_reads_;
+    // Tests that assert coalescing set this to the number of followers that
+    // must join before the leader reads. Production leaves it at zero, so a
+    // fast read is never delayed.
+    std::atomic<int> cold_read_waiters_required_for_test_{0};
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
