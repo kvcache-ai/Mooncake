@@ -63,6 +63,8 @@ class WeightStoreWriter:
         self._receipts: list[UploadReceipt] = []
         self._closed = False
         self._committed = False
+        self._aborted = False
+        self._upload_started = False
         self._commit_decision_may_exist = False
 
     @property
@@ -121,8 +123,8 @@ class WeightStoreWriter:
                     and participant_id not in self._flushed_participants
                 ):
                     flushed.extend(self._flush_participant(participant_id))
-        except BaseException:
-            self.abort()
+        except BaseException as error:
+            self._abort_after_failure(error)
             raise
         return tuple(flushed)
 
@@ -140,13 +142,15 @@ class WeightStoreWriter:
             )
         )
         if missing:
-            self.abort()
-            raise WeightStoreError(
+            error = WeightStoreError(
                 "Weight snapshot is missing required fragments: " + ", ".join(missing)
             )
+            self._abort_after_failure(error)
+            raise error
         if set(self._required_by_participant) != self._flushed_participants:
-            self.abort()
-            raise WeightStoreError("Weight snapshot has unflushed participants")
+            error = WeightStoreError("Weight snapshot has unflushed participants")
+            self._abort_after_failure(error)
+            raise error
         manifest = self._weight_store._commit_upload_from_writer(
             self._plan,
             self._receipts,
@@ -159,15 +163,30 @@ class WeightStoreWriter:
     def abort(self) -> None:
         """Remove uploaded payloads unless this writer has already committed."""
 
-        if self._closed:
+        if self._committed or self._aborted:
             return
         if self._commit_decision_may_exist:
             raise WeightStoreError(
                 "Weight snapshot commit decision may exist; retry commit instead"
             )
+        # Reject further writes even if cleanup fails, but leave abort retryable.
         self._closed = True
-        if self._receipts:
+        # A failed upload() may have stored payloads without returning receipts,
+        # so once any upload has started, clean up the whole plan even when no
+        # receipts were collected. Before that, nothing exists in the Store.
+        if self._upload_started:
             self._weight_store.abort_upload(self._plan, self._receipts)
+        self._aborted = True
+
+    def _abort_after_failure(self, error: BaseException) -> None:
+        """Abort after ``error``; keep its message if cleanup also fails."""
+
+        try:
+            self.abort()
+        except WeightStoreError as cleanup_error:
+            raise WeightStoreError(
+                f"{cleanup_error}; original error: {type(error).__name__}: {error}"
+            ) from error
 
     def _mark_commit_decision_may_exist(self) -> None:
         self._commit_decision_may_exist = True
@@ -190,6 +209,9 @@ class WeightStoreWriter:
             raise WeightStoreError(
                 f"snapshot source binding is missing: {participant_id}"
             )
+        # Set before upload() so a flush that fails after storing payloads is
+        # still cleaned up by abort().
+        self._upload_started = True
         receipts = self._weight_store.upload(
             self._plan,
             self._placement,
@@ -220,7 +242,9 @@ class WeightStoreWriter:
             if not self._committed:
                 self.commit()
         elif not self._commit_decision_may_exist:
-            self.abort()
+            self._abort_after_failure(
+                exc_value if exc_value is not None else exc_type()
+            )
         return False
 
 
