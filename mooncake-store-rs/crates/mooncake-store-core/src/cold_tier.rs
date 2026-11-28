@@ -20,6 +20,15 @@ pub struct ColdBackingRouteFilter {
     pub limit: Option<usize>,
 }
 
+/// A bounded page of indexed cold backing candidates.
+#[derive(Clone, Debug, Default)]
+pub struct ColdBackingRoutePage {
+    pub routes: Vec<crate::route::ObjectRoute>,
+    /// Opaque continuation for the same backend, namespace, and filter. An empty page
+    /// can still have a continuation when scanned entries are stale.
+    pub next_cursor: Option<String>,
+}
+
 /// Metadata for an object on a Mooncake-managed local Cold Tier device.
 ///
 /// Remote NoF descriptors are request-local; they are not encoded in `cold_tier_id` or selected

@@ -1,9 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use mooncake_store_core::{
-    CasResult, ColdBackingRouteFilter, ColdTierDeviceFilter, ColdTierDeviceRecord,
-    ColdTierDeviceUpdate, ColdTierPutDeviceResult, ColdTierUsageDelta, MetadataBackend,
-    NofBackingRouteFilter, ObjectKey, ObjectRoute, Result, RouteVersion, StoreError,
+    CasResult, ColdBackingRouteFilter, ColdBackingRoutePage, ColdTierDeviceFilter,
+    ColdTierDeviceRecord, ColdTierDeviceUpdate, ColdTierPutDeviceResult, ColdTierUsageDelta,
+    MetadataBackend, NofBackingRouteFilter, ObjectKey, ObjectRoute, Result, RouteVersion,
+    StoreError,
 };
 use redis::{Commands, Script};
 
@@ -41,6 +42,23 @@ local next_payload = cjson.encode(device)
 redis.call('SET', key, next_payload)
 return {2, next_payload}
 "#;
+
+const PRUNE_MISSING_BACKING_ROUTE: &str = r#"
+if redis.call('HEXISTS', KEYS[1], 'payload') == 0 then
+    for i = 2, #KEYS do redis.call('SREM', KEYS[i], KEYS[1]) end
+end
+return 1
+"#;
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ColdBackingCursor {
+    index: String,
+    cursor: u64,
+    // SSCAN COUNT is a hint. Carry overflow forward instead of dropping entries
+    // or loading more than the caller's candidate budget.
+    pending: VecDeque<String>,
+    done: bool,
+}
 
 fn route_matches_cold_backing_filter(route: &ObjectRoute, filter: &ColdBackingRouteFilter) -> bool {
     if filter
@@ -89,6 +107,92 @@ fn route_matches_nof_backing_filter(route: &ObjectRoute, filter: &NofBackingRout
 }
 
 impl RedisMetadataBackend {
+    pub(super) fn redis_scan_object_routes_by_cold_backing(
+        &self,
+        filter: &ColdBackingRouteFilter,
+        cursor: Option<&str>,
+        max_candidates: usize,
+    ) -> Result<ColdBackingRoutePage> {
+        let max_candidates = max_candidates.min(filter.limit.unwrap_or(usize::MAX));
+        if max_candidates == 0 {
+            return Ok(ColdBackingRoutePage {
+                routes: Vec::new(),
+                next_cursor: cursor.map(str::to_string),
+            });
+        }
+        let index = self.cold_backing_filter_index(filter).ok_or_else(|| {
+            StoreError::Unsupported(
+                "paged cold backing scans require a device, state, or owner filter".into(),
+            )
+        })?;
+        let mut scan: ColdBackingCursor = cursor
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(json_error)?
+            .unwrap_or_else(|| ColdBackingCursor {
+                index: index.clone(),
+                ..Default::default()
+            });
+        let prefix = self.keyspace.object_prefix();
+        if scan.index != index || scan.pending.iter().any(|key| !key.starts_with(&prefix)) {
+            return Err(StoreError::InvalidState(
+                "cold backing cursor belongs to another index or namespace".into(),
+            ));
+        }
+        let mut connection = self.connection("redis scan cold backing routes")?;
+        if scan.pending.is_empty() && !scan.done {
+            let (next, keys): (u64, Vec<String>) = redis::cmd("SSCAN")
+                .arg(&index)
+                .arg(scan.cursor)
+                .arg("COUNT")
+                .arg(max_candidates.min(256))
+                .query(&mut connection)
+                .map_err(|error| metadata_error("redis scan cold backing index page", error))?;
+            scan.cursor = next;
+            scan.pending.extend(keys);
+            scan.done = next == 0;
+        }
+        let keys = scan
+            .pending
+            .drain(..max_candidates.min(scan.pending.len()))
+            .collect::<Vec<_>>();
+        let mut routes = Vec::new();
+        if !keys.is_empty() {
+            let mut pipe = redis::pipe();
+            for key in &keys {
+                pipe.hget(key, "payload");
+            }
+            let payloads: Vec<Option<String>> = pipe
+                .query(&mut connection)
+                .map_err(|error| metadata_error("redis load cold backing page", error))?;
+            for (key, payload) in keys.iter().zip(payloads) {
+                if let Some(payload) = payload {
+                    let route: ObjectRoute = serde_json::from_str(&payload).map_err(json_error)?;
+                    if route_matches_cold_backing_filter(&route, filter) {
+                        routes.push(route);
+                    }
+                } else {
+                    Script::new(PRUNE_MISSING_BACKING_ROUTE)
+                        .key(key)
+                        .key(&index)
+                        .invoke::<i64>(&mut connection)
+                        .map_err(|error| {
+                            metadata_error("redis prune missing cold backing route", error)
+                        })?;
+                }
+            }
+        }
+        let next_cursor = if scan.done && scan.pending.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&scan).map_err(json_error)?)
+        };
+        Ok(ColdBackingRoutePage {
+            routes,
+            next_cursor,
+        })
+    }
+
     pub(super) fn cold_backing_filter_index(
         &self,
         filter: &ColdBackingRouteFilter,
@@ -249,29 +353,37 @@ impl RedisMetadataBackend {
         &self,
         filter: &NofBackingRouteFilter,
     ) -> Result<Vec<ObjectRoute>> {
-        let Some(index) = self.nof_backing_filter_index(filter) else {
-            return MetadataBackend::list_object_routes_by_nof_backing(self, filter);
-        };
+        if filter.limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        self.ensure_nof_backing_indexes()?;
+        let indexes = self
+            .nof_backing_filter_index(filter)
+            .map_or_else(|| self.nof_state_indexes().to_vec(), |index| vec![index]);
         let keys =
             self.query_readonly("redis list object routes by nof backing", |connection| {
-                scan_set_members_bounded(
-                    connection,
-                    &index,
-                    MAX_REDIS_LIST_ITEMS,
-                    MAX_REDIS_SCAN_PAGES,
-                )
+                let mut keys = BTreeSet::new();
+                for index in &indexes {
+                    keys.extend(scan_set_members_bounded(
+                        connection,
+                        index,
+                        MAX_REDIS_LIST_ITEMS,
+                        MAX_REDIS_SCAN_PAGES,
+                    )?);
+                }
+                Ok(keys.into_iter().collect::<Vec<_>>())
             })?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
         let entries =
             self.query_readonly("redis load nof backing object routes", |connection| {
-                let mut entries = Vec::with_capacity(keys.len());
+                let mut pipe = redis::pipe();
                 for key in &keys {
-                    let payload: Option<String> = redis::cmd("HGET")
-                        .arg(key.as_str())
-                        .arg("payload")
-                        .query(connection)?;
-                    entries.push((key.clone(), payload));
+                    pipe.hget(key, "payload");
                 }
-                Ok(entries)
+                let payloads: Vec<Option<String>> = pipe.query(connection)?;
+                Ok(keys.iter().cloned().zip(payloads).collect::<Vec<_>>())
             })?;
         let mut stale_keys = Vec::new();
         let mut routes = Vec::new();
@@ -284,12 +396,17 @@ impl RedisMetadataBackend {
         }
         if !stale_keys.is_empty() {
             let mut connection = self.connection("redis prune stale nof backing route index")?;
-            connection
-                .srem::<_, _, ()>(&index, stale_keys)
-                .map_err(|error| metadata_error("redis srem nof backing route index", error))?;
-        }
-        if routes.is_empty() {
-            return MetadataBackend::list_object_routes_by_nof_backing(self, filter);
+            for key in stale_keys {
+                // Route recreation and its index updates are one CAS. Do not
+                // prune an entry using a pre-recreation missing-payload read.
+                Script::new(PRUNE_MISSING_BACKING_ROUTE)
+                    .key(&key)
+                    .key(&indexes)
+                    .invoke::<i64>(&mut connection)
+                    .map_err(|error| {
+                        metadata_error("redis prune nof backing route index", error)
+                    })?;
+            }
         }
         Ok(routes
             .into_iter()

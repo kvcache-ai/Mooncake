@@ -1,6 +1,6 @@
 use crate::cold_tier::{
-    ColdBackingRouteFilter, ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceUpdate,
-    ColdTierPutDeviceResult, ColdTierUsageDelta,
+    ColdBackingRouteFilter, ColdBackingRoutePage, ColdTierDeviceFilter, ColdTierDeviceRecord,
+    ColdTierDeviceUpdate, ColdTierPutDeviceResult, ColdTierUsageDelta,
 };
 use crate::error::Result;
 use crate::identity::{
@@ -221,6 +221,39 @@ pub trait MetadataBackend: Send + Sync {
             }
         }
         Ok(routes)
+    }
+
+    /// Pages cold backing candidates with an opaque continuation.
+    /// Resume even an empty page when it carries a continuation. Production
+    /// backends should bound candidate reads before loading route payloads.
+    /// The default sorts the filtered route set for tests and small datasets.
+    fn scan_object_routes_by_cold_backing(
+        &self,
+        filter: &ColdBackingRouteFilter,
+        cursor: Option<&str>,
+        max_candidates: usize,
+    ) -> Result<ColdBackingRoutePage> {
+        let max_candidates = max_candidates.min(filter.limit.unwrap_or(usize::MAX));
+        if max_candidates == 0 {
+            return Ok(ColdBackingRoutePage {
+                routes: Vec::new(),
+                next_cursor: cursor.map(str::to_string),
+            });
+        }
+        let mut filter = filter.clone();
+        filter.limit = None;
+        let mut routes = self.list_object_routes_by_cold_backing(&filter)?;
+        routes.sort_by(|left, right| left.key.cmp(&right.key));
+        if let Some(cursor) = cursor {
+            routes.retain(|route| route.key.0.as_str() > cursor);
+        }
+        let next_cursor =
+            (routes.len() >= max_candidates).then(|| routes[max_candidates - 1].key.0.clone());
+        routes.truncate(max_candidates);
+        Ok(ColdBackingRoutePage {
+            routes,
+            next_cursor,
+        })
     }
 
     /// Lists object routes in the given namespace scope.

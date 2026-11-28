@@ -20538,6 +20538,7 @@ mod fault_injection_prop;
 mod lifecycle_tests;
 mod namespace_adversarial;
 mod namespace_isolation_tests;
+mod nof_metadata_index_tests;
 mod perf_invariant_tests;
 mod quota_prop;
 mod review_gc_starvation;
